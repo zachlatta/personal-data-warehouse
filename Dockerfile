@@ -12,8 +12,12 @@ RUN uv sync --frozen --group dev --no-install-project
 
 COPY README.md ./
 COPY src ./src
-RUN uv sync --frozen --group dev && mkdir -p "$DAGSTER_HOME"
+COPY docker/dagster.yaml "$DAGSTER_HOME/dagster.yaml"
+COPY docker/entrypoint.sh /usr/local/bin/personal-data-warehouse-entrypoint
+RUN uv sync --frozen --group dev \
+    && chmod +x /usr/local/bin/personal-data-warehouse-entrypoint
 
 EXPOSE 3000
 
+ENTRYPOINT ["personal-data-warehouse-entrypoint"]
 CMD ["uv", "run", "dagster", "dev", "-h", "0.0.0.0", "-p", "3000", "-m", "personal_data_warehouse.definitions"]
