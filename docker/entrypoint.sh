@@ -10,4 +10,13 @@ if [ -z "${DAGSTER_POSTGRES_URL:-}" ]; then
   exit 1
 fi
 
+case "$DAGSTER_POSTGRES_URL" in
+  postgres://*)
+    export DAGSTER_POSTGRES_URL="postgresql://${DAGSTER_POSTGRES_URL#postgres://}"
+    ;;
+  postgresql+psycopg2://*)
+    export DAGSTER_POSTGRES_URL="postgresql://${DAGSTER_POSTGRES_URL#postgresql+psycopg2://}"
+    ;;
+esac
+
 exec "$@"

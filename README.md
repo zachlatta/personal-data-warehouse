@@ -105,7 +105,7 @@ GMAIL_PAGE_SIZE=500
 GMAIL_INCLUDE_SPAM_TRASH=true
 ```
 
-If Coolify exposes the database as `DATABASE_URL`, the container entrypoint maps it to `DAGSTER_POSTGRES_URL` automatically.
+If Coolify exposes the database as `DATABASE_URL`, the container entrypoint maps it to `DAGSTER_POSTGRES_URL` automatically. It also normalizes `postgres://...` to `postgresql://...` because Dagster's SQLAlchemy storage expects the `postgresql` dialect name.
 
 5. Deploy, open the app URL, and materialize `gmail_mailbox_sync` in Dagster.
 
