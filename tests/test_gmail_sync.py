@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from datetime import UTC, datetime
 import json
 from unittest.mock import patch
@@ -8,11 +9,15 @@ from unittest.mock import patch
 from googleapiclient.errors import HttpError
 from httplib2 import Response
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.defs.gmail_sync import gmail_mailbox_sync_every_minute
 from personal_data_warehouse.gmail_sync import (
     collapsed_message_body_to_markdown,
     decode_base64url,
     execute_gmail_request,
+    exclusive_gmail_sync_lock,
+    exclusive_process_lock,
     extract_message_bodies,
+    GMAIL_SYNC_POSTGRES_LOCK_ID,
     gmail_token_json_from_env,
     history_message_ids,
     message_body_to_markdown,
@@ -47,6 +52,40 @@ def test_gmail_token_json_from_env_accepts_base64(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ZACH_HACKCLUB_COM_TOKEN_JSON_B64", encoded_token)
 
     assert gmail_token_json_from_env("zach@hackclub.com") == token_json
+
+
+def test_gmail_sync_schedule_runs_every_minute_by_default() -> None:
+    assert gmail_mailbox_sync_every_minute.cron_schedule == "* * * * *"
+    assert gmail_mailbox_sync_every_minute.default_status.value == "RUNNING"
+
+
+def test_exclusive_process_lock_is_non_blocking(tmp_path) -> None:
+    lock_path = tmp_path / "gmail-sync.lock"
+
+    with exclusive_process_lock(lock_path) as first_acquired:
+        assert first_acquired
+        with exclusive_process_lock(lock_path) as second_acquired:
+            assert not second_acquired
+
+
+def test_exclusive_gmail_sync_lock_uses_postgres_when_configured(monkeypatch) -> None:
+    calls: list[tuple[str, int]] = []
+
+    @contextmanager
+    def fake_postgres_lock(postgres_url: str, lock_id: int):
+        calls.append((postgres_url, lock_id))
+        yield False
+
+    monkeypatch.setenv("DAGSTER_POSTGRES_URL", "postgresql://postgres/dagster")
+    monkeypatch.setattr(
+        "personal_data_warehouse.gmail_sync.exclusive_postgres_advisory_lock",
+        fake_postgres_lock,
+    )
+
+    with exclusive_gmail_sync_lock() as acquired:
+        assert not acquired
+
+    assert calls == [("postgresql://postgres/dagster", GMAIL_SYNC_POSTGRES_LOCK_ID)]
 
 
 def test_decode_base64url_handles_missing_padding() -> None:

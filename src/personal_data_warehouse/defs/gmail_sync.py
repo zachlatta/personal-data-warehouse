@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from dagster import Definitions, MaterializeResult, MetadataValue, RetryPolicy, asset, definitions
+from dagster import (
+    DefaultScheduleStatus,
+    Definitions,
+    MaterializeResult,
+    MetadataValue,
+    RetryPolicy,
+    asset,
+    define_asset_job,
+    definitions,
+    schedule,
+)
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
@@ -38,6 +48,25 @@ def gmail_mailbox_sync(context) -> MaterializeResult:
     )
 
 
+gmail_mailbox_sync_job = define_asset_job(
+    "gmail_mailbox_sync_job",
+    selection=[gmail_mailbox_sync],
+)
+
+
+@schedule(
+    cron_schedule="* * * * *",
+    job=gmail_mailbox_sync_job,
+    default_status=DefaultScheduleStatus.RUNNING,
+)
+def gmail_mailbox_sync_every_minute():
+    return {}
+
+
 @definitions
 def defs() -> Definitions:
-    return Definitions(assets=[gmail_mailbox_sync])
+    return Definitions(
+        assets=[gmail_mailbox_sync],
+        jobs=[gmail_mailbox_sync_job],
+        schedules=[gmail_mailbox_sync_every_minute],
+    )

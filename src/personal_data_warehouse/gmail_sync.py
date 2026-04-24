@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import base64
+import fcntl
 import json
 import os
 import re
 from email.utils import getaddresses, parseaddr
+from pathlib import Path
+import tempfile
 import time
 from typing import Callable, TypeVar
 
@@ -23,6 +27,8 @@ from personal_data_warehouse.clickhouse import ClickHouseWarehouse, SyncState
 from personal_data_warehouse.config import GmailAccount, Settings, env_slug
 
 EPOCH_UTC = datetime.fromtimestamp(0, tz=UTC)
+DEFAULT_GMAIL_SYNC_LOCK_PATH = Path(tempfile.gettempdir()) / "personal-data-warehouse-gmail-sync.lock"
+GMAIL_SYNC_POSTGRES_LOCK_ID = 7_403_111_836
 T = TypeVar("T")
 
 
@@ -36,6 +42,68 @@ class MailboxSyncSummary:
     query: str | None
 
 
+def gmail_sync_lock_path() -> Path:
+    return Path(os.getenv("GMAIL_SYNC_LOCK_PATH", str(DEFAULT_GMAIL_SYNC_LOCK_PATH))).expanduser()
+
+
+def gmail_sync_lock_postgres_url() -> str | None:
+    return (
+        os.getenv("GMAIL_SYNC_LOCK_POSTGRES_URL")
+        or os.getenv("DAGSTER_POSTGRES_URL")
+        or os.getenv("DATABASE_URL")
+        or None
+    )
+
+
+@contextmanager
+def exclusive_gmail_sync_lock() -> Iterator[bool]:
+    postgres_url = gmail_sync_lock_postgres_url()
+    if postgres_url:
+        with exclusive_postgres_advisory_lock(postgres_url, GMAIL_SYNC_POSTGRES_LOCK_ID) as acquired:
+            yield acquired
+        return
+
+    with exclusive_process_lock(gmail_sync_lock_path()) as acquired:
+        yield acquired
+
+
+@contextmanager
+def exclusive_postgres_advisory_lock(postgres_url: str, lock_id: int) -> Iterator[bool]:
+    import psycopg2
+
+    connection = psycopg2.connect(postgres_url)
+    connection.autocommit = True
+    cursor = connection.cursor()
+    acquired = False
+    try:
+        cursor.execute("SELECT pg_try_advisory_lock(%s)", (lock_id,))
+        acquired = bool(cursor.fetchone()[0])
+        yield acquired
+    finally:
+        if acquired:
+            cursor.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
+        cursor.close()
+        connection.close()
+
+
+@contextmanager
+def exclusive_process_lock(path: Path) -> Iterator[bool]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
 class GmailSyncRunner:
     def __init__(self, *, settings: Settings, warehouse: ClickHouseWarehouse, logger) -> None:
         self._settings = settings
@@ -43,43 +111,48 @@ class GmailSyncRunner:
         self._logger = logger
 
     def sync_all(self) -> list[MailboxSyncSummary]:
-        self._warehouse.ensure_tables()
-        state_by_account = self._warehouse.load_sync_state()
+        with exclusive_gmail_sync_lock() as acquired:
+            if not acquired:
+                self._logger.warning("Skipping Gmail sync because another Gmail sync is already running")
+                return []
 
-        summaries: list[MailboxSyncSummary] = []
-        failures: list[str] = []
+            self._warehouse.ensure_tables()
+            state_by_account = self._warehouse.load_sync_state()
 
-        for account in self._settings.gmail_accounts:
-            state = state_by_account.get(account.email_address)
-            try:
-                summary = self._sync_account(account, state)
-            except Exception as exc:
-                last_history_id = state.last_history_id if state else 0
+            summaries: list[MailboxSyncSummary] = []
+            failures: list[str] = []
+
+            for account in self._settings.gmail_accounts:
+                state = state_by_account.get(account.email_address)
+                try:
+                    summary = self._sync_account(account, state)
+                except Exception as exc:
+                    last_history_id = state.last_history_id if state else 0
+                    self._warehouse.insert_sync_state(
+                        account=account.email_address,
+                        last_history_id=last_history_id,
+                        last_sync_type=state.last_sync_type if state else "unknown",
+                        status="failed",
+                        error=str(exc),
+                        updated_at=datetime.now(tz=UTC),
+                    )
+                    failures.append(f"{account.email_address}: {exc}")
+                    continue
+
                 self._warehouse.insert_sync_state(
-                    account=account.email_address,
-                    last_history_id=last_history_id,
-                    last_sync_type=state.last_sync_type if state else "unknown",
-                    status="failed",
-                    error=str(exc),
+                    account=summary.account,
+                    last_history_id=summary.next_history_id,
+                    last_sync_type=summary.sync_type,
+                    status="ok",
+                    error="",
                     updated_at=datetime.now(tz=UTC),
                 )
-                failures.append(f"{account.email_address}: {exc}")
-                continue
+                summaries.append(summary)
 
-            self._warehouse.insert_sync_state(
-                account=summary.account,
-                last_history_id=summary.next_history_id,
-                last_sync_type=summary.sync_type,
-                status="ok",
-                error="",
-                updated_at=datetime.now(tz=UTC),
-            )
-            summaries.append(summary)
+            if failures:
+                raise RuntimeError("Mailbox sync failed for: " + "; ".join(failures))
 
-        if failures:
-            raise RuntimeError("Mailbox sync failed for: " + "; ".join(failures))
-
-        return summaries
+            return summaries
 
     def _sync_account(self, account: GmailAccount, state: SyncState | None) -> MailboxSyncSummary:
         service = build_gmail_service(account=account, settings=self._settings)

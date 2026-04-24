@@ -78,6 +78,12 @@ uv run dg dev
 
 Then materialize the `gmail_mailbox_sync` asset from the Dagster UI.
 
+The Docker/Coolify deployment also includes an enabled Dagster schedule,
+`gmail_mailbox_sync_every_minute`, which runs the Gmail sync every minute.
+Gmail syncs use a nonblocking lock so a scheduled tick skips if another sync is still running.
+When `DAGSTER_POSTGRES_URL` or `DATABASE_URL` is set, the lock uses a Postgres advisory lock;
+otherwise it falls back to a local process lock.
+
 ## Docker / Coolify
 
 This repo includes a `Dockerfile` that runs Dagster on port `3000` with `uv`.
