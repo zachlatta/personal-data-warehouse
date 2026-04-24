@@ -1,0 +1,11 @@
+.dg/
+.env
+.git/
+.pytest_cache/
+.ruff_cache/
+.secrets/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
