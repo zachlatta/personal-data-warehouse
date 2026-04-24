@@ -8,9 +8,11 @@ import pytest
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.slack_sync import (
     SlackRateLimitedError,
+    SlackApiCallError,
     SlackSyncRunner,
     SlackTransientError,
     conversation_to_row,
+    conversation_activity_ts,
     conversation_may_have_activity_since,
     file_rows_from_message,
     iter_cursor_items,
@@ -86,6 +88,10 @@ class FakeWarehouse:
         include_archived=False,
         archived_only=False,
         conversation_types=(),
+        not_full_only=False,
+        zero_messages_only=False,
+        skip_known_errors=False,
+        limit=None,
     ):
         self.conversation_payload_calls.append(
             {
@@ -94,6 +100,10 @@ class FakeWarehouse:
                 "include_archived": include_archived,
                 "archived_only": archived_only,
                 "conversation_types": conversation_types,
+                "not_full_only": not_full_only,
+                "zero_messages_only": zero_messages_only,
+                "skip_known_errors": skip_known_errors,
+                "limit": limit,
             }
         )
         payloads = []
@@ -111,6 +121,21 @@ class FakeWarehouse:
             )["conversation_type"] not in conversation_types:
                 continue
             payloads.append(payload)
+        if not_full_only:
+            payloads = [
+                payload
+                for payload in payloads
+                if self.states.get((account, team_id, "conversation", str(payload["id"])), {}).get("last_sync_type") != "full"
+                or self.states.get((account, team_id, "conversation", str(payload["id"])), {}).get("status") != "ok"
+            ]
+        if skip_known_errors:
+            payloads = [
+                payload
+                for payload in payloads
+                if self.states.get((account, team_id, "conversation", str(payload["id"])), {}).get("status") != "error"
+            ]
+        if limit is not None:
+            payloads = payloads[:limit]
         return payloads
 
     def load_slack_thread_parent_refs(self, *, account, team_id, since_ts=None, limit=None, skip_completed=False, order="recent"):
@@ -277,6 +302,9 @@ def test_conversation_recency_uses_latest_or_updated_metadata():
     assert conversation_may_have_activity_since({"updated": 100_000}, 99.0)
     assert conversation_may_have_activity_since({"updated": 100_000_000_000}, 99_999_999.0)
     assert conversation_may_have_activity_since({"id": "C1"}, 999.0)
+    assert conversation_activity_ts({"latest": {"ts": "120.000001"}}) == pytest.approx(120.000001)
+    assert conversation_activity_ts({"updated": 120_000}) == pytest.approx(120_000)
+    assert conversation_activity_ts({"updated": 120_000_000_000}) == pytest.approx(120_000_000)
 
 
 def test_runner_full_sync_collects_workspace_conversations_messages_threads_and_files(monkeypatch):
@@ -510,6 +538,264 @@ def test_runner_can_filter_cached_conversations_by_type(monkeypatch):
 
     assert warehouse.conversation_payload_calls[0]["conversation_types"] == ("im", "mpim")
     assert [params["channel"] for method, params in client.calls if method == "conversations.history"] == ["D1", "G1"]
+
+
+def test_runner_can_load_only_not_full_cached_conversations(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse(
+        states={("zrl", "T1", "conversation", "C_DONE"): {"status": "ok", "last_sync_type": "full"}}
+    )
+    warehouse.conversation_payloads = [
+        {"id": "C_DONE", "name": "done", "is_channel": True},
+        {"id": "C_BACKLOG", "name": "backlog", "is_channel": True},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1713974400.000100", "user": "U1", "text": "backlog"}], "response_metadata": {}}
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        not_full_only=True,
+        conversation_limit=10,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.conversation_payload_calls[0]["not_full_only"] is True
+    assert warehouse.conversation_payload_calls[0]["limit"] == 10
+    assert [params["channel"] for method, params in client.calls if method == "conversations.history"] == ["C_BACKLOG"]
+
+
+def test_runner_can_skip_known_conversation_errors(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse(
+        states={("zrl", "T1", "conversation", "C_ERROR"): {"status": "error", "last_sync_type": "full"}}
+    )
+    warehouse.conversation_payloads = [
+        {"id": "C_ERROR", "name": "error", "is_channel": True},
+        {"id": "C_OK", "name": "ok", "is_channel": True},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1713974400.000100", "user": "U1", "text": "ok"}], "response_metadata": {}}
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        not_full_only=True,
+        skip_known_errors=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.conversation_payload_calls[0]["skip_known_errors"] is True
+    assert [params["channel"] for method, params in client.calls if method == "conversations.history"] == ["C_OK"]
+
+
+def test_runner_records_conversation_errors_and_continues(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "C_DENIED", "name": "denied", "is_channel": True},
+        {"id": "C_OK", "name": "ok", "is_channel": True},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                SlackApiCallError("conversations.history failed: not_in_channel"),
+                {"ok": True, "messages": [{"ts": "1713974400.000100", "user": "U1", "text": "ok"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert any(
+        update["object_type"] == "conversation"
+        and update["object_id"] == "C_DENIED"
+        and update["status"] == "error"
+        for update in warehouse.state_updates
+    )
+    assert warehouse.messages[0]["conversation_id"] == "C_OK"
+
+
+def test_runner_freshness_priority_refreshes_conversations_and_syncs_ui_order(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.list": [
+                {
+                    "ok": True,
+                    "channels": [
+                        {"id": "C_PUBLIC", "name": "public", "is_channel": True, "latest": {"ts": "1995.000000"}},
+                        {"id": "G_PRIVATE", "name": "private", "is_private": True, "latest": {"ts": "1996.000000"}},
+                        {"id": "G_MPIM", "name": "mpim", "is_mpim": True, "latest": {"ts": "1997.000000"}},
+                        {"id": "D_OLD", "user": "U0", "is_im": True, "latest": {"ts": "1000.000000"}},
+                        {"id": "D_NEW", "user": "U1", "is_im": True, "latest": {"ts": "1999.000000"}},
+                    ],
+                    "response_metadata": {},
+                }
+            ],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1999.000000", "user": "U1", "text": "dm"}], "response_metadata": {}},
+                {"ok": True, "messages": [{"ts": "1997.000000", "user": "U2", "text": "group"}], "response_metadata": {}},
+                {"ok": True, "messages": [{"ts": "1996.000000", "user": "U3", "text": "private"}], "response_metadata": {}},
+                {"ok": True, "messages": [{"ts": "1995.000000", "user": "U4", "text": "public"}], "response_metadata": {}},
+            ],
+        }
+    )
+    warehouse = FakeWarehouse()
+
+    summary = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()[0]
+
+    list_params = [params for method, params in client.calls if method == "conversations.list"][0]
+    history_params = [params for method, params in client.calls if method == "conversations.history"]
+    assert list_params["exclude_archived"] == "true"
+    assert list_params["types"] == "public_channel,private_channel,mpim,im"
+    assert [params["channel"] for params in history_params] == ["D_NEW", "G_MPIM", "G_PRIVATE", "C_PUBLIC"]
+    assert all(float(params["oldest"]) == pytest.approx(1400.0) for params in history_params)
+    assert summary.sync_type == "freshness_priority"
+    assert summary.conversations_seen == 4
+    assert summary.messages_written == 4
+    assert len(warehouse.conversations) == 5
+
+
+def test_runner_freshness_priority_can_use_cached_conversations_for_fast_polls(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "C_PUBLIC", "name": "public", "is_channel": True, "latest": {"ts": "1995.000000"}},
+        {"id": "D_NEW", "user": "U1", "is_im": True, "latest": {"ts": "1999.000000"}},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1999.000000", "user": "U1", "text": "dm"}], "response_metadata": {}},
+                {"ok": True, "messages": [{"ts": "1995.000000", "user": "U4", "text": "public"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert not any(method == "conversations.list" for method, _params in client.calls)
+    assert [params["channel"] for method, params in client.calls if method == "conversations.history"] == ["D_NEW", "C_PUBLIC"]
+    assert warehouse.conversation_payload_calls[0]["include_archived"] is False
+
+
+def test_runner_freshness_priority_can_refresh_one_conversation_type(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.list": [
+                {
+                    "ok": True,
+                    "channels": [{"id": "D_NEW", "user": "U1", "is_im": True, "latest": {"ts": "1999.000000"}}],
+                    "response_metadata": {},
+                }
+            ],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1999.000000", "user": "U1", "text": "dm"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=FakeWarehouse(),
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        freshness_priority=True,
+        conversation_types=("im",),
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    list_params = [params for method, params in client.calls if method == "conversations.list"][0]
+    assert list_params["types"] == "im"
+    assert [params["channel"] for method, params in client.calls if method == "conversations.history"] == ["D_NEW"]
 
 
 def test_runner_thread_replies_only_is_resumable(monkeypatch):

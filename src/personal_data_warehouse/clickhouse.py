@@ -696,24 +696,62 @@ class ClickHouseWarehouse:
         include_archived: bool = False,
         archived_only: bool = False,
         conversation_types: tuple[str, ...] = (),
+        not_full_only: bool = False,
+        zero_messages_only: bool = False,
+        skip_known_errors: bool = False,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         archived_clause = ""
         if archived_only:
-            archived_clause = "AND is_archived = 1"
+            archived_clause = "AND c.is_archived = 1"
         elif not include_archived:
-            archived_clause = "AND is_archived = 0"
+            archived_clause = "AND c.is_archived = 0"
         type_clause = ""
         if conversation_types:
             values = ", ".join(_sql_string(conversation_type) for conversation_type in conversation_types)
-            type_clause = f"AND conversation_type IN ({values})"
+            type_clause = f"AND c.conversation_type IN ({values})"
+        backlog_clauses = []
+        if not_full_only:
+            backlog_clauses.append("NOT (s.status = 'ok' AND s.last_sync_type = 'full')")
+        if zero_messages_only:
+            backlog_clauses.append("m.message_count = 0")
+        if skip_known_errors:
+            backlog_clauses.append("s.status != 'error'")
+        backlog_clause = ""
+        if backlog_clauses:
+            backlog_clause = "AND " + " AND ".join(backlog_clauses)
+        limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
         rows = self._query(
             f"""
-            SELECT raw_json
-            FROM slack_conversations FINAL
-            WHERE account = {_sql_string(account)}
-              AND team_id = {_sql_string(team_id)}
+            SELECT c.raw_json
+            FROM (SELECT * FROM slack_conversations FINAL) AS c
+            LEFT JOIN (SELECT * FROM slack_sync_state FINAL WHERE object_type = 'conversation') AS s
+                ON c.account = s.account AND c.team_id = s.team_id AND c.conversation_id = s.object_id
+            LEFT JOIN (
+                SELECT account, team_id, conversation_id, count() AS message_count
+                FROM slack_messages FINAL
+                WHERE is_deleted = 0
+                GROUP BY account, team_id, conversation_id
+            ) AS m
+                ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id
+            WHERE c.account = {_sql_string(account)}
+              AND c.team_id = {_sql_string(team_id)}
               {archived_clause}
               {type_clause}
+              {backlog_clause}
+            ORDER BY
+                NOT (s.status = 'ok' AND s.last_sync_type = 'full') DESC,
+                m.message_count = 0 DESC,
+                multiIf(
+                    c.conversation_type = 'im', 1,
+                    c.conversation_type = 'mpim', 2,
+                    c.conversation_type = 'private_channel', 3,
+                    c.conversation_type = 'public_channel', 4,
+                    5
+                ),
+                c.is_archived,
+                c.conversation_id
+            {limit_clause}
             """
         )
         payloads = []
