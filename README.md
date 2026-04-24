@@ -84,6 +84,9 @@ Gmail syncs use a nonblocking lock so a scheduled tick skips if another sync is 
 When `DAGSTER_POSTGRES_URL` or `DATABASE_URL` is set, the lock uses a Postgres advisory lock;
 otherwise it falls back to a local process lock.
 
+Slack sync has the same deployment behavior through `slack_workspace_sync_every_minute`.
+It also runs every minute and skips overlapping Slack sync runs with a separate lock.
+
 ## Docker / Coolify
 
 This repo includes a `Dockerfile` that runs Dagster on port `3000` with `uv`.
