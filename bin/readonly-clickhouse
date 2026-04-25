@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: bin/readonly-clickhouse 'select ...'
+       echo 'select ...' | bin/readonly-clickhouse
+EOF
+}
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if [[ $# -gt 0 ]]; then
+  sql="$*"
+elif [[ ! -t 0 ]]; then
+  sql="$(cat)"
+else
+  usage
+  exit 2
+fi
+
+if [[ -z "${sql//[[:space:]]/}" ]]; then
+  usage
+  exit 2
+fi
+
+uv run python - "$sql" <<'PY'
+from __future__ import annotations
+
+import csv
+import os
+import sys
+from typing import Any
+
+from clickhouse_driver import Client as NativeClickHouseClient
+import clickhouse_connect
+from dotenv import load_dotenv
+
+from personal_data_warehouse.clickhouse import _parse_clickhouse_url
+
+
+def write_tsv(rows: list[tuple[Any, ...]], column_names: list[str]) -> None:
+    writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
+    if column_names:
+        writer.writerow(column_names)
+    writer.writerows(rows)
+
+
+load_dotenv(".env")
+clickhouse_url = os.environ.get("CLICKHOUSE_URL")
+if not clickhouse_url:
+    print("CLICKHOUSE_URL must be set in the environment or .env", file=sys.stderr)
+    raise SystemExit(1)
+
+sql = sys.argv[1]
+parsed = _parse_clickhouse_url(clickhouse_url)
+
+if parsed["client_type"] == "native":
+    client = NativeClickHouseClient(**parsed["kwargs"])
+    rows, columns = client.execute(
+        sql,
+        with_column_types=True,
+        settings={"readonly": 1},
+    )
+    write_tsv(rows, [name for name, _column_type in columns])
+else:
+    client = clickhouse_connect.get_client(**parsed["kwargs"])
+    result = client.query(sql, settings={"readonly": 1})
+    write_tsv(result.result_rows, list(result.column_names))
+PY
