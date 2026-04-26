@@ -56,6 +56,15 @@ ATTACHMENT_COLUMNS = (
     "text",
     "text_extraction_status",
     "text_extraction_error",
+    "ai_provider",
+    "ai_model",
+    "ai_base_url",
+    "ai_prompt_version",
+    "ai_prompt_sha256",
+    "ai_prompt",
+    "ai_source_status",
+    "ai_elapsed_ms",
+    "ai_processed_at",
     "is_deleted",
     "part_json",
     "synced_at",
@@ -380,6 +389,15 @@ class ClickHouseWarehouse:
                 text String,
                 text_extraction_status LowCardinality(String),
                 text_extraction_error String,
+                ai_provider LowCardinality(String),
+                ai_model String,
+                ai_base_url String,
+                ai_prompt_version LowCardinality(String),
+                ai_prompt_sha256 String,
+                ai_prompt String,
+                ai_source_status LowCardinality(String),
+                ai_elapsed_ms UInt64,
+                ai_processed_at DateTime64(3, 'UTC'),
                 is_deleted UInt8,
                 part_json String,
                 synced_at DateTime64(3, 'UTC'),
@@ -389,6 +407,33 @@ class ClickHouseWarehouse:
             PARTITION BY toYYYYMM(synced_at)
             ORDER BY (account, message_id, part_id, filename)
             """
+        )
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_provider LowCardinality(String) AFTER text_extraction_error"
+        )
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_model String AFTER ai_provider"
+        )
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_base_url String AFTER ai_model"
+        )
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_prompt_version LowCardinality(String) AFTER ai_base_url"
+        )
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_prompt_sha256 String AFTER ai_prompt_version"
+        )
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_prompt String AFTER ai_prompt_sha256"
+        )
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_source_status LowCardinality(String) AFTER ai_prompt"
+        )
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_elapsed_ms UInt64 AFTER ai_source_status"
+        )
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_processed_at DateTime64(3, 'UTC') AFTER ai_elapsed_ms"
         )
         self._command(
             """
@@ -415,6 +460,15 @@ class ClickHouseWarehouse:
                 a.text AS text,
                 a.text_extraction_status AS text_extraction_status,
                 a.text_extraction_error AS text_extraction_error,
+                a.ai_provider AS ai_provider,
+                a.ai_model AS ai_model,
+                a.ai_base_url AS ai_base_url,
+                a.ai_prompt_version AS ai_prompt_version,
+                a.ai_prompt_sha256 AS ai_prompt_sha256,
+                a.ai_prompt AS ai_prompt,
+                a.ai_source_status AS ai_source_status,
+                a.ai_elapsed_ms AS ai_elapsed_ms,
+                a.ai_processed_at AS ai_processed_at,
                 a.synced_at AS attachment_synced_at,
                 m.synced_at AS message_synced_at
             FROM (SELECT * FROM gmail_attachments FINAL) AS a

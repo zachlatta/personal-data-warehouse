@@ -12,9 +12,16 @@ import zipfile
 from googleapiclient.errors import HttpError
 from httplib2 import Response
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.defs.gmail_sync import gmail_mailbox_sync_every_minute
+from personal_data_warehouse.defs.gmail_sync import (
+    gmail_mailbox_sync_every_minute,
+    ollama_resource_from_env,
+    prepare_attachment_ai_fallback,
+)
 from personal_data_warehouse.gmail_auth import update_env_file
 from personal_data_warehouse.gmail_sync import (
+    ATTACHMENT_AI_PROMPT,
+    ATTACHMENT_AI_PROMPT_VERSION,
+    AttachmentAiFallbackConfig,
     attachment_parts_from_message,
     attachment_rows_for_message,
     collapsed_message_body_to_markdown,
@@ -71,6 +78,23 @@ class FakeLogger:
         pass
 
 
+class FakeOllamaResource:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.generate_calls = []
+        self.ensure_model_calls = []
+        self.ensure_model_error: Exception | None = None
+
+    def ensure_model(self, model: str, *, pull: bool = True) -> None:
+        self.ensure_model_calls.append((model, pull))
+        if self.ensure_model_error:
+            raise self.ensure_model_error
+
+    def generate(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        return self.response
+
+
 class FakeAttachmentBackfillWarehouse:
     def __init__(self, messages: list[dict[str, object]], existing_keys=None) -> None:
         self.messages = messages
@@ -124,6 +148,36 @@ def test_load_settings_accepts_gmail_attachment_limits(monkeypatch) -> None:
     assert settings.gmail_attachment_backfill_batch_size == 25
 
 
+def test_load_settings_enables_gmail_attachment_ai_fallback_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+
+    assert settings.gmail_attachment_ai_fallback_enabled is True
+    assert settings.gmail_attachment_ai_fallback_base_url == "http://127.0.0.1:11435"
+    assert settings.gmail_attachment_ai_fallback_model == "gemma4:e2b"
+    assert settings.gmail_attachment_ai_fallback_pull_model is True
+
+
+def test_load_settings_accepts_gmail_attachment_ai_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL", "http://rotom.local:11435")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_MODEL", "gemma4:e2b")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES", "2")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL", "false")
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+
+    assert settings.gmail_attachment_ai_fallback_enabled is True
+    assert settings.gmail_attachment_ai_fallback_base_url == "http://rotom.local:11435"
+    assert settings.gmail_attachment_ai_fallback_model == "gemma4:e2b"
+    assert settings.gmail_attachment_ai_fallback_timeout_seconds == 45
+    assert settings.gmail_attachment_ai_fallback_pdf_max_pages == 2
+    assert settings.gmail_attachment_ai_fallback_pull_model is False
+
+
 def test_gmail_token_json_from_env_accepts_base64(monkeypatch) -> None:
     token_json = json.dumps({"token": "access-token"})
     encoded_token = base64.b64encode(token_json.encode("utf-8")).decode("ascii")
@@ -135,6 +189,40 @@ def test_gmail_token_json_from_env_accepts_base64(monkeypatch) -> None:
 def test_gmail_sync_schedule_runs_every_minute_by_default() -> None:
     assert gmail_mailbox_sync_every_minute.cron_schedule == "* * * * *"
     assert gmail_mailbox_sync_every_minute.default_status.value == "RUNNING"
+
+
+def test_ollama_resource_from_env_reads_only_ai_connection_settings(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL", "http://ollama.local:11435")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS", "67")
+
+    resource = ollama_resource_from_env()
+
+    assert resource.base_url == "http://ollama.local:11435"
+    assert resource.request_timeout_seconds == 67
+
+
+def test_prepare_attachment_ai_fallback_returns_ready_config(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_MODEL", "gemma4:e2b")
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    ollama = FakeOllamaResource("{}")
+
+    config = prepare_attachment_ai_fallback(settings=settings, ollama=ollama, logger=FakeLogger())
+
+    assert config is not None
+    assert config.client is ollama
+    assert ollama.ensure_model_calls == [("gemma4:e2b", True)]
+
+
+def test_prepare_attachment_ai_fallback_disables_run_when_model_setup_fails(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    ollama = FakeOllamaResource("{}")
+    ollama.ensure_model_error = RuntimeError("down")
+
+    config = prepare_attachment_ai_fallback(settings=settings, ollama=ollama, logger=FakeLogger())
+
+    assert config is None
 
 
 def test_google_auth_update_env_file_replaces_and_appends_values(tmp_path) -> None:
@@ -379,6 +467,82 @@ def test_attachment_rows_for_message_fetches_attachment_id_content() -> None:
     assert rows[0]["text_extraction_status"] == "ok"
     assert "Attachment" in rows[0]["text"]
     assert "HTML" in rows[0]["text"]
+
+
+def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) -> None:
+    image_content = b"\x89PNG\r\n\x1a\nfake screenshot bytes"
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "receipt.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+
+    ollama = FakeOllamaResource(
+        json.dumps(
+            {
+                "summary": "Payment receipt.",
+                "visible_text": ["Total $42.00", "Paid Apr 23, 2026"],
+                "likely_document_type": "receipt",
+                "useful_for_search": "payment receipt total",
+            }
+        )
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=100,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+    )
+
+    row = rows[0]
+    assert row["text_extraction_status"] == "ai_ok"
+    assert "Payment receipt" in row["text"]
+    assert "Total $42.00" in row["text"]
+    assert row["ai_provider"] == "ollama"
+    assert row["ai_model"] == "gemma4:e2b"
+    assert row["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
+    assert row["ai_prompt"] == ATTACHMENT_AI_PROMPT
+    assert row["ai_source_status"] == "unsupported"
+    assert row["ai_elapsed_ms"] >= 0
+    assert row["ai_processed_at"] > datetime(2026, 4, 23, tzinfo=UTC)
+    assert ollama.generate_calls == [
+        {
+            "model": "gemma4:e2b",
+            "prompt": ATTACHMENT_AI_PROMPT,
+            "images": [image_content],
+            "options": {"temperature": 0, "num_predict": 512},
+            "think": False,
+            "timeout_seconds": 30,
+        }
+    ]
+    metadata = json.loads(row["text_extraction_error"])
+    assert metadata["source_status"] == "unsupported"
+    assert metadata["model"] == "gemma4:e2b"
+    assert metadata["prompt_sha256"] == row["ai_prompt_sha256"]
 
 
 def test_attachment_rows_for_message_skips_existing_and_tombstones_missing_attachment() -> None:

@@ -14,9 +14,13 @@ import ssl
 from email.utils import getaddresses, parseaddr
 from io import BytesIO
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import time
-from typing import Callable, TypeVar
+from typing import Callable, Protocol, TypeVar
+import urllib.error
+import urllib.request
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -41,7 +45,22 @@ ZIP_MAX_MEMBERS = 200
 ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
+ATTACHMENT_AI_PROVIDER = "ollama"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v1"
+ATTACHMENT_AI_PROMPT = """Analyze this real Gmail attachment image.
+
+Return concise JSON with these keys:
+- summary: one sentence describing what the attachment appears to be.
+- visible_text: readable text visible in the image, preserving important names, dates, amounts, addresses, and identifiers.
+- likely_document_type: a short label such as receipt, invoice, chart, photo, official letter, form, screenshot, or unknown.
+- useful_for_search: concise search keywords and entities.
+
+If text is unclear, say so. Do not invent details."""
+ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
+IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 T = TypeVar("T")
+ATTACHMENT_AI_FALLBACK_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -63,6 +82,39 @@ class AttachmentTextExtraction:
     text: str
     status: str
     error: str = ""
+    ai_provider: str = ""
+    ai_model: str = ""
+    ai_base_url: str = ""
+    ai_prompt_version: str = ""
+    ai_prompt_sha256: str = ""
+    ai_prompt: str = ""
+    ai_source_status: str = ""
+    ai_elapsed_ms: int = 0
+    ai_processed_at: datetime = EPOCH_UTC
+
+
+@dataclass(frozen=True)
+class AttachmentAiFallbackConfig:
+    provider: str
+    base_url: str
+    model: str
+    timeout_seconds: int
+    pdf_max_pages: int
+    pull_model: bool = True
+    client: AttachmentVisionClient | None = None
+
+
+class AttachmentVisionClient(Protocol):
+    def generate(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        images: Sequence[bytes],
+        options: Mapping[str, object] | None = None,
+        think: bool = False,
+        timeout_seconds: int | None = None,
+    ) -> str: ...
 
 
 class AttachmentTextUnavailable(Exception):
@@ -138,10 +190,25 @@ def exclusive_process_lock(path: Path) -> Iterator[bool]:
 
 
 class GmailSyncRunner:
-    def __init__(self, *, settings: Settings, warehouse: ClickHouseWarehouse, logger) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        warehouse: ClickHouseWarehouse,
+        logger,
+        attachment_ai_client: AttachmentVisionClient | None = None,
+        attachment_ai_fallback: AttachmentAiFallbackConfig | None | object = ATTACHMENT_AI_FALLBACK_UNSET,
+    ) -> None:
         self._settings = settings
         self._warehouse = warehouse
         self._logger = logger
+        if attachment_ai_fallback is ATTACHMENT_AI_FALLBACK_UNSET:
+            self._attachment_ai_fallback = attachment_ai_fallback_config_from_settings(
+                settings,
+                client=attachment_ai_client,
+            )
+        else:
+            self._attachment_ai_fallback = attachment_ai_fallback
 
     def sync_all(self) -> list[MailboxSyncSummary]:
         with exclusive_gmail_sync_lock() as acquired:
@@ -350,6 +417,7 @@ class GmailSyncRunner:
                             existing_keys=existing_attachment_keys,
                             max_bytes=self._settings.gmail_attachment_max_bytes,
                             text_max_chars=self._settings.gmail_attachment_text_max_chars,
+                            ai_fallback=self._attachment_ai_fallback,
                         )
                     )
             self._warehouse.insert_messages(rows)
@@ -403,6 +471,7 @@ class GmailSyncRunner:
                     max_bytes=self._settings.gmail_attachment_max_bytes,
                     text_max_chars=self._settings.gmail_attachment_text_max_chars,
                     force_reprocess=force_reprocess,
+                    ai_fallback=self._attachment_ai_fallback,
                 )
             )
         return rows
@@ -470,6 +539,7 @@ class GmailSyncRunner:
                     max_bytes=self._settings.gmail_attachment_max_bytes,
                     text_max_chars=self._settings.gmail_attachment_text_max_chars,
                     force_reprocess=True,
+                    ai_fallback=self._attachment_ai_fallback,
                 )
                 self._warehouse.insert_attachments(rows)
                 self._warehouse.insert_attachment_backfill_state(
@@ -516,6 +586,24 @@ class GmailSyncRunner:
             text_chars,
         )
         return (candidates, rows_written, text_chars)
+
+
+def attachment_ai_fallback_config_from_settings(
+    settings: Settings,
+    *,
+    client: AttachmentVisionClient | None = None,
+) -> AttachmentAiFallbackConfig | None:
+    if not settings.gmail_attachment_ai_fallback_enabled:
+        return None
+    return AttachmentAiFallbackConfig(
+        provider=ATTACHMENT_AI_PROVIDER,
+        base_url=settings.gmail_attachment_ai_fallback_base_url.rstrip("/"),
+        model=settings.gmail_attachment_ai_fallback_model,
+        timeout_seconds=settings.gmail_attachment_ai_fallback_timeout_seconds,
+        pdf_max_pages=settings.gmail_attachment_ai_fallback_pdf_max_pages,
+        pull_model=settings.gmail_attachment_ai_fallback_pull_model,
+        client=client,
+    )
 
 
 def build_gmail_service(*, account: GmailAccount, settings: Settings):
@@ -720,6 +808,7 @@ def attachment_rows_for_message(
     max_bytes: int,
     text_max_chars: int,
     force_reprocess: bool = False,
+    ai_fallback: AttachmentAiFallbackConfig | None = None,
 ) -> list[dict[str, object]]:
     message_id = str(message.get("id", ""))
     current_parts = attachment_parts_from_message(message)
@@ -740,6 +829,7 @@ def attachment_rows_for_message(
                 synced_at=synced_at,
                 max_bytes=max_bytes,
                 text_max_chars=text_max_chars,
+                ai_fallback=ai_fallback,
             )
         )
 
@@ -809,6 +899,15 @@ def deleted_attachment_row(
         "text": "",
         "text_extraction_status": "deleted",
         "text_extraction_error": "",
+        "ai_provider": "",
+        "ai_model": "",
+        "ai_base_url": "",
+        "ai_prompt_version": "",
+        "ai_prompt_sha256": "",
+        "ai_prompt": "",
+        "ai_source_status": "",
+        "ai_elapsed_ms": 0,
+        "ai_processed_at": EPOCH_UTC,
         "is_deleted": 1,
         "part_json": "{}",
         "synced_at": synced_at,
@@ -845,6 +944,7 @@ def attachment_part_to_row(
     synced_at: datetime,
     max_bytes: int,
     text_max_chars: int,
+    ai_fallback: AttachmentAiFallbackConfig | None = None,
 ) -> dict[str, object]:
     message_id = str(message.get("id", ""))
     headers = header_map(part.get("headers", []))
@@ -895,6 +995,14 @@ def attachment_part_to_row(
                     filename=filename,
                     max_chars=text_max_chars,
                 )
+                extraction = apply_attachment_ai_fallback(
+                    extraction=extraction,
+                    content=content,
+                    mime_type=mime_type,
+                    filename=filename,
+                    max_chars=text_max_chars,
+                    config=ai_fallback,
+                )
 
     sync_version = int(synced_at.timestamp() * 1000)
     return {
@@ -914,6 +1022,15 @@ def attachment_part_to_row(
         "text": extraction.text,
         "text_extraction_status": extraction.status,
         "text_extraction_error": extraction.error,
+        "ai_provider": extraction.ai_provider,
+        "ai_model": extraction.ai_model,
+        "ai_base_url": extraction.ai_base_url,
+        "ai_prompt_version": extraction.ai_prompt_version,
+        "ai_prompt_sha256": extraction.ai_prompt_sha256,
+        "ai_prompt": extraction.ai_prompt,
+        "ai_source_status": extraction.ai_source_status,
+        "ai_elapsed_ms": extraction.ai_elapsed_ms,
+        "ai_processed_at": extraction.ai_processed_at,
         "is_deleted": 0,
         "part_json": attachment_part_json(part),
         "synced_at": synced_at,
@@ -1005,6 +1122,231 @@ def extract_attachment_text(
     if len(text) > max_chars:
         return AttachmentTextExtraction(text=text[:max_chars], status="truncated")
     return AttachmentTextExtraction(text=text, status="ok")
+
+
+def apply_attachment_ai_fallback(
+    *,
+    extraction: AttachmentTextExtraction,
+    content: bytes,
+    mime_type: str,
+    filename: str,
+    max_chars: int,
+    config: AttachmentAiFallbackConfig | None,
+) -> AttachmentTextExtraction:
+    if config is None or extraction.status not in ATTACHMENT_AI_FALLBACK_STATUSES:
+        return extraction
+    try:
+        images = attachment_ai_fallback_images(
+            content=content,
+            mime_type=mime_type,
+            filename=filename,
+            pdf_max_pages=config.pdf_max_pages,
+            timeout_seconds=config.timeout_seconds,
+        )
+        if not images:
+            return extraction
+        started_at = time.monotonic()
+        response_text = call_ollama_attachment_vision_model(
+            images=images,
+            config=config,
+        )
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    except Exception as exc:
+        return replace(
+            extraction,
+            error=truncate_error(
+                "; ".join(
+                    part
+                    for part in (
+                        extraction.error,
+                        f"AI fallback failed: {exc}",
+                    )
+                    if part
+                )
+            ),
+        )
+
+    text = normalize_markdown(format_attachment_ai_response(response_text))
+    if not text:
+        return extraction
+    status = "ai_ok"
+    if len(text) > max_chars:
+        text = text[:max_chars]
+        status = "ai_truncated"
+
+    prompt_sha256 = hashlib.sha256(ATTACHMENT_AI_PROMPT.encode("utf-8")).hexdigest()
+    metadata = {
+        "source_status": extraction.status,
+        "source_error": extraction.error,
+        "provider": config.provider,
+        "model": config.model,
+        "base_url": config.base_url,
+        "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
+        "prompt_sha256": prompt_sha256,
+    }
+    return AttachmentTextExtraction(
+        text=text,
+        status=status,
+        error=truncate_error(json.dumps(metadata, sort_keys=True, separators=(",", ":"))),
+        ai_provider=config.provider,
+        ai_model=config.model,
+        ai_base_url=config.base_url,
+        ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION,
+        ai_prompt_sha256=prompt_sha256,
+        ai_prompt=ATTACHMENT_AI_PROMPT,
+        ai_source_status=extraction.status,
+        ai_elapsed_ms=elapsed_ms,
+        ai_processed_at=datetime.now(tz=UTC),
+    )
+
+
+def attachment_ai_fallback_images(
+    *,
+    content: bytes,
+    mime_type: str,
+    filename: str,
+    pdf_max_pages: int,
+    timeout_seconds: int,
+) -> list[bytes]:
+    extension = Path(filename.lower()).suffix
+    if is_supported_image_attachment(content=content, mime_type=mime_type, extension=extension):
+        return [content]
+    if mime_type == "application/pdf" or extension == ".pdf" or looks_like_pdf(content):
+        if not looks_like_pdf(content):
+            return []
+        return render_pdf_attachment_pages(
+            content=content,
+            max_pages=pdf_max_pages,
+            timeout_seconds=timeout_seconds,
+        )
+    return []
+
+
+def is_supported_image_attachment(*, content: bytes, mime_type: str, extension: str) -> bool:
+    if mime_type in IMAGE_MIME_TYPES or extension in IMAGE_EXTENSIONS:
+        return looks_like_supported_image(content)
+    return looks_like_supported_image(content)
+
+
+def looks_like_supported_image(content: bytes) -> bool:
+    return (
+        content.startswith(b"\x89PNG\r\n\x1a\n")
+        or content.startswith(b"\xff\xd8\xff")
+        or content.startswith(b"RIFF") and content[8:12] == b"WEBP"
+    )
+
+
+def render_pdf_attachment_pages(*, content: bytes, max_pages: int, timeout_seconds: int) -> list[bytes]:
+    pdftoppm = shutil.which("pdftoppm")
+    if not pdftoppm:
+        raise RuntimeError("pdftoppm is not installed; cannot render image-only PDF for AI fallback")
+
+    with tempfile.TemporaryDirectory() as directory:
+        tempdir = Path(directory)
+        input_path = tempdir / "attachment.pdf"
+        output_prefix = tempdir / "page"
+        input_path.write_bytes(content)
+        command = [
+            pdftoppm,
+            "-png",
+            "-r",
+            "160",
+            "-f",
+            "1",
+            "-l",
+            str(max_pages),
+            str(input_path),
+            str(output_prefix),
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"pdftoppm failed: {stderr or result.returncode}")
+        return [path.read_bytes() for path in sorted(tempdir.glob("page-*.png"))]
+
+
+def call_ollama_attachment_vision_model(
+    *,
+    images: Sequence[bytes],
+    config: AttachmentAiFallbackConfig,
+) -> str:
+    options = {
+        "temperature": 0,
+        "num_predict": 512,
+    }
+    if config.client is not None:
+        return config.client.generate(
+            model=config.model,
+            prompt=ATTACHMENT_AI_PROMPT,
+            images=images,
+            options=options,
+            think=False,
+            timeout_seconds=config.timeout_seconds,
+        )
+
+    image_payload = [base64.b64encode(image).decode("ascii") for image in images]
+    payload = {
+        "model": config.model,
+        "prompt": ATTACHMENT_AI_PROMPT,
+        "images": image_payload,
+        "stream": False,
+        "think": False,
+        "options": options,
+    }
+    request = urllib.request.Request(
+        f"{config.base_url}/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+            response_data = json.loads(response.read())
+    except urllib.error.URLError as exc:
+        raise RuntimeError(str(exc)) from exc
+    return str(response_data.get("response", ""))
+
+
+def format_attachment_ai_response(response_text: str) -> str:
+    payload = parse_attachment_ai_json_response(response_text)
+    if not payload:
+        return response_text.strip()
+
+    visible_text = payload.get("visible_text", "")
+    if isinstance(visible_text, list):
+        visible_text_value = "\n".join(str(item) for item in visible_text if str(item).strip())
+    else:
+        visible_text_value = str(visible_text)
+
+    return "\n\n".join(
+        part
+        for part in (
+            "AI attachment extraction",
+            f"Summary: {payload.get('summary', '')}".strip(),
+            f"Likely document type: {payload.get('likely_document_type', '')}".strip(),
+            f"Visible text:\n{visible_text_value}".strip(),
+            f"Useful for search: {payload.get('useful_for_search', '')}".strip(),
+        )
+        if part and not part.endswith(":")
+    )
+
+
+def parse_attachment_ai_json_response(response_text: str) -> dict[str, object] | None:
+    text = response_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
 
 
 def raw_attachment_text(

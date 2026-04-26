@@ -102,6 +102,16 @@ otherwise it falls back to a local process lock.
 Each Gmail asset run also drains up to `GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE`
 already-synced attachment-candidate messages per mailbox. This backfills attachment
 text without advancing Gmail history cursors. Set it to `0` to disable this pass.
+By default, Gmail sync calls an Ollama-compatible vision model for otherwise
+unextractable image attachments and image-only PDFs. Set
+`GMAIL_ATTACHMENT_AI_FALLBACK_ENABLED=false` to disable it.
+The fallback is intended for slow background enrichment; deterministic extraction
+still runs first. Configure it with `GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL`,
+`GMAIL_ATTACHMENT_AI_FALLBACK_MODEL`, `GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS`,
+`GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES`, and
+`GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL`. A reusable Dagster `OllamaResource`
+verifies the model before each Gmail run and pulls it when missing unless model
+pulls are disabled.
 
 Slack sync splits freshness, coverage, and metadata into separate schedules. The
 `slack_workspace_sync_every_minute` schedule keeps recent messages fresh every minute.
@@ -187,6 +197,9 @@ The sync creates and maintains:
 Attachments are stored in `gmail_attachments`, keyed by `(account, message_id, part_id, filename)`.
 The sync stores attachment metadata, content hashes, text extraction status, and extracted text for searchable formats.
 Supported text extraction includes plain text-like files, HTML, PDF, ZIP contents, and Office Open XML files such as `.docx`, `.pptx`, and `.xlsx`.
+When AI fallback is enabled, successful model output is stored with `text_extraction_status = 'ai_ok'`
+or `ai_truncated`, alongside the provider, model, base URL, exact prompt, prompt hash,
+prompt version, source extraction status, elapsed time, and processing timestamp.
 Attachments that cannot be extracted still get metadata rows with `text_extraction_status`.
 
 Use `gmail_attachment_search` to search attachment text with surrounding message context:

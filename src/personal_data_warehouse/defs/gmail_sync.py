@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from dagster import (
     DefaultScheduleStatus,
     Definitions,
@@ -11,21 +13,79 @@ from dagster import (
     definitions,
     schedule,
 )
+from dotenv import load_dotenv
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
-from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.gmail_sync import GmailSyncRunner
+from personal_data_warehouse.config import (
+    DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL,
+    DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS,
+    load_settings,
+)
+from personal_data_warehouse.gmail_sync import (
+    GmailSyncRunner,
+    attachment_ai_fallback_config_from_settings,
+)
+from personal_data_warehouse.ollama_resource import OllamaResource
 from personal_data_warehouse.schedule_guards import skip_if_job_active
+
+
+def ollama_resource_from_env() -> OllamaResource:
+    load_dotenv()
+    return OllamaResource(
+        base_url=os.getenv("GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL")
+        or DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL,
+        request_timeout_seconds=int(
+            os.getenv(
+                "GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS",
+                str(DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS),
+            )
+        ),
+    )
+
+
+def prepare_attachment_ai_fallback(*, settings, ollama: OllamaResource, logger):
+    config = attachment_ai_fallback_config_from_settings(settings, client=ollama)
+    if config is None:
+        logger.info("Gmail attachment AI fallback is disabled")
+        return None
+    try:
+        ollama.ensure_model(config.model, pull=config.pull_model)
+    except Exception as exc:
+        logger.warning(
+            "Gmail attachment AI fallback is enabled but %s model %s is not ready at %s: %s",
+            config.provider,
+            config.model,
+            config.base_url,
+            exc,
+        )
+        return None
+    logger.info(
+        "Gmail attachment AI fallback is ready via %s model %s at %s",
+        config.provider,
+        config.model,
+        config.base_url,
+    )
+    return config
 
 
 @asset(
     group_name="gmail",
     retry_policy=RetryPolicy(max_retries=3, delay=30),
 )
-def gmail_mailbox_sync(context) -> MaterializeResult:
+def gmail_mailbox_sync(context, ollama: OllamaResource) -> MaterializeResult:
     settings = load_settings(require_gmail_client_secrets=False)
+    attachment_ai_fallback = prepare_attachment_ai_fallback(
+        settings=settings,
+        ollama=ollama,
+        logger=context.log,
+    )
     warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
-    summaries = GmailSyncRunner(settings=settings, warehouse=warehouse, logger=context.log).sync_all()
+    summaries = GmailSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=context.log,
+        attachment_ai_fallback=attachment_ai_fallback,
+    ).sync_all()
 
     return MaterializeResult(
         metadata={
@@ -82,4 +142,5 @@ def defs() -> Definitions:
         assets=[gmail_mailbox_sync],
         jobs=[gmail_mailbox_sync_job],
         schedules=[gmail_mailbox_sync_every_minute],
+        resources={"ollama": ollama_resource_from_env()},
     )

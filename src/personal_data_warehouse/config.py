@@ -13,6 +13,11 @@ DEFAULT_GMAIL_PAGE_SIZE = 500
 DEFAULT_GMAIL_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_GMAIL_ATTACHMENT_TEXT_MAX_CHARS = 1_000_000
 DEFAULT_GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE = 100
+DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL = "http://127.0.0.1:11435"
+DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_MODEL = "gemma4:e2b"
+DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS = 120
+DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES = 1
+DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL = True
 DEFAULT_CALENDAR_PAGE_SIZE = 2500
 DEFAULT_SLACK_PAGE_SIZE = 200
 DEFAULT_SLACK_LOOKBACK_DAYS = 14
@@ -86,6 +91,12 @@ class Settings:
     calendar_scopes: tuple[str, ...] = (CALENDAR_READONLY_SCOPE,)
     calendar_page_size: int = DEFAULT_CALENDAR_PAGE_SIZE
     calendar_force_full_sync: bool = False
+    gmail_attachment_ai_fallback_enabled: bool = True
+    gmail_attachment_ai_fallback_base_url: str = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL
+    gmail_attachment_ai_fallback_model: str = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_MODEL
+    gmail_attachment_ai_fallback_timeout_seconds: int = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS
+    gmail_attachment_ai_fallback_pdf_max_pages: int = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES
+    gmail_attachment_ai_fallback_pull_model: bool = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL
 
     def account_for_email(self, email_address: str) -> GmailAccount:
         normalized = email_address.strip().lower()
@@ -164,6 +175,24 @@ def load_settings(
     if gmail_attachment_backfill_batch_size < 0:
         raise ValueError("GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE must be greater than or equal to 0")
 
+    gmail_attachment_ai_fallback_timeout_seconds = int(
+        os.getenv(
+            "GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS",
+            str(DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS),
+        )
+    )
+    if gmail_attachment_ai_fallback_timeout_seconds < 1:
+        raise ValueError("GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS must be at least 1")
+
+    gmail_attachment_ai_fallback_pdf_max_pages = int(
+        os.getenv(
+            "GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES",
+            str(DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES),
+        )
+    )
+    if gmail_attachment_ai_fallback_pdf_max_pages < 1:
+        raise ValueError("GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES must be at least 1")
+
     calendar_page_size = int(os.getenv("CALENDAR_PAGE_SIZE", str(DEFAULT_CALENDAR_PAGE_SIZE)))
     if calendar_page_size < 1 or calendar_page_size > 2500:
         raise ValueError("CALENDAR_PAGE_SIZE must be between 1 and 2500")
@@ -204,6 +233,20 @@ def load_settings(
         gmail_attachment_max_bytes=gmail_attachment_max_bytes,
         gmail_attachment_text_max_chars=gmail_attachment_text_max_chars,
         gmail_attachment_backfill_batch_size=gmail_attachment_backfill_batch_size,
+        gmail_attachment_ai_fallback_enabled=_parse_bool_env(
+            os.getenv("GMAIL_ATTACHMENT_AI_FALLBACK_ENABLED"),
+            True,
+        ),
+        gmail_attachment_ai_fallback_base_url=os.getenv("GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL")
+        or DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL,
+        gmail_attachment_ai_fallback_model=os.getenv("GMAIL_ATTACHMENT_AI_FALLBACK_MODEL")
+        or DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_MODEL,
+        gmail_attachment_ai_fallback_timeout_seconds=gmail_attachment_ai_fallback_timeout_seconds,
+        gmail_attachment_ai_fallback_pdf_max_pages=gmail_attachment_ai_fallback_pdf_max_pages,
+        gmail_attachment_ai_fallback_pull_model=_parse_bool_env(
+            os.getenv("GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL"),
+            DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL,
+        ),
         calendar_accounts=calendar_accounts,
         calendar_scopes=(CALENDAR_READONLY_SCOPE,),
         calendar_page_size=calendar_page_size,
