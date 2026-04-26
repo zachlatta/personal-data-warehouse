@@ -7,7 +7,7 @@ run_coordinator:
   module: dagster._core.run_coordinator
   class: QueuedRunCoordinator
   config:
-    max_concurrent_runs: 4
+    max_concurrent_runs: 8
     dequeue_interval_seconds: 5
     dequeue_use_threads: true
     dequeue_num_workers: 4
