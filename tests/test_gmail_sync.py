@@ -207,6 +207,23 @@ def test_execute_gmail_request_retries_transient_backend_errors() -> None:
     sleep.assert_called_once_with(1)
 
 
+def test_execute_gmail_request_retries_transient_network_errors() -> None:
+    attempts = 0
+
+    def flaky_request() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise BrokenPipeError("broken pipe")
+        return "ok"
+
+    with patch("personal_data_warehouse.gmail_sync.time.sleep") as sleep:
+        assert execute_gmail_request(flaky_request) == "ok"
+
+    assert attempts == 2
+    sleep.assert_called_once_with(1)
+
+
 def test_extract_message_bodies_walks_nested_parts() -> None:
     payload = {
         "mimeType": "multipart/alternative",
@@ -553,6 +570,62 @@ def test_extract_attachment_text_supports_nested_zip_contents() -> None:
     assert "## inner.zip" in extraction.text
     assert "## nested.txt" in extraction.text
     assert "Nested contract text" in extraction.text
+
+
+def test_extract_attachment_text_marks_encrypted_pdf() -> None:
+    from pypdf import PdfWriter
+
+    buffer = BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.encrypt("secret")
+    writer.write(buffer)
+
+    extraction = extract_attachment_text(
+        content=buffer.getvalue(),
+        mime_type="application/pdf",
+        filename="tax.pdf",
+        max_chars=1000,
+    )
+
+    assert extraction.status == "encrypted"
+    assert "PDF is encrypted" in extraction.error
+
+
+def test_extract_attachment_text_marks_mislabeled_pdf_as_unsupported() -> None:
+    extraction = extract_attachment_text(
+        content=b"\x89PNG\r\n\x1a\n",
+        mime_type="image/png",
+        filename="printFriendly.pdf",
+        max_chars=1000,
+    )
+
+    assert extraction.status == "unsupported"
+    assert "does not contain PDF data" in extraction.error
+
+
+def test_extract_attachment_text_marks_invalid_office_document() -> None:
+    extraction = extract_attachment_text(
+        content=b"\xd0\xcf\x11\xe0\x00not-open-xml",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename="form.docx",
+        max_chars=1000,
+    )
+
+    assert extraction.status == "invalid_office_document"
+    assert "not a valid zip container" in extraction.error
+
+
+def test_extract_attachment_text_marks_invalid_zip_archive() -> None:
+    extraction = extract_attachment_text(
+        content=b"\x00not-a-zip",
+        mime_type="application/zip",
+        filename="archive.zip",
+        max_chars=1000,
+    )
+
+    assert extraction.status == "invalid_archive"
+    assert "not a valid archive" in extraction.error
 
 
 def test_extract_attachment_text_truncates_large_text() -> None:

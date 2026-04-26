@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import ssl
 from email.utils import getaddresses, parseaddr
 from io import BytesIO
 from pathlib import Path
@@ -25,6 +26,7 @@ from google.oauth2.credentials import Credentials
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from markdownify import markdownify as html_to_markdown
 import warnings
+import zlib
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse, SyncState
 from personal_data_warehouse.config import GmailAccount, Settings, env_slug
@@ -61,6 +63,13 @@ class AttachmentTextExtraction:
     text: str
     status: str
     error: str = ""
+
+
+class AttachmentTextUnavailable(Exception):
+    def __init__(self, *, status: str, error: str) -> None:
+        super().__init__(error)
+        self.status = status
+        self.error = error
 
 
 AttachmentKey = tuple[str, str, str]
@@ -983,6 +992,8 @@ def extract_attachment_text(
             filename=filename,
             max_chars=max_chars,
         )
+    except AttachmentTextUnavailable as exc:
+        return AttachmentTextExtraction(text="", status=exc.status, error=truncate_error(exc.error))
     except Exception as exc:
         return AttachmentTextExtraction(text="", status="error", error=truncate_error(str(exc)))
     if text is None:
@@ -1090,13 +1101,46 @@ def html_attachment_text(content: bytes) -> str:
 
 
 def pdf_attachment_text(content: bytes) -> str:
-    from pypdf import PdfReader
+    if not looks_like_pdf(content):
+        if looks_like_text(content):
+            return decode_text_bytes(content)
+        raise AttachmentTextUnavailable(
+            status="unsupported",
+            error="attachment is labeled as a PDF but does not contain PDF data",
+        )
 
-    reader = PdfReader(BytesIO(content))
-    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    from pypdf import PdfReader
+    from pypdf.errors import FileNotDecryptedError, PdfReadError, PdfStreamError
+
+    try:
+        reader = PdfReader(BytesIO(content))
+        if reader.is_encrypted:
+            decrypt_result = reader.decrypt("")
+            if decrypt_result == 0:
+                raise AttachmentTextUnavailable(
+                    status="encrypted",
+                    error="PDF is encrypted and could not be decrypted with an empty password",
+                )
+        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    except AttachmentTextUnavailable:
+        raise
+    except FileNotDecryptedError as exc:
+        raise AttachmentTextUnavailable(status="encrypted", error=str(exc)) from exc
+    except PdfReadError as exc:
+        raise AttachmentTextUnavailable(status="invalid_pdf", error=str(exc)) from exc
+    except PdfStreamError as exc:
+        raise AttachmentTextUnavailable(status="invalid_pdf", error=str(exc)) from exc
 
 
 def office_open_xml_attachment_text(content: bytes) -> str:
+    if not zipfile.is_zipfile(BytesIO(content)):
+        if looks_like_text(content):
+            return decode_text_bytes(content)
+        raise AttachmentTextUnavailable(
+            status="invalid_office_document",
+            error="Office Open XML attachment is not a valid zip container",
+        )
+
     text_parts: list[str] = []
     with zipfile.ZipFile(BytesIO(content)) as archive:
         for name in sorted(archive.namelist()):
@@ -1115,14 +1159,33 @@ def office_open_xml_attachment_text(content: bytes) -> str:
 def zip_attachment_text(*, content: bytes, max_chars: int, archive_depth: int = 0) -> str | None:
     if archive_depth > ZIP_MAX_RECURSION_DEPTH:
         return None
+    if not zipfile.is_zipfile(BytesIO(content)):
+        if looks_like_text(content):
+            return decode_text_bytes(content)
+        raise AttachmentTextUnavailable(status="invalid_archive", error="ZIP attachment is not a valid archive")
 
     text_parts: list[str] = []
     total_uncompressed_bytes = 0
-    with zipfile.ZipFile(BytesIO(content)) as archive:
-        for member_index, info in enumerate(archive.infolist()):
+    read_errors: list[str] = []
+    encrypted_members = 0
+    try:
+        archive = zipfile.ZipFile(BytesIO(content))
+    except zipfile.BadZipFile as exc:
+        raise AttachmentTextUnavailable(status="invalid_archive", error=str(exc)) from exc
+
+    with archive:
+        try:
+            infos = archive.infolist()
+        except (EOFError, RuntimeError, zipfile.BadZipFile, zlib.error) as exc:
+            raise AttachmentTextUnavailable(status="invalid_archive", error=str(exc)) from exc
+
+        for member_index, info in enumerate(infos):
             if member_index >= ZIP_MAX_MEMBERS or len("\n\n".join(text_parts)) >= max_chars:
                 break
-            if info.is_dir() or info.flag_bits & 0x1:
+            if info.is_dir():
+                continue
+            if info.flag_bits & 0x1:
+                encrypted_members += 1
                 continue
             if info.file_size > ZIP_MAX_MEMBER_BYTES:
                 continue
@@ -1133,7 +1196,8 @@ def zip_attachment_text(*, content: bytes, max_chars: int, archive_depth: int = 
             member_name = info.filename
             try:
                 member_content = archive.read(info)
-            except RuntimeError:
+            except (EOFError, RuntimeError, zipfile.BadZipFile, zlib.error) as exc:
+                read_errors.append(f"{member_name}: {exc}")
                 continue
 
             member_text = raw_attachment_text(
@@ -1156,6 +1220,16 @@ def zip_attachment_text(*, content: bytes, max_chars: int, archive_depth: int = 
             text_parts.append(section[:remaining_chars])
 
     if not text_parts:
+        if read_errors:
+            raise AttachmentTextUnavailable(
+                status="invalid_archive",
+                error="Could not read text from ZIP members: " + "; ".join(read_errors[:5]),
+            )
+        if encrypted_members:
+            raise AttachmentTextUnavailable(
+                status="encrypted",
+                error=f"ZIP contains {encrypted_members} encrypted member(s)",
+            )
         return None
     return "\n\n".join(text_parts)
 
@@ -1214,6 +1288,10 @@ def looks_like_text(content: bytes) -> bool:
     except UnicodeDecodeError:
         return False
     return True
+
+
+def looks_like_pdf(content: bytes) -> bool:
+    return content.lstrip()[:5] == b"%PDF-"
 
 
 def attachment_part_json(part: Mapping[str, object]) -> str:
@@ -1409,6 +1487,9 @@ def _http_status(exc: HttpError) -> int | None:
     return getattr(exc.resp, "status", None)
 
 
+TRANSIENT_GMAIL_EXCEPTIONS = (ConnectionError, TimeoutError, OSError, ssl.SSLError)
+
+
 def execute_gmail_request(request_fn: Callable[[], T], *, max_attempts: int = 5) -> T:
     for attempt in range(1, max_attempts + 1):
         try:
@@ -1416,6 +1497,10 @@ def execute_gmail_request(request_fn: Callable[[], T], *, max_attempts: int = 5)
         except HttpError as exc:
             status = _http_status(exc)
             if status not in {429, 500, 502, 503, 504} or attempt == max_attempts:
+                raise
+            time.sleep(min(2 ** (attempt - 1), 30))
+        except TRANSIENT_GMAIL_EXCEPTIONS:
+            if attempt == max_attempts:
                 raise
             time.sleep(min(2 ** (attempt - 1), 30))
     raise RuntimeError("unreachable Gmail retry state")
