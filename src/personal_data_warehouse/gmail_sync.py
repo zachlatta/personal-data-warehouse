@@ -48,18 +48,29 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v5"
-ATTACHMENT_AI_PROMPT = """Analyze this real Gmail attachment image.
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v6"
+ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
 
-Return concise JSON with these keys:
-- is_useful: true if the image may contain meaningful user-visible information worth indexing. Use false only when the image is clearly blank, decorative, a tracking pixel, a logo-only image, UI chrome, or an attachment placeholder with no useful content. Receipts, invoices, photos, charts, screenshots of documents, and screenshots containing readable content are useful. Generic words like "Gmail attachment" alone are not useful. If unsure, use true.
-- scene_summary: one sentence describing the whole image, including people, setting, activity, important objects, and visual context. Do not summarize only the largest text region.
-- visible_text: readable text visible anywhere in the image, preserving important names, dates, amounts, addresses, headings, labels, and identifiers.
-- likely_document_type: a short label such as receipt, invoice, chart, photo, official letter, form, screenshot, or unknown.
-- document_context: a short explanation of what the attachment appears to be in context, such as classroom presentation photo, event flyer, product screenshot, scanned receipt, handwritten note, or unknown.
-- search_keywords: concise search keywords, named entities, topics, settings, activities, and visible text phrases useful for finding this later.
+Return only concise JSON with this schema:
+{
+  "is_useful": true,
+  "document_type": "logo|slide|screenshot|ad|poster|photo|chart|illustration|receipt|invoice|form|unknown",
+  "summary": "one faithful sentence about the whole image",
+  "visible_text": ["exact readable text chunks from anywhere in the image"],
+  "entities": ["brands, orgs, people, products, places"],
+  "search_keywords": ["specific useful search terms"],
+  "uncertainties": ["short notes for hard-to-read text"]
+}
 
-Describe the full scene even when there is prominent text. If text is unclear, say so. Do not invent details."""
+Use arrays for visible_text, entities, search_keywords, and uncertainties, even when there is only one item.
+
+OCR first: extract titles, headings, bullets, labels, legends, names, dates, orgs, brands, numbers, and calls to action before writing a caption. For charts, include axis labels, legends, and visible values. For logos, extract the organization or brand name. For photos, briefly describe people, setting, activity, and objects, and extract readable signs/posters/slides.
+
+Logos and wordmarks are useful: set document_type to "logo", put the exact brand text in visible_text, and put the normalized brand/org name in entities. Ads, banners, posters, screenshots, charts, and slides are useful when they contain readable text or meaningful visual context.
+
+Never call the image a Gmail placeholder or Gmail interface unless Gmail UI or a literal Gmail attachment placeholder is visible. Do not infer visible text from the filename. Preserve acronyms and capitalization in OCR text, such as AI, DoD, UC Berkeley, CLTC, and FAST COMPANY. If text is partially uncertain, include your best reading and add "(uncertain)" or an uncertainties note. Avoid generic keywords such as image, attachment, photo, and Gmail unless they are literally visible or specifically useful.
+
+Use false for is_useful only for blank/decorative/tracking images or literal placeholders with no useful visible text. Do not invent details."""
 ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
 ATTACHMENT_AI_MIN_IMAGE_BYTES = 16 * 1024
 IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
@@ -1366,22 +1377,28 @@ def format_attachment_ai_response(response_text: str) -> str:
     if not attachment_ai_response_is_useful(payload):
         return ""
 
-    scene_summary = attachment_ai_response_field(payload, "scene_summary", "summary")
-    visible_text = payload.get("visible_text", "")
-    visible_text_value = attachment_ai_response_text(visible_text, separator="\n")
-    likely_document_type = attachment_ai_response_field(payload, "likely_document_type")
+    document_type = attachment_ai_response_field(payload, "document_type", "likely_document_type")
+    summary = attachment_ai_response_field(payload, "summary", "scene_summary")
     document_context = attachment_ai_response_field(payload, "document_context")
-    search_keywords = attachment_ai_response_field(payload, "search_keywords", "useful_for_search")
+    visible_text_value = attachment_ai_response_text(payload.get("visible_text", ""), separator="\n")
+    entities = attachment_ai_response_text(payload.get("entities", ""), separator=", ")
+    search_keywords = attachment_ai_response_text(
+        attachment_ai_response_first(payload, "search_keywords", "useful_for_search"),
+        separator=", ",
+    )
+    uncertainties = attachment_ai_response_text(payload.get("uncertainties", ""), separator="\n")
 
     return "\n\n".join(
         part
         for part in (
             "AI attachment extraction",
-            f"Scene: {scene_summary}".strip(),
-            f"Likely document type: {likely_document_type}".strip(),
+            f"Document type: {document_type}".strip(),
+            f"Summary: {summary}".strip(),
             f"Document context: {document_context}".strip(),
             f"Visible text:\n{visible_text_value}".strip(),
+            f"Entities: {entities}".strip(),
             f"Search keywords: {search_keywords}".strip(),
+            f"Uncertainties:\n{uncertainties}".strip(),
         )
         if part and not part.endswith(":")
     )
@@ -1421,12 +1438,15 @@ def attachment_ai_response_is_useful(payload: Mapping[str, object]) -> bool:
 def attachment_ai_response_is_generic_placeholder(payload: Mapping[str, object]) -> bool:
     summary = attachment_ai_response_field(payload, "scene_summary", "summary")
     visible_text = attachment_ai_response_text(payload.get("visible_text", ""))
-    likely_document_type = attachment_ai_response_field(payload, "likely_document_type")
+    likely_document_type = attachment_ai_response_field(payload, "document_type", "likely_document_type")
     document_context = attachment_ai_response_field(payload, "document_context")
-    useful_for_search = attachment_ai_response_field(payload, "search_keywords", "useful_for_search")
+    entities = attachment_ai_response_text(payload.get("entities", ""))
+    useful_for_search = attachment_ai_response_text(
+        attachment_ai_response_first(payload, "search_keywords", "useful_for_search")
+    )
     combined = " ".join(
         part
-        for part in (summary, visible_text, likely_document_type, document_context, useful_for_search)
+        for part in (summary, visible_text, likely_document_type, document_context, entities, useful_for_search)
         if part
     ).lower()
     if not combined:
@@ -1434,10 +1454,30 @@ def attachment_ai_response_is_generic_placeholder(payload: Mapping[str, object])
     if not re.search(r"\b(placeholder|no discernible content|no useful content|generic gmail attachment)\b", combined):
         return False
 
-    searchable = " ".join(part for part in (visible_text, useful_for_search) if part).lower()
+    searchable = " ".join(part for part in (visible_text, entities, useful_for_search) if part).lower()
     searchable_words = set(re.findall(r"[a-z0-9]+", searchable))
-    generic_words = {"gmail", "attachment", "image", "placeholder", "unknown", "none", "no", "content"}
+    generic_words = {
+        "attachment",
+        "blank",
+        "content",
+        "decorative",
+        "generic",
+        "gmail",
+        "image",
+        "none",
+        "no",
+        "placeholder",
+        "unknown",
+    }
     return searchable_words <= generic_words
+
+
+def attachment_ai_response_first(payload: Mapping[str, object], *names: str) -> object:
+    for name in names:
+        value = payload.get(name, "")
+        if attachment_ai_response_text(value):
+            return value
+    return ""
 
 
 def attachment_ai_response_field(payload: Mapping[str, object], *names: str) -> str:
@@ -1456,13 +1496,16 @@ def attachment_ai_response_text(value: object, *, separator: str = " ") -> str:
 
 def attachment_ai_response_has_indexable_content(payload: Mapping[str, object]) -> bool:
     values = [
+        payload.get("document_type", ""),
         payload.get("scene_summary", ""),
         payload.get("summary", ""),
         payload.get("visible_text", ""),
         payload.get("likely_document_type", ""),
         payload.get("document_context", ""),
+        payload.get("entities", ""),
         payload.get("search_keywords", ""),
         payload.get("useful_for_search", ""),
+        payload.get("uncertainties", ""),
     ]
     for value in values:
         text = attachment_ai_response_text(value)

@@ -1,0 +1,153 @@
+#!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
+import base64
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import time
+import urllib.request
+
+from personal_data_warehouse.gmail_sync import (
+    ATTACHMENT_AI_PROMPT,
+    ATTACHMENT_AI_PROMPT_VERSION,
+    format_attachment_ai_response,
+    parse_attachment_ai_json_response,
+)
+from personal_data_warehouse.gmail_attachment_ai_eval import (
+    PRODUCTION_RUBRIC_CASES,
+    score_attachment_ai_results,
+)
+
+
+@dataclass(frozen=True)
+class EvalSample:
+    sample_id: int
+    filename: str
+    image_paths: list[str]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run Gmail attachment AI fallback prompt against local samples.")
+    parser.add_argument("--manifest", default=".cache/gmail-ai-eval/manifest.json")
+    parser.add_argument("--out", default=".cache/gmail-ai-eval/results.json")
+    parser.add_argument("--base-url", default="http://127.0.0.1:11435")
+    parser.add_argument("--model", default="gemma4:e2b")
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--timeout", type=int, default=90)
+    parser.add_argument("--write-production-rubric", default="")
+    parser.add_argument("--score-results", default="")
+    parser.add_argument("--rubric", default="")
+    args = parser.parse_args()
+
+    if args.write_production_rubric:
+        Path(args.write_production_rubric).write_text(
+            json.dumps({"cases": PRODUCTION_RUBRIC_CASES}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return
+
+    if args.score_results:
+        results_payload = json.loads(Path(args.score_results).read_text(encoding="utf-8"))
+        rubric_payload = (
+            json.loads(Path(args.rubric).read_text(encoding="utf-8"))
+            if args.rubric
+            else {"cases": PRODUCTION_RUBRIC_CASES}
+        )
+        scored = score_attachment_ai_results(
+            results_payload.get("results", []),
+            rubric_payload.get("cases", []),
+        )
+        print(json.dumps(scored, indent=2, ensure_ascii=False))
+        return
+
+    manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    samples = [
+        EvalSample(
+            sample_id=int(sample["sample_id"]),
+            filename=str(sample["filename"]),
+            image_paths=[str(path) for path in sample["image_paths"]],
+        )
+        for sample in manifest.get("samples", [])
+    ]
+    if args.limit > 0:
+        samples = samples[: args.limit]
+
+    results = []
+    for sample in samples:
+        started = time.monotonic()
+        response_text = generate(
+            base_url=args.base_url.rstrip("/"),
+            model=args.model,
+            prompt=ATTACHMENT_AI_PROMPT,
+            image_paths=sample.image_paths,
+            timeout=args.timeout,
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        parsed = parse_attachment_ai_json_response(response_text)
+        formatted = format_attachment_ai_response(response_text)
+        result = {
+            "sample_id": sample.sample_id,
+            "filename": sample.filename,
+            "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
+            "model": args.model,
+            "elapsed_ms": elapsed_ms,
+            "raw_response": response_text,
+            "parsed": parsed,
+            "formatted_text": formatted,
+            "manual_score": None,
+            "notes": "",
+        }
+        results.append(result)
+        print(
+            json.dumps(
+                {
+                    "sample_id": sample.sample_id,
+                    "filename": sample.filename,
+                    "elapsed_ms": elapsed_ms,
+                    "formatted_text": formatted[:700],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    Path(args.out).write_text(
+        json.dumps(
+            {
+                "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
+                "prompt": ATTACHMENT_AI_PROMPT,
+                "model": args.model,
+                "results": results,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def generate(*, base_url: str, model: str, prompt: str, image_paths: list[str], timeout: int) -> str:
+    images = [base64.b64encode(Path(path).read_bytes()).decode("ascii") for path in image_paths]
+    request = urllib.request.Request(
+        f"{base_url}/api/generate",
+        data=json.dumps(
+            {
+                "model": model,
+                "prompt": prompt,
+                "images": images,
+                "stream": False,
+                "think": False,
+                "format": "json",
+                "options": {"temperature": 0, "num_predict": 768},
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read())
+    return str(payload.get("response", ""))
+
+
+if __name__ == "__main__":
+    main()

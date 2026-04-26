@@ -648,11 +648,72 @@ def test_attachment_rows_for_message_ai_fallback_keeps_scene_and_visible_text() 
 
     row = rows[0]
     assert row["text_extraction_status"] == "ai_ok"
-    assert "Scene: A woman presenting to children in a classroom" in row["text"]
+    assert "Summary: A woman presenting to children in a classroom" in row["text"]
     assert "Visible text:" in row["text"]
     assert "TO SHARE OR NOT TO SHARE?" in row["text"]
     assert "Document context: classroom presentation photo" in row["text"]
     assert row["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
+
+
+def test_attachment_rows_for_message_ai_fallback_formats_ocr_first_schema() -> None:
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"fake logo image bytes" * 1000)
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "ATT00001.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+
+    ollama = FakeOllamaResource(
+        json.dumps(
+            {
+                "is_useful": True,
+                "document_type": "logo",
+                "summary": "Common Sense Media logo with a green checkmark icon.",
+                "visible_text": ["common sense media"],
+                "entities": ["Common Sense Media"],
+                "search_keywords": ["Common Sense Media", "green checkmark logo"],
+                "uncertainties": [],
+            }
+        )
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(image_content) + 1,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+    )
+
+    row = rows[0]
+    assert row["text_extraction_status"] == "ai_ok"
+    assert "Document type: logo" in row["text"]
+    assert "Summary: Common Sense Media logo" in row["text"]
+    assert "Visible text:\ncommon sense media" in row["text"]
+    assert "Entities: Common Sense Media" in row["text"]
+    assert "Search keywords: Common Sense Media, green checkmark logo" in row["text"]
 
 
 def test_attachment_rows_for_message_records_ai_empty_for_non_useful_images() -> None:
