@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -13,19 +13,26 @@ import (
 )
 
 func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	slog.SetDefault(logger)
+
 	cfg, err := config.LoadFromEnv(os.Getenv)
 	if err != nil {
-		log.Fatal(err)
+		logger.Error("configuration failed", "error", err)
+		os.Exit(1)
 	}
+	logger.Info("configuration loaded", "addr", cfg.Addr, "base_url", cfg.BaseURL, "max_rows", cfg.MaxRows, "max_field_chars", cfg.MaxFieldChars, "query_timeout", cfg.QueryTimeout)
 	runner, err := query.NewClickHouseRunner(cfg.ClickHouseURL, cfg.QueryTimeout)
 	if err != nil {
-		log.Fatalf("connect to ClickHouse: %v", err)
+		logger.Error("connect to ClickHouse failed", "error", err)
+		os.Exit(1)
 	}
 	defer runner.Close()
 
 	authSvc := pdwauth.NewService([]byte(cfg.SecretToken), time.Now)
-	log.Printf("personal data warehouse MCP server listening on %s", cfg.Addr)
+	logger.Info("personal data warehouse MCP server listening", "addr", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, server.NewMux(cfg, authSvc, runner)); err != nil {
-		log.Fatal(err)
+		logger.Error("HTTP server stopped", "error", err)
+		os.Exit(1)
 	}
 }

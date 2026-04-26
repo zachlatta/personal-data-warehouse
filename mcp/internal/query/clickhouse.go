@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	clickhouse "github.com/ClickHouse/clickhouse-go/v2"
@@ -15,8 +16,12 @@ type ClickHouseRunner struct {
 }
 
 func NewClickHouseRunner(clickhouseURL string, timeout time.Duration) (*ClickHouseRunner, error) {
+	logger := slog.Default().With("component", "clickhouse")
+	started := time.Now()
+	logger.Info("opening ClickHouse connection", "timeout", timeout)
 	opts, err := clickhouse.ParseDSN(clickhouseURL)
 	if err != nil {
+		logger.Error("ClickHouse DSN parse failed", "error", err)
 		return nil, err
 	}
 	if timeout > 0 {
@@ -31,8 +36,10 @@ func NewClickHouseRunner(clickhouseURL string, timeout time.Duration) (*ClickHou
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
+		logger.Error("ClickHouse ping failed", "error", err, "duration", time.Since(started))
 		return nil, err
 	}
+	logger.Info("ClickHouse connection ready", "duration", time.Since(started))
 	return &ClickHouseRunner{db: db}, nil
 }
 
@@ -40,18 +47,29 @@ func (r *ClickHouseRunner) Close() error {
 	if r == nil || r.db == nil {
 		return nil
 	}
-	return r.db.Close()
+	err := r.db.Close()
+	if err != nil {
+		slog.Default().With("component", "clickhouse").Error("ClickHouse close failed", "error", err)
+	} else {
+		slog.Default().With("component", "clickhouse").Info("ClickHouse connection closed")
+	}
+	return err
 }
 
 func (r *ClickHouseRunner) Query(ctx context.Context, statement string, maxRows int) (RawResult, error) {
+	logger := slog.Default().With("component", "clickhouse")
+	started := time.Now()
+	logger.DebugContext(ctx, "ClickHouse query dispatch", "sql", statement, "max_rows", maxRows)
 	rows, err := r.db.QueryContext(ctx, statement)
 	if err != nil {
+		logger.ErrorContext(ctx, "ClickHouse query dispatch failed", "sql", statement, "error", err, "duration", time.Since(started))
 		return RawResult{}, err
 	}
 	defer rows.Close()
 
 	columns, err := rows.Columns()
 	if err != nil {
+		logger.ErrorContext(ctx, "ClickHouse columns read failed", "sql", statement, "error", err, "duration", time.Since(started))
 		return RawResult{}, err
 	}
 	result := RawResult{Columns: columns}
@@ -65,6 +83,7 @@ func (r *ClickHouseRunner) Query(ctx context.Context, statement string, maxRows 
 			ptrs[i] = &values[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
+			logger.ErrorContext(ctx, "ClickHouse row scan failed", "sql", statement, "error", err, "duration", time.Since(started))
 			return RawResult{}, err
 		}
 		row := make(map[string]any, len(columns))
@@ -74,8 +93,10 @@ func (r *ClickHouseRunner) Query(ctx context.Context, statement string, maxRows 
 		result.Rows = append(result.Rows, row)
 	}
 	if err := rows.Err(); err != nil {
+		logger.ErrorContext(ctx, "ClickHouse rows iteration failed", "sql", statement, "error", err, "duration", time.Since(started))
 		return RawResult{}, err
 	}
+	logger.DebugContext(ctx, "ClickHouse query returned", "sql", statement, "rows", len(result.Rows), "columns", len(result.Columns), "duration", time.Since(started))
 	return result, nil
 }
 

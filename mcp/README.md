@@ -72,9 +72,9 @@ MCP_BASE_URL=https://your-public-coolify-domain
 
 Do not reuse the root `Dockerfile`; that one runs Dagster.
 
-## Tool
+## Tools
 
-The server exposes one MCP tool:
+The server exposes a query MCP tool:
 
 ```json
 {
@@ -88,6 +88,17 @@ The server exposes one MCP tool:
 Only read-only statements are allowed: `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `DESC`, and `EXPLAIN`.
 
 Each statement returns CSV text to keep tool responses compact. Results are automatically capped by `MCP_MAX_ROWS`. Long string fields are truncated to `MCP_MAX_FIELD_CHARS`. When truncation happens, the response includes a second small truncation CSV with instructions for fetching the full field with `length(column)` and chunked `substring(column, start, size)` queries.
+
+It also exposes a schema overview MCP tool:
+
+```json
+{
+  "name": "schema_overview",
+  "input": {}
+}
+```
+
+`schema_overview` returns one schema CSV with `table`, `column`, `type`, `default_type`, `default_expression`, and `comment` columns, then one sample CSV per table with up to three rows from that table. Sample rows use the same long-field truncation metadata as normal query results. The schema map only uses `SHOW TABLES` and `DESCRIBE TABLE` against the default database, so it does not require access to ClickHouse `system.*` metadata tables.
 
 ## Verify
 

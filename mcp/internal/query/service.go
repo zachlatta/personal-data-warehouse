@@ -6,13 +6,16 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
 type Options struct {
 	MaxRows       int
 	MaxFieldChars int
+	Logger        *slog.Logger
 }
 
 type Runner interface {
@@ -27,7 +30,10 @@ type RawResult struct {
 type Service struct {
 	runner Runner
 	opts   Options
+	logger *slog.Logger
 }
+
+const schemaSampleRows = 3
 
 type Response struct {
 	Results []Result `json:"results"`
@@ -94,29 +100,40 @@ func NewService(runner Runner, opts Options) *Service {
 	if opts.MaxFieldChars <= 0 {
 		opts.MaxFieldChars = 4000
 	}
-	return &Service{runner: runner, opts: opts}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Service{runner: runner, opts: opts, logger: logger.With("component", "query")}
 }
 
 func (s *Service) Execute(ctx context.Context, sql []string) Response {
 	if len(sql) == 0 {
 		err := "sql must contain at least one statement"
+		s.logger.WarnContext(ctx, "query batch rejected", "error", err)
 		return Response{Results: []Result{{Error: err, CSV: errorCSV(err)}}}
 	}
 
+	started := time.Now()
+	s.logger.InfoContext(ctx, "query batch started", "statements", len(sql), "max_rows", s.opts.MaxRows, "max_field_chars", s.opts.MaxFieldChars)
 	results := make([]Result, 0, len(sql))
 	for _, statement := range sql {
+		queryStarted := time.Now()
 		result := Result{SQL: statement}
 		if err := ValidateReadOnlySQL(statement); err != nil {
 			result.Error = err.Error()
 			result.CSV = errorCSV(result.Error)
 			results = append(results, result)
+			s.logger.WarnContext(ctx, "query rejected by read-only validator", "sql", statement, "error", result.Error)
 			continue
 		}
+		s.logger.DebugContext(ctx, "query started", "sql", statement)
 		raw, err := s.runner.Query(ctx, statement, s.opts.MaxRows+1)
 		if err != nil {
 			result.Error = err.Error()
 			result.CSV = errorCSV(result.Error)
 			results = append(results, result)
+			s.logger.ErrorContext(ctx, "query failed", "sql", statement, "error", err, "duration", time.Since(queryStarted))
 			continue
 		}
 		rows, trunc := s.truncateRows(raw.Rows)
@@ -125,17 +142,107 @@ func (s *Service) Execute(ctx context.Context, sql []string) Response {
 		if err != nil {
 			result.Error = err.Error()
 			result.CSV = errorCSV(result.Error)
+			s.logger.ErrorContext(ctx, "query result encoding failed", "sql", statement, "error", err, "duration", time.Since(queryStarted))
+		} else {
+			s.logger.InfoContext(ctx, "query completed", "sql", statement, "rows", len(rows), "columns", len(raw.Columns), "truncated_rows", trunc.Rows, "truncated_fields", len(trunc.Fields), "duration", time.Since(queryStarted))
 		}
 		results = append(results, result)
 	}
+	s.logger.InfoContext(ctx, "query batch completed", "statements", len(sql), "duration", time.Since(started))
 	return Response{Results: results}
 }
 
+func (s *Service) SchemaOverview(ctx context.Context) Response {
+	const showTablesSQL = "SHOW TABLES"
+	started := time.Now()
+	schemaResult := Result{SQL: "SHOW TABLES + DESCRIBE TABLE <each table>"}
+	s.logger.InfoContext(ctx, "schema overview started")
+
+	tablesResult, err := s.runner.Query(ctx, showTablesSQL, 0)
+	if err != nil {
+		schemaResult.Error = err.Error()
+		schemaResult.CSV = errorCSV(schemaResult.Error)
+		s.logger.ErrorContext(ctx, "schema overview table listing failed", "sql", showTablesSQL, "error", err, "duration", time.Since(started))
+		return Response{Results: []Result{schemaResult}}
+	}
+	tables := tableNames(tablesResult)
+	s.logger.InfoContext(ctx, "schema overview tables listed", "tables", len(tables))
+
+	rows := make([]map[string]any, 0)
+	sampleResults := make([]Result, 0, len(tables))
+	for _, table := range tables {
+		describeSQL := "DESCRIBE TABLE " + quoteClickHouseIdentifier(table)
+		describeStarted := time.Now()
+		s.logger.DebugContext(ctx, "schema overview describe started", "table", table, "sql", describeSQL)
+		describeResult, err := s.runner.Query(ctx, describeSQL, 0)
+		if err != nil {
+			schemaResult.Error = err.Error()
+			schemaResult.CSV = errorCSV(schemaResult.Error)
+			s.logger.ErrorContext(ctx, "schema overview describe failed", "table", table, "sql", describeSQL, "error", err, "duration", time.Since(describeStarted))
+			return Response{Results: []Result{schemaResult}}
+		}
+		for _, column := range describeResult.Rows {
+			rows = append(rows, map[string]any{
+				"table":              table,
+				"column":             rowString(column, "name"),
+				"type":               rowString(column, "type"),
+				"default_type":       rowString(column, "default_type"),
+				"default_expression": rowString(column, "default_expression"),
+				"comment":            rowString(column, "comment"),
+			})
+		}
+		s.logger.DebugContext(ctx, "schema overview describe completed", "table", table, "columns", len(describeResult.Rows), "duration", time.Since(describeStarted))
+		sampleResults = append(sampleResults, s.sampleRows(ctx, table))
+	}
+
+	schemaResult.CSV, err = rowsToCSV([]string{"table", "column", "type", "default_type", "default_expression", "comment"}, rows)
+	if err != nil {
+		schemaResult.Error = err.Error()
+		schemaResult.CSV = errorCSV(schemaResult.Error)
+		s.logger.ErrorContext(ctx, "schema overview encoding failed", "error", err, "duration", time.Since(started))
+		return Response{Results: []Result{schemaResult}}
+	}
+	results := make([]Result, 0, 1+len(sampleResults))
+	results = append(results, schemaResult)
+	results = append(results, sampleResults...)
+	s.logger.InfoContext(ctx, "schema overview completed", "tables", len(tables), "columns", len(rows), "sample_results", len(sampleResults), "duration", time.Since(started))
+	return Response{Results: results}
+}
+
+func (s *Service) sampleRows(ctx context.Context, table string) Result {
+	sampleSQL := fmt.Sprintf("SELECT * FROM %s LIMIT %d", quoteClickHouseIdentifier(table), schemaSampleRows)
+	started := time.Now()
+	result := Result{SQL: sampleSQL}
+	s.logger.DebugContext(ctx, "schema overview sample started", "table", table, "sql", sampleSQL)
+	raw, err := s.runner.Query(ctx, sampleSQL, schemaSampleRows)
+	if err != nil {
+		result.Error = err.Error()
+		result.CSV = errorCSV(result.Error)
+		s.logger.ErrorContext(ctx, "schema overview sample failed", "table", table, "sql", sampleSQL, "error", err, "duration", time.Since(started))
+		return result
+	}
+	rows, trunc := s.truncateRowsWithMaxRows(raw.Rows, schemaSampleRows)
+	result.Truncated = trunc
+	result.CSV, err = rowsToCSV(raw.Columns, rows)
+	if err != nil {
+		result.Error = err.Error()
+		result.CSV = errorCSV(result.Error)
+		s.logger.ErrorContext(ctx, "schema overview sample encoding failed", "table", table, "sql", sampleSQL, "error", err, "duration", time.Since(started))
+		return result
+	}
+	s.logger.DebugContext(ctx, "schema overview sample completed", "table", table, "rows", len(rows), "columns", len(raw.Columns), "truncated_rows", trunc.Rows, "truncated_fields", len(trunc.Fields), "duration", time.Since(started))
+	return result
+}
+
 func (s *Service) truncateRows(rows []map[string]any) ([]map[string]any, Truncation) {
-	trunc := Truncation{MaxRows: s.opts.MaxRows, MaxFieldChars: s.opts.MaxFieldChars}
-	if len(rows) > s.opts.MaxRows {
+	return s.truncateRowsWithMaxRows(rows, s.opts.MaxRows)
+}
+
+func (s *Service) truncateRowsWithMaxRows(rows []map[string]any, maxRows int) ([]map[string]any, Truncation) {
+	trunc := Truncation{MaxRows: maxRows, MaxFieldChars: s.opts.MaxFieldChars}
+	if len(rows) > maxRows {
 		trunc.Rows = true
-		rows = rows[:s.opts.MaxRows]
+		rows = rows[:maxRows]
 	}
 	out := make([]map[string]any, 0, len(rows))
 	for rowIndex, row := range rows {
@@ -217,4 +324,30 @@ func errorCSV(message string) string {
 		return "error\n" + message
 	}
 	return out
+}
+
+func tableNames(result RawResult) []string {
+	tables := make([]string, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		name := rowString(row, "name")
+		if name == "" && len(result.Columns) == 1 {
+			name = rowString(row, result.Columns[0])
+		}
+		if name != "" {
+			tables = append(tables, name)
+		}
+	}
+	return tables
+}
+
+func rowString(row map[string]any, column string) string {
+	value, ok := row[column]
+	if !ok || value == nil {
+		return ""
+	}
+	return csvValue(value)
+}
+
+func quoteClickHouseIdentifier(identifier string) string {
+	return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
 }

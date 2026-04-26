@@ -23,6 +23,98 @@ func (f fakeRunner) Query(_ context.Context, sql string, maxRows int) (RawResult
 	return result, nil
 }
 
+type recordingRunner struct {
+	results map[string]RawResult
+	queries []string
+}
+
+func (r *recordingRunner) Query(_ context.Context, sql string, maxRows int) (RawResult, error) {
+	r.queries = append(r.queries, sql)
+	result := r.results[sql]
+	if maxRows > 0 && len(result.Rows) > maxRows {
+		result.Rows = result.Rows[:maxRows]
+	}
+	return result, nil
+}
+
+func TestServiceSchemaOverviewUsesShowDescribeAndSamples(t *testing.T) {
+	runner := &recordingRunner{results: map[string]RawResult{
+		"SHOW TABLES": {
+			Columns: []string{"name"},
+			Rows: []map[string]any{
+				{"name": "gmail_messages"},
+				{"name": "slack`messages"},
+			},
+		},
+		"DESCRIBE TABLE `gmail_messages`": {
+			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
+			Rows: []map[string]any{
+				{"name": "id", "type": "String", "default_type": "", "default_expression": "", "comment": ""},
+				{"name": "body", "type": "String", "default_type": "", "default_expression": "", "comment": "message text"},
+			},
+		},
+		"SELECT * FROM `gmail_messages` LIMIT 3": {
+			Columns: []string{"id", "body"},
+			Rows: []map[string]any{
+				{"id": "msg-1", "body": "abcdefghijklmnopqrstuvwxyz"},
+				{"id": "msg-2", "body": "short"},
+			},
+		},
+		"DESCRIBE TABLE `slack``messages`": {
+			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
+			Rows: []map[string]any{
+				{"name": "channel_id", "type": "String", "default_type": "", "default_expression": "", "comment": ""},
+			},
+		},
+		"SELECT * FROM `slack``messages` LIMIT 3": {
+			Columns: []string{"channel_id"},
+			Rows:    []map[string]any{{"channel_id": "C123"}},
+		},
+	}}
+	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 10})
+
+	resp := svc.SchemaOverview(context.Background())
+
+	wantQueries := []string{
+		"SHOW TABLES",
+		"DESCRIBE TABLE `gmail_messages`",
+		"SELECT * FROM `gmail_messages` LIMIT 3",
+		"DESCRIBE TABLE `slack``messages`",
+		"SELECT * FROM `slack``messages` LIMIT 3",
+	}
+	if strings.Join(runner.queries, "\n") != strings.Join(wantQueries, "\n") {
+		t.Fatalf("queries = %#v, want %#v", runner.queries, wantQueries)
+	}
+	if len(resp.Results) != 3 {
+		t.Fatalf("results length = %d, want 3", len(resp.Results))
+	}
+	wantCSV := strings.Join([]string{
+		"table,column,type,default_type,default_expression,comment",
+		"gmail_messages,id,String,,,",
+		"gmail_messages,body,String,,,message text",
+		"slack`messages,channel_id,String,,,",
+	}, "\n")
+	result := resp.Results[0]
+	if result.Error != "" {
+		t.Fatalf("SchemaOverview returned error: %s", result.Error)
+	}
+	if result.CSV != wantCSV {
+		t.Fatalf("CSV = %q, want %q", result.CSV, wantCSV)
+	}
+	if resp.Results[1].SQL != "SELECT * FROM `gmail_messages` LIMIT 3" {
+		t.Fatalf("sample SQL = %q", resp.Results[1].SQL)
+	}
+	if want := "id,body\nmsg-1,abcdefghij\nmsg-2,short"; resp.Results[1].CSV != want {
+		t.Fatalf("sample CSV = %q, want %q", resp.Results[1].CSV, want)
+	}
+	if len(resp.Results[1].Truncated.Fields) != 1 {
+		t.Fatalf("sample truncations = %#v", resp.Results[1].Truncated.Fields)
+	}
+	if resp.Results[2].CSV != "channel_id\nC123" {
+		t.Fatalf("second sample CSV = %q", resp.Results[2].CSV)
+	}
+}
+
 func TestServiceExecuteTruncatesRowsAndFields(t *testing.T) {
 	svc := NewService(fakeRunner{results: map[string]RawResult{
 		"SELECT body FROM gmail_messages": {

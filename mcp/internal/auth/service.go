@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
@@ -27,6 +28,7 @@ type Service struct {
 	now           func() time.Time
 	consumedCodes map[string]int64
 	mu            sync.Mutex
+	logger        *slog.Logger
 }
 
 type Claims struct {
@@ -52,11 +54,12 @@ func NewService(secret []byte, now func() time.Time) *Service {
 	if now == nil {
 		now = time.Now
 	}
-	return &Service{secret: secret, now: now, consumedCodes: make(map[string]int64)}
+	return &Service{secret: secret, now: now, consumedCodes: make(map[string]int64), logger: slog.Default().With("component", "auth")}
 }
 
 func (s *Service) RegisterHandlers(mux *http.ServeMux, baseURL string) {
 	baseURL = strings.TrimRight(baseURL, "/")
+	s.logger.Info("registering OAuth handlers", "base_url", baseURL)
 	mux.HandleFunc("/.well-known/oauth-protected-resource", s.protectedResourceMetadata(baseURL))
 	mux.HandleFunc("/.well-known/oauth-authorization-server", s.authServerMetadata(baseURL))
 	mux.HandleFunc("/oauth/register", s.registerClient)
@@ -69,8 +72,10 @@ func (s *Service) RequireBearer(metadataURL string) func(http.Handler) http.Hand
 	return mcpauth.RequireBearerToken(func(ctx context.Context, token string, req *http.Request) (*mcpauth.TokenInfo, error) {
 		claims, err := s.VerifyBearer(token)
 		if err != nil {
+			s.logger.WarnContext(ctx, "bearer token rejected", "path", req.URL.Path, "error", err)
 			return nil, fmt.Errorf("%w: %v", mcpauth.ErrInvalidToken, err)
 		}
+		s.logger.DebugContext(ctx, "bearer token accepted", "path", req.URL.Path, "client", tokenFingerprint(claims.ClientID))
 		return &mcpauth.TokenInfo{
 			Scopes:     strings.Fields(claims.Scope),
 			Expiration: claims.Expires,
@@ -131,6 +136,7 @@ func (s *Service) authServerMetadata(baseURL string) http.HandlerFunc {
 
 func (s *Service) registerClient(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		s.logger.WarnContext(r.Context(), "client registration rejected", "reason", "method", "method", r.Method)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -141,10 +147,12 @@ func (s *Service) registerClient(w http.ResponseWriter, r *http.Request) {
 		Scope                   string   `json:"scope"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.logger.WarnContext(r.Context(), "client registration rejected", "reason", "invalid_json", "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_client_metadata", "invalid registration JSON")
 		return
 	}
 	if len(req.RedirectURIs) == 0 {
+		s.logger.WarnContext(r.Context(), "client registration rejected", "reason", "missing_redirect_uris")
 		oauthError(w, http.StatusBadRequest, "invalid_client_metadata", "redirect_uris is required")
 		return
 	}
@@ -157,9 +165,11 @@ func (s *Service) registerClient(w http.ResponseWriter, r *http.Request) {
 	}
 	clientID, err := s.sign(payload)
 	if err != nil {
+		s.logger.ErrorContext(r.Context(), "client registration failed", "error", err)
 		http.Error(w, "could not register client", http.StatusInternalServerError)
 		return
 	}
+	s.logger.InfoContext(r.Context(), "client registered", "client", tokenFingerprint(clientID), "redirect_uris", len(req.RedirectURIs))
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"client_id":                  clientID,
 		"client_id_issued_at":        s.now().Unix(),
@@ -178,40 +188,50 @@ func (s *Service) jwks(w http.ResponseWriter, r *http.Request) {
 func (s *Service) authorize(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		authorizePage.Execute(w, r.URL.Query())
+		s.logger.DebugContext(r.Context(), "authorization page requested")
+		if err := authorizePage.Execute(w, r.URL.Query()); err != nil {
+			s.logger.ErrorContext(r.Context(), "authorization page render failed", "error", err)
+		}
 	case http.MethodPost:
 		s.authorizePost(w, r)
 	default:
+		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "method", "method", r.Method)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
 func (s *Service) authorizePost(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
+		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "invalid_form", "error", err)
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(r.Form.Get("secret_token")), s.secret) != 1 {
+		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "invalid_secret", "client", tokenFingerprint(r.Form.Get("client_id")))
 		http.Error(w, "invalid secret token", http.StatusUnauthorized)
 		return
 	}
 	clientID := r.Form.Get("client_id")
 	redirectURI := r.Form.Get("redirect_uri")
 	if err := s.validateClientRedirect(clientID, redirectURI); err != nil {
+		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "invalid_redirect", "client", tokenFingerprint(clientID), "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	if r.Form.Get("response_type") != "code" {
+		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "unsupported_response_type", "client", tokenFingerprint(clientID))
 		oauthError(w, http.StatusBadRequest, "unsupported_response_type", "response_type must be code")
 		return
 	}
 	challenge := r.Form.Get("code_challenge")
 	method := r.Form.Get("code_challenge_method")
 	if challenge == "" {
+		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "missing_code_challenge", "client", tokenFingerprint(clientID))
 		oauthError(w, http.StatusBadRequest, "invalid_request", "code_challenge is required")
 		return
 	}
 	if method != "S256" {
+		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "unsupported_code_challenge_method", "client", tokenFingerprint(clientID), "method", method)
 		oauthError(w, http.StatusBadRequest, "invalid_request", "code_challenge_method must be S256")
 		return
 	}
@@ -227,11 +247,13 @@ func (s *Service) authorizePost(w http.ResponseWriter, r *http.Request) {
 		Iat:                 s.now().Unix(),
 	})
 	if err != nil {
+		s.logger.ErrorContext(r.Context(), "authorization code signing failed", "client", tokenFingerprint(clientID), "error", err)
 		http.Error(w, "could not authorize", http.StatusInternalServerError)
 		return
 	}
 	target, err := url.Parse(redirectURI)
 	if err != nil {
+		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "invalid_redirect_uri", "client", tokenFingerprint(clientID), "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_request", "invalid redirect_uri")
 		return
 	}
@@ -241,24 +263,29 @@ func (s *Service) authorizePost(w http.ResponseWriter, r *http.Request) {
 		q.Set("state", state)
 	}
 	target.RawQuery = q.Encode()
+	s.logger.InfoContext(r.Context(), "authorization code issued", "client", tokenFingerprint(clientID), "redirect_host", target.Host)
 	http.Redirect(w, r, target.String(), http.StatusFound)
 }
 
 func (s *Service) token(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		s.logger.WarnContext(r.Context(), "token request rejected", "reason", "method", "method", r.Method)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
+		s.logger.WarnContext(r.Context(), "token request rejected", "reason", "invalid_form", "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_request", "invalid form")
 		return
 	}
+	s.logger.DebugContext(r.Context(), "token request received", "grant_type", r.Form.Get("grant_type"), "client", tokenFingerprint(r.Form.Get("client_id")))
 	switch r.Form.Get("grant_type") {
 	case "authorization_code":
 		s.tokenFromCode(w, r)
 	case "refresh_token":
 		s.tokenFromRefresh(w, r)
 	default:
+		s.logger.WarnContext(r.Context(), "token request rejected", "reason", "unsupported_grant_type", "grant_type", r.Form.Get("grant_type"), "client", tokenFingerprint(r.Form.Get("client_id")))
 		oauthError(w, http.StatusBadRequest, "unsupported_grant_type", "unsupported grant_type")
 	}
 }
@@ -267,42 +294,52 @@ func (s *Service) tokenFromCode(w http.ResponseWriter, r *http.Request) {
 	rawCode := r.Form.Get("code")
 	var code signedPayload
 	if err := s.verifySigned(rawCode, "code", &code); err != nil {
+		s.logger.WarnContext(r.Context(), "authorization code token exchange rejected", "reason", "invalid_code", "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid authorization code")
 		return
 	}
 	if code.Exp != 0 && s.now().Unix() > code.Exp {
+		s.logger.WarnContext(r.Context(), "authorization code token exchange rejected", "reason", "expired_code", "client", tokenFingerprint(code.ClientID))
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "authorization code expired")
 		return
 	}
 	if code.ClientID != r.Form.Get("client_id") || code.RedirectURI != r.Form.Get("redirect_uri") {
+		s.logger.WarnContext(r.Context(), "authorization code token exchange rejected", "reason", "client_or_redirect_mismatch", "client", tokenFingerprint(r.Form.Get("client_id")))
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "client_id or redirect_uri mismatch")
 		return
 	}
 	if !verifyPKCE(r.Form.Get("code_verifier"), code.CodeChallenge, code.CodeChallengeMethod) {
+		s.logger.WarnContext(r.Context(), "authorization code token exchange rejected", "reason", "pkce_failed", "client", tokenFingerprint(code.ClientID))
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
 		return
 	}
 	if !s.consumeAuthorizationCode(rawCode, code.Exp) {
+		s.logger.WarnContext(r.Context(), "authorization code token exchange rejected", "reason", "code_replay", "client", tokenFingerprint(code.ClientID))
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "authorization code already used")
 		return
 	}
+	s.logger.InfoContext(r.Context(), "authorization code exchanged", "client", tokenFingerprint(code.ClientID))
 	s.writeTokenResponse(w, code.ClientID)
 }
 
 func (s *Service) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 	var refresh signedPayload
 	if err := s.verifySigned(r.Form.Get("refresh_token"), "refresh", &refresh); err != nil {
+		s.logger.WarnContext(r.Context(), "refresh token exchange rejected", "reason", "invalid_refresh", "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid refresh token")
 		return
 	}
 	if refresh.Exp != 0 && s.now().Unix() > refresh.Exp {
+		s.logger.WarnContext(r.Context(), "refresh token exchange rejected", "reason", "expired_refresh", "client", tokenFingerprint(refresh.ClientID))
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token expired")
 		return
 	}
 	if clientID := r.Form.Get("client_id"); clientID != "" && clientID != refresh.ClientID {
+		s.logger.WarnContext(r.Context(), "refresh token exchange rejected", "reason", "client_mismatch", "client", tokenFingerprint(clientID))
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
 		return
 	}
+	s.logger.InfoContext(r.Context(), "refresh token exchanged", "client", tokenFingerprint(refresh.ClientID))
 	s.writeTokenResponse(w, refresh.ClientID)
 }
 
@@ -311,14 +348,17 @@ func (s *Service) writeTokenResponse(w http.ResponseWriter, clientID string) {
 	refreshExp := s.now().Add(365 * 24 * time.Hour).Unix()
 	access, err := s.sign(signedPayload{Type: "access", ClientID: clientID, Scope: "query", Nonce: nonce(), Exp: accessExp, Iat: s.now().Unix()})
 	if err != nil {
+		s.logger.Error("access token signing failed", "client", tokenFingerprint(clientID), "error", err)
 		http.Error(w, "could not issue access token", http.StatusInternalServerError)
 		return
 	}
 	refresh, err := s.sign(signedPayload{Type: "refresh", ClientID: clientID, Scope: "query", Nonce: nonce(), Exp: refreshExp, Iat: s.now().Unix()})
 	if err != nil {
+		s.logger.Error("refresh token signing failed", "client", tokenFingerprint(clientID), "error", err)
 		http.Error(w, "could not issue refresh token", http.StatusInternalServerError)
 		return
 	}
+	s.logger.Info("token response issued", "client", tokenFingerprint(clientID), "access_expires_at", accessExp, "refresh_expires_at", refreshExp)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  access,
 		"refresh_token": refresh,
