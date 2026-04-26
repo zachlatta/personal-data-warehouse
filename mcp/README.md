@@ -87,7 +87,7 @@ The server exposes one MCP tool:
 
 Only read-only statements are allowed: `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `DESC`, and `EXPLAIN`.
 
-Results are automatically capped by `MCP_MAX_ROWS`. Long string fields are truncated to `MCP_MAX_FIELD_CHARS`, and the response includes instructions for fetching the full field with `length(column)` and chunked `substring(column, start, size)` queries.
+Each statement returns CSV text to keep tool responses compact. Results are automatically capped by `MCP_MAX_ROWS`. Long string fields are truncated to `MCP_MAX_FIELD_CHARS`. When truncation happens, the response includes a second small truncation CSV with instructions for fetching the full field with `length(column)` and chunked `substring(column, start, size)` queries.
 
 ## Verify
 

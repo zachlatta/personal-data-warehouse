@@ -43,11 +43,8 @@ func TestServiceExecuteTruncatesRowsAndFields(t *testing.T) {
 	if !result.Truncated.Rows {
 		t.Fatal("expected row truncation")
 	}
-	if got := len(result.Rows); got != 2 {
-		t.Fatalf("returned rows = %d", got)
-	}
-	if result.Rows[0]["body"] != "abcdefghij" {
-		t.Fatalf("truncated field = %#v", result.Rows[0]["body"])
+	if want := "body\nabcdefghij\nsecond"; result.CSV != want {
+		t.Fatalf("CSV = %q, want %q", result.CSV, want)
 	}
 	if len(result.Truncated.Fields) != 1 {
 		t.Fatalf("field truncations = %d", len(result.Truncated.Fields))
@@ -58,6 +55,10 @@ func TestServiceExecuteTruncatesRowsAndFields(t *testing.T) {
 	}
 	if !strings.Contains(field.Instructions, "substring(body") || !strings.Contains(field.Instructions, "length(body)") {
 		t.Fatalf("instructions do not explain full retrieval: %q", field.Instructions)
+	}
+	truncCSV := result.Truncated.CSV()
+	if !strings.Contains(truncCSV, "rows") || !strings.Contains(truncCSV, "field") || !strings.Contains(truncCSV, "substring(body") {
+		t.Fatalf("truncation CSV does not explain truncation: %q", truncCSV)
 	}
 }
 
@@ -74,10 +75,30 @@ func TestServiceExecuteReportsPerQueryErrors(t *testing.T) {
 	if !strings.Contains(resp.Results[0].Error, "clickhouse failed") {
 		t.Fatalf("first error = %q", resp.Results[0].Error)
 	}
-	if resp.Results[1].Error != "" || len(resp.Results[1].Rows) != 1 {
+	if !strings.Contains(resp.Results[0].CSV, "clickhouse failed") {
+		t.Fatalf("first CSV = %q", resp.Results[0].CSV)
+	}
+	if resp.Results[1].Error != "" || resp.Results[1].CSV != "1\n1" {
 		t.Fatalf("second result = %#v", resp.Results[1])
 	}
 	if !strings.Contains(resp.Results[2].Error, "read-only") {
 		t.Fatalf("third error = %q", resp.Results[2].Error)
+	}
+}
+
+func TestServiceExecuteEscapesCSVValues(t *testing.T) {
+	svc := NewService(fakeRunner{results: map[string]RawResult{
+		"SELECT subject, labels FROM gmail_messages": {
+			Columns: []string{"subject", "labels"},
+			Rows: []map[string]any{
+				{"subject": "hello, \"world\"\nnext", "labels": []string{"INBOX", "STARRED"}},
+			},
+		},
+	}}, Options{MaxRows: 5, MaxFieldChars: 100})
+
+	resp := svc.Execute(context.Background(), []string{"SELECT subject, labels FROM gmail_messages"})
+	want := "subject,labels\n\"hello, \"\"world\"\"\nnext\",\"[\"\"INBOX\"\",\"\"STARRED\"\"]\""
+	if resp.Results[0].CSV != want {
+		t.Fatalf("CSV = %q, want %q", resp.Results[0].CSV, want)
 	}
 }

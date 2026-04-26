@@ -27,9 +27,17 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "query",
 		Title:       "Query ClickHouse",
-		Description: "Run read-only SQL queries against the personal ClickHouse data warehouse. Results are row-limited and long fields are truncated with instructions for retrieving full field content.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input queryInput) (*mcp.CallToolResult, query.Response, error) {
-		return nil, svc.Execute(ctx, input.SQL), nil
+		Description: "Run read-only SQL queries against the personal ClickHouse data warehouse. Each statement returns CSV text. Results are row-limited and long fields are truncated.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input queryInput) (*mcp.CallToolResult, any, error) {
+		resp := svc.Execute(ctx, input.SQL)
+		content := make([]mcp.Content, 0, len(resp.Results))
+		for _, result := range resp.Results {
+			content = append(content, &mcp.TextContent{Text: result.CSV})
+			if !result.Truncated.Empty() {
+				content = append(content, &mcp.TextContent{Text: result.Truncated.CSV()})
+			}
+		}
+		return &mcp.CallToolResult{Content: content}, nil, nil
 	})
 	return server
 }
