@@ -93,6 +93,7 @@ class SlackSyncRunner:
         sync_thread_replies: bool = True,
         sync_thread_replies_only: bool = False,
         sync_conversations_only: bool = False,
+        sync_conversation_info_only: bool = False,
         skip_completed_full: bool = False,
         skip_completed_threads: bool = False,
         thread_order: str = "recent",
@@ -123,6 +124,7 @@ class SlackSyncRunner:
         self._sync_thread_replies = sync_thread_replies
         self._sync_thread_replies_only = sync_thread_replies_only
         self._sync_conversations_only = sync_conversations_only
+        self._sync_conversation_info_only = sync_conversation_info_only
         self._skip_completed_full = skip_completed_full
         self._skip_completed_threads = skip_completed_threads
         self._thread_order = thread_order
@@ -193,6 +195,14 @@ class SlackSyncRunner:
                 messages_written=0,
                 users_written=0,
                 files_written=0,
+            )
+
+        if self._sync_conversation_info_only:
+            return self._sync_account_conversation_info(
+                account=account,
+                team_id=team_id,
+                client=client,
+                synced_at=synced_at,
             )
 
         if self._sync_thread_replies_only:
@@ -581,6 +591,52 @@ class SlackSyncRunner:
             messages_written=messages_written,
             users_written=0,
             files_written=files_written,
+        )
+
+    def _sync_account_conversation_info(
+        self,
+        *,
+        account: SlackAccount,
+        team_id: str,
+        client,
+        synced_at: datetime,
+    ) -> SlackSyncSummary:
+        conversations = self._warehouse.load_slack_read_state_candidate_payloads(
+            account=account.account,
+            team_id=team_id,
+            conversation_types=self._conversation_types,
+            limit=self._conversation_limit,
+        )
+        rows = []
+        for conversation in conversations:
+            if not isinstance(conversation, Mapping) or not conversation.get("id"):
+                continue
+            conversation_id = str(conversation["id"])
+            try:
+                response = self._call(client, "conversations.info", channel=conversation_id)
+            except SlackApiCallError as exc:
+                self._logger.warning("Could not refresh Slack conversation info for %s: %s", conversation_id, exc)
+                continue
+            info = response.get("channel")
+            if isinstance(info, Mapping):
+                rows.append(
+                    conversation_to_row(
+                        account=account.account,
+                        team_id=team_id,
+                        conversation=info,
+                        synced_at=synced_at,
+                    )
+                )
+
+        self._warehouse.insert_slack_conversations(rows)
+        return SlackSyncSummary(
+            account=account.account,
+            team_id=team_id,
+            sync_type="conversation_info",
+            conversations_seen=len(conversations),
+            messages_written=0,
+            users_written=0,
+            files_written=0,
         )
 
     def _sync_one_thread_replies(
@@ -1371,6 +1427,11 @@ def main() -> None:
         help="Only refresh active Slack conversations without fetching messages",
     )
     parser.add_argument(
+        "--sync-conversation-info-only",
+        action="store_true",
+        help="Only refresh conversations.info for cached active conversations",
+    )
+    parser.add_argument(
         "--skip-completed-threads",
         action="store_true",
         help="Skip thread parents already marked ok in slack_sync_state",
@@ -1427,6 +1488,7 @@ def main() -> None:
             sync_thread_replies=not args.skip_thread_replies,
             sync_thread_replies_only=args.sync_thread_replies_only,
             sync_conversations_only=args.sync_conversations_only,
+            sync_conversation_info_only=args.sync_conversation_info_only,
             skip_completed_full=args.skip_completed_full,
             skip_completed_threads=args.skip_completed_threads,
             thread_order=args.thread_order,

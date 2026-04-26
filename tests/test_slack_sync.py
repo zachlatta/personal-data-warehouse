@@ -54,6 +54,7 @@ class FakeWarehouse:
         self.ensure_calls = 0
         self.conversation_payloads = []
         self.conversation_payload_calls = []
+        self.read_state_candidate_calls = []
         self.thread_refs = []
         self.thread_ref_calls = []
         self.teams = []
@@ -180,6 +181,29 @@ class FakeWarehouse:
         if limit is not None:
             refs = refs[:limit]
         return refs
+
+    def load_slack_read_state_candidate_payloads(self, *, account, team_id, conversation_types=(), limit=None):
+        self.read_state_candidate_calls.append(
+            {
+                "account": account,
+                "team_id": team_id,
+                "conversation_types": conversation_types,
+                "limit": limit,
+            }
+        )
+        payloads = []
+        for payload in self.conversation_payloads:
+            if conversation_types and conversation_to_row(
+                account=account,
+                team_id=team_id,
+                conversation=payload,
+                synced_at=datetime(2026, 4, 24, tzinfo=UTC),
+            )["conversation_type"] not in conversation_types:
+                continue
+            payloads.append(payload)
+        if limit is not None:
+            payloads = payloads[:limit]
+        return payloads
 
     def insert_slack_conversation_members(self, rows):
         self.members.extend(rows)
@@ -425,6 +449,50 @@ def test_runner_can_refresh_conversations_without_fetching_messages(monkeypatch)
     assert summaries[0].messages_written == 0
     assert len(warehouse.conversations) == 1
     assert [method for method, _params in client.calls] == ["auth.test", "team.info", "conversations.list"]
+
+
+def test_runner_can_refresh_conversation_info_only(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+            "conversations.info": [
+                {
+                    "ok": True,
+                    "channel": {
+                        "id": "C1",
+                        "name": "hq",
+                        "is_channel": True,
+                        "is_member": True,
+                        "last_read": "1713974400.000100",
+                    },
+                }
+            ],
+        }
+    )
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [{"id": "C1", "name": "hq", "is_channel": True, "is_member": True}]
+
+    summaries = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        conversation_limit=1,
+        sync_conversation_info_only=True,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert summaries[0].sync_type == "conversation_info"
+    assert summaries[0].conversations_seen == 1
+    assert summaries[0].messages_written == 0
+    assert warehouse.read_state_candidate_calls[0]["limit"] == 1
+    assert warehouse.conversations[0]["conversation_id"] == "C1"
+    assert "last_read" in warehouse.conversations[0]["raw_json"]
+    assert [method for method, _params in client.calls] == ["auth.test", "team.info", "conversations.info"]
 
 
 def test_runner_incremental_uses_lookback_and_skips_unchanged_threads(monkeypatch):

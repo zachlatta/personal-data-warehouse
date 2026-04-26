@@ -857,6 +857,124 @@ class ClickHouseWarehouse:
             ORDER BY m.account, m.team_id, m.message_datetime, m.message_ts
             """
         )
+        self._command(
+            """
+            CREATE OR REPLACE VIEW slack_current_conversations AS
+            SELECT
+                c.account AS account,
+                c.team_id AS team_id,
+                c.conversation_type AS conversation_type,
+                c.conversation_id AS conversation_id,
+                c.name AS conversation_name,
+                c.is_member AS is_member,
+                c.is_archived AS is_archived,
+                JSONExtractString(c.raw_json, 'last_read') AS last_read_ts,
+                toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0 AS read_state_known,
+                maxIf(m.message_datetime, m.is_deleted = 0 AND m.message_ts != '') AS latest_message_at,
+                countIf(m.is_deleted = 0 AND m.message_ts != '') AS message_count,
+                countIf(m.is_deleted = 0 AND m.message_ts != '' AND m.is_thread_reply = 0) AS top_level_message_count,
+                countIf(m.is_deleted = 0 AND m.message_ts != '' AND m.is_thread_reply = 1) AS thread_reply_count,
+                countIf(
+                    m.is_deleted = 0
+                    AND m.message_ts != ''
+                    AND toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0
+                    AND toFloat64OrZero(m.message_ts) > toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read'))
+                ) AS unread_message_count,
+                countIf(
+                    m.is_deleted = 0
+                    AND m.message_ts != ''
+                    AND m.is_thread_reply = 0
+                    AND toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0
+                    AND toFloat64OrZero(m.message_ts) > toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read'))
+                ) AS unread_top_level_count,
+                countIf(
+                    m.is_deleted = 0
+                    AND m.message_ts != ''
+                    AND m.is_thread_reply = 1
+                    AND toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0
+                    AND toFloat64OrZero(m.message_ts) > toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read'))
+                ) AS unread_thread_reply_count,
+                c.synced_at AS conversation_synced_at
+            FROM (SELECT * FROM slack_conversations FINAL) AS c
+            LEFT JOIN (SELECT * FROM slack_messages FINAL) AS m
+                ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id
+            GROUP BY
+                c.account,
+                c.team_id,
+                c.conversation_type,
+                c.conversation_id,
+                c.name,
+                c.is_member,
+                c.is_archived,
+                c.raw_json,
+                c.synced_at
+            ORDER BY latest_message_at DESC, c.account, c.team_id, c.conversation_id
+            """
+        )
+        self._command(
+            """
+            CREATE OR REPLACE VIEW slack_current_threads AS
+            SELECT
+                p.account AS account,
+                p.team_id AS team_id,
+                c.conversation_type AS conversation_type,
+                c.name AS conversation_name,
+                p.conversation_id AS conversation_id,
+                p.message_ts AS thread_ts,
+                p.message_datetime AS thread_started_at,
+                p.user_id AS parent_user_id,
+                u.display_name AS parent_display_name,
+                u.real_name AS parent_real_name,
+                u.name AS parent_user_name,
+                p.text AS parent_text,
+                p.reply_count AS slack_reply_count,
+                countIf(r.is_deleted = 0 AND r.is_thread_reply = 1) AS synced_reply_count,
+                greatest(toInt64(p.reply_count) - toInt64(countIf(r.is_deleted = 0 AND r.is_thread_reply = 1)), 0) AS unsynced_reply_count,
+                maxIf(r.message_datetime, r.is_deleted = 0 AND r.is_thread_reply = 1) AS latest_synced_reply_at,
+                p.latest_reply_ts AS slack_latest_reply_ts,
+                s.status AS thread_sync_status,
+                s.cursor_ts AS thread_sync_cursor_ts,
+                JSONExtractString(c.raw_json, 'last_read') AS conversation_last_read_ts,
+                toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0 AS read_state_known,
+                (
+                    toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0
+                    AND toFloat64OrZero(p.latest_reply_ts) > toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read'))
+                ) AS has_unread_replies
+            FROM (SELECT * FROM slack_messages FINAL WHERE is_deleted = 0 AND is_thread_reply = 0 AND reply_count > 0) AS p
+            LEFT JOIN (SELECT * FROM slack_messages FINAL) AS r
+                ON p.account = r.account
+                AND p.team_id = r.team_id
+                AND p.conversation_id = r.conversation_id
+                AND p.message_ts = r.thread_ts
+            LEFT JOIN (SELECT * FROM slack_conversations FINAL) AS c
+                ON p.account = c.account AND p.team_id = c.team_id AND p.conversation_id = c.conversation_id
+            LEFT JOIN (SELECT * FROM slack_users FINAL) AS u
+                ON p.account = u.account AND p.team_id = u.team_id AND p.user_id = u.user_id
+            LEFT JOIN (SELECT * FROM slack_sync_state FINAL WHERE object_type = 'thread') AS s
+                ON p.account = s.account
+                AND p.team_id = s.team_id
+                AND concat(p.conversation_id, ':', p.message_ts) = s.object_id
+            GROUP BY
+                p.account,
+                p.team_id,
+                c.conversation_type,
+                c.name,
+                p.conversation_id,
+                p.message_ts,
+                p.message_datetime,
+                p.user_id,
+                u.display_name,
+                u.real_name,
+                u.name,
+                p.text,
+                p.reply_count,
+                p.latest_reply_ts,
+                s.status,
+                s.cursor_ts,
+                c.raw_json
+            ORDER BY latest_synced_reply_at DESC, p.message_datetime DESC, p.account, p.team_id, p.conversation_id, p.message_ts
+            """
+        )
 
     def load_sync_state(self) -> dict[str, SyncState]:
         rows = self._query(
@@ -1276,6 +1394,53 @@ class ClickHouseWarehouse:
             }
             for row in rows
         ]
+
+    def load_slack_read_state_candidate_payloads(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_types: tuple[str, ...] = (),
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        type_clause = ""
+        if conversation_types:
+            values = ", ".join(_sql_string(conversation_type) for conversation_type in conversation_types)
+            type_clause = f"AND c.conversation_type IN ({values})"
+        limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
+        rows = self._query(
+            f"""
+            SELECT c.raw_json
+            FROM (SELECT * FROM slack_conversations FINAL) AS c
+            LEFT JOIN (
+                SELECT
+                    account,
+                    team_id,
+                    conversation_id,
+                    max(message_datetime) AS latest_message_at
+                FROM slack_messages FINAL
+                WHERE is_deleted = 0
+                GROUP BY account, team_id, conversation_id
+            ) AS m
+                ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id
+            WHERE c.account = {_sql_string(account)}
+              AND c.team_id = {_sql_string(team_id)}
+              AND c.is_archived = 0
+              AND c.is_member = 1
+              {type_clause}
+            ORDER BY m.latest_message_at DESC, c.conversation_id
+            {limit_clause}
+            """
+        )
+        payloads = []
+        for (raw_json,) in rows:
+            try:
+                parsed = json.loads(raw_json)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                payloads.append(parsed)
+        return payloads
 
     def insert_slack_conversation_members(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("slack_conversation_members", rows, SLACK_CONVERSATION_MEMBER_COLUMNS)

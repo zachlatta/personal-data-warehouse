@@ -136,11 +136,23 @@ parent's `latest_reply_ts` has advanced beyond the stored thread cursor, so it r
 Slack's thread API rate limits. Threads that already produced Slack API errors are skipped by the
 scheduled pass so one inaccessible thread does not block the backlog. Configure it with
 `SLACK_ASSET_THREAD_LIMIT`, `SLACK_ASSET_THREAD_SINCE_DAYS`, and `SLACK_ASSET_THREAD_ORDER`.
+`slack_workspace_read_state_sync_every_five_minutes` refreshes `conversations.info` for a small
+set of recently active member conversations, staggered two minutes after the thread schedule. This
+updates user-specific fields such as `last_read` for deriving unread state. Configure it with
+`SLACK_ASSET_READ_STATE_LIMIT`.
 Freshness stages also poll capped sets of cached conversations per type, ordered by recent
 activity, so each scheduled run remains bounded.
 All Slack schedules share a nonblocking Slack lock, so a scheduled tick skips if another Slack
 sync stage is still running.
 Calendar sync runs through `calendar_event_sync_every_minute` with its own nonblocking lock.
+
+Slack also creates interface-oriented views:
+
+- `slack_current_conversations`: one row per conversation with latest message time, message counts,
+  `last_read` when known, and derived unread counts.
+- `slack_current_threads`: one row per thread parent with Slack's parent `reply_count`, synced reply
+  count, unsynced reply count, thread sync state, and unread-reply signal when conversation
+  `last_read` is known.
 
 ## Docker / Coolify
 

@@ -157,6 +157,19 @@ def run_slack_thread_sync(*, settings, warehouse, logger) -> list[SlackSyncSumma
     ).sync_all()
 
 
+def run_slack_read_state_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
+    return SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=logger,
+        sync_users=False,
+        sync_members=False,
+        sync_conversation_info_only=True,
+        conversation_limit=_int_env("SLACK_ASSET_READ_STATE_LIMIT", 10),
+        max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
+    ).sync_all()
+
+
 def _metadata_conversation_types_for_time(now: datetime) -> tuple[str, ...]:
     stage = ((now.hour * 60) + now.minute) // _int_env("SLACK_ASSET_METADATA_EVERY_MINUTES", 15)
     return (
@@ -289,6 +302,18 @@ def slack_workspace_thread_sync(context) -> MaterializeResult:
     )
 
 
+@asset(
+    group_name="slack",
+    retry_policy=RetryPolicy(max_retries=3, delay=60),
+)
+def slack_workspace_read_state_sync(context) -> MaterializeResult:
+    return _run_locked_slack_stage(
+        context,
+        stage_name="read_state",
+        run_fn=run_slack_read_state_sync,
+    )
+
+
 def _run_locked_slack_stage(context, *, stage_name: str, run_fn) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_slack=True)
     warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
@@ -350,6 +375,11 @@ slack_workspace_thread_sync_job = define_asset_job(
     selection=[slack_workspace_thread_sync],
 )
 
+slack_workspace_read_state_sync_job = define_asset_job(
+    "slack_workspace_read_state_sync_job",
+    selection=[slack_workspace_read_state_sync],
+)
+
 
 @schedule(
     cron_schedule="* * * * *",
@@ -396,6 +426,15 @@ def slack_workspace_thread_sync_every_five_minutes(context):
     return skip_if_job_active(context, job_name="slack_workspace_thread_sync_job")
 
 
+@schedule(
+    cron_schedule="2-59/5 * * * *",
+    job=slack_workspace_read_state_sync_job,
+    default_status=DefaultScheduleStatus.RUNNING,
+)
+def slack_workspace_read_state_sync_every_five_minutes(context):
+    return skip_if_job_active(context, job_name="slack_workspace_read_state_sync_job")
+
+
 @definitions
 def defs() -> Definitions:
     return Definitions(
@@ -405,6 +444,7 @@ def defs() -> Definitions:
             slack_workspace_metadata_sync,
             slack_workspace_user_sync,
             slack_workspace_thread_sync,
+            slack_workspace_read_state_sync,
         ],
         jobs=[
             slack_workspace_sync_job,
@@ -412,6 +452,7 @@ def defs() -> Definitions:
             slack_workspace_metadata_sync_job,
             slack_workspace_user_sync_job,
             slack_workspace_thread_sync_job,
+            slack_workspace_read_state_sync_job,
         ],
         schedules=[
             slack_workspace_sync_every_minute,
@@ -419,5 +460,6 @@ def defs() -> Definitions:
             slack_workspace_metadata_sync_every_fifteen_minutes,
             slack_workspace_user_sync_hourly,
             slack_workspace_thread_sync_every_five_minutes,
+            slack_workspace_read_state_sync_every_five_minutes,
         ],
     )
