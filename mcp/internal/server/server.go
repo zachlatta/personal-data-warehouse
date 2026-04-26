@@ -100,8 +100,9 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner) ht
 
 	mcpServer := NewMCPServer(runner, query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, Logger: slog.Default()})
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{
-		Stateless:    true,
-		JSONResponse: true,
+		JSONResponse:   true,
+		Logger:         slog.Default().With("component", "mcp_streamable"),
+		SessionTimeout: 30 * time.Minute,
 	})
 	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(mcpHandler)
 	mux.Handle("/mcp", protected)
