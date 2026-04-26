@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const MinSecretTokenLength = 32
+
 type Config struct {
 	Addr          string
 	BaseURL       string
@@ -38,6 +40,9 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	}
 	if len(missing) > 0 {
 		return Config{}, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
+	}
+	if len(cfg.SecretToken) < MinSecretTokenLength {
+		return Config{}, fmt.Errorf("MCP_SECRET_TOKEN must be at least %d characters", MinSecretTokenLength)
 	}
 
 	var err error

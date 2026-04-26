@@ -19,7 +19,7 @@ func TestLoadFromEnvRequiresClickHouseURLAndSecret(t *testing.T) {
 func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	env := map[string]string{
 		"CLICKHOUSE_URL":      "https://default:secret@example.com/default?secure=true",
-		"MCP_SECRET_TOKEN":    "setup-secret",
+		"MCP_SECRET_TOKEN":    "0123456789abcdef0123456789abcdef",
 		"MCP_ADDR":            ":9090",
 		"MCP_BASE_URL":        "https://mcp.example.com/",
 		"MCP_MAX_ROWS":        "7",
@@ -43,5 +43,19 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.QueryTimeout != 42*time.Second {
 		t.Fatalf("QueryTimeout = %s", cfg.QueryTimeout)
+	}
+}
+
+func TestLoadFromEnvRejectsWeakSecretToken(t *testing.T) {
+	env := map[string]string{
+		"CLICKHOUSE_URL":   "https://default:secret@example.com/default?secure=true",
+		"MCP_SECRET_TOKEN": "short",
+	}
+	_, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err == nil {
+		t.Fatal("expected weak secret error")
+	}
+	if !strings.Contains(err.Error(), "at least 32 characters") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

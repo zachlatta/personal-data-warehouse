@@ -36,6 +36,10 @@ def gmail_mailbox_sync(context) -> MaterializeResult:
                         "next_history_id": summary.next_history_id,
                         "messages_written": summary.messages_written,
                         "deleted_messages": summary.deleted_messages,
+                        "attachments_written": summary.attachments_written,
+                        "attachment_text_chars": summary.attachment_text_chars,
+                        "attachment_backfill_candidates": summary.attachment_backfill_candidates,
+                        "attachment_backfill_rows_written": summary.attachment_backfill_rows_written,
                         "query": summary.query,
                     }
                     for summary in summaries
@@ -44,6 +48,14 @@ def gmail_mailbox_sync(context) -> MaterializeResult:
             "mailbox_count": len(summaries),
             "messages_written": sum(summary.messages_written for summary in summaries),
             "deleted_messages": sum(summary.deleted_messages for summary in summaries),
+            "attachments_written": sum(summary.attachments_written for summary in summaries),
+            "attachment_text_chars": sum(summary.attachment_text_chars for summary in summaries),
+            "attachment_backfill_candidates": sum(
+                summary.attachment_backfill_candidates for summary in summaries
+            ),
+            "attachment_backfill_rows_written": sum(
+                summary.attachment_backfill_rows_written for summary in summaries
+            ),
         }
     )
 

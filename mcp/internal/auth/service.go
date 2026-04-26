@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
@@ -22,8 +23,10 @@ import (
 )
 
 type Service struct {
-	secret []byte
-	now    func() time.Time
+	secret        []byte
+	now           func() time.Time
+	consumedCodes map[string]int64
+	mu            sync.Mutex
 }
 
 type Claims struct {
@@ -49,7 +52,7 @@ func NewService(secret []byte, now func() time.Time) *Service {
 	if now == nil {
 		now = time.Now
 	}
-	return &Service{secret: secret, now: now}
+	return &Service{secret: secret, now: now, consumedCodes: make(map[string]int64)}
 }
 
 func (s *Service) RegisterHandlers(mux *http.ServeMux, baseURL string) {
@@ -121,7 +124,7 @@ func (s *Service) authServerMetadata(baseURL string) http.HandlerFunc {
 			ResponseTypesSupported:            []string{"code"},
 			GrantTypesSupported:               []string{"authorization_code", "refresh_token"},
 			TokenEndpointAuthMethodsSupported: []string{"none"},
-			CodeChallengeMethodsSupported:     []string{"S256", "plain"},
+			CodeChallengeMethodsSupported:     []string{"S256"},
 		})
 	}
 }
@@ -208,11 +211,8 @@ func (s *Service) authorizePost(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_request", "code_challenge is required")
 		return
 	}
-	if method == "" {
-		method = "plain"
-	}
-	if method != "plain" && method != "S256" {
-		oauthError(w, http.StatusBadRequest, "invalid_request", "unsupported code_challenge_method")
+	if method != "S256" {
+		oauthError(w, http.StatusBadRequest, "invalid_request", "code_challenge_method must be S256")
 		return
 	}
 	code, err := s.sign(signedPayload{
@@ -264,8 +264,9 @@ func (s *Service) token(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) tokenFromCode(w http.ResponseWriter, r *http.Request) {
+	rawCode := r.Form.Get("code")
 	var code signedPayload
-	if err := s.verifySigned(r.Form.Get("code"), "code", &code); err != nil {
+	if err := s.verifySigned(rawCode, "code", &code); err != nil {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid authorization code")
 		return
 	}
@@ -279,6 +280,10 @@ func (s *Service) tokenFromCode(w http.ResponseWriter, r *http.Request) {
 	}
 	if !verifyPKCE(r.Form.Get("code_verifier"), code.CodeChallenge, code.CodeChallengeMethod) {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
+		return
+	}
+	if !s.consumeAuthorizationCode(rawCode, code.Exp) {
+		oauthError(w, http.StatusBadRequest, "invalid_grant", "authorization code already used")
 		return
 	}
 	s.writeTokenResponse(w, code.ClientID)
@@ -375,12 +380,34 @@ func (s *Service) verifySigned(token, expectedType string, payload *signedPayloa
 }
 
 func verifyPKCE(verifier, challenge, method string) bool {
-	if method == "" || method == "plain" {
-		return subtle.ConstantTimeCompare([]byte(verifier), []byte(challenge)) == 1
+	if method != "S256" {
+		return false
 	}
 	sum := sha256.Sum256([]byte(verifier))
 	encoded := base64.RawURLEncoding.EncodeToString(sum[:])
 	return subtle.ConstantTimeCompare([]byte(encoded), []byte(challenge)) == 1
+}
+
+func (s *Service) consumeAuthorizationCode(code string, expiresAt int64) bool {
+	fingerprint := tokenFingerprint(code)
+	now := s.now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, exp := range s.consumedCodes {
+		if exp != 0 && now > exp {
+			delete(s.consumedCodes, key)
+		}
+	}
+	if _, exists := s.consumedCodes[fingerprint]; exists {
+		return false
+	}
+	s.consumedCodes[fingerprint] = expiresAt
+	return true
+}
+
+func tokenFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 func nonce() string {

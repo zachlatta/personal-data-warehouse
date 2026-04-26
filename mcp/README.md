@@ -21,14 +21,14 @@ MCP_MAX_FIELD_CHARS=4000
 MCP_QUERY_TIMEOUT=300s
 ```
 
-`MCP_SECRET_TOKEN` is the shared setup secret. During Claude connector setup, the OAuth page asks for this value. After a successful login, Claude uses bearer tokens issued by the server. Rotating `MCP_SECRET_TOKEN` invalidates existing sessions.
+`MCP_SECRET_TOKEN` is the shared setup secret and token signing key. It must be at least 32 characters; use a high-entropy random value. During Claude connector setup, the OAuth page asks for this value. After a successful login, Claude uses bearer tokens issued by the server. Rotating `MCP_SECRET_TOKEN` invalidates existing sessions.
 
 ## Run Locally
 
 ```bash
 cd mcp
 set -a; source ../.env; set +a
-export MCP_SECRET_TOKEN=choose-a-local-secret
+export MCP_SECRET_TOKEN=choose-a-random-local-secret-at-least-32-chars
 export MCP_BASE_URL=http://localhost:8080
 go run ./cmd/pdw-mcp
 ```
