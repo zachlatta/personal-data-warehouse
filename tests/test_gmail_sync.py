@@ -545,6 +545,69 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
     assert metadata["prompt_sha256"] == row["ai_prompt_sha256"]
 
 
+def test_attachment_rows_for_message_records_ai_empty_for_non_useful_images() -> None:
+    image_content = b"\x89PNG\r\n\x1a\nfake blank image bytes"
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "placeholder.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+
+    ollama = FakeOllamaResource(
+        json.dumps(
+            {
+                "is_useful": False,
+                "summary": "",
+                "visible_text": "",
+                "likely_document_type": "",
+                "useful_for_search": "",
+            }
+        )
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=100,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+    )
+
+    row = rows[0]
+    assert row["text_extraction_status"] == "ai_empty"
+    assert row["text"] == ""
+    assert row["ai_provider"] == "ollama"
+    assert row["ai_model"] == "gemma4:e2b"
+    assert row["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
+    assert row["ai_prompt"] == ATTACHMENT_AI_PROMPT
+    assert row["ai_source_status"] == "unsupported"
+    metadata = json.loads(row["text_extraction_error"])
+    assert metadata["prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
+    assert metadata["prompt_sha256"] == row["ai_prompt_sha256"]
+
+
 def test_attachment_rows_for_message_skips_existing_and_tombstones_missing_attachment() -> None:
     message = {
         "id": "gmail-id",

@@ -46,15 +46,17 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v1"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v2"
 ATTACHMENT_AI_PROMPT = """Analyze this real Gmail attachment image.
 
 Return concise JSON with these keys:
+- is_useful: true if the image contains meaningful user-visible information worth indexing, false if it is blank, decorative, a tracking pixel, a logo-only image, UI chrome, or an attachment placeholder with no useful content.
 - summary: one sentence describing what the attachment appears to be.
 - visible_text: readable text visible in the image, preserving important names, dates, amounts, addresses, and identifiers.
 - likely_document_type: a short label such as receipt, invoice, chart, photo, official letter, form, screenshot, or unknown.
 - useful_for_search: concise search keywords and entities.
 
+If is_useful is false, leave summary, visible_text, likely_document_type, and useful_for_search empty.
 If text is unclear, say so. Do not invent details."""
 ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
 IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
@@ -1166,14 +1168,6 @@ def apply_attachment_ai_fallback(
             ),
         )
 
-    text = normalize_markdown(format_attachment_ai_response(response_text))
-    if not text:
-        return extraction
-    status = "ai_ok"
-    if len(text) > max_chars:
-        text = text[:max_chars]
-        status = "ai_truncated"
-
     prompt_sha256 = hashlib.sha256(ATTACHMENT_AI_PROMPT.encode("utf-8")).hexdigest()
     metadata = {
         "source_status": extraction.status,
@@ -1184,6 +1178,15 @@ def apply_attachment_ai_fallback(
         "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
         "prompt_sha256": prompt_sha256,
     }
+
+    text = normalize_markdown(format_attachment_ai_response(response_text))
+    status = "ai_ok"
+    if not text:
+        status = "ai_empty"
+    elif len(text) > max_chars:
+        text = text[:max_chars]
+        status = "ai_truncated"
+
     return AttachmentTextExtraction(
         text=text,
         status=status,
@@ -1315,6 +1318,8 @@ def format_attachment_ai_response(response_text: str) -> str:
     payload = parse_attachment_ai_json_response(response_text)
     if not payload:
         return response_text.strip()
+    if not attachment_ai_response_is_useful(payload):
+        return ""
 
     visible_text = payload.get("visible_text", "")
     if isinstance(visible_text, list):
@@ -1347,6 +1352,19 @@ def parse_attachment_ai_json_response(response_text: str) -> dict[str, object] |
     if isinstance(payload, dict):
         return payload
     return None
+
+
+def attachment_ai_response_is_useful(payload: Mapping[str, object]) -> bool:
+    value = payload.get("is_useful")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"false", "no", "0"}:
+            return False
+        if normalized in {"true", "yes", "1"}:
+            return True
+    return True
 
 
 def raw_attachment_text(
