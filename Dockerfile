@@ -14,10 +14,12 @@ COPY README.md ./
 COPY src ./src
 COPY docker/dagster.yaml "$DAGSTER_HOME/dagster.yaml"
 COPY docker/entrypoint.sh /usr/local/bin/personal-data-warehouse-entrypoint
+COPY docker/start-dagster.sh /usr/local/bin/personal-data-warehouse-start-dagster
 RUN uv sync --frozen --group dev \
-    && chmod +x /usr/local/bin/personal-data-warehouse-entrypoint
+    && chmod +x /usr/local/bin/personal-data-warehouse-entrypoint \
+    && chmod +x /usr/local/bin/personal-data-warehouse-start-dagster
 
 EXPOSE 3000
 
 ENTRYPOINT ["personal-data-warehouse-entrypoint"]
-CMD ["uv", "run", "dagster", "dev", "-h", "0.0.0.0", "-p", "3000", "-m", "personal_data_warehouse.definitions"]
+CMD ["personal-data-warehouse-start-dagster"]

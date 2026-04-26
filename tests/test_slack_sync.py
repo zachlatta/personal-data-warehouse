@@ -476,6 +476,34 @@ def test_runner_retries_slack_rate_limits(monkeypatch):
     assert sleeps == [2]
 
 
+def test_runner_fails_when_slack_rate_limit_budget_is_exceeded(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    sleeps = []
+    client = FakeSlackClient(
+        {
+            "auth.test": [
+                SlackRateLimitedError(retry_after=2),
+                SlackRateLimitedError(retry_after=2),
+                {"ok": True, "team_id": "T1", "team": "Hack Club"},
+            ],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="rate limit budget exceeded"):
+        SlackSyncRunner(
+            settings=settings,
+            warehouse=FakeWarehouse(),
+            logger=NullLogger(),
+            client_factory=lambda account: client,
+            sleep=sleeps.append,
+            max_rate_limit_sleep_seconds=3,
+        ).sync_all()
+
+    assert sleeps == [2]
+
+
 def test_runner_retries_transient_slack_request_failures(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")

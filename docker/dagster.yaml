@@ -2,3 +2,31 @@ storage:
   postgres:
     postgres_url:
       env: DAGSTER_POSTGRES_URL
+
+run_coordinator:
+  module: dagster._core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 4
+    dequeue_interval_seconds: 5
+    dequeue_use_threads: true
+    dequeue_num_workers: 4
+    tag_concurrency_limits:
+      - key: dagster/schedule_name
+        value: slack_workspace_sync_every_minute
+        limit: 1
+      - key: dagster/schedule_name
+        value: slack_workspace_coverage_sync_every_seven_minutes
+        limit: 1
+      - key: dagster/schedule_name
+        value: slack_workspace_metadata_sync_every_fifteen_minutes
+        limit: 1
+      - key: dagster/schedule_name
+        value: slack_workspace_user_sync_hourly
+        limit: 1
+      - key: dagster/schedule_name
+        value: gmail_mailbox_sync_every_minute
+        limit: 1
+      - key: dagster/schedule_name
+        value: calendar_event_sync_every_minute
+        limit: 1

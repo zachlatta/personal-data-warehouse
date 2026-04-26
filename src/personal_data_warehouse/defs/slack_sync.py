@@ -18,10 +18,15 @@ from dagster import (
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.slack_sync import SlackSyncRunner, SlackSyncSummary
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 
 SLACK_SYNC_POSTGRES_LOCK_ID = 7_403_111_837
+
+
+def _rate_limit_budget_seconds() -> int:
+    return _int_env("SLACK_ASSET_RATE_LIMIT_BUDGET_SECONDS", 120)
 
 
 def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
@@ -54,6 +59,7 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
                 conversation_types=conversation_types,
                 conversation_limit=conversation_limit,
                 sync_thread_replies=False,
+                max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
             ).sync_all()
         )
 
@@ -81,6 +87,7 @@ def run_slack_coverage_sync(*, settings, warehouse, logger, now: datetime | None
                 skip_known_errors=True,
                 conversation_limit=coverage["limit"],
                 sync_thread_replies=False,
+                max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
             ).sync_all()
         )
 
@@ -112,6 +119,7 @@ def run_slack_metadata_sync(
             conversation_page_limit=_int_env("SLACK_ASSET_METADATA_CONVERSATION_PAGE_LIMIT", 1),
             sync_conversations_only=True,
             sync_thread_replies=False,
+            max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
         ).sync_all()
     )
 
@@ -128,6 +136,7 @@ def run_slack_user_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary
         use_existing_conversations=True,
         conversation_limit=0,
         sync_thread_replies=False,
+        max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
     ).sync_all()
 
 
@@ -313,8 +322,8 @@ slack_workspace_user_sync_job = define_asset_job(
     job=slack_workspace_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def slack_workspace_sync_every_minute():
-    return {}
+def slack_workspace_sync_every_minute(context):
+    return skip_if_job_active(context, job_name="slack_workspace_sync_job")
 
 
 @schedule(
@@ -322,8 +331,8 @@ def slack_workspace_sync_every_minute():
     job=slack_workspace_coverage_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def slack_workspace_coverage_sync_every_seven_minutes():
-    return {}
+def slack_workspace_coverage_sync_every_seven_minutes(context):
+    return skip_if_job_active(context, job_name="slack_workspace_coverage_sync_job")
 
 
 @schedule(
@@ -331,8 +340,8 @@ def slack_workspace_coverage_sync_every_seven_minutes():
     job=slack_workspace_metadata_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def slack_workspace_metadata_sync_every_fifteen_minutes():
-    return {}
+def slack_workspace_metadata_sync_every_fifteen_minutes(context):
+    return skip_if_job_active(context, job_name="slack_workspace_metadata_sync_job")
 
 
 @schedule(
@@ -340,8 +349,8 @@ def slack_workspace_metadata_sync_every_fifteen_minutes():
     job=slack_workspace_user_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def slack_workspace_user_sync_hourly():
-    return {}
+def slack_workspace_user_sync_hourly(context):
+    return skip_if_job_active(context, job_name="slack_workspace_user_sync_job")
 
 
 @definitions

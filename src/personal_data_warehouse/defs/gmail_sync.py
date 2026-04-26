@@ -15,6 +15,7 @@ from dagster import (
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.gmail_sync import GmailSyncRunner
+from personal_data_warehouse.schedule_guards import skip_if_job_active
 
 
 @asset(
@@ -71,8 +72,8 @@ gmail_mailbox_sync_job = define_asset_job(
     job=gmail_mailbox_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def gmail_mailbox_sync_every_minute():
-    return {}
+def gmail_mailbox_sync_every_minute(context):
+    return skip_if_job_active(context, job_name="gmail_mailbox_sync_job")
 
 
 @definitions

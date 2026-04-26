@@ -15,6 +15,7 @@ from dagster import (
 from personal_data_warehouse.calendar_sync import CalendarSyncRunner
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 
 CALENDAR_SYNC_POSTGRES_LOCK_ID = 7_403_111_838
@@ -70,8 +71,8 @@ calendar_event_sync_job = define_asset_job(
     job=calendar_event_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def calendar_event_sync_every_minute():
-    return {}
+def calendar_event_sync_every_minute(context):
+    return skip_if_job_active(context, job_name="calendar_event_sync_job")
 
 
 @definitions

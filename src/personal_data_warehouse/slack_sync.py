@@ -22,6 +22,10 @@ class SlackRateLimitedError(Exception):
         self.retry_after = retry_after
 
 
+class SlackRateLimitBudgetExceeded(Exception):
+    pass
+
+
 class SlackApiCallError(Exception):
     pass
 
@@ -94,6 +98,7 @@ class SlackSyncRunner:
         thread_order: str = "recent",
         thread_limit: int | None = None,
         thread_since_days: int | None = None,
+        max_rate_limit_sleep_seconds: int | None = None,
     ) -> None:
         self._settings = settings
         self._warehouse = warehouse
@@ -123,6 +128,8 @@ class SlackSyncRunner:
         self._thread_order = thread_order
         self._thread_limit = thread_limit
         self._thread_since_days = thread_since_days
+        self._max_rate_limit_sleep_seconds = max_rate_limit_sleep_seconds
+        self._rate_limit_sleep_seconds = 0
 
     def sync_all(self) -> list[SlackSyncSummary]:
         self._warehouse.ensure_slack_tables()
@@ -923,6 +930,16 @@ class SlackSyncRunner:
             try:
                 return client.call(method, **params)
             except SlackRateLimitedError as exc:
+                if (
+                    self._max_rate_limit_sleep_seconds is not None
+                    and self._rate_limit_sleep_seconds + exc.retry_after > self._max_rate_limit_sleep_seconds
+                ):
+                    raise SlackRateLimitBudgetExceeded(
+                        "Slack API rate limit budget exceeded "
+                        f"after {self._rate_limit_sleep_seconds}s of sleeps; "
+                        f"next {method} retry requested {exc.retry_after}s"
+                    ) from exc
+                self._rate_limit_sleep_seconds += exc.retry_after
                 self._logger.warning("Slack rate limited %s for %ss", method, exc.retry_after)
                 self._sleep(exc.retry_after)
             except SlackTransientError as exc:
@@ -1342,6 +1359,11 @@ def main() -> None:
     parser.add_argument("--thread-limit", type=int, help="Maximum known thread parents to process")
     parser.add_argument("--thread-since-days", type=int, help="Only process known thread parents newer than this many days")
     parser.add_argument(
+        "--max-rate-limit-sleep-seconds",
+        type=int,
+        help="Fail the run after this many cumulative Slack 429 sleep seconds",
+    )
+    parser.add_argument(
         "--skip-completed-full",
         action="store_true",
         help="When force-full syncing, skip conversations already marked full/ok in slack_sync_state",
@@ -1390,6 +1412,7 @@ def main() -> None:
             thread_order=args.thread_order,
             thread_limit=args.thread_limit,
             thread_since_days=args.thread_since_days,
+            max_rate_limit_sleep_seconds=args.max_rate_limit_sleep_seconds,
         )
 
     if args.validate_only:
