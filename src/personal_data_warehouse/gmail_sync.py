@@ -48,11 +48,11 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v3"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v4"
 ATTACHMENT_AI_PROMPT = """Analyze this real Gmail attachment image.
 
 Return concise JSON with these keys:
-- is_useful: true if the image may contain meaningful user-visible information worth indexing. Use false only when the image is clearly blank, decorative, a tracking pixel, a logo-only image, UI chrome, or an attachment placeholder with no useful content. Receipts, invoices, photos, charts, screenshots of documents, and screenshots containing readable content are useful. If unsure, use true.
+- is_useful: true if the image may contain meaningful user-visible information worth indexing. Use false only when the image is clearly blank, decorative, a tracking pixel, a logo-only image, UI chrome, or an attachment placeholder with no useful content. Receipts, invoices, photos, charts, screenshots of documents, and screenshots containing readable content are useful. Generic words like "Gmail attachment" alone are not useful. If unsure, use true.
 - summary: one sentence describing what the attachment appears to be.
 - visible_text: readable text visible in the image, preserving important names, dates, amounts, addresses, and identifiers.
 - likely_document_type: a short label such as receipt, invoice, chart, photo, official letter, form, screenshot, or unknown.
@@ -1401,6 +1401,8 @@ def parse_attachment_ai_json_response(response_text: str) -> dict[str, object] |
 
 
 def attachment_ai_response_is_useful(payload: Mapping[str, object]) -> bool:
+    if attachment_ai_response_is_generic_placeholder(payload):
+        return False
     value = payload.get("is_useful")
     if isinstance(value, bool):
         return value or attachment_ai_response_has_indexable_content(payload)
@@ -1413,6 +1415,33 @@ def attachment_ai_response_is_useful(payload: Mapping[str, object]) -> bool:
     return True
 
 
+def attachment_ai_response_is_generic_placeholder(payload: Mapping[str, object]) -> bool:
+    summary = attachment_ai_response_text(payload.get("summary", ""))
+    visible_text = attachment_ai_response_text(payload.get("visible_text", ""))
+    likely_document_type = attachment_ai_response_text(payload.get("likely_document_type", ""))
+    useful_for_search = attachment_ai_response_text(payload.get("useful_for_search", ""))
+    combined = " ".join(
+        part
+        for part in (summary, visible_text, likely_document_type, useful_for_search)
+        if part
+    ).lower()
+    if not combined:
+        return False
+    if not re.search(r"\b(placeholder|no discernible content|no useful content|generic gmail attachment)\b", combined):
+        return False
+
+    searchable = " ".join(part for part in (visible_text, useful_for_search) if part).lower()
+    searchable_words = set(re.findall(r"[a-z0-9]+", searchable))
+    generic_words = {"gmail", "attachment", "image", "placeholder", "unknown", "none", "no", "content"}
+    return searchable_words <= generic_words
+
+
+def attachment_ai_response_text(value: object) -> str:
+    if isinstance(value, list):
+        return " ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
+
 def attachment_ai_response_has_indexable_content(payload: Mapping[str, object]) -> bool:
     values = [
         payload.get("summary", ""),
@@ -1421,10 +1450,7 @@ def attachment_ai_response_has_indexable_content(payload: Mapping[str, object]) 
         payload.get("useful_for_search", ""),
     ]
     for value in values:
-        if isinstance(value, list):
-            text = " ".join(str(item) for item in value)
-        else:
-            text = str(value)
+        text = attachment_ai_response_text(value)
         if re.search(r"[A-Za-z0-9]", text):
             return True
     return False

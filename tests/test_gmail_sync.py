@@ -817,6 +817,60 @@ def test_attachment_rows_for_message_skips_tiny_images_for_ai_fallback() -> None
     assert ollama.generate_calls == []
 
 
+def test_attachment_rows_for_message_filters_generic_ai_placeholders() -> None:
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"fake placeholder image bytes" * 1000)
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "placeholder.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+    ollama = FakeOllamaResource(
+        json.dumps(
+            {
+                "is_useful": True,
+                "summary": "The image appears to be a placeholder or a visual representation of a Gmail attachment without any discernible content.",
+                "visible_text": "Gmail attachment",
+                "likely_document_type": "unknown",
+                "useful_for_search": "Gmail attachment",
+            }
+        )
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(image_content) + 1,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+    )
+
+    assert rows[0]["text_extraction_status"] == "ai_empty"
+    assert rows[0]["text"] == ""
+    assert rows[0]["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
+
+
 def test_attachment_ai_call_timeout_returns_control() -> None:
     started_at = time.monotonic()
 
