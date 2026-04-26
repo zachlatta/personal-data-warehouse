@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from dagster import DagsterRunStatus, SkipReason
 
 from personal_data_warehouse.schedule_guards import ACTIVE_RUN_STATUSES, skip_if_job_active
@@ -31,6 +33,7 @@ def test_skip_if_job_active_skips_when_prior_run_is_active() -> None:
     assert "gmail_mailbox_sync_job" in result.skip_message
     assert context.instance.filters.job_name == "gmail_mailbox_sync_job"
     assert context.instance.filters.statuses == ACTIVE_RUN_STATUSES
+    assert context.instance.filters.updated_after > datetime.now(tz=UTC) - timedelta(minutes=11)
     assert context.instance.limit == 1
 
 
@@ -45,3 +48,4 @@ def test_skip_if_job_active_allows_run_when_no_prior_run_is_active() -> None:
         DagsterRunStatus.STARTING,
         DagsterRunStatus.STARTED,
     )
+    assert context.instance.filters.updated_after > datetime.now(tz=UTC) - timedelta(minutes=11)
