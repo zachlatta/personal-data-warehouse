@@ -9,6 +9,9 @@ from dotenv import load_dotenv
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 DEFAULT_GMAIL_PAGE_SIZE = 500
+DEFAULT_GMAIL_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+DEFAULT_GMAIL_ATTACHMENT_TEXT_MAX_CHARS = 1_000_000
+DEFAULT_GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE = 100
 DEFAULT_SLACK_PAGE_SIZE = 200
 DEFAULT_SLACK_LOOKBACK_DAYS = 14
 DEFAULT_SLACK_THREAD_AUDIT_DAYS = 30
@@ -62,6 +65,9 @@ class Settings:
     gmail_include_spam_trash: bool
     gmail_force_full_sync: bool
     gmail_full_sync_query: str | None
+    gmail_attachment_max_bytes: int
+    gmail_attachment_text_max_chars: int
+    gmail_attachment_backfill_batch_size: int
     slack_accounts: tuple[SlackAccount, ...]
     slack_page_size: int
     slack_lookback_days: int
@@ -109,6 +115,27 @@ def load_settings(
     if page_size < 1 or page_size > 500:
         raise ValueError("GMAIL_PAGE_SIZE must be between 1 and 500")
 
+    gmail_attachment_max_bytes = int(
+        os.getenv("GMAIL_ATTACHMENT_MAX_BYTES", str(DEFAULT_GMAIL_ATTACHMENT_MAX_BYTES))
+    )
+    if gmail_attachment_max_bytes < 0:
+        raise ValueError("GMAIL_ATTACHMENT_MAX_BYTES must be greater than or equal to 0")
+
+    gmail_attachment_text_max_chars = int(
+        os.getenv("GMAIL_ATTACHMENT_TEXT_MAX_CHARS", str(DEFAULT_GMAIL_ATTACHMENT_TEXT_MAX_CHARS))
+    )
+    if gmail_attachment_text_max_chars < 0:
+        raise ValueError("GMAIL_ATTACHMENT_TEXT_MAX_CHARS must be greater than or equal to 0")
+
+    gmail_attachment_backfill_batch_size = int(
+        os.getenv(
+            "GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE",
+            str(DEFAULT_GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE),
+        )
+    )
+    if gmail_attachment_backfill_batch_size < 0:
+        raise ValueError("GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE must be greater than or equal to 0")
+
     slack_account_names = _parse_csv_env(os.getenv("SLACK_ACCOUNTS"))
     if require_slack and not slack_account_names:
         raise ValueError("SLACK_ACCOUNTS must be set to a comma-separated list of Slack account names")
@@ -141,6 +168,9 @@ def load_settings(
         gmail_include_spam_trash=_parse_bool_env(os.getenv("GMAIL_INCLUDE_SPAM_TRASH"), True),
         gmail_force_full_sync=_parse_bool_env(os.getenv("GMAIL_FORCE_FULL_SYNC"), False),
         gmail_full_sync_query=os.getenv("GMAIL_FULL_SYNC_QUERY") or None,
+        gmail_attachment_max_bytes=gmail_attachment_max_bytes,
+        gmail_attachment_text_max_chars=gmail_attachment_text_max_chars,
+        gmail_attachment_backfill_batch_size=gmail_attachment_backfill_batch_size,
         slack_accounts=tuple(slack_accounts),
         slack_page_size=slack_page_size,
         slack_lookback_days=int(os.getenv("SLACK_LOOKBACK_DAYS", str(DEFAULT_SLACK_LOOKBACK_DAYS))),

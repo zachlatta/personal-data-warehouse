@@ -39,6 +39,29 @@ MESSAGE_COLUMNS = (
     "sync_version",
 )
 
+ATTACHMENT_COLUMNS = (
+    "account",
+    "message_id",
+    "thread_id",
+    "history_id",
+    "internal_date",
+    "part_id",
+    "attachment_id",
+    "filename",
+    "mime_type",
+    "content_id",
+    "content_disposition",
+    "size",
+    "content_sha256",
+    "text",
+    "text_extraction_status",
+    "text_extraction_error",
+    "is_deleted",
+    "part_json",
+    "synced_at",
+    "sync_version",
+)
+
 SYNC_STATE_COLUMNS = (
     "account",
     "last_history_id",
@@ -46,6 +69,16 @@ SYNC_STATE_COLUMNS = (
     "status",
     "error",
     "updated_at",
+)
+
+ATTACHMENT_BACKFILL_STATE_COLUMNS = (
+    "account",
+    "message_id",
+    "status",
+    "attachment_rows_written",
+    "error",
+    "updated_at",
+    "sync_version",
 )
 
 SLACK_TEAM_COLUMNS = (
@@ -290,6 +323,70 @@ class ClickHouseWarehouse:
         )
         self._command(
             """
+            CREATE TABLE IF NOT EXISTS gmail_attachments (
+                account LowCardinality(String),
+                message_id String,
+                thread_id String,
+                history_id UInt64,
+                internal_date DateTime64(3, 'UTC'),
+                part_id String,
+                attachment_id String,
+                filename String,
+                mime_type LowCardinality(String),
+                content_id String,
+                content_disposition String,
+                size UInt64,
+                content_sha256 String,
+                text String,
+                text_extraction_status LowCardinality(String),
+                text_extraction_error String,
+                is_deleted UInt8,
+                part_json String,
+                synced_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(synced_at)
+            ORDER BY (account, message_id, part_id, filename)
+            """
+        )
+        self._command(
+            """
+            CREATE OR REPLACE VIEW gmail_attachment_search AS
+            SELECT
+                a.account AS account,
+                a.message_id AS message_id,
+                m.thread_id AS thread_id,
+                m.internal_date AS internal_date,
+                m.subject AS subject,
+                m.from_address AS from_address,
+                m.to_addresses AS to_addresses,
+                m.cc_addresses AS cc_addresses,
+                m.bcc_addresses AS bcc_addresses,
+                m.label_ids AS label_ids,
+                a.part_id AS part_id,
+                a.attachment_id AS attachment_id,
+                a.filename AS filename,
+                a.mime_type AS mime_type,
+                a.content_id AS content_id,
+                a.content_disposition AS content_disposition,
+                a.size AS size,
+                a.content_sha256 AS content_sha256,
+                a.text AS text,
+                a.text_extraction_status AS text_extraction_status,
+                a.text_extraction_error AS text_extraction_error,
+                a.synced_at AS attachment_synced_at,
+                m.synced_at AS message_synced_at
+            FROM (SELECT * FROM gmail_attachments FINAL) AS a
+            INNER JOIN (SELECT * FROM gmail_messages FINAL) AS m
+                ON a.account = m.account AND a.message_id = m.message_id
+            WHERE a.is_deleted = 0
+              AND m.is_deleted = 0
+            ORDER BY a.account, m.internal_date, a.message_id, a.part_id, a.filename
+            """
+        )
+        self._command(
+            """
             CREATE TABLE IF NOT EXISTS gmail_sync_state (
                 account LowCardinality(String),
                 last_history_id UInt64,
@@ -300,6 +397,21 @@ class ClickHouseWarehouse:
             )
             ENGINE = ReplacingMergeTree(updated_at)
             ORDER BY (account)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS gmail_attachment_backfill_state (
+                account LowCardinality(String),
+                message_id String,
+                status LowCardinality(String),
+                attachment_rows_written UInt32,
+                error String,
+                updated_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            ORDER BY (account, message_id)
             """
         )
 
@@ -606,6 +718,52 @@ class ClickHouseWarehouse:
             MESSAGE_COLUMNS,
         )
 
+    def insert_attachments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("gmail_attachments", rows, ATTACHMENT_COLUMNS)
+
+    def load_attachment_backfill_candidate_messages(
+        self,
+        *,
+        account: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        rows = self._query(
+            f"""
+            SELECT
+                payload_json
+            FROM gmail_messages FINAL
+            WHERE account = {_sql_string(account)}
+              AND is_deleted = 0
+              AND {_gmail_attachment_candidate_clause()}
+              AND message_id NOT IN (
+                  SELECT message_id
+                  FROM gmail_attachment_backfill_state FINAL
+                  WHERE account = {_sql_string(account)}
+                    AND status = 'ok'
+              )
+            ORDER BY internal_date DESC, message_id DESC
+            LIMIT {int(limit)}
+            """
+        )
+        messages: list[dict[str, Any]] = []
+        for (payload_json,) in rows:
+            try:
+                parsed = json.loads(str(payload_json))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                messages.append(parsed)
+        return messages
+
+    def insert_attachment_backfill_state(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows(
+            "gmail_attachment_backfill_state",
+            rows,
+            ATTACHMENT_BACKFILL_STATE_COLUMNS,
+        )
+
     def existing_message_ids(self, *, account: str, message_ids: list[str]) -> set[str]:
         if not message_ids:
             return set()
@@ -621,6 +779,61 @@ class ClickHouseWarehouse:
             """
         )
         return {str(row[0]) for row in rows}
+
+    def existing_attachment_keys(
+        self,
+        *,
+        account: str,
+        message_ids: list[str],
+    ) -> set[tuple[str, str, str]]:
+        if not message_ids:
+            return set()
+        account_value = _sql_string(account)
+        id_values = ", ".join(_sql_string(message_id) for message_id in message_ids)
+        rows = self._query(
+            f"""
+            SELECT
+                message_id,
+                part_id,
+                filename
+            FROM gmail_attachments FINAL
+            WHERE account = {account_value}
+              AND is_deleted = 0
+              AND message_id IN ({id_values})
+            """
+        )
+        return {(str(row[0]), str(row[1]), str(row[2])) for row in rows}
+
+    def load_message_payloads(
+        self,
+        *,
+        account: str,
+        message_ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        if not message_ids:
+            return {}
+        account_value = _sql_string(account)
+        id_values = ", ".join(_sql_string(message_id) for message_id in message_ids)
+        rows = self._query(
+            f"""
+            SELECT
+                message_id,
+                payload_json
+            FROM gmail_messages FINAL
+            WHERE account = {account_value}
+              AND is_deleted = 0
+              AND message_id IN ({id_values})
+            """
+        )
+        payloads: dict[str, dict[str, Any]] = {}
+        for message_id, payload_json in rows:
+            try:
+                parsed = json.loads(str(payload_json))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                payloads[str(message_id)] = parsed
+        return payloads
 
     def insert_sync_state(
         self,
@@ -954,3 +1167,12 @@ def _query_bool(values: list[str], *, default: bool) -> bool:
 
 def _sql_string(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _gmail_attachment_candidate_clause() -> str:
+    filename_pattern = r"\"filename\":\"[^\"]+\""
+    return (
+        "(position(payload_json, '\"attachmentId\"') > 0 "
+        f"OR match(payload_json, {_sql_string(filename_pattern)}) "
+        "OR positionCaseInsensitive(payload_json, 'Content-Disposition') > 0)"
+    )

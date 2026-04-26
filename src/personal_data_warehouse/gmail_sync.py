@@ -2,18 +2,22 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import re
 from email.utils import getaddresses, parseaddr
+from io import BytesIO
 from pathlib import Path
 import tempfile
 import time
 from typing import Callable, TypeVar
+import zipfile
+import xml.etree.ElementTree as ET
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -29,6 +33,12 @@ from personal_data_warehouse.config import GmailAccount, Settings, env_slug
 EPOCH_UTC = datetime.fromtimestamp(0, tz=UTC)
 DEFAULT_GMAIL_SYNC_LOCK_PATH = Path(tempfile.gettempdir()) / "personal-data-warehouse-gmail-sync.lock"
 GMAIL_SYNC_POSTGRES_LOCK_ID = 7_403_111_836
+ZIP_MIME_TYPES = {"application/zip", "application/x-zip-compressed"}
+ZIP_EXTENSIONS = {".zip"}
+ZIP_MAX_MEMBERS = 200
+ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
+ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+ZIP_MAX_RECURSION_DEPTH = 1
 T = TypeVar("T")
 
 
@@ -39,7 +49,21 @@ class MailboxSyncSummary:
     next_history_id: int
     messages_written: int
     deleted_messages: int
+    attachments_written: int
+    attachment_text_chars: int
     query: str | None
+    attachment_backfill_candidates: int = 0
+    attachment_backfill_rows_written: int = 0
+
+
+@dataclass(frozen=True)
+class AttachmentTextExtraction:
+    text: str
+    status: str
+    error: str = ""
+
+
+AttachmentKey = tuple[str, str, str]
 
 
 def gmail_sync_lock_path() -> Path:
@@ -157,14 +181,16 @@ class GmailSyncRunner:
     def _sync_account(self, account: GmailAccount, state: SyncState | None) -> MailboxSyncSummary:
         service = build_gmail_service(account=account, settings=self._settings)
         if self._settings.gmail_force_full_sync or not state or state.last_history_id == 0:
-            return self._full_sync(account=account, service=service)
+            summary = self._full_sync(account=account, service=service)
+            return self._with_attachment_backfill(account=account, service=service, summary=summary)
 
         try:
-            return self._partial_sync(
+            summary = self._partial_sync(
                 account=account,
                 service=service,
                 start_history_id=state.last_history_id,
             )
+            return self._with_attachment_backfill(account=account, service=service, summary=summary)
         except HttpError as exc:
             if _http_status(exc) != 404:
                 raise
@@ -173,12 +199,15 @@ class GmailSyncRunner:
                 account.email_address,
                 state.last_history_id,
             )
-            return self._full_sync(account=account, service=service)
+            summary = self._full_sync(account=account, service=service)
+            return self._with_attachment_backfill(account=account, service=service, summary=summary)
 
     def _full_sync(self, *, account: GmailAccount, service) -> MailboxSyncSummary:
         sync_started_at = datetime.now(tz=UTC)
         next_history_id = current_history_id(service)
         messages_written = 0
+        attachments_written = 0
+        attachment_text_chars = 0
 
         self._logger.info(
             "Starting full Gmail sync for %s with query %r",
@@ -198,19 +227,40 @@ class GmailSyncRunner:
             new_message_ids = [
                 message_id for message_id in message_ids if message_id not in existing_message_ids
             ]
+            fetched_messages = [fetch_message(service, message_id) for message_id in new_message_ids]
             rows = [
                 message_to_row(
                     account=account.email_address,
-                    message=fetch_message(service, message_id),
+                    message=message,
                     synced_at=sync_started_at,
                 )
-                for message_id in new_message_ids
+                for message in fetched_messages
             ]
             self._warehouse.insert_messages(rows)
             messages_written += len(rows)
+
+            existing_messages = list(
+                self._warehouse.load_message_payloads(
+                    account=account.email_address,
+                    message_ids=sorted(existing_message_ids),
+                ).values()
+            )
+            attachment_rows = self._attachment_rows_for_messages(
+                account=account,
+                service=service,
+                messages=[*fetched_messages, *existing_messages],
+                message_ids=message_ids,
+                synced_at=sync_started_at,
+                force_reprocess=self._settings.gmail_force_full_sync,
+            )
+            self._warehouse.insert_attachments(attachment_rows)
+            attachments_written += len(attachment_rows)
+            attachment_text_chars += sum(len(str(row["text"])) for row in attachment_rows)
+
             self._logger.info(
-                "Synced %s new Gmail messages for %s so far; skipped %s existing messages in latest page",
+                "Synced %s new Gmail messages and %s Gmail attachment rows for %s so far; skipped %s existing messages in latest page",
                 messages_written,
+                attachments_written,
                 account.email_address,
                 len(existing_message_ids),
             )
@@ -221,6 +271,8 @@ class GmailSyncRunner:
             next_history_id=next_history_id,
             messages_written=messages_written,
             deleted_messages=0,
+            attachments_written=attachments_written,
+            attachment_text_chars=attachment_text_chars,
             query=self._settings.gmail_full_sync_query,
         )
 
@@ -234,6 +286,8 @@ class GmailSyncRunner:
 
         messages_written = 0
         deleted_messages = 0
+        attachments_written = 0
+        attachment_text_chars = 0
 
         self._logger.info(
             "Starting incremental Gmail sync for %s from history %s (%s messages changed)",
@@ -244,6 +298,11 @@ class GmailSyncRunner:
 
         for message_ids in chunked(sorted(changed_message_ids), self._settings.gmail_page_size):
             rows = []
+            attachment_rows = []
+            existing_attachment_keys = self._warehouse.existing_attachment_keys(
+                account=account.email_address,
+                message_ids=message_ids,
+            )
             for message_id in message_ids:
                 message = fetch_message_or_none(service, message_id)
                 if message is None:
@@ -251,6 +310,15 @@ class GmailSyncRunner:
                         deleted_message_row(
                             account=account.email_address,
                             message_id=message_id,
+                            synced_at=sync_started_at,
+                            history_id=next_history_id,
+                        )
+                    )
+                    attachment_rows.extend(
+                        deleted_attachment_rows(
+                            account=account.email_address,
+                            message_id=message_id,
+                            existing_keys=existing_attachment_keys,
                             synced_at=sync_started_at,
                             history_id=next_history_id,
                         )
@@ -264,11 +332,26 @@ class GmailSyncRunner:
                             synced_at=sync_started_at,
                         )
                     )
+                    attachment_rows.extend(
+                        attachment_rows_for_message(
+                            account=account.email_address,
+                            service=service,
+                            message=message,
+                            synced_at=sync_started_at,
+                            existing_keys=existing_attachment_keys,
+                            max_bytes=self._settings.gmail_attachment_max_bytes,
+                            text_max_chars=self._settings.gmail_attachment_text_max_chars,
+                        )
+                    )
             self._warehouse.insert_messages(rows)
+            self._warehouse.insert_attachments(attachment_rows)
             messages_written += len(rows)
+            attachments_written += len(attachment_rows)
+            attachment_text_chars += sum(len(str(row["text"])) for row in attachment_rows)
             self._logger.info(
-                "Synced %s changed Gmail messages for %s so far",
+                "Synced %s changed Gmail messages and %s Gmail attachment rows for %s so far",
                 messages_written,
+                attachments_written,
                 account.email_address,
             )
 
@@ -278,8 +361,152 @@ class GmailSyncRunner:
             next_history_id=next_history_id,
             messages_written=messages_written,
             deleted_messages=deleted_messages,
+            attachments_written=attachments_written,
+            attachment_text_chars=attachment_text_chars,
             query=None,
         )
+
+    def _attachment_rows_for_messages(
+        self,
+        *,
+        account: GmailAccount,
+        service,
+        messages: list[Mapping[str, object]],
+        message_ids: list[str],
+        synced_at: datetime,
+        force_reprocess: bool = False,
+    ) -> list[dict[str, object]]:
+        if not messages:
+            return []
+        existing_attachment_keys = self._warehouse.existing_attachment_keys(
+            account=account.email_address,
+            message_ids=message_ids,
+        )
+        rows: list[dict[str, object]] = []
+        for message in messages:
+            rows.extend(
+                attachment_rows_for_message(
+                    account=account.email_address,
+                    service=service,
+                    message=message,
+                    synced_at=synced_at,
+                    existing_keys=existing_attachment_keys,
+                    max_bytes=self._settings.gmail_attachment_max_bytes,
+                    text_max_chars=self._settings.gmail_attachment_text_max_chars,
+                    force_reprocess=force_reprocess,
+                )
+            )
+        return rows
+
+    def _with_attachment_backfill(
+        self,
+        *,
+        account: GmailAccount,
+        service,
+        summary: MailboxSyncSummary,
+    ) -> MailboxSyncSummary:
+        try:
+            candidates, rows_written, text_chars = self._backfill_attachment_candidates(
+                account=account,
+                service=service,
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "Skipping Gmail attachment backfill for %s because it failed: %s",
+                account.email_address,
+                exc,
+            )
+            return summary
+        return replace(
+            summary,
+            attachments_written=summary.attachments_written + rows_written,
+            attachment_text_chars=summary.attachment_text_chars + text_chars,
+            attachment_backfill_candidates=candidates,
+            attachment_backfill_rows_written=rows_written,
+        )
+
+    def _backfill_attachment_candidates(self, *, account: GmailAccount, service) -> tuple[int, int, int]:
+        limit = self._settings.gmail_attachment_backfill_batch_size
+        if limit <= 0:
+            return (0, 0, 0)
+
+        messages = self._warehouse.load_attachment_backfill_candidate_messages(
+            account=account.email_address,
+            limit=limit,
+        )
+        if not messages:
+            return (0, 0, 0)
+
+        candidates = 0
+        rows_written = 0
+        text_chars = 0
+
+        for message in messages:
+            message_id = str(message.get("id", ""))
+            if not message_id:
+                continue
+            candidates += 1
+            synced_at = datetime.now(tz=UTC)
+            try:
+                existing_keys = self._warehouse.existing_attachment_keys(
+                    account=account.email_address,
+                    message_ids=[message_id],
+                )
+                rows = attachment_rows_for_message(
+                    account=account.email_address,
+                    service=service,
+                    message=message,
+                    synced_at=synced_at,
+                    existing_keys=existing_keys,
+                    max_bytes=self._settings.gmail_attachment_max_bytes,
+                    text_max_chars=self._settings.gmail_attachment_text_max_chars,
+                    force_reprocess=True,
+                )
+                self._warehouse.insert_attachments(rows)
+                self._warehouse.insert_attachment_backfill_state(
+                    [
+                        attachment_backfill_state_row(
+                            account=account.email_address,
+                            message_id=message_id,
+                            status="ok",
+                            attachment_rows_written=len(rows),
+                            error="",
+                            updated_at=synced_at,
+                        )
+                    ]
+                )
+            except Exception as exc:
+                self._warehouse.insert_attachment_backfill_state(
+                    [
+                        attachment_backfill_state_row(
+                            account=account.email_address,
+                            message_id=message_id,
+                            status="failed",
+                            attachment_rows_written=0,
+                            error=truncate_error(str(exc)),
+                            updated_at=datetime.now(tz=UTC),
+                        )
+                    ]
+                )
+                self._logger.warning(
+                    "Failed to backfill Gmail attachments for %s message %s: %s",
+                    account.email_address,
+                    message_id,
+                    exc,
+                )
+                continue
+
+            rows_written += len(rows)
+            text_chars += sum(len(str(row["text"])) for row in rows)
+
+        self._logger.info(
+            "Backfilled Gmail attachments for %s: %s candidates, %s rows, %s text chars",
+            account.email_address,
+            candidates,
+            rows_written,
+            text_chars,
+        )
+        return (candidates, rows_written, text_chars)
 
 
 def build_gmail_service(*, account: GmailAccount, settings: Settings):
@@ -490,6 +717,541 @@ def deleted_message_row(*, account: str, message_id: str, synced_at: datetime, h
     }
 
 
+def attachment_rows_for_message(
+    *,
+    account: str,
+    service,
+    message: Mapping[str, object],
+    synced_at: datetime,
+    existing_keys: set[AttachmentKey],
+    max_bytes: int,
+    text_max_chars: int,
+    force_reprocess: bool = False,
+) -> list[dict[str, object]]:
+    message_id = str(message.get("id", ""))
+    current_parts = attachment_parts_from_message(message)
+    current_keys = {attachment_key(message_id=message_id, part=part) for part in current_parts}
+    message_existing_keys = {key for key in existing_keys if key[0] == message_id}
+
+    rows: list[dict[str, object]] = []
+    for part in current_parts:
+        key = attachment_key(message_id=message_id, part=part)
+        if key in existing_keys and not force_reprocess:
+            continue
+        rows.append(
+            attachment_part_to_row(
+                account=account,
+                service=service,
+                message=message,
+                part=part,
+                synced_at=synced_at,
+                max_bytes=max_bytes,
+                text_max_chars=text_max_chars,
+            )
+        )
+
+    for key in sorted(message_existing_keys - current_keys):
+        rows.append(
+            deleted_attachment_row(
+                account=account,
+                message_id=key[0],
+                part_id=key[1],
+                attachment_id="",
+                filename=key[2],
+                synced_at=synced_at,
+                history_id=int(message.get("historyId", 0)),
+            )
+        )
+    return rows
+
+
+def deleted_attachment_rows(
+    *,
+    account: str,
+    message_id: str,
+    existing_keys: set[AttachmentKey],
+    synced_at: datetime,
+    history_id: int,
+) -> list[dict[str, object]]:
+    return [
+        deleted_attachment_row(
+            account=account,
+            message_id=key[0],
+            part_id=key[1],
+            attachment_id="",
+            filename=key[2],
+            synced_at=synced_at,
+            history_id=history_id,
+        )
+        for key in sorted(existing_keys)
+        if key[0] == message_id
+    ]
+
+
+def deleted_attachment_row(
+    *,
+    account: str,
+    message_id: str,
+    part_id: str,
+    attachment_id: str,
+    filename: str,
+    synced_at: datetime,
+    history_id: int,
+) -> dict[str, object]:
+    sync_version = int(synced_at.timestamp() * 1000)
+    return {
+        "account": account,
+        "message_id": message_id,
+        "thread_id": "",
+        "history_id": int(history_id),
+        "internal_date": EPOCH_UTC,
+        "part_id": part_id,
+        "attachment_id": attachment_id,
+        "filename": filename,
+        "mime_type": "",
+        "content_id": "",
+        "content_disposition": "",
+        "size": 0,
+        "content_sha256": "",
+        "text": "",
+        "text_extraction_status": "deleted",
+        "text_extraction_error": "",
+        "is_deleted": 1,
+        "part_json": "{}",
+        "synced_at": synced_at,
+        "sync_version": sync_version,
+    }
+
+
+def attachment_backfill_state_row(
+    *,
+    account: str,
+    message_id: str,
+    status: str,
+    attachment_rows_written: int,
+    error: str,
+    updated_at: datetime,
+) -> dict[str, object]:
+    return {
+        "account": account,
+        "message_id": message_id,
+        "status": status,
+        "attachment_rows_written": int(attachment_rows_written),
+        "error": error,
+        "updated_at": updated_at,
+        "sync_version": int(updated_at.timestamp() * 1000),
+    }
+
+
+def attachment_part_to_row(
+    *,
+    account: str,
+    service,
+    message: Mapping[str, object],
+    part: Mapping[str, object],
+    synced_at: datetime,
+    max_bytes: int,
+    text_max_chars: int,
+) -> dict[str, object]:
+    message_id = str(message.get("id", ""))
+    headers = header_map(part.get("headers", []))
+    body = part_body(part)
+    attachment_id = str(body.get("attachmentId", ""))
+    filename = str(part.get("filename", ""))
+    mime_type = normalized_mime_type(str(part.get("mimeType", "")))
+    declared_size = int(body.get("size", 0) or 0)
+    content_sha256 = ""
+
+    if max_bytes == 0:
+        extraction = AttachmentTextExtraction(
+            text="",
+            status="disabled",
+            error="attachment downloads disabled by GMAIL_ATTACHMENT_MAX_BYTES=0",
+        )
+    elif declared_size > max_bytes:
+        extraction = AttachmentTextExtraction(
+            text="",
+            status="too_large",
+            error=f"attachment size {declared_size} exceeds GMAIL_ATTACHMENT_MAX_BYTES={max_bytes}",
+        )
+    else:
+        try:
+            content = attachment_content_bytes(service=service, message_id=message_id, part=part)
+        except Exception as exc:
+            content = b""
+            extraction = AttachmentTextExtraction(
+                text="",
+                status="fetch_error",
+                error=truncate_error(str(exc)),
+            )
+        else:
+            if not content:
+                extraction = AttachmentTextExtraction(text="", status="no_content")
+            elif len(content) > max_bytes:
+                extraction = AttachmentTextExtraction(
+                    text="",
+                    status="too_large",
+                    error=f"attachment content length {len(content)} exceeds GMAIL_ATTACHMENT_MAX_BYTES={max_bytes}",
+                )
+            else:
+                content_sha256 = hashlib.sha256(content).hexdigest()
+                declared_size = declared_size or len(content)
+                extraction = extract_attachment_text(
+                    content=content,
+                    mime_type=mime_type,
+                    filename=filename,
+                    max_chars=text_max_chars,
+                )
+
+    sync_version = int(synced_at.timestamp() * 1000)
+    return {
+        "account": account,
+        "message_id": message_id,
+        "thread_id": str(message.get("threadId", "")),
+        "history_id": int(message.get("historyId", 0)),
+        "internal_date": internal_date_from_message(message),
+        "part_id": str(part.get("partId", "")),
+        "attachment_id": attachment_id,
+        "filename": filename,
+        "mime_type": mime_type,
+        "content_id": headers.get("content-id", ""),
+        "content_disposition": headers.get("content-disposition", ""),
+        "size": declared_size,
+        "content_sha256": content_sha256,
+        "text": extraction.text,
+        "text_extraction_status": extraction.status,
+        "text_extraction_error": extraction.error,
+        "is_deleted": 0,
+        "part_json": attachment_part_json(part),
+        "synced_at": synced_at,
+        "sync_version": sync_version,
+    }
+
+
+def attachment_parts_from_message(message: Mapping[str, object]) -> list[Mapping[str, object]]:
+    payload = message.get("payload", {})
+    if not isinstance(payload, Mapping):
+        return []
+    return [part for part in walk_parts(payload) if is_attachment_part(part)]
+
+
+def is_attachment_part(part: Mapping[str, object]) -> bool:
+    body = part_body(part)
+    headers = header_map(part.get("headers", []))
+    content_disposition = headers.get("content-disposition", "").lower()
+    return bool(
+        str(part.get("filename", ""))
+        or body.get("attachmentId")
+        or content_disposition.startswith("attachment")
+        or content_disposition.startswith("inline")
+    )
+
+
+def attachment_key(*, message_id: str, part: Mapping[str, object]) -> AttachmentKey:
+    body = part_body(part)
+    return (
+        message_id,
+        str(part.get("partId", "")),
+        str(part.get("filename", "")),
+    )
+
+
+def part_body(part: Mapping[str, object]) -> Mapping[str, object]:
+    body = part.get("body", {})
+    if isinstance(body, Mapping):
+        return body
+    return {}
+
+
+def attachment_content_bytes(*, service, message_id: str, part: Mapping[str, object]) -> bytes:
+    body = part_body(part)
+    data = body.get("data")
+    if data:
+        return decode_base64url_bytes(data)
+    attachment_id = body.get("attachmentId")
+    if attachment_id:
+        return fetch_attachment_bytes(service=service, message_id=message_id, attachment_id=str(attachment_id))
+    return b""
+
+
+def fetch_attachment_bytes(*, service, message_id: str, attachment_id: str) -> bytes:
+    response = execute_gmail_request(
+        lambda: service.users()
+        .messages()
+        .attachments()
+        .get(userId="me", messageId=message_id, id=attachment_id)
+        .execute()
+    )
+    return decode_base64url_bytes(response.get("data"))
+
+
+def extract_attachment_text(
+    *,
+    content: bytes,
+    mime_type: str,
+    filename: str,
+    max_chars: int,
+) -> AttachmentTextExtraction:
+    try:
+        text = raw_attachment_text(
+            content=content,
+            mime_type=mime_type,
+            filename=filename,
+            max_chars=max_chars,
+        )
+    except Exception as exc:
+        return AttachmentTextExtraction(text="", status="error", error=truncate_error(str(exc)))
+    if text is None:
+        return AttachmentTextExtraction(text="", status="unsupported")
+
+    text = normalize_markdown(text)
+    if not text:
+        return AttachmentTextExtraction(text="", status="empty")
+    if len(text) > max_chars:
+        return AttachmentTextExtraction(text=text[:max_chars], status="truncated")
+    return AttachmentTextExtraction(text=text, status="ok")
+
+
+def raw_attachment_text(
+    *,
+    content: bytes,
+    mime_type: str,
+    filename: str,
+    max_chars: int,
+    archive_depth: int = 0,
+) -> str | None:
+    extension = Path(filename.lower()).suffix
+    if mime_type == "text/html" or extension in {".html", ".htm"}:
+        return html_attachment_text(content)
+    if is_plain_text_attachment(mime_type=mime_type, extension=extension):
+        return decode_text_bytes(content)
+    if mime_type == "application/pdf" or extension == ".pdf":
+        return pdf_attachment_text(content)
+    if extension in {".docx", ".pptx", ".xlsx"} or mime_type in {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }:
+        return office_open_xml_attachment_text(content)
+    if is_zip_attachment(mime_type=mime_type, extension=extension):
+        return zip_attachment_text(
+            content=content,
+            max_chars=max_chars,
+            archive_depth=archive_depth,
+        )
+    if looks_like_text(content):
+        return decode_text_bytes(content)
+    return None
+
+
+def is_zip_attachment(*, mime_type: str, extension: str) -> bool:
+    return mime_type in ZIP_MIME_TYPES or extension in ZIP_EXTENSIONS
+
+
+def is_plain_text_attachment(*, mime_type: str, extension: str) -> bool:
+    if mime_type.startswith("text/"):
+        return True
+    return mime_type in {
+        "application/json",
+        "application/ld+json",
+        "application/xml",
+        "application/yaml",
+        "application/x-yaml",
+        "application/javascript",
+        "application/x-sh",
+        "message/rfc822",
+    } or extension in {
+        ".txt",
+        ".text",
+        ".md",
+        ".markdown",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".jsonl",
+        ".xml",
+        ".yaml",
+        ".yml",
+        ".ics",
+        ".log",
+        ".py",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".go",
+        ".rs",
+        ".rb",
+        ".php",
+        ".java",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".sql",
+        ".sh",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+    }
+
+
+def html_attachment_text(content: bytes) -> str:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(decode_text_bytes(content), "html.parser")
+    return soup.get_text("\n")
+
+
+def pdf_attachment_text(content: bytes) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(BytesIO(content))
+    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def office_open_xml_attachment_text(content: bytes) -> str:
+    text_parts: list[str] = []
+    with zipfile.ZipFile(BytesIO(content)) as archive:
+        for name in sorted(archive.namelist()):
+            if not should_extract_office_xml(name):
+                continue
+            try:
+                root = ET.fromstring(archive.read(name))
+            except ET.ParseError:
+                continue
+            for element in root.iter():
+                if element.text and element.text.strip():
+                    text_parts.append(element.text.strip())
+    return "\n".join(text_parts)
+
+
+def zip_attachment_text(*, content: bytes, max_chars: int, archive_depth: int = 0) -> str | None:
+    if archive_depth > ZIP_MAX_RECURSION_DEPTH:
+        return None
+
+    text_parts: list[str] = []
+    total_uncompressed_bytes = 0
+    with zipfile.ZipFile(BytesIO(content)) as archive:
+        for member_index, info in enumerate(archive.infolist()):
+            if member_index >= ZIP_MAX_MEMBERS or len("\n\n".join(text_parts)) >= max_chars:
+                break
+            if info.is_dir() or info.flag_bits & 0x1:
+                continue
+            if info.file_size > ZIP_MAX_MEMBER_BYTES:
+                continue
+            total_uncompressed_bytes += info.file_size
+            if total_uncompressed_bytes > ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES:
+                break
+
+            member_name = info.filename
+            try:
+                member_content = archive.read(info)
+            except RuntimeError:
+                continue
+
+            member_text = raw_attachment_text(
+                content=member_content,
+                mime_type=mime_type_from_filename(member_name),
+                filename=member_name,
+                max_chars=max_chars,
+                archive_depth=archive_depth + 1,
+            )
+            if not member_text:
+                continue
+            remaining_chars = max_chars - len("\n\n".join(text_parts))
+            if remaining_chars <= 0:
+                break
+            marker = f"## {member_name}"
+            body = normalize_markdown(member_text)
+            if not body:
+                continue
+            section = f"{marker}\n\n{body}"
+            text_parts.append(section[:remaining_chars])
+
+    if not text_parts:
+        return None
+    return "\n\n".join(text_parts)
+
+
+def mime_type_from_filename(filename: str) -> str:
+    extension = Path(filename.lower()).suffix
+    if extension in {".html", ".htm"}:
+        return "text/html"
+    if extension == ".pdf":
+        return "application/pdf"
+    if extension == ".docx":
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if extension == ".pptx":
+        return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    if extension == ".xlsx":
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if extension in ZIP_EXTENSIONS:
+        return "application/zip"
+    return ""
+
+
+def should_extract_office_xml(name: str) -> bool:
+    if not name.endswith(".xml"):
+        return False
+    return name.startswith(
+        (
+            "word/",
+            "ppt/slides/",
+            "ppt/notesSlides/",
+            "xl/sharedStrings.xml",
+            "xl/worksheets/",
+            "docProps/",
+        )
+    )
+
+
+def decode_text_bytes(content: bytes) -> str:
+    try:
+        return content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    if content.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return content.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    return content.decode("latin-1")
+
+
+def looks_like_text(content: bytes) -> bool:
+    sample = content[:4096]
+    if b"\x00" in sample:
+        return False
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def attachment_part_json(part: Mapping[str, object]) -> str:
+    body = part_body(part)
+    scrubbed_body = dict(body)
+    if "data" in scrubbed_body:
+        scrubbed_body["data"] = "<redacted>"
+    scrubbed_part = dict(part)
+    scrubbed_part["body"] = scrubbed_body
+    return json.dumps(scrubbed_part, sort_keys=True, separators=(",", ":"))
+
+
+def normalized_mime_type(value: str) -> str:
+    return value.split(";", 1)[0].strip().lower()
+
+
+def truncate_error(value: str, limit: int = 2000) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit]
+
+
 def internal_date_from_message(message: Mapping[str, object]) -> datetime:
     value = message.get("internalDate")
     if value is None:
@@ -643,12 +1405,15 @@ def walk_parts(payload: Mapping[str, object]) -> Iterator[Mapping[str, object]]:
 
 
 def decode_base64url(value: object) -> str:
+    return decode_base64url_bytes(value).decode("utf-8", errors="replace")
+
+
+def decode_base64url_bytes(value: object) -> bytes:
     if not value:
-        return ""
+        return b""
     encoded = str(value)
     padding = "=" * (-len(encoded) % 4)
-    decoded = base64.urlsafe_b64decode(encoded + padding)
-    return decoded.decode("utf-8", errors="replace")
+    return base64.urlsafe_b64decode(encoded + padding)
 
 
 def chunked(values: Sequence[str], size: int) -> Iterator[list[str]]:
