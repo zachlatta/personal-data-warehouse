@@ -779,6 +779,62 @@ def test_attachment_rows_for_message_records_ai_empty_for_non_useful_images() ->
     assert metadata["prompt_sha256"] == row["ai_prompt_sha256"]
 
 
+def test_attachment_rows_for_message_drops_non_useful_visual_summary_without_text() -> None:
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"fake decorative image bytes" * 1000)
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "decorative.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+
+    ollama = FakeOllamaResource(
+        json.dumps(
+            {
+                "is_useful": False,
+                "document_type": "unknown",
+                "summary": "A decorative gift box illustration.",
+                "visible_text": ["unknown"],
+                "entities": ["gift", "ribbon"],
+                "search_keywords": ["gift box", "ribbon graphic"],
+                "uncertainties": ["No readable text is visible."],
+            }
+        )
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(image_content) + 1,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+    )
+
+    assert rows[0]["text_extraction_status"] == "ai_empty"
+    assert rows[0]["text"] == ""
+
+
 def test_attachment_rows_for_message_keeps_content_when_ai_usefulness_flag_is_wrong() -> None:
     image_content = b"\x89PNG\r\n\x1a\n" + (b"fake receipt image bytes" * 1000)
     message = {

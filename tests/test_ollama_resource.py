@@ -127,6 +127,7 @@ def test_ollama_resource_ensure_model_starts_local_server_when_unavailable(monke
     assert args == ["ollama", "serve"]
     assert kwargs["env"]["OLLAMA_HOST"] == "127.0.0.1:11435"
     assert kwargs["env"]["OLLAMA_MODELS"] == "/tmp/ollama-models"
+    assert kwargs["env"]["GGML_METAL_TENSOR_DISABLE"] == "1"
     assert kwargs["stdout"] == subprocess.DEVNULL
     assert process.terminated is True
 

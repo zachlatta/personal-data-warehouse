@@ -66,6 +66,9 @@ class OllamaResource(ConfigurableResource):
             return
         env = dict(os.environ)
         env["OLLAMA_HOST"] = ollama_host_from_base_url(self.normalized_base_url)
+        # Keeps Apple Silicon Metal acceleration while avoiding a known Metal 4
+        # cooperative-tensor compile crash on current M-series hardware.
+        env.setdefault("GGML_METAL_TENSOR_DISABLE", "1")
         if self.models_dir:
             env["OLLAMA_MODELS"] = self.models_dir
             os.makedirs(self.models_dir, exist_ok=True)

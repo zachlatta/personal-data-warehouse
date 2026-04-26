@@ -48,7 +48,7 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v6"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v8"
 ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
 
 Return only concise JSON with this schema:
@@ -64,11 +64,11 @@ Return only concise JSON with this schema:
 
 Use arrays for visible_text, entities, search_keywords, and uncertainties, even when there is only one item.
 
-OCR first: extract titles, headings, bullets, labels, legends, names, dates, orgs, brands, numbers, and calls to action before writing a caption. For charts, include axis labels, legends, and visible values. For logos, extract the organization or brand name. For photos, briefly describe people, setting, activity, and objects, and extract readable signs/posters/slides.
+OCR first: extract titles, headings, bullets, labels, legends, names, dates, orgs, brands, numbers, and calls to action before writing a caption. For charts, include axis labels, legends, and visible values. For logos and wordmarks, inspect every text region, including small text at the bottom or edges, and include the full visible phrase rather than only the largest words. For photos, briefly describe people, setting, activity, and objects, and extract readable signs/posters/slides.
 
-Logos and wordmarks are useful: set document_type to "logo", put the exact brand text in visible_text, and put the normalized brand/org name in entities. Ads, banners, posters, screenshots, charts, and slides are useful when they contain readable text or meaningful visual context.
+If any readable text exists anywhere in the image, is_useful must be true. Logos and wordmarks are useful: set document_type to "logo", put all exact brand text in visible_text, and put the normalized brand/org name in entities. Ads, banners, posters, screenshots, charts, and slides are useful when they contain readable text or meaningful visual context.
 
-Never call the image a Gmail placeholder or Gmail interface unless Gmail UI or a literal Gmail attachment placeholder is visible. Do not infer visible text from the filename. Preserve acronyms and capitalization in OCR text, such as AI, DoD, UC Berkeley, CLTC, and FAST COMPANY. If text is partially uncertain, include your best reading and add "(uncertain)" or an uncertainties note. Avoid generic keywords such as image, attachment, photo, and Gmail unless they are literally visible or specifically useful.
+Never call the image a Gmail placeholder or Gmail interface unless Gmail UI or a literal Gmail attachment placeholder is visible. Do not infer visible text from the filename or from these instructions. Preserve acronyms and capitalization exactly as they appear in OCR text. Only include text that is visibly printed in the image; do not turn incidental shapes, shadows, monitors, or decorative marks into OCR text. If no text is visible, visible_text must be [] rather than ["unknown"], ["none"], or prose. If text is partially uncertain, include your best reading and add "(uncertain)" or an uncertainties note. Avoid generic keywords such as image, attachment, photo, and Gmail unless they are literally visible or specifically useful.
 
 Use false for is_useful only for blank/decorative/tracking images or literal placeholders with no useful visible text. Do not invent details."""
 ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
@@ -1380,9 +1380,9 @@ def format_attachment_ai_response(response_text: str) -> str:
     document_type = attachment_ai_response_field(payload, "document_type", "likely_document_type")
     summary = attachment_ai_response_field(payload, "summary", "scene_summary")
     document_context = attachment_ai_response_field(payload, "document_context")
-    visible_text_value = attachment_ai_response_text(payload.get("visible_text", ""), separator="\n")
-    entities = attachment_ai_response_text(payload.get("entities", ""), separator=", ")
-    search_keywords = attachment_ai_response_text(
+    visible_text_value = attachment_ai_response_indexable_text(payload.get("visible_text", ""), separator="\n")
+    entities = attachment_ai_response_indexable_text(payload.get("entities", ""), separator=", ")
+    search_keywords = attachment_ai_response_indexable_text(
         attachment_ai_response_first(payload, "search_keywords", "useful_for_search"),
         separator=", ",
     )
@@ -1494,24 +1494,35 @@ def attachment_ai_response_text(value: object, *, separator: str = " ") -> str:
     return str(value).strip()
 
 
+def attachment_ai_response_indexable_text(value: object, *, separator: str = " ") -> str:
+    if isinstance(value, list):
+        return separator.join(
+            item
+            for item in (str(item).strip() for item in value)
+            if item and not attachment_ai_response_value_is_non_indexable(item)
+        )
+    text = str(value).strip()
+    if attachment_ai_response_value_is_non_indexable(text):
+        return ""
+    return text
+
+
+def attachment_ai_response_value_is_non_indexable(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    return normalized in {
+        "",
+        "n a",
+        "no readable text",
+        "no text",
+        "none",
+        "not applicable",
+        "unknown",
+    }
+
+
 def attachment_ai_response_has_indexable_content(payload: Mapping[str, object]) -> bool:
-    values = [
-        payload.get("document_type", ""),
-        payload.get("scene_summary", ""),
-        payload.get("summary", ""),
-        payload.get("visible_text", ""),
-        payload.get("likely_document_type", ""),
-        payload.get("document_context", ""),
-        payload.get("entities", ""),
-        payload.get("search_keywords", ""),
-        payload.get("useful_for_search", ""),
-        payload.get("uncertainties", ""),
-    ]
-    for value in values:
-        text = attachment_ai_response_text(value)
-        if re.search(r"[A-Za-z0-9]", text):
-            return True
-    return False
+    text = attachment_ai_response_indexable_text(payload.get("visible_text", ""))
+    return bool(re.search(r"[A-Za-z0-9]", text))
 
 
 def raw_attachment_text(
