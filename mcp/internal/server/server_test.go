@@ -24,6 +24,10 @@ func (f fakeRunner) Query(_ context.Context, sql string, maxRows int) (query.Raw
 
 func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	runner := fakeRunner{results: map[string]query.RawResult{
+		"SELECT currentDatabase() AS database": {
+			Columns: []string{"database"},
+			Rows:    []map[string]any{{"database": "default"}},
+		},
 		"SHOW TABLES": {
 			Columns: []string{"name"},
 			Rows:    []map[string]any{{"name": "gmail_messages"}},
@@ -76,22 +80,15 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("schema_overview returned error: %#v", result.Content)
 	}
-	if len(result.Content) != 2 {
+	if len(result.Content) != 1 {
 		t.Fatalf("content length = %d", len(result.Content))
 	}
 	text, ok := result.Content[0].(*mcp.TextContent)
 	if !ok {
 		t.Fatalf("content type = %T", result.Content[0])
 	}
-	if !strings.Contains(text.Text, "table,column,type") || !strings.Contains(text.Text, "gmail_messages,subject,String") {
+	if !strings.Contains(text.Text, "# default.gmail_messages") || !strings.Contains(text.Text, "subject\nhello") {
 		t.Fatalf("unexpected schema overview text: %q", text.Text)
-	}
-	sampleText, ok := result.Content[1].(*mcp.TextContent)
-	if !ok {
-		t.Fatalf("sample content type = %T", result.Content[1])
-	}
-	if sampleText.Text != "subject\nhello" {
-		t.Fatalf("unexpected sample text: %q", sampleText.Text)
 	}
 
 	cancel()

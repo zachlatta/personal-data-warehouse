@@ -98,7 +98,17 @@ It also exposes a schema overview MCP tool:
 }
 ```
 
-`schema_overview` returns one schema CSV with `table`, `column`, `type`, `default_type`, `default_expression`, and `comment` columns, then one sample CSV per table with up to three rows from that table. Sample rows use the same long-field truncation metadata as normal query results. The schema map only uses `SHOW TABLES` and `DESCRIBE TABLE` against the default database, so it does not require access to ClickHouse `system.*` metadata tables.
+`schema_overview` returns one text block with a section per table:
+
+```text
+# database.table_name
+
+column1,column2,column3
+sample row 1
+sample row 2
+```
+
+It uses `currentDatabase()` and `SHOW TABLES` against the current ClickHouse database, then samples up to three rows per table. Sample cell values are capped at 15 characters to keep the preview compact; truncation metadata is included when a preview value is shortened. It does not require access to ClickHouse `system.*` metadata tables.
 
 ## Verify
 

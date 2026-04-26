@@ -34,6 +34,7 @@ type Service struct {
 }
 
 const schemaSampleRows = 3
+const schemaSampleFieldChars = 15
 
 type Response struct {
 	Results []Result `json:"results"`
@@ -154,9 +155,22 @@ func (s *Service) Execute(ctx context.Context, sql []string) Response {
 
 func (s *Service) SchemaOverview(ctx context.Context) Response {
 	const showTablesSQL = "SHOW TABLES"
+	const currentDatabaseSQL = "SELECT currentDatabase() AS database"
 	started := time.Now()
-	schemaResult := Result{SQL: "SHOW TABLES + DESCRIBE TABLE <each table>"}
+	schemaResult := Result{SQL: "SELECT currentDatabase() + SHOW TABLES + SELECT * FROM <each table> LIMIT 3"}
 	s.logger.InfoContext(ctx, "schema overview started")
+
+	databaseResult, err := s.runner.Query(ctx, currentDatabaseSQL, 1)
+	if err != nil {
+		schemaResult.Error = err.Error()
+		schemaResult.CSV = errorCSV(schemaResult.Error)
+		s.logger.ErrorContext(ctx, "schema overview database lookup failed", "sql", currentDatabaseSQL, "error", err, "duration", time.Since(started))
+		return Response{Results: []Result{schemaResult}}
+	}
+	database := currentDatabaseName(databaseResult)
+	if database == "" {
+		database = "default"
+	}
 
 	tablesResult, err := s.runner.Query(ctx, showTablesSQL, 0)
 	if err != nil {
@@ -168,45 +182,32 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 	tables := tableNames(tablesResult)
 	s.logger.InfoContext(ctx, "schema overview tables listed", "tables", len(tables))
 
-	rows := make([]map[string]any, 0)
-	sampleResults := make([]Result, 0, len(tables))
-	for _, table := range tables {
-		describeSQL := "DESCRIBE TABLE " + quoteClickHouseIdentifier(table)
-		describeStarted := time.Now()
-		s.logger.DebugContext(ctx, "schema overview describe started", "table", table, "sql", describeSQL)
-		describeResult, err := s.runner.Query(ctx, describeSQL, 0)
-		if err != nil {
-			schemaResult.Error = err.Error()
-			schemaResult.CSV = errorCSV(schemaResult.Error)
-			s.logger.ErrorContext(ctx, "schema overview describe failed", "table", table, "sql", describeSQL, "error", err, "duration", time.Since(describeStarted))
+	var out strings.Builder
+	overviewTrunc := Truncation{MaxRows: schemaSampleRows, MaxFieldChars: schemaSampleFieldChars}
+	for i, table := range tables {
+		sample := s.sampleRows(ctx, table)
+		if sample.Error != "" {
+			schemaResult.Error = sample.Error
+			schemaResult.CSV = sample.CSV
 			return Response{Results: []Result{schemaResult}}
 		}
-		for _, column := range describeResult.Rows {
-			rows = append(rows, map[string]any{
-				"table":              table,
-				"column":             rowString(column, "name"),
-				"type":               rowString(column, "type"),
-				"default_type":       rowString(column, "default_type"),
-				"default_expression": rowString(column, "default_expression"),
-				"comment":            rowString(column, "comment"),
-			})
+		if i > 0 {
+			out.WriteString("\n")
 		}
-		s.logger.DebugContext(ctx, "schema overview describe completed", "table", table, "columns", len(describeResult.Rows), "duration", time.Since(describeStarted))
-		sampleResults = append(sampleResults, s.sampleRows(ctx, table))
+		out.WriteString("# ")
+		out.WriteString(database)
+		out.WriteString(".")
+		out.WriteString(table)
+		out.WriteString("\n\n")
+		out.WriteString(sample.CSV)
+		out.WriteString("\n")
+		overviewTrunc.Fields = append(overviewTrunc.Fields, sample.Truncated.Fields...)
 	}
 
-	schemaResult.CSV, err = rowsToCSV([]string{"table", "column", "type", "default_type", "default_expression", "comment"}, rows)
-	if err != nil {
-		schemaResult.Error = err.Error()
-		schemaResult.CSV = errorCSV(schemaResult.Error)
-		s.logger.ErrorContext(ctx, "schema overview encoding failed", "error", err, "duration", time.Since(started))
-		return Response{Results: []Result{schemaResult}}
-	}
-	results := make([]Result, 0, 1+len(sampleResults))
-	results = append(results, schemaResult)
-	results = append(results, sampleResults...)
-	s.logger.InfoContext(ctx, "schema overview completed", "tables", len(tables), "columns", len(rows), "sample_results", len(sampleResults), "duration", time.Since(started))
-	return Response{Results: results}
+	schemaResult.CSV = out.String()
+	schemaResult.Truncated = overviewTrunc
+	s.logger.InfoContext(ctx, "schema overview completed", "database", database, "tables", len(tables), "truncated_fields", len(overviewTrunc.Fields), "duration", time.Since(started))
+	return Response{Results: []Result{schemaResult}}
 }
 
 func (s *Service) sampleRows(ctx context.Context, table string) Result {
@@ -221,7 +222,7 @@ func (s *Service) sampleRows(ctx context.Context, table string) Result {
 		s.logger.ErrorContext(ctx, "schema overview sample failed", "table", table, "sql", sampleSQL, "error", err, "duration", time.Since(started))
 		return result
 	}
-	rows, trunc := s.truncateRowsWithMaxRows(raw.Rows, schemaSampleRows)
+	rows, trunc := s.truncateSampleRows(raw.Rows)
 	result.Truncated = trunc
 	result.CSV, err = rowsToCSV(raw.Columns, rows)
 	if err != nil {
@@ -260,6 +261,23 @@ func (s *Service) truncateRowsWithMaxRows(rows []map[string]any, maxRows int) ([
 	return out, trunc
 }
 
+func (s *Service) truncateSampleRows(rows []map[string]any) ([]map[string]any, Truncation) {
+	trunc := Truncation{MaxRows: schemaSampleRows, MaxFieldChars: schemaSampleFieldChars}
+	if len(rows) > schemaSampleRows {
+		trunc.Rows = true
+		rows = rows[:schemaSampleRows]
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for rowIndex, row := range rows {
+		copied := make(map[string]any, len(row))
+		for column, value := range row {
+			copied[column] = s.truncatePreviewValue(rowIndex, column, csvValue(value), &trunc)
+		}
+		out = append(out, copied)
+	}
+	return out, trunc
+}
+
 func (s *Service) truncateString(rowIndex int, column, value string, trunc *Truncation) string {
 	chars := utf8.RuneCountInString(value)
 	if chars <= s.opts.MaxFieldChars {
@@ -274,6 +292,22 @@ func (s *Service) truncateString(rowIndex int, column, value string, trunc *Trun
 		Instructions:  fullFieldInstructions(column, s.opts.MaxFieldChars),
 	})
 	return string(runes[:s.opts.MaxFieldChars])
+}
+
+func (s *Service) truncatePreviewValue(rowIndex int, column, value string, trunc *Truncation) string {
+	chars := utf8.RuneCountInString(value)
+	if chars <= schemaSampleFieldChars {
+		return value
+	}
+	runes := []rune(value)
+	trunc.Fields = append(trunc.Fields, FieldTruncation{
+		Row:           rowIndex,
+		Column:        column,
+		ReturnedChars: schemaSampleFieldChars,
+		OriginalChars: chars,
+		Instructions:  fullFieldInstructions(column, schemaSampleFieldChars),
+	})
+	return string(runes[:schemaSampleFieldChars])
 }
 
 func fullFieldInstructions(column string, chunkSize int) string {
@@ -338,6 +372,17 @@ func tableNames(result RawResult) []string {
 		}
 	}
 	return tables
+}
+
+func currentDatabaseName(result RawResult) string {
+	if len(result.Rows) == 0 {
+		return ""
+	}
+	name := rowString(result.Rows[0], "database")
+	if name == "" && len(result.Columns) == 1 {
+		name = rowString(result.Rows[0], result.Columns[0])
+	}
+	return name
 }
 
 func rowString(row map[string]any, column string) string {
