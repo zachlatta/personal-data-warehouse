@@ -519,7 +519,7 @@ def test_attachment_rows_for_message_fetches_attachment_id_content() -> None:
 
 
 def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) -> None:
-    image_content = b"\x89PNG\r\n\x1a\nfake screenshot bytes"
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"fake screenshot bytes" * 1000)
     message = {
         "id": "gmail-id",
         "threadId": "thread-id",
@@ -554,7 +554,7 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
         message=message,
         synced_at=datetime(2026, 4, 23, tzinfo=UTC),
         existing_keys=set(),
-        max_bytes=100,
+        max_bytes=len(image_content) + 1,
         text_max_chars=1000,
         ai_fallback=AttachmentAiFallbackConfig(
             provider="ollama",
@@ -596,7 +596,7 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
 
 
 def test_attachment_rows_for_message_records_ai_empty_for_non_useful_images() -> None:
-    image_content = b"\x89PNG\r\n\x1a\nfake blank image bytes"
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"fake blank image bytes" * 1000)
     message = {
         "id": "gmail-id",
         "threadId": "thread-id",
@@ -632,7 +632,7 @@ def test_attachment_rows_for_message_records_ai_empty_for_non_useful_images() ->
         message=message,
         synced_at=datetime(2026, 4, 23, tzinfo=UTC),
         existing_keys=set(),
-        max_bytes=100,
+        max_bytes=len(image_content) + 1,
         text_max_chars=1000,
         ai_fallback=AttachmentAiFallbackConfig(
             provider="ollama",
@@ -659,7 +659,7 @@ def test_attachment_rows_for_message_records_ai_empty_for_non_useful_images() ->
 
 
 def test_attachment_rows_for_message_keeps_content_when_ai_usefulness_flag_is_wrong() -> None:
-    image_content = b"\x89PNG\r\n\x1a\nfake receipt image bytes"
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"fake receipt image bytes" * 1000)
     message = {
         "id": "gmail-id",
         "threadId": "thread-id",
@@ -695,7 +695,7 @@ def test_attachment_rows_for_message_keeps_content_when_ai_usefulness_flag_is_wr
         message=message,
         synced_at=datetime(2026, 4, 23, tzinfo=UTC),
         existing_keys=set(),
-        max_bytes=100,
+        max_bytes=len(image_content) + 1,
         text_max_chars=1000,
         ai_fallback=AttachmentAiFallbackConfig(
             provider="ollama",
@@ -716,7 +716,7 @@ def test_attachment_rows_for_message_keeps_content_when_ai_usefulness_flag_is_wr
 
 
 def test_attachment_rows_for_message_parses_json_string_wrapped_ai_response() -> None:
-    image_content = b"\x89PNG\r\n\x1a\nfake placeholder image bytes"
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"fake placeholder image bytes" * 1000)
     message = {
         "id": "gmail-id",
         "threadId": "thread-id",
@@ -756,7 +756,7 @@ def test_attachment_rows_for_message_parses_json_string_wrapped_ai_response() ->
         message=message,
         synced_at=datetime(2026, 4, 23, tzinfo=UTC),
         existing_keys=set(),
-        max_bytes=100,
+        max_bytes=len(image_content) + 1,
         text_max_chars=1000,
         ai_fallback=AttachmentAiFallbackConfig(
             provider="ollama",
@@ -771,6 +771,50 @@ def test_attachment_rows_for_message_parses_json_string_wrapped_ai_response() ->
 
     assert rows[0]["text_extraction_status"] == "ai_empty"
     assert rows[0]["text"] == ""
+
+
+def test_attachment_rows_for_message_skips_tiny_images_for_ai_fallback() -> None:
+    image_content = b"\x89PNG\r\n\x1a\nsmall"
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "tracking.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+    ollama = FakeOllamaResource("{}")
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(image_content) + 1,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+    )
+
+    assert rows[0]["text_extraction_status"] == "unsupported"
+    assert rows[0]["ai_model"] == ""
+    assert ollama.generate_calls == []
 
 
 def test_attachment_ai_call_timeout_returns_control() -> None:

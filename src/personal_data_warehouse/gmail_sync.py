@@ -60,6 +60,7 @@ Return concise JSON with these keys:
 
 If text is unclear, say so. Do not invent details."""
 ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
+ATTACHMENT_AI_MIN_IMAGE_BYTES = 16 * 1024
 IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 T = TypeVar("T")
@@ -1228,6 +1229,8 @@ def attachment_ai_fallback_images(
 
 
 def is_supported_image_attachment(*, content: bytes, mime_type: str, extension: str) -> bool:
+    if len(content) < ATTACHMENT_AI_MIN_IMAGE_BYTES:
+        return False
     if mime_type in IMAGE_MIME_TYPES or extension in IMAGE_EXTENSIONS:
         return looks_like_supported_image(content)
     return looks_like_supported_image(content)
