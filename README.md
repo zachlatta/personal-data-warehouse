@@ -130,6 +130,12 @@ Slack sync splits freshness, coverage, and metadata into separate schedules. The
 with smaller batches, and `slack_workspace_metadata_sync_every_fifteen_minutes` refreshes one
 capped page of active conversation metadata at a time. `slack_workspace_user_sync_hourly`
 refreshes the full Slack user list outside the more frequent metadata path.
+`slack_workspace_thread_sync_every_five_minutes` backfills `conversations.replies` for known
+thread parents. It defaults to one thread per run and only revisits completed threads when the
+parent's `latest_reply_ts` has advanced beyond the stored thread cursor, so it remains gentle on
+Slack's thread API rate limits. Threads that already produced Slack API errors are skipped by the
+scheduled pass so one inaccessible thread does not block the backlog. Configure it with
+`SLACK_ASSET_THREAD_LIMIT`, `SLACK_ASSET_THREAD_SINCE_DAYS`, and `SLACK_ASSET_THREAD_ORDER`.
 Freshness stages also poll capped sets of cached conversations per type, ordered by recent
 activity, so each scheduled run remains bounded.
 All Slack schedules share a nonblocking Slack lock, so a scheduled tick skips if another Slack

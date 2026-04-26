@@ -525,6 +525,7 @@ class SlackSyncRunner:
             since_ts=since_ts,
             limit=self._thread_limit,
             skip_completed=self._skip_completed_threads,
+            skip_known_errors=self._skip_known_errors,
             order=self._thread_order,
         )
         messages_written = 0
@@ -532,9 +533,15 @@ class SlackSyncRunner:
         for index, thread_ref in enumerate(thread_refs, start=1):
             conversation_id = str(thread_ref["conversation_id"])
             thread_ts = str(thread_ref["thread_ts"])
+            latest_reply_ts = str(thread_ref.get("latest_reply_ts") or "")
             object_id = thread_state_object_id(conversation_id=conversation_id, thread_ts=thread_ts)
             state = state_by_key.get((account.account, team_id, "thread", object_id))
-            if self._skip_completed_threads and self._state_is_ok(state):
+            if self._skip_known_errors and self._state_has_status(state, "error"):
+                continue
+            if self._skip_completed_threads and self._thread_state_covers_latest_reply(
+                state,
+                latest_reply_ts=latest_reply_ts,
+            ):
                 continue
             try:
                 result = self._sync_one_thread_replies(
@@ -919,10 +926,23 @@ class SlackSyncRunner:
         return last_sync_type == "full" and status == "ok"
 
     def _state_is_ok(self, state: Any) -> bool:
+        return self._state_has_status(state, "ok")
+
+    def _state_has_status(self, state: Any, expected_status: str) -> bool:
         if not state:
             return False
         status = state.get("status") if isinstance(state, Mapping) else getattr(state, "status", "")
-        return status == "ok"
+        return status == expected_status
+
+    def _thread_state_covers_latest_reply(self, state: Any, *, latest_reply_ts: str) -> bool:
+        if not self._state_is_ok(state):
+            return False
+        if not latest_reply_ts:
+            return True
+        cursor_ts = state.get("cursor_ts") if isinstance(state, Mapping) else getattr(state, "cursor_ts", "")
+        if not cursor_ts:
+            return True
+        return float(str(cursor_ts)) >= float(latest_reply_ts)
 
     def _call(self, client, method: str, **params) -> dict[str, Any]:
         transient_attempts = 0

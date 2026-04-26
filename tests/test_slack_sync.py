@@ -138,7 +138,17 @@ class FakeWarehouse:
             payloads = payloads[:limit]
         return payloads
 
-    def load_slack_thread_parent_refs(self, *, account, team_id, since_ts=None, limit=None, skip_completed=False, order="recent"):
+    def load_slack_thread_parent_refs(
+        self,
+        *,
+        account,
+        team_id,
+        since_ts=None,
+        limit=None,
+        skip_completed=False,
+        skip_known_errors=False,
+        order="recent",
+    ):
         self.thread_ref_calls.append(
             {
                 "account": account,
@@ -146,16 +156,26 @@ class FakeWarehouse:
                 "since_ts": since_ts,
                 "limit": limit,
                 "skip_completed": skip_completed,
+                "skip_known_errors": skip_known_errors,
                 "order": order,
             }
         )
         refs = list(self.thread_refs)
-        if skip_completed:
+        if skip_known_errors:
             refs = [
                 ref
                 for ref in refs
                 if self.states.get((account, team_id, "thread", f"{ref['conversation_id']}:{ref['thread_ts']}"), {}).get("status")
-                != "ok"
+                != "error"
+            ]
+        if skip_completed:
+            refs = [
+                ref
+                for ref in refs
+                if not thread_state_covers_ref(
+                    self.states.get((account, team_id, "thread", f"{ref['conversation_id']}:{ref['thread_ts']}"), {}),
+                    ref,
+                )
             ]
         if limit is not None:
             refs = refs[:limit]
@@ -872,7 +892,11 @@ def test_runner_thread_replies_only_is_resumable(monkeypatch):
         {"conversation_id": "C2", "thread_ts": "1713974600.000100", "reply_count": 1, "latest_reply_ts": "1713974700.000100"},
     ]
     warehouse.states = {
-        ("zrl", "T1", "thread", "C1:1713974400.000100"): {"status": "ok", "last_sync_type": "thread_replies"}
+        ("zrl", "T1", "thread", "C1:1713974400.000100"): {
+            "status": "ok",
+            "last_sync_type": "thread_replies",
+            "cursor_ts": "1713974500.000100",
+        }
     }
     client = FakeSlackClient(
         {
@@ -909,3 +933,108 @@ def test_runner_thread_replies_only_is_resumable(monkeypatch):
     assert summary.sync_type == "thread_replies"
     assert summary.messages_written == 2
     assert any(update["object_type"] == "thread" and update["object_id"] == "C2:1713974600.000100" for update in warehouse.state_updates)
+
+
+def test_runner_reprocesses_completed_thread_when_latest_reply_advances(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.thread_refs = [
+        {"conversation_id": "C1", "thread_ts": "1713974400.000100", "reply_count": 2, "latest_reply_ts": "1713974600.000100"},
+    ]
+    warehouse.states = {
+        ("zrl", "T1", "thread", "C1:1713974400.000100"): {
+            "status": "ok",
+            "last_sync_type": "thread_replies",
+            "cursor_ts": "1713974500.000100",
+        }
+    }
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.replies": [
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1713974400.000100", "user": "U1", "text": "root", "reply_count": 2},
+                        {"ts": "1713974500.000100", "thread_ts": "1713974400.000100", "user": "U2", "text": "old reply"},
+                        {"ts": "1713974600.000100", "thread_ts": "1713974400.000100", "user": "U3", "text": "new reply"},
+                    ],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+
+    summary = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_thread_replies_only=True,
+        skip_completed_threads=True,
+        sleep=lambda seconds: None,
+    ).sync_all()[0]
+
+    assert [params["channel"] for method, params in client.calls if method == "conversations.replies"] == ["C1"]
+    assert summary.messages_written == 3
+    assert warehouse.state_updates[-1]["cursor_ts"] == "1713974600.000100"
+
+
+def test_runner_thread_replies_only_can_skip_known_errors(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.thread_refs = [
+        {"conversation_id": "C_ERROR", "thread_ts": "1713974400.000100", "reply_count": 1, "latest_reply_ts": "1713974500.000100"},
+        {"conversation_id": "C_OK", "thread_ts": "1713974600.000100", "reply_count": 1, "latest_reply_ts": "1713974700.000100"},
+    ]
+    warehouse.states = {
+        ("zrl", "T1", "thread", "C_ERROR:1713974400.000100"): {
+            "status": "error",
+            "last_sync_type": "thread_replies",
+            "cursor_ts": "1713974400.000100",
+        }
+    }
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.replies": [
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1713974600.000100", "user": "U1", "text": "root", "reply_count": 1},
+                        {"ts": "1713974700.000100", "thread_ts": "1713974600.000100", "user": "U2", "text": "reply"},
+                    ],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_thread_replies_only=True,
+        skip_known_errors=True,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.thread_ref_calls[0]["skip_known_errors"] is True
+    assert [params["channel"] for method, params in client.calls if method == "conversations.replies"] == ["C_OK"]
+
+
+def thread_state_covers_ref(state, ref):
+    if state.get("status") != "ok":
+        return False
+    latest_reply_ts = str(ref.get("latest_reply_ts") or "")
+    cursor_ts = str(state.get("cursor_ts") or "")
+    if not latest_reply_ts or not cursor_ts:
+        return True
+    return float(cursor_ts) >= float(latest_reply_ts)

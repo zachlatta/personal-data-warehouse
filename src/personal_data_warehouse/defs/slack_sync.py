@@ -140,6 +140,23 @@ def run_slack_user_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary
     ).sync_all()
 
 
+def run_slack_thread_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
+    return SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=logger,
+        sync_users=False,
+        sync_members=False,
+        sync_thread_replies_only=True,
+        skip_completed_threads=True,
+        skip_known_errors=True,
+        thread_order=os.getenv("SLACK_ASSET_THREAD_ORDER", "recent"),
+        thread_limit=_int_env("SLACK_ASSET_THREAD_LIMIT", 1),
+        thread_since_days=_int_env("SLACK_ASSET_THREAD_SINCE_DAYS", settings.slack_thread_audit_days),
+        max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
+    ).sync_all()
+
+
 def _metadata_conversation_types_for_time(now: datetime) -> tuple[str, ...]:
     stage = ((now.hour * 60) + now.minute) // _int_env("SLACK_ASSET_METADATA_EVERY_MINUTES", 15)
     return (
@@ -260,6 +277,18 @@ def slack_workspace_user_sync(context) -> MaterializeResult:
     )
 
 
+@asset(
+    group_name="slack",
+    retry_policy=RetryPolicy(max_retries=3, delay=60),
+)
+def slack_workspace_thread_sync(context) -> MaterializeResult:
+    return _run_locked_slack_stage(
+        context,
+        stage_name="threads",
+        run_fn=run_slack_thread_sync,
+    )
+
+
 def _run_locked_slack_stage(context, *, stage_name: str, run_fn) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_slack=True)
     warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
@@ -316,6 +345,11 @@ slack_workspace_user_sync_job = define_asset_job(
     selection=[slack_workspace_user_sync],
 )
 
+slack_workspace_thread_sync_job = define_asset_job(
+    "slack_workspace_thread_sync_job",
+    selection=[slack_workspace_thread_sync],
+)
+
 
 @schedule(
     cron_schedule="* * * * *",
@@ -353,6 +387,15 @@ def slack_workspace_user_sync_hourly(context):
     return skip_if_job_active(context, job_name="slack_workspace_user_sync_job")
 
 
+@schedule(
+    cron_schedule="*/5 * * * *",
+    job=slack_workspace_thread_sync_job,
+    default_status=DefaultScheduleStatus.RUNNING,
+)
+def slack_workspace_thread_sync_every_five_minutes(context):
+    return skip_if_job_active(context, job_name="slack_workspace_thread_sync_job")
+
+
 @definitions
 def defs() -> Definitions:
     return Definitions(
@@ -361,17 +404,20 @@ def defs() -> Definitions:
             slack_workspace_coverage_sync,
             slack_workspace_metadata_sync,
             slack_workspace_user_sync,
+            slack_workspace_thread_sync,
         ],
         jobs=[
             slack_workspace_sync_job,
             slack_workspace_coverage_sync_job,
             slack_workspace_metadata_sync_job,
             slack_workspace_user_sync_job,
+            slack_workspace_thread_sync_job,
         ],
         schedules=[
             slack_workspace_sync_every_minute,
             slack_workspace_coverage_sync_every_seven_minutes,
             slack_workspace_metadata_sync_every_fifteen_minutes,
             slack_workspace_user_sync_hourly,
+            slack_workspace_thread_sync_every_five_minutes,
         ],
     )

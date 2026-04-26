@@ -1221,6 +1221,7 @@ class ClickHouseWarehouse:
         since_ts: float | None = None,
         limit: int | None = None,
         skip_completed: bool = False,
+        skip_known_errors: bool = False,
         order: str = "recent",
     ) -> list[dict[str, Any]]:
         where_clauses = [
@@ -1232,8 +1233,16 @@ class ClickHouseWarehouse:
         ]
         if since_ts is not None:
             where_clauses.append(f"toFloat64(m.message_ts) >= {since_ts:.6f}")
+        if skip_known_errors:
+            where_clauses.append("(s.object_id = '' OR s.status != 'error')")
         if skip_completed:
-            where_clauses.append("s.object_id = ''")
+            where_clauses.append(
+                "("
+                "s.object_id = '' "
+                "OR s.status != 'ok' "
+                "OR (m.latest_reply_ts != '' AND s.cursor_ts != '' AND toFloat64(m.latest_reply_ts) > toFloat64(s.cursor_ts))"
+                ")"
+            )
         order_by = "m.message_datetime DESC, m.message_ts DESC"
         if order == "reply_count":
             order_by = "m.reply_count DESC, m.message_datetime DESC, m.message_ts DESC"
@@ -1252,7 +1261,6 @@ class ClickHouseWarehouse:
                 AND m.team_id = s.team_id
                 AND s.object_type = 'thread'
                 AND concat(m.conversation_id, ':', m.message_ts) = s.object_id
-                AND s.status = 'ok'
             WHERE {" AND ".join(where_clauses)}
             ORDER BY {order_by}
             {limit_clause}
