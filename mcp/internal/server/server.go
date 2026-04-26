@@ -16,12 +16,14 @@ type queryInput struct {
 	SQL []string `json:"sql" jsonschema:"array of read-only ClickHouse SQL strings to run"`
 }
 
+const serverInstructions = "Read-only ClickHouse warehouse for Zach's personal data. Contains synced Gmail mail and attachment text for configured mailboxes, Slack workspace messages/files/users, and calendar data when present. Use for questions about those datasets; query ClickHouse SQL only."
+
 func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	svc := query.NewService(runner, opts)
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "personal-data-warehouse",
 		Version: "0.1.0",
-	}, nil)
+	}, &mcp.ServerOptions{Instructions: serverInstructions})
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "query",
 		Title:       "Query ClickHouse",
