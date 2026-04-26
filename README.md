@@ -146,14 +146,6 @@ All Slack schedules share a nonblocking Slack lock, so a scheduled tick skips if
 sync stage is still running.
 Calendar sync runs through `calendar_event_sync_every_minute` with its own nonblocking lock.
 
-Slack also creates interface-oriented views:
-
-- `slack_current_conversations`: one row per conversation with latest message time, message counts,
-  `last_read` when known, and derived unread counts.
-- `slack_current_threads`: one row per thread parent with Slack's parent `reply_count`, synced reply
-  count, unsynced reply count, thread sync state, and unread-reply signal when conversation
-  `last_read` is known.
-
 ## Docker / Coolify
 
 This repo includes a `Dockerfile` that runs Dagster on port `3000` with `uv`.
@@ -230,36 +222,6 @@ When AI fallback is enabled, successful model output is stored with `text_extrac
 or `ai_truncated`, alongside the provider, model, base URL, exact prompt, prompt hash,
 prompt version, source extraction status, elapsed time, and processing timestamp.
 Attachments that cannot be extracted still get metadata rows with `text_extraction_status`.
-
-Use `gmail_attachment_search` to search attachment text with surrounding message context:
-
-```sql
-SELECT
-  internal_date,
-  subject,
-  from_address,
-  filename,
-  text
-FROM gmail_attachment_search
-WHERE positionCaseInsensitive(text, 'search terms') > 0
-ORDER BY internal_date DESC
-LIMIT 20
-```
-
-Use `calendar_event_search` to search current calendar events:
-
-```sql
-SELECT
-  start_at,
-  summary,
-  location,
-  description
-FROM calendar_event_search
-WHERE positionCaseInsensitive(summary, 'search terms') > 0
-   OR positionCaseInsensitive(description, 'search terms') > 0
-ORDER BY start_at DESC
-LIMIT 20
-```
 
 ## Verification
 

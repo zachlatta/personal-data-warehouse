@@ -268,6 +268,17 @@ SLACK_SYNC_STATE_COLUMNS = (
     "sync_version",
 )
 
+OBSOLETE_VIEWS = (
+    "calendar_event_search",
+    "gmail_attachment_search",
+    "gmail_thread_messages",
+    "slack_ui_messages",
+    "slack_conversation_timeline",
+    "slack_thread_messages",
+    "slack_current_conversations",
+    "slack_current_threads",
+)
+
 
 @dataclass(frozen=True)
 class SyncState:
@@ -299,6 +310,8 @@ class ClickHouseWarehouse:
                 )
 
     def ensure_tables(self) -> None:
+        self._drop_obsolete_views()
+
         self._command(
             """
             CREATE TABLE IF NOT EXISTS gmail_messages (
@@ -337,38 +350,6 @@ class ClickHouseWarehouse:
         self._command("ALTER TABLE gmail_messages ADD COLUMN IF NOT EXISTS body_markdown_full String AFTER body_markdown")
         self._command(
             "ALTER TABLE gmail_messages ADD COLUMN IF NOT EXISTS body_markdown_clean String AFTER body_markdown_full"
-        )
-        self._command(
-            """
-            CREATE OR REPLACE VIEW gmail_thread_messages AS
-            SELECT
-                account,
-                thread_id,
-                internal_date,
-                message_id,
-                subject,
-                from_address,
-                to_addresses,
-                cc_addresses,
-                bcc_addresses,
-                label_ids,
-                row_number() OVER (
-                    PARTITION BY account, thread_id
-                    ORDER BY internal_date, message_id
-                ) AS thread_message_index,
-                count() OVER (
-                    PARTITION BY account, thread_id
-                ) AS thread_message_count,
-                body_markdown,
-                body_markdown_full,
-                body_markdown_clean,
-                snippet,
-                history_id,
-                synced_at
-            FROM gmail_messages FINAL
-            WHERE is_deleted = 0
-            ORDER BY account, thread_id, internal_date, message_id
-            """
         )
         self._command(
             """
@@ -437,50 +418,6 @@ class ClickHouseWarehouse:
         )
         self._command(
             """
-            CREATE OR REPLACE VIEW gmail_attachment_search AS
-            SELECT
-                a.account AS account,
-                a.message_id AS message_id,
-                m.thread_id AS thread_id,
-                m.internal_date AS internal_date,
-                m.subject AS subject,
-                m.from_address AS from_address,
-                m.to_addresses AS to_addresses,
-                m.cc_addresses AS cc_addresses,
-                m.bcc_addresses AS bcc_addresses,
-                m.label_ids AS label_ids,
-                a.part_id AS part_id,
-                a.attachment_id AS attachment_id,
-                a.filename AS filename,
-                a.mime_type AS mime_type,
-                a.content_id AS content_id,
-                a.content_disposition AS content_disposition,
-                a.size AS size,
-                a.content_sha256 AS content_sha256,
-                a.text AS text,
-                a.text_extraction_status AS text_extraction_status,
-                a.text_extraction_error AS text_extraction_error,
-                a.ai_provider AS ai_provider,
-                a.ai_model AS ai_model,
-                a.ai_base_url AS ai_base_url,
-                a.ai_prompt_version AS ai_prompt_version,
-                a.ai_prompt_sha256 AS ai_prompt_sha256,
-                a.ai_prompt AS ai_prompt,
-                a.ai_source_status AS ai_source_status,
-                a.ai_elapsed_ms AS ai_elapsed_ms,
-                a.ai_processed_at AS ai_processed_at,
-                a.synced_at AS attachment_synced_at,
-                m.synced_at AS message_synced_at
-            FROM (SELECT * FROM gmail_attachments FINAL) AS a
-            INNER JOIN (SELECT * FROM gmail_messages FINAL) AS m
-                ON a.account = m.account AND a.message_id = m.message_id
-            WHERE a.is_deleted = 0
-              AND m.is_deleted = 0
-            ORDER BY a.account, m.internal_date, a.message_id, a.part_id, a.filename
-            """
-        )
-        self._command(
-            """
             CREATE TABLE IF NOT EXISTS gmail_sync_state (
                 account LowCardinality(String),
                 last_history_id UInt64,
@@ -510,6 +447,8 @@ class ClickHouseWarehouse:
         )
 
     def ensure_calendar_tables(self) -> None:
+        self._drop_obsolete_views()
+
         self._command(
             """
             CREATE TABLE IF NOT EXISTS calendar_events (
@@ -561,36 +500,10 @@ class ClickHouseWarehouse:
             ORDER BY (account, calendar_id)
             """
         )
-        self._command(
-            """
-            CREATE OR REPLACE VIEW calendar_event_search AS
-            SELECT
-                account,
-                calendar_id,
-                event_id,
-                recurring_event_id,
-                i_cal_uid,
-                summary,
-                description,
-                location,
-                creator_email,
-                organizer_email,
-                start_at,
-                end_at,
-                start_date,
-                end_date,
-                is_all_day,
-                attendees_json,
-                html_link,
-                updated_at,
-                synced_at
-            FROM calendar_events FINAL
-            WHERE is_deleted = 0
-            ORDER BY account, calendar_id, start_at, event_id
-            """
-        )
 
     def ensure_slack_tables(self) -> None:
+        self._drop_obsolete_views()
+
         self._command(
             """
             CREATE TABLE IF NOT EXISTS slack_teams (
@@ -768,211 +681,6 @@ class ClickHouseWarehouse:
             )
             ENGINE = ReplacingMergeTree(sync_version)
             ORDER BY (account, team_id, object_type, object_id)
-            """
-        )
-        self._command(
-            """
-            CREATE OR REPLACE VIEW slack_conversation_timeline AS
-            SELECT
-                m.account AS account,
-                m.team_id AS team_id,
-                c.conversation_type,
-                c.name AS conversation_name,
-                m.conversation_id AS conversation_id,
-                m.message_ts AS message_ts,
-                m.message_datetime AS message_datetime,
-                m.thread_ts AS thread_ts,
-                m.user_id AS user_id,
-                u.display_name,
-                u.real_name,
-                u.name AS user_name,
-                m.text AS text,
-                m.reply_count AS reply_count,
-                m.latest_reply_ts AS latest_reply_ts,
-                m.raw_json AS raw_json
-            FROM (SELECT * FROM slack_messages FINAL) AS m
-            LEFT JOIN (SELECT * FROM slack_conversations FINAL) AS c
-                ON m.account = c.account AND m.team_id = c.team_id AND m.conversation_id = c.conversation_id
-            LEFT JOIN (SELECT * FROM slack_users FINAL) AS u
-                ON m.account = u.account AND m.team_id = u.team_id AND m.user_id = u.user_id
-            WHERE m.is_deleted = 0 AND m.is_thread_reply = 0
-            ORDER BY m.account, m.team_id, m.conversation_id, m.message_datetime
-            """
-        )
-        self._command(
-            """
-            CREATE OR REPLACE VIEW slack_thread_messages AS
-            SELECT
-                m.account AS account,
-                m.team_id AS team_id,
-                m.conversation_id AS conversation_id,
-                c.name AS conversation_name,
-                m.thread_ts AS thread_ts,
-                m.message_ts AS message_ts,
-                m.message_datetime AS message_datetime,
-                m.user_id AS user_id,
-                u.display_name,
-                u.real_name,
-                u.name AS user_name,
-                m.text AS text,
-                m.raw_json AS raw_json
-            FROM (SELECT * FROM slack_messages FINAL) AS m
-            LEFT JOIN (SELECT * FROM slack_conversations FINAL) AS c
-                ON m.account = c.account AND m.team_id = c.team_id AND m.conversation_id = c.conversation_id
-            LEFT JOIN (SELECT * FROM slack_users FINAL) AS u
-                ON m.account = u.account AND m.team_id = u.team_id AND m.user_id = u.user_id
-            WHERE m.is_deleted = 0
-            ORDER BY m.account, m.team_id, m.conversation_id, m.thread_ts, m.message_datetime, m.message_ts
-            """
-        )
-        self._command(
-            """
-            CREATE OR REPLACE VIEW slack_ui_messages AS
-            SELECT
-                m.account AS account,
-                m.team_id AS team_id,
-                c.conversation_type,
-                c.name AS conversation_name,
-                m.conversation_id AS conversation_id,
-                m.message_ts AS message_ts,
-                m.message_datetime AS message_datetime,
-                m.thread_ts AS thread_ts,
-                m.parent_message_ts AS parent_message_ts,
-                m.is_thread_parent AS is_thread_parent,
-                m.is_thread_reply AS is_thread_reply,
-                m.user_id AS user_id,
-                u.display_name,
-                u.real_name,
-                u.name AS user_name,
-                m.text AS text,
-                m.reply_count AS reply_count,
-                m.latest_reply_ts AS latest_reply_ts,
-                m.raw_json AS raw_json
-            FROM (SELECT * FROM slack_messages FINAL) AS m
-            LEFT JOIN (SELECT * FROM slack_conversations FINAL) AS c
-                ON m.account = c.account AND m.team_id = c.team_id AND m.conversation_id = c.conversation_id
-            LEFT JOIN (SELECT * FROM slack_users FINAL) AS u
-                ON m.account = u.account AND m.team_id = u.team_id AND m.user_id = u.user_id
-            WHERE m.is_deleted = 0
-            ORDER BY m.account, m.team_id, m.message_datetime, m.message_ts
-            """
-        )
-        self._command(
-            """
-            CREATE OR REPLACE VIEW slack_current_conversations AS
-            SELECT
-                c.account AS account,
-                c.team_id AS team_id,
-                c.conversation_type AS conversation_type,
-                c.conversation_id AS conversation_id,
-                c.name AS conversation_name,
-                c.is_member AS is_member,
-                c.is_archived AS is_archived,
-                JSONExtractString(c.raw_json, 'last_read') AS last_read_ts,
-                toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0 AS read_state_known,
-                maxIf(m.message_datetime, m.is_deleted = 0 AND m.message_ts != '') AS latest_message_at,
-                countIf(m.is_deleted = 0 AND m.message_ts != '') AS message_count,
-                countIf(m.is_deleted = 0 AND m.message_ts != '' AND m.is_thread_reply = 0) AS top_level_message_count,
-                countIf(m.is_deleted = 0 AND m.message_ts != '' AND m.is_thread_reply = 1) AS thread_reply_count,
-                countIf(
-                    m.is_deleted = 0
-                    AND m.message_ts != ''
-                    AND toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0
-                    AND toFloat64OrZero(m.message_ts) > toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read'))
-                ) AS unread_message_count,
-                countIf(
-                    m.is_deleted = 0
-                    AND m.message_ts != ''
-                    AND m.is_thread_reply = 0
-                    AND toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0
-                    AND toFloat64OrZero(m.message_ts) > toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read'))
-                ) AS unread_top_level_count,
-                countIf(
-                    m.is_deleted = 0
-                    AND m.message_ts != ''
-                    AND m.is_thread_reply = 1
-                    AND toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0
-                    AND toFloat64OrZero(m.message_ts) > toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read'))
-                ) AS unread_thread_reply_count,
-                c.synced_at AS conversation_synced_at
-            FROM (SELECT * FROM slack_conversations FINAL) AS c
-            LEFT JOIN (SELECT * FROM slack_messages FINAL) AS m
-                ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id
-            GROUP BY
-                c.account,
-                c.team_id,
-                c.conversation_type,
-                c.conversation_id,
-                c.name,
-                c.is_member,
-                c.is_archived,
-                c.raw_json,
-                c.synced_at
-            ORDER BY latest_message_at DESC, c.account, c.team_id, c.conversation_id
-            """
-        )
-        self._command(
-            """
-            CREATE OR REPLACE VIEW slack_current_threads AS
-            SELECT
-                p.account AS account,
-                p.team_id AS team_id,
-                c.conversation_type AS conversation_type,
-                c.name AS conversation_name,
-                p.conversation_id AS conversation_id,
-                p.message_ts AS thread_ts,
-                p.message_datetime AS thread_started_at,
-                p.user_id AS parent_user_id,
-                u.display_name AS parent_display_name,
-                u.real_name AS parent_real_name,
-                u.name AS parent_user_name,
-                p.text AS parent_text,
-                p.reply_count AS slack_reply_count,
-                countIf(r.is_deleted = 0 AND r.is_thread_reply = 1) AS synced_reply_count,
-                greatest(toInt64(p.reply_count) - toInt64(countIf(r.is_deleted = 0 AND r.is_thread_reply = 1)), 0) AS unsynced_reply_count,
-                maxIf(r.message_datetime, r.is_deleted = 0 AND r.is_thread_reply = 1) AS latest_synced_reply_at,
-                p.latest_reply_ts AS slack_latest_reply_ts,
-                s.status AS thread_sync_status,
-                s.cursor_ts AS thread_sync_cursor_ts,
-                JSONExtractString(c.raw_json, 'last_read') AS conversation_last_read_ts,
-                toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0 AS read_state_known,
-                (
-                    toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read')) > 0
-                    AND toFloat64OrZero(p.latest_reply_ts) > toFloat64OrZero(JSONExtractString(c.raw_json, 'last_read'))
-                ) AS has_unread_replies
-            FROM (SELECT * FROM slack_messages FINAL WHERE is_deleted = 0 AND is_thread_reply = 0 AND reply_count > 0) AS p
-            LEFT JOIN (SELECT * FROM slack_messages FINAL) AS r
-                ON p.account = r.account
-                AND p.team_id = r.team_id
-                AND p.conversation_id = r.conversation_id
-                AND p.message_ts = r.thread_ts
-            LEFT JOIN (SELECT * FROM slack_conversations FINAL) AS c
-                ON p.account = c.account AND p.team_id = c.team_id AND p.conversation_id = c.conversation_id
-            LEFT JOIN (SELECT * FROM slack_users FINAL) AS u
-                ON p.account = u.account AND p.team_id = u.team_id AND p.user_id = u.user_id
-            LEFT JOIN (SELECT * FROM slack_sync_state FINAL WHERE object_type = 'thread') AS s
-                ON p.account = s.account
-                AND p.team_id = s.team_id
-                AND concat(p.conversation_id, ':', p.message_ts) = s.object_id
-            GROUP BY
-                p.account,
-                p.team_id,
-                c.conversation_type,
-                c.name,
-                p.conversation_id,
-                p.message_ts,
-                p.message_datetime,
-                p.user_id,
-                u.display_name,
-                u.real_name,
-                u.name,
-                p.text,
-                p.reply_count,
-                p.latest_reply_ts,
-                s.status,
-                s.cursor_ts,
-                c.raw_json
-            ORDER BY latest_synced_reply_at DESC, p.message_datetime DESC, p.account, p.team_id, p.conversation_id, p.message_ts
             """
         )
 
@@ -1509,6 +1217,10 @@ class ClickHouseWarehouse:
             """
         )
         return {str(row[0]) for row in rows}
+
+    def _drop_obsolete_views(self) -> None:
+        for view in OBSOLETE_VIEWS:
+            self._command(f"DROP VIEW IF EXISTS {view}")
 
     def _command(self, sql: str) -> None:
         def run() -> None:
