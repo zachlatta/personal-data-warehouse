@@ -1200,13 +1200,16 @@ def zip_attachment_text(*, content: bytes, max_chars: int, archive_depth: int = 
                 read_errors.append(f"{member_name}: {exc}")
                 continue
 
-            member_text = raw_attachment_text(
-                content=member_content,
-                mime_type=mime_type_from_filename(member_name),
-                filename=member_name,
-                max_chars=max_chars,
-                archive_depth=archive_depth + 1,
-            )
+            try:
+                member_text = raw_attachment_text(
+                    content=member_content,
+                    mime_type=mime_type_from_filename(member_name),
+                    filename=member_name,
+                    max_chars=max_chars,
+                    archive_depth=archive_depth + 1,
+                )
+            except AttachmentTextUnavailable:
+                continue
             if not member_text:
                 continue
             remaining_chars = max_chars - len("\n\n".join(text_parts))

@@ -572,6 +572,24 @@ def test_extract_attachment_text_supports_nested_zip_contents() -> None:
     assert "Nested contract text" in extraction.text
 
 
+def test_extract_attachment_text_skips_unreadable_zip_members() -> None:
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("broken.pdf", b"%PDF-1.7\nnot a complete pdf")
+        archive.writestr("notes.txt", "Readable member")
+
+    extraction = extract_attachment_text(
+        content=buffer.getvalue(),
+        mime_type="application/zip",
+        filename="mixed.zip",
+        max_chars=1000,
+    )
+
+    assert extraction.status == "ok"
+    assert "Readable member" in extraction.text
+    assert "broken.pdf" not in extraction.text
+
+
 def test_extract_attachment_text_marks_encrypted_pdf() -> None:
     from pypdf import PdfWriter
 
