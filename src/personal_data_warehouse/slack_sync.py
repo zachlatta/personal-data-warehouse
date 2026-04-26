@@ -74,6 +74,7 @@ class SlackSyncRunner:
         sleep: Callable[[int], None] | None = None,
         history_window: timedelta | None = None,
         sync_users: bool = True,
+        user_page_limit: int | None = None,
         sync_members: bool = True,
         freshness_priority: bool = False,
         use_existing_conversations: bool = False,
@@ -84,8 +85,10 @@ class SlackSyncRunner:
         zero_messages_only: bool = False,
         skip_known_errors: bool = False,
         conversation_limit: int | None = None,
+        conversation_page_limit: int | None = None,
         sync_thread_replies: bool = True,
         sync_thread_replies_only: bool = False,
+        sync_conversations_only: bool = False,
         skip_completed_full: bool = False,
         skip_completed_threads: bool = False,
         thread_order: str = "recent",
@@ -100,6 +103,7 @@ class SlackSyncRunner:
         self._sleep = sleep or time.sleep
         self._history_window = history_window
         self._sync_users_enabled = sync_users
+        self._user_page_limit = user_page_limit
         self._sync_members_enabled = sync_members
         self._freshness_priority = freshness_priority
         self._use_existing_conversations = use_existing_conversations
@@ -110,8 +114,10 @@ class SlackSyncRunner:
         self._zero_messages_only = zero_messages_only
         self._skip_known_errors = skip_known_errors
         self._conversation_limit = conversation_limit
+        self._conversation_page_limit = conversation_page_limit
         self._sync_thread_replies = sync_thread_replies
         self._sync_thread_replies_only = sync_thread_replies_only
+        self._sync_conversations_only = sync_conversations_only
         self._skip_completed_full = skip_completed_full
         self._skip_completed_threads = skip_completed_threads
         self._thread_order = thread_order
@@ -165,6 +171,23 @@ class SlackSyncRunner:
             [team_to_row(account=account.account, auth_payload=auth, team_payload=team_info.get("team", {}), synced_at=synced_at)]
         )
 
+        if self._sync_conversations_only:
+            conversations = self._refresh_active_conversations(
+                account=account.account,
+                team_id=team_id,
+                client=client,
+                synced_at=synced_at,
+            )
+            return SlackSyncSummary(
+                account=account.account,
+                team_id=team_id,
+                sync_type="conversation_refresh",
+                conversations_seen=len(conversations),
+                messages_written=0,
+                users_written=0,
+                files_written=0,
+            )
+
         if self._sync_thread_replies_only:
             return self._sync_account_thread_replies(
                 account=account,
@@ -186,7 +209,10 @@ class SlackSyncRunner:
 
         users_written = 0
         if self._sync_users_enabled:
-            for users in iter_cursor_pages(client, "users.list", "members", limit=self._settings.slack_page_size, call=self._call):
+            for page_index, users in enumerate(
+                iter_cursor_pages(client, "users.list", "members", limit=self._settings.slack_page_size, call=self._call),
+                start=1,
+            ):
                 rows = [
                     user_to_row(account=account.account, team_id=team_id, user=user, synced_at=synced_at)
                     for user in users
@@ -195,6 +221,8 @@ class SlackSyncRunner:
                 self._warehouse.insert_slack_users(rows)
                 users_written += len(rows)
                 self._logger.info("Synced %s Slack users for %s so far", users_written, account.account)
+                if self._user_page_limit is not None and page_index >= self._user_page_limit:
+                    break
 
         conversation_pages: Iterator[list[object]]
         if self._use_existing_conversations:
@@ -373,6 +401,8 @@ class SlackSyncRunner:
                 if isinstance(conversation, Mapping) and conversation_type(conversation) in group
             ]
             group_conversations.sort(key=conversation_activity_ts, reverse=True)
+            if self._conversation_limit is not None:
+                group_conversations = group_conversations[: self._conversation_limit]
             group_written = 0
             for conversation in group_conversations:
                 if not conversation.get("id"):
@@ -402,7 +432,10 @@ class SlackSyncRunner:
 
         users_written = 0
         if self._sync_users_enabled:
-            for users in iter_cursor_pages(client, "users.list", "members", limit=self._settings.slack_page_size, call=self._call):
+            for page_index, users in enumerate(
+                iter_cursor_pages(client, "users.list", "members", limit=self._settings.slack_page_size, call=self._call),
+                start=1,
+            ):
                 rows = [
                     user_to_row(account=account.account, team_id=team_id, user=user, synced_at=synced_at)
                     for user in users
@@ -410,6 +443,8 @@ class SlackSyncRunner:
                 ]
                 self._warehouse.insert_slack_users(rows)
                 users_written += len(rows)
+                if self._user_page_limit is not None and page_index >= self._user_page_limit:
+                    break
 
         return SlackSyncSummary(
             account=account.account,
@@ -431,14 +466,17 @@ class SlackSyncRunner:
     ) -> list[object]:
         conversations: list[object] = []
         types = ",".join(self._conversation_types) if self._conversation_types else SLACK_CONVERSATION_TYPES
-        for page in iter_cursor_pages(
-            client,
-            "conversations.list",
-            "channels",
-            limit=self._settings.slack_page_size,
-            call=self._call,
-            types=types,
-            exclude_archived="true",
+        for page_index, page in enumerate(
+            iter_cursor_pages(
+                client,
+                "conversations.list",
+                "channels",
+                limit=self._settings.slack_page_size,
+                call=self._call,
+                types=types,
+                exclude_archived="true",
+            ),
+            start=1,
         ):
             conversations.extend(page)
             rows = [
@@ -452,6 +490,8 @@ class SlackSyncRunner:
                 if isinstance(conversation, Mapping)
             ]
             self._warehouse.insert_slack_conversations(rows)
+            if self._conversation_page_limit is not None and page_index >= self._conversation_page_limit:
+                break
         self._logger.info("Freshness discovered %s active Slack conversations for %s", len(conversations), account)
         return conversations
 
@@ -1239,6 +1279,7 @@ def main() -> None:
     parser.add_argument("--interval-seconds", type=int, default=900)
     parser.add_argument("--history-window-minutes", type=int, help="Only fetch recent history windows, for smoke checks")
     parser.add_argument("--skip-users", action="store_true", help="Skip users.list during this run")
+    parser.add_argument("--user-page-limit", type=int, help="Maximum users.list pages to fetch in this run")
     parser.add_argument("--skip-members", action="store_true", help="Skip conversations.members during this run")
     parser.add_argument(
         "--freshness-priority",
@@ -1280,11 +1321,17 @@ def main() -> None:
         help="When using cached conversations, skip conversations already marked error in slack_sync_state",
     )
     parser.add_argument("--conversation-limit", type=int, help="Maximum cached conversations to process in this run")
+    parser.add_argument("--conversation-page-limit", type=int, help="Maximum conversations.list pages to fetch in this run")
     parser.add_argument("--skip-thread-replies", action="store_true", help="Skip conversations.replies during this run")
     parser.add_argument(
         "--sync-thread-replies-only",
         action="store_true",
         help="Only backfill conversations.replies for known thread parent messages",
+    )
+    parser.add_argument(
+        "--sync-conversations-only",
+        action="store_true",
+        help="Only refresh active Slack conversations without fetching messages",
     )
     parser.add_argument(
         "--skip-completed-threads",
@@ -1323,6 +1370,7 @@ def main() -> None:
             logger=PrintLogger(),
             history_window=history_window,
             sync_users=not args.skip_users,
+            user_page_limit=args.user_page_limit,
             sync_members=not args.skip_members,
             freshness_priority=args.freshness_priority,
             use_existing_conversations=args.use_existing_conversations,
@@ -1333,8 +1381,10 @@ def main() -> None:
             zero_messages_only=args.zero_messages_only,
             skip_known_errors=args.skip_known_errors,
             conversation_limit=args.conversation_limit,
+            conversation_page_limit=args.conversation_page_limit,
             sync_thread_replies=not args.skip_thread_replies,
             sync_thread_replies_only=args.sync_thread_replies_only,
+            sync_conversations_only=args.sync_conversations_only,
             skip_completed_full=args.skip_completed_full,
             skip_completed_threads=args.skip_completed_threads,
             thread_order=args.thread_order,

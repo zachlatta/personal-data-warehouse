@@ -103,8 +103,16 @@ Each Gmail asset run also drains up to `GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE`
 already-synced attachment-candidate messages per mailbox. This backfills attachment
 text without advancing Gmail history cursors. Set it to `0` to disable this pass.
 
-Slack sync has the same deployment behavior through `slack_workspace_sync_every_minute`.
-It also runs every minute and skips overlapping Slack sync runs with a separate lock.
+Slack sync splits freshness, coverage, and metadata into separate schedules. The
+`slack_workspace_sync_every_minute` schedule keeps recent messages fresh every minute.
+`slack_workspace_coverage_sync_every_seven_minutes` backfills incomplete cached conversations
+with smaller batches, and `slack_workspace_metadata_sync_every_fifteen_minutes` refreshes one
+capped page of active conversation metadata at a time. `slack_workspace_user_sync_hourly`
+refreshes the full Slack user list outside the more frequent metadata path.
+Freshness stages also poll capped sets of cached conversations per type, ordered by recent
+activity, so each scheduled run remains bounded.
+All Slack schedules share a nonblocking Slack lock, so a scheduled tick skips if another Slack
+sync stage is still running.
 Calendar sync runs through `calendar_event_sync_every_minute` with its own nonblocking lock.
 
 ## Docker / Coolify

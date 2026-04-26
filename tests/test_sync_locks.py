@@ -6,7 +6,17 @@ from types import SimpleNamespace
 
 import personal_data_warehouse.defs.slack_sync as slack_defs
 from personal_data_warehouse.config import Settings
-from personal_data_warehouse.defs.slack_sync import run_intelligent_slack_sync, slack_workspace_sync_every_minute
+from personal_data_warehouse.defs.slack_sync import (
+    run_intelligent_slack_sync,
+    run_slack_coverage_sync,
+    run_slack_freshness_sync,
+    run_slack_metadata_sync,
+    run_slack_user_sync,
+    slack_workspace_coverage_sync_every_seven_minutes,
+    slack_workspace_metadata_sync_every_fifteen_minutes,
+    slack_workspace_sync_every_minute,
+    slack_workspace_user_sync_hourly,
+)
 from personal_data_warehouse.slack_sync import SlackSyncSummary
 from personal_data_warehouse.sync_locks import (
     exclusive_process_lock,
@@ -23,9 +33,241 @@ def test_lock_env_prefix_normalizes_names() -> None:
 def test_slack_sync_schedule_runs_every_minute_by_default() -> None:
     assert slack_workspace_sync_every_minute.cron_schedule == "* * * * *"
     assert slack_workspace_sync_every_minute.default_status.value == "RUNNING"
+    assert slack_workspace_coverage_sync_every_seven_minutes.cron_schedule == "*/7 * * * *"
+    assert slack_workspace_coverage_sync_every_seven_minutes.default_status.value == "RUNNING"
+    assert slack_workspace_metadata_sync_every_fifteen_minutes.cron_schedule == "*/15 * * * *"
+    assert slack_workspace_metadata_sync_every_fifteen_minutes.default_status.value == "RUNNING"
+    assert slack_workspace_user_sync_hourly.cron_schedule == "0 * * * *"
+    assert slack_workspace_user_sync_hourly.default_status.value == "RUNNING"
 
 
-def test_slack_asset_default_runs_intelligent_priority_cycle(monkeypatch) -> None:
+def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def sync_all(self):
+            return [
+                SlackSyncSummary(
+                    account="zrl",
+                    team_id="T1",
+                    sync_type="test",
+                    conversations_seen=1,
+                    messages_written=2,
+                    users_written=0,
+                    files_written=0,
+                )
+            ]
+
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
+    settings = Settings(
+        clickhouse_url=None,
+        gmail_accounts=(),
+        gmail_oauth_client_secrets_json=None,
+        gmail_scopes=(),
+        gmail_page_size=500,
+        gmail_include_spam_trash=True,
+        gmail_force_full_sync=False,
+        gmail_full_sync_query=None,
+        gmail_attachment_max_bytes=25 * 1024 * 1024,
+        gmail_attachment_text_max_chars=1_000_000,
+        gmail_attachment_backfill_batch_size=100,
+        slack_accounts=(),
+        slack_page_size=200,
+        slack_lookback_days=14,
+        slack_thread_audit_days=30,
+        slack_force_full_sync=False,
+    )
+
+    summaries = run_slack_freshness_sync(
+        settings=settings,
+        warehouse=SimpleNamespace(),
+        logger=SimpleNamespace(),
+    )
+
+    assert len(summaries) == 4
+    assert [call["conversation_types"] for call in calls] == [
+        ("im",),
+        ("mpim",),
+        ("private_channel",),
+        ("public_channel",),
+    ]
+    assert all(call["freshness_priority"] for call in calls)
+    assert all(call["use_existing_conversations"] is True for call in calls)
+    assert [call["conversation_limit"] for call in calls] == [500, 250, 100, 100]
+    assert all(call["sync_users"] is False for call in calls)
+    assert all(call["sync_members"] is False for call in calls)
+    assert all(call["sync_thread_replies"] is False for call in calls)
+
+
+def test_slack_coverage_sync_runs_current_stage(monkeypatch) -> None:
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def sync_all(self):
+            return [
+                SlackSyncSummary(
+                    account="zrl",
+                    team_id="T1",
+                    sync_type="test",
+                    conversations_seen=1,
+                    messages_written=2,
+                    users_written=0,
+                    files_written=0,
+                )
+            ]
+
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
+    settings = Settings(
+        clickhouse_url=None,
+        gmail_accounts=(),
+        gmail_oauth_client_secrets_json=None,
+        gmail_scopes=(),
+        gmail_page_size=500,
+        gmail_include_spam_trash=True,
+        gmail_force_full_sync=False,
+        gmail_full_sync_query=None,
+        gmail_attachment_max_bytes=25 * 1024 * 1024,
+        gmail_attachment_text_max_chars=1_000_000,
+        gmail_attachment_backfill_batch_size=100,
+        slack_accounts=(),
+        slack_page_size=200,
+        slack_lookback_days=14,
+        slack_thread_audit_days=30,
+        slack_force_full_sync=False,
+    )
+
+    summaries = run_slack_coverage_sync(
+        settings=settings,
+        warehouse=SimpleNamespace(),
+        logger=SimpleNamespace(),
+        now=datetime(2026, 4, 24, 17, 1, tzinfo=UTC),
+    )
+
+    assert len(summaries) == 1
+    coverage_call = calls[0]
+    assert coverage_call["use_existing_conversations"] is True
+    assert coverage_call["conversation_types"] == ("mpim",)
+    assert coverage_call["not_full_only"] is True
+    assert coverage_call["skip_known_errors"] is True
+    assert coverage_call["conversation_limit"] == 50
+    assert coverage_call["settings"].slack_force_full_sync is True
+    assert settings.slack_force_full_sync is False
+
+
+def test_slack_metadata_sync_refreshes_one_conversation_type(monkeypatch) -> None:
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def sync_all(self):
+            return [
+                SlackSyncSummary(
+                    account="zrl",
+                    team_id="T1",
+                    sync_type="test",
+                    conversations_seen=1,
+                    messages_written=0,
+                    users_written=1,
+                    files_written=0,
+                )
+            ]
+
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
+    settings = Settings(
+        clickhouse_url=None,
+        gmail_accounts=(),
+        gmail_oauth_client_secrets_json=None,
+        gmail_scopes=(),
+        gmail_page_size=500,
+        gmail_include_spam_trash=True,
+        gmail_force_full_sync=False,
+        gmail_full_sync_query=None,
+        gmail_attachment_max_bytes=25 * 1024 * 1024,
+        gmail_attachment_text_max_chars=1_000_000,
+        gmail_attachment_backfill_batch_size=100,
+        slack_accounts=(),
+        slack_page_size=200,
+        slack_lookback_days=14,
+        slack_thread_audit_days=30,
+        slack_force_full_sync=False,
+    )
+
+    summaries = run_slack_metadata_sync(
+        settings=settings,
+        warehouse=SimpleNamespace(),
+        logger=SimpleNamespace(),
+        now=datetime(2026, 4, 24, 17, 15, tzinfo=UTC),
+    )
+
+    assert len(summaries) == 1
+    assert calls[0]["sync_conversations_only"] is True
+    assert calls[0]["conversation_types"] == ("mpim",)
+    assert calls[0]["conversation_page_limit"] == 1
+
+
+def test_slack_user_sync_refreshes_all_users_without_messages(monkeypatch) -> None:
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def sync_all(self):
+            return [
+                SlackSyncSummary(
+                    account="zrl",
+                    team_id="T1",
+                    sync_type="test",
+                    conversations_seen=0,
+                    messages_written=0,
+                    users_written=1,
+                    files_written=0,
+                )
+            ]
+
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
+    settings = Settings(
+        clickhouse_url=None,
+        gmail_accounts=(),
+        gmail_oauth_client_secrets_json=None,
+        gmail_scopes=(),
+        gmail_page_size=500,
+        gmail_include_spam_trash=True,
+        gmail_force_full_sync=False,
+        gmail_full_sync_query=None,
+        gmail_attachment_max_bytes=25 * 1024 * 1024,
+        gmail_attachment_text_max_chars=1_000_000,
+        gmail_attachment_backfill_batch_size=100,
+        slack_accounts=(),
+        slack_page_size=200,
+        slack_lookback_days=14,
+        slack_thread_audit_days=30,
+        slack_force_full_sync=False,
+    )
+
+    summaries = run_slack_user_sync(
+        settings=settings,
+        warehouse=SimpleNamespace(),
+        logger=SimpleNamespace(),
+    )
+
+    assert len(summaries) == 1
+    assert calls[0]["sync_users"] is True
+    assert "user_page_limit" not in calls[0]
+    assert calls[0]["use_existing_conversations"] is True
+    assert calls[0]["conversation_limit"] == 0
+    assert calls[0]["sync_thread_replies"] is False
+
+
+def test_slack_intelligent_sync_keeps_legacy_combined_behavior(monkeypatch) -> None:
     calls = []
 
     class FakeRunner:
@@ -73,25 +315,7 @@ def test_slack_asset_default_runs_intelligent_priority_cycle(monkeypatch) -> Non
     )
 
     assert len(summaries) == 5
-    assert [call["conversation_types"] for call in calls[:4]] == [
-        ("im",),
-        ("mpim",),
-        ("private_channel",),
-        ("public_channel",),
-    ]
-    assert all(call["freshness_priority"] for call in calls[:4])
-    assert all(call["sync_users"] is False for call in calls[:4])
-    assert all(call["sync_members"] is False for call in calls[:4])
-    assert all(call["sync_thread_replies"] is False for call in calls[:4])
-
-    coverage_call = calls[4]
-    assert coverage_call["use_existing_conversations"] is True
-    assert coverage_call["conversation_types"] == ("mpim",)
-    assert coverage_call["not_full_only"] is True
-    assert coverage_call["skip_known_errors"] is True
-    assert coverage_call["conversation_limit"] == 500
-    assert coverage_call["settings"].slack_force_full_sync is True
-    assert settings.slack_force_full_sync is False
+    assert len(calls) == 5
 
 
 def test_exclusive_process_lock_is_non_blocking(tmp_path) -> None:

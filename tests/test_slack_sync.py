@@ -371,6 +371,42 @@ def test_runner_full_sync_collects_workspace_conversations_messages_threads_and_
     assert any(update["object_type"] == "conversation" and update["cursor_ts"] == "1713974400.000100" for update in warehouse.state_updates)
 
 
+def test_runner_can_refresh_conversations_without_fetching_messages(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+            "conversations.list": [
+                {
+                    "ok": True,
+                    "channels": [{"id": "C1", "name": "hq", "is_channel": True}],
+                    "response_metadata": {"next_cursor": "next"},
+                }
+            ],
+        }
+    )
+    warehouse = FakeWarehouse()
+
+    summaries = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        conversation_page_limit=1,
+        sync_conversations_only=True,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert summaries[0].sync_type == "conversation_refresh"
+    assert summaries[0].conversations_seen == 1
+    assert summaries[0].messages_written == 0
+    assert len(warehouse.conversations) == 1
+    assert [method for method, _params in client.calls] == ["auth.test", "team.info", "conversations.list"]
+
+
 def test_runner_incremental_uses_lookback_and_skips_unchanged_threads(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
