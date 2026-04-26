@@ -46,17 +46,16 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v2"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v3"
 ATTACHMENT_AI_PROMPT = """Analyze this real Gmail attachment image.
 
 Return concise JSON with these keys:
-- is_useful: true if the image contains meaningful user-visible information worth indexing, false if it is blank, decorative, a tracking pixel, a logo-only image, UI chrome, or an attachment placeholder with no useful content.
+- is_useful: true if the image may contain meaningful user-visible information worth indexing. Use false only when the image is clearly blank, decorative, a tracking pixel, a logo-only image, UI chrome, or an attachment placeholder with no useful content. Receipts, invoices, photos, charts, screenshots of documents, and screenshots containing readable content are useful. If unsure, use true.
 - summary: one sentence describing what the attachment appears to be.
 - visible_text: readable text visible in the image, preserving important names, dates, amounts, addresses, and identifiers.
 - likely_document_type: a short label such as receipt, invoice, chart, photo, official letter, form, screenshot, or unknown.
 - useful_for_search: concise search keywords and entities.
 
-If is_useful is false, leave summary, visible_text, likely_document_type, and useful_for_search empty.
 If text is unclear, say so. Do not invent details."""
 ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
 IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
@@ -1349,6 +1348,8 @@ def parse_attachment_ai_json_response(response_text: str) -> dict[str, object] |
         payload = json.loads(text)
     except json.JSONDecodeError:
         return None
+    if isinstance(payload, str) and payload.strip() != text:
+        return parse_attachment_ai_json_response(payload)
     if isinstance(payload, dict):
         return payload
     return None
@@ -1357,14 +1358,31 @@ def parse_attachment_ai_json_response(response_text: str) -> dict[str, object] |
 def attachment_ai_response_is_useful(payload: Mapping[str, object]) -> bool:
     value = payload.get("is_useful")
     if isinstance(value, bool):
-        return value
+        return value or attachment_ai_response_has_indexable_content(payload)
     if isinstance(value, str):
         normalized = value.strip().lower()
         if normalized in {"false", "no", "0"}:
-            return False
+            return attachment_ai_response_has_indexable_content(payload)
         if normalized in {"true", "yes", "1"}:
             return True
     return True
+
+
+def attachment_ai_response_has_indexable_content(payload: Mapping[str, object]) -> bool:
+    values = [
+        payload.get("summary", ""),
+        payload.get("visible_text", ""),
+        payload.get("likely_document_type", ""),
+        payload.get("useful_for_search", ""),
+    ]
+    for value in values:
+        if isinstance(value, list):
+            text = " ".join(str(item) for item in value)
+        else:
+            text = str(value)
+        if re.search(r"[A-Za-z0-9]", text):
+            return True
+    return False
 
 
 def raw_attachment_text(

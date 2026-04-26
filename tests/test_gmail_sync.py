@@ -608,6 +608,121 @@ def test_attachment_rows_for_message_records_ai_empty_for_non_useful_images() ->
     assert metadata["prompt_sha256"] == row["ai_prompt_sha256"]
 
 
+def test_attachment_rows_for_message_keeps_content_when_ai_usefulness_flag_is_wrong() -> None:
+    image_content = b"\x89PNG\r\n\x1a\nfake receipt image bytes"
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "receipt.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+
+    ollama = FakeOllamaResource(
+        json.dumps(
+            {
+                "is_useful": False,
+                "summary": "Coffee receipt.",
+                "visible_text": "Fairgrounds Coffee & Tea",
+                "likely_document_type": "receipt",
+                "useful_for_search": "coffee receipt",
+            }
+        )
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=100,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+    )
+
+    row = rows[0]
+    assert row["text_extraction_status"] == "ai_ok"
+    assert "Coffee receipt" in row["text"]
+    assert "Fairgrounds Coffee & Tea" in row["text"]
+    assert row["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
+
+
+def test_attachment_rows_for_message_parses_json_string_wrapped_ai_response() -> None:
+    image_content = b"\x89PNG\r\n\x1a\nfake placeholder image bytes"
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "placeholder.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+
+    ollama = FakeOllamaResource(
+        json.dumps(
+            "```json\n"
+            + json.dumps(
+                {
+                    "is_useful": False,
+                    "summary": "",
+                    "visible_text": "",
+                    "likely_document_type": "",
+                    "useful_for_search": "",
+                }
+            )
+            + "\n```"
+        )
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=100,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+    )
+
+    assert rows[0]["text_extraction_status"] == "ai_empty"
+    assert rows[0]["text"] == ""
+
+
 def test_attachment_rows_for_message_skips_existing_and_tombstones_missing_attachment() -> None:
     message = {
         "id": "gmail-id",
