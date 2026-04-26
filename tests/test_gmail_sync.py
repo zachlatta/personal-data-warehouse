@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import hashlib
 from io import BytesIO
 import json
+import time
 from unittest.mock import patch
 import zipfile
 
@@ -38,6 +39,7 @@ from personal_data_warehouse.gmail_sync import (
     history_message_ids,
     message_body_to_markdown,
     message_to_row,
+    run_attachment_ai_call_with_timeout,
     strip_quoted_history,
 )
 
@@ -769,6 +771,23 @@ def test_attachment_rows_for_message_parses_json_string_wrapped_ai_response() ->
 
     assert rows[0]["text_extraction_status"] == "ai_empty"
     assert rows[0]["text"] == ""
+
+
+def test_attachment_ai_call_timeout_returns_control() -> None:
+    started_at = time.monotonic()
+
+    def slow_call() -> str:
+        time.sleep(1)
+        return "too late"
+
+    try:
+        run_attachment_ai_call_with_timeout(slow_call, timeout_seconds=0.01)
+    except TimeoutError as exc:
+        assert "timed out" in str(exc)
+    else:
+        raise AssertionError("expected timeout")
+
+    assert time.monotonic() - started_at < 0.5
 
 
 def test_attachment_rows_for_message_skips_existing_and_tombstones_missing_attachment() -> None:

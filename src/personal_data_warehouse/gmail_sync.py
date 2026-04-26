@@ -9,8 +9,8 @@ import fcntl
 import hashlib
 import json
 import os
+import queue
 import re
-import signal
 import ssl
 from email.utils import getaddresses, parseaddr
 from io import BytesIO
@@ -1285,8 +1285,8 @@ def call_ollama_attachment_vision_model(
         "num_predict": 512,
     }
     if config.client is not None:
-        with attachment_ai_wall_clock_timeout(config.timeout_seconds):
-            return config.client.generate(
+        return run_attachment_ai_call_with_timeout(
+            lambda: config.client.generate(
                 model=config.model,
                 prompt=ATTACHMENT_AI_PROMPT,
                 images=images,
@@ -1294,7 +1294,9 @@ def call_ollama_attachment_vision_model(
                 options=options,
                 think=False,
                 timeout_seconds=config.timeout_seconds,
-            )
+            ),
+            timeout_seconds=config.timeout_seconds,
+        )
 
     image_payload = [base64.b64encode(image).decode("ascii") for image in images]
     payload = {
@@ -1311,33 +1313,46 @@ def call_ollama_attachment_vision_model(
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
+
+    def request_ollama_generate() -> dict[str, object]:
+        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+            payload = json.loads(response.read())
+        if isinstance(payload, dict):
+            return payload
+        raise RuntimeError("Ollama returned a non-object JSON response")
+
     try:
-        with attachment_ai_wall_clock_timeout(config.timeout_seconds):
-            with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-                response_data = json.loads(response.read())
+        response_data = run_attachment_ai_call_with_timeout(
+            request_ollama_generate,
+            timeout_seconds=config.timeout_seconds,
+        )
     except urllib.error.URLError as exc:
         raise RuntimeError(str(exc)) from exc
     return str(response_data.get("response", ""))
 
 
-@contextmanager
-def attachment_ai_wall_clock_timeout(timeout_seconds: int) -> Iterator[None]:
-    if timeout_seconds <= 0 or threading.current_thread() is not threading.main_thread():
-        yield
-        return
+def run_attachment_ai_call_with_timeout[T](call: Callable[[], T], *, timeout_seconds: float) -> T:
+    if timeout_seconds <= 0:
+        return call()
 
-    previous_handler = signal.getsignal(signal.SIGALRM)
+    results: queue.Queue[tuple[bool, T | BaseException]] = queue.Queue(maxsize=1)
 
-    def raise_timeout(_signum, _frame) -> None:
-        raise TimeoutError(f"AI attachment fallback timed out after {timeout_seconds} seconds")
+    def target() -> None:
+        try:
+            results.put((True, call()), block=False)
+        except BaseException as exc:
+            results.put((False, exc), block=False)
 
-    signal.signal(signal.SIGALRM, raise_timeout)
-    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
+    thread = threading.Thread(target=target, name="gmail-attachment-ai-call", daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        raise TimeoutError(f"AI attachment fallback timed out after {timeout_seconds:g} seconds")
+
+    ok, value = results.get_nowait()
+    if ok:
+        return value  # type: ignore[return-value]
+    raise value
 
 
 def format_attachment_ai_response(response_text: str) -> str:
