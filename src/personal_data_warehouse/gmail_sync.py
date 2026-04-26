@@ -19,16 +19,16 @@ from typing import Callable, TypeVar
 import zipfile
 import xml.etree.ElementTree as ET
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.oauth2.credentials import Credentials
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from markdownify import markdownify as html_to_markdown
 import warnings
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse, SyncState
 from personal_data_warehouse.config import GmailAccount, Settings, env_slug
+from personal_data_warehouse.google_auth import google_token_json_from_env, load_google_credentials
 
 EPOCH_UTC = datetime.fromtimestamp(0, tz=UTC)
 DEFAULT_GMAIL_SYNC_LOCK_PATH = Path(tempfile.gettempdir()) / "personal-data-warehouse-gmail-sync.lock"
@@ -515,28 +515,12 @@ def build_gmail_service(*, account: GmailAccount, settings: Settings):
 
 
 def load_credentials(*, account: GmailAccount, settings: Settings) -> Credentials:
-    token_json = gmail_token_json_from_env(account.email_address)
-    if not token_json:
-        raise RuntimeError(
-            f"No Gmail OAuth token for {account.email_address}. "
-            f"Set GMAIL_{env_slug(account.email_address)}_TOKEN_JSON_B64."
-        )
-
-    credentials = Credentials.from_authorized_user_info(
-        json.loads(token_json),
-        settings.gmail_scopes,
+    return load_google_credentials(
+        email_address=account.email_address,
+        settings=settings,
+        scopes=settings.gmail_scopes,
+        service_name="Gmail",
     )
-    if credentials.valid:
-        return credentials
-
-    if not credentials.expired or not credentials.refresh_token:
-        raise RuntimeError(
-            f"Stored OAuth token for {account.email_address} cannot be refreshed. "
-            f"Update GMAIL_{env_slug(account.email_address)}_TOKEN_JSON_B64 and authorize again."
-        )
-
-    credentials.refresh(Request())
-    return credentials
 
 
 def gmail_token_json_from_env(email_address: str) -> str | None:
@@ -555,7 +539,7 @@ def gmail_token_json_from_env(email_address: str) -> str | None:
         value = os.getenv(name)
         if value:
             return base64.b64decode(value).decode("utf-8")
-    return None
+    return google_token_json_from_env(email_address)
 
 
 def current_history_id(service) -> int:

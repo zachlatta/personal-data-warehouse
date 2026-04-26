@@ -81,6 +81,46 @@ ATTACHMENT_BACKFILL_STATE_COLUMNS = (
     "sync_version",
 )
 
+CALENDAR_EVENT_COLUMNS = (
+    "account",
+    "calendar_id",
+    "event_id",
+    "recurring_event_id",
+    "i_cal_uid",
+    "status",
+    "is_deleted",
+    "summary",
+    "description",
+    "location",
+    "creator_email",
+    "organizer_email",
+    "start_at",
+    "end_at",
+    "start_date",
+    "end_date",
+    "is_all_day",
+    "html_link",
+    "attendees_json",
+    "reminders_json",
+    "recurrence",
+    "event_type",
+    "raw_json",
+    "updated_at",
+    "synced_at",
+    "sync_version",
+)
+
+CALENDAR_SYNC_STATE_COLUMNS = (
+    "account",
+    "calendar_id",
+    "sync_token",
+    "last_sync_type",
+    "status",
+    "error",
+    "updated_at",
+    "sync_version",
+)
+
 SLACK_TEAM_COLUMNS = (
     "account",
     "team_id",
@@ -412,6 +452,87 @@ class ClickHouseWarehouse:
             )
             ENGINE = ReplacingMergeTree(sync_version)
             ORDER BY (account, message_id)
+            """
+        )
+
+    def ensure_calendar_tables(self) -> None:
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS calendar_events (
+                account LowCardinality(String),
+                calendar_id String,
+                event_id String,
+                recurring_event_id String,
+                i_cal_uid String,
+                status LowCardinality(String),
+                is_deleted UInt8,
+                summary String,
+                description String,
+                location String,
+                creator_email String,
+                organizer_email String,
+                start_at DateTime64(3, 'UTC'),
+                end_at DateTime64(3, 'UTC'),
+                start_date String,
+                end_date String,
+                is_all_day UInt8,
+                html_link String,
+                attendees_json String,
+                reminders_json String,
+                recurrence Array(String),
+                event_type LowCardinality(String),
+                raw_json String,
+                updated_at DateTime64(3, 'UTC'),
+                synced_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(synced_at)
+            ORDER BY (account, calendar_id, event_id)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS calendar_sync_state (
+                account LowCardinality(String),
+                calendar_id String,
+                sync_token String,
+                last_sync_type LowCardinality(String),
+                status LowCardinality(String),
+                error String,
+                updated_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            ORDER BY (account, calendar_id)
+            """
+        )
+        self._command(
+            """
+            CREATE OR REPLACE VIEW calendar_event_search AS
+            SELECT
+                account,
+                calendar_id,
+                event_id,
+                recurring_event_id,
+                i_cal_uid,
+                summary,
+                description,
+                location,
+                creator_email,
+                organizer_email,
+                start_at,
+                end_at,
+                start_date,
+                end_date,
+                is_all_day,
+                attendees_json,
+                html_link,
+                updated_at,
+                synced_at
+            FROM calendar_events FINAL
+            WHERE is_deleted = 0
+            ORDER BY account, calendar_id, start_at, event_id
             """
         )
 
@@ -762,6 +883,69 @@ class ClickHouseWarehouse:
             "gmail_attachment_backfill_state",
             rows,
             ATTACHMENT_BACKFILL_STATE_COLUMNS,
+        )
+
+    def insert_calendar_events(self, rows: list[dict[str, Any]]) -> None:
+        rows_by_partition: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for row in rows:
+            rows_by_partition.setdefault(_calendar_event_partition_key(row), []).append(row)
+        for partition_rows in rows_by_partition.values():
+            self._insert_rows("calendar_events", partition_rows, CALENDAR_EVENT_COLUMNS)
+
+    def load_calendar_sync_state(self) -> dict[tuple[str, str], dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT
+                account,
+                calendar_id,
+                sync_token,
+                last_sync_type,
+                status,
+                error,
+                updated_at
+            FROM calendar_sync_state FINAL
+            """
+        )
+        states: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            key = (str(row[0]), str(row[1]))
+            states[key] = {
+                "account": row[0],
+                "calendar_id": row[1],
+                "sync_token": row[2],
+                "last_sync_type": row[3],
+                "status": row[4],
+                "error": row[5],
+                "updated_at": row[6],
+            }
+        return states
+
+    def insert_calendar_sync_state(
+        self,
+        *,
+        account: str,
+        calendar_id: str,
+        sync_token: str,
+        last_sync_type: str,
+        status: str,
+        error: str,
+        updated_at: datetime,
+    ) -> None:
+        self._insert(
+            "calendar_sync_state",
+            [
+                (
+                    account,
+                    calendar_id,
+                    sync_token,
+                    last_sync_type,
+                    status,
+                    error,
+                    updated_at,
+                    int(updated_at.timestamp() * 1_000_000),
+                )
+            ],
+            CALENDAR_SYNC_STATE_COLUMNS,
         )
 
     def existing_message_ids(self, *, account: str, message_ids: list[str]) -> set[str]:
@@ -1214,3 +1398,10 @@ def _gmail_attachment_candidate_clause() -> str:
         f"OR match(payload_json, {_sql_string(filename_pattern)}) "
         "OR positionCaseInsensitive(payload_json, 'Content-Disposition') > 0)"
     )
+
+
+def _calendar_event_partition_key(row: dict[str, Any]) -> tuple[int, int]:
+    start_at = row.get("start_at")
+    if isinstance(start_at, datetime):
+        return (start_at.year, start_at.month)
+    return (1970, 1)

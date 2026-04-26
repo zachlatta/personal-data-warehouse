@@ -13,6 +13,7 @@ from googleapiclient.errors import HttpError
 from httplib2 import Response
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs.gmail_sync import gmail_mailbox_sync_every_minute
+from personal_data_warehouse.gmail_auth import update_env_file
 from personal_data_warehouse.gmail_sync import (
     attachment_parts_from_message,
     attachment_rows_for_message,
@@ -134,6 +135,26 @@ def test_gmail_token_json_from_env_accepts_base64(monkeypatch) -> None:
 def test_gmail_sync_schedule_runs_every_minute_by_default() -> None:
     assert gmail_mailbox_sync_every_minute.cron_schedule == "* * * * *"
     assert gmail_mailbox_sync_every_minute.default_status.value == "RUNNING"
+
+
+def test_google_auth_update_env_file_replaces_and_appends_values(tmp_path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("CLICKHOUSE_URL=clickhouse://example\nGMAIL_ZACH_EXAMPLE_COM_TOKEN_JSON_B64=old\n")
+
+    update_env_file(
+        env_path,
+        {
+            "GOOGLE_ZACH_EXAMPLE_COM_TOKEN_JSON_B64": "new",
+            "GMAIL_ZACH_EXAMPLE_COM_TOKEN_JSON_B64": "new",
+        },
+    )
+
+    assert env_path.read_text().splitlines() == [
+        "CLICKHOUSE_URL=clickhouse://example",
+        "GMAIL_ZACH_EXAMPLE_COM_TOKEN_JSON_B64=new",
+        "",
+        "GOOGLE_ZACH_EXAMPLE_COM_TOKEN_JSON_B64=new",
+    ]
 
 
 def test_exclusive_process_lock_is_non_blocking(tmp_path) -> None:

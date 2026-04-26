@@ -8,10 +8,12 @@ import re
 from dotenv import load_dotenv
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 DEFAULT_GMAIL_PAGE_SIZE = 500
 DEFAULT_GMAIL_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_GMAIL_ATTACHMENT_TEXT_MAX_CHARS = 1_000_000
 DEFAULT_GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE = 100
+DEFAULT_CALENDAR_PAGE_SIZE = 2500
 DEFAULT_SLACK_PAGE_SIZE = 200
 DEFAULT_SLACK_LOOKBACK_DAYS = 14
 DEFAULT_SLACK_THREAD_AUDIT_DAYS = 30
@@ -49,6 +51,12 @@ class GmailAccount:
 
 
 @dataclass(frozen=True)
+class CalendarAccount:
+    email_address: str
+    calendar_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SlackAccount:
     account: str
     token: str
@@ -73,6 +81,11 @@ class Settings:
     slack_lookback_days: int
     slack_thread_audit_days: int
     slack_force_full_sync: bool
+    google_scopes: tuple[str, ...] = (GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE)
+    calendar_accounts: tuple[CalendarAccount, ...] = ()
+    calendar_scopes: tuple[str, ...] = (CALENDAR_READONLY_SCOPE,)
+    calendar_page_size: int = DEFAULT_CALENDAR_PAGE_SIZE
+    calendar_force_full_sync: bool = False
 
     def account_for_email(self, email_address: str) -> GmailAccount:
         normalized = email_address.strip().lower()
@@ -88,6 +101,7 @@ def load_settings(
     require_clickhouse: bool = True,
     require_gmail: bool = True,
     require_gmail_client_secrets: bool = False,
+    require_calendar: bool = False,
     require_slack: bool = False,
 ) -> Settings:
     load_dotenv()
@@ -109,6 +123,20 @@ def load_settings(
             email_address=email_address,
         )
         for email_address in account_emails
+    )
+
+    calendar_account_emails = _parse_csv_env(os.getenv("CALENDAR_ACCOUNTS")) or account_emails
+    if require_calendar and not calendar_account_emails:
+        raise ValueError(
+            "CALENDAR_ACCOUNTS or GMAIL_ACCOUNTS must be set to a comma-separated list of Google account addresses"
+        )
+    calendar_accounts = tuple(
+        CalendarAccount(
+            email_address=email_address,
+            calendar_ids=_parse_csv_env(os.getenv(f"CALENDAR_{env_slug(email_address)}_CALENDAR_IDS"))
+            or ("primary",),
+        )
+        for email_address in calendar_account_emails
     )
 
     page_size = int(os.getenv("GMAIL_PAGE_SIZE", str(DEFAULT_GMAIL_PAGE_SIZE)))
@@ -135,6 +163,10 @@ def load_settings(
     )
     if gmail_attachment_backfill_batch_size < 0:
         raise ValueError("GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE must be greater than or equal to 0")
+
+    calendar_page_size = int(os.getenv("CALENDAR_PAGE_SIZE", str(DEFAULT_CALENDAR_PAGE_SIZE)))
+    if calendar_page_size < 1 or calendar_page_size > 2500:
+        raise ValueError("CALENDAR_PAGE_SIZE must be between 1 and 2500")
 
     slack_account_names = _parse_csv_env(os.getenv("SLACK_ACCOUNTS"))
     if require_slack and not slack_account_names:
@@ -163,6 +195,7 @@ def load_settings(
         clickhouse_url=clickhouse_url,
         gmail_accounts=gmail_accounts,
         gmail_oauth_client_secrets_json=client_secrets_json,
+        google_scopes=(GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE),
         gmail_scopes=(GMAIL_READONLY_SCOPE,),
         gmail_page_size=page_size,
         gmail_include_spam_trash=_parse_bool_env(os.getenv("GMAIL_INCLUDE_SPAM_TRASH"), True),
@@ -171,6 +204,10 @@ def load_settings(
         gmail_attachment_max_bytes=gmail_attachment_max_bytes,
         gmail_attachment_text_max_chars=gmail_attachment_text_max_chars,
         gmail_attachment_backfill_batch_size=gmail_attachment_backfill_batch_size,
+        calendar_accounts=calendar_accounts,
+        calendar_scopes=(CALENDAR_READONLY_SCOPE,),
+        calendar_page_size=calendar_page_size,
+        calendar_force_full_sync=_parse_bool_env(os.getenv("CALENDAR_FORCE_FULL_SYNC"), False),
         slack_accounts=tuple(slack_accounts),
         slack_page_size=slack_page_size,
         slack_lookback_days=int(os.getenv("SLACK_LOOKBACK_DAYS", str(DEFAULT_SLACK_LOOKBACK_DAYS))),
