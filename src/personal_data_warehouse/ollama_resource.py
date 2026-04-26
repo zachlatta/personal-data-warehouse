@@ -117,6 +117,7 @@ class OllamaResource(ConfigurableResource):
         model: str,
         prompt: str,
         images: Sequence[bytes] = (),
+        format: str | None = None,
         options: Mapping[str, object] | None = None,
         think: bool = False,
         timeout_seconds: int | None = None,
@@ -128,6 +129,8 @@ class OllamaResource(ConfigurableResource):
             "stream": False,
             "think": think,
         }
+        if format is not None:
+            payload["format"] = format
         if options is not None:
             payload["options"] = dict(options)
         response = self._post_json(

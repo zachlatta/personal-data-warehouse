@@ -141,6 +141,7 @@ def test_ollama_resource_generate_posts_images_prompt_and_options(monkeypatch) -
         model="gemma4:e2b",
         prompt="describe this",
         images=[b"fake image"],
+        format="json",
         options={"temperature": 0},
         think=False,
         timeout_seconds=56,
@@ -156,5 +157,6 @@ def test_ollama_resource_generate_posts_images_prompt_and_options(monkeypatch) -
         "images": ["ZmFrZSBpbWFnZQ=="],
         "stream": False,
         "think": False,
+        "format": "json",
         "options": {"temperature": 0},
     }

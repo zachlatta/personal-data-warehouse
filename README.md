@@ -41,9 +41,11 @@ GMAIL_ACCOUNTS=zach@zachlatta.com,zach@hackclub.com
 Optional:
 
 ```bash
-GMAIL_OAUTH_CLIENT_SECRETS_JSON_B64=...
+GMAIL_DOMAIN_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON_B64=...
+GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64=...
 GMAIL_ZACH_ZACHLATTA_COM_TOKEN_JSON_B64=...
 GMAIL_ZACH_HACKCLUB_COM_TOKEN_JSON_B64=...
+GOOGLE_ZACH_ZACHLATTA_COM_TOKEN_JSON_B64=...
 GOOGLE_ZACH_HACKCLUB_COM_TOKEN_JSON_B64=...
 GMAIL_PAGE_SIZE=500
 GMAIL_INCLUDE_SPAM_TRASH=true
@@ -57,7 +59,9 @@ CALENDAR_PAGE_SIZE=2500
 
 Notes:
 
-- `GMAIL_OAUTH_CLIENT_SECRETS_JSON` or `GMAIL_OAUTH_CLIENT_SECRETS_JSON_B64` is only needed when running the browser auth flow.
+- OAuth client secrets are only needed when running the browser auth flow.
+- Use a separate OAuth app per email domain: `GMAIL_DOMAIN_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON_B64` for `hackclub.com`, `GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64` for `zachlatta.com`, and so on. `GOOGLE_DOMAIN_<DOMAIN_SLUG>_OAUTH_CLIENT_SECRETS_JSON_B64` is also supported.
+- The legacy global `GMAIL_OAUTH_CLIENT_SECRETS_JSON_B64` fallback is only used when the configured Google accounts span one email domain.
 - Sync runtime requires one `GOOGLE_<ACCOUNT_SLUG>_TOKEN_JSON_B64` or legacy `GMAIL_<ACCOUNT_SLUG>_TOKEN_JSON_B64` value per Google account.
 - Google OAuth client secrets and account tokens are env-only; the app does not read or write Google secrets from the filesystem.
 - Calendar sync defaults to the accounts in `GMAIL_ACCOUNTS` and the `primary` calendar unless `CALENDAR_ACCOUNTS` or `CALENDAR_<ACCOUNT_SLUG>_CALENDAR_IDS` are set.
@@ -81,6 +85,13 @@ This uses browser-based OAuth for both Gmail readonly and Calendar readonly scop
 `GOOGLE_<ACCOUNT_SLUG>_TOKEN_JSON_B64=...` and legacy `GMAIL_<ACCOUNT_SLUG>_TOKEN_JSON_B64=...`
 lines to add to `.env` or Coolify. `personal-data-warehouse-google-auth` is an alias for
 the same auth flow.
+
+Add each domain's OAuth app client secrets before authorizing mailboxes in that domain:
+
+```bash
+GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64=...
+uv run personal-data-warehouse-google-auth --email zach@zachlatta.com --write-env
+```
 
 ## Running The Sync
 

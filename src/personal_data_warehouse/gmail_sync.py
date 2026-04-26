@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import ssl
 from email.utils import getaddresses, parseaddr
 from io import BytesIO
@@ -17,6 +18,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Callable, Protocol, TypeVar
 import urllib.error
@@ -112,6 +114,7 @@ class AttachmentVisionClient(Protocol):
         model: str,
         prompt: str,
         images: Sequence[bytes],
+        format: str | None = None,
         options: Mapping[str, object] | None = None,
         think: bool = False,
         timeout_seconds: int | None = None,
@@ -1282,14 +1285,16 @@ def call_ollama_attachment_vision_model(
         "num_predict": 512,
     }
     if config.client is not None:
-        return config.client.generate(
-            model=config.model,
-            prompt=ATTACHMENT_AI_PROMPT,
-            images=images,
-            options=options,
-            think=False,
-            timeout_seconds=config.timeout_seconds,
-        )
+        with attachment_ai_wall_clock_timeout(config.timeout_seconds):
+            return config.client.generate(
+                model=config.model,
+                prompt=ATTACHMENT_AI_PROMPT,
+                images=images,
+                format="json",
+                options=options,
+                think=False,
+                timeout_seconds=config.timeout_seconds,
+            )
 
     image_payload = [base64.b64encode(image).decode("ascii") for image in images]
     payload = {
@@ -1298,6 +1303,7 @@ def call_ollama_attachment_vision_model(
         "images": image_payload,
         "stream": False,
         "think": False,
+        "format": "json",
         "options": options,
     }
     request = urllib.request.Request(
@@ -1306,11 +1312,32 @@ def call_ollama_attachment_vision_model(
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-            response_data = json.loads(response.read())
+        with attachment_ai_wall_clock_timeout(config.timeout_seconds):
+            with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+                response_data = json.loads(response.read())
     except urllib.error.URLError as exc:
         raise RuntimeError(str(exc)) from exc
     return str(response_data.get("response", ""))
+
+
+@contextmanager
+def attachment_ai_wall_clock_timeout(timeout_seconds: int) -> Iterator[None]:
+    if timeout_seconds <= 0 or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def raise_timeout(_signum, _frame) -> None:
+        raise TimeoutError(f"AI attachment fallback timed out after {timeout_seconds} seconds")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def format_attachment_ai_response(response_text: str) -> str:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from personal_data_warehouse.config import env_slug, load_settings
+from personal_data_warehouse.config import email_domain, env_slug, load_settings
 
 
 def run_oauth_flow(email_address: str) -> dict[str, str]:
@@ -16,10 +16,19 @@ def run_oauth_flow(email_address: str) -> dict[str, str]:
         require_gmail=False,
         require_gmail_client_secrets=True,
     )
-    if not settings.gmail_oauth_client_secrets_json:
-        raise RuntimeError("GMAIL_OAUTH_CLIENT_SECRETS_JSON or GMAIL_OAUTH_CLIENT_SECRETS_JSON_B64 must be set")
+    client_secrets_json = settings.google_oauth_client_secrets_json_for_email(email_address)
+    if not client_secrets_json:
+        slug = env_slug(email_address)
+        domain_slug = env_slug(email_domain(email_address))
+        raise RuntimeError(
+            f"No Google OAuth client secrets configured for {email_address}. "
+            f"Set GOOGLE_DOMAIN_{domain_slug}_OAUTH_CLIENT_SECRETS_JSON_B64 or "
+            f"GMAIL_DOMAIN_{domain_slug}_OAUTH_CLIENT_SECRETS_JSON_B64. "
+            f"Account override names GOOGLE_{slug}_OAUTH_CLIENT_SECRETS_JSON_B64 and "
+            f"GMAIL_{slug}_OAUTH_CLIENT_SECRETS_JSON_B64 are also supported."
+        )
     flow = InstalledAppFlow.from_client_config(
-        json.loads(settings.gmail_oauth_client_secrets_json),
+        json.loads(client_secrets_json),
         settings.google_scopes,
     )
     credentials = flow.run_local_server(port=0)

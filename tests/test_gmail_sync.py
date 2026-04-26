@@ -124,6 +124,53 @@ def test_load_settings_accepts_oauth_client_secrets_json_env(monkeypatch) -> Non
     assert settings.gmail_oauth_client_secrets_json == '{"installed":{}}'
 
 
+def test_load_settings_accepts_domain_specific_oauth_client_secrets(monkeypatch) -> None:
+    hackclub_secrets_json = '{"installed":{"client_id":"hackclub-client"}}'
+    zachlatta_secrets_json = '{"installed":{"client_id":"zachlatta-client"}}'
+    encoded_hackclub_secrets = base64.b64encode(hackclub_secrets_json.encode("utf-8")).decode("ascii")
+    encoded_zachlatta_secrets = base64.b64encode(zachlatta_secrets_json.encode("utf-8")).decode("ascii")
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com,zach@zachlatta.com")
+    monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRETS_JSON", '{"installed":{"client_id":"default-client"}}')
+    monkeypatch.setenv("GMAIL_DOMAIN_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON_B64", encoded_hackclub_secrets)
+    monkeypatch.setenv("GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64", encoded_zachlatta_secrets)
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=True)
+
+    assert (
+        settings.google_oauth_client_secrets_json_for_email("zach@zachlatta.com")
+        == zachlatta_secrets_json
+    )
+    assert settings.google_oauth_client_secrets_json_for_email("zach@hackclub.com") == hackclub_secrets_json
+
+
+def test_load_settings_does_not_use_global_oauth_client_for_multiple_domains(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com,zach@zachlatta.com")
+    monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRETS_JSON", '{"installed":{"client_id":"default-client"}}')
+    for name in (
+        "GOOGLE_ZACH_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON",
+        "GOOGLE_ZACH_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON_B64",
+        "GMAIL_ZACH_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON",
+        "GMAIL_ZACH_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON_B64",
+        "GOOGLE_ZACH_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON",
+        "GOOGLE_ZACH_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64",
+        "GMAIL_ZACH_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON",
+        "GMAIL_ZACH_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64",
+        "GOOGLE_DOMAIN_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON",
+        "GOOGLE_DOMAIN_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON_B64",
+        "GMAIL_DOMAIN_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON",
+        "GMAIL_DOMAIN_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON_B64",
+        "GOOGLE_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON",
+        "GOOGLE_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64",
+        "GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON",
+        "GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64",
+    ):
+        monkeypatch.setenv(name, "")
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=True)
+
+    assert settings.google_oauth_client_secrets_json_for_email("zach@zachlatta.com") is None
+
+
 def test_load_settings_can_skip_oauth_client_secrets_for_sync_runtime(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
     monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRETS_JSON", "")
@@ -534,6 +581,7 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
             "model": "gemma4:e2b",
             "prompt": ATTACHMENT_AI_PROMPT,
             "images": [image_content],
+            "format": "json",
             "options": {"temperature": 0, "num_predict": 512},
             "think": False,
             "timeout_seconds": 30,
