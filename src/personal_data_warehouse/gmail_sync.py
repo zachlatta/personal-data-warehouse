@@ -48,17 +48,18 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v4"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v5"
 ATTACHMENT_AI_PROMPT = """Analyze this real Gmail attachment image.
 
 Return concise JSON with these keys:
 - is_useful: true if the image may contain meaningful user-visible information worth indexing. Use false only when the image is clearly blank, decorative, a tracking pixel, a logo-only image, UI chrome, or an attachment placeholder with no useful content. Receipts, invoices, photos, charts, screenshots of documents, and screenshots containing readable content are useful. Generic words like "Gmail attachment" alone are not useful. If unsure, use true.
-- summary: one sentence describing what the attachment appears to be.
-- visible_text: readable text visible in the image, preserving important names, dates, amounts, addresses, and identifiers.
+- scene_summary: one sentence describing the whole image, including people, setting, activity, important objects, and visual context. Do not summarize only the largest text region.
+- visible_text: readable text visible anywhere in the image, preserving important names, dates, amounts, addresses, headings, labels, and identifiers.
 - likely_document_type: a short label such as receipt, invoice, chart, photo, official letter, form, screenshot, or unknown.
-- useful_for_search: concise search keywords and entities.
+- document_context: a short explanation of what the attachment appears to be in context, such as classroom presentation photo, event flyer, product screenshot, scanned receipt, handwritten note, or unknown.
+- search_keywords: concise search keywords, named entities, topics, settings, activities, and visible text phrases useful for finding this later.
 
-If text is unclear, say so. Do not invent details."""
+Describe the full scene even when there is prominent text. If text is unclear, say so. Do not invent details."""
 ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
 ATTACHMENT_AI_MIN_IMAGE_BYTES = 16 * 1024
 IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
@@ -1365,20 +1366,22 @@ def format_attachment_ai_response(response_text: str) -> str:
     if not attachment_ai_response_is_useful(payload):
         return ""
 
+    scene_summary = attachment_ai_response_field(payload, "scene_summary", "summary")
     visible_text = payload.get("visible_text", "")
-    if isinstance(visible_text, list):
-        visible_text_value = "\n".join(str(item) for item in visible_text if str(item).strip())
-    else:
-        visible_text_value = str(visible_text)
+    visible_text_value = attachment_ai_response_text(visible_text, separator="\n")
+    likely_document_type = attachment_ai_response_field(payload, "likely_document_type")
+    document_context = attachment_ai_response_field(payload, "document_context")
+    search_keywords = attachment_ai_response_field(payload, "search_keywords", "useful_for_search")
 
     return "\n\n".join(
         part
         for part in (
             "AI attachment extraction",
-            f"Summary: {payload.get('summary', '')}".strip(),
-            f"Likely document type: {payload.get('likely_document_type', '')}".strip(),
+            f"Scene: {scene_summary}".strip(),
+            f"Likely document type: {likely_document_type}".strip(),
+            f"Document context: {document_context}".strip(),
             f"Visible text:\n{visible_text_value}".strip(),
-            f"Useful for search: {payload.get('useful_for_search', '')}".strip(),
+            f"Search keywords: {search_keywords}".strip(),
         )
         if part and not part.endswith(":")
     )
@@ -1416,13 +1419,14 @@ def attachment_ai_response_is_useful(payload: Mapping[str, object]) -> bool:
 
 
 def attachment_ai_response_is_generic_placeholder(payload: Mapping[str, object]) -> bool:
-    summary = attachment_ai_response_text(payload.get("summary", ""))
+    summary = attachment_ai_response_field(payload, "scene_summary", "summary")
     visible_text = attachment_ai_response_text(payload.get("visible_text", ""))
-    likely_document_type = attachment_ai_response_text(payload.get("likely_document_type", ""))
-    useful_for_search = attachment_ai_response_text(payload.get("useful_for_search", ""))
+    likely_document_type = attachment_ai_response_field(payload, "likely_document_type")
+    document_context = attachment_ai_response_field(payload, "document_context")
+    useful_for_search = attachment_ai_response_field(payload, "search_keywords", "useful_for_search")
     combined = " ".join(
         part
-        for part in (summary, visible_text, likely_document_type, useful_for_search)
+        for part in (summary, visible_text, likely_document_type, document_context, useful_for_search)
         if part
     ).lower()
     if not combined:
@@ -1436,17 +1440,28 @@ def attachment_ai_response_is_generic_placeholder(payload: Mapping[str, object])
     return searchable_words <= generic_words
 
 
-def attachment_ai_response_text(value: object) -> str:
+def attachment_ai_response_field(payload: Mapping[str, object], *names: str) -> str:
+    for name in names:
+        text = attachment_ai_response_text(payload.get(name, ""))
+        if text:
+            return text
+    return ""
+
+
+def attachment_ai_response_text(value: object, *, separator: str = " ") -> str:
     if isinstance(value, list):
-        return " ".join(str(item).strip() for item in value if str(item).strip())
+        return separator.join(str(item).strip() for item in value if str(item).strip())
     return str(value).strip()
 
 
 def attachment_ai_response_has_indexable_content(payload: Mapping[str, object]) -> bool:
     values = [
+        payload.get("scene_summary", ""),
         payload.get("summary", ""),
         payload.get("visible_text", ""),
         payload.get("likely_document_type", ""),
+        payload.get("document_context", ""),
+        payload.get("search_keywords", ""),
         payload.get("useful_for_search", ""),
     ]
     for value in values:
