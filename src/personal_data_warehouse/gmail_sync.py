@@ -53,7 +53,7 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v18"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v19"
 ATTACHMENT_AI_GENERATION_OPTIONS = {
     "temperature": 0,
     "num_predict": 320,
@@ -1652,6 +1652,12 @@ def run_ollama_generate_request_with_process_timeout(
     ok, value = results.get_nowait()
     if ok and isinstance(value, dict):
         return value
+    terminated_runners = terminate_ollama_runner_processes()
+    if terminated_runners:
+        LOGGER.warning(
+            "Terminated %s Ollama runner process(es) after Gmail attachment Ollama worker error",
+            terminated_runners,
+        )
     raise RuntimeError(str(value))
 
 
