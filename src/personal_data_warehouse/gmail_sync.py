@@ -53,7 +53,7 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v17"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v18"
 ATTACHMENT_AI_GENERATION_OPTIONS = {
     "temperature": 0,
     "num_predict": 320,
@@ -1639,6 +1639,12 @@ def run_ollama_generate_request_with_process_timeout(
         if process.is_alive():
             process.kill()
             process.join(timeout=5)
+        terminated_runners = terminate_ollama_runner_processes()
+        if terminated_runners:
+            LOGGER.warning(
+                "Terminated %s Ollama runner process(es) after Gmail attachment AI timeout",
+                terminated_runners,
+            )
         raise TimeoutError(f"AI attachment fallback timed out after {timeout_seconds:g} seconds")
     if results.empty():
         LOGGER.warning("Gmail attachment Ollama generate worker exited without a result: code=%s", process.exitcode)
@@ -1674,6 +1680,54 @@ def reset_ollama_generate_worker_signal_handlers() -> None:
             signal.signal(signum, signal.SIG_DFL)
         except (AttributeError, OSError, ValueError):
             continue
+
+
+def terminate_ollama_runner_processes(proc_root: Path = Path("/proc")) -> int:
+    pids = ollama_runner_pids(proc_root=proc_root)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            LOGGER.warning("Could not terminate Ollama runner pid=%s: permission denied", pid)
+    time.sleep(0.2)
+    killed = 0
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            killed += 1
+            continue
+        except PermissionError:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except ProcessLookupError:
+            killed += 1
+        except PermissionError:
+            LOGGER.warning("Could not kill Ollama runner pid=%s: permission denied", pid)
+    return killed
+
+
+def ollama_runner_pids(proc_root: Path = Path("/proc")) -> list[int]:
+    pids: list[int] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return pids
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        args = [arg.decode("utf-8", errors="replace") for arg in cmdline.split(b"\0") if arg]
+        if len(args) >= 2 and Path(args[0]).name == "ollama" and args[1] == "runner":
+            pids.append(int(entry.name))
+    return pids
 
 
 def attachment_ai_supporting_ocr_text(*, images: Sequence[bytes], timeout_seconds: int) -> str:

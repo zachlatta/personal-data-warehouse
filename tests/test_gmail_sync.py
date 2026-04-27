@@ -49,6 +49,7 @@ from personal_data_warehouse.gmail_sync import (
     history_message_ids,
     message_body_to_markdown,
     message_to_row,
+    ollama_runner_pids,
     run_attachment_ai_call_with_timeout,
     run_ollama_generate_request_with_process_timeout,
     strip_quoted_history,
@@ -1326,6 +1327,21 @@ def test_attachment_ai_call_timeout_returns_control() -> None:
         raise AssertionError("expected timeout")
 
     assert time.monotonic() - started_at < 0.5
+
+
+def test_ollama_runner_pids_detects_only_ollama_runners(tmp_path) -> None:
+    runner = tmp_path / "123"
+    runner.mkdir()
+    (runner / "cmdline").write_bytes(b"/usr/local/bin/ollama\0runner\0--model\0qwen3-vl:2b\0")
+    server = tmp_path / "456"
+    server.mkdir()
+    (server / "cmdline").write_bytes(b"/usr/local/bin/ollama\0serve\0")
+    python = tmp_path / "789"
+    python.mkdir()
+    (python / "cmdline").write_bytes(b"python\0-m\0dagster\0")
+    (tmp_path / "not-a-pid").mkdir()
+
+    assert ollama_runner_pids(proc_root=tmp_path) == [123]
 
 
 def test_ollama_generate_process_timeout_returns_control() -> None:
