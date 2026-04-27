@@ -63,6 +63,9 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             ).sync_all()
         )
 
+    if _bool_env("SLACK_ASSET_READ_STATE_WITH_FRESHNESS", True):
+        summaries.extend(run_slack_read_state_sync(settings=settings, warehouse=warehouse, logger=logger))
+
     return summaries
 
 
@@ -165,7 +168,7 @@ def run_slack_read_state_sync(*, settings, warehouse, logger) -> list[SlackSyncS
         sync_users=False,
         sync_members=False,
         sync_conversation_info_only=True,
-        conversation_limit=_int_env("SLACK_ASSET_READ_STATE_LIMIT", 10),
+        conversation_limit=_int_env("SLACK_ASSET_READ_STATE_LIMIT", 25),
         max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
     ).sync_all()
 
@@ -240,6 +243,13 @@ def _coverage_stage_for_time(now: datetime) -> dict[str, object] | None:
 def _int_env(name: str, default: int) -> int:
     value = os.getenv(name)
     return int(value) if value else default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @asset(

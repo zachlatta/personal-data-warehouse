@@ -105,6 +105,7 @@ def test_slack_read_state_candidates_include_direct_messages() -> None:
     warehouse.load_slack_read_state_candidate_payloads(account="zrl", team_id="T1", limit=10)
 
     assert "(c.is_member = 1 OR c.is_im = 1 OR c.is_mpim = 1)" in queries[0]
+    assert "m.latest_message_at IS NOT NULL" in queries[0]
     assert "last_read" in queries[0]
 
 

@@ -1249,6 +1249,7 @@ class ClickHouseWarehouse:
               AND c.team_id = {_sql_string(team_id)}
               AND c.is_archived = 0
               AND (c.is_member = 1 OR c.is_im = 1 OR c.is_mpim = 1)
+              AND m.latest_message_at IS NOT NULL
               {type_clause}
             ORDER BY
                 toDecimal64OrZero(JSONExtractString(c.raw_json, 'last_read'), 6) = 0 DESC,

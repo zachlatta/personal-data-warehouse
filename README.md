@@ -145,7 +145,10 @@ scheduled pass so one inaccessible thread does not block the backlog. Configure 
 `slack_workspace_read_state_sync_every_five_minutes` refreshes `conversations.info` for a small
 set of recently active account-relevant conversations, including DMs, group DMs, and member
 channels, staggered two minutes after the thread schedule. This updates user-specific fields such
-as `last_read` for deriving unread state. Configure it with `SLACK_ASSET_READ_STATE_LIMIT`.
+as `last_read` for deriving unread state. The every-minute freshness sync also piggybacks the same
+read-state refresh while it already holds the Slack lock, so current-account state does not depend
+on a separate read-state run winning the scheduler race. Configure it with
+`SLACK_ASSET_READ_STATE_LIMIT`.
 Freshness stages also poll capped sets of cached conversations per type, ordered by recent
 activity, so each scheduled run remains bounded.
 All Slack schedules share a nonblocking Slack lock, so a scheduled tick skips if another Slack
