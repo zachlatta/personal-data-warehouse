@@ -8,6 +8,7 @@ import base64
 import fcntl
 import hashlib
 import json
+import multiprocessing
 import os
 import queue
 import re
@@ -1332,7 +1333,7 @@ def call_ollama_attachment_vision_model(
         "temperature": 0,
         "num_predict": 512,
     }
-    if config.client is not None:
+    if config.client is not None and config.client.__class__.__name__ != "OllamaResource":
         return run_attachment_ai_call_with_timeout(
             lambda: config.client.generate(
                 model=config.model,
@@ -1362,21 +1363,58 @@ def call_ollama_attachment_vision_model(
         headers={"Content-Type": "application/json"},
     )
 
-    def request_ollama_generate() -> dict[str, object]:
-        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-            payload = json.loads(response.read())
-        if isinstance(payload, dict):
-            return payload
-        raise RuntimeError("Ollama returned a non-object JSON response")
-
-    try:
-        response_data = run_attachment_ai_call_with_timeout(
-            request_ollama_generate,
-            timeout_seconds=config.timeout_seconds,
-        )
-    except urllib.error.URLError as exc:
-        raise RuntimeError(str(exc)) from exc
+    response_data = run_ollama_generate_request_with_process_timeout(
+        request,
+        timeout_seconds=config.timeout_seconds,
+    )
     return str(response_data.get("response", ""))
+
+
+def run_ollama_generate_request_with_process_timeout(
+    request: urllib.request.Request,
+    *,
+    timeout_seconds: int,
+) -> dict[str, object]:
+    context = multiprocessing.get_context("fork")
+    results: multiprocessing.Queue[tuple[bool, dict[str, object] | str]] = context.Queue(maxsize=1)
+    process = context.Process(
+        target=ollama_generate_request_worker,
+        args=(request.full_url, bytes(request.data or b""), dict(request.headers), timeout_seconds, results),
+        daemon=True,
+    )
+    process.start()
+    process.join(timeout_seconds)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        raise TimeoutError(f"AI attachment fallback timed out after {timeout_seconds:g} seconds")
+    if results.empty():
+        raise RuntimeError(f"Ollama generate worker exited with code {process.exitcode}")
+    ok, value = results.get_nowait()
+    if ok and isinstance(value, dict):
+        return value
+    raise RuntimeError(str(value))
+
+
+def ollama_generate_request_worker(
+    url: str,
+    data: bytes,
+    headers: Mapping[str, str],
+    timeout_seconds: int,
+    results,
+) -> None:
+    request = urllib.request.Request(url, data=data, headers=dict(headers))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read())
+        if not isinstance(payload, dict):
+            raise RuntimeError("Ollama returned a non-object JSON response")
+        results.put((True, payload), block=False)
+    except Exception as exc:
+        results.put((False, str(exc)), block=False)
 
 
 def attachment_ai_supporting_ocr_text(*, images: Sequence[bytes], timeout_seconds: int) -> str:
