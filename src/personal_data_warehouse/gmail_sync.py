@@ -8,6 +8,7 @@ import base64
 import fcntl
 import hashlib
 import json
+import logging
 import multiprocessing
 import os
 import queue
@@ -40,6 +41,7 @@ from personal_data_warehouse.clickhouse import ClickHouseWarehouse, SyncState
 from personal_data_warehouse.config import GmailAccount, Settings, env_slug
 from personal_data_warehouse.google_auth import google_token_json_from_env, load_google_credentials
 
+LOGGER = logging.getLogger(__name__)
 EPOCH_UTC = datetime.fromtimestamp(0, tz=UTC)
 DEFAULT_GMAIL_SYNC_LOCK_PATH = Path(tempfile.gettempdir()) / "personal-data-warehouse-gmail-sync.lock"
 GMAIL_SYNC_POSTGRES_LOCK_ID = 7_403_111_836
@@ -50,7 +52,11 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v12"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v13"
+ATTACHMENT_AI_GENERATION_OPTIONS = {
+    "temperature": 0,
+    "num_predict": 320,
+}
 ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
 
 Return only concise JSON with this schema:
@@ -73,6 +79,8 @@ If any readable text exists anywhere in the image, is_useful must be true. Logos
 Never call the image a Gmail placeholder or Gmail interface unless Gmail UI or a literal Gmail attachment placeholder is visible. Do not infer visible text from the filename or from these instructions. Preserve acronyms and capitalization exactly as they appear. Only include text that is visibly printed in the image; do not turn incidental shapes, shadows, monitors, or decorative marks into OCR text. If no text is visible, visible_text must be [] rather than ["unknown"], ["none"], or prose. If text is partially uncertain, include your best reading and add "(uncertain)" or an uncertainties note. Avoid generic keywords such as image, attachment, photo, and Gmail unless they are literally visible or specifically useful.
 
 If deterministic OCR hints are provided, treat them as weak hints, not ground truth. Ignore OCR-looking noise made of random single letters, punctuation, texture artifacts, or decorative marks. Use OCR hints only when they align with visibly printed text in the image.
+
+Keep the JSON concise enough to finish quickly: prefer at most 12 visible_text chunks, 10 entities, 10 search_keywords, and 5 uncertainties, while still preserving all important names, titles, dates, numbers, and readable sign/poster text.
 
 Use false for is_useful only for blank/decorative/tracking images or literal placeholders with no useful visible text. Do not invent details."""
 ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
@@ -529,9 +537,15 @@ class GmailSyncRunner:
         if limit <= 0:
             return (0, 0, 0)
 
+        ai_provider = self._attachment_ai_fallback.provider if self._attachment_ai_fallback else ""
+        ai_model = self._attachment_ai_fallback.model if self._attachment_ai_fallback else ""
+        ai_prompt_version = ATTACHMENT_AI_PROMPT_VERSION if self._attachment_ai_fallback else ""
         messages = self._warehouse.load_attachment_backfill_candidate_messages(
             account=account.email_address,
             limit=limit,
+            ai_provider=ai_provider,
+            ai_model=ai_model,
+            ai_prompt_version=ai_prompt_version,
         )
         if not messages:
             return (0, 0, 0)
@@ -571,6 +585,9 @@ class GmailSyncRunner:
                             status="ok",
                             attachment_rows_written=len(rows),
                             error="",
+                            ai_provider=ai_provider,
+                            ai_model=ai_model,
+                            ai_prompt_version=ai_prompt_version,
                             updated_at=synced_at,
                         )
                     ]
@@ -584,6 +601,9 @@ class GmailSyncRunner:
                             status="failed",
                             attachment_rows_written=0,
                             error=truncate_error(str(exc)),
+                            ai_provider=ai_provider,
+                            ai_model=ai_model,
+                            ai_prompt_version=ai_prompt_version,
                             updated_at=datetime.now(tz=UTC),
                         )
                     ]
@@ -943,6 +963,9 @@ def attachment_backfill_state_row(
     status: str,
     attachment_rows_written: int,
     error: str,
+    ai_provider: str = "",
+    ai_model: str = "",
+    ai_prompt_version: str = "",
     updated_at: datetime,
 ) -> dict[str, object]:
     return {
@@ -951,6 +974,9 @@ def attachment_backfill_state_row(
         "status": status,
         "attachment_rows_written": int(attachment_rows_written),
         "error": error,
+        "ai_provider": ai_provider,
+        "ai_model": ai_model,
+        "ai_prompt_version": ai_prompt_version,
         "updated_at": updated_at,
         "sync_version": int(updated_at.timestamp() * 1000),
     }
@@ -1156,6 +1182,7 @@ def apply_attachment_ai_fallback(
 ) -> AttachmentTextExtraction:
     if config is None or extraction.status not in ATTACHMENT_AI_FALLBACK_STATUSES:
         return extraction
+    started_at = time.monotonic()
     try:
         images = attachment_ai_fallback_images(
             content=content,
@@ -1166,10 +1193,19 @@ def apply_attachment_ai_fallback(
         )
         if not images:
             return extraction
-        started_at = time.monotonic()
         supporting_ocr_text = attachment_ai_supporting_ocr_text(
             images=images,
             timeout_seconds=config.timeout_seconds,
+        )
+        LOGGER.info(
+            "Starting Gmail attachment AI fallback model=%s source_status=%s mime_type=%s content_bytes=%s image_count=%s ocr_chars=%s timeout_seconds=%s",
+            config.model,
+            extraction.status,
+            mime_type,
+            len(content),
+            len(images),
+            len(supporting_ocr_text),
+            config.timeout_seconds,
         )
         prompt = attachment_ai_prompt(supporting_ocr_text=supporting_ocr_text)
         response_text = call_ollama_attachment_vision_model(
@@ -1179,6 +1215,15 @@ def apply_attachment_ai_fallback(
         )
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
     except Exception as exc:
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        LOGGER.warning(
+            "Gmail attachment AI fallback failed model=%s source_status=%s mime_type=%s elapsed_ms=%s: %s",
+            config.model,
+            extraction.status,
+            mime_type,
+            elapsed_ms,
+            exc,
+        )
         return replace(
             extraction,
             error=truncate_error(
@@ -1202,6 +1247,7 @@ def apply_attachment_ai_fallback(
         "base_url": config.base_url,
         "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
         "prompt_sha256": prompt_sha256,
+        "generation_options": ATTACHMENT_AI_GENERATION_OPTIONS,
     }
 
     text = normalize_markdown(
@@ -1329,10 +1375,6 @@ def call_ollama_attachment_vision_model(
     config: AttachmentAiFallbackConfig,
     prompt: str,
 ) -> str:
-    options = {
-        "temperature": 0,
-        "num_predict": 512,
-    }
     if config.client is not None and config.client.__class__.__name__ != "OllamaResource":
         return run_attachment_ai_call_with_timeout(
             lambda: config.client.generate(
@@ -1340,7 +1382,7 @@ def call_ollama_attachment_vision_model(
                 prompt=prompt,
                 images=images,
                 format="json",
-                options=options,
+                options=ATTACHMENT_AI_GENERATION_OPTIONS,
                 think=False,
                 timeout_seconds=config.timeout_seconds,
             ),
@@ -1355,7 +1397,7 @@ def call_ollama_attachment_vision_model(
         "stream": False,
         "think": False,
         "format": "json",
-        "options": options,
+        "options": ATTACHMENT_AI_GENERATION_OPTIONS,
     }
     request = urllib.request.Request(
         f"{config.base_url}/api/generate",
@@ -1375,16 +1417,29 @@ def run_ollama_generate_request_with_process_timeout(
     *,
     timeout_seconds: int,
 ) -> dict[str, object]:
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("spawn")
     results: multiprocessing.Queue[tuple[bool, dict[str, object] | str]] = context.Queue(maxsize=1)
     process = context.Process(
         target=ollama_generate_request_worker,
         args=(request.full_url, bytes(request.data or b""), dict(request.headers), timeout_seconds, results),
         daemon=True,
     )
+    started_at = time.monotonic()
     process.start()
+    LOGGER.info(
+        "Started Gmail attachment Ollama generate worker pid=%s timeout_seconds=%s",
+        process.pid,
+        timeout_seconds,
+    )
     process.join(timeout_seconds)
     if process.is_alive():
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        LOGGER.warning(
+            "Terminating Gmail attachment Ollama generate worker pid=%s elapsed_ms=%s timeout_seconds=%s",
+            process.pid,
+            elapsed_ms,
+            timeout_seconds,
+        )
         process.terminate()
         process.join(timeout=5)
         if process.is_alive():
@@ -1392,6 +1447,7 @@ def run_ollama_generate_request_with_process_timeout(
             process.join(timeout=5)
         raise TimeoutError(f"AI attachment fallback timed out after {timeout_seconds:g} seconds")
     if results.empty():
+        LOGGER.warning("Gmail attachment Ollama generate worker exited without a result: code=%s", process.exitcode)
         raise RuntimeError(f"Ollama generate worker exited with code {process.exitcode}")
     ok, value = results.get_nowait()
     if ok and isinstance(value, dict):
@@ -1406,6 +1462,7 @@ def ollama_generate_request_worker(
     timeout_seconds: int,
     results,
 ) -> None:
+    reset_ollama_generate_worker_signal_handlers()
     request = urllib.request.Request(url, data=data, headers=dict(headers))
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
@@ -1415,6 +1472,14 @@ def ollama_generate_request_worker(
         results.put((True, payload), block=False)
     except BaseException as exc:
         results.put((False, str(exc)), block=False)
+
+
+def reset_ollama_generate_worker_signal_handlers() -> None:
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (AttributeError, OSError, ValueError):
+            continue
 
 
 def attachment_ai_supporting_ocr_text(*, images: Sequence[bytes], timeout_seconds: int) -> str:

@@ -86,6 +86,9 @@ ATTACHMENT_BACKFILL_STATE_COLUMNS = (
     "status",
     "attachment_rows_written",
     "error",
+    "ai_provider",
+    "ai_model",
+    "ai_prompt_version",
     "updated_at",
     "sync_version",
 )
@@ -475,12 +478,24 @@ class ClickHouseWarehouse:
                 status LowCardinality(String),
                 attachment_rows_written UInt32,
                 error String,
+                ai_provider LowCardinality(String),
+                ai_model String,
+                ai_prompt_version LowCardinality(String),
                 updated_at DateTime64(3, 'UTC'),
                 sync_version UInt64
             )
             ENGINE = ReplacingMergeTree(sync_version)
             ORDER BY (account, message_id)
             """
+        )
+        self._command(
+            "ALTER TABLE gmail_attachment_backfill_state ADD COLUMN IF NOT EXISTS ai_provider LowCardinality(String) AFTER error"
+        )
+        self._command(
+            "ALTER TABLE gmail_attachment_backfill_state ADD COLUMN IF NOT EXISTS ai_model String AFTER ai_provider"
+        )
+        self._command(
+            "ALTER TABLE gmail_attachment_backfill_state ADD COLUMN IF NOT EXISTS ai_prompt_version LowCardinality(String) AFTER ai_model"
         )
         self._ensure_gmail_account_state_view()
         self._ensure_combined_account_state_view_if_possible()
@@ -816,6 +831,9 @@ class ClickHouseWarehouse:
         *,
         account: str,
         limit: int,
+        ai_provider: str = "",
+        ai_model: str = "",
+        ai_prompt_version: str = "",
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -832,6 +850,9 @@ class ClickHouseWarehouse:
                   FROM gmail_attachment_backfill_state FINAL
                   WHERE account = {_sql_string(account)}
                     AND status = 'ok'
+                    AND ai_provider = {_sql_string(ai_provider)}
+                    AND ai_model = {_sql_string(ai_model)}
+                    AND ai_prompt_version = {_sql_string(ai_prompt_version)}
               )
             ORDER BY internal_date DESC, message_id DESC
             LIMIT {int(limit)}

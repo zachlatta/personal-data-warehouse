@@ -4,10 +4,14 @@ import base64
 from contextlib import contextmanager
 from datetime import UTC, datetime
 import hashlib
+import http.server
 from io import BytesIO
 import json
+import socketserver
 import subprocess
+import threading
 import time
+import urllib.request
 from unittest.mock import patch
 import zipfile
 
@@ -44,6 +48,7 @@ from personal_data_warehouse.gmail_sync import (
     message_body_to_markdown,
     message_to_row,
     run_attachment_ai_call_with_timeout,
+    run_ollama_generate_request_with_process_timeout,
     strip_quoted_history,
 )
 
@@ -107,8 +112,26 @@ class FakeAttachmentBackfillWarehouse:
         self.existing_keys = set(existing_keys or set())
         self.attachment_rows: list[dict[str, object]] = []
         self.state_rows: list[dict[str, object]] = []
+        self.candidate_requests: list[dict[str, object]] = []
 
-    def load_attachment_backfill_candidate_messages(self, *, account: str, limit: int):
+    def load_attachment_backfill_candidate_messages(
+        self,
+        *,
+        account: str,
+        limit: int,
+        ai_provider: str = "",
+        ai_model: str = "",
+        ai_prompt_version: str = "",
+    ):
+        self.candidate_requests.append(
+            {
+                "account": account,
+                "limit": limit,
+                "ai_provider": ai_provider,
+                "ai_model": ai_model,
+                "ai_prompt_version": ai_prompt_version,
+            }
+        )
         return self.messages[:limit]
 
     def existing_attachment_keys(self, *, account: str, message_ids: list[str]):
@@ -589,7 +612,7 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
             "prompt": ATTACHMENT_AI_PROMPT,
             "images": [image_content],
             "format": "json",
-            "options": {"temperature": 0, "num_predict": 512},
+            "options": {"temperature": 0, "num_predict": 320},
             "think": False,
             "timeout_seconds": 30,
         }
@@ -598,6 +621,7 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
     assert metadata["source_status"] == "unsupported"
     assert metadata["model"] == "gemma4:e2b"
     assert metadata["prompt_sha256"] == row["ai_prompt_sha256"]
+    assert metadata["generation_options"] == {"temperature": 0, "num_predict": 320}
 
 
 def test_attachment_ai_prompt_includes_deterministic_ocr_hints() -> None:
@@ -1223,6 +1247,42 @@ def test_attachment_ai_call_timeout_returns_control() -> None:
     assert time.monotonic() - started_at < 0.5
 
 
+def test_ollama_generate_process_timeout_returns_control() -> None:
+    class ThreadingTCPServer(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+
+    class SlowOllamaHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            time.sleep(1)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"response":"{}"}')
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    with ThreadingTCPServer(("127.0.0.1", 0), SlowOllamaHandler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/api/generate",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+        started_at = time.monotonic()
+        try:
+            run_ollama_generate_request_with_process_timeout(request, timeout_seconds=0.05)
+        except TimeoutError as exc:
+            assert "timed out" in str(exc)
+        else:
+            raise AssertionError("expected timeout")
+        finally:
+            server.shutdown()
+
+    assert time.monotonic() - started_at < 0.75
+
+
 def test_attachment_rows_for_message_skips_existing_and_tombstones_missing_attachment() -> None:
     message = {
         "id": "gmail-id",
@@ -1320,9 +1380,15 @@ def test_runner_backfills_attachment_candidates_and_marks_state(monkeypatch) -> 
     assert text_chars == len("backfill text")
     assert warehouse.attachment_rows[0]["filename"] == "notes.txt"
     assert warehouse.attachment_rows[0]["text"] == "backfill text"
+    assert warehouse.candidate_requests[0]["ai_provider"] == "ollama"
+    assert warehouse.candidate_requests[0]["ai_model"] == "qwen3-vl:8b"
+    assert warehouse.candidate_requests[0]["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
     assert warehouse.state_rows[0]["message_id"] == "gmail-id"
     assert warehouse.state_rows[0]["status"] == "ok"
     assert warehouse.state_rows[0]["attachment_rows_written"] == 1
+    assert warehouse.state_rows[0]["ai_provider"] == "ollama"
+    assert warehouse.state_rows[0]["ai_model"] == "qwen3-vl:8b"
+    assert warehouse.state_rows[0]["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
 
 
 def test_runner_marks_false_positive_attachment_candidates_as_processed(monkeypatch) -> None:

@@ -30,6 +30,43 @@ def test_gmail_schema_creates_account_state_view() -> None:
     assert any("CREATE OR REPLACE VIEW gmail_account_state_items" in command for command in commands)
 
 
+def test_gmail_attachment_backfill_schema_tracks_ai_version() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+
+    warehouse._command = commands.append
+    warehouse._query = lambda _sql: [(0,)]
+
+    warehouse.ensure_tables()
+
+    assert any("ai_provider LowCardinality(String)" in command for command in commands)
+    assert any("ADD COLUMN IF NOT EXISTS ai_model" in command for command in commands)
+    assert any("ADD COLUMN IF NOT EXISTS ai_prompt_version" in command for command in commands)
+
+
+def test_gmail_attachment_backfill_candidates_are_scoped_to_ai_version() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    queries: list[str] = []
+
+    def fake_query(sql: str):
+        queries.append(sql)
+        return []
+
+    warehouse._query = fake_query
+
+    warehouse.load_attachment_backfill_candidate_messages(
+        account="zrl@example.com",
+        limit=5,
+        ai_provider="ollama",
+        ai_model="qwen3-vl:8b",
+        ai_prompt_version="gmail-attachment-ai-v13",
+    )
+
+    assert "AND ai_provider = 'ollama'" in queries[0]
+    assert "AND ai_model = 'qwen3-vl:8b'" in queries[0]
+    assert "AND ai_prompt_version = 'gmail-attachment-ai-v13'" in queries[0]
+
+
 def test_slack_schema_creates_identity_table_and_account_state_view() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     commands: list[str] = []
