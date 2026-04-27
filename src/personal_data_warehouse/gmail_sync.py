@@ -53,11 +53,12 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v14"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v15"
 ATTACHMENT_AI_GENERATION_OPTIONS = {
     "temperature": 0,
     "num_predict": 320,
 }
+ATTACHMENT_AI_RESPONSE_FORMAT = "prompted_json"
 ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE = 1280
 ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY = 85
 ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
@@ -1253,6 +1254,7 @@ def apply_attachment_ai_fallback(
         "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
         "prompt_sha256": prompt_sha256,
         "generation_options": ATTACHMENT_AI_GENERATION_OPTIONS,
+        "response_format": ATTACHMENT_AI_RESPONSE_FORMAT,
         "model_image_preprocessing": {
             "format": "jpeg",
             "max_edge": ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE,
@@ -1415,7 +1417,7 @@ def call_ollama_attachment_vision_model(
                 model=config.model,
                 prompt=prompt,
                 images=images,
-                format="json",
+                format=None,
                 options=ATTACHMENT_AI_GENERATION_OPTIONS,
                 think=False,
                 timeout_seconds=config.timeout_seconds,
@@ -1430,7 +1432,6 @@ def call_ollama_attachment_vision_model(
         "images": image_payload,
         "stream": False,
         "think": False,
-        "format": "json",
         "options": ATTACHMENT_AI_GENERATION_OPTIONS,
     }
     request = urllib.request.Request(

@@ -58,12 +58,12 @@ def test_gmail_attachment_backfill_candidates_are_scoped_to_ai_version() -> None
         account="zrl@example.com",
         limit=5,
         ai_provider="ollama",
-        ai_model="qwen3-vl:8b",
+        ai_model="qwen3-vl:2b",
         ai_prompt_version="gmail-attachment-ai-v13",
     )
 
     assert "AND ai_provider = 'ollama'" in queries[0]
-    assert "AND ai_model = 'qwen3-vl:8b'" in queries[0]
+    assert "AND ai_model = 'qwen3-vl:2b'" in queries[0]
     assert "AND ai_prompt_version = 'gmail-attachment-ai-v13'" in queries[0]
 
 

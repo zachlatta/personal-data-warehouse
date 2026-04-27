@@ -122,9 +122,9 @@ still runs first. Configure it with `GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL`,
 `GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES`, and
 `GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL`. A reusable Dagster `OllamaResource`
 verifies the model before each Gmail run and pulls it when missing unless model
-pulls are disabled. The default model is `qwen3-vl:8b`, chosen for stronger
-small-model OCR and visual-language understanding on logos, screenshots, charts,
-slides, and scene text. When the resource starts Ollama itself, it sets
+pulls are disabled. The default model is `qwen3-vl:2b`, chosen as the smallest
+Qwen vision model that keeps background CPU fallback practical while deterministic
+OCR supplies additional search text. When the resource starts Ollama itself, it sets
 `GGML_METAL_TENSOR_DISABLE=1` so Apple Silicon keeps Metal acceleration while
 avoiding the current Metal cooperative-tensor crash seen with some vision models.
 The Docker image also includes Tesseract so fallback rows can append a short

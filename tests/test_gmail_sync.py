@@ -233,8 +233,8 @@ def test_load_settings_enables_gmail_attachment_ai_fallback_by_default(monkeypat
 
     assert settings.gmail_attachment_ai_fallback_enabled is True
     assert settings.gmail_attachment_ai_fallback_base_url == "http://127.0.0.1:11435"
-    assert settings.gmail_attachment_ai_fallback_model == "qwen3-vl:8b"
-    assert settings.gmail_attachment_ai_fallback_timeout_seconds == 120
+    assert settings.gmail_attachment_ai_fallback_model == "qwen3-vl:2b"
+    assert settings.gmail_attachment_ai_fallback_timeout_seconds == 60
     assert settings.gmail_attachment_ai_fallback_pull_model is True
 
 
@@ -613,7 +613,7 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
             "model": "gemma4:e2b",
             "prompt": ATTACHMENT_AI_PROMPT,
             "images": [image_content],
-            "format": "json",
+            "format": None,
             "options": {"temperature": 0, "num_predict": 320},
             "think": False,
             "timeout_seconds": 30,
@@ -624,6 +624,7 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
     assert metadata["model"] == "gemma4:e2b"
     assert metadata["prompt_sha256"] == row["ai_prompt_sha256"]
     assert metadata["generation_options"] == {"temperature": 0, "num_predict": 320}
+    assert metadata["response_format"] == "prompted_json"
 
 
 def test_attachment_ai_prompt_includes_deterministic_ocr_hints() -> None:
@@ -1396,13 +1397,13 @@ def test_runner_backfills_attachment_candidates_and_marks_state(monkeypatch) -> 
     assert warehouse.attachment_rows[0]["filename"] == "notes.txt"
     assert warehouse.attachment_rows[0]["text"] == "backfill text"
     assert warehouse.candidate_requests[0]["ai_provider"] == "ollama"
-    assert warehouse.candidate_requests[0]["ai_model"] == "qwen3-vl:8b"
+    assert warehouse.candidate_requests[0]["ai_model"] == "qwen3-vl:2b"
     assert warehouse.candidate_requests[0]["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
     assert warehouse.state_rows[0]["message_id"] == "gmail-id"
     assert warehouse.state_rows[0]["status"] == "ok"
     assert warehouse.state_rows[0]["attachment_rows_written"] == 1
     assert warehouse.state_rows[0]["ai_provider"] == "ollama"
-    assert warehouse.state_rows[0]["ai_model"] == "qwen3-vl:8b"
+    assert warehouse.state_rows[0]["ai_model"] == "qwen3-vl:2b"
     assert warehouse.state_rows[0]["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
 
 
