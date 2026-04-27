@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse, SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS
 
@@ -147,3 +148,39 @@ def test_slack_account_state_sql_uses_precise_and_thread_read_state() -> None:
     assert "toDecimal64OrZero(m.message_ts, 6)" in sql
     assert "thread_last_read_ts" in sql
     assert "JSONExtractBool(raw_json, 'subscribed')" in sql
+
+
+def test_slack_conversation_insert_preserves_existing_read_state() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    inserted: list[dict[str, object]] = []
+    incoming = {
+        "account": "zrl",
+        "team_id": "T1",
+        "conversation_id": "D1",
+        "raw_json": json.dumps({"id": "D1", "is_im": True, "unread_count": 0, "is_open": False}),
+    }
+
+    warehouse._query = lambda _sql: [
+        (
+            "D1",
+            json.dumps(
+                {
+                    "id": "D1",
+                    "is_im": True,
+                    "last_read": "1777302000.000000",
+                    "unread_count": 2,
+                    "unread_count_display": 2,
+                    "is_open": True,
+                }
+            ),
+        )
+    ]
+    warehouse._insert_rows = lambda _table, rows, _columns: inserted.extend(rows)
+
+    warehouse.insert_slack_conversations([incoming])
+
+    payload = json.loads(str(inserted[0]["raw_json"]))
+    assert payload["last_read"] == "1777302000.000000"
+    assert payload["unread_count"] == 0
+    assert payload["unread_count_display"] == 2
+    assert payload["is_open"] is False

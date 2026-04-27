@@ -195,6 +195,12 @@ SLACK_CONVERSATION_COLUMNS = (
     "synced_at",
     "sync_version",
 )
+SLACK_CONVERSATION_READ_STATE_FIELDS = (
+    "last_read",
+    "unread_count",
+    "unread_count_display",
+    "is_open",
+)
 
 SLACK_CONVERSATION_MEMBER_COLUMNS = (
     "account",
@@ -1076,7 +1082,75 @@ class ClickHouseWarehouse:
         self._insert_rows("slack_users", rows, SLACK_USER_COLUMNS)
 
     def insert_slack_conversations(self, rows: list[dict[str, Any]]) -> None:
+        rows = self._preserve_slack_conversation_read_state(rows)
         self._insert_rows("slack_conversations", rows, SLACK_CONVERSATION_COLUMNS)
+
+    def _preserve_slack_conversation_read_state(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows_missing_read_state = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row.get("raw_json", "")))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if any(_missing_json_field(payload, field) for field in SLACK_CONVERSATION_READ_STATE_FIELDS):
+                rows_missing_read_state.append(row)
+        if not rows_missing_read_state:
+            return rows
+
+        ids_by_scope: dict[tuple[str, str], set[str]] = {}
+        for row in rows_missing_read_state:
+            scope = (str(row["account"]), str(row["team_id"]))
+            ids_by_scope.setdefault(scope, set()).add(str(row["conversation_id"]))
+
+        existing_payloads: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for (account, team_id), conversation_ids in ids_by_scope.items():
+            id_values = ", ".join(_sql_string(conversation_id) for conversation_id in sorted(conversation_ids))
+            existing_rows = self._query(
+                f"""
+                SELECT conversation_id, raw_json
+                FROM slack_conversations FINAL
+                WHERE account = {_sql_string(account)}
+                  AND team_id = {_sql_string(team_id)}
+                  AND conversation_id IN ({id_values})
+                """
+            )
+            for conversation_id, raw_json in existing_rows:
+                try:
+                    existing_payload = json.loads(str(raw_json))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(existing_payload, dict):
+                    existing_payloads[(account, team_id, str(conversation_id))] = existing_payload
+
+        preserved_rows = []
+        for row in rows:
+            key = (str(row["account"]), str(row["team_id"]), str(row["conversation_id"]))
+            existing_payload = existing_payloads.get(key)
+            if not existing_payload:
+                preserved_rows.append(row)
+                continue
+            try:
+                payload = json.loads(str(row.get("raw_json", "")))
+            except json.JSONDecodeError:
+                preserved_rows.append(row)
+                continue
+            if not isinstance(payload, dict):
+                preserved_rows.append(row)
+                continue
+            changed = False
+            for field in SLACK_CONVERSATION_READ_STATE_FIELDS:
+                if _missing_json_field(payload, field) and not _missing_json_field(existing_payload, field):
+                    payload[field] = existing_payload[field]
+                    changed = True
+            if not changed:
+                preserved_rows.append(row)
+                continue
+            preserved_row = dict(row)
+            preserved_row["raw_json"] = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+            preserved_rows.append(preserved_row)
+        return preserved_rows
 
     def load_slack_conversation_payloads(
         self,
@@ -1819,6 +1893,10 @@ def _query_bool(values: list[str], *, default: bool) -> bool:
     if not values:
         return default
     return values[0].strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _missing_json_field(payload: dict[str, Any], field: str) -> bool:
+    return field not in payload or payload[field] is None or payload[field] == ""
 
 
 def _sql_string(value: str) -> str:
