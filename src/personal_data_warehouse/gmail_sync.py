@@ -34,6 +34,7 @@ from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from markdownify import markdownify as html_to_markdown
+from PIL import Image, ImageOps, UnidentifiedImageError
 import warnings
 import zlib
 
@@ -52,11 +53,13 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v13"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v14"
 ATTACHMENT_AI_GENERATION_OPTIONS = {
     "temperature": 0,
     "num_predict": 320,
 }
+ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE = 1280
+ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY = 85
 ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
 
 Return only concise JSON with this schema:
@@ -1197,19 +1200,21 @@ def apply_attachment_ai_fallback(
             images=images,
             timeout_seconds=config.timeout_seconds,
         )
+        model_images = attachment_ai_model_images(images)
         LOGGER.info(
-            "Starting Gmail attachment AI fallback model=%s source_status=%s mime_type=%s content_bytes=%s image_count=%s ocr_chars=%s timeout_seconds=%s",
+            "Starting Gmail attachment AI fallback model=%s source_status=%s mime_type=%s content_bytes=%s image_count=%s model_image_bytes=%s ocr_chars=%s timeout_seconds=%s",
             config.model,
             extraction.status,
             mime_type,
             len(content),
             len(images),
+            sum(len(image) for image in model_images),
             len(supporting_ocr_text),
             config.timeout_seconds,
         )
         prompt = attachment_ai_prompt(supporting_ocr_text=supporting_ocr_text)
         response_text = call_ollama_attachment_vision_model(
-            images=images,
+            images=model_images,
             config=config,
             prompt=prompt,
         )
@@ -1248,6 +1253,11 @@ def apply_attachment_ai_fallback(
         "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
         "prompt_sha256": prompt_sha256,
         "generation_options": ATTACHMENT_AI_GENERATION_OPTIONS,
+        "model_image_preprocessing": {
+            "format": "jpeg",
+            "max_edge": ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE,
+            "quality": ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY,
+        },
     }
 
     text = normalize_markdown(
@@ -1299,6 +1309,30 @@ def attachment_ai_fallback_images(
             timeout_seconds=timeout_seconds,
         )
     return []
+
+
+def attachment_ai_model_images(images: Sequence[bytes]) -> list[bytes]:
+    return [attachment_ai_model_image(image) for image in images]
+
+
+def attachment_ai_model_image(image: bytes) -> bytes:
+    try:
+        with Image.open(BytesIO(image)) as original:
+            rendered = ImageOps.exif_transpose(original)
+            width, height = rendered.size
+            scale = min(ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE / max(width, height), 1)
+            if scale < 1:
+                rendered = rendered.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            if rendered.mode not in {"RGB", "L"}:
+                rendered = rendered.convert("RGB")
+            output = BytesIO()
+            rendered.save(output, format="JPEG", quality=ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY, optimize=True)
+            return output.getvalue()
+    except (OSError, UnidentifiedImageError):
+        return image
 
 
 def is_supported_image_attachment(*, content: bytes, mime_type: str, extension: str) -> bool:

@@ -17,6 +17,7 @@ import zipfile
 
 from googleapiclient.errors import HttpError
 from httplib2 import Response
+from PIL import Image
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs.gmail_sync import (
     gmail_mailbox_sync_every_minute,
@@ -28,6 +29,7 @@ from personal_data_warehouse.gmail_sync import (
     ATTACHMENT_AI_PROMPT,
     ATTACHMENT_AI_PROMPT_VERSION,
     AttachmentAiFallbackConfig,
+    attachment_ai_model_image,
     attachment_ai_prompt,
     attachment_ai_supporting_ocr_text,
     attachment_parts_from_message,
@@ -631,6 +633,19 @@ def test_attachment_ai_prompt_includes_deterministic_ocr_hints() -> None:
     assert "Deterministic OCR hints from the same image" in prompt
     assert "THE HA CK\nSTRIKES BACK" in prompt
     assert "weak evidence" in prompt
+
+
+def test_attachment_ai_model_image_downscales_to_jpeg() -> None:
+    image = Image.effect_noise((1800, 1400), 80).convert("RGB")
+    original = BytesIO()
+    image.save(original, format="PNG")
+
+    model_image = attachment_ai_model_image(original.getvalue())
+
+    assert model_image.startswith(b"\xff\xd8")
+    with Image.open(BytesIO(model_image)) as resized:
+        assert resized.format == "JPEG"
+        assert max(resized.size) == 1280
 
 
 def test_attachment_rows_for_message_ai_fallback_sends_ocr_hints_to_model(monkeypatch) -> None:
