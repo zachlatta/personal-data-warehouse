@@ -874,6 +874,69 @@ def test_format_attachment_ai_response_keeps_supporting_ocr_for_wrong_non_useful
     assert formatted == "AI attachment extraction\n\nDeterministic OCR text:\nTHE HACK STRIKES BACK"
 
 
+def test_attachment_rows_for_message_records_ai_ocr_only_when_model_rejects_useful_ocr(monkeypatch) -> None:
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"fake flyer screenshot bytes" * 1000)
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "flyer.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+    ollama = FakeOllamaResource(
+        json.dumps(
+            {
+                "is_useful": False,
+                "document_type": "unknown",
+                "summary": "No useful visible text.",
+                "visible_text": [],
+                "entities": [],
+                "search_keywords": [],
+                "uncertainties": [],
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "personal_data_warehouse.gmail_sync.attachment_ai_supporting_ocr_text",
+        lambda **_kwargs: "NASA Quantity: 20000\nExpected delivery: Monday, Apr 27",
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(image_content) + 1,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="qwen3-vl:2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+    )
+
+    row = rows[0]
+    assert row["text_extraction_status"] == "ai_ocr_only"
+    assert "Deterministic OCR text:\nNASA Quantity: 20000" in row["text"]
+    metadata = json.loads(row["text_extraction_error"])
+    assert metadata["model_content_status"] == "ocr_only"
+    assert metadata["prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
+
+
 def test_attachment_ai_supporting_ocr_filters_short_garbage(monkeypatch) -> None:
     def fake_run(*_args, **_kwargs):
         return subprocess.CompletedProcess(

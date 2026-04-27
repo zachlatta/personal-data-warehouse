@@ -53,7 +53,7 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v15"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v16"
 ATTACHMENT_AI_GENERATION_OPTIONS = {
     "temperature": 0,
     "num_predict": 320,
@@ -134,6 +134,12 @@ class AttachmentAiFallbackConfig:
     pdf_max_pages: int
     pull_model: bool = True
     client: AttachmentVisionClient | None = None
+
+
+@dataclass(frozen=True)
+class AttachmentAiFormattedResponse:
+    text: str
+    model_content_status: str
 
 
 class AttachmentVisionClient(Protocol):
@@ -1262,14 +1268,18 @@ def apply_attachment_ai_fallback(
         },
     }
 
-    text = normalize_markdown(
-        format_attachment_ai_response(
-            response_text,
-            supporting_ocr_text=supporting_ocr_text,
-        )
+    formatted = format_attachment_ai_response_details(
+        response_text,
+        supporting_ocr_text=supporting_ocr_text,
     )
+    text = normalize_markdown(
+        formatted.text
+    )
+    metadata["model_content_status"] = formatted.model_content_status
     status = "ai_ok"
-    if not text:
+    if formatted.model_content_status == "ocr_only" and text:
+        status = "ai_ocr_only"
+    elif not text:
         status = "ai_empty"
     elif len(text) > max_chars:
         text = text[:max_chars]
@@ -1288,6 +1298,96 @@ def apply_attachment_ai_fallback(
         ai_source_status=extraction.status,
         ai_elapsed_ms=elapsed_ms,
         ai_processed_at=datetime.now(tz=UTC),
+    )
+
+
+def format_attachment_ai_response(
+    response_text: str,
+    *,
+    supporting_ocr_text: str = "",
+) -> str:
+    return format_attachment_ai_response_details(
+        response_text,
+        supporting_ocr_text=supporting_ocr_text,
+    ).text
+
+
+def format_attachment_ai_response_details(
+    response_text: str,
+    *,
+    supporting_ocr_text: str = "",
+) -> AttachmentAiFormattedResponse:
+    payload = parse_attachment_ai_json_response(response_text)
+    ocr_text = supporting_ocr_text.strip()
+    if not payload:
+        model_text = response_text.strip()
+        if attachment_ai_unstructured_response_is_non_useful(model_text):
+            model_text = ""
+        text = "\n\n".join(
+            part
+            for part in (
+                model_text,
+                f"Deterministic OCR text:\n{ocr_text}".strip(),
+            )
+            if part and not part.endswith(":")
+        )
+        if model_text:
+            return AttachmentAiFormattedResponse(text=text, model_content_status="unstructured")
+        if ocr_text:
+            return AttachmentAiFormattedResponse(text=text, model_content_status="ocr_only")
+        return AttachmentAiFormattedResponse(text="", model_content_status="empty")
+
+    if not attachment_ai_response_is_useful(payload):
+        if not ocr_text:
+            return AttachmentAiFormattedResponse(text="", model_content_status="empty")
+        return AttachmentAiFormattedResponse(
+            text="\n\n".join(
+                (
+                    "AI attachment extraction",
+                    f"Deterministic OCR text:\n{ocr_text}".strip(),
+                )
+            ),
+            model_content_status="ocr_only",
+        )
+
+    document_type = attachment_ai_response_field(payload, "document_type", "likely_document_type")
+    summary = attachment_ai_response_field(payload, "summary", "scene_summary")
+    document_context = attachment_ai_response_field(payload, "document_context")
+    visible_text_value = attachment_ai_response_indexable_text(payload.get("visible_text", ""), separator="\n")
+    entities = attachment_ai_response_indexable_text(payload.get("entities", ""), separator=", ")
+    search_keywords = attachment_ai_response_indexable_text(
+        attachment_ai_response_first(payload, "search_keywords", "useful_for_search"),
+        separator=", ",
+    )
+    uncertainties = attachment_ai_response_text(payload.get("uncertainties", ""), separator="\n")
+
+    text = "\n\n".join(
+        part
+        for part in (
+            "AI attachment extraction",
+            f"Document type: {document_type}".strip(),
+            f"Summary: {summary}".strip(),
+            f"Document context: {document_context}".strip(),
+            f"Visible text:\n{visible_text_value}".strip(),
+            f"Entities: {entities}".strip(),
+            f"Search keywords: {search_keywords}".strip(),
+            f"Uncertainties:\n{uncertainties}".strip(),
+            f"Deterministic OCR text:\n{ocr_text}".strip(),
+        )
+        if part and not part.endswith(":")
+    )
+    return AttachmentAiFormattedResponse(text=text, model_content_status="structured")
+
+
+def attachment_ai_unstructured_response_is_non_useful(response_text: str) -> bool:
+    normalized = response_text.strip().lower()
+    if not normalized:
+        return True
+    return bool(
+        re.search(
+            r"\b(no readable text|no visible text|no useful content|placeholder|generic gmail attachment|blank image)\b",
+            normalized,
+        )
     )
 
 
