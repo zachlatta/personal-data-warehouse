@@ -18,6 +18,7 @@ from personal_data_warehouse.slack_sync import (
     iter_cursor_items,
     message_to_row,
     reaction_rows_from_message,
+    slack_account_identity_to_row,
     team_to_row,
     ts_to_datetime,
     user_to_row,
@@ -58,6 +59,7 @@ class FakeWarehouse:
         self.thread_refs = []
         self.thread_ref_calls = []
         self.teams = []
+        self.identities = []
         self.users = []
         self.conversations = []
         self.members = []
@@ -65,6 +67,7 @@ class FakeWarehouse:
         self.reactions = []
         self.files = []
         self.state_updates = []
+        self.account_state_refreshes = []
 
     def ensure_slack_tables(self):
         self.ensure_calls += 1
@@ -74,6 +77,9 @@ class FakeWarehouse:
 
     def insert_slack_teams(self, rows):
         self.teams.extend(rows)
+
+    def insert_slack_account_identities(self, rows):
+        self.identities.extend(rows)
 
     def insert_slack_users(self, rows):
         self.users.extend(rows)
@@ -220,6 +226,9 @@ class FakeWarehouse:
     def insert_slack_sync_state(self, **kwargs):
         self.state_updates.append(kwargs)
 
+    def refresh_slack_account_state_items(self, **kwargs):
+        self.account_state_refreshes.append(kwargs)
+
     def existing_slack_message_ids(self, *, account, team_id, conversation_id, oldest_ts, latest_ts):
         return set()
 
@@ -261,6 +270,12 @@ def test_mapping_rows_preserve_ui_fields_and_raw_json():
         team_payload={"id": "T1", "name": "Hack Club", "domain": "hackclub"},
         synced_at=synced_at,
     )
+    identity = slack_account_identity_to_row(
+        account="zrl",
+        team_id="T1",
+        auth_payload={"team_id": "T1", "team": "Hack Club", "user_id": "U1", "url": "https://hackclub.slack.com/"},
+        synced_at=synced_at,
+    )
     user = user_to_row(
         account="zrl",
         team_id="T1",
@@ -291,6 +306,8 @@ def test_mapping_rows_preserve_ui_fields_and_raw_json():
     )
 
     assert team["team_id"] == "T1"
+    assert identity["user_id"] == "U1"
+    assert identity["url"] == "https://hackclub.slack.com/"
     assert user["email"] == "a@example.com"
     assert conversation["conversation_type"] == "public_channel"
     assert message["message_datetime"] == ts_to_datetime("1713974400.000200")
@@ -403,6 +420,10 @@ def test_runner_full_sync_collects_workspace_conversations_messages_threads_and_
     assert summaries[0].messages_written == 4
     assert warehouse.ensure_calls == 1
     assert len(warehouse.teams) == 1
+    assert warehouse.identities[0]["user_id"] == "U1"
+    assert warehouse.account_state_refreshes[0]["account"] == "zrl"
+    assert warehouse.account_state_refreshes[0]["team_id"] == "T1"
+    assert isinstance(warehouse.account_state_refreshes[0]["synced_at"], datetime)
     assert len(warehouse.users) == 1
     assert len(warehouse.conversations) == 1
     assert len(warehouse.members) == 1

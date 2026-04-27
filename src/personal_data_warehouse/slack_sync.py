@@ -142,7 +142,13 @@ class SlackSyncRunner:
         for account in self._settings.slack_accounts:
             client = self._client_factory(account)
             try:
-                summaries.append(self._sync_account(account=account, client=client, state_by_key=state_by_key))
+                summary = self._sync_account(account=account, client=client, state_by_key=state_by_key)
+                self._warehouse.refresh_slack_account_state_items(
+                    account=summary.account,
+                    team_id=summary.team_id,
+                    synced_at=self._now(),
+                )
+                summaries.append(summary)
             except Exception as exc:
                 failures.append(f"{account.account}: {exc}")
                 continue
@@ -178,6 +184,9 @@ class SlackSyncRunner:
 
         self._warehouse.insert_slack_teams(
             [team_to_row(account=account.account, auth_payload=auth, team_payload=team_info.get("team", {}), synced_at=synced_at)]
+        )
+        self._warehouse.insert_slack_account_identities(
+            [slack_account_identity_to_row(account=account.account, team_id=team_id, auth_payload=auth, synced_at=synced_at)]
         )
 
         if self._sync_conversations_only:
@@ -1079,6 +1088,25 @@ def team_to_row(*, account: str, auth_payload: Mapping[str, object], team_payloa
         "domain": str(team_payload.get("domain", "")),
         "enterprise_id": str(auth_payload.get("enterprise_id") or team_payload.get("enterprise_id") or ""),
         "raw_json": json_dumps({"auth": auth_payload, "team": team_payload}),
+        "synced_at": synced_at,
+        "sync_version": sync_version_from_datetime(synced_at),
+    }
+
+
+def slack_account_identity_to_row(
+    *,
+    account: str,
+    team_id: str,
+    auth_payload: Mapping[str, object],
+    synced_at: datetime,
+) -> dict[str, object]:
+    return {
+        "account": account,
+        "team_id": team_id,
+        "user_id": str(auth_payload.get("user_id", "")),
+        "team_name": str(auth_payload.get("team", "")),
+        "url": str(auth_payload.get("url", "")),
+        "raw_json": json_dumps(auth_payload),
         "synced_at": synced_at,
         "sync_version": sync_version_from_datetime(synced_at),
     }

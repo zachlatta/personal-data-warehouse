@@ -143,9 +143,9 @@ Slack's thread API rate limits. Threads that already produced Slack API errors a
 scheduled pass so one inaccessible thread does not block the backlog. Configure it with
 `SLACK_ASSET_THREAD_LIMIT`, `SLACK_ASSET_THREAD_SINCE_DAYS`, and `SLACK_ASSET_THREAD_ORDER`.
 `slack_workspace_read_state_sync_every_five_minutes` refreshes `conversations.info` for a small
-set of recently active member conversations, staggered two minutes after the thread schedule. This
-updates user-specific fields such as `last_read` for deriving unread state. Configure it with
-`SLACK_ASSET_READ_STATE_LIMIT`.
+set of recently active account-relevant conversations, including DMs, group DMs, and member
+channels, staggered two minutes after the thread schedule. This updates user-specific fields such
+as `last_read` for deriving unread state. Configure it with `SLACK_ASSET_READ_STATE_LIMIT`.
 Freshness stages also poll capped sets of cached conversations per type, ordered by recent
 activity, so each scheduled run remains bounded.
 All Slack schedules share a nonblocking Slack lock, so a scheduled tick skips if another Slack
@@ -208,6 +208,14 @@ The sync creates and maintains:
 - `gmail_sync_state`: per-mailbox sync cursor and last run status
 - `calendar_events`: latest known state for each calendar event
 - `calendar_sync_state`: per-account/calendar sync token and last run status
+- `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
+
+The warehouse also creates account-management views for current user state:
+
+- `gmail_account_state_items`: Gmail inbox threads that currently appear in the account state layer
+- `slack_account_state_items`: Slack DMs, mentions, participating threads, and channel unread items for
+  the authenticated Slack user when read state is known
+- `account_state_items`: combined Gmail and Slack entrypoint when both source views exist
 
 `gmail_messages` stores:
 
