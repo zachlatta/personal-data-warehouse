@@ -125,6 +125,8 @@ verifies the model before each Gmail run and pulls it when missing unless model
 pulls are disabled. When the resource starts Ollama itself, it sets
 `GGML_METAL_TENSOR_DISABLE=1` so Apple Silicon keeps Metal acceleration while
 avoiding the current Metal cooperative-tensor crash seen with some vision models.
+The Docker image also includes Tesseract so fallback rows can append a short
+deterministic OCR section when it recovers text the vision model misses.
 
 Slack sync splits freshness, coverage, and metadata into separate schedules. The
 `slack_workspace_sync_every_minute` schedule keeps recent messages fresh every minute.

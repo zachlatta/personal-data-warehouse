@@ -8,7 +8,7 @@ ENV DAGSTER_HOME=/app/.dagster \
     UV_LINK_MODE=copy
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl poppler-utils zstd \
+    && apt-get install -y --no-install-recommends ca-certificates curl poppler-utils tesseract-ocr zstd \
     && arch="$(dpkg --print-architecture)" \
     && curl -fsSL "https://ollama.com/download/ollama-linux-${arch}.tar.zst" \
         | zstd -d \

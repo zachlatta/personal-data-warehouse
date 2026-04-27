@@ -12,6 +12,7 @@ import urllib.request
 from personal_data_warehouse.gmail_sync import (
     ATTACHMENT_AI_PROMPT,
     ATTACHMENT_AI_PROMPT_VERSION,
+    attachment_ai_supporting_ocr_text,
     format_attachment_ai_response,
     parse_attachment_ai_json_response,
 )
@@ -85,14 +86,20 @@ def main() -> None:
             timeout=args.timeout,
         )
         elapsed_ms = int((time.monotonic() - started) * 1000)
+        images = [Path(path).read_bytes() for path in sample.image_paths]
+        supporting_ocr_text = attachment_ai_supporting_ocr_text(
+            images=images,
+            timeout_seconds=args.timeout,
+        )
         parsed = parse_attachment_ai_json_response(response_text)
-        formatted = format_attachment_ai_response(response_text)
+        formatted = format_attachment_ai_response(response_text, supporting_ocr_text=supporting_ocr_text)
         result = {
             "sample_id": sample.sample_id,
             "filename": sample.filename,
             "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
             "model": args.model,
             "elapsed_ms": elapsed_ms,
+            "supporting_ocr_text": supporting_ocr_text,
             "raw_response": response_text,
             "parsed": parsed,
             "formatted_text": formatted,

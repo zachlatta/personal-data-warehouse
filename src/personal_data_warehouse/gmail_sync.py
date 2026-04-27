@@ -48,7 +48,7 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v8"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v9"
 ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
 
 Return only concise JSON with this schema:
@@ -1163,6 +1163,10 @@ def apply_attachment_ai_fallback(
         if not images:
             return extraction
         started_at = time.monotonic()
+        supporting_ocr_text = attachment_ai_supporting_ocr_text(
+            images=images,
+            timeout_seconds=config.timeout_seconds,
+        )
         response_text = call_ollama_attachment_vision_model(
             images=images,
             config=config,
@@ -1194,7 +1198,12 @@ def apply_attachment_ai_fallback(
         "prompt_sha256": prompt_sha256,
     }
 
-    text = normalize_markdown(format_attachment_ai_response(response_text))
+    text = normalize_markdown(
+        format_attachment_ai_response(
+            response_text,
+            supporting_ocr_text=supporting_ocr_text,
+        )
+    )
     status = "ai_ok"
     if not text:
         status = "ai_empty"
@@ -1346,6 +1355,50 @@ def call_ollama_attachment_vision_model(
     return str(response_data.get("response", ""))
 
 
+def attachment_ai_supporting_ocr_text(*, images: Sequence[bytes], timeout_seconds: int) -> str:
+    tesseract = shutil.which("tesseract")
+    if not tesseract:
+        return ""
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    with tempfile.TemporaryDirectory() as directory:
+        tempdir = Path(directory)
+        for index, image in enumerate(images, start=1):
+            image_path = tempdir / f"attachment-page-{index}.png"
+            image_path.write_bytes(image)
+            try:
+                result = subprocess.run(
+                    [tesseract, str(image_path), "stdout", "--psm", "6"],
+                    capture_output=True,
+                    check=False,
+                    timeout=max(1, min(timeout_seconds, 20)),
+                )
+            except Exception:
+                continue
+            if result.returncode != 0:
+                continue
+            for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+                normalized_line = attachment_ai_clean_ocr_line(line)
+                if not normalized_line:
+                    continue
+                key = normalized_line.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                lines.append(normalized_line)
+    return "\n".join(lines)
+
+
+def attachment_ai_clean_ocr_line(line: str) -> str:
+    normalized_line = " ".join(line.split()).strip(" |!\"'`.,:;[]{}()<>“”‘’")
+    letters = re.findall(r"[A-Za-z]", normalized_line)
+    digits = re.findall(r"\d", normalized_line)
+    if len(letters) < 3 and len(digits) < 3:
+        return ""
+    return normalized_line
+
+
 def run_attachment_ai_call_with_timeout[T](call: Callable[[], T], *, timeout_seconds: float) -> T:
     if timeout_seconds <= 0:
         return call()
@@ -1370,12 +1423,26 @@ def run_attachment_ai_call_with_timeout[T](call: Callable[[], T], *, timeout_sec
     raise value
 
 
-def format_attachment_ai_response(response_text: str) -> str:
+def format_attachment_ai_response(response_text: str, *, supporting_ocr_text: str = "") -> str:
     payload = parse_attachment_ai_json_response(response_text)
     if not payload:
-        return response_text.strip()
+        return "\n\n".join(
+            part
+            for part in (
+                response_text.strip(),
+                f"Deterministic OCR text:\n{supporting_ocr_text}".strip(),
+            )
+            if part and not part.endswith(":")
+        )
     if not attachment_ai_response_is_useful(payload):
-        return ""
+        if not supporting_ocr_text.strip():
+            return ""
+        return "\n\n".join(
+            (
+                "AI attachment extraction",
+                f"Deterministic OCR text:\n{supporting_ocr_text}".strip(),
+            )
+        )
 
     document_type = attachment_ai_response_field(payload, "document_type", "likely_document_type")
     summary = attachment_ai_response_field(payload, "summary", "scene_summary")
@@ -1399,6 +1466,7 @@ def format_attachment_ai_response(response_text: str) -> str:
             f"Entities: {entities}".strip(),
             f"Search keywords: {search_keywords}".strip(),
             f"Uncertainties:\n{uncertainties}".strip(),
+            f"Deterministic OCR text:\n{supporting_ocr_text}".strip(),
         )
         if part and not part.endswith(":")
     )

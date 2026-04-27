@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import hashlib
 from io import BytesIO
 import json
+import subprocess
 import time
 from unittest.mock import patch
 import zipfile
@@ -23,6 +24,7 @@ from personal_data_warehouse.gmail_sync import (
     ATTACHMENT_AI_PROMPT,
     ATTACHMENT_AI_PROMPT_VERSION,
     AttachmentAiFallbackConfig,
+    attachment_ai_supporting_ocr_text,
     attachment_parts_from_message,
     attachment_rows_for_message,
     collapsed_message_body_to_markdown,
@@ -33,6 +35,7 @@ from personal_data_warehouse.gmail_sync import (
     exclusive_gmail_sync_lock,
     exclusive_process_lock,
     extract_message_bodies,
+    format_attachment_ai_response,
     GMAIL_SYNC_POSTGRES_LOCK_ID,
     GmailSyncRunner,
     gmail_token_json_from_env,
@@ -714,6 +717,63 @@ def test_attachment_rows_for_message_ai_fallback_formats_ocr_first_schema() -> N
     assert "Visible text:\ncommon sense media" in row["text"]
     assert "Entities: Common Sense Media" in row["text"]
     assert "Search keywords: Common Sense Media, green checkmark logo" in row["text"]
+
+
+def test_format_attachment_ai_response_appends_supporting_ocr_text() -> None:
+    formatted = format_attachment_ai_response(
+        json.dumps(
+            {
+                "is_useful": True,
+                "document_type": "logo",
+                "summary": "A stylized Hack Club logo.",
+                "visible_text": ["HACK", "THE"],
+                "entities": ["Hack Club"],
+                "search_keywords": ["Hack Club"],
+                "uncertainties": [],
+            }
+        ),
+        supporting_ocr_text="THE HACK\nSTRIKES BACK",
+    )
+
+    assert "Visible text:\nHACK\nTHE" in formatted
+    assert "Deterministic OCR text:\nTHE HACK\nSTRIKES BACK" in formatted
+
+
+def test_format_attachment_ai_response_keeps_supporting_ocr_for_wrong_non_useful_flag() -> None:
+    formatted = format_attachment_ai_response(
+        json.dumps(
+            {
+                "is_useful": False,
+                "document_type": "unknown",
+                "summary": "No useful visible text.",
+                "visible_text": [],
+                "entities": [],
+                "search_keywords": [],
+                "uncertainties": [],
+            }
+        ),
+        supporting_ocr_text="THE HACK STRIKES BACK",
+    )
+
+    assert formatted == "AI attachment extraction\n\nDeterministic OCR text:\nTHE HACK STRIKES BACK"
+
+
+def test_attachment_ai_supporting_ocr_filters_short_garbage(monkeypatch) -> None:
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=b"\xe2\x80\x9c(YQ +\n\xe2\x80\x94a\nGS\nTHE HACK\n81-2908499\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr("personal_data_warehouse.gmail_sync.shutil.which", lambda _name: "/usr/bin/tesseract")
+    monkeypatch.setattr("personal_data_warehouse.gmail_sync.subprocess.run", fake_run)
+
+    assert (
+        attachment_ai_supporting_ocr_text(images=[b"not really an image"], timeout_seconds=30)
+        == "THE HACK\n81-2908499"
+    )
 
 
 def test_attachment_rows_for_message_records_ai_empty_for_non_useful_images() -> None:
