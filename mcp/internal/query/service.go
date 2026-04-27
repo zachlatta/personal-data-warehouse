@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -35,6 +37,7 @@ type Service struct {
 
 const schemaSampleRows = 3
 const schemaSampleFieldChars = 15
+const schemaSampleConcurrency = 16
 
 type Response struct {
 	Results []Result `json:"results"`
@@ -184,8 +187,9 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 
 	var out strings.Builder
 	overviewTrunc := Truncation{MaxRows: schemaSampleRows, MaxFieldChars: schemaSampleFieldChars}
+	sampleResults := s.sampleTables(ctx, tables)
 	for i, table := range tables {
-		sample := s.sampleRows(ctx, table)
+		sample := sampleResults[i]
 		if sample.Error != "" {
 			schemaResult.Error = sample.Error
 			schemaResult.CSV = sample.CSV
@@ -210,10 +214,51 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 	return Response{Results: []Result{schemaResult}}
 }
 
+func (s *Service) sampleTables(ctx context.Context, tables []string) []Result {
+	results := make([]Result, len(tables))
+	sem := make(chan struct{}, schemaSampleConcurrency)
+	var wg sync.WaitGroup
+	for i, table := range tables {
+		i, table := i, table
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results[i] = Result{Error: ctx.Err().Error(), CSV: errorCSV(ctx.Err().Error())}
+				return
+			}
+			results[i] = s.sampleRows(ctx, table)
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
 func (s *Service) sampleRows(ctx context.Context, table string) Result {
-	sampleSQL := fmt.Sprintf("SELECT * FROM %s LIMIT %d", quoteClickHouseIdentifier(table), schemaSampleRows)
+	tableIdentifier := quoteClickHouseIdentifier(table)
+	describeSQL := "DESCRIBE TABLE " + tableIdentifier
 	started := time.Now()
-	result := Result{SQL: sampleSQL}
+	result := Result{SQL: describeSQL}
+	s.logger.DebugContext(ctx, "schema overview describe started", "table", table, "sql", describeSQL)
+	describeResult, err := s.runner.Query(ctx, describeSQL, 0)
+	if err != nil {
+		result.Error = err.Error()
+		result.CSV = errorCSV(result.Error)
+		s.logger.ErrorContext(ctx, "schema overview describe failed", "table", table, "sql", describeSQL, "error", err, "duration", time.Since(started))
+		return result
+	}
+	columns := describedColumnNames(describeResult)
+	if len(columns) == 0 {
+		result.CSV = ""
+		s.logger.DebugContext(ctx, "schema overview sample skipped empty table schema", "table", table, "duration", time.Since(started))
+		return result
+	}
+
+	sampleSQL := previewSampleSQL(tableIdentifier, columns)
+	result.SQL = sampleSQL
 	s.logger.DebugContext(ctx, "schema overview sample started", "table", table, "sql", sampleSQL)
 	raw, err := s.runner.Query(ctx, sampleSQL, schemaSampleRows)
 	if err != nil {
@@ -222,16 +267,16 @@ func (s *Service) sampleRows(ctx context.Context, table string) Result {
 		s.logger.ErrorContext(ctx, "schema overview sample failed", "table", table, "sql", sampleSQL, "error", err, "duration", time.Since(started))
 		return result
 	}
-	rows, trunc := s.truncateSampleRows(raw.Rows)
+	rows, trunc := previewRows(columns, raw.Rows)
 	result.Truncated = trunc
-	result.CSV, err = rowsToCSV(raw.Columns, rows)
+	result.CSV, err = rowsToCSV(columns, rows)
 	if err != nil {
 		result.Error = err.Error()
 		result.CSV = errorCSV(result.Error)
 		s.logger.ErrorContext(ctx, "schema overview sample encoding failed", "table", table, "sql", sampleSQL, "error", err, "duration", time.Since(started))
 		return result
 	}
-	s.logger.DebugContext(ctx, "schema overview sample completed", "table", table, "rows", len(rows), "columns", len(raw.Columns), "truncated_rows", trunc.Rows, "truncated_fields", len(trunc.Fields), "duration", time.Since(started))
+	s.logger.InfoContext(ctx, "schema overview table sampled", "table", table, "rows", len(rows), "columns", len(columns), "truncated_fields", len(trunc.Fields), "duration", time.Since(started))
 	return result
 }
 
@@ -261,23 +306,6 @@ func (s *Service) truncateRowsWithMaxRows(rows []map[string]any, maxRows int) ([
 	return out, trunc
 }
 
-func (s *Service) truncateSampleRows(rows []map[string]any) ([]map[string]any, Truncation) {
-	trunc := Truncation{MaxRows: schemaSampleRows, MaxFieldChars: schemaSampleFieldChars}
-	if len(rows) > schemaSampleRows {
-		trunc.Rows = true
-		rows = rows[:schemaSampleRows]
-	}
-	out := make([]map[string]any, 0, len(rows))
-	for rowIndex, row := range rows {
-		copied := make(map[string]any, len(row))
-		for column, value := range row {
-			copied[column] = s.truncatePreviewValue(rowIndex, column, csvValue(value), &trunc)
-		}
-		out = append(out, copied)
-	}
-	return out, trunc
-}
-
 func (s *Service) truncateString(rowIndex int, column, value string, trunc *Truncation) string {
 	chars := utf8.RuneCountInString(value)
 	if chars <= s.opts.MaxFieldChars {
@@ -292,22 +320,6 @@ func (s *Service) truncateString(rowIndex int, column, value string, trunc *Trun
 		Instructions:  fullFieldInstructions(column, s.opts.MaxFieldChars),
 	})
 	return string(runes[:s.opts.MaxFieldChars])
-}
-
-func (s *Service) truncatePreviewValue(rowIndex int, column, value string, trunc *Truncation) string {
-	chars := utf8.RuneCountInString(value)
-	if chars <= schemaSampleFieldChars {
-		return value
-	}
-	runes := []rune(value)
-	trunc.Fields = append(trunc.Fields, FieldTruncation{
-		Row:           rowIndex,
-		Column:        column,
-		ReturnedChars: schemaSampleFieldChars,
-		OriginalChars: chars,
-		Instructions:  fullFieldInstructions(column, schemaSampleFieldChars),
-	})
-	return string(runes[:schemaSampleFieldChars])
 }
 
 func fullFieldInstructions(column string, chunkSize int) string {
@@ -374,6 +386,58 @@ func tableNames(result RawResult) []string {
 	return tables
 }
 
+func describedColumnNames(result RawResult) []string {
+	columns := make([]string, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		name := rowString(row, "name")
+		if name != "" {
+			columns = append(columns, name)
+		}
+	}
+	return columns
+}
+
+func previewSampleSQL(tableIdentifier string, columns []string) string {
+	expressions := make([]string, 0, 2*len(columns))
+	for i, column := range columns {
+		identifier := quoteClickHouseIdentifier(column)
+		lengthAlias := quoteClickHouseIdentifier(previewLengthColumn(i))
+		expressions = append(expressions,
+			fmt.Sprintf("substring(toString(%s), 1, %d) AS %s", identifier, schemaSampleFieldChars, identifier),
+			fmt.Sprintf("length(toString(%s)) AS %s", identifier, lengthAlias),
+		)
+	}
+	return fmt.Sprintf("SELECT %s FROM %s LIMIT %d", strings.Join(expressions, ", "), tableIdentifier, schemaSampleRows)
+}
+
+func previewRows(columns []string, rows []map[string]any) ([]map[string]any, Truncation) {
+	trunc := Truncation{MaxRows: schemaSampleRows, MaxFieldChars: schemaSampleFieldChars}
+	out := make([]map[string]any, 0, len(rows))
+	for rowIndex, row := range rows {
+		copied := make(map[string]any, len(columns))
+		for columnIndex, column := range columns {
+			preview := csvValue(row[column])
+			copied[column] = preview
+			originalChars := intValue(row[previewLengthColumn(columnIndex)])
+			if originalChars > schemaSampleFieldChars {
+				trunc.Fields = append(trunc.Fields, FieldTruncation{
+					Row:           rowIndex,
+					Column:        column,
+					ReturnedChars: utf8.RuneCountInString(preview),
+					OriginalChars: originalChars,
+					Instructions:  fullFieldInstructions(column, schemaSampleFieldChars),
+				})
+			}
+		}
+		out = append(out, copied)
+	}
+	return out, trunc
+}
+
+func previewLengthColumn(index int) string {
+	return fmt.Sprintf("__pdw_preview_len_%d", index)
+}
+
 func currentDatabaseName(result RawResult) string {
 	if len(result.Rows) == 0 {
 		return ""
@@ -395,4 +459,41 @@ func rowString(row map[string]any, column string) string {
 
 func quoteClickHouseIdentifier(identifier string) string {
 	return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
+}
+
+func intValue(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int8:
+		return int(v)
+	case int16:
+		return int(v)
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case uint:
+		return int(v)
+	case uint8:
+		return int(v)
+	case uint16:
+		return int(v)
+	case uint32:
+		return int(v)
+	case uint64:
+		return int(v)
+	case float32:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return int(n)
+	case string:
+		n, _ := strconv.Atoi(v)
+		return n
+	default:
+		return 0
+	}
 }

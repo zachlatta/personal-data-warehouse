@@ -36,9 +36,9 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
 			Rows:    []map[string]any{{"name": "subject", "type": "String"}},
 		},
-		"SELECT * FROM `gmail_messages` LIMIT 3": {
-			Columns: []string{"subject"},
-			Rows:    []map[string]any{{"subject": "hello"}},
+		"SELECT substring(toString(`subject`), 1, 15) AS `subject`, length(toString(`subject`)) AS `__pdw_preview_len_0` FROM `gmail_messages` LIMIT 3": {
+			Columns: []string{"subject", "__pdw_preview_len_0"},
+			Rows:    []map[string]any{{"subject": "hello", "__pdw_preview_len_0": 5}},
 		},
 	}}
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
