@@ -847,6 +847,19 @@ def test_attachment_ai_supporting_ocr_filters_short_garbage(monkeypatch) -> None
                 "5\t1\t1\t1\t4\t1\t0\t0\t1\t1\t96.1\tTHE\n"
                 "5\t1\t1\t1\t4\t2\t0\t0\t1\t1\t89.5\tHACK\n"
                 "5\t1\t1\t1\t5\t1\t0\t0\t1\t1\t90.0\t81-2908499\n"
+                "5\t1\t1\t1\t6\t1\t0\t0\t1\t1\t95.0\t4\n"
+                "5\t1\t1\t1\t6\t2\t0\t0\t1\t1\t95.0\tSS\n"
+                "5\t1\t1\t1\t6\t3\t0\t0\t1\t1\t95.0\t,\n"
+                "5\t1\t1\t1\t6\t4\t0\t0\t1\t1\t95.0\tMi\n"
+                "5\t1\t1\t1\t6\t5\t0\t0\t1\t1\t95.0\t3\n"
+                "5\t1\t1\t1\t6\t6\t0\t0\t1\t1\t95.0\t%\n"
+                "5\t1\t1\t1\t6\t7\t0\t0\t1\t1\t95.0\thk\n"
+                "5\t1\t1\t1\t7\t1\t0\t0\t1\t1\t95.0\tS|\n"
+                "5\t1\t1\t1\t7\t2\t0\t0\t1\t1\t95.0\tHME\n"
+                "5\t1\t1\t1\t7\t3\t0\t0\t1\t1\t95.0\tVi\n"
+                "5\t1\t1\t1\t7\t4\t0\t0\t1\t1\t95.0\t=)\n"
+                "5\t1\t1\t1\t7\t5\t0\t0\t1\t1\t95.0\t|\n"
+                "5\t1\t1\t1\t7\t6\t0\t0\t1\t1\t95.0\tee\n"
             ).encode(),
             stderr=b"",
         )

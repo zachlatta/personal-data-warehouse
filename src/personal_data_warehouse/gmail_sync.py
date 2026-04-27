@@ -48,7 +48,7 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v11"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v12"
 ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
 
 Return only concise JSON with this schema:
@@ -69,6 +69,8 @@ OCR first: extract titles, headings, bullets, labels, legends, names, dates, org
 If any readable text exists anywhere in the image, is_useful must be true. Logos and wordmarks are useful: set document_type to "logo", put all exact brand text in visible_text, and put the normalized brand/org name in entities. Ads, banners, posters, screenshots, charts, and slides are useful when they contain readable text or meaningful visual context.
 
 Never call the image a Gmail placeholder or Gmail interface unless Gmail UI or a literal Gmail attachment placeholder is visible. Do not infer visible text from the filename or from these instructions. Preserve acronyms and capitalization exactly as they appear. Only include text that is visibly printed in the image; do not turn incidental shapes, shadows, monitors, or decorative marks into OCR text. If no text is visible, visible_text must be [] rather than ["unknown"], ["none"], or prose. If text is partially uncertain, include your best reading and add "(uncertain)" or an uncertainties note. Avoid generic keywords such as image, attachment, photo, and Gmail unless they are literally visible or specifically useful.
+
+If deterministic OCR hints are provided, treat them as weak hints, not ground truth. Ignore OCR-looking noise made of random single letters, punctuation, texture artifacts, or decorative marks. Use OCR hints only when they align with visibly printed text in the image.
 
 Use false for is_useful only for blank/decorative/tracking images or literal placeholders with no useful visible text. Do not invent details."""
 ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
@@ -1312,7 +1314,8 @@ def attachment_ai_prompt(*, supporting_ocr_text: str = "") -> str:
             ocr_text,
             (
                 "Use these OCR hints as weak evidence only. Correct obvious OCR errors by looking at the image, "
-                "keep uncertain readings marked uncertain, and ignore OCR tokens that are not visibly supported."
+                "keep uncertain readings marked uncertain, and ignore OCR tokens that are not visibly supported "
+                "or that look like random texture/punctuation artifacts."
             ),
         )
     )
@@ -1420,10 +1423,13 @@ def attachment_ai_ocr_lines_from_tsv(tsv_text: str) -> list[str]:
             confidence = float(columns[10])
         except ValueError:
             continue
-        if confidence < 0:
+        if confidence < 55:
+            continue
+        word = columns[11].strip()
+        if not word:
             continue
         key = (columns[1], columns[2], columns[3], columns[4])
-        lines.setdefault(key, []).append((confidence, columns[11]))
+        lines.setdefault(key, []).append((confidence, word))
 
     cleaned_lines: list[str] = []
     for words in lines.values():
@@ -1434,7 +1440,7 @@ def attachment_ai_ocr_lines_from_tsv(tsv_text: str) -> list[str]:
         cleaned = attachment_ai_clean_ocr_line(text)
         if not cleaned:
             continue
-        if average_confidence < 45:
+        if average_confidence < 65:
             continue
         if len(cleaned) > 240 and average_confidence < 70:
             continue
@@ -1448,6 +1454,17 @@ def attachment_ai_clean_ocr_line(line: str) -> str:
     digits = re.findall(r"\d", normalized_line)
     if len(letters) < 3 and len(digits) < 3:
         return ""
+    non_space_chars = re.findall(r"\S", normalized_line)
+    alnum_chars = re.findall(r"[A-Za-z0-9]", normalized_line)
+    if non_space_chars and len(alnum_chars) / len(non_space_chars) < 0.55:
+        return ""
+    tokens = re.findall(r"[A-Za-z0-9]+", normalized_line)
+    if len(tokens) >= 4:
+        if max(len(token) for token in tokens) <= 3:
+            return ""
+        single_character_tokens = [token for token in tokens if len(token) == 1]
+        if len(single_character_tokens) / len(tokens) > 0.4:
+            return ""
     return normalized_line
 
 
