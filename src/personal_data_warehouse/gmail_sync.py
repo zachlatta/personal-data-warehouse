@@ -53,7 +53,7 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v16"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v17"
 ATTACHMENT_AI_GENERATION_OPTIONS = {
     "temperature": 0,
     "num_predict": 320,
@@ -61,6 +61,8 @@ ATTACHMENT_AI_GENERATION_OPTIONS = {
 ATTACHMENT_AI_RESPONSE_FORMAT = "prompted_json"
 ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE = 1280
 ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY = 85
+ATTACHMENT_AI_OCR_ONLY_MIN_ALNUM_CHARS = 40
+ATTACHMENT_AI_OCR_ONLY_MIN_LINES = 2
 ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
 
 Return only concise JSON with this schema:
@@ -1207,6 +1209,44 @@ def apply_attachment_ai_fallback(
             images=images,
             timeout_seconds=config.timeout_seconds,
         )
+        prompt = attachment_ai_prompt(supporting_ocr_text=supporting_ocr_text)
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        metadata = attachment_ai_metadata(
+            extraction=extraction,
+            config=config,
+            prompt_sha256=prompt_sha256,
+        )
+        if attachment_ai_supporting_ocr_is_enough(supporting_ocr_text):
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            metadata["model_content_status"] = "ocr_only_pre_model"
+            metadata["model_call_skipped"] = True
+            text = normalize_markdown(
+                "\n\n".join(
+                    (
+                        "AI attachment extraction",
+                        f"Deterministic OCR text:\n{supporting_ocr_text.strip()}",
+                    )
+                )
+            )
+            status = "ai_ocr_only"
+            if len(text) > max_chars:
+                text = text[:max_chars]
+                status = "ai_truncated"
+            return AttachmentTextExtraction(
+                text=text,
+                status=status,
+                error=truncate_error(json.dumps(metadata, sort_keys=True, separators=(",", ":"))),
+                ai_provider=config.provider,
+                ai_model=config.model,
+                ai_base_url=config.base_url,
+                ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION,
+                ai_prompt_sha256=prompt_sha256,
+                ai_prompt=prompt,
+                ai_source_status=extraction.status,
+                ai_elapsed_ms=elapsed_ms,
+                ai_processed_at=datetime.now(tz=UTC),
+            )
+
         model_images = attachment_ai_model_images(images)
         LOGGER.info(
             "Starting Gmail attachment AI fallback model=%s source_status=%s mime_type=%s content_bytes=%s image_count=%s model_image_bytes=%s ocr_chars=%s timeout_seconds=%s",
@@ -1219,7 +1259,6 @@ def apply_attachment_ai_fallback(
             len(supporting_ocr_text),
             config.timeout_seconds,
         )
-        prompt = attachment_ai_prompt(supporting_ocr_text=supporting_ocr_text)
         response_text = call_ollama_attachment_vision_model(
             images=model_images,
             config=config,
@@ -1250,32 +1289,19 @@ def apply_attachment_ai_fallback(
             ),
         )
 
-    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    metadata = {
-        "source_status": extraction.status,
-        "source_error": extraction.error,
-        "provider": config.provider,
-        "model": config.model,
-        "base_url": config.base_url,
-        "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
-        "prompt_sha256": prompt_sha256,
-        "generation_options": ATTACHMENT_AI_GENERATION_OPTIONS,
-        "response_format": ATTACHMENT_AI_RESPONSE_FORMAT,
-        "model_image_preprocessing": {
-            "format": "jpeg",
-            "max_edge": ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE,
-            "quality": ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY,
-        },
-    }
+    metadata = attachment_ai_metadata(
+        extraction=extraction,
+        config=config,
+        prompt_sha256=prompt_sha256,
+    )
 
     formatted = format_attachment_ai_response_details(
         response_text,
         supporting_ocr_text=supporting_ocr_text,
     )
-    text = normalize_markdown(
-        formatted.text
-    )
+    text = normalize_markdown(formatted.text)
     metadata["model_content_status"] = formatted.model_content_status
+    metadata["model_call_skipped"] = False
     status = "ai_ok"
     if formatted.model_content_status == "ocr_only" and text:
         status = "ai_ocr_only"
@@ -1298,6 +1324,39 @@ def apply_attachment_ai_fallback(
         ai_source_status=extraction.status,
         ai_elapsed_ms=elapsed_ms,
         ai_processed_at=datetime.now(tz=UTC),
+    )
+
+
+def attachment_ai_metadata(
+    *,
+    extraction: AttachmentTextExtraction,
+    config: AttachmentAiFallbackConfig,
+    prompt_sha256: str,
+) -> dict[str, object]:
+    return {
+        "source_status": extraction.status,
+        "source_error": extraction.error,
+        "provider": config.provider,
+        "model": config.model,
+        "base_url": config.base_url,
+        "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
+        "prompt_sha256": prompt_sha256,
+        "generation_options": ATTACHMENT_AI_GENERATION_OPTIONS,
+        "response_format": ATTACHMENT_AI_RESPONSE_FORMAT,
+        "model_image_preprocessing": {
+            "format": "jpeg",
+            "max_edge": ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE,
+            "quality": ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY,
+        },
+    }
+
+
+def attachment_ai_supporting_ocr_is_enough(text: str) -> bool:
+    lines = [line for line in text.splitlines() if line.strip()]
+    alnum_chars = re.findall(r"[A-Za-z0-9]", text)
+    return (
+        len(alnum_chars) >= ATTACHMENT_AI_OCR_ONLY_MIN_ALNUM_CHARS
+        and len(lines) >= ATTACHMENT_AI_OCR_ONLY_MIN_LINES
     )
 
 

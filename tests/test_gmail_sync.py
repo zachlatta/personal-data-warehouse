@@ -932,8 +932,10 @@ def test_attachment_rows_for_message_records_ai_ocr_only_when_model_rejects_usef
     row = rows[0]
     assert row["text_extraction_status"] == "ai_ocr_only"
     assert "Deterministic OCR text:\nNASA Quantity: 20000" in row["text"]
+    assert ollama.generate_calls == []
     metadata = json.loads(row["text_extraction_error"])
-    assert metadata["model_content_status"] == "ocr_only"
+    assert metadata["model_content_status"] == "ocr_only_pre_model"
+    assert metadata["model_call_skipped"] is True
     assert metadata["prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
 
 
