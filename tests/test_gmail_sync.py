@@ -29,6 +29,7 @@ from personal_data_warehouse.gmail_sync import (
     ATTACHMENT_AI_PROMPT,
     ATTACHMENT_AI_PROMPT_VERSION,
     AttachmentAiFallbackConfig,
+    AttachmentAiModelAttemptBudget,
     attachment_ai_model_image,
     attachment_ai_prompt,
     attachment_ai_supporting_ocr_text,
@@ -938,6 +939,60 @@ def test_attachment_rows_for_message_records_ai_ocr_only_when_model_rejects_usef
     assert metadata["model_content_status"] == "ocr_only_pre_model"
     assert metadata["model_call_skipped"] is True
     assert metadata["prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
+
+
+def test_attachment_rows_for_message_skips_model_after_attempt_budget(monkeypatch) -> None:
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"fake hard image bytes" * 1000)
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "hard-image.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+    ollama = FakeOllamaResource("{}")
+    monkeypatch.setattr(
+        "personal_data_warehouse.gmail_sync.attachment_ai_supporting_ocr_text",
+        lambda **_kwargs: "",
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(image_content) + 1,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="qwen3-vl:2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+            model_attempt_budget=AttachmentAiModelAttemptBudget(limit=0),
+        ),
+    )
+
+    row = rows[0]
+    assert row["text_extraction_status"] == "ai_model_skipped"
+    assert row["text"] == ""
+    assert ollama.generate_calls == []
+    metadata = json.loads(row["text_extraction_error"])
+    assert metadata["model_content_status"] == "model_attempt_limit_exceeded"
+    assert metadata["model_call_skipped"] is True
+    assert metadata["model_attempt_limit"] == 0
 
 
 def test_attachment_ai_supporting_ocr_filters_short_garbage(monkeypatch) -> None:

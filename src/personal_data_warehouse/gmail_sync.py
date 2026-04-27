@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import base64
 import fcntl
@@ -53,7 +53,7 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v19"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v20"
 ATTACHMENT_AI_GENERATION_OPTIONS = {
     "temperature": 0,
     "num_predict": 320,
@@ -63,6 +63,7 @@ ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE = 1280
 ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY = 85
 ATTACHMENT_AI_OCR_ONLY_MIN_ALNUM_CHARS = 40
 ATTACHMENT_AI_OCR_ONLY_MIN_LINES = 2
+ATTACHMENT_AI_MODEL_ATTEMPT_LIMIT = 2
 ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
 
 Return only concise JSON with this schema:
@@ -136,6 +137,23 @@ class AttachmentAiFallbackConfig:
     pdf_max_pages: int
     pull_model: bool = True
     client: AttachmentVisionClient | None = None
+    model_attempt_budget: AttachmentAiModelAttemptBudget | None = None
+
+
+@dataclass
+class AttachmentAiModelAttemptBudget:
+    limit: int
+    attempts: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def acquire(self) -> int | None:
+        if self.limit < 1:
+            return None
+        with self.lock:
+            if self.attempts >= self.limit:
+                return None
+            self.attempts += 1
+            return self.attempts
 
 
 @dataclass(frozen=True)
@@ -656,6 +674,7 @@ def attachment_ai_fallback_config_from_settings(
         pdf_max_pages=settings.gmail_attachment_ai_fallback_pdf_max_pages,
         pull_model=settings.gmail_attachment_ai_fallback_pull_model,
         client=client,
+        model_attempt_budget=AttachmentAiModelAttemptBudget(ATTACHMENT_AI_MODEL_ATTEMPT_LIMIT),
     )
 
 
@@ -1247,9 +1266,30 @@ def apply_attachment_ai_fallback(
                 ai_processed_at=datetime.now(tz=UTC),
             )
 
+        model_attempt_index = attachment_ai_model_attempt_index(config)
+        if model_attempt_index is None:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            metadata["model_content_status"] = "model_attempt_limit_exceeded"
+            metadata["model_call_skipped"] = True
+            metadata["model_attempt_limit"] = attachment_ai_model_attempt_limit(config)
+            return AttachmentTextExtraction(
+                text="",
+                status="ai_model_skipped",
+                error=truncate_error(json.dumps(metadata, sort_keys=True, separators=(",", ":"))),
+                ai_provider=config.provider,
+                ai_model=config.model,
+                ai_base_url=config.base_url,
+                ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION,
+                ai_prompt_sha256=prompt_sha256,
+                ai_prompt=prompt,
+                ai_source_status=extraction.status,
+                ai_elapsed_ms=elapsed_ms,
+                ai_processed_at=datetime.now(tz=UTC),
+            )
+
         model_images = attachment_ai_model_images(images)
         LOGGER.info(
-            "Starting Gmail attachment AI fallback model=%s source_status=%s mime_type=%s content_bytes=%s image_count=%s model_image_bytes=%s ocr_chars=%s timeout_seconds=%s",
+            "Starting Gmail attachment AI fallback model=%s source_status=%s mime_type=%s content_bytes=%s image_count=%s model_image_bytes=%s ocr_chars=%s timeout_seconds=%s model_attempt=%s",
             config.model,
             extraction.status,
             mime_type,
@@ -1258,6 +1298,7 @@ def apply_attachment_ai_fallback(
             sum(len(image) for image in model_images),
             len(supporting_ocr_text),
             config.timeout_seconds,
+            model_attempt_index,
         )
         response_text = call_ollama_attachment_vision_model(
             images=model_images,
@@ -1275,6 +1316,27 @@ def apply_attachment_ai_fallback(
             elapsed_ms,
             exc,
         )
+        if "prompt_sha256" in locals() and "prompt" in locals() and "metadata" in locals():
+            metadata["model_content_status"] = "model_failed"
+            metadata["model_call_skipped"] = False
+            metadata["model_error"] = str(exc)
+            if "model_attempt_index" in locals():
+                metadata["model_attempt_index"] = model_attempt_index
+            metadata["model_attempt_limit"] = attachment_ai_model_attempt_limit(config)
+            return AttachmentTextExtraction(
+                text="",
+                status="ai_model_failed",
+                error=truncate_error(json.dumps(metadata, sort_keys=True, separators=(",", ":"))),
+                ai_provider=config.provider,
+                ai_model=config.model,
+                ai_base_url=config.base_url,
+                ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION,
+                ai_prompt_sha256=prompt_sha256,
+                ai_prompt=prompt,
+                ai_source_status=extraction.status,
+                ai_elapsed_ms=elapsed_ms,
+                ai_processed_at=datetime.now(tz=UTC),
+            )
         return replace(
             extraction,
             error=truncate_error(
@@ -1302,6 +1364,8 @@ def apply_attachment_ai_fallback(
     text = normalize_markdown(formatted.text)
     metadata["model_content_status"] = formatted.model_content_status
     metadata["model_call_skipped"] = False
+    metadata["model_attempt_index"] = model_attempt_index
+    metadata["model_attempt_limit"] = attachment_ai_model_attempt_limit(config)
     status = "ai_ok"
     if formatted.model_content_status == "ocr_only" and text:
         status = "ai_ocr_only"
@@ -1358,6 +1422,18 @@ def attachment_ai_supporting_ocr_is_enough(text: str) -> bool:
         len(alnum_chars) >= ATTACHMENT_AI_OCR_ONLY_MIN_ALNUM_CHARS
         and len(lines) >= ATTACHMENT_AI_OCR_ONLY_MIN_LINES
     )
+
+
+def attachment_ai_model_attempt_index(config: AttachmentAiFallbackConfig) -> int | None:
+    if config.model_attempt_budget is None:
+        return 1
+    return config.model_attempt_budget.acquire()
+
+
+def attachment_ai_model_attempt_limit(config: AttachmentAiFallbackConfig) -> int | None:
+    if config.model_attempt_budget is None:
+        return None
+    return config.model_attempt_budget.limit
 
 
 def format_attachment_ai_response(
