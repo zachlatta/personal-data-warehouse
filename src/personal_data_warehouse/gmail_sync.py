@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import re
+import signal
 import ssl
 from email.utils import getaddresses, parseaddr
 from io import BytesIO
@@ -1471,6 +1472,8 @@ def attachment_ai_clean_ocr_line(line: str) -> str:
 def run_attachment_ai_call_with_timeout[T](call: Callable[[], T], *, timeout_seconds: float) -> T:
     if timeout_seconds <= 0:
         return call()
+    if threading.current_thread() is threading.main_thread() and hasattr(signal, "setitimer"):
+        return run_attachment_ai_call_with_signal_timeout(call, timeout_seconds=timeout_seconds)
 
     results: queue.Queue[tuple[bool, T | BaseException]] = queue.Queue(maxsize=1)
 
@@ -1490,6 +1493,27 @@ def run_attachment_ai_call_with_timeout[T](call: Callable[[], T], *, timeout_sec
     if ok:
         return value  # type: ignore[return-value]
     raise value
+
+
+def run_attachment_ai_call_with_signal_timeout[T](call: Callable[[], T], *, timeout_seconds: float) -> T:
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    started_at = time.monotonic()
+
+    def timeout_handler(_signum, _frame) -> None:
+        raise TimeoutError(f"AI attachment fallback timed out after {timeout_seconds:g} seconds")
+
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            elapsed = time.monotonic() - started_at
+            remaining = max(previous_timer[0] - max(elapsed, 0), 0)
+            signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
 
 
 def format_attachment_ai_response(response_text: str, *, supporting_ocr_text: str = "") -> str:
