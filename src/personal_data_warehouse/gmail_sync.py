@@ -1413,7 +1413,7 @@ def ollama_generate_request_worker(
         if not isinstance(payload, dict):
             raise RuntimeError("Ollama returned a non-object JSON response")
         results.put((True, payload), block=False)
-    except Exception as exc:
+    except BaseException as exc:
         results.put((False, str(exc)), block=False)
 
 
