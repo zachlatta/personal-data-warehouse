@@ -208,7 +208,8 @@ def test_load_settings_enables_gmail_attachment_ai_fallback_by_default(monkeypat
 
     assert settings.gmail_attachment_ai_fallback_enabled is True
     assert settings.gmail_attachment_ai_fallback_base_url == "http://127.0.0.1:11435"
-    assert settings.gmail_attachment_ai_fallback_model == "gemma4:e2b"
+    assert settings.gmail_attachment_ai_fallback_model == "qwen3-vl:8b"
+    assert settings.gmail_attachment_ai_fallback_timeout_seconds == 120
     assert settings.gmail_attachment_ai_fallback_pull_model is True
 
 
