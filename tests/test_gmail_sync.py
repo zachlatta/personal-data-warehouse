@@ -763,7 +763,16 @@ def test_attachment_ai_supporting_ocr_filters_short_garbage(monkeypatch) -> None
         return subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout=b"\xe2\x80\x9c(YQ +\n\xe2\x80\x94a\nGS\nTHE HACK\n81-2908499\n",
+            stdout=(
+                "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+                "5\t1\t1\t1\t1\t1\t0\t0\t1\t1\t59.2\t(YQ\n"
+                "5\t1\t1\t1\t1\t2\t0\t0\t1\t1\t96.9\t+\n"
+                "5\t1\t1\t1\t2\t1\t0\t0\t1\t1\t0.0\t-a\n"
+                "5\t1\t1\t1\t3\t1\t0\t0\t1\t1\t58.9\tGS\n"
+                "5\t1\t1\t1\t4\t1\t0\t0\t1\t1\t96.1\tTHE\n"
+                "5\t1\t1\t1\t4\t2\t0\t0\t1\t1\t89.5\tHACK\n"
+                "5\t1\t1\t1\t5\t1\t0\t0\t1\t1\t90.0\t81-2908499\n"
+            ).encode(),
             stderr=b"",
         )
 

@@ -48,7 +48,7 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v9"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v10"
 ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
 
 Return only concise JSON with this schema:
@@ -1369,7 +1369,7 @@ def attachment_ai_supporting_ocr_text(*, images: Sequence[bytes], timeout_second
             image_path.write_bytes(image)
             try:
                 result = subprocess.run(
-                    [tesseract, str(image_path), "stdout", "--psm", "6"],
+                    [tesseract, str(image_path), "stdout", "--psm", "6", "tsv"],
                     capture_output=True,
                     check=False,
                     timeout=max(1, min(timeout_seconds, 20)),
@@ -1378,7 +1378,7 @@ def attachment_ai_supporting_ocr_text(*, images: Sequence[bytes], timeout_second
                 continue
             if result.returncode != 0:
                 continue
-            for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            for line in attachment_ai_ocr_lines_from_tsv(result.stdout.decode("utf-8", errors="replace")):
                 normalized_line = attachment_ai_clean_ocr_line(line)
                 if not normalized_line:
                     continue
@@ -1388,6 +1388,38 @@ def attachment_ai_supporting_ocr_text(*, images: Sequence[bytes], timeout_second
                 seen.add(key)
                 lines.append(normalized_line)
     return "\n".join(lines)
+
+
+def attachment_ai_ocr_lines_from_tsv(tsv_text: str) -> list[str]:
+    lines: dict[tuple[str, str, str, str], list[tuple[float, str]]] = {}
+    for row in tsv_text.splitlines()[1:]:
+        columns = row.split("\t")
+        if len(columns) < 12 or columns[0] != "5":
+            continue
+        try:
+            confidence = float(columns[10])
+        except ValueError:
+            continue
+        if confidence < 0:
+            continue
+        key = (columns[1], columns[2], columns[3], columns[4])
+        lines.setdefault(key, []).append((confidence, columns[11]))
+
+    cleaned_lines: list[str] = []
+    for words in lines.values():
+        if not words:
+            continue
+        average_confidence = sum(confidence for confidence, _word in words) / len(words)
+        text = " ".join(word for _confidence, word in words)
+        cleaned = attachment_ai_clean_ocr_line(text)
+        if not cleaned:
+            continue
+        if average_confidence < 45:
+            continue
+        if len(cleaned) > 240 and average_confidence < 70:
+            continue
+        cleaned_lines.append(cleaned)
+    return cleaned_lines
 
 
 def attachment_ai_clean_ocr_line(line: str) -> str:
