@@ -110,7 +110,7 @@ def test_slack_read_state_candidates_include_direct_messages() -> None:
     assert "last_read" in queries[0]
 
 
-def test_slack_account_state_refresh_inserts_tombstones_before_snapshot() -> None:
+def test_slack_account_state_refresh_inserts_snapshot_before_tombstones() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     commands: list[str] = []
     inserts: list[tuple[str, list[tuple[object, ...]], tuple[str, ...]]] = []
@@ -128,11 +128,11 @@ def test_slack_account_state_refresh_inserts_tombstones_before_snapshot() -> Non
 
     warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=synced_at)
 
+    assert "INSERT INTO slack_account_state_item_rows" in commands[0]
     assert inserts[0][0] == "slack_account_state_item_rows"
     tombstone = inserts[0][1][0]
     assert tombstone[SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS.index("is_deleted")] == 1
     assert tombstone[SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS.index("sync_version")] == int(synced_at.timestamp() * 1_000_000)
-    assert "INSERT INTO slack_account_state_item_rows" in commands[0]
 
 
 def test_slack_account_state_sql_uses_precise_and_thread_read_state() -> None:

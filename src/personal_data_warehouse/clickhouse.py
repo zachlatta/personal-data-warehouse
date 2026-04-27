@@ -1404,6 +1404,12 @@ class ClickHouseWarehouse:
               AND is_deleted = 0
             """
         )
+        self._command(
+            f"""
+            INSERT INTO slack_account_state_item_rows ({columns})
+            {self._slack_account_state_items_select_sql(account=account, team_id=team_id, synced_at=synced_at, sync_version=sync_version + 1)}
+            """
+        )
         if active_rows:
             tombstones = []
             is_deleted_index = SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS.index("is_deleted")
@@ -1416,12 +1422,6 @@ class ClickHouseWarehouse:
                 values[sync_version_index] = sync_version
                 tombstones.append(tuple(values))
             self._insert("slack_account_state_item_rows", tombstones, SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS)
-        self._command(
-            f"""
-            INSERT INTO slack_account_state_item_rows ({columns})
-            {self._slack_account_state_items_select_sql(account=account, team_id=team_id, synced_at=synced_at, sync_version=sync_version + 1)}
-            """
-        )
 
     def existing_slack_message_ids(
         self,
