@@ -48,13 +48,13 @@ ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
 ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v10"
+ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v11"
 ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
 
 Return only concise JSON with this schema:
 {
   "is_useful": true,
-  "document_type": "logo|slide|screenshot|ad|poster|photo|chart|illustration|receipt|invoice|form|unknown",
+  "document_type": "logo|slide|screenshot|ad|poster|photo|chart|illustration|receipt|invoice|form|floor_plan|diagram|unknown",
   "summary": "one faithful sentence about the whole image",
   "visible_text": ["exact readable text chunks from anywhere in the image"],
   "entities": ["brands, orgs, people, products, places"],
@@ -68,7 +68,7 @@ OCR first: extract titles, headings, bullets, labels, legends, names, dates, org
 
 If any readable text exists anywhere in the image, is_useful must be true. Logos and wordmarks are useful: set document_type to "logo", put all exact brand text in visible_text, and put the normalized brand/org name in entities. Ads, banners, posters, screenshots, charts, and slides are useful when they contain readable text or meaningful visual context.
 
-Never call the image a Gmail placeholder or Gmail interface unless Gmail UI or a literal Gmail attachment placeholder is visible. Do not infer visible text from the filename or from these instructions. Preserve acronyms and capitalization exactly as they appear in OCR text. Only include text that is visibly printed in the image; do not turn incidental shapes, shadows, monitors, or decorative marks into OCR text. If no text is visible, visible_text must be [] rather than ["unknown"], ["none"], or prose. If text is partially uncertain, include your best reading and add "(uncertain)" or an uncertainties note. Avoid generic keywords such as image, attachment, photo, and Gmail unless they are literally visible or specifically useful.
+Never call the image a Gmail placeholder or Gmail interface unless Gmail UI or a literal Gmail attachment placeholder is visible. Do not infer visible text from the filename or from these instructions. Preserve acronyms and capitalization exactly as they appear. Only include text that is visibly printed in the image; do not turn incidental shapes, shadows, monitors, or decorative marks into OCR text. If no text is visible, visible_text must be [] rather than ["unknown"], ["none"], or prose. If text is partially uncertain, include your best reading and add "(uncertain)" or an uncertainties note. Avoid generic keywords such as image, attachment, photo, and Gmail unless they are literally visible or specifically useful.
 
 Use false for is_useful only for blank/decorative/tracking images or literal placeholders with no useful visible text. Do not invent details."""
 ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
@@ -1167,9 +1167,11 @@ def apply_attachment_ai_fallback(
             images=images,
             timeout_seconds=config.timeout_seconds,
         )
+        prompt = attachment_ai_prompt(supporting_ocr_text=supporting_ocr_text)
         response_text = call_ollama_attachment_vision_model(
             images=images,
             config=config,
+            prompt=prompt,
         )
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
     except Exception as exc:
@@ -1187,7 +1189,7 @@ def apply_attachment_ai_fallback(
             ),
         )
 
-    prompt_sha256 = hashlib.sha256(ATTACHMENT_AI_PROMPT.encode("utf-8")).hexdigest()
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     metadata = {
         "source_status": extraction.status,
         "source_error": extraction.error,
@@ -1220,7 +1222,7 @@ def apply_attachment_ai_fallback(
         ai_base_url=config.base_url,
         ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION,
         ai_prompt_sha256=prompt_sha256,
-        ai_prompt=ATTACHMENT_AI_PROMPT,
+        ai_prompt=prompt,
         ai_source_status=extraction.status,
         ai_elapsed_ms=elapsed_ms,
         ai_processed_at=datetime.now(tz=UTC),
@@ -1299,10 +1301,28 @@ def render_pdf_attachment_pages(*, content: bytes, max_pages: int, timeout_secon
         return [path.read_bytes() for path in sorted(tempdir.glob("page-*.png"))]
 
 
+def attachment_ai_prompt(*, supporting_ocr_text: str = "") -> str:
+    ocr_text = supporting_ocr_text.strip()
+    if not ocr_text:
+        return ATTACHMENT_AI_PROMPT
+    return "\n\n".join(
+        (
+            ATTACHMENT_AI_PROMPT,
+            "Deterministic OCR hints from the same image, before model reasoning:",
+            ocr_text,
+            (
+                "Use these OCR hints as weak evidence only. Correct obvious OCR errors by looking at the image, "
+                "keep uncertain readings marked uncertain, and ignore OCR tokens that are not visibly supported."
+            ),
+        )
+    )
+
+
 def call_ollama_attachment_vision_model(
     *,
     images: Sequence[bytes],
     config: AttachmentAiFallbackConfig,
+    prompt: str,
 ) -> str:
     options = {
         "temperature": 0,
@@ -1312,7 +1332,7 @@ def call_ollama_attachment_vision_model(
         return run_attachment_ai_call_with_timeout(
             lambda: config.client.generate(
                 model=config.model,
-                prompt=ATTACHMENT_AI_PROMPT,
+                prompt=prompt,
                 images=images,
                 format="json",
                 options=options,
@@ -1325,7 +1345,7 @@ def call_ollama_attachment_vision_model(
     image_payload = [base64.b64encode(image).decode("ascii") for image in images]
     payload = {
         "model": config.model,
-        "prompt": ATTACHMENT_AI_PROMPT,
+        "prompt": prompt,
         "images": image_payload,
         "stream": False,
         "think": False,

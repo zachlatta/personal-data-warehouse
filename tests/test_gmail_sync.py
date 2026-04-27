@@ -24,6 +24,7 @@ from personal_data_warehouse.gmail_sync import (
     ATTACHMENT_AI_PROMPT,
     ATTACHMENT_AI_PROMPT_VERSION,
     AttachmentAiFallbackConfig,
+    attachment_ai_prompt,
     attachment_ai_supporting_ocr_text,
     attachment_parts_from_message,
     attachment_rows_for_message,
@@ -596,6 +597,80 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
     assert metadata["source_status"] == "unsupported"
     assert metadata["model"] == "gemma4:e2b"
     assert metadata["prompt_sha256"] == row["ai_prompt_sha256"]
+
+
+def test_attachment_ai_prompt_includes_deterministic_ocr_hints() -> None:
+    prompt = attachment_ai_prompt(supporting_ocr_text="THE HA CK\nSTRIKES BACK")
+
+    assert ATTACHMENT_AI_PROMPT in prompt
+    assert "Deterministic OCR hints from the same image" in prompt
+    assert "THE HA CK\nSTRIKES BACK" in prompt
+    assert "weak evidence" in prompt
+
+
+def test_attachment_rows_for_message_ai_fallback_sends_ocr_hints_to_model(monkeypatch) -> None:
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"fake logo image bytes" * 1000)
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "logo.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+    ollama = FakeOllamaResource(
+        json.dumps(
+            {
+                "is_useful": True,
+                "document_type": "logo",
+                "summary": "A Hack Club logo.",
+                "visible_text": ["THE HACK STRIKES BACK"],
+                "entities": ["Hack Club"],
+                "search_keywords": ["Hack Club", "The Hack Strikes Back"],
+                "uncertainties": ["OCR split HACK as HA CK."],
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "personal_data_warehouse.gmail_sync.attachment_ai_supporting_ocr_text",
+        lambda **_kwargs: "THE HA CK\nSTRIKES BACK",
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(image_content) + 1,
+        text_max_chars=2000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+    )
+
+    row = rows[0]
+    sent_prompt = ollama.generate_calls[0]["prompt"]
+    assert "Deterministic OCR hints from the same image" in sent_prompt
+    assert "THE HA CK\nSTRIKES BACK" in sent_prompt
+    assert row["ai_prompt"] == sent_prompt
+    assert row["ai_prompt_sha256"] == hashlib.sha256(sent_prompt.encode("utf-8")).hexdigest()
+    assert "Visible text:\nTHE HACK STRIKES BACK" in row["text"]
+    assert "Deterministic OCR text:\nTHE HA CK\nSTRIKES BACK" in row["text"]
 
 
 def test_attachment_rows_for_message_ai_fallback_keeps_scene_and_visible_text() -> None:
