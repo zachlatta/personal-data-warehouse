@@ -16,6 +16,7 @@ from dagster import (
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.defs.voice_memos_drive_ingest import voice_memos_drive_ingest
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.voice_memos_drive_ingest import build_google_drive_service
@@ -31,6 +32,7 @@ DEFAULT_VOICE_MEMOS_TRANSCRIPTION_BATCH_SIZE = 3
 
 @asset(
     group_name="voice_memos",
+    deps=[voice_memos_drive_ingest],
     retry_policy=RetryPolicy(max_retries=2, delay=120),
 )
 def voice_memos_transcription(context) -> MaterializeResult:
@@ -89,7 +91,7 @@ def voice_memos_transcription(context) -> MaterializeResult:
 
 voice_memos_transcription_job = define_asset_job(
     "voice_memos_transcription_job",
-    selection=[voice_memos_transcription],
+    selection="*voice_memos_transcription",
 )
 
 

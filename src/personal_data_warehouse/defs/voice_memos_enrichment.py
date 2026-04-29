@@ -17,6 +17,8 @@ from dagster import (
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.defs.calendar_sync import calendar_event_sync
+from personal_data_warehouse.defs.voice_memos_transcription import voice_memos_transcription
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.voice_memos_enrichment import (
@@ -31,6 +33,7 @@ DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE = 0
 
 @asset(
     group_name="voice_memos",
+    deps=[voice_memos_transcription, calendar_event_sync],
     retry_policy=RetryPolicy(max_retries=1, delay=120),
 )
 def voice_memos_enrichment(context) -> MaterializeResult:
@@ -81,7 +84,7 @@ def voice_memos_enrichment(context) -> MaterializeResult:
 
 voice_memos_enrichment_job = define_asset_job(
     "voice_memos_enrichment_job",
-    selection=[voice_memos_enrichment],
+    selection="*voice_memos_enrichment",
 )
 
 
