@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypedDict
+
+
+@dataclass(frozen=True)
+class ObjectPresence:
+    audio_exists: bool
+    metadata_exists: bool
 
 
 class StoredObject(TypedDict):
@@ -21,6 +28,9 @@ class ObjectStore(Protocol):
     def has_metadata(self, *, content_sha256: str) -> bool:
         pass
 
+    def presence(self, *, content_sha256: str) -> ObjectPresence:
+        pass
+
     def put_file(
         self,
         *,
@@ -28,6 +38,7 @@ class ObjectStore(Protocol):
         object_key: str,
         content_sha256: str,
         content_type: str,
+        skip_existing_check: bool = False,
     ) -> StoredObject:
         pass
 
@@ -38,6 +49,7 @@ class ObjectStore(Protocol):
         payload: dict[str, object],
         content_sha256: str,
         source_content_sha256: str | None = None,
+        skip_existing_check: bool = False,
     ) -> StoredObject:
         pass
 

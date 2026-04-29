@@ -240,6 +240,42 @@ Run the local Mac uploader:
 uv run personal-data-warehouse-voice-memos-upload
 ```
 
+The uploader defaults to a lightweight incremental mode for cron. Incremental mode keeps local
+state in `~/Library/Application Support/personal-data-warehouse/voice-memos-upload-state.json`;
+unchanged recordings that already uploaded both audio and metadata are skipped before hashing,
+network checks, OAuth refresh, or Drive API calls. Use full mode for periodic repair/backfill:
+
+```bash
+uv run personal-data-warehouse-voice-memos-upload --mode full
+```
+
+For a five-minute cron job:
+
+```cron
+*/5 * * * * cd /path/to/personal-data-warehouse && uv run personal-data-warehouse-voice-memos-upload --mode incremental
+```
+
+The Mac uploader skips expected network no-op cases with exit code `0`: no default route,
+blocked tethered/mobile/in-flight network, failed Google Drive preflight, or transient Drive
+timeouts. Blocked Wi-Fi SSID and hardware-port regexes can be customized with
+`VOICE_MEMOS_UPLOAD_BLOCKED_SSID_PATTERNS` and
+`VOICE_MEMOS_UPLOAD_BLOCKED_HARDWARE_PORT_PATTERNS` as comma-separated regex lists.
+On recent macOS releases, SSID visibility is protected by Location Services. The uploader tries
+CoreWLAN first, then `networksetup`, `ipconfig`, and `system_profiler`, but a CLI may still see an
+unavailable or redacted SSID until the launching app/process has location permission. Check what the
+uploader can see with:
+
+```bash
+uv run personal-data-warehouse-voice-memos-upload --network-diagnostics
+```
+
+If it reports `SSID unavailable`, grant Location Services permission to the app launching the
+command, such as Terminal or iTerm, in System Settings > Privacy & Security > Location Services.
+Classic `cron` may not have a grantable GUI app identity on current macOS; in that case use the
+default fail-open unknown-SSID behavior plus Drive preflight, or run the job from a user LaunchAgent
+associated with a location-authorized app. Set `VOICE_MEMOS_UPLOAD_REQUIRE_WIFI_SSID=true` only if
+unavailable SSID should fail closed.
+
 The configured Drive folder is treated as the object-storage root. The uploader creates real
 subfolders under that root, using colocated inbox object keys such as
 `apple-voice-memos/inbox/YYYY/MM/YYYY-MM-DD-<sha256>.qta` and

@@ -16,6 +16,7 @@ def load_google_credentials(
     settings: Settings,
     scopes: tuple[str, ...],
     service_name: str,
+    request_timeout_seconds: int = 120,
 ) -> Credentials:
     token_json = google_token_json_from_env(email_address)
     if not token_json:
@@ -36,8 +37,24 @@ def load_google_credentials(
             f"GMAIL_{env_slug(email_address)}_TOKEN_JSON_B64 and authorize again."
         )
 
-    credentials.refresh(Request())
+    credentials.refresh(TimeoutRequest(timeout_seconds=request_timeout_seconds))
     return credentials
+
+
+class TimeoutRequest:
+    def __init__(self, *, timeout_seconds: int) -> None:
+        self._request = Request()
+        self._timeout_seconds = timeout_seconds
+
+    def __call__(self, url, method="GET", body=None, headers=None, timeout=120, **kwargs):
+        return self._request(
+            url,
+            method=method,
+            body=body,
+            headers=headers,
+            timeout=min(timeout, self._timeout_seconds) if timeout else self._timeout_seconds,
+            **kwargs,
+        )
 
 
 def google_token_json_from_env(email_address: str) -> str | None:

@@ -4,7 +4,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
-from personal_data_warehouse_voice_memos.scanner import recording_from_path, scan_voice_memos
+from personal_data_warehouse_voice_memos.scanner import recording_from_path, scan_voice_memo_file_candidates, scan_voice_memos
+from personal_data_warehouse_voice_memos.state import VoiceMemosUploadState
+from personal_data_warehouse_voice_memos.storage import ObjectPresence
 from personal_data_warehouse_voice_memos.sync import VoiceMemosUploadRunner
 
 
@@ -31,6 +33,7 @@ class FakeObjectStore:
         self.existing_metadata_sha256 = existing_metadata_sha256 or set()
         self.file_uploads: list[tuple[Path, str]] = []
         self.json_uploads: list[tuple[str, dict[str, object]]] = []
+        self.presence_calls: list[str] = []
 
     def has_blob(self, *, content_sha256: str) -> bool:
         return content_sha256 in self.existing_sha256
@@ -38,7 +41,22 @@ class FakeObjectStore:
     def has_metadata(self, *, content_sha256: str) -> bool:
         return content_sha256 in self.existing_metadata_sha256
 
-    def put_file(self, *, path: Path, object_key: str, content_sha256: str, content_type: str):
+    def presence(self, *, content_sha256: str) -> ObjectPresence:
+        self.presence_calls.append(content_sha256)
+        return ObjectPresence(
+            audio_exists=content_sha256 in self.existing_sha256,
+            metadata_exists=content_sha256 in self.existing_metadata_sha256,
+        )
+
+    def put_file(
+        self,
+        *,
+        path: Path,
+        object_key: str,
+        content_sha256: str,
+        content_type: str,
+        skip_existing_check: bool = False,
+    ):
         if content_sha256 not in self.existing_sha256:
             self.file_uploads.append((path, object_key))
         self.existing_sha256.add(content_sha256)
@@ -56,6 +74,7 @@ class FakeObjectStore:
         payload: dict[str, object],
         content_sha256: str,
         source_content_sha256: str | None = None,
+        skip_existing_check: bool = False,
     ):
         self.json_uploads.append((object_key, payload))
         if source_content_sha256:
@@ -174,3 +193,71 @@ def test_mac_runner_supports_parallel_workers(tmp_path) -> None:
     assert summary.metadata_uploaded == 2
     assert len(object_store.file_uploads) == 2
     assert len(object_store.json_uploads) == 2
+
+
+def test_incremental_runner_skips_unchanged_state_complete_files_without_drive_calls(tmp_path) -> None:
+    recording = tmp_path / "20260427 100004-40DC0200.m4a"
+    recording.write_bytes(b"already-synced")
+    full_recording = recording_from_path(recording)
+    object_store = FakeObjectStore()
+    state = VoiceMemosUploadState.empty(account="zach@example.com", recordings_path=tmp_path)
+    candidate = next(iter(scan_voice_memo_file_candidates(tmp_path, extensions=(".m4a",))))
+    state.mark_success(
+        candidate=candidate,
+        content_sha256=full_recording.content_sha256,
+        audio_uploaded=True,
+        metadata_uploaded=True,
+        now=datetime(2026, 4, 27, 12, tzinfo=UTC),
+    )
+    network_checks = 0
+
+    def before_upload_check() -> str | None:
+        nonlocal network_checks
+        network_checks += 1
+        return None
+
+    summary = VoiceMemosUploadRunner(
+        account="zach@example.com",
+        recordings_path=tmp_path,
+        extensions=(".m4a",),
+        object_store=object_store,
+        logger=FakeLogger(),
+        mode="incremental",
+        upload_state=state,
+        before_upload_check=before_upload_check,
+        now=lambda: datetime(2026, 4, 27, 12, 5, tzinfo=UTC),
+    ).sync()
+
+    assert summary.recordings_seen == 1
+    assert summary.recordings_selected == 0
+    assert summary.recordings_skipped == 1
+    assert object_store.presence_calls == []
+    assert object_store.file_uploads == []
+    assert object_store.json_uploads == []
+    assert network_checks == 0
+
+
+def test_incremental_runner_defers_upload_when_network_guard_blocks_before_drive_calls(tmp_path) -> None:
+    recording = tmp_path / "20260427 100004-40DC0200.m4a"
+    recording.write_bytes(b"new-recording")
+    object_store = FakeObjectStore()
+    state = VoiceMemosUploadState.empty(account="zach@example.com", recordings_path=tmp_path)
+
+    summary = VoiceMemosUploadRunner(
+        account="zach@example.com",
+        recordings_path=tmp_path,
+        extensions=(".m4a",),
+        object_store=object_store,
+        logger=FakeLogger(),
+        mode="incremental",
+        upload_state=state,
+        before_upload_check=lambda: "blocked Wi-Fi SSID: United Wi-Fi",
+        now=lambda: datetime(2026, 4, 27, 12, 5, tzinfo=UTC),
+    ).sync()
+
+    assert summary.recordings_seen == 1
+    assert summary.recordings_selected == 1
+    assert summary.recordings_deferred == 1
+    assert object_store.presence_calls == []
+    assert object_store.file_uploads == []
+    assert object_store.json_uploads == []

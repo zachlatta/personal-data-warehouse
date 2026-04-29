@@ -7,9 +7,10 @@ import threading
 import time
 from typing import Any
 
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
 
-from personal_data_warehouse_voice_memos.storage import StoredObject
+from personal_data_warehouse_voice_memos.storage import ObjectPresence, StoredObject
 
 _FOLDER_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _FOLDER_LOCKS_LOCK = threading.Lock()
@@ -38,6 +39,24 @@ class GoogleDriveObjectStore:
             kind="voice_memo_metadata",
         ) is not None
 
+    def presence(self, *, content_sha256: str) -> ObjectPresence:
+        response = self._find_all_by_content_sha256(content_sha256=content_sha256)
+        files = response.get("files", []) if isinstance(response, dict) else []
+        audio_exists = False
+        metadata_exists = False
+        for file in files:
+            if not isinstance(file, dict):
+                continue
+            app_properties = file.get("appProperties", {})
+            if not isinstance(app_properties, dict):
+                continue
+            kind = app_properties.get("pdw_kind")
+            if kind == "voice_memo_audio":
+                audio_exists = True
+            elif kind == "voice_memo_metadata":
+                metadata_exists = True
+        return ObjectPresence(audio_exists=audio_exists, metadata_exists=metadata_exists)
+
     def put_file(
         self,
         *,
@@ -45,14 +64,16 @@ class GoogleDriveObjectStore:
         object_key: str,
         content_sha256: str,
         content_type: str,
+        skip_existing_check: bool = False,
     ) -> StoredObject:
-        existing = self._find_by_app_property(
-            key="content_sha256",
-            value=content_sha256,
-            kind="voice_memo_audio",
-        )
-        if existing is not None:
-            return self._stored_object(existing, object_key)
+        if not skip_existing_check:
+            existing = self._find_by_app_property(
+                key="content_sha256",
+                value=content_sha256,
+                kind="voice_memo_audio",
+            )
+            if existing is not None:
+                return self._stored_object(existing, object_key)
 
         body = {
             "name": drive_name_from_object_key(object_key),
@@ -89,8 +110,9 @@ class GoogleDriveObjectStore:
         payload: dict[str, object],
         content_sha256: str,
         source_content_sha256: str | None = None,
+        skip_existing_check: bool = False,
     ) -> StoredObject:
-        if source_content_sha256:
+        if source_content_sha256 and not skip_existing_check:
             existing = self._find_by_app_property(
                 key="audio_content_sha256",
                 value=source_content_sha256,
@@ -154,6 +176,40 @@ class GoogleDriveObjectStore:
         files = response.get("files", []) if isinstance(response, dict) else []
         first = files[0] if files else None
         return first if isinstance(first, dict) else None
+
+    def _find_all_by_content_sha256(self, *, content_sha256: str) -> dict[str, Any]:
+        escaped_folder_id = escape_query_value(self._folder_id)
+        escaped_sha = escape_query_value(content_sha256)
+        query = (
+            "trashed = false "
+            "and appProperties has { key='pdw_source' and value='voice_memos' } "
+            f"and appProperties has {{ key='pdw_root_folder_id' and value='{escaped_folder_id}' }} "
+            "and ("
+            "appProperties has { key='pdw_stage' and value='inbox' } "
+            "or appProperties has { key='pdw_stage' and value='library' }"
+            ") "
+            "and ("
+            "("
+            "appProperties has { key='pdw_kind' and value='voice_memo_audio' } "
+            f"and appProperties has {{ key='content_sha256' and value='{escaped_sha}' }}"
+            ") "
+            "or ("
+            "appProperties has { key='pdw_kind' and value='voice_memo_metadata' } "
+            f"and appProperties has {{ key='audio_content_sha256' and value='{escaped_sha}' }}"
+            ")"
+            ")"
+        )
+        return self._execute(
+            lambda: self._service.files()
+            .list(
+                q=query,
+                pageSize=10,
+                fields="files(id,webViewLink,appProperties)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
 
     def _ensure_parent_folder(self, object_key: str) -> str:
         parts = [part for part in object_key.split("/")[:-1] if part]
@@ -235,6 +291,26 @@ class GoogleDriveObjectStore:
                     break
                 time.sleep(min(30, attempt))
         raise RuntimeError(f"Google Drive request failed after {self._max_attempts} attempts: {last_exc}") from last_exc
+
+
+def is_transient_google_error(exc: Exception) -> bool:
+    if isinstance(exc, HttpError):
+        status = getattr(exc.resp, "status", None)
+        return status in {408, 429, 500, 502, 503, 504}
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "timed out",
+            "timeout",
+            "temporary failure",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "network is unreachable",
+            "name or service not known",
+        )
+    )
 
 
 def drive_name_from_object_key(object_key: str) -> str:
