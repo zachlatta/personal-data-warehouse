@@ -15,6 +15,8 @@ shutdown() {
 
 trap shutdown INT TERM EXIT
 
+uv run python -m personal_data_warehouse.dagster_bootstrap
+
 uv run dagster-daemon run -m personal_data_warehouse.definitions &
 daemon_pid="$!"
 

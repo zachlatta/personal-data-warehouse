@@ -11,3 +11,10 @@ run_coordinator:
     dequeue_interval_seconds: 5
     dequeue_use_threads: true
     dequeue_num_workers: 4
+
+run_monitoring:
+  enabled: true
+  poll_interval_seconds: 60
+  start_timeout_seconds: 300
+  cancel_timeout_seconds: 300
+  max_runtime_seconds: 14400
