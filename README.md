@@ -375,17 +375,19 @@ AGENT_MODEL=gpt-5.3-codex
 AGENT_AUTH_VOLUME=pdw-agent-auth
 AGENT_RUNS_VOLUME=pdw-agent-runs
 AGENT_RUNS_DIR=/agent-runs
+AGENT_DOCKER_NETWORK=coolify
 ```
 
 The read-only ClickHouse tool is exposed through a short-lived proxy owned by the Dagster process.
 The agent container receives only a proxy URL and per-run bearer token, not `CLICKHOUSE_URL`. Defaults
-work on Docker Desktop/OrbStack via `host.docker.internal`. In Coolify, set these if the spawned
-agent container must reach the Dagster container over a specific Docker network:
+work on Docker Desktop/OrbStack via `host.docker.internal`. In Coolify, set `AGENT_DOCKER_NETWORK`
+to the app network, usually `coolify`; when the network is not `bridge`, the proxy host defaults to
+the Dagster container hostname. Override the host only if Docker DNS cannot resolve that hostname:
 
 ```bash
-AGENT_DOCKER_NETWORK=<coolify-network-name>
+AGENT_DOCKER_NETWORK=coolify
 AGENT_TOOL_PROXY_BIND_HOST=0.0.0.0
-AGENT_TOOL_PROXY_PUBLIC_HOST=<dagster-container-hostname-or-ip>
+AGENT_TOOL_PROXY_PUBLIC_HOST=<optional-dagster-container-hostname-or-ip>
 ```
 
 Log in from the Coolify terminal after the Dagster app can use Docker:

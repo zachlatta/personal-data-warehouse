@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import uuid
 from typing import Any
@@ -33,6 +34,8 @@ DEFAULT_AGENT_IMAGE_REPOSITORY = "personal-data-warehouse-agent"
 DEFAULT_AGENT_DOCKERFILE_PATH = Path(__file__).resolve().parents[2] / "docker" / "agent.Dockerfile"
 DEFAULT_AGENT_ENTRYPOINT_PATH = Path(__file__).resolve().parents[2] / "docker" / "agent-entrypoint.sh"
 DEFAULT_AGENT_BUILD_CONTEXT_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_AGENT_TOOL_PROXY_BIND_HOST = "0.0.0.0"
+DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST = "host.docker.internal"
 
 
 @dataclass(frozen=True)
@@ -820,6 +823,7 @@ def provider_auth_lock(provider: str):
 
 
 def agent_config_from_env() -> AgentContainerConfig:
+    network = os.getenv("AGENT_DOCKER_NETWORK", DEFAULT_AGENT_NETWORK)
     return AgentContainerConfig(
         image=default_agent_docker_image(),
         provider=os.getenv("AGENT_PROVIDER", "codex"),
@@ -827,14 +831,23 @@ def agent_config_from_env() -> AgentContainerConfig:
         auth_volume=os.getenv("AGENT_AUTH_VOLUME", DEFAULT_AGENT_AUTH_VOLUME),
         runs_volume=os.getenv("AGENT_RUNS_VOLUME", DEFAULT_AGENT_RUNS_VOLUME),
         runs_dir=Path(os.getenv("AGENT_RUNS_DIR", DEFAULT_AGENT_RUNS_DIR)),
-        network=os.getenv("AGENT_DOCKER_NETWORK", DEFAULT_AGENT_NETWORK),
+        network=network,
         memory=os.getenv("AGENT_DOCKER_MEMORY", DEFAULT_AGENT_MEMORY),
         cpus=os.getenv("AGENT_DOCKER_CPUS", DEFAULT_AGENT_CPUS),
         pids_limit=int(os.getenv("AGENT_DOCKER_PIDS_LIMIT", str(DEFAULT_AGENT_PIDS_LIMIT))),
         timeout_seconds=int(os.getenv("AGENT_TIMEOUT_SECONDS", "1800")),
-        tool_proxy_bind_host=os.getenv("AGENT_TOOL_PROXY_BIND_HOST", "0.0.0.0"),
-        tool_proxy_public_host=os.getenv("AGENT_TOOL_PROXY_PUBLIC_HOST", "host.docker.internal"),
+        tool_proxy_bind_host=os.getenv("AGENT_TOOL_PROXY_BIND_HOST", DEFAULT_AGENT_TOOL_PROXY_BIND_HOST),
+        tool_proxy_public_host=os.getenv(
+            "AGENT_TOOL_PROXY_PUBLIC_HOST",
+            default_agent_tool_proxy_public_host(network),
+        ),
     )
+
+
+def default_agent_tool_proxy_public_host(network: str) -> str:
+    if network and network != DEFAULT_AGENT_NETWORK:
+        return socket.gethostname()
+    return DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST
 
 
 def default_agent_docker_image(

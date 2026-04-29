@@ -7,7 +7,7 @@ import re
 
 from dotenv import load_dotenv
 
-from personal_data_warehouse.agent_runner import default_agent_docker_image
+from personal_data_warehouse.agent_runner import default_agent_docker_image, default_agent_tool_proxy_public_host
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -472,7 +472,10 @@ def load_settings(
             docker_cpus=os.getenv("AGENT_DOCKER_CPUS", DEFAULT_AGENT_DOCKER_CPUS),
             docker_pids_limit=agent_pids_limit,
             tool_proxy_bind_host=os.getenv("AGENT_TOOL_PROXY_BIND_HOST", DEFAULT_AGENT_TOOL_PROXY_BIND_HOST),
-            tool_proxy_public_host=os.getenv("AGENT_TOOL_PROXY_PUBLIC_HOST", DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST),
+            tool_proxy_public_host=os.getenv(
+                "AGENT_TOOL_PROXY_PUBLIC_HOST",
+                default_agent_tool_proxy_public_host(os.getenv("AGENT_DOCKER_NETWORK", DEFAULT_AGENT_DOCKER_NETWORK)),
+            ),
         )
 
     google_scopes = [GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE]

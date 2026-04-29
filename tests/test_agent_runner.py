@@ -5,6 +5,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import threading
+import time
+from urllib import request
 
 from personal_data_warehouse.agent_resource import AgentResource
 from personal_data_warehouse.agent_runner import (
@@ -16,8 +19,10 @@ from personal_data_warehouse.agent_runner import (
     agent_run_event_rows,
     agent_run_row,
     agent_run_tool_call_rows,
+    agent_config_from_env,
     auth_docker_command,
     default_agent_docker_image,
+    default_agent_tool_proxy_public_host,
     ensure_agent_image,
     volume_copy_command,
     write_builtin_cli_tools,
@@ -229,6 +234,17 @@ def test_default_agent_docker_image_uses_agent_image_inputs_hash(tmp_path) -> No
     assert changed != image
 
 
+def test_agent_config_uses_container_hostname_for_non_bridge_proxy(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_DOCKER_NETWORK", "coolify")
+    monkeypatch.setattr("personal_data_warehouse.agent_runner.socket.gethostname", lambda: "dagster-container")
+
+    config = agent_config_from_env()
+
+    assert config.network == "coolify"
+    assert config.tool_proxy_public_host == "dagster-container"
+    assert default_agent_tool_proxy_public_host("bridge") == "host.docker.internal"
+
+
 def test_ensure_agent_image_skips_build_when_derived_image_exists() -> None:
     calls = []
 
@@ -352,6 +368,52 @@ def test_builtin_cli_tools_reject_write_queries_through_proxy(tmp_path) -> None:
     assert "read-only" in payload["error"]
 
 
+def test_agent_tool_proxy_serializes_clickhouse_queries() -> None:
+    active = 0
+    max_active = 0
+    guard = threading.Lock()
+
+    class FakeRunner:
+        def query(self, sql, *, max_rows):
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return RawResult(columns=["sql"], rows=[{"sql": sql}])
+            finally:
+                with guard:
+                    active -= 1
+
+    service = ClickHouseReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
+    with run_agent_tool_proxy(query_service=service, bind_host="127.0.0.1", public_host="127.0.0.1") as env:
+        results = []
+
+        def post(sql: str) -> None:
+            req = request.Request(
+                f"{env['PDW_AGENT_TOOL_PROXY_URL']}/query",
+                data=json.dumps({"sql": sql}).encode("utf-8"),
+                headers={
+                    "authorization": f"Bearer {env['PDW_AGENT_TOOL_PROXY_TOKEN']}",
+                    "content-type": "application/json",
+                },
+                method="POST",
+            )
+            with request.urlopen(req, timeout=5) as response:
+                results.append(json.loads(response.read().decode("utf-8")))
+
+        threads = [threading.Thread(target=post, args=(f"SELECT {index}",)) for index in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert len(results) == 3
+    assert all(result["error"] == "" for result in results)
+    assert max_active == 1
+
+
 def test_builtin_cli_tools_reject_invalid_json_shape(tmp_path) -> None:
     write_builtin_cli_tools(tmp_path)
     candidate = tmp_path / "candidate.json"
@@ -402,6 +464,17 @@ def test_load_settings_derives_agent_image_when_required(monkeypatch) -> None:
     assert settings.agent is not None
     assert settings.agent.docker_image.startswith("personal-data-warehouse-agent:")
     assert len(settings.agent.docker_image.rsplit(":", 1)[1]) == 6
+
+
+def test_load_settings_uses_container_hostname_for_non_bridge_agent_network(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_DOCKER_NETWORK", "coolify")
+    monkeypatch.setattr("personal_data_warehouse.agent_runner.socket.gethostname", lambda: "dagster-container")
+
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_agent=True)
+
+    assert settings.agent is not None
+    assert settings.agent.docker_network == "coolify"
+    assert settings.agent.tool_proxy_public_host == "dagster-container"
 
 
 def test_agent_resource_builds_container_config() -> None:

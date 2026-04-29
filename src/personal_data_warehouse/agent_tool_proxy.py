@@ -19,6 +19,7 @@ def run_agent_tool_proxy(
     public_host: str = "host.docker.internal",
 ) -> Iterator[dict[str, str]]:
     token = secrets.token_urlsafe(32)
+    query_lock = threading.Lock()
 
     class AgentToolProxyHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
@@ -33,10 +34,14 @@ def run_agent_tool_proxy(
                 return
             if self.path == "/query":
                 sql = str(payload.get("sql") or "")
-                self._write_json(query_service.execute_one(sql).as_tool_payload())
+                with query_lock:
+                    result = query_service.execute_one(sql).as_tool_payload()
+                self._write_json(result)
                 return
             if self.path == "/schema":
-                self._write_json(query_service.schema_overview().as_tool_payload())
+                with query_lock:
+                    result = query_service.schema_overview().as_tool_payload()
+                self._write_json(result)
                 return
             self._write_json({"error": "not found"}, status=404)
 
