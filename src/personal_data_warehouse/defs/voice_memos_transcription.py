@@ -2,10 +2,21 @@ from __future__ import annotations
 
 import os
 
-from dagster import Definitions, MaterializeResult, MetadataValue, RetryPolicy, asset, define_asset_job, definitions
+from dagster import (
+    DefaultScheduleStatus,
+    Definitions,
+    MaterializeResult,
+    MetadataValue,
+    RetryPolicy,
+    asset,
+    define_asset_job,
+    definitions,
+    schedule,
+)
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.voice_memos_drive_ingest import build_google_drive_service
 from personal_data_warehouse.voice_memos_transcription import (
@@ -82,9 +93,19 @@ voice_memos_transcription_job = define_asset_job(
 )
 
 
+@schedule(
+    cron_schedule="*/15 * * * *",
+    job=voice_memos_transcription_job,
+    default_status=DefaultScheduleStatus.RUNNING,
+)
+def voice_memos_transcription_every_fifteen_minutes(context):
+    return skip_if_job_active(context, job_name="voice_memos_transcription_job")
+
+
 @definitions
 def defs() -> Definitions:
     return Definitions(
         assets=[voice_memos_transcription],
         jobs=[voice_memos_transcription_job],
+        schedules=[voice_memos_transcription_every_fifteen_minutes],
     )

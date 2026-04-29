@@ -3,10 +3,21 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime, timedelta
 
-from dagster import Definitions, MaterializeResult, MetadataValue, RetryPolicy, asset, define_asset_job, definitions
+from dagster import (
+    DefaultScheduleStatus,
+    Definitions,
+    MaterializeResult,
+    MetadataValue,
+    RetryPolicy,
+    asset,
+    define_asset_job,
+    definitions,
+    schedule,
+)
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.voice_memos_enrichment import (
     DEFAULT_ENRICHMENT_LOOKBACK_WEEKS,
@@ -74,9 +85,19 @@ voice_memos_enrichment_job = define_asset_job(
 )
 
 
+@schedule(
+    cron_schedule="17 * * * *",
+    job=voice_memos_enrichment_job,
+    default_status=DefaultScheduleStatus.RUNNING,
+)
+def voice_memos_enrichment_hourly(context):
+    return skip_if_job_active(context, job_name="voice_memos_enrichment_job")
+
+
 @definitions
 def defs() -> Definitions:
     return Definitions(
         assets=[voice_memos_enrichment],
         jobs=[voice_memos_enrichment_job],
+        schedules=[voice_memos_enrichment_hourly],
     )
