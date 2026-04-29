@@ -302,9 +302,9 @@ Transcription is a separate Dagster asset. Configure AssemblyAI:
 ASSEMBLYAI_API_KEY=...
 VOICE_MEMOS_TRANSCRIPTION_PROVIDER=assemblyai
 VOICE_MEMOS_TRANSCRIPTION_BATCH_SIZE=3
-OPENAI_API_KEY=...
-OPENAI_MODEL=gpt-5.3-codex
-OPENAI_TIMEOUT_SECONDS=1800
+AGENT_DOCKER_IMAGE=personal-data-warehouse-agent:latest
+AGENT_PROVIDER=codex
+AGENT_MODEL=gpt-5.3-codex
 VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS=12
 VOICE_MEMOS_ENRICHMENT_BATCH_SIZE=0
 ```
@@ -319,12 +319,11 @@ The transcription asset stores the raw AssemblyAI response JSON in ClickHouse an
 normalized diarized segments for search. AssemblyAI is configured with Universal-3 Pro plus
 domain keyterms for Hack Club and common project/product terms.
 
-Transcript enrichment is a separate OpenAI-backed Dagster asset. It reads completed transcription
-runs, gives the model a bounded read-only ClickHouse query tool, and stores a cleaned transcript,
-calendar match, attendees, speaker map, summary, topics, action items, evidence, and raw structured
-result JSON. The query tool shares the same read-only conventions as the MCP query app and
-`bin/readonly-clickhouse`: statements are locally restricted to read-only verbs and ClickHouse is
-called with `readonly=1`.
+Transcript enrichment is a separate agent-backed Dagster asset. It reads completed transcription
+runs, asks a one-off subscription-authenticated Codex or Claude Code container to produce structured
+JSON, and stores a cleaned transcript, calendar match, attendees, speaker map, summary, topics,
+action items, evidence, and raw structured result JSON. The agent container receives only the
+per-run prompt, schema, and deterministic local CLI helpers, not production API keys.
 
 By default enrichment processes all completed transcripts from the last twelve weeks that do not
 already have the current enrichment prompt version. Set `VOICE_MEMOS_ENRICHMENT_BATCH_SIZE` to a
@@ -342,7 +341,7 @@ uv run python -c "from dagster import materialize; from personal_data_warehouse.
 
 ### Containerized Agent Enrichment
 
-Voice Memos enrichment can also run through a one-off Codex or Claude Code container using your
+Voice Memos enrichment runs through a one-off Codex or Claude Code container by default, using your
 logged-in CLI subscription instead of API keys. Dagster owns the Docker socket and spawns the agent
 container; the agent container does not receive the Docker socket, Dagster env, ClickHouse URL,
 Google tokens, Slack tokens, or API keys.
@@ -369,13 +368,23 @@ Also mount the host Docker socket into the Dagster app only:
 Set the Dagster app env:
 
 ```bash
-VOICE_MEMOS_ENRICHMENT_BACKEND=agent
 AGENT_DOCKER_IMAGE=personal-data-warehouse-agent:latest
 AGENT_PROVIDER=codex
 AGENT_MODEL=gpt-5.3-codex
 AGENT_AUTH_VOLUME=pdw-agent-auth
 AGENT_RUNS_VOLUME=pdw-agent-runs
 AGENT_RUNS_DIR=/agent-runs
+```
+
+The read-only ClickHouse tool is exposed through a short-lived proxy owned by the Dagster process.
+The agent container receives only a proxy URL and per-run bearer token, not `CLICKHOUSE_URL`. Defaults
+work on Docker Desktop/OrbStack via `host.docker.internal`. In Coolify, set these if the spawned
+agent container must reach the Dagster container over a specific Docker network:
+
+```bash
+AGENT_DOCKER_NETWORK=<coolify-network-name>
+AGENT_TOOL_PROXY_BIND_HOST=0.0.0.0
+AGENT_TOOL_PROXY_PUBLIC_HOST=<dagster-container-hostname-or-ip>
 ```
 
 Log in from the Coolify terminal after the Dagster app can use Docker:
@@ -400,21 +409,24 @@ still lands in `voice_memo_enrichments`.
 
 The agent integration is exposed to Dagster as an `AgentResource`. The core Docker runner remains
 plain Python for testing, while assets receive the resource and use it to start one-off containers.
-The Voice Memos asset currently consumes this resource when `VOICE_MEMOS_ENRICHMENT_BACKEND=agent`;
-other assets can reuse the same resource later.
+The Voice Memos enrichment asset consumes this resource by default; other assets can reuse the same
+resource later.
 
-Each run also gets a per-run `tools/` directory mounted into the agent container and prepended to
-`PATH`. These are small local CLI helpers intended for Bash workflows inside the disposable
-container. Current built-ins:
+Each run also gets a per-run `tools/` directory mounted into the agent container. The runner exports
+absolute helper paths because Codex/Claude shell environments may not preserve `PATH` changes.
+Current built-ins:
 
 ```bash
-pdw-tool-help
-pdw-validate-json candidate.json "$AGENT_SCHEMA_PATH"
+"$PDW_TOOL_HELP"
+"$PDW_VALIDATE_JSON" candidate.json "$AGENT_SCHEMA_PATH"
+"$PDW_CLICKHOUSE_SCHEMA"
+"$PDW_CLICKHOUSE_QUERY" "SELECT summary, attendees_json FROM calendar_events LIMIT 5"
 ```
 
-These helpers are deterministic and do not have production credentials. Secret-backed tools should
-only be added deliberately, with the understanding that any credential available to a CLI is also
-available to arbitrary Bash inside the agent container.
+`$PDW_CLICKHOUSE_SCHEMA` and `$PDW_CLICKHOUSE_QUERY` route through the per-run read-only proxy. SQL
+is locally restricted to read-only statement types and ClickHouse is called with `readonly=1`.
+Secret-backed tools should only be added deliberately, with the understanding that any credential or
+capability available to a CLI is also available to arbitrary Bash inside the agent container.
 
 Written tests that do not call live agents run with the normal suite:
 
@@ -436,9 +448,9 @@ AGENT_MODEL=gpt-5.3-codex \
 uv run pytest tests/test_agent_runner_live.py -q
 ```
 
-The first live test verifies the image has both CLIs and no Docker socket. The second starts a real
-one-off agent container and verifies it can return schema-conforming JSON through the subscription
-login.
+The live tests verify the image has both CLIs and no Docker socket, start real one-off agent
+containers through the subscription login, and check that the built-in ClickHouse CLI can reach a
+host-owned read-only proxy without receiving the raw ClickHouse URL.
 
 ## ClickHouse Tables
 

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import subprocess
 
+from personal_data_warehouse.agent_resource import AgentResource
 from personal_data_warehouse.agent_runner import (
     AgentContainerConfig,
-    AgentResource,
     AgentRunRequest,
     AgentRunResult,
     AgentRunEvent,
@@ -19,6 +20,8 @@ from personal_data_warehouse.agent_runner import (
     volume_copy_command,
     write_builtin_cli_tools,
 )
+from personal_data_warehouse.agent_tool_proxy import run_agent_tool_proxy
+from personal_data_warehouse.clickhouse_readonly import ClickHouseReadOnlyService, RawResult
 from personal_data_warehouse.config import load_settings
 
 
@@ -45,8 +48,12 @@ def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> N
     assert "--read-only" in command
     assert "OPENAI_API_KEY" not in " ".join(command)
     assert "ANTHROPIC_API_KEY" not in " ".join(command)
+    assert "CLICKHOUSE_URL" not in " ".join(command)
     assert "type=volume,src=pdw-agent-auth,dst=/agent-auth" in command
     assert "type=volume,src=pdw-agent-runs,dst=/agent-runs" in command
+    assert "--add-host" in command
+    assert "host.docker.internal:host-gateway" in command
+    assert any(item.endswith("/tools/pdw-clickhouse-query") for item in command if item.startswith("PDW_CLICKHOUSE_QUERY="))
 
 
 def test_container_agent_runner_writes_prompt_schema_and_parses_final_json(tmp_path) -> None:
@@ -74,7 +81,42 @@ def test_container_agent_runner_writes_prompt_schema_and_parses_final_json(tmp_p
     assert result.final_output_json == {"meeting_title": "Done"}
     assert result.events[0].event_type == "agent_message"
     assert (tmp_path / "run-1" / "tools" / "pdw-validate-json").exists()
+    assert (tmp_path / "run-1" / "tools" / "pdw-clickhouse-query").exists()
+    assert (tmp_path / "run-1" / "tools" / "pdw-clickhouse-schema").exists()
     assert (tmp_path / "run-1" / "TOOLS.md").exists()
+
+
+def test_container_agent_runner_can_inject_clickhouse_proxy_without_raw_url(tmp_path) -> None:
+    volume_copy_calls = 0
+    agent_command = []
+
+    def fake_run(command, **kwargs):
+        nonlocal volume_copy_calls, agent_command
+        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+            volume_copy_calls += 1
+            if volume_copy_calls == 2:
+                (tmp_path / "run-1" / "final.json").write_text('{"ok":true}', encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        agent_command = command
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    config = AgentContainerConfig(
+        image="pdw-agent:latest",
+        runs_dir=tmp_path,
+        tool_proxy_bind_host="127.0.0.1",
+        tool_proxy_public_host="127.0.0.1",
+    )
+    result = ContainerAgentRunner(config, runner=fake_run).run_with_clickhouse(
+        AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1"),
+        warehouse=object(),
+    )
+
+    joined = " ".join(agent_command)
+    assert result.status == "completed"
+    assert "PDW_AGENT_TOOL_PROXY_URL=http://127.0.0.1:" in joined
+    assert "PDW_AGENT_TOOL_PROXY_TOKEN=" in joined
+    assert "PDW_CLICKHOUSE_QUERY=" in joined
+    assert "CLICKHOUSE_URL" not in joined
 
 
 def test_volume_copy_command_copies_run_files_without_socket(tmp_path) -> None:
@@ -115,6 +157,23 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
                 event_json={"type": "mcp_tool_call", "tool_name": "query", "arguments": {"sql": "SELECT 1"}},
                 text="{}",
                 created_at=now,
+            ),
+            AgentRunEvent(
+                event_index=1,
+                stream="stdout",
+                event_type="item.completed",
+                event_json={
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": '/bin/bash -lc "$PDW_CLICKHOUSE_QUERY SELECT 1"',
+                        "aggregated_output": '{"csv":"1\\n1"}',
+                        "exit_code": 0,
+                        "status": "completed",
+                    },
+                },
+                text="{}",
+                created_at=now,
             )
         ],
     )
@@ -122,8 +181,9 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
     assert agent_run_row(result)["final_output_json"] == '{"ok":true}'
     assert agent_run_event_rows(result)[0]["event_type"] == "mcp_tool_call"
     tool_rows = agent_run_tool_call_rows(result)
-    assert tool_rows[0]["tool_name"] == "query"
+    assert [row["tool_name"] for row in tool_rows] == ["query", "pdw-clickhouse-query"]
     assert tool_rows[0]["arguments_json"] == '{"sql":"SELECT 1"}'
+    assert "PDW_CLICKHOUSE_QUERY" in tool_rows[1]["arguments_json"]
 
 
 def test_auth_command_uses_subscription_volume_without_api_keys() -> None:
@@ -149,6 +209,7 @@ def test_agent_entrypoint_skips_codex_git_repo_check() -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" in entrypoint
     assert "shell_environment_policy.inherit=all" in entrypoint
     assert 'export PATH="$tools_dir:$PATH"' in entrypoint
+    assert '< "$prompt_path"' in entrypoint
 
 
 def test_builtin_cli_tools_validate_json(tmp_path) -> None:
@@ -180,6 +241,50 @@ def test_builtin_cli_tools_validate_json(tmp_path) -> None:
 
     assert completed.returncode == 0
     assert completed.stdout.strip() == "ok"
+
+
+def test_builtin_cli_tools_query_clickhouse_proxy(tmp_path) -> None:
+    class FakeRunner:
+        def query(self, sql, *, max_rows):
+            assert max_rows == 3
+            return RawResult(columns=["answer"], rows=[{"answer": 42}])
+
+    write_builtin_cli_tools(tmp_path)
+    service = ClickHouseReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
+    with run_agent_tool_proxy(query_service=service, bind_host="127.0.0.1", public_host="127.0.0.1") as env:
+        completed = subprocess.run(
+            [str(tmp_path / "tools" / "pdw-clickhouse-query"), "SELECT 42 AS answer"],
+            env={**env, "PATH": os.environ.get("PATH", "")},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["csv"] == "answer\n42"
+    assert payload["error"] == ""
+
+
+def test_builtin_cli_tools_reject_write_queries_through_proxy(tmp_path) -> None:
+    class FakeRunner:
+        def query(self, sql, *, max_rows):
+            raise AssertionError("write query should be rejected before runner")
+
+    write_builtin_cli_tools(tmp_path)
+    service = ClickHouseReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
+    with run_agent_tool_proxy(query_service=service, bind_host="127.0.0.1", public_host="127.0.0.1") as env:
+        completed = subprocess.run(
+            [str(tmp_path / "tools" / "pdw-clickhouse-query"), "DROP TABLE voice_memo_enrichments"],
+            env={**env, "PATH": os.environ.get("PATH", "")},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert "read-only" in payload["error"]
 
 
 def test_builtin_cli_tools_reject_invalid_json_shape(tmp_path) -> None:
@@ -216,6 +321,7 @@ def test_load_settings_reads_agent_config_without_api_keys(monkeypatch) -> None:
     monkeypatch.setenv("AGENT_DOCKER_IMAGE", "pdw-agent:latest")
     monkeypatch.setenv("AGENT_PROVIDER", "claude")
     monkeypatch.setenv("AGENT_MODEL", "claude-test")
+    monkeypatch.setenv("AGENT_TOOL_PROXY_PUBLIC_HOST", "dagster")
 
     settings = load_settings(require_clickhouse=False, require_gmail=False, require_agent=True)
 
@@ -223,6 +329,7 @@ def test_load_settings_reads_agent_config_without_api_keys(monkeypatch) -> None:
     assert settings.agent.provider == "claude"
     assert settings.agent.model == "claude-test"
     assert settings.agent.docker_image == "pdw-agent:latest"
+    assert settings.agent.tool_proxy_public_host == "dagster"
 
 
 def test_agent_resource_builds_container_config() -> None:
@@ -234,6 +341,7 @@ def test_agent_resource_builds_container_config() -> None:
         runs_volume="runs-vol",
         runs_dir="/tmp/runs",
         timeout_seconds=123,
+        tool_proxy_public_host="dagster",
     )
 
     config = resource.container_config()
@@ -245,3 +353,16 @@ def test_agent_resource_builds_container_config() -> None:
     assert config.runs_volume == "runs-vol"
     assert str(config.runs_dir) == "/tmp/runs"
     assert config.timeout_seconds == 123
+    assert config.tool_proxy_public_host == "dagster"
+
+
+def test_agent_resource_disabled_fails_with_clear_error() -> None:
+    resource = AgentResource.disabled()
+
+    assert resource.is_configured is False
+    try:
+        resource.container_config()
+    except RuntimeError as exc:
+        assert "AGENT_DOCKER_IMAGE" in str(exc)
+    else:
+        raise AssertionError("disabled AgentResource should not build a container config")

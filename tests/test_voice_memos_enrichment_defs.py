@@ -6,11 +6,9 @@ from personal_data_warehouse.defs.calendar_sync import calendar_event_sync
 from personal_data_warehouse.defs import voice_memos_enrichment as voice_memos_enrichment_defs
 from personal_data_warehouse.defs.voice_memos_drive_ingest import voice_memos_drive_ingest
 from personal_data_warehouse.defs.voice_memos_enrichment import (
-    DEFAULT_AGENT_RESOURCE,
     DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE,
-    DEFAULT_VOICE_MEMOS_ENRICHMENT_BACKEND,
+    UNCONFIGURED_AGENT_RESOURCE,
     voice_memos_enrichment,
-    voice_memos_enrichment_backend,
     voice_memos_enrichment_job,
     voice_memos_enrichment_hourly,
     voice_memos_enrichment_model,
@@ -32,23 +30,28 @@ def test_voice_memos_enrichment_job_selects_asset() -> None:
 def test_voice_memos_enrichment_defaults_to_all_recent_transcripts() -> None:
     assert DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE == 0
     assert DEFAULT_ENRICHMENT_LOOKBACK_WEEKS == 12
-    assert DEFAULT_VOICE_MEMOS_ENRICHMENT_BACKEND == "openai_responses"
 
 
-def test_voice_memos_enrichment_backend_can_use_agent(monkeypatch) -> None:
-    monkeypatch.setenv("VOICE_MEMOS_ENRICHMENT_BACKEND", "agent")
+def test_voice_memos_enrichment_uses_agent_provider_model_and_prompt() -> None:
     settings = FakeSettings()
-    settings.agent = type("FakeAgentConfig", (), {"provider": "codex", "model": "gpt-agent"})()
 
-    assert voice_memos_enrichment_backend() == "agent"
     assert voice_memos_enrichment_provider(settings) == "agent_codex"
     assert voice_memos_enrichment_model(settings) == "gpt-agent"
     assert voice_memos_enrichment_prompt_version() == AGENT_ENRICHMENT_PROMPT_VERSION
 
 
-def test_voice_memos_defs_provides_default_agent_resource(monkeypatch) -> None:
-    monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_BACKEND", raising=False)
+def test_voice_memos_enrichment_client_uses_configured_agent_over_unconfigured_resource() -> None:
+    client = voice_memos_enrichment_defs.voice_memos_enrichment_client(
+        settings=FakeSettings(),
+        warehouse=object(),
+        logger=None,
+        agent=UNCONFIGURED_AGENT_RESOURCE,
+    )
 
+    assert client._agent.docker_image == "pdw-agent:latest"
+
+
+def test_voice_memos_defs_provides_default_agent_resource() -> None:
     repository = defs().get_repository_def()
 
     assert "agent" in repository.get_top_level_resources()
@@ -69,7 +72,7 @@ def test_voice_memos_enrichment_job_selects_full_upstream_lineage() -> None:
             voice_memos_transcription,
             voice_memos_enrichment,
         ],
-        resources={"agent": DEFAULT_AGENT_RESOURCE},
+        resources={"agent": UNCONFIGURED_AGENT_RESOURCE},
     ).get_repository_def()
 
     assert voice_memos_enrichment_job.selection.resolve(repository.asset_graph) == {
@@ -94,10 +97,11 @@ def test_voice_memos_enrichment_backlog_sensor_runs_every_minute() -> None:
 
 def test_voice_memos_enrichment_backlog_sensor_skips_when_backlog_is_empty(monkeypatch) -> None:
     calls = []
+    settings_calls = []
     monkeypatch.setattr(
         voice_memos_enrichment_defs,
         "load_settings",
-        lambda **_kwargs: FakeSettings(),
+        lambda **kwargs: settings_calls.append(kwargs) or FakeSettings(),
     )
     monkeypatch.setattr(
         voice_memos_enrichment_defs,
@@ -117,8 +121,9 @@ def test_voice_memos_enrichment_backlog_sensor_skips_when_backlog_is_empty(monke
 
     assert isinstance(result, SkipReason)
     assert "No unenriched Voice Memos" in result.skip_message
+    assert settings_calls[0]["require_agent"] is True
     assert calls[0][1]["limit"] == 1
-    assert calls[0][1]["model"] == "gpt-test"
+    assert calls[0][1]["model"] == "gpt-agent"
 
 
 def test_voice_memos_enrichment_backlog_sensor_launches_when_backlog_exists(monkeypatch) -> None:
@@ -149,4 +154,22 @@ def test_voice_memos_enrichment_backlog_sensor_launches_when_backlog_exists(monk
 
 class FakeSettings:
     clickhouse_url = "clickhouse://example"
-    openai = type("FakeOpenAIConfig", (), {"model": "gpt-test"})()
+    agent = type(
+        "FakeAgentConfig",
+        (),
+        {
+            "provider": "codex",
+            "model": "gpt-agent",
+            "docker_image": "pdw-agent:latest",
+            "auth_volume": "auth-vol",
+            "runs_volume": "runs-vol",
+            "runs_dir": "/tmp/runs",
+            "docker_network": "bridge",
+            "docker_memory": "4g",
+            "docker_cpus": "2",
+            "docker_pids_limit": 512,
+            "timeout_seconds": 1800,
+            "tool_proxy_bind_host": "127.0.0.1",
+            "tool_proxy_public_host": "127.0.0.1",
+        },
+    )()

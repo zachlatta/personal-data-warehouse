@@ -31,10 +31,6 @@ DEFAULT_ASSEMBLYAI_POLL_INTERVAL_SECONDS = 5
 DEFAULT_ASSEMBLYAI_TIMEOUT_SECONDS = 1800
 DEFAULT_ASSEMBLYAI_MIN_SPEAKERS_EXPECTED = 1
 DEFAULT_ASSEMBLYAI_MAX_SPEAKERS_EXPECTED = 8
-DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
-DEFAULT_OPENAI_MODEL = "gpt-5.3-codex"
-DEFAULT_OPENAI_TIMEOUT_SECONDS = 1800
-DEFAULT_OPENAI_REASONING_EFFORT = "high"
 DEFAULT_AGENT_PROVIDER = "codex"
 DEFAULT_AGENT_AUTH_VOLUME = "pdw-agent-auth"
 DEFAULT_AGENT_RUNS_VOLUME = "pdw-agent-runs"
@@ -44,6 +40,8 @@ DEFAULT_AGENT_DOCKER_NETWORK = "bridge"
 DEFAULT_AGENT_DOCKER_MEMORY = "4g"
 DEFAULT_AGENT_DOCKER_CPUS = "2"
 DEFAULT_AGENT_DOCKER_PIDS_LIMIT = 512
+DEFAULT_AGENT_TOOL_PROXY_BIND_HOST = "0.0.0.0"
+DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST = "host.docker.internal"
 
 
 def _parse_csv_env(value: str | None) -> tuple[str, ...]:
@@ -127,15 +125,6 @@ class AssemblyAIConfig:
 
 
 @dataclass(frozen=True)
-class OpenAIConfig:
-    api_key: str
-    base_url: str = DEFAULT_OPENAI_BASE_URL
-    model: str = DEFAULT_OPENAI_MODEL
-    timeout_seconds: int = DEFAULT_OPENAI_TIMEOUT_SECONDS
-    reasoning_effort: str | None = DEFAULT_OPENAI_REASONING_EFFORT
-
-
-@dataclass(frozen=True)
 class AgentConfig:
     provider: str
     model: str
@@ -148,6 +137,8 @@ class AgentConfig:
     docker_memory: str = DEFAULT_AGENT_DOCKER_MEMORY
     docker_cpus: str = DEFAULT_AGENT_DOCKER_CPUS
     docker_pids_limit: int = DEFAULT_AGENT_DOCKER_PIDS_LIMIT
+    tool_proxy_bind_host: str = DEFAULT_AGENT_TOOL_PROXY_BIND_HOST
+    tool_proxy_public_host: str = DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST
 
 
 @dataclass(frozen=True)
@@ -183,7 +174,6 @@ class Settings:
     google_oauth_client_secrets_json_by_domain: tuple[tuple[str, str], ...] = ()
     voice_memos: VoiceMemosConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
-    openai: OpenAIConfig | None = None
     agent: AgentConfig | None = None
 
     def account_for_email(self, email_address: str) -> GmailAccount:
@@ -223,7 +213,6 @@ def load_settings(
     require_slack: bool = False,
     require_voice_memos: bool = False,
     require_assemblyai: bool = False,
-    require_openai: bool = False,
     require_agent: bool = False,
 ) -> Settings:
     load_dotenv()
@@ -457,22 +446,6 @@ def load_settings(
             max_speakers_expected=assemblyai_max_speakers_expected,
         )
 
-    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    openai: OpenAIConfig | None = None
-    if require_openai or openai_api_key:
-        if not openai_api_key:
-            raise ValueError("OPENAI_API_KEY must be set for Voice Memos enrichment")
-        openai_timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", str(DEFAULT_OPENAI_TIMEOUT_SECONDS)))
-        if openai_timeout_seconds < 1:
-            raise ValueError("OPENAI_TIMEOUT_SECONDS must be at least 1")
-        openai = OpenAIConfig(
-            api_key=openai_api_key,
-            base_url=(os.getenv("OPENAI_BASE_URL") or DEFAULT_OPENAI_BASE_URL).rstrip("/"),
-            model=os.getenv("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
-            timeout_seconds=openai_timeout_seconds,
-            reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT") or DEFAULT_OPENAI_REASONING_EFFORT,
-        )
-
     agent_docker_image = os.getenv("AGENT_DOCKER_IMAGE", "").strip()
     agent: AgentConfig | None = None
     if require_agent or agent_docker_image:
@@ -499,6 +472,8 @@ def load_settings(
             docker_memory=os.getenv("AGENT_DOCKER_MEMORY", DEFAULT_AGENT_DOCKER_MEMORY),
             docker_cpus=os.getenv("AGENT_DOCKER_CPUS", DEFAULT_AGENT_DOCKER_CPUS),
             docker_pids_limit=agent_pids_limit,
+            tool_proxy_bind_host=os.getenv("AGENT_TOOL_PROXY_BIND_HOST", DEFAULT_AGENT_TOOL_PROXY_BIND_HOST),
+            tool_proxy_public_host=os.getenv("AGENT_TOOL_PROXY_PUBLIC_HOST", DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST),
         )
 
     google_scopes = [GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE]
@@ -547,6 +522,5 @@ def load_settings(
         slack_force_full_sync=_parse_bool_env(os.getenv("SLACK_FORCE_FULL_SYNC"), False),
         voice_memos=voice_memos,
         assemblyai=assemblyai,
-        openai=openai,
         agent=agent,
     )

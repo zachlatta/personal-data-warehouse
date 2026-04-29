@@ -27,14 +27,12 @@ if [ ! -f "$schema_path" ]; then
   exit 2
 fi
 
-prompt="$(cat "$prompt_path")"
-
 case "$provider" in
   codex)
     if [ -n "$model" ]; then
-      codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c shell_environment_policy.inherit=all --model "$model" --output-last-message "$final_message_path" --output-schema "$schema_path" "$prompt"
+      codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c shell_environment_policy.inherit=all --model "$model" --output-last-message "$final_message_path" --output-schema "$schema_path" - < "$prompt_path"
     else
-      codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c shell_environment_policy.inherit=all --output-last-message "$final_message_path" --output-schema "$schema_path" "$prompt"
+      codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c shell_environment_policy.inherit=all --output-last-message "$final_message_path" --output-schema "$schema_path" - < "$prompt_path"
     fi
     if [ -f "$final_message_path" ]; then
       python3 - "$final_message_path" "$final_json_path" <<'PY'
@@ -56,9 +54,9 @@ PY
     ;;
   claude)
     if [ -n "$model" ]; then
-      claude -p --model "$model" --output-format stream-json --json-schema "$(cat "$schema_path")" "$prompt"
+      claude -p --model "$model" --output-format stream-json --json-schema "$(cat "$schema_path")" < "$prompt_path"
     else
-      claude -p --output-format stream-json --json-schema "$(cat "$schema_path")" "$prompt"
+      claude -p --output-format stream-json --json-schema "$(cat "$schema_path")" < "$prompt_path"
     fi
     ;;
   *)

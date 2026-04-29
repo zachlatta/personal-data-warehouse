@@ -6,33 +6,21 @@ from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
 import json
 import re
-import time
-from typing import Any
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
-import requests
-
 from personal_data_warehouse.agent_runner import (
-    AgentResource,
     AgentRunRequest,
+    AgentRunResult,
     agent_run_event_rows,
     agent_run_row,
     agent_run_tool_call_rows,
 )
 from personal_data_warehouse.clickhouse import _sql_string
-from personal_data_warehouse.clickhouse_readonly import (
-    ClickHouseReadOnlyRunner,
-    ClickHouseReadOnlyService,
-    strip_markdown_code_fence,
-)
 
 
-ENRICHMENT_PROVIDER = "openai"
-ENRICHMENT_PROMPT_VERSION = "voice-memo-enrichment-v20"
-AGENT_ENRICHMENT_PROMPT_VERSION = "voice-memo-enrichment-agent-v1"
-DEFAULT_ENRICHMENT_MAX_TOOL_CALLS = 8
-DEFAULT_ENRICHMENT_MIN_TOOL_CALLS = 3
-DEFAULT_OPENAI_REASONING_EFFORT = "high"
+DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
+AGENT_ENRICHMENT_PROMPT_VERSION = "voice-memo-enrichment-agent-v4"
 DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
 DEFAULT_ENRICHMENT_LOOKBACK_WEEKS = 12
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
@@ -46,290 +34,23 @@ class VoiceMemosEnrichmentSummary:
     recordings_failed: int
 
 
-class OpenAIResponsesClient:
-    def __init__(
+class AgentRunClient(Protocol):
+    def run_with_clickhouse(
         self,
+        request: AgentRunRequest,
         *,
-        api_key: str,
-        model: str,
-        base_url: str = "https://api.openai.com",
-        timeout_seconds: int = 1800,
-        reasoning_effort: str | None = DEFAULT_OPENAI_REASONING_EFFORT,
-        max_response_retries: int = 2,
-        retry_delay_seconds: float = 2.0,
-        session=None,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        self._api_key = api_key
-        self._model = model
-        self._base_url = base_url.rstrip("/")
-        self._timeout_seconds = timeout_seconds
-        self._reasoning_effort = reasoning_effort
-        self._max_response_retries = max_response_retries
-        self._retry_delay_seconds = retry_delay_seconds
-        self._session = session or requests.Session()
-        self._sleep = sleep
-
-    @property
-    def model(self) -> str:
-        return self._model
-
-    def create_structured(self, *, system_prompt: str, user_prompt: str, schema: Mapping[str, Any]) -> Mapping[str, Any]:
-        return self.create_agentic_structured(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            schema=schema,
-            tools=[],
-            tool_executor=lambda _name, _arguments: {},
-            max_tool_calls=0,
-        )
-
-    def create_agentic_structured(
-        self,
-        *,
-        system_prompt: str,
-        user_prompt: str,
-        schema: Mapping[str, Any],
-        tools: Sequence[Mapping[str, Any]],
-        tool_executor: Callable[[str, Mapping[str, Any]], Mapping[str, Any]],
-        max_tool_calls: int = DEFAULT_ENRICHMENT_MAX_TOOL_CALLS,
-        min_tool_calls: int = 0,
-        require_tool_call: bool = False,
-        result_validator: Callable[[Mapping[str, Any]], Sequence[str]] | None = None,
-        max_validation_retries: int = 2,
-        logger=None,
-        recording_id: str = "",
-    ) -> Mapping[str, Any]:
-        conversation: list[Mapping[str, Any]] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        tool_trace: list[dict[str, Any]] = []
-
-        response_index = 0
-        started = time.monotonic()
-        required_tool_retry_sent = False
-        required_tool_calls = max(1 if require_tool_call else 0, min_tool_calls)
-        validation_retries = 0
-        final_only_repair = False
-        while True:
-            response_index += 1
-            if logger:
-                logger.info(
-                    "OpenAI enrichment request %s started for %s; prior_tool_calls=%s input_items=%s",
-                    response_index,
-                    recording_id,
-                    len(tool_trace),
-                    len(conversation),
-                )
-            if final_only_repair:
-                request_tools = []
-            elif len(tool_trace) >= max_tool_calls:
-                request_tools = []
-            else:
-                request_tools = schema_discovery_tools(tools) if required_tool_calls and not tool_trace else tools
-            payload = self._post_response_with_retries(
-                input_items=conversation,
-                schema=schema,
-                tools=request_tools,
-                tool_choice="required" if request_tools and len(tool_trace) < required_tool_calls else None,
-                logger=logger,
-                recording_id=recording_id,
-                response_index=response_index,
-            )
-            calls = response_function_calls(payload)
-            if logger:
-                logger.info(
-                    "OpenAI enrichment request %s finished for %s; function_calls=%s elapsed=%.1fs",
-                    response_index,
-                    recording_id,
-                    len(calls),
-                    time.monotonic() - started,
-            )
-            if not calls:
-                if tools and len(tool_trace) < required_tool_calls:
-                    if required_tool_retry_sent:
-                        raise RuntimeError(
-                            f"OpenAI enrichment returned final output after {len(tool_trace)} tool calls; "
-                            f"{required_tool_calls} required"
-                        )
-                    required_tool_retry_sent = True
-                    conversation.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"You returned final JSON after {len(tool_trace)} warehouse tool calls, but "
-                                f"{required_tool_calls} are required before final output. Use show_schema if you need "
-                                "table/column context, then make focused sql read-only queries to verify calendar, "
-                                "attendee identity, speaker identity, and domain-term evidence. Then return the structured JSON."
-                            ),
-                        }
-                    )
-                    if logger:
-                        logger.warning(
-                            "OpenAI enrichment returned final output for %s before required tool calls; retrying",
-                            recording_id,
-                        )
-                    continue
-                result = json.loads(response_output_text(payload))
-                if tool_trace:
-                    result["__tool_calls"] = tool_trace
-                validation_issues = list(result_validator(result) if result_validator else [])
-                if validation_issues:
-                    result["__validation_issues"] = validation_issues
-                    if validation_retries < max_validation_retries:
-                        validation_retries += 1
-                        final_only_repair = True
-                        conversation.append(
-                            {
-                                "role": "user",
-                                "content": validation_repair_prompt(result=result, issues=validation_issues),
-                            }
-                        )
-                        if logger:
-                            logger.warning(
-                                "OpenAI enrichment final output for %s failed validation; retrying repair %s/%s: %s",
-                                recording_id,
-                                validation_retries,
-                                max_validation_retries,
-                                "; ".join(validation_issues[:5]),
-                            )
-                        continue
-                    if logger:
-                        logger.warning(
-                            "OpenAI enrichment final output for %s still has validation issues after repair: %s",
-                            recording_id,
-                            "; ".join(validation_issues[:5]),
-                        )
-                if logger:
-                    logger.info(
-                        "OpenAI enrichment final structured output ready for %s; total_tool_calls=%s elapsed=%.1fs",
-                        recording_id,
-                        len(tool_trace),
-                        time.monotonic() - started,
-                    )
-                return result
-
-            if len(tool_trace) + len(calls) > max_tool_calls:
-                raise RuntimeError(f"OpenAI enrichment exceeded {max_tool_calls} tool calls")
-
-            conversation.extend(payload.get("output") or [])
-            for call_index, call in enumerate(calls, start=1):
-                name = str(call.get("name", ""))
-                arguments = parse_function_arguments(call.get("arguments"))
-                if logger:
-                    logger.info(
-                        "OpenAI tool call %s.%s for %s: %s %s",
-                        response_index,
-                        call_index,
-                        recording_id,
-                        name,
-                        summarize_tool_arguments(arguments),
-                    )
-                output = tool_executor(name, arguments)
-                if logger:
-                    logger.info(
-                        "OpenAI tool call %s.%s finished for %s: %s",
-                        response_index,
-                        call_index,
-                        recording_id,
-                        summarize_tool_output(output),
-                    )
-                tool_trace.append(
-                    {
-                        "name": name,
-                        "arguments": dict(arguments),
-                        "output": output,
-                    }
-                )
-                conversation.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": str(call.get("call_id", "")),
-                        "output": json.dumps(output, sort_keys=True, default=str),
-                    }
-                )
-
-    def _post_response(
-        self,
-        *,
-        input_items: Sequence[Mapping[str, Any]],
-        schema: Mapping[str, Any],
-        tools: Sequence[Mapping[str, Any]],
-        tool_choice: str | Mapping[str, Any] | None = None,
-    ) -> Mapping[str, Any]:
-        body: dict[str, Any] = {
-            "model": self._model,
-            "input": list(input_items),
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "voice_memo_enrichment",
-                    "strict": True,
-                    "schema": schema,
-                }
-            },
-        }
-        if tools:
-            body["tools"] = list(tools)
-        if self._reasoning_effort:
-            body["reasoning"] = {"effort": self._reasoning_effort}
-        if tool_choice is not None:
-            body["tool_choice"] = tool_choice
-        response = self._session.post(
-            f"{self._base_url}/v1/responses",
-            headers={
-                "authorization": f"Bearer {self._api_key}",
-                "content-type": "application/json",
-            },
-            json=body,
-            timeout=self._timeout_seconds,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def _post_response_with_retries(
-        self,
-        *,
-        input_items: Sequence[Mapping[str, Any]],
-        schema: Mapping[str, Any],
-        tools: Sequence[Mapping[str, Any]],
-        tool_choice: str | Mapping[str, Any] | None = None,
-        logger=None,
-        recording_id: str = "",
-        response_index: int = 0,
-    ) -> Mapping[str, Any]:
-        attempts = self._max_response_retries + 1
-        for attempt in range(1, attempts + 1):
-            try:
-                return self._post_response(
-                    input_items=input_items,
-                    schema=schema,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                )
-            except requests.RequestException as exc:
-                if attempt >= attempts:
-                    raise
-                if logger:
-                    logger.warning(
-                        "OpenAI enrichment request %s attempt %s/%s failed for %s: %s; retrying in %.1fs",
-                        response_index,
-                        attempt,
-                        attempts,
-                        recording_id,
-                        exc,
-                        self._retry_delay_seconds,
-                    )
-                self._sleep(self._retry_delay_seconds)
-        raise RuntimeError("unreachable OpenAI retry state")
+        warehouse,
+        max_rows: int = 50,
+        max_field_chars: int = 3000,
+    ) -> AgentRunResult:
+        ...
 
 
 class ContainerAgentStructuredClient:
     def __init__(
         self,
         *,
-        agent: AgentResource,
+        agent: AgentRunClient,
         provider: str,
         model: str,
         warehouse=None,
@@ -353,7 +74,7 @@ class ContainerAgentStructuredClient:
         schema: Mapping[str, Any],
         tools: Sequence[Mapping[str, Any]],
         tool_executor: Callable[[str, Mapping[str, Any]], Mapping[str, Any]],
-        max_tool_calls: int = DEFAULT_ENRICHMENT_MAX_TOOL_CALLS,
+        max_tool_calls: int = 8,
         min_tool_calls: int = 0,
         require_tool_call: bool = False,
         result_validator: Callable[[Mapping[str, Any]], Sequence[str]] | None = None,
@@ -370,19 +91,27 @@ class ContainerAgentStructuredClient:
             max_tool_calls=max_tool_calls,
             require_tool_call=require_tool_call,
         )
-        result = self._agent.run(
-            AgentRunRequest(
-                prompt=prompt,
-                schema=schema,
-                task_type="voice_memo_enrichment",
-                subject_id=recording_id,
-                provider=self._provider,
-                model=self._model,
-            )
+        request = AgentRunRequest(
+            prompt=prompt,
+            schema=schema,
+            task_type="voice_memo_enrichment",
+            subject_id=recording_id,
+            provider=self._provider,
+            model=self._model,
         )
+        if self._warehouse is not None:
+            result = self._agent.run_with_clickhouse(request, warehouse=self._warehouse)
+        else:
+            result = self._agent.run(request)
         self._record_agent_result(result)
         if result.status != "completed":
             raise RuntimeError(result.error or f"agent run {result.run_id} failed")
+        required_cli_calls = max(min_tool_calls, 1 if require_tool_call else 0)
+        actual_cli_calls = count_clickhouse_cli_calls(result.events)
+        if actual_cli_calls < required_cli_calls:
+            raise RuntimeError(
+                f"agent ran {actual_cli_calls} ClickHouse CLI calls; {required_cli_calls} required before final output"
+            )
 
         output = dict(result.final_output_json)
         validation_issues = list(result_validator(output) if result_validator else [])
@@ -409,21 +138,6 @@ class ContainerAgentStructuredClient:
             self._warehouse.insert_agent_run_tool_calls(tool_call_rows)
 
 
-class ClickHouseEnrichmentTool:
-    def __init__(self, query_service: ClickHouseReadOnlyService) -> None:
-        self._query_service = query_service
-
-    def execute(self, name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
-        if name == "show_schema":
-            result = self._query_service.schema_overview()
-            return result.as_tool_payload()
-        if name != "sql":
-            return {"error": f"unknown tool: {name}"}
-        sql = strip_markdown_code_fence(str(arguments.get("query", arguments.get("sql", ""))))
-        result = self._query_service.execute_one(sql)
-        return result.as_tool_payload()
-
-
 class VoiceMemosEnrichmentRunner:
     def __init__(
         self,
@@ -432,8 +146,8 @@ class VoiceMemosEnrichmentRunner:
         client,
         logger,
         now: Callable[[], datetime] | None = None,
-        provider: str = ENRICHMENT_PROVIDER,
-        prompt_version: str = ENRICHMENT_PROMPT_VERSION,
+        provider: str = DEFAULT_AGENT_ENRICHMENT_PROVIDER,
+        prompt_version: str = AGENT_ENRICHMENT_PROMPT_VERSION,
     ) -> None:
         self._warehouse = warehouse
         self._client = client
@@ -441,13 +155,6 @@ class VoiceMemosEnrichmentRunner:
         self._now = now or (lambda: datetime.now(tz=UTC))
         self._provider = provider
         self._prompt_version = prompt_version
-        self._query_tool = ClickHouseEnrichmentTool(
-            ClickHouseReadOnlyService(
-                ClickHouseReadOnlyRunner(warehouse),
-                max_rows=50,
-                max_field_chars=3000,
-            )
-        )
 
     def sync(self, *, limit: int | None, recorded_after: datetime | None = None) -> VoiceMemosEnrichmentSummary:
         self._warehouse.ensure_voice_memos_tables()
@@ -476,9 +183,9 @@ class VoiceMemosEnrichmentRunner:
                     system_prompt=enrichment_system_prompt(),
                     user_prompt=prompt,
                     schema=enrichment_schema(),
-                    tools=warehouse_tool_definitions(),
-                    tool_executor=self._query_tool.execute,
-                    min_tool_calls=DEFAULT_ENRICHMENT_MIN_TOOL_CALLS,
+                    tools=[],
+                    tool_executor=lambda _name, _arguments: {},
+                    min_tool_calls=3,
                     require_tool_call=True,
                     result_validator=lambda result, recording=recording, transcript_segments=transcript_segments: validate_enrichment_result(
                         recording=recording,
@@ -848,79 +555,6 @@ def unique_names(names: Sequence[str]) -> list[str]:
         seen.add(normalized)
         unique.append(stripped)
     return unique
-
-
-def warehouse_tool_definitions() -> list[dict[str, Any]]:
-    return [sql_tool_definition(), show_schema_tool_definition()]
-
-
-def schema_discovery_tools(tools: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    schema_tools = [tool for tool in tools if tool.get("name") == "show_schema"]
-    return schema_tools or list(tools)
-
-
-def sql_tool_definition() -> dict[str, Any]:
-    return {
-        "type": "function",
-        "name": "sql",
-        "description": (
-            "Run one read-only ClickHouse SQL query against the personal data warehouse. "
-            "Use this freely to inspect calendar, email, Slack, and related context while enriching the transcript. "
-            "Call show_schema first so your query uses live table and column names. "
-            "Only SELECT, WITH, SHOW, DESCRIBE, DESC, and EXPLAIN statements are accepted."
-        ),
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "A single read-only ClickHouse SQL statement.",
-                }
-            },
-            "required": ["query"],
-        },
-    }
-
-
-def show_schema_tool_definition() -> dict[str, Any]:
-    return {
-        "type": "function",
-        "name": "show_schema",
-        "description": (
-            "Return a compact ClickHouse schema overview for the current database. "
-            "The overview uses currentDatabase(), SHOW TABLES, DESCRIBE TABLE, and up to three sampled rows per table. "
-            "Sample cell values are truncated to keep the result compact. Use this before SQL when table or column names are unclear."
-        ),
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {},
-        },
-    }
-
-
-def validation_repair_prompt(*, result: Mapping[str, Any], issues: Sequence[str]) -> str:
-    return json.dumps(
-        {
-            "task": "Repair the previous structured JSON so it passes validation. Return corrected structured JSON only.",
-            "validation_issues": list(issues),
-            "repair_rules": [
-                "Do not use tools in this repair turn; use the transcript, diarized_segments, tool evidence, and previous draft already in context.",
-                "Preserve the transcript as a transcript. Do not summarize, omit substantive turns, or compress long turns into notes.",
-                f"For long recordings, corrected_transcript may be exactly {LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL}; local code will assemble the detailed transcript from diarized_segments.",
-                "Format corrected_transcript with one speaker turn per line or paragraph. Never put multiple 'Name:' speaker turns in one paragraph.",
-                "Use full names from speaker_map as corrected_transcript prefixes for resolved people.",
-                "Do not leave attendees or resolved speakers as one-token names when the existing evidence contains a fuller name.",
-                "If the previous tool evidence only supports a one-token attendee name, explain the uncertainty in evidence and prefer the fuller candidate name found in Gmail/calendar context.",
-                "If a diarization label is mixed, corrected_transcript can use turn-level attribution, but uncertain turns should use the mixed/unresolved speaker name from speaker_map.",
-                "Keep meeting_notes and summary concise, but keep corrected_transcript faithful and detailed.",
-            ],
-            "previous_result": result,
-        },
-        sort_keys=True,
-        default=str,
-    )
 
 
 def validate_enrichment_result(
@@ -1327,9 +961,10 @@ def container_agent_prompt(
                 "You are running as a one-off CLI agent inside an isolated Docker container.",
                 "The final answer must be valid JSON matching final_output_contract.schema.",
                 "Use Bash freely for local scratch scripts and deterministic CLI helpers in the run workspace.",
-                "Run pdw-tool-help to see the local CLI tools available on PATH.",
-                "Before final output, you may write candidate JSON to a file and run pdw-validate-json candidate.json \"$AGENT_SCHEMA_PATH\".",
-                "These local CLI tools do not have production credentials. Use the preloaded recording, calendar_candidates, identity_hints, transcript, and diarized_segments in user_prompt unless a future run provides explicit credential-backed tools.",
+                "Run \"$PDW_TOOL_HELP\" to see the local CLI tools available in this run.",
+                "Use \"$PDW_CLICKHOUSE_SCHEMA\" and \"$PDW_CLICKHOUSE_QUERY\" for read-only warehouse research. These call a short-lived proxy; the raw ClickHouse URL is not available in the container.",
+                "Before final output, you may write candidate JSON to a file and run \"$PDW_VALIDATE_JSON\" candidate.json \"$AGENT_SCHEMA_PATH\".",
+                "These local CLI tools are the only supported tool interface inside the agent container.",
             ],
             "tool_expectations": {
                 "tool_names": [str(tool.get("name", "")) for tool in tools if isinstance(tool, Mapping)],
@@ -1341,6 +976,17 @@ def container_agent_prompt(
         sort_keys=True,
         default=str,
     )
+
+
+def count_clickhouse_cli_calls(events: Sequence[Any]) -> int:
+    count = 0
+    for event in events:
+        text = str(getattr(event, "text", ""))
+        if "PDW_CLICKHOUSE_QUERY" in text or "pdw-clickhouse-query" in text:
+            count += 1
+        if "PDW_CLICKHOUSE_SCHEMA" in text or "pdw-clickhouse-schema" in text:
+            count += 1
+    return count
 
 
 def enrichment_user_prompt(
@@ -1374,12 +1020,12 @@ def enrichment_user_prompt(
             "transcript": transcript,
             "diarized_segments": list(transcript_segments),
             "instructions": [
-                "Before final output, call show_schema first, then use multiple focused sql tool calls to search calendar, email, Slack, and related warehouse context.",
+                "Before final output, run \"$PDW_CLICKHOUSE_SCHEMA\" first, then use multiple focused \"$PDW_CLICKHOUSE_QUERY\" calls to search calendar, email, Slack, and related warehouse context.",
                 "Make separate warehouse checks for: the selected calendar event including attendee data, attendee/person identity evidence, and suspicious domain terms or organizations that need spelling verification.",
                 "Hard requirements: accurate meeting date/time, accurate attendees and name spellings, and accurate domain terms in corrected_transcript.",
                 "attendees means actual meeting participants who speak or are strongly evidenced as present. Do not include calendar invitees merely because they were invited, especially if responseStatus is needsAction and there is no transcript evidence they attended.",
                 "If you select a calendar event, meeting_start_at, meeting_end_at, and meeting_location must come from that calendar event or verified ClickHouse context.",
-                "Do not leave attendees as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, use show_schema results to query Slack/email identity data before finalizing attendees or speaker_map.",
+                "Do not leave attendees as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, use \"$PDW_CLICKHOUSE_SCHEMA\" results to query Slack/email identity data before finalizing attendees or speaker_map.",
                 "Do not stop at a one-token name like a Slack display_name or calendar first name. Search Gmail/calendar/Slack context around the event title, email local part, usernames, candidate briefs, and prior messages until you find a full preferred/legal name or have clear evidence none is available.",
                 "When a speaker is identified only by a first name, use calendar attendee emails plus Slack/email identity evidence to resolve the full name.",
                 "Calendar candidates may include identity_hints for attendee emails. Use possible_names from identity_hints for attendee and speaker names when supported by transcript evidence.",
@@ -1420,7 +1066,7 @@ def enrichment_user_prompt(
             "clickhouse_context": {
                 "result_format": "Tool results are CSV with truncation metadata.",
                 "query_notes": [
-                    "Use show_schema output to identify table names, column names, and whether fields are scalar or arrays before writing sql.",
+                    "Use \"$PDW_CLICKHOUSE_SCHEMA\" output to identify table names, column names, and whether fields are scalar or arrays before writing SQL.",
                     "For array columns, use array functions such as arrayExists instead of scalar string functions.",
                     "Compare DateTime columns with toDateTime64('YYYY-MM-DD HH:MM:SS', 3, 'UTC') or a range; do not compare DateTime columns to ISO strings with timezone suffixes.",
                     "Do not add FORMAT clauses; the tool already returns CSV.",
@@ -1748,55 +1394,3 @@ def parseable_model_datetime(value: str) -> bool:
     except ValueError:
         return False
     return True
-
-
-def response_output_text(payload: Mapping[str, Any]) -> str:
-    if text := payload.get("output_text"):
-        return str(text)
-    for item in payload.get("output", []) or []:
-        if not isinstance(item, Mapping):
-            continue
-        for content in item.get("content", []) or []:
-            if isinstance(content, Mapping) and content.get("type") in {"output_text", "text"}:
-                if "text" in content:
-                    return str(content["text"])
-    raise RuntimeError("OpenAI response did not contain output text")
-
-
-def response_function_calls(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    calls: list[Mapping[str, Any]] = []
-    for item in payload.get("output", []) or []:
-        if isinstance(item, Mapping) and item.get("type") == "function_call":
-            calls.append(item)
-    return calls
-
-
-def parse_function_arguments(value: Any) -> Mapping[str, Any]:
-    if isinstance(value, Mapping):
-        return value
-    if value in (None, ""):
-        return {}
-    try:
-        parsed = json.loads(str(value))
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, Mapping) else {}
-
-
-def summarize_tool_arguments(arguments: Mapping[str, Any]) -> str:
-    if sql := (arguments.get("query") or arguments.get("sql")):
-        compact = " ".join(str(sql).split())
-        return f"sql={compact[:240]}"
-    return json.dumps(dict(arguments), sort_keys=True, default=str)[:240]
-
-
-def summarize_tool_output(output: Mapping[str, Any]) -> str:
-    if error := output.get("error"):
-        return f"error={str(error)[:240]}"
-    csv_text = str(output.get("csv", ""))
-    rows = max(0, len(csv_text.splitlines()) - 1) if csv_text else 0
-    truncated = output.get("truncated") if isinstance(output.get("truncated"), Mapping) else {}
-    return (
-        f"rows={rows} truncated_rows={bool(truncated.get('rows'))} "
-        f"truncated_fields={len(truncated.get('fields') or [])}"
-    )

@@ -14,7 +14,8 @@ import subprocess
 import uuid
 from typing import Any
 
-from dagster import ConfigurableResource
+from personal_data_warehouse.agent_tool_proxy import run_agent_tool_proxy
+from personal_data_warehouse.clickhouse_readonly import ClickHouseReadOnlyRunner, ClickHouseReadOnlyService
 
 
 DEFAULT_AGENT_AUTH_VOLUME = "pdw-agent-auth"
@@ -43,6 +44,8 @@ class AgentContainerConfig:
     cpus: str = DEFAULT_AGENT_CPUS
     pids_limit: int = DEFAULT_AGENT_PIDS_LIMIT
     timeout_seconds: int = 1800
+    tool_proxy_bind_host: str = "0.0.0.0"
+    tool_proxy_public_host: str = "host.docker.internal"
 
     @property
     def normalized_provider(self) -> str:
@@ -61,6 +64,7 @@ class AgentRunRequest:
     run_id: str = field(default_factory=lambda: f"agent-{uuid.uuid4().hex}")
     provider: str | None = None
     model: str | None = None
+    extra_env: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def input_sha256(self) -> str:
@@ -77,6 +81,18 @@ class AgentRunRequest:
             default=str,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def with_extra_env(self, env: Mapping[str, str]) -> AgentRunRequest:
+        return AgentRunRequest(
+            prompt=self.prompt,
+            schema=self.schema,
+            task_type=self.task_type,
+            subject_id=self.subject_id,
+            run_id=self.run_id,
+            provider=self.provider,
+            model=self.model,
+            extra_env={**dict(self.extra_env), **dict(env)},
+        )
 
 
 @dataclass(frozen=True)
@@ -172,6 +188,26 @@ class ContainerAgentRunner:
             events=events,
         )
 
+    def run_with_clickhouse(
+        self,
+        request: AgentRunRequest,
+        *,
+        warehouse,
+        max_rows: int = 50,
+        max_field_chars: int = 3000,
+    ) -> AgentRunResult:
+        query_service = ClickHouseReadOnlyService(
+            ClickHouseReadOnlyRunner(warehouse),
+            max_rows=max_rows,
+            max_field_chars=max_field_chars,
+        )
+        with run_agent_tool_proxy(
+            query_service=query_service,
+            bind_host=self._config.tool_proxy_bind_host,
+            public_host=self._config.tool_proxy_public_host,
+        ) as tool_env:
+            return self.run(request.with_extra_env(tool_env))
+
     def _sync_run_dir_to_volume(self, run_id: str, run_dir: Path) -> None:
         self._runner(
             volume_copy_command(
@@ -243,12 +279,22 @@ class ContainerAgentRunner:
             "--env",
             f"AGENT_TOOL_MANIFEST_PATH={container_run_dir}/{DEFAULT_AGENT_TOOL_MANIFEST_NAME}",
             "--env",
+            f"PDW_TOOL_HELP={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-tool-help",
+            "--env",
+            f"PDW_VALIDATE_JSON={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-validate-json",
+            "--env",
+            f"PDW_CLICKHOUSE_SCHEMA={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-clickhouse-schema",
+            "--env",
+            f"PDW_CLICKHOUSE_QUERY={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-clickhouse-query",
+            "--env",
             f"CODEX_HOME={DEFAULT_AGENT_CONTAINER_AUTH_DIR}/codex",
             "--env",
             f"CLAUDE_CONFIG_DIR={DEFAULT_AGENT_CONTAINER_AUTH_DIR}/claude",
             "--env",
             "HOME=/tmp/agent-home",
         ]
+        for key, value in sorted(request.extra_env.items()):
+            env.extend(["--env", f"{key}={value}"])
         return [
             "docker",
             "run",
@@ -259,6 +305,8 @@ class ContainerAgentRunner:
             container_run_dir,
             "--network",
             self._config.network,
+            "--add-host",
+            "host.docker.internal:host-gateway",
             "--memory",
             self._config.memory,
             "--cpus",
@@ -281,52 +329,6 @@ class ContainerAgentRunner:
             *env,
             self._config.image,
         ]
-
-
-class AgentResource(ConfigurableResource):
-    provider: str = "codex"
-    model: str = ""
-    docker_image: str
-    auth_volume: str = DEFAULT_AGENT_AUTH_VOLUME
-    runs_volume: str = DEFAULT_AGENT_RUNS_VOLUME
-    runs_dir: str = DEFAULT_AGENT_RUNS_DIR
-    network: str = DEFAULT_AGENT_NETWORK
-    memory: str = DEFAULT_AGENT_MEMORY
-    cpus: str = DEFAULT_AGENT_CPUS
-    pids_limit: int = DEFAULT_AGENT_PIDS_LIMIT
-    timeout_seconds: int = 1800
-
-    def container_config(self) -> AgentContainerConfig:
-        return AgentContainerConfig(
-            image=self.docker_image,
-            provider=self.provider,
-            model=self.model,
-            auth_volume=self.auth_volume,
-            runs_volume=self.runs_volume,
-            runs_dir=Path(self.runs_dir),
-            network=self.network,
-            memory=self.memory,
-            cpus=self.cpus,
-            pids_limit=self.pids_limit,
-            timeout_seconds=self.timeout_seconds,
-        )
-
-    def runner(self) -> ContainerAgentRunner:
-        return ContainerAgentRunner(self.container_config())
-
-    def run(self, request: AgentRunRequest) -> AgentRunResult:
-        effective_request = request
-        if request.provider is None or request.model is None:
-            effective_request = AgentRunRequest(
-                prompt=request.prompt,
-                schema=request.schema,
-                task_type=request.task_type,
-                subject_id=request.subject_id,
-                run_id=request.run_id,
-                provider=request.provider or self.provider,
-                model=request.model if request.model is not None else self.model,
-            )
-        return self.runner().run(effective_request)
 
 
 def agent_events_from_streams(*, stdout: str, stderr: str, created_at: datetime) -> list[AgentRunEvent]:
@@ -420,6 +422,16 @@ def agent_run_tool_call_rows(result: AgentRunResult) -> list[dict[str, Any]]:
 
 
 def extract_tool_name(payload: Mapping[str, Any]) -> str:
+    item = payload.get("item")
+    if isinstance(item, Mapping) and item.get("type") == "command_execution":
+        command = str(item.get("command") or "")
+        if "pdw-clickhouse-query" in command or "PDW_CLICKHOUSE_QUERY" in command:
+            return "pdw-clickhouse-query"
+        if "pdw-clickhouse-schema" in command or "PDW_CLICKHOUSE_SCHEMA" in command:
+            return "pdw-clickhouse-schema"
+        if "pdw-validate-json" in command or "PDW_VALIDATE_JSON" in command:
+            return "pdw-validate-json"
+        return "bash"
     for key in ("tool_name", "tool", "name"):
         value = payload.get(key)
         if isinstance(value, str) and value:
@@ -435,6 +447,9 @@ def extract_tool_name(payload: Mapping[str, Any]) -> str:
 
 
 def extract_tool_arguments(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    item = payload.get("item")
+    if isinstance(item, Mapping) and item.get("type") == "command_execution":
+        return {"command": str(item.get("command") or "")}
     value = payload.get("arguments") or payload.get("args") or payload.get("input")
     if isinstance(value, Mapping):
         return value
@@ -449,6 +464,13 @@ def extract_tool_arguments(payload: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def extract_tool_result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    item = payload.get("item")
+    if isinstance(item, Mapping) and item.get("type") == "command_execution":
+        return {
+            "status": str(item.get("status") or ""),
+            "exit_code": item.get("exit_code"),
+            "output": str(item.get("aggregated_output") or ""),
+        }
     value = payload.get("result") or payload.get("output")
     if isinstance(value, Mapping):
         return value
@@ -556,6 +578,14 @@ def write_builtin_cli_tools(run_dir: Path) -> None:
     validate_tool.write_text(PDW_VALIDATE_JSON_SCRIPT, encoding="utf-8")
     validate_tool.chmod(0o755)
 
+    clickhouse_query_tool = tools_dir / "pdw-clickhouse-query"
+    clickhouse_query_tool.write_text(PDW_CLICKHOUSE_QUERY_SCRIPT, encoding="utf-8")
+    clickhouse_query_tool.chmod(0o755)
+
+    clickhouse_schema_tool = tools_dir / "pdw-clickhouse-schema"
+    clickhouse_schema_tool.write_text(PDW_CLICKHOUSE_SCHEMA_SCRIPT, encoding="utf-8")
+    clickhouse_schema_tool.chmod(0o755)
+
     help_tool = tools_dir / "pdw-tool-help"
     help_tool.write_text(PDW_TOOL_HELP_SCRIPT, encoding="utf-8")
     help_tool.chmod(0o755)
@@ -566,11 +596,17 @@ def write_builtin_cli_tools(run_dir: Path) -> None:
 def cli_tool_manifest() -> str:
     return """# Agent CLI Tools
 
-These commands are available on PATH inside the agent container. They are local deterministic helpers and do not have production credentials.
+These commands live in `$AGENT_TOOLS_DIR` inside the agent container. The runner also exports absolute path helpers: `$PDW_TOOL_HELP`, `$PDW_VALIDATE_JSON`, `$PDW_CLICKHOUSE_SCHEMA`, and `$PDW_CLICKHOUSE_QUERY`.
 
 ## pdw-tool-help
 
 Print this tool manifest.
+
+Usage:
+
+```bash
+"$PDW_TOOL_HELP"
+```
 
 ## pdw-validate-json
 
@@ -579,10 +615,25 @@ Validate a JSON file against a simple JSON object schema.
 Usage:
 
 ```bash
-pdw-validate-json candidate.json schema.json
+"$PDW_VALIDATE_JSON" candidate.json schema.json
 ```
 
 Supported schema checks: object root, required keys, additionalProperties=false, and primitive `string`, `number`, `integer`, `boolean`, `array`, and `object` property types.
+
+## pdw-clickhouse-schema
+
+Print a compact read-only ClickHouse schema overview through the per-run tool proxy.
+
+## pdw-clickhouse-query
+
+Run one read-only ClickHouse query through the per-run tool proxy. The raw ClickHouse URL is not available in the agent container.
+
+Usage:
+
+```bash
+"$PDW_CLICKHOUSE_QUERY" "SELECT * FROM calendar_events LIMIT 5"
+cat query.sql | "$PDW_CLICKHOUSE_QUERY"
+```
 """
 
 
@@ -671,6 +722,79 @@ def matches_type(value: Any, expected_type: str) -> bool:
     if expected_type == "null":
         return value is None
     return True
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
+"""
+
+
+PDW_CLICKHOUSE_CLIENT_PY = r'''
+from __future__ import annotations
+
+import json
+import os
+import sys
+from urllib import error, request
+
+
+def proxy_request(path: str, payload: dict[str, object]) -> int:
+    base_url = os.getenv("PDW_AGENT_TOOL_PROXY_URL", "").rstrip("/")
+    token = os.getenv("PDW_AGENT_TOOL_PROXY_TOKEN", "")
+    if not base_url or not token:
+        print("ClickHouse proxy is not configured for this agent run", file=sys.stderr)
+        return 2
+    body = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        f"{base_url}{path}",
+        data=body,
+        headers={
+            "authorization": f"Bearer {token}",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=30) as response:
+            text = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        print(text or str(exc), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"ClickHouse proxy request failed: {exc}", file=sys.stderr)
+        return 1
+    print(text)
+    return 0
+'''
+
+
+PDW_CLICKHOUSE_QUERY_SCRIPT = f"""#!/usr/bin/env python3
+{PDW_CLICKHOUSE_CLIENT_PY}
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) > 2:
+        print("usage: pdw-clickhouse-query [SQL]", file=sys.stderr)
+        return 2
+    sql = argv[1] if len(argv) == 2 else sys.stdin.read()
+    return proxy_request("/query", {{"sql": sql}})
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
+"""
+
+
+PDW_CLICKHOUSE_SCHEMA_SCRIPT = f"""#!/usr/bin/env python3
+{PDW_CLICKHOUSE_CLIENT_PY}
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1:
+        print("usage: pdw-clickhouse-schema", file=sys.stderr)
+        return 2
+    return proxy_request("/schema", {{}})
 
 
 if __name__ == "__main__":

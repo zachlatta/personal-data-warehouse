@@ -2,14 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import requests
-
-from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.voice_memos_enrichment import (
-    ClickHouseEnrichmentTool,
-    ENRICHMENT_PROMPT_VERSION,
+    AGENT_ENRICHMENT_PROMPT_VERSION,
     LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
-    OpenAIResponsesClient,
     apply_segment_preserving_transcript_fallback,
     ensure_recording_level_fields,
     enrichment_row,
@@ -22,293 +17,9 @@ from personal_data_warehouse.voice_memos_enrichment import (
     load_attendee_identity_hints,
     parse_attendee_summaries,
     possible_identity_names_from_text,
-    parse_function_arguments,
     recording_time_interpretations,
-    response_function_calls,
-    response_output_text,
-    show_schema_tool_definition,
-    sql_tool_definition,
-    summarize_tool_arguments,
-    summarize_tool_output,
     validate_enrichment_result,
-    warehouse_tool_definitions,
 )
-
-
-class FakeResponse:
-    def __init__(self, payload) -> None:
-        self._payload = payload
-
-    def raise_for_status(self) -> None:
-        pass
-
-    def json(self):
-        return self._payload
-
-
-class FakeSession:
-    def __init__(self) -> None:
-        self.posts = []
-
-    def post(self, url, **kwargs):
-        self.posts.append((url, kwargs))
-        return FakeResponse(
-            {
-                "output": [
-                    {
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": (
-                                    '{"calendar_event_id":"","calendar_confidence":0,"meeting_title":"Test",'
-                                    '"meeting_start_at":"","meeting_end_at":"","meeting_location":"","attendees":[],'
-                                    '"speaker_map":[],"corrected_transcript":"Speaker A: Hello","meeting_notes":"Notes","summary":"Summary",'
-                                    '"topics":[],"action_items":[],"evidence":[]}'
-                                ),
-                            }
-                        ]
-                    }
-                ]
-            }
-        )
-
-
-class FakeToolCallingSession:
-    def __init__(self) -> None:
-        self.posts = []
-
-    def post(self, url, **kwargs):
-        self.posts.append((url, kwargs))
-        if len(self.posts) == 1:
-            return FakeResponse(
-                {
-                    "output": [
-                        {
-                            "type": "function_call",
-                            "call_id": "call_1",
-                            "name": "sql",
-                            "arguments": '{"query":"SELECT summary FROM calendar_events LIMIT 1"}',
-                        }
-                    ]
-                }
-            )
-        return FakeResponse(
-            {
-                "output": [
-                    {
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": (
-                                    '{"calendar_event_id":"event1","calendar_confidence":0.9,"meeting_title":"Tool Matched",'
-                                    '"meeting_start_at":"2026-04-27T10:00:00+00:00","meeting_end_at":"2026-04-27T11:00:00+00:00",'
-                                    '"meeting_location":"","attendees":[],"speaker_map":[],"corrected_transcript":"Speaker A: Hello",'
-                                    '"meeting_notes":"Notes","summary":"Summary","topics":[],"action_items":[],"evidence":["Used ClickHouse"]}'
-                                ),
-                            }
-                        ]
-                    }
-                ]
-            }
-        )
-
-
-class FakeTransientFailureSession:
-    def __init__(self) -> None:
-        self.posts = []
-
-    def post(self, url, **kwargs):
-        self.posts.append((url, kwargs))
-        if len(self.posts) == 1:
-            raise requests.exceptions.ReadTimeout("temporary timeout")
-        return FakeResponse(
-            {
-                "output": [
-                    {
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": (
-                                    '{"calendar_event_id":"","calendar_confidence":0,"meeting_title":"Retried",'
-                                    '"meeting_start_at":"","meeting_end_at":"","meeting_location":"","attendees":[],'
-                                    '"speaker_map":[],"corrected_transcript":"Speaker A: Hello","meeting_notes":"Notes",'
-                                    '"summary":"Summary","topics":[],"action_items":[],"evidence":[]}'
-                                ),
-                            }
-                        ]
-                    }
-                ]
-            }
-        )
-
-
-class FakeToolRequiredRetrySession:
-    def __init__(self) -> None:
-        self.posts = []
-
-    def post(self, url, **kwargs):
-        self.posts.append((url, kwargs))
-        if len(self.posts) == 1:
-            return FakeResponse(
-                {
-                    "output": [
-                        {
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": (
-                                        '{"calendar_event_id":"","calendar_confidence":0,"meeting_title":"Skipped Tool",'
-                                        '"meeting_start_at":"","meeting_end_at":"","meeting_location":"","attendees":[],'
-                                        '"speaker_map":[],"corrected_transcript":"Speaker A: Hello","meeting_notes":"Notes",'
-                                        '"summary":"Summary","topics":[],"action_items":[],"evidence":[]}'
-                                    ),
-                                }
-                            ]
-                        }
-                    ]
-                }
-            )
-        if len(self.posts) == 2:
-            return FakeResponse(
-                {
-                    "output": [
-                        {
-                            "type": "function_call",
-                            "call_id": "call_1",
-                            "name": "show_schema",
-                            "arguments": "{}",
-                        }
-                    ]
-                }
-            )
-        return FakeResponse(
-            {
-                "output": [
-                    {
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": (
-                                    '{"calendar_event_id":"event1","calendar_confidence":0.9,"meeting_title":"Tool Matched",'
-                                    '"meeting_start_at":"2026-04-27T10:00:00+00:00","meeting_end_at":"2026-04-27T11:00:00+00:00",'
-                                    '"meeting_location":"","attendees":[],"speaker_map":[],"corrected_transcript":"Speaker A: Hello",'
-                                    '"meeting_notes":"Notes","summary":"Summary","topics":[],"action_items":[],"evidence":["Used ClickHouse"]}'
-                                ),
-                            }
-                        ]
-                    }
-                ]
-            }
-        )
-
-
-class FakeMinimumToolCallingSession:
-    def __init__(self) -> None:
-        self.posts = []
-
-    def post(self, url, **kwargs):
-        self.posts.append((url, kwargs))
-        if len(self.posts) in {1, 2}:
-            name = "show_schema" if len(self.posts) == 1 else "sql"
-            arguments = "{}" if name == "show_schema" else '{"query":"SELECT 2"}'
-            return FakeResponse(
-                {
-                    "output": [
-                        {
-                            "type": "function_call",
-                            "call_id": f"call_{len(self.posts)}",
-                            "name": name,
-                            "arguments": arguments,
-                        }
-                    ]
-                }
-            )
-        return FakeResponse(
-            {
-                "output": [
-                    {
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": (
-                                    '{"calendar_event_id":"event1","calendar_confidence":0.9,"meeting_title":"Enough Tools",'
-                                    '"meeting_start_at":"2026-04-27T10:00:00+00:00","meeting_end_at":"2026-04-27T11:00:00+00:00",'
-                                    '"meeting_location":"","attendees":[],"speaker_map":[],"corrected_transcript":"Speaker A: Hello",'
-                                    '"meeting_notes":"Notes","summary":"Summary","topics":[],"action_items":[],"evidence":["Used ClickHouse"]}'
-                                ),
-                            }
-                        ]
-                    }
-                ]
-            }
-        )
-
-
-class FakeValidationRepairSession:
-    def __init__(self) -> None:
-        self.posts = []
-
-    def post(self, url, **kwargs):
-        self.posts.append((url, kwargs))
-        if len(self.posts) == 1:
-            return FakeResponse(
-                {
-                    "output": [
-                        {
-                            "type": "function_call",
-                            "call_id": "call_1",
-                            "name": "show_schema",
-                            "arguments": "{}",
-                        }
-                    ]
-                }
-            )
-        title = "Needs Repair" if len(self.posts) == 2 else "Repaired"
-        transcript = "Alex: Hello." if len(self.posts) == 2 else "Alex Rivera: Hello."
-        return FakeResponse(
-            {
-                "output": [
-                    {
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": (
-                                    '{"calendar_event_id":"event1","calendar_confidence":0.9,'
-                                    f'"meeting_title":"{title}",'
-                                    '"meeting_start_at":"2026-04-27T10:00:00+00:00",'
-                                    '"meeting_end_at":"2026-04-27T11:00:00+00:00",'
-                                    '"meeting_location":"","attendees":["Alex Rivera"],'
-                                    '"speaker_map":[{"speaker_label":"A","speaker_name":"Alex Rivera","confidence":1,"evidence":"test"}],'
-                                    f'"corrected_transcript":"{transcript}",'
-                                    '"meeting_notes":"Notes","summary":"Summary","topics":[],"action_items":[],"evidence":["Used ClickHouse"]}'
-                                ),
-                            }
-                        ]
-                    }
-                ]
-            }
-        )
-
-
-class FakeReadOnlyService:
-    def __init__(self) -> None:
-        self.sql = []
-
-    def execute_one(self, sql):
-        self.sql.append(sql)
-
-        class Result:
-            def as_tool_payload(self):
-                return {"sql": sql, "csv": "summary\nCalendar Match", "error": "", "truncated": {"rows": False, "fields": []}}
-
-        return Result()
-
-    def schema_overview(self):
-        class Result:
-            def as_tool_payload(self):
-                return {"sql": "SHOW TABLES", "csv": "# db.table\n\ncolumn\nvalue", "error": "", "truncated": {"rows": False, "fields": []}}
-
-        return Result()
 
 
 class FakeIdentityWarehouse:
@@ -318,188 +29,6 @@ class FakeIdentityWarehouse:
         if "FROM gmail_messages" in sql:
             return [("system@example.com", "Guest Person accepted their invite", "Guest Person joined")]
         return []
-
-
-def test_load_settings_reads_openai_config(monkeypatch) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_MODEL", "gpt-5.3-codex")
-
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_openai=True)
-
-    assert settings.openai is not None
-    assert settings.openai.api_key == "test-key"
-    assert settings.openai.model == "gpt-5.3-codex"
-    assert settings.openai.reasoning_effort == "high"
-
-
-def test_openai_responses_client_uses_structured_outputs() -> None:
-    session = FakeSession()
-
-    result = OpenAIResponsesClient(api_key="test-key", model="gpt-5.3-codex", session=session).create_structured(
-        system_prompt="system",
-        user_prompt="user",
-        schema=enrichment_schema(),
-    )
-
-    assert result["meeting_title"] == "Test"
-    body = session.posts[0][1]["json"]
-    assert body["model"] == "gpt-5.3-codex"
-    assert body["text"]["format"]["type"] == "json_schema"
-    assert body["text"]["format"]["strict"] is True
-    assert body["reasoning"] == {"effort": "high"}
-
-
-def test_openai_responses_client_executes_function_calls_before_structured_output() -> None:
-    session = FakeToolCallingSession()
-    service = FakeReadOnlyService()
-    tool = ClickHouseEnrichmentTool(service)
-
-    result = OpenAIResponsesClient(api_key="test-key", model="gpt-5.3-codex", session=session).create_agentic_structured(
-        system_prompt="system",
-        user_prompt="user",
-        schema=enrichment_schema(),
-        tools=warehouse_tool_definitions(),
-        tool_executor=tool.execute,
-        max_tool_calls=2,
-    )
-
-    assert result["meeting_title"] == "Tool Matched"
-    assert service.sql == ["SELECT summary FROM calendar_events LIMIT 1"]
-    assert result["__tool_calls"][0]["name"] == "sql"
-    first_body = session.posts[0][1]["json"]
-    second_body = session.posts[1][1]["json"]
-    assert first_body["tools"][0]["name"] == "sql"
-    assert first_body["tools"][1]["name"] == "show_schema"
-    assert "tool_choice" not in first_body
-    assert any(item.get("type") == "function_call_output" for item in second_body["input"])
-
-
-def test_openai_responses_client_retries_transient_request_failures() -> None:
-    session = FakeTransientFailureSession()
-    sleeps = []
-
-    result = OpenAIResponsesClient(
-        api_key="test-key",
-        model="gpt-5.3-codex",
-        session=session,
-        retry_delay_seconds=0.25,
-        sleep=sleeps.append,
-    ).create_structured(
-        system_prompt="system",
-        user_prompt="user",
-        schema=enrichment_schema(),
-    )
-
-    assert result["meeting_title"] == "Retried"
-    assert len(session.posts) == 2
-    assert sleeps == [0.25]
-
-
-def test_openai_responses_client_requires_tool_call_when_requested() -> None:
-    session = FakeToolRequiredRetrySession()
-    service = FakeReadOnlyService()
-    tool = ClickHouseEnrichmentTool(service)
-
-    result = OpenAIResponsesClient(api_key="test-key", model="gpt-5.3-codex", session=session).create_agentic_structured(
-        system_prompt="system",
-        user_prompt="user",
-        schema=enrichment_schema(),
-        tools=warehouse_tool_definitions(),
-        tool_executor=tool.execute,
-        max_tool_calls=2,
-        require_tool_call=True,
-    )
-
-    assert result["meeting_title"] == "Tool Matched"
-    assert service.sql == []
-    assert len(session.posts) == 3
-    assert session.posts[0][1]["json"]["tool_choice"] == "required"
-    assert [tool["name"] for tool in session.posts[0][1]["json"]["tools"]] == ["show_schema"]
-    retry_body = session.posts[1][1]["json"]
-    assert retry_body["tool_choice"] == "required"
-    assert [tool["name"] for tool in retry_body["tools"]] == ["show_schema"]
-    assert "0 warehouse tool calls" in retry_body["input"][-1]["content"]
-    assert "tool_choice" not in session.posts[2][1]["json"]
-
-
-def test_openai_responses_client_can_require_multiple_tool_calls() -> None:
-    session = FakeMinimumToolCallingSession()
-    service = FakeReadOnlyService()
-    tool = ClickHouseEnrichmentTool(service)
-
-    result = OpenAIResponsesClient(api_key="test-key", model="gpt-5.3-codex", session=session).create_agentic_structured(
-        system_prompt="system",
-        user_prompt="user",
-        schema=enrichment_schema(),
-        tools=warehouse_tool_definitions(),
-        tool_executor=tool.execute,
-        min_tool_calls=2,
-        max_tool_calls=3,
-    )
-
-    assert result["meeting_title"] == "Enough Tools"
-    assert service.sql == ["SELECT 2"]
-    assert session.posts[0][1]["json"]["tool_choice"] == "required"
-    assert [tool["name"] for tool in session.posts[0][1]["json"]["tools"]] == ["show_schema"]
-    assert session.posts[1][1]["json"]["tool_choice"] == "required"
-    assert [tool["name"] for tool in session.posts[1][1]["json"]["tools"]] == ["sql", "show_schema"]
-    assert "tool_choice" not in session.posts[2][1]["json"]
-
-
-def test_openai_responses_client_repairs_failed_validation_without_more_tools() -> None:
-    session = FakeValidationRepairSession()
-    service = FakeReadOnlyService()
-    tool = ClickHouseEnrichmentTool(service)
-
-    result = OpenAIResponsesClient(api_key="test-key", model="gpt-5.3-codex", session=session).create_agentic_structured(
-        system_prompt="system",
-        user_prompt="user",
-        schema=enrichment_schema(),
-        tools=warehouse_tool_definitions(),
-        tool_executor=tool.execute,
-        min_tool_calls=1,
-        result_validator=lambda result: ["use full speaker names"]
-        if result.get("meeting_title") == "Needs Repair"
-        else [],
-    )
-
-    assert result["meeting_title"] == "Repaired"
-    assert result["corrected_transcript"] == "Alex Rivera: Hello."
-    assert len(session.posts) == 3
-    assert [tool["name"] for tool in session.posts[0][1]["json"]["tools"]] == ["show_schema"]
-    repair_body = session.posts[2][1]["json"]
-    assert "tools" not in repair_body
-    assert "use full speaker names" in repair_body["input"][-1]["content"]
-
-
-def test_openai_responses_client_hides_tools_after_tool_budget_is_used() -> None:
-    session = FakeValidationRepairSession()
-    service = FakeReadOnlyService()
-    tool = ClickHouseEnrichmentTool(service)
-
-    result = OpenAIResponsesClient(api_key="test-key", model="gpt-5.3-codex", session=session).create_agentic_structured(
-        system_prompt="system",
-        user_prompt="user",
-        schema=enrichment_schema(),
-        tools=warehouse_tool_definitions(),
-        tool_executor=tool.execute,
-        min_tool_calls=1,
-        max_tool_calls=1,
-    )
-
-    assert result["meeting_title"] == "Needs Repair"
-    assert len(session.posts) == 2
-    assert "tools" not in session.posts[1][1]["json"]
-
-
-def test_function_call_helpers_parse_response_payloads() -> None:
-    payload = {"output": [{"type": "function_call", "name": "sql", "arguments": '{"query":"SELECT 1"}'}]}
-
-    calls = response_function_calls(payload)
-
-    assert calls[0]["name"] == "sql"
-    assert parse_function_arguments(calls[0]["arguments"]) == {"query": "SELECT 1"}
-    assert parse_function_arguments("not json") == {}
 
 
 def test_validate_enrichment_result_flags_compression_short_prefixes_and_opening_loss() -> None:
@@ -875,34 +404,6 @@ def test_segment_preserving_fallback_uses_tool_evidence_names_for_asr_variants()
     assert "Robyn Correct" not in result["corrected_transcript"]
 
 
-def test_enrichment_tool_definitions_are_sql_and_show_schema() -> None:
-    tools = warehouse_tool_definitions()
-
-    assert [tool["name"] for tool in tools] == ["sql", "show_schema"]
-    assert sql_tool_definition()["parameters"]["required"] == ["query"]
-    assert show_schema_tool_definition()["parameters"]["properties"] == {}
-
-
-def test_clickhouse_enrichment_tool_executes_sql_and_show_schema() -> None:
-    service = FakeReadOnlyService()
-    tool = ClickHouseEnrichmentTool(service)
-
-    sql_result = tool.execute("sql", {"query": "SELECT 1"})
-    schema_result = tool.execute("show_schema", {})
-
-    assert service.sql == ["SELECT 1"]
-    assert sql_result["csv"] == "summary\nCalendar Match"
-    assert schema_result["csv"].startswith("# db.table")
-
-
-def test_tool_log_summaries_are_compact() -> None:
-    assert summarize_tool_arguments({"sql": "SELECT *\nFROM calendar_events LIMIT 10"}).startswith("sql=SELECT * FROM")
-    assert summarize_tool_output({"csv": "a\n1\n2", "truncated": {"rows": False, "fields": []}}) == (
-        "rows=2 truncated_rows=False truncated_fields=0"
-    )
-    assert "error=bad" in summarize_tool_output({"error": "bad"})
-
-
 def test_normalize_corrected_transcript_prefixes_carries_obvious_continuations() -> None:
     corrected = normalize_corrected_transcript_prefixes(
         "Alex Rivera: Hello.\n\nThis is a continuation: with a colon.\n\nUnknown: Leave this alone.\n\nRiley: Hi.",
@@ -993,7 +494,7 @@ def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit
 
     load_enrichment_candidates(
         Warehouse(),
-        provider="openai",
+        provider="agent_codex",
         model="test-model",
         prompt_version="test-prompt",
         limit=None,
@@ -1014,7 +515,7 @@ def test_load_enrichment_candidates_keeps_limit_when_configured() -> None:
 
     load_enrichment_candidates(
         Warehouse(),
-        provider="openai",
+        provider="agent_codex",
         model="test-model",
         prompt_version="test-prompt",
         limit=12,
@@ -1087,9 +588,9 @@ def test_enrichment_row_serializes_structured_result() -> None:
             "action_items": [],
             "evidence": ["Evidence"],
         },
-        provider="openai",
+        provider="agent_codex",
         model="gpt-5.3-codex",
-        prompt_version=ENRICHMENT_PROMPT_VERSION,
+        prompt_version=AGENT_ENRICHMENT_PROMPT_VERSION,
         status="completed",
         error="",
         created_at=datetime(2026, 4, 27, tzinfo=UTC),
@@ -1124,9 +625,9 @@ def test_enrichment_row_normalizes_corrected_transcript_prefixes() -> None:
             "action_items": [],
             "evidence": [],
         },
-        provider="openai",
+        provider="agent_codex",
         model="gpt-5.3-codex",
-        prompt_version=ENRICHMENT_PROMPT_VERSION,
+        prompt_version=AGENT_ENRICHMENT_PROMPT_VERSION,
         status="completed",
         error="",
         created_at=datetime(2026, 4, 27, tzinfo=UTC),
@@ -1157,9 +658,9 @@ def test_enrichment_row_canonicalizes_close_name_variants_to_verified_attendees(
             "action_items": [],
             "evidence": ["Opening line says Tayler, matching Taylor Singh."],
         },
-        provider="openai",
+        provider="agent_codex",
         model="gpt-5.3-codex",
-        prompt_version=ENRICHMENT_PROMPT_VERSION,
+        prompt_version=AGENT_ENRICHMENT_PROMPT_VERSION,
         status="completed",
         error="",
         created_at=datetime(2026, 4, 27, tzinfo=UTC),
@@ -1176,7 +677,3 @@ def test_canonicalize_text_verified_name_mentions_only_rewrites_close_name_varia
     )
 
     assert text == "Hey Taylor, maybe we should talk with Morgan and Cory."
-
-
-def test_response_output_text_reads_output_content() -> None:
-    assert response_output_text({"output": [{"content": [{"type": "output_text", "text": "{}"}]}]}) == "{}"
