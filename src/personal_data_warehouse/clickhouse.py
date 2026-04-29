@@ -129,6 +129,9 @@ CALENDAR_SYNC_STATE_COLUMNS = (
     "last_sync_type",
     "status",
     "error",
+    "expanded_synced_at",
+    "expanded_window_start",
+    "expanded_window_end",
     "updated_at",
     "sync_version",
 )
@@ -673,12 +676,24 @@ class ClickHouseWarehouse:
                 last_sync_type LowCardinality(String),
                 status LowCardinality(String),
                 error String,
+                expanded_synced_at DateTime64(3, 'UTC'),
+                expanded_window_start DateTime64(3, 'UTC'),
+                expanded_window_end DateTime64(3, 'UTC'),
                 updated_at DateTime64(3, 'UTC'),
                 sync_version UInt64
             )
             ENGINE = ReplacingMergeTree(sync_version)
             ORDER BY (account, calendar_id)
             """
+        )
+        self._command(
+            "ALTER TABLE calendar_sync_state ADD COLUMN IF NOT EXISTS expanded_synced_at DateTime64(3, 'UTC') AFTER error"
+        )
+        self._command(
+            "ALTER TABLE calendar_sync_state ADD COLUMN IF NOT EXISTS expanded_window_start DateTime64(3, 'UTC') AFTER expanded_synced_at"
+        )
+        self._command(
+            "ALTER TABLE calendar_sync_state ADD COLUMN IF NOT EXISTS expanded_window_end DateTime64(3, 'UTC') AFTER expanded_window_start"
         )
 
     def ensure_voice_memos_tables(self) -> None:
@@ -1233,6 +1248,61 @@ class ClickHouseWarehouse:
         for partition_rows in rows_by_partition.values():
             self._insert_rows("calendar_events", partition_rows, CALENDAR_EVENT_COLUMNS)
 
+    def load_active_recurring_calendar_event_ids(
+        self,
+        *,
+        account: str,
+        calendar_id: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> list[str]:
+        rows = self._query(
+            f"""
+            SELECT event_id
+            FROM calendar_events FINAL
+            WHERE account = {_sql_string(account)}
+              AND calendar_id = {_sql_string(calendar_id)}
+              AND recurring_event_id != ''
+              AND is_deleted = 0
+              AND start_at < parseDateTimeBestEffort({_sql_string(window_end.isoformat())})
+              AND end_at > parseDateTimeBestEffort({_sql_string(window_start.isoformat())})
+            """
+        )
+        return [str(row[0]) for row in rows]
+
+    def mark_calendar_events_deleted(
+        self,
+        *,
+        account: str,
+        calendar_id: str,
+        event_ids: list[str],
+        synced_at: datetime,
+    ) -> int:
+        if not event_ids:
+            return 0
+        event_ids_sql = "[" + ", ".join(_sql_string(event_id) for event_id in event_ids) + "]"
+        rows = self._query(
+            f"""
+            SELECT {", ".join(CALENDAR_EVENT_COLUMNS)}
+            FROM calendar_events FINAL
+            WHERE account = {_sql_string(account)}
+              AND calendar_id = {_sql_string(calendar_id)}
+              AND has({event_ids_sql}, event_id)
+              AND is_deleted = 0
+            """
+        )
+        tombstones: list[dict[str, Any]] = []
+        sync_version = int(synced_at.timestamp() * 1_000_000)
+        for row in rows:
+            tombstone = dict(zip(CALENDAR_EVENT_COLUMNS, row, strict=True))
+            tombstone["status"] = "cancelled"
+            tombstone["is_deleted"] = 1
+            tombstone["synced_at"] = synced_at
+            tombstone["sync_version"] = sync_version
+            tombstones.append(tombstone)
+        self.insert_calendar_events(tombstones)
+        return len(tombstones)
+
     def load_calendar_sync_state(self) -> dict[tuple[str, str], dict[str, Any]]:
         rows = self._query(
             """
@@ -1243,6 +1313,9 @@ class ClickHouseWarehouse:
                 last_sync_type,
                 status,
                 error,
+                expanded_synced_at,
+                expanded_window_start,
+                expanded_window_end,
                 updated_at
             FROM calendar_sync_state FINAL
             """
@@ -1257,7 +1330,10 @@ class ClickHouseWarehouse:
                 "last_sync_type": row[3],
                 "status": row[4],
                 "error": row[5],
-                "updated_at": row[6],
+                "expanded_synced_at": row[6],
+                "expanded_window_start": row[7],
+                "expanded_window_end": row[8],
+                "updated_at": row[9],
             }
         return states
 
@@ -1270,6 +1346,9 @@ class ClickHouseWarehouse:
         last_sync_type: str,
         status: str,
         error: str,
+        expanded_synced_at: datetime,
+        expanded_window_start: datetime,
+        expanded_window_end: datetime,
         updated_at: datetime,
     ) -> None:
         self._insert(
@@ -1282,6 +1361,9 @@ class ClickHouseWarehouse:
                     last_sync_type,
                     status,
                     error,
+                    expanded_synced_at,
+                    expanded_window_start,
+                    expanded_window_end,
                     updated_at,
                     int(updated_at.timestamp() * 1_000_000),
                 )
@@ -2246,8 +2328,18 @@ class ClickHouseWarehouse:
             except (NetworkError, SocketTimeoutError, TimeoutError, ConnectionError, OSError, EOFError):
                 if attempt == 5:
                     raise
+                self._disconnect_clickhouse_client()
                 time.sleep(min(60, 5 * attempt))
         raise RuntimeError("unreachable ClickHouse retry state")
+
+    def _disconnect_clickhouse_client(self) -> None:
+        disconnect = getattr(self._client, "disconnect", None)
+        if callable(disconnect):
+            disconnect()
+            return
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()
 
 
 def _parse_clickhouse_url(clickhouse_url: str) -> dict[str, Any]:

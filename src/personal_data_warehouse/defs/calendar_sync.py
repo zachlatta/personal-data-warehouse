@@ -49,6 +49,18 @@ def calendar_event_sync(context) -> MaterializeResult:
                         "sync_type": summary.sync_type,
                         "events_written": summary.events_written,
                         "deleted_events": summary.deleted_events,
+                        "expanded_events_written": summary.expanded_events_written,
+                        "expanded_deleted_events": summary.expanded_deleted_events,
+                        "expanded_synced_at": summary.expanded_synced_at.isoformat()
+                        if summary.expanded_synced_at
+                        else None,
+                        "expanded_window_start": summary.expanded_window_start.isoformat()
+                        if summary.expanded_window_start
+                        else None,
+                        "expanded_window_end": summary.expanded_window_end.isoformat()
+                        if summary.expanded_window_end
+                        else None,
+                        "recurring_changes_seen": summary.recurring_changes_seen,
                     }
                     for summary in summaries
                 ]
@@ -56,6 +68,8 @@ def calendar_event_sync(context) -> MaterializeResult:
             "calendar_count": len(summaries),
             "events_written": sum(summary.events_written for summary in summaries),
             "deleted_events": sum(summary.deleted_events for summary in summaries),
+            "expanded_events_written": sum(summary.expanded_events_written for summary in summaries),
+            "expanded_deleted_events": sum(summary.expanded_deleted_events for summary in summaries),
         }
     )
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 import json
 import time
 from typing import Any
@@ -24,6 +24,12 @@ class CalendarSyncSummary:
     next_sync_token: str
     events_written: int
     deleted_events: int
+    expanded_events_written: int = 0
+    expanded_deleted_events: int = 0
+    expanded_synced_at: datetime | None = None
+    expanded_window_start: datetime | None = None
+    expanded_window_end: datetime | None = None
+    recurring_changes_seen: bool = False
 
 
 class CalendarSyncRunner:
@@ -69,6 +75,9 @@ class CalendarSyncRunner:
                         last_sync_type=str((state or {}).get("last_sync_type", "unknown")),
                         status="failed",
                         error=str(exc),
+                        expanded_synced_at=state_datetime(state, "expanded_synced_at"),
+                        expanded_window_start=state_datetime(state, "expanded_window_start"),
+                        expanded_window_end=state_datetime(state, "expanded_window_end"),
                         updated_at=self._now(),
                     )
                     failures.append(f"{account.email_address}/{calendar_id}: {exc}")
@@ -81,6 +90,10 @@ class CalendarSyncRunner:
                     last_sync_type=summary.sync_type,
                     status="ok",
                     error="",
+                    expanded_synced_at=summary.expanded_synced_at or state_datetime(state, "expanded_synced_at"),
+                    expanded_window_start=summary.expanded_window_start
+                    or state_datetime(state, "expanded_window_start"),
+                    expanded_window_end=summary.expanded_window_end or state_datetime(state, "expanded_window_end"),
                     updated_at=self._now(),
                 )
                 summaries.append(summary)
@@ -99,21 +112,25 @@ class CalendarSyncRunner:
     ) -> CalendarSyncSummary:
         sync_token = str((state or {}).get("sync_token", ""))
         if self._settings.calendar_force_full_sync or not sync_token:
-            return self._sync_events(
+            return self._sync_calendar_with_expanded_instances(
                 account=account,
                 calendar_id=calendar_id,
                 service=service,
+                state=state,
                 sync_type="full",
                 sync_token=None,
+                force_expanded=True,
             )
 
         try:
-            return self._sync_events(
+            return self._sync_calendar_with_expanded_instances(
                 account=account,
                 calendar_id=calendar_id,
                 service=service,
+                state=state,
                 sync_type="partial",
                 sync_token=sync_token,
+                force_expanded=False,
             )
         except HttpError as exc:
             if _http_status(exc) != 410:
@@ -123,13 +140,72 @@ class CalendarSyncRunner:
                 account.email_address,
                 calendar_id,
             )
-            return self._sync_events(
+            return self._sync_calendar_with_expanded_instances(
                 account=account,
                 calendar_id=calendar_id,
                 service=service,
+                state=state,
                 sync_type="full",
                 sync_token=None,
+                force_expanded=True,
             )
+
+    def _sync_calendar_with_expanded_instances(
+        self,
+        *,
+        account: CalendarAccount,
+        calendar_id: str,
+        service,
+        state: Mapping[str, Any] | None,
+        sync_type: str,
+        sync_token: str | None,
+        force_expanded: bool,
+    ) -> CalendarSyncSummary:
+        summary = self._sync_events(
+            account=account,
+            calendar_id=calendar_id,
+            service=service,
+            sync_type=sync_type,
+            sync_token=sync_token,
+        )
+        if not self._should_sync_expanded_instances(
+            state=state,
+            force=force_expanded or summary.recurring_changes_seen,
+        ):
+            return summary
+        expanded_summary = self._sync_expanded_instances(
+            account=account,
+            calendar_id=calendar_id,
+            service=service,
+        )
+        return CalendarSyncSummary(
+            account=summary.account,
+            calendar_id=summary.calendar_id,
+            sync_type=summary.sync_type,
+            next_sync_token=summary.next_sync_token,
+            events_written=summary.events_written + expanded_summary.events_written,
+            deleted_events=summary.deleted_events + expanded_summary.deleted_events,
+            expanded_events_written=expanded_summary.events_written,
+            expanded_deleted_events=expanded_summary.deleted_events,
+            expanded_synced_at=expanded_summary.expanded_synced_at,
+            expanded_window_start=expanded_summary.expanded_window_start,
+            expanded_window_end=expanded_summary.expanded_window_end,
+            recurring_changes_seen=summary.recurring_changes_seen,
+        )
+
+    def _should_sync_expanded_instances(
+        self,
+        *,
+        state: Mapping[str, Any] | None,
+        force: bool,
+    ) -> bool:
+        if force:
+            return True
+        expanded_synced_at = state_datetime(state, "expanded_synced_at")
+        if expanded_synced_at == EPOCH_UTC:
+            return True
+        interval = timedelta(minutes=self._settings.calendar_expanded_sync_interval_minutes)
+        return self._now() - expanded_synced_at >= interval
 
     def _sync_events(
         self,
@@ -144,6 +220,7 @@ class CalendarSyncRunner:
         events_written = 0
         deleted_events = 0
         next_sync_token = sync_token or ""
+        recurring_changes_seen = False
 
         self._logger.info(
             "Starting %s Google Calendar sync for %s/%s",
@@ -166,6 +243,7 @@ class CalendarSyncRunner:
                 )
                 for event in events
             ]
+            recurring_changes_seen = recurring_changes_seen or any(is_recurring_related_event(event) for event in events)
             self._warehouse.insert_calendar_events(rows)
             events_written += len(rows)
             deleted_events += sum(1 for row in rows if row["is_deleted"])
@@ -185,6 +263,94 @@ class CalendarSyncRunner:
             next_sync_token=next_sync_token,
             events_written=events_written,
             deleted_events=deleted_events,
+            recurring_changes_seen=recurring_changes_seen,
+        )
+
+    def _sync_expanded_instances(
+        self,
+        *,
+        account: CalendarAccount,
+        calendar_id: str,
+        service,
+    ) -> CalendarSyncSummary:
+        synced_at = self._now()
+        window_start = synced_at - timedelta(days=self._settings.calendar_expanded_sync_lookback_days)
+        window_end = synced_at + timedelta(days=self._settings.calendar_expanded_sync_lookahead_days)
+        active_recurring_event_ids = set(
+            self._warehouse.load_active_recurring_calendar_event_ids(
+                account=account.email_address,
+                calendar_id=calendar_id,
+                window_start=window_start,
+                window_end=window_end,
+            )
+        )
+        seen_recurring_event_ids: set[str] = set()
+        events_written = 0
+        deleted_events = 0
+
+        self._logger.info(
+            "Starting expanded Google Calendar instance sync for %s/%s from %s to %s",
+            account.email_address,
+            calendar_id,
+            window_start.isoformat(),
+            window_end.isoformat(),
+        )
+        for events in iter_expanded_event_pages(
+            service=service,
+            calendar_id=calendar_id,
+            page_size=self._settings.calendar_page_size,
+            time_min=window_start,
+            time_max=window_end,
+        ):
+            rows = [
+                event_to_row(
+                    account=account.email_address,
+                    calendar_id=calendar_id,
+                    event=event,
+                    synced_at=synced_at,
+                )
+                for event in events
+                if event.get("recurringEventId")
+            ]
+            for row in rows:
+                if row["recurring_event_id"]:
+                    seen_recurring_event_ids.add(row["event_id"])
+            self._warehouse.insert_calendar_events(rows)
+            events_written += len(rows)
+            deleted_events += sum(1 for row in rows if row["is_deleted"])
+            self._logger.info(
+                "Synced %s expanded Google Calendar instances for %s/%s so far",
+                events_written,
+                account.email_address,
+                calendar_id,
+            )
+
+        stale_event_ids = sorted(active_recurring_event_ids - seen_recurring_event_ids)
+        stale_deleted_events = self._warehouse.mark_calendar_events_deleted(
+            account=account.email_address,
+            calendar_id=calendar_id,
+            event_ids=stale_event_ids,
+            synced_at=synced_at,
+        )
+        if stale_deleted_events:
+            self._logger.info(
+                "Marked %s stale expanded Google Calendar instances deleted for %s/%s",
+                stale_deleted_events,
+                account.email_address,
+                calendar_id,
+            )
+        return CalendarSyncSummary(
+            account=account.email_address,
+            calendar_id=calendar_id,
+            sync_type="expanded",
+            next_sync_token="",
+            events_written=events_written + stale_deleted_events,
+            deleted_events=deleted_events + stale_deleted_events,
+            expanded_events_written=events_written + stale_deleted_events,
+            expanded_deleted_events=deleted_events + stale_deleted_events,
+            expanded_synced_at=synced_at,
+            expanded_window_start=window_start,
+            expanded_window_end=window_end,
         )
 
 
@@ -221,6 +387,36 @@ def iter_event_pages(
         items = [item for item in response.get("items", []) if isinstance(item, Mapping)]
         next_sync_token = response.get("nextSyncToken")
         yield items, str(next_sync_token) if next_sync_token else None
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return
+
+
+def iter_expanded_event_pages(
+    *,
+    service,
+    calendar_id: str,
+    page_size: int,
+    time_min: datetime,
+    time_max: datetime,
+) -> Iterator[list[Mapping[str, Any]]]:
+    page_token: str | None = None
+    while True:
+        list_kwargs: dict[str, Any] = {
+            "calendarId": calendar_id,
+            "maxResults": page_size,
+            "showDeleted": True,
+            "singleEvents": True,
+            "orderBy": "startTime",
+            "timeMin": calendar_api_datetime(time_min),
+            "timeMax": calendar_api_datetime(time_max),
+        }
+        if page_token:
+            list_kwargs["pageToken"] = page_token
+
+        response = execute_calendar_request(lambda: service.events().list(**list_kwargs).execute())
+        yield [item for item in response.get("items", []) if isinstance(item, Mapping)]
 
         page_token = response.get("nextPageToken")
         if not page_token:
@@ -315,6 +511,27 @@ def json_dumps(value: Any) -> str:
 
 def sync_version_from_datetime(value: datetime) -> int:
     return int(value.timestamp() * 1_000_000)
+
+
+def state_datetime(state: Mapping[str, Any] | None, key: str) -> datetime:
+    value = (state or {}).get(key)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    if isinstance(value, str) and value:
+        return parse_rfc3339(value) or EPOCH_UTC
+    return EPOCH_UTC
+
+
+def is_recurring_related_event(event: Mapping[str, Any]) -> bool:
+    return bool(event.get("recurringEventId") or event.get("recurrence") or event.get("status") == "cancelled")
+
+
+def calendar_api_datetime(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _http_status(exc: HttpError) -> int | None:

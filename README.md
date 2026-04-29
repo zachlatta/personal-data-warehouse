@@ -57,6 +57,9 @@ GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE=100
 CALENDAR_ACCOUNTS=zach@hackclub.com
 CALENDAR_ZACH_HACKCLUB_COM_CALENDAR_IDS=primary
 CALENDAR_PAGE_SIZE=2500
+CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS=365
+CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS=365
+CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES=60
 VOICE_MEMOS_ACCOUNT=you@example.com
 VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
 VOICE_MEMOS_STORAGE_BACKEND=google_drive
@@ -71,6 +74,7 @@ Notes:
 - Sync runtime requires one `GOOGLE_<ACCOUNT_SLUG>_TOKEN_JSON_B64` or legacy `GMAIL_<ACCOUNT_SLUG>_TOKEN_JSON_B64` value per Google account.
 - Google OAuth client secrets and account tokens are env-only; the app does not read or write Google secrets from the filesystem.
 - Calendar sync defaults to the accounts in `GMAIL_ACCOUNTS` and the `primary` calendar unless `CALENDAR_ACCOUNTS` or `CALENDAR_<ACCOUNT_SLUG>_CALENDAR_IDS` are set.
+- Calendar sync also expands recurring event instances in a rolling window so generated occurrences can be matched directly. The expanded pass runs hourly by default, and immediately after full syncs or recurrence-related changes. Tune it with `CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS`, `CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS`, and `CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES`.
 
 ## Gmail Auth
 
@@ -111,7 +115,7 @@ uv run dg dev
 ```
 
 Then materialize the `gmail_mailbox_sync` asset from the Dagster UI.
-Materialize `calendar_event_sync` to sync Google Calendar events.
+Materialize `calendar_event_sync` to sync Google Calendar events. Calendar sync uses Google's incremental cursor for ordinary changes and a rolling expanded-instance window for recurring event occurrences.
 
 The Docker/Coolify deployment also includes an enabled Dagster schedule,
 `gmail_mailbox_sync_every_minute`, which runs the Gmail sync every minute.

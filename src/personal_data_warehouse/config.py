@@ -22,6 +22,9 @@ DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS = 60
 DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES = 1
 DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL = True
 DEFAULT_CALENDAR_PAGE_SIZE = 2500
+DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS = 365
+DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS = 365
+DEFAULT_CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES = 60
 DEFAULT_SLACK_PAGE_SIZE = 200
 DEFAULT_SLACK_LOOKBACK_DAYS = 14
 DEFAULT_SLACK_THREAD_AUDIT_DAYS = 30
@@ -166,6 +169,9 @@ class Settings:
     calendar_scopes: tuple[str, ...] = (CALENDAR_READONLY_SCOPE,)
     calendar_page_size: int = DEFAULT_CALENDAR_PAGE_SIZE
     calendar_force_full_sync: bool = False
+    calendar_expanded_sync_lookback_days: int = DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS
+    calendar_expanded_sync_lookahead_days: int = DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS
+    calendar_expanded_sync_interval_minutes: int = DEFAULT_CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES
     gmail_attachment_ai_fallback_enabled: bool = True
     gmail_attachment_ai_fallback_base_url: str = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL
     gmail_attachment_ai_fallback_model: str = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_MODEL
@@ -330,6 +336,24 @@ def load_settings(
     calendar_page_size = int(os.getenv("CALENDAR_PAGE_SIZE", str(DEFAULT_CALENDAR_PAGE_SIZE)))
     if calendar_page_size < 1 or calendar_page_size > 2500:
         raise ValueError("CALENDAR_PAGE_SIZE must be between 1 and 2500")
+    calendar_expanded_sync_lookback_days = int(
+        os.getenv("CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS", str(DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS))
+    )
+    if calendar_expanded_sync_lookback_days < 0:
+        raise ValueError("CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS must be at least 0")
+    calendar_expanded_sync_lookahead_days = int(
+        os.getenv("CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS", str(DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS))
+    )
+    if calendar_expanded_sync_lookahead_days < 0:
+        raise ValueError("CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS must be at least 0")
+    calendar_expanded_sync_interval_minutes = int(
+        os.getenv(
+            "CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES",
+            str(DEFAULT_CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES),
+        )
+    )
+    if calendar_expanded_sync_interval_minutes < 1:
+        raise ValueError("CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES must be at least 1")
 
     slack_account_names = _parse_csv_env(os.getenv("SLACK_ACCOUNTS"))
     if require_slack and not slack_account_names:
@@ -515,6 +539,9 @@ def load_settings(
         calendar_scopes=(CALENDAR_READONLY_SCOPE,),
         calendar_page_size=calendar_page_size,
         calendar_force_full_sync=_parse_bool_env(os.getenv("CALENDAR_FORCE_FULL_SYNC"), False),
+        calendar_expanded_sync_lookback_days=calendar_expanded_sync_lookback_days,
+        calendar_expanded_sync_lookahead_days=calendar_expanded_sync_lookahead_days,
+        calendar_expanded_sync_interval_minutes=calendar_expanded_sync_interval_minutes,
         slack_accounts=tuple(slack_accounts),
         slack_page_size=slack_page_size,
         slack_lookback_days=int(os.getenv("SLACK_LOOKBACK_DAYS", str(DEFAULT_SLACK_LOOKBACK_DAYS))),
