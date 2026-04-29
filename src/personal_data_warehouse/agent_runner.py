@@ -29,6 +29,10 @@ DEFAULT_AGENT_MEMORY = "4g"
 DEFAULT_AGENT_CPUS = "2"
 DEFAULT_AGENT_PIDS_LIMIT = 512
 DEFAULT_AGENT_NETWORK = "bridge"
+DEFAULT_AGENT_IMAGE_REPOSITORY = "personal-data-warehouse-agent"
+DEFAULT_AGENT_DOCKERFILE_PATH = Path(__file__).resolve().parents[2] / "docker" / "agent.Dockerfile"
+DEFAULT_AGENT_ENTRYPOINT_PATH = Path(__file__).resolve().parents[2] / "docker" / "agent-entrypoint.sh"
+DEFAULT_AGENT_BUILD_CONTEXT_DIR = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -818,7 +822,7 @@ def provider_auth_lock(provider: str):
 def agent_config_from_env() -> AgentContainerConfig:
     image = os.getenv("AGENT_DOCKER_IMAGE", "").strip()
     if not image:
-        raise ValueError("AGENT_DOCKER_IMAGE must be set")
+        image = default_agent_docker_image()
     return AgentContainerConfig(
         image=image,
         provider=os.getenv("AGENT_PROVIDER", "codex"),
@@ -831,7 +835,70 @@ def agent_config_from_env() -> AgentContainerConfig:
         cpus=os.getenv("AGENT_DOCKER_CPUS", DEFAULT_AGENT_CPUS),
         pids_limit=int(os.getenv("AGENT_DOCKER_PIDS_LIMIT", str(DEFAULT_AGENT_PIDS_LIMIT))),
         timeout_seconds=int(os.getenv("AGENT_TIMEOUT_SECONDS", "1800")),
+        tool_proxy_bind_host=os.getenv("AGENT_TOOL_PROXY_BIND_HOST", "0.0.0.0"),
+        tool_proxy_public_host=os.getenv("AGENT_TOOL_PROXY_PUBLIC_HOST", "host.docker.internal"),
     )
+
+
+def default_agent_docker_image(
+    *,
+    repository: str = DEFAULT_AGENT_IMAGE_REPOSITORY,
+    dockerfile_path: Path = DEFAULT_AGENT_DOCKERFILE_PATH,
+    entrypoint_path: Path = DEFAULT_AGENT_ENTRYPOINT_PATH,
+) -> str:
+    digest = hashlib.sha256()
+    for path in (dockerfile_path, entrypoint_path):
+        digest.update(str(path.name).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return f"{repository}:{digest.hexdigest()[:6]}"
+
+
+def ensure_agent_image(
+    image: str | None = None,
+    *,
+    dockerfile_path: Path = DEFAULT_AGENT_DOCKERFILE_PATH,
+    entrypoint_path: Path = DEFAULT_AGENT_ENTRYPOINT_PATH,
+    context_dir: Path = DEFAULT_AGENT_BUILD_CONTEXT_DIR,
+    runner=subprocess.run,
+) -> str:
+    explicit_image = bool(image and image.strip())
+    resolved_image = (
+        image.strip()
+        if image
+        else default_agent_docker_image(dockerfile_path=dockerfile_path, entrypoint_path=entrypoint_path)
+    )
+    inspect = runner(
+        ["docker", "image", "inspect", resolved_image],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if getattr(inspect, "returncode", 1) == 0:
+        return resolved_image
+    if explicit_image:
+        pull = runner(
+            ["docker", "pull", resolved_image],
+            check=False,
+        )
+        if getattr(pull, "returncode", 1) == 0:
+            return resolved_image
+    build = runner(
+        [
+            "docker",
+            "build",
+            "-f",
+            str(dockerfile_path),
+            "-t",
+            resolved_image,
+            str(context_dir),
+        ],
+        check=False,
+    )
+    if getattr(build, "returncode", 1) != 0:
+        raise RuntimeError(f"failed to build agent Docker image {resolved_image}")
+    return resolved_image
 
 
 def auth_docker_command(*, provider: str, action: str, config: AgentContainerConfig, interactive: bool) -> list[str]:
@@ -876,7 +943,24 @@ def auth_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("provider", choices=["codex", "claude"])
     parser.add_argument("--non-interactive", action="store_true", help="Do not allocate a TTY for the login/status container.")
     args = parser.parse_args(argv)
+    configured_image = os.getenv("AGENT_DOCKER_IMAGE", "").strip() or None
+    image = ensure_agent_image(configured_image)
     config = agent_config_from_env()
+    config = AgentContainerConfig(
+        image=image,
+        provider=config.provider,
+        model=config.model,
+        auth_volume=config.auth_volume,
+        runs_volume=config.runs_volume,
+        runs_dir=config.runs_dir,
+        network=config.network,
+        memory=config.memory,
+        cpus=config.cpus,
+        pids_limit=config.pids_limit,
+        timeout_seconds=config.timeout_seconds,
+        tool_proxy_bind_host=config.tool_proxy_bind_host,
+        tool_proxy_public_host=config.tool_proxy_public_host,
+    )
     command = auth_docker_command(
         provider=args.provider,
         action=args.action,

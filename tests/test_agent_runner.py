@@ -17,6 +17,8 @@ from personal_data_warehouse.agent_runner import (
     agent_run_row,
     agent_run_tool_call_rows,
     auth_docker_command,
+    default_agent_docker_image,
+    ensure_agent_image,
     volume_copy_command,
     write_builtin_cli_tools,
 )
@@ -202,6 +204,85 @@ def test_auth_command_uses_subscription_volume_without_api_keys() -> None:
     assert "codex login --device-auth" in command[-1]
 
 
+def test_default_agent_docker_image_uses_agent_image_inputs_hash(tmp_path) -> None:
+    dockerfile = tmp_path / "agent.Dockerfile"
+    entrypoint = tmp_path / "agent-entrypoint.sh"
+    dockerfile.write_text("FROM alpine\n", encoding="utf-8")
+    entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    image = default_agent_docker_image(
+        repository="pdw-agent",
+        dockerfile_path=dockerfile,
+        entrypoint_path=entrypoint,
+    )
+    first = image.rsplit(":", 1)[1]
+
+    entrypoint.write_text("#!/bin/sh\necho changed\n", encoding="utf-8")
+    changed = default_agent_docker_image(
+        repository="pdw-agent",
+        dockerfile_path=dockerfile,
+        entrypoint_path=entrypoint,
+    )
+
+    assert image.startswith("pdw-agent:")
+    assert len(first) == 6
+    assert changed != image
+
+
+def test_ensure_agent_image_skips_build_when_image_exists() -> None:
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0)
+
+    image = ensure_agent_image("pdw-agent:test", runner=fake_run)
+
+    assert image == "pdw-agent:test"
+    assert calls == [(["docker", "image", "inspect", "pdw-agent:test"], {"capture_output": True, "text": True, "check": False})]
+
+
+def test_ensure_agent_image_pulls_explicit_missing_image() -> None:
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(command, 1)
+        return subprocess.CompletedProcess(command, 0)
+
+    image = ensure_agent_image("registry.example/pdw-agent:test", runner=fake_run)
+
+    assert image == "registry.example/pdw-agent:test"
+    assert calls[0][0] == ["docker", "image", "inspect", "registry.example/pdw-agent:test"]
+    assert calls[1][0] == ["docker", "pull", "registry.example/pdw-agent:test"]
+
+
+def test_ensure_agent_image_builds_when_image_is_missing(tmp_path) -> None:
+    dockerfile = tmp_path / "agent.Dockerfile"
+    entrypoint = tmp_path / "agent-entrypoint.sh"
+    context_dir = tmp_path / "context"
+    dockerfile.write_text("FROM alpine\n", encoding="utf-8")
+    entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
+    context_dir.mkdir()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 1 if command[:3] == ["docker", "image", "inspect"] else 0)
+
+    image = ensure_agent_image(
+        dockerfile_path=dockerfile,
+        entrypoint_path=entrypoint,
+        context_dir=context_dir,
+        runner=fake_run,
+    )
+
+    assert image.startswith("personal-data-warehouse-agent:")
+    assert calls[0][0] == ["docker", "image", "inspect", image]
+    assert calls[1][0] == ["docker", "build", "-f", str(dockerfile), "-t", image, str(context_dir)]
+
+
 def test_agent_entrypoint_skips_codex_git_repo_check() -> None:
     entrypoint = Path("docker/agent-entrypoint.sh").read_text(encoding="utf-8")
 
@@ -332,6 +413,16 @@ def test_load_settings_reads_agent_config_without_api_keys(monkeypatch) -> None:
     assert settings.agent.tool_proxy_public_host == "dagster"
 
 
+def test_load_settings_derives_agent_image_when_required(monkeypatch) -> None:
+    monkeypatch.delenv("AGENT_DOCKER_IMAGE", raising=False)
+
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_agent=True)
+
+    assert settings.agent is not None
+    assert settings.agent.docker_image.startswith("personal-data-warehouse-agent:")
+    assert len(settings.agent.docker_image.rsplit(":", 1)[1]) == 6
+
+
 def test_agent_resource_builds_container_config() -> None:
     resource = AgentResource(
         docker_image="pdw-agent:latest",
@@ -363,6 +454,6 @@ def test_agent_resource_disabled_fails_with_clear_error() -> None:
     try:
         resource.container_config()
     except RuntimeError as exc:
-        assert "AGENT_DOCKER_IMAGE" in str(exc)
+        assert "AgentResource is not configured" in str(exc)
     else:
         raise AssertionError("disabled AgentResource should not build a container config")

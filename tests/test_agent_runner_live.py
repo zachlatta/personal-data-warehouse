@@ -11,6 +11,7 @@ from personal_data_warehouse.agent_runner import (
     AgentContainerConfig,
     AgentRunRequest,
     ContainerAgentRunner,
+    ensure_agent_image,
     write_builtin_cli_tools,
 )
 from personal_data_warehouse.agent_tool_proxy import run_agent_tool_proxy
@@ -24,9 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def live_agent_config(tmp_path) -> AgentContainerConfig:
-    image = os.getenv("AGENT_DOCKER_IMAGE", "").strip()
-    if not image:
-        pytest.skip("AGENT_DOCKER_IMAGE is required for live agent tests")
+    image = ensure_agent_image(os.getenv("AGENT_DOCKER_IMAGE", "").strip() or None)
     return AgentContainerConfig(
         image=image,
         provider=os.getenv("AGENT_PROVIDER", "codex"),

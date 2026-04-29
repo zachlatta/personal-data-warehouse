@@ -7,6 +7,8 @@ import re
 
 from dotenv import load_dotenv
 
+from personal_data_warehouse.agent_runner import default_agent_docker_image
+
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
@@ -448,9 +450,9 @@ def load_settings(
 
     agent_docker_image = os.getenv("AGENT_DOCKER_IMAGE", "").strip()
     agent: AgentConfig | None = None
+    if require_agent and not agent_docker_image:
+        agent_docker_image = default_agent_docker_image()
     if require_agent or agent_docker_image:
-        if not agent_docker_image:
-            raise ValueError("AGENT_DOCKER_IMAGE must be set for containerized agents")
         agent_provider = (os.getenv("AGENT_PROVIDER") or DEFAULT_AGENT_PROVIDER).strip().lower()
         if agent_provider not in {"codex", "claude"}:
             raise ValueError("AGENT_PROVIDER must be codex or claude")

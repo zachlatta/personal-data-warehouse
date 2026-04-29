@@ -302,7 +302,6 @@ Transcription is a separate Dagster asset. Configure AssemblyAI:
 ASSEMBLYAI_API_KEY=...
 VOICE_MEMOS_TRANSCRIPTION_PROVIDER=assemblyai
 VOICE_MEMOS_TRANSCRIPTION_BATCH_SIZE=3
-AGENT_DOCKER_IMAGE=personal-data-warehouse-agent:latest
 AGENT_PROVIDER=codex
 AGENT_MODEL=gpt-5.3-codex
 VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS=12
@@ -346,10 +345,15 @@ logged-in CLI subscription instead of API keys. Dagster owns the Docker socket a
 container; the agent container does not receive the Docker socket, Dagster env, ClickHouse URL,
 Google tokens, Slack tokens, or API keys.
 
-Build and deploy the agent image separately:
+The auth/bootstrap command builds the agent image on demand. If `AGENT_DOCKER_IMAGE` is unset, it
+derives a tag like `personal-data-warehouse-agent:<hash>` from the agent Dockerfile and entrypoint,
+checks whether that image already exists locally, and builds it only when missing. Set
+`AGENT_DOCKER_IMAGE` only when you want to force a specific image tag; explicit tags are pulled
+first when missing locally, then built locally if the pull fails:
 
 ```bash
-docker build -f docker/agent.Dockerfile -t personal-data-warehouse-agent:latest .
+# Optional override; otherwise the hash-based image tag is derived automatically.
+AGENT_DOCKER_IMAGE=personal-data-warehouse-agent:latest
 ```
 
 For Coolify, add two persistent Docker volumes and mount them into the Dagster app:
@@ -358,6 +362,10 @@ For Coolify, add two persistent Docker volumes and mount them into the Dagster a
 pdw-agent-auth -> /agent-auth
 pdw-agent-runs -> /agent-runs
 ```
+
+`pdw-agent-auth` stores persistent Codex/Claude CLI login state. `pdw-agent-runs` is the shared
+handoff volume for per-run prompts, schemas, local helper tools, final JSON/message files, and other
+agent run artifacts. The run volume is not used for subscription auth.
 
 Also mount the host Docker socket into the Dagster app only:
 
@@ -368,7 +376,6 @@ Also mount the host Docker socket into the Dagster app only:
 Set the Dagster app env:
 
 ```bash
-AGENT_DOCKER_IMAGE=personal-data-warehouse-agent:latest
 AGENT_PROVIDER=codex
 AGENT_MODEL=gpt-5.3-codex
 AGENT_AUTH_VOLUME=pdw-agent-auth
@@ -393,6 +400,10 @@ Log in from the Coolify terminal after the Dagster app can use Docker:
 uv run personal-data-warehouse-agent-auth login codex
 uv run personal-data-warehouse-agent-auth status codex
 ```
+
+The first command also ensures the agent image exists on the Docker host. Re-run it after changing
+`docker/agent.Dockerfile` or `docker/agent-entrypoint.sh`; the derived image tag changes with those
+inputs.
 
 For Claude later:
 
@@ -434,15 +445,13 @@ Written tests that do not call live agents run with the normal suite:
 uv run pytest tests/test_agent_runner.py tests/test_voice_memos_enrichment_defs.py tests/test_clickhouse_schema.py
 ```
 
-Live Docker/subscription smoke tests are opt-in because they require Docker, the agent image, and a
-logged-in subscription auth volume:
+Live Docker/subscription smoke tests are opt-in because they require Docker and a logged-in
+subscription auth volume:
 
 ```bash
-docker build -f docker/agent.Dockerfile -t personal-data-warehouse-agent:latest .
 uv run personal-data-warehouse-agent-auth login codex
 
 RUN_LIVE_AGENT_TESTS=1 \
-AGENT_DOCKER_IMAGE=personal-data-warehouse-agent:latest \
 AGENT_PROVIDER=codex \
 AGENT_MODEL=gpt-5.3-codex \
 uv run pytest tests/test_agent_runner_live.py -q

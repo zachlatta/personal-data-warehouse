@@ -122,4 +122,4 @@ class AgentResource(ConfigurableResource):
 
     def _raise_if_unconfigured(self) -> None:
         if not self.is_configured:
-            raise RuntimeError("AgentResource is not configured. Set AGENT_DOCKER_IMAGE before running agent assets.")
+            raise RuntimeError("AgentResource is not configured. Enable agent settings before running agent assets.")
