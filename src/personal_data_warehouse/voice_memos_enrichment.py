@@ -557,6 +557,26 @@ def unique_names(names: Sequence[str]) -> list[str]:
     return unique
 
 
+def result_transcript(result: Mapping[str, Any]) -> str:
+    return str(result.get("transcript") or result.get("corrected_transcript") or result.get("cleaned_transcript") or "")
+
+
+def result_title(result: Mapping[str, Any]) -> str:
+    return str(result.get("title") or result.get("meeting_title") or "")
+
+
+def result_start_at(result: Mapping[str, Any]) -> str:
+    return str(result.get("start_at") or result.get("meeting_start_at") or "")
+
+
+def result_end_at(result: Mapping[str, Any]) -> str:
+    return str(result.get("end_at") or result.get("meeting_end_at") or "")
+
+
+def result_participants(result: Mapping[str, Any]) -> Any:
+    return result.get("participants") or result.get("attendees") or []
+
+
 def validate_enrichment_result(
     *,
     recording: Mapping[str, Any],
@@ -564,27 +584,27 @@ def validate_enrichment_result(
     result: Mapping[str, Any],
 ) -> list[str]:
     issues: list[str] = []
-    corrected = str(result.get("corrected_transcript") or "")
+    transcript = result_transcript(result)
     source = str(recording.get("transcript_text") or "")
-    local_assembly_requested = corrected.strip() == LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL
-    if len(source) >= 5_000 and len(corrected) < int(len(source) * 0.60) and not local_assembly_requested:
+    local_assembly_requested = transcript.strip() == LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL
+    if len(source) >= 5_000 and len(transcript) < int(len(source) * 0.60) and not local_assembly_requested:
         issues.append(
-            f"corrected_transcript is too compressed: {len(corrected)} chars vs {len(source)} source chars; preserve substantive turns"
+            f"transcript is too compressed: {len(transcript)} chars vs {len(source)} source chars; preserve substantive turns"
         )
-    if not str(result.get("meeting_title") or "").strip():
-        issues.append("meeting_title is empty; create a useful title even when there is no matched calendar event")
-    if not parseable_model_datetime(str(result.get("meeting_start_at") or "")):
-        issues.append("meeting_start_at is missing or invalid; use the calendar event start or the recording timestamp")
-    if not parseable_model_datetime(str(result.get("meeting_end_at") or "")):
-        issues.append("meeting_end_at is missing or invalid; use the calendar event end or estimate from transcript segment duration")
+    if not result_title(result).strip():
+        issues.append("title is empty; create a useful title even when there is no matched calendar event")
+    if not parseable_model_datetime(result_start_at(result)):
+        issues.append("start_at is missing or invalid; use the calendar event start or the recording timestamp")
+    if not parseable_model_datetime(result_end_at(result)):
+        issues.append("end_at is missing or invalid; use the calendar event end or estimate from transcript segment duration")
 
     speaker_map = [item for item in result.get("speaker_map", []) if isinstance(item, Mapping)]
     speaker_names = [str(item.get("speaker_name") or "").strip() for item in speaker_map]
-    attendee_names = [str(name).strip() for name in result.get("attendees", []) if isinstance(name, str)]
-    incomplete_attendees = incomplete_enrichment_person_names(result.get("attendees") or [])
-    if incomplete_attendees:
+    participant_names = [str(name).strip() for name in result_participants(result) if isinstance(name, str)]
+    incomplete_participants = incomplete_enrichment_person_names(result_participants(result))
+    if incomplete_participants:
         issues.append(
-            f"attendees contain incomplete names: {incomplete_attendees[:5]}; keep researching calendar, Gmail, Slack, and candidate/context messages for full names"
+            f"participants contain incomplete names: {incomplete_participants[:5]}; keep researching calendar, Gmail, Slack, and candidate/context messages for full names"
         )
 
     for item in speaker_map:
@@ -603,12 +623,12 @@ def validate_enrichment_result(
                 f"speaker {item.get('speaker_label')} has ambiguous speaker_name {name!r}; use one verified full name or a clearly mixed/unresolved label"
             )
 
-    prefix_names = corrected_transcript_prefixes(corrected)
-    resolved_prefix_names = [*speaker_names, *attendee_names]
-    multi_prefix_lines = lines_with_multiple_speaker_prefixes(corrected, resolved_prefix_names)
+    prefix_names = corrected_transcript_prefixes(transcript)
+    resolved_prefix_names = [*speaker_names, *participant_names]
+    multi_prefix_lines = lines_with_multiple_speaker_prefixes(transcript, resolved_prefix_names)
     if multi_prefix_lines and not local_assembly_requested:
         issues.append(
-            f"corrected_transcript has multiple speaker turns in one line/paragraph; split each speaker turn separately: {multi_prefix_lines[:2]}"
+            f"transcript has multiple speaker turns in one line/paragraph; split each speaker turn separately: {multi_prefix_lines[:2]}"
         )
     if not local_assembly_requested:
         for name in resolved_prefix_names:
@@ -616,23 +636,23 @@ def validate_enrichment_result(
                 continue
             first = name.split()[0]
             if first in prefix_names and name not in prefix_names:
-                issues.append(f"corrected_transcript uses first-name prefix {first!r}; use full speaker name {name!r}")
+                issues.append(f"transcript uses first-name prefix {first!r}; use full speaker name {name!r}")
 
     opening_text = "\n".join(str(segment.get("text") or "") for segment in transcript_segments[:6])
     opening_addressee = re.search(r"\bhow are you,\s*([A-Z][A-Za-z]+)\b", opening_text, flags=re.IGNORECASE)
     if opening_addressee and not local_assembly_requested:
         addressee = opening_addressee.group(1)
         phrase = rf"\bhow are you,\s*{re.escape(addressee)}\b"
-        if not re.search(rf":[^\n]{{0,160}}{phrase}", corrected, flags=re.IGNORECASE):
+        if not re.search(rf":[^\n]{{0,160}}{phrase}", transcript, flags=re.IGNORECASE):
             issues.append(
-                f"opening dialogue lost addressee evidence: raw early segment has 'How are you, {addressee}?' and corrected_transcript should preserve that addressed turn"
+                f"opening dialogue lost addressee evidence: raw early segment has 'How are you, {addressee}?' and transcript should preserve that addressed turn"
             )
-        elif re.search(rf"(?m)^{re.escape(addressee)}(?:\s+\S+)?:[^\n]{{0,160}}{phrase}", corrected, flags=re.IGNORECASE):
+        elif re.search(rf"(?m)^{re.escape(addressee)}(?:\s+\S+)?:[^\n]{{0,160}}{phrase}", transcript, flags=re.IGNORECASE):
             issues.append(
                 f"opening dialogue has likely self-address: a line prefixed by {addressee!r} also says 'How are you, {addressee}?'"
             )
 
-    if same_speaker_asks_and_answers_opening_greeting(corrected) and not local_assembly_requested:
+    if same_speaker_asks_and_answers_opening_greeting(transcript) and not local_assembly_requested:
         issues.append(
             "opening dialogue has the same speaker asking 'how are you?' and then answering 'I'm doing great'; reassign or merge the short greeting turn"
         )
@@ -698,22 +718,22 @@ def apply_segment_preserving_transcript_fallback(
 ) -> dict[str, Any]:
     current = dict(result)
     issues = list(current.get("__validation_issues") or [])
-    local_assembly_requested = str(current.get("corrected_transcript") or "").strip() == LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL
-    if not local_assembly_requested and not any(str(issue).startswith("corrected_transcript is too compressed") for issue in issues):
+    local_assembly_requested = result_transcript(current).strip() == LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL
+    if not local_assembly_requested and not any(str(issue).startswith("transcript is too compressed") for issue in issues):
         return current
     if not transcript_segments:
         return current
 
-    current["corrected_transcript"] = build_segment_preserving_corrected_transcript(
+    current["transcript"] = build_segment_preserving_corrected_transcript(
         transcript_segments=transcript_segments,
         result=current,
     )
     current.setdefault("evidence", [])
     if isinstance(current["evidence"], list):
         reason = (
-            "Corrected transcript assembled locally from diarized segments because the recording is long."
+            "Transcript assembled locally from diarized segments because the recording is long."
             if local_assembly_requested
-            else "Corrected transcript rebuilt from diarized segments after model output was too compressed."
+            else "Transcript rebuilt from diarized segments after model output was too compressed."
         )
         current["evidence"].append(reason)
     remaining_issues = validate_enrichment_result(recording=recording, transcript_segments=transcript_segments, result=current)
@@ -737,14 +757,14 @@ def ensure_recording_level_fields(
 
     start, end = recording_time_bounds(recording=recording, transcript_segments=transcript_segments)
     filled = False
-    if not parseable_model_datetime(str(current.get("meeting_start_at") or "")):
-        current["meeting_start_at"] = start.isoformat()
+    if not parseable_model_datetime(result_start_at(current)):
+        current["start_at"] = start.isoformat()
         filled = True
-    if not parseable_model_datetime(str(current.get("meeting_end_at") or "")):
-        current["meeting_end_at"] = end.isoformat()
+    if not parseable_model_datetime(result_end_at(current)):
+        current["end_at"] = end.isoformat()
         filled = True
-    if not str(current.get("meeting_title") or "").strip():
-        current["meeting_title"] = f"Voice Memo {start.strftime('%Y-%m-%d %H:%M UTC')}"
+    if not result_title(current).strip():
+        current["title"] = f"Voice Memo {start.strftime('%Y-%m-%d %H:%M UTC')}"
         filled = True
     if filled:
         current.setdefault("evidence", [])
@@ -783,7 +803,7 @@ def build_segment_preserving_corrected_transcript(
     result: Mapping[str, Any],
 ) -> str:
     speaker_map = [item for item in result.get("speaker_map", []) if isinstance(item, Mapping)]
-    verified_names = [name for name in result.get("attendees", []) if isinstance(name, str)]
+    verified_names = [name for name in result_participants(result) if isinstance(name, str)]
     speaker_names = [str(item.get("speaker_name") or "") for item in speaker_map]
     evidence_names = evidence_names_from_result(result)
     known_speaker_names = list(
@@ -932,10 +952,10 @@ def enrichment_system_prompt() -> str:
     return (
         "You enrich transcripts from personal Voice Memos. Return only structured JSON matching the schema. "
         "Before final JSON, you must use warehouse tools: first call show_schema to inspect live table/column names, then use sql for read-only investigation. "
-        "Use read-only queries to verify likely calendar matches, attendees, speaker identities, and domain terms. "
-        "The non-negotiable requirements are accurate meeting time/date, accurate attendees and name spellings, and accurate domain terms in corrected_transcript. "
+        "Use read-only queries to verify likely calendar matches, participants, speaker identities, and domain terms. "
+        "The non-negotiable requirements are accurate time/date, accurate participant/name spellings, and accurate domain terms in transcript. "
         "Do not invent calendar links, people, or locations. If uncertain, set low confidence and explain the uncertainty in evidence. "
-        "Keep corrected_transcript faithful to the transcript; put synthesized narrative writing only in meeting_notes and summary."
+        "Keep transcript faithful to the source; put synthesized narrative writing only in summary."
     )
 
 
@@ -1011,7 +1031,7 @@ def enrichment_user_prompt(
             "local_transcript_assembly": {
                 "sentinel": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
                 "use_when_transcript_char_count_at_least": LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS,
-                "explanation": "For long recordings, return the sentinel as corrected_transcript. The pipeline assembles the full detailed transcript locally from diarized_segments after metadata, identity, and term research are complete.",
+                "explanation": "For long recordings, return the sentinel as transcript. The pipeline assembles the full detailed transcript locally from diarized_segments after metadata, identity, and term research are complete.",
             },
             "recorded_at_interpretations": recording_time_interpretations(recording.get("recorded_at"))
             if isinstance(recording.get("recorded_at"), datetime)
@@ -1021,23 +1041,23 @@ def enrichment_user_prompt(
             "diarized_segments": list(transcript_segments),
             "instructions": [
                 "Before final output, run \"$PDW_CLICKHOUSE_SCHEMA\" first, then use multiple focused \"$PDW_CLICKHOUSE_QUERY\" calls to search calendar, email, Slack, and related warehouse context.",
-                "Make separate warehouse checks for: the selected calendar event including attendee data, attendee/person identity evidence, and suspicious domain terms or organizations that need spelling verification.",
-                "Hard requirements: accurate meeting date/time, accurate attendees and name spellings, and accurate domain terms in corrected_transcript.",
-                "attendees means actual meeting participants who speak or are strongly evidenced as present. Do not include calendar invitees merely because they were invited, especially if responseStatus is needsAction and there is no transcript evidence they attended.",
-                "If you select a calendar event, meeting_start_at, meeting_end_at, and meeting_location must come from that calendar event or verified ClickHouse context.",
-                "Do not leave attendees as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, use \"$PDW_CLICKHOUSE_SCHEMA\" results to query Slack/email identity data before finalizing attendees or speaker_map.",
+                "Make separate warehouse checks for: the selected calendar event including attendee data, participant/person identity evidence, and suspicious domain terms or organizations that need spelling verification.",
+                "Hard requirements: accurate date/time, accurate participant/name spellings, and accurate domain terms in transcript.",
+                "participants means actual people who speak or are strongly evidenced as present. Do not include calendar invitees merely because they were invited, especially if responseStatus is needsAction and there is no transcript evidence they attended.",
+                "If you select a calendar event, start_at and end_at must come from that calendar event or verified ClickHouse context.",
+                "Do not leave participants as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, use \"$PDW_CLICKHOUSE_SCHEMA\" results to query Slack/email identity data before finalizing participants or speaker_map.",
                 "Do not stop at a one-token name like a Slack display_name or calendar first name. Search Gmail/calendar/Slack context around the event title, email local part, usernames, candidate briefs, and prior messages until you find a full preferred/legal name or have clear evidence none is available.",
                 "When a speaker is identified only by a first name, use calendar attendee emails plus Slack/email identity evidence to resolve the full name.",
                 "Calendar candidates may include identity_hints for attendee emails. Use possible_names from identity_hints for attendee and speaker names when supported by transcript evidence.",
-                "Normalize spoken name mentions in corrected_transcript to verified attendee spellings when ASR produces a close variant, especially in greetings and introductions.",
+                "Normalize spoken name mentions in transcript to verified participant spellings when ASR produces a close variant, especially in greetings and introductions.",
                 "If the transcript says a person or organization name differently than the calendar candidate, query for that spoken name/project before deciding.",
                 "For technical/product terms that are unclear or unfamiliar, query Slack/Gmail for likely spelling variants and use the spelling supported by warehouse evidence.",
-                "Correct ASR domain-term errors in corrected_transcript, for example Hack Club not Hat Club, Hackatime not Hackertime/Hacker Time, Stardance not Start Dance, OpenRouter, OpenAI, Anthropic, Congressional App Challenge, Challenger, Framework, Spindrift, and Pellegrino.",
+                "Correct ASR domain-term errors in transcript, for example Hack Club not Hat Club, Hackatime not Hackertime/Hacker Time, Stardance not Start Dance, OpenRouter, OpenAI, Anthropic, Congressional App Challenge, Challenger, Framework, Spindrift, and Pellegrino.",
                 "The source timestamp may be a local wall-clock time incorrectly tagged as UTC. Use recorded_at_interpretations and transcript evidence when matching calendar events.",
                 "Direct spoken names, greetings, introductions, and project names are strong evidence. If they conflict with a nearby calendar candidate, query for the spoken name/project before selecting the candidate.",
                 "Pick the best calendar event if supported by transcript/time/context evidence.",
-                "If no calendar event matches, set calendar_event_id to an empty string and calendar_confidence to 0, but still produce a useful meeting_title, meeting_start_at, meeting_end_at, summary, topics, action_items, evidence, and corrected_transcript. Personal journal entries or ad-hoc voice notes are valid outputs.",
-                "For no-calendar recordings, derive meeting_start_at from the recording timestamp and estimate meeting_end_at from diarized segment duration when available.",
+                "If no calendar event matches, set calendar_event_id to an empty string and calendar_confidence to 0, but still produce a useful title, start_at, end_at, summary, action_items, evidence, and transcript. Personal journal entries or ad-hoc voice notes are valid outputs.",
+                "For no-calendar recordings, derive start_at from the recording timestamp and estimate end_at from diarized segment duration when available.",
                 "speaker_map must summarize each original diarized_segments speaker_label as a real person only when that label is stable; otherwise map it to an unresolved mixed label. Do not invent generic speaker labels that are not present in diarized_segments.",
                 "If a speaker label might be one of several interviewers, do not write a candidate list as the speaker_name. Use a clearly mixed/unresolved label and put the candidate names in evidence unless you can verify a single person.",
                 "Assign real speaker names only when directly supported by greetings, self-introductions, calendar attendees, Slack/email identity evidence, or strongly identifying transcript context. Use low confidence and an unresolved label when uncertain.",
@@ -1047,21 +1067,20 @@ def enrichment_user_prompt(
                 "If a speaker label says lines that only the addressee could say, such as 'How are you, PERSON?' under PERSON's prefix, your mapping is wrong. Re-evaluate the speaker_map or mark the label mixed/unresolved.",
                 "For opening small talk, reason as a dialogue chain: greeting to addressee, addressee response, return question, original speaker response. Use that chain to validate speaker labels before final output.",
                 "Opening greetings are often split across diarization labels. If a low-confidence initial 'Hey NAME' is followed by another label saying 'hey/how are you' and a third label replies 'I'm doing great. How are you, PERSON?', attribute the greeting fragments to PERSON when that matches the later stable speaker, not to a different participant who only appears later.",
-                "Before final output, scan corrected_transcript for self-address contradictions. A line prefixed by PERSON must not contain 'How are you, PERSON?' or similar direct address to the same person. In an opening chain, 'I'm doing great. How are you, PERSON?' is spoken by the person who was just greeted, and the next 'I'm good' is PERSON's reply.",
+                "Before final output, scan transcript for self-address contradictions. A line prefixed by PERSON must not contain 'How are you, PERSON?' or similar direct address to the same person. In an opening chain, 'I'm doing great. How are you, PERSON?' is spoken by the person who was just greeted, and the next 'I'm good' is PERSON's reply.",
                 "In opening greetings, the same speaker should not ask 'how are you?' and then immediately answer 'I'm doing great'. If diarization splits 'Hey NAME, how are you?' into two short segments, merge or attribute those short greeting fragments to the greeter.",
                 "If the first few short greeting segments conflict with later stable diarization, prefer a coherent dialogue chain over the raw short-segment labels. It is better to merge or reattribute short opening greetings than to create a transcript where someone asks how they themselves are.",
-                "Use diarized_segments as the source of truth for speaker turns. Preserve chronological turn order in corrected_transcript.",
-                f"If transcript_char_count is at least {LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS}, set corrected_transcript exactly to {LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL}. Do not emit the full transcript in your JSON for long recordings; focus on calendar matching, attendee identities, speaker_map, domain-term evidence, notes, topics, and action items.",
-                "When you are not using the local transcript assembly sentinel, every substantive diarized segment should be represented in corrected_transcript. Do not compress it into a summary.",
-                "Format corrected_transcript as speaker turns, one turn per line or paragraph. Never put multiple 'Name:' speaker turns in the same paragraph.",
+                "Use diarized_segments as the source of truth for speaker turns. Preserve chronological turn order in transcript.",
+                f"If transcript_char_count is at least {LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS}, set transcript exactly to {LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL}. Do not emit the full transcript in your JSON for long recordings; focus on calendar matching, participant identities, speaker_map, domain-term evidence, summary, and action items.",
+                "When you are not using the local transcript assembly sentinel, every substantive diarized segment should be represented in transcript. Do not compress it into a summary.",
+                "Format transcript as speaker turns, one turn per line or paragraph. Never put multiple 'Name:' speaker turns in the same paragraph.",
                 "Use full resolved person names as turn prefixes, for example 'Person One:' instead of 'Person:'.",
-                "Corrected_transcript attribution is turn-level: do not blindly apply a global speaker label when diarization is mixed. If a low-confidence or contradictory segment has local dialogue evidence for a different speaker, prefix that turn with the locally supported person or an unresolved label.",
+                "Transcript attribution is turn-level: do not blindly apply a global speaker label when diarization is mixed. If a low-confidence or contradictory segment has local dialogue evidence for a different speaker, prefix that turn with the locally supported person or an unresolved label.",
                 "Do not attribute an opening low-confidence label to a later stable speaker if the dialogue chain contradicts it. For example, a label that later belongs to one participant may still have an early greeting turn that should be another participant or unresolved based on surrounding dialogue.",
-                "Only replace an original diarization label with a real person name when local turn evidence or stable speaker_map evidence supports it. If a label is mixed, unstable, or below 0.9 confidence, speaker_map should say mixed/unresolved, while corrected_transcript may still use real names for individual turns that have strong local evidence.",
-                "Write corrected_transcript as a faithful speaker-labeled transcript. Correct obvious ASR errors, names, punctuation, and paragraph breaks, but do not summarize, reorder, omit substantive sections, merge unrelated turns, or convert the transcript into prose notes.",
-                "Write meeting_notes as a readable narrative brief. This can be synthesized and compressed.",
-                "Create a concise useful meeting title.",
-                "Extract attendees, topics, and action items.",
+                "Only replace an original diarization label with a real person name when local turn evidence or stable speaker_map evidence supports it. If a label is mixed, unstable, or below 0.9 confidence, speaker_map should say mixed/unresolved, while transcript may still use real names for individual turns that have strong local evidence.",
+                "Write transcript as a faithful speaker-labeled transcript. Correct obvious ASR errors, names, punctuation, and paragraph breaks, but do not summarize, reorder, omit substantive sections, merge unrelated turns, or convert the transcript into prose notes.",
+                "Create a concise useful title.",
+                "Extract participants and action items.",
             ],
             "clickhouse_context": {
                 "result_format": "Tool results are CSV with truncation metadata.",
@@ -1086,11 +1105,10 @@ def enrichment_schema() -> dict[str, Any]:
         "properties": {
             "calendar_event_id": {"type": "string"},
             "calendar_confidence": {"type": "number"},
-            "meeting_title": {"type": "string"},
-            "meeting_start_at": {"type": "string"},
-            "meeting_end_at": {"type": "string"},
-            "meeting_location": {"type": "string"},
-            "attendees": {"type": "array", "items": {"type": "string"}},
+            "title": {"type": "string"},
+            "start_at": {"type": "string"},
+            "end_at": {"type": "string"},
+            "participants": {"type": "array", "items": {"type": "string"}},
             "speaker_map": {
                 "type": "array",
                 "items": {
@@ -1117,26 +1135,21 @@ def enrichment_schema() -> dict[str, Any]:
                     "required": ["speaker_label", "speaker_name", "confidence", "evidence"],
                 },
             },
-            "corrected_transcript": {"type": "string"},
-            "meeting_notes": {"type": "string"},
+            "transcript": {"type": "string"},
             "summary": {"type": "string"},
-            "topics": {"type": "array", "items": {"type": "string"}},
             "action_items": {"type": "array", "items": {"type": "string"}},
             "evidence": {"type": "array", "items": {"type": "string"}},
         },
         "required": [
             "calendar_event_id",
             "calendar_confidence",
-            "meeting_title",
-            "meeting_start_at",
-            "meeting_end_at",
-            "meeting_location",
-            "attendees",
+            "title",
+            "start_at",
+            "end_at",
+            "participants",
             "speaker_map",
-            "corrected_transcript",
-            "meeting_notes",
+            "transcript",
             "summary",
-            "topics",
             "action_items",
             "evidence",
         ],
@@ -1156,11 +1169,10 @@ def enrichment_row(
 ) -> dict[str, Any]:
     result = canonicalize_result_verified_name_mentions(result)
     speaker_names = speaker_names_from_result(result)
-    corrected_transcript = normalize_corrected_transcript_prefixes(
-        str(result.get("corrected_transcript") or result.get("cleaned_transcript") or ""),
+    transcript = normalize_corrected_transcript_prefixes(
+        result_transcript(result),
         speaker_names=speaker_names,
     )
-    meeting_notes = str(result.get("meeting_notes") or result.get("summary") or "")
     return {
         "account": str(recording.get("account", "")),
         "recording_id": str(recording.get("recording_id", "")),
@@ -1171,17 +1183,12 @@ def enrichment_row(
         "error": error,
         "calendar_event_id": str(result.get("calendar_event_id", "")),
         "calendar_confidence": float(result.get("calendar_confidence", 0) or 0),
-        "meeting_title": str(result.get("meeting_title", "")),
-        "meeting_start_at": parse_model_datetime(str(result.get("meeting_start_at", ""))),
-        "meeting_end_at": parse_model_datetime(str(result.get("meeting_end_at", ""))),
-        "meeting_location": str(result.get("meeting_location", "")),
-        "attendees_json": json.dumps(result.get("attendees") or [], sort_keys=True, separators=(",", ":")),
-        "speaker_map_json": json.dumps(result.get("speaker_map") or [], sort_keys=True, separators=(",", ":")),
-        "cleaned_transcript": corrected_transcript,
-        "corrected_transcript": corrected_transcript,
-        "meeting_notes": meeting_notes,
+        "title": result_title(result),
+        "start_at": parse_model_datetime(result_start_at(result)),
+        "end_at": parse_model_datetime(result_end_at(result)),
+        "participants_json": json.dumps(result_participants(result), sort_keys=True, separators=(",", ":")),
+        "transcript": transcript,
         "summary": str(result.get("summary", "")),
-        "topics_json": json.dumps(result.get("topics") or [], sort_keys=True, separators=(",", ":")),
         "action_items_json": json.dumps(result.get("action_items") or [], sort_keys=True, separators=(",", ":")),
         "evidence_json": json.dumps(result.get("evidence") or [], sort_keys=True, separators=(",", ":")),
         "raw_result_json": json.dumps(result, sort_keys=True, separators=(",", ":")),
@@ -1204,16 +1211,13 @@ def failed_enrichment_row(
         result={
             "calendar_event_id": "",
             "calendar_confidence": 0,
-            "meeting_title": "",
-            "meeting_start_at": "",
-            "meeting_end_at": "",
-            "meeting_location": "",
-            "attendees": [],
+            "title": "",
+            "start_at": "",
+            "end_at": "",
+            "participants": [],
             "speaker_map": [],
-            "corrected_transcript": "",
-            "meeting_notes": "",
+            "transcript": "",
             "summary": "",
-            "topics": [],
             "action_items": [],
             "evidence": [],
         },
@@ -1249,9 +1253,9 @@ def canonicalize_result_verified_name_mentions(result: Mapping[str, Any]) -> dic
 
 def verified_human_names_from_result(result: Mapping[str, Any]) -> list[str]:
     names: list[str] = []
-    for attendee in result.get("attendees") or []:
-        if isinstance(attendee, str) and attendee.strip() and "@" not in attendee:
-            names.append(attendee.strip())
+    for participant in result_participants(result):
+        if isinstance(participant, str) and participant.strip() and "@" not in participant:
+            names.append(participant.strip())
     names.extend(speaker_names_from_result(result))
 
     unique: list[str] = []

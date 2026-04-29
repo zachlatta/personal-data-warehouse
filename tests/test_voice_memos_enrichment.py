@@ -44,7 +44,7 @@ def test_validate_enrichment_result_flags_compression_short_prefixes_and_opening
                 {"speaker_label": "B", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "test"},
                 {"speaker_label": "C", "speaker_name": "Priya Narayan", "confidence": 0.99, "evidence": "test"},
             ],
-            "corrected_transcript": "Alex: I'm doing great. How are you.",
+            "transcript": "Alex: I'm doing great. How are you.",
         },
     )
 
@@ -62,7 +62,7 @@ def test_validate_enrichment_result_flags_same_speaker_asking_and_answering_gree
                 {"speaker_label": "B", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "test"},
                 {"speaker_label": "C", "speaker_name": "Priya Narayan", "confidence": 0.99, "evidence": "test"},
             ],
-            "corrected_transcript": "\n".join(
+            "transcript": "\n".join(
                 [
                     "Alex Rivera: Hey, Priya.",
                     "Priya Narayan: Hey, how are you?",
@@ -85,7 +85,7 @@ def test_validate_enrichment_result_flags_multiple_speaker_turns_on_one_line() -
                 {"speaker_label": "B", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "test"},
                 {"speaker_label": "C", "speaker_name": "Priya Narayan", "confidence": 0.99, "evidence": "test"},
             ],
-            "corrected_transcript": "Alex Rivera: Hi. Priya Narayan: Hello.",
+            "transcript": "Alex Rivera: Hi. Priya Narayan: Hello.",
         },
     )
 
@@ -97,10 +97,10 @@ def test_validate_enrichment_result_allows_full_attendee_prefix_outside_speaker_
         recording={"transcript_text": "short"},
         transcript_segments=[],
         result={
-            "meeting_title": "Test",
-            "meeting_start_at": "2026-04-27T14:00:00+00:00",
-            "meeting_end_at": "2026-04-27T14:30:00+00:00",
-            "attendees": ["Alex Rivera", "Priya Narayan"],
+            "title": "Test",
+            "start_at": "2026-04-27T14:00:00+00:00",
+            "end_at": "2026-04-27T14:30:00+00:00",
+            "participants": ["Alex Rivera", "Priya Narayan"],
             "speaker_map": [
                 {
                     "speaker_label": "A",
@@ -109,7 +109,7 @@ def test_validate_enrichment_result_allows_full_attendee_prefix_outside_speaker_
                     "evidence": "mixed",
                 }
             ],
-            "corrected_transcript": "Alex Rivera: Hello.\nUnresolved mixed speaker (label A): Hi.",
+            "transcript": "Alex Rivera: Hello.\nUnresolved mixed speaker (label A): Hi.",
         },
     )
 
@@ -121,15 +121,15 @@ def test_validate_enrichment_result_allows_local_transcript_assembly_sentinel_fo
         recording={"transcript_text": "x" * 20_000},
         transcript_segments=[{"text": "I'm doing great. How are you, Alex?"}],
         result={
-            "meeting_title": "Long Recording",
-            "meeting_start_at": "2026-04-27T14:00:00+00:00",
-            "meeting_end_at": "2026-04-27T14:30:00+00:00",
-            "attendees": ["Alex Rivera", "Priya Narayan"],
+            "title": "Long Recording",
+            "start_at": "2026-04-27T14:00:00+00:00",
+            "end_at": "2026-04-27T14:30:00+00:00",
+            "participants": ["Alex Rivera", "Priya Narayan"],
             "speaker_map": [
                 {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "test"},
                 {"speaker_label": "B", "speaker_name": "Priya Narayan", "confidence": 0.99, "evidence": "test"},
             ],
-            "corrected_transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+            "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
         },
     )
 
@@ -142,16 +142,16 @@ def test_validate_enrichment_result_flags_incomplete_attendee_names() -> None:
         recording={"transcript_text": "short"},
         transcript_segments=[],
         result={
-            "attendees": ["Riley", "Jordan Ellis"],
+            "participants": ["Riley", "Jordan Ellis"],
             "speaker_map": [
                 {"speaker_label": "A", "speaker_name": "Jordan Ellis", "confidence": 0.99, "evidence": "test"},
                 {"speaker_label": "B", "speaker_name": "Riley", "confidence": 0.99, "evidence": "test"},
             ],
-            "corrected_transcript": "Jordan Ellis: Hey, Riley.\nRiley: Hey.",
+            "transcript": "Jordan Ellis: Hey, Riley.\nRiley: Hey.",
         },
     )
 
-    assert any("attendees contain incomplete names" in issue for issue in issues)
+    assert any("participants contain incomplete names" in issue for issue in issues)
 
 
 def test_validate_enrichment_result_flags_attendee_email_name_hybrids() -> None:
@@ -159,16 +159,16 @@ def test_validate_enrichment_result_flags_attendee_email_name_hybrids() -> None:
         recording={"transcript_text": "short"},
         transcript_segments=[],
         result={
-            "attendees": ["Riley (riley@example.com)", "Jordan Ellis"],
+            "participants": ["Riley (riley@example.com)", "Jordan Ellis"],
             "speaker_map": [
                 {"speaker_label": "A", "speaker_name": "Jordan Ellis", "confidence": 0.99, "evidence": "test"},
                 {"speaker_label": "B", "speaker_name": "Riley (riley@example.com)", "confidence": 0.99, "evidence": "test"},
             ],
-            "corrected_transcript": "Jordan Ellis: Hey, Riley.\nRiley (riley@example.com): Hey.",
+            "transcript": "Jordan Ellis: Hey, Riley.\nRiley (riley@example.com): Hey.",
         },
     )
 
-    assert any("attendees contain incomplete names" in issue for issue in issues)
+    assert any("participants contain incomplete names" in issue for issue in issues)
     assert any("malformed speaker_name" in issue for issue in issues)
 
 
@@ -177,7 +177,7 @@ def test_validate_enrichment_result_flags_low_confidence_resolved_speaker_names(
         recording={"transcript_text": "short"},
         transcript_segments=[],
         result={
-            "attendees": ["Jordan Ellis", "Casey Morgan"],
+            "participants": ["Jordan Ellis", "Casey Morgan"],
             "speaker_map": [
                 {"speaker_label": "A", "speaker_name": "Jordan Ellis", "confidence": 0.56, "evidence": "weak"},
                 {
@@ -187,7 +187,7 @@ def test_validate_enrichment_result_flags_low_confidence_resolved_speaker_names(
                     "evidence": "mixed",
                 },
             ],
-            "corrected_transcript": "Jordan Ellis: Hello.\nInterviewer (Casey Morgan or Taylor Reed): Hi.",
+            "transcript": "Jordan Ellis: Hello.\nInterviewer (Casey Morgan or Taylor Reed): Hi.",
         },
     )
 
@@ -200,7 +200,7 @@ def test_validate_enrichment_result_flags_slash_separated_candidate_speaker_name
         recording={"transcript_text": "short"},
         transcript_segments=[],
         result={
-            "attendees": ["Jordan Ellis", "Casey Morgan", "Taylor Reed"],
+            "participants": ["Jordan Ellis", "Casey Morgan", "Taylor Reed"],
             "speaker_map": [
                 {
                     "speaker_label": "A",
@@ -209,7 +209,7 @@ def test_validate_enrichment_result_flags_slash_separated_candidate_speaker_name
                     "evidence": "mixed",
                 },
             ],
-            "corrected_transcript": "Interviewer (mixed: Casey Morgan / Taylor Reed): Hello.",
+            "transcript": "Interviewer (mixed: Casey Morgan / Taylor Reed): Hello.",
         },
     )
 
@@ -221,7 +221,7 @@ def test_validate_enrichment_result_flags_uncertainty_inside_speaker_name() -> N
         recording={"transcript_text": "short"},
         transcript_segments=[],
         result={
-            "attendees": ["Jordan Ellis", "Casey Morgan"],
+            "participants": ["Jordan Ellis", "Casey Morgan"],
             "speaker_map": [
                 {
                     "speaker_label": "A",
@@ -230,7 +230,7 @@ def test_validate_enrichment_result_flags_uncertainty_inside_speaker_name() -> N
                     "evidence": "mixed",
                 },
             ],
-            "corrected_transcript": "Interviewer (likely Jordan Ellis; may include Casey Morgan): Hello.",
+            "transcript": "Interviewer (likely Jordan Ellis; may include Casey Morgan): Hello.",
         },
     )
 
@@ -242,7 +242,7 @@ def test_validate_enrichment_result_flags_person_guess_inside_unresolved_speaker
         recording={"transcript_text": "short"},
         transcript_segments=[],
         result={
-            "attendees": ["Jordan Ellis", "Casey Morgan"],
+            "participants": ["Jordan Ellis", "Casey Morgan"],
             "speaker_map": [
                 {
                     "speaker_label": "A",
@@ -251,7 +251,7 @@ def test_validate_enrichment_result_flags_person_guess_inside_unresolved_speaker
                     "evidence": "mixed",
                 },
             ],
-            "corrected_transcript": "Mixed/Unresolved (Jordan Ellis + interviewer): Hello.",
+            "transcript": "Mixed/Unresolved (Jordan Ellis + interviewer): Hello.",
         },
     )
 
@@ -263,12 +263,12 @@ def test_validate_enrichment_result_allows_plain_mixed_unresolved_speaker_names(
         recording={"transcript_text": "short"},
         transcript_segments=[],
         result={
-            "attendees": ["Jordan Ellis", "Casey Morgan"],
+            "participants": ["Jordan Ellis", "Casey Morgan"],
             "speaker_map": [
                 {"speaker_label": "A", "speaker_name": "Mixed/Unresolved Speaker (A)", "confidence": 0.56, "evidence": "mixed"},
                 {"speaker_label": "B", "speaker_name": "Jordan Ellis", "confidence": 0.99, "evidence": "test"},
             ],
-            "corrected_transcript": "Mixed/Unresolved Speaker (A): Hello.\nJordan Ellis: Hi.",
+            "transcript": "Mixed/Unresolved Speaker (A): Hello.\nJordan Ellis: Hi.",
         },
     )
 
@@ -288,8 +288,8 @@ def test_segment_preserving_fallback_rebuilds_compressed_transcript_with_opening
         recording={"transcript_text": "x" * 10_000},
         transcript_segments=segments,
         result={
-            "__validation_issues": ["corrected_transcript is too compressed: 10 chars vs 10000 source chars"],
-            "attendees": ["Alex Rivera", "Priya Narayan", "Morgan Lee"],
+            "__validation_issues": ["transcript is too compressed: 10 chars vs 10000 source chars"],
+            "participants": ["Alex Rivera", "Priya Narayan", "Morgan Lee"],
             "speaker_map": [
                 {
                     "speaker_label": "A",
@@ -300,12 +300,12 @@ def test_segment_preserving_fallback_rebuilds_compressed_transcript_with_opening
                 {"speaker_label": "B", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "test"},
                 {"speaker_label": "C", "speaker_name": "Priya Narayan", "confidence": 0.99, "evidence": "test"},
             ],
-            "corrected_transcript": "short",
+            "transcript": "short",
             "evidence": [],
         },
     )
 
-    corrected = result["corrected_transcript"]
+    corrected = result["transcript"]
     assert corrected.splitlines()[:5] == [
         "Alex Rivera: Hey, Priya.",
         "Alex Rivera: Hey, how are you?",
@@ -321,16 +321,16 @@ def test_segment_preserving_fallback_assembles_local_transcript_sentinel() -> No
         recording={"transcript_text": "x" * 20_000},
         transcript_segments=[{"segment_index": 0, "speaker_label": "A", "text": "Hello there."}],
         result={
-            "attendees": ["Alex Rivera"],
+            "participants": ["Alex Rivera"],
             "speaker_map": [
                 {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "test"},
             ],
-            "corrected_transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+            "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
             "evidence": [],
         },
     )
 
-    assert result["corrected_transcript"] == "Alex Rivera: Hello there."
+    assert result["transcript"] == "Alex Rivera: Hello there."
     assert any("assembled locally" in evidence for evidence in result["evidence"])
 
 
@@ -339,7 +339,7 @@ def test_segment_preserving_fallback_does_not_use_context_phrases_as_speaker_nam
         recording={"transcript_text": "x" * 20_000},
         transcript_segments=[{"segment_index": 0, "speaker_label": "A", "text": "Hello there."}],
         result={
-            "attendees": ["Riley Chen"],
+            "participants": ["Riley Chen"],
             "speaker_map": [
                 {
                     "speaker_label": "A",
@@ -348,13 +348,13 @@ def test_segment_preserving_fallback_does_not_use_context_phrases_as_speaker_nam
                     "evidence": "Before Riley joins, this label contains setup banter.",
                 },
             ],
-            "corrected_transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+            "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
             "evidence": ["Before Riley joins, this label contains setup banter."],
         },
     )
 
-    assert result["corrected_transcript"] == "Unresolved mixed speaker (label A): Hello there."
-    assert "Before Riley:" not in result["corrected_transcript"]
+    assert result["transcript"] == "Unresolved mixed speaker (label A): Hello there."
+    assert "Before Riley:" not in result["transcript"]
 
 
 def test_name_canonicalization_handles_close_first_name_variant() -> None:
@@ -382,7 +382,7 @@ def test_segment_preserving_fallback_uses_tool_evidence_names_for_asr_variants()
         recording={"transcript_text": "x" * 5_000},
         transcript_segments=[{"segment_index": 0, "speaker_label": "A", "text": "I spoke with Robyn Correct."}],
         result={
-            "__validation_issues": ["corrected_transcript is too compressed: 10 chars vs 5000 source chars"],
+            "__validation_issues": ["transcript is too compressed: 10 chars vs 5000 source chars"],
             "__tool_calls": [
                 {
                     "name": "sql",
@@ -391,17 +391,17 @@ def test_segment_preserving_fallback_uses_tool_evidence_names_for_asr_variants()
                     },
                 }
             ],
-            "attendees": ["Alex Rivera"],
+            "participants": ["Alex Rivera"],
             "speaker_map": [
                 {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "test"},
             ],
-            "corrected_transcript": "short",
+            "transcript": "short",
             "evidence": [],
         },
     )
 
-    assert "Robin Correct" in result["corrected_transcript"]
-    assert "Robyn Correct" not in result["corrected_transcript"]
+    assert "Robin Correct" in result["transcript"]
+    assert "Robyn Correct" not in result["transcript"]
 
 
 def test_normalize_corrected_transcript_prefixes_carries_obvious_continuations() -> None:
@@ -435,14 +435,20 @@ def test_possible_identity_names_from_text_reads_capitalized_full_names() -> Non
     assert "Guest Person" in possible_identity_names_from_text("Guest Person accepted their invite")
 
 
-def test_enrichment_schema_separates_corrected_transcript_from_notes() -> None:
+def test_enrichment_schema_uses_simplified_output_fields() -> None:
     schema = enrichment_schema()
 
-    assert "corrected_transcript" in schema["properties"]
-    assert "meeting_notes" in schema["properties"]
+    assert "transcript" in schema["properties"]
+    assert "title" in schema["properties"]
+    assert "start_at" in schema["properties"]
+    assert "end_at" in schema["properties"]
+    assert "participants" in schema["properties"]
     assert "cleaned_transcript" not in schema["properties"]
-    assert "corrected_transcript" in schema["required"]
-    assert "meeting_notes" in schema["required"]
+    assert "corrected_transcript" not in schema["properties"]
+    assert "meeting_notes" not in schema["properties"]
+    assert "topics" not in schema["properties"]
+    assert "transcript" in schema["required"]
+    assert "participants" in schema["required"]
 
 
 def test_enrichment_user_prompt_includes_diarized_segments_and_speaker_rules() -> None:
@@ -465,9 +471,9 @@ def test_enrichment_user_prompt_includes_diarized_segments_and_speaker_rules() -
     assert "source of truth for speaker turns" in prompt
     assert "Do not invent generic speaker labels" in prompt
     assert "recorded_at_interpretations" in prompt
-    assert "Corrected_transcript attribution is turn-level" in prompt
+    assert "Transcript attribution is turn-level" in prompt
     assert "below 0.9 confidence" in prompt
-    assert "Hard requirements: accurate meeting date/time" in prompt
+    assert "Hard requirements: accurate date/time" in prompt
     assert "full name can be resolved" in prompt
     assert "calendar attendee emails plus Slack/email identity evidence" in prompt
     assert "relevant_tables" not in prompt
@@ -534,16 +540,16 @@ def test_ensure_recording_level_fields_fills_no_calendar_outputs() -> None:
         result={
             "calendar_event_id": "",
             "calendar_confidence": 0,
-            "meeting_title": "",
-            "meeting_start_at": "",
-            "meeting_end_at": "",
+            "title": "",
+            "start_at": "",
+            "end_at": "",
             "evidence": [],
         },
     )
 
-    assert result["meeting_title"] == "Voice Memo 2026-04-27 14:00 UTC"
-    assert result["meeting_start_at"] == "2026-04-27T14:00:00+00:00"
-    assert result["meeting_end_at"] == "2026-04-27T14:01:30+00:00"
+    assert result["title"] == "Voice Memo 2026-04-27 14:00 UTC"
+    assert result["start_at"] == "2026-04-27T14:00:00+00:00"
+    assert result["end_at"] == "2026-04-27T14:01:30+00:00"
     assert any("No matching calendar event" in evidence for evidence in result["evidence"])
 
 
@@ -575,16 +581,14 @@ def test_enrichment_row_serializes_structured_result() -> None:
         result={
             "calendar_event_id": "event1",
             "calendar_confidence": 0.8,
-            "meeting_title": "Meeting",
-            "meeting_start_at": "2026-04-27T10:00:00+00:00",
-            "meeting_end_at": "2026-04-27T11:00:00+00:00",
-            "meeting_location": "Zoom",
-            "attendees": ["a@example.com"],
+            "title": "Meeting",
+            "start_at": "2026-04-27T10:00:00+00:00",
+            "end_at": "2026-04-27T11:00:00+00:00",
+            "location": "Zoom",
+            "participants": ["a@example.com"],
             "speaker_map": [],
-            "corrected_transcript": "Speaker A: Hello",
-            "meeting_notes": "Notes",
+            "transcript": "Speaker A: Hello",
             "summary": "Summary",
-            "topics": ["Topic"],
             "action_items": [],
             "evidence": ["Evidence"],
         },
@@ -597,11 +601,9 @@ def test_enrichment_row_serializes_structured_result() -> None:
     )
 
     assert row["calendar_event_id"] == "event1"
-    assert row["meeting_start_at"] == datetime(2026, 4, 27, 10, tzinfo=UTC)
-    assert row["attendees_json"] == '["a@example.com"]'
-    assert row["cleaned_transcript"] == "Speaker A: Hello"
-    assert row["corrected_transcript"] == "Speaker A: Hello"
-    assert row["meeting_notes"] == "Notes"
+    assert row["start_at"] == datetime(2026, 4, 27, 10, tzinfo=UTC)
+    assert row["participants_json"] == '["a@example.com"]'
+    assert row["transcript"] == "Speaker A: Hello"
 
 
 def test_enrichment_row_normalizes_corrected_transcript_prefixes() -> None:
@@ -610,18 +612,16 @@ def test_enrichment_row_normalizes_corrected_transcript_prefixes() -> None:
         result={
             "calendar_event_id": "",
             "calendar_confidence": 0,
-            "meeting_title": "Meeting",
-            "meeting_start_at": "",
-            "meeting_end_at": "",
-            "meeting_location": "",
-            "attendees": [],
+            "title": "Meeting",
+            "start_at": "",
+            "end_at": "",
+            "location": "",
+            "participants": [],
             "speaker_map": [
                 {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 1, "evidence": "intro"},
             ],
-            "corrected_transcript": "Alex Rivera: Hello.\n\nThis is continued.",
-            "meeting_notes": "Notes",
+            "transcript": "Alex Rivera: Hello.\n\nThis is continued.",
             "summary": "Summary",
-            "topics": [],
             "action_items": [],
             "evidence": [],
         },
@@ -633,7 +633,7 @@ def test_enrichment_row_normalizes_corrected_transcript_prefixes() -> None:
         created_at=datetime(2026, 4, 27, tzinfo=UTC),
     )
 
-    assert row["corrected_transcript"] == "Alex Rivera: Hello.\n\nAlex Rivera: This is continued."
+    assert row["transcript"] == "Alex Rivera: Hello.\n\nAlex Rivera: This is continued."
 
 
 def test_enrichment_row_canonicalizes_close_name_variants_to_verified_attendees() -> None:
@@ -642,19 +642,17 @@ def test_enrichment_row_canonicalizes_close_name_variants_to_verified_attendees(
         result={
             "calendar_event_id": "",
             "calendar_confidence": 0,
-            "meeting_title": "Meeting",
-            "meeting_start_at": "",
-            "meeting_end_at": "",
-            "meeting_location": "",
-            "attendees": ["Alex Rivera", "Taylor Singh"],
+            "title": "Meeting",
+            "start_at": "",
+            "end_at": "",
+            "location": "",
+            "participants": ["Alex Rivera", "Taylor Singh"],
             "speaker_map": [
                 {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 1, "evidence": "intro"},
                 {"speaker_label": "B", "speaker_name": "Taylor Singh", "confidence": 1, "evidence": "calendar"},
             ],
-            "corrected_transcript": "Alex Rivera: Hey Tayler, how are you?\n\nTaylor Singh: Good.",
-            "meeting_notes": "Alex greeted Tayler.",
+            "transcript": "Alex Rivera: Hey Tayler, how are you?\n\nTaylor Singh: Good.",
             "summary": "Call with Tayler.",
-            "topics": [],
             "action_items": [],
             "evidence": ["Opening line says Tayler, matching Taylor Singh."],
         },
@@ -666,7 +664,7 @@ def test_enrichment_row_canonicalizes_close_name_variants_to_verified_attendees(
         created_at=datetime(2026, 4, 27, tzinfo=UTC),
     )
 
-    assert "Hey Taylor" in row["corrected_transcript"]
+    assert "Hey Taylor" in row["transcript"]
     assert "Tayler" not in row["raw_result_json"]
 
 

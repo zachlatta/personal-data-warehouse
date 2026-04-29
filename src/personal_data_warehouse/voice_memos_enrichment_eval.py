@@ -29,18 +29,19 @@ def score_enrichment_row(row: dict[str, Any], *, diarized_labels: list[str]) -> 
     components["calendar"] = score_calendar(row, issues)
     components["must_haves"] = score_must_haves(row, issues)
 
-    speaker_map = parse_json_list(row.get("speaker_map_json"))
+    raw_result = parse_json_object(row.get("raw_result_json"))
+    speaker_map = parse_json_list(row.get("speaker_map_json")) or parse_json_list(raw_result.get("speaker_map"))
     components["speaker_map"] = score_speaker_map(speaker_map, diarized_labels, issues)
-    attendees = parse_json_list(row.get("attendees_json"))
-    components["corrected_transcript"] = score_corrected_transcript(
-        str(row.get("corrected_transcript") or ""),
+    participants = parse_json_list(row.get("participants_json")) or parse_json_list(row.get("attendees_json"))
+    components["transcript"] = score_transcript(
+        str(row.get("transcript") or row.get("corrected_transcript") or ""),
         speaker_names=[
             *[str(item.get("speaker_name", "")) for item in speaker_map if isinstance(item, dict)],
-            *[str(attendee) for attendee in attendees if isinstance(attendee, str)],
+            *[str(participant) for participant in participants if isinstance(participant, str)],
         ],
         issues=issues,
     )
-    components["notes"] = score_notes(row, issues)
+    components["content"] = score_content(row, issues)
     components["tools"] = score_tools(row, issues)
 
     weights = {
@@ -48,8 +49,8 @@ def score_enrichment_row(row: dict[str, Any], *, diarized_labels: list[str]) -> 
         "calendar": 0.17,
         "must_haves": 0.22,
         "speaker_map": 0.18,
-        "corrected_transcript": 0.18,
-        "notes": 0.07,
+        "transcript": 0.18,
+        "content": 0.07,
         "tools": 0.10,
     }
     score = sum(components[name] * weight for name, weight in weights.items())
@@ -81,43 +82,44 @@ def score_calendar(row: dict[str, Any], issues: list[str]) -> float:
 
 def score_must_haves(row: dict[str, Any], issues: list[str]) -> float:
     score = 0.0
-    if parse_datetime_like(str(row.get("meeting_start_at") or "")) and parse_datetime_like(str(row.get("meeting_end_at") or "")):
+    if parse_datetime_like(str(row.get("start_at") or row.get("meeting_start_at") or "")) and parse_datetime_like(str(row.get("end_at") or row.get("meeting_end_at") or "")):
         score += 0.3
     else:
-        issues.append("meeting_start_at/end_at are missing or not parseable")
+        issues.append("start_at/end_at are missing or not parseable")
 
-    attendees = parse_json_list(row.get("attendees_json"))
-    unresolved_attendee_emails = [
-        attendee
-        for attendee in attendees
-        if isinstance(attendee, str) and "@" in attendee and not unresolved_speaker_name(attendee)
+    participants = parse_json_list(row.get("participants_json")) or parse_json_list(row.get("attendees_json"))
+    unresolved_participant_emails = [
+        participant
+        for participant in participants
+        if isinstance(participant, str) and "@" in participant and not unresolved_speaker_name(participant)
     ]
-    incomplete_attendee_names = incomplete_human_names(attendees)
+    incomplete_participant_names = incomplete_human_names(participants)
     if (
-        attendees
-        and all(isinstance(attendee, str) and attendee.strip() for attendee in attendees)
-        and not unresolved_attendee_emails
-        and not incomplete_attendee_names
+        participants
+        and all(isinstance(participant, str) and participant.strip() for participant in participants)
+        and not unresolved_participant_emails
+        and not incomplete_participant_names
     ):
         score += 0.3
     else:
-        if unresolved_attendee_emails:
-            issues.append(f"attendees contain unresolved email addresses: {unresolved_attendee_emails[:5]}")
-        elif incomplete_attendee_names:
-            issues.append(f"attendees contain incomplete names: {incomplete_attendee_names[:5]}")
+        if unresolved_participant_emails:
+            issues.append(f"participants contain unresolved email addresses: {unresolved_participant_emails[:5]}")
+        elif incomplete_participant_names:
+            issues.append(f"participants contain incomplete names: {incomplete_participant_names[:5]}")
         else:
-            issues.append("attendees are empty or malformed")
+            issues.append("participants are empty or malformed")
 
-    corrected = str(row.get("corrected_transcript") or "")
-    bad_terms = bad_transcription_terms(corrected)
+    transcript = str(row.get("transcript") or row.get("corrected_transcript") or "")
+    bad_terms = bad_transcription_terms(transcript)
     if not bad_terms:
         score += 0.25
     else:
-        issues.append(f"corrected_transcript contains likely bad ASR terms: {bad_terms[:5]}")
+        issues.append(f"transcript contains likely bad ASR terms: {bad_terms[:5]}")
 
-    speaker_map = parse_json_list(row.get("speaker_map_json"))
+    raw_result = parse_json_object(row.get("raw_result_json"))
+    speaker_map = parse_json_list(row.get("speaker_map_json")) or parse_json_list(raw_result.get("speaker_map"))
     names = [str(item.get("speaker_name", "")) for item in speaker_map if isinstance(item, dict)]
-    bad_names = incomplete_speaker_names_for_unresolved_attendees(names, attendees)
+    bad_names = incomplete_speaker_names_for_unresolved_participants(names, participants)
     if names and all(name == name.strip() and not malformed_person_name(name) for name in names) and not bad_names:
         score += 0.15
     else:
@@ -161,15 +163,15 @@ def score_speaker_map(speaker_map: list[Any], diarized_labels: list[str], issues
     return max(0.0, min(1.0, valid))
 
 
-def score_corrected_transcript(corrected: str, *, speaker_names: list[str], issues: list[str]) -> float:
-    if len(corrected) < 500:
-        issues.append("corrected_transcript is too short")
+def score_transcript(transcript: str, *, speaker_names: list[str], issues: list[str]) -> float:
+    if len(transcript) < 500:
+        issues.append("transcript is too short")
         return 0.0
 
-    line_turns = [line.strip() for line in corrected.splitlines() if line.strip()]
-    paragraphs = line_turns if len(line_turns) > 1 else [paragraph.strip() for paragraph in re.split(r"\n\s*\n", corrected) if paragraph.strip()]
+    line_turns = [line.strip() for line in transcript.splitlines() if line.strip()]
+    paragraphs = line_turns if len(line_turns) > 1 else [paragraph.strip() for paragraph in re.split(r"\n\s*\n", transcript) if paragraph.strip()]
     if not paragraphs:
-        issues.append("corrected_transcript has no paragraphs")
+        issues.append("transcript has no paragraphs")
         return 0.0
 
     allowed = set(speaker_names)
@@ -185,41 +187,36 @@ def score_corrected_transcript(corrected: str, *, speaker_names: list[str], issu
 
     prefix_score = 1.0
     if unprefixed:
-        issues.append(f"corrected_transcript has unprefixed paragraphs: {unprefixed[:3]}")
+        issues.append(f"transcript has unprefixed paragraphs: {unprefixed[:3]}")
         prefix_score -= min(0.5, 0.1 * len(unprefixed))
     if unknown_prefixes:
-        issues.append(f"corrected_transcript uses prefixes outside speaker_map: {sorted(set(unknown_prefixes))[:5]}")
+        issues.append(f"transcript uses prefixes outside speaker_map: {sorted(set(unknown_prefixes))[:5]}")
         prefix_score -= min(0.5, 0.1 * len(set(unknown_prefixes)))
 
     turn_count_score = min(1.0, len(paragraphs) / 20)
     narrative_penalty = 0.0
     narrative_openers = ("the meeting opened", "the call covered", "hack club met", "this was a")
-    if corrected.strip().lower().startswith(narrative_openers):
-        issues.append("corrected_transcript starts like narrative notes")
+    if transcript.strip().lower().startswith(narrative_openers):
+        issues.append("transcript starts like narrative notes")
         narrative_penalty = 0.4
     return max(0.0, min(1.0, 0.7 * prefix_score + 0.3 * turn_count_score - narrative_penalty))
 
 
-def score_notes(row: dict[str, Any], issues: list[str]) -> float:
-    meeting_notes = str(row.get("meeting_notes") or "")
+def score_content(row: dict[str, Any], issues: list[str]) -> float:
     summary = str(row.get("summary") or "")
     action_items = parse_json_list(row.get("action_items_json"))
     evidence = parse_json_list(row.get("evidence_json"))
     score = 0.0
     if len(summary) >= 120:
-        score += 0.25
+        score += 0.4
     else:
         issues.append("summary is short")
-    if len(meeting_notes) >= 400:
-        score += 0.35
-    else:
-        issues.append("meeting_notes are short")
     if action_items:
-        score += 0.2
+        score += 0.3
     else:
         issues.append("action_items are empty")
     if evidence:
-        score += 0.2
+        score += 0.3
     else:
         issues.append("evidence is empty")
     return score
@@ -253,6 +250,18 @@ def parse_json_list(value: Any) -> list[Any]:
     except json.JSONDecodeError:
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def parse_json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def parse_datetime_like(value: str) -> bool:
@@ -289,13 +298,13 @@ def malformed_person_name(name: str) -> bool:
     return bool(re.search(r"\b(speaker|unknown|unidentified)\b", normalized, flags=re.IGNORECASE))
 
 
-def incomplete_speaker_names_for_unresolved_attendees(names: list[str], attendees: list[Any]) -> list[str]:
-    unresolved_attendee_emails = [
-        str(attendee)
-        for attendee in attendees
-        if isinstance(attendee, str) and "@" in attendee and not unresolved_speaker_name(attendee)
+def incomplete_speaker_names_for_unresolved_participants(names: list[str], participants: list[Any]) -> list[str]:
+    unresolved_participant_emails = [
+        str(participant)
+        for participant in participants
+        if isinstance(participant, str) and "@" in participant and not unresolved_speaker_name(participant)
     ]
-    if not unresolved_attendee_emails:
+    if not unresolved_participant_emails:
         return []
     incomplete = []
     for name in names:
@@ -369,13 +378,13 @@ def severe_issues(issues: list[str]) -> bool:
         "speaker_map contains non-diarized labels",
         "speaker_map contains ambiguous candidate speaker name",
         "speaker ",
-        "corrected_transcript starts like narrative notes",
-        "corrected_transcript uses prefixes outside speaker_map",
-        "meeting_start_at/end_at are missing or not parseable",
-        "attendees are empty or malformed",
-        "attendees contain unresolved email addresses",
-        "attendees contain incomplete names",
-        "corrected_transcript contains likely bad ASR terms",
+        "transcript starts like narrative notes",
+        "transcript uses prefixes outside speaker_map",
+        "start_at/end_at are missing or not parseable",
+        "participants are empty or malformed",
+        "participants contain unresolved email addresses",
+        "participants contain incomplete names",
+        "transcript contains likely bad ASR terms",
         "speaker names are incomplete when full names are known",
     )
     return any(any(issue.startswith(marker) for marker in severe_markers) for issue in issues)

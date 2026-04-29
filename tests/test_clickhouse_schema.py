@@ -100,10 +100,31 @@ def test_voice_memos_schema_creates_file_table() -> None:
     assert any("CREATE TABLE IF NOT EXISTS agent_runs" in command for command in commands)
     assert any("CREATE TABLE IF NOT EXISTS agent_run_events" in command for command in commands)
     assert any("CREATE TABLE IF NOT EXISTS agent_run_tool_calls" in command for command in commands)
-    assert any("corrected_transcript String" in command for command in commands)
-    assert any("meeting_notes String" in command for command in commands)
-    assert any("ADD COLUMN IF NOT EXISTS corrected_transcript" in command for command in commands)
-    assert any("ADD COLUMN IF NOT EXISTS meeting_notes" in command for command in commands)
+    assert any("transcript String" in command for command in commands)
+    assert any("participants_json String" in command for command in commands)
+    assert any("ADD COLUMN IF NOT EXISTS transcript" in command for command in commands)
+    assert any("DROP COLUMN IF EXISTS cleaned_transcript" in command for command in commands)
+
+
+def test_voice_memos_enrichment_schema_backfills_renamed_columns_before_drop() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+
+    warehouse._command = commands.append
+    warehouse._query = lambda _sql: [
+        ("meeting_title",),
+        ("meeting_start_at",),
+        ("meeting_end_at",),
+        ("attendees_json",),
+        ("corrected_transcript",),
+    ]
+
+    warehouse.ensure_voice_memos_tables()
+
+    update_index = next(index for index, command in enumerate(commands) if "UPDATE" in command and "meeting_title" in command)
+    drop_index = next(index for index, command in enumerate(commands) if "DROP COLUMN IF EXISTS meeting_title" in command)
+    assert update_index < drop_index
+    assert "participants_json = if(participants_json = '', attendees_json, participants_json)" in commands[update_index]
 
 
 def test_voice_memos_schema_recreates_old_content_hash_ordering() -> None:

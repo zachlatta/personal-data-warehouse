@@ -201,17 +201,12 @@ VOICE_MEMO_ENRICHMENT_COLUMNS = (
     "error",
     "calendar_event_id",
     "calendar_confidence",
-    "meeting_title",
-    "meeting_start_at",
-    "meeting_end_at",
-    "meeting_location",
-    "attendees_json",
-    "speaker_map_json",
-    "cleaned_transcript",
-    "corrected_transcript",
-    "meeting_notes",
+    "title",
+    "start_at",
+    "end_at",
+    "participants_json",
+    "transcript",
     "summary",
-    "topics_json",
     "action_items_json",
     "evidence_json",
     "raw_result_json",
@@ -784,17 +779,12 @@ class ClickHouseWarehouse:
                 error String,
                 calendar_event_id String,
                 calendar_confidence Float64,
-                meeting_title String,
-                meeting_start_at DateTime64(3, 'UTC'),
-                meeting_end_at DateTime64(3, 'UTC'),
-                meeting_location String,
-                attendees_json String,
-                speaker_map_json String,
-                cleaned_transcript String,
-                corrected_transcript String,
-                meeting_notes String,
+                title String,
+                start_at DateTime64(3, 'UTC'),
+                end_at DateTime64(3, 'UTC'),
+                participants_json String,
+                transcript String,
                 summary String,
-                topics_json String,
                 action_items_json String,
                 evidence_json String,
                 raw_result_json String,
@@ -806,9 +796,46 @@ class ClickHouseWarehouse:
             ORDER BY (account, recording_id, provider, model, prompt_version)
             """
         )
-        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS corrected_transcript String AFTER cleaned_transcript")
-        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS meeting_notes String AFTER corrected_transcript")
+        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS title String AFTER calendar_confidence")
+        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS start_at DateTime64(3, 'UTC') AFTER title")
+        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS end_at DateTime64(3, 'UTC') AFTER start_at")
+        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS participants_json String AFTER end_at")
+        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS transcript String AFTER participants_json")
+        columns = self._table_column_names("voice_memo_enrichments")
+        if {"meeting_title", "meeting_start_at", "meeting_end_at", "attendees_json", "corrected_transcript"}.issubset(columns):
+            self._command(
+                """
+                ALTER TABLE voice_memo_enrichments
+                UPDATE
+                    title = if(title = '', meeting_title, title),
+                    start_at = if(start_at = toDateTime64(0, 3, 'UTC'), meeting_start_at, start_at),
+                    end_at = if(end_at = toDateTime64(0, 3, 'UTC'), meeting_end_at, end_at),
+                    participants_json = if(participants_json = '', attendees_json, participants_json),
+                    transcript = if(transcript = '', corrected_transcript, transcript)
+                WHERE 1
+                SETTINGS mutations_sync = 2
+                """
+            )
+        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS meeting_title")
+        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS meeting_start_at")
+        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS meeting_end_at")
+        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS meeting_location")
+        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS attendees_json")
+        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS speaker_map_json")
+        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS cleaned_transcript")
+        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS corrected_transcript")
+        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS meeting_notes")
+        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS topics_json")
         self.ensure_agent_tables()
+
+    def _table_column_names(self, table_name: str) -> set[str]:
+        query = getattr(self, "_query", None)
+        if not callable(query):
+            return set()
+        try:
+            return {str(row[0]) for row in query(f"DESCRIBE TABLE {table_name}")}
+        except Exception:
+            return set()
 
     def ensure_agent_tables(self) -> None:
         self._command(

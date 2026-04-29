@@ -12,16 +12,16 @@ def base_row(**overrides):
         "error": "",
         "calendar_event_id": "event1",
         "calendar_confidence": 0.95,
-        "meeting_start_at": "2026-04-27T10:00:00+00:00",
-        "meeting_end_at": "2026-04-27T11:00:00+00:00",
-        "attendees_json": json.dumps(["Alex Rivera", "Riley Chen"]),
+        "start_at": "2026-04-27T10:00:00+00:00",
+        "end_at": "2026-04-27T11:00:00+00:00",
+        "participants_json": json.dumps(["Alex Rivera", "Riley Chen"]),
         "speaker_map_json": json.dumps(
             [
                 {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.95, "evidence": "intro"},
                 {"speaker_label": "B", "speaker_name": "Riley", "confidence": 0.95, "evidence": "greeting"},
             ]
         ),
-        "corrected_transcript": "\n\n".join(
+        "transcript": "\n\n".join(
             [
                 "Alex Rivera: Hello Riley.",
                 "Riley: Hello Alex.",
@@ -30,11 +30,18 @@ def base_row(**overrides):
             ]
             * 6
         ),
-        "meeting_notes": "These are detailed notes. " * 30,
         "summary": "This is a useful summary of the meeting. " * 5,
         "action_items_json": json.dumps(["Follow up"]),
         "evidence_json": json.dumps(["Calendar matched"]),
-        "raw_result_json": json.dumps({"__tool_calls": [{"output": {"csv": "a\n1", "error": ""}}]}),
+        "raw_result_json": json.dumps(
+            {
+                "speaker_map": [
+                    {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.95, "evidence": "intro"},
+                    {"speaker_label": "B", "speaker_name": "Riley", "confidence": 0.95, "evidence": "greeting"},
+                ],
+                "__tool_calls": [{"output": {"csv": "a\n1", "error": ""}}],
+            }
+        ),
     }
     row.update(overrides)
     return row
@@ -56,7 +63,7 @@ def test_score_enrichment_row_penalizes_missing_speaker_labels() -> None:
 
 
 def test_score_enrichment_row_penalizes_unknown_transcript_prefix() -> None:
-    row = base_row(corrected_transcript="\n\n".join(["Alex Rivera: Hello.", "Unknown: Hi.", "Riley: Bye."] * 12))
+    row = base_row(transcript="\n\n".join(["Alex Rivera: Hello.", "Unknown: Hi.", "Riley: Bye."] * 12))
 
     score = score_enrichment_row(row, diarized_labels=["A", "B"])
 
@@ -66,7 +73,7 @@ def test_score_enrichment_row_penalizes_unknown_transcript_prefix() -> None:
 
 def test_score_enrichment_row_scores_single_newline_turns() -> None:
     row = base_row(
-        corrected_transcript="\n".join(
+        transcript="\n".join(
             [
                 "Alex Rivera: Hello. This is a longer turn with enough words for scoring.",
                 "Riley: Hi. This is another longer turn with enough words for scoring.",
@@ -77,10 +84,10 @@ def test_score_enrichment_row_scores_single_newline_turns() -> None:
 
     score = score_enrichment_row(row, diarized_labels=["A", "B"])
 
-    assert score.components["corrected_transcript"] == 1.0
+    assert score.components["transcript"] == 1.0
 
 
-def test_score_enrichment_row_allows_attendee_turn_level_prefixes() -> None:
+def test_score_enrichment_row_allows_participant_turn_level_prefixes() -> None:
     row = base_row(
         speaker_map_json=json.dumps(
             [
@@ -92,8 +99,8 @@ def test_score_enrichment_row_allows_attendee_turn_level_prefixes() -> None:
                 }
             ]
         ),
-        attendees_json=json.dumps(["Alex Rivera", "Riley Chen"]),
-        corrected_transcript="\n".join(["Alex Rivera: Hello.", "Unresolved mixed speaker (label A): Hi."] * 12),
+        participants_json=json.dumps(["Alex Rivera", "Riley Chen"]),
+        transcript="\n".join(["Alex Rivera: Hello.", "Unresolved mixed speaker (label A): Hi."] * 12),
     )
 
     score = score_enrichment_row(row, diarized_labels=["A"])
@@ -114,7 +121,7 @@ def test_score_enrichment_row_allows_unresolved_low_confidence_speaker() -> None
                 },
             ]
         ),
-        corrected_transcript="\n\n".join(["Alex Rivera: Hello.", "Speaker B (mixed diarization): Hi."] * 12),
+        transcript="\n\n".join(["Alex Rivera: Hello.", "Speaker B (mixed diarization): Hi."] * 12),
     )
 
     score = score_enrichment_row(row, diarized_labels=["A", "B"])
@@ -151,7 +158,7 @@ def test_score_enrichment_row_fails_candidate_list_speaker_name() -> None:
                 {"speaker_label": "B", "speaker_name": "Riley Chen", "confidence": 0.95, "evidence": "intro"},
             ]
         ),
-        corrected_transcript="\n\n".join(
+        transcript="\n\n".join(
             ["Interviewer (mixed: Casey Morgan / Taylor Reed): Hello.", "Riley Chen: Hi."] * 12
         ),
     )
@@ -175,7 +182,7 @@ def test_score_enrichment_row_fails_uncertainty_inside_speaker_name() -> None:
                 {"speaker_label": "B", "speaker_name": "Riley Chen", "confidence": 0.95, "evidence": "intro"},
             ]
         ),
-        corrected_transcript="\n\n".join(
+        transcript="\n\n".join(
             ["Interviewer (likely Casey Morgan; may include Taylor Reed): Hello.", "Riley Chen: Hi."] * 12
         ),
     )
@@ -199,7 +206,7 @@ def test_score_enrichment_row_fails_person_guess_inside_unresolved_speaker_name(
                 {"speaker_label": "B", "speaker_name": "Riley Chen", "confidence": 0.95, "evidence": "intro"},
             ]
         ),
-        corrected_transcript="\n\n".join(
+        transcript="\n\n".join(
             ["Mixed/Unresolved (Casey Morgan + interviewer): Hello.", "Riley Chen: Hi."] * 12
         ),
     )
@@ -212,10 +219,10 @@ def test_score_enrichment_row_fails_person_guess_inside_unresolved_speaker_name(
 
 def test_score_enrichment_row_treats_must_haves_as_severe() -> None:
     row = base_row(
-        meeting_start_at="",
-        meeting_end_at="",
-        attendees_json=json.dumps([]),
-        corrected_transcript="\n\n".join(
+        start_at="",
+        end_at="",
+        participants_json=json.dumps([]),
+        transcript="\n\n".join(
             ["Alex Rivera: Hat Club discussed Start Dance.", "Riley: Hackertime and Open Router are useful."] * 12
         ),
     )
@@ -223,18 +230,18 @@ def test_score_enrichment_row_treats_must_haves_as_severe() -> None:
     score = score_enrichment_row(row, diarized_labels=["A", "B"])
 
     assert not score.passed
-    assert any("meeting_start_at/end_at" in issue for issue in score.issues)
-    assert any("attendees are empty" in issue for issue in score.issues)
+    assert any("start_at/end_at" in issue for issue in score.issues)
+    assert any("participants are empty" in issue for issue in score.issues)
     assert any("bad ASR terms" in issue for issue in score.issues)
 
 
-def test_score_enrichment_row_fails_unresolved_attendee_emails_and_known_incomplete_names() -> None:
+def test_score_enrichment_row_fails_unresolved_participant_emails_and_known_incomplete_names() -> None:
     row = base_row(
-        attendees_json=json.dumps(["host@example.com", "guest@example.com"]),
+        participants_json=json.dumps(["host@example.com", "guest@example.com"]),
         speaker_map_json=json.dumps(
             [
                 {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.95, "evidence": "intro"},
-                {"speaker_label": "B", "speaker_name": "Alex", "confidence": 0.95, "evidence": "calendar attendee"},
+                {"speaker_label": "B", "speaker_name": "Alex", "confidence": 0.95, "evidence": "calendar participant"},
             ]
         ),
     )
@@ -246,18 +253,18 @@ def test_score_enrichment_row_fails_unresolved_attendee_emails_and_known_incompl
     assert any("Alex" in issue and "incomplete" in issue for issue in score.issues)
 
 
-def test_score_enrichment_row_fails_incomplete_attendee_names() -> None:
-    row = base_row(attendees_json=json.dumps(["Alex Rivera", "Alex"]))
+def test_score_enrichment_row_fails_incomplete_participant_names() -> None:
+    row = base_row(participants_json=json.dumps(["Alex Rivera", "Alex"]))
 
     score = score_enrichment_row(row, diarized_labels=["A", "B"])
 
     assert not score.passed
-    assert any("attendees contain incomplete names" in issue for issue in score.issues)
+    assert any("participants contain incomplete names" in issue for issue in score.issues)
 
 
-def test_score_enrichment_row_fails_attendee_email_name_hybrids() -> None:
+def test_score_enrichment_row_fails_participant_email_name_hybrids() -> None:
     row = base_row(
-        attendees_json=json.dumps(["Riley (riley@example.com)", "Alex Rivera"]),
+        participants_json=json.dumps(["Riley (riley@example.com)", "Alex Rivera"]),
         speaker_map_json=json.dumps(
             [
                 {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.95, "evidence": "intro"},

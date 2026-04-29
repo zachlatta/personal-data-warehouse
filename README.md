@@ -320,15 +320,15 @@ domain keyterms for Hack Club and common project/product terms.
 
 Transcript enrichment is a separate agent-backed Dagster asset. It reads completed transcription
 runs, asks a one-off subscription-authenticated Codex or Claude Code container to produce structured
-JSON, and stores a cleaned transcript, calendar match, attendees, speaker map, summary, topics,
-action items, evidence, and raw structured result JSON. The agent container receives only the
+JSON, and stores a canonical transcript, calendar match, participants, summary, action items,
+evidence, and raw structured result JSON. The agent container receives only the
 per-run prompt, schema, and deterministic local CLI helpers, not production API keys.
 
 By default enrichment processes all completed transcripts from the last twelve weeks that do not
 already have the current enrichment prompt version. Set `VOICE_MEMOS_ENRICHMENT_BATCH_SIZE` to a
 positive number to cap a run; the default `0` means no cap. If a recording does not match a calendar
-event, the enrichment still produces a title, recording-based time range, summary, topics, and
-corrected transcript. For long recordings, the model returns metadata and speaker/term evidence,
+event, the enrichment still produces a title, recording-based time range, summary, action items,
+and transcript. For long recordings, the model returns metadata and speaker/term evidence,
 then the pipeline assembles the detailed speaker-labeled transcript locally from diarized segments
 to avoid large model responses timing out.
 
@@ -470,7 +470,7 @@ The sync creates and maintains:
 - `voice_memo_files`: latest known metadata for Voice Memos audio files uploaded through Drive
 - `voice_memo_transcription_runs`: raw transcription provider results and run state
 - `voice_memo_transcript_segments`: normalized diarized transcript segments
-- `voice_memo_enrichments`: cleaned transcript, calendar match, speaker map, and searchable meeting metadata
+- `voice_memo_enrichments`: canonical transcript, calendar match, participants, summary, action items, and evidence
 - `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
 
