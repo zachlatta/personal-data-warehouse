@@ -3,24 +3,27 @@ from __future__ import annotations
 import os
 
 from dagster import (
-    DefaultScheduleStatus,
+    DefaultSensorStatus,
     Definitions,
     MaterializeResult,
     MetadataValue,
+    RunRequest,
     RetryPolicy,
+    SkipReason,
     asset,
     define_asset_job,
     definitions,
-    schedule,
+    sensor,
 )
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs.voice_memos_drive_ingest import voice_memos_drive_ingest
-from personal_data_warehouse.schedule_guards import skip_if_job_active
+from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.voice_memos_drive_ingest import build_google_drive_service
 from personal_data_warehouse.voice_memos_transcription import (
+    ASSEMBLYAI_PROVIDER,
     AssemblyAIClient,
     GoogleDriveVoiceMemoAudioSource,
     VoiceMemosTranscriptionRunner,
@@ -28,6 +31,7 @@ from personal_data_warehouse.voice_memos_transcription import (
 
 VOICE_MEMOS_TRANSCRIPTION_POSTGRES_LOCK_ID = 7_403_111_840
 DEFAULT_VOICE_MEMOS_TRANSCRIPTION_BATCH_SIZE = 3
+VOICE_MEMOS_TRANSCRIPTION_SENSOR_INTERVAL_SECONDS = 60
 
 
 @asset(
@@ -95,13 +99,22 @@ voice_memos_transcription_job = define_asset_job(
 )
 
 
-@schedule(
-    cron_schedule="*/15 * * * *",
+@sensor(
     job=voice_memos_transcription_job,
-    default_status=DefaultScheduleStatus.RUNNING,
+    default_status=DefaultSensorStatus.RUNNING,
+    minimum_interval_seconds=VOICE_MEMOS_TRANSCRIPTION_SENSOR_INTERVAL_SECONDS,
 )
-def voice_memos_transcription_every_fifteen_minutes(context):
-    return skip_if_job_active(context, job_name="voice_memos_transcription_job")
+def voice_memos_transcription_backlog_sensor(context):
+    active = skip_if_job_in_progress(context, job_name="voice_memos_transcription_job")
+    if isinstance(active, SkipReason):
+        return active
+
+    settings = load_settings(require_gmail=False, require_assemblyai=True)
+    warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+    if not warehouse.load_untranscribed_voice_memo_files(provider=ASSEMBLYAI_PROVIDER, limit=1):
+        return SkipReason("No untranscribed Voice Memos found in ClickHouse.")
+
+    return RunRequest(tags={"voice_memos_trigger": "transcription_backlog"})
 
 
 @definitions
@@ -109,5 +122,5 @@ def defs() -> Definitions:
     return Definitions(
         assets=[voice_memos_transcription],
         jobs=[voice_memos_transcription_job],
-        schedules=[voice_memos_transcription_every_fifteen_minutes],
+        sensors=[voice_memos_transcription_backlog_sensor],
     )

@@ -1,29 +1,33 @@
 from __future__ import annotations
 
 from dagster import (
-    DefaultScheduleStatus,
+    DefaultSensorStatus,
     Definitions,
     MaterializeResult,
     MetadataValue,
+    RunRequest,
     RetryPolicy,
+    SkipReason,
     asset,
     define_asset_job,
     definitions,
-    schedule,
+    sensor,
 )
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.schedule_guards import skip_if_job_active
+from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.voice_memos_drive_ingest import (
     GoogleDriveVoiceMemosPromoter,
     VoiceMemosDriveIngestRunner,
     build_google_drive_service,
+    has_drive_metadata_payloads,
     iter_drive_metadata_payloads,
 )
 
 VOICE_MEMOS_DRIVE_INGEST_POSTGRES_LOCK_ID = 7_403_111_839
+VOICE_MEMOS_SENSOR_INTERVAL_SECONDS = 60
 
 
 @asset(
@@ -73,13 +77,28 @@ voice_memos_drive_ingest_job = define_asset_job(
 )
 
 
-@schedule(
-    cron_schedule="*/5 * * * *",
+@sensor(
     job=voice_memos_drive_ingest_job,
-    default_status=DefaultScheduleStatus.RUNNING,
+    default_status=DefaultSensorStatus.RUNNING,
+    minimum_interval_seconds=VOICE_MEMOS_SENSOR_INTERVAL_SECONDS,
 )
-def voice_memos_drive_ingest_every_five_minutes(context):
-    return skip_if_job_active(context, job_name="voice_memos_drive_ingest_job")
+def voice_memos_drive_inbox_sensor(context):
+    active = skip_if_job_in_progress(context, job_name="voice_memos_drive_ingest_job")
+    if isinstance(active, SkipReason):
+        return active
+
+    settings = load_settings(require_gmail=False, require_voice_memos=True)
+    if settings.voice_memos is None:
+        raise RuntimeError("Voice Memos sync is not configured")
+    service = build_google_drive_service(account=settings.voice_memos.account, settings=settings)
+    if not has_drive_metadata_payloads(
+        service=service,
+        folder_id=settings.voice_memos.google_drive_folder_id,
+        stage="inbox",
+    ):
+        return SkipReason("No Voice Memos inbox metadata found in Google Drive.")
+
+    return RunRequest(tags={"voice_memos_trigger": "drive_inbox"})
 
 
 @definitions
@@ -87,5 +106,5 @@ def defs() -> Definitions:
     return Definitions(
         assets=[voice_memos_drive_ingest],
         jobs=[voice_memos_drive_ingest_job],
-        schedules=[voice_memos_drive_ingest_every_five_minutes],
+        sensors=[voice_memos_drive_inbox_sensor],
     )

@@ -286,8 +286,11 @@ for short indexing fields such as `pdw_stage`, `pdw_kind`, and content hashes. D
 `pdw_stage=inbox`, then promotes processed files to `apple-voice-memos/library/YYYY/MM/`.
 A future S3 backend can keep the same metadata format and swap only the object-store implementation.
 
-Dagster runs `voice_memos_drive_ingest` every five minutes by default. For a Coolify scheduled
-task instead of the Dagster UI:
+Dagster uses enabled sensors for the Voice Memos pipeline. The Drive inbox sensor checks for new
+Google Drive metadata every minute and launches ingest when it finds work. Backlog sensors then
+launch transcription and enrichment when ClickHouse has unprocessed recordings or transcripts.
+An hourly enrichment schedule remains enabled as a repair pass. For a Coolify scheduled task
+instead of the Dagster UI:
 
 ```bash
 uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.voice_memos_drive_ingest import voice_memos_drive_ingest; raise SystemExit(0 if materialize([voice_memos_drive_ingest]).success else 1)"
@@ -323,7 +326,7 @@ result JSON. The query tool shares the same read-only conventions as the MCP que
 `bin/readonly-clickhouse`: statements are locally restricted to read-only verbs and ClickHouse is
 called with `readonly=1`.
 
-By default enrichment processes all completed transcripts from the last eight weeks that do not
+By default enrichment processes all completed transcripts from the last twelve weeks that do not
 already have the current enrichment prompt version. Set `VOICE_MEMOS_ENRICHMENT_BATCH_SIZE` to a
 positive number to cap a run; the default `0` means no cap. If a recording does not match a calendar
 event, the enrichment still produces a title, recording-based time range, summary, topics, and

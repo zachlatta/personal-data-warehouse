@@ -10,6 +10,12 @@ ACTIVE_RUN_STATUSES = (
     DagsterRunStatus.STARTING,
     DagsterRunStatus.STARTED,
 )
+IN_PROGRESS_RUN_STATUSES = (
+    DagsterRunStatus.QUEUED,
+    DagsterRunStatus.STARTING,
+    DagsterRunStatus.STARTED,
+    DagsterRunStatus.CANCELING,
+)
 
 
 def skip_if_job_active(context, *, job_name: str) -> SkipReason | dict:
@@ -21,6 +27,16 @@ def skip_if_job_active(context, *, job_name: str) -> SkipReason | dict:
     )
     if runs:
         return SkipReason(f"Skipping {job_name}; an earlier run was updated in the last {stale_after}.")
+    return {}
+
+
+def skip_if_job_in_progress(context, *, job_name: str) -> SkipReason | dict:
+    runs = context.instance.get_runs(
+        filters=RunsFilter(job_name=job_name, statuses=IN_PROGRESS_RUN_STATUSES),
+        limit=1,
+    )
+    if runs:
+        return SkipReason(f"Skipping {job_name}; an earlier run is already queued or in progress.")
     return {}
 
 

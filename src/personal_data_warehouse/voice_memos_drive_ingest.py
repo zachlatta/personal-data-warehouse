@@ -294,13 +294,7 @@ def iter_drive_metadata_payloads(
     page_token: str | None = None
     while True:
         response = execute_drive_request(service.files().list(
-            q=(
-                "trashed = false "
-                "and appProperties has { key='pdw_source' and value='voice_memos' } "
-                f"and appProperties has {{ key='pdw_root_folder_id' and value='{escape_drive_query_value(folder_id)}' }} "
-                "and appProperties has { key='pdw_kind' and value='voice_memo_metadata' } "
-                f"and appProperties has {{ key='pdw_stage' and value='{escape_drive_query_value(stage)}' }}"
-            ),
+            q=drive_metadata_files_query(folder_id=folder_id, stage=stage),
             pageSize=1000,
             pageToken=page_token,
             fields="nextPageToken,files(id,name,webViewLink,appProperties)",
@@ -321,6 +315,32 @@ def iter_drive_metadata_payloads(
         page_token = response.get("nextPageToken")
         if not page_token:
             return
+
+
+def has_drive_metadata_payloads(
+    *,
+    service,
+    folder_id: str,
+    stage: str = "inbox",
+) -> bool:
+    response = execute_drive_request(service.files().list(
+        q=drive_metadata_files_query(folder_id=folder_id, stage=stage),
+        pageSize=1,
+        fields="files(id)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ))
+    return bool(response.get("files", [])) if isinstance(response, Mapping) else False
+
+
+def drive_metadata_files_query(*, folder_id: str, stage: str) -> str:
+    return (
+        "trashed = false "
+        "and appProperties has { key='pdw_source' and value='voice_memos' } "
+        f"and appProperties has {{ key='pdw_root_folder_id' and value='{escape_drive_query_value(folder_id)}' }} "
+        "and appProperties has { key='pdw_kind' and value='voice_memo_metadata' } "
+        f"and appProperties has {{ key='pdw_stage' and value='{escape_drive_query_value(stage)}' }}"
+    )
 
 
 def download_drive_json(*, service, file_id: str) -> Mapping[str, Any]:
