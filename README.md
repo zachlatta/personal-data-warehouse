@@ -11,6 +11,8 @@ Current ingestion path:
 - Google Calendar events use the same per-account Google OAuth tokens.
 - Calendar first runs do a full event sync, then later runs use Google Calendar `syncToken`.
 - If Calendar expires the saved sync token, the sync falls back to a full resync for that calendar.
+- Voice Memos use a two-stage path: a local macOS uploader writes audio files and JSON metadata
+  to Google Drive, then a Dagster asset ingests those metadata into ClickHouse.
 
 ## Dependency Management
 
@@ -55,6 +57,10 @@ GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE=100
 CALENDAR_ACCOUNTS=zach@hackclub.com
 CALENDAR_ZACH_HACKCLUB_COM_CALENDAR_IDS=primary
 CALENDAR_PAGE_SIZE=2500
+VOICE_MEMOS_ACCOUNT=you@example.com
+VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
+VOICE_MEMOS_STORAGE_BACKEND=google_drive
+VOICE_MEMOS_EXTENSIONS=.m4a,.qta
 ```
 
 Notes:
@@ -92,6 +98,9 @@ Add each domain's OAuth app client secrets before authorizing mailboxes in that 
 GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64=...
 uv run personal-data-warehouse-google-auth --email zach@zachlatta.com --write-env
 ```
+
+If Voice Memos are configured, the auth flow also requests Google Drive access so the local
+uploader and Drive ingest asset can use the same account token.
 
 ## Running The Sync
 
@@ -201,6 +210,97 @@ Calendar asset:
 uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.calendar_sync import calendar_event_sync; raise SystemExit(0 if materialize([calendar_event_sync]).success else 1)"
 ```
 
+## Voice Memos Sync
+
+Voice Memos are split across two processes so the Mac never talks to ClickHouse directly:
+
+1. A local macOS CLI scans Apple's Voice Memos recordings directory and uploads new `.m4a`
+   and `.qta` audio files to the Google Drive inbox, alongside one JSON metadata file per audio file.
+2. The remote Dagster asset reads inbox metadata, writes metadata rows to ClickHouse, then promotes
+   the audio and JSON objects into the library prefix.
+
+Configure the shared Drive folder:
+
+```bash
+VOICE_MEMOS_ACCOUNT=you@example.com
+VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
+VOICE_MEMOS_STORAGE_BACKEND=google_drive
+VOICE_MEMOS_EXTENSIONS=.m4a,.qta
+```
+
+Re-authorize the Google account after adding Voice Memos config so the token includes Drive scope:
+
+```bash
+uv run personal-data-warehouse-google-auth --email you@example.com --write-env
+```
+
+Run the local Mac uploader:
+
+```bash
+uv run personal-data-warehouse-voice-memos-upload
+```
+
+The configured Drive folder is treated as the object-storage root. The uploader creates real
+subfolders under that root, using colocated inbox object keys such as
+`apple-voice-memos/inbox/YYYY/MM/YYYY-MM-DD-<sha256>.qta` and
+`apple-voice-memos/inbox/YYYY/MM/YYYY-MM-DD-<sha256>.json`. The JSON body is storage-location-free:
+it stores recording metadata, not Drive paths or future S3 keys. Dagster derives provider locations
+from the backend context and stores them in ClickHouse columns. Drive `appProperties` are used only
+for short indexing fields such as `pdw_stage`, `pdw_kind`, and content hashes. Dagster only scans
+`pdw_stage=inbox`, then promotes processed files to `apple-voice-memos/library/YYYY/MM/`.
+A future S3 backend can keep the same metadata format and swap only the object-store implementation.
+
+Dagster runs `voice_memos_drive_ingest` every five minutes by default. For a Coolify scheduled
+task instead of the Dagster UI:
+
+```bash
+uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.voice_memos_drive_ingest import voice_memos_drive_ingest; raise SystemExit(0 if materialize([voice_memos_drive_ingest]).success else 1)"
+```
+
+Transcription is a separate Dagster asset. Configure AssemblyAI:
+
+```bash
+ASSEMBLYAI_API_KEY=...
+VOICE_MEMOS_TRANSCRIPTION_PROVIDER=assemblyai
+VOICE_MEMOS_TRANSCRIPTION_BATCH_SIZE=3
+OPENAI_API_KEY=...
+OPENAI_MODEL=gpt-5.3-codex
+OPENAI_TIMEOUT_SECONDS=1800
+VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS=8
+VOICE_MEMOS_ENRICHMENT_BATCH_SIZE=0
+```
+
+Run one transcription batch:
+
+```bash
+uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.voice_memos_transcription import voice_memos_transcription; raise SystemExit(0 if materialize([voice_memos_transcription]).success else 1)"
+```
+
+The transcription asset stores the raw AssemblyAI response JSON in ClickHouse and also stores
+normalized diarized segments for search. AssemblyAI is configured with Universal-3 Pro plus
+domain keyterms for Hack Club and common project/product terms.
+
+Transcript enrichment is a separate OpenAI-backed Dagster asset. It reads completed transcription
+runs, gives the model a bounded read-only ClickHouse query tool, and stores a cleaned transcript,
+calendar match, attendees, speaker map, summary, topics, action items, evidence, and raw structured
+result JSON. The query tool shares the same read-only conventions as the MCP query app and
+`bin/readonly-clickhouse`: statements are locally restricted to read-only verbs and ClickHouse is
+called with `readonly=1`.
+
+By default enrichment processes all completed transcripts from the last eight weeks that do not
+already have the current enrichment prompt version. Set `VOICE_MEMOS_ENRICHMENT_BATCH_SIZE` to a
+positive number to cap a run; the default `0` means no cap. If a recording does not match a calendar
+event, the enrichment still produces a title, recording-based time range, summary, topics, and
+corrected transcript. For long recordings, the model returns metadata and speaker/term evidence,
+then the pipeline assembles the detailed speaker-labeled transcript locally from diarized segments
+to avoid large model responses timing out.
+
+Run enrichment:
+
+```bash
+uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.voice_memos_enrichment import voice_memos_enrichment; raise SystemExit(0 if materialize([voice_memos_enrichment]).success else 1)"
+```
+
 ## ClickHouse Tables
 
 The sync creates and maintains:
@@ -211,6 +311,10 @@ The sync creates and maintains:
 - `gmail_sync_state`: per-mailbox sync cursor and last run status
 - `calendar_events`: latest known state for each calendar event
 - `calendar_sync_state`: per-account/calendar sync token and last run status
+- `voice_memo_files`: latest known metadata for Voice Memos audio files uploaded through Drive
+- `voice_memo_transcription_runs`: raw transcription provider results and run state
+- `voice_memo_transcript_segments`: normalized diarized transcript segments
+- `voice_memo_enrichments`: cleaned transcript, calendar match, speaker map, and searchable meeting metadata
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
 
 The warehouse also creates account-management views for current user state:

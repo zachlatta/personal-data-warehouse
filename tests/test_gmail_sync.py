@@ -18,7 +18,7 @@ import zipfile
 from googleapiclient.errors import HttpError
 from httplib2 import Response
 from PIL import Image
-from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.config import DEFAULT_OPENAI_TIMEOUT_SECONDS, load_settings
 from personal_data_warehouse.defs.gmail_sync import (
     gmail_mailbox_sync_every_minute,
     ollama_resource_from_env,
@@ -238,6 +238,25 @@ def test_load_settings_enables_gmail_attachment_ai_fallback_by_default(monkeypat
     assert settings.gmail_attachment_ai_fallback_model == "qwen3-vl:2b"
     assert settings.gmail_attachment_ai_fallback_timeout_seconds == 60
     assert settings.gmail_attachment_ai_fallback_pull_model is True
+
+
+def test_load_settings_uses_long_openai_timeout_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+
+    settings = load_settings(require_clickhouse=False, require_openai=True)
+
+    assert settings.openai is not None
+    assert settings.openai.timeout_seconds == DEFAULT_OPENAI_TIMEOUT_SECONDS == 1800
+
+
+def test_load_settings_accepts_openai_timeout_override(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("OPENAI_TIMEOUT_SECONDS", "2400")
+
+    settings = load_settings(require_clickhouse=False, require_openai=True)
+
+    assert settings.openai is not None
+    assert settings.openai.timeout_seconds == 2400
 
 
 def test_load_settings_accepts_gmail_attachment_ai_fallback(monkeypatch) -> None:
@@ -1730,7 +1749,7 @@ def test_message_to_row_extracts_headers_and_bodies() -> None:
         "payload": {
             "headers": [
                 {"name": "Subject", "value": "Test subject"},
-                {"name": "From", "value": "Zach <zach@example.com>"},
+                {"name": "From", "value": "Example Sender <sender@example.com>"},
                 {"name": "To", "value": "friend@example.com"},
                 {"name": "Message-ID", "value": "<abc@example.com>"},
             ],
@@ -1752,7 +1771,7 @@ def test_message_to_row_extracts_headers_and_bodies() -> None:
     assert row["message_id"] == "gmail-id"
     assert row["history_id"] == 42
     assert row["subject"] == "Test subject"
-    assert row["from_address"] == "zach@example.com"
+    assert row["from_address"] == "sender@example.com"
     assert row["to_addresses"] == ["friend@example.com"]
     assert row["body_text"] == "hello"
     assert row["body_html"] == "<p>hello</p>"

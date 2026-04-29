@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 DEFAULT_GMAIL_PAGE_SIZE = 500
 DEFAULT_GMAIL_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_GMAIL_ATTACHMENT_TEXT_MAX_CHARS = 1_000_000
@@ -22,6 +23,18 @@ DEFAULT_CALENDAR_PAGE_SIZE = 2500
 DEFAULT_SLACK_PAGE_SIZE = 200
 DEFAULT_SLACK_LOOKBACK_DAYS = 14
 DEFAULT_SLACK_THREAD_AUDIT_DAYS = 30
+DEFAULT_VOICE_MEMOS_EXTENSIONS = (".m4a", ".qta")
+DEFAULT_VOICE_MEMOS_STORAGE_BACKEND = "google_drive"
+DEFAULT_VOICE_MEMOS_TRANSCRIPTION_PROVIDER = "assemblyai"
+DEFAULT_ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com"
+DEFAULT_ASSEMBLYAI_POLL_INTERVAL_SECONDS = 5
+DEFAULT_ASSEMBLYAI_TIMEOUT_SECONDS = 1800
+DEFAULT_ASSEMBLYAI_MIN_SPEAKERS_EXPECTED = 1
+DEFAULT_ASSEMBLYAI_MAX_SPEAKERS_EXPECTED = 8
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
+DEFAULT_OPENAI_MODEL = "gpt-5.3-codex"
+DEFAULT_OPENAI_TIMEOUT_SECONDS = 1800
+DEFAULT_OPENAI_REASONING_EFFORT = "high"
 
 
 def _parse_csv_env(value: str | None) -> tuple[str, ...]:
@@ -34,6 +47,15 @@ def _parse_bool_env(value: str | None, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _parse_optional_int_env(name: str, default: int | None) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    if not value.strip():
+        return None
+    return int(value)
 
 
 def _json_env_value(name: str) -> str | None:
@@ -76,6 +98,35 @@ class SlackAccount:
 
 
 @dataclass(frozen=True)
+class VoiceMemosConfig:
+    account: str
+    recordings_path: str
+    extensions: tuple[str, ...]
+    storage_backend: str
+    google_drive_folder_id: str
+    transcription_provider: str = DEFAULT_VOICE_MEMOS_TRANSCRIPTION_PROVIDER
+
+
+@dataclass(frozen=True)
+class AssemblyAIConfig:
+    api_key: str
+    base_url: str = DEFAULT_ASSEMBLYAI_BASE_URL
+    poll_interval_seconds: int = DEFAULT_ASSEMBLYAI_POLL_INTERVAL_SECONDS
+    timeout_seconds: int = DEFAULT_ASSEMBLYAI_TIMEOUT_SECONDS
+    min_speakers_expected: int | None = DEFAULT_ASSEMBLYAI_MIN_SPEAKERS_EXPECTED
+    max_speakers_expected: int | None = DEFAULT_ASSEMBLYAI_MAX_SPEAKERS_EXPECTED
+
+
+@dataclass(frozen=True)
+class OpenAIConfig:
+    api_key: str
+    base_url: str = DEFAULT_OPENAI_BASE_URL
+    model: str = DEFAULT_OPENAI_MODEL
+    timeout_seconds: int = DEFAULT_OPENAI_TIMEOUT_SECONDS
+    reasoning_effort: str | None = DEFAULT_OPENAI_REASONING_EFFORT
+
+
+@dataclass(frozen=True)
 class Settings:
     clickhouse_url: str | None
     gmail_accounts: tuple[GmailAccount, ...]
@@ -106,6 +157,9 @@ class Settings:
     gmail_attachment_ai_fallback_pull_model: bool = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL
     google_oauth_client_secrets_json_by_account: tuple[tuple[str, str], ...] = ()
     google_oauth_client_secrets_json_by_domain: tuple[tuple[str, str], ...] = ()
+    voice_memos: VoiceMemosConfig | None = None
+    assemblyai: AssemblyAIConfig | None = None
+    openai: OpenAIConfig | None = None
 
     def account_for_email(self, email_address: str) -> GmailAccount:
         normalized = email_address.strip().lower()
@@ -142,6 +196,9 @@ def load_settings(
     require_gmail_client_secrets: bool = False,
     require_calendar: bool = False,
     require_slack: bool = False,
+    require_voice_memos: bool = False,
+    require_assemblyai: bool = False,
+    require_openai: bool = False,
 ) -> Settings:
     load_dotenv()
 
@@ -280,11 +337,125 @@ def load_settings(
     if slack_page_size < 1 or slack_page_size > 200:
         raise ValueError("SLACK_PAGE_SIZE must be between 1 and 200")
 
+    default_voice_memos_account = account_emails[0] if account_emails else ""
+    voice_memos_account = os.getenv("VOICE_MEMOS_ACCOUNT", default_voice_memos_account).strip()
+    voice_memos_storage_backend = os.getenv(
+        "VOICE_MEMOS_STORAGE_BACKEND",
+        DEFAULT_VOICE_MEMOS_STORAGE_BACKEND,
+    ).strip()
+    voice_memos_recordings_path = os.path.expanduser(
+        os.getenv(
+            "VOICE_MEMOS_RECORDINGS_PATH",
+            "~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings",
+        )
+    )
+    voice_memos_extensions = tuple(
+        extension if extension.startswith(".") else f".{extension}"
+        for extension in (
+            _parse_csv_env(os.getenv("VOICE_MEMOS_EXTENSIONS"))
+            or DEFAULT_VOICE_MEMOS_EXTENSIONS
+        )
+    )
+    voice_memos_google_drive_folder_id = (
+        os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
+        or ""
+    ).strip()
+    voice_memos_transcription_provider = os.getenv(
+        "VOICE_MEMOS_TRANSCRIPTION_PROVIDER",
+        DEFAULT_VOICE_MEMOS_TRANSCRIPTION_PROVIDER,
+    ).strip()
+    voice_memos: VoiceMemosConfig | None = None
+    if require_voice_memos or os.getenv("VOICE_MEMOS_ACCOUNT") or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID"):
+        if not voice_memos_account:
+            raise ValueError("VOICE_MEMOS_ACCOUNT or GMAIL_ACCOUNTS must be set for Voice Memos sync")
+        if voice_memos_storage_backend not in {"google_drive"}:
+            raise ValueError("VOICE_MEMOS_STORAGE_BACKEND currently supports: google_drive")
+        if voice_memos_transcription_provider not in {"assemblyai"}:
+            raise ValueError("VOICE_MEMOS_TRANSCRIPTION_PROVIDER currently supports: assemblyai")
+        if voice_memos_storage_backend == "google_drive" and not voice_memos_google_drive_folder_id:
+            raise ValueError("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set for Google Drive Voice Memos storage")
+        if not voice_memos_extensions:
+            raise ValueError("VOICE_MEMOS_EXTENSIONS must include at least one extension")
+        voice_memos = VoiceMemosConfig(
+            account=voice_memos_account,
+            recordings_path=voice_memos_recordings_path,
+            extensions=tuple(extension.lower() for extension in voice_memos_extensions),
+            storage_backend=voice_memos_storage_backend,
+            google_drive_folder_id=voice_memos_google_drive_folder_id,
+            transcription_provider=voice_memos_transcription_provider,
+        )
+
+    assemblyai_api_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
+    assemblyai: AssemblyAIConfig | None = None
+    if require_assemblyai or assemblyai_api_key:
+        if not assemblyai_api_key:
+            raise ValueError("ASSEMBLYAI_API_KEY must be set for Voice Memos transcription")
+        assemblyai_poll_interval_seconds = int(
+            os.getenv(
+                "ASSEMBLYAI_POLL_INTERVAL_SECONDS",
+                str(DEFAULT_ASSEMBLYAI_POLL_INTERVAL_SECONDS),
+            )
+        )
+        if assemblyai_poll_interval_seconds < 1:
+            raise ValueError("ASSEMBLYAI_POLL_INTERVAL_SECONDS must be at least 1")
+        assemblyai_timeout_seconds = int(
+            os.getenv("ASSEMBLYAI_TIMEOUT_SECONDS", str(DEFAULT_ASSEMBLYAI_TIMEOUT_SECONDS))
+        )
+        if assemblyai_timeout_seconds < 1:
+            raise ValueError("ASSEMBLYAI_TIMEOUT_SECONDS must be at least 1")
+        assemblyai_min_speakers_expected = _parse_optional_int_env(
+            "ASSEMBLYAI_MIN_SPEAKERS_EXPECTED",
+            DEFAULT_ASSEMBLYAI_MIN_SPEAKERS_EXPECTED,
+        )
+        assemblyai_max_speakers_expected = _parse_optional_int_env(
+            "ASSEMBLYAI_MAX_SPEAKERS_EXPECTED",
+            DEFAULT_ASSEMBLYAI_MAX_SPEAKERS_EXPECTED,
+        )
+        if assemblyai_min_speakers_expected is not None and assemblyai_min_speakers_expected < 1:
+            raise ValueError("ASSEMBLYAI_MIN_SPEAKERS_EXPECTED must be at least 1")
+        if assemblyai_max_speakers_expected is not None and assemblyai_max_speakers_expected < 1:
+            raise ValueError("ASSEMBLYAI_MAX_SPEAKERS_EXPECTED must be at least 1")
+        if (
+            assemblyai_min_speakers_expected is not None
+            and assemblyai_max_speakers_expected is not None
+            and assemblyai_min_speakers_expected > assemblyai_max_speakers_expected
+        ):
+            raise ValueError("ASSEMBLYAI_MIN_SPEAKERS_EXPECTED must be less than or equal to ASSEMBLYAI_MAX_SPEAKERS_EXPECTED")
+        assemblyai = AssemblyAIConfig(
+            api_key=assemblyai_api_key,
+            base_url=(os.getenv("ASSEMBLYAI_BASE_URL") or DEFAULT_ASSEMBLYAI_BASE_URL).rstrip("/"),
+            poll_interval_seconds=assemblyai_poll_interval_seconds,
+            timeout_seconds=assemblyai_timeout_seconds,
+            min_speakers_expected=assemblyai_min_speakers_expected,
+            max_speakers_expected=assemblyai_max_speakers_expected,
+        )
+
+    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    openai: OpenAIConfig | None = None
+    if require_openai or openai_api_key:
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY must be set for Voice Memos enrichment")
+        openai_timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", str(DEFAULT_OPENAI_TIMEOUT_SECONDS)))
+        if openai_timeout_seconds < 1:
+            raise ValueError("OPENAI_TIMEOUT_SECONDS must be at least 1")
+        openai = OpenAIConfig(
+            api_key=openai_api_key,
+            base_url=(os.getenv("OPENAI_BASE_URL") or DEFAULT_OPENAI_BASE_URL).rstrip("/"),
+            model=os.getenv("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
+            timeout_seconds=openai_timeout_seconds,
+            reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT") or DEFAULT_OPENAI_REASONING_EFFORT,
+        )
+
+    google_scopes = [GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE]
+    if voice_memos and voice_memos.storage_backend == "google_drive":
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
+
     return Settings(
         clickhouse_url=clickhouse_url,
         gmail_accounts=gmail_accounts,
         gmail_oauth_client_secrets_json=client_secrets_json,
-        google_scopes=(GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE),
+        google_scopes=tuple(dict.fromkeys(google_scopes)),
         gmail_scopes=(GMAIL_READONLY_SCOPE,),
         gmail_page_size=page_size,
         gmail_include_spam_trash=_parse_bool_env(os.getenv("GMAIL_INCLUDE_SPAM_TRASH"), True),
@@ -320,4 +491,7 @@ def load_settings(
             os.getenv("SLACK_THREAD_AUDIT_DAYS", str(DEFAULT_SLACK_THREAD_AUDIT_DAYS))
         ),
         slack_force_full_sync=_parse_bool_env(os.getenv("SLACK_FORCE_FULL_SYNC"), False),
+        voice_memos=voice_memos,
+        assemblyai=assemblyai,
+        openai=openai,
     )

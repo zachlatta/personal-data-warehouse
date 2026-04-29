@@ -81,6 +81,61 @@ def test_slack_schema_creates_identity_table_and_account_state_view() -> None:
     assert any("CREATE OR REPLACE VIEW slack_account_state_items" in command for command in commands)
 
 
+def test_voice_memos_schema_creates_file_table() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+
+    warehouse._command = commands.append
+
+    warehouse.ensure_voice_memos_tables()
+
+    assert any("CREATE TABLE IF NOT EXISTS voice_memo_files" in command for command in commands)
+    assert any("storage_backend LowCardinality(String)" in command for command in commands)
+    assert any("metadata_storage_key String" in command for command in commands)
+    assert any("ORDER BY (account, recording_id)" in command for command in commands)
+    assert not any("ALTER TABLE IF EXISTS voice_memo_files" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS voice_memo_transcription_runs" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS voice_memo_transcript_segments" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS voice_memo_enrichments" in command for command in commands)
+    assert any("corrected_transcript String" in command for command in commands)
+    assert any("meeting_notes String" in command for command in commands)
+    assert any("ADD COLUMN IF NOT EXISTS corrected_transcript" in command for command in commands)
+    assert any("ADD COLUMN IF NOT EXISTS meeting_notes" in command for command in commands)
+
+
+def test_voice_memos_schema_recreates_old_content_hash_ordering() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+
+    warehouse._command = commands.append
+    warehouse._query = lambda _sql: [("CREATE TABLE voice_memo_files (...) ORDER BY (account, content_sha256)",)]
+
+    warehouse.ensure_voice_memos_tables()
+
+    assert commands[0] == "DROP TABLE IF EXISTS voice_memo_files"
+    assert any("ORDER BY (account, recording_id)" in command for command in commands)
+
+
+def test_voice_memos_untranscribed_query_orders_recent_recordings() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    queries: list[str] = []
+
+    def fake_query(sql: str):
+        queries.append(sql)
+        return []
+
+    warehouse._query = fake_query
+
+    assert warehouse.load_untranscribed_voice_memo_files(provider="assemblyai", limit=3) == []
+
+    assert "FROM voice_memo_files AS f" in queries[0]
+    assert "voice_memo_transcription_runs" in queries[0]
+    assert "provider = 'assemblyai'" in queries[0]
+    assert "status = 'completed'" in queries[0]
+    assert "ORDER BY f.recorded_at DESC" in queries[0]
+    assert "LIMIT 3" in queries[0]
+
+
 def test_combined_account_state_view_created_when_source_views_exist() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     commands: list[str] = []

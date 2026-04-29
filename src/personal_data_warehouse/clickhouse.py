@@ -133,6 +133,92 @@ CALENDAR_SYNC_STATE_COLUMNS = (
     "sync_version",
 )
 
+VOICE_MEMO_FILE_COLUMNS = (
+    "account",
+    "recording_id",
+    "title",
+    "original_path",
+    "filename",
+    "extension",
+    "content_type",
+    "size_bytes",
+    "content_sha256",
+    "file_created_at",
+    "file_modified_at",
+    "recorded_at",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "metadata_storage_key",
+    "metadata_storage_file_id",
+    "metadata_storage_url",
+    "metadata_content_sha256",
+    "is_deleted",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS = (
+    "account",
+    "recording_id",
+    "provider",
+    "provider_transcript_id",
+    "model",
+    "status",
+    "error",
+    "transcript_text",
+    "raw_result_json",
+    "requested_at",
+    "completed_at",
+    "sync_version",
+)
+
+VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS = (
+    "account",
+    "recording_id",
+    "provider",
+    "provider_transcript_id",
+    "segment_index",
+    "speaker_label",
+    "start_ms",
+    "end_ms",
+    "confidence",
+    "text",
+    "words_json",
+    "created_at",
+    "sync_version",
+)
+
+VOICE_MEMO_ENRICHMENT_COLUMNS = (
+    "account",
+    "recording_id",
+    "provider",
+    "model",
+    "prompt_version",
+    "status",
+    "error",
+    "calendar_event_id",
+    "calendar_confidence",
+    "meeting_title",
+    "meeting_start_at",
+    "meeting_end_at",
+    "meeting_location",
+    "attendees_json",
+    "speaker_map_json",
+    "cleaned_transcript",
+    "corrected_transcript",
+    "meeting_notes",
+    "summary",
+    "topics_json",
+    "action_items_json",
+    "evidence_json",
+    "raw_result_json",
+    "created_at",
+    "sync_version",
+)
+
 SLACK_TEAM_COLUMNS = (
     "account",
     "team_id",
@@ -561,6 +647,139 @@ class ClickHouseWarehouse:
             """
         )
 
+    def ensure_voice_memos_tables(self) -> None:
+        if self._voice_memo_files_needs_recreate():
+            self._command("DROP TABLE IF EXISTS voice_memo_files")
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS voice_memo_files (
+                account LowCardinality(String),
+                recording_id String,
+                title String,
+                original_path String,
+                filename String,
+                extension LowCardinality(String),
+                content_type LowCardinality(String),
+                size_bytes UInt64,
+                content_sha256 String,
+                file_created_at DateTime64(3, 'UTC'),
+                file_modified_at DateTime64(3, 'UTC'),
+                recorded_at DateTime64(3, 'UTC'),
+                storage_backend LowCardinality(String),
+                storage_key String,
+                storage_file_id String,
+                storage_url String,
+                metadata_storage_key String,
+                metadata_storage_file_id String,
+                metadata_storage_url String,
+                metadata_content_sha256 String,
+                is_deleted UInt8,
+                raw_metadata_json String,
+                ingested_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(ingested_at)
+            ORDER BY (account, recording_id)
+            """
+        )
+        self._command("ALTER TABLE voice_memo_files ADD COLUMN IF NOT EXISTS metadata_storage_key String")
+        self._command("ALTER TABLE voice_memo_files ADD COLUMN IF NOT EXISTS metadata_storage_file_id String")
+        self._command("ALTER TABLE voice_memo_files ADD COLUMN IF NOT EXISTS metadata_storage_url String")
+        self._command("ALTER TABLE voice_memo_files ADD COLUMN IF NOT EXISTS metadata_content_sha256 String")
+        self.ensure_voice_memo_transcription_tables()
+
+    def ensure_voice_memo_transcription_tables(self) -> None:
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS voice_memo_transcription_runs (
+                account LowCardinality(String),
+                recording_id String,
+                provider LowCardinality(String),
+                provider_transcript_id String,
+                model String,
+                status LowCardinality(String),
+                error String,
+                transcript_text String,
+                raw_result_json String,
+                requested_at DateTime64(3, 'UTC'),
+                completed_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(requested_at)
+            ORDER BY (account, recording_id, provider)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS voice_memo_transcript_segments (
+                account LowCardinality(String),
+                recording_id String,
+                provider LowCardinality(String),
+                provider_transcript_id String,
+                segment_index UInt32,
+                speaker_label String,
+                start_ms UInt64,
+                end_ms UInt64,
+                confidence Float64,
+                text String,
+                words_json String,
+                created_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(created_at)
+            ORDER BY (account, recording_id, provider, segment_index)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS voice_memo_enrichments (
+                account LowCardinality(String),
+                recording_id String,
+                provider LowCardinality(String),
+                model String,
+                prompt_version String,
+                status LowCardinality(String),
+                error String,
+                calendar_event_id String,
+                calendar_confidence Float64,
+                meeting_title String,
+                meeting_start_at DateTime64(3, 'UTC'),
+                meeting_end_at DateTime64(3, 'UTC'),
+                meeting_location String,
+                attendees_json String,
+                speaker_map_json String,
+                cleaned_transcript String,
+                corrected_transcript String,
+                meeting_notes String,
+                summary String,
+                topics_json String,
+                action_items_json String,
+                evidence_json String,
+                raw_result_json String,
+                created_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(created_at)
+            ORDER BY (account, recording_id, provider, model, prompt_version)
+            """
+        )
+        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS corrected_transcript String AFTER cleaned_transcript")
+        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS meeting_notes String AFTER corrected_transcript")
+
+    def _voice_memo_files_needs_recreate(self) -> bool:
+        try:
+            rows = self._query("SHOW CREATE TABLE voice_memo_files")
+        except Exception:
+            return False
+        if not rows:
+            return False
+        create_statement = str(rows[0][0])
+        return "ORDER BY (account, content_sha256)" in create_statement
+
     def ensure_slack_tables(self) -> None:
         self._drop_obsolete_views()
 
@@ -943,6 +1162,68 @@ class ClickHouseWarehouse:
             ],
             CALENDAR_SYNC_STATE_COLUMNS,
         )
+
+    def insert_voice_memo_files(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("voice_memo_files", rows, VOICE_MEMO_FILE_COLUMNS)
+
+    def insert_voice_memo_transcription_runs(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("voice_memo_transcription_runs", rows, VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS)
+
+    def insert_voice_memo_transcript_segments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("voice_memo_transcript_segments", rows, VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS)
+
+    def insert_voice_memo_enrichments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("voice_memo_enrichments", rows, VOICE_MEMO_ENRICHMENT_COLUMNS)
+
+    def load_untranscribed_voice_memo_files(self, *, provider: str, limit: int) -> list[dict[str, Any]]:
+        provider_sql = _sql_string(provider)
+        rows = self._query(
+            f"""
+            SELECT
+                f.account,
+                f.recording_id,
+                f.title,
+                f.filename,
+                f.extension,
+                f.content_type,
+                f.size_bytes,
+                f.content_sha256,
+                f.recorded_at,
+                f.storage_backend,
+                f.storage_key,
+                f.storage_file_id,
+                f.storage_url
+            FROM voice_memo_files AS f
+            LEFT JOIN
+            (
+                SELECT account, recording_id
+                FROM voice_memo_transcription_runs
+                WHERE provider = {provider_sql}
+                  AND status = 'completed'
+                GROUP BY account, recording_id
+            ) AS t
+            ON f.account = t.account AND f.recording_id = t.recording_id
+            WHERE t.recording_id = ''
+            ORDER BY f.recorded_at DESC
+            LIMIT {int(limit)}
+            """
+        )
+        columns = (
+            "account",
+            "recording_id",
+            "title",
+            "filename",
+            "extension",
+            "content_type",
+            "size_bytes",
+            "content_sha256",
+            "recorded_at",
+            "storage_backend",
+            "storage_key",
+            "storage_file_id",
+            "storage_url",
+        )
+        return [dict(zip(columns, row, strict=True)) for row in rows]
 
     def existing_message_ids(self, *, account: str, message_ids: list[str]) -> set[str]:
         if not message_ids:

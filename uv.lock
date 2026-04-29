@@ -1553,6 +1553,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pypdf" },
     { name = "python-dotenv" },
+    { name = "requests" },
     { name = "slack-sdk" },
 ]
 
@@ -1575,6 +1576,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "pypdf", specifier = ">=6.10.2" },
     { name = "python-dotenv", specifier = ">=1.1.0" },
+    { name = "requests", specifier = ">=2.32.0" },
     { name = "slack-sdk", specifier = ">=3.41.0" },
 ]
 
