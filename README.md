@@ -340,6 +340,106 @@ Run enrichment:
 uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.voice_memos_enrichment import voice_memos_enrichment; raise SystemExit(0 if materialize([voice_memos_enrichment]).success else 1)"
 ```
 
+### Containerized Agent Enrichment
+
+Voice Memos enrichment can also run through a one-off Codex or Claude Code container using your
+logged-in CLI subscription instead of API keys. Dagster owns the Docker socket and spawns the agent
+container; the agent container does not receive the Docker socket, Dagster env, ClickHouse URL,
+Google tokens, Slack tokens, or API keys.
+
+Build and deploy the agent image separately:
+
+```bash
+docker build -f docker/agent.Dockerfile -t personal-data-warehouse-agent:latest .
+```
+
+For Coolify, add two persistent Docker volumes and mount them into the Dagster app:
+
+```text
+pdw-agent-auth -> /agent-auth
+pdw-agent-runs -> /agent-runs
+```
+
+Also mount the host Docker socket into the Dagster app only:
+
+```text
+/var/run/docker.sock -> /var/run/docker.sock
+```
+
+Set the Dagster app env:
+
+```bash
+VOICE_MEMOS_ENRICHMENT_BACKEND=agent
+AGENT_DOCKER_IMAGE=personal-data-warehouse-agent:latest
+AGENT_PROVIDER=codex
+AGENT_MODEL=gpt-5.3-codex
+AGENT_AUTH_VOLUME=pdw-agent-auth
+AGENT_RUNS_VOLUME=pdw-agent-runs
+AGENT_RUNS_DIR=/agent-runs
+```
+
+Log in from the Coolify terminal after the Dagster app can use Docker:
+
+```bash
+uv run personal-data-warehouse-agent-auth login codex
+uv run personal-data-warehouse-agent-auth status codex
+```
+
+For Claude later:
+
+```bash
+AGENT_PROVIDER=claude
+AGENT_MODEL=<claude-model-name>
+uv run personal-data-warehouse-agent-auth login claude
+uv run personal-data-warehouse-agent-auth status claude
+```
+
+Agent run metadata, streamed CLI events, and detected tool-call events are stored in ClickHouse
+tables `agent_runs`, `agent_run_events`, and `agent_run_tool_calls`. The final Voice Memos result
+still lands in `voice_memo_enrichments`.
+
+The agent integration is exposed to Dagster as an `AgentResource`. The core Docker runner remains
+plain Python for testing, while assets receive the resource and use it to start one-off containers.
+The Voice Memos asset currently consumes this resource when `VOICE_MEMOS_ENRICHMENT_BACKEND=agent`;
+other assets can reuse the same resource later.
+
+Each run also gets a per-run `tools/` directory mounted into the agent container and prepended to
+`PATH`. These are small local CLI helpers intended for Bash workflows inside the disposable
+container. Current built-ins:
+
+```bash
+pdw-tool-help
+pdw-validate-json candidate.json "$AGENT_SCHEMA_PATH"
+```
+
+These helpers are deterministic and do not have production credentials. Secret-backed tools should
+only be added deliberately, with the understanding that any credential available to a CLI is also
+available to arbitrary Bash inside the agent container.
+
+Written tests that do not call live agents run with the normal suite:
+
+```bash
+uv run pytest tests/test_agent_runner.py tests/test_voice_memos_enrichment_defs.py tests/test_clickhouse_schema.py
+```
+
+Live Docker/subscription smoke tests are opt-in because they require Docker, the agent image, and a
+logged-in subscription auth volume:
+
+```bash
+docker build -f docker/agent.Dockerfile -t personal-data-warehouse-agent:latest .
+uv run personal-data-warehouse-agent-auth login codex
+
+RUN_LIVE_AGENT_TESTS=1 \
+AGENT_DOCKER_IMAGE=personal-data-warehouse-agent:latest \
+AGENT_PROVIDER=codex \
+AGENT_MODEL=gpt-5.3-codex \
+uv run pytest tests/test_agent_runner_live.py -q
+```
+
+The first live test verifies the image has both CLIs and no Docker socket. The second starts a real
+one-off agent container and verifies it can return schema-conforming JSON through the subscription
+login.
+
 ## ClickHouse Tables
 
 The sync creates and maintains:
@@ -354,6 +454,7 @@ The sync creates and maintains:
 - `voice_memo_transcription_runs`: raw transcription provider results and run state
 - `voice_memo_transcript_segments`: normalized diarized transcript segments
 - `voice_memo_enrichments`: cleaned transcript, calendar match, speaker map, and searchable meeting metadata
+- `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
 
 The warehouse also creates account-management views for current user state:

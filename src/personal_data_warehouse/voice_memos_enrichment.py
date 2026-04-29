@@ -12,6 +12,13 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from personal_data_warehouse.agent_runner import (
+    AgentResource,
+    AgentRunRequest,
+    agent_run_event_rows,
+    agent_run_row,
+    agent_run_tool_call_rows,
+)
 from personal_data_warehouse.clickhouse import _sql_string
 from personal_data_warehouse.clickhouse_readonly import (
     ClickHouseReadOnlyRunner,
@@ -22,6 +29,7 @@ from personal_data_warehouse.clickhouse_readonly import (
 
 ENRICHMENT_PROVIDER = "openai"
 ENRICHMENT_PROMPT_VERSION = "voice-memo-enrichment-v20"
+AGENT_ENRICHMENT_PROMPT_VERSION = "voice-memo-enrichment-agent-v1"
 DEFAULT_ENRICHMENT_MAX_TOOL_CALLS = 8
 DEFAULT_ENRICHMENT_MIN_TOOL_CALLS = 3
 DEFAULT_OPENAI_REASONING_EFFORT = "high"
@@ -317,6 +325,90 @@ class OpenAIResponsesClient:
         raise RuntimeError("unreachable OpenAI retry state")
 
 
+class ContainerAgentStructuredClient:
+    def __init__(
+        self,
+        *,
+        agent: AgentResource,
+        provider: str,
+        model: str,
+        warehouse=None,
+        logger=None,
+    ) -> None:
+        self._agent = agent
+        self._provider = provider
+        self._model = model
+        self._warehouse = warehouse
+        self._logger = logger
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def create_agentic_structured(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        schema: Mapping[str, Any],
+        tools: Sequence[Mapping[str, Any]],
+        tool_executor: Callable[[str, Mapping[str, Any]], Mapping[str, Any]],
+        max_tool_calls: int = DEFAULT_ENRICHMENT_MAX_TOOL_CALLS,
+        min_tool_calls: int = 0,
+        require_tool_call: bool = False,
+        result_validator: Callable[[Mapping[str, Any]], Sequence[str]] | None = None,
+        max_validation_retries: int = 2,
+        logger=None,
+        recording_id: str = "",
+    ) -> Mapping[str, Any]:
+        prompt = container_agent_prompt(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema=schema,
+            tools=tools,
+            min_tool_calls=min_tool_calls,
+            max_tool_calls=max_tool_calls,
+            require_tool_call=require_tool_call,
+        )
+        result = self._agent.run(
+            AgentRunRequest(
+                prompt=prompt,
+                schema=schema,
+                task_type="voice_memo_enrichment",
+                subject_id=recording_id,
+                provider=self._provider,
+                model=self._model,
+            )
+        )
+        self._record_agent_result(result)
+        if result.status != "completed":
+            raise RuntimeError(result.error or f"agent run {result.run_id} failed")
+
+        output = dict(result.final_output_json)
+        validation_issues = list(result_validator(output) if result_validator else [])
+        if validation_issues:
+            output["__validation_issues"] = validation_issues
+            if logger or self._logger:
+                (logger or self._logger).warning(
+                    "Container agent final output for %s has validation issues: %s",
+                    recording_id,
+                    "; ".join(validation_issues[:5]),
+                )
+        return output
+
+    def _record_agent_result(self, result) -> None:
+        if self._warehouse is None:
+            return
+        self._warehouse.ensure_agent_tables()
+        self._warehouse.insert_agent_runs([agent_run_row(result)])
+        event_rows = agent_run_event_rows(result)
+        if event_rows:
+            self._warehouse.insert_agent_run_events(event_rows)
+        tool_call_rows = agent_run_tool_call_rows(result)
+        if tool_call_rows:
+            self._warehouse.insert_agent_run_tool_calls(tool_call_rows)
+
+
 class ClickHouseEnrichmentTool:
     def __init__(self, query_service: ClickHouseReadOnlyService) -> None:
         self._query_service = query_service
@@ -337,7 +429,7 @@ class VoiceMemosEnrichmentRunner:
         self,
         *,
         warehouse,
-        client: OpenAIResponsesClient,
+        client,
         logger,
         now: Callable[[], datetime] | None = None,
         provider: str = ENRICHMENT_PROVIDER,
@@ -1210,6 +1302,44 @@ def enrichment_system_prompt() -> str:
         "The non-negotiable requirements are accurate meeting time/date, accurate attendees and name spellings, and accurate domain terms in corrected_transcript. "
         "Do not invent calendar links, people, or locations. If uncertain, set low confidence and explain the uncertainty in evidence. "
         "Keep corrected_transcript faithful to the transcript; put synthesized narrative writing only in meeting_notes and summary."
+    )
+
+
+def container_agent_prompt(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    schema: Mapping[str, Any],
+    tools: Sequence[Mapping[str, Any]],
+    min_tool_calls: int,
+    max_tool_calls: int,
+    require_tool_call: bool,
+) -> str:
+    return json.dumps(
+        {
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "final_output_contract": {
+                "format": "Return one JSON object and no prose.",
+                "schema": schema,
+            },
+            "agent_runtime_notes": [
+                "You are running as a one-off CLI agent inside an isolated Docker container.",
+                "The final answer must be valid JSON matching final_output_contract.schema.",
+                "Use Bash freely for local scratch scripts and deterministic CLI helpers in the run workspace.",
+                "Run pdw-tool-help to see the local CLI tools available on PATH.",
+                "Before final output, you may write candidate JSON to a file and run pdw-validate-json candidate.json \"$AGENT_SCHEMA_PATH\".",
+                "These local CLI tools do not have production credentials. Use the preloaded recording, calendar_candidates, identity_hints, transcript, and diarized_segments in user_prompt unless a future run provides explicit credential-backed tools.",
+            ],
+            "tool_expectations": {
+                "tool_names": [str(tool.get("name", "")) for tool in tools if isinstance(tool, Mapping)],
+                "min_tool_calls": min_tool_calls,
+                "max_tool_calls": max_tool_calls,
+                "require_tool_call": require_tool_call,
+            },
+        },
+        sort_keys=True,
+        default=str,
     )
 
 

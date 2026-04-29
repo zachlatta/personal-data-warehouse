@@ -219,6 +219,45 @@ VOICE_MEMO_ENRICHMENT_COLUMNS = (
     "sync_version",
 )
 
+AGENT_RUN_COLUMNS = (
+    "run_id",
+    "provider",
+    "model",
+    "task_type",
+    "subject_id",
+    "status",
+    "input_sha256",
+    "final_output_json",
+    "error",
+    "exit_code",
+    "started_at",
+    "completed_at",
+    "sync_version",
+)
+
+AGENT_RUN_EVENT_COLUMNS = (
+    "run_id",
+    "event_index",
+    "stream",
+    "event_type",
+    "event_json",
+    "text",
+    "created_at",
+    "sync_version",
+)
+
+AGENT_RUN_TOOL_CALL_COLUMNS = (
+    "run_id",
+    "event_index",
+    "tool_name",
+    "arguments_json",
+    "result_json",
+    "error",
+    "started_at",
+    "completed_at",
+    "sync_version",
+)
+
 SLACK_TEAM_COLUMNS = (
     "account",
     "team_id",
@@ -769,6 +808,66 @@ class ClickHouseWarehouse:
         )
         self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS corrected_transcript String AFTER cleaned_transcript")
         self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS meeting_notes String AFTER corrected_transcript")
+        self.ensure_agent_tables()
+
+    def ensure_agent_tables(self) -> None:
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS agent_runs (
+                run_id String,
+                provider LowCardinality(String),
+                model String,
+                task_type LowCardinality(String),
+                subject_id String,
+                status LowCardinality(String),
+                input_sha256 String,
+                final_output_json String,
+                error String,
+                exit_code Int32,
+                started_at DateTime64(3, 'UTC'),
+                completed_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(started_at)
+            ORDER BY (run_id)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS agent_run_events (
+                run_id String,
+                event_index UInt32,
+                stream LowCardinality(String),
+                event_type LowCardinality(String),
+                event_json String,
+                text String,
+                created_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(created_at)
+            ORDER BY (run_id, event_index)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS agent_run_tool_calls (
+                run_id String,
+                event_index UInt32,
+                tool_name String,
+                arguments_json String,
+                result_json String,
+                error String,
+                started_at DateTime64(3, 'UTC'),
+                completed_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(started_at)
+            ORDER BY (run_id, event_index, tool_name)
+            """
+        )
 
     def _voice_memo_files_needs_recreate(self) -> bool:
         try:
@@ -1174,6 +1273,15 @@ class ClickHouseWarehouse:
 
     def insert_voice_memo_enrichments(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("voice_memo_enrichments", rows, VOICE_MEMO_ENRICHMENT_COLUMNS)
+
+    def insert_agent_runs(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("agent_runs", rows, AGENT_RUN_COLUMNS)
+
+    def insert_agent_run_events(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("agent_run_events", rows, AGENT_RUN_EVENT_COLUMNS)
+
+    def insert_agent_run_tool_calls(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("agent_run_tool_calls", rows, AGENT_RUN_TOOL_CALL_COLUMNS)
 
     def load_untranscribed_voice_memo_files(self, *, provider: str, limit: int) -> list[dict[str, Any]]:
         provider_sql = _sql_string(provider)

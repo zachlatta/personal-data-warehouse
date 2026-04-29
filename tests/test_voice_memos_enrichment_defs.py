@@ -6,13 +6,23 @@ from personal_data_warehouse.defs.calendar_sync import calendar_event_sync
 from personal_data_warehouse.defs import voice_memos_enrichment as voice_memos_enrichment_defs
 from personal_data_warehouse.defs.voice_memos_drive_ingest import voice_memos_drive_ingest
 from personal_data_warehouse.defs.voice_memos_enrichment import (
+    DEFAULT_AGENT_RESOURCE,
     DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE,
+    DEFAULT_VOICE_MEMOS_ENRICHMENT_BACKEND,
     voice_memos_enrichment,
+    voice_memos_enrichment_backend,
     voice_memos_enrichment_job,
     voice_memos_enrichment_hourly,
+    voice_memos_enrichment_model,
+    voice_memos_enrichment_prompt_version,
+    voice_memos_enrichment_provider,
+    defs,
 )
 from personal_data_warehouse.defs.voice_memos_transcription import voice_memos_transcription
-from personal_data_warehouse.voice_memos_enrichment import DEFAULT_ENRICHMENT_LOOKBACK_WEEKS
+from personal_data_warehouse.voice_memos_enrichment import (
+    AGENT_ENRICHMENT_PROMPT_VERSION,
+    DEFAULT_ENRICHMENT_LOOKBACK_WEEKS,
+)
 
 
 def test_voice_memos_enrichment_job_selects_asset() -> None:
@@ -22,6 +32,26 @@ def test_voice_memos_enrichment_job_selects_asset() -> None:
 def test_voice_memos_enrichment_defaults_to_all_recent_transcripts() -> None:
     assert DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE == 0
     assert DEFAULT_ENRICHMENT_LOOKBACK_WEEKS == 12
+    assert DEFAULT_VOICE_MEMOS_ENRICHMENT_BACKEND == "openai_responses"
+
+
+def test_voice_memos_enrichment_backend_can_use_agent(monkeypatch) -> None:
+    monkeypatch.setenv("VOICE_MEMOS_ENRICHMENT_BACKEND", "agent")
+    settings = FakeSettings()
+    settings.agent = type("FakeAgentConfig", (), {"provider": "codex", "model": "gpt-agent"})()
+
+    assert voice_memos_enrichment_backend() == "agent"
+    assert voice_memos_enrichment_provider(settings) == "agent_codex"
+    assert voice_memos_enrichment_model(settings) == "gpt-agent"
+    assert voice_memos_enrichment_prompt_version() == AGENT_ENRICHMENT_PROMPT_VERSION
+
+
+def test_voice_memos_defs_provides_default_agent_resource(monkeypatch) -> None:
+    monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_BACKEND", raising=False)
+
+    repository = defs().get_repository_def()
+
+    assert "agent" in repository.get_top_level_resources()
 
 
 def test_voice_memos_enrichment_depends_on_transcription_and_calendar() -> None:
@@ -39,6 +69,7 @@ def test_voice_memos_enrichment_job_selects_full_upstream_lineage() -> None:
             voice_memos_transcription,
             voice_memos_enrichment,
         ],
+        resources={"agent": DEFAULT_AGENT_RESOURCE},
     ).get_repository_def()
 
     assert voice_memos_enrichment_job.selection.resolve(repository.asset_graph) == {

@@ -35,6 +35,15 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 DEFAULT_OPENAI_MODEL = "gpt-5.3-codex"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 1800
 DEFAULT_OPENAI_REASONING_EFFORT = "high"
+DEFAULT_AGENT_PROVIDER = "codex"
+DEFAULT_AGENT_AUTH_VOLUME = "pdw-agent-auth"
+DEFAULT_AGENT_RUNS_VOLUME = "pdw-agent-runs"
+DEFAULT_AGENT_RUNS_DIR = "/agent-runs"
+DEFAULT_AGENT_TIMEOUT_SECONDS = 1800
+DEFAULT_AGENT_DOCKER_NETWORK = "bridge"
+DEFAULT_AGENT_DOCKER_MEMORY = "4g"
+DEFAULT_AGENT_DOCKER_CPUS = "2"
+DEFAULT_AGENT_DOCKER_PIDS_LIMIT = 512
 
 
 def _parse_csv_env(value: str | None) -> tuple[str, ...]:
@@ -127,6 +136,21 @@ class OpenAIConfig:
 
 
 @dataclass(frozen=True)
+class AgentConfig:
+    provider: str
+    model: str
+    docker_image: str
+    auth_volume: str = DEFAULT_AGENT_AUTH_VOLUME
+    runs_volume: str = DEFAULT_AGENT_RUNS_VOLUME
+    runs_dir: str = DEFAULT_AGENT_RUNS_DIR
+    timeout_seconds: int = DEFAULT_AGENT_TIMEOUT_SECONDS
+    docker_network: str = DEFAULT_AGENT_DOCKER_NETWORK
+    docker_memory: str = DEFAULT_AGENT_DOCKER_MEMORY
+    docker_cpus: str = DEFAULT_AGENT_DOCKER_CPUS
+    docker_pids_limit: int = DEFAULT_AGENT_DOCKER_PIDS_LIMIT
+
+
+@dataclass(frozen=True)
 class Settings:
     clickhouse_url: str | None
     gmail_accounts: tuple[GmailAccount, ...]
@@ -160,6 +184,7 @@ class Settings:
     voice_memos: VoiceMemosConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
     openai: OpenAIConfig | None = None
+    agent: AgentConfig | None = None
 
     def account_for_email(self, email_address: str) -> GmailAccount:
         normalized = email_address.strip().lower()
@@ -199,6 +224,7 @@ def load_settings(
     require_voice_memos: bool = False,
     require_assemblyai: bool = False,
     require_openai: bool = False,
+    require_agent: bool = False,
 ) -> Settings:
     load_dotenv()
 
@@ -447,6 +473,34 @@ def load_settings(
             reasoning_effort=os.getenv("OPENAI_REASONING_EFFORT") or DEFAULT_OPENAI_REASONING_EFFORT,
         )
 
+    agent_docker_image = os.getenv("AGENT_DOCKER_IMAGE", "").strip()
+    agent: AgentConfig | None = None
+    if require_agent or agent_docker_image:
+        if not agent_docker_image:
+            raise ValueError("AGENT_DOCKER_IMAGE must be set for containerized agents")
+        agent_provider = (os.getenv("AGENT_PROVIDER") or DEFAULT_AGENT_PROVIDER).strip().lower()
+        if agent_provider not in {"codex", "claude"}:
+            raise ValueError("AGENT_PROVIDER must be codex or claude")
+        agent_timeout_seconds = int(os.getenv("AGENT_TIMEOUT_SECONDS", str(DEFAULT_AGENT_TIMEOUT_SECONDS)))
+        if agent_timeout_seconds < 1:
+            raise ValueError("AGENT_TIMEOUT_SECONDS must be at least 1")
+        agent_pids_limit = int(os.getenv("AGENT_DOCKER_PIDS_LIMIT", str(DEFAULT_AGENT_DOCKER_PIDS_LIMIT)))
+        if agent_pids_limit < 1:
+            raise ValueError("AGENT_DOCKER_PIDS_LIMIT must be at least 1")
+        agent = AgentConfig(
+            provider=agent_provider,
+            model=os.getenv("AGENT_MODEL", "").strip(),
+            docker_image=agent_docker_image,
+            auth_volume=os.getenv("AGENT_AUTH_VOLUME", DEFAULT_AGENT_AUTH_VOLUME),
+            runs_volume=os.getenv("AGENT_RUNS_VOLUME", DEFAULT_AGENT_RUNS_VOLUME),
+            runs_dir=os.getenv("AGENT_RUNS_DIR", DEFAULT_AGENT_RUNS_DIR),
+            timeout_seconds=agent_timeout_seconds,
+            docker_network=os.getenv("AGENT_DOCKER_NETWORK", DEFAULT_AGENT_DOCKER_NETWORK),
+            docker_memory=os.getenv("AGENT_DOCKER_MEMORY", DEFAULT_AGENT_DOCKER_MEMORY),
+            docker_cpus=os.getenv("AGENT_DOCKER_CPUS", DEFAULT_AGENT_DOCKER_CPUS),
+            docker_pids_limit=agent_pids_limit,
+        )
+
     google_scopes = [GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE]
     if voice_memos and voice_memos.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
@@ -494,4 +548,5 @@ def load_settings(
         voice_memos=voice_memos,
         assemblyai=assemblyai,
         openai=openai,
+        agent=agent,
     )
