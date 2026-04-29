@@ -820,11 +820,8 @@ def provider_auth_lock(provider: str):
 
 
 def agent_config_from_env() -> AgentContainerConfig:
-    image = os.getenv("AGENT_DOCKER_IMAGE", "").strip()
-    if not image:
-        image = default_agent_docker_image()
     return AgentContainerConfig(
-        image=image,
+        image=default_agent_docker_image(),
         provider=os.getenv("AGENT_PROVIDER", "codex"),
         model=os.getenv("AGENT_MODEL", ""),
         auth_volume=os.getenv("AGENT_AUTH_VOLUME", DEFAULT_AGENT_AUTH_VOLUME),
@@ -856,19 +853,13 @@ def default_agent_docker_image(
 
 
 def ensure_agent_image(
-    image: str | None = None,
     *,
     dockerfile_path: Path = DEFAULT_AGENT_DOCKERFILE_PATH,
     entrypoint_path: Path = DEFAULT_AGENT_ENTRYPOINT_PATH,
     context_dir: Path = DEFAULT_AGENT_BUILD_CONTEXT_DIR,
     runner=subprocess.run,
 ) -> str:
-    explicit_image = bool(image and image.strip())
-    resolved_image = (
-        image.strip()
-        if image
-        else default_agent_docker_image(dockerfile_path=dockerfile_path, entrypoint_path=entrypoint_path)
-    )
+    resolved_image = default_agent_docker_image(dockerfile_path=dockerfile_path, entrypoint_path=entrypoint_path)
     inspect = runner(
         ["docker", "image", "inspect", resolved_image],
         capture_output=True,
@@ -877,13 +868,6 @@ def ensure_agent_image(
     )
     if getattr(inspect, "returncode", 1) == 0:
         return resolved_image
-    if explicit_image:
-        pull = runner(
-            ["docker", "pull", resolved_image],
-            check=False,
-        )
-        if getattr(pull, "returncode", 1) == 0:
-            return resolved_image
     build = runner(
         [
             "docker",
@@ -943,8 +927,7 @@ def auth_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("provider", choices=["codex", "claude"])
     parser.add_argument("--non-interactive", action="store_true", help="Do not allocate a TTY for the login/status container.")
     args = parser.parse_args(argv)
-    configured_image = os.getenv("AGENT_DOCKER_IMAGE", "").strip() or None
-    image = ensure_agent_image(configured_image)
+    image = ensure_agent_image()
     config = agent_config_from_env()
     config = AgentContainerConfig(
         image=image,

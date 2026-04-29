@@ -448,11 +448,8 @@ def load_settings(
             max_speakers_expected=assemblyai_max_speakers_expected,
         )
 
-    agent_docker_image = os.getenv("AGENT_DOCKER_IMAGE", "").strip()
     agent: AgentConfig | None = None
-    if require_agent and not agent_docker_image:
-        agent_docker_image = default_agent_docker_image()
-    if require_agent or agent_docker_image:
+    if require_agent:
         agent_provider = (os.getenv("AGENT_PROVIDER") or DEFAULT_AGENT_PROVIDER).strip().lower()
         if agent_provider not in {"codex", "claude"}:
             raise ValueError("AGENT_PROVIDER must be codex or claude")
@@ -465,7 +462,7 @@ def load_settings(
         agent = AgentConfig(
             provider=agent_provider,
             model=os.getenv("AGENT_MODEL", "").strip(),
-            docker_image=agent_docker_image,
+            docker_image=default_agent_docker_image(),
             auth_volume=os.getenv("AGENT_AUTH_VOLUME", DEFAULT_AGENT_AUTH_VOLUME),
             runs_volume=os.getenv("AGENT_RUNS_VOLUME", DEFAULT_AGENT_RUNS_VOLUME),
             runs_dir=os.getenv("AGENT_RUNS_DIR", DEFAULT_AGENT_RUNS_DIR),

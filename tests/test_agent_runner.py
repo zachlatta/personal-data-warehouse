@@ -229,33 +229,17 @@ def test_default_agent_docker_image_uses_agent_image_inputs_hash(tmp_path) -> No
     assert changed != image
 
 
-def test_ensure_agent_image_skips_build_when_image_exists() -> None:
+def test_ensure_agent_image_skips_build_when_derived_image_exists() -> None:
     calls = []
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
         return subprocess.CompletedProcess(command, 0)
 
-    image = ensure_agent_image("pdw-agent:test", runner=fake_run)
+    image = ensure_agent_image(runner=fake_run)
 
-    assert image == "pdw-agent:test"
-    assert calls == [(["docker", "image", "inspect", "pdw-agent:test"], {"capture_output": True, "text": True, "check": False})]
-
-
-def test_ensure_agent_image_pulls_explicit_missing_image() -> None:
-    calls = []
-
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-        if command[:3] == ["docker", "image", "inspect"]:
-            return subprocess.CompletedProcess(command, 1)
-        return subprocess.CompletedProcess(command, 0)
-
-    image = ensure_agent_image("registry.example/pdw-agent:test", runner=fake_run)
-
-    assert image == "registry.example/pdw-agent:test"
-    assert calls[0][0] == ["docker", "image", "inspect", "registry.example/pdw-agent:test"]
-    assert calls[1][0] == ["docker", "pull", "registry.example/pdw-agent:test"]
+    assert image.startswith("personal-data-warehouse-agent:")
+    assert calls == [(["docker", "image", "inspect", image], {"capture_output": True, "text": True, "check": False})]
 
 
 def test_ensure_agent_image_builds_when_image_is_missing(tmp_path) -> None:
@@ -399,7 +383,6 @@ def test_builtin_cli_tools_reject_invalid_json_shape(tmp_path) -> None:
 
 
 def test_load_settings_reads_agent_config_without_api_keys(monkeypatch) -> None:
-    monkeypatch.setenv("AGENT_DOCKER_IMAGE", "pdw-agent:latest")
     monkeypatch.setenv("AGENT_PROVIDER", "claude")
     monkeypatch.setenv("AGENT_MODEL", "claude-test")
     monkeypatch.setenv("AGENT_TOOL_PROXY_PUBLIC_HOST", "dagster")
@@ -409,13 +392,11 @@ def test_load_settings_reads_agent_config_without_api_keys(monkeypatch) -> None:
     assert settings.agent is not None
     assert settings.agent.provider == "claude"
     assert settings.agent.model == "claude-test"
-    assert settings.agent.docker_image == "pdw-agent:latest"
+    assert settings.agent.docker_image.startswith("personal-data-warehouse-agent:")
     assert settings.agent.tool_proxy_public_host == "dagster"
 
 
 def test_load_settings_derives_agent_image_when_required(monkeypatch) -> None:
-    monkeypatch.delenv("AGENT_DOCKER_IMAGE", raising=False)
-
     settings = load_settings(require_clickhouse=False, require_gmail=False, require_agent=True)
 
     assert settings.agent is not None

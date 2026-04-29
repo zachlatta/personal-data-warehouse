@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def live_agent_config(tmp_path) -> AgentContainerConfig:
-    image = ensure_agent_image(os.getenv("AGENT_DOCKER_IMAGE", "").strip() or None)
+    image = ensure_agent_image()
     return AgentContainerConfig(
         image=image,
         provider=os.getenv("AGENT_PROVIDER", "codex"),

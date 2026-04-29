@@ -345,16 +345,10 @@ logged-in CLI subscription instead of API keys. Dagster owns the Docker socket a
 container; the agent container does not receive the Docker socket, Dagster env, ClickHouse URL,
 Google tokens, Slack tokens, or API keys.
 
-The auth/bootstrap command builds the agent image on demand. If `AGENT_DOCKER_IMAGE` is unset, it
-derives a tag like `personal-data-warehouse-agent:<hash>` from the agent Dockerfile and entrypoint,
-checks whether that image already exists locally, and builds it only when missing. Set
-`AGENT_DOCKER_IMAGE` only when you want to force a specific image tag; explicit tags are pulled
-first when missing locally, then built locally if the pull fails:
-
-```bash
-# Optional override; otherwise the hash-based image tag is derived automatically.
-AGENT_DOCKER_IMAGE=personal-data-warehouse-agent:latest
-```
+The auth/bootstrap command builds the agent image on demand. It derives a tag like
+`personal-data-warehouse-agent:<hash>` from the agent Dockerfile and entrypoint, checks whether that
+image already exists locally, and builds it only when missing. Do not set `AGENT_DOCKER_IMAGE`; the
+hash-derived tag is the only supported image path.
 
 For Coolify, add two persistent Docker volumes and mount them into the Dagster app:
 

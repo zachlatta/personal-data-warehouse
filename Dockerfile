@@ -20,6 +20,8 @@ RUN uv sync --frozen --group dev --no-install-project
 
 COPY README.md ./
 COPY src ./src
+COPY docker/agent.Dockerfile docker/agent.Dockerfile
+COPY docker/agent-entrypoint.sh docker/agent-entrypoint.sh
 COPY docker/dagster.yaml "$DAGSTER_HOME/dagster.yaml"
 COPY docker/entrypoint.sh /usr/local/bin/personal-data-warehouse-entrypoint
 COPY docker/start-dagster.sh /usr/local/bin/personal-data-warehouse-start-dagster
