@@ -139,6 +139,7 @@ class ContainerAgentRunner:
         if provider not in {"codex", "claude"}:
             raise ValueError("agent provider must be codex or claude")
         model = request.model if request.model is not None else self._config.model
+        self._ensure_managed_image()
         run_dir = self._prepare_run_dir(request)
         self._sync_run_dir_to_volume(request.run_id, run_dir)
         command = self.docker_command(request=request, provider=provider, model=model)
@@ -214,6 +215,11 @@ class ContainerAgentRunner:
             public_host=self._config.tool_proxy_public_host,
         ) as tool_env:
             return self.run(request.with_extra_env(tool_env))
+
+    def _ensure_managed_image(self) -> None:
+        if self._config.image != default_agent_docker_image():
+            return
+        ensure_agent_image(runner=self._runner)
 
     def _sync_run_dir_to_volume(self, run_id: str, run_dir: Path) -> None:
         self._runner(

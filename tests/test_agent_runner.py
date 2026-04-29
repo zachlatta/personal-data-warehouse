@@ -93,6 +93,39 @@ def test_container_agent_runner_writes_prompt_schema_and_parses_final_json(tmp_p
     assert (tmp_path / "run-1" / "TOOLS.md").exists()
 
 
+def test_container_agent_runner_builds_missing_managed_image_before_run(tmp_path) -> None:
+    calls = []
+    volume_copy_calls = 0
+    image = default_agent_docker_image()
+
+    def fake_run(command, **kwargs):
+        nonlocal volume_copy_calls
+        calls.append(command)
+        if command == ["docker", "image", "inspect", image]:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
+        if command[:2] == ["docker", "build"]:
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+            volume_copy_calls += 1
+            if volume_copy_calls == 2:
+                (tmp_path / "run-1" / "final.json").write_text('{"ok":true}', encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout='{"type":"agent_message","text":"ok"}\n', stderr="")
+
+    config = AgentContainerConfig(image=image, runs_dir=tmp_path)
+    request = AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1")
+
+    result = ContainerAgentRunner(config, runner=fake_run).run(request)
+
+    assert result.status == "completed"
+    assert calls[0] == ["docker", "image", "inspect", image]
+    assert calls[1][:2] == ["docker", "build"]
+    assert calls[1][calls[1].index("-t") + 1] == image
+    agent_run_index = next(index for index, call in enumerate(calls) if call[:2] == ["docker", "run"] and image in call)
+    build_index = next(index for index, call in enumerate(calls) if call[:2] == ["docker", "build"])
+    assert build_index < agent_run_index
+
+
 def test_container_agent_runner_can_inject_clickhouse_proxy_without_raw_url(tmp_path) -> None:
     volume_copy_calls = 0
     agent_command = []
