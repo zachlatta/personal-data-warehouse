@@ -244,18 +244,6 @@ class CalendarSyncRunner:
                 for event in events
             ]
             recurring_changes_seen = recurring_changes_seen or any(is_recurring_related_event(event) for event in events)
-            rows = [
-                *historical_rows_for_changed_events(
-                    existing_rows=self._warehouse.load_active_calendar_events_by_id(
-                        account=account.email_address,
-                        calendar_id=calendar_id,
-                        event_ids=[row["event_id"] for row in rows],
-                    ),
-                    rows=rows,
-                    synced_at=synced_at,
-                ),
-                *rows,
-            ]
             self._warehouse.insert_calendar_events(rows)
             events_written += len(rows)
             deleted_events += sum(1 for row in rows if row["is_deleted"])
@@ -296,14 +284,6 @@ class CalendarSyncRunner:
                 window_end=window_end,
             )
         )
-        stale_recurring_event_ids = set(
-            self._warehouse.load_active_recurring_calendar_event_ids(
-                account=account.email_address,
-                calendar_id=calendar_id,
-                window_start=synced_at,
-                window_end=window_end,
-            )
-        )
         seen_recurring_event_ids: set[str] = set()
         events_written = 0
         deleted_events = 0
@@ -323,22 +303,14 @@ class CalendarSyncRunner:
             time_max=window_end,
         ):
             rows = [
-                row
-                for event in events
-                if event.get("recurringEventId")
-                for row in [
-                    event_to_row(
-                        account=account.email_address,
-                        calendar_id=calendar_id,
-                        event=event,
-                        synced_at=synced_at,
-                    )
-                ]
-                if not is_late_deleted_recurring_instance(
-                    row=row,
-                    active_recurring_event_ids=active_recurring_event_ids,
+                event_to_row(
+                    account=account.email_address,
+                    calendar_id=calendar_id,
+                    event=event,
                     synced_at=synced_at,
                 )
+                for event in events
+                if event.get("recurringEventId")
             ]
             for row in rows:
                 if row["recurring_event_id"]:
@@ -353,7 +325,7 @@ class CalendarSyncRunner:
                 calendar_id,
             )
 
-        stale_event_ids = sorted(stale_recurring_event_ids - seen_recurring_event_ids)
+        stale_event_ids = sorted(active_recurring_event_ids - seen_recurring_event_ids)
         stale_deleted_events = self._warehouse.mark_calendar_events_deleted(
             account=account.email_address,
             calendar_id=calendar_id,
@@ -535,90 +507,6 @@ def nested_string(value: Mapping[str, Any], key: str, nested_key: str) -> str:
 
 def json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-
-def historical_rows_for_changed_events(
-    *,
-    existing_rows: Mapping[str, Mapping[str, Any]],
-    rows: list[dict[str, Any]],
-    synced_at: datetime,
-) -> list[dict[str, Any]]:
-    historical_rows: list[dict[str, Any]] = []
-    for row in rows:
-        existing = existing_rows.get(str(row["event_id"]))
-        if not existing or str(existing.get("recurring_event_id", "")):
-            continue
-        if not should_preserve_historical_event(existing=existing, incoming=row, synced_at=synced_at):
-            continue
-        historical_rows.append(historical_event_row(existing=existing, synced_at=synced_at))
-    return historical_rows
-
-
-def should_preserve_historical_event(
-    *,
-    existing: Mapping[str, Any],
-    incoming: Mapping[str, Any],
-    synced_at: datetime,
-) -> bool:
-    existing_start = normalize_datetime(existing.get("start_at"))
-    if existing_start is None or existing_start > synced_at:
-        return False
-    if incoming["is_deleted"]:
-        return True
-    return normalize_datetime(existing.get("start_at")) != normalize_datetime(incoming.get("start_at")) or normalize_datetime(
-        existing.get("end_at")
-    ) != normalize_datetime(incoming.get("end_at"))
-
-
-def historical_event_row(*, existing: Mapping[str, Any], synced_at: datetime) -> dict[str, Any]:
-    row = dict(existing)
-    original_event_id = str(row["event_id"])
-    row["event_id"] = f"{original_event_id}_{historical_event_suffix(normalize_datetime(row.get('start_at')))}_historical"
-    row["status"] = "confirmed"
-    row["is_deleted"] = 0
-    row["synced_at"] = synced_at
-    row["sync_version"] = sync_version_from_datetime(synced_at)
-    row["raw_json"] = historical_raw_json(row["raw_json"], original_event_id=original_event_id)
-    return row
-
-
-def historical_event_suffix(value: datetime | None) -> str:
-    if value is None:
-        return "unknown"
-    return value.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-
-
-def historical_raw_json(value: Any, *, original_event_id: str) -> str:
-    try:
-        parsed = json.loads(str(value)) if value else {}
-    except json.JSONDecodeError:
-        parsed = {"original_raw_json": str(value)}
-    if not isinstance(parsed, dict):
-        parsed = {"original_raw_json": parsed}
-    parsed["pdw_historical_event"] = True
-    parsed["pdw_original_event_id"] = original_event_id
-    parsed["pdw_historical_reason"] = "Preserved because Google Calendar changed or cancelled this event after its original start time."
-    return json_dumps(parsed)
-
-
-def is_late_deleted_recurring_instance(
-    *,
-    row: Mapping[str, Any],
-    active_recurring_event_ids: set[str],
-    synced_at: datetime,
-) -> bool:
-    if not row["is_deleted"] or str(row["event_id"]) not in active_recurring_event_ids:
-        return False
-    start_at = normalize_datetime(row.get("start_at"))
-    return start_at is not None and start_at <= synced_at
-
-
-def normalize_datetime(value: Any) -> datetime | None:
-    if not isinstance(value, datetime):
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
 
 
 def sync_version_from_datetime(value: datetime) -> int:

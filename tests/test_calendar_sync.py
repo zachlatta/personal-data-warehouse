@@ -67,8 +67,6 @@ class FakeCalendarWarehouse:
         self.state = state or {}
         self.events = []
         self.active_recurring_event_ids = []
-        self.active_recurring_event_rows = []
-        self.active_calendar_events_by_id = {}
         self.deleted_event_ids = []
         self.state_rows = []
         self.ensure_calendar_tables_called = False
@@ -83,20 +81,7 @@ class FakeCalendarWarehouse:
         self.events.extend(rows)
 
     def load_active_recurring_calendar_event_ids(self, **kwargs):
-        if self.active_recurring_event_rows:
-            return [
-                row["event_id"]
-                for row in self.active_recurring_event_rows
-                if row["start_at"] < kwargs["window_end"] and row["end_at"] > kwargs["window_start"]
-            ]
         return self.active_recurring_event_ids
-
-    def load_active_calendar_events_by_id(self, **kwargs):
-        return {
-            event_id: self.active_calendar_events_by_id[event_id]
-            for event_id in kwargs["event_ids"]
-            if event_id in self.active_calendar_events_by_id
-        }
 
     def mark_calendar_events_deleted(self, **kwargs) -> int:
         self.deleted_event_ids.extend(kwargs["event_ids"])
@@ -513,203 +498,6 @@ def test_runner_forces_expanded_sync_on_cancelled_event(monkeypatch) -> None:
     assert summaries[0].recurring_changes_seen is True
 
 
-def test_runner_preserves_started_event_when_google_moves_it(monkeypatch) -> None:
-    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
-    service = FakeCalendarService(
-        [
-            {
-                "items": [
-                    {
-                        "id": "event-1",
-                        "status": "confirmed",
-                        "summary": "Kennedy Space Center / Hack Club",
-                        "start": {"dateTime": "2026-04-06T12:30:00-04:00"},
-                        "end": {"dateTime": "2026-04-06T13:00:00-04:00"},
-                    }
-                ],
-                "nextSyncToken": "new-token",
-            }
-        ]
-    )
-    warehouse = FakeCalendarWarehouse(
-        state={
-            ("zach@example.com", "primary"): {
-                "sync_token": "old-token",
-                "last_sync_type": "partial",
-                "expanded_synced_at": datetime(2026, 3, 30, 16, 45, tzinfo=UTC),
-            }
-        }
-    )
-    warehouse.active_calendar_events_by_id["event-1"] = event_to_row(
-        account="zach@example.com",
-        calendar_id="primary",
-        event={
-            "id": "event-1",
-            "status": "confirmed",
-            "summary": "KSC VC / Hack Club",
-            "start": {"dateTime": "2026-03-30T12:30:00-04:00"},
-            "end": {"dateTime": "2026-03-30T13:00:00-04:00"},
-        },
-        synced_at=datetime(2026, 3, 26, tzinfo=UTC),
-    )
-
-    runner = CalendarSyncRunner(
-        settings=settings,
-        warehouse=warehouse,
-        logger=FakeLogger(),
-        service_factory=lambda account: service,
-        now=lambda: datetime(2026, 3, 30, 16, 59, tzinfo=UTC),
-    )
-    summaries = runner.sync_all()
-
-    historical_row = warehouse.events[0]
-    updated_row = warehouse.events[1]
-    assert historical_row["event_id"] == "event-1_20260330T163000Z_historical"
-    assert historical_row["summary"] == "KSC VC / Hack Club"
-    assert historical_row["start_at"] == datetime(2026, 3, 30, 16, 30, tzinfo=UTC)
-    assert json.loads(historical_row["raw_json"])["pdw_original_event_id"] == "event-1"
-    assert updated_row["event_id"] == "event-1"
-    assert updated_row["start_at"] == datetime(2026, 4, 6, 16, 30, tzinfo=UTC)
-    assert summaries[0].events_written == 2
-
-
-def test_runner_does_not_preserve_future_event_when_google_moves_it(monkeypatch) -> None:
-    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
-    service = FakeCalendarService(
-        [
-            {
-                "items": [
-                    {
-                        "id": "event-1",
-                        "status": "confirmed",
-                        "summary": "Planning",
-                        "start": {"dateTime": "2026-05-08T12:30:00-04:00"},
-                        "end": {"dateTime": "2026-05-08T13:00:00-04:00"},
-                    }
-                ],
-                "nextSyncToken": "new-token",
-            }
-        ]
-    )
-    warehouse = FakeCalendarWarehouse(
-        state={
-            ("zach@example.com", "primary"): {
-                "sync_token": "old-token",
-                "last_sync_type": "partial",
-                "expanded_synced_at": datetime(2026, 4, 30, 12, 30, tzinfo=UTC),
-            }
-        }
-    )
-    warehouse.active_calendar_events_by_id["event-1"] = event_to_row(
-        account="zach@example.com",
-        calendar_id="primary",
-        event={
-            "id": "event-1",
-            "status": "confirmed",
-            "summary": "Planning",
-            "start": {"dateTime": "2026-05-01T12:30:00-04:00"},
-            "end": {"dateTime": "2026-05-01T13:00:00-04:00"},
-        },
-        synced_at=datetime(2026, 4, 29, tzinfo=UTC),
-    )
-
-    runner = CalendarSyncRunner(
-        settings=settings,
-        warehouse=warehouse,
-        logger=FakeLogger(),
-        service_factory=lambda account: service,
-        now=lambda: datetime(2026, 4, 30, 13, 0, tzinfo=UTC),
-    )
-    summaries = runner.sync_all()
-
-    assert [row["event_id"] for row in warehouse.events] == ["event-1"]
-    assert warehouse.events[0]["start_at"] == datetime(2026, 5, 8, 16, 30, tzinfo=UTC)
-    assert summaries[0].events_written == 1
-
-
-def test_runner_keeps_started_recurring_instance_when_google_late_cancels_it(monkeypatch) -> None:
-    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
-    service = FakeCalendarService(
-        [
-            {"items": [], "nextSyncToken": "new-token"},
-            {
-                "items": [
-                    {
-                        "id": "series-1_20260428T193000Z",
-                        "recurringEventId": "series-1",
-                        "status": "cancelled",
-                        "summary": "Stardance Challenge Activation",
-                        "start": {"dateTime": "2026-04-28T14:30:00-05:00"},
-                        "end": {"dateTime": "2026-04-28T15:30:00-05:00"},
-                    }
-                ]
-            },
-        ]
-    )
-    warehouse = FakeCalendarWarehouse()
-    warehouse.active_recurring_event_rows = [
-        {
-            "event_id": "series-1_20260428T193000Z",
-            "start_at": datetime(2026, 4, 28, 19, 30, tzinfo=UTC),
-            "end_at": datetime(2026, 4, 28, 20, 30, tzinfo=UTC),
-        }
-    ]
-
-    runner = CalendarSyncRunner(
-        settings=settings,
-        warehouse=warehouse,
-        logger=FakeLogger(),
-        service_factory=lambda account: service,
-        now=lambda: datetime(2026, 4, 30, 13, 0, tzinfo=UTC),
-    )
-    summaries = runner.sync_all()
-
-    assert warehouse.events == []
-    assert warehouse.deleted_event_ids == []
-    assert summaries[0].expanded_events_written == 0
-    assert summaries[0].expanded_deleted_events == 0
-
-
-def test_runner_only_deletes_future_stale_recurring_instances(monkeypatch) -> None:
-    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
-    service = FakeCalendarService(
-        [
-            {"items": [], "nextSyncToken": "new-token"},
-            {"items": []},
-        ]
-    )
-    warehouse = FakeCalendarWarehouse()
-    warehouse.active_recurring_event_rows = [
-        {
-            "event_id": "series-1_20260428T193000Z",
-            "start_at": datetime(2026, 4, 28, 19, 30, tzinfo=UTC),
-            "end_at": datetime(2026, 4, 28, 20, 30, tzinfo=UTC),
-        },
-        {
-            "event_id": "series-1_20260505T193000Z",
-            "start_at": datetime(2026, 5, 5, 19, 30, tzinfo=UTC),
-            "end_at": datetime(2026, 5, 5, 20, 30, tzinfo=UTC),
-        },
-    ]
-
-    runner = CalendarSyncRunner(
-        settings=settings,
-        warehouse=warehouse,
-        logger=FakeLogger(),
-        service_factory=lambda account: service,
-        now=lambda: datetime(2026, 4, 30, 13, 0, tzinfo=UTC),
-    )
-    summaries = runner.sync_all()
-
-    assert warehouse.deleted_event_ids == ["series-1_20260505T193000Z"]
-    assert summaries[0].expanded_events_written == 1
-    assert summaries[0].expanded_deleted_events == 1
-
-
 def test_calendar_api_datetime_normalizes_utc() -> None:
     assert calendar_api_datetime(datetime(2026, 4, 2, 9)) == "2026-04-02T09:00:00Z"
 
@@ -733,55 +521,6 @@ def test_clickhouse_insert_calendar_events_batches_by_event_month() -> None:
 
     assert [len(batch[1]) for batch in inserted_batches] == [2, 1]
     assert all(batch[0] == "calendar_events" for batch in inserted_batches)
-
-
-def test_clickhouse_load_active_calendar_events_by_id_returns_rows_by_event_id() -> None:
-    warehouse = object.__new__(ClickHouseWarehouse)
-    existing_row = {
-        "account": "zach@example.com",
-        "calendar_id": "primary",
-        "event_id": "event-1",
-        "recurring_event_id": "",
-        "i_cal_uid": "uid-1",
-        "status": "confirmed",
-        "is_deleted": 0,
-        "summary": "Planning",
-        "description": "",
-        "location": "",
-        "creator_email": "",
-        "organizer_email": "",
-        "start_at": datetime(2026, 4, 1, tzinfo=UTC),
-        "end_at": datetime(2026, 4, 1, 1, tzinfo=UTC),
-        "start_date": "",
-        "end_date": "",
-        "is_all_day": 0,
-        "html_link": "",
-        "attendees_json": "[]",
-        "reminders_json": "{}",
-        "recurrence": [],
-        "event_type": "",
-        "raw_json": "{}",
-        "updated_at": datetime(2026, 3, 1, tzinfo=UTC),
-        "synced_at": datetime(2026, 3, 1, tzinfo=UTC),
-        "sync_version": 1,
-    }
-    queries = []
-
-    def fake_query(sql):
-        queries.append(sql)
-        return [tuple(existing_row[column] for column in CALENDAR_EVENT_COLUMNS)]
-
-    warehouse._query = fake_query
-
-    rows = warehouse.load_active_calendar_events_by_id(
-        account="zach@example.com",
-        calendar_id="primary",
-        event_ids=["event-1", "event-2"],
-    )
-
-    assert rows["event-1"]["summary"] == "Planning"
-    assert "has(['event-1', 'event-2'], event_id)" in queries[0]
-    assert "AND is_deleted = 0" in queries[0]
 
 
 def test_clickhouse_ensure_calendar_tables_migrates_expanded_sync_state_columns() -> None:

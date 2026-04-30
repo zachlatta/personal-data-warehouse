@@ -1289,31 +1289,6 @@ class ClickHouseWarehouse:
         )
         return [str(row[0]) for row in rows]
 
-    def load_active_calendar_events_by_id(
-        self,
-        *,
-        account: str,
-        calendar_id: str,
-        event_ids: list[str],
-    ) -> dict[str, dict[str, Any]]:
-        if not event_ids:
-            return {}
-        event_ids_sql = "[" + ", ".join(_sql_string(event_id) for event_id in event_ids) + "]"
-        rows = self._query(
-            f"""
-            SELECT {", ".join(CALENDAR_EVENT_COLUMNS)}
-            FROM calendar_events FINAL
-            WHERE account = {_sql_string(account)}
-              AND calendar_id = {_sql_string(calendar_id)}
-              AND has({event_ids_sql}, event_id)
-              AND is_deleted = 0
-            """
-        )
-        return {
-            str(row[CALENDAR_EVENT_COLUMNS.index("event_id")]): dict(zip(CALENDAR_EVENT_COLUMNS, row, strict=True))
-            for row in rows
-        }
-
     def mark_calendar_events_deleted(
         self,
         *,
