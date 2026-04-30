@@ -2293,7 +2293,7 @@ class ClickHouseWarehouse:
             WITH
                 latest_calendar_events AS (
                     SELECT
-                        account,
+                        argMax(account, synced_at) AS calendar_account,
                         event_id,
                         argMax(calendar_id, synced_at) AS calendar_id,
                         argMax(organizer_email, synced_at) AS organizer_email,
@@ -2307,7 +2307,7 @@ class ClickHouseWarehouse:
                         argMax(html_link, synced_at) AS html_link
                     FROM calendar_events FINAL
                     WHERE is_deleted = 0
-                    GROUP BY account, event_id
+                    GROUP BY event_id
                 ),
                 latest_enrichments AS (
                     SELECT
@@ -2329,7 +2329,8 @@ class ClickHouseWarehouse:
                     GROUP BY account, recording_id
                 )
             SELECT
-                c.account AS account,
+                c.calendar_account AS calendar_account,
+                e.account AS recording_account,
                 c.calendar_id AS calendar_id,
                 c.event_id AS event_id,
                 e.recording_id AS recording_id,
@@ -2354,8 +2355,7 @@ class ClickHouseWarehouse:
                 e.enriched_at AS created_at
             FROM latest_calendar_events AS c
             INNER JOIN latest_enrichments AS e
-                ON c.account = e.account
-               AND c.event_id = e.calendar_event_id
+                ON c.event_id = e.calendar_event_id
             WHERE e.calendar_event_id != ''
             """
         )
@@ -2365,11 +2365,10 @@ class ClickHouseWarehouse:
             WITH
                 latest_calendar_events AS (
                     SELECT
-                        account,
                         event_id
                     FROM calendar_events FINAL
                     WHERE is_deleted = 0
-                    GROUP BY account, event_id
+                    GROUP BY event_id
                 ),
                 latest_enrichments AS (
                     SELECT
@@ -2417,8 +2416,7 @@ class ClickHouseWarehouse:
                AND e.recording_id = f.recording_id
                AND f.is_deleted = 0
             LEFT JOIN latest_calendar_events AS c
-                ON e.account = c.account
-               AND e.calendar_event_id = c.event_id
+                ON e.calendar_event_id = c.event_id
             WHERE e.calendar_event_id = ''
                OR e.calendar_confidence <= 0
                OR c.event_id = ''

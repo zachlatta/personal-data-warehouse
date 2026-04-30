@@ -235,8 +235,12 @@ def test_calendar_schema_creates_clean_transcript_views_when_sources_exist() -> 
     no_match_view_sql = next(
         command for command in commands if "CREATE OR REPLACE VIEW clean_transcripts_no_calendar_match" in command
     )
+    assert "c.calendar_account AS calendar_account" in calendar_view_sql
+    assert "e.account AS recording_account" in calendar_view_sql
     assert "c.event_id AS event_id" in calendar_view_sql
     assert "if(e.title != '', e.title, c.summary) AS title" in calendar_view_sql
+    assert "ON c.event_id = e.calendar_event_id" in calendar_view_sql
+    assert "c.account = e.account" not in calendar_view_sql
     assert "e.summary AS summary" in calendar_view_sql
     assert "calendar_event_id AS calendar_event_id" not in calendar_view_sql
     assert "transcript_summary" not in calendar_view_sql
