@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from dagster import AssetKey, DagsterInstance, Definitions, RunRequest, SkipReason, build_sensor_context
 
 from personal_data_warehouse.defs.calendar_sync import calendar_event_sync
@@ -19,7 +21,7 @@ from personal_data_warehouse.defs.apple_voice_memos_enrichment import (
 from personal_data_warehouse.defs.apple_voice_memos_transcription import apple_voice_memos_transcription
 from personal_data_warehouse.apple_voice_memos_enrichment import (
     AGENT_ENRICHMENT_PROMPT_VERSION,
-    DEFAULT_ENRICHMENT_LOOKBACK_WEEKS,
+    DEFAULT_ENRICHMENT_RECORDED_AFTER,
 )
 
 
@@ -27,9 +29,25 @@ def test_apple_voice_memos_enrichment_job_selects_asset() -> None:
     assert apple_voice_memos_enrichment_job.name == "apple_voice_memos_enrichment_job"
 
 
-def test_apple_voice_memos_enrichment_defaults_to_all_recent_transcripts() -> None:
+def test_apple_voice_memos_enrichment_defaults_to_december_2024_cutoff() -> None:
     assert DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE == 0
-    assert DEFAULT_ENRICHMENT_LOOKBACK_WEEKS == 12
+    assert DEFAULT_ENRICHMENT_RECORDED_AFTER == datetime(2024, 12, 1, tzinfo=UTC)
+
+
+def test_apple_voice_memos_enrichment_recorded_after_defaults_to_december_2024(monkeypatch) -> None:
+    monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER", raising=False)
+
+    assert apple_voice_memos_enrichment_defs.apple_voice_memos_enrichment_recorded_after() == datetime(
+        2024, 12, 1, tzinfo=UTC
+    )
+
+
+def test_apple_voice_memos_enrichment_recorded_after_env_accepts_date(monkeypatch) -> None:
+    monkeypatch.setenv("VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER", "2025-01-15")
+
+    assert apple_voice_memos_enrichment_defs.apple_voice_memos_enrichment_recorded_after() == datetime(
+        2025, 1, 15, tzinfo=UTC
+    )
 
 
 def test_apple_voice_memos_enrichment_uses_agent_provider_model_and_prompt() -> None:
@@ -98,6 +116,7 @@ def test_apple_voice_memos_enrichment_backlog_sensor_runs_every_minute() -> None
 def test_apple_voice_memos_enrichment_backlog_sensor_skips_when_backlog_is_empty(monkeypatch) -> None:
     calls = []
     settings_calls = []
+    monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER", raising=False)
     monkeypatch.setattr(
         apple_voice_memos_enrichment_defs,
         "load_settings",
@@ -124,9 +143,11 @@ def test_apple_voice_memos_enrichment_backlog_sensor_skips_when_backlog_is_empty
     assert settings_calls[0]["require_agent"] is True
     assert calls[0][1]["limit"] == 1
     assert calls[0][1]["model"] == "gpt-agent"
+    assert calls[0][1]["recorded_after"] == datetime(2024, 12, 1, tzinfo=UTC)
 
 
 def test_apple_voice_memos_enrichment_backlog_sensor_launches_when_backlog_exists(monkeypatch) -> None:
+    monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER", raising=False)
     monkeypatch.setattr(
         apple_voice_memos_enrichment_defs,
         "load_settings",

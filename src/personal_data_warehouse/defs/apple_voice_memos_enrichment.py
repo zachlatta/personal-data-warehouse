@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from dagster import (
     DefaultScheduleStatus,
@@ -28,7 +28,7 @@ from personal_data_warehouse.schedule_guards import skip_if_job_active, skip_if_
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.apple_voice_memos_enrichment import (
     AGENT_ENRICHMENT_PROMPT_VERSION,
-    DEFAULT_ENRICHMENT_LOOKBACK_WEEKS,
+    DEFAULT_ENRICHMENT_RECORDED_AFTER,
     ContainerAgentStructuredClient,
     VoiceMemosEnrichmentRunner,
     load_enrichment_candidates,
@@ -37,6 +37,7 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
 VOICE_MEMOS_ENRICHMENT_POSTGRES_LOCK_ID = 7_403_111_841
 DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE = 0
 VOICE_MEMOS_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 60
+VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER_ENV = "VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER"
 UNCONFIGURED_AGENT_RESOURCE = AgentResource.disabled()
 
 
@@ -57,10 +58,7 @@ def apple_voice_memos_enrichment(context, agent: AgentResource) -> MaterializeRe
             str(DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE),
         )
     )
-    lookback_weeks = int(os.getenv("VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS", str(DEFAULT_ENRICHMENT_LOOKBACK_WEEKS)))
-    if lookback_weeks < 1:
-        raise ValueError("VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS must be at least 1")
-    recorded_after = datetime.now(tz=UTC) - timedelta(weeks=lookback_weeks)
+    recorded_after = apple_voice_memos_enrichment_recorded_after()
     warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
     with exclusive_sync_lock(
         name="apple_voice_memos_enrichment",
@@ -88,7 +86,7 @@ def apple_voice_memos_enrichment(context, agent: AgentResource) -> MaterializeRe
             "recordings_seen": MetadataValue.int(summary.recordings_seen if summary else 0),
             "recordings_enriched": MetadataValue.int(summary.recordings_enriched if summary else 0),
             "recordings_failed": MetadataValue.int(summary.recordings_failed if summary else 0),
-            "lookback_weeks": MetadataValue.int(lookback_weeks),
+            "recorded_after": MetadataValue.text(recorded_after.isoformat()),
         }
     )
 
@@ -123,10 +121,7 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
         require_agent=True,
     )
 
-    lookback_weeks = int(os.getenv("VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS", str(DEFAULT_ENRICHMENT_LOOKBACK_WEEKS)))
-    if lookback_weeks < 1:
-        raise ValueError("VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS must be at least 1")
-    recorded_after = datetime.now(tz=UTC) - timedelta(weeks=lookback_weeks)
+    recorded_after = apple_voice_memos_enrichment_recorded_after()
     warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
     candidates = load_enrichment_candidates(
         warehouse,
@@ -140,6 +135,23 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
         return SkipReason("No unenriched Voice Memos transcripts found in ClickHouse.")
 
     return RunRequest(tags={"apple_voice_memos_trigger": "enrichment_backlog"})
+
+
+def apple_voice_memos_enrichment_recorded_after() -> datetime:
+    value = os.getenv(VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER_ENV)
+    if value is None or not value.strip():
+        return DEFAULT_ENRICHMENT_RECORDED_AFTER
+
+    raw_value = value.strip()
+    try:
+        recorded_after = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"{VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER_ENV} must be an ISO date or datetime, got {raw_value!r}"
+        ) from exc
+    if recorded_after.tzinfo is None:
+        recorded_after = recorded_after.replace(tzinfo=UTC)
+    return recorded_after.astimezone(UTC)
 
 
 def apple_voice_memos_enrichment_provider(settings) -> str:
