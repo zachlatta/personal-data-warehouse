@@ -77,6 +77,49 @@ def test_gmail_attachment_schema_keeps_enrichment_payloads_off_attachment_rows()
     assert "text_extraction_status LowCardinality(String)" in enrichment_sql
 
 
+def test_gmail_attachment_schema_migrates_legacy_enrichment_columns_before_drop() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+    legacy_columns = {
+        "text",
+        "text_extraction_status",
+        "text_extraction_error",
+        "ai_provider",
+        "ai_model",
+        "ai_base_url",
+        "ai_prompt_version",
+        "ai_prompt_sha256",
+        "ai_prompt",
+        "ai_source_status",
+        "ai_elapsed_ms",
+        "ai_processed_at",
+    }
+
+    def fake_query(sql: str):
+        if sql == "DESCRIBE TABLE gmail_attachments":
+            return [(column,) for column in sorted(legacy_columns | {"content_sha256", "synced_at", "sync_version"})]
+        return [(0,)]
+
+    warehouse._command = commands.append
+    warehouse._query = fake_query
+
+    warehouse.ensure_tables()
+
+    migrate_index = next(
+        index for index, command in enumerate(commands) if "INSERT INTO gmail_attachment_enrichments" in command
+    )
+    drop_text_index = next(
+        index for index, command in enumerate(commands) if "DROP COLUMN IF EXISTS text" in command
+    )
+    migrate_sql = commands[migrate_index]
+    assert migrate_index < drop_text_index
+    assert "FROM gmail_attachments FINAL" in migrate_sql
+    assert "argMax(text, sync_version) AS migrated_text" in migrate_sql
+    assert "GROUP BY" in migrate_sql
+    assert any("ALTER TABLE gmail_attachments DROP COLUMN IF EXISTS ai_provider" in command for command in commands)
+    assert any("ALTER TABLE gmail_attachments DROP COLUMN IF EXISTS ai_processed_at" in command for command in commands)
+
+
 def test_gmail_attachment_backfill_candidates_are_scoped_to_ai_version() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     queries: list[str] = []

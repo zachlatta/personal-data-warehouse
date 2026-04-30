@@ -99,6 +99,21 @@ ATTACHMENT_ENRICHMENT_COLUMNS = (
     "sync_version",
 )
 
+LEGACY_ATTACHMENT_ENRICHMENT_COLUMNS = (
+    "text",
+    "text_extraction_status",
+    "text_extraction_error",
+    "ai_provider",
+    "ai_model",
+    "ai_base_url",
+    "ai_prompt_version",
+    "ai_prompt_sha256",
+    "ai_prompt",
+    "ai_source_status",
+    "ai_elapsed_ms",
+    "ai_processed_at",
+)
+
 CALENDAR_EVENT_COLUMNS = (
     "account",
     "calendar_id",
@@ -626,6 +641,7 @@ class ClickHouseWarehouse:
             ORDER BY (content_sha256, ai_provider, ai_model, ai_prompt_version)
             """
         )
+        self._migrate_legacy_gmail_attachment_enrichments()
         self._ensure_clean_gmail_inbox_view()
 
     def ensure_calendar_tables(self) -> None:
@@ -861,6 +877,67 @@ class ClickHouseWarehouse:
             return {str(row[0]) for row in query(f"DESCRIBE TABLE {table_name}")}
         except Exception:
             return set()
+
+    def _migrate_legacy_gmail_attachment_enrichments(self) -> None:
+        columns = self._table_column_names("gmail_attachments")
+        legacy_columns = set(LEGACY_ATTACHMENT_ENRICHMENT_COLUMNS)
+        if not legacy_columns.issubset(columns):
+            return
+
+        self._command(
+            """
+            INSERT INTO gmail_attachment_enrichments (
+                content_sha256,
+                ai_provider,
+                ai_model,
+                ai_prompt_version,
+                text,
+                text_extraction_status,
+                text_extraction_error,
+                ai_base_url,
+                ai_prompt_sha256,
+                ai_prompt,
+                ai_source_status,
+                ai_elapsed_ms,
+                ai_processed_at,
+                updated_at,
+                sync_version
+            )
+            SELECT
+                content_sha256,
+                ai_provider,
+                ai_model,
+                ai_prompt_version,
+                argMax(text, sync_version) AS migrated_text,
+                argMax(text_extraction_status, sync_version) AS migrated_text_extraction_status,
+                argMax(text_extraction_error, sync_version) AS migrated_text_extraction_error,
+                argMax(ai_base_url, sync_version) AS migrated_ai_base_url,
+                argMax(ai_prompt_sha256, sync_version) AS migrated_ai_prompt_sha256,
+                argMax(ai_prompt, sync_version) AS migrated_ai_prompt,
+                argMax(ai_source_status, sync_version) AS migrated_ai_source_status,
+                argMax(ai_elapsed_ms, sync_version) AS migrated_ai_elapsed_ms,
+                argMax(ai_processed_at, sync_version) AS migrated_ai_processed_at,
+                max(synced_at) AS migrated_updated_at,
+                max(sync_version) AS migrated_sync_version
+            FROM gmail_attachments FINAL
+            WHERE content_sha256 != ''
+              AND (
+                text != ''
+                OR text_extraction_status != ''
+                OR text_extraction_error != ''
+                OR ai_provider != ''
+                OR ai_model != ''
+                OR ai_prompt_version != ''
+              )
+            GROUP BY
+                content_sha256,
+                ai_provider,
+                ai_model,
+                ai_prompt_version
+            """
+        )
+        for column in LEGACY_ATTACHMENT_ENRICHMENT_COLUMNS:
+            self._command(f"ALTER TABLE gmail_attachments DROP COLUMN IF EXISTS {column}")
 
     def ensure_agent_tables(self) -> None:
         self._command(
