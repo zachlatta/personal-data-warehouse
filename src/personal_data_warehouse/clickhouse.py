@@ -53,18 +53,6 @@ ATTACHMENT_COLUMNS = (
     "content_disposition",
     "size",
     "content_sha256",
-    "text",
-    "text_extraction_status",
-    "text_extraction_error",
-    "ai_provider",
-    "ai_model",
-    "ai_base_url",
-    "ai_prompt_version",
-    "ai_prompt_sha256",
-    "ai_prompt",
-    "ai_source_status",
-    "ai_elapsed_ms",
-    "ai_processed_at",
     "is_deleted",
     "part_json",
     "synced_at",
@@ -89,6 +77,24 @@ ATTACHMENT_BACKFILL_STATE_COLUMNS = (
     "ai_provider",
     "ai_model",
     "ai_prompt_version",
+    "updated_at",
+    "sync_version",
+)
+
+ATTACHMENT_ENRICHMENT_COLUMNS = (
+    "content_sha256",
+    "ai_provider",
+    "ai_model",
+    "ai_prompt_version",
+    "text",
+    "text_extraction_status",
+    "text_extraction_error",
+    "ai_base_url",
+    "ai_prompt_sha256",
+    "ai_prompt",
+    "ai_source_status",
+    "ai_elapsed_ms",
+    "ai_processed_at",
     "updated_at",
     "sync_version",
 )
@@ -546,18 +552,6 @@ class ClickHouseWarehouse:
                 content_disposition String,
                 size UInt64,
                 content_sha256 String,
-                text String,
-                text_extraction_status LowCardinality(String),
-                text_extraction_error String,
-                ai_provider LowCardinality(String),
-                ai_model String,
-                ai_base_url String,
-                ai_prompt_version LowCardinality(String),
-                ai_prompt_sha256 String,
-                ai_prompt String,
-                ai_source_status LowCardinality(String),
-                ai_elapsed_ms UInt64,
-                ai_processed_at DateTime64(3, 'UTC'),
                 is_deleted UInt8,
                 part_json String,
                 synced_at DateTime64(3, 'UTC'),
@@ -567,33 +561,6 @@ class ClickHouseWarehouse:
             PARTITION BY toYYYYMM(synced_at)
             ORDER BY (account, message_id, part_id, filename)
             """
-        )
-        self._command(
-            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_provider LowCardinality(String) AFTER text_extraction_error"
-        )
-        self._command(
-            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_model String AFTER ai_provider"
-        )
-        self._command(
-            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_base_url String AFTER ai_model"
-        )
-        self._command(
-            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_prompt_version LowCardinality(String) AFTER ai_base_url"
-        )
-        self._command(
-            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_prompt_sha256 String AFTER ai_prompt_version"
-        )
-        self._command(
-            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_prompt String AFTER ai_prompt_sha256"
-        )
-        self._command(
-            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_source_status LowCardinality(String) AFTER ai_prompt"
-        )
-        self._command(
-            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_elapsed_ms UInt64 AFTER ai_source_status"
-        )
-        self._command(
-            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS ai_processed_at DateTime64(3, 'UTC') AFTER ai_elapsed_ms"
         )
         self._command(
             """
@@ -635,6 +602,29 @@ class ClickHouseWarehouse:
         )
         self._command(
             "ALTER TABLE gmail_attachment_backfill_state ADD COLUMN IF NOT EXISTS ai_prompt_version LowCardinality(String) AFTER ai_model"
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS gmail_attachment_enrichments (
+                content_sha256 String,
+                ai_provider LowCardinality(String),
+                ai_model String,
+                ai_prompt_version LowCardinality(String),
+                text String,
+                text_extraction_status LowCardinality(String),
+                text_extraction_error String,
+                ai_base_url String,
+                ai_prompt_sha256 String,
+                ai_prompt String,
+                ai_source_status LowCardinality(String),
+                ai_elapsed_ms UInt64,
+                ai_processed_at DateTime64(3, 'UTC'),
+                updated_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            ORDER BY (content_sha256, ai_provider, ai_model, ai_prompt_version)
+            """
         )
         self._ensure_clean_gmail_inbox_view()
 
@@ -1258,6 +1248,65 @@ class ClickHouseWarehouse:
             "gmail_attachment_backfill_state",
             rows,
             ATTACHMENT_BACKFILL_STATE_COLUMNS,
+        )
+
+    def load_attachment_enrichments(
+        self,
+        *,
+        content_sha256s: list[str],
+        ai_provider: str,
+        ai_model: str,
+        ai_prompt_version: str,
+    ) -> dict[str, dict[str, Any]]:
+        hashes = sorted({value for value in content_sha256s if value})
+        if not hashes:
+            return {}
+        hash_list = ", ".join(_sql_string(value) for value in hashes)
+        rows = self._query(
+            f"""
+            SELECT
+                content_sha256,
+                text,
+                text_extraction_status,
+                text_extraction_error,
+                ai_provider,
+                ai_model,
+                ai_base_url,
+                ai_prompt_version,
+                ai_prompt_sha256,
+                ai_prompt,
+                ai_source_status,
+                ai_elapsed_ms,
+                ai_processed_at
+            FROM gmail_attachment_enrichments FINAL
+            WHERE content_sha256 IN ({hash_list})
+              AND ai_provider = {_sql_string(ai_provider)}
+              AND ai_model = {_sql_string(ai_model)}
+              AND ai_prompt_version = {_sql_string(ai_prompt_version)}
+            """
+        )
+        columns = (
+            "content_sha256",
+            "text",
+            "text_extraction_status",
+            "text_extraction_error",
+            "ai_provider",
+            "ai_model",
+            "ai_base_url",
+            "ai_prompt_version",
+            "ai_prompt_sha256",
+            "ai_prompt",
+            "ai_source_status",
+            "ai_elapsed_ms",
+            "ai_processed_at",
+        )
+        return {str(row[0]): dict(zip(columns, row, strict=True)) for row in rows}
+
+    def insert_attachment_enrichments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows(
+            "gmail_attachment_enrichments",
+            rows,
+            ATTACHMENT_ENRICHMENT_COLUMNS,
         )
 
     def insert_calendar_events(self, rows: list[dict[str, Any]]) -> None:

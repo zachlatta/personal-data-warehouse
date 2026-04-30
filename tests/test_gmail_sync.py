@@ -30,6 +30,8 @@ from personal_data_warehouse.gmail_sync import (
     ATTACHMENT_AI_PROMPT_VERSION,
     AttachmentAiFallbackConfig,
     AttachmentAiModelAttemptBudget,
+    AttachmentTextExtraction,
+    WarehouseAttachmentEnrichmentCache,
     attachment_ai_model_image,
     attachment_ai_prompt,
     attachment_ai_supporting_ocr_text,
@@ -146,6 +148,56 @@ class FakeAttachmentBackfillWarehouse:
 
     def insert_attachment_backfill_state(self, rows: list[dict[str, object]]) -> None:
         self.state_rows.extend(rows)
+
+
+class FakeAttachmentEnrichmentCache:
+    def __init__(self, cached: dict[str, AttachmentTextExtraction] | None = None) -> None:
+        self.cached = dict(cached or {})
+        self.get_calls: list[str] = []
+        self.put_calls: list[tuple[str, AttachmentTextExtraction]] = []
+
+    def get(self, content_sha256: str) -> AttachmentTextExtraction | None:
+        self.get_calls.append(content_sha256)
+        return self.cached.get(content_sha256)
+
+    def put(self, content_sha256: str, extraction: AttachmentTextExtraction) -> None:
+        self.put_calls.append((content_sha256, extraction))
+        self.cached[content_sha256] = extraction
+
+
+class FakeWarehouseAttachmentEnrichments:
+    def __init__(self, rows: dict[tuple[str, str, str, str], dict[str, object]] | None = None) -> None:
+        self.rows = dict(rows or {})
+        self.load_calls: list[dict[str, object]] = []
+        self.inserted_rows: list[dict[str, object]] = []
+
+    def load_attachment_enrichments(
+        self,
+        *,
+        content_sha256s: list[str],
+        ai_provider: str,
+        ai_model: str,
+        ai_prompt_version: str,
+    ) -> dict[str, dict[str, object]]:
+        self.load_calls.append(
+            {
+                "content_sha256s": content_sha256s,
+                "ai_provider": ai_provider,
+                "ai_model": ai_model,
+                "ai_prompt_version": ai_prompt_version,
+            }
+        )
+        return {
+            content_sha256: row
+            for content_sha256 in content_sha256s
+            if (
+                row := self.rows.get((content_sha256, ai_provider, ai_model, ai_prompt_version))
+            )
+            is not None
+        }
+
+    def insert_attachment_enrichments(self, rows: list[dict[str, object]]) -> None:
+        self.inserted_rows.extend(rows)
 
 
 def test_load_settings_accepts_oauth_client_secrets_json_env(monkeypatch) -> None:
@@ -627,6 +679,347 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
     assert metadata["prompt_sha256"] == row["ai_prompt_sha256"]
     assert metadata["generation_options"] == {"temperature": 0, "num_predict": 320}
     assert metadata["response_format"] == "prompted_json"
+
+
+def test_attachment_rows_for_message_reuses_cached_enrichment_by_hash() -> None:
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"cached image bytes" * 1000)
+    content_sha256 = hashlib.sha256(image_content).hexdigest()
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "receipt.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                }
+            ]
+        },
+    }
+    cached = AttachmentTextExtraction(
+        text="AI attachment extraction\n\nSummary: cached receipt",
+        status="ai_ok",
+        ai_provider="ollama",
+        ai_model="gemma4:e2b",
+        ai_base_url="http://127.0.0.1:11435",
+        ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION,
+        ai_prompt_sha256="prompt-hash",
+        ai_prompt=ATTACHMENT_AI_PROMPT,
+        ai_source_status="unsupported",
+        ai_elapsed_ms=12,
+        ai_processed_at=datetime(2026, 4, 20, tzinfo=UTC),
+    )
+    cache = FakeAttachmentEnrichmentCache({content_sha256: cached})
+    ollama = FakeOllamaResource("{}")
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(image_content) + 1,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+        enrichment_cache=cache,
+    )
+
+    assert rows[0]["content_sha256"] == content_sha256
+    assert rows[0]["text_extraction_status"] == "ai_ok"
+    assert rows[0]["text"] == "AI attachment extraction\n\nSummary: cached receipt"
+    assert rows[0]["ai_model"] == "gemma4:e2b"
+    assert cache.get_calls == [content_sha256]
+    assert cache.put_calls == []
+    assert ollama.generate_calls == []
+
+
+def test_attachment_rows_for_message_reuses_cached_text_enrichment_by_hash_without_ai() -> None:
+    content = b"actual attachment text that should not be reparsed"
+    content_sha256 = hashlib.sha256(content).hexdigest()
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "notes.txt",
+                    "mimeType": "text/plain",
+                    "body": {"data": _gmail_data(content), "size": len(content)},
+                }
+            ]
+        },
+    }
+    cached = AttachmentTextExtraction(
+        text="cached text enrichment",
+        status="ok",
+        ai_processed_at=datetime(2026, 4, 20, tzinfo=UTC),
+    )
+    cache = FakeAttachmentEnrichmentCache({content_sha256: cached})
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(content) + 1,
+        text_max_chars=1000,
+        enrichment_cache=cache,
+    )
+
+    assert rows[0]["content_sha256"] == content_sha256
+    assert rows[0]["text_extraction_status"] == "ok"
+    assert rows[0]["text"] == "cached text enrichment"
+    assert rows[0]["ai_model"] == ""
+    assert cache.get_calls == [content_sha256]
+    assert cache.put_calls == []
+
+
+def test_attachment_rows_for_message_caches_new_enrichment_for_duplicate_hashes() -> None:
+    image_content = b"\x89PNG\r\n\x1a\n" + (b"duplicate image bytes" * 1000)
+    content_sha256 = hashlib.sha256(image_content).hexdigest()
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "1",
+                    "filename": "one.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                },
+                {
+                    "partId": "2",
+                    "filename": "two.png",
+                    "mimeType": "image/png",
+                    "body": {"data": _gmail_data(image_content), "size": len(image_content)},
+                },
+            ]
+        },
+    }
+    cache = FakeAttachmentEnrichmentCache()
+    ollama = FakeOllamaResource(
+        json.dumps(
+            {
+                "is_useful": True,
+                "document_type": "logo",
+                "summary": "A cached logo.",
+                "visible_text": ["CACHED"],
+                "entities": ["Cached"],
+                "search_keywords": ["cached logo"],
+                "uncertainties": [],
+            }
+        )
+    )
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(image_content) + 1,
+        text_max_chars=1000,
+        ai_fallback=AttachmentAiFallbackConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11435",
+            model="gemma4:e2b",
+            timeout_seconds=30,
+            pdf_max_pages=1,
+            pull_model=True,
+            client=ollama,
+        ),
+        enrichment_cache=cache,
+    )
+
+    assert [row["content_sha256"] for row in rows] == [content_sha256, content_sha256]
+    assert [row["text_extraction_status"] for row in rows] == ["ai_ok", "ai_ok"]
+    assert "A cached logo" in rows[0]["text"]
+    assert rows[1]["text"] == rows[0]["text"]
+    assert len(ollama.generate_calls) == 1
+    assert cache.get_calls == [content_sha256, content_sha256]
+    assert len(cache.put_calls) == 1
+    assert cache.put_calls[0][0] == content_sha256
+
+
+def test_attachment_rows_for_message_caches_new_text_enrichment_for_duplicate_hashes_without_ai() -> None:
+    content = b"duplicate plain text attachment"
+    content_sha256 = hashlib.sha256(content).hexdigest()
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "1",
+                    "filename": "one.txt",
+                    "mimeType": "text/plain",
+                    "body": {"data": _gmail_data(content), "size": len(content)},
+                },
+                {
+                    "partId": "2",
+                    "filename": "two.txt",
+                    "mimeType": "text/plain",
+                    "body": {"data": _gmail_data(content), "size": len(content)},
+                },
+            ]
+        },
+    }
+    cache = FakeAttachmentEnrichmentCache()
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=len(content) + 1,
+        text_max_chars=1000,
+        enrichment_cache=cache,
+    )
+
+    assert [row["content_sha256"] for row in rows] == [content_sha256, content_sha256]
+    assert [row["text"] for row in rows] == ["duplicate plain text attachment", "duplicate plain text attachment"]
+    assert [row["text_extraction_status"] for row in rows] == ["ok", "ok"]
+    assert cache.get_calls == [content_sha256, content_sha256]
+    assert len(cache.put_calls) == 1
+    assert cache.put_calls[0][0] == content_sha256
+
+
+def test_warehouse_attachment_enrichment_cache_writes_text_extraction_to_enrichment_table() -> None:
+    warehouse = FakeWarehouseAttachmentEnrichments()
+    cache = WarehouseAttachmentEnrichmentCache(warehouse=warehouse, config=None)
+    extraction = AttachmentTextExtraction(
+        text="cached parsed text",
+        status="ok",
+        ai_processed_at=datetime(1970, 1, 1, tzinfo=UTC),
+    )
+
+    cache.put("hash-1", extraction)
+
+    assert len(warehouse.inserted_rows) == 1
+    inserted = warehouse.inserted_rows[0]
+    assert inserted["content_sha256"] == "hash-1"
+    assert inserted["text"] == "cached parsed text"
+    assert inserted["text_extraction_status"] == "ok"
+    assert inserted["ai_provider"] == ""
+    assert inserted["ai_model"] == ""
+    assert inserted["ai_prompt_version"] == ""
+
+
+def test_warehouse_attachment_enrichment_cache_does_not_reuse_deterministic_unsupported_for_ai() -> None:
+    ai_config = AttachmentAiFallbackConfig(
+        provider="ollama",
+        base_url="http://127.0.0.1:11435",
+        model="qwen3-vl:2b",
+        timeout_seconds=30,
+        pdf_max_pages=1,
+        pull_model=False,
+    )
+    warehouse = FakeWarehouseAttachmentEnrichments(
+        {
+            (
+                "hash-1",
+                "",
+                "",
+                "",
+            ): {
+                "content_sha256": "hash-1",
+                "text": "",
+                "text_extraction_status": "unsupported",
+                "text_extraction_error": "unsupported",
+                "ai_provider": "",
+                "ai_model": "",
+                "ai_base_url": "",
+                "ai_prompt_version": "",
+                "ai_prompt_sha256": "",
+                "ai_prompt": "",
+                "ai_source_status": "",
+                "ai_elapsed_ms": 0,
+                "ai_processed_at": datetime(1970, 1, 1, tzinfo=UTC),
+            }
+        }
+    )
+    cache = WarehouseAttachmentEnrichmentCache(warehouse=warehouse, config=ai_config)
+
+    assert cache.get("hash-1") is None
+    assert warehouse.load_calls == [
+        {
+            "content_sha256s": ["hash-1"],
+            "ai_provider": "ollama",
+            "ai_model": "qwen3-vl:2b",
+            "ai_prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
+        },
+        {
+            "content_sha256s": ["hash-1"],
+            "ai_provider": "",
+            "ai_model": "",
+            "ai_prompt_version": "",
+        },
+    ]
+
+
+def test_warehouse_attachment_enrichment_cache_reuses_deterministic_ok_for_ai() -> None:
+    ai_config = AttachmentAiFallbackConfig(
+        provider="ollama",
+        base_url="http://127.0.0.1:11435",
+        model="qwen3-vl:2b",
+        timeout_seconds=30,
+        pdf_max_pages=1,
+        pull_model=False,
+    )
+    warehouse = FakeWarehouseAttachmentEnrichments(
+        {
+            (
+                "hash-1",
+                "",
+                "",
+                "",
+            ): {
+                "content_sha256": "hash-1",
+                "text": "deterministic cached text",
+                "text_extraction_status": "ok",
+                "text_extraction_error": "",
+                "ai_provider": "",
+                "ai_model": "",
+                "ai_base_url": "",
+                "ai_prompt_version": "",
+                "ai_prompt_sha256": "",
+                "ai_prompt": "",
+                "ai_source_status": "",
+                "ai_elapsed_ms": 0,
+                "ai_processed_at": datetime(1970, 1, 1, tzinfo=UTC),
+            }
+        }
+    )
+    cache = WarehouseAttachmentEnrichmentCache(warehouse=warehouse, config=ai_config)
+
+    extraction = cache.get("hash-1")
+
+    assert extraction is not None
+    assert extraction.text == "deterministic cached text"
+    assert extraction.status == "ok"
+    assert extraction.ai_model == ""
 
 
 def test_attachment_ai_prompt_includes_deterministic_ocr_hints() -> None:
@@ -1269,7 +1662,7 @@ def test_attachment_rows_for_message_parses_json_string_wrapped_ai_response() ->
     assert rows[0]["text"] == ""
 
 
-def test_attachment_rows_for_message_skips_tiny_images_for_ai_fallback() -> None:
+def test_attachment_rows_for_message_skips_sub_minimum_images_for_ai_fallback() -> None:
     image_content = b"\x89PNG\r\n\x1a\nsmall"
     message = {
         "id": "gmail-id",

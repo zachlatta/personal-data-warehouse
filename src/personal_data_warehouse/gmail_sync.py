@@ -91,7 +91,7 @@ Keep the JSON concise enough to finish quickly: prefer at most 12 visible_text c
 
 Use false for is_useful only for blank/decorative/tracking images or literal placeholders with no useful visible text. Do not invent details."""
 ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
-ATTACHMENT_AI_MIN_IMAGE_BYTES = 16 * 1024
+ATTACHMENT_AI_MIN_IMAGE_BYTES = 256
 IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 T = TypeVar("T")
@@ -126,6 +126,12 @@ class AttachmentTextExtraction:
     ai_source_status: str = ""
     ai_elapsed_ms: int = 0
     ai_processed_at: datetime = EPOCH_UTC
+
+
+class AttachmentEnrichmentCache(Protocol):
+    def get(self, content_sha256: str) -> AttachmentTextExtraction | None: ...
+
+    def put(self, content_sha256: str, extraction: AttachmentTextExtraction) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -387,6 +393,7 @@ class GmailSyncRunner:
                 message_ids=message_ids,
                 synced_at=sync_started_at,
                 force_reprocess=self._settings.gmail_force_full_sync,
+                enrichment_cache=self._attachment_enrichment_cache(),
             )
             self._warehouse.insert_attachments(attachment_rows)
             attachments_written += len(attachment_rows)
@@ -438,6 +445,7 @@ class GmailSyncRunner:
                 account=account.email_address,
                 message_ids=message_ids,
             )
+            enrichment_cache = self._attachment_enrichment_cache()
             for message_id in message_ids:
                 message = fetch_message_or_none(service, message_id)
                 if message is None:
@@ -477,6 +485,7 @@ class GmailSyncRunner:
                             max_bytes=self._settings.gmail_attachment_max_bytes,
                             text_max_chars=self._settings.gmail_attachment_text_max_chars,
                             ai_fallback=self._attachment_ai_fallback,
+                            enrichment_cache=enrichment_cache,
                         )
                     )
             self._warehouse.insert_messages(rows)
@@ -511,6 +520,7 @@ class GmailSyncRunner:
         message_ids: list[str],
         synced_at: datetime,
         force_reprocess: bool = False,
+        enrichment_cache: AttachmentEnrichmentCache | None = None,
     ) -> list[dict[str, object]]:
         if not messages:
             return []
@@ -531,6 +541,7 @@ class GmailSyncRunner:
                     text_max_chars=self._settings.gmail_attachment_text_max_chars,
                     force_reprocess=force_reprocess,
                     ai_fallback=self._attachment_ai_fallback,
+                    enrichment_cache=enrichment_cache,
                 )
             )
         return rows
@@ -583,6 +594,7 @@ class GmailSyncRunner:
         candidates = 0
         rows_written = 0
         text_chars = 0
+        enrichment_cache = self._attachment_enrichment_cache()
 
         for message in messages:
             message_id = str(message.get("id", ""))
@@ -605,6 +617,7 @@ class GmailSyncRunner:
                     text_max_chars=self._settings.gmail_attachment_text_max_chars,
                     force_reprocess=True,
                     ai_fallback=self._attachment_ai_fallback,
+                    enrichment_cache=enrichment_cache,
                 )
                 self._warehouse.insert_attachments(rows)
                 self._warehouse.insert_attachment_backfill_state(
@@ -658,6 +671,16 @@ class GmailSyncRunner:
         )
         return (candidates, rows_written, text_chars)
 
+    def _attachment_enrichment_cache(self) -> AttachmentEnrichmentCache | None:
+        if not hasattr(self._warehouse, "load_attachment_enrichments") or not hasattr(
+            self._warehouse, "insert_attachment_enrichments"
+        ):
+            return None
+        return WarehouseAttachmentEnrichmentCache(
+            warehouse=self._warehouse,
+            config=self._attachment_ai_fallback,
+        )
+
 
 def attachment_ai_fallback_config_from_settings(
     settings: Settings,
@@ -676,6 +699,121 @@ def attachment_ai_fallback_config_from_settings(
         client=client,
         model_attempt_budget=AttachmentAiModelAttemptBudget(ATTACHMENT_AI_MODEL_ATTEMPT_LIMIT),
     )
+
+
+class WarehouseAttachmentEnrichmentCache:
+    _MISSING = object()
+
+    def __init__(self, *, warehouse, config: AttachmentAiFallbackConfig | None) -> None:
+        self._warehouse = warehouse
+        self._config = config
+        self._cache: dict[str, AttachmentTextExtraction | object] = {}
+
+    def get(self, content_sha256: str) -> AttachmentTextExtraction | None:
+        if not content_sha256:
+            return None
+        cached = self._cache.get(content_sha256)
+        if cached is self._MISSING:
+            return None
+        if isinstance(cached, AttachmentTextExtraction):
+            return cached
+
+        rows = self._warehouse.load_attachment_enrichments(
+            content_sha256s=[content_sha256],
+            ai_provider=self._config.provider if self._config is not None else "",
+            ai_model=self._config.model if self._config is not None else "",
+            ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION if self._config is not None else "",
+        )
+        row = rows.get(content_sha256)
+        if row is None and self._config is not None:
+            deterministic_rows = self._warehouse.load_attachment_enrichments(
+                content_sha256s=[content_sha256],
+                ai_provider="",
+                ai_model="",
+                ai_prompt_version="",
+            )
+            deterministic_row = deterministic_rows.get(content_sha256)
+            if deterministic_row is not None and str(
+                deterministic_row.get("text_extraction_status", "")
+            ) not in ATTACHMENT_AI_FALLBACK_STATUSES:
+                row = deterministic_row
+        if row is None:
+            self._cache[content_sha256] = self._MISSING
+            return None
+        extraction = attachment_text_extraction_from_enrichment_row(row)
+        self._cache[content_sha256] = extraction
+        return extraction
+
+    def put(self, content_sha256: str, extraction: AttachmentTextExtraction) -> None:
+        if not content_sha256 or not attachment_enrichment_is_cacheable(extraction):
+            return
+        self._cache[content_sha256] = extraction
+        self._warehouse.insert_attachment_enrichments(
+            [
+                attachment_enrichment_row(
+                    content_sha256=content_sha256,
+                    extraction=extraction,
+                    updated_at=datetime.now(tz=UTC),
+                )
+            ]
+        )
+
+
+def attachment_enrichment_is_cacheable(extraction: AttachmentTextExtraction) -> bool:
+    return extraction.status not in {
+        "",
+        "disabled",
+        "fetch_error",
+        "too_large",
+        "no_content",
+        "ai_model_failed",
+        "ai_model_skipped",
+    }
+
+
+def attachment_text_extraction_from_enrichment_row(row: Mapping[str, object]) -> AttachmentTextExtraction:
+    ai_processed_at = row.get("ai_processed_at", EPOCH_UTC)
+    if not isinstance(ai_processed_at, datetime):
+        ai_processed_at = EPOCH_UTC
+    return AttachmentTextExtraction(
+        text=str(row.get("text", "")),
+        status=str(row.get("text_extraction_status", "")),
+        error=str(row.get("text_extraction_error", "")),
+        ai_provider=str(row.get("ai_provider", "")),
+        ai_model=str(row.get("ai_model", "")),
+        ai_base_url=str(row.get("ai_base_url", "")),
+        ai_prompt_version=str(row.get("ai_prompt_version", "")),
+        ai_prompt_sha256=str(row.get("ai_prompt_sha256", "")),
+        ai_prompt=str(row.get("ai_prompt", "")),
+        ai_source_status=str(row.get("ai_source_status", "")),
+        ai_elapsed_ms=int(row.get("ai_elapsed_ms", 0) or 0),
+        ai_processed_at=ai_processed_at,
+    )
+
+
+def attachment_enrichment_row(
+    *,
+    content_sha256: str,
+    extraction: AttachmentTextExtraction,
+    updated_at: datetime,
+) -> dict[str, object]:
+    return {
+        "content_sha256": content_sha256,
+        "ai_provider": extraction.ai_provider,
+        "ai_model": extraction.ai_model,
+        "ai_prompt_version": extraction.ai_prompt_version,
+        "text": extraction.text,
+        "text_extraction_status": extraction.status,
+        "text_extraction_error": extraction.error,
+        "ai_base_url": extraction.ai_base_url,
+        "ai_prompt_sha256": extraction.ai_prompt_sha256,
+        "ai_prompt": extraction.ai_prompt,
+        "ai_source_status": extraction.ai_source_status,
+        "ai_elapsed_ms": extraction.ai_elapsed_ms,
+        "ai_processed_at": extraction.ai_processed_at,
+        "updated_at": updated_at,
+        "sync_version": int(updated_at.timestamp() * 1000),
+    }
 
 
 def build_gmail_service(*, account: GmailAccount, settings: Settings):
@@ -881,6 +1019,7 @@ def attachment_rows_for_message(
     text_max_chars: int,
     force_reprocess: bool = False,
     ai_fallback: AttachmentAiFallbackConfig | None = None,
+    enrichment_cache: AttachmentEnrichmentCache | None = None,
 ) -> list[dict[str, object]]:
     message_id = str(message.get("id", ""))
     current_parts = attachment_parts_from_message(message)
@@ -902,6 +1041,7 @@ def attachment_rows_for_message(
                 max_bytes=max_bytes,
                 text_max_chars=text_max_chars,
                 ai_fallback=ai_fallback,
+                enrichment_cache=enrichment_cache,
             )
         )
 
@@ -1023,6 +1163,7 @@ def attachment_part_to_row(
     max_bytes: int,
     text_max_chars: int,
     ai_fallback: AttachmentAiFallbackConfig | None = None,
+    enrichment_cache: AttachmentEnrichmentCache | None = None,
 ) -> dict[str, object]:
     message_id = str(message.get("id", ""))
     headers = header_map(part.get("headers", []))
@@ -1067,20 +1208,26 @@ def attachment_part_to_row(
             else:
                 content_sha256 = hashlib.sha256(content).hexdigest()
                 declared_size = declared_size or len(content)
-                extraction = extract_attachment_text(
-                    content=content,
-                    mime_type=mime_type,
-                    filename=filename,
-                    max_chars=text_max_chars,
-                )
-                extraction = apply_attachment_ai_fallback(
-                    extraction=extraction,
-                    content=content,
-                    mime_type=mime_type,
-                    filename=filename,
-                    max_chars=text_max_chars,
-                    config=ai_fallback,
-                )
+                cached_extraction = enrichment_cache.get(content_sha256) if enrichment_cache is not None else None
+                if cached_extraction is not None:
+                    extraction = cached_extraction
+                else:
+                    extraction = extract_attachment_text(
+                        content=content,
+                        mime_type=mime_type,
+                        filename=filename,
+                        max_chars=text_max_chars,
+                    )
+                    extraction = apply_attachment_ai_fallback(
+                        extraction=extraction,
+                        content=content,
+                        mime_type=mime_type,
+                        filename=filename,
+                        max_chars=text_max_chars,
+                        config=ai_fallback,
+                    )
+                    if enrichment_cache is not None:
+                        enrichment_cache.put(content_sha256, extraction)
 
     sync_version = int(synced_at.timestamp() * 1000)
     return {
