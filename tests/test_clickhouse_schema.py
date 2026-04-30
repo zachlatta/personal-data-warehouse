@@ -19,7 +19,7 @@ def test_gmail_schema_drops_thread_view_and_does_not_recreate_it() -> None:
     assert all("CREATE OR REPLACE VIEW gmail_thread_messages" not in command for command in commands)
 
 
-def test_gmail_schema_creates_account_state_view() -> None:
+def test_gmail_schema_creates_clean_inbox_view() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     commands: list[str] = []
 
@@ -28,7 +28,17 @@ def test_gmail_schema_creates_account_state_view() -> None:
 
     warehouse.ensure_tables()
 
-    assert any("CREATE OR REPLACE VIEW gmail_account_state_items" in command for command in commands)
+    assert any("DROP VIEW IF EXISTS account_state_items" in command for command in commands)
+    assert any("DROP VIEW IF EXISTS gmail_account_state_items" in command for command in commands)
+    assert any("CREATE OR REPLACE VIEW clean_gmail_inbox" in command for command in commands)
+    view_sql = next(command for command in commands if "CREATE OR REPLACE VIEW clean_gmail_inbox" in command)
+    assert "thread_id AS thread_id" in view_sql
+    assert "latest_message_id AS message_id" in view_sql
+    assert "latest_activity_at AS latest_at" in view_sql
+    assert "latest_from_address AS from_address" in view_sql
+    assert "source_table" not in view_sql
+    assert "drilldown_hint" not in view_sql
+    assert all("CREATE OR REPLACE VIEW account_state_items" not in command for command in commands)
 
 
 def test_gmail_attachment_backfill_schema_tracks_ai_version() -> None:
@@ -78,7 +88,17 @@ def test_slack_schema_creates_identity_table_and_account_state_view() -> None:
     warehouse.ensure_slack_tables()
 
     assert any("CREATE TABLE IF NOT EXISTS slack_account_identities" in command for command in commands)
-    assert any("CREATE OR REPLACE VIEW slack_account_state_items" in command for command in commands)
+    assert any("DROP TABLE IF EXISTS slack_account_state_items" in command for command in commands)
+    assert any("CREATE OR REPLACE VIEW clean_slack_inbox" in command for command in commands)
+    view_sql = next(command for command in commands if "CREATE OR REPLACE VIEW clean_slack_inbox" in command)
+    assert "scope_id AS team_id" in view_sql
+    assert "item_type AS kind" in view_sql
+    assert "item_state AS state" in view_sql
+    assert "latest_activity_at AS latest_at" in view_sql
+    assert "container_id AS conversation_id" in view_sql
+    assert "message_id AS message_ts" in view_sql
+    assert "source_table" not in view_sql
+    assert "drilldown_hint" not in view_sql
 
 
 def test_apple_voice_memos_schema_creates_file_table() -> None:
@@ -187,7 +207,7 @@ def test_apple_voice_memos_untranscribed_query_orders_recent_recordings() -> Non
     assert "LIMIT 3" in queries[0]
 
 
-def test_combined_account_state_view_created_when_source_views_exist() -> None:
+def test_combined_account_state_view_is_not_created() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     commands: list[str] = []
 
@@ -196,7 +216,63 @@ def test_combined_account_state_view_created_when_source_views_exist() -> None:
 
     warehouse.ensure_tables()
 
-    assert any("CREATE OR REPLACE VIEW account_state_items" in command for command in commands)
+    assert any("DROP VIEW IF EXISTS account_state_items" in command for command in commands)
+    assert all("CREATE OR REPLACE VIEW account_state_items" not in command for command in commands)
+
+
+def test_calendar_schema_creates_clean_transcript_views_when_sources_exist() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+
+    warehouse._command = commands.append
+    warehouse._query = lambda _sql: [(1,)]
+
+    warehouse.ensure_calendar_tables()
+
+    assert any("CREATE OR REPLACE VIEW clean_calendar_with_transcripts" in command for command in commands)
+    assert any("CREATE OR REPLACE VIEW clean_transcripts_no_calendar_match" in command for command in commands)
+    calendar_view_sql = next(command for command in commands if "CREATE OR REPLACE VIEW clean_calendar_with_transcripts" in command)
+    no_match_view_sql = next(
+        command for command in commands if "CREATE OR REPLACE VIEW clean_transcripts_no_calendar_match" in command
+    )
+    assert "c.event_id AS event_id" in calendar_view_sql
+    assert "if(e.title != '', e.title, c.summary) AS title" in calendar_view_sql
+    assert "e.summary AS summary" in calendar_view_sql
+    assert "calendar_event_id AS calendar_event_id" not in calendar_view_sql
+    assert "transcript_summary" not in calendar_view_sql
+    assert "recording_id AS recording_id" in no_match_view_sql
+    assert "if(e.title != '', e.title, f.title) AS title" in no_match_view_sql
+    assert "e.calendar_event_id AS attempted_calendar_event_id" in no_match_view_sql
+    assert "calendar_event_not_found" in no_match_view_sql
+    assert "OR c.event_id = ''" in no_match_view_sql
+    assert "e.summary AS summary" in no_match_view_sql
+    assert "transcript_summary" not in no_match_view_sql
+
+
+def test_calendar_schema_skips_clean_transcript_views_until_sources_exist() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+
+    warehouse._command = commands.append
+    warehouse._query = lambda _sql: [(0,)]
+
+    warehouse.ensure_calendar_tables()
+
+    assert all("CREATE OR REPLACE VIEW clean_calendar_with_transcripts" not in command for command in commands)
+    assert all("CREATE OR REPLACE VIEW clean_transcripts_no_calendar_match" not in command for command in commands)
+
+
+def test_apple_voice_memos_schema_creates_clean_transcript_views_when_calendar_exists() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+
+    warehouse._command = commands.append
+    warehouse._query = lambda _sql: [(1,)]
+
+    warehouse.ensure_apple_voice_memos_tables()
+
+    assert any("CREATE OR REPLACE VIEW clean_calendar_with_transcripts" in command for command in commands)
+    assert any("CREATE OR REPLACE VIEW clean_transcripts_no_calendar_match" in command for command in commands)
 
 
 def test_slack_read_state_candidates_include_direct_messages() -> None:

@@ -445,9 +445,12 @@ SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS = (
 )
 
 OBSOLETE_VIEWS = (
+    "account_state_items",
     "calendar_event_search",
     "gmail_attachment_search",
     "gmail_thread_messages",
+    "gmail_account_state_items",
+    "slack_account_state_items",
     "slack_ui_messages",
     "slack_conversation_timeline",
     "slack_thread_messages",
@@ -633,8 +636,7 @@ class ClickHouseWarehouse:
         self._command(
             "ALTER TABLE gmail_attachment_backfill_state ADD COLUMN IF NOT EXISTS ai_prompt_version LowCardinality(String) AFTER ai_model"
         )
-        self._ensure_gmail_account_state_view()
-        self._ensure_combined_account_state_view_if_possible()
+        self._ensure_clean_gmail_inbox_view()
 
     def ensure_calendar_tables(self) -> None:
         self._drop_obsolete_views()
@@ -702,6 +704,7 @@ class ClickHouseWarehouse:
         self._command(
             "ALTER TABLE calendar_sync_state ADD COLUMN IF NOT EXISTS expanded_window_end DateTime64(3, 'UTC') AFTER expanded_window_start"
         )
+        self._ensure_clean_calendar_transcript_views_if_possible()
 
     def ensure_apple_voice_memos_tables(self) -> None:
         self._rename_legacy_voice_memos_tables()
@@ -853,6 +856,7 @@ class ClickHouseWarehouse:
         self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS meeting_notes")
         self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS topics_json")
         self.ensure_agent_tables()
+        self._ensure_clean_calendar_transcript_views_if_possible()
 
     def _rename_legacy_voice_memos_tables(self) -> None:
         for legacy_table, current_table in APPLE_VOICE_MEMOS_TABLE_RENAMES:
@@ -1167,8 +1171,7 @@ class ClickHouseWarehouse:
             ORDER BY (source, account, scope_id, item_id)
             """
         )
-        self._ensure_slack_account_state_view()
-        self._ensure_combined_account_state_view_if_possible()
+        self._ensure_clean_slack_inbox_view()
 
     def load_sync_state(self) -> dict[str, SyncState]:
         rows = self._query(
@@ -1975,41 +1978,24 @@ class ClickHouseWarehouse:
         )
         return {str(row[0]) for row in rows}
 
-    def _ensure_gmail_account_state_view(self) -> None:
+    def _ensure_clean_gmail_inbox_view(self) -> None:
         self._command(
             """
-            CREATE OR REPLACE VIEW gmail_account_state_items AS
+            CREATE OR REPLACE VIEW clean_gmail_inbox AS
             SELECT
-                'gmail' AS source,
                 account AS account,
-                '' AS scope_id,
-                concat('gmail:', account, ':thread:', thread_id) AS item_id,
-                multiIf(
-                    unread_count > 0, 'unread_inbox_thread',
-                    important_count > 0, 'important_inbox_thread',
-                    starred_count > 0, 'starred_inbox_thread',
-                    'inbox_thread'
-                ) AS item_type,
-                multiIf(unread_count > 0, 'unread', 'inbox') AS item_state,
-                toUInt8(multiIf(unread_count > 0, 10, important_count > 0, 20, starred_count > 0, 30, 40)) AS priority_rank,
-                latest_activity_at AS latest_activity_at,
-                thread_id AS container_id,
-                '' AS container_name,
                 thread_id AS thread_id,
                 latest_message_id AS message_id,
-                latest_from_address AS actor_id,
-                latest_from_address AS actor_name,
-                latest_subject AS title,
+                latest_activity_at AS latest_at,
+                latest_from_address AS from_address,
+                latest_subject AS subject,
                 latest_preview AS preview,
+                toUInt64(message_count) AS message_count,
                 toUInt64(unread_count) AS unread_count,
-                multiIf(
-                    unread_count > 0, 'Unread Gmail inbox thread',
-                    important_count > 0, 'Important Gmail inbox thread',
-                    starred_count > 0, 'Starred Gmail inbox thread',
-                    'Gmail inbox thread'
-                ) AS reason,
-                'gmail_messages' AS source_table,
-                'Query gmail_messages by account and thread_id for full message history.' AS drilldown_hint
+                toUInt64(important_count) AS important_count,
+                toUInt64(starred_count) AS starred_count,
+                multiIf(unread_count > 0, 'unread', important_count > 0, 'important', starred_count > 0, 'starred', 'inbox') AS state,
+                toUInt8(multiIf(unread_count > 0, 10, important_count > 0, 20, starred_count > 0, 30, 40)) AS priority
             FROM (
                 SELECT
                     account,
@@ -2030,6 +2016,7 @@ class ClickHouseWarehouse:
                         1,
                         1000
                     ) AS latest_preview,
+                    count() AS message_count,
                     countIf(has(label_ids, 'UNREAD')) AS unread_count,
                     countIf(has(label_ids, 'IMPORTANT')) AS important_count,
                     countIf(has(label_ids, 'STARRED')) AS starred_count
@@ -2267,45 +2254,174 @@ class ClickHouseWarehouse:
             GROUP BY c.account, c.team_id, c.conversation_id, c.name
         """
 
-    def _ensure_slack_account_state_view(self) -> None:
+    def _ensure_clean_slack_inbox_view(self) -> None:
         self._command(
             """
-            CREATE OR REPLACE VIEW slack_account_state_items AS
+            CREATE OR REPLACE VIEW clean_slack_inbox AS
             SELECT
-                source,
-                account,
-                scope_id,
-                item_id,
-                item_type,
-                item_state,
-                priority_rank,
-                latest_activity_at,
-                container_id,
-                container_name,
-                thread_id,
-                message_id,
-                actor_id,
-                actor_name,
-                title,
-                preview,
-                unread_count,
-                reason,
-                source_table,
-                drilldown_hint
+                account AS account,
+                scope_id AS team_id,
+                item_type AS kind,
+                item_state AS state,
+                priority_rank AS priority,
+                latest_activity_at AS latest_at,
+                container_id AS conversation_id,
+                container_name AS conversation_name,
+                thread_id AS thread_ts,
+                message_id AS message_ts,
+                actor_id AS actor_id,
+                actor_name AS actor_name,
+                title AS title,
+                preview AS preview,
+                unread_count AS unread_count,
+                reason AS reason
             FROM slack_account_state_item_rows FINAL
             WHERE is_deleted = 0
             """
         )
 
-    def _ensure_combined_account_state_view_if_possible(self) -> None:
-        if not self._relation_exists("gmail_account_state_items") or not self._relation_exists("slack_account_state_items"):
+    def _ensure_clean_calendar_transcript_views_if_possible(self) -> None:
+        if (
+            not self._relation_exists("calendar_events")
+            or not self._relation_exists("apple_voice_memos_files")
+            or not self._relation_exists("apple_voice_memos_enrichments")
+        ):
             return
         self._command(
             """
-            CREATE OR REPLACE VIEW account_state_items AS
-            SELECT * FROM gmail_account_state_items
-            UNION ALL
-            SELECT * FROM slack_account_state_items
+            CREATE OR REPLACE VIEW clean_calendar_with_transcripts AS
+            WITH
+                latest_calendar_events AS (
+                    SELECT
+                        account,
+                        event_id,
+                        argMax(calendar_id, synced_at) AS calendar_id,
+                        argMax(organizer_email, synced_at) AS organizer_email,
+                        argMax(summary, synced_at) AS summary,
+                        argMax(description, synced_at) AS description,
+                        argMax(location, synced_at) AS location,
+                        argMax(start_at, synced_at) AS start_at,
+                        argMax(end_at, synced_at) AS end_at,
+                        argMax(is_all_day, synced_at) AS is_all_day,
+                        argMax(attendees_json, synced_at) AS attendees_json,
+                        argMax(html_link, synced_at) AS html_link
+                    FROM calendar_events FINAL
+                    WHERE is_deleted = 0
+                    GROUP BY account, event_id
+                ),
+                latest_enrichments AS (
+                    SELECT
+                        account,
+                        recording_id,
+                        argMax(calendar_event_id, created_at) AS calendar_event_id,
+                        argMax(calendar_confidence, created_at) AS calendar_confidence,
+                        argMax(title, created_at) AS title,
+                        argMax(start_at, created_at) AS start_at,
+                        argMax(end_at, created_at) AS end_at,
+                        argMax(participants_json, created_at) AS participants_json,
+                        argMax(transcript, created_at) AS transcript,
+                        argMax(summary, created_at) AS summary,
+                        argMax(action_items_json, created_at) AS action_items_json,
+                        argMax(evidence_json, created_at) AS evidence_json,
+                        max(created_at) AS enriched_at
+                    FROM apple_voice_memos_enrichments FINAL
+                    WHERE status = 'completed'
+                    GROUP BY account, recording_id
+                )
+            SELECT
+                c.account AS account,
+                c.calendar_id AS calendar_id,
+                c.event_id AS event_id,
+                e.recording_id AS recording_id,
+                if(e.title != '', e.title, c.summary) AS title,
+                e.start_at AS start_at,
+                e.end_at AS end_at,
+                c.organizer_email AS organizer_email,
+                c.summary AS calendar_title,
+                c.description AS calendar_description,
+                c.location AS location,
+                c.start_at AS calendar_start_at,
+                c.end_at AS calendar_end_at,
+                c.is_all_day AS is_all_day,
+                c.attendees_json AS attendees_json,
+                c.html_link AS calendar_url,
+                e.calendar_confidence AS calendar_confidence,
+                e.participants_json AS participants_json,
+                e.transcript AS transcript,
+                e.summary AS summary,
+                e.action_items_json AS action_items_json,
+                e.evidence_json AS evidence_json,
+                e.enriched_at AS created_at
+            FROM latest_calendar_events AS c
+            INNER JOIN latest_enrichments AS e
+                ON c.account = e.account
+               AND c.event_id = e.calendar_event_id
+            WHERE e.calendar_event_id != ''
+            """
+        )
+        self._command(
+            """
+            CREATE OR REPLACE VIEW clean_transcripts_no_calendar_match AS
+            WITH
+                latest_calendar_events AS (
+                    SELECT
+                        account,
+                        event_id
+                    FROM calendar_events FINAL
+                    WHERE is_deleted = 0
+                    GROUP BY account, event_id
+                ),
+                latest_enrichments AS (
+                    SELECT
+                        account,
+                        recording_id,
+                        argMax(calendar_event_id, created_at) AS calendar_event_id,
+                        argMax(calendar_confidence, created_at) AS calendar_confidence,
+                        argMax(title, created_at) AS title,
+                        argMax(start_at, created_at) AS start_at,
+                        argMax(end_at, created_at) AS end_at,
+                        argMax(participants_json, created_at) AS participants_json,
+                        argMax(transcript, created_at) AS transcript,
+                        argMax(summary, created_at) AS summary,
+                        argMax(action_items_json, created_at) AS action_items_json,
+                        argMax(evidence_json, created_at) AS evidence_json,
+                        max(created_at) AS enriched_at
+                    FROM apple_voice_memos_enrichments FINAL
+                    WHERE status = 'completed'
+                    GROUP BY account, recording_id
+                )
+            SELECT
+                e.account AS account,
+                e.recording_id AS recording_id,
+                f.recorded_at AS recorded_at,
+                if(e.title != '', e.title, f.title) AS title,
+                e.start_at AS start_at,
+                e.end_at AS end_at,
+                e.calendar_event_id AS attempted_calendar_event_id,
+                e.calendar_confidence AS calendar_confidence,
+                multiIf(
+                    e.calendar_event_id = '', 'no_calendar_event_id',
+                    e.calendar_confidence <= 0, 'low_calendar_confidence',
+                    c.event_id = '', 'calendar_event_not_found',
+                    'no_calendar_match'
+                ) AS calendar_match_issue,
+                e.participants_json AS participants_json,
+                e.transcript AS transcript,
+                e.summary AS summary,
+                e.action_items_json AS action_items_json,
+                e.evidence_json AS evidence_json,
+                e.enriched_at AS created_at
+            FROM latest_enrichments AS e
+            LEFT JOIN (SELECT * FROM apple_voice_memos_files FINAL) AS f
+                ON e.account = f.account
+               AND e.recording_id = f.recording_id
+               AND f.is_deleted = 0
+            LEFT JOIN latest_calendar_events AS c
+                ON e.account = c.account
+               AND e.calendar_event_id = c.event_id
+            WHERE e.calendar_event_id = ''
+               OR e.calendar_confidence <= 0
+               OR c.event_id = ''
             """
         )
 

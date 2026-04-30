@@ -478,12 +478,13 @@ The sync creates and maintains:
 - `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
 
-The warehouse also creates account-management views for current user state:
+The warehouse also creates clean views for current inbox and transcript state:
 
-- `gmail_account_state_items`: Gmail inbox threads that currently appear in the account state layer
-- `slack_account_state_items`: Slack DMs, mentions, participating threads, and channel unread items for
+- `clean_gmail_inbox`: Gmail inbox threads that currently appear in the account state layer
+- `clean_slack_inbox`: Slack DMs, mentions, participating threads, and channel unread items for
   the authenticated Slack user when read state is known
-- `account_state_items`: combined Gmail and Slack entrypoint when both source views exist
+- `clean_calendar_with_transcripts`: calendar events joined to matched Voice Memo transcript enrichments
+- `clean_transcripts_no_calendar_match`: completed Voice Memo transcript enrichments without a calendar match
 
 `gmail_messages` stores:
 
