@@ -241,7 +241,7 @@ uv run personal-data-warehouse-google-auth --email you@example.com --write-env
 Run the local Mac uploader:
 
 ```bash
-uv run personal-data-warehouse-voice-memos-upload
+uv run personal-data-warehouse-apple-voice-memos-upload
 ```
 
 The uploader defaults to a lightweight incremental mode for cron. Incremental mode keeps local
@@ -250,13 +250,13 @@ unchanged recordings that already uploaded both audio and metadata are skipped b
 network checks, OAuth refresh, or Drive API calls. Use full mode for periodic repair/backfill:
 
 ```bash
-uv run personal-data-warehouse-voice-memos-upload --mode full
+uv run personal-data-warehouse-apple-voice-memos-upload --mode full
 ```
 
 For a five-minute cron job:
 
 ```cron
-*/5 * * * * cd /path/to/personal-data-warehouse && uv run personal-data-warehouse-voice-memos-upload --mode incremental
+*/5 * * * * cd /path/to/personal-data-warehouse && uv run personal-data-warehouse-apple-voice-memos-upload --mode incremental
 ```
 
 The Mac uploader skips expected network no-op cases with exit code `0`: no default route,
@@ -270,7 +270,7 @@ unavailable or redacted SSID until the launching app/process has location permis
 uploader can see with:
 
 ```bash
-uv run personal-data-warehouse-voice-memos-upload --network-diagnostics
+uv run personal-data-warehouse-apple-voice-memos-upload --network-diagnostics
 ```
 
 If it reports `SSID unavailable`, grant Location Services permission to the app launching the
@@ -297,7 +297,7 @@ An hourly enrichment schedule remains enabled as a repair pass. For a Coolify sc
 instead of the Dagster UI:
 
 ```bash
-uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.voice_memos_drive_ingest import voice_memos_drive_ingest; raise SystemExit(0 if materialize([voice_memos_drive_ingest]).success else 1)"
+uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.apple_voice_memos_drive_ingest import apple_voice_memos_drive_ingest; raise SystemExit(0 if materialize([apple_voice_memos_drive_ingest]).success else 1)"
 ```
 
 Transcription is a separate Dagster asset. Configure AssemblyAI:
@@ -315,7 +315,7 @@ VOICE_MEMOS_ENRICHMENT_BATCH_SIZE=0
 Run one transcription batch:
 
 ```bash
-uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.voice_memos_transcription import voice_memos_transcription; raise SystemExit(0 if materialize([voice_memos_transcription]).success else 1)"
+uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.apple_voice_memos_transcription import apple_voice_memos_transcription; raise SystemExit(0 if materialize([apple_voice_memos_transcription]).success else 1)"
 ```
 
 The transcription asset stores the raw AssemblyAI response JSON in ClickHouse and also stores
@@ -339,7 +339,7 @@ to avoid large model responses timing out.
 Run enrichment:
 
 ```bash
-uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.voice_memos_enrichment import voice_memos_enrichment; raise SystemExit(0 if materialize([voice_memos_enrichment]).success else 1)"
+uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.apple_voice_memos_enrichment import apple_voice_memos_enrichment; raise SystemExit(0 if materialize([apple_voice_memos_enrichment]).success else 1)"
 ```
 
 ### Containerized Agent Enrichment
@@ -416,7 +416,7 @@ uv run personal-data-warehouse-agent-auth status claude
 
 Agent run metadata, streamed CLI events, and detected tool-call events are stored in ClickHouse
 tables `agent_runs`, `agent_run_events`, and `agent_run_tool_calls`. The final Voice Memos result
-still lands in `voice_memo_enrichments`.
+still lands in `apple_voice_memos_enrichments`.
 
 The agent integration is exposed to Dagster as an `AgentResource`. The core Docker runner remains
 plain Python for testing, while assets receive the resource and use it to start one-off containers.
@@ -442,7 +442,7 @@ capability available to a CLI is also available to arbitrary Bash inside the age
 Written tests that do not call live agents run with the normal suite:
 
 ```bash
-uv run pytest tests/test_agent_runner.py tests/test_voice_memos_enrichment_defs.py tests/test_clickhouse_schema.py
+uv run pytest tests/test_agent_runner.py tests/test_apple_voice_memos_enrichment_defs.py tests/test_clickhouse_schema.py
 ```
 
 Live Docker/subscription smoke tests are opt-in because they require Docker and a logged-in
@@ -471,10 +471,10 @@ The sync creates and maintains:
 - `gmail_sync_state`: per-mailbox sync cursor and last run status
 - `calendar_events`: latest known state for each calendar event
 - `calendar_sync_state`: per-account/calendar sync token and last run status
-- `voice_memo_files`: latest known metadata for Voice Memos audio files uploaded through Drive
-- `voice_memo_transcription_runs`: raw transcription provider results and run state
-- `voice_memo_transcript_segments`: normalized diarized transcript segments
-- `voice_memo_enrichments`: canonical transcript, calendar match, participants, summary, action items, and evidence
+- `apple_voice_memos_files`: latest known metadata for Voice Memos audio files uploaded through Drive
+- `apple_voice_memos_transcription_runs`: raw transcription provider results and run state
+- `apple_voice_memos_transcript_segments`: normalized diarized transcript segments
+- `apple_voice_memos_enrichments`: canonical transcript, calendar match, participants, summary, action items, and evidence
 - `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
 

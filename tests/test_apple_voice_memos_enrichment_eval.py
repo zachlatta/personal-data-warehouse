@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from personal_data_warehouse.voice_memos_enrichment_eval import score_enrichment_row
+from personal_data_warehouse.apple_voice_memos_enrichment_eval import score_enrichment_row
 
 
 def base_row(**overrides):

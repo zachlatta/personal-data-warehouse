@@ -18,11 +18,11 @@ from dagster import (
 
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.defs.voice_memos_drive_ingest import voice_memos_drive_ingest
+from personal_data_warehouse.defs.apple_voice_memos_drive_ingest import apple_voice_memos_drive_ingest
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
-from personal_data_warehouse.voice_memos_drive_ingest import build_google_drive_service
-from personal_data_warehouse.voice_memos_transcription import (
+from personal_data_warehouse.apple_voice_memos_drive_ingest import build_google_drive_service
+from personal_data_warehouse.apple_voice_memos_transcription import (
     ASSEMBLYAI_PROVIDER,
     AssemblyAIClient,
     GoogleDriveVoiceMemoAudioSource,
@@ -35,11 +35,11 @@ VOICE_MEMOS_TRANSCRIPTION_SENSOR_INTERVAL_SECONDS = 60
 
 
 @asset(
-    group_name="voice_memos",
-    deps=[voice_memos_drive_ingest],
+    group_name="apple_voice_memos",
+    deps=[apple_voice_memos_drive_ingest],
     retry_policy=RetryPolicy(max_retries=2, delay=120),
 )
-def voice_memos_transcription(context) -> MaterializeResult:
+def apple_voice_memos_transcription(context) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_voice_memos=True, require_assemblyai=True)
     if settings.voice_memos is None:
         raise RuntimeError("Voice Memos sync is not configured")
@@ -55,7 +55,7 @@ def voice_memos_transcription(context) -> MaterializeResult:
     warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
 
     with exclusive_sync_lock(
-        name="voice_memos_transcription",
+        name="apple_voice_memos_transcription",
         postgres_lock_id=VOICE_MEMOS_TRANSCRIPTION_POSTGRES_LOCK_ID,
     ) as acquired:
         if not acquired:
@@ -93,34 +93,34 @@ def voice_memos_transcription(context) -> MaterializeResult:
     )
 
 
-voice_memos_transcription_job = define_asset_job(
-    "voice_memos_transcription_job",
-    selection="*voice_memos_transcription",
+apple_voice_memos_transcription_job = define_asset_job(
+    "apple_voice_memos_transcription_job",
+    selection="*apple_voice_memos_transcription",
 )
 
 
 @sensor(
-    job=voice_memos_transcription_job,
+    job=apple_voice_memos_transcription_job,
     default_status=DefaultSensorStatus.RUNNING,
     minimum_interval_seconds=VOICE_MEMOS_TRANSCRIPTION_SENSOR_INTERVAL_SECONDS,
 )
-def voice_memos_transcription_backlog_sensor(context):
-    active = skip_if_job_in_progress(context, job_name="voice_memos_transcription_job")
+def apple_voice_memos_transcription_backlog_sensor(context):
+    active = skip_if_job_in_progress(context, job_name="apple_voice_memos_transcription_job")
     if isinstance(active, SkipReason):
         return active
 
     settings = load_settings(require_gmail=False, require_assemblyai=True)
     warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
-    if not warehouse.load_untranscribed_voice_memo_files(provider=ASSEMBLYAI_PROVIDER, limit=1):
+    if not warehouse.load_untranscribed_apple_voice_memos_files(provider=ASSEMBLYAI_PROVIDER, limit=1):
         return SkipReason("No untranscribed Voice Memos found in ClickHouse.")
 
-    return RunRequest(tags={"voice_memos_trigger": "transcription_backlog"})
+    return RunRequest(tags={"apple_voice_memos_trigger": "transcription_backlog"})
 
 
 @definitions
 def defs() -> Definitions:
     return Definitions(
-        assets=[voice_memos_transcription],
-        jobs=[voice_memos_transcription_job],
-        sensors=[voice_memos_transcription_backlog_sensor],
+        assets=[apple_voice_memos_transcription],
+        jobs=[apple_voice_memos_transcription_job],
+        sensors=[apple_voice_memos_transcription_backlog_sensor],
     )

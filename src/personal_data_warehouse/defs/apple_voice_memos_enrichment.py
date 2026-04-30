@@ -23,10 +23,10 @@ from personal_data_warehouse.agent_resource import AgentResource
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs.calendar_sync import calendar_event_sync
-from personal_data_warehouse.defs.voice_memos_transcription import voice_memos_transcription
+from personal_data_warehouse.defs.apple_voice_memos_transcription import apple_voice_memos_transcription
 from personal_data_warehouse.schedule_guards import skip_if_job_active, skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
-from personal_data_warehouse.voice_memos_enrichment import (
+from personal_data_warehouse.apple_voice_memos_enrichment import (
     AGENT_ENRICHMENT_PROMPT_VERSION,
     DEFAULT_ENRICHMENT_LOOKBACK_WEEKS,
     ContainerAgentStructuredClient,
@@ -41,11 +41,11 @@ UNCONFIGURED_AGENT_RESOURCE = AgentResource.disabled()
 
 
 @asset(
-    group_name="voice_memos",
-    deps=[voice_memos_transcription, calendar_event_sync],
+    group_name="apple_voice_memos",
+    deps=[apple_voice_memos_transcription, calendar_event_sync],
     retry_policy=RetryPolicy(max_retries=1, delay=120),
 )
-def voice_memos_enrichment(context, agent: AgentResource) -> MaterializeResult:
+def apple_voice_memos_enrichment(context, agent: AgentResource) -> MaterializeResult:
     settings = load_settings(
         require_gmail=False,
         require_agent=True,
@@ -63,7 +63,7 @@ def voice_memos_enrichment(context, agent: AgentResource) -> MaterializeResult:
     recorded_after = datetime.now(tz=UTC) - timedelta(weeks=lookback_weeks)
     warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
     with exclusive_sync_lock(
-        name="voice_memos_enrichment",
+        name="apple_voice_memos_enrichment",
         postgres_lock_id=VOICE_MEMOS_ENRICHMENT_POSTGRES_LOCK_ID,
     ) as acquired:
         if not acquired:
@@ -72,15 +72,15 @@ def voice_memos_enrichment(context, agent: AgentResource) -> MaterializeResult:
         else:
             summary = VoiceMemosEnrichmentRunner(
                 warehouse=warehouse,
-                client=voice_memos_enrichment_client(
+                client=apple_voice_memos_enrichment_client(
                     settings=settings,
                     warehouse=warehouse,
                     logger=context.log,
                     agent=agent,
                 ),
                 logger=context.log,
-                provider=voice_memos_enrichment_provider(settings),
-                prompt_version=voice_memos_enrichment_prompt_version(),
+                provider=apple_voice_memos_enrichment_provider(settings),
+                prompt_version=apple_voice_memos_enrichment_prompt_version(),
             ).sync(limit=batch_size if batch_size > 0 else None, recorded_after=recorded_after)
 
     return MaterializeResult(
@@ -93,28 +93,28 @@ def voice_memos_enrichment(context, agent: AgentResource) -> MaterializeResult:
     )
 
 
-voice_memos_enrichment_job = define_asset_job(
-    "voice_memos_enrichment_job",
-    selection="*voice_memos_enrichment",
+apple_voice_memos_enrichment_job = define_asset_job(
+    "apple_voice_memos_enrichment_job",
+    selection="*apple_voice_memos_enrichment",
 )
 
 
 @schedule(
     cron_schedule="17 * * * *",
-    job=voice_memos_enrichment_job,
+    job=apple_voice_memos_enrichment_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def voice_memos_enrichment_hourly(context):
-    return skip_if_job_active(context, job_name="voice_memos_enrichment_job")
+def apple_voice_memos_enrichment_hourly(context):
+    return skip_if_job_active(context, job_name="apple_voice_memos_enrichment_job")
 
 
 @sensor(
-    job=voice_memos_enrichment_job,
+    job=apple_voice_memos_enrichment_job,
     default_status=DefaultSensorStatus.RUNNING,
     minimum_interval_seconds=VOICE_MEMOS_ENRICHMENT_SENSOR_INTERVAL_SECONDS,
 )
-def voice_memos_enrichment_backlog_sensor(context):
-    active = skip_if_job_in_progress(context, job_name="voice_memos_enrichment_job")
+def apple_voice_memos_enrichment_backlog_sensor(context):
+    active = skip_if_job_in_progress(context, job_name="apple_voice_memos_enrichment_job")
     if isinstance(active, SkipReason):
         return active
 
@@ -130,31 +130,31 @@ def voice_memos_enrichment_backlog_sensor(context):
     warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
     candidates = load_enrichment_candidates(
         warehouse,
-        provider=voice_memos_enrichment_provider(settings),
-        model=voice_memos_enrichment_model(settings),
-        prompt_version=voice_memos_enrichment_prompt_version(),
+        provider=apple_voice_memos_enrichment_provider(settings),
+        model=apple_voice_memos_enrichment_model(settings),
+        prompt_version=apple_voice_memos_enrichment_prompt_version(),
         limit=1,
         recorded_after=recorded_after,
     )
     if not candidates:
         return SkipReason("No unenriched Voice Memos transcripts found in ClickHouse.")
 
-    return RunRequest(tags={"voice_memos_trigger": "enrichment_backlog"})
+    return RunRequest(tags={"apple_voice_memos_trigger": "enrichment_backlog"})
 
 
-def voice_memos_enrichment_provider(settings) -> str:
+def apple_voice_memos_enrichment_provider(settings) -> str:
     return f"agent_{settings.agent.provider}"
 
 
-def voice_memos_enrichment_model(settings) -> str:
+def apple_voice_memos_enrichment_model(settings) -> str:
     return settings.agent.model
 
 
-def voice_memos_enrichment_prompt_version() -> str:
+def apple_voice_memos_enrichment_prompt_version() -> str:
     return AGENT_ENRICHMENT_PROMPT_VERSION
 
 
-def voice_memos_enrichment_client(*, settings, warehouse, logger, agent: AgentResource | None = None):
+def apple_voice_memos_enrichment_client(*, settings, warehouse, logger, agent: AgentResource | None = None):
     if settings.agent is None:
         raise RuntimeError("Agent runner is not configured")
     agent_resource = agent if agent is not None and agent.is_configured else agent_resource_from_settings(settings)
@@ -180,9 +180,9 @@ def defs() -> Definitions:
     if settings.agent is not None:
         resources["agent"] = agent_resource_from_settings(settings)
     return Definitions(
-        assets=[voice_memos_enrichment],
-        jobs=[voice_memos_enrichment_job],
-        schedules=[voice_memos_enrichment_hourly],
-        sensors=[voice_memos_enrichment_backlog_sensor],
+        assets=[apple_voice_memos_enrichment],
+        jobs=[apple_voice_memos_enrichment_job],
+        schedules=[apple_voice_memos_enrichment_hourly],
+        sensors=[apple_voice_memos_enrichment_backlog_sensor],
         resources=resources,
     )

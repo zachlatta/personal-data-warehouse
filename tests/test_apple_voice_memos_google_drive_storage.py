@@ -76,6 +76,8 @@ def test_google_drive_store_dedupes_and_uploads_with_app_properties(tmp_path) ->
     assert stored_json["storage_file_id"] == "created-json"
     assert "appProperties has" in str(service.files_resource.list_calls[0]["q"])
     assert "pdw_stage" in str(service.files_resource.list_calls[0]["q"])
+    assert "value='apple_voice_memos'" in str(service.files_resource.list_calls[0]["q"])
+    assert "value='voice_memos'" in str(service.files_resource.list_calls[0]["q"])
     created_folders = [
         call["body"]["name"]
         for call in service.files_resource.create_calls
@@ -86,7 +88,7 @@ def test_google_drive_store_dedupes_and_uploads_with_app_properties(tmp_path) ->
     json_body = service.files_resource.create_calls[5]["body"]
     assert file_body["name"] == "2026-04-27-abc123.qta"
     assert file_body["parents"] == ["folder-04"]
-    assert file_body["appProperties"]["pdw_source"] == "voice_memos"
+    assert file_body["appProperties"]["pdw_source"] == "apple_voice_memos"
     assert file_body["appProperties"]["pdw_root_folder_id"] == "folder-id"
     assert file_body["appProperties"]["pdw_stage"] == "inbox"
     assert "storage_key" not in file_body["appProperties"]

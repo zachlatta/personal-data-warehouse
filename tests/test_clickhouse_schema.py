@@ -81,22 +81,22 @@ def test_slack_schema_creates_identity_table_and_account_state_view() -> None:
     assert any("CREATE OR REPLACE VIEW slack_account_state_items" in command for command in commands)
 
 
-def test_voice_memos_schema_creates_file_table() -> None:
+def test_apple_voice_memos_schema_creates_file_table() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     commands: list[str] = []
 
     warehouse._command = commands.append
 
-    warehouse.ensure_voice_memos_tables()
+    warehouse.ensure_apple_voice_memos_tables()
 
-    assert any("CREATE TABLE IF NOT EXISTS voice_memo_files" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_voice_memos_files" in command for command in commands)
     assert any("storage_backend LowCardinality(String)" in command for command in commands)
     assert any("metadata_storage_key String" in command for command in commands)
     assert any("ORDER BY (account, recording_id)" in command for command in commands)
-    assert not any("ALTER TABLE IF EXISTS voice_memo_files" in command for command in commands)
-    assert any("CREATE TABLE IF NOT EXISTS voice_memo_transcription_runs" in command for command in commands)
-    assert any("CREATE TABLE IF NOT EXISTS voice_memo_transcript_segments" in command for command in commands)
-    assert any("CREATE TABLE IF NOT EXISTS voice_memo_enrichments" in command for command in commands)
+    assert not any("ALTER TABLE IF EXISTS apple_voice_memos_files" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_voice_memos_transcription_runs" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_voice_memos_transcript_segments" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_voice_memos_enrichments" in command for command in commands)
     assert any("CREATE TABLE IF NOT EXISTS agent_runs" in command for command in commands)
     assert any("CREATE TABLE IF NOT EXISTS agent_run_events" in command for command in commands)
     assert any("CREATE TABLE IF NOT EXISTS agent_run_tool_calls" in command for command in commands)
@@ -106,7 +106,34 @@ def test_voice_memos_schema_creates_file_table() -> None:
     assert any("DROP COLUMN IF EXISTS cleaned_transcript" in command for command in commands)
 
 
-def test_voice_memos_enrichment_schema_backfills_renamed_columns_before_drop() -> None:
+def test_apple_voice_memos_schema_renames_legacy_tables() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+    legacy_tables = {
+        "voice_memo_files",
+        "voice_memo_transcription_runs",
+        "voice_memo_transcript_segments",
+        "voice_memo_enrichments",
+    }
+
+    def fake_query(sql: str):
+        if sql.startswith("EXISTS TABLE "):
+            table = sql.removeprefix("EXISTS TABLE ")
+            return [(1 if table in legacy_tables else 0,)]
+        return []
+
+    warehouse._command = commands.append
+    warehouse._query = fake_query
+
+    warehouse.ensure_apple_voice_memos_tables()
+
+    assert "RENAME TABLE voice_memo_files TO apple_voice_memos_files" in commands
+    assert "RENAME TABLE voice_memo_transcription_runs TO apple_voice_memos_transcription_runs" in commands
+    assert "RENAME TABLE voice_memo_transcript_segments TO apple_voice_memos_transcript_segments" in commands
+    assert "RENAME TABLE voice_memo_enrichments TO apple_voice_memos_enrichments" in commands
+
+
+def test_apple_voice_memos_enrichment_schema_backfills_renamed_columns_before_drop() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     commands: list[str] = []
 
@@ -119,7 +146,7 @@ def test_voice_memos_enrichment_schema_backfills_renamed_columns_before_drop() -
         ("corrected_transcript",),
     ]
 
-    warehouse.ensure_voice_memos_tables()
+    warehouse.ensure_apple_voice_memos_tables()
 
     update_index = next(index for index, command in enumerate(commands) if "UPDATE" in command and "meeting_title" in command)
     drop_index = next(index for index, command in enumerate(commands) if "DROP COLUMN IF EXISTS meeting_title" in command)
@@ -127,20 +154,20 @@ def test_voice_memos_enrichment_schema_backfills_renamed_columns_before_drop() -
     assert "participants_json = if(participants_json = '', attendees_json, participants_json)" in commands[update_index]
 
 
-def test_voice_memos_schema_recreates_old_content_hash_ordering() -> None:
+def test_apple_voice_memos_schema_recreates_old_content_hash_ordering() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     commands: list[str] = []
 
     warehouse._command = commands.append
-    warehouse._query = lambda _sql: [("CREATE TABLE voice_memo_files (...) ORDER BY (account, content_sha256)",)]
+    warehouse._query = lambda _sql: [("CREATE TABLE apple_voice_memos_files (...) ORDER BY (account, content_sha256)",)]
 
-    warehouse.ensure_voice_memos_tables()
+    warehouse.ensure_apple_voice_memos_tables()
 
-    assert commands[0] == "DROP TABLE IF EXISTS voice_memo_files"
+    assert commands[0] == "DROP TABLE IF EXISTS apple_voice_memos_files"
     assert any("ORDER BY (account, recording_id)" in command for command in commands)
 
 
-def test_voice_memos_untranscribed_query_orders_recent_recordings() -> None:
+def test_apple_voice_memos_untranscribed_query_orders_recent_recordings() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     queries: list[str] = []
 
@@ -150,10 +177,10 @@ def test_voice_memos_untranscribed_query_orders_recent_recordings() -> None:
 
     warehouse._query = fake_query
 
-    assert warehouse.load_untranscribed_voice_memo_files(provider="assemblyai", limit=3) == []
+    assert warehouse.load_untranscribed_apple_voice_memos_files(provider="assemblyai", limit=3) == []
 
-    assert "FROM voice_memo_files AS f" in queries[0]
-    assert "voice_memo_transcription_runs" in queries[0]
+    assert "FROM apple_voice_memos_files AS f" in queries[0]
+    assert "apple_voice_memos_transcription_runs" in queries[0]
     assert "provider = 'assemblyai'" in queries[0]
     assert "status = 'completed'" in queries[0]
     assert "ORDER BY f.recorded_at DESC" in queries[0]

@@ -14,6 +14,12 @@ from personal_data_warehouse_voice_memos.storage import ObjectPresence, StoredOb
 
 _FOLDER_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _FOLDER_LOCKS_LOCK = threading.Lock()
+APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY = (
+    "("
+    "appProperties has { key='pdw_source' and value='apple_voice_memos' } "
+    "or appProperties has { key='pdw_source' and value='voice_memos' }"
+    ")"
+)
 
 
 class GoogleDriveObjectStore:
@@ -80,7 +86,7 @@ class GoogleDriveObjectStore:
             "parents": [self._folder_id],
             "mimeType": content_type,
             "appProperties": {
-                "pdw_source": "voice_memos",
+                "pdw_source": "apple_voice_memos",
                 "pdw_kind": "voice_memo_audio",
                 "pdw_root_folder_id": self._folder_id,
                 "pdw_stage": object_stage(object_key),
@@ -122,7 +128,7 @@ class GoogleDriveObjectStore:
                 return self._stored_object(existing, object_key)
 
         app_properties = {
-            "pdw_source": "voice_memos",
+            "pdw_source": "apple_voice_memos",
             "pdw_kind": "voice_memo_metadata",
             "pdw_root_folder_id": self._folder_id,
             "pdw_stage": object_stage(object_key),
@@ -153,7 +159,7 @@ class GoogleDriveObjectStore:
     def _find_by_app_property(self, *, key: str, value: str, kind: str) -> dict[str, Any] | None:
         query = (
             "trashed = false "
-            "and appProperties has { key='pdw_source' and value='voice_memos' } "
+            f"and {APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY} "
             f"and appProperties has {{ key='pdw_root_folder_id' and value='{escape_query_value(self._folder_id)}' }} "
             f"and appProperties has {{ key='pdw_kind' and value='{escape_query_value(kind)}' }} "
             "and ("
@@ -182,7 +188,7 @@ class GoogleDriveObjectStore:
         escaped_sha = escape_query_value(content_sha256)
         query = (
             "trashed = false "
-            "and appProperties has { key='pdw_source' and value='voice_memos' } "
+            f"and {APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY} "
             f"and appProperties has {{ key='pdw_root_folder_id' and value='{escaped_folder_id}' }} "
             "and ("
             "appProperties has { key='pdw_stage' and value='inbox' } "
@@ -258,7 +264,7 @@ class GoogleDriveObjectStore:
                         "parents": [parent_id],
                         "mimeType": "application/vnd.google-apps.folder",
                         "appProperties": {
-                            "pdw_source": "voice_memos",
+                            "pdw_source": "apple_voice_memos",
                             "pdw_kind": "object_storage_prefix",
                             "pdw_root_folder_id": self._folder_id,
                         },

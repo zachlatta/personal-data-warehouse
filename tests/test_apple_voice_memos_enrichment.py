@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from personal_data_warehouse.voice_memos_enrichment import (
+from personal_data_warehouse.apple_voice_memos_enrichment import (
     AGENT_ENRICHMENT_PROMPT_VERSION,
     LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
     apply_segment_preserving_transcript_fallback,

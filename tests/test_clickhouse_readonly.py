@@ -31,7 +31,7 @@ def test_validate_readonly_sql_rejects_writes_and_multiple_statements() -> None:
         "DROP TABLE gmail_messages",
         "SELECT 1; DELETE FROM gmail_messages WHERE 1",
         "WITH x AS (SELECT 1) INSERT INTO y SELECT * FROM x",
-        "OPTIMIZE TABLE voice_memo_enrichments FINAL",
+        "OPTIMIZE TABLE apple_voice_memos_enrichments FINAL",
     ]:
         with pytest.raises(ValueError, match="read-only|multiple"):
             validate_readonly_sql(sql)

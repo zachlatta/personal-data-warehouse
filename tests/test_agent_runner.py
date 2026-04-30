@@ -180,7 +180,7 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
         run_id="run-1",
         provider="codex",
         model="gpt-test",
-        task_type="voice_memo_enrichment",
+        task_type="apple_voice_memo_enrichment",
         subject_id="rec-1",
         input_sha256="abc",
         status="completed",
@@ -389,7 +389,7 @@ def test_builtin_cli_tools_reject_write_queries_through_proxy(tmp_path) -> None:
     service = ClickHouseReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
     with run_agent_tool_proxy(query_service=service, bind_host="127.0.0.1", public_host="127.0.0.1") as env:
         completed = subprocess.run(
-            [str(tmp_path / "tools" / "pdw-clickhouse-query"), "DROP TABLE voice_memo_enrichments"],
+            [str(tmp_path / "tools" / "pdw-clickhouse-query"), "DROP TABLE apple_voice_memos_enrichments"],
             env={**env, "PATH": os.environ.get("PATH", "")},
             capture_output=True,
             text=True,

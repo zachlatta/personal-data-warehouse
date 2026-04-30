@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from personal_data_warehouse.voice_memos_drive_ingest import (
+from personal_data_warehouse.apple_voice_memos_drive_ingest import (
     GoogleDriveVoiceMemosPromoter,
     VoiceMemosDriveIngestRunner,
     attach_storage_context,
@@ -23,13 +23,13 @@ class FakeLogger:
 
 class FakeWarehouse:
     def __init__(self) -> None:
-        self.ensure_voice_memos_tables_called = False
+        self.ensure_apple_voice_memos_tables_called = False
         self.rows: list[dict[str, object]] = []
 
-    def ensure_voice_memos_tables(self) -> None:
-        self.ensure_voice_memos_tables_called = True
+    def ensure_apple_voice_memos_tables(self) -> None:
+        self.ensure_apple_voice_memos_tables_called = True
 
-    def insert_voice_memo_files(self, rows) -> None:
+    def insert_apple_voice_memos_files(self, rows) -> None:
         self.rows.extend(rows)
 
 
@@ -229,7 +229,7 @@ def test_drive_ingest_runner_writes_metadata_rows() -> None:
         now=lambda: datetime(2026, 4, 27, 13, tzinfo=UTC),
     ).sync()
 
-    assert warehouse.ensure_voice_memos_tables_called
+    assert warehouse.ensure_apple_voice_memos_tables_called
     assert summary.metadata_seen == 1
     assert summary.rows_written == 1
     assert summary.recordings_promoted == 1
@@ -247,6 +247,8 @@ def test_drive_metadata_listing_uses_root_folder_app_property_not_direct_parent(
     assert "'root-folder' in parents" not in query
     assert "pdw_root_folder_id" in query
     assert "root-folder" in query
+    assert "value='apple_voice_memos'" in query
+    assert "value='voice_memos'" in query
     assert "pdw_stage' and value='inbox" in query
 
 

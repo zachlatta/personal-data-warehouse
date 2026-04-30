@@ -59,11 +59,11 @@ def test_skip_if_job_active_allows_run_when_no_prior_run_is_active() -> None:
 def test_skip_if_job_in_progress_skips_any_active_run_without_stale_cutoff() -> None:
     context = FakeContext([object()])
 
-    result = skip_if_job_in_progress(context, job_name="voice_memos_transcription_job")
+    result = skip_if_job_in_progress(context, job_name="apple_voice_memos_transcription_job")
 
     assert isinstance(result, SkipReason)
-    assert "voice_memos_transcription_job" in result.skip_message
-    assert context.instance.filters.job_name == "voice_memos_transcription_job"
+    assert "apple_voice_memos_transcription_job" in result.skip_message
+    assert context.instance.filters.job_name == "apple_voice_memos_transcription_job"
     assert context.instance.filters.statuses == IN_PROGRESS_RUN_STATUSES
     assert context.instance.filters.updated_after is None
     assert context.instance.limit == 1

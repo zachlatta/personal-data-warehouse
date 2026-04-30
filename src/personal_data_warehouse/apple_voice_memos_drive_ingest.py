@@ -27,6 +27,12 @@ class VoiceMemosDriveIngestSummary:
 
 INBOX_PREFIX = "apple-voice-memos/inbox/"
 LIBRARY_PREFIX = "apple-voice-memos/library/"
+APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY = (
+    "("
+    "appProperties has { key='pdw_source' and value='apple_voice_memos' } "
+    "or appProperties has { key='pdw_source' and value='voice_memos' }"
+    ")"
+)
 
 
 class VoiceMemosDriveIngestRunner:
@@ -46,12 +52,12 @@ class VoiceMemosDriveIngestRunner:
         self._now = now or (lambda: datetime.now(tz=UTC))
 
     def sync(self) -> VoiceMemosDriveIngestSummary:
-        self._warehouse.ensure_voice_memos_tables()
+        self._warehouse.ensure_apple_voice_memos_tables()
         ingested_at = self._now()
         metadata = list(self._metadata_source())
         row_metadata = [library_metadata_payload(payload) for payload in metadata] if self._promoter else metadata
         rows = [metadata_to_row(payload, ingested_at=ingested_at) for payload in row_metadata]
-        self._warehouse.insert_voice_memo_files(rows)
+        self._warehouse.insert_apple_voice_memos_files(rows)
         promoted = 0
         if self._promoter:
             for payload in metadata:
@@ -156,7 +162,7 @@ class GoogleDriveVoiceMemosPromoter:
                         "parents": [parent_id],
                         "mimeType": "application/vnd.google-apps.folder",
                         "appProperties": {
-                            "pdw_source": "voice_memos",
+                            "pdw_source": "apple_voice_memos",
                             "pdw_kind": "object_storage_prefix",
                             "pdw_root_folder_id": self._folder_id,
                             "pdw_stage": storage_stage_from_folder_name(name),
@@ -336,7 +342,7 @@ def has_drive_metadata_payloads(
 def drive_metadata_files_query(*, folder_id: str, stage: str) -> str:
     return (
         "trashed = false "
-        "and appProperties has { key='pdw_source' and value='voice_memos' } "
+        f"and {APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY} "
         f"and appProperties has {{ key='pdw_root_folder_id' and value='{escape_drive_query_value(folder_id)}' }} "
         "and appProperties has { key='pdw_kind' and value='voice_memo_metadata' } "
         f"and appProperties has {{ key='pdw_stage' and value='{escape_drive_query_value(stage)}' }}"
@@ -368,7 +374,7 @@ def find_drive_audio_file(*, service, folder_id: str, payload: Mapping[str, Any]
     response = execute_drive_request(service.files().list(
         q=(
             "trashed = false "
-            "and appProperties has { key='pdw_source' and value='voice_memos' } "
+            f"and {APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY} "
             f"and appProperties has {{ key='pdw_root_folder_id' and value='{escape_drive_query_value(folder_id)}' }} "
             "and appProperties has { key='pdw_kind' and value='voice_memo_audio' } "
             f"and appProperties has {{ key='pdw_stage' and value='{escape_drive_query_value(stage)}' }} "

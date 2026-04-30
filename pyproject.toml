@@ -21,6 +21,7 @@ dependencies = [
 personal-data-warehouse-gmail-auth = "personal_data_warehouse.gmail_auth:main"
 personal-data-warehouse-google-auth = "personal_data_warehouse.gmail_auth:main"
 personal-data-warehouse-slack-sync = "personal_data_warehouse.slack_sync:main"
+personal-data-warehouse-apple-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"
 personal-data-warehouse-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"
 personal-data-warehouse-agent-auth = "personal_data_warehouse.agent_runner:auth_main"
 

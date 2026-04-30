@@ -4,8 +4,11 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+import requests
+
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.voice_memos_transcription import (
+from personal_data_warehouse.apple_voice_memos_transcription import (
     ASSEMBLYAI_PROVIDER,
     AssemblyAIClient,
     VoiceMemosTranscriptionRunner,
@@ -16,11 +19,14 @@ from personal_data_warehouse.voice_memos_transcription import (
 
 
 class FakeResponse:
-    def __init__(self, payload) -> None:
+    def __init__(self, payload, *, status_code: int = 200, text: str = "") -> None:
         self._payload = payload
+        self.status_code = status_code
+        self.text = text
 
     def raise_for_status(self) -> None:
-        pass
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} Client Error")
 
     def json(self):
         return self._payload
@@ -77,17 +83,17 @@ class FakeWarehouse:
         self.run_rows = []
         self.segment_rows = []
 
-    def ensure_voice_memos_tables(self) -> None:
+    def ensure_apple_voice_memos_tables(self) -> None:
         self.ensure_called = True
 
-    def load_untranscribed_voice_memo_files(self, *, provider: str, limit: int):
+    def load_untranscribed_apple_voice_memos_files(self, *, provider: str, limit: int):
         assert provider == ASSEMBLYAI_PROVIDER
         return self.recordings[:limit]
 
-    def insert_voice_memo_transcription_runs(self, rows) -> None:
+    def insert_apple_voice_memos_transcription_runs(self, rows) -> None:
         self.run_rows.extend(rows)
 
-    def insert_voice_memo_transcript_segments(self, rows) -> None:
+    def insert_apple_voice_memos_transcript_segments(self, rows) -> None:
         self.segment_rows.extend(rows)
 
 
@@ -174,6 +180,28 @@ def test_assemblyai_client_uploads_submits_and_polls(tmp_path) -> None:
     assert session.posts[1][1]["json"]["speaker_labels"] is True
     assert session.posts[1][1]["json"]["speaker_options"]["max_speakers_expected"] == 8
     assert len(session.gets) == 2
+
+
+def test_assemblyai_client_submit_error_includes_response_body(tmp_path) -> None:
+    class SubmitErrorSession(FakeSession):
+        def post(self, url, **kwargs):
+            self.posts.append((url, kwargs))
+            if url.endswith("/v2/upload"):
+                return FakeResponse({"upload_url": "https://cdn.example/audio"})
+            return FakeResponse(
+                {"error": "bad audio_url"},
+                status_code=400,
+                text='{"error":"unsupported audio format"}',
+            )
+
+    audio = tmp_path / "memo.m4a"
+    audio.write_bytes(b"audio")
+
+    with pytest.raises(RuntimeError, match="unsupported audio format"):
+        AssemblyAIClient(api_key="test-key", session=SubmitErrorSession()).transcribe_file(
+            path=audio,
+            content_type="audio/mp4",
+        )
 
 
 def test_transcription_segment_rows_use_utterances() -> None:

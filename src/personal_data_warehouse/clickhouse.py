@@ -217,6 +217,13 @@ VOICE_MEMO_ENRICHMENT_COLUMNS = (
     "sync_version",
 )
 
+APPLE_VOICE_MEMOS_TABLE_RENAMES = (
+    ("voice_memo_files", "apple_voice_memos_files"),
+    ("voice_memo_transcription_runs", "apple_voice_memos_transcription_runs"),
+    ("voice_memo_transcript_segments", "apple_voice_memos_transcript_segments"),
+    ("voice_memo_enrichments", "apple_voice_memos_enrichments"),
+)
+
 AGENT_RUN_COLUMNS = (
     "run_id",
     "provider",
@@ -696,12 +703,13 @@ class ClickHouseWarehouse:
             "ALTER TABLE calendar_sync_state ADD COLUMN IF NOT EXISTS expanded_window_end DateTime64(3, 'UTC') AFTER expanded_window_start"
         )
 
-    def ensure_voice_memos_tables(self) -> None:
-        if self._voice_memo_files_needs_recreate():
-            self._command("DROP TABLE IF EXISTS voice_memo_files")
+    def ensure_apple_voice_memos_tables(self) -> None:
+        self._rename_legacy_voice_memos_tables()
+        if self._apple_voice_memos_files_needs_recreate():
+            self._command("DROP TABLE IF EXISTS apple_voice_memos_files")
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS voice_memo_files (
+            CREATE TABLE IF NOT EXISTS apple_voice_memos_files (
                 account LowCardinality(String),
                 recording_id String,
                 title String,
@@ -732,16 +740,19 @@ class ClickHouseWarehouse:
             ORDER BY (account, recording_id)
             """
         )
-        self._command("ALTER TABLE voice_memo_files ADD COLUMN IF NOT EXISTS metadata_storage_key String")
-        self._command("ALTER TABLE voice_memo_files ADD COLUMN IF NOT EXISTS metadata_storage_file_id String")
-        self._command("ALTER TABLE voice_memo_files ADD COLUMN IF NOT EXISTS metadata_storage_url String")
-        self._command("ALTER TABLE voice_memo_files ADD COLUMN IF NOT EXISTS metadata_content_sha256 String")
+        self._command("ALTER TABLE apple_voice_memos_files ADD COLUMN IF NOT EXISTS metadata_storage_key String")
+        self._command("ALTER TABLE apple_voice_memos_files ADD COLUMN IF NOT EXISTS metadata_storage_file_id String")
+        self._command("ALTER TABLE apple_voice_memos_files ADD COLUMN IF NOT EXISTS metadata_storage_url String")
+        self._command("ALTER TABLE apple_voice_memos_files ADD COLUMN IF NOT EXISTS metadata_content_sha256 String")
         self.ensure_voice_memo_transcription_tables()
+
+    def ensure_voice_memos_tables(self) -> None:
+        self.ensure_apple_voice_memos_tables()
 
     def ensure_voice_memo_transcription_tables(self) -> None:
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS voice_memo_transcription_runs (
+            CREATE TABLE IF NOT EXISTS apple_voice_memos_transcription_runs (
                 account LowCardinality(String),
                 recording_id String,
                 provider LowCardinality(String),
@@ -762,7 +773,7 @@ class ClickHouseWarehouse:
         )
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS voice_memo_transcript_segments (
+            CREATE TABLE IF NOT EXISTS apple_voice_memos_transcript_segments (
                 account LowCardinality(String),
                 recording_id String,
                 provider LowCardinality(String),
@@ -784,7 +795,7 @@ class ClickHouseWarehouse:
         )
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS voice_memo_enrichments (
+            CREATE TABLE IF NOT EXISTS apple_voice_memos_enrichments (
                 account LowCardinality(String),
                 recording_id String,
                 provider LowCardinality(String),
@@ -811,16 +822,16 @@ class ClickHouseWarehouse:
             ORDER BY (account, recording_id, provider, model, prompt_version)
             """
         )
-        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS title String AFTER calendar_confidence")
-        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS start_at DateTime64(3, 'UTC') AFTER title")
-        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS end_at DateTime64(3, 'UTC') AFTER start_at")
-        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS participants_json String AFTER end_at")
-        self._command("ALTER TABLE voice_memo_enrichments ADD COLUMN IF NOT EXISTS transcript String AFTER participants_json")
-        columns = self._table_column_names("voice_memo_enrichments")
+        self._command("ALTER TABLE apple_voice_memos_enrichments ADD COLUMN IF NOT EXISTS title String AFTER calendar_confidence")
+        self._command("ALTER TABLE apple_voice_memos_enrichments ADD COLUMN IF NOT EXISTS start_at DateTime64(3, 'UTC') AFTER title")
+        self._command("ALTER TABLE apple_voice_memos_enrichments ADD COLUMN IF NOT EXISTS end_at DateTime64(3, 'UTC') AFTER start_at")
+        self._command("ALTER TABLE apple_voice_memos_enrichments ADD COLUMN IF NOT EXISTS participants_json String AFTER end_at")
+        self._command("ALTER TABLE apple_voice_memos_enrichments ADD COLUMN IF NOT EXISTS transcript String AFTER participants_json")
+        columns = self._table_column_names("apple_voice_memos_enrichments")
         if {"meeting_title", "meeting_start_at", "meeting_end_at", "attendees_json", "corrected_transcript"}.issubset(columns):
             self._command(
                 """
-                ALTER TABLE voice_memo_enrichments
+                ALTER TABLE apple_voice_memos_enrichments
                 UPDATE
                     title = if(title = '', meeting_title, title),
                     start_at = if(start_at = toDateTime64(0, 3, 'UTC'), meeting_start_at, start_at),
@@ -831,17 +842,22 @@ class ClickHouseWarehouse:
                 SETTINGS mutations_sync = 2
                 """
             )
-        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS meeting_title")
-        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS meeting_start_at")
-        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS meeting_end_at")
-        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS meeting_location")
-        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS attendees_json")
-        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS speaker_map_json")
-        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS cleaned_transcript")
-        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS corrected_transcript")
-        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS meeting_notes")
-        self._command("ALTER TABLE voice_memo_enrichments DROP COLUMN IF EXISTS topics_json")
+        self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS meeting_title")
+        self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS meeting_start_at")
+        self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS meeting_end_at")
+        self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS meeting_location")
+        self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS attendees_json")
+        self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS speaker_map_json")
+        self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS cleaned_transcript")
+        self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS corrected_transcript")
+        self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS meeting_notes")
+        self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS topics_json")
         self.ensure_agent_tables()
+
+    def _rename_legacy_voice_memos_tables(self) -> None:
+        for legacy_table, current_table in APPLE_VOICE_MEMOS_TABLE_RENAMES:
+            if self._relation_exists(legacy_table) and not self._relation_exists(current_table):
+                self._command(f"RENAME TABLE {legacy_table} TO {current_table}")
 
     def _table_column_names(self, table_name: str) -> set[str]:
         query = getattr(self, "_query", None)
@@ -911,9 +927,9 @@ class ClickHouseWarehouse:
             """
         )
 
-    def _voice_memo_files_needs_recreate(self) -> bool:
+    def _apple_voice_memos_files_needs_recreate(self) -> bool:
         try:
-            rows = self._query("SHOW CREATE TABLE voice_memo_files")
+            rows = self._query("SHOW CREATE TABLE apple_voice_memos_files")
         except Exception:
             return False
         if not rows:
@@ -1371,17 +1387,29 @@ class ClickHouseWarehouse:
             CALENDAR_SYNC_STATE_COLUMNS,
         )
 
+    def insert_apple_voice_memos_files(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_voice_memos_files", rows, VOICE_MEMO_FILE_COLUMNS)
+
     def insert_voice_memo_files(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("voice_memo_files", rows, VOICE_MEMO_FILE_COLUMNS)
+        self.insert_apple_voice_memos_files(rows)
+
+    def insert_apple_voice_memos_transcription_runs(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_voice_memos_transcription_runs", rows, VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS)
 
     def insert_voice_memo_transcription_runs(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("voice_memo_transcription_runs", rows, VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS)
+        self.insert_apple_voice_memos_transcription_runs(rows)
+
+    def insert_apple_voice_memos_transcript_segments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_voice_memos_transcript_segments", rows, VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS)
 
     def insert_voice_memo_transcript_segments(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("voice_memo_transcript_segments", rows, VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS)
+        self.insert_apple_voice_memos_transcript_segments(rows)
+
+    def insert_apple_voice_memos_enrichments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_voice_memos_enrichments", rows, VOICE_MEMO_ENRICHMENT_COLUMNS)
 
     def insert_voice_memo_enrichments(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("voice_memo_enrichments", rows, VOICE_MEMO_ENRICHMENT_COLUMNS)
+        self.insert_apple_voice_memos_enrichments(rows)
 
     def insert_agent_runs(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_runs", rows, AGENT_RUN_COLUMNS)
@@ -1392,7 +1420,7 @@ class ClickHouseWarehouse:
     def insert_agent_run_tool_calls(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_run_tool_calls", rows, AGENT_RUN_TOOL_CALL_COLUMNS)
 
-    def load_untranscribed_voice_memo_files(self, *, provider: str, limit: int) -> list[dict[str, Any]]:
+    def load_untranscribed_apple_voice_memos_files(self, *, provider: str, limit: int) -> list[dict[str, Any]]:
         provider_sql = _sql_string(provider)
         rows = self._query(
             f"""
@@ -1410,11 +1438,11 @@ class ClickHouseWarehouse:
                 f.storage_key,
                 f.storage_file_id,
                 f.storage_url
-            FROM voice_memo_files AS f
+            FROM apple_voice_memos_files AS f
             LEFT JOIN
             (
                 SELECT account, recording_id
-                FROM voice_memo_transcription_runs
+                FROM apple_voice_memos_transcription_runs
                 WHERE provider = {provider_sql}
                   AND status = 'completed'
                 GROUP BY account, recording_id
@@ -1441,6 +1469,9 @@ class ClickHouseWarehouse:
             "storage_url",
         )
         return [dict(zip(columns, row, strict=True)) for row in rows]
+
+    def load_untranscribed_voice_memo_files(self, *, provider: str, limit: int) -> list[dict[str, Any]]:
+        return self.load_untranscribed_apple_voice_memos_files(provider=provider, limit=limit)
 
     def existing_message_ids(self, *, account: str, message_ids: list[str]) -> set[str]:
         if not message_ids:
@@ -2281,9 +2312,9 @@ class ClickHouseWarehouse:
     def _relation_exists(self, relation: str) -> bool:
         try:
             rows = self._query(f"EXISTS TABLE {relation}")
+            return bool(rows and int(rows[0][0]) == 1)
         except Exception:
             return False
-        return bool(rows and int(rows[0][0]) == 1)
 
     def _drop_obsolete_views(self) -> None:
         for view in OBSOLETE_VIEWS:

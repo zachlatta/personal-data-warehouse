@@ -18,7 +18,7 @@ from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
-from personal_data_warehouse.voice_memos_drive_ingest import (
+from personal_data_warehouse.apple_voice_memos_drive_ingest import (
     GoogleDriveVoiceMemosPromoter,
     VoiceMemosDriveIngestRunner,
     build_google_drive_service,
@@ -31,17 +31,17 @@ VOICE_MEMOS_SENSOR_INTERVAL_SECONDS = 60
 
 
 @asset(
-    group_name="voice_memos",
+    group_name="apple_voice_memos",
     retry_policy=RetryPolicy(max_retries=3, delay=60),
 )
-def voice_memos_drive_ingest(context) -> MaterializeResult:
+def apple_voice_memos_drive_ingest(context) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_voice_memos=True)
     if settings.voice_memos is None:
         raise RuntimeError("Voice Memos sync is not configured")
     warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
 
     with exclusive_sync_lock(
-        name="voice_memos_drive_ingest",
+        name="apple_voice_memos_drive_ingest",
         postgres_lock_id=VOICE_MEMOS_DRIVE_INGEST_POSTGRES_LOCK_ID,
     ) as acquired:
         if not acquired:
@@ -71,19 +71,19 @@ def voice_memos_drive_ingest(context) -> MaterializeResult:
     )
 
 
-voice_memos_drive_ingest_job = define_asset_job(
-    "voice_memos_drive_ingest_job",
-    selection=[voice_memos_drive_ingest],
+apple_voice_memos_drive_ingest_job = define_asset_job(
+    "apple_voice_memos_drive_ingest_job",
+    selection=[apple_voice_memos_drive_ingest],
 )
 
 
 @sensor(
-    job=voice_memos_drive_ingest_job,
+    job=apple_voice_memos_drive_ingest_job,
     default_status=DefaultSensorStatus.RUNNING,
     minimum_interval_seconds=VOICE_MEMOS_SENSOR_INTERVAL_SECONDS,
 )
-def voice_memos_drive_inbox_sensor(context):
-    active = skip_if_job_in_progress(context, job_name="voice_memos_drive_ingest_job")
+def apple_voice_memos_drive_inbox_sensor(context):
+    active = skip_if_job_in_progress(context, job_name="apple_voice_memos_drive_ingest_job")
     if isinstance(active, SkipReason):
         return active
 
@@ -98,13 +98,13 @@ def voice_memos_drive_inbox_sensor(context):
     ):
         return SkipReason("No Voice Memos inbox metadata found in Google Drive.")
 
-    return RunRequest(tags={"voice_memos_trigger": "drive_inbox"})
+    return RunRequest(tags={"apple_voice_memos_trigger": "drive_inbox"})
 
 
 @definitions
 def defs() -> Definitions:
     return Definitions(
-        assets=[voice_memos_drive_ingest],
-        jobs=[voice_memos_drive_ingest_job],
-        sensors=[voice_memos_drive_inbox_sensor],
+        assets=[apple_voice_memos_drive_ingest],
+        jobs=[apple_voice_memos_drive_ingest_job],
+        sensors=[apple_voice_memos_drive_inbox_sensor],
     )

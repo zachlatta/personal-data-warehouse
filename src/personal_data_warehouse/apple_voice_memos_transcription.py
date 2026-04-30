@@ -18,6 +18,7 @@ import requests
 ASSEMBLYAI_PROVIDER = "assemblyai"
 ASSEMBLYAI_SPEECH_MODELS = ("universal-3-pro", "universal-2")
 DEFAULT_ASSEMBLYAI_SPEAKER_OPTIONS = {"min_speakers_expected": 1, "max_speakers_expected": 8}
+MAX_ASSEMBLYAI_ERROR_BODY_CHARS = 2000
 ASSEMBLYAI_KEYTERMS_PROMPT = (
     "Hack Club",
     "Congressional App Challenge",
@@ -85,7 +86,7 @@ class AssemblyAIClient:
                 data=file,
                 timeout=self._timeout_seconds,
             )
-        response.raise_for_status()
+        _raise_for_status_with_body(response)
         payload = response.json()
         upload_url = str(payload.get("upload_url", ""))
         if not upload_url:
@@ -99,7 +100,7 @@ class AssemblyAIClient:
             json=assemblyai_transcript_request(audio_url=audio_url, speaker_options=self._speaker_options),
             timeout=self._timeout_seconds,
         )
-        response.raise_for_status()
+        _raise_for_status_with_body(response)
         payload = response.json()
         transcript_id = str(payload.get("id", ""))
         if not transcript_id:
@@ -114,7 +115,7 @@ class AssemblyAIClient:
                 headers=self._headers,
                 timeout=self._timeout_seconds,
             )
-            response.raise_for_status()
+            _raise_for_status_with_body(response)
             payload = response.json()
             status = str(payload.get("status", ""))
             if status == "completed":
@@ -124,6 +125,18 @@ class AssemblyAIClient:
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Timed out waiting for AssemblyAI transcript {transcript_id}")
             self._sleep(self._poll_interval_seconds)
+
+
+def _raise_for_status_with_body(response) -> None:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        body = str(getattr(response, "text", "") or "").strip()
+        if body:
+            if len(body) > MAX_ASSEMBLYAI_ERROR_BODY_CHARS:
+                body = f"{body[:MAX_ASSEMBLYAI_ERROR_BODY_CHARS]}...<truncated>"
+            raise RuntimeError(f"{exc}; response_body={body}") from exc
+        raise
 
 
 def assemblyai_transcript_request(
@@ -188,8 +201,8 @@ class VoiceMemosTranscriptionRunner:
         self._provider = provider
 
     def sync(self, *, limit: int) -> VoiceMemosTranscriptionSummary:
-        self._warehouse.ensure_voice_memos_tables()
-        recordings = self._warehouse.load_untranscribed_voice_memo_files(provider=self._provider, limit=limit)
+        self._warehouse.ensure_apple_voice_memos_tables()
+        recordings = self._warehouse.load_untranscribed_apple_voice_memos_files(provider=self._provider, limit=limit)
         transcribed = 0
         failed = 0
         segments_written = 0
@@ -204,11 +217,11 @@ class VoiceMemosTranscriptionRunner:
                         content_type=str(recording.get("content_type", "")),
                     )
                 completed_at = self._now()
-                self._warehouse.insert_voice_memo_transcription_runs(
+                self._warehouse.insert_apple_voice_memos_transcription_runs(
                     [transcription_run_row(recording, result, requested_at=requested_at, completed_at=completed_at)]
                 )
                 segment_rows = transcription_segment_rows(recording, result, created_at=completed_at)
-                self._warehouse.insert_voice_memo_transcript_segments(segment_rows)
+                self._warehouse.insert_apple_voice_memos_transcript_segments(segment_rows)
                 transcribed += 1
                 segments_written += len(segment_rows)
                 self._logger.info(
@@ -221,7 +234,7 @@ class VoiceMemosTranscriptionRunner:
             except Exception as exc:
                 failed += 1
                 completed_at = self._now()
-                self._warehouse.insert_voice_memo_transcription_runs(
+                self._warehouse.insert_apple_voice_memos_transcription_runs(
                     [
                         failed_transcription_run_row(
                             recording,

@@ -20,7 +20,7 @@ from personal_data_warehouse.clickhouse import _sql_string
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
-AGENT_ENRICHMENT_PROMPT_VERSION = "voice-memo-enrichment-agent-v4"
+AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v4"
 DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
 DEFAULT_ENRICHMENT_LOOKBACK_WEEKS = 12
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
@@ -94,7 +94,7 @@ class ContainerAgentStructuredClient:
         request = AgentRunRequest(
             prompt=prompt,
             schema=schema,
-            task_type="voice_memo_enrichment",
+            task_type="apple_voice_memo_enrichment",
             subject_id=recording_id,
             provider=self._provider,
             model=self._model,
@@ -157,7 +157,7 @@ class VoiceMemosEnrichmentRunner:
         self._prompt_version = prompt_version
 
     def sync(self, *, limit: int | None, recorded_after: datetime | None = None) -> VoiceMemosEnrichmentSummary:
-        self._warehouse.ensure_voice_memos_tables()
+        self._warehouse.ensure_apple_voice_memos_tables()
         recordings = load_enrichment_candidates(
             self._warehouse,
             provider=self._provider,
@@ -205,7 +205,7 @@ class VoiceMemosEnrichmentRunner:
                     transcript_segments=transcript_segments,
                     result=result,
                 )
-                self._warehouse.insert_voice_memo_enrichments(
+                self._warehouse.insert_apple_voice_memos_enrichments(
                     [
                         enrichment_row(
                             recording=recording,
@@ -222,7 +222,7 @@ class VoiceMemosEnrichmentRunner:
                 enriched += 1
             except Exception as exc:
                 failed += 1
-                self._warehouse.insert_voice_memo_enrichments(
+                self._warehouse.insert_apple_voice_memos_enrichments(
                     [
                         failed_enrichment_row(
                             recording=recording,
@@ -269,13 +269,13 @@ def load_enrichment_candidates(
             f.recorded_at,
             f.title,
             r.transcript_text
-        FROM voice_memo_files AS f
-        INNER JOIN voice_memo_transcription_runs AS r
+        FROM apple_voice_memos_files AS f
+        INNER JOIN apple_voice_memos_transcription_runs AS r
             ON f.account = r.account AND f.recording_id = r.recording_id
         LEFT JOIN
         (
             SELECT account, recording_id
-            FROM voice_memo_enrichments
+            FROM apple_voice_memos_enrichments
             WHERE provider = {_sql_string(provider)}
               AND model = {_sql_string(model)}
               AND prompt_version = {_sql_string(prompt_version)}
@@ -360,7 +360,7 @@ def load_transcript_segments(warehouse, recording: Mapping[str, Any]) -> list[di
     rows = warehouse._query(
         f"""
         SELECT segment_index, speaker_label, start_ms, end_ms, confidence, text
-        FROM voice_memo_transcript_segments
+        FROM apple_voice_memos_transcript_segments
         WHERE account = {_sql_string(str(recording.get("account", "")))}
           AND recording_id = {_sql_string(str(recording.get("recording_id", "")))}
           AND provider = 'assemblyai'
