@@ -224,6 +224,8 @@ def test_apple_voice_memos_schema_creates_file_table() -> None:
     assert any("CREATE TABLE IF NOT EXISTS apple_voice_memos_transcript_segments" in command for command in commands)
     assert any("CREATE TABLE IF NOT EXISTS apple_voice_memos_enrichments" in command for command in commands)
     assert any("CREATE TABLE IF NOT EXISTS agent_runs" in command for command in commands)
+    assert any("prompt_version String" in command for command in commands)
+    assert any("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS prompt_version" in command for command in commands)
     assert any("CREATE TABLE IF NOT EXISTS agent_run_events" in command for command in commands)
     assert any("CREATE TABLE IF NOT EXISTS agent_run_tool_calls" in command for command in commands)
     assert any("transcript String" in command for command in commands)

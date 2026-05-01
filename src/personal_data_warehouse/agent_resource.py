@@ -114,6 +114,7 @@ class AgentResource(ConfigurableResource):
             schema=request.schema,
             task_type=request.task_type,
             subject_id=request.subject_id,
+            prompt_version=request.prompt_version,
             run_id=request.run_id,
             provider=request.provider or self.provider,
             model=request.model if request.model is not None else self.model,

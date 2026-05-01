@@ -29,6 +29,7 @@ from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.apple_voice_memos_enrichment import (
     AGENT_ENRICHMENT_PROMPT_VERSION,
     DEFAULT_ENRICHMENT_RECORDED_AFTER,
+    DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     ContainerAgentStructuredClient,
     VoiceMemosEnrichmentRunner,
     load_enrichment_candidates,
@@ -38,6 +39,8 @@ VOICE_MEMOS_ENRICHMENT_POSTGRES_LOCK_ID = 7_403_111_841
 DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE = 0
 VOICE_MEMOS_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 60
 VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER_ENV = "VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER"
+VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_ENV = "VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION"
+VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV = "VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS"
 UNCONFIGURED_AGENT_RESOURCE = AgentResource.disabled()
 
 
@@ -79,6 +82,8 @@ def apple_voice_memos_enrichment(context, agent: AgentResource) -> MaterializeRe
                 logger=context.log,
                 provider=apple_voice_memos_enrichment_provider(settings),
                 prompt_version=apple_voice_memos_enrichment_prompt_version(),
+                force_prompt_version=apple_voice_memos_enrichment_force_prompt_version(),
+                max_error_attempts=apple_voice_memos_enrichment_max_error_attempts(),
             ).sync(limit=batch_size if batch_size > 0 else None, recorded_after=recorded_after)
 
     return MaterializeResult(
@@ -130,6 +135,8 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
         prompt_version=apple_voice_memos_enrichment_prompt_version(),
         limit=1,
         recorded_after=recorded_after,
+        force_prompt_version=apple_voice_memos_enrichment_force_prompt_version(),
+        max_error_attempts=apple_voice_memos_enrichment_max_error_attempts(),
     )
     if not candidates:
         return SkipReason("No unenriched Voice Memos transcripts found in ClickHouse.")
@@ -164,6 +171,21 @@ def apple_voice_memos_enrichment_model(settings) -> str:
 
 def apple_voice_memos_enrichment_prompt_version() -> str:
     return AGENT_ENRICHMENT_PROMPT_VERSION
+
+
+def apple_voice_memos_enrichment_force_prompt_version() -> bool:
+    value = os.getenv(VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def apple_voice_memos_enrichment_max_error_attempts() -> int:
+    value = os.getenv(VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV, "").strip()
+    if not value:
+        return DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS
+    attempts = int(value)
+    if attempts < 0:
+        raise ValueError(f"{VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV} must be non-negative")
+    return attempts
 
 
 def apple_voice_memos_enrichment_client(*, settings, warehouse, logger, agent: AgentResource | None = None):

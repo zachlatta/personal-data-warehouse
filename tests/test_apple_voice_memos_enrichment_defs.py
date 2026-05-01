@@ -11,8 +11,10 @@ from personal_data_warehouse.defs.apple_voice_memos_enrichment import (
     DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE,
     UNCONFIGURED_AGENT_RESOURCE,
     apple_voice_memos_enrichment,
+    apple_voice_memos_enrichment_force_prompt_version,
     apple_voice_memos_enrichment_job,
     apple_voice_memos_enrichment_hourly,
+    apple_voice_memos_enrichment_max_error_attempts,
     apple_voice_memos_enrichment_model,
     apple_voice_memos_enrichment_prompt_version,
     apple_voice_memos_enrichment_provider,
@@ -56,6 +58,20 @@ def test_apple_voice_memos_enrichment_uses_agent_provider_model_and_prompt() -> 
     assert apple_voice_memos_enrichment_provider(settings) == "agent_codex"
     assert apple_voice_memos_enrichment_model(settings) == "gpt-agent"
     assert apple_voice_memos_enrichment_prompt_version() == AGENT_ENRICHMENT_PROMPT_VERSION
+
+
+def test_apple_voice_memos_enrichment_force_prompt_version_env(monkeypatch) -> None:
+    monkeypatch.setenv("VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION", "true")
+
+    assert apple_voice_memos_enrichment_force_prompt_version() is True
+
+
+def test_apple_voice_memos_enrichment_max_error_attempts_env(monkeypatch) -> None:
+    monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS", raising=False)
+    assert apple_voice_memos_enrichment_max_error_attempts() == 5
+
+    monkeypatch.setenv("VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS", "9")
+    assert apple_voice_memos_enrichment_max_error_attempts() == 9
 
 
 def test_apple_voice_memos_enrichment_client_uses_configured_agent_over_unconfigured_resource() -> None:
@@ -144,6 +160,8 @@ def test_apple_voice_memos_enrichment_backlog_sensor_skips_when_backlog_is_empty
     assert calls[0][1]["limit"] == 1
     assert calls[0][1]["model"] == "gpt-agent"
     assert calls[0][1]["recorded_after"] == datetime(2024, 12, 1, tzinfo=UTC)
+    assert calls[0][1]["force_prompt_version"] is False
+    assert calls[0][1]["max_error_attempts"] == 5
 
 
 def test_apple_voice_memos_enrichment_backlog_sensor_launches_when_backlog_exists(monkeypatch) -> None:

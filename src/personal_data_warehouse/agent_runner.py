@@ -36,6 +36,7 @@ DEFAULT_AGENT_ENTRYPOINT_PATH = Path(__file__).resolve().parents[2] / "docker" /
 DEFAULT_AGENT_BUILD_CONTEXT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_AGENT_TOOL_PROXY_BIND_HOST = "0.0.0.0"
 DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST = "host.docker.internal"
+DEFAULT_AGENT_MAX_PROMPT_CHARS = 900_000
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class AgentContainerConfig:
     timeout_seconds: int = 1800
     tool_proxy_bind_host: str = "0.0.0.0"
     tool_proxy_public_host: str = "host.docker.internal"
+    max_prompt_chars: int = DEFAULT_AGENT_MAX_PROMPT_CHARS
 
     @property
     def normalized_provider(self) -> str:
@@ -68,6 +70,7 @@ class AgentRunRequest:
     schema: Mapping[str, Any]
     task_type: str = "generic"
     subject_id: str = ""
+    prompt_version: str = ""
     run_id: str = field(default_factory=lambda: f"agent-{uuid.uuid4().hex}")
     provider: str | None = None
     model: str | None = None
@@ -81,6 +84,7 @@ class AgentRunRequest:
                 "schema": self.schema,
                 "task_type": self.task_type,
                 "subject_id": self.subject_id,
+                "prompt_version": self.prompt_version,
                 "provider": self.provider,
                 "model": self.model,
             },
@@ -95,6 +99,7 @@ class AgentRunRequest:
             schema=self.schema,
             task_type=self.task_type,
             subject_id=self.subject_id,
+            prompt_version=self.prompt_version,
             run_id=self.run_id,
             provider=self.provider,
             model=self.model,
@@ -119,6 +124,7 @@ class AgentRunResult:
     model: str
     task_type: str
     subject_id: str
+    prompt_version: str
     input_sha256: str
     status: str
     final_output_json: Mapping[str, Any]
@@ -127,6 +133,12 @@ class AgentRunResult:
     started_at: datetime
     completed_at: datetime
     events: Sequence[AgentRunEvent]
+
+
+def agent_prompt_size_error(prompt: str, max_prompt_chars: int) -> str:
+    if max_prompt_chars <= 0 or len(prompt) <= max_prompt_chars:
+        return ""
+    return f"agent prompt exceeds maximum length of {max_prompt_chars} characters: {len(prompt)}"
 
 
 class ContainerAgentRunner:
@@ -139,6 +151,25 @@ class ContainerAgentRunner:
         if provider not in {"codex", "claude"}:
             raise ValueError("agent provider must be codex or claude")
         model = request.model if request.model is not None else self._config.model
+        prompt_too_large = agent_prompt_size_error(request.prompt, self._config.max_prompt_chars)
+        if prompt_too_large:
+            now = datetime.now(tz=UTC)
+            return AgentRunResult(
+                run_id=request.run_id,
+                provider=provider,
+                model=model,
+                task_type=request.task_type,
+                subject_id=request.subject_id,
+                prompt_version=request.prompt_version,
+                input_sha256=request.input_sha256,
+                status="error",
+                final_output_json={},
+                error=prompt_too_large,
+                exit_code=2,
+                started_at=now,
+                completed_at=now,
+                events=[],
+            )
         self._ensure_managed_image()
         run_dir = self._prepare_run_dir(request)
         self._sync_run_dir_to_volume(request.run_id, run_dir)
@@ -186,6 +217,7 @@ class ContainerAgentRunner:
             model=model,
             task_type=request.task_type,
             subject_id=request.subject_id,
+            prompt_version=request.prompt_version,
             input_sha256=request.input_sha256,
             status=status,
             final_output_json=final_output,
@@ -260,6 +292,7 @@ class ContainerAgentRunner:
                     "run_id": request.run_id,
                     "task_type": request.task_type,
                     "subject_id": request.subject_id,
+                    "prompt_version": request.prompt_version,
                     "input_sha256": request.input_sha256,
                 },
                 sort_keys=True,
@@ -380,6 +413,7 @@ def agent_run_row(result: AgentRunResult) -> dict[str, Any]:
         "model": result.model,
         "task_type": result.task_type,
         "subject_id": result.subject_id,
+        "prompt_version": result.prompt_version,
         "status": result.status,
         "input_sha256": result.input_sha256,
         "final_output_json": json.dumps(result.final_output_json, sort_keys=True, separators=(",", ":"), default=str),

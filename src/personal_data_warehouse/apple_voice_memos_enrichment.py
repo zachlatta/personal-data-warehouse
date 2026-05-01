@@ -23,8 +23,12 @@ DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
 AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v4"
 DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
 DEFAULT_ENRICHMENT_RECORDED_AFTER = datetime(2024, 12, 1, tzinfo=UTC)
+DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 5
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
 LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS = 12_000
+PROMPT_TRANSCRIPT_WITH_SEGMENTS_MAX_CHARS = 8_000
+PROMPT_TRANSCRIPT_WITHOUT_SEGMENTS_MAX_CHARS = 60_000
+PROMPT_GMAIL_MENTIONS_PER_IDENTITY_HINT = 3
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,7 @@ class ContainerAgentStructuredClient:
         max_validation_retries: int = 2,
         logger=None,
         recording_id: str = "",
+        prompt_version: str = "",
     ) -> Mapping[str, Any]:
         prompt = container_agent_prompt(
             system_prompt=system_prompt,
@@ -96,6 +101,7 @@ class ContainerAgentStructuredClient:
             schema=schema,
             task_type="apple_voice_memo_enrichment",
             subject_id=recording_id,
+            prompt_version=prompt_version,
             provider=self._provider,
             model=self._model,
         )
@@ -148,6 +154,8 @@ class VoiceMemosEnrichmentRunner:
         now: Callable[[], datetime] | None = None,
         provider: str = DEFAULT_AGENT_ENRICHMENT_PROVIDER,
         prompt_version: str = AGENT_ENRICHMENT_PROMPT_VERSION,
+        force_prompt_version: bool = False,
+        max_error_attempts: int = DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     ) -> None:
         self._warehouse = warehouse
         self._client = client
@@ -155,6 +163,8 @@ class VoiceMemosEnrichmentRunner:
         self._now = now or (lambda: datetime.now(tz=UTC))
         self._provider = provider
         self._prompt_version = prompt_version
+        self._force_prompt_version = force_prompt_version
+        self._max_error_attempts = max_error_attempts
 
     def sync(self, *, limit: int | None, recorded_after: datetime | None = None) -> VoiceMemosEnrichmentSummary:
         self._warehouse.ensure_apple_voice_memos_tables()
@@ -165,6 +175,8 @@ class VoiceMemosEnrichmentRunner:
             prompt_version=self._prompt_version,
             limit=limit,
             recorded_after=recorded_after,
+            force_prompt_version=self._force_prompt_version,
+            max_error_attempts=self._max_error_attempts,
         )
         enriched = 0
         failed = 0
@@ -194,6 +206,7 @@ class VoiceMemosEnrichmentRunner:
                     ),
                     logger=self._logger,
                     recording_id=recording_id,
+                    prompt_version=self._prompt_version,
                 )
                 result = apply_segment_preserving_transcript_fallback(
                     recording=recording,
@@ -250,17 +263,39 @@ def load_enrichment_candidates(
     prompt_version: str,
     limit: int | None,
     recorded_after: datetime | None = None,
+    force_prompt_version: bool = False,
+    max_error_attempts: int = DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
 ) -> list[dict[str, Any]]:
     filters = [
         "r.provider = 'assemblyai'",
         "r.status = 'completed'",
         "e.recording_id = ''",
     ]
+    if max_error_attempts > 0:
+        filters.append(f"ifNull(a.error_attempts, 0) < {int(max_error_attempts)}")
     if recorded_after is not None:
         if recorded_after.tzinfo is None:
             recorded_after = recorded_after.replace(tzinfo=UTC)
         filters.append(f"f.recorded_at >= parseDateTimeBestEffort({_sql_string(recorded_after.astimezone(UTC).isoformat())})")
     limit_sql = f"LIMIT {int(limit)}" if limit and limit > 0 else ""
+    completed_prompt_filter = f"AND prompt_version = {_sql_string(prompt_version)}" if force_prompt_version else ""
+    agent_run_provider = provider.removeprefix("agent_")
+    error_attempts_join = ""
+    if max_error_attempts > 0:
+        error_attempts_join = f"""
+        LEFT JOIN
+        (
+            SELECT subject_id, count() AS error_attempts
+            FROM agent_runs
+            WHERE task_type = 'apple_voice_memo_enrichment'
+              AND provider = {_sql_string(agent_run_provider)}
+              AND model = {_sql_string(model)}
+              AND prompt_version = {_sql_string(prompt_version)}
+              AND status = 'error'
+            GROUP BY subject_id
+        ) AS a
+            ON f.recording_id = a.subject_id
+        """
     rows = warehouse._query(
         f"""
         SELECT
@@ -278,11 +313,12 @@ def load_enrichment_candidates(
             FROM apple_voice_memos_enrichments
             WHERE provider = {_sql_string(provider)}
               AND model = {_sql_string(model)}
-              AND prompt_version = {_sql_string(prompt_version)}
+              {completed_prompt_filter}
               AND status = 'completed'
             GROUP BY account, recording_id
         ) AS e
             ON f.account = e.account AND f.recording_id = e.recording_id
+        {error_attempts_join}
         WHERE {" AND ".join(filters)}
         ORDER BY f.recorded_at DESC
         {limit_sql}
@@ -1015,9 +1051,14 @@ def enrichment_user_prompt(
     calendar_candidates: Sequence[Mapping[str, Any]],
     transcript_segments: Sequence[Mapping[str, Any]] = (),
 ) -> str:
-    transcript = str(recording.get("transcript_text", ""))
-    if len(transcript) > 60_000:
-        transcript = transcript[:60_000]
+    source_transcript = str(recording.get("transcript_text", ""))
+    sanitized_segments = [prompt_transcript_segment(segment) for segment in transcript_segments]
+    transcript_limit = (
+        PROMPT_TRANSCRIPT_WITH_SEGMENTS_MAX_CHARS
+        if sanitized_segments
+        else PROMPT_TRANSCRIPT_WITHOUT_SEGMENTS_MAX_CHARS
+    )
+    transcript = source_transcript[:transcript_limit]
     return json.dumps(
         {
             "recording": {
@@ -1026,7 +1067,9 @@ def enrichment_user_prompt(
                 if hasattr(recording.get("recorded_at"), "isoformat")
                 else str(recording.get("recorded_at")),
                 "title": recording.get("title"),
-                "transcript_char_count": len(str(recording.get("transcript_text", ""))),
+                "transcript_char_count": len(source_transcript),
+                "transcript_in_prompt_char_count": len(transcript),
+                "transcript_truncated": len(source_transcript) > len(transcript),
             },
             "local_transcript_assembly": {
                 "sentinel": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
@@ -1036,9 +1079,9 @@ def enrichment_user_prompt(
             "recorded_at_interpretations": recording_time_interpretations(recording.get("recorded_at"))
             if isinstance(recording.get("recorded_at"), datetime)
             else [],
-            "calendar_candidates": list(calendar_candidates),
+            "calendar_candidates": [prompt_calendar_candidate(candidate) for candidate in calendar_candidates],
             "transcript": transcript,
-            "diarized_segments": list(transcript_segments),
+            "diarized_segments": sanitized_segments,
             "instructions": [
                 "Before final output, run \"$PDW_CLICKHOUSE_SCHEMA\" first, then use multiple focused \"$PDW_CLICKHOUSE_QUERY\" calls to search calendar, email, Slack, and related warehouse context.",
                 "Make separate warehouse checks for: the selected calendar event including attendee data, participant/person identity evidence, and suspicious domain terms or organizations that need spelling verification.",
@@ -1096,6 +1139,78 @@ def enrichment_user_prompt(
         sort_keys=True,
         default=str,
     )
+
+
+def prompt_transcript_segment(segment: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "segment_index": int(segment.get("segment_index") or 0),
+        "speaker_label": str(segment.get("speaker_label") or ""),
+        "start_ms": int(segment.get("start_ms") or 0),
+        "end_ms": int(segment.get("end_ms") or 0),
+        "confidence": float(segment.get("confidence") or 0),
+        "text": str(segment.get("text") or ""),
+    }
+
+
+def prompt_calendar_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "event_id": str(candidate.get("event_id") or ""),
+        "summary": str(candidate.get("summary") or ""),
+        "start_at": str(candidate.get("start_at") or ""),
+        "end_at": str(candidate.get("end_at") or ""),
+        "location": str(candidate.get("location") or ""),
+        "attendees": [str(attendee) for attendee in candidate.get("attendees") or []],
+        "attendee_details": [
+            prompt_attendee_detail(attendee)
+            for attendee in candidate.get("attendee_details") or []
+            if isinstance(attendee, Mapping)
+        ],
+        "identity_hints": prompt_identity_hints(candidate.get("identity_hints") or {}),
+    }
+
+
+def prompt_attendee_detail(attendee: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "display_name": str(attendee.get("display_name") or ""),
+        "email": str(attendee.get("email") or ""),
+    }
+
+
+def prompt_identity_hints(identity_hints: Mapping[str, Any]) -> dict[str, Any]:
+    compacted: dict[str, Any] = {}
+    for email, raw_hint in identity_hints.items():
+        if not isinstance(raw_hint, Mapping):
+            continue
+        compacted[str(email)] = {
+            "email": str(raw_hint.get("email") or email),
+            "possible_names": [str(name) for name in raw_hint.get("possible_names") or []],
+            "slack_users": [
+                prompt_slack_user(user) for user in raw_hint.get("slack_users") or [] if isinstance(user, Mapping)
+            ],
+            "gmail_mentions": [
+                prompt_gmail_mention(mention)
+                for mention in list(raw_hint.get("gmail_mentions") or [])[:PROMPT_GMAIL_MENTIONS_PER_IDENTITY_HINT]
+                if isinstance(mention, Mapping)
+            ],
+        }
+    return compacted
+
+
+def prompt_slack_user(user: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "name": str(user.get("name") or ""),
+        "real_name": str(user.get("real_name") or ""),
+        "display_name": str(user.get("display_name") or ""),
+        "user_id": str(user.get("user_id") or ""),
+    }
+
+
+def prompt_gmail_mention(mention: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "from_address": str(mention.get("from_address") or ""),
+        "subject": str(mention.get("subject") or "")[:240],
+        "snippet": str(mention.get("snippet") or "")[:240],
+    }
 
 
 def enrichment_schema() -> dict[str, Any]:

@@ -251,6 +251,7 @@ AGENT_RUN_COLUMNS = (
     "model",
     "task_type",
     "subject_id",
+    "prompt_version",
     "status",
     "input_sha256",
     "final_output_json",
@@ -948,6 +949,7 @@ class ClickHouseWarehouse:
                 model String,
                 task_type LowCardinality(String),
                 subject_id String,
+                prompt_version String,
                 status LowCardinality(String),
                 input_sha256 String,
                 final_output_json String,
@@ -962,6 +964,7 @@ class ClickHouseWarehouse:
             ORDER BY (run_id)
             """
         )
+        self._command("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS prompt_version String AFTER subject_id")
         self._command(
             """
             CREATE TABLE IF NOT EXISTS agent_run_events (

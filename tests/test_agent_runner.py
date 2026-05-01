@@ -182,6 +182,7 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
         model="gpt-test",
         task_type="apple_voice_memo_enrichment",
         subject_id="rec-1",
+        prompt_version="prompt-v1",
         input_sha256="abc",
         status="completed",
         final_output_json={"ok": True},
@@ -219,11 +220,35 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
     )
 
     assert agent_run_row(result)["final_output_json"] == '{"ok":true}'
+    assert agent_run_row(result)["prompt_version"] == "prompt-v1"
     assert agent_run_event_rows(result)[0]["event_type"] == "mcp_tool_call"
     tool_rows = agent_run_tool_call_rows(result)
     assert [row["tool_name"] for row in tool_rows] == ["query", "pdw-clickhouse-query"]
     assert tool_rows[0]["arguments_json"] == '{"sql":"SELECT 1"}'
     assert "PDW_CLICKHOUSE_QUERY" in tool_rows[1]["arguments_json"]
+
+
+def test_container_agent_runner_rejects_oversized_prompt_before_docker(tmp_path) -> None:
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    config = AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path, max_prompt_chars=10)
+    request = AgentRunRequest(
+        prompt="x" * 11,
+        schema={"type": "object"},
+        run_id="run-1",
+        prompt_version="prompt-v1",
+    )
+
+    result = ContainerAgentRunner(config, runner=fake_run).run(request)
+
+    assert result.status == "error"
+    assert result.prompt_version == "prompt-v1"
+    assert "agent prompt exceeds maximum length of 10 characters" in result.error
+    assert calls == []
 
 
 def test_auth_command_uses_subscription_volume_without_api_keys() -> None:

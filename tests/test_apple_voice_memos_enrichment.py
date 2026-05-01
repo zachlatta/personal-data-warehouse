@@ -490,6 +490,59 @@ def test_enrichment_user_prompt_includes_diarized_segments_and_speaker_rules() -
     assert LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL in prompt
 
 
+def test_enrichment_user_prompt_omits_raw_provider_payload_fields() -> None:
+    prompt = enrichment_user_prompt(
+        recording={
+            "recording_id": "rec1",
+            "recorded_at": datetime(2026, 4, 27, tzinfo=UTC),
+            "title": "Title",
+            "transcript_text": "Transcript text",
+            "raw_result_json": "LEAK_RECORDING_RAW",
+        },
+        calendar_candidates=[
+            {
+                "event_id": "event1",
+                "summary": "Meeting",
+                "start_at": "2026-04-27T10:00:00+00:00",
+                "end_at": "2026-04-27T10:30:00+00:00",
+                "location": "Zoom",
+                "attendees": ["Guest Person"],
+                "attendee_details": [{"display_name": "Guest Person", "email": "guest@example.com"}],
+                "identity_hints": {
+                    "guest@example.com": {
+                        "email": "guest@example.com",
+                        "possible_names": ["Guest Person"],
+                        "gmail_mentions": [
+                            {"from_address": "a@example.com", "subject": f"subject {index}", "snippet": "snippet"}
+                            for index in range(10)
+                        ],
+                        "raw_result_json": "LEAK_HINT_RAW",
+                    }
+                },
+                "raw_json": "LEAK_EVENT_RAW",
+            }
+        ],
+        transcript_segments=[
+            {
+                "segment_index": 0,
+                "speaker_label": "A",
+                "start_ms": 0,
+                "end_ms": 1000,
+                "confidence": 0.9,
+                "text": "Hello",
+                "words_json": "LEAK_WORDS",
+                "raw_result_json": "LEAK_SEGMENT_RAW",
+            }
+        ],
+    )
+
+    assert "LEAK_" not in prompt
+    assert "words_json" not in prompt
+    assert "raw_result_json" not in prompt
+    assert "subject 0" in prompt
+    assert "subject 3" not in prompt
+
+
 def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit() -> None:
     queries = []
 
@@ -509,6 +562,9 @@ def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit
 
     assert "f.recorded_at >= parseDateTimeBestEffort('2026-03-03T00:00:00+00:00')" in queries[0]
     assert "LIMIT" not in queries[0]
+    assert "FROM apple_voice_memos_enrichments" in queries[0]
+    assert "AND prompt_version = 'test-prompt'\n              AND status = 'completed'" not in queries[0]
+    assert "ifNull(a.error_attempts, 0) < 5" in queries[0]
 
 
 def test_load_enrichment_candidates_keeps_limit_when_configured() -> None:
@@ -529,6 +585,70 @@ def test_load_enrichment_candidates_keeps_limit_when_configured() -> None:
     )
 
     assert "LIMIT 12" in queries[0]
+
+
+def test_load_enrichment_candidates_can_force_current_prompt_version() -> None:
+    queries = []
+
+    class Warehouse:
+        def _query(self, sql):
+            queries.append(sql)
+            return []
+
+    load_enrichment_candidates(
+        Warehouse(),
+        provider="agent_codex",
+        model="test-model",
+        prompt_version="test-prompt",
+        limit=1,
+        force_prompt_version=True,
+    )
+
+    assert "AND prompt_version = 'test-prompt'\n              AND status = 'completed'" in queries[0]
+
+
+def test_load_enrichment_candidates_uses_agent_error_budget() -> None:
+    queries = []
+
+    class Warehouse:
+        def _query(self, sql):
+            queries.append(sql)
+            return []
+
+    load_enrichment_candidates(
+        Warehouse(),
+        provider="agent_codex",
+        model="test-model",
+        prompt_version="test-prompt",
+        limit=1,
+        max_error_attempts=7,
+    )
+
+    assert "FROM agent_runs" in queries[0]
+    assert "provider = 'codex'" in queries[0]
+    assert "prompt_version = 'test-prompt'" in queries[0]
+    assert "ifNull(a.error_attempts, 0) < 7" in queries[0]
+
+
+def test_load_enrichment_candidates_can_disable_agent_error_budget() -> None:
+    queries = []
+
+    class Warehouse:
+        def _query(self, sql):
+            queries.append(sql)
+            return []
+
+    load_enrichment_candidates(
+        Warehouse(),
+        provider="agent_codex",
+        model="test-model",
+        prompt_version="test-prompt",
+        limit=1,
+        max_error_attempts=0,
+    )
+
+    assert "FROM agent_runs" not in queries[0]
+    assert "error_attempts" not in queries[0]
 
 
 def test_ensure_recording_level_fields_fills_no_calendar_outputs() -> None:
