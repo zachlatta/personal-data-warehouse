@@ -1552,15 +1552,8 @@ class ClickHouseWarehouse:
     def insert_agent_run_tool_calls(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_run_tool_calls", rows, AGENT_RUN_TOOL_CALL_COLUMNS)
 
-    def load_untranscribed_apple_voice_memos_files(
-        self,
-        *,
-        provider: str,
-        limit: int,
-        max_failed_attempts: int = 3,
-    ) -> list[dict[str, Any]]:
+    def load_untranscribed_apple_voice_memos_files(self, *, provider: str, limit: int) -> list[dict[str, Any]]:
         provider_sql = _sql_string(provider)
-        max_failed_attempts_sql = max(0, int(max_failed_attempts))
         rows = self._query(
             f"""
             SELECT
@@ -1583,21 +1576,11 @@ class ClickHouseWarehouse:
                 SELECT account, recording_id
                 FROM apple_voice_memos_transcription_runs
                 WHERE provider = {provider_sql}
-                  AND status = 'completed'
+                  AND status IN ('completed', 'error')
                 GROUP BY account, recording_id
-            ) AS t
-            ON f.account = t.account AND f.recording_id = t.recording_id
-            LEFT JOIN
-            (
-                SELECT account, recording_id, count() AS failed_attempts
-                FROM apple_voice_memos_transcription_runs
-                WHERE provider = {provider_sql}
-                  AND status = 'error'
-                GROUP BY account, recording_id
-            ) AS e
-            ON f.account = e.account AND f.recording_id = e.recording_id
-            WHERE t.recording_id = ''
-              AND e.failed_attempts < {max_failed_attempts_sql}
+            ) AS terminal
+            ON f.account = terminal.account AND f.recording_id = terminal.recording_id
+            WHERE terminal.recording_id = ''
             ORDER BY f.recorded_at DESC
             LIMIT {int(limit)}
             """
