@@ -311,8 +311,32 @@ def test_apple_voice_memos_untranscribed_query_orders_recent_recordings() -> Non
     assert "apple_voice_memos_transcription_runs" in queries[0]
     assert "provider = 'assemblyai'" in queries[0]
     assert "status = 'completed'" in queries[0]
+    assert "status = 'error'" in queries[0]
+    assert "e.failed_attempts < 3" in queries[0]
     assert "ORDER BY f.recorded_at DESC" in queries[0]
     assert "LIMIT 3" in queries[0]
+
+
+def test_apple_voice_memos_untranscribed_query_accepts_custom_failed_attempt_budget() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    queries: list[str] = []
+
+    def fake_query(sql: str):
+        queries.append(sql)
+        return []
+
+    warehouse._query = fake_query
+
+    assert (
+        warehouse.load_untranscribed_apple_voice_memos_files(
+            provider="assemblyai",
+            limit=3,
+            max_failed_attempts=1,
+        )
+        == []
+    )
+
+    assert "e.failed_attempts < 1" in queries[0]
 
 
 def test_combined_account_state_view_is_not_created() -> None:
