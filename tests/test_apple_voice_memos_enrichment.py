@@ -562,6 +562,8 @@ def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit
 
     assert "f.recorded_at >= parseDateTimeBestEffort('2026-03-03T00:00:00+00:00')" in queries[0]
     assert "LIMIT" not in queries[0]
+    assert "FROM apple_voice_memos_files AS f FINAL" in queries[0]
+    assert "INNER JOIN apple_voice_memos_transcription_runs AS r FINAL" in queries[0]
     assert "FROM apple_voice_memos_enrichments" in queries[0]
     assert "r.content_sha256" in queries[0]
     assert "f.content_sha256 = r.content_sha256" in queries[0]

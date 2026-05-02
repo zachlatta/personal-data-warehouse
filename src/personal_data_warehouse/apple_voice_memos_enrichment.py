@@ -305,8 +305,8 @@ def load_enrichment_candidates(
             f.recorded_at,
             f.title,
             r.transcript_text
-        FROM apple_voice_memos_files AS f
-        INNER JOIN apple_voice_memos_transcription_runs AS r
+        FROM apple_voice_memos_files AS f FINAL
+        INNER JOIN apple_voice_memos_transcription_runs AS r FINAL
             ON f.account = r.account
               AND f.recording_id = r.recording_id
               AND f.content_sha256 = r.content_sha256
