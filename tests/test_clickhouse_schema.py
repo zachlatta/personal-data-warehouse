@@ -310,7 +310,11 @@ def test_apple_voice_memos_untranscribed_query_orders_recent_recordings() -> Non
     assert "FROM apple_voice_memos_files AS f" in queries[0]
     assert "apple_voice_memos_transcription_runs" in queries[0]
     assert "provider = 'assemblyai'" in queries[0]
-    assert "status IN ('completed', 'error')" in queries[0]
+    assert "status = 'completed'" in queries[0]
+    assert "status IN ('completed', 'error')" not in queries[0]
+    assert "status = 'error'" in queries[0]
+    assert "current account balance is negative" in queries[0]
+    assert "upload failed, please try again" in queries[0]
     assert "ORDER BY f.recorded_at DESC" in queries[0]
     assert "LIMIT 3" in queries[0]
 

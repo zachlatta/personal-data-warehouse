@@ -199,6 +199,23 @@ VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS = (
     "sync_version",
 )
 
+RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS = (
+    "current account balance is negative",
+    "please top up",
+    "upload failed, please try again",
+    "too many requests",
+    "rate limit",
+    "rate limited",
+    "timeout",
+    "timed out",
+    "temporarily",
+    "temporary",
+    "500 server error",
+    "502 server error",
+    "503 server error",
+    "504 server error",
+)
+
 VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS = (
     "account",
     "recording_id",
@@ -1576,7 +1593,10 @@ class ClickHouseWarehouse:
                 SELECT account, recording_id
                 FROM apple_voice_memos_transcription_runs
                 WHERE provider = {provider_sql}
-                  AND status IN ('completed', 'error')
+                  AND (
+                    status = 'completed'
+                    OR (status = 'error' AND NOT ({_retryable_voice_memo_transcription_error_sql("error")}))
+                  )
                 GROUP BY account, recording_id
             ) AS terminal
             ON f.account = terminal.account AND f.recording_id = terminal.recording_id
@@ -2683,6 +2703,13 @@ def _missing_json_field(payload: dict[str, Any], field: str) -> bool:
 
 def _sql_string(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _retryable_voice_memo_transcription_error_sql(column: str) -> str:
+    return " OR ".join(
+        f"positionCaseInsensitive({column}, {_sql_string(pattern)}) > 0"
+        for pattern in RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS
+    )
 
 
 def _gmail_attachment_candidate_clause() -> str:
