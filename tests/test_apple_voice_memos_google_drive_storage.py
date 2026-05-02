@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+import threading
+
+from httplib2.error import RedirectMissingLocation
 
 from personal_data_warehouse_voice_memos.google_drive_storage import GoogleDriveObjectStore
+from personal_data_warehouse_voice_memos.cli import build_google_drive_http
 
 
 class FakeRequest:
@@ -100,3 +105,62 @@ def test_google_drive_store_dedupes_and_uploads_with_app_properties(tmp_path) ->
     assert json_body["appProperties"]["pdw_root_folder_id"] == "folder-id"
     assert json_body["appProperties"]["pdw_stage"] == "inbox"
     assert "storage_key" not in json_body["appProperties"]
+
+
+def test_google_drive_http_allows_resumable_upload_308_without_location_header() -> None:
+    server = HTTPServer(("127.0.0.1", 0), ResumableUploadProgressHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        http = build_google_drive_http(credentials=FakeCredentials(), timeout_seconds=5)
+        response, _ = http.request(
+            f"http://127.0.0.1:{server.server_port}/upload",
+            method="PUT",
+            body=b"chunk",
+            headers={"Content-Range": "bytes 0-4/10"},
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert response.status == 308
+    assert response["range"] == "bytes=0-4"
+
+
+def test_default_httplib2_raises_on_resumable_upload_308_without_location_header() -> None:
+    server = HTTPServer(("127.0.0.1", 0), ResumableUploadProgressHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        http = build_google_drive_http(credentials=FakeCredentials(), timeout_seconds=5)
+        http.http.redirect_codes = http.http.redirect_codes | {308}
+        try:
+            http.request(
+                f"http://127.0.0.1:{server.server_port}/upload",
+                method="PUT",
+                body=b"chunk",
+                headers={"Content-Range": "bytes 0-4/10"},
+            )
+        except RedirectMissingLocation:
+            pass
+        else:
+            raise AssertionError("Expected RedirectMissingLocation")
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+class FakeCredentials:
+    def before_request(self, request, method, url, headers) -> None:
+        return None
+
+
+class ResumableUploadProgressHandler(BaseHTTPRequestHandler):
+    def do_PUT(self) -> None:
+        self.send_response(308)
+        self.send_header("Range", "bytes=0-4")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format, *args) -> None:
+        return None

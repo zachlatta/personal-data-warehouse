@@ -129,8 +129,14 @@ def build_google_drive_service(*, account: str, settings, request_timeout_second
         service_name="Google Drive",
         request_timeout_seconds=request_timeout_seconds,
     )
-    http = google_auth_httplib2.AuthorizedHttp(credentials, http=httplib2.Http(timeout=request_timeout_seconds))
+    http = build_google_drive_http(credentials=credentials, timeout_seconds=request_timeout_seconds)
     return build("drive", "v3", http=http, cache_discovery=False)
+
+
+def build_google_drive_http(*, credentials, timeout_seconds: int):
+    http = httplib2.Http(timeout=timeout_seconds)
+    http.redirect_codes = frozenset(code for code in http.redirect_codes if code != 308)
+    return google_auth_httplib2.AuthorizedHttp(credentials, http=http)
 
 
 def build_before_upload_check(*, preflight_timeout_seconds: float):
