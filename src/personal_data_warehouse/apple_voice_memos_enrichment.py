@@ -301,30 +301,34 @@ def load_enrichment_candidates(
         SELECT
             f.account,
             f.recording_id,
+            r.content_sha256,
             f.recorded_at,
             f.title,
             r.transcript_text
         FROM apple_voice_memos_files AS f
         INNER JOIN apple_voice_memos_transcription_runs AS r
-            ON f.account = r.account AND f.recording_id = r.recording_id
+            ON f.account = r.account
+              AND f.recording_id = r.recording_id
+              AND f.content_sha256 = r.content_sha256
         LEFT JOIN
         (
-            SELECT account, recording_id
+            SELECT account, recording_id, content_sha256, created_at
             FROM apple_voice_memos_enrichments
             WHERE provider = {_sql_string(provider)}
               AND model = {_sql_string(model)}
               {completed_prompt_filter}
               AND status = 'completed'
-            GROUP BY account, recording_id
         ) AS e
-            ON f.account = e.account AND f.recording_id = e.recording_id
+            ON f.account = e.account
+              AND f.recording_id = e.recording_id
+              AND e.content_sha256 = r.content_sha256
         {error_attempts_join}
         WHERE {" AND ".join(filters)}
         ORDER BY f.recorded_at DESC
         {limit_sql}
         """
     )
-    columns = ("account", "recording_id", "recorded_at", "title", "transcript_text")
+    columns = ("account", "recording_id", "content_sha256", "recorded_at", "title", "transcript_text")
     return [dict(zip(columns, row, strict=True)) for row in rows]
 
 
@@ -1291,6 +1295,7 @@ def enrichment_row(
     return {
         "account": str(recording.get("account", "")),
         "recording_id": str(recording.get("recording_id", "")),
+        "content_sha256": str(recording.get("content_sha256", "")),
         "provider": provider,
         "model": model,
         "prompt_version": prompt_version,

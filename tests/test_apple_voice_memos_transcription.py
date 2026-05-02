@@ -78,6 +78,7 @@ class FakeWarehouse:
                 "recording_id": "20260427 100004-40DC0200",
                 "filename": "memo.m4a",
                 "content_type": "audio/mp4",
+                "content_sha256": "audio-hash",
             }
         ]
         self.run_rows = []
@@ -242,4 +243,5 @@ def test_transcription_runner_writes_run_and_segments() -> None:
     assert summary.recordings_transcribed == 1
     assert summary.segments_written == 2
     assert warehouse.run_rows[0]["provider_transcript_id"] == "tx1"
+    assert warehouse.run_rows[0]["content_sha256"] == "audio-hash"
     assert warehouse.segment_rows[0]["speaker_label"] == "A"

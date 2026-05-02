@@ -264,6 +264,7 @@ def transcription_run_row(
     return {
         "account": str(recording.get("account", "")),
         "recording_id": str(recording.get("recording_id", "")),
+        "content_sha256": str(recording.get("content_sha256", "")),
         "provider": ASSEMBLYAI_PROVIDER,
         "provider_transcript_id": str(result.get("id", "")),
         "model": str(result.get("speech_model_used") or ",".join(result.get("speech_models") or [])),
@@ -288,6 +289,7 @@ def failed_transcription_run_row(
     return {
         "account": str(recording.get("account", "")),
         "recording_id": str(recording.get("recording_id", "")),
+        "content_sha256": str(recording.get("content_sha256", "")),
         "provider": provider,
         "provider_transcript_id": "",
         "model": "",

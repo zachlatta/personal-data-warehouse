@@ -12,7 +12,7 @@ import threading
 from personal_data_warehouse_voice_memos.scanner import (
     VoiceMemoFileCandidate,
     VoiceMemoRecording,
-    recording_from_path,
+    recording_from_candidate,
     scan_voice_memo_file_candidates,
 )
 from personal_data_warehouse_voice_memos.state import VoiceMemosUploadState
@@ -20,6 +20,7 @@ from personal_data_warehouse_voice_memos.storage import ObjectPresence, ObjectSt
 
 OBJECT_PREFIX = "apple-voice-memos"
 INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox"
+PARTIAL_LOCAL_DURATION_TOLERANCE_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -98,11 +99,22 @@ class VoiceMemosUploadRunner:
 
         if self._limit is not None:
             candidates = candidates[: self._limit]
-        recordings = [(candidate, recording_from_path(candidate.path)) for candidate in candidates]
-        bytes_seen = sum(recording.size_bytes for _, recording in recordings)
+        recordings_seen = len(candidates)
+        bytes_seen = sum(candidate.size_bytes for candidate in candidates)
+        partial_candidates = [candidate for candidate in candidates if voice_memo_candidate_is_partially_materialized(candidate)]
+        partial_candidate_set = set(partial_candidates)
+        candidates = [candidate for candidate in candidates if candidate not in partial_candidate_set]
+        for candidate in partial_candidates:
+            self._logger.warning(
+                "Deferring %s because Voice Memos reports %.2fs total but only %.2fs local audio",
+                candidate.filename,
+                candidate.duration_seconds or 0,
+                candidate.local_duration_seconds or 0,
+            )
+        recordings = [(candidate, recording_from_candidate(candidate)) for candidate in candidates]
         self._logger.info(
             "Found %s Voice Memos recordings totaling %s",
-            len(recordings),
+            recordings_seen,
             format_bytes(bytes_seen),
         )
         if recordings and self._before_upload_check is not None:
@@ -110,13 +122,13 @@ class VoiceMemosUploadRunner:
             if skip_reason:
                 self._logger.warning("Skipping Voice Memos upload: %s", skip_reason)
                 return VoiceMemosUploadSummary(
-                    recordings_seen=len(recordings),
+                    recordings_seen=recordings_seen,
                     recordings_skipped=0,
                     recordings_uploaded=0,
                     metadata_uploaded=0,
                     bytes_seen=bytes_seen,
                     recordings_selected=len(recordings),
-                    recordings_deferred=len(recordings),
+                    recordings_deferred=len(recordings) + len(partial_candidates),
                 )
         self._logger.info("Uploading with %s worker(s)", self._workers)
 
@@ -146,7 +158,7 @@ class VoiceMemosUploadRunner:
         bytes_skipped = sum(result.bytes_skipped for result in results)
 
         summary = VoiceMemosUploadSummary(
-            recordings_seen=len(recordings),
+            recordings_seen=recordings_seen,
             recordings_skipped=skipped,
             recordings_uploaded=uploaded,
             metadata_uploaded=metadata_uploaded,
@@ -154,6 +166,7 @@ class VoiceMemosUploadRunner:
             bytes_uploaded=bytes_uploaded,
             bytes_skipped=bytes_skipped,
             recordings_selected=len(recordings),
+            recordings_deferred=len(partial_candidates),
         )
         self._logger.info(
             "Voice Memos upload summary: seen=%s (%s), uploaded=%s (%s), skipped=%s (%s), metadata=%s",
@@ -179,11 +192,21 @@ class VoiceMemosUploadRunner:
         selected: list[VoiceMemoFileCandidate] = []
         state_skipped = 0
         age_deferred = 0
+        partial_deferred = 0
         now = self._now()
 
         for candidate in candidates:
             if self._min_file_age_seconds and (now - candidate.file_modified_at).total_seconds() < self._min_file_age_seconds:
                 age_deferred += 1
+                continue
+            if voice_memo_candidate_is_partially_materialized(candidate):
+                partial_deferred += 1
+                self._logger.warning(
+                    "Deferring %s because Voice Memos reports %.2fs total but only %.2fs local audio",
+                    candidate.filename,
+                    candidate.duration_seconds or 0,
+                    candidate.local_duration_seconds or 0,
+                )
                 continue
             entry = self._upload_state.entry_for(candidate) if self._upload_state is not None else None
             if entry is not None and entry.complete and entry.matches(candidate):
@@ -195,7 +218,7 @@ class VoiceMemosUploadRunner:
             "Incremental selection: selected=%s skipped=%s deferred=%s",
             len(selected),
             state_skipped,
-            age_deferred,
+            age_deferred + partial_deferred,
         )
         if not selected:
             return VoiceMemosUploadSummary(
@@ -207,7 +230,7 @@ class VoiceMemosUploadRunner:
                 bytes_uploaded=0,
                 bytes_skipped=sum(candidate.size_bytes for candidate in candidates if self._is_state_complete(candidate)),
                 recordings_selected=0,
-                recordings_deferred=age_deferred,
+                recordings_deferred=age_deferred + partial_deferred,
             )
 
         if self._before_upload_check is not None:
@@ -223,11 +246,11 @@ class VoiceMemosUploadRunner:
                     bytes_uploaded=0,
                     bytes_skipped=sum(candidate.size_bytes for candidate in candidates if self._is_state_complete(candidate)),
                     recordings_selected=len(selected),
-                    recordings_deferred=len(selected) + age_deferred,
+                    recordings_deferred=len(selected) + age_deferred + partial_deferred,
                 )
 
         self._logger.info("Uploading with %s worker(s)", self._workers)
-        recordings = [(candidate, recording_from_path(candidate.path)) for candidate in selected]
+        recordings = [(candidate, recording_from_candidate(candidate)) for candidate in selected]
         if self._workers == 1 or len(recordings) <= 1:
             results = [
                 self._sync_candidate(index=index, total=len(recordings), candidate=candidate, recording=recording)
@@ -263,7 +286,7 @@ class VoiceMemosUploadRunner:
             bytes_uploaded=bytes_uploaded,
             bytes_skipped=bytes_skipped,
             recordings_selected=len(selected),
-            recordings_deferred=age_deferred,
+            recordings_deferred=age_deferred + partial_deferred,
         )
         self._logger.info(
             "Voice Memos upload summary: seen=%s (%s), selected=%s, uploaded=%s (%s), skipped=%s (%s), deferred=%s, metadata=%s",
@@ -405,25 +428,38 @@ def build_metadata(
     recording: VoiceMemoRecording,
     uploaded_at: datetime,
 ) -> dict[str, object]:
+    recording_payload = {
+        "recording_id": recording.recording_id,
+        "title": recording.title,
+        "original_path": str(recording.path),
+        "filename": recording.filename,
+        "extension": recording.extension,
+        "content_type": recording.content_type,
+        "size_bytes": recording.size_bytes,
+        "content_sha256": recording.content_sha256,
+        "file_created_at": recording.file_created_at.isoformat(),
+        "file_modified_at": recording.file_modified_at.isoformat(),
+        "recorded_at": recording.recorded_at.isoformat(),
+    }
+    if recording.duration_seconds is not None:
+        recording_payload["duration_seconds"] = recording.duration_seconds
+    if recording.local_duration_seconds is not None:
+        recording_payload["local_duration_seconds"] = recording.local_duration_seconds
     return {
         "schema_version": 1,
         "source": "apple_voice_memos",
         "account": account,
         "uploaded_at": uploaded_at.isoformat(),
-        "recording": {
-            "recording_id": recording.recording_id,
-            "title": recording.title,
-            "original_path": str(recording.path),
-            "filename": recording.filename,
-            "extension": recording.extension,
-            "content_type": recording.content_type,
-            "size_bytes": recording.size_bytes,
-            "content_sha256": recording.content_sha256,
-            "file_created_at": recording.file_created_at.isoformat(),
-            "file_modified_at": recording.file_modified_at.isoformat(),
-            "recorded_at": recording.recorded_at.isoformat(),
-        },
+        "recording": recording_payload,
     }
+
+
+def voice_memo_candidate_is_partially_materialized(candidate: VoiceMemoFileCandidate) -> bool:
+    if candidate.duration_seconds is None or candidate.local_duration_seconds is None:
+        return False
+    if candidate.duration_seconds > 0 and candidate.local_duration_seconds <= 0:
+        return True
+    return candidate.duration_seconds > candidate.local_duration_seconds + PARTIAL_LOCAL_DURATION_TOLERANCE_SECONDS
 
 
 def object_presence(object_store: ObjectStore, *, content_sha256: str) -> ObjectPresence:

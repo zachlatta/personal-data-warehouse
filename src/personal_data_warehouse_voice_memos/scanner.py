@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 import hashlib
 import mimetypes
+import sqlite3
+from typing import Mapping
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,8 @@ class VoiceMemoRecording:
     file_created_at: datetime
     file_modified_at: datetime
     recorded_at: datetime
+    duration_seconds: float | None = None
+    local_duration_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,8 @@ class VoiceMemoFileCandidate:
     birthtime_ns: int
     mtime_ns: int
     recorded_at: datetime
+    duration_seconds: float | None = None
+    local_duration_seconds: float | None = None
 
 
 def scan_voice_memo_file_candidates(
@@ -44,23 +50,25 @@ def scan_voice_memo_file_candidates(
     root = Path(recordings_path).expanduser()
     normalized_extensions = {extension.lower() for extension in extensions}
     candidates: list[VoiceMemoFileCandidate] = []
+    cloud_metadata = load_cloud_recording_metadata(root)
 
     for path in sorted(root.iterdir()):
         if not path.is_file() or path.suffix.lower() not in normalized_extensions:
             continue
-        candidates.append(file_candidate_from_path(path))
+        candidates.append(file_candidate_from_path(path, cloud_metadata=cloud_metadata.get(path.name)))
 
     return candidates
 
 
 def scan_voice_memos(recordings_path: Path | str, *, extensions: tuple[str, ...]) -> list[VoiceMemoRecording]:
-    return [recording_from_path(candidate.path) for candidate in scan_voice_memo_file_candidates(recordings_path, extensions=extensions)]
+    return [recording_from_candidate(candidate) for candidate in scan_voice_memo_file_candidates(recordings_path, extensions=extensions)]
 
 
-def file_candidate_from_path(path: Path) -> VoiceMemoFileCandidate:
+def file_candidate_from_path(path: Path, *, cloud_metadata: Mapping[str, float | None] | None = None) -> VoiceMemoFileCandidate:
     stat = path.stat()
     created_at = datetime.fromtimestamp(file_birthtime(stat), tz=UTC)
     modified_at = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
+    metadata = cloud_metadata or {}
     return VoiceMemoFileCandidate(
         path=path,
         recording_id=path.stem,
@@ -72,6 +80,8 @@ def file_candidate_from_path(path: Path) -> VoiceMemoFileCandidate:
         birthtime_ns=file_birthtime_ns(stat),
         mtime_ns=stat.st_mtime_ns,
         recorded_at=recorded_at_from_filename(path.stem) or created_at,
+        duration_seconds=metadata.get("duration_seconds"),
+        local_duration_seconds=metadata.get("local_duration_seconds"),
     )
 
 
@@ -92,6 +102,63 @@ def recording_from_path(path: Path) -> VoiceMemoRecording:
         file_modified_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC),
         recorded_at=recorded_at_from_filename(path.stem) or created_at,
     )
+
+
+def recording_from_candidate(candidate: VoiceMemoFileCandidate) -> VoiceMemoRecording:
+    recording = recording_from_path(candidate.path)
+    return VoiceMemoRecording(
+        path=recording.path,
+        recording_id=recording.recording_id,
+        title=recording.title,
+        filename=recording.filename,
+        extension=recording.extension,
+        content_type=recording.content_type,
+        size_bytes=recording.size_bytes,
+        content_sha256=recording.content_sha256,
+        file_created_at=recording.file_created_at,
+        file_modified_at=recording.file_modified_at,
+        recorded_at=recording.recorded_at,
+        duration_seconds=candidate.duration_seconds,
+        local_duration_seconds=candidate.local_duration_seconds,
+    )
+
+
+def load_cloud_recording_metadata(root: Path) -> dict[str, dict[str, float | None]]:
+    database_path = root / "CloudRecordings.db"
+    if not database_path.exists():
+        return {}
+    try:
+        connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return {}
+    try:
+        rows = connection.execute(
+            """
+            SELECT ZPATH, ZDURATION, ZLOCALDURATION
+            FROM ZCLOUDRECORDING
+            WHERE ZPATH IS NOT NULL
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        connection.close()
+    metadata: dict[str, dict[str, float | None]] = {}
+    for path, duration, local_duration in rows:
+        filename = str(path or "")
+        if not filename:
+            continue
+        metadata[filename] = {
+            "duration_seconds": _optional_float(duration),
+            "local_duration_seconds": _optional_float(local_duration),
+        }
+    return metadata
+
+
+def _optional_float(value) -> float | None:
+    if value is None:
+        return None
+    return float(value)
 
 
 def file_sha256(path: Path) -> str:

@@ -563,6 +563,9 @@ def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit
     assert "f.recorded_at >= parseDateTimeBestEffort('2026-03-03T00:00:00+00:00')" in queries[0]
     assert "LIMIT" not in queries[0]
     assert "FROM apple_voice_memos_enrichments" in queries[0]
+    assert "r.content_sha256" in queries[0]
+    assert "f.content_sha256 = r.content_sha256" in queries[0]
+    assert "e.content_sha256 = r.content_sha256" in queries[0]
     assert "AND prompt_version = 'test-prompt'\n              AND status = 'completed'" not in queries[0]
     assert "ifNull(a.error_attempts, 0) < 5" in queries[0]
 
@@ -697,7 +700,7 @@ def test_load_calendar_candidates_searches_utc_and_local_wall_clock_anchors() ->
 
 def test_enrichment_row_serializes_structured_result() -> None:
     row = enrichment_row(
-        recording={"account": "zach@example.com", "recording_id": "rec1"},
+        recording={"account": "zach@example.com", "recording_id": "rec1", "content_sha256": "audio-hash"},
         result={
             "calendar_event_id": "event1",
             "calendar_confidence": 0.8,
@@ -721,6 +724,7 @@ def test_enrichment_row_serializes_structured_result() -> None:
     )
 
     assert row["calendar_event_id"] == "event1"
+    assert row["content_sha256"] == "audio-hash"
     assert row["start_at"] == datetime(2026, 4, 27, 10, tzinfo=UTC)
     assert row["participants_json"] == '["a@example.com"]'
     assert row["transcript"] == "Speaker A: Hello"

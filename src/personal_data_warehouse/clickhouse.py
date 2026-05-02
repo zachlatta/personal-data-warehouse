@@ -187,6 +187,7 @@ VOICE_MEMO_FILE_COLUMNS = (
 VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS = (
     "account",
     "recording_id",
+    "content_sha256",
     "provider",
     "provider_transcript_id",
     "model",
@@ -235,6 +236,7 @@ VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS = (
 VOICE_MEMO_ENRICHMENT_COLUMNS = (
     "account",
     "recording_id",
+    "content_sha256",
     "provider",
     "model",
     "prompt_version",
@@ -782,6 +784,7 @@ class ClickHouseWarehouse:
             CREATE TABLE IF NOT EXISTS apple_voice_memos_transcription_runs (
                 account LowCardinality(String),
                 recording_id String,
+                content_sha256 String,
                 provider LowCardinality(String),
                 provider_transcript_id String,
                 model String,
@@ -798,6 +801,10 @@ class ClickHouseWarehouse:
             ORDER BY (account, recording_id, provider)
             """
         )
+        self._command(
+            "ALTER TABLE apple_voice_memos_transcription_runs ADD COLUMN IF NOT EXISTS content_sha256 String AFTER recording_id"
+        )
+        self._backfill_voice_memo_transcription_run_content_hashes()
         self._command(
             """
             CREATE TABLE IF NOT EXISTS apple_voice_memos_transcript_segments (
@@ -825,6 +832,7 @@ class ClickHouseWarehouse:
             CREATE TABLE IF NOT EXISTS apple_voice_memos_enrichments (
                 account LowCardinality(String),
                 recording_id String,
+                content_sha256 String,
                 provider LowCardinality(String),
                 model String,
                 prompt_version String,
@@ -849,6 +857,7 @@ class ClickHouseWarehouse:
             ORDER BY (account, recording_id, provider, model, prompt_version)
             """
         )
+        self._command("ALTER TABLE apple_voice_memos_enrichments ADD COLUMN IF NOT EXISTS content_sha256 String AFTER recording_id")
         self._command("ALTER TABLE apple_voice_memos_enrichments ADD COLUMN IF NOT EXISTS title String AFTER calendar_confidence")
         self._command("ALTER TABLE apple_voice_memos_enrichments ADD COLUMN IF NOT EXISTS start_at DateTime64(3, 'UTC') AFTER title")
         self._command("ALTER TABLE apple_voice_memos_enrichments ADD COLUMN IF NOT EXISTS end_at DateTime64(3, 'UTC') AFTER start_at")
@@ -879,6 +888,7 @@ class ClickHouseWarehouse:
         self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS corrected_transcript")
         self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS meeting_notes")
         self._command("ALTER TABLE apple_voice_memos_enrichments DROP COLUMN IF EXISTS topics_json")
+        self._backfill_voice_memo_enrichment_content_hashes()
         self.ensure_agent_tables()
         self._ensure_clean_calendar_transcript_views_if_possible()
 
@@ -1590,17 +1600,19 @@ class ClickHouseWarehouse:
             FROM apple_voice_memos_files AS f
             LEFT JOIN
             (
-                SELECT account, recording_id
+                SELECT account, recording_id, content_sha256, completed_at
                 FROM apple_voice_memos_transcription_runs
                 WHERE provider = {provider_sql}
                   AND (
                     status = 'completed'
                     OR (status = 'error' AND NOT ({_retryable_voice_memo_transcription_error_sql("error")}))
                   )
-                GROUP BY account, recording_id
             ) AS terminal
-            ON f.account = terminal.account AND f.recording_id = terminal.recording_id
+            ON f.account = terminal.account
+              AND f.recording_id = terminal.recording_id
+              AND terminal.content_sha256 = f.content_sha256
             WHERE terminal.recording_id = ''
+              AND f.size_bytes > 0
             ORDER BY f.recorded_at DESC
             LIMIT {int(limit)}
             """
@@ -1624,6 +1636,78 @@ class ClickHouseWarehouse:
 
     def load_untranscribed_voice_memo_files(self, *, provider: str, limit: int) -> list[dict[str, Any]]:
         return self.load_untranscribed_apple_voice_memos_files(provider=provider, limit=limit)
+
+    def _backfill_voice_memo_transcription_run_content_hashes(self) -> None:
+        self._command(
+            """
+            INSERT INTO apple_voice_memos_transcription_runs
+            SELECT
+                r.account,
+                r.recording_id,
+                f.file_content_sha256,
+                r.provider,
+                r.provider_transcript_id,
+                r.model,
+                r.status,
+                r.error,
+                r.transcript_text,
+                r.raw_result_json,
+                r.requested_at,
+                r.completed_at,
+                greatest(r.sync_version + 1, toUInt64(toUnixTimestamp64Micro(now64(6)))) AS sync_version
+            FROM apple_voice_memos_transcription_runs AS r FINAL
+            INNER JOIN
+            (
+                SELECT account, recording_id, argMax(content_sha256, sync_version) AS file_content_sha256
+                FROM apple_voice_memos_files
+                WHERE content_sha256 != ''
+                GROUP BY account, recording_id
+            ) AS f
+                ON r.account = f.account AND r.recording_id = f.recording_id
+            WHERE r.content_sha256 = ''
+              AND f.file_content_sha256 != ''
+            """
+        )
+
+    def _backfill_voice_memo_enrichment_content_hashes(self) -> None:
+        self._command(
+            """
+            INSERT INTO apple_voice_memos_enrichments
+            SELECT
+                e.account,
+                e.recording_id,
+                f.file_content_sha256,
+                e.provider,
+                e.model,
+                e.prompt_version,
+                e.status,
+                e.error,
+                e.calendar_event_id,
+                e.calendar_confidence,
+                e.title,
+                e.start_at,
+                e.end_at,
+                e.participants_json,
+                e.transcript,
+                e.summary,
+                e.action_items_json,
+                e.evidence_json,
+                e.raw_result_json,
+                e.created_at,
+                greatest(e.sync_version + 1, toUInt64(toUnixTimestamp64Micro(now64(6)))) AS sync_version
+            FROM apple_voice_memos_enrichments AS e FINAL
+            INNER JOIN
+            (
+                SELECT account, recording_id, argMax(content_sha256, sync_version) AS file_content_sha256
+                FROM apple_voice_memos_files
+                WHERE content_sha256 != ''
+                GROUP BY account, recording_id
+            ) AS f
+                ON e.account = f.account AND e.recording_id = f.recording_id
+            WHERE e.content_sha256 = ''
+              AND f.file_content_sha256 != ''
+            """
+        )
 
     def existing_message_ids(self, *, account: str, message_ids: list[str]) -> set[str]:
         if not message_ids:

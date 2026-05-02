@@ -315,6 +315,8 @@ def test_apple_voice_memos_untranscribed_query_orders_recent_recordings() -> Non
     assert "status = 'error'" in queries[0]
     assert "current account balance is negative" in queries[0]
     assert "upload failed, please try again" in queries[0]
+    assert "terminal.content_sha256 = f.content_sha256" in queries[0]
+    assert "AND f.size_bytes > 0" in queries[0]
     assert "ORDER BY f.recorded_at DESC" in queries[0]
     assert "LIMIT 3" in queries[0]
 
