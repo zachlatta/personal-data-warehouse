@@ -18,13 +18,17 @@ func TestLoadFromEnvRequiresClickHouseURLAndSecret(t *testing.T) {
 
 func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	env := map[string]string{
-		"CLICKHOUSE_URL":      "https://default:secret@example.com/default?secure=true",
-		"MCP_SECRET_TOKEN":    "0123456789abcdef0123456789abcdef",
-		"MCP_ADDR":            ":9090",
-		"MCP_BASE_URL":        "https://mcp.example.com/",
-		"MCP_MAX_ROWS":        "7",
-		"MCP_MAX_FIELD_CHARS": "12",
-		"MCP_QUERY_TIMEOUT":   "42s",
+		"CLICKHOUSE_URL":            "https://default:secret@example.com/default?secure=true",
+		"MCP_SECRET_TOKEN":          "0123456789abcdef0123456789abcdef",
+		"MCP_ADDR":                  ":9090",
+		"MCP_BASE_URL":              "https://mcp.example.com/",
+		"MCP_MAX_ROWS":              "7",
+		"MCP_MAX_FIELD_CHARS":       "12",
+		"MCP_QUERY_CACHE_MAX_BYTES": "1048576",
+		"MCP_GET_FIELD_MAX_CHARS":   "345",
+		"MCP_QUERY_CACHE_TTL":       "15m",
+		"MCP_DEBUG_CACHE_TOOL":      "true",
+		"MCP_QUERY_TIMEOUT":         "42s",
 	}
 
 	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
@@ -40,6 +44,9 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.MaxRows != 7 || cfg.MaxFieldChars != 12 {
 		t.Fatalf("limits = rows %d chars %d", cfg.MaxRows, cfg.MaxFieldChars)
+	}
+	if cfg.QueryCacheMaxBytes != 1048576 || cfg.GetFieldMaxChars != 345 || cfg.QueryCacheTTL != 15*time.Minute || !cfg.DebugCacheTool {
+		t.Fatalf("cache limits = bytes %d field chars %d ttl %s debug %v", cfg.QueryCacheMaxBytes, cfg.GetFieldMaxChars, cfg.QueryCacheTTL, cfg.DebugCacheTool)
 	}
 	if cfg.QueryTimeout != 42*time.Second {
 		t.Fatalf("QueryTimeout = %s", cfg.QueryTimeout)
