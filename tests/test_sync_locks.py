@@ -17,7 +17,7 @@ from personal_data_warehouse.defs.slack_sync import (
     slack_workspace_coverage_sync_every_seven_minutes,
     slack_workspace_metadata_sync_every_fifteen_minutes,
     slack_workspace_read_state_sync_every_five_minutes,
-    slack_workspace_sync_every_minute,
+    slack_workspace_sync_every_five_minutes,
     slack_workspace_thread_sync_every_five_minutes,
     slack_workspace_user_sync_hourly,
 )
@@ -34,9 +34,9 @@ def test_lock_env_prefix_normalizes_names() -> None:
     assert lock_env_prefix("slack-workspace") == "SLACK_WORKSPACE"
 
 
-def test_slack_sync_schedule_runs_every_minute_by_default() -> None:
-    assert slack_workspace_sync_every_minute.cron_schedule == "* * * * *"
-    assert slack_workspace_sync_every_minute.default_status.value == "RUNNING"
+def test_slack_sync_schedule_runs_every_five_minutes_by_default() -> None:
+    assert slack_workspace_sync_every_five_minutes.cron_schedule == "*/5 * * * *"
+    assert slack_workspace_sync_every_five_minutes.default_status.value == "RUNNING"
     assert slack_workspace_coverage_sync_every_seven_minutes.cron_schedule == "*/7 * * * *"
     assert slack_workspace_coverage_sync_every_seven_minutes.default_status.value == "RUNNING"
     assert slack_workspace_metadata_sync_every_fifteen_minutes.cron_schedule == "*/15 * * * *"

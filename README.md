@@ -144,7 +144,7 @@ The Docker image also includes Tesseract so fallback rows can append a short
 deterministic OCR section when it recovers text the vision model misses.
 
 Slack sync splits freshness, coverage, and metadata into separate schedules. The
-`slack_workspace_sync_every_minute` schedule keeps recent messages fresh every minute.
+`slack_workspace_sync_every_five_minutes` schedule keeps recent messages fresh every five minutes.
 `slack_workspace_coverage_sync_every_seven_minutes` backfills incomplete cached conversations
 with smaller batches, and `slack_workspace_metadata_sync_every_fifteen_minutes` refreshes one
 capped page of active conversation metadata at a time. `slack_workspace_user_sync_hourly`

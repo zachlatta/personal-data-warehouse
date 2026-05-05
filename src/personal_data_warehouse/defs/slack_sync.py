@@ -392,11 +392,11 @@ slack_workspace_read_state_sync_job = define_asset_job(
 
 
 @schedule(
-    cron_schedule="* * * * *",
+    cron_schedule="*/5 * * * *",
     job=slack_workspace_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def slack_workspace_sync_every_minute(context):
+def slack_workspace_sync_every_five_minutes(context):
     return skip_if_job_active(context, job_name="slack_workspace_sync_job")
 
 
@@ -465,7 +465,7 @@ def defs() -> Definitions:
             slack_workspace_read_state_sync_job,
         ],
         schedules=[
-            slack_workspace_sync_every_minute,
+            slack_workspace_sync_every_five_minutes,
             slack_workspace_coverage_sync_every_seven_minutes,
             slack_workspace_metadata_sync_every_fifteen_minutes,
             slack_workspace_user_sync_hourly,
