@@ -33,9 +33,15 @@ def test_gmail_schema_creates_clean_inbox_view() -> None:
     assert any("CREATE OR REPLACE VIEW clean_gmail_inbox" in command for command in commands)
     view_sql = next(command for command in commands if "CREATE OR REPLACE VIEW clean_gmail_inbox" in command)
     assert "thread_id AS thread_id" in view_sql
-    assert "latest_message_id AS message_id" in view_sql
     assert "latest_activity_at AS latest_at" in view_sql
-    assert "latest_from_address AS from_address" in view_sql
+    assert "latest_from_address AS latest_from_address" in view_sql
+    assert "latest_preview AS latest_preview" in view_sql
+    assert "toJSONString(thread_messages) AS thread_messages_json" in view_sql
+    assert "arraySort(" in view_sql
+    assert "message -> tupleElement(message, 1)" in view_sql
+    assert "groupArray(" in view_sql
+    assert "body_markdown_clean" in view_sql
+    assert " AS preview" not in view_sql
     assert "source_table" not in view_sql
     assert "drilldown_hint" not in view_sql
     assert all("CREATE OR REPLACE VIEW account_state_items" not in command for command in commands)

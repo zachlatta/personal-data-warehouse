@@ -517,7 +517,8 @@ The sync creates and maintains:
 
 The warehouse also creates clean views for current inbox and transcript state:
 
-- `clean_gmail_inbox`: Gmail inbox threads that currently appear in the account state layer
+- `clean_gmail_inbox`: Gmail inbox threads with latest-message summary fields and
+  `thread_messages_json` carrying full thread context oldest-to-newest
 - `clean_slack_inbox`: Slack DMs, mentions, participating threads, and channel unread items for
   the authenticated Slack user when read state is known
 - `clean_calendar_with_transcripts`: calendar events joined to matched Voice Memo transcript enrichments

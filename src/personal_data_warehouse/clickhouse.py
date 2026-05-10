@@ -2218,23 +2218,19 @@ class ClickHouseWarehouse:
             SELECT
                 account AS account,
                 thread_id AS thread_id,
-                latest_message_id AS message_id,
                 latest_activity_at AS latest_at,
-                latest_from_address AS from_address,
+                latest_from_address AS latest_from_address,
                 latest_subject AS subject,
-                latest_preview AS preview,
-                toUInt64(message_count) AS message_count,
+                latest_preview AS latest_preview,
+                multiIf(unread_count > 0, 'unread', important_count > 0, 'important', starred_count > 0, 'starred', 'inbox') AS state,
                 toUInt64(unread_count) AS unread_count,
                 toUInt64(important_count) AS important_count,
-                toUInt64(starred_count) AS starred_count,
-                multiIf(unread_count > 0, 'unread', important_count > 0, 'important', starred_count > 0, 'starred', 'inbox') AS state,
-                toUInt8(multiIf(unread_count > 0, 10, important_count > 0, 20, starred_count > 0, 30, 40)) AS priority
+                toJSONString(thread_messages) AS thread_messages_json
             FROM (
                 SELECT
                     account,
                     thread_id,
                     max(internal_date) AS latest_activity_at,
-                    argMax(message_id, internal_date) AS latest_message_id,
                     argMax(subject, internal_date) AS latest_subject,
                     argMax(from_address, internal_date) AS latest_from_address,
                     substring(
@@ -2249,10 +2245,24 @@ class ClickHouseWarehouse:
                         1,
                         1000
                     ) AS latest_preview,
-                    count() AS message_count,
                     countIf(has(label_ids, 'UNREAD')) AS unread_count,
                     countIf(has(label_ids, 'IMPORTANT')) AS important_count,
-                    countIf(has(label_ids, 'STARRED')) AS starred_count
+                    countIf(has(label_ids, 'STARRED')) AS starred_count,
+                    arraySort(
+                        message -> tupleElement(message, 1),
+                        groupArray(
+                            CAST(
+                                tuple(
+                                    internal_date,
+                                    from_address,
+                                    to_addresses,
+                                    cc_addresses,
+                                    body_markdown_clean
+                                ),
+                                'Tuple(internal_date DateTime64(3, ''UTC''), from_address String, to_addresses Array(String), cc_addresses Array(String), body_markdown_clean String)'
+                            )
+                        )
+                    ) AS thread_messages
                 FROM gmail_messages FINAL
                 WHERE is_deleted = 0
                   AND has(label_ids, 'INBOX')
