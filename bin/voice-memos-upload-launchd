@@ -1,0 +1,32 @@
+#!/bin/zsh
+set -u
+
+REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
+UV="/opt/homebrew/bin/uv"
+LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
+LOG_FILE="$LOG_DIR/voice-memos-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/voice-memos-upload.heartbeat"
+
+mkdir -p "$LOG_DIR"
+
+started_at_epoch="$(date +%s)"
+started_at_iso="$(date -Iseconds)"
+
+echo "[$started_at_iso] starting voice memos upload" >> "$LOG_FILE"
+
+if ! cd "$REPO_DIR"; then
+  exit_code=1
+  echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
+else
+  "$UV" run personal-data-warehouse-voice-memos-upload --mode incremental >> "$LOG_FILE" 2>&1
+  exit_code=$?
+fi
+
+finished_at_epoch="$(date +%s)"
+finished_at_iso="$(date -Iseconds)"
+duration_seconds="$((finished_at_epoch - started_at_epoch))"
+
+printf "%s\n" "$finished_at_iso" > "$HEARTBEAT_FILE"
+echo "[$finished_at_iso] finished voice memos upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
+
+exit "$exit_code"

@@ -244,7 +244,7 @@ Run the local Mac uploader:
 uv run personal-data-warehouse-apple-voice-memos-upload
 ```
 
-The uploader defaults to a lightweight incremental mode for cron. Incremental mode keeps local
+The uploader defaults to a lightweight incremental mode for scheduled background runs. Incremental mode keeps local
 state in `~/Library/Application Support/personal-data-warehouse/voice-memos-upload-state.json`;
 unchanged recordings that already uploaded both audio and metadata are skipped before hashing,
 network checks, OAuth refresh, or Drive API calls. Use full mode for periodic repair/backfill:
@@ -253,10 +253,47 @@ network checks, OAuth refresh, or Drive API calls. Use full mode for periodic re
 uv run personal-data-warehouse-apple-voice-memos-upload --mode full
 ```
 
-For a five-minute cron job:
+On Zach's MacBook Pro, the local uploader is managed by a per-user macOS LaunchAgent
+instead of cron. The checked-in plist template lives at
+`ops/launchd/com.zachlatta.personal-data-warehouse.voice-memos-upload.plist` and runs
+`bin/voice-memos-upload-launchd` every five minutes. The wrapper records each run, exit
+code, duration, and heartbeat under `~/Library/Logs/personal-data-warehouse/`.
 
-```cron
-*/5 * * * * cd /path/to/personal-data-warehouse && uv run personal-data-warehouse-apple-voice-memos-upload --mode incremental
+Install or refresh the LaunchAgent:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.voice-memos-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.voice-memos-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.voice-memos-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.voice-memos-upload
+```
+
+Run it immediately:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.voice-memos-upload
+```
+
+Monitor it:
+
+```bash
+bin/voice-memos-upload-status
+launchctl print gui/$(id -u)/com.zachlatta.personal-data-warehouse.voice-memos-upload
+tail -80 ~/Library/Logs/personal-data-warehouse/voice-memos-upload.run.log
+cat ~/Library/Logs/personal-data-warehouse/voice-memos-upload.heartbeat
+```
+
+If LaunchAgent runs fail with `PermissionError: [Errno 1] Operation not permitted` for
+`~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings`, macOS Full Disk Access
+is blocking the background process. Grant Full Disk Access in System Settings > Privacy & Security
+> Full Disk Access to the executable chain used by the job, especially `/bin/zsh`,
+`/opt/homebrew/bin/uv`, `/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`, and
+its current real path `/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`.
+After changing privacy permissions, rerun:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.voice-memos-upload
+bin/voice-memos-upload-status
 ```
 
 The Mac uploader skips expected network no-op cases with exit code `0`: no default route,

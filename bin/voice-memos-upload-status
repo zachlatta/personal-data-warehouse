@@ -1,0 +1,26 @@
+#!/bin/zsh
+set -u
+
+LABEL="com.zachlatta.personal-data-warehouse.voice-memos-upload"
+LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
+RUN_LOG="$LOG_DIR/voice-memos-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/voice-memos-upload.heartbeat"
+
+echo "LaunchAgent:"
+launchctl print "gui/$(id -u)/$LABEL" | sed -n '1,45p'
+
+echo
+echo "Heartbeat:"
+if [[ -f "$HEARTBEAT_FILE" ]]; then
+  cat "$HEARTBEAT_FILE"
+else
+  echo "missing"
+fi
+
+echo
+echo "Recent run log:"
+if [[ -f "$RUN_LOG" ]]; then
+  tail -40 "$RUN_LOG"
+else
+  echo "missing: $RUN_LOG"
+fi
