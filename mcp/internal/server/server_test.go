@@ -31,15 +31,23 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 		},
 		"SHOW TABLES": {
 			Columns: []string{"name"},
-			Rows:    []map[string]any{{"name": "gmail_messages"}},
+			Rows:    []map[string]any{{"name": "gmail_messages"}, {"name": "apple_voice_memos_enrichments"}},
 		},
 		"DESCRIBE TABLE `gmail_messages`": {
 			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
 			Rows:    []map[string]any{{"name": "subject", "type": "String"}},
 		},
+		"DESCRIBE TABLE `apple_voice_memos_enrichments`": {
+			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
+			Rows:    []map[string]any{{"name": "transcript", "type": "String"}, {"name": "summary", "type": "String"}},
+		},
 		"SELECT substring(toString(`subject`), 1, 15) AS `subject`, length(toString(`subject`)) AS `__pdw_preview_len_0` FROM `gmail_messages` LIMIT 3": {
 			Columns: []string{"subject", "__pdw_preview_len_0"},
 			Rows:    []map[string]any{{"subject": "hello", "__pdw_preview_len_0": 5}},
+		},
+		"SELECT substring(toString(`transcript`), 1, 15) AS `transcript`, length(toString(`transcript`)) AS `__pdw_preview_len_0`, substring(toString(`summary`), 1, 15) AS `summary`, length(toString(`summary`)) AS `__pdw_preview_len_1` FROM `apple_voice_memos_enrichments` LIMIT 3": {
+			Columns: []string{"transcript", "__pdw_preview_len_0", "summary", "__pdw_preview_len_1"},
+			Rows:    []map[string]any{{"transcript": "meeting words", "__pdw_preview_len_0": 13, "summary": "recap", "__pdw_preview_len_1": 5}},
 		},
 		"SELECT subject FROM gmail_messages LIMIT 1": {
 			Columns: []string{"subject"},
@@ -70,6 +78,17 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	found := map[string]bool{}
 	for _, tool := range tools.Tools {
 		found[tool.Name] = true
+		if tool.Name == "query" || tool.Name == "schema_overview" {
+			if !strings.Contains(tool.Description, "default.gmail_messages(subject)") {
+				t.Fatalf("%s description does not include schema for discovery: %q", tool.Name, tool.Description)
+			}
+			if !strings.Contains(tool.Description, "Apple Voice Memos audio metadata, transcripts") {
+				t.Fatalf("%s description does not include inferred transcript access: %q", tool.Name, tool.Description)
+			}
+			if !strings.Contains(tool.Description, "default.apple_voice_memos_enrichments(transcript, summary)") {
+				t.Fatalf("%s description does not include transcript schema for discovery: %q", tool.Name, tool.Description)
+			}
+		}
 		if tool.Name == "query" || tool.Name == "get_field" || tool.Name == "get_rows" || tool.Name == "grep_rows" {
 			if !strings.Contains(tool.Description, "Do NOT compute substring offsets in SQL") {
 				t.Fatalf("%s description does not steer away from substring SQL: %q", tool.Name, tool.Description)

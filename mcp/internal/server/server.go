@@ -48,7 +48,7 @@ type grepRowsInput struct {
 
 type debugCacheInput struct{}
 
-const serverInstructions = "Read-only ClickHouse warehouse for Zach's personal data. Contains synced Gmail mail and attachment text for configured mailboxes, Slack workspace messages/files/users, and calendar data when present. Use for questions about those datasets; query ClickHouse SQL only."
+const serverInstructions = "Read-only ClickHouse warehouse for Zach's personal data. Contains synced Gmail mail and attachment text for configured mailboxes, Slack workspace messages/files/users, calendar data, Apple Voice Memos, transcripts, and transcript enrichments when present. Use for questions about those datasets; query ClickHouse SQL only."
 
 const queryDescription = "Execute read-only ClickHouse SQL, cache the full result under query_id, and return a preview. Example: query({\"sql\":[\"SELECT id, transcript FROM voice_memo_transcripts WHERE id='abc'\"],\"preview_rows\":1,\"format\":\"csv\"}) returns query_id plus a truncated preview; then call get_field(query_id,row=0,column=\"transcript\",offset=0,length=200000) to read the full transcript. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: get_rows pages cached rows, grep_rows searches cached rows, schema_overview lists tables."
 
@@ -58,6 +58,10 @@ const getFieldDescription = "Return a raw character chunk from one cached cell, 
 
 const grepRowsDescription = "Regex-search cached query rows without re-executing SQL and return match context. Example: grep_rows({\"query_id\":\"abc123\",\"pattern\":\"weighted projects\",\"columns\":[\"transcript\"],\"limit\":20}) finds where that phrase appears across cached transcripts. Do NOT compute substring offsets in SQL. Use get_field to read the matching long field. Related tools: query creates query_id, get_rows pages rows."
 
+const schemaOverviewDescription = "List tables and columns in the default ClickHouse database with compact samples. Example: schema_overview({}) returns one text section per table. Do NOT compute substring offsets in SQL. Use query to create a query_id, then get_field for long fields. Related tools: query, get_rows, get_field, grep_rows."
+
+const schemaToolDescriptionMaxChars = 12000
+
 func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	logger := opts.Logger
 	if logger == nil {
@@ -65,6 +69,7 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	}
 	serverLogger := logger.With("component", "server")
 	svc := query.NewService(runner, opts)
+	schemaDescription := schemaDescriptionForTools(context.Background(), runner, serverLogger)
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "personal-data-warehouse",
 		Version: "0.1.0",
@@ -73,7 +78,7 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "query",
 		Title:       "Query ClickHouse",
-		Description: queryDescription,
+		Description: withSchemaDescription(queryDescription, schemaDescription),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input queryInput) (*mcp.CallToolResult, any, error) {
 		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "query", "statements", len(input.SQL))
 		resp := svc.Execute(ctx, input.SQL, input.PreviewRows, input.Format)
@@ -119,7 +124,7 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "schema_overview",
 		Title:       "Schema Overview",
-		Description: "List tables and columns in the default ClickHouse database with compact samples. Example: schema_overview({}) returns one text section per table. Do NOT compute substring offsets in SQL. Use query to create a query_id, then get_field for long fields. Related tools: query, get_rows, get_field, grep_rows.",
+		Description: withSchemaDescription(schemaOverviewDescription, schemaDescription),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input schemaOverviewInput) (*mcp.CallToolResult, any, error) {
 		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "schema_overview")
 		resp := svc.SchemaOverview(ctx)
@@ -140,6 +145,159 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 		}, nil, nil
 	})
 	return server
+}
+
+func schemaDescriptionForTools(ctx context.Context, runner query.Runner, logger *slog.Logger) string {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	database := "default"
+	if result, err := runner.Query(ctx, "SELECT currentDatabase() AS database", 1); err == nil {
+		if name := rawRowString(result, "database"); name != "" {
+			database = name
+		}
+	} else {
+		logger.WarnContext(ctx, "tool schema description database lookup failed", "error", err)
+	}
+
+	result, err := runner.Query(ctx, "SHOW TABLES", 0)
+	if err != nil {
+		logger.WarnContext(ctx, "tool schema description table listing failed", "error", err)
+		return ""
+	}
+	tables := rawTableNames(result)
+	entries := make([]string, 0, len(tables))
+	for _, table := range tables {
+		describeSQL := "DESCRIBE TABLE " + quoteClickHouseIdentifier(table)
+		result, err := runner.Query(ctx, describeSQL, 0)
+		if err != nil {
+			logger.WarnContext(ctx, "tool schema description table describe failed", "table", table, "error", err)
+			continue
+		}
+		columns := rawColumnNames(result)
+		if len(columns) == 0 {
+			continue
+		}
+		entries = append(entries, database+"."+table+"("+strings.Join(columns, ", ")+")")
+	}
+	if len(entries) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	if summary := schemaCapabilitySummary(entries); summary != "" {
+		out.WriteString("Available personal data warehouse access inferred from live schema: ")
+		out.WriteString(summary)
+		out.WriteString(".\n")
+	}
+	out.WriteString("Live warehouse schema for tool discovery:\n")
+	for _, entry := range entries {
+		out.WriteString("- ")
+		out.WriteString(entry)
+		out.WriteString("\n")
+	}
+	return truncateDescription(out.String(), schemaToolDescriptionMaxChars)
+}
+
+func rawTableNames(result query.RawResult) []string {
+	tables := make([]string, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		name := rawValueString(row["name"])
+		if name == "" && len(result.Columns) == 1 {
+			name = rawValueString(row[result.Columns[0]])
+		}
+		if name != "" {
+			tables = append(tables, name)
+		}
+	}
+	return tables
+}
+
+func rawColumnNames(result query.RawResult) []string {
+	columns := make([]string, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		if name := rawValueString(row["name"]); name != "" {
+			columns = append(columns, name)
+		}
+	}
+	return columns
+}
+
+func rawRowString(result query.RawResult, column string) string {
+	if len(result.Rows) == 0 {
+		return ""
+	}
+	value := rawValueString(result.Rows[0][column])
+	if value == "" && len(result.Columns) == 1 {
+		value = rawValueString(result.Rows[0][result.Columns[0]])
+	}
+	return value
+}
+
+func rawValueString(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		return ""
+	}
+}
+
+func quoteClickHouseIdentifier(identifier string) string {
+	return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
+}
+
+func schemaCapabilitySummary(entries []string) string {
+	capabilities := make([]string, 0, 5)
+	has := func(needles ...string) bool {
+		for _, entry := range entries {
+			lower := strings.ToLower(entry)
+			for _, needle := range needles {
+				if strings.Contains(lower, needle) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if has("gmail") {
+		capabilities = append(capabilities, "Gmail email, threads, inbox state, and attachment text")
+	}
+	if has("slack") {
+		capabilities = append(capabilities, "Slack messages, files, users, channels, DMs, mentions, and unread state")
+	}
+	if has("calendar") {
+		capabilities = append(capabilities, "Google Calendar events and calendar-linked meeting context")
+	}
+	if has("transcript", "voice_memos", "voice memo") {
+		capabilities = append(capabilities, "Apple Voice Memos audio metadata, transcripts, diarized segments, transcript enrichments, meeting notes, summaries, action items, and transcript/calendar matches")
+	}
+	if has("agent_run") {
+		capabilities = append(capabilities, "agent run audit logs, tool calls, and events")
+	}
+	return strings.Join(capabilities, "; ")
+}
+
+func withSchemaDescription(base, schema string) string {
+	if schema == "" {
+		return base
+	}
+	return base + "\n\n" + schema
+}
+
+func truncateDescription(description string, maxChars int) string {
+	if maxChars <= 0 || len(description) <= maxChars {
+		return description
+	}
+	cut := strings.LastIndex(description[:maxChars], "\n")
+	if cut <= 0 {
+		cut = maxChars
+	}
+	return strings.TrimRight(description[:cut], "\n") + "\n- ... schema truncated for MCP tool description size"
 }
 
 func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner) http.Handler {
