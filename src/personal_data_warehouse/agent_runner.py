@@ -206,10 +206,10 @@ class ContainerAgentRunner:
 
         self._sync_run_dir_from_volume(request.run_id, run_dir)
         final_output, final_error = load_agent_final_output(run_dir=run_dir, provider=provider, events=events)
+        if exit_code != 0 and not error:
+            error = agent_exit_error(exit_code=exit_code, events=events)
         if final_error and not error:
             error = final_error
-        if exit_code != 0 and not error:
-            error = f"agent container exited with code {exit_code}"
         status = "completed" if exit_code == 0 and not error else "error"
         return AgentRunResult(
             run_id=request.run_id,
@@ -545,6 +545,23 @@ def load_agent_final_output(
         if extracted:
             return load_json_mapping(strip_markdown_code_fence(extracted))
     return {}, "agent did not produce parseable final JSON"
+
+
+def agent_exit_error(*, exit_code: int, events: Sequence[AgentRunEvent]) -> str:
+    details = last_error_event_text(events)
+    if details:
+        return f"agent container exited with code {exit_code}: {details}"
+    return f"agent container exited with code {exit_code}"
+
+
+def last_error_event_text(events: Sequence[AgentRunEvent]) -> str:
+    for event in reversed(events):
+        text = event.text.strip()
+        if not text:
+            continue
+        if event.stream == "stderr" or "error" in event.event_type.lower() or "Error:" in text or "ERROR" in text:
+            return text[-1000:]
+    return ""
 
 
 def load_json_mapping(value: str) -> tuple[Mapping[str, Any], str]:

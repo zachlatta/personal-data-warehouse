@@ -251,6 +251,31 @@ def test_container_agent_runner_rejects_oversized_prompt_before_docker(tmp_path)
     assert calls == []
 
 
+def test_container_agent_runner_reports_nonzero_exit_stderr_before_json_parse_error(tmp_path) -> None:
+    volume_copy_calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal volume_copy_calls
+        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+            volume_copy_calls += 1
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout='{"type":"thread.started"}\n',
+            stderr="Error: turn/start failed: Input exceeds the maximum length of 1048576 characters.\n",
+        )
+
+    config = AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path)
+    request = AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1")
+
+    result = ContainerAgentRunner(config, runner=fake_run).run(request)
+
+    assert result.status == "error"
+    assert "agent container exited with code 1" in result.error
+    assert "Input exceeds the maximum length" in result.error
+
+
 def test_auth_command_uses_subscription_volume_without_api_keys() -> None:
     command = auth_docker_command(
         provider="codex",

@@ -33,6 +33,13 @@ DEFAULT_MAX_ROWS = 100
 DEFAULT_MAX_FIELD_CHARS = 4000
 SCHEMA_SAMPLE_ROWS = 3
 SCHEMA_SAMPLE_FIELD_CHARS = 15
+SCHEMA_SAMPLE_EXCLUDED_TABLES = frozenset(
+    {
+        "agent_run_events",
+        "agent_run_tool_calls",
+        "agent_runs",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -209,6 +216,11 @@ class ClickHouseReadOnlyService:
             sections: list[str] = []
             fields: list[FieldTruncation] = []
             for table in tables:
+                if table in SCHEMA_SAMPLE_EXCLUDED_TABLES:
+                    columns = self._describe_columns(table=table)
+                    if columns:
+                        sections.append(f"# {database}.{table}\n\n{rows_to_csv(['column'], [{'column': column} for column in columns])}")
+                    continue
                 sample = self._sample_table(database=database, table=table)
                 if sample.error:
                     return sample
@@ -227,6 +239,10 @@ class ClickHouseReadOnlyService:
         except Exception as exc:
             message = str(exc)
             return ReadOnlyQueryResult(sql=result_sql, csv=rows_to_csv(["error"], [{"error": message}]), error=message)
+
+    def _describe_columns(self, *, table: str) -> list[str]:
+        describe_sql = f"DESCRIBE TABLE {quote_clickhouse_identifier(table)}"
+        return described_column_names(self._runner.query(describe_sql, max_rows=0))
 
     def _sample_table(self, *, database: str, table: str) -> ReadOnlyQueryResult:
         table_identifier = quote_clickhouse_identifier(table)

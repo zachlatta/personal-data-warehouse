@@ -125,6 +125,37 @@ def test_readonly_service_schema_overview_samples_tables_like_mcp() -> None:
     assert result.truncated.fields[0].column == "summary"
 
 
+def test_readonly_service_schema_overview_does_not_sample_agent_telemetry_tables() -> None:
+    class FakeTelemetrySchemaRunner:
+        def __init__(self) -> None:
+            self.sql = []
+
+        def query(self, sql: str, *, max_rows: int) -> RawResult:
+            self.sql.append((sql, max_rows))
+            if sql == "SELECT currentDatabase() AS database":
+                return RawResult(columns=["database"], rows=[{"database": "pdw"}])
+            if sql == "SHOW TABLES":
+                return RawResult(columns=["name"], rows=[{"name": "agent_run_events"}])
+            if sql == "DESCRIBE TABLE `agent_run_events`":
+                return RawResult(
+                    columns=["name", "type"],
+                    rows=[{"name": "run_id", "type": "String"}, {"name": "text", "type": "String"}],
+                )
+            raise AssertionError(sql)
+
+    runner = FakeTelemetrySchemaRunner()
+
+    result = ClickHouseReadOnlyService(runner).schema_overview()
+
+    assert result.error == ""
+    assert result.csv == "# pdw.agent_run_events\n\ncolumn\nrun_id\ntext"
+    assert runner.sql == [
+        ("SELECT currentDatabase() AS database", 1),
+        ("SHOW TABLES", 0),
+        ("DESCRIBE TABLE `agent_run_events`", 0),
+    ]
+
+
 def test_rows_to_csv_matches_mcp_csv_conventions() -> None:
     csv = rows_to_csv(
         ["subject", "labels", "created_at"],

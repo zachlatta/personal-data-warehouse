@@ -286,12 +286,21 @@ def load_enrichment_candidates(
         LEFT JOIN
         (
             SELECT subject_id, count() AS error_attempts
-            FROM agent_runs
-            WHERE task_type = 'apple_voice_memo_enrichment'
-              AND provider = {_sql_string(agent_run_provider)}
-              AND model = {_sql_string(model)}
-              AND prompt_version = {_sql_string(prompt_version)}
-              AND status = 'error'
+            FROM
+            (
+                SELECT subject_id
+                FROM agent_runs
+                WHERE task_type = 'apple_voice_memo_enrichment'
+                  AND provider = {_sql_string(agent_run_provider)}
+                  AND model = {_sql_string(model)}
+                  AND status = 'error'
+                UNION ALL
+                SELECT recording_id AS subject_id
+                FROM apple_voice_memos_enrichments
+                WHERE provider = {_sql_string(provider)}
+                  AND model = {_sql_string(model)}
+                  AND status = 'error'
+            )
             GROUP BY subject_id
         ) AS a
             ON f.recording_id = a.subject_id
