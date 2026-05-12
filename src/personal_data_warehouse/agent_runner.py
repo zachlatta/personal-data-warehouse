@@ -25,6 +25,7 @@ DEFAULT_AGENT_RUNS_DIR = "/agent-runs"
 DEFAULT_AGENT_CONTAINER_AUTH_DIR = "/agent-auth"
 DEFAULT_AGENT_CONTAINER_RUNS_DIR = "/agent-runs"
 DEFAULT_AGENT_TOOLS_DIR_NAME = "tools"
+DEFAULT_AGENT_INPUTS_DIR_NAME = "inputs"
 DEFAULT_AGENT_TOOL_MANIFEST_NAME = "TOOLS.md"
 DEFAULT_AGENT_MEMORY = "4g"
 DEFAULT_AGENT_CPUS = "2"
@@ -75,6 +76,7 @@ class AgentRunRequest:
     provider: str | None = None
     model: str | None = None
     extra_env: Mapping[str, str] = field(default_factory=dict)
+    input_files: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def input_sha256(self) -> str:
@@ -87,6 +89,7 @@ class AgentRunRequest:
                 "prompt_version": self.prompt_version,
                 "provider": self.provider,
                 "model": self.model,
+                "input_files": self.input_files,
             },
             sort_keys=True,
             default=str,
@@ -104,6 +107,7 @@ class AgentRunRequest:
             provider=self.provider,
             model=self.model,
             extra_env={**dict(self.extra_env), **dict(env)},
+            input_files=self.input_files,
         )
 
 
@@ -139,6 +143,13 @@ def agent_prompt_size_error(prompt: str, max_prompt_chars: int) -> str:
     if max_prompt_chars <= 0 or len(prompt) <= max_prompt_chars:
         return ""
     return f"agent prompt exceeds maximum length of {max_prompt_chars} characters: {len(prompt)}"
+
+
+def safe_agent_input_path(inputs_dir: Path, relative_path: str) -> Path:
+    path = Path(relative_path)
+    if path.is_absolute() or ".." in path.parts or not str(path).strip():
+        raise ValueError(f"agent input file path must be relative and stay inside inputs dir: {relative_path!r}")
+    return inputs_dir / path
 
 
 class ContainerAgentRunner:
@@ -286,6 +297,13 @@ class ContainerAgentRunner:
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "prompt.txt").write_text(request.prompt, encoding="utf-8")
         (run_dir / "schema.json").write_text(json.dumps(request.schema, sort_keys=True), encoding="utf-8")
+        inputs_dir = run_dir / DEFAULT_AGENT_INPUTS_DIR_NAME
+        if request.input_files:
+            inputs_dir.mkdir(parents=True, exist_ok=True)
+            for relative_path, content in request.input_files.items():
+                input_path = safe_agent_input_path(inputs_dir, relative_path)
+                input_path.parent.mkdir(parents=True, exist_ok=True)
+                input_path.write_text(content, encoding="utf-8")
         (run_dir / "request.json").write_text(
             json.dumps(
                 {
@@ -294,6 +312,7 @@ class ContainerAgentRunner:
                     "subject_id": request.subject_id,
                     "prompt_version": request.prompt_version,
                     "input_sha256": request.input_sha256,
+                    "input_files": sorted(request.input_files),
                 },
                 sort_keys=True,
             ),
@@ -324,6 +343,8 @@ class ContainerAgentRunner:
             f"AGENT_TOOLS_DIR={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}",
             "--env",
             f"AGENT_TOOL_MANIFEST_PATH={container_run_dir}/{DEFAULT_AGENT_TOOL_MANIFEST_NAME}",
+            "--env",
+            f"AGENT_INPUT_DIR={container_run_dir}/{DEFAULT_AGENT_INPUTS_DIR_NAME}",
             "--env",
             f"PDW_TOOL_HELP={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-tool-help",
             "--env",

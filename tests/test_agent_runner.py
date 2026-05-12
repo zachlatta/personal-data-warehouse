@@ -159,6 +159,55 @@ def test_container_agent_runner_can_inject_clickhouse_proxy_without_raw_url(tmp_
     assert "CLICKHOUSE_URL" not in joined
 
 
+def test_container_agent_runner_writes_input_files_and_exports_input_dir(tmp_path) -> None:
+    agent_command = []
+    volume_copy_calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal agent_command, volume_copy_calls
+        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+            volume_copy_calls += 1
+            if volume_copy_calls == 2:
+                (tmp_path / "run-1" / "final.json").write_text('{"ok":true}', encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        agent_command = command
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    config = AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path)
+    request = AgentRunRequest(
+        prompt="Read input file",
+        schema={"type": "object"},
+        run_id="run-1",
+        input_files={"payload/task.json": '{"big":"payload"}'},
+    )
+
+    result = ContainerAgentRunner(config, runner=fake_run).run(request)
+
+    assert result.status == "completed"
+    assert (tmp_path / "run-1" / "inputs" / "payload" / "task.json").read_text(encoding="utf-8") == '{"big":"payload"}'
+    assert "AGENT_INPUT_DIR=/agent-runs/run-1/inputs" in agent_command
+    assert json.loads((tmp_path / "run-1" / "request.json").read_text(encoding="utf-8"))["input_files"] == [
+        "payload/task.json"
+    ]
+
+
+def test_container_agent_runner_rejects_unsafe_input_file_paths(tmp_path) -> None:
+    config = AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path)
+    request = AgentRunRequest(
+        prompt="Read input file",
+        schema={"type": "object"},
+        run_id="run-1",
+        input_files={"../outside.json": "{}"},
+    )
+
+    try:
+        ContainerAgentRunner(config, runner=lambda command, **kwargs: None).run(request)
+    except ValueError as exc:
+        assert "agent input file path must be relative" in str(exc)
+    else:
+        raise AssertionError("expected unsafe input path to fail")
+
+
 def test_volume_copy_command_copies_run_files_without_socket(tmp_path) -> None:
     command = volume_copy_command(
         volume="pdw-agent-runs",

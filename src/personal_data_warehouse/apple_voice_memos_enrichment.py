@@ -29,6 +29,7 @@ LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS = 12_000
 PROMPT_TRANSCRIPT_WITH_SEGMENTS_MAX_CHARS = 8_000
 PROMPT_TRANSCRIPT_WITHOUT_SEGMENTS_MAX_CHARS = 60_000
 PROMPT_GMAIL_MENTIONS_PER_IDENTITY_HINT = 3
+AGENT_USER_PROMPT_INPUT_FILE = "user_prompt.json"
 
 
 @dataclass(frozen=True)
@@ -89,12 +90,13 @@ class ContainerAgentStructuredClient:
     ) -> Mapping[str, Any]:
         prompt = container_agent_prompt(
             system_prompt=system_prompt,
-            user_prompt=user_prompt,
+            user_prompt=user_prompt_file_prompt(AGENT_USER_PROMPT_INPUT_FILE),
             schema=schema,
             tools=tools,
             min_tool_calls=min_tool_calls,
             max_tool_calls=max_tool_calls,
             require_tool_call=require_tool_call,
+            user_prompt_file=AGENT_USER_PROMPT_INPUT_FILE,
         )
         request = AgentRunRequest(
             prompt=prompt,
@@ -104,6 +106,7 @@ class ContainerAgentStructuredClient:
             prompt_version=prompt_version,
             provider=self._provider,
             model=self._model,
+            input_files={AGENT_USER_PROMPT_INPUT_FILE: user_prompt},
         )
         if self._warehouse is not None:
             result = self._agent.run_with_clickhouse(request, warehouse=self._warehouse)
@@ -1017,33 +1020,49 @@ def container_agent_prompt(
     min_tool_calls: int,
     max_tool_calls: int,
     require_tool_call: bool,
+    user_prompt_file: str = "",
 ) -> str:
-    return json.dumps(
-        {
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-            "final_output_contract": {
-                "format": "Return one JSON object and no prose.",
-                "schema": schema,
-            },
-            "agent_runtime_notes": [
-                "You are running as a one-off CLI agent inside an isolated Docker container.",
-                "The final answer must be valid JSON matching final_output_contract.schema.",
-                "Use Bash freely for local scratch scripts and deterministic CLI helpers in the run workspace.",
-                "Run \"$PDW_TOOL_HELP\" to see the local CLI tools available in this run.",
-                "Use \"$PDW_CLICKHOUSE_SCHEMA\" and \"$PDW_CLICKHOUSE_QUERY\" for read-only warehouse research. These call a short-lived proxy; the raw ClickHouse URL is not available in the container.",
-                "Before final output, you may write candidate JSON to a file and run \"$PDW_VALIDATE_JSON\" candidate.json \"$AGENT_SCHEMA_PATH\".",
-                "These local CLI tools are the only supported tool interface inside the agent container.",
-            ],
-            "tool_expectations": {
-                "tool_names": [str(tool.get("name", "")) for tool in tools if isinstance(tool, Mapping)],
-                "min_tool_calls": min_tool_calls,
-                "max_tool_calls": max_tool_calls,
-                "require_tool_call": require_tool_call,
-            },
+    payload: dict[str, Any] = {
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "final_output_contract": {
+            "format": "Return one JSON object and no prose.",
+            "schema": schema,
         },
-        sort_keys=True,
-        default=str,
+        "agent_runtime_notes": [
+            "You are running as a one-off CLI agent inside an isolated Docker container.",
+            "The final answer must be valid JSON matching final_output_contract.schema.",
+            "Use Bash freely for local scratch scripts and deterministic CLI helpers in the run workspace.",
+            "Run \"$PDW_TOOL_HELP\" to see the local CLI tools available in this run.",
+            "Use \"$AGENT_INPUT_DIR\" to read large task input files that were intentionally not embedded in this prompt.",
+            "Use \"$PDW_CLICKHOUSE_SCHEMA\" and \"$PDW_CLICKHOUSE_QUERY\" for read-only warehouse research. These call a short-lived proxy; the raw ClickHouse URL is not available in the container.",
+            "Before final output, you may write candidate JSON to a file and run \"$PDW_VALIDATE_JSON\" candidate.json \"$AGENT_SCHEMA_PATH\".",
+            "These local CLI tools are the only supported tool interface inside the agent container.",
+        ],
+        "tool_expectations": {
+            "tool_names": [str(tool.get("name", "")) for tool in tools if isinstance(tool, Mapping)],
+            "min_tool_calls": min_tool_calls,
+            "max_tool_calls": max_tool_calls,
+            "require_tool_call": require_tool_call,
+        },
+    }
+    if user_prompt_file:
+        payload["user_prompt_file"] = {
+            "path": f"$AGENT_INPUT_DIR/{user_prompt_file}",
+            "read_first": f"cat \"$AGENT_INPUT_DIR/{user_prompt_file}\"",
+            "format": "JSON",
+            "instructions": [
+                "Read this file before doing warehouse research or producing final JSON.",
+                "Treat the file contents as the full user_prompt/task input.",
+            ],
+        }
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def user_prompt_file_prompt(file_name: str) -> str:
+    return (
+        f"The full task input JSON is stored in $AGENT_INPUT_DIR/{file_name}. "
+        f"Run `cat \"$AGENT_INPUT_DIR/{file_name}\"` and use that JSON as the user_prompt."
     )
 
 

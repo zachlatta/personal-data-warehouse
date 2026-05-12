@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from personal_data_warehouse.apple_voice_memos_enrichment import (
+    AGENT_USER_PROMPT_INPUT_FILE,
     AGENT_ENRICHMENT_PROMPT_VERSION,
+    ContainerAgentStructuredClient,
     LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
     apply_segment_preserving_transcript_fallback,
     ensure_recording_level_fields,
@@ -20,6 +22,7 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
     recording_time_interpretations,
     validate_enrichment_result,
 )
+from personal_data_warehouse.agent_runner import AgentRunResult
 
 
 class FakeIdentityWarehouse:
@@ -29,6 +32,50 @@ class FakeIdentityWarehouse:
         if "FROM gmail_messages" in sql:
             return [("system@example.com", "Guest Person accepted their invite", "Guest Person joined")]
         return []
+
+
+def test_container_agent_structured_client_stores_user_prompt_as_input_file() -> None:
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.request = None
+
+        def run(self, request):
+            self.request = request
+            now = datetime(2026, 4, 27, tzinfo=UTC)
+            return AgentRunResult(
+                run_id=request.run_id,
+                provider=request.provider or "codex",
+                model=request.model or "gpt-test",
+                task_type=request.task_type,
+                subject_id=request.subject_id,
+                prompt_version=request.prompt_version,
+                input_sha256=request.input_sha256,
+                status="completed",
+                final_output_json={"ok": True},
+                error="",
+                exit_code=0,
+                started_at=now,
+                completed_at=now,
+                events=[],
+            )
+
+    agent = FakeAgent()
+    large_user_prompt = '{"transcript":"' + ("hello " * 10_000) + '"}'
+
+    result = ContainerAgentStructuredClient(agent=agent, provider="codex", model="gpt-test").create_agentic_structured(
+        system_prompt="system",
+        user_prompt=large_user_prompt,
+        schema={"type": "object"},
+        tools=[],
+        tool_executor=lambda _name, _arguments: {},
+        min_tool_calls=0,
+    )
+
+    assert result == {"ok": True}
+    assert agent.request is not None
+    assert agent.request.input_files == {AGENT_USER_PROMPT_INPUT_FILE: large_user_prompt}
+    assert large_user_prompt not in agent.request.prompt
+    assert f"$AGENT_INPUT_DIR/{AGENT_USER_PROMPT_INPUT_FILE}" in agent.request.prompt
 
 
 def test_validate_enrichment_result_flags_compression_short_prefixes_and_opening_loss() -> None:
