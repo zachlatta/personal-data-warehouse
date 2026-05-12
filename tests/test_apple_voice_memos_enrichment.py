@@ -11,6 +11,7 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
     ensure_recording_level_fields,
     enrichment_row,
     enrichment_schema,
+    enrichment_task_input,
     enrichment_user_prompt,
     load_enrichment_candidates,
     load_calendar_candidates,
@@ -34,7 +35,7 @@ class FakeIdentityWarehouse:
         return []
 
 
-def test_container_agent_structured_client_stores_user_prompt_as_input_file() -> None:
+def test_container_agent_structured_client_keeps_prompt_and_stores_extra_input_files() -> None:
     class FakeAgent:
         def __init__(self) -> None:
             self.request = None
@@ -60,21 +61,24 @@ def test_container_agent_structured_client_stores_user_prompt_as_input_file() ->
             )
 
     agent = FakeAgent()
-    large_user_prompt = '{"transcript":"' + ("hello " * 10_000) + '"}'
+    user_prompt = "Read the extra input file and return JSON."
+    large_input = '{"transcript":"' + ("hello " * 10_000) + '"}'
 
     result = ContainerAgentStructuredClient(agent=agent, provider="codex", model="gpt-test").create_agentic_structured(
         system_prompt="system",
-        user_prompt=large_user_prompt,
+        user_prompt=user_prompt,
         schema={"type": "object"},
         tools=[],
         tool_executor=lambda _name, _arguments: {},
         min_tool_calls=0,
+        input_files={AGENT_USER_PROMPT_INPUT_FILE: large_input},
     )
 
     assert result == {"ok": True}
     assert agent.request is not None
-    assert agent.request.input_files == {AGENT_USER_PROMPT_INPUT_FILE: large_user_prompt}
-    assert large_user_prompt not in agent.request.prompt
+    assert agent.request.input_files == {AGENT_USER_PROMPT_INPUT_FILE: large_input}
+    assert user_prompt in agent.request.prompt
+    assert large_input not in agent.request.prompt
     assert f"$AGENT_INPUT_DIR/{AGENT_USER_PROMPT_INPUT_FILE}" in agent.request.prompt
 
 
@@ -498,26 +502,14 @@ def test_enrichment_schema_uses_simplified_output_fields() -> None:
     assert "participants" in schema["required"]
 
 
-def test_enrichment_user_prompt_includes_diarized_segments_and_speaker_rules() -> None:
+def test_enrichment_user_prompt_includes_task_rules_and_input_file_reference() -> None:
     prompt = enrichment_user_prompt(
-        recording={"recording_id": "rec1", "recorded_at": datetime(2026, 4, 27, tzinfo=UTC), "title": "Title"},
-        calendar_candidates=[],
-        transcript_segments=[
-            {
-                "segment_index": 0,
-                "speaker_label": "A",
-                "start_ms": 0,
-                "end_ms": 1000,
-                "confidence": 0.9,
-                "text": "Hello",
-            }
-        ],
+        input_file=AGENT_USER_PROMPT_INPUT_FILE,
     )
 
-    assert '"speaker_label": "A"' in prompt
+    assert f"$AGENT_INPUT_DIR/{AGENT_USER_PROMPT_INPUT_FILE}" in prompt
     assert "source of truth for speaker turns" in prompt
     assert "Do not invent generic speaker labels" in prompt
-    assert "recorded_at_interpretations" in prompt
     assert "Transcript attribution is turn-level" in prompt
     assert "below 0.9 confidence" in prompt
     assert "Hard requirements: accurate date/time" in prompt
@@ -535,10 +527,33 @@ def test_enrichment_user_prompt_includes_diarized_segments_and_speaker_rules() -
     assert "Stardance not Start Dance" in prompt
     assert "Personal journal entries or ad-hoc voice notes are valid outputs" in prompt
     assert LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL in prompt
+    assert '"speaker_label": "A"' not in prompt
 
 
-def test_enrichment_user_prompt_omits_raw_provider_payload_fields() -> None:
-    prompt = enrichment_user_prompt(
+def test_enrichment_task_input_includes_diarized_segments_and_recording_context() -> None:
+    task_input = enrichment_task_input(
+        recording={"recording_id": "rec1", "recorded_at": datetime(2026, 4, 27, tzinfo=UTC), "title": "Title"},
+        calendar_candidates=[],
+        transcript_segments=[
+            {
+                "segment_index": 0,
+                "speaker_label": "A",
+                "start_ms": 0,
+                "end_ms": 1000,
+                "confidence": 0.9,
+                "text": "Hello",
+            }
+        ],
+    )
+
+    assert '"speaker_label": "A"' in task_input
+    assert "recorded_at_interpretations" in task_input
+    assert "diarized_segments" in task_input
+    assert "source of truth for speaker turns" not in task_input
+
+
+def test_enrichment_task_input_omits_raw_provider_payload_fields() -> None:
+    task_input = enrichment_task_input(
         recording={
             "recording_id": "rec1",
             "recorded_at": datetime(2026, 4, 27, tzinfo=UTC),
@@ -583,11 +598,11 @@ def test_enrichment_user_prompt_omits_raw_provider_payload_fields() -> None:
         ],
     )
 
-    assert "LEAK_" not in prompt
-    assert "words_json" not in prompt
-    assert "raw_result_json" not in prompt
-    assert "subject 0" in prompt
-    assert "subject 3" not in prompt
+    assert "LEAK_" not in task_input
+    assert "words_json" not in task_input
+    assert "raw_result_json" not in task_input
+    assert "subject 0" in task_input
+    assert "subject 3" not in task_input
 
 
 def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit() -> None:

@@ -84,19 +84,20 @@ class ContainerAgentStructuredClient:
         require_tool_call: bool = False,
         result_validator: Callable[[Mapping[str, Any]], Sequence[str]] | None = None,
         max_validation_retries: int = 2,
+        input_files: Mapping[str, str] | None = None,
         logger=None,
         recording_id: str = "",
         prompt_version: str = "",
     ) -> Mapping[str, Any]:
         prompt = container_agent_prompt(
             system_prompt=system_prompt,
-            user_prompt=user_prompt_file_prompt(AGENT_USER_PROMPT_INPUT_FILE),
+            user_prompt=user_prompt,
             schema=schema,
             tools=tools,
             min_tool_calls=min_tool_calls,
             max_tool_calls=max_tool_calls,
             require_tool_call=require_tool_call,
-            user_prompt_file=AGENT_USER_PROMPT_INPUT_FILE,
+            input_files=input_files,
         )
         request = AgentRunRequest(
             prompt=prompt,
@@ -106,7 +107,7 @@ class ContainerAgentStructuredClient:
             prompt_version=prompt_version,
             provider=self._provider,
             model=self._model,
-            input_files={AGENT_USER_PROMPT_INPUT_FILE: user_prompt},
+            input_files=dict(input_files or {}),
         )
         if self._warehouse is not None:
             result = self._agent.run_with_clickhouse(request, warehouse=self._warehouse)
@@ -190,6 +191,9 @@ class VoiceMemosEnrichmentRunner:
                 calendar_candidates = load_calendar_candidates(self._warehouse, recording)
                 transcript_segments = load_transcript_segments(self._warehouse, recording)
                 prompt = enrichment_user_prompt(
+                    input_file=AGENT_USER_PROMPT_INPUT_FILE,
+                )
+                task_input = enrichment_task_input(
                     recording=recording,
                     calendar_candidates=calendar_candidates,
                     transcript_segments=transcript_segments,
@@ -207,6 +211,7 @@ class VoiceMemosEnrichmentRunner:
                         transcript_segments=transcript_segments,
                         result=result,
                     ),
+                    input_files={AGENT_USER_PROMPT_INPUT_FILE: task_input},
                     logger=self._logger,
                     recording_id=recording_id,
                     prompt_version=self._prompt_version,
@@ -1020,8 +1025,9 @@ def container_agent_prompt(
     min_tool_calls: int,
     max_tool_calls: int,
     require_tool_call: bool,
-    user_prompt_file: str = "",
+    input_files: Mapping[str, str] | None = None,
 ) -> str:
+    input_files = input_files or {}
     payload: dict[str, Any] = {
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
@@ -1046,24 +1052,15 @@ def container_agent_prompt(
             "require_tool_call": require_tool_call,
         },
     }
-    if user_prompt_file:
-        payload["user_prompt_file"] = {
-            "path": f"$AGENT_INPUT_DIR/{user_prompt_file}",
-            "read_first": f"cat \"$AGENT_INPUT_DIR/{user_prompt_file}\"",
-            "format": "JSON",
-            "instructions": [
-                "Read this file before doing warehouse research or producing final JSON.",
-                "Treat the file contents as the full user_prompt/task input.",
-            ],
+    if input_files:
+        payload["input_files"] = {
+            name: {
+                "path": f"$AGENT_INPUT_DIR/{name}",
+                "read": f"cat \"$AGENT_INPUT_DIR/{name}\"",
+            }
+            for name in sorted(input_files)
         }
     return json.dumps(payload, sort_keys=True, default=str)
-
-
-def user_prompt_file_prompt(file_name: str) -> str:
-    return (
-        f"The full task input JSON is stored in $AGENT_INPUT_DIR/{file_name}. "
-        f"Run `cat \"$AGENT_INPUT_DIR/{file_name}\"` and use that JSON as the user_prompt."
-    )
 
 
 def count_clickhouse_cli_calls(events: Sequence[Any]) -> int:
@@ -1077,7 +1074,45 @@ def count_clickhouse_cli_calls(events: Sequence[Any]) -> int:
     return count
 
 
-def enrichment_user_prompt(
+def enrichment_user_prompt(*, input_file: str = AGENT_USER_PROMPT_INPUT_FILE) -> str:
+    return json.dumps(
+        {
+            "task": "Enrich one personal Voice Memo transcript.",
+            "input_data": {
+                "path": f"$AGENT_INPUT_DIR/{input_file}",
+                "read_first": f"cat \"$AGENT_INPUT_DIR/{input_file}\"",
+                "format": "JSON",
+                "contents": [
+                    "recording metadata and transcript length fields",
+                    "recorded_at_interpretations",
+                    "calendar_candidates with compact attendee identity hints",
+                    "truncated source transcript",
+                    "diarized_segments",
+                ],
+            },
+            "instructions": enrichment_instructions(),
+            "local_transcript_assembly": {
+                "sentinel": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+                "use_when_transcript_char_count_at_least": LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS,
+                "explanation": "For long recordings, return the sentinel as transcript. The pipeline assembles the full detailed transcript locally from diarized_segments after metadata, identity, and term research are complete.",
+            },
+            "clickhouse_context": {
+                "result_format": "Tool results are CSV with truncation metadata.",
+                "query_notes": [
+                    "Use \"$PDW_CLICKHOUSE_SCHEMA\" output to identify table names, column names, and whether fields are scalar or arrays before writing SQL.",
+                    "For array columns, use array functions such as arrayExists instead of scalar string functions.",
+                    "Compare DateTime columns with toDateTime64('YYYY-MM-DD HH:MM:SS', 3, 'UTC') or a range; do not compare DateTime columns to ISO strings with timezone suffixes.",
+                    "Do not add FORMAT clauses; the tool already returns CSV.",
+                    "Prefer small LIMITs and focused SELECT columns.",
+                ],
+            },
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+def enrichment_task_input(
     *,
     recording: Mapping[str, Any],
     calendar_candidates: Sequence[Mapping[str, Any]],
@@ -1103,74 +1138,62 @@ def enrichment_user_prompt(
                 "transcript_in_prompt_char_count": len(transcript),
                 "transcript_truncated": len(source_transcript) > len(transcript),
             },
-            "local_transcript_assembly": {
-                "sentinel": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
-                "use_when_transcript_char_count_at_least": LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS,
-                "explanation": "For long recordings, return the sentinel as transcript. The pipeline assembles the full detailed transcript locally from diarized_segments after metadata, identity, and term research are complete.",
-            },
             "recorded_at_interpretations": recording_time_interpretations(recording.get("recorded_at"))
             if isinstance(recording.get("recorded_at"), datetime)
             else [],
             "calendar_candidates": [prompt_calendar_candidate(candidate) for candidate in calendar_candidates],
             "transcript": transcript,
             "diarized_segments": sanitized_segments,
-            "instructions": [
-                "Before final output, run \"$PDW_CLICKHOUSE_SCHEMA\" first, then use multiple focused \"$PDW_CLICKHOUSE_QUERY\" calls to search calendar, email, Slack, and related warehouse context.",
-                "Make separate warehouse checks for: the selected calendar event including attendee data, participant/person identity evidence, and suspicious domain terms or organizations that need spelling verification.",
-                "Hard requirements: accurate date/time, accurate participant/name spellings, and accurate domain terms in transcript.",
-                "participants means actual people who speak or are strongly evidenced as present. Do not include calendar invitees merely because they were invited, especially if responseStatus is needsAction and there is no transcript evidence they attended.",
-                "If you select a calendar event, start_at and end_at must come from that calendar event or verified ClickHouse context.",
-                "Do not leave participants as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, use \"$PDW_CLICKHOUSE_SCHEMA\" results to query Slack/email identity data before finalizing participants or speaker_map.",
-                "Do not stop at a one-token name like a Slack display_name or calendar first name. Search Gmail/calendar/Slack context around the event title, email local part, usernames, candidate briefs, and prior messages until you find a full preferred/legal name or have clear evidence none is available.",
-                "When a speaker is identified only by a first name, use calendar attendee emails plus Slack/email identity evidence to resolve the full name.",
-                "Calendar candidates may include identity_hints for attendee emails. Use possible_names from identity_hints for attendee and speaker names when supported by transcript evidence.",
-                "Normalize spoken name mentions in transcript to verified participant spellings when ASR produces a close variant, especially in greetings and introductions.",
-                "If the transcript says a person or organization name differently than the calendar candidate, query for that spoken name/project before deciding.",
-                "For technical/product terms that are unclear or unfamiliar, query Slack/Gmail for likely spelling variants and use the spelling supported by warehouse evidence.",
-                "Correct ASR domain-term errors in transcript, for example Hack Club not Hat Club, Hackatime not Hackertime/Hacker Time, Stardance not Start Dance, OpenRouter, OpenAI, Anthropic, Congressional App Challenge, Challenger, Framework, Spindrift, and Pellegrino.",
-                "The source timestamp may be a local wall-clock time incorrectly tagged as UTC. Use recorded_at_interpretations and transcript evidence when matching calendar events.",
-                "Direct spoken names, greetings, introductions, and project names are strong evidence. If they conflict with a nearby calendar candidate, query for the spoken name/project before selecting the candidate.",
-                "Pick the best calendar event if supported by transcript/time/context evidence.",
-                "If no calendar event matches, set calendar_event_id to an empty string and calendar_confidence to 0, but still produce a useful title, start_at, end_at, summary, action_items, evidence, and transcript. Personal journal entries or ad-hoc voice notes are valid outputs.",
-                "For no-calendar recordings, derive start_at from the recording timestamp and estimate end_at from diarized segment duration when available.",
-                "speaker_map must summarize each original diarized_segments speaker_label as a real person only when that label is stable; otherwise map it to an unresolved mixed label. Do not invent generic speaker labels that are not present in diarized_segments.",
-                "If a speaker label might be one of several interviewers, do not write a candidate list as the speaker_name. Use a clearly mixed/unresolved label and put the candidate names in evidence unless you can verify a single person.",
-                "Assign real speaker names only when directly supported by greetings, self-introductions, calendar attendees, Slack/email identity evidence, or strongly identifying transcript context. Use low confidence and an unresolved label when uncertain.",
-                "Audit every diarized speaker_label across all its turns before assigning a real person. If one label contains turns from multiple apparent people, contradictory greetings, or identity-bearing turns with very low confidence, mark that label as mixed/unresolved instead of assigning a real name.",
-                "In greetings, 'Hey NAME' or 'How are you, NAME?' usually means NAME is the addressee, not the speaker. Do not swap addressee and speaker when correcting transcript prefixes.",
-                "Do not infer a diarized label's identity from a single low-confidence short greeting or interjection. Prefer the label's longer, high-confidence turns and conversational consistency.",
-                "If a speaker label says lines that only the addressee could say, such as 'How are you, PERSON?' under PERSON's prefix, your mapping is wrong. Re-evaluate the speaker_map or mark the label mixed/unresolved.",
-                "For opening small talk, reason as a dialogue chain: greeting to addressee, addressee response, return question, original speaker response. Use that chain to validate speaker labels before final output.",
-                "Opening greetings are often split across diarization labels. If a low-confidence initial 'Hey NAME' is followed by another label saying 'hey/how are you' and a third label replies 'I'm doing great. How are you, PERSON?', attribute the greeting fragments to PERSON when that matches the later stable speaker, not to a different participant who only appears later.",
-                "Before final output, scan transcript for self-address contradictions. A line prefixed by PERSON must not contain 'How are you, PERSON?' or similar direct address to the same person. In an opening chain, 'I'm doing great. How are you, PERSON?' is spoken by the person who was just greeted, and the next 'I'm good' is PERSON's reply.",
-                "In opening greetings, the same speaker should not ask 'how are you?' and then immediately answer 'I'm doing great'. If diarization splits 'Hey NAME, how are you?' into two short segments, merge or attribute those short greeting fragments to the greeter.",
-                "If the first few short greeting segments conflict with later stable diarization, prefer a coherent dialogue chain over the raw short-segment labels. It is better to merge or reattribute short opening greetings than to create a transcript where someone asks how they themselves are.",
-                "Use diarized_segments as the source of truth for speaker turns. Preserve chronological turn order in transcript.",
-                f"If transcript_char_count is at least {LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS}, set transcript exactly to {LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL}. Do not emit the full transcript in your JSON for long recordings; focus on calendar matching, participant identities, speaker_map, domain-term evidence, summary, and action items.",
-                "When you are not using the local transcript assembly sentinel, every substantive diarized segment should be represented in transcript. Do not compress it into a summary.",
-                "Format transcript as speaker turns, one turn per line or paragraph. Never put multiple 'Name:' speaker turns in the same paragraph.",
-                "Use full resolved person names as turn prefixes, for example 'Person One:' instead of 'Person:'.",
-                "Transcript attribution is turn-level: do not blindly apply a global speaker label when diarization is mixed. If a low-confidence or contradictory segment has local dialogue evidence for a different speaker, prefix that turn with the locally supported person or an unresolved label.",
-                "Do not attribute an opening low-confidence label to a later stable speaker if the dialogue chain contradicts it. For example, a label that later belongs to one participant may still have an early greeting turn that should be another participant or unresolved based on surrounding dialogue.",
-                "Only replace an original diarization label with a real person name when local turn evidence or stable speaker_map evidence supports it. If a label is mixed, unstable, or below 0.9 confidence, speaker_map should say mixed/unresolved, while transcript may still use real names for individual turns that have strong local evidence.",
-                "Write transcript as a faithful speaker-labeled transcript. Correct obvious ASR errors, names, punctuation, and paragraph breaks, but do not summarize, reorder, omit substantive sections, merge unrelated turns, or convert the transcript into prose notes.",
-                "Create a concise useful title.",
-                "Extract participants and action items.",
-            ],
-            "clickhouse_context": {
-                "result_format": "Tool results are CSV with truncation metadata.",
-                "query_notes": [
-                    "Use \"$PDW_CLICKHOUSE_SCHEMA\" output to identify table names, column names, and whether fields are scalar or arrays before writing SQL.",
-                    "For array columns, use array functions such as arrayExists instead of scalar string functions.",
-                    "Compare DateTime columns with toDateTime64('YYYY-MM-DD HH:MM:SS', 3, 'UTC') or a range; do not compare DateTime columns to ISO strings with timezone suffixes.",
-                    "Do not add FORMAT clauses; the tool already returns CSV.",
-                    "Prefer small LIMITs and focused SELECT columns.",
-                ],
-            },
         },
         sort_keys=True,
         default=str,
     )
+
+
+def enrichment_instructions() -> list[str]:
+    return [
+        "Before final output, read input_data.path, then run \"$PDW_CLICKHOUSE_SCHEMA\" and multiple focused \"$PDW_CLICKHOUSE_QUERY\" calls to search calendar, email, Slack, and related warehouse context.",
+        "Make separate warehouse checks for: the selected calendar event including attendee data, participant/person identity evidence, and suspicious domain terms or organizations that need spelling verification.",
+        "Hard requirements: accurate date/time, accurate participant/name spellings, and accurate domain terms in transcript.",
+        "participants means actual people who speak or are strongly evidenced as present. Do not include calendar invitees merely because they were invited, especially if responseStatus is needsAction and there is no transcript evidence they attended.",
+        "If you select a calendar event, start_at and end_at must come from that calendar event or verified ClickHouse context.",
+        "Do not leave participants as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, use \"$PDW_CLICKHOUSE_SCHEMA\" results to query Slack/email identity data before finalizing participants or speaker_map.",
+        "Do not stop at a one-token name like a Slack display_name or calendar first name. Search Gmail/calendar/Slack context around the event title, email local part, usernames, candidate briefs, and prior messages until you find a full preferred/legal name or have clear evidence none is available.",
+        "When a speaker is identified only by a first name, use calendar attendee emails plus Slack/email identity evidence to resolve the full name.",
+        "Calendar candidates may include identity_hints for attendee emails. Use possible_names from identity_hints for attendee and speaker names when supported by transcript evidence.",
+        "Normalize spoken name mentions in transcript to verified participant spellings when ASR produces a close variant, especially in greetings and introductions.",
+        "If the transcript says a person or organization name differently than the calendar candidate, query for that spoken name/project before deciding.",
+        "For technical/product terms that are unclear or unfamiliar, query Slack/Gmail for likely spelling variants and use the spelling supported by warehouse evidence.",
+        "Correct ASR domain-term errors in transcript, for example Hack Club not Hat Club, Hackatime not Hackertime/Hacker Time, Stardance not Start Dance, OpenRouter, OpenAI, Anthropic, Congressional App Challenge, Challenger, Framework, Spindrift, and Pellegrino.",
+        "The source timestamp may be a local wall-clock time incorrectly tagged as UTC. Use recorded_at_interpretations and transcript evidence when matching calendar events.",
+        "Direct spoken names, greetings, introductions, and project names are strong evidence. If they conflict with a nearby calendar candidate, query for the spoken name/project before selecting the candidate.",
+        "Pick the best calendar event if supported by transcript/time/context evidence.",
+        "If no calendar event matches, set calendar_event_id to an empty string and calendar_confidence to 0, but still produce a useful title, start_at, end_at, summary, action_items, evidence, and transcript. Personal journal entries or ad-hoc voice notes are valid outputs.",
+        "For no-calendar recordings, derive start_at from the recording timestamp and estimate end_at from diarized segment duration when available.",
+        "speaker_map must summarize each original diarized_segments speaker_label as a real person only when that label is stable; otherwise map it to an unresolved mixed label. Do not invent generic speaker labels that are not present in diarized_segments.",
+        "If a speaker label might be one of several interviewers, do not write a candidate list as the speaker_name. Use a clearly mixed/unresolved label and put the candidate names in evidence unless you can verify a single person.",
+        "Assign real speaker names only when directly supported by greetings, self-introductions, calendar attendees, Slack/email identity evidence, or strongly identifying transcript context. Use low confidence and an unresolved label when uncertain.",
+        "Audit every diarized speaker_label across all its turns before assigning a real person. If one label contains turns from multiple apparent people, contradictory greetings, or identity-bearing turns with very low confidence, mark that label as mixed/unresolved instead of assigning a real name.",
+        "In greetings, 'Hey NAME' or 'How are you, NAME?' usually means NAME is the addressee, not the speaker. Do not swap addressee and speaker when correcting transcript prefixes.",
+        "Do not infer a diarized label's identity from a single low-confidence short greeting or interjection. Prefer the label's longer, high-confidence turns and conversational consistency.",
+        "If a speaker label says lines that only the addressee could say, such as 'How are you, PERSON?' under PERSON's prefix, your mapping is wrong. Re-evaluate the speaker_map or mark the label mixed/unresolved.",
+        "For opening small talk, reason as a dialogue chain: greeting to addressee, addressee response, return question, original speaker response. Use that chain to validate speaker labels before final output.",
+        "Opening greetings are often split across diarization labels. If a low-confidence initial 'Hey NAME' is followed by another label saying 'hey/how are you' and a third label replies 'I'm doing great. How are you, PERSON?', attribute the greeting fragments to PERSON when that matches the later stable speaker, not to a different participant who only appears later.",
+        "Before final output, scan transcript for self-address contradictions. A line prefixed by PERSON must not contain 'How are you, PERSON?' or similar direct address to the same person. In an opening chain, 'I'm doing great. How are you, PERSON?' is spoken by the person who was just greeted, and the next 'I'm good' is PERSON's reply.",
+        "In opening greetings, the same speaker should not ask 'how are you?' and then immediately answer 'I'm doing great'. If diarization splits 'Hey NAME, how are you?' into two short segments, merge or attribute those short greeting fragments to the greeter.",
+        "If the first few short greeting segments conflict with later stable diarization, prefer a coherent dialogue chain over the raw short-segment labels. It is better to merge or reattribute short opening greetings than to create a transcript where someone asks how they themselves are.",
+        "Use diarized_segments as the source of truth for speaker turns. Preserve chronological turn order in transcript.",
+        f"If transcript_char_count is at least {LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS}, set transcript exactly to {LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL}. Do not emit the full transcript in your JSON for long recordings; focus on calendar matching, participant identities, speaker_map, domain-term evidence, summary, and action items.",
+        "When you are not using the local transcript assembly sentinel, every substantive diarized segment should be represented in transcript. Do not compress it into a summary.",
+        "Format transcript as speaker turns, one turn per line or paragraph. Never put multiple 'Name:' speaker turns in the same paragraph.",
+        "Use full resolved person names as turn prefixes, for example 'Person One:' instead of 'Person:'.",
+        "Transcript attribution is turn-level: do not blindly apply a global speaker label when diarization is mixed. If a low-confidence or contradictory segment has local dialogue evidence for a different speaker, prefix that turn with the locally supported person or an unresolved label.",
+        "Do not attribute an opening low-confidence label to a later stable speaker if the dialogue chain contradicts it. For example, a label that later belongs to one participant may still have an early greeting turn that should be another participant or unresolved based on surrounding dialogue.",
+        "Only replace an original diarization label with a real person name when local turn evidence or stable speaker_map evidence supports it. If a label is mixed, unstable, or below 0.9 confidence, speaker_map should say mixed/unresolved, while transcript may still use real names for individual turns that have strong local evidence.",
+        "Write transcript as a faithful speaker-labeled transcript. Correct obvious ASR errors, names, punctuation, and paragraph breaks, but do not summarize, reorder, omit substantive sections, merge unrelated turns, or convert the transcript into prose notes.",
+        "Create a concise useful title.",
+        "Extract participants and action items.",
+    ]
 
 
 def prompt_transcript_segment(segment: Mapping[str, Any]) -> dict[str, Any]:
