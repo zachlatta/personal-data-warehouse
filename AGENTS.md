@@ -1,5 +1,16 @@
 # Agent Notes
 
+## Commit and Push Safety
+
+Before committing or pushing, review the complete staged diff line by line for secrets,
+credentials, tokens, private URLs, personal data, generated artifacts, and anything else
+that should not be public. If there is even a smidgen of doubt about whether a change is
+safe to commit or push, stop and check with Zach before proceeding.
+
+Always assume other agents may be running in the same worktree. Before committing, carefully
+verify the staged changes and commit only the changes made in the current session unless Zach
+explicitly instructs otherwise.
+
 ## Local Voice Memos Upload Scheduler
 
 This Mac is intended to run the local Voice Memos uploader through a user LaunchAgent:
