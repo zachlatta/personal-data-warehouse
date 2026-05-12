@@ -64,6 +64,11 @@ def main() -> None:
             [
                 *(account.email_address for account in settings.gmail_accounts),
                 *(account.email_address for account in settings.calendar_accounts),
+                *(
+                    [settings.alice_voice_recordings.google_drive_account]
+                    if settings.alice_voice_recordings is not None
+                    else []
+                ),
             ]
         )
     )

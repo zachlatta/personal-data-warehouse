@@ -25,25 +25,42 @@ APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY = (
 class GoogleDriveObjectStore:
     backend = "google_drive"
 
-    def __init__(self, *, folder_id: str, service, max_attempts: int = 5) -> None:
+    def __init__(
+        self,
+        *,
+        folder_id: str,
+        service,
+        max_attempts: int = 5,
+        source: str = "apple_voice_memos",
+        legacy_sources: tuple[str, ...] = ("voice_memos",),
+        audio_kind: str = "voice_memo_audio",
+        metadata_kind: str = "voice_memo_metadata",
+    ) -> None:
         self._folder_id = folder_id
         self._service = service
         self._max_attempts = max_attempts
         self._folder_cache: dict[tuple[str, str], str] = {}
+        self._source = source
+        self._legacy_sources = legacy_sources
+        self._audio_kind = audio_kind
+        self._metadata_kind = metadata_kind
 
     def has_blob(self, *, content_sha256: str) -> bool:
         return self._find_by_app_property(
             key="content_sha256",
             value=content_sha256,
-            kind="voice_memo_audio",
+            kind=self._audio_kind,
         ) is not None
 
     def has_metadata(self, *, content_sha256: str) -> bool:
         return self._find_by_app_property(
             key="audio_content_sha256",
             value=content_sha256,
-            kind="voice_memo_metadata",
+            kind=self._metadata_kind,
         ) is not None
+
+    def has_object(self, *, kind: str, key: str, value: str) -> bool:
+        return self._find_by_app_property(key=key, value=value, kind=kind) is not None
 
     def presence(self, *, content_sha256: str) -> ObjectPresence:
         response = self._find_all_by_content_sha256(content_sha256=content_sha256)
@@ -57,9 +74,9 @@ class GoogleDriveObjectStore:
             if not isinstance(app_properties, dict):
                 continue
             kind = app_properties.get("pdw_kind")
-            if kind == "voice_memo_audio":
+            if kind == self._audio_kind:
                 audio_exists = True
-            elif kind == "voice_memo_metadata":
+            elif kind == self._metadata_kind:
                 metadata_exists = True
         return ObjectPresence(audio_exists=audio_exists, metadata_exists=metadata_exists)
 
@@ -71,27 +88,32 @@ class GoogleDriveObjectStore:
         content_sha256: str,
         content_type: str,
         skip_existing_check: bool = False,
+        app_properties: dict[str, str] | None = None,
+        kind: str | None = None,
     ) -> StoredObject:
+        object_kind = kind or self._audio_kind
         if not skip_existing_check:
             existing = self._find_by_app_property(
                 key="content_sha256",
                 value=content_sha256,
-                kind="voice_memo_audio",
+                kind=object_kind,
             )
             if existing is not None:
                 return self._stored_object(existing, object_key)
 
+        object_app_properties = {
+            "pdw_source": self._source,
+            "pdw_kind": object_kind,
+            "pdw_root_folder_id": self._folder_id,
+            "pdw_stage": object_stage(object_key),
+            "content_sha256": content_sha256,
+        }
+        object_app_properties.update(app_properties or {})
         body = {
             "name": drive_name_from_object_key(object_key),
             "parents": [self._folder_id],
             "mimeType": content_type,
-            "appProperties": {
-                "pdw_source": "apple_voice_memos",
-                "pdw_kind": "voice_memo_audio",
-                "pdw_root_folder_id": self._folder_id,
-                "pdw_stage": object_stage(object_key),
-                "content_sha256": content_sha256,
-            },
+            "appProperties": object_app_properties,
         }
         parent_id = self._ensure_parent_folder(object_key)
         body["name"] = drive_name_from_object_key(object_key)
@@ -117,22 +139,34 @@ class GoogleDriveObjectStore:
         content_sha256: str,
         source_content_sha256: str | None = None,
         skip_existing_check: bool = False,
+        app_properties: dict[str, str] | None = None,
+        kind: str | None = None,
     ) -> StoredObject:
+        object_kind = kind or self._metadata_kind
         if source_content_sha256 and not skip_existing_check:
             existing = self._find_by_app_property(
                 key="audio_content_sha256",
                 value=source_content_sha256,
-                kind="voice_memo_metadata",
+                kind=object_kind,
+            )
+            if existing is not None:
+                return self._stored_object(existing, object_key)
+        if not source_content_sha256 and not skip_existing_check:
+            existing = self._find_by_app_property(
+                key="content_sha256",
+                value=content_sha256,
+                kind=object_kind,
             )
             if existing is not None:
                 return self._stored_object(existing, object_key)
 
         app_properties = {
-            "pdw_source": "apple_voice_memos",
-            "pdw_kind": "voice_memo_metadata",
+            "pdw_source": self._source,
+            "pdw_kind": object_kind,
             "pdw_root_folder_id": self._folder_id,
             "pdw_stage": object_stage(object_key),
             "content_sha256": content_sha256,
+            **(app_properties or {}),
         }
         if source_content_sha256:
             app_properties["audio_content_sha256"] = source_content_sha256
@@ -159,7 +193,7 @@ class GoogleDriveObjectStore:
     def _find_by_app_property(self, *, key: str, value: str, kind: str) -> dict[str, Any] | None:
         query = (
             "trashed = false "
-            f"and {APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY} "
+            f"and {self._source_query()} "
             f"and appProperties has {{ key='pdw_root_folder_id' and value='{escape_query_value(self._folder_id)}' }} "
             f"and appProperties has {{ key='pdw_kind' and value='{escape_query_value(kind)}' }} "
             "and ("
@@ -188,7 +222,7 @@ class GoogleDriveObjectStore:
         escaped_sha = escape_query_value(content_sha256)
         query = (
             "trashed = false "
-            f"and {APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY} "
+            f"and {self._source_query()} "
             f"and appProperties has {{ key='pdw_root_folder_id' and value='{escaped_folder_id}' }} "
             "and ("
             "appProperties has { key='pdw_stage' and value='inbox' } "
@@ -196,11 +230,11 @@ class GoogleDriveObjectStore:
             ") "
             "and ("
             "("
-            "appProperties has { key='pdw_kind' and value='voice_memo_audio' } "
+            f"appProperties has {{ key='pdw_kind' and value='{escape_query_value(self._audio_kind)}' }} "
             f"and appProperties has {{ key='content_sha256' and value='{escaped_sha}' }}"
             ") "
             "or ("
-            "appProperties has { key='pdw_kind' and value='voice_memo_metadata' } "
+            f"appProperties has {{ key='pdw_kind' and value='{escape_query_value(self._metadata_kind)}' }} "
             f"and appProperties has {{ key='audio_content_sha256' and value='{escaped_sha}' }}"
             ")"
             ")"
@@ -264,7 +298,7 @@ class GoogleDriveObjectStore:
                         "parents": [parent_id],
                         "mimeType": "application/vnd.google-apps.folder",
                         "appProperties": {
-                            "pdw_source": "apple_voice_memos",
+                            "pdw_source": self._source,
                             "pdw_kind": "object_storage_prefix",
                             "pdw_root_folder_id": self._folder_id,
                         },
@@ -285,6 +319,16 @@ class GoogleDriveObjectStore:
             "storage_file_id": str(response.get("id", "")),
             "storage_url": str(response.get("webViewLink", "")),
         }
+
+    def _source_query(self) -> str:
+        sources = (self._source, *self._legacy_sources)
+        clauses = [
+            f"appProperties has {{ key='pdw_source' and value='{escape_query_value(source)}' }}"
+            for source in dict.fromkeys(sources)
+        ]
+        if len(clauses) == 1:
+            return clauses[0]
+        return "(" + " or ".join(clauses) + ")"
 
     def _execute(self, operation):
         last_exc = None

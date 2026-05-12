@@ -31,6 +31,9 @@ DEFAULT_SLACK_THREAD_AUDIT_DAYS = 30
 DEFAULT_VOICE_MEMOS_EXTENSIONS = (".m4a", ".qta")
 DEFAULT_VOICE_MEMOS_STORAGE_BACKEND = "google_drive"
 DEFAULT_VOICE_MEMOS_TRANSCRIPTION_PROVIDER = "assemblyai"
+DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
+DEFAULT_ALICE_STORAGE_BACKEND = "google_drive"
+DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS = 120
 DEFAULT_ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com"
 DEFAULT_ASSEMBLYAI_POLL_INTERVAL_SECONDS = 5
 DEFAULT_ASSEMBLYAI_TIMEOUT_SECONDS = 1800
@@ -120,6 +123,18 @@ class VoiceMemosConfig:
 
 
 @dataclass(frozen=True)
+class AliceVoiceRecordingsConfig:
+    account: str
+    key_id: str
+    secret_key: str
+    base_url: str
+    storage_backend: str
+    google_drive_account: str
+    google_drive_folder_id: str
+    request_timeout_seconds: int = DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True)
 class AssemblyAIConfig:
     api_key: str
     base_url: str = DEFAULT_ASSEMBLYAI_BASE_URL
@@ -181,6 +196,7 @@ class Settings:
     google_oauth_client_secrets_json_by_account: tuple[tuple[str, str], ...] = ()
     google_oauth_client_secrets_json_by_domain: tuple[tuple[str, str], ...] = ()
     voice_memos: VoiceMemosConfig | None = None
+    alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
 
@@ -207,6 +223,8 @@ class Settings:
             email_domain(account.email_address)
             for account in [*self.gmail_accounts, *self.calendar_accounts]
         }
+        if self.alice_voice_recordings is not None:
+            configured_domains.add(email_domain(self.alice_voice_recordings.google_drive_account))
         if len(configured_domains) <= 1:
             return self.gmail_oauth_client_secrets_json
         return None
@@ -220,6 +238,7 @@ def load_settings(
     require_calendar: bool = False,
     require_slack: bool = False,
     require_voice_memos: bool = False,
+    require_alice_voice_recordings: bool = False,
     require_assemblyai: bool = False,
     require_agent: bool = False,
 ) -> Settings:
@@ -427,6 +446,60 @@ def load_settings(
             transcription_provider=voice_memos_transcription_provider,
         )
 
+    alice_account = os.getenv("ALICE_VOICE_RECORDINGS_ACCOUNT", "").strip()
+    alice_key_id = os.getenv("ALICE_API_KEY_ID", "").strip()
+    alice_secret_key = os.getenv("ALICE_API_SECRET_KEY", "").strip()
+    alice_base_url = os.getenv("ALICE_API_BASE_URL", DEFAULT_ALICE_BASE_URL).strip()
+    alice_storage_backend = os.getenv("ALICE_VOICE_RECORDINGS_STORAGE_BACKEND", DEFAULT_ALICE_STORAGE_BACKEND).strip()
+    alice_google_drive_account = (
+        os.getenv("ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_ACCOUNT")
+        or os.getenv("VOICE_MEMOS_ACCOUNT")
+        or default_voice_memos_account
+    ).strip()
+    alice_google_drive_folder_id = (
+        os.getenv("ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
+        or ""
+    ).strip()
+    alice_request_timeout_seconds = int(
+        os.getenv("ALICE_VOICE_RECORDINGS_REQUEST_TIMEOUT_SECONDS", str(DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS))
+    )
+    alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
+    if (
+        require_alice_voice_recordings
+        or alice_account
+        or alice_key_id
+        or alice_secret_key
+        or os.getenv("ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_FOLDER_ID")
+    ):
+        if not alice_account:
+            raise ValueError("ALICE_VOICE_RECORDINGS_ACCOUNT must be set for Alice voice recordings import")
+        if not alice_key_id:
+            raise ValueError("ALICE_API_KEY_ID must be set for Alice voice recordings import")
+        if not alice_secret_key:
+            raise ValueError("ALICE_API_SECRET_KEY must be set for Alice voice recordings import")
+        if alice_storage_backend not in {"google_drive"}:
+            raise ValueError("ALICE_VOICE_RECORDINGS_STORAGE_BACKEND currently supports: google_drive")
+        if not alice_google_drive_account:
+            raise ValueError("ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_ACCOUNT or VOICE_MEMOS_ACCOUNT must be set")
+        if not alice_google_drive_folder_id:
+            raise ValueError(
+                "ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_FOLDER_ID or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
+        if alice_request_timeout_seconds < 1:
+            raise ValueError("ALICE_VOICE_RECORDINGS_REQUEST_TIMEOUT_SECONDS must be at least 1")
+        alice_voice_recordings = AliceVoiceRecordingsConfig(
+            account=alice_account,
+            key_id=alice_key_id,
+            secret_key=alice_secret_key,
+            base_url=alice_base_url,
+            storage_backend=alice_storage_backend,
+            google_drive_account=alice_google_drive_account,
+            google_drive_folder_id=alice_google_drive_folder_id,
+            request_timeout_seconds=alice_request_timeout_seconds,
+        )
+
     assemblyai_api_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
     assemblyai: AssemblyAIConfig | None = None
     if require_assemblyai or assemblyai_api_key:
@@ -505,6 +578,8 @@ def load_settings(
     google_scopes = [GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE]
     if voice_memos and voice_memos.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if alice_voice_recordings and alice_voice_recordings.storage_backend == "google_drive":
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
 
     return Settings(
         clickhouse_url=clickhouse_url,
@@ -550,6 +625,7 @@ def load_settings(
         ),
         slack_force_full_sync=_parse_bool_env(os.getenv("SLACK_FORCE_FULL_SYNC"), False),
         voice_memos=voice_memos,
+        alice_voice_recordings=alice_voice_recordings,
         assemblyai=assemblyai,
         agent=agent,
     )

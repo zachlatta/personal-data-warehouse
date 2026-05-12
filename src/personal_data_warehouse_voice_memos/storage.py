@@ -28,6 +28,9 @@ class ObjectStore(Protocol):
     def has_metadata(self, *, content_sha256: str) -> bool:
         pass
 
+    def has_object(self, *, kind: str, key: str, value: str) -> bool:
+        pass
+
     def presence(self, *, content_sha256: str) -> ObjectPresence:
         pass
 
@@ -39,6 +42,8 @@ class ObjectStore(Protocol):
         content_sha256: str,
         content_type: str,
         skip_existing_check: bool = False,
+        app_properties: dict[str, str] | None = None,
+        kind: str | None = None,
     ) -> StoredObject:
         pass
 
@@ -50,6 +55,8 @@ class ObjectStore(Protocol):
         content_sha256: str,
         source_content_sha256: str | None = None,
         skip_existing_check: bool = False,
+        app_properties: dict[str, str] | None = None,
+        kind: str | None = None,
     ) -> StoredObject:
         pass
 

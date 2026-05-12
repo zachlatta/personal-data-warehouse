@@ -327,6 +327,78 @@ for short indexing fields such as `pdw_stage`, `pdw_kind`, and content hashes. D
 `pdw_stage=inbox`, then promotes processed files to `apple-voice-memos/library/YYYY/MM/`.
 A future S3 backend can keep the same metadata format and swap only the object-store implementation.
 
+### Alice App Voice Recordings
+
+Alice App voice recordings are archived into the same Google Drive object-storage root using the
+Voice Memos sidecar shape. The importer writes a raw recording file plus one storage-location-free
+JSON metadata file with the same dated content-hash basename when audio is available:
+
+```text
+alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-<sha256>.<ext>
+alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-<sha256>.json
+```
+
+Alice is treated as an archive source, so the importer preserves whatever the API still exposes.
+Older Alice items may no longer have a raw media file; those still get a durable metadata sidecar:
+
+```text
+alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<alice-id>.json
+```
+
+If Alice returns a recording webpage rather than raw media, the page is archived too, because it may
+contain the only remaining transcript/source artifact:
+
+```text
+alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-<sha256-or-alice-id>.html
+```
+
+Alice transcript emails from Gmail are also treated as recovery artifacts. This covers recordings
+that Alice no longer exposes through the API, including auto-deleted recordings where Gmail may be
+the only remaining source. The Gmail recovery asset writes the email body, transcript attachments,
+and any attached audio beside the recording metadata:
+
+```text
+alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.email.md
+alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.email.json
+alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.transcript.txt
+alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.transcript-formatted.docx
+alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.audio.<ext>
+```
+
+Configure Alice API credentials and the Drive object-storage root:
+
+```bash
+ALICE_VOICE_RECORDINGS_ACCOUNT=you@example.com
+ALICE_API_KEY_ID=<alice-api-key-id>
+ALICE_API_SECRET_KEY=<alice-api-secret-key>
+ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_ACCOUNT=you@example.com
+ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
+```
+
+If `ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_ACCOUNT` or
+`ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_FOLDER_ID` are omitted, the importer falls back to the
+Voice Memos Drive account and folder settings. The Google account must have a stored token with
+Drive scope, using the same auth flow as Voice Memos:
+
+```bash
+uv run personal-data-warehouse-google-auth --email you@example.com --write-env
+```
+
+Dagster exposes `alice_voice_recordings_import` and `alice_voice_recordings_gmail_recovery` in the
+`alice_voice_recordings` group, with `alice_voice_recordings_import_job` scheduled daily at
+04:17 UTC. This is the scheduler of record for regular Alice archival. To run the API import
+manually:
+
+```bash
+uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.alice_voice_recordings import alice_voice_recordings_import; raise SystemExit(0 if materialize([alice_voice_recordings_import]).success else 1)"
+```
+
+To run the Gmail recovery pass manually:
+
+```bash
+uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.alice_voice_recordings import alice_voice_recordings_gmail_recovery; raise SystemExit(0 if materialize([alice_voice_recordings_gmail_recovery]).success else 1)"
+```
+
 Dagster uses enabled sensors for the Voice Memos pipeline. The Drive inbox sensor checks for new
 Google Drive metadata every minute and launches ingest when it finds work. Backlog sensors then
 launch transcription and enrichment when ClickHouse has unprocessed recordings or transcripts.
