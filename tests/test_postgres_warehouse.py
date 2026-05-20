@@ -22,6 +22,7 @@ from personal_data_warehouse.postgres import (
     INTEGER_COLUMNS,
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
+    _normalize_insert_value,
 )
 
 
@@ -102,6 +103,15 @@ def test_postgres_message_upsert_keeps_highest_sync_version(warehouse: PostgresW
     rows = warehouse._query("SELECT subject, sync_version FROM gmail_messages WHERE message_id = %s", ("m1",))
 
     assert rows == [("new", 20)]
+
+
+def test_postgres_insert_normalizes_nul_text_values() -> None:
+    assert _normalize_insert_value("before\x00after") == "before\\u0000after"
+    assert _normalize_insert_value(["ok", "before\x00after", ("nested\x00value",)]) == [
+        "ok",
+        "before\\u0000after",
+        ["nested\\u0000value"],
+    ]
 
 
 def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: PostgresWarehouse) -> None:

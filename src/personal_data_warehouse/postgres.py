@@ -49,6 +49,8 @@ from personal_data_warehouse.clickhouse import (
 )
 from personal_data_warehouse.config import normalize_postgres_url
 
+POSTGRES_TEXT_NUL_REPLACEMENT = "\\u0000"
+
 
 @dataclass(frozen=True)
 class TableSpec:
@@ -1877,8 +1879,12 @@ def _validate_identifier(value: str) -> str:
 def _normalize_insert_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return _ensure_utc(value)
+    if isinstance(value, str):
+        return value.replace("\x00", POSTGRES_TEXT_NUL_REPLACEMENT)
+    if isinstance(value, list):
+        return [_normalize_insert_value(item) for item in value]
     if isinstance(value, tuple):
-        return list(value)
+        return [_normalize_insert_value(item) for item in value]
     return value
 
 
