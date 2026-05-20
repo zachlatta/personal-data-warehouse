@@ -14,7 +14,6 @@ from dagster import (
     sensor,
 )
 
-from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
@@ -25,6 +24,7 @@ from personal_data_warehouse.apple_voice_memos_drive_ingest import (
     has_drive_metadata_payloads,
     iter_drive_metadata_payloads,
 )
+from personal_data_warehouse.warehouse import warehouse_from_settings
 
 VOICE_MEMOS_DRIVE_INGEST_POSTGRES_LOCK_ID = 7_403_111_839
 VOICE_MEMOS_SENSOR_INTERVAL_SECONDS = 60
@@ -38,7 +38,7 @@ def apple_voice_memos_drive_ingest(context) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_voice_memos=True)
     if settings.voice_memos is None:
         raise RuntimeError("Voice Memos sync is not configured")
-    warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+    warehouse = warehouse_from_settings(settings)
 
     with exclusive_sync_lock(
         name="apple_voice_memos_drive_ingest",

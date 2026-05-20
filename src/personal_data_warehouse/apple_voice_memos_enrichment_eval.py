@@ -231,11 +231,11 @@ def score_tools(row: dict[str, Any], issues: list[str]) -> float:
         return 0.0
     calls = payload.get("__tool_calls") or []
     if not calls:
-        issues.append("no ClickHouse tool calls were recorded")
+        issues.append("no warehouse tool calls were recorded")
         return 0.4
     errors = [call for call in calls if isinstance(call, dict) and call.get("output", {}).get("error")]
     if errors:
-        issues.append(f"{len(errors)} ClickHouse tool calls returned errors")
+        issues.append(f"{len(errors)} warehouse tool calls returned errors")
         return max(0.0, 1.0 - 0.3 * len(errors))
     return 1.0
 

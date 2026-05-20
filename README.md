@@ -1,6 +1,6 @@
 # personal_data_warehouse
 
-This project syncs Gmail mailbox data and Google Calendar events into ClickHouse through Dagster.
+This project syncs Gmail mailbox data, Google Calendar events, Slack data, and Voice Memos into Postgres through Dagster.
 
 Current ingestion path:
 
@@ -12,7 +12,9 @@ Current ingestion path:
 - Calendar first runs do a full event sync, then later runs use Google Calendar `syncToken`.
 - If Calendar expires the saved sync token, the sync falls back to a full resync for that calendar.
 - Voice Memos use a two-stage path: a local macOS uploader writes audio files and JSON metadata
-  to Google Drive, then a Dagster asset ingests those metadata into ClickHouse.
+  to Google Drive, then a Dagster asset ingests those metadata into Postgres.
+- Finance accounts use Plaid Link for authorization, then sync accounts, transactions,
+  investment holdings/transactions, and liabilities into Postgres.
 
 ## Dependency Management
 
@@ -36,7 +38,7 @@ uv run dg dev
 Add these to `.env`:
 
 ```bash
-CLICKHOUSE_URL=...
+POSTGRES_DATABASE_URL=...
 GMAIL_ACCOUNTS=zach@zachlatta.com,zach@hackclub.com
 ```
 
@@ -64,6 +66,13 @@ VOICE_MEMOS_ACCOUNT=you@example.com
 VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
 VOICE_MEMOS_STORAGE_BACKEND=google_drive
 VOICE_MEMOS_EXTENSIONS=.m4a,.qta
+PLAID_CLIENT_ID=<plaid-client-id>
+PLAID_SECRET=<plaid-secret>
+PLAID_ENV=sandbox
+PLAID_ITEMS=capital_one,robinhood,mortgage
+PLAID_CAPITAL_ONE_ACCESS_TOKEN=<plaid-access-token>
+PLAID_ROBINHOOD_ACCESS_TOKEN=<plaid-access-token>
+PLAID_MORTGAGE_ACCESS_TOKEN=<plaid-access-token>
 ```
 
 Notes:
@@ -168,6 +177,49 @@ All Slack schedules share a nonblocking Slack lock, so a scheduled tick skips if
 sync stage is still running.
 Calendar sync runs through `calendar_event_sync_every_minute` with its own nonblocking lock.
 
+## Finance Sync
+
+Finance sync uses Plaid as the first provider. Plaid access tokens stay in `.env`; Postgres stores
+the item/account identifiers, normalized query fields, and raw provider JSON, but not the access
+tokens themselves.
+
+Configure Plaid API credentials:
+
+```bash
+PLAID_CLIENT_ID=...
+PLAID_SECRET=...
+PLAID_ENV=development
+PLAID_PRODUCTS=transactions
+PLAID_ADDITIONAL_CONSENTED_PRODUCTS=investments,liabilities
+```
+
+Authorize each institution login through the local Plaid Link helper:
+
+```bash
+uv run personal-data-warehouse-plaid-auth --item capital_one --products transactions --write-env
+uv run personal-data-warehouse-plaid-auth --item mortgage --products liabilities --additional-consented-products transactions --write-env
+uv run personal-data-warehouse-plaid-auth --item robinhood --products investments --additional-consented-products transactions --write-env
+uv run personal-data-warehouse-plaid-auth --item fidelity --products investments --additional-consented-products transactions --write-env
+```
+
+If a Plaid OAuth institution requires an explicit redirect URI, register it in the Plaid Dashboard
+and pass it with `--redirect-uri` or set `PLAID_REDIRECT_URI`. Desktop web OAuth can often complete
+without a redirect URI, but production OAuth access depends on Plaid account approval and institution
+registration.
+
+Run the sync manually:
+
+```bash
+uv run personal-data-warehouse-finance-sync
+```
+
+Dagster exposes `finance_account_sync` in the `finance` group, scheduled hourly by
+`finance_account_sync_hourly`. The sync records product-specific errors in `finance_sync_state`
+without failing the whole item, so a Capital One transaction sync can still succeed even if
+investment or liability data is unavailable for that item. Fidelity connectivity depends on the
+account and Plaid's current institution support; if Plaid cannot connect it, the warehouse schema is
+ready for a future Akoya, Finicity, or export-file provider.
+
 ## Docker / Coolify
 
 This repo includes a `Dockerfile` that runs Dagster on port `3000` with `uv`.
@@ -182,7 +234,7 @@ For Coolify:
 
 ```bash
 DAGSTER_POSTGRES_URL=postgresql://...
-CLICKHOUSE_URL=...
+POSTGRES_DATABASE_URL=postgresql://...
 GMAIL_ACCOUNTS=zach@hackclub.com
 GOOGLE_ZACH_HACKCLUB_COM_TOKEN_JSON_B64=...
 GMAIL_PAGE_SIZE=500
@@ -216,11 +268,11 @@ uv run python -c "from dagster import materialize; from personal_data_warehouse.
 
 ## Voice Memos Sync
 
-Voice Memos are split across two processes so the Mac never talks to ClickHouse directly:
+Voice Memos are split across two processes so the Mac never talks to the warehouse directly:
 
 1. A local macOS CLI scans Apple's Voice Memos recordings directory and uploads new `.m4a`
    and `.qta` audio files to the Google Drive inbox, alongside one JSON metadata file per audio file.
-2. The remote Dagster asset reads inbox metadata, writes metadata rows to ClickHouse, then promotes
+2. The remote Dagster asset reads inbox metadata, writes metadata rows to Postgres, then promotes
    the audio and JSON objects into the library prefix.
 
 Configure the shared Drive folder:
@@ -322,7 +374,7 @@ subfolders under that root, using colocated inbox object keys such as
 `apple-voice-memos/inbox/YYYY/MM/YYYY-MM-DD-<sha256>.qta` and
 `apple-voice-memos/inbox/YYYY/MM/YYYY-MM-DD-<sha256>.json`. The JSON body is storage-location-free:
 it stores recording metadata, not Drive paths or future S3 keys. Dagster derives provider locations
-from the backend context and stores them in ClickHouse columns. Drive `appProperties` are used only
+from the backend context and stores them in warehouse columns. Drive `appProperties` are used only
 for short indexing fields such as `pdw_stage`, `pdw_kind`, and content hashes. Dagster only scans
 `pdw_stage=inbox`, then promotes processed files to `apple-voice-memos/library/YYYY/MM/`.
 A future S3 backend can keep the same metadata format and swap only the object-store implementation.
@@ -401,7 +453,7 @@ uv run python -c "from dagster import materialize; from personal_data_warehouse.
 
 Dagster uses enabled sensors for the Voice Memos pipeline. The Drive inbox sensor checks for new
 Google Drive metadata every minute and launches ingest when it finds work. Backlog sensors then
-launch transcription and enrichment when ClickHouse has unprocessed recordings or transcripts.
+launch transcription and enrichment when Postgres has unprocessed recordings or transcripts.
 An hourly enrichment schedule remains enabled as a repair pass. For a Coolify scheduled task
 instead of the Dagster UI:
 
@@ -427,7 +479,7 @@ Run one transcription batch:
 uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.apple_voice_memos_transcription import apple_voice_memos_transcription; raise SystemExit(0 if materialize([apple_voice_memos_transcription]).success else 1)"
 ```
 
-The transcription asset stores the raw AssemblyAI response JSON in ClickHouse and also stores
+The transcription asset stores the raw AssemblyAI response JSON in Postgres and also stores
 normalized diarized segments for search. AssemblyAI is configured with Universal-3 Pro plus
 domain keyterms for Hack Club and common project/product terms.
 
@@ -455,7 +507,7 @@ uv run python -c "from dagster import materialize; from personal_data_warehouse.
 
 Voice Memos enrichment runs through a one-off Codex or Claude Code container by default, using your
 logged-in CLI subscription instead of API keys. Dagster owns the Docker socket and spawns the agent
-container; the agent container does not receive the Docker socket, Dagster env, ClickHouse URL,
+container; the agent container does not receive the Docker socket, Dagster env, Postgres URL,
 Google tokens, Slack tokens, or API keys.
 
 The agent resource and auth/bootstrap command build the agent image on demand. They derive a tag
@@ -491,8 +543,8 @@ AGENT_RUNS_DIR=/agent-runs
 AGENT_DOCKER_NETWORK=coolify
 ```
 
-The read-only ClickHouse tool is exposed through a short-lived proxy owned by the Dagster process.
-The agent container receives only a proxy URL and per-run bearer token, not `CLICKHOUSE_URL`. Defaults
+The read-only Postgres tool is exposed through a short-lived proxy owned by the Dagster process.
+The agent container receives only a proxy URL and per-run bearer token, not `POSTGRES_DATABASE_URL`. Defaults
 work on Docker Desktop/OrbStack via `host.docker.internal`. In Coolify, set `AGENT_DOCKER_NETWORK`
 to the app network, usually `coolify`; when the network is not `bridge`, the proxy host defaults to
 the Dagster container hostname. Override the host only if Docker DNS cannot resolve that hostname:
@@ -523,7 +575,7 @@ uv run personal-data-warehouse-agent-auth login claude
 uv run personal-data-warehouse-agent-auth status claude
 ```
 
-Agent run metadata, streamed CLI events, and detected tool-call events are stored in ClickHouse
+Agent run metadata, streamed CLI events, and detected tool-call events are stored in Postgres
 tables `agent_runs`, `agent_run_events`, and `agent_run_tool_calls`. The final Voice Memos result
 still lands in `apple_voice_memos_enrichments`.
 
@@ -539,19 +591,19 @@ Current built-ins:
 ```bash
 "$PDW_TOOL_HELP"
 "$PDW_VALIDATE_JSON" candidate.json "$AGENT_SCHEMA_PATH"
-"$PDW_CLICKHOUSE_SCHEMA"
-"$PDW_CLICKHOUSE_QUERY" "SELECT summary, attendees_json FROM calendar_events LIMIT 5"
+"$PDW_POSTGRES_SCHEMA"
+"$PDW_POSTGRES_QUERY" "SELECT summary, attendees_json FROM calendar_events LIMIT 5"
 ```
 
-`$PDW_CLICKHOUSE_SCHEMA` and `$PDW_CLICKHOUSE_QUERY` route through the per-run read-only proxy. SQL
-is locally restricted to read-only statement types and ClickHouse is called with `readonly=1`.
+`$PDW_POSTGRES_SCHEMA` and `$PDW_POSTGRES_QUERY` route through the per-run read-only proxy. SQL
+is locally restricted to read-only statement types.
 Secret-backed tools should only be added deliberately, with the understanding that any credential or
 capability available to a CLI is also available to arbitrary Bash inside the agent container.
 
 Written tests that do not call live agents run with the normal suite:
 
 ```bash
-uv run pytest tests/test_agent_runner.py tests/test_apple_voice_memos_enrichment_defs.py tests/test_clickhouse_schema.py
+uv run pytest tests/test_agent_runner.py tests/test_apple_voice_memos_enrichment_defs.py tests/test_postgres_warehouse.py
 ```
 
 Live Docker/subscription smoke tests are opt-in because they require Docker and a logged-in
@@ -567,10 +619,10 @@ uv run pytest tests/test_agent_runner_live.py -q
 ```
 
 The live tests verify the image has both CLIs and no Docker socket, start real one-off agent
-containers through the subscription login, and check that the built-in ClickHouse CLI can reach a
-host-owned read-only proxy without receiving the raw ClickHouse URL.
+containers through the subscription login, and check that the built-in Postgres CLI can reach a
+host-owned read-only proxy without receiving the raw Postgres URL.
 
-## ClickHouse Tables
+## Warehouse Tables
 
 The sync creates and maintains:
 
@@ -586,6 +638,14 @@ The sync creates and maintains:
 - `apple_voice_memos_enrichments`: canonical transcript, calendar match, participants, summary, action items, and evidence
 - `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
+- `finance_items`: Plaid item metadata for each linked institution login, without access tokens
+- `finance_accounts`: latest known account profile and balance fields
+- `finance_transactions`: Plaid transaction sync adds, modifications, and removal tombstones
+- `finance_investment_holdings`: latest known investment positions
+- `finance_investment_securities`: securities referenced by holdings and investment transactions
+- `finance_investment_transactions`: investment transaction history over the configured lookback window
+- `finance_liabilities`: mortgage, credit, and student-loan liability details
+- `finance_sync_state`: per-item/product cursors and last run status
 
 The warehouse also creates clean views for current inbox and transcript state:
 
@@ -593,6 +653,8 @@ The warehouse also creates clean views for current inbox and transcript state:
   `thread_messages_json` carrying full thread context oldest-to-newest
 - `clean_slack_inbox`: Slack DMs, mentions, participating threads, and channel unread items for
   the authenticated Slack user when read state is known
+- `clean_finance_accounts`, `clean_finance_transactions`, and `clean_finance_holdings`: queryable
+  current finance account, transaction, and holding views
 - `clean_calendar_with_transcripts`: calendar events joined to matched Voice Memo transcript enrichments
 - `clean_transcripts_no_calendar_match`: completed Voice Memo transcript enrichments without a calendar match
 
@@ -615,6 +677,23 @@ When AI fallback is enabled, successful model output is stored with `text_extrac
 or `ai_truncated`, alongside the provider, model, base URL, exact prompt, prompt hash,
 prompt version, source extraction status, elapsed time, and processing timestamp.
 Attachments that cannot be extracted still get metadata rows with `text_extraction_status`.
+
+## Postgres Migration
+
+Runtime code uses `POSTGRES_DATABASE_URL`. ClickHouse is still supported as a read-only migration
+source so historical deployments can be moved over without preserving duplicate physical row
+versions.
+
+To migrate and verify ClickHouse `FINAL` state into Postgres:
+
+```bash
+CLICKHOUSE_URL=... POSTGRES_DATABASE_URL=... \
+uv run personal-data-warehouse-postgres-migration migrate-and-verify
+```
+
+For a dry run, point `--schema` at a temporary Postgres schema first. Verification compares row
+counts and canonical row hashes table-by-table. Leave ClickHouse read-only for rollback/archive
+until the migrated Postgres warehouse has been running cleanly.
 
 ## Verification
 

@@ -44,40 +44,43 @@ func (r *recordingRunner) Query(_ context.Context, sql string, maxRows int) (Raw
 	return result, nil
 }
 
-func TestServiceSchemaOverviewUsesShowDescribeAndSamples(t *testing.T) {
+func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
+	showTablesSQL := "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name"
+	describeGmailSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'gmail_messages' ORDER BY ordinal_position"
+	describeSlackSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'slack\"messages' ORDER BY ordinal_position"
 	runner := &recordingRunner{results: map[string]RawResult{
-		"SELECT currentDatabase() AS database": {
+		"SELECT current_database() AS database": {
 			Columns: []string{"database"},
 			Rows:    []map[string]any{{"database": "default"}},
 		},
-		"SHOW TABLES": {
+		showTablesSQL: {
 			Columns: []string{"name"},
 			Rows: []map[string]any{
 				{"name": "gmail_messages"},
-				{"name": "slack`messages"},
+				{"name": "slack\"messages"},
 			},
 		},
-		"DESCRIBE TABLE `gmail_messages`": {
+		describeGmailSQL: {
 			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
 			Rows: []map[string]any{
 				{"name": "id", "type": "String"},
 				{"name": "body", "type": "String"},
 			},
 		},
-		"SELECT substring(toString(`id`), 1, 15) AS `id`, length(toString(`id`)) AS `__pdw_preview_len_0`, substring(toString(`body`), 1, 15) AS `body`, length(toString(`body`)) AS `__pdw_preview_len_1` FROM `gmail_messages` LIMIT 3": {
+		"SELECT substring(\"id\"::text from 1 for 15) AS \"id\", char_length(\"id\"::text) AS \"__pdw_preview_len_0\", substring(\"body\"::text from 1 for 15) AS \"body\", char_length(\"body\"::text) AS \"__pdw_preview_len_1\" FROM \"gmail_messages\" LIMIT 3": {
 			Columns: []string{"id", "__pdw_preview_len_0", "body", "__pdw_preview_len_1"},
 			Rows: []map[string]any{
 				{"id": "msg-1", "__pdw_preview_len_0": 5, "body": "abcdefghijklmno", "__pdw_preview_len_1": 26},
 				{"id": "msg-2", "__pdw_preview_len_0": 5, "body": "short", "__pdw_preview_len_1": 5},
 			},
 		},
-		"DESCRIBE TABLE `slack``messages`": {
+		describeSlackSQL: {
 			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
 			Rows: []map[string]any{
 				{"name": "channel_id", "type": "String"},
 			},
 		},
-		"SELECT substring(toString(`channel_id`), 1, 15) AS `channel_id`, length(toString(`channel_id`)) AS `__pdw_preview_len_0` FROM `slack``messages` LIMIT 3": {
+		"SELECT substring(\"channel_id\"::text from 1 for 15) AS \"channel_id\", char_length(\"channel_id\"::text) AS \"__pdw_preview_len_0\" FROM \"slack\"\"messages\" LIMIT 3": {
 			Columns: []string{"channel_id", "__pdw_preview_len_0"},
 			Rows:    []map[string]any{{"channel_id": "C123", "__pdw_preview_len_0": 4}},
 		},
@@ -87,17 +90,17 @@ func TestServiceSchemaOverviewUsesShowDescribeAndSamples(t *testing.T) {
 	resp := svc.SchemaOverview(context.Background())
 
 	wantQueries := []string{
-		"SELECT currentDatabase() AS database",
-		"SHOW TABLES",
+		"SELECT current_database() AS database",
+		showTablesSQL,
 	}
 	if strings.Join(runner.queries[:2], "\n") != strings.Join(wantQueries, "\n") {
 		t.Fatalf("first queries = %#v, want %#v", runner.queries[:2], wantQueries)
 	}
 	wantSampleQueries := []string{
-		"DESCRIBE TABLE `gmail_messages`",
-		"SELECT substring(toString(`id`), 1, 15) AS `id`, length(toString(`id`)) AS `__pdw_preview_len_0`, substring(toString(`body`), 1, 15) AS `body`, length(toString(`body`)) AS `__pdw_preview_len_1` FROM `gmail_messages` LIMIT 3",
-		"DESCRIBE TABLE `slack``messages`",
-		"SELECT substring(toString(`channel_id`), 1, 15) AS `channel_id`, length(toString(`channel_id`)) AS `__pdw_preview_len_0` FROM `slack``messages` LIMIT 3",
+		describeGmailSQL,
+		"SELECT substring(\"id\"::text from 1 for 15) AS \"id\", char_length(\"id\"::text) AS \"__pdw_preview_len_0\", substring(\"body\"::text from 1 for 15) AS \"body\", char_length(\"body\"::text) AS \"__pdw_preview_len_1\" FROM \"gmail_messages\" LIMIT 3",
+		describeSlackSQL,
+		"SELECT substring(\"channel_id\"::text from 1 for 15) AS \"channel_id\", char_length(\"channel_id\"::text) AS \"__pdw_preview_len_0\" FROM \"slack\"\"messages\" LIMIT 3",
 	}
 	gotSampleQueries := append([]string(nil), runner.queries[2:]...)
 	slices.Sort(gotSampleQueries)
@@ -115,7 +118,7 @@ func TestServiceSchemaOverviewUsesShowDescribeAndSamples(t *testing.T) {
 		"msg-1,abcdefghijklmno",
 		"msg-2,short",
 		"",
-		"# default.slack`messages",
+		"# default.slack\"messages",
 		"",
 		"channel_id",
 		"C123",
@@ -194,14 +197,14 @@ func TestServiceExecuteTruncatesRowsAndFields(t *testing.T) {
 func TestServiceExecuteReportsPerQueryErrors(t *testing.T) {
 	svc := NewService(fakeRunner{
 		results: map[string]RawResult{"SELECT 1": {Columns: []string{"1"}, Rows: []map[string]any{{"1": 1}}}},
-		errs:    map[string]error{"SELECT broken": errors.New("clickhouse failed")},
+		errs:    map[string]error{"SELECT broken": errors.New("postgres failed")},
 	}, Options{MaxRows: 5, MaxFieldChars: 100})
 
 	resp := svc.Execute(context.Background(), []string{"SELECT broken", "SELECT 1", "DROP TABLE x"}, 20, "csv")
 	if len(resp.Results) != 3 {
 		t.Fatalf("results length = %d", len(resp.Results))
 	}
-	if !strings.Contains(resp.Results[0].Error, "clickhouse failed") {
+	if !strings.Contains(resp.Results[0].Error, "postgres failed") {
 		t.Fatalf("first error = %q", resp.Results[0].Error)
 	}
 	if resp.Results[1].Error != "" || resp.Results[1].QueryID == "" || resp.Results[1].Preview != "1\n1" {

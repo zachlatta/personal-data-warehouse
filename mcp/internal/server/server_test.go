@@ -25,27 +25,27 @@ func (f fakeRunner) Query(_ context.Context, sql string, maxRows int) (query.Raw
 
 func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	runner := fakeRunner{results: map[string]query.RawResult{
-		"SELECT currentDatabase() AS database": {
+		"SELECT current_database() AS database": {
 			Columns: []string{"database"},
 			Rows:    []map[string]any{{"database": "default"}},
 		},
-		"SHOW TABLES": {
+		"SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name": {
 			Columns: []string{"name"},
 			Rows:    []map[string]any{{"name": "gmail_messages"}, {"name": "apple_voice_memos_enrichments"}},
 		},
-		"DESCRIBE TABLE `gmail_messages`": {
-			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
-			Rows:    []map[string]any{{"name": "subject", "type": "String"}},
+		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'gmail_messages' ORDER BY ordinal_position": {
+			Columns: []string{"name"},
+			Rows:    []map[string]any{{"name": "subject"}},
 		},
-		"DESCRIBE TABLE `apple_voice_memos_enrichments`": {
-			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
-			Rows:    []map[string]any{{"name": "transcript", "type": "String"}, {"name": "summary", "type": "String"}},
+		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'apple_voice_memos_enrichments' ORDER BY ordinal_position": {
+			Columns: []string{"name"},
+			Rows:    []map[string]any{{"name": "transcript"}, {"name": "summary"}},
 		},
-		"SELECT substring(toString(`subject`), 1, 15) AS `subject`, length(toString(`subject`)) AS `__pdw_preview_len_0` FROM `gmail_messages` LIMIT 3": {
+		"SELECT substring(\"subject\"::text from 1 for 15) AS \"subject\", char_length(\"subject\"::text) AS \"__pdw_preview_len_0\" FROM \"gmail_messages\" LIMIT 3": {
 			Columns: []string{"subject", "__pdw_preview_len_0"},
 			Rows:    []map[string]any{{"subject": "hello", "__pdw_preview_len_0": 5}},
 		},
-		"SELECT substring(toString(`transcript`), 1, 15) AS `transcript`, length(toString(`transcript`)) AS `__pdw_preview_len_0`, substring(toString(`summary`), 1, 15) AS `summary`, length(toString(`summary`)) AS `__pdw_preview_len_1` FROM `apple_voice_memos_enrichments` LIMIT 3": {
+		"SELECT substring(\"transcript\"::text from 1 for 15) AS \"transcript\", char_length(\"transcript\"::text) AS \"__pdw_preview_len_0\", substring(\"summary\"::text from 1 for 15) AS \"summary\", char_length(\"summary\"::text) AS \"__pdw_preview_len_1\" FROM \"apple_voice_memos_enrichments\" LIMIT 3": {
 			Columns: []string{"transcript", "__pdw_preview_len_0", "summary", "__pdw_preview_len_1"},
 			Rows:    []map[string]any{{"transcript": "meeting words", "__pdw_preview_len_0": 13, "summary": "recap", "__pdw_preview_len_1": 5}},
 		},

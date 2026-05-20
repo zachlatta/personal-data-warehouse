@@ -16,7 +16,7 @@ import (
 )
 
 type queryInput struct {
-	SQL         []string `json:"sql" jsonschema:"array of read-only ClickHouse SQL strings to run"`
+	SQL         []string `json:"sql" jsonschema:"array of read-only Postgres SQL strings to run"`
 	PreviewRows int      `json:"preview_rows,omitempty" jsonschema:"number of initial rows to preview per statement, default 20"`
 	Format      string   `json:"format,omitempty" jsonschema:"preview format: csv, json, or ndjson; default csv"`
 }
@@ -48,9 +48,9 @@ type grepRowsInput struct {
 
 type debugCacheInput struct{}
 
-const serverInstructions = "Read-only ClickHouse warehouse for Zach's personal data. Contains synced Gmail mail and attachment text for configured mailboxes, Slack workspace messages/files/users, calendar data, Apple Voice Memos, transcripts, and transcript enrichments when present. Use for questions about those datasets; query ClickHouse SQL only."
+const serverInstructions = "Read-only Postgres warehouse for Zach's personal data. Contains synced Gmail mail and attachment text for configured mailboxes, Slack workspace messages/files/users, calendar data, Apple Voice Memos, transcripts, and transcript enrichments when present. Use for questions about those datasets; query Postgres SQL only."
 
-const queryDescription = "Execute read-only ClickHouse SQL, cache the full result under query_id, and return a preview. Example: query({\"sql\":[\"SELECT id, transcript FROM voice_memo_transcripts WHERE id='abc'\"],\"preview_rows\":1,\"format\":\"csv\"}) returns query_id plus a truncated preview; then call get_field(query_id,row=0,column=\"transcript\",offset=0,length=200000) to read the full transcript. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: get_rows pages cached rows, grep_rows searches cached rows, schema_overview lists tables."
+const queryDescription = "Execute read-only Postgres SQL, cache the full result under query_id, and return a preview. Example: query({\"sql\":[\"SELECT id, transcript FROM voice_memo_transcripts WHERE id='abc'\"],\"preview_rows\":1,\"format\":\"csv\"}) returns query_id plus a truncated preview; then call get_field(query_id,row=0,column=\"transcript\",offset=0,length=200000) to read the full transcript. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: get_rows pages cached rows, grep_rows searches cached rows, schema_overview lists tables."
 
 const getRowsDescription = "Return a row slice from a cached query result without re-executing SQL. Example: get_rows({\"query_id\":\"abc123\",\"offset\":50,\"limit\":25}) returns rows 50-74 in the query's original format unless format is overridden. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: query creates query_id, get_field reads a long cell, grep_rows searches cached rows."
 
@@ -58,7 +58,7 @@ const getFieldDescription = "Return a raw character chunk from one cached cell, 
 
 const grepRowsDescription = "Regex-search cached query rows without re-executing SQL and return match context. Example: grep_rows({\"query_id\":\"abc123\",\"pattern\":\"weighted projects\",\"columns\":[\"transcript\"],\"limit\":20}) finds where that phrase appears across cached transcripts. Do NOT compute substring offsets in SQL. Use get_field to read the matching long field. Related tools: query creates query_id, get_rows pages rows."
 
-const schemaOverviewDescription = "List tables and columns in the default ClickHouse database with compact samples. Example: schema_overview({}) returns one text section per table. Do NOT compute substring offsets in SQL. Use query to create a query_id, then get_field for long fields. Related tools: query, get_rows, get_field, grep_rows."
+const schemaOverviewDescription = "List tables and columns in the default Postgres schema with compact samples. Example: schema_overview({}) returns one text section per table. Do NOT compute substring offsets in SQL. Use query to create a query_id, then get_field for long fields. Related tools: query, get_rows, get_field, grep_rows."
 
 const schemaToolDescriptionMaxChars = 12000
 
@@ -77,7 +77,7 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	serverLogger.Info("registering MCP tools")
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "query",
-		Title:       "Query ClickHouse",
+		Title:       "Query Postgres",
 		Description: withSchemaDescription(queryDescription, schemaDescription),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input queryInput) (*mcp.CallToolResult, any, error) {
 		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "query", "statements", len(input.SQL))
@@ -152,7 +152,7 @@ func schemaDescriptionForTools(ctx context.Context, runner query.Runner, logger 
 	defer cancel()
 
 	database := "default"
-	if result, err := runner.Query(ctx, "SELECT currentDatabase() AS database", 1); err == nil {
+	if result, err := runner.Query(ctx, "SELECT current_database() AS database", 1); err == nil {
 		if name := rawRowString(result, "database"); name != "" {
 			database = name
 		}
@@ -160,7 +160,7 @@ func schemaDescriptionForTools(ctx context.Context, runner query.Runner, logger 
 		logger.WarnContext(ctx, "tool schema description database lookup failed", "error", err)
 	}
 
-	result, err := runner.Query(ctx, "SHOW TABLES", 0)
+	result, err := runner.Query(ctx, "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name", 0)
 	if err != nil {
 		logger.WarnContext(ctx, "tool schema description table listing failed", "error", err)
 		return ""
@@ -168,7 +168,7 @@ func schemaDescriptionForTools(ctx context.Context, runner query.Runner, logger 
 	tables := rawTableNames(result)
 	entries := make([]string, 0, len(tables))
 	for _, table := range tables {
-		describeSQL := "DESCRIBE TABLE " + quoteClickHouseIdentifier(table)
+		describeSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '" + strings.ReplaceAll(table, "'", "''") + "' ORDER BY ordinal_position"
 		result, err := runner.Query(ctx, describeSQL, 0)
 		if err != nil {
 			logger.WarnContext(ctx, "tool schema description table describe failed", "table", table, "error", err)
@@ -245,10 +245,6 @@ func rawValueString(value any) string {
 	default:
 		return ""
 	}
-}
-
-func quoteClickHouseIdentifier(identifier string) string {
-	return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
 }
 
 func schemaCapabilitySummary(entries []string) string {

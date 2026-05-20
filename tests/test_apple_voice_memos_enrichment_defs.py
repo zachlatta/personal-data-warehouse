@@ -138,11 +138,7 @@ def test_apple_voice_memos_enrichment_backlog_sensor_skips_when_backlog_is_empty
         "load_settings",
         lambda **kwargs: settings_calls.append(kwargs) or FakeSettings(),
     )
-    monkeypatch.setattr(
-        apple_voice_memos_enrichment_defs,
-        "ClickHouseWarehouse",
-        lambda _url: object(),
-    )
+    monkeypatch.setattr(apple_voice_memos_enrichment_defs, "warehouse_from_settings", lambda _settings: object())
     monkeypatch.setattr(
         apple_voice_memos_enrichment_defs,
         "load_enrichment_candidates",
@@ -171,11 +167,7 @@ def test_apple_voice_memos_enrichment_backlog_sensor_launches_when_backlog_exist
         "load_settings",
         lambda **_kwargs: FakeSettings(),
     )
-    monkeypatch.setattr(
-        apple_voice_memos_enrichment_defs,
-        "ClickHouseWarehouse",
-        lambda _url: object(),
-    )
+    monkeypatch.setattr(apple_voice_memos_enrichment_defs, "warehouse_from_settings", lambda _settings: object())
     monkeypatch.setattr(
         apple_voice_memos_enrichment_defs,
         "load_enrichment_candidates",
@@ -193,6 +185,7 @@ def test_apple_voice_memos_enrichment_backlog_sensor_launches_when_backlog_exist
 
 class FakeSettings:
     clickhouse_url = "clickhouse://example"
+    postgres_database_url = "postgresql://example"
     agent = type(
         "FakeAgentConfig",
         (),

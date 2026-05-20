@@ -11,37 +11,37 @@ import (
 const MinSecretTokenLength = 32
 
 type Config struct {
-	Addr               string
-	BaseURL            string
-	ClickHouseURL      string
-	SecretToken        string
-	MaxRows            int
-	MaxFieldChars      int
-	QueryCacheMaxBytes int64
-	GetFieldMaxChars   int
-	QueryCacheTTL      time.Duration
-	DebugCacheTool     bool
-	QueryTimeout       time.Duration
+	Addr                string
+	BaseURL             string
+	PostgresDatabaseURL string
+	SecretToken         string
+	MaxRows             int
+	MaxFieldChars       int
+	QueryCacheMaxBytes  int64
+	GetFieldMaxChars    int
+	QueryCacheTTL       time.Duration
+	DebugCacheTool      bool
+	QueryTimeout        time.Duration
 }
 
 func LoadFromEnv(getenv func(string) string) (Config, error) {
 	cfg := Config{
-		Addr:               valueOrDefault(getenv("MCP_ADDR"), ":8080"),
-		BaseURL:            strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
-		ClickHouseURL:      strings.TrimSpace(getenv("CLICKHOUSE_URL")),
-		SecretToken:        getenv("MCP_SECRET_TOKEN"),
-		MaxRows:            100000,
-		MaxFieldChars:      4000,
-		QueryCacheMaxBytes: 256 * 1024 * 1024,
-		GetFieldMaxChars:   200000,
-		QueryCacheTTL:      30 * time.Minute,
-		DebugCacheTool:     false,
-		QueryTimeout:       300 * time.Second,
+		Addr:                valueOrDefault(getenv("MCP_ADDR"), ":8080"),
+		BaseURL:             strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
+		PostgresDatabaseURL: normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
+		SecretToken:         getenv("MCP_SECRET_TOKEN"),
+		MaxRows:             100000,
+		MaxFieldChars:       4000,
+		QueryCacheMaxBytes:  256 * 1024 * 1024,
+		GetFieldMaxChars:    200000,
+		QueryCacheTTL:       30 * time.Minute,
+		DebugCacheTool:      false,
+		QueryTimeout:        300 * time.Second,
 	}
 
 	var missing []string
-	if cfg.ClickHouseURL == "" {
-		missing = append(missing, "CLICKHOUSE_URL")
+	if cfg.PostgresDatabaseURL == "" {
+		missing = append(missing, "POSTGRES_DATABASE_URL")
 	}
 	if cfg.SecretToken == "" {
 		missing = append(missing, "MCP_SECRET_TOKEN")
@@ -81,6 +81,17 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func normalizePostgresURL(raw string) string {
+	value := strings.TrimSpace(raw)
+	if strings.HasPrefix(value, "postgres://") {
+		return "postgresql://" + strings.TrimPrefix(value, "postgres://")
+	}
+	if strings.HasPrefix(value, "postgresql+psycopg2://") {
+		return "postgresql://" + strings.TrimPrefix(value, "postgresql+psycopg2://")
+	}
+	return value
 }
 
 func valueOrDefault(value, fallback string) string {

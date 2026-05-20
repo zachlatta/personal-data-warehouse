@@ -7,8 +7,6 @@ func TestValidateReadOnlySQLAllowsReadOnlyStatements(t *testing.T) {
 		"SELECT * FROM gmail_messages LIMIT 1",
 		"WITH recent AS (SELECT 1) SELECT * FROM recent",
 		"SHOW TABLES",
-		"DESCRIBE TABLE slack_messages",
-		"DESC gmail_messages",
 		"EXPLAIN SELECT 1",
 		"  SELECT 1;  ",
 	} {

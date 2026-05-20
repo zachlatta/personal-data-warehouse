@@ -8,12 +8,10 @@ import (
 )
 
 var allowedFirstKeywords = map[string]bool{
-	"SELECT":   true,
-	"WITH":     true,
-	"SHOW":     true,
-	"DESCRIBE": true,
-	"DESC":     true,
-	"EXPLAIN":  true,
+	"SELECT":  true,
+	"WITH":    true,
+	"SHOW":    true,
+	"EXPLAIN": true,
 }
 
 var forbiddenKeywords = map[string]bool{
@@ -48,7 +46,7 @@ func ValidateReadOnlySQL(sql string) error {
 		return errors.New("SQL must contain a statement")
 	}
 	if !allowedFirstKeywords[words[0]] {
-		return fmt.Errorf("query tool is read-only; statement must start with SELECT, WITH, SHOW, DESCRIBE, DESC, or EXPLAIN")
+		return fmt.Errorf("query tool is read-only; statement must start with SELECT, WITH, SHOW, or EXPLAIN")
 	}
 	for _, word := range words {
 		if forbiddenKeywords[word] {

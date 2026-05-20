@@ -16,11 +16,11 @@ from dagster import (
     schedule,
 )
 
-from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.slack_sync import SlackSyncRunner, SlackSyncSummary
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
+from personal_data_warehouse.warehouse import warehouse_from_settings
 
 SLACK_SYNC_POSTGRES_LOCK_ID = 7_403_111_837
 
@@ -326,7 +326,7 @@ def slack_workspace_read_state_sync(context) -> MaterializeResult:
 
 def _run_locked_slack_stage(context, *, stage_name: str, run_fn) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_slack=True)
-    warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+    warehouse = warehouse_from_settings(settings)
     with exclusive_sync_lock(name="slack", postgres_lock_id=SLACK_SYNC_POSTGRES_LOCK_ID) as acquired:
         if not acquired:
             context.log.warning("Skipping Slack %s sync because another Slack sync is already running", stage_name)

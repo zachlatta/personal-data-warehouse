@@ -9,6 +9,7 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.slack_sync import (
     SlackRateLimitedError,
     SlackApiCallError,
+    SlackWebApiClient,
     SlackSyncRunner,
     SlackTransientError,
     conversation_to_row,
@@ -231,6 +232,22 @@ class FakeWarehouse:
 
     def existing_slack_message_ids(self, *, account, team_id, conversation_id, oldest_ts, latest_ts):
         return set()
+
+
+def test_slack_web_api_client_uses_bounded_timeout(monkeypatch):
+    captured = {}
+
+    class FakeWebClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("SLACK_API_TIMEOUT_SECONDS", "7")
+    monkeypatch.setattr("personal_data_warehouse.slack_sync.WebClient", FakeWebClient)
+
+    SlackWebApiClient("xoxp-test-token")
+
+    assert captured["token"] == "xoxp-test-token"
+    assert captured["timeout"] == 7
 
 
 def test_slack_config_uses_account_slug_for_token(monkeypatch):
@@ -611,6 +628,54 @@ def test_runner_fails_when_slack_rate_limit_budget_is_exceeded(monkeypatch):
         ).sync_all()
 
     assert sleeps == [2]
+
+
+def test_runner_returns_partial_when_known_error_sync_hits_rate_limit_budget(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    sleeps = []
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "C_RATE_LIMITED", "name": "slow", "is_channel": True},
+        {"id": "C_NOT_REACHED", "name": "later", "is_channel": True},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                SlackRateLimitedError(retry_after=2),
+                SlackRateLimitedError(retry_after=2),
+            ],
+        }
+    )
+
+    summary = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        not_full_only=True,
+        skip_known_errors=True,
+        sync_thread_replies=False,
+        sleep=sleeps.append,
+        max_rate_limit_sleep_seconds=3,
+    ).sync_all()[0]
+
+    assert sleeps == [2]
+    assert summary.conversations_seen == 2
+    assert summary.messages_written == 0
+    assert [params["channel"] for method, params in client.calls if method == "conversations.history"] == [
+        "C_RATE_LIMITED",
+        "C_RATE_LIMITED",
+    ]
+    assert len(warehouse.account_state_refreshes) == 1
+    assert warehouse.account_state_refreshes[0]["account"] == "zrl"
+    assert warehouse.account_state_refreshes[0]["team_id"] == "T1"
 
 
 def test_runner_retries_transient_slack_request_failures(monkeypatch):

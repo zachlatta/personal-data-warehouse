@@ -16,7 +16,6 @@ from personal_data_warehouse.agent_runner import (
     agent_run_row,
     agent_run_tool_call_rows,
 )
-from personal_data_warehouse.clickhouse import _sql_string
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
@@ -28,6 +27,10 @@ LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
 LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS = 12_000
 PROMPT_TRANSCRIPT_WITH_SEGMENTS_MAX_CHARS = 8_000
 PROMPT_TRANSCRIPT_WITHOUT_SEGMENTS_MAX_CHARS = 60_000
+
+
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 PROMPT_GMAIL_MENTIONS_PER_IDENTITY_HINT = 3
 AGENT_USER_PROMPT_INPUT_FILE = "user_prompt.json"
 
@@ -40,7 +43,7 @@ class VoiceMemosEnrichmentSummary:
 
 
 class AgentRunClient(Protocol):
-    def run_with_clickhouse(
+    def run_with_warehouse(
         self,
         request: AgentRunRequest,
         *,
@@ -110,17 +113,17 @@ class ContainerAgentStructuredClient:
             input_files=dict(input_files or {}),
         )
         if self._warehouse is not None:
-            result = self._agent.run_with_clickhouse(request, warehouse=self._warehouse)
+            result = self._agent.run_with_warehouse(request, warehouse=self._warehouse)
         else:
             result = self._agent.run(request)
         self._record_agent_result(result)
         if result.status != "completed":
             raise RuntimeError(result.error or f"agent run {result.run_id} failed")
         required_cli_calls = max(min_tool_calls, 1 if require_tool_call else 0)
-        actual_cli_calls = count_clickhouse_cli_calls(result.events)
+        actual_cli_calls = count_warehouse_cli_calls(result.events)
         if actual_cli_calls < required_cli_calls:
             raise RuntimeError(
-                f"agent ran {actual_cli_calls} ClickHouse CLI calls; {required_cli_calls} required before final output"
+                f"agent ran {actual_cli_calls} warehouse CLI calls; {required_cli_calls} required before final output"
             )
 
         output = dict(result.final_output_json)
@@ -277,14 +280,14 @@ def load_enrichment_candidates(
     filters = [
         "r.provider = 'assemblyai'",
         "r.status = 'completed'",
-        "e.recording_id = ''",
+        "e.recording_id IS NULL",
     ]
     if max_error_attempts > 0:
-        filters.append(f"ifNull(a.error_attempts, 0) < {int(max_error_attempts)}")
+        filters.append(f"COALESCE(a.error_attempts, 0) < {int(max_error_attempts)}")
     if recorded_after is not None:
         if recorded_after.tzinfo is None:
             recorded_after = recorded_after.replace(tzinfo=UTC)
-        filters.append(f"f.recorded_at >= parseDateTimeBestEffort({_sql_string(recorded_after.astimezone(UTC).isoformat())})")
+        filters.append(f"f.recorded_at >= {_sql_string(recorded_after.astimezone(UTC).isoformat())}::timestamptz")
     limit_sql = f"LIMIT {int(limit)}" if limit and limit > 0 else ""
     completed_prompt_filter = f"AND prompt_version = {_sql_string(prompt_version)}" if force_prompt_version else ""
     agent_run_provider = provider.removeprefix("agent_")
@@ -293,7 +296,7 @@ def load_enrichment_candidates(
         error_attempts_join = f"""
         LEFT JOIN
         (
-            SELECT subject_id, count() AS error_attempts
+            SELECT subject_id, count(*) AS error_attempts
             FROM
             (
                 SELECT subject_id
@@ -322,8 +325,8 @@ def load_enrichment_candidates(
             f.recorded_at,
             f.title,
             r.transcript_text
-        FROM apple_voice_memos_files AS f FINAL
-        INNER JOIN apple_voice_memos_transcription_runs AS r FINAL
+        FROM apple_voice_memos_files AS f
+        INNER JOIN apple_voice_memos_transcription_runs AS r
             ON f.account = r.account
               AND f.recording_id = r.recording_id
               AND f.content_sha256 = r.content_sha256
@@ -352,18 +355,21 @@ def load_enrichment_candidates(
 def load_calendar_candidates(warehouse, recording: Mapping[str, Any]) -> list[dict[str, Any]]:
     recorded_at = recording["recorded_at"]
     anchors = recording_time_interpretations(recorded_at)
-    starts = [anchor["utc"].isoformat() for anchor in anchors]
-    starts_sql = "[" + ", ".join(_sql_string(start) for start in starts) + "]"
-    earliest = min(anchor["utc"] for anchor in anchors).isoformat()
-    latest = max(anchor["utc"] for anchor in anchors).isoformat()
+    starts = [anchor["utc"] for anchor in anchors]
+    earliest = min(starts).isoformat()
+    latest = max(starts).isoformat()
+    distance_sql = "LEAST(" + ", ".join(
+        f"ABS(EXTRACT(EPOCH FROM (start_at - {_sql_string(start.isoformat())}::timestamptz)))"
+        for start in starts
+    ) + ")"
     rows = warehouse._query(
         f"""
         SELECT event_id, summary, start_at, end_at, location, attendees_json
         FROM calendar_events
-        WHERE start_at <= parseDateTimeBestEffort({_sql_string(latest)}) + INTERVAL 3 HOUR
-          AND end_at >= parseDateTimeBestEffort({_sql_string(earliest)}) - INTERVAL 3 HOUR
+        WHERE start_at <= {_sql_string(latest)}::timestamptz + INTERVAL '3 hours'
+          AND end_at >= {_sql_string(earliest)}::timestamptz - INTERVAL '3 hours'
           AND is_deleted = 0
-        ORDER BY arrayMin(x -> abs(dateDiff('second', start_at, parseDateTimeBestEffort(x))), {starts_sql})
+        ORDER BY {distance_sql}
         LIMIT 12
         """
     )
@@ -497,7 +503,7 @@ def load_attendee_identity_hints(
     if not emails:
         return hints
 
-    email_list_sql = "[" + ",".join(_sql_string(email) for email in emails) + "]"
+    email_list_sql = "(" + ",".join(_sql_string(email) for email in emails) + ")"
     try:
         slack_rows = warehouse._query(
             f"""
@@ -532,9 +538,9 @@ def load_attendee_identity_hints(
                 f"""
                 SELECT from_address, subject, snippet
                 FROM gmail_messages
-                WHERE positionCaseInsensitive(from_address, {_sql_string(email)}) > 0
-                   OR positionCaseInsensitive(subject, {_sql_string(local_part)}) > 0
-                   OR positionCaseInsensitive(snippet, {_sql_string(local_part)}) > 0
+                WHERE position(lower({_sql_string(email)}) in lower(from_address)) > 0
+                   OR position(lower({_sql_string(local_part)}) in lower(subject)) > 0
+                   OR position(lower({_sql_string(local_part)}) in lower(snippet)) > 0
                 ORDER BY internal_date DESC
                 LIMIT 20
                 """
@@ -1041,7 +1047,7 @@ def container_agent_prompt(
             "Use Bash freely for local scratch scripts and deterministic CLI helpers in the run workspace.",
             "Run \"$PDW_TOOL_HELP\" to see the local CLI tools available in this run.",
             "Use \"$AGENT_INPUT_DIR\" to read large task input files that were intentionally not embedded in this prompt.",
-            "Use \"$PDW_CLICKHOUSE_SCHEMA\" and \"$PDW_CLICKHOUSE_QUERY\" for read-only warehouse research. These call a short-lived proxy; the raw ClickHouse URL is not available in the container.",
+            "Use \"$PDW_POSTGRES_SCHEMA\" and \"$PDW_POSTGRES_QUERY\" for read-only warehouse research. These call a short-lived proxy; the raw Postgres URL is not available in the container.",
             "Before final output, you may write candidate JSON to a file and run \"$PDW_VALIDATE_JSON\" candidate.json \"$AGENT_SCHEMA_PATH\".",
             "These local CLI tools are the only supported tool interface inside the agent container.",
         ],
@@ -1063,15 +1069,29 @@ def container_agent_prompt(
     return json.dumps(payload, sort_keys=True, default=str)
 
 
-def count_clickhouse_cli_calls(events: Sequence[Any]) -> int:
+def count_warehouse_cli_calls(events: Sequence[Any]) -> int:
     count = 0
     for event in events:
         text = str(getattr(event, "text", ""))
-        if "PDW_CLICKHOUSE_QUERY" in text or "pdw-clickhouse-query" in text:
+        if (
+            "PDW_POSTGRES_QUERY" in text
+            or "pdw-postgres-query" in text
+            or "PDW_CLICKHOUSE_QUERY" in text
+            or "pdw-clickhouse-query" in text
+        ):
             count += 1
-        if "PDW_CLICKHOUSE_SCHEMA" in text or "pdw-clickhouse-schema" in text:
+        if (
+            "PDW_POSTGRES_SCHEMA" in text
+            or "pdw-postgres-schema" in text
+            or "PDW_CLICKHOUSE_SCHEMA" in text
+            or "pdw-clickhouse-schema" in text
+        ):
             count += 1
     return count
+
+
+def count_clickhouse_cli_calls(events: Sequence[Any]) -> int:
+    return count_warehouse_cli_calls(events)
 
 
 def enrichment_user_prompt(*, input_file: str = AGENT_USER_PROMPT_INPUT_FILE) -> str:
@@ -1096,12 +1116,12 @@ def enrichment_user_prompt(*, input_file: str = AGENT_USER_PROMPT_INPUT_FILE) ->
                 "use_when_transcript_char_count_at_least": LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS,
                 "explanation": "For long recordings, return the sentinel as transcript. The pipeline assembles the full detailed transcript locally from diarized_segments after metadata, identity, and term research are complete.",
             },
-            "clickhouse_context": {
+            "warehouse_context": {
                 "result_format": "Tool results are CSV with truncation metadata.",
                 "query_notes": [
-                    "Use \"$PDW_CLICKHOUSE_SCHEMA\" output to identify table names, column names, and whether fields are scalar or arrays before writing SQL.",
-                    "For array columns, use array functions such as arrayExists instead of scalar string functions.",
-                    "Compare DateTime columns with toDateTime64('YYYY-MM-DD HH:MM:SS', 3, 'UTC') or a range; do not compare DateTime columns to ISO strings with timezone suffixes.",
+                    "Use \"$PDW_POSTGRES_SCHEMA\" output to identify table names, column names, and whether fields are scalar or arrays before writing SQL.",
+                    "For array columns, use Postgres array operators such as value = ANY(column).",
+                    "Compare timestamptz columns with typed timestamp literals or ranges; do not compare timestamp columns to untyped ISO strings with timezone suffixes.",
                     "Do not add FORMAT clauses; the tool already returns CSV.",
                     "Prefer small LIMITs and focused SELECT columns.",
                 ],
@@ -1152,12 +1172,12 @@ def enrichment_task_input(
 
 def enrichment_instructions() -> list[str]:
     return [
-        "Before final output, read input_data.path, then run \"$PDW_CLICKHOUSE_SCHEMA\" and multiple focused \"$PDW_CLICKHOUSE_QUERY\" calls to search calendar, email, Slack, and related warehouse context.",
+        "Before final output, read input_data.path, then run \"$PDW_POSTGRES_SCHEMA\" and multiple focused \"$PDW_POSTGRES_QUERY\" calls to search calendar, email, Slack, and related warehouse context.",
         "Make separate warehouse checks for: the selected calendar event including attendee data, participant/person identity evidence, and suspicious domain terms or organizations that need spelling verification.",
         "Hard requirements: accurate date/time, accurate participant/name spellings, and accurate domain terms in transcript.",
         "participants means actual people who speak or are strongly evidenced as present. Do not include calendar invitees merely because they were invited, especially if responseStatus is needsAction and there is no transcript evidence they attended.",
-        "If you select a calendar event, start_at and end_at must come from that calendar event or verified ClickHouse context.",
-        "Do not leave participants as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, use \"$PDW_CLICKHOUSE_SCHEMA\" results to query Slack/email identity data before finalizing participants or speaker_map.",
+        "If you select a calendar event, start_at and end_at must come from that calendar event or verified warehouse context.",
+        "Do not leave participants as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, use \"$PDW_POSTGRES_SCHEMA\" results to query Slack/email identity data before finalizing participants or speaker_map.",
         "Do not stop at a one-token name like a Slack display_name or calendar first name. Search Gmail/calendar/Slack context around the event title, email local part, usernames, candidate briefs, and prior messages until you find a full preferred/legal name or have clear evidence none is available.",
         "When a speaker is identified only by a first name, use calendar attendee emails plus Slack/email identity evidence to resolve the full name.",
         "Calendar candidates may include identity_hints for attendee emails. Use possible_names from identity_hints for attendee and speaker names when supported by transcript evidence.",

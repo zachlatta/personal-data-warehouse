@@ -469,10 +469,10 @@ func (s *Service) truncateRowsForOutput(rows []map[string]any) ([]map[string]any
 }
 
 func (s *Service) SchemaOverview(ctx context.Context) Response {
-	const showTablesSQL = "SHOW TABLES"
-	const currentDatabaseSQL = "SELECT currentDatabase() AS database"
+	const showTablesSQL = "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name"
+	const currentDatabaseSQL = "SELECT current_database() AS database"
 	started := time.Now()
-	schemaResult := Result{SQL: "SELECT currentDatabase() + SHOW TABLES + SELECT * FROM <each table> LIMIT 3"}
+	schemaResult := Result{SQL: "SELECT current_database() + information_schema.tables + SELECT * FROM <each table> LIMIT 3"}
 	s.logger.InfoContext(ctx, "schema overview started")
 
 	databaseResult, err := s.runner.Query(ctx, currentDatabaseSQL, 1)
@@ -550,8 +550,8 @@ func (s *Service) sampleTables(ctx context.Context, tables []string) []Result {
 }
 
 func (s *Service) sampleRows(ctx context.Context, table string) Result {
-	tableIdentifier := quoteClickHouseIdentifier(table)
-	describeSQL := "DESCRIBE TABLE " + tableIdentifier
+	tableIdentifier := quotePostgresIdentifier(table)
+	describeSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '" + strings.ReplaceAll(table, "'", "''") + "' ORDER BY ordinal_position"
 	started := time.Now()
 	result := Result{SQL: describeSQL}
 	s.logger.DebugContext(ctx, "schema overview describe started", "table", table, "sql", describeSQL)
@@ -707,11 +707,11 @@ func describedColumnNames(result RawResult) []string {
 func previewSampleSQL(tableIdentifier string, columns []string) string {
 	expressions := make([]string, 0, 2*len(columns))
 	for i, column := range columns {
-		identifier := quoteClickHouseIdentifier(column)
-		lengthAlias := quoteClickHouseIdentifier(previewLengthColumn(i))
+		identifier := quotePostgresIdentifier(column)
+		lengthAlias := quotePostgresIdentifier(previewLengthColumn(i))
 		expressions = append(expressions,
-			fmt.Sprintf("substring(toString(%s), 1, %d) AS %s", identifier, schemaSampleFieldChars, identifier),
-			fmt.Sprintf("length(toString(%s)) AS %s", identifier, lengthAlias),
+			fmt.Sprintf("substring(%s::text from 1 for %d) AS %s", identifier, schemaSampleFieldChars, identifier),
+			fmt.Sprintf("char_length(%s::text) AS %s", identifier, lengthAlias),
 		)
 	}
 	return fmt.Sprintf("SELECT %s FROM %s LIMIT %d", strings.Join(expressions, ", "), tableIdentifier, schemaSampleRows)
@@ -763,8 +763,8 @@ func rowString(row map[string]any, column string) string {
 	return csvValue(value)
 }
 
-func quoteClickHouseIdentifier(identifier string) string {
-	return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
+func quotePostgresIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
 func intValue(value any) int {

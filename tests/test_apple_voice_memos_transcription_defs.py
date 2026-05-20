@@ -47,11 +47,7 @@ def test_apple_voice_memos_transcription_backlog_sensor_skips_when_backlog_is_em
         "load_settings",
         lambda **_kwargs: FakeSettings(),
     )
-    monkeypatch.setattr(
-        apple_voice_memos_transcription_defs,
-        "ClickHouseWarehouse",
-        lambda _url: fake_warehouse,
-    )
+    monkeypatch.setattr(apple_voice_memos_transcription_defs, "warehouse_from_settings", lambda _settings: fake_warehouse)
 
     with DagsterInstance.ephemeral() as instance:
         result = apple_voice_memos_transcription_defs.apple_voice_memos_transcription_backlog_sensor(
@@ -72,8 +68,8 @@ def test_apple_voice_memos_transcription_backlog_sensor_launches_when_backlog_ex
     )
     monkeypatch.setattr(
         apple_voice_memos_transcription_defs,
-        "ClickHouseWarehouse",
-        lambda _url: FakeWarehouse([{"recording_id": "memo-1"}]),
+        "warehouse_from_settings",
+        lambda _settings: FakeWarehouse([{"recording_id": "memo-1"}]),
     )
 
     with DagsterInstance.ephemeral() as instance:
@@ -87,6 +83,7 @@ def test_apple_voice_memos_transcription_backlog_sensor_launches_when_backlog_ex
 
 class FakeSettings:
     clickhouse_url = "clickhouse://example"
+    postgres_database_url = "postgresql://example"
 
 
 class FakeWarehouse:

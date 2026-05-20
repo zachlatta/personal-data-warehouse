@@ -11,7 +11,6 @@ import re
 import tempfile
 from typing import Any
 
-from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.gmail_sync import attachment_content_bytes
 from personal_data_warehouse_voice_memos.storage import ObjectStore, StoredObject
 
@@ -223,7 +222,7 @@ class AliceGmailRecoveryRunner:
 
 def load_alice_gmail_transcript_emails(
     *,
-    warehouse: ClickHouseWarehouse,
+    warehouse: Any,
     accounts: Sequence[str],
 ) -> list[AliceGmailTranscriptEmail]:
     if not accounts:
@@ -243,16 +242,16 @@ def load_alice_gmail_transcript_emails(
             body_markdown_clean,
             body_text,
             body_html
-        FROM gmail_messages FINAL
+        FROM gmail_messages
         WHERE is_deleted = 0
           AND account IN ({account_values})
           AND from_address = 'alice@aliceapp.ai'
           AND (
-              positionCaseInsensitive(snippet, 'recording and transcript') > 0
-              OR positionCaseInsensitive(body_text, 'recording and transcript') > 0
-              OR positionCaseInsensitive(body_html, 'recording and transcript') > 0
-              OR positionCaseInsensitive(body_text, 'Head to the recording page') > 0
-              OR positionCaseInsensitive(body_html, 'Head to the recording page') > 0
+              position(lower('recording and transcript') in lower(snippet)) > 0
+              OR position(lower('recording and transcript') in lower(body_text)) > 0
+              OR position(lower('recording and transcript') in lower(body_html)) > 0
+              OR position(lower('Head to the recording page') in lower(body_text)) > 0
+              OR position(lower('Head to the recording page') in lower(body_html)) > 0
           )
         ORDER BY internal_date
         """
@@ -290,7 +289,7 @@ def load_alice_gmail_transcript_emails(
 
 def load_alice_gmail_attachments(
     *,
-    warehouse: ClickHouseWarehouse,
+    warehouse: Any,
     message_ids_by_account: Mapping[str, Sequence[str]],
 ) -> dict[tuple[str, str], list[AliceGmailAttachment]]:
     clauses = []
@@ -313,7 +312,7 @@ def load_alice_gmail_attachments(
             size,
             content_sha256,
             part_json
-        FROM gmail_attachments FINAL
+        FROM gmail_attachments
         WHERE is_deleted = 0
           AND ({' OR '.join(clauses)})
         ORDER BY internal_date, part_id, filename
@@ -456,4 +455,4 @@ def ensure_utc(value: object) -> datetime:
 
 
 def sql_string(value: str) -> str:
-    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    return "'" + value.replace("'", "''") + "'"

@@ -1,13 +1,13 @@
 # Personal Data Warehouse MCP
 
-This is a Go remote MCP server for querying the ClickHouse warehouse from Claude connectors.
+This is a Go remote MCP server for querying the Postgres warehouse from Claude connectors.
 
 ## Environment
 
 Required:
 
 ```bash
-CLICKHOUSE_URL=...
+POSTGRES_DATABASE_URL=...
 MCP_SECRET_TOKEN=...
 MCP_BASE_URL=https://your-public-coolify-domain
 ```
@@ -69,7 +69,7 @@ Exposed port: 8080
 Set:
 
 ```bash
-CLICKHOUSE_URL=...
+POSTGRES_DATABASE_URL=...
 MCP_SECRET_TOKEN=...
 MCP_BASE_URL=https://your-public-coolify-domain
 ```
@@ -82,7 +82,7 @@ The server exposes cursor-based query tools. `query` executes SQL once, caches t
 
 ### `query`
 
-Executes read-only ClickHouse SQL, caches each result under a generated `query_id`, and returns a preview.
+Executes read-only Postgres SQL, caches each result under a generated `query_id`, and returns a preview.
 
 ```json
 {
@@ -95,7 +95,7 @@ Executes read-only ClickHouse SQL, caches each result under a generated `query_i
 }
 ```
 
-Only read-only statements are allowed: `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `DESC`, and `EXPLAIN`.
+Only read-only statements are allowed: `SELECT`, `WITH`, `SHOW`, and `EXPLAIN`.
 
 Each SQL string in `sql` gets its own `query_id`. `format` may be `csv`, `json`, or `ndjson`; `csv` is the default. Query results over `MCP_MAX_ROWS` are rejected with a clear error. Long preview fields are truncated to `MCP_MAX_FIELD_CHARS`, and truncation metadata is returned as structured data:
 
@@ -196,7 +196,7 @@ sample row 1
 sample row 2
 ```
 
-It uses `currentDatabase()` and `SHOW TABLES` against the current ClickHouse database, then samples up to three rows per table. Sample cell values are capped at 15 characters to keep the preview compact; truncation metadata is included when a preview value is shortened. It does not require access to ClickHouse `system.*` metadata tables.
+It uses `current_database()` and `information_schema` against the current Postgres schema, then samples up to three rows per table. Sample cell values are capped at 15 characters to keep the preview compact; truncation metadata is included when a preview value is shortened.
 
 ### `_debug_cache_status`
 
@@ -210,9 +210,9 @@ go test ./...
 go build -o /tmp/pdw-mcp ./cmd/pdw-mcp
 ```
 
-To verify against the real ClickHouse URL from the repository `.env`:
+To verify against the real Postgres URL from the repository `.env`:
 
 ```bash
 set -a; source ../.env; set +a
-go test ./internal/query -run TestClickHouseRunnerUsesRealClickHouseURL -count=1
+go test ./internal/query -run TestPostgresRunnerUsesRealPostgresDatabaseURL -count=1
 ```

@@ -54,7 +54,7 @@ def test_alice_voice_recordings_asset_writes_summary_metadata(monkeypatch) -> No
 
 def test_alice_gmail_recovery_asset_writes_summary_metadata(monkeypatch) -> None:
     monkeypatch.setattr(alice_defs, "load_settings", lambda **_kwargs: FakeSettings())
-    monkeypatch.setattr(alice_defs, "ClickHouseWarehouse", lambda _url: object())
+    monkeypatch.setattr(alice_defs, "warehouse_from_settings", lambda _settings: object())
     monkeypatch.setattr(alice_defs, "load_alice_gmail_transcript_emails", lambda **_kwargs: [])
     monkeypatch.setattr(alice_defs, "build_google_drive_service", lambda **_kwargs: object())
     monkeypatch.setattr(alice_defs, "build_gmail_service", lambda **_kwargs: object())
@@ -82,6 +82,7 @@ class FakeConfig:
 
 class FakeSettings:
     clickhouse_url = "clickhouse://example"
+    postgres_database_url = "postgresql://example"
     gmail_accounts = ()
     alice_voice_recordings = FakeConfig()
 

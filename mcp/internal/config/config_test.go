@@ -6,19 +6,19 @@ import (
 	"time"
 )
 
-func TestLoadFromEnvRequiresClickHouseURLAndSecret(t *testing.T) {
+func TestLoadFromEnvRequiresPostgresURLAndSecret(t *testing.T) {
 	_, err := LoadFromEnv(func(string) string { return "" })
 	if err == nil {
 		t.Fatal("expected missing env error")
 	}
-	if !strings.Contains(err.Error(), "CLICKHOUSE_URL") || !strings.Contains(err.Error(), "MCP_SECRET_TOKEN") {
+	if !strings.Contains(err.Error(), "POSTGRES_DATABASE_URL") || !strings.Contains(err.Error(), "MCP_SECRET_TOKEN") {
 		t.Fatalf("error should mention both missing env vars, got %q", err.Error())
 	}
 }
 
 func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	env := map[string]string{
-		"CLICKHOUSE_URL":            "https://default:secret@example.com/default?secure=true",
+		"POSTGRES_DATABASE_URL":     "postgres://default:secret@example.com/default",
 		"MCP_SECRET_TOKEN":          "0123456789abcdef0123456789abcdef",
 		"MCP_ADDR":                  ":9090",
 		"MCP_BASE_URL":              "https://mcp.example.com/",
@@ -51,12 +51,15 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	if cfg.QueryTimeout != 42*time.Second {
 		t.Fatalf("QueryTimeout = %s", cfg.QueryTimeout)
 	}
+	if cfg.PostgresDatabaseURL != "postgresql://default:secret@example.com/default" {
+		t.Fatalf("PostgresDatabaseURL = %q", cfg.PostgresDatabaseURL)
+	}
 }
 
 func TestLoadFromEnvRejectsWeakSecretToken(t *testing.T) {
 	env := map[string]string{
-		"CLICKHOUSE_URL":   "https://default:secret@example.com/default?secure=true",
-		"MCP_SECRET_TOKEN": "short",
+		"POSTGRES_DATABASE_URL": "postgresql://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":      "short",
 	}
 	_, err := LoadFromEnv(func(key string) string { return env[key] })
 	if err == nil {

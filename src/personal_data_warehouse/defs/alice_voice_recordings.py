@@ -13,7 +13,6 @@ from dagster import (
 )
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.gmail_sync import build_gmail_service
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
@@ -25,6 +24,7 @@ from personal_data_warehouse_alice_voice_recordings.gmail_recovery import (
 from personal_data_warehouse_alice_voice_recordings.sync import SOURCE, AliceVoiceRecordingsImportRunner
 from personal_data_warehouse_voice_memos.cli import build_google_drive_service
 from personal_data_warehouse_voice_memos.google_drive_storage import GoogleDriveObjectStore
+from personal_data_warehouse.warehouse import warehouse_from_settings
 
 ALICE_VOICE_RECORDINGS_IMPORT_POSTGRES_LOCK_ID = 7_403_111_840
 
@@ -96,7 +96,6 @@ def alice_voice_recordings_import(context) -> MaterializeResult:
 )
 def alice_voice_recordings_gmail_recovery(context) -> MaterializeResult:
     settings = load_settings(
-        require_clickhouse=True,
         require_gmail=False,
         require_alice_voice_recordings=True,
     )
@@ -112,7 +111,7 @@ def alice_voice_recordings_gmail_recovery(context) -> MaterializeResult:
             context.log.warning("Skipping Alice Gmail recovery because another run is already active")
             summary = None
         else:
-            warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+            warehouse = warehouse_from_settings(settings)
             emails = load_alice_gmail_transcript_emails(
                 warehouse=warehouse,
                 accounts=[account.email_address for account in settings.gmail_accounts],

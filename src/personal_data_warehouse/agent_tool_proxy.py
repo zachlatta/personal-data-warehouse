@@ -8,13 +8,13 @@ import secrets
 import threading
 from typing import Any
 
-from personal_data_warehouse.clickhouse_readonly import ClickHouseReadOnlyService
+from personal_data_warehouse.postgres_readonly import PostgresReadOnlyService
 
 
 @contextmanager
 def run_agent_tool_proxy(
     *,
-    query_service: ClickHouseReadOnlyService,
+    query_service: PostgresReadOnlyService,
     bind_host: str = "0.0.0.0",
     public_host: str = "host.docker.internal",
 ) -> Iterator[dict[str, str]]:

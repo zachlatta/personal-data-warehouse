@@ -15,12 +15,12 @@ from dagster import (
 )
 from dotenv import load_dotenv
 
-from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import (
     DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL,
     DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS,
     load_settings,
 )
+from personal_data_warehouse.warehouse import warehouse_from_settings
 from personal_data_warehouse.gmail_sync import (
     GmailSyncRunner,
     attachment_ai_fallback_config_from_settings,
@@ -79,7 +79,7 @@ def gmail_mailbox_sync(context, ollama: OllamaResource) -> MaterializeResult:
         ollama=ollama,
         logger=context.log,
     )
-    warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+    warehouse = warehouse_from_settings(settings)
     summaries = GmailSyncRunner(
         settings=settings,
         warehouse=warehouse,

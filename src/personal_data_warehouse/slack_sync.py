@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import argparse
 import json
+import os
 import time
 from typing import Any
 
@@ -14,6 +15,7 @@ from slack_sdk.errors import SlackApiError, SlackRequestError
 from personal_data_warehouse.config import Settings, SlackAccount, load_settings
 
 SLACK_CONVERSATION_TYPES = "public_channel,private_channel,mpim,im"
+DEFAULT_SLACK_API_TIMEOUT_SECONDS = 30
 
 
 class SlackRateLimitedError(Exception):
@@ -47,7 +49,10 @@ class SlackSyncSummary:
 
 class SlackWebApiClient:
     def __init__(self, token: str) -> None:
-        self._client = WebClient(token=token)
+        timeout = int(os.getenv("SLACK_API_TIMEOUT_SECONDS", str(DEFAULT_SLACK_API_TIMEOUT_SECONDS)))
+        if timeout < 1:
+            raise ValueError("SLACK_API_TIMEOUT_SECONDS must be at least 1")
+        self._client = WebClient(token=token, timeout=timeout)
 
     def call(self, method: str, **params) -> dict[str, Any]:
         try:
@@ -330,6 +335,24 @@ class SlackSyncRunner:
                         sync_version=sync_version,
                         oldest_ts=oldest_ts,
                     )
+                except SlackRateLimitBudgetExceeded as exc:
+                    if self._skip_known_errors:
+                        self._logger.warning(
+                            "Stopping Slack conversation sync for %s after rate limit budget was exhausted at %s: %s",
+                            account.account,
+                            conversation_id,
+                            exc,
+                        )
+                        return SlackSyncSummary(
+                            account=account.account,
+                            team_id=team_id,
+                            sync_type=sync_type,
+                            conversations_seen=conversations_seen,
+                            messages_written=messages_written,
+                            users_written=users_written,
+                            files_written=files_written,
+                        )
+                    raise
                 except SlackApiCallError as exc:
                     self._record_conversation_error(
                         account=account.account,
@@ -572,6 +595,17 @@ class SlackSyncRunner:
                     synced_at=synced_at,
                     sync_version=sync_version,
                 )
+            except SlackRateLimitBudgetExceeded as exc:
+                if self._skip_known_errors:
+                    self._logger.warning(
+                        "Stopping Slack thread sync for %s after rate limit budget was exhausted at %s/%s: %s",
+                        account.account,
+                        conversation_id,
+                        thread_ts,
+                        exc,
+                    )
+                    break
+                raise
             except SlackApiCallError as exc:
                 self._logger.warning("Could not sync Slack thread %s in %s: %s", thread_ts, conversation_id, exc)
                 self._warehouse.insert_slack_sync_state(
@@ -1393,7 +1427,7 @@ def run_loop(*, runner_factory: Callable[[], SlackSyncRunner], duration: timedel
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sync Slack workspace data into ClickHouse.")
+    parser = argparse.ArgumentParser(description="Sync Slack workspace data into Postgres.")
     parser.add_argument("--validate-only", action="store_true", help="Validate Slack credentials without syncing data")
     parser.add_argument("--loop", action="store_true", help="Run repeatedly until --duration elapses")
     parser.add_argument("--duration", default="30m", help="Loop duration like 30m, 1h, 3h, 1d")
@@ -1479,10 +1513,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from personal_data_warehouse.clickhouse import ClickHouseWarehouse
+    from personal_data_warehouse.warehouse import warehouse_from_settings
 
     settings = load_settings(require_gmail=False, require_slack=True)
-    warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+    warehouse = warehouse_from_settings(settings)
     history_window = timedelta(minutes=args.history_window_minutes) if args.history_window_minutes else None
 
     class PrintLogger:

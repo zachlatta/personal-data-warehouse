@@ -15,7 +15,7 @@ from personal_data_warehouse.agent_runner import (
     write_builtin_cli_tools,
 )
 from personal_data_warehouse.agent_tool_proxy import run_agent_tool_proxy
-from personal_data_warehouse.clickhouse_readonly import ClickHouseReadOnlyService, RawResult
+from personal_data_warehouse.postgres_readonly import PostgresReadOnlyService, RawResult
 
 
 pytestmark = pytest.mark.skipif(
@@ -126,7 +126,7 @@ def test_live_agent_builtin_cli_can_query_host_proxy(tmp_path) -> None:
         def query(self, sql, *, max_rows):
             return RawResult(columns=["answer"], rows=[{"answer": 42}])
 
-    service = ClickHouseReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
+    service = PostgresReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
     with run_agent_tool_proxy(query_service=service) as env:
         completed = subprocess.run(
             [
@@ -146,7 +146,7 @@ def test_live_agent_builtin_cli_can_query_host_proxy(tmp_path) -> None:
                 config.image,
                 "sh",
                 "-lc",
-                "export PATH=/run/tools:$PATH && pdw-clickhouse-query 'SELECT 42 AS answer'",
+                "export PATH=/run/tools:$PATH && pdw-postgres-query 'SELECT 42 AS answer'",
             ],
             capture_output=True,
             text=True,

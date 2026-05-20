@@ -28,8 +28,8 @@ from personal_data_warehouse.agent_runner import (
     write_builtin_cli_tools,
 )
 from personal_data_warehouse.agent_tool_proxy import run_agent_tool_proxy
-from personal_data_warehouse.clickhouse_readonly import ClickHouseReadOnlyService, RawResult
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.postgres_readonly import PostgresReadOnlyService, RawResult
 
 
 def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> None:
@@ -56,11 +56,12 @@ def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> N
     assert "OPENAI_API_KEY" not in " ".join(command)
     assert "ANTHROPIC_API_KEY" not in " ".join(command)
     assert "CLICKHOUSE_URL" not in " ".join(command)
+    assert "POSTGRES_DATABASE_URL" not in " ".join(command)
     assert "type=volume,src=pdw-agent-auth,dst=/agent-auth" in command
     assert "type=volume,src=pdw-agent-runs,dst=/agent-runs" in command
     assert "--add-host" in command
     assert "host.docker.internal:host-gateway" in command
-    assert any(item.endswith("/tools/pdw-clickhouse-query") for item in command if item.startswith("PDW_CLICKHOUSE_QUERY="))
+    assert any(item.endswith("/tools/pdw-postgres-query") for item in command if item.startswith("PDW_POSTGRES_QUERY="))
 
 
 def test_container_agent_runner_writes_prompt_schema_and_parses_final_json(tmp_path) -> None:
@@ -88,8 +89,8 @@ def test_container_agent_runner_writes_prompt_schema_and_parses_final_json(tmp_p
     assert result.final_output_json == {"meeting_title": "Done"}
     assert result.events[0].event_type == "agent_message"
     assert (tmp_path / "run-1" / "tools" / "pdw-validate-json").exists()
-    assert (tmp_path / "run-1" / "tools" / "pdw-clickhouse-query").exists()
-    assert (tmp_path / "run-1" / "tools" / "pdw-clickhouse-schema").exists()
+    assert (tmp_path / "run-1" / "tools" / "pdw-postgres-query").exists()
+    assert (tmp_path / "run-1" / "tools" / "pdw-postgres-schema").exists()
     assert (tmp_path / "run-1" / "TOOLS.md").exists()
 
 
@@ -126,7 +127,7 @@ def test_container_agent_runner_builds_missing_managed_image_before_run(tmp_path
     assert build_index < agent_run_index
 
 
-def test_container_agent_runner_can_inject_clickhouse_proxy_without_raw_url(tmp_path) -> None:
+def test_container_agent_runner_can_inject_postgres_proxy_without_raw_url(tmp_path) -> None:
     volume_copy_calls = 0
     agent_command = []
 
@@ -146,7 +147,7 @@ def test_container_agent_runner_can_inject_clickhouse_proxy_without_raw_url(tmp_
         tool_proxy_bind_host="127.0.0.1",
         tool_proxy_public_host="127.0.0.1",
     )
-    result = ContainerAgentRunner(config, runner=fake_run).run_with_clickhouse(
+    result = ContainerAgentRunner(config, runner=fake_run).run_with_warehouse(
         AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1"),
         warehouse=object(),
     )
@@ -155,8 +156,9 @@ def test_container_agent_runner_can_inject_clickhouse_proxy_without_raw_url(tmp_
     assert result.status == "completed"
     assert "PDW_AGENT_TOOL_PROXY_URL=http://127.0.0.1:" in joined
     assert "PDW_AGENT_TOOL_PROXY_TOKEN=" in joined
-    assert "PDW_CLICKHOUSE_QUERY=" in joined
+    assert "PDW_POSTGRES_QUERY=" in joined
     assert "CLICKHOUSE_URL" not in joined
+    assert "POSTGRES_DATABASE_URL" not in joined
 
 
 def test_container_agent_runner_writes_input_files_and_exports_input_dir(tmp_path) -> None:
@@ -256,7 +258,7 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
                     "type": "item.completed",
                     "item": {
                         "type": "command_execution",
-                        "command": '/bin/bash -lc "$PDW_CLICKHOUSE_QUERY SELECT 1"',
+                        "command": '/bin/bash -lc "$PDW_POSTGRES_QUERY SELECT 1"',
                         "aggregated_output": '{"csv":"1\\n1"}',
                         "exit_code": 0,
                         "status": "completed",
@@ -272,9 +274,9 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
     assert agent_run_row(result)["prompt_version"] == "prompt-v1"
     assert agent_run_event_rows(result)[0]["event_type"] == "mcp_tool_call"
     tool_rows = agent_run_tool_call_rows(result)
-    assert [row["tool_name"] for row in tool_rows] == ["query", "pdw-clickhouse-query"]
+    assert [row["tool_name"] for row in tool_rows] == ["query", "pdw-postgres-query"]
     assert tool_rows[0]["arguments_json"] == '{"sql":"SELECT 1"}'
-    assert "PDW_CLICKHOUSE_QUERY" in tool_rows[1]["arguments_json"]
+    assert "PDW_POSTGRES_QUERY" in tool_rows[1]["arguments_json"]
 
 
 def test_container_agent_runner_rejects_oversized_prompt_before_docker(tmp_path) -> None:
@@ -456,17 +458,17 @@ def test_builtin_cli_tools_validate_json(tmp_path) -> None:
     assert completed.stdout.strip() == "ok"
 
 
-def test_builtin_cli_tools_query_clickhouse_proxy(tmp_path) -> None:
+def test_builtin_cli_tools_query_postgres_proxy(tmp_path) -> None:
     class FakeRunner:
         def query(self, sql, *, max_rows):
             assert max_rows == 3
             return RawResult(columns=["answer"], rows=[{"answer": 42}])
 
     write_builtin_cli_tools(tmp_path)
-    service = ClickHouseReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
+    service = PostgresReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
     with run_agent_tool_proxy(query_service=service, bind_host="127.0.0.1", public_host="127.0.0.1") as env:
         completed = subprocess.run(
-            [str(tmp_path / "tools" / "pdw-clickhouse-query"), "SELECT 42 AS answer"],
+            [str(tmp_path / "tools" / "pdw-postgres-query"), "SELECT 42 AS answer"],
             env={**env, "PATH": os.environ.get("PATH", "")},
             capture_output=True,
             text=True,
@@ -485,10 +487,10 @@ def test_builtin_cli_tools_reject_write_queries_through_proxy(tmp_path) -> None:
             raise AssertionError("write query should be rejected before runner")
 
     write_builtin_cli_tools(tmp_path)
-    service = ClickHouseReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
+    service = PostgresReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
     with run_agent_tool_proxy(query_service=service, bind_host="127.0.0.1", public_host="127.0.0.1") as env:
         completed = subprocess.run(
-            [str(tmp_path / "tools" / "pdw-clickhouse-query"), "DROP TABLE apple_voice_memos_enrichments"],
+            [str(tmp_path / "tools" / "pdw-postgres-query"), "DROP TABLE apple_voice_memos_enrichments"],
             env={**env, "PATH": os.environ.get("PATH", "")},
             capture_output=True,
             text=True,
@@ -500,7 +502,7 @@ def test_builtin_cli_tools_reject_write_queries_through_proxy(tmp_path) -> None:
     assert "read-only" in payload["error"]
 
 
-def test_agent_tool_proxy_serializes_clickhouse_queries() -> None:
+def test_agent_tool_proxy_serializes_postgres_queries() -> None:
     active = 0
     max_active = 0
     guard = threading.Lock()
@@ -518,7 +520,7 @@ def test_agent_tool_proxy_serializes_clickhouse_queries() -> None:
                 with guard:
                     active -= 1
 
-    service = ClickHouseReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
+    service = PostgresReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
     with run_agent_tool_proxy(query_service=service, bind_host="127.0.0.1", public_host="127.0.0.1") as env:
         results = []
 
@@ -587,6 +589,7 @@ def test_load_settings_reads_agent_config_without_api_keys(monkeypatch) -> None:
     assert settings.agent.provider == "claude"
     assert settings.agent.model == "claude-test"
     assert settings.agent.docker_image.startswith("personal-data-warehouse-agent:")
+    assert settings.agent.runs_dir == ".agent-runs"
     assert settings.agent.tool_proxy_public_host == "dagster"
 
 

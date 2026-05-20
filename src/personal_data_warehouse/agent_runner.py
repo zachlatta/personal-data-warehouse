@@ -16,12 +16,12 @@ import uuid
 from typing import Any
 
 from personal_data_warehouse.agent_tool_proxy import run_agent_tool_proxy
-from personal_data_warehouse.clickhouse_readonly import ClickHouseReadOnlyRunner, ClickHouseReadOnlyService
+from personal_data_warehouse.postgres_readonly import PostgresReadOnlyRunner, PostgresReadOnlyService
 
 
 DEFAULT_AGENT_AUTH_VOLUME = "pdw-agent-auth"
 DEFAULT_AGENT_RUNS_VOLUME = "pdw-agent-runs"
-DEFAULT_AGENT_RUNS_DIR = "/agent-runs"
+DEFAULT_AGENT_RUNS_DIR = ".agent-runs"
 DEFAULT_AGENT_CONTAINER_AUTH_DIR = "/agent-auth"
 DEFAULT_AGENT_CONTAINER_RUNS_DIR = "/agent-runs"
 DEFAULT_AGENT_TOOLS_DIR_NAME = "tools"
@@ -239,7 +239,7 @@ class ContainerAgentRunner:
             events=events,
         )
 
-    def run_with_clickhouse(
+    def run_with_warehouse(
         self,
         request: AgentRunRequest,
         *,
@@ -247,8 +247,8 @@ class ContainerAgentRunner:
         max_rows: int = 50,
         max_field_chars: int = 3000,
     ) -> AgentRunResult:
-        query_service = ClickHouseReadOnlyService(
-            ClickHouseReadOnlyRunner(warehouse),
+        query_service = PostgresReadOnlyService(
+            PostgresReadOnlyRunner(warehouse),
             max_rows=max_rows,
             max_field_chars=max_field_chars,
         )
@@ -258,6 +258,21 @@ class ContainerAgentRunner:
             public_host=self._config.tool_proxy_public_host,
         ) as tool_env:
             return self.run(request.with_extra_env(tool_env))
+
+    def run_with_clickhouse(
+        self,
+        request: AgentRunRequest,
+        *,
+        warehouse,
+        max_rows: int = 50,
+        max_field_chars: int = 3000,
+    ) -> AgentRunResult:
+        return self.run_with_warehouse(
+            request,
+            warehouse=warehouse,
+            max_rows=max_rows,
+            max_field_chars=max_field_chars,
+        )
 
     def _ensure_managed_image(self) -> None:
         if self._config.image != default_agent_docker_image():
@@ -350,9 +365,9 @@ class ContainerAgentRunner:
             "--env",
             f"PDW_VALIDATE_JSON={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-validate-json",
             "--env",
-            f"PDW_CLICKHOUSE_SCHEMA={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-clickhouse-schema",
+            f"PDW_POSTGRES_SCHEMA={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-postgres-schema",
             "--env",
-            f"PDW_CLICKHOUSE_QUERY={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-clickhouse-query",
+            f"PDW_POSTGRES_QUERY={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-postgres-query",
             "--env",
             f"CODEX_HOME={DEFAULT_AGENT_CONTAINER_AUTH_DIR}/codex",
             "--env",
@@ -493,10 +508,14 @@ def extract_tool_name(payload: Mapping[str, Any]) -> str:
     item = payload.get("item")
     if isinstance(item, Mapping) and item.get("type") == "command_execution":
         command = str(item.get("command") or "")
+        if "pdw-postgres-query" in command or "PDW_POSTGRES_QUERY" in command:
+            return "pdw-postgres-query"
+        if "pdw-postgres-schema" in command or "PDW_POSTGRES_SCHEMA" in command:
+            return "pdw-postgres-schema"
         if "pdw-clickhouse-query" in command or "PDW_CLICKHOUSE_QUERY" in command:
-            return "pdw-clickhouse-query"
+            return "pdw-postgres-query"
         if "pdw-clickhouse-schema" in command or "PDW_CLICKHOUSE_SCHEMA" in command:
-            return "pdw-clickhouse-schema"
+            return "pdw-postgres-schema"
         if "pdw-validate-json" in command or "PDW_VALIDATE_JSON" in command:
             return "pdw-validate-json"
         return "bash"
@@ -663,13 +682,13 @@ def write_builtin_cli_tools(run_dir: Path) -> None:
     validate_tool.write_text(PDW_VALIDATE_JSON_SCRIPT, encoding="utf-8")
     validate_tool.chmod(0o755)
 
-    clickhouse_query_tool = tools_dir / "pdw-clickhouse-query"
-    clickhouse_query_tool.write_text(PDW_CLICKHOUSE_QUERY_SCRIPT, encoding="utf-8")
-    clickhouse_query_tool.chmod(0o755)
+    postgres_query_tool = tools_dir / "pdw-postgres-query"
+    postgres_query_tool.write_text(PDW_POSTGRES_QUERY_SCRIPT, encoding="utf-8")
+    postgres_query_tool.chmod(0o755)
 
-    clickhouse_schema_tool = tools_dir / "pdw-clickhouse-schema"
-    clickhouse_schema_tool.write_text(PDW_CLICKHOUSE_SCHEMA_SCRIPT, encoding="utf-8")
-    clickhouse_schema_tool.chmod(0o755)
+    postgres_schema_tool = tools_dir / "pdw-postgres-schema"
+    postgres_schema_tool.write_text(PDW_POSTGRES_SCHEMA_SCRIPT, encoding="utf-8")
+    postgres_schema_tool.chmod(0o755)
 
     help_tool = tools_dir / "pdw-tool-help"
     help_tool.write_text(PDW_TOOL_HELP_SCRIPT, encoding="utf-8")
@@ -681,7 +700,7 @@ def write_builtin_cli_tools(run_dir: Path) -> None:
 def cli_tool_manifest() -> str:
     return """# Agent CLI Tools
 
-These commands live in `$AGENT_TOOLS_DIR` inside the agent container. The runner also exports absolute path helpers: `$PDW_TOOL_HELP`, `$PDW_VALIDATE_JSON`, `$PDW_CLICKHOUSE_SCHEMA`, and `$PDW_CLICKHOUSE_QUERY`.
+These commands live in `$AGENT_TOOLS_DIR` inside the agent container. The runner also exports absolute path helpers: `$PDW_TOOL_HELP`, `$PDW_VALIDATE_JSON`, `$PDW_POSTGRES_SCHEMA`, and `$PDW_POSTGRES_QUERY`.
 
 ## pdw-tool-help
 
@@ -705,19 +724,19 @@ Usage:
 
 Supported schema checks: object root, required keys, additionalProperties=false, and primitive `string`, `number`, `integer`, `boolean`, `array`, and `object` property types.
 
-## pdw-clickhouse-schema
+## pdw-postgres-schema
 
-Print a compact read-only ClickHouse schema overview through the per-run tool proxy.
+Print a compact read-only Postgres schema overview through the per-run tool proxy.
 
-## pdw-clickhouse-query
+## pdw-postgres-query
 
-Run one read-only ClickHouse query through the per-run tool proxy. The raw ClickHouse URL is not available in the agent container.
+Run one read-only Postgres query through the per-run tool proxy. The raw Postgres URL is not available in the agent container.
 
 Usage:
 
 ```bash
-"$PDW_CLICKHOUSE_QUERY" "SELECT * FROM calendar_events LIMIT 5"
-cat query.sql | "$PDW_CLICKHOUSE_QUERY"
+"$PDW_POSTGRES_QUERY" "SELECT * FROM calendar_events LIMIT 5"
+cat query.sql | "$PDW_POSTGRES_QUERY"
 ```
 """
 
@@ -814,7 +833,7 @@ if __name__ == "__main__":
 """
 
 
-PDW_CLICKHOUSE_CLIENT_PY = r'''
+PDW_POSTGRES_CLIENT_PY = r'''
 from __future__ import annotations
 
 import json
@@ -827,7 +846,7 @@ def proxy_request(path: str, payload: dict[str, object]) -> int:
     base_url = os.getenv("PDW_AGENT_TOOL_PROXY_URL", "").rstrip("/")
     token = os.getenv("PDW_AGENT_TOOL_PROXY_TOKEN", "")
     if not base_url or not token:
-        print("ClickHouse proxy is not configured for this agent run", file=sys.stderr)
+        print("Postgres proxy is not configured for this agent run", file=sys.stderr)
         return 2
     body = json.dumps(payload).encode("utf-8")
     req = request.Request(
@@ -847,20 +866,20 @@ def proxy_request(path: str, payload: dict[str, object]) -> int:
         print(text or str(exc), file=sys.stderr)
         return 1
     except Exception as exc:
-        print(f"ClickHouse proxy request failed: {exc}", file=sys.stderr)
+        print(f"Postgres proxy request failed: {exc}", file=sys.stderr)
         return 1
     print(text)
     return 0
 '''
 
 
-PDW_CLICKHOUSE_QUERY_SCRIPT = f"""#!/usr/bin/env python3
-{PDW_CLICKHOUSE_CLIENT_PY}
+PDW_POSTGRES_QUERY_SCRIPT = f"""#!/usr/bin/env python3
+{PDW_POSTGRES_CLIENT_PY}
 
 
 def main(argv: list[str]) -> int:
     if len(argv) > 2:
-        print("usage: pdw-clickhouse-query [SQL]", file=sys.stderr)
+        print("usage: pdw-postgres-query [SQL]", file=sys.stderr)
         return 2
     sql = argv[1] if len(argv) == 2 else sys.stdin.read()
     return proxy_request("/query", {{"sql": sql}})
@@ -871,13 +890,13 @@ if __name__ == "__main__":
 """
 
 
-PDW_CLICKHOUSE_SCHEMA_SCRIPT = f"""#!/usr/bin/env python3
-{PDW_CLICKHOUSE_CLIENT_PY}
+PDW_POSTGRES_SCHEMA_SCRIPT = f"""#!/usr/bin/env python3
+{PDW_POSTGRES_CLIENT_PY}
 
 
 def main(argv: list[str]) -> int:
     if len(argv) != 1:
-        print("usage: pdw-clickhouse-schema", file=sys.stderr)
+        print("usage: pdw-postgres-schema", file=sys.stderr)
         return 2
     return proxy_request("/schema", {{}})
 

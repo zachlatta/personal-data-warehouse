@@ -622,16 +622,16 @@ def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit
         recorded_after=datetime(2026, 3, 3, tzinfo=UTC),
     )
 
-    assert "f.recorded_at >= parseDateTimeBestEffort('2026-03-03T00:00:00+00:00')" in queries[0]
+    assert "f.recorded_at >= '2026-03-03T00:00:00+00:00'::timestamptz" in queries[0]
     assert "LIMIT" not in queries[0]
-    assert "FROM apple_voice_memos_files AS f FINAL" in queries[0]
-    assert "INNER JOIN apple_voice_memos_transcription_runs AS r FINAL" in queries[0]
+    assert "FROM apple_voice_memos_files AS f" in queries[0]
+    assert "INNER JOIN apple_voice_memos_transcription_runs AS r" in queries[0]
     assert "FROM apple_voice_memos_enrichments" in queries[0]
     assert "r.content_sha256" in queries[0]
     assert "f.content_sha256 = r.content_sha256" in queries[0]
     assert "e.content_sha256 = r.content_sha256" in queries[0]
     assert "AND prompt_version = 'test-prompt'\n              AND status = 'completed'" not in queries[0]
-    assert "ifNull(a.error_attempts, 0) < 5" in queries[0]
+    assert "COALESCE(a.error_attempts, 0) < 5" in queries[0]
 
 
 def test_load_enrichment_candidates_keeps_limit_when_configured() -> None:
@@ -695,8 +695,8 @@ def test_load_enrichment_candidates_uses_agent_error_budget() -> None:
     assert "FROM apple_voice_memos_enrichments" in queries[0]
     assert "provider = 'codex'" in queries[0]
     assert "provider = 'agent_codex'" in queries[0]
-    assert "prompt_version = 'test-prompt'" not in queries[0].split("SELECT subject_id, count() AS error_attempts", 1)[1]
-    assert "ifNull(a.error_attempts, 0) < 7" in queries[0]
+    assert "prompt_version = 'test-prompt'" not in queries[0].split("SELECT subject_id, count(*) AS error_attempts", 1)[1]
+    assert "COALESCE(a.error_attempts, 0) < 7" in queries[0]
 
 
 def test_load_enrichment_candidates_can_disable_agent_error_budget() -> None:

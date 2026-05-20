@@ -22,9 +22,9 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("configuration loaded", "addr", cfg.Addr, "base_url", cfg.BaseURL, "max_rows", cfg.MaxRows, "max_field_chars", cfg.MaxFieldChars, "query_timeout", cfg.QueryTimeout)
-	runner, err := query.NewClickHouseRunner(cfg.ClickHouseURL, cfg.QueryTimeout)
+	runner, err := query.NewPostgresRunner(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
 	if err != nil {
-		logger.Error("connect to ClickHouse failed", "error", err)
+		logger.Error("connect to Postgres failed", "error", err)
 		os.Exit(1)
 	}
 	defer runner.Close()

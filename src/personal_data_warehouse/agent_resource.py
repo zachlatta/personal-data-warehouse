@@ -89,7 +89,7 @@ class AgentResource(ConfigurableResource):
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         return self.runner().run(self._effective_request(request))
 
-    def run_with_clickhouse(
+    def run_with_warehouse(
         self,
         request: AgentRunRequest,
         *,
@@ -98,8 +98,23 @@ class AgentResource(ConfigurableResource):
         max_field_chars: int = 3000,
     ) -> AgentRunResult:
         effective_request = self._effective_request(request)
-        return self.runner().run_with_clickhouse(
+        return self.runner().run_with_warehouse(
             effective_request,
+            warehouse=warehouse,
+            max_rows=max_rows,
+            max_field_chars=max_field_chars,
+        )
+
+    def run_with_clickhouse(
+        self,
+        request: AgentRunRequest,
+        *,
+        warehouse,
+        max_rows: int = 50,
+        max_field_chars: int = 3000,
+    ) -> AgentRunResult:
+        return self.run_with_warehouse(
+            request,
             warehouse=warehouse,
             max_rows=max_rows,
             max_field_chars=max_field_chars,

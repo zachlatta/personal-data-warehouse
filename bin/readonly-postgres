@@ -3,8 +3,8 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: bin/readonly-clickhouse 'select ...'
-       echo 'select ...' | bin/readonly-clickhouse
+Usage: bin/readonly-postgres 'select ...'
+       echo 'select ...' | bin/readonly-postgres
 EOF
 }
 
@@ -34,19 +34,19 @@ import sys
 
 from dotenv import load_dotenv
 
-from personal_data_warehouse.clickhouse import ClickHouseWarehouse
-from personal_data_warehouse.clickhouse_readonly import ClickHouseReadOnlyRunner, csv_value
+from personal_data_warehouse.postgres import PostgresWarehouse
+from personal_data_warehouse.postgres_readonly import PostgresReadOnlyRunner, csv_value
 
 
 load_dotenv(".env")
-clickhouse_url = os.environ.get("CLICKHOUSE_URL")
-if not clickhouse_url:
-    print("CLICKHOUSE_URL must be set in the environment or .env", file=sys.stderr)
+postgres_database_url = os.environ.get("POSTGRES_DATABASE_URL")
+if not postgres_database_url:
+    print("POSTGRES_DATABASE_URL must be set in the environment or .env", file=sys.stderr)
     raise SystemExit(1)
 
 sql = sys.argv[1]
-warehouse = ClickHouseWarehouse(clickhouse_url)
-result = ClickHouseReadOnlyRunner(warehouse).query(sql, max_rows=0)
+warehouse = PostgresWarehouse(postgres_database_url)
+result = PostgresReadOnlyRunner(warehouse).query(sql, max_rows=0)
 writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
 if result.columns:
     writer.writerow(result.columns)

@@ -11,6 +11,7 @@ dependencies = [
     "google-auth-oauthlib>=1.2.2",
     "markdownify>=1.2.2",
     "pillow>=12.2.0",
+    "psycopg2-binary>=2.9.10",
     "pypdf>=6.10.2",
     "python-dotenv>=1.1.0",
     "requests>=2.32.0",
@@ -24,6 +25,9 @@ personal-data-warehouse-slack-sync = "personal_data_warehouse.slack_sync:main"
 personal-data-warehouse-apple-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"
 personal-data-warehouse-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"
 personal-data-warehouse-agent-auth = "personal_data_warehouse.agent_runner:auth_main"
+personal-data-warehouse-postgres-migration = "personal_data_warehouse.postgres_migration:main"
+personal-data-warehouse-finance-sync = "personal_data_warehouse.finance_sync:main"
+personal-data-warehouse-plaid-auth = "personal_data_warehouse.finance_sync:auth_main"
 
 [dependency-groups]
 dev = [

@@ -20,7 +20,6 @@ from dagster import (
 )
 
 from personal_data_warehouse.agent_resource import AgentResource
-from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs.calendar_sync import calendar_event_sync
 from personal_data_warehouse.defs.apple_voice_memos_transcription import apple_voice_memos_transcription
@@ -34,6 +33,7 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
     VoiceMemosEnrichmentRunner,
     load_enrichment_candidates,
 )
+from personal_data_warehouse.warehouse import warehouse_from_settings
 
 VOICE_MEMOS_ENRICHMENT_POSTGRES_LOCK_ID = 7_403_111_841
 DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE = 0
@@ -62,7 +62,7 @@ def apple_voice_memos_enrichment(context, agent: AgentResource) -> MaterializeRe
         )
     )
     recorded_after = apple_voice_memos_enrichment_recorded_after()
-    warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+    warehouse = warehouse_from_settings(settings)
     with exclusive_sync_lock(
         name="apple_voice_memos_enrichment",
         postgres_lock_id=VOICE_MEMOS_ENRICHMENT_POSTGRES_LOCK_ID,
@@ -127,7 +127,7 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
     )
 
     recorded_after = apple_voice_memos_enrichment_recorded_after()
-    warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+    warehouse = warehouse_from_settings(settings)
     candidates = load_enrichment_candidates(
         warehouse,
         provider=apple_voice_memos_enrichment_provider(settings),
@@ -139,7 +139,7 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
         max_error_attempts=apple_voice_memos_enrichment_max_error_attempts(),
     )
     if not candidates:
-        return SkipReason("No unenriched Voice Memos transcripts found in ClickHouse.")
+        return SkipReason("No unenriched Voice Memos transcripts found in Postgres.")
 
     return RunRequest(tags={"apple_voice_memos_trigger": "enrichment_backlog"})
 

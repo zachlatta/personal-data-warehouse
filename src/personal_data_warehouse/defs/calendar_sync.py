@@ -13,10 +13,10 @@ from dagster import (
 )
 
 from personal_data_warehouse.calendar_sync import CalendarSyncRunner
-from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
+from personal_data_warehouse.warehouse import warehouse_from_settings
 
 CALENDAR_SYNC_POSTGRES_LOCK_ID = 7_403_111_838
 
@@ -27,7 +27,7 @@ CALENDAR_SYNC_POSTGRES_LOCK_ID = 7_403_111_838
 )
 def calendar_event_sync(context) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_calendar=True)
-    warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+    warehouse = warehouse_from_settings(settings)
     with exclusive_sync_lock(name="calendar", postgres_lock_id=CALENDAR_SYNC_POSTGRES_LOCK_ID) as acquired:
         if not acquired:
             context.log.warning("Skipping Calendar sync because another Calendar sync is already running")

@@ -16,7 +16,6 @@ from dagster import (
     sensor,
 )
 
-from personal_data_warehouse.clickhouse import ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs.apple_voice_memos_drive_ingest import apple_voice_memos_drive_ingest
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
@@ -28,6 +27,7 @@ from personal_data_warehouse.apple_voice_memos_transcription import (
     GoogleDriveVoiceMemoAudioSource,
     VoiceMemosTranscriptionRunner,
 )
+from personal_data_warehouse.warehouse import warehouse_from_settings
 
 VOICE_MEMOS_TRANSCRIPTION_POSTGRES_LOCK_ID = 7_403_111_840
 DEFAULT_VOICE_MEMOS_TRANSCRIPTION_BATCH_SIZE = 3
@@ -52,7 +52,7 @@ def apple_voice_memos_transcription(context) -> MaterializeResult:
             str(DEFAULT_VOICE_MEMOS_TRANSCRIPTION_BATCH_SIZE),
         )
     )
-    warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+    warehouse = warehouse_from_settings(settings)
 
     with exclusive_sync_lock(
         name="apple_voice_memos_transcription",
@@ -110,9 +110,9 @@ def apple_voice_memos_transcription_backlog_sensor(context):
         return active
 
     settings = load_settings(require_gmail=False, require_assemblyai=True)
-    warehouse = ClickHouseWarehouse(settings.clickhouse_url or "")
+    warehouse = warehouse_from_settings(settings)
     if not warehouse.load_untranscribed_apple_voice_memos_files(provider=ASSEMBLYAI_PROVIDER, limit=1):
-        return SkipReason("No untranscribed Voice Memos found in ClickHouse.")
+        return SkipReason("No untranscribed Voice Memos found in Postgres.")
 
     return RunRequest(tags={"apple_voice_memos_trigger": "transcription_backlog"})
 
