@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from personal_data_warehouse.postgres_migration import canonical_value, collapse_clickhouse_rows
+from personal_data_warehouse import postgres_migration
+from personal_data_warehouse.postgres_migration import canonical_value, collapse_clickhouse_rows, migrate
 
 
 def test_collapse_clickhouse_rows_keeps_highest_version_per_key() -> None:
@@ -47,6 +48,34 @@ def test_canonical_value_decodes_clickhouse_byte_strings_as_valid_utf8_prefix() 
     assert canonical_value(b"hello \xe2\x82") == "hello "
 
 
+def test_migrate_rebuilds_slack_conversation_stats_after_slack_messages(monkeypatch) -> None:
+    events: list[str] = []
+    postgres = FakePostgres(events)
+
+    monkeypatch.setattr(postgres_migration, "ensure_all_tables", lambda postgres: None)
+    monkeypatch.setattr(postgres_migration, "truncate_tables", lambda postgres, tables: None)
+    monkeypatch.setattr(postgres_migration, "prepare_postgres_copy_stage", lambda postgres, columns: None)
+    monkeypatch.setattr(postgres_migration, "iter_clickhouse_current_rows", lambda *args, **kwargs: iter(()))
+
+    migrate(
+        clickhouse=object(),
+        postgres=postgres,
+        tables=("slack_messages",),
+        chunk_size=1000,
+        truncate=True,
+    )
+
+    assert events == ["rebuild"]
+
+
 class NoFetchClickHouse:
     def _query(self, sql: str):
         raise AssertionError(sql)
+
+
+class FakePostgres:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def rebuild_slack_conversation_stats(self) -> None:
+        self._events.append("rebuild")

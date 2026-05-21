@@ -50,6 +50,14 @@ from personal_data_warehouse.clickhouse import (
 from personal_data_warehouse.config import normalize_postgres_url
 
 POSTGRES_TEXT_NUL_REPLACEMENT = "\\u0000"
+SLACK_CONVERSATION_STATS_COLUMNS = (
+    "account",
+    "team_id",
+    "conversation_id",
+    "message_count",
+    "latest_message_at",
+    "updated_at",
+)
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,11 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("account", "team_id", "conversation_id", "user_id"),
     ),
     "slack_messages": TableSpec(SLACK_MESSAGE_COLUMNS, ("account", "team_id", "conversation_id", "message_ts")),
+    "slack_conversation_stats": TableSpec(
+        SLACK_CONVERSATION_STATS_COLUMNS,
+        ("account", "team_id", "conversation_id"),
+        "updated_at",
+    ),
     "slack_message_reactions": TableSpec(
         SLACK_REACTION_COLUMNS,
         ("account", "team_id", "conversation_id", "message_ts", "reaction_name", "user_id"),
@@ -163,6 +176,7 @@ TIMESTAMP_COLUMNS = {
     "created_at",
     "started_at",
     "latest_activity_at",
+    "latest_message_at",
     "message_datetime",
     "ai_processed_at",
     "datetime",
@@ -199,6 +213,7 @@ INTEGER_COLUMNS = {
     "reply_count",
     "reply_users_count",
     "reaction_count",
+    "message_count",
     "priority_rank",
     "unread_count",
     "sync_version",
@@ -300,12 +315,14 @@ class PostgresWarehouse:
                 "slack_conversations",
                 "slack_conversation_members",
                 "slack_messages",
+                "slack_conversation_stats",
                 "slack_message_reactions",
                 "slack_files",
                 "slack_sync_state",
                 "slack_account_state_item_rows",
             ]
         )
+        self._ensure_slack_conversation_stats_backfilled()
         self._ensure_clean_slack_inbox_view()
 
     def ensure_finance_tables(self) -> None:
@@ -966,12 +983,7 @@ class PostgresWarehouse:
              AND c.team_id = s.team_id
              AND c.conversation_id = s.object_id
              AND s.object_type = 'conversation'
-            LEFT JOIN (
-                SELECT account, team_id, conversation_id, count(*) AS message_count
-                FROM slack_messages
-                WHERE is_deleted = 0
-                GROUP BY account, team_id, conversation_id
-            ) AS m
+            LEFT JOIN slack_conversation_stats AS m
               ON c.account = m.account
              AND c.team_id = m.team_id
              AND c.conversation_id = m.conversation_id
@@ -1070,7 +1082,13 @@ class PostgresWarehouse:
         conversation_types: tuple[str, ...] = (),
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        where = ["c.account = %s", "c.team_id = %s", "c.is_archived = 0", "(c.is_member = 1 OR c.is_im = 1 OR c.is_mpim = 1)", "m.latest_message_at IS NOT NULL"]
+        where = [
+            "c.account = %s",
+            "c.team_id = %s",
+            "c.is_archived = 0",
+            "(c.is_member = 1 OR c.is_im = 1 OR c.is_mpim = 1)",
+            "m.latest_message_at >= now() - INTERVAL '30 days'",
+        ]
         params: list[Any] = [account, team_id]
         if conversation_types:
             where.append("c.conversation_type = ANY(%s)")
@@ -1082,13 +1100,7 @@ class PostgresWarehouse:
             f"""
             SELECT c.raw_json
             FROM slack_conversations AS c
-            LEFT JOIN (
-                SELECT account, team_id, conversation_id, max(message_datetime) AS latest_message_at
-                FROM slack_messages
-                WHERE is_deleted = 0
-                  AND message_datetime >= now() - INTERVAL '30 days'
-                GROUP BY account, team_id, conversation_id
-            ) AS m
+            LEFT JOIN slack_conversation_stats AS m
               ON c.account = m.account
              AND c.team_id = m.team_id
              AND c.conversation_id = m.conversation_id
@@ -1114,12 +1126,145 @@ class PostgresWarehouse:
 
     def insert_slack_messages(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("slack_messages", rows, SLACK_MESSAGE_COLUMNS)
+        self._refresh_slack_conversation_stats_for_rows(rows)
 
     def insert_slack_message_reactions(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("slack_message_reactions", rows, SLACK_REACTION_COLUMNS)
 
     def insert_slack_files(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("slack_files", rows, SLACK_FILE_COLUMNS)
+
+    def rebuild_slack_conversation_stats(self, *, account: str | None = None, team_id: str | None = None) -> None:
+        if team_id is not None and account is None:
+            raise ValueError("account is required when team_id is set")
+        where: list[str] = ["is_deleted = 0"]
+        params: list[Any] = []
+        delete_where: list[str] = []
+        delete_params: list[Any] = []
+        if account is not None:
+            where.append("account = %s")
+            params.append(account)
+            delete_where.append("account = %s")
+            delete_params.append(account)
+        if team_id is not None:
+            where.append("team_id = %s")
+            params.append(team_id)
+            delete_where.append("team_id = %s")
+            delete_params.append(team_id)
+
+        delete_sql = "DELETE FROM slack_conversation_stats"
+        if delete_where:
+            delete_sql += " WHERE " + " AND ".join(delete_where)
+        try:
+            self._command("BEGIN")
+            self._command(delete_sql, tuple(delete_params))
+            self._command(
+                f"""
+                INSERT INTO slack_conversation_stats (
+                    account,
+                    team_id,
+                    conversation_id,
+                    message_count,
+                    latest_message_at,
+                    updated_at
+                )
+                SELECT
+                    account,
+                    team_id,
+                    conversation_id,
+                    count(*)::bigint AS message_count,
+                    max(message_datetime) AS latest_message_at,
+                    clock_timestamp() AS updated_at
+                FROM slack_messages
+                WHERE {" AND ".join(where)}
+                GROUP BY account, team_id, conversation_id
+                """,
+                tuple(params),
+            )
+            self._command("COMMIT")
+        except Exception:
+            self._command("ROLLBACK")
+            raise
+
+    def _ensure_slack_conversation_stats_backfilled(self) -> None:
+        rows = self._query(
+            """
+            SELECT
+                EXISTS (SELECT 1 FROM slack_conversation_stats LIMIT 1),
+                EXISTS (SELECT 1 FROM slack_messages LIMIT 1)
+            """
+        )
+        if rows and not bool(rows[0][0]) and bool(rows[0][1]):
+            self.rebuild_slack_conversation_stats()
+
+    def _refresh_slack_conversation_stats_for_rows(self, rows: list[dict[str, Any]]) -> None:
+        keys = sorted(
+            {
+                (
+                    str(row["account"]),
+                    str(row["team_id"]),
+                    str(row["conversation_id"]),
+                )
+                for row in rows
+            }
+        )
+        if not keys:
+            return
+        self._refresh_slack_conversation_stats_for_keys(keys)
+
+    def _refresh_slack_conversation_stats_for_keys(self, keys: list[tuple[str, str, str]]) -> None:
+        try:
+            self._command("BEGIN")
+            with self._connection.cursor() as cursor:
+                execute_values(
+                    cursor,
+                    """
+                    WITH affected(account, team_id, conversation_id) AS (VALUES %s)
+                    DELETE FROM slack_conversation_stats AS s
+                    USING affected AS a
+                    WHERE s.account = a.account
+                      AND s.team_id = a.team_id
+                      AND s.conversation_id = a.conversation_id
+                    """,
+                    keys,
+                    template="(%s, %s, %s)",
+                    page_size=1000,
+                )
+                execute_values(
+                    cursor,
+                    """
+                    WITH affected(account, team_id, conversation_id) AS (VALUES %s)
+                    INSERT INTO slack_conversation_stats (
+                        account,
+                        team_id,
+                        conversation_id,
+                        message_count,
+                        latest_message_at,
+                        updated_at
+                    )
+                    SELECT
+                        m.account,
+                        m.team_id,
+                        m.conversation_id,
+                        count(*)::bigint AS message_count,
+                        max(m.message_datetime) AS latest_message_at,
+                        clock_timestamp() AS updated_at
+                    FROM slack_messages AS m
+                    INNER JOIN affected AS a
+                      ON m.account = a.account
+                     AND m.team_id = a.team_id
+                     AND m.conversation_id = a.conversation_id
+                    WHERE m.is_deleted = 0
+                    GROUP BY m.account, m.team_id, m.conversation_id
+                    """,
+                    keys,
+                    template="(%s, %s, %s)",
+                    page_size=1000,
+                )
+            self._command("COMMIT")
+        except Exception:
+            self._command("ROLLBACK")
+            raise
 
     def insert_slack_sync_state(
         self,

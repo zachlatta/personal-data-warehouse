@@ -94,6 +94,57 @@ def _default_row(columns: tuple[str, ...], **overrides):
     return row
 
 
+def _slack_conversation_row(*, conversation_id: str, conversation_type: str = "im", **overrides):
+    now = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    row = _default_row(
+        SLACK_CONVERSATION_COLUMNS,
+        account="zrl",
+        team_id="T1",
+        conversation_id=conversation_id,
+        conversation_type=conversation_type,
+        name=f"{conversation_id}-name",
+        is_im=1 if conversation_type == "im" else 0,
+        is_mpim=1 if conversation_type == "mpim" else 0,
+        is_private=1 if conversation_type == "private_channel" else 0,
+        is_channel=1 if conversation_type == "public_channel" else 0,
+        is_member=1,
+        is_archived=0,
+        raw_json=f'{{"id":"{conversation_id}","last_read":"0"}}',
+        created_at=now,
+        synced_at=now,
+        sync_version=1,
+    )
+    row.update(overrides)
+    return row
+
+
+def _slack_message_row(
+    *,
+    conversation_id: str,
+    message_ts: str,
+    message_datetime: datetime,
+    sync_version: int = 1,
+    is_deleted: int = 0,
+    **overrides,
+):
+    row = _default_row(
+        SLACK_MESSAGE_COLUMNS,
+        account="zrl",
+        team_id="T1",
+        conversation_id=conversation_id,
+        message_ts=message_ts,
+        message_datetime=message_datetime,
+        thread_ts=message_ts,
+        text=f"message {message_ts}",
+        is_deleted=is_deleted,
+        raw_json="{}",
+        synced_at=message_datetime,
+        sync_version=sync_version,
+    )
+    row.update(overrides)
+    return row
+
+
 def test_postgres_message_upsert_keeps_highest_sync_version(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
 
@@ -155,6 +206,241 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     index_names = {row[0] for row in rows}
     assert "slack_messages_recent_scope_time_idx" in index_names
     assert "slack_messages_recent_thread_time_idx" in index_names
+
+
+def test_postgres_slack_tables_create_conversation_stats_table(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_slack_tables()
+
+    rows = warehouse._query(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'slack_conversation_stats'
+        ORDER BY ordinal_position
+        """
+    )
+
+    assert [row[0] for row in rows] == [
+        "account",
+        "team_id",
+        "conversation_id",
+        "message_count",
+        "latest_message_at",
+        "updated_at",
+    ]
+
+
+def test_postgres_rebuild_slack_conversation_stats_backfills_live_messages(
+    warehouse: PostgresWarehouse,
+) -> None:
+    older = datetime(2026, 5, 19, 11, tzinfo=UTC)
+    newer = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(conversation_id="C1", message_ts="1770000000.000001", message_datetime=older),
+            _slack_message_row(conversation_id="C1", message_ts="1770000000.000002", message_datetime=newer),
+            _slack_message_row(
+                conversation_id="C2",
+                message_ts="1770000000.000003",
+                message_datetime=newer,
+                is_deleted=1,
+            ),
+        ]
+    )
+    warehouse._command("TRUNCATE slack_conversation_stats")
+
+    warehouse.rebuild_slack_conversation_stats()
+
+    rows = warehouse._query(
+        """
+        SELECT conversation_id, message_count, latest_message_at
+        FROM slack_conversation_stats
+        ORDER BY conversation_id
+        """
+    )
+    assert rows == [("C1", 2, newer)]
+
+
+def test_postgres_ensure_slack_tables_backfills_empty_conversation_stats(
+    warehouse: PostgresWarehouse,
+) -> None:
+    now = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="1770000000.000001",
+                message_datetime=now,
+            )
+        ]
+    )
+    warehouse._command("TRUNCATE slack_conversation_stats")
+
+    warehouse.ensure_slack_tables()
+
+    rows = warehouse._query(
+        "SELECT conversation_id, message_count, latest_message_at FROM slack_conversation_stats",
+    )
+    assert rows == [("C1", 1, now)]
+
+
+def test_postgres_insert_slack_messages_refreshes_conversation_stats(
+    warehouse: PostgresWarehouse,
+) -> None:
+    older = datetime(2026, 5, 19, 11, tzinfo=UTC)
+    newer = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.ensure_slack_tables()
+
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(conversation_id="C1", message_ts="1770000000.000001", message_datetime=older),
+            _slack_message_row(conversation_id="C1", message_ts="1770000000.000002", message_datetime=newer),
+        ]
+    )
+
+    rows = warehouse._query(
+        "SELECT message_count, latest_message_at FROM slack_conversation_stats WHERE conversation_id = %s",
+        ("C1",),
+    )
+    assert rows == [(2, newer)]
+
+
+def test_postgres_slack_conversation_stats_follow_tombstones_and_ignore_stale_rows(
+    warehouse: PostgresWarehouse,
+) -> None:
+    older = datetime(2026, 5, 19, 11, tzinfo=UTC)
+    newer = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.ensure_slack_tables()
+    live = _slack_message_row(
+        conversation_id="C1",
+        message_ts="1770000000.000001",
+        message_datetime=older,
+        sync_version=10,
+    )
+
+    warehouse.insert_slack_messages(
+        [
+            live,
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="1770000000.000002",
+                message_datetime=newer,
+                sync_version=10,
+            ),
+        ]
+    )
+    warehouse.insert_slack_messages([{**live, "is_deleted": 1, "sync_version": 20}])
+    warehouse.insert_slack_messages([{**live, "is_deleted": 0, "sync_version": 5}])
+
+    rows = warehouse._query(
+        "SELECT message_count, latest_message_at FROM slack_conversation_stats WHERE conversation_id = %s",
+        ("C1",),
+    )
+    assert rows == [(1, newer)]
+
+
+def test_postgres_slack_conversation_loader_uses_stats_for_zero_message_filter(
+    warehouse: PostgresWarehouse,
+) -> None:
+    now = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(conversation_id="C-empty", raw_json='{"id":"C-empty"}'),
+            _slack_conversation_row(conversation_id="C-with-message", raw_json='{"id":"C-with-message"}'),
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C-with-message",
+                message_ts="1770000000.000001",
+                message_datetime=now,
+            )
+        ]
+    )
+
+    payloads = warehouse.load_slack_conversation_payloads(
+        account="zrl",
+        team_id="T1",
+        zero_messages_only=True,
+    )
+
+    assert payloads == [{"id": "C-empty"}]
+
+
+def test_postgres_slack_conversation_loader_query_uses_stats_not_message_grouping(
+    warehouse: PostgresWarehouse,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_query(sql, params=None):
+        captured["sql"] = sql
+        return []
+
+    monkeypatch.setattr(warehouse, "_query", fake_query)
+
+    warehouse.load_slack_conversation_payloads(account="zrl", team_id="T1")
+
+    assert "slack_conversation_stats AS m" in captured["sql"]
+    assert "FROM slack_messages" not in captured["sql"]
+    assert "GROUP BY account, team_id, conversation_id" not in captured["sql"]
+
+
+def test_postgres_slack_read_state_candidates_use_stats_latest_message_at(
+    warehouse: PostgresWarehouse,
+) -> None:
+    recent = datetime.now(tz=UTC)
+    old = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(conversation_id="C-recent", raw_json='{"id":"C-recent","last_read":"0"}'),
+            _slack_conversation_row(conversation_id="C-old", raw_json='{"id":"C-old","last_read":"0"}'),
+            _slack_conversation_row(conversation_id="C-empty", raw_json='{"id":"C-empty","last_read":"0"}'),
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C-recent",
+                message_ts="1770000000.000001",
+                message_datetime=recent,
+            ),
+            _slack_message_row(
+                conversation_id="C-old",
+                message_ts="1760000000.000001",
+                message_datetime=old,
+            ),
+        ]
+    )
+
+    payloads = warehouse.load_slack_read_state_candidate_payloads(account="zrl", team_id="T1")
+
+    assert payloads == [{"id": "C-recent", "last_read": "0"}]
+
+
+def test_postgres_slack_read_state_candidate_query_uses_stats_not_message_grouping(
+    warehouse: PostgresWarehouse,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_query(sql, params=None):
+        captured["sql"] = sql
+        return []
+
+    monkeypatch.setattr(warehouse, "_query", fake_query)
+
+    warehouse.load_slack_read_state_candidate_payloads(account="zrl", team_id="T1")
+
+    assert "slack_conversation_stats AS m" in captured["sql"]
+    assert "FROM slack_messages" not in captured["sql"]
+    assert "GROUP BY account, team_id, conversation_id" not in captured["sql"]
 
 
 def test_postgres_slack_account_state_query_does_not_materialize_recent_messages(warehouse: PostgresWarehouse) -> None:

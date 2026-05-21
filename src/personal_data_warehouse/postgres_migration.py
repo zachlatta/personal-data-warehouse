@@ -287,6 +287,9 @@ def migrate(
             migrated += len(rows)
             print(f"{table}: migrated {migrated} rows", flush=True)
         print(f"{table}: migration complete ({migrated} rows)", flush=True)
+    if "slack_messages" in tables:
+        print("slack_conversation_stats: rebuilding from migrated slack_messages", flush=True)
+        postgres.rebuild_slack_conversation_stats()
 
 
 def verify(
