@@ -149,7 +149,12 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	}
 
 	queryResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query", Arguments: map[string]any{
-		"sql":          []string{"SELECT subject FROM gmail_messages LIMIT 1"},
+		"queries": []map[string]any{
+			{
+				"question": "What is one recent Gmail subject?",
+				"sql":      "SELECT subject FROM gmail_messages LIMIT 1",
+			},
+		},
 		"preview_rows": 1,
 		"format":       "csv",
 	}})
@@ -172,6 +177,38 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	if queryPayload.Results[0].QueryID == "" || queryPayload.Results[0].Preview != "subject\nhello" {
 		t.Fatalf("unexpected query payload: %#v", queryPayload)
 	}
+
+	legacyResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query", Arguments: map[string]any{
+		"sql": []string{"SELECT subject FROM gmail_messages LIMIT 1"},
+	}})
+	if err != nil {
+		t.Fatalf("legacy query CallTool failed: %v", err)
+	}
+	legacyText := legacyResult.Content[0].(*mcp.TextContent).Text
+	if !legacyResult.IsError || legacyText == "" {
+		t.Fatalf("legacy sql-only query was not rejected: %q", legacyText)
+	}
+
+	blankQuestionResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query", Arguments: map[string]any{
+		"queries": []map[string]any{
+			{"question": " ", "sql": "SELECT subject FROM gmail_messages LIMIT 1"},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("blank question query CallTool failed: %v", err)
+	}
+	var blankQuestionPayload struct {
+		Results []struct {
+			Error string `json:"error"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(blankQuestionResult.Content[0].(*mcp.TextContent).Text), &blankQuestionPayload); err != nil {
+		t.Fatalf("blank question query response was not JSON: %v", err)
+	}
+	if !blankQuestionResult.IsError || !strings.Contains(blankQuestionPayload.Results[0].Error, "queries[0].question") {
+		t.Fatalf("blank query question was not rejected: %#v", blankQuestionPayload)
+	}
+
 	fieldResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "get_field", Arguments: map[string]any{
 		"query_id": queryPayload.Results[0].QueryID,
 		"row":      0,

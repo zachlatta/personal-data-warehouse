@@ -37,6 +37,27 @@ type RawResult struct {
 	Rows    []map[string]any
 }
 
+type Statement struct {
+	Question string
+	SQL      string
+}
+
+type statementValidationError struct {
+	Message      string
+	Index        int
+	Question     string
+	SQL          string
+	HasStatement bool
+}
+
+func (e statementValidationError) logFields() []any {
+	fields := []any{"error", e.Message}
+	if e.HasStatement {
+		fields = append(fields, "index", e.Index, "question", e.Question, "sql", e.SQL)
+	}
+	return fields
+}
+
 type Service struct {
 	runner Runner
 	opts   Options
@@ -196,11 +217,50 @@ func NewService(runner Runner, opts Options) *Service {
 	return &Service{runner: runner, opts: opts, logger: logger.With("component", "query"), cache: newQueryCache(opts.QueryCacheMaxBytes, opts.QueryCacheTTL)}
 }
 
-func (s *Service) Execute(ctx context.Context, sql []string, previewRows int, format string) QueryResponse {
-	if len(sql) == 0 {
-		err := "sql must contain at least one statement"
-		s.logger.WarnContext(ctx, "query batch rejected", "error", err)
-		return QueryResponse{Results: []QueryResult{{Error: err}}}
+func normalizeStatements(statements []Statement) ([]Statement, statementValidationError) {
+	if len(statements) == 0 {
+		return nil, statementValidationError{Message: "queries must contain at least one {question, sql} statement; legacy sql array input is no longer accepted"}
+	}
+	normalized := make([]Statement, 0, len(statements))
+	for i, statement := range statements {
+		question := strings.TrimSpace(statement.Question)
+		sql := strings.TrimSpace(statement.SQL)
+		if question == "" {
+			return nil, statementValidationError{
+				Message:      fmt.Sprintf("queries[%d].question must be a concise plain-English question this SQL statement is trying to answer", i),
+				Index:        i,
+				Question:     question,
+				SQL:          sql,
+				HasStatement: true,
+			}
+		}
+		if sql == "" {
+			return nil, statementValidationError{
+				Message:      fmt.Sprintf("queries[%d].sql must contain a read-only Postgres SQL statement", i),
+				Index:        i,
+				Question:     question,
+				SQL:          sql,
+				HasStatement: true,
+			}
+		}
+		normalized = append(normalized, Statement{Question: question, SQL: sql})
+	}
+	return normalized, statementValidationError{}
+}
+
+func statementQuestions(statements []Statement) []string {
+	questions := make([]string, 0, len(statements))
+	for _, statement := range statements {
+		questions = append(questions, statement.Question)
+	}
+	return questions
+}
+
+func (s *Service) Execute(ctx context.Context, statements []Statement, previewRows int, format string) QueryResponse {
+	statements, validationErr := normalizeStatements(statements)
+	if validationErr.Message != "" {
+		s.logger.WarnContext(ctx, "query batch rejected", validationErr.logFields()...)
+		return QueryResponse{Results: []QueryResult{{Error: validationErr.Message}}}
 	}
 	format = normalizeFormat(format)
 	if previewRows < 0 {
@@ -211,34 +271,36 @@ func (s *Service) Execute(ctx context.Context, sql []string, previewRows int, fo
 	}
 
 	started := time.Now()
-	s.logger.InfoContext(ctx, "query batch started", "statements", len(sql), "max_rows", s.opts.MaxRows, "max_field_chars", s.opts.MaxFieldChars, "format", format, "preview_rows", previewRows)
-	results := make([]QueryResult, 0, len(sql))
-	for _, statement := range sql {
+	questions := statementQuestions(statements)
+	s.logger.InfoContext(ctx, "query batch started", "statements", len(statements), "questions", questions, "max_rows", s.opts.MaxRows, "max_field_chars", s.opts.MaxFieldChars, "format", format, "preview_rows", previewRows)
+	results := make([]QueryResult, 0, len(statements))
+	for _, statement := range statements {
 		queryStarted := time.Now()
-		result := QueryResult{SQL: statement, Format: format}
-		if err := ValidateReadOnlySQL(statement); err != nil {
+		result := QueryResult{SQL: statement.SQL, Format: format}
+		if err := ValidateReadOnlySQL(statement.SQL); err != nil {
 			result.Error = err.Error()
 			results = append(results, result)
-			s.logger.WarnContext(ctx, "query rejected by read-only validator", "sql", statement, "error", result.Error)
+			s.logger.WarnContext(ctx, "query rejected by read-only validator", "question", statement.Question, "sql", statement.SQL, "error", result.Error)
 			continue
 		}
-		s.logger.DebugContext(ctx, "query started", "sql", statement)
-		raw, err := s.runner.Query(ctx, statement, s.opts.MaxRows+1)
+		s.logger.DebugContext(ctx, "query started", "question", statement.Question, "sql", statement.SQL)
+		raw, err := s.runner.Query(ctx, statement.SQL, s.opts.MaxRows+1)
 		if err != nil {
 			result.Error = err.Error()
 			results = append(results, result)
-			s.logger.ErrorContext(ctx, "query failed", "sql", statement, "error", err, "duration", time.Since(queryStarted))
+			s.logger.ErrorContext(ctx, "query failed", "question", statement.Question, "sql", statement.SQL, "error", err, "duration", time.Since(queryStarted))
 			continue
 		}
 		if len(raw.Rows) > s.opts.MaxRows {
 			result.Error = fmt.Sprintf("query returned more than MCP_MAX_ROWS (%d) rows; add a LIMIT or narrower WHERE clause and re-run the query", s.opts.MaxRows)
 			results = append(results, result)
-			s.logger.WarnContext(ctx, "query rejected by row cap", "sql", statement, "rows_seen", len(raw.Rows), "max_rows", s.opts.MaxRows, "duration", time.Since(queryStarted))
+			s.logger.WarnContext(ctx, "query rejected by row cap", "question", statement.Question, "sql", statement.SQL, "rows_seen", len(raw.Rows), "max_rows", s.opts.MaxRows, "duration", time.Since(queryStarted))
 			continue
 		}
 		entry := &queryCacheEntry{
 			ID:        newQueryID(),
-			SQL:       statement,
+			Question:  statement.Question,
+			SQL:       statement.SQL,
 			Columns:   append([]string(nil), raw.Columns...),
 			Rows:      copyRows(raw.Rows),
 			Format:    format,
@@ -247,7 +309,7 @@ func (s *Service) Execute(ctx context.Context, sql []string, previewRows int, fo
 		entry.SizeBytes = estimateEntrySize(entry)
 		if err := s.cache.add(entry); err != nil {
 			result.Error = err.Error()
-			s.logger.ErrorContext(ctx, "query result encoding failed", "sql", statement, "error", err, "duration", time.Since(queryStarted))
+			s.logger.ErrorContext(ctx, "query result encoding failed", "question", statement.Question, "sql", statement.SQL, "error", err, "duration", time.Since(queryStarted))
 		} else {
 			result.QueryID = entry.ID
 			result.TotalRows = len(entry.Rows)
@@ -256,19 +318,20 @@ func (s *Service) Execute(ctx context.Context, sql []string, previewRows int, fo
 			if err != nil {
 				result.Error = err.Error()
 			}
-			s.logger.InfoContext(ctx, "query completed", "sql", statement, "query_id", entry.ID, "rows", len(entry.Rows), "columns", len(raw.Columns), "truncated_fields", len(result.Truncations), "duration", time.Since(queryStarted))
+			s.logger.InfoContext(ctx, "query completed", "question", statement.Question, "sql", statement.SQL, "query_id", entry.ID, "rows", len(entry.Rows), "columns", len(raw.Columns), "truncated_fields", len(result.Truncations), "duration", time.Since(queryStarted))
 		}
 		results = append(results, result)
 	}
-	s.logger.InfoContext(ctx, "query batch completed", "statements", len(sql), "duration", time.Since(started))
+	s.logger.InfoContext(ctx, "query batch completed", "statements", len(statements), "questions", questions, "duration", time.Since(started))
 	return QueryResponse{Results: results}
 }
 
-func (s *Service) GetRows(queryID string, offset, limit int, format string) RowsResponse {
+func (s *Service) GetRows(ctx context.Context, queryID string, offset, limit int, format string) RowsResponse {
 	entry, err := s.cache.get(queryID)
 	if err != nil {
 		return RowsResponse{QueryID: queryID, Error: err.Error()}
 	}
+	s.logger.InfoContext(ctx, "get_rows using cached query", "query_id", queryID, "question", entry.Question, "offset", offset, "limit", limit)
 	if offset < 0 {
 		return RowsResponse{QueryID: queryID, Error: "offset must be >= 0"}
 	}
@@ -300,13 +363,14 @@ func (s *Service) GetRows(queryID string, offset, limit int, format string) Rows
 	return resp
 }
 
-func (s *Service) GetField(queryID string, row int, column string, offset, length int) FieldResponse {
+func (s *Service) GetField(ctx context.Context, queryID string, row int, column string, offset, length int) FieldResponse {
 	resp := FieldResponse{QueryID: queryID, Row: row, Column: column, Offset: offset}
 	entry, err := s.cache.get(queryID)
 	if err != nil {
 		resp.Error = err.Error()
 		return resp
 	}
+	s.logger.InfoContext(ctx, "get_field using cached query", "query_id", queryID, "question", entry.Question, "row", row, "column", column, "offset", offset, "length", length)
 	if row < 0 || row >= len(entry.Rows) {
 		if len(entry.Rows) == 0 {
 			resp.Error = fmt.Sprintf("row %d is out of range for query_id %s; the cached result has 0 rows", row, queryID)
@@ -343,13 +407,14 @@ func (s *Service) GetField(queryID string, row int, column string, offset, lengt
 	return resp
 }
 
-func (s *Service) GrepRows(queryID, pattern string, columns []string, limit, contextChars int) GrepResponse {
+func (s *Service) GrepRows(ctx context.Context, queryID, pattern string, columns []string, limit, contextChars int) GrepResponse {
 	resp := GrepResponse{QueryID: queryID, Pattern: pattern}
 	entry, err := s.cache.get(queryID)
 	if err != nil {
 		resp.Error = err.Error()
 		return resp
 	}
+	s.logger.InfoContext(ctx, "grep_rows using cached query", "query_id", queryID, "question", entry.Question, "columns", len(columns), "limit", limit)
 	if pattern == "" {
 		resp.Error = "pattern must not be empty"
 		return resp
@@ -815,6 +880,7 @@ type queryCache struct {
 
 type queryCacheEntry struct {
 	ID         string
+	Question   string
 	SQL        string
 	Columns    []string
 	Rows       []map[string]any
@@ -927,7 +993,7 @@ func copyRows(rows []map[string]any) []map[string]any {
 }
 
 func estimateEntrySize(entry *queryCacheEntry) int64 {
-	size := int64(len(entry.ID) + len(entry.SQL) + len(entry.Format))
+	size := int64(len(entry.ID) + len(entry.Question) + len(entry.SQL) + len(entry.Format))
 	for _, column := range entry.Columns {
 		size += int64(len(column))
 	}

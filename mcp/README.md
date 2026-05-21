@@ -95,12 +95,19 @@ SQL starting points:
 ### `query`
 
 Executes read-only Postgres SQL, caches each result under a generated `query_id`, and returns a preview.
+Each SQL statement must include `question`, a concise plain-English question this SQL statement is
+trying to answer. Legacy `sql` array input is rejected.
 
 ```json
 {
   "name": "query",
   "input": {
-    "sql": ["SELECT recording_id, transcript FROM apple_voice_memos_enrichments WHERE status = 'completed' ORDER BY created_at DESC LIMIT 1"],
+    "queries": [
+      {
+        "question": "What is the most recent completed Voice Memo transcript?",
+        "sql": "SELECT recording_id, transcript FROM apple_voice_memos_enrichments WHERE status = 'completed' ORDER BY created_at DESC LIMIT 1"
+      }
+    ],
     "preview_rows": 1,
     "format": "csv"
   }
@@ -109,14 +116,17 @@ Executes read-only Postgres SQL, caches each result under a generated `query_id`
 
 Only read-only statements are allowed: `SELECT`, `WITH`, `SHOW`, and `EXPLAIN`.
 
-Each SQL string in `sql` gets its own `query_id`. `format` may be `csv`, `json`, or `ndjson`; `csv` is the default. Query results over `MCP_MAX_ROWS` are rejected with a clear error. Long preview fields are truncated to `MCP_MAX_FIELD_CHARS`, and truncation metadata is returned as structured data:
+Each query object in `queries` gets its own `query_id`. The server logs `question` with the SQL,
+query_id, row count, duration, errors, and follow-up cached-result tool calls. `format` may be `csv`,
+`json`, or `ndjson`; `csv` is the default. Query results over `MCP_MAX_ROWS` are rejected with a clear
+error. Long preview fields are truncated to `MCP_MAX_FIELD_CHARS`, and truncation metadata is returned as structured data:
 
 ```json
 {
   "query_id": "f00d...",
   "total_rows": 1,
-  "column_names": ["id", "transcript"],
-  "preview": "id,transcript\nabc,first 4000 chars...\n# TRUNCATIONS: [{\"row\":0,\"column\":\"transcript\",\"returned\":4000,\"total\":24168}]",
+  "column_names": ["recording_id", "transcript"],
+  "preview": "recording_id,transcript\nabc,first 4000 chars...\n# TRUNCATIONS: [{\"row\":0,\"column\":\"transcript\",\"returned\":4000,\"total\":24168}]",
   "truncations": [
     {"row": 0, "column": "transcript", "returned": 4000, "total": 24168}
   ]

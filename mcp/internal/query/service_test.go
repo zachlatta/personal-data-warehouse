@@ -44,6 +44,10 @@ func (r *recordingRunner) Query(_ context.Context, sql string, maxRows int) (Raw
 	return result, nil
 }
 
+func statement(question, sql string) Statement {
+	return Statement{Question: question, SQL: sql}
+}
+
 func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	showTablesSQL := "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
 	describeCleanGmailSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'clean_gmail_inbox' ORDER BY ordinal_position"
@@ -157,6 +161,7 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 
 func TestServiceExecuteTruncatesRowsAndFields(t *testing.T) {
 	longTranscript := strings.Repeat("x", 24000)
+	question := "What Gmail message bodies should be previewed?"
 	runner := &recordingRunner{results: map[string]RawResult{
 		"SELECT body FROM gmail_messages": {
 			Columns: []string{"body"},
@@ -169,13 +174,20 @@ func TestServiceExecuteTruncatesRowsAndFields(t *testing.T) {
 	}}
 	svc := NewService(runner, Options{MaxRows: 100000, MaxFieldChars: 4000, GetFieldMaxChars: 200000})
 
-	resp := svc.Execute(context.Background(), []string{"SELECT body FROM gmail_messages"}, 1, "csv")
+	resp := svc.Execute(context.Background(), []Statement{statement(question, "SELECT body FROM gmail_messages")}, 1, "csv")
 	if len(resp.Results) != 1 {
 		t.Fatalf("results length = %d", len(resp.Results))
 	}
 	result := resp.Results[0]
 	if result.QueryID == "" {
 		t.Fatalf("query_id was empty: %#v", result)
+	}
+	entry, err := svc.cache.get(result.QueryID)
+	if err != nil {
+		t.Fatalf("cached query missing: %v", err)
+	}
+	if entry.Question != question {
+		t.Fatalf("cached question = %q, want %q", entry.Question, question)
 	}
 	if result.TotalRows != 3 {
 		t.Fatalf("total rows = %d", result.TotalRows)
@@ -202,7 +214,7 @@ func TestServiceExecuteTruncatesRowsAndFields(t *testing.T) {
 	if err := json.Unmarshal([]byte(rawTruncations), &parsed); err != nil {
 		t.Fatalf("truncation metadata is not parseable JSON: %v; %q", err, rawTruncations)
 	}
-	fieldResp := svc.GetField(result.QueryID, 0, "body", 0, 200000)
+	fieldResp := svc.GetField(context.Background(), result.QueryID, 0, "body", 0, 200000)
 	if fieldResp.Error != "" {
 		t.Fatalf("GetField returned error: %s", fieldResp.Error)
 	}
@@ -214,13 +226,40 @@ func TestServiceExecuteTruncatesRowsAndFields(t *testing.T) {
 	}
 }
 
+func TestServiceExecuteRequiresQuestionPerSQLStatement(t *testing.T) {
+	runner := &recordingRunner{results: map[string]RawResult{
+		"SELECT 1": {Columns: []string{"1"}, Rows: []map[string]any{{"1": 1}}},
+	}}
+	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
+
+	noQueries := svc.Execute(context.Background(), nil, 20, "csv")
+	if !strings.Contains(noQueries.Results[0].Error, "queries must contain at least one") {
+		t.Fatalf("missing queries error = %#v", noQueries.Results[0])
+	}
+	blankQuestion := svc.Execute(context.Background(), []Statement{statement(" ", "SELECT 1")}, 20, "csv")
+	if !strings.Contains(blankQuestion.Results[0].Error, "queries[0].question") {
+		t.Fatalf("blank question error = %#v", blankQuestion.Results[0])
+	}
+	blankSQL := svc.Execute(context.Background(), []Statement{statement("What is one?", " ")}, 20, "csv")
+	if !strings.Contains(blankSQL.Results[0].Error, "queries[0].sql") {
+		t.Fatalf("blank sql error = %#v", blankSQL.Results[0])
+	}
+	if len(runner.queries) != 0 {
+		t.Fatalf("invalid query inputs executed SQL: %#v", runner.queries)
+	}
+}
+
 func TestServiceExecuteReportsPerQueryErrors(t *testing.T) {
 	svc := NewService(fakeRunner{
 		results: map[string]RawResult{"SELECT 1": {Columns: []string{"1"}, Rows: []map[string]any{{"1": 1}}}},
 		errs:    map[string]error{"SELECT broken": errors.New("postgres failed")},
 	}, Options{MaxRows: 5, MaxFieldChars: 100})
 
-	resp := svc.Execute(context.Background(), []string{"SELECT broken", "SELECT 1", "DROP TABLE x"}, 20, "csv")
+	resp := svc.Execute(context.Background(), []Statement{
+		statement("What happens when Postgres returns an error?", "SELECT broken"),
+		statement("Does a simple read-only query work?", "SELECT 1"),
+		statement("Is a destructive query rejected?", "DROP TABLE x"),
+	}, 20, "csv")
 	if len(resp.Results) != 3 {
 		t.Fatalf("results length = %d", len(resp.Results))
 	}
@@ -245,7 +284,7 @@ func TestServiceExecuteEscapesCSVValues(t *testing.T) {
 		},
 	}}, Options{MaxRows: 5, MaxFieldChars: 100})
 
-	resp := svc.Execute(context.Background(), []string{"SELECT subject, labels FROM gmail_messages"}, 20, "csv")
+	resp := svc.Execute(context.Background(), []Statement{statement("What Gmail subjects and labels need CSV escaping?", "SELECT subject, labels FROM gmail_messages")}, 20, "csv")
 	want := "subject,labels\n\"hello, \"\"world\"\"\nnext\",\"[\"\"INBOX\"\",\"\"STARRED\"\"]\""
 	if resp.Results[0].Preview != want {
 		t.Fatalf("CSV = %q, want %q", resp.Results[0].Preview, want)
@@ -264,9 +303,9 @@ func TestServiceGetRowsPaginatesCachedRowsAndInheritsFormat(t *testing.T) {
 		},
 	}}
 	svc := NewService(runner, Options{MaxRows: 100000})
-	resp := svc.Execute(context.Background(), []string{"SELECT id, body FROM gmail_messages ORDER BY id"}, 1, "ndjson")
+	resp := svc.Execute(context.Background(), []Statement{statement("Which Gmail messages should be paginated by id?", "SELECT id, body FROM gmail_messages ORDER BY id")}, 1, "ndjson")
 
-	rows := svc.GetRows(resp.Results[0].QueryID, 1, 2, "")
+	rows := svc.GetRows(context.Background(), resp.Results[0].QueryID, 1, 2, "")
 	if rows.Error != "" {
 		t.Fatalf("GetRows error: %s", rows.Error)
 	}
@@ -291,14 +330,14 @@ func TestServiceGetFieldReadsTailsWithoutSQLSubstringArithmetic(t *testing.T) {
 	}}
 	svc := NewService(runner, Options{MaxRows: 100000, MaxFieldChars: 20})
 
-	resp := svc.Execute(context.Background(), []string{"SELECT recording_id, transcript FROM apple_voice_memos_enrichments ORDER BY recording_id LIMIT 18"}, 18, "json")
+	resp := svc.Execute(context.Background(), []Statement{statement("Which transcript tails should be available without substring SQL?", "SELECT recording_id, transcript FROM apple_voice_memos_enrichments ORDER BY recording_id LIMIT 18")}, 18, "json")
 	queryID := resp.Results[0].QueryID
 	if queryID == "" {
 		t.Fatalf("missing query_id: %#v", resp.Results[0])
 	}
 	for i := range rows {
 		value := rows[i]["transcript"].(string)
-		field := svc.GetField(queryID, i, "transcript", utf8RuneLen(value)-11, 11)
+		field := svc.GetField(context.Background(), queryID, i, "transcript", utf8RuneLen(value)-11, 11)
 		if field.Error != "" {
 			t.Fatalf("row %d GetField error: %s", i, field.Error)
 		}
@@ -327,9 +366,9 @@ func TestServiceGrepRowsSearchesCachedResults(t *testing.T) {
 		},
 	}}
 	svc := NewService(runner, Options{MaxRows: 100000, MaxFieldChars: 20})
-	resp := svc.Execute(context.Background(), []string{"SELECT recording_id, transcript FROM apple_voice_memos_enrichments"}, 2, "json")
+	resp := svc.Execute(context.Background(), []Statement{statement("Which transcripts mention weighted projects?", "SELECT recording_id, transcript FROM apple_voice_memos_enrichments")}, 2, "json")
 
-	grep := svc.GrepRows(resp.Results[0].QueryID, "weighted projects", []string{"transcript"}, 100, 5)
+	grep := svc.GrepRows(context.Background(), resp.Results[0].QueryID, "weighted projects", []string{"transcript"}, 100, 5)
 	if grep.Error != "" {
 		t.Fatalf("GrepRows error: %s", grep.Error)
 	}
@@ -350,13 +389,13 @@ func TestServiceUnknownAndExpiredQueryIDErrorsAreActionable(t *testing.T) {
 		"SELECT body FROM gmail_messages": {Columns: []string{"body"}, Rows: []map[string]any{{"body": "hello"}}},
 	}}, Options{QueryCacheTTL: time.Nanosecond})
 
-	unknown := svc.GetRows("missing", 0, 1, "")
+	unknown := svc.GetRows(context.Background(), "missing", 0, 1, "")
 	if !strings.Contains(unknown.Error, "unknown or expired query_id") || !strings.Contains(unknown.Error, "re-run query") {
 		t.Fatalf("unknown error not actionable: %q", unknown.Error)
 	}
-	resp := svc.Execute(context.Background(), []string{"SELECT body FROM gmail_messages"}, 1, "csv")
+	resp := svc.Execute(context.Background(), []Statement{statement("Which Gmail body should expire from the query cache?", "SELECT body FROM gmail_messages")}, 1, "csv")
 	time.Sleep(time.Millisecond)
-	expired := svc.GetField(resp.Results[0].QueryID, 0, "body", 0, 10)
+	expired := svc.GetField(context.Background(), resp.Results[0].QueryID, 0, "body", 0, 10)
 	if !strings.Contains(expired.Error, "unknown or expired query_id") || !strings.Contains(expired.Error, "server restarts") {
 		t.Fatalf("expired error not actionable: %q", expired.Error)
 	}
@@ -374,7 +413,7 @@ func TestServiceRejectsQueriesOverRowCap(t *testing.T) {
 		},
 	}}, Options{MaxRows: 2})
 
-	resp := svc.Execute(context.Background(), []string{"SELECT body FROM gmail_messages"}, 20, "csv")
+	resp := svc.Execute(context.Background(), []Statement{statement("Does the Gmail body query exceed the row cap?", "SELECT body FROM gmail_messages")}, 20, "csv")
 	if !strings.Contains(resp.Results[0].Error, "more than MCP_MAX_ROWS") {
 		t.Fatalf("expected row cap error, got %#v", resp.Results[0])
 	}

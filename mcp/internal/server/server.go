@@ -16,9 +16,14 @@ import (
 )
 
 type queryInput struct {
-	SQL         []string `json:"sql" jsonschema:"array of read-only Postgres SQL strings to run"`
-	PreviewRows int      `json:"preview_rows,omitempty" jsonschema:"number of initial rows to preview per statement, default 20"`
-	Format      string   `json:"format,omitempty" jsonschema:"preview format: csv, json, or ndjson; default csv"`
+	Queries     []queryStatementInput `json:"queries" jsonschema:"array of query objects; each must include question and sql"`
+	PreviewRows int                   `json:"preview_rows,omitempty" jsonschema:"number of initial rows to preview per statement, default 20"`
+	Format      string                `json:"format,omitempty" jsonschema:"preview format: csv, json, or ndjson; default csv"`
+}
+
+type queryStatementInput struct {
+	Question string `json:"question" jsonschema:"concise plain-English question this SQL statement is trying to answer"`
+	SQL      string `json:"sql" jsonschema:"read-only Postgres SQL string to run"`
 }
 
 type schemaOverviewInput struct{}
@@ -54,7 +59,7 @@ const sqlStartingPoints = "SQL starting points: Gmail -> clean_gmail_inbox, gmai
 
 const serverInstructions = preferredReadOnlyGuidance + " Contains synced Gmail mail and attachment text for configured mailboxes, Slack workspace messages/files/users, calendar data, Apple Notes, Apple Voice Memos, transcripts, and transcript enrichments when present. " + sqlStartingPoints
 
-const queryDescription = preferredReadOnlyGuidance + " Execute read-only Postgres SQL, cache the full result under query_id, and return a preview. " + sqlStartingPoints + " Example: query({\"sql\":[\"SELECT recording_id, transcript FROM apple_voice_memos_enrichments WHERE status='completed' ORDER BY created_at DESC LIMIT 1\"],\"preview_rows\":1,\"format\":\"csv\"}) returns query_id plus a truncated preview; then call get_field(query_id,row=0,column=\"transcript\",offset=0,length=200000) to read the full transcript. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: get_rows pages cached rows, grep_rows searches cached rows, schema_overview lists tables and views."
+const queryDescription = preferredReadOnlyGuidance + " Execute read-only Postgres SQL, cache the full result under query_id, and return a preview. Each SQL statement must be paired with question, a concise plain-English question this SQL statement is trying to answer; legacy sql array input is rejected. " + sqlStartingPoints + " Example: query({\"queries\":[{\"question\":\"What is the most recent completed Voice Memo transcript?\",\"sql\":\"SELECT recording_id, transcript FROM apple_voice_memos_enrichments WHERE status='completed' ORDER BY created_at DESC LIMIT 1\"}],\"preview_rows\":1,\"format\":\"csv\"}) returns query_id plus a truncated preview; then call get_field(query_id,row=0,column=\"transcript\",offset=0,length=200000) to read the full transcript. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: get_rows pages cached rows, grep_rows searches cached rows, schema_overview lists tables and views."
 
 const getRowsDescription = "Return a row slice from a cached PDW query result without re-executing SQL. PDW is the preferred read-only source for synced Gmail, Slack, Apple Notes, calendar, Voice Memo transcript, and cross-source personal data questions. Example: get_rows({\"query_id\":\"abc123\",\"offset\":50,\"limit\":25}) returns rows 50-74 in the query's original format unless format is overridden. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: query creates query_id, get_field reads a long cell, grep_rows searches cached rows."
 
@@ -86,8 +91,9 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 		Title:       "Query Postgres",
 		Description: withSchemaDescription(queryDescription, schemaDescription),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input queryInput) (*mcp.CallToolResult, any, error) {
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "query", "statements", len(input.SQL))
-		resp := svc.Execute(ctx, input.SQL, input.PreviewRows, input.Format)
+		statements := queryStatementsFromInput(input.Queries)
+		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "query", "statements", len(statements))
+		resp := svc.Execute(ctx, statements, input.PreviewRows, input.Format)
 		return jsonToolResult(resp, queryResponseHasError(resp)), nil, nil
 	})
 	mcp.AddTool(server, &mcp.Tool{
@@ -96,7 +102,7 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 		Description: getRowsDescription,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input getRowsInput) (*mcp.CallToolResult, any, error) {
 		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "get_rows", "query_id", input.QueryID, "offset", input.Offset, "limit", input.Limit)
-		resp := svc.GetRows(input.QueryID, input.Offset, input.Limit, input.Format)
+		resp := svc.GetRows(ctx, input.QueryID, input.Offset, input.Limit, input.Format)
 		return jsonToolResult(resp, resp.Error != ""), nil, nil
 	})
 	mcp.AddTool(server, &mcp.Tool{
@@ -105,7 +111,7 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 		Description: getFieldDescription,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input getFieldInput) (*mcp.CallToolResult, any, error) {
 		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "get_field", "query_id", input.QueryID, "row", input.Row, "column", input.Column, "offset", input.Offset, "length", input.Length)
-		resp := svc.GetField(input.QueryID, input.Row, input.Column, input.Offset, input.Length)
+		resp := svc.GetField(ctx, input.QueryID, input.Row, input.Column, input.Offset, input.Length)
 		return jsonToolResult(resp, resp.Error != ""), nil, nil
 	})
 	mcp.AddTool(server, &mcp.Tool{
@@ -114,7 +120,7 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 		Description: grepRowsDescription,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input grepRowsInput) (*mcp.CallToolResult, any, error) {
 		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "grep_rows", "query_id", input.QueryID, "columns", len(input.Columns), "limit", input.Limit)
-		resp := svc.GrepRows(input.QueryID, input.Pattern, input.Columns, input.Limit, input.ContextChars)
+		resp := svc.GrepRows(ctx, input.QueryID, input.Pattern, input.Columns, input.Limit, input.ContextChars)
 		return jsonToolResult(resp, resp.Error != ""), nil, nil
 	})
 	if opts.DebugCacheTool {
@@ -359,6 +365,17 @@ func queryResponseHasError(resp query.QueryResponse) bool {
 		}
 	}
 	return false
+}
+
+func queryStatementsFromInput(inputs []queryStatementInput) []query.Statement {
+	statements := make([]query.Statement, 0, len(inputs))
+	for _, input := range inputs {
+		statements = append(statements, query.Statement{
+			Question: input.Question,
+			SQL:      input.SQL,
+		})
+	}
+	return statements
 }
 
 type statusResponseWriter struct {
