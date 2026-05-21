@@ -469,7 +469,7 @@ func (s *Service) truncateRowsForOutput(rows []map[string]any) ([]map[string]any
 }
 
 func (s *Service) SchemaOverview(ctx context.Context) Response {
-	const showTablesSQL = "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name"
+	const showTablesSQL = "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
 	const currentDatabaseSQL = "SELECT current_database() AS database"
 	started := time.Now()
 	schemaResult := Result{SQL: "SELECT current_database() + information_schema.tables + SELECT * FROM <each table> LIMIT 3"}

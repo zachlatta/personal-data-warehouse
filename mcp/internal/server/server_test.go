@@ -29,9 +29,13 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 			Columns: []string{"database"},
 			Rows:    []map[string]any{{"database": "default"}},
 		},
-		"SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name": {
+		"SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name": {
 			Columns: []string{"name"},
-			Rows:    []map[string]any{{"name": "gmail_messages"}, {"name": "apple_voice_memos_enrichments"}},
+			Rows:    []map[string]any{{"name": "clean_gmail_inbox"}, {"name": "gmail_messages"}, {"name": "apple_voice_memos_enrichments"}},
+		},
+		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'clean_gmail_inbox' ORDER BY ordinal_position": {
+			Columns: []string{"name"},
+			Rows:    []map[string]any{{"name": "thread_id"}, {"name": "latest_subject"}},
 		},
 		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'gmail_messages' ORDER BY ordinal_position": {
 			Columns: []string{"name"},
@@ -40,6 +44,10 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'apple_voice_memos_enrichments' ORDER BY ordinal_position": {
 			Columns: []string{"name"},
 			Rows:    []map[string]any{{"name": "transcript"}, {"name": "summary"}},
+		},
+		"SELECT substring(\"thread_id\"::text from 1 for 15) AS \"thread_id\", char_length(\"thread_id\"::text) AS \"__pdw_preview_len_0\", substring(\"latest_subject\"::text from 1 for 15) AS \"latest_subject\", char_length(\"latest_subject\"::text) AS \"__pdw_preview_len_1\" FROM \"clean_gmail_inbox\" LIMIT 3": {
+			Columns: []string{"thread_id", "__pdw_preview_len_0", "latest_subject", "__pdw_preview_len_1"},
+			Rows:    []map[string]any{{"thread_id": "thread-1", "__pdw_preview_len_0": 8, "latest_subject": "hello inbox", "__pdw_preview_len_1": 11}},
 		},
 		"SELECT substring(\"subject\"::text from 1 for 15) AS \"subject\", char_length(\"subject\"::text) AS \"__pdw_preview_len_0\" FROM \"gmail_messages\" LIMIT 3": {
 			Columns: []string{"subject", "__pdw_preview_len_0"},
@@ -79,6 +87,24 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	for _, tool := range tools.Tools {
 		found[tool.Name] = true
 		if tool.Name == "query" || tool.Name == "schema_overview" {
+			if !strings.Contains(tool.Description, "Preferred read-only source") {
+				t.Fatalf("%s description does not steer agents to PDW first: %q", tool.Name, tool.Description)
+			}
+			if !strings.Contains(tool.Description, "Use this PDW server before live Gmail or Slack connectors for read-only questions") {
+				t.Fatalf("%s description does not prefer PDW over live connectors for reads: %q", tool.Name, tool.Description)
+			}
+			if !strings.Contains(tool.Description, "clean_gmail_inbox") || !strings.Contains(tool.Description, "clean_slack_inbox") {
+				t.Fatalf("%s description does not include clean-view SQL starting points: %q", tool.Name, tool.Description)
+			}
+			if strings.Contains(tool.Description, "voice_memo_transcripts") {
+				t.Fatalf("%s description still references stale transcript table: %q", tool.Name, tool.Description)
+			}
+			if !strings.Contains(tool.Description, "apple_voice_memos_enrichments") {
+				t.Fatalf("%s description does not include live transcript table: %q", tool.Name, tool.Description)
+			}
+			if !strings.Contains(tool.Description, "default.clean_gmail_inbox(thread_id, latest_subject)") {
+				t.Fatalf("%s description does not include clean view schema for discovery: %q", tool.Name, tool.Description)
+			}
 			if !strings.Contains(tool.Description, "default.gmail_messages(subject)") {
 				t.Fatalf("%s description does not include schema for discovery: %q", tool.Name, tool.Description)
 			}
@@ -114,6 +140,9 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	text, ok := result.Content[0].(*mcp.TextContent)
 	if !ok {
 		t.Fatalf("content type = %T", result.Content[0])
+	}
+	if !strings.Contains(text.Text, "# default.clean_gmail_inbox") || !strings.Contains(text.Text, "thread_id,latest_subject\nthread-1,hello inbox") {
+		t.Fatalf("schema overview did not include clean view: %q", text.Text)
 	}
 	if !strings.Contains(text.Text, "# default.gmail_messages") || !strings.Contains(text.Text, "subject\nhello") {
 		t.Fatalf("unexpected schema overview text: %q", text.Text)

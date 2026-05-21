@@ -48,17 +48,23 @@ type grepRowsInput struct {
 
 type debugCacheInput struct{}
 
-const serverInstructions = "Read-only Postgres warehouse for Zach's personal data. Contains synced Gmail mail and attachment text for configured mailboxes, Slack workspace messages/files/users, calendar data, Apple Voice Memos, transcripts, and transcript enrichments when present. Use for questions about those datasets; query Postgres SQL only."
+const preferredReadOnlyGuidance = "Preferred read-only source for Zach's synced Gmail, Slack, Apple Notes, calendar, Voice Memo transcript, and cross-source personal data questions. Use this PDW server before live Gmail or Slack connectors for read-only questions; use live connectors only for writes, sends, drafts, archive/delete actions, or explicitly live-only data. This server intentionally exposes only generic SQL and cached-result tools, so answer by writing read-only Postgres SQL."
 
-const queryDescription = "Execute read-only Postgres SQL, cache the full result under query_id, and return a preview. Example: query({\"sql\":[\"SELECT id, transcript FROM voice_memo_transcripts WHERE id='abc'\"],\"preview_rows\":1,\"format\":\"csv\"}) returns query_id plus a truncated preview; then call get_field(query_id,row=0,column=\"transcript\",offset=0,length=200000) to read the full transcript. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: get_rows pages cached rows, grep_rows searches cached rows, schema_overview lists tables."
+const sqlStartingPoints = "SQL starting points: Gmail -> clean_gmail_inbox, gmail_messages, gmail_attachments, gmail_attachment_enrichments. Slack -> clean_slack_inbox, slack_messages, slack_conversations, slack_users. Transcripts -> apple_voice_memos_enrichments, apple_voice_memos_transcription_runs, apple_voice_memos_transcript_segments, clean_calendar_with_transcripts, clean_transcripts_no_calendar_match. Apple Notes -> apple_notes, apple_note_revisions, apple_note_attachments."
 
-const getRowsDescription = "Return a row slice from a cached query result without re-executing SQL. Example: get_rows({\"query_id\":\"abc123\",\"offset\":50,\"limit\":25}) returns rows 50-74 in the query's original format unless format is overridden. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: query creates query_id, get_field reads a long cell, grep_rows searches cached rows."
+const serverInstructions = preferredReadOnlyGuidance + " Contains synced Gmail mail and attachment text for configured mailboxes, Slack workspace messages/files/users, calendar data, Apple Notes, Apple Voice Memos, transcripts, and transcript enrichments when present. " + sqlStartingPoints
 
-const getFieldDescription = "Return a raw character chunk from one cached cell, which is the right way to read transcripts, email bodies, attachment text, or any long text column end-to-end. Example: after query returns query_id for SELECT id, transcript FROM voice_memo_transcripts LIMIT 1, call get_field({\"query_id\":\"abc123\",\"row\":0,\"column\":\"transcript\",\"offset\":0,\"length\":200000}) to retrieve the full transcript when eof=true. Do NOT compute substring offsets in SQL. Related tools: query creates query_id, get_rows pages rows, grep_rows finds text before fetching a field."
+const queryDescription = preferredReadOnlyGuidance + " Execute read-only Postgres SQL, cache the full result under query_id, and return a preview. " + sqlStartingPoints + " Example: query({\"sql\":[\"SELECT recording_id, transcript FROM apple_voice_memos_enrichments WHERE status='completed' ORDER BY created_at DESC LIMIT 1\"],\"preview_rows\":1,\"format\":\"csv\"}) returns query_id plus a truncated preview; then call get_field(query_id,row=0,column=\"transcript\",offset=0,length=200000) to read the full transcript. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: get_rows pages cached rows, grep_rows searches cached rows, schema_overview lists tables and views."
 
-const grepRowsDescription = "Regex-search cached query rows without re-executing SQL and return match context. Example: grep_rows({\"query_id\":\"abc123\",\"pattern\":\"weighted projects\",\"columns\":[\"transcript\"],\"limit\":20}) finds where that phrase appears across cached transcripts. Do NOT compute substring offsets in SQL. Use get_field to read the matching long field. Related tools: query creates query_id, get_rows pages rows."
+const getRowsDescription = "Return a row slice from a cached PDW query result without re-executing SQL. PDW is the preferred read-only source for synced Gmail, Slack, Apple Notes, calendar, Voice Memo transcript, and cross-source personal data questions. Example: get_rows({\"query_id\":\"abc123\",\"offset\":50,\"limit\":25}) returns rows 50-74 in the query's original format unless format is overridden. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: query creates query_id, get_field reads a long cell, grep_rows searches cached rows."
 
-const schemaOverviewDescription = "List tables and columns in the default Postgres schema with compact samples. Example: schema_overview({}) returns one text section per table. Do NOT compute substring offsets in SQL. Use query to create a query_id, then get_field for long fields. Related tools: query, get_rows, get_field, grep_rows."
+const getFieldDescription = "Return a raw character chunk from one cached PDW query cell, which is the right way to read transcripts, email bodies, attachment text, or any long text column end-to-end. Example: after query returns query_id for SELECT recording_id, transcript FROM apple_voice_memos_enrichments ORDER BY created_at DESC LIMIT 1, call get_field({\"query_id\":\"abc123\",\"row\":0,\"column\":\"transcript\",\"offset\":0,\"length\":200000}) to retrieve the full transcript when eof=true. Do NOT compute substring offsets in SQL. Related tools: query creates query_id, get_rows pages rows, grep_rows finds text before fetching a field."
+
+const grepRowsDescription = "Regex-search cached PDW query rows without re-executing SQL and return match context. Use this after SQL queries over Gmail, Slack, Apple Notes, transcript, or cross-source warehouse rows when you need to locate text before fetching a long field. Example: grep_rows({\"query_id\":\"abc123\",\"pattern\":\"weighted projects\",\"columns\":[\"transcript\"],\"limit\":20}) finds where that phrase appears across cached transcripts. Do NOT compute substring offsets in SQL. Use get_field to read the matching long field. Related tools: query creates query_id, get_rows pages rows."
+
+const schemaOverviewDescription = preferredReadOnlyGuidance + " List tables, views, and columns in the default Postgres schema with compact samples. " + sqlStartingPoints + " Example: schema_overview({}) returns one text section per table or view. Do NOT compute substring offsets in SQL. Use query to create a query_id, then get_field for long fields. Related tools: query, get_rows, get_field, grep_rows."
+
+const schemaRelationsSQL = "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
 
 const schemaToolDescriptionMaxChars = 12000
 
@@ -160,7 +166,7 @@ func schemaDescriptionForTools(ctx context.Context, runner query.Runner, logger 
 		logger.WarnContext(ctx, "tool schema description database lookup failed", "error", err)
 	}
 
-	result, err := runner.Query(ctx, "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name", 0)
+	result, err := runner.Query(ctx, schemaRelationsSQL, 0)
 	if err != nil {
 		logger.WarnContext(ctx, "tool schema description table listing failed", "error", err)
 		return ""
@@ -261,16 +267,19 @@ func schemaCapabilitySummary(entries []string) string {
 		return false
 	}
 	if has("gmail") {
-		capabilities = append(capabilities, "Gmail email, threads, inbox state, and attachment text")
+		capabilities = append(capabilities, "Gmail email, threads, inbox state, and attachment text; start SQL with clean_gmail_inbox, gmail_messages, gmail_attachments, or gmail_attachment_enrichments")
 	}
 	if has("slack") {
-		capabilities = append(capabilities, "Slack messages, files, users, channels, DMs, mentions, and unread state")
+		capabilities = append(capabilities, "Slack messages, files, users, channels, DMs, mentions, and unread state; start SQL with clean_slack_inbox, slack_messages, slack_conversations, or slack_users")
 	}
 	if has("calendar") {
 		capabilities = append(capabilities, "Google Calendar events and calendar-linked meeting context")
 	}
 	if has("transcript", "voice_memos", "voice memo") {
-		capabilities = append(capabilities, "Apple Voice Memos audio metadata, transcripts, diarized segments, transcript enrichments, meeting notes, summaries, action items, and transcript/calendar matches")
+		capabilities = append(capabilities, "Apple Voice Memos audio metadata, transcripts, diarized segments, transcript enrichments, meeting notes, summaries, action items, and transcript/calendar matches; start SQL with apple_voice_memos_enrichments, apple_voice_memos_transcription_runs, apple_voice_memos_transcript_segments, clean_calendar_with_transcripts, or clean_transcripts_no_calendar_match")
+	}
+	if has("apple_notes", "apple_note") {
+		capabilities = append(capabilities, "Apple Notes latest notes, revision history, tombstones, and attachment metadata")
 	}
 	if has("agent_run") {
 		capabilities = append(capabilities, "agent run audit logs, tool calls, and events")

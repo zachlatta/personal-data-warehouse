@@ -1,6 +1,9 @@
 # Personal Data Warehouse MCP
 
-This is a Go remote MCP server for querying the Postgres warehouse from Claude connectors.
+This is a Go remote MCP server for querying the Postgres warehouse from Claude connectors. It is
+the preferred read-only source for synced Gmail, Slack, Apple Notes, calendar, Voice Memo transcript,
+and cross-source personal data questions. It intentionally exposes generic SQL tools instead of
+Gmail-, Slack-, or transcript-specific tools.
 
 ## Environment
 
@@ -80,6 +83,15 @@ Do not reuse the root `Dockerfile`; that one runs Dagster.
 
 The server exposes cursor-based query tools. `query` executes SQL once, caches the full result in the server process, and returns a `query_id` handle for follow-up calls. Cached results expire after `MCP_QUERY_CACHE_TTL` and are evicted least-recently-used when the process-wide `MCP_QUERY_CACHE_MAX_BYTES` cap is reached. If the server restarts, old `query_id`s are invalid and the caller should re-run `query`.
 
+SQL starting points:
+
+- Gmail: `clean_gmail_inbox`, `gmail_messages`, `gmail_attachments`, `gmail_attachment_enrichments`
+- Slack: `clean_slack_inbox`, `slack_messages`, `slack_conversations`, `slack_users`
+- Transcripts: `apple_voice_memos_enrichments`, `apple_voice_memos_transcription_runs`,
+  `apple_voice_memos_transcript_segments`, `clean_calendar_with_transcripts`,
+  `clean_transcripts_no_calendar_match`
+- Apple Notes: `apple_notes`, `apple_note_revisions`, `apple_note_attachments`
+
 ### `query`
 
 Executes read-only Postgres SQL, caches each result under a generated `query_id`, and returns a preview.
@@ -88,7 +100,7 @@ Executes read-only Postgres SQL, caches each result under a generated `query_id`
 {
   "name": "query",
   "input": {
-    "sql": ["SELECT id, transcript FROM voice_memo_transcripts WHERE id = 'abc'"],
+    "sql": ["SELECT recording_id, transcript FROM apple_voice_memos_enrichments WHERE status = 'completed' ORDER BY created_at DESC LIMIT 1"],
     "preview_rows": 1,
     "format": "csv"
   }
@@ -186,7 +198,7 @@ It also exposes a schema overview MCP tool:
 }
 ```
 
-`schema_overview` returns one text block with a section per table:
+`schema_overview` returns one text block with a section per table or view:
 
 ```text
 # database.table_name

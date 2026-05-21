@@ -45,7 +45,8 @@ func (r *recordingRunner) Query(_ context.Context, sql string, maxRows int) (Raw
 }
 
 func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
-	showTablesSQL := "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name"
+	showTablesSQL := "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
+	describeCleanGmailSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'clean_gmail_inbox' ORDER BY ordinal_position"
 	describeGmailSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'gmail_messages' ORDER BY ordinal_position"
 	describeSlackSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'slack\"messages' ORDER BY ordinal_position"
 	runner := &recordingRunner{results: map[string]RawResult{
@@ -56,9 +57,21 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		showTablesSQL: {
 			Columns: []string{"name"},
 			Rows: []map[string]any{
+				{"name": "clean_gmail_inbox"},
 				{"name": "gmail_messages"},
 				{"name": "slack\"messages"},
 			},
+		},
+		describeCleanGmailSQL: {
+			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
+			Rows: []map[string]any{
+				{"name": "thread_id", "type": "String"},
+				{"name": "latest_subject", "type": "String"},
+			},
+		},
+		"SELECT substring(\"thread_id\"::text from 1 for 15) AS \"thread_id\", char_length(\"thread_id\"::text) AS \"__pdw_preview_len_0\", substring(\"latest_subject\"::text from 1 for 15) AS \"latest_subject\", char_length(\"latest_subject\"::text) AS \"__pdw_preview_len_1\" FROM \"clean_gmail_inbox\" LIMIT 3": {
+			Columns: []string{"thread_id", "__pdw_preview_len_0", "latest_subject", "__pdw_preview_len_1"},
+			Rows:    []map[string]any{{"thread_id": "thread-1", "__pdw_preview_len_0": 8, "latest_subject": "hello inbox", "__pdw_preview_len_1": 11}},
 		},
 		describeGmailSQL: {
 			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
@@ -97,6 +110,8 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		t.Fatalf("first queries = %#v, want %#v", runner.queries[:2], wantQueries)
 	}
 	wantSampleQueries := []string{
+		describeCleanGmailSQL,
+		"SELECT substring(\"thread_id\"::text from 1 for 15) AS \"thread_id\", char_length(\"thread_id\"::text) AS \"__pdw_preview_len_0\", substring(\"latest_subject\"::text from 1 for 15) AS \"latest_subject\", char_length(\"latest_subject\"::text) AS \"__pdw_preview_len_1\" FROM \"clean_gmail_inbox\" LIMIT 3",
 		describeGmailSQL,
 		"SELECT substring(\"id\"::text from 1 for 15) AS \"id\", char_length(\"id\"::text) AS \"__pdw_preview_len_0\", substring(\"body\"::text from 1 for 15) AS \"body\", char_length(\"body\"::text) AS \"__pdw_preview_len_1\" FROM \"gmail_messages\" LIMIT 3",
 		describeSlackSQL,
@@ -112,6 +127,11 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		t.Fatalf("results length = %d, want 1", len(resp.Results))
 	}
 	wantCSV := strings.Join([]string{
+		"# default.clean_gmail_inbox",
+		"",
+		"thread_id,latest_subject",
+		"thread-1,hello inbox",
+		"",
 		"# default.gmail_messages",
 		"",
 		"id,body",
@@ -261,17 +281,17 @@ func TestServiceGetRowsPaginatesCachedRowsAndInheritsFormat(t *testing.T) {
 func TestServiceGetFieldReadsTailsWithoutSQLSubstringArithmetic(t *testing.T) {
 	rows := make([]map[string]any, 18)
 	for i := range rows {
-		rows[i] = map[string]any{"id": i, "transcript": strings.Repeat("head ", 1000) + "tail-marker"}
+		rows[i] = map[string]any{"recording_id": i, "transcript": strings.Repeat("head ", 1000) + "tail-marker"}
 	}
 	runner := &recordingRunner{results: map[string]RawResult{
-		"SELECT id, transcript FROM voice_memo_transcripts ORDER BY id LIMIT 18": {
-			Columns: []string{"id", "transcript"},
+		"SELECT recording_id, transcript FROM apple_voice_memos_enrichments ORDER BY recording_id LIMIT 18": {
+			Columns: []string{"recording_id", "transcript"},
 			Rows:    rows,
 		},
 	}}
 	svc := NewService(runner, Options{MaxRows: 100000, MaxFieldChars: 20})
 
-	resp := svc.Execute(context.Background(), []string{"SELECT id, transcript FROM voice_memo_transcripts ORDER BY id LIMIT 18"}, 18, "json")
+	resp := svc.Execute(context.Background(), []string{"SELECT recording_id, transcript FROM apple_voice_memos_enrichments ORDER BY recording_id LIMIT 18"}, 18, "json")
 	queryID := resp.Results[0].QueryID
 	if queryID == "" {
 		t.Fatalf("missing query_id: %#v", resp.Results[0])
@@ -298,16 +318,16 @@ func TestServiceGetFieldReadsTailsWithoutSQLSubstringArithmetic(t *testing.T) {
 
 func TestServiceGrepRowsSearchesCachedResults(t *testing.T) {
 	runner := &recordingRunner{results: map[string]RawResult{
-		"SELECT id, transcript FROM voice_memo_transcripts": {
-			Columns: []string{"id", "transcript"},
+		"SELECT recording_id, transcript FROM apple_voice_memos_enrichments": {
+			Columns: []string{"recording_id", "transcript"},
 			Rows: []map[string]any{
-				{"id": "a", "transcript": "nothing here"},
-				{"id": "b", "transcript": "we discussed weighted projects yesterday"},
+				{"recording_id": "a", "transcript": "nothing here"},
+				{"recording_id": "b", "transcript": "we discussed weighted projects yesterday"},
 			},
 		},
 	}}
 	svc := NewService(runner, Options{MaxRows: 100000, MaxFieldChars: 20})
-	resp := svc.Execute(context.Background(), []string{"SELECT id, transcript FROM voice_memo_transcripts"}, 2, "json")
+	resp := svc.Execute(context.Background(), []string{"SELECT recording_id, transcript FROM apple_voice_memos_enrichments"}, 2, "json")
 
 	grep := svc.GrepRows(resp.Results[0].QueryID, "weighted projects", []string{"transcript"}, 100, 5)
 	if grep.Error != "" {
