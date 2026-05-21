@@ -1125,8 +1125,9 @@ class PostgresWarehouse:
         self._insert_rows("slack_conversation_members", rows, SLACK_CONVERSATION_MEMBER_COLUMNS)
 
     def insert_slack_messages(self, rows: list[dict[str, Any]]) -> None:
+        increments, latest_candidates, recompute_keys = self._slack_conversation_stat_changes_for_message_rows(rows)
         self._insert_rows("slack_messages", rows, SLACK_MESSAGE_COLUMNS)
-        self._refresh_slack_conversation_stats_for_rows(rows)
+        self._apply_slack_conversation_stat_changes(increments, latest_candidates, recompute_keys)
 
     def insert_slack_message_reactions(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("slack_message_reactions", rows, SLACK_REACTION_COLUMNS)
@@ -1197,20 +1198,160 @@ class PostgresWarehouse:
         if rows and not bool(rows[0][0]) and bool(rows[0][1]):
             self.rebuild_slack_conversation_stats()
 
-    def _refresh_slack_conversation_stats_for_rows(self, rows: list[dict[str, Any]]) -> None:
+    def _slack_conversation_stat_changes_for_message_rows(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> tuple[dict[tuple[str, str, str], int], dict[tuple[str, str, str], datetime], set[tuple[str, str, str]]]:
+        existing_rows = self._load_existing_slack_message_stat_rows(rows)
+        increments: dict[tuple[str, str, str], int] = {}
+        latest_candidates: dict[tuple[str, str, str], datetime] = {}
+        recompute_keys: set[tuple[str, str, str]] = set()
+        for row in rows:
+            message_key = (
+                str(row["account"]),
+                str(row["team_id"]),
+                str(row["conversation_id"]),
+                str(row["message_ts"]),
+            )
+            conversation_key = message_key[:3]
+            existing = existing_rows.get(message_key)
+            incoming_sync_version = int(row["sync_version"])
+            if existing is not None and int(existing["sync_version"]) > incoming_sync_version:
+                continue
+
+            old_live = existing is not None and int(existing["is_deleted"]) == 0
+            new_live = int(row["is_deleted"]) == 0
+            new_datetime = _ensure_utc(row["message_datetime"])
+            if old_live and not new_live:
+                recompute_keys.add(conversation_key)
+                continue
+            if old_live and new_live:
+                old_datetime = _ensure_utc(existing["message_datetime"])
+                if new_datetime < old_datetime:
+                    recompute_keys.add(conversation_key)
+                elif new_datetime > old_datetime:
+                    current_latest = latest_candidates.get(conversation_key)
+                    if current_latest is None or new_datetime > current_latest:
+                        latest_candidates[conversation_key] = new_datetime
+                continue
+            if not old_live and new_live:
+                increments[conversation_key] = increments.get(conversation_key, 0) + 1
+                current_latest = latest_candidates.get(conversation_key)
+                if current_latest is None or new_datetime > current_latest:
+                    latest_candidates[conversation_key] = new_datetime
+        return increments, latest_candidates, recompute_keys
+
+    def _load_existing_slack_message_stat_rows(self, rows: list[dict[str, Any]]) -> dict[tuple[str, str, str, str], dict[str, Any]]:
         keys = sorted(
             {
                 (
                     str(row["account"]),
                     str(row["team_id"]),
                     str(row["conversation_id"]),
+                    str(row["message_ts"]),
                 )
                 for row in rows
             }
         )
         if not keys:
+            return {}
+        with self._connection.cursor() as cursor:
+            execute_values(
+                cursor,
+                """
+                WITH incoming(account, team_id, conversation_id, message_ts) AS (VALUES %s)
+                SELECT
+                    m.account,
+                    m.team_id,
+                    m.conversation_id,
+                    m.message_ts,
+                    m.is_deleted,
+                    m.message_datetime,
+                    m.sync_version
+                FROM slack_messages AS m
+                INNER JOIN incoming AS i
+                  ON m.account = i.account
+                 AND m.team_id = i.team_id
+                 AND m.conversation_id = i.conversation_id
+                 AND m.message_ts = i.message_ts
+                """,
+                keys,
+                template="(%s, %s, %s, %s)",
+                page_size=max(len(keys), 1),
+            )
+            existing = cursor.fetchall()
+        return {
+            (str(row[0]), str(row[1]), str(row[2]), str(row[3])): {
+                "is_deleted": int(row[4]),
+                "message_datetime": row[5],
+                "sync_version": int(row[6]),
+            }
+            for row in existing
+        }
+
+    def _apply_slack_conversation_stat_changes(
+        self,
+        increments: dict[tuple[str, str, str], int],
+        latest_candidates: dict[tuple[str, str, str], datetime],
+        recompute_keys: set[tuple[str, str, str]],
+    ) -> None:
+        incremental_rows = [
+            (
+                account,
+                team_id,
+                conversation_id,
+                increments.get((account, team_id, conversation_id), 0),
+                latest_candidates[(account, team_id, conversation_id)],
+            )
+            for account, team_id, conversation_id in sorted(latest_candidates)
+            if (account, team_id, conversation_id) not in recompute_keys
+        ]
+        if incremental_rows:
+            self._upsert_slack_conversation_stat_increments(incremental_rows)
+        if recompute_keys:
+            self._refresh_slack_conversation_stats_for_keys(sorted(recompute_keys))
+
+    def _upsert_slack_conversation_stat_increments(
+        self,
+        rows: list[tuple[str, str, str, int, datetime]],
+    ) -> None:
+        if not rows:
             return
-        self._refresh_slack_conversation_stats_for_keys(keys)
+        with self._connection.cursor() as cursor:
+            execute_values(
+                cursor,
+                """
+                INSERT INTO slack_conversation_stats (
+                    account,
+                    team_id,
+                    conversation_id,
+                    message_count,
+                    latest_message_at,
+                    updated_at
+                )
+                VALUES %s
+                ON CONFLICT (account, team_id, conversation_id) DO UPDATE SET
+                    message_count = slack_conversation_stats.message_count + EXCLUDED.message_count,
+                    latest_message_at = GREATEST(
+                        slack_conversation_stats.latest_message_at,
+                        EXCLUDED.latest_message_at
+                    ),
+                    updated_at = EXCLUDED.updated_at
+                """,
+                [
+                    (
+                        account,
+                        team_id,
+                        conversation_id,
+                        int(message_count),
+                        _ensure_utc(latest_message_at),
+                        datetime.now(tz=UTC),
+                    )
+                    for account, team_id, conversation_id, message_count, latest_message_at in rows
+                ],
+                template="(%s, %s, %s, %s, %s, %s)",
+                page_size=1000,
+            )
 
     def _refresh_slack_conversation_stats_for_keys(self, keys: list[tuple[str, str, str]]) -> None:
         try:

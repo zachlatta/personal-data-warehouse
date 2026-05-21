@@ -308,6 +308,35 @@ def test_postgres_insert_slack_messages_refreshes_conversation_stats(
     assert rows == [(2, newer)]
 
 
+def test_postgres_insert_slack_messages_updates_stats_without_full_conversation_recompute(
+    warehouse: PostgresWarehouse,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.ensure_slack_tables()
+
+    def fail_full_recompute(keys):
+        raise AssertionError(f"unexpected full conversation recompute: {keys}")
+
+    monkeypatch.setattr(warehouse, "_refresh_slack_conversation_stats_for_keys", fail_full_recompute)
+
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="1770000000.000001",
+                message_datetime=now,
+            )
+        ]
+    )
+
+    rows = warehouse._query(
+        "SELECT message_count, latest_message_at FROM slack_conversation_stats WHERE conversation_id = %s",
+        ("C1",),
+    )
+    assert rows == [(1, now)]
+
+
 def test_postgres_slack_conversation_stats_follow_tombstones_and_ignore_stale_rows(
     warehouse: PostgresWarehouse,
 ) -> None:
