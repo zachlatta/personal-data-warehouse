@@ -240,6 +240,22 @@ def test_apple_voice_memos_schema_creates_file_table() -> None:
     assert any("DROP COLUMN IF EXISTS cleaned_transcript" in command for command in commands)
 
 
+def test_apple_notes_schema_creates_note_revision_and_attachment_tables() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+
+    warehouse._command = commands.append
+
+    warehouse.ensure_apple_notes_tables()
+
+    assert any("CREATE TABLE IF NOT EXISTS apple_notes" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_note_revisions" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_note_attachments" in command for command in commands)
+    assert any("latest_revision_id String" in command for command in commands)
+    assert any("ORDER BY (account, note_id, revision_id)" in command for command in commands)
+    assert any("ORDER BY (account, note_id, revision_id, attachment_id)" in command for command in commands)
+
+
 def test_apple_voice_memos_schema_renames_legacy_tables() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     commands: list[str] = []

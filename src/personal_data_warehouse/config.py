@@ -31,6 +31,8 @@ DEFAULT_SLACK_THREAD_AUDIT_DAYS = 30
 DEFAULT_VOICE_MEMOS_EXTENSIONS = (".m4a", ".qta")
 DEFAULT_VOICE_MEMOS_STORAGE_BACKEND = "google_drive"
 DEFAULT_VOICE_MEMOS_TRANSCRIPTION_PROVIDER = "assemblyai"
+DEFAULT_APPLE_NOTES_STORE_PATH = "~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
+DEFAULT_APPLE_NOTES_STORAGE_BACKEND = "google_drive"
 DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
 DEFAULT_ALICE_STORAGE_BACKEND = "google_drive"
 DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS = 120
@@ -159,6 +161,15 @@ class VoiceMemosConfig:
 
 
 @dataclass(frozen=True)
+class AppleNotesConfig:
+    account: str
+    store_path: str
+    storage_backend: str
+    google_drive_account: str
+    google_drive_folder_id: str
+
+
+@dataclass(frozen=True)
 class AliceVoiceRecordingsConfig:
     account: str
     key_id: str
@@ -232,6 +243,7 @@ class Settings:
     google_oauth_client_secrets_json_by_account: tuple[tuple[str, str], ...] = ()
     google_oauth_client_secrets_json_by_domain: tuple[tuple[str, str], ...] = ()
     voice_memos: VoiceMemosConfig | None = None
+    apple_notes: AppleNotesConfig | None = None
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
@@ -263,6 +275,8 @@ class Settings:
         }
         if self.alice_voice_recordings is not None:
             configured_domains.add(email_domain(self.alice_voice_recordings.google_drive_account))
+        if self.apple_notes is not None:
+            configured_domains.add(email_domain(self.apple_notes.google_drive_account))
         if len(configured_domains) <= 1:
             return self.gmail_oauth_client_secrets_json
         return None
@@ -280,6 +294,7 @@ def load_settings(
     require_calendar: bool = False,
     require_slack: bool = False,
     require_voice_memos: bool = False,
+    require_apple_notes: bool = False,
     require_alice_voice_recordings: bool = False,
     require_assemblyai: bool = False,
     require_agent: bool = False,
@@ -566,6 +581,54 @@ def load_settings(
             transcription_provider=voice_memos_transcription_provider,
         )
 
+    apple_notes_account = (
+        os.getenv("APPLE_NOTES_ACCOUNT")
+        or os.getenv("VOICE_MEMOS_ACCOUNT")
+        or default_voice_memos_account
+    ).strip()
+    apple_notes_store_path = os.path.expanduser(
+        os.getenv("APPLE_NOTES_STORE_PATH", DEFAULT_APPLE_NOTES_STORE_PATH)
+    )
+    apple_notes_storage_backend = os.getenv(
+        "APPLE_NOTES_STORAGE_BACKEND",
+        DEFAULT_APPLE_NOTES_STORAGE_BACKEND,
+    ).strip()
+    apple_notes_google_drive_account = (
+        os.getenv("APPLE_NOTES_GOOGLE_DRIVE_ACCOUNT")
+        or apple_notes_account
+        or voice_memos_account
+    ).strip()
+    apple_notes_google_drive_folder_id = (
+        os.getenv("APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
+        or ""
+    ).strip()
+    apple_notes: AppleNotesConfig | None = None
+    if (
+        require_apple_notes
+        or os.getenv("APPLE_NOTES_ACCOUNT")
+        or os.getenv("APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_NOTES_STORE_PATH")
+    ):
+        if not apple_notes_account:
+            raise ValueError("APPLE_NOTES_ACCOUNT or GMAIL_ACCOUNTS must be set for Apple Notes sync")
+        if apple_notes_storage_backend not in {"google_drive"}:
+            raise ValueError("APPLE_NOTES_STORAGE_BACKEND currently supports: google_drive")
+        if not apple_notes_google_drive_account:
+            raise ValueError("APPLE_NOTES_GOOGLE_DRIVE_ACCOUNT or APPLE_NOTES_ACCOUNT must be set")
+        if not apple_notes_google_drive_folder_id:
+            raise ValueError(
+                "APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
+        apple_notes = AppleNotesConfig(
+            account=apple_notes_account,
+            store_path=apple_notes_store_path,
+            storage_backend=apple_notes_storage_backend,
+            google_drive_account=apple_notes_google_drive_account,
+            google_drive_folder_id=apple_notes_google_drive_folder_id,
+        )
+
     alice_account = os.getenv("ALICE_VOICE_RECORDINGS_ACCOUNT", "").strip()
     alice_key_id = os.getenv("ALICE_API_KEY_ID", "").strip()
     alice_secret_key = os.getenv("ALICE_API_SECRET_KEY", "").strip()
@@ -698,6 +761,8 @@ def load_settings(
     google_scopes = [GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE]
     if voice_memos and voice_memos.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if apple_notes and apple_notes.storage_backend == "google_drive":
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if alice_voice_recordings and alice_voice_recordings.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
 
@@ -745,6 +810,7 @@ def load_settings(
         ),
         slack_force_full_sync=_parse_bool_env(os.getenv("SLACK_FORCE_FULL_SYNC"), False),
         voice_memos=voice_memos,
+        apple_notes=apple_notes,
         alice_voice_recordings=alice_voice_recordings,
         assemblyai=assemblyai,
         agent=agent,

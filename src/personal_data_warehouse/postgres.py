@@ -17,6 +17,9 @@ from personal_data_warehouse.clickhouse import (
     ATTACHMENT_BACKFILL_STATE_COLUMNS,
     ATTACHMENT_COLUMNS,
     ATTACHMENT_ENRICHMENT_COLUMNS,
+    APPLE_NOTE_ATTACHMENT_COLUMNS,
+    APPLE_NOTE_COLUMNS,
+    APPLE_NOTE_REVISION_COLUMNS,
     CALENDAR_EVENT_COLUMNS,
     CALENDAR_SYNC_STATE_COLUMNS,
     FINANCE_ACCOUNT_COLUMNS,
@@ -94,6 +97,12 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         VOICE_MEMO_ENRICHMENT_COLUMNS,
         ("account", "recording_id", "provider", "model", "prompt_version"),
     ),
+    "apple_notes": TableSpec(APPLE_NOTE_COLUMNS, ("account", "note_id")),
+    "apple_note_revisions": TableSpec(APPLE_NOTE_REVISION_COLUMNS, ("account", "note_id", "revision_id")),
+    "apple_note_attachments": TableSpec(
+        APPLE_NOTE_ATTACHMENT_COLUMNS,
+        ("account", "note_id", "revision_id", "attachment_id"),
+    ),
     "agent_runs": TableSpec(AGENT_RUN_COLUMNS, ("run_id",)),
     "agent_run_events": TableSpec(AGENT_RUN_EVENT_COLUMNS, ("run_id", "event_index")),
     "agent_run_tool_calls": TableSpec(AGENT_RUN_TOOL_CALL_COLUMNS, ("run_id", "event_index", "tool_name")),
@@ -149,6 +158,12 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     ),
 }
 
+POSTGRES_INSERT_PAGE_SIZES = {
+    "apple_notes": 50,
+    "apple_note_revisions": 50,
+    "apple_note_attachments": 250,
+}
+
 
 ARRAY_COLUMNS = {
     "label_ids",
@@ -171,6 +186,8 @@ TIMESTAMP_COLUMNS = {
     "file_modified_at",
     "recorded_at",
     "ingested_at",
+    "modified_at",
+    "exported_at",
     "requested_at",
     "completed_at",
     "created_at",
@@ -220,6 +237,7 @@ INTEGER_COLUMNS = {
     "pending",
     "is_removed",
     "is_overdue",
+    "is_missing",
 }
 
 FLOAT_COLUMNS = {
@@ -300,6 +318,9 @@ class PostgresWarehouse:
     def ensure_voice_memos_tables(self) -> None:
         self.ensure_apple_voice_memos_tables()
 
+    def ensure_apple_notes_tables(self) -> None:
+        self._ensure_table_group(["apple_notes", "apple_note_revisions", "apple_note_attachments"])
+
     def ensure_voice_memo_transcription_tables(self) -> None:
         self.ensure_apple_voice_memos_tables()
 
@@ -360,15 +381,20 @@ class PostgresWarehouse:
 
     def _ensure_indexes(self) -> None:
         for sql in (
+            "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public",
             "CREATE INDEX IF NOT EXISTS gmail_messages_thread_idx ON gmail_messages (account, thread_id, internal_date DESC)",
             "CREATE INDEX IF NOT EXISTS gmail_messages_label_ids_idx ON gmail_messages USING gin (label_ids)",
             "CREATE INDEX IF NOT EXISTS gmail_attachments_message_idx ON gmail_attachments (account, message_id)",
             "CREATE INDEX IF NOT EXISTS calendar_events_time_idx ON calendar_events (start_at, end_at)",
             "CREATE INDEX IF NOT EXISTS voice_memo_files_recorded_idx ON apple_voice_memos_files (recorded_at DESC)",
+            "CREATE INDEX IF NOT EXISTS apple_notes_modified_idx ON apple_notes (modified_at DESC) WHERE is_deleted = 0",
+            "CREATE INDEX IF NOT EXISTS apple_note_revisions_note_idx ON apple_note_revisions (account, note_id, modified_at DESC)",
+            "CREATE INDEX IF NOT EXISTS apple_note_attachments_hash_idx ON apple_note_attachments (content_sha256)",
             "CREATE INDEX IF NOT EXISTS slack_messages_conversation_time_idx ON slack_messages (account, team_id, conversation_id, message_datetime DESC)",
             "CREATE INDEX IF NOT EXISTS slack_messages_recent_scope_time_idx ON slack_messages (account, team_id, message_datetime DESC) WHERE is_deleted = 0",
             "CREATE INDEX IF NOT EXISTS slack_messages_recent_thread_time_idx ON slack_messages (account, team_id, thread_ts, message_datetime DESC) WHERE is_deleted = 0",
             "CREATE INDEX IF NOT EXISTS slack_messages_thread_idx ON slack_messages (account, team_id, conversation_id, thread_ts)",
+            "CREATE INDEX IF NOT EXISTS slack_messages_text_trgm_live_idx ON slack_messages USING gin (text public.gin_trgm_ops) WHERE is_deleted = 0",
             "CREATE INDEX IF NOT EXISTS slack_conversations_scope_idx ON slack_conversations (account, team_id, conversation_type)",
             "CREATE INDEX IF NOT EXISTS slack_state_scope_idx ON slack_sync_state (account, team_id, object_type, object_id)",
             "CREATE INDEX IF NOT EXISTS finance_accounts_item_idx ON finance_accounts (source, item_id, type, subtype)",
@@ -631,6 +657,15 @@ class PostgresWarehouse:
 
     def insert_voice_memo_enrichments(self, rows: list[dict[str, Any]]) -> None:
         self.insert_apple_voice_memos_enrichments(rows)
+
+    def insert_apple_notes(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_notes", rows, APPLE_NOTE_COLUMNS)
+
+    def insert_apple_note_revisions(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_note_revisions", rows, APPLE_NOTE_REVISION_COLUMNS)
+
+    def insert_apple_note_attachments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_note_attachments", rows, APPLE_NOTE_ATTACHMENT_COLUMNS)
 
     def insert_agent_runs(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_runs", rows, AGENT_RUN_COLUMNS)
@@ -2108,7 +2143,7 @@ class PostgresWarehouse:
             {_upsert_clause(table, spec, columns)}
         """
         with self._connection.cursor() as cursor:
-            execute_values(cursor, sql, rows, template=template, page_size=1000)
+            execute_values(cursor, sql, rows, template=template, page_size=POSTGRES_INSERT_PAGE_SIZES.get(table, 1000))
 
     def _insert_rows(self, table: str, rows: list[dict[str, Any]], columns: tuple[str, ...]) -> None:
         self._insert(table, [tuple(_normalize_insert_value(row[column]) for column in columns) for row in rows], columns)

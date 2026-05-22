@@ -72,17 +72,23 @@ class NetworkPolicy:
         self._runner = runner or run_command
 
     @classmethod
-    def from_env(cls) -> NetworkPolicy:
+    def from_env(cls, *, prefix: str = "VOICE_MEMOS_UPLOAD", fallback_prefix: str | None = None) -> NetworkPolicy:
+        fallback = fallback_prefix or prefix
         return cls(
             blocked_ssid_patterns=patterns_from_env(
-                "VOICE_MEMOS_UPLOAD_BLOCKED_SSID_PATTERNS",
+                f"{prefix}_BLOCKED_SSID_PATTERNS",
                 DEFAULT_BLOCKED_SSID_PATTERNS,
+                fallback_name=f"{fallback}_BLOCKED_SSID_PATTERNS",
             ),
             blocked_hardware_port_patterns=patterns_from_env(
-                "VOICE_MEMOS_UPLOAD_BLOCKED_HARDWARE_PORT_PATTERNS",
+                f"{prefix}_BLOCKED_HARDWARE_PORT_PATTERNS",
                 DEFAULT_BLOCKED_HARDWARE_PORT_PATTERNS,
+                fallback_name=f"{fallback}_BLOCKED_HARDWARE_PORT_PATTERNS",
             ),
-            require_wifi_ssid=parse_bool_env("VOICE_MEMOS_UPLOAD_REQUIRE_WIFI_SSID", False),
+            require_wifi_ssid=parse_bool_env(
+                f"{prefix}_REQUIRE_WIFI_SSID",
+                parse_bool_env(f"{fallback}_REQUIRE_WIFI_SSID", False),
+            ),
         )
 
     def check(self) -> NetworkDecision:
@@ -231,8 +237,10 @@ def preflight_google_drive(timeout_seconds: float) -> NetworkDecision:
     return NetworkDecision(True, "Google Drive preflight succeeded")
 
 
-def patterns_from_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+def patterns_from_env(name: str, default: tuple[str, ...], *, fallback_name: str | None = None) -> tuple[str, ...]:
     value = os.getenv(name, "").strip()
+    if not value and fallback_name:
+        value = os.getenv(fallback_name, "").strip()
     if not value:
         return default
     return tuple(pattern.strip() for pattern in value.split(",") if pattern.strip())

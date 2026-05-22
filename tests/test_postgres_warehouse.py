@@ -8,6 +8,9 @@ import pytest
 from dotenv import load_dotenv
 
 from personal_data_warehouse.clickhouse import (
+    APPLE_NOTE_ATTACHMENT_COLUMNS,
+    APPLE_NOTE_COLUMNS,
+    APPLE_NOTE_REVISION_COLUMNS,
     CALENDAR_EVENT_COLUMNS,
     SLACK_ACCOUNT_IDENTITY_COLUMNS,
     SLACK_CONVERSATION_COLUMNS,
@@ -169,6 +172,7 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
     warehouse.ensure_tables()
     warehouse.ensure_calendar_tables()
     warehouse.ensure_apple_voice_memos_tables()
+    warehouse.ensure_apple_notes_tables()
     warehouse.ensure_slack_tables()
     warehouse.ensure_finance_tables()
 
@@ -177,12 +181,13 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
         SELECT table_name
         FROM information_schema.tables
         WHERE table_schema = current_schema()
-          AND table_name IN ('gmail_messages', 'calendar_events', 'slack_messages', 'apple_voice_memos_files', 'finance_accounts')
+          AND table_name IN ('gmail_messages', 'calendar_events', 'slack_messages', 'apple_voice_memos_files', 'apple_notes', 'finance_accounts')
         ORDER BY table_name
         """
     )
 
     assert [row[0] for row in rows] == [
+        "apple_notes",
         "apple_voice_memos_files",
         "calendar_events",
         "finance_accounts",
@@ -206,6 +211,10 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     index_names = {row[0] for row in rows}
     assert "slack_messages_recent_scope_time_idx" in index_names
     assert "slack_messages_recent_thread_time_idx" in index_names
+    assert "slack_messages_text_trgm_live_idx" in index_names
+
+    extension_rows = warehouse._query("SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'")
+    assert extension_rows == [("pg_trgm",)]
 
 
 def test_postgres_slack_tables_create_conversation_stats_table(warehouse: PostgresWarehouse) -> None:
@@ -663,6 +672,90 @@ def test_postgres_voice_memo_ensure_can_skip_runtime_content_hash_backfill(wareh
 
     warehouse.ensure_apple_voice_memos_tables()
     assert warehouse._query("SELECT content_sha256 FROM apple_voice_memos_transcription_runs") == [("audio-hash",)]
+
+
+def test_postgres_apple_notes_revision_history_keeps_latest_state(warehouse: PostgresWarehouse) -> None:
+    older = datetime(2026, 5, 21, 12, tzinfo=UTC)
+    newer = datetime(2026, 5, 21, 13, tzinfo=UTC)
+    warehouse.ensure_apple_notes_tables()
+
+    warehouse.insert_apple_notes(
+        [
+            _default_row(
+                APPLE_NOTE_COLUMNS,
+                account="zach@example.test",
+                note_id="note-1",
+                latest_revision_id="rev-old",
+                title="old",
+                modified_at=older,
+                ingested_at=older,
+                sync_version=1,
+            )
+        ]
+    )
+    warehouse.insert_apple_notes(
+        [
+            _default_row(
+                APPLE_NOTE_COLUMNS,
+                account="zach@example.test",
+                note_id="note-1",
+                latest_revision_id="rev-new",
+                title="new",
+                modified_at=newer,
+                ingested_at=newer,
+                sync_version=2,
+            )
+        ]
+    )
+    warehouse.insert_apple_note_revisions(
+        [
+            _default_row(
+                APPLE_NOTE_REVISION_COLUMNS,
+                account="zach@example.test",
+                note_id="note-1",
+                revision_id="rev-old",
+                title="old",
+                modified_at=older,
+                exported_at=older,
+                ingested_at=older,
+                sync_version=1,
+            ),
+            _default_row(
+                APPLE_NOTE_REVISION_COLUMNS,
+                account="zach@example.test",
+                note_id="note-1",
+                revision_id="rev-new",
+                title="new",
+                modified_at=newer,
+                exported_at=newer,
+                ingested_at=newer,
+                sync_version=2,
+            ),
+        ]
+    )
+    warehouse.insert_apple_note_attachments(
+        [
+            _default_row(
+                APPLE_NOTE_ATTACHMENT_COLUMNS,
+                account="zach@example.test",
+                note_id="note-1",
+                revision_id="rev-new",
+                attachment_id="att-1",
+                filename="photo.txt",
+                content_sha256="att-sha",
+                ingested_at=newer,
+                sync_version=2,
+            )
+        ]
+    )
+
+    latest = warehouse._query("SELECT latest_revision_id, title FROM apple_notes WHERE note_id = %s", ("note-1",))
+    revisions = warehouse._query("SELECT revision_id FROM apple_note_revisions WHERE note_id = %s ORDER BY revision_id", ("note-1",))
+    attachments = warehouse._query("SELECT attachment_id FROM apple_note_attachments WHERE note_id = %s", ("note-1",))
+
+    assert latest == [("rev-new", "new")]
+    assert revisions == [("rev-new",), ("rev-old",)]
+    assert attachments == [("att-1",)]
 
 
 def test_postgres_slack_account_state_uses_empty_actor_for_missing_user(warehouse: PostgresWarehouse) -> None:

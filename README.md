@@ -1,6 +1,6 @@
 # personal_data_warehouse
 
-This project syncs Gmail mailbox data, Google Calendar events, Slack data, and Voice Memos into Postgres through Dagster.
+This project syncs Gmail mailbox data, Google Calendar events, Slack data, Apple Notes, and Voice Memos into Postgres through Dagster.
 
 Current ingestion path:
 
@@ -13,6 +13,8 @@ Current ingestion path:
 - If Calendar expires the saved sync token, the sync falls back to a full resync for that calendar.
 - Voice Memos use a two-stage path: a local macOS uploader writes audio files and JSON metadata
   to Google Drive, then a Dagster asset ingests those metadata into Postgres.
+- Apple Notes use the same two-stage local Mac path: a LaunchAgent snapshots the local Notes
+  SQLite store, uploads immutable note revision sidecars to Google Drive, and Dagster ingests them.
 - Finance accounts use Plaid Link for authorization, then sync accounts, transactions,
   investment holdings/transactions, and liabilities into Postgres.
 
@@ -379,6 +381,96 @@ for short indexing fields such as `pdw_stage`, `pdw_kind`, and content hashes. D
 `pdw_stage=inbox`, then promotes processed files to `apple-voice-memos/library/YYYY/MM/`.
 A future S3 backend can keep the same metadata format and swap only the object-store implementation.
 
+## Apple Notes Sync
+
+Apple Notes follows the Voice Memos split so the Mac never talks to the warehouse directly:
+
+1. A local macOS CLI snapshots `NoteStore.sqlite`, extracts notes, folders, readable HTML/text, and
+   locally available attachments, then uploads immutable revision sidecars to the Google Drive inbox.
+2. A Dagster asset reads inbox metadata, writes latest-note, revision-history, and attachment rows
+   to Postgres, then promotes the Drive objects into the library prefix.
+
+Configure the shared Drive folder:
+
+```bash
+APPLE_NOTES_ACCOUNT=you@example.com
+APPLE_NOTES_GOOGLE_DRIVE_ACCOUNT=you@example.com
+APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
+APPLE_NOTES_STORAGE_BACKEND=google_drive
+APPLE_NOTES_STORE_PATH=~/Library/Group\ Containers/group.com.apple.notes/NoteStore.sqlite
+```
+
+If `APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID` is omitted, the sync falls back to
+`VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID`. Re-authorize the Google account after adding Apple Notes
+config so the token includes Drive scope:
+
+```bash
+uv run personal-data-warehouse-google-auth --email you@example.com --write-env
+```
+
+Run the local Mac uploader:
+
+```bash
+uv run personal-data-warehouse-apple-notes-upload
+```
+
+Incremental mode keeps local state in
+`~/Library/Application Support/personal-data-warehouse/apple-notes-upload-state.json`. If a note's
+fingerprint is unchanged, the uploader skips Drive work. If the title, body, folder, timestamps, or
+attachment manifest changes, it uploads a new immutable revision under:
+
+```text
+apple-notes/inbox/YYYY/MM/<note-id>/<revision-id>.json
+apple-notes/inbox/YYYY/MM/<note-id>/<revision-id>.html
+apple-notes/inbox/YYYY/MM/<note-id>/<revision-id>/attachments/<attachment-id>-<sha256>.<ext>
+```
+
+Deleted notes become tombstone revisions and mark the latest `apple_notes` row as deleted. The
+revision history remains in `apple_note_revisions`.
+
+On Zach's MacBook Pro, the local uploader is managed by a per-user macOS LaunchAgent. The checked-in
+plist template lives at
+`ops/launchd/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist` and runs
+`bin/apple-notes-upload-launchd` every five minutes. The wrapper records each run, exit code,
+duration, and heartbeat under `~/Library/Logs/personal-data-warehouse/`.
+
+Install or refresh the LaunchAgent:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload
+```
+
+Run it immediately:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload
+```
+
+Monitor it:
+
+```bash
+bin/apple-notes-upload-status
+launchctl print gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload
+tail -80 ~/Library/Logs/personal-data-warehouse/apple-notes-upload.run.log
+cat ~/Library/Logs/personal-data-warehouse/apple-notes-upload.heartbeat
+```
+
+If LaunchAgent runs fail with `PermissionError` or SQLite `authorization denied` for
+`~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`, macOS Full Disk Access is
+blocking the background process. Grant Full Disk Access in System Settings > Privacy & Security
+> Full Disk Access to `/bin/zsh`, `/opt/homebrew/bin/uv`,
+`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`, and its current real path
+`/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`, then
+kickstart the LaunchAgent again.
+
+The Apple Notes uploader uses the same network guard as Voice Memos. Apple Notes-specific
+`APPLE_NOTES_UPLOAD_BLOCKED_SSID_PATTERNS`,
+`APPLE_NOTES_UPLOAD_BLOCKED_HARDWARE_PORT_PATTERNS`, and
+`APPLE_NOTES_UPLOAD_REQUIRE_WIFI_SSID` override the Voice Memos defaults when set.
+
 ### Alice App Voice Recordings
 
 Alice App voice recordings are archived into the same Google Drive object-storage root using the
@@ -636,6 +728,9 @@ The sync creates and maintains:
 - `apple_voice_memos_transcription_runs`: raw transcription provider results and run state
 - `apple_voice_memos_transcript_segments`: normalized diarized transcript segments
 - `apple_voice_memos_enrichments`: canonical transcript, calendar match, participants, summary, action items, and evidence
+- `apple_notes`: latest known state for each Apple Note
+- `apple_note_revisions`: every observed Apple Note revision and tombstone
+- `apple_note_attachments`: attachment metadata and storage pointers per note revision
 - `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
 - `finance_items`: Plaid item metadata for each linked institution login, without access tokens

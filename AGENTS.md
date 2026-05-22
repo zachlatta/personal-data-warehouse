@@ -54,3 +54,44 @@ Access to the executable chain used by the job, especially `/bin/zsh`, `/opt/hom
 `/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. Its current real path is
 `/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`. Then
 kickstart the LaunchAgent again.
+
+## Local Apple Notes Upload Scheduler
+
+This Mac is intended to run the local Apple Notes uploader through a user LaunchAgent:
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.apple-notes-upload`
+- Installed plist: `~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist`
+- Wrapper script: `bin/apple-notes-upload-launchd`
+- Run cadence: every 300 seconds with `RunAtLoad`
+- Command: `/opt/homebrew/bin/uv run personal-data-warehouse-apple-notes-upload --mode incremental`
+- Main run log: `~/Library/Logs/personal-data-warehouse/apple-notes-upload.run.log`
+- Heartbeat file: `~/Library/Logs/personal-data-warehouse/apple-notes-upload.heartbeat`
+- Status helper: `bin/apple-notes-upload-status`
+
+Use these commands when inspecting or repairing it:
+
+```bash
+bin/apple-notes-upload-status
+launchctl print gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload
+tail -80 ~/Library/Logs/personal-data-warehouse/apple-notes-upload.run.log
+cat ~/Library/Logs/personal-data-warehouse/apple-notes-upload.heartbeat
+```
+
+If the plist changes, reinstall it with:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload
+```
+
+If the run log shows `PermissionError` or SQLite `authorization denied` for
+`~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`, the LaunchAgent is loaded
+correctly but macOS Full Disk Access is blocking the background process. Grant Full Disk Access to
+the executable chain used by the job, especially `/bin/zsh`, `/opt/homebrew/bin/uv`, and
+`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. Its current real path is
+`/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`. Then
+kickstart the LaunchAgent again.

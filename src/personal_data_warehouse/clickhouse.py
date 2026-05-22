@@ -264,6 +264,89 @@ APPLE_VOICE_MEMOS_TABLE_RENAMES = (
     ("voice_memo_enrichments", "apple_voice_memos_enrichments"),
 )
 
+APPLE_NOTE_COLUMNS = (
+    "account",
+    "note_id",
+    "latest_revision_id",
+    "title",
+    "folder_id",
+    "folder_path",
+    "apple_account_id",
+    "apple_account_name",
+    "created_at",
+    "modified_at",
+    "body_text",
+    "body_html",
+    "body_markdown",
+    "content_sha256",
+    "attachments_json",
+    "storage_backend",
+    "metadata_storage_key",
+    "metadata_storage_file_id",
+    "metadata_storage_url",
+    "metadata_content_sha256",
+    "html_storage_key",
+    "html_storage_file_id",
+    "html_storage_url",
+    "html_content_sha256",
+    "is_deleted",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+APPLE_NOTE_REVISION_COLUMNS = (
+    "account",
+    "note_id",
+    "revision_id",
+    "title",
+    "folder_id",
+    "folder_path",
+    "apple_account_id",
+    "apple_account_name",
+    "created_at",
+    "modified_at",
+    "exported_at",
+    "body_text",
+    "body_html",
+    "body_markdown",
+    "content_sha256",
+    "attachments_json",
+    "storage_backend",
+    "metadata_storage_key",
+    "metadata_storage_file_id",
+    "metadata_storage_url",
+    "metadata_content_sha256",
+    "html_storage_key",
+    "html_storage_file_id",
+    "html_storage_url",
+    "html_content_sha256",
+    "is_deleted",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+APPLE_NOTE_ATTACHMENT_COLUMNS = (
+    "account",
+    "note_id",
+    "revision_id",
+    "attachment_id",
+    "filename",
+    "content_type",
+    "size_bytes",
+    "content_sha256",
+    "is_missing",
+    "error",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
 AGENT_RUN_COLUMNS = (
     "run_id",
     "provider",
@@ -958,6 +1041,109 @@ class ClickHouseWarehouse:
 
     def ensure_voice_memos_tables(self) -> None:
         self.ensure_apple_voice_memos_tables()
+
+    def ensure_apple_notes_tables(self) -> None:
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS apple_notes (
+                account LowCardinality(String),
+                note_id String,
+                latest_revision_id String,
+                title String,
+                folder_id String,
+                folder_path String,
+                apple_account_id String,
+                apple_account_name String,
+                created_at DateTime64(3, 'UTC'),
+                modified_at DateTime64(3, 'UTC'),
+                body_text String,
+                body_html String,
+                body_markdown String,
+                content_sha256 String,
+                attachments_json String,
+                storage_backend LowCardinality(String),
+                metadata_storage_key String,
+                metadata_storage_file_id String,
+                metadata_storage_url String,
+                metadata_content_sha256 String,
+                html_storage_key String,
+                html_storage_file_id String,
+                html_storage_url String,
+                html_content_sha256 String,
+                is_deleted UInt8,
+                raw_metadata_json String,
+                ingested_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(ingested_at)
+            ORDER BY (account, note_id)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS apple_note_revisions (
+                account LowCardinality(String),
+                note_id String,
+                revision_id String,
+                title String,
+                folder_id String,
+                folder_path String,
+                apple_account_id String,
+                apple_account_name String,
+                created_at DateTime64(3, 'UTC'),
+                modified_at DateTime64(3, 'UTC'),
+                exported_at DateTime64(3, 'UTC'),
+                body_text String,
+                body_html String,
+                body_markdown String,
+                content_sha256 String,
+                attachments_json String,
+                storage_backend LowCardinality(String),
+                metadata_storage_key String,
+                metadata_storage_file_id String,
+                metadata_storage_url String,
+                metadata_content_sha256 String,
+                html_storage_key String,
+                html_storage_file_id String,
+                html_storage_url String,
+                html_content_sha256 String,
+                is_deleted UInt8,
+                raw_metadata_json String,
+                ingested_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(ingested_at)
+            ORDER BY (account, note_id, revision_id)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS apple_note_attachments (
+                account LowCardinality(String),
+                note_id String,
+                revision_id String,
+                attachment_id String,
+                filename String,
+                content_type LowCardinality(String),
+                size_bytes UInt64,
+                content_sha256 String,
+                is_missing UInt8,
+                error String,
+                storage_backend LowCardinality(String),
+                storage_key String,
+                storage_file_id String,
+                storage_url String,
+                raw_metadata_json String,
+                ingested_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(ingested_at)
+            ORDER BY (account, note_id, revision_id, attachment_id)
+            """
+        )
 
     def ensure_voice_memo_transcription_tables(self) -> None:
         self._command(
@@ -1750,6 +1936,15 @@ class ClickHouseWarehouse:
 
     def insert_voice_memo_enrichments(self, rows: list[dict[str, Any]]) -> None:
         self.insert_apple_voice_memos_enrichments(rows)
+
+    def insert_apple_notes(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_notes", rows, APPLE_NOTE_COLUMNS)
+
+    def insert_apple_note_revisions(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_note_revisions", rows, APPLE_NOTE_REVISION_COLUMNS)
+
+    def insert_apple_note_attachments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_note_attachments", rows, APPLE_NOTE_ATTACHMENT_COLUMNS)
 
     def insert_agent_runs(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_runs", rows, AGENT_RUN_COLUMNS)
