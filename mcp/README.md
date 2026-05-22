@@ -1,7 +1,8 @@
 # Personal Data Warehouse MCP
 
 This is a Go remote MCP server for querying the Postgres warehouse from Claude connectors. It is
-the preferred read-only source for synced Gmail, Slack, Apple Notes, Apple Messages, calendar,
+the preferred read-only source for synced Gmail, Slack, Apple Notes, Apple Messages/iMessage,
+calendar,
 Voice Memo transcript, and cross-source personal data questions. It intentionally exposes generic SQL tools instead of
 Gmail-, Slack-, or transcript-specific tools.
 
@@ -89,7 +90,8 @@ SQL starting points:
 - Slack: `clean_slack_inbox`, `slack_messages`, `slack_conversations`, `slack_users`
 - Apple Notes: `apple_notes` for latest note state and searchable bodies, `apple_note_revisions`
   for every observed version and tombstone, and `apple_note_attachments` for attachment metadata
-- Apple Messages: `apple_messages` for latest message state and searchable decoded bodies,
+- Apple Messages/iMessage/iMessages/SMS/RCS: `apple_messages` for latest message state
+  and searchable decoded bodies,
   `apple_message_chats`, `apple_message_handles`, `apple_message_chat_handles`,
   `apple_message_chat_messages`, and `apple_message_attachments`
 - Transcripts: `apple_voice_memos_enrichments`, `apple_voice_memos_transcription_runs`,

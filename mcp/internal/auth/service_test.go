@@ -102,6 +102,27 @@ func TestOAuthFlowAcceptsSecretAndIssuesBearerToken(t *testing.T) {
 	}
 }
 
+func TestProtectedResourceMetadataNamesAppleMessagesAndIMessage(t *testing.T) {
+	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
+	mux := http.NewServeMux()
+	svc.RegisterHandlers(mux, "https://mcp.example.com")
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("protected resource metadata status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	name, _ := payload["resource_name"].(string)
+	if !strings.Contains(name, "Apple Messages") || !strings.Contains(name, "iMessage") {
+		t.Fatalf("resource_name does not advertise Apple Messages/iMessage: %q", name)
+	}
+}
+
 func TestAuthorizeRejectsPlainPKCE(t *testing.T) {
 	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
 	mux := http.NewServeMux()

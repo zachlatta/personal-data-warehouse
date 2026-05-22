@@ -109,7 +109,7 @@ func (s *Service) protectedResourceMetadata(baseURL string) http.HandlerFunc {
 			AuthorizationServers:   []string{baseURL},
 			ScopesSupported:        []string{"query"},
 			BearerMethodsSupported: []string{"header"},
-			ResourceName:           "Personal Data Warehouse MCP",
+			ResourceName:           "Personal Data Warehouse MCP - Gmail, Slack, Apple Notes, Apple Messages/iMessage",
 			ResourceDocumentation:  baseURL + "/",
 			ResourcePolicyURI:      baseURL + "/",
 			ResourceTOSURI:         baseURL + "/",

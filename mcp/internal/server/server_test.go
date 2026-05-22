@@ -173,6 +173,9 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 			if !strings.Contains(tool.Description, "Apple Messages") || !strings.Contains(tool.Description, "apple_messages") {
 				t.Fatalf("%s description does not include Apple Messages SQL starting points: %q", tool.Name, tool.Description)
 			}
+			if !strings.Contains(tool.Description, "iMessage") || !strings.Contains(tool.Description, "iMessages") {
+				t.Fatalf("%s description does not include iMessage aliases for connector discovery: %q", tool.Name, tool.Description)
+			}
 			if !strings.Contains(tool.Description, "default.clean_gmail_inbox(thread_id, latest_subject)") {
 				t.Fatalf("%s description does not include clean view schema for discovery: %q", tool.Name, tool.Description)
 			}
