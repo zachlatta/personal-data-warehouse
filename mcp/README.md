@@ -1,8 +1,8 @@
 # Personal Data Warehouse MCP
 
 This is a Go remote MCP server for querying the Postgres warehouse from Claude connectors. It is
-the preferred read-only source for synced Gmail, Slack, Apple Notes, calendar, Voice Memo transcript,
-and cross-source personal data questions. It intentionally exposes generic SQL tools instead of
+the preferred read-only source for synced Gmail, Slack, Apple Notes, Apple Messages, calendar,
+Voice Memo transcript, and cross-source personal data questions. It intentionally exposes generic SQL tools instead of
 Gmail-, Slack-, or transcript-specific tools.
 
 ## Environment
@@ -89,6 +89,9 @@ SQL starting points:
 - Slack: `clean_slack_inbox`, `slack_messages`, `slack_conversations`, `slack_users`
 - Apple Notes: `apple_notes` for latest note state and searchable bodies, `apple_note_revisions`
   for every observed version and tombstone, and `apple_note_attachments` for attachment metadata
+- Apple Messages: `apple_messages` for latest message state and searchable decoded bodies,
+  `apple_message_chats`, `apple_message_handles`, `apple_message_chat_handles`,
+  `apple_message_chat_messages`, and `apple_message_attachments`
 - Transcripts: `apple_voice_memos_enrichments`, `apple_voice_memos_transcription_runs`,
   `apple_voice_memos_transcript_segments`, `clean_calendar_with_transcripts`,
   `clean_transcripts_no_calendar_match`
@@ -190,8 +193,8 @@ Returns a character chunk from one cached cell. This is the right tool for readi
 
 The response includes `total_chars`, `returned_chars`, `offset`, `value`, and `eof`. `length` is capped by `MCP_GET_FIELD_MAX_CHARS`.
 
-Use `get_field` the same way for Apple Notes `body_text`, `body_html`, `body_markdown`, or
-`raw_metadata_json` columns after querying `apple_notes` or `apple_note_revisions`.
+Use `get_field` the same way for Apple Notes `body_text`, `body_html`, `body_markdown`, Apple
+Messages `body_text`, or `raw_metadata_json` columns after querying the relevant tables.
 
 Reading a 24 KB transcript now takes exactly two MCP calls:
 

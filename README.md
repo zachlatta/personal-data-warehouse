@@ -1,6 +1,6 @@
 # personal_data_warehouse
 
-This project syncs Gmail mailbox data, Google Calendar events, Slack data, Apple Notes, and Voice Memos into Postgres through Dagster.
+This project syncs Gmail mailbox data, Google Calendar events, Slack data, Apple Notes, Apple Messages, and Voice Memos into Postgres through Dagster.
 
 Current ingestion path:
 
@@ -15,6 +15,9 @@ Current ingestion path:
   to Google Drive, then a Dagster asset ingests those metadata into Postgres.
 - Apple Notes use the same two-stage local Mac path: a LaunchAgent snapshots the local Notes
   SQLite store, uploads immutable note revision sidecars to Google Drive, and Dagster ingests them.
+- Apple Messages use the same local Mac object-store path: a LaunchAgent snapshots `chat.db`,
+  uploads compressed message batches plus bounded attachment backfill objects to Google Drive,
+  and Dagster ingests them into normalized Postgres tables.
 - Finance accounts use Plaid Link for authorization, then sync accounts, transactions,
   investment holdings/transactions, and liabilities into Postgres.
 
@@ -68,6 +71,14 @@ VOICE_MEMOS_ACCOUNT=you@example.com
 VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
 VOICE_MEMOS_STORAGE_BACKEND=google_drive
 VOICE_MEMOS_EXTENSIONS=.m4a,.qta
+APPLE_MESSAGES_ACCOUNT=you@example.com
+APPLE_MESSAGES_GOOGLE_DRIVE_ACCOUNT=you@example.com
+APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
+APPLE_MESSAGES_STORAGE_BACKEND=google_drive
+APPLE_MESSAGES_STORE_PATH=~/Library/Messages/chat.db
+APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN=536870912
+APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN=200
+APPLE_MESSAGES_UPLOAD_WORKERS=4
 PLAID_CLIENT_ID=<plaid-client-id>
 PLAID_SECRET=<plaid-secret>
 PLAID_ENV=sandbox
@@ -114,8 +125,8 @@ GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64=...
 uv run personal-data-warehouse-google-auth --email zach@zachlatta.com --write-env
 ```
 
-If Voice Memos are configured, the auth flow also requests Google Drive access so the local
-uploader and Drive ingest asset can use the same account token.
+If Voice Memos, Apple Notes, or Apple Messages are configured, the auth flow also requests Google
+Drive access so the local uploader and Drive ingest asset can use the same account token.
 
 ## Running The Sync
 
@@ -471,6 +482,92 @@ The Apple Notes uploader uses the same network guard as Voice Memos. Apple Notes
 `APPLE_NOTES_UPLOAD_BLOCKED_HARDWARE_PORT_PATTERNS`, and
 `APPLE_NOTES_UPLOAD_REQUIRE_WIFI_SSID` override the Voice Memos defaults when set.
 
+## Apple Messages Sync
+
+Apple Messages follows the same local-Apple-data path as Apple Notes: the Mac never talks directly
+to Postgres. The local uploader snapshots `~/Library/Messages/chat.db`, streams iMessage, SMS, RCS,
+chat, handle, join, deletion, and attachment metadata into compressed JSONL batches, and uploads
+those batches to Google Drive. Attachment binaries are uploaded separately in bounded backfill runs
+so message text can land quickly while large media catches up.
+
+Configure the shared Drive folder:
+
+```bash
+APPLE_MESSAGES_ACCOUNT=you@example.com
+APPLE_MESSAGES_GOOGLE_DRIVE_ACCOUNT=you@example.com
+APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
+APPLE_MESSAGES_STORAGE_BACKEND=google_drive
+APPLE_MESSAGES_STORE_PATH=~/Library/Messages/chat.db
+APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN=536870912
+APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN=200
+APPLE_MESSAGES_UPLOAD_WORKERS=4
+```
+
+If `APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID` is omitted, the sync falls back to
+`APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID`, then `VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID`. Re-authorize the
+Google account after adding Apple Messages config so the token includes Drive scope:
+
+```bash
+uv run personal-data-warehouse-google-auth --email you@example.com --write-env
+```
+
+Run the local Mac uploader:
+
+```bash
+uv run personal-data-warehouse-apple-messages-upload
+```
+
+Incremental mode keeps local state in
+`~/Library/Application Support/personal-data-warehouse/apple-messages-upload-state.sqlite`. Message,
+chat, handle, join, deletion, and attachment metadata batches are written under:
+
+```text
+apple-messages/inbox/batches/YYYY/MM/<exported-at>-<batch-sha256>.jsonl.gz
+```
+
+Attachment binaries are uploaded under:
+
+```text
+apple-messages/inbox/attachments/YYYY/MM/<message-date>-<attachment-guid>-<content-sha256>.<ext>
+```
+
+Dagster exposes `apple_messages_drive_ingest` in the `apple_messages` group. The enabled Drive inbox
+sensor checks for new batches every minute, writes `apple_messages`, `apple_message_chats`,
+`apple_message_handles`, `apple_message_chat_handles`, `apple_message_chat_messages`, and
+`apple_message_attachments`, then promotes Drive objects into the `apple-messages/library/...`
+prefix.
+
+On Zach's MacBook Pro, the local uploader is managed by a per-user macOS LaunchAgent. The checked-in
+plist template lives at
+`ops/launchd/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist` and runs
+`bin/apple-messages-upload-launchd` every five minutes.
+
+Install or refresh the LaunchAgent:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messages-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messages-upload
+```
+
+Monitor it:
+
+```bash
+bin/apple-messages-upload-status
+launchctl print gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messages-upload
+tail -80 ~/Library/Logs/personal-data-warehouse/apple-messages-upload.run.log
+cat ~/Library/Logs/personal-data-warehouse/apple-messages-upload.heartbeat
+```
+
+If LaunchAgent runs fail with `PermissionError` or SQLite `authorization denied` for
+`~/Library/Messages/chat.db`, macOS Full Disk Access is blocking the background process. Grant Full
+Disk Access in System Settings > Privacy & Security > Full Disk Access to `/bin/zsh`,
+`/opt/homebrew/bin/uv`, `/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`, and
+its current real path
+`/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`, then
+kickstart the LaunchAgent again.
+
 ### Alice App Voice Recordings
 
 Alice App voice recordings are archived into the same Google Drive object-storage root using the
@@ -731,6 +828,11 @@ The sync creates and maintains:
 - `apple_notes`: latest known state for each Apple Note
 - `apple_note_revisions`: every observed Apple Note revision and tombstone
 - `apple_note_attachments`: attachment metadata and storage pointers per note revision
+- `apple_messages`: latest known state for each Apple Messages row, including decoded body text,
+  service, tapback/reply/edit metadata, and tombstones
+- `apple_message_chats`, `apple_message_handles`, `apple_message_chat_handles`,
+  `apple_message_chat_messages`: normalized conversation, participant, and membership tables
+- `apple_message_attachments`: attachment metadata and staged Drive storage pointers
 - `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
 - `finance_items`: Plaid item metadata for each linked institution login, without access tokens

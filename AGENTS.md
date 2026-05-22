@@ -95,3 +95,48 @@ the executable chain used by the job, especially `/bin/zsh`, `/opt/homebrew/bin/
 `/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. Its current real path is
 `/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`. Then
 kickstart the LaunchAgent again.
+
+## Local Apple Messages Upload Scheduler
+
+This Mac is intended to run the local Apple Messages uploader through a user LaunchAgent:
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.apple-messages-upload`
+- Installed plist: `~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist`
+- Wrapper script: `bin/apple-messages-upload-launchd`
+- Run cadence: every 300 seconds with `RunAtLoad`
+- Command: `/opt/homebrew/bin/uv run personal-data-warehouse-apple-messages-upload --mode incremental`
+- Main run log: `~/Library/Logs/personal-data-warehouse/apple-messages-upload.run.log`
+- Heartbeat file: `~/Library/Logs/personal-data-warehouse/apple-messages-upload.heartbeat`
+- Status helper: `bin/apple-messages-upload-status`
+
+Use these commands when inspecting or repairing it:
+
+```bash
+bin/apple-messages-upload-status
+launchctl print gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messages-upload
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messages-upload
+tail -80 ~/Library/Logs/personal-data-warehouse/apple-messages-upload.run.log
+cat ~/Library/Logs/personal-data-warehouse/apple-messages-upload.heartbeat
+```
+
+If the plist changes, reinstall it with:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messages-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messages-upload
+```
+
+If the run log shows `PermissionError` or SQLite `authorization denied` for
+`~/Library/Messages/chat.db`, the LaunchAgent is loaded correctly but macOS Full Disk Access is
+blocking the background process. Grant Full Disk Access to the executable chain used by the job,
+especially `/bin/zsh`, `/opt/homebrew/bin/uv`, and
+`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. Its current real path is
+`/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`. Then
+kickstart the LaunchAgent again.
+
+Apple Messages SQL starting points are `apple_messages`, `apple_message_chats`,
+`apple_message_handles`, `apple_message_chat_handles`, `apple_message_chat_messages`, and
+`apple_message_attachments`.

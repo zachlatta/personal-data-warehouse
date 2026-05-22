@@ -256,6 +256,26 @@ def test_apple_notes_schema_creates_note_revision_and_attachment_tables() -> Non
     assert any("ORDER BY (account, note_id, revision_id, attachment_id)" in command for command in commands)
 
 
+def test_apple_messages_schema_creates_normalized_message_tables() -> None:
+    warehouse = object.__new__(ClickHouseWarehouse)
+    commands: list[str] = []
+
+    warehouse._command = commands.append
+
+    warehouse.ensure_apple_messages_tables()
+
+    assert any("CREATE TABLE IF NOT EXISTS apple_message_handles" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_message_chats" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_message_chat_handles" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_messages" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_message_chat_messages" in command for command in commands)
+    assert any("CREATE TABLE IF NOT EXISTS apple_message_attachments" in command for command in commands)
+    assert any("body_text String" in command for command in commands)
+    assert any("attributed_body_sha256 String" in command for command in commands)
+    assert any("ORDER BY (account, message_id)" in command for command in commands)
+    assert any("ORDER BY (account, attachment_id, message_id)" in command for command in commands)
+
+
 def test_apple_voice_memos_schema_renames_legacy_tables() -> None:
     warehouse = object.__new__(ClickHouseWarehouse)
     commands: list[str] = []

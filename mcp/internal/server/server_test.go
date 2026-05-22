@@ -32,10 +32,23 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 		"SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name": {
 			Columns: []string{"name"},
 			Rows: []map[string]any{
+				{"name": "apple_messages"},
 				{"name": "apple_notes"},
 				{"name": "apple_voice_memos_enrichments"},
 				{"name": "clean_gmail_inbox"},
 				{"name": "gmail_messages"},
+			},
+		},
+		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'apple_messages' ORDER BY ordinal_position": {
+			Columns: []string{"name"},
+			Rows: []map[string]any{
+				{"name": "message_id"},
+				{"name": "message_at"},
+				{"name": "service"},
+				{"name": "handle_id"},
+				{"name": "body_text"},
+				{"name": "is_from_me"},
+				{"name": "is_deleted"},
 			},
 		},
 		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'apple_notes' ORDER BY ordinal_position": {
@@ -72,6 +85,25 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 		"SELECT substring(\"transcript\"::text from 1 for 15) AS \"transcript\", char_length(\"transcript\"::text) AS \"__pdw_preview_len_0\", substring(\"summary\"::text from 1 for 15) AS \"summary\", char_length(\"summary\"::text) AS \"__pdw_preview_len_1\" FROM \"apple_voice_memos_enrichments\" LIMIT 3": {
 			Columns: []string{"transcript", "__pdw_preview_len_0", "summary", "__pdw_preview_len_1"},
 			Rows:    []map[string]any{{"transcript": "meeting words", "__pdw_preview_len_0": 13, "summary": "recap", "__pdw_preview_len_1": 5}},
+		},
+		"SELECT substring(\"message_id\"::text from 1 for 15) AS \"message_id\", char_length(\"message_id\"::text) AS \"__pdw_preview_len_0\", substring(\"message_at\"::text from 1 for 15) AS \"message_at\", char_length(\"message_at\"::text) AS \"__pdw_preview_len_1\", substring(\"service\"::text from 1 for 15) AS \"service\", char_length(\"service\"::text) AS \"__pdw_preview_len_2\", substring(\"handle_id\"::text from 1 for 15) AS \"handle_id\", char_length(\"handle_id\"::text) AS \"__pdw_preview_len_3\", substring(\"body_text\"::text from 1 for 15) AS \"body_text\", char_length(\"body_text\"::text) AS \"__pdw_preview_len_4\", substring(\"is_from_me\"::text from 1 for 15) AS \"is_from_me\", char_length(\"is_from_me\"::text) AS \"__pdw_preview_len_5\", substring(\"is_deleted\"::text from 1 for 15) AS \"is_deleted\", char_length(\"is_deleted\"::text) AS \"__pdw_preview_len_6\" FROM \"apple_messages\" LIMIT 3": {
+			Columns: []string{"message_id", "__pdw_preview_len_0", "message_at", "__pdw_preview_len_1", "service", "__pdw_preview_len_2", "handle_id", "__pdw_preview_len_3", "body_text", "__pdw_preview_len_4", "is_from_me", "__pdw_preview_len_5", "is_deleted", "__pdw_preview_len_6"},
+			Rows: []map[string]any{{
+				"message_id":          "message-1",
+				"__pdw_preview_len_0": 9,
+				"message_at":          "2026-05-21T12",
+				"__pdw_preview_len_1": 13,
+				"service":             "iMessage",
+				"__pdw_preview_len_2": 8,
+				"handle_id":           "1",
+				"__pdw_preview_len_3": 1,
+				"body_text":           "hello message",
+				"__pdw_preview_len_4": 13,
+				"is_from_me":          "0",
+				"__pdw_preview_len_5": 1,
+				"is_deleted":          "0",
+				"__pdw_preview_len_6": 1,
+			}},
 		},
 		"SELECT substring(\"note_id\"::text from 1 for 15) AS \"note_id\", char_length(\"note_id\"::text) AS \"__pdw_preview_len_0\", substring(\"title\"::text from 1 for 15) AS \"title\", char_length(\"title\"::text) AS \"__pdw_preview_len_1\", substring(\"modified_at\"::text from 1 for 15) AS \"modified_at\", char_length(\"modified_at\"::text) AS \"__pdw_preview_len_2\", substring(\"body_text\"::text from 1 for 15) AS \"body_text\", char_length(\"body_text\"::text) AS \"__pdw_preview_len_3\", substring(\"body_html\"::text from 1 for 15) AS \"body_html\", char_length(\"body_html\"::text) AS \"__pdw_preview_len_4\", substring(\"is_deleted\"::text from 1 for 15) AS \"is_deleted\", char_length(\"is_deleted\"::text) AS \"__pdw_preview_len_5\" FROM \"apple_notes\" LIMIT 3": {
 			Columns: []string{"note_id", "__pdw_preview_len_0", "title", "__pdw_preview_len_1", "modified_at", "__pdw_preview_len_2", "body_text", "__pdw_preview_len_3", "body_html", "__pdw_preview_len_4", "is_deleted", "__pdw_preview_len_5"},
@@ -138,6 +170,9 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 			if !strings.Contains(tool.Description, "Apple Notes") || !strings.Contains(tool.Description, "apple_notes") {
 				t.Fatalf("%s description does not include Apple Notes SQL starting points: %q", tool.Name, tool.Description)
 			}
+			if !strings.Contains(tool.Description, "Apple Messages") || !strings.Contains(tool.Description, "apple_messages") {
+				t.Fatalf("%s description does not include Apple Messages SQL starting points: %q", tool.Name, tool.Description)
+			}
 			if !strings.Contains(tool.Description, "default.clean_gmail_inbox(thread_id, latest_subject)") {
 				t.Fatalf("%s description does not include clean view schema for discovery: %q", tool.Name, tool.Description)
 			}
@@ -153,10 +188,13 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 			if !strings.Contains(tool.Description, "default.apple_notes(note_id, title, modified_at, body_text, body_html, is_deleted)") {
 				t.Fatalf("%s description does not include Apple Notes schema for discovery: %q", tool.Name, tool.Description)
 			}
+			if !strings.Contains(tool.Description, "default.apple_messages(message_id, message_at, service, handle_id, body_text, is_from_me, is_deleted)") {
+				t.Fatalf("%s description does not include Apple Messages schema for discovery: %q", tool.Name, tool.Description)
+			}
 		}
 		if tool.Name == "get_field" {
-			if !strings.Contains(tool.Description, "Apple Notes body_text/body_html/body_markdown") {
-				t.Fatalf("%s description does not steer agents to get_field for Apple Notes bodies: %q", tool.Name, tool.Description)
+			if !strings.Contains(tool.Description, "Apple Notes body_text/body_html/body_markdown") || !strings.Contains(tool.Description, "Apple Messages body_text") {
+				t.Fatalf("%s description does not steer agents to get_field for Apple local-data bodies: %q", tool.Name, tool.Description)
 			}
 		}
 		if tool.Name == "query" || tool.Name == "get_field" || tool.Name == "get_rows" || tool.Name == "grep_rows" {
@@ -193,6 +231,9 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	}
 	if !strings.Contains(text.Text, "# default.apple_notes") || !strings.Contains(text.Text, "note_id,title,modified_at,body_text,body_html,is_deleted") {
 		t.Fatalf("schema overview did not include Apple Notes table: %q", text.Text)
+	}
+	if !strings.Contains(text.Text, "# default.apple_messages") || !strings.Contains(text.Text, "message_id,message_at,service,handle_id,body_text,is_from_me,is_deleted") {
+		t.Fatalf("schema overview did not include Apple Messages table: %q", text.Text)
 	}
 
 	queryResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query", Arguments: map[string]any{

@@ -33,6 +33,11 @@ DEFAULT_VOICE_MEMOS_STORAGE_BACKEND = "google_drive"
 DEFAULT_VOICE_MEMOS_TRANSCRIPTION_PROVIDER = "assemblyai"
 DEFAULT_APPLE_NOTES_STORE_PATH = "~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
 DEFAULT_APPLE_NOTES_STORAGE_BACKEND = "google_drive"
+DEFAULT_APPLE_MESSAGES_STORE_PATH = "~/Library/Messages/chat.db"
+DEFAULT_APPLE_MESSAGES_STORAGE_BACKEND = "google_drive"
+DEFAULT_APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN = 512 * 1024 * 1024
+DEFAULT_APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN = 200
+DEFAULT_APPLE_MESSAGES_UPLOAD_WORKERS = 4
 DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
 DEFAULT_ALICE_STORAGE_BACKEND = "google_drive"
 DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS = 120
@@ -170,6 +175,18 @@ class AppleNotesConfig:
 
 
 @dataclass(frozen=True)
+class AppleMessagesConfig:
+    account: str
+    store_path: str
+    storage_backend: str
+    google_drive_account: str
+    google_drive_folder_id: str
+    attachment_bytes_per_run: int = DEFAULT_APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN
+    attachment_count_per_run: int = DEFAULT_APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN
+    upload_workers: int = DEFAULT_APPLE_MESSAGES_UPLOAD_WORKERS
+
+
+@dataclass(frozen=True)
 class AliceVoiceRecordingsConfig:
     account: str
     key_id: str
@@ -244,6 +261,7 @@ class Settings:
     google_oauth_client_secrets_json_by_domain: tuple[tuple[str, str], ...] = ()
     voice_memos: VoiceMemosConfig | None = None
     apple_notes: AppleNotesConfig | None = None
+    apple_messages: AppleMessagesConfig | None = None
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
@@ -277,6 +295,8 @@ class Settings:
             configured_domains.add(email_domain(self.alice_voice_recordings.google_drive_account))
         if self.apple_notes is not None:
             configured_domains.add(email_domain(self.apple_notes.google_drive_account))
+        if self.apple_messages is not None:
+            configured_domains.add(email_domain(self.apple_messages.google_drive_account))
         if len(configured_domains) <= 1:
             return self.gmail_oauth_client_secrets_json
         return None
@@ -295,6 +315,7 @@ def load_settings(
     require_slack: bool = False,
     require_voice_memos: bool = False,
     require_apple_notes: bool = False,
+    require_apple_messages: bool = False,
     require_alice_voice_recordings: bool = False,
     require_assemblyai: bool = False,
     require_agent: bool = False,
@@ -629,6 +650,81 @@ def load_settings(
             google_drive_folder_id=apple_notes_google_drive_folder_id,
         )
 
+    apple_messages_account = (
+        os.getenv("APPLE_MESSAGES_ACCOUNT")
+        or os.getenv("APPLE_NOTES_ACCOUNT")
+        or os.getenv("VOICE_MEMOS_ACCOUNT")
+        or default_voice_memos_account
+    ).strip()
+    apple_messages_store_path = os.path.expanduser(
+        os.getenv("APPLE_MESSAGES_STORE_PATH", DEFAULT_APPLE_MESSAGES_STORE_PATH)
+    )
+    apple_messages_storage_backend = os.getenv(
+        "APPLE_MESSAGES_STORAGE_BACKEND",
+        DEFAULT_APPLE_MESSAGES_STORAGE_BACKEND,
+    ).strip()
+    apple_messages_google_drive_account = (
+        os.getenv("APPLE_MESSAGES_GOOGLE_DRIVE_ACCOUNT")
+        or apple_messages_account
+        or apple_notes_google_drive_account
+        or voice_memos_account
+    ).strip()
+    apple_messages_google_drive_folder_id = (
+        os.getenv("APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
+        or ""
+    ).strip()
+    apple_messages_attachment_bytes_per_run = int(
+        os.getenv(
+            "APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN",
+            str(DEFAULT_APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN),
+        )
+    )
+    apple_messages_attachment_count_per_run = int(
+        os.getenv(
+            "APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN",
+            str(DEFAULT_APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN),
+        )
+    )
+    apple_messages_upload_workers = int(
+        os.getenv("APPLE_MESSAGES_UPLOAD_WORKERS", str(DEFAULT_APPLE_MESSAGES_UPLOAD_WORKERS))
+    )
+    apple_messages: AppleMessagesConfig | None = None
+    if (
+        require_apple_messages
+        or os.getenv("APPLE_MESSAGES_ACCOUNT")
+        or os.getenv("APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_MESSAGES_STORE_PATH")
+    ):
+        if not apple_messages_account:
+            raise ValueError("APPLE_MESSAGES_ACCOUNT or GMAIL_ACCOUNTS must be set for Apple Messages sync")
+        if apple_messages_storage_backend not in {"google_drive"}:
+            raise ValueError("APPLE_MESSAGES_STORAGE_BACKEND currently supports: google_drive")
+        if not apple_messages_google_drive_account:
+            raise ValueError("APPLE_MESSAGES_GOOGLE_DRIVE_ACCOUNT or APPLE_MESSAGES_ACCOUNT must be set")
+        if not apple_messages_google_drive_folder_id:
+            raise ValueError(
+                "APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
+        if apple_messages_attachment_bytes_per_run < 0:
+            raise ValueError("APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN must be greater than or equal to 0")
+        if apple_messages_attachment_count_per_run < 0:
+            raise ValueError("APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN must be greater than or equal to 0")
+        if apple_messages_upload_workers < 1:
+            raise ValueError("APPLE_MESSAGES_UPLOAD_WORKERS must be at least 1")
+        apple_messages = AppleMessagesConfig(
+            account=apple_messages_account,
+            store_path=apple_messages_store_path,
+            storage_backend=apple_messages_storage_backend,
+            google_drive_account=apple_messages_google_drive_account,
+            google_drive_folder_id=apple_messages_google_drive_folder_id,
+            attachment_bytes_per_run=apple_messages_attachment_bytes_per_run,
+            attachment_count_per_run=apple_messages_attachment_count_per_run,
+            upload_workers=apple_messages_upload_workers,
+        )
+
     alice_account = os.getenv("ALICE_VOICE_RECORDINGS_ACCOUNT", "").strip()
     alice_key_id = os.getenv("ALICE_API_KEY_ID", "").strip()
     alice_secret_key = os.getenv("ALICE_API_SECRET_KEY", "").strip()
@@ -763,6 +859,8 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if apple_notes and apple_notes.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if apple_messages and apple_messages.storage_backend == "google_drive":
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if alice_voice_recordings and alice_voice_recordings.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
 
@@ -811,6 +909,7 @@ def load_settings(
         slack_force_full_sync=_parse_bool_env(os.getenv("SLACK_FORCE_FULL_SYNC"), False),
         voice_memos=voice_memos,
         apple_notes=apple_notes,
+        apple_messages=apple_messages,
         alice_voice_recordings=alice_voice_recordings,
         assemblyai=assemblyai,
         agent=agent,

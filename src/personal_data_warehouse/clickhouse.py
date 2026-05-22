@@ -347,6 +347,148 @@ APPLE_NOTE_ATTACHMENT_COLUMNS = (
     "sync_version",
 )
 
+APPLE_MESSAGE_HANDLE_COLUMNS = (
+    "account",
+    "handle_id",
+    "handle_rowid",
+    "address",
+    "country",
+    "service",
+    "uncanonicalized_id",
+    "person_centric_id",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+APPLE_MESSAGE_CHAT_COLUMNS = (
+    "account",
+    "chat_id",
+    "chat_rowid",
+    "guid",
+    "chat_identifier",
+    "service_name",
+    "display_name",
+    "room_name",
+    "account_login",
+    "style",
+    "state",
+    "is_archived",
+    "is_filtered",
+    "is_recovered",
+    "is_pending_review",
+    "last_read_message_at",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+APPLE_MESSAGE_CHAT_HANDLE_COLUMNS = (
+    "account",
+    "chat_id",
+    "handle_id",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+APPLE_MESSAGE_COLUMNS = (
+    "account",
+    "message_id",
+    "message_rowid",
+    "handle_id",
+    "service",
+    "message_account",
+    "body_text",
+    "body_source",
+    "body_decode_status",
+    "body_decode_error",
+    "attributed_body_sha256",
+    "subject",
+    "country",
+    "message_type",
+    "message_item_type",
+    "is_from_me",
+    "is_read",
+    "is_sent",
+    "is_delivered",
+    "is_finished",
+    "is_system_message",
+    "is_service_message",
+    "is_forward",
+    "is_empty",
+    "is_audio_message",
+    "is_played",
+    "cache_has_attachments",
+    "has_unseen_mention",
+    "is_spam",
+    "reply_to_guid",
+    "associated_message_guid",
+    "associated_message_type",
+    "associated_message_emoji",
+    "balloon_bundle_id",
+    "group_title",
+    "group_action_type",
+    "message_action_type",
+    "message_source",
+    "expressive_send_style_id",
+    "message_at",
+    "date_ns",
+    "date_read",
+    "date_delivered",
+    "date_played",
+    "date_edited",
+    "date_retracted",
+    "date_recovered",
+    "is_deleted",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+APPLE_MESSAGE_CHAT_MESSAGE_COLUMNS = (
+    "account",
+    "chat_id",
+    "message_id",
+    "message_date",
+    "message_date_ns",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+APPLE_MESSAGE_ATTACHMENT_COLUMNS = (
+    "account",
+    "attachment_id",
+    "attachment_rowid",
+    "message_id",
+    "guid",
+    "original_guid",
+    "filename",
+    "transfer_name",
+    "content_type",
+    "uti",
+    "mime_type",
+    "total_bytes",
+    "size_bytes",
+    "content_sha256",
+    "is_missing",
+    "error",
+    "is_outgoing",
+    "is_sticker",
+    "hide_attachment",
+    "transfer_state",
+    "created_at",
+    "start_at",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
 AGENT_RUN_COLUMNS = (
     "run_id",
     "provider",
@@ -1142,6 +1284,186 @@ class ClickHouseWarehouse:
             ENGINE = ReplacingMergeTree(sync_version)
             PARTITION BY toYYYYMM(ingested_at)
             ORDER BY (account, note_id, revision_id, attachment_id)
+            """
+        )
+
+    def ensure_apple_messages_tables(self) -> None:
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS apple_message_handles (
+                account LowCardinality(String),
+                handle_id String,
+                handle_rowid UInt64,
+                address String,
+                country LowCardinality(String),
+                service LowCardinality(String),
+                uncanonicalized_id String,
+                person_centric_id String,
+                raw_metadata_json String,
+                ingested_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(ingested_at)
+            ORDER BY (account, handle_id)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS apple_message_chats (
+                account LowCardinality(String),
+                chat_id String,
+                chat_rowid UInt64,
+                guid String,
+                chat_identifier String,
+                service_name LowCardinality(String),
+                display_name String,
+                room_name String,
+                account_login String,
+                style Int64,
+                state Int64,
+                is_archived UInt8,
+                is_filtered UInt8,
+                is_recovered UInt8,
+                is_pending_review UInt8,
+                last_read_message_at DateTime64(3, 'UTC'),
+                raw_metadata_json String,
+                ingested_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(ingested_at)
+            ORDER BY (account, chat_id)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS apple_message_chat_handles (
+                account LowCardinality(String),
+                chat_id String,
+                handle_id String,
+                raw_metadata_json String,
+                ingested_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(ingested_at)
+            ORDER BY (account, chat_id, handle_id)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS apple_messages (
+                account LowCardinality(String),
+                message_id String,
+                message_rowid UInt64,
+                handle_id String,
+                service LowCardinality(String),
+                message_account String,
+                body_text String,
+                body_source LowCardinality(String),
+                body_decode_status LowCardinality(String),
+                body_decode_error String,
+                attributed_body_sha256 String,
+                subject String,
+                country LowCardinality(String),
+                message_type Int64,
+                message_item_type Int64,
+                is_from_me UInt8,
+                is_read UInt8,
+                is_sent UInt8,
+                is_delivered UInt8,
+                is_finished UInt8,
+                is_system_message UInt8,
+                is_service_message UInt8,
+                is_forward UInt8,
+                is_empty UInt8,
+                is_audio_message UInt8,
+                is_played UInt8,
+                cache_has_attachments UInt8,
+                has_unseen_mention UInt8,
+                is_spam UInt8,
+                reply_to_guid String,
+                associated_message_guid String,
+                associated_message_type Int64,
+                associated_message_emoji String,
+                balloon_bundle_id String,
+                group_title String,
+                group_action_type Int64,
+                message_action_type Int64,
+                message_source Int64,
+                expressive_send_style_id String,
+                message_at DateTime64(3, 'UTC'),
+                date_ns Int64,
+                date_read DateTime64(3, 'UTC'),
+                date_delivered DateTime64(3, 'UTC'),
+                date_played DateTime64(3, 'UTC'),
+                date_edited DateTime64(3, 'UTC'),
+                date_retracted DateTime64(3, 'UTC'),
+                date_recovered DateTime64(3, 'UTC'),
+                is_deleted UInt8,
+                raw_metadata_json String,
+                ingested_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(ingested_at)
+            ORDER BY (account, message_id)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS apple_message_chat_messages (
+                account LowCardinality(String),
+                chat_id String,
+                message_id String,
+                message_date DateTime64(3, 'UTC'),
+                message_date_ns Int64,
+                raw_metadata_json String,
+                ingested_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(ingested_at)
+            ORDER BY (account, chat_id, message_id)
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS apple_message_attachments (
+                account LowCardinality(String),
+                attachment_id String,
+                attachment_rowid UInt64,
+                message_id String,
+                guid String,
+                original_guid String,
+                filename String,
+                transfer_name String,
+                content_type LowCardinality(String),
+                uti String,
+                mime_type String,
+                total_bytes UInt64,
+                size_bytes UInt64,
+                content_sha256 String,
+                is_missing UInt8,
+                error String,
+                is_outgoing UInt8,
+                is_sticker UInt8,
+                hide_attachment UInt8,
+                transfer_state Int64,
+                created_at DateTime64(3, 'UTC'),
+                start_at DateTime64(3, 'UTC'),
+                storage_backend LowCardinality(String),
+                storage_key String,
+                storage_file_id String,
+                storage_url String,
+                raw_metadata_json String,
+                ingested_at DateTime64(3, 'UTC'),
+                sync_version UInt64
+            )
+            ENGINE = ReplacingMergeTree(sync_version)
+            PARTITION BY toYYYYMM(ingested_at)
+            ORDER BY (account, attachment_id, message_id)
             """
         )
 
@@ -1945,6 +2267,24 @@ class ClickHouseWarehouse:
 
     def insert_apple_note_attachments(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("apple_note_attachments", rows, APPLE_NOTE_ATTACHMENT_COLUMNS)
+
+    def insert_apple_message_handles(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_message_handles", rows, APPLE_MESSAGE_HANDLE_COLUMNS)
+
+    def insert_apple_message_chats(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_message_chats", rows, APPLE_MESSAGE_CHAT_COLUMNS)
+
+    def insert_apple_message_chat_handles(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_message_chat_handles", rows, APPLE_MESSAGE_CHAT_HANDLE_COLUMNS)
+
+    def insert_apple_messages(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_messages", rows, APPLE_MESSAGE_COLUMNS)
+
+    def insert_apple_message_chat_messages(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_message_chat_messages", rows, APPLE_MESSAGE_CHAT_MESSAGE_COLUMNS)
+
+    def insert_apple_message_attachments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_message_attachments", rows, APPLE_MESSAGE_ATTACHMENT_COLUMNS)
 
     def insert_agent_runs(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_runs", rows, AGENT_RUN_COLUMNS)

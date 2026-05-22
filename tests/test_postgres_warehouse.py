@@ -23,9 +23,11 @@ from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
     FLOAT_COLUMNS,
     INTEGER_COLUMNS,
+    POSTGRES_TABLES,
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
     _normalize_insert_value,
+    _upsert_clause,
 )
 
 
@@ -168,11 +170,29 @@ def test_postgres_insert_normalizes_nul_text_values() -> None:
     ]
 
 
+def test_apple_message_attachment_upsert_preserves_existing_storage_when_metadata_record_is_blank() -> None:
+    clause = _upsert_clause("apple_message_attachments", POSTGRES_TABLES["apple_message_attachments"])
+
+    assert (
+        "\"storage_file_id\" = COALESCE(NULLIF(EXCLUDED.\"storage_file_id\", ''), "
+        "\"apple_message_attachments\".\"storage_file_id\")"
+    ) in clause
+    assert (
+        "\"storage_key\" = COALESCE(NULLIF(EXCLUDED.\"storage_key\", ''), "
+        "\"apple_message_attachments\".\"storage_key\")"
+    ) in clause
+    assert (
+        "\"content_sha256\" = COALESCE(NULLIF(EXCLUDED.\"content_sha256\", ''), "
+        "\"apple_message_attachments\".\"content_sha256\")"
+    ) in clause
+
+
 def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     warehouse.ensure_calendar_tables()
     warehouse.ensure_apple_voice_memos_tables()
     warehouse.ensure_apple_notes_tables()
+    warehouse.ensure_apple_messages_tables()
     warehouse.ensure_slack_tables()
     warehouse.ensure_finance_tables()
 
@@ -181,12 +201,16 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
         SELECT table_name
         FROM information_schema.tables
         WHERE table_schema = current_schema()
-          AND table_name IN ('gmail_messages', 'calendar_events', 'slack_messages', 'apple_voice_memos_files', 'apple_notes', 'finance_accounts')
+          AND table_name IN (
+            'gmail_messages', 'calendar_events', 'slack_messages', 'apple_voice_memos_files',
+            'apple_notes', 'apple_messages', 'finance_accounts'
+          )
         ORDER BY table_name
         """
     )
 
     assert [row[0] for row in rows] == [
+        "apple_messages",
         "apple_notes",
         "apple_voice_memos_files",
         "calendar_events",

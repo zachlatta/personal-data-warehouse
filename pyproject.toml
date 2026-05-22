@@ -13,6 +13,7 @@ dependencies = [
     "pillow>=12.2.0",
     "psycopg2-binary>=2.9.10",
     "pypdf>=6.10.2",
+    "pytypedstream>=0.1.0",
     "python-dotenv>=1.1.0",
     "requests>=2.32.0",
     "slack-sdk>=3.41.0",
@@ -25,6 +26,7 @@ personal-data-warehouse-slack-sync = "personal_data_warehouse.slack_sync:main"
 personal-data-warehouse-apple-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"
 personal-data-warehouse-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"
 personal-data-warehouse-apple-notes-upload = "personal_data_warehouse_apple_notes.cli:main"
+personal-data-warehouse-apple-messages-upload = "personal_data_warehouse_apple_messages.cli:main"
 personal-data-warehouse-agent-auth = "personal_data_warehouse.agent_runner:auth_main"
 personal-data-warehouse-postgres-migration = "personal_data_warehouse.postgres_migration:main"
 personal-data-warehouse-finance-sync = "personal_data_warehouse.finance_sync:main"
@@ -42,6 +44,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
+packages = [
+    "src/personal_data_warehouse",
+    "src/personal_data_warehouse_alice_voice_recordings",
+    "src/personal_data_warehouse_apple_messages",
+    "src/personal_data_warehouse_apple_notes",
+    "src/personal_data_warehouse_voice_memos",
+]
 force-include = { "pyproject.toml" = "pyproject.toml" }
 
 [tool.dg]

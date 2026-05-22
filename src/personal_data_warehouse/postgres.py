@@ -20,6 +20,12 @@ from personal_data_warehouse.clickhouse import (
     APPLE_NOTE_ATTACHMENT_COLUMNS,
     APPLE_NOTE_COLUMNS,
     APPLE_NOTE_REVISION_COLUMNS,
+    APPLE_MESSAGE_ATTACHMENT_COLUMNS,
+    APPLE_MESSAGE_CHAT_COLUMNS,
+    APPLE_MESSAGE_CHAT_HANDLE_COLUMNS,
+    APPLE_MESSAGE_CHAT_MESSAGE_COLUMNS,
+    APPLE_MESSAGE_COLUMNS,
+    APPLE_MESSAGE_HANDLE_COLUMNS,
     CALENDAR_EVENT_COLUMNS,
     CALENDAR_SYNC_STATE_COLUMNS,
     FINANCE_ACCOUNT_COLUMNS,
@@ -103,6 +109,18 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         APPLE_NOTE_ATTACHMENT_COLUMNS,
         ("account", "note_id", "revision_id", "attachment_id"),
     ),
+    "apple_message_handles": TableSpec(APPLE_MESSAGE_HANDLE_COLUMNS, ("account", "handle_id")),
+    "apple_message_chats": TableSpec(APPLE_MESSAGE_CHAT_COLUMNS, ("account", "chat_id")),
+    "apple_message_chat_handles": TableSpec(APPLE_MESSAGE_CHAT_HANDLE_COLUMNS, ("account", "chat_id", "handle_id")),
+    "apple_messages": TableSpec(APPLE_MESSAGE_COLUMNS, ("account", "message_id")),
+    "apple_message_chat_messages": TableSpec(
+        APPLE_MESSAGE_CHAT_MESSAGE_COLUMNS,
+        ("account", "chat_id", "message_id"),
+    ),
+    "apple_message_attachments": TableSpec(
+        APPLE_MESSAGE_ATTACHMENT_COLUMNS,
+        ("account", "attachment_id", "message_id"),
+    ),
     "agent_runs": TableSpec(AGENT_RUN_COLUMNS, ("run_id",)),
     "agent_run_events": TableSpec(AGENT_RUN_EVENT_COLUMNS, ("run_id", "event_index")),
     "agent_run_tool_calls": TableSpec(AGENT_RUN_TOOL_CALL_COLUMNS, ("run_id", "event_index", "tool_name")),
@@ -162,6 +180,8 @@ POSTGRES_INSERT_PAGE_SIZES = {
     "apple_notes": 50,
     "apple_note_revisions": 50,
     "apple_note_attachments": 250,
+    "apple_messages": 500,
+    "apple_message_attachments": 500,
 }
 
 
@@ -195,6 +215,15 @@ TIMESTAMP_COLUMNS = {
     "latest_activity_at",
     "latest_message_at",
     "message_datetime",
+    "message_at",
+    "message_date",
+    "last_read_message_at",
+    "date_read",
+    "date_delivered",
+    "date_played",
+    "date_edited",
+    "date_retracted",
+    "date_recovered",
     "ai_processed_at",
     "datetime",
     "authorized_datetime",
@@ -238,6 +267,42 @@ INTEGER_COLUMNS = {
     "is_removed",
     "is_overdue",
     "is_missing",
+    "handle_rowid",
+    "chat_rowid",
+    "message_rowid",
+    "attachment_rowid",
+    "style",
+    "state",
+    "message_type",
+    "message_item_type",
+    "group_action_type",
+    "message_action_type",
+    "message_source",
+    "associated_message_type",
+    "date_ns",
+    "message_date_ns",
+    "total_bytes",
+    "transfer_state",
+    "is_from_me",
+    "is_read",
+    "is_sent",
+    "is_delivered",
+    "is_finished",
+    "is_system_message",
+    "is_service_message",
+    "is_forward",
+    "is_empty",
+    "is_audio_message",
+    "is_played",
+    "cache_has_attachments",
+    "has_unseen_mention",
+    "is_spam",
+    "is_outgoing",
+    "is_sticker",
+    "hide_attachment",
+    "is_filtered",
+    "is_recovered",
+    "is_pending_review",
 }
 
 FLOAT_COLUMNS = {
@@ -321,6 +386,18 @@ class PostgresWarehouse:
     def ensure_apple_notes_tables(self) -> None:
         self._ensure_table_group(["apple_notes", "apple_note_revisions", "apple_note_attachments"])
 
+    def ensure_apple_messages_tables(self) -> None:
+        self._ensure_table_group(
+            [
+                "apple_message_handles",
+                "apple_message_chats",
+                "apple_message_chat_handles",
+                "apple_messages",
+                "apple_message_chat_messages",
+                "apple_message_attachments",
+            ]
+        )
+
     def ensure_voice_memo_transcription_tables(self) -> None:
         self.ensure_apple_voice_memos_tables()
 
@@ -390,6 +467,10 @@ class PostgresWarehouse:
             "CREATE INDEX IF NOT EXISTS apple_notes_modified_idx ON apple_notes (modified_at DESC) WHERE is_deleted = 0",
             "CREATE INDEX IF NOT EXISTS apple_note_revisions_note_idx ON apple_note_revisions (account, note_id, modified_at DESC)",
             "CREATE INDEX IF NOT EXISTS apple_note_attachments_hash_idx ON apple_note_attachments (content_sha256)",
+            "CREATE INDEX IF NOT EXISTS apple_messages_time_idx ON apple_messages (message_at DESC) WHERE is_deleted = 0",
+            "CREATE INDEX IF NOT EXISTS apple_messages_body_trgm_idx ON apple_messages USING gin (body_text public.gin_trgm_ops) WHERE is_deleted = 0",
+            "CREATE INDEX IF NOT EXISTS apple_message_chat_messages_chat_time_idx ON apple_message_chat_messages (account, chat_id, message_date DESC)",
+            "CREATE INDEX IF NOT EXISTS apple_message_attachments_hash_idx ON apple_message_attachments (content_sha256)",
             "CREATE INDEX IF NOT EXISTS slack_messages_conversation_time_idx ON slack_messages (account, team_id, conversation_id, message_datetime DESC)",
             "CREATE INDEX IF NOT EXISTS slack_messages_recent_scope_time_idx ON slack_messages (account, team_id, message_datetime DESC) WHERE is_deleted = 0",
             "CREATE INDEX IF NOT EXISTS slack_messages_recent_thread_time_idx ON slack_messages (account, team_id, thread_ts, message_datetime DESC) WHERE is_deleted = 0",
@@ -666,6 +747,24 @@ class PostgresWarehouse:
 
     def insert_apple_note_attachments(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("apple_note_attachments", rows, APPLE_NOTE_ATTACHMENT_COLUMNS)
+
+    def insert_apple_message_handles(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_message_handles", rows, APPLE_MESSAGE_HANDLE_COLUMNS)
+
+    def insert_apple_message_chats(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_message_chats", rows, APPLE_MESSAGE_CHAT_COLUMNS)
+
+    def insert_apple_message_chat_handles(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_message_chat_handles", rows, APPLE_MESSAGE_CHAT_HANDLE_COLUMNS)
+
+    def insert_apple_messages(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_messages", rows, APPLE_MESSAGE_COLUMNS)
+
+    def insert_apple_message_chat_messages(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_message_chat_messages", rows, APPLE_MESSAGE_CHAT_MESSAGE_COLUMNS)
+
+    def insert_apple_message_attachments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_message_attachments", rows, APPLE_MESSAGE_ATTACHMENT_COLUMNS)
 
     def insert_agent_runs(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_runs", rows, AGENT_RUN_COLUMNS)
@@ -2179,12 +2278,32 @@ def _upsert_clause(table: str, spec: TableSpec, columns: tuple[str, ...] | None 
     conflict_columns = ", ".join(_identifier(column) for column in spec.primary_key)
     if not update_columns:
         return f"ON CONFLICT ({conflict_columns}) DO NOTHING"
-    assignments = ", ".join(f"{_identifier(column)} = EXCLUDED.{_identifier(column)}" for column in update_columns)
+    preserve_non_empty_columns = {
+        "apple_message_attachments": {
+            "content_sha256",
+            "storage_backend",
+            "storage_key",
+            "storage_file_id",
+            "storage_url",
+        }
+    }.get(table, set())
+    assignments = ", ".join(
+        _upsert_assignment(table=table, column=column, preserve_non_empty=column in preserve_non_empty_columns)
+        for column in update_columns
+    )
     version_column = spec.version_column
     return (
         f"ON CONFLICT ({conflict_columns}) DO UPDATE SET {assignments} "
         f"WHERE {_identifier(table)}.{_identifier(version_column)} <= EXCLUDED.{_identifier(version_column)}"
     )
+
+
+def _upsert_assignment(*, table: str, column: str, preserve_non_empty: bool) -> str:
+    quoted_column = _identifier(column)
+    excluded_column = f"EXCLUDED.{quoted_column}"
+    if preserve_non_empty:
+        return f"{quoted_column} = COALESCE(NULLIF({excluded_column}, ''), {_identifier(table)}.{quoted_column})"
+    return f"{quoted_column} = {excluded_column}"
 
 
 def _identifier(value: str) -> str:
