@@ -87,10 +87,11 @@ SQL starting points:
 
 - Gmail: `clean_gmail_inbox`, `gmail_messages`, `gmail_attachments`, `gmail_attachment_enrichments`
 - Slack: `clean_slack_inbox`, `slack_messages`, `slack_conversations`, `slack_users`
+- Apple Notes: `apple_notes` for latest note state and searchable bodies, `apple_note_revisions`
+  for every observed version and tombstone, and `apple_note_attachments` for attachment metadata
 - Transcripts: `apple_voice_memos_enrichments`, `apple_voice_memos_transcription_runs`,
   `apple_voice_memos_transcript_segments`, `clean_calendar_with_transcripts`,
   `clean_transcripts_no_calendar_match`
-- Apple Notes: `apple_notes`, `apple_note_revisions`, `apple_note_attachments`
 
 ### `query`
 
@@ -109,6 +110,24 @@ trying to answer. Legacy `sql` array input is rejected.
       }
     ],
     "preview_rows": 1,
+    "format": "csv"
+  }
+}
+```
+
+Apple Notes bodies can be long, so query the row first and then use `get_field` for the full body:
+
+```json
+{
+  "name": "query",
+  "input": {
+    "queries": [
+      {
+        "question": "What are the most recently modified non-deleted Apple Notes?",
+        "sql": "SELECT note_id, title, modified_at, body_text, body_html FROM apple_notes WHERE is_deleted = 0 ORDER BY modified_at DESC LIMIT 5"
+      }
+    ],
+    "preview_rows": 5,
     "format": "csv"
   }
 }
@@ -170,6 +189,9 @@ Returns a character chunk from one cached cell. This is the right tool for readi
 ```
 
 The response includes `total_chars`, `returned_chars`, `offset`, `value`, and `eof`. `length` is capped by `MCP_GET_FIELD_MAX_CHARS`.
+
+Use `get_field` the same way for Apple Notes `body_text`, `body_html`, `body_markdown`, or
+`raw_metadata_json` columns after querying `apple_notes` or `apple_note_revisions`.
 
 Reading a 24 KB transcript now takes exactly two MCP calls:
 
