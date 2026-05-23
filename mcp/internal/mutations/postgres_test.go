@@ -1,6 +1,9 @@
 package mutations
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
 	mutations, err := normalizeForStorage(CreateRequestInput{
@@ -62,5 +65,145 @@ func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
 	}
 	if contactOps[0]["op"] != "delete_contact" || mutations[4].Operation != ContactsBatchMutationOperation {
 		t.Fatalf("contact mutation = %#v", mutations[4])
+	}
+}
+
+func TestUpdatedGmailEmailPayloadConvertsSendToDraft(t *testing.T) {
+	mutation := Mutation{
+		ID:        "mut-email",
+		Provider:  "gmail",
+		Operation: GmailSendEmailOperation,
+		Title:     "Send email: Original",
+		Payload: map[string]any{
+			"delivery_mode": "send",
+			"message": map[string]any{
+				"to":                 []any{"old@example.test"},
+				"subject":            "Original",
+				"body_text":          "Original body",
+				"reply_to_thread_id": "thread-1",
+				"in_reply_to":        "<old@example.test>",
+				"references":         []any{"<old@example.test>"},
+			},
+		},
+		Preview: map[string]any{
+			"context": map[string]any{"source": "test"},
+			"email":   map[string]any{"subject": "Original", "body_text": "Original body"},
+		},
+	}
+
+	payload, preview, title, err := updatedGmailEmailPayload(mutation, UpdateGmailEmailMutationInput{
+		DeliveryMode: "draft",
+		Message: map[string]any{
+			"to":        []string{"new@example.test"},
+			"cc":        []string{"copy@example.test"},
+			"subject":   "Edited",
+			"body_text": "Edited plain body",
+			"body_html": "<p>Edited <strong>HTML</strong></p>",
+		},
+	})
+	if err != nil {
+		t.Fatalf("updatedGmailEmailPayload returned error: %v", err)
+	}
+	if title != "Create draft: Edited" {
+		t.Fatalf("title = %q", title)
+	}
+	if payload["delivery_mode"] != "draft" {
+		t.Fatalf("delivery_mode = %#v", payload["delivery_mode"])
+	}
+	message := mapFromAny(payload["message"])
+	if got := stringSliceFromAny(message["to"]); len(got) != 1 || got[0] != "new@example.test" {
+		t.Fatalf("to = %#v", message["to"])
+	}
+	if message["reply_to_thread_id"] != "thread-1" || message["in_reply_to"] != "<old@example.test>" {
+		t.Fatalf("reply metadata was not preserved: %#v", message)
+	}
+	previewEmail := mapFromAny(preview["email"])
+	if previewEmail["delivery_mode"] != "draft" || previewEmail["mode"] != "reply" {
+		t.Fatalf("preview email = %#v", previewEmail)
+	}
+	if mapFromAny(preview["context"])["source"] != "test" {
+		t.Fatalf("preview context = %#v", preview["context"])
+	}
+}
+
+func TestUpdatedGmailEmailPayloadRejectsInvalidDraft(t *testing.T) {
+	mutation := Mutation{
+		Payload: map[string]any{
+			"delivery_mode": "send",
+			"message": map[string]any{
+				"to":        []any{"old@example.test"},
+				"subject":   "Original",
+				"body_text": "Original body",
+			},
+		},
+		Preview: map[string]any{},
+	}
+
+	if _, _, _, err := updatedGmailEmailPayload(mutation, UpdateGmailEmailMutationInput{
+		DeliveryMode: "maybe",
+		Message:      map[string]any{"to": []string{"new@example.test"}, "subject": "Edited", "body_text": "Body"},
+	}); err == nil {
+		t.Fatal("expected invalid delivery mode error")
+	}
+	if _, _, _, err := updatedGmailEmailPayload(mutation, UpdateGmailEmailMutationInput{
+		DeliveryMode: "draft",
+		Message:      map[string]any{"to": []string{}, "subject": "Edited", "body_text": "Body"},
+	}); err == nil {
+		t.Fatal("expected recipient error")
+	}
+}
+
+func TestExtractGmailSignatureHTML(t *testing.T) {
+	bodyHTML := `<html><body><div>Reply body</div><br><div class="gmail_signature"><div dir="ltr"><span>--</span><br><a href="https://hackclub.com">Hack Club</a></div></div><div class="gmail_quote">quoted</div></body></html>`
+
+	signature := extractGmailSignatureHTML(bodyHTML)
+	if !strings.Contains(signature, `class="gmail_signature"`) || !strings.Contains(signature, `https://hackclub.com`) {
+		t.Fatalf("signature = %q", signature)
+	}
+	if strings.Contains(signature, "gmail_quote") {
+		t.Fatalf("signature included quote: %q", signature)
+	}
+}
+
+func TestAppendGmailSignatureToMessageAddsHTMLAndText(t *testing.T) {
+	message := map[string]any{
+		"to":        []string{"zach@example.test"},
+		"subject":   "Hello",
+		"body_text": "Hello there.",
+		"body_html": "",
+	}
+	signature := gmailSignature{
+		HTML: `<div class="gmail_signature"><div>--<br><a href="https://hackclub.com">Hack Club</a></div></div>`,
+		Text: "--\nZach Latta\nHack Club",
+	}
+
+	out := appendGmailSignatureToMessage(message, signature)
+	bodyHTML := stringFromAny(out["body_html"])
+	if !strings.Contains(bodyHTML, "<div>Hello there.</div><div><br></div>") || !strings.Contains(bodyHTML, `class="gmail_signature"`) || !strings.Contains(bodyHTML, `https://hackclub.com`) {
+		t.Fatalf("body_html = %q", bodyHTML)
+	}
+	bodyText := stringFromAny(out["body_text"])
+	if !strings.Contains(bodyText, "Hello there.\n\n--\nZach Latta") {
+		t.Fatalf("body_text = %q", bodyText)
+	}
+}
+
+func TestEmailPlainTextToHTMLUsesGmailStyleDivs(t *testing.T) {
+	bodyHTML := emailPlainTextToHTML("First line\nSecond line\n\nNext paragraph")
+
+	want := "<div>First line<br>Second line</div><div><br></div><div>Next paragraph</div>"
+	if bodyHTML != want {
+		t.Fatalf("body_html = %q, want %q", bodyHTML, want)
+	}
+}
+
+func TestAppendGmailSignatureSkipsExistingSignature(t *testing.T) {
+	message := map[string]any{
+		"body_text": "Hello\n\n--\nExisting",
+		"body_html": `<p>Hello</p><div class="gmail_signature">Existing</div>`,
+	}
+
+	if !gmailEmailHasSignature(message) {
+		t.Fatal("expected existing signature to be detected")
 	}
 }

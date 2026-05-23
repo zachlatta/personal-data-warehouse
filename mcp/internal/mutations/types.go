@@ -35,6 +35,7 @@ type Store interface {
 	CreateRequest(ctx context.Context, input CreateRequestInput) (Request, error)
 	ListRequests(ctx context.Context, filter RequestFilter) ([]Request, error)
 	GetRequest(ctx context.Context, id string) (Request, error)
+	UpdateGmailEmailMutation(ctx context.Context, requestID string, mutationID string, input UpdateGmailEmailMutationInput, actor string) (Mutation, error)
 	ApproveRequest(ctx context.Context, id string, actor string) (Request, error)
 	RejectRequest(ctx context.Context, id string, actor string, reason string) (Request, error)
 }
@@ -50,6 +51,11 @@ type CreateRequestInput struct {
 	Context     map[string]any
 	Mutations   []MutationInput
 	RequestedBy string
+}
+
+type UpdateGmailEmailMutationInput struct {
+	DeliveryMode string
+	Message      map[string]any
 }
 
 type MutationInput struct {

@@ -234,6 +234,30 @@ def test_gmail_send_email_executor_creates_reply_draft_with_thread_headers() -> 
     assert message["References"] == "<message-0@example.test> <message-1@example.test>"
 
 
+def test_build_email_raw_preserves_gmail_style_html_body() -> None:
+    body_html = (
+        '<div>Hello from PDW.</div><div><br></div>'
+        '<div class="gmail_signature"><div dir="ltr"><span style="color:rgb(0,0,0);font-family:arial,sans-serif">--</span><br/>'
+        '<font face="arial, sans-serif" color="#000000" style="background-color:rgb(255,255,255)">Zach Latta</font>'
+        "</div></div>"
+    )
+
+    raw = gmail_mutations.build_email_raw(
+        account="zach@example.test",
+        message={
+            "to": ["one@example.test"],
+            "subject": "HTML body",
+            "body_text": "Hello from PDW.\n\n--\nZach Latta\n",
+            "body_html": body_html,
+        },
+    )
+
+    message = _decode_raw_message(raw)
+    html_part = message.get_body(preferencelist=("html",))
+    assert html_part is not None
+    assert html_part.get_content().strip() == body_html
+
+
 def test_gmail_mutation_failure_status_marks_missing_scope_as_blocked() -> None:
     error = RuntimeError("OAuth token for zach@example.test cannot be refreshed")
 

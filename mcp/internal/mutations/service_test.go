@@ -29,6 +29,10 @@ func (s *recordingStore) GetRequest(context.Context, string) (Request, error) {
 	return Request{}, nil
 }
 
+func (s *recordingStore) UpdateGmailEmailMutation(context.Context, string, string, UpdateGmailEmailMutationInput, string) (Mutation, error) {
+	return Mutation{}, nil
+}
+
 func (s *recordingStore) ApproveRequest(context.Context, string, string) (Request, error) {
 	return Request{}, nil
 }

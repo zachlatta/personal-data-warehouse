@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"strings"
 	"time"
 
@@ -28,6 +29,11 @@ type storedMutation struct {
 	Reason    string
 	Payload   map[string]any
 	Preview   map[string]any
+}
+
+type gmailSignature struct {
+	HTML string
+	Text string
 }
 
 func NewPostgresStore(databaseURL string, timeout time.Duration) (*PostgresStore, error) {
@@ -75,6 +81,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if err != nil {
 		return Request{}, err
 	}
+	normalized = s.enrichGmailEmailSignatures(ctx, normalized)
 	idempotencyKey, err := requestIdempotencyKey(input, normalized)
 	if err != nil {
 		return Request{}, err
@@ -226,6 +233,92 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string) (Request, err
 		request.MutationCount = len(mutations)
 	}
 	return request, nil
+}
+
+func (s *PostgresStore) UpdateGmailEmailMutation(ctx context.Context, requestID string, mutationID string, input UpdateGmailEmailMutationInput, actor string) (Mutation, error) {
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+	if err := s.EnsureTables(ctx); err != nil {
+		return Mutation{}, err
+	}
+	if actor == "" {
+		actor = reviewerActorID
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Mutation{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	requestStatus, err := requestStatusForUpdate(ctx, tx, requestID)
+	if err != nil {
+		return Mutation{}, err
+	}
+	if requestStatus != "pending_review" {
+		return Mutation{}, fmt.Errorf("cannot edit mutation for request with status %s", requestStatus)
+	}
+	mutation, err := mutationForUpdate(ctx, tx, requestID, mutationID)
+	if err != nil {
+		return Mutation{}, err
+	}
+	if mutation.Status != "pending_review" {
+		return Mutation{}, fmt.Errorf("cannot edit mutation with status %s", mutation.Status)
+	}
+	if mutation.Provider != "gmail" || mutation.Operation != GmailSendEmailOperation {
+		return Mutation{}, fmt.Errorf("cannot edit mutation with operation %s", mutation.Operation)
+	}
+	payload, preview, title, err := updatedGmailEmailPayload(mutation, input)
+	if err != nil {
+		return Mutation{}, err
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE upstream_mutations
+		   SET title = $1,
+		       payload_json = $2::jsonb,
+		       preview_json = $3::jsonb,
+		       revision = revision + 1,
+		       updated_at = $4
+		 WHERE id = $5
+	`, title, jsonString(payload), jsonString(preview), now, mutationID); err != nil {
+		return Mutation{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE upstream_mutation_requests
+		   SET revision = revision + 1,
+		       updated_at = $1
+		 WHERE id = $2
+	`, now, requestID); err != nil {
+		return Mutation{}, err
+	}
+	message := mapFromAny(payload["message"])
+	if err := appendMutationEvent(ctx, tx, mutationID, "edited", "human", actor, map[string]any{
+		"request_id":    requestID,
+		"delivery_mode": payload["delivery_mode"],
+		"message":       message,
+	}); err != nil {
+		return Mutation{}, err
+	}
+	if err := appendRequestEvent(ctx, tx, requestID, "mutation_edited", "human", actor, map[string]any{
+		"mutation_id":   mutationID,
+		"delivery_mode": payload["delivery_mode"],
+	}); err != nil {
+		return Mutation{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Mutation{}, err
+	}
+	committed = true
+	mutation.Title = title
+	mutation.Payload = payload
+	mutation.Preview = preview
+	mutation.Revision++
+	mutation.UpdatedAt = now
+	return mutation, nil
 }
 
 func (s *PostgresStore) ApproveRequest(ctx context.Context, id string, actor string) (Request, error) {
@@ -498,6 +591,78 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 	return applyGmailThreadPreviewRows(mutations, previewRows), nil
 }
 
+func (s *PostgresStore) enrichGmailEmailSignatures(ctx context.Context, mutations []storedMutation) []storedMutation {
+	if s == nil || s.db == nil {
+		return mutations
+	}
+	signatures := map[string]gmailSignature{}
+	for index := range mutations {
+		mutation := mutations[index]
+		if mutation.Provider != "gmail" || mutation.Operation != GmailSendEmailOperation {
+			continue
+		}
+		message := mapFromAny(mutation.Payload["message"])
+		if gmailEmailHasSignature(message) {
+			continue
+		}
+		account := normalizeAccount(mutation.Account)
+		if account == "" {
+			continue
+		}
+		signature, ok := signatures[account]
+		if !ok {
+			var err error
+			signature, err = s.latestGmailSignature(ctx, account)
+			if err != nil {
+				signature = gmailSignature{}
+			}
+			signatures[account] = signature
+		}
+		if signature.Empty() {
+			continue
+		}
+		message = appendGmailSignatureToMessage(message, signature)
+		mutations[index].Payload["message"] = message
+		previewEmail := mapFromAny(mutations[index].Preview["email"])
+		for key, value := range message {
+			previewEmail[key] = value
+		}
+		previewEmail["delivery_mode"] = mutations[index].Payload["delivery_mode"]
+		previewEmail["mode"] = emailPreviewMode(message)
+		previewEmail["signature_source"] = "gmail_messages.sent"
+		mutations[index].Preview["email"] = previewEmail
+	}
+	return mutations
+}
+
+func (s *PostgresStore) latestGmailSignature(ctx context.Context, account string) (gmailSignature, error) {
+	var bodyHTML, bodyText string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(body_html, ''), COALESCE(body_text, '')
+		FROM gmail_messages
+		WHERE account = $1
+		  AND is_deleted = 0
+		  AND 'SENT' = ANY(label_ids)
+		  AND position('gmail_signature' in lower(COALESCE(body_html, ''))) > 0
+		ORDER BY internal_date DESC
+		LIMIT 1
+	`, account).Scan(&bodyHTML, &bodyText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return gmailSignature{}, nil
+	}
+	if err != nil {
+		return gmailSignature{}, err
+	}
+	signature := gmailSignature{
+		HTML: extractGmailSignatureHTML(bodyHTML),
+		Text: extractGmailSignatureText(bodyText),
+	}
+	if signature.Text == "" && signature.HTML != "" {
+		signature.Text = htmlFragmentText(signature.HTML)
+	}
+	return signature, nil
+}
+
 func (s *PostgresStore) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -619,7 +784,7 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Provider:  "gmail",
 				Operation: GmailSendEmailOperation,
 				Account:   account,
-				Title:     optionalTitle(mutation.Title, emailRequestTitle(message)),
+				Title:     optionalTitle(mutation.Title, gmailEmailRequestTitle(deliveryMode, message)),
 				Reason:    reason,
 				Payload: map[string]any{
 					"delivery_mode": deliveryMode,
@@ -684,11 +849,229 @@ func normalizeMessageForStorage(message map[string]any) map[string]any {
 	return out
 }
 
+func updatedGmailEmailPayload(mutation Mutation, input UpdateGmailEmailMutationInput) (map[string]any, map[string]any, string, error) {
+	deliveryMode, err := normalizeDeliveryMode(input.DeliveryMode)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	existingPayload := cloneMap(mutation.Payload)
+	mergedMessage := mapFromAny(existingPayload["message"])
+	for key, value := range input.Message {
+		mergedMessage[key] = value
+	}
+	message := normalizeMessageForStorage(mergedMessage)
+	if !hasAnyRecipient(message) {
+		return nil, nil, "", errors.New("Gmail email mutation must include at least one recipient")
+	}
+	if strings.TrimSpace(stringFromAny(message["subject"])) == "" {
+		return nil, nil, "", errors.New("Gmail email mutation must include subject")
+	}
+	if strings.TrimSpace(stringFromAny(message["body_text"])) == "" && strings.TrimSpace(stringFromAny(message["body_html"])) == "" {
+		return nil, nil, "", errors.New("Gmail email mutation must include body_text or body_html")
+	}
+
+	payload := existingPayload
+	payload["delivery_mode"] = deliveryMode
+	payload["message"] = message
+
+	preview := cloneMap(mutation.Preview)
+	previewEmail := cloneMap(message)
+	previewEmail["mode"] = emailPreviewMode(message)
+	previewEmail["delivery_mode"] = deliveryMode
+	preview["email"] = previewEmail
+
+	return payload, preview, gmailEmailRequestTitle(deliveryMode, message), nil
+}
+
+func (signature gmailSignature) Empty() bool {
+	return strings.TrimSpace(signature.HTML) == "" && strings.TrimSpace(signature.Text) == ""
+}
+
+func gmailEmailHasSignature(message map[string]any) bool {
+	bodyHTML := strings.ToLower(stringFromAny(message["body_html"]))
+	bodyText := strings.ReplaceAll(stringFromAny(message["body_text"]), "\r\n", "\n")
+	return strings.Contains(bodyHTML, "gmail_signature") ||
+		strings.Contains(bodyHTML, "zach@hackclub.com") && strings.Contains(bodyHTML, "hackclub.com/donate") ||
+		strings.Contains(bodyText, "\n--\n") ||
+		strings.HasPrefix(strings.TrimSpace(bodyText), "--\n")
+}
+
+func appendGmailSignatureToMessage(message map[string]any, signature gmailSignature) map[string]any {
+	out := cloneMap(message)
+	bodyText := stringFromAny(out["body_text"])
+	bodyHTML := strings.TrimSpace(stringFromAny(out["body_html"]))
+	signatureHTML := strings.TrimSpace(signature.HTML)
+	signatureText := strings.TrimSpace(signature.Text)
+	if signatureText == "" && signatureHTML != "" {
+		signatureText = htmlFragmentText(signatureHTML)
+	}
+	if bodyHTML == "" && signatureHTML != "" {
+		bodyHTML = emailPlainTextToHTML(bodyText)
+	}
+	if signatureHTML != "" {
+		out["body_html"] = joinEmailHTML(bodyHTML, signatureHTML)
+	}
+	if signatureText != "" {
+		out["body_text"] = joinEmailText(bodyText, signatureText)
+	}
+	return out
+}
+
+func joinEmailHTML(bodyHTML string, signatureHTML string) string {
+	bodyHTML = strings.TrimSpace(bodyHTML)
+	signatureHTML = strings.TrimSpace(signatureHTML)
+	if bodyHTML == "" {
+		return signatureHTML
+	}
+	if signatureHTML == "" {
+		return bodyHTML
+	}
+	return bodyHTML + `<div><br></div>` + signatureHTML
+}
+
+func joinEmailText(bodyText string, signatureText string) string {
+	bodyText = strings.TrimRight(strings.ReplaceAll(bodyText, "\r\n", "\n"), "\n")
+	signatureText = strings.TrimSpace(strings.ReplaceAll(signatureText, "\r\n", "\n"))
+	if bodyText == "" {
+		return signatureText + "\n"
+	}
+	if signatureText == "" {
+		return bodyText + "\n"
+	}
+	return bodyText + "\n\n" + signatureText + "\n"
+}
+
+func emailPlainTextToHTML(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "<div><br></div>"
+	}
+	paragraphs := strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n\n")
+	out := strings.Builder{}
+	for paragraphIndex, paragraph := range paragraphs {
+		lines := normalizeStringSlice(strings.Split(paragraph, "\n"))
+		if len(lines) == 0 {
+			continue
+		}
+		if out.Len() > 0 && paragraphIndex > 0 {
+			out.WriteString("<div><br></div>")
+		}
+		out.WriteString("<div>")
+		for index, line := range lines {
+			if index > 0 {
+				out.WriteString("<br>")
+			}
+			out.WriteString(html.EscapeString(line))
+		}
+		out.WriteString("</div>")
+	}
+	if out.Len() == 0 {
+		return "<div><br></div>"
+	}
+	return out.String()
+}
+
+func extractGmailSignatureHTML(bodyHTML string) string {
+	lower := strings.ToLower(bodyHTML)
+	marker := strings.Index(lower, "gmail_signature")
+	if marker < 0 {
+		return ""
+	}
+	start := strings.LastIndex(lower[:marker], "<div")
+	if start < 0 {
+		return ""
+	}
+	end := matchingDivEnd(lower, start)
+	if end <= start || end > len(bodyHTML) {
+		return ""
+	}
+	return strings.TrimSpace(bodyHTML[start:end])
+}
+
+func matchingDivEnd(lowerHTML string, start int) int {
+	depth := 0
+	cursor := start
+	for cursor < len(lowerHTML) {
+		nextOpen := strings.Index(lowerHTML[cursor:], "<div")
+		nextClose := strings.Index(lowerHTML[cursor:], "</div")
+		if nextOpen < 0 && nextClose < 0 {
+			return -1
+		}
+		if nextOpen >= 0 && (nextClose < 0 || nextOpen < nextClose) {
+			depth++
+			cursor += nextOpen + len("<div")
+			continue
+		}
+		depth--
+		cursor += nextClose
+		tagEnd := strings.Index(lowerHTML[cursor:], ">")
+		if tagEnd < 0 {
+			return -1
+		}
+		cursor += tagEnd + 1
+		if depth == 0 {
+			return cursor
+		}
+	}
+	return -1
+}
+
+func extractGmailSignatureText(bodyText string) string {
+	bodyText = strings.ReplaceAll(bodyText, "\r\n", "\n")
+	for _, delimiter := range []string{"\n--\n", "\n-- \n"} {
+		index := strings.Index(bodyText, delimiter)
+		if index < 0 {
+			continue
+		}
+		signature := bodyText[index+1:]
+		if quoteIndex := strings.Index(signature, "\nOn "); quoteIndex >= 0 && strings.Contains(signature[quoteIndex:], " wrote:") {
+			signature = signature[:quoteIndex]
+		}
+		return strings.TrimSpace(signature)
+	}
+	return ""
+}
+
+func htmlFragmentText(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	lower := strings.ToLower(value)
+	out := strings.Builder{}
+	for index := 0; index < len(value); {
+		if value[index] != '<' {
+			out.WriteByte(value[index])
+			index++
+			continue
+		}
+		end := strings.IndexByte(value[index:], '>')
+		if end < 0 {
+			break
+		}
+		tag := lower[index : index+end+1]
+		if strings.HasPrefix(tag, "<br") || strings.HasPrefix(tag, "</div") || strings.HasPrefix(tag, "</p") {
+			out.WriteByte('\n')
+		}
+		index += end + 1
+	}
+	lines := normalizeStringSlice(strings.Split(html.UnescapeString(out.String()), "\n"))
+	return strings.Join(lines, "\n")
+}
+
 func emailPreviewMode(message map[string]any) string {
 	if strings.TrimSpace(stringFromAny(message["reply_to_thread_id"])) != "" {
 		return "reply"
 	}
 	return "new_thread"
+}
+
+func gmailEmailRequestTitle(deliveryMode string, message map[string]any) string {
+	if deliveryMode == "draft" {
+		subject := strings.TrimSpace(stringFromAny(message["subject"]))
+		if subject == "" {
+			return "Create draft"
+		}
+		return "Create draft: " + subject
+	}
+	return emailRequestTitle(message)
 }
 
 func contactMutationTitle(operation map[string]any, index int) string {
@@ -772,6 +1155,23 @@ func pendingMutationIDsForUpdate(ctx context.Context, tx *sql.Tx, requestID stri
 		return nil, err
 	}
 	return ids, nil
+}
+
+func mutationForUpdate(ctx context.Context, tx *sql.Tx, requestID string, mutationID string) (Mutation, error) {
+	row := tx.QueryRowContext(ctx, `
+		SELECT id, request_id, request_index, provider, operation, account, status, title, reason,
+		       payload_json, preview_json, result_json, error, idempotency_key, revision, attempt_count,
+		       requested_by, approved_by, claimed_by, claimed_at, created_at, updated_at, approved_at,
+		       executed_at, observed_at
+		FROM upstream_mutations
+		WHERE request_id = $1 AND id = $2
+		FOR UPDATE
+	`, requestID, mutationID)
+	mutation, err := scanMutation(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Mutation{}, ErrNotFound
+	}
+	return mutation, err
 }
 
 func appendRequestEvent(ctx context.Context, tx *sql.Tx, requestID string, eventType string, actorType string, actorID string, event map[string]any) error {

@@ -12,11 +12,20 @@ import (
 	"html"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
 
 const sessionCookieName = "pdw_mutation_ui_session"
+
+var (
+	gmailSignatureScriptPattern                    = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script\s*>`)
+	gmailSignatureEventAttrPattern                 = regexp.MustCompile(`(?is)\s+on[a-z0-9_-]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)`)
+	gmailSignatureDoubleQuotedJavascriptURLPattern = regexp.MustCompile(`(?is)(\s+(?:href|src)\s*=\s*)"\s*javascript:[^"]*"`)
+	gmailSignatureSingleQuotedJavascriptURLPattern = regexp.MustCompile(`(?is)(\s+(?:href|src)\s*=\s*)'\s*javascript:[^']*'`)
+	gmailSignatureUnquotedJavascriptURLPattern     = regexp.MustCompile(`(?is)(\s+(?:href|src)\s*=\s*)javascript:[^\s>]+`)
+)
 
 type sessionPayload struct {
 	Subject string `json:"sub"`
@@ -94,6 +103,27 @@ func (s *Service) handleRequestRoute(w http.ResponseWriter, r *http.Request, ses
 	}
 	if len(parts) == 1 && r.Method == http.MethodGet {
 		s.renderRequestDetail(w, r, session, requestID, "")
+		return
+	}
+	if len(parts) == 4 && parts[1] == "mutations" && parts[3] == "update-email" && r.Method == http.MethodPost {
+		if !s.validCSRF(r, session) {
+			http.Error(w, "invalid csrf token", http.StatusForbidden)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "invalid form", http.StatusBadRequest)
+			return
+		}
+		mutationID, err := url.PathUnescape(parts[2])
+		if err != nil || mutationID == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if _, err := s.store.UpdateGmailEmailMutation(r.Context(), requestID, mutationID, gmailEmailUpdateInputFromForm(r), reviewerActorID); err != nil {
+			s.renderRequestDetail(w, r, session, requestID, err.Error())
+			return
+		}
+		http.Redirect(w, r, ReviewPath+"/requests/"+url.PathEscape(requestID), http.StatusSeeOther)
 		return
 	}
 	if len(parts) == 2 && r.Method == http.MethodPost {
@@ -254,7 +284,7 @@ func (s *Service) renderRequestDetail(w http.ResponseWriter, r *http.Request, se
 		fmt.Fprintf(w, `<form class="actions" method="post" action="%s/requests/%s/reject"><input type="hidden" name="csrf_token" value="%s"><input name="reason" placeholder="Reason"><button type="submit">Deny</button></form>`, ReviewPath, url.PathEscape(request.ID), html.EscapeString(session.CSRF))
 	}
 	fmt.Fprint(w, `</section><section><h2>Mutations</h2>`)
-	renderMutationList(w, request.Mutations)
+	renderMutationList(w, request.Mutations, request.ID, request.Status, session.CSRF)
 	fmt.Fprint(w, `</section></main>`)
 	writeHTMLFooter(w)
 }
@@ -278,7 +308,7 @@ type mutationRenderItem struct {
 	Mutation  *Mutation
 }
 
-func renderMutationList(w http.ResponseWriter, mutations []Mutation) {
+func renderMutationList(w http.ResponseWriter, mutations []Mutation, requestID string, requestStatus string, csrf string) {
 	gmailGroups := map[string]*gmailMutationGroup{}
 	contactGroups := map[string]*contactMutationGroup{}
 	items := []mutationRenderItem{}
@@ -328,12 +358,16 @@ func renderMutationList(w http.ResponseWriter, mutations []Mutation) {
 			continue
 		}
 		if item.Mutation != nil {
-			renderMutationArticle(w, *item.Mutation)
+			renderMutationArticle(w, *item.Mutation, requestID, requestStatus, csrf)
 		}
 	}
 }
 
-func renderMutationArticle(w http.ResponseWriter, mutation Mutation) {
+func renderMutationArticle(w http.ResponseWriter, mutation Mutation, requestID string, requestStatus string, csrf string) {
+	if isGmailEmailMutation(mutation) {
+		renderGmailEmailMutation(w, mutation, requestID, requestStatus, csrf)
+		return
+	}
 	fmt.Fprintf(w, `<article class="mutation"><h3>%s</h3><p class="mutation-meta">%s %s for %s</p><pre>%s</pre><pre>%s</pre></article>`,
 		html.EscapeString(mutation.Title),
 		html.EscapeString(mutation.Status),
@@ -346,6 +380,288 @@ func renderMutationArticle(w http.ResponseWriter, mutation Mutation) {
 
 func isContactMutation(mutation Mutation) bool {
 	return mutation.Provider == "google_people" || mutation.Operation == ContactsBatchMutationOperation || mutation.Operation == GooglePeopleContactsOperation
+}
+
+func isGmailEmailMutation(mutation Mutation) bool {
+	return mutation.Provider == "gmail" && mutation.Operation == GmailSendEmailOperation
+}
+
+func renderGmailEmailMutation(w http.ResponseWriter, mutation Mutation, requestID string, requestStatus string, csrf string) {
+	email := gmailEmailPreview(mutation)
+	deliveryMode := gmailEmailDeliveryMode(mutation, email)
+	pending := requestStatus == "pending_review" && mutation.Status == "pending_review"
+	fmt.Fprintf(w, `<article class="mutation gmail-email-mutation"><div class="mutation-head"><div><p class="eyebrow">Gmail Email</p><h3>%s</h3></div><span class="pill">%s</span></div>`,
+		html.EscapeString(gmailEmailTitle(deliveryMode)),
+		html.EscapeString(mutation.Status),
+	)
+	fmt.Fprintf(w, `<p class="mutation-meta">%s for %s</p>`, html.EscapeString(mutation.Operation), html.EscapeString(mutation.Account))
+	fmt.Fprintf(w, `<p class="mutation-reason">%s</p>`, html.EscapeString(gmailEmailActionText(deliveryMode)))
+	if pending {
+		renderGmailEmailEditForm(w, mutation, requestID, email, deliveryMode, csrf)
+	} else {
+		renderGmailEmailReadOnly(w, email, deliveryMode)
+	}
+	fmt.Fprint(w, `</article>`)
+}
+
+func gmailEmailPreview(mutation Mutation) map[string]any {
+	email := mapFromAny(mapFromAny(mutation.Payload)["message"])
+	preview := mapFromAny(mutation.Preview["email"])
+	for key, value := range preview {
+		email[key] = value
+	}
+	return email
+}
+
+func gmailEmailDeliveryMode(mutation Mutation, email map[string]any) string {
+	payload := mapFromAny(mutation.Payload)
+	mode := strings.TrimSpace(stringFromAny(payload["delivery_mode"]))
+	if mode == "" {
+		mode = strings.TrimSpace(stringFromAny(email["delivery_mode"]))
+	}
+	if mode == "draft" {
+		return "draft"
+	}
+	return "send"
+}
+
+func gmailEmailTitle(deliveryMode string) string {
+	if deliveryMode == "draft" {
+		return "Create Gmail draft"
+	}
+	return "Send Gmail email"
+}
+
+func gmailEmailActionText(deliveryMode string) string {
+	if deliveryMode == "draft" {
+		return "Creates a Gmail draft after approval."
+	}
+	return "Will send this email after approval."
+}
+
+func renderGmailEmailEditForm(w http.ResponseWriter, mutation Mutation, requestID string, email map[string]any, deliveryMode string, csrf string) {
+	action := ReviewPath + "/requests/" + url.PathEscape(requestID) + "/mutations/" + url.PathEscape(mutation.ID) + "/update-email"
+	bodyHTML := strings.TrimSpace(stringFromAny(email["body_html"]))
+	bodyText := stringFromAny(email["body_text"])
+	if bodyHTML == "" {
+		bodyHTML = emailPlainTextToHTML(bodyText)
+	}
+	editorBodyHTML, signatureHTML := splitEmailBodyAndSignatureHTML(bodyHTML)
+	fmt.Fprintf(w, `<form class="gmail-email-form" method="post" action="%s">`, action)
+	fmt.Fprintf(w, `<input type="hidden" name="csrf_token" value="%s">`, html.EscapeString(csrf))
+	fmt.Fprint(w, `<div class="gmail-email-delivery" role="group" aria-label="Delivery mode">`)
+	renderDeliveryModeOption(w, "send", "Send email", deliveryMode == "send")
+	renderDeliveryModeOption(w, "draft", "Create draft", deliveryMode == "draft")
+	fmt.Fprint(w, `</div>`)
+	fmt.Fprintf(w, `<div class="gmail-email-fields"><label>To<input name="to" value="%s"></label>`, html.EscapeString(strings.Join(stringSliceFromAny(email["to"]), ", ")))
+	fmt.Fprintf(w, `<label>Cc<input name="cc" value="%s"></label>`, html.EscapeString(strings.Join(stringSliceFromAny(email["cc"]), ", ")))
+	fmt.Fprintf(w, `<label>Bcc<input name="bcc" value="%s"></label>`, html.EscapeString(strings.Join(stringSliceFromAny(email["bcc"]), ", ")))
+	fmt.Fprintf(w, `<label>Subject<input name="subject" value="%s"></label></div>`, html.EscapeString(stringFromAny(email["subject"])))
+	fmt.Fprintf(w, `<input type="hidden" name="reply_to_thread_id" value="%s">`, html.EscapeString(stringFromAny(email["reply_to_thread_id"])))
+	fmt.Fprintf(w, `<input type="hidden" name="in_reply_to" value="%s">`, html.EscapeString(stringFromAny(email["in_reply_to"])))
+	fmt.Fprintf(w, `<input type="hidden" name="references" value="%s">`, html.EscapeString(strings.Join(stringSliceFromAny(email["references"]), "\n")))
+	fmt.Fprintf(w, `<input type="hidden" name="body_text" value="%s">`, html.EscapeString(bodyText))
+	fmt.Fprintf(w, `<input type="hidden" name="body_html" value="%s">`, html.EscapeString(bodyHTML))
+	fmt.Fprint(w, `<div class="gmail-email-editor-wrap"><div class="gmail-email-toolbar" aria-label="Formatting toolbar"><button type="button" data-command="bold" aria-label="Bold"><strong>B</strong></button><button type="button" data-command="italic" aria-label="Italic"><em>I</em></button><button type="button" data-command="bulletList" aria-label="Bulleted list">Bullets</button><button type="button" data-command="orderedList" aria-label="Numbered list">1.</button></div>`)
+	fmt.Fprintf(w, `<div class="gmail-email-editor" data-tiptap-editor data-initial-html="%s"></div>`, html.EscapeString(editorBodyHTML))
+	if signatureHTML != "" {
+		fmt.Fprintf(w, `<div class="gmail-email-signature-preview" data-gmail-signature-preview>%s</div>`, sanitizeGmailSignaturePreviewHTML(signatureHTML))
+	}
+	fmt.Fprint(w, `</div>`)
+	fmt.Fprint(w, `<div class="gmail-email-actions"><button type="submit">Save email changes</button><button type="submit" name="set_delivery_mode" value="draft">Save as draft instead</button></div>`)
+	fmt.Fprint(w, `</form>`)
+	writeTiptapScript(w)
+}
+
+func sanitizeGmailSignaturePreviewHTML(value string) string {
+	value = gmailSignatureScriptPattern.ReplaceAllString(value, "")
+	value = gmailSignatureEventAttrPattern.ReplaceAllString(value, "")
+	value = gmailSignatureDoubleQuotedJavascriptURLPattern.ReplaceAllString(value, `${1}"#"`)
+	value = gmailSignatureSingleQuotedJavascriptURLPattern.ReplaceAllString(value, `${1}'#'`)
+	value = gmailSignatureUnquotedJavascriptURLPattern.ReplaceAllString(value, `${1}#`)
+	return value
+}
+
+func renderDeliveryModeOption(w http.ResponseWriter, value string, label string, checked bool) {
+	checkedAttr := ""
+	if checked {
+		checkedAttr = " checked"
+	}
+	fmt.Fprintf(w, `<label class="delivery-option"><input type="radio" name="delivery_mode" value="%s"%s><span>%s</span></label>`, html.EscapeString(value), checkedAttr, html.EscapeString(label))
+}
+
+func splitEmailBodyAndSignatureHTML(bodyHTML string) (string, string) {
+	signatureHTML := extractGmailSignatureHTML(bodyHTML)
+	if signatureHTML == "" {
+		return bodyHTML, ""
+	}
+	index := strings.Index(bodyHTML, signatureHTML)
+	if index < 0 {
+		return bodyHTML, ""
+	}
+	body := strings.TrimSpace(bodyHTML[:index])
+	body = trimTrailingSignatureSeparatorHTML(body)
+	if body == "" {
+		body = "<div><br></div>"
+	}
+	return body, signatureHTML
+}
+
+func trimTrailingSignatureSeparatorHTML(bodyHTML string) string {
+	bodyHTML = strings.TrimSpace(bodyHTML)
+	for {
+		trimmed := strings.TrimSpace(bodyHTML)
+		next := strings.TrimSpace(strings.TrimSuffix(trimmed, "<div><br></div>"))
+		next = strings.TrimSpace(strings.TrimSuffix(next, "<div><br/></div>"))
+		next = strings.TrimSpace(strings.TrimSuffix(next, "<br>"))
+		next = strings.TrimSpace(strings.TrimSuffix(next, "<br/>"))
+		next = strings.TrimSpace(strings.TrimSuffix(next, "<br />"))
+		if next == trimmed {
+			return trimmed
+		}
+		bodyHTML = next
+	}
+}
+
+func renderGmailEmailReadOnly(w http.ResponseWriter, email map[string]any, deliveryMode string) {
+	fmt.Fprint(w, `<div class="gmail-email-readonly">`)
+	fmt.Fprintf(w, `<dl><dt>Delivery</dt><dd>%s</dd><dt>To</dt><dd>%s</dd><dt>Cc</dt><dd>%s</dd><dt>Bcc</dt><dd>%s</dd><dt>Subject</dt><dd>%s</dd></dl>`,
+		html.EscapeString(deliveryMode),
+		html.EscapeString(strings.Join(stringSliceFromAny(email["to"]), ", ")),
+		html.EscapeString(strings.Join(stringSliceFromAny(email["cc"]), ", ")),
+		html.EscapeString(strings.Join(stringSliceFromAny(email["bcc"]), ", ")),
+		html.EscapeString(stringFromAny(email["subject"])),
+	)
+	bodyHTML := strings.TrimSpace(stringFromAny(email["body_html"]))
+	if bodyHTML == "" {
+		bodyHTML = emailPlainTextToHTML(stringFromAny(email["body_text"]))
+	}
+	fmt.Fprintf(w, `<iframe class="gmail-email-body-frame" sandbox referrerpolicy="no-referrer" srcdoc="%s"></iframe>`, html.EscapeString(emailHTMLDocument(bodyHTML)))
+	fmt.Fprint(w, `</div>`)
+}
+
+func writeTiptapScript(w http.ResponseWriter) {
+	fmt.Fprint(w, `<script type="module">
+import { Editor } from "https://esm.sh/@tiptap/core@3.23.6";
+import StarterKit from "https://esm.sh/@tiptap/starter-kit@3.23.6";
+import Link from "https://esm.sh/@tiptap/extension-link@3.23.6";
+import { TextStyleKit } from "https://esm.sh/@tiptap/extension-text-style@3.23.6";
+function syncEmailEditor(editor, form) {
+  const htmlInput = form.querySelector('input[name="body_html"]');
+  const textInput = form.querySelector('input[name="body_text"]');
+  const signature = form.querySelector("[data-gmail-signature-preview]");
+  const editorHTML = stripTrailingEmptyParagraphs(editor.getHTML());
+  const signatureHTML = signature ? signature.innerHTML.trim() : "";
+  if (htmlInput) htmlInput.value = signatureHTML ? editorHTML + "<div><br></div>" + signatureHTML : editorHTML;
+  if (textInput) {
+    const bodyText = editor.getText({ blockSeparator: "\n\n" }).trimEnd();
+    const signatureText = signature ? normalizeEmailText(signature.innerText) : "";
+    textInput.value = signatureText ? bodyText + "\n\n" + signatureText + "\n" : bodyText;
+  }
+}
+function stripTrailingEmptyParagraphs(value) {
+  const template = document.createElement("template");
+  template.innerHTML = value || "";
+  while (template.content.lastElementChild?.textContent.trim() === "" && !template.content.lastElementChild.querySelector("img")) {
+    template.content.lastElementChild.remove();
+  }
+  return template.innerHTML.trim() || "<div><br></div>";
+}
+function normalizeEmailText(value) {
+  return (value || "").replace(/\r\n/g, "\n").split("\n").map((line) => line.trimEnd()).filter((line, index, lines) => line.trim() !== "" || (index > 0 && index < lines.length - 1)).join("\n").trim();
+}
+function normalizeInitialEmailHTML(value) {
+  const template = document.createElement("template");
+  template.innerHTML = value || "<p></p>";
+  template.content.querySelectorAll("font").forEach((font) => {
+    const span = document.createElement("span");
+    const styles = [];
+    if (font.getAttribute("face")) styles.push("font-family: " + font.getAttribute("face"));
+    if (font.getAttribute("color")) styles.push("color: " + font.getAttribute("color"));
+    if (font.getAttribute("style")) styles.push(font.getAttribute("style"));
+    if (styles.length) span.setAttribute("style", styles.join("; "));
+    while (font.firstChild) span.appendChild(font.firstChild);
+    font.replaceWith(span);
+  });
+  template.content.querySelectorAll("div").forEach((div) => {
+    if (div.textContent.trim() !== "--") return;
+    div.querySelectorAll("br").forEach((br) => br.remove());
+  });
+  template.content.querySelectorAll("div").forEach((div) => {
+    if (div.classList.contains("gmail_signature")) return;
+    if (div.textContent.trim() === "" && !div.querySelector("img")) div.remove();
+  });
+  template.content.querySelectorAll("br").forEach((br) => {
+    const next = br.nextElementSibling;
+    if (next?.classList?.contains("gmail_signature")) br.remove();
+  });
+  return template.innerHTML;
+}
+function initEmailEditor(root) {
+  if (root.dataset.ready === "true") return;
+  root.dataset.ready = "true";
+  const form = root.closest("form");
+  const toolbar = form.querySelector(".gmail-email-toolbar");
+  let bodyDirty = false;
+  const editor = new Editor({
+    element: root,
+    extensions: [StarterKit, TextStyleKit, Link.configure({ openOnClick: false })],
+    content: normalizeInitialEmailHTML(root.dataset.initialHtml),
+    editorProps: { attributes: { class: "gmail-email-editor-surface" } },
+    onUpdate: ({ editor }) => {
+      bodyDirty = true;
+      syncEmailEditor(editor, form);
+    }
+  });
+  toolbar?.querySelectorAll("[data-command]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const command = button.dataset.command;
+      if (command === "bold") editor.chain().focus().toggleBold().run();
+      if (command === "italic") editor.chain().focus().toggleItalic().run();
+      if (command === "bulletList") editor.chain().focus().toggleBulletList().run();
+      if (command === "orderedList") editor.chain().focus().toggleOrderedList().run();
+      bodyDirty = true;
+      syncEmailEditor(editor, form);
+    });
+  });
+  form.addEventListener("submit", () => {
+    if (bodyDirty) syncEmailEditor(editor, form);
+  });
+}
+document.querySelectorAll("[data-tiptap-editor]").forEach(initEmailEditor);
+</script>`)
+}
+
+func gmailEmailUpdateInputFromForm(r *http.Request) UpdateGmailEmailMutationInput {
+	deliveryMode := strings.TrimSpace(r.FormValue("set_delivery_mode"))
+	if deliveryMode == "" {
+		deliveryMode = r.FormValue("delivery_mode")
+	}
+	message := map[string]any{
+		"to":        splitEmailAddressList(r.FormValue("to")),
+		"cc":        splitEmailAddressList(r.FormValue("cc")),
+		"bcc":       splitEmailAddressList(r.FormValue("bcc")),
+		"subject":   strings.TrimSpace(r.FormValue("subject")),
+		"body_text": r.FormValue("body_text"),
+		"body_html": r.FormValue("body_html"),
+	}
+	if replyToThreadID := strings.TrimSpace(r.FormValue("reply_to_thread_id")); replyToThreadID != "" {
+		message["reply_to_thread_id"] = replyToThreadID
+	}
+	if inReplyTo := strings.TrimSpace(r.FormValue("in_reply_to")); inReplyTo != "" {
+		message["in_reply_to"] = inReplyTo
+	}
+	if references := splitEmailAddressList(r.FormValue("references")); len(references) > 0 {
+		message["references"] = references
+	}
+	return UpdateGmailEmailMutationInput{DeliveryMode: deliveryMode, Message: message}
+}
+
+func splitEmailAddressList(value string) []string {
+	fields := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	})
+	return normalizeStringSlice(fields)
 }
 
 func renderGmailMutationGroup(w http.ResponseWriter, group *gmailMutationGroup) {
@@ -363,6 +679,7 @@ func renderGmailMutationGroup(w http.ResponseWriter, group *gmailMutationGroup) 
 		html.EscapeString(gmailMutationGroupStatus(group.Status, len(group.Mutations))),
 	)
 	fmt.Fprintf(w, `<p class="mutation-meta">%s for %s</p>`, html.EscapeString(group.Operation), html.EscapeString(group.Account))
+	fmt.Fprintf(w, `<p class="mutation-reason">%s</p>`, html.EscapeString(gmailMutationGroupActionText(group.Operation, len(threadGroups))))
 
 	fmt.Fprint(w, `<div class="gmail-thread-list">`)
 	for _, thread := range threadGroups {
@@ -387,6 +704,23 @@ func gmailMutationGroupThreads(mutations []Mutation) []map[string]any {
 
 func gmailMutationGroupTitle(verb string, threadCount int) string {
 	return fmt.Sprintf("%s %d Gmail thread%s", verb, threadCount, plural(threadCount))
+}
+
+func gmailMutationGroupActionText(operation string, threadCount int) string {
+	threadNoun := "thread"
+	if threadCount != 1 {
+		threadNoun = "threads"
+	}
+	if operation == GmailUnarchiveOperation {
+		if threadCount == 1 {
+			return "Restores this thread to the Inbox."
+		}
+		return "Restores these " + threadNoun + " to the Inbox."
+	}
+	if threadCount == 1 {
+		return "Removes this thread from the Inbox."
+	}
+	return "Removes these " + threadNoun + " from the Inbox."
 }
 
 func gmailMutationGroupStatus(status string, mutationCount int) string {
@@ -1212,8 +1546,9 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f2ee;padding:10px;
 .gmail-label{background:#e8eaed;color:#3c4043;border-radius:4px;padding:2px 6px;font-size:12px;font-weight:500}.gmail-thread-meta{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:#5f6368;font-size:12px}.thread-id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#80868b}
 .gmail-expanded{border-top:1px solid #e8eaed;background:#fff}.gmail-expanded-subject{display:flex;align-items:center;gap:18px;padding:18px 28px 8px 76px}.gmail-expanded-subject h4{font-size:22px;font-weight:400;margin:0;color:#202124}
 .gmail-messages{padding:0 0 18px}.gmail-message{border-top:1px solid #f1f3f4}.gmail-message summary{list-style:none}.gmail-message summary::-webkit-details-marker{display:none}.gmail-message-summary{display:grid;grid-template-columns:48px minmax(0,1fr);gap:14px;padding:18px 28px;cursor:pointer}.gmail-message-summary:hover{background:#f8fafd}.gmail-avatar{width:40px;height:40px;border-radius:50%%;background:#5e7ce2;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.gmail-message-summary-main{min-width:0}.gmail-message-header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.gmail-message-header strong{display:inline;font-size:15px}.gmail-message-header time{color:#5f6368;font-size:13px;white-space:nowrap}.gmail-to{display:block;color:#5f6368;font-size:12px;margin-top:3px}.gmail-message-preview{margin:8px 0 0;color:#5f6368;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.gmail-message[open] .gmail-message-preview{display:none}.gmail-message-body{padding:0 28px 22px 90px}.gmail-message-body p{margin:8px 0 0;color:#3c4043;line-height:1.45;white-space:pre-wrap}.gmail-body-frame{display:block;width:100%%;height:760px;border:0;background:white}.gmail-quoted{margin-top:14px;border-left:3px solid #dadce0;padding-left:12px}.gmail-quoted>summary{color:#5f6368;cursor:pointer;font-size:13px;margin-bottom:8px}.gmail-body-frame.quoted{height:520px}.raw-json{border-top:1px solid #e8eaed;padding-top:12px;margin-bottom:16px}.raw-json summary{color:#5f6368;cursor:pointer}
+.gmail-email-mutation{padding:0;overflow:hidden}.gmail-email-mutation>.mutation-head,.gmail-email-mutation>.mutation-meta,.gmail-email-mutation>.mutation-reason,.gmail-email-mutation>.gmail-email-form,.gmail-email-mutation>.gmail-email-readonly{margin-left:16px;margin-right:16px}.gmail-email-mutation>.mutation-head{margin-top:16px}.gmail-email-form{display:grid;gap:12px;margin-top:14px;margin-bottom:16px}.gmail-email-delivery{display:flex;gap:8px;flex-wrap:wrap}.delivery-option{display:flex;align-items:center;gap:7px;margin:0;border:1px solid #dadce0;border-radius:6px;padding:7px 10px;background:#fff;color:#3c4043;font-weight:600}.delivery-option:has(input:checked){border-color:#1a73e8;background:#e8f0fe;color:#174ea6}.delivery-option input{margin:0}.gmail-email-fields{border:1px solid #dadce0;border-radius:6px;background:#fff}.gmail-email-fields label{display:grid;grid-template-columns:72px minmax(0,1fr);gap:12px;align-items:center;margin:0;padding:10px 12px;border-top:1px solid #eef0f2;color:#5f6368;font-size:13px}.gmail-email-fields label:first-child{border-top:0}.gmail-email-fields input{border:0;border-radius:0;padding:0;font:inherit;color:#202124;min-width:0}.gmail-email-fields input:focus{outline:0}.gmail-email-editor-wrap{border:1px solid #dadce0;border-radius:6px;background:#fff;overflow:hidden}.gmail-email-toolbar{display:flex;gap:4px;align-items:center;border-bottom:1px solid #e8eaed;background:#f8fafd;padding:6px}.gmail-email-toolbar button{background:#fff;color:#3c4043;border:1px solid #dadce0;padding:5px 8px;min-width:30px}.gmail-email-editor-surface{min-height:180px;padding:14px;outline:none;line-height:1.45}.gmail-email-editor:has(+ .gmail-email-signature-preview) .gmail-email-editor-surface{min-height:0;padding-bottom:6px}.gmail-email-editor-surface p{margin:0 0 10px}.gmail-email-editor-surface ul,.gmail-email-editor-surface ol{margin:8px 0 8px 22px;padding:0}.gmail-email-signature-preview{padding:0 14px 14px;color:#202124;line-height:normal}.gmail-email-signature-preview div{margin:0}.gmail-email-signature-preview div[dir=ltr]>span:first-child+br{display:none}.gmail-email-signature-preview a{color:#1a73e8}.gmail-email-actions{display:flex;gap:8px;flex-wrap:wrap}.gmail-email-actions button[name=set_delivery_mode]{background:#137333}.gmail-email-readonly{display:grid;gap:12px;margin-top:14px;margin-bottom:16px}.gmail-email-readonly dl{display:grid;grid-template-columns:86px minmax(0,1fr);gap:8px 12px;margin:0;border:1px solid #dadce0;border-radius:6px;padding:12px;background:#fff}.gmail-email-readonly dt{color:#5f6368}.gmail-email-readonly dd{margin:0;overflow-wrap:anywhere}.gmail-email-body-frame{width:100%%;height:360px;border:1px solid #dadce0;border-radius:6px;background:#fff}
 .contact-mutation{padding:0;overflow:hidden}.contact-mutation>.mutation-head,.contact-mutation>.mutation-meta{margin-left:16px;margin-right:16px}.contact-mutation>.mutation-head{margin-top:16px}.contact-operations{border-top:1px solid #dfe1e5;margin-top:16px}.contact-operation{border-top:1px solid #f1f3f4;padding:18px 16px}.contact-operation:first-child{border-top:0}.contact-operation.destructive{box-shadow:inset 3px 0 #c5221f}.contact-operation-main{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:flex-start}.contact-avatar{width:40px;height:40px;border-radius:50%%;background:#137333;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.contact-operation.destructive .contact-avatar{background:#c5221f}.contact-operation-copy{min-width:0}.contact-operation-copy h4{margin:2px 0 4px;font-size:18px}.contact-op{margin:0;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.contact-meta{display:flex;flex-wrap:wrap;gap:8px;color:#5f6368;font-size:13px}.contact-effect,.contact-resource{margin:8px 0 0;color:#3c4043}.contact-effect code,.contact-resource code{background:#f1f3f4;border-radius:4px;padding:2px 5px}.contact-diff{margin-top:12px;border:1px solid #e8eaed;border-radius:6px;background:white}.contact-inline-row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;border-top:1px solid #eef0f2;padding:10px 12px}.contact-inline-row:first-child{border-top:0}.contact-inline-row>code{background:#f8fafd;border-radius:4px;padding:4px 6px;justify-self:start}.contact-inline-change{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.contact-inline-old,.contact-inline-new,.contact-inline-unchanged{border-radius:4px;padding:3px 6px;overflow-wrap:anywhere}.contact-inline-old{background:#fce8e6;color:#8c1d18;text-decoration:line-through;text-decoration-thickness:2px}.contact-inline-new{background:#e6f4ea;color:#137333;text-decoration:none}.contact-inline-arrow{color:#5f6368}.contact-diff-empty{margin:0;padding:12px;color:#5f6368}.contact-person-block{margin-top:12px;border-top:1px solid #e8eaed;padding-top:12px}.contact-block-title{margin:0 0 8px;font-weight:700}.contact-person-block dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;margin:0}.contact-person-block dt{color:#5f6368}.contact-person-block dd{margin:0}.contact-operation .raw-json{margin-bottom:0}
-@media (max-width:760px){main{padding:16px}.gmail-row{grid-template-columns:20px 20px minmax(0,1fr) 56px;gap:8px}.gmail-important,.gmail-list-labels{display:none}.gmail-sender{grid-column:3}.gmail-subject{grid-column:3 / 5;white-space:normal}.gmail-date{grid-column:4;grid-row:1}.gmail-expanded-subject{padding-left:18px;display:block}.gmail-message-summary{grid-template-columns:36px minmax(0,1fr);padding:18px}.gmail-message-body{padding-left:18px;padding-right:18px}.gmail-message-header{display:block}.gmail-message-header time{display:block;margin-top:4px}.gmail-body-frame{height:620px}.contact-operation-main{grid-template-columns:40px minmax(0,1fr)}.contact-operation-main>.pill{grid-column:2}.contact-person-block dl{grid-template-columns:1fr}.contact-inline-row{grid-template-columns:1fr;gap:8px}.contact-inline-change{align-items:flex-start}}
+@media (max-width:760px){main{padding:16px}.gmail-row{grid-template-columns:20px 20px minmax(0,1fr) 56px;gap:8px}.gmail-important,.gmail-list-labels{display:none}.gmail-sender{grid-column:3}.gmail-subject{grid-column:3 / 5;white-space:normal}.gmail-date{grid-column:4;grid-row:1}.gmail-expanded-subject{padding-left:18px;display:block}.gmail-message-summary{grid-template-columns:36px minmax(0,1fr);padding:18px}.gmail-message-body{padding-left:18px;padding-right:18px}.gmail-message-header{display:block}.gmail-message-header time{display:block;margin-top:4px}.gmail-body-frame{height:620px}.gmail-email-fields label,.gmail-email-readonly dl{grid-template-columns:1fr}.gmail-email-toolbar{flex-wrap:wrap}.contact-operation-main{grid-template-columns:40px minmax(0,1fr)}.contact-operation-main>.pill{grid-column:2}.contact-person-block dl{grid-template-columns:1fr}.contact-inline-row{grid-template-columns:1fr;gap:8px}.contact-inline-change{align-items:flex-start}}
 </style></head><body>`, html.EscapeString(title))
 }
 

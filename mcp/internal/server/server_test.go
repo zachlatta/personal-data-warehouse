@@ -40,6 +40,10 @@ func (s fakeMutationStore) GetRequest(context.Context, string) (mutations.Reques
 	return mutations.Request{}, mutations.ErrNotFound
 }
 
+func (s fakeMutationStore) UpdateGmailEmailMutation(context.Context, string, string, mutations.UpdateGmailEmailMutationInput, string) (mutations.Mutation, error) {
+	return mutations.Mutation{}, mutations.ErrNotFound
+}
+
 func (s fakeMutationStore) ApproveRequest(context.Context, string, string) (mutations.Request, error) {
 	return mutations.Request{}, mutations.ErrNotFound
 }

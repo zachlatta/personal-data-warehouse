@@ -12,9 +12,17 @@ import (
 )
 
 type reviewStore struct {
-	requests []Request
-	approved []string
-	rejected []string
+	requests     []Request
+	approved     []string
+	rejected     []string
+	emailUpdates []emailUpdateCall
+}
+
+type emailUpdateCall struct {
+	RequestID  string
+	MutationID string
+	Input      UpdateGmailEmailMutationInput
+	Actor      string
 }
 
 func (s *reviewStore) CreateRequest(context.Context, CreateRequestInput) (Request, error) {
@@ -32,6 +40,28 @@ func (s *reviewStore) GetRequest(_ context.Context, id string) (Request, error) 
 		}
 	}
 	return Request{}, ErrNotFound
+}
+
+func (s *reviewStore) UpdateGmailEmailMutation(_ context.Context, requestID string, mutationID string, input UpdateGmailEmailMutationInput, actor string) (Mutation, error) {
+	s.emailUpdates = append(s.emailUpdates, emailUpdateCall{RequestID: requestID, MutationID: mutationID, Input: input, Actor: actor})
+	for requestIndex := range s.requests {
+		if s.requests[requestIndex].ID != requestID {
+			continue
+		}
+		for mutationIndex := range s.requests[requestIndex].Mutations {
+			mutation := &s.requests[requestIndex].Mutations[mutationIndex]
+			if mutation.ID != mutationID {
+				continue
+			}
+			mutation.Payload["delivery_mode"] = input.DeliveryMode
+			mutation.Payload["message"] = cloneMap(input.Message)
+			previewEmail := cloneMap(input.Message)
+			previewEmail["delivery_mode"] = input.DeliveryMode
+			mutation.Preview["email"] = previewEmail
+			return *mutation, nil
+		}
+	}
+	return Mutation{}, ErrNotFound
 }
 
 func (s *reviewStore) ApproveRequest(_ context.Context, id string, actor string) (Request, error) {
@@ -301,6 +331,7 @@ func TestReviewUIRendersGmailThreadPreview(t *testing.T) {
 	body := detailResponse.Body.String()
 	for _, want := range []string{
 		"Archive 2 Gmail threads",
+		"Removes these threads from the Inbox.",
 		`<details class="gmail-thread">`,
 		`<summary class="gmail-row">`,
 		`class="gmail-body-frame"`,
@@ -342,6 +373,210 @@ func TestReviewUIRendersGmailThreadPreview(t *testing.T) {
 	}
 	if strings.Contains(body, "background:#f2f6fc") || strings.Contains(body, "inset 3px 0 #1a73e8") {
 		t.Fatalf("gmail thread rows should not use selected blue styling by default: %q", body)
+	}
+}
+
+func TestReviewUIRendersGmailUnarchiveThreadPreview(t *testing.T) {
+	store := &reviewStore{requests: []Request{{
+		ID:        "req-unarchive",
+		Status:    "pending_review",
+		Title:     "Restore client thread",
+		Reason:    "needs to return to inbox",
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+		Mutations: []Mutation{{
+			ID:        "mut-unarchive",
+			Provider:  "gmail",
+			Operation: GmailUnarchiveOperation,
+			Account:   "zach@example.test",
+			Status:    "pending_review",
+			Title:     "Unarchive: Client follow-up",
+			Reason:    "needs to return to inbox",
+			Payload:   map[string]any{"thread_ids": []any{"thread-unarchive"}},
+			Preview: map[string]any{
+				"thread_count": 1,
+				"threads": []any{map[string]any{
+					"thread_id":           "thread-unarchive",
+					"subject":             "Client follow-up",
+					"latest_from_address": "Alex <alex@example.test>",
+					"latest_at":           "2026-05-22T15:15:00Z",
+					"latest_preview":      "Can we bring this back into focus next week?",
+					"message_count":       1,
+					"inbox_message_count": 0,
+					"labels":              []any{"CATEGORY_UPDATES"},
+					"messages": []any{map[string]any{
+						"message_id":    "message-unarchive",
+						"from_address":  "Alex <alex@example.test>",
+						"to_addresses":  []any{"zach@example.test"},
+						"internal_date": "2026-05-22T15:15:00Z",
+						"preview_text":  "Can we bring this back into focus next week?",
+					}},
+				}},
+			},
+		}},
+	}}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-unarchive", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail status = %d body=%q", detailResponse.Code, detailResponse.Body.String())
+	}
+	body := detailResponse.Body.String()
+	for _, want := range []string{
+		"Unarchive 1 Gmail thread",
+		"Restores this thread to the Inbox.",
+		"gmail.unarchive_threads for zach@example.test",
+		"Client follow-up",
+		"Alex &lt;alex@example.test&gt;",
+		"Can we bring this back into focus next week?",
+		"Updates",
+		`<details class="gmail-thread">`,
+		`<summary class="gmail-row">`,
+		`class="mutation gmail-mutation"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("unarchive detail page missing %q: %q", want, body)
+		}
+	}
+	if strings.Contains(body, `<pre>{`) {
+		t.Fatalf("unarchive preview should not lead with raw JSON: %q", body)
+	}
+}
+
+func TestReviewUIRendersGmailSendEmailEditor(t *testing.T) {
+	store := &reviewStore{requests: []Request{gmailEmailReviewRequest()}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-email", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail status = %d body=%q", detailResponse.Code, detailResponse.Body.String())
+	}
+	body := detailResponse.Body.String()
+	for _, want := range []string{
+		`class="mutation gmail-email-mutation"`,
+		"Send Gmail email",
+		"Will send this email after approval.",
+		`data-tiptap-editor`,
+		`@tiptap/core@3.23.6`,
+		`@tiptap/extension-link@3.23.6`,
+		`@tiptap/extension-text-style@3.23.6`,
+		`name="delivery_mode" value="send" checked`,
+		`name="delivery_mode" value="draft"`,
+		"Create draft",
+		"one@example.test",
+		"cc@example.test",
+		"secret@example.test",
+		"Original subject",
+		"Original body",
+		`name="reply_to_thread_id" value="thread-reply"`,
+		`name="in_reply_to" value="&lt;message@example.test&gt;"`,
+		`name="body_html"`,
+		"Save email changes",
+		"Save as draft instead",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("email editor page missing %q: %q", want, body)
+		}
+	}
+	if strings.Contains(body, `<pre>{`) {
+		t.Fatalf("email editor should not lead with raw JSON: %q", body)
+	}
+}
+
+func TestReviewUIUpdatesGmailSendEmailMutation(t *testing.T) {
+	store := &reviewStore{requests: []Request{gmailEmailReviewRequest()}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-email", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+	csrfToken := hiddenFieldValue(t, detailResponse.Body.String(), "csrf_token")
+
+	updateForm := url.Values{
+		"csrf_token":         {csrfToken},
+		"delivery_mode":      {"send"},
+		"set_delivery_mode":  {"draft"},
+		"to":                 {"two@example.test, three@example.test"},
+		"cc":                 {"edited-cc@example.test"},
+		"bcc":                {"edited-bcc@example.test"},
+		"subject":            {"Edited subject"},
+		"body_text":          {"Edited plain body"},
+		"body_html":          {"<p><strong>Edited HTML body</strong></p>"},
+		"reply_to_thread_id": {"thread-reply"},
+		"in_reply_to":        {"<message@example.test>"},
+		"references":         {"<message@example.test>"},
+	}
+	updateResponse := httptest.NewRecorder()
+	updateRequest := httptest.NewRequest(http.MethodPost, "/mutation-review/requests/req-email/mutations/mut-email/update-email", strings.NewReader(updateForm.Encode()))
+	updateRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		updateRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(updateResponse, updateRequest)
+
+	if updateResponse.Code != http.StatusSeeOther {
+		t.Fatalf("update status = %d body=%q", updateResponse.Code, updateResponse.Body.String())
+	}
+	if location := updateResponse.Header().Get("Location"); location != "/mutation-review/requests/req-email" {
+		t.Fatalf("update redirect = %q", location)
+	}
+	if len(store.emailUpdates) != 1 {
+		t.Fatalf("email updates = %#v", store.emailUpdates)
+	}
+	update := store.emailUpdates[0]
+	if update.RequestID != "req-email" || update.MutationID != "mut-email" || update.Actor != "web-ui" {
+		t.Fatalf("unexpected update call = %#v", update)
+	}
+	if update.Input.DeliveryMode != "draft" {
+		t.Fatalf("delivery mode = %q", update.Input.DeliveryMode)
+	}
+	message := update.Input.Message
+	if strings.Join(stringSliceFromAny(message["to"]), ",") != "two@example.test,three@example.test" {
+		t.Fatalf("to = %#v", message["to"])
+	}
+	if message["subject"] != "Edited subject" || message["body_text"] != "Edited plain body" || message["body_html"] != "<p><strong>Edited HTML body</strong></p>" {
+		t.Fatalf("message = %#v", message)
+	}
+	if message["reply_to_thread_id"] != "thread-reply" || message["in_reply_to"] != "<message@example.test>" {
+		t.Fatalf("reply metadata = %#v", message)
 	}
 }
 
@@ -560,6 +795,77 @@ func TestSplitGmailQuotedHTML(t *testing.T) {
 	}
 	if !strings.Contains(quote, "parent") || !strings.Contains(quote, "gmail_quote") {
 		t.Fatalf("quote = %q", quote)
+	}
+}
+
+func TestSplitEmailBodyAndSignatureHTML(t *testing.T) {
+	body, signature := splitEmailBodyAndSignatureHTML(`<div>Hello</div><div><br></div><div class="gmail_signature"><div dir="ltr">--<br>Zach</div></div>`)
+
+	if body != "<div>Hello</div>" {
+		t.Fatalf("body = %q", body)
+	}
+	if !strings.Contains(signature, `class="gmail_signature"`) || !strings.Contains(signature, "Zach") {
+		t.Fatalf("signature = %q", signature)
+	}
+}
+
+func TestSanitizeGmailSignaturePreviewHTML(t *testing.T) {
+	preview := sanitizeGmailSignaturePreviewHTML(`<div class="gmail_signature"><script>alert("x")</script><img src=x onerror="alert(1)"><a href="javascript:alert(2)">bad</a><a href="mailto:zach@example.test">ok</a></div>`)
+
+	for _, forbidden := range []string{"<script", "onerror", "javascript:"} {
+		if strings.Contains(strings.ToLower(preview), forbidden) {
+			t.Fatalf("preview contains %q: %q", forbidden, preview)
+		}
+	}
+	if !strings.Contains(preview, `href="#"`) || !strings.Contains(preview, `mailto:zach@example.test`) {
+		t.Fatalf("preview did not preserve safe signature content: %q", preview)
+	}
+}
+
+func gmailEmailReviewRequest() Request {
+	message := map[string]any{
+		"to":                 []any{"one@example.test"},
+		"cc":                 []any{"cc@example.test"},
+		"bcc":                []any{"secret@example.test"},
+		"subject":            "Original subject",
+		"body_text":          "Original body",
+		"body_html":          "<p>Original body</p>",
+		"reply_to_thread_id": "thread-reply",
+		"in_reply_to":        "<message@example.test>",
+		"references":         []any{"<message@example.test>"},
+	}
+	return Request{
+		ID:        "req-email",
+		Status:    "pending_review",
+		Title:     "Send proposed email",
+		Reason:    "reply to customer",
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+		Mutations: []Mutation{{
+			ID:        "mut-email",
+			RequestID: "req-email",
+			Provider:  "gmail",
+			Operation: GmailSendEmailOperation,
+			Account:   "zach@example.test",
+			Status:    "pending_review",
+			Title:     "Send email: Original subject",
+			Reason:    "reply to customer",
+			Payload: map[string]any{
+				"delivery_mode": "send",
+				"message":       cloneMap(message),
+			},
+			Preview: map[string]any{
+				"email": map[string]any{
+					"mode":          "reply",
+					"delivery_mode": "send",
+					"to":            message["to"],
+					"cc":            message["cc"],
+					"bcc":           message["bcc"],
+					"subject":       message["subject"],
+					"body_text":     message["body_text"],
+					"body_html":     message["body_html"],
+				},
+			},
+		}},
 	}
 }
 
