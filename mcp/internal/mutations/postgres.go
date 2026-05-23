@@ -447,6 +447,7 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 				)
 				from 1 for 1600
 			) AS preview_text,
+			substring(COALESCE(message.body_html, '') from 1 for 200000) AS body_html,
 			count(*) OVER (PARTITION BY message.account, message.thread_id)::bigint AS message_count,
 			count(*) FILTER (WHERE 'INBOX' = ANY(message.label_ids)) OVER (PARTITION BY message.account, message.thread_id)::bigint AS inbox_message_count
 		FROM gmail_messages AS message
@@ -478,6 +479,7 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 			&row.InternalDate,
 			&row.Snippet,
 			&row.PreviewText,
+			&row.BodyHTML,
 			&messageCount,
 			&inboxMessageCount,
 		); err != nil {

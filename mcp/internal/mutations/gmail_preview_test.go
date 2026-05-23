@@ -1,6 +1,7 @@
 package mutations
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -33,6 +34,7 @@ func TestApplyGmailThreadPreviewRowsMergesWarehouseMessages(t *testing.T) {
 			InternalDate:      older,
 			Snippet:           "We received your receipt.",
 			PreviewText:       "We received your receipt and attached it to the transaction.",
+			BodyHTML:          "<main>Receipt body</main>",
 			MessageCount:      2,
 			InboxMessageCount: 2,
 		},
@@ -43,10 +45,10 @@ func TestApplyGmailThreadPreviewRowsMergesWarehouseMessages(t *testing.T) {
 			Subject:           "Receipt received",
 			FromAddress:       "HCB <receipts@hcb.example>",
 			ToAddresses:       []string{"zach@example.test"},
-			LabelIDs:          []string{"INBOX", "UNREAD"},
+			LabelIDs:          []string{"INBOX", "UNREAD", "Label_29"},
 			InternalDate:      latest,
-			Snippet:           "Everything is synced.",
-			PreviewText:       "Everything is synced. No action is required.",
+			Snippet:           "Everything is synced. No action is required.",
+			PreviewText:       "![](https://tracking.example/open) | | | --- | --- | noisy table",
 			MessageCount:      2,
 			InboxMessageCount: 2,
 		},
@@ -73,10 +75,22 @@ func TestApplyGmailThreadPreviewRowsMergesWarehouseMessages(t *testing.T) {
 	if messages[0]["message_id"] != "message-older" || messages[1]["message_id"] != "message-latest" {
 		t.Fatalf("message order = %#v", messages)
 	}
-	if stringSliceFromAny(thread["labels"])[0] != "CATEGORY_UPDATES" {
+	if messages[0]["body_html"] != "<main>Receipt body</main>" {
+		t.Fatalf("body_html = %#v", messages[0]["body_html"])
+	}
+	labels := stringSliceFromAny(thread["labels"])
+	if strings.Join(labels, ",") != "Updates,Unread" {
 		t.Fatalf("labels = %#v", thread["labels"])
 	}
 	if mutations[0].Preview["threads"].([]any)[0].(map[string]any)["subject"] != nil {
 		t.Fatalf("original mutation preview was mutated: %#v", mutations[0].Preview)
+	}
+}
+
+func TestCleanGmailPreviewTextRemovesQuotedReply(t *testing.T) {
+	got := cleanGmailPreviewText("Attached receipt -- Zach On Wed, May 13, 2026 at 8:25 AM HCB <hcb@hackclub.com> wrote: parent body")
+
+	if got != "Attached receipt -- Zach" {
+		t.Fatalf("cleaned preview = %q", got)
 	}
 }

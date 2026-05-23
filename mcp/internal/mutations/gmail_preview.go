@@ -1,10 +1,14 @@
 package mutations
 
 import (
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
+
+var markdownImagePattern = regexp.MustCompile(`!\[[^\]]*\]\([^)]+\)`)
+var gmailQuotedTextPattern = regexp.MustCompile(`(?i)\s+On\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+.+$`)
 
 type gmailThreadPreviewRow struct {
 	Account           string
@@ -18,6 +22,7 @@ type gmailThreadPreviewRow struct {
 	InternalDate      time.Time
 	Snippet           string
 	PreviewText       string
+	BodyHTML          string
 	MessageCount      int
 	InboxMessageCount int
 }
@@ -151,6 +156,9 @@ func gmailThreadPreviewFromRows(threadID string, rows []gmailThreadPreviewRow) m
 			"preview_text":  bestGmailPreviewText(row),
 			"label_ids":     append([]string{}, row.LabelIDs...),
 		}
+		if bodyHTML := strings.TrimSpace(row.BodyHTML); bodyHTML != "" {
+			message["body_html"] = bodyHTML
+		}
 		messages = append(messages, message)
 	}
 	if inboxMessageCount == 0 {
@@ -203,12 +211,8 @@ func appendVisibleGmailLabels(existing []string, labels []string) []string {
 		seen[label] = true
 	}
 	for _, label := range labels {
-		normalized := strings.TrimSpace(label)
+		normalized := formatGmailLabel(label)
 		if normalized == "" || seen[normalized] {
-			continue
-		}
-		switch normalized {
-		case "INBOX", "TRASH", "SPAM":
 			continue
 		}
 		existing = append(existing, normalized)
@@ -218,10 +222,44 @@ func appendVisibleGmailLabels(existing []string, labels []string) []string {
 }
 
 func bestGmailPreviewText(row gmailThreadPreviewRow) string {
-	if text := compactWhitespace(row.PreviewText); text != "" {
+	if text := cleanGmailPreviewText(row.Snippet); text != "" {
 		return text
 	}
-	return compactWhitespace(row.Snippet)
+	return cleanGmailPreviewText(row.PreviewText)
+}
+
+func cleanGmailPreviewText(value string) string {
+	value = markdownImagePattern.ReplaceAllString(value, "")
+	value = gmailQuotedTextPattern.ReplaceAllString(value, "")
+	value = strings.ReplaceAll(value, "|", " ")
+	value = strings.ReplaceAll(value, "---", " ")
+	return compactWhitespace(value)
+}
+
+func formatGmailLabel(value string) string {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" || strings.HasPrefix(normalized, "Label_") {
+		return ""
+	}
+	switch normalized {
+	case "INBOX", "TRASH", "SPAM", "CATEGORY_PERSONAL":
+		return ""
+	case "UNREAD":
+		return "Unread"
+	case "IMPORTANT":
+		return "Important"
+	case "STARRED":
+		return "Starred"
+	case "CATEGORY_UPDATES":
+		return "Updates"
+	case "CATEGORY_PROMOTIONS":
+		return "Promotions"
+	case "CATEGORY_SOCIAL":
+		return "Social"
+	case "CATEGORY_FORUMS":
+		return "Forums"
+	}
+	return strings.ReplaceAll(strings.TrimPrefix(normalized, "CATEGORY_"), "_", " ")
 }
 
 func compactWhitespace(value string) string {
