@@ -194,7 +194,7 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "gmail_messages_internal_date_idx",
         "gmail_messages",
-        "CREATE INDEX IF NOT EXISTS gmail_messages_internal_date_idx ON gmail_messages (internal_date DESC)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_internal_date_idx ON gmail_messages (internal_date DESC)",
     ),
     IndexSpec(
         "gmail_messages_label_ids_idx",
@@ -204,19 +204,19 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "gmail_messages_from_trgm_idx",
         "gmail_messages",
-        "CREATE INDEX IF NOT EXISTS gmail_messages_from_trgm_idx ON gmail_messages USING gin (from_address public.gin_trgm_ops)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_from_trgm_idx ON gmail_messages USING gin (from_address public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
         "gmail_messages_subject_trgm_idx",
         "gmail_messages",
-        "CREATE INDEX IF NOT EXISTS gmail_messages_subject_trgm_idx ON gmail_messages USING gin (subject public.gin_trgm_ops)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_subject_trgm_idx ON gmail_messages USING gin (subject public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
         "gmail_messages_snippet_trgm_idx",
         "gmail_messages",
-        "CREATE INDEX IF NOT EXISTS gmail_messages_snippet_trgm_idx ON gmail_messages USING gin (snippet public.gin_trgm_ops)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_snippet_trgm_idx ON gmail_messages USING gin (snippet public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
@@ -308,7 +308,7 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "slack_messages_user_time_idx",
         "slack_messages",
-        "CREATE INDEX IF NOT EXISTS slack_messages_user_time_idx ON slack_messages (user_id, message_datetime DESC)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_user_time_idx ON slack_messages (user_id, message_datetime DESC)",
     ),
     IndexSpec(
         "slack_messages_synced_at_idx",
@@ -2446,9 +2446,12 @@ class PostgresWarehouse:
             SELECT 1
             FROM pg_class AS c
             INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            INNER JOIN pg_index AS i ON i.indexrelid = c.oid
             WHERE n.nspname = %s
               AND c.relname = %s
               AND c.relkind = 'i'
+              AND i.indisvalid
+              AND i.indisready
             LIMIT 1
             """,
             (self._schema, index_name),

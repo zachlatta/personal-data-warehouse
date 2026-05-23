@@ -303,10 +303,41 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     index_names = {row[0] for row in rows}
     assert "slack_messages_recent_scope_time_idx" in index_names
     assert "slack_messages_recent_thread_time_idx" in index_names
+    assert "slack_messages_user_time_idx" in index_names
     assert "slack_messages_text_trgm_live_idx" in index_names
+
+    slack_user_indexes = warehouse._query(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND tablename = 'slack_users'
+        """
+    )
+    slack_user_index_names = {row[0] for row in slack_user_indexes}
+    assert "slack_users_email_lower_idx" in slack_user_index_names
 
     extension_rows = warehouse._query("SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'")
     assert extension_rows == [("pg_trgm",)]
+
+
+def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_tables()
+
+    rows = warehouse._query(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND tablename = 'gmail_messages'
+        """
+    )
+
+    index_names = {row[0] for row in rows}
+    assert "gmail_messages_internal_date_idx" in index_names
+    assert "gmail_messages_from_trgm_idx" in index_names
+    assert "gmail_messages_subject_trgm_idx" in index_names
+    assert "gmail_messages_snippet_trgm_idx" in index_names
 
 
 def test_postgres_contacts_tables_use_jsonb_without_changing_existing_raw_json(warehouse: PostgresWarehouse) -> None:

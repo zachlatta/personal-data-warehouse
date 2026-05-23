@@ -27,7 +27,11 @@ from personal_data_warehouse.agent_runner import AgentRunResult
 
 
 class FakeIdentityWarehouse:
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
     def _query(self, sql):
+        self.queries.append(sql)
         if "FROM slack_users" in sql:
             return [("guest@example.com", "guest", "guest", "", "U1")]
         if "FROM gmail_messages" in sql:
@@ -473,13 +477,18 @@ def test_parse_attendee_summaries_reads_calendar_json() -> None:
 
 
 def test_load_attendee_identity_hints_extracts_possible_full_names_without_hardcoding() -> None:
+    warehouse = FakeIdentityWarehouse()
     hints = load_attendee_identity_hints(
-        FakeIdentityWarehouse(),
+        warehouse,
         [{"display_name": "", "email": "guest@example.com"}],
     )
 
     assert hints["guest@example.com"]["possible_names"] == ["Guest Person"]
     assert hints["guest@example.com"]["gmail_mentions"][0]["subject"] == "Guest Person accepted their invite"
+    gmail_query = next(query for query in warehouse.queries if "FROM gmail_messages" in query)
+    assert "ILIKE" in gmail_query
+    assert "is_deleted = 0" in gmail_query
+    assert "position(lower" not in gmail_query
 
 
 def test_possible_identity_names_from_text_reads_capitalized_full_names() -> None:

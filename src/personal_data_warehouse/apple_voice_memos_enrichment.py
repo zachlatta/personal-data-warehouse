@@ -31,6 +31,13 @@ PROMPT_TRANSCRIPT_WITHOUT_SEGMENTS_MAX_CHARS = 60_000
 
 def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _sql_like_contains(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return _sql_string(f"%{escaped}%")
+
+
 PROMPT_GMAIL_MENTIONS_PER_IDENTITY_HINT = 3
 AGENT_USER_PROMPT_INPUT_FILE = "user_prompt.json"
 
@@ -538,9 +545,12 @@ def load_attendee_identity_hints(
                 f"""
                 SELECT from_address, subject, snippet
                 FROM gmail_messages
-                WHERE position(lower({_sql_string(email)}) in lower(from_address)) > 0
-                   OR position(lower({_sql_string(local_part)}) in lower(subject)) > 0
-                   OR position(lower({_sql_string(local_part)}) in lower(snippet)) > 0
+                WHERE is_deleted = 0
+                  AND (
+                    from_address ILIKE {_sql_like_contains(email)} ESCAPE E'\\\\'
+                    OR subject ILIKE {_sql_like_contains(local_part)} ESCAPE E'\\\\'
+                    OR snippet ILIKE {_sql_like_contains(local_part)} ESCAPE E'\\\\'
+                  )
                 ORDER BY internal_date DESC
                 LIMIT 20
                 """
