@@ -137,6 +137,107 @@ func TestReviewUIRequiresLoginAndApprovesRequest(t *testing.T) {
 	}
 }
 
+func TestReviewUIRendersGmailThreadPreview(t *testing.T) {
+	store := &reviewStore{requests: []Request{{
+		ID:        "req-123",
+		Status:    "pending_review",
+		Title:     "Archive notification",
+		Reason:    "automated notification",
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+		Mutations: []Mutation{{
+			ID:        "mut-123",
+			Provider:  "gmail",
+			Operation: GmailArchiveOperation,
+			Account:   "zach@example.test",
+			Status:    "pending_review",
+			Title:     "Archive: Receipt received",
+			Payload:   map[string]any{"thread_ids": []any{"thread-1"}},
+			Preview: map[string]any{
+				"thread_count": 1,
+				"threads": []any{map[string]any{
+					"thread_id":           "thread-1",
+					"subject":             "Receipt received",
+					"latest_from_address": "HCB <receipts@hcb.example>",
+					"latest_at":           "2026-05-20T09:30:00Z",
+					"latest_preview":      "Everything is synced. No action is required.",
+					"message_count":       2,
+					"inbox_message_count": 2,
+					"labels":              []any{"CATEGORY_UPDATES", "UNREAD"},
+					"messages": []any{map[string]any{
+						"message_id":    "message-older",
+						"from_address":  "HCB <receipts@hcb.example>",
+						"to_addresses":  []any{"zach@example.test"},
+						"internal_date": "2026-05-19T12:00:00Z",
+						"preview_text":  "We received your receipt and attached it to the transaction.",
+						"label_ids":     []any{"INBOX", "CATEGORY_UPDATES"},
+					}, map[string]any{
+						"message_id":    "message-latest",
+						"from_address":  "HCB <receipts@hcb.example>",
+						"to_addresses":  []any{"zach@example.test"},
+						"internal_date": "2026-05-20T09:30:00Z",
+						"preview_text":  "Everything is synced. No action is required.",
+						"label_ids":     []any{"INBOX", "UNREAD"},
+					}},
+				}},
+			},
+		}},
+	}}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-123", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail status = %d body=%q", detailResponse.Code, detailResponse.Body.String())
+	}
+	body := detailResponse.Body.String()
+	for _, want := range []string{
+		`class="gmail-thread"`,
+		"Receipt received",
+		"HCB &lt;receipts@hcb.example&gt;",
+		"Everything is synced. No action is required.",
+		"2 messages",
+		"CATEGORY_UPDATES",
+		"zach@example.test",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("detail page missing %q: %q", want, body)
+		}
+	}
+	if strings.Contains(body, `<pre>{`) {
+		t.Fatalf("gmail preview should not lead with raw JSON: %q", body)
+	}
+}
+
+func loginCookies(t *testing.T, handler http.Handler) []*http.Cookie {
+	t.Helper()
+	loginForm := url.Values{"password": {"correct horse battery staple"}}
+	loginResponse := httptest.NewRecorder()
+	loginRequest := httptest.NewRequest(http.MethodPost, "/mutation-review/login", strings.NewReader(loginForm.Encode()))
+	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	handler.ServeHTTP(loginResponse, loginRequest)
+	if loginResponse.Code != http.StatusSeeOther {
+		t.Fatalf("login status = %d body=%q", loginResponse.Code, loginResponse.Body.String())
+	}
+	cookies := loginResponse.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("login did not set a session cookie")
+	}
+	return cookies
+}
+
 func hiddenFieldValue(t *testing.T, body string, name string) string {
 	t.Helper()
 	pattern := regexp.MustCompile(`name="` + regexp.QuoteMeta(name) + `" value="([^"]+)"`)

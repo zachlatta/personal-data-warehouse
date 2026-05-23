@@ -217,6 +217,10 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string) (Request, err
 	if err != nil {
 		return Request{}, err
 	}
+	mutations, err = s.enrichGmailThreadPreviews(ctx, mutations)
+	if err != nil {
+		return Request{}, err
+	}
 	request.Mutations = mutations
 	if request.MutationCount == 0 {
 		request.MutationCount = len(mutations)
@@ -404,6 +408,92 @@ func (s *PostgresStore) listMutationsForRequest(ctx context.Context, requestID s
 		return nil, err
 	}
 	return mutations, nil
+}
+
+func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations []Mutation) ([]Mutation, error) {
+	targets := gmailThreadPreviewTargets(mutations)
+	if len(targets) == 0 {
+		return mutations, nil
+	}
+	args := make([]any, 0, len(targets)*2)
+	values := make([]string, 0, len(targets))
+	for _, target := range targets {
+		args = append(args, target.Account, target.ThreadID)
+		values = append(values, fmt.Sprintf("($%d, $%d)", len(args)-1, len(args)))
+	}
+
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		WITH wanted(account, thread_id) AS (
+			VALUES %s
+		)
+		SELECT
+			message.account,
+			message.thread_id,
+			message.message_id,
+			message.subject,
+			message.from_address,
+			COALESCE(array_to_json(message.to_addresses)::text, '[]') AS to_addresses_json,
+			COALESCE(array_to_json(message.cc_addresses)::text, '[]') AS cc_addresses_json,
+			COALESCE(array_to_json(message.label_ids)::text, '[]') AS label_ids_json,
+			message.internal_date,
+			message.snippet,
+			substring(
+				COALESCE(
+					NULLIF(message.body_markdown_clean, ''),
+					NULLIF(message.body_markdown, ''),
+					NULLIF(message.body_text, ''),
+					message.snippet,
+					''
+				)
+				from 1 for 1600
+			) AS preview_text,
+			count(*) OVER (PARTITION BY message.account, message.thread_id)::bigint AS message_count,
+			count(*) FILTER (WHERE 'INBOX' = ANY(message.label_ids)) OVER (PARTITION BY message.account, message.thread_id)::bigint AS inbox_message_count
+		FROM gmail_messages AS message
+		JOIN wanted ON wanted.account = message.account AND wanted.thread_id = message.thread_id
+		WHERE message.is_deleted = 0
+		  AND NOT ('TRASH' = ANY(message.label_ids))
+		  AND NOT ('SPAM' = ANY(message.label_ids))
+		ORDER BY message.account ASC, message.thread_id ASC, message.internal_date ASC, message.message_id ASC
+	`, strings.Join(values, ", ")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	previewRows := []gmailThreadPreviewRow{}
+	for rows.Next() {
+		var row gmailThreadPreviewRow
+		var toAddressesJSON, ccAddressesJSON, labelIDsJSON string
+		var messageCount, inboxMessageCount int64
+		if err := rows.Scan(
+			&row.Account,
+			&row.ThreadID,
+			&row.MessageID,
+			&row.Subject,
+			&row.FromAddress,
+			&toAddressesJSON,
+			&ccAddressesJSON,
+			&labelIDsJSON,
+			&row.InternalDate,
+			&row.Snippet,
+			&row.PreviewText,
+			&messageCount,
+			&inboxMessageCount,
+		); err != nil {
+			return nil, err
+		}
+		row.ToAddresses = decodeJSONStringArray(toAddressesJSON)
+		row.CCAddresses = decodeJSONStringArray(ccAddressesJSON)
+		row.LabelIDs = decodeJSONStringArray(labelIDsJSON)
+		row.MessageCount = int(messageCount)
+		row.InboxMessageCount = int(inboxMessageCount)
+		previewRows = append(previewRows, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return applyGmailThreadPreviewRows(mutations, previewRows), nil
 }
 
 func (s *PostgresStore) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -723,6 +813,22 @@ func decodeJSONMap(data []byte) map[string]any {
 		return map[string]any{}
 	}
 	return out
+}
+
+func decodeJSONStringArray(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	out := []string{}
+	if err := json.Unmarshal([]byte(value), &out); err == nil {
+		return normalizeStringSlice(out)
+	}
+	var anyValues []any
+	if err := json.Unmarshal([]byte(value), &anyValues); err != nil {
+		return nil
+	}
+	return stringSliceFromAny(anyValues)
 }
 
 var upstreamMutationSchemaStatements = []string{
