@@ -11,6 +11,7 @@ from personal_data_warehouse.agent_runner import default_agent_docker_image, def
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+CONTACTS_READONLY_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 DEFAULT_GMAIL_PAGE_SIZE = 500
 DEFAULT_GMAIL_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -25,6 +26,7 @@ DEFAULT_CALENDAR_PAGE_SIZE = 2500
 DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS = 365
 DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS = 365
 DEFAULT_CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES = 60
+DEFAULT_CONTACT_PAGE_SIZE = 1000
 DEFAULT_SLACK_PAGE_SIZE = 200
 DEFAULT_SLACK_LOOKBACK_DAYS = 14
 DEFAULT_SLACK_THREAD_AUDIT_DAYS = 30
@@ -118,6 +120,11 @@ class GmailAccount:
 class CalendarAccount:
     email_address: str
     calendar_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ContactGoogleAccount:
+    email_address: str
 
 
 @dataclass(frozen=True)
@@ -251,6 +258,10 @@ class Settings:
     calendar_expanded_sync_lookback_days: int = DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS
     calendar_expanded_sync_lookahead_days: int = DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS
     calendar_expanded_sync_interval_minutes: int = DEFAULT_CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES
+    contact_google_accounts: tuple[ContactGoogleAccount, ...] = ()
+    contact_scopes: tuple[str, ...] = (CONTACTS_READONLY_SCOPE,)
+    contact_page_size: int = DEFAULT_CONTACT_PAGE_SIZE
+    contact_force_full_sync: bool = False
     gmail_attachment_ai_fallback_enabled: bool = True
     gmail_attachment_ai_fallback_base_url: str = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL
     gmail_attachment_ai_fallback_model: str = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_MODEL
@@ -289,7 +300,7 @@ class Settings:
 
         configured_domains = {
             email_domain(account.email_address)
-            for account in [*self.gmail_accounts, *self.calendar_accounts]
+            for account in [*self.gmail_accounts, *self.calendar_accounts, *self.contact_google_accounts]
         }
         if self.alice_voice_recordings is not None:
             configured_domains.add(email_domain(self.alice_voice_recordings.google_drive_account))
@@ -312,6 +323,7 @@ def load_settings(
     require_gmail: bool = True,
     require_gmail_client_secrets: bool = False,
     require_calendar: bool = False,
+    require_contacts: bool = False,
     require_slack: bool = False,
     require_voice_memos: bool = False,
     require_apple_notes: bool = False,
@@ -362,9 +374,17 @@ def load_settings(
         for email_address in calendar_account_emails
     )
 
+    contact_google_account_emails = _parse_csv_env(os.getenv("CONTACT_GOOGLE_ACCOUNTS"))
+    if require_contacts and not contact_google_account_emails:
+        raise ValueError("CONTACT_GOOGLE_ACCOUNTS must be set to a comma-separated list of Google account addresses")
+    contact_google_accounts = tuple(
+        ContactGoogleAccount(email_address=email_address)
+        for email_address in contact_google_account_emails
+    )
+
     google_oauth_client_secrets_json_by_account = tuple(
         (email_address.lower(), account_client_secrets_json)
-        for email_address in dict.fromkeys([*account_emails, *calendar_account_emails])
+        for email_address in dict.fromkeys([*account_emails, *calendar_account_emails, *contact_google_account_emails])
         if (
             account_client_secrets_json := (
                 _json_env_value(f"GOOGLE_{env_slug(email_address)}_OAUTH_CLIENT_SECRETS_JSON")
@@ -376,7 +396,7 @@ def load_settings(
         (domain, domain_client_secrets_json)
         for domain in dict.fromkeys(
             email_domain(email_address)
-            for email_address in [*account_emails, *calendar_account_emails]
+            for email_address in [*account_emails, *calendar_account_emails, *contact_google_account_emails]
         )
         if (
             domain_client_secrets_json := (
@@ -460,6 +480,10 @@ def load_settings(
     )
     if calendar_expanded_sync_interval_minutes < 1:
         raise ValueError("CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES must be at least 1")
+
+    contact_page_size = int(os.getenv("CONTACT_PAGE_SIZE", str(DEFAULT_CONTACT_PAGE_SIZE)))
+    if contact_page_size < 1 or contact_page_size > 1000:
+        raise ValueError("CONTACT_PAGE_SIZE must be between 1 and 1000")
 
     slack_account_names = _parse_csv_env(os.getenv("SLACK_ACCOUNTS"))
     if require_slack and not slack_account_names:
@@ -855,6 +879,8 @@ def load_settings(
         )
 
     google_scopes = [GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE]
+    if contact_google_accounts:
+        google_scopes.append(CONTACTS_READONLY_SCOPE)
     if voice_memos and voice_memos.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if apple_notes and apple_notes.storage_backend == "google_drive":
@@ -900,6 +926,10 @@ def load_settings(
         calendar_expanded_sync_lookback_days=calendar_expanded_sync_lookback_days,
         calendar_expanded_sync_lookahead_days=calendar_expanded_sync_lookahead_days,
         calendar_expanded_sync_interval_minutes=calendar_expanded_sync_interval_minutes,
+        contact_google_accounts=contact_google_accounts,
+        contact_scopes=(CONTACTS_READONLY_SCOPE,),
+        contact_page_size=contact_page_size,
+        contact_force_full_sync=_parse_bool_env(os.getenv("CONTACT_FORCE_FULL_SYNC"), False),
         slack_accounts=tuple(slack_accounts),
         slack_page_size=slack_page_size,
         slack_lookback_days=int(os.getenv("SLACK_LOOKBACK_DAYS", str(DEFAULT_SLACK_LOOKBACK_DAYS))),

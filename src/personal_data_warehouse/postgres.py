@@ -8,7 +8,7 @@ import re
 from typing import Any
 
 import psycopg2
-from psycopg2.extras import execute_values
+from psycopg2.extras import Json, execute_values
 
 from personal_data_warehouse.clickhouse import (
     AGENT_RUN_COLUMNS,
@@ -28,6 +28,8 @@ from personal_data_warehouse.clickhouse import (
     APPLE_MESSAGE_HANDLE_COLUMNS,
     CALENDAR_EVENT_COLUMNS,
     CALENDAR_SYNC_STATE_COLUMNS,
+    CONTACT_CARD_COLUMNS,
+    CONTACT_SYNC_STATE_COLUMNS,
     FINANCE_ACCOUNT_COLUMNS,
     FINANCE_INVESTMENT_HOLDING_COLUMNS,
     FINANCE_INVESTMENT_SECURITY_COLUMNS,
@@ -90,6 +92,14 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     ),
     "calendar_events": TableSpec(CALENDAR_EVENT_COLUMNS, ("account", "calendar_id", "event_id")),
     "calendar_sync_state": TableSpec(CALENDAR_SYNC_STATE_COLUMNS, ("account", "calendar_id")),
+    "contact_cards": TableSpec(
+        CONTACT_CARD_COLUMNS,
+        ("source", "account", "source_kind", "address_book_id", "card_id"),
+    ),
+    "contact_sync_state": TableSpec(
+        CONTACT_SYNC_STATE_COLUMNS,
+        ("source", "account", "source_kind", "address_book_id"),
+    ),
     "apple_voice_memos_files": TableSpec(VOICE_MEMO_FILE_COLUMNS, ("account", "recording_id")),
     "apple_voice_memos_transcription_runs": TableSpec(
         VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
@@ -193,6 +203,32 @@ ARRAY_COLUMNS = {
     "recurrence",
 }
 
+JSONB_COLUMNS_BY_TABLE = {
+    "contact_cards": {
+        "emails",
+        "phones",
+        "addresses",
+        "organizations",
+        "urls",
+        "groups",
+        "dates",
+        "photos",
+        "raw_json",
+    },
+}
+
+JSONB_ARRAY_COLUMNS_BY_TABLE = {
+    "contact_cards": {
+        "emails",
+        "phones",
+        "addresses",
+        "organizations",
+        "urls",
+        "groups",
+        "photos",
+    },
+}
+
 TIMESTAMP_COLUMNS = {
     "internal_date",
     "synced_at",
@@ -218,6 +254,8 @@ TIMESTAMP_COLUMNS = {
     "message_at",
     "message_date",
     "last_read_message_at",
+    "full_synced_at",
+    "source_updated_at",
     "date_read",
     "date_delivered",
     "date_played",
@@ -363,6 +401,10 @@ class PostgresWarehouse:
         self._ensure_table_group(["calendar_events", "calendar_sync_state"])
         self._ensure_clean_calendar_transcript_views_if_possible()
 
+    def ensure_contacts_tables(self) -> None:
+        self._ensure_table_group(["contact_cards", "contact_sync_state"])
+        self._ensure_clean_contacts_view()
+
     def ensure_apple_voice_memos_tables(self, *, backfill_content_hashes: bool = True) -> None:
         self._ensure_table_group(
             [
@@ -445,7 +487,10 @@ class PostgresWarehouse:
 
     def _ensure_table(self, table: str) -> None:
         spec = POSTGRES_TABLES[table]
-        column_sql = [f"{_identifier(column)} {_postgres_type(column)} NOT NULL DEFAULT {_default_sql(column)}" for column in spec.columns]
+        column_sql = [
+            f"{_identifier(column)} {_postgres_type(column, table=table)} NOT NULL DEFAULT {_default_sql(column, table=table)}"
+            for column in spec.columns
+        ]
         primary_key = ", ".join(_identifier(column) for column in spec.primary_key)
         self._command(
             f"""
@@ -463,6 +508,11 @@ class PostgresWarehouse:
             "CREATE INDEX IF NOT EXISTS gmail_messages_label_ids_idx ON gmail_messages USING gin (label_ids)",
             "CREATE INDEX IF NOT EXISTS gmail_attachments_message_idx ON gmail_attachments (account, message_id)",
             "CREATE INDEX IF NOT EXISTS calendar_events_time_idx ON calendar_events (start_at, end_at)",
+            "CREATE INDEX IF NOT EXISTS contact_cards_display_idx ON contact_cards (account, source_kind, display_name) WHERE is_deleted = 0",
+            "CREATE INDEX IF NOT EXISTS contact_cards_primary_email_idx ON contact_cards (lower(primary_email)) WHERE is_deleted = 0 AND primary_email != ''",
+            "CREATE INDEX IF NOT EXISTS contact_cards_primary_phone_idx ON contact_cards (lower(primary_phone)) WHERE is_deleted = 0 AND primary_phone != ''",
+            "CREATE INDEX IF NOT EXISTS contact_cards_source_updated_idx ON contact_cards (source_updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS contact_cards_raw_json_idx ON contact_cards USING gin (raw_json)",
             "CREATE INDEX IF NOT EXISTS voice_memo_files_recorded_idx ON apple_voice_memos_files (recorded_at DESC)",
             "CREATE INDEX IF NOT EXISTS apple_notes_modified_idx ON apple_notes (modified_at DESC) WHERE is_deleted = 0",
             "CREATE INDEX IF NOT EXISTS apple_note_revisions_note_idx ON apple_note_revisions (account, note_id, modified_at DESC)",
@@ -714,6 +764,90 @@ class PostgresWarehouse:
             ],
             CALENDAR_SYNC_STATE_COLUMNS,
         )
+
+    def insert_contact_cards(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("contact_cards", rows, CONTACT_CARD_COLUMNS)
+
+    def load_contact_sync_state(self) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+        columns = CONTACT_SYNC_STATE_COLUMNS
+        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM contact_sync_state")
+        return {
+            (str(row[0]), str(row[1]), str(row[2]), str(row[3])): dict(zip(columns, row, strict=True))
+            for row in rows
+        }
+
+    def insert_contact_sync_state(
+        self,
+        *,
+        source: str,
+        account: str,
+        source_kind: str,
+        address_book_id: str,
+        sync_token: str,
+        last_sync_type: str,
+        status: str,
+        error: str,
+        full_synced_at: datetime,
+        updated_at: datetime,
+    ) -> None:
+        self._insert(
+            "contact_sync_state",
+            [
+                (
+                    source,
+                    account,
+                    source_kind,
+                    address_book_id,
+                    sync_token,
+                    last_sync_type,
+                    status,
+                    error,
+                    full_synced_at,
+                    updated_at,
+                    int(_ensure_utc(updated_at).timestamp() * 1_000_000),
+                )
+            ],
+            CONTACT_SYNC_STATE_COLUMNS,
+        )
+
+    def mark_missing_contact_cards_deleted(
+        self,
+        *,
+        source: str,
+        account: str,
+        source_kind: str,
+        address_book_id: str,
+        active_card_ids: set[str],
+        synced_at: datetime,
+    ) -> int:
+        params: list[Any] = [source, account, source_kind, address_book_id]
+        active_filter = ""
+        if active_card_ids:
+            active_filter = "AND NOT (card_id = ANY(%s))"
+            params.append(sorted(active_card_ids))
+        rows = self._query(
+            f"""
+            SELECT {", ".join(_identifier(column) for column in CONTACT_CARD_COLUMNS)}
+            FROM contact_cards
+            WHERE source = %s
+              AND account = %s
+              AND source_kind = %s
+              AND address_book_id = %s
+              AND is_deleted = 0
+              {active_filter}
+            """,
+            tuple(params),
+        )
+        tombstones: list[dict[str, Any]] = []
+        sync_version = int(_ensure_utc(synced_at).timestamp() * 1_000_000)
+        for row in rows:
+            tombstone = dict(zip(CONTACT_CARD_COLUMNS, row, strict=True))
+            tombstone["is_deleted"] = 1
+            tombstone["synced_at"] = synced_at
+            tombstone["sync_version"] = sync_version
+            tombstones.append(tombstone)
+        self.insert_contact_cards(tombstones)
+        return len(tombstones)
 
     def insert_apple_voice_memos_files(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("apple_voice_memos_files", rows, VOICE_MEMO_FILE_COLUMNS)
@@ -1824,6 +1958,42 @@ class PostgresWarehouse:
             """
         )
 
+    def _ensure_clean_contacts_view(self) -> None:
+        self._command(
+            """
+            CREATE OR REPLACE VIEW clean_contacts AS
+            SELECT
+                source,
+                account,
+                source_kind,
+                address_book_id,
+                card_id,
+                etag,
+                source_uid,
+                display_name,
+                given_name,
+                family_name,
+                organization,
+                job_title,
+                primary_email,
+                primary_phone,
+                emails,
+                phones,
+                addresses,
+                organizations,
+                urls,
+                groups,
+                dates,
+                photos,
+                notes,
+                source_updated_at,
+                synced_at,
+                raw_json
+            FROM contact_cards
+            WHERE is_deleted = 0
+            """
+        )
+
     def _ensure_clean_finance_views(self) -> None:
         self._command(
             """
@@ -2322,10 +2492,19 @@ class PostgresWarehouse:
             execute_values(cursor, sql, rows, template=template, page_size=POSTGRES_INSERT_PAGE_SIZES.get(table, 1000))
 
     def _insert_rows(self, table: str, rows: list[dict[str, Any]], columns: tuple[str, ...]) -> None:
-        self._insert(table, [tuple(_normalize_insert_value(row[column]) for column in columns) for row in rows], columns)
+        self._insert(
+            table,
+            [
+                tuple(_normalize_insert_value(row[column], table=table, column=column) for column in columns)
+                for row in rows
+            ],
+            columns,
+        )
 
 
-def _postgres_type(column: str) -> str:
+def _postgres_type(column: str, *, table: str | None = None) -> str:
+    if _is_jsonb_column(table, column):
+        return "jsonb"
     if column in ARRAY_COLUMNS:
         return "text[]"
     if column in TIMESTAMP_COLUMNS:
@@ -2337,7 +2516,11 @@ def _postgres_type(column: str) -> str:
     return "text"
 
 
-def _default_sql(column: str) -> str:
+def _default_sql(column: str, *, table: str | None = None) -> str:
+    if _is_jsonb_column(table, column):
+        if column in JSONB_ARRAY_COLUMNS_BY_TABLE.get(table or "", set()):
+            return "'[]'::jsonb"
+        return "'{}'::jsonb"
     if column in ARRAY_COLUMNS:
         return "'{}'::text[]"
     if column in TIMESTAMP_COLUMNS:
@@ -2347,6 +2530,10 @@ def _default_sql(column: str) -> str:
     if column in INTEGER_COLUMNS:
         return "0"
     return "''"
+
+
+def _is_jsonb_column(table: str | None, column: str) -> bool:
+    return bool(table and column in JSONB_COLUMNS_BY_TABLE.get(table, set()))
 
 
 def _upsert_clause(table: str, spec: TableSpec, columns: tuple[str, ...] | None = None) -> str:
@@ -2393,7 +2580,9 @@ def _validate_identifier(value: str) -> str:
     return value
 
 
-def _normalize_insert_value(value: Any) -> Any:
+def _normalize_insert_value(value: Any, *, table: str | None = None, column: str | None = None) -> Any:
+    if column and _is_jsonb_column(table, column):
+        return Json(_normalize_json_value(value), dumps=lambda data: json.dumps(data, sort_keys=True, separators=(",", ":"), default=str))
     if isinstance(value, datetime):
         return _ensure_utc(value)
     if isinstance(value, str):
@@ -2402,6 +2591,18 @@ def _normalize_insert_value(value: Any) -> Any:
         return [_normalize_insert_value(item) for item in value]
     if isinstance(value, tuple):
         return [_normalize_insert_value(item) for item in value]
+    return value
+
+
+def _normalize_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\x00", POSTGRES_TEXT_NUL_REPLACEMENT)
+    if isinstance(value, datetime):
+        return _ensure_utc(value).isoformat()
+    if isinstance(value, dict):
+        return {str(key): _normalize_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_json_value(item) for item in value]
     return value
 
 

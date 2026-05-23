@@ -43,10 +43,10 @@ def run_oauth_flow(email_address: str) -> dict[str, str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Authorize one or more Google accounts for the personal data warehouse Gmail and Calendar syncs.",
+        description="Authorize one or more Google accounts for the personal data warehouse Gmail, Calendar, Contacts, and Drive-backed syncs.",
     )
-    parser.add_argument("--email", help="Google account email address from GMAIL_ACCOUNTS or CALENDAR_ACCOUNTS")
-    parser.add_argument("--all", action="store_true", help="Authorize every account in GMAIL_ACCOUNTS and CALENDAR_ACCOUNTS")
+    parser.add_argument("--email", help="Google account email address from GMAIL_ACCOUNTS, CALENDAR_ACCOUNTS, or CONTACT_GOOGLE_ACCOUNTS")
+    parser.add_argument("--all", action="store_true", help="Authorize every configured Google account")
     parser.add_argument(
         "--write-env",
         action="store_true",
@@ -64,6 +64,7 @@ def main() -> None:
             [
                 *(account.email_address for account in settings.gmail_accounts),
                 *(account.email_address for account in settings.calendar_accounts),
+                *(account.email_address for account in settings.contact_google_accounts),
                 *(
                     [settings.alice_voice_recordings.google_drive_account]
                     if settings.alice_voice_recordings is not None
@@ -79,14 +80,16 @@ def main() -> None:
         normalized = args.email.strip().lower()
         if normalized not in {email.lower() for email in configured_emails}:
             configured = ", ".join(configured_emails)
-            raise ValueError(f"{args.email} is not configured in GMAIL_ACCOUNTS or CALENDAR_ACCOUNTS ({configured})")
+            raise ValueError(
+                f"{args.email} is not configured in GMAIL_ACCOUNTS, CALENDAR_ACCOUNTS, or CONTACT_GOOGLE_ACCOUNTS ({configured})"
+            )
         emails = (args.email,)
     else:
         parser.error("pass either --email or --all")
         return
 
     if not emails:
-        parser.error("no accounts configured in GMAIL_ACCOUNTS or CALENDAR_ACCOUNTS")
+        parser.error("no accounts configured in GMAIL_ACCOUNTS, CALENDAR_ACCOUNTS, or CONTACT_GOOGLE_ACCOUNTS")
         return
 
     for email_address in emails:

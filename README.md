@@ -11,6 +11,9 @@ Current ingestion path:
 - Google Calendar events use the same per-account Google OAuth tokens.
 - Calendar first runs do a full event sync, then later runs use Google Calendar `syncToken`.
 - If Calendar expires the saved sync token, the sync falls back to a full resync for that calendar.
+- Google Contacts syncs intentionally saved contacts for configured Google accounts through the
+  People API. It mirrors source cards with raw JSON payloads, sync tokens, and tombstones; it does
+  not import Gmail autocomplete/Other Contacts or infer people across sources.
 - Voice Memos use a two-stage path: a local macOS uploader writes audio files and JSON metadata
   to Google Drive, then a Dagster asset ingests those metadata into Postgres.
 - Apple Notes use the same two-stage local Mac path: a LaunchAgent snapshots the local Notes
@@ -67,6 +70,9 @@ CALENDAR_PAGE_SIZE=2500
 CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS=365
 CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS=365
 CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES=60
+CONTACT_GOOGLE_ACCOUNTS=you@work.example,you@personal.example
+CONTACT_PAGE_SIZE=1000
+CONTACT_FORCE_FULL_SYNC=false
 VOICE_MEMOS_ACCOUNT=you@example.com
 VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
 VOICE_MEMOS_STORAGE_BACKEND=google_drive
@@ -97,6 +103,8 @@ Notes:
 - Google OAuth client secrets and account tokens are env-only; the app does not read or write Google secrets from the filesystem.
 - Calendar sync defaults to the accounts in `GMAIL_ACCOUNTS` and the `primary` calendar unless `CALENDAR_ACCOUNTS` or `CALENDAR_<ACCOUNT_SLUG>_CALENDAR_IDS` are set.
 - Calendar sync also expands recurring event instances in a rolling window so generated occurrences can be matched directly. The expanded pass runs hourly by default, and immediately after full syncs or recurrence-related changes. Tune it with `CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS`, `CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS`, and `CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES`.
+- Contacts sync uses `CONTACT_GOOGLE_ACCOUNTS` and intentionally saved Google Contacts only. It does
+  not sync Gmail autocomplete/Other Contacts or Workspace directory contacts in v1.
 
 ## Gmail Auth
 
@@ -125,8 +133,36 @@ GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64=...
 uv run personal-data-warehouse-google-auth --email zach@zachlatta.com --write-env
 ```
 
-If Voice Memos, Apple Notes, or Apple Messages are configured, the auth flow also requests Google
-Drive access so the local uploader and Drive ingest asset can use the same account token.
+If Contacts are configured, the auth flow also requests Google Contacts readonly access. If Voice
+Memos, Apple Notes, or Apple Messages are configured, the auth flow also requests Google Drive
+access so the local uploader and Drive ingest asset can use the same account token.
+
+## Google Contacts Sync
+
+Configure the Google accounts whose intentionally saved contacts should be mirrored:
+
+```bash
+CONTACT_GOOGLE_ACCOUNTS=you@work.example,you@personal.example
+CONTACT_PAGE_SIZE=1000
+CONTACT_FORCE_FULL_SYNC=false
+```
+
+Re-authorize each account after adding contacts config so the token includes Contacts readonly:
+
+```bash
+uv run personal-data-warehouse-google-auth --email you@work.example --write-env
+uv run personal-data-warehouse-google-auth --email you@personal.example --write-env
+```
+
+Run the sync manually:
+
+```bash
+uv run personal-data-warehouse-contacts-sync
+```
+
+Dagster exposes `google_contacts_sync` in the `contacts` group, scheduled hourly by
+`contacts_sync_hourly`. The sync writes `contact_cards` and `contact_sync_state`, with
+`clean_contacts` as the current non-deleted view.
 
 ## Running The Sync
 

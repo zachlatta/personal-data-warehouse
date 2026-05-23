@@ -18,6 +18,8 @@ from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
     FLOAT_COLUMNS,
     INTEGER_COLUMNS,
+    JSONB_ARRAY_COLUMNS_BY_TABLE,
+    JSONB_COLUMNS_BY_TABLE,
     POSTGRES_TABLES,
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
@@ -418,6 +420,7 @@ def verify_methods(
 def ensure_all_tables(postgres: PostgresWarehouse) -> None:
     postgres.ensure_tables()
     postgres.ensure_calendar_tables()
+    postgres.ensure_contacts_tables()
     postgres.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
     postgres.ensure_slack_tables()
     postgres.ensure_finance_tables()
@@ -451,7 +454,7 @@ def postgres_copy_insert(
     buffer.seek(0)
 
     column_sql = ", ".join(_identifier(column) for column in columns)
-    select_sql = ", ".join(postgres_stage_cast(column) for column in columns)
+    select_sql = ", ".join(postgres_stage_cast(table, column) for column in columns)
     sql = f"""
         INSERT INTO {_identifier(table)} ({column_sql})
         SELECT {select_sql}
@@ -485,10 +488,13 @@ def postgres_text_value(value: str) -> str:
     return value.replace("\x00", POSTGRES_TEXT_NUL_REPLACEMENT)
 
 
-def postgres_stage_cast(column: str) -> str:
+def postgres_stage_cast(table: str, column: str) -> str:
     identifier = _identifier(column)
     if column in ARRAY_COLUMNS:
         return f"COALESCE(ARRAY(SELECT jsonb_array_elements_text(NULLIF(stage.{identifier}, '')::jsonb)), '{{}}'::text[]) AS {identifier}"
+    if column in JSONB_COLUMNS_BY_TABLE.get(table, set()):
+        default = "'[]'::jsonb" if column in JSONB_ARRAY_COLUMNS_BY_TABLE.get(table, set()) else "'{}'::jsonb"
+        return f"COALESCE(NULLIF(stage.{identifier}, '')::jsonb, {default}) AS {identifier}"
     if column in TIMESTAMP_COLUMNS:
         return f"NULLIF(stage.{identifier}, '')::timestamptz AS {identifier}"
     if column in INTEGER_COLUMNS:

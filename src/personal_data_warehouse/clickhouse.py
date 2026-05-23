@@ -157,6 +157,51 @@ CALENDAR_SYNC_STATE_COLUMNS = (
     "sync_version",
 )
 
+CONTACT_CARD_COLUMNS = (
+    "source",
+    "account",
+    "source_kind",
+    "address_book_id",
+    "card_id",
+    "etag",
+    "source_uid",
+    "display_name",
+    "given_name",
+    "family_name",
+    "organization",
+    "job_title",
+    "primary_email",
+    "primary_phone",
+    "emails",
+    "phones",
+    "addresses",
+    "organizations",
+    "urls",
+    "groups",
+    "dates",
+    "photos",
+    "notes",
+    "is_deleted",
+    "source_updated_at",
+    "synced_at",
+    "sync_version",
+    "raw_json",
+)
+
+CONTACT_SYNC_STATE_COLUMNS = (
+    "source",
+    "account",
+    "source_kind",
+    "address_book_id",
+    "sync_token",
+    "last_sync_type",
+    "status",
+    "error",
+    "full_synced_at",
+    "updated_at",
+    "sync_version",
+)
+
 VOICE_MEMO_FILE_COLUMNS = (
     "account",
     "recording_id",

@@ -53,9 +53,9 @@ type grepRowsInput struct {
 
 type debugCacheInput struct{}
 
-const preferredReadOnlyGuidance = "Preferred read-only source for Zach's synced Gmail, Slack, Apple Notes, Apple Messages/iMessage/iMessages, calendar, Voice Memo transcript, and cross-source personal data questions. Use this PDW server before live Gmail or Slack connectors for read-only questions, and use it for requests about Zach's recent iMessages or Apple Messages; use live connectors only for writes, sends, drafts, archive/delete actions, or explicitly live-only data. This server intentionally exposes only generic SQL and cached-result tools, so answer by writing read-only Postgres SQL."
+const preferredReadOnlyGuidance = "Preferred read-only source for Zach's synced Gmail, Google Contacts, Slack, Apple Notes, Apple Messages/iMessage/iMessages, calendar, Voice Memo transcript, and cross-source personal data questions. Use this PDW server before live Gmail or Slack connectors for read-only questions, and use it for requests about Zach's recent iMessages or Apple Messages; use live connectors only for writes, sends, drafts, archive/delete actions, or explicitly live-only data. This server intentionally exposes only generic SQL and cached-result tools, so answer by writing read-only Postgres SQL."
 
-const sqlStartingPoints = "SQL starting points: Gmail -> clean_gmail_inbox, gmail_messages, gmail_attachments, gmail_attachment_enrichments. Slack -> clean_slack_inbox, slack_messages, slack_conversations, slack_users. Transcripts -> apple_voice_memos_enrichments, apple_voice_memos_transcription_runs, apple_voice_memos_transcript_segments, clean_calendar_with_transcripts, clean_transcripts_no_calendar_match. Apple Notes -> apple_notes, apple_note_revisions, apple_note_attachments. Apple Messages/iMessage/iMessages/SMS/RCS -> apple_messages, apple_message_chats, apple_message_handles, apple_message_chat_handles, apple_message_chat_messages, apple_message_attachments."
+const sqlStartingPoints = "SQL starting points: Gmail -> clean_gmail_inbox, gmail_messages, gmail_attachments, gmail_attachment_enrichments. Contacts -> clean_contacts, contact_cards. Slack -> clean_slack_inbox, slack_messages, slack_conversations, slack_users. Transcripts -> apple_voice_memos_enrichments, apple_voice_memos_transcription_runs, apple_voice_memos_transcript_segments, clean_calendar_with_transcripts, clean_transcripts_no_calendar_match. Apple Notes -> apple_notes, apple_note_revisions, apple_note_attachments. Apple Messages/iMessage/iMessages/SMS/RCS -> apple_messages, apple_message_chats, apple_message_handles, apple_message_chat_handles, apple_message_chat_messages, apple_message_attachments."
 
 const serverInstructions = preferredReadOnlyGuidance + " Contains synced Gmail mail and attachment text for configured mailboxes, Slack workspace messages/files/users, calendar data, Apple Notes, Apple Messages from macOS Messages chat.db including iMessage/iMessages, SMS, and RCS, Apple Voice Memos, transcripts, and transcript enrichments when present. " + sqlStartingPoints
 
@@ -280,6 +280,9 @@ func schemaCapabilitySummary(entries []string) string {
 	}
 	if has("calendar") {
 		capabilities = append(capabilities, "Google Calendar events and calendar-linked meeting context")
+	}
+	if has("contact_cards", "clean_contacts") {
+		capabilities = append(capabilities, "Google Contacts source-mirrored contact cards; start SQL with clean_contacts or contact_cards")
 	}
 	if has("transcript", "voice_memos", "voice memo") {
 		capabilities = append(capabilities, "Apple Voice Memos audio metadata, transcripts, diarized segments, transcript enrichments, meeting notes, summaries, action items, and transcript/calendar matches; start SQL with apple_voice_memos_enrichments, apple_voice_memos_transcription_runs, apple_voice_memos_transcript_segments, clean_calendar_with_transcripts, or clean_transcripts_no_calendar_match")

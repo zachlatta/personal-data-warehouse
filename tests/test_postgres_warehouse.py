@@ -12,6 +12,7 @@ from personal_data_warehouse.clickhouse import (
     APPLE_NOTE_COLUMNS,
     APPLE_NOTE_REVISION_COLUMNS,
     CALENDAR_EVENT_COLUMNS,
+    CONTACT_CARD_COLUMNS,
     SLACK_ACCOUNT_IDENTITY_COLUMNS,
     SLACK_CONVERSATION_COLUMNS,
     SLACK_CONVERSATION_MEMBER_COLUMNS,
@@ -167,6 +168,37 @@ def _slack_member_row(*, conversation_id: str, user_id: str, sync_version: int =
     return row
 
 
+def _contact_card_row(*, card_id: str, display_name: str, sync_version: int, is_deleted: int = 0, **overrides):
+    now = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    row = _default_row(
+        CONTACT_CARD_COLUMNS,
+        source="google_people",
+        account="contact@example.test",
+        source_kind="google_contacts",
+        address_book_id="people/me",
+        card_id=card_id,
+        etag=f"etag-{card_id}",
+        source_uid=f"source-{card_id}",
+        display_name=display_name,
+        primary_email=f"{card_id}@example.test",
+        emails=[{"value": f"{card_id}@example.test"}],
+        phones=[],
+        addresses=[],
+        organizations=[],
+        urls=[],
+        groups=[],
+        dates={"birthdays": [], "events": []},
+        photos=[],
+        is_deleted=is_deleted,
+        source_updated_at=now,
+        synced_at=now,
+        sync_version=sync_version,
+        raw_json={"resourceName": card_id},
+    )
+    row.update(overrides)
+    return row
+
+
 def test_postgres_message_upsert_keeps_highest_sync_version(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
 
@@ -207,6 +239,7 @@ def test_apple_message_attachment_upsert_preserves_existing_storage_when_metadat
 def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     warehouse.ensure_calendar_tables()
+    warehouse.ensure_contacts_tables()
     warehouse.ensure_apple_voice_memos_tables()
     warehouse.ensure_apple_notes_tables()
     warehouse.ensure_apple_messages_tables()
@@ -220,7 +253,7 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
         WHERE table_schema = current_schema()
           AND table_name IN (
             'gmail_messages', 'calendar_events', 'slack_messages', 'apple_voice_memos_files',
-            'apple_notes', 'apple_messages', 'finance_accounts'
+            'apple_notes', 'apple_messages', 'finance_accounts', 'contact_cards'
           )
         ORDER BY table_name
         """
@@ -231,6 +264,7 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
         "apple_notes",
         "apple_voice_memos_files",
         "calendar_events",
+        "contact_cards",
         "finance_accounts",
         "gmail_messages",
         "slack_messages",
@@ -256,6 +290,156 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
 
     extension_rows = warehouse._query("SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'")
     assert extension_rows == [("pg_trgm",)]
+
+
+def test_postgres_contacts_tables_use_jsonb_without_changing_existing_raw_json(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_contacts_tables()
+    warehouse.ensure_slack_tables()
+
+    rows = warehouse._query(
+        """
+        SELECT table_name, column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND (
+            (table_name = 'contact_cards' AND column_name IN ('emails', 'raw_json'))
+            OR (table_name = 'slack_conversations' AND column_name = 'raw_json')
+          )
+        ORDER BY table_name, column_name
+        """
+    )
+
+    assert rows == [
+        ("contact_cards", "emails", "jsonb"),
+        ("contact_cards", "raw_json", "jsonb"),
+        ("slack_conversations", "raw_json", "text"),
+    ]
+
+
+def test_postgres_contact_cards_upsert_jsonb_and_clean_view(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_contacts_tables()
+
+    warehouse.insert_contact_cards([
+        _contact_card_row(card_id="people/c1", display_name="New Name", sync_version=20)
+    ])
+    warehouse.insert_contact_cards([
+        _contact_card_row(card_id="people/c1", display_name="Old Name", sync_version=10)
+    ])
+    warehouse.insert_contact_cards([
+        _contact_card_row(card_id="people/c2", display_name="Deleted", sync_version=20, is_deleted=1)
+    ])
+
+    rows = warehouse._query(
+        """
+        SELECT display_name, emails #>> '{0,value}', raw_json ->> 'resourceName'
+        FROM clean_contacts
+        ORDER BY card_id
+        """
+    )
+
+    assert rows == [("New Name", "people/c1@example.test", "people/c1")]
+
+
+def test_postgres_contact_card_edit_replaces_existing_active_card(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_contacts_tables()
+
+    warehouse.insert_contact_cards([
+        _contact_card_row(card_id="people/c1", display_name="Old Name", sync_version=10)
+    ])
+    warehouse.insert_contact_cards([
+        _contact_card_row(
+            card_id="people/c1",
+            display_name="Edited Name",
+            sync_version=20,
+            primary_email="edited@example.test",
+            emails=[{"value": "edited@example.test"}],
+            raw_json={"resourceName": "people/c1", "etag": "edited"},
+        )
+    ])
+
+    rows = warehouse._query(
+        """
+        SELECT display_name, primary_email, emails #>> '{0,value}', raw_json ->> 'etag'
+        FROM clean_contacts
+        WHERE card_id = 'people/c1'
+        """
+    )
+
+    assert rows == [("Edited Name", "edited@example.test", "edited@example.test", "edited")]
+
+
+def test_postgres_contact_card_incremental_delete_removes_card_from_clean_contacts(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_contacts_tables()
+
+    warehouse.insert_contact_cards([
+        _contact_card_row(card_id="people/c1", display_name="Active Name", sync_version=10)
+    ])
+    warehouse.insert_contact_cards([
+        _contact_card_row(
+            card_id="people/c1",
+            display_name="",
+            sync_version=20,
+            is_deleted=1,
+            primary_email="",
+            emails=[],
+            raw_json={"resourceName": "people/c1", "metadata": {"deleted": True}},
+        )
+    ])
+
+    rows = warehouse._query(
+        """
+        SELECT is_deleted, raw_json #>> '{metadata,deleted}'
+        FROM contact_cards
+        WHERE card_id = 'people/c1'
+        """
+    )
+    clean_rows = warehouse._query("SELECT count(*) FROM clean_contacts WHERE card_id = 'people/c1'")
+
+    assert rows == [(1, "true")]
+    assert clean_rows == [(0,)]
+
+
+def test_postgres_mark_missing_contact_cards_deleted_tombstones_only_scope(warehouse: PostgresWarehouse) -> None:
+    synced_at = datetime(2026, 5, 20, 12, tzinfo=UTC)
+    warehouse.ensure_contacts_tables()
+    warehouse.insert_contact_cards(
+        [
+            _contact_card_row(card_id="people/keep", display_name="Keep", sync_version=1),
+            _contact_card_row(card_id="people/delete", display_name="Delete", sync_version=1),
+            _contact_card_row(
+                card_id="people/other",
+                display_name="Other",
+                sync_version=1,
+                account="other@example.test",
+            ),
+        ]
+    )
+
+    deleted = warehouse.mark_missing_contact_cards_deleted(
+        source="google_people",
+        account="contact@example.test",
+        source_kind="google_contacts",
+        address_book_id="people/me",
+        active_card_ids={"people/keep"},
+        synced_at=synced_at,
+    )
+
+    rows = warehouse._query(
+        """
+        SELECT account, card_id, is_deleted, synced_at
+        FROM contact_cards
+        ORDER BY account, card_id
+        """
+    )
+
+    assert deleted == 1
+    assert rows == [
+        ("contact@example.test", "people/delete", 1, synced_at),
+        ("contact@example.test", "people/keep", 0, datetime(2026, 5, 19, 12, tzinfo=UTC)),
+        ("other@example.test", "people/other", 0, datetime(2026, 5, 19, 12, tzinfo=UTC)),
+    ]
 
 
 def test_postgres_slack_tables_create_conversation_stats_table(warehouse: PostgresWarehouse) -> None:
