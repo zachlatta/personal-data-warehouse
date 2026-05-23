@@ -1255,8 +1255,85 @@ class PostgresWarehouse:
         )
         return _json_payloads(rows)
 
+    def load_slack_member_sync_candidate_payloads(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_types: tuple[str, ...] = ("private_channel",),
+        limit: int | None = None,
+        skip_known_errors: bool = False,
+    ) -> list[dict[str, Any]]:
+        where = [
+            "c.account = %s",
+            "c.team_id = %s",
+            "c.is_archived = 0",
+            "c.is_member = 1",
+        ]
+        params: list[Any] = [account, team_id]
+        if conversation_types:
+            where.append("c.conversation_type = ANY(%s)")
+            params.append(list(conversation_types))
+        if skip_known_errors:
+            where.append("COALESCE(s.status, '') != 'error'")
+        limit_clause = "LIMIT %s" if limit is not None else ""
+        if limit is not None:
+            params.append(int(limit))
+        rows = self._query(
+            f"""
+            SELECT c.raw_json
+            FROM slack_conversations AS c
+            LEFT JOIN slack_sync_state AS s
+              ON c.account = s.account
+             AND c.team_id = s.team_id
+             AND c.conversation_id = s.object_id
+             AND s.object_type = 'conversation_members'
+            WHERE {" AND ".join(where)}
+            ORDER BY
+                (COALESCE(s.status, '') = 'ok') ASC,
+                s.updated_at ASC NULLS FIRST,
+                c.num_members DESC,
+                c.conversation_id
+            {limit_clause}
+            """,
+            tuple(params),
+        )
+        return _json_payloads(rows)
+
     def insert_slack_conversation_members(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("slack_conversation_members", rows, SLACK_CONVERSATION_MEMBER_COLUMNS)
+
+    def replace_slack_conversation_members(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+        rows: list[dict[str, Any]],
+        synced_at: datetime,
+        sync_version: int,
+    ) -> None:
+        self.insert_slack_conversation_members(rows)
+        active_user_ids = sorted({str(row["user_id"]) for row in rows})
+        params: list[Any] = [synced_at, sync_version, account, team_id, conversation_id, sync_version]
+        active_filter = ""
+        if active_user_ids:
+            active_filter = "AND NOT (user_id = ANY(%s))"
+            params.append(active_user_ids)
+        self._command(
+            f"""
+            UPDATE slack_conversation_members
+               SET is_deleted = 1,
+                   synced_at = %s,
+                   sync_version = %s
+             WHERE account = %s
+               AND team_id = %s
+               AND conversation_id = %s
+               AND sync_version <= %s
+               {active_filter}
+            """,
+            tuple(params),
+        )
 
     def insert_slack_messages(self, rows: list[dict[str, Any]]) -> None:
         increments, latest_candidates, recompute_keys = self._slack_conversation_stat_changes_for_message_rows(rows)

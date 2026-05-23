@@ -56,6 +56,8 @@ class FakeWarehouse:
         self.ensure_calls = 0
         self.conversation_payloads = []
         self.conversation_payload_calls = []
+        self.member_candidate_payloads = []
+        self.member_candidate_calls = []
         self.read_state_candidate_calls = []
         self.thread_refs = []
         self.thread_ref_calls = []
@@ -64,6 +66,7 @@ class FakeWarehouse:
         self.users = []
         self.conversations = []
         self.members = []
+        self.member_replacements = []
         self.messages = []
         self.reactions = []
         self.files = []
@@ -212,8 +215,45 @@ class FakeWarehouse:
             payloads = payloads[:limit]
         return payloads
 
+    def load_slack_member_sync_candidate_payloads(
+        self,
+        *,
+        account,
+        team_id,
+        conversation_types=(),
+        limit=None,
+        skip_known_errors=False,
+    ):
+        self.member_candidate_calls.append(
+            {
+                "account": account,
+                "team_id": team_id,
+                "conversation_types": conversation_types,
+                "limit": limit,
+                "skip_known_errors": skip_known_errors,
+            }
+        )
+        payloads = []
+        candidates = self.member_candidate_payloads or self.conversation_payloads
+        for payload in candidates:
+            if conversation_types and conversation_to_row(
+                account=account,
+                team_id=team_id,
+                conversation=payload,
+                synced_at=datetime(2026, 4, 24, tzinfo=UTC),
+            )["conversation_type"] not in conversation_types:
+                continue
+            payloads.append(payload)
+        if limit is not None:
+            payloads = payloads[:limit]
+        return payloads
+
     def insert_slack_conversation_members(self, rows):
         self.members.extend(rows)
+
+    def replace_slack_conversation_members(self, **kwargs):
+        self.member_replacements.append(kwargs)
+        self.members.extend(kwargs["rows"])
 
     def insert_slack_messages(self, rows):
         self.messages.extend(rows)
@@ -451,6 +491,86 @@ def test_runner_full_sync_collects_workspace_conversations_messages_threads_and_
     }
     assert warehouse.files[0]["file_id"] == "F1"
     assert any(update["object_type"] == "conversation" and update["cursor_ts"] == "1713974400.000100" for update in warehouse.state_updates)
+
+
+def test_runner_members_only_syncs_cached_private_member_candidates(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+            "conversations.members": [{"ok": True, "members": ["U1", "U2"], "response_metadata": {}}],
+        }
+    )
+    warehouse = FakeWarehouse()
+    warehouse.member_candidate_payloads = [{"id": "G1", "name": "private", "is_private": True, "is_member": True}]
+
+    summaries = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_members_only=True,
+        sync_users=True,
+        sync_members=False,
+        use_existing_conversations=True,
+        conversation_types=("private_channel",),
+        conversation_limit=50,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert summaries[0].sync_type == "members"
+    assert summaries[0].conversations_seen == 1
+    assert [method for method, _params in client.calls] == ["auth.test", "team.info", "conversations.members"]
+    assert warehouse.member_candidate_calls == [
+        {
+            "account": "zrl",
+            "team_id": "T1",
+            "conversation_types": ("private_channel",),
+            "limit": 50,
+            "skip_known_errors": False,
+        }
+    ]
+    assert [row["user_id"] for row in warehouse.member_replacements[0]["rows"]] == ["U1", "U2"]
+    assert warehouse.member_replacements[0]["conversation_id"] == "G1"
+    assert warehouse.state_updates[-1]["object_type"] == "conversation_members"
+    assert warehouse.state_updates[-1]["object_id"] == "G1"
+    assert warehouse.state_updates[-1]["status"] == "ok"
+
+
+def test_runner_members_only_records_errors_without_replacing_members(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+            "conversations.members": [SlackApiCallError("conversations.members failed: not_in_channel")],
+        }
+    )
+    warehouse = FakeWarehouse()
+    warehouse.member_candidate_payloads = [{"id": "G1", "name": "private", "is_private": True, "is_member": True}]
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_members_only=True,
+        use_existing_conversations=True,
+        conversation_types=("private_channel",),
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.member_replacements == []
+    assert warehouse.members == []
+    assert warehouse.state_updates[-1]["object_type"] == "conversation_members"
+    assert warehouse.state_updates[-1]["object_id"] == "G1"
+    assert warehouse.state_updates[-1]["status"] == "error"
+    assert "not_in_channel" in warehouse.state_updates[-1]["error"]
 
 
 def test_runner_can_refresh_conversations_without_fetching_messages(monkeypatch):

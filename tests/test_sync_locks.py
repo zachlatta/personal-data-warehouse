@@ -10,10 +10,12 @@ from personal_data_warehouse.defs.slack_sync import (
     run_intelligent_slack_sync,
     run_slack_coverage_sync,
     run_slack_freshness_sync,
+    run_slack_member_sync,
     run_slack_metadata_sync,
     run_slack_read_state_sync,
     run_slack_thread_sync,
     run_slack_user_sync,
+    slack_workspace_member_sync_hourly,
     slack_workspace_coverage_sync_every_seven_minutes,
     slack_workspace_metadata_sync_every_fifteen_minutes,
     slack_workspace_read_state_sync_every_five_minutes,
@@ -47,6 +49,8 @@ def test_slack_sync_schedule_runs_every_five_minutes_by_default() -> None:
     assert slack_workspace_thread_sync_every_five_minutes.default_status.value == "RUNNING"
     assert slack_workspace_read_state_sync_every_five_minutes.cron_schedule == "2-59/5 * * * *"
     assert slack_workspace_read_state_sync_every_five_minutes.default_status.value == "RUNNING"
+    assert slack_workspace_member_sync_hourly.cron_schedule == "17 * * * *"
+    assert slack_workspace_member_sync_hourly.default_status.value == "RUNNING"
 
 
 def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
@@ -381,6 +385,62 @@ def test_slack_thread_sync_backfills_known_threads_conservatively(monkeypatch) -
     assert calls[0]["thread_order"] == "recent"
     assert calls[0]["thread_limit"] == 1
     assert calls[0]["thread_since_days"] == 30
+
+
+def test_slack_member_sync_refreshes_private_members_conservatively(monkeypatch) -> None:
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def sync_all(self):
+            return [
+                SlackSyncSummary(
+                    account="zrl",
+                    team_id="T1",
+                    sync_type="members",
+                    conversations_seen=1,
+                    messages_written=0,
+                    users_written=0,
+                    files_written=0,
+                )
+            ]
+
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
+    settings = Settings(
+        clickhouse_url=None,
+        gmail_accounts=(),
+        gmail_oauth_client_secrets_json=None,
+        gmail_scopes=(),
+        gmail_page_size=500,
+        gmail_include_spam_trash=True,
+        gmail_force_full_sync=False,
+        gmail_full_sync_query=None,
+        gmail_attachment_max_bytes=25 * 1024 * 1024,
+        gmail_attachment_text_max_chars=1_000_000,
+        gmail_attachment_backfill_batch_size=100,
+        slack_accounts=(),
+        slack_page_size=200,
+        slack_lookback_days=14,
+        slack_thread_audit_days=30,
+        slack_force_full_sync=False,
+    )
+
+    summaries = run_slack_member_sync(
+        settings=settings,
+        warehouse=SimpleNamespace(),
+        logger=SimpleNamespace(),
+    )
+
+    assert len(summaries) == 1
+    assert calls[0]["sync_users"] is False
+    assert calls[0]["sync_members"] is False
+    assert calls[0]["sync_members_only"] is True
+    assert calls[0]["use_existing_conversations"] is True
+    assert calls[0]["conversation_types"] == ("private_channel",)
+    assert calls[0]["conversation_limit"] == 50
+    assert calls[0]["sync_thread_replies"] is False
 
 
 def test_slack_read_state_sync_refreshes_recent_conversation_info(monkeypatch) -> None:

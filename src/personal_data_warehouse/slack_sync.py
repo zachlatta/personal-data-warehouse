@@ -97,6 +97,7 @@ class SlackSyncRunner:
         conversation_page_limit: int | None = None,
         sync_thread_replies: bool = True,
         sync_thread_replies_only: bool = False,
+        sync_members_only: bool = False,
         sync_conversations_only: bool = False,
         sync_conversation_info_only: bool = False,
         skip_completed_full: bool = False,
@@ -128,6 +129,7 @@ class SlackSyncRunner:
         self._conversation_page_limit = conversation_page_limit
         self._sync_thread_replies = sync_thread_replies
         self._sync_thread_replies_only = sync_thread_replies_only
+        self._sync_members_only = sync_members_only
         self._sync_conversations_only = sync_conversations_only
         self._sync_conversation_info_only = sync_conversation_info_only
         self._skip_completed_full = skip_completed_full
@@ -229,6 +231,15 @@ class SlackSyncRunner:
                 state_by_key=state_by_key,
             )
 
+        if self._sync_members_only:
+            return self._sync_account_members(
+                account=account,
+                team_id=team_id,
+                client=client,
+                synced_at=synced_at,
+                sync_version=sync_version,
+            )
+
         if self._freshness_priority:
             return self._sync_account_freshness_priority(
                 account=account,
@@ -319,6 +330,7 @@ class SlackSyncRunner:
                         conversation_id=conversation_id,
                         client=client,
                         synced_at=synced_at,
+                        sync_version=sync_version,
                     )
                 oldest_ts = self._oldest_ts_for_conversation(state)
                 if oldest_ts is not None and not conversation_may_have_activity_since(conversation, oldest_ts):
@@ -636,6 +648,55 @@ class SlackSyncRunner:
             files_written=files_written,
         )
 
+    def _sync_account_members(
+        self,
+        *,
+        account: SlackAccount,
+        team_id: str,
+        client,
+        synced_at: datetime,
+        sync_version: int,
+    ) -> SlackSyncSummary:
+        conversations = self._warehouse.load_slack_member_sync_candidate_payloads(
+            account=account.account,
+            team_id=team_id,
+            conversation_types=self._conversation_types or ("private_channel",),
+            limit=self._conversation_limit,
+            skip_known_errors=self._skip_known_errors,
+        )
+        members_written = 0
+        for index, conversation in enumerate(conversations, start=1):
+            if not isinstance(conversation, Mapping) or not conversation.get("id"):
+                continue
+            conversation_id = str(conversation["id"])
+            members_written += self._sync_members(
+                account=account.account,
+                team_id=team_id,
+                conversation_id=conversation_id,
+                client=client,
+                synced_at=synced_at,
+                sync_version=sync_version,
+                record_state=True,
+            )
+            if index % 50 == 0:
+                self._logger.info("Synced Slack members for %s conversations on %s so far", index, account.account)
+
+        self._logger.info(
+            "Synced %s Slack member rows across %s conversations for %s",
+            members_written,
+            len(conversations),
+            account.account,
+        )
+        return SlackSyncSummary(
+            account=account.account,
+            team_id=team_id,
+            sync_type="members",
+            conversations_seen=len(conversations),
+            messages_written=0,
+            users_written=0,
+            files_written=0,
+        )
+
     def _sync_account_conversation_info(
         self,
         *,
@@ -738,7 +799,17 @@ class SlackSyncRunner:
         )
         return {"messages_written": messages_written, "files_written": files_written}
 
-    def _sync_members(self, *, account: str, team_id: str, conversation_id: str, client, synced_at: datetime) -> None:
+    def _sync_members(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+        client,
+        synced_at: datetime,
+        sync_version: int,
+        record_state: bool = False,
+    ) -> int:
         try:
             members = list(
                 iter_cursor_items(
@@ -752,7 +823,20 @@ class SlackSyncRunner:
             )
         except SlackApiCallError as exc:
             self._logger.warning("Could not sync Slack members for %s: %s", conversation_id, exc)
-            return
+            if record_state:
+                self._warehouse.insert_slack_sync_state(
+                    account=account,
+                    team_id=team_id,
+                    object_type="conversation_members",
+                    object_id=conversation_id,
+                    cursor_ts="",
+                    last_sync_type="members",
+                    status="error",
+                    error=str(exc),
+                    updated_at=synced_at,
+                    sync_version=sync_version,
+                )
+            return 0
 
         rows = [
             conversation_member_to_row(
@@ -764,7 +848,31 @@ class SlackSyncRunner:
             )
             for user_id in members
         ]
-        self._warehouse.insert_slack_conversation_members(rows)
+        if hasattr(self._warehouse, "replace_slack_conversation_members"):
+            self._warehouse.replace_slack_conversation_members(
+                account=account,
+                team_id=team_id,
+                conversation_id=conversation_id,
+                rows=rows,
+                synced_at=synced_at,
+                sync_version=sync_version,
+            )
+        else:
+            self._warehouse.insert_slack_conversation_members(rows)
+        if record_state:
+            self._warehouse.insert_slack_sync_state(
+                account=account,
+                team_id=team_id,
+                object_type="conversation_members",
+                object_id=conversation_id,
+                cursor_ts="",
+                last_sync_type="members",
+                status="ok",
+                error="",
+                updated_at=synced_at,
+                sync_version=sync_version,
+            )
+        return len(rows)
 
     def _sync_conversation_messages(
         self,
@@ -1484,6 +1592,11 @@ def main() -> None:
         help="Only backfill conversations.replies for known thread parent messages",
     )
     parser.add_argument(
+        "--sync-members-only",
+        action="store_true",
+        help="Only refresh conversations.members for cached conversations",
+    )
+    parser.add_argument(
         "--sync-conversations-only",
         action="store_true",
         help="Only refresh active Slack conversations without fetching messages",
@@ -1549,6 +1662,7 @@ def main() -> None:
             conversation_page_limit=args.conversation_page_limit,
             sync_thread_replies=not args.skip_thread_replies,
             sync_thread_replies_only=args.sync_thread_replies_only,
+            sync_members_only=args.sync_members_only,
             sync_conversations_only=args.sync_conversations_only,
             sync_conversation_info_only=args.sync_conversation_info_only,
             skip_completed_full=args.skip_completed_full,

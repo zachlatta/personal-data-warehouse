@@ -14,6 +14,7 @@ from personal_data_warehouse.clickhouse import (
     CALENDAR_EVENT_COLUMNS,
     SLACK_ACCOUNT_IDENTITY_COLUMNS,
     SLACK_CONVERSATION_COLUMNS,
+    SLACK_CONVERSATION_MEMBER_COLUMNS,
     SLACK_MESSAGE_COLUMNS,
     VOICE_MEMO_ENRICHMENT_COLUMNS,
     VOICE_MEMO_FILE_COLUMNS,
@@ -150,6 +151,22 @@ def _slack_message_row(
     return row
 
 
+def _slack_member_row(*, conversation_id: str, user_id: str, sync_version: int = 1, is_deleted: int = 0, **overrides):
+    now = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    row = _default_row(
+        SLACK_CONVERSATION_MEMBER_COLUMNS,
+        account="zrl",
+        team_id="T1",
+        conversation_id=conversation_id,
+        user_id=user_id,
+        is_deleted=is_deleted,
+        synced_at=now,
+        sync_version=sync_version,
+    )
+    row.update(overrides)
+    return row
+
+
 def test_postgres_message_upsert_keeps_highest_sync_version(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
 
@@ -262,6 +279,113 @@ def test_postgres_slack_tables_create_conversation_stats_table(warehouse: Postgr
         "latest_message_at",
         "updated_at",
     ]
+
+
+def test_postgres_replace_slack_conversation_members_tombstones_missing_members(warehouse: PostgresWarehouse) -> None:
+    old_sync = datetime(2026, 5, 18, 12, tzinfo=UTC)
+    new_sync = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversation_members(
+        [
+            _slack_member_row(conversation_id="G1", user_id="U1", synced_at=old_sync, sync_version=1),
+            _slack_member_row(conversation_id="G1", user_id="U2", synced_at=old_sync, sync_version=1),
+            _slack_member_row(conversation_id="G2", user_id="U9", synced_at=old_sync, sync_version=1),
+        ]
+    )
+
+    warehouse.replace_slack_conversation_members(
+        account="zrl",
+        team_id="T1",
+        conversation_id="G1",
+        rows=[
+            _slack_member_row(conversation_id="G1", user_id="U2", synced_at=new_sync, sync_version=2),
+            _slack_member_row(conversation_id="G1", user_id="U3", synced_at=new_sync, sync_version=2),
+        ],
+        synced_at=new_sync,
+        sync_version=2,
+    )
+
+    rows = warehouse._query(
+        """
+        SELECT conversation_id, user_id, is_deleted, synced_at, sync_version
+        FROM slack_conversation_members
+        ORDER BY conversation_id, user_id
+        """
+    )
+
+    assert rows == [
+        ("G1", "U1", 1, new_sync, 2),
+        ("G1", "U2", 0, new_sync, 2),
+        ("G1", "U3", 0, new_sync, 2),
+        ("G2", "U9", 0, old_sync, 1),
+    ]
+
+
+def test_postgres_member_sync_candidates_prioritize_never_synced_private_channels(warehouse: PostgresWarehouse) -> None:
+    old_sync = datetime(2026, 5, 18, 12, tzinfo=UTC)
+    newer_sync = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(
+                conversation_id="G1",
+                conversation_type="private_channel",
+                raw_json='{"id":"G1","name":"never-synced","is_private":true,"is_member":true}',
+                num_members=5,
+            ),
+            _slack_conversation_row(
+                conversation_id="G2",
+                conversation_type="private_channel",
+                raw_json='{"id":"G2","name":"already-synced","is_private":true,"is_member":true}',
+                num_members=20,
+            ),
+            _slack_conversation_row(
+                conversation_id="G3",
+                conversation_type="private_channel",
+                raw_json='{"id":"G3","name":"archived","is_private":true,"is_member":true,"is_archived":true}',
+                is_archived=1,
+            ),
+            _slack_conversation_row(
+                conversation_id="C1",
+                conversation_type="public_channel",
+                raw_json='{"id":"C1","name":"public","is_channel":true,"is_member":true}',
+                num_members=100,
+            ),
+        ]
+    )
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation_members",
+        object_id="G2",
+        cursor_ts="",
+        last_sync_type="members",
+        status="ok",
+        error="",
+        updated_at=old_sync,
+        sync_version=1,
+    )
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation_members",
+        object_id="C1",
+        cursor_ts="",
+        last_sync_type="members",
+        status="ok",
+        error="",
+        updated_at=newer_sync,
+        sync_version=2,
+    )
+
+    payloads = warehouse.load_slack_member_sync_candidate_payloads(
+        account="zrl",
+        team_id="T1",
+        conversation_types=("private_channel",),
+        limit=10,
+    )
+
+    assert [payload["id"] for payload in payloads] == ["G1", "G2"]
 
 
 def test_postgres_rebuild_slack_conversation_stats_backfills_live_messages(
