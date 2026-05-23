@@ -80,20 +80,60 @@ run_backup() {
   log "completed ${type} backup"
 }
 
+backup_state_dir() {
+  local spool="${PGBACKREST_SPOOL_PATH:-/var/spool/pgbackrest}"
+  printf '%s\n' "$spool/pdw-backup-loop/${PGBACKREST_STANZA:-pdw}"
+}
+
+backup_state_mark_done() {
+  local key="$1"
+  local dir
+  dir="$(backup_state_dir)"
+  mkdir -p "$dir"
+  : > "$dir/$key"
+}
+
+backup_state_done() {
+  local key="$1"
+  test -e "$(backup_state_dir)/$key"
+}
+
 backup_type_for_now() {
-  local hour weekday
+  local date hour weekday week
+  date="$(date -u +%Y%m%d)"
   hour="$(date -u +%H)"
   weekday="$(date -u +%u)"
+  week="$(date -u +%G%V)"
 
   if [ -n "${PDW_PGBACKREST_BACKUP_FORCE_TYPE:-}" ]; then
     printf '%s\n' "$PDW_PGBACKREST_BACKUP_FORCE_TYPE"
-  elif [ "$weekday" = "${PDW_PGBACKREST_FULL_BACKUP_WEEKDAY_UTC:-7}" ] && [ "$hour" = "${PDW_PGBACKREST_FULL_BACKUP_HOUR_UTC:-08}" ]; then
+  elif [ "$weekday" = "${PDW_PGBACKREST_FULL_BACKUP_WEEKDAY_UTC:-7}" ] \
+    && [ "$hour" -ge "${PDW_PGBACKREST_FULL_BACKUP_HOUR_UTC:-08}" ] \
+    && ! backup_state_done "full-$week"; then
     printf 'full\n'
-  elif [ "$hour" = "${PDW_PGBACKREST_DIFF_BACKUP_HOUR_UTC:-08}" ]; then
+  elif [ "$hour" -ge "${PDW_PGBACKREST_DIFF_BACKUP_HOUR_UTC:-08}" ] \
+    && ! backup_state_done "diff-$date"; then
     printf 'diff\n'
   else
     printf 'incr\n'
   fi
+}
+
+mark_backup_type_done() {
+  local type="$1"
+  local date week
+  date="$(date -u +%Y%m%d)"
+  week="$(date -u +%G%V)"
+
+  case "$type" in
+    full)
+      backup_state_mark_done "full-$week"
+      backup_state_mark_done "diff-$date"
+      ;;
+    diff)
+      backup_state_mark_done "diff-$date"
+      ;;
+  esac
 }
 
 main() {
@@ -102,13 +142,19 @@ main() {
   run_check
 
   if bool_enabled "${PDW_PGBACKREST_BACKUP_ON_STARTUP:-true}" && ! has_backup; then
-    run_backup full
+    if run_backup full; then
+      mark_backup_type_done full
+    fi
   fi
 
   local interval="${PDW_PGBACKREST_BACKUP_INTERVAL_SECONDS:-21600}"
+  local type
   while true; do
     sleep "$interval"
-    run_backup "$(backup_type_for_now)" || true
+    type="$(backup_type_for_now)"
+    if run_backup "$type"; then
+      mark_backup_type_done "$type"
+    fi
   done
 }
 

@@ -107,8 +107,8 @@ seconds.
 
 Default backup selection is:
 
-- full: Sunday at 08:00 UTC
-- differential: other days at 08:00 UTC
+- full: once each Sunday after 08:00 UTC
+- differential: once each other day after 08:00 UTC
 - incremental: all other loop wakeups
 
 Useful overrides:
