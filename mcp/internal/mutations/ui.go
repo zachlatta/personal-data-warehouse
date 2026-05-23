@@ -389,7 +389,9 @@ func isGmailEmailMutation(mutation Mutation) bool {
 func renderGmailEmailMutation(w http.ResponseWriter, mutation Mutation, requestID string, requestStatus string, csrf string) {
 	email := gmailEmailPreview(mutation)
 	deliveryMode := gmailEmailDeliveryMode(mutation, email)
+	variants := gmailEmailVariants(mutation, email)
 	pending := requestStatus == "pending_review" && mutation.Status == "pending_review"
+	replyThreads := gmailEmailReplyThreads(mutation)
 	fmt.Fprintf(w, `<article class="mutation gmail-email-mutation"><div class="mutation-head"><div><p class="eyebrow">Gmail Email</p><h3>%s</h3></div><span class="pill">%s</span></div>`,
 		html.EscapeString(gmailEmailTitle(deliveryMode)),
 		html.EscapeString(mutation.Status),
@@ -397,8 +399,16 @@ func renderGmailEmailMutation(w http.ResponseWriter, mutation Mutation, requestI
 	fmt.Fprintf(w, `<p class="mutation-meta">%s for %s</p>`, html.EscapeString(mutation.Operation), html.EscapeString(mutation.Account))
 	fmt.Fprintf(w, `<p class="mutation-reason">%s</p>`, html.EscapeString(gmailEmailActionText(deliveryMode)))
 	if pending {
-		renderGmailEmailEditForm(w, mutation, requestID, email, deliveryMode, csrf)
+		if len(replyThreads) > 0 {
+			renderGmailEmailReplyContext(w, replyThreads, func(w http.ResponseWriter) {
+				renderGmailInlineReplyComposer(w, mutation, requestID, variants, deliveryMode, csrf)
+			})
+		} else {
+			renderGmailEmailEditForms(w, mutation, requestID, variants, deliveryMode, csrf)
+		}
+		writeTiptapScript(w)
 	} else {
+		renderGmailEmailReplyContext(w, replyThreads, nil)
 		renderGmailEmailReadOnly(w, email, deliveryMode)
 	}
 	fmt.Fprint(w, `</article>`)
@@ -425,6 +435,50 @@ func gmailEmailDeliveryMode(mutation Mutation, email map[string]any) string {
 	return "send"
 }
 
+type gmailEmailVariant struct {
+	ID       string
+	Title    string
+	Message  map[string]any
+	Selected bool
+}
+
+func gmailEmailVariants(mutation Mutation, fallbackEmail map[string]any) []gmailEmailVariant {
+	payload := mapFromAny(mutation.Payload)
+	rawVariants := normalizeStoredEmailVariants(payload["variants"])
+	if len(rawVariants) == 0 {
+		return []gmailEmailVariant{{
+			Message:  cloneMap(fallbackEmail),
+			Selected: true,
+		}}
+	}
+	selectedID := strings.TrimSpace(stringFromAny(payload["selected_variant_id"]))
+	if selectedID == "" {
+		selectedID = strings.TrimSpace(stringFromAny(mapFromAny(mutation.Preview["email"])["selected_variant_id"]))
+	}
+	out := make([]gmailEmailVariant, 0, len(rawVariants))
+	selectedFound := false
+	for index, raw := range rawVariants {
+		id := strings.TrimSpace(stringFromAny(raw["id"]))
+		if id == "" {
+			id = emailVariantID(index)
+		}
+		selected := id == selectedID
+		if selected {
+			selectedFound = true
+		}
+		out = append(out, gmailEmailVariant{
+			ID:       id,
+			Title:    strings.TrimSpace(stringFromAny(raw["title"])),
+			Message:  mapFromAny(raw["message"]),
+			Selected: selected,
+		})
+	}
+	if !selectedFound && len(out) > 0 {
+		out[0].Selected = true
+	}
+	return out
+}
+
 func gmailEmailTitle(deliveryMode string) string {
 	if deliveryMode == "draft" {
 		return "Create Gmail draft"
@@ -439,8 +493,85 @@ func gmailEmailActionText(deliveryMode string) string {
 	return "Will send this email after approval."
 }
 
-func renderGmailEmailEditForm(w http.ResponseWriter, mutation Mutation, requestID string, email map[string]any, deliveryMode string, csrf string) {
+func renderGmailEmailReplyContext(w http.ResponseWriter, threads []map[string]any, renderComposer func(http.ResponseWriter)) {
+	if len(threads) == 0 {
+		return
+	}
+	fmt.Fprint(w, `<div class="gmail-email-reply-context"><div class="gmail-email-reply-context-head">Replying in thread</div><div class="gmail-thread-list">`)
+	for index, thread := range threads {
+		if index == 0 && renderComposer != nil {
+			renderGmailThreadWithOptions(w, thread, gmailThreadRenderOptions{
+				Open:                true,
+				RenderAfterMessages: renderComposer,
+			})
+			continue
+		}
+		renderGmailThread(w, thread)
+	}
+	fmt.Fprint(w, `</div></div>`)
+}
+
+func gmailEmailReplyThreads(mutation Mutation) []map[string]any {
+	threadIDs := gmailEmailReplyThreadIDs(mutation)
+	if len(threadIDs) == 0 {
+		return nil
+	}
+	existingThreads := mapSliceFromAny(mutation.Preview["reply_threads"])
+	existingByID := map[string]map[string]any{}
+	for _, thread := range existingThreads {
+		threadID := strings.TrimSpace(stringFromAny(thread["thread_id"]))
+		if threadID != "" {
+			existingByID[threadID] = thread
+		}
+	}
+
+	threads := make([]map[string]any, 0, len(threadIDs))
+	for _, threadID := range threadIDs {
+		thread := cloneMap(existingByID[threadID])
+		if len(thread) == 0 {
+			thread["thread_id"] = threadID
+		}
+		threads = append(threads, thread)
+	}
+	return threads
+}
+
+func renderGmailInlineReplyComposer(w http.ResponseWriter, mutation Mutation, requestID string, variants []gmailEmailVariant, deliveryMode string, csrf string) {
+	fmt.Fprint(w, `<div class="gmail-inline-reply">`)
+	fmt.Fprintf(w, `<div class="gmail-avatar" aria-hidden="true">%s</div>`, html.EscapeString(senderInitial(mutation.Account)))
+	fmt.Fprint(w, `<div class="gmail-inline-reply-main">`)
+	renderGmailEmailEditForms(w, mutation, requestID, variants, deliveryMode, csrf)
+	fmt.Fprint(w, `</div></div>`)
+}
+
+func renderGmailEmailEditForms(w http.ResponseWriter, mutation Mutation, requestID string, variants []gmailEmailVariant, deliveryMode string, csrf string) {
+	if len(variants) > 1 {
+		fmt.Fprint(w, `<div class="gmail-email-tabs" data-email-variant-tabs>`)
+		for index, variant := range variants {
+			activeClass := ""
+			selectedAttr := "false"
+			if variant.Selected {
+				activeClass = " active"
+				selectedAttr = "true"
+			}
+			fmt.Fprintf(w, `<button type="button" class="gmail-email-tab%s" data-email-variant-tab="%d" aria-selected="%s">%s</button>`, activeClass, index, selectedAttr, html.EscapeString(variant.Title))
+		}
+		fmt.Fprint(w, `</div>`)
+	}
+	for index, variant := range variants {
+		hiddenAttr := ""
+		if len(variants) > 1 && !variant.Selected {
+			hiddenAttr = " hidden"
+		}
+		fmt.Fprintf(w, `<div class="gmail-email-variant-panel" data-email-variant-panel="%d"%s>`, index, hiddenAttr)
+		renderGmailEmailEditForm(w, mutation, requestID, variant, deliveryMode, csrf, len(variants) > 1)
+		fmt.Fprint(w, `</div>`)
+	}
+}
+
+func renderGmailEmailEditForm(w http.ResponseWriter, mutation Mutation, requestID string, variant gmailEmailVariant, deliveryMode string, csrf string, hasVariants bool) {
 	action := ReviewPath + "/requests/" + url.PathEscape(requestID) + "/mutations/" + url.PathEscape(mutation.ID) + "/update-email"
+	email := variant.Message
 	bodyHTML := strings.TrimSpace(stringFromAny(email["body_html"]))
 	bodyText := stringFromAny(email["body_text"])
 	if bodyHTML == "" {
@@ -449,10 +580,16 @@ func renderGmailEmailEditForm(w http.ResponseWriter, mutation Mutation, requestI
 	editorBodyHTML, signatureHTML := splitEmailBodyAndSignatureHTML(bodyHTML)
 	fmt.Fprintf(w, `<form class="gmail-email-form" method="post" action="%s">`, action)
 	fmt.Fprintf(w, `<input type="hidden" name="csrf_token" value="%s">`, html.EscapeString(csrf))
+	if variant.ID != "" {
+		fmt.Fprintf(w, `<input type="hidden" name="selected_variant_id" value="%s">`, html.EscapeString(variant.ID))
+	}
 	fmt.Fprint(w, `<div class="gmail-email-delivery" role="group" aria-label="Delivery mode">`)
 	renderDeliveryModeOption(w, "send", "Send email", deliveryMode == "send")
 	renderDeliveryModeOption(w, "draft", "Create draft", deliveryMode == "draft")
 	fmt.Fprint(w, `</div>`)
+	if hasVariants {
+		fmt.Fprintf(w, `<p class="gmail-email-variant-copy">Selected proposal: <strong>%s</strong></p>`, html.EscapeString(variant.Title))
+	}
 	fmt.Fprintf(w, `<div class="gmail-email-fields"><label>To<input name="to" value="%s"></label>`, html.EscapeString(strings.Join(stringSliceFromAny(email["to"]), ", ")))
 	fmt.Fprintf(w, `<label>Cc<input name="cc" value="%s"></label>`, html.EscapeString(strings.Join(stringSliceFromAny(email["cc"]), ", ")))
 	fmt.Fprintf(w, `<label>Bcc<input name="bcc" value="%s"></label>`, html.EscapeString(strings.Join(stringSliceFromAny(email["bcc"]), ", ")))
@@ -468,9 +605,12 @@ func renderGmailEmailEditForm(w http.ResponseWriter, mutation Mutation, requestI
 		fmt.Fprintf(w, `<div class="gmail-email-signature-preview" data-gmail-signature-preview>%s</div>`, sanitizeGmailSignaturePreviewHTML(signatureHTML))
 	}
 	fmt.Fprint(w, `</div>`)
-	fmt.Fprint(w, `<div class="gmail-email-actions"><button type="submit">Save email changes</button><button type="submit" name="set_delivery_mode" value="draft">Save as draft instead</button></div>`)
+	primaryLabel := "Save email changes"
+	if hasVariants {
+		primaryLabel = "Use this version"
+	}
+	fmt.Fprintf(w, `<div class="gmail-email-actions"><button type="submit">%s</button><button type="submit" name="set_delivery_mode" value="draft">Save as draft instead</button></div>`, html.EscapeString(primaryLabel))
 	fmt.Fprint(w, `</form>`)
-	writeTiptapScript(w)
 }
 
 func sanitizeGmailSignaturePreviewHTML(value string) string {
@@ -628,7 +768,28 @@ function initEmailEditor(root) {
     if (bodyDirty) syncEmailEditor(editor, form);
   });
 }
+function initEmailVariantTabs(root) {
+  if (root.dataset.ready === "true") return;
+  root.dataset.ready = "true";
+  const article = root.closest(".gmail-email-mutation");
+  const tabs = Array.from(root.querySelectorAll("[data-email-variant-tab]"));
+  const panels = Array.from(article?.querySelectorAll("[data-email-variant-panel]") || []);
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      const target = tab.dataset.emailVariantTab;
+      tabs.forEach((candidate) => {
+        const active = candidate === tab;
+        candidate.classList.toggle("active", active);
+        candidate.setAttribute("aria-selected", active ? "true" : "false");
+      });
+      panels.forEach((panel) => {
+        panel.hidden = panel.dataset.emailVariantPanel !== target;
+      });
+    });
+  });
+}
 document.querySelectorAll("[data-tiptap-editor]").forEach(initEmailEditor);
+document.querySelectorAll("[data-email-variant-tabs]").forEach(initEmailVariantTabs);
 </script>`)
 }
 
@@ -654,7 +815,11 @@ func gmailEmailUpdateInputFromForm(r *http.Request) UpdateGmailEmailMutationInpu
 	if references := splitEmailAddressList(r.FormValue("references")); len(references) > 0 {
 		message["references"] = references
 	}
-	return UpdateGmailEmailMutationInput{DeliveryMode: deliveryMode, Message: message}
+	return UpdateGmailEmailMutationInput{
+		DeliveryMode:      deliveryMode,
+		Message:           message,
+		SelectedVariantID: strings.TrimSpace(r.FormValue("selected_variant_id")),
+	}
 }
 
 func splitEmailAddressList(value string) []string {
@@ -1086,7 +1251,16 @@ func mapSliceFromAnyValue(value any) []map[string]any {
 	}
 }
 
+type gmailThreadRenderOptions struct {
+	Open                bool
+	RenderAfterMessages func(http.ResponseWriter)
+}
+
 func renderGmailThread(w http.ResponseWriter, thread map[string]any) {
+	renderGmailThreadWithOptions(w, thread, gmailThreadRenderOptions{})
+}
+
+func renderGmailThreadWithOptions(w http.ResponseWriter, thread map[string]any, options gmailThreadRenderOptions) {
 	threadID := strings.TrimSpace(stringFromAny(thread["thread_id"]))
 	subject := strings.TrimSpace(stringFromAny(thread["subject"]))
 	if subject == "" {
@@ -1113,7 +1287,11 @@ func renderGmailThread(w http.ResponseWriter, thread map[string]any) {
 	labels = appendVisibleGmailLabels(labels, rawLabels)
 	senderName := gmailSenderDisplayName(sender, subject)
 
-	fmt.Fprint(w, `<details class="gmail-thread">`)
+	openAttr := ""
+	if options.Open {
+		openAttr = " open"
+	}
+	fmt.Fprintf(w, `<details class="gmail-thread"%s>`, openAttr)
 	fmt.Fprint(w, `<summary class="gmail-row">`)
 	fmt.Fprint(w, `<span class="gmail-checkbox" aria-hidden="true"></span><span class="gmail-star" aria-hidden="true">&#9734;</span><span class="gmail-important" aria-hidden="true"></span>`)
 	fmt.Fprintf(w, `<span class="gmail-sender">%s`, html.EscapeString(senderName))
@@ -1157,6 +1335,9 @@ func renderGmailThread(w http.ResponseWriter, thread map[string]any) {
 		}
 		fmt.Fprint(w, `</div>`)
 	}
+	if options.RenderAfterMessages != nil {
+		options.RenderAfterMessages(w)
+	}
 	fmt.Fprint(w, `</div></details>`)
 }
 
@@ -1198,9 +1379,9 @@ func renderGmailMessage(w http.ResponseWriter, message map[string]any, fallbackO
 	if bodyHTML != "" {
 		bodyHTML, quotedHTML := splitGmailQuotedHTML(bodyHTML)
 		fmt.Fprint(w, `<div class="gmail-message-body">`)
-		fmt.Fprintf(w, `<iframe class="gmail-body-frame" sandbox referrerpolicy="no-referrer" srcdoc="%s"></iframe>`, html.EscapeString(emailHTMLDocument(bodyHTML)))
+		fmt.Fprintf(w, `<iframe class="gmail-body-frame" style="height:%dpx" sandbox referrerpolicy="no-referrer" srcdoc="%s"></iframe>`, gmailBodyFrameHeight(bodyHTML, false), html.EscapeString(emailHTMLDocument(bodyHTML)))
 		if quotedHTML != "" {
-			fmt.Fprintf(w, `<details class="gmail-quoted"><summary>Quoted message</summary><iframe class="gmail-body-frame quoted" sandbox referrerpolicy="no-referrer" srcdoc="%s"></iframe></details>`, html.EscapeString(emailHTMLDocument(quotedHTML)))
+			fmt.Fprintf(w, `<details class="gmail-quoted"><summary>Quoted message</summary><iframe class="gmail-body-frame quoted" style="height:%dpx" sandbox referrerpolicy="no-referrer" srcdoc="%s"></iframe></details>`, gmailBodyFrameHeight(quotedHTML, true), html.EscapeString(emailHTMLDocument(quotedHTML)))
 		}
 		fmt.Fprint(w, `</div>`)
 	} else if preview != "" {
@@ -1222,6 +1403,38 @@ func hasGmailUnreadLabel(labels []string) bool {
 		}
 	}
 	return false
+}
+
+func gmailBodyFrameHeight(bodyHTML string, quoted bool) int {
+	text := htmlFragmentText(bodyHTML)
+	lines := normalizeStringSlice(strings.Split(text, "\n"))
+	visualLines := 1
+	if len(lines) > 0 {
+		visualLines = 0
+		for _, line := range lines {
+			lineLength := len([]rune(line))
+			visualLines += max(1, (lineLength+89)/90)
+		}
+	}
+	height := 76 + visualLines*20
+	lowerHTML := strings.ToLower(bodyHTML)
+	if strings.Contains(lowerHTML, "<img") {
+		height += 140
+	}
+	if strings.Contains(lowerHTML, "<table") {
+		height += 24
+	}
+	minHeight, maxHeight := 128, 240
+	if quoted {
+		minHeight, maxHeight = 112, 200
+	}
+	if height < minHeight {
+		return minHeight
+	}
+	if height > maxHeight {
+		return maxHeight
+	}
+	return height
 }
 
 func emailHTMLDocument(bodyHTML string) string {
@@ -1545,8 +1758,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f2ee;padding:10px;
 .gmail-row:hover{background:#f8fafd;box-shadow:0 1px 3px rgba(60,64,67,.22)}.gmail-thread[open]>.gmail-row{box-shadow:inset 3px 0 #dadce0}.gmail-checkbox{width:14px;height:14px;border:2px solid #5f6368;border-radius:2px}.gmail-star{color:#5f6368;font-size:18px;line-height:1}.gmail-important{width:13px;height:14px;clip-path:polygon(0 0,70%% 0,100%% 50%%,70%% 100%%,0 100%%,30%% 50%%);background:#5f6368}.gmail-sender{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gmail-count{font-weight:500;color:#5f6368}.gmail-list-labels{display:flex;gap:6px;align-items:center;overflow:hidden;white-space:nowrap}.gmail-subject{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gmail-subject span{color:#5f6368;font-weight:400}.gmail-date{text-align:right;color:#5f6368;font-size:12px;font-weight:600;white-space:nowrap}
 .gmail-label{background:#e8eaed;color:#3c4043;border-radius:4px;padding:2px 6px;font-size:12px;font-weight:500}.gmail-thread-meta{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:#5f6368;font-size:12px}.thread-id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#80868b}
 .gmail-expanded{border-top:1px solid #e8eaed;background:#fff}.gmail-expanded-subject{display:flex;align-items:center;gap:18px;padding:18px 28px 8px 76px}.gmail-expanded-subject h4{font-size:22px;font-weight:400;margin:0;color:#202124}
-.gmail-messages{padding:0 0 18px}.gmail-message{border-top:1px solid #f1f3f4}.gmail-message summary{list-style:none}.gmail-message summary::-webkit-details-marker{display:none}.gmail-message-summary{display:grid;grid-template-columns:48px minmax(0,1fr);gap:14px;padding:18px 28px;cursor:pointer}.gmail-message-summary:hover{background:#f8fafd}.gmail-avatar{width:40px;height:40px;border-radius:50%%;background:#5e7ce2;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.gmail-message-summary-main{min-width:0}.gmail-message-header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.gmail-message-header strong{display:inline;font-size:15px}.gmail-message-header time{color:#5f6368;font-size:13px;white-space:nowrap}.gmail-to{display:block;color:#5f6368;font-size:12px;margin-top:3px}.gmail-message-preview{margin:8px 0 0;color:#5f6368;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.gmail-message[open] .gmail-message-preview{display:none}.gmail-message-body{padding:0 28px 22px 90px}.gmail-message-body p{margin:8px 0 0;color:#3c4043;line-height:1.45;white-space:pre-wrap}.gmail-body-frame{display:block;width:100%%;height:760px;border:0;background:white}.gmail-quoted{margin-top:14px;border-left:3px solid #dadce0;padding-left:12px}.gmail-quoted>summary{color:#5f6368;cursor:pointer;font-size:13px;margin-bottom:8px}.gmail-body-frame.quoted{height:520px}.raw-json{border-top:1px solid #e8eaed;padding-top:12px;margin-bottom:16px}.raw-json summary{color:#5f6368;cursor:pointer}
-.gmail-email-mutation{padding:0;overflow:hidden}.gmail-email-mutation>.mutation-head,.gmail-email-mutation>.mutation-meta,.gmail-email-mutation>.mutation-reason,.gmail-email-mutation>.gmail-email-form,.gmail-email-mutation>.gmail-email-readonly{margin-left:16px;margin-right:16px}.gmail-email-mutation>.mutation-head{margin-top:16px}.gmail-email-form{display:grid;gap:12px;margin-top:14px;margin-bottom:16px}.gmail-email-delivery{display:flex;gap:8px;flex-wrap:wrap}.delivery-option{display:flex;align-items:center;gap:7px;margin:0;border:1px solid #dadce0;border-radius:6px;padding:7px 10px;background:#fff;color:#3c4043;font-weight:600}.delivery-option:has(input:checked){border-color:#1a73e8;background:#e8f0fe;color:#174ea6}.delivery-option input{margin:0}.gmail-email-fields{border:1px solid #dadce0;border-radius:6px;background:#fff}.gmail-email-fields label{display:grid;grid-template-columns:72px minmax(0,1fr);gap:12px;align-items:center;margin:0;padding:10px 12px;border-top:1px solid #eef0f2;color:#5f6368;font-size:13px}.gmail-email-fields label:first-child{border-top:0}.gmail-email-fields input{border:0;border-radius:0;padding:0;font:inherit;color:#202124;min-width:0}.gmail-email-fields input:focus{outline:0}.gmail-email-editor-wrap{border:1px solid #dadce0;border-radius:6px;background:#fff;overflow:hidden}.gmail-email-toolbar{display:flex;gap:4px;align-items:center;border-bottom:1px solid #e8eaed;background:#f8fafd;padding:6px}.gmail-email-toolbar button{background:#fff;color:#3c4043;border:1px solid #dadce0;padding:5px 8px;min-width:30px}.gmail-email-editor-surface{min-height:180px;padding:14px;outline:none;line-height:1.45}.gmail-email-editor:has(+ .gmail-email-signature-preview) .gmail-email-editor-surface{min-height:0;padding-bottom:6px}.gmail-email-editor-surface p{margin:0 0 10px}.gmail-email-editor-surface ul,.gmail-email-editor-surface ol{margin:8px 0 8px 22px;padding:0}.gmail-email-signature-preview{padding:0 14px 14px;color:#202124;line-height:normal}.gmail-email-signature-preview div{margin:0}.gmail-email-signature-preview div[dir=ltr]>span:first-child+br{display:none}.gmail-email-signature-preview a{color:#1a73e8}.gmail-email-actions{display:flex;gap:8px;flex-wrap:wrap}.gmail-email-actions button[name=set_delivery_mode]{background:#137333}.gmail-email-readonly{display:grid;gap:12px;margin-top:14px;margin-bottom:16px}.gmail-email-readonly dl{display:grid;grid-template-columns:86px minmax(0,1fr);gap:8px 12px;margin:0;border:1px solid #dadce0;border-radius:6px;padding:12px;background:#fff}.gmail-email-readonly dt{color:#5f6368}.gmail-email-readonly dd{margin:0;overflow-wrap:anywhere}.gmail-email-body-frame{width:100%%;height:360px;border:1px solid #dadce0;border-radius:6px;background:#fff}
+.gmail-messages{padding:0 0 18px}.gmail-message{border-top:1px solid #f1f3f4}.gmail-message summary{list-style:none}.gmail-message summary::-webkit-details-marker{display:none}.gmail-message-summary{display:grid;grid-template-columns:48px minmax(0,1fr);gap:14px;padding:18px 28px;cursor:pointer}.gmail-message-summary:hover{background:#f8fafd}.gmail-avatar{width:40px;height:40px;border-radius:50%%;background:#5e7ce2;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.gmail-message-summary-main{min-width:0}.gmail-message-header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.gmail-message-header strong{display:inline;font-size:15px}.gmail-message-header time{color:#5f6368;font-size:13px;white-space:nowrap}.gmail-to{display:block;color:#5f6368;font-size:12px;margin-top:3px}.gmail-message-preview{margin:8px 0 0;color:#5f6368;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.gmail-message[open] .gmail-message-preview{display:none}.gmail-message-body{padding:0 28px 22px 90px}.gmail-message-body p{margin:8px 0 0;color:#3c4043;line-height:1.45;white-space:pre-wrap}.gmail-body-frame{display:block;width:100%%;min-height:120px;max-height:520px;border:0;background:white}.gmail-quoted{margin-top:14px;border-left:3px solid #dadce0;padding-left:12px}.gmail-quoted>summary{color:#5f6368;cursor:pointer;font-size:13px;margin-bottom:8px}.gmail-body-frame.quoted{max-height:340px}.raw-json{border-top:1px solid #e8eaed;padding-top:12px;margin-bottom:16px}.raw-json summary{color:#5f6368;cursor:pointer}
+.gmail-email-mutation{padding:0;overflow:hidden}.gmail-email-mutation>.mutation-head,.gmail-email-mutation>.mutation-meta,.gmail-email-mutation>.mutation-reason,.gmail-email-mutation>.gmail-email-form,.gmail-email-mutation>.gmail-email-readonly,.gmail-email-mutation>.gmail-email-tabs,.gmail-email-mutation>.gmail-email-variant-panel,.gmail-email-mutation>.gmail-email-reply-context{margin-left:16px;margin-right:16px}.gmail-email-mutation>.mutation-head{margin-top:16px}.gmail-email-reply-context{margin-top:14px;border:1px solid #dadce0;border-radius:6px;overflow:hidden;background:#fff}.gmail-email-reply-context-head{padding:10px 12px;border-bottom:1px solid #e8eaed;color:#5f6368;font-size:13px;font-weight:700}.gmail-email-reply-context .gmail-thread:first-child{border-top:0}.gmail-inline-reply{display:grid;grid-template-columns:48px minmax(0,1fr);gap:14px;padding:18px 28px 24px;border-top:1px solid #f1f3f4}.gmail-inline-reply-main{min-width:0}.gmail-inline-reply .gmail-email-tabs{margin-top:0}.gmail-inline-reply .gmail-email-form{margin:0}.gmail-inline-reply .gmail-email-variant-panel{margin:0}.gmail-inline-reply .gmail-email-editor-surface{min-height:108px}.gmail-email-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-top:14px;border-bottom:1px solid #e8eaed}.gmail-email-tab{border:0;border-bottom:3px solid transparent;border-radius:0;background:transparent;color:#5f6368;padding:9px 10px;font-weight:700}.gmail-email-tab.active{border-bottom-color:#1a73e8;color:#202124;background:#f8fafd}.gmail-email-form{display:grid;gap:12px;margin-top:14px;margin-bottom:16px}.gmail-email-variant-copy{margin:0;color:#5f6368}.gmail-email-delivery{display:flex;gap:8px;flex-wrap:wrap}.delivery-option{display:flex;align-items:center;gap:7px;margin:0;border:1px solid #dadce0;border-radius:6px;padding:7px 10px;background:#fff;color:#3c4043;font-weight:600}.delivery-option:has(input:checked){border-color:#1a73e8;background:#e8f0fe;color:#174ea6}.delivery-option input{margin:0}.gmail-email-fields{border:1px solid #dadce0;border-radius:6px;background:#fff}.gmail-email-fields label{display:grid;grid-template-columns:72px minmax(0,1fr);gap:12px;align-items:center;margin:0;padding:10px 12px;border-top:1px solid #eef0f2;color:#5f6368;font-size:13px}.gmail-email-fields label:first-child{border-top:0}.gmail-email-fields input{border:0;border-radius:0;padding:0;font:inherit;color:#202124;min-width:0}.gmail-email-fields input:focus{outline:0}.gmail-email-editor-wrap{border:1px solid #dadce0;border-radius:6px;background:#fff;overflow:hidden}.gmail-email-toolbar{display:flex;gap:4px;align-items:center;border-bottom:1px solid #e8eaed;background:#f8fafd;padding:6px}.gmail-email-toolbar button{background:#fff;color:#3c4043;border:1px solid #dadce0;padding:5px 8px;min-width:30px}.gmail-email-editor-surface{min-height:180px;padding:14px;outline:none;line-height:1.45}.gmail-email-editor:has(+ .gmail-email-signature-preview) .gmail-email-editor-surface{min-height:0;padding-bottom:6px}.gmail-email-editor-surface p{margin:0 0 10px}.gmail-email-editor-surface ul,.gmail-email-editor-surface ol{margin:8px 0 8px 22px;padding:0}.gmail-email-signature-preview{padding:0 14px 14px;color:#202124;line-height:normal}.gmail-email-signature-preview div{margin:0}.gmail-email-signature-preview div[dir=ltr]>span:first-child+br{display:none}.gmail-email-signature-preview a{color:#1a73e8}.gmail-email-actions{display:flex;gap:8px;flex-wrap:wrap}.gmail-email-actions button[name=set_delivery_mode]{background:#137333}.gmail-email-readonly{display:grid;gap:12px;margin-top:14px;margin-bottom:16px}.gmail-email-readonly dl{display:grid;grid-template-columns:86px minmax(0,1fr);gap:8px 12px;margin:0;border:1px solid #dadce0;border-radius:6px;padding:12px;background:#fff}.gmail-email-readonly dt{color:#5f6368}.gmail-email-readonly dd{margin:0;overflow-wrap:anywhere}.gmail-email-body-frame{width:100%%;height:360px;border:1px solid #dadce0;border-radius:6px;background:#fff}
 .contact-mutation{padding:0;overflow:hidden}.contact-mutation>.mutation-head,.contact-mutation>.mutation-meta{margin-left:16px;margin-right:16px}.contact-mutation>.mutation-head{margin-top:16px}.contact-operations{border-top:1px solid #dfe1e5;margin-top:16px}.contact-operation{border-top:1px solid #f1f3f4;padding:18px 16px}.contact-operation:first-child{border-top:0}.contact-operation.destructive{box-shadow:inset 3px 0 #c5221f}.contact-operation-main{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:flex-start}.contact-avatar{width:40px;height:40px;border-radius:50%%;background:#137333;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.contact-operation.destructive .contact-avatar{background:#c5221f}.contact-operation-copy{min-width:0}.contact-operation-copy h4{margin:2px 0 4px;font-size:18px}.contact-op{margin:0;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.contact-meta{display:flex;flex-wrap:wrap;gap:8px;color:#5f6368;font-size:13px}.contact-effect,.contact-resource{margin:8px 0 0;color:#3c4043}.contact-effect code,.contact-resource code{background:#f1f3f4;border-radius:4px;padding:2px 5px}.contact-diff{margin-top:12px;border:1px solid #e8eaed;border-radius:6px;background:white}.contact-inline-row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;border-top:1px solid #eef0f2;padding:10px 12px}.contact-inline-row:first-child{border-top:0}.contact-inline-row>code{background:#f8fafd;border-radius:4px;padding:4px 6px;justify-self:start}.contact-inline-change{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.contact-inline-old,.contact-inline-new,.contact-inline-unchanged{border-radius:4px;padding:3px 6px;overflow-wrap:anywhere}.contact-inline-old{background:#fce8e6;color:#8c1d18;text-decoration:line-through;text-decoration-thickness:2px}.contact-inline-new{background:#e6f4ea;color:#137333;text-decoration:none}.contact-inline-arrow{color:#5f6368}.contact-diff-empty{margin:0;padding:12px;color:#5f6368}.contact-person-block{margin-top:12px;border-top:1px solid #e8eaed;padding-top:12px}.contact-block-title{margin:0 0 8px;font-weight:700}.contact-person-block dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;margin:0}.contact-person-block dt{color:#5f6368}.contact-person-block dd{margin:0}.contact-operation .raw-json{margin-bottom:0}
 @media (max-width:760px){main{padding:16px}.gmail-row{grid-template-columns:20px 20px minmax(0,1fr) 56px;gap:8px}.gmail-important,.gmail-list-labels{display:none}.gmail-sender{grid-column:3}.gmail-subject{grid-column:3 / 5;white-space:normal}.gmail-date{grid-column:4;grid-row:1}.gmail-expanded-subject{padding-left:18px;display:block}.gmail-message-summary{grid-template-columns:36px minmax(0,1fr);padding:18px}.gmail-message-body{padding-left:18px;padding-right:18px}.gmail-message-header{display:block}.gmail-message-header time{display:block;margin-top:4px}.gmail-body-frame{height:620px}.gmail-email-fields label,.gmail-email-readonly dl{grid-template-columns:1fr}.gmail-email-toolbar{flex-wrap:wrap}.contact-operation-main{grid-template-columns:40px minmax(0,1fr)}.contact-operation-main>.pill{grid-column:2}.contact-person-block dl{grid-template-columns:1fr}.contact-inline-row{grid-template-columns:1fr;gap:8px}.contact-inline-change{align-items:flex-start}}
 </style></head><body>`, html.EscapeString(title))

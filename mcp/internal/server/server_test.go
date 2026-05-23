@@ -52,6 +52,36 @@ func (s fakeMutationStore) RejectRequest(context.Context, string, string, string
 	return mutations.Request{}, mutations.ErrNotFound
 }
 
+type recordingMutationStore struct {
+	request mutations.Request
+	input   mutations.CreateRequestInput
+}
+
+func (s *recordingMutationStore) CreateRequest(_ context.Context, input mutations.CreateRequestInput) (mutations.Request, error) {
+	s.input = input
+	return s.request, nil
+}
+
+func (s *recordingMutationStore) ListRequests(context.Context, mutations.RequestFilter) ([]mutations.Request, error) {
+	return nil, nil
+}
+
+func (s *recordingMutationStore) GetRequest(context.Context, string) (mutations.Request, error) {
+	return mutations.Request{}, mutations.ErrNotFound
+}
+
+func (s *recordingMutationStore) UpdateGmailEmailMutation(context.Context, string, string, mutations.UpdateGmailEmailMutationInput, string) (mutations.Mutation, error) {
+	return mutations.Mutation{}, mutations.ErrNotFound
+}
+
+func (s *recordingMutationStore) ApproveRequest(context.Context, string, string) (mutations.Request, error) {
+	return mutations.Request{}, mutations.ErrNotFound
+}
+
+func (s *recordingMutationStore) RejectRequest(context.Context, string, string, string) (mutations.Request, error) {
+	return mutations.Request{}, mutations.ErrNotFound
+}
+
 func TestMCPServerRegistersMutationProposalToolsWhenConfigured(t *testing.T) {
 	runner := fakeRunner{results: map[string]query.RawResult{}}
 	mutationSvc := mutations.NewService(fakeMutationStore{request: mutations.Request{
@@ -105,6 +135,71 @@ func TestMCPServerRegistersMutationProposalToolsWhenConfigured(t *testing.T) {
 	text := result.Content[0].(*mcp.TextContent).Text
 	if !strings.Contains(text, `"request_id": "req-123"`) || !strings.Contains(text, `"approval_url": "https://mcp.example.test/mutation-review/requests/req-123"`) {
 		t.Fatalf("unexpected mutation proposal response: %q", text)
+	}
+}
+
+func TestMCPServerProposeGmailSendEmailAcceptsVariants(t *testing.T) {
+	runner := fakeRunner{results: map[string]query.RawResult{}}
+	store := &recordingMutationStore{request: mutations.Request{
+		ID:     "req-variants",
+		Status: "pending_review",
+		Mutations: []mutations.Mutation{{
+			ID: "mut-variants",
+		}},
+	}}
+	mutationSvc := mutations.NewService(store, mutations.Config{
+		BaseURL:       "https://mcp.example.test",
+		GmailAccounts: []string{"zach@example.test"},
+	})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	srv := NewMCPServerWithMutations(runner, query.Options{MaxRows: 5, MaxFieldChars: 100}, mutationSvc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = srv.Run(ctx, serverTransport)
+	}()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect failed: %v", err)
+	}
+	defer session.Close()
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "propose_gmail_send_email", Arguments: map[string]any{
+		"account":   "zach@example.test",
+		"to":        []string{"zach@example.test"},
+		"subject":   "Base subject",
+		"body_text": "Base body",
+		"reason":    "review alternate replies",
+		"variants": []map[string]any{{
+			"title":     "Direct Reply",
+			"body_text": "Direct body",
+		}, {
+			"title":     "Softer Ask",
+			"subject":   "Softer subject",
+			"body_text": "Softer body",
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("CallTool failed: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("propose_gmail_send_email returned error: %#v", result.Content)
+	}
+	if len(store.input.Mutations) != 1 {
+		t.Fatalf("expected one mutation, got %#v", store.input.Mutations)
+	}
+	variants := store.input.Mutations[0].EmailVariants
+	if len(variants) != 2 {
+		t.Fatalf("expected two email variants, got %#v", variants)
+	}
+	if variants[0].Title != "Direct Reply" || variants[1].Title != "Softer Ask" {
+		t.Fatalf("unexpected variant titles: %#v", variants)
+	}
+	if variants[1].Subject != "Softer subject" || variants[1].BodyText != "Softer body" {
+		t.Fatalf("unexpected second variant: %#v", variants[1])
 	}
 }
 

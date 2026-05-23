@@ -45,18 +45,19 @@ type ProposeGmailUnarchiveThreadsInput struct {
 }
 
 type ProposeGmailSendEmailInput struct {
-	Account         string         `json:"account" jsonschema:"configured Gmail account email address"`
-	To              []string       `json:"to" jsonschema:"primary recipients"`
-	CC              []string       `json:"cc,omitempty" jsonschema:"carbon-copy recipients"`
-	BCC             []string       `json:"bcc,omitempty" jsonschema:"blind-copy recipients"`
-	Subject         string         `json:"subject" jsonschema:"email subject"`
-	BodyText        string         `json:"body_text" jsonschema:"plain-text email body"`
-	BodyHTML        string         `json:"body_html,omitempty" jsonschema:"optional HTML email body"`
-	ReplyToThreadID string         `json:"reply_to_thread_id,omitempty" jsonschema:"optional Gmail thread ID to reply in"`
-	DeliveryMode    string         `json:"delivery_mode,omitempty" jsonschema:"send or draft; default send"`
-	Reason          string         `json:"reason" jsonschema:"why this email should be sent or drafted"`
-	Title           string         `json:"title,omitempty" jsonschema:"optional review request title"`
-	Context         map[string]any `json:"context,omitempty" jsonschema:"optional source context for human review"`
+	Account         string                   `json:"account" jsonschema:"configured Gmail account email address"`
+	To              []string                 `json:"to" jsonschema:"primary recipients"`
+	CC              []string                 `json:"cc,omitempty" jsonschema:"carbon-copy recipients"`
+	BCC             []string                 `json:"bcc,omitempty" jsonschema:"blind-copy recipients"`
+	Subject         string                   `json:"subject" jsonschema:"email subject"`
+	BodyText        string                   `json:"body_text" jsonschema:"plain-text email body"`
+	BodyHTML        string                   `json:"body_html,omitempty" jsonschema:"optional HTML email body"`
+	ReplyToThreadID string                   `json:"reply_to_thread_id,omitempty" jsonschema:"optional Gmail thread ID to reply in"`
+	DeliveryMode    string                   `json:"delivery_mode,omitempty" jsonschema:"send or draft; default send"`
+	Reason          string                   `json:"reason" jsonschema:"why this email should be sent or drafted"`
+	Title           string                   `json:"title,omitempty" jsonschema:"optional review request title"`
+	Context         map[string]any           `json:"context,omitempty" jsonschema:"optional source context for human review"`
+	Variants        []GmailEmailVariantInput `json:"variants,omitempty" jsonschema:"optional alternate email proposals; each variant must have a short two-word title for the review tab"`
 }
 
 type ProposeContactMutationsInput struct {
@@ -149,10 +150,11 @@ func (s *Service) ProposeGmailSendEmail(ctx context.Context, input ProposeGmailS
 		Reason:  strings.TrimSpace(input.Reason),
 		Context: cloneMap(input.Context),
 		Mutations: []MutationInput{{
-			Type:         GmailSendEmailOperation,
-			Account:      normalizeAccount(input.Account),
-			DeliveryMode: deliveryMode,
-			Message:      message,
+			Type:          GmailSendEmailOperation,
+			Account:       normalizeAccount(input.Account),
+			DeliveryMode:  deliveryMode,
+			Message:       message,
+			EmailVariants: cloneEmailVariantInputs(input.Variants),
 		}},
 		RequestedBy: defaultRequestedBy,
 	})
@@ -233,14 +235,27 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 			return err
 		}
 		_ = deliveryMode
-		if !hasAnyRecipient(mutation.Message) {
-			return fmt.Errorf("mutation %d Gmail email mutation must include at least one recipient", index)
+		messages := []map[string]any{mutation.Message}
+		if len(mutation.EmailVariants) > 0 {
+			variants, err := normalizeEmailVariantInputs(mutation.Message, mutation.EmailVariants)
+			if err != nil {
+				return fmt.Errorf("mutation %d %w", index, err)
+			}
+			messages = make([]map[string]any, 0, len(variants))
+			for _, variant := range variants {
+				messages = append(messages, mapFromAny(variant["message"]))
+			}
 		}
-		if strings.TrimSpace(stringFromAny(mutation.Message["subject"])) == "" {
-			return fmt.Errorf("mutation %d Gmail email mutation must include subject", index)
-		}
-		if strings.TrimSpace(stringFromAny(mutation.Message["body_text"])) == "" && strings.TrimSpace(stringFromAny(mutation.Message["body_html"])) == "" {
-			return fmt.Errorf("mutation %d Gmail email mutation must include body_text or body_html", index)
+		for messageIndex, message := range messages {
+			if !hasAnyRecipient(message) {
+				return fmt.Errorf("mutation %d Gmail email mutation variant %d must include at least one recipient", index, messageIndex+1)
+			}
+			if strings.TrimSpace(stringFromAny(message["subject"])) == "" {
+				return fmt.Errorf("mutation %d Gmail email mutation variant %d must include subject", index, messageIndex+1)
+			}
+			if strings.TrimSpace(stringFromAny(message["body_text"])) == "" && strings.TrimSpace(stringFromAny(message["body_html"])) == "" {
+				return fmt.Errorf("mutation %d Gmail email mutation variant %d must include body_text or body_html", index, messageIndex+1)
+			}
 		}
 	case GooglePeopleContactsOperation, ContactsBatchMutationOperation:
 		if err := validateConfiguredAccount(account, s.cfg.ContactGoogleAccounts, "CONTACT_GOOGLE_ACCOUNTS"); err != nil {
@@ -289,16 +304,52 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 		deliveryMode = "send"
 	}
 	return MutationInput{
-		Type:         strings.TrimSpace(mutationType),
-		Account:      normalizeAccount(stringFromAny(raw["account"])),
-		Title:        strings.TrimSpace(stringFromAny(raw["title"])),
-		Reason:       strings.TrimSpace(stringFromAny(raw["reason"])),
-		ThreadIDs:    stringSliceFromAny(raw["thread_ids"]),
-		DeliveryMode: deliveryMode,
-		Message:      message,
-		Operations:   mapSliceFromAny(raw["operations"]),
-		Raw:          cloneMap(raw),
+		Type:          strings.TrimSpace(mutationType),
+		Account:       normalizeAccount(stringFromAny(raw["account"])),
+		Title:         strings.TrimSpace(stringFromAny(raw["title"])),
+		Reason:        strings.TrimSpace(stringFromAny(raw["reason"])),
+		ThreadIDs:     stringSliceFromAny(raw["thread_ids"]),
+		DeliveryMode:  deliveryMode,
+		Message:       message,
+		EmailVariants: emailVariantInputsFromAny(raw["variants"]),
+		Operations:    mapSliceFromAny(raw["operations"]),
+		Raw:           cloneMap(raw),
 	}, nil
+}
+
+func cloneEmailVariantInputs(input []GmailEmailVariantInput) []GmailEmailVariantInput {
+	out := make([]GmailEmailVariantInput, 0, len(input))
+	for _, variant := range input {
+		cloned := variant
+		cloned.Message = cloneMap(variant.Message)
+		cloned.To = append([]string(nil), variant.To...)
+		cloned.CC = append([]string(nil), variant.CC...)
+		cloned.BCC = append([]string(nil), variant.BCC...)
+		cloned.References = append([]string(nil), variant.References...)
+		out = append(out, cloned)
+	}
+	return out
+}
+
+func emailVariantInputsFromAny(value any) []GmailEmailVariantInput {
+	items := mapSliceFromAny(value)
+	out := make([]GmailEmailVariantInput, 0, len(items))
+	for _, item := range items {
+		out = append(out, GmailEmailVariantInput{
+			Title:           stringFromAny(item["title"]),
+			Message:         mapFromAny(item["message"]),
+			To:              stringSliceFromAny(item["to"]),
+			CC:              stringSliceFromAny(item["cc"]),
+			BCC:             stringSliceFromAny(item["bcc"]),
+			Subject:         stringFromAny(item["subject"]),
+			BodyText:        stringFromAny(item["body_text"]),
+			BodyHTML:        stringFromAny(item["body_html"]),
+			ReplyToThreadID: stringFromAny(item["reply_to_thread_id"]),
+			InReplyTo:       stringFromAny(item["in_reply_to"]),
+			References:      stringSliceFromAny(item["references"]),
+		})
+	}
+	return out
 }
 
 func optionalTitle(value string, fallback string) string {

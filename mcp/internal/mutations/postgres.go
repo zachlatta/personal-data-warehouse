@@ -621,7 +621,26 @@ func (s *PostgresStore) enrichGmailEmailSignatures(ctx context.Context, mutation
 		if signature.Empty() {
 			continue
 		}
-		message = appendGmailSignatureToMessage(message, signature)
+		variants := normalizeStoredEmailVariants(mutation.Payload["variants"])
+		if len(variants) > 0 {
+			for variantIndex, variant := range variants {
+				variantMessage := mapFromAny(variant["message"])
+				if !gmailEmailHasSignature(variantMessage) {
+					variantMessage = appendGmailSignatureToMessage(variantMessage, signature)
+				}
+				variants[variantIndex]["message"] = variantMessage
+				if stringFromAny(variant["id"]) == stringFromAny(mutation.Payload["selected_variant_id"]) {
+					message = variantMessage
+				}
+			}
+			if stringFromAny(mutation.Payload["selected_variant_id"]) == "" {
+				mutation.Payload["selected_variant_id"] = stringFromAny(variants[0]["id"])
+				message = mapFromAny(variants[0]["message"])
+			}
+			mutations[index].Payload["variants"] = variants
+		} else {
+			message = appendGmailSignatureToMessage(message, signature)
+		}
 		mutations[index].Payload["message"] = message
 		previewEmail := mapFromAny(mutations[index].Preview["email"])
 		for key, value := range message {
@@ -630,6 +649,10 @@ func (s *PostgresStore) enrichGmailEmailSignatures(ctx context.Context, mutation
 		previewEmail["delivery_mode"] = mutations[index].Payload["delivery_mode"]
 		previewEmail["mode"] = emailPreviewMode(message)
 		previewEmail["signature_source"] = "gmail_messages.sent"
+		if len(variants) > 0 {
+			previewEmail["variants"] = variants
+			previewEmail["selected_variant_id"] = mutations[index].Payload["selected_variant_id"]
+		}
 		mutations[index].Preview["email"] = previewEmail
 	}
 	return mutations
@@ -780,27 +803,46 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				return nil, err
 			}
 			message := normalizeMessageForStorage(mutation.Message)
+			variants, err := normalizeEmailVariantInputs(message, mutation.EmailVariants)
+			if err != nil {
+				return nil, err
+			}
+			selectedVariantID := ""
+			if len(variants) > 0 {
+				selectedVariantID = stringFromAny(variants[0]["id"])
+				message = mapFromAny(variants[0]["message"])
+			}
+			payload := map[string]any{
+				"delivery_mode": deliveryMode,
+				"message":       message,
+			}
+			if len(variants) > 0 {
+				payload["variants"] = variants
+				payload["selected_variant_id"] = selectedVariantID
+			}
+			previewEmail := map[string]any{
+				"mode":          emailPreviewMode(message),
+				"delivery_mode": deliveryMode,
+				"to":            message["to"],
+				"cc":            message["cc"],
+				"bcc":           message["bcc"],
+				"subject":       message["subject"],
+				"body_text":     message["body_text"],
+				"body_html":     message["body_html"],
+			}
+			if len(variants) > 0 {
+				previewEmail["variants"] = variants
+				previewEmail["selected_variant_id"] = selectedVariantID
+			}
 			out = append(out, storedMutation{
 				Provider:  "gmail",
 				Operation: GmailSendEmailOperation,
 				Account:   account,
 				Title:     optionalTitle(mutation.Title, gmailEmailRequestTitle(deliveryMode, message)),
 				Reason:    reason,
-				Payload: map[string]any{
-					"delivery_mode": deliveryMode,
-					"message":       message,
-				},
+				Payload:   payload,
 				Preview: map[string]any{
-					"email": map[string]any{
-						"mode":          emailPreviewMode(message),
-						"delivery_mode": deliveryMode,
-						"to":            message["to"],
-						"cc":            message["cc"],
-						"bcc":           message["bcc"],
-						"subject":       message["subject"],
-						"body_text":     message["body_text"],
-						"body_html":     message["body_html"],
-					},
+					"email":   previewEmail,
 					"context": input.Context,
 				},
 			})
@@ -849,13 +891,126 @@ func normalizeMessageForStorage(message map[string]any) map[string]any {
 	return out
 }
 
+func normalizeEmailVariantInputs(baseMessage map[string]any, variants []GmailEmailVariantInput) ([]map[string]any, error) {
+	out := make([]map[string]any, 0, len(variants))
+	seenIDs := map[string]bool{}
+	for index, variant := range variants {
+		title, err := normalizeEmailVariantTitle(variant.Title)
+		if err != nil {
+			return nil, err
+		}
+		message := emailVariantMessage(baseMessage, variant)
+		normalizedMessage := normalizeMessageForStorage(message)
+		id := emailVariantID(index)
+		if seenIDs[id] {
+			return nil, fmt.Errorf("duplicate email variant id %q", id)
+		}
+		seenIDs[id] = true
+		out = append(out, map[string]any{
+			"id":      id,
+			"title":   title,
+			"message": normalizedMessage,
+		})
+	}
+	return out, nil
+}
+
+func normalizeStoredEmailVariants(value any) []map[string]any {
+	rawVariants := mapSliceFromAny(value)
+	out := make([]map[string]any, 0, len(rawVariants))
+	for index, raw := range rawVariants {
+		title := strings.TrimSpace(stringFromAny(raw["title"]))
+		if title == "" {
+			title = fmt.Sprintf("Variant %d", index+1)
+		}
+		id := strings.TrimSpace(stringFromAny(raw["id"]))
+		if id == "" {
+			id = emailVariantID(index)
+		}
+		message := normalizeMessageForStorage(mapFromAny(raw["message"]))
+		out = append(out, map[string]any{
+			"id":      id,
+			"title":   title,
+			"message": message,
+		})
+	}
+	return out
+}
+
+func emailVariantMessage(baseMessage map[string]any, variant GmailEmailVariantInput) map[string]any {
+	message := cloneMap(baseMessage)
+	for key, value := range variant.Message {
+		message[key] = value
+	}
+	if values := normalizeStringSlice(variant.To); len(values) > 0 {
+		message["to"] = values
+	}
+	if values := normalizeStringSlice(variant.CC); len(values) > 0 {
+		message["cc"] = values
+	}
+	if values := normalizeStringSlice(variant.BCC); len(values) > 0 {
+		message["bcc"] = values
+	}
+	if subject := strings.TrimSpace(variant.Subject); subject != "" {
+		message["subject"] = subject
+	}
+	if variant.BodyText != "" {
+		message["body_text"] = variant.BodyText
+	}
+	if variant.BodyHTML != "" {
+		message["body_html"] = variant.BodyHTML
+	}
+	if replyToThreadID := strings.TrimSpace(variant.ReplyToThreadID); replyToThreadID != "" {
+		message["reply_to_thread_id"] = replyToThreadID
+	}
+	if inReplyTo := strings.TrimSpace(variant.InReplyTo); inReplyTo != "" {
+		message["in_reply_to"] = inReplyTo
+	}
+	if references := normalizeStringSlice(variant.References); len(references) > 0 {
+		message["references"] = references
+	}
+	return message
+}
+
+func normalizeEmailVariantTitle(value string) (string, error) {
+	words := strings.Fields(value)
+	if len(words) != 2 {
+		return "", errors.New("Gmail email variant title must be exactly two words")
+	}
+	title := strings.Join(words, " ")
+	if len([]rune(title)) > 32 {
+		return "", errors.New("Gmail email variant title must be 32 characters or fewer")
+	}
+	return title, nil
+}
+
+func emailVariantID(index int) string {
+	return fmt.Sprintf("variant_%d", index+1)
+}
+
 func updatedGmailEmailPayload(mutation Mutation, input UpdateGmailEmailMutationInput) (map[string]any, map[string]any, string, error) {
 	deliveryMode, err := normalizeDeliveryMode(input.DeliveryMode)
 	if err != nil {
 		return nil, nil, "", err
 	}
 	existingPayload := cloneMap(mutation.Payload)
+	variants := normalizeStoredEmailVariants(existingPayload["variants"])
+	selectedVariantID := strings.TrimSpace(input.SelectedVariantID)
+	if selectedVariantID == "" {
+		selectedVariantID = strings.TrimSpace(stringFromAny(existingPayload["selected_variant_id"]))
+	}
+	if selectedVariantID == "" && len(variants) > 0 {
+		selectedVariantID = stringFromAny(variants[0]["id"])
+	}
 	mergedMessage := mapFromAny(existingPayload["message"])
+	selectedVariantIndex := -1
+	for index, variant := range variants {
+		if stringFromAny(variant["id"]) == selectedVariantID {
+			mergedMessage = mapFromAny(variant["message"])
+			selectedVariantIndex = index
+			break
+		}
+	}
 	for key, value := range input.Message {
 		mergedMessage[key] = value
 	}
@@ -873,11 +1028,23 @@ func updatedGmailEmailPayload(mutation Mutation, input UpdateGmailEmailMutationI
 	payload := existingPayload
 	payload["delivery_mode"] = deliveryMode
 	payload["message"] = message
+	if len(variants) > 0 {
+		if selectedVariantIndex < 0 {
+			return nil, nil, "", fmt.Errorf("unknown Gmail email variant %q", selectedVariantID)
+		}
+		variants[selectedVariantIndex]["message"] = message
+		payload["variants"] = variants
+		payload["selected_variant_id"] = selectedVariantID
+	}
 
 	preview := cloneMap(mutation.Preview)
 	previewEmail := cloneMap(message)
 	previewEmail["mode"] = emailPreviewMode(message)
 	previewEmail["delivery_mode"] = deliveryMode
+	if len(variants) > 0 {
+		previewEmail["variants"] = variants
+		previewEmail["selected_variant_id"] = selectedVariantID
+	}
 	preview["email"] = previewEmail
 
 	return payload, preview, gmailEmailRequestTitle(deliveryMode, message), nil

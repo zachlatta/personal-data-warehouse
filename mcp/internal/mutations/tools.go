@@ -45,7 +45,7 @@ func RegisterTools(server *mcp.Server, service *Service) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "propose_gmail_send_email",
 		Title:       "Propose Gmail Email",
-		Description: mutationToolDescription + " Proposes sending or drafting a Gmail email.",
+		Description: mutationToolDescription + " Proposes sending or drafting a Gmail email. May include one email or multiple variants; each variant needs a short two-word title for the review tabs.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input ProposeGmailSendEmailInput) (*mcp.CallToolResult, any, error) {
 		logger.InfoContext(ctx, "MCP mutation tool called", "tool", "propose_gmail_send_email", "delivery_mode", input.DeliveryMode)
 		resp, err := service.ProposeGmailSendEmail(ctx, input)

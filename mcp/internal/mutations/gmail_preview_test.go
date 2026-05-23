@@ -87,6 +87,93 @@ func TestApplyGmailThreadPreviewRowsMergesWarehouseMessages(t *testing.T) {
 	}
 }
 
+func TestApplyGmailThreadPreviewRowsAddsReplyThreadToGmailEmailMutations(t *testing.T) {
+	latest := time.Date(2026, 5, 22, 15, 45, 0, 0, time.UTC)
+	mutations := []Mutation{{
+		ID:        "mut-email",
+		Provider:  "gmail",
+		Operation: GmailSendEmailOperation,
+		Account:   "zach@example.test",
+		Payload: map[string]any{
+			"message": map[string]any{
+				"to":                 []any{"one@example.test"},
+				"subject":            "Re: Existing thread",
+				"body_text":          "Reply body",
+				"reply_to_thread_id": "thread-reply",
+			},
+		},
+		Preview: map[string]any{
+			"email": map[string]any{"mode": "reply", "subject": "Re: Existing thread"},
+		},
+	}}
+
+	got := applyGmailThreadPreviewRows(mutations, []gmailThreadPreviewRow{{
+		Account:           "zach@example.test",
+		ThreadID:          "thread-reply",
+		MessageID:         "message-parent",
+		Subject:           "Existing thread",
+		FromAddress:       "Customer <customer@example.test>",
+		ToAddresses:       []string{"zach@example.test"},
+		LabelIDs:          []string{"INBOX", "CATEGORY_PERSONAL"},
+		InternalDate:      latest,
+		Snippet:           "Can you take a look?",
+		PreviewText:       "Can you take a look at this before Friday?",
+		BodyHTML:          "<p>Can you take a look?</p>",
+		MessageCount:      1,
+		InboxMessageCount: 1,
+	}})
+
+	threads := mapSliceFromAny(got[0].Preview["reply_threads"])
+	if len(threads) != 1 {
+		t.Fatalf("reply_threads = %#v", got[0].Preview["reply_threads"])
+	}
+	thread := threads[0]
+	if thread["thread_id"] != "thread-reply" || thread["subject"] != "Existing thread" {
+		t.Fatalf("reply thread summary = %#v", thread)
+	}
+	messages := mapSliceFromAny(thread["messages"])
+	if len(messages) != 1 || messages[0]["body_html"] != "<p>Can you take a look?</p>" {
+		t.Fatalf("reply thread messages = %#v", thread["messages"])
+	}
+	if got[0].Preview["reply_thread_count"] != 1 {
+		t.Fatalf("reply_thread_count = %#v", got[0].Preview["reply_thread_count"])
+	}
+}
+
+func TestGmailThreadPreviewTargetsIncludeGmailEmailVariantReplyThreads(t *testing.T) {
+	targets := gmailThreadPreviewTargets([]Mutation{{
+		ID:        "mut-email",
+		Provider:  "gmail",
+		Operation: GmailSendEmailOperation,
+		Account:   "zach@example.test",
+		Payload: map[string]any{
+			"message": map[string]any{
+				"reply_to_thread_id": "thread-direct",
+			},
+			"variants": []map[string]any{{
+				"id":    "variant_1",
+				"title": "Direct Reply",
+				"message": map[string]any{
+					"reply_to_thread_id": "thread-direct",
+				},
+			}, {
+				"id":    "variant_2",
+				"title": "Softer Ask",
+				"message": map[string]any{
+					"reply_to_thread_id": "thread-softer",
+				},
+			}},
+		},
+	}})
+
+	if len(targets) != 2 {
+		t.Fatalf("targets = %#v", targets)
+	}
+	if targets[0].ThreadID != "thread-direct" || targets[1].ThreadID != "thread-softer" {
+		t.Fatalf("targets = %#v", targets)
+	}
+}
+
 func TestCleanGmailPreviewTextRemovesQuotedReply(t *testing.T) {
 	got := cleanGmailPreviewText("Attached receipt -- Zach On Wed, May 13, 2026 at 8:25 AM HCB <hcb@hackclub.com> wrote: parent body")
 

@@ -51,57 +51,73 @@ func applyGmailThreadPreviewRows(mutations []Mutation, rows []gmailThreadPreview
 	out := make([]Mutation, len(mutations))
 	copy(out, mutations)
 	for index, mutation := range out {
-		if !isGmailThreadMutation(mutation) {
-			continue
-		}
-		threadIDs := gmailMutationThreadIDs(mutation)
-		if len(threadIDs) == 0 {
-			continue
-		}
-		existingThreads := mapSliceFromAny(mutation.Preview["threads"])
-		existingByID := map[string]map[string]any{}
-		for _, thread := range existingThreads {
-			threadID := strings.TrimSpace(stringFromAny(thread["thread_id"]))
-			if threadID != "" {
-				existingByID[threadID] = thread
+		switch {
+		case isGmailThreadMutation(mutation):
+			threadIDs := gmailMutationThreadIDs(mutation)
+			threads, changed := mergeGmailThreadPreviews(mutation.Account, threadIDs, mapSliceFromAny(mutation.Preview["threads"]), rowsByThread)
+			if changed {
+				preview := cloneMap(mutation.Preview)
+				preview["thread_count"] = len(threads)
+				preview["threads"] = threads
+				out[index].Preview = preview
 			}
-		}
-
-		preview := cloneMap(mutation.Preview)
-		threads := make([]map[string]any, 0, len(threadIDs))
-		changed := false
-		for _, threadID := range threadIDs {
-			thread := cloneMap(existingByID[threadID])
-			if len(thread) == 0 {
-				thread["thread_id"] = threadID
+		case isGmailEmailMutation(mutation):
+			threadIDs := gmailEmailReplyThreadIDs(mutation)
+			threads, changed := mergeGmailThreadPreviews(mutation.Account, threadIDs, mapSliceFromAny(mutation.Preview["reply_threads"]), rowsByThread)
+			if changed {
+				preview := cloneMap(mutation.Preview)
+				preview["reply_thread_count"] = len(threads)
+				preview["reply_threads"] = threads
+				out[index].Preview = preview
 			}
-			if threadRows := rowsByThread[gmailThreadPreviewKey{Account: normalizeAccount(mutation.Account), ThreadID: threadID}]; len(threadRows) > 0 {
-				thread = gmailThreadPreviewFromRows(threadID, threadRows)
-				changed = true
-			}
-			threads = append(threads, thread)
-		}
-		if changed {
-			preview["thread_count"] = len(threads)
-			preview["threads"] = threads
-			out[index].Preview = preview
 		}
 	}
 	return out
+}
+
+func mergeGmailThreadPreviews(account string, threadIDs []string, existingThreads []map[string]any, rowsByThread map[gmailThreadPreviewKey][]gmailThreadPreviewRow) ([]map[string]any, bool) {
+	if len(threadIDs) == 0 {
+		return nil, false
+	}
+	existingByID := map[string]map[string]any{}
+	for _, thread := range existingThreads {
+		threadID := strings.TrimSpace(stringFromAny(thread["thread_id"]))
+		if threadID != "" {
+			existingByID[threadID] = thread
+		}
+	}
+
+	threads := make([]map[string]any, 0, len(threadIDs))
+	changed := false
+	for _, threadID := range threadIDs {
+		thread := cloneMap(existingByID[threadID])
+		if len(thread) == 0 {
+			thread["thread_id"] = threadID
+		}
+		if threadRows := rowsByThread[gmailThreadPreviewKey{Account: normalizeAccount(account), ThreadID: threadID}]; len(threadRows) > 0 {
+			thread = gmailThreadPreviewFromRows(threadID, threadRows)
+			changed = true
+		}
+		threads = append(threads, thread)
+	}
+	return threads, changed
 }
 
 func gmailThreadPreviewTargets(mutations []Mutation) []gmailThreadPreviewKey {
 	targets := []gmailThreadPreviewKey{}
 	seen := map[gmailThreadPreviewKey]bool{}
 	for _, mutation := range mutations {
-		if !isGmailThreadMutation(mutation) {
-			continue
-		}
 		account := normalizeAccount(mutation.Account)
 		if account == "" {
 			continue
 		}
-		for _, threadID := range gmailMutationThreadIDs(mutation) {
+		threadIDs := []string{}
+		if isGmailThreadMutation(mutation) {
+			threadIDs = gmailMutationThreadIDs(mutation)
+		} else if isGmailEmailMutation(mutation) {
+			threadIDs = gmailEmailReplyThreadIDs(mutation)
+		}
+		for _, threadID := range threadIDs {
 			key := gmailThreadPreviewKey{Account: account, ThreadID: strings.TrimSpace(threadID)}
 			if key.ThreadID == "" || seen[key] {
 				continue
@@ -188,6 +204,32 @@ func gmailThreadPreviewFromRows(threadID string, rows []gmailThreadPreviewRow) m
 
 func isGmailThreadMutation(mutation Mutation) bool {
 	return mutation.Provider == "gmail" && (mutation.Operation == GmailArchiveOperation || mutation.Operation == GmailUnarchiveOperation)
+}
+
+func gmailEmailReplyThreadIDs(mutation Mutation) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	appendMessageThreadID := func(message map[string]any) {
+		threadID := strings.TrimSpace(stringFromAny(message["reply_to_thread_id"]))
+		if threadID == "" || seen[threadID] {
+			return
+		}
+		out = append(out, threadID)
+		seen[threadID] = true
+	}
+
+	payload := mapFromAny(mutation.Payload)
+	appendMessageThreadID(mapFromAny(payload["message"]))
+	for _, variant := range normalizeStoredEmailVariants(payload["variants"]) {
+		appendMessageThreadID(mapFromAny(variant["message"]))
+	}
+
+	previewEmail := mapFromAny(mutation.Preview["email"])
+	appendMessageThreadID(previewEmail)
+	for _, variant := range normalizeStoredEmailVariants(previewEmail["variants"]) {
+		appendMessageThreadID(mapFromAny(variant["message"]))
+	}
+	return out
 }
 
 func gmailMutationThreadIDs(mutation Mutation) []string {

@@ -98,7 +98,7 @@ When mutation review is enabled, the server also exposes:
 - `propose_mutation_request`
 - `propose_gmail_archive_threads`
 - `propose_gmail_unarchive_threads`
-- `propose_gmail_send_email`
+- `propose_gmail_send_email` (optionally with multiple reviewed variants; each variant needs a two-word tab title)
 - `propose_contact_mutations`
 
 These tools only create rows in the `upstream_mutation_requests` and `upstream_mutations` tables.

@@ -160,6 +160,61 @@ func TestProposeGmailSendEmailCreatesReviewRequest(t *testing.T) {
 	}
 }
 
+func TestProposeGmailSendEmailAcceptsTitledVariants(t *testing.T) {
+	store := &recordingStore{request: Request{ID: "req-email", Status: "pending_review"}}
+	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
+
+	_, err := service.ProposeGmailSendEmail(context.Background(), ProposeGmailSendEmailInput{
+		Account:      "zach@example.test",
+		To:           []string{"one@example.test"},
+		Subject:      "Hello",
+		BodyText:     "Base body",
+		DeliveryMode: "send",
+		Reason:       "offer choices",
+		Variants: []GmailEmailVariantInput{{
+			Title:    "Direct Reply",
+			BodyText: "Direct body",
+		}, {
+			Title:    "Softer Ask",
+			BodyText: "Softer body",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ProposeGmailSendEmail returned error: %v", err)
+	}
+
+	mutation := store.createCalls[0].Mutations[0]
+	if len(mutation.EmailVariants) != 2 {
+		t.Fatalf("variants = %#v", mutation.EmailVariants)
+	}
+	if mutation.EmailVariants[0].Title != "Direct Reply" || mutation.EmailVariants[1].Title != "Softer Ask" {
+		t.Fatalf("variant titles = %#v", mutation.EmailVariants)
+	}
+}
+
+func TestProposeGmailSendEmailRejectsVariantWithoutTwoWordTitle(t *testing.T) {
+	store := &recordingStore{}
+	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
+
+	_, err := service.ProposeGmailSendEmail(context.Background(), ProposeGmailSendEmailInput{
+		Account:  "zach@example.test",
+		To:       []string{"one@example.test"},
+		Subject:  "Hello",
+		BodyText: "Body",
+		Reason:   "offer choices",
+		Variants: []GmailEmailVariantInput{{
+			Title:    "Direct",
+			BodyText: "Direct body",
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "variant title") {
+		t.Fatalf("expected variant title error, got %v", err)
+	}
+	if len(store.createCalls) != 0 {
+		t.Fatalf("CreateRequest should not have been called: %#v", store.createCalls)
+	}
+}
+
 func TestProposeContactMutationsCreatesReviewRequest(t *testing.T) {
 	store := &recordingStore{request: Request{
 		ID:     "req-contact",

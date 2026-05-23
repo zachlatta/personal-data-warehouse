@@ -55,8 +55,14 @@ func (s *reviewStore) UpdateGmailEmailMutation(_ context.Context, requestID stri
 			}
 			mutation.Payload["delivery_mode"] = input.DeliveryMode
 			mutation.Payload["message"] = cloneMap(input.Message)
+			if input.SelectedVariantID != "" {
+				mutation.Payload["selected_variant_id"] = input.SelectedVariantID
+			}
 			previewEmail := cloneMap(input.Message)
 			previewEmail["delivery_mode"] = input.DeliveryMode
+			if input.SelectedVariantID != "" {
+				previewEmail["selected_variant_id"] = input.SelectedVariantID
+			}
 			mutation.Preview["email"] = previewEmail
 			return *mutation, nil
 		}
@@ -498,6 +504,14 @@ func TestReviewUIRendersGmailSendEmailEditor(t *testing.T) {
 		`name="reply_to_thread_id" value="thread-reply"`,
 		`name="in_reply_to" value="&lt;message@example.test&gt;"`,
 		`name="body_html"`,
+		`class="gmail-email-reply-context"`,
+		"Replying in thread",
+		`<details class="gmail-thread" open>`,
+		`<summary class="gmail-row">`,
+		`class="gmail-inline-reply"`,
+		"Existing customer thread",
+		"Customer &lt;customer@example.test&gt;",
+		"Can you take a look?",
 		"Save email changes",
 		"Save as draft instead",
 	} {
@@ -507,6 +521,104 @@ func TestReviewUIRendersGmailSendEmailEditor(t *testing.T) {
 	}
 	if strings.Contains(body, `<pre>{`) {
 		t.Fatalf("email editor should not lead with raw JSON: %q", body)
+	}
+	if strings.Index(body, `class="gmail-message-body"`) > strings.Index(body, `class="gmail-inline-reply"`) {
+		t.Fatalf("inline reply composer should render after existing messages: %q", body)
+	}
+}
+
+func TestReviewUIRendersGmailSendEmailVariantTabs(t *testing.T) {
+	store := &reviewStore{requests: []Request{gmailEmailVariantReviewRequest()}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-email-variants", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail status = %d body=%q", detailResponse.Code, detailResponse.Body.String())
+	}
+	body := detailResponse.Body.String()
+	for _, want := range []string{
+		`class="gmail-email-tabs"`,
+		`data-email-variant-tab="0"`,
+		`data-email-variant-tab="1"`,
+		"Direct Reply",
+		"Softer Ask",
+		`name="selected_variant_id" value="variant_1"`,
+		`name="selected_variant_id" value="variant_2"`,
+		"Selected proposal: <strong>Direct Reply</strong>",
+		"Selected proposal: <strong>Softer Ask</strong>",
+		"Direct body",
+		"Softer body",
+		"Use this version",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("variant email editor page missing %q: %q", want, body)
+		}
+	}
+}
+
+func TestReviewUIUpdatesSelectedGmailEmailVariant(t *testing.T) {
+	store := &reviewStore{requests: []Request{gmailEmailVariantReviewRequest()}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-email-variants", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+	csrfToken := hiddenFieldValue(t, detailResponse.Body.String(), "csrf_token")
+
+	updateForm := url.Values{
+		"csrf_token":          {csrfToken},
+		"selected_variant_id": {"variant_2"},
+		"delivery_mode":       {"send"},
+		"to":                  {"one@example.test"},
+		"subject":             {"Softer subject"},
+		"body_text":           {"Edited softer body"},
+		"body_html":           {"<p>Edited softer body</p>"},
+	}
+	updateResponse := httptest.NewRecorder()
+	updateRequest := httptest.NewRequest(http.MethodPost, "/mutation-review/requests/req-email-variants/mutations/mut-email-variants/update-email", strings.NewReader(updateForm.Encode()))
+	updateRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		updateRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(updateResponse, updateRequest)
+
+	if updateResponse.Code != http.StatusSeeOther {
+		t.Fatalf("update status = %d body=%q", updateResponse.Code, updateResponse.Body.String())
+	}
+	if len(store.emailUpdates) != 1 {
+		t.Fatalf("email updates = %#v", store.emailUpdates)
+	}
+	update := store.emailUpdates[0]
+	if update.Input.SelectedVariantID != "variant_2" {
+		t.Fatalf("selected variant = %q", update.Input.SelectedVariantID)
+	}
+	if update.Input.Message["subject"] != "Softer subject" || update.Input.Message["body_text"] != "Edited softer body" {
+		t.Fatalf("message = %#v", update.Input.Message)
 	}
 }
 
@@ -822,6 +934,22 @@ func TestSanitizeGmailSignaturePreviewHTML(t *testing.T) {
 	}
 }
 
+func TestGmailBodyFrameHeightKeepsShortEmailsCompact(t *testing.T) {
+	short := gmailBodyFrameHeight("<p>Short notification</p>", false)
+	long := gmailBodyFrameHeight("<p>"+strings.Repeat("Long body text. ", 200)+"</p>", false)
+	quoted := gmailBodyFrameHeight("<p>"+strings.Repeat("Quoted body text. ", 200)+"</p>", true)
+
+	if short > 180 {
+		t.Fatalf("short email height = %d", short)
+	}
+	if long > 240 {
+		t.Fatalf("long email height = %d", long)
+	}
+	if quoted > 200 {
+		t.Fatalf("quoted email height = %d", quoted)
+	}
+}
+
 func gmailEmailReviewRequest() Request {
 	message := map[string]any{
 		"to":                 []any{"one@example.test"},
@@ -863,6 +991,85 @@ func gmailEmailReviewRequest() Request {
 					"subject":       message["subject"],
 					"body_text":     message["body_text"],
 					"body_html":     message["body_html"],
+				},
+				"reply_thread_count": 1,
+				"reply_threads": []any{map[string]any{
+					"thread_id":           "thread-reply",
+					"subject":             "Existing customer thread",
+					"latest_from_address": "Customer <customer@example.test>",
+					"latest_at":           "2026-05-22T15:45:00Z",
+					"latest_preview":      "Can you take a look?",
+					"message_count":       1,
+					"inbox_message_count": 1,
+					"labels":              []any{"INBOX"},
+					"messages": []any{map[string]any{
+						"message_id":    "message-parent",
+						"from_address":  "Customer <customer@example.test>",
+						"to_addresses":  []any{"zach@example.test"},
+						"internal_date": "2026-05-22T15:45:00Z",
+						"preview_text":  "Can you take a look?",
+						"body_html":     "<p>Can you take a look?</p>",
+						"label_ids":     []any{"INBOX"},
+					}},
+				}},
+			},
+		}},
+	}
+}
+
+func gmailEmailVariantReviewRequest() Request {
+	directMessage := map[string]any{
+		"to":        []any{"one@example.test"},
+		"subject":   "Direct subject",
+		"body_text": "Direct body",
+		"body_html": "<p>Direct body</p>",
+	}
+	softerMessage := map[string]any{
+		"to":        []any{"one@example.test"},
+		"subject":   "Softer subject",
+		"body_text": "Softer body",
+		"body_html": "<p>Softer body</p>",
+	}
+	variants := []map[string]any{{
+		"id":      "variant_1",
+		"title":   "Direct Reply",
+		"message": cloneMap(directMessage),
+	}, {
+		"id":      "variant_2",
+		"title":   "Softer Ask",
+		"message": cloneMap(softerMessage),
+	}}
+	return Request{
+		ID:        "req-email-variants",
+		Status:    "pending_review",
+		Title:     "Send proposed email",
+		Reason:    "reply to customer",
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+		Mutations: []Mutation{{
+			ID:        "mut-email-variants",
+			RequestID: "req-email-variants",
+			Provider:  "gmail",
+			Operation: GmailSendEmailOperation,
+			Account:   "zach@example.test",
+			Status:    "pending_review",
+			Title:     "Send email: Direct subject",
+			Reason:    "reply to customer",
+			Payload: map[string]any{
+				"delivery_mode":       "send",
+				"selected_variant_id": "variant_1",
+				"message":             cloneMap(directMessage),
+				"variants":            variants,
+			},
+			Preview: map[string]any{
+				"email": map[string]any{
+					"mode":                "new_thread",
+					"delivery_mode":       "send",
+					"selected_variant_id": "variant_1",
+					"to":                  directMessage["to"],
+					"subject":             directMessage["subject"],
+					"body_text":           directMessage["body_text"],
+					"body_html":           directMessage["body_html"],
+					"variants":            variants,
 				},
 			},
 		}},

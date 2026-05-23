@@ -126,6 +126,119 @@ func TestUpdatedGmailEmailPayloadConvertsSendToDraft(t *testing.T) {
 	}
 }
 
+func TestNormalizeForStorageStoresEmailVariantsWithSelectedMessage(t *testing.T) {
+	mutations, err := normalizeForStorage(CreateRequestInput{
+		Reason: "choose email",
+		Mutations: []MutationInput{{
+			Type:         GmailSendEmailOperation,
+			Account:      "zach@example.test",
+			DeliveryMode: "send",
+			Message: map[string]any{
+				"to":        []string{"one@example.test"},
+				"subject":   "Base subject",
+				"body_text": "Base body",
+			},
+			EmailVariants: []GmailEmailVariantInput{{
+				Title:    "Direct Reply",
+				BodyText: "Direct body",
+			}, {
+				Title:    "Softer Ask",
+				Subject:  "Softer subject",
+				BodyText: "Softer body",
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("normalizeForStorage returned error: %v", err)
+	}
+	payload := mutations[0].Payload
+	if payload["selected_variant_id"] != "variant_1" {
+		t.Fatalf("selected_variant_id = %#v", payload["selected_variant_id"])
+	}
+	message := mapFromAny(payload["message"])
+	if message["body_text"] != "Direct body" || message["subject"] != "Base subject" {
+		t.Fatalf("selected message = %#v", message)
+	}
+	variants := mapSliceFromAny(payload["variants"])
+	if len(variants) != 2 {
+		t.Fatalf("variants = %#v", payload["variants"])
+	}
+	if variants[0]["title"] != "Direct Reply" || mapFromAny(variants[1]["message"])["subject"] != "Softer subject" {
+		t.Fatalf("variants = %#v", variants)
+	}
+	previewEmail := mapFromAny(mutations[0].Preview["email"])
+	if previewEmail["selected_variant_id"] != "variant_1" || len(mapSliceFromAny(previewEmail["variants"])) != 2 {
+		t.Fatalf("preview email = %#v", previewEmail)
+	}
+}
+
+func TestUpdatedGmailEmailPayloadSelectsVariant(t *testing.T) {
+	mutation := Mutation{
+		ID:        "mut-email",
+		Provider:  "gmail",
+		Operation: GmailSendEmailOperation,
+		Payload: map[string]any{
+			"delivery_mode":       "send",
+			"selected_variant_id": "variant_1",
+			"message": map[string]any{
+				"to":        []any{"one@example.test"},
+				"subject":   "Direct",
+				"body_text": "Direct body",
+			},
+			"variants": []map[string]any{{
+				"id":    "variant_1",
+				"title": "Direct Reply",
+				"message": map[string]any{
+					"to":        []any{"one@example.test"},
+					"subject":   "Direct",
+					"body_text": "Direct body",
+				},
+			}, {
+				"id":    "variant_2",
+				"title": "Softer Ask",
+				"message": map[string]any{
+					"to":        []any{"one@example.test"},
+					"subject":   "Softer",
+					"body_text": "Softer body",
+				},
+			}},
+		},
+		Preview: map[string]any{},
+	}
+
+	payload, preview, title, err := updatedGmailEmailPayload(mutation, UpdateGmailEmailMutationInput{
+		DeliveryMode:      "draft",
+		SelectedVariantID: "variant_2",
+		Message: map[string]any{
+			"body_text": "Edited softer body",
+		},
+	})
+	if err != nil {
+		t.Fatalf("updatedGmailEmailPayload returned error: %v", err)
+	}
+	if title != "Create draft: Softer" {
+		t.Fatalf("title = %q", title)
+	}
+	if payload["selected_variant_id"] != "variant_2" || payload["delivery_mode"] != "draft" {
+		t.Fatalf("payload metadata = %#v", payload)
+	}
+	message := mapFromAny(payload["message"])
+	if message["subject"] != "Softer" || message["body_text"] != "Edited softer body" {
+		t.Fatalf("selected message = %#v", message)
+	}
+	variants := mapSliceFromAny(payload["variants"])
+	if mapFromAny(variants[0]["message"])["body_text"] != "Direct body" {
+		t.Fatalf("first variant was modified: %#v", variants[0])
+	}
+	if mapFromAny(variants[1]["message"])["body_text"] != "Edited softer body" {
+		t.Fatalf("second variant was not updated: %#v", variants[1])
+	}
+	previewEmail := mapFromAny(preview["email"])
+	if previewEmail["selected_variant_id"] != "variant_2" || len(mapSliceFromAny(previewEmail["variants"])) != 2 {
+		t.Fatalf("preview email = %#v", previewEmail)
+	}
+}
+
 func TestUpdatedGmailEmailPayloadRejectsInvalidDraft(t *testing.T) {
 	mutation := Mutation{
 		Payload: map[string]any{
