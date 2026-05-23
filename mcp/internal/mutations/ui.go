@@ -266,27 +266,49 @@ type gmailMutationGroup struct {
 	Mutations []Mutation
 }
 
+type contactMutationGroup struct {
+	Account   string
+	Status    string
+	Mutations []Mutation
+}
+
 type mutationRenderItem struct {
-	GroupKey string
-	Mutation *Mutation
+	GroupKind string
+	GroupKey  string
+	Mutation  *Mutation
 }
 
 func renderMutationList(w http.ResponseWriter, mutations []Mutation) {
-	groups := map[string]*gmailMutationGroup{}
+	gmailGroups := map[string]*gmailMutationGroup{}
+	contactGroups := map[string]*contactMutationGroup{}
 	items := []mutationRenderItem{}
 	for index := range mutations {
 		mutation := mutations[index]
 		if isGmailThreadMutation(mutation) {
 			key := mutation.Operation + "\x00" + mutation.Account
-			group := groups[key]
+			group := gmailGroups[key]
 			if group == nil {
 				group = &gmailMutationGroup{
 					Operation: mutation.Operation,
 					Account:   mutation.Account,
 					Status:    mutation.Status,
 				}
-				groups[key] = group
-				items = append(items, mutationRenderItem{GroupKey: key})
+				gmailGroups[key] = group
+				items = append(items, mutationRenderItem{GroupKind: "gmail", GroupKey: key})
+			}
+			if group.Status != mutation.Status {
+				group.Status = "mixed"
+			}
+			group.Mutations = append(group.Mutations, mutation)
+			continue
+		}
+		if isContactMutation(mutation) {
+			key := mutation.Account
+			group := contactGroups[key]
+			if group == nil {
+				group = &contactMutationGroup{Account: mutation.Account, Status: mutation.Status}
+				contactGroups[key] = group
+				items = append(items, mutationRenderItem{GroupKind: "contact", GroupKey: key})
 			}
 			if group.Status != mutation.Status {
 				group.Status = "mixed"
@@ -297,8 +319,12 @@ func renderMutationList(w http.ResponseWriter, mutations []Mutation) {
 		items = append(items, mutationRenderItem{Mutation: &mutation})
 	}
 	for _, item := range items {
-		if item.GroupKey != "" {
-			renderGmailMutationGroup(w, groups[item.GroupKey])
+		switch item.GroupKind {
+		case "gmail":
+			renderGmailMutationGroup(w, gmailGroups[item.GroupKey])
+			continue
+		case "contact":
+			renderContactMutationGroup(w, contactGroups[item.GroupKey])
 			continue
 		}
 		if item.Mutation != nil {
@@ -316,6 +342,10 @@ func renderMutationArticle(w http.ResponseWriter, mutation Mutation) {
 		html.EscapeString(prettyJSON(mutation.Payload)),
 		html.EscapeString(prettyJSON(mutation.Preview)),
 	)
+}
+
+func isContactMutation(mutation Mutation) bool {
+	return mutation.Provider == "google_people" || mutation.Operation == ContactsBatchMutationOperation || mutation.Operation == GooglePeopleContactsOperation
 }
 
 func renderGmailMutationGroup(w http.ResponseWriter, group *gmailMutationGroup) {
@@ -367,6 +397,348 @@ func gmailMutationGroupStatus(status string, mutationCount int) string {
 		return status
 	}
 	return fmt.Sprintf("%d %s", mutationCount, status)
+}
+
+func renderContactMutationGroup(w http.ResponseWriter, group *contactMutationGroup) {
+	if group == nil {
+		return
+	}
+	operations := contactMutationGroupOperations(group.Mutations)
+	fmt.Fprintf(w, `<article class="mutation contact-mutation"><div class="mutation-head"><div><p class="eyebrow">Contacts</p><h3>%s</h3></div><span class="pill">%s</span></div>`,
+		html.EscapeString(contactMutationGroupTitle(len(operations))),
+		html.EscapeString(gmailMutationGroupStatus(group.Status, len(group.Mutations))),
+	)
+	fmt.Fprintf(w, `<p class="mutation-meta">contacts.batch_mutation for %s</p>`, html.EscapeString(group.Account))
+	fmt.Fprint(w, `<div class="contact-operations">`)
+	for _, operation := range operations {
+		renderContactOperation(w, operation)
+	}
+	fmt.Fprint(w, `</div></article>`)
+}
+
+type contactOperationView struct {
+	Operation map[string]any
+	Mutation  Mutation
+}
+
+func contactMutationGroupOperations(mutations []Mutation) []contactOperationView {
+	operations := []contactOperationView{}
+	for _, mutation := range mutations {
+		opMaps := mapSliceFromAny(mutation.Preview["operations"])
+		if len(opMaps) == 0 {
+			opMaps = mapSliceFromAny(mutation.Payload["operations"])
+		}
+		for _, operation := range opMaps {
+			operations = append(operations, contactOperationView{Operation: operation, Mutation: mutation})
+		}
+	}
+	return operations
+}
+
+func contactMutationGroupTitle(operationCount int) string {
+	return fmt.Sprintf("Apply %d contact change%s", operationCount, plural(operationCount))
+}
+
+func renderContactOperation(w http.ResponseWriter, view contactOperationView) {
+	operation := view.Operation
+	op := strings.TrimSpace(stringFromAny(operation["op"]))
+	summary := contactOperationSummary(operation)
+	title := contactOperationTitle(op)
+	classes := "contact-operation"
+	if op == "delete_contact" {
+		classes += " destructive"
+	}
+	fmt.Fprintf(w, `<div class="%s">`, html.EscapeString(classes))
+	fmt.Fprint(w, `<div class="contact-operation-main">`)
+	fmt.Fprintf(w, `<div class="contact-avatar" aria-hidden="true">%s</div>`, html.EscapeString(senderInitial(summary.DisplayName)))
+	fmt.Fprint(w, `<div class="contact-operation-copy">`)
+	fmt.Fprintf(w, `<p class="contact-op">%s</p>`, html.EscapeString(title))
+	fmt.Fprintf(w, `<h4>%s</h4>`, html.EscapeString(contactSummaryTitle(summary, operation)))
+	renderContactSummaryMeta(w, summary)
+	renderContactOperationEffect(w, operation)
+	fmt.Fprint(w, `</div>`)
+	fmt.Fprintf(w, `<span class="pill">%s</span>`, html.EscapeString(view.Mutation.Status))
+	fmt.Fprint(w, `</div>`)
+	renderContactOperationBody(w, operation)
+	fmt.Fprintf(w, `<details class="raw-json"><summary>Raw contact operation</summary><pre class="json-code">%s</pre></details>`, html.EscapeString(prettyJSON(operation)))
+	fmt.Fprint(w, `</div>`)
+}
+
+type contactSummary struct {
+	DisplayName  string
+	PrimaryEmail string
+	PrimaryPhone string
+	Organization string
+}
+
+func contactOperationSummary(operation map[string]any) contactSummary {
+	if summary := contactSummaryFromSummaryMap(mapFromAny(operation["summary"])); !summary.Empty() {
+		return summary
+	}
+	for _, key := range []string{"person", "after", "before"} {
+		if summary := contactSummaryFromPerson(mapFromAny(operation[key])); !summary.Empty() {
+			return summary
+		}
+	}
+	return contactSummary{}
+}
+
+func contactSummaryFromSummaryMap(value map[string]any) contactSummary {
+	return contactSummary{
+		DisplayName:  strings.TrimSpace(stringFromAny(value["display_name"])),
+		PrimaryEmail: strings.TrimSpace(stringFromAny(value["primary_email"])),
+		PrimaryPhone: strings.TrimSpace(stringFromAny(value["primary_phone"])),
+		Organization: strings.TrimSpace(stringFromAny(value["organization"])),
+	}
+}
+
+func contactSummaryFromPerson(person map[string]any) contactSummary {
+	return contactSummary{
+		DisplayName:  firstContactFieldValue(person["names"], "displayName", "unstructuredName", "givenName"),
+		PrimaryEmail: firstContactFieldValue(contactPersonValue(person, "emailAddresses", "email_addresses", "emails"), "value"),
+		PrimaryPhone: firstContactFieldValue(contactPersonValue(person, "phoneNumbers", "phone_numbers", "phones"), "canonicalForm", "value"),
+		Organization: contactOrganizationSummary(contactPersonValue(person, "organizations")),
+	}
+}
+
+func (summary contactSummary) Empty() bool {
+	return summary.DisplayName == "" && summary.PrimaryEmail == "" && summary.PrimaryPhone == "" && summary.Organization == ""
+}
+
+func contactOperationTitle(op string) string {
+	switch op {
+	case "create_contact":
+		return "Create contact"
+	case "update_contact":
+		return "Update contact"
+	case "delete_contact":
+		return "Delete contact"
+	default:
+		return "Change contact"
+	}
+}
+
+func contactSummaryTitle(summary contactSummary, operation map[string]any) string {
+	for _, value := range []string{summary.DisplayName, summary.PrimaryEmail, strings.TrimSpace(stringFromAny(operation["resource_name"]))} {
+		if value != "" {
+			return value
+		}
+	}
+	return "Unnamed contact"
+}
+
+func renderContactSummaryMeta(w http.ResponseWriter, summary contactSummary) {
+	fmt.Fprint(w, `<div class="contact-meta">`)
+	for _, value := range []string{summary.PrimaryEmail, summary.PrimaryPhone, summary.Organization} {
+		if value != "" {
+			fmt.Fprintf(w, `<span>%s</span>`, html.EscapeString(value))
+		}
+	}
+	fmt.Fprint(w, `</div>`)
+}
+
+func renderContactOperationEffect(w http.ResponseWriter, operation map[string]any) {
+	op := strings.TrimSpace(stringFromAny(operation["op"]))
+	switch op {
+	case "update_contact":
+		fields := contactUpdateFields(operation)
+		fmt.Fprint(w, `<p class="contact-effect">Replaces `)
+		if len(fields) == 0 {
+			fmt.Fprint(w, `selected fields`)
+		} else {
+			for index, field := range fields {
+				if index > 0 {
+					fmt.Fprint(w, `, `)
+				}
+				fmt.Fprintf(w, `<code>%s</code>`, html.EscapeString(field))
+			}
+		}
+		fmt.Fprint(w, `</p>`)
+	case "delete_contact":
+		fmt.Fprint(w, `<p class="contact-effect">Deletes this contact from Google Contacts.</p>`)
+	case "create_contact":
+		fmt.Fprint(w, `<p class="contact-effect">Creates a new Google Contact.</p>`)
+	}
+	if resource := strings.TrimSpace(stringFromAny(operation["resource_name"])); resource != "" {
+		fmt.Fprintf(w, `<p class="contact-resource"><code>%s</code></p>`, html.EscapeString(resource))
+	}
+}
+
+func renderContactOperationBody(w http.ResponseWriter, operation map[string]any) {
+	op := strings.TrimSpace(stringFromAny(operation["op"]))
+	switch op {
+	case "update_contact":
+		renderContactUpdateDiff(w, operation)
+	case "create_contact":
+		renderContactPersonBlock(w, "Contact to create", mapFromAny(operation["person"]))
+	case "delete_contact":
+		renderContactPersonBlock(w, "Contact to delete", mapFromAny(operation["before"]))
+	}
+}
+
+func renderContactUpdateDiff(w http.ResponseWriter, operation map[string]any) {
+	fields := contactUpdateFields(operation)
+	before := mapFromAny(operation["before"])
+	after := mapFromAny(operation["after"])
+	fmt.Fprint(w, `<p class="muted">Fields not listed here are not part of this update.</p>`)
+	fmt.Fprint(w, `<table class="contact-diff"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>`)
+	for _, field := range fields {
+		fmt.Fprintf(w, `<tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>`,
+			html.EscapeString(field),
+			renderContactFieldValue(before[field]),
+			renderContactFieldValue(after[field]),
+		)
+	}
+	if len(fields) == 0 {
+		fmt.Fprint(w, `<tr><td colspan="3">No explicit update fields were provided.</td></tr>`)
+	}
+	fmt.Fprint(w, `</tbody></table>`)
+}
+
+func renderContactPersonBlock(w http.ResponseWriter, title string, person map[string]any) {
+	if len(person) == 0 {
+		return
+	}
+	summary := contactSummaryFromPerson(person)
+	fmt.Fprintf(w, `<div class="contact-person-block"><p class="contact-block-title">%s</p>`, html.EscapeString(title))
+	fmt.Fprint(w, `<dl>`)
+	for _, row := range []struct {
+		Label string
+		Value string
+	}{
+		{"Name", summary.DisplayName},
+		{"Email", summary.PrimaryEmail},
+		{"Phone", summary.PrimaryPhone},
+		{"Organization", summary.Organization},
+	} {
+		if row.Value != "" {
+			fmt.Fprintf(w, `<dt>%s</dt><dd>%s</dd>`, html.EscapeString(row.Label), html.EscapeString(row.Value))
+		}
+	}
+	fmt.Fprint(w, `</dl></div>`)
+}
+
+func renderContactFieldValue(value any) string {
+	text := contactFieldValueSummary(value)
+	if text == "" {
+		text = "Not set"
+	}
+	return `<span class="contact-field-value">` + html.EscapeString(text) + `</span>`
+}
+
+func contactFieldValueSummary(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case []any:
+		values := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text := contactFieldMapSummary(mapFromAny(item)); text != "" {
+				values = append(values, text)
+			}
+		}
+		return strings.Join(values, "; ")
+	case []map[string]any:
+		values := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text := contactFieldMapSummary(item); text != "" {
+				values = append(values, text)
+			}
+		}
+		return strings.Join(values, "; ")
+	case map[string]any:
+		return contactFieldMapSummary(typed)
+	default:
+		return compactWhitespace(stringFromAny(value))
+	}
+}
+
+func contactFieldMapSummary(value map[string]any) string {
+	for _, keys := range [][]string{
+		{"displayName", "unstructuredName", "givenName"},
+		{"canonicalForm", "value"},
+		{"value"},
+		{"name"},
+		{"title"},
+	} {
+		if text := firstContactValueFromMap(value, keys...); text != "" {
+			return text
+		}
+	}
+	return compactWhitespace(prettyJSON(value))
+}
+
+func contactUpdateFields(operation map[string]any) []string {
+	for _, key := range []string{"update_person_fields", "updatePersonFields"} {
+		value := operation[key]
+		if values := stringSliceFromAny(value); len(values) > 0 {
+			return values
+		}
+		if text := strings.TrimSpace(stringFromAny(value)); text != "" {
+			return normalizeStringSlice(strings.Split(text, ","))
+		}
+	}
+	return nil
+}
+
+func contactPersonValue(person map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := person[key]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func firstContactFieldValue(value any, keys ...string) string {
+	for _, item := range mapSliceFromAnyValue(value) {
+		if text := firstContactValueFromMap(item, keys...); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func firstContactValueFromMap(value map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if text := strings.TrimSpace(stringFromAny(value[key])); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func contactOrganizationSummary(value any) string {
+	for _, item := range mapSliceFromAnyValue(value) {
+		name := strings.TrimSpace(stringFromAny(item["name"]))
+		title := strings.TrimSpace(stringFromAny(item["title"]))
+		switch {
+		case name != "" && title != "":
+			return title + ", " + name
+		case name != "":
+			return name
+		case title != "":
+			return title
+		}
+	}
+	return ""
+}
+
+func mapSliceFromAnyValue(value any) []map[string]any {
+	switch typed := value.(type) {
+	case []map[string]any:
+		return typed
+	case []any:
+		out := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if itemMap := mapFromAny(item); len(itemMap) > 0 {
+				out = append(out, itemMap)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func renderGmailThread(w http.ResponseWriter, thread map[string]any) {
@@ -818,7 +1190,7 @@ button{background:#1a73e8;color:white;border:0;padding:9px 12px;border-radius:6p
 input{padding:8px;border:1px solid #bdc1c6;border-radius:6px}
 label{display:grid;gap:6px;margin:14px 0}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f2ee;padding:10px;border-radius:6px}
-.reason,.status,.mutation-meta,.empty{color:#5f6368}.error{color:#9b1c1c}.actions{display:inline-flex;gap:8px;margin-right:8px}
+.reason,.status,.mutation-meta,.empty,.muted{color:#5f6368}.error{color:#9b1c1c}.actions{display:inline-flex;gap:8px;margin-right:8px}
 .mutation-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
 .mutation-reason{margin:8px 0 10px;color:#3c4043}.eyebrow{margin:0 0 4px;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
 .pill{background:#e8f0fe;color:#174ea6;border-radius:999px;padding:4px 9px;font-size:12px;font-weight:600;white-space:nowrap}
@@ -829,7 +1201,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f2ee;padding:10px;
 .gmail-label{background:#e8eaed;color:#3c4043;border-radius:4px;padding:2px 6px;font-size:12px;font-weight:500}.gmail-thread-meta{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:#5f6368;font-size:12px}.thread-id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#80868b}
 .gmail-expanded{border-top:1px solid #e8eaed;background:#fff}.gmail-expanded-subject{display:flex;align-items:center;gap:18px;padding:18px 28px 8px 76px}.gmail-expanded-subject h4{font-size:22px;font-weight:400;margin:0;color:#202124}
 .gmail-messages{padding:0 0 18px}.gmail-message{border-top:1px solid #f1f3f4}.gmail-message summary{list-style:none}.gmail-message summary::-webkit-details-marker{display:none}.gmail-message-summary{display:grid;grid-template-columns:48px minmax(0,1fr);gap:14px;padding:18px 28px;cursor:pointer}.gmail-message-summary:hover{background:#f8fafd}.gmail-avatar{width:40px;height:40px;border-radius:50%%;background:#5e7ce2;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.gmail-message-summary-main{min-width:0}.gmail-message-header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.gmail-message-header strong{display:inline;font-size:15px}.gmail-message-header time{color:#5f6368;font-size:13px;white-space:nowrap}.gmail-to{display:block;color:#5f6368;font-size:12px;margin-top:3px}.gmail-message-preview{margin:8px 0 0;color:#5f6368;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.gmail-message[open] .gmail-message-preview{display:none}.gmail-message-body{padding:0 28px 22px 90px}.gmail-message-body p{margin:8px 0 0;color:#3c4043;line-height:1.45;white-space:pre-wrap}.gmail-body-frame{display:block;width:100%%;height:760px;border:0;background:white}.gmail-quoted{margin-top:14px;border-left:3px solid #dadce0;padding-left:12px}.gmail-quoted>summary{color:#5f6368;cursor:pointer;font-size:13px;margin-bottom:8px}.gmail-body-frame.quoted{height:520px}.raw-json{border-top:1px solid #e8eaed;padding-top:12px;margin-bottom:16px}.raw-json summary{color:#5f6368;cursor:pointer}
-@media (max-width:760px){main{padding:16px}.gmail-row{grid-template-columns:20px 20px minmax(0,1fr) 56px;gap:8px}.gmail-important,.gmail-list-labels{display:none}.gmail-sender{grid-column:3}.gmail-subject{grid-column:3 / 5;white-space:normal}.gmail-date{grid-column:4;grid-row:1}.gmail-expanded-subject{padding-left:18px;display:block}.gmail-message-summary{grid-template-columns:36px minmax(0,1fr);padding:18px}.gmail-message-body{padding-left:18px;padding-right:18px}.gmail-message-header{display:block}.gmail-message-header time{display:block;margin-top:4px}.gmail-body-frame{height:620px}}
+.contact-mutation{padding:0;overflow:hidden}.contact-mutation>.mutation-head,.contact-mutation>.mutation-meta{margin-left:16px;margin-right:16px}.contact-mutation>.mutation-head{margin-top:16px}.contact-operations{border-top:1px solid #dfe1e5;margin-top:16px}.contact-operation{border-top:1px solid #f1f3f4;padding:18px 16px}.contact-operation:first-child{border-top:0}.contact-operation.destructive{box-shadow:inset 3px 0 #c5221f}.contact-operation-main{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:flex-start}.contact-avatar{width:40px;height:40px;border-radius:50%%;background:#137333;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.contact-operation.destructive .contact-avatar{background:#c5221f}.contact-operation-copy{min-width:0}.contact-operation-copy h4{margin:2px 0 4px;font-size:18px}.contact-op{margin:0;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.contact-meta{display:flex;flex-wrap:wrap;gap:8px;color:#5f6368;font-size:13px}.contact-effect,.contact-resource{margin:8px 0 0;color:#3c4043}.contact-effect code,.contact-resource code{background:#f1f3f4;border-radius:4px;padding:2px 5px}.contact-diff{margin-top:12px}.contact-diff th,.contact-diff td{font-size:13px}.contact-field-value{display:block;line-height:1.4}.contact-person-block{margin-top:12px;border-top:1px solid #e8eaed;padding-top:12px}.contact-block-title{margin:0 0 8px;font-weight:700}.contact-person-block dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;margin:0}.contact-person-block dt{color:#5f6368}.contact-person-block dd{margin:0}.contact-operation .raw-json{margin-bottom:0}
+@media (max-width:760px){main{padding:16px}.gmail-row{grid-template-columns:20px 20px minmax(0,1fr) 56px;gap:8px}.gmail-important,.gmail-list-labels{display:none}.gmail-sender{grid-column:3}.gmail-subject{grid-column:3 / 5;white-space:normal}.gmail-date{grid-column:4;grid-row:1}.gmail-expanded-subject{padding-left:18px;display:block}.gmail-message-summary{grid-template-columns:36px minmax(0,1fr);padding:18px}.gmail-message-body{padding-left:18px;padding-right:18px}.gmail-message-header{display:block}.gmail-message-header time{display:block;margin-top:4px}.gmail-body-frame{height:620px}.contact-operation-main{grid-template-columns:40px minmax(0,1fr)}.contact-operation-main>.pill{grid-column:2}.contact-person-block dl{grid-template-columns:1fr}.contact-diff{display:block;overflow-x:auto}}
 </style></head><body>`, html.EscapeString(title))
 }
 

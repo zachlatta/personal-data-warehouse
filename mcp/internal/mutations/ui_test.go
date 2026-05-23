@@ -411,6 +411,139 @@ func TestRenderGmailThreadOpensLatestMessageWhenOnlyThreadUnreadIsKnown(t *testi
 	}
 }
 
+func TestReviewUIRendersContactMutationPreview(t *testing.T) {
+	store := &reviewStore{requests: []Request{{
+		ID:        "req-contact",
+		Status:    "pending_review",
+		Title:     "Clean up contacts",
+		Reason:    "dedupe stale contacts",
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+		Mutations: []Mutation{{
+			ID:        "mut-update",
+			Provider:  "google_people",
+			Operation: ContactsBatchMutationOperation,
+			Account:   "zach@example.test",
+			Status:    "pending_review",
+			Title:     "Update contact: Ada Lovelace",
+			Payload: map[string]any{"operations": []any{map[string]any{
+				"op":                   "update_contact",
+				"resource_name":        "people/ada",
+				"update_person_fields": []any{"names", "emailAddresses"},
+			}}},
+			Preview: map[string]any{"operations": []any{map[string]any{
+				"op":                   "update_contact",
+				"op_index":             0,
+				"resource_name":        "people/ada",
+				"update_person_fields": []any{"names", "emailAddresses"},
+				"summary": map[string]any{
+					"display_name":  "Ada Lovelace",
+					"primary_email": "ada@example.test",
+					"organization":  "Analytical Engines",
+				},
+				"before": map[string]any{
+					"names":          []any{map[string]any{"displayName": "Ada Old"}},
+					"emailAddresses": []any{map[string]any{"value": "ada.old@example.test"}},
+				},
+				"after": map[string]any{
+					"names":          []any{map[string]any{"displayName": "Ada Lovelace"}},
+					"emailAddresses": []any{map[string]any{"value": "ada@example.test"}},
+				},
+			}}},
+		}, {
+			ID:        "mut-create",
+			Provider:  "google_people",
+			Operation: ContactsBatchMutationOperation,
+			Account:   "zach@example.test",
+			Status:    "pending_review",
+			Title:     "Create contact: Grace Hopper",
+			Payload: map[string]any{"operations": []any{map[string]any{
+				"op": "create_contact",
+			}}},
+			Preview: map[string]any{"operations": []any{map[string]any{
+				"op":       "create_contact",
+				"op_index": 1,
+				"person": map[string]any{
+					"names":          []any{map[string]any{"displayName": "Grace Hopper"}},
+					"emailAddresses": []any{map[string]any{"value": "grace@example.test"}},
+					"phoneNumbers":   []any{map[string]any{"value": "+1 555 0100"}},
+					"organizations":  []any{map[string]any{"name": "Navy", "title": "Rear Admiral"}},
+				},
+			}}},
+		}, {
+			ID:        "mut-delete",
+			Provider:  "google_people",
+			Operation: ContactsBatchMutationOperation,
+			Account:   "zach@example.test",
+			Status:    "pending_review",
+			Title:     "Delete contact: Old Duplicate",
+			Payload: map[string]any{"operations": []any{map[string]any{
+				"op":            "delete_contact",
+				"resource_name": "people/old",
+			}}},
+			Preview: map[string]any{"operations": []any{map[string]any{
+				"op":            "delete_contact",
+				"op_index":      2,
+				"resource_name": "people/old",
+				"before": map[string]any{
+					"names":          []any{map[string]any{"displayName": "Old Duplicate"}},
+					"emailAddresses": []any{map[string]any{"value": "old@example.test"}},
+				},
+			}}},
+		}},
+	}}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-contact", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail status = %d body=%q", detailResponse.Code, detailResponse.Body.String())
+	}
+	body := detailResponse.Body.String()
+	for _, want := range []string{
+		"Apply 3 contact changes",
+		`class="mutation contact-mutation"`,
+		"Update contact",
+		"Create contact",
+		"Delete contact",
+		"Ada Lovelace",
+		"ada@example.test",
+		"Grace Hopper",
+		"grace@example.test",
+		"Old Duplicate",
+		"people/old",
+		"Before",
+		"After",
+		"names",
+		"emailAddresses",
+		"Fields not listed here are not part of this update.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("contact detail page missing %q: %q", want, body)
+		}
+	}
+	operationCount := strings.Count(body, `<div class="contact-operation">`) +
+		strings.Count(body, `<div class="contact-operation destructive">`)
+	if operationCount != 3 {
+		t.Fatalf("contact operation count = %d body=%q", operationCount, body)
+	}
+	if strings.Contains(body, `<pre>{`) {
+		t.Fatalf("contact preview should not lead with raw JSON: %q", body)
+	}
+}
+
 func TestSplitGmailQuotedHTML(t *testing.T) {
 	body, quote := splitGmailQuotedHTML(`<div>reply</div><div class="gmail_quote gmail_quote_container"><blockquote class="gmail_quote">parent</blockquote></div>`)
 
