@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import hashlib
 import json
 import re
 from typing import Any
+import uuid
 
 import psycopg2
 from psycopg2.extras import Json, execute_values
@@ -61,6 +63,11 @@ SLACK_CONVERSATION_STATS_COLUMNS = (
     "latest_message_at",
     "updated_at",
 )
+UPSTREAM_MUTATION_CLAIMABLE_STATUSES = ("approved", "failed_retryable")
+GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION = "contacts.batch_mutation"
+GMAIL_ARCHIVE_OPERATION = "gmail.archive_threads"
+GMAIL_UNARCHIVE_OPERATION = "gmail.unarchive_threads"
+GMAIL_SEND_EMAIL_OPERATION = "gmail.send_email"
 REMOVED_PERSONAL_FINANCE_VIEWS = (
     "clean_finance_accounts",
     "clean_finance_transactions",
@@ -83,6 +90,14 @@ class TableSpec:
     columns: tuple[str, ...]
     primary_key: tuple[str, ...]
     version_column: str = "sync_version"
+
+
+@dataclass(frozen=True)
+class IndexSpec:
+    name: str
+    table: str
+    sql: str
+    requires_pg_trgm: bool = False
 
 
 POSTGRES_TABLES: dict[str, TableSpec] = {
@@ -169,6 +184,194 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("source", "account", "scope_id", "item_id"),
     ),
 }
+
+POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
+    IndexSpec(
+        "gmail_messages_thread_idx",
+        "gmail_messages",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_thread_idx ON gmail_messages (account, thread_id, internal_date DESC)",
+    ),
+    IndexSpec(
+        "gmail_messages_internal_date_idx",
+        "gmail_messages",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_internal_date_idx ON gmail_messages (internal_date DESC)",
+    ),
+    IndexSpec(
+        "gmail_messages_label_ids_idx",
+        "gmail_messages",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_label_ids_idx ON gmail_messages USING gin (label_ids)",
+    ),
+    IndexSpec(
+        "gmail_messages_from_trgm_idx",
+        "gmail_messages",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_from_trgm_idx ON gmail_messages USING gin (from_address public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "gmail_messages_subject_trgm_idx",
+        "gmail_messages",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_subject_trgm_idx ON gmail_messages USING gin (subject public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "gmail_messages_snippet_trgm_idx",
+        "gmail_messages",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_snippet_trgm_idx ON gmail_messages USING gin (snippet public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "gmail_attachments_message_idx",
+        "gmail_attachments",
+        "CREATE INDEX IF NOT EXISTS gmail_attachments_message_idx ON gmail_attachments (account, message_id)",
+    ),
+    IndexSpec(
+        "calendar_events_time_idx",
+        "calendar_events",
+        "CREATE INDEX IF NOT EXISTS calendar_events_time_idx ON calendar_events (start_at, end_at)",
+    ),
+    IndexSpec(
+        "contact_cards_display_idx",
+        "contact_cards",
+        "CREATE INDEX IF NOT EXISTS contact_cards_display_idx ON contact_cards (account, source_kind, display_name) WHERE is_deleted = 0",
+    ),
+    IndexSpec(
+        "contact_cards_primary_email_idx",
+        "contact_cards",
+        "CREATE INDEX IF NOT EXISTS contact_cards_primary_email_idx ON contact_cards (lower(primary_email)) WHERE is_deleted = 0 AND primary_email != ''",
+    ),
+    IndexSpec(
+        "contact_cards_primary_phone_idx",
+        "contact_cards",
+        "CREATE INDEX IF NOT EXISTS contact_cards_primary_phone_idx ON contact_cards (lower(primary_phone)) WHERE is_deleted = 0 AND primary_phone != ''",
+    ),
+    IndexSpec(
+        "contact_cards_source_updated_idx",
+        "contact_cards",
+        "CREATE INDEX IF NOT EXISTS contact_cards_source_updated_idx ON contact_cards (source_updated_at DESC)",
+    ),
+    IndexSpec(
+        "contact_cards_raw_json_idx",
+        "contact_cards",
+        "CREATE INDEX IF NOT EXISTS contact_cards_raw_json_idx ON contact_cards USING gin (raw_json)",
+    ),
+    IndexSpec(
+        "voice_memo_files_recorded_idx",
+        "apple_voice_memos_files",
+        "CREATE INDEX IF NOT EXISTS voice_memo_files_recorded_idx ON apple_voice_memos_files (recorded_at DESC)",
+    ),
+    IndexSpec(
+        "apple_notes_modified_idx",
+        "apple_notes",
+        "CREATE INDEX IF NOT EXISTS apple_notes_modified_idx ON apple_notes (modified_at DESC) WHERE is_deleted = 0",
+    ),
+    IndexSpec(
+        "apple_note_revisions_note_idx",
+        "apple_note_revisions",
+        "CREATE INDEX IF NOT EXISTS apple_note_revisions_note_idx ON apple_note_revisions (account, note_id, modified_at DESC)",
+    ),
+    IndexSpec(
+        "apple_note_attachments_hash_idx",
+        "apple_note_attachments",
+        "CREATE INDEX IF NOT EXISTS apple_note_attachments_hash_idx ON apple_note_attachments (content_sha256)",
+    ),
+    IndexSpec(
+        "apple_messages_time_idx",
+        "apple_messages",
+        "CREATE INDEX IF NOT EXISTS apple_messages_time_idx ON apple_messages (message_at DESC) WHERE is_deleted = 0",
+    ),
+    IndexSpec(
+        "apple_messages_body_trgm_idx",
+        "apple_messages",
+        "CREATE INDEX IF NOT EXISTS apple_messages_body_trgm_idx ON apple_messages USING gin (body_text public.gin_trgm_ops) WHERE is_deleted = 0",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "apple_message_chat_messages_chat_time_idx",
+        "apple_message_chat_messages",
+        "CREATE INDEX IF NOT EXISTS apple_message_chat_messages_chat_time_idx ON apple_message_chat_messages (account, chat_id, message_date DESC)",
+    ),
+    IndexSpec(
+        "apple_message_attachments_hash_idx",
+        "apple_message_attachments",
+        "CREATE INDEX IF NOT EXISTS apple_message_attachments_hash_idx ON apple_message_attachments (content_sha256)",
+    ),
+    IndexSpec(
+        "agent_run_events_created_idx",
+        "agent_run_events",
+        "CREATE INDEX IF NOT EXISTS agent_run_events_created_idx ON agent_run_events (created_at DESC)",
+    ),
+    IndexSpec(
+        "slack_messages_conversation_time_idx",
+        "slack_messages",
+        "CREATE INDEX IF NOT EXISTS slack_messages_conversation_time_idx ON slack_messages (account, team_id, conversation_id, message_datetime DESC)",
+    ),
+    IndexSpec(
+        "slack_messages_user_time_idx",
+        "slack_messages",
+        "CREATE INDEX IF NOT EXISTS slack_messages_user_time_idx ON slack_messages (user_id, message_datetime DESC)",
+    ),
+    IndexSpec(
+        "slack_messages_synced_at_idx",
+        "slack_messages",
+        "CREATE INDEX IF NOT EXISTS slack_messages_synced_at_idx ON slack_messages (synced_at)",
+    ),
+    IndexSpec(
+        "slack_messages_recent_scope_time_idx",
+        "slack_messages",
+        "CREATE INDEX IF NOT EXISTS slack_messages_recent_scope_time_idx ON slack_messages (account, team_id, message_datetime DESC) WHERE is_deleted = 0",
+    ),
+    IndexSpec(
+        "slack_messages_recent_thread_time_idx",
+        "slack_messages",
+        "CREATE INDEX IF NOT EXISTS slack_messages_recent_thread_time_idx ON slack_messages (account, team_id, thread_ts, message_datetime DESC) WHERE is_deleted = 0",
+    ),
+    IndexSpec(
+        "slack_messages_thread_idx",
+        "slack_messages",
+        "CREATE INDEX IF NOT EXISTS slack_messages_thread_idx ON slack_messages (account, team_id, conversation_id, thread_ts)",
+    ),
+    IndexSpec(
+        "slack_messages_text_trgm_live_idx",
+        "slack_messages",
+        "CREATE INDEX IF NOT EXISTS slack_messages_text_trgm_live_idx ON slack_messages USING gin (text public.gin_trgm_ops) WHERE is_deleted = 0",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "slack_conversations_scope_idx",
+        "slack_conversations",
+        "CREATE INDEX IF NOT EXISTS slack_conversations_scope_idx ON slack_conversations (account, team_id, conversation_type)",
+    ),
+    IndexSpec(
+        "slack_conversations_synced_at_idx",
+        "slack_conversations",
+        "CREATE INDEX IF NOT EXISTS slack_conversations_synced_at_idx ON slack_conversations (synced_at)",
+    ),
+    IndexSpec(
+        "slack_users_email_lower_idx",
+        "slack_users",
+        "CREATE INDEX IF NOT EXISTS slack_users_email_lower_idx ON slack_users (lower(email)) WHERE email != ''",
+    ),
+    IndexSpec(
+        "slack_users_synced_at_idx",
+        "slack_users",
+        "CREATE INDEX IF NOT EXISTS slack_users_synced_at_idx ON slack_users (synced_at)",
+    ),
+    IndexSpec(
+        "slack_conversation_members_synced_at_idx",
+        "slack_conversation_members",
+        "CREATE INDEX IF NOT EXISTS slack_conversation_members_synced_at_idx ON slack_conversation_members (synced_at)",
+    ),
+    IndexSpec(
+        "slack_state_scope_idx",
+        "slack_sync_state",
+        "CREATE INDEX IF NOT EXISTS slack_state_scope_idx ON slack_sync_state (account, team_id, object_type, object_id)",
+    ),
+    IndexSpec(
+        "slack_account_state_live_scope_idx",
+        "slack_account_state_item_rows",
+        "CREATE INDEX IF NOT EXISTS slack_account_state_live_scope_idx ON slack_account_state_item_rows (account, scope_id, priority_rank, latest_activity_at DESC) WHERE is_deleted = 0",
+    ),
+)
 
 POSTGRES_INSERT_PAGE_SIZES = {
     "apple_notes": 50,
@@ -336,6 +539,8 @@ class PostgresWarehouse:
         self._schema = _validate_identifier(schema)
         self._connection = psycopg2.connect(normalized)
         self._connection.autocommit = True
+        self._ensured_index_names: set[str] = set()
+        self._pg_trgm_ensured = False
         self._command(f"CREATE SCHEMA IF NOT EXISTS {_identifier(self._schema)}")
         self._command(f"SET search_path TO {_identifier(self._schema)}")
 
@@ -429,10 +634,1776 @@ class PostgresWarehouse:
         for table in REMOVED_PERSONAL_FINANCE_TABLES:
             self._command(f"DROP TABLE IF EXISTS {_identifier(table)} CASCADE")
 
+    def ensure_upstream_mutation_tables(self) -> None:
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS upstream_mutation_requests (
+                id text PRIMARY KEY,
+                status text NOT NULL DEFAULT 'pending_review',
+                title text NOT NULL DEFAULT '',
+                reason text NOT NULL DEFAULT '',
+                context_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                result_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                error text NOT NULL DEFAULT '',
+                idempotency_key text NOT NULL DEFAULT '',
+                revision bigint NOT NULL DEFAULT 1,
+                requested_by text NOT NULL DEFAULT '',
+                approved_by text NOT NULL DEFAULT '',
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                approved_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                executed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                observed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz
+            )
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS upstream_mutations (
+                id text PRIMARY KEY,
+                request_id text NOT NULL DEFAULT '',
+                request_index bigint NOT NULL DEFAULT 0,
+                provider text NOT NULL DEFAULT '',
+                operation text NOT NULL DEFAULT '',
+                account text NOT NULL DEFAULT '',
+                status text NOT NULL DEFAULT 'pending_review',
+                title text NOT NULL DEFAULT '',
+                reason text NOT NULL DEFAULT '',
+                payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                preview_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                result_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                error text NOT NULL DEFAULT '',
+                idempotency_key text NOT NULL DEFAULT '',
+                revision bigint NOT NULL DEFAULT 1,
+                attempt_count bigint NOT NULL DEFAULT 0,
+                requested_by text NOT NULL DEFAULT '',
+                approved_by text NOT NULL DEFAULT '',
+                claimed_by text NOT NULL DEFAULT '',
+                claimed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                approved_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                executed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                observed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz
+            )
+            """
+        )
+        self._command("ALTER TABLE upstream_mutations ADD COLUMN IF NOT EXISTS request_id text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE upstream_mutations ADD COLUMN IF NOT EXISTS request_index bigint NOT NULL DEFAULT 0")
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS upstream_mutation_events (
+                mutation_id text NOT NULL,
+                event_index bigint NOT NULL,
+                event_type text NOT NULL DEFAULT '',
+                actor_type text NOT NULL DEFAULT '',
+                actor_id text NOT NULL DEFAULT '',
+                event_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (mutation_id, event_index)
+            )
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS upstream_mutation_request_events (
+                request_id text NOT NULL,
+                event_index bigint NOT NULL,
+                event_type text NOT NULL DEFAULT '',
+                actor_type text NOT NULL DEFAULT '',
+                actor_id text NOT NULL DEFAULT '',
+                event_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (request_id, event_index)
+            )
+            """
+        )
+        for sql in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutation_requests_idempotency_idx ON upstream_mutation_requests (idempotency_key) WHERE idempotency_key != ''",
+            "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_status_updated_idx ON upstream_mutation_requests (status, updated_at)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutations_idempotency_idx ON upstream_mutations (idempotency_key) WHERE idempotency_key != ''",
+            "CREATE INDEX IF NOT EXISTS upstream_mutations_request_idx ON upstream_mutations (request_id, request_index, created_at, id)",
+            "CREATE INDEX IF NOT EXISTS upstream_mutations_status_updated_idx ON upstream_mutations (status, updated_at)",
+            "CREATE INDEX IF NOT EXISTS upstream_mutation_request_events_request_idx ON upstream_mutation_request_events (request_id, event_index)",
+            "CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON upstream_mutation_events (mutation_id, event_index)",
+        ):
+            self._command(sql)
+
+    def gmail_archive_thread_previews(self, *, account: str, thread_ids: Sequence[str]) -> list[dict[str, Any]]:
+        normalized_thread_ids = _normalize_thread_ids(thread_ids)
+        if not normalized_thread_ids:
+            return []
+        rows = self._query(
+            """
+            SELECT
+                thread_id,
+                (array_agg(subject ORDER BY internal_date DESC, message_id ASC))[1] AS subject,
+                (array_agg(from_address ORDER BY internal_date DESC, message_id ASC))[1] AS latest_from_address,
+                max(internal_date) AS latest_at,
+                count(*)::bigint AS inbox_message_count
+            FROM gmail_messages
+            WHERE account = %s
+              AND thread_id = ANY(%s)
+              AND is_deleted = 0
+              AND 'INBOX' = ANY(label_ids)
+              AND NOT ('TRASH' = ANY(label_ids))
+              AND NOT ('SPAM' = ANY(label_ids))
+            GROUP BY thread_id
+            """,
+            (account, list(normalized_thread_ids)),
+        )
+        rows_by_thread_id = {
+            str(row[0]): {
+                "thread_id": str(row[0]),
+                "subject": str(row[1]),
+                "latest_from_address": str(row[2]),
+                "latest_at": row[3],
+                "inbox_message_count": int(row[4]),
+            }
+            for row in rows
+        }
+        return [rows_by_thread_id[thread_id] for thread_id in normalized_thread_ids if thread_id in rows_by_thread_id]
+
+    def gmail_unarchive_thread_previews(self, *, account: str, thread_ids: Sequence[str]) -> list[dict[str, Any]]:
+        normalized_thread_ids = _normalize_thread_ids(thread_ids)
+        if not normalized_thread_ids:
+            return []
+        rows = self._query(
+            """
+            SELECT
+                thread_id,
+                (array_agg(subject ORDER BY internal_date DESC, message_id ASC))[1] AS subject,
+                (array_agg(from_address ORDER BY internal_date DESC, message_id ASC))[1] AS latest_from_address,
+                max(internal_date) AS latest_at,
+                count(*)::bigint AS message_count
+            FROM gmail_messages
+            WHERE account = %s
+              AND thread_id = ANY(%s)
+              AND is_deleted = 0
+              AND NOT ('INBOX' = ANY(label_ids))
+              AND NOT ('TRASH' = ANY(label_ids))
+              AND NOT ('SPAM' = ANY(label_ids))
+            GROUP BY thread_id
+            """,
+            (account, list(normalized_thread_ids)),
+        )
+        rows_by_thread_id = {
+            str(row[0]): {
+                "thread_id": str(row[0]),
+                "subject": str(row[1]),
+                "latest_from_address": str(row[2]),
+                "latest_at": row[3],
+                "message_count": int(row[4]),
+            }
+            for row in rows
+        }
+        return [rows_by_thread_id[thread_id] for thread_id in normalized_thread_ids if thread_id in rows_by_thread_id]
+
+    def propose_gmail_archive_threads(
+        self,
+        *,
+        account: str,
+        thread_ids: Sequence[str],
+        reason: str,
+        title: str | None = None,
+        context: dict[str, Any] | None = None,
+        requested_by: str = "mcp",
+    ) -> dict[str, Any]:
+        normalized_thread_ids = _normalize_thread_ids(thread_ids)
+        if not normalized_thread_ids:
+            raise ValueError("thread_ids must include at least one Gmail thread ID")
+        return self.propose_upstream_mutation_request(
+            title=title or f"Archive {len(normalized_thread_ids)} Gmail thread{'s' if len(normalized_thread_ids) != 1 else ''}",
+            reason=reason,
+            mutations=[
+                {
+                    "type": "gmail.archive_threads",
+                    "account": account,
+                    "thread_ids": normalized_thread_ids,
+                }
+            ],
+            context=context,
+            requested_by=requested_by,
+        )
+
+    def propose_gmail_unarchive_threads(
+        self,
+        *,
+        account: str,
+        thread_ids: Sequence[str],
+        reason: str,
+        title: str | None = None,
+        context: dict[str, Any] | None = None,
+        requested_by: str = "mcp",
+    ) -> dict[str, Any]:
+        normalized_thread_ids = _normalize_thread_ids(thread_ids)
+        if not normalized_thread_ids:
+            raise ValueError("thread_ids must include at least one Gmail thread ID")
+        return self.propose_upstream_mutation_request(
+            title=title or f"Unarchive {len(normalized_thread_ids)} Gmail thread{'s' if len(normalized_thread_ids) != 1 else ''}",
+            reason=reason,
+            mutations=[
+                {
+                    "type": "gmail.unarchive_threads",
+                    "account": account,
+                    "thread_ids": normalized_thread_ids,
+                }
+            ],
+            context=context,
+            requested_by=requested_by,
+        )
+
+    def propose_gmail_send_email(
+        self,
+        *,
+        account: str,
+        message: Mapping[str, Any],
+        reason: str,
+        delivery_mode: str = "send",
+        title: str | None = None,
+        context: dict[str, Any] | None = None,
+        requested_by: str = "mcp",
+    ) -> dict[str, Any]:
+        subject = str(message.get("subject") or "").strip()
+        return self.propose_upstream_mutation_request(
+            title=title or f"Send email{f': {subject}' if subject else ''}",
+            reason=reason,
+            mutations=[
+                {
+                    "type": GMAIL_SEND_EMAIL_OPERATION,
+                    "account": account,
+                    "delivery_mode": delivery_mode,
+                    "message": dict(message),
+                }
+            ],
+            context=context,
+            requested_by=requested_by,
+        )
+
+    def propose_contact_mutations(
+        self,
+        *,
+        account: str,
+        operations: Sequence[Mapping[str, Any]],
+        reason: str,
+        title: str | None = None,
+        context: dict[str, Any] | None = None,
+        requested_by: str = "mcp",
+    ) -> dict[str, Any]:
+        if not operations:
+            raise ValueError("operations must include at least one contact mutation")
+        return self.propose_upstream_mutation_request(
+            title=title or f"Apply {len(operations)} contact mutation{'s' if len(operations) != 1 else ''}",
+            reason=reason,
+            mutations=[
+                {
+                    "type": "google_people.contacts",
+                    "account": account,
+                    "operations": list(operations),
+                }
+            ],
+            context=context,
+            requested_by=requested_by,
+        )
+
+    def propose_upstream_mutation_request(
+        self,
+        *,
+        title: str,
+        reason: str,
+        mutations: Sequence[Mapping[str, Any]],
+        context: dict[str, Any] | None = None,
+        requested_by: str = "mcp",
+    ) -> dict[str, Any]:
+        self.ensure_tables()
+        self.ensure_contacts_tables()
+        self.ensure_upstream_mutation_tables()
+        if not title.strip():
+            raise ValueError("title must not be blank")
+        if not reason.strip():
+            raise ValueError("reason must not be blank")
+        normalized_mutations = self._normalize_upstream_mutation_request_mutations(
+            request_reason=reason,
+            request_context=context or {},
+            mutations=mutations,
+        )
+        if not normalized_mutations:
+            raise ValueError("mutations must include at least one mutation")
+
+        idempotency_key = _upstream_mutation_request_idempotency_key(
+            title=title,
+            reason=reason,
+            mutations=normalized_mutations,
+        )
+        existing = self.get_upstream_mutation_request_by_idempotency_key(idempotency_key)
+        if existing is not None:
+            return existing
+
+        now = datetime.now(tz=UTC)
+        request_id = f"req_{uuid.uuid4().hex}"
+        self._command(
+            """
+            INSERT INTO upstream_mutation_requests (
+                id, status, title, reason, context_json, result_json, idempotency_key,
+                requested_by, created_at, updated_at
+            )
+            VALUES (%s, 'pending_review', %s, %s, %s, '{}'::jsonb, %s, %s, %s, %s)
+            """,
+            (
+                request_id,
+                title,
+                reason,
+                _jsonb_param(context or {}),
+                idempotency_key,
+                requested_by,
+                now,
+                now,
+            ),
+        )
+        self._append_upstream_mutation_request_event(
+            request_id,
+            event_type="created",
+            actor_type="agent",
+            actor_id=requested_by,
+            event_json={"title": title, "reason": reason, "context": context or {}, "mutation_count": len(normalized_mutations)},
+        )
+        for index, mutation in enumerate(normalized_mutations):
+            mutation_id = f"mut_{uuid.uuid4().hex}"
+            self._command(
+                """
+                INSERT INTO upstream_mutations (
+                    id, request_id, request_index, provider, operation, account, status, title, reason,
+                    payload_json, preview_json, result_json, idempotency_key,
+                    requested_by, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, 'pending_review', %s, %s, %s, %s, '{}'::jsonb, '', %s, %s, %s)
+                """,
+                (
+                    mutation_id,
+                    request_id,
+                    index,
+                    mutation["provider"],
+                    mutation["operation"],
+                    mutation["account"],
+                    mutation["title"],
+                    mutation["reason"],
+                    _jsonb_param(mutation["payload_json"]),
+                    _jsonb_param(mutation["preview_json"]),
+                    requested_by,
+                    now,
+                    now,
+                ),
+            )
+            self._append_upstream_mutation_event(
+                mutation_id,
+                event_type="created",
+                actor_type="agent",
+                actor_id=requested_by,
+                event_json={
+                    "request_id": request_id,
+                    "request_index": index,
+                    "title": mutation["title"],
+                    "reason": mutation["reason"],
+                    "payload": mutation["payload_json"],
+                    "preview": mutation["preview_json"],
+                },
+            )
+        created = self.get_upstream_mutation_request(request_id)
+        if created is None:
+            raise RuntimeError(f"created mutation request {request_id} could not be loaded")
+        return created
+
+    def get_upstream_mutation(self, mutation_id: str) -> dict[str, Any] | None:
+        rows = self._query_dicts("SELECT * FROM upstream_mutations WHERE id = %s", (mutation_id,))
+        return rows[0] if rows else None
+
+    def get_upstream_mutation_request(self, request_id: str) -> dict[str, Any] | None:
+        self.ensure_upstream_mutation_tables()
+        rows = self._query_dicts("SELECT * FROM upstream_mutation_requests WHERE id = %s", (request_id,))
+        if not rows:
+            return None
+        request = rows[0]
+        request["mutations"] = self.list_upstream_mutations_for_request(request_id)
+        return request
+
+    def get_upstream_mutation_request_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        rows = self._query_dicts(
+            "SELECT id FROM upstream_mutation_requests WHERE idempotency_key = %s",
+            (idempotency_key,),
+        )
+        return self.get_upstream_mutation_request(str(rows[0]["id"])) if rows else None
+
+    def list_upstream_mutation_requests(
+        self,
+        *,
+        statuses: Sequence[str] | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        self.ensure_upstream_mutation_tables()
+        if statuses:
+            return self._query_dicts(
+                """
+                SELECT request.*,
+                       count(mutation.id)::bigint AS mutation_count
+                FROM upstream_mutation_requests AS request
+                LEFT JOIN upstream_mutations AS mutation ON mutation.request_id = request.id
+                WHERE request.status = ANY(%s)
+                GROUP BY request.id
+                ORDER BY request.created_at DESC, request.id DESC
+                LIMIT %s
+                """,
+                (list(statuses), int(limit)),
+            )
+        return self._query_dicts(
+            """
+            SELECT request.*,
+                   count(mutation.id)::bigint AS mutation_count
+            FROM upstream_mutation_requests AS request
+            LEFT JOIN upstream_mutations AS mutation ON mutation.request_id = request.id
+            GROUP BY request.id
+            ORDER BY request.created_at DESC, request.id DESC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+
+    def list_upstream_mutations_for_request(self, request_id: str) -> list[dict[str, Any]]:
+        self.ensure_upstream_mutation_tables()
+        return self._query_dicts(
+            """
+            SELECT *
+            FROM upstream_mutations
+            WHERE request_id = %s
+            ORDER BY request_index ASC, created_at ASC, id ASC
+            """,
+            (request_id,),
+        )
+
+    def list_upstream_mutation_request_events(self, request_id: str) -> list[dict[str, Any]]:
+        return self._query_dicts(
+            """
+            SELECT *
+            FROM upstream_mutation_request_events
+            WHERE request_id = %s
+            ORDER BY event_index ASC
+            """,
+            (request_id,),
+        )
+
+    def list_upstream_mutations(
+        self,
+        *,
+        statuses: Sequence[str] | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        self.ensure_upstream_mutation_tables()
+        if statuses:
+            return self._query_dicts(
+                """
+                SELECT *
+                FROM upstream_mutations
+                WHERE status = ANY(%s)
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (list(statuses), int(limit)),
+            )
+        return self._query_dicts(
+            """
+            SELECT *
+            FROM upstream_mutations
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+
+    def list_upstream_mutation_events(self, mutation_id: str) -> list[dict[str, Any]]:
+        return self._query_dicts(
+            """
+            SELECT *
+            FROM upstream_mutation_events
+            WHERE mutation_id = %s
+            ORDER BY event_index ASC
+            """,
+            (mutation_id,),
+        )
+
+    def remove_upstream_mutation_from_request(
+        self,
+        *,
+        request_id: str,
+        mutation_id: str,
+        actor_id: str = "reviewer",
+    ) -> dict[str, Any]:
+        request = self.get_upstream_mutation_request(request_id)
+        if request is None:
+            raise ValueError(f"unknown mutation request: {request_id}")
+        if request["status"] != "pending_review":
+            raise ValueError(f"cannot edit request with status {request['status']}")
+        mutation = self.get_upstream_mutation(mutation_id)
+        if mutation is None or mutation["request_id"] != request_id:
+            raise ValueError(f"unknown mutation for request {request_id}: {mutation_id}")
+        if mutation["status"] != "pending_review":
+            raise ValueError(f"cannot remove mutation with status {mutation['status']}")
+        remaining = [
+            child
+            for child in self.list_upstream_mutations_for_request(request_id)
+            if child["id"] != mutation_id and child["status"] == "pending_review"
+        ]
+        if not remaining:
+            raise ValueError("cannot remove every pending mutation from a request")
+
+        now = datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE upstream_mutations
+               SET status = 'rejected',
+                   error = 'removed during review',
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (now, mutation_id),
+        )
+        self._command(
+            """
+            UPDATE upstream_mutation_requests
+               SET revision = revision + 1,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (now, request_id),
+        )
+        self._append_upstream_mutation_event(
+            mutation_id,
+            event_type="removed",
+            actor_type="human",
+            actor_id=actor_id,
+            event_json={"request_id": request_id},
+        )
+        self._append_upstream_mutation_request_event(
+            request_id,
+            event_type="mutation_removed",
+            actor_type="human",
+            actor_id=actor_id,
+            event_json={"mutation_id": mutation_id},
+        )
+        updated = self.get_upstream_mutation_request(request_id)
+        if updated is None:
+            raise RuntimeError(f"edited mutation request {request_id} could not be loaded")
+        return updated
+
+    def approve_upstream_mutation_request(self, request_id: str, *, actor_id: str = "reviewer") -> dict[str, Any]:
+        request = self.get_upstream_mutation_request(request_id)
+        if request is None:
+            raise ValueError(f"unknown mutation request: {request_id}")
+        if request["status"] != "pending_review":
+            raise ValueError(f"cannot approve request with status {request['status']}")
+        pending = [mutation for mutation in request["mutations"] if mutation["status"] == "pending_review"]
+        if not pending:
+            raise ValueError("cannot approve a request without pending mutations")
+        for mutation in pending:
+            self._validate_upstream_mutation_approvable(mutation)
+
+        now = datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE upstream_mutation_requests
+               SET status = 'approved',
+                   approved_by = %s,
+                   approved_at = %s,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (actor_id, now, now, request_id),
+        )
+        self._command(
+            """
+            UPDATE upstream_mutations
+               SET status = 'approved',
+                   approved_by = %s,
+                   approved_at = %s,
+                   updated_at = %s
+             WHERE request_id = %s
+               AND status = 'pending_review'
+            """,
+            (actor_id, now, now, request_id),
+        )
+        for mutation in pending:
+            self._append_upstream_mutation_event(
+                str(mutation["id"]),
+                event_type="approved",
+                actor_type="human",
+                actor_id=actor_id,
+                event_json={"request_id": request_id},
+            )
+        self._append_upstream_mutation_request_event(
+            request_id,
+            event_type="approved",
+            actor_type="human",
+            actor_id=actor_id,
+            event_json={"approved_mutation_ids": [str(mutation["id"]) for mutation in pending]},
+        )
+        updated = self.get_upstream_mutation_request(request_id)
+        if updated is None:
+            raise RuntimeError(f"approved mutation request {request_id} could not be loaded")
+        return updated
+
+    def reject_upstream_mutation_request(
+        self,
+        request_id: str,
+        *,
+        actor_id: str = "reviewer",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        request = self.get_upstream_mutation_request(request_id)
+        if request is None:
+            raise ValueError(f"unknown mutation request: {request_id}")
+        if request["status"] != "pending_review":
+            raise ValueError(f"cannot reject request with status {request['status']}")
+        now = datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE upstream_mutation_requests
+               SET status = 'rejected',
+                   error = %s,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (reason, now, request_id),
+        )
+        self._command(
+            """
+            UPDATE upstream_mutations
+               SET status = 'rejected',
+                   error = %s,
+                   updated_at = %s
+             WHERE request_id = %s
+               AND status = 'pending_review'
+            """,
+            (reason, now, request_id),
+        )
+        pending = [mutation for mutation in request["mutations"] if mutation["status"] == "pending_review"]
+        for mutation in pending:
+            self._append_upstream_mutation_event(
+                str(mutation["id"]),
+                event_type="rejected",
+                actor_type="human",
+                actor_id=actor_id,
+                event_json={"request_id": request_id, "reason": reason},
+            )
+        self._append_upstream_mutation_request_event(
+            request_id,
+            event_type="rejected",
+            actor_type="human",
+            actor_id=actor_id,
+            event_json={"reason": reason},
+        )
+        updated = self.get_upstream_mutation_request(request_id)
+        if updated is None:
+            raise RuntimeError(f"rejected mutation request {request_id} could not be loaded")
+        return updated
+
+    def _validate_upstream_mutation_approvable(self, mutation: Mapping[str, Any]) -> None:
+        payload = _as_json_dict(mutation["payload_json"])
+        if (
+            mutation["provider"] == "gmail"
+            and mutation["operation"] in {GMAIL_ARCHIVE_OPERATION, GMAIL_UNARCHIVE_OPERATION}
+            and not _normalize_thread_ids(payload.get("thread_ids") or [])
+        ):
+            raise ValueError("cannot approve a Gmail thread mutation without thread IDs")
+        if mutation["provider"] == "gmail" and mutation["operation"] == GMAIL_SEND_EMAIL_OPERATION:
+            message = _json_mapping(payload.get("message"))
+            _gmail_email_delivery_mode(payload.get("delivery_mode"))
+            if not any(_normalize_email_recipients(message.get(field)) for field in ("to", "cc", "bcc")):
+                raise ValueError("cannot approve a Gmail email mutation without recipients")
+            if not str(message.get("subject") or "").strip():
+                raise ValueError("cannot approve a Gmail email mutation without a subject")
+            if not str(message.get("body_text") or "").strip() and not str(message.get("body_html") or "").strip():
+                raise ValueError("cannot approve a Gmail email mutation without a body")
+        if (
+            mutation["provider"] == "google_people"
+            and mutation["operation"] == GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION
+            and not _json_list(payload.get("operations"))
+        ):
+            raise ValueError("cannot approve a contact mutation without operations")
+
+    def remove_threads_from_gmail_archive_mutation(
+        self,
+        *,
+        mutation_id: str,
+        thread_ids: Sequence[str],
+        actor_id: str = "reviewer",
+    ) -> dict[str, Any]:
+        mutation = self.get_upstream_mutation(mutation_id)
+        if mutation is None:
+            raise ValueError(f"unknown mutation: {mutation_id}")
+        if mutation["status"] != "pending_review":
+            raise ValueError(f"cannot edit mutation with status {mutation['status']}")
+        payload = _as_json_dict(mutation["payload_json"])
+        current_thread_ids = _normalize_thread_ids(payload.get("thread_ids") or [])
+        remove_thread_ids = set(_normalize_thread_ids(thread_ids))
+        remaining_thread_ids = [thread_id for thread_id in current_thread_ids if thread_id not in remove_thread_ids]
+        if len(remaining_thread_ids) == len(current_thread_ids):
+            raise ValueError("no matching thread IDs were removed")
+        if not remaining_thread_ids:
+            raise ValueError("cannot remove every thread from a pending archive mutation")
+        payload["thread_ids"] = remaining_thread_ids
+        preview = _as_json_dict(mutation["preview_json"])
+        preview["thread_count"] = len(remaining_thread_ids)
+        if isinstance(preview.get("threads"), list):
+            preview["threads"] = [
+                item
+                for item in preview["threads"]
+                if isinstance(item, dict) and str(item.get("thread_id") or "") in set(remaining_thread_ids)
+            ]
+        now = datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE upstream_mutations
+               SET payload_json = %s,
+                   preview_json = %s,
+                   revision = revision + 1,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (_jsonb_param(payload), _jsonb_param(preview), now, mutation_id),
+        )
+        self._append_upstream_mutation_event(
+            mutation_id,
+            event_type="edited",
+            actor_type="human",
+            actor_id=actor_id,
+            event_json={"removed_thread_ids": sorted(remove_thread_ids), "remaining_thread_ids": remaining_thread_ids},
+        )
+        updated = self.get_upstream_mutation(mutation_id)
+        if updated is None:
+            raise RuntimeError(f"edited mutation {mutation_id} could not be loaded")
+        return updated
+
+    def remove_operations_from_contact_mutation(
+        self,
+        *,
+        mutation_id: str,
+        operation_indexes: Sequence[int],
+        actor_id: str = "reviewer",
+    ) -> dict[str, Any]:
+        mutation = self.get_upstream_mutation(mutation_id)
+        if mutation is None:
+            raise ValueError(f"unknown mutation: {mutation_id}")
+        if mutation["status"] != "pending_review":
+            raise ValueError(f"cannot edit mutation with status {mutation['status']}")
+        if mutation["provider"] != "google_people" or mutation["operation"] != GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION:
+            raise ValueError("mutation is not a Google contacts batch mutation")
+        payload = _as_json_dict(mutation["payload_json"])
+        operations = _json_list(payload.get("operations"))
+        remove_indexes = sorted({int(index) for index in operation_indexes if int(index) >= 0})
+        if not remove_indexes:
+            raise ValueError("operation_indexes must include at least one operation index")
+        existing_indexes = set(range(len(operations)))
+        missing_indexes = [index for index in remove_indexes if index not in existing_indexes]
+        if missing_indexes:
+            raise ValueError(f"unknown operation indexes: {', '.join(str(index) for index in missing_indexes)}")
+        remaining_operations = [operation for index, operation in enumerate(operations) if index not in set(remove_indexes)]
+        if not remaining_operations:
+            raise ValueError("cannot remove every operation from a pending contact mutation")
+
+        preview = _as_json_dict(mutation["preview_json"])
+        preview_operations = _json_list(preview.get("operations"))
+        removed_operations = [
+            operation for operation in preview_operations if int(operation.get("op_index", -1)) in set(remove_indexes)
+        ]
+        remaining_preview_operations = [
+            {**operation, "op_index": new_index}
+            for new_index, operation in enumerate(
+                operation for operation in preview_operations if int(operation.get("op_index", -1)) not in set(remove_indexes)
+            )
+        ]
+        preview["operation_count"] = len(remaining_operations)
+        preview["operations"] = remaining_preview_operations
+        payload["operations"] = remaining_operations
+        now = datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE upstream_mutations
+               SET payload_json = %s,
+                   preview_json = %s,
+                   revision = revision + 1,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (_jsonb_param(payload), _jsonb_param(preview), now, mutation_id),
+        )
+        self._append_upstream_mutation_event(
+            mutation_id,
+            event_type="edited",
+            actor_type="human",
+            actor_id=actor_id,
+            event_json={
+                "removed_operation_indexes": remove_indexes,
+                "removed_operations": removed_operations,
+                "remaining_operation_count": len(remaining_operations),
+            },
+        )
+        updated = self.get_upstream_mutation(mutation_id)
+        if updated is None:
+            raise RuntimeError(f"edited mutation {mutation_id} could not be loaded")
+        return updated
+
+    def update_gmail_email_mutation(
+        self,
+        *,
+        mutation_id: str,
+        message: Mapping[str, Any],
+        delivery_mode: str,
+        actor_id: str = "reviewer",
+    ) -> dict[str, Any]:
+        mutation = self.get_upstream_mutation(mutation_id)
+        if mutation is None:
+            raise ValueError(f"unknown mutation: {mutation_id}")
+        if mutation["status"] != "pending_review":
+            raise ValueError(f"cannot edit mutation with status {mutation['status']}")
+        if mutation["provider"] != "gmail" or mutation["operation"] != GMAIL_SEND_EMAIL_OPERATION:
+            raise ValueError("mutation is not a Gmail email mutation")
+        payload = _as_json_dict(mutation["payload_json"])
+        existing_message = _json_mapping(payload.get("message"))
+        merged_message = {**existing_message, **dict(message)}
+        preview = _as_json_dict(mutation["preview_json"])
+        normalized_payload, normalized_preview = self._normalize_gmail_email_payload(
+            account=str(mutation["account"]),
+            delivery_mode=delivery_mode,
+            message=merged_message,
+            request_context=_json_mapping(preview.get("context")),
+        )
+        now = datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE upstream_mutations
+               SET payload_json = %s,
+                   preview_json = %s,
+                   revision = revision + 1,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (_jsonb_param(normalized_payload), _jsonb_param(normalized_preview), now, mutation_id),
+        )
+        self._append_upstream_mutation_event(
+            mutation_id,
+            event_type="edited",
+            actor_type="human",
+            actor_id=actor_id,
+            event_json={
+                "delivery_mode": normalized_payload["delivery_mode"],
+                "message": normalized_payload["message"],
+            },
+        )
+        updated = self.get_upstream_mutation(mutation_id)
+        if updated is None:
+            raise RuntimeError(f"edited mutation {mutation_id} could not be loaded")
+        return updated
+
+    def approve_upstream_mutation(self, mutation_id: str, *, actor_id: str = "reviewer") -> dict[str, Any]:
+        mutation = self.get_upstream_mutation(mutation_id)
+        if mutation is None:
+            raise ValueError(f"unknown mutation: {mutation_id}")
+        if mutation["status"] != "pending_review":
+            raise ValueError(f"cannot approve mutation with status {mutation['status']}")
+        self._validate_upstream_mutation_approvable(mutation)
+        now = datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE upstream_mutations
+               SET status = 'approved',
+                   approved_by = %s,
+                   approved_at = %s,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (actor_id, now, now, mutation_id),
+        )
+        self._append_upstream_mutation_event(
+            mutation_id,
+            event_type="approved",
+            actor_type="human",
+            actor_id=actor_id,
+            event_json={},
+        )
+        if mutation.get("request_id"):
+            self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
+        updated = self.get_upstream_mutation(mutation_id)
+        if updated is None:
+            raise RuntimeError(f"approved mutation {mutation_id} could not be loaded")
+        return updated
+
+    def reject_upstream_mutation(
+        self,
+        mutation_id: str,
+        *,
+        actor_id: str = "reviewer",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        mutation = self.get_upstream_mutation(mutation_id)
+        if mutation is None:
+            raise ValueError(f"unknown mutation: {mutation_id}")
+        if mutation["status"] != "pending_review":
+            raise ValueError(f"cannot reject mutation with status {mutation['status']}")
+        now = datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE upstream_mutations
+               SET status = 'rejected',
+                   error = %s,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (reason, now, mutation_id),
+        )
+        self._append_upstream_mutation_event(
+            mutation_id,
+            event_type="rejected",
+            actor_type="human",
+            actor_id=actor_id,
+            event_json={"reason": reason},
+        )
+        if mutation.get("request_id"):
+            self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
+        updated = self.get_upstream_mutation(mutation_id)
+        if updated is None:
+            raise RuntimeError(f"rejected mutation {mutation_id} could not be loaded")
+        return updated
+
+    def claim_approved_upstream_mutations(self, *, limit: int, claimed_by: str) -> list[dict[str, Any]]:
+        self.ensure_upstream_mutation_tables()
+        if limit <= 0:
+            return []
+        now = datetime.now(tz=UTC)
+        rows = self._query_dicts(
+            """
+            WITH candidates AS (
+                SELECT id
+                FROM upstream_mutations
+                WHERE status = ANY(%s)
+                ORDER BY approved_at ASC, created_at ASC, id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            UPDATE upstream_mutations AS mutation
+               SET status = 'executing',
+                   claimed_by = %s,
+                   claimed_at = %s,
+                   updated_at = %s,
+                   attempt_count = attempt_count + 1
+              FROM candidates
+             WHERE mutation.id = candidates.id
+            RETURNING mutation.*
+            """,
+            (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), int(limit), claimed_by, now, now),
+        )
+        for row in rows:
+            self._append_upstream_mutation_event(
+                str(row["id"]),
+                event_type="claimed",
+                actor_type="dagster",
+                actor_id=claimed_by,
+                event_json={"attempt_count": int(row["attempt_count"])},
+            )
+        for request_id in sorted({str(row.get("request_id") or "") for row in rows if row.get("request_id")}):
+            self._refresh_upstream_mutation_request_status(request_id)
+        return rows
+
+    def complete_upstream_mutation(self, mutation_id: str, *, result_json: dict[str, Any], actor_id: str) -> None:
+        now = datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE upstream_mutations
+               SET status = 'succeeded',
+                   result_json = %s,
+                   error = '',
+                   executed_at = %s,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (_jsonb_param(result_json), now, now, mutation_id),
+        )
+        self._append_upstream_mutation_event(
+            mutation_id,
+            event_type="executed",
+            actor_type="dagster",
+            actor_id=actor_id,
+            event_json=result_json,
+        )
+        mutation = self.get_upstream_mutation(mutation_id)
+        if mutation and mutation.get("request_id"):
+            self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
+
+    def fail_upstream_mutation(
+        self,
+        mutation_id: str,
+        *,
+        status: str,
+        error: str,
+        result_json: dict[str, Any] | None = None,
+        actor_id: str,
+    ) -> None:
+        if status not in {"failed_retryable", "failed_terminal", "blocked_missing_credentials"}:
+            raise ValueError(f"unsupported failure status: {status}")
+        now = datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE upstream_mutations
+               SET status = %s,
+                   error = %s,
+                   result_json = %s,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (status, error, _jsonb_param(result_json or {}), now, mutation_id),
+        )
+        self._append_upstream_mutation_event(
+            mutation_id,
+            event_type="failed",
+            actor_type="dagster",
+            actor_id=actor_id,
+            event_json={"status": status, "error": error, "result": result_json or {}},
+        )
+        mutation = self.get_upstream_mutation(mutation_id)
+        if mutation and mutation.get("request_id"):
+            self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
+
+    def approved_upstream_mutation_count(self) -> int:
+        self.ensure_upstream_mutation_tables()
+        rows = self._query(
+            """
+            SELECT count(*)::bigint
+            FROM upstream_mutations
+            WHERE status = ANY(%s)
+            """,
+            (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES),),
+        )
+        return int(rows[0][0]) if rows else 0
+
+    def observe_succeeded_gmail_archive_mutations(self, *, limit: int = 100) -> int:
+        self.ensure_upstream_mutation_tables()
+        mutations = self._query_dicts(
+            """
+            SELECT *
+            FROM upstream_mutations
+            WHERE provider = 'gmail'
+              AND operation = 'gmail.archive_threads'
+              AND status = 'succeeded'
+            ORDER BY executed_at ASC, id ASC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+        observed = 0
+        for mutation in mutations:
+            payload = _as_json_dict(mutation["payload_json"])
+            thread_ids = _normalize_thread_ids(payload.get("thread_ids") or [])
+            if not thread_ids:
+                continue
+            live_rows = self._query(
+                """
+                SELECT thread_id
+                FROM gmail_messages
+                WHERE account = %s
+                  AND thread_id = ANY(%s)
+                  AND is_deleted = 0
+                  AND 'INBOX' = ANY(label_ids)
+                  AND NOT ('TRASH' = ANY(label_ids))
+                  AND NOT ('SPAM' = ANY(label_ids))
+                LIMIT 1
+                """,
+                (mutation["account"], list(thread_ids)),
+            )
+            if live_rows:
+                continue
+            now = datetime.now(tz=UTC)
+            self._command(
+                """
+                UPDATE upstream_mutations
+                   SET status = 'observed',
+                       observed_at = %s,
+                       updated_at = %s
+                 WHERE id = %s
+                   AND status = 'succeeded'
+                """,
+                (now, now, mutation["id"]),
+            )
+            self._append_upstream_mutation_event(
+                str(mutation["id"]),
+                event_type="observed",
+                actor_type="dagster",
+                actor_id="upstream_mutation_worker",
+                event_json={"thread_ids": thread_ids},
+            )
+            if mutation.get("request_id"):
+                self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
+            observed += 1
+        return observed
+
+    def observe_succeeded_gmail_unarchive_mutations(self, *, limit: int = 100) -> int:
+        self.ensure_upstream_mutation_tables()
+        mutations = self._query_dicts(
+            """
+            SELECT *
+            FROM upstream_mutations
+            WHERE provider = 'gmail'
+              AND operation = 'gmail.unarchive_threads'
+              AND status = 'succeeded'
+            ORDER BY executed_at ASC, id ASC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+        observed = 0
+        for mutation in mutations:
+            payload = _as_json_dict(mutation["payload_json"])
+            thread_ids = _normalize_thread_ids(payload.get("thread_ids") or [])
+            if not thread_ids:
+                continue
+            inbox_rows = self._query(
+                """
+                SELECT DISTINCT thread_id
+                FROM gmail_messages
+                WHERE account = %s
+                  AND thread_id = ANY(%s)
+                  AND is_deleted = 0
+                  AND 'INBOX' = ANY(label_ids)
+                  AND NOT ('TRASH' = ANY(label_ids))
+                  AND NOT ('SPAM' = ANY(label_ids))
+                """,
+                (mutation["account"], list(thread_ids)),
+            )
+            observed_thread_ids = {str(row[0]) for row in inbox_rows}
+            if any(thread_id not in observed_thread_ids for thread_id in thread_ids):
+                continue
+            now = datetime.now(tz=UTC)
+            self._command(
+                """
+                UPDATE upstream_mutations
+                   SET status = 'observed',
+                       observed_at = %s,
+                       updated_at = %s
+                 WHERE id = %s
+                   AND status = 'succeeded'
+                """,
+                (now, now, mutation["id"]),
+            )
+            self._append_upstream_mutation_event(
+                str(mutation["id"]),
+                event_type="observed",
+                actor_type="dagster",
+                actor_id="upstream_mutation_worker",
+                event_json={"thread_ids": thread_ids},
+            )
+            if mutation.get("request_id"):
+                self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
+            observed += 1
+        return observed
+
+    def observe_succeeded_gmail_email_mutations(self, *, limit: int = 100) -> int:
+        self.ensure_upstream_mutation_tables()
+        mutations = self._query_dicts(
+            """
+            SELECT *
+            FROM upstream_mutations
+            WHERE provider = 'gmail'
+              AND operation = %s
+              AND status = 'succeeded'
+            ORDER BY executed_at ASC, id ASC
+            LIMIT %s
+            """,
+            (GMAIL_SEND_EMAIL_OPERATION, int(limit)),
+        )
+        observed = 0
+        for mutation in mutations:
+            result = _as_json_dict(mutation["result_json"])
+            message_ids = [
+                value
+                for value in [
+                    str(result.get("sent_message_id") or "").strip(),
+                    str(result.get("draft_message_id") or "").strip(),
+                ]
+                if value
+            ]
+            if not message_ids:
+                continue
+            rows = self._query(
+                """
+                SELECT message_id
+                FROM gmail_messages
+                WHERE account = %s
+                  AND message_id = ANY(%s)
+                  AND is_deleted = 0
+                """,
+                (mutation["account"], message_ids),
+            )
+            observed_message_ids = {str(row[0]) for row in rows}
+            if any(message_id not in observed_message_ids for message_id in message_ids):
+                continue
+            now = datetime.now(tz=UTC)
+            self._command(
+                """
+                UPDATE upstream_mutations
+                   SET status = 'observed',
+                       observed_at = %s,
+                       updated_at = %s
+                 WHERE id = %s
+                   AND status = 'succeeded'
+                """,
+                (now, now, mutation["id"]),
+            )
+            self._append_upstream_mutation_event(
+                str(mutation["id"]),
+                event_type="observed",
+                actor_type="dagster",
+                actor_id="upstream_mutation_worker",
+                event_json={"message_ids": message_ids, "delivery_mode": str(result.get("delivery_mode") or "")},
+            )
+            if mutation.get("request_id"):
+                self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
+            observed += 1
+        return observed
+
+    def observe_succeeded_contact_mutations(self, *, limit: int = 100) -> int:
+        self.ensure_contacts_tables()
+        self.ensure_upstream_mutation_tables()
+        mutations = self._query_dicts(
+            """
+            SELECT *
+            FROM upstream_mutations
+            WHERE provider = 'google_people'
+              AND operation = %s
+              AND status = 'succeeded'
+            ORDER BY executed_at ASC, id ASC
+            LIMIT %s
+            """,
+            (GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION, int(limit)),
+        )
+        observed = 0
+        for mutation in mutations:
+            payload = _as_json_dict(mutation["payload_json"])
+            result = _as_json_dict(mutation["result_json"])
+            operations = _json_list(payload.get("operations"))
+            if not operations:
+                continue
+            if not self._contact_mutation_observed(account=str(mutation["account"]), operations=operations, result=result):
+                continue
+            now = datetime.now(tz=UTC)
+            self._command(
+                """
+                UPDATE upstream_mutations
+                   SET status = 'observed',
+                       observed_at = %s,
+                       updated_at = %s
+                 WHERE id = %s
+                   AND status = 'succeeded'
+                """,
+                (now, now, mutation["id"]),
+            )
+            self._append_upstream_mutation_event(
+                str(mutation["id"]),
+                event_type="observed",
+                actor_type="dagster",
+                actor_id="upstream_mutation_worker",
+                event_json={"operation_count": len(operations)},
+            )
+            if mutation.get("request_id"):
+                self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
+            observed += 1
+        return observed
+
+    def _refresh_upstream_mutation_request_status(self, request_id: str) -> None:
+        request = self._query_dicts("SELECT * FROM upstream_mutation_requests WHERE id = %s", (request_id,))
+        if not request:
+            return
+        mutations = self.list_upstream_mutations_for_request(request_id)
+        if not mutations:
+            return
+        statuses = [str(mutation["status"]) for mutation in mutations]
+        active_statuses = [status for status in statuses if status != "rejected"]
+        if not active_statuses:
+            status = "rejected"
+        elif any(status == "pending_review" for status in active_statuses):
+            status = "pending_review"
+        elif any(status == "executing" for status in active_statuses):
+            status = "executing"
+        elif any(status == "approved" for status in active_statuses):
+            status = "approved"
+        elif any(status == "failed_retryable" for status in active_statuses):
+            status = "failed_retryable"
+        elif any(status == "blocked_missing_credentials" for status in active_statuses):
+            status = "blocked_missing_credentials"
+        elif any(status == "failed_terminal" for status in active_statuses):
+            status = "failed_terminal"
+        elif all(status == "observed" for status in active_statuses):
+            status = "observed"
+        elif all(status in {"succeeded", "observed"} for status in active_statuses):
+            status = "succeeded"
+        else:
+            status = request[0]["status"]
+
+        now = datetime.now(tz=UTC)
+        executed_at = max((mutation["executed_at"] for mutation in mutations), default=request[0]["executed_at"])
+        observed_at = max((mutation["observed_at"] for mutation in mutations), default=request[0]["observed_at"])
+        result_json = {
+            "mutation_statuses": {str(mutation["id"]): str(mutation["status"]) for mutation in mutations},
+        }
+        self._command(
+            """
+            UPDATE upstream_mutation_requests
+               SET status = %s,
+                   result_json = %s,
+                   executed_at = CASE WHEN %s > executed_at THEN %s ELSE executed_at END,
+                   observed_at = CASE WHEN %s > observed_at THEN %s ELSE observed_at END,
+                   updated_at = %s
+             WHERE id = %s
+            """,
+            (
+                status,
+                _jsonb_param(result_json),
+                executed_at,
+                executed_at,
+                observed_at,
+                observed_at,
+                now,
+                request_id,
+            ),
+        )
+
+    def _normalize_upstream_mutation_request_mutations(
+        self,
+        *,
+        request_reason: str,
+        request_context: Mapping[str, Any],
+        mutations: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        if not mutations:
+            return normalized
+        for index, mutation in enumerate(mutations):
+            if not isinstance(mutation, Mapping):
+                raise ValueError(f"mutation {index} must be an object")
+            mutation_type = str(mutation.get("type") or mutation.get("operation") or "").strip()
+            if mutation_type in {GMAIL_ARCHIVE_OPERATION, GMAIL_UNARCHIVE_OPERATION}:
+                account = str(mutation.get("account") or "").strip().lower()
+                thread_ids = _normalize_thread_ids(mutation.get("thread_ids") or [])
+                if not account:
+                    raise ValueError(f"mutation {index} must include account")
+                if not thread_ids:
+                    raise ValueError(f"mutation {index} must include thread_ids")
+                previews = (
+                    self.gmail_archive_thread_previews(account=account, thread_ids=thread_ids)
+                    if mutation_type == GMAIL_ARCHIVE_OPERATION
+                    else self.gmail_unarchive_thread_previews(account=account, thread_ids=thread_ids)
+                )
+                previews_by_thread_id = {str(preview["thread_id"]): preview for preview in previews}
+                missing_thread_ids = [thread_id for thread_id in thread_ids if thread_id not in previews_by_thread_id]
+                if missing_thread_ids:
+                    state = "non-inbox" if mutation_type == "gmail.archive_threads" else "non-archived"
+                    raise ValueError(f"unknown or {state} Gmail thread IDs for {account}: {', '.join(missing_thread_ids)}")
+                for thread_id in thread_ids:
+                    preview_row = _json_ready(previews_by_thread_id[thread_id])
+                    subject = str(preview_row.get("subject") or thread_id)
+                    archive = mutation_type == GMAIL_ARCHIVE_OPERATION
+                    normalized.append(
+                        {
+                            "provider": "gmail",
+                            "operation": mutation_type,
+                            "account": account,
+                            "title": str(mutation.get("title") or f"{'Archive' if archive else 'Unarchive'}: {subject}"),
+                            "reason": str(mutation.get("reason") or request_reason),
+                            "payload_json": (
+                                {"thread_ids": [thread_id], "remove_label_ids": ["INBOX"]}
+                                if archive
+                                else {"thread_ids": [thread_id], "add_label_ids": ["INBOX"]}
+                            ),
+                            "preview_json": {
+                                "thread_count": 1,
+                                "threads": [preview_row],
+                                "context": _normalize_json_value(dict(request_context)),
+                            },
+                        }
+                    )
+            elif mutation_type == GMAIL_SEND_EMAIL_OPERATION:
+                account = str(mutation.get("account") or "").strip().lower()
+                if not account:
+                    raise ValueError(f"mutation {index} must include account")
+                payload, preview = self._normalize_gmail_email_payload(
+                    account=account,
+                    delivery_mode=str(mutation.get("delivery_mode") or "send"),
+                    message=_json_mapping(mutation.get("message")),
+                    request_context=request_context,
+                )
+                normalized.append(
+                    {
+                        "provider": "gmail",
+                        "operation": GMAIL_SEND_EMAIL_OPERATION,
+                        "account": account,
+                        "title": str(mutation.get("title") or _gmail_email_title(payload["message"])),
+                        "reason": str(mutation.get("reason") or request_reason),
+                        "payload_json": payload,
+                        "preview_json": preview,
+                    }
+                )
+            elif mutation_type in {"google_people.contacts", "contacts.batch_mutation"}:
+                account = str(mutation.get("account") or "").strip().lower()
+                if not account:
+                    raise ValueError(f"mutation {index} must include account")
+                operations = self._normalize_contact_mutation_operations(
+                    account=account,
+                    operations=_json_list(mutation.get("operations")),
+                )
+                if not operations:
+                    raise ValueError(f"mutation {index} must include operations")
+                for operation in operations:
+                    preview_operation = self._contact_mutation_operation_preview(
+                        account=account,
+                        operation=operation,
+                        op_index=0,
+                    )
+                    normalized.append(
+                        {
+                            "provider": "google_people",
+                            "operation": GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
+                            "account": account,
+                            "title": str(mutation.get("title") or _contact_mutation_title(preview_operation)),
+                            "reason": str(mutation.get("reason") or request_reason),
+                            "payload_json": {"operations": [operation]},
+                            "preview_json": {
+                                "operation_count": 1,
+                                "operations": [preview_operation],
+                                "context": _normalize_json_value(dict(request_context)),
+                            },
+                        }
+                    )
+            else:
+                raise ValueError(
+                    f"mutation {index} has unsupported type {mutation_type!r}; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, or google_people.contacts"
+                )
+        return normalized
+
+    def _normalize_gmail_email_payload(
+        self,
+        *,
+        account: str,
+        delivery_mode: str,
+        message: Mapping[str, Any],
+        request_context: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        mode = _gmail_email_delivery_mode(delivery_mode)
+        normalized_message = {
+            "to": _normalize_email_recipients(message.get("to")),
+            "cc": _normalize_email_recipients(message.get("cc")),
+            "bcc": _normalize_email_recipients(message.get("bcc")),
+            "subject": str(message.get("subject") or "").strip(),
+            "body_text": str(message.get("body_text") or ""),
+            "body_html": str(message.get("body_html") or ""),
+        }
+        reply_to_thread_id = str(
+            message.get("reply_to_thread_id") or message.get("thread_id") or message.get("replyToThreadId") or ""
+        ).strip()
+        reply_context: dict[str, Any] = {}
+        if reply_to_thread_id:
+            reply_context = self._gmail_reply_thread_context(account=account, thread_id=reply_to_thread_id)
+            if not reply_context:
+                raise ValueError(f"unknown Gmail reply thread ID for {account}: {reply_to_thread_id}")
+            normalized_message["reply_to_thread_id"] = reply_to_thread_id
+            if not normalized_message["subject"]:
+                normalized_message["subject"] = _reply_subject(str(reply_context.get("subject") or ""))
+            in_reply_to = str(message.get("in_reply_to") or message.get("inReplyTo") or "").strip()
+            if not in_reply_to:
+                in_reply_to = str(reply_context.get("rfc822_message_id") or "").strip()
+            if in_reply_to:
+                normalized_message["in_reply_to"] = in_reply_to
+            references = _normalize_email_recipients(message.get("references"))
+            if not references and in_reply_to:
+                references = [in_reply_to]
+            if references:
+                normalized_message["references"] = references
+        elif not normalized_message["subject"]:
+            raise ValueError("Gmail email mutation must include subject")
+
+        if not any(normalized_message[field] for field in ("to", "cc", "bcc")):
+            raise ValueError("Gmail email mutation must include at least one recipient")
+        if not normalized_message["body_text"].strip() and not normalized_message["body_html"].strip():
+            raise ValueError("Gmail email mutation must include body_text or body_html")
+
+        payload = {
+            "delivery_mode": mode,
+            "message": _normalize_json_value(normalized_message),
+        }
+        preview = {
+            "email": {
+                "mode": "reply" if reply_to_thread_id else "new_thread",
+                "delivery_mode": mode,
+                **_normalize_json_value(normalized_message),
+            },
+            "context": _normalize_json_value(dict(request_context)),
+        }
+        if reply_context:
+            preview["email"]["reply_context"] = _normalize_json_value(reply_context)
+        return payload, preview
+
+    def _gmail_reply_thread_context(self, *, account: str, thread_id: str) -> dict[str, Any]:
+        rows = self._query_dicts(
+            """
+            SELECT
+                thread_id,
+                subject,
+                from_address AS latest_from_address,
+                rfc822_message_id,
+                internal_date AS latest_at
+            FROM gmail_messages
+            WHERE account = %s
+              AND thread_id = %s
+              AND is_deleted = 0
+              AND NOT ('TRASH' = ANY(label_ids))
+              AND NOT ('SPAM' = ANY(label_ids))
+            ORDER BY internal_date DESC, message_id ASC
+            LIMIT 1
+            """,
+            (account, thread_id),
+        )
+        return _json_ready(rows[0]) if rows else {}
+
+    def _normalize_contact_mutation_operations(
+        self,
+        *,
+        account: str,
+        operations: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for index, operation in enumerate(operations):
+            if not isinstance(operation, Mapping):
+                raise ValueError(f"operation {index} must be an object")
+            op = str(operation.get("op") or "").strip()
+            client_op_id = str(operation.get("client_op_id") or f"op-{index}").strip() or f"op-{index}"
+            if op == "create_contact":
+                person = _json_mapping(operation.get("person"))
+                if not person:
+                    raise ValueError(f"operation {index} create_contact must include person")
+                if person.get("resourceName"):
+                    raise ValueError(f"operation {index} create_contact person must not include resourceName")
+                normalized.append({"op": op, "client_op_id": client_op_id, "person": _normalize_json_value(person)})
+            elif op == "update_contact":
+                resource_name = _contact_resource_name(operation)
+                expected_etag = _contact_expected_etag(operation)
+                fields = _contact_update_fields(operation.get("update_person_fields") or operation.get("updatePersonFields"))
+                person = _json_mapping(operation.get("person"))
+                if not person:
+                    raise ValueError(f"operation {index} update_contact must include person")
+                current = self._contact_card(account=account, resource_name=resource_name)
+                if current is None:
+                    raise ValueError(f"operation {index} update_contact references unknown contact {resource_name}")
+                if expected_etag and str(current["etag"]) != expected_etag:
+                    raise ValueError(f"operation {index} update_contact etag does not match current contact {resource_name}")
+                person = dict(person)
+                person["resourceName"] = resource_name
+                if expected_etag and not person.get("etag"):
+                    person["etag"] = expected_etag
+                normalized.append(
+                    {
+                        "op": op,
+                        "client_op_id": client_op_id,
+                        "resource_name": resource_name,
+                        "expected_etag": expected_etag,
+                        "update_person_fields": fields,
+                        "person": _normalize_json_value(person),
+                    }
+                )
+            elif op == "delete_contact":
+                resource_name = _contact_resource_name(operation)
+                expected_etag = _contact_expected_etag(operation)
+                current = self._contact_card(account=account, resource_name=resource_name)
+                if current is None:
+                    raise ValueError(f"operation {index} delete_contact references unknown contact {resource_name}")
+                if expected_etag and str(current["etag"]) != expected_etag:
+                    raise ValueError(f"operation {index} delete_contact etag does not match current contact {resource_name}")
+                normalized.append(
+                    {
+                        "op": op,
+                        "client_op_id": client_op_id,
+                        "resource_name": resource_name,
+                        "expected_etag": expected_etag,
+                        "reason": str(operation.get("reason") or ""),
+                    }
+                )
+            else:
+                raise ValueError(
+                    f"operation {index} has unsupported op {op!r}; expected create_contact, update_contact, or delete_contact"
+                )
+        return normalized
+
+    def _contact_mutation_operation_preview(
+        self,
+        *,
+        account: str,
+        operation: Mapping[str, Any],
+        op_index: int,
+    ) -> dict[str, Any]:
+        op = str(operation.get("op") or "")
+        preview: dict[str, Any] = {
+            "op_index": op_index,
+            "op": op,
+            "client_op_id": str(operation.get("client_op_id") or ""),
+        }
+        if op == "create_contact":
+            person = _json_mapping(operation.get("person"))
+            preview.update(
+                {
+                    "summary": _contact_person_summary(person),
+                    "after": person,
+                }
+            )
+        elif op in {"update_contact", "delete_contact"}:
+            resource_name = str(operation.get("resource_name") or "")
+            current = self._contact_card(account=account, resource_name=resource_name)
+            before = _as_json_dict(current["raw_json"]) if current else {}
+            preview.update(
+                {
+                    "resource_name": resource_name,
+                    "expected_etag": str(operation.get("expected_etag") or ""),
+                    "summary": _contact_person_summary(before),
+                    "before": before,
+                }
+            )
+            if op == "update_contact":
+                preview["after"] = _json_mapping(operation.get("person"))
+                preview["update_person_fields"] = list(operation.get("update_person_fields") or [])
+            else:
+                preview["reason"] = str(operation.get("reason") or "")
+        return preview
+
+    def _contact_card(self, *, account: str, resource_name: str) -> dict[str, Any] | None:
+        rows = self._query_dicts(
+            """
+            SELECT *
+            FROM contact_cards
+            WHERE source = 'google_people'
+              AND account = %s
+              AND source_kind = 'google_contacts'
+              AND address_book_id = 'people/me'
+              AND card_id = %s
+              AND is_deleted = 0
+            """,
+            (account, resource_name),
+        )
+        return rows[0] if rows else None
+
+    def _contact_mutation_observed(
+        self,
+        *,
+        account: str,
+        operations: Sequence[Mapping[str, Any]],
+        result: Mapping[str, Any],
+    ) -> bool:
+        created_by_client_id = {
+            str(item.get("client_op_id") or ""): str(item.get("resource_name") or "")
+            for item in _json_list(result.get("operation_results"))
+            if item.get("op") == "create_contact"
+        }
+        for operation in operations:
+            op = str(operation.get("op") or "")
+            resource_name = str(operation.get("resource_name") or "")
+            if op == "create_contact":
+                resource_name = created_by_client_id.get(str(operation.get("client_op_id") or ""), "")
+                if not resource_name:
+                    return False
+                if self._contact_card(account=account, resource_name=resource_name) is None:
+                    return False
+            elif op == "update_contact":
+                row = self._contact_card(account=account, resource_name=resource_name)
+                if row is None:
+                    return False
+                expected_result = _operation_result_for_resource(result, resource_name)
+                result_etag = str(expected_result.get("etag") or "")
+                if result_etag and str(row["etag"]) != result_etag:
+                    return False
+            elif op == "delete_contact":
+                if self._contact_card(account=account, resource_name=resource_name) is not None:
+                    return False
+            else:
+                return False
+        return True
+
+    def _append_upstream_mutation_event(
+        self,
+        mutation_id: str,
+        *,
+        event_type: str,
+        actor_type: str,
+        actor_id: str,
+        event_json: dict[str, Any],
+    ) -> None:
+        self._command(
+            """
+            INSERT INTO upstream_mutation_events (
+                mutation_id, event_index, event_type, actor_type, actor_id, event_json, created_at
+            )
+            SELECT
+                %s,
+                COALESCE(max(event_index) + 1, 0),
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
+            FROM upstream_mutation_events
+            WHERE mutation_id = %s
+            """,
+            (
+                mutation_id,
+                event_type,
+                actor_type,
+                actor_id,
+                _jsonb_param(event_json),
+                datetime.now(tz=UTC),
+                mutation_id,
+            ),
+        )
+
+    def _append_upstream_mutation_request_event(
+        self,
+        request_id: str,
+        *,
+        event_type: str,
+        actor_type: str,
+        actor_id: str,
+        event_json: dict[str, Any],
+    ) -> None:
+        self._command(
+            """
+            INSERT INTO upstream_mutation_request_events (
+                request_id, event_index, event_type, actor_type, actor_id, event_json, created_at
+            )
+            SELECT
+                %s,
+                COALESCE(max(event_index) + 1, 0),
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
+            FROM upstream_mutation_request_events
+            WHERE request_id = %s
+            """,
+            (
+                request_id,
+                event_type,
+                actor_type,
+                actor_id,
+                _jsonb_param(event_json),
+                datetime.now(tz=UTC),
+                request_id,
+            ),
+        )
+
     def _ensure_table_group(self, tables: Sequence[str]) -> None:
         for table in tables:
             self._ensure_table(table)
-        self._ensure_indexes()
+        self._ensure_indexes(tables)
 
     def _ensure_table(self, table: str) -> None:
         spec = POSTGRES_TABLES[table]
@@ -450,40 +2421,39 @@ class PostgresWarehouse:
             """
         )
 
-    def _ensure_indexes(self) -> None:
-        for sql in (
-            "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public",
-            "CREATE INDEX IF NOT EXISTS gmail_messages_thread_idx ON gmail_messages (account, thread_id, internal_date DESC)",
-            "CREATE INDEX IF NOT EXISTS gmail_messages_label_ids_idx ON gmail_messages USING gin (label_ids)",
-            "CREATE INDEX IF NOT EXISTS gmail_attachments_message_idx ON gmail_attachments (account, message_id)",
-            "CREATE INDEX IF NOT EXISTS calendar_events_time_idx ON calendar_events (start_at, end_at)",
-            "CREATE INDEX IF NOT EXISTS contact_cards_display_idx ON contact_cards (account, source_kind, display_name) WHERE is_deleted = 0",
-            "CREATE INDEX IF NOT EXISTS contact_cards_primary_email_idx ON contact_cards (lower(primary_email)) WHERE is_deleted = 0 AND primary_email != ''",
-            "CREATE INDEX IF NOT EXISTS contact_cards_primary_phone_idx ON contact_cards (lower(primary_phone)) WHERE is_deleted = 0 AND primary_phone != ''",
-            "CREATE INDEX IF NOT EXISTS contact_cards_source_updated_idx ON contact_cards (source_updated_at DESC)",
-            "CREATE INDEX IF NOT EXISTS contact_cards_raw_json_idx ON contact_cards USING gin (raw_json)",
-            "CREATE INDEX IF NOT EXISTS voice_memo_files_recorded_idx ON apple_voice_memos_files (recorded_at DESC)",
-            "CREATE INDEX IF NOT EXISTS apple_notes_modified_idx ON apple_notes (modified_at DESC) WHERE is_deleted = 0",
-            "CREATE INDEX IF NOT EXISTS apple_note_revisions_note_idx ON apple_note_revisions (account, note_id, modified_at DESC)",
-            "CREATE INDEX IF NOT EXISTS apple_note_attachments_hash_idx ON apple_note_attachments (content_sha256)",
-            "CREATE INDEX IF NOT EXISTS apple_messages_time_idx ON apple_messages (message_at DESC) WHERE is_deleted = 0",
-            "CREATE INDEX IF NOT EXISTS apple_messages_body_trgm_idx ON apple_messages USING gin (body_text public.gin_trgm_ops) WHERE is_deleted = 0",
-            "CREATE INDEX IF NOT EXISTS apple_message_chat_messages_chat_time_idx ON apple_message_chat_messages (account, chat_id, message_date DESC)",
-            "CREATE INDEX IF NOT EXISTS apple_message_attachments_hash_idx ON apple_message_attachments (content_sha256)",
-            "CREATE INDEX IF NOT EXISTS slack_messages_conversation_time_idx ON slack_messages (account, team_id, conversation_id, message_datetime DESC)",
-            "CREATE INDEX IF NOT EXISTS slack_messages_recent_scope_time_idx ON slack_messages (account, team_id, message_datetime DESC) WHERE is_deleted = 0",
-            "CREATE INDEX IF NOT EXISTS slack_messages_recent_thread_time_idx ON slack_messages (account, team_id, thread_ts, message_datetime DESC) WHERE is_deleted = 0",
-            "CREATE INDEX IF NOT EXISTS slack_messages_thread_idx ON slack_messages (account, team_id, conversation_id, thread_ts)",
-            "CREATE INDEX IF NOT EXISTS slack_messages_text_trgm_live_idx ON slack_messages USING gin (text public.gin_trgm_ops) WHERE is_deleted = 0",
-            "CREATE INDEX IF NOT EXISTS slack_conversations_scope_idx ON slack_conversations (account, team_id, conversation_type)",
-            "CREATE INDEX IF NOT EXISTS slack_state_scope_idx ON slack_sync_state (account, team_id, object_type, object_id)",
-        ):
+    def _ensure_indexes(self, tables: Sequence[str]) -> None:
+        table_names = set(tables)
+        for index in POSTGRES_INDEXES:
+            if index.table not in table_names or index.name in self._ensured_index_names:
+                continue
             try:
-                self._command(sql)
+                if self._index_exists(index.name):
+                    self._ensured_index_names.add(index.name)
+                    continue
+                if index.requires_pg_trgm and not self._pg_trgm_ensured:
+                    self._command("CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public")
+                    self._pg_trgm_ensured = True
+                self._command(index.sql)
+                self._ensured_index_names.add(index.name)
             except Exception:
                 # Tests often create only a subset of tables. Missing-table index failures
                 # are harmless because ensure_* is called again by each runtime asset.
                 pass
+
+    def _index_exists(self, index_name: str) -> bool:
+        rows = self._query(
+            """
+            SELECT 1
+            FROM pg_class AS c
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s
+              AND c.relname = %s
+              AND c.relkind = 'i'
+            LIMIT 1
+            """,
+            (self._schema, index_name),
+        )
+        return bool(rows)
 
     def load_sync_state(self) -> dict[str, SyncState]:
         rows = self._query(
@@ -2250,6 +4220,12 @@ class PostgresWarehouse:
             cursor.execute(sql, params)
             return cursor.fetchall()
 
+    def _query_dicts(self, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
+        with self._connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            columns = [description[0] for description in cursor.description]
+            return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+
     def _insert(self, table: str, rows: list[tuple[Any, ...]], columns: tuple[str, ...]) -> None:
         if not rows:
             return
@@ -2377,6 +4353,210 @@ def _normalize_json_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_normalize_json_value(item) for item in value]
     return value
+
+
+def _jsonb_param(value: Any) -> Json:
+    return Json(_normalize_json_value(value), dumps=lambda data: json.dumps(data, sort_keys=True, separators=(",", ":"), default=str))
+
+
+def _as_json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}
+
+
+def _json_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def _json_ready(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: _normalize_json_value(item) for key, item in value.items()}
+
+
+def _normalize_thread_ids(thread_ids: Any) -> list[str]:
+    if not isinstance(thread_ids, Sequence) or isinstance(thread_ids, (str, bytes)):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in thread_ids:
+        thread_id = str(value).strip()
+        if thread_id and thread_id not in seen:
+            normalized.append(thread_id)
+            seen.add(thread_id)
+    return normalized
+
+
+def _gmail_email_delivery_mode(value: Any) -> str:
+    mode = str(value or "send").strip().lower()
+    if mode not in {"send", "draft"}:
+        raise ValueError("Gmail email delivery_mode must be send or draft")
+    return mode
+
+
+def _normalize_email_recipients(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = value.split(",")
+    elif isinstance(value, Sequence):
+        raw_values = value
+    else:
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        item = str(raw_value).strip()
+        if item and item not in seen:
+            normalized.append(item)
+            seen.add(item)
+    return normalized
+
+
+def _reply_subject(subject: str) -> str:
+    stripped = subject.strip()
+    if not stripped:
+        return "Re:"
+    return stripped if stripped.lower().startswith("re:") else f"Re: {stripped}"
+
+
+def _gmail_email_title(message: Mapping[str, Any]) -> str:
+    subject = str(message.get("subject") or "email")
+    prefix = "Reply" if str(message.get("reply_to_thread_id") or "").strip() else "Send"
+    return f"{prefix}: {subject}"
+
+
+def _upstream_mutation_request_idempotency_key(
+    *,
+    title: str,
+    reason: str,
+    mutations: Sequence[Mapping[str, Any]],
+) -> str:
+    mutation_keys = [
+        {
+            "provider": str(mutation.get("provider") or ""),
+            "operation": str(mutation.get("operation") or ""),
+            "account": str(mutation.get("account") or ""),
+            "payload_json": _normalize_json_value(mutation.get("payload_json")),
+        }
+        for mutation in mutations
+    ]
+    payload = {
+        "mutations": sorted(
+            mutation_keys,
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+        ),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return f"upstream_mutation_request:{digest}"
+
+
+def _contact_resource_name(operation: Mapping[str, Any]) -> str:
+    resource_name = str(operation.get("resource_name") or operation.get("resourceName") or "").strip()
+    if not resource_name.startswith("people/"):
+        raise ValueError("contact resource_name must be a people/* resource name")
+    return resource_name
+
+
+def _contact_expected_etag(operation: Mapping[str, Any]) -> str:
+    return str(operation.get("expected_etag") or operation.get("etag") or "").strip()
+
+
+def _contact_update_fields(value: Any) -> list[str]:
+    if isinstance(value, str):
+        fields = [field.strip() for field in value.split(",")]
+    elif isinstance(value, Sequence):
+        fields = [str(field).strip() for field in value]
+    else:
+        fields = []
+    normalized = [field for field in fields if field]
+    if not normalized:
+        raise ValueError("update_contact must include update_person_fields")
+    allowed = {
+        "addresses",
+        "biographies",
+        "birthdays",
+        "calendarUrls",
+        "clientData",
+        "emailAddresses",
+        "events",
+        "externalIds",
+        "genders",
+        "imClients",
+        "interests",
+        "locales",
+        "locations",
+        "memberships",
+        "miscKeywords",
+        "names",
+        "nicknames",
+        "occupations",
+        "organizations",
+        "phoneNumbers",
+        "relations",
+        "sipAddresses",
+        "urls",
+        "userDefined",
+    }
+    unsupported = [field for field in normalized if field not in allowed]
+    if unsupported:
+        raise ValueError(f"unsupported update_person_fields: {', '.join(unsupported)}")
+    return list(dict.fromkeys(normalized))
+
+
+def _contact_person_summary(person: Mapping[str, Any]) -> dict[str, Any]:
+    names = person.get("names")
+    emails = person.get("emailAddresses")
+    phones = person.get("phoneNumbers")
+    organizations = person.get("organizations")
+    return {
+        "display_name": _first_contact_value(names, "displayName"),
+        "primary_email": _first_contact_value(emails, "value"),
+        "primary_phone": _first_contact_value(phones, "canonicalForm") or _first_contact_value(phones, "value"),
+        "organization": _first_contact_value(organizations, "name"),
+        "resource_name": str(person.get("resourceName") or ""),
+        "etag": str(person.get("etag") or ""),
+    }
+
+
+def _contact_mutation_title(preview_operation: Mapping[str, Any]) -> str:
+    op = str(preview_operation.get("op") or "")
+    summary = _json_mapping(preview_operation.get("summary"))
+    label = str(summary.get("display_name") or summary.get("primary_email") or preview_operation.get("resource_name") or "contact")
+    if op == "create_contact":
+        return f"Create contact: {label}"
+    if op == "update_contact":
+        return f"Update contact: {label}"
+    if op == "delete_contact":
+        return f"Delete contact: {label}"
+    return f"Change contact: {label}"
+
+
+def _first_contact_value(value: Any, key: str) -> str:
+    if not isinstance(value, list):
+        return ""
+    for item in value:
+        if isinstance(item, Mapping) and item.get(key):
+            return str(item.get(key))
+    return ""
+
+
+def _operation_result_for_resource(result: Mapping[str, Any], resource_name: str) -> dict[str, Any]:
+    for item in _json_list(result.get("operation_results")):
+        if str(item.get("resource_name") or "") == resource_name:
+            return item
+    return {}
 
 
 def _ensure_utc(value: datetime) -> datetime:

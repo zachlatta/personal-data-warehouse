@@ -17,12 +17,14 @@ dependencies = [
     "python-dotenv>=1.1.0",
     "requests>=2.32.0",
     "slack-sdk>=3.41.0",
+    "mcp[cli]>=1.23.0",
 ]
 
 [project.scripts]
 personal-data-warehouse-gmail-auth = "personal_data_warehouse.gmail_auth:main"
 personal-data-warehouse-google-auth = "personal_data_warehouse.gmail_auth:main"
 personal-data-warehouse-contacts-sync = "personal_data_warehouse.contacts_sync:main"
+personal-data-warehouse-mcp = "personal_data_warehouse.mcp_server:main"
 personal-data-warehouse-slack-sync = "personal_data_warehouse.slack_sync:main"
 personal-data-warehouse-apple-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"
 personal-data-warehouse-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"

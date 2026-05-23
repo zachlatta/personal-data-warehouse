@@ -10,8 +10,11 @@ from dotenv import load_dotenv
 from personal_data_warehouse.agent_runner import default_agent_docker_image, default_agent_tool_proxy_public_host
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 CONTACTS_READONLY_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
+CONTACTS_SCOPE = "https://www.googleapis.com/auth/contacts"
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 DEFAULT_GMAIL_PAGE_SIZE = 500
 DEFAULT_GMAIL_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -126,7 +129,6 @@ class SlackAccount:
     team_id: str | None
 
 
-
 @dataclass(frozen=True)
 class VoiceMemosConfig:
     account: str
@@ -215,6 +217,8 @@ class Settings:
     slack_lookback_days: int
     slack_thread_audit_days: int
     slack_force_full_sync: bool
+    gmail_mutation_scopes: tuple[str, ...] = (GMAIL_MODIFY_SCOPE,)
+    gmail_compose_scopes: tuple[str, ...] = (GMAIL_COMPOSE_SCOPE,)
     google_scopes: tuple[str, ...] = (GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE)
     calendar_accounts: tuple[CalendarAccount, ...] = ()
     calendar_scopes: tuple[str, ...] = (CALENDAR_READONLY_SCOPE,)
@@ -225,6 +229,7 @@ class Settings:
     calendar_expanded_sync_interval_minutes: int = DEFAULT_CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES
     contact_google_accounts: tuple[ContactGoogleAccount, ...] = ()
     contact_scopes: tuple[str, ...] = (CONTACTS_READONLY_SCOPE,)
+    contact_mutation_scopes: tuple[str, ...] = (CONTACTS_SCOPE,)
     contact_page_size: int = DEFAULT_CONTACT_PAGE_SIZE
     contact_force_full_sync: bool = False
     gmail_attachment_ai_fallback_enabled: bool = True
@@ -250,6 +255,14 @@ class Settings:
                 return account
         configured = ", ".join(account.email_address for account in self.gmail_accounts)
         raise ValueError(f"{email_address} is not configured in GMAIL_ACCOUNTS ({configured})")
+
+    def contact_account_for_email(self, email_address: str) -> ContactGoogleAccount:
+        normalized = email_address.strip().lower()
+        for account in self.contact_google_accounts:
+            if account.email_address.lower() == normalized:
+                return account
+        configured = ", ".join(account.email_address for account in self.contact_google_accounts)
+        raise ValueError(f"{email_address} is not configured in CONTACT_GOOGLE_ACCOUNTS ({configured})")
 
     def google_oauth_client_secrets_json_for_email(self, email_address: str) -> str | None:
         normalized = email_address.strip().lower()
@@ -286,8 +299,10 @@ def load_settings(
     require_postgres: bool | None = None,
     require_gmail: bool = True,
     require_gmail_client_secrets: bool = False,
+    require_gmail_mutations: bool = False,
     require_calendar: bool = False,
     require_contacts: bool = False,
+    require_contact_mutations: bool = False,
     require_slack: bool = False,
     require_voice_memos: bool = False,
     require_apple_notes: bool = False,
@@ -311,7 +326,7 @@ def load_settings(
         raise ValueError("POSTGRES_DATABASE_URL must be set")
 
     account_emails = _parse_csv_env(os.getenv("GMAIL_ACCOUNTS"))
-    if require_gmail and not account_emails:
+    if (require_gmail or require_gmail_mutations) and not account_emails:
         raise ValueError("GMAIL_ACCOUNTS must be set to a comma-separated list of mailbox addresses")
 
     client_secrets_json = _json_env_value("GMAIL_OAUTH_CLIENT_SECRETS_JSON")
@@ -338,7 +353,7 @@ def load_settings(
     )
 
     contact_google_account_emails = _parse_csv_env(os.getenv("CONTACT_GOOGLE_ACCOUNTS"))
-    if require_contacts and not contact_google_account_emails:
+    if (require_contacts or require_contact_mutations) and not contact_google_account_emails:
         raise ValueError("CONTACT_GOOGLE_ACCOUNTS must be set to a comma-separated list of Google account addresses")
     contact_google_accounts = tuple(
         ContactGoogleAccount(email_address=email_address)
@@ -790,6 +805,8 @@ def load_settings(
         gmail_oauth_client_secrets_json=client_secrets_json,
         google_scopes=tuple(dict.fromkeys(google_scopes)),
         gmail_scopes=(GMAIL_READONLY_SCOPE,),
+        gmail_mutation_scopes=(GMAIL_MODIFY_SCOPE,),
+        gmail_compose_scopes=(GMAIL_COMPOSE_SCOPE,),
         gmail_page_size=page_size,
         gmail_include_spam_trash=_parse_bool_env(os.getenv("GMAIL_INCLUDE_SPAM_TRASH"), True),
         gmail_force_full_sync=_parse_bool_env(os.getenv("GMAIL_FORCE_FULL_SYNC"), False),
@@ -822,6 +839,7 @@ def load_settings(
         calendar_expanded_sync_interval_minutes=calendar_expanded_sync_interval_minutes,
         contact_google_accounts=contact_google_accounts,
         contact_scopes=(CONTACTS_READONLY_SCOPE,),
+        contact_mutation_scopes=(CONTACTS_SCOPE,),
         contact_page_size=contact_page_size,
         contact_force_full_sync=_parse_bool_env(os.getenv("CONTACT_FORCE_FULL_SYNC"), False),
         slack_accounts=tuple(slack_accounts),

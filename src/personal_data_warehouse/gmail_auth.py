@@ -7,10 +7,16 @@ from pathlib import Path
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from personal_data_warehouse.config import email_domain, env_slug, load_settings
+from personal_data_warehouse.config import CONTACTS_SCOPE, GMAIL_COMPOSE_SCOPE, GMAIL_MODIFY_SCOPE, email_domain, env_slug, load_settings
 
 
-def run_oauth_flow(email_address: str) -> dict[str, str]:
+def run_oauth_flow(
+    email_address: str,
+    *,
+    include_gmail_modify: bool = False,
+    include_gmail_compose: bool = False,
+    include_contacts_write: bool = False,
+) -> dict[str, str]:
     settings = load_settings(
         require_clickhouse=False,
         require_gmail=False,
@@ -27,9 +33,16 @@ def run_oauth_flow(email_address: str) -> dict[str, str]:
             f"Account override names GOOGLE_{slug}_OAUTH_CLIENT_SECRETS_JSON_B64 and "
             f"GMAIL_{slug}_OAUTH_CLIENT_SECRETS_JSON_B64 are also supported."
         )
+    scopes = list(settings.google_scopes)
+    if include_gmail_modify:
+        scopes.append(GMAIL_MODIFY_SCOPE)
+    if include_gmail_compose:
+        scopes.append(GMAIL_COMPOSE_SCOPE)
+    if include_contacts_write:
+        scopes.append(CONTACTS_SCOPE)
     flow = InstalledAppFlow.from_client_config(
         json.loads(client_secrets_json),
-        settings.google_scopes,
+        tuple(dict.fromkeys(scopes)),
     )
     credentials = flow.run_local_server(port=0)
     encoded_token = base64.b64encode(credentials.to_json().encode("utf-8")).decode("ascii")
@@ -51,6 +64,21 @@ def main() -> None:
         "--write-env",
         action="store_true",
         help="Update the local .env file with generated token values instead of only printing them",
+    )
+    parser.add_argument(
+        "--include-gmail-modify",
+        action="store_true",
+        help="Request Gmail modify scope so approved mutation jobs can archive Gmail threads.",
+    )
+    parser.add_argument(
+        "--include-gmail-compose",
+        action="store_true",
+        help="Request Gmail compose scope so approved mutation jobs can create drafts or send Gmail messages.",
+    )
+    parser.add_argument(
+        "--include-contacts-write",
+        action="store_true",
+        help="Request Google Contacts write scope so approved mutation jobs can create, update, or delete contacts.",
     )
     args = parser.parse_args()
 
@@ -93,7 +121,12 @@ def main() -> None:
         return
 
     for email_address in emails:
-        env_values = run_oauth_flow(email_address)
+        env_values = run_oauth_flow(
+            email_address,
+            include_gmail_modify=args.include_gmail_modify,
+            include_gmail_compose=args.include_gmail_compose,
+            include_contacts_write=args.include_contacts_write,
+        )
         if args.write_env:
             update_env_file(Path(".env"), env_values)
             print(f"Updated .env token env vars for {email_address}")
