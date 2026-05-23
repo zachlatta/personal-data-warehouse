@@ -428,13 +428,13 @@ func TestReviewUIRendersContactMutationPreview(t *testing.T) {
 			Payload: map[string]any{"operations": []any{map[string]any{
 				"op":                   "update_contact",
 				"resource_name":        "people/ada",
-				"update_person_fields": []any{"names", "emailAddresses"},
+				"update_person_fields": []any{"names", "emailAddresses", "organizations"},
 			}}},
 			Preview: map[string]any{"operations": []any{map[string]any{
 				"op":                   "update_contact",
 				"op_index":             0,
 				"resource_name":        "people/ada",
-				"update_person_fields": []any{"names", "emailAddresses"},
+				"update_person_fields": []any{"names", "emailAddresses", "organizations"},
 				"summary": map[string]any{
 					"display_name":  "Ada Lovelace",
 					"primary_email": "ada@example.test",
@@ -443,10 +443,12 @@ func TestReviewUIRendersContactMutationPreview(t *testing.T) {
 				"before": map[string]any{
 					"names":          []any{map[string]any{"displayName": "Ada Old"}},
 					"emailAddresses": []any{map[string]any{"value": "ada.old@example.test"}},
+					"organizations":  []any{map[string]any{"name": "Old Lab", "title": "Old Role"}},
 				},
 				"after": map[string]any{
 					"names":          []any{map[string]any{"displayName": "Ada Lovelace"}},
 					"emailAddresses": []any{map[string]any{"value": "ada@example.test"}},
+					"organizations":  []any{map[string]any{"name": "Analytical Engines", "title": "Computer Scientist"}},
 				},
 			}}},
 		}, {
@@ -528,6 +530,9 @@ func TestReviewUIRendersContactMutationPreview(t *testing.T) {
 		"After",
 		"names",
 		"emailAddresses",
+		"organizations",
+		"Old Role, Old Lab",
+		"Computer Scientist, Analytical Engines",
 		"Fields not listed here are not part of this update.",
 	} {
 		if !strings.Contains(body, want) {

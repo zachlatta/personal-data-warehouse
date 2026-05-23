@@ -654,6 +654,9 @@ func contactFieldValueSummary(value any) string {
 }
 
 func contactFieldMapSummary(value map[string]any) string {
+	if organization := contactOrganizationSummary([]map[string]any{value}); organization != "" {
+		return organization
+	}
 	for _, keys := range [][]string{
 		{"displayName", "unstructuredName", "givenName"},
 		{"canonicalForm", "value"},
