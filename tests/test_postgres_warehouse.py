@@ -244,7 +244,6 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
     warehouse.ensure_apple_notes_tables()
     warehouse.ensure_apple_messages_tables()
     warehouse.ensure_slack_tables()
-    warehouse.ensure_finance_tables()
 
     rows = warehouse._query(
         """
@@ -253,7 +252,7 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
         WHERE table_schema = current_schema()
           AND table_name IN (
             'gmail_messages', 'calendar_events', 'slack_messages', 'apple_voice_memos_files',
-            'apple_notes', 'apple_messages', 'finance_accounts', 'contact_cards'
+            'apple_notes', 'apple_messages', 'contact_cards'
           )
         ORDER BY table_name
         """
@@ -265,10 +264,28 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
         "apple_voice_memos_files",
         "calendar_events",
         "contact_cards",
-        "finance_accounts",
         "gmail_messages",
         "slack_messages",
     ]
+
+
+def test_postgres_warehouse_drops_removed_personal_finance_schema(warehouse: PostgresWarehouse) -> None:
+    warehouse._command("CREATE TABLE finance_accounts (id text PRIMARY KEY)")
+    warehouse._command("CREATE VIEW clean_finance_accounts AS SELECT id FROM finance_accounts")
+
+    warehouse.ensure_tables()
+
+    rows = warehouse._query(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = current_schema()
+          AND table_name IN ('finance_accounts', 'clean_finance_accounts')
+        ORDER BY table_name
+        """
+    )
+
+    assert rows == []
 
 
 def test_postgres_slack_tables_create_recent_message_indexes(warehouse: PostgresWarehouse) -> None:

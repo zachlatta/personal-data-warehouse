@@ -30,14 +30,6 @@ from personal_data_warehouse.clickhouse import (
     CALENDAR_SYNC_STATE_COLUMNS,
     CONTACT_CARD_COLUMNS,
     CONTACT_SYNC_STATE_COLUMNS,
-    FINANCE_ACCOUNT_COLUMNS,
-    FINANCE_INVESTMENT_HOLDING_COLUMNS,
-    FINANCE_INVESTMENT_SECURITY_COLUMNS,
-    FINANCE_INVESTMENT_TRANSACTION_COLUMNS,
-    FINANCE_ITEM_COLUMNS,
-    FINANCE_LIABILITY_COLUMNS,
-    FINANCE_SYNC_STATE_COLUMNS,
-    FINANCE_TRANSACTION_COLUMNS,
     MESSAGE_COLUMNS,
     RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS,
     SLACK_ACCOUNT_IDENTITY_COLUMNS,
@@ -68,6 +60,21 @@ SLACK_CONVERSATION_STATS_COLUMNS = (
     "message_count",
     "latest_message_at",
     "updated_at",
+)
+REMOVED_PERSONAL_FINANCE_VIEWS = (
+    "clean_finance_accounts",
+    "clean_finance_transactions",
+    "clean_finance_holdings",
+)
+REMOVED_PERSONAL_FINANCE_TABLES = (
+    "finance_sync_state",
+    "finance_liabilities",
+    "finance_investment_transactions",
+    "finance_investment_securities",
+    "finance_investment_holdings",
+    "finance_transactions",
+    "finance_accounts",
+    "finance_items",
 )
 
 
@@ -161,29 +168,6 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS,
         ("source", "account", "scope_id", "item_id"),
     ),
-    "finance_items": TableSpec(FINANCE_ITEM_COLUMNS, ("source", "item_id")),
-    "finance_accounts": TableSpec(FINANCE_ACCOUNT_COLUMNS, ("source", "item_id", "account_id")),
-    "finance_transactions": TableSpec(FINANCE_TRANSACTION_COLUMNS, ("source", "item_id", "transaction_id")),
-    "finance_investment_holdings": TableSpec(
-        FINANCE_INVESTMENT_HOLDING_COLUMNS,
-        ("source", "item_id", "account_id", "security_id"),
-    ),
-    "finance_investment_securities": TableSpec(
-        FINANCE_INVESTMENT_SECURITY_COLUMNS,
-        ("source", "item_id", "security_id"),
-    ),
-    "finance_investment_transactions": TableSpec(
-        FINANCE_INVESTMENT_TRANSACTION_COLUMNS,
-        ("source", "item_id", "investment_transaction_id"),
-    ),
-    "finance_liabilities": TableSpec(
-        FINANCE_LIABILITY_COLUMNS,
-        ("source", "item_id", "account_id", "liability_type"),
-    ),
-    "finance_sync_state": TableSpec(
-        FINANCE_SYNC_STATE_COLUMNS,
-        ("source", "item_name", "item_id", "object_type"),
-    ),
 }
 
 POSTGRES_INSERT_PAGE_SIZES = {
@@ -263,8 +247,6 @@ TIMESTAMP_COLUMNS = {
     "date_retracted",
     "date_recovered",
     "ai_processed_at",
-    "datetime",
-    "authorized_datetime",
 }
 
 INTEGER_COLUMNS = {
@@ -301,9 +283,6 @@ INTEGER_COLUMNS = {
     "priority_rank",
     "unread_count",
     "sync_version",
-    "pending",
-    "is_removed",
-    "is_overdue",
     "is_missing",
     "handle_rowid",
     "chat_rowid",
@@ -346,28 +325,6 @@ INTEGER_COLUMNS = {
 FLOAT_COLUMNS = {
     "confidence",
     "calendar_confidence",
-    "current_balance",
-    "available_balance",
-    "limit_balance",
-    "amount",
-    "quantity",
-    "cost_basis",
-    "institution_price",
-    "institution_value",
-    "vested_quantity",
-    "vested_value",
-    "close_price",
-    "price",
-    "fees",
-    "interest_rate_percentage",
-    "last_payment_amount",
-    "next_monthly_payment",
-    "original_principal_balance",
-    "outstanding_principal_balance",
-    "ytd_interest_paid",
-    "ytd_principal_paid",
-    "minimum_payment_amount",
-    "last_statement_balance",
 }
 
 
@@ -386,6 +343,7 @@ class PostgresWarehouse:
         self._connection.close()
 
     def ensure_tables(self) -> None:
+        self.drop_personal_finance_schema()
         self._ensure_table_group(
             [
                 "gmail_messages",
@@ -465,20 +423,11 @@ class PostgresWarehouse:
         self._ensure_slack_conversation_stats_backfilled()
         self._ensure_clean_slack_inbox_view()
 
-    def ensure_finance_tables(self) -> None:
-        self._ensure_table_group(
-            [
-                "finance_items",
-                "finance_accounts",
-                "finance_transactions",
-                "finance_investment_holdings",
-                "finance_investment_securities",
-                "finance_investment_transactions",
-                "finance_liabilities",
-                "finance_sync_state",
-            ]
-        )
-        self._ensure_clean_finance_views()
+    def drop_personal_finance_schema(self) -> None:
+        for view in REMOVED_PERSONAL_FINANCE_VIEWS:
+            self._command(f"DROP VIEW IF EXISTS {_identifier(view)} CASCADE")
+        for table in REMOVED_PERSONAL_FINANCE_TABLES:
+            self._command(f"DROP TABLE IF EXISTS {_identifier(table)} CASCADE")
 
     def _ensure_table_group(self, tables: Sequence[str]) -> None:
         for table in tables:
@@ -528,10 +477,6 @@ class PostgresWarehouse:
             "CREATE INDEX IF NOT EXISTS slack_messages_text_trgm_live_idx ON slack_messages USING gin (text public.gin_trgm_ops) WHERE is_deleted = 0",
             "CREATE INDEX IF NOT EXISTS slack_conversations_scope_idx ON slack_conversations (account, team_id, conversation_type)",
             "CREATE INDEX IF NOT EXISTS slack_state_scope_idx ON slack_sync_state (account, team_id, object_type, object_id)",
-            "CREATE INDEX IF NOT EXISTS finance_accounts_item_idx ON finance_accounts (source, item_id, type, subtype)",
-            "CREATE INDEX IF NOT EXISTS finance_transactions_account_date_idx ON finance_transactions (source, account_id, date DESC)",
-            "CREATE INDEX IF NOT EXISTS finance_holdings_account_idx ON finance_investment_holdings (source, item_id, account_id)",
-            "CREATE INDEX IF NOT EXISTS finance_liabilities_item_idx ON finance_liabilities (source, item_id, liability_type)",
         ):
             try:
                 self._command(sql)
@@ -1043,80 +988,6 @@ class PostgresWarehouse:
             "gmail_sync_state",
             [(account, int(last_history_id), last_sync_type, status, error, updated_at)],
             SYNC_STATE_COLUMNS,
-        )
-
-    def insert_finance_items(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("finance_items", rows, FINANCE_ITEM_COLUMNS)
-
-    def insert_finance_accounts(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("finance_accounts", rows, FINANCE_ACCOUNT_COLUMNS)
-
-    def insert_finance_transactions(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("finance_transactions", rows, FINANCE_TRANSACTION_COLUMNS)
-
-    def insert_finance_investment_holdings(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("finance_investment_holdings", rows, FINANCE_INVESTMENT_HOLDING_COLUMNS)
-
-    def insert_finance_investment_securities(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("finance_investment_securities", rows, FINANCE_INVESTMENT_SECURITY_COLUMNS)
-
-    def insert_finance_investment_transactions(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("finance_investment_transactions", rows, FINANCE_INVESTMENT_TRANSACTION_COLUMNS)
-
-    def insert_finance_liabilities(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("finance_liabilities", rows, FINANCE_LIABILITY_COLUMNS)
-
-    def load_finance_sync_state(self) -> dict[tuple[str, str, str, str], dict[str, Any]]:
-        columns = (
-            "source",
-            "item_name",
-            "item_id",
-            "object_type",
-            "cursor",
-            "start_date",
-            "end_date",
-            "status",
-            "error",
-            "updated_at",
-        )
-        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM finance_sync_state")
-        return {
-            (str(row[0]), str(row[1]), str(row[2]), str(row[3])): dict(zip(columns, row, strict=True))
-            for row in rows
-        }
-
-    def insert_finance_sync_state(
-        self,
-        *,
-        source: str,
-        item_name: str,
-        item_id: str,
-        object_type: str,
-        cursor: str,
-        start_date: str,
-        end_date: str,
-        status: str,
-        error: str,
-        updated_at: datetime,
-    ) -> None:
-        self._insert(
-            "finance_sync_state",
-            [
-                (
-                    source,
-                    item_name,
-                    item_id,
-                    object_type,
-                    cursor,
-                    start_date,
-                    end_date,
-                    status,
-                    error,
-                    updated_at,
-                    int(_ensure_utc(updated_at).timestamp() * 1_000_000),
-                )
-            ],
-            FINANCE_SYNC_STATE_COLUMNS,
         )
 
     def load_slack_sync_state(self) -> dict[tuple[str, str, str, str], dict[str, Any]]:
@@ -1991,104 +1862,6 @@ class PostgresWarehouse:
                 raw_json
             FROM contact_cards
             WHERE is_deleted = 0
-            """
-        )
-
-    def _ensure_clean_finance_views(self) -> None:
-        self._command(
-            """
-            CREATE OR REPLACE VIEW clean_finance_accounts AS
-            SELECT
-                a.source,
-                a.item_name,
-                a.item_id,
-                i.institution_name,
-                a.account_id,
-                a.name,
-                a.official_name,
-                a.mask,
-                a.type,
-                a.subtype,
-                a.current_balance,
-                a.available_balance,
-                a.limit_balance,
-                a.iso_currency_code,
-                a.unofficial_currency_code,
-                a.synced_at
-            FROM finance_accounts AS a
-            LEFT JOIN finance_items AS i
-              ON a.source = i.source
-             AND a.item_id = i.item_id
-            WHERE a.is_deleted = 0
-            """
-        )
-        self._command(
-            """
-            CREATE OR REPLACE VIEW clean_finance_transactions AS
-            SELECT
-                t.source,
-                t.item_name,
-                t.item_id,
-                i.institution_name,
-                t.account_id,
-                a.name AS account_name,
-                t.transaction_id,
-                t.pending_transaction_id,
-                t.date,
-                t.authorized_date,
-                t.name,
-                t.merchant_name,
-                t.amount,
-                t.iso_currency_code,
-                t.personal_finance_category_primary,
-                t.personal_finance_category_detailed,
-                t.payment_channel,
-                t.pending,
-                t.synced_at
-            FROM finance_transactions AS t
-            LEFT JOIN finance_items AS i
-              ON t.source = i.source
-             AND t.item_id = i.item_id
-            LEFT JOIN finance_accounts AS a
-              ON t.source = a.source
-             AND t.item_id = a.item_id
-             AND t.account_id = a.account_id
-            WHERE t.is_removed = 0
-            """
-        )
-        self._command(
-            """
-            CREATE OR REPLACE VIEW clean_finance_holdings AS
-            SELECT
-                h.source,
-                h.item_name,
-                h.item_id,
-                i.institution_name,
-                h.account_id,
-                a.name AS account_name,
-                h.security_id,
-                s.name AS security_name,
-                s.ticker_symbol,
-                s.type AS security_type,
-                h.quantity,
-                h.cost_basis,
-                h.institution_price,
-                h.institution_value,
-                h.iso_currency_code,
-                h.synced_at
-            FROM finance_investment_holdings AS h
-            LEFT JOIN finance_items AS i
-              ON h.source = i.source
-             AND h.item_id = i.item_id
-            LEFT JOIN finance_accounts AS a
-              ON h.source = a.source
-             AND h.item_id = a.item_id
-             AND h.account_id = a.account_id
-            LEFT JOIN finance_investment_securities AS s
-              ON h.source = s.source
-             AND h.item_id = s.item_id
-             AND h.security_id = s.security_id
-            WHERE h.is_deleted = 0
             """
         )
 

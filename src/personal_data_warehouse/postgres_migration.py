@@ -423,7 +423,6 @@ def ensure_all_tables(postgres: PostgresWarehouse) -> None:
     postgres.ensure_contacts_tables()
     postgres.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
     postgres.ensure_slack_tables()
-    postgres.ensure_finance_tables()
 
 
 def truncate_tables(postgres: PostgresWarehouse, tables: tuple[str, ...]) -> None:

@@ -59,14 +59,6 @@ DEFAULT_AGENT_DOCKER_CPUS = "2"
 DEFAULT_AGENT_DOCKER_PIDS_LIMIT = 512
 DEFAULT_AGENT_TOOL_PROXY_BIND_HOST = "0.0.0.0"
 DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST = "host.docker.internal"
-DEFAULT_PLAID_ENVIRONMENT = "sandbox"
-DEFAULT_PLAID_API_VERSION = "2020-09-14"
-DEFAULT_PLAID_CLIENT_NAME = "Personal Data Warehouse"
-DEFAULT_PLAID_PRODUCTS = ("transactions",)
-DEFAULT_PLAID_ADDITIONAL_CONSENTED_PRODUCTS = ("investments", "liabilities")
-DEFAULT_PLAID_COUNTRY_CODES = ("US",)
-DEFAULT_PLAID_REQUEST_TIMEOUT_SECONDS = 60
-DEFAULT_PLAID_INVESTMENTS_LOOKBACK_DAYS = 730
 
 
 def _parse_csv_env(value: str | None) -> tuple[str, ...]:
@@ -133,33 +125,6 @@ class SlackAccount:
     token: str
     team_id: str | None
 
-
-@dataclass(frozen=True)
-class PlaidItem:
-    name: str
-    access_token: str
-    access_token_env: str
-    item_id: str
-    institution_name: str
-
-
-@dataclass(frozen=True)
-class PlaidConfig:
-    client_id: str
-    secret: str
-    environment: str
-    api_version: str
-    client_name: str
-    products: tuple[str, ...]
-    additional_consented_products: tuple[str, ...]
-    optional_products: tuple[str, ...]
-    required_if_supported_products: tuple[str, ...]
-    country_codes: tuple[str, ...]
-    redirect_uri: str | None
-    webhook: str | None
-    items: tuple[PlaidItem, ...]
-    request_timeout_seconds: int = DEFAULT_PLAID_REQUEST_TIMEOUT_SECONDS
-    investments_lookback_days: int = DEFAULT_PLAID_INVESTMENTS_LOOKBACK_DAYS
 
 
 @dataclass(frozen=True)
@@ -277,7 +242,6 @@ class Settings:
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
     postgres_database_url: str | None = None
-    plaid: PlaidConfig | None = None
 
     def account_for_email(self, email_address: str) -> GmailAccount:
         normalized = email_address.strip().lower()
@@ -331,7 +295,6 @@ def load_settings(
     require_alice_voice_recordings: bool = False,
     require_assemblyai: bool = False,
     require_agent: bool = False,
-    require_finance: bool = False,
 ) -> Settings:
     load_dotenv()
 
@@ -507,75 +470,6 @@ def load_settings(
     slack_page_size = int(os.getenv("SLACK_PAGE_SIZE", str(DEFAULT_SLACK_PAGE_SIZE)))
     if slack_page_size < 1 or slack_page_size > 200:
         raise ValueError("SLACK_PAGE_SIZE must be between 1 and 200")
-
-    plaid_client_id = os.getenv("PLAID_CLIENT_ID", "").strip()
-    plaid_secret = os.getenv("PLAID_SECRET", "").strip()
-    plaid_environment = os.getenv("PLAID_ENV", DEFAULT_PLAID_ENVIRONMENT).strip().lower()
-    plaid_item_names = _parse_csv_env(os.getenv("PLAID_ITEMS"))
-    plaid: PlaidConfig | None = None
-    if require_finance or plaid_client_id or plaid_secret or plaid_item_names:
-        if plaid_environment not in {"sandbox", "development", "production"}:
-            raise ValueError("PLAID_ENV must be sandbox, development, or production")
-        if not plaid_client_id:
-            raise ValueError("PLAID_CLIENT_ID must be set for Plaid finance sync")
-        if not plaid_secret:
-            raise ValueError("PLAID_SECRET must be set for Plaid finance sync")
-
-        plaid_request_timeout_seconds = int(
-            os.getenv("PLAID_REQUEST_TIMEOUT_SECONDS", str(DEFAULT_PLAID_REQUEST_TIMEOUT_SECONDS))
-        )
-        if plaid_request_timeout_seconds < 1:
-            raise ValueError("PLAID_REQUEST_TIMEOUT_SECONDS must be at least 1")
-        plaid_investments_lookback_days = int(
-            os.getenv("PLAID_INVESTMENTS_LOOKBACK_DAYS", str(DEFAULT_PLAID_INVESTMENTS_LOOKBACK_DAYS))
-        )
-        if plaid_investments_lookback_days < 1:
-            raise ValueError("PLAID_INVESTMENTS_LOOKBACK_DAYS must be at least 1")
-
-        plaid_items: list[PlaidItem] = []
-        for item_name in plaid_item_names:
-            slug = env_slug(item_name)
-            access_token_env = f"PLAID_{slug}_ACCESS_TOKEN"
-            access_token = os.getenv(access_token_env, "").strip()
-            if require_finance and not access_token:
-                raise ValueError(f"{access_token_env} must be set for Plaid item {item_name}")
-            if access_token:
-                plaid_items.append(
-                    PlaidItem(
-                        name=item_name,
-                        access_token=access_token,
-                        access_token_env=access_token_env,
-                        item_id=os.getenv(f"PLAID_{slug}_ITEM_ID", "").strip(),
-                        institution_name=os.getenv(f"PLAID_{slug}_INSTITUTION_NAME", "").strip(),
-                    )
-                )
-        if require_finance and not plaid_items:
-            raise ValueError("PLAID_ITEMS must include at least one item with an access token")
-
-        plaid = PlaidConfig(
-            client_id=plaid_client_id,
-            secret=plaid_secret,
-            environment=plaid_environment,
-            api_version=os.getenv("PLAID_API_VERSION", DEFAULT_PLAID_API_VERSION).strip(),
-            client_name=os.getenv("PLAID_CLIENT_NAME", DEFAULT_PLAID_CLIENT_NAME).strip()
-            or DEFAULT_PLAID_CLIENT_NAME,
-            products=_parse_csv_env(os.getenv("PLAID_PRODUCTS")) or DEFAULT_PLAID_PRODUCTS,
-            additional_consented_products=_parse_csv_env(
-                os.getenv("PLAID_ADDITIONAL_CONSENTED_PRODUCTS")
-            )
-            or DEFAULT_PLAID_ADDITIONAL_CONSENTED_PRODUCTS,
-            optional_products=_parse_csv_env(os.getenv("PLAID_OPTIONAL_PRODUCTS")),
-            required_if_supported_products=_parse_csv_env(
-                os.getenv("PLAID_REQUIRED_IF_SUPPORTED_PRODUCTS")
-            ),
-            country_codes=_parse_csv_env(os.getenv("PLAID_COUNTRY_CODES"))
-            or DEFAULT_PLAID_COUNTRY_CODES,
-            redirect_uri=(os.getenv("PLAID_REDIRECT_URI") or "").strip() or None,
-            webhook=(os.getenv("PLAID_WEBHOOK") or "").strip() or None,
-            items=tuple(plaid_items),
-            request_timeout_seconds=plaid_request_timeout_seconds,
-            investments_lookback_days=plaid_investments_lookback_days,
-        )
 
     default_voice_memos_account = account_emails[0] if account_emails else ""
     voice_memos_account = os.getenv("VOICE_MEMOS_ACCOUNT", default_voice_memos_account).strip()
@@ -944,7 +838,6 @@ def load_settings(
         assemblyai=assemblyai,
         agent=agent,
         postgres_database_url=postgres_database_url,
-        plaid=plaid,
     )
 
 

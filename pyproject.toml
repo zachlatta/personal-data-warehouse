@@ -30,8 +30,6 @@ personal-data-warehouse-apple-notes-upload = "personal_data_warehouse_apple_note
 personal-data-warehouse-apple-messages-upload = "personal_data_warehouse_apple_messages.cli:main"
 personal-data-warehouse-agent-auth = "personal_data_warehouse.agent_runner:auth_main"
 personal-data-warehouse-postgres-migration = "personal_data_warehouse.postgres_migration:main"
-personal-data-warehouse-finance-sync = "personal_data_warehouse.finance_sync:main"
-personal-data-warehouse-plaid-auth = "personal_data_warehouse.finance_sync:auth_main"
 
 [dependency-groups]
 dev = [

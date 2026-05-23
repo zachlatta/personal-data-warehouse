@@ -21,8 +21,6 @@ Current ingestion path:
 - Apple Messages use the same local Mac object-store path: a LaunchAgent snapshots `chat.db`,
   uploads compressed message batches plus bounded attachment backfill objects to Google Drive,
   and Dagster ingests them into normalized Postgres tables.
-- Finance accounts use Plaid Link for authorization, then sync accounts, transactions,
-  investment holdings/transactions, and liabilities into Postgres.
 
 ## Dependency Management
 
@@ -85,13 +83,6 @@ APPLE_MESSAGES_STORE_PATH=~/Library/Messages/chat.db
 APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN=536870912
 APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN=200
 APPLE_MESSAGES_UPLOAD_WORKERS=4
-PLAID_CLIENT_ID=<plaid-client-id>
-PLAID_SECRET=<plaid-secret>
-PLAID_ENV=sandbox
-PLAID_ITEMS=capital_one,robinhood,mortgage
-PLAID_CAPITAL_ONE_ACCESS_TOKEN=<plaid-access-token>
-PLAID_ROBINHOOD_ACCESS_TOKEN=<plaid-access-token>
-PLAID_MORTGAGE_ACCESS_TOKEN=<plaid-access-token>
 ```
 
 Notes:
@@ -225,49 +216,6 @@ activity, so each scheduled run remains bounded.
 All Slack schedules share a nonblocking Slack lock, so a scheduled tick skips if another Slack
 sync stage is still running.
 Calendar sync runs through `calendar_event_sync_every_minute` with its own nonblocking lock.
-
-## Finance Sync
-
-Finance sync uses Plaid as the first provider. Plaid access tokens stay in `.env`; Postgres stores
-the item/account identifiers, normalized query fields, and raw provider JSON, but not the access
-tokens themselves.
-
-Configure Plaid API credentials:
-
-```bash
-PLAID_CLIENT_ID=...
-PLAID_SECRET=...
-PLAID_ENV=development
-PLAID_PRODUCTS=transactions
-PLAID_ADDITIONAL_CONSENTED_PRODUCTS=investments,liabilities
-```
-
-Authorize each institution login through the local Plaid Link helper:
-
-```bash
-uv run personal-data-warehouse-plaid-auth --item capital_one --products transactions --write-env
-uv run personal-data-warehouse-plaid-auth --item mortgage --products liabilities --additional-consented-products transactions --write-env
-uv run personal-data-warehouse-plaid-auth --item robinhood --products investments --additional-consented-products transactions --write-env
-uv run personal-data-warehouse-plaid-auth --item fidelity --products investments --additional-consented-products transactions --write-env
-```
-
-If a Plaid OAuth institution requires an explicit redirect URI, register it in the Plaid Dashboard
-and pass it with `--redirect-uri` or set `PLAID_REDIRECT_URI`. Desktop web OAuth can often complete
-without a redirect URI, but production OAuth access depends on Plaid account approval and institution
-registration.
-
-Run the sync manually:
-
-```bash
-uv run personal-data-warehouse-finance-sync
-```
-
-Dagster exposes `finance_account_sync` in the `finance` group, scheduled hourly by
-`finance_account_sync_hourly`. The sync records product-specific errors in `finance_sync_state`
-without failing the whole item, so a Capital One transaction sync can still succeed even if
-investment or liability data is unavailable for that item. Fidelity connectivity depends on the
-account and Plaid's current institution support; if Plaid cannot connect it, the warehouse schema is
-ready for a future Akoya, Finicity, or export-file provider.
 
 ## Docker / Coolify
 
@@ -871,14 +819,6 @@ The sync creates and maintains:
 - `apple_message_attachments`: attachment metadata and staged Drive storage pointers
 - `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
-- `finance_items`: Plaid item metadata for each linked institution login, without access tokens
-- `finance_accounts`: latest known account profile and balance fields
-- `finance_transactions`: Plaid transaction sync adds, modifications, and removal tombstones
-- `finance_investment_holdings`: latest known investment positions
-- `finance_investment_securities`: securities referenced by holdings and investment transactions
-- `finance_investment_transactions`: investment transaction history over the configured lookback window
-- `finance_liabilities`: mortgage, credit, and student-loan liability details
-- `finance_sync_state`: per-item/product cursors and last run status
 
 The warehouse also creates clean views for current inbox and transcript state:
 
@@ -886,8 +826,6 @@ The warehouse also creates clean views for current inbox and transcript state:
   `thread_messages_json` carrying full thread context oldest-to-newest
 - `clean_slack_inbox`: Slack DMs, mentions, participating threads, and channel unread items for
   the authenticated Slack user when read state is known
-- `clean_finance_accounts`, `clean_finance_transactions`, and `clean_finance_holdings`: queryable
-  current finance account, transaction, and holding views
 - `clean_calendar_with_transcripts`: calendar events joined to matched Voice Memo transcript enrichments
 - `clean_transcripts_no_calendar_match`: completed Voice Memo transcript enrichments without a calendar match
 
