@@ -97,6 +97,30 @@ Notes:
 - Contacts sync uses `CONTACT_GOOGLE_ACCOUNTS` and intentionally saved Google Contacts only. It does
   not sync Gmail autocomplete/Other Contacts or Workspace directory contacts in v1.
 
+## Mutation Approval UI
+
+The Go MCP server can expose Gmail/contact mutation proposal tools plus a browser review UI for
+pending requests. Set a password before starting it:
+
+```bash
+PDW_MUTATION_UI_PASSWORD=...
+```
+
+Approval URLs returned by MCP tools point at `/mutation-review/requests/<request_id>` and redirect
+to `/mutation-review/login` until you sign in. The UI uses an HttpOnly session cookie plus per-form
+CSRF tokens for approve and deny actions. The old per-action `PDW_MUTATION_REVIEW_PIN` flow is no
+longer used.
+
+Optional UI settings:
+
+```bash
+PDW_MUTATION_UI_SESSION_SECRET=<high-entropy-secret>
+PDW_MUTATION_UI_SESSION_TTL_SECONDS=43200
+```
+
+If `PDW_MUTATION_UI_SESSION_SECRET` is omitted, the process generates an ephemeral signing secret
+at startup, which logs out existing browser sessions on restart.
+
 ## Gmail Auth
 
 Authorize each mailbox once before running the sync:

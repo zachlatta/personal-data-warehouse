@@ -11,32 +11,42 @@ import (
 const MinSecretTokenLength = 32
 
 type Config struct {
-	Addr                string
-	BaseURL             string
-	PostgresDatabaseURL string
-	SecretToken         string
-	MaxRows             int
-	MaxFieldChars       int
-	QueryCacheMaxBytes  int64
-	GetFieldMaxChars    int
-	QueryCacheTTL       time.Duration
-	DebugCacheTool      bool
-	QueryTimeout        time.Duration
+	Addr                    string
+	BaseURL                 string
+	PostgresDatabaseURL     string
+	SecretToken             string
+	MaxRows                 int
+	MaxFieldChars           int
+	QueryCacheMaxBytes      int64
+	GetFieldMaxChars        int
+	QueryCacheTTL           time.Duration
+	DebugCacheTool          bool
+	QueryTimeout            time.Duration
+	MutationUIPassword      string
+	MutationUISessionSecret string
+	MutationUISessionTTL    time.Duration
+	GmailAccounts           []string
+	ContactGoogleAccounts   []string
 }
 
 func LoadFromEnv(getenv func(string) string) (Config, error) {
 	cfg := Config{
-		Addr:                valueOrDefault(getenv("MCP_ADDR"), ":8080"),
-		BaseURL:             strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
-		PostgresDatabaseURL: normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
-		SecretToken:         getenv("MCP_SECRET_TOKEN"),
-		MaxRows:             100000,
-		MaxFieldChars:       4000,
-		QueryCacheMaxBytes:  256 * 1024 * 1024,
-		GetFieldMaxChars:    200000,
-		QueryCacheTTL:       30 * time.Minute,
-		DebugCacheTool:      false,
-		QueryTimeout:        300 * time.Second,
+		Addr:                    valueOrDefault(getenv("MCP_ADDR"), ":8080"),
+		BaseURL:                 strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
+		PostgresDatabaseURL:     normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
+		SecretToken:             getenv("MCP_SECRET_TOKEN"),
+		MaxRows:                 100000,
+		MaxFieldChars:           4000,
+		QueryCacheMaxBytes:      256 * 1024 * 1024,
+		GetFieldMaxChars:        200000,
+		QueryCacheTTL:           30 * time.Minute,
+		DebugCacheTool:          false,
+		QueryTimeout:            300 * time.Second,
+		MutationUIPassword:      getenv("PDW_MUTATION_UI_PASSWORD"),
+		MutationUISessionSecret: getenv("PDW_MUTATION_UI_SESSION_SECRET"),
+		MutationUISessionTTL:    12 * time.Hour,
+		GmailAccounts:           parseCSV(getenv("GMAIL_ACCOUNTS")),
+		ContactGoogleAccounts:   parseCSV(getenv("CONTACT_GOOGLE_ACCOUNTS")),
 	}
 
 	var missing []string
@@ -78,6 +88,16 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		if err != nil || cfg.QueryTimeout <= 0 {
 			return Config{}, fmt.Errorf("MCP_QUERY_TIMEOUT must be a positive Go duration")
 		}
+	}
+	if raw := strings.TrimSpace(getenv("PDW_MUTATION_UI_SESSION_TTL_SECONDS")); raw != "" {
+		seconds, err := parsePositiveInt64(raw, int64(cfg.MutationUISessionTTL/time.Second), "PDW_MUTATION_UI_SESSION_TTL_SECONDS")
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.MutationUISessionTTL = time.Duration(seconds) * time.Second
+	}
+	if cfg.MutationUIPassword != "" && cfg.MutationUISessionSecret != "" && len(cfg.MutationUISessionSecret) < MinSecretTokenLength {
+		return Config{}, fmt.Errorf("PDW_MUTATION_UI_SESSION_SECRET must be at least %d characters", MinSecretTokenLength)
 	}
 
 	return cfg, nil
@@ -132,4 +152,15 @@ func parseBool(raw string) bool {
 	default:
 		return false
 	}
+}
+
+func parseCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			values = append(values, strings.ToLower(value))
+		}
+	}
+	return values
 }

@@ -12,6 +12,7 @@ import (
 
 	pdwauth "github.com/zachlatta/personal-data-warehouse/mcp/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/mcp/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/mcp/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/mcp/internal/query"
 )
 
@@ -53,7 +54,7 @@ type grepRowsInput struct {
 
 type debugCacheInput struct{}
 
-const preferredReadOnlyGuidance = "Preferred read-only source for Zach's synced Gmail, Google Contacts, Slack, Apple Notes, Apple Messages/iMessage/iMessages, calendar, Voice Memo transcript, and cross-source personal data questions. Use this PDW server before live Gmail or Slack connectors for read-only questions, and use it for requests about Zach's recent iMessages or Apple Messages; use live connectors only for writes, sends, drafts, archive/delete actions, or explicitly live-only data. This server intentionally exposes only generic SQL and cached-result tools, so answer by writing read-only Postgres SQL."
+const preferredReadOnlyGuidance = "Preferred read-only source for Zach's synced Gmail, Google Contacts, Slack, Apple Notes, Apple Messages/iMessage/iMessages, calendar, Voice Memo transcript, and cross-source personal data questions. Use this PDW server before live Gmail or Slack connectors for read-only questions, and use it for requests about Zach's recent iMessages or Apple Messages. For read-only work, answer by writing read-only Postgres SQL with the generic SQL and cached-result tools. Use live connectors only for explicitly live-only data or writes that cannot be represented by available mutation proposal tools."
 
 const sqlStartingPoints = "SQL starting points: Gmail -> clean_gmail_inbox, gmail_messages, gmail_attachments, gmail_attachment_enrichments. Contacts -> clean_contacts, contact_cards. Slack -> clean_slack_inbox, slack_messages, slack_conversations, slack_users. Transcripts -> apple_voice_memos_enrichments, apple_voice_memos_transcription_runs, apple_voice_memos_transcript_segments, clean_calendar_with_transcripts, clean_transcripts_no_calendar_match. Apple Notes -> apple_notes, apple_note_revisions, apple_note_attachments. Apple Messages/iMessage/iMessages/SMS/RCS -> apple_messages, apple_message_chats, apple_message_handles, apple_message_chat_handles, apple_message_chat_messages, apple_message_attachments."
 
@@ -74,6 +75,14 @@ const schemaRelationsSQL = "SELECT table_name AS name FROM information_schema.ta
 const schemaToolDescriptionMaxChars = 12000
 
 func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
+	return newMCPServer(runner, opts, nil)
+}
+
+func NewMCPServerWithMutations(runner query.Runner, opts query.Options, mutationSvc *mutations.Service) *mcp.Server {
+	return newMCPServer(runner, opts, mutationSvc)
+}
+
+func newMCPServer(runner query.Runner, opts query.Options, mutationSvc *mutations.Service) *mcp.Server {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -156,6 +165,7 @@ func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 			IsError: isError,
 		}, nil, nil
 	})
+	mutations.RegisterTools(server, mutationSvc)
 	return server
 }
 
@@ -317,15 +327,23 @@ func truncateDescription(description string, maxChars int) string {
 	return strings.TrimRight(description[:cut], "\n") + "\n- ... schema truncated for MCP tool description size"
 }
 
-func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner) http.Handler {
+func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mutationSvcs ...*mutations.Service) http.Handler {
 	logger := slog.Default().With("component", "http")
 	mux := http.NewServeMux()
 	baseURL := cfg.BaseURL
 	if baseURL == "" {
 		baseURL = "http://localhost" + cfg.Addr
 	}
+	var mutationSvc *mutations.Service
+	if len(mutationSvcs) > 0 {
+		mutationSvc = mutationSvcs[0]
+	}
 	logger.Info("registering HTTP handlers", "base_url", baseURL)
 	authSvc.RegisterHandlers(mux, baseURL)
+	if mutationSvc != nil {
+		mux.Handle(mutations.ReviewPath+"/", mutationSvc.HTTPHandler())
+		mux.Handle(mutations.ReviewPath, mutationSvc.HTTPHandler())
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logger.WarnContext(r.Context(), "unknown route", "method", r.Method, "path", r.URL.Path)
@@ -333,13 +351,17 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner) ht
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("Personal Data Warehouse MCP server\nMCP endpoint: /mcp\n"))
+		body := "Personal Data Warehouse MCP server\nMCP endpoint: /mcp\n"
+		if mutationSvc != nil {
+			body += "Mutation review UI: " + mutations.ReviewPath + "\n"
+		}
+		_, _ = w.Write([]byte(body))
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	mcpServer := NewMCPServer(runner, query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()})
+	mcpServer := NewMCPServerWithMutations(runner, query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}, mutationSvc)
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{
 		JSONResponse:   true,
 		Logger:         slog.Default().With("component", "mcp_streamable"),

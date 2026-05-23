@@ -8,6 +8,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/zachlatta/personal-data-warehouse/mcp/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/mcp/internal/query"
 )
 
@@ -21,6 +22,86 @@ func (f fakeRunner) Query(_ context.Context, sql string, maxRows int) (query.Raw
 		result.Rows = result.Rows[:maxRows]
 	}
 	return result, nil
+}
+
+type fakeMutationStore struct {
+	request mutations.Request
+}
+
+func (s fakeMutationStore) CreateRequest(context.Context, mutations.CreateRequestInput) (mutations.Request, error) {
+	return s.request, nil
+}
+
+func (s fakeMutationStore) ListRequests(context.Context, mutations.RequestFilter) ([]mutations.Request, error) {
+	return nil, nil
+}
+
+func (s fakeMutationStore) GetRequest(context.Context, string) (mutations.Request, error) {
+	return mutations.Request{}, mutations.ErrNotFound
+}
+
+func (s fakeMutationStore) ApproveRequest(context.Context, string, string) (mutations.Request, error) {
+	return mutations.Request{}, mutations.ErrNotFound
+}
+
+func (s fakeMutationStore) RejectRequest(context.Context, string, string, string) (mutations.Request, error) {
+	return mutations.Request{}, mutations.ErrNotFound
+}
+
+func TestMCPServerRegistersMutationProposalToolsWhenConfigured(t *testing.T) {
+	runner := fakeRunner{results: map[string]query.RawResult{}}
+	mutationSvc := mutations.NewService(fakeMutationStore{request: mutations.Request{
+		ID:     "req-123",
+		Status: "pending_review",
+		Mutations: []mutations.Mutation{{
+			ID: "mut-123",
+		}},
+	}}, mutations.Config{BaseURL: "https://mcp.example.test"})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	srv := NewMCPServerWithMutations(runner, query.Options{MaxRows: 5, MaxFieldChars: 100}, mutationSvc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = srv.Run(ctx, serverTransport)
+	}()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect failed: %v", err)
+	}
+	defer session.Close()
+
+	tools, err := session.ListTools(ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+	found := map[string]bool{}
+	for _, tool := range tools.Tools {
+		found[tool.Name] = true
+	}
+	for _, name := range []string{"query", "propose_gmail_archive_threads", "propose_gmail_unarchive_threads", "propose_gmail_send_email", "propose_contact_mutations", "propose_mutation_request"} {
+		if !found[name] {
+			t.Fatalf("%s tool not listed: %#v", name, tools.Tools)
+		}
+	}
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "propose_gmail_archive_threads", Arguments: map[string]any{
+		"account":    "zach@example.test",
+		"thread_ids": []string{"thread-1"},
+		"reason":     "clear stale mail",
+	}})
+	if err != nil {
+		t.Fatalf("CallTool failed: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("propose_gmail_archive_threads returned error: %#v", result.Content)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, `"request_id": "req-123"`) || !strings.Contains(text, `"approval_url": "https://mcp.example.test/mutation-review/requests/req-123"`) {
+		t.Fatalf("unexpected mutation proposal response: %q", text)
+	}
 }
 
 func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {

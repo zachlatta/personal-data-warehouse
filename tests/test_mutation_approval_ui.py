@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from http.cookiejar import CookieJar
+import re
 from datetime import UTC, datetime
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 import pytest
 
@@ -285,7 +287,9 @@ def approval_ui(monkeypatch):
             bind_host="127.0.0.1",
             port=0,
             public_base_url=None,
-            review_pin="123456",
+            password="correct horse battery staple",
+            session_secret="test-session-secret",
+            session_ttl_seconds=3600,
         )
     )
     try:
@@ -294,55 +298,91 @@ def approval_ui(monkeypatch):
         server.close()
 
 
-def test_approval_ui_views_removes_thread_and_approves_with_pin(approval_ui) -> None:
+def test_approval_ui_requires_login_and_rejects_bad_password(approval_ui) -> None:
     server, warehouse = approval_ui
 
-    list_page = _get(f"{server.public_base_url}/mutations")
+    login_page = _get(f"{server.public_base_url}/mutations")
+    assert "Sign in" in login_page
+    assert "Archive threads" not in login_page
+
+    with pytest.raises(HTTPError) as bad_password:
+        _post(server.public_base_url, "/login", {"password": "wrong", "next": "/requests"})
+    assert bad_password.value.code == 403
+    assert warehouse.requests["req-1"]["status"] == "pending_review"
+
+    opener = _login(server.public_base_url)
+    list_page = _get(f"{server.public_base_url}/mutations", opener=opener)
     assert "Archive threads" in list_page
 
-    detail = _get(f"{server.public_base_url}/requests/req-1")
+
+def test_approval_ui_views_removes_thread_and_approves_with_session(approval_ui) -> None:
+    server, warehouse = approval_ui
+    opener = _login(server.public_base_url)
+
+    detail = _get(f"{server.public_base_url}/requests/req-1", opener=opener)
     assert "Archive Gmail Threads" in detail
     assert "2 pending" in detail
     assert "thread-1" in detail
     assert "thread-2" in detail
+    assert "PIN" not in detail
+    csrf_token = _csrf_token(detail)
 
-    _post(server.public_base_url, "/requests/req-1/remove-mutation", {"pin": "123456", "mutation_id": "mut-1"})
+    _post(
+        server.public_base_url,
+        "/requests/req-1/remove-mutation",
+        {"csrf_token": csrf_token, "mutation_id": "mut-1"},
+        opener=opener,
+    )
     assert warehouse.mutations["mut-1"]["status"] == "rejected"
 
-    with pytest.raises(HTTPError) as bad_pin:
-        _post(server.public_base_url, "/requests/req-1/approve", {"pin": "000000"})
-    assert bad_pin.value.code == 403
+    with pytest.raises(HTTPError) as bad_csrf:
+        _post(server.public_base_url, "/requests/req-1/approve", {"csrf_token": "wrong"}, opener=opener)
+    assert bad_csrf.value.code == 403
     assert warehouse.requests["req-1"]["status"] == "pending_review"
 
-    _post(server.public_base_url, "/requests/req-1/approve", {"pin": "123456"})
+    _post(server.public_base_url, "/requests/req-1/approve", {"csrf_token": csrf_token}, opener=opener)
     assert warehouse.requests["req-1"]["status"] == "approved"
     assert warehouse.mutations["mut-2"]["status"] == "approved"
 
     with pytest.raises(HTTPError) as after_approval:
-        _post(server.public_base_url, "/requests/req-1/remove-mutation", {"pin": "123456", "mutation_id": "mut-2"})
+        _post(
+            server.public_base_url,
+            "/requests/req-1/remove-mutation",
+            {"csrf_token": csrf_token, "mutation_id": "mut-2"},
+            opener=opener,
+        )
     assert after_approval.value.code == 400
 
 
-def test_approval_ui_rejects_with_pin(approval_ui) -> None:
+def test_approval_ui_rejects_with_session(approval_ui) -> None:
     server, warehouse = approval_ui
+    opener = _login(server.public_base_url)
+    csrf_token = _csrf_token(_get(f"{server.public_base_url}/requests/req-2", opener=opener))
 
-    _post(server.public_base_url, "/requests/req-2/reject", {"pin": "123456", "reason": "too risky"})
+    _post(server.public_base_url, "/requests/req-2/reject", {"csrf_token": csrf_token, "reason": "too risky"}, opener=opener)
 
     assert warehouse.requests["req-2"]["status"] == "rejected"
     assert warehouse.requests["req-2"]["error"] == "too risky"
 
 
-def test_approval_ui_removes_contact_operation_with_pin(approval_ui) -> None:
+def test_approval_ui_removes_contact_operation_with_session(approval_ui) -> None:
     server, warehouse = approval_ui
+    opener = _login(server.public_base_url)
 
-    detail = _get(f"{server.public_base_url}/requests/req-contact")
+    detail = _get(f"{server.public_base_url}/requests/req-contact", opener=opener)
     assert "Contact Changes" in detail
     assert "1 update" in detail
     assert "1 delete" in detail
     assert "people/1" in detail
     assert "people/2" in detail
+    csrf_token = _csrf_token(detail)
 
-    _post(server.public_base_url, "/mutations/mut-contact/remove-operation", {"pin": "123456", "op_index": "1"})
+    _post(
+        server.public_base_url,
+        "/mutations/mut-contact/remove-operation",
+        {"csrf_token": csrf_token, "op_index": "1"},
+        opener=opener,
+    )
 
     assert warehouse.mutations["mut-contact"]["payload_json"]["operations"] == [
         {"op": "update_contact", "resource_name": "people/1"}
@@ -351,18 +391,20 @@ def test_approval_ui_removes_contact_operation_with_pin(approval_ui) -> None:
 
 def test_approval_ui_edits_email_and_approves_as_draft(approval_ui) -> None:
     server, warehouse = approval_ui
+    opener = _login(server.public_base_url)
 
-    detail = _get(f"{server.public_base_url}/requests/req-email")
+    detail = _get(f"{server.public_base_url}/requests/req-email", opener=opener)
     assert "Emails" in detail
     assert "1 send" in detail
     assert "Original body" in detail
     assert "Approve as draft" in detail
+    csrf_token = _csrf_token(detail)
 
     _post(
         server.public_base_url,
         "/mutations/mut-email/approve-email",
         {
-            "pin": "123456",
+            "csrf_token": csrf_token,
             "delivery_mode": "draft",
             "to": "two@example.test",
             "cc": "cc@example.test",
@@ -371,6 +413,7 @@ def test_approval_ui_edits_email_and_approves_as_draft(approval_ui) -> None:
             "body_text": "Edited body",
             "body_html": "",
         },
+        opener=opener,
     )
 
     assert warehouse.mutations["mut-email"]["status"] == "approved"
@@ -379,31 +422,73 @@ def test_approval_ui_edits_email_and_approves_as_draft(approval_ui) -> None:
     assert warehouse.mutations["mut-email"]["payload_json"]["message"]["body_text"] == "Edited body"
 
 
-def test_approval_ui_config_generates_pin_only_when_env_is_absent(monkeypatch, capsys) -> None:
-    monkeypatch.delenv("PDW_MUTATION_REVIEW_PIN", raising=False)
+def test_approval_ui_config_requires_password(monkeypatch) -> None:
+    monkeypatch.delenv("PDW_MUTATION_UI_PASSWORD", raising=False)
+
+    with pytest.raises(ValueError, match="PDW_MUTATION_UI_PASSWORD"):
+        mutation_approval_ui_config_from_env()
+
+
+def test_approval_ui_config_reads_password_session_and_server_settings(monkeypatch) -> None:
+    monkeypatch.setenv("PDW_MUTATION_UI_PASSWORD", "secret password")
+    monkeypatch.setenv("PDW_MUTATION_UI_SESSION_SECRET", "session-secret")
+    monkeypatch.setenv("PDW_MUTATION_UI_SESSION_TTL_SECONDS", "600")
+    monkeypatch.setenv("PDW_MUTATION_UI_PORT", "1234")
+    monkeypatch.setenv("PDW_MUTATION_UI_PUBLIC_BASE_URL", "https://mutations.example.test")
+    monkeypatch.setenv("PDW_MUTATION_UI_BIND_HOST", "0.0.0.0")
+
+    config = mutation_approval_ui_config_from_env()
+
+    assert config.bind_host == "0.0.0.0"
+    assert config.port == 1234
+    assert config.public_base_url == "https://mutations.example.test"
+    assert config.password == "secret password"
+    assert config.session_secret == "session-secret"
+    assert config.session_ttl_seconds == 600
+
+
+def test_approval_ui_config_generates_ephemeral_session_secret(monkeypatch) -> None:
+    monkeypatch.setenv("PDW_MUTATION_UI_PASSWORD", "secret password")
+    monkeypatch.delenv("PDW_MUTATION_UI_SESSION_SECRET", raising=False)
     monkeypatch.delenv("PDW_MUTATION_UI_PORT", raising=False)
     monkeypatch.delenv("PDW_MUTATION_UI_PUBLIC_BASE_URL", raising=False)
     monkeypatch.delenv("PDW_MUTATION_UI_BIND_HOST", raising=False)
+    monkeypatch.delenv("PDW_MUTATION_UI_SESSION_TTL_SECONDS", raising=False)
 
     config = mutation_approval_ui_config_from_env()
 
     assert config.bind_host == "127.0.0.1"
     assert config.port == 0
-    assert len(config.review_pin) == 6
-    assert "PDW mutation approval PIN:" in capsys.readouterr().err
+    assert config.password == "secret password"
+    assert len(config.session_secret) >= 32
+    assert config.session_ttl_seconds == 12 * 60 * 60
 
 
-def _get(url: str) -> str:
-    with urlopen(url, timeout=5) as response:
+def _login(base_url: str, password: str = "correct horse battery staple"):
+    opener = build_opener(HTTPCookieProcessor(CookieJar()))
+    _post(base_url, "/login", {"password": password, "next": "/requests"}, opener=opener)
+    return opener
+
+
+def _csrf_token(html: str) -> str:
+    match = re.search(r'name="csrf_token" value="([^"]+)"', html)
+    assert match is not None
+    return match.group(1)
+
+
+def _get(url: str, *, opener=None) -> str:
+    open_fn = opener.open if opener is not None else urlopen
+    with open_fn(url, timeout=5) as response:
         return response.read().decode("utf-8")
 
 
-def _post(base_url: str, path: str, data: dict[str, str]) -> str:
+def _post(base_url: str, path: str, data: dict[str, str], *, opener=None) -> str:
     request = Request(
         f"{base_url}{path}",
         data=urlencode(data).encode("utf-8"),
         headers={"content-type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urlopen(request, timeout=5) as response:
+    open_fn = opener.open if opener is not None else urlopen
+    with open_fn(request, timeout=5) as response:
         return response.read().decode("utf-8")

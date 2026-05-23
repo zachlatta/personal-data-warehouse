@@ -2,9 +2,8 @@
 
 This is a Go remote MCP server for querying the Postgres warehouse from Claude connectors. It is
 the preferred read-only source for synced Gmail, Slack, Apple Notes, Apple Messages/iMessage,
-calendar,
-Voice Memo transcript, and cross-source personal data questions. It intentionally exposes generic SQL tools instead of
-Gmail-, Slack-, or transcript-specific tools.
+calendar, Voice Memo transcript, and cross-source personal data questions. It exposes generic SQL
+tools for reads, and can optionally expose human-reviewed Gmail/Contacts mutation proposal tools.
 
 ## Environment
 
@@ -27,9 +26,17 @@ MCP_GET_FIELD_MAX_CHARS=200000
 MCP_QUERY_CACHE_TTL=30m
 MCP_DEBUG_CACHE_TOOL=false
 MCP_QUERY_TIMEOUT=300s
+PDW_MUTATION_UI_PASSWORD=...
+PDW_MUTATION_UI_SESSION_SECRET=...
+PDW_MUTATION_UI_SESSION_TTL_SECONDS=43200
 ```
 
 `MCP_SECRET_TOKEN` is the shared setup secret and token signing key. It must be at least 32 characters; use a high-entropy random value. During Claude connector setup, the OAuth page asks for this value. After a successful login, Claude uses bearer tokens issued by the server. Rotating `MCP_SECRET_TOKEN` invalidates existing sessions.
+
+Set `PDW_MUTATION_UI_PASSWORD` to enable the mutation proposal tools and the review UI at
+`/mutation-review`. `PDW_MUTATION_UI_SESSION_SECRET` should be a separate high-entropy value; if it
+is omitted, the process generates an ephemeral signing secret and browser sessions are invalidated
+on restart.
 
 ## Run Locally
 
@@ -76,6 +83,8 @@ Set:
 POSTGRES_DATABASE_URL=...
 MCP_SECRET_TOKEN=...
 MCP_BASE_URL=https://your-public-coolify-domain
+PDW_MUTATION_UI_PASSWORD=...
+PDW_MUTATION_UI_SESSION_SECRET=...
 ```
 
 Do not reuse the root `Dockerfile`; that one runs Dagster.
@@ -83,6 +92,18 @@ Do not reuse the root `Dockerfile`; that one runs Dagster.
 ## Tools
 
 The server exposes cursor-based query tools. `query` executes SQL once, caches the full result in the server process, and returns a `query_id` handle for follow-up calls. Cached results expire after `MCP_QUERY_CACHE_TTL` and are evicted least-recently-used when the process-wide `MCP_QUERY_CACHE_MAX_BYTES` cap is reached. If the server restarts, old `query_id`s are invalid and the caller should re-run `query`.
+
+When mutation review is enabled, the server also exposes:
+
+- `propose_mutation_request`
+- `propose_gmail_archive_threads`
+- `propose_gmail_unarchive_threads`
+- `propose_gmail_send_email`
+- `propose_contact_mutations`
+
+These tools only create rows in the `upstream_mutation_requests` and `upstream_mutations` tables.
+They return an approval URL under `/mutation-review`; the actual Gmail or Contacts write is still
+performed later by the existing approved-mutation worker.
 
 SQL starting points:
 

@@ -18,17 +18,22 @@ func TestLoadFromEnvRequiresPostgresURLAndSecret(t *testing.T) {
 
 func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	env := map[string]string{
-		"POSTGRES_DATABASE_URL":     "postgres://default:secret@example.com/default",
-		"MCP_SECRET_TOKEN":          "0123456789abcdef0123456789abcdef",
-		"MCP_ADDR":                  ":9090",
-		"MCP_BASE_URL":              "https://mcp.example.com/",
-		"MCP_MAX_ROWS":              "7",
-		"MCP_MAX_FIELD_CHARS":       "12",
-		"MCP_QUERY_CACHE_MAX_BYTES": "1048576",
-		"MCP_GET_FIELD_MAX_CHARS":   "345",
-		"MCP_QUERY_CACHE_TTL":       "15m",
-		"MCP_DEBUG_CACHE_TOOL":      "true",
-		"MCP_QUERY_TIMEOUT":         "42s",
+		"POSTGRES_DATABASE_URL":               "postgres://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":                    "0123456789abcdef0123456789abcdef",
+		"MCP_ADDR":                            ":9090",
+		"MCP_BASE_URL":                        "https://mcp.example.com/",
+		"MCP_MAX_ROWS":                        "7",
+		"MCP_MAX_FIELD_CHARS":                 "12",
+		"MCP_QUERY_CACHE_MAX_BYTES":           "1048576",
+		"MCP_GET_FIELD_MAX_CHARS":             "345",
+		"MCP_QUERY_CACHE_TTL":                 "15m",
+		"MCP_DEBUG_CACHE_TOOL":                "true",
+		"MCP_QUERY_TIMEOUT":                   "42s",
+		"PDW_MUTATION_UI_PASSWORD":            "review-password",
+		"PDW_MUTATION_UI_SESSION_SECRET":      "0123456789abcdef0123456789abcdef",
+		"PDW_MUTATION_UI_SESSION_TTL_SECONDS": "7200",
+		"GMAIL_ACCOUNTS":                      "zach@example.test, work@example.test",
+		"CONTACT_GOOGLE_ACCOUNTS":             "contacts@example.test",
 	}
 
 	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
@@ -50,6 +55,15 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.QueryTimeout != 42*time.Second {
 		t.Fatalf("QueryTimeout = %s", cfg.QueryTimeout)
+	}
+	if cfg.MutationUIPassword != "review-password" || cfg.MutationUISessionSecret != "0123456789abcdef0123456789abcdef" || cfg.MutationUISessionTTL != 2*time.Hour {
+		t.Fatalf("mutation UI config = password %q ttl %s secret_len %d", cfg.MutationUIPassword, cfg.MutationUISessionTTL, len(cfg.MutationUISessionSecret))
+	}
+	if strings.Join(cfg.GmailAccounts, ",") != "zach@example.test,work@example.test" {
+		t.Fatalf("GmailAccounts = %#v", cfg.GmailAccounts)
+	}
+	if strings.Join(cfg.ContactGoogleAccounts, ",") != "contacts@example.test" {
+		t.Fatalf("ContactGoogleAccounts = %#v", cfg.ContactGoogleAccounts)
 	}
 	if cfg.PostgresDatabaseURL != "postgresql://default:secret@example.com/default" {
 		t.Fatalf("PostgresDatabaseURL = %q", cfg.PostgresDatabaseURL)

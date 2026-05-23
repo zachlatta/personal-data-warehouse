@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable
 from dataclasses import dataclass
+import hashlib
+import hmac
 from html import escape
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import secrets
-import sys
 import threading
+import time
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.warehouse import warehouse_from_settings
+
+SESSION_COOKIE_NAME = "pdw_mutation_ui_session"
+DEFAULT_SESSION_TTL_SECONDS = 12 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -21,7 +28,9 @@ class MutationApprovalUiConfig:
     bind_host: str
     port: int
     public_base_url: str | None
-    review_pin: str
+    password: str
+    session_secret: str
+    session_ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS
 
 
 class RunningMutationApprovalUi:
@@ -43,15 +52,22 @@ class RunningMutationApprovalUi:
 
 
 def mutation_approval_ui_config_from_env() -> MutationApprovalUiConfig:
-    review_pin = os.getenv("PDW_MUTATION_REVIEW_PIN") or generated_review_pin()
+    password = os.getenv("PDW_MUTATION_UI_PASSWORD")
+    if not password:
+        raise ValueError("PDW_MUTATION_UI_PASSWORD must be set")
     port = int(os.getenv("PDW_MUTATION_UI_PORT", "0"))
     if port < 0 or port > 65535:
         raise ValueError("PDW_MUTATION_UI_PORT must be between 0 and 65535")
+    ttl_seconds = int(os.getenv("PDW_MUTATION_UI_SESSION_TTL_SECONDS", str(DEFAULT_SESSION_TTL_SECONDS)))
+    if ttl_seconds <= 0:
+        raise ValueError("PDW_MUTATION_UI_SESSION_TTL_SECONDS must be positive")
     return MutationApprovalUiConfig(
         bind_host=os.getenv("PDW_MUTATION_UI_BIND_HOST", "127.0.0.1"),
         port=port,
         public_base_url=os.getenv("PDW_MUTATION_UI_PUBLIC_BASE_URL") or None,
-        review_pin=review_pin,
+        password=password,
+        session_secret=os.getenv("PDW_MUTATION_UI_SESSION_SECRET") or secrets.token_urlsafe(48),
+        session_ttl_seconds=ttl_seconds,
     )
 
 
@@ -62,12 +78,6 @@ def start_mutation_approval_ui(config: MutationApprovalUiConfig) -> RunningMutat
     thread.start()
     public_base_url = config.public_base_url or f"http://{config.bind_host}:{server.server_port}"
     return RunningMutationApprovalUi(server=server, thread=thread, public_base_url=public_base_url)
-
-
-def generated_review_pin() -> str:
-    pin = f"{secrets.randbelow(1_000_000):06d}"
-    print(f"PDW mutation approval PIN: {pin}", file=sys.stderr, flush=True)
-    return pin
 
 
 def mutation_approval_handler(config: MutationApprovalUiConfig) -> type[BaseHTTPRequestHandler]:
@@ -83,29 +93,52 @@ def mutation_approval_handler(config: MutationApprovalUiConfig) -> type[BaseHTTP
     class MutationApprovalHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             path = urlparse(self.path).path
+            if path == "/login":
+                session = self._current_session()
+                next_path = safe_next_path(form_value(parse_qs(urlparse(self.path).query), "next") or "/requests")
+                if session is not None:
+                    self._redirect(next_path)
+                    return
+                self._write_html(login_page(next_path))
+                return
+            if path == "/logout":
+                self._redirect("/login", clear_session=True)
+                return
+
+            session = self._require_session()
+            if session is None:
+                return
+            csrf_token = str(session.get("csrf_token") or "")
             if path in {"", "/", "/mutations", "/requests"}:
                 self._write_html(with_warehouse(render_request_list))
                 return
             request_id = request_id_from_path(path)
             if request_id:
-                self._write_html(with_warehouse(lambda warehouse: render_request_detail(warehouse, request_id)))
+                self._write_html(with_warehouse(lambda warehouse: render_request_detail(warehouse, request_id, csrf_token)))
                 return
             mutation_id = mutation_id_from_path(path)
             if mutation_id:
-                self._write_html(with_warehouse(lambda warehouse: render_mutation_detail(warehouse, mutation_id)))
+                self._write_html(with_warehouse(lambda warehouse: render_mutation_detail(warehouse, mutation_id, csrf_token)))
                 return
             self._write_html(page("Not found", "<p>Not found.</p>"), status=404)
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
+            if path == "/login":
+                self._handle_login()
+                return
+
+            session = self._require_session()
+            if session is None:
+                return
             request_id = request_id_from_action_path(path)
             mutation_id = mutation_id_from_action_path(path)
             if not request_id and not mutation_id:
                 self._write_html(page("Not found", "<p>Not found.</p>"), status=404)
                 return
             form = self._read_form()
-            if not secrets.compare_digest(form_value(form, "pin"), config.review_pin):
-                self._write_html(page("Invalid PIN", "<p>Invalid review PIN.</p>"), status=403)
+            if not csrf_token_is_valid(form_value(form, "csrf_token"), session):
+                self._write_html(page("Invalid session", "<p>Your session could not be verified. Please sign in again.</p>"), status=403)
                 return
             try:
                 if request_id and path.endswith("/approve"):
@@ -185,6 +218,47 @@ def mutation_approval_handler(config: MutationApprovalUiConfig) -> type[BaseHTTP
         def log_message(self, _format: str, *_args: Any) -> None:
             return
 
+        def _handle_login(self) -> None:
+            form = self._read_form()
+            next_path = safe_next_path(form_value(form, "next") or "/requests")
+            if not secrets.compare_digest(form_value(form, "password"), config.password):
+                self._write_html(login_page(next_path, error="Incorrect password."), status=403)
+                return
+            token, _session = create_session_token(config)
+            self._redirect(next_path, session_token=token)
+
+        def _current_session(self) -> dict[str, Any] | None:
+            token = session_token_from_cookie(self.headers.get("cookie", ""))
+            if not token:
+                return None
+            return verify_session_token(token, config)
+
+        def _require_session(self) -> dict[str, Any] | None:
+            session = self._current_session()
+            if session is not None:
+                return session
+            if self.command == "GET":
+                self._redirect("/login?" + urlencode({"next": safe_next_path(self.path)}))
+            else:
+                self._write_html(page("Authentication required", "<p>Please sign in before reviewing mutation requests.</p>"), status=403)
+            return None
+
+        def _redirect(
+            self,
+            location: str,
+            *,
+            status: int = 303,
+            session_token: str | None = None,
+            clear_session: bool = False,
+        ) -> None:
+            self.send_response(status)
+            self.send_header("location", location)
+            if session_token is not None:
+                self.send_header("set-cookie", session_cookie_header(session_token, config))
+            if clear_session:
+                self.send_header("set-cookie", clear_session_cookie_header(config))
+            self.end_headers()
+
         def _read_form(self) -> dict[str, list[str]]:
             body = self.rfile.read(int(self.headers.get("content-length", "0") or "0"))
             return parse_qs(body.decode("utf-8"), keep_blank_values=True)
@@ -194,10 +268,126 @@ def mutation_approval_handler(config: MutationApprovalUiConfig) -> type[BaseHTTP
             self.send_response(status)
             self.send_header("content-type", "text/html; charset=utf-8")
             self.send_header("content-length", str(len(encoded)))
+            self.send_header("cache-control", "no-store")
             self.end_headers()
             self.wfile.write(encoded)
 
     return MutationApprovalHandler
+
+
+def create_session_token(config: MutationApprovalUiConfig) -> tuple[str, dict[str, Any]]:
+    now = int(time.time())
+    session = {
+        "iat": now,
+        "exp": now + config.session_ttl_seconds,
+        "csrf_token": secrets.token_urlsafe(32),
+        "nonce": secrets.token_urlsafe(16),
+    }
+    return sign_session_payload(session, config.session_secret), session
+
+
+def sign_session_payload(payload: dict[str, Any], secret: str) -> str:
+    body_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    body = base64_url_encode(body_bytes)
+    signature = hmac.new(secret.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest()
+    return f"{body}.{base64_url_encode(signature)}"
+
+
+def verify_session_token(token: str, config: MutationApprovalUiConfig) -> dict[str, Any] | None:
+    parts = token.split(".")
+    if len(parts) != 2:
+        return None
+    try:
+        signed_body = parts[0].encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    expected_signature = hmac.new(config.session_secret.encode("utf-8"), signed_body, hashlib.sha256).digest()
+    try:
+        actual_signature = base64_url_decode(parts[1])
+        payload_data = base64_url_decode(parts[0])
+    except ValueError:
+        return None
+    if not hmac.compare_digest(actual_signature, expected_signature):
+        return None
+    try:
+        payload = json.loads(payload_data.decode("utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        expires_at = int(payload.get("exp") or 0)
+    except (TypeError, ValueError):
+        return None
+    if expires_at < int(time.time()):
+        return None
+    if not isinstance(payload.get("csrf_token"), str) or not payload["csrf_token"]:
+        return None
+    return payload
+
+
+def csrf_token_is_valid(token: str, session: dict[str, Any]) -> bool:
+    expected = session.get("csrf_token")
+    return isinstance(expected, str) and secrets.compare_digest(token, expected)
+
+
+def session_token_from_cookie(cookie_header: str) -> str:
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header)
+    except Exception:
+        return ""
+    morsel = cookie.get(SESSION_COOKIE_NAME)
+    return morsel.value if morsel is not None else ""
+
+
+def session_cookie_header(token: str, config: MutationApprovalUiConfig) -> str:
+    parts = [
+        f"{SESSION_COOKIE_NAME}={token}",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        f"Max-Age={config.session_ttl_seconds}",
+    ]
+    if secure_cookies(config):
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def clear_session_cookie_header(config: MutationApprovalUiConfig) -> str:
+    parts = [
+        f"{SESSION_COOKIE_NAME}=",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        "Max-Age=0",
+    ]
+    if secure_cookies(config):
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def secure_cookies(config: MutationApprovalUiConfig) -> bool:
+    return bool(config.public_base_url and config.public_base_url.lower().startswith("https://"))
+
+
+def safe_next_path(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc or not value.startswith("/"):
+        return "/requests"
+    return value
+
+
+def base64_url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def base64_url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    try:
+        return base64.urlsafe_b64decode(value + padding)
+    except Exception as exc:
+        raise ValueError("invalid base64") from exc
 
 
 def render_request_list(warehouse) -> str:
@@ -219,7 +409,7 @@ def render_request_list(warehouse) -> str:
     return page("Mutation Requests", table)
 
 
-def render_request_detail(warehouse, request_id: str) -> str:
+def render_request_detail(warehouse, request_id: str, csrf_token: str) -> str:
     request = warehouse.get_upstream_mutation_request(request_id)
     if request is None:
         return page("Request not found", f"<p>No mutation request exists for <code>{escape(request_id)}</code>.</p>")
@@ -229,10 +419,10 @@ def render_request_detail(warehouse, request_id: str) -> str:
     if request["status"] == "pending_review":
         forms = (
             f"<form method=\"post\" action=\"/requests/{escape(request_id)}/approve\">"
-            "<input name=\"pin\" type=\"password\" placeholder=\"PIN\" required>"
+            f"{csrf_input(csrf_token)}"
             "<button type=\"submit\">Approve all remaining</button></form>"
             f"<form method=\"post\" action=\"/requests/{escape(request_id)}/reject\">"
-            "<input name=\"pin\" type=\"password\" placeholder=\"PIN\" required>"
+            f"{csrf_input(csrf_token)}"
             "<input name=\"reason\" type=\"text\" placeholder=\"Reason\">"
             "<button type=\"submit\">Reject request</button></form>"
         )
@@ -245,7 +435,7 @@ def render_request_detail(warehouse, request_id: str) -> str:
           <dt>Revision</dt><dd>{escape(str(request['revision']))}</dd>
         </dl>
         {render_request_overview(mutations)}
-        {render_request_mutation_groups(request, mutations)}
+        {render_request_mutation_groups(request, mutations, csrf_token)}
         <h2>Review</h2>
         <div class="actions">{forms or '<p>No pending review actions.</p>'}</div>
         <h2>Audit</h2>
@@ -270,36 +460,40 @@ def render_request_overview(mutations: list[dict[str, Any]]) -> str:
     )
 
 
-def render_request_mutation_groups(request: dict[str, Any], mutations: list[dict[str, Any]]) -> str:
+def render_request_mutation_groups(request: dict[str, Any], mutations: list[dict[str, Any]], csrf_token: str) -> str:
     valid_mutations = [mutation for mutation in mutations if isinstance(mutation, dict)]
     sections = [
         render_gmail_thread_group(
             request=request,
             mutations=[mutation for mutation in valid_mutations if mutation.get("operation") == "gmail.archive_threads"],
             title="Archive Gmail Threads",
+            csrf_token=csrf_token,
         ),
         render_gmail_thread_group(
             request=request,
             mutations=[mutation for mutation in valid_mutations if mutation.get("operation") == "gmail.unarchive_threads"],
             title="Unarchive Gmail Threads",
+            csrf_token=csrf_token,
         ),
         render_email_group(
             request=request,
             mutations=[mutation for mutation in valid_mutations if mutation.get("operation") == "gmail.send_email"],
+            csrf_token=csrf_token,
         ),
         render_contact_group(
             request=request,
             mutations=[mutation for mutation in valid_mutations if mutation.get("operation") == "contacts.batch_mutation"],
+            csrf_token=csrf_token,
         ),
     ]
     known_operations = {"gmail.archive_threads", "gmail.unarchive_threads", "gmail.send_email", "contacts.batch_mutation"}
     unknown = [mutation for mutation in valid_mutations if mutation.get("operation") not in known_operations]
     if unknown:
-        sections.append(render_unknown_group(request=request, mutations=unknown))
+        sections.append(render_unknown_group(request=request, mutations=unknown, csrf_token=csrf_token))
     return "<h2>Changes</h2>" + "".join(section for section in sections if section)
 
 
-def render_gmail_thread_group(*, request: dict[str, Any], mutations: list[dict[str, Any]], title: str) -> str:
+def render_gmail_thread_group(*, request: dict[str, Any], mutations: list[dict[str, Any]], title: str, csrf_token: str) -> str:
     if not mutations:
         return ""
     status_counts = counts_by(mutations, lambda mutation: str(mutation.get("status") or ""))
@@ -318,7 +512,7 @@ def render_gmail_thread_group(*, request: dict[str, Any], mutations: list[dict[s
                 f"<td>{escape(str(thread.get('latest_from_address') or ''))}</td>"
                 f"<td>{escape(str(thread.get('message_count') or thread.get('inbox_message_count') or ''))}</td>"
                 f"<td>{escape(str(mutation.get('reason') or ''))}</td>"
-                f"<td>{render_request_row_actions(request, mutation)}</td>"
+                f"<td>{render_request_row_actions(request, mutation, csrf_token)}</td>"
                 "</tr>"
             )
     return (
@@ -331,7 +525,7 @@ def render_gmail_thread_group(*, request: dict[str, Any], mutations: list[dict[s
     )
 
 
-def render_email_group(*, request: dict[str, Any], mutations: list[dict[str, Any]]) -> str:
+def render_email_group(*, request: dict[str, Any], mutations: list[dict[str, Any]], csrf_token: str) -> str:
     if not mutations:
         return ""
     mode_counts = counts_by(mutations, email_delivery_mode)
@@ -350,10 +544,10 @@ def render_email_group(*, request: dict[str, Any], mutations: list[dict[str, Any
             f"<td>{escape(str(email.get('mode') or 'new_thread'))}</td>"
             f"<td>{escape(', '.join(str(item) for item in email.get('to', [])))}</td>"
             f"<td>{escape(str(email.get('subject') or ''))}</td>"
-            f"<td>{render_request_row_actions(request, mutation)}</td>"
+            f"<td>{render_request_row_actions(request, mutation, csrf_token)}</td>"
             "</tr>"
         )
-        detail_sections.append(render_email_preview(mutation, allow_edits=True, heading_level=4))
+        detail_sections.append(render_email_preview(mutation, allow_edits=True, heading_level=4, csrf_token=csrf_token))
     return (
         "<section class=\"mutation-group\">"
         "<h3>Emails</h3>"
@@ -365,7 +559,7 @@ def render_email_group(*, request: dict[str, Any], mutations: list[dict[str, Any
     )
 
 
-def render_contact_group(*, request: dict[str, Any], mutations: list[dict[str, Any]]) -> str:
+def render_contact_group(*, request: dict[str, Any], mutations: list[dict[str, Any]], csrf_token: str) -> str:
     if not mutations:
         return ""
     operation_rows = []
@@ -388,7 +582,7 @@ def render_contact_group(*, request: dict[str, Any], mutations: list[dict[str, A
                 f"<td><code>{escape(str(operation.get('resource_name') or ''))}</code></td>"
                 f"<td>{contact_operation_effect(operation)}</td>"
                 f"<td>{escape(str(summary.get('display_name') or summary.get('primary_email') or ''))}</td>"
-                f"<td>{render_contact_row_actions(request, mutation, op_index)}</td>"
+                f"<td>{render_contact_row_actions(request, mutation, op_index, csrf_token)}</td>"
                 "</tr>"
             )
             detail_sections.append(render_contact_operation_detail(operation, op_index=op_index))
@@ -404,7 +598,7 @@ def render_contact_group(*, request: dict[str, Any], mutations: list[dict[str, A
     )
 
 
-def render_unknown_group(*, request: dict[str, Any], mutations: list[dict[str, Any]]) -> str:
+def render_unknown_group(*, request: dict[str, Any], mutations: list[dict[str, Any]], csrf_token: str) -> str:
     rows = []
     for mutation in mutations:
         rows.append(
@@ -413,7 +607,7 @@ def render_unknown_group(*, request: dict[str, Any], mutations: list[dict[str, A
             f"<td>{escape(str(mutation.get('provider') or ''))}</td>"
             f"<td>{escape(str(mutation.get('operation') or ''))}</td>"
             f"<td>{escape(str(mutation.get('title') or ''))}</td>"
-            f"<td>{render_request_row_actions(request, mutation)}</td>"
+            f"<td>{render_request_row_actions(request, mutation, csrf_token)}</td>"
             "</tr>"
         )
     return (
@@ -425,33 +619,33 @@ def render_unknown_group(*, request: dict[str, Any], mutations: list[dict[str, A
     )
 
 
-def render_request_row_actions(request: dict[str, Any], mutation: dict[str, Any]) -> str:
+def render_request_row_actions(request: dict[str, Any], mutation: dict[str, Any], csrf_token: str) -> str:
     mutation_id = str(mutation.get("id") or "")
     parts = [f"<a href=\"/mutations/{escape(mutation_id)}\">Open</a>"]
     if request["status"] == "pending_review" and mutation["status"] == "pending_review":
         parts.append(
             f"<form method=\"post\" action=\"/requests/{escape(str(request['id']))}/remove-mutation\" class=\"inline\">"
             f"<input type=\"hidden\" name=\"mutation_id\" value=\"{escape(mutation_id)}\">"
-            "<input name=\"pin\" type=\"password\" placeholder=\"PIN\" required>"
+            f"{csrf_input(csrf_token)}"
             "<button type=\"submit\">Remove</button></form>"
         )
     return " ".join(parts)
 
 
-def render_contact_row_actions(request: dict[str, Any], mutation: dict[str, Any], op_index: int) -> str:
+def render_contact_row_actions(request: dict[str, Any], mutation: dict[str, Any], op_index: int, csrf_token: str) -> str:
     mutation_id = str(mutation.get("id") or "")
     parts = [f"<a href=\"/mutations/{escape(mutation_id)}\">Open</a>"]
     if request["status"] == "pending_review" and mutation["status"] == "pending_review":
         parts.append(
             f"<form method=\"post\" action=\"/mutations/{escape(mutation_id)}/remove-operation\" class=\"inline\">"
             f"<input type=\"hidden\" name=\"op_index\" value=\"{op_index}\">"
-            "<input name=\"pin\" type=\"password\" placeholder=\"PIN\" required>"
+            f"{csrf_input(csrf_token)}"
             "<button type=\"submit\">Remove</button></form>"
         )
     return " ".join(parts)
 
 
-def render_mutation_detail(warehouse, mutation_id: str) -> str:
+def render_mutation_detail(warehouse, mutation_id: str, csrf_token: str) -> str:
     mutation = warehouse.get_upstream_mutation(mutation_id)
     if mutation is None:
         return page("Mutation not found", f"<p>No mutation exists for <code>{escape(mutation_id)}</code>.</p>")
@@ -470,7 +664,7 @@ def render_mutation_detail(warehouse, mutation_id: str) -> str:
                 "<form method=\"post\" action=\"/mutations/"
                 f"{escape(mutation_id)}/remove-thread\" class=\"inline\">"
                 f"<input type=\"hidden\" name=\"thread_id\" value=\"{escape(thread_id)}\">"
-                "<input name=\"pin\" type=\"password\" placeholder=\"PIN\" required>"
+                f"{csrf_input(csrf_token)}"
                 "<button type=\"submit\">Remove</button></form>"
             )
         thread_rows.append(
@@ -500,7 +694,7 @@ def render_mutation_detail(warehouse, mutation_id: str) -> str:
                 "<form method=\"post\" action=\"/mutations/"
                 f"{escape(mutation_id)}/remove-operation\" class=\"inline\">"
                 f"<input type=\"hidden\" name=\"op_index\" value=\"{op_index}\">"
-                "<input name=\"pin\" type=\"password\" placeholder=\"PIN\" required>"
+                f"{csrf_input(csrf_token)}"
                 "<button type=\"submit\">Remove</button></form>"
             )
         summary = json_object(operation.get("summary"))
@@ -523,15 +717,15 @@ def render_mutation_detail(warehouse, mutation_id: str) -> str:
             f"<tbody>{''.join(operation_rows)}</tbody></table>"
             f"{''.join(operation_detail_sections)}"
         )
-    details += render_email_preview(mutation, allow_edits=True, heading_level=2)
+    details += render_email_preview(mutation, allow_edits=True, heading_level=2, csrf_token=csrf_token)
     forms = ""
     if mutation["status"] == "pending_review":
         forms = (
             f"<form method=\"post\" action=\"/mutations/{escape(mutation_id)}/approve\">"
-            "<input name=\"pin\" type=\"password\" placeholder=\"PIN\" required>"
+            f"{csrf_input(csrf_token)}"
             "<button type=\"submit\">Approve</button></form>"
             f"<form method=\"post\" action=\"/mutations/{escape(mutation_id)}/reject\">"
-            "<input name=\"pin\" type=\"password\" placeholder=\"PIN\" required>"
+            f"{csrf_input(csrf_token)}"
             "<input name=\"reason\" type=\"text\" placeholder=\"Reason\">"
             "<button type=\"submit\">Reject</button></form>"
         )
@@ -555,7 +749,7 @@ def render_mutation_detail(warehouse, mutation_id: str) -> str:
     return page(str(mutation["title"]), body)
 
 
-def render_email_preview(mutation: dict[str, Any], *, allow_edits: bool, heading_level: int) -> str:
+def render_email_preview(mutation: dict[str, Any], *, allow_edits: bool, heading_level: int, csrf_token: str = "") -> str:
     if mutation.get("provider") != "gmail" or mutation.get("operation") != "gmail.send_email":
         return ""
     mutation_id = str(mutation["id"])
@@ -584,7 +778,7 @@ def render_email_preview(mutation: dict[str, Any], *, allow_edits: bool, heading
     return f"""
         <{heading}>Email</{heading}>
         <form method="post" action="{action}">
-          <input name="pin" type="password" placeholder="PIN" required>
+          {csrf_input(csrf_token)}
           <label>Delivery
             <select name="delivery_mode">
               <option value="send"{' selected' if delivery_mode == 'send' else ''}>send</option>
@@ -602,6 +796,35 @@ def render_email_preview(mutation: dict[str, Any], *, allow_edits: bool, heading
           <button type="submit" formaction="{approve_action}" name="approve_delivery_mode" value="send">Approve and send</button>
         </form>
     """
+
+
+def csrf_input(csrf_token: str) -> str:
+    return f"<input type=\"hidden\" name=\"csrf_token\" value=\"{escape(csrf_token)}\">"
+
+
+def login_page(next_path: str, *, error: str = "") -> str:
+    error_html = f"<p class=\"error\">{escape(error)}</p>" if error else ""
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Sign in</title>
+  <style>
+    body {{ font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; color: #111827; background: #f8fafc; }}
+    main {{ width: min(360px, calc(100vw - 32px)); background: white; border: 1px solid #d8dee8; border-radius: 8px; padding: 24px; box-sizing: border-box; }}
+    label {{ display: block; font-weight: 600; margin-bottom: 8px; }}
+    input {{ width: 100%; box-sizing: border-box; font: inherit; padding: 8px 10px; margin: 0 0 12px; }}
+    button {{ font: inherit; border: 1px solid #0f766e; background: #0f766e; color: white; border-radius: 6px; padding: 8px 10px; cursor: pointer; }}
+    .error {{ color: #b91c1c; }}
+  </style>
+</head>
+<body><main><h1>Sign in</h1>{error_html}<form method="post" action="/login">
+  <input type="hidden" name="next" value="{escape(next_path)}">
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+  <button type="submit">Sign in</button>
+</form></main></body>
+</html>"""
 
 
 def page(title: str, body: str) -> str:
@@ -639,7 +862,7 @@ def page(title: str, body: str) -> str:
     dd {{ margin-left: 112px; margin-bottom: 6px; }}
   </style>
 </head>
-<body><main><h1>{escape(title)}</h1>{body}</main></body>
+<body><main><nav><a href="/requests">Requests</a> <a href="/logout">Log out</a></nav><h1>{escape(title)}</h1>{body}</main></body>
 </html>"""
 
 

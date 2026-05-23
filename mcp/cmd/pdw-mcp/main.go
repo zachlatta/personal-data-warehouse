@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
@@ -8,6 +9,7 @@ import (
 
 	pdwauth "github.com/zachlatta/personal-data-warehouse/mcp/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/mcp/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/mcp/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/mcp/internal/query"
 	"github.com/zachlatta/personal-data-warehouse/mcp/internal/server"
 )
@@ -30,8 +32,30 @@ func main() {
 	defer runner.Close()
 
 	authSvc := pdwauth.NewService([]byte(cfg.SecretToken), time.Now)
+	var mutationSvc *mutations.Service
+	if cfg.MutationUIPassword != "" {
+		mutationStore, err := mutations.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+		if err != nil {
+			logger.Error("connect to mutation Postgres store failed", "error", err)
+			os.Exit(1)
+		}
+		defer mutationStore.Close()
+		if err := mutationStore.EnsureTables(context.Background()); err != nil {
+			logger.Error("ensure mutation tables failed", "error", err)
+			os.Exit(1)
+		}
+		mutationSvc = mutations.NewService(mutationStore, mutations.Config{
+			BaseURL:               cfg.BaseURL,
+			UIPassword:            cfg.MutationUIPassword,
+			SessionSecret:         cfg.MutationUISessionSecret,
+			SessionTTL:            cfg.MutationUISessionTTL,
+			GmailAccounts:         cfg.GmailAccounts,
+			ContactGoogleAccounts: cfg.ContactGoogleAccounts,
+		})
+		logger.Info("mutation review UI enabled", "path", mutations.ReviewPath)
+	}
 	logger.Info("personal data warehouse MCP server listening", "addr", cfg.Addr)
-	if err := http.ListenAndServe(cfg.Addr, server.NewMux(cfg, authSvc, runner)); err != nil {
+	if err := http.ListenAndServe(cfg.Addr, server.NewMux(cfg, authSvc, runner, mutationSvc)); err != nil {
 		logger.Error("HTTP server stopped", "error", err)
 		os.Exit(1)
 	}
