@@ -101,9 +101,16 @@ class GmailMutationExecutor:
         message = _mapping(payload.get("message"))
         delivery_mode = _delivery_mode(payload.get("delivery_mode"))
         try:
+            reply_to_thread_id = str(message.get("reply_to_thread_id") or "").strip()
+            if reply_to_thread_id and not str(message.get("in_reply_to") or "").strip():
+                return GmailMutationResult(
+                    status="failed_terminal",
+                    result_json={"delivery_mode": delivery_mode, "thread_id": reply_to_thread_id},
+                    error="reply email is missing In-Reply-To metadata; recreate the mutation after Gmail thread enrichment is available",
+                )
+            message = _message_with_reply_references(message)
             raw = build_email_raw(account=account, message=message)
             gmail_message: dict[str, Any] = {"raw": raw}
-            reply_to_thread_id = str(message.get("reply_to_thread_id") or "").strip()
             if reply_to_thread_id:
                 gmail_message["threadId"] = reply_to_thread_id
 
@@ -237,6 +244,18 @@ def _delivery_mode(value: Any) -> str:
     if mode not in {"send", "draft"}:
         raise ValueError("delivery_mode must be send or draft")
     return mode
+
+
+def _message_with_reply_references(message: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(message)
+    in_reply_to = str(out.get("in_reply_to") or "").strip()
+    if not str(out.get("reply_to_thread_id") or "").strip() or not in_reply_to:
+        return out
+    references = _string_list(out.get("references"))
+    if in_reply_to not in references:
+        references.append(in_reply_to)
+    out["references"] = references
+    return out
 
 
 def _string_list(value: Any) -> list[str]:

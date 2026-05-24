@@ -3,6 +3,7 @@ package mutations
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
@@ -123,6 +124,165 @@ func TestUpdatedGmailEmailPayloadConvertsSendToDraft(t *testing.T) {
 	}
 	if mapFromAny(preview["context"])["source"] != "test" {
 		t.Fatalf("preview context = %#v", preview["context"])
+	}
+}
+
+func TestApplyGmailReplyHeaderRowsPopulatesReplyMetadata(t *testing.T) {
+	mutations := []storedMutation{{
+		Provider:  "gmail",
+		Operation: GmailSendEmailOperation,
+		Account:   "zach@example.test",
+		Payload: map[string]any{
+			"delivery_mode": "draft",
+			"message": map[string]any{
+				"to":                 []string{"sender@example.test"},
+				"subject":            "Re: Existing thread",
+				"body_text":          "Reply body",
+				"reply_to_thread_id": "thread-1",
+			},
+		},
+		Preview: map[string]any{
+			"email": map[string]any{"subject": "Re: Existing thread"},
+		},
+	}}
+
+	got := applyGmailReplyHeaderRows(mutations, []gmailReplyHeaderRow{{
+		Account:          "zach@example.test",
+		ThreadID:         "thread-1",
+		RFC822MessageID:  "<parent@example.test>",
+		ReferencesHeader: "<root@example.test>",
+		InReplyToHeader:  "<previous@example.test>",
+	}})
+
+	message := mapFromAny(got[0].Payload["message"])
+	if message["in_reply_to"] != "<parent@example.test>" {
+		t.Fatalf("in_reply_to = %#v", message["in_reply_to"])
+	}
+	references := stringSliceFromAny(message["references"])
+	if strings.Join(references, " ") != "<root@example.test> <parent@example.test>" {
+		t.Fatalf("references = %#v", references)
+	}
+	previewEmail := mapFromAny(got[0].Preview["email"])
+	if previewEmail["in_reply_to"] != "<parent@example.test>" || previewEmail["mode"] != "reply" {
+		t.Fatalf("preview email = %#v", previewEmail)
+	}
+}
+
+func TestApplyGmailReplyHeaderRowsPopulatesVariantReplyMetadata(t *testing.T) {
+	mutations := []storedMutation{{
+		Provider:  "gmail",
+		Operation: GmailSendEmailOperation,
+		Account:   "zach@example.test",
+		Payload: map[string]any{
+			"delivery_mode":       "send",
+			"selected_variant_id": "variant_2",
+			"message": map[string]any{
+				"to":        []string{"sender@example.test"},
+				"subject":   "Re: Existing thread",
+				"body_text": "Base body",
+			},
+			"variants": []map[string]any{{
+				"id":    "variant_1",
+				"title": "Direct Reply",
+				"message": map[string]any{
+					"to":                 []string{"sender@example.test"},
+					"subject":            "Re: Existing thread",
+					"body_text":          "Direct body",
+					"reply_to_thread_id": "thread-1",
+				},
+			}, {
+				"id":    "variant_2",
+				"title": "Softer Ask",
+				"message": map[string]any{
+					"to":                 []string{"sender@example.test"},
+					"subject":            "Re: Existing thread",
+					"body_text":          "Softer body",
+					"reply_to_thread_id": "thread-1",
+				},
+			}},
+		},
+		Preview: map[string]any{
+			"email": map[string]any{"subject": "Re: Existing thread"},
+		},
+	}}
+
+	got := applyGmailReplyHeaderRows(mutations, []gmailReplyHeaderRow{{
+		Account:          "zach@example.test",
+		ThreadID:         "thread-1",
+		RFC822MessageID:  "<parent@example.test>",
+		ReferencesHeader: "<root@example.test>",
+	}})
+
+	payload := got[0].Payload
+	message := mapFromAny(payload["message"])
+	if message["body_text"] != "Softer body" || message["in_reply_to"] != "<parent@example.test>" {
+		t.Fatalf("selected message = %#v", message)
+	}
+	variants := normalizeStoredEmailVariants(payload["variants"])
+	if len(variants) != 2 {
+		t.Fatalf("variants = %#v", payload["variants"])
+	}
+	for _, variant := range variants {
+		variantMessage := mapFromAny(variant["message"])
+		if variantMessage["in_reply_to"] != "<parent@example.test>" {
+			t.Fatalf("variant message = %#v", variantMessage)
+		}
+	}
+	previewEmail := mapFromAny(got[0].Preview["email"])
+	previewVariants := normalizeStoredEmailVariants(previewEmail["variants"])
+	if len(previewVariants) != 2 || previewEmail["selected_variant_id"] != "variant_2" {
+		t.Fatalf("preview variants = %#v", previewEmail)
+	}
+}
+
+func TestApplyGmailReplyQuoteRowsAddsGmailStyleHistoryAfterSignature(t *testing.T) {
+	mutations := []storedMutation{{
+		Provider:  "gmail",
+		Operation: GmailSendEmailOperation,
+		Account:   "zach@example.test",
+		Payload: map[string]any{
+			"delivery_mode": "send",
+			"message": map[string]any{
+				"to":                 []string{"sender@example.test"},
+				"subject":            "Re: Existing thread",
+				"body_text":          "Reply body\n\n--\nZach",
+				"body_html":          `<div>Reply body</div><div><br></div><div class="gmail_signature"><div>--<br>Zach</div></div>`,
+				"reply_to_thread_id": "thread-1",
+			},
+		},
+		Preview: map[string]any{
+			"email": map[string]any{"subject": "Re: Existing thread"},
+		},
+	}}
+
+	got := applyGmailReplyQuoteRows(mutations, []gmailReplyQuoteRow{{
+		Account:      "zach@example.test",
+		ThreadID:     "thread-1",
+		FromAddress:  "Sender <sender@example.test>",
+		InternalDate: time.Date(2026, 5, 23, 18, 4, 0, 0, time.UTC),
+		BodyHTML:     `<p>Parent body</p>`,
+		BodyText:     "Parent body",
+	}})
+
+	message := mapFromAny(got[0].Payload["message"])
+	bodyHTML := stringFromAny(message["body_html"])
+	signatureIndex := strings.Index(bodyHTML, "gmail_signature")
+	quoteIndex := strings.Index(bodyHTML, "gmail_quote")
+	if signatureIndex < 0 || quoteIndex < 0 || signatureIndex > quoteIndex {
+		t.Fatalf("body_html did not keep signature before quote: %q", bodyHTML)
+	}
+	for _, want := range []string{`class="gmail_quote gmail_quote_container"`, `class="gmail_attr"`, `Sender &lt;sender@example.test&gt; wrote:`, `<blockquote class="gmail_quote"`, "Parent body"} {
+		if !strings.Contains(bodyHTML, want) {
+			t.Fatalf("body_html missing %q: %q", want, bodyHTML)
+		}
+	}
+	bodyText := stringFromAny(message["body_text"])
+	if !strings.Contains(bodyText, "--\nZach\n\nOn Sat, May 23, 2026 at 6:04 PM, Sender <sender@example.test> wrote:\n> Parent body") {
+		t.Fatalf("body_text = %q", bodyText)
+	}
+	previewEmail := mapFromAny(got[0].Preview["email"])
+	if !strings.Contains(stringFromAny(previewEmail["body_html"]), "gmail_quote") {
+		t.Fatalf("preview email = %#v", previewEmail)
 	}
 }
 
@@ -297,6 +457,31 @@ func TestAppendGmailSignatureToMessageAddsHTMLAndText(t *testing.T) {
 	}
 	bodyText := stringFromAny(out["body_text"])
 	if !strings.Contains(bodyText, "Hello there.\n\n--\nZach Latta") {
+		t.Fatalf("body_text = %q", bodyText)
+	}
+}
+
+func TestAppendGmailSignatureToMessageReplacesPlainTextSignatureForHTML(t *testing.T) {
+	message := map[string]any{
+		"to":        []string{"zach@example.test"},
+		"subject":   "Hello",
+		"body_text": "Hello there.\n\n--\nZach Latta\nFounder",
+		"body_html": "",
+	}
+	signature := gmailSignature{
+		HTML: `<div class="gmail_signature"><div>--<br><a href="https://hackclub.com">Hack Club</a></div></div>`,
+		Text: "--\nZach Latta\nHack Club",
+	}
+
+	out := appendGmailSignatureToMessage(message, signature)
+	bodyHTML := stringFromAny(out["body_html"])
+	if !strings.Contains(bodyHTML, "<div>Hello there.</div><div><br></div>") || !strings.Contains(bodyHTML, `class="gmail_signature"`) {
+		t.Fatalf("body_html = %q", bodyHTML)
+	}
+	if strings.Contains(bodyHTML, "Founder") {
+		t.Fatalf("plain text signature leaked into HTML body: %q", bodyHTML)
+	}
+	if bodyText := stringFromAny(out["body_text"]); bodyText != "Hello there.\n\n--\nZach Latta\nFounder" {
 		t.Fatalf("body_text = %q", bodyText)
 	}
 }

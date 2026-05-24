@@ -36,6 +36,24 @@ type gmailSignature struct {
 	Text string
 }
 
+type gmailReplyHeaderRow struct {
+	Account          string
+	ThreadID         string
+	RFC822MessageID  string
+	ReferencesHeader string
+	InReplyToHeader  string
+}
+
+type gmailReplyQuoteRow struct {
+	Account         string
+	ThreadID        string
+	FromAddress     string
+	InternalDate    time.Time
+	BodyHTML        string
+	BodyText        string
+	RFC822MessageID string
+}
+
 func NewPostgresStore(databaseURL string, timeout time.Duration) (*PostgresStore, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -81,7 +99,9 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if err != nil {
 		return Request{}, err
 	}
+	normalized = s.enrichGmailEmailReplyHeaders(ctx, normalized)
 	normalized = s.enrichGmailEmailSignatures(ctx, normalized)
+	normalized = s.enrichGmailEmailReplyQuotes(ctx, normalized)
 	idempotencyKey, err := requestIdempotencyKey(input, normalized)
 	if err != nil {
 		return Request{}, err
@@ -274,6 +294,25 @@ func (s *PostgresStore) UpdateGmailEmailMutation(ctx context.Context, requestID 
 	payload, preview, title, err := updatedGmailEmailPayload(mutation, input)
 	if err != nil {
 		return Mutation{}, err
+	}
+	enriched := s.enrichGmailEmailReplyHeaders(ctx, []storedMutation{{
+		Provider:  mutation.Provider,
+		Operation: mutation.Operation,
+		Account:   mutation.Account,
+		Title:     title,
+		Reason:    mutation.Reason,
+		Payload:   payload,
+		Preview:   preview,
+	}})
+	if len(enriched) == 1 {
+		payload = enriched[0].Payload
+		preview = enriched[0].Preview
+	}
+	enriched = s.enrichGmailEmailSignatures(ctx, enriched)
+	enriched = s.enrichGmailEmailReplyQuotes(ctx, enriched)
+	if len(enriched) == 1 {
+		payload = enriched[0].Payload
+		preview = enriched[0].Preview
 	}
 	now := time.Now().UTC()
 	if _, err := tx.ExecContext(ctx, `
@@ -591,6 +630,400 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 	return applyGmailThreadPreviewRows(mutations, previewRows), nil
 }
 
+func (s *PostgresStore) enrichGmailEmailReplyHeaders(ctx context.Context, mutations []storedMutation) []storedMutation {
+	if s == nil || s.db == nil {
+		return mutations
+	}
+	targets := gmailReplyHeaderTargets(mutations)
+	if len(targets) == 0 {
+		return mutations
+	}
+	args := make([]any, 0, len(targets)*2)
+	values := make([]string, 0, len(targets))
+	for _, target := range targets {
+		args = append(args, target.Account, target.ThreadID)
+		values = append(values, fmt.Sprintf("($%d, $%d)", len(args)-1, len(args)))
+	}
+
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		WITH wanted(account, thread_id) AS (
+			VALUES %s
+		),
+		ranked AS (
+			SELECT
+				message.account,
+				message.thread_id,
+				message.rfc822_message_id,
+				COALESCE((
+					SELECT header ->> 'value'
+					FROM jsonb_array_elements(COALESCE(message.payload_json::jsonb #> '{payload,headers}', '[]'::jsonb)) AS header
+					WHERE lower(header ->> 'name') = 'references'
+					LIMIT 1
+				), '') AS references_header,
+				COALESCE((
+					SELECT header ->> 'value'
+					FROM jsonb_array_elements(COALESCE(message.payload_json::jsonb #> '{payload,headers}', '[]'::jsonb)) AS header
+					WHERE lower(header ->> 'name') = 'in-reply-to'
+					LIMIT 1
+				), '') AS in_reply_to_header,
+				row_number() OVER (
+					PARTITION BY message.account, message.thread_id
+					ORDER BY message.internal_date DESC, message.message_id DESC
+				) AS row_number
+			FROM gmail_messages AS message
+			JOIN wanted ON wanted.account = message.account AND wanted.thread_id = message.thread_id
+			WHERE message.is_deleted = 0
+			  AND COALESCE(message.rfc822_message_id, '') != ''
+			  AND NOT ('TRASH' = ANY(message.label_ids))
+			  AND NOT ('SPAM' = ANY(message.label_ids))
+			  AND NOT ('DRAFT' = ANY(message.label_ids))
+		)
+		SELECT account, thread_id, rfc822_message_id, references_header, in_reply_to_header
+		FROM ranked
+		WHERE row_number = 1
+	`, strings.Join(values, ", ")), args...)
+	if err != nil {
+		return mutations
+	}
+	defer rows.Close()
+
+	headerRows := []gmailReplyHeaderRow{}
+	for rows.Next() {
+		var row gmailReplyHeaderRow
+		if err := rows.Scan(&row.Account, &row.ThreadID, &row.RFC822MessageID, &row.ReferencesHeader, &row.InReplyToHeader); err != nil {
+			return mutations
+		}
+		headerRows = append(headerRows, row)
+	}
+	if err := rows.Err(); err != nil {
+		return mutations
+	}
+	return applyGmailReplyHeaderRows(mutations, headerRows)
+}
+
+func gmailReplyHeaderTargets(mutations []storedMutation) []gmailThreadPreviewKey {
+	targets := []gmailThreadPreviewKey{}
+	seen := map[gmailThreadPreviewKey]bool{}
+	for _, mutation := range mutations {
+		if mutation.Provider != "gmail" || mutation.Operation != GmailSendEmailOperation {
+			continue
+		}
+		account := normalizeAccount(mutation.Account)
+		if account == "" {
+			continue
+		}
+		payload := mapFromAny(mutation.Payload)
+		messages := []map[string]any{mapFromAny(payload["message"])}
+		for _, variant := range normalizeStoredEmailVariants(payload["variants"]) {
+			messages = append(messages, mapFromAny(variant["message"]))
+		}
+		for _, message := range messages {
+			if !gmailMessageNeedsReplyHeaders(message) {
+				continue
+			}
+			key := gmailThreadPreviewKey{Account: account, ThreadID: strings.TrimSpace(stringFromAny(message["reply_to_thread_id"]))}
+			if key.ThreadID == "" || seen[key] {
+				continue
+			}
+			targets = append(targets, key)
+			seen[key] = true
+		}
+	}
+	return targets
+}
+
+func applyGmailReplyHeaderRows(mutations []storedMutation, rows []gmailReplyHeaderRow) []storedMutation {
+	if len(mutations) == 0 || len(rows) == 0 {
+		return mutations
+	}
+	rowsByThread := map[gmailThreadPreviewKey]gmailReplyHeaderRow{}
+	for _, row := range rows {
+		key := gmailThreadPreviewKey{Account: normalizeAccount(row.Account), ThreadID: strings.TrimSpace(row.ThreadID)}
+		if key.Account == "" || key.ThreadID == "" || strings.TrimSpace(row.RFC822MessageID) == "" {
+			continue
+		}
+		rowsByThread[key] = row
+	}
+	if len(rowsByThread) == 0 {
+		return mutations
+	}
+
+	out := make([]storedMutation, len(mutations))
+	copy(out, mutations)
+	for index := range out {
+		mutation := &out[index]
+		if mutation.Provider != "gmail" || mutation.Operation != GmailSendEmailOperation {
+			continue
+		}
+		account := normalizeAccount(mutation.Account)
+		payload := cloneMap(mutation.Payload)
+		message := mapFromAny(payload["message"])
+		variants := normalizeStoredEmailVariants(payload["variants"])
+		selectedVariantID := strings.TrimSpace(stringFromAny(payload["selected_variant_id"]))
+		changed := false
+
+		if len(variants) > 0 {
+			if selectedVariantID == "" {
+				selectedVariantID = stringFromAny(variants[0]["id"])
+				payload["selected_variant_id"] = selectedVariantID
+				changed = true
+			}
+			for variantIndex, variant := range variants {
+				variantMessage := mapFromAny(variant["message"])
+				row := rowsByThread[gmailThreadPreviewKey{Account: account, ThreadID: strings.TrimSpace(stringFromAny(variantMessage["reply_to_thread_id"]))}]
+				if enriched, ok := gmailMessageWithReplyHeaders(variantMessage, row); ok {
+					variants[variantIndex]["message"] = enriched
+					variantMessage = enriched
+					changed = true
+				}
+				if stringFromAny(variant["id"]) == selectedVariantID {
+					message = variantMessage
+				}
+			}
+			payload["variants"] = variants
+		} else {
+			row := rowsByThread[gmailThreadPreviewKey{Account: account, ThreadID: strings.TrimSpace(stringFromAny(message["reply_to_thread_id"]))}]
+			if enriched, ok := gmailMessageWithReplyHeaders(message, row); ok {
+				message = enriched
+				changed = true
+			}
+		}
+		if !changed {
+			continue
+		}
+		payload["message"] = message
+		mutation.Payload = payload
+		syncGmailEmailPreviewFromPayload(mutation, message, variants)
+	}
+	return out
+}
+
+func gmailMessageNeedsReplyHeaders(message map[string]any) bool {
+	if strings.TrimSpace(stringFromAny(message["reply_to_thread_id"])) == "" {
+		return false
+	}
+	return strings.TrimSpace(stringFromAny(message["in_reply_to"])) == "" || len(stringSliceFromAny(message["references"])) == 0
+}
+
+func gmailMessageWithReplyHeaders(message map[string]any, row gmailReplyHeaderRow) (map[string]any, bool) {
+	if strings.TrimSpace(stringFromAny(message["reply_to_thread_id"])) == "" || strings.TrimSpace(row.RFC822MessageID) == "" {
+		return message, false
+	}
+	out := cloneMap(message)
+	changed := false
+	parentMessageID := strings.TrimSpace(row.RFC822MessageID)
+	if strings.TrimSpace(stringFromAny(out["in_reply_to"])) == "" {
+		out["in_reply_to"] = parentMessageID
+		changed = true
+	}
+	references := stringSliceFromAny(out["references"])
+	existingReferenceCount := len(references)
+	if len(references) == 0 {
+		references = splitMessageIDHeader(row.ReferencesHeader)
+		if len(references) == 0 {
+			references = splitMessageIDHeader(row.InReplyToHeader)
+		}
+	}
+	references, refsChanged := appendUniqueMessageID(references, parentMessageID)
+	if refsChanged || existingReferenceCount == 0 {
+		out["references"] = references
+		changed = true
+	}
+	return out, changed
+}
+
+func splitMessageIDHeader(value string) []string {
+	return normalizeStringSlice(strings.Fields(value))
+}
+
+func appendUniqueMessageID(values []string, value string) ([]string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" || containsString(values, value) {
+		return values, false
+	}
+	return append(values, value), true
+}
+
+func (s *PostgresStore) enrichGmailEmailReplyQuotes(ctx context.Context, mutations []storedMutation) []storedMutation {
+	if s == nil || s.db == nil {
+		return mutations
+	}
+	targets := gmailReplyQuoteTargets(mutations)
+	if len(targets) == 0 {
+		return mutations
+	}
+	args := make([]any, 0, len(targets)*2)
+	values := make([]string, 0, len(targets))
+	for _, target := range targets {
+		args = append(args, target.Account, target.ThreadID)
+		values = append(values, fmt.Sprintf("($%d, $%d)", len(args)-1, len(args)))
+	}
+
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		WITH wanted(account, thread_id) AS (
+			VALUES %s
+		),
+		ranked AS (
+			SELECT
+				message.account,
+				message.thread_id,
+				message.from_address,
+				message.internal_date,
+				COALESCE(message.body_html, '') AS body_html,
+				COALESCE(message.body_text, '') AS body_text,
+				message.rfc822_message_id,
+				row_number() OVER (
+					PARTITION BY message.account, message.thread_id
+					ORDER BY message.internal_date DESC, message.message_id DESC
+				) AS row_number
+			FROM gmail_messages AS message
+			JOIN wanted ON wanted.account = message.account AND wanted.thread_id = message.thread_id
+			WHERE message.is_deleted = 0
+			  AND NOT ('TRASH' = ANY(message.label_ids))
+			  AND NOT ('SPAM' = ANY(message.label_ids))
+			  AND NOT ('DRAFT' = ANY(message.label_ids))
+		)
+		SELECT account, thread_id, from_address, internal_date, body_html, body_text, rfc822_message_id
+		FROM ranked
+		WHERE row_number = 1
+	`, strings.Join(values, ", ")), args...)
+	if err != nil {
+		return mutations
+	}
+	defer rows.Close()
+
+	quoteRows := []gmailReplyQuoteRow{}
+	for rows.Next() {
+		var row gmailReplyQuoteRow
+		if err := rows.Scan(&row.Account, &row.ThreadID, &row.FromAddress, &row.InternalDate, &row.BodyHTML, &row.BodyText, &row.RFC822MessageID); err != nil {
+			return mutations
+		}
+		quoteRows = append(quoteRows, row)
+	}
+	if err := rows.Err(); err != nil {
+		return mutations
+	}
+	return applyGmailReplyQuoteRows(mutations, quoteRows)
+}
+
+func gmailReplyQuoteTargets(mutations []storedMutation) []gmailThreadPreviewKey {
+	targets := []gmailThreadPreviewKey{}
+	seen := map[gmailThreadPreviewKey]bool{}
+	for _, mutation := range mutations {
+		if mutation.Provider != "gmail" || mutation.Operation != GmailSendEmailOperation {
+			continue
+		}
+		account := normalizeAccount(mutation.Account)
+		if account == "" {
+			continue
+		}
+		payload := mapFromAny(mutation.Payload)
+		messages := []map[string]any{mapFromAny(payload["message"])}
+		for _, variant := range normalizeStoredEmailVariants(payload["variants"]) {
+			messages = append(messages, mapFromAny(variant["message"]))
+		}
+		for _, message := range messages {
+			threadID := strings.TrimSpace(stringFromAny(message["reply_to_thread_id"]))
+			if threadID == "" || gmailEmailHasReplyQuote(message) {
+				continue
+			}
+			key := gmailThreadPreviewKey{Account: account, ThreadID: threadID}
+			if seen[key] {
+				continue
+			}
+			targets = append(targets, key)
+			seen[key] = true
+		}
+	}
+	return targets
+}
+
+func applyGmailReplyQuoteRows(mutations []storedMutation, rows []gmailReplyQuoteRow) []storedMutation {
+	if len(mutations) == 0 || len(rows) == 0 {
+		return mutations
+	}
+	rowsByThread := map[gmailThreadPreviewKey]gmailReplyQuoteRow{}
+	for _, row := range rows {
+		key := gmailThreadPreviewKey{Account: normalizeAccount(row.Account), ThreadID: strings.TrimSpace(row.ThreadID)}
+		if key.Account == "" || key.ThreadID == "" {
+			continue
+		}
+		rowsByThread[key] = row
+	}
+	if len(rowsByThread) == 0 {
+		return mutations
+	}
+
+	out := make([]storedMutation, len(mutations))
+	copy(out, mutations)
+	for index := range out {
+		mutation := &out[index]
+		if mutation.Provider != "gmail" || mutation.Operation != GmailSendEmailOperation {
+			continue
+		}
+		account := normalizeAccount(mutation.Account)
+		payload := cloneMap(mutation.Payload)
+		message := mapFromAny(payload["message"])
+		variants := normalizeStoredEmailVariants(payload["variants"])
+		selectedVariantID := strings.TrimSpace(stringFromAny(payload["selected_variant_id"]))
+		changed := false
+
+		if len(variants) > 0 {
+			if selectedVariantID == "" {
+				selectedVariantID = stringFromAny(variants[0]["id"])
+				payload["selected_variant_id"] = selectedVariantID
+				changed = true
+			}
+			for variantIndex, variant := range variants {
+				variantMessage := mapFromAny(variant["message"])
+				row := rowsByThread[gmailThreadPreviewKey{Account: account, ThreadID: strings.TrimSpace(stringFromAny(variantMessage["reply_to_thread_id"]))}]
+				if enriched, ok := gmailMessageWithReplyQuote(variantMessage, row); ok {
+					variants[variantIndex]["message"] = enriched
+					variantMessage = enriched
+					changed = true
+				}
+				if stringFromAny(variant["id"]) == selectedVariantID {
+					message = variantMessage
+				}
+			}
+			payload["variants"] = variants
+		} else {
+			row := rowsByThread[gmailThreadPreviewKey{Account: account, ThreadID: strings.TrimSpace(stringFromAny(message["reply_to_thread_id"]))}]
+			if enriched, ok := gmailMessageWithReplyQuote(message, row); ok {
+				message = enriched
+				changed = true
+			}
+		}
+		if !changed {
+			continue
+		}
+		payload["message"] = message
+		mutation.Payload = payload
+		syncGmailEmailPreviewFromPayload(mutation, message, variants)
+	}
+	return out
+}
+
+func syncGmailEmailPreviewFromPayload(mutation *storedMutation, message map[string]any, variants []map[string]any) {
+	if mutation == nil {
+		return
+	}
+	if mutation.Preview == nil {
+		mutation.Preview = map[string]any{}
+	}
+	previewEmail := mapFromAny(mutation.Preview["email"])
+	for key, value := range message {
+		previewEmail[key] = value
+	}
+	previewEmail["delivery_mode"] = mutation.Payload["delivery_mode"]
+	previewEmail["mode"] = emailPreviewMode(message)
+	if len(variants) > 0 {
+		previewEmail["variants"] = variants
+		previewEmail["selected_variant_id"] = mutation.Payload["selected_variant_id"]
+	}
+	mutation.Preview["email"] = previewEmail
+}
+
 func (s *PostgresStore) enrichGmailEmailSignatures(ctx context.Context, mutations []storedMutation) []storedMutation {
 	if s == nil || s.db == nil {
 		return mutations
@@ -602,7 +1035,7 @@ func (s *PostgresStore) enrichGmailEmailSignatures(ctx context.Context, mutation
 			continue
 		}
 		message := mapFromAny(mutation.Payload["message"])
-		if gmailEmailHasSignature(message) {
+		if gmailEmailHasHTMLSignature(message) {
 			continue
 		}
 		account := normalizeAccount(mutation.Account)
@@ -625,7 +1058,7 @@ func (s *PostgresStore) enrichGmailEmailSignatures(ctx context.Context, mutation
 		if len(variants) > 0 {
 			for variantIndex, variant := range variants {
 				variantMessage := mapFromAny(variant["message"])
-				if !gmailEmailHasSignature(variantMessage) {
+				if !gmailEmailHasHTMLSignature(variantMessage) {
 					variantMessage = appendGmailSignatureToMessage(variantMessage, signature)
 				}
 				variants[variantIndex]["message"] = variantMessage
@@ -1055,11 +1488,18 @@ func (signature gmailSignature) Empty() bool {
 }
 
 func gmailEmailHasSignature(message map[string]any) bool {
+	return gmailEmailHasHTMLSignature(message) || gmailEmailHasTextSignature(message)
+}
+
+func gmailEmailHasHTMLSignature(message map[string]any) bool {
 	bodyHTML := strings.ToLower(stringFromAny(message["body_html"]))
-	bodyText := strings.ReplaceAll(stringFromAny(message["body_text"]), "\r\n", "\n")
 	return strings.Contains(bodyHTML, "gmail_signature") ||
-		strings.Contains(bodyHTML, "zach@hackclub.com") && strings.Contains(bodyHTML, "hackclub.com/donate") ||
-		strings.Contains(bodyText, "\n--\n") ||
+		strings.Contains(bodyHTML, "zach@hackclub.com") && strings.Contains(bodyHTML, "hackclub.com/donate")
+}
+
+func gmailEmailHasTextSignature(message map[string]any) bool {
+	bodyText := strings.ReplaceAll(stringFromAny(message["body_text"]), "\r\n", "\n")
+	return strings.Contains(bodyText, "\n--\n") ||
 		strings.HasPrefix(strings.TrimSpace(bodyText), "--\n")
 }
 
@@ -1067,21 +1507,129 @@ func appendGmailSignatureToMessage(message map[string]any, signature gmailSignat
 	out := cloneMap(message)
 	bodyText := stringFromAny(out["body_text"])
 	bodyHTML := strings.TrimSpace(stringFromAny(out["body_html"]))
+	bodyTextWithoutSignature := bodyText
+	if body, _, ok := splitEmailTextAndSignature(bodyText); ok {
+		bodyTextWithoutSignature = body
+	}
 	signatureHTML := strings.TrimSpace(signature.HTML)
 	signatureText := strings.TrimSpace(signature.Text)
 	if signatureText == "" && signatureHTML != "" {
 		signatureText = htmlFragmentText(signatureHTML)
 	}
 	if bodyHTML == "" && signatureHTML != "" {
-		bodyHTML = emailPlainTextToHTML(bodyText)
+		bodyHTML = emailPlainTextToHTML(bodyTextWithoutSignature)
 	}
-	if signatureHTML != "" {
+	if signatureHTML != "" && !gmailEmailHasHTMLSignature(out) {
 		out["body_html"] = joinEmailHTML(bodyHTML, signatureHTML)
 	}
-	if signatureText != "" {
+	if signatureText != "" && !gmailEmailHasTextSignature(out) {
 		out["body_text"] = joinEmailText(bodyText, signatureText)
 	}
 	return out
+}
+
+func gmailEmailHasReplyQuote(message map[string]any) bool {
+	bodyHTML := strings.ToLower(stringFromAny(message["body_html"]))
+	if strings.Contains(bodyHTML, "gmail_quote") {
+		return true
+	}
+	bodyText := strings.ReplaceAll(stringFromAny(message["body_text"]), "\r\n", "\n")
+	return strings.Contains(bodyText, "\nOn ") && strings.Contains(bodyText, " wrote:")
+}
+
+func gmailMessageWithReplyQuote(message map[string]any, row gmailReplyQuoteRow) (map[string]any, bool) {
+	if strings.TrimSpace(stringFromAny(message["reply_to_thread_id"])) == "" || strings.TrimSpace(row.ThreadID) == "" || gmailEmailHasReplyQuote(message) {
+		return message, false
+	}
+	quoteHTML := gmailReplyQuoteHTML(row)
+	quoteText := gmailReplyQuoteText(row)
+	if quoteHTML == "" && quoteText == "" {
+		return message, false
+	}
+	out := cloneMap(message)
+	bodyText := stringFromAny(out["body_text"])
+	bodyHTML := strings.TrimSpace(stringFromAny(out["body_html"]))
+	if bodyHTML == "" && bodyText != "" {
+		bodyHTML = emailPlainTextToHTML(bodyText)
+	}
+	if quoteHTML != "" {
+		out["body_html"] = joinEmailHTML(bodyHTML, quoteHTML)
+	}
+	if quoteText != "" {
+		out["body_text"] = joinEmailText(bodyText, quoteText)
+	}
+	return out, true
+}
+
+func gmailReplyQuoteHTML(row gmailReplyQuoteRow) string {
+	bodyHTML := strings.TrimSpace(htmlBodyFragment(row.BodyHTML))
+	if bodyHTML == "" {
+		bodyHTML = emailPlainTextToHTML(row.BodyText)
+	}
+	if strings.TrimSpace(htmlFragmentText(bodyHTML)) == "" && !strings.Contains(strings.ToLower(bodyHTML), "<img") {
+		return ""
+	}
+	return `<div class="gmail_quote gmail_quote_container"><div dir="ltr" class="gmail_attr">` +
+		html.EscapeString(gmailReplyQuoteAttribution(row)) +
+		`<br></div><blockquote class="gmail_quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex">` +
+		bodyHTML +
+		`</blockquote></div>`
+}
+
+func gmailReplyQuoteText(row gmailReplyQuoteRow) string {
+	bodyText := strings.TrimSpace(row.BodyText)
+	if bodyText == "" {
+		bodyText = strings.TrimSpace(htmlFragmentText(row.BodyHTML))
+	}
+	if bodyText == "" {
+		return ""
+	}
+	return gmailReplyQuoteAttribution(row) + "\n" + quoteEmailText(bodyText)
+}
+
+func gmailReplyQuoteAttribution(row gmailReplyQuoteRow) string {
+	from := strings.TrimSpace(row.FromAddress)
+	if from == "" {
+		from = "someone"
+	}
+	if row.InternalDate.IsZero() {
+		return "On " + from + " wrote:"
+	}
+	return "On " + row.InternalDate.Format("Mon, Jan 2, 2006 at 3:04 PM") + ", " + from + " wrote:"
+}
+
+func quoteEmailText(value string) string {
+	lines := strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n")
+	for index, line := range lines {
+		line = strings.TrimRight(line, " \t")
+		if strings.HasPrefix(line, ">") {
+			lines[index] = line
+		} else if line == "" {
+			lines[index] = ">"
+		} else {
+			lines[index] = "> " + line
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func htmlBodyFragment(value string) string {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	bodyStart := strings.Index(lower, "<body")
+	if bodyStart < 0 {
+		return value
+	}
+	openEnd := strings.Index(lower[bodyStart:], ">")
+	if openEnd < 0 {
+		return value
+	}
+	contentStart := bodyStart + openEnd + 1
+	bodyEnd := strings.LastIndex(lower, "</body>")
+	if bodyEnd < contentStart {
+		return strings.TrimSpace(value[contentStart:])
+	}
+	return strings.TrimSpace(value[contentStart:bodyEnd])
 }
 
 func joinEmailHTML(bodyHTML string, signatureHTML string) string {
@@ -1184,6 +1732,14 @@ func matchingDivEnd(lowerHTML string, start int) int {
 }
 
 func extractGmailSignatureText(bodyText string) string {
+	_, signature, ok := splitEmailTextAndSignature(bodyText)
+	if !ok {
+		return ""
+	}
+	return signature
+}
+
+func splitEmailTextAndSignature(bodyText string) (string, string, bool) {
 	bodyText = strings.ReplaceAll(bodyText, "\r\n", "\n")
 	for _, delimiter := range []string{"\n--\n", "\n-- \n"} {
 		index := strings.Index(bodyText, delimiter)
@@ -1194,9 +1750,9 @@ func extractGmailSignatureText(bodyText string) string {
 		if quoteIndex := strings.Index(signature, "\nOn "); quoteIndex >= 0 && strings.Contains(signature[quoteIndex:], " wrote:") {
 			signature = signature[:quoteIndex]
 		}
-		return strings.TrimSpace(signature)
+		return strings.TrimRight(bodyText[:index], "\n"), strings.TrimSpace(signature), true
 	}
-	return ""
+	return bodyText, "", false
 }
 
 func htmlFragmentText(value string) string {

@@ -234,6 +234,36 @@ def test_gmail_send_email_executor_creates_reply_draft_with_thread_headers() -> 
     assert message["References"] == "<message-0@example.test> <message-1@example.test>"
 
 
+def test_gmail_send_email_executor_blocks_reply_without_message_headers() -> None:
+    service = FakeGmailService()
+    executor = GmailMutationExecutor(
+        settings=object(),
+        service_factory=lambda account: service,
+    )
+
+    result = executor.execute(
+        {
+            "provider": "gmail",
+            "operation": GMAIL_SEND_EMAIL_OPERATION,
+            "account": "zach@example.test",
+            "payload_json": {
+                "delivery_mode": "draft",
+                "message": {
+                    "to": ["sender@example.test"],
+                    "subject": "Re: Existing thread",
+                    "body_text": "Reply body",
+                    "reply_to_thread_id": "thread-1",
+                },
+            },
+        }
+    )
+
+    assert result.status == "failed_terminal"
+    assert "In-Reply-To" in result.error
+    assert service.draft_create_calls == []
+    assert service.send_calls == []
+
+
 def test_build_email_raw_preserves_gmail_style_html_body() -> None:
     body_html = (
         '<div>Hello from PDW.</div><div><br></div>'
