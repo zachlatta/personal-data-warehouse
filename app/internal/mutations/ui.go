@@ -283,7 +283,9 @@ func (s *Service) renderRequestDetail(w http.ResponseWriter, r *http.Request, se
 		fmt.Fprintf(w, `<form class="actions" method="post" action="%s/requests/%s/approve"><input type="hidden" name="csrf_token" value="%s"><button type="submit">Approve</button></form>`, ReviewPath, url.PathEscape(request.ID), html.EscapeString(session.CSRF))
 		fmt.Fprintf(w, `<form class="actions" method="post" action="%s/requests/%s/reject"><input type="hidden" name="csrf_token" value="%s"><input name="reason" placeholder="Reason"><button type="submit">Deny</button></form>`, ReviewPath, url.PathEscape(request.ID), html.EscapeString(session.CSRF))
 	}
-	fmt.Fprint(w, `</section><section><h2>Mutations</h2>`)
+	fmt.Fprint(w, `</section>`)
+	renderRequestContext(w, request.Context)
+	fmt.Fprint(w, `<section><h2>Mutations</h2>`)
 	renderMutationList(w, request.Mutations, request.ID, request.Status, session.CSRF)
 	fmt.Fprint(w, `</section></main>`)
 	writeHTMLFooter(w)
@@ -969,12 +971,17 @@ func contactMutationGroupTitle(operationCount int) string {
 
 func renderContactOperation(w http.ResponseWriter, view contactOperationView) {
 	operation := view.Operation
-	op := strings.TrimSpace(stringFromAny(operation["op"]))
+	op := canonicalContactOp(strings.TrimSpace(stringFromAny(operation["op"])))
 	summary := contactOperationSummary(operation)
 	title := contactOperationTitle(op)
 	classes := "contact-operation"
-	if op == "delete_contact" {
+	switch op {
+	case "delete_contact":
 		classes += " destructive"
+	case "create_contact":
+		classes += " creating"
+	case "update_contact":
+		classes += " updating"
 	}
 	fmt.Fprintf(w, `<div class="%s">`, html.EscapeString(classes))
 	fmt.Fprint(w, `<div class="contact-operation-main">`)
@@ -983,11 +990,11 @@ func renderContactOperation(w http.ResponseWriter, view contactOperationView) {
 	fmt.Fprintf(w, `<p class="contact-op">%s</p>`, html.EscapeString(title))
 	fmt.Fprintf(w, `<h4>%s</h4>`, html.EscapeString(contactSummaryTitle(summary, operation)))
 	renderContactSummaryMeta(w, summary)
-	renderContactOperationEffect(w, operation)
+	renderContactOperationEffect(w, operation, op)
 	fmt.Fprint(w, `</div>`)
 	fmt.Fprintf(w, `<span class="pill">%s</span>`, html.EscapeString(view.Mutation.Status))
 	fmt.Fprint(w, `</div>`)
-	renderContactOperationBody(w, operation)
+	renderContactOperationBody(w, operation, op)
 	fmt.Fprintf(w, `<details class="raw-json"><summary>Raw contact operation</summary><pre class="json-code">%s</pre></details>`, html.EscapeString(prettyJSON(operation)))
 	fmt.Fprint(w, `</div>`)
 }
@@ -1008,7 +1015,96 @@ func contactOperationSummary(operation map[string]any) contactSummary {
 			return summary
 		}
 	}
+	if summary := contactSummaryFromFlatOperation(operation); !summary.Empty() {
+		return summary
+	}
 	return contactSummary{}
+}
+
+// canonicalContactOp maps the short verb form ("create"/"update"/"delete") that
+// some proposers emit to the canonical form used by the rest of this package.
+func canonicalContactOp(op string) string {
+	switch op {
+	case "create":
+		return "create_contact"
+	case "update":
+		return "update_contact"
+	case "delete":
+		return "delete_contact"
+	}
+	return op
+}
+
+// contactSummaryFromFlatOperation reads a contact summary from a flat-shape
+// operation that puts fields directly on the operation map (display_name,
+// primary_email, primary_phone, organization, job_title) rather than nesting
+// them inside a Google `Person` object.
+func contactSummaryFromFlatOperation(operation map[string]any) contactSummary {
+	displayName := strings.TrimSpace(stringFromAny(operation["display_name"]))
+	if displayName == "" {
+		given := strings.TrimSpace(stringFromAny(operation["given_name"]))
+		family := strings.TrimSpace(stringFromAny(operation["family_name"]))
+		displayName = strings.TrimSpace(given + " " + family)
+	}
+	organization := strings.TrimSpace(stringFromAny(operation["organization"]))
+	if jobTitle := strings.TrimSpace(stringFromAny(operation["job_title"])); jobTitle != "" {
+		if organization != "" {
+			organization = jobTitle + ", " + organization
+		} else {
+			organization = jobTitle
+		}
+	}
+	return contactSummary{
+		DisplayName:  displayName,
+		PrimaryEmail: strings.TrimSpace(stringFromAny(operation["primary_email"])),
+		PrimaryPhone: strings.TrimSpace(stringFromAny(operation["primary_phone"])),
+		Organization: organization,
+	}
+}
+
+// personFromFlatOperation synthesizes a Google `Person`-shaped map from the
+// flat top-level fields of an operation so the existing person-block renderer
+// can work on either shape.
+func personFromFlatOperation(operation map[string]any) map[string]any {
+	person := map[string]any{}
+	displayName := strings.TrimSpace(stringFromAny(operation["display_name"]))
+	given := strings.TrimSpace(stringFromAny(operation["given_name"]))
+	family := strings.TrimSpace(stringFromAny(operation["family_name"]))
+	if displayName == "" {
+		displayName = strings.TrimSpace(given + " " + family)
+	}
+	if displayName != "" || given != "" || family != "" {
+		nameEntry := map[string]any{}
+		if displayName != "" {
+			nameEntry["displayName"] = displayName
+		}
+		if given != "" {
+			nameEntry["givenName"] = given
+		}
+		if family != "" {
+			nameEntry["familyName"] = family
+		}
+		person["names"] = []any{nameEntry}
+	}
+	if email := strings.TrimSpace(stringFromAny(operation["primary_email"])); email != "" {
+		person["emailAddresses"] = []any{map[string]any{"value": email}}
+	}
+	if phone := strings.TrimSpace(stringFromAny(operation["primary_phone"])); phone != "" {
+		person["phoneNumbers"] = []any{map[string]any{"canonicalForm": phone, "value": phone}}
+	}
+	organization := strings.TrimSpace(stringFromAny(operation["organization"]))
+	jobTitle := strings.TrimSpace(stringFromAny(operation["job_title"]))
+	if organization != "" || jobTitle != "" {
+		orgEntry := map[string]any{}
+		if organization != "" {
+			orgEntry["name"] = organization
+		}
+		if jobTitle != "" {
+			orgEntry["title"] = jobTitle
+		}
+		person["organizations"] = []any{orgEntry}
+	}
+	return person
 }
 
 func contactSummaryFromSummaryMap(value map[string]any) contactSummary {
@@ -1065,8 +1161,7 @@ func renderContactSummaryMeta(w http.ResponseWriter, summary contactSummary) {
 	fmt.Fprint(w, `</div>`)
 }
 
-func renderContactOperationEffect(w http.ResponseWriter, operation map[string]any) {
-	op := strings.TrimSpace(stringFromAny(operation["op"]))
+func renderContactOperationEffect(w http.ResponseWriter, operation map[string]any, op string) {
 	switch op {
 	case "update_contact":
 		fields := contactUpdateFields(operation)
@@ -1092,15 +1187,22 @@ func renderContactOperationEffect(w http.ResponseWriter, operation map[string]an
 	}
 }
 
-func renderContactOperationBody(w http.ResponseWriter, operation map[string]any) {
-	op := strings.TrimSpace(stringFromAny(operation["op"]))
+func renderContactOperationBody(w http.ResponseWriter, operation map[string]any, op string) {
 	switch op {
 	case "update_contact":
 		renderContactUpdateDiff(w, operation)
 	case "create_contact":
-		renderContactPersonBlock(w, "Contact to create", mapFromAny(operation["person"]))
+		person := mapFromAny(operation["person"])
+		if len(person) == 0 {
+			person = personFromFlatOperation(operation)
+		}
+		renderContactPersonBlock(w, "Contact to create", person)
 	case "delete_contact":
-		renderContactPersonBlock(w, "Contact to delete", mapFromAny(operation["before"]))
+		person := mapFromAny(operation["before"])
+		if len(person) == 0 {
+			person = personFromFlatOperation(operation)
+		}
+		renderContactPersonBlock(w, "Contact to delete", person)
 	}
 }
 
@@ -1152,6 +1254,113 @@ func renderContactPersonBlock(w http.ResponseWriter, title string, person map[st
 		}
 	}
 	fmt.Fprint(w, `</dl></div>`)
+}
+
+// renderRequestContext renders the free-form context map attached to a
+// request. It pulls out well-known keys (source, note, identifications) so
+// they can be skimmed, and folds anything else into a collapsed JSON block.
+func renderRequestContext(w http.ResponseWriter, ctx map[string]any) {
+	if len(ctx) == 0 {
+		return
+	}
+	source := strings.TrimSpace(stringFromAny(ctx["source"]))
+	note := strings.TrimSpace(stringFromAny(ctx["note"]))
+	identifications := mapSliceFromAny(ctx["identifications"])
+	handled := map[string]bool{}
+	if source != "" {
+		handled["source"] = true
+	}
+	if note != "" {
+		handled["note"] = true
+	}
+	if len(identifications) > 0 {
+		handled["identifications"] = true
+	}
+	leftover := map[string]any{}
+	for key, value := range ctx {
+		if !handled[key] {
+			leftover[key] = value
+		}
+	}
+	if source == "" && note == "" && len(identifications) == 0 && len(leftover) == 0 {
+		return
+	}
+	fmt.Fprint(w, `<section class="request-context"><h2>Context</h2>`)
+	if source != "" {
+		fmt.Fprintf(w, `<p class="context-source"><span class="context-label">Source</span> %s</p>`, html.EscapeString(source))
+	}
+	if note != "" {
+		fmt.Fprintf(w, `<p class="context-note">%s</p>`, html.EscapeString(note))
+	}
+	if len(identifications) > 0 {
+		fmt.Fprint(w, `<h3 class="context-heading">Identifications</h3><div class="identifications">`)
+		for _, item := range identifications {
+			renderIdentification(w, item)
+		}
+		fmt.Fprint(w, `</div>`)
+	}
+	if len(leftover) > 0 {
+		fmt.Fprintf(w, `<details class="raw-json"><summary>Other context</summary><pre class="json-code">%s</pre></details>`, html.EscapeString(prettyJSON(leftover)))
+	}
+	fmt.Fprint(w, `</section>`)
+}
+
+func renderIdentification(w http.ResponseWriter, item map[string]any) {
+	name := strings.TrimSpace(stringFromAny(item["inferred_name"]))
+	if name == "" {
+		name = strings.TrimSpace(stringFromAny(item["name"]))
+	}
+	if name == "" {
+		name = strings.TrimSpace(stringFromAny(item["display_name"]))
+	}
+	if name == "" {
+		name = "Unidentified"
+	}
+	confidence := strings.TrimSpace(stringFromAny(item["confidence"]))
+	action := strings.TrimSpace(stringFromAny(item["action"]))
+	maskedPhone := strings.TrimSpace(stringFromAny(item["masked_phone"]))
+	evidence := stringSliceFromAny(item["evidence"])
+
+	fmt.Fprint(w, `<article class="identification">`)
+	fmt.Fprintf(w, `<div class="identification-head"><strong>%s</strong><div class="identification-chips">`, html.EscapeString(name))
+	if confidence != "" {
+		fmt.Fprintf(w, `<span class="confidence-chip %s">%s confidence</span>`, html.EscapeString(confidenceCSSClass(confidence)), html.EscapeString(confidence))
+	}
+	if action != "" {
+		fmt.Fprintf(w, `<span class="identification-action">%s</span>`, html.EscapeString(action))
+	}
+	if maskedPhone != "" {
+		fmt.Fprintf(w, `<code class="identification-phone">%s</code>`, html.EscapeString(maskedPhone))
+	}
+	fmt.Fprint(w, `</div></div>`)
+	if len(evidence) > 0 {
+		fmt.Fprint(w, `<ul class="identification-evidence">`)
+		for _, line := range evidence {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			fmt.Fprintf(w, `<li>%s</li>`, html.EscapeString(line))
+		}
+		fmt.Fprint(w, `</ul>`)
+	}
+	fmt.Fprint(w, `</article>`)
+}
+
+func confidenceCSSClass(confidence string) string {
+	switch strings.ToLower(strings.TrimSpace(confidence)) {
+	case "high":
+		return "confidence-high"
+	case "medium-high":
+		return "confidence-medium-high"
+	case "medium":
+		return "confidence-medium"
+	case "medium-low":
+		return "confidence-medium-low"
+	case "low":
+		return "confidence-low"
+	}
+	return ""
 }
 
 func contactFieldDisplayValue(value any) string {
@@ -1853,7 +2062,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f2ee;padding:10px;
 .calendar-tech dl{margin:10px 0 0;display:grid;grid-template-columns:140px minmax(0,1fr);gap:6px 12px}
 .calendar-tech dt{color:#5f6368;font-size:12px}
 .calendar-tech dd{margin:0;color:#202124;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow-wrap:anywhere}
-.contact-mutation{padding:0;overflow:hidden}.contact-mutation>.mutation-head,.contact-mutation>.mutation-meta{margin-left:16px;margin-right:16px}.contact-mutation>.mutation-head{margin-top:16px}.contact-operations{border-top:1px solid #dfe1e5;margin-top:16px}.contact-operation{border-top:1px solid #f1f3f4;padding:18px 16px}.contact-operation:first-child{border-top:0}.contact-operation.destructive{box-shadow:inset 3px 0 #c5221f}.contact-operation-main{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:flex-start}.contact-avatar{width:40px;height:40px;border-radius:50%%;background:#137333;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.contact-operation.destructive .contact-avatar{background:#c5221f}.contact-operation-copy{min-width:0}.contact-operation-copy h4{margin:2px 0 4px;font-size:18px}.contact-op{margin:0;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.contact-meta{display:flex;flex-wrap:wrap;gap:8px;color:#5f6368;font-size:13px}.contact-effect,.contact-resource{margin:8px 0 0;color:#3c4043}.contact-effect code,.contact-resource code{background:#f1f3f4;border-radius:4px;padding:2px 5px}.contact-diff{margin-top:12px;border:1px solid #e8eaed;border-radius:6px;background:white}.contact-inline-row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;border-top:1px solid #eef0f2;padding:10px 12px}.contact-inline-row:first-child{border-top:0}.contact-inline-row>code{background:#f8fafd;border-radius:4px;padding:4px 6px;justify-self:start}.contact-inline-change{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.contact-inline-old,.contact-inline-new,.contact-inline-unchanged{border-radius:4px;padding:3px 6px;overflow-wrap:anywhere}.contact-inline-old{background:#fce8e6;color:#8c1d18;text-decoration:line-through;text-decoration-thickness:2px}.contact-inline-new{background:#e6f4ea;color:#137333;text-decoration:none}.contact-inline-arrow{color:#5f6368}.contact-diff-empty{margin:0;padding:12px;color:#5f6368}.contact-person-block{margin-top:12px;border-top:1px solid #e8eaed;padding-top:12px}.contact-block-title{margin:0 0 8px;font-weight:700}.contact-person-block dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;margin:0}.contact-person-block dt{color:#5f6368}.contact-person-block dd{margin:0}.contact-operation .raw-json{margin-bottom:0}
+.contact-mutation{padding:0;overflow:hidden}.contact-mutation>.mutation-head,.contact-mutation>.mutation-meta{margin-left:16px;margin-right:16px}.contact-mutation>.mutation-head{margin-top:16px}.contact-operations{border-top:1px solid #dfe1e5;margin-top:16px}.contact-operation{border-top:1px solid #f1f3f4;padding:18px 16px}.contact-operation:first-child{border-top:0}.contact-operation.destructive{box-shadow:inset 3px 0 #c5221f}.contact-operation.creating{box-shadow:inset 3px 0 #137333}.contact-operation.updating{box-shadow:inset 3px 0 #1967d2}.contact-operation.creating .contact-avatar{background:#137333}.contact-operation.updating .contact-avatar{background:#1967d2}.contact-operation-main{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:flex-start}.contact-avatar{width:40px;height:40px;border-radius:50%%;background:#137333;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.contact-operation.destructive .contact-avatar{background:#c5221f}.contact-operation-copy{min-width:0}.contact-operation-copy h4{margin:2px 0 4px;font-size:18px}.contact-op{margin:0;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.contact-meta{display:flex;flex-wrap:wrap;gap:8px;color:#5f6368;font-size:13px}.contact-effect,.contact-resource{margin:8px 0 0;color:#3c4043}.contact-effect code,.contact-resource code{background:#f1f3f4;border-radius:4px;padding:2px 5px}.contact-diff{margin-top:12px;border:1px solid #e8eaed;border-radius:6px;background:white}.contact-inline-row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;border-top:1px solid #eef0f2;padding:10px 12px}.contact-inline-row:first-child{border-top:0}.contact-inline-row>code{background:#f8fafd;border-radius:4px;padding:4px 6px;justify-self:start}.contact-inline-change{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.contact-inline-old,.contact-inline-new,.contact-inline-unchanged{border-radius:4px;padding:3px 6px;overflow-wrap:anywhere}.contact-inline-old{background:#fce8e6;color:#8c1d18;text-decoration:line-through;text-decoration-thickness:2px}.contact-inline-new{background:#e6f4ea;color:#137333;text-decoration:none}.contact-inline-arrow{color:#5f6368}.contact-diff-empty{margin:0;padding:12px;color:#5f6368}.contact-person-block{margin-top:12px;border-top:1px solid #e8eaed;padding-top:12px}.contact-block-title{margin:0 0 8px;font-weight:700}.contact-person-block dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;margin:0}.contact-person-block dt{color:#5f6368}.contact-person-block dd{margin:0}.contact-operation .raw-json{margin-bottom:0}
+.request-context{padding:18px 20px;background:#fff;border:1px solid #dadce0;border-radius:8px;margin:14px 0}.request-context h2{margin:0 0 12px;font-size:18px}.request-context .context-heading{font-size:13px;font-weight:700;color:#5f6368;text-transform:uppercase;letter-spacing:.04em;margin:18px 0 10px}.context-source{margin:0 0 10px;color:#3c4043}.context-label{display:inline-block;color:#5f6368;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-right:6px}.context-note{margin:0 0 6px;color:#3c4043;white-space:pre-wrap}.identifications{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}.identification{border:1px solid #e8eaed;border-radius:6px;padding:12px 14px;background:#fafbfc}.identification-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px}.identification-head strong{font-size:14px;color:#202124}.identification-chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.confidence-chip{display:inline-block;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:600;background:#e8eaed;color:#3c4043}.confidence-chip.confidence-high{background:#e6f4ea;color:#137333}.confidence-chip.confidence-medium-high,.confidence-chip.confidence-medium{background:#fef7e0;color:#92660e}.confidence-chip.confidence-medium-low{background:#fce8e6;color:#a50e0e}.confidence-chip.confidence-low{background:#fce8e6;color:#a50e0e}.identification-action{display:inline-block;background:#fef7e0;color:#92660e;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:600}.identification-phone{background:#f1f3f4;color:#3c4043;border-radius:4px;padding:2px 6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.identification-evidence{margin:8px 0 0;padding-left:20px;color:#3c4043}.identification-evidence li{margin:3px 0}
 @media (max-width:760px){main{padding:16px}.gmail-row{grid-template-columns:20px 20px minmax(0,1fr) 56px;gap:8px}.gmail-important,.gmail-list-labels{display:none}.gmail-sender{grid-column:3}.gmail-subject{grid-column:3 / 5;white-space:normal}.gmail-date{grid-column:4;grid-row:1}.gmail-expanded-subject{padding-left:18px;display:block}.gmail-message-summary{grid-template-columns:36px minmax(0,1fr);padding:18px}.gmail-message-body{padding-left:18px;padding-right:18px}.gmail-message-header{display:block}.gmail-message-header time{display:block;margin-top:4px}.gmail-body-frame{height:620px}.gmail-email-fields label,.gmail-email-readonly dl{grid-template-columns:1fr}.gmail-email-toolbar{flex-wrap:wrap}.contact-operation-main{grid-template-columns:40px minmax(0,1fr)}.contact-operation-main>.pill{grid-column:2}.contact-person-block dl{grid-template-columns:1fr}.contact-inline-row{grid-template-columns:1fr;gap:8px}.contact-inline-change{align-items:flex-start}}
 </style></head><body>`, html.EscapeString(title))
 }

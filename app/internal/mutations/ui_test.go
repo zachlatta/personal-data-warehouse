@@ -893,7 +893,8 @@ func TestReviewUIRendersContactMutationPreview(t *testing.T) {
 			t.Fatalf("contact detail page missing %q: %q", want, body)
 		}
 	}
-	operationCount := strings.Count(body, `<div class="contact-operation">`) +
+	operationCount := strings.Count(body, `<div class="contact-operation updating">`) +
+		strings.Count(body, `<div class="contact-operation creating">`) +
 		strings.Count(body, `<div class="contact-operation destructive">`)
 	if operationCount != 3 {
 		t.Fatalf("contact operation count = %d body=%q", operationCount, body)
@@ -1077,6 +1078,153 @@ func gmailEmailVariantReviewRequest() Request {
 				},
 			},
 		}},
+	}
+}
+
+func TestReviewUIRendersRequestContextAndFlatShapeContact(t *testing.T) {
+	store := &reviewStore{requests: []Request{{
+		ID:        "req-flat",
+		Status:    "pending_review",
+		Title:     "Add Barnav Mitra and Reem Khalifa to Contacts",
+		Reason:    "Add high-confidence identifications from recent Apple Messages handles.",
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+		Context: map[string]any{
+			"source": "Apple Messages + Gmail/Slack lookup via PDW",
+			"note":   "Phone numbers are masked in tool output, so contacts are added by email.",
+			"identifications": []any{
+				map[string]any{
+					"inferred_name": "Barnav Mitra",
+					"confidence":    "high",
+					"masked_phone":  "+197****4215",
+					"evidence": []any{
+						"Zach addressed them as Barnav in messages",
+						"Slack user barnav.mitra has email barnav.mitra@icloud.com",
+					},
+				},
+				map[string]any{
+					"inferred_name": "Nick (last name unknown)",
+					"confidence":    "medium-low",
+					"action":        "not proposed",
+					"masked_phone":  "+168****1483",
+					"evidence":      []any{"Zach sent 'Hi Nick...' but no reliable full name found"},
+				},
+			},
+			"unhandled_key": map[string]any{"foo": "bar"},
+		},
+		Mutations: []Mutation{{
+			ID:        "mut-flat-create",
+			Provider:  "google_people",
+			Operation: ContactsBatchMutationOperation,
+			Account:   "zach@hackclub.com",
+			Status:    "pending_review",
+			Title:     "Create contact: Barnav Mitra",
+			Payload: map[string]any{"operations": []any{map[string]any{
+				"op":            "create",
+				"given_name":    "Barnav",
+				"family_name":   "Mitra",
+				"display_name":  "Barnav Mitra",
+				"primary_email": "barnav.mitra@icloud.com",
+				"organization":  "Hack Club",
+				"job_title":     "Gap Year participant",
+			}}},
+			Preview: map[string]any{"operations": []any{map[string]any{
+				"op":            "create",
+				"op_index":      0,
+				"given_name":    "Barnav",
+				"family_name":   "Mitra",
+				"display_name":  "Barnav Mitra",
+				"primary_email": "barnav.mitra@icloud.com",
+				"organization":  "Hack Club",
+				"job_title":     "Gap Year participant",
+			}}},
+		}},
+	}}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-flat", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail status = %d body=%q", detailResponse.Code, detailResponse.Body.String())
+	}
+	body := detailResponse.Body.String()
+	for _, want := range []string{
+		// Context block surfaces source/note/identifications instead of dumping raw JSON.
+		`class="request-context"`,
+		"Apple Messages + Gmail/Slack lookup via PDW",
+		"Phone numbers are masked",
+		"Identifications",
+		"Barnav Mitra",
+		`class="confidence-chip confidence-high"`,
+		"high confidence",
+		"Nick (last name unknown)",
+		`class="confidence-chip confidence-medium-low"`,
+		`class="identification-action"`,
+		"not proposed",
+		`class="identification-phone"`,
+		"+197****4215",
+		"Zach addressed them as Barnav in messages",
+		// Unhandled context keys fall back to JSON so nothing is silently lost.
+		"Other context",
+		"unhandled_key",
+		// Flat-shape contact op renders as a regular create card with person details.
+		`<div class="contact-operation creating">`,
+		"Create contact",
+		"barnav.mitra@icloud.com",
+		"Hack Club",
+		"Gap Year participant, Hack Club",
+		"Creates a new Google Contact.",
+		// Person block extracted from flat top-level fields.
+		"Contact to create",
+		"<dt>Email</dt><dd>barnav.mitra@icloud.com</dd>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("flat contact + context page missing %q: %q", want, body)
+		}
+	}
+}
+
+func TestReviewUIOmitsContextSectionWhenEmpty(t *testing.T) {
+	store := &reviewStore{requests: []Request{{
+		ID:        "req-no-context",
+		Status:    "pending_review",
+		Title:     "No context",
+		Reason:    "no context provided",
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+		// No Context field set.
+	}}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-no-context", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+
+	body := detailResponse.Body.String()
+	if strings.Contains(body, `class="request-context"`) {
+		t.Fatalf("expected no request-context section, got: %q", body)
 	}
 }
 
