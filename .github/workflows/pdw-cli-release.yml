@@ -1,0 +1,193 @@
+name: pdw-cli Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "pdw-cli/v*"
+    paths:
+      - ".github/workflows/pdw-cli-release.yml"
+      - "app/cmd/pdw-cli/**"
+      - "app/internal/cliclient/**"
+      - "app/internal/selfupdate/**"
+      - "app/internal/tool/**"
+      - "app/internal/api/**"
+      - "app/internal/auth/**"
+      - "app/go.mod"
+      - "app/go.sum"
+  pull_request:
+    paths:
+      - ".github/workflows/pdw-cli-release.yml"
+      - "app/cmd/pdw-cli/**"
+      - "app/internal/cliclient/**"
+      - "app/internal/selfupdate/**"
+      - "app/go.mod"
+      - "app/go.sum"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Go tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+      - name: Run tests
+        working-directory: app
+        run: go test ./...
+
+  version:
+    name: Resolve version
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      tag: ${{ steps.compute.outputs.tag }}
+      kind: ${{ steps.compute.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # `git rev-list --count` needs full history
+      - name: Compute version
+        id: compute
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          # Commit count gives a monotonic patch number so ShouldUpdate
+          # reports newer for every commit on main, even between tagged
+          # releases.
+          count=$(git rev-list --count HEAD)
+          if [[ "$REF" == refs/tags/pdw-cli/v* ]]; then
+            tag="${REF#refs/tags/}"
+            version="${tag#pdw-cli/}"
+            kind="tag"
+          elif [[ "$REF" == refs/heads/main ]]; then
+            version="v0.0.${count}-sha.${short_sha}"
+            tag="pdw-cli/${version}"
+            kind="main"
+          else
+            version="v0.0.${count}-pr.${short_sha}"
+            tag="pdw-cli/${version}"
+            kind="dry-run"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$version tag=$tag kind=$kind"
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+
+      - name: Build
+        working-directory: app
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist/staging
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "../dist/staging/pdw-cli" ./cmd/pdw-cli
+
+      - name: Package
+        working-directory: dist
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="pdw-cli_${VERSION}_${GOOS}_${GOARCH}.tar.gz"
+          tar -C staging -czf "$name" pdw-cli
+          rm -rf staging
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdw-cli-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    # Release on every push event — both commits to main and tag pushes.
+    # PRs build but never release (no write perms on forks, and we don't
+    # want PR builds clobbering the "latest" release that selfupdate uses).
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/pdw-cli/v'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          rm -f SHA256SUMS
+          shopt -s nullglob
+          sha256sum pdw-cli_*.tar.gz | sort > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          KIND: ${{ needs.version.outputs.kind }}
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          notes="Automated release built from \`$GITHUB_SHA\` (\`$KIND\`). Verify downloads against \`SHA256SUMS\`. \`pdw-cli update\` will install this automatically."
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            # --latest forces this release into /releases/latest even though
+            # per-commit tags carry a -sha.<short> pre-release suffix that
+            # GitHub would otherwise skip from latest-auto-detection. This
+            # is what makes `pdw-cli update` see every commit.
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "pdw-cli $VERSION" \
+              --notes "$notes" \
+              --latest
+          else
+            # Re-mark as latest in case a different release was last created.
+            gh release edit "$TAG" --latest
+          fi
+          gh release upload "$TAG" pdw-cli_*.tar.gz SHA256SUMS --clobber

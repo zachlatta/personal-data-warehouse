@@ -371,12 +371,70 @@ It uses `current_database()` and `information_schema` against the current Postgr
 
 When `MCP_DEBUG_CACHE_TOOL=true`, the server also exposes `_debug_cache_status` to show live `query_id`s, ages, and process-wide cache size.
 
+## CLI: `pdw-cli`
+
+`cmd/pdw-cli` is a small command-line client that consumes `/api/tools`. It
+discovers every tool the server exposes at runtime, so it stays in sync
+without changes when new tools are added.
+
+```bash
+cd app
+go build -o /tmp/pdw-cli ./cmd/pdw-cli
+
+export PDW_API_URL=http://localhost:8080
+export PDW_SECRET_TOKEN=...           # same value the server sees
+export PDW_CLIENT_NAME=pdw-cli        # optional; default is "pdw-cli"
+
+/tmp/pdw-cli list                     # name/title/description table
+/tmp/pdw-cli list --json              # raw JSON tool list
+/tmp/pdw-cli describe query           # title + description + input JSON Schema
+/tmp/pdw-cli call schema_overview     # zero-input tool
+/tmp/pdw-cli call query --data '{"queries":[{"question":"row count","sql":"SELECT 1"}]}'
+echo '{"queries":[{"question":"q","sql":"SELECT 1"}]}' | /tmp/pdw-cli call query
+```
+
+`--base-url`, `--token`, and `--client` flags override the corresponding
+environment variables. Server errors surface as non-zero exits with the
+structured `code`/`message`/`http <status>` envelope on stderr.
+
+### Self-update
+
+`pdw-cli update` replaces the running binary with the latest GitHub release
+from `zachlatta/personal-data-warehouse`, verifying the download against
+`SHA256SUMS`. Releases are produced automatically by `.github/workflows/pdw-cli-release.yml`:
+
+- **Every push to `main`** that touches `app/**` (CLI, client, selfupdate,
+  shared `tool`/`api`/`auth` packages, or `go.mod`/`go.sum`) builds binaries
+  for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64` and
+  publishes a release tagged `pdw-cli/v0.0.<commit-count>-sha.<short-sha>`.
+  The commit count is monotonic, so `pdw-cli update` always sees newer
+  builds without waiting for a manual tag.
+- **`pdw-cli/v*` git tags** publish a release tagged with the version you
+  pushed (e.g. `pdw-cli/v0.1.0`).
+- Each release is force-marked `--latest` so it shows up at
+  `/releases/latest` even though the `-sha.<short>` suffix would normally
+  be classified as a semver pre-release.
+- Pull requests just run tests + build to check the matrix; they never
+  publish.
+
+```bash
+pdw-cli version        # prints the build version baked in via -ldflags
+pdw-cli update --check # report whether a newer release exists
+pdw-cli update         # download, verify SHA256, atomically replace this binary
+pdw-cli update --force # reinstall even if already on the latest version
+pdw-cli update --repo other/fork --github-api https://api.github.com  # alt source
+```
+
+Override the GitHub repo with `PDW_CLI_REPO` or `--repo` (the test suite uses
+both `--repo` and `--github-api` to drive end-to-end fakes).
+
 ## Verify
 
 ```bash
 cd app
 go test ./...
 go build -o /tmp/pdw-mcp ./cmd/pdw-mcp
+go build -o /tmp/pdw-cli ./cmd/pdw-cli
 ```
 
 To verify against the real Postgres URL from the repository `.env`:
