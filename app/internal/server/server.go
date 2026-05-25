@@ -22,7 +22,7 @@ const debugCacheStatusDescription = "Return live cached query_ids, ages, and tot
 func mcpToolHooks(logger *slog.Logger) tool.Hooks {
 	return tool.Hooks{
 		OnCall: func(ctx context.Context, name string) {
-			logger.InfoContext(ctx, "MCP tool called", "tool", name)
+			logger.InfoContext(ctx, "MCP tool called", "tool", name, "client", pdwauth.ClientNameFromContext(ctx))
 		},
 	}
 }
@@ -405,6 +405,8 @@ func (w *statusResponseWriter) Flush() {
 
 func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := pdwauth.WithClientNameHolder(r.Context())
+		r = r.WithContext(ctx)
 		started := time.Now()
 		rec := &statusResponseWriter{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
@@ -412,6 +414,6 @@ func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		logger.InfoContext(r.Context(), "HTTP request completed", "method", r.Method, "path", r.URL.Path, "status", status, "bytes", rec.bytes, "duration", time.Since(started))
+		logger.InfoContext(r.Context(), "HTTP request completed", "method", r.Method, "path", r.URL.Path, "status", status, "bytes", rec.bytes, "duration", time.Since(started), "client", pdwauth.ClientNameFromContext(r.Context()))
 	})
 }
