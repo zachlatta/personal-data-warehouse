@@ -1,0 +1,31 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "column": {
+      "description": "column name to read",
+      "type": "string"
+    },
+    "length": {
+      "description": "number of characters to return, default 50000 and capped by MCP_GET_FIELD_MAX_CHARS",
+      "type": "integer"
+    },
+    "offset": {
+      "description": "zero-based character offset, default 0",
+      "type": "integer"
+    },
+    "query_id": {
+      "description": "query_id returned by query",
+      "type": "string"
+    },
+    "row": {
+      "description": "zero-based row index in the cached result",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "query_id",
+    "row",
+    "column"
+  ],
+  "type": "object"
+}

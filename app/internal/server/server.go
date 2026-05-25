@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -117,69 +116,14 @@ func newMCPServer(runner query.Runner, opts query.Options, mutationSvc *mutation
 		Version: "0.1.0",
 	}, &mcp.ServerOptions{Instructions: serverInstructions})
 	serverLogger.Info("registering MCP tools")
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "query",
-		Title:       "Query Postgres",
-		Description: withSchemaDescription(queryDescription, schemaDescription),
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input queryInput) (*mcp.CallToolResult, any, error) {
-		statements := queryStatementsFromInput(input.Queries)
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "query", "statements", len(statements))
-		resp := svc.Execute(ctx, statements, input.PreviewRows, input.Format)
-		return jsonToolResult(resp, queryResponseHasError(resp)), nil, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "get_rows",
-		Title:       "Get Cached Rows",
-		Description: getRowsDescription,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input getRowsInput) (*mcp.CallToolResult, any, error) {
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "get_rows", "query_id", input.QueryID, "offset", input.Offset, "limit", input.Limit)
-		resp := svc.GetRows(ctx, input.QueryID, input.Offset, input.Limit, input.Format)
-		return jsonToolResult(resp, resp.Error != ""), nil, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "get_field",
-		Title:       "Get Cached Field",
-		Description: getFieldDescription,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input getFieldInput) (*mcp.CallToolResult, any, error) {
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "get_field", "query_id", input.QueryID, "row", input.Row, "column", input.Column, "offset", input.Offset, "length", input.Length)
-		resp := svc.GetField(ctx, input.QueryID, input.Row, input.Column, input.Offset, input.Length)
-		return jsonToolResult(resp, resp.Error != ""), nil, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "grep_rows",
-		Title:       "Grep Cached Rows",
-		Description: grepRowsDescription,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input grepRowsInput) (*mcp.CallToolResult, any, error) {
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "grep_rows", "query_id", input.QueryID, "columns", len(input.Columns), "limit", input.Limit)
-		resp := svc.GrepRows(ctx, input.QueryID, input.Pattern, input.Columns, input.Limit, input.ContextChars)
-		return jsonToolResult(resp, resp.Error != ""), nil, nil
-	})
+	hooks := mcpToolHooks(serverLogger)
+	tools := readOnlyTools(svc, schemaDescription)
 	if opts.DebugCacheTool {
-		debugCacheStatusTool(svc).RegisterMCP(server, mcpToolHooks(serverLogger))
+		tools = append(tools, debugCacheStatusTool(svc))
 	}
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "schema_overview",
-		Title:       "Schema Overview",
-		Description: withSchemaDescription(schemaOverviewDescription, schemaDescription),
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input schemaOverviewInput) (*mcp.CallToolResult, any, error) {
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "schema_overview")
-		resp := svc.SchemaOverview(ctx)
-		content := make([]mcp.Content, 0, len(resp.Results))
-		isError := false
-		for _, result := range resp.Results {
-			content = append(content, &mcp.TextContent{Text: result.CSV})
-			if !result.Truncated.Empty() {
-				content = append(content, &mcp.TextContent{Text: result.Truncated.CSV()})
-			}
-			if result.Error != "" {
-				isError = true
-			}
-		}
-		return &mcp.CallToolResult{
-			Content: content,
-			IsError: isError,
-		}, nil, nil
-	})
+	for _, t := range tools {
+		t.RegisterMCP(server, hooks)
+	}
 	mutations.RegisterTools(server, mutationSvc)
 	return server
 }
@@ -385,20 +329,6 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(mcpHandler)
 	mux.Handle("/mcp", protected)
 	return logRequests(logger, mux)
-}
-
-func jsonToolResult(value any, isError bool) *mcp.CallToolResult {
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: `{"error":"failed to encode tool response"}`}},
-			IsError: true,
-		}
-	}
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: string(data)}},
-		IsError: isError,
-	}
 }
 
 func queryResponseHasError(resp query.QueryResponse) bool {

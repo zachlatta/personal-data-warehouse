@@ -1,0 +1,25 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "format": {
+      "description": "optional override: csv, json, or ndjson; default is the original query format",
+      "type": "string"
+    },
+    "limit": {
+      "description": "number of rows to return, default 50",
+      "type": "integer"
+    },
+    "offset": {
+      "description": "zero-based row offset, default 0",
+      "type": "integer"
+    },
+    "query_id": {
+      "description": "query_id returned by query",
+      "type": "string"
+    }
+  },
+  "required": [
+    "query_id"
+  ],
+  "type": "object"
+}
