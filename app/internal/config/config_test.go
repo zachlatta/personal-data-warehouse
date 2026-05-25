@@ -70,6 +70,45 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvPrefersPDWSecretTokenOverMCPSecretToken(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL": "postgresql://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":      "legacy0123456789abcdef0123456789abcd",
+		"PDW_SECRET_TOKEN":      "preferred0123456789abcdef0123456789abcd",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv: %v", err)
+	}
+	if cfg.SecretToken != "preferred0123456789abcdef0123456789abcd" {
+		t.Fatalf("SecretToken = %q; PDW_SECRET_TOKEN must win over legacy MCP_SECRET_TOKEN", cfg.SecretToken)
+	}
+}
+
+func TestLoadFromEnvFallsBackToMCPSecretToken(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL": "postgresql://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":      "legacy0123456789abcdef0123456789abcd",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv: %v", err)
+	}
+	if cfg.SecretToken != "legacy0123456789abcdef0123456789abcd" {
+		t.Fatalf("SecretToken = %q; expected MCP_SECRET_TOKEN fallback", cfg.SecretToken)
+	}
+}
+
+func TestLoadFromEnvErrorMentionsPDWSecretToken(t *testing.T) {
+	_, err := LoadFromEnv(func(string) string { return "" })
+	if err == nil {
+		t.Fatal("expected missing env error")
+	}
+	if !strings.Contains(err.Error(), "PDW_SECRET_TOKEN") {
+		t.Fatalf("missing-env error should mention PDW_SECRET_TOKEN, got %q", err.Error())
+	}
+}
+
 func TestLoadFromEnvRejectsWeakSecretToken(t *testing.T) {
 	env := map[string]string{
 		"POSTGRES_DATABASE_URL": "postgresql://default:secret@example.com/default",

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -26,7 +27,16 @@ type Tool interface {
 	// and returns the output value. isError is true when the call should be
 	// surfaced to the caller as an error (decode failure, handler error, or
 	// the tool's own IsError predicate firing on a successful return).
+	//
+	// For adapters that distinguish hard errors from soft IsError flags
+	// (HTTP returns 4xx/5xx only for hard errors), use err vs. isError to
+	// decide: err != nil means hard error; err == nil && isError means soft.
 	Invoke(ctx context.Context, rawInput json.RawMessage) (output any, isError bool, err error)
+
+	// InputSchema returns the JSON Schema describing the tool's input. The
+	// same schema the MCP SDK derives via reflection on the input type, so
+	// HTTP tool listings and MCP tool listings stay aligned.
+	InputSchema() (*jsonschema.Schema, error)
 
 	// RegisterMCP registers the tool against an MCP server using mcp.AddTool
 	// so the SDK's schema reflection runs on the concrete input type. Hooks

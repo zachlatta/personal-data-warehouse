@@ -9,6 +9,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/zachlatta/personal-data-warehouse/app/internal/api"
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
@@ -319,7 +320,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		body := "Personal Data Warehouse MCP server\nMCP endpoint: /mcp\n"
+		body := "Personal Data Warehouse app\nMCP endpoint: /mcp\nHTTP API: /api/tools\n"
 		if mutationSvc != nil {
 			body += "Mutation review UI: " + mutations.ReviewPath + "\n"
 		}
@@ -339,6 +340,12 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	})
 	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(mcpHandler)
 	mux.Handle("/mcp", protected)
+
+	apiHandler := api.NewHandler(registry, slog.Default())
+	apiProtected := authSvc.RequireStaticBearer()(apiHandler)
+	mux.Handle("/api/tools", apiProtected)
+	mux.Handle("/api/tools/", apiProtected)
+
 	return logRequests(logger, mux)
 }
 

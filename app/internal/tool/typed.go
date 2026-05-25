@@ -3,7 +3,9 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -30,6 +32,11 @@ type Typed[I any, O any] struct {
 func (t *Typed[I, O]) Name() string        { return t.NameStr }
 func (t *Typed[I, O]) Title() string       { return t.TitleStr }
 func (t *Typed[I, O]) Description() string { return t.DescriptionStr }
+
+func (t *Typed[I, O]) InputSchema() (*jsonschema.Schema, error) {
+	var zero I
+	return jsonschema.ForType(reflect.TypeOf(zero), &jsonschema.ForOptions{})
+}
 
 func (t *Typed[I, O]) Invoke(ctx context.Context, raw json.RawMessage) (any, bool, error) {
 	var input I
