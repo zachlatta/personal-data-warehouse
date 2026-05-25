@@ -7,11 +7,11 @@ import (
 	"os"
 	"time"
 
-	pdwauth "github.com/zachlatta/personal-data-warehouse/mcp/internal/auth"
-	"github.com/zachlatta/personal-data-warehouse/mcp/internal/config"
-	"github.com/zachlatta/personal-data-warehouse/mcp/internal/mutations"
-	"github.com/zachlatta/personal-data-warehouse/mcp/internal/query"
-	"github.com/zachlatta/personal-data-warehouse/mcp/internal/server"
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/server"
 )
 
 func main() {

@@ -41,7 +41,7 @@ on restart.
 ## Run Locally
 
 ```bash
-cd mcp
+cd app
 set -a; source ../.env; set +a
 export MCP_SECRET_TOKEN=choose-a-random-local-secret-at-least-32-chars
 export MCP_BASE_URL=http://localhost:8080
@@ -73,7 +73,7 @@ Create a new Dockerfile-based app using this repository.
 Use:
 
 ```text
-Dockerfile path: mcp/Dockerfile
+Dockerfile path: app/Dockerfile
 Exposed port: 8080
 ```
 
@@ -275,7 +275,7 @@ When `MCP_DEBUG_CACHE_TOOL=true`, the server also exposes `_debug_cache_status` 
 ## Verify
 
 ```bash
-cd mcp
+cd app
 go test ./...
 go build -o /tmp/pdw-mcp ./cmd/pdw-mcp
 ```

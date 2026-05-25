@@ -10,10 +10,10 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	pdwauth "github.com/zachlatta/personal-data-warehouse/mcp/internal/auth"
-	"github.com/zachlatta/personal-data-warehouse/mcp/internal/config"
-	"github.com/zachlatta/personal-data-warehouse/mcp/internal/mutations"
-	"github.com/zachlatta/personal-data-warehouse/mcp/internal/query"
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 )
 
 type queryInput struct {
