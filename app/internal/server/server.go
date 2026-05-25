@@ -96,33 +96,42 @@ const schemaRelationsSQL = "SELECT table_name AS name FROM information_schema.ta
 const schemaToolDescriptionMaxChars = 12000
 
 func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
-	return newMCPServer(runner, opts, nil)
+	return NewMCPServerWithMutations(runner, opts, nil)
 }
 
 func NewMCPServerWithMutations(runner query.Runner, opts query.Options, mutationSvc *mutations.Service) *mcp.Server {
-	return newMCPServer(runner, opts, mutationSvc)
-}
-
-func newMCPServer(runner query.Runner, opts query.Options, mutationSvc *mutations.Service) *mcp.Server {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+	registry, _ := buildRegistry(runner, opts, mutationSvc, logger)
+	return newMCPServerFromRegistry(registry, logger)
+}
+
+// buildRegistry constructs the shared query.Service and assembles the
+// tool.Registry that both surfaces (MCP and HTTP) consume. The query.Service
+// is returned so callers that want the cache (e.g. NewMux for shutdown) can
+// hold onto it; passing it back also makes the shared-cache contract obvious.
+func buildRegistry(runner query.Runner, opts query.Options, mutationSvc *mutations.Service, logger *slog.Logger) (*tool.Registry, *query.Service) {
 	serverLogger := logger.With("component", "server")
 	svc := query.NewService(runner, opts)
 	schemaDescription := schemaDescriptionForTools(context.Background(), runner, serverLogger)
+	tools := readOnlyTools(svc, schemaDescription)
+	if opts.DebugCacheTool {
+		tools = append(tools, debugCacheStatusTool(svc))
+	}
+	return tool.NewRegistry(tools, mutations.Tools(mutationSvc)), svc
+}
+
+func newMCPServerFromRegistry(registry *tool.Registry, logger *slog.Logger) *mcp.Server {
+	serverLogger := logger.With("component", "server")
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "personal-data-warehouse",
 		Version: "0.1.0",
 	}, &mcp.ServerOptions{Instructions: serverInstructions})
 	serverLogger.Info("registering MCP tools")
 	hooks := mcpToolHooks(serverLogger)
-	tools := readOnlyTools(svc, schemaDescription)
-	if opts.DebugCacheTool {
-		tools = append(tools, debugCacheStatusTool(svc))
-	}
-	tools = append(tools, mutations.Tools(mutationSvc)...)
-	for _, t := range tools {
+	for _, t := range registry.All() {
 		t.RegisterMCP(server, hooks)
 	}
 	return server
@@ -320,7 +329,9 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	mcpServer := NewMCPServerWithMutations(runner, query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}, mutationSvc)
+	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}
+	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default())
+	mcpServer := newMCPServerFromRegistry(registry, slog.Default())
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{
 		JSONResponse:   true,
 		Logger:         slog.Default().With("component", "mcp_streamable"),
