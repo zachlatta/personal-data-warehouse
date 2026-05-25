@@ -121,10 +121,10 @@ func newMCPServer(runner query.Runner, opts query.Options, mutationSvc *mutation
 	if opts.DebugCacheTool {
 		tools = append(tools, debugCacheStatusTool(svc))
 	}
+	tools = append(tools, mutations.Tools(mutationSvc)...)
 	for _, t := range tools {
 		t.RegisterMCP(server, hooks)
 	}
-	mutations.RegisterTools(server, mutationSvc)
 	return server
 }
 

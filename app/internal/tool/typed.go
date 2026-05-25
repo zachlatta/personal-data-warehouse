@@ -82,7 +82,10 @@ func jsonToolResult(value any, isError bool) *mcp.CallToolResult {
 }
 
 func mcpErrorResult(err error) *mcp.CallToolResult {
-	body, _ := json.Marshal(map[string]string{"error": err.Error()})
+	body, mErr := json.MarshalIndent(map[string]string{"error": err.Error()}, "", "  ")
+	if mErr != nil {
+		body = []byte(`{"error":"failed to encode tool response"}`)
+	}
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(body)}},
 		IsError: true,

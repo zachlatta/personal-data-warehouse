@@ -2,78 +2,59 @@ package mutations
 
 import (
 	"context"
-	"encoding/json"
-	"log/slog"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
 const mutationToolDescription = "Create a pending upstream mutation request for human review in the Personal Data Warehouse. The tool does not execute the mutation; it returns a request_id and approval_url for the web review UI."
 
-func RegisterTools(server *mcp.Server, service *Service) {
-	if server == nil || service == nil {
-		return
+// Tools returns the propose_* MCP tools backed by the given service. Returns
+// nil when service is nil so callers can pass the result straight into a
+// tool.Registry without a nil guard.
+func Tools(service *Service) []tool.Tool {
+	if service == nil {
+		return nil
 	}
-	logger := slog.Default().With("component", "mutations")
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "propose_mutation_request",
-		Title:       "Propose Mutation Request",
-		Description: mutationToolDescription + " Use this when a task requires multiple Gmail or Google Contacts changes to be reviewed together.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input ProposeMutationRequestInput) (*mcp.CallToolResult, any, error) {
-		logger.InfoContext(ctx, "MCP mutation tool called", "tool", "propose_mutation_request", "mutations", len(input.Mutations))
-		resp, err := service.ProposeMutationRequest(ctx, input)
-		return mutationToolResult(resp, err), nil, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "propose_gmail_archive_threads",
-		Title:       "Propose Gmail Archive",
-		Description: mutationToolDescription + " Proposes removing INBOX from one or more Gmail threads.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input ProposeGmailArchiveThreadsInput) (*mcp.CallToolResult, any, error) {
-		logger.InfoContext(ctx, "MCP mutation tool called", "tool", "propose_gmail_archive_threads", "threads", len(input.ThreadIDs))
-		resp, err := service.ProposeGmailArchiveThreads(ctx, input)
-		return mutationToolResult(resp, err), nil, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "propose_gmail_unarchive_threads",
-		Title:       "Propose Gmail Unarchive",
-		Description: mutationToolDescription + " Proposes adding INBOX back to one or more Gmail threads.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input ProposeGmailUnarchiveThreadsInput) (*mcp.CallToolResult, any, error) {
-		logger.InfoContext(ctx, "MCP mutation tool called", "tool", "propose_gmail_unarchive_threads", "threads", len(input.ThreadIDs))
-		resp, err := service.ProposeGmailUnarchiveThreads(ctx, input)
-		return mutationToolResult(resp, err), nil, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "propose_gmail_send_email",
-		Title:       "Propose Gmail Email",
-		Description: mutationToolDescription + " Proposes sending or drafting a Gmail email. May include one email or multiple variants; each variant needs a short two-word title for the review tabs.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input ProposeGmailSendEmailInput) (*mcp.CallToolResult, any, error) {
-		logger.InfoContext(ctx, "MCP mutation tool called", "tool", "propose_gmail_send_email", "delivery_mode", input.DeliveryMode)
-		resp, err := service.ProposeGmailSendEmail(ctx, input)
-		return mutationToolResult(resp, err), nil, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "propose_contact_mutations",
-		Title:       "Propose Contact Mutations",
-		Description: mutationToolDescription + " Proposes reviewed Google Contacts create, update, or delete operations.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input ProposeContactMutationsInput) (*mcp.CallToolResult, any, error) {
-		logger.InfoContext(ctx, "MCP mutation tool called", "tool", "propose_contact_mutations", "operations", len(input.Operations))
-		resp, err := service.ProposeContactMutations(ctx, input)
-		return mutationToolResult(resp, err), nil, nil
-	})
-}
-
-func mutationToolResult(value any, err error) *mcp.CallToolResult {
-	isError := err != nil
-	if err != nil {
-		value = map[string]string{"error": err.Error()}
-	}
-	data, marshalErr := json.MarshalIndent(value, "", "  ")
-	if marshalErr != nil {
-		data = []byte(`{"error":"failed to encode tool response"}`)
-		isError = true
-	}
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: string(data)}},
-		IsError: isError,
+	return []tool.Tool{
+		&tool.Typed[ProposeMutationRequestInput, ProposalResponse]{
+			NameStr:        "propose_mutation_request",
+			TitleStr:       "Propose Mutation Request",
+			DescriptionStr: mutationToolDescription + " Use this when a task requires multiple Gmail or Google Contacts changes to be reviewed together.",
+			Handle: func(ctx context.Context, in ProposeMutationRequestInput) (ProposalResponse, error) {
+				return service.ProposeMutationRequest(ctx, in)
+			},
+		},
+		&tool.Typed[ProposeGmailArchiveThreadsInput, ProposalResponse]{
+			NameStr:        "propose_gmail_archive_threads",
+			TitleStr:       "Propose Gmail Archive",
+			DescriptionStr: mutationToolDescription + " Proposes removing INBOX from one or more Gmail threads.",
+			Handle: func(ctx context.Context, in ProposeGmailArchiveThreadsInput) (ProposalResponse, error) {
+				return service.ProposeGmailArchiveThreads(ctx, in)
+			},
+		},
+		&tool.Typed[ProposeGmailUnarchiveThreadsInput, ProposalResponse]{
+			NameStr:        "propose_gmail_unarchive_threads",
+			TitleStr:       "Propose Gmail Unarchive",
+			DescriptionStr: mutationToolDescription + " Proposes adding INBOX back to one or more Gmail threads.",
+			Handle: func(ctx context.Context, in ProposeGmailUnarchiveThreadsInput) (ProposalResponse, error) {
+				return service.ProposeGmailUnarchiveThreads(ctx, in)
+			},
+		},
+		&tool.Typed[ProposeGmailSendEmailInput, ProposalResponse]{
+			NameStr:        "propose_gmail_send_email",
+			TitleStr:       "Propose Gmail Email",
+			DescriptionStr: mutationToolDescription + " Proposes sending or drafting a Gmail email. May include one email or multiple variants; each variant needs a short two-word title for the review tabs.",
+			Handle: func(ctx context.Context, in ProposeGmailSendEmailInput) (ProposalResponse, error) {
+				return service.ProposeGmailSendEmail(ctx, in)
+			},
+		},
+		&tool.Typed[ProposeContactMutationsInput, ProposalResponse]{
+			NameStr:        "propose_contact_mutations",
+			TitleStr:       "Propose Contact Mutations",
+			DescriptionStr: mutationToolDescription + " Proposes reviewed Google Contacts create, update, or delete operations.",
+			Handle: func(ctx context.Context, in ProposeContactMutationsInput) (ProposalResponse, error) {
+				return service.ProposeContactMutations(ctx, in)
+			},
+		},
 	}
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 )
 
@@ -19,21 +20,26 @@ import (
 // regression guard against accidental drift in tool input schemas.
 var updateSchemaGoldens = flag.Bool("update", false, "regenerate input-schema golden files")
 
-// readOnlyToolsForSnapshot is the list of tool names we want byte-identical
-// MCP InputSchemas for across the refactor. _debug_cache_status is excluded
-// because it's gated behind a config flag and already covered separately;
-// propose_* are covered when PR 3 lands.
-var readOnlyToolsForSnapshot = []string{
+// snapshotTools is the list of tool names we want byte-identical MCP
+// InputSchemas for across refactors. _debug_cache_status is excluded
+// because it is gated behind a config flag and covered separately.
+var snapshotTools = []string{
 	"query",
 	"get_rows",
 	"get_field",
 	"grep_rows",
 	"schema_overview",
+	"propose_mutation_request",
+	"propose_gmail_archive_threads",
+	"propose_gmail_unarchive_threads",
+	"propose_gmail_send_email",
+	"propose_contact_mutations",
 }
 
 func TestMCPToolInputSchemasMatchGolden(t *testing.T) {
 	runner := fakeRunner{results: map[string]query.RawResult{}}
-	srv := NewMCPServer(runner, query.Options{MaxRows: 5, MaxFieldChars: 100})
+	mutationSvc := mutations.NewService(fakeMutationStore{request: mutations.Request{ID: "snapshot"}}, mutations.Config{BaseURL: "https://snapshot.example.test"})
+	srv := NewMCPServerWithMutations(runner, query.Options{MaxRows: 5, MaxFieldChars: 100}, mutationSvc)
 
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -57,7 +63,7 @@ func TestMCPToolInputSchemasMatchGolden(t *testing.T) {
 		byName[tl.Name] = tl
 	}
 
-	for _, name := range readOnlyToolsForSnapshot {
+	for _, name := range snapshotTools {
 		tl, ok := byName[name]
 		if !ok {
 			t.Fatalf("tool %q not exposed; got %v", name, byName)
