@@ -203,6 +203,90 @@ func TestMCPServerProposeGmailSendEmailAcceptsVariants(t *testing.T) {
 	}
 }
 
+func TestMCPServerExposesDebugCacheStatusOnlyWhenEnabled(t *testing.T) {
+	runner := fakeRunner{results: map[string]query.RawResult{}}
+
+	// Off by default.
+	disabledSrv := NewMCPServer(runner, query.Options{MaxRows: 5, MaxFieldChars: 100})
+	disabledNames := listToolNames(t, disabledSrv)
+	if disabledNames["_debug_cache_status"] {
+		t.Fatalf("_debug_cache_status must not be listed when DebugCacheTool is false: %v", disabledNames)
+	}
+
+	// On when enabled, returns a JSON DebugCacheStatus document.
+	enabledSrv := NewMCPServer(runner, query.Options{MaxRows: 5, MaxFieldChars: 100, DebugCacheTool: true})
+	enabledNames := listToolNames(t, enabledSrv)
+	if !enabledNames["_debug_cache_status"] {
+		t.Fatalf("_debug_cache_status must be listed when DebugCacheTool is true: %v", enabledNames)
+	}
+
+	text := callToolText(t, enabledSrv, "_debug_cache_status", map[string]any{})
+	var status struct {
+		TotalBytes int64 `json:"total_bytes"`
+		MaxBytes   int64 `json:"max_bytes"`
+		TTLSeconds int64 `json:"ttl_seconds"`
+		Queries    []any `json:"queries"`
+	}
+	if err := json.Unmarshal([]byte(text), &status); err != nil {
+		t.Fatalf("_debug_cache_status response was not JSON: %v\n%s", err, text)
+	}
+	if status.Queries == nil {
+		t.Fatalf("expected queries field to be present (empty array), got nil: %s", text)
+	}
+}
+
+func listToolNames(t *testing.T, srv *mcp.Server) map[string]bool {
+	t.Helper()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect failed: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	tools, err := session.ListTools(ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+	names := map[string]bool{}
+	for _, tool := range tools.Tools {
+		names[tool.Name] = true
+	}
+	return names
+}
+
+func callToolText(t *testing.T, srv *mcp.Server, name string, args map[string]any) string {
+	t.Helper()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect failed: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool(%s) failed: %v", name, err)
+	}
+	if result.IsError {
+		t.Fatalf("%s returned IsError: %#v", name, result.Content)
+	}
+	if len(result.Content) == 0 {
+		t.Fatalf("%s returned no content", name)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("%s first content type = %T", name, result.Content[0])
+	}
+	return text.Text
+}
+
 func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	runner := fakeRunner{results: map[string]query.RawResult{
 		"SELECT current_database() AS database": {

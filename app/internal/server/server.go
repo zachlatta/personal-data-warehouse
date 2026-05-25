@@ -14,7 +14,29 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
+
+const debugCacheStatusDescription = "Return live cached query_ids, ages, and total cache size for debugging. Example: _debug_cache_status({}) shows which query handles are still valid. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: query, get_rows, grep_rows."
+
+func mcpToolHooks(logger *slog.Logger) tool.Hooks {
+	return tool.Hooks{
+		OnCall: func(ctx context.Context, name string) {
+			logger.InfoContext(ctx, "MCP tool called", "tool", name)
+		},
+	}
+}
+
+func debugCacheStatusTool(svc *query.Service) tool.Tool {
+	return &tool.Typed[debugCacheInput, query.DebugCacheStatus]{
+		NameStr:        "_debug_cache_status",
+		TitleStr:       "Debug Query Cache Status",
+		DescriptionStr: debugCacheStatusDescription,
+		Handle: func(_ context.Context, _ debugCacheInput) (query.DebugCacheStatus, error) {
+			return svc.DebugCacheStatus(), nil
+		},
+	}
+}
 
 type queryInput struct {
 	Queries     []queryStatementInput `json:"queries" jsonschema:"array of query objects; each must include question and sql"`
@@ -133,14 +155,7 @@ func newMCPServer(runner query.Runner, opts query.Options, mutationSvc *mutation
 		return jsonToolResult(resp, resp.Error != ""), nil, nil
 	})
 	if opts.DebugCacheTool {
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "_debug_cache_status",
-			Title:       "Debug Query Cache Status",
-			Description: "Return live cached query_ids, ages, and total cache size for debugging. Example: _debug_cache_status({}) shows which query handles are still valid. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: query, get_rows, grep_rows.",
-		}, func(ctx context.Context, req *mcp.CallToolRequest, input debugCacheInput) (*mcp.CallToolResult, any, error) {
-			serverLogger.InfoContext(ctx, "MCP tool called", "tool", "_debug_cache_status")
-			return jsonToolResult(svc.DebugCacheStatus(), false), nil, nil
-		})
+		debugCacheStatusTool(svc).RegisterMCP(server, mcpToolHooks(serverLogger))
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "schema_overview",
