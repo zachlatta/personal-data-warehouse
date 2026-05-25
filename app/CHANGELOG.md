@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Breaking: every client must now identify itself with a name that gets logged on every request, so it's possible to tell connectors apart (claude vs. codex vs. hermes, etc.).
+  - HTTP API: `Authorization: Bearer <client_name>:<PDW_SECRET_TOKEN>`. A bare `Bearer <token>` is rejected with 401.
+  - MCP OAuth: the authorize page has a new required `Client name` field alongside the secret. The name is embedded in the issued access/refresh tokens; existing tokens minted before this change are rejected and must be re-authorized.
+  - The name appears as `client=<name>` on the per-request log line, on MCP tool-call logs, and on API tool-call logs.
 - New: HTTP API at `/api/tools` (list) and `POST /api/tools/{name}` (invoke). Every MCP tool is exposed; same input/output, `{data: ...}` / `{error: {...}}` envelope. Static-bearer auth via `PDW_SECRET_TOKEN`. The query cache is shared with MCP — a `query_id` minted on one surface is fetchable on the other.
 - New: `PDW_SECRET_TOKEN` is the preferred env var for the shared secret. `MCP_SECRET_TOKEN` is still read as a fallback for one release.
 - Internal: MCP and HTTP both consume a shared `tool.Registry`. No MCP-visible behavior change: tool names, descriptions, input schemas, and call results are byte-identical (regression-tested via golden snapshot).

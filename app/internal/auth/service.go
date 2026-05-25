@@ -31,14 +31,16 @@ type Service struct {
 }
 
 type Claims struct {
-	ClientID string
-	Scope    string
-	Expires  time.Time
+	ClientID   string
+	ClientName string
+	Scope      string
+	Expires    time.Time
 }
 
 type signedPayload struct {
 	Type                string   `json:"type"`
 	ClientID            string   `json:"client_id,omitempty"`
+	ClientName          string   `json:"client_name,omitempty"`
 	RedirectURIs        []string `json:"redirect_uris,omitempty"`
 	RedirectURI         string   `json:"redirect_uri,omitempty"`
 	CodeChallenge       string   `json:"code_challenge,omitempty"`
@@ -74,7 +76,8 @@ func (s *Service) RequireBearer(metadataURL string) func(http.Handler) http.Hand
 			s.logger.WarnContext(ctx, "bearer token rejected", "path", req.URL.Path, "error", err)
 			return nil, fmt.Errorf("%w: %v", mcpauth.ErrInvalidToken, err)
 		}
-		s.logger.DebugContext(ctx, "bearer token accepted", "path", req.URL.Path, "client", tokenFingerprint(claims.ClientID))
+		SetClientName(ctx, claims.ClientName)
+		s.logger.DebugContext(ctx, "bearer token accepted", "path", req.URL.Path, "client", claims.ClientName)
 		return &mcpauth.TokenInfo{
 			Scopes:     strings.Fields(claims.Scope),
 			Expiration: claims.Expires,
@@ -94,10 +97,14 @@ func (s *Service) VerifyBearer(token string) (*Claims, error) {
 	if payload.Exp != 0 && s.now().Unix() > payload.Exp {
 		return nil, errors.New("token expired")
 	}
+	if payload.ClientName == "" {
+		return nil, errors.New("token missing client name; re-authorize the connector")
+	}
 	return &Claims{
-		ClientID: payload.ClientID,
-		Scope:    payload.Scope,
-		Expires:  time.Unix(payload.Exp, 0),
+		ClientID:   payload.ClientID,
+		ClientName: payload.ClientName,
+		Scope:      payload.Scope,
+		Expires:    time.Unix(payload.Exp, 0),
 	}, nil
 }
 
@@ -210,6 +217,12 @@ func (s *Service) authorizePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid secret token", http.StatusUnauthorized)
 		return
 	}
+	clientName, ok := ValidateClientName(r.Form.Get("client_name"))
+	if !ok {
+		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "invalid_client_name")
+		http.Error(w, "client name is required (letters, digits, '.', '_', '-', spaces; no ':' or control characters)", http.StatusBadRequest)
+		return
+	}
 	clientID := r.Form.Get("client_id")
 	redirectURI := r.Form.Get("redirect_uri")
 	if err := s.validateClientRedirect(clientID, redirectURI); err != nil {
@@ -237,6 +250,7 @@ func (s *Service) authorizePost(w http.ResponseWriter, r *http.Request) {
 	code, err := s.sign(signedPayload{
 		Type:                "code",
 		ClientID:            clientID,
+		ClientName:          clientName,
 		RedirectURI:         redirectURI,
 		CodeChallenge:       challenge,
 		CodeChallengeMethod: method,
@@ -262,7 +276,7 @@ func (s *Service) authorizePost(w http.ResponseWriter, r *http.Request) {
 		q.Set("state", state)
 	}
 	target.RawQuery = q.Encode()
-	s.logger.InfoContext(r.Context(), "authorization code issued", "client", tokenFingerprint(clientID), "redirect_host", target.Host)
+	s.logger.InfoContext(r.Context(), "authorization code issued", "client", clientName, "client_id", tokenFingerprint(clientID), "redirect_host", target.Host)
 	http.Redirect(w, r, target.String(), http.StatusFound)
 }
 
@@ -317,8 +331,13 @@ func (s *Service) tokenFromCode(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "authorization code already used")
 		return
 	}
-	s.logger.InfoContext(r.Context(), "authorization code exchanged", "client", tokenFingerprint(code.ClientID))
-	s.writeTokenResponse(w, code.ClientID)
+	if code.ClientName == "" {
+		s.logger.WarnContext(r.Context(), "authorization code token exchange rejected", "reason", "missing_client_name", "client_id", tokenFingerprint(code.ClientID))
+		oauthError(w, http.StatusBadRequest, "invalid_grant", "authorization code missing client_name; re-authorize")
+		return
+	}
+	s.logger.InfoContext(r.Context(), "authorization code exchanged", "client", code.ClientName, "client_id", tokenFingerprint(code.ClientID))
+	s.writeTokenResponse(w, code.ClientID, code.ClientName)
 }
 
 func (s *Service) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
@@ -338,26 +357,31 @@ func (s *Service) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
 		return
 	}
-	s.logger.InfoContext(r.Context(), "refresh token exchanged", "client", tokenFingerprint(refresh.ClientID))
-	s.writeTokenResponse(w, refresh.ClientID)
+	if refresh.ClientName == "" {
+		s.logger.WarnContext(r.Context(), "refresh token exchange rejected", "reason", "missing_client_name", "client_id", tokenFingerprint(refresh.ClientID))
+		oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token missing client_name; re-authorize")
+		return
+	}
+	s.logger.InfoContext(r.Context(), "refresh token exchanged", "client", refresh.ClientName, "client_id", tokenFingerprint(refresh.ClientID))
+	s.writeTokenResponse(w, refresh.ClientID, refresh.ClientName)
 }
 
-func (s *Service) writeTokenResponse(w http.ResponseWriter, clientID string) {
+func (s *Service) writeTokenResponse(w http.ResponseWriter, clientID, clientName string) {
 	accessExp := s.now().Add(24 * time.Hour).Unix()
 	refreshExp := s.now().Add(365 * 24 * time.Hour).Unix()
-	access, err := s.sign(signedPayload{Type: "access", ClientID: clientID, Scope: "query", Nonce: nonce(), Exp: accessExp, Iat: s.now().Unix()})
+	access, err := s.sign(signedPayload{Type: "access", ClientID: clientID, ClientName: clientName, Scope: "query", Nonce: nonce(), Exp: accessExp, Iat: s.now().Unix()})
 	if err != nil {
-		s.logger.Error("access token signing failed", "client", tokenFingerprint(clientID), "error", err)
+		s.logger.Error("access token signing failed", "client", clientName, "error", err)
 		http.Error(w, "could not issue access token", http.StatusInternalServerError)
 		return
 	}
-	refresh, err := s.sign(signedPayload{Type: "refresh", ClientID: clientID, Scope: "query", Nonce: nonce(), Exp: refreshExp, Iat: s.now().Unix()})
+	refresh, err := s.sign(signedPayload{Type: "refresh", ClientID: clientID, ClientName: clientName, Scope: "query", Nonce: nonce(), Exp: refreshExp, Iat: s.now().Unix()})
 	if err != nil {
-		s.logger.Error("refresh token signing failed", "client", tokenFingerprint(clientID), "error", err)
+		s.logger.Error("refresh token signing failed", "client", clientName, "error", err)
 		http.Error(w, "could not issue refresh token", http.StatusInternalServerError)
 		return
 	}
-	s.logger.Info("token response issued", "client", tokenFingerprint(clientID), "access_expires_at", accessExp, "refresh_expires_at", refreshExp)
+	s.logger.Info("token response issued", "client", clientName, "access_expires_at", accessExp, "refresh_expires_at", refreshExp)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  access,
 		"refresh_token": refresh,
@@ -510,5 +534,8 @@ var authorizePage = template.Must(template.New("authorize").Parse(`<!doctype htm
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Personal Data Warehouse</title>
 <style>body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:36rem;margin:12vh auto;padding:0 1rem;color:#172026}label,input,button{font-size:1rem}input{display:block;width:100%;box-sizing:border-box;margin:.5rem 0 1rem;padding:.7rem;border:1px solid #b8c1cc;border-radius:6px}button{padding:.7rem 1rem;border:0;border-radius:6px;background:#172026;color:white}</style></head>
 <body><h1>Authorize Personal Data Warehouse</h1><form method="post">
-{{range $key, $values := .}}{{range $values}}<input type="hidden" name="{{$key}}" value="{{.}}">{{end}}{{end}}
-<label for="secret_token">Secret token</label><input id="secret_token" name="secret_token" type="password" autofocus required><button type="submit">Authorize</button></form></body></html>`))
+{{range $key, $values := .}}{{if and (ne $key "client_name") (ne $key "secret_token")}}{{range $values}}<input type="hidden" name="{{$key}}" value="{{.}}">{{end}}{{end}}{{end}}
+<label for="client_name">Client name</label><input id="client_name" name="client_name" type="text" autocomplete="off" autofocus required placeholder="e.g. claude, codex, hermes" maxlength="64">
+<label for="secret_token">Secret token</label><input id="secret_token" name="secret_token" type="password" required>
+<p style="font-size:.9rem;color:#5a6b78;margin:-.5rem 0 1rem">The client name is logged on every request so you can tell connectors apart.</p>
+<button type="submit">Authorize</button></form></body></html>`))

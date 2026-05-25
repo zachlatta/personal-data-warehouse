@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
@@ -91,7 +92,7 @@ func (h *handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	}
 	body = trimWhitespace(body)
 
-	h.logger.InfoContext(r.Context(), "API tool called", "tool", name)
+	h.logger.InfoContext(r.Context(), "API tool called", "tool", name, "client", pdwauth.ClientNameFromContext(r.Context()))
 	out, isErr, callErr := t.Invoke(r.Context(), body)
 	if callErr != nil {
 		// Decode failures bubble up as callErr too; tell them apart by type.
