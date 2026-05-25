@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -214,7 +213,7 @@ func (s *Service) authorizePost(w http.ResponseWriter, r *http.Request) {
 	clientID := r.Form.Get("client_id")
 	redirectURI := r.Form.Get("redirect_uri")
 	if err := s.validateClientRedirect(clientID, redirectURI); err != nil {
-		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "invalid_redirect", "client", tokenFingerprint(clientID), "error", err)
+		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "invalid_redirect", "client", tokenFingerprint(clientID), "redirect_uri", redirectURI, "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -373,10 +372,48 @@ func (s *Service) validateClientRedirect(clientID, redirectURI string) error {
 	if err := s.verifySigned(clientID, "client", &client); err != nil {
 		return errors.New("invalid client_id")
 	}
-	if !slices.Contains(client.RedirectURIs, redirectURI) {
-		return errors.New("redirect_uri was not registered")
+	for _, registered := range client.RedirectURIs {
+		if redirectURIsMatch(registered, redirectURI) {
+			return nil
+		}
 	}
-	return nil
+	return errors.New("redirect_uri was not registered")
+}
+
+// redirectURIsMatch reports whether a redirect_uri presented in an authorization
+// request matches one registered by the client. Match is exact except for
+// loopback URIs (RFC 8252 §7.3): when both URIs are http on a loopback host
+// (127.0.0.1, ::1, or localhost), the port is allowed to differ so native
+// clients can bind to an ephemeral port each flow.
+func redirectURIsMatch(registered, presented string) bool {
+	if registered == presented {
+		return true
+	}
+	reg, err := url.Parse(registered)
+	if err != nil {
+		return false
+	}
+	pre, err := url.Parse(presented)
+	if err != nil {
+		return false
+	}
+	if !isLoopbackRedirect(reg) || !isLoopbackRedirect(pre) {
+		return false
+	}
+	return reg.Scheme == pre.Scheme &&
+		strings.EqualFold(reg.Hostname(), pre.Hostname()) &&
+		reg.Path == pre.Path
+}
+
+func isLoopbackRedirect(u *url.URL) bool {
+	if u.Scheme != "http" {
+		return false
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	return false
 }
 
 func (s *Service) sign(payload signedPayload) (string, error) {

@@ -123,6 +123,84 @@ func TestProtectedResourceMetadataNamesAppleMessagesAndIMessage(t *testing.T) {
 	}
 }
 
+func TestAuthorizeAllowsLoopbackPortVariation(t *testing.T) {
+	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
+	mux := http.NewServeMux()
+	svc.RegisterHandlers(mux, "https://mcp.example.com")
+
+	regBody := `{"redirect_uris":["http://127.0.0.1:51000/callback"],"token_endpoint_auth_method":"none"}`
+	regReq := httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(regBody))
+	regReq.Header.Set("Content-Type", "application/json")
+	regRec := httptest.NewRecorder()
+	mux.ServeHTTP(regRec, regReq)
+	if regRec.Code != http.StatusCreated {
+		t.Fatalf("register status = %d body=%s", regRec.Code, regRec.Body.String())
+	}
+	var reg struct {
+		ClientID string `json:"client_id"`
+	}
+	if err := json.Unmarshal(regRec.Body.Bytes(), &reg); err != nil {
+		t.Fatal(err)
+	}
+
+	form := url.Values{
+		"client_id":             {reg.ClientID},
+		"redirect_uri":          {"http://127.0.0.1:62345/callback"},
+		"response_type":         {"code"},
+		"code_challenge":        {s256Challenge("challenge")},
+		"code_challenge_method": {"S256"},
+		"secret_token":          {"setup-secret"},
+	}
+	authReq := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
+	authReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	authRec := httptest.NewRecorder()
+	mux.ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusFound {
+		t.Fatalf("authorize status = %d body=%s", authRec.Code, authRec.Body.String())
+	}
+	loc := authRec.Header().Get("Location")
+	if !strings.HasPrefix(loc, "http://127.0.0.1:62345/callback?") {
+		t.Fatalf("redirect did not preserve presented port: %q", loc)
+	}
+}
+
+func TestAuthorizeRejectsNonLoopbackHostMismatch(t *testing.T) {
+	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
+	mux := http.NewServeMux()
+	svc.RegisterHandlers(mux, "https://mcp.example.com")
+
+	regBody := `{"redirect_uris":["https://claude.ai/api/mcp/auth_callback"],"token_endpoint_auth_method":"none"}`
+	regReq := httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(regBody))
+	regReq.Header.Set("Content-Type", "application/json")
+	regRec := httptest.NewRecorder()
+	mux.ServeHTTP(regRec, regReq)
+	if regRec.Code != http.StatusCreated {
+		t.Fatalf("register status = %d body=%s", regRec.Code, regRec.Body.String())
+	}
+	var reg struct {
+		ClientID string `json:"client_id"`
+	}
+	if err := json.Unmarshal(regRec.Body.Bytes(), &reg); err != nil {
+		t.Fatal(err)
+	}
+
+	form := url.Values{
+		"client_id":             {reg.ClientID},
+		"redirect_uri":          {"https://evil.example.com/api/mcp/auth_callback"},
+		"response_type":         {"code"},
+		"code_challenge":        {s256Challenge("challenge")},
+		"code_challenge_method": {"S256"},
+		"secret_token":          {"setup-secret"},
+	}
+	authReq := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
+	authReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	authRec := httptest.NewRecorder()
+	mux.ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusBadRequest {
+		t.Fatalf("authorize status = %d body=%s", authRec.Code, authRec.Body.String())
+	}
+}
+
 func TestAuthorizeRejectsPlainPKCE(t *testing.T) {
 	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
 	mux := http.NewServeMux()
