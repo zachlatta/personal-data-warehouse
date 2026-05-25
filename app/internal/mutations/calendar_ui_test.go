@@ -9,6 +9,7 @@ import (
 )
 
 func TestReviewUIRendersCalendarCreateEvent(t *testing.T) {
+	withCalendarReviewLocation(t, "UTC")
 	store := &reviewStore{requests: []Request{{
 		ID:        "req-cal-create",
 		Status:    "pending_review",
@@ -145,6 +146,61 @@ func TestReviewUIRendersCalendarUpdateEventWithDiff(t *testing.T) {
 		`>Zoom (HD)<`,
 		// Notification chip shows "Don't notify"
 		`Don&#39;t notify`,
+	})
+}
+
+func TestReviewUIRendersTimedCalendarEventInLocalTimezone(t *testing.T) {
+	withCalendarReviewLocation(t, "America/New_York")
+	store := &reviewStore{requests: []Request{{
+		ID:        "req-cal-local",
+		Status:    "pending_review",
+		Title:     "Move roadmap sync",
+		Reason:    "moving the time and room",
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+		Mutations: []Mutation{{
+			ID:        "mut-cal-local",
+			Provider:  CalendarProvider,
+			Operation: CalendarUpdateEventOperation,
+			Account:   "zach@example.test",
+			Status:    "pending_review",
+			Title:     "Update event: PDW roadmap sync (renamed)",
+			Reason:    "moving the time and room; renaming to clarify scope",
+			Payload: map[string]any{
+				"calendar_id":  "primary",
+				"send_updates": "none",
+				"event_id":     "evt-local",
+				"patch": map[string]any{
+					"summary": "PDW roadmap sync (renamed)",
+					"start":   map[string]any{"dateTime": "2026-05-28T18:00:00Z", "timeZone": "UTC"},
+					"end":     map[string]any{"dateTime": "2026-05-28T18:30:00Z", "timeZone": "UTC"},
+				},
+			},
+			Preview: map[string]any{
+				"event": map[string]any{
+					"operation":    "update",
+					"calendar_id":  "primary",
+					"send_updates": "none",
+					"event_id":     "evt-local",
+					"summary":      "PDW roadmap sync (renamed)",
+					"start":        map[string]any{"dateTime": "2026-05-28T18:00:00Z", "timeZone": "UTC"},
+					"end":          map[string]any{"dateTime": "2026-05-28T18:30:00Z", "timeZone": "UTC"},
+				},
+			},
+		}},
+	}}}
+	body := fetchRequestDetail(t, store)
+
+	mustContain(t, body, []string{
+		`Thursday, May 28, 2026`,
+		`2:00`,
+		`2:30 PM EDT`,
+		`Thursday, May 28, 2026 2:00 PM EDT`,
+		`Thursday, May 28, 2026 2:30 PM EDT`,
+	})
+	mustNotContain(t, body, []string{
+		`6:00 – 6:30 PM UTC`,
+		`2026-05-28T18:00:00Z (UTC)`,
+		`2026-05-28T18:30:00Z (UTC)`,
 	})
 }
 
@@ -406,4 +462,24 @@ func mustContain(t *testing.T, body string, fragments []string) {
 			t.Fatalf("page missing %q\n--- body ---\n%s", want, body)
 		}
 	}
+}
+
+func mustNotContain(t *testing.T, body string, fragments []string) {
+	t.Helper()
+	for _, unwanted := range fragments {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("page unexpectedly contained %q\n--- body ---\n%s", unwanted, body)
+		}
+	}
+}
+
+func withCalendarReviewLocation(t *testing.T, name string) {
+	t.Helper()
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		t.Fatalf("LoadLocation(%q): %v", name, err)
+	}
+	old := calendarReviewLocation
+	calendarReviewLocation = func() *time.Location { return loc }
+	t.Cleanup(func() { calendarReviewLocation = old })
 }

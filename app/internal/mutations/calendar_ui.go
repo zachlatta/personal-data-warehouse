@@ -14,6 +14,13 @@ import (
 
 var calendarURLPattern = regexp.MustCompile(`https?://[^\s<>"']+`)
 
+var calendarReviewLocation = func() *time.Location {
+	if time.Local == nil {
+		return time.UTC
+	}
+	return time.Local
+}
+
 func renderCalendarMutation(w http.ResponseWriter, mutation Mutation) {
 	preview, _ := mutation.Preview["event"].(map[string]any)
 	if preview == nil {
@@ -143,8 +150,8 @@ func renderCalendarWhen(w http.ResponseWriter, preview map[string]any) {
 	if startMap == nil && endMap == nil {
 		return
 	}
-	startDate, startTime, startTz, startAllDay := parseCalendarTime(startMap)
-	endDate, endTime, endTz, _ := parseCalendarTime(endMap)
+	startDate, startTime, _, startAllDay := parseCalendarTime(startMap)
+	endDate, endTime, _, _ := parseCalendarTime(endMap)
 	if startDate == nil && endDate == nil {
 		return
 	}
@@ -170,10 +177,11 @@ func renderCalendarWhen(w http.ResponseWriter, preview map[string]any) {
 			fmt.Fprintf(w, `<div class="calendar-when-time">All day</div>`)
 		}
 	} else if startTime != nil {
+		localStart, localEnd, localStartTz, localEndTz := calendarLocalTimeRange(*startTime, endTime)
 		fmt.Fprintf(w, `<div class="calendar-when-date">%s</div>`,
-			html.EscapeString(formatFullDate(*startDate)),
+			html.EscapeString(formatFullDate(localStart)),
 		)
-		timeStr := html.EscapeString(formatTimeRange(*startTime, endTime, startTz, endTz))
+		timeStr := html.EscapeString(formatTimeRange(localStart, localEnd, localStartTz, localEndTz))
 		fmt.Fprintf(w, `<div class="calendar-when-time">%s</div>`, timeStr)
 	}
 	fmt.Fprintf(w, `</div></div>`)
@@ -292,14 +300,8 @@ func renderCalendarPatchValue(key string, value any) string {
 		}
 	case map[string]any:
 		if key == "start" || key == "end" {
-			if dt := strings.TrimSpace(stringFromAny(typed["dateTime"])); dt != "" {
-				if tz := strings.TrimSpace(stringFromAny(typed["timeZone"])); tz != "" {
-					return html.EscapeString(dt + " (" + tz + ")")
-				}
-				return html.EscapeString(dt)
-			}
-			if d := strings.TrimSpace(stringFromAny(typed["date"])); d != "" {
-				return html.EscapeString(d + " (all day)")
+			if formatted := formatCalendarPatchTime(typed); formatted != "" {
+				return html.EscapeString(formatted)
 			}
 		}
 	}
@@ -511,6 +513,7 @@ func parseCalendarTime(value map[string]any) (date *time.Time, timeOfDay *time.T
 	if value == nil {
 		return nil, nil, "", false
 	}
+	tz := strings.TrimSpace(stringFromAny(value["timeZone"]))
 	if d := strings.TrimSpace(stringFromAny(value["date"])); d != "" {
 		if parsed, err := time.Parse("2006-01-02", d); err == nil {
 			return &parsed, nil, "", true
@@ -518,14 +521,22 @@ func parseCalendarTime(value map[string]any) (date *time.Time, timeOfDay *time.T
 	}
 	if dt := strings.TrimSpace(stringFromAny(value["dateTime"])); dt != "" {
 		// Try RFC3339 first (covers ...Z and ...+HH:MM forms)
-		if parsed, err := time.Parse(time.RFC3339, dt); err == nil {
+		if parsed, err := time.Parse(time.RFC3339Nano, dt); err == nil {
 			d := time.Date(parsed.Year(), parsed.Month(), parsed.Day(), 0, 0, 0, 0, parsed.Location())
-			return &d, &parsed, strings.TrimSpace(stringFromAny(value["timeZone"])), false
+			return &d, &parsed, tz, false
+		}
+		if tz != "" {
+			if loc, err := time.LoadLocation(tz); err == nil {
+				if parsed, err := time.ParseInLocation("2006-01-02T15:04:05", dt, loc); err == nil {
+					d := time.Date(parsed.Year(), parsed.Month(), parsed.Day(), 0, 0, 0, 0, parsed.Location())
+					return &d, &parsed, tz, false
+				}
+			}
 		}
 		// Fall back to naive form without timezone
 		if parsed, err := time.Parse("2006-01-02T15:04:05", dt); err == nil {
 			d := time.Date(parsed.Year(), parsed.Month(), parsed.Day(), 0, 0, 0, 0, parsed.Location())
-			return &d, &parsed, strings.TrimSpace(stringFromAny(value["timeZone"])), false
+			return &d, &parsed, tz, false
 		}
 	}
 	return nil, nil, "", false
@@ -548,6 +559,9 @@ func formatTimeRange(start time.Time, end *time.Time, startTz, endTz string) str
 	if tz == "" {
 		tz = endTz
 	}
+	if startTz != "" && endTz != "" && startTz != endTz {
+		return startStr + " " + startTz + " – " + endStr + " " + endTz
+	}
 	// Combine AM/PM smartly: if same period, e.g. "9:00 – 9:30 AM"
 	if strings.HasSuffix(startStr, " AM") && strings.HasSuffix(endStr, " AM") {
 		startStr = strings.TrimSuffix(startStr, " AM")
@@ -562,6 +576,55 @@ func formatTimeRange(start time.Time, end *time.Time, startTz, endTz string) str
 
 func formatTimeOfDay(t time.Time) string {
 	return t.Format("3:04 PM")
+}
+
+func calendarLocalTimeRange(start time.Time, end *time.Time) (time.Time, *time.Time, string, string) {
+	loc := calendarReviewLocation()
+	if loc == nil {
+		loc = time.UTC
+	}
+	localStart := start.In(loc)
+	var localEnd *time.Time
+	if end != nil {
+		converted := end.In(loc)
+		localEnd = &converted
+	}
+	endTz := ""
+	if localEnd != nil {
+		endTz = calendarTimeZoneLabel(*localEnd)
+	}
+	return localStart, localEnd, calendarTimeZoneLabel(localStart), endTz
+}
+
+func calendarTimeZoneLabel(value time.Time) string {
+	name, offset := value.Zone()
+	if name != "" {
+		return name
+	}
+	if offset == 0 {
+		return "UTC"
+	}
+	sign := "+"
+	if offset < 0 {
+		sign = "-"
+		offset = -offset
+	}
+	return fmt.Sprintf("UTC%s%02d:%02d", sign, offset/3600, (offset%3600)/60)
+}
+
+func formatCalendarPatchTime(value map[string]any) string {
+	date, timeOfDay, _, allDay := parseCalendarTime(value)
+	if allDay {
+		if date == nil {
+			return ""
+		}
+		return formatFullDate(*date) + " (all day)"
+	}
+	if timeOfDay == nil {
+		return ""
+	}
+	localTime, _, localTz, _ := calendarLocalTimeRange(*timeOfDay, nil)
+	return formatFullDate(localTime) + " " + formatTimeOfDay(localTime) + " " + localTz
 }
 
 // humanRecurrence converts a Google Calendar RRULE list into a short English
