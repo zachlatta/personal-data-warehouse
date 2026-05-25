@@ -43,6 +43,7 @@ func TestOAuthFlowAcceptsSecretAndIssuesBearerToken(t *testing.T) {
 		"code_challenge":        {s256Challenge("challenge")},
 		"code_challenge_method": {"S256"},
 		"secret_token":          {"setup-secret"},
+		"client_name":           {"claude-test"},
 	}
 	authReq := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
 	authReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -89,8 +90,40 @@ func TestOAuthFlowAcceptsSecretAndIssuesBearerToken(t *testing.T) {
 	if token.AccessToken == "" || token.RefreshToken == "" || token.TokenType != "Bearer" {
 		t.Fatalf("bad token response: %#v", token)
 	}
-	if _, err := svc.VerifyBearer(token.AccessToken); err != nil {
+	claims, err := svc.VerifyBearer(token.AccessToken)
+	if err != nil {
 		t.Fatalf("VerifyBearer failed: %v", err)
+	}
+	if claims.ClientName != "claude-test" {
+		t.Fatalf("access token ClientName = %q, want %q", claims.ClientName, "claude-test")
+	}
+
+	// The refresh token must also carry the client name so the next exchange
+	// can issue a new access token without losing the identity.
+	refreshForm := url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {reg.ClientID},
+		"refresh_token": {token.RefreshToken},
+	}
+	refreshReq := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(refreshForm.Encode()))
+	refreshReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	refreshRec := httptest.NewRecorder()
+	mux.ServeHTTP(refreshRec, refreshReq)
+	if refreshRec.Code != http.StatusOK {
+		t.Fatalf("refresh status = %d body=%s", refreshRec.Code, refreshRec.Body.String())
+	}
+	var refreshed struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(refreshRec.Body.Bytes(), &refreshed); err != nil {
+		t.Fatal(err)
+	}
+	refreshedClaims, err := svc.VerifyBearer(refreshed.AccessToken)
+	if err != nil {
+		t.Fatalf("VerifyBearer after refresh failed: %v", err)
+	}
+	if refreshedClaims.ClientName != "claude-test" {
+		t.Fatalf("refreshed access token ClientName = %q, want %q", refreshedClaims.ClientName, "claude-test")
 	}
 
 	replayReq := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(tokenForm.Encode()))
@@ -150,6 +183,7 @@ func TestAuthorizeAllowsLoopbackPortVariation(t *testing.T) {
 		"code_challenge":        {s256Challenge("challenge")},
 		"code_challenge_method": {"S256"},
 		"secret_token":          {"setup-secret"},
+		"client_name":           {"claude-test"},
 	}
 	authReq := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
 	authReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -191,6 +225,7 @@ func TestAuthorizeRejectsNonLoopbackHostMismatch(t *testing.T) {
 		"code_challenge":        {s256Challenge("challenge")},
 		"code_challenge_method": {"S256"},
 		"secret_token":          {"setup-secret"},
+		"client_name":           {"claude-test"},
 	}
 	authReq := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
 	authReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -198,6 +233,54 @@ func TestAuthorizeRejectsNonLoopbackHostMismatch(t *testing.T) {
 	mux.ServeHTTP(authRec, authReq)
 	if authRec.Code != http.StatusBadRequest {
 		t.Fatalf("authorize status = %d body=%s", authRec.Code, authRec.Body.String())
+	}
+}
+
+func TestAuthorizeRejectsMissingClientName(t *testing.T) {
+	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
+	mux := http.NewServeMux()
+	svc.RegisterHandlers(mux, "https://mcp.example.com")
+	clientID := registerTestClient(t, mux)
+
+	form := url.Values{
+		"client_id":             {clientID},
+		"redirect_uri":          {"https://claude.ai/api/mcp/auth_callback"},
+		"response_type":         {"code"},
+		"code_challenge":        {s256Challenge("challenge")},
+		"code_challenge_method": {"S256"},
+		"secret_token":          {"setup-secret"},
+		// client_name intentionally omitted
+	}
+	authReq := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
+	authReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	authRec := httptest.NewRecorder()
+	mux.ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusBadRequest {
+		t.Fatalf("authorize status = %d body=%s", authRec.Code, authRec.Body.String())
+	}
+	if !strings.Contains(authRec.Body.String(), "client name") {
+		t.Fatalf("body should mention required client name: %q", authRec.Body.String())
+	}
+}
+
+func TestVerifyBearerRejectsTokenWithoutClientName(t *testing.T) {
+	// A token minted before the client-name change has ClientName="". The
+	// server must refuse it so legacy connectors are forced through the new
+	// authorize page rather than silently logging as "".
+	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
+	legacy, err := svc.sign(signedPayload{
+		Type:     "access",
+		ClientID: "legacy-client",
+		Scope:    "query",
+		Nonce:    "n",
+		Exp:      svc.now().Add(time.Hour).Unix(),
+		Iat:      svc.now().Unix(),
+	})
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if _, err := svc.VerifyBearer(legacy); err == nil {
+		t.Fatal("VerifyBearer accepted a token with no client name; legacy tokens must be rejected")
 	}
 }
 

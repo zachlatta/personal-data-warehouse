@@ -37,11 +37,15 @@ PDW_MUTATION_UI_SESSION_TTL_SECONDS=43200
 ```
 
 `PDW_SECRET_TOKEN` is the shared secret. It does triple duty: signing key for
-the MCP OAuth bearer tokens, the value Claude prompts for during connector
-OAuth setup, and the raw bearer the HTTP API expects in
-`Authorization: Bearer <token>`. It must be at least 32 characters; use a
-high-entropy random value. Rotating it invalidates existing MCP sessions and
-any CLI/API clients holding the old token.
+the MCP OAuth bearer tokens, the value entered on the OAuth authorize page
+during connector setup, and the raw bearer the HTTP API expects in
+`Authorization: Bearer <client_name>:<token>`. It must be at least 32
+characters; use a high-entropy random value. Rotating it invalidates existing
+MCP sessions and any CLI/API clients holding the old token.
+
+Every authenticated request must identify the calling client by name (e.g.
+`claude`, `codex`, `hermes`, `claude-cli`) so the per-request log line shows
+who's calling. See the HTTP API and Claude Connector sections below.
 
 `MCP_SECRET_TOKEN` is still read as a fallback for one release so existing
 deployments keep working — set `PDW_SECRET_TOKEN` and drop the legacy var
@@ -80,7 +84,7 @@ https://your-public-coolify-domain/mcp
 ```
 
 3. Claude will start the OAuth flow.
-4. Enter `PDW_SECRET_TOKEN` on the authorization page.
+4. On the authorization page, enter a **client name** (e.g. `claude`, `claude-laptop`, `claude-work`) — this is what shows up in the server logs for every request the connector makes — and `PDW_SECRET_TOKEN`.
 
 ## Coolify
 
@@ -113,8 +117,14 @@ same input/output schemas, same shared `query_id` cache, different envelope.
 ### Auth
 
 ```http
-Authorization: Bearer <PDW_SECRET_TOKEN>
+Authorization: Bearer <client_name>:<PDW_SECRET_TOKEN>
 ```
+
+The client name is required (e.g. `codex`, `hermes`, `claude-cli`) — it's
+logged on every authenticated request so you can tell connectors apart. A
+bare `Bearer <token>` (no name) is rejected with `401`. Names must be 1–64
+characters, with no `:` (it separates name from token) and no control
+characters.
 
 The OAuth flow at `/oauth/*` is MCP-only; the HTTP API uses the raw shared
 secret directly. Tokens are compared in constant time.
@@ -141,7 +151,7 @@ JSON (same shape MCP uses); response wraps the tool's output in `data`:
 
 ```bash
 curl -sS https://your-host/api/tools/query \
-  -H "Authorization: Bearer $PDW_SECRET_TOKEN" \
+  -H "Authorization: Bearer codex:$PDW_SECRET_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"queries":[{"question":"recent transcripts","sql":"SELECT recording_id FROM apple_voice_memos_enrichments LIMIT 3"}],"format":"json"}'
 ```
@@ -166,7 +176,7 @@ The returned `query_id` is also valid for follow-up MCP calls and vice versa.
 
 | Status | Code                 | When                                                                 |
 |--------|----------------------|----------------------------------------------------------------------|
-| 401    | _(plain text)_       | Missing or invalid `Authorization: Bearer` header                    |
+| 401    | _(plain text)_       | Missing/invalid `Authorization: Bearer <name>:<token>` header        |
 | 404    | `tool_not_found`     | Unknown tool name, or unknown path under `/api`                      |
 | 400    | `invalid_input`      | Request body is not valid JSON for the tool's input schema           |
 | 405    | `method_not_allowed` | Wrong HTTP method (POST on `/api/tools`, GET on `/api/tools/{name}`) |

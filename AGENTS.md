@@ -11,6 +11,39 @@ Always assume other agents may be running in the same worktree. Before committin
 verify the staged changes and commit only the changes made in the current session unless Zach
 explicitly instructs otherwise.
 
+## Production Logs
+
+Production runs as a Coolify app on the `rotom` server. The best way to read
+its logs is the Loki wrapper in the `sysadmin` repo:
+`~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs`.
+
+That script talks to Loki over Tailscale, so it only works from a machine on
+the tailnet. This dev machine, `crobat`, is on the tailnet and has access.
+Before assuming you can use it, confirm you are actually on `crobat` by
+running `hostname` (or `scutil --get LocalHostName`) and checking the output
+equals `crobat`. If you are anywhere else, stop and ask Zach instead of
+guessing.
+
+Once you have confirmed you are on `crobat`, useful starting points:
+
+```bash
+# Recent app/container logs for the Coolify deployment.
+~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs \
+  --format-logs --since 1h '{job="coolify",server="rotom"}'
+
+# Filter to a specific container, e.g. the Dagster app.
+~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs \
+  --format-logs --since 1h \
+  '{job="coolify",server="rotom"} | json | container_name =~ "(?i).*dagster.*"'
+
+# Host-level system logs for rotom itself.
+~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs \
+  --format-logs --since 1h '{job="machine",server="rotom"}'
+```
+
+See `~/dev/zachlatta/sysadmin/README.md` and the script's `--help` for the
+full set of selectors and flags.
+
 ## Local Voice Memos Upload Scheduler
 
 This Mac is intended to run the local Voice Memos uploader through a user LaunchAgent:

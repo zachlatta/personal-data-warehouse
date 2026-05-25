@@ -55,7 +55,7 @@ func TestAPIRequiresBearer(t *testing.T) {
 func TestAPIListsTools(t *testing.T) {
 	srv := newMuxAPITestServer(t)
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/api/tools", nil)
-	req.Header.Set("Authorization", "Bearer "+muxAPITestSecret)
+	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET: %v", err)
@@ -92,7 +92,7 @@ func TestAPIQueryAndGetRowsShareCache(t *testing.T) {
 	srv := newMuxAPITestServer(t)
 	queryBody := `{"queries":[{"question":"how many","sql":"SELECT 1 AS n"}],"preview_rows":1,"format":"csv"}`
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/query", strings.NewReader(queryBody))
-	req.Header.Set("Authorization", "Bearer "+muxAPITestSecret)
+	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -120,7 +120,7 @@ func TestAPIQueryAndGetRowsShareCache(t *testing.T) {
 
 	rowsBody := `{"query_id":"` + queryID + `","offset":1,"limit":2}`
 	rowsReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/get_rows", strings.NewReader(rowsBody))
-	rowsReq.Header.Set("Authorization", "Bearer "+muxAPITestSecret)
+	rowsReq.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
 	rowsReq.Header.Set("Content-Type", "application/json")
 	rowsResp, err := http.DefaultClient.Do(rowsReq)
 	if err != nil {
@@ -155,7 +155,7 @@ func TestAPIInputSchemasMatchMCPGolden(t *testing.T) {
 	// internal derivation, this test fails before a CLI sees the drift.
 	srv := newMuxAPITestServer(t)
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/tools", nil)
-	req.Header.Set("Authorization", "Bearer "+muxAPITestSecret)
+	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET: %v", err)
@@ -198,7 +198,7 @@ func TestAPIInputSchemasMatchMCPGolden(t *testing.T) {
 func TestAPIUnknownToolReturns404(t *testing.T) {
 	srv := newMuxAPITestServer(t)
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/no_such_tool", strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer "+muxAPITestSecret)
+	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST: %v", err)
