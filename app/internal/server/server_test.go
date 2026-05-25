@@ -203,6 +203,61 @@ func TestMCPServerProposeGmailSendEmailAcceptsVariants(t *testing.T) {
 	}
 }
 
+// TestMCPHandlerErrorWrapsAsIsError pins the MCP error envelope produced when
+// a tool handler returns a non-nil error: the result body is the indented
+// {"error":"..."} map and IsError=true. This is the path mutation tools take
+// when service validation rejects an input.
+func TestMCPHandlerErrorWrapsAsIsError(t *testing.T) {
+	runner := fakeRunner{results: map[string]query.RawResult{}}
+	mutationSvc := mutations.NewService(fakeMutationStore{request: mutations.Request{ID: "ignored"}}, mutations.Config{BaseURL: "https://mcp.example.test"})
+	srv := NewMCPServerWithMutations(runner, query.Options{MaxRows: 5, MaxFieldChars: 100}, mutationSvc)
+
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Run(ctx, serverTransport) }()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect failed: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	// propose_mutation_request with a malformed mutation triggers
+	// mutationInputFromMap -> error, which Typed.Handle propagates as a
+	// non-nil err, exercising tool.mcpErrorResult.
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "propose_mutation_request", Arguments: map[string]any{
+		"title":     "broken",
+		"reason":    "test error path",
+		"mutations": []map[string]any{{"kind": "totally_unknown_kind"}},
+	}})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected IsError=true; content=%#v", result.Content)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("expected one content block, got %d", len(result.Content))
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("content type = %T", result.Content[0])
+	}
+	var body map[string]string
+	if err := json.Unmarshal([]byte(text.Text), &body); err != nil {
+		t.Fatalf("error body was not JSON: %v\n%s", err, text.Text)
+	}
+	if body["error"] == "" {
+		t.Fatalf("error body missing \"error\" field: %s", text.Text)
+	}
+	// Indented format must match what mutationToolResult emitted pre-refactor.
+	if !strings.Contains(text.Text, "\n  \"error\":") {
+		t.Fatalf("error envelope is not indented as before: %q", text.Text)
+	}
+}
+
 func TestMCPServerExposesDebugCacheStatusOnlyWhenEnabled(t *testing.T) {
 	runner := fakeRunner{results: map[string]query.RawResult{}}
 
