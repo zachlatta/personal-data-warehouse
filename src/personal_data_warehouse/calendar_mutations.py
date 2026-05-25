@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import ssl
 from typing import Any
 
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -230,6 +231,8 @@ def calendar_mutation_failure_status(exc: Exception) -> str:
         if status in {429, 500, 502, 503, 504}:
             return "failed_retryable"
         return "failed_terminal"
+    if isinstance(exc, RefreshError):
+        return "blocked_missing_credentials"
     if isinstance(exc, (ConnectionError, TimeoutError, OSError, ssl.SSLError)):
         return "failed_retryable"
     if isinstance(exc, RuntimeError) and ("OAuth token" in str(exc) or "cannot be refreshed" in str(exc)):
