@@ -1,9 +1,14 @@
-# Personal Data Warehouse MCP
+# Personal Data Warehouse App
 
-This is a Go remote MCP server for querying the Postgres warehouse from Claude connectors. It is
-the preferred read-only source for synced Gmail, Slack, Apple Notes, Apple Messages/iMessage,
-calendar, Voice Memo transcript, and cross-source personal data questions. It exposes generic SQL
-tools for reads, and can optionally expose human-reviewed Gmail/Contacts mutation proposal tools.
+This is the Go app that fronts the Postgres warehouse. It exposes the same
+set of tools (`query`, `get_rows`, `get_field`, `grep_rows`, `schema_overview`,
+plus optional Gmail/Contacts mutation proposals) over two surfaces:
+
+- **MCP** at `/mcp` — the default flow, used by Claude connectors. OAuth-protected.
+- **HTTP API** at `/api/tools` — for CLI and script use. Static-bearer protected.
+
+Both surfaces share the same in-process query cache, so a `query_id` minted on
+one surface is fetchable from the other without re-running the SQL.
 
 ## Environment
 
@@ -11,7 +16,7 @@ Required:
 
 ```bash
 POSTGRES_DATABASE_URL=...
-MCP_SECRET_TOKEN=...
+PDW_SECRET_TOKEN=...
 MCP_BASE_URL=https://your-public-coolify-domain
 ```
 
@@ -31,7 +36,16 @@ PDW_MUTATION_UI_SESSION_SECRET=...
 PDW_MUTATION_UI_SESSION_TTL_SECONDS=43200
 ```
 
-`MCP_SECRET_TOKEN` is the shared setup secret and token signing key. It must be at least 32 characters; use a high-entropy random value. During Claude connector setup, the OAuth page asks for this value. After a successful login, Claude uses bearer tokens issued by the server. Rotating `MCP_SECRET_TOKEN` invalidates existing sessions.
+`PDW_SECRET_TOKEN` is the shared secret. It does triple duty: signing key for
+the MCP OAuth bearer tokens, the value Claude prompts for during connector
+OAuth setup, and the raw bearer the HTTP API expects in
+`Authorization: Bearer <token>`. It must be at least 32 characters; use a
+high-entropy random value. Rotating it invalidates existing MCP sessions and
+any CLI/API clients holding the old token.
+
+`MCP_SECRET_TOKEN` is still read as a fallback for one release so existing
+deployments keep working — set `PDW_SECRET_TOKEN` and drop the legacy var
+when convenient.
 
 Set `PDW_MUTATION_UI_PASSWORD` to enable the mutation proposal tools and the review UI at
 `/mutation-review`. `PDW_MUTATION_UI_SESSION_SECRET` should be a separate high-entropy value; if it
@@ -43,15 +57,17 @@ on restart.
 ```bash
 cd app
 set -a; source ../.env; set +a
-export MCP_SECRET_TOKEN=choose-a-random-local-secret-at-least-32-chars
+export PDW_SECRET_TOKEN=choose-a-random-local-secret-at-least-32-chars
 export MCP_BASE_URL=http://localhost:8080
 go run ./cmd/pdw-mcp
 ```
 
-The MCP endpoint is:
+Endpoints:
 
 ```text
-http://localhost:8080/mcp
+http://localhost:8080/mcp           # MCP transport (OAuth-protected)
+http://localhost:8080/api/tools     # HTTP API tool list (static-bearer)
+http://localhost:8080/api/tools/{name}  # Invoke a tool
 ```
 
 ## Claude Connector Setup
@@ -64,7 +80,7 @@ https://your-public-coolify-domain/mcp
 ```
 
 3. Claude will start the OAuth flow.
-4. Enter `MCP_SECRET_TOKEN` on the authorization page.
+4. Enter `PDW_SECRET_TOKEN` on the authorization page.
 
 ## Coolify
 
@@ -81,13 +97,86 @@ Set:
 
 ```bash
 POSTGRES_DATABASE_URL=...
-MCP_SECRET_TOKEN=...
+PDW_SECRET_TOKEN=...
 MCP_BASE_URL=https://your-public-coolify-domain
 PDW_MUTATION_UI_PASSWORD=...
 PDW_MUTATION_UI_SESSION_SECRET=...
 ```
 
 Do not reuse the root `Dockerfile`; that one runs Dagster.
+
+## HTTP API
+
+Every MCP tool is also reachable over HTTP for CLI and script use. Same tools,
+same input/output schemas, same shared `query_id` cache, different envelope.
+
+### Auth
+
+```http
+Authorization: Bearer <PDW_SECRET_TOKEN>
+```
+
+The OAuth flow at `/oauth/*` is MCP-only; the HTTP API uses the raw shared
+secret directly. Tokens are compared in constant time.
+
+### Endpoints
+
+`GET /api/tools` — list all tools with their JSON Schema input definitions:
+
+```json
+{
+  "data": [
+    {
+      "name": "query",
+      "title": "Query Postgres",
+      "description": "...",
+      "input_schema": { "type": "object", "properties": { ... } }
+    }
+  ]
+}
+```
+
+`POST /api/tools/{name}` — invoke a tool. Request body is the raw tool input
+JSON (same shape MCP uses); response wraps the tool's output in `data`:
+
+```bash
+curl -sS https://your-host/api/tools/query \
+  -H "Authorization: Bearer $PDW_SECRET_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"queries":[{"question":"recent transcripts","sql":"SELECT recording_id FROM apple_voice_memos_enrichments LIMIT 3"}],"format":"json"}'
+```
+
+```json
+{
+  "data": {
+    "results": [
+      { "query_id": "abc123...", "total_rows": 3, "column_names": ["recording_id"], "preview": "..." }
+    ]
+  }
+}
+```
+
+The returned `query_id` is also valid for follow-up MCP calls and vice versa.
+
+### Errors
+
+```json
+{ "error": { "code": "tool_not_found", "message": "no tool named foo" } }
+```
+
+| Status | Code                 | When                                                                 |
+|--------|----------------------|----------------------------------------------------------------------|
+| 401    | _(plain text)_       | Missing or invalid `Authorization: Bearer` header                    |
+| 404    | `tool_not_found`     | Unknown tool name, or unknown path under `/api`                      |
+| 400    | `invalid_input`      | Request body is not valid JSON for the tool's input schema           |
+| 405    | `method_not_allowed` | Wrong HTTP method (POST on `/api/tools`, GET on `/api/tools/{name}`) |
+| 502    | `tool_error`         | Tool handler returned an error (e.g. Postgres unreachable)           |
+| 500    | `schema_error`       | Server-side schema derivation bug                                    |
+
+**Partial success returns 200.** A `query` call with three statements where
+one fails returns `200` with per-statement `error` fields in the body — same
+as MCP, where `IsError=true` would still carry the partial results. Inspect
+`data.results[].error` to detect this case.
 
 ## Tools
 
