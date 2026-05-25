@@ -24,11 +24,17 @@ class FakeSettings:
             raise ValueError(f"{email_address} is not configured")
         return FakeAccount(self.configured_account)
 
+    def calendar_account_for_email(self, email_address: str):
+        if email_address.strip().lower() != self.configured_account:
+            raise ValueError(f"{email_address} is not configured")
+        return FakeAccount(self.configured_account)
+
 
 class FakeWarehouse:
     def __init__(self) -> None:
         self.proposals = []
         self.contact_proposals = []
+        self.calendar_proposals = []
         self.request_proposals = []
         self.closed = False
 
@@ -47,6 +53,18 @@ class FakeWarehouse:
     def propose_contact_mutations(self, **kwargs):
         self.contact_proposals.append(kwargs)
         return {"id": "req-contact", "status": "pending_review", "mutations": [{"id": "mut-contact"}]}
+
+    def propose_calendar_create_event(self, **kwargs):
+        self.calendar_proposals.append(("create", kwargs))
+        return {"id": "req-calendar-create", "status": "pending_review", "mutations": [{"id": "mut-calendar-create"}]}
+
+    def propose_calendar_update_event(self, **kwargs):
+        self.calendar_proposals.append(("update", kwargs))
+        return {"id": "req-calendar-update", "status": "pending_review", "mutations": [{"id": "mut-calendar-update"}]}
+
+    def propose_calendar_delete_event(self, **kwargs):
+        self.calendar_proposals.append(("delete", kwargs))
+        return {"id": "req-calendar-delete", "status": "pending_review", "mutations": [{"id": "mut-calendar-delete"}]}
 
     def propose_upstream_mutation_request(self, **kwargs):
         self.request_proposals.append(kwargs)
@@ -231,6 +249,50 @@ def test_mcp_propose_gmail_send_email_returns_approval_url(monkeypatch) -> None:
     ]
 
 
+def test_mcp_propose_calendar_create_event_returns_approval_url(monkeypatch) -> None:
+    warehouse = FakeWarehouse()
+    monkeypatch.setattr(mcp_server, "load_settings", lambda **kwargs: FakeSettings())
+    monkeypatch.setattr(mcp_server, "warehouse_from_settings", lambda settings: warehouse)
+    event = {
+        "summary": "Planning",
+        "start": {"dateTime": "2030-01-01T10:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2030-01-01T10:30:00", "timeZone": "UTC"},
+    }
+
+    result = mcp_server.propose_calendar_create_event_mutation(
+        account="ZACH@example.test",
+        event=event,
+        calendar_id="primary",
+        send_updates="none",
+        reason="schedule planning",
+        title="Schedule planning",
+        context={"source": "test"},
+        approval_ui=FakeApprovalUi(),
+    )
+
+    assert result == {
+        "request_id": "req-calendar-create",
+        "mutation_ids": ["mut-calendar-create"],
+        "approval_url": "http://127.0.0.1:9999/requests/req-calendar-create",
+        "status": "pending_review",
+    }
+    assert warehouse.calendar_proposals == [
+        (
+            "create",
+            {
+                "account": "zach@example.test",
+                "event": event,
+                "reason": "schedule planning",
+                "calendar_id": "primary",
+                "send_updates": "none",
+                "title": "Schedule planning",
+                "context": {"source": "test"},
+                "requested_by": "mcp",
+            },
+        )
+    ]
+
+
 def test_mcp_propose_mutation_request_returns_request_approval_url(monkeypatch) -> None:
     warehouse = FakeWarehouse()
     monkeypatch.setattr(mcp_server, "load_settings", lambda **kwargs: FakeSettings())
@@ -245,6 +307,15 @@ def test_mcp_propose_mutation_request_returns_request_approval_url(monkeypatch) 
             "message": {"to": ["one@example.test"], "subject": "Hello", "body_text": "Body"},
         },
         {"type": "google_people.contacts", "account": "zach@example.test", "operations": [{"op": "delete_contact", "resource_name": "people/1"}]},
+        {
+            "type": "calendar.create_event",
+            "account": "zach@example.test",
+            "event": {
+                "summary": "Planning",
+                "start": {"dateTime": "2030-01-01T10:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2030-01-01T10:30:00", "timeZone": "UTC"},
+            },
+        },
     ]
     result = mcp_server.propose_mutation_request(
         title="Do the task",

@@ -7,7 +7,15 @@ from pathlib import Path
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from personal_data_warehouse.config import CONTACTS_SCOPE, GMAIL_COMPOSE_SCOPE, GMAIL_MODIFY_SCOPE, email_domain, env_slug, load_settings
+from personal_data_warehouse.config import (
+    CALENDAR_MUTATION_SCOPE,
+    CONTACTS_SCOPE,
+    GMAIL_COMPOSE_SCOPE,
+    GMAIL_MODIFY_SCOPE,
+    email_domain,
+    env_slug,
+    load_settings,
+)
 
 
 def run_oauth_flow(
@@ -16,6 +24,7 @@ def run_oauth_flow(
     include_gmail_modify: bool = False,
     include_gmail_compose: bool = False,
     include_contacts_write: bool = False,
+    include_calendar_write: bool = False,
 ) -> dict[str, str]:
     settings = load_settings(
         require_clickhouse=False,
@@ -40,6 +49,8 @@ def run_oauth_flow(
         scopes.append(GMAIL_COMPOSE_SCOPE)
     if include_contacts_write:
         scopes.append(CONTACTS_SCOPE)
+    if include_calendar_write:
+        scopes.append(CALENDAR_MUTATION_SCOPE)
     flow = InstalledAppFlow.from_client_config(
         json.loads(client_secrets_json),
         tuple(dict.fromkeys(scopes)),
@@ -79,6 +90,11 @@ def main() -> None:
         "--include-contacts-write",
         action="store_true",
         help="Request Google Contacts write scope so approved mutation jobs can create, update, or delete contacts.",
+    )
+    parser.add_argument(
+        "--include-calendar-write",
+        action="store_true",
+        help="Request Google Calendar full scope so approved mutation jobs can create, update, or delete calendar events.",
     )
     args = parser.parse_args()
 
@@ -126,6 +142,7 @@ def main() -> None:
             include_gmail_modify=args.include_gmail_modify,
             include_gmail_compose=args.include_gmail_compose,
             include_contacts_write=args.include_contacts_write,
+            include_calendar_write=args.include_calendar_write,
         )
         if args.write_env:
             update_env_file(Path(".env"), env_values)

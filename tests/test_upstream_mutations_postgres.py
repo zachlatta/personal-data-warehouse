@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 import os
 import uuid
 
 import pytest
 from dotenv import load_dotenv
 
-from personal_data_warehouse.clickhouse import CONTACT_CARD_COLUMNS, MESSAGE_COLUMNS
+from personal_data_warehouse.clickhouse import CALENDAR_EVENT_COLUMNS, CONTACT_CARD_COLUMNS, MESSAGE_COLUMNS
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
     FLOAT_COLUMNS,
@@ -464,6 +465,51 @@ def test_contact_mutation_proposal_edit_and_observe(warehouse: PostgresWarehouse
     assert warehouse.get_upstream_mutation_request(mutation["id"])["status"] == "observed"
 
 
+def test_calendar_event_mutation_proposal_and_observe(warehouse: PostgresWarehouse) -> None:
+    mutation = warehouse.propose_calendar_create_event(
+        account="zach@example.test",
+        title="Schedule planning",
+        reason="test calendar create",
+        event={
+            "summary": "Planning",
+            "start": {"dateTime": "2030-01-01T10:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2030-01-01T10:30:00", "timeZone": "UTC"},
+        },
+        send_updates="none",
+    )
+
+    assert mutation["status"] == "pending_review"
+    child = mutation["mutations"][0]
+    assert child["provider"] == "google_calendar"
+    assert child["operation"] == "calendar.create_event"
+    assert child["payload_json"]["calendar_id"] == "primary"
+    assert child["payload_json"]["send_updates"] == "none"
+    assert child["preview_json"]["event"]["summary"] == "Planning"
+
+    warehouse.approve_upstream_mutation_request(mutation["id"], actor_id="zach")
+    claimed = warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker")
+    assert claimed[0]["id"] == child["id"]
+    warehouse.complete_upstream_mutation(
+        child["id"],
+        result_json={"calendar_id": "primary", "event_id": "event-1", "etag": '"created-etag"'},
+        actor_id="worker",
+    )
+    assert warehouse.observe_succeeded_calendar_event_mutations() == 0
+
+    warehouse.insert_calendar_events(
+        [
+            _calendar_event_row(
+                event_id="event-1",
+                summary="Planning",
+                etag='"created-etag"',
+                sync_version=2,
+            )
+        ]
+    )
+    assert warehouse.observe_succeeded_calendar_event_mutations() == 1
+    assert warehouse.get_upstream_mutation_request(mutation["id"])["status"] == "observed"
+
+
 def _message_row(
     *,
     message_id: str,
@@ -541,6 +587,38 @@ def _contact_card_row(
         },
     )
     return row
+
+
+def _calendar_event_row(
+    *,
+    event_id: str,
+    summary: str,
+    etag: str,
+    sync_version: int = 1,
+    is_deleted: int = 0,
+):
+    now = datetime(2026, 5, 22, 12, tzinfo=UTC)
+    raw_event = {
+        "id": event_id,
+        "etag": etag,
+        "status": "cancelled" if is_deleted else "confirmed",
+        "summary": summary,
+    }
+    return _default_row(
+        CALENDAR_EVENT_COLUMNS,
+        account="zach@example.test",
+        calendar_id="primary",
+        event_id=event_id,
+        status=raw_event["status"],
+        is_deleted=is_deleted,
+        summary=summary,
+        start_at=now,
+        end_at=now,
+        raw_json=json.dumps(raw_event, sort_keys=True, separators=(",", ":")),
+        updated_at=now,
+        synced_at=now,
+        sync_version=sync_version,
+    )
 
 
 def _default_row(columns: tuple[str, ...], **overrides):

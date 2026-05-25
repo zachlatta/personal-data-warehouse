@@ -13,6 +13,7 @@ GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+CALENDAR_MUTATION_SCOPE = "https://www.googleapis.com/auth/calendar"
 CONTACTS_READONLY_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 CONTACTS_SCOPE = "https://www.googleapis.com/auth/contacts"
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
@@ -222,6 +223,7 @@ class Settings:
     google_scopes: tuple[str, ...] = (GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE)
     calendar_accounts: tuple[CalendarAccount, ...] = ()
     calendar_scopes: tuple[str, ...] = (CALENDAR_READONLY_SCOPE,)
+    calendar_mutation_scopes: tuple[str, ...] = (CALENDAR_MUTATION_SCOPE,)
     calendar_page_size: int = DEFAULT_CALENDAR_PAGE_SIZE
     calendar_force_full_sync: bool = False
     calendar_expanded_sync_lookback_days: int = DEFAULT_CALENDAR_EXPANDED_SYNC_LOOKBACK_DAYS
@@ -255,6 +257,14 @@ class Settings:
                 return account
         configured = ", ".join(account.email_address for account in self.gmail_accounts)
         raise ValueError(f"{email_address} is not configured in GMAIL_ACCOUNTS ({configured})")
+
+    def calendar_account_for_email(self, email_address: str) -> CalendarAccount:
+        normalized = email_address.strip().lower()
+        for account in self.calendar_accounts:
+            if account.email_address.lower() == normalized:
+                return account
+        configured = ", ".join(account.email_address for account in self.calendar_accounts)
+        raise ValueError(f"{email_address} is not configured in CALENDAR_ACCOUNTS ({configured})")
 
     def contact_account_for_email(self, email_address: str) -> ContactGoogleAccount:
         normalized = email_address.strip().lower()
@@ -832,6 +842,7 @@ def load_settings(
         google_oauth_client_secrets_json_by_domain=google_oauth_client_secrets_json_by_domain,
         calendar_accounts=calendar_accounts,
         calendar_scopes=(CALENDAR_READONLY_SCOPE,),
+        calendar_mutation_scopes=(CALENDAR_MUTATION_SCOPE,),
         calendar_page_size=calendar_page_size,
         calendar_force_full_sync=_parse_bool_env(os.getenv("CALENDAR_FORCE_FULL_SYNC"), False),
         calendar_expanded_sync_lookback_days=calendar_expanded_sync_lookback_days,

@@ -368,6 +368,10 @@ func renderMutationArticle(w http.ResponseWriter, mutation Mutation, requestID s
 		renderGmailEmailMutation(w, mutation, requestID, requestStatus, csrf)
 		return
 	}
+	if isCalendarMutation(mutation) {
+		renderCalendarMutation(w, mutation)
+		return
+	}
 	fmt.Fprintf(w, `<article class="mutation"><h3>%s</h3><p class="mutation-meta">%s %s for %s</p><pre>%s</pre><pre>%s</pre></article>`,
 		html.EscapeString(mutation.Title),
 		html.EscapeString(mutation.Status),
@@ -376,6 +380,17 @@ func renderMutationArticle(w http.ResponseWriter, mutation Mutation, requestID s
 		html.EscapeString(prettyJSON(mutation.Payload)),
 		html.EscapeString(prettyJSON(mutation.Preview)),
 	)
+}
+
+func isCalendarMutation(mutation Mutation) bool {
+	if mutation.Provider == CalendarProvider {
+		return true
+	}
+	switch mutation.Operation {
+	case CalendarCreateEventOperation, CalendarUpdateEventOperation, CalendarDeleteEventOperation:
+		return true
+	}
+	return false
 }
 
 func isContactMutation(mutation Mutation) bool {
@@ -1774,6 +1789,70 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f2ee;padding:10px;
 .gmail-expanded{border-top:1px solid #e8eaed;background:#fff}.gmail-expanded-subject{display:flex;align-items:center;gap:18px;padding:18px 28px 8px 76px}.gmail-expanded-subject h4{font-size:22px;font-weight:400;margin:0;color:#202124}
 .gmail-messages{padding:0 0 18px}.gmail-message{border-top:1px solid #f1f3f4}.gmail-message summary{list-style:none}.gmail-message summary::-webkit-details-marker{display:none}.gmail-message-summary{display:grid;grid-template-columns:48px minmax(0,1fr);gap:14px;padding:18px 28px;cursor:pointer}.gmail-message-summary:hover{background:#f8fafd}.gmail-avatar{width:40px;height:40px;border-radius:50%%;background:#5e7ce2;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.gmail-message-summary-main{min-width:0}.gmail-message-header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.gmail-message-header strong{display:inline;font-size:15px}.gmail-message-header time{color:#5f6368;font-size:13px;white-space:nowrap}.gmail-to{display:block;color:#5f6368;font-size:12px;margin-top:3px}.gmail-message-preview{margin:8px 0 0;color:#5f6368;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.gmail-message[open] .gmail-message-preview{display:none}.gmail-message-body{padding:0 28px 22px 90px}.gmail-message-body p{margin:8px 0 0;color:#3c4043;line-height:1.45;white-space:pre-wrap}.gmail-body-frame{display:block;width:100%%;min-height:120px;max-height:520px;border:0;background:white}.gmail-quoted{margin-top:14px;border-left:3px solid #dadce0;padding-left:12px}.gmail-quoted>summary{color:#5f6368;cursor:pointer;font-size:13px;margin-bottom:8px}.gmail-body-frame.quoted{max-height:340px}.raw-json{border-top:1px solid #e8eaed;padding-top:12px;margin-bottom:16px}.raw-json summary{color:#5f6368;cursor:pointer}
 .gmail-email-mutation{padding:0;overflow:hidden}.gmail-email-mutation>.mutation-head,.gmail-email-mutation>.mutation-meta,.gmail-email-mutation>.mutation-reason,.gmail-email-mutation>.gmail-email-form,.gmail-email-mutation>.gmail-email-readonly,.gmail-email-mutation>.gmail-email-tabs,.gmail-email-mutation>.gmail-email-variant-panel,.gmail-email-mutation>.gmail-email-reply-context{margin-left:16px;margin-right:16px}.gmail-email-mutation>.mutation-head{margin-top:16px}.gmail-email-reply-context{margin-top:14px;border:1px solid #dadce0;border-radius:6px;overflow:hidden;background:#fff}.gmail-email-reply-context-head{padding:10px 12px;border-bottom:1px solid #e8eaed;color:#5f6368;font-size:13px;font-weight:700}.gmail-email-reply-context .gmail-thread:first-child{border-top:0}.gmail-inline-reply{display:grid;grid-template-columns:48px minmax(0,1fr);gap:14px;padding:18px 28px 24px;border-top:1px solid #f1f3f4}.gmail-inline-reply-main{min-width:0}.gmail-inline-reply .gmail-email-tabs{margin-top:0}.gmail-inline-reply .gmail-email-form{margin:0}.gmail-inline-reply .gmail-email-variant-panel{margin:0}.gmail-inline-reply .gmail-email-editor-surface{min-height:108px}.gmail-email-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-top:14px;border-bottom:1px solid #e8eaed}.gmail-email-tab{border:0;border-bottom:3px solid transparent;border-radius:0;background:transparent;color:#5f6368;padding:9px 10px;font-weight:700}.gmail-email-tab.active{border-bottom-color:#1a73e8;color:#202124;background:#f8fafd}.gmail-email-form{display:grid;gap:12px;margin-top:14px;margin-bottom:16px}.gmail-email-variant-copy{margin:0;color:#5f6368}.gmail-email-delivery{display:flex;gap:8px;flex-wrap:wrap}.delivery-option{display:flex;align-items:center;gap:7px;margin:0;border:1px solid #dadce0;border-radius:6px;padding:7px 10px;background:#fff;color:#3c4043;font-weight:600}.delivery-option:has(input:checked){border-color:#1a73e8;background:#e8f0fe;color:#174ea6}.delivery-option input{margin:0}.gmail-email-fields{border:1px solid #dadce0;border-radius:6px;background:#fff}.gmail-email-fields label{display:grid;grid-template-columns:72px minmax(0,1fr);gap:12px;align-items:center;margin:0;padding:10px 12px;border-top:1px solid #eef0f2;color:#5f6368;font-size:13px}.gmail-email-fields label:first-child{border-top:0}.gmail-email-fields input{border:0;border-radius:0;padding:0;font:inherit;color:#202124;min-width:0}.gmail-email-fields input:focus{outline:0}.gmail-email-editor-wrap{border:1px solid #dadce0;border-radius:6px;background:#fff;overflow:hidden}.gmail-email-toolbar{display:flex;gap:4px;align-items:center;border-bottom:1px solid #e8eaed;background:#f8fafd;padding:6px}.gmail-email-toolbar button{background:#fff;color:#3c4043;border:1px solid #dadce0;padding:5px 8px;min-width:30px}.gmail-email-editor-surface{min-height:180px;padding:14px;outline:none;line-height:1.45}.gmail-email-editor:has(+ .gmail-email-signature-preview) .gmail-email-editor-surface{min-height:0;padding-bottom:6px}.gmail-email-editor-surface p{margin:0 0 10px}.gmail-email-editor-surface ul,.gmail-email-editor-surface ol{margin:8px 0 8px 22px;padding:0}.gmail-email-signature-preview{padding:0 14px 14px;color:#202124;line-height:normal}.gmail-email-signature-preview div{margin:0}.gmail-email-signature-preview div[dir=ltr]>span:first-child+br{display:none}.gmail-email-signature-preview a{color:#1a73e8}.gmail-email-quote-preview{border-top:1px solid #eef0f2;margin:4px 14px 14px;padding-top:10px}.gmail-email-quote-preview>summary{color:#5f6368;cursor:pointer;font-size:13px}.gmail-email-actions{display:flex;gap:8px;flex-wrap:wrap}.gmail-email-actions button[name=set_delivery_mode]{background:#137333}.gmail-email-readonly{display:grid;gap:12px;margin-top:14px;margin-bottom:16px}.gmail-email-readonly dl{display:grid;grid-template-columns:86px minmax(0,1fr);gap:8px 12px;margin:0;border:1px solid #dadce0;border-radius:6px;padding:12px;background:#fff}.gmail-email-readonly dt{color:#5f6368}.gmail-email-readonly dd{margin:0;overflow-wrap:anywhere}.gmail-email-body-frame{width:100%%;height:360px;border:1px solid #dadce0;border-radius:6px;background:#fff}
+.calendar-mutation{padding:0;overflow:hidden;border:1px solid #dadce0;border-radius:8px;background:#fff;box-shadow:0 1px 3px rgba(60,64,67,.08)}
+.calendar-mutation .calendar-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 20px;border-top-left-radius:8px;border-top-right-radius:8px;color:#fff}
+.calendar-mutation.create .calendar-banner{background:linear-gradient(135deg,#137333,#1e8e3e)}
+.calendar-mutation.update .calendar-banner{background:linear-gradient(135deg,#1a73e8,#4285f4)}
+.calendar-mutation.delete .calendar-banner{background:linear-gradient(135deg,#a50e0e,#c5221f)}
+.calendar-banner-left{display:flex;align-items:center;gap:14px;flex-wrap:wrap;min-width:0}
+.calendar-op-badge{background:rgba(255,255,255,.22);padding:5px 12px;border-radius:999px;font-weight:700;font-size:13px;letter-spacing:.02em;white-space:nowrap}
+.calendar-banner-account{color:rgba(255,255,255,.92);font-size:13px;font-weight:600;overflow-wrap:anywhere}
+.calendar-status-pill{background:rgba(255,255,255,.18);color:#fff;border-radius:999px;padding:4px 10px;font-size:12px;font-weight:700;white-space:nowrap}
+.calendar-body{padding:18px 22px 22px}
+.calendar-title{font-size:24px;font-weight:600;margin:0 0 4px;color:#202124;line-height:1.25}
+.calendar-reason{margin:0 0 16px;color:#5f6368;font-size:14px}
+.calendar-when{display:flex;gap:14px;align-items:flex-start;padding:14px 16px;border-radius:8px;background:#f1f3f4;margin-bottom:16px}
+.calendar-when-icon{font-size:22px;line-height:1.2}
+.calendar-when-body{display:flex;flex-direction:column;gap:2px;min-width:0}
+.calendar-when-date{font-weight:700;color:#202124;font-size:16px}
+.calendar-when-time{color:#3c4043;font-size:14px}
+.calendar-meta{list-style:none;margin:0 0 14px;padding:0;display:flex;flex-wrap:wrap;gap:10px}
+.calendar-meta-item{display:flex;align-items:center;gap:8px;background:#fff;border:1px solid #e0e3e7;border-radius:999px;padding:6px 12px;font-size:13px;color:#3c4043}
+.calendar-meta-item code{background:transparent;color:#202124;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.calendar-meta-label{display:block;color:#80868b;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;line-height:1.1;margin-bottom:1px}
+.calendar-meta-notify.off{background:#fdecea;border-color:#f6c9c6;color:#a50e0e}
+.calendar-meta-notify.external{background:#fff7e0;border-color:#fbd982;color:#92660e}
+.calendar-meta-recurrence{background:#e8f0fe;border-color:#c5d7fb;color:#174ea6}
+.calendar-icon{font-size:16px;line-height:1}
+.calendar-section{margin:18px 0 0;padding:0}
+.calendar-section h4{font-size:13px;font-weight:700;color:#5f6368;text-transform:uppercase;letter-spacing:.04em;margin:0 0 8px}
+.calendar-location{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;background:#fafbfc;border-radius:8px;border:1px solid #e8eaed;font-size:14px;color:#202124}
+.calendar-description p{margin:0;color:#202124;line-height:1.5}
+.calendar-attendees ul{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px}
+.calendar-attendee{display:flex;align-items:center;gap:12px;padding:8px 10px;border:1px solid #e8eaed;border-radius:8px;background:#fff}
+.calendar-avatar{width:36px;height:36px;flex-shrink:0;border-radius:50%%;display:grid;place-items:center;color:#fff;font-weight:700;font-size:14px}
+.calendar-avatar.color-a{background:#1a73e8}
+.calendar-avatar.color-b{background:#137333}
+.calendar-avatar.color-c{background:#a142f4}
+.calendar-avatar.color-d{background:#f9ab00}
+.calendar-avatar.color-e{background:#d93025}
+.calendar-avatar.color-f{background:#12b5cb}
+.calendar-avatar.color-g{background:#f538a0}
+.calendar-avatar.color-h{background:#7d3c98}
+.calendar-attendee-body{min-width:0;flex:1}
+.calendar-attendee-name{font-size:14px;font-weight:600;color:#202124;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.calendar-attendee-email{font-size:12px;color:#5f6368;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.calendar-attendee-tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.calendar-attendee-tag{background:#e8f0fe;color:#174ea6;border-radius:6px;padding:2px 7px;font-size:11px;font-weight:600}
+.calendar-attendee-tag.organizer{background:#fef7e0;color:#92660e}
+.calendar-attendee-tag.optional{background:#f1f3f4;color:#5f6368}
+.calendar-attendee-tag.rsvp-accepted{background:#e6f4ea;color:#137333}
+.calendar-attendee-tag.rsvp-declined{background:#fce8e6;color:#a50e0e}
+.calendar-attendee-tag.rsvp-tentative{background:#fff7e0;color:#92660e}
+.calendar-attendee-tag.rsvp-needsAction{background:#f1f3f4;color:#5f6368}
+.calendar-patch table{border:1px solid #e8eaed;border-radius:8px;overflow:hidden;background:#fff}
+.calendar-patch th,.calendar-patch td{border-bottom:1px solid #f1f3f4;padding:10px 12px}
+.calendar-patch th{background:#f8fafd;font-weight:600;color:#202124;font-size:13px;width:140px;text-align:left}
+.calendar-patch tr:last-child th,.calendar-patch tr:last-child td{border-bottom:0}
+.calendar-patch tbody th{background:#f8fafd;font-weight:600;color:#3c4043}
+.calendar-patch td{color:#202124}
+.calendar-patch td pre{white-space:pre-wrap;margin:0;background:#f8fafd;padding:8px 10px;border-radius:6px;font-size:12px}
+.calendar-delete-warning{background:#fce8e6;border:1px solid #f6c9c6;color:#a50e0e;border-radius:8px;padding:14px 16px;font-size:14px;line-height:1.45}
+.calendar-tech{margin-top:18px;border-top:1px solid #e8eaed;padding-top:10px}
+.calendar-tech summary{color:#5f6368;cursor:pointer;font-size:13px}
+.calendar-tech dl{margin:10px 0 0;display:grid;grid-template-columns:140px minmax(0,1fr);gap:6px 12px}
+.calendar-tech dt{color:#5f6368;font-size:12px}
+.calendar-tech dd{margin:0;color:#202124;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow-wrap:anywhere}
 .contact-mutation{padding:0;overflow:hidden}.contact-mutation>.mutation-head,.contact-mutation>.mutation-meta{margin-left:16px;margin-right:16px}.contact-mutation>.mutation-head{margin-top:16px}.contact-operations{border-top:1px solid #dfe1e5;margin-top:16px}.contact-operation{border-top:1px solid #f1f3f4;padding:18px 16px}.contact-operation:first-child{border-top:0}.contact-operation.destructive{box-shadow:inset 3px 0 #c5221f}.contact-operation-main{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:flex-start}.contact-avatar{width:40px;height:40px;border-radius:50%%;background:#137333;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.contact-operation.destructive .contact-avatar{background:#c5221f}.contact-operation-copy{min-width:0}.contact-operation-copy h4{margin:2px 0 4px;font-size:18px}.contact-op{margin:0;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.contact-meta{display:flex;flex-wrap:wrap;gap:8px;color:#5f6368;font-size:13px}.contact-effect,.contact-resource{margin:8px 0 0;color:#3c4043}.contact-effect code,.contact-resource code{background:#f1f3f4;border-radius:4px;padding:2px 5px}.contact-diff{margin-top:12px;border:1px solid #e8eaed;border-radius:6px;background:white}.contact-inline-row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;border-top:1px solid #eef0f2;padding:10px 12px}.contact-inline-row:first-child{border-top:0}.contact-inline-row>code{background:#f8fafd;border-radius:4px;padding:4px 6px;justify-self:start}.contact-inline-change{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.contact-inline-old,.contact-inline-new,.contact-inline-unchanged{border-radius:4px;padding:3px 6px;overflow-wrap:anywhere}.contact-inline-old{background:#fce8e6;color:#8c1d18;text-decoration:line-through;text-decoration-thickness:2px}.contact-inline-new{background:#e6f4ea;color:#137333;text-decoration:none}.contact-inline-arrow{color:#5f6368}.contact-diff-empty{margin:0;padding:12px;color:#5f6368}.contact-person-block{margin-top:12px;border-top:1px solid #e8eaed;padding-top:12px}.contact-block-title{margin:0 0 8px;font-weight:700}.contact-person-block dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;margin:0}.contact-person-block dt{color:#5f6368}.contact-person-block dd{margin:0}.contact-operation .raw-json{margin-bottom:0}
 @media (max-width:760px){main{padding:16px}.gmail-row{grid-template-columns:20px 20px minmax(0,1fr) 56px;gap:8px}.gmail-important,.gmail-list-labels{display:none}.gmail-sender{grid-column:3}.gmail-subject{grid-column:3 / 5;white-space:normal}.gmail-date{grid-column:4;grid-row:1}.gmail-expanded-subject{padding-left:18px;display:block}.gmail-message-summary{grid-template-columns:36px minmax(0,1fr);padding:18px}.gmail-message-body{padding-left:18px;padding-right:18px}.gmail-message-header{display:block}.gmail-message-header time{display:block;margin-top:4px}.gmail-body-frame{height:620px}.gmail-email-fields label,.gmail-email-readonly dl{grid-template-columns:1fr}.gmail-email-toolbar{flex-wrap:wrap}.contact-operation-main{grid-template-columns:40px minmax(0,1fr)}.contact-operation-main>.pill{grid-column:2}.contact-person-block dl{grid-template-columns:1fr}.contact-inline-row{grid-template-columns:1fr;gap:8px}.contact-inline-change{align-items:flex-start}}
 </style></head><body>`, html.EscapeString(title))

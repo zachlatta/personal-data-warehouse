@@ -15,6 +15,11 @@ from dagster import (
     sensor,
 )
 
+from personal_data_warehouse.calendar_mutations import (
+    CALENDAR_PROVIDER,
+    CalendarMutationResult,
+    CalendarMutationExecutor,
+)
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.contact_mutations import (
     GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
@@ -61,6 +66,7 @@ def process_upstream_mutations(context) -> dict[str, object]:
                 warehouse=warehouse,
                 gmail_executor=GmailMutationExecutor(settings=settings),
                 contact_executor=GoogleContactMutationExecutor(settings=settings),
+                calendar_executor=CalendarMutationExecutor(settings=settings),
                 limit=batch_size,
                 claimed_by=claimed_by,
             )
@@ -103,6 +109,7 @@ def process_upstream_mutation_batch(
     warehouse,
     gmail_executor: GmailMutationExecutor,
     contact_executor: GoogleContactMutationExecutor,
+    calendar_executor: CalendarMutationExecutor,
     limit: int,
     claimed_by: str,
 ) -> UpstreamMutationWorkerSummary:
@@ -111,6 +118,7 @@ def process_upstream_mutation_batch(
     observed += warehouse.observe_succeeded_gmail_unarchive_mutations()
     observed += warehouse.observe_succeeded_gmail_email_mutations()
     observed += warehouse.observe_succeeded_contact_mutations()
+    observed += warehouse.observe_succeeded_calendar_event_mutations()
     claimed = warehouse.claim_approved_upstream_mutations(limit=limit, claimed_by=claimed_by)
 
     succeeded = 0
@@ -118,10 +126,21 @@ def process_upstream_mutation_batch(
     failed_terminal = 0
     blocked_missing_credentials = 0
     for mutation in claimed:
-        if mutation.get("provider") == "google_people" and mutation.get("operation") == GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION:
+        provider = mutation.get("provider")
+        if provider == "google_people" and mutation.get("operation") == GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION:
             result = contact_executor.execute(mutation)
-        else:
+        elif provider == CALENDAR_PROVIDER:
+            result = calendar_executor.execute(mutation)
+        elif provider == "gmail":
             result = gmail_executor.execute(mutation)
+        else:
+            # Unknown providers should not be burned to failed_terminal by a stale worker
+            # version. Leave them claimable for a worker that understands them.
+            result = CalendarMutationResult(
+                status="failed_retryable",
+                result_json={"reason": "unknown provider for this worker version"},
+                error=f"unsupported provider {provider!r}; deferring for a newer worker",
+            )
         if result.status == "succeeded":
             warehouse.complete_upstream_mutation(
                 str(mutation["id"]),

@@ -51,6 +51,7 @@ func main() {
 			SessionTTL:            cfg.MutationUISessionTTL,
 			GmailAccounts:         cfg.GmailAccounts,
 			ContactGoogleAccounts: cfg.ContactGoogleAccounts,
+			CalendarAccounts:      cfg.CalendarAccounts,
 		})
 		logger.Info("mutation review UI enabled", "path", mutations.ReviewPath)
 	}

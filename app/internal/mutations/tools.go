@@ -56,5 +56,29 @@ func Tools(service *Service) []tool.Tool {
 				return service.ProposeContactMutations(ctx, in)
 			},
 		},
+		&tool.Typed[ProposeCalendarCreateEventInput, ProposalResponse]{
+			NameStr:        "propose_calendar_create_event",
+			TitleStr:       "Propose Calendar Create Event",
+			DescriptionStr: mutationToolDescription + " Proposes creating a new Google Calendar event. The event body is the standard Google Calendar event resource (summary, description, start, end, attendees, recurrence, etc.).",
+			Handle: func(ctx context.Context, in ProposeCalendarCreateEventInput) (ProposalResponse, error) {
+				return service.ProposeCalendarCreateEvent(ctx, in)
+			},
+		},
+		&tool.Typed[ProposeCalendarUpdateEventInput, ProposalResponse]{
+			NameStr:        "propose_calendar_update_event",
+			TitleStr:       "Propose Calendar Update Event",
+			DescriptionStr: mutationToolDescription + " Proposes patching an existing Google Calendar event. Only fields listed in `patch` are replaced; pass an instance event_id to override a single occurrence of a recurring event. expected_etag enables optimistic concurrency by rejecting the mutation if the event changes between proposal and execution.",
+			Handle: func(ctx context.Context, in ProposeCalendarUpdateEventInput) (ProposalResponse, error) {
+				return service.ProposeCalendarUpdateEvent(ctx, in)
+			},
+		},
+		&tool.Typed[ProposeCalendarDeleteEventInput, ProposalResponse]{
+			NameStr:        "propose_calendar_delete_event",
+			TitleStr:       "Propose Calendar Delete Event",
+			DescriptionStr: mutationToolDescription + " Proposes deleting a Google Calendar event. Pass an instance event_id to cancel a single occurrence of a recurring event; pass expected_etag to fail-fast if the event changed since proposal.",
+			Handle: func(ctx context.Context, in ProposeCalendarDeleteEventInput) (ProposalResponse, error) {
+				return service.ProposeCalendarDeleteEvent(ctx, in)
+			},
+		},
 	}
 }

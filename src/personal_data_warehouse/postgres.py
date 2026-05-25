@@ -68,6 +68,15 @@ GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION = "contacts.batch_mutation"
 GMAIL_ARCHIVE_OPERATION = "gmail.archive_threads"
 GMAIL_UNARCHIVE_OPERATION = "gmail.unarchive_threads"
 GMAIL_SEND_EMAIL_OPERATION = "gmail.send_email"
+CALENDAR_PROVIDER = "google_calendar"
+CALENDAR_CREATE_EVENT_OPERATION = "calendar.create_event"
+CALENDAR_UPDATE_EVENT_OPERATION = "calendar.update_event"
+CALENDAR_DELETE_EVENT_OPERATION = "calendar.delete_event"
+CALENDAR_EVENT_OPERATIONS = (
+    CALENDAR_CREATE_EVENT_OPERATION,
+    CALENDAR_UPDATE_EVENT_OPERATION,
+    CALENDAR_DELETE_EVENT_OPERATION,
+)
 REMOVED_PERSONAL_FINANCE_VIEWS = (
     "clean_finance_accounts",
     "clean_finance_transactions",
@@ -900,6 +909,97 @@ class PostgresWarehouse:
                     "type": "google_people.contacts",
                     "account": account,
                     "operations": list(operations),
+                }
+            ],
+            context=context,
+            requested_by=requested_by,
+        )
+
+    def propose_calendar_create_event(
+        self,
+        *,
+        account: str,
+        event: Mapping[str, Any],
+        reason: str,
+        calendar_id: str = "primary",
+        send_updates: str = "all",
+        title: str | None = None,
+        context: dict[str, Any] | None = None,
+        requested_by: str = "mcp",
+    ) -> dict[str, Any]:
+        return self.propose_upstream_mutation_request(
+            title=title or _calendar_event_title("Create event", event),
+            reason=reason,
+            mutations=[
+                {
+                    "type": CALENDAR_CREATE_EVENT_OPERATION,
+                    "account": account,
+                    "calendar_id": calendar_id,
+                    "send_updates": send_updates,
+                    "event": dict(event),
+                }
+            ],
+            context=context,
+            requested_by=requested_by,
+        )
+
+    def propose_calendar_update_event(
+        self,
+        *,
+        account: str,
+        event_id: str,
+        patch: Mapping[str, Any],
+        reason: str,
+        calendar_id: str = "primary",
+        expected_etag: str = "",
+        send_updates: str = "all",
+        title: str | None = None,
+        context: dict[str, Any] | None = None,
+        requested_by: str = "mcp",
+    ) -> dict[str, Any]:
+        return self.propose_upstream_mutation_request(
+            title=title or _calendar_event_title("Update event", patch),
+            reason=reason,
+            mutations=[
+                {
+                    "type": CALENDAR_UPDATE_EVENT_OPERATION,
+                    "account": account,
+                    "calendar_id": calendar_id,
+                    "event_id": event_id,
+                    "expected_etag": expected_etag,
+                    "send_updates": send_updates,
+                    "patch": dict(patch),
+                }
+            ],
+            context=context,
+            requested_by=requested_by,
+        )
+
+    def propose_calendar_delete_event(
+        self,
+        *,
+        account: str,
+        event_id: str,
+        reason: str,
+        calendar_id: str = "primary",
+        expected_etag: str = "",
+        send_updates: str = "all",
+        title: str | None = None,
+        context: dict[str, Any] | None = None,
+        requested_by: str = "mcp",
+    ) -> dict[str, Any]:
+        event_id = event_id.strip()
+        return self.propose_upstream_mutation_request(
+            title=title or f"Delete event {event_id}",
+            reason=reason,
+            mutations=[
+                {
+                    "type": CALENDAR_DELETE_EVENT_OPERATION,
+                    "account": account,
+                    "calendar_id": calendar_id,
+                    "event_id": event_id,
+                    "expected_etag": expected_etag,
+                    "send_updates": send_updates,
                 }
             ],
             context=context,
@@ -1914,6 +2014,100 @@ class PostgresWarehouse:
             observed += 1
         return observed
 
+    def observe_succeeded_calendar_event_mutations(self, *, limit: int = 100) -> int:
+        self.ensure_calendar_tables()
+        self.ensure_upstream_mutation_tables()
+        mutations = self._query_dicts(
+            """
+            SELECT *
+            FROM upstream_mutations
+            WHERE provider = %s
+              AND operation = ANY(%s)
+              AND status = 'succeeded'
+            ORDER BY executed_at ASC, id ASC
+            LIMIT %s
+            """,
+            (
+                CALENDAR_PROVIDER,
+                list(CALENDAR_EVENT_OPERATIONS),
+                int(limit),
+            ),
+        )
+        observed = 0
+        for mutation in mutations:
+            payload = _as_json_dict(mutation["payload_json"])
+            result = _as_json_dict(mutation["result_json"])
+            calendar_id = str(payload.get("calendar_id") or result.get("calendar_id") or "primary").strip() or "primary"
+            event_id = str(result.get("event_id") or payload.get("event_id") or "").strip()
+            operation = str(mutation["operation"])
+            if not event_id:
+                continue
+            if not self._calendar_event_mutation_observed(
+                account=str(mutation["account"]),
+                calendar_id=calendar_id,
+                event_id=event_id,
+                operation=operation,
+                result=result,
+            ):
+                continue
+            now = datetime.now(tz=UTC)
+            self._command(
+                """
+                UPDATE upstream_mutations
+                   SET status = 'observed',
+                       observed_at = %s,
+                       updated_at = %s
+                 WHERE id = %s
+                   AND status = 'succeeded'
+                """,
+                (now, now, mutation["id"]),
+            )
+            self._append_upstream_mutation_event(
+                str(mutation["id"]),
+                event_type="observed",
+                actor_type="dagster",
+                actor_id="upstream_mutation_worker",
+                event_json={"calendar_id": calendar_id, "event_id": event_id, "operation": operation},
+            )
+            if mutation.get("request_id"):
+                self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
+            observed += 1
+        return observed
+
+    def _calendar_event_mutation_observed(
+        self,
+        *,
+        account: str,
+        calendar_id: str,
+        event_id: str,
+        operation: str,
+        result: Mapping[str, Any],
+    ) -> bool:
+        rows = self._query_dicts(
+            """
+            SELECT is_deleted, raw_json
+            FROM calendar_events
+            WHERE account = %s
+              AND calendar_id = %s
+              AND event_id = %s
+            LIMIT 1
+            """,
+            (account, calendar_id, event_id),
+        )
+        if not rows:
+            return False
+        row = rows[0]
+        is_deleted = int(row.get("is_deleted") or 0) != 0
+        if operation == CALENDAR_DELETE_EVENT_OPERATION:
+            return is_deleted
+        if is_deleted:
+            return False
+        expected_etag = str(result.get("etag") or "").strip()
+        if not expected_etag:
+            return True
+        live_event = _as_json_dict(row.get("raw_json"))
+        return str(live_event.get("etag") or "").strip() == expected_etag
+
     def _refresh_upstream_mutation_request_status(self, request_id: str) -> None:
         request = self._query_dicts("SELECT * FROM upstream_mutation_requests WHERE id = %s", (request_id,))
         if not request:
@@ -2078,9 +2272,92 @@ class PostgresWarehouse:
                             },
                         }
                     )
+            elif mutation_type in CALENDAR_EVENT_OPERATIONS:
+                account = str(mutation.get("account") or "").strip().lower()
+                if not account:
+                    raise ValueError(f"mutation {index} must include account")
+                calendar_id = _calendar_id(mutation.get("calendar_id"))
+                send_updates = _calendar_send_updates(mutation.get("send_updates"))
+                expected_etag = str(mutation.get("expected_etag") or "").strip()
+                if mutation_type == CALENDAR_CREATE_EVENT_OPERATION:
+                    event = _json_mapping(mutation.get("event"))
+                    if not event:
+                        raise ValueError(f"mutation {index} must include event")
+                    if "start" not in event:
+                        raise ValueError(f"mutation {index} event must include start")
+                    if "end" not in event:
+                        raise ValueError(f"mutation {index} event must include end")
+                    payload = {
+                        "calendar_id": calendar_id,
+                        "send_updates": send_updates,
+                        "event": _normalize_json_value(event),
+                    }
+                    preview_event = _calendar_event_preview(
+                        event=event,
+                        operation="create",
+                        calendar_id=calendar_id,
+                        send_updates=send_updates,
+                    )
+                    title = str(mutation.get("title") or _calendar_event_title("Create event", event))
+                elif mutation_type == CALENDAR_UPDATE_EVENT_OPERATION:
+                    event_id = str(mutation.get("event_id") or "").strip()
+                    patch = _json_mapping(mutation.get("patch"))
+                    if not event_id:
+                        raise ValueError(f"mutation {index} must include event_id")
+                    if not patch:
+                        raise ValueError(f"mutation {index} must include patch")
+                    payload = {
+                        "calendar_id": calendar_id,
+                        "send_updates": send_updates,
+                        "event_id": event_id,
+                        "expected_etag": expected_etag,
+                        "patch": _normalize_json_value(patch),
+                    }
+                    preview_event = _calendar_event_preview(
+                        event=patch,
+                        operation="update",
+                        calendar_id=calendar_id,
+                        send_updates=send_updates,
+                        event_id=event_id,
+                        expected_etag=expected_etag,
+                    )
+                    title = str(mutation.get("title") or _calendar_event_title("Update event", patch))
+                else:
+                    event_id = str(mutation.get("event_id") or "").strip()
+                    if not event_id:
+                        raise ValueError(f"mutation {index} must include event_id")
+                    payload = {
+                        "calendar_id": calendar_id,
+                        "send_updates": send_updates,
+                        "event_id": event_id,
+                        "expected_etag": expected_etag,
+                    }
+                    preview_event = _calendar_event_preview(
+                        event={},
+                        operation="delete",
+                        calendar_id=calendar_id,
+                        send_updates=send_updates,
+                        event_id=event_id,
+                        expected_etag=expected_etag,
+                    )
+                    title = str(mutation.get("title") or f"Delete event {event_id}")
+                normalized.append(
+                    {
+                        "provider": CALENDAR_PROVIDER,
+                        "operation": mutation_type,
+                        "account": account,
+                        "title": title,
+                        "reason": str(mutation.get("reason") or request_reason),
+                        "payload_json": payload,
+                        "preview_json": {
+                            "event": preview_event,
+                            "context": _normalize_json_value(dict(request_context)),
+                        },
+                    }
+                )
             else:
                 raise ValueError(
-                    f"mutation {index} has unsupported type {mutation_type!r}; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, or google_people.contacts"
+                    f"mutation {index} has unsupported type {mutation_type!r}; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, google_people.contacts, calendar.create_event, calendar.update_event, or calendar.delete_event"
                 )
         return normalized
 
@@ -4382,6 +4659,60 @@ def _json_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def _calendar_id(value: Any) -> str:
+    return str(value or "primary").strip() or "primary"
+
+
+def _calendar_send_updates(value: Any) -> str:
+    send_updates = str(value or "all").strip()
+    if send_updates not in {"all", "externalOnly", "none"}:
+        raise ValueError("send_updates must be all, externalOnly, or none")
+    return send_updates
+
+
+def _calendar_event_title(prefix: str, event: Mapping[str, Any]) -> str:
+    summary = str(event.get("summary") or "").strip()
+    return f"{prefix}: {summary}" if summary else prefix
+
+
+def _calendar_event_preview(
+    *,
+    event: Mapping[str, Any],
+    operation: str,
+    calendar_id: str,
+    send_updates: str,
+    event_id: str = "",
+    expected_etag: str = "",
+) -> dict[str, Any]:
+    preview: dict[str, Any] = {
+        "operation": operation,
+        "calendar_id": calendar_id,
+        "send_updates": send_updates,
+    }
+    if event_id:
+        preview["event_id"] = event_id
+    if expected_etag:
+        preview["expected_etag"] = expected_etag
+    for key in (
+        "summary",
+        "description",
+        "location",
+        "start",
+        "end",
+        "attendees",
+        "recurrence",
+        "reminders",
+        "transparency",
+        "visibility",
+        "status",
+        "color_id",
+        "colorId",
+    ):
+        if key in event:
+            preview[key] = _normalize_json_value(event[key])
+    return preview
 
 
 def _json_ready(value: dict[str, Any]) -> dict[str, Any]:

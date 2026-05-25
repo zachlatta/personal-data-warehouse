@@ -119,6 +119,78 @@ def create_mcp_server(*, approval_ui: RunningMutationApprovalUi) -> FastMCP:
             approval_ui=approval_ui,
         )
 
+    @mcp.tool()
+    def propose_calendar_create_event(
+        account: str,
+        event: dict[str, Any],
+        reason: str,
+        calendar_id: str = "primary",
+        send_updates: str = "all",
+        title: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Propose creating a Google Calendar event, returning a human approval URL."""
+        return propose_calendar_create_event_mutation(
+            account=account,
+            event=event,
+            reason=reason,
+            calendar_id=calendar_id,
+            send_updates=send_updates,
+            title=title,
+            context=context,
+            approval_ui=approval_ui,
+        )
+
+    @mcp.tool()
+    def propose_calendar_update_event(
+        account: str,
+        event_id: str,
+        patch: dict[str, Any],
+        reason: str,
+        calendar_id: str = "primary",
+        expected_etag: str = "",
+        send_updates: str = "all",
+        title: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Propose patching a Google Calendar event, returning a human approval URL."""
+        return propose_calendar_update_event_mutation(
+            account=account,
+            event_id=event_id,
+            patch=patch,
+            reason=reason,
+            calendar_id=calendar_id,
+            expected_etag=expected_etag,
+            send_updates=send_updates,
+            title=title,
+            context=context,
+            approval_ui=approval_ui,
+        )
+
+    @mcp.tool()
+    def propose_calendar_delete_event(
+        account: str,
+        event_id: str,
+        reason: str,
+        calendar_id: str = "primary",
+        expected_etag: str = "",
+        send_updates: str = "all",
+        title: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Propose deleting a Google Calendar event, returning a human approval URL."""
+        return propose_calendar_delete_event_mutation(
+            account=account,
+            event_id=event_id,
+            reason=reason,
+            calendar_id=calendar_id,
+            expected_etag=expected_etag,
+            send_updates=send_updates,
+            title=title,
+            context=context,
+            approval_ui=approval_ui,
+        )
+
     return mcp
 
 
@@ -148,6 +220,10 @@ def propose_mutation_request_batch(
         require_contact_mutations=any(
             mutation_type in {"google_people.contacts", "contacts.batch_mutation"} for mutation_type in mutation_types
         ),
+        require_calendar=any(
+            mutation_type in {"calendar.create_event", "calendar.update_event", "calendar.delete_event"}
+            for mutation_type in mutation_types
+        ),
     )
     normalized_mutations: list[dict[str, Any]] = []
     for index, mutation in enumerate(mutations):
@@ -157,9 +233,11 @@ def propose_mutation_request_batch(
             normalized["account"] = settings.account_for_email(str(mutation.get("account") or "")).email_address
         elif mutation_type in {"google_people.contacts", "contacts.batch_mutation"}:
             normalized["account"] = settings.contact_account_for_email(str(mutation.get("account") or "")).email_address
+        elif mutation_type in {"calendar.create_event", "calendar.update_event", "calendar.delete_event"}:
+            normalized["account"] = settings.calendar_account_for_email(str(mutation.get("account") or "")).email_address
         else:
             raise ValueError(
-                f"mutation {index} has unsupported type {mutation_type!r}; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, or google_people.contacts"
+                f"mutation {index} has unsupported type {mutation_type!r}; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, google_people.contacts, calendar.create_event, calendar.update_event, or calendar.delete_event"
             )
         normalized_mutations.append(normalized)
 
@@ -351,6 +429,121 @@ def propose_contact_mutations_batch(
     finally:
         warehouse.close()
 
+    request_id = str(mutation["id"])
+    return {
+        "request_id": request_id,
+        "mutation_ids": [str(child["id"]) for child in mutation.get("mutations", [])],
+        "approval_url": approval_ui.request_url(request_id),
+        "status": str(mutation["status"]),
+    }
+
+
+def propose_calendar_create_event_mutation(
+    *,
+    account: str,
+    event: dict[str, Any],
+    reason: str,
+    approval_ui: RunningMutationApprovalUi,
+    calendar_id: str = "primary",
+    send_updates: str = "all",
+    title: str | None = None,
+    context: dict[str, Any] | None = None,
+    requested_by: str = "mcp",
+) -> dict[str, Any]:
+    if not reason.strip():
+        raise ValueError("reason must not be blank")
+    settings = load_settings(require_gmail=False, require_calendar=True)
+    calendar_account = settings.calendar_account_for_email(account)
+    warehouse = warehouse_from_settings(settings)
+    try:
+        mutation = warehouse.propose_calendar_create_event(
+            account=calendar_account.email_address,
+            event=event,
+            reason=reason,
+            calendar_id=calendar_id,
+            send_updates=send_updates,
+            title=title,
+            context=context,
+            requested_by=requested_by,
+        )
+    finally:
+        warehouse.close()
+    return _mutation_response(mutation=mutation, approval_ui=approval_ui)
+
+
+def propose_calendar_update_event_mutation(
+    *,
+    account: str,
+    event_id: str,
+    patch: dict[str, Any],
+    reason: str,
+    approval_ui: RunningMutationApprovalUi,
+    calendar_id: str = "primary",
+    expected_etag: str = "",
+    send_updates: str = "all",
+    title: str | None = None,
+    context: dict[str, Any] | None = None,
+    requested_by: str = "mcp",
+) -> dict[str, Any]:
+    if not reason.strip():
+        raise ValueError("reason must not be blank")
+    settings = load_settings(require_gmail=False, require_calendar=True)
+    calendar_account = settings.calendar_account_for_email(account)
+    warehouse = warehouse_from_settings(settings)
+    try:
+        mutation = warehouse.propose_calendar_update_event(
+            account=calendar_account.email_address,
+            event_id=event_id,
+            patch=patch,
+            reason=reason,
+            calendar_id=calendar_id,
+            expected_etag=expected_etag,
+            send_updates=send_updates,
+            title=title,
+            context=context,
+            requested_by=requested_by,
+        )
+    finally:
+        warehouse.close()
+    return _mutation_response(mutation=mutation, approval_ui=approval_ui)
+
+
+def propose_calendar_delete_event_mutation(
+    *,
+    account: str,
+    event_id: str,
+    reason: str,
+    approval_ui: RunningMutationApprovalUi,
+    calendar_id: str = "primary",
+    expected_etag: str = "",
+    send_updates: str = "all",
+    title: str | None = None,
+    context: dict[str, Any] | None = None,
+    requested_by: str = "mcp",
+) -> dict[str, Any]:
+    if not reason.strip():
+        raise ValueError("reason must not be blank")
+    settings = load_settings(require_gmail=False, require_calendar=True)
+    calendar_account = settings.calendar_account_for_email(account)
+    warehouse = warehouse_from_settings(settings)
+    try:
+        mutation = warehouse.propose_calendar_delete_event(
+            account=calendar_account.email_address,
+            event_id=event_id,
+            reason=reason,
+            calendar_id=calendar_id,
+            expected_etag=expected_etag,
+            send_updates=send_updates,
+            title=title,
+            context=context,
+            requested_by=requested_by,
+        )
+    finally:
+        warehouse.close()
+    return _mutation_response(mutation=mutation, approval_ui=approval_ui)
+
+
+def _mutation_response(*, mutation: dict[str, Any], approval_ui: RunningMutationApprovalUi) -> dict[str, Any]:
     request_id = str(mutation["id"])
     return {
         "request_id": request_id,

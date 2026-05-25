@@ -65,6 +65,9 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	if strings.Join(cfg.ContactGoogleAccounts, ",") != "contacts@example.test" {
 		t.Fatalf("ContactGoogleAccounts = %#v", cfg.ContactGoogleAccounts)
 	}
+	if strings.Join(cfg.CalendarAccounts, ",") != "zach@example.test,work@example.test" {
+		t.Fatalf("CalendarAccounts = %#v", cfg.CalendarAccounts)
+	}
 	if cfg.PostgresDatabaseURL != "postgresql://default:secret@example.com/default" {
 		t.Fatalf("PostgresDatabaseURL = %q", cfg.PostgresDatabaseURL)
 	}
@@ -82,6 +85,22 @@ func TestLoadFromEnvPrefersPDWSecretTokenOverMCPSecretToken(t *testing.T) {
 	}
 	if cfg.SecretToken != "preferred0123456789abcdef0123456789abcd" {
 		t.Fatalf("SecretToken = %q; PDW_SECRET_TOKEN must win over legacy MCP_SECRET_TOKEN", cfg.SecretToken)
+	}
+}
+
+func TestLoadFromEnvCalendarAccountsFallbackIgnoresBlankOverride(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL": "postgresql://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":      "legacy0123456789abcdef0123456789abcd",
+		"GMAIL_ACCOUNTS":        "zach@example.test",
+		"CALENDAR_ACCOUNTS":     " ",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv: %v", err)
+	}
+	if strings.Join(cfg.CalendarAccounts, ",") != "zach@example.test" {
+		t.Fatalf("CalendarAccounts = %#v", cfg.CalendarAccounts)
 	}
 }
 

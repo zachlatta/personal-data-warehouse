@@ -1296,6 +1296,80 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 					},
 				})
 			}
+		case CalendarCreateEventOperation:
+			sendUpdates, err := normalizeCalendarSendUpdates(mutation.SendUpdates)
+			if err != nil {
+				return nil, err
+			}
+			calendarID := normalizeCalendarID(mutation.CalendarID)
+			event := cloneMap(mutation.Event)
+			payload := map[string]any{
+				"calendar_id":  calendarID,
+				"send_updates": sendUpdates,
+				"event":        event,
+			}
+			out = append(out, storedMutation{
+				Provider:  CalendarProvider,
+				Operation: CalendarCreateEventOperation,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, calendarEventTitle("Create event", event)),
+				Reason:    reason,
+				Payload:   payload,
+				Preview: map[string]any{
+					"event":   calendarEventPreview(event, "create", calendarID, sendUpdates, "", ""),
+					"context": input.Context,
+				},
+			})
+		case CalendarUpdateEventOperation:
+			sendUpdates, err := normalizeCalendarSendUpdates(mutation.SendUpdates)
+			if err != nil {
+				return nil, err
+			}
+			calendarID := normalizeCalendarID(mutation.CalendarID)
+			patch := cloneMap(mutation.Patch)
+			payload := map[string]any{
+				"calendar_id":   calendarID,
+				"send_updates":  sendUpdates,
+				"event_id":      mutation.EventID,
+				"expected_etag": mutation.ExpectedEtag,
+				"patch":         patch,
+			}
+			out = append(out, storedMutation{
+				Provider:  CalendarProvider,
+				Operation: CalendarUpdateEventOperation,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, calendarEventTitle("Update event", patch)),
+				Reason:    reason,
+				Payload:   payload,
+				Preview: map[string]any{
+					"event":   calendarEventPreview(patch, "update", calendarID, sendUpdates, mutation.EventID, mutation.ExpectedEtag),
+					"context": input.Context,
+				},
+			})
+		case CalendarDeleteEventOperation:
+			sendUpdates, err := normalizeCalendarSendUpdates(mutation.SendUpdates)
+			if err != nil {
+				return nil, err
+			}
+			calendarID := normalizeCalendarID(mutation.CalendarID)
+			payload := map[string]any{
+				"calendar_id":   calendarID,
+				"send_updates":  sendUpdates,
+				"event_id":      mutation.EventID,
+				"expected_etag": mutation.ExpectedEtag,
+			}
+			out = append(out, storedMutation{
+				Provider:  CalendarProvider,
+				Operation: CalendarDeleteEventOperation,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, "Delete event "+mutation.EventID),
+				Reason:    reason,
+				Payload:   payload,
+				Preview: map[string]any{
+					"event":   calendarEventPreview(map[string]any{}, "delete", calendarID, sendUpdates, mutation.EventID, mutation.ExpectedEtag),
+					"context": input.Context,
+				},
+			})
 		default:
 			return nil, fmt.Errorf("mutation %d has unsupported type %q", index, mutation.Type)
 		}

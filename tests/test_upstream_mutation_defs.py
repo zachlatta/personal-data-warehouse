@@ -3,6 +3,7 @@ from __future__ import annotations
 from dagster import DagsterInstance, RunRequest, SkipReason, build_sensor_context
 
 from personal_data_warehouse.defs import upstream_mutations as upstream_mutation_defs
+from personal_data_warehouse.calendar_mutations import CalendarMutationResult
 from personal_data_warehouse.contact_mutations import ContactMutationResult
 from personal_data_warehouse.gmail_mutations import GmailMutationResult
 
@@ -35,6 +36,9 @@ class FakeWarehouse:
         return 0
 
     def observe_succeeded_contact_mutations(self) -> int:
+        return 0
+
+    def observe_succeeded_calendar_event_mutations(self) -> int:
         return 0
 
     def claim_approved_upstream_mutations(self, *, limit: int, claimed_by: str):
@@ -110,8 +114,8 @@ def test_upstream_mutation_sensor_emits_run_when_approved_work_exists(monkeypatc
 
 
 def test_process_upstream_mutation_batch_completes_and_fails_claimed_rows() -> None:
-    mutation_a = {"id": "mut-a"}
-    mutation_b = {"id": "mut-b"}
+    mutation_a = {"id": "mut-a", "provider": "gmail"}
+    mutation_b = {"id": "mut-b", "provider": "gmail"}
     warehouse = FakeWarehouse(
         claimed=[mutation_a, mutation_b],
         observed=1,
@@ -128,6 +132,7 @@ def test_process_upstream_mutation_batch_completes_and_fails_claimed_rows() -> N
         warehouse=warehouse,
         gmail_executor=executor,
         contact_executor=contact_executor,
+        calendar_executor=FakeExecutor([]),
         limit=5,
         claimed_by="worker-1",
     )
@@ -155,6 +160,7 @@ def test_process_upstream_mutation_batch_routes_contact_mutations_to_contact_exe
         warehouse=warehouse,
         gmail_executor=gmail_executor,
         contact_executor=contact_executor,
+        calendar_executor=FakeExecutor([]),
         limit=5,
         claimed_by="worker-1",
     )
@@ -162,4 +168,51 @@ def test_process_upstream_mutation_batch_routes_contact_mutations_to_contact_exe
     assert contact_executor.seen == [mutation]
     assert gmail_executor.seen == []
     assert warehouse.completed == [("mut-contact", {"operation_results": []}, "worker-1")]
+    assert summary.succeeded == 1
+
+
+def test_process_upstream_mutation_batch_defers_unknown_provider() -> None:
+    mutation = {"id": "mut-unknown", "provider": "future_provider", "operation": "future.op"}
+    warehouse = FakeWarehouse(claimed=[mutation])
+
+    summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=FakeExecutor([]),
+        contact_executor=FakeExecutor([]),
+        calendar_executor=FakeExecutor([]),
+        limit=5,
+        claimed_by="worker-1",
+    )
+
+    assert warehouse.completed == []
+    assert len(warehouse.failed) == 1
+    failed_id, status, error, _, _ = warehouse.failed[0]
+    assert failed_id == "mut-unknown"
+    assert status == "failed_retryable"
+    assert "unsupported provider" in error
+    assert summary.failed_retryable == 1
+
+
+def test_process_upstream_mutation_batch_routes_calendar_mutations_to_calendar_executor() -> None:
+    mutation = {
+        "id": "mut-calendar",
+        "provider": "google_calendar",
+        "operation": "calendar.create_event",
+    }
+    warehouse = FakeWarehouse(claimed=[mutation])
+    calendar_executor = FakeExecutor(
+        [CalendarMutationResult(status="succeeded", result_json={"event_id": "evt-1"})]
+    )
+
+    summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=FakeExecutor([]),
+        contact_executor=FakeExecutor([]),
+        calendar_executor=calendar_executor,
+        limit=5,
+        claimed_by="worker-1",
+    )
+
+    assert calendar_executor.seen == [mutation]
+    assert warehouse.completed == [("mut-calendar", {"event_id": "evt-1"}, "worker-1")]
     assert summary.succeeded == 1

@@ -14,6 +14,10 @@ const (
 	GmailSendEmailOperation        = "gmail.send_email"
 	GooglePeopleContactsOperation  = "google_people.contacts"
 	ContactsBatchMutationOperation = "contacts.batch_mutation"
+	CalendarProvider               = "google_calendar"
+	CalendarCreateEventOperation   = "calendar.create_event"
+	CalendarUpdateEventOperation   = "calendar.update_event"
+	CalendarDeleteEventOperation   = "calendar.delete_event"
 
 	defaultRequestedBy = "mcp"
 	reviewerActorID    = "web-ui"
@@ -28,6 +32,7 @@ type Config struct {
 	SessionTTL            time.Duration
 	GmailAccounts         []string
 	ContactGoogleAccounts []string
+	CalendarAccounts      []string
 	Now                   func() time.Time
 }
 
@@ -69,6 +74,12 @@ type MutationInput struct {
 	Message       map[string]any
 	EmailVariants []GmailEmailVariantInput
 	Operations    []map[string]any
+	CalendarID    string
+	EventID       string
+	ExpectedEtag  string
+	SendUpdates   string
+	Event         map[string]any
+	Patch         map[string]any
 	Raw           map[string]any
 }
 

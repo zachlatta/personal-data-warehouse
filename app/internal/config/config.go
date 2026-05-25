@@ -27,6 +27,7 @@ type Config struct {
 	MutationUISessionTTL    time.Duration
 	GmailAccounts           []string
 	ContactGoogleAccounts   []string
+	CalendarAccounts        []string
 }
 
 func LoadFromEnv(getenv func(string) string) (Config, error) {
@@ -47,6 +48,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		MutationUISessionTTL:    12 * time.Hour,
 		GmailAccounts:           parseCSV(getenv("GMAIL_ACCOUNTS")),
 		ContactGoogleAccounts:   parseCSV(getenv("CONTACT_GOOGLE_ACCOUNTS")),
+		CalendarAccounts:        parseCSV(firstNonEmpty(getenv("CALENDAR_ACCOUNTS"), getenv("GMAIL_ACCOUNTS"))),
 	}
 
 	var missing []string
@@ -116,7 +118,7 @@ func normalizePostgresURL(raw string) string {
 
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
-		if v != "" {
+		if strings.TrimSpace(v) != "" {
 			return v
 		}
 	}
