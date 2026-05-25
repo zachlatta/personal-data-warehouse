@@ -1,0 +1,42 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "format": {
+      "description": "preview format: csv, json, or ndjson; default csv",
+      "type": "string"
+    },
+    "preview_rows": {
+      "description": "number of initial rows to preview per statement, default 20",
+      "type": "integer"
+    },
+    "queries": {
+      "description": "array of query objects; each must include question and sql",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "question": {
+            "description": "concise plain-English question this SQL statement is trying to answer",
+            "type": "string"
+          },
+          "sql": {
+            "description": "read-only Postgres SQL string to run",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question",
+          "sql"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    }
+  },
+  "required": [
+    "queries"
+  ],
+  "type": "object"
+}

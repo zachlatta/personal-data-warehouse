@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -10,11 +9,34 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/zachlatta/personal-data-warehouse/app/internal/api"
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
+
+const debugCacheStatusDescription = "Return live cached query_ids, ages, and total cache size for debugging. Example: _debug_cache_status({}) shows which query handles are still valid. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: query, get_rows, grep_rows."
+
+func mcpToolHooks(logger *slog.Logger) tool.Hooks {
+	return tool.Hooks{
+		OnCall: func(ctx context.Context, name string) {
+			logger.InfoContext(ctx, "MCP tool called", "tool", name)
+		},
+	}
+}
+
+func debugCacheStatusTool(svc *query.Service) tool.Tool {
+	return &tool.Typed[debugCacheInput, query.DebugCacheStatus]{
+		NameStr:        "_debug_cache_status",
+		TitleStr:       "Debug Query Cache Status",
+		DescriptionStr: debugCacheStatusDescription,
+		Handle: func(_ context.Context, _ debugCacheInput) (query.DebugCacheStatus, error) {
+			return svc.DebugCacheStatus(), nil
+		},
+	}
+}
 
 type queryInput struct {
 	Queries     []queryStatementInput `json:"queries" jsonschema:"array of query objects; each must include question and sql"`
@@ -75,97 +97,44 @@ const schemaRelationsSQL = "SELECT table_name AS name FROM information_schema.ta
 const schemaToolDescriptionMaxChars = 12000
 
 func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
-	return newMCPServer(runner, opts, nil)
+	return NewMCPServerWithMutations(runner, opts, nil)
 }
 
 func NewMCPServerWithMutations(runner query.Runner, opts query.Options, mutationSvc *mutations.Service) *mcp.Server {
-	return newMCPServer(runner, opts, mutationSvc)
-}
-
-func newMCPServer(runner query.Runner, opts query.Options, mutationSvc *mutations.Service) *mcp.Server {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+	registry, _ := buildRegistry(runner, opts, mutationSvc, logger)
+	return newMCPServerFromRegistry(registry, logger)
+}
+
+// buildRegistry constructs the shared query.Service and assembles the
+// tool.Registry that both surfaces (MCP and HTTP) consume. The query.Service
+// is returned so callers that want the cache (e.g. NewMux for shutdown) can
+// hold onto it; passing it back also makes the shared-cache contract obvious.
+func buildRegistry(runner query.Runner, opts query.Options, mutationSvc *mutations.Service, logger *slog.Logger) (*tool.Registry, *query.Service) {
 	serverLogger := logger.With("component", "server")
 	svc := query.NewService(runner, opts)
 	schemaDescription := schemaDescriptionForTools(context.Background(), runner, serverLogger)
+	tools := readOnlyTools(svc, schemaDescription)
+	if opts.DebugCacheTool {
+		tools = append(tools, debugCacheStatusTool(svc))
+	}
+	return tool.NewRegistry(tools, mutations.Tools(mutationSvc)), svc
+}
+
+func newMCPServerFromRegistry(registry *tool.Registry, logger *slog.Logger) *mcp.Server {
+	serverLogger := logger.With("component", "server")
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "personal-data-warehouse",
 		Version: "0.1.0",
 	}, &mcp.ServerOptions{Instructions: serverInstructions})
 	serverLogger.Info("registering MCP tools")
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "query",
-		Title:       "Query Postgres",
-		Description: withSchemaDescription(queryDescription, schemaDescription),
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input queryInput) (*mcp.CallToolResult, any, error) {
-		statements := queryStatementsFromInput(input.Queries)
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "query", "statements", len(statements))
-		resp := svc.Execute(ctx, statements, input.PreviewRows, input.Format)
-		return jsonToolResult(resp, queryResponseHasError(resp)), nil, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "get_rows",
-		Title:       "Get Cached Rows",
-		Description: getRowsDescription,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input getRowsInput) (*mcp.CallToolResult, any, error) {
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "get_rows", "query_id", input.QueryID, "offset", input.Offset, "limit", input.Limit)
-		resp := svc.GetRows(ctx, input.QueryID, input.Offset, input.Limit, input.Format)
-		return jsonToolResult(resp, resp.Error != ""), nil, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "get_field",
-		Title:       "Get Cached Field",
-		Description: getFieldDescription,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input getFieldInput) (*mcp.CallToolResult, any, error) {
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "get_field", "query_id", input.QueryID, "row", input.Row, "column", input.Column, "offset", input.Offset, "length", input.Length)
-		resp := svc.GetField(ctx, input.QueryID, input.Row, input.Column, input.Offset, input.Length)
-		return jsonToolResult(resp, resp.Error != ""), nil, nil
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "grep_rows",
-		Title:       "Grep Cached Rows",
-		Description: grepRowsDescription,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input grepRowsInput) (*mcp.CallToolResult, any, error) {
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "grep_rows", "query_id", input.QueryID, "columns", len(input.Columns), "limit", input.Limit)
-		resp := svc.GrepRows(ctx, input.QueryID, input.Pattern, input.Columns, input.Limit, input.ContextChars)
-		return jsonToolResult(resp, resp.Error != ""), nil, nil
-	})
-	if opts.DebugCacheTool {
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "_debug_cache_status",
-			Title:       "Debug Query Cache Status",
-			Description: "Return live cached query_ids, ages, and total cache size for debugging. Example: _debug_cache_status({}) shows which query handles are still valid. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: query, get_rows, grep_rows.",
-		}, func(ctx context.Context, req *mcp.CallToolRequest, input debugCacheInput) (*mcp.CallToolResult, any, error) {
-			serverLogger.InfoContext(ctx, "MCP tool called", "tool", "_debug_cache_status")
-			return jsonToolResult(svc.DebugCacheStatus(), false), nil, nil
-		})
+	hooks := mcpToolHooks(serverLogger)
+	for _, t := range registry.All() {
+		t.RegisterMCP(server, hooks)
 	}
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "schema_overview",
-		Title:       "Schema Overview",
-		Description: withSchemaDescription(schemaOverviewDescription, schemaDescription),
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input schemaOverviewInput) (*mcp.CallToolResult, any, error) {
-		serverLogger.InfoContext(ctx, "MCP tool called", "tool", "schema_overview")
-		resp := svc.SchemaOverview(ctx)
-		content := make([]mcp.Content, 0, len(resp.Results))
-		isError := false
-		for _, result := range resp.Results {
-			content = append(content, &mcp.TextContent{Text: result.CSV})
-			if !result.Truncated.Empty() {
-				content = append(content, &mcp.TextContent{Text: result.Truncated.CSV()})
-			}
-			if result.Error != "" {
-				isError = true
-			}
-		}
-		return &mcp.CallToolResult{
-			Content: content,
-			IsError: isError,
-		}, nil, nil
-	})
-	mutations.RegisterTools(server, mutationSvc)
 	return server
 }
 
@@ -351,7 +320,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		body := "Personal Data Warehouse MCP server\nMCP endpoint: /mcp\n"
+		body := "Personal Data Warehouse app\nMCP endpoint: /mcp\nHTTP API: /api/tools\n"
 		if mutationSvc != nil {
 			body += "Mutation review UI: " + mutations.ReviewPath + "\n"
 		}
@@ -361,7 +330,9 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	mcpServer := NewMCPServerWithMutations(runner, query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}, mutationSvc)
+	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}
+	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default())
+	mcpServer := newMCPServerFromRegistry(registry, slog.Default())
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{
 		JSONResponse:   true,
 		Logger:         slog.Default().With("component", "mcp_streamable"),
@@ -369,21 +340,13 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	})
 	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(mcpHandler)
 	mux.Handle("/mcp", protected)
-	return logRequests(logger, mux)
-}
 
-func jsonToolResult(value any, isError bool) *mcp.CallToolResult {
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: `{"error":"failed to encode tool response"}`}},
-			IsError: true,
-		}
-	}
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: string(data)}},
-		IsError: isError,
-	}
+	apiHandler := api.NewHandler(registry, slog.Default())
+	apiProtected := authSvc.RequireStaticBearer()(apiHandler)
+	mux.Handle("/api/tools", apiProtected)
+	mux.Handle("/api/tools/", apiProtected)
+
+	return logRequests(logger, mux)
 }
 
 func queryResponseHasError(resp query.QueryResponse) bool {

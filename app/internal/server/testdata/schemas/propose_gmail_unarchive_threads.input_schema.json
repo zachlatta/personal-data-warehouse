@@ -1,0 +1,38 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "account": {
+      "description": "configured Gmail account email address",
+      "type": "string"
+    },
+    "context": {
+      "additionalProperties": true,
+      "description": "optional source context for human review",
+      "type": "object"
+    },
+    "reason": {
+      "description": "why these threads should be returned to the inbox",
+      "type": "string"
+    },
+    "thread_ids": {
+      "description": "Gmail thread IDs to unarchive",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "title": {
+      "description": "optional review request title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "account",
+    "thread_ids",
+    "reason"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,109 @@
+package server
+
+import (
+	"context"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
+)
+
+func readOnlyTools(svc *query.Service, schemaDescription string) []tool.Tool {
+	return []tool.Tool{
+		queryTool(svc, schemaDescription),
+		getRowsTool(svc),
+		getFieldTool(svc),
+		grepRowsTool(svc),
+		schemaOverviewTool(svc, schemaDescription),
+	}
+}
+
+func queryTool(svc *query.Service, schemaDescription string) tool.Tool {
+	return &tool.Typed[queryInput, query.QueryResponse]{
+		NameStr:        "query",
+		TitleStr:       "Query Postgres",
+		DescriptionStr: withSchemaDescription(queryDescription, schemaDescription),
+		Handle: func(ctx context.Context, in queryInput) (query.QueryResponse, error) {
+			return svc.Execute(ctx, queryStatementsFromInput(in.Queries), in.PreviewRows, in.Format), nil
+		},
+		IsError: queryResponseHasError,
+	}
+}
+
+func getRowsTool(svc *query.Service) tool.Tool {
+	return &tool.Typed[getRowsInput, query.RowsResponse]{
+		NameStr:        "get_rows",
+		TitleStr:       "Get Cached Rows",
+		DescriptionStr: getRowsDescription,
+		Handle: func(ctx context.Context, in getRowsInput) (query.RowsResponse, error) {
+			return svc.GetRows(ctx, in.QueryID, in.Offset, in.Limit, in.Format), nil
+		},
+		IsError: func(r query.RowsResponse) bool { return r.Error != "" },
+	}
+}
+
+func getFieldTool(svc *query.Service) tool.Tool {
+	return &tool.Typed[getFieldInput, query.FieldResponse]{
+		NameStr:        "get_field",
+		TitleStr:       "Get Cached Field",
+		DescriptionStr: getFieldDescription,
+		Handle: func(ctx context.Context, in getFieldInput) (query.FieldResponse, error) {
+			return svc.GetField(ctx, in.QueryID, in.Row, in.Column, in.Offset, in.Length), nil
+		},
+		IsError: func(r query.FieldResponse) bool { return r.Error != "" },
+	}
+}
+
+func grepRowsTool(svc *query.Service) tool.Tool {
+	return &tool.Typed[grepRowsInput, query.GrepResponse]{
+		NameStr:        "grep_rows",
+		TitleStr:       "Grep Cached Rows",
+		DescriptionStr: grepRowsDescription,
+		Handle: func(ctx context.Context, in grepRowsInput) (query.GrepResponse, error) {
+			return svc.GrepRows(ctx, in.QueryID, in.Pattern, in.Columns, in.Limit, in.ContextChars), nil
+		},
+		IsError: func(r query.GrepResponse) bool { return r.Error != "" },
+	}
+}
+
+func schemaOverviewTool(svc *query.Service, schemaDescription string) tool.Tool {
+	return &tool.Typed[schemaOverviewInput, schemaOverviewOutput]{
+		NameStr:        "schema_overview",
+		TitleStr:       "Schema Overview",
+		DescriptionStr: withSchemaDescription(schemaOverviewDescription, schemaDescription),
+		Handle: func(ctx context.Context, _ schemaOverviewInput) (schemaOverviewOutput, error) {
+			return schemaOverviewOutput{Response: svc.SchemaOverview(ctx)}, nil
+		},
+		IsError: func(o schemaOverviewOutput) bool { return o.hasError() },
+	}
+}
+
+// schemaOverviewOutput wraps query.Response so it can implement
+// tool.MultiContentMarshaler without query depending on the MCP SDK.
+type schemaOverviewOutput struct {
+	query.Response
+}
+
+func (o schemaOverviewOutput) hasError() bool {
+	for _, r := range o.Results {
+		if r.Error != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (o schemaOverviewOutput) MCPCallToolResult(isError bool) *mcp.CallToolResult {
+	content := make([]mcp.Content, 0, len(o.Results))
+	for _, result := range o.Results {
+		content = append(content, &mcp.TextContent{Text: result.CSV})
+		if !result.Truncated.Empty() {
+			content = append(content, &mcp.TextContent{Text: result.Truncated.CSV()})
+		}
+	}
+	return &mcp.CallToolResult{
+		Content: content,
+		IsError: isError,
+	}
+}

@@ -1,0 +1,36 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "columns": {
+      "description": "optional list of columns to search; default all columns",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
+    "context_chars": {
+      "description": "characters of context around each match, default 200",
+      "type": "integer"
+    },
+    "limit": {
+      "description": "maximum matches to return, default 100",
+      "type": "integer"
+    },
+    "pattern": {
+      "description": "case-insensitive regex pattern to search",
+      "type": "string"
+    },
+    "query_id": {
+      "description": "query_id returned by query",
+      "type": "string"
+    }
+  },
+  "required": [
+    "query_id",
+    "pattern"
+  ],
+  "type": "object"
+}

@@ -34,7 +34,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		Addr:                    valueOrDefault(getenv("MCP_ADDR"), ":8080"),
 		BaseURL:                 strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
 		PostgresDatabaseURL:     normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
-		SecretToken:             getenv("MCP_SECRET_TOKEN"),
+		SecretToken:             firstNonEmpty(getenv("PDW_SECRET_TOKEN"), getenv("MCP_SECRET_TOKEN")),
 		MaxRows:                 100000,
 		MaxFieldChars:           4000,
 		QueryCacheMaxBytes:      256 * 1024 * 1024,
@@ -54,13 +54,13 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		missing = append(missing, "POSTGRES_DATABASE_URL")
 	}
 	if cfg.SecretToken == "" {
-		missing = append(missing, "MCP_SECRET_TOKEN")
+		missing = append(missing, "PDW_SECRET_TOKEN (or legacy MCP_SECRET_TOKEN)")
 	}
 	if len(missing) > 0 {
 		return Config{}, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
 	}
 	if len(cfg.SecretToken) < MinSecretTokenLength {
-		return Config{}, fmt.Errorf("MCP_SECRET_TOKEN must be at least %d characters", MinSecretTokenLength)
+		return Config{}, fmt.Errorf("PDW_SECRET_TOKEN (or legacy MCP_SECRET_TOKEN) must be at least %d characters", MinSecretTokenLength)
 	}
 
 	var err error
@@ -112,6 +112,15 @@ func normalizePostgresURL(raw string) string {
 		return "postgresql://" + strings.TrimPrefix(value, "postgresql+psycopg2://")
 	}
 	return value
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func valueOrDefault(value, fallback string) string {
