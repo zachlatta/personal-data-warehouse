@@ -6,12 +6,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 )
 
@@ -30,7 +33,8 @@ func newMuxAPITestServer(t *testing.T) *httptest.Server {
 		MaxRows:       100,
 		MaxFieldChars: 1000,
 	}
-	mux := NewMux(cfg, authSvc, runner)
+	mutationSvc := mutations.NewService(fakeMutationStore{request: mutations.Request{ID: "mux-fixture"}}, mutations.Config{BaseURL: "http://example.test"})
+	mux := NewMux(cfg, authSvc, runner, mutationSvc)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -141,6 +145,53 @@ func TestAPIQueryAndGetRowsShareCache(t *testing.T) {
 	}
 	if rowsEnvelope.Data.QueryID != queryID {
 		t.Fatalf("get_rows returned different query_id: got %q want %q", rowsEnvelope.Data.QueryID, queryID)
+	}
+}
+
+func TestAPIInputSchemasMatchMCPGolden(t *testing.T) {
+	// API tool listings must return the exact same JSON Schema as MCP shows
+	// for every tool. If the SDK changes how it reflects schemas, or if the
+	// tool package's InputSchema() helper diverges from mcp.AddTool's
+	// internal derivation, this test fails before a CLI sees the drift.
+	srv := newMuxAPITestServer(t)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/tools", nil)
+	req.Header.Set("Authorization", "Bearer "+muxAPITestSecret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	var payload struct {
+		Data []struct {
+			Name        string         `json:"name"`
+			InputSchema map[string]any `json:"input_schema"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	apiByName := map[string]map[string]any{}
+	for _, e := range payload.Data {
+		apiByName[e.Name] = e.InputSchema
+	}
+	for _, name := range snapshotTools {
+		gotAPI, ok := apiByName[name]
+		if !ok {
+			t.Fatalf("API listing missing %q", name)
+		}
+		goldenBytes, err := os.ReadFile(filepath.Join("testdata", "schemas", name+".input_schema.json"))
+		if err != nil {
+			t.Fatalf("read golden for %q: %v", name, err)
+		}
+		var golden map[string]any
+		if err := json.Unmarshal(goldenBytes, &golden); err != nil {
+			t.Fatalf("decode golden %q: %v", name, err)
+		}
+		gotJSON, _ := json.Marshal(gotAPI)
+		wantJSON, _ := json.Marshal(golden)
+		if string(gotJSON) != string(wantJSON) {
+			t.Fatalf("API input_schema for %q diverges from MCP golden\n  api:    %s\n  golden: %s", name, gotJSON, wantJSON)
+		}
 	}
 }
 
