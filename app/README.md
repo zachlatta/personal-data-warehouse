@@ -381,9 +381,13 @@ without changes when new tools are added.
 cd app
 go build -o /tmp/pdw-cli ./cmd/pdw-cli
 
-export PDW_API_URL=http://localhost:8080
-export PDW_SECRET_TOKEN=...           # same value the server sees
-export PDW_CLIENT_NAME=pdw-cli        # optional; default is "pdw-cli"
+# One-time setup. Stores URL+token in $XDG_CONFIG_HOME/pdw-cli/config.json
+# (defaults to ~/.config/pdw-cli/config.json) with mode 0600.
+/tmp/pdw-cli login \
+  --base-url http://localhost:8080 \
+  --token "$(pass show pdw)" \
+  --client laptop
+# or run without flags for an interactive prompt.
 
 /tmp/pdw-cli list                     # name/title/description table
 /tmp/pdw-cli list --json              # raw JSON tool list
@@ -391,11 +395,16 @@ export PDW_CLIENT_NAME=pdw-cli        # optional; default is "pdw-cli"
 /tmp/pdw-cli call schema_overview     # zero-input tool
 /tmp/pdw-cli call query --data '{"queries":[{"question":"row count","sql":"SELECT 1"}]}'
 echo '{"queries":[{"question":"q","sql":"SELECT 1"}]}' | /tmp/pdw-cli call query
+/tmp/pdw-cli config show              # prints config with the token redacted
+/tmp/pdw-cli logout                   # removes the config file
 ```
 
-`--base-url`, `--token`, and `--client` flags override the corresponding
-environment variables. Server errors surface as non-zero exits with the
-structured `code`/`message`/`http <status>` envelope on stderr.
+Values resolve in this order: **`--flag` > environment variable > config
+file > default**. Env vars (`PDW_API_URL`, `PDW_SECRET_TOKEN`,
+`PDW_CLIENT_NAME`) and flags (`--base-url`, `--token`, `--client`) still
+work for one-off invocations, scripts, and CI. Server errors surface as
+non-zero exits with the structured `code`/`message`/`http <status>`
+envelope on stderr.
 
 ### Self-update
 

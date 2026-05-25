@@ -12,6 +12,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/cliclient"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/cliconfig"
 )
 
 const usage = `pdw-cli — talk to the personal data warehouse /api/tools surface.
@@ -20,6 +21,13 @@ USAGE
   pdw-cli [--base-url URL] [--token TOKEN] [--client NAME] <command> [args]
 
 COMMANDS
+  login                      Save warehouse URL + token to a per-user config file
+                             so future runs need no env vars or flags.
+                               --base-url URL  Warehouse URL (else prompted).
+                               --token TOKEN   Bearer token (else prompted).
+                               --client NAME   Client identifier (else prompted; default pdw-cli).
+  logout                     Remove the saved configuration.
+  config show                Print the resolved configuration with the token redacted.
   list                       List every tool the server exposes.
                                --json   Emit the raw tool list as a JSON array.
   describe <name>            Print one tool's title, description, and input schema.
@@ -34,21 +42,30 @@ COMMANDS
                                                   $PDW_CLI_REPO or zachlatta/personal-data-warehouse).
   help                       Show this message.
 
+CONFIGURATION
+  Values resolve in this order: --flag > environment > config file > default.
+  Run "pdw-cli login" once to write $XDG_CONFIG_HOME/pdw-cli/config.json
+  (defaults to ~/.config/pdw-cli/config.json) with mode 0600.
+
 ENVIRONMENT
   PDW_API_URL        Base URL of the warehouse app (e.g. http://localhost:8080).
   PDW_SECRET_TOKEN   Shared secret matching the server's PDW_SECRET_TOKEN.
   PDW_CLIENT_NAME    Client identifier sent on every request. Default: pdw-cli.
   PDW_CLI_REPO       GitHub repo for self-update. Default: zachlatta/personal-data-warehouse.
+  XDG_CONFIG_HOME    Overrides the config directory root.
 
 EXAMPLES
+  pdw-cli login                          # one-time setup; persists URL + token
   pdw-cli list
   pdw-cli describe query
   pdw-cli call schema_overview
   pdw-cli call query --data '{"queries":[{"question":"row count","sql":"SELECT 1"}]}'
   echo '{"queries":[{"question":"q","sql":"SELECT 1"}]}' | pdw-cli call query
+  pdw-cli config show
   pdw-cli version
   pdw-cli update --check
   pdw-cli update
+  pdw-cli logout
 `
 
 // version is overridden at build time via -ldflags "-X main.version=v1.2.3".
@@ -90,6 +107,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	if cmd == "update" {
 		return runUpdate(rest, stdout, stderr, getenv)
 	}
+	if cmd == "login" {
+		return runLogin(rest, stdin, stdout, stderr, getenv)
+	}
+	if cmd == "logout" {
+		return runLogout(rest, stdout, stderr, getenv)
+	}
+	if cmd == "config" {
+		return runConfig(rest, stdout, stderr, getenv)
+	}
 
 	resolved, err := resolveConfig(*baseURL, *clientName, *token, getenv)
 	if err != nil {
@@ -123,20 +149,28 @@ type resolvedConfig struct {
 }
 
 func resolveConfig(flagBase, flagClient, flagToken string, getenv func(string) string) (resolvedConfig, error) {
+	// Config file lookup is best-effort — a missing or corrupt file should
+	// not stop a fully-flagged or fully-env'd invocation from working.
+	var fileCfg cliconfig.Config
+	if path, perr := cliconfig.Path(getenv); perr == nil {
+		if loaded, lerr := cliconfig.Load(path); lerr == nil {
+			fileCfg = loaded
+		}
+	}
 	rc := resolvedConfig{
-		baseURL:    firstNonEmpty(flagBase, getenv("PDW_API_URL")),
-		clientName: firstNonEmpty(flagClient, getenv("PDW_CLIENT_NAME"), "pdw-cli"),
-		token:      firstNonEmpty(flagToken, getenv("PDW_SECRET_TOKEN")),
+		baseURL:    firstNonEmpty(flagBase, getenv("PDW_API_URL"), fileCfg.BaseURL),
+		clientName: firstNonEmpty(flagClient, getenv("PDW_CLIENT_NAME"), fileCfg.ClientName, "pdw-cli"),
+		token:      firstNonEmpty(flagToken, getenv("PDW_SECRET_TOKEN"), fileCfg.Token),
 	}
 	var missing []string
 	if rc.baseURL == "" {
-		missing = append(missing, "PDW_API_URL (or --base-url)")
+		missing = append(missing, "warehouse URL (--base-url, PDW_API_URL, or `pdw-cli login`)")
 	}
 	if rc.token == "" {
-		missing = append(missing, "PDW_SECRET_TOKEN (or --token)")
+		missing = append(missing, "bearer token (--token, PDW_SECRET_TOKEN, or `pdw-cli login`)")
 	}
 	if len(missing) > 0 {
-		return rc, fmt.Errorf("missing required configuration: %s", strings.Join(missing, ", "))
+		return rc, fmt.Errorf("not configured: %s", strings.Join(missing, "; "))
 	}
 	return rc, nil
 }
