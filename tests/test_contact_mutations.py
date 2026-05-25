@@ -144,3 +144,10 @@ def test_contact_mutation_executor_blocks_stale_etag(monkeypatch) -> None:
 
 def test_contact_mutation_failure_status_marks_network_retryable() -> None:
     assert contact_mutation_failure_status(ConnectionError("down")) == "failed_retryable"
+
+
+def test_contact_mutation_failure_status_treats_refresh_error_as_blocked() -> None:
+    from google.auth.exceptions import RefreshError
+
+    err = RefreshError("invalid_scope: Bad Request", {"error": "invalid_scope"})
+    assert contact_mutation_failure_status(err) == "blocked_missing_credentials"

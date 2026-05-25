@@ -396,3 +396,10 @@ def test_create_event_executor_rejects_empty_event_body(monkeypatch) -> None:
 def test_calendar_mutation_failure_status_maps_missing_oauth_to_blocked() -> None:
     err = RuntimeError("OAuth token for zach@example.test cannot be refreshed")
     assert calendar_mutation_failure_status(err) == "blocked_missing_credentials"
+
+
+def test_calendar_mutation_failure_status_treats_refresh_error_as_blocked() -> None:
+    from google.auth.exceptions import RefreshError
+
+    err = RefreshError("invalid_scope: Bad Request", {"error": "invalid_scope"})
+    assert calendar_mutation_failure_status(err) == "blocked_missing_credentials"

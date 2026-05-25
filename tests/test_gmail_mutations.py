@@ -294,6 +294,14 @@ def test_gmail_mutation_failure_status_marks_missing_scope_as_blocked() -> None:
     assert gmail_mutation_failure_status(error) == "blocked_missing_credentials"
 
 
+def test_gmail_mutation_failure_status_treats_refresh_error_as_blocked() -> None:
+    from google.auth.exceptions import RefreshError
+
+    error = RefreshError("invalid_scope: Bad Request", {"error": "invalid_scope"})
+
+    assert gmail_mutation_failure_status(error) == "blocked_missing_credentials"
+
+
 def _decode_raw_message(raw: str):
     padded = raw + ("=" * (-len(raw) % 4))
     return BytesParser(policy=policy.default).parsebytes(base64.urlsafe_b64decode(padded.encode("ascii")))
