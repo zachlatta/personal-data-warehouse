@@ -200,8 +200,8 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
-# Local Go build output for the MCP server
-mcp/pdw-mcp
+# Local Go build output for the app (MCP server)
+app/pdw-mcp
 
 # PyPI configuration file
 .pypirc

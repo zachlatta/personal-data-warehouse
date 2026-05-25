@@ -8,8 +8,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/zachlatta/personal-data-warehouse/mcp/internal/mutations"
-	"github.com/zachlatta/personal-data-warehouse/mcp/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 )
 
 type fakeRunner struct {
