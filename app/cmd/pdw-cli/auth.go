@@ -39,7 +39,11 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv f
 	}
 
 	reader := bufio.NewReader(stdin)
-	baseURL, err := promptValue(*flagBase, existing.BaseURL, "Warehouse API URL", false, reader, stdout)
+	baseDefault := existing.BaseURL
+	if baseDefault == "" {
+		baseDefault = defaultBaseURL
+	}
+	baseURL, err := promptValue(*flagBase, baseDefault, "Warehouse API URL", false, reader, stdout)
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw-cli login:", err)
 		return 2

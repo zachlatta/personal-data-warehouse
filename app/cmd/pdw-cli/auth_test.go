@@ -101,6 +101,28 @@ func TestLoginPreservesExistingValuesWhenBlankSubmitted(t *testing.T) {
 	}
 }
 
+func TestLoginUsesDefaultBaseURLWhenPromptBlank(t *testing.T) {
+	home := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	// Blank line for URL (should accept default) + token + client.
+	stdin := strings.NewReader("\nprompt-token\nlaptop\n")
+	code := run([]string{"login"}, stdin, &stdout, &stderr, envWithHome(home))
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s, stdout=%s", code, stderr.String(), stdout.String())
+	}
+	cfg, err := cliconfig.Load(configPathFor(t, home))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BaseURL != defaultBaseURL {
+		t.Fatalf("base url = %q, want default %q", cfg.BaseURL, defaultBaseURL)
+	}
+	// The prompt should advertise the default so the user knows what Enter accepts.
+	if !strings.Contains(stdout.String(), defaultBaseURL) {
+		t.Fatalf("prompt should show default URL hint; stdout=%s", stdout.String())
+	}
+}
+
 func TestLoginRejectsMissingRequiredFieldsInNonInteractiveMode(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer

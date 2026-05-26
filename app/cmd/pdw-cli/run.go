@@ -23,7 +23,8 @@ USAGE
 COMMANDS
   login                      Save warehouse URL + token to a per-user config file
                              so future runs need no env vars or flags.
-                               --base-url URL  Warehouse URL (else prompted).
+                               --base-url URL  Warehouse URL (else prompted; defaults
+                                               to https://personal-data-warehouse.zachlatta.com/).
                                --token TOKEN   Bearer token (else prompted).
                                --client NAME   Client identifier (else prompted; default pdw-cli).
   logout                     Remove the saved configuration.
@@ -74,6 +75,10 @@ var version = "dev"
 // defaultRepo is the GitHub repo this CLI updates from when --repo and
 // PDW_CLI_REPO are unset.
 const defaultRepo = "zachlatta/personal-data-warehouse"
+
+// defaultBaseURL is the warehouse URL the login prompt offers when the user
+// has no saved config and doesn't type one in.
+const defaultBaseURL = "https://personal-data-warehouse.zachlatta.com/"
 
 // run is the testable entry point. It returns the process exit code rather
 // than calling os.Exit so it can be driven from tests.
