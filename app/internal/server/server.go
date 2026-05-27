@@ -93,8 +93,9 @@ type grepRowsInput struct {
 type debugCacheInput struct{}
 
 type sqlInput struct {
-	SQL    string `json:"sql" jsonschema:"read-only Postgres SQL string to run"`
-	Format string `json:"format,omitempty" jsonschema:"output format: csv (default), json, or ndjson"`
+	Question string `json:"question" jsonschema:"concise plain-English question this SQL statement is trying to answer"`
+	SQL      string `json:"sql" jsonschema:"read-only Postgres SQL string to run"`
+	Format   string `json:"format,omitempty" jsonschema:"output format: csv (default), json, or ndjson"`
 }
 
 // serverInstructions is the only place MCP-side keyword discovery needs to
@@ -115,7 +116,7 @@ const grepRowsDescription = "Regex-search a cached query result and return match
 
 const schemaOverviewDescription = "Required first call. Lists the warehouse's tables, views, columns, and compact samples so the caller can pick the right tables before writing SQL. Each base table heading includes an approximate row count from planner statistics, formatted as `(~N rows, estimated)`; use that estimate for sizing decisions instead of running SELECT COUNT(*) over large tables."
 
-const sqlDescription = "Run a read-only Postgres SQL statement and return its full result, like a psql session. Skips the query cache, pagination, and field truncation that the MCP query tool applies. Refuses write SQL and caps the response at 1,000,000 rows."
+const sqlDescription = "Run a read-only Postgres SQL statement and return its full result, like a psql session. Skips the query cache, pagination, and field truncation that the MCP query tool applies. Refuses write SQL and caps the response at 1,000,000 rows. Each call must include question, a concise plain-English question this SQL statement is trying to answer, so server logs capture the caller's intent."
 
 func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	return NewMCPServerWithMutations(runner, opts, nil)

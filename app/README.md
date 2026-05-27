@@ -157,12 +157,13 @@ JSON (same shape MCP uses); response wraps the tool's output in `data`:
 curl -sS https://your-host/api/tools/sql \
   -H "Authorization: Bearer codex:$PDW_SECRET_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"sql":"SELECT recording_id FROM apple_voice_memos_enrichments LIMIT 3","format":"json"}'
+  -d '{"question":"What are three Voice Memo recording IDs?","sql":"SELECT recording_id FROM apple_voice_memos_enrichments LIMIT 3","format":"json"}'
 ```
 
 ```json
 {
   "data": {
+    "question": "What are three Voice Memo recording IDs?",
     "sql": "SELECT recording_id FROM apple_voice_memos_enrichments LIMIT 3",
     "format": "json",
     "column_names": ["recording_id"],
@@ -404,9 +405,9 @@ go build -o /tmp/pdw-cli ./cmd/pdw-cli
 /tmp/pdw-cli list --json              # raw JSON tool list
 /tmp/pdw-cli describe sql             # title + description + input JSON Schema
 /tmp/pdw-cli call schema_overview     # zero-input tool
-/tmp/pdw-cli sql 'SELECT 1'           # defaults to CSV and prints an output-format note
-/tmp/pdw-cli sql --output json 'SELECT now()'
-/tmp/pdw-cli sql --output nd-json 'SELECT * FROM gmail_messages LIMIT 3'
+/tmp/pdw-cli sql 'What is one?' 'SELECT 1'  # defaults to CSV and prints an output-format note
+/tmp/pdw-cli sql --output json 'What time is it?' 'SELECT now()'
+/tmp/pdw-cli sql --output nd-json 'Which recent Gmail messages exist?' 'SELECT * FROM gmail_messages LIMIT 3'
 /tmp/pdw-cli config show              # prints config with the token redacted
 /tmp/pdw-cli logout                   # removes the config file
 ```

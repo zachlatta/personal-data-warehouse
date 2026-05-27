@@ -83,7 +83,7 @@ func TestSQLCommandDefaultOutputsNoteAndCSV(t *testing.T) {
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 
-	out, errOut, code := runCLI(t, srv.URL, "", "sql", "SELECT 1 AS n")
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "How many rows do we get?", "SELECT 1 AS n")
 	if code != 0 {
 		t.Fatalf("expected zero exit, got %d (stderr=%s)", code, errOut)
 	}
@@ -98,9 +98,9 @@ func TestSQLCommandDefaultOutputsNoteAndCSV(t *testing.T) {
 
 func TestSQLCommandExplicitJSONOmitsDefaultNote(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{"sql":"SELECT 1 AS n","format":"json","rows":[{"n":1}],"total_rows":1}}`)
+		_, _ = io.WriteString(w, `{"data":{"question":"What is one?","sql":"SELECT 1 AS n","format":"json","rows":[{"n":1}],"total_rows":1}}`)
 	})
-	out, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "json", "SELECT 1 AS n")
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "json", "What is one?", "SELECT 1 AS n")
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
 	}
@@ -111,7 +111,7 @@ func TestSQLCommandExplicitJSONOmitsDefaultNote(t *testing.T) {
 	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
 		t.Fatalf("request body is not JSON: %v\n%s", err, srv.lastBody)
 	}
-	if input["sql"] != "SELECT 1 AS n" || input["format"] != "json" {
+	if input["sql"] != "SELECT 1 AS n" || input["format"] != "json" || input["question"] != "What is one?" {
 		t.Fatalf("request input = %#v", input)
 	}
 	if strings.Contains(out, sqlOutputHint) {
@@ -126,7 +126,7 @@ func TestSQLCommandNDJSONFlagMapsToToolFormat(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"sql":"SELECT 1 AS n","format":"ndjson","rows":"{\"n\":1}\n{\"n\":2}","total_rows":2}}`)
 	})
-	out, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "nd-json", "SELECT 1 AS n")
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "nd-json", "Which rows come back?", "SELECT 1 AS n")
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
 	}
@@ -146,7 +146,7 @@ func TestSQLCommandRejectsInvalidOutputFormat(t *testing.T) {
 	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
 		t.Fatal("server should not be hit")
 	})
-	_, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "table", "SELECT 1")
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "table", "Whatever?", "SELECT 1")
 	if code == 0 {
 		t.Fatalf("expected non-zero exit")
 	}
@@ -157,9 +157,9 @@ func TestSQLCommandRejectsInvalidOutputFormat(t *testing.T) {
 
 func TestSQLCommandReturnsDomainErrorsOnStderr(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{"sql":"DELETE FROM gmail_messages","format":"csv","error":"query tool is read-only"}}`)
+		_, _ = io.WriteString(w, `{"data":{"question":"Delete everything?","sql":"DELETE FROM gmail_messages","format":"csv","error":"query tool is read-only"}}`)
 	})
-	out, errOut, code := runCLI(t, srv.URL, "", "sql", "DELETE FROM gmail_messages")
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "Delete everything?", "DELETE FROM gmail_messages")
 	if code == 0 {
 		t.Fatalf("expected non-zero exit")
 	}
@@ -168,6 +168,27 @@ func TestSQLCommandReturnsDomainErrorsOnStderr(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "query tool is read-only") {
 		t.Fatalf("stderr missing domain error: %s", errOut)
+	}
+}
+
+func TestSQLCommandRequiresQuestionAndSQL(t *testing.T) {
+	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be hit")
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "SELECT 1")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit when only one positional arg is given")
+	}
+	if !strings.Contains(errOut, "English question") {
+		t.Fatalf("stderr should mention required English question: %s", errOut)
+	}
+
+	_, errOut, code = runCLI(t, srv.URL, "", "sql", "", "SELECT 1")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit when question is blank")
+	}
+	if !strings.Contains(errOut, "question") {
+		t.Fatalf("stderr should mention blank question: %s", errOut)
 	}
 }
 

@@ -138,6 +138,7 @@ const FullQueryRowCap = 1_000_000
 // Format). No caching, no per-field truncation — that's the whole point of
 // this surface vs. the MCP query tool.
 type FullQueryResponse struct {
+	Question    string   `json:"question"`
 	SQL         string   `json:"sql"`
 	Format      string   `json:"format"`
 	ColumnNames []string `json:"column_names,omitempty"`
@@ -491,26 +492,35 @@ func (s *Service) GrepRows(ctx context.Context, queryID, pattern string, columns
 // ExecuteFull runs a single read-only SQL statement and returns the entire
 // result formatted as CSV/JSON/NDJSON. It bypasses the query cache, applies
 // no per-field truncation, and only enforces the FullQueryRowCap safety
-// limit. Used by the CLI-only sql tool.
-func (s *Service) ExecuteFull(ctx context.Context, sql, format string) FullQueryResponse {
+// limit. Used by the CLI-only sql tool. The question is a concise
+// plain-English description of what the SQL is trying to answer; it is
+// required so that server logs always carry the caller's intent alongside
+// the SQL, the same way the MCP query tool does.
+func (s *Service) ExecuteFull(ctx context.Context, question, sql, format string) FullQueryResponse {
+	question = strings.TrimSpace(question)
 	sql = strings.TrimSpace(sql)
 	format = normalizeFormat(format)
-	resp := FullQueryResponse{SQL: sql, Format: format}
+	resp := FullQueryResponse{Question: question, SQL: sql, Format: format}
+	if question == "" {
+		resp.Error = "question must be a concise plain-English question this SQL statement is trying to answer"
+		s.logger.WarnContext(ctx, "sql rejected: missing question", "sql", sql)
+		return resp
+	}
 	if sql == "" {
 		resp.Error = "sql must be a non-empty Postgres SQL statement"
 		return resp
 	}
 	if err := ValidateReadOnlySQL(sql); err != nil {
 		resp.Error = err.Error()
-		s.logger.WarnContext(ctx, "sql rejected by read-only validator", "sql", sql, "error", resp.Error)
+		s.logger.WarnContext(ctx, "sql rejected by read-only validator", "question", question, "sql", sql, "error", resp.Error)
 		return resp
 	}
 	started := time.Now()
-	s.logger.InfoContext(ctx, "sql started", "sql", sql, "format", format, "row_cap", FullQueryRowCap)
+	s.logger.InfoContext(ctx, "sql started", "question", question, "sql", sql, "format", format, "row_cap", FullQueryRowCap)
 	raw, err := s.runner.Query(ctx, sql, FullQueryRowCap+1)
 	if err != nil {
 		resp.Error = err.Error()
-		s.logger.ErrorContext(ctx, "sql failed", "sql", sql, "error", err, "duration", time.Since(started))
+		s.logger.ErrorContext(ctx, "sql failed", "question", question, "sql", sql, "error", err, "duration", time.Since(started))
 		return resp
 	}
 	rows := raw.Rows
@@ -523,11 +533,11 @@ func (s *Service) ExecuteFull(ctx context.Context, sql, format string) FullQuery
 	formatted, err := formatFullRows(raw.Columns, rows, format)
 	if err != nil {
 		resp.Error = err.Error()
-		s.logger.ErrorContext(ctx, "sql encoding failed", "sql", sql, "error", err, "duration", time.Since(started))
+		s.logger.ErrorContext(ctx, "sql encoding failed", "question", question, "sql", sql, "error", err, "duration", time.Since(started))
 		return resp
 	}
 	resp.Rows = formatted
-	s.logger.InfoContext(ctx, "sql completed", "sql", sql, "rows", len(rows), "truncated", resp.Truncated, "duration", time.Since(started))
+	s.logger.InfoContext(ctx, "sql completed", "question", question, "sql", sql, "rows", len(rows), "truncated", resp.Truncated, "duration", time.Since(started))
 	return resp
 }
 

@@ -111,7 +111,7 @@ func TestAPIRunsSQL(t *testing.T) {
 	// statement goes in, the full result comes back without a query_id
 	// (no caching) and without field truncation.
 	srv := newMuxAPITestServer(t)
-	body := `{"sql":"SELECT 1 AS n","format":"csv"}`
+	body := `{"question":"How many rows?","sql":"SELECT 1 AS n","format":"csv"}`
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/sql", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
 	req.Header.Set("Content-Type", "application/json")
@@ -126,6 +126,7 @@ func TestAPIRunsSQL(t *testing.T) {
 	}
 	var envelope struct {
 		Data struct {
+			Question    string   `json:"question"`
 			SQL         string   `json:"sql"`
 			Format      string   `json:"format"`
 			ColumnNames []string `json:"column_names"`
@@ -140,7 +141,7 @@ func TestAPIRunsSQL(t *testing.T) {
 	if envelope.Data.Error != "" {
 		t.Fatalf("sql error: %s", envelope.Data.Error)
 	}
-	if envelope.Data.TotalRows != 3 || envelope.Data.Format != "csv" {
+	if envelope.Data.Question != "How many rows?" || envelope.Data.TotalRows != 3 || envelope.Data.Format != "csv" {
 		t.Fatalf("unexpected response: %#v", envelope.Data)
 	}
 	if envelope.Data.Rows != "n\n1\n2\n3" {

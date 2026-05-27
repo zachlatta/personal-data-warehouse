@@ -509,9 +509,12 @@ func TestExecuteFullReturnsFullCSVWithoutCachingOrTruncation(t *testing.T) {
 	}}
 	svc := NewService(runner, Options{MaxRows: 1, MaxFieldChars: 10})
 
-	resp := svc.ExecuteFull(context.Background(), "SELECT id, body FROM gmail_messages ORDER BY id", "csv")
+	resp := svc.ExecuteFull(context.Background(), "Show me every gmail body in order.", "SELECT id, body FROM gmail_messages ORDER BY id", "csv")
 	if resp.Error != "" {
 		t.Fatalf("ExecuteFull error: %s", resp.Error)
+	}
+	if resp.Question != "Show me every gmail body in order." {
+		t.Fatalf("question = %q", resp.Question)
 	}
 	if resp.Format != "csv" || resp.TotalRows != 2 {
 		t.Fatalf("unexpected metadata: %#v", resp)
@@ -536,9 +539,17 @@ func TestExecuteFullReturnsFullCSVWithoutCachingOrTruncation(t *testing.T) {
 
 func TestExecuteFullRejectsWriteSQL(t *testing.T) {
 	svc := NewService(fakeRunner{}, Options{})
-	resp := svc.ExecuteFull(context.Background(), "DELETE FROM gmail_messages", "csv")
+	resp := svc.ExecuteFull(context.Background(), "Delete everything?", "DELETE FROM gmail_messages", "csv")
 	if resp.Error == "" {
 		t.Fatalf("expected validator to reject DELETE, got %#v", resp)
+	}
+}
+
+func TestExecuteFullRejectsBlankQuestion(t *testing.T) {
+	svc := NewService(fakeRunner{}, Options{})
+	resp := svc.ExecuteFull(context.Background(), "   ", "SELECT 1", "csv")
+	if !strings.Contains(resp.Error, "question") {
+		t.Fatalf("expected blank-question error, got %#v", resp)
 	}
 }
 
@@ -550,7 +561,7 @@ func TestExecuteFullJSONFormatReturnsRowSlice(t *testing.T) {
 		},
 	}}
 	svc := NewService(runner, Options{})
-	resp := svc.ExecuteFull(context.Background(), "SELECT id FROM gmail_messages", "json")
+	resp := svc.ExecuteFull(context.Background(), "Which message ids exist?", "SELECT id FROM gmail_messages", "json")
 	if resp.Error != "" {
 		t.Fatalf("ExecuteFull error: %s", resp.Error)
 	}

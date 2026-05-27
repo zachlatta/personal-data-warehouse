@@ -79,7 +79,7 @@ func sqlTool(svc *query.Service) tool.Tool {
 		DescriptionStr: sqlDescription,
 		SurfacesField:  tool.SurfaceCLIOnly,
 		Handle: func(ctx context.Context, in sqlInput) (query.FullQueryResponse, error) {
-			return svc.ExecuteFull(ctx, in.SQL, in.Format), nil
+			return svc.ExecuteFull(ctx, in.Question, in.SQL, in.Format), nil
 		},
 		IsError: func(r query.FullQueryResponse) bool { return r.Error != "" },
 	}

@@ -39,7 +39,12 @@ COMMANDS
   call <name> [--data JSON]  Invoke a tool. With --data, send that JSON as the
                              request body. Without --data, read JSON from stdin.
                                --data JSON   Inline JSON input.
-  sql [--output FMT] <SQL>    Run read-only SQL and print the result rows.
+  sql [--output FMT] <QUESTION> <SQL>
+                             Run read-only SQL and print the result rows.
+                             QUESTION is a concise plain-English description of
+                             what the SQL is trying to answer; it is required so
+                             server logs capture the caller's intent (same
+                             contract as the MCP query tool).
                                --output FMT  csv, json, or nd-json. If omitted,
                                              defaults to csv and prints a note.
   schema                     Run schema_overview and print the warehouse schema
@@ -69,8 +74,8 @@ EXAMPLES
   pdw-cli list
   pdw-cli describe sql
   pdw-cli call schema_overview
-  pdw-cli sql 'SELECT 1'
-  pdw-cli sql --output json 'SELECT now()'
+  pdw-cli sql 'What is one?' 'SELECT 1'
+  pdw-cli sql --output json 'What time is it?' 'SELECT now()'
   pdw-cli config show
   pdw-cli version
   pdw-cli update --check
@@ -208,8 +213,9 @@ func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer
 const sqlOutputHint = "note: use --output [csv|json|nd-json] to specify output format"
 
 type sqlCommandInput struct {
-	SQL    string `json:"sql"`
-	Format string `json:"format"`
+	Question string `json:"question"`
+	SQL      string `json:"sql"`
+	Format   string `json:"format"`
 }
 
 type sqlCommandResponse struct {
@@ -231,12 +237,26 @@ func runSQL(client *cliclient.Client, args []string, stdout, stderr io.Writer) i
 		fmt.Fprintln(stderr, "pdw-cli sql:", err)
 		return 2
 	}
-	sql := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	positional := fs.Args()
+	if len(positional) < 2 {
+		fmt.Fprintln(stderr, "pdw-cli sql: both an English question and a SQL query are required (usage: pdw-cli sql [--output FMT] <QUESTION> <SQL>)")
+		return 2
+	}
+	if len(positional) > 2 {
+		fmt.Fprintln(stderr, "pdw-cli sql: unexpected extra arguments; pass question and SQL as two quoted positional args")
+		return 2
+	}
+	question := strings.TrimSpace(positional[0])
+	sql := strings.TrimSpace(positional[1])
+	if question == "" {
+		fmt.Fprintln(stderr, "pdw-cli sql: question must be a concise plain-English question this SQL statement is trying to answer")
+		return 2
+	}
 	if sql == "" {
 		fmt.Fprintln(stderr, "pdw-cli sql: SQL query is required")
 		return 2
 	}
-	input, err := json.Marshal(sqlCommandInput{SQL: sql, Format: format})
+	input, err := json.Marshal(sqlCommandInput{Question: question, SQL: sql, Format: format})
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw-cli sql:", err)
 		return 1

@@ -5,12 +5,17 @@
       "description": "output format: csv (default), json, or ndjson",
       "type": "string"
     },
+    "question": {
+      "description": "concise plain-English question this SQL statement is trying to answer",
+      "type": "string"
+    },
     "sql": {
       "description": "read-only Postgres SQL string to run",
       "type": "string"
     }
   },
   "required": [
+    "question",
     "sql"
   ],
   "type": "object"
