@@ -272,6 +272,51 @@ def test_upstream_mutation_claim_fail_and_observe_transitions(warehouse: Postgre
     assert warehouse.get_upstream_mutation_request(retryable_mutation["id"])["status"] == "failed_retryable"
 
 
+def test_complete_upstream_mutations_bulk_updates_rows_and_events(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_tables()
+    warehouse.insert_messages(
+        [
+            _message_row(message_id="m1", thread_id="thread-1", subject="One", labels=["INBOX"], sync_version=1),
+            _message_row(message_id="m2", thread_id="thread-2", subject="Two", labels=["INBOX"], sync_version=1),
+        ]
+    )
+    request = warehouse.propose_mutation(
+        title="Archive 2 Gmail threads",
+        reason="clear mail",
+        mutations=[
+            {
+                "type": "gmail.archive_threads",
+                "account": "zach@example.test",
+                "thread_ids": ["thread-1"],
+            },
+            {
+                "type": "gmail.archive_threads",
+                "account": "zach@example.test",
+                "thread_ids": ["thread-2"],
+            },
+        ],
+    )
+    warehouse.approve_upstream_mutation_request(request["id"], actor_id="zach")
+    claimed = warehouse.claim_approved_upstream_mutations(limit=10, claimed_by="worker-1")
+
+    completed = warehouse.complete_upstream_mutations(
+        completions=[
+            (claimed[0]["id"], {"archived_thread_ids": ["thread-1"]}),
+            (claimed[1]["id"], {"archived_thread_ids": ["thread-2"]}),
+        ],
+        actor_id="worker-1",
+    )
+
+    assert completed == 2
+    assert warehouse.get_upstream_mutation_request(request["id"])["status"] == "succeeded"
+    for mutation in warehouse.list_upstream_mutations_for_request(request["id"]):
+        assert mutation["status"] == "succeeded"
+        events = warehouse.list_upstream_mutation_events(mutation["id"])
+        assert events[-1]["event_type"] == "executed"
+        assert events[-1]["actor_id"] == "worker-1"
+        assert events[-1]["event_json"]["archived_thread_ids"]
+
+
 def test_reclaim_stale_executing_mutations_resets_orphaned_gmail_rows(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     warehouse.insert_messages(

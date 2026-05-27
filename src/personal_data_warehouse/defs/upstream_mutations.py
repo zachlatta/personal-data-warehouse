@@ -312,23 +312,27 @@ def _process_gmail_thread_label_mutation_group(
             message_ids=batch_message_ids,
         )
         if batch_result.status == "succeeded":
+            successful_results: list[tuple[dict, dict[str, object]]] = []
             for mutation in batch_mutations:
                 mutation_id = str(mutation["id"])
-                result = GmailMutationResult(
-                    status="succeeded",
-                    result_json=_gmail_thread_label_batch_result_json(
-                        operation=operation,
-                        mutation=mutation,
-                        message_ids=message_ids_by_mutation_id[mutation_id],
-                    ),
+                successful_results.append(
+                    (
+                        mutation,
+                        _gmail_thread_label_batch_result_json(
+                            operation=operation,
+                            mutation=mutation,
+                            message_ids=message_ids_by_mutation_id[mutation_id],
+                        ),
+                    )
                 )
-                status = _record_mutation_result(
-                    warehouse=warehouse,
-                    mutation=mutation,
-                    result=result,
-                    claimed_by=claimed_by,
-                )
-                counts[status] += 1
+            _record_successful_mutation_results(
+                warehouse=warehouse,
+                mutation_results=successful_results,
+                claimed_by=claimed_by,
+            )
+            for mutation, _result_json in successful_results:
+                mutation_id = str(mutation["id"])
+                counts["succeeded"] += 1
                 processed_mutation_ids.add(mutation_id)
         elif batch_result.status == "failed_terminal":
             fallback_mutations.extend(batch_mutations)
@@ -374,6 +378,29 @@ def _process_gmail_thread_label_mutation_group(
         processed_mutation_ids.add(mutation_id)
 
     return processed_mutation_ids, counts
+
+
+def _record_successful_mutation_results(
+    *,
+    warehouse,
+    mutation_results: list[tuple[dict, dict[str, object]]],
+    claimed_by: str,
+) -> None:
+    if not mutation_results:
+        return
+    if hasattr(warehouse, "complete_upstream_mutations"):
+        warehouse.complete_upstream_mutations(
+            completions=[(str(mutation["id"]), result_json) for mutation, result_json in mutation_results],
+            actor_id=claimed_by,
+        )
+        return
+    for mutation, result_json in mutation_results:
+        _record_mutation_result(
+            warehouse=warehouse,
+            mutation=mutation,
+            result=GmailMutationResult(status="succeeded", result_json=result_json),
+            claimed_by=claimed_by,
+        )
 
 
 def _gmail_thread_label_batch_result_json(

@@ -1661,6 +1661,83 @@ class PostgresWarehouse:
         if mutation and mutation.get("request_id"):
             self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
 
+    def complete_upstream_mutations(
+        self,
+        *,
+        completions: Sequence[tuple[str, Mapping[str, Any]]],
+        actor_id: str,
+    ) -> int:
+        self.ensure_upstream_mutation_tables()
+        if not completions:
+            return 0
+        now = datetime.now(tz=UTC)
+        completion_rows = [
+            {"id": mutation_id, "result_json": dict(result_json)}
+            for mutation_id, result_json in completions
+        ]
+        rows = self._query_dicts(
+            """
+            WITH completion_data AS (
+                SELECT id, result_json
+                FROM jsonb_to_recordset(%s::jsonb) AS row(id text, result_json jsonb)
+            ),
+            updated AS (
+                UPDATE upstream_mutations AS mutation
+                   SET status = 'succeeded',
+                       result_json = completion_data.result_json,
+                       error = '',
+                       executed_at = %s,
+                       updated_at = %s
+                  FROM completion_data
+                 WHERE mutation.id = completion_data.id
+                RETURNING mutation.id, mutation.request_id, completion_data.result_json
+            )
+            SELECT id, request_id, result_json
+            FROM updated
+            """,
+            (_jsonb_param(completion_rows), now, now),
+        )
+        if not rows:
+            return 0
+        event_rows = [
+            {"mutation_id": str(row["id"]), "event_json": _as_json_dict(row["result_json"])}
+            for row in rows
+        ]
+        self._command(
+            """
+            WITH event_data AS (
+                SELECT mutation_id, event_json
+                FROM jsonb_to_recordset(%s::jsonb) AS row(mutation_id text, event_json jsonb)
+            ),
+            next_indexes AS (
+                SELECT
+                    event_data.mutation_id,
+                    COALESCE(max(event.event_index) + 1, 0) AS event_index
+                FROM event_data
+                LEFT JOIN upstream_mutation_events AS event
+                  ON event.mutation_id = event_data.mutation_id
+                GROUP BY event_data.mutation_id
+            )
+            INSERT INTO upstream_mutation_events (
+                mutation_id, event_index, event_type, actor_type, actor_id, event_json, created_at
+            )
+            SELECT
+                event_data.mutation_id,
+                next_indexes.event_index,
+                'executed',
+                'dagster',
+                %s,
+                event_data.event_json,
+                %s
+            FROM event_data
+            JOIN next_indexes ON next_indexes.mutation_id = event_data.mutation_id
+            """,
+            (_jsonb_param(event_rows), actor_id, now),
+        )
+        for request_id in sorted({str(row.get("request_id") or "") for row in rows if row.get("request_id")}):
+            self._refresh_upstream_mutation_request_status(request_id)
+        return len(rows)
+
     def fail_upstream_mutation(
         self,
         mutation_id: str,

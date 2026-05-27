@@ -31,6 +31,7 @@ class FakeWarehouse:
         self.message_ids_by_thread_id = dict(message_ids_by_thread_id or {})
         self.closed = False
         self.completed = []
+        self.bulk_completed = []
         self.failed = []
         self.claim_limit = None
         self.claimed_by = None
@@ -81,6 +82,12 @@ class FakeWarehouse:
 
     def complete_upstream_mutation(self, mutation_id: str, *, result_json: dict, actor_id: str) -> None:
         self.completed.append((mutation_id, result_json, actor_id))
+
+    def complete_upstream_mutations(self, *, completions, actor_id: str) -> int:
+        self.bulk_completed.append((list(completions), actor_id))
+        for mutation_id, result_json in completions:
+            self.completed.append((mutation_id, result_json, actor_id))
+        return len(completions)
 
     def fail_upstream_mutation(
         self,
@@ -296,6 +303,15 @@ def test_process_upstream_mutation_batch_batches_gmail_archive_rows() -> None:
         ("zach@example.test", GMAIL_ARCHIVE_OPERATION, ["message-1", "message-2"])
     ]
     assert gmail_executor.seen == []
+    assert warehouse.bulk_completed == [
+        (
+            [
+                ("mut-a", {"archived_thread_ids": ["thread-1"], "batch_modified_message_ids": ["message-1"]}),
+                ("mut-b", {"archived_thread_ids": ["thread-2"], "batch_modified_message_ids": ["message-2"]}),
+            ],
+            "worker-1",
+        )
+    ]
     assert warehouse.completed == [
         ("mut-a", {"archived_thread_ids": ["thread-1"], "batch_modified_message_ids": ["message-1"]}, "worker-1"),
         ("mut-b", {"archived_thread_ids": ["thread-2"], "batch_modified_message_ids": ["message-2"]}, "worker-1"),
