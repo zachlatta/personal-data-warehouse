@@ -22,6 +22,35 @@ Current ingestion path:
   uploads compressed message batches plus bounded attachment backfill objects to Google Drive,
   and Dagster ingests them into normalized Postgres tables.
 
+## CLI: `pdw-cli`
+
+`pdw-cli` is the command-line client for the warehouse's HTTP API. Install
+the latest release with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zachlatta/personal-data-warehouse/main/app/install.sh | sh
+```
+
+The script detects your OS/architecture, downloads the matching binary from
+the latest GitHub release, verifies it against `SHA256SUMS`, and installs it
+to `/usr/local/bin` (or `~/.local/bin` if that's not writable). If the
+install directory isn't on `PATH`, it appends an `export` line to your
+shell's rc file (`~/.zshrc`, `~/.bashrc`/`~/.bash_profile`,
+`~/.config/fish/config.fish`, or `~/.profile`) — re-runs are idempotent
+thanks to a marker comment. Override with `PDW_CLI_INSTALL_DIR=/some/dir`,
+pin a version with `PDW_CLI_VERSION=pdw-cli/v0.1.0`, or point at a fork
+with `PDW_CLI_REPO=owner/repo`.
+
+After installing:
+
+```bash
+pdw-cli login    # interactive: stores API URL + token in ~/.config/pdw-cli/config.json
+pdw-cli list     # confirms the connection works
+pdw-cli update   # later: self-updates to the newest release
+```
+
+See [`app/README.md`](app/README.md) for the full command reference.
+
 ## Dependency Management
 
 This repo uses [`uv`](https://docs.astral.sh/uv/).
