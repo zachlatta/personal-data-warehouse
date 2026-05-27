@@ -95,6 +95,7 @@ func (h *handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	h.logger.InfoContext(r.Context(), "API tool called", "tool", name, "client", pdwauth.ClientNameFromContext(r.Context()))
 	out, isErr, callErr := t.Invoke(r.Context(), body)
 	if callErr != nil {
+		h.logger.InfoContext(r.Context(), "API tool result", "tool", name, "client", pdwauth.ClientNameFromContext(r.Context()), "is_error", true, "error", callErr.Error())
 		// Decode failures bubble up as callErr too; tell them apart by type.
 		var syntaxErr *json.SyntaxError
 		var typeErr *json.UnmarshalTypeError
@@ -105,10 +106,19 @@ func (h *handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "tool_error", callErr.Error())
 		return
 	}
+	h.logger.InfoContext(r.Context(), "API tool result", "tool", name, "client", pdwauth.ClientNameFromContext(r.Context()), "is_error", isErr, "output", marshalAPIOutput(out))
 	// Soft IsError (per-statement errors etc.) returns 200 with data;
 	// callers inspect partial-success fields in the body. Matches MCP.
 	_ = isErr
 	writeJSON(w, http.StatusOK, map[string]any{"data": out})
+}
+
+func marshalAPIOutput(out any) string {
+	data, err := json.Marshal(out)
+	if err != nil {
+		return "<encode error: " + err.Error() + ">"
+	}
+	return string(data)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

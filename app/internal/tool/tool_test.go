@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
@@ -146,6 +149,138 @@ func TestRegistryByNameFindsAndMisses(t *testing.T) {
 	}
 	if got := reg.ByName("missing"); got != nil {
 		t.Fatalf("ByName(missing) = %v, want nil", got)
+	}
+}
+
+type recordedResult struct {
+	name    string
+	output  any
+	isError bool
+	err     error
+}
+
+type resultRecorder struct {
+	mu      sync.Mutex
+	results []recordedResult
+}
+
+func (r *resultRecorder) record(_ context.Context, name string, output any, isError bool, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.results = append(r.results, recordedResult{name: name, output: output, isError: isError, err: err})
+}
+
+func (r *resultRecorder) snapshot() []recordedResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]recordedResult, len(r.results))
+	copy(out, r.results)
+	return out
+}
+
+func runOverMCP(t *testing.T, tt tool.Tool, hooks tool.Hooks, name string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	srv := mcp.NewServer(&mcp.Implementation{Name: "tool-test", Version: "0.1.0"}, nil)
+	tt.RegisterMCP(srv, hooks)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "tool-test-client", Version: "0.1.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	return result
+}
+
+func TestRegisterMCPFiresOnResultWithOutputOnSuccess(t *testing.T) {
+	tt := newEcho(func(_ context.Context, in echoInput) (echoOutput, error) {
+		return echoOutput{Value: in.Value, N: in.N}, nil
+	}, nil)
+	rec := &resultRecorder{}
+	runOverMCP(t, tt, tool.Hooks{OnResult: rec.record}, "echo", map[string]any{"value": "hi", "n": 2})
+
+	got := rec.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 OnResult call, got %d (%#v)", len(got), got)
+	}
+	if got[0].name != "echo" {
+		t.Fatalf("name = %q", got[0].name)
+	}
+	if got[0].isError {
+		t.Fatal("isError should be false on success")
+	}
+	if got[0].err != nil {
+		t.Fatalf("err = %v", got[0].err)
+	}
+	out, ok := got[0].output.(echoOutput)
+	if !ok {
+		t.Fatalf("output type = %T", got[0].output)
+	}
+	if out.Value != "hi" || out.N != 2 {
+		t.Fatalf("output = %#v", out)
+	}
+}
+
+func TestRegisterMCPFiresOnResultWithSoftIsErrorTrue(t *testing.T) {
+	tt := newEcho(func(_ context.Context, _ echoInput) (echoOutput, error) {
+		return echoOutput{Error: "partial"}, nil
+	}, func(o echoOutput) bool { return o.Error != "" })
+	rec := &resultRecorder{}
+	runOverMCP(t, tt, tool.Hooks{OnResult: rec.record}, "echo", map[string]any{"value": "ignored"})
+
+	got := rec.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 OnResult call, got %d", len(got))
+	}
+	if !got[0].isError {
+		t.Fatal("soft IsError predicate must surface as isError=true on the hook")
+	}
+	if got[0].err != nil {
+		t.Fatalf("err must be nil on soft errors, got %v", got[0].err)
+	}
+	if _, ok := got[0].output.(echoOutput); !ok {
+		t.Fatalf("output type = %T; soft errors must still carry the payload", got[0].output)
+	}
+}
+
+func TestRegisterMCPFiresOnResultWithHandlerError(t *testing.T) {
+	boom := errors.New("boom")
+	tt := newEcho(func(_ context.Context, _ echoInput) (echoOutput, error) {
+		return echoOutput{}, boom
+	}, nil)
+	rec := &resultRecorder{}
+	runOverMCP(t, tt, tool.Hooks{OnResult: rec.record}, "echo", map[string]any{"value": "ignored"})
+
+	got := rec.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 OnResult call, got %d", len(got))
+	}
+	if !got[0].isError {
+		t.Fatal("handler error must surface as isError=true")
+	}
+	if got[0].err == nil || got[0].err.Error() != "boom" {
+		t.Fatalf("err = %v", got[0].err)
+	}
+	if got[0].output != nil {
+		t.Fatalf("output must be nil on handler error, got %#v", got[0].output)
+	}
+}
+
+func TestRegisterMCPWithoutOnResultHookStillWorks(t *testing.T) {
+	tt := newEcho(func(_ context.Context, in echoInput) (echoOutput, error) {
+		return echoOutput{Value: in.Value}, nil
+	}, nil)
+	// nil hooks must not panic and the call should still complete.
+	result := runOverMCP(t, tt, tool.Hooks{}, "echo", map[string]any{"value": "ok"})
+	if result.IsError {
+		t.Fatalf("call failed: %#v", result.Content)
 	}
 }
 

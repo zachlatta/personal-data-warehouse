@@ -1,9 +1,11 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -240,3 +242,79 @@ var errBoom = boomError("boom")
 type boomError string
 
 func (e boomError) Error() string { return string(e) }
+
+func newHandlerWithLogger(t *testing.T, buf *bytes.Buffer, tools ...tool.Tool) http.Handler {
+	t.Helper()
+	registry := tool.NewRegistry(tools)
+	logger := slog.New(slog.NewJSONHandler(buf, nil))
+	return api.NewHandler(registry, logger)
+}
+
+func TestCallToolLogsFullOutputOnSuccess(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHandlerWithLogger(t, &buf, newEcho("echo"))
+	req := httptest.NewRequest(http.MethodPost, "/api/tools/echo", strings.NewReader(`{"value":"hi","n":2}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, `"msg":"API tool result"`) {
+		t.Fatalf("logs missing result line: %s", logs)
+	}
+	if !strings.Contains(logs, `"tool":"echo"`) {
+		t.Fatalf("logs missing tool name: %s", logs)
+	}
+	if !strings.Contains(logs, `"is_error":false`) {
+		t.Fatalf("logs missing is_error=false: %s", logs)
+	}
+	if !strings.Contains(logs, `\"value\":\"hi\"`) || !strings.Contains(logs, `\"n\":2`) {
+		t.Fatalf("logs missing full output payload: %s", logs)
+	}
+}
+
+func TestCallToolLogsFullOutputOnSoftError(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHandlerWithLogger(t, &buf, newSoftErrorTool("soft", "partial"))
+	req := httptest.NewRequest(http.MethodPost, "/api/tools/soft", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, `"msg":"API tool result"`) {
+		t.Fatalf("logs missing result line: %s", logs)
+	}
+	if !strings.Contains(logs, `"is_error":true`) {
+		t.Fatalf("soft IsError must log is_error=true: %s", logs)
+	}
+	if !strings.Contains(logs, `\"soft\":\"partial\"`) {
+		t.Fatalf("soft IsError must still log payload: %s", logs)
+	}
+}
+
+func TestCallToolLogsErrorOnHandlerError(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHandlerWithLogger(t, &buf, newFailingTool("broken", errBoom))
+	req := httptest.NewRequest(http.MethodPost, "/api/tools/broken", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, `"msg":"API tool result"`) {
+		t.Fatalf("logs missing result line: %s", logs)
+	}
+	if !strings.Contains(logs, `"is_error":true`) {
+		t.Fatalf("logs missing is_error=true: %s", logs)
+	}
+	if !strings.Contains(logs, `"error":"boom"`) {
+		t.Fatalf("logs missing error field: %s", logs)
+	}
+	if strings.Contains(logs, `"output"`) {
+		t.Fatalf("logs must not include output on handler error: %s", logs)
+	}
+}

@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -635,4 +638,65 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 
 	cancel()
 	<-serverErr
+}
+
+func TestMcpToolHooksOnResultLogsFullOutputOnSuccess(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	hooks := mcpToolHooks(logger)
+
+	hooks.OnResult(context.Background(), "echo", map[string]any{"value": "hi", "n": 2}, false, nil)
+
+	line := buf.String()
+	if !strings.Contains(line, `"msg":"MCP tool result"`) {
+		t.Fatalf("log missing msg: %s", line)
+	}
+	if !strings.Contains(line, `"tool":"echo"`) {
+		t.Fatalf("log missing tool name: %s", line)
+	}
+	if !strings.Contains(line, `"is_error":false`) {
+		t.Fatalf("log missing is_error=false: %s", line)
+	}
+	// Full output must be present, JSON-encoded as a string field.
+	if !strings.Contains(line, `\"value\":\"hi\"`) || !strings.Contains(line, `\"n\":2`) {
+		t.Fatalf("log missing full output payload: %s", line)
+	}
+}
+
+func TestMcpToolHooksOnResultLogsHandlerError(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	hooks := mcpToolHooks(logger)
+
+	hooks.OnResult(context.Background(), "echo", nil, true, errors.New("boom"))
+
+	line := buf.String()
+	if !strings.Contains(line, `"msg":"MCP tool result"`) {
+		t.Fatalf("log missing msg: %s", line)
+	}
+	if !strings.Contains(line, `"is_error":true`) {
+		t.Fatalf("log missing is_error=true: %s", line)
+	}
+	if !strings.Contains(line, `"error":"boom"`) {
+		t.Fatalf("log missing error field: %s", line)
+	}
+	if strings.Contains(line, `"output"`) {
+		t.Fatalf("log must not include output on handler error: %s", line)
+	}
+}
+
+func TestMcpToolHooksOnResultLogsSoftError(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	hooks := mcpToolHooks(logger)
+
+	hooks.OnResult(context.Background(), "soft", map[string]any{"partial": "yes"}, true, nil)
+
+	line := buf.String()
+	if !strings.Contains(line, `"is_error":true`) {
+		t.Fatalf("soft IsError must log is_error=true: %s", line)
+	}
+	if !strings.Contains(line, `\"partial\":\"yes\"`) {
+		t.Fatalf("soft IsError must still log full payload: %s", line)
+	}
 }

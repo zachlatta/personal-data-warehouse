@@ -49,6 +49,10 @@ type Tool interface {
 type Hooks struct {
 	// OnCall fires at the start of every tool invocation with the tool name.
 	OnCall func(ctx context.Context, name string)
+	// OnResult fires after the handler returns with the raw output value (or
+	// nil if err is non-nil). isError reflects either a handler error or the
+	// tool's IsError predicate firing on a successful return.
+	OnResult func(ctx context.Context, name string, output any, isError bool, err error)
 }
 
 // MultiContentMarshaler lets a tool's output produce a custom MCP

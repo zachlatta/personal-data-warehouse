@@ -64,9 +64,15 @@ func (t *Typed[I, O]) RegisterMCP(server *mcp.Server, hooks Hooks) {
 		}
 		out, err := t.Handle(ctx, input)
 		if err != nil {
+			if hooks.OnResult != nil {
+				hooks.OnResult(ctx, t.NameStr, nil, true, err)
+			}
 			return mcpErrorResult(err), nil, nil
 		}
 		isErr := t.IsError != nil && t.IsError(out)
+		if hooks.OnResult != nil {
+			hooks.OnResult(ctx, t.NameStr, out, isErr, nil)
+		}
 		if mc, ok := any(out).(MultiContentMarshaler); ok {
 			return mc.MCPCallToolResult(isErr), nil, nil
 		}

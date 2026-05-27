@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -24,7 +25,22 @@ func mcpToolHooks(logger *slog.Logger) tool.Hooks {
 		OnCall: func(ctx context.Context, name string) {
 			logger.InfoContext(ctx, "MCP tool called", "tool", name, "client", pdwauth.ClientNameFromContext(ctx))
 		},
+		OnResult: func(ctx context.Context, name string, output any, isError bool, err error) {
+			if err != nil {
+				logger.InfoContext(ctx, "MCP tool result", "tool", name, "client", pdwauth.ClientNameFromContext(ctx), "is_error", true, "error", err.Error())
+				return
+			}
+			logger.InfoContext(ctx, "MCP tool result", "tool", name, "client", pdwauth.ClientNameFromContext(ctx), "is_error", isError, "output", marshalToolOutput(output))
+		},
 	}
+}
+
+func marshalToolOutput(output any) string {
+	data, err := json.Marshal(output)
+	if err != nil {
+		return "<encode error: " + err.Error() + ">"
+	}
+	return string(data)
 }
 
 func debugCacheStatusTool(svc *query.Service) tool.Tool {
