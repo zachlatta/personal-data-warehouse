@@ -360,6 +360,87 @@ func (s *PostgresStore) UpdateGmailEmailMutation(ctx context.Context, requestID 
 	return mutation, nil
 }
 
+func (s *PostgresStore) RemoveMutation(ctx context.Context, requestID string, mutationID string, actor string) (Mutation, error) {
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+	if err := s.EnsureTables(ctx); err != nil {
+		return Mutation{}, err
+	}
+	if actor == "" {
+		actor = reviewerActorID
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Mutation{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	requestStatus, err := requestStatusForUpdate(ctx, tx, requestID)
+	if err != nil {
+		return Mutation{}, err
+	}
+	if requestStatus != "pending_review" {
+		return Mutation{}, fmt.Errorf("cannot remove mutation from request with status %s", requestStatus)
+	}
+	mutation, err := mutationForUpdate(ctx, tx, requestID, mutationID)
+	if err != nil {
+		return Mutation{}, err
+	}
+	if mutation.Status != "pending_review" {
+		return Mutation{}, fmt.Errorf("cannot remove mutation with status %s", mutation.Status)
+	}
+	pendingIDs, err := pendingMutationIDsForUpdate(ctx, tx, requestID)
+	if err != nil {
+		return Mutation{}, err
+	}
+	remaining := 0
+	for _, id := range pendingIDs {
+		if id != mutationID {
+			remaining++
+		}
+	}
+	if remaining == 0 {
+		return Mutation{}, errors.New("cannot remove every pending mutation from a request; deny the request instead")
+	}
+	const removalError = "removed during review"
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE upstream_mutations
+		   SET status = 'rejected',
+		       error = $1,
+		       updated_at = $2
+		 WHERE id = $3
+	`, removalError, now, mutationID); err != nil {
+		return Mutation{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE upstream_mutation_requests
+		   SET revision = revision + 1,
+		       updated_at = $1
+		 WHERE id = $2
+	`, now, requestID); err != nil {
+		return Mutation{}, err
+	}
+	if err := appendMutationEvent(ctx, tx, mutationID, "removed", "human", actor, map[string]any{"request_id": requestID}); err != nil {
+		return Mutation{}, err
+	}
+	if err := appendRequestEvent(ctx, tx, requestID, "mutation_removed", "human", actor, map[string]any{"mutation_id": mutationID}); err != nil {
+		return Mutation{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Mutation{}, err
+	}
+	committed = true
+	mutation.Status = "rejected"
+	mutation.Error = removalError
+	mutation.UpdatedAt = now
+	return mutation, nil
+}
+
 func (s *PostgresStore) ApproveRequest(ctx context.Context, id string, actor string) (Request, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()

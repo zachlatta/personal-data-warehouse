@@ -41,6 +41,7 @@ type Store interface {
 	ListRequests(ctx context.Context, filter RequestFilter) ([]Request, error)
 	GetRequest(ctx context.Context, id string) (Request, error)
 	UpdateGmailEmailMutation(ctx context.Context, requestID string, mutationID string, input UpdateGmailEmailMutationInput, actor string) (Mutation, error)
+	RemoveMutation(ctx context.Context, requestID string, mutationID string, actor string) (Mutation, error)
 	ApproveRequest(ctx context.Context, id string, actor string) (Request, error)
 	RejectRequest(ctx context.Context, id string, actor string, reason string) (Request, error)
 }

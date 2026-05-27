@@ -33,6 +33,10 @@ func (s *recordingStore) UpdateGmailEmailMutation(context.Context, string, strin
 	return Mutation{}, nil
 }
 
+func (s *recordingStore) RemoveMutation(context.Context, string, string, string) (Mutation, error) {
+	return Mutation{}, nil
+}
+
 func (s *recordingStore) ApproveRequest(context.Context, string, string) (Request, error) {
 	return Request{}, nil
 }

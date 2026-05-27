@@ -2,6 +2,7 @@ package mutations
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,6 +17,13 @@ type reviewStore struct {
 	approved     []string
 	rejected     []string
 	emailUpdates []emailUpdateCall
+	removed      []removeMutationCall
+}
+
+type removeMutationCall struct {
+	RequestID  string
+	MutationID string
+	Actor      string
 }
 
 type emailUpdateCall struct {
@@ -64,6 +72,34 @@ func (s *reviewStore) UpdateGmailEmailMutation(_ context.Context, requestID stri
 				previewEmail["selected_variant_id"] = input.SelectedVariantID
 			}
 			mutation.Preview["email"] = previewEmail
+			return *mutation, nil
+		}
+	}
+	return Mutation{}, ErrNotFound
+}
+
+func (s *reviewStore) RemoveMutation(_ context.Context, requestID string, mutationID string, actor string) (Mutation, error) {
+	s.removed = append(s.removed, removeMutationCall{RequestID: requestID, MutationID: mutationID, Actor: actor})
+	for requestIndex := range s.requests {
+		if s.requests[requestIndex].ID != requestID {
+			continue
+		}
+		remaining := 0
+		for _, mutation := range s.requests[requestIndex].Mutations {
+			if mutation.ID != mutationID && mutation.Status == "pending_review" {
+				remaining++
+			}
+		}
+		if remaining == 0 {
+			return Mutation{}, errors.New("cannot remove every pending mutation from a request; deny the request instead")
+		}
+		for mutationIndex := range s.requests[requestIndex].Mutations {
+			mutation := &s.requests[requestIndex].Mutations[mutationIndex]
+			if mutation.ID != mutationID {
+				continue
+			}
+			mutation.Status = "rejected"
+			mutation.Error = "removed during review"
 			return *mutation, nil
 		}
 	}
@@ -693,6 +729,122 @@ func TestReviewUIUpdatesGmailSendEmailMutation(t *testing.T) {
 	}
 	if message["reply_to_thread_id"] != "thread-reply" || message["in_reply_to"] != "<message@example.test>" {
 		t.Fatalf("reply metadata = %#v", message)
+	}
+}
+
+func TestReviewUIRemovesGmailEmailMutation(t *testing.T) {
+	request := gmailEmailReviewRequest()
+	request.Mutations = append(request.Mutations, Mutation{
+		ID:        "mut-email-second",
+		RequestID: request.ID,
+		Provider:  "gmail",
+		Operation: GmailSendEmailOperation,
+		Account:   "zach@example.test",
+		Status:    "pending_review",
+		Title:     "Send email: Second",
+		Payload: map[string]any{
+			"delivery_mode": "send",
+			"message": map[string]any{
+				"to":        []any{"other@example.test"},
+				"subject":   "Second",
+				"body_text": "Second body",
+			},
+		},
+		Preview: map[string]any{},
+	})
+	store := &reviewStore{requests: []Request{request}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-email", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+	body := detailResponse.Body.String()
+	if !strings.Contains(body, `/mutations/mut-email/remove`) {
+		t.Fatalf("detail page missing remove form action: %q", body)
+	}
+	if !strings.Contains(body, "Don't send") {
+		t.Fatalf("detail page missing Don't send button: %q", body)
+	}
+	csrfToken := hiddenFieldValue(t, body, "csrf_token")
+
+	removeForm := url.Values{"csrf_token": {csrfToken}}
+	removeResponse := httptest.NewRecorder()
+	removeRequest := httptest.NewRequest(http.MethodPost, "/mutation-review/requests/req-email/mutations/mut-email/remove", strings.NewReader(removeForm.Encode()))
+	removeRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		removeRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(removeResponse, removeRequest)
+
+	if removeResponse.Code != http.StatusSeeOther {
+		t.Fatalf("remove status = %d body=%q", removeResponse.Code, removeResponse.Body.String())
+	}
+	if location := removeResponse.Header().Get("Location"); location != "/mutation-review/requests/req-email" {
+		t.Fatalf("remove redirect = %q", location)
+	}
+	if len(store.removed) != 1 {
+		t.Fatalf("removed calls = %#v", store.removed)
+	}
+	call := store.removed[0]
+	if call.RequestID != "req-email" || call.MutationID != "mut-email" || call.Actor != "web-ui" {
+		t.Fatalf("unexpected remove call = %#v", call)
+	}
+	if store.requests[0].Mutations[0].Status != "rejected" {
+		t.Fatalf("first mutation status = %q", store.requests[0].Mutations[0].Status)
+	}
+	if store.requests[0].Mutations[0].Error != "removed during review" {
+		t.Fatalf("first mutation error = %q", store.requests[0].Mutations[0].Error)
+	}
+}
+
+func TestReviewUIRejectsRemovingLastPendingMutation(t *testing.T) {
+	store := &reviewStore{requests: []Request{gmailEmailReviewRequest()}}
+	service := NewService(store, Config{
+		BaseURL:       "https://mcp.example.test",
+		UIPassword:    "correct horse battery staple",
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		SessionTTL:    time.Hour,
+		Now:           func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	})
+	handler := service.HTTPHandler()
+	cookies := loginCookies(t, handler)
+
+	detailResponse := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/mutation-review/requests/req-email", nil)
+	for _, cookie := range cookies {
+		detailRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(detailResponse, detailRequest)
+	csrfToken := hiddenFieldValue(t, detailResponse.Body.String(), "csrf_token")
+
+	removeForm := url.Values{"csrf_token": {csrfToken}}
+	removeResponse := httptest.NewRecorder()
+	removeRequest := httptest.NewRequest(http.MethodPost, "/mutation-review/requests/req-email/mutations/mut-email/remove", strings.NewReader(removeForm.Encode()))
+	removeRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		removeRequest.AddCookie(cookie)
+	}
+	handler.ServeHTTP(removeResponse, removeRequest)
+
+	if removeResponse.Code != http.StatusOK {
+		t.Fatalf("remove status = %d body=%q", removeResponse.Code, removeResponse.Body.String())
+	}
+	if !strings.Contains(removeResponse.Body.String(), "cannot remove every pending mutation") {
+		t.Fatalf("expected error message, got %q", removeResponse.Body.String())
+	}
+	if store.requests[0].Mutations[0].Status != "pending_review" {
+		t.Fatalf("mutation should remain pending, got %q", store.requests[0].Mutations[0].Status)
 	}
 }
 
