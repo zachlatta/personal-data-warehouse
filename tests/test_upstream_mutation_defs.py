@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 from dagster import DagsterInstance, RunRequest, SkipReason, build_sensor_context
 
 from personal_data_warehouse.defs import upstream_mutations as upstream_mutation_defs
@@ -20,6 +22,8 @@ class FakeWarehouse:
         claimed=None,
         observed: int = 0,
         message_ids_by_thread_id=None,
+        reclaimed: int = 0,
+        stale_reclaimable_count: int = 0,
     ) -> None:
         self.approved_count = approved_count
         self.claimed = list(claimed or [])
@@ -32,12 +36,20 @@ class FakeWarehouse:
         self.claimed_by = None
         self.ensure_called = False
         self.message_id_lookups = []
+        self.reclaimed_count = reclaimed
+        self.reclaim_calls = []
+        self.stale_reclaimable_count = stale_reclaimable_count
+        self.stale_reclaimable_calls = []
 
     def ensure_upstream_mutation_tables(self) -> None:
         self.ensure_called = True
 
     def approved_upstream_mutation_count(self) -> int:
         return self.approved_count
+
+    def stale_reclaimable_upstream_mutation_count(self, *, stale_after, idempotent_operations) -> int:
+        self.stale_reclaimable_calls.append((stale_after, tuple(idempotent_operations)))
+        return self.stale_reclaimable_count
 
     def observe_succeeded_gmail_archive_mutations(self) -> int:
         return self.observed
@@ -58,6 +70,10 @@ class FakeWarehouse:
         self.claim_limit = limit
         self.claimed_by = claimed_by
         return self.claimed
+
+    def reclaim_stale_executing_mutations(self, *, stale_after, idempotent_operations, actor_id):
+        self.reclaim_calls.append((stale_after, tuple(idempotent_operations), actor_id))
+        return self.reclaimed_count
 
     def gmail_message_ids_for_thread_label_mutation(self, *, account: str, thread_ids: list[str], archive: bool):
         self.message_id_lookups.append((account, thread_ids, archive))
@@ -141,6 +157,42 @@ def test_upstream_mutation_sensor_emits_run_when_approved_work_exists(monkeypatc
     assert warehouse.closed is True
 
 
+def test_upstream_mutation_sensor_emits_run_when_stale_reclaimable_work_exists(monkeypatch) -> None:
+    warehouse = FakeWarehouse(stale_reclaimable_count=2)
+    monkeypatch.setattr(upstream_mutation_defs, "load_settings", lambda **_kwargs: object())
+    monkeypatch.setattr(upstream_mutation_defs, "warehouse_from_settings", lambda _settings: warehouse)
+
+    with DagsterInstance.ephemeral() as instance:
+        result = upstream_mutation_defs.upstream_mutation_sensor(build_sensor_context(instance=instance))
+
+    assert isinstance(result, RunRequest)
+    assert result.tags == {
+        "upstream_mutation_trigger": "stale_executing_reclaim",
+        "approved_mutation_count": "0",
+        "reclaimable_mutation_count": "2",
+    }
+    assert len(warehouse.stale_reclaimable_calls) == 1
+    stale_after, idempotent_operations = warehouse.stale_reclaimable_calls[0]
+    assert stale_after == timedelta(seconds=upstream_mutation_defs.DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS)
+    assert ("gmail", GMAIL_ARCHIVE_OPERATION) in idempotent_operations
+    assert ("gmail", GMAIL_UNARCHIVE_OPERATION) in idempotent_operations
+    assert warehouse.closed is True
+
+
+def test_upstream_mutation_sensor_skips_when_no_approved_or_reclaimable_work(monkeypatch) -> None:
+    warehouse = FakeWarehouse()
+    monkeypatch.setattr(upstream_mutation_defs, "load_settings", lambda **_kwargs: object())
+    monkeypatch.setattr(upstream_mutation_defs, "warehouse_from_settings", lambda _settings: warehouse)
+
+    with DagsterInstance.ephemeral() as instance:
+        result = upstream_mutation_defs.upstream_mutation_sensor(build_sensor_context(instance=instance))
+
+    assert isinstance(result, SkipReason)
+    assert result.skip_message == "No approved or stale reclaimable upstream mutations found."
+    assert len(warehouse.stale_reclaimable_calls) == 1
+    assert warehouse.closed is True
+
+
 def test_process_upstream_mutation_batch_completes_and_fails_claimed_rows() -> None:
     mutation_a = {"id": "mut-a", "provider": "gmail"}
     mutation_b = {"id": "mut-b", "provider": "gmail"}
@@ -174,6 +226,28 @@ def test_process_upstream_mutation_batch_completes_and_fails_claimed_rows() -> N
     assert summary.succeeded == 1
     assert summary.failed_retryable == 1
     assert summary.observed == 1
+
+
+def test_process_upstream_mutation_batch_reclaims_stale_executing_rows_before_claiming() -> None:
+    warehouse = FakeWarehouse(reclaimed=3)
+
+    summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=FakeGmailExecutor([]),
+        contact_executor=FakeExecutor([]),
+        calendar_executor=FakeExecutor([]),
+        limit=10,
+        claimed_by="worker-1",
+        reclaim_after=timedelta(minutes=30),
+    )
+
+    assert summary.reclaimed == 3
+    assert len(warehouse.reclaim_calls) == 1
+    stale_after, idempotent_operations, actor_id = warehouse.reclaim_calls[0]
+    assert stale_after == timedelta(minutes=30)
+    assert actor_id == "worker-1"
+    assert ("gmail", GMAIL_ARCHIVE_OPERATION) in idempotent_operations
+    assert ("gmail", GMAIL_UNARCHIVE_OPERATION) in idempotent_operations
 
 
 def test_process_upstream_mutation_batch_batches_gmail_archive_rows() -> None:

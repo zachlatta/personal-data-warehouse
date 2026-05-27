@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 import uuid
@@ -270,6 +270,173 @@ def test_upstream_mutation_claim_fail_and_observe_transitions(warehouse: Postgre
     assert observed_after_sync == 1
     assert warehouse.get_upstream_mutation_request(succeeded_mutation["id"])["status"] == "observed"
     assert warehouse.get_upstream_mutation_request(retryable_mutation["id"])["status"] == "failed_retryable"
+
+
+def test_reclaim_stale_executing_mutations_resets_orphaned_gmail_rows(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_tables()
+    warehouse.insert_messages(
+        [
+            _message_row(message_id="m1", thread_id="thread-1", subject="One", labels=["INBOX"], sync_version=1),
+            _message_row(message_id="m2", thread_id="thread-2", subject="Two", labels=["INBOX"], sync_version=1),
+            _message_row(message_id="m3", thread_id="thread-3", subject="Three", labels=["INBOX"], sync_version=1),
+        ]
+    )
+
+    stale_request = warehouse.propose_mutation(
+        title="Stale archive",
+        reason="worker crashed",
+        mutations=[{
+            "type": "gmail.archive_threads",
+            "account": "zach@example.test",
+            "thread_ids": ["thread-1"],
+        }],
+    )
+    fresh_request = warehouse.propose_mutation(
+        title="Fresh archive",
+        reason="just claimed",
+        mutations=[{
+            "type": "gmail.archive_threads",
+            "account": "zach@example.test",
+            "thread_ids": ["thread-2"],
+        }],
+    )
+    untouched_request = warehouse.propose_mutation(
+        title="Already approved",
+        reason="not claimed",
+        mutations=[{
+            "type": "gmail.archive_threads",
+            "account": "zach@example.test",
+            "thread_ids": ["thread-3"],
+        }],
+    )
+    warehouse.approve_upstream_mutation_request(stale_request["id"], actor_id="zach")
+    warehouse.approve_upstream_mutation_request(fresh_request["id"], actor_id="zach")
+    warehouse.approve_upstream_mutation_request(untouched_request["id"], actor_id="zach")
+
+    stale_mutation_id = stale_request["mutations"][0]["id"]
+    fresh_mutation_id = fresh_request["mutations"][0]["id"]
+    untouched_mutation_id = untouched_request["mutations"][0]["id"]
+
+    # Simulate two prior worker claims: one stale (60 min old), one fresh.
+    long_ago = datetime.now(tz=UTC) - timedelta(minutes=60)
+    just_now = datetime.now(tz=UTC) - timedelta(minutes=1)
+    warehouse._command(
+        """
+        UPDATE upstream_mutations
+           SET status = 'executing',
+               claimed_by = 'dead-worker',
+               claimed_at = %s,
+               updated_at = %s,
+               attempt_count = 1
+         WHERE id = %s
+        """,
+        (long_ago, long_ago, stale_mutation_id),
+    )
+    warehouse._command(
+        """
+        UPDATE upstream_mutations
+           SET status = 'executing',
+               claimed_by = 'live-worker',
+               claimed_at = %s,
+               updated_at = %s,
+               attempt_count = 1
+         WHERE id = %s
+        """,
+        (just_now, just_now, fresh_mutation_id),
+    )
+
+    assert warehouse.stale_reclaimable_upstream_mutation_count(
+        stale_after=timedelta(minutes=15),
+        idempotent_operations=(("gmail", "gmail.archive_threads"), ("gmail", "gmail.unarchive_threads")),
+    ) == 1
+
+    reclaimed = warehouse.reclaim_stale_executing_mutations(
+        stale_after=timedelta(minutes=15),
+        idempotent_operations=(("gmail", "gmail.archive_threads"), ("gmail", "gmail.unarchive_threads")),
+        actor_id="reaper",
+    )
+    assert reclaimed == 1
+
+    stale_after_reclaim = warehouse.get_upstream_mutation(stale_mutation_id)
+    assert stale_after_reclaim["status"] == "approved"
+    assert stale_after_reclaim["claimed_by"] == ""
+    reclaim_events = [
+        event
+        for event in warehouse.list_upstream_mutation_events(stale_mutation_id)
+        if event["event_type"] == "reclaimed"
+    ]
+    assert len(reclaim_events) == 1
+    assert reclaim_events[0]["actor_id"] == "reaper"
+    assert reclaim_events[0]["event_json"]["previous_claimed_by"] == "dead-worker"
+    assert reclaim_events[0]["event_json"]["attempt_count"] == 1
+
+    fresh_after_reclaim = warehouse.get_upstream_mutation(fresh_mutation_id)
+    assert fresh_after_reclaim["status"] == "executing"
+    assert fresh_after_reclaim["claimed_by"] == "live-worker"
+
+    untouched_after_reclaim = warehouse.get_upstream_mutation(untouched_mutation_id)
+    assert untouched_after_reclaim["status"] == "approved"
+    assert warehouse.stale_reclaimable_upstream_mutation_count(
+        stale_after=timedelta(minutes=15),
+        idempotent_operations=(("gmail", "gmail.archive_threads"), ("gmail", "gmail.unarchive_threads")),
+    ) == 0
+
+    # Reclaimed row is again claimable by the next worker tick.
+    claimed = warehouse.claim_approved_upstream_mutations(limit=10, claimed_by="next-worker")
+    assert stale_mutation_id in {row["id"] for row in claimed}
+
+
+def test_reclaim_stale_executing_mutations_leaves_non_idempotent_ops(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_tables()
+    warehouse.insert_messages(
+        [
+            _message_row(message_id="m1", thread_id="thread-1", subject="One", labels=["INBOX"], sync_version=1),
+        ]
+    )
+
+    request = warehouse.propose_mutation(
+        title="Send email",
+        reason="stuck non-idempotent",
+        mutations=[
+            {
+                "type": "gmail.send_email",
+                "account": "zach@example.test",
+                "delivery_mode": "send",
+                "message": {
+                    "to": ["one@example.test"],
+                    "subject": "Hi",
+                    "body_text": "Body",
+                },
+            }
+        ],
+    )
+    warehouse.approve_upstream_mutation_request(request["id"], actor_id="zach")
+    mutation_id = request["mutations"][0]["id"]
+    long_ago = datetime.now(tz=UTC) - timedelta(hours=2)
+    warehouse._command(
+        """
+        UPDATE upstream_mutations
+           SET status = 'executing',
+               claimed_by = 'dead-worker',
+               claimed_at = %s,
+               updated_at = %s,
+               attempt_count = 1
+         WHERE id = %s
+        """,
+        (long_ago, long_ago, mutation_id),
+    )
+
+    reclaimed = warehouse.reclaim_stale_executing_mutations(
+        stale_after=timedelta(minutes=15),
+        idempotent_operations=(("gmail", "gmail.archive_threads"), ("gmail", "gmail.unarchive_threads")),
+        actor_id="reaper",
+    )
+    assert reclaimed == 0
+    assert warehouse.stale_reclaimable_upstream_mutation_count(
+        stale_after=timedelta(minutes=15),
+        idempotent_operations=(("gmail", "gmail.archive_threads"), ("gmail", "gmail.unarchive_threads")),
+    ) == 0
+    assert warehouse.get_upstream_mutation(mutation_id)["status"] == "executing"
 
 
 def test_gmail_unarchive_mutation_validation_and_observe(warehouse: PostgresWarehouse) -> None:

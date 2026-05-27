@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 import os
 import socket
 
@@ -38,8 +39,16 @@ from personal_data_warehouse.warehouse import warehouse_from_settings
 
 UPSTREAM_MUTATION_WORKER_POSTGRES_LOCK_ID = 7_403_111_843
 UPSTREAM_MUTATION_SENSOR_INTERVAL_SECONDS = 10
-DEFAULT_UPSTREAM_MUTATION_BATCH_SIZE = 100
+DEFAULT_UPSTREAM_MUTATION_BATCH_SIZE = 500
+DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS = 900
 GMAIL_THREAD_LABEL_OPERATIONS = {GMAIL_ARCHIVE_OPERATION, GMAIL_UNARCHIVE_OPERATION}
+# Operations whose retry semantics make it safe to reclaim a stale `executing` row without
+# risking duplicate user-visible side effects. Gmail's batchModify is idempotent for label
+# add/remove; anything that creates or sends data (calendar events, emails, contacts) is not.
+RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
+    ("gmail", GMAIL_ARCHIVE_OPERATION),
+    ("gmail", GMAIL_UNARCHIVE_OPERATION),
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +59,7 @@ class UpstreamMutationWorkerSummary:
     failed_terminal: int = 0
     blocked_missing_credentials: int = 0
     observed: int = 0
+    reclaimed: int = 0
     skipped_due_to_lock: bool = False
 
 
@@ -57,7 +67,8 @@ class UpstreamMutationWorkerSummary:
 def process_upstream_mutations(context) -> dict[str, object]:
     settings = load_settings(require_gmail=False)
     warehouse = warehouse_from_settings(settings)
-    batch_size = int(os.getenv("UPSTREAM_MUTATION_BATCH_SIZE", str(DEFAULT_UPSTREAM_MUTATION_BATCH_SIZE)))
+    batch_size = _upstream_mutation_batch_size()
+    reclaim_after = _upstream_mutation_reclaim_after()
     claimed_by = f"dagster:{socket.gethostname()}:upstream_mutation_worker"
 
     try:
@@ -75,6 +86,7 @@ def process_upstream_mutations(context) -> dict[str, object]:
                 calendar_executor=CalendarMutationExecutor(settings=settings),
                 limit=batch_size,
                 claimed_by=claimed_by,
+                reclaim_after=reclaim_after,
             )
     finally:
         warehouse.close()
@@ -102,10 +114,25 @@ def upstream_mutation_sensor(context):
     warehouse = warehouse_from_settings(settings)
     try:
         count = warehouse.approved_upstream_mutation_count()
+        if count <= 0:
+            reclaimable_count = warehouse.stale_reclaimable_upstream_mutation_count(
+                stale_after=_upstream_mutation_reclaim_after(),
+                idempotent_operations=RECLAIMABLE_IDEMPOTENT_OPERATIONS,
+            )
+        else:
+            reclaimable_count = 0
     finally:
         warehouse.close()
     if count <= 0:
-        return SkipReason("No approved upstream mutations found.")
+        if reclaimable_count <= 0:
+            return SkipReason("No approved or stale reclaimable upstream mutations found.")
+        return RunRequest(
+            tags={
+                "upstream_mutation_trigger": "stale_executing_reclaim",
+                "approved_mutation_count": "0",
+                "reclaimable_mutation_count": str(reclaimable_count),
+            }
+        )
 
     return RunRequest(tags={"upstream_mutation_trigger": "approved_backlog", "approved_mutation_count": str(count)})
 
@@ -118,8 +145,14 @@ def process_upstream_mutation_batch(
     calendar_executor: CalendarMutationExecutor,
     limit: int,
     claimed_by: str,
+    reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
 ) -> UpstreamMutationWorkerSummary:
     warehouse.ensure_upstream_mutation_tables()
+    reclaimed = warehouse.reclaim_stale_executing_mutations(
+        stale_after=reclaim_after,
+        idempotent_operations=RECLAIMABLE_IDEMPOTENT_OPERATIONS,
+        actor_id=claimed_by,
+    )
     observed = warehouse.observe_succeeded_gmail_archive_mutations()
     observed += warehouse.observe_succeeded_gmail_unarchive_mutations()
     observed += warehouse.observe_succeeded_gmail_email_mutations()
@@ -185,6 +218,22 @@ def process_upstream_mutation_batch(
         failed_terminal=failed_terminal,
         blocked_missing_credentials=blocked_missing_credentials,
         observed=observed,
+        reclaimed=reclaimed,
+    )
+
+
+def _upstream_mutation_batch_size() -> int:
+    return int(os.getenv("UPSTREAM_MUTATION_BATCH_SIZE", str(DEFAULT_UPSTREAM_MUTATION_BATCH_SIZE)))
+
+
+def _upstream_mutation_reclaim_after() -> timedelta:
+    return timedelta(
+        seconds=int(
+            os.getenv(
+                "UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS",
+                str(DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
+            )
+        )
     )
 
 

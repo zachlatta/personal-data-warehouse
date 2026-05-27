@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import re
@@ -1549,6 +1549,92 @@ class PostgresWarehouse:
         for request_id in sorted({str(row.get("request_id") or "") for row in rows if row.get("request_id")}):
             self._refresh_upstream_mutation_request_status(request_id)
         return rows
+
+    def reclaim_stale_executing_mutations(
+        self,
+        *,
+        stale_after: timedelta,
+        idempotent_operations: Sequence[tuple[str, str]],
+        actor_id: str,
+    ) -> int:
+        # Only safe to call while holding the upstream-mutation worker advisory lock. The reset
+        # reuses approved_at ordering so reclaimed rows go to the head of the queue, but it does
+        # not protect against a concurrent worker that still believes it owns the claim.
+        self.ensure_upstream_mutation_tables()
+        if not idempotent_operations:
+            return 0
+        now = datetime.now(tz=UTC)
+        cutoff = now - stale_after
+        providers = [provider for provider, _ in idempotent_operations]
+        operations = [operation for _, operation in idempotent_operations]
+        rows = self._query_dicts(
+            """
+            WITH candidates AS (
+                SELECT id, request_id, claimed_by, attempt_count
+                FROM upstream_mutations
+                WHERE status = 'executing'
+                  AND claimed_at < %s
+                  AND (provider, operation) IN (
+                      SELECT * FROM UNNEST(%s::text[], %s::text[])
+                  )
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE upstream_mutations AS mutation
+               SET status = 'approved',
+                   claimed_by = '',
+                   claimed_at = '1970-01-01 00:00:00+00'::timestamptz,
+                   updated_at = %s
+              FROM candidates
+             WHERE mutation.id = candidates.id
+            RETURNING
+                mutation.id,
+                mutation.request_id,
+                candidates.claimed_by AS previous_claimed_by,
+                candidates.attempt_count
+            """,
+            (cutoff, providers, operations, now),
+        )
+        for row in rows:
+            self._append_upstream_mutation_event(
+                str(row["id"]),
+                event_type="reclaimed",
+                actor_type="dagster",
+                actor_id=actor_id,
+                event_json={
+                    "previous_claimed_by": str(row.get("previous_claimed_by") or ""),
+                    "attempt_count": int(row.get("attempt_count") or 0),
+                    "stale_after_seconds": int(stale_after.total_seconds()),
+                },
+            )
+        for request_id in sorted({str(row.get("request_id") or "") for row in rows if row.get("request_id")}):
+            self._refresh_upstream_mutation_request_status(request_id)
+        return len(rows)
+
+    def stale_reclaimable_upstream_mutation_count(
+        self,
+        *,
+        stale_after: timedelta,
+        idempotent_operations: Sequence[tuple[str, str]],
+    ) -> int:
+        self.ensure_upstream_mutation_tables()
+        if not idempotent_operations:
+            return 0
+        cutoff = datetime.now(tz=UTC) - stale_after
+        providers = [provider for provider, _ in idempotent_operations]
+        operations = [operation for _, operation in idempotent_operations]
+        rows = self._query(
+            """
+            SELECT count(*)::bigint
+            FROM upstream_mutations
+            WHERE status = 'executing'
+              AND claimed_at < %s
+              AND (provider, operation) IN (
+                  SELECT * FROM UNNEST(%s::text[], %s::text[])
+              )
+            """,
+            (cutoff, providers, operations),
+        )
+        return int(rows[0][0]) if rows else 0
 
     def complete_upstream_mutation(self, mutation_id: str, *, result_json: dict[str, Any], actor_id: str) -> None:
         now = datetime.now(tz=UTC)
