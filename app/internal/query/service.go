@@ -562,6 +562,8 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 	tables := tableNames(tablesResult)
 	s.logger.InfoContext(ctx, "schema overview tables listed", "tables", len(tables))
 
+	rowEstimates := s.tableRowEstimates(ctx)
+
 	var out strings.Builder
 	overviewTrunc := Truncation{MaxRows: schemaSampleRows, MaxFieldChars: schemaSampleFieldChars}
 	sampleResults := s.sampleTables(ctx, tables)
@@ -579,6 +581,11 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 		out.WriteString(database)
 		out.WriteString(".")
 		out.WriteString(table)
+		if estimate, ok := rowEstimates[table]; ok && estimate >= 0 {
+			out.WriteString(" (~")
+			out.WriteString(formatRowCount(estimate))
+			out.WriteString(" rows, estimated)")
+		}
 		out.WriteString("\n\n")
 		out.WriteString(sample.CSV)
 		out.WriteString("\n")
@@ -589,6 +596,72 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 	schemaResult.Truncated = overviewTrunc
 	s.logger.InfoContext(ctx, "schema overview completed", "database", database, "tables", len(tables), "truncated_fields", len(overviewTrunc.Fields), "duration", time.Since(started))
 	return Response{Results: []Result{schemaResult}}
+}
+
+// tableRowEstimates returns a map of base-table name → planner row estimate
+// (pg_class.reltuples) for tables in the current schema. Estimates are O(1)
+// catalog lookups and never block on a heap scan, so the schema overview can
+// expose rough table sizes without forcing clients to write SELECT COUNT(*).
+// Views and tables with no estimate yet (never analyzed) are omitted.
+func (s *Service) tableRowEstimates(ctx context.Context) map[string]int64 {
+	const sql = "SELECT c.relname AS name, c.reltuples::bigint AS row_estimate " +
+		"FROM pg_class c " +
+		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
+		"WHERE n.nspname = current_schema() " +
+		"AND c.relkind IN ('r', 'p', 'm') " +
+		"AND c.reltuples >= 0"
+	started := time.Now()
+	result, err := s.runner.Query(ctx, sql, 0)
+	if err != nil {
+		s.logger.WarnContext(ctx, "schema overview row estimate lookup failed", "sql", sql, "error", err, "duration", time.Since(started))
+		return nil
+	}
+	out := make(map[string]int64, len(result.Rows))
+	for _, row := range result.Rows {
+		name, ok := row["name"].(string)
+		if !ok || name == "" {
+			continue
+		}
+		switch v := row["row_estimate"].(type) {
+		case int64:
+			out[name] = v
+		case int:
+			out[name] = int64(v)
+		case int32:
+			out[name] = int64(v)
+		case float64:
+			out[name] = int64(v)
+		case string:
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				out[name] = n
+			}
+		}
+	}
+	s.logger.DebugContext(ctx, "schema overview row estimates loaded", "tables", len(out), "duration", time.Since(started))
+	return out
+}
+
+// formatRowCount renders an integer with thousands separators (e.g. 1234567 → "1,234,567").
+func formatRowCount(n int64) string {
+	if n < 0 {
+		return "-" + formatRowCount(-n)
+	}
+	s := strconv.FormatInt(n, 10)
+	if len(s) <= 3 {
+		return s
+	}
+	first := len(s) % 3
+	if first == 0 {
+		first = 3
+	}
+	var b strings.Builder
+	b.Grow(len(s) + (len(s)-1)/3)
+	b.WriteString(s[:first])
+	for i := first; i < len(s); i += 3 {
+		b.WriteByte(',')
+		b.WriteString(s[i : i+3])
+	}
+	return b.String()
 }
 
 func (s *Service) sampleTables(ctx context.Context, tables []string) []Result {

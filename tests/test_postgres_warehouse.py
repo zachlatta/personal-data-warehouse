@@ -304,7 +304,10 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     assert "slack_messages_recent_scope_time_idx" in index_names
     assert "slack_messages_recent_thread_time_idx" in index_names
     assert "slack_messages_user_time_idx" in index_names
-    assert "slack_messages_text_trgm_live_idx" in index_names
+    assert "slack_messages_time_idx" in index_names
+    assert "slack_messages_text_trgm_idx" in index_names
+    # The earlier partial trgm index has been superseded by the full-coverage one.
+    assert "slack_messages_text_trgm_live_idx" not in index_names
 
     slack_user_indexes = warehouse._query(
         """
@@ -319,6 +322,29 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
 
     extension_rows = warehouse._query("SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'")
     assert extension_rows == [("pg_trgm",)]
+
+
+def test_postgres_ensure_indexes_drops_obsolete_indexes(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_slack_tables()
+    # Recreate the legacy partial index out-of-band, simulating an existing deployment
+    # that ran on an older revision before the full-coverage index was introduced.
+    warehouse._command(
+        "CREATE INDEX IF NOT EXISTS slack_messages_text_trgm_live_idx "
+        "ON slack_messages USING gin (text public.gin_trgm_ops) WHERE is_deleted = 0"
+    )
+    pre_rows = warehouse._query(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
+        "AND tablename = 'slack_messages' AND indexname = 'slack_messages_text_trgm_live_idx'"
+    )
+    assert pre_rows, "test setup failed: legacy index should exist before re-running ensure"
+
+    warehouse.ensure_slack_tables()
+
+    post_rows = warehouse._query(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
+        "AND tablename = 'slack_messages' AND indexname = 'slack_messages_text_trgm_live_idx'"
+    )
+    assert post_rows == []
 
 
 def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehouse) -> None:
@@ -338,6 +364,9 @@ def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehous
     assert "gmail_messages_from_trgm_idx" in index_names
     assert "gmail_messages_subject_trgm_idx" in index_names
     assert "gmail_messages_snippet_trgm_idx" in index_names
+    assert "gmail_messages_body_text_trgm_idx" in index_names
+    assert "gmail_messages_body_markdown_trgm_idx" in index_names
+    assert "gmail_messages_body_html_trgm_idx" in index_names
 
 
 def test_postgres_contacts_tables_use_jsonb_without_changing_existing_raw_json(warehouse: PostgresWarehouse) -> None:

@@ -229,6 +229,24 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         requires_pg_trgm=True,
     ),
     IndexSpec(
+        "gmail_messages_body_text_trgm_idx",
+        "gmail_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_body_text_trgm_idx ON gmail_messages USING gin (body_text public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "gmail_messages_body_markdown_trgm_idx",
+        "gmail_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_body_markdown_trgm_idx ON gmail_messages USING gin (body_markdown_clean public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "gmail_messages_body_html_trgm_idx",
+        "gmail_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_body_html_trgm_idx ON gmail_messages USING gin (body_html public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
         "gmail_attachments_message_idx",
         "gmail_attachments",
         "CREATE INDEX IF NOT EXISTS gmail_attachments_message_idx ON gmail_attachments (account, message_id)",
@@ -315,6 +333,14 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS slack_messages_conversation_time_idx ON slack_messages (account, team_id, conversation_id, message_datetime DESC)",
     ),
     IndexSpec(
+        # Single-column index on message_datetime so global MIN/MAX/COUNT
+        # probes and time-only date-range scans use an index instead of a
+        # full table scan across all 30M+ messages.
+        "slack_messages_time_idx",
+        "slack_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_time_idx ON slack_messages (message_datetime DESC)",
+    ),
+    IndexSpec(
         "slack_messages_user_time_idx",
         "slack_messages",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_user_time_idx ON slack_messages (user_id, message_datetime DESC)",
@@ -340,9 +366,12 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS slack_messages_thread_idx ON slack_messages (account, team_id, conversation_id, thread_ts)",
     ),
     IndexSpec(
-        "slack_messages_text_trgm_live_idx",
+        # Full-coverage trgm index on slack_messages.text. Replaces the
+        # earlier partial (WHERE is_deleted=0) index so queries that omit
+        # the is_deleted filter still get index acceleration.
+        "slack_messages_text_trgm_idx",
         "slack_messages",
-        "CREATE INDEX IF NOT EXISTS slack_messages_text_trgm_live_idx ON slack_messages USING gin (text public.gin_trgm_ops) WHERE is_deleted = 0",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_text_trgm_idx ON slack_messages USING gin (text public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
@@ -381,6 +410,14 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS slack_account_state_live_scope_idx ON slack_account_state_item_rows (account, scope_id, priority_rank, latest_activity_at DESC) WHERE is_deleted = 0",
     ),
 )
+
+# Indexes that used to exist but have been superseded. Dropped idempotently
+# during _ensure_indexes so existing deployments converge with fresh installs.
+POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
+    # Replaced by the full-coverage slack_messages_text_trgm_idx.
+    ("slack_messages_text_trgm_live_idx", "slack_messages"),
+)
+
 
 POSTGRES_INSERT_PAGE_SIZES = {
     "apple_notes": 50,
@@ -2747,6 +2784,14 @@ class PostgresWarehouse:
             except Exception:
                 # Tests often create only a subset of tables. Missing-table index failures
                 # are harmless because ensure_* is called again by each runtime asset.
+                pass
+        for obsolete_name, obsolete_table in POSTGRES_OBSOLETE_INDEXES:
+            if obsolete_table not in table_names:
+                continue
+            try:
+                if self._index_exists(obsolete_name):
+                    self._command(f"DROP INDEX CONCURRENTLY IF EXISTS {_identifier(obsolete_name)}")
+            except Exception:
                 pass
 
     def _index_exists(self, index_name: str) -> bool:

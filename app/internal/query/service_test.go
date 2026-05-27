@@ -29,6 +29,7 @@ func (f fakeRunner) Query(_ context.Context, sql string, maxRows int) (RawResult
 
 type recordingRunner struct {
 	results map[string]RawResult
+	errs    map[string]error
 	mu      sync.Mutex
 	queries []string
 }
@@ -37,6 +38,9 @@ func (r *recordingRunner) Query(_ context.Context, sql string, maxRows int) (Raw
 	r.mu.Lock()
 	r.queries = append(r.queries, sql)
 	r.mu.Unlock()
+	if err := r.errs[sql]; err != nil {
+		return RawResult{}, err
+	}
 	result := r.results[sql]
 	if maxRows > 0 && len(result.Rows) > maxRows {
 		result.Rows = result.Rows[:maxRows]
@@ -64,6 +68,13 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 				{"name": "clean_gmail_inbox"},
 				{"name": "gmail_messages"},
 				{"name": "slack\"messages"},
+			},
+		},
+		"SELECT c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0": {
+			Columns: []string{"name", "row_estimate"},
+			Rows: []map[string]any{
+				{"name": "gmail_messages", "row_estimate": int64(1234567)},
+				{"name": "slack\"messages", "row_estimate": int64(42)},
 			},
 		},
 		describeCleanGmailSQL: {
@@ -106,12 +117,14 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 
 	resp := svc.SchemaOverview(context.Background())
 
+	rowEstimateSQL := "SELECT c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0"
 	wantQueries := []string{
 		"SELECT current_database() AS database",
 		showTablesSQL,
+		rowEstimateSQL,
 	}
-	if strings.Join(runner.queries[:2], "\n") != strings.Join(wantQueries, "\n") {
-		t.Fatalf("first queries = %#v, want %#v", runner.queries[:2], wantQueries)
+	if strings.Join(runner.queries[:3], "\n") != strings.Join(wantQueries, "\n") {
+		t.Fatalf("first queries = %#v, want %#v", runner.queries[:3], wantQueries)
 	}
 	wantSampleQueries := []string{
 		describeCleanGmailSQL,
@@ -121,7 +134,7 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		describeSlackSQL,
 		"SELECT substring(\"channel_id\"::text from 1 for 15) AS \"channel_id\", char_length(\"channel_id\"::text) AS \"__pdw_preview_len_0\" FROM \"slack\"\"messages\" LIMIT 3",
 	}
-	gotSampleQueries := append([]string(nil), runner.queries[2:]...)
+	gotSampleQueries := append([]string(nil), runner.queries[3:]...)
 	slices.Sort(gotSampleQueries)
 	slices.Sort(wantSampleQueries)
 	if strings.Join(gotSampleQueries, "\n") != strings.Join(wantSampleQueries, "\n") {
@@ -136,13 +149,13 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		"thread_id,latest_subject",
 		"thread-1,hello inbox",
 		"",
-		"# default.gmail_messages",
+		"# default.gmail_messages (~1,234,567 rows, estimated)",
 		"",
 		"id,body",
 		"msg-1,abcdefghijklmno",
 		"msg-2,short",
 		"",
-		"# default.slack\"messages",
+		"# default.slack\"messages (~42 rows, estimated)",
 		"",
 		"channel_id",
 		"C123",
@@ -156,6 +169,64 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	}
 	if len(result.Truncated.Fields) != 1 {
 		t.Fatalf("sample truncations = %#v", result.Truncated.Fields)
+	}
+}
+
+func TestFormatRowCount(t *testing.T) {
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{0, "0"},
+		{7, "7"},
+		{42, "42"},
+		{999, "999"},
+		{1000, "1,000"},
+		{12345, "12,345"},
+		{1234567, "1,234,567"},
+		{33387274, "33,387,274"},
+		{-1500, "-1,500"},
+	}
+	for _, c := range cases {
+		if got := formatRowCount(c.in); got != c.want {
+			t.Errorf("formatRowCount(%d) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestServiceSchemaOverviewSkipsRowCountWhenLookupFails(t *testing.T) {
+	const rowEstimateSQL = "SELECT c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0"
+	showTablesSQL := "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
+	describeSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'gmail_messages' ORDER BY ordinal_position"
+	sampleSQL := "SELECT substring(\"id\"::text from 1 for 15) AS \"id\", char_length(\"id\"::text) AS \"__pdw_preview_len_0\" FROM \"gmail_messages\" LIMIT 3"
+	runner := &recordingRunner{
+		results: map[string]RawResult{
+			"SELECT current_database() AS database": {
+				Columns: []string{"database"}, Rows: []map[string]any{{"database": "default"}},
+			},
+			showTablesSQL: {Columns: []string{"name"}, Rows: []map[string]any{{"name": "gmail_messages"}}},
+			describeSQL: {
+				Columns: []string{"name"},
+				Rows:    []map[string]any{{"name": "id"}},
+			},
+			sampleSQL: {
+				Columns: []string{"id", "__pdw_preview_len_0"},
+				Rows:    []map[string]any{{"id": "msg-1", "__pdw_preview_len_0": 5}},
+			},
+		},
+		errs: map[string]error{rowEstimateSQL: errors.New("pg_class lookup denied")},
+	}
+	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
+
+	resp := svc.SchemaOverview(context.Background())
+	if len(resp.Results) != 1 {
+		t.Fatalf("results length = %d", len(resp.Results))
+	}
+	if resp.Results[0].Error != "" {
+		t.Fatalf("SchemaOverview surfaced row-estimate failure as error: %q", resp.Results[0].Error)
+	}
+	if !strings.Contains(resp.Results[0].CSV, "# default.gmail_messages\n") {
+		t.Fatalf("expected unannotated heading when row estimate lookup fails, got %q", resp.Results[0].CSV)
 	}
 }
 
