@@ -71,7 +71,7 @@ func runCLI(t *testing.T, baseURL string, stdin string, args ...string) (stdout,
 	return outBuf.String(), errBuf.String(), code
 }
 
-func TestCallQueryFullResultAgainstRealMux(t *testing.T) {
+func TestSQLCommandDefaultOutputsNoteAndCSV(t *testing.T) {
 	authSvc := pdwauth.NewService([]byte(cliTestToken), func() time.Time { return time.Unix(0, 0) })
 	handler := pdwserver.NewMux(config.Config{
 		Addr:          ":0",
@@ -83,14 +83,91 @@ func TestCallQueryFullResultAgainstRealMux(t *testing.T) {
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 
-	out, errOut, code := runCLI(t, srv.URL, "", "call", "query_full_result", "--data", `{"sql":"SELECT 1 AS n","format":"csv"}`)
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "SELECT 1 AS n")
 	if code != 0 {
 		t.Fatalf("expected zero exit, got %d (stderr=%s)", code, errOut)
 	}
-	for _, want := range []string{`"sql": "SELECT 1 AS n"`, `"format": "csv"`, `"total_rows": 2`, `"rows": "n\n1\n2"`} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("query_full_result CLI output missing %q:\n%s", want, out)
-		}
+	wantOut := sqlOutputHint + "\n" + "n\n1\n2\n"
+	if out != wantOut {
+		t.Fatalf("sql CLI output = %q, want %q", out, wantOut)
+	}
+	if strings.Contains(out, `"rows"`) || strings.Contains(out, `"total_rows"`) {
+		t.Fatalf("sql CLI should print row output, not response metadata:\n%s", out)
+	}
+}
+
+func TestSQLCommandExplicitJSONOmitsDefaultNote(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"sql":"SELECT 1 AS n","format":"json","rows":[{"n":1}],"total_rows":1}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "json", "SELECT 1 AS n")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	if srv.lastPath != "/api/tools/sql" || srv.lastMethod != http.MethodPost {
+		t.Fatalf("server got %s %s", srv.lastMethod, srv.lastPath)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("request body is not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if input["sql"] != "SELECT 1 AS n" || input["format"] != "json" {
+		t.Fatalf("request input = %#v", input)
+	}
+	if strings.Contains(out, sqlOutputHint) {
+		t.Fatalf("explicit output should not print default note:\n%s", out)
+	}
+	if !strings.Contains(out, "[\n  {\n    \"n\": 1\n  }\n]") {
+		t.Fatalf("json rows were not pretty-printed:\n%s", out)
+	}
+}
+
+func TestSQLCommandNDJSONFlagMapsToToolFormat(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"sql":"SELECT 1 AS n","format":"ndjson","rows":"{\"n\":1}\n{\"n\":2}","total_rows":2}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "nd-json", "SELECT 1 AS n")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("request body is not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if input["format"] != "ndjson" {
+		t.Fatalf("format = %q, want ndjson", input["format"])
+	}
+	if out != "{\"n\":1}\n{\"n\":2}\n" {
+		t.Fatalf("nd-json output = %q", out)
+	}
+}
+
+func TestSQLCommandRejectsInvalidOutputFormat(t *testing.T) {
+	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be hit")
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "table", "SELECT 1")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit")
+	}
+	if !strings.Contains(errOut, "invalid --output") {
+		t.Fatalf("stderr missing invalid output message: %s", errOut)
+	}
+}
+
+func TestSQLCommandReturnsDomainErrorsOnStderr(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"sql":"DELETE FROM gmail_messages","format":"csv","error":"query tool is read-only"}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "DELETE FROM gmail_messages")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit")
+	}
+	if out != "" {
+		t.Fatalf("stdout = %q, want empty", out)
+	}
+	if !strings.Contains(errOut, "query tool is read-only") {
+		t.Fatalf("stderr missing domain error: %s", errOut)
 	}
 }
 

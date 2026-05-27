@@ -39,6 +39,9 @@ COMMANDS
   call <name> [--data JSON]  Invoke a tool. With --data, send that JSON as the
                              request body. Without --data, read JSON from stdin.
                                --data JSON   Inline JSON input.
+  sql [--output FMT] <SQL>    Run read-only SQL and print the result rows.
+                               --output FMT  csv, json, or nd-json. If omitted,
+                                             defaults to csv and prints a note.
   schema                     Run schema_overview and print the warehouse schema
                              (same as running pdw-cli with no command).
   version                    Print the build version.
@@ -64,10 +67,10 @@ ENVIRONMENT
 EXAMPLES
   pdw-cli login                          # one-time setup; persists URL + token
   pdw-cli list
-  pdw-cli describe query_full_result
+  pdw-cli describe sql
   pdw-cli call schema_overview
-  pdw-cli call query_full_result --data '{"sql":"SELECT 1"}'
-  echo '{"sql":"SELECT now()"}' | pdw-cli call query_full_result
+  pdw-cli sql 'SELECT 1'
+  pdw-cli sql --output json 'SELECT now()'
   pdw-cli config show
   pdw-cli version
   pdw-cli update --check
@@ -149,6 +152,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		return runDescribe(client, rest, stdout, stderr)
 	case "call":
 		return runCall(client, rest, stdin, stdout, stderr)
+	case "sql":
+		return runSQL(client, rest, stdout, stderr)
 	case "schema":
 		return runSchema(client, rest, stdout, stderr)
 	default:
@@ -197,6 +202,101 @@ func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer
 			fmt.Fprintln(stdout, r.CSV)
 		}
 	}
+	return 0
+}
+
+const sqlOutputHint = "note: use --output [csv|json|nd-json] to specify output format"
+
+type sqlCommandInput struct {
+	SQL    string `json:"sql"`
+	Format string `json:"format"`
+}
+
+type sqlCommandResponse struct {
+	Rows  json.RawMessage `json:"rows"`
+	Error string          `json:"error"`
+}
+
+func runSQL(client *cliclient.Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("sql", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	output := fs.String("output", "", "output format: csv, json, or nd-json")
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(stderr, "pdw-cli sql:", err)
+		return 2
+	}
+	formatSpecified := strings.TrimSpace(*output) != ""
+	format, err := normalizeSQLOutputFormat(*output)
+	if err != nil {
+		fmt.Fprintln(stderr, "pdw-cli sql:", err)
+		return 2
+	}
+	sql := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if sql == "" {
+		fmt.Fprintln(stderr, "pdw-cli sql: SQL query is required")
+		return 2
+	}
+	input, err := json.Marshal(sqlCommandInput{SQL: sql, Format: format})
+	if err != nil {
+		fmt.Fprintln(stderr, "pdw-cli sql:", err)
+		return 1
+	}
+	out, err := client.CallTool(context.Background(), "sql", input)
+	if err != nil {
+		var apiErr *cliclient.APIError
+		if errors.As(err, &apiErr) {
+			fmt.Fprintf(stderr, "pdw-cli sql: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
+			return 1
+		}
+		fmt.Fprintln(stderr, "pdw-cli sql:", err)
+		return 1
+	}
+	var payload sqlCommandResponse
+	if err := json.Unmarshal(out, &payload); err != nil {
+		fmt.Fprintln(stdout, string(out))
+		return 0
+	}
+	if payload.Error != "" {
+		fmt.Fprintln(stderr, "pdw-cli sql:", payload.Error)
+		return 1
+	}
+	if !formatSpecified {
+		fmt.Fprintln(stdout, sqlOutputHint)
+	}
+	return printSQLRows(payload.Rows, format, stdout)
+}
+
+func normalizeSQLOutputFormat(output string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(output)) {
+	case "", "csv":
+		return "csv", nil
+	case "json":
+		return "json", nil
+	case "nd-json", "ndjson":
+		return "ndjson", nil
+	default:
+		return "", fmt.Errorf("invalid --output %q; use csv, json, or nd-json", output)
+	}
+}
+
+func printSQLRows(rows json.RawMessage, format string, stdout io.Writer) int {
+	if len(rows) == 0 || string(rows) == "null" {
+		return 0
+	}
+	if format == "json" {
+		if pretty, err := prettyJSON(rows); err == nil {
+			fmt.Fprintln(stdout, pretty)
+			return 0
+		}
+		fmt.Fprintln(stdout, string(rows))
+		return 0
+	}
+	var text string
+	if err := json.Unmarshal(rows, &text); err != nil {
+		fmt.Fprintln(stdout, string(rows))
+		return 0
+	}
+	fmt.Fprintln(stdout, text)
 	return 0
 }
 

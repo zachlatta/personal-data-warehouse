@@ -16,7 +16,7 @@ func readOnlyTools(svc *query.Service) []tool.Tool {
 		getFieldTool(svc),
 		grepRowsTool(svc),
 		schemaOverviewTool(svc),
-		queryFullResultTool(svc),
+		sqlTool(svc),
 	}
 }
 
@@ -72,13 +72,13 @@ func grepRowsTool(svc *query.Service) tool.Tool {
 	}
 }
 
-func queryFullResultTool(svc *query.Service) tool.Tool {
-	return &tool.Typed[queryFullResultInput, query.FullQueryResponse]{
-		NameStr:        "query_full_result",
-		TitleStr:       "Run SQL (full result)",
-		DescriptionStr: queryFullResultDescription,
+func sqlTool(svc *query.Service) tool.Tool {
+	return &tool.Typed[sqlInput, query.FullQueryResponse]{
+		NameStr:        "sql",
+		TitleStr:       "Run SQL",
+		DescriptionStr: sqlDescription,
 		SurfacesField:  tool.SurfaceCLIOnly,
-		Handle: func(ctx context.Context, in queryFullResultInput) (query.FullQueryResponse, error) {
+		Handle: func(ctx context.Context, in sqlInput) (query.FullQueryResponse, error) {
 			return svc.ExecuteFull(ctx, in.SQL, in.Format), nil
 		},
 		IsError: func(r query.FullQueryResponse) bool { return r.Error != "" },

@@ -10,7 +10,7 @@ Each tool declares which surfaces it appears on:
 
 - **MCP-only**: `query`, `get_rows`, `get_field`, `grep_rows` — cursor-style
   tools designed for an LLM stepping through results.
-- **CLI-only**: `query_full_result` — psql-style "give me the whole result"
+- **CLI-only**: `sql` — psql-style "give me the whole result"
   for terminal/script use; no caching, no field truncation.
 - **Both**: `schema_overview`, the `propose_*` mutation tools.
 
@@ -141,8 +141,8 @@ secret directly. Tokens are compared in constant time.
 {
   "data": [
     {
-      "name": "query_full_result",
-      "title": "Run SQL (full result)",
+      "name": "sql",
+      "title": "Run SQL",
       "description": "...",
       "input_schema": { "type": "object", "properties": { ... } }
     }
@@ -154,7 +154,7 @@ secret directly. Tokens are compared in constant time.
 JSON (same shape MCP uses); response wraps the tool's output in `data`:
 
 ```bash
-curl -sS https://your-host/api/tools/query_full_result \
+curl -sS https://your-host/api/tools/sql \
   -H "Authorization: Bearer codex:$PDW_SECRET_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"sql":"SELECT recording_id FROM apple_voice_memos_enrichments LIMIT 3","format":"json"}'
@@ -196,7 +196,7 @@ as MCP, where `IsError=true` would still carry the partial results. Inspect
 
 The MCP server exposes cursor-based query tools. `query` executes SQL once, caches the full result in the server process, and returns a `query_id` handle for follow-up calls. Cached results expire after `MCP_QUERY_CACHE_TTL` and are evicted least-recently-used when the process-wide `MCP_QUERY_CACHE_MAX_BYTES` cap is reached. If the server restarts, old `query_id`s are invalid and the caller should re-run `query`.
 
-The CLI/HTTP API exposes a separate `query_full_result` tool that runs one
+The CLI/HTTP API exposes a separate `sql` tool that runs one
 SQL statement and returns the entire result body in one response — no caching,
 no field truncation, just a safety cap of 1,000,000 rows. Use it the way
 you'd use `psql` interactively or from a shell script.
@@ -402,10 +402,11 @@ go build -o /tmp/pdw-cli ./cmd/pdw-cli
 
 /tmp/pdw-cli list                     # name/title/description table
 /tmp/pdw-cli list --json              # raw JSON tool list
-/tmp/pdw-cli describe query_full_result  # title + description + input JSON Schema
+/tmp/pdw-cli describe sql             # title + description + input JSON Schema
 /tmp/pdw-cli call schema_overview     # zero-input tool
-/tmp/pdw-cli call query_full_result --data '{"sql":"SELECT 1"}'
-echo '{"sql":"SELECT now()"}' | /tmp/pdw-cli call query_full_result
+/tmp/pdw-cli sql 'SELECT 1'           # defaults to CSV and prints an output-format note
+/tmp/pdw-cli sql --output json 'SELECT now()'
+/tmp/pdw-cli sql --output nd-json 'SELECT * FROM gmail_messages LIMIT 3'
 /tmp/pdw-cli config show              # prints config with the token redacted
 /tmp/pdw-cli logout                   # removes the config file
 ```

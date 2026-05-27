@@ -26,7 +26,7 @@ const muxAPITestSecret = "test-secret-token-at-least-32-chars-x"
 // for the core read/query and mutation proposal schemas snapshotted here.
 var apiSnapshotTools = []string{
 	"schema_overview",
-	"query_full_result",
+	"sql",
 	"propose_mutation",
 	"propose_mutation_help",
 }
@@ -35,7 +35,7 @@ var apiSnapshotTools = []string{
 var mcpOnlyToolNames = []string{"query", "get_rows", "get_field", "grep_rows"}
 
 // cliOnlyToolNames are exposed on the HTTP API but must NOT appear on MCP.
-var cliOnlyToolNames = []string{"query_full_result"}
+var cliOnlyToolNames = []string{"sql"}
 
 func newMuxAPITestServer(t *testing.T) *httptest.Server {
 	t.Helper()
@@ -94,7 +94,7 @@ func TestAPIListsTools(t *testing.T) {
 	for _, e := range payload.Data {
 		names[e.Name] = true
 	}
-	for _, required := range []string{"schema_overview", "query_full_result"} {
+	for _, required := range []string{"schema_overview", "sql"} {
 		if !names[required] {
 			t.Fatalf("API tool list missing %q: %#v", required, names)
 		}
@@ -106,18 +106,18 @@ func TestAPIListsTools(t *testing.T) {
 	}
 }
 
-func TestAPIRunsQueryFullResult(t *testing.T) {
-	// Pins the CLI-only query_full_result tool: a single read-only SQL
+func TestAPIRunsSQL(t *testing.T) {
+	// Pins the CLI-only sql tool: a single read-only SQL
 	// statement goes in, the full result comes back without a query_id
 	// (no caching) and without field truncation.
 	srv := newMuxAPITestServer(t)
 	body := `{"sql":"SELECT 1 AS n","format":"csv"}`
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/query_full_result", strings.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/sql", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("POST query_full_result: %v", err)
+		t.Fatalf("POST sql: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -138,7 +138,7 @@ func TestAPIRunsQueryFullResult(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if envelope.Data.Error != "" {
-		t.Fatalf("query_full_result error: %s", envelope.Data.Error)
+		t.Fatalf("sql error: %s", envelope.Data.Error)
 	}
 	if envelope.Data.TotalRows != 3 || envelope.Data.Format != "csv" {
 		t.Fatalf("unexpected response: %#v", envelope.Data)
