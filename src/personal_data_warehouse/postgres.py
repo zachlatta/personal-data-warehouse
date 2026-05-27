@@ -1782,6 +1782,38 @@ class PostgresWarehouse:
         )
         return int(rows[0][0]) if rows else 0
 
+    def gmail_message_ids_for_thread_label_mutation(
+        self,
+        *,
+        account: str,
+        thread_ids: Sequence[str],
+        archive: bool,
+    ) -> dict[str, list[str]]:
+        normalized_thread_ids = _normalize_thread_ids(thread_ids)
+        if not normalized_thread_ids:
+            return {}
+        inbox_filter = "AND 'INBOX' = ANY(label_ids)" if archive else ""
+        rows = self._query(
+            f"""
+            SELECT thread_id, message_id
+            FROM gmail_messages
+            WHERE account = %s
+              AND thread_id = ANY(%s)
+              AND is_deleted = 0
+              AND NOT ('TRASH' = ANY(label_ids))
+              AND NOT ('SPAM' = ANY(label_ids))
+              {inbox_filter}
+            ORDER BY thread_id ASC, internal_date ASC, message_id ASC
+            """,
+            (account, list(normalized_thread_ids)),
+        )
+        ids_by_thread_id = {thread_id: [] for thread_id in normalized_thread_ids}
+        for thread_id, message_id in rows:
+            normalized_thread_id = str(thread_id)
+            if normalized_thread_id in ids_by_thread_id:
+                ids_by_thread_id[normalized_thread_id].append(str(message_id))
+        return ids_by_thread_id
+
     def observe_succeeded_gmail_archive_mutations(self, *, limit: int = 100) -> int:
         self.ensure_upstream_mutation_tables()
         mutations = self._query_dicts(

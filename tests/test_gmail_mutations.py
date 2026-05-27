@@ -40,6 +40,12 @@ class FakeMessagesResource:
     def __init__(self, service) -> None:
         self._service = service
 
+    def batchModify(self, **kwargs):
+        self._service.batch_modify_calls.append(kwargs)
+        if self._service.batch_modify_errors:
+            return FakeGmailRequest(response={}, error=self._service.batch_modify_errors.pop(0))
+        return FakeGmailRequest(response={})
+
     def send(self, **kwargs):
         self._service.send_calls.append(kwargs)
         return FakeGmailRequest(response={"id": "sent-message-1", "threadId": kwargs["body"].get("threadId", "thread-new")})
@@ -75,9 +81,11 @@ class FakeUsersResource:
 
 
 class FakeGmailService:
-    def __init__(self, *, errors=None) -> None:
+    def __init__(self, *, errors=None, batch_modify_errors=None) -> None:
         self.errors = list(errors or [])
+        self.batch_modify_errors = list(batch_modify_errors or [])
         self.modify_calls = []
+        self.batch_modify_calls = []
         self.send_calls = []
         self.draft_create_calls = []
 
@@ -129,6 +137,81 @@ def test_gmail_unarchive_executor_adds_inbox_to_threads() -> None:
     assert result.result_json["unarchived_thread_ids"] == ["thread-1"]
     assert service.modify_calls == [
         {"userId": "me", "id": "thread-1", "body": {"addLabelIds": ["INBOX"]}},
+    ]
+
+
+def test_gmail_archive_executor_batch_modifies_messages() -> None:
+    service = FakeGmailService()
+    executor = GmailMutationExecutor(
+        settings=object(),
+        service_factory=lambda account: service,
+    )
+
+    result = executor.execute_message_batch_modify(
+        account="zach@example.test",
+        operation=GMAIL_ARCHIVE_OPERATION,
+        message_ids=["message-1", "message-2", "message-1"],
+    )
+
+    assert result.status == "succeeded"
+    assert result.result_json["archived_message_ids"] == ["message-1", "message-2"]
+    assert result.result_json["batch_modified_message_ids"] == ["message-1", "message-2"]
+    assert service.batch_modify_calls == [
+        {
+            "userId": "me",
+            "body": {"removeLabelIds": ["INBOX"], "ids": ["message-1", "message-2"]},
+        }
+    ]
+    assert service.modify_calls == []
+
+
+def test_gmail_unarchive_executor_batch_modifies_messages() -> None:
+    service = FakeGmailService()
+    executor = GmailMutationExecutor(
+        settings=object(),
+        service_factory=lambda account: service,
+    )
+
+    result = executor.execute_message_batch_modify(
+        account="zach@example.test",
+        operation=GMAIL_UNARCHIVE_OPERATION,
+        message_ids=["message-1"],
+    )
+
+    assert result.status == "succeeded"
+    assert result.result_json["unarchived_message_ids"] == ["message-1"]
+    assert service.batch_modify_calls == [
+        {"userId": "me", "body": {"addLabelIds": ["INBOX"], "ids": ["message-1"]}}
+    ]
+
+
+def test_gmail_archive_executor_batch_records_partial_progress_for_retryable_failure(monkeypatch) -> None:
+    monkeypatch.setattr(gmail_mutations, "GMAIL_BATCH_MODIFY_MESSAGE_LIMIT", 2)
+    monkeypatch.setattr(gmail_mutations, "execute_gmail_request", lambda request_fn: request_fn())
+    service = FakeGmailService(batch_modify_errors=[None, ConnectionError("network down")])
+    executor = GmailMutationExecutor(
+        settings=object(),
+        service_factory=lambda account: service,
+    )
+
+    result = executor.execute_message_batch_modify(
+        account="zach@example.test",
+        operation=GMAIL_ARCHIVE_OPERATION,
+        message_ids=["message-1", "message-2", "message-3"],
+    )
+
+    assert result.status == "failed_retryable"
+    assert result.result_json["archived_message_ids"] == ["message-1", "message-2"]
+    assert result.result_json["batch_modified_message_ids"] == ["message-1", "message-2"]
+    assert service.batch_modify_calls == [
+        {
+            "userId": "me",
+            "body": {"removeLabelIds": ["INBOX"], "ids": ["message-1", "message-2"]},
+        },
+        {
+            "userId": "me",
+            "body": {"removeLabelIds": ["INBOX"], "ids": ["message-3"]},
+        },
     ]
 
 

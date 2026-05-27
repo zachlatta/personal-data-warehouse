@@ -25,7 +25,12 @@ from personal_data_warehouse.contact_mutations import (
     GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
     GoogleContactMutationExecutor,
 )
-from personal_data_warehouse.gmail_mutations import GmailMutationExecutor
+from personal_data_warehouse.gmail_mutations import (
+    GMAIL_ARCHIVE_OPERATION,
+    GMAIL_UNARCHIVE_OPERATION,
+    GmailMutationExecutor,
+    GmailMutationResult,
+)
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
@@ -33,7 +38,8 @@ from personal_data_warehouse.warehouse import warehouse_from_settings
 
 UPSTREAM_MUTATION_WORKER_POSTGRES_LOCK_ID = 7_403_111_843
 UPSTREAM_MUTATION_SENSOR_INTERVAL_SECONDS = 10
-DEFAULT_UPSTREAM_MUTATION_BATCH_SIZE = 10
+DEFAULT_UPSTREAM_MUTATION_BATCH_SIZE = 100
+GMAIL_THREAD_LABEL_OPERATIONS = {GMAIL_ARCHIVE_OPERATION, GMAIL_UNARCHIVE_OPERATION}
 
 
 @dataclass(frozen=True)
@@ -125,7 +131,23 @@ def process_upstream_mutation_batch(
     failed_retryable = 0
     failed_terminal = 0
     blocked_missing_credentials = 0
+    processed_mutation_ids: set[str] = set()
+    for group in _gmail_thread_label_mutation_groups(claimed):
+        processed, counts = _process_gmail_thread_label_mutation_group(
+            warehouse=warehouse,
+            gmail_executor=gmail_executor,
+            mutations=group,
+            claimed_by=claimed_by,
+        )
+        processed_mutation_ids.update(processed)
+        succeeded += counts["succeeded"]
+        failed_retryable += counts["failed_retryable"]
+        failed_terminal += counts["failed_terminal"]
+        blocked_missing_credentials += counts["blocked_missing_credentials"]
+
     for mutation in claimed:
+        if str(mutation["id"]) in processed_mutation_ids:
+            continue
         provider = mutation.get("provider")
         if provider == "google_people" and mutation.get("operation") == GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION:
             result = contact_executor.execute(mutation)
@@ -141,27 +163,20 @@ def process_upstream_mutation_batch(
                 result_json={"reason": "unknown provider for this worker version"},
                 error=f"unsupported provider {provider!r}; deferring for a newer worker",
             )
-        if result.status == "succeeded":
-            warehouse.complete_upstream_mutation(
-                str(mutation["id"]),
-                result_json=result.result_json,
-                actor_id=claimed_by,
-            )
+        status = _record_mutation_result(
+            warehouse=warehouse,
+            mutation=mutation,
+            result=result,
+            claimed_by=claimed_by,
+        )
+        if status == "succeeded":
             succeeded += 1
+        elif status == "failed_retryable":
+            failed_retryable += 1
+        elif status == "blocked_missing_credentials":
+            blocked_missing_credentials += 1
         else:
-            warehouse.fail_upstream_mutation(
-                str(mutation["id"]),
-                status=result.status,
-                error=result.error,
-                result_json=result.result_json,
-                actor_id=claimed_by,
-            )
-            if result.status == "failed_retryable":
-                failed_retryable += 1
-            elif result.status == "blocked_missing_credentials":
-                blocked_missing_credentials += 1
-            else:
-                failed_terminal += 1
+            failed_terminal += 1
 
     return UpstreamMutationWorkerSummary(
         claimed=len(claimed),
@@ -171,6 +186,201 @@ def process_upstream_mutation_batch(
         blocked_missing_credentials=blocked_missing_credentials,
         observed=observed,
     )
+
+
+def _gmail_thread_label_mutation_groups(claimed: list[dict]) -> list[list[dict]]:
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for mutation in claimed:
+        if not _is_gmail_thread_label_mutation(mutation):
+            continue
+        key = (str(mutation.get("account") or ""), str(mutation.get("operation") or ""))
+        groups.setdefault(key, []).append(mutation)
+    return list(groups.values())
+
+
+def _is_gmail_thread_label_mutation(mutation: dict) -> bool:
+    return (
+        mutation.get("provider") == "gmail"
+        and mutation.get("operation") in GMAIL_THREAD_LABEL_OPERATIONS
+        and bool(_mutation_thread_ids(mutation))
+    )
+
+
+def _process_gmail_thread_label_mutation_group(
+    *,
+    warehouse,
+    gmail_executor: GmailMutationExecutor,
+    mutations: list[dict],
+    claimed_by: str,
+) -> tuple[set[str], dict[str, int]]:
+    processed_mutation_ids: set[str] = set()
+    counts = {"succeeded": 0, "failed_retryable": 0, "failed_terminal": 0, "blocked_missing_credentials": 0}
+    if not mutations:
+        return processed_mutation_ids, counts
+
+    account = str(mutations[0].get("account") or "")
+    operation = str(mutations[0].get("operation") or "")
+    archive = operation == GMAIL_ARCHIVE_OPERATION
+    all_thread_ids = _unique(
+        thread_id
+        for mutation in mutations
+        for thread_id in _mutation_thread_ids(mutation)
+    )
+    try:
+        message_ids_by_thread = warehouse.gmail_message_ids_for_thread_label_mutation(
+            account=account,
+            thread_ids=all_thread_ids,
+            archive=archive,
+        )
+    except Exception:
+        return processed_mutation_ids, counts
+
+    batch_mutations: list[dict] = []
+    fallback_mutations: list[dict] = []
+    message_ids_by_mutation_id: dict[str, list[str]] = {}
+    for mutation in mutations:
+        mutation_id = str(mutation["id"])
+        message_ids = _unique(
+            message_id
+            for thread_id in _mutation_thread_ids(mutation)
+            for message_id in message_ids_by_thread.get(thread_id, [])
+        )
+        message_ids_by_mutation_id[mutation_id] = message_ids
+        if message_ids:
+            batch_mutations.append(mutation)
+        else:
+            fallback_mutations.append(mutation)
+
+    if batch_mutations:
+        batch_message_ids = _unique(
+            message_id
+            for mutation in batch_mutations
+            for message_id in message_ids_by_mutation_id[str(mutation["id"])]
+        )
+        batch_result = gmail_executor.execute_message_batch_modify(
+            account=account,
+            operation=operation,
+            message_ids=batch_message_ids,
+        )
+        if batch_result.status == "succeeded":
+            for mutation in batch_mutations:
+                mutation_id = str(mutation["id"])
+                result = GmailMutationResult(
+                    status="succeeded",
+                    result_json=_gmail_thread_label_batch_result_json(
+                        operation=operation,
+                        mutation=mutation,
+                        message_ids=message_ids_by_mutation_id[mutation_id],
+                    ),
+                )
+                status = _record_mutation_result(
+                    warehouse=warehouse,
+                    mutation=mutation,
+                    result=result,
+                    claimed_by=claimed_by,
+                )
+                counts[status] += 1
+                processed_mutation_ids.add(mutation_id)
+        elif batch_result.status == "failed_terminal":
+            fallback_mutations.extend(batch_mutations)
+        else:
+            modified_message_ids = set(batch_result.result_json.get("batch_modified_message_ids") or [])
+            for mutation in batch_mutations:
+                mutation_id = str(mutation["id"])
+                result_json = _gmail_thread_label_batch_result_json(
+                    operation=operation,
+                    mutation=mutation,
+                    message_ids=[
+                        message_id
+                        for message_id in message_ids_by_mutation_id[mutation_id]
+                        if message_id in modified_message_ids
+                    ],
+                )
+                result = GmailMutationResult(
+                    status=batch_result.status,
+                    result_json=result_json,
+                    error=batch_result.error,
+                )
+                status = _record_mutation_result(
+                    warehouse=warehouse,
+                    mutation=mutation,
+                    result=result,
+                    claimed_by=claimed_by,
+                )
+                counts[status] += 1
+                processed_mutation_ids.add(mutation_id)
+
+    for mutation in fallback_mutations:
+        mutation_id = str(mutation["id"])
+        if mutation_id in processed_mutation_ids:
+            continue
+        result = gmail_executor.execute(mutation)
+        status = _record_mutation_result(
+            warehouse=warehouse,
+            mutation=mutation,
+            result=result,
+            claimed_by=claimed_by,
+        )
+        counts[status] += 1
+        processed_mutation_ids.add(mutation_id)
+
+    return processed_mutation_ids, counts
+
+
+def _gmail_thread_label_batch_result_json(
+    *,
+    operation: str,
+    mutation: dict,
+    message_ids: list[str],
+) -> dict[str, object]:
+    thread_ids = _mutation_thread_ids(mutation)
+    progress_key = "archived_thread_ids" if operation == GMAIL_ARCHIVE_OPERATION else "unarchived_thread_ids"
+    return {
+        progress_key: thread_ids,
+        "batch_modified_message_ids": message_ids,
+    }
+
+
+def _record_mutation_result(*, warehouse, mutation: dict, result, claimed_by: str) -> str:
+    if result.status == "succeeded":
+        warehouse.complete_upstream_mutation(
+            str(mutation["id"]),
+            result_json=result.result_json,
+            actor_id=claimed_by,
+        )
+        return "succeeded"
+    warehouse.fail_upstream_mutation(
+        str(mutation["id"]),
+        status=result.status,
+        error=result.error,
+        result_json=result.result_json,
+        actor_id=claimed_by,
+    )
+    if result.status == "failed_retryable":
+        return "failed_retryable"
+    if result.status == "blocked_missing_credentials":
+        return "blocked_missing_credentials"
+    return "failed_terminal"
+
+
+def _mutation_thread_ids(mutation: dict) -> list[str]:
+    payload = mutation.get("payload_json")
+    if not isinstance(payload, dict):
+        return []
+    thread_ids = payload.get("thread_ids")
+    if isinstance(thread_ids, str) or not isinstance(thread_ids, list):
+        return []
+    return _unique(str(thread_id).strip() for thread_id in thread_ids if str(thread_id).strip())
+
+
+def _unique(values) -> list[str]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    return normalized
 
 
 @definitions

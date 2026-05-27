@@ -19,6 +19,7 @@ from personal_data_warehouse.google_auth import load_google_credentials
 GMAIL_ARCHIVE_OPERATION = "gmail.archive_threads"
 GMAIL_UNARCHIVE_OPERATION = "gmail.unarchive_threads"
 GMAIL_SEND_EMAIL_OPERATION = "gmail.send_email"
+GMAIL_BATCH_MODIFY_MESSAGE_LIMIT = 1000
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,64 @@ class GmailMutationExecutor:
             return GmailMutationResult(
                 status=gmail_mutation_failure_status(exc),
                 result_json={progress_key: changed_thread_ids},
+                error=str(exc),
+            )
+
+    def execute_message_batch_modify(
+        self,
+        *,
+        account: str,
+        operation: str,
+        message_ids: list[str],
+    ) -> GmailMutationResult:
+        if operation not in {GMAIL_ARCHIVE_OPERATION, GMAIL_UNARCHIVE_OPERATION}:
+            return GmailMutationResult(
+                status="failed_terminal",
+                result_json={},
+                error=f"unsupported Gmail batch modify operation: {operation}",
+            )
+        normalized_message_ids = _message_ids(message_ids)
+        progress_key = "archived_message_ids" if operation == GMAIL_ARCHIVE_OPERATION else "unarchived_message_ids"
+        if not normalized_message_ids:
+            return GmailMutationResult(status="succeeded", result_json={progress_key: []})
+
+        modify_body = (
+            {"removeLabelIds": ["INBOX"]}
+            if operation == GMAIL_ARCHIVE_OPERATION
+            else {"addLabelIds": ["INBOX"]}
+        )
+        changed_message_ids: list[str] = []
+        batch_responses: list[dict[str, Any]] = []
+        try:
+            service = self._service(account=account, operation=operation)
+            for chunk in _chunks(normalized_message_ids, GMAIL_BATCH_MODIFY_MESSAGE_LIMIT):
+                response = execute_gmail_request(
+                    lambda chunk=chunk: service.users()
+                    .messages()
+                    .batchModify(
+                        userId="me",
+                        body={**modify_body, "ids": chunk},
+                    )
+                    .execute()
+                )
+                changed_message_ids.extend(chunk)
+                batch_responses.append(response or {})
+            return GmailMutationResult(
+                status="succeeded",
+                result_json={
+                    progress_key: changed_message_ids,
+                    "batch_modified_message_ids": changed_message_ids,
+                    "batch_modify_responses": batch_responses,
+                },
+            )
+        except Exception as exc:
+            return GmailMutationResult(
+                status=gmail_mutation_failure_status(exc),
+                result_json={
+                    progress_key: changed_message_ids,
+                    "batch_modified_message_ids": changed_message_ids,
+                    "batch_modify_responses": batch_responses,
+                },
                 error=str(exc),
             )
 
@@ -201,6 +260,24 @@ def _thread_ids(value: Any) -> list[str]:
     if isinstance(value, str) or not isinstance(value, list):
         return []
     return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _message_ids(value: Any) -> list[str]:
+    if isinstance(value, str) or not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        message_id = str(item).strip()
+        if message_id and message_id not in seen:
+            normalized.append(message_id)
+            seen.add(message_id)
+    return normalized
+
+
+def _chunks(values: list[str], size: int):
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
 
 
 def build_email_raw(*, account: str, message: Mapping[str, Any]) -> str:

@@ -50,6 +50,11 @@ def test_upstream_mutation_request_validation_idempotency_and_review(warehouse: 
         warehouse.propose_gmail_archive_threads(account="zach@example.test", thread_ids=[], reason="clear mail")
     with pytest.raises(ValueError, match="unknown or non-inbox"):
         warehouse.propose_gmail_archive_threads(account="zach@example.test", thread_ids=["missing"], reason="clear mail")
+    assert warehouse.gmail_message_ids_for_thread_label_mutation(
+        account="zach@example.test",
+        thread_ids=["thread-1", "thread-2"],
+        archive=True,
+    ) == {"thread-1": ["m1"], "thread-2": ["m2"]}
 
     mutation = warehouse.propose_gmail_archive_threads(
         account="zach@example.test",
@@ -248,6 +253,11 @@ def test_gmail_unarchive_mutation_validation_and_observe(warehouse: PostgresWare
             _message_row(message_id="m2", thread_id="inbox-thread", subject="Inbox", labels=["INBOX"], sync_version=1),
         ]
     )
+    assert warehouse.gmail_message_ids_for_thread_label_mutation(
+        account="zach@example.test",
+        thread_ids=["archived-thread"],
+        archive=False,
+    ) == {"archived-thread": ["m1"]}
 
     with pytest.raises(ValueError, match="unknown or non-archived"):
         warehouse.propose_upstream_mutation_request(

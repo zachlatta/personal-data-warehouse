@@ -5,20 +5,33 @@ from dagster import DagsterInstance, RunRequest, SkipReason, build_sensor_contex
 from personal_data_warehouse.defs import upstream_mutations as upstream_mutation_defs
 from personal_data_warehouse.calendar_mutations import CalendarMutationResult
 from personal_data_warehouse.contact_mutations import ContactMutationResult
-from personal_data_warehouse.gmail_mutations import GmailMutationResult
+from personal_data_warehouse.gmail_mutations import (
+    GMAIL_ARCHIVE_OPERATION,
+    GMAIL_UNARCHIVE_OPERATION,
+    GmailMutationResult,
+)
 
 
 class FakeWarehouse:
-    def __init__(self, *, approved_count: int = 0, claimed=None, observed: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        approved_count: int = 0,
+        claimed=None,
+        observed: int = 0,
+        message_ids_by_thread_id=None,
+    ) -> None:
         self.approved_count = approved_count
         self.claimed = list(claimed or [])
         self.observed = observed
+        self.message_ids_by_thread_id = dict(message_ids_by_thread_id or {})
         self.closed = False
         self.completed = []
         self.failed = []
         self.claim_limit = None
         self.claimed_by = None
         self.ensure_called = False
+        self.message_id_lookups = []
 
     def ensure_upstream_mutation_tables(self) -> None:
         self.ensure_called = True
@@ -46,6 +59,10 @@ class FakeWarehouse:
         self.claimed_by = claimed_by
         return self.claimed
 
+    def gmail_message_ids_for_thread_label_mutation(self, *, account: str, thread_ids: list[str], archive: bool):
+        self.message_id_lookups.append((account, thread_ids, archive))
+        return {thread_id: list(self.message_ids_by_thread_id.get(thread_id, [])) for thread_id in thread_ids}
+
     def complete_upstream_mutation(self, mutation_id: str, *, result_json: dict, actor_id: str) -> None:
         self.completed.append((mutation_id, result_json, actor_id))
 
@@ -72,6 +89,17 @@ class FakeExecutor:
     def execute(self, mutation):
         self.seen.append(mutation)
         return self.results.pop(0)
+
+
+class FakeGmailExecutor(FakeExecutor):
+    def __init__(self, results, *, batch_results=None) -> None:
+        super().__init__(results)
+        self.batch_results = list(batch_results or [])
+        self.batch_calls = []
+
+    def execute_message_batch_modify(self, *, account: str, operation: str, message_ids: list[str]):
+        self.batch_calls.append((account, operation, message_ids))
+        return self.batch_results.pop(0)
 
 
 def test_upstream_mutation_sensor_runs_every_ten_seconds() -> None:
@@ -146,6 +174,152 @@ def test_process_upstream_mutation_batch_completes_and_fails_claimed_rows() -> N
     assert summary.succeeded == 1
     assert summary.failed_retryable == 1
     assert summary.observed == 1
+
+
+def test_process_upstream_mutation_batch_batches_gmail_archive_rows() -> None:
+    mutation_a = {
+        "id": "mut-a",
+        "provider": "gmail",
+        "operation": GMAIL_ARCHIVE_OPERATION,
+        "account": "zach@example.test",
+        "payload_json": {"thread_ids": ["thread-1"]},
+    }
+    mutation_b = {
+        "id": "mut-b",
+        "provider": "gmail",
+        "operation": GMAIL_ARCHIVE_OPERATION,
+        "account": "zach@example.test",
+        "payload_json": {"thread_ids": ["thread-2"]},
+    }
+    warehouse = FakeWarehouse(
+        claimed=[mutation_a, mutation_b],
+        message_ids_by_thread_id={"thread-1": ["message-1"], "thread-2": ["message-2"]},
+    )
+    gmail_executor = FakeGmailExecutor(
+        [],
+        batch_results=[
+            GmailMutationResult(
+                status="succeeded",
+                result_json={
+                    "archived_message_ids": ["message-1", "message-2"],
+                    "batch_modified_message_ids": ["message-1", "message-2"],
+                },
+            )
+        ],
+    )
+
+    summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=gmail_executor,
+        contact_executor=FakeExecutor([]),
+        calendar_executor=FakeExecutor([]),
+        limit=100,
+        claimed_by="worker-1",
+    )
+
+    assert warehouse.message_id_lookups == [("zach@example.test", ["thread-1", "thread-2"], True)]
+    assert gmail_executor.batch_calls == [
+        ("zach@example.test", GMAIL_ARCHIVE_OPERATION, ["message-1", "message-2"])
+    ]
+    assert gmail_executor.seen == []
+    assert warehouse.completed == [
+        ("mut-a", {"archived_thread_ids": ["thread-1"], "batch_modified_message_ids": ["message-1"]}, "worker-1"),
+        ("mut-b", {"archived_thread_ids": ["thread-2"], "batch_modified_message_ids": ["message-2"]}, "worker-1"),
+    ]
+    assert warehouse.failed == []
+    assert summary.claimed == 2
+    assert summary.succeeded == 2
+
+
+def test_process_upstream_mutation_batch_falls_back_when_batch_modify_has_no_messages() -> None:
+    mutation = {
+        "id": "mut-a",
+        "provider": "gmail",
+        "operation": GMAIL_UNARCHIVE_OPERATION,
+        "account": "zach@example.test",
+        "payload_json": {"thread_ids": ["thread-1"]},
+    }
+    warehouse = FakeWarehouse(claimed=[mutation], message_ids_by_thread_id={})
+    gmail_executor = FakeGmailExecutor(
+        [GmailMutationResult(status="succeeded", result_json={"unarchived_thread_ids": ["thread-1"]})],
+    )
+
+    summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=gmail_executor,
+        contact_executor=FakeExecutor([]),
+        calendar_executor=FakeExecutor([]),
+        limit=100,
+        claimed_by="worker-1",
+    )
+
+    assert gmail_executor.batch_calls == []
+    assert gmail_executor.seen == [mutation]
+    assert warehouse.completed == [("mut-a", {"unarchived_thread_ids": ["thread-1"]}, "worker-1")]
+    assert summary.succeeded == 1
+
+
+def test_process_upstream_mutation_batch_records_retryable_batch_failure_progress() -> None:
+    mutation_a = {
+        "id": "mut-a",
+        "provider": "gmail",
+        "operation": GMAIL_ARCHIVE_OPERATION,
+        "account": "zach@example.test",
+        "payload_json": {"thread_ids": ["thread-1"]},
+    }
+    mutation_b = {
+        "id": "mut-b",
+        "provider": "gmail",
+        "operation": GMAIL_ARCHIVE_OPERATION,
+        "account": "zach@example.test",
+        "payload_json": {"thread_ids": ["thread-2"]},
+    }
+    warehouse = FakeWarehouse(
+        claimed=[mutation_a, mutation_b],
+        message_ids_by_thread_id={"thread-1": ["message-1"], "thread-2": ["message-2"]},
+    )
+    gmail_executor = FakeGmailExecutor(
+        [],
+        batch_results=[
+            GmailMutationResult(
+                status="failed_retryable",
+                result_json={
+                    "archived_message_ids": ["message-1"],
+                    "batch_modified_message_ids": ["message-1"],
+                },
+                error="network down",
+            )
+        ],
+    )
+
+    summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=gmail_executor,
+        contact_executor=FakeExecutor([]),
+        calendar_executor=FakeExecutor([]),
+        limit=100,
+        claimed_by="worker-1",
+    )
+
+    assert gmail_executor.seen == []
+    assert warehouse.completed == []
+    assert warehouse.failed == [
+        (
+            "mut-a",
+            "failed_retryable",
+            "network down",
+            {"archived_thread_ids": ["thread-1"], "batch_modified_message_ids": ["message-1"]},
+            "worker-1",
+        ),
+        (
+            "mut-b",
+            "failed_retryable",
+            "network down",
+            {"archived_thread_ids": ["thread-2"], "batch_modified_message_ids": []},
+            "worker-1",
+        ),
+    ]
+    assert summary.failed_retryable == 2
 
 
 def test_process_upstream_mutation_batch_routes_contact_mutations_to_contact_executor() -> None:
