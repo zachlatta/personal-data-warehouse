@@ -18,7 +18,11 @@ import (
 const usage = `pdw-cli — talk to the personal data warehouse /api/tools surface.
 
 USAGE
-  pdw-cli [--base-url URL] [--token TOKEN] [--client NAME] <command> [args]
+  pdw-cli [--base-url URL] [--token TOKEN] [--client NAME] [<command> [args]]
+
+With no command, pdw-cli runs schema_overview and prints the warehouse
+schema, so callers always see what tables and columns are available before
+writing SQL.
 
 COMMANDS
   login                      Save warehouse URL + token to a per-user config file
@@ -35,6 +39,8 @@ COMMANDS
   call <name> [--data JSON]  Invoke a tool. With --data, send that JSON as the
                              request body. Without --data, read JSON from stdin.
                                --data JSON   Inline JSON input.
+  schema                     Run schema_overview and print the warehouse schema
+                             (same as running pdw-cli with no command).
   version                    Print the build version.
   update                     Replace this binary with the latest GitHub release.
                                --check  Only report whether an update is available.
@@ -94,11 +100,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		return 2
 	}
 	rest := rootFlags.Args()
+	var cmd string
 	if len(rest) == 0 {
-		fmt.Fprint(stderr, usage)
-		return 2
+		// No command: default to schema_overview so callers always see the
+		// schema first. Falls through to the auth/client setup below.
+		cmd = "schema"
+	} else {
+		cmd, rest = rest[0], rest[1:]
 	}
-	cmd, rest := rest[0], rest[1:]
 
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		fmt.Fprint(stdout, usage)
@@ -140,11 +149,55 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		return runDescribe(client, rest, stdout, stderr)
 	case "call":
 		return runCall(client, rest, stdin, stdout, stderr)
+	case "schema":
+		return runSchema(client, rest, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "pdw-cli: unknown command %q\n", cmd)
 		fmt.Fprint(stderr, usage)
 		return 2
 	}
+}
+
+// runSchema calls schema_overview and prints its CSV result blocks as plain
+// text so the no-args invocation is human-readable. Any extra args are
+// rejected to keep the command's contract narrow.
+func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		fmt.Fprintln(stderr, "pdw-cli schema: unexpected arguments")
+		return 2
+	}
+	out, err := client.CallTool(context.Background(), "schema_overview", nil)
+	if err != nil {
+		var apiErr *cliclient.APIError
+		if errors.As(err, &apiErr) {
+			fmt.Fprintf(stderr, "pdw-cli schema: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
+			return 1
+		}
+		fmt.Fprintln(stderr, "pdw-cli schema:", err)
+		return 1
+	}
+	var payload struct {
+		Results []struct {
+			SQL   string `json:"sql"`
+			CSV   string `json:"csv"`
+			Error string `json:"error"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		// Server gave us something we can't parse; surface the raw payload.
+		fmt.Fprintln(stdout, string(out))
+		return 0
+	}
+	for _, r := range payload.Results {
+		if r.Error != "" {
+			fmt.Fprintln(stderr, "pdw-cli schema:", r.Error)
+			return 1
+		}
+		if r.CSV != "" {
+			fmt.Fprintln(stdout, r.CSV)
+		}
+	}
+	return 0
 }
 
 type resolvedConfig struct {

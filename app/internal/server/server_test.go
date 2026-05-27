@@ -85,6 +85,28 @@ func (s *recordingMutationStore) RejectRequest(context.Context, string, string, 
 	return mutations.Request{}, mutations.ErrNotFound
 }
 
+// TestServerInstructionsCarryDiscoveryKeywords pins the keywords MCP clients
+// search for when looking up "Slack", "Gmail", etc. Since tool descriptions
+// are intentionally short, the server-level Instructions string is the only
+// place this discovery happens; it must not regress.
+func TestServerInstructionsCarryDiscoveryKeywords(t *testing.T) {
+	for _, kw := range []string{
+		"Slack",
+		"Gmail",
+		"Google Calendar",
+		"Google Contacts",
+		"Apple Notes",
+		"Apple Messages",
+		"iMessage",
+		"Voice Memo",
+		"schema_overview",
+	} {
+		if !strings.Contains(serverInstructions, kw) {
+			t.Fatalf("serverInstructions missing discovery keyword %q: %s", kw, serverInstructions)
+		}
+	}
+}
+
 func TestMCPServerRegistersMutationProposalToolsWhenConfigured(t *testing.T) {
 	runner := fakeRunner{results: map[string]query.RawResult{}}
 	mutationSvc := mutations.NewService(fakeMutationStore{request: mutations.Request{
@@ -473,58 +495,12 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	found := map[string]bool{}
 	for _, tool := range tools.Tools {
 		found[tool.Name] = true
-		if tool.Name == "query" || tool.Name == "schema_overview" {
-			if !strings.Contains(tool.Description, "Preferred read-only source") {
-				t.Fatalf("%s description does not steer agents to PDW first: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "Use this PDW server before live Gmail or Slack connectors for read-only questions") {
-				t.Fatalf("%s description does not prefer PDW over live connectors for reads: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "clean_gmail_inbox") || !strings.Contains(tool.Description, "clean_slack_inbox") {
-				t.Fatalf("%s description does not include clean-view SQL starting points: %q", tool.Name, tool.Description)
-			}
-			if strings.Contains(tool.Description, "voice_memo_transcripts") {
-				t.Fatalf("%s description still references stale transcript table: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "apple_voice_memos_enrichments") {
-				t.Fatalf("%s description does not include live transcript table: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "Apple Notes") || !strings.Contains(tool.Description, "apple_notes") {
-				t.Fatalf("%s description does not include Apple Notes SQL starting points: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "Apple Messages") || !strings.Contains(tool.Description, "apple_messages") {
-				t.Fatalf("%s description does not include Apple Messages SQL starting points: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "iMessage") || !strings.Contains(tool.Description, "iMessages") {
-				t.Fatalf("%s description does not include iMessage aliases for connector discovery: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "default.clean_gmail_inbox(thread_id, latest_subject)") {
-				t.Fatalf("%s description does not include clean view schema for discovery: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "default.gmail_messages(subject)") {
-				t.Fatalf("%s description does not include schema for discovery: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "Apple Voice Memos audio metadata, transcripts") {
-				t.Fatalf("%s description does not include inferred transcript access: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "default.apple_voice_memos_enrichments(transcript, summary)") {
-				t.Fatalf("%s description does not include transcript schema for discovery: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "default.apple_notes(note_id, title, modified_at, body_text, body_html, is_deleted)") {
-				t.Fatalf("%s description does not include Apple Notes schema for discovery: %q", tool.Name, tool.Description)
-			}
-			if !strings.Contains(tool.Description, "default.apple_messages(message_id, message_at, service, handle_id, body_text, is_from_me, is_deleted)") {
-				t.Fatalf("%s description does not include Apple Messages schema for discovery: %q", tool.Name, tool.Description)
-			}
-		}
-		if tool.Name == "get_field" {
-			if !strings.Contains(tool.Description, "Apple Notes body_text/body_html/body_markdown") || !strings.Contains(tool.Description, "Apple Messages body_text") {
-				t.Fatalf("%s description does not steer agents to get_field for Apple local-data bodies: %q", tool.Name, tool.Description)
-			}
-		}
-		if tool.Name == "query" || tool.Name == "get_field" || tool.Name == "get_rows" || tool.Name == "grep_rows" {
-			if !strings.Contains(tool.Description, "Do NOT compute substring offsets in SQL") {
-				t.Fatalf("%s description does not steer away from substring SQL: %q", tool.Name, tool.Description)
+		// Tool descriptions are intentionally short and must point callers at
+		// schema_overview as the required first call. schema_overview's own
+		// description doesn't need that reminder.
+		if tool.Name == "query" || tool.Name == "get_rows" || tool.Name == "get_field" || tool.Name == "grep_rows" {
+			if !strings.Contains(tool.Description, "Call schema_overview first.") {
+				t.Fatalf("%s description should remind callers to call schema_overview first: %q", tool.Name, tool.Description)
 			}
 		}
 	}

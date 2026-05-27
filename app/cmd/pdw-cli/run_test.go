@@ -41,9 +41,9 @@ func runCLI(t *testing.T, baseURL string, stdin string, args ...string) (stdout,
 	t.Helper()
 	var outBuf, errBuf bytes.Buffer
 	env := map[string]string{
-		"PDW_API_URL":       baseURL,
-		"PDW_SECRET_TOKEN":  cliTestToken,
-		"PDW_CLIENT_NAME":   "pdw-cli-test",
+		"PDW_API_URL":      baseURL,
+		"PDW_SECRET_TOKEN": cliTestToken,
+		"PDW_CLIENT_NAME":  "pdw-cli-test",
 	}
 	code = run(args, strings.NewReader(stdin), &outBuf, &errBuf, func(k string) string { return env[k] })
 	return outBuf.String(), errBuf.String(), code
@@ -64,14 +64,59 @@ func TestHelpExitsZero(t *testing.T) {
 	}
 }
 
-func TestNoArgsShowsHelpOnStderrAndExitsNonZero(t *testing.T) {
-	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {})
-	_, errOut, code := runCLI(t, srv.URL, "")
-	if code == 0 {
-		t.Fatalf("expected non-zero exit, got 0")
+func TestNoArgsRunsSchemaOverview(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"results":[{"sql":"SCHEMA","csv":"# default.slack_messages\nuser_id,conversation_id\nU09,C0\n"}]}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "")
+	if code != 0 {
+		t.Fatalf("expected zero exit, got %d (stderr=%s)", code, errOut)
 	}
-	if !strings.Contains(errOut, "list") {
-		t.Fatalf("stderr missing usage: %s", errOut)
+	if srv.lastPath != "/api/tools/schema_overview" || srv.lastMethod != http.MethodPost {
+		t.Fatalf("expected POST /api/tools/schema_overview, got %s %s", srv.lastMethod, srv.lastPath)
+	}
+	if !strings.Contains(out, "default.slack_messages") || !strings.Contains(out, "user_id,conversation_id") {
+		t.Fatalf("schema CSV not printed:\n%s", out)
+	}
+}
+
+func TestSchemaCommandRunsSchemaOverview(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"results":[{"sql":"SCHEMA","csv":"# default.gmail_messages\nsubject\nhello\n"}]}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "schema")
+	if code != 0 {
+		t.Fatalf("expected zero exit, got %d (stderr=%s)", code, errOut)
+	}
+	if srv.lastPath != "/api/tools/schema_overview" || srv.lastMethod != http.MethodPost {
+		t.Fatalf("expected POST /api/tools/schema_overview, got %s %s", srv.lastMethod, srv.lastPath)
+	}
+	if !strings.Contains(out, "default.gmail_messages") || !strings.Contains(out, "subject") {
+		t.Fatalf("schema CSV not printed:\n%s", out)
+	}
+}
+
+func TestSchemaCommandRejectsArguments(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("server should not be called")
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "schema", "extra")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit")
+	}
+	if !strings.Contains(errOut, "unexpected arguments") {
+		t.Fatalf("stderr missing argument error: %s", errOut)
+	}
+}
+
+func TestNoArgsWithoutConfigReportsMissingCredentials(t *testing.T) {
+	var outBuf, errBuf bytes.Buffer
+	code := run(nil, strings.NewReader(""), &outBuf, &errBuf, func(string) string { return "" })
+	if code == 0 {
+		t.Fatalf("expected non-zero exit when unconfigured")
+	}
+	if !strings.Contains(errBuf.String(), "PDW_API_URL") && !strings.Contains(errBuf.String(), "PDW_SECRET_TOKEN") {
+		t.Fatalf("stderr should hint at missing credentials: %s", errBuf.String())
 	}
 }
 

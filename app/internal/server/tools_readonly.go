@@ -9,21 +9,21 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
-func readOnlyTools(svc *query.Service, schemaDescription string) []tool.Tool {
+func readOnlyTools(svc *query.Service) []tool.Tool {
 	return []tool.Tool{
-		queryTool(svc, schemaDescription),
+		queryTool(svc),
 		getRowsTool(svc),
 		getFieldTool(svc),
 		grepRowsTool(svc),
-		schemaOverviewTool(svc, schemaDescription),
+		schemaOverviewTool(svc),
 	}
 }
 
-func queryTool(svc *query.Service, schemaDescription string) tool.Tool {
+func queryTool(svc *query.Service) tool.Tool {
 	return &tool.Typed[queryInput, query.QueryResponse]{
 		NameStr:        "query",
 		TitleStr:       "Query Postgres",
-		DescriptionStr: withSchemaDescription(queryDescription, schemaDescription),
+		DescriptionStr: queryDescription,
 		Handle: func(ctx context.Context, in queryInput) (query.QueryResponse, error) {
 			return svc.Execute(ctx, queryStatementsFromInput(in.Queries), in.PreviewRows, in.Format), nil
 		},
@@ -67,11 +67,11 @@ func grepRowsTool(svc *query.Service) tool.Tool {
 	}
 }
 
-func schemaOverviewTool(svc *query.Service, schemaDescription string) tool.Tool {
+func schemaOverviewTool(svc *query.Service) tool.Tool {
 	return &tool.Typed[schemaOverviewInput, schemaOverviewOutput]{
 		NameStr:        "schema_overview",
 		TitleStr:       "Schema Overview",
-		DescriptionStr: withSchemaDescription(schemaOverviewDescription, schemaDescription),
+		DescriptionStr: schemaOverviewDescription,
 		Handle: func(ctx context.Context, _ schemaOverviewInput) (schemaOverviewOutput, error) {
 			return schemaOverviewOutput{Response: svc.SchemaOverview(ctx)}, nil
 		},

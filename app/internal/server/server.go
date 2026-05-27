@@ -18,7 +18,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
-const debugCacheStatusDescription = "Return live cached query_ids, ages, and total cache size for debugging. Example: _debug_cache_status({}) shows which query handles are still valid. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: query, get_rows, grep_rows."
+const debugCacheStatusDescription = "Return live cached query_ids, ages, and total cache size for debugging."
 
 func mcpToolHooks(logger *slog.Logger) tool.Hooks {
 	return tool.Hooks{
@@ -92,25 +92,23 @@ type grepRowsInput struct {
 
 type debugCacheInput struct{}
 
-const preferredReadOnlyGuidance = "Preferred read-only source for Zach's synced Gmail, Google Contacts, Slack, Apple Notes, Apple Messages/iMessage/iMessages, calendar, Voice Memo transcript, and cross-source personal data questions. Use this PDW server before live Gmail or Slack connectors for read-only questions, and use it for requests about Zach's recent iMessages or Apple Messages. For read-only work, answer by writing read-only Postgres SQL with the generic SQL and cached-result tools. Use live connectors only for explicitly live-only data or writes that cannot be represented by available mutation proposal tools."
+// serverInstructions is the only place MCP-side keyword discovery needs to
+// happen: clients searching for "Slack" or "Gmail" hit this paragraph. The
+// per-tool descriptions stay deliberately short; the rich content lives in
+// the schema_overview response.
+const serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Apple Notes, Apple Messages (iMessage/SMS/RCS), and Apple Voice Memo transcripts. Always call schema_overview first to learn the tables and columns; then write read-only Postgres SQL with query."
 
-const sqlStartingPoints = "SQL starting points: Gmail -> clean_gmail_inbox, gmail_messages, gmail_attachments, gmail_attachment_enrichments. Contacts -> clean_contacts, contact_cards. Slack -> clean_slack_inbox, slack_messages, slack_conversations, slack_users. Transcripts -> apple_voice_memos_enrichments, apple_voice_memos_transcription_runs, apple_voice_memos_transcript_segments, clean_calendar_with_transcripts, clean_transcripts_no_calendar_match. Apple Notes -> apple_notes, apple_note_revisions, apple_note_attachments. Apple Messages/iMessage/iMessages/SMS/RCS -> apple_messages, apple_message_chats, apple_message_handles, apple_message_chat_handles, apple_message_chat_messages, apple_message_attachments."
+const schemaFirstReminder = "Call schema_overview first."
 
-const serverInstructions = preferredReadOnlyGuidance + " Contains synced Gmail mail and attachment text for configured mailboxes, Slack workspace messages/files/users, calendar data, Apple Notes, Apple Messages from macOS Messages chat.db including iMessage/iMessages, SMS, and RCS, Apple Voice Memos, transcripts, and transcript enrichments when present. " + sqlStartingPoints
+const queryDescription = "Run read-only Postgres SQL against the personal data warehouse and cache the result under a query_id. " + schemaFirstReminder + " Each SQL statement must be paired with question, a concise plain-English question this SQL statement is trying to answer."
 
-const queryDescription = preferredReadOnlyGuidance + " Execute read-only Postgres SQL, cache the full result under query_id, and return a preview. Each SQL statement must be paired with question, a concise plain-English question this SQL statement is trying to answer; legacy sql array input is rejected. " + sqlStartingPoints + " Example: query({\"queries\":[{\"question\":\"What is the most recent completed Voice Memo transcript?\",\"sql\":\"SELECT recording_id, transcript FROM apple_voice_memos_enrichments WHERE status='completed' ORDER BY created_at DESC LIMIT 1\"}],\"preview_rows\":1,\"format\":\"csv\"}) returns query_id plus a truncated preview; then call get_field(query_id,row=0,column=\"transcript\",offset=0,length=200000) to read the full transcript. Apple Notes example: query latest non-deleted notes from apple_notes with note_id, title, modified_at, body_text, body_html, or body_markdown; then call get_field for long body columns. Apple Messages/iMessage example: query recent messages from apple_messages with message_id, message_at, service, handle_id, body_text, is_from_me, and is_deleted; then call get_field for long body_text or raw_metadata_json columns. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: get_rows pages cached rows, grep_rows searches cached rows, schema_overview lists tables and views."
+const getRowsDescription = "Return a row slice from a cached query result by query_id. " + schemaFirstReminder
 
-const getRowsDescription = "Return a row slice from a cached PDW query result without re-executing SQL. PDW is the preferred read-only source for synced Gmail, Slack, Apple Notes, Apple Messages/iMessage/iMessages, calendar, Voice Memo transcript, and cross-source personal data questions. Example: get_rows({\"query_id\":\"abc123\",\"offset\":50,\"limit\":25}) returns rows 50-74 in the query's original format unless format is overridden. Do NOT compute substring offsets in SQL. Use get_field for long fields. Related tools: query creates query_id, get_field reads a long cell, grep_rows searches cached rows."
+const getFieldDescription = "Return a character chunk from a single cell in a cached query result. Use this to read long fields (transcripts, message bodies, email bodies, note bodies) end-to-end without putting substring offsets in SQL. " + schemaFirstReminder
 
-const getFieldDescription = "Return a raw character chunk from one cached PDW query cell, which is the right way to read transcripts, Apple Notes body_text/body_html/body_markdown, Apple Messages body_text, iMessage body_text, email bodies, attachment text, or any long text column end-to-end. Example: after query returns query_id for SELECT recording_id, transcript FROM apple_voice_memos_enrichments ORDER BY created_at DESC LIMIT 1, call get_field({\"query_id\":\"abc123\",\"row\":0,\"column\":\"transcript\",\"offset\":0,\"length\":200000}) to retrieve the full transcript when eof=true. For Apple Notes, query apple_notes or apple_note_revisions and read body_text, body_html, body_markdown, or raw_metadata_json with get_field. For Apple Messages/iMessages, query apple_messages and read body_text or raw_metadata_json with get_field. Do NOT compute substring offsets in SQL. Related tools: query creates query_id, get_rows pages rows, grep_rows finds text before fetching a field."
+const grepRowsDescription = "Regex-search a cached query result and return match context. " + schemaFirstReminder
 
-const grepRowsDescription = "Regex-search cached PDW query rows without re-executing SQL and return match context. Use this after SQL queries over Gmail, Slack, Apple Notes, Apple Messages/iMessage/iMessages, transcript, or cross-source warehouse rows when you need to locate text before fetching a long field. Example: grep_rows({\"query_id\":\"abc123\",\"pattern\":\"weighted projects\",\"columns\":[\"transcript\"],\"limit\":20}) finds where that phrase appears across cached transcripts. Do NOT compute substring offsets in SQL. Use get_field to read the matching long field. Related tools: query creates query_id, get_rows pages rows."
-
-const schemaOverviewDescription = preferredReadOnlyGuidance + " List tables, views, and columns in the default Postgres schema with compact samples. " + sqlStartingPoints + " Example: schema_overview({}) returns one text section per table or view. Do NOT compute substring offsets in SQL. Use query to create a query_id, then get_field for long fields. Related tools: query, get_rows, get_field, grep_rows."
-
-const schemaRelationsSQL = "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
-
-const schemaToolDescriptionMaxChars = 12000
+const schemaOverviewDescription = "Required first call. Lists the warehouse's tables, views, columns, and compact samples so the caller can pick the right tables before writing SQL."
 
 func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	return NewMCPServerWithMutations(runner, opts, nil)
@@ -129,11 +127,9 @@ func NewMCPServerWithMutations(runner query.Runner, opts query.Options, mutation
 // tool.Registry that both surfaces (MCP and HTTP) consume. The query.Service
 // is returned so callers that want the cache (e.g. NewMux for shutdown) can
 // hold onto it; passing it back also makes the shared-cache contract obvious.
-func buildRegistry(runner query.Runner, opts query.Options, mutationSvc *mutations.Service, logger *slog.Logger) (*tool.Registry, *query.Service) {
-	serverLogger := logger.With("component", "server")
+func buildRegistry(runner query.Runner, opts query.Options, mutationSvc *mutations.Service, _ *slog.Logger) (*tool.Registry, *query.Service) {
 	svc := query.NewService(runner, opts)
-	schemaDescription := schemaDescriptionForTools(context.Background(), runner, serverLogger)
-	tools := readOnlyTools(svc, schemaDescription)
+	tools := readOnlyTools(svc)
 	if opts.DebugCacheTool {
 		tools = append(tools, debugCacheStatusTool(svc))
 	}
@@ -152,164 +148,6 @@ func newMCPServerFromRegistry(registry *tool.Registry, logger *slog.Logger) *mcp
 		t.RegisterMCP(server, hooks)
 	}
 	return server
-}
-
-func schemaDescriptionForTools(ctx context.Context, runner query.Runner, logger *slog.Logger) string {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	database := "default"
-	if result, err := runner.Query(ctx, "SELECT current_database() AS database", 1); err == nil {
-		if name := rawRowString(result, "database"); name != "" {
-			database = name
-		}
-	} else {
-		logger.WarnContext(ctx, "tool schema description database lookup failed", "error", err)
-	}
-
-	result, err := runner.Query(ctx, schemaRelationsSQL, 0)
-	if err != nil {
-		logger.WarnContext(ctx, "tool schema description table listing failed", "error", err)
-		return ""
-	}
-	tables := rawTableNames(result)
-	entries := make([]string, 0, len(tables))
-	for _, table := range tables {
-		describeSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '" + strings.ReplaceAll(table, "'", "''") + "' ORDER BY ordinal_position"
-		result, err := runner.Query(ctx, describeSQL, 0)
-		if err != nil {
-			logger.WarnContext(ctx, "tool schema description table describe failed", "table", table, "error", err)
-			continue
-		}
-		columns := rawColumnNames(result)
-		if len(columns) == 0 {
-			continue
-		}
-		entries = append(entries, database+"."+table+"("+strings.Join(columns, ", ")+")")
-	}
-	if len(entries) == 0 {
-		return ""
-	}
-
-	var out strings.Builder
-	if summary := schemaCapabilitySummary(entries); summary != "" {
-		out.WriteString("Available personal data warehouse access inferred from live schema: ")
-		out.WriteString(summary)
-		out.WriteString(".\n")
-	}
-	out.WriteString("Live warehouse schema for tool discovery:\n")
-	for _, entry := range entries {
-		out.WriteString("- ")
-		out.WriteString(entry)
-		out.WriteString("\n")
-	}
-	return truncateDescription(out.String(), schemaToolDescriptionMaxChars)
-}
-
-func rawTableNames(result query.RawResult) []string {
-	tables := make([]string, 0, len(result.Rows))
-	for _, row := range result.Rows {
-		name := rawValueString(row["name"])
-		if name == "" && len(result.Columns) == 1 {
-			name = rawValueString(row[result.Columns[0]])
-		}
-		if name != "" {
-			tables = append(tables, name)
-		}
-	}
-	return tables
-}
-
-func rawColumnNames(result query.RawResult) []string {
-	columns := make([]string, 0, len(result.Rows))
-	for _, row := range result.Rows {
-		if name := rawValueString(row["name"]); name != "" {
-			columns = append(columns, name)
-		}
-	}
-	return columns
-}
-
-func rawRowString(result query.RawResult, column string) string {
-	if len(result.Rows) == 0 {
-		return ""
-	}
-	value := rawValueString(result.Rows[0][column])
-	if value == "" && len(result.Columns) == 1 {
-		value = rawValueString(result.Rows[0][result.Columns[0]])
-	}
-	return value
-}
-
-func rawValueString(value any) string {
-	switch v := value.(type) {
-	case nil:
-		return ""
-	case string:
-		return v
-	case []byte:
-		return string(v)
-	default:
-		return ""
-	}
-}
-
-func schemaCapabilitySummary(entries []string) string {
-	capabilities := make([]string, 0, 5)
-	has := func(needles ...string) bool {
-		for _, entry := range entries {
-			lower := strings.ToLower(entry)
-			for _, needle := range needles {
-				if strings.Contains(lower, needle) {
-					return true
-				}
-			}
-		}
-		return false
-	}
-	if has("gmail") {
-		capabilities = append(capabilities, "Gmail email, threads, inbox state, and attachment text; start SQL with clean_gmail_inbox, gmail_messages, gmail_attachments, or gmail_attachment_enrichments")
-	}
-	if has("slack") {
-		capabilities = append(capabilities, "Slack messages, files, users, channels, DMs, mentions, and unread state; start SQL with clean_slack_inbox, slack_messages, slack_conversations, or slack_users")
-	}
-	if has("calendar") {
-		capabilities = append(capabilities, "Google Calendar events and calendar-linked meeting context")
-	}
-	if has("contact_cards", "clean_contacts") {
-		capabilities = append(capabilities, "Google Contacts source-mirrored contact cards; start SQL with clean_contacts or contact_cards")
-	}
-	if has("transcript", "voice_memos", "voice memo") {
-		capabilities = append(capabilities, "Apple Voice Memos audio metadata, transcripts, diarized segments, transcript enrichments, meeting notes, summaries, action items, and transcript/calendar matches; start SQL with apple_voice_memos_enrichments, apple_voice_memos_transcription_runs, apple_voice_memos_transcript_segments, clean_calendar_with_transcripts, or clean_transcripts_no_calendar_match")
-	}
-	if has("apple_notes", "apple_note") {
-		capabilities = append(capabilities, "Apple Notes latest notes, body text/html/markdown, revision history, tombstones, and attachment metadata; start SQL with apple_notes, apple_note_revisions, or apple_note_attachments")
-	}
-	if has("apple_messages", "apple_message") {
-		capabilities = append(capabilities, "Apple Messages latest messages, decoded body text, chats, handles, participants, message-chat joins, tombstones, and attachment metadata; start SQL with apple_messages, apple_message_chats, apple_message_handles, apple_message_chat_handles, apple_message_chat_messages, or apple_message_attachments")
-	}
-	if has("agent_run") {
-		capabilities = append(capabilities, "agent run audit logs, tool calls, and events")
-	}
-	return strings.Join(capabilities, "; ")
-}
-
-func withSchemaDescription(base, schema string) string {
-	if schema == "" {
-		return base
-	}
-	return base + "\n\n" + schema
-}
-
-func truncateDescription(description string, maxChars int) string {
-	if maxChars <= 0 || len(description) <= maxChars {
-		return description
-	}
-	cut := strings.LastIndex(description[:maxChars], "\n")
-	if cut <= 0 {
-		cut = maxChars
-	}
-	return strings.TrimRight(description[:cut], "\n") + "\n- ... schema truncated for MCP tool description size"
 }
 
 func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mutationSvcs ...*mutations.Service) http.Handler {
