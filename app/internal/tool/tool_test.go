@@ -284,6 +284,55 @@ func TestRegisterMCPWithoutOnResultHookStillWorks(t *testing.T) {
 	}
 }
 
+func TestRegistryFilterPreservesOrderAndIndexesIndependently(t *testing.T) {
+	a := newEcho(nil, nil)
+	a.NameStr = "a"
+	a.SurfacesField = tool.SurfaceMCPOnly
+	b := newEcho(nil, nil)
+	b.NameStr = "b"
+	c := newEcho(nil, nil)
+	c.NameStr = "c"
+	c.SurfacesField = tool.SurfaceCLIOnly
+	reg := tool.NewRegistry([]tool.Tool{a, b, c})
+
+	mcp := reg.Filter(func(t tool.Tool) bool { return t.Surfaces().ShowsOnMCP() })
+	cli := reg.Filter(func(t tool.Tool) bool { return t.Surfaces().ShowsOnCLI() })
+
+	mcpNames := []string{}
+	for _, t := range mcp.All() {
+		mcpNames = append(mcpNames, t.Name())
+	}
+	if len(mcpNames) != 2 || mcpNames[0] != "a" || mcpNames[1] != "b" {
+		t.Fatalf("MCP filter result = %v", mcpNames)
+	}
+	cliNames := []string{}
+	for _, t := range cli.All() {
+		cliNames = append(cliNames, t.Name())
+	}
+	if len(cliNames) != 2 || cliNames[0] != "b" || cliNames[1] != "c" {
+		t.Fatalf("CLI filter result = %v", cliNames)
+	}
+	if cli.ByName("a") != nil {
+		t.Fatal("MCP-only tool leaked into the CLI filter's ByName index")
+	}
+	if mcp.ByName("c") != nil {
+		t.Fatal("CLI-only tool leaked into the MCP filter's ByName index")
+	}
+}
+
+func TestSurfaceDefaultShowsOnBothSurfaces(t *testing.T) {
+	var s tool.Surface
+	if !s.ShowsOnMCP() || !s.ShowsOnCLI() {
+		t.Fatalf("Surface zero value must show on both surfaces; got mcp=%v cli=%v", s.ShowsOnMCP(), s.ShowsOnCLI())
+	}
+	if tool.SurfaceMCPOnly.ShowsOnCLI() {
+		t.Fatal("SurfaceMCPOnly must not show on CLI")
+	}
+	if tool.SurfaceCLIOnly.ShowsOnMCP() {
+		t.Fatal("SurfaceCLIOnly must not show on MCP")
+	}
+}
+
 func TestRegistryRejectsDuplicateNames(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {

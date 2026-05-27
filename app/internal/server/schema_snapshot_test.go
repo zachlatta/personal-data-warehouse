@@ -20,10 +20,12 @@ import (
 // regression guard against accidental drift in tool input schemas.
 var updateSchemaGoldens = flag.Bool("update", false, "regenerate input-schema golden files")
 
-// snapshotTools is the list of tool names we want byte-identical MCP
+// mcpSnapshotTools is the list of tool names we want byte-identical MCP
 // InputSchemas for across refactors. _debug_cache_status is excluded
-// because it is gated behind a config flag and covered separately.
-var snapshotTools = []string{
+// because it is gated behind a config flag and covered separately. CLI-only
+// tools (e.g. query_full_result) are checked from the HTTP API side via
+// apiSnapshotTools in mux_api_test.go.
+var mcpSnapshotTools = []string{
 	"query",
 	"get_rows",
 	"get_field",
@@ -60,7 +62,7 @@ func TestMCPToolInputSchemasMatchGolden(t *testing.T) {
 		byName[tl.Name] = tl
 	}
 
-	for _, name := range snapshotTools {
+	for _, name := range mcpSnapshotTools {
 		tl, ok := byName[name]
 		if !ok {
 			t.Fatalf("tool %q not exposed; got %v", name, byName)
@@ -86,6 +88,37 @@ func TestMCPToolInputSchemasMatchGolden(t *testing.T) {
 		gotWithNL := append(got, '\n')
 		if string(gotWithNL) != string(want) {
 			t.Fatalf("input schema for %s drifted.\n--- want ---\n%s\n--- got ---\n%s", name, want, gotWithNL)
+		}
+	}
+}
+
+func TestMCPDoesNotListCLIOnlyTools(t *testing.T) {
+	runner := fakeRunner{results: map[string]query.RawResult{}}
+	srv := NewMCPServer(runner, query.Options{MaxRows: 5, MaxFieldChars: 100})
+
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Run(ctx, serverTransport) }()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "snapshot-client", Version: "0.1.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect failed: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	tools, err := session.ListTools(ctx, &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+	byName := map[string]bool{}
+	for _, tl := range tools.Tools {
+		byName[tl.Name] = true
+	}
+	for _, name := range cliOnlyToolNames {
+		if byName[name] {
+			t.Fatalf("CLI-only tool %q must not be exposed on MCP: %#v", name, byName)
 		}
 	}
 }

@@ -20,6 +20,23 @@ import (
 
 const muxAPITestSecret = "test-secret-token-at-least-32-chars-x"
 
+// apiSnapshotTools lists tool names whose API-exposed input schemas we pin
+// against the testdata/schemas/{name}.input_schema.json goldens. It mirrors
+// mcpSnapshotTools but swaps in the CLI-only tools (and drops MCP-only ones)
+// for the core read/query and mutation proposal schemas snapshotted here.
+var apiSnapshotTools = []string{
+	"schema_overview",
+	"query_full_result",
+	"propose_mutation",
+	"propose_mutation_help",
+}
+
+// mcpOnlyToolNames are exposed on MCP but must NOT appear on the HTTP API.
+var mcpOnlyToolNames = []string{"query", "get_rows", "get_field", "grep_rows"}
+
+// cliOnlyToolNames are exposed on the HTTP API but must NOT appear on MCP.
+var cliOnlyToolNames = []string{"query_full_result"}
+
 func newMuxAPITestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	runner := fakeRunner{results: map[string]query.RawResult{
@@ -77,82 +94,79 @@ func TestAPIListsTools(t *testing.T) {
 	for _, e := range payload.Data {
 		names[e.Name] = true
 	}
-	for _, required := range []string{"query", "get_rows", "get_field", "grep_rows", "schema_overview"} {
+	for _, required := range []string{"schema_overview", "query_full_result"} {
 		if !names[required] {
 			t.Fatalf("API tool list missing %q: %#v", required, names)
 		}
 	}
+	for _, hidden := range mcpOnlyToolNames {
+		if names[hidden] {
+			t.Fatalf("MCP-only tool %q must not be exposed on the API: %#v", hidden, names)
+		}
+	}
 }
 
-func TestAPIQueryAndGetRowsShareCache(t *testing.T) {
-	// Pins PR 4's shared-cache contract: a query_id minted on the API is
-	// fetchable from the API (and over MCP, since both surfaces consume the
-	// same tool.Registry which is constructed once per process and holds
-	// the only query.Service).
+func TestAPIRunsQueryFullResult(t *testing.T) {
+	// Pins the CLI-only query_full_result tool: a single read-only SQL
+	// statement goes in, the full result comes back without a query_id
+	// (no caching) and without field truncation.
 	srv := newMuxAPITestServer(t)
-	queryBody := `{"queries":[{"question":"how many","sql":"SELECT 1 AS n"}],"preview_rows":1,"format":"csv"}`
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/query", strings.NewReader(queryBody))
+	body := `{"sql":"SELECT 1 AS n","format":"csv"}`
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/query_full_result", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("POST query: %v", err)
+		t.Fatalf("POST query_full_result: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("query status = %d body = %s", resp.StatusCode, body)
+		t.Fatalf("status = %d body = %s", resp.StatusCode, body)
 	}
-	var queryEnvelope struct {
+	var envelope struct {
 		Data struct {
-			Results []struct {
-				QueryID string `json:"query_id"`
-			} `json:"results"`
+			SQL         string   `json:"sql"`
+			Format      string   `json:"format"`
+			ColumnNames []string `json:"column_names"`
+			TotalRows   int      `json:"total_rows"`
+			Rows        string   `json:"rows"`
+			Error       string   `json:"error"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&queryEnvelope); err != nil {
-		t.Fatalf("decode query: %v", err)
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode: %v", err)
 	}
-	if len(queryEnvelope.Data.Results) != 1 || queryEnvelope.Data.Results[0].QueryID == "" {
-		t.Fatalf("missing query_id: %#v", queryEnvelope)
+	if envelope.Data.Error != "" {
+		t.Fatalf("query_full_result error: %s", envelope.Data.Error)
 	}
-	queryID := queryEnvelope.Data.Results[0].QueryID
-
-	rowsBody := `{"query_id":"` + queryID + `","offset":1,"limit":2}`
-	rowsReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/get_rows", strings.NewReader(rowsBody))
-	rowsReq.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
-	rowsReq.Header.Set("Content-Type", "application/json")
-	rowsResp, err := http.DefaultClient.Do(rowsReq)
-	if err != nil {
-		t.Fatalf("POST get_rows: %v", err)
+	if envelope.Data.TotalRows != 3 || envelope.Data.Format != "csv" {
+		t.Fatalf("unexpected response: %#v", envelope.Data)
 	}
-	defer rowsResp.Body.Close()
-	if rowsResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(rowsResp.Body)
-		t.Fatalf("get_rows status = %d body = %s", rowsResp.StatusCode, body)
-	}
-	var rowsEnvelope struct {
-		Data struct {
-			QueryID string `json:"query_id"`
-			Error   string `json:"error"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(rowsResp.Body).Decode(&rowsEnvelope); err != nil {
-		t.Fatalf("decode get_rows: %v", err)
-	}
-	if rowsEnvelope.Data.Error != "" {
-		t.Fatalf("get_rows reported error against the same query_id, cache not shared: %s", rowsEnvelope.Data.Error)
-	}
-	if rowsEnvelope.Data.QueryID != queryID {
-		t.Fatalf("get_rows returned different query_id: got %q want %q", rowsEnvelope.Data.QueryID, queryID)
+	if envelope.Data.Rows != "n\n1\n2\n3" {
+		t.Fatalf("rows body = %q", envelope.Data.Rows)
 	}
 }
 
-func TestAPIInputSchemasMatchMCPGolden(t *testing.T) {
-	// API tool listings must return the exact same JSON Schema as MCP shows
-	// for every tool. If the SDK changes how it reflects schemas, or if the
-	// tool package's InputSchema() helper diverges from mcp.AddTool's
-	// internal derivation, this test fails before a CLI sees the drift.
+func TestAPIRejectsMCPOnlyTools(t *testing.T) {
+	srv := newMuxAPITestServer(t)
+	for _, name := range mcpOnlyToolNames {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/"+name, strings.NewReader(`{}`))
+		req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", name, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("MCP-only tool %q was reachable from the API: status=%d", name, resp.StatusCode)
+		}
+	}
+}
+
+func TestAPIInputSchemasMatchGolden(t *testing.T) {
+	// API tool listings must return the pinned JSON Schema for every API
+	// tool whose input schema we snapshot.
 	srv := newMuxAPITestServer(t)
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/tools", nil)
 	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
@@ -174,23 +188,32 @@ func TestAPIInputSchemasMatchMCPGolden(t *testing.T) {
 	for _, e := range payload.Data {
 		apiByName[e.Name] = e.InputSchema
 	}
-	for _, name := range snapshotTools {
+	for _, name := range apiSnapshotTools {
 		gotAPI, ok := apiByName[name]
 		if !ok {
 			t.Fatalf("API listing missing %q", name)
 		}
-		goldenBytes, err := os.ReadFile(filepath.Join("testdata", "schemas", name+".input_schema.json"))
+		path := filepath.Join("testdata", "schemas", name+".input_schema.json")
+		gotJSON, err := json.MarshalIndent(gotAPI, "", "  ")
 		if err != nil {
-			t.Fatalf("read golden for %q: %v", name, err)
+			t.Fatalf("marshal API schema for %q: %v", name, err)
 		}
-		var golden map[string]any
-		if err := json.Unmarshal(goldenBytes, &golden); err != nil {
-			t.Fatalf("decode golden %q: %v", name, err)
+		gotWithNL := append(gotJSON, '\n')
+		if *updateSchemaGoldens {
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(path, gotWithNL, 0o644); err != nil {
+				t.Fatalf("write golden for %q: %v", name, err)
+			}
+			continue
 		}
-		gotJSON, _ := json.Marshal(gotAPI)
-		wantJSON, _ := json.Marshal(golden)
-		if string(gotJSON) != string(wantJSON) {
-			t.Fatalf("API input_schema for %q diverges from MCP golden\n  api:    %s\n  golden: %s", name, gotJSON, wantJSON)
+		goldenBytes, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read golden for %q: %v (run with -update to create it)", name, err)
+		}
+		if string(gotWithNL) != string(goldenBytes) {
+			t.Fatalf("API input_schema for %q diverges from golden\n--- want ---\n%s\n--- got ---\n%s", name, goldenBytes, gotWithNL)
 		}
 	}
 }

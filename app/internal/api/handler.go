@@ -1,7 +1,7 @@
-// Package api exposes the shared tool.Registry over a CLI-friendly HTTP
-// surface. Every tool listed on MCP is also reachable here as
-// POST /api/tools/{name}. Auth is the static PDW_SECRET_TOKEN bearer; the
-// handler itself does not check auth — wrap it in auth.RequireStaticBearer.
+// Package api exposes a filtered tool.Registry over a CLI-friendly HTTP
+// surface. Tools are reachable as POST /api/tools/{name}. Auth is the static
+// PDW_SECRET_TOKEN bearer; the handler itself does not check auth -- wrap it
+// in auth.RequireStaticBearer.
 package api
 
 import (

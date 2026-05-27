@@ -64,10 +64,10 @@ ENVIRONMENT
 EXAMPLES
   pdw-cli login                          # one-time setup; persists URL + token
   pdw-cli list
-  pdw-cli describe query
+  pdw-cli describe query_full_result
   pdw-cli call schema_overview
-  pdw-cli call query --data '{"queries":[{"question":"row count","sql":"SELECT 1"}]}'
-  echo '{"queries":[{"question":"q","sql":"SELECT 1"}]}' | pdw-cli call query
+  pdw-cli call query_full_result --data '{"sql":"SELECT 1"}'
+  echo '{"sql":"SELECT now()"}' | pdw-cli call query_full_result
   pdw-cli config show
   pdw-cli version
   pdw-cli update --check

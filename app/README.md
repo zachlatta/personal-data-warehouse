@@ -1,14 +1,18 @@
 # Personal Data Warehouse App
 
-This is the Go app that fronts the Postgres warehouse. It exposes the same
-set of tools (`query`, `get_rows`, `get_field`, `grep_rows`, `schema_overview`,
-plus optional Gmail, Calendar, and Contacts mutation proposals) over two surfaces:
+This is the Go app that fronts the Postgres warehouse. It exposes a tool
+registry over two surfaces:
 
 - **MCP** at `/mcp` — the default flow, used by Claude connectors. OAuth-protected.
 - **HTTP API** at `/api/tools` — for CLI and script use. Static-bearer protected.
 
-Both surfaces share the same in-process query cache, so a `query_id` minted on
-one surface is fetchable from the other without re-running the SQL.
+Each tool declares which surfaces it appears on:
+
+- **MCP-only**: `query`, `get_rows`, `get_field`, `grep_rows` — cursor-style
+  tools designed for an LLM stepping through results.
+- **CLI-only**: `query_full_result` — psql-style "give me the whole result"
+  for terminal/script use; no caching, no field truncation.
+- **Both**: `schema_overview`, the `propose_*` mutation tools.
 
 ## Environment
 
@@ -111,8 +115,8 @@ Do not reuse the root `Dockerfile`; that one runs Dagster.
 
 ## HTTP API
 
-Every MCP tool is also reachable over HTTP for CLI and script use. Same tools,
-same input/output schemas, same shared `query_id` cache, different envelope.
+Tools marked CLI-only or "both" are reachable here. MCP-only tools
+(`query`, `get_rows`, `get_field`, `grep_rows`) return `404 tool_not_found`.
 
 ### Auth
 
@@ -137,8 +141,8 @@ secret directly. Tokens are compared in constant time.
 {
   "data": [
     {
-      "name": "query",
-      "title": "Query Postgres",
+      "name": "query_full_result",
+      "title": "Run SQL (full result)",
       "description": "...",
       "input_schema": { "type": "object", "properties": { ... } }
     }
@@ -150,23 +154,23 @@ secret directly. Tokens are compared in constant time.
 JSON (same shape MCP uses); response wraps the tool's output in `data`:
 
 ```bash
-curl -sS https://your-host/api/tools/query \
+curl -sS https://your-host/api/tools/query_full_result \
   -H "Authorization: Bearer codex:$PDW_SECRET_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"queries":[{"question":"recent transcripts","sql":"SELECT recording_id FROM apple_voice_memos_enrichments LIMIT 3"}],"format":"json"}'
+  -d '{"sql":"SELECT recording_id FROM apple_voice_memos_enrichments LIMIT 3","format":"json"}'
 ```
 
 ```json
 {
   "data": {
-    "results": [
-      { "query_id": "abc123...", "total_rows": 3, "column_names": ["recording_id"], "preview": "..." }
-    ]
+    "sql": "SELECT recording_id FROM apple_voice_memos_enrichments LIMIT 3",
+    "format": "json",
+    "column_names": ["recording_id"],
+    "total_rows": 3,
+    "rows": [{"recording_id": "..."}, ...]
   }
 }
 ```
-
-The returned `query_id` is also valid for follow-up MCP calls and vice versa.
 
 ### Errors
 
@@ -190,7 +194,12 @@ as MCP, where `IsError=true` would still carry the partial results. Inspect
 
 ## Tools
 
-The server exposes cursor-based query tools. `query` executes SQL once, caches the full result in the server process, and returns a `query_id` handle for follow-up calls. Cached results expire after `MCP_QUERY_CACHE_TTL` and are evicted least-recently-used when the process-wide `MCP_QUERY_CACHE_MAX_BYTES` cap is reached. If the server restarts, old `query_id`s are invalid and the caller should re-run `query`.
+The MCP server exposes cursor-based query tools. `query` executes SQL once, caches the full result in the server process, and returns a `query_id` handle for follow-up calls. Cached results expire after `MCP_QUERY_CACHE_TTL` and are evicted least-recently-used when the process-wide `MCP_QUERY_CACHE_MAX_BYTES` cap is reached. If the server restarts, old `query_id`s are invalid and the caller should re-run `query`.
+
+The CLI/HTTP API exposes a separate `query_full_result` tool that runs one
+SQL statement and returns the entire result body in one response — no caching,
+no field truncation, just a safety cap of 1,000,000 rows. Use it the way
+you'd use `psql` interactively or from a shell script.
 
 When mutation review is enabled, the server also exposes:
 
@@ -393,10 +402,10 @@ go build -o /tmp/pdw-cli ./cmd/pdw-cli
 
 /tmp/pdw-cli list                     # name/title/description table
 /tmp/pdw-cli list --json              # raw JSON tool list
-/tmp/pdw-cli describe query           # title + description + input JSON Schema
+/tmp/pdw-cli describe query_full_result  # title + description + input JSON Schema
 /tmp/pdw-cli call schema_overview     # zero-input tool
-/tmp/pdw-cli call query --data '{"queries":[{"question":"row count","sql":"SELECT 1"}]}'
-echo '{"queries":[{"question":"q","sql":"SELECT 1"}]}' | /tmp/pdw-cli call query
+/tmp/pdw-cli call query_full_result --data '{"sql":"SELECT 1"}'
+echo '{"sql":"SELECT now()"}' | /tmp/pdw-cli call query_full_result
 /tmp/pdw-cli config show              # prints config with the token redacted
 /tmp/pdw-cli logout                   # removes the config file
 ```

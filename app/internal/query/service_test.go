@@ -32,11 +32,13 @@ type recordingRunner struct {
 	errs    map[string]error
 	mu      sync.Mutex
 	queries []string
+	maxRows []int
 }
 
 func (r *recordingRunner) Query(_ context.Context, sql string, maxRows int) (RawResult, error) {
 	r.mu.Lock()
 	r.queries = append(r.queries, sql)
+	r.maxRows = append(r.maxRows, maxRows)
 	r.mu.Unlock()
 	if err := r.errs[sql]; err != nil {
 		return RawResult{}, err
@@ -492,4 +494,79 @@ func TestServiceRejectsQueriesOverRowCap(t *testing.T) {
 
 func utf8RuneLen(value string) int {
 	return len([]rune(value))
+}
+
+func TestExecuteFullReturnsFullCSVWithoutCachingOrTruncation(t *testing.T) {
+	bigBody := strings.Repeat("x", 250000)
+	runner := &recordingRunner{results: map[string]RawResult{
+		"SELECT id, body FROM gmail_messages ORDER BY id": {
+			Columns: []string{"id", "body"},
+			Rows: []map[string]any{
+				{"id": 1, "body": bigBody},
+				{"id": 2, "body": "second"},
+			},
+		},
+	}}
+	svc := NewService(runner, Options{MaxRows: 1, MaxFieldChars: 10})
+
+	resp := svc.ExecuteFull(context.Background(), "SELECT id, body FROM gmail_messages ORDER BY id", "csv")
+	if resp.Error != "" {
+		t.Fatalf("ExecuteFull error: %s", resp.Error)
+	}
+	if resp.Format != "csv" || resp.TotalRows != 2 {
+		t.Fatalf("unexpected metadata: %#v", resp)
+	}
+	body, ok := resp.Rows.(string)
+	if !ok {
+		t.Fatalf("rows type = %T", resp.Rows)
+	}
+	if !strings.Contains(body, bigBody) {
+		t.Fatalf("ExecuteFull truncated the big body field; output length = %d", len(body))
+	}
+	if !slices.Equal(resp.ColumnNames, []string{"id", "body"}) {
+		t.Fatalf("column names = %#v", resp.ColumnNames)
+	}
+	if status := svc.DebugCacheStatus(); len(status.Queries) != 0 {
+		t.Fatalf("ExecuteFull populated query cache: %#v", status.Queries)
+	}
+	if len(runner.maxRows) != 1 || runner.maxRows[0] != FullQueryRowCap+1 {
+		t.Fatalf("runner maxRows = %#v, want [%d]", runner.maxRows, FullQueryRowCap+1)
+	}
+}
+
+func TestExecuteFullRejectsWriteSQL(t *testing.T) {
+	svc := NewService(fakeRunner{}, Options{})
+	resp := svc.ExecuteFull(context.Background(), "DELETE FROM gmail_messages", "csv")
+	if resp.Error == "" {
+		t.Fatalf("expected validator to reject DELETE, got %#v", resp)
+	}
+}
+
+func TestExecuteFullJSONFormatReturnsRowSlice(t *testing.T) {
+	runner := &recordingRunner{results: map[string]RawResult{
+		"SELECT id FROM gmail_messages": {
+			Columns: []string{"id"},
+			Rows:    []map[string]any{{"id": 1}, {"id": 2}},
+		},
+	}}
+	svc := NewService(runner, Options{})
+	resp := svc.ExecuteFull(context.Background(), "SELECT id FROM gmail_messages", "json")
+	if resp.Error != "" {
+		t.Fatalf("ExecuteFull error: %s", resp.Error)
+	}
+	rows, ok := resp.Rows.([]map[string]any)
+	if !ok {
+		t.Fatalf("rows type = %T", resp.Rows)
+	}
+	if len(rows) != 2 || rows[0]["id"] != 1 || rows[1]["id"] != 2 {
+		t.Fatalf("unexpected rows: %#v", rows)
+	}
+
+	encoded, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"rows":[{"id":1},{"id":2}]`) {
+		t.Fatalf("encoded JSON missing rows array: %s", encoded)
+	}
 }

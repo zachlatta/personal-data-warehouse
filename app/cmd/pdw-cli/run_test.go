@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	pdwserver "github.com/zachlatta/personal-data-warehouse/app/internal/server"
 )
 
 const cliTestToken = "test-secret-token-at-least-32-chars-x"
@@ -37,6 +44,21 @@ func newStubServer(t *testing.T, handler func(http.ResponseWriter, *http.Request
 	return s
 }
 
+type cliIntegrationRunner struct{}
+
+func (cliIntegrationRunner) Query(_ context.Context, sql string, _ int) (query.RawResult, error) {
+	if sql != "SELECT 1 AS n" {
+		return query.RawResult{}, fmt.Errorf("unexpected SQL: %s", sql)
+	}
+	return query.RawResult{
+		Columns: []string{"n"},
+		Rows: []map[string]any{
+			{"n": int64(1)},
+			{"n": int64(2)},
+		},
+	}, nil
+}
+
 func runCLI(t *testing.T, baseURL string, stdin string, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
 	var outBuf, errBuf bytes.Buffer
@@ -47,6 +69,29 @@ func runCLI(t *testing.T, baseURL string, stdin string, args ...string) (stdout,
 	}
 	code = run(args, strings.NewReader(stdin), &outBuf, &errBuf, func(k string) string { return env[k] })
 	return outBuf.String(), errBuf.String(), code
+}
+
+func TestCallQueryFullResultAgainstRealMux(t *testing.T) {
+	authSvc := pdwauth.NewService([]byte(cliTestToken), func() time.Time { return time.Unix(0, 0) })
+	handler := pdwserver.NewMux(config.Config{
+		Addr:          ":0",
+		BaseURL:       "http://example.test",
+		SecretToken:   cliTestToken,
+		MaxRows:       10,
+		MaxFieldChars: 10,
+	}, authSvc, cliIntegrationRunner{})
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	out, errOut, code := runCLI(t, srv.URL, "", "call", "query_full_result", "--data", `{"sql":"SELECT 1 AS n","format":"csv"}`)
+	if code != 0 {
+		t.Fatalf("expected zero exit, got %d (stderr=%s)", code, errOut)
+	}
+	for _, want := range []string{`"sql": "SELECT 1 AS n"`, `"format": "csv"`, `"total_rows": 2`, `"rows": "n\n1\n2"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("query_full_result CLI output missing %q:\n%s", want, out)
+		}
+	}
 }
 
 func TestHelpExitsZero(t *testing.T) {

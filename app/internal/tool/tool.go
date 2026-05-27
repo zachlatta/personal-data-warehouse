@@ -23,6 +23,11 @@ type Tool interface {
 	Title() string
 	Description() string
 
+	// Surfaces reports which transports should expose this tool. The zero
+	// value means every transport; tools that should only appear on MCP
+	// or only on the CLI/HTTP API set a non-zero value.
+	Surfaces() Surface
+
 	// Invoke decodes rawInput into the tool's input type, runs the handler,
 	// and returns the output value. isError is true when the call should be
 	// surfaced to the caller as an error (decode failure, handler error, or
@@ -44,6 +49,26 @@ type Tool interface {
 	// on a specific logger.
 	RegisterMCP(server *mcp.Server, hooks Hooks)
 }
+
+// Surface designates which transports a Tool should be exposed on.
+// SurfaceAll (the zero value) means every transport, so adding the field
+// without setting it preserves the historical "everywhere" default.
+type Surface int
+
+const (
+	// SurfaceAll exposes the tool on every transport.
+	SurfaceAll Surface = iota
+	// SurfaceMCPOnly hides the tool from the CLI/HTTP API.
+	SurfaceMCPOnly
+	// SurfaceCLIOnly hides the tool from the MCP server.
+	SurfaceCLIOnly
+)
+
+// ShowsOnMCP reports whether a tool with this Surface should be visible to MCP clients.
+func (s Surface) ShowsOnMCP() bool { return s != SurfaceCLIOnly }
+
+// ShowsOnCLI reports whether a tool with this Surface should be visible to the CLI/HTTP API.
+func (s Surface) ShowsOnCLI() bool { return s != SurfaceMCPOnly }
 
 // Hooks are optional callbacks adapters can supply. All fields may be nil.
 type Hooks struct {
@@ -96,3 +121,19 @@ func NewRegistry(toolSets ...[]Tool) *Registry {
 func (r *Registry) All() []Tool { return r.tools }
 
 func (r *Registry) ByName(name string) Tool { return r.index[name] }
+
+// Filter returns a new Registry containing only tools for which keep returns
+// true. Registration order is preserved and the returned registry's index is
+// independent of the source, so adapters can filter once at startup and use
+// the result as their canonical lookup map.
+func (r *Registry) Filter(keep func(Tool) bool) *Registry {
+	out := &Registry{index: map[string]Tool{}}
+	for _, t := range r.tools {
+		if !keep(t) {
+			continue
+		}
+		out.index[t.Name()] = t
+		out.tools = append(out.tools, t)
+	}
+	return out
+}

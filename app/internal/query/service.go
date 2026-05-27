@@ -127,6 +127,26 @@ type GrepMatch struct {
 	Context    string `json:"context"`
 }
 
+// FullQueryRowCap is the safety ceiling ExecuteFull applies to a single
+// statement. It exists so a stray `SELECT * FROM huge_table` does not stream
+// hundreds of millions of rows into a terminal; callers needing more should
+// page with LIMIT/OFFSET.
+const FullQueryRowCap = 1_000_000
+
+// FullQueryResponse is the response for query_full_result. Rows holds the
+// formatted body (CSV string, JSON array, or NDJSON string depending on
+// Format). No caching, no per-field truncation — that's the whole point of
+// this surface vs. the MCP query tool.
+type FullQueryResponse struct {
+	SQL         string   `json:"sql"`
+	Format      string   `json:"format"`
+	ColumnNames []string `json:"column_names,omitempty"`
+	TotalRows   int      `json:"total_rows"`
+	Truncated   bool     `json:"truncated,omitempty"`
+	Rows        any      `json:"rows,omitempty"`
+	Error       string   `json:"error,omitempty"`
+}
+
 type DebugCacheStatus struct {
 	TotalBytes int64             `json:"total_bytes"`
 	MaxBytes   int64             `json:"max_bytes"`
@@ -466,6 +486,76 @@ func (s *Service) GrepRows(ctx context.Context, queryID, pattern string, columns
 		}
 	}
 	return resp
+}
+
+// ExecuteFull runs a single read-only SQL statement and returns the entire
+// result formatted as CSV/JSON/NDJSON. It bypasses the query cache, applies
+// no per-field truncation, and only enforces the FullQueryRowCap safety
+// limit. Used by the CLI-only query_full_result tool.
+func (s *Service) ExecuteFull(ctx context.Context, sql, format string) FullQueryResponse {
+	sql = strings.TrimSpace(sql)
+	format = normalizeFormat(format)
+	resp := FullQueryResponse{SQL: sql, Format: format}
+	if sql == "" {
+		resp.Error = "sql must be a non-empty Postgres SQL statement"
+		return resp
+	}
+	if err := ValidateReadOnlySQL(sql); err != nil {
+		resp.Error = err.Error()
+		s.logger.WarnContext(ctx, "query_full_result rejected by read-only validator", "sql", sql, "error", resp.Error)
+		return resp
+	}
+	started := time.Now()
+	s.logger.InfoContext(ctx, "query_full_result started", "sql", sql, "format", format, "row_cap", FullQueryRowCap)
+	raw, err := s.runner.Query(ctx, sql, FullQueryRowCap+1)
+	if err != nil {
+		resp.Error = err.Error()
+		s.logger.ErrorContext(ctx, "query_full_result failed", "sql", sql, "error", err, "duration", time.Since(started))
+		return resp
+	}
+	rows := raw.Rows
+	if len(rows) > FullQueryRowCap {
+		rows = rows[:FullQueryRowCap]
+		resp.Truncated = true
+	}
+	resp.ColumnNames = append([]string(nil), raw.Columns...)
+	resp.TotalRows = len(rows)
+	formatted, err := formatFullRows(raw.Columns, rows, format)
+	if err != nil {
+		resp.Error = err.Error()
+		s.logger.ErrorContext(ctx, "query_full_result encoding failed", "sql", sql, "error", err, "duration", time.Since(started))
+		return resp
+	}
+	resp.Rows = formatted
+	s.logger.InfoContext(ctx, "query_full_result completed", "sql", sql, "rows", len(rows), "truncated", resp.Truncated, "duration", time.Since(started))
+	return resp
+}
+
+func formatFullRows(columns []string, rows []map[string]any, format string) (any, error) {
+	switch format {
+	case "json":
+		out := make([]map[string]any, len(rows))
+		for i, row := range rows {
+			copied := make(map[string]any, len(row))
+			for k, v := range row {
+				copied[k] = v
+			}
+			out[i] = copied
+		}
+		return out, nil
+	case "ndjson":
+		lines := make([]string, 0, len(rows))
+		for _, row := range rows {
+			data, err := json.Marshal(row)
+			if err != nil {
+				return nil, err
+			}
+			lines = append(lines, string(data))
+		}
+		return strings.Join(lines, "\n"), nil
+	default:
+		return rowsToCSV(columns, rows)
+	}
 }
 
 func (s *Service) DebugCacheStatus() DebugCacheStatus {

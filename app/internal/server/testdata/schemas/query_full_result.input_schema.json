@@ -1,0 +1,17 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "format": {
+      "description": "output format: csv (default), json, or ndjson",
+      "type": "string"
+    },
+    "sql": {
+      "description": "read-only Postgres SQL string to run",
+      "type": "string"
+    }
+  },
+  "required": [
+    "sql"
+  ],
+  "type": "object"
+}

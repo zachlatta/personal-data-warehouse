@@ -15,8 +15,8 @@ import (
 // surfaced via Typed.IsError instead.
 type Handler[I any, O any] func(ctx context.Context, input I) (O, error)
 
-// IsErrorFn promotes a successful handler return to an error in the
-// adapter's eyes (MCP CallToolResult.IsError=true, HTTP non-2xx).
+// IsErrorFn promotes a successful handler return to a domain-level error in
+// the adapter's eyes (for example, MCP CallToolResult.IsError=true).
 type IsErrorFn[O any] func(O) bool
 
 // Typed is the concrete implementation tools use. The generic parameters
@@ -25,13 +25,17 @@ type Typed[I any, O any] struct {
 	NameStr        string
 	TitleStr       string
 	DescriptionStr string
-	Handle         Handler[I, O]
-	IsError        IsErrorFn[O]
+	// SurfacesField defaults to SurfaceAll so existing tools keep their
+	// "exposed everywhere" behavior without setting the field.
+	SurfacesField Surface
+	Handle        Handler[I, O]
+	IsError       IsErrorFn[O]
 }
 
 func (t *Typed[I, O]) Name() string        { return t.NameStr }
 func (t *Typed[I, O]) Title() string       { return t.TitleStr }
 func (t *Typed[I, O]) Description() string { return t.DescriptionStr }
+func (t *Typed[I, O]) Surfaces() Surface   { return t.SurfacesField }
 
 func (t *Typed[I, O]) InputSchema() (*jsonschema.Schema, error) {
 	var zero I

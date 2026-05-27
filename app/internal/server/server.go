@@ -92,6 +92,11 @@ type grepRowsInput struct {
 
 type debugCacheInput struct{}
 
+type queryFullResultInput struct {
+	SQL    string `json:"sql" jsonschema:"read-only Postgres SQL string to run"`
+	Format string `json:"format,omitempty" jsonschema:"output format: csv (default), json, or ndjson"`
+}
+
 // serverInstructions is the only place MCP-side keyword discovery needs to
 // happen: clients searching for "Slack" or "Gmail" hit this paragraph. The
 // per-tool descriptions stay deliberately short; the rich content lives in
@@ -109,6 +114,8 @@ const getFieldDescription = "Return a character chunk from a single cell in a ca
 const grepRowsDescription = "Regex-search a cached query result and return match context. " + schemaFirstReminder
 
 const schemaOverviewDescription = "Required first call. Lists the warehouse's tables, views, columns, and compact samples so the caller can pick the right tables before writing SQL. Each base table heading includes an approximate row count from planner statistics, formatted as `(~N rows, estimated)`; use that estimate for sizing decisions instead of running SELECT COUNT(*) over large tables."
+
+const queryFullResultDescription = "Run a read-only Postgres SQL statement and return its full result, like a psql session. Skips the query cache, pagination, and field truncation that the MCP query tool applies. Refuses write SQL and caps the response at 1,000,000 rows."
 
 func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	return NewMCPServerWithMutations(runner, opts, nil)
@@ -144,11 +151,14 @@ func newMCPServerFromRegistry(registry *tool.Registry, logger *slog.Logger) *mcp
 	}, &mcp.ServerOptions{Instructions: serverInstructions})
 	serverLogger.Info("registering MCP tools")
 	hooks := mcpToolHooks(serverLogger)
-	for _, t := range registry.All() {
+	for _, t := range registry.Filter(toolShowsOnMCP).All() {
 		t.RegisterMCP(server, hooks)
 	}
 	return server
 }
+
+func toolShowsOnMCP(t tool.Tool) bool { return t.Surfaces().ShowsOnMCP() }
+func toolShowsOnCLI(t tool.Tool) bool { return t.Surfaces().ShowsOnCLI() }
 
 func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mutationSvcs ...*mutations.Service) http.Handler {
 	logger := slog.Default().With("component", "http")
@@ -195,7 +205,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(mcpHandler)
 	mux.Handle("/mcp", protected)
 
-	apiHandler := api.NewHandler(registry, slog.Default())
+	apiHandler := api.NewHandler(registry.Filter(toolShowsOnCLI), slog.Default())
 	apiProtected := authSvc.RequireStaticBearer()(apiHandler)
 	mux.Handle("/api/tools", apiProtected)
 	mux.Handle("/api/tools/", apiProtected)
