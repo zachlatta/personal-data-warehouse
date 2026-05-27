@@ -21,84 +21,11 @@ type ProposalResponse struct {
 	Status      string   `json:"status"`
 }
 
-type ProposeMutationRequestInput struct {
+type ProposeMutationInput struct {
 	Title     string           `json:"title" jsonschema:"short human-readable title for the reviewed request"`
 	Reason    string           `json:"reason" jsonschema:"why these mutations should be reviewed and approved"`
-	Mutations []map[string]any `json:"mutations" jsonschema:"one or more mutation objects"`
+	Mutations []map[string]any `json:"mutations" jsonschema:"one or more mutation objects; call propose_mutation_help to see the supported types and their payload schemas"`
 	Context   map[string]any   `json:"context,omitempty" jsonschema:"optional source context for human review"`
-}
-
-type ProposeGmailArchiveThreadsInput struct {
-	Account   string         `json:"account" jsonschema:"configured Gmail account email address"`
-	ThreadIDs []string       `json:"thread_ids" jsonschema:"Gmail thread IDs to archive"`
-	Reason    string         `json:"reason" jsonschema:"why these threads should be archived"`
-	Title     string         `json:"title,omitempty" jsonschema:"optional review request title"`
-	Context   map[string]any `json:"context,omitempty" jsonschema:"optional source context for human review"`
-}
-
-type ProposeGmailUnarchiveThreadsInput struct {
-	Account   string         `json:"account" jsonschema:"configured Gmail account email address"`
-	ThreadIDs []string       `json:"thread_ids" jsonschema:"Gmail thread IDs to unarchive"`
-	Reason    string         `json:"reason" jsonschema:"why these threads should be returned to the inbox"`
-	Title     string         `json:"title,omitempty" jsonschema:"optional review request title"`
-	Context   map[string]any `json:"context,omitempty" jsonschema:"optional source context for human review"`
-}
-
-type ProposeGmailSendEmailInput struct {
-	Account         string                   `json:"account" jsonschema:"configured Gmail account email address"`
-	To              []string                 `json:"to" jsonschema:"primary recipients"`
-	CC              []string                 `json:"cc,omitempty" jsonschema:"carbon-copy recipients"`
-	BCC             []string                 `json:"bcc,omitempty" jsonschema:"blind-copy recipients"`
-	Subject         string                   `json:"subject" jsonschema:"email subject"`
-	BodyText        string                   `json:"body_text" jsonschema:"plain-text email body"`
-	BodyHTML        string                   `json:"body_html,omitempty" jsonschema:"optional HTML email body"`
-	ReplyToThreadID string                   `json:"reply_to_thread_id,omitempty" jsonschema:"optional Gmail thread ID to reply in"`
-	DeliveryMode    string                   `json:"delivery_mode,omitempty" jsonschema:"send or draft; default send"`
-	Reason          string                   `json:"reason" jsonschema:"why this email should be sent or drafted"`
-	Title           string                   `json:"title,omitempty" jsonschema:"optional review request title"`
-	Context         map[string]any           `json:"context,omitempty" jsonschema:"optional source context for human review"`
-	Variants        []GmailEmailVariantInput `json:"variants,omitempty" jsonschema:"optional alternate email proposals; each variant must have a short two-word title for the review tab"`
-}
-
-type ProposeContactMutationsInput struct {
-	Account    string           `json:"account" jsonschema:"configured Google Contacts account email address"`
-	Operations []map[string]any `json:"operations" jsonschema:"contact create, update, or delete operation objects"`
-	Reason     string           `json:"reason" jsonschema:"why these contact mutations should be applied"`
-	Title      string           `json:"title,omitempty" jsonschema:"optional review request title"`
-	Context    map[string]any   `json:"context,omitempty" jsonschema:"optional source context for human review"`
-}
-
-type ProposeCalendarCreateEventInput struct {
-	Account     string         `json:"account" jsonschema:"configured Google Calendar account email address"`
-	CalendarID  string         `json:"calendar_id,omitempty" jsonschema:"calendar to insert into; defaults to primary"`
-	Event       map[string]any `json:"event" jsonschema:"Google Calendar event resource body (summary, start, end, attendees, recurrence, etc.)"`
-	SendUpdates string         `json:"send_updates,omitempty" jsonschema:"all, externalOnly, or none; defaults to all"`
-	Reason      string         `json:"reason" jsonschema:"why this event should be created"`
-	Title       string         `json:"title,omitempty" jsonschema:"optional review request title"`
-	Context     map[string]any `json:"context,omitempty" jsonschema:"optional source context for human review"`
-}
-
-type ProposeCalendarUpdateEventInput struct {
-	Account      string         `json:"account" jsonschema:"configured Google Calendar account email address"`
-	CalendarID   string         `json:"calendar_id,omitempty" jsonschema:"calendar that owns the event; defaults to primary"`
-	EventID      string         `json:"event_id" jsonschema:"Google Calendar event ID to update (instance IDs are supported for recurring overrides)"`
-	ExpectedEtag string         `json:"expected_etag,omitempty" jsonschema:"optional etag of the live event captured at proposal time; if it changes the mutation is rejected at execution time"`
-	Patch        map[string]any `json:"patch" jsonschema:"partial Google Calendar event resource fields to update; only included keys are replaced"`
-	SendUpdates  string         `json:"send_updates,omitempty" jsonschema:"all, externalOnly, or none; defaults to all"`
-	Reason       string         `json:"reason" jsonschema:"why this event should be updated"`
-	Title        string         `json:"title,omitempty" jsonschema:"optional review request title"`
-	Context      map[string]any `json:"context,omitempty" jsonschema:"optional source context for human review"`
-}
-
-type ProposeCalendarDeleteEventInput struct {
-	Account      string         `json:"account" jsonschema:"configured Google Calendar account email address"`
-	CalendarID   string         `json:"calendar_id,omitempty" jsonschema:"calendar that owns the event; defaults to primary"`
-	EventID      string         `json:"event_id" jsonschema:"Google Calendar event ID to delete (instance IDs are supported for recurring overrides)"`
-	ExpectedEtag string         `json:"expected_etag,omitempty" jsonschema:"optional etag of the live event captured at proposal time; if it changes the mutation is rejected at execution time"`
-	SendUpdates  string         `json:"send_updates,omitempty" jsonschema:"all, externalOnly, or none; defaults to all"`
-	Reason       string         `json:"reason" jsonschema:"why this event should be deleted"`
-	Title        string         `json:"title,omitempty" jsonschema:"optional review request title"`
-	Context      map[string]any `json:"context,omitempty" jsonschema:"optional source context for human review"`
 }
 
 func NewService(store Store, cfg Config) *Service {
@@ -117,7 +44,7 @@ func NewService(store Store, cfg Config) *Service {
 	return &Service{store: store, cfg: cfg}
 }
 
-func (s *Service) ProposeMutationRequest(ctx context.Context, input ProposeMutationRequestInput) (ProposalResponse, error) {
+func (s *Service) ProposeMutation(ctx context.Context, input ProposeMutationInput) (ProposalResponse, error) {
 	mutations := make([]MutationInput, 0, len(input.Mutations))
 	for index, raw := range input.Mutations {
 		mutation, err := mutationInputFromMap(raw, index)
@@ -131,139 +58,6 @@ func (s *Service) ProposeMutationRequest(ctx context.Context, input ProposeMutat
 		Reason:      strings.TrimSpace(input.Reason),
 		Context:     cloneMap(input.Context),
 		Mutations:   mutations,
-		RequestedBy: defaultRequestedBy,
-	})
-}
-
-func (s *Service) ProposeGmailArchiveThreads(ctx context.Context, input ProposeGmailArchiveThreadsInput) (ProposalResponse, error) {
-	threadIDs := normalizeStringSlice(input.ThreadIDs)
-	return s.createRequest(ctx, CreateRequestInput{
-		Title:   optionalTitle(input.Title, fmt.Sprintf("Archive %d Gmail thread%s", len(threadIDs), plural(len(threadIDs)))),
-		Reason:  strings.TrimSpace(input.Reason),
-		Context: cloneMap(input.Context),
-		Mutations: []MutationInput{{
-			Type:      GmailArchiveOperation,
-			Account:   normalizeAccount(input.Account),
-			ThreadIDs: threadIDs,
-		}},
-		RequestedBy: defaultRequestedBy,
-	})
-}
-
-func (s *Service) ProposeGmailUnarchiveThreads(ctx context.Context, input ProposeGmailUnarchiveThreadsInput) (ProposalResponse, error) {
-	threadIDs := normalizeStringSlice(input.ThreadIDs)
-	return s.createRequest(ctx, CreateRequestInput{
-		Title:   optionalTitle(input.Title, fmt.Sprintf("Unarchive %d Gmail thread%s", len(threadIDs), plural(len(threadIDs)))),
-		Reason:  strings.TrimSpace(input.Reason),
-		Context: cloneMap(input.Context),
-		Mutations: []MutationInput{{
-			Type:      GmailUnarchiveOperation,
-			Account:   normalizeAccount(input.Account),
-			ThreadIDs: threadIDs,
-		}},
-		RequestedBy: defaultRequestedBy,
-	})
-}
-
-func (s *Service) ProposeGmailSendEmail(ctx context.Context, input ProposeGmailSendEmailInput) (ProposalResponse, error) {
-	deliveryMode := strings.TrimSpace(input.DeliveryMode)
-	if deliveryMode == "" {
-		deliveryMode = "send"
-	}
-	message := map[string]any{
-		"to":                 normalizeStringSlice(input.To),
-		"cc":                 normalizeStringSlice(input.CC),
-		"bcc":                normalizeStringSlice(input.BCC),
-		"subject":            strings.TrimSpace(input.Subject),
-		"body_text":          input.BodyText,
-		"body_html":          input.BodyHTML,
-		"reply_to_thread_id": strings.TrimSpace(input.ReplyToThreadID),
-	}
-	return s.createRequest(ctx, CreateRequestInput{
-		Title:   optionalTitle(input.Title, emailRequestTitle(message)),
-		Reason:  strings.TrimSpace(input.Reason),
-		Context: cloneMap(input.Context),
-		Mutations: []MutationInput{{
-			Type:          GmailSendEmailOperation,
-			Account:       normalizeAccount(input.Account),
-			DeliveryMode:  deliveryMode,
-			Message:       message,
-			EmailVariants: cloneEmailVariantInputs(input.Variants),
-		}},
-		RequestedBy: defaultRequestedBy,
-	})
-}
-
-func (s *Service) ProposeCalendarCreateEvent(ctx context.Context, input ProposeCalendarCreateEventInput) (ProposalResponse, error) {
-	event := cloneMap(input.Event)
-	calendarID := normalizeCalendarID(input.CalendarID)
-	sendUpdates := strings.TrimSpace(input.SendUpdates)
-	return s.createRequest(ctx, CreateRequestInput{
-		Title:   optionalTitle(input.Title, calendarEventTitle("Create event", event)),
-		Reason:  strings.TrimSpace(input.Reason),
-		Context: cloneMap(input.Context),
-		Mutations: []MutationInput{{
-			Type:        CalendarCreateEventOperation,
-			Account:     normalizeAccount(input.Account),
-			CalendarID:  calendarID,
-			SendUpdates: sendUpdates,
-			Event:       event,
-		}},
-		RequestedBy: defaultRequestedBy,
-	})
-}
-
-func (s *Service) ProposeCalendarUpdateEvent(ctx context.Context, input ProposeCalendarUpdateEventInput) (ProposalResponse, error) {
-	patch := cloneMap(input.Patch)
-	calendarID := normalizeCalendarID(input.CalendarID)
-	sendUpdates := strings.TrimSpace(input.SendUpdates)
-	return s.createRequest(ctx, CreateRequestInput{
-		Title:   optionalTitle(input.Title, calendarEventTitle("Update event", patch)),
-		Reason:  strings.TrimSpace(input.Reason),
-		Context: cloneMap(input.Context),
-		Mutations: []MutationInput{{
-			Type:         CalendarUpdateEventOperation,
-			Account:      normalizeAccount(input.Account),
-			CalendarID:   calendarID,
-			EventID:      strings.TrimSpace(input.EventID),
-			ExpectedEtag: strings.TrimSpace(input.ExpectedEtag),
-			SendUpdates:  sendUpdates,
-			Patch:        patch,
-		}},
-		RequestedBy: defaultRequestedBy,
-	})
-}
-
-func (s *Service) ProposeCalendarDeleteEvent(ctx context.Context, input ProposeCalendarDeleteEventInput) (ProposalResponse, error) {
-	calendarID := normalizeCalendarID(input.CalendarID)
-	sendUpdates := strings.TrimSpace(input.SendUpdates)
-	return s.createRequest(ctx, CreateRequestInput{
-		Title:   optionalTitle(input.Title, "Delete event "+strings.TrimSpace(input.EventID)),
-		Reason:  strings.TrimSpace(input.Reason),
-		Context: cloneMap(input.Context),
-		Mutations: []MutationInput{{
-			Type:         CalendarDeleteEventOperation,
-			Account:      normalizeAccount(input.Account),
-			CalendarID:   calendarID,
-			EventID:      strings.TrimSpace(input.EventID),
-			ExpectedEtag: strings.TrimSpace(input.ExpectedEtag),
-			SendUpdates:  sendUpdates,
-		}},
-		RequestedBy: defaultRequestedBy,
-	})
-}
-
-func (s *Service) ProposeContactMutations(ctx context.Context, input ProposeContactMutationsInput) (ProposalResponse, error) {
-	operations := cloneMapSlice(input.Operations)
-	return s.createRequest(ctx, CreateRequestInput{
-		Title:   optionalTitle(input.Title, fmt.Sprintf("Apply %d contact mutation%s", len(operations), plural(len(operations)))),
-		Reason:  strings.TrimSpace(input.Reason),
-		Context: cloneMap(input.Context),
-		Mutations: []MutationInput{{
-			Type:       GooglePeopleContactsOperation,
-			Account:    normalizeAccount(input.Account),
-			Operations: operations,
-		}},
 		RequestedBy: defaultRequestedBy,
 	})
 }
@@ -391,7 +185,7 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 			return fmt.Errorf("mutation %d must include event_id", index)
 		}
 	default:
-		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, google_people.contacts, calendar.create_event, calendar.update_event, or calendar.delete_event", index, mutationType)
+		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, or calendar.delete_event", index, mutationType)
 	}
 	return nil
 }
@@ -424,7 +218,6 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 	if strings.TrimSpace(mutationType) == "" {
 		mutationType = stringFromAny(raw["operation"])
 	}
-	message := mapFromAny(raw["message"])
 	deliveryMode := stringFromAny(raw["delivery_mode"])
 	if deliveryMode == "" {
 		deliveryMode = "send"
@@ -436,7 +229,7 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 		Reason:        strings.TrimSpace(stringFromAny(raw["reason"])),
 		ThreadIDs:     stringSliceFromAny(raw["thread_ids"]),
 		DeliveryMode:  deliveryMode,
-		Message:       message,
+		Message:       mapFromAny(raw["message"]),
 		EmailVariants: emailVariantInputsFromAny(raw["variants"]),
 		Operations:    mapSliceFromAny(raw["operations"]),
 		CalendarID:    normalizeCalendarID(stringFromAny(raw["calendar_id"])),
@@ -445,7 +238,6 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 		SendUpdates:   strings.TrimSpace(stringFromAny(raw["send_updates"])),
 		Event:         mapFromAny(raw["event"]),
 		Patch:         mapFromAny(raw["patch"]),
-		Raw:           cloneMap(raw),
 	}, nil
 }
 
@@ -489,20 +281,6 @@ func calendarEventTitle(prefix string, event map[string]any) string {
 		return prefix
 	}
 	return prefix + ": " + summary
-}
-
-func cloneEmailVariantInputs(input []GmailEmailVariantInput) []GmailEmailVariantInput {
-	out := make([]GmailEmailVariantInput, 0, len(input))
-	for _, variant := range input {
-		cloned := variant
-		cloned.Message = cloneMap(variant.Message)
-		cloned.To = append([]string(nil), variant.To...)
-		cloned.CC = append([]string(nil), variant.CC...)
-		cloned.BCC = append([]string(nil), variant.BCC...)
-		cloned.References = append([]string(nil), variant.References...)
-		out = append(out, cloned)
-	}
-	return out
 }
 
 func emailVariantInputsFromAny(value any) []GmailEmailVariantInput {

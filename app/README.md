@@ -2,7 +2,7 @@
 
 This is the Go app that fronts the Postgres warehouse. It exposes the same
 set of tools (`query`, `get_rows`, `get_field`, `grep_rows`, `schema_overview`,
-plus optional Gmail/Contacts mutation proposals) over two surfaces:
+plus optional Gmail, Calendar, and Contacts mutation proposals) over two surfaces:
 
 - **MCP** at `/mcp` — the default flow, used by Claude connectors. OAuth-protected.
 - **HTTP API** at `/api/tools` — for CLI and script use. Static-bearer protected.
@@ -194,15 +194,17 @@ The server exposes cursor-based query tools. `query` executes SQL once, caches t
 
 When mutation review is enabled, the server also exposes:
 
-- `propose_mutation_request`
-- `propose_gmail_archive_threads`
-- `propose_gmail_unarchive_threads`
-- `propose_gmail_send_email` (optionally with multiple reviewed variants; each variant needs a two-word tab title)
-- `propose_contact_mutations`
+- `propose_mutation` — single entry point that takes `title`, `reason`, `mutations: [...]`,
+  and optional `context`. Each entry in `mutations` carries a `type` (e.g. `gmail.send_email`,
+  `gmail.archive_threads`, `calendar.update_event`) plus that type's payload fields. Batching
+  multiple mutations into one call groups them under one review request.
+- `propose_mutation_help` — zero-argument tool that returns the catalog of supported mutation
+  types with field-by-field descriptions and worked examples. Call this first to see how to
+  shape each mutation entry.
 
 These tools only create rows in the `upstream_mutation_requests` and `upstream_mutations` tables.
-They return an approval URL under `/mutation-review`; the actual Gmail or Contacts write is still
-performed later by the existing approved-mutation worker.
+They return an approval URL under `/mutation-review`; the actual Gmail, Calendar, or Contacts
+write is still performed later by the existing approved-mutation worker.
 
 SQL starting points:
 

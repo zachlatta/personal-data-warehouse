@@ -47,26 +47,41 @@ def test_upstream_mutation_request_validation_idempotency_and_review(warehouse: 
     )
 
     with pytest.raises(ValueError, match="thread_ids"):
-        warehouse.propose_gmail_archive_threads(account="zach@example.test", thread_ids=[], reason="clear mail")
+        warehouse.propose_mutation(
+            title="Archive bad",
+            reason="clear mail",
+            mutations=[{"type": "gmail.archive_threads", "account": "zach@example.test", "thread_ids": []}],
+        )
     with pytest.raises(ValueError, match="unknown or non-inbox"):
-        warehouse.propose_gmail_archive_threads(account="zach@example.test", thread_ids=["missing"], reason="clear mail")
+        warehouse.propose_mutation(
+            title="Archive missing",
+            reason="clear mail",
+            mutations=[{"type": "gmail.archive_threads", "account": "zach@example.test", "thread_ids": ["missing"]}],
+        )
     assert warehouse.gmail_message_ids_for_thread_label_mutation(
         account="zach@example.test",
         thread_ids=["thread-1", "thread-2"],
         archive=True,
     ) == {"thread-1": ["m1"], "thread-2": ["m2"]}
 
-    mutation = warehouse.propose_gmail_archive_threads(
-        account="zach@example.test",
-        thread_ids=["thread-1", "thread-2", "thread-1"],
-        reason="clear mail",
+    mutation = warehouse.propose_mutation(
         title="Archive old threads",
+        reason="clear mail",
         context={"source": "unit-test"},
+        mutations=[{
+            "type": "gmail.archive_threads",
+            "account": "zach@example.test",
+            "thread_ids": ["thread-1", "thread-2", "thread-1"],
+        }],
     )
-    duplicate = warehouse.propose_gmail_archive_threads(
-        account="zach@example.test",
-        thread_ids=["thread-2", "thread-1"],
+    duplicate = warehouse.propose_mutation(
+        title="Archive 2 Gmail threads",
         reason="duplicate proposal",
+        mutations=[{
+            "type": "gmail.archive_threads",
+            "account": "zach@example.test",
+            "thread_ids": ["thread-2", "thread-1"],
+        }],
     )
 
     assert duplicate["id"] == mutation["id"]
@@ -108,10 +123,14 @@ def test_request_rejection_logs_child_mutation_events(warehouse: PostgresWarehou
             _message_row(message_id="m2", thread_id="thread-2", subject="Two", labels=["INBOX"], sync_version=1),
         ]
     )
-    request = warehouse.propose_gmail_archive_threads(
-        account="zach@example.test",
-        thread_ids=["thread-1", "thread-2"],
+    request = warehouse.propose_mutation(
+        title="Archive 2 Gmail threads",
         reason="clear mail",
+        mutations=[{
+            "type": "gmail.archive_threads",
+            "account": "zach@example.test",
+            "thread_ids": ["thread-1", "thread-2"],
+        }],
     )
 
     warehouse.reject_upstream_mutation_request(request["id"], actor_id="zach", reason="not today")
@@ -137,7 +156,7 @@ def test_upstream_mutation_request_can_span_gmail_and_contacts(warehouse: Postgr
         ]
     )
 
-    request = warehouse.propose_upstream_mutation_request(
+    request = warehouse.propose_mutation(
         title="Morning cleanup",
         reason="clear inbox and clean contacts",
         requested_by="agent-test",
@@ -198,15 +217,23 @@ def test_upstream_mutation_claim_fail_and_observe_transitions(warehouse: Postgre
         ]
     )
 
-    succeeded_mutation = warehouse.propose_gmail_archive_threads(
-        account="zach@example.test",
-        thread_ids=["thread-1"],
+    succeeded_mutation = warehouse.propose_mutation(
+        title="Archive 1 Gmail thread",
         reason="clear mail",
+        mutations=[{
+            "type": "gmail.archive_threads",
+            "account": "zach@example.test",
+            "thread_ids": ["thread-1"],
+        }],
     )
-    retryable_mutation = warehouse.propose_gmail_archive_threads(
-        account="zach@example.test",
-        thread_ids=["thread-2"],
+    retryable_mutation = warehouse.propose_mutation(
+        title="Archive 1 Gmail thread",
         reason="clear mail too",
+        mutations=[{
+            "type": "gmail.archive_threads",
+            "account": "zach@example.test",
+            "thread_ids": ["thread-2"],
+        }],
     )
     warehouse.approve_upstream_mutation_request(succeeded_mutation["id"], actor_id="zach")
     warehouse.approve_upstream_mutation_request(retryable_mutation["id"], actor_id="zach")
@@ -260,7 +287,7 @@ def test_gmail_unarchive_mutation_validation_and_observe(warehouse: PostgresWare
     ) == {"archived-thread": ["m1"]}
 
     with pytest.raises(ValueError, match="unknown or non-archived"):
-        warehouse.propose_upstream_mutation_request(
+        warehouse.propose_mutation(
             title="Bad unarchive",
             reason="not archived",
             mutations=[
@@ -272,7 +299,7 @@ def test_gmail_unarchive_mutation_validation_and_observe(warehouse: PostgresWare
             ],
         )
 
-    request = warehouse.propose_upstream_mutation_request(
+    request = warehouse.propose_mutation(
         title="Unarchive one",
         reason="bring it back",
         mutations=[
@@ -322,7 +349,7 @@ def test_gmail_send_email_mutation_proposal_edit_reply_and_observe(warehouse: Po
         ]
     )
 
-    request = warehouse.propose_upstream_mutation_request(
+    request = warehouse.propose_mutation(
         title="Send follow-ups",
         reason="agent drafted useful replies",
         mutations=[
@@ -409,29 +436,32 @@ def test_contact_mutation_proposal_edit_and_observe(warehouse: PostgresWarehouse
         ]
     )
 
-    mutation = warehouse.propose_contact_mutations(
-        account="zach@example.test",
+    mutation = warehouse.propose_mutation(
         title="Clean contacts",
         reason="test contact batch",
-        operations=[
-            {
-                "op": "update_contact",
-                "client_op_id": "update-1",
-                "resource_name": "people/update",
-                "etag": "etag-update",
-                "update_person_fields": ["names"],
-                "person": {
-                    "names": [{"displayName": "Updated Person", "givenName": "Updated"}],
+        mutations=[{
+            "type": "google_people.contacts",
+            "account": "zach@example.test",
+            "operations": [
+                {
+                    "op": "update_contact",
+                    "client_op_id": "update-1",
+                    "resource_name": "people/update",
+                    "etag": "etag-update",
+                    "update_person_fields": ["names"],
+                    "person": {
+                        "names": [{"displayName": "Updated Person", "givenName": "Updated"}],
+                    },
                 },
-            },
-            {
-                "op": "delete_contact",
-                "client_op_id": "delete-1",
-                "resource_name": "people/delete",
-                "etag": "etag-delete",
-                "reason": "duplicate",
-            },
-        ],
+                {
+                    "op": "delete_contact",
+                    "client_op_id": "delete-1",
+                    "resource_name": "people/delete",
+                    "etag": "etag-delete",
+                    "reason": "duplicate",
+                },
+            ],
+        }],
     )
 
     assert mutation["status"] == "pending_review"
@@ -476,16 +506,19 @@ def test_contact_mutation_proposal_edit_and_observe(warehouse: PostgresWarehouse
 
 
 def test_calendar_event_mutation_proposal_and_observe(warehouse: PostgresWarehouse) -> None:
-    mutation = warehouse.propose_calendar_create_event(
-        account="zach@example.test",
+    mutation = warehouse.propose_mutation(
         title="Schedule planning",
         reason="test calendar create",
-        event={
-            "summary": "Planning",
-            "start": {"dateTime": "2030-01-01T10:00:00", "timeZone": "UTC"},
-            "end": {"dateTime": "2030-01-01T10:30:00", "timeZone": "UTC"},
-        },
-        send_updates="none",
+        mutations=[{
+            "type": "calendar.create_event",
+            "account": "zach@example.test",
+            "event": {
+                "summary": "Planning",
+                "start": {"dateTime": "2030-01-01T10:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2030-01-01T10:30:00", "timeZone": "UTC"},
+            },
+            "send_updates": "none",
+        }],
     )
 
     assert mutation["status"] == "pending_review"

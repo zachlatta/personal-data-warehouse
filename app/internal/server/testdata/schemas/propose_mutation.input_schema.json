@@ -1,17 +1,13 @@
 {
   "additionalProperties": false,
   "properties": {
-    "account": {
-      "description": "configured Google Contacts account email address",
-      "type": "string"
-    },
     "context": {
       "additionalProperties": true,
       "description": "optional source context for human review",
       "type": "object"
     },
-    "operations": {
-      "description": "contact create, update, or delete operation objects",
+    "mutations": {
+      "description": "one or more mutation objects; call propose_mutation_help to see the supported types and their payload schemas",
       "items": {
         "additionalProperties": true,
         "type": "object"
@@ -22,18 +18,18 @@
       ]
     },
     "reason": {
-      "description": "why these contact mutations should be applied",
+      "description": "why these mutations should be reviewed and approved",
       "type": "string"
     },
     "title": {
-      "description": "optional review request title",
+      "description": "short human-readable title for the reviewed request",
       "type": "string"
     }
   },
   "required": [
-    "account",
-    "operations",
-    "reason"
+    "title",
+    "reason",
+    "mutations"
   ],
   "type": "object"
 }

@@ -140,22 +140,26 @@ func TestMCPServerRegistersMutationProposalToolsWhenConfigured(t *testing.T) {
 	for _, tool := range tools.Tools {
 		found[tool.Name] = true
 	}
-	for _, name := range []string{"query", "propose_gmail_archive_threads", "propose_gmail_unarchive_threads", "propose_gmail_send_email", "propose_contact_mutations", "propose_mutation_request"} {
+	for _, name := range []string{"query", "propose_mutation", "propose_mutation_help"} {
 		if !found[name] {
 			t.Fatalf("%s tool not listed: %#v", name, tools.Tools)
 		}
 	}
 
-	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "propose_gmail_archive_threads", Arguments: map[string]any{
-		"account":    "zach@example.test",
-		"thread_ids": []string{"thread-1"},
-		"reason":     "clear stale mail",
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "propose_mutation", Arguments: map[string]any{
+		"title":  "Archive stale mail",
+		"reason": "clear stale mail",
+		"mutations": []map[string]any{{
+			"type":       "gmail.archive_threads",
+			"account":    "zach@example.test",
+			"thread_ids": []string{"thread-1"},
+		}},
 	}})
 	if err != nil {
 		t.Fatalf("CallTool failed: %v", err)
 	}
 	if result.IsError {
-		t.Fatalf("propose_gmail_archive_threads returned error: %#v", result.Content)
+		t.Fatalf("propose_mutation returned error: %#v", result.Content)
 	}
 	text := result.Content[0].(*mcp.TextContent).Text
 	if !strings.Contains(text, `"request_id": "req-123"`) || !strings.Contains(text, `"approval_url": "https://mcp.example.test/mutation-review/requests/req-123"`) {
@@ -192,26 +196,32 @@ func TestMCPServerProposeGmailSendEmailAcceptsVariants(t *testing.T) {
 	}
 	defer session.Close()
 
-	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "propose_gmail_send_email", Arguments: map[string]any{
-		"account":   "zach@example.test",
-		"to":        []string{"zach@example.test"},
-		"subject":   "Base subject",
-		"body_text": "Base body",
-		"reason":    "review alternate replies",
-		"variants": []map[string]any{{
-			"title":     "Direct Reply",
-			"body_text": "Direct body",
-		}, {
-			"title":     "Softer Ask",
-			"subject":   "Softer subject",
-			"body_text": "Softer body",
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "propose_mutation", Arguments: map[string]any{
+		"title":  "Send reply",
+		"reason": "review alternate replies",
+		"mutations": []map[string]any{{
+			"type":    "gmail.send_email",
+			"account": "zach@example.test",
+			"message": map[string]any{
+				"to":        []string{"zach@example.test"},
+				"subject":   "Base subject",
+				"body_text": "Base body",
+			},
+			"variants": []map[string]any{{
+				"title":     "Direct Reply",
+				"body_text": "Direct body",
+			}, {
+				"title":     "Softer Ask",
+				"subject":   "Softer subject",
+				"body_text": "Softer body",
+			}},
 		}},
 	}})
 	if err != nil {
 		t.Fatalf("CallTool failed: %v", err)
 	}
 	if result.IsError {
-		t.Fatalf("propose_gmail_send_email returned error: %#v", result.Content)
+		t.Fatalf("propose_mutation returned error: %#v", result.Content)
 	}
 	if len(store.input.Mutations) != 1 {
 		t.Fatalf("expected one mutation, got %#v", store.input.Mutations)
@@ -249,10 +259,10 @@ func TestMCPHandlerErrorWrapsAsIsError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = session.Close() })
 
-	// propose_mutation_request with a malformed mutation triggers
-	// mutationInputFromMap -> error, which Typed.Handle propagates as a
-	// non-nil err, exercising tool.mcpErrorResult.
-	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "propose_mutation_request", Arguments: map[string]any{
+	// propose_mutation with a malformed mutation triggers mutationInputFromMap
+	// -> validation error, which Typed.Handle propagates as a non-nil err,
+	// exercising tool.mcpErrorResult.
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "propose_mutation", Arguments: map[string]any{
 		"title":     "broken",
 		"reason":    "test error path",
 		"mutations": []map[string]any{{"kind": "totally_unknown_kind"}},

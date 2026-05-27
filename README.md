@@ -128,7 +128,7 @@ Notes:
 
 ## Mutation Approval UI
 
-The Go MCP server can expose Gmail/contact mutation proposal tools plus a browser review UI for
+The Go MCP server can expose Gmail, Calendar, and Contacts mutation proposal tools plus a browser review UI for
 pending requests. Set a password before starting it:
 
 ```bash

@@ -80,7 +80,6 @@ type MutationInput struct {
 	SendUpdates   string
 	Event         map[string]any
 	Patch         map[string]any
-	Raw           map[string]any
 }
 
 type GmailEmailVariantInput struct {

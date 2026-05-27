@@ -41,7 +41,7 @@ func (s *recordingStore) RejectRequest(context.Context, string, string, string) 
 	return Request{}, nil
 }
 
-func TestProposeGmailArchiveThreadsCreatesReviewRequest(t *testing.T) {
+func TestProposeMutationGmailArchiveThreads(t *testing.T) {
 	store := &recordingStore{request: Request{
 		ID:     "req-123",
 		Status: "pending_review",
@@ -54,15 +54,18 @@ func TestProposeGmailArchiveThreadsCreatesReviewRequest(t *testing.T) {
 		Now:     func() time.Time { return time.Unix(1700000000, 0).UTC() },
 	})
 
-	response, err := service.ProposeGmailArchiveThreads(context.Background(), ProposeGmailArchiveThreadsInput{
-		Account:   "ZACH@example.test",
-		ThreadIDs: []string{" thread-1 ", "", "thread-2"},
-		Reason:    "clear stale mail",
-		Title:     "Archive stale mail",
-		Context:   map[string]any{"source": "test"},
+	response, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+		Title:  "Archive stale mail",
+		Reason: "clear stale mail",
+		Mutations: []map[string]any{{
+			"type":       GmailArchiveOperation,
+			"account":    "ZACH@example.test",
+			"thread_ids": []any{" thread-1 ", "", "thread-2"},
+		}},
+		Context: map[string]any{"source": "test"},
 	})
 	if err != nil {
-		t.Fatalf("ProposeGmailArchiveThreads returned error: %v", err)
+		t.Fatalf("ProposeMutation returned error: %v", err)
 	}
 
 	if response.RequestID != "req-123" || response.Status != "pending_review" {
@@ -96,14 +99,18 @@ func TestProposeGmailArchiveThreadsCreatesReviewRequest(t *testing.T) {
 	}
 }
 
-func TestProposeGmailArchiveThreadsRejectsEmptyThreadIDsBeforeStore(t *testing.T) {
+func TestProposeMutationRejectsEmptyGmailThreadIDsBeforeStore(t *testing.T) {
 	store := &recordingStore{}
 	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
 
-	_, err := service.ProposeGmailArchiveThreads(context.Background(), ProposeGmailArchiveThreadsInput{
-		Account:   "zach@example.test",
-		ThreadIDs: []string{" "},
-		Reason:    "clear stale mail",
+	_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+		Title:  "Archive stale mail",
+		Reason: "clear stale mail",
+		Mutations: []map[string]any{{
+			"type":       GmailArchiveOperation,
+			"account":    "zach@example.test",
+			"thread_ids": []any{" "},
+		}},
 	})
 	if err == nil {
 		t.Fatal("expected empty thread_ids error")
@@ -116,7 +123,7 @@ func TestProposeGmailArchiveThreadsRejectsEmptyThreadIDsBeforeStore(t *testing.T
 	}
 }
 
-func TestProposeGmailSendEmailCreatesReviewRequest(t *testing.T) {
+func TestProposeMutationGmailSendEmail(t *testing.T) {
 	store := &recordingStore{request: Request{
 		ID:     "req-email",
 		Status: "pending_review",
@@ -126,20 +133,25 @@ func TestProposeGmailSendEmailCreatesReviewRequest(t *testing.T) {
 	}}
 	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
 
-	_, err := service.ProposeGmailSendEmail(context.Background(), ProposeGmailSendEmailInput{
-		Account:         "ZACH@example.test",
-		To:              []string{" one@example.test "},
-		CC:              []string{"two@example.test"},
-		BCC:             []string{"secret@example.test"},
-		Subject:         " Hello ",
-		BodyText:        "Body",
-		ReplyToThreadID: " thread-1 ",
-		DeliveryMode:    "draft",
-		Reason:          "follow up",
-		Title:           "Reply",
+	_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+		Title:  "Reply",
+		Reason: "follow up",
+		Mutations: []map[string]any{{
+			"type":          GmailSendEmailOperation,
+			"account":       "ZACH@example.test",
+			"delivery_mode": "draft",
+			"message": map[string]any{
+				"to":                 []any{" one@example.test "},
+				"cc":                 []any{"two@example.test"},
+				"bcc":                []any{"secret@example.test"},
+				"subject":            " Hello ",
+				"body_text":          "Body",
+				"reply_to_thread_id": " thread-1 ",
+			},
+		}},
 	})
 	if err != nil {
-		t.Fatalf("ProposeGmailSendEmail returned error: %v", err)
+		t.Fatalf("ProposeMutation returned error: %v", err)
 	}
 
 	if len(store.createCalls) != 1 || len(store.createCalls[0].Mutations) != 1 {
@@ -149,38 +161,41 @@ func TestProposeGmailSendEmailCreatesReviewRequest(t *testing.T) {
 	if mutation.Type != GmailSendEmailOperation || mutation.Account != "zach@example.test" || mutation.DeliveryMode != "draft" {
 		t.Fatalf("unexpected email mutation: %#v", mutation)
 	}
-	if got := mutation.Message["subject"]; got != "Hello" {
-		t.Fatalf("subject = %#v", got)
+	if got := strings.TrimSpace(stringFromAny(mutation.Message["subject"])); got != "Hello" {
+		t.Fatalf("subject = %#v", mutation.Message["subject"])
 	}
 	if got := strings.Join(stringSliceFromAny(mutation.Message["to"]), ","); got != "one@example.test" {
 		t.Fatalf("to = %q", got)
 	}
-	if got := mutation.Message["reply_to_thread_id"]; got != "thread-1" {
-		t.Fatalf("reply_to_thread_id = %#v", got)
+	if got := strings.TrimSpace(stringFromAny(mutation.Message["reply_to_thread_id"])); got != "thread-1" {
+		t.Fatalf("reply_to_thread_id = %#v", mutation.Message["reply_to_thread_id"])
 	}
 }
 
-func TestProposeGmailSendEmailAcceptsTitledVariants(t *testing.T) {
+func TestProposeMutationGmailSendEmailAcceptsTitledVariants(t *testing.T) {
 	store := &recordingStore{request: Request{ID: "req-email", Status: "pending_review"}}
 	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
 
-	_, err := service.ProposeGmailSendEmail(context.Background(), ProposeGmailSendEmailInput{
-		Account:      "zach@example.test",
-		To:           []string{"one@example.test"},
-		Subject:      "Hello",
-		BodyText:     "Base body",
-		DeliveryMode: "send",
-		Reason:       "offer choices",
-		Variants: []GmailEmailVariantInput{{
-			Title:    "Direct Reply",
-			BodyText: "Direct body",
-		}, {
-			Title:    "Softer Ask",
-			BodyText: "Softer body",
+	_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+		Title:  "Reply",
+		Reason: "offer choices",
+		Mutations: []map[string]any{{
+			"type":          GmailSendEmailOperation,
+			"account":       "zach@example.test",
+			"delivery_mode": "send",
+			"message": map[string]any{
+				"to":        []any{"one@example.test"},
+				"subject":   "Hello",
+				"body_text": "Base body",
+			},
+			"variants": []map[string]any{
+				{"title": "Direct Reply", "body_text": "Direct body"},
+				{"title": "Softer Ask", "body_text": "Softer body"},
+			},
 		}},
 	})
 	if err != nil {
-		t.Fatalf("ProposeGmailSendEmail returned error: %v", err)
+		t.Fatalf("ProposeMutation returned error: %v", err)
 	}
 
 	mutation := store.createCalls[0].Mutations[0]
@@ -192,19 +207,24 @@ func TestProposeGmailSendEmailAcceptsTitledVariants(t *testing.T) {
 	}
 }
 
-func TestProposeGmailSendEmailRejectsVariantWithoutTwoWordTitle(t *testing.T) {
+func TestProposeMutationRejectsGmailVariantWithoutTwoWordTitle(t *testing.T) {
 	store := &recordingStore{}
 	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
 
-	_, err := service.ProposeGmailSendEmail(context.Background(), ProposeGmailSendEmailInput{
-		Account:  "zach@example.test",
-		To:       []string{"one@example.test"},
-		Subject:  "Hello",
-		BodyText: "Body",
-		Reason:   "offer choices",
-		Variants: []GmailEmailVariantInput{{
-			Title:    "Direct",
-			BodyText: "Direct body",
+	_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+		Title:  "Reply",
+		Reason: "offer choices",
+		Mutations: []map[string]any{{
+			"type":    GmailSendEmailOperation,
+			"account": "zach@example.test",
+			"message": map[string]any{
+				"to":        []any{"one@example.test"},
+				"subject":   "Hello",
+				"body_text": "Body",
+			},
+			"variants": []map[string]any{
+				{"title": "Direct", "body_text": "Direct body"},
+			},
 		}},
 	})
 	if err == nil || !strings.Contains(err.Error(), "variant title") {
@@ -215,7 +235,7 @@ func TestProposeGmailSendEmailRejectsVariantWithoutTwoWordTitle(t *testing.T) {
 	}
 }
 
-func TestProposeContactMutationsCreatesReviewRequest(t *testing.T) {
+func TestProposeMutationContactMutations(t *testing.T) {
 	store := &recordingStore{request: Request{
 		ID:     "req-contact",
 		Status: "pending_review",
@@ -224,16 +244,20 @@ func TestProposeContactMutationsCreatesReviewRequest(t *testing.T) {
 		}},
 	}}
 	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
-	operations := []map[string]any{{"op": "create_contact", "person": map[string]any{"names": []any{map[string]any{"givenName": "New"}}}}}
 
-	_, err := service.ProposeContactMutations(context.Background(), ProposeContactMutationsInput{
-		Account:    "ZACH@example.test",
-		Operations: operations,
-		Reason:     "add missing contact",
-		Title:      "Add contact",
+	_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+		Title:  "Add contact",
+		Reason: "add missing contact",
+		Mutations: []map[string]any{{
+			"type":    GooglePeopleContactsOperation,
+			"account": "ZACH@example.test",
+			"operations": []map[string]any{
+				{"op": "create_contact", "person": map[string]any{"names": []any{map[string]any{"givenName": "New"}}}},
+			},
+		}},
 	})
 	if err != nil {
-		t.Fatalf("ProposeContactMutations returned error: %v", err)
+		t.Fatalf("ProposeMutation returned error: %v", err)
 	}
 
 	if len(store.createCalls) != 1 || len(store.createCalls[0].Mutations) != 1 {
@@ -242,5 +266,67 @@ func TestProposeContactMutationsCreatesReviewRequest(t *testing.T) {
 	mutation := store.createCalls[0].Mutations[0]
 	if mutation.Type != GooglePeopleContactsOperation || mutation.Account != "zach@example.test" || len(mutation.Operations) != 1 {
 		t.Fatalf("unexpected contact mutation: %#v", mutation)
+	}
+}
+
+func TestProposeMutationAcceptsOperationAliasAndContactBatchOperation(t *testing.T) {
+	store := &recordingStore{request: Request{
+		ID:     "req-contact",
+		Status: "pending_review",
+		Mutations: []Mutation{{
+			ID: "mut-contact",
+		}},
+	}}
+	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
+
+	_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+		Title:  "Add contact",
+		Reason: "add missing contact",
+		Mutations: []map[string]any{{
+			"operation": ContactsBatchMutationOperation,
+			"account":   "ZACH@example.test",
+			"operations": []map[string]any{
+				{"op": "create_contact", "person": map[string]any{"names": []any{map[string]any{"givenName": "New"}}}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ProposeMutation returned error: %v", err)
+	}
+
+	if len(store.createCalls) != 1 || len(store.createCalls[0].Mutations) != 1 {
+		t.Fatalf("unexpected create calls: %#v", store.createCalls)
+	}
+	mutation := store.createCalls[0].Mutations[0]
+	if mutation.Type != ContactsBatchMutationOperation || mutation.Account != "zach@example.test" || len(mutation.Operations) != 1 {
+		t.Fatalf("unexpected contact mutation: %#v", mutation)
+	}
+}
+
+func TestMutationHelpDocumentsSupportedMutationTypes(t *testing.T) {
+	help := MutationHelp()
+	types := map[string]bool{}
+	for _, mutationType := range help.Mutations {
+		types[mutationType.Type] = true
+		if len(mutationType.Fields) == 0 {
+			t.Fatalf("%s has no documented fields", mutationType.Type)
+		}
+		if len(mutationType.Example) == 0 {
+			t.Fatalf("%s has no example", mutationType.Type)
+		}
+	}
+
+	for _, expected := range []string{
+		GmailArchiveOperation,
+		GmailUnarchiveOperation,
+		GmailSendEmailOperation,
+		GooglePeopleContactsOperation,
+		CalendarCreateEventOperation,
+		CalendarUpdateEventOperation,
+		CalendarDeleteEventOperation,
+	} {
+		if !types[expected] {
+			t.Fatalf("help missing mutation type %s", expected)
+		}
 	}
 }

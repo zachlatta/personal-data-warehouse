@@ -29,11 +29,8 @@ var snapshotTools = []string{
 	"get_field",
 	"grep_rows",
 	"schema_overview",
-	"propose_mutation_request",
-	"propose_gmail_archive_threads",
-	"propose_gmail_unarchive_threads",
-	"propose_gmail_send_email",
-	"propose_contact_mutations",
+	"propose_mutation",
+	"propose_mutation_help",
 }
 
 func TestMCPToolInputSchemasMatchGolden(t *testing.T) {
