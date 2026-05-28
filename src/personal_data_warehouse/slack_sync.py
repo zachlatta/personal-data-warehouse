@@ -1035,7 +1035,8 @@ class SlackSyncRunner:
                 self._warehouse.insert_slack_messages(deleted_rows)
                 messages_written += len(deleted_rows)
 
-        persist_cursor(latest_cursor, status="ok")
+        if latest_cursor:
+            persist_cursor(latest_cursor, status="ok")
 
         return {"messages_written": messages_written, "files_written": files_written}
 

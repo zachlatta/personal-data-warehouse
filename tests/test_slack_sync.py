@@ -1475,6 +1475,59 @@ def test_runner_partial_sync_tombstones_missing_top_level_but_not_replies(monkey
     assert [row["message_ts"] for row in tombstones] == ["1980.000000"]
 
 
+def test_runner_partial_sync_with_empty_window_does_not_clear_cursor(monkeypatch):
+    # A partial freshness pass can legitimately find no messages in its recent
+    # window. That must not overwrite an existing high-water cursor with "",
+    # because cached public channels often lack Slack `latest.ts` metadata and
+    # rely on warehouse state for prioritization/resume behavior.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation", "C_STALE"): {
+                "cursor_ts": "1778687074.782329",
+                "last_sync_type": "partial",
+                "status": "ok",
+            }
+        }
+    )
+    warehouse.conversation_payloads = [
+        {"id": "C_STALE", "name": "stale-channel", "is_channel": True, "latest": {"ts": "1779999999.000000"}},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [{"ok": True, "messages": [], "response_metadata": {}}],
+        }
+    )
+
+    summary = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(1_780_001_000, tz=UTC),
+        history_window=timedelta(hours=2),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()[0]
+
+    assert summary.conversations_seen == 1
+    assert summary.messages_written == 0
+    assert warehouse.messages == []
+    assert [
+        update
+        for update in warehouse.state_updates
+        if update["object_type"] == "conversation" and update["object_id"] == "C_STALE"
+    ] == []
+
+
 def test_runner_partial_sync_persists_progress_across_pages(monkeypatch):
     # Regression: when a partial sync of a huge channel exhausted the rate-limit
     # budget mid-page, the old materialize-all-then-write approach lost the
