@@ -219,8 +219,12 @@ def test_slack_coverage_sync_runs_current_stage(monkeypatch) -> None:
     assert coverage_call["not_full_only"] is True
     assert coverage_call["skip_known_errors"] is True
     assert coverage_call["conversation_limit"] == 50
-    assert coverage_call["settings"].slack_force_full_sync is True
-    assert settings.slack_force_full_sync is False
+    # Coverage must not force a full sync; channels with a partial cursor need to
+    # resume from cursor, not restart from the start of history. Forcing full sync
+    # on every coverage pass exhausted the rate-limit budget on huge channels
+    # before any progress could be recorded.
+    assert coverage_call["settings"] is settings
+    assert coverage_call["settings"].slack_force_full_sync is False
 
 
 def test_slack_metadata_sync_refreshes_one_conversation_type(monkeypatch) -> None:

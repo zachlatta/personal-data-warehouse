@@ -105,6 +105,7 @@ class SlackSyncRunner:
         thread_order: str = "recent",
         thread_limit: int | None = None,
         thread_since_days: int | None = None,
+        thread_missing_replies_only: bool = False,
         max_rate_limit_sleep_seconds: int | None = None,
     ) -> None:
         self._settings = settings
@@ -137,6 +138,7 @@ class SlackSyncRunner:
         self._thread_order = thread_order
         self._thread_limit = thread_limit
         self._thread_since_days = thread_since_days
+        self._thread_missing_replies_only = thread_missing_replies_only
         self._max_rate_limit_sleep_seconds = max_rate_limit_sleep_seconds
         self._rate_limit_sleep_seconds = 0
 
@@ -247,6 +249,7 @@ class SlackSyncRunner:
                 client=client,
                 synced_at=synced_at,
                 sync_version=sync_version,
+                state_by_key=state_by_key,
             )
 
         users_written = 0
@@ -333,7 +336,11 @@ class SlackSyncRunner:
                         sync_version=sync_version,
                     )
                 oldest_ts = self._oldest_ts_for_conversation(state)
-                if oldest_ts is not None and not conversation_may_have_activity_since(conversation, oldest_ts):
+                if oldest_ts is not None and not conversation_may_have_activity_since(
+                    conversation,
+                    oldest_ts,
+                    cursor_ts=self._state_cursor_ts(state),
+                ):
                     continue
                 if oldest_ts is not None:
                     sync_type = "partial"
@@ -428,6 +435,7 @@ class SlackSyncRunner:
         client,
         synced_at: datetime,
         sync_version: int,
+        state_by_key: Mapping[tuple[str, str, str, str], Any],
     ) -> SlackSyncSummary:
         oldest_ts = self._freshness_oldest_ts()
         if self._use_existing_conversations:
@@ -446,6 +454,14 @@ class SlackSyncRunner:
                 client=client,
                 synced_at=synced_at,
             )
+
+        def _conversation_cursor_ts(conversation: Mapping[str, object]) -> float | None:
+            conversation_id = conversation.get("id")
+            if not conversation_id:
+                return None
+            state = state_by_key.get((account.account, team_id, "conversation", str(conversation_id)))
+            return self._state_cursor_ts(state)
+
         priority_groups = (
             ("im",),
             ("mpim",),
@@ -461,14 +477,24 @@ class SlackSyncRunner:
                 for conversation in conversations
                 if isinstance(conversation, Mapping) and conversation_type(conversation) in group
             ]
-            group_conversations.sort(key=conversation_activity_ts, reverse=True)
+            group_conversations.sort(
+                key=lambda conversation: conversation_activity_ts(
+                    conversation,
+                    cursor_ts=_conversation_cursor_ts(conversation),
+                ),
+                reverse=True,
+            )
             if self._conversation_limit is not None:
                 group_conversations = group_conversations[: self._conversation_limit]
             group_written = 0
             for conversation in group_conversations:
                 if not conversation.get("id"):
                     continue
-                if not conversation_may_have_activity_since(conversation, oldest_ts):
+                if not conversation_may_have_activity_since(
+                    conversation,
+                    oldest_ts,
+                    cursor_ts=_conversation_cursor_ts(conversation),
+                ):
                     continue
                 result = self._sync_conversation_messages(
                     account=account.account,
@@ -581,6 +607,7 @@ class SlackSyncRunner:
             skip_completed=self._skip_completed_threads,
             skip_known_errors=self._skip_known_errors,
             order=self._thread_order,
+            missing_replies_only=self._thread_missing_replies_only,
         )
         messages_written = 0
         files_written = 0
@@ -895,8 +922,27 @@ class SlackSyncRunner:
                 sync_version=sync_version,
             )
 
-        messages = list(
-            iter_cursor_items(
+        all_messages: list[Mapping[str, object]] = []
+        messages_written = 0
+        files_written = 0
+        latest_cursor = ""
+
+        def persist_cursor(cursor_value: str, status: str) -> None:
+            self._warehouse.insert_slack_sync_state(
+                account=account,
+                team_id=team_id,
+                object_type="conversation",
+                object_id=conversation_id,
+                cursor_ts=cursor_value,
+                last_sync_type="partial",
+                status=status,
+                error="",
+                updated_at=synced_at,
+                sync_version=sync_version,
+            )
+
+        try:
+            for messages in iter_cursor_pages(
                 client,
                 "conversations.history",
                 "messages",
@@ -905,47 +951,68 @@ class SlackSyncRunner:
                 channel=conversation_id,
                 oldest=oldest_ts,
                 inclusive="true",
-            )
-        )
-        rows, reaction_rows, file_rows = self._message_related_rows(
-            account=account,
-            team_id=team_id,
-            conversation_id=conversation_id,
-            messages=messages,
-            synced_at=synced_at,
-        )
-
-        if self._sync_thread_replies:
-            thread_parent_ts = [
-                str(message["ts"])
-                for message in messages
-                if isinstance(message, Mapping) and message.get("ts") and int(message.get("reply_count") or 0) > 0
-            ]
-            for parent_ts in thread_parent_ts:
-                replies = list(
-                    iter_cursor_items(
-                        client,
-                        "conversations.replies",
-                        "messages",
-                        limit=self._settings.slack_page_size,
-                        call=self._call,
-                        channel=conversation_id,
-                        ts=parent_ts,
-                    )
-                )
-                reply_rows, reply_reactions, reply_files = self._message_related_rows(
+            ):
+                page_messages = [m for m in messages if isinstance(m, Mapping) and m.get("ts")]
+                all_messages.extend(page_messages)
+                rows, reaction_rows, file_rows = self._message_related_rows(
                     account=account,
                     team_id=team_id,
                     conversation_id=conversation_id,
-                    messages=replies,
+                    messages=page_messages,
                     synced_at=synced_at,
                 )
-                rows.extend(reply_rows)
-                reaction_rows.extend(reply_reactions)
-                file_rows.extend(reply_files)
 
-        if oldest_ts is not None and rows:
-            latest_ts = max(float(row["message_ts"]) for row in rows)
+                if self._sync_thread_replies:
+                    for parent_ts in [
+                        str(message["ts"])
+                        for message in page_messages
+                        if int(message.get("reply_count") or 0) > 0
+                    ]:
+                        replies = list(
+                            iter_cursor_items(
+                                client,
+                                "conversations.replies",
+                                "messages",
+                                limit=self._settings.slack_page_size,
+                                call=self._call,
+                                channel=conversation_id,
+                                ts=parent_ts,
+                            )
+                        )
+                        reply_rows, reply_reactions, reply_files = self._message_related_rows(
+                            account=account,
+                            team_id=team_id,
+                            conversation_id=conversation_id,
+                            messages=replies,
+                            synced_at=synced_at,
+                        )
+                        rows.extend(reply_rows)
+                        reaction_rows.extend(reply_reactions)
+                        file_rows.extend(reply_files)
+
+                self._warehouse.insert_slack_messages(rows)
+                self._warehouse.insert_slack_message_reactions(reaction_rows)
+                self._warehouse.insert_slack_files(file_rows)
+                messages_written += len(rows)
+                files_written += len(file_rows)
+
+                page_latest = max(
+                    (str(message.get("ts")) for message in page_messages if message.get("ts")),
+                    default="",
+                )
+                if page_latest and (not latest_cursor or float(page_latest) > float(latest_cursor)):
+                    # Persist the new high-water cursor immediately. If a later page
+                    # aborts on a rate-limit budget exhaustion, the next pass picks
+                    # up from this cursor instead of re-fetching the same window.
+                    latest_cursor = page_latest
+                    persist_cursor(latest_cursor, status="ok")
+        except SlackRateLimitBudgetExceeded:
+            if latest_cursor:
+                persist_cursor(latest_cursor, status="ok")
+            raise
+
+        if all_messages:
+            latest_ts = max(float(message["ts"]) for message in all_messages)
             existing = self._warehouse.existing_slack_message_ids(
                 account=account,
                 team_id=team_id,
@@ -953,36 +1020,24 @@ class SlackSyncRunner:
                 oldest_ts=str(oldest_ts),
                 latest_ts=f"{latest_ts:.6f}",
             )
-            seen = {row["message_ts"] for row in rows}
-            for missing_ts in sorted(existing - seen):
-                rows.append(
-                    deleted_message_row(
-                        account=account,
-                        team_id=team_id,
-                        conversation_id=conversation_id,
-                        message_ts=missing_ts,
-                        synced_at=synced_at,
-                    )
+            seen = {str(message["ts"]) for message in all_messages}
+            deleted_rows = [
+                deleted_message_row(
+                    account=account,
+                    team_id=team_id,
+                    conversation_id=conversation_id,
+                    message_ts=missing_ts,
+                    synced_at=synced_at,
                 )
+                for missing_ts in sorted(existing - seen)
+            ]
+            if deleted_rows:
+                self._warehouse.insert_slack_messages(deleted_rows)
+                messages_written += len(deleted_rows)
 
-        self._warehouse.insert_slack_messages(rows)
-        self._warehouse.insert_slack_message_reactions(reaction_rows)
-        self._warehouse.insert_slack_files(file_rows)
-        latest_cursor = max((str(message.get("ts")) for message in messages if isinstance(message, Mapping) and message.get("ts")), default="")
-        self._warehouse.insert_slack_sync_state(
-            account=account,
-            team_id=team_id,
-            object_type="conversation",
-            object_id=conversation_id,
-            cursor_ts=latest_cursor,
-            last_sync_type="partial" if oldest_ts is not None else "full",
-            status="ok",
-            error="",
-            updated_at=synced_at,
-            sync_version=sync_version,
-        )
+        persist_cursor(latest_cursor, status="ok")
 
-        return {"messages_written": len(rows), "files_written": len(file_rows)}
+        return {"messages_written": messages_written, "files_written": files_written}
 
     def _sync_full_conversation_messages_streaming(
         self,
@@ -997,76 +1052,90 @@ class SlackSyncRunner:
         messages_written = 0
         files_written = 0
         latest_cursor = ""
-        for messages in iter_cursor_pages(
-            client,
-            "conversations.history",
-            "messages",
-            limit=self._settings.slack_page_size,
-            call=self._call,
-            channel=conversation_id,
-            inclusive="true",
-        ):
-            rows, reaction_rows, file_rows = self._message_related_rows(
+
+        def persist_cursor(cursor_value: str, *, completed: bool) -> None:
+            self._warehouse.insert_slack_sync_state(
                 account=account,
                 team_id=team_id,
-                conversation_id=conversation_id,
-                messages=messages,
-                synced_at=synced_at,
+                object_type="conversation",
+                object_id=conversation_id,
+                cursor_ts=cursor_value,
+                # Mark "partial" until the whole conversation has been streamed,
+                # so coverage keeps the channel in its candidate set until done.
+                last_sync_type="full" if completed else "partial",
+                status="ok",
+                error="",
+                updated_at=synced_at,
+                sync_version=sync_version,
             )
 
-            if self._sync_thread_replies:
-                thread_parent_ts = [
-                    str(message["ts"])
-                    for message in messages
-                    if isinstance(message, Mapping) and message.get("ts") and int(message.get("reply_count") or 0) > 0
-                ]
-                for parent_ts in thread_parent_ts:
-                    replies = list(
-                        iter_cursor_items(
-                            client,
-                            "conversations.replies",
-                            "messages",
-                            limit=self._settings.slack_page_size,
-                            call=self._call,
-                            channel=conversation_id,
-                            ts=parent_ts,
+        try:
+            for messages in iter_cursor_pages(
+                client,
+                "conversations.history",
+                "messages",
+                limit=self._settings.slack_page_size,
+                call=self._call,
+                channel=conversation_id,
+                inclusive="true",
+            ):
+                rows, reaction_rows, file_rows = self._message_related_rows(
+                    account=account,
+                    team_id=team_id,
+                    conversation_id=conversation_id,
+                    messages=messages,
+                    synced_at=synced_at,
+                )
+
+                if self._sync_thread_replies:
+                    thread_parent_ts = [
+                        str(message["ts"])
+                        for message in messages
+                        if isinstance(message, Mapping) and message.get("ts") and int(message.get("reply_count") or 0) > 0
+                    ]
+                    for parent_ts in thread_parent_ts:
+                        replies = list(
+                            iter_cursor_items(
+                                client,
+                                "conversations.replies",
+                                "messages",
+                                limit=self._settings.slack_page_size,
+                                call=self._call,
+                                channel=conversation_id,
+                                ts=parent_ts,
+                            )
                         )
-                    )
-                    reply_rows, reply_reactions, reply_files = self._message_related_rows(
-                        account=account,
-                        team_id=team_id,
-                        conversation_id=conversation_id,
-                        messages=replies,
-                        synced_at=synced_at,
-                    )
-                    rows.extend(reply_rows)
-                    reaction_rows.extend(reply_reactions)
-                    file_rows.extend(reply_files)
+                        reply_rows, reply_reactions, reply_files = self._message_related_rows(
+                            account=account,
+                            team_id=team_id,
+                            conversation_id=conversation_id,
+                            messages=replies,
+                            synced_at=synced_at,
+                        )
+                        rows.extend(reply_rows)
+                        reaction_rows.extend(reply_reactions)
+                        file_rows.extend(reply_files)
 
-            self._warehouse.insert_slack_messages(rows)
-            self._warehouse.insert_slack_message_reactions(reaction_rows)
-            self._warehouse.insert_slack_files(file_rows)
-            messages_written += len(rows)
-            files_written += len(file_rows)
-            page_latest = max(
-                (str(message.get("ts")) for message in messages if isinstance(message, Mapping) and message.get("ts")),
-                default="",
-            )
-            if page_latest and (not latest_cursor or float(page_latest) > float(latest_cursor)):
-                latest_cursor = page_latest
+                self._warehouse.insert_slack_messages(rows)
+                self._warehouse.insert_slack_message_reactions(reaction_rows)
+                self._warehouse.insert_slack_files(file_rows)
+                messages_written += len(rows)
+                files_written += len(file_rows)
+                page_latest = max(
+                    (str(message.get("ts")) for message in messages if isinstance(message, Mapping) and message.get("ts")),
+                    default="",
+                )
+                if page_latest and (not latest_cursor or float(page_latest) > float(latest_cursor)):
+                    latest_cursor = page_latest
+                    # Persist progress so a rate-limit abort partway through a
+                    # multi-year channel doesn't restart from scratch next pass.
+                    persist_cursor(latest_cursor, completed=False)
+        except SlackRateLimitBudgetExceeded:
+            if latest_cursor:
+                persist_cursor(latest_cursor, completed=False)
+            raise
 
-        self._warehouse.insert_slack_sync_state(
-            account=account,
-            team_id=team_id,
-            object_type="conversation",
-            object_id=conversation_id,
-            cursor_ts=latest_cursor,
-            last_sync_type="full",
-            status="ok",
-            error="",
-            updated_at=synced_at,
-            sync_version=sync_version,
-        )
+        persist_cursor(latest_cursor, completed=True)
 
         return {"messages_written": messages_written, "files_written": files_written}
 
@@ -1114,6 +1183,17 @@ class SlackSyncRunner:
                 )
             )
         return rows, reaction_rows, file_rows
+
+    def _state_cursor_ts(self, state: Any) -> float | None:
+        if not state:
+            return None
+        cursor = state.get("cursor_ts") if isinstance(state, Mapping) else getattr(state, "cursor_ts", "")
+        if not cursor:
+            return None
+        try:
+            return float(str(cursor))
+        except (TypeError, ValueError):
+            return None
 
     def _oldest_ts_for_conversation(self, state: Any) -> float | None:
         if self._history_window is not None:
@@ -1459,20 +1539,35 @@ def conversation_type(conversation: Mapping[str, object]) -> str:
     return "unknown"
 
 
-def conversation_may_have_activity_since(conversation: Mapping[str, object], oldest_ts: float) -> bool:
+def conversation_may_have_activity_since(
+    conversation: Mapping[str, object],
+    oldest_ts: float,
+    *,
+    cursor_ts: float | None = None,
+) -> bool:
+    # `latest.ts` (from conversations.list/info) is authoritative when present, but Slack
+    # omits it for nearly all channels. `updated` tracks channel-property edits (topic,
+    # purpose, members), NOT message activity; using it as a freshness gate silently
+    # skips any channel whose metadata hasn't changed recently. Use our own cursor_ts
+    # instead; fall back to "include" rather than to `updated`.
     latest = conversation.get("latest")
     if isinstance(latest, Mapping) and latest.get("ts"):
         return float(str(latest["ts"])) >= oldest_ts
-    updated = conversation.get("updated")
-    if updated not in (None, ""):
-        updated_value = float(str(updated))
-        if updated_value > 10_000_000_000:
-            updated_value = updated_value / 1000
-        return updated_value >= oldest_ts
+    if cursor_ts is not None and cursor_ts > 0:
+        # We know exactly the ts of our last-synced message. If we're behind the
+        # window we definitely need to sync; if we're ahead, new messages may have
+        # arrived since, so let the conversation_limit cap bound the work.
+        return True
     return True
 
 
-def conversation_activity_ts(conversation: Mapping[str, object]) -> float:
+def conversation_activity_ts(
+    conversation: Mapping[str, object],
+    *,
+    cursor_ts: float | None = None,
+) -> float:
+    if cursor_ts is not None and cursor_ts > 0:
+        return cursor_ts
     latest = conversation.get("latest")
     if isinstance(latest, Mapping) and latest.get("ts"):
         return float(str(latest["ts"]))
@@ -1611,9 +1706,14 @@ def main() -> None:
         action="store_true",
         help="Skip thread parents already marked ok in slack_sync_state",
     )
-    parser.add_argument("--thread-order", choices=["recent", "reply_count"], default="recent")
+    parser.add_argument("--thread-order", choices=["recent", "reply_count", "oldest"], default="recent")
     parser.add_argument("--thread-limit", type=int, help="Maximum known thread parents to process")
     parser.add_argument("--thread-since-days", type=int, help="Only process known thread parents newer than this many days")
+    parser.add_argument(
+        "--thread-missing-replies-only",
+        action="store_true",
+        help="Only process thread parents with reply_count > 0 and no replies stored in the warehouse",
+    )
     parser.add_argument(
         "--max-rate-limit-sleep-seconds",
         type=int,
@@ -1670,6 +1770,7 @@ def main() -> None:
             thread_order=args.thread_order,
             thread_limit=args.thread_limit,
             thread_since_days=args.thread_since_days,
+            thread_missing_replies_only=args.thread_missing_replies_only,
             max_rate_limit_sleep_seconds=args.max_rate_limit_sleep_seconds,
         )
 

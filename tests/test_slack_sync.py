@@ -72,6 +72,7 @@ class FakeWarehouse:
         self.files = []
         self.state_updates = []
         self.account_state_refreshes = []
+        self.existing_message_ids: set[str] = set()
 
     def ensure_slack_tables(self):
         self.ensure_calls += 1
@@ -159,6 +160,7 @@ class FakeWarehouse:
         skip_completed=False,
         skip_known_errors=False,
         order="recent",
+        missing_replies_only=False,
     ):
         self.thread_ref_calls.append(
             {
@@ -169,6 +171,7 @@ class FakeWarehouse:
                 "skip_completed": skip_completed,
                 "skip_known_errors": skip_known_errors,
                 "order": order,
+                "missing_replies_only": missing_replies_only,
             }
         )
         refs = list(self.thread_refs)
@@ -271,7 +274,11 @@ class FakeWarehouse:
         self.account_state_refreshes.append(kwargs)
 
     def existing_slack_message_ids(self, *, account, team_id, conversation_id, oldest_ts, latest_ts):
-        return set()
+        # The real implementation filters to is_thread_reply = 0 because
+        # conversations.history doesn't return replies and including them here
+        # would cause every reply in the window to be tombstoned. Tests set
+        # `existing_message_ids` to the set this returns.
+        return set(self.existing_message_ids)
 
 
 def test_slack_web_api_client_uses_bounded_timeout(monkeypatch):
@@ -414,15 +421,28 @@ def test_iter_cursor_items_pages_until_next_cursor_is_empty():
     assert client.calls[1][1]["cursor"] == "next"
 
 
-def test_conversation_recency_uses_latest_or_updated_metadata():
+def test_conversation_recency_uses_latest_or_cursor_state():
+    # Slack's `latest.ts`, when present, is authoritative.
     assert conversation_may_have_activity_since({"latest": {"ts": "100.000001"}}, 99.0)
     assert not conversation_may_have_activity_since({"latest": {"ts": "100.000001"}}, 101.0)
-    assert conversation_may_have_activity_since({"updated": 100_000}, 99.0)
-    assert conversation_may_have_activity_since({"updated": 100_000_000_000}, 99_999_999.0)
+    # When no `latest.ts` and no cursor state, default to including the channel.
+    # Slack's `updated` (channel-property edit time) is NOT a valid message-activity
+    # signal; channels with stale metadata were silently skipped under the old
+    # behavior, which is what broke large stale-metadata channels.
     assert conversation_may_have_activity_since({"id": "C1"}, 999.0)
+    assert conversation_may_have_activity_since({"updated": 100_000}, 99.0)
+    assert conversation_may_have_activity_since({"updated": 100_000}, 200_000)
+    # When our own cursor is provided, include regardless of whether we're behind
+    # or ahead; the conversation_limit cap bounds the work.
+    assert conversation_may_have_activity_since({}, 100.0, cursor_ts=50.0)
+    assert conversation_may_have_activity_since({}, 100.0, cursor_ts=200.0)
+
+    # Sort key prefers cursor_ts (truthful) over Slack hints.
     assert conversation_activity_ts({"latest": {"ts": "120.000001"}}) == pytest.approx(120.000001)
     assert conversation_activity_ts({"updated": 120_000}) == pytest.approx(120_000)
     assert conversation_activity_ts({"updated": 120_000_000_000}) == pytest.approx(120_000_000)
+    assert conversation_activity_ts({"updated": 120_000}, cursor_ts=200.0) == pytest.approx(200.0)
+    assert conversation_activity_ts({"latest": {"ts": "100.0"}}, cursor_ts=200.0) == pytest.approx(200.0)
 
 
 def test_runner_full_sync_collects_workspace_conversations_messages_threads_and_files(monkeypatch):
@@ -1115,6 +1135,62 @@ def test_runner_freshness_priority_can_use_cached_conversations_for_fast_polls(m
     assert warehouse.conversation_payload_calls[0]["include_archived"] is False
 
 
+def test_runner_freshness_priority_syncs_stuck_channel_without_latest_metadata(monkeypatch):
+    # Regression: Slack does not populate `latest` for channels in stored payloads,
+    # so the freshness path used to fall back to `conversation.updated` (channel-
+    # property edit time, not message activity), which silently skipped any
+    # channel whose metadata had not changed recently. With cursor-aware filtering
+    # the channel is included via its stored sync_state.cursor_ts.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        # No `latest.ts`. `updated` is before the freshness window (oldest_ts=1400).
+        # Under the old behavior this channel would have been skipped silently
+        # because the activity filter fell back to `updated < oldest_ts`.
+        {"id": "C_STUCK", "name": "large-channel", "is_channel": True, "updated": 500},
+    ]
+    warehouse.states = {
+        ("zrl", "T1", "conversation", "C_STUCK"): {
+            "cursor_ts": "1900.000000",
+            "last_sync_type": "partial",
+            "status": "ok",
+        }
+    }
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [{"ts": "1999.000000", "user": "U1", "text": "fresh"}],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    history_channels = [params["channel"] for method, params in client.calls if method == "conversations.history"]
+    assert history_channels == ["C_STUCK"]
+
+
 def test_runner_freshness_priority_can_refresh_one_conversation_type(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
@@ -1302,6 +1378,159 @@ def test_runner_thread_replies_only_can_skip_known_errors(monkeypatch):
 
     assert warehouse.thread_ref_calls[0]["skip_known_errors"] is True
     assert [params["channel"] for method, params in client.calls if method == "conversations.replies"] == ["C_OK"]
+
+
+def test_runner_thread_replies_only_can_select_missing_replies(monkeypatch):
+    warehouse = FakeWarehouse()
+    warehouse.thread_refs = [
+        {"conversation_id": "C1", "thread_ts": "1713974400.000100", "reply_count": 1, "latest_reply_ts": ""},
+    ]
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.replies": [
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1713974400.000100", "user": "U1", "text": "root"},
+                        {"ts": "1713974500.000100", "thread_ts": "1713974400.000100", "user": "U2", "text": "reply"},
+                    ],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_thread_replies_only=True,
+        thread_missing_replies_only=True,
+        thread_order="oldest",
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.thread_ref_calls[0]["missing_replies_only"] is True
+    assert warehouse.thread_ref_calls[0]["order"] == "oldest"
+
+
+def test_runner_partial_sync_tombstones_missing_top_level_but_not_replies(monkeypatch):
+    # Regression: when partial sync's deletion-detection compared the set of
+    # `conversations.history` results against everything in DB within the
+    # window (including thread replies the API never returns inline), every
+    # reply in the window got tombstoned. Filter is now applied at the warehouse
+    # level (is_thread_reply = 0); assert the runner relies on that and only
+    # tombstones top-level messages.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse(states={("zrl", "T1", "conversation", "C_STUCK"): {"cursor_ts": "1900.000000"}})
+    warehouse.conversation_payloads = [
+        {"id": "C_STUCK", "name": "large-channel", "is_channel": True, "latest": {"ts": "1999.000000"}},
+    ]
+    # Top-level messages the API returns now: 1999 and 1990.
+    # `existing_message_ids` simulates the warehouse layer correctly filtering
+    # to is_thread_reply = 0; replies must NOT appear here. The only stale
+    # top-level row in the window is "1980.000000".
+    warehouse.existing_message_ids = {"1990.000000", "1999.000000", "1980.000000"}
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1999.000000", "user": "U1", "text": "newest"},
+                        {"ts": "1990.000000", "user": "U2", "text": "older"},
+                    ],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(seconds=200),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    tombstones = [row for row in warehouse.messages if row.get("is_deleted") == 1]
+    assert [row["message_ts"] for row in tombstones] == ["1980.000000"]
+
+
+def test_runner_partial_sync_persists_progress_across_pages(monkeypatch):
+    # Regression: when a partial sync of a huge channel exhausted the rate-limit
+    # budget mid-page, the old materialize-all-then-write approach lost the
+    # cursor advance, so the next pass re-fetched the same window and got stuck
+    # in the same place. The new streaming partial sync writes rows and updates
+    # the cursor per page so progress survives the abort.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "C_BIG", "name": "large-channel", "is_channel": True, "latest": {"ts": "5000.000000"}},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            # First page returns messages and a next_cursor; the budget is then
+            # exhausted before the second page is fetched.
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [{"ts": "3000.000000", "user": "U1", "text": "first"}],
+                    "response_metadata": {"next_cursor": "next"},
+                },
+                SlackRateLimitedError(retry_after=999),
+            ],
+        }
+    )
+
+    sleeps: list[int] = []
+    with pytest.raises(RuntimeError):
+        SlackSyncRunner(
+            settings=settings,
+            warehouse=warehouse,
+            logger=NullLogger(),
+            client_factory=lambda account: client,
+            now=lambda: datetime.fromtimestamp(3500, tz=UTC),
+            history_window=timedelta(seconds=2000),
+            sync_users=False,
+            sync_members=False,
+            use_existing_conversations=True,
+            freshness_priority=True,
+            sync_thread_replies=False,
+            sleep=sleeps.append,
+            max_rate_limit_sleep_seconds=10,
+        ).sync_all()
+
+    # Page 1 messages must have been persisted before the abort.
+    assert any(row["message_ts"] == "3000.000000" for row in warehouse.messages)
+    # And the cursor must have advanced to the page 1 high-water mark, so the
+    # next pass continues forward instead of restarting.
+    assert any(
+        update["object_id"] == "C_BIG" and update["cursor_ts"] == "3000.000000"
+        for update in warehouse.state_updates
+    )
 
 
 def thread_state_covers_ref(state, ref):

@@ -838,6 +838,35 @@ def test_postgres_slack_conversation_loader_query_uses_stats_not_message_groupin
     assert "GROUP BY account, team_id, conversation_id" not in captured["sql"]
 
 
+def test_postgres_slack_thread_missing_replies_filter_ignores_tombstones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    captured: dict[str, object] = {}
+
+    def fake_query(sql, params=None):
+        captured["sql"] = sql
+        captured["params"] = params
+        return []
+
+    monkeypatch.setattr(warehouse, "_query", fake_query)
+
+    warehouse.load_slack_thread_parent_refs(
+        account="zrl",
+        team_id="T1",
+        missing_replies_only=True,
+        order="oldest",
+        limit=5,
+    )
+
+    assert "NOT EXISTS" in str(captured["sql"])
+    assert "r.thread_ts = m.message_ts" in str(captured["sql"])
+    assert "AND r.is_deleted = 0" in str(captured["sql"])
+    assert "AND r.is_thread_reply = 1" in str(captured["sql"])
+    assert "ORDER BY m.message_datetime ASC, m.message_ts ASC" in str(captured["sql"])
+    assert captured["params"] == ("zrl", "T1", 5)
+
+
 def test_postgres_slack_read_state_candidates_use_stats_latest_message_at(
     warehouse: PostgresWarehouse,
 ) -> None:
@@ -895,6 +924,33 @@ def test_postgres_slack_account_state_query_does_not_materialize_recent_messages
 
     assert "recent_messages AS NOT MATERIALIZED" in sql
     assert "current_conversations AS NOT MATERIALIZED" in sql
+
+
+def test_postgres_existing_slack_message_ids_only_returns_top_level_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    captured: dict[str, object] = {}
+
+    def fake_query(sql, params=None):
+        captured["sql"] = sql
+        captured["params"] = params
+        return [("1713974400.000100",)]
+
+    monkeypatch.setattr(warehouse, "_query", fake_query)
+
+    message_ids = warehouse.existing_slack_message_ids(
+        account="zrl",
+        team_id="T1",
+        conversation_id="C1",
+        oldest_ts="1713974000.000000",
+        latest_ts="1713975000.000000",
+    )
+
+    assert message_ids == {"1713974400.000100"}
+    assert "AND is_deleted = 0" in str(captured["sql"])
+    assert "AND is_thread_reply = 0" in str(captured["sql"])
+    assert captured["params"] == ("zrl", "T1", "C1", 1713974000.0, 1713975000.0)
 
 
 def test_postgres_message_upsert_preserves_latest_tombstone(warehouse: PostgresWarehouse) -> None:

@@ -3430,6 +3430,7 @@ class PostgresWarehouse:
                     ELSE 5
                 END,
                 c.is_archived,
+                s.updated_at ASC NULLS FIRST,
                 c.conversation_id
             {limit_clause}
             """,
@@ -3447,6 +3448,7 @@ class PostgresWarehouse:
         skip_completed: bool = False,
         skip_known_errors: bool = False,
         order: str = "recent",
+        missing_replies_only: bool = False,
     ) -> list[dict[str, Any]]:
         where = [
             "m.account = %s",
@@ -3473,9 +3475,23 @@ class PostgresWarehouse:
                 + ")"
                 ")"
             )
+        if missing_replies_only:
+            where.append(
+                "NOT EXISTS ("
+                "SELECT 1 FROM slack_messages AS r "
+                "WHERE r.account = m.account "
+                "AND r.team_id = m.team_id "
+                "AND r.conversation_id = m.conversation_id "
+                "AND r.thread_ts = m.message_ts "
+                "AND r.is_deleted = 0 "
+                "AND r.is_thread_reply = 1"
+                ")"
+            )
         order_by = "m.message_datetime DESC, m.message_ts DESC"
         if order == "reply_count":
             order_by = "m.reply_count DESC, m.message_datetime DESC, m.message_ts DESC"
+        elif order == "oldest":
+            order_by = "m.message_datetime ASC, m.message_ts ASC"
         limit_clause = "LIMIT %s" if limit is not None else ""
         if limit is not None:
             params.append(int(limit))
@@ -3978,6 +3994,11 @@ class PostgresWarehouse:
         oldest_ts: str,
         latest_ts: str,
     ) -> set[str]:
+        # Restrict to top-level messages: `conversations.history` never returns
+        # thread replies inline, so the caller's "seen" set will not include them
+        # either. Returning replies here would make every reply within the window
+        # look like a deletion to the caller, and they would get tombstoned on
+        # the next partial sync.
         rows = self._query(
             f"""
             SELECT message_ts
@@ -3986,6 +4007,7 @@ class PostgresWarehouse:
               AND team_id = %s
               AND conversation_id = %s
               AND is_deleted = 0
+              AND is_thread_reply = 0
               AND {_numeric_ts("message_ts")} >= %s
               AND {_numeric_ts("message_ts")} <= %s
             """,

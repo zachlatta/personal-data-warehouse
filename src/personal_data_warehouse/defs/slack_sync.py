@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import os
 
@@ -74,10 +73,14 @@ def run_slack_coverage_sync(*, settings, warehouse, logger, now: datetime | None
     summaries: list[SlackSyncSummary] = []
     coverage = _coverage_stage_for_time(current_time)
     if coverage is not None:
-        coverage_settings = replace(settings, slack_force_full_sync=True)
+        # Don't force a full sync: channels with a partial cursor resume from cursor
+        # via _oldest_ts_for_conversation; channels with no state still get a full
+        # streaming sync. Forcing full on every coverage pass restreamed large
+        # multi-year channels from scratch and exhausted the rate-limit budget
+        # before any progress was recorded.
         summaries.extend(
             SlackSyncRunner(
-                settings=coverage_settings,
+                settings=settings,
                 warehouse=warehouse,
                 logger=logger,
                 sync_users=False,
@@ -156,6 +159,26 @@ def run_slack_thread_sync(*, settings, warehouse, logger) -> list[SlackSyncSumma
         thread_order=os.getenv("SLACK_ASSET_THREAD_ORDER", "recent"),
         thread_limit=_int_env("SLACK_ASSET_THREAD_LIMIT", 1),
         thread_since_days=_int_env("SLACK_ASSET_THREAD_SINCE_DAYS", settings.slack_thread_audit_days),
+        max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
+    ).sync_all()
+
+
+def run_slack_thread_backfill_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
+    # Walks parents that have reply_count > 0 but no reply rows in the warehouse,
+    # ignoring the rolling thread_since_days window so old backlogs can actually
+    # be drained.
+    return SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=logger,
+        sync_users=False,
+        sync_members=False,
+        sync_thread_replies_only=True,
+        skip_completed_threads=True,
+        skip_known_errors=True,
+        thread_order=os.getenv("SLACK_ASSET_THREAD_BACKFILL_ORDER", "oldest"),
+        thread_limit=_int_env("SLACK_ASSET_THREAD_BACKFILL_LIMIT", 5),
+        thread_missing_replies_only=True,
         max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
     ).sync_all()
 
@@ -332,6 +355,18 @@ def slack_workspace_thread_sync(context) -> MaterializeResult:
     group_name="slack",
     retry_policy=RetryPolicy(max_retries=3, delay=60),
 )
+def slack_workspace_thread_backfill_sync(context) -> MaterializeResult:
+    return _run_locked_slack_stage(
+        context,
+        stage_name="threads_backfill",
+        run_fn=run_slack_thread_backfill_sync,
+    )
+
+
+@asset(
+    group_name="slack",
+    retry_policy=RetryPolicy(max_retries=3, delay=60),
+)
 def slack_workspace_read_state_sync(context) -> MaterializeResult:
     return _run_locked_slack_stage(
         context,
@@ -413,6 +448,11 @@ slack_workspace_thread_sync_job = define_asset_job(
     selection=[slack_workspace_thread_sync],
 )
 
+slack_workspace_thread_backfill_sync_job = define_asset_job(
+    "slack_workspace_thread_backfill_sync_job",
+    selection=[slack_workspace_thread_backfill_sync],
+)
+
 slack_workspace_read_state_sync_job = define_asset_job(
     "slack_workspace_read_state_sync_job",
     selection=[slack_workspace_read_state_sync],
@@ -470,6 +510,15 @@ def slack_workspace_thread_sync_every_five_minutes(context):
 
 
 @schedule(
+    cron_schedule="3-59/5 * * * *",
+    job=slack_workspace_thread_backfill_sync_job,
+    default_status=DefaultScheduleStatus.RUNNING,
+)
+def slack_workspace_thread_backfill_sync_every_five_minutes(context):
+    return skip_if_job_active(context, job_name="slack_workspace_thread_backfill_sync_job")
+
+
+@schedule(
     cron_schedule="2-59/5 * * * *",
     job=slack_workspace_read_state_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
@@ -496,6 +545,7 @@ def defs() -> Definitions:
             slack_workspace_metadata_sync,
             slack_workspace_user_sync,
             slack_workspace_thread_sync,
+            slack_workspace_thread_backfill_sync,
             slack_workspace_read_state_sync,
             slack_workspace_member_sync,
         ],
@@ -505,6 +555,7 @@ def defs() -> Definitions:
             slack_workspace_metadata_sync_job,
             slack_workspace_user_sync_job,
             slack_workspace_thread_sync_job,
+            slack_workspace_thread_backfill_sync_job,
             slack_workspace_read_state_sync_job,
             slack_workspace_member_sync_job,
         ],
@@ -514,6 +565,7 @@ def defs() -> Definitions:
             slack_workspace_metadata_sync_every_fifteen_minutes,
             slack_workspace_user_sync_hourly,
             slack_workspace_thread_sync_every_five_minutes,
+            slack_workspace_thread_backfill_sync_every_five_minutes,
             slack_workspace_read_state_sync_every_five_minutes,
             slack_workspace_member_sync_hourly,
         ],
