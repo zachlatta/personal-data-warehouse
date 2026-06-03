@@ -245,6 +245,20 @@ avoiding the current Metal cooperative-tensor crash seen with some vision models
 The Docker image also includes Tesseract so fallback rows can append a short
 deterministic OCR section when it recovers text the vision model misses.
 
+Gmail sync can also upload each attachment's raw bytes to Google Drive alongside
+the extracted text. By default attachments land in the same object store as the
+other Drive pipelines: the folder and account fall back to
+`VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID` and `VOICE_MEMOS_ACCOUNT`, so storage is on
+whenever that shared folder is configured. Set `GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID`
+to store them in a different folder, or leave both unset to disable blob storage.
+Blobs are content-addressed by SHA-256 (so identical attachments are stored once,
+and they coexist with other pipelines in the shared folder via distinct `pdw_source`
+and key prefixes). The resulting Drive pointer is recorded in the `storage_backend`,
+`storage_key`, `storage_file_id`, and `storage_url` columns of `gmail_attachments`.
+Uploads use a single Drive account for every mailbox (`GMAIL_ATTACHMENT_GOOGLE_DRIVE_ACCOUNT`,
+falling back to `VOICE_MEMOS_ACCOUNT`) so attachments from mailboxes whose own OAuth
+project lacks the Drive API still reach the shared store.
+
 Slack sync splits freshness, coverage, and metadata into separate schedules. The
 `slack_workspace_sync_every_five_minutes` schedule keeps recent messages fresh every five minutes.
 `slack_workspace_coverage_sync_every_seven_minutes` backfills incomplete cached conversations

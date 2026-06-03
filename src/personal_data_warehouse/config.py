@@ -21,6 +21,8 @@ DEFAULT_GMAIL_PAGE_SIZE = 500
 DEFAULT_GMAIL_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_GMAIL_ATTACHMENT_TEXT_MAX_CHARS = 1_000_000
 DEFAULT_GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE = 100
+DEFAULT_GMAIL_ATTACHMENT_STORAGE_BACKEND = "google_drive"
+GMAIL_ATTACHMENT_STORAGE_BACKENDS = ("none", "google_drive")
 DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_BASE_URL = "http://127.0.0.1:11435"
 DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_MODEL = "qwen3-vl:2b"
 DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS = 60
@@ -240,6 +242,9 @@ class Settings:
     gmail_attachment_ai_fallback_timeout_seconds: int = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS
     gmail_attachment_ai_fallback_pdf_max_pages: int = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES
     gmail_attachment_ai_fallback_pull_model: bool = DEFAULT_GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL
+    gmail_attachment_storage_backend: str = DEFAULT_GMAIL_ATTACHMENT_STORAGE_BACKEND
+    gmail_attachment_google_drive_folder_id: str = ""
+    gmail_attachment_google_drive_account: str = ""
     google_oauth_client_secrets_json_by_account: tuple[tuple[str, str], ...] = ()
     google_oauth_client_secrets_json_by_domain: tuple[tuple[str, str], ...] = ()
     voice_memos: VoiceMemosConfig | None = None
@@ -249,6 +254,13 @@ class Settings:
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
     postgres_database_url: str | None = None
+
+    @property
+    def gmail_attachment_storage_enabled(self) -> bool:
+        return (
+            self.gmail_attachment_storage_backend == "google_drive"
+            and bool(self.gmail_attachment_google_drive_folder_id)
+        )
 
     def account_for_email(self, email_address: str) -> GmailAccount:
         normalized = email_address.strip().lower()
@@ -429,6 +441,14 @@ def load_settings(
     if gmail_attachment_backfill_batch_size < 0:
         raise ValueError("GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE must be greater than or equal to 0")
 
+    gmail_attachment_storage_backend = os.getenv(
+        "GMAIL_ATTACHMENT_STORAGE_BACKEND",
+        DEFAULT_GMAIL_ATTACHMENT_STORAGE_BACKEND,
+    ).strip().lower()
+    if gmail_attachment_storage_backend not in GMAIL_ATTACHMENT_STORAGE_BACKENDS:
+        supported = ", ".join(GMAIL_ATTACHMENT_STORAGE_BACKENDS)
+        raise ValueError(f"GMAIL_ATTACHMENT_STORAGE_BACKEND must be one of: {supported}")
+
     gmail_attachment_ai_fallback_timeout_seconds = int(
         os.getenv(
             "GMAIL_ATTACHMENT_AI_FALLBACK_TIMEOUT_SECONDS",
@@ -520,6 +540,19 @@ def load_settings(
         or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
         or ""
     ).strip()
+
+    # Gmail attachments share the same object store as the other Drive pipelines by
+    # default, falling back to the shared voice-memos folder/account.
+    gmail_attachment_google_drive_folder_id = (
+        os.getenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("GMAIL_ATTACHMENT_DRIVE_FOLDER_ID")
+        or voice_memos_google_drive_folder_id
+    ).strip()
+    gmail_attachment_google_drive_account = (
+        os.getenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_ACCOUNT")
+        or voice_memos_account
+        or default_voice_memos_account
+    ).strip().lower()
     voice_memos_transcription_provider = os.getenv(
         "VOICE_MEMOS_TRANSCRIPTION_PROVIDER",
         DEFAULT_VOICE_MEMOS_TRANSCRIPTION_PROVIDER,
@@ -808,6 +841,8 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if alice_voice_recordings and alice_voice_recordings.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if gmail_attachment_storage_backend == "google_drive" and gmail_attachment_google_drive_folder_id:
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
 
     return Settings(
         clickhouse_url=clickhouse_url,
@@ -824,6 +859,9 @@ def load_settings(
         gmail_attachment_max_bytes=gmail_attachment_max_bytes,
         gmail_attachment_text_max_chars=gmail_attachment_text_max_chars,
         gmail_attachment_backfill_batch_size=gmail_attachment_backfill_batch_size,
+        gmail_attachment_storage_backend=gmail_attachment_storage_backend,
+        gmail_attachment_google_drive_folder_id=gmail_attachment_google_drive_folder_id,
+        gmail_attachment_google_drive_account=gmail_attachment_google_drive_account,
         gmail_attachment_ai_fallback_enabled=_parse_bool_env(
             os.getenv("GMAIL_ATTACHMENT_AI_FALLBACK_ENABLED"),
             True,

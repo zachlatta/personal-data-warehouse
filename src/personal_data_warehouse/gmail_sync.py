@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import mimetypes
 import multiprocessing
 import os
 import queue
@@ -41,6 +42,7 @@ import zlib
 from personal_data_warehouse.clickhouse import ClickHouseWarehouse, SyncState
 from personal_data_warehouse.config import GmailAccount, Settings, env_slug
 from personal_data_warehouse.google_auth import google_token_json_from_env, load_google_credentials
+from personal_data_warehouse_voice_memos.storage import ObjectStore, StoredObject
 
 LOGGER = logging.getLogger(__name__)
 EPOCH_UTC = datetime.fromtimestamp(0, tz=UTC)
@@ -52,6 +54,12 @@ ZIP_MAX_MEMBERS = 200
 ZIP_MAX_MEMBER_BYTES = 25 * 1024 * 1024
 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 ZIP_MAX_RECURSION_DEPTH = 1
+GMAIL_ATTACHMENT_STORAGE_SOURCE = "gmail_attachments"
+GMAIL_ATTACHMENT_STORAGE_KIND = "gmail_attachment"
+GMAIL_ATTACHMENT_STORAGE_METADATA_KIND = "gmail_attachment_metadata"
+GMAIL_ATTACHMENT_STORAGE_PREFIX = "gmail-attachments"
+GMAIL_ATTACHMENT_STORAGE_STAGE = "library"
+GMAIL_ATTACHMENT_STORAGE_MAX_EXTENSION_LEN = 16
 ATTACHMENT_AI_PROVIDER = "ollama"
 ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v20"
 ATTACHMENT_AI_GENERATION_OPTIONS = {
@@ -110,6 +118,7 @@ class MailboxSyncSummary:
     query: str | None
     attachment_backfill_candidates: int = 0
     attachment_backfill_rows_written: int = 0
+    attachments_stored: int = 0
 
 
 @dataclass(frozen=True)
@@ -263,10 +272,12 @@ class GmailSyncRunner:
         logger,
         attachment_ai_client: AttachmentVisionClient | None = None,
         attachment_ai_fallback: AttachmentAiFallbackConfig | None | object = ATTACHMENT_AI_FALLBACK_UNSET,
+        attachment_object_store_factory: Callable[[GmailAccount], ObjectStore | None] | None = None,
     ) -> None:
         self._settings = settings
         self._warehouse = warehouse
         self._logger = logger
+        self._attachment_object_store_factory = attachment_object_store_factory
         if attachment_ai_fallback is ATTACHMENT_AI_FALLBACK_UNSET:
             self._attachment_ai_fallback = attachment_ai_fallback_config_from_settings(
                 settings,
@@ -321,17 +332,23 @@ class GmailSyncRunner:
 
     def _sync_account(self, account: GmailAccount, state: SyncState | None) -> MailboxSyncSummary:
         service = build_gmail_service(account=account, settings=self._settings)
+        object_store = self._attachment_object_store(account)
         if self._settings.gmail_force_full_sync or not state or state.last_history_id == 0:
-            summary = self._full_sync(account=account, service=service)
-            return self._with_attachment_backfill(account=account, service=service, summary=summary)
+            summary = self._full_sync(account=account, service=service, object_store=object_store)
+            return self._with_attachment_backfill(
+                account=account, service=service, summary=summary, object_store=object_store
+            )
 
         try:
             summary = self._partial_sync(
                 account=account,
                 service=service,
                 start_history_id=state.last_history_id,
+                object_store=object_store,
             )
-            return self._with_attachment_backfill(account=account, service=service, summary=summary)
+            return self._with_attachment_backfill(
+                account=account, service=service, summary=summary, object_store=object_store
+            )
         except HttpError as exc:
             if _http_status(exc) != 404:
                 raise
@@ -340,15 +357,33 @@ class GmailSyncRunner:
                 account.email_address,
                 state.last_history_id,
             )
-            summary = self._full_sync(account=account, service=service)
-            return self._with_attachment_backfill(account=account, service=service, summary=summary)
+            summary = self._full_sync(account=account, service=service, object_store=object_store)
+            return self._with_attachment_backfill(
+                account=account, service=service, summary=summary, object_store=object_store
+            )
 
-    def _full_sync(self, *, account: GmailAccount, service) -> MailboxSyncSummary:
+    def _attachment_object_store(self, account: GmailAccount) -> ObjectStore | None:
+        if self._attachment_object_store_factory is None:
+            return None
+        try:
+            return self._attachment_object_store_factory(account)
+        except Exception as exc:
+            self._logger.warning(
+                "Skipping Gmail attachment object store for %s because it could not be built: %s",
+                account.email_address,
+                exc,
+            )
+            return None
+
+    def _full_sync(
+        self, *, account: GmailAccount, service, object_store: ObjectStore | None = None
+    ) -> MailboxSyncSummary:
         sync_started_at = datetime.now(tz=UTC)
         next_history_id = current_history_id(service)
         messages_written = 0
         attachments_written = 0
         attachment_text_chars = 0
+        attachments_stored = 0
 
         self._logger.info(
             "Starting full Gmail sync for %s with query %r",
@@ -394,10 +429,12 @@ class GmailSyncRunner:
                 synced_at=sync_started_at,
                 force_reprocess=self._settings.gmail_force_full_sync,
                 enrichment_cache=self._attachment_enrichment_cache(),
+                object_store=object_store,
             )
             self._warehouse.insert_attachments(attachment_rows)
             attachments_written += len(attachment_rows)
             attachment_text_chars += sum(len(str(row["text"])) for row in attachment_rows)
+            attachments_stored += count_attachments_stored(attachment_rows)
 
             self._logger.info(
                 "Synced %s new Gmail messages and %s Gmail attachment rows for %s so far; skipped %s existing messages in latest page",
@@ -416,9 +453,12 @@ class GmailSyncRunner:
             attachments_written=attachments_written,
             attachment_text_chars=attachment_text_chars,
             query=self._settings.gmail_full_sync_query,
+            attachments_stored=attachments_stored,
         )
 
-    def _partial_sync(self, *, account: GmailAccount, service, start_history_id: int) -> MailboxSyncSummary:
+    def _partial_sync(
+        self, *, account: GmailAccount, service, start_history_id: int, object_store: ObjectStore | None = None
+    ) -> MailboxSyncSummary:
         sync_started_at = datetime.now(tz=UTC)
         changed_message_ids, next_history_id = load_incremental_message_ids(
             service=service,
@@ -430,6 +470,7 @@ class GmailSyncRunner:
         deleted_messages = 0
         attachments_written = 0
         attachment_text_chars = 0
+        attachments_stored = 0
 
         self._logger.info(
             "Starting incremental Gmail sync for %s from history %s (%s messages changed)",
@@ -486,6 +527,7 @@ class GmailSyncRunner:
                             text_max_chars=self._settings.gmail_attachment_text_max_chars,
                             ai_fallback=self._attachment_ai_fallback,
                             enrichment_cache=enrichment_cache,
+                            object_store=object_store,
                         )
                     )
             self._warehouse.insert_messages(rows)
@@ -493,6 +535,7 @@ class GmailSyncRunner:
             messages_written += len(rows)
             attachments_written += len(attachment_rows)
             attachment_text_chars += sum(len(str(row["text"])) for row in attachment_rows)
+            attachments_stored += count_attachments_stored(attachment_rows)
             self._logger.info(
                 "Synced %s changed Gmail messages and %s Gmail attachment rows for %s so far",
                 messages_written,
@@ -509,6 +552,7 @@ class GmailSyncRunner:
             attachments_written=attachments_written,
             attachment_text_chars=attachment_text_chars,
             query=None,
+            attachments_stored=attachments_stored,
         )
 
     def _attachment_rows_for_messages(
@@ -521,6 +565,7 @@ class GmailSyncRunner:
         synced_at: datetime,
         force_reprocess: bool = False,
         enrichment_cache: AttachmentEnrichmentCache | None = None,
+        object_store: ObjectStore | None = None,
     ) -> list[dict[str, object]]:
         if not messages:
             return []
@@ -542,6 +587,7 @@ class GmailSyncRunner:
                     force_reprocess=force_reprocess,
                     ai_fallback=self._attachment_ai_fallback,
                     enrichment_cache=enrichment_cache,
+                    object_store=object_store,
                 )
             )
         return rows
@@ -552,11 +598,13 @@ class GmailSyncRunner:
         account: GmailAccount,
         service,
         summary: MailboxSyncSummary,
+        object_store: ObjectStore | None = None,
     ) -> MailboxSyncSummary:
         try:
-            candidates, rows_written, text_chars = self._backfill_attachment_candidates(
+            candidates, rows_written, text_chars, stored = self._backfill_attachment_candidates(
                 account=account,
                 service=service,
+                object_store=object_store,
             )
         except Exception as exc:
             self._logger.warning(
@@ -571,12 +619,15 @@ class GmailSyncRunner:
             attachment_text_chars=summary.attachment_text_chars + text_chars,
             attachment_backfill_candidates=candidates,
             attachment_backfill_rows_written=rows_written,
+            attachments_stored=summary.attachments_stored + stored,
         )
 
-    def _backfill_attachment_candidates(self, *, account: GmailAccount, service) -> tuple[int, int, int]:
+    def _backfill_attachment_candidates(
+        self, *, account: GmailAccount, service, object_store: ObjectStore | None = None
+    ) -> tuple[int, int, int, int]:
         limit = self._settings.gmail_attachment_backfill_batch_size
         if limit <= 0:
-            return (0, 0, 0)
+            return (0, 0, 0, 0)
 
         ai_provider = self._attachment_ai_fallback.provider if self._attachment_ai_fallback else ""
         ai_model = self._attachment_ai_fallback.model if self._attachment_ai_fallback else ""
@@ -589,11 +640,12 @@ class GmailSyncRunner:
             ai_prompt_version=ai_prompt_version,
         )
         if not messages:
-            return (0, 0, 0)
+            return (0, 0, 0, 0)
 
         candidates = 0
         rows_written = 0
         text_chars = 0
+        stored = 0
         enrichment_cache = self._attachment_enrichment_cache()
 
         for message in messages:
@@ -618,6 +670,7 @@ class GmailSyncRunner:
                     force_reprocess=True,
                     ai_fallback=self._attachment_ai_fallback,
                     enrichment_cache=enrichment_cache,
+                    object_store=object_store,
                 )
                 self._warehouse.insert_attachments(rows)
                 self._warehouse.insert_attachment_backfill_state(
@@ -661,15 +714,17 @@ class GmailSyncRunner:
 
             rows_written += len(rows)
             text_chars += sum(len(str(row["text"])) for row in rows)
+            stored += count_attachments_stored(rows)
 
         self._logger.info(
-            "Backfilled Gmail attachments for %s: %s candidates, %s rows, %s text chars",
+            "Backfilled Gmail attachments for %s: %s candidates, %s rows, %s text chars, %s blobs stored",
             account.email_address,
             candidates,
             rows_written,
             text_chars,
+            stored,
         )
-        return (candidates, rows_written, text_chars)
+        return (candidates, rows_written, text_chars, stored)
 
     def _attachment_enrichment_cache(self) -> AttachmentEnrichmentCache | None:
         if not hasattr(self._warehouse, "load_attachment_enrichments") or not hasattr(
@@ -1020,6 +1075,7 @@ def attachment_rows_for_message(
     force_reprocess: bool = False,
     ai_fallback: AttachmentAiFallbackConfig | None = None,
     enrichment_cache: AttachmentEnrichmentCache | None = None,
+    object_store: ObjectStore | None = None,
 ) -> list[dict[str, object]]:
     message_id = str(message.get("id", ""))
     current_parts = attachment_parts_from_message(message)
@@ -1042,6 +1098,7 @@ def attachment_rows_for_message(
                 text_max_chars=text_max_chars,
                 ai_fallback=ai_fallback,
                 enrichment_cache=enrichment_cache,
+                object_store=object_store,
             )
         )
 
@@ -1108,6 +1165,11 @@ def deleted_attachment_row(
         "content_disposition": "",
         "size": 0,
         "content_sha256": "",
+        "storage_backend": "",
+        "storage_key": "",
+        "storage_file_id": "",
+        "storage_url": "",
+        "storage_status": "",
         "text": "",
         "text_extraction_status": "deleted",
         "text_extraction_error": "",
@@ -1153,6 +1215,77 @@ def attachment_backfill_state_row(
     }
 
 
+def gmail_attachment_extension(*, filename: str, mime_type: str) -> str:
+    suffix = Path(filename).suffix
+    if not suffix and mime_type:
+        suffix = mimetypes.guess_extension(mime_type.split(";", 1)[0].strip()) or ""
+    suffix = "".join(char for char in suffix if char.isalnum() or char == ".")
+    if len(suffix) > GMAIL_ATTACHMENT_STORAGE_MAX_EXTENSION_LEN:
+        return ""
+    return suffix.lower()
+
+
+def gmail_attachment_object_key(
+    *,
+    internal_date: datetime,
+    content_sha256: str,
+    filename: str,
+    mime_type: str,
+    stage: str = GMAIL_ATTACHMENT_STORAGE_STAGE,
+) -> str:
+    moment = internal_date.astimezone(UTC)
+    date_prefix = moment.strftime("%Y/%m/%Y-%m-%d")
+    extension = gmail_attachment_extension(filename=filename, mime_type=mime_type)
+    return f"{GMAIL_ATTACHMENT_STORAGE_PREFIX}/{stage}/{date_prefix}-{content_sha256}{extension}"
+
+
+def store_attachment_blob(
+    *,
+    object_store: ObjectStore,
+    content: bytes,
+    content_sha256: str,
+    mime_type: str,
+    filename: str,
+    internal_date: datetime,
+    account: str,
+    message_id: str,
+    part_id: str,
+    attachment_id: str,
+    stage: str = GMAIL_ATTACHMENT_STORAGE_STAGE,
+) -> StoredObject:
+    object_key = gmail_attachment_object_key(
+        internal_date=internal_date,
+        content_sha256=content_sha256,
+        filename=filename,
+        mime_type=mime_type,
+        stage=stage,
+    )
+    app_properties = {
+        "gmail_account": account,
+        "gmail_message_id": message_id,
+        "gmail_part_id": part_id,
+    }
+    if attachment_id:
+        app_properties["gmail_attachment_id_sha256"] = hashlib.sha256(
+            attachment_id.encode("utf-8")
+        ).hexdigest()
+    with tempfile.NamedTemporaryFile(prefix="pdw-gmail-attachment-") as handle:
+        handle.write(content)
+        handle.flush()
+        return object_store.put_file(
+            path=Path(handle.name),
+            object_key=object_key,
+            content_sha256=content_sha256,
+            content_type=mime_type or "application/octet-stream",
+            kind=GMAIL_ATTACHMENT_STORAGE_KIND,
+            app_properties=app_properties,
+        )
+
+
+def count_attachments_stored(rows: Sequence[Mapping[str, object]]) -> int:
+    return sum(1 for row in rows if row.get("storage_status") == "stored")
+
+
 def attachment_part_to_row(
     *,
     account: str,
@@ -1164,6 +1297,7 @@ def attachment_part_to_row(
     text_max_chars: int,
     ai_fallback: AttachmentAiFallbackConfig | None = None,
     enrichment_cache: AttachmentEnrichmentCache | None = None,
+    object_store: ObjectStore | None = None,
 ) -> dict[str, object]:
     message_id = str(message.get("id", ""))
     headers = header_map(part.get("headers", []))
@@ -1172,7 +1306,13 @@ def attachment_part_to_row(
     filename = str(part.get("filename", ""))
     mime_type = normalized_mime_type(str(part.get("mimeType", "")))
     declared_size = int(body.get("size", 0) or 0)
+    internal_date = internal_date_from_message(message)
     content_sha256 = ""
+    storage_backend = ""
+    storage_key = ""
+    storage_file_id = ""
+    storage_url = ""
+    storage_status = ""
 
     if max_bytes == 0:
         extraction = AttachmentTextExtraction(
@@ -1208,6 +1348,34 @@ def attachment_part_to_row(
             else:
                 content_sha256 = hashlib.sha256(content).hexdigest()
                 declared_size = declared_size or len(content)
+                if object_store is not None:
+                    try:
+                        stored = store_attachment_blob(
+                            object_store=object_store,
+                            content=content,
+                            content_sha256=content_sha256,
+                            mime_type=mime_type,
+                            filename=filename,
+                            internal_date=internal_date,
+                            account=account,
+                            message_id=message_id,
+                            part_id=str(part.get("partId", "")),
+                            attachment_id=attachment_id,
+                        )
+                    except Exception as exc:
+                        storage_status = "upload_error"
+                        LOGGER.warning(
+                            "gmail attachment blob upload failed for %s/%s: %s",
+                            message_id,
+                            part.get("partId", ""),
+                            truncate_error(str(exc)),
+                        )
+                    else:
+                        storage_backend = stored["storage_backend"]
+                        storage_key = stored["storage_key"]
+                        storage_file_id = stored["storage_file_id"]
+                        storage_url = stored["storage_url"]
+                        storage_status = "stored"
                 cached_extraction = enrichment_cache.get(content_sha256) if enrichment_cache is not None else None
                 if cached_extraction is not None:
                     extraction = cached_extraction
@@ -1235,7 +1403,7 @@ def attachment_part_to_row(
         "message_id": message_id,
         "thread_id": str(message.get("threadId", "")),
         "history_id": int(message.get("historyId", 0)),
-        "internal_date": internal_date_from_message(message),
+        "internal_date": internal_date,
         "part_id": str(part.get("partId", "")),
         "attachment_id": attachment_id,
         "filename": filename,
@@ -1244,6 +1412,11 @@ def attachment_part_to_row(
         "content_disposition": headers.get("content-disposition", ""),
         "size": declared_size,
         "content_sha256": content_sha256,
+        "storage_backend": storage_backend,
+        "storage_key": storage_key,
+        "storage_file_id": storage_file_id,
+        "storage_url": storage_url,
+        "storage_status": storage_status,
         "text": extraction.text,
         "text_extraction_status": extraction.status,
         "text_extraction_error": extraction.error,

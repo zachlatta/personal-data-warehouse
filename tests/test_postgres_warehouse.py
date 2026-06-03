@@ -236,6 +236,27 @@ def test_apple_message_attachment_upsert_preserves_existing_storage_when_metadat
     ) in clause
 
 
+def test_gmail_attachment_upsert_preserves_existing_storage_when_record_is_blank() -> None:
+    clause = _upsert_clause("gmail_attachments", POSTGRES_TABLES["gmail_attachments"])
+
+    assert (
+        "\"storage_backend\" = COALESCE(NULLIF(EXCLUDED.\"storage_backend\", ''), "
+        "\"gmail_attachments\".\"storage_backend\")"
+    ) in clause
+    assert (
+        "\"storage_key\" = COALESCE(NULLIF(EXCLUDED.\"storage_key\", ''), "
+        "\"gmail_attachments\".\"storage_key\")"
+    ) in clause
+    assert (
+        "\"storage_file_id\" = COALESCE(NULLIF(EXCLUDED.\"storage_file_id\", ''), "
+        "\"gmail_attachments\".\"storage_file_id\")"
+    ) in clause
+    assert (
+        "\"storage_status\" = COALESCE(NULLIF(EXCLUDED.\"storage_status\", ''), "
+        "\"gmail_attachments\".\"storage_status\")"
+    ) in clause
+
+
 def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     warehouse.ensure_calendar_tables()

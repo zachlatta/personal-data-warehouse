@@ -53,6 +53,11 @@ ATTACHMENT_COLUMNS = (
     "content_disposition",
     "size",
     "content_sha256",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "storage_status",
     "is_deleted",
     "part_json",
     "synced_at",
@@ -857,6 +862,11 @@ class ClickHouseWarehouse:
                 content_disposition String,
                 size UInt64,
                 content_sha256 String,
+                storage_backend LowCardinality(String),
+                storage_key String,
+                storage_file_id String,
+                storage_url String,
+                storage_status LowCardinality(String),
                 is_deleted UInt8,
                 part_json String,
                 synced_at DateTime64(3, 'UTC'),
@@ -866,6 +876,15 @@ class ClickHouseWarehouse:
             PARTITION BY toYYYYMM(synced_at)
             ORDER BY (account, message_id, part_id, filename)
             """
+        )
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS storage_backend LowCardinality(String) AFTER content_sha256"
+        )
+        self._command("ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS storage_key String AFTER storage_backend")
+        self._command("ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS storage_file_id String AFTER storage_key")
+        self._command("ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS storage_url String AFTER storage_file_id")
+        self._command(
+            "ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS storage_status LowCardinality(String) AFTER storage_url"
         )
         self._command(
             """

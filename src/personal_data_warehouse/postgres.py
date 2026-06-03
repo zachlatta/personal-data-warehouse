@@ -604,6 +604,10 @@ class PostgresWarehouse:
                 "gmail_attachment_enrichments",
             ]
         )
+        for column in ("storage_backend", "storage_key", "storage_file_id", "storage_url", "storage_status"):
+            self._command(
+                f"ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS {_identifier(column)} text NOT NULL DEFAULT ''"
+            )
         self._ensure_clean_gmail_inbox_view()
 
     def ensure_calendar_tables(self) -> None:
@@ -4642,7 +4646,14 @@ def _upsert_clause(table: str, spec: TableSpec, columns: tuple[str, ...] | None 
             "storage_key",
             "storage_file_id",
             "storage_url",
-        }
+        },
+        "gmail_attachments": {
+            "storage_backend",
+            "storage_key",
+            "storage_file_id",
+            "storage_url",
+            "storage_status",
+        },
     }.get(table, set())
     assignments = ", ".join(
         _upsert_assignment(table=table, column=column, preserve_non_empty=column in preserve_non_empty_columns)

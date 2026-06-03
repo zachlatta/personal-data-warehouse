@@ -9,6 +9,7 @@ from io import BytesIO
 import json
 import socketserver
 import subprocess
+from pathlib import Path
 import threading
 import time
 import urllib.request
@@ -18,7 +19,7 @@ import zipfile
 from googleapiclient.errors import HttpError
 from httplib2 import Response
 from PIL import Image
-from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
 from personal_data_warehouse.defs.gmail_sync import (
     gmail_mailbox_sync_every_minute,
     ollama_resource_from_env,
@@ -38,8 +39,14 @@ from personal_data_warehouse.gmail_sync import (
     attachment_parts_from_message,
     attachment_rows_for_message,
     collapsed_message_body_to_markdown,
+    count_attachments_stored,
     decode_base64url,
+    deleted_attachment_row,
     deleted_attachment_rows,
+    GMAIL_ATTACHMENT_STORAGE_KIND,
+    GMAIL_ATTACHMENT_STORAGE_PREFIX,
+    gmail_attachment_extension,
+    gmail_attachment_object_key,
     execute_gmail_request,
     extract_attachment_text,
     exclusive_gmail_sync_lock,
@@ -93,6 +100,47 @@ class FakeLogger:
 
     def warning(self, *args, **kwargs) -> None:
         pass
+
+
+class FakeObjectStore:
+    backend = "google_drive"
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.put_calls: list[dict] = []
+
+    def put_file(
+        self,
+        *,
+        path,
+        object_key: str,
+        content_sha256: str,
+        content_type: str,
+        skip_existing_check: bool = False,
+        app_properties: dict | None = None,
+        kind: str | None = None,
+    ) -> dict:
+        self.put_calls.append(
+            {
+                "object_key": object_key,
+                "content_sha256": content_sha256,
+                "content_type": content_type,
+                "app_properties": dict(app_properties or {}),
+                "kind": kind,
+                "content": Path(path).read_bytes(),
+            }
+        )
+        if self.fail:
+            raise RuntimeError("drive upload boom")
+        return {
+            "storage_backend": self.backend,
+            "storage_key": object_key,
+            "storage_file_id": f"file-{content_sha256[:8]}",
+            "storage_url": f"https://drive.example/{content_sha256[:8]}",
+        }
+
+    def has_object(self, *, kind: str, key: str, value: str) -> bool:
+        return False
 
 
 class FakeOllamaResource:
@@ -278,6 +326,100 @@ def test_load_settings_accepts_gmail_attachment_limits(monkeypatch) -> None:
     assert settings.gmail_attachment_max_bytes == 1024
     assert settings.gmail_attachment_text_max_chars == 2048
     assert settings.gmail_attachment_backfill_batch_size == 25
+
+
+def test_load_settings_disables_attachment_storage_without_folder(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+    monkeypatch.delenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", raising=False)
+    monkeypatch.delenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID", raising=False)
+    monkeypatch.delenv("VOICE_MEMOS_DRIVE_FOLDER_ID", raising=False)
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+
+    assert settings.gmail_attachment_storage_backend == "google_drive"
+    assert settings.gmail_attachment_google_drive_folder_id == ""
+    assert settings.gmail_attachment_storage_enabled is False
+    assert GOOGLE_DRIVE_SCOPE not in settings.google_scopes
+
+
+def test_load_settings_enables_attachment_storage_with_folder(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "folder-123")
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+
+    assert settings.gmail_attachment_storage_enabled is True
+    assert settings.gmail_attachment_google_drive_folder_id == "folder-123"
+    assert GOOGLE_DRIVE_SCOPE in settings.google_scopes
+
+
+def test_load_settings_rejects_unknown_attachment_storage_backend(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_STORAGE_BACKEND", "s3")
+
+    try:
+        load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    except ValueError as exc:
+        assert "GMAIL_ATTACHMENT_STORAGE_BACKEND" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for unknown storage backend")
+
+
+def test_load_settings_attachment_storage_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_STORAGE_BACKEND", "none")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "folder-123")
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+
+    assert settings.gmail_attachment_storage_enabled is False
+    assert GOOGLE_DRIVE_SCOPE not in settings.google_scopes
+
+
+def test_load_settings_normalizes_attachment_storage_backend(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_STORAGE_BACKEND", "GOOGLE_DRIVE")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "folder-123")
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+
+    assert settings.gmail_attachment_storage_backend == "google_drive"
+    assert settings.gmail_attachment_storage_enabled is True
+
+
+def test_load_settings_reads_attachment_storage_drive_account(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "folder-123")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_ACCOUNT", "Zach@ZachLatta.com")
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+
+    assert settings.gmail_attachment_google_drive_account == "zach@zachlatta.com"
+
+
+def test_load_settings_shares_voice_memos_object_store_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com,zach@zachlatta.com")
+    monkeypatch.delenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", raising=False)
+    monkeypatch.delenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_ACCOUNT", raising=False)
+    monkeypatch.setenv("VOICE_MEMOS_ACCOUNT", "zach@zachlatta.com")
+    monkeypatch.setenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID", "shared-folder-id")
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+
+    # Gmail attachments land in the same Drive store as voice memos by default.
+    assert settings.gmail_attachment_google_drive_folder_id == "shared-folder-id"
+    assert settings.gmail_attachment_google_drive_account == "zach@zachlatta.com"
+    assert settings.gmail_attachment_storage_enabled is True
+
+
+def test_load_settings_attachment_folder_overrides_shared_store(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
+    monkeypatch.setenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID", "shared-folder-id")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "gmail-only-folder")
+
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+
+    assert settings.gmail_attachment_google_drive_folder_id == "gmail-only-folder"
 
 
 def test_load_settings_enables_gmail_attachment_ai_fallback_by_default(monkeypatch) -> None:
@@ -679,6 +821,169 @@ def test_attachment_rows_for_message_uses_ai_fallback_for_images(monkeypatch) ->
     assert metadata["prompt_sha256"] == row["ai_prompt_sha256"]
     assert metadata["generation_options"] == {"temperature": 0, "num_predict": 320}
     assert metadata["response_format"] == "prompted_json"
+
+
+def _attachment_message(content: bytes, *, filename: str = "notes.txt", mime_type: str = "text/plain") -> dict:
+    return {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": filename,
+                    "mimeType": mime_type,
+                    "body": {"data": _gmail_data(content), "size": len(content)},
+                }
+            ]
+        },
+    }
+
+
+def test_attachment_part_to_row_uploads_blob_to_object_store() -> None:
+    content = b"attachment blob bytes"
+    object_store = FakeObjectStore()
+    message = _attachment_message(content)
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=100,
+        text_max_chars=100,
+        object_store=object_store,
+    )
+
+    row = rows[0]
+    sha = hashlib.sha256(content).hexdigest()
+    assert row["storage_backend"] == "google_drive"
+    assert row["storage_status"] == "stored"
+    assert row["storage_file_id"] == f"file-{sha[:8]}"
+    assert row["storage_url"] == f"https://drive.example/{sha[:8]}"
+    assert row["storage_key"].startswith(f"{GMAIL_ATTACHMENT_STORAGE_PREFIX}/library/2024/04/2024-04-23-")
+    assert row["storage_key"].endswith(".txt")
+
+    assert len(object_store.put_calls) == 1
+    call = object_store.put_calls[0]
+    assert call["content"] == content
+    assert call["content_sha256"] == sha
+    assert call["kind"] == GMAIL_ATTACHMENT_STORAGE_KIND
+    assert call["content_type"] == "text/plain"
+    assert call["app_properties"]["gmail_account"] == "zach@example.com"
+    assert call["app_properties"]["gmail_message_id"] == "gmail-id"
+    assert call["app_properties"]["gmail_part_id"] == "2"
+
+
+def test_attachment_part_to_row_records_upload_error() -> None:
+    content = b"attachment blob bytes"
+    object_store = FakeObjectStore(fail=True)
+    message = _attachment_message(content)
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=message,
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=100,
+        text_max_chars=100,
+        object_store=object_store,
+    )
+
+    row = rows[0]
+    assert row["storage_status"] == "upload_error"
+    assert row["storage_backend"] == ""
+    assert row["storage_key"] == ""
+    assert row["storage_file_id"] == ""
+    assert row["storage_url"] == ""
+    # Text extraction still succeeds even when the blob upload fails.
+    assert row["text_extraction_status"] == "ok"
+    assert row["content_sha256"] == hashlib.sha256(content).hexdigest()
+
+
+def test_attachment_part_to_row_skips_upload_without_object_store() -> None:
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=_attachment_message(b"hello"),
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=100,
+        text_max_chars=100,
+    )
+
+    row = rows[0]
+    assert row["storage_status"] == ""
+    assert row["storage_backend"] == ""
+    assert row["storage_key"] == ""
+
+
+def test_attachment_part_to_row_does_not_upload_oversized_attachment() -> None:
+    content = b"x" * 200
+    object_store = FakeObjectStore()
+
+    rows = attachment_rows_for_message(
+        account="zach@example.com",
+        service=FakeGmailAttachmentService({}),
+        message=_attachment_message(content),
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        existing_keys=set(),
+        max_bytes=10,
+        text_max_chars=100,
+        object_store=object_store,
+    )
+
+    assert object_store.put_calls == []
+    assert rows[0]["storage_status"] == ""
+    assert rows[0]["text_extraction_status"] == "too_large"
+
+
+def test_deleted_attachment_row_has_empty_storage_fields() -> None:
+    row = deleted_attachment_row(
+        account="zach@example.com",
+        message_id="gmail-id",
+        part_id="2",
+        attachment_id="",
+        filename="notes.txt",
+        synced_at=datetime(2026, 4, 23, tzinfo=UTC),
+        history_id=7,
+    )
+
+    assert row["storage_backend"] == ""
+    assert row["storage_key"] == ""
+    assert row["storage_file_id"] == ""
+    assert row["storage_url"] == ""
+    assert row["storage_status"] == ""
+
+
+def test_count_attachments_stored_counts_only_stored_rows() -> None:
+    rows = [
+        {"storage_status": "stored"},
+        {"storage_status": "upload_error"},
+        {"storage_status": ""},
+        {"storage_status": "stored"},
+    ]
+    assert count_attachments_stored(rows) == 2
+
+
+def test_gmail_attachment_object_key_uses_internal_date_and_sha() -> None:
+    key = gmail_attachment_object_key(
+        internal_date=datetime(2026, 4, 23, 9, 30, tzinfo=UTC),
+        content_sha256="abc123",
+        filename="report.PDF",
+        mime_type="application/pdf",
+    )
+    assert key == f"{GMAIL_ATTACHMENT_STORAGE_PREFIX}/library/2026/04/2026-04-23-abc123.pdf"
+
+
+def test_gmail_attachment_extension_falls_back_to_mime_type() -> None:
+    assert gmail_attachment_extension(filename="no-extension", mime_type="application/pdf") == ".pdf"
+    assert gmail_attachment_extension(filename="photo.JPG", mime_type="image/jpeg") == ".jpg"
+    assert gmail_attachment_extension(filename="blob", mime_type="") == ""
 
 
 def test_attachment_rows_for_message_reuses_cached_enrichment_by_hash() -> None:
@@ -1915,7 +2220,7 @@ def test_runner_backfills_attachment_candidates_and_marks_state(monkeypatch) -> 
     settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
     runner = GmailSyncRunner(settings=settings, warehouse=warehouse, logger=FakeLogger())
 
-    candidates, rows_written, text_chars = runner._backfill_attachment_candidates(
+    candidates, rows_written, text_chars, stored = runner._backfill_attachment_candidates(
         account=settings.gmail_accounts[0],
         service=FakeGmailAttachmentService({}),
     )
@@ -1923,6 +2228,7 @@ def test_runner_backfills_attachment_candidates_and_marks_state(monkeypatch) -> 
     assert candidates == 1
     assert rows_written == 1
     assert text_chars == len("backfill text")
+    assert stored == 0
     assert warehouse.attachment_rows[0]["filename"] == "notes.txt"
     assert warehouse.attachment_rows[0]["text"] == "backfill text"
     assert warehouse.candidate_requests[0]["ai_provider"] == "ollama"
@@ -1950,7 +2256,7 @@ def test_runner_marks_false_positive_attachment_candidates_as_processed(monkeypa
     settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
     runner = GmailSyncRunner(settings=settings, warehouse=warehouse, logger=FakeLogger())
 
-    candidates, rows_written, text_chars = runner._backfill_attachment_candidates(
+    candidates, rows_written, text_chars, stored = runner._backfill_attachment_candidates(
         account=settings.gmail_accounts[0],
         service=FakeGmailAttachmentService({}),
     )
@@ -1958,6 +2264,7 @@ def test_runner_marks_false_positive_attachment_candidates_as_processed(monkeypa
     assert candidates == 1
     assert rows_written == 0
     assert text_chars == 0
+    assert stored == 0
     assert warehouse.attachment_rows == []
     assert warehouse.state_rows[0]["status"] == "ok"
     assert warehouse.state_rows[0]["attachment_rows_written"] == 0

@@ -81,6 +81,11 @@ def test_gmail_attachment_schema_keeps_enrichment_payloads_off_attachment_rows()
     assert "ai_prompt_version" not in attachment_sql
     assert "text String" in enrichment_sql
     assert "text_extraction_status LowCardinality(String)" in enrichment_sql
+    assert any("ADD COLUMN IF NOT EXISTS storage_backend" in command for command in commands)
+    assert any("ADD COLUMN IF NOT EXISTS storage_key" in command for command in commands)
+    assert any("ADD COLUMN IF NOT EXISTS storage_file_id" in command for command in commands)
+    assert any("ADD COLUMN IF NOT EXISTS storage_url" in command for command in commands)
+    assert any("ADD COLUMN IF NOT EXISTS storage_status" in command for command in commands)
 
 
 def test_gmail_attachment_schema_migrates_legacy_enrichment_columns_before_drop() -> None:
