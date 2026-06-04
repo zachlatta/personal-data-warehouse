@@ -84,3 +84,20 @@ def test_factory_uses_shared_voice_memos_account_when_attachment_account_unset(m
     factory(settings.account_for_email("zach@hackclub.com"))
 
     assert captured == ["zach@zachlatta.com"]
+
+
+def test_gmail_schedule_skips_when_prior_run_is_in_progress(monkeypatch) -> None:
+    calls: list[tuple[object, str]] = []
+    expected = object()
+
+    def fake_skip_if_job_in_progress(context, *, job_name: str):
+        calls.append((context, job_name))
+        return expected
+
+    monkeypatch.setattr(gmail_sync_defs, "skip_if_job_in_progress", fake_skip_if_job_in_progress)
+    context = object()
+
+    result = gmail_sync_defs.gmail_mailbox_sync_every_minute._execution_fn.decorated_fn(context)
+
+    assert result is expected
+    assert calls == [(context, "gmail_mailbox_sync_job")]

@@ -31,7 +31,7 @@ from personal_data_warehouse.gmail_sync import (
     attachment_ai_fallback_config_from_settings,
 )
 from personal_data_warehouse.ollama_resource import OllamaResource
-from personal_data_warehouse.schedule_guards import skip_if_job_active
+from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse_voice_memos.cli import build_google_drive_service
 from personal_data_warehouse_voice_memos.google_drive_storage import GoogleDriveObjectStore
 from personal_data_warehouse_voice_memos.storage import ObjectStore
@@ -179,7 +179,7 @@ gmail_mailbox_sync_job = define_asset_job(
     default_status=DefaultScheduleStatus.RUNNING,
 )
 def gmail_mailbox_sync_every_minute(context):
-    return skip_if_job_active(context, job_name="gmail_mailbox_sync_job")
+    return skip_if_job_in_progress(context, job_name="gmail_mailbox_sync_job")
 
 
 @definitions
