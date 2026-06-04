@@ -175,5 +175,11 @@ func decodeAPIError(status int, body []byte) error {
 	if status == http.StatusUnauthorized {
 		return &APIError{Status: status, Code: "unauthorized", Message: msg}
 	}
+	// Gateway timeouts (Cloudflare 524, plus 504/408) return an HTML body that
+	// is useless to a caller. Replace it with an actionable hint instead.
+	switch status {
+	case 524, http.StatusGatewayTimeout, http.StatusRequestTimeout:
+		return &APIError{Status: status, Code: "timeout", Message: "the query took too long and the gateway timed out; narrow it with selective filters (conversation_id, thread_ts, sender, a tighter time range) or add LIMIT, and avoid full scans such as raw_json::text LIKE '%...%'"}
+	}
 	return &APIError{Status: status, Code: "http_error", Message: msg}
 }

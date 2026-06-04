@@ -146,18 +146,20 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		t.Fatalf("results length = %d, want 1", len(resp.Results))
 	}
 	wantCSV := strings.Join([]string{
-		"# default.clean_gmail_inbox",
+		"-- Reference these tables by their bare name in FROM/JOIN (e.g. FROM gmail_messages). Do not prefix them with the database name (\"default.\").",
+		"",
+		"# clean_gmail_inbox",
 		"",
 		"thread_id,latest_subject",
 		"thread-1,hello inbox",
 		"",
-		"# default.gmail_messages (~1,234,567 rows, estimated)",
+		"# gmail_messages (~1,234,567 rows, estimated)",
 		"",
 		"id,body",
 		"msg-1,abcdefghijklmno",
 		"msg-2,short",
 		"",
-		"# default.slack\"messages (~42 rows, estimated)",
+		"# slack\"messages (~42 rows, estimated)",
 		"",
 		"channel_id",
 		"C123",
@@ -227,7 +229,7 @@ func TestServiceSchemaOverviewSkipsRowCountWhenLookupFails(t *testing.T) {
 	if resp.Results[0].Error != "" {
 		t.Fatalf("SchemaOverview surfaced row-estimate failure as error: %q", resp.Results[0].Error)
 	}
-	if !strings.Contains(resp.Results[0].CSV, "# default.gmail_messages\n") {
+	if !strings.Contains(resp.Results[0].CSV, "# gmail_messages\n") {
 		t.Fatalf("expected unannotated heading when row estimate lookup fails, got %q", resp.Results[0].CSV)
 	}
 }

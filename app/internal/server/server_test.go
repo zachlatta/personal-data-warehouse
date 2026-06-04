@@ -542,16 +542,16 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	if !ok {
 		t.Fatalf("content type = %T", result.Content[0])
 	}
-	if !strings.Contains(text.Text, "# default.clean_gmail_inbox") || !strings.Contains(text.Text, "thread_id,latest_subject\nthread-1,hello inbox") {
+	if !strings.Contains(text.Text, "# clean_gmail_inbox") || !strings.Contains(text.Text, "thread_id,latest_subject\nthread-1,hello inbox") {
 		t.Fatalf("schema overview did not include clean view: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# default.gmail_messages") || !strings.Contains(text.Text, "subject\nhello") {
+	if !strings.Contains(text.Text, "# gmail_messages") || !strings.Contains(text.Text, "subject\nhello") {
 		t.Fatalf("unexpected schema overview text: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# default.apple_notes") || !strings.Contains(text.Text, "note_id,title,modified_at,body_text,body_html,is_deleted") {
+	if !strings.Contains(text.Text, "# apple_notes") || !strings.Contains(text.Text, "note_id,title,modified_at,body_text,body_html,is_deleted") {
 		t.Fatalf("schema overview did not include Apple Notes table: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# default.apple_messages") || !strings.Contains(text.Text, "message_id,message_at,service,handle_id,body_text,is_from_me,is_deleted") {
+	if !strings.Contains(text.Text, "# apple_messages") || !strings.Contains(text.Text, "message_id,message_at,service,handle_id,body_text,is_from_me,is_deleted") {
 		t.Fatalf("schema overview did not include Apple Messages table: %q", text.Text)
 	}
 

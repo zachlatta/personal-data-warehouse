@@ -193,6 +193,29 @@ func TestCallToolBubblesToolError(t *testing.T) {
 	}
 }
 
+func TestCallToolGatewayTimeoutReturnsActionableMessage(t *testing.T) {
+	for _, status := range []int{524, http.StatusGatewayTimeout, http.StatusRequestTimeout} {
+		srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, "<html><body>error code: 524</body></html>")
+		})
+		_, err := newClient(t, srv.URL).CallTool(context.Background(), "sql", json.RawMessage(`{}`))
+		var apiErr *cliclient.APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("status %d: err = %v, want *APIError", status, err)
+		}
+		if apiErr.Code != "timeout" {
+			t.Fatalf("status %d: code = %q, want timeout", status, apiErr.Code)
+		}
+		if strings.Contains(apiErr.Message, "html") {
+			t.Fatalf("status %d: message leaked HTML body: %q", status, apiErr.Message)
+		}
+		if !strings.Contains(apiErr.Message, "timed out") {
+			t.Fatalf("status %d: message = %q", status, apiErr.Message)
+		}
+	}
+}
+
 func TestCallToolFallsBackWhenServerReturnsNonJSONError(t *testing.T) {
 	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

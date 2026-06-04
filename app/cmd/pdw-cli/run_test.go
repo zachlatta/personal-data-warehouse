@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -177,10 +179,10 @@ func TestSQLCommandRequiresQuestionAndSQL(t *testing.T) {
 	})
 	_, errOut, code := runCLI(t, srv.URL, "", "sql", "SELECT 1")
 	if code == 0 {
-		t.Fatalf("expected non-zero exit when only one positional arg is given")
+		t.Fatalf("expected non-zero exit when the question is given but no SQL (no stdin)")
 	}
-	if !strings.Contains(errOut, "English question") {
-		t.Fatalf("stderr should mention required English question: %s", errOut)
+	if !strings.Contains(errOut, "SQL query is required") {
+		t.Fatalf("stderr should mention the missing SQL: %s", errOut)
 	}
 
 	_, errOut, code = runCLI(t, srv.URL, "", "sql", "", "SELECT 1")
@@ -352,11 +354,11 @@ func TestCallPassesDataFlagAsBody(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprintf(w, `{"data":{"echo":%s}}`, `"hi"`)
 	})
-	out, _, code := runCLI(t, srv.URL, "", "call", "query", "--data", `{"sql":"SELECT 1"}`)
+	out, _, code := runCLI(t, srv.URL, "", "call", "get_rows", "--data", `{"sql":"SELECT 1"}`)
 	if code != 0 {
 		t.Fatalf("exit code = %d, out=%s", code, out)
 	}
-	if srv.lastPath != "/api/tools/query" || srv.lastMethod != http.MethodPost {
+	if srv.lastPath != "/api/tools/get_rows" || srv.lastMethod != http.MethodPost {
 		t.Fatalf("server got %s %s", srv.lastMethod, srv.lastPath)
 	}
 	if string(srv.lastBody) != `{"sql":"SELECT 1"}` {
@@ -374,7 +376,7 @@ func TestCallReadsStdinWhenNoDataFlag(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"ok":true}}`)
 	})
-	out, _, code := runCLI(t, srv.URL, `  {"x":1}  `, "call", "query")
+	out, _, code := runCLI(t, srv.URL, `  {"x":1}  `, "call", "get_rows")
 	if code != 0 {
 		t.Fatalf("exit code = %d, out=%s", code, out)
 	}
@@ -387,7 +389,7 @@ func TestCallRejectsInvalidJSONInput(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Fatal("server should not be hit")
 	})
-	_, errOut, code := runCLI(t, srv.URL, "", "call", "query", "--data", `{nope`)
+	_, errOut, code := runCLI(t, srv.URL, "", "call", "get_rows", "--data", `{nope`)
 	if code == 0 {
 		t.Fatalf("expected non-zero exit")
 	}
@@ -412,12 +414,194 @@ func TestCallServerErrorReturnsNonZeroAndStructuredMessage(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = io.WriteString(w, `{"error":{"code":"tool_error","message":"postgres unreachable"}}`)
 	})
-	_, errOut, code := runCLI(t, srv.URL, "", "call", "query", "--data", `{}`)
+	_, errOut, code := runCLI(t, srv.URL, "", "call", "get_rows", "--data", `{}`)
 	if code == 0 {
 		t.Fatalf("expected non-zero exit")
 	}
 	if !strings.Contains(errOut, "tool_error") || !strings.Contains(errOut, "postgres unreachable") {
 		t.Fatalf("stderr missing message: %s", errOut)
+	}
+}
+
+func TestCallRedirectsSQLToolsToSQLCommand(t *testing.T) {
+	for _, name := range []string{"sql", "query"} {
+		srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+			t.Fatalf("server should not be hit for call %s", name)
+		})
+		_, errOut, code := runCLI(t, srv.URL, "", "call", name, "--data", `{"sql":"SELECT 1"}`)
+		if code == 0 {
+			t.Fatalf("call %s should be rejected, not run", name)
+		}
+		if !strings.Contains(errOut, "pdw-cli sql") {
+			t.Fatalf("call %s should redirect to the sql command, got: %s", name, errOut)
+		}
+	}
+}
+
+func TestColumnsCommandUsesSQLTool(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"rows":"column_name,data_type,is_nullable\nid,text,NO"}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "columns", "gmail_messages")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	if srv.lastPath != "/api/tools/sql" || srv.lastMethod != http.MethodPost {
+		t.Fatalf("server got %s %s", srv.lastMethod, srv.lastPath)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if !strings.Contains(input["sql"], "information_schema.columns") || !strings.Contains(input["sql"], "'gmail_messages'") {
+		t.Fatalf("columns SQL = %q", input["sql"])
+	}
+	if !strings.Contains(out, "column_name,data_type,is_nullable") || !strings.Contains(out, "id,text,NO") {
+		t.Fatalf("columns output:\n%s", out)
+	}
+}
+
+func TestColumnsCommandRejectsBadIdentifier(t *testing.T) {
+	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be hit")
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "columns", "gmail; DROP TABLE x")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit for an injection-y table name")
+	}
+	if !strings.Contains(errOut, "bare identifier") {
+		t.Fatalf("stderr = %s", errOut)
+	}
+}
+
+func TestSQLCommandReadsSQLFromStdin(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"rows":"n\n1"}}`)
+	})
+	_, errOut, code := runCLI(t, srv.URL, "SELECT 1 AS n", "sql", "What is one?")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if input["sql"] != "SELECT 1 AS n" || input["question"] != "What is one?" {
+		t.Fatalf("input = %#v", input)
+	}
+}
+
+func TestSQLCommandReadsSQLFromFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "q.sql")
+	if err := os.WriteFile(path, []byte("SELECT 1 AS n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"rows":"n\n1"}}`)
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "--file", path, "What is one?")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if input["sql"] != "SELECT 1 AS n" {
+		t.Fatalf("sql = %q", input["sql"])
+	}
+}
+
+func TestHelpFlagsExitZero(t *testing.T) {
+	for _, arg := range []string{"--help", "-h"} {
+		var outBuf, errBuf bytes.Buffer
+		code := run([]string{arg}, strings.NewReader(""), &outBuf, &errBuf, func(string) string { return "" })
+		if code != 0 {
+			t.Fatalf("%s exit = %d (stderr=%s)", arg, code, errBuf.String())
+		}
+		if !strings.Contains(outBuf.String(), "USAGE") {
+			t.Fatalf("%s did not print usage to stdout:\n%s", arg, outBuf.String())
+		}
+	}
+}
+
+func TestCallHelpFlagExitsZero(t *testing.T) {
+	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be hit")
+	})
+	out, _, code := runCLI(t, srv.URL, "", "call", "--help")
+	if code != 0 {
+		t.Fatalf("call --help exit = %d", code)
+	}
+	if !strings.Contains(out, "USAGE") {
+		t.Fatalf("call --help did not print usage:\n%s", out)
+	}
+}
+
+func TestSubcommandHelpFlagsDoNotRequireConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"list", "--help"},
+		{"describe", "--help"},
+		{"call", "--help"},
+		{"sql", "--help"},
+		{"columns", "--help"},
+		{"schema", "--help"},
+	} {
+		var outBuf, errBuf bytes.Buffer
+		code := run(args, strings.NewReader(""), &outBuf, &errBuf, func(string) string { return "" })
+		if code != 0 {
+			t.Fatalf("%v exit = %d (stderr=%s)", args, code, errBuf.String())
+		}
+		if !strings.Contains(outBuf.String(), "USAGE") {
+			t.Fatalf("%v did not print usage to stdout:\n%s", args, outBuf.String())
+		}
+	}
+}
+
+func TestCallUnknownToolSuggestsClosest(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/tools" {
+			_, _ = io.WriteString(w, `{"data":[{"name":"get_rows","title":"","description":"","input_schema":{}},{"name":"schema_overview","title":"","description":"","input_schema":{}}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":{"code":"tool_not_found","message":"no tool named get_row"}}`)
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "call", "get_row", "--data", `{}`)
+	if code == 0 {
+		t.Fatalf("expected non-zero exit")
+	}
+	if !strings.Contains(errOut, "did you mean") || !strings.Contains(errOut, "get_rows") {
+		t.Fatalf("stderr should suggest the closest tool: %s", errOut)
+	}
+}
+
+func TestCallAcceptsDataAliasFlags(t *testing.T) {
+	for _, flagName := range []string{"--args", "--input", "--json"} {
+		srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"data":{"ok":true}}`)
+		})
+		_, errOut, code := runCLI(t, srv.URL, "", "call", "get_rows", flagName, `{"x":1}`)
+		if code != 0 {
+			t.Fatalf("%s exit = %d, stderr=%s", flagName, code, errOut)
+		}
+		if string(srv.lastBody) != `{"x":1}` {
+			t.Fatalf("%s body = %q", flagName, srv.lastBody)
+		}
+	}
+}
+
+func TestCallKeyValueArgsGivesHelpfulError(t *testing.T) {
+	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be hit")
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "call", "get_rows", "question=hi", "sql=SELECT 1")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit for key=value args")
+	}
+	if !strings.Contains(errOut, "--data") {
+		t.Fatalf("stderr should steer to --data/JSON: %s", errOut)
 	}
 }
 

@@ -665,6 +665,14 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 	rowEstimates := s.tableRowEstimates(ctx)
 
 	var out strings.Builder
+	// Lead with one line that tells callers how to reference these tables in
+	// SQL. The per-table headings below are bare table names; without this
+	// note callers tend to copy the database name into FROM clauses
+	// (e.g. FROM postgres.gmail_messages), which Postgres rejects because
+	// that is database-qualified, not schema-qualified, syntax.
+	out.WriteString("-- Reference these tables by their bare name in FROM/JOIN (e.g. FROM gmail_messages). Do not prefix them with the database name (\"")
+	out.WriteString(database)
+	out.WriteString(".\").\n\n")
 	overviewTrunc := Truncation{MaxRows: schemaSampleRows, MaxFieldChars: schemaSampleFieldChars}
 	sampleResults := s.sampleTables(ctx, tables)
 	for i, table := range tables {
@@ -678,8 +686,6 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 			out.WriteString("\n")
 		}
 		out.WriteString("# ")
-		out.WriteString(database)
-		out.WriteString(".")
 		out.WriteString(table)
 		if estimate, ok := rowEstimates[table]; ok && estimate >= 0 {
 			out.WriteString(" (~")

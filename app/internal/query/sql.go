@@ -74,7 +74,7 @@ func rejectMultipleStatements(sql string) error {
 			}
 		case ';':
 			if !inSingle && !inDouble && !inBacktick && strings.TrimSpace(sql[i+1:]) != "" {
-				return errors.New("multiple SQL statements are not allowed")
+				return errors.New("multiple SQL statements are not allowed; send one statement per call and run the rest as separate queries")
 			}
 		}
 	}

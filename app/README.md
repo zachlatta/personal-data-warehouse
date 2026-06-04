@@ -367,17 +367,26 @@ It also exposes a schema overview MCP tool:
 }
 ```
 
-`schema_overview` returns one text block with a section per table or view:
+`schema_overview` returns one text block: a leading note on how to reference
+the tables, then a section per table or view headed by its bare name (the name
+you use directly in `FROM`/`JOIN`):
 
 ```text
-# database.table_name
+-- Reference these tables by their bare name in FROM/JOIN (e.g. FROM gmail_messages). Do not prefix them with the database name ("postgres.").
+
+# table_name
 
 column1,column2,column3
 sample row 1
 sample row 2
 ```
 
-It uses `current_database()` and `information_schema` against the current Postgres schema, then samples up to three rows per table. Sample cell values are capped at 15 characters to keep the preview compact; truncation metadata is included when a preview value is shortened.
+The heading is the bare table name on purpose: it is what `FROM` expects.
+Earlier versions printed `# database.table_name`, which led callers to write
+`FROM postgres.table_name` — invalid in Postgres, where qualification is
+`schema.table`, not `database.table`. It uses `current_database()` and
+`information_schema` against the current Postgres schema, then samples up to
+three rows per table. Sample cell values are capped at 15 characters to keep the preview compact; truncation metadata is included when a preview value is shortened.
 
 ### `_debug_cache_status`
 
@@ -404,13 +413,21 @@ go build -o /tmp/pdw-cli ./cmd/pdw-cli
 /tmp/pdw-cli list                     # name/title/description table
 /tmp/pdw-cli list --json              # raw JSON tool list
 /tmp/pdw-cli describe sql             # title + description + input JSON Schema
-/tmp/pdw-cli call schema_overview     # zero-input tool
+/tmp/pdw-cli call schema_overview     # zero-input NON-SQL tool
+/tmp/pdw-cli columns gmail_messages   # column names + types for one table
 /tmp/pdw-cli sql 'What is one?' 'SELECT 1'  # defaults to CSV and prints an output-format note
 /tmp/pdw-cli sql --output json 'What time is it?' 'SELECT now()'
 /tmp/pdw-cli sql --output nd-json 'Which recent Gmail messages exist?' 'SELECT * FROM gmail_messages LIMIT 3'
+/tmp/pdw-cli sql --file query.sql 'Find calendar transcripts mentioning Vercel'  # SQL from a file
+/tmp/pdw-cli sql 'Recent Slack messages' < query.sql                             # SQL from stdin
 /tmp/pdw-cli config show              # prints config with the token redacted
 /tmp/pdw-cli logout                   # removes the config file
 ```
+
+Running SQL has exactly one path: the `sql` command. The read-only query tool
+is named `sql` over the CLI/HTTP API and `query` over MCP, so `pdw-cli call sql`
+and `pdw-cli call query` are both rejected with a pointer to `pdw-cli sql`. This
+keeps SQL off the JSON-quoting `call` path. `call` is for non-SQL tools only.
 
 Values resolve in this order: **`--flag` > environment variable > config
 file > default**. Env vars (`PDW_API_URL`, `PDW_SECRET_TOKEN`,
