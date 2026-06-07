@@ -454,6 +454,25 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     assert extension_rows == [("pg_trgm",)]
 
 
+def test_postgres_slack_messages_set_autovacuum_storage_parameters(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_slack_tables()
+
+    rows = warehouse._query(
+        """
+        SELECT unnest(c.reloptions)
+        FROM pg_class AS c
+        INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = current_schema()
+          AND c.relname = 'slack_messages'
+        """
+    )
+    reloptions = {row[0] for row in rows}
+    assert "autovacuum_analyze_scale_factor=0" in reloptions
+    assert "autovacuum_analyze_threshold=50000" in reloptions
+    assert "autovacuum_vacuum_scale_factor=0" in reloptions
+    assert "autovacuum_vacuum_threshold=100000" in reloptions
+
+
 def test_postgres_ensure_indexes_drops_obsolete_indexes(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_slack_tables()
     # Recreate the legacy partial index out-of-band, simulating an existing deployment

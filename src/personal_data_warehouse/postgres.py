@@ -99,6 +99,11 @@ class TableSpec:
     columns: tuple[str, ...]
     primary_key: tuple[str, ...]
     version_column: str = "sync_version"
+    # Per-table storage parameters applied via ALTER TABLE ... SET after creation.
+    # Used to override autovacuum thresholds on large, append-heavy tables whose
+    # default size-proportional triggers would otherwise rarely fire (leaving stale
+    # planner statistics and unreclaimed dead tuples).
+    storage_parameters: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -110,7 +115,14 @@ class IndexSpec:
 
 
 POSTGRES_TABLES: dict[str, TableSpec] = {
-    "gmail_messages": TableSpec(MESSAGE_COLUMNS, ("account", "message_id")),
+    "gmail_messages": TableSpec(
+        MESSAGE_COLUMNS,
+        ("account", "message_id"),
+        storage_parameters=(
+            ("autovacuum_analyze_scale_factor", "0.02"),
+            ("autovacuum_vacuum_scale_factor", "0.05"),
+        ),
+    ),
     "gmail_attachments": TableSpec(ATTACHMENT_COLUMNS, ("account", "message_id", "part_id", "filename")),
     "gmail_sync_state": TableSpec(SYNC_STATE_COLUMNS, ("account",), "updated_at"),
     "gmail_attachment_backfill_state": TableSpec(
@@ -173,7 +185,16 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         SLACK_CONVERSATION_MEMBER_COLUMNS,
         ("account", "team_id", "conversation_id", "user_id"),
     ),
-    "slack_messages": TableSpec(SLACK_MESSAGE_COLUMNS, ("account", "team_id", "conversation_id", "message_ts")),
+    "slack_messages": TableSpec(
+        SLACK_MESSAGE_COLUMNS,
+        ("account", "team_id", "conversation_id", "message_ts"),
+        storage_parameters=(
+            ("autovacuum_analyze_scale_factor", "0"),
+            ("autovacuum_analyze_threshold", "50000"),
+            ("autovacuum_vacuum_scale_factor", "0"),
+            ("autovacuum_vacuum_threshold", "100000"),
+        ),
+    ),
     "slack_conversation_stats": TableSpec(
         SLACK_CONVERSATION_STATS_COLUMNS,
         ("account", "team_id", "conversation_id"),
@@ -182,6 +203,12 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "slack_message_reactions": TableSpec(
         SLACK_REACTION_COLUMNS,
         ("account", "team_id", "conversation_id", "message_ts", "reaction_name", "user_id"),
+        storage_parameters=(
+            ("autovacuum_analyze_scale_factor", "0"),
+            ("autovacuum_analyze_threshold", "20000"),
+            ("autovacuum_vacuum_scale_factor", "0"),
+            ("autovacuum_vacuum_threshold", "50000"),
+        ),
     ),
     "slack_files": TableSpec(
         SLACK_FILE_COLUMNS,
@@ -2735,6 +2762,9 @@ class PostgresWarehouse:
             )
             """
         )
+        if spec.storage_parameters:
+            settings = ", ".join(f"{key} = {value}" for key, value in spec.storage_parameters)
+            self._command(f"ALTER TABLE {_identifier(table)} SET ({settings})")
 
     def _ensure_indexes(self, tables: Sequence[str]) -> None:
         table_names = set(tables)
