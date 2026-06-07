@@ -176,6 +176,8 @@ class FakeAttachmentBackfillWarehouse:
         ai_provider: str = "",
         ai_model: str = "",
         ai_prompt_version: str = "",
+        include_storage_pending: bool = False,
+        storage_max_bytes: int = 0,
     ):
         self.candidate_requests.append(
             {
@@ -184,6 +186,8 @@ class FakeAttachmentBackfillWarehouse:
                 "ai_provider": ai_provider,
                 "ai_model": ai_model,
                 "ai_prompt_version": ai_prompt_version,
+                "include_storage_pending": include_storage_pending,
+                "storage_max_bytes": storage_max_bytes,
             }
         )
         return self.messages[:limit]
@@ -2234,12 +2238,59 @@ def test_runner_backfills_attachment_candidates_and_marks_state(monkeypatch) -> 
     assert warehouse.candidate_requests[0]["ai_provider"] == "ollama"
     assert warehouse.candidate_requests[0]["ai_model"] == "qwen3-vl:2b"
     assert warehouse.candidate_requests[0]["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
+    assert warehouse.candidate_requests[0]["include_storage_pending"] is False
     assert warehouse.state_rows[0]["message_id"] == "gmail-id"
     assert warehouse.state_rows[0]["status"] == "ok"
     assert warehouse.state_rows[0]["attachment_rows_written"] == 1
     assert warehouse.state_rows[0]["ai_provider"] == "ollama"
     assert warehouse.state_rows[0]["ai_model"] == "qwen3-vl:2b"
     assert warehouse.state_rows[0]["ai_prompt_version"] == ATTACHMENT_AI_PROMPT_VERSION
+
+
+def test_runner_backfill_stores_blobs_for_storage_pending_candidates(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE", "10")
+    message = {
+        "id": "gmail-id",
+        "threadId": "thread-id",
+        "historyId": "42",
+        "internalDate": "1713875400000",
+        "payload": {
+            "parts": [
+                {
+                    "partId": "2",
+                    "filename": "notes.txt",
+                    "mimeType": "text/plain",
+                    "body": {"data": _gmail_data(b"backfill text"), "size": 13},
+                }
+            ]
+        },
+    }
+    # Already synced/enriched on a prior run, so this message is only a candidate
+    # because its blob was never stored to Drive (e.g. processed before Drive
+    # storage shipped). force_reprocess must still re-store the blob.
+    warehouse = FakeAttachmentBackfillWarehouse(
+        [message],
+        existing_keys={("gmail-id", "2", "notes.txt")},
+    )
+    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    runner = GmailSyncRunner(settings=settings, warehouse=warehouse, logger=FakeLogger())
+    object_store = FakeObjectStore()
+
+    candidates, rows_written, _text_chars, stored = runner._backfill_attachment_candidates(
+        account=settings.gmail_accounts[0],
+        service=FakeGmailAttachmentService({}),
+        object_store=object_store,
+    )
+
+    assert candidates == 1
+    assert rows_written == 1
+    assert stored == 1
+    assert len(object_store.put_calls) == 1
+    assert warehouse.attachment_rows[0]["storage_status"] == "stored"
+    request = warehouse.candidate_requests[0]
+    assert request["include_storage_pending"] is True
+    assert request["storage_max_bytes"] == settings.gmail_attachment_max_bytes
 
 
 def test_runner_marks_false_positive_attachment_candidates_as_processed(monkeypatch) -> None:

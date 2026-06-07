@@ -638,6 +638,8 @@ class GmailSyncRunner:
             ai_provider=ai_provider,
             ai_model=ai_model,
             ai_prompt_version=ai_prompt_version,
+            include_storage_pending=object_store is not None,
+            storage_max_bytes=self._settings.gmail_attachment_max_bytes,
         )
         if not messages:
             return (0, 0, 0, 0)

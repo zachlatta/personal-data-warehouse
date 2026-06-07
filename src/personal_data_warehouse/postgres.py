@@ -2814,17 +2814,13 @@ class PostgresWarehouse:
         ai_provider: str = "",
         ai_model: str = "",
         ai_prompt_version: str = "",
+        include_storage_pending: bool = False,
+        storage_max_bytes: int = 0,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
-        rows = self._query(
-            f"""
-            SELECT payload_json
-            FROM gmail_messages
-            WHERE account = %s
-              AND is_deleted = 0
-              AND {_postgres_gmail_attachment_candidate_clause()}
-              AND NOT EXISTS (
+        ai_pending_clause = """
+              NOT EXISTS (
                   SELECT 1
                   FROM gmail_attachment_backfill_state state
                   WHERE state.account = gmail_messages.account
@@ -2833,11 +2829,35 @@ class PostgresWarehouse:
                     AND state.ai_provider = %s
                     AND state.ai_model = %s
                     AND state.ai_prompt_version = %s
-              )
+              )"""
+        params: list[Any] = [account, ai_provider, ai_model, ai_prompt_version]
+        pending_clause = ai_pending_clause
+        if include_storage_pending and storage_max_bytes > 0:
+            pending_clause = f"""({ai_pending_clause}
+              OR EXISTS (
+                  SELECT 1
+                  FROM gmail_attachments pending
+                  WHERE pending.account = gmail_messages.account
+                    AND pending.message_id = gmail_messages.message_id
+                    AND pending.is_deleted = 0
+                    AND pending.size > 0
+                    AND pending.size <= %s
+                    AND pending.storage_status <> 'stored'
+              ))"""
+            params.append(int(storage_max_bytes))
+        params.append(int(limit))
+        rows = self._query(
+            f"""
+            SELECT payload_json
+            FROM gmail_messages
+            WHERE account = %s
+              AND is_deleted = 0
+              AND {_postgres_gmail_attachment_candidate_clause()}
+              AND {pending_clause}
             ORDER BY internal_date DESC, message_id DESC
             LIMIT %s
             """,
-            (account, ai_provider, ai_model, ai_prompt_version, int(limit)),
+            tuple(params),
         )
         messages: list[dict[str, Any]] = []
         for (payload_json,) in rows:

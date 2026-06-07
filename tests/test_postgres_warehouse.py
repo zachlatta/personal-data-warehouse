@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json
 import os
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from dotenv import load_dotenv
@@ -23,6 +24,8 @@ from personal_data_warehouse.clickhouse import (
 )
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
+    ATTACHMENT_BACKFILL_STATE_COLUMNS,
+    ATTACHMENT_COLUMNS,
     FLOAT_COLUMNS,
     INTEGER_COLUMNS,
     POSTGRES_TABLES,
@@ -208,6 +211,112 @@ def test_postgres_message_upsert_keeps_highest_sync_version(warehouse: PostgresW
     rows = warehouse._query("SELECT subject, sync_version FROM gmail_messages WHERE message_id = %s", ("m1",))
 
     assert rows == [("new", 20)]
+
+
+def _gmail_attachment_payload(*, message_id: str) -> str:
+    return json.dumps(
+        {
+            "id": message_id,
+            "payload": {
+                "parts": [
+                    {
+                        "partId": "1",
+                        "filename": "report.pdf",
+                        "mimeType": "application/pdf",
+                        "body": {"attachmentId": f"att-{message_id}", "size": 1024},
+                    }
+                ]
+            },
+        }
+    )
+
+
+def test_postgres_backfill_candidates_include_storage_pending(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_tables()
+    account = "zach@example.test"
+    provider, model, version = "ollama", "qwen3-vl:2b", "gmail-attachment-ai-v20"
+    now = datetime(2026, 5, 1, tzinfo=UTC)
+
+    def insert_message(message_id: str) -> None:
+        row = _message_row(message_id=message_id, subject="s", labels=["INBOX"], sync_version=1)
+        row["payload_json"] = _gmail_attachment_payload(message_id=message_id)
+        warehouse.insert_messages([row])
+
+    def mark_enriched(message_id: str) -> None:
+        warehouse.insert_attachment_backfill_state(
+            [
+                _default_row(
+                    ATTACHMENT_BACKFILL_STATE_COLUMNS,
+                    account=account,
+                    message_id=message_id,
+                    status="ok",
+                    ai_provider=provider,
+                    ai_model=model,
+                    ai_prompt_version=version,
+                    updated_at=now,
+                    sync_version=1,
+                )
+            ]
+        )
+
+    def insert_attachment(message_id: str, *, size: int, storage_status: str) -> None:
+        warehouse.insert_attachments(
+            [
+                _default_row(
+                    ATTACHMENT_COLUMNS,
+                    account=account,
+                    message_id=message_id,
+                    part_id="1",
+                    filename="report.pdf",
+                    attachment_id=f"att-{message_id}",
+                    size=size,
+                    storage_status=storage_status,
+                    is_deleted=0,
+                    synced_at=now,
+                    sync_version=1,
+                )
+            ]
+        )
+
+    storage_max_bytes = 25 * 1024
+
+    # Enriched before Drive storage shipped: blob never stored -> must be reclaimed.
+    insert_message("m_pending")
+    mark_enriched("m_pending")
+    insert_attachment("m_pending", size=1024, storage_status="")
+    # Enriched and already stored -> must NOT be reselected (avoids re-upload loop).
+    insert_message("m_stored")
+    mark_enriched("m_stored")
+    insert_attachment("m_stored", size=1024, storage_status="stored")
+    # Enriched, unstored, but larger than max bytes -> never storable, must NOT loop forever.
+    insert_message("m_toolarge")
+    mark_enriched("m_toolarge")
+    insert_attachment("m_toolarge", size=10 * 1024 * 1024, storage_status="")
+    # Brand-new message, not yet enriched -> normal AI candidate either way.
+    insert_message("m_new")
+
+    without_storage = warehouse.load_attachment_backfill_candidate_messages(
+        account=account,
+        limit=10,
+        ai_provider=provider,
+        ai_model=model,
+        ai_prompt_version=version,
+    )
+    # Reproduces the stall: enriched-but-unstored history is invisible to the AI-only gate.
+    assert {message["id"] for message in without_storage} == {"m_new"}
+
+    with_storage = warehouse.load_attachment_backfill_candidate_messages(
+        account=account,
+        limit=10,
+        ai_provider=provider,
+        ai_model=model,
+        ai_prompt_version=version,
+        include_storage_pending=True,
+        storage_max_bytes=storage_max_bytes,
+    )
+    # Storage-pending history is reclaimed without dropping normal AI candidates,
+    # and already-stored / too-large attachments stay excluded.
+    assert {message["id"] for message in with_storage} == {"m_new", "m_pending"}
 
 
 def test_postgres_insert_normalizes_nul_text_values() -> None:
