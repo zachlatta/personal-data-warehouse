@@ -663,6 +663,7 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 	s.logger.InfoContext(ctx, "schema overview tables listed", "tables", len(tables))
 
 	rowEstimates := s.tableRowEstimates(ctx)
+	indexes := s.tableIndexes(ctx)
 
 	var out strings.Builder
 	// Lead with one line that tells callers how to reference these tables in
@@ -674,6 +675,7 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 	out.WriteString(database)
 	out.WriteString(".\").\n")
 	out.WriteString("-- Each column header below is annotated with its Postgres type in parentheses, e.g. is_deleted (bigint), to_addresses (text[]).\n")
+	out.WriteString("-- Each table lists its indexes. A gin (col gin_trgm_ops) index makes ILIKE and ~/~* substring search fast on that one column: match the column directly, e.g. body_text ILIKE '%x%' OR subject ILIKE '%x%'. Wrapping columns in lower(a || b || ...) or casting (to_addresses::text) bypasses every index and forces a full table scan, so search each indexed column separately and keep un-indexed expressions out of the same OR.\n")
 	out.WriteString(fmt.Sprintf("-- Sample values below are previews truncated to %d characters; query a table directly for full values.\n\n", schemaSampleFieldChars))
 	sampleResults := s.sampleTables(ctx, tables)
 	for i, table := range tables {
@@ -693,7 +695,16 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 			out.WriteString(formatRowCount(estimate))
 			out.WriteString(" rows, estimated)")
 		}
-		out.WriteString("\n\n")
+		out.WriteString("\n")
+		if lines := indexes[table]; len(lines) > 0 {
+			out.WriteString("# indexes:\n")
+			for _, line := range lines {
+				out.WriteString("#   ")
+				out.WriteString(line)
+				out.WriteString("\n")
+			}
+		}
+		out.WriteString("\n")
 		out.WriteString(sample.CSV)
 		out.WriteString("\n")
 	}
@@ -749,6 +760,46 @@ func (s *Service) tableRowEstimates(ctx context.Context) map[string]int64 {
 		}
 	}
 	s.logger.DebugContext(ctx, "schema overview row estimates loaded", "tables", len(out), "duration", time.Since(started))
+	return out
+}
+
+// tableIndexes returns a map of table name → rendered index lines, one per
+// index, e.g. "btree (account, message_id) [primary key]" or
+// "gin (body_text gin_trgm_ops)". Like tableRowEstimates this is a single O(1)
+// catalog lookup, so the schema overview stays self-maintaining: whatever
+// indexes exist in Postgres are exactly what callers see, including which
+// columns carry a gin_trgm_ops (trigram) index usable for ILIKE/~ substring
+// search. The def is taken straight from pg_get_indexdef with the leading
+// "CREATE ... USING " boilerplate stripped, so partial-index WHERE clauses and
+// operator classes survive verbatim and nothing has to be hand-maintained.
+func (s *Service) tableIndexes(ctx context.Context) map[string][]string {
+	const sql = "SELECT t.relname AS name, " +
+		"regexp_replace(pg_get_indexdef(ix.indexrelid), '^.* USING ', '') AS def, " +
+		"CASE WHEN ix.indisprimary THEN ' [primary key]' WHEN ix.indisunique THEN ' [unique]' ELSE '' END AS flag " +
+		"FROM pg_index ix " +
+		"JOIN pg_class i ON i.oid = ix.indexrelid " +
+		"JOIN pg_class t ON t.oid = ix.indrelid " +
+		"JOIN pg_namespace n ON n.oid = t.relnamespace " +
+		"WHERE n.nspname = current_schema() " +
+		"AND t.relkind IN ('r', 'p', 'm') " +
+		"ORDER BY t.relname, ix.indisprimary DESC, def"
+	started := time.Now()
+	result, err := s.runner.Query(ctx, sql, 0)
+	if err != nil {
+		s.logger.WarnContext(ctx, "schema overview index lookup failed", "sql", sql, "error", err, "duration", time.Since(started))
+		return nil
+	}
+	out := make(map[string][]string, len(result.Rows))
+	for _, row := range result.Rows {
+		name, _ := row["name"].(string)
+		def, _ := row["def"].(string)
+		flag, _ := row["flag"].(string)
+		if name == "" || def == "" {
+			continue
+		}
+		out[name] = append(out[name], def+flag)
+	}
+	s.logger.DebugContext(ctx, "schema overview indexes loaded", "tables", len(out), "duration", time.Since(started))
 	return out
 }
 

@@ -69,6 +69,7 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	describeCleanGmailSQL := describeColumnsSQL("clean_gmail_inbox")
 	describeGmailSQL := describeColumnsSQL("gmail_messages")
 	describeSlackSQL := describeColumnsSQL("slack\"messages")
+	indexSQL := "SELECT t.relname AS name, regexp_replace(pg_get_indexdef(ix.indexrelid), '^.* USING ', '') AS def, CASE WHEN ix.indisprimary THEN ' [primary key]' WHEN ix.indisunique THEN ' [unique]' ELSE '' END AS flag FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_class t ON t.oid = ix.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = current_schema() AND t.relkind IN ('r', 'p', 'm') ORDER BY t.relname, ix.indisprimary DESC, def"
 	runner := &recordingRunner{results: map[string]RawResult{
 		"SELECT current_database() AS database": {
 			Columns: []string{"database"},
@@ -87,6 +88,15 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 			Rows: []map[string]any{
 				{"name": "gmail_messages", "row_estimate": int64(1234567)},
 				{"name": "slack\"messages", "row_estimate": int64(42)},
+			},
+		},
+		indexSQL: {
+			Columns: []string{"name", "def", "flag"},
+			Rows: []map[string]any{
+				{"name": "gmail_messages", "def": "btree (account, message_id)", "flag": " [primary key]"},
+				{"name": "gmail_messages", "def": "gin (body_text gin_trgm_ops)", "flag": ""},
+				{"name": "slack\"messages", "def": "btree (account, team_id, conversation_id, message_ts)", "flag": " [primary key]"},
+				{"name": "slack\"messages", "def": "gin (text gin_trgm_ops)", "flag": ""},
 			},
 		},
 		describeCleanGmailSQL: {
@@ -134,9 +144,10 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		"SELECT current_database() AS database",
 		showTablesSQL,
 		rowEstimateSQL,
+		indexSQL,
 	}
-	if strings.Join(runner.queries[:3], "\n") != strings.Join(wantQueries, "\n") {
-		t.Fatalf("first queries = %#v, want %#v", runner.queries[:3], wantQueries)
+	if strings.Join(runner.queries[:4], "\n") != strings.Join(wantQueries, "\n") {
+		t.Fatalf("first queries = %#v, want %#v", runner.queries[:4], wantQueries)
 	}
 	wantSampleQueries := []string{
 		describeCleanGmailSQL,
@@ -146,7 +157,7 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		describeSlackSQL,
 		"SELECT substring(\"channel_id\"::text from 1 for 15) AS \"channel_id\", char_length(\"channel_id\"::text) AS \"__pdw_preview_len_0\" FROM \"slack\"\"messages\" LIMIT 3",
 	}
-	gotSampleQueries := append([]string(nil), runner.queries[3:]...)
+	gotSampleQueries := append([]string(nil), runner.queries[4:]...)
 	slices.Sort(gotSampleQueries)
 	slices.Sort(wantSampleQueries)
 	if strings.Join(gotSampleQueries, "\n") != strings.Join(wantSampleQueries, "\n") {
@@ -158,6 +169,7 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	wantCSV := strings.Join([]string{
 		"-- Reference these tables by their bare name in FROM/JOIN (e.g. FROM gmail_messages). Do not prefix them with the database name (\"default.\").",
 		"-- Each column header below is annotated with its Postgres type in parentheses, e.g. is_deleted (bigint), to_addresses (text[]).",
+		"-- Each table lists its indexes. A gin (col gin_trgm_ops) index makes ILIKE and ~/~* substring search fast on that one column: match the column directly, e.g. body_text ILIKE '%x%' OR subject ILIKE '%x%'. Wrapping columns in lower(a || b || ...) or casting (to_addresses::text) bypasses every index and forces a full table scan, so search each indexed column separately and keep un-indexed expressions out of the same OR.",
 		"-- Sample values below are previews truncated to 15 characters; query a table directly for full values.",
 		"",
 		"# clean_gmail_inbox",
@@ -166,12 +178,18 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		"thread-1,hello inbox",
 		"",
 		"# gmail_messages (~1,234,567 rows, estimated)",
+		"# indexes:",
+		"#   btree (account, message_id) [primary key]",
+		"#   gin (body_text gin_trgm_ops)",
 		"",
 		"id (String),body (String)",
 		"msg-1,abcdefghijklmno",
 		"msg-2,short",
 		"",
 		"# slack\"messages (~42 rows, estimated)",
+		"# indexes:",
+		"#   btree (account, team_id, conversation_id, message_ts) [primary key]",
+		"#   gin (text gin_trgm_ops)",
 		"",
 		"channel_id (String)",
 		"C123",
