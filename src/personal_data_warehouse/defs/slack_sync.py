@@ -185,7 +185,11 @@ def run_slack_thread_backfill_sync(*, settings, warehouse, logger) -> list[Slack
         skip_completed_threads=True,
         skip_known_errors=True,
         thread_order=os.getenv("SLACK_ASSET_THREAD_BACKFILL_ORDER", "oldest"),
-        thread_limit=_int_env("SLACK_ASSET_THREAD_BACKFILL_LIMIT", 5),
+        # Drain the historical backlog of parents whose replies were never fetched.
+        # At 5/run this would take years; 100/run lets each pass use its full
+        # rate-limit budget (it aborts gracefully when the budget is hit, so this is
+        # an upper bound, not a guarantee of 100 replies per run).
+        thread_limit=_int_env("SLACK_ASSET_THREAD_BACKFILL_LIMIT", 100),
         thread_missing_replies_only=True,
         max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
     ).sync_all()
