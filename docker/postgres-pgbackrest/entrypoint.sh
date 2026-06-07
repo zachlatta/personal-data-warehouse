@@ -126,11 +126,22 @@ start_backup_loop() {
     return
   fi
 
-  if [ "$(id -u)" = "0" ]; then
-    gosu postgres pdw-pgbackrest-backup-loop &
-  else
-    pdw-pgbackrest-backup-loop &
-  fi
+  # Supervise the loop: if it ever exits (it should not), restart it rather
+  # than leaving Postgres serving with backups silently stopped. The loop
+  # itself is written to survive transient failures, so a restart here is a
+  # last-resort backstop, not the normal recovery path.
+  local restart_delay="${PDW_PGBACKREST_BACKUP_LOOP_RESTART_SECONDS:-60}"
+  (
+    while true; do
+      if [ "$(id -u)" = "0" ]; then
+        gosu postgres pdw-pgbackrest-backup-loop || true
+      else
+        pdw-pgbackrest-backup-loop || true
+      fi
+      log "backup loop exited unexpectedly; restarting in ${restart_delay}s"
+      sleep "$restart_delay"
+    done
+  ) &
   log "started pgBackRest backup loop"
 }
 

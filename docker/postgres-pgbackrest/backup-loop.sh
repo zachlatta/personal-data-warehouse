@@ -137,9 +137,19 @@ mark_backup_type_done() {
 }
 
 main() {
-  wait_for_postgres
-  ensure_stanza
-  run_check
+  if ! wait_for_postgres; then
+    log "Postgres never became ready; backup loop exiting"
+    exit 1
+  fi
+
+  # Startup repo preparation is best-effort. A transient repository problem
+  # (e.g. the S3 endpoint briefly unreachable, as during a slowking restart)
+  # must never kill the loop the way an unguarded failure under `set -e` would
+  # -- otherwise backups stop silently until the container is recreated, while
+  # Postgres keeps serving. Log and continue; the periodic loop below
+  # re-asserts repo health every cycle and retries on its own.
+  ensure_stanza || log "stanza preparation failed at startup; will retry each cycle"
+  run_check || log "pgBackRest check failed at startup; will retry each cycle"
 
   if bool_enabled "${PDW_PGBACKREST_BACKUP_ON_STARTUP:-true}" && ! has_backup; then
     if run_backup full; then
@@ -151,6 +161,10 @@ main() {
   local type
   while true; do
     sleep "$interval"
+    # Re-assert repo health each cycle, but never let a transient failure here
+    # abort the loop -- fall through to the (guarded) backup attempt regardless.
+    ensure_stanza || log "stanza preparation failed; continuing to backup attempt"
+    run_check || log "pgBackRest check failed; continuing to backup attempt"
     type="$(backup_type_for_now)"
     if run_backup "$type"; then
       mark_backup_type_done "$type"
