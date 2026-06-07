@@ -3,8 +3,6 @@ name = "personal_data_warehouse"
 requires-python = ">=3.10,<3.15"
 version = "0.1.0"
 dependencies = [
-    "clickhouse-connect>=0.8.18",
-    "clickhouse-driver>=0.2.10",
     "dagster==1.12.22",
     "dagster-postgres>=0.28.22",
     "google-api-python-client>=2.169.0",
@@ -29,7 +27,6 @@ personal-data-warehouse-voice-memos-upload = "personal_data_warehouse_voice_memo
 personal-data-warehouse-apple-notes-upload = "personal_data_warehouse_apple_notes.cli:main"
 personal-data-warehouse-apple-messages-upload = "personal_data_warehouse_apple_messages.cli:main"
 personal-data-warehouse-agent-auth = "personal_data_warehouse.agent_runner:auth_main"
-personal-data-warehouse-postgres-migration = "personal_data_warehouse.postgres_migration:main"
 
 [dependency-groups]
 dev = [

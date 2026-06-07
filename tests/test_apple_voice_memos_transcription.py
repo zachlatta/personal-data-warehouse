@@ -126,7 +126,7 @@ class FakeTranscriptionClient:
 def test_load_settings_reads_assemblyai_config(monkeypatch) -> None:
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_assemblyai=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_assemblyai=True)
 
     assert settings.assemblyai is not None
     assert settings.assemblyai.api_key == "test-key"
@@ -140,7 +140,7 @@ def test_load_settings_reads_assemblyai_speaker_options(monkeypatch) -> None:
     monkeypatch.setenv("ASSEMBLYAI_MIN_SPEAKERS_EXPECTED", "2")
     monkeypatch.setenv("ASSEMBLYAI_MAX_SPEAKERS_EXPECTED", "6")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_assemblyai=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_assemblyai=True)
 
     assert settings.assemblyai is not None
     assert settings.assemblyai.min_speakers_expected == 2

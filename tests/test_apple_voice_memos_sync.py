@@ -93,7 +93,7 @@ def test_load_settings_adds_drive_scope_when_voice_memos_uses_google_drive(monke
     monkeypatch.setenv("VOICE_MEMOS_ACCOUNT", "zach@example.com")
     monkeypatch.setenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID", "folder-id")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_voice_memos=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_voice_memos=True)
 
     assert settings.voice_memos is not None
     assert settings.voice_memos.account == "zach@example.com"
@@ -194,7 +194,7 @@ def test_mac_runner_defers_short_zero_local_duration_voice_memos(tmp_path) -> No
     assert object_store.file_uploads == []
 
 
-def test_mac_runner_uploads_audio_files_and_metadata_without_clickhouse(tmp_path) -> None:
+def test_mac_runner_uploads_audio_files_and_metadata(tmp_path) -> None:
     existing = tmp_path / "20260427 100004-40DC0200.m4a"
     fresh = tmp_path / "20260325 145019-DAAC9394.qta"
     existing.write_bytes(b"already-synced")

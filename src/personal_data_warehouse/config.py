@@ -204,7 +204,6 @@ class AgentConfig:
 
 @dataclass(frozen=True)
 class Settings:
-    clickhouse_url: str | None
     gmail_accounts: tuple[GmailAccount, ...]
     gmail_oauth_client_secrets_json: str | None
     gmail_scopes: tuple[str, ...]
@@ -312,13 +311,9 @@ class Settings:
         return None
 
 
-_UNSET = object()
-
-
 def load_settings(
     *,
-    require_clickhouse: bool | object = _UNSET,
-    require_postgres: bool | None = None,
+    require_postgres: bool = True,
     require_gmail: bool = True,
     require_gmail_client_secrets: bool = False,
     require_gmail_mutations: bool = False,
@@ -335,14 +330,6 @@ def load_settings(
 ) -> Settings:
     load_dotenv()
 
-    explicit_require_clickhouse = require_clickhouse is not _UNSET
-    require_clickhouse_bool = bool(require_clickhouse) if explicit_require_clickhouse else False
-    if require_postgres is None:
-        require_postgres = not explicit_require_clickhouse
-
-    clickhouse_url = os.getenv("CLICKHOUSE_URL")
-    if require_clickhouse_bool and not clickhouse_url:
-        raise ValueError("CLICKHOUSE_URL must be set")
     postgres_database_url = normalize_postgres_url(os.getenv("POSTGRES_DATABASE_URL"))
     if require_postgres and not postgres_database_url:
         raise ValueError("POSTGRES_DATABASE_URL must be set")
@@ -845,7 +832,6 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
 
     return Settings(
-        clickhouse_url=clickhouse_url,
         gmail_accounts=gmail_accounts,
         gmail_oauth_client_secrets_json=client_secrets_json,
         google_scopes=tuple(dict.fromkeys(google_scopes)),

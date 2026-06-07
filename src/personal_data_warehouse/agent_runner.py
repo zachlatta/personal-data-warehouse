@@ -259,21 +259,6 @@ class ContainerAgentRunner:
         ) as tool_env:
             return self.run(request.with_extra_env(tool_env))
 
-    def run_with_clickhouse(
-        self,
-        request: AgentRunRequest,
-        *,
-        warehouse,
-        max_rows: int = 50,
-        max_field_chars: int = 3000,
-    ) -> AgentRunResult:
-        return self.run_with_warehouse(
-            request,
-            warehouse=warehouse,
-            max_rows=max_rows,
-            max_field_chars=max_field_chars,
-        )
-
     def _ensure_managed_image(self) -> None:
         if self._config.image != default_agent_docker_image():
             return
@@ -511,10 +496,6 @@ def extract_tool_name(payload: Mapping[str, Any]) -> str:
         if "pdw-postgres-query" in command or "PDW_POSTGRES_QUERY" in command:
             return "pdw-postgres-query"
         if "pdw-postgres-schema" in command or "PDW_POSTGRES_SCHEMA" in command:
-            return "pdw-postgres-schema"
-        if "pdw-clickhouse-query" in command or "PDW_CLICKHOUSE_QUERY" in command:
-            return "pdw-postgres-query"
-        if "pdw-clickhouse-schema" in command or "PDW_CLICKHOUSE_SCHEMA" in command:
             return "pdw-postgres-schema"
         if "pdw-validate-json" in command or "PDW_VALIDATE_JSON" in command:
             return "pdw-validate-json"

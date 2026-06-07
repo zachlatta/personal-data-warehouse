@@ -57,7 +57,7 @@ def main() -> None:
         return
 
     settings = load_settings(
-        require_clickhouse=False,
+        require_postgres=False,
         require_gmail=False,
         require_voice_memos=True,
     )

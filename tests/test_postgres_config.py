@@ -16,43 +16,28 @@ def test_normalize_postgres_url_accepts_coolify_postgres_scheme() -> None:
 
 def test_load_settings_reads_postgres_database_url(monkeypatch) -> None:
     monkeypatch.setattr(config, "load_dotenv", lambda: None)
-    monkeypatch.delenv("CLICKHOUSE_URL", raising=False)
     monkeypatch.setenv("POSTGRES_DATABASE_URL", "postgres://user:pass@example.test/db")
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.test")
 
     settings = load_settings()
 
     assert settings.postgres_database_url == "postgresql://user:pass@example.test/db"
-    assert settings.clickhouse_url is None
 
 
 def test_load_settings_requires_postgres_url_for_runtime(monkeypatch) -> None:
     monkeypatch.setattr(config, "load_dotenv", lambda: None)
     monkeypatch.delenv("POSTGRES_DATABASE_URL", raising=False)
-    monkeypatch.delenv("CLICKHOUSE_URL", raising=False)
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.test")
 
     with pytest.raises(ValueError, match="POSTGRES_DATABASE_URL"):
         load_settings()
 
 
-def test_load_settings_can_still_require_clickhouse_for_migration(monkeypatch) -> None:
-    monkeypatch.setattr(config, "load_dotenv", lambda: None)
-    monkeypatch.delenv("CLICKHOUSE_URL", raising=False)
-    monkeypatch.setenv("POSTGRES_DATABASE_URL", "postgresql://user:pass@example.test/db")
-    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.test")
-
-    with pytest.raises(ValueError, match="CLICKHOUSE_URL"):
-        load_settings(require_clickhouse=True, require_postgres=True)
-
-
 def test_load_settings_skips_warehouse_url_when_explicitly_disabled(monkeypatch) -> None:
     monkeypatch.setattr(config, "load_dotenv", lambda: None)
     monkeypatch.delenv("POSTGRES_DATABASE_URL", raising=False)
-    monkeypatch.delenv("CLICKHOUSE_URL", raising=False)
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.test")
 
-    settings = load_settings(require_clickhouse=False)
+    settings = load_settings(require_postgres=False)
 
     assert settings.postgres_database_url is None
-    assert settings.clickhouse_url is None

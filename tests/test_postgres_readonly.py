@@ -7,7 +7,7 @@ def normalize_sql(sql: str) -> str:
     return " ".join(sql.split())
 
 
-def test_postgres_readonly_sql_rejects_clickhouse_describe() -> None:
+def test_postgres_readonly_sql_rejects_describe() -> None:
     validate_postgres_readonly_sql("SELECT * FROM gmail_messages LIMIT 1")
     validate_postgres_readonly_sql("WITH x AS (SELECT 1) SELECT * FROM x")
     validate_postgres_readonly_sql("SHOW search_path")

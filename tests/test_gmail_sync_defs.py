@@ -15,7 +15,7 @@ def _settings(monkeypatch, **env):
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, value)
-    return load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    return load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
 
 def test_factory_is_none_when_storage_disabled(monkeypatch) -> None:

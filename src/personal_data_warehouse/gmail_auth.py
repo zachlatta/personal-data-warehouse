@@ -27,7 +27,7 @@ def run_oauth_flow(
     include_calendar_write: bool = False,
 ) -> dict[str, str]:
     settings = load_settings(
-        require_clickhouse=False,
+        require_postgres=False,
         require_gmail=False,
         require_gmail_client_secrets=True,
     )
@@ -99,7 +99,7 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = load_settings(
-        require_clickhouse=False,
+        require_postgres=False,
         require_gmail=False,
         require_gmail_client_secrets=True,
     )

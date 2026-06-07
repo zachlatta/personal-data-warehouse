@@ -105,21 +105,6 @@ class AgentResource(ConfigurableResource):
             max_field_chars=max_field_chars,
         )
 
-    def run_with_clickhouse(
-        self,
-        request: AgentRunRequest,
-        *,
-        warehouse,
-        max_rows: int = 50,
-        max_field_chars: int = 3000,
-    ) -> AgentRunResult:
-        return self.run_with_warehouse(
-            request,
-            warehouse=warehouse,
-            max_rows=max_rows,
-            max_field_chars=max_field_chars,
-        )
-
     def _effective_request(self, request: AgentRunRequest) -> AgentRunRequest:
         self._raise_if_unconfigured()
         if request.provider is not None and request.model is not None:

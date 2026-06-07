@@ -18,10 +18,10 @@ def test_load_settings_requires_gmail_accounts_for_mutation_paths(monkeypatch) -
     monkeypatch.setenv("GMAIL_ACCOUNTS", "")
 
     with pytest.raises(ValueError, match="GMAIL_ACCOUNTS"):
-        load_settings(require_clickhouse=False, require_gmail=False, require_gmail_mutations=True)
+        load_settings(require_postgres=False, require_gmail=False, require_gmail_mutations=True)
 
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.test")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_gmail_mutations=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_gmail_mutations=True)
 
     assert settings.gmail_mutation_scopes == (GMAIL_MODIFY_SCOPE,)
     assert settings.gmail_compose_scopes == (GMAIL_COMPOSE_SCOPE,)
@@ -35,10 +35,10 @@ def test_load_settings_requires_contact_accounts_for_contact_mutation_paths(monk
     monkeypatch.setenv("CONTACT_GOOGLE_ACCOUNTS", "")
 
     with pytest.raises(ValueError, match="CONTACT_GOOGLE_ACCOUNTS"):
-        load_settings(require_clickhouse=False, require_gmail=False, require_contact_mutations=True)
+        load_settings(require_postgres=False, require_gmail=False, require_contact_mutations=True)
 
     monkeypatch.setenv("CONTACT_GOOGLE_ACCOUNTS", "zach@example.test")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_contact_mutations=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_contact_mutations=True)
 
     assert settings.contact_mutation_scopes == (CONTACTS_SCOPE,)
     assert CONTACTS_SCOPE not in settings.contact_scopes

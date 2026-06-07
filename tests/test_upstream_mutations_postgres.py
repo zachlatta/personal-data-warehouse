@@ -8,7 +8,7 @@ import uuid
 import pytest
 from dotenv import load_dotenv
 
-from personal_data_warehouse.clickhouse import CALENDAR_EVENT_COLUMNS, CONTACT_CARD_COLUMNS, MESSAGE_COLUMNS
+from personal_data_warehouse.schema import CALENDAR_EVENT_COLUMNS, CONTACT_CARD_COLUMNS, MESSAGE_COLUMNS
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
     FLOAT_COLUMNS,

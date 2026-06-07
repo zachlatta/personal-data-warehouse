@@ -137,7 +137,7 @@ def test_load_settings_contacts_config_and_scope(monkeypatch) -> None:
     monkeypatch.setenv("CONTACT_GOOGLE_ACCOUNTS", "work@example.com,personal@example.com")
     monkeypatch.setenv("CONTACT_PAGE_SIZE", "500")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_contacts=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_contacts=True)
 
     assert [account.email_address for account in settings.contact_google_accounts] == [
         "work@example.com",
@@ -206,7 +206,7 @@ def test_iter_google_contact_pages_requests_contacts_source_and_sync_token() -> 
 
 def test_runner_full_sync_writes_cards_tombstones_and_state(monkeypatch) -> None:
     monkeypatch.setenv("CONTACT_GOOGLE_ACCOUNTS", "account@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_contacts=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_contacts=True)
     service = FakeContactsService([{"connections": [google_person("people/c1")], "nextSyncToken": "next"}])
     warehouse = FakeContactsWarehouse()
     warehouse.missing_tombstone_count = 1
@@ -232,7 +232,7 @@ def test_runner_full_sync_writes_cards_tombstones_and_state(monkeypatch) -> None
 
 def test_runner_incremental_sync_uses_existing_sync_token(monkeypatch) -> None:
     monkeypatch.setenv("CONTACT_GOOGLE_ACCOUNTS", "account@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_contacts=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_contacts=True)
     state = {
         (SOURCE, "account@example.com", SOURCE_KIND, ADDRESS_BOOK_ID): {
             "sync_token": "old-token",
@@ -260,7 +260,7 @@ def test_runner_incremental_sync_uses_existing_sync_token(monkeypatch) -> None:
 
 def test_runner_expired_sync_token_falls_back_to_full(monkeypatch) -> None:
     monkeypatch.setenv("CONTACT_GOOGLE_ACCOUNTS", "account@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_contacts=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_contacts=True)
     state = {
         (SOURCE, "account@example.com", SOURCE_KIND, ADDRESS_BOOK_ID): {
             "sync_token": "old-token",
@@ -291,7 +291,7 @@ def test_runner_expired_sync_token_falls_back_to_full(monkeypatch) -> None:
 
 def test_runner_failure_preserves_previous_state_without_tombstoning(monkeypatch) -> None:
     monkeypatch.setenv("CONTACT_GOOGLE_ACCOUNTS", "account@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_contacts=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_contacts=True)
     state = {
         (SOURCE, "account@example.com", SOURCE_KIND, ADDRESS_BOOK_ID): {
             "sync_token": "old-token",
@@ -319,7 +319,7 @@ def test_runner_failure_preserves_previous_state_without_tombstoning(monkeypatch
 
 def test_runner_failure_after_page_does_not_write_partial_cards(monkeypatch) -> None:
     monkeypatch.setenv("CONTACT_GOOGLE_ACCOUNTS", "account@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_contacts=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_contacts=True)
     service = FakeContactsService(
         [{"connections": [google_person("people/c1")], "nextPageToken": "page-2"}],
         errors=[HttpError(Response({"status": "403"}), b"denied")],
@@ -353,7 +353,7 @@ def test_contact_rows_are_json_serializable_for_asset_metadata() -> None:
 
 def test_public_contacts_sync_summary_does_not_expose_sync_token(monkeypatch) -> None:
     monkeypatch.setenv("CONTACT_GOOGLE_ACCOUNTS", "account@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_contacts=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_contacts=True)
     service = FakeContactsService([{"connections": [], "nextSyncToken": "sync-token-value"}])
     warehouse = FakeContactsWarehouse()
 

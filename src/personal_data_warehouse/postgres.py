@@ -12,7 +12,7 @@ import uuid
 import psycopg2
 from psycopg2.extras import Json, execute_values
 
-from personal_data_warehouse.clickhouse import (
+from personal_data_warehouse.schema import (
     AGENT_RUN_COLUMNS,
     AGENT_RUN_EVENT_COLUMNS,
     AGENT_RUN_TOOL_CALL_COLUMNS,

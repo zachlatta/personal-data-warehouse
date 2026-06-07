@@ -75,7 +75,6 @@ def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
 
     monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
     settings = Settings(
-        clickhouse_url=None,
         gmail_accounts=(),
         gmail_oauth_client_secrets_json=None,
         gmail_scopes=(),
@@ -136,7 +135,6 @@ def test_slack_freshness_sync_piggybacks_read_state(monkeypatch) -> None:
 
     monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
     settings = Settings(
-        clickhouse_url=None,
         gmail_accounts=(),
         gmail_oauth_client_secrets_json=None,
         gmail_scopes=(),
@@ -187,7 +185,6 @@ def test_slack_coverage_sync_runs_current_stage(monkeypatch) -> None:
 
     monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
     settings = Settings(
-        clickhouse_url=None,
         gmail_accounts=(),
         gmail_oauth_client_secrets_json=None,
         gmail_scopes=(),
@@ -249,7 +246,6 @@ def test_slack_metadata_sync_refreshes_one_conversation_type(monkeypatch) -> Non
 
     monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
     settings = Settings(
-        clickhouse_url=None,
         gmail_accounts=(),
         gmail_oauth_client_secrets_json=None,
         gmail_scopes=(),
@@ -302,7 +298,6 @@ def test_slack_user_sync_refreshes_all_users_without_messages(monkeypatch) -> No
 
     monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
     settings = Settings(
-        clickhouse_url=None,
         gmail_accounts=(),
         gmail_oauth_client_secrets_json=None,
         gmail_scopes=(),
@@ -356,7 +351,6 @@ def test_slack_thread_sync_backfills_known_threads_conservatively(monkeypatch) -
 
     monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
     settings = Settings(
-        clickhouse_url=None,
         gmail_accounts=(),
         gmail_oauth_client_secrets_json=None,
         gmail_scopes=(),
@@ -413,7 +407,6 @@ def test_slack_member_sync_refreshes_private_members_conservatively(monkeypatch)
 
     monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
     settings = Settings(
-        clickhouse_url=None,
         gmail_accounts=(),
         gmail_oauth_client_secrets_json=None,
         gmail_scopes=(),
@@ -469,7 +462,6 @@ def test_slack_read_state_sync_refreshes_recent_conversation_info(monkeypatch) -
 
     monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
     settings = Settings(
-        clickhouse_url=None,
         gmail_accounts=(),
         gmail_oauth_client_secrets_json=None,
         gmail_scopes=(),
@@ -522,7 +514,6 @@ def test_slack_intelligent_sync_keeps_legacy_combined_behavior(monkeypatch) -> N
 
     monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
     settings = Settings(
-        clickhouse_url=None,
         gmail_accounts=(),
         gmail_oauth_client_secrets_json=None,
         gmail_scopes=(),

@@ -256,7 +256,7 @@ def test_load_settings_accepts_oauth_client_secrets_json_env(monkeypatch) -> Non
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
     monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRETS_JSON", '{"installed":{}}')
 
-    settings = load_settings(require_clickhouse=False)
+    settings = load_settings(require_postgres=False)
 
     assert settings.gmail_oauth_client_secrets_json == '{"installed":{}}'
 
@@ -271,7 +271,7 @@ def test_load_settings_accepts_domain_specific_oauth_client_secrets(monkeypatch)
     monkeypatch.setenv("GMAIL_DOMAIN_HACKCLUB_COM_OAUTH_CLIENT_SECRETS_JSON_B64", encoded_hackclub_secrets)
     monkeypatch.setenv("GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64", encoded_zachlatta_secrets)
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=True)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=True)
 
     assert (
         settings.google_oauth_client_secrets_json_for_email("zach@zachlatta.com")
@@ -303,7 +303,7 @@ def test_load_settings_does_not_use_global_oauth_client_for_multiple_domains(mon
     ):
         monkeypatch.setenv(name, "")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=True)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=True)
 
     assert settings.google_oauth_client_secrets_json_for_email("zach@zachlatta.com") is None
 
@@ -313,7 +313,7 @@ def test_load_settings_can_skip_oauth_client_secrets_for_sync_runtime(monkeypatc
     monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRETS_JSON", "")
     monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRETS_JSON_B64", "")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     assert settings.gmail_accounts[0].email_address == "zach@hackclub.com"
     assert settings.gmail_oauth_client_secrets_json is None
@@ -325,7 +325,7 @@ def test_load_settings_accepts_gmail_attachment_limits(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ATTACHMENT_TEXT_MAX_CHARS", "2048")
     monkeypatch.setenv("GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE", "25")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     assert settings.gmail_attachment_max_bytes == 1024
     assert settings.gmail_attachment_text_max_chars == 2048
@@ -338,7 +338,7 @@ def test_load_settings_disables_attachment_storage_without_folder(monkeypatch) -
     monkeypatch.delenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID", raising=False)
     monkeypatch.delenv("VOICE_MEMOS_DRIVE_FOLDER_ID", raising=False)
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     assert settings.gmail_attachment_storage_backend == "google_drive"
     assert settings.gmail_attachment_google_drive_folder_id == ""
@@ -350,7 +350,7 @@ def test_load_settings_enables_attachment_storage_with_folder(monkeypatch) -> No
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
     monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "folder-123")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     assert settings.gmail_attachment_storage_enabled is True
     assert settings.gmail_attachment_google_drive_folder_id == "folder-123"
@@ -362,7 +362,7 @@ def test_load_settings_rejects_unknown_attachment_storage_backend(monkeypatch) -
     monkeypatch.setenv("GMAIL_ATTACHMENT_STORAGE_BACKEND", "s3")
 
     try:
-        load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+        load_settings(require_postgres=False, require_gmail_client_secrets=False)
     except ValueError as exc:
         assert "GMAIL_ATTACHMENT_STORAGE_BACKEND" in str(exc)
     else:
@@ -374,7 +374,7 @@ def test_load_settings_attachment_storage_can_be_disabled(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ATTACHMENT_STORAGE_BACKEND", "none")
     monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "folder-123")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     assert settings.gmail_attachment_storage_enabled is False
     assert GOOGLE_DRIVE_SCOPE not in settings.google_scopes
@@ -385,7 +385,7 @@ def test_load_settings_normalizes_attachment_storage_backend(monkeypatch) -> Non
     monkeypatch.setenv("GMAIL_ATTACHMENT_STORAGE_BACKEND", "GOOGLE_DRIVE")
     monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "folder-123")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     assert settings.gmail_attachment_storage_backend == "google_drive"
     assert settings.gmail_attachment_storage_enabled is True
@@ -396,7 +396,7 @@ def test_load_settings_reads_attachment_storage_drive_account(monkeypatch) -> No
     monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "folder-123")
     monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_ACCOUNT", "Zach@ZachLatta.com")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     assert settings.gmail_attachment_google_drive_account == "zach@zachlatta.com"
 
@@ -408,7 +408,7 @@ def test_load_settings_shares_voice_memos_object_store_by_default(monkeypatch) -
     monkeypatch.setenv("VOICE_MEMOS_ACCOUNT", "zach@zachlatta.com")
     monkeypatch.setenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID", "shared-folder-id")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     # Gmail attachments land in the same Drive store as voice memos by default.
     assert settings.gmail_attachment_google_drive_folder_id == "shared-folder-id"
@@ -421,7 +421,7 @@ def test_load_settings_attachment_folder_overrides_shared_store(monkeypatch) -> 
     monkeypatch.setenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID", "shared-folder-id")
     monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "gmail-only-folder")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     assert settings.gmail_attachment_google_drive_folder_id == "gmail-only-folder"
 
@@ -429,7 +429,7 @@ def test_load_settings_attachment_folder_overrides_shared_store(monkeypatch) -> 
 def test_load_settings_enables_gmail_attachment_ai_fallback_by_default(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     assert settings.gmail_attachment_ai_fallback_enabled is True
     assert settings.gmail_attachment_ai_fallback_base_url == "http://127.0.0.1:11435"
@@ -447,7 +447,7 @@ def test_load_settings_accepts_gmail_attachment_ai_fallback(monkeypatch) -> None
     monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_PDF_MAX_PAGES", "2")
     monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_PULL_MODEL", "false")
 
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
     assert settings.gmail_attachment_ai_fallback_enabled is True
     assert settings.gmail_attachment_ai_fallback_base_url == "http://rotom.local:11435"
@@ -483,7 +483,7 @@ def test_ollama_resource_from_env_reads_only_ai_connection_settings(monkeypatch)
 def test_prepare_attachment_ai_fallback_returns_ready_config(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
     monkeypatch.setenv("GMAIL_ATTACHMENT_AI_FALLBACK_MODEL", "gemma4:e2b")
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
     ollama = FakeOllamaResource("{}")
 
     config = prepare_attachment_ai_fallback(settings=settings, ollama=ollama, logger=FakeLogger())
@@ -495,7 +495,7 @@ def test_prepare_attachment_ai_fallback_returns_ready_config(monkeypatch) -> Non
 
 def test_prepare_attachment_ai_fallback_disables_run_when_model_setup_fails(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
     ollama = FakeOllamaResource("{}")
     ollama.ensure_model_error = RuntimeError("down")
 
@@ -506,7 +506,7 @@ def test_prepare_attachment_ai_fallback_disables_run_when_model_setup_fails(monk
 
 def test_google_auth_update_env_file_replaces_and_appends_values(tmp_path) -> None:
     env_path = tmp_path / ".env"
-    env_path.write_text("CLICKHOUSE_URL=clickhouse://example\nGMAIL_ZACH_EXAMPLE_COM_TOKEN_JSON_B64=old\n")
+    env_path.write_text("POSTGRES_DATABASE_URL=postgresql://example\nGMAIL_ZACH_EXAMPLE_COM_TOKEN_JSON_B64=old\n")
 
     update_env_file(
         env_path,
@@ -517,7 +517,7 @@ def test_google_auth_update_env_file_replaces_and_appends_values(tmp_path) -> No
     )
 
     assert env_path.read_text().splitlines() == [
-        "CLICKHOUSE_URL=clickhouse://example",
+        "POSTGRES_DATABASE_URL=postgresql://example",
         "GMAIL_ZACH_EXAMPLE_COM_TOKEN_JSON_B64=new",
         "",
         "GOOGLE_ZACH_EXAMPLE_COM_TOKEN_JSON_B64=new",
@@ -2221,7 +2221,7 @@ def test_runner_backfills_attachment_candidates_and_marks_state(monkeypatch) -> 
         [message],
         existing_keys={("gmail-id", "2", "notes.txt")},
     )
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
     runner = GmailSyncRunner(settings=settings, warehouse=warehouse, logger=FakeLogger())
 
     candidates, rows_written, text_chars, stored = runner._backfill_attachment_candidates(
@@ -2273,7 +2273,7 @@ def test_runner_backfill_stores_blobs_for_storage_pending_candidates(monkeypatch
         [message],
         existing_keys={("gmail-id", "2", "notes.txt")},
     )
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
     runner = GmailSyncRunner(settings=settings, warehouse=warehouse, logger=FakeLogger())
     object_store = FakeObjectStore()
 
@@ -2304,7 +2304,7 @@ def test_runner_marks_false_positive_attachment_candidates_as_processed(monkeypa
         "payload": {"mimeType": "text/plain", "body": {"data": _gmail_data(b"plain body")}},
     }
     warehouse = FakeAttachmentBackfillWarehouse([message])
-    settings = load_settings(require_clickhouse=False, require_gmail_client_secrets=False)
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
     runner = GmailSyncRunner(settings=settings, warehouse=warehouse, logger=FakeLogger())
 
     candidates, rows_written, text_chars, stored = runner._backfill_attachment_candidates(

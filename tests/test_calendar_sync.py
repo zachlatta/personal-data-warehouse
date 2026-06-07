@@ -15,7 +15,6 @@ from personal_data_warehouse.calendar_sync import (
     iter_event_pages,
     parse_calendar_event_time,
 )
-from personal_data_warehouse.clickhouse import CALENDAR_EVENT_COLUMNS, CALENDAR_SYNC_STATE_COLUMNS, ClickHouseWarehouse
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs.calendar_sync import calendar_event_sync_every_minute
 from personal_data_warehouse.google_auth import google_token_json_from_env
@@ -94,7 +93,7 @@ class FakeCalendarWarehouse:
 def test_load_settings_defaults_calendar_accounts_to_gmail_accounts(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_calendar=True)
 
     assert settings.calendar_accounts[0].email_address == "zach@example.com"
     assert settings.calendar_accounts[0].calendar_ids == ("primary",)
@@ -123,7 +122,7 @@ def test_load_settings_accepts_calendar_specific_accounts_and_ids(monkeypatch) -
     monkeypatch.setenv("CALENDAR_EXPANDED_SYNC_LOOKAHEAD_DAYS", "60")
     monkeypatch.setenv("CALENDAR_EXPANDED_SYNC_INTERVAL_MINUTES", "120")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_calendar=True)
 
     assert settings.calendar_accounts[0].email_address == "zach@example.com"
     assert settings.calendar_accounts[0].calendar_ids == ("primary", "team@example.com")
@@ -227,7 +226,7 @@ def test_iter_expanded_event_pages_requests_single_events_window() -> None:
 
 def test_runner_full_sync_writes_events_and_state(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_calendar=True)
     service = FakeCalendarService(
         [
             {"items": [{"id": "event-1", "summary": "Sync"}], "nextSyncToken": "next"},
@@ -257,7 +256,7 @@ def test_runner_full_sync_writes_events_and_state(monkeypatch) -> None:
 
 def test_runner_incremental_sync_uses_sync_token_and_counts_cancelled(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_calendar=True)
     service = FakeCalendarService(
         [
             {"items": [{"id": "event-1", "status": "cancelled"}], "nextSyncToken": "new-token"},
@@ -292,7 +291,7 @@ def test_runner_incremental_sync_uses_sync_token_and_counts_cancelled(monkeypatc
 
 def test_runner_falls_back_to_full_sync_when_sync_token_is_stale(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_calendar=True)
     stale_token_error = HttpError(Response({"status": "410"}), b"sync token expired")
     service = FakeCalendarService(
         responses=[
@@ -326,7 +325,7 @@ def test_runner_falls_back_to_full_sync_when_sync_token_is_stale(monkeypatch) ->
 
 def test_runner_expanded_sync_writes_recurring_instances_and_deletes_stale(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_calendar=True)
     service = FakeCalendarService(
         [
             {"items": [], "nextSyncToken": "new-token"},
@@ -379,7 +378,7 @@ def test_runner_expanded_sync_writes_recurring_instances_and_deletes_stale(monke
 
 def test_runner_skips_expanded_sync_when_recent(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_calendar=True)
     service = FakeCalendarService(
         [
             {"items": [{"id": "event-1", "status": "confirmed"}], "nextSyncToken": "new-token"},
@@ -412,7 +411,7 @@ def test_runner_skips_expanded_sync_when_recent(monkeypatch) -> None:
 
 def test_runner_forces_expanded_sync_on_recurring_change(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_calendar=True)
     service = FakeCalendarService(
         [
             {
@@ -464,7 +463,7 @@ def test_runner_forces_expanded_sync_on_recurring_change(monkeypatch) -> None:
 
 def test_runner_forces_expanded_sync_on_cancelled_event(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_calendar=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_calendar=True)
     service = FakeCalendarService(
         [
             {
@@ -500,190 +499,3 @@ def test_runner_forces_expanded_sync_on_cancelled_event(monkeypatch) -> None:
 
 def test_calendar_api_datetime_normalizes_utc() -> None:
     assert calendar_api_datetime(datetime(2026, 4, 2, 9)) == "2026-04-02T09:00:00Z"
-
-
-def test_clickhouse_insert_calendar_events_batches_by_event_month() -> None:
-    warehouse = object.__new__(ClickHouseWarehouse)
-    inserted_batches = []
-
-    def fake_insert_rows(table, rows, columns):
-        inserted_batches.append((table, rows, columns))
-
-    warehouse._insert_rows = fake_insert_rows
-
-    warehouse.insert_calendar_events(
-        [
-            {"start_at": datetime(2026, 4, 1, tzinfo=UTC)},
-            {"start_at": datetime(2026, 5, 1, tzinfo=UTC)},
-            {"start_at": datetime(2026, 4, 2, tzinfo=UTC)},
-        ]
-    )
-
-    assert [len(batch[1]) for batch in inserted_batches] == [2, 1]
-    assert all(batch[0] == "calendar_events" for batch in inserted_batches)
-
-
-def test_clickhouse_ensure_calendar_tables_migrates_expanded_sync_state_columns() -> None:
-    warehouse = object.__new__(ClickHouseWarehouse)
-    commands = []
-
-    def fake_command(sql):
-        commands.append(sql)
-
-    warehouse._command = fake_command
-    warehouse._drop_obsolete_views = lambda: None
-
-    warehouse.ensure_calendar_tables()
-
-    joined = "\n".join(commands)
-    assert "expanded_synced_at DateTime64(3, 'UTC')" in joined
-    assert "expanded_window_start DateTime64(3, 'UTC')" in joined
-    assert "expanded_window_end DateTime64(3, 'UTC')" in joined
-    assert "ALTER TABLE calendar_sync_state ADD COLUMN IF NOT EXISTS expanded_synced_at" in joined
-    assert "ALTER TABLE calendar_sync_state ADD COLUMN IF NOT EXISTS expanded_window_start" in joined
-    assert "ALTER TABLE calendar_sync_state ADD COLUMN IF NOT EXISTS expanded_window_end" in joined
-
-
-def test_clickhouse_sync_state_round_trips_expanded_sync_state() -> None:
-    warehouse = object.__new__(ClickHouseWarehouse)
-    inserted = []
-    expanded_synced_at = datetime(2026, 4, 29, 13, tzinfo=UTC)
-    expanded_window_start = datetime(2025, 4, 29, 13, tzinfo=UTC)
-    expanded_window_end = datetime(2027, 4, 29, 13, tzinfo=UTC)
-    updated_at = datetime(2026, 4, 29, 13, 1, tzinfo=UTC)
-
-    def fake_insert(table, rows, columns):
-        inserted.append((table, rows, columns))
-
-    warehouse._insert = fake_insert
-
-    warehouse.insert_calendar_sync_state(
-        account="zach@example.com",
-        calendar_id="primary",
-        sync_token="sync-token",
-        last_sync_type="partial",
-        status="ok",
-        error="",
-        expanded_synced_at=expanded_synced_at,
-        expanded_window_start=expanded_window_start,
-        expanded_window_end=expanded_window_end,
-        updated_at=updated_at,
-    )
-
-    assert inserted[0][0] == "calendar_sync_state"
-    assert inserted[0][2] == CALENDAR_SYNC_STATE_COLUMNS
-    assert inserted[0][1][0] == (
-        "zach@example.com",
-        "primary",
-        "sync-token",
-        "partial",
-        "ok",
-        "",
-        expanded_synced_at,
-        expanded_window_start,
-        expanded_window_end,
-        updated_at,
-        int(updated_at.timestamp() * 1_000_000),
-    )
-
-    def fake_query(sql):
-        return [
-            (
-                "zach@example.com",
-                "primary",
-                "sync-token",
-                "partial",
-                "ok",
-                "",
-                expanded_synced_at,
-                expanded_window_start,
-                expanded_window_end,
-                updated_at,
-            )
-        ]
-
-    warehouse._query = fake_query
-
-    state = warehouse.load_calendar_sync_state()
-
-    assert state[("zach@example.com", "primary")]["expanded_synced_at"] == expanded_synced_at
-    assert state[("zach@example.com", "primary")]["expanded_window_start"] == expanded_window_start
-    assert state[("zach@example.com", "primary")]["expanded_window_end"] == expanded_window_end
-
-
-def test_clickhouse_mark_calendar_events_deleted_writes_tombstones() -> None:
-    warehouse = object.__new__(ClickHouseWarehouse)
-    existing_row = {
-        "account": "zach@example.com",
-        "calendar_id": "primary",
-        "event_id": "event-1",
-        "recurring_event_id": "series-1",
-        "i_cal_uid": "uid-1",
-        "status": "confirmed",
-        "is_deleted": 0,
-        "summary": "Recurring meeting",
-        "description": "",
-        "location": "",
-        "creator_email": "",
-        "organizer_email": "",
-        "start_at": datetime(2026, 4, 1, tzinfo=UTC),
-        "end_at": datetime(2026, 4, 1, 1, tzinfo=UTC),
-        "start_date": "",
-        "end_date": "",
-        "is_all_day": 0,
-        "html_link": "",
-        "attendees_json": "[]",
-        "reminders_json": "{}",
-        "recurrence": [],
-        "event_type": "",
-        "raw_json": "{}",
-        "updated_at": datetime(2026, 3, 1, tzinfo=UTC),
-        "synced_at": datetime(2026, 3, 1, tzinfo=UTC),
-        "sync_version": 1,
-    }
-    inserted_rows = []
-
-    def fake_query(sql):
-        return [tuple(existing_row[column] for column in CALENDAR_EVENT_COLUMNS)]
-
-    def fake_insert_calendar_events(rows):
-        inserted_rows.extend(rows)
-
-    warehouse._query = fake_query
-    warehouse.insert_calendar_events = fake_insert_calendar_events
-    synced_at = datetime(2026, 4, 29, tzinfo=UTC)
-
-    count = warehouse.mark_calendar_events_deleted(
-        account="zach@example.com",
-        calendar_id="primary",
-        event_ids=["event-1"],
-        synced_at=synced_at,
-    )
-
-    assert count == 1
-    assert inserted_rows[0]["event_id"] == "event-1"
-    assert inserted_rows[0]["status"] == "cancelled"
-    assert inserted_rows[0]["is_deleted"] == 1
-    assert inserted_rows[0]["synced_at"] == synced_at
-    assert inserted_rows[0]["sync_version"] == int(synced_at.timestamp() * 1_000_000)
-
-
-def test_clickhouse_retries_disconnect_before_retry(monkeypatch) -> None:
-    warehouse = object.__new__(ClickHouseWarehouse)
-    calls = []
-    monkeypatch.setattr("personal_data_warehouse.clickhouse.time.sleep", lambda seconds: calls.append(f"sleep:{seconds}"))
-
-    class FakeClient:
-        def disconnect(self):
-            calls.append("disconnect")
-
-    warehouse._client = FakeClient()
-
-    def flaky_operation():
-        calls.append("operation")
-        if calls.count("operation") == 1:
-            raise TimeoutError("stale connection")
-        return "ok"
-
-    assert warehouse._with_clickhouse_retries(flaky_operation) == "ok"
-    assert calls == ["operation", "disconnect", "sleep:5", "operation"]

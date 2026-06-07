@@ -39,8 +39,9 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 import warnings
 import zlib
 
-from personal_data_warehouse.clickhouse import ClickHouseWarehouse, SyncState
 from personal_data_warehouse.config import GmailAccount, Settings, env_slug
+from personal_data_warehouse.postgres import PostgresWarehouse
+from personal_data_warehouse.schema import SyncState
 from personal_data_warehouse.google_auth import google_token_json_from_env, load_google_credentials
 from personal_data_warehouse_voice_memos.storage import ObjectStore, StoredObject
 
@@ -268,7 +269,7 @@ class GmailSyncRunner:
         self,
         *,
         settings: Settings,
-        warehouse: ClickHouseWarehouse,
+        warehouse: PostgresWarehouse,
         logger,
         attachment_ai_client: AttachmentVisionClient | None = None,
         attachment_ai_fallback: AttachmentAiFallbackConfig | None | object = ATTACHMENT_AI_FALLBACK_UNSET,

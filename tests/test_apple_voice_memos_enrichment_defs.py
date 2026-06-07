@@ -184,7 +184,6 @@ def test_apple_voice_memos_enrichment_backlog_sensor_launches_when_backlog_exist
 
 
 class FakeSettings:
-    clickhouse_url = "clickhouse://example"
     postgres_database_url = "postgresql://example"
     agent = type(
         "FakeAgentConfig",

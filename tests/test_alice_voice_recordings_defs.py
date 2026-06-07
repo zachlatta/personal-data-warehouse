@@ -81,7 +81,6 @@ class FakeConfig:
 
 
 class FakeSettings:
-    clickhouse_url = "clickhouse://example"
     postgres_database_url = "postgresql://example"
     gmail_accounts = ()
     alice_voice_recordings = FakeConfig()

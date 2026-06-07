@@ -1083,25 +1083,11 @@ def count_warehouse_cli_calls(events: Sequence[Any]) -> int:
     count = 0
     for event in events:
         text = str(getattr(event, "text", ""))
-        if (
-            "PDW_POSTGRES_QUERY" in text
-            or "pdw-postgres-query" in text
-            or "PDW_CLICKHOUSE_QUERY" in text
-            or "pdw-clickhouse-query" in text
-        ):
+        if "PDW_POSTGRES_QUERY" in text or "pdw-postgres-query" in text:
             count += 1
-        if (
-            "PDW_POSTGRES_SCHEMA" in text
-            or "pdw-postgres-schema" in text
-            or "PDW_CLICKHOUSE_SCHEMA" in text
-            or "pdw-clickhouse-schema" in text
-        ):
+        if "PDW_POSTGRES_SCHEMA" in text or "pdw-postgres-schema" in text:
             count += 1
     return count
-
-
-def count_clickhouse_cli_calls(events: Sequence[Any]) -> int:
-    return count_warehouse_cli_calls(events)
 
 
 def enrichment_user_prompt(*, input_file: str = AGENT_USER_PROMPT_INPUT_FILE) -> str:

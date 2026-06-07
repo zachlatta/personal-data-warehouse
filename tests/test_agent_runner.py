@@ -55,7 +55,6 @@ def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> N
     assert "--read-only" in command
     assert "OPENAI_API_KEY" not in " ".join(command)
     assert "ANTHROPIC_API_KEY" not in " ".join(command)
-    assert "CLICKHOUSE_URL" not in " ".join(command)
     assert "POSTGRES_DATABASE_URL" not in " ".join(command)
     assert "type=volume,src=pdw-agent-auth,dst=/agent-auth" in command
     assert "type=volume,src=pdw-agent-runs,dst=/agent-runs" in command
@@ -157,7 +156,6 @@ def test_container_agent_runner_can_inject_postgres_proxy_without_raw_url(tmp_pa
     assert "PDW_AGENT_TOOL_PROXY_URL=http://127.0.0.1:" in joined
     assert "PDW_AGENT_TOOL_PROXY_TOKEN=" in joined
     assert "PDW_POSTGRES_QUERY=" in joined
-    assert "CLICKHOUSE_URL" not in joined
     assert "POSTGRES_DATABASE_URL" not in joined
 
 
@@ -583,7 +581,7 @@ def test_load_settings_reads_agent_config_without_api_keys(monkeypatch) -> None:
     monkeypatch.setenv("AGENT_MODEL", "claude-test")
     monkeypatch.setenv("AGENT_TOOL_PROXY_PUBLIC_HOST", "dagster")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_agent=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_agent=True)
 
     assert settings.agent is not None
     assert settings.agent.provider == "claude"
@@ -594,7 +592,7 @@ def test_load_settings_reads_agent_config_without_api_keys(monkeypatch) -> None:
 
 
 def test_load_settings_derives_agent_image_when_required(monkeypatch) -> None:
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_agent=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_agent=True)
 
     assert settings.agent is not None
     assert settings.agent.docker_image.startswith("personal-data-warehouse-agent:")
@@ -605,7 +603,7 @@ def test_load_settings_uses_container_hostname_for_non_bridge_agent_network(monk
     monkeypatch.setenv("AGENT_DOCKER_NETWORK", "coolify")
     monkeypatch.setattr("personal_data_warehouse.agent_runner.socket.gethostname", lambda: "dagster-container")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_agent=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_agent=True)
 
     assert settings.agent is not None
     assert settings.agent.docker_network == "coolify"

@@ -209,7 +209,7 @@ def agent_resource_from_settings(settings) -> AgentResource:
 
 @definitions
 def defs() -> Definitions:
-    settings = load_settings(require_gmail=False)
+    settings = load_settings(require_postgres=False, require_gmail=False)
     resources = {"agent": UNCONFIGURED_AGENT_RESOURCE}
     if settings.agent is not None:
         resources["agent"] = agent_resource_from_settings(settings)

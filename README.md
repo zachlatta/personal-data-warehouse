@@ -916,23 +916,6 @@ or `ai_truncated`, alongside the provider, model, base URL, exact prompt, prompt
 prompt version, source extraction status, elapsed time, and processing timestamp.
 Attachments that cannot be extracted still get metadata rows with `text_extraction_status`.
 
-## Postgres Migration
-
-Runtime code uses `POSTGRES_DATABASE_URL`. ClickHouse is still supported as a read-only migration
-source so historical deployments can be moved over without preserving duplicate physical row
-versions.
-
-To migrate and verify ClickHouse `FINAL` state into Postgres:
-
-```bash
-CLICKHOUSE_URL=... POSTGRES_DATABASE_URL=... \
-uv run personal-data-warehouse-postgres-migration migrate-and-verify
-```
-
-For a dry run, point `--schema` at a temporary Postgres schema first. Verification compares row
-counts and canonical row hashes table-by-table. Leave ClickHouse read-only for rollback/archive
-until the migrated Postgres warehouse has been running cleanly.
-
 ## Verification
 
 Run tests:

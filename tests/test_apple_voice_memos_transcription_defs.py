@@ -82,7 +82,6 @@ def test_apple_voice_memos_transcription_backlog_sensor_launches_when_backlog_ex
 
 
 class FakeSettings:
-    clickhouse_url = "clickhouse://example"
     postgres_database_url = "postgresql://example"
 
 

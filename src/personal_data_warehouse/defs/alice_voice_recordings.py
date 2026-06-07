@@ -35,7 +35,7 @@ ALICE_VOICE_RECORDINGS_IMPORT_POSTGRES_LOCK_ID = 7_403_111_840
 )
 def alice_voice_recordings_import(context) -> MaterializeResult:
     settings = load_settings(
-        require_clickhouse=False,
+        require_postgres=False,
         require_gmail=False,
         require_alice_voice_recordings=True,
     )

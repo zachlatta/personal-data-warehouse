@@ -91,7 +91,7 @@ def test_load_settings_adds_drive_scope_when_apple_messages_uses_google_drive(mo
     monkeypatch.setenv("APPLE_MESSAGES_ACCOUNT", "zach@example.com")
     monkeypatch.setenv("APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID", "folder-id")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_apple_messages=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_apple_messages=True)
 
     assert settings.apple_messages is not None
     assert settings.apple_messages.account == "zach@example.com"

@@ -306,7 +306,7 @@ def test_slack_config_uses_account_slug_for_token(monkeypatch):
     monkeypatch.setenv("SLACK_LOOKBACK_DAYS", "3")
     monkeypatch.setenv("SLACK_THREAD_AUDIT_DAYS", "9")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
 
     assert len(settings.slack_accounts) == 1
     assert settings.slack_accounts[0].account == "zrl"
@@ -323,7 +323,7 @@ def test_slack_config_requires_user_token_when_slack_required(monkeypatch):
     monkeypatch.delenv("SLACK_MISSING_TOKEN", raising=False)
 
     with pytest.raises(ValueError, match="SLACK_MISSING_TOKEN"):
-        load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+        load_settings(require_postgres=False, require_gmail=False, require_slack=True)
 
 
 def test_mapping_rows_preserve_ui_fields_and_raw_json():
@@ -448,7 +448,7 @@ def test_conversation_recency_uses_latest_or_cursor_state():
 def test_runner_full_sync_collects_workspace_conversations_messages_threads_and_files(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     client = FakeSlackClient(
         {
             "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
@@ -516,7 +516,7 @@ def test_runner_full_sync_collects_workspace_conversations_messages_threads_and_
 def test_runner_members_only_syncs_cached_private_member_candidates(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     client = FakeSlackClient(
         {
             "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
@@ -563,7 +563,7 @@ def test_runner_members_only_syncs_cached_private_member_candidates(monkeypatch)
 def test_runner_members_only_records_errors_without_replacing_members(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     client = FakeSlackClient(
         {
             "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
@@ -596,7 +596,7 @@ def test_runner_members_only_records_errors_without_replacing_members(monkeypatc
 def test_runner_can_refresh_conversations_without_fetching_messages(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     client = FakeSlackClient(
         {
             "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
@@ -632,7 +632,7 @@ def test_runner_can_refresh_conversations_without_fetching_messages(monkeypatch)
 def test_runner_can_refresh_conversation_info_only(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     client = FakeSlackClient(
         {
             "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
@@ -677,7 +677,7 @@ def test_runner_incremental_uses_lookback_and_skips_unchanged_threads(monkeypatc
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
     monkeypatch.setenv("SLACK_LOOKBACK_DAYS", "2")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     state_key = ("zrl", "T1", "conversation", "C1")
     client = FakeSlackClient(
         {
@@ -720,7 +720,7 @@ def test_runner_incremental_uses_lookback_and_skips_unchanged_threads(monkeypatc
 def test_runner_retries_slack_rate_limits(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     sleeps = []
     client = FakeSlackClient(
         {
@@ -745,7 +745,7 @@ def test_runner_retries_slack_rate_limits(monkeypatch):
 def test_runner_fails_when_slack_rate_limit_budget_is_exceeded(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     sleeps = []
     client = FakeSlackClient(
         {
@@ -773,7 +773,7 @@ def test_runner_fails_when_slack_rate_limit_budget_is_exceeded(monkeypatch):
 def test_runner_returns_partial_when_known_error_sync_hits_rate_limit_budget(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     sleeps = []
     warehouse = FakeWarehouse()
     warehouse.conversation_payloads = [
@@ -821,7 +821,7 @@ def test_runner_returns_partial_when_known_error_sync_hits_rate_limit_budget(mon
 def test_runner_retries_transient_slack_request_failures(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     sleeps = []
     client = FakeSlackClient(
         {
@@ -846,7 +846,7 @@ def test_runner_retries_transient_slack_request_failures(monkeypatch):
 def test_runner_can_backfill_archived_cached_conversations(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse()
     warehouse.conversation_payloads = [
         {"id": "C1", "name": "active", "is_channel": True, "is_archived": False},
@@ -883,7 +883,7 @@ def test_runner_can_backfill_archived_cached_conversations(monkeypatch):
 def test_runner_can_filter_cached_conversations_by_type(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse()
     warehouse.conversation_payloads = [
         {"id": "C1", "name": "public", "is_channel": True},
@@ -921,7 +921,7 @@ def test_runner_can_filter_cached_conversations_by_type(monkeypatch):
 def test_runner_can_load_only_not_full_cached_conversations(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse(
         states={("zrl", "T1", "conversation", "C_DONE"): {"status": "ok", "last_sync_type": "full"}}
     )
@@ -961,7 +961,7 @@ def test_runner_can_load_only_not_full_cached_conversations(monkeypatch):
 def test_runner_can_skip_known_conversation_errors(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse(
         states={("zrl", "T1", "conversation", "C_ERROR"): {"status": "error", "last_sync_type": "full"}}
     )
@@ -1000,7 +1000,7 @@ def test_runner_can_skip_known_conversation_errors(monkeypatch):
 def test_runner_records_conversation_errors_and_continues(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse()
     warehouse.conversation_payloads = [
         {"id": "C_DENIED", "name": "denied", "is_channel": True},
@@ -1041,7 +1041,7 @@ def test_runner_records_conversation_errors_and_continues(monkeypatch):
 def test_runner_freshness_priority_refreshes_conversations_and_syncs_ui_order(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     client = FakeSlackClient(
         {
             "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
@@ -1098,7 +1098,7 @@ def test_runner_freshness_priority_refreshes_conversations_and_syncs_ui_order(mo
 def test_runner_freshness_priority_can_use_cached_conversations_for_fast_polls(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse()
     warehouse.conversation_payloads = [
         {"id": "C_PUBLIC", "name": "public", "is_channel": True, "latest": {"ts": "1995.000000"}},
@@ -1143,7 +1143,7 @@ def test_runner_freshness_priority_syncs_stuck_channel_without_latest_metadata(m
     # the channel is included via its stored sync_state.cursor_ts.
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse()
     warehouse.conversation_payloads = [
         # No `latest.ts`. `updated` is before the freshness window (oldest_ts=1400).
@@ -1194,7 +1194,7 @@ def test_runner_freshness_priority_syncs_stuck_channel_without_latest_metadata(m
 def test_runner_freshness_priority_can_refresh_one_conversation_type(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     client = FakeSlackClient(
         {
             "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
@@ -1235,7 +1235,7 @@ def test_runner_freshness_priority_can_refresh_one_conversation_type(monkeypatch
 def test_runner_thread_replies_only_is_resumable(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse()
     warehouse.thread_refs = [
         {"conversation_id": "C1", "thread_ts": "1713974400.000100", "reply_count": 1, "latest_reply_ts": "1713974500.000100"},
@@ -1288,7 +1288,7 @@ def test_runner_thread_replies_only_is_resumable(monkeypatch):
 def test_runner_reprocesses_completed_thread_when_latest_reply_advances(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse()
     warehouse.thread_refs = [
         {"conversation_id": "C1", "thread_ts": "1713974400.000100", "reply_count": 2, "latest_reply_ts": "1713974600.000100"},
@@ -1336,7 +1336,7 @@ def test_runner_reprocesses_completed_thread_when_latest_reply_advances(monkeypa
 def test_runner_thread_replies_only_can_skip_known_errors(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse()
     warehouse.thread_refs = [
         {"conversation_id": "C_ERROR", "thread_ts": "1713974400.000100", "reply_count": 1, "latest_reply_ts": "1713974500.000100"},
@@ -1387,7 +1387,7 @@ def test_runner_thread_replies_only_can_select_missing_replies(monkeypatch):
     ]
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     client = FakeSlackClient(
         {
             "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
@@ -1429,7 +1429,7 @@ def test_runner_partial_sync_tombstones_missing_top_level_but_not_replies(monkey
     # tombstones top-level messages.
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse(states={("zrl", "T1", "conversation", "C_STUCK"): {"cursor_ts": "1900.000000"}})
     warehouse.conversation_payloads = [
         {"id": "C_STUCK", "name": "large-channel", "is_channel": True, "latest": {"ts": "1999.000000"}},
@@ -1482,7 +1482,7 @@ def test_runner_partial_sync_with_empty_window_does_not_clear_cursor(monkeypatch
     # rely on warehouse state for prioritization/resume behavior.
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse(
         states={
             ("zrl", "T1", "conversation", "C_STALE"): {
@@ -1536,7 +1536,7 @@ def test_runner_partial_sync_persists_progress_across_pages(monkeypatch):
     # the cursor per page so progress survives the abort.
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_slack=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse()
     warehouse.conversation_payloads = [
         {"id": "C_BIG", "name": "large-channel", "is_channel": True, "latest": {"ts": "5000.000000"}},

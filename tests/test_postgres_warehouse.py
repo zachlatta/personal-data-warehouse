@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import pytest
 from dotenv import load_dotenv
 
-from personal_data_warehouse.clickhouse import (
+from personal_data_warehouse.schema import (
     APPLE_NOTE_ATTACHMENT_COLUMNS,
     APPLE_NOTE_COLUMNS,
     APPLE_NOTE_REVISION_COLUMNS,
@@ -1119,7 +1119,7 @@ def test_postgres_gmail_clean_inbox_view_matches_current_state(warehouse: Postgr
     assert "body_markdown_clean" in rows[0][5]
 
 
-def test_postgres_gmail_clean_inbox_preview_uses_clickhouse_byte_prefix(warehouse: PostgresWarehouse) -> None:
+def test_postgres_gmail_clean_inbox_preview_uses_byte_prefix(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     preview = ("a" * 998) + "€" + "after"
     expected = preview.encode("utf-8")[:1000].decode("utf-8", errors="ignore")
@@ -1145,7 +1145,7 @@ def test_postgres_gmail_clean_inbox_ties_latest_message_by_lowest_message_id(war
     assert rows == [("lower",)]
 
 
-def test_postgres_calendar_transcript_views_use_latest_clickhouse_grouping(warehouse: PostgresWarehouse) -> None:
+def test_postgres_calendar_transcript_views_use_latest_grouping(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_calendar_tables()
     warehouse.ensure_apple_voice_memos_tables()
     older = datetime(2026, 5, 19, 11, tzinfo=UTC)

@@ -195,7 +195,7 @@ def legacy_metadata_payload() -> dict[str, object]:
     }
 
 
-def test_metadata_to_row_maps_drive_metadata_to_clickhouse_row() -> None:
+def test_metadata_to_row_maps_drive_metadata_to_row() -> None:
     row = metadata_to_row(decorated_metadata_payload(), ingested_at=datetime(2026, 4, 27, 13, tzinfo=UTC))
 
     assert row["account"] == "zach@example.com"

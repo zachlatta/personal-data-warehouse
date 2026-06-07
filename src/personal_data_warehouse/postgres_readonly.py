@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from personal_data_warehouse.clickhouse_readonly import (
+from personal_data_warehouse.readonly_sql import (
     DEFAULT_MAX_FIELD_CHARS,
     DEFAULT_MAX_ROWS,
     FieldTruncation,
@@ -16,7 +16,7 @@ from personal_data_warehouse.clickhouse_readonly import (
     int_value,
     rows_to_csv,
     strip_markdown_code_fence,
-    validate_readonly_sql as validate_clickhouse_readonly_sql,
+    validate_readonly_sql,
 )
 
 SCHEMA_SAMPLE_ROWS = 3
@@ -162,7 +162,7 @@ def rows_to_raw_result(columns: Sequence[str], rows: Sequence[Sequence[Any]]) ->
 
 
 def validate_postgres_readonly_sql(sql: str) -> None:
-    validate_clickhouse_readonly_sql(sql)
+    validate_readonly_sql(sql)
     keyword = first_sql_keyword(strip_markdown_code_fence(sql))
     if keyword in {"DESCRIBE", "DESC"}:
         raise ValueError("query tool is read-only; statement must start with SELECT, WITH, SHOW, or EXPLAIN")

@@ -118,7 +118,7 @@ def test_load_settings_adds_drive_scope_when_apple_notes_uses_google_drive(monke
     monkeypatch.setenv("APPLE_NOTES_ACCOUNT", "zach@example.com")
     monkeypatch.setenv("APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID", "folder-id")
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_apple_notes=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_apple_notes=True)
 
     assert settings.apple_notes is not None
     assert settings.apple_notes.account == "zach@example.com"

@@ -51,7 +51,7 @@ def main() -> None:
         print_network_diagnostics()
         return
 
-    settings = load_settings(require_clickhouse=False, require_gmail=False, require_apple_messages=True)
+    settings = load_settings(require_postgres=False, require_gmail=False, require_apple_messages=True)
     if settings.apple_messages is None:
         raise RuntimeError("Apple Messages sync is not configured")
     if settings.apple_messages.storage_backend != "google_drive":
