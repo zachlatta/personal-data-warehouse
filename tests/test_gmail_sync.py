@@ -2321,6 +2321,66 @@ def test_runner_marks_false_positive_attachment_candidates_as_processed(monkeypa
     assert warehouse.state_rows[0]["attachment_rows_written"] == 0
 
 
+def test_runner_backfills_attachment_candidates_in_parallel(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_BACKFILL_BATCH_SIZE", "10")
+    monkeypatch.setenv("GMAIL_ATTACHMENT_BACKFILL_CONCURRENCY", "4")
+    messages = [
+        {
+            "id": f"gmail-id-{index}",
+            "threadId": "thread-id",
+            "historyId": "42",
+            "internalDate": "1713875400000",
+            "payload": {
+                "parts": [
+                    {
+                        "partId": "2",
+                        "filename": f"notes-{index}.txt",
+                        "mimeType": "text/plain",
+                        "body": {"data": _gmail_data(f"backfill {index}".encode()), "size": 11},
+                    }
+                ]
+            },
+        }
+        for index in range(5)
+    ]
+    existing_keys = {(f"gmail-id-{index}", "2", f"notes-{index}.txt") for index in range(5)}
+    warehouse = FakeAttachmentBackfillWarehouse(messages, existing_keys=existing_keys)
+    object_store = FakeObjectStore()
+    settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
+    runner = GmailSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=FakeLogger(),
+        attachment_object_store_factory=lambda account: object_store,
+    )
+
+    opened_calls: list[bool] = []
+    monkeypatch.setattr(runner, "_supports_parallel_backfill", lambda: True)
+    monkeypatch.setattr(runner, "_open_worker_warehouse", lambda: opened_calls.append(True) or warehouse)
+    monkeypatch.setattr(
+        "personal_data_warehouse.gmail_sync.build_gmail_service",
+        lambda *, account, settings: FakeGmailAttachmentService({}),
+    )
+
+    candidates, rows_written, _text_chars, stored = runner._backfill_attachment_candidates(
+        account=settings.gmail_accounts[0],
+        service=FakeGmailAttachmentService({}),
+        object_store=object_store,
+    )
+
+    assert opened_calls, "parallel path should open per-worker warehouses"
+    assert candidates == 5
+    assert rows_written == 5
+    assert stored == 5
+    assert len(object_store.put_calls) == 5
+    assert len(warehouse.attachment_rows) == 5
+    assert all(row["storage_status"] == "stored" for row in warehouse.attachment_rows)
+    assert len(warehouse.state_rows) == 5
+    assert {row["message_id"] for row in warehouse.state_rows} == {f"gmail-id-{index}" for index in range(5)}
+    assert all(row["status"] == "ok" for row in warehouse.state_rows)
+
+
 def test_extract_attachment_text_supports_office_open_xml() -> None:
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:

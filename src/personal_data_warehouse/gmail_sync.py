@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -41,6 +42,7 @@ import zlib
 
 from personal_data_warehouse.config import GmailAccount, Settings, env_slug
 from personal_data_warehouse.postgres import PostgresWarehouse
+from personal_data_warehouse.warehouse import warehouse_from_settings
 from personal_data_warehouse.schema import SyncState
 from personal_data_warehouse.google_auth import google_token_json_from_env, load_google_credentials
 from personal_data_warehouse_voice_memos.storage import ObjectStore, StoredObject
@@ -642,82 +644,29 @@ class GmailSyncRunner:
             include_storage_pending=object_store is not None,
             storage_max_bytes=self._settings.gmail_attachment_max_bytes,
         )
+        messages = [message for message in messages if str(message.get("id", ""))]
         if not messages:
             return (0, 0, 0, 0)
 
-        candidates = 0
-        rows_written = 0
-        text_chars = 0
-        stored = 0
-        enrichment_cache = self._attachment_enrichment_cache()
-
-        for message in messages:
-            message_id = str(message.get("id", ""))
-            if not message_id:
-                continue
-            candidates += 1
-            synced_at = datetime.now(tz=UTC)
-            try:
-                existing_keys = self._warehouse.existing_attachment_keys(
-                    account=account.email_address,
-                    message_ids=[message_id],
-                )
-                rows = attachment_rows_for_message(
-                    account=account.email_address,
-                    service=service,
-                    message=message,
-                    synced_at=synced_at,
-                    existing_keys=existing_keys,
-                    max_bytes=self._settings.gmail_attachment_max_bytes,
-                    text_max_chars=self._settings.gmail_attachment_text_max_chars,
-                    force_reprocess=True,
-                    ai_fallback=self._attachment_ai_fallback,
-                    enrichment_cache=enrichment_cache,
-                    object_store=object_store,
-                )
-                self._warehouse.insert_attachments(rows)
-                self._warehouse.insert_attachment_backfill_state(
-                    [
-                        attachment_backfill_state_row(
-                            account=account.email_address,
-                            message_id=message_id,
-                            status="ok",
-                            attachment_rows_written=len(rows),
-                            error="",
-                            ai_provider=ai_provider,
-                            ai_model=ai_model,
-                            ai_prompt_version=ai_prompt_version,
-                            updated_at=synced_at,
-                        )
-                    ]
-                )
-            except Exception as exc:
-                self._warehouse.insert_attachment_backfill_state(
-                    [
-                        attachment_backfill_state_row(
-                            account=account.email_address,
-                            message_id=message_id,
-                            status="failed",
-                            attachment_rows_written=0,
-                            error=truncate_error(str(exc)),
-                            ai_provider=ai_provider,
-                            ai_model=ai_model,
-                            ai_prompt_version=ai_prompt_version,
-                            updated_at=datetime.now(tz=UTC),
-                        )
-                    ]
-                )
-                self._logger.warning(
-                    "Failed to backfill Gmail attachments for %s message %s: %s",
-                    account.email_address,
-                    message_id,
-                    exc,
-                )
-                continue
-
-            rows_written += len(rows)
-            text_chars += sum(len(str(row["text"])) for row in rows)
-            stored += count_attachments_stored(rows)
+        candidates = len(messages)
+        ai_identity = (ai_provider, ai_model, ai_prompt_version)
+        concurrency = max(1, self._settings.gmail_attachment_backfill_concurrency)
+        if concurrency > 1 and len(messages) > 1 and self._supports_parallel_backfill():
+            rows_written, text_chars, stored = self._backfill_messages_parallel(
+                account=account,
+                messages=messages,
+                object_store=object_store,
+                ai_identity=ai_identity,
+                concurrency=min(concurrency, len(messages)),
+            )
+        else:
+            rows_written, text_chars, stored = self._backfill_messages_serial(
+                account=account,
+                service=service,
+                messages=messages,
+                object_store=object_store,
+                ai_identity=ai_identity,
+            )
 
         self._logger.info(
             "Backfilled Gmail attachments for %s: %s candidates, %s rows, %s text chars, %s blobs stored",
@@ -729,13 +678,189 @@ class GmailSyncRunner:
         )
         return (candidates, rows_written, text_chars, stored)
 
-    def _attachment_enrichment_cache(self) -> AttachmentEnrichmentCache | None:
-        if not hasattr(self._warehouse, "load_attachment_enrichments") or not hasattr(
-            self._warehouse, "insert_attachment_enrichments"
+    def _supports_parallel_backfill(self) -> bool:
+        return isinstance(self._warehouse, PostgresWarehouse)
+
+    def _open_worker_warehouse(self) -> PostgresWarehouse:
+        return warehouse_from_settings(self._settings)
+
+    def _backfill_messages_serial(
+        self,
+        *,
+        account: GmailAccount,
+        service,
+        messages: list[Mapping[str, object]],
+        object_store: ObjectStore | None,
+        ai_identity: tuple[str, str, str],
+    ) -> tuple[int, int, int]:
+        enrichment_cache = self._attachment_enrichment_cache()
+        rows_written = 0
+        text_chars = 0
+        stored = 0
+        for message in messages:
+            written, chars, blobs = self._backfill_message(
+                account=account,
+                message=message,
+                service=service,
+                object_store=object_store,
+                warehouse=self._warehouse,
+                enrichment_cache=enrichment_cache,
+                ai_identity=ai_identity,
+            )
+            rows_written += written
+            text_chars += chars
+            stored += blobs
+        return (rows_written, text_chars, stored)
+
+    def _backfill_messages_parallel(
+        self,
+        *,
+        account: GmailAccount,
+        messages: list[Mapping[str, object]],
+        object_store: ObjectStore | None,
+        ai_identity: tuple[str, str, str],
+        concurrency: int,
+    ) -> tuple[int, int, int]:
+        # Google API clients and psycopg2 connections are not thread-safe, so each
+        # worker thread gets its own warehouse, Gmail service, Drive store, and
+        # enrichment cache. wants_object_store mirrors the caller so that
+        # storage-pending candidates still get their blobs uploaded.
+        thread_local = threading.local()
+        opened: list[PostgresWarehouse] = []
+        opened_lock = threading.Lock()
+        wants_object_store = object_store is not None
+
+        def resources():
+            existing = getattr(thread_local, "backfill", None)
+            if existing is not None:
+                return existing
+            warehouse = self._open_worker_warehouse()
+            with opened_lock:
+                opened.append(warehouse)
+            worker_service = build_gmail_service(account=account, settings=self._settings)
+            store = self._attachment_object_store(account) if wants_object_store else None
+            cache = self._attachment_enrichment_cache(warehouse)
+            built = (warehouse, worker_service, store, cache)
+            thread_local.backfill = built
+            return built
+
+        def process(message: Mapping[str, object]) -> tuple[int, int, int]:
+            warehouse, worker_service, store, cache = resources()
+            return self._backfill_message(
+                account=account,
+                message=message,
+                service=worker_service,
+                object_store=store,
+                warehouse=warehouse,
+                enrichment_cache=cache,
+                ai_identity=ai_identity,
+            )
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=concurrency, thread_name_prefix="gmail-backfill"
+            ) as pool:
+                results = list(pool.map(process, messages))
+        finally:
+            with opened_lock:
+                worker_warehouses = list(opened)
+            for warehouse in worker_warehouses:
+                try:
+                    warehouse.close()
+                except Exception:
+                    pass
+
+        rows_written = sum(written for written, _chars, _blobs in results)
+        text_chars = sum(chars for _written, chars, _blobs in results)
+        stored = sum(blobs for _written, _chars, blobs in results)
+        return (rows_written, text_chars, stored)
+
+    def _backfill_message(
+        self,
+        *,
+        account: GmailAccount,
+        message: Mapping[str, object],
+        service,
+        object_store: ObjectStore | None,
+        warehouse,
+        enrichment_cache: AttachmentEnrichmentCache | None,
+        ai_identity: tuple[str, str, str],
+    ) -> tuple[int, int, int]:
+        message_id = str(message.get("id", ""))
+        ai_provider, ai_model, ai_prompt_version = ai_identity
+        synced_at = datetime.now(tz=UTC)
+        try:
+            existing_keys = warehouse.existing_attachment_keys(
+                account=account.email_address,
+                message_ids=[message_id],
+            )
+            rows = attachment_rows_for_message(
+                account=account.email_address,
+                service=service,
+                message=message,
+                synced_at=synced_at,
+                existing_keys=existing_keys,
+                max_bytes=self._settings.gmail_attachment_max_bytes,
+                text_max_chars=self._settings.gmail_attachment_text_max_chars,
+                force_reprocess=True,
+                ai_fallback=self._attachment_ai_fallback,
+                enrichment_cache=enrichment_cache,
+                object_store=object_store,
+            )
+            warehouse.insert_attachments(rows)
+            warehouse.insert_attachment_backfill_state(
+                [
+                    attachment_backfill_state_row(
+                        account=account.email_address,
+                        message_id=message_id,
+                        status="ok",
+                        attachment_rows_written=len(rows),
+                        error="",
+                        ai_provider=ai_provider,
+                        ai_model=ai_model,
+                        ai_prompt_version=ai_prompt_version,
+                        updated_at=synced_at,
+                    )
+                ]
+            )
+        except Exception as exc:
+            warehouse.insert_attachment_backfill_state(
+                [
+                    attachment_backfill_state_row(
+                        account=account.email_address,
+                        message_id=message_id,
+                        status="failed",
+                        attachment_rows_written=0,
+                        error=truncate_error(str(exc)),
+                        ai_provider=ai_provider,
+                        ai_model=ai_model,
+                        ai_prompt_version=ai_prompt_version,
+                        updated_at=datetime.now(tz=UTC),
+                    )
+                ]
+            )
+            self._logger.warning(
+                "Failed to backfill Gmail attachments for %s message %s: %s",
+                account.email_address,
+                message_id,
+                exc,
+            )
+            return (0, 0, 0)
+
+        return (
+            len(rows),
+            sum(len(str(row["text"])) for row in rows),
+            count_attachments_stored(rows),
+        )
+
+    def _attachment_enrichment_cache(self, warehouse=None) -> AttachmentEnrichmentCache | None:
+        warehouse = warehouse if warehouse is not None else self._warehouse
+        if not hasattr(warehouse, "load_attachment_enrichments") or not hasattr(
+            warehouse, "insert_attachment_enrichments"
         ):
             return None
         return WarehouseAttachmentEnrichmentCache(
-            warehouse=self._warehouse,
+            warehouse=warehouse,
             config=self._attachment_ai_fallback,
         )
 
