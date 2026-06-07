@@ -14,7 +14,7 @@ import (
 )
 
 // envWithHome returns a getenv stub backed by the given temp dir as $HOME
-// (so cliconfig.Path resolves to <tmp>/.config/pdw-cli/config.json) plus
+// (so cliconfig.Path resolves to <tmp>/.config/pdw/config.json) plus
 // any caller-supplied overrides.
 func envWithHome(tmp string, extra ...map[string]string) func(string) string {
 	m := map[string]string{"HOME": tmp}
@@ -27,6 +27,11 @@ func envWithHome(tmp string, extra ...map[string]string) func(string) string {
 }
 
 func configPathFor(t *testing.T, home string) string {
+	t.Helper()
+	return filepath.Join(home, ".config", "pdw", "config.json")
+}
+
+func legacyConfigPathFor(t *testing.T, home string) string {
 	t.Helper()
 	return filepath.Join(home, ".config", "pdw-cli", "config.json")
 }
@@ -171,6 +176,22 @@ func TestLogoutRemovesConfig(t *testing.T) {
 	}
 }
 
+func TestLogoutRemovesLegacyConfig(t *testing.T) {
+	home := t.TempDir()
+	legacy := legacyConfigPathFor(t, home)
+	if err := cliconfig.Save(legacy, cliconfig.Config{BaseURL: "http://x", Token: "t", ClientName: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"logout"}, strings.NewReader(""), &stdout, &stderr, envWithHome(home))
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, stderr.String())
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy config still present after logout: %v", err)
+	}
+}
+
 func TestLogoutWhenAbsentSucceeds(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -231,6 +252,47 @@ func TestListUsesConfigFileWhenEnvAbsent(t *testing.T) {
 	}
 	if srv.lastAuth != "Bearer from-config:"+cliTestToken {
 		t.Fatalf("server auth = %q; expected the config-file client+token", srv.lastAuth)
+	}
+}
+
+func TestListFallsBackToLegacyConfig(t *testing.T) {
+	home := t.TempDir()
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	})
+	// Only a legacy pdw-cli config exists (as written by a pre-rename binary).
+	if err := cliconfig.Save(legacyConfigPathFor(t, home), cliconfig.Config{
+		BaseURL: srv.URL, Token: cliTestToken, ClientName: "from-legacy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"list"}, strings.NewReader(""), &stdout, &stderr, envWithHome(home))
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, stderr.String())
+	}
+	if srv.lastAuth != "Bearer from-legacy:"+cliTestToken {
+		t.Fatalf("server auth = %q; expected the legacy config-file client+token", srv.lastAuth)
+	}
+}
+
+func TestDefaultClientNameIsPDW(t *testing.T) {
+	home := t.TempDir()
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	})
+	// URL + token supplied, but no client name anywhere: the default applies.
+	getenv := envWithHome(home, map[string]string{
+		"PDW_API_URL":      srv.URL,
+		"PDW_SECRET_TOKEN": cliTestToken,
+	})
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"list"}, strings.NewReader(""), &stdout, &stderr, getenv)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, stderr.String())
+	}
+	if srv.lastAuth != "Bearer pdw:"+cliTestToken {
+		t.Fatalf("server auth = %q; default client name should be \"pdw\"", srv.lastAuth)
 	}
 }
 
@@ -295,8 +357,8 @@ func TestListGivesActionableErrorWhenNotConfigured(t *testing.T) {
 		t.Fatal("expected non-zero exit")
 	}
 	// The error must point users at the new option, not just env vars.
-	if !strings.Contains(stderr.String(), "pdw-cli login") {
-		t.Fatalf("stderr should suggest `pdw-cli login`: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "pdw login") {
+		t.Fatalf("stderr should suggest `pdw login`: %s", stderr.String())
 	}
 }
 

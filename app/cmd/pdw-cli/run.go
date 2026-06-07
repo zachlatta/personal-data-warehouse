@@ -16,12 +16,12 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/cliconfig"
 )
 
-const usage = `pdw-cli — talk to the personal data warehouse /api/tools surface.
+const usage = `pdw — talk to the personal data warehouse /api/tools surface.
 
 USAGE
-  pdw-cli [--base-url URL] [--token TOKEN] [--client NAME] [<command> [args]]
+  pdw [--base-url URL] [--token TOKEN] [--client NAME] [<command> [args]]
 
-With no command, pdw-cli runs schema_overview and prints the warehouse
+With no command, pdw runs schema_overview and prints the warehouse
 schema, so callers always see what tables and columns are available before
 writing SQL.
 
@@ -31,7 +31,7 @@ COMMANDS
                                --base-url URL  Warehouse URL (else prompted; defaults
                                                to https://personal-data-warehouse.zachlatta.com/).
                                --token TOKEN   Bearer token (else prompted).
-                               --client NAME   Client identifier (else prompted; default pdw-cli).
+                               --client NAME   Client identifier (else prompted; default pdw).
   logout                     Remove the saved configuration.
   config show                Print the resolved configuration with the token redacted.
   list                       List every tool the server exposes.
@@ -57,42 +57,43 @@ COMMANDS
                              schema) before writing SQL so you don't guess column
                              names.
   schema                     Run schema_overview and print the warehouse schema
-                             (same as running pdw-cli with no command).
+                             (same as running pdw with no command).
   version                    Print the build version.
   update                     Replace this binary with the latest GitHub release.
                                --check  Only report whether an update is available.
                                --force  Reinstall even if already on the latest version.
                                --repo OWNER/NAME  GitHub repo to pull from (default
-                                                  $PDW_CLI_REPO or zachlatta/personal-data-warehouse).
+                                                  $PDW_REPO or zachlatta/personal-data-warehouse).
   help                       Show this message.
 
 CONFIGURATION
   Values resolve in this order: --flag > environment > config file > default.
-  Run "pdw-cli login" once to write $XDG_CONFIG_HOME/pdw-cli/config.json
-  (defaults to ~/.config/pdw-cli/config.json) with mode 0600.
+  Run "pdw login" once to write $XDG_CONFIG_HOME/pdw/config.json
+  (defaults to ~/.config/pdw/config.json) with mode 0600.
 
 ENVIRONMENT
   PDW_API_URL        Base URL of the warehouse app (e.g. http://localhost:8080).
   PDW_SECRET_TOKEN   Shared secret matching the server's PDW_SECRET_TOKEN.
-  PDW_CLIENT_NAME    Client identifier sent on every request. Default: pdw-cli.
-  PDW_CLI_REPO       GitHub repo for self-update. Default: zachlatta/personal-data-warehouse.
+  PDW_CLIENT_NAME    Client identifier sent on every request. Default: pdw.
+  PDW_REPO           GitHub repo for self-update. Default: zachlatta/personal-data-warehouse.
+                     (The legacy PDW_CLI_REPO name is still honored.)
   XDG_CONFIG_HOME    Overrides the config directory root.
 
 EXAMPLES
-  pdw-cli login                          # one-time setup; persists URL + token
-  pdw-cli list
-  pdw-cli describe sql
-  pdw-cli call schema_overview
-  pdw-cli columns gmail_messages
-  pdw-cli sql 'What is one?' 'SELECT 1'
-  pdw-cli sql --output json 'What time is it?' 'SELECT now()'
-  pdw-cli sql --file query.sql 'Find calendar transcripts mentioning Vercel'
-  pdw-cli sql 'Recent Slack messages in a channel' < query.sql
-  pdw-cli config show
-  pdw-cli version
-  pdw-cli update --check
-  pdw-cli update
-  pdw-cli logout
+  pdw login                          # one-time setup; persists URL + token
+  pdw list
+  pdw describe sql
+  pdw call schema_overview
+  pdw columns gmail_messages
+  pdw sql 'What is one?' 'SELECT 1'
+  pdw sql --output json 'What time is it?' 'SELECT now()'
+  pdw sql --file query.sql 'Find calendar transcripts mentioning Vercel'
+  pdw sql 'Recent Slack messages in a channel' < query.sql
+  pdw config show
+  pdw version
+  pdw update --check
+  pdw update
+  pdw logout
 `
 
 // version is overridden at build time via -ldflags "-X main.version=v1.2.3".
@@ -109,13 +110,13 @@ const defaultBaseURL = "https://personal-data-warehouse.zachlatta.com/"
 // run is the testable entry point. It returns the process exit code rather
 // than calling os.Exit so it can be driven from tests.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(string) string) int {
-	rootFlags := flag.NewFlagSet("pdw-cli", flag.ContinueOnError)
+	rootFlags := flag.NewFlagSet("pdw", flag.ContinueOnError)
 	rootFlags.SetOutput(io.Discard)
 	baseURL := rootFlags.String("base-url", "", "base URL of the warehouse app (overrides PDW_API_URL)")
 	token := rootFlags.String("token", "", "PDW_SECRET_TOKEN value (overrides PDW_SECRET_TOKEN)")
 	clientName := rootFlags.String("client", "", "client name reported in server logs (overrides PDW_CLIENT_NAME)")
 	if err := rootFlags.Parse(args); err != nil {
-		// `pdw-cli --help` / `-h` surfaces as flag.ErrHelp; treat it as the
+		// `pdw --help` / `-h` surfaces as flag.ErrHelp; treat it as the
 		// help command (stdout, exit 0) rather than a usage error.
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(stdout, usage)
@@ -163,12 +164,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 
 	resolved, err := resolveConfig(*baseURL, *clientName, *token, getenv)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli:", err)
+		fmt.Fprintln(stderr, "pdw:", err)
 		return 2
 	}
 	client, err := cliclient.New(resolved.baseURL, resolved.clientName, resolved.token)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli:", err)
+		fmt.Fprintln(stderr, "pdw:", err)
 		return 2
 	}
 
@@ -186,7 +187,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	case "schema":
 		return runSchema(client, rest, stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "pdw-cli: unknown command %q\n", cmd)
+		fmt.Fprintf(stderr, "pdw: unknown command %q\n", cmd)
 		fmt.Fprint(stderr, usage)
 		return 2
 	}
@@ -197,17 +198,17 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 // rejected to keep the command's contract narrow.
 func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 {
-		fmt.Fprintln(stderr, "pdw-cli schema: unexpected arguments")
+		fmt.Fprintln(stderr, "pdw schema: unexpected arguments")
 		return 2
 	}
 	out, err := client.CallTool(context.Background(), "schema_overview", nil)
 	if err != nil {
 		var apiErr *cliclient.APIError
 		if errors.As(err, &apiErr) {
-			fmt.Fprintf(stderr, "pdw-cli schema: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
+			fmt.Fprintf(stderr, "pdw schema: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
 			return 1
 		}
-		fmt.Fprintln(stderr, "pdw-cli schema:", err)
+		fmt.Fprintln(stderr, "pdw schema:", err)
 		return 1
 	}
 	var payload struct {
@@ -224,7 +225,7 @@ func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer
 	}
 	for _, r := range payload.Results {
 		if r.Error != "" {
-			fmt.Fprintln(stderr, "pdw-cli schema:", r.Error)
+			fmt.Fprintln(stderr, "pdw schema:", r.Error)
 			return 1
 		}
 		if r.CSV != "" {
@@ -257,13 +258,13 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 			fmt.Fprint(stdout, usage)
 			return 0
 		}
-		fmt.Fprintln(stderr, "pdw-cli sql:", err)
+		fmt.Fprintln(stderr, "pdw sql:", err)
 		return 2
 	}
 	formatSpecified := strings.TrimSpace(*output) != ""
 	format, err := normalizeSQLOutputFormat(*output)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli sql:", err)
+		fmt.Fprintln(stderr, "pdw sql:", err)
 		return 2
 	}
 	question, sql, code := resolveSQLInput(fs.Args(), *file, stdin, stderr)
@@ -272,17 +273,17 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 	}
 	input, err := json.Marshal(sqlCommandInput{Question: question, SQL: sql, Format: format})
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli sql:", err)
+		fmt.Fprintln(stderr, "pdw sql:", err)
 		return 1
 	}
 	out, err := client.CallTool(context.Background(), "sql", input)
 	if err != nil {
 		var apiErr *cliclient.APIError
 		if errors.As(err, &apiErr) {
-			fmt.Fprintf(stderr, "pdw-cli sql: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
+			fmt.Fprintf(stderr, "pdw sql: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
 			return 1
 		}
-		fmt.Fprintln(stderr, "pdw-cli sql:", err)
+		fmt.Fprintln(stderr, "pdw sql:", err)
 		return 1
 	}
 	var payload sqlCommandResponse
@@ -291,7 +292,7 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 		return 0
 	}
 	if payload.Error != "" {
-		fmt.Fprintln(stderr, "pdw-cli sql:", payload.Error)
+		fmt.Fprintln(stderr, "pdw sql:", payload.Error)
 		return 1
 	}
 	if !formatSpecified {
@@ -309,23 +310,23 @@ func resolveSQLInput(positional []string, file string, stdin io.Reader, stderr i
 	switch {
 	case file != "":
 		if len(positional) == 0 {
-			fmt.Fprintln(stderr, "pdw-cli sql: a plain-English question is required (usage: pdw-cli sql --file QUERY.sql <QUESTION>)")
+			fmt.Fprintln(stderr, "pdw sql: a plain-English question is required (usage: pdw sql --file QUERY.sql <QUESTION>)")
 			return "", "", 2
 		}
 		if len(positional) > 1 {
-			fmt.Fprintln(stderr, "pdw-cli sql: SQL came from --file, so pass only the question as a positional argument")
+			fmt.Fprintln(stderr, "pdw sql: SQL came from --file, so pass only the question as a positional argument")
 			return "", "", 2
 		}
 		question = strings.TrimSpace(positional[0])
 		b, err := os.ReadFile(file)
 		if err != nil {
-			fmt.Fprintln(stderr, "pdw-cli sql: read --file:", err)
+			fmt.Fprintln(stderr, "pdw sql: read --file:", err)
 			return "", "", 2
 		}
 		sql = strings.TrimSpace(string(b))
 	case len(positional) >= 2:
 		if len(positional) > 2 {
-			fmt.Fprintln(stderr, "pdw-cli sql: unexpected extra arguments; pass the question and SQL as two quoted positional args (or use --file / stdin for the SQL)")
+			fmt.Fprintln(stderr, "pdw sql: unexpected extra arguments; pass the question and SQL as two quoted positional args (or use --file / stdin for the SQL)")
 			return "", "", 2
 		}
 		question = strings.TrimSpace(positional[0])
@@ -335,24 +336,24 @@ func resolveSQLInput(positional []string, file string, stdin io.Reader, stderr i
 		question = strings.TrimSpace(positional[0])
 		b, err := io.ReadAll(stdin)
 		if err != nil {
-			fmt.Fprintln(stderr, "pdw-cli sql: read stdin:", err)
+			fmt.Fprintln(stderr, "pdw sql: read stdin:", err)
 			return "", "", 2
 		}
 		sql = strings.TrimSpace(string(b))
 		if sql == "" {
-			fmt.Fprintln(stderr, "pdw-cli sql: SQL query is required; pass it as the second argument, via --file, or on stdin")
+			fmt.Fprintln(stderr, "pdw sql: SQL query is required; pass it as the second argument, via --file, or on stdin")
 			return "", "", 2
 		}
 	default:
-		fmt.Fprintln(stderr, "pdw-cli sql: both an English question and a SQL query are required (usage: pdw-cli sql [--output FMT] <QUESTION> <SQL>)")
+		fmt.Fprintln(stderr, "pdw sql: both an English question and a SQL query are required (usage: pdw sql [--output FMT] <QUESTION> <SQL>)")
 		return "", "", 2
 	}
 	if question == "" {
-		fmt.Fprintln(stderr, "pdw-cli sql: question must be a concise plain-English question this SQL statement is trying to answer")
+		fmt.Fprintln(stderr, "pdw sql: question must be a concise plain-English question this SQL statement is trying to answer")
 		return "", "", 2
 	}
 	if sql == "" {
-		fmt.Fprintln(stderr, "pdw-cli sql: SQL query is required")
+		fmt.Fprintln(stderr, "pdw sql: SQL query is required")
 		return "", "", 2
 	}
 	return question, sql, 0
@@ -362,33 +363,33 @@ func resolveSQLInput(positional []string, file string, stdin io.Reader, stderr i
 // exact column names before writing SQL instead of guessing them.
 func runColumns(client *cliclient.Client, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "pdw-cli columns: table name is required (usage: pdw-cli columns <table>)")
+		fmt.Fprintln(stderr, "pdw columns: table name is required (usage: pdw columns <table>)")
 		return 2
 	}
 	if len(args) > 1 {
-		fmt.Fprintln(stderr, "pdw-cli columns: unexpected extra arguments; pass a single table name")
+		fmt.Fprintln(stderr, "pdw columns: unexpected extra arguments; pass a single table name")
 		return 2
 	}
 	table := strings.TrimSpace(args[0])
 	if !validIdentifier(table) {
-		fmt.Fprintln(stderr, "pdw-cli columns: table name must be a bare identifier (letters, digits, underscores)")
+		fmt.Fprintln(stderr, "pdw columns: table name must be a bare identifier (letters, digits, underscores)")
 		return 2
 	}
 	sql := "SELECT column_name, data_type, is_nullable FROM information_schema.columns " +
 		"WHERE table_schema = current_schema() AND table_name = '" + table + "' ORDER BY ordinal_position"
 	input, err := json.Marshal(sqlCommandInput{Question: "What columns does the " + table + " table have?", SQL: sql, Format: "csv"})
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli columns:", err)
+		fmt.Fprintln(stderr, "pdw columns:", err)
 		return 1
 	}
 	out, err := client.CallTool(context.Background(), "sql", input)
 	if err != nil {
 		var apiErr *cliclient.APIError
 		if errors.As(err, &apiErr) {
-			fmt.Fprintf(stderr, "pdw-cli columns: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
+			fmt.Fprintf(stderr, "pdw columns: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
 			return 1
 		}
-		fmt.Fprintln(stderr, "pdw-cli columns:", err)
+		fmt.Fprintln(stderr, "pdw columns:", err)
 		return 1
 	}
 	var payload sqlCommandResponse
@@ -397,7 +398,7 @@ func runColumns(client *cliclient.Client, args []string, stdout, stderr io.Write
 		return 0
 	}
 	if payload.Error != "" {
-		fmt.Fprintln(stderr, "pdw-cli columns:", payload.Error)
+		fmt.Fprintln(stderr, "pdw columns:", payload.Error)
 		return 1
 	}
 	return printSQLRows(payload.Rows, "csv", stdout)
@@ -464,23 +465,22 @@ type resolvedConfig struct {
 func resolveConfig(flagBase, flagClient, flagToken string, getenv func(string) string) (resolvedConfig, error) {
 	// Config file lookup is best-effort — a missing or corrupt file should
 	// not stop a fully-flagged or fully-env'd invocation from working.
+	// Resolve transparently falls back to the legacy pdw-cli config path.
 	var fileCfg cliconfig.Config
-	if path, perr := cliconfig.Path(getenv); perr == nil {
-		if loaded, lerr := cliconfig.Load(path); lerr == nil {
-			fileCfg = loaded
-		}
+	if loaded, _, rerr := cliconfig.Resolve(getenv); rerr == nil {
+		fileCfg = loaded
 	}
 	rc := resolvedConfig{
 		baseURL:    firstNonEmpty(flagBase, getenv("PDW_API_URL"), fileCfg.BaseURL),
-		clientName: firstNonEmpty(flagClient, getenv("PDW_CLIENT_NAME"), fileCfg.ClientName, "pdw-cli"),
+		clientName: firstNonEmpty(flagClient, getenv("PDW_CLIENT_NAME"), fileCfg.ClientName, "pdw"),
 		token:      firstNonEmpty(flagToken, getenv("PDW_SECRET_TOKEN"), fileCfg.Token),
 	}
 	var missing []string
 	if rc.baseURL == "" {
-		missing = append(missing, "warehouse URL (--base-url, PDW_API_URL, or `pdw-cli login`)")
+		missing = append(missing, "warehouse URL (--base-url, PDW_API_URL, or `pdw login`)")
 	}
 	if rc.token == "" {
-		missing = append(missing, "bearer token (--token, PDW_SECRET_TOKEN, or `pdw-cli login`)")
+		missing = append(missing, "bearer token (--token, PDW_SECRET_TOKEN, or `pdw login`)")
 	}
 	if len(missing) > 0 {
 		return rc, fmt.Errorf("not configured: %s", strings.Join(missing, "; "))
@@ -506,23 +506,23 @@ func runList(client *cliclient.Client, args []string, stdout, stderr io.Writer) 
 			fmt.Fprint(stdout, usage)
 			return 0
 		}
-		fmt.Fprintln(stderr, "pdw-cli list:", err)
+		fmt.Fprintln(stderr, "pdw list:", err)
 		return 2
 	}
 	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "pdw-cli list: unexpected positional arguments")
+		fmt.Fprintln(stderr, "pdw list: unexpected positional arguments")
 		return 2
 	}
 	tools, err := client.ListTools(context.Background())
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli list:", err)
+		fmt.Fprintln(stderr, "pdw list:", err)
 		return 1
 	}
 	if *asJSON {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(tools); err != nil {
-			fmt.Fprintln(stderr, "pdw-cli list:", err)
+			fmt.Fprintln(stderr, "pdw list:", err)
 			return 1
 		}
 		return 0
@@ -538,17 +538,17 @@ func runList(client *cliclient.Client, args []string, stdout, stderr io.Writer) 
 
 func runDescribe(client *cliclient.Client, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "pdw-cli describe: tool name is required")
+		fmt.Fprintln(stderr, "pdw describe: tool name is required")
 		return 2
 	}
 	if len(args) > 1 {
-		fmt.Fprintln(stderr, "pdw-cli describe: unexpected extra arguments")
+		fmt.Fprintln(stderr, "pdw describe: unexpected extra arguments")
 		return 2
 	}
 	name := args[0]
 	tools, err := client.ListTools(context.Background())
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli describe:", err)
+		fmt.Fprintln(stderr, "pdw describe:", err)
 		return 1
 	}
 	for _, t := range tools {
@@ -563,7 +563,7 @@ func runDescribe(client *cliclient.Client, args []string, stdout, stderr io.Writ
 			return 0
 		}
 	}
-	fmt.Fprintf(stderr, "pdw-cli describe: no tool named %q (try 'pdw-cli list')\n", name)
+	fmt.Fprintf(stderr, "pdw describe: no tool named %q (try 'pdw list')\n", name)
 	return 1
 }
 
@@ -574,7 +574,7 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 	}
 	name, rest, err := extractToolName(args)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli call:", err)
+		fmt.Fprintln(stderr, "pdw call:", err)
 		return 2
 	}
 	// There is exactly one supported way to run SQL: the `sql` command. The
@@ -582,10 +582,10 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 	// arrive here under either name. Redirect both to the single path instead
 	// of accepting a second, quoting-prone JSON route through `call`.
 	if name == "sql" || name == "query" {
-		fmt.Fprintln(stderr, "pdw-cli call: run SQL with the dedicated `sql` command, not `call`:")
-		fmt.Fprintln(stderr, "  pdw-cli sql '<question>' '<sql>'")
-		fmt.Fprintln(stderr, "  pdw-cli sql --file query.sql '<question>'   # SQL from a file")
-		fmt.Fprintln(stderr, "  pdw-cli sql '<question>' < query.sql         # SQL from stdin")
+		fmt.Fprintln(stderr, "pdw call: run SQL with the dedicated `sql` command, not `call`:")
+		fmt.Fprintln(stderr, "  pdw sql '<question>' '<sql>'")
+		fmt.Fprintln(stderr, "  pdw sql --file query.sql '<question>'   # SQL from a file")
+		fmt.Fprintln(stderr, "  pdw sql '<question>' < query.sql         # SQL from stdin")
 		fmt.Fprintln(stderr, "This avoids JSON/shell quoting; `call` is only for non-SQL tools.")
 		return 2
 	}
@@ -602,21 +602,21 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 			fmt.Fprint(stdout, usage)
 			return 0
 		}
-		fmt.Fprintln(stderr, "pdw-cli call:", err)
+		fmt.Fprintln(stderr, "pdw call:", err)
 		return 2
 	}
 	if extra := fs.Args(); len(extra) > 0 {
 		if looksLikeKeyValue(extra) {
-			fmt.Fprintln(stderr, "pdw-cli call: pass tool input as JSON via --data '{\"key\":\"value\"}' or on stdin, not key=value arguments")
+			fmt.Fprintln(stderr, "pdw call: pass tool input as JSON via --data '{\"key\":\"value\"}' or on stdin, not key=value arguments")
 			return 2
 		}
-		fmt.Fprintln(stderr, "pdw-cli call: unexpected extra arguments")
+		fmt.Fprintln(stderr, "pdw call: unexpected extra arguments")
 		return 2
 	}
 
 	input, err := loadCallInput(firstNonEmpty(*data, *dataArgs, *dataInput, *dataJSON), stdin)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli call:", err)
+		fmt.Fprintln(stderr, "pdw call:", err)
 		return 2
 	}
 	out, err := client.CallTool(context.Background(), name, input)
@@ -625,14 +625,14 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		if errors.As(err, &apiErr) {
 			if apiErr.Code == "tool_not_found" {
 				if s := suggestTool(client, name); s != "" {
-					fmt.Fprintf(stderr, "pdw-cli call: %s (http %d): %s; did you mean %q? (run 'pdw-cli list')\n", apiErr.Code, apiErr.Status, apiErr.Message, s)
+					fmt.Fprintf(stderr, "pdw call: %s (http %d): %s; did you mean %q? (run 'pdw list')\n", apiErr.Code, apiErr.Status, apiErr.Message, s)
 					return 1
 				}
 			}
-			fmt.Fprintf(stderr, "pdw-cli call: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
+			fmt.Fprintf(stderr, "pdw call: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
 			return 1
 		}
-		fmt.Fprintln(stderr, "pdw-cli call:", err)
+		fmt.Fprintln(stderr, "pdw call:", err)
 		return 1
 	}
 	pretty, perr := prettyJSON(out)

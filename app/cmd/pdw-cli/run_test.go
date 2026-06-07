@@ -432,7 +432,7 @@ func TestCallRedirectsSQLToolsToSQLCommand(t *testing.T) {
 		if code == 0 {
 			t.Fatalf("call %s should be rejected, not run", name)
 		}
-		if !strings.Contains(errOut, "pdw-cli sql") {
+		if !strings.Contains(errOut, "pdw sql") {
 			t.Fatalf("call %s should redirect to the sql command, got: %s", name, errOut)
 		}
 	}

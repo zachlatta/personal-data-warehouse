@@ -392,41 +392,45 @@ three rows per table. Sample cell values are capped at 15 characters to keep the
 
 When `MCP_DEBUG_CACHE_TOOL=true`, the server also exposes `_debug_cache_status` to show live `query_id`s, ages, and process-wide cache size.
 
-## CLI: `pdw-cli`
+## CLI: `pdw`
 
-`cmd/pdw-cli` is a small command-line client that consumes `/api/tools`. It
-discovers every tool the server exposes at runtime, so it stays in sync
-without changes when new tools are added.
+`cmd/pdw-cli` builds the `pdw` command: a small command-line client that
+consumes `/api/tools`. It discovers every tool the server exposes at runtime,
+so it stays in sync without changes when new tools are added. (The source
+directory and release artifacts keep the historical `pdw-cli` name so that
+binaries installed before the rename can still self-update — see
+[Self-update](#self-update).)
 
 ```bash
 cd app
-go build -o /tmp/pdw-cli ./cmd/pdw-cli
+go build -o /tmp/pdw ./cmd/pdw-cli
 
-# One-time setup. Stores URL+token in $XDG_CONFIG_HOME/pdw-cli/config.json
-# (defaults to ~/.config/pdw-cli/config.json) with mode 0600.
-/tmp/pdw-cli login \
+# One-time setup. Stores URL+token in $XDG_CONFIG_HOME/pdw/config.json
+# (defaults to ~/.config/pdw/config.json) with mode 0600. A pre-rename
+# ~/.config/pdw-cli/config.json is still read as a fallback.
+/tmp/pdw login \
   --base-url http://localhost:8080 \
   --token "$(pass show pdw)" \
   --client laptop
 # or run without flags for an interactive prompt.
 
-/tmp/pdw-cli list                     # name/title/description table
-/tmp/pdw-cli list --json              # raw JSON tool list
-/tmp/pdw-cli describe sql             # title + description + input JSON Schema
-/tmp/pdw-cli call schema_overview     # zero-input NON-SQL tool
-/tmp/pdw-cli columns gmail_messages   # column names + types for one table
-/tmp/pdw-cli sql 'What is one?' 'SELECT 1'  # defaults to CSV and prints an output-format note
-/tmp/pdw-cli sql --output json 'What time is it?' 'SELECT now()'
-/tmp/pdw-cli sql --output nd-json 'Which recent Gmail messages exist?' 'SELECT * FROM gmail_messages LIMIT 3'
-/tmp/pdw-cli sql --file query.sql 'Find calendar transcripts mentioning Vercel'  # SQL from a file
-/tmp/pdw-cli sql 'Recent Slack messages' < query.sql                             # SQL from stdin
-/tmp/pdw-cli config show              # prints config with the token redacted
-/tmp/pdw-cli logout                   # removes the config file
+/tmp/pdw list                     # name/title/description table
+/tmp/pdw list --json              # raw JSON tool list
+/tmp/pdw describe sql             # title + description + input JSON Schema
+/tmp/pdw call schema_overview     # zero-input NON-SQL tool
+/tmp/pdw columns gmail_messages   # column names + types for one table
+/tmp/pdw sql 'What is one?' 'SELECT 1'  # defaults to CSV and prints an output-format note
+/tmp/pdw sql --output json 'What time is it?' 'SELECT now()'
+/tmp/pdw sql --output nd-json 'Which recent Gmail messages exist?' 'SELECT * FROM gmail_messages LIMIT 3'
+/tmp/pdw sql --file query.sql 'Find calendar transcripts mentioning Vercel'  # SQL from a file
+/tmp/pdw sql 'Recent Slack messages' < query.sql                             # SQL from stdin
+/tmp/pdw config show              # prints config with the token redacted
+/tmp/pdw logout                   # removes the config file
 ```
 
 Running SQL has exactly one path: the `sql` command. The read-only query tool
-is named `sql` over the CLI/HTTP API and `query` over MCP, so `pdw-cli call sql`
-and `pdw-cli call query` are both rejected with a pointer to `pdw-cli sql`. This
+is named `sql` over the CLI/HTTP API and `query` over MCP, so `pdw call sql`
+and `pdw call query` are both rejected with a pointer to `pdw sql`. This
 keeps SQL off the JSON-quoting `call` path. `call` is for non-SQL tools only.
 
 Values resolve in this order: **`--flag` > environment variable > config
@@ -438,15 +442,20 @@ envelope on stderr.
 
 ### Self-update
 
-`pdw-cli update` replaces the running binary with the latest GitHub release
+`pdw update` replaces the running binary with the latest GitHub release
 from `zachlatta/personal-data-warehouse`, verifying the download against
-`SHA256SUMS`. Releases are produced automatically by `.github/workflows/pdw-cli-release.yml`:
+`SHA256SUMS`. Release artifacts keep the historical `pdw-cli` name (the
+asset `pdw-cli_<version>_<os>_<arch>.tar.gz` packs a single `pdw-cli` file,
+and tags are `pdw-cli/v*`) so that binaries installed before the `pdw-cli` →
+`pdw` rename can still self-update; `pdw update` writes the new binary back to
+whatever path the running binary occupies, so it keeps the `pdw` name on disk.
+Releases are produced automatically by `.github/workflows/pdw-cli-release.yml`:
 
 - **Every push to `main`** that touches `app/**` (CLI, client, selfupdate,
   shared `tool`/`api`/`auth` packages, or `go.mod`/`go.sum`) builds binaries
   for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64` and
   publishes a release tagged `pdw-cli/v0.0.<commit-count>-sha.<short-sha>`.
-  The commit count is monotonic, so `pdw-cli update` always sees newer
+  The commit count is monotonic, so `pdw update` always sees newer
   builds without waiting for a manual tag.
 - **`pdw-cli/v*` git tags** publish a release tagged with the version you
   pushed (e.g. `pdw-cli/v0.1.0`).
@@ -457,15 +466,16 @@ from `zachlatta/personal-data-warehouse`, verifying the download against
   publish.
 
 ```bash
-pdw-cli version        # prints the build version baked in via -ldflags
-pdw-cli update --check # report whether a newer release exists
-pdw-cli update         # download, verify SHA256, atomically replace this binary
-pdw-cli update --force # reinstall even if already on the latest version
-pdw-cli update --repo other/fork --github-api https://api.github.com  # alt source
+pdw version        # prints the build version baked in via -ldflags
+pdw update --check # report whether a newer release exists
+pdw update         # download, verify SHA256, atomically replace this binary
+pdw update --force # reinstall even if already on the latest version
+pdw update --repo other/fork --github-api https://api.github.com  # alt source
 ```
 
-Override the GitHub repo with `PDW_CLI_REPO` or `--repo` (the test suite uses
-both `--repo` and `--github-api` to drive end-to-end fakes).
+Override the GitHub repo with `PDW_REPO` or `--repo` (legacy `PDW_CLI_REPO`
+is still honored; the test suite uses both `--repo` and `--github-api` to
+drive end-to-end fakes).
 
 ## Verify
 
@@ -473,7 +483,7 @@ both `--repo` and `--github-api` to drive end-to-end fakes).
 cd app
 go test ./...
 go build -o /tmp/pdw-mcp ./cmd/pdw-mcp
-go build -o /tmp/pdw-cli ./cmd/pdw-cli
+go build -o /tmp/pdw ./cmd/pdw-cli
 ```
 
 To verify against the real Postgres URL from the repository `.env`:

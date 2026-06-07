@@ -19,22 +19,25 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv f
 	flagToken := fs.String("token", "", "bearer token")
 	flagClient := fs.String("client", "", "client name reported in server logs")
 	if err := fs.Parse(args); err != nil {
-		fmt.Fprintln(stderr, "pdw-cli login:", err)
+		fmt.Fprintln(stderr, "pdw login:", err)
 		return 2
 	}
 	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "pdw-cli login: unexpected positional arguments")
+		fmt.Fprintln(stderr, "pdw login: unexpected positional arguments")
 		return 2
 	}
 
+	// Writes always go to the canonical pdw path, but prefill the prompts
+	// from whatever Resolve finds — including a legacy pdw-cli config — so an
+	// existing login migrates forward on the next `pdw login`.
 	path, err := cliconfig.Path(getenv)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli login:", err)
+		fmt.Fprintln(stderr, "pdw login:", err)
 		return 2
 	}
-	existing, err := cliconfig.Load(path)
+	existing, _, err := cliconfig.Resolve(getenv)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli login:", err)
+		fmt.Fprintln(stderr, "pdw login:", err)
 		return 1
 	}
 
@@ -45,21 +48,21 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv f
 	}
 	baseURL, err := promptValue(*flagBase, baseDefault, "Warehouse API URL", false, reader, stdout)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli login:", err)
+		fmt.Fprintln(stderr, "pdw login:", err)
 		return 2
 	}
 	token, err := promptValue(*flagToken, existing.Token, "Bearer token", true, reader, stdout)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli login:", err)
+		fmt.Fprintln(stderr, "pdw login:", err)
 		return 2
 	}
 	clientDefault := existing.ClientName
 	if clientDefault == "" {
-		clientDefault = "pdw-cli"
+		clientDefault = "pdw"
 	}
 	clientName, err := promptValue(*flagClient, clientDefault, "Client name", false, reader, stdout)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli login:", err)
+		fmt.Fprintln(stderr, "pdw login:", err)
 		return 2
 	}
 
@@ -70,11 +73,11 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv f
 	}
 	// Validate before touching disk — surface bad URL/empty token early.
 	if _, err := cliclient.New(cfg.BaseURL, cfg.ClientName, cfg.Token); err != nil {
-		fmt.Fprintln(stderr, "pdw-cli login:", err)
+		fmt.Fprintln(stderr, "pdw login:", err)
 		return 2
 	}
 	if err := cliconfig.Save(path, cfg); err != nil {
-		fmt.Fprintln(stderr, "pdw-cli login:", err)
+		fmt.Fprintln(stderr, "pdw login:", err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "Saved configuration for %s as %s to %s\n", cfg.BaseURL, cfg.ClientName, path)
@@ -83,49 +86,48 @@ func runLogin(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv f
 
 func runLogout(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
 	if len(args) > 0 {
-		fmt.Fprintln(stderr, "pdw-cli logout: unexpected arguments")
+		fmt.Fprintln(stderr, "pdw logout: unexpected arguments")
 		return 2
 	}
-	path, err := cliconfig.Path(getenv)
+	// Remove both the canonical pdw config and any legacy pdw-cli config so
+	// logout fully de-authenticates regardless of which one a prior login wrote.
+	removed, err := cliconfig.DeleteAll(getenv)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli logout:", err)
-		return 2
-	}
-	if err := cliconfig.Delete(path); err != nil {
-		fmt.Fprintln(stderr, "pdw-cli logout:", err)
+		fmt.Fprintln(stderr, "pdw logout:", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "Removed %s\n", path)
+	if len(removed) == 0 {
+		fmt.Fprintln(stdout, "Nothing to remove (not configured)")
+		return 0
+	}
+	for _, path := range removed {
+		fmt.Fprintf(stdout, "Removed %s\n", path)
+	}
 	return 0
 }
 
 func runConfig(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
 	if len(args) == 0 || args[0] != "show" {
-		fmt.Fprintln(stderr, `pdw-cli config: only "show" is supported (e.g. pdw-cli config show)`)
+		fmt.Fprintln(stderr, `pdw config: only "show" is supported (e.g. pdw config show)`)
 		return 2
 	}
 	if len(args) > 1 {
-		fmt.Fprintln(stderr, "pdw-cli config show: unexpected arguments")
+		fmt.Fprintln(stderr, "pdw config show: unexpected arguments")
 		return 2
 	}
-	path, err := cliconfig.Path(getenv)
+	cfg, path, err := cliconfig.Resolve(getenv)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli config:", err)
-		return 2
-	}
-	cfg, err := cliconfig.Load(path)
-	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli config:", err)
+		fmt.Fprintln(stderr, "pdw config:", err)
 		return 1
 	}
 	if cfg == (cliconfig.Config{}) {
-		fmt.Fprintf(stdout, "not configured (no config at %s)\nrun `pdw-cli login` to set up\n", path)
+		fmt.Fprintf(stdout, "not configured (no config at %s)\nrun `pdw login` to set up\n", path)
 		return 0
 	}
 	fmt.Fprintf(stdout, "path: %s\n", path)
 	body, err := json.MarshalIndent(cfg.Redacted(), "", "  ")
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli config:", err)
+		fmt.Fprintln(stderr, "pdw config:", err)
 		return 1
 	}
 	fmt.Fprintln(stdout, string(body))

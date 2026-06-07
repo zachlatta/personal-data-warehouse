@@ -12,7 +12,7 @@ import (
 
 func runVersion(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 {
-		fmt.Fprintln(stderr, "pdw-cli version: unexpected arguments")
+		fmt.Fprintln(stderr, "pdw version: unexpected arguments")
 		return 2
 	}
 	fmt.Fprintln(stdout, version)
@@ -24,24 +24,26 @@ func runUpdate(args []string, stdout, stderr io.Writer, getenv func(string) stri
 	fs.SetOutput(io.Discard)
 	check := fs.Bool("check", false, "only report whether an update is available")
 	force := fs.Bool("force", false, "reinstall even if already on the latest version")
-	repo := fs.String("repo", "", "GitHub repo in owner/name form (default $PDW_CLI_REPO or "+defaultRepo+")")
+	repo := fs.String("repo", "", "GitHub repo in owner/name form (default $PDW_REPO or "+defaultRepo+")")
 	target := fs.String("target", "", "path to replace (default: this binary)")
 	api := fs.String("github-api", "", "GitHub API base URL (default https://api.github.com; for tests)")
 	if err := fs.Parse(args); err != nil {
-		fmt.Fprintln(stderr, "pdw-cli update:", err)
+		fmt.Fprintln(stderr, "pdw update:", err)
 		return 2
 	}
 	if fs.NArg() > 0 {
-		fmt.Fprintln(stderr, "pdw-cli update: unexpected positional arguments")
+		fmt.Fprintln(stderr, "pdw update: unexpected positional arguments")
 		return 2
 	}
 
-	resolvedRepo := firstNonEmpty(*repo, getenv("PDW_CLI_REPO"), defaultRepo)
+	// PDW_REPO is the current name; PDW_CLI_REPO is still honored for configs
+	// written before the pdw-cli -> pdw rename.
+	resolvedRepo := firstNonEmpty(*repo, getenv("PDW_REPO"), getenv("PDW_CLI_REPO"), defaultRepo)
 	resolvedTarget := *target
 	if resolvedTarget == "" {
 		exe, err := os.Executable()
 		if err != nil {
-			fmt.Fprintf(stderr, "pdw-cli update: cannot determine current binary path: %v\n", err)
+			fmt.Fprintf(stderr, "pdw update: cannot determine current binary path: %v\n", err)
 			return 1
 		}
 		resolvedTarget = exe
@@ -55,13 +57,13 @@ func runUpdate(args []string, stdout, stderr io.Writer, getenv func(string) stri
 	ctx := context.Background()
 	rel, err := client.LatestRelease(ctx)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli update:", err)
+		fmt.Fprintln(stderr, "pdw update:", err)
 		return 1
 	}
 
 	newer, err := selfupdate.ShouldUpdate(version, rel.Version)
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli update:", err)
+		fmt.Fprintln(stderr, "pdw update:", err)
 		return 1
 	}
 
@@ -81,11 +83,11 @@ func runUpdate(args []string, stdout, stderr io.Writer, getenv func(string) stri
 
 	binary, err := client.FetchBinary(ctx, rel, selfupdate.CurrentOS(), selfupdate.CurrentArch())
 	if err != nil {
-		fmt.Fprintln(stderr, "pdw-cli update:", err)
+		fmt.Fprintln(stderr, "pdw update:", err)
 		return 1
 	}
 	if err := selfupdate.ApplyUpdate(resolvedTarget, binary); err != nil {
-		fmt.Fprintln(stderr, "pdw-cli update:", err)
+		fmt.Fprintln(stderr, "pdw update:", err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "updated %s to %s\n", resolvedTarget, rel.Version)

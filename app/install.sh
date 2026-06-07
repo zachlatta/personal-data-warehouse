@@ -1,20 +1,30 @@
 #!/usr/bin/env sh
-# Install the latest pdw-cli release from
+# Install the latest pdw release from
 # github.com/zachlatta/personal-data-warehouse.
+#
+# The command installs as `pdw`. Release artifacts retain the historical
+# `pdw-cli` name so binaries installed before the rename can still self-update.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/zachlatta/personal-data-warehouse/main/app/install.sh | sh
 #
-# Environment overrides:
-#   PDW_CLI_REPO       GitHub repo (default: zachlatta/personal-data-warehouse)
-#   PDW_CLI_VERSION    Release tag to install (default: latest)
-#   PDW_CLI_INSTALL_DIR  Install directory (default: /usr/local/bin if writable,
-#                        else $HOME/.local/bin)
+# Environment overrides (legacy PDW_CLI_* names are still honored):
+#   PDW_REPO         GitHub repo (default: zachlatta/personal-data-warehouse)
+#   PDW_VERSION      Release tag to install (default: latest)
+#   PDW_INSTALL_DIR  Install directory (default: /usr/local/bin if writable,
+#                    else $HOME/.local/bin)
 
 set -eu
 
-REPO="${PDW_CLI_REPO:-zachlatta/personal-data-warehouse}"
-VERSION="${PDW_CLI_VERSION:-latest}"
+# Name of the installed command, and the file packaged inside the release
+# tarball. They differ deliberately: the artifact keeps the pre-rename
+# `pdw-cli` name so older installs keep self-updating, while we install it
+# on disk as `pdw`.
+INSTALL_NAME="pdw"
+ASSET_PREFIX="pdw-cli"
+
+REPO="${PDW_REPO:-${PDW_CLI_REPO:-zachlatta/personal-data-warehouse}}"
+VERSION="${PDW_VERSION:-${PDW_CLI_VERSION:-latest}}"
 
 log() { printf '==> %s\n' "$*"; }
 err() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -57,8 +67,8 @@ resolved_tag=$(printf '%s' "$release_json" \
 
 # Tags look like pdw-cli/v0.0.42-sha.abcdef0; the asset file embeds only the
 # version portion after the slash.
-asset_version="${resolved_tag#pdw-cli/}"
-asset="pdw-cli_${asset_version}_${os}_${arch}.tar.gz"
+asset_version="${resolved_tag#${ASSET_PREFIX}/}"
+asset="${ASSET_PREFIX}_${asset_version}_${os}_${arch}.tar.gz"
 
 base="https://github.com/${REPO}/releases/download/${resolved_tag}"
 asset_url="${base}/${asset}"
@@ -91,12 +101,12 @@ fi
 
 log "Extracting"
 tar -xzf "$tmp/$asset" -C "$tmp"
-[ -f "$tmp/pdw-cli" ] || err "extracted archive missing pdw-cli binary"
-chmod +x "$tmp/pdw-cli"
+[ -f "$tmp/$ASSET_PREFIX" ] || err "extracted archive missing $ASSET_PREFIX binary"
+chmod +x "$tmp/$ASSET_PREFIX"
 
 # Pick install dir.
-if [ -n "${PDW_CLI_INSTALL_DIR:-}" ]; then
-  install_dir="$PDW_CLI_INSTALL_DIR"
+if [ -n "${PDW_INSTALL_DIR:-${PDW_CLI_INSTALL_DIR:-}}" ]; then
+  install_dir="${PDW_INSTALL_DIR:-$PDW_CLI_INSTALL_DIR}"
 elif [ -w /usr/local/bin ] 2>/dev/null; then
   install_dir="/usr/local/bin"
 else
@@ -104,9 +114,10 @@ else
 fi
 
 mkdir -p "$install_dir"
-mv "$tmp/pdw-cli" "$install_dir/pdw-cli"
+# The tarball member is named $ASSET_PREFIX (pdw-cli); install it as `pdw`.
+mv "$tmp/$ASSET_PREFIX" "$install_dir/$INSTALL_NAME"
 
-log "Installed $install_dir/pdw-cli ($asset_version)"
+log "Installed $install_dir/$INSTALL_NAME ($asset_version)"
 
 case ":$PATH:" in
   *":$install_dir:"*)
@@ -118,7 +129,9 @@ case ":$PATH:" in
 esac
 
 # If the install dir isn't on PATH, append an export line to the user's shell
-# rc files. Marker comment keeps re-runs idempotent.
+# rc files. Marker comment keeps re-runs idempotent. Keep the historical
+# "pdw-cli installer" wording so machines that ran the pre-rename installer
+# don't get a second, duplicate PATH block appended.
 marker="# added by pdw-cli installer"
 posix_line="export PATH=\"$install_dir:\$PATH\""
 fish_line="set -gx PATH $install_dir \$PATH"
@@ -178,6 +191,6 @@ if [ -n "$updated_rcs" ]; then
 fi
 
 printf 'Next steps:\n'
-printf '  pdw-cli login          # store the API URL and token (interactive)\n'
-printf '  pdw-cli list           # confirm the connection works\n'
-printf '  pdw-cli update         # later: self-update to the latest release\n'
+printf '  pdw login          # store the API URL and token (interactive)\n'
+printf '  pdw list           # confirm the connection works\n'
+printf '  pdw update         # later: self-update to the latest release\n'

@@ -21,7 +21,7 @@ func TestPathRespectsXDGConfigHome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Path: %v", err)
 	}
-	want := filepath.Join(xdg, "pdw-cli", "config.json")
+	want := filepath.Join(xdg, "pdw", "config.json")
 	if got != want {
 		t.Fatalf("Path = %q, want %q", got, want)
 	}
@@ -33,7 +33,7 @@ func TestPathDefaultsToHomeDotConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Path: %v", err)
 	}
-	want := filepath.Join(home, ".config", "pdw-cli", "config.json")
+	want := filepath.Join(home, ".config", "pdw", "config.json")
 	if got != want {
 		t.Fatalf("Path = %q, want %q", got, want)
 	}
@@ -189,5 +189,131 @@ func TestRedactKeepsEmptyTokenEmpty(t *testing.T) {
 	cfg := cliconfig.Config{BaseURL: "http://x"}
 	if cfg.Redacted().Token != "" {
 		t.Fatalf("empty token must remain empty after redaction")
+	}
+}
+
+func TestLegacyPathPointsAtPDWCLIDir(t *testing.T) {
+	home := t.TempDir()
+	got, err := cliconfig.LegacyPath(envFromMap(map[string]string{"HOME": home}))
+	if err != nil {
+		t.Fatalf("LegacyPath: %v", err)
+	}
+	want := filepath.Join(home, ".config", "pdw-cli", "config.json")
+	if got != want {
+		t.Fatalf("LegacyPath = %q, want %q", got, want)
+	}
+}
+
+func TestResolvePrefersCanonicalPath(t *testing.T) {
+	home := t.TempDir()
+	env := envFromMap(map[string]string{"HOME": home})
+	canonical, _ := cliconfig.Path(env)
+	legacy, _ := cliconfig.LegacyPath(env)
+	if err := cliconfig.Save(canonical, cliconfig.Config{BaseURL: "http://new", Token: "t1", ClientName: "c1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cliconfig.Save(legacy, cliconfig.Config{BaseURL: "http://old", Token: "t2", ClientName: "c2"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, path, err := cliconfig.Resolve(env)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if cfg.BaseURL != "http://new" || path != canonical {
+		t.Fatalf("Resolve = %#v from %q, want canonical config", cfg, path)
+	}
+}
+
+func TestResolveFallsBackToLegacyConfig(t *testing.T) {
+	home := t.TempDir()
+	env := envFromMap(map[string]string{"HOME": home})
+	legacy, _ := cliconfig.LegacyPath(env)
+	want := cliconfig.Config{BaseURL: "http://old", Token: "tok", ClientName: "laptop"}
+	if err := cliconfig.Save(legacy, want); err != nil {
+		t.Fatal(err)
+	}
+	cfg, path, err := cliconfig.Resolve(env)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if cfg != want {
+		t.Fatalf("Resolve = %#v, want %#v (legacy config)", cfg, want)
+	}
+	if path != legacy {
+		t.Fatalf("Resolve path = %q, want legacy %q", path, legacy)
+	}
+}
+
+func TestResolveReportsMalformedLegacyConfig(t *testing.T) {
+	home := t.TempDir()
+	env := envFromMap(map[string]string{"HOME": home})
+	legacy, _ := cliconfig.LegacyPath(env)
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, path, err := cliconfig.Resolve(env)
+	if err == nil {
+		t.Fatal("expected malformed legacy config to be reported")
+	}
+	if path != legacy {
+		t.Fatalf("Resolve error path = %q, want legacy path %q", path, legacy)
+	}
+	if !strings.Contains(err.Error(), legacy) {
+		t.Fatalf("Resolve error should mention legacy path, got: %v", err)
+	}
+}
+
+func TestResolveReturnsCanonicalPathWhenNothingExists(t *testing.T) {
+	home := t.TempDir()
+	env := envFromMap(map[string]string{"HOME": home})
+	canonical, _ := cliconfig.Path(env)
+	cfg, path, err := cliconfig.Resolve(env)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if cfg != (cliconfig.Config{}) {
+		t.Fatalf("expected zero config, got %#v", cfg)
+	}
+	if path != canonical {
+		t.Fatalf("Resolve path = %q, want canonical %q so a future Save lands there", path, canonical)
+	}
+}
+
+func TestDeleteAllRemovesBothLocations(t *testing.T) {
+	home := t.TempDir()
+	env := envFromMap(map[string]string{"HOME": home})
+	canonical, _ := cliconfig.Path(env)
+	legacy, _ := cliconfig.LegacyPath(env)
+	if err := cliconfig.Save(canonical, cliconfig.Config{BaseURL: "http://a", Token: "t", ClientName: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cliconfig.Save(legacy, cliconfig.Config{BaseURL: "http://b", Token: "t", ClientName: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := cliconfig.DeleteAll(env)
+	if err != nil {
+		t.Fatalf("DeleteAll: %v", err)
+	}
+	if len(removed) != 2 {
+		t.Fatalf("DeleteAll removed %v, want both config files", removed)
+	}
+	for _, p := range []string{canonical, legacy} {
+		if _, statErr := os.Stat(p); !os.IsNotExist(statErr) {
+			t.Fatalf("config still present at %s: %v", p, statErr)
+		}
+	}
+}
+
+func TestDeleteAllWhenNothingConfiguredIsNoOp(t *testing.T) {
+	home := t.TempDir()
+	removed, err := cliconfig.DeleteAll(envFromMap(map[string]string{"HOME": home}))
+	if err != nil {
+		t.Fatalf("DeleteAll: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("DeleteAll removed %v, want nothing", removed)
 	}
 }
