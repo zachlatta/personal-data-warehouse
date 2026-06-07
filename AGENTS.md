@@ -36,13 +36,13 @@ its logs is the Loki wrapper in the `sysadmin` repo:
 `~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs`.
 
 That script talks to Loki over Tailscale, so it only works from a machine on
-the tailnet. This dev machine, `crobat`, is on the tailnet and has access.
-Before assuming you can use it, confirm you are actually on `crobat` by
-running `hostname` (or `scutil --get LocalHostName`) and checking the output
-equals `crobat`. If you are anywhere else, stop and ask Zach instead of
-guessing.
+the tailnet. Zach's dev machines `crobat` and `porygon` are both on the tailnet
+and have access. Before assuming you can use it, confirm you are actually on
+`crobat` or `porygon` by running `hostname` (or `scutil --get LocalHostName`)
+and checking the output equals one of those. If you are anywhere else, stop and
+ask Zach instead of guessing.
 
-Once you have confirmed you are on `crobat`, useful starting points:
+Once you have confirmed you are on `crobat` or `porygon`, useful starting points:
 
 ```bash
 # Recent app/container logs for the Coolify deployment.
