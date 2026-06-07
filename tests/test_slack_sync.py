@@ -1135,6 +1135,67 @@ def test_runner_freshness_priority_can_use_cached_conversations_for_fast_polls(m
     assert warehouse.conversation_payload_calls[0]["include_archived"] is False
 
 
+def test_runner_freshness_priority_fetches_thread_replies_inline(monkeypatch):
+    # Regression: the freshness sync used to skip replies (sync_thread_replies=False),
+    # so brand-new threads landed in the warehouse as a lone parent and their replies
+    # fell to a heavily throttled backfill job. With inline replies enabled, a thread
+    # parent that appears in the recent window is captured complete in the same pass.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "C_PUBLIC", "name": "public", "is_channel": True, "latest": {"ts": "1999.000000"}},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [{"ts": "1999.000000", "user": "U1", "text": "parent", "reply_count": 2}],
+                    "response_metadata": {},
+                },
+            ],
+            "conversations.replies": [
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1999.000000", "user": "U1", "text": "parent", "reply_count": 2},
+                        {"ts": "1999.000100", "thread_ts": "1999.000000", "user": "U2", "text": "reply one"},
+                        {"ts": "1999.000200", "thread_ts": "1999.000000", "user": "U3", "text": "reply two"},
+                    ],
+                    "response_metadata": {},
+                },
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=True,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    replies_calls = [params for method, params in client.calls if method == "conversations.replies"]
+    assert [params["channel"] for params in replies_calls] == ["C_PUBLIC"]
+    assert replies_calls[0]["ts"] == "1999.000000"
+    stored_replies = {
+        row["message_ts"] for row in warehouse.messages if row["is_thread_reply"] == 1
+    }
+    assert stored_replies == {"1999.000100", "1999.000200"}
+
+
 def test_runner_freshness_priority_syncs_stuck_channel_without_latest_metadata(monkeypatch):
     # Regression: Slack does not populate `latest` for channels in stored payloads,
     # so the freshness path used to fall back to `conversation.updated` (channel-

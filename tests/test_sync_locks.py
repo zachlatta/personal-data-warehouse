@@ -110,7 +110,8 @@ def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
     assert [call["conversation_limit"] for call in calls[:4]] == [500, 250, 100, 100]
     assert all(call["sync_users"] is False for call in calls)
     assert all(call["sync_members"] is False for call in calls)
-    assert all(call["sync_thread_replies"] is False for call in calls[:4])
+    # Freshness fetches replies inline so brand-new threads are captured complete.
+    assert all(call["sync_thread_replies"] is True for call in calls[:4])
 
 
 def test_slack_freshness_sync_piggybacks_read_state(monkeypatch) -> None:
@@ -381,7 +382,7 @@ def test_slack_thread_sync_backfills_known_threads_conservatively(monkeypatch) -
     assert calls[0]["skip_completed_threads"] is True
     assert calls[0]["skip_known_errors"] is True
     assert calls[0]["thread_order"] == "recent"
-    assert calls[0]["thread_limit"] == 1
+    assert calls[0]["thread_limit"] == 25
     assert calls[0]["thread_since_days"] == 30
 
 

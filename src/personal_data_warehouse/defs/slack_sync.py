@@ -57,7 +57,12 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
                 use_existing_conversations=True,
                 conversation_types=conversation_types,
                 conversation_limit=conversation_limit,
-                sync_thread_replies=False,
+                # Fetch replies inline for thread parents that land in the recent
+                # window so brand-new threads are captured complete on first pass.
+                # Bounded to parents within the freshness window and still capped by
+                # the rate-limit budget below. Coverage (which walks multi-year
+                # history) stays decoupled and leaves old replies to the backfill job.
+                sync_thread_replies=True,
                 max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
             ).sync_all()
         )
@@ -157,7 +162,10 @@ def run_slack_thread_sync(*, settings, warehouse, logger) -> list[SlackSyncSumma
         skip_completed_threads=True,
         skip_known_errors=True,
         thread_order=os.getenv("SLACK_ASSET_THREAD_ORDER", "recent"),
-        thread_limit=_int_env("SLACK_ASSET_THREAD_LIMIT", 1),
+        # Audit replies for recent thread parents. At 1/run this could not keep up
+        # with thread creation, so new replies on existing threads fell years behind;
+        # 25/run stays ahead of activity while remaining inside the rate-limit budget.
+        thread_limit=_int_env("SLACK_ASSET_THREAD_LIMIT", 25),
         thread_since_days=_int_env("SLACK_ASSET_THREAD_SINCE_DAYS", settings.slack_thread_audit_days),
         max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
     ).sync_all()
