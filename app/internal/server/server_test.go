@@ -27,6 +27,16 @@ func (f fakeRunner) Query(_ context.Context, sql string, maxRows int) (query.Raw
 	return result, nil
 }
 
+func describeColumnsSQL(table string) string {
+	return "SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type " +
+		"FROM pg_attribute a " +
+		"JOIN pg_class c ON c.oid = a.attrelid " +
+		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
+		"WHERE n.nspname = current_schema() AND c.relname = '" + strings.ReplaceAll(table, "'", "''") + "' " +
+		"AND a.attnum > 0 AND NOT a.attisdropped " +
+		"ORDER BY a.attnum"
+}
+
 type fakeMutationStore struct {
 	request mutations.Request
 }
@@ -401,40 +411,40 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 				{"name": "gmail_messages"},
 			},
 		},
-		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'apple_messages' ORDER BY ordinal_position": {
-			Columns: []string{"name"},
+		describeColumnsSQL("apple_messages"): {
+			Columns: []string{"name", "type"},
 			Rows: []map[string]any{
-				{"name": "message_id"},
-				{"name": "message_at"},
-				{"name": "service"},
-				{"name": "handle_id"},
-				{"name": "body_text"},
-				{"name": "is_from_me"},
-				{"name": "is_deleted"},
+				{"name": "message_id", "type": "text"},
+				{"name": "message_at", "type": "timestamp with time zone"},
+				{"name": "service", "type": "text"},
+				{"name": "handle_id", "type": "text"},
+				{"name": "body_text", "type": "text"},
+				{"name": "is_from_me", "type": "bigint"},
+				{"name": "is_deleted", "type": "bigint"},
 			},
 		},
-		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'apple_notes' ORDER BY ordinal_position": {
-			Columns: []string{"name"},
+		describeColumnsSQL("apple_notes"): {
+			Columns: []string{"name", "type"},
 			Rows: []map[string]any{
-				{"name": "note_id"},
-				{"name": "title"},
-				{"name": "modified_at"},
-				{"name": "body_text"},
-				{"name": "body_html"},
-				{"name": "is_deleted"},
+				{"name": "note_id", "type": "text"},
+				{"name": "title", "type": "text"},
+				{"name": "modified_at", "type": "timestamp with time zone"},
+				{"name": "body_text", "type": "text"},
+				{"name": "body_html", "type": "text"},
+				{"name": "is_deleted", "type": "bigint"},
 			},
 		},
-		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'clean_gmail_inbox' ORDER BY ordinal_position": {
-			Columns: []string{"name"},
-			Rows:    []map[string]any{{"name": "thread_id"}, {"name": "latest_subject"}},
+		describeColumnsSQL("clean_gmail_inbox"): {
+			Columns: []string{"name", "type"},
+			Rows:    []map[string]any{{"name": "thread_id", "type": "text"}, {"name": "latest_subject", "type": "text"}},
 		},
-		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'gmail_messages' ORDER BY ordinal_position": {
-			Columns: []string{"name"},
-			Rows:    []map[string]any{{"name": "subject"}},
+		describeColumnsSQL("gmail_messages"): {
+			Columns: []string{"name", "type"},
+			Rows:    []map[string]any{{"name": "subject", "type": "text"}},
 		},
-		"SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'apple_voice_memos_enrichments' ORDER BY ordinal_position": {
-			Columns: []string{"name"},
-			Rows:    []map[string]any{{"name": "transcript"}, {"name": "summary"}},
+		describeColumnsSQL("apple_voice_memos_enrichments"): {
+			Columns: []string{"name", "type"},
+			Rows:    []map[string]any{{"name": "transcript", "type": "text"}, {"name": "summary", "type": "text"}},
 		},
 		"SELECT substring(\"thread_id\"::text from 1 for 15) AS \"thread_id\", char_length(\"thread_id\"::text) AS \"__pdw_preview_len_0\", substring(\"latest_subject\"::text from 1 for 15) AS \"latest_subject\", char_length(\"latest_subject\"::text) AS \"__pdw_preview_len_1\" FROM \"clean_gmail_inbox\" LIMIT 3": {
 			Columns: []string{"thread_id", "__pdw_preview_len_0", "latest_subject", "__pdw_preview_len_1"},
@@ -542,16 +552,16 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	if !ok {
 		t.Fatalf("content type = %T", result.Content[0])
 	}
-	if !strings.Contains(text.Text, "# clean_gmail_inbox") || !strings.Contains(text.Text, "thread_id,latest_subject\nthread-1,hello inbox") {
+	if !strings.Contains(text.Text, "# clean_gmail_inbox") || !strings.Contains(text.Text, "thread_id (text),latest_subject (text)\nthread-1,hello inbox") {
 		t.Fatalf("schema overview did not include clean view: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# gmail_messages") || !strings.Contains(text.Text, "subject\nhello") {
+	if !strings.Contains(text.Text, "# gmail_messages") || !strings.Contains(text.Text, "subject (text)\nhello") {
 		t.Fatalf("unexpected schema overview text: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# apple_notes") || !strings.Contains(text.Text, "note_id,title,modified_at,body_text,body_html,is_deleted") {
+	if !strings.Contains(text.Text, "# apple_notes") || !strings.Contains(text.Text, "note_id (text),title (text),modified_at (timestamp with time zone),body_text (text),body_html (text),is_deleted (bigint)") {
 		t.Fatalf("schema overview did not include Apple Notes table: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# apple_messages") || !strings.Contains(text.Text, "message_id,message_at,service,handle_id,body_text,is_from_me,is_deleted") {
+	if !strings.Contains(text.Text, "# apple_messages") || !strings.Contains(text.Text, "message_id (text),message_at (timestamp with time zone),service (text),handle_id (text),body_text (text),is_from_me (bigint),is_deleted (bigint)") {
 		t.Fatalf("schema overview did not include Apple Messages table: %q", text.Text)
 	}
 

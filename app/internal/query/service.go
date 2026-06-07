@@ -672,8 +672,9 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 	// that is database-qualified, not schema-qualified, syntax.
 	out.WriteString("-- Reference these tables by their bare name in FROM/JOIN (e.g. FROM gmail_messages). Do not prefix them with the database name (\"")
 	out.WriteString(database)
-	out.WriteString(".\").\n\n")
-	overviewTrunc := Truncation{MaxRows: schemaSampleRows, MaxFieldChars: schemaSampleFieldChars}
+	out.WriteString(".\").\n")
+	out.WriteString("-- Each column header below is annotated with its Postgres type in parentheses, e.g. is_deleted (bigint), to_addresses (text[]).\n")
+	out.WriteString(fmt.Sprintf("-- Sample values below are previews truncated to %d characters; query a table directly for full values.\n\n", schemaSampleFieldChars))
 	sampleResults := s.sampleTables(ctx, tables)
 	for i, table := range tables {
 		sample := sampleResults[i]
@@ -695,12 +696,16 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 		out.WriteString("\n\n")
 		out.WriteString(sample.CSV)
 		out.WriteString("\n")
-		overviewTrunc.Fields = append(overviewTrunc.Fields, sample.Truncated.Fields...)
 	}
 
+	// Deliberately leave schemaResult.Truncated empty. Every sample value is
+	// truncated to schemaSampleFieldChars by design, so a per-field truncation
+	// table would be one noise row per sampled field across every table
+	// (~1k+ rows, dwarfing the schema itself) and the overview isn't cached, so
+	// there is no query_id to fetch fuller values with anyway. The preview note
+	// above states the cap once instead.
 	schemaResult.CSV = out.String()
-	schemaResult.Truncated = overviewTrunc
-	s.logger.InfoContext(ctx, "schema overview completed", "database", database, "tables", len(tables), "truncated_fields", len(overviewTrunc.Fields), "duration", time.Since(started))
+	s.logger.InfoContext(ctx, "schema overview completed", "database", database, "tables", len(tables), "duration", time.Since(started))
 	return Response{Results: []Result{schemaResult}}
 }
 
@@ -795,7 +800,18 @@ func (s *Service) sampleTables(ctx context.Context, tables []string) []Result {
 
 func (s *Service) sampleRows(ctx context.Context, table string) Result {
 	tableIdentifier := quotePostgresIdentifier(table)
-	describeSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '" + strings.ReplaceAll(table, "'", "''") + "' ORDER BY ordinal_position"
+	// Pull each column's precise type via format_type (e.g. text[], bigint,
+	// timestamp with time zone) rather than information_schema.data_type, which
+	// collapses every array to the unhelpful "ARRAY". Callers use these types to
+	// avoid writing predicates the planner rejects, such as `is_deleted = false`
+	// against a bigint or `to_addresses ILIKE ...` against a text[].
+	describeSQL := "SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type " +
+		"FROM pg_attribute a " +
+		"JOIN pg_class c ON c.oid = a.attrelid " +
+		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
+		"WHERE n.nspname = current_schema() AND c.relname = '" + strings.ReplaceAll(table, "'", "''") + "' " +
+		"AND a.attnum > 0 AND NOT a.attisdropped " +
+		"ORDER BY a.attnum"
 	started := time.Now()
 	result := Result{SQL: describeSQL}
 	s.logger.DebugContext(ctx, "schema overview describe started", "table", table, "sql", describeSQL)
@@ -807,6 +823,7 @@ func (s *Service) sampleRows(ctx context.Context, table string) Result {
 		return result
 	}
 	columns := describedColumnNames(describeResult)
+	columnTypes := describedColumnTypes(describeResult)
 	if len(columns) == 0 {
 		result.CSV = ""
 		s.logger.DebugContext(ctx, "schema overview sample skipped empty table schema", "table", table, "duration", time.Since(started))
@@ -825,7 +842,7 @@ func (s *Service) sampleRows(ctx context.Context, table string) Result {
 	}
 	rows, trunc := previewRows(columns, raw.Rows)
 	result.Truncated = trunc
-	result.CSV, err = rowsToCSV(columns, rows)
+	result.CSV, err = rowsToCSVWithHeaders(columnHeadersWithTypes(columns, columnTypes), columns, rows)
 	if err != nil {
 		result.Error = err.Error()
 		result.CSV = errorCSV(result.Error)
@@ -878,9 +895,17 @@ func (s *Service) truncateString(rowIndex int, column, value string, trunc *Trun
 }
 
 func rowsToCSV(columns []string, rows []map[string]any) (string, error) {
+	return rowsToCSVWithHeaders(columns, columns, rows)
+}
+
+// rowsToCSVWithHeaders is rowsToCSV with a separate header row, so the visible
+// column labels (e.g. `is_deleted (bigint)`) can differ from the keys used to
+// look up each row's values (e.g. `is_deleted`). headers and columns must be
+// the same length and order.
+func rowsToCSVWithHeaders(headers, columns []string, rows []map[string]any) (string, error) {
 	var buf bytes.Buffer
 	writer := csv.NewWriter(&buf)
-	if err := writer.Write(columns); err != nil {
+	if err := writer.Write(headers); err != nil {
 		return "", err
 	}
 	for _, row := range rows {
@@ -946,6 +971,36 @@ func describedColumnNames(result RawResult) []string {
 		}
 	}
 	return columns
+}
+
+func describedColumnTypes(result RawResult) map[string]string {
+	types := make(map[string]string, len(result.Rows))
+	for _, row := range result.Rows {
+		name := rowString(row, "name")
+		if name == "" {
+			continue
+		}
+		types[name] = rowString(row, "type")
+	}
+	return types
+}
+
+// columnHeadersWithTypes renders the per-table CSV header so each column name
+// carries its Postgres type inline in parentheses, e.g. `is_deleted (bigint)`,
+// `to_addresses (text[])`. Callers see the exact type on the column itself
+// instead of guessing from truncated sample values, which is what led them to
+// write predicates the planner rejects (`is_deleted = false` against a bigint,
+// `to_addresses ILIKE ...` against a text[]).
+func columnHeadersWithTypes(columns []string, types map[string]string) []string {
+	headers := make([]string, len(columns))
+	for i, column := range columns {
+		typeName := types[column]
+		if typeName == "" {
+			typeName = "unknown"
+		}
+		headers[i] = column + " (" + typeName + ")"
+	}
+	return headers
 }
 
 func previewSampleSQL(tableIdentifier string, columns []string) string {

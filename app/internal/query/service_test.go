@@ -54,11 +54,21 @@ func statement(question, sql string) Statement {
 	return Statement{Question: question, SQL: sql}
 }
 
+func describeColumnsSQL(table string) string {
+	return "SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type " +
+		"FROM pg_attribute a " +
+		"JOIN pg_class c ON c.oid = a.attrelid " +
+		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
+		"WHERE n.nspname = current_schema() AND c.relname = '" + strings.ReplaceAll(table, "'", "''") + "' " +
+		"AND a.attnum > 0 AND NOT a.attisdropped " +
+		"ORDER BY a.attnum"
+}
+
 func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	showTablesSQL := "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
-	describeCleanGmailSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'clean_gmail_inbox' ORDER BY ordinal_position"
-	describeGmailSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'gmail_messages' ORDER BY ordinal_position"
-	describeSlackSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'slack\"messages' ORDER BY ordinal_position"
+	describeCleanGmailSQL := describeColumnsSQL("clean_gmail_inbox")
+	describeGmailSQL := describeColumnsSQL("gmail_messages")
+	describeSlackSQL := describeColumnsSQL("slack\"messages")
 	runner := &recordingRunner{results: map[string]RawResult{
 		"SELECT current_database() AS database": {
 			Columns: []string{"database"},
@@ -147,21 +157,23 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	}
 	wantCSV := strings.Join([]string{
 		"-- Reference these tables by their bare name in FROM/JOIN (e.g. FROM gmail_messages). Do not prefix them with the database name (\"default.\").",
+		"-- Each column header below is annotated with its Postgres type in parentheses, e.g. is_deleted (bigint), to_addresses (text[]).",
+		"-- Sample values below are previews truncated to 15 characters; query a table directly for full values.",
 		"",
 		"# clean_gmail_inbox",
 		"",
-		"thread_id,latest_subject",
+		"thread_id (String),latest_subject (String)",
 		"thread-1,hello inbox",
 		"",
 		"# gmail_messages (~1,234,567 rows, estimated)",
 		"",
-		"id,body",
+		"id (String),body (String)",
 		"msg-1,abcdefghijklmno",
 		"msg-2,short",
 		"",
 		"# slack\"messages (~42 rows, estimated)",
 		"",
-		"channel_id",
+		"channel_id (String)",
 		"C123",
 	}, "\n") + "\n"
 	result := resp.Results[0]
@@ -171,8 +183,12 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	if result.CSV != wantCSV {
 		t.Fatalf("CSV = %q, want %q", result.CSV, wantCSV)
 	}
-	if len(result.Truncated.Fields) != 1 {
-		t.Fatalf("sample truncations = %#v", result.Truncated.Fields)
+	// The schema overview deliberately emits no per-field truncation table:
+	// every sample value is a fixed-width preview, so a truncation row per
+	// field would be pure noise (and there is no cached query_id to fetch
+	// fuller values with). The leading note states the preview cap instead.
+	if !result.Truncated.Empty() {
+		t.Fatalf("schema overview should not emit a truncation table, got %#v", result.Truncated)
 	}
 }
 
@@ -201,7 +217,7 @@ func TestFormatRowCount(t *testing.T) {
 func TestServiceSchemaOverviewSkipsRowCountWhenLookupFails(t *testing.T) {
 	const rowEstimateSQL = "SELECT c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0"
 	showTablesSQL := "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
-	describeSQL := "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'gmail_messages' ORDER BY ordinal_position"
+	describeSQL := describeColumnsSQL("gmail_messages")
 	sampleSQL := "SELECT substring(\"id\"::text from 1 for 15) AS \"id\", char_length(\"id\"::text) AS \"__pdw_preview_len_0\" FROM \"gmail_messages\" LIMIT 3"
 	runner := &recordingRunner{
 		results: map[string]RawResult{
