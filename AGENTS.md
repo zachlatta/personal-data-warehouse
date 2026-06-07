@@ -11,6 +11,24 @@ Always assume other agents may be running in the same worktree. Before committin
 verify the staged changes and commit only the changes made in the current session unless Zach
 explicitly instructs otherwise.
 
+## Deployment / Production
+
+This app runs in production as a Coolify app on `rotom`, Zach's personal Coolify server (Linux,
+on the Tailscale tailnet). You can `ssh rotom` to inspect its running config directly.
+
+Coolify management tooling lives in the `sysadmin` repo at `~/dev/zachlatta/sysadmin`:
+
+- On `crobat` you can obtain a Coolify API key from that repo to drive the Coolify API. See its
+  `README.md` and the `rotom/` notes folder for details.
+- The same repo holds the Loki log wrapper used to read production logs — see the
+  [Production Logs](#production-logs) section below.
+
+To investigate the production Dagster deployment directly, connect to its Postgres. The
+production Dagster Postgres URL is **not** present in this worktree: `.env` is gitignored and
+only exists in the parent (non-worktree) checkout. Read `PROD_DAGSTER_URL` from the parent
+repo's env file at `~/dev/zachlatta/personal-data-warehouse/.env`. In production, Dagster reads
+the same connection string from `DAGSTER_POSTGRES_URL` (see `docker/dagster.yaml`).
+
 ## Production Logs
 
 Production runs as a Coolify app on the `rotom` server. The best way to read
