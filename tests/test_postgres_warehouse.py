@@ -31,6 +31,7 @@ from personal_data_warehouse.postgres import (
     POSTGRES_TABLES,
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
+    _dedupe_conflict_rows,
     _normalize_insert_value,
     _upsert_clause,
 )
@@ -211,6 +212,77 @@ def test_postgres_message_upsert_keeps_highest_sync_version(warehouse: PostgresW
     rows = warehouse._query("SELECT subject, sync_version FROM gmail_messages WHERE message_id = %s", ("m1",))
 
     assert rows == [("new", 20)]
+
+
+def test_dedupe_conflict_rows_collapses_duplicate_primary_keys() -> None:
+    columns = SLACK_MESSAGE_COLUMNS
+    spec = POSTGRES_TABLES["slack_messages"]
+
+    def _row(*, message_ts: str, sync_version: int, text: str) -> tuple:
+        values = _default_row(
+            columns,
+            account="zrl",
+            team_id="T1",
+            conversation_id="C1",
+            message_ts=message_ts,
+            sync_version=sync_version,
+            text=text,
+        )
+        return tuple(values[column] for column in columns)
+
+    # Same primary key four times in one batch; the version guard keeps the
+    # highest sync_version and, on ties, the last occurrence.
+    rows = [
+        _row(message_ts="100.1", sync_version=1, text="first"),
+        _row(message_ts="100.1", sync_version=3, text="high-version"),
+        _row(message_ts="100.1", sync_version=3, text="tie-last-wins"),
+        _row(message_ts="100.1", sync_version=2, text="stale"),
+        _row(message_ts="200.2", sync_version=1, text="distinct-key"),
+    ]
+
+    deduped = _dedupe_conflict_rows(list(rows), columns, spec)
+
+    ts_index = columns.index("message_ts")
+    text_index = columns.index("text")
+    winners = {row[ts_index]: row[text_index] for row in deduped}
+    assert winners == {"100.1": "tie-last-wins", "200.2": "distinct-key"}
+
+
+def test_dedupe_conflict_rows_leaves_unique_batch_untouched() -> None:
+    columns = SLACK_MESSAGE_COLUMNS
+    spec = POSTGRES_TABLES["slack_messages"]
+    rows = [
+        tuple(_default_row(columns, conversation_id="C1", message_ts="1.0", sync_version=1)[c] for c in columns),
+        tuple(_default_row(columns, conversation_id="C1", message_ts="2.0", sync_version=1)[c] for c in columns),
+    ]
+
+    assert _dedupe_conflict_rows(rows, columns, spec) is rows
+
+
+def test_postgres_insert_slack_messages_dedupes_duplicate_keys_in_one_batch(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_slack_tables()
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+
+    # Two rows with the SAME (account, team_id, conversation_id, message_ts) in a
+    # single insert batch — the exact shape that produced "ON CONFLICT DO UPDATE
+    # command cannot affect row a second time" in prod. Must not raise, and the
+    # higher sync_version must win.
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1", message_ts="100.1", message_datetime=message_datetime, sync_version=1, text="old"
+            ),
+            _slack_message_row(
+                conversation_id="C1", message_ts="100.1", message_datetime=message_datetime, sync_version=2, text="new"
+            ),
+        ]
+    )
+
+    rows = warehouse._query(
+        "SELECT text, sync_version FROM slack_messages WHERE conversation_id = %s AND message_ts = %s",
+        ("C1", "100.1"),
+    )
+    assert rows == [("new", 2)]
 
 
 def _gmail_attachment_payload(*, message_id: str) -> str:

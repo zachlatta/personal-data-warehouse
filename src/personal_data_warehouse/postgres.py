@@ -4628,6 +4628,7 @@ class PostgresWarehouse:
         if not rows:
             return
         spec = POSTGRES_TABLES[table]
+        rows = _dedupe_conflict_rows(rows, columns, spec)
         column_sql = ", ".join(_identifier(column) for column in columns)
         template = "(" + ", ".join(["%s"] * len(columns)) + ")"
         sql = f"""
@@ -4681,6 +4682,65 @@ def _default_sql(column: str, *, table: str | None = None) -> str:
 
 def _is_jsonb_column(table: str | None, column: str) -> bool:
     return bool(table and column in JSONB_COLUMNS_BY_TABLE.get(table, set()))
+
+
+def _dedupe_conflict_rows(
+    rows: list[tuple[Any, ...]],
+    columns: tuple[str, ...],
+    spec: TableSpec,
+) -> list[tuple[Any, ...]]:
+    """Collapse rows that share an ON CONFLICT key within a single batch.
+
+    Postgres rejects an ``INSERT ... ON CONFLICT DO UPDATE`` whose VALUES list
+    targets the same conflict row twice ("ON CONFLICT DO UPDATE command cannot
+    affect row a second time"). A sync window can legitimately yield two rows
+    with the same primary key (e.g. an edited Slack message appearing twice in
+    one ``conversations.history`` page), which used to fail the entire run.
+
+    Keep the row that the version guard (``table.version <= EXCLUDED.version``)
+    would leave persisted: the highest ``version_column`` value, and the last
+    occurrence on ties. First-seen order of distinct keys is preserved.
+    """
+    primary_key = spec.primary_key
+    if len(rows) <= 1 or not primary_key:
+        return rows
+    try:
+        key_indexes = tuple(columns.index(column) for column in primary_key)
+    except ValueError:
+        # A primary-key column is absent from this partial insert; without the
+        # full key we can't dedupe safely, so leave the batch untouched.
+        return rows
+    version_index = columns.index(spec.version_column) if spec.version_column in columns else None
+
+    winners: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+    for row in rows:
+        key = tuple(row[index] for index in key_indexes)
+        existing = winners.get(key)
+        if existing is None or _conflict_row_wins(row, existing, version_index):
+            winners[key] = row
+    if len(winners) == len(rows):
+        return rows
+    return list(winners.values())
+
+
+def _conflict_row_wins(
+    candidate: tuple[Any, ...],
+    existing: tuple[Any, ...],
+    version_index: int | None,
+) -> bool:
+    """Whether ``candidate`` (later in batch order) supersedes ``existing``.
+
+    Mirrors the SQL guard ``table.version <= EXCLUDED.version``: a later row
+    wins when its version is greater than or equal to the kept row's, so ties
+    fall to the last writer. Falls back to last-wins when there is no version
+    column or the values are not comparable.
+    """
+    if version_index is None:
+        return True
+    try:
+        return candidate[version_index] >= existing[version_index]
+    except TypeError:
+        return True
 
 
 def _upsert_clause(table: str, spec: TableSpec, columns: tuple[str, ...] | None = None) -> str:
