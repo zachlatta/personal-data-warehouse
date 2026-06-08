@@ -173,12 +173,17 @@ gmail_mailbox_sync_job = define_asset_job(
 )
 
 
+# A full mailbox sync takes ~9 minutes, so an every-minute cadence ran it
+# effectively back-to-back and continuously. The skip_if_job_in_progress guard
+# already prevents overlapping runs, but spacing the cron to every 15 minutes
+# guarantees a real idle gap between runs, draining sustained CPU/memory pressure
+# on the host (which was thrashing swap and starving the Dagster gRPC heartbeat).
 @schedule(
-    cron_schedule="* * * * *",
+    cron_schedule="*/15 * * * *",
     job=gmail_mailbox_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def gmail_mailbox_sync_every_minute(context):
+def gmail_mailbox_sync_every_fifteen_minutes(context):
     return skip_if_job_in_progress(context, job_name="gmail_mailbox_sync_job")
 
 
@@ -187,6 +192,6 @@ def defs() -> Definitions:
     return Definitions(
         assets=[gmail_mailbox_sync],
         jobs=[gmail_mailbox_sync_job],
-        schedules=[gmail_mailbox_sync_every_minute],
+        schedules=[gmail_mailbox_sync_every_fifteen_minutes],
         resources={"ollama": ollama_resource_from_env()},
     )

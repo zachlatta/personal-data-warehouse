@@ -222,7 +222,9 @@ Then materialize the `gmail_mailbox_sync` asset from the Dagster UI.
 Materialize `calendar_event_sync` to sync Google Calendar events. Calendar sync uses Google's incremental cursor for ordinary changes and a rolling expanded-instance window for recurring event occurrences.
 
 The Docker/Coolify deployment also includes an enabled Dagster schedule,
-`gmail_mailbox_sync_every_minute`, which runs the Gmail sync every minute.
+`gmail_mailbox_sync_every_fifteen_minutes`, which runs the Gmail sync every 15 minutes.
+A full mailbox sync takes several minutes, so this cadence leaves an idle gap between runs
+instead of running back-to-back continuously (which kept the host under sustained load).
 Gmail syncs use a nonblocking lock so a scheduled tick skips if another sync is still running.
 When `DAGSTER_POSTGRES_URL` or `DATABASE_URL` is set, the lock uses a Postgres advisory lock;
 otherwise it falls back to a local process lock.
@@ -284,7 +286,7 @@ Freshness stages also poll capped sets of cached conversations per type, ordered
 activity, so each scheduled run remains bounded.
 All Slack schedules share a nonblocking Slack lock, so a scheduled tick skips if another Slack
 sync stage is still running.
-Calendar sync runs through `calendar_event_sync_every_minute` with its own nonblocking lock.
+Calendar sync runs through `calendar_event_sync_every_five_minutes` with its own nonblocking lock.
 
 ## Docker / Coolify
 

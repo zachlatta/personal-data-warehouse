@@ -21,7 +21,7 @@ from httplib2 import Response
 from PIL import Image
 from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
 from personal_data_warehouse.defs.gmail_sync import (
-    gmail_mailbox_sync_every_minute,
+    gmail_mailbox_sync_every_fifteen_minutes,
     ollama_resource_from_env,
     prepare_attachment_ai_fallback,
 )
@@ -465,9 +465,9 @@ def test_gmail_token_json_from_env_accepts_base64(monkeypatch) -> None:
     assert gmail_token_json_from_env("zach@hackclub.com") == token_json
 
 
-def test_gmail_sync_schedule_runs_every_minute_by_default() -> None:
-    assert gmail_mailbox_sync_every_minute.cron_schedule == "* * * * *"
-    assert gmail_mailbox_sync_every_minute.default_status.value == "RUNNING"
+def test_gmail_sync_schedule_runs_every_fifteen_minutes_by_default() -> None:
+    assert gmail_mailbox_sync_every_fifteen_minutes.cron_schedule == "*/15 * * * *"
+    assert gmail_mailbox_sync_every_fifteen_minutes.default_status.value == "RUNNING"
 
 
 def test_ollama_resource_from_env_reads_only_ai_connection_settings(monkeypatch) -> None:

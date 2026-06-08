@@ -16,7 +16,7 @@ from personal_data_warehouse.calendar_sync import (
     parse_calendar_event_time,
 )
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.defs.calendar_sync import calendar_event_sync_every_minute
+from personal_data_warehouse.defs.calendar_sync import calendar_event_sync_every_five_minutes
 from personal_data_warehouse.google_auth import google_token_json_from_env
 
 
@@ -109,9 +109,9 @@ def test_google_token_json_from_env_accepts_shared_google_token(monkeypatch) -> 
     assert google_token_json_from_env("zach@example.com") == token_json
 
 
-def test_calendar_sync_schedule_runs_every_minute_by_default() -> None:
-    assert calendar_event_sync_every_minute.cron_schedule == "* * * * *"
-    assert calendar_event_sync_every_minute.default_status.value == "RUNNING"
+def test_calendar_sync_schedule_runs_every_five_minutes_by_default() -> None:
+    assert calendar_event_sync_every_five_minutes.cron_schedule == "*/5 * * * *"
+    assert calendar_event_sync_every_five_minutes.default_status.value == "RUNNING"
 
 
 def test_load_settings_accepts_calendar_specific_accounts_and_ids(monkeypatch) -> None:

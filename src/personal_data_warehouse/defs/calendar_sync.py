@@ -81,11 +81,11 @@ calendar_event_sync_job = define_asset_job(
 
 
 @schedule(
-    cron_schedule="* * * * *",
+    cron_schedule="*/5 * * * *",
     job=calendar_event_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def calendar_event_sync_every_minute(context):
+def calendar_event_sync_every_five_minutes(context):
     return skip_if_job_active(context, job_name="calendar_event_sync_job")
 
 
@@ -94,5 +94,5 @@ def defs() -> Definitions:
     return Definitions(
         assets=[calendar_event_sync],
         jobs=[calendar_event_sync_job],
-        schedules=[calendar_event_sync_every_minute],
+        schedules=[calendar_event_sync_every_five_minutes],
     )

@@ -97,7 +97,7 @@ def test_gmail_schedule_skips_when_prior_run_is_in_progress(monkeypatch) -> None
     monkeypatch.setattr(gmail_sync_defs, "skip_if_job_in_progress", fake_skip_if_job_in_progress)
     context = object()
 
-    result = gmail_sync_defs.gmail_mailbox_sync_every_minute._execution_fn.decorated_fn(context)
+    result = gmail_sync_defs.gmail_mailbox_sync_every_fifteen_minutes._execution_fn.decorated_fn(context)
 
     assert result is expected
     assert calls == [(context, "gmail_mailbox_sync_job")]
