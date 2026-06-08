@@ -18,18 +18,30 @@ from dagster import (
 
 from personal_data_warehouse.apple_messages_drive_ingest import (
     AppleMessagesDriveIngestRunner,
-    GoogleDriveAppleMessagesPromoter,
-    build_google_drive_service,
-    has_drive_batch_payloads,
-    iter_drive_batch_payloads,
+    has_batch_payloads,
+    iter_batch_payloads,
 )
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 APPLE_MESSAGES_DRIVE_INGEST_POSTGRES_LOCK_ID = 8_407_112_440
 APPLE_MESSAGES_SENSOR_INTERVAL_SECONDS = 60
+
+
+def _apple_messages_object_store(settings):
+    return build_object_store(
+        google_drive_spec(
+            folder_id=settings.apple_messages.google_drive_folder_id,
+            account=settings.apple_messages.google_drive_account,
+            source="apple_messages",
+            blob_kind="apple_message_attachment",
+            metadata_kind="apple_message_export_batch",
+        ),
+        settings=settings,
+    )
 
 
 @asset(
@@ -50,20 +62,11 @@ def apple_messages_drive_ingest(context) -> MaterializeResult:
             context.log.warning("Skipping Apple Messages Drive ingest because another run is already active")
             summary = None
         else:
-            service = build_google_drive_service(account=settings.apple_messages.google_drive_account, settings=settings)
+            object_store = _apple_messages_object_store(settings)
             summary = AppleMessagesDriveIngestRunner(
                 warehouse=warehouse,
-                batch_source=lambda: iter_drive_batch_payloads(
-                    service=service,
-                    folder_id=settings.apple_messages.google_drive_folder_id,
-                ),
-                promoter_factory=lambda: GoogleDriveAppleMessagesPromoter(
-                    service=build_google_drive_service(
-                        account=settings.apple_messages.google_drive_account,
-                        settings=settings,
-                    ),
-                    folder_id=settings.apple_messages.google_drive_folder_id,
-                ),
+                batch_source=lambda: iter_batch_payloads(object_store=object_store),
+                object_store_factory=lambda: _apple_messages_object_store(settings),
                 promotion_workers=int(os.getenv("APPLE_MESSAGES_DRIVE_INGEST_PROMOTION_WORKERS", "8")),
                 logger=context.log,
             ).sync()
@@ -101,13 +104,8 @@ def apple_messages_drive_inbox_sensor(context):
     settings = load_settings(require_gmail=False, require_apple_messages=True)
     if settings.apple_messages is None:
         raise RuntimeError("Apple Messages sync is not configured")
-    service = build_google_drive_service(account=settings.apple_messages.google_drive_account, settings=settings)
-    if not has_drive_batch_payloads(
-        service=service,
-        folder_id=settings.apple_messages.google_drive_folder_id,
-        stage="inbox",
-    ):
-        return SkipReason("No Apple Messages inbox batches found in Google Drive.")
+    if not has_batch_payloads(object_store=_apple_messages_object_store(settings), stage="inbox"):
+        return SkipReason("No Apple Messages inbox batches found in object storage.")
 
     return RunRequest(tags={"apple_messages_trigger": "drive_inbox"})
 

@@ -45,7 +45,7 @@ from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.warehouse import warehouse_from_settings
 from personal_data_warehouse.schema import SyncState
 from personal_data_warehouse.google_auth import google_token_json_from_env, load_google_credentials
-from personal_data_warehouse_voice_memos.storage import ObjectStore, StoredObject
+from personal_data_warehouse.objectstore import ObjectStore, StoredObject
 
 LOGGER = logging.getLogger(__name__)
 EPOCH_UTC = datetime.fromtimestamp(0, tz=UTC)

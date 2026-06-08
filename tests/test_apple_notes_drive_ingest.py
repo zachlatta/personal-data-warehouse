@@ -7,12 +7,14 @@ import json
 from personal_data_warehouse.apple_notes_drive_ingest import (
     AppleNotesDriveIngestRunner,
     clean_metadata_payload,
-    drive_metadata_files_query,
+    has_metadata_payloads,
+    iter_metadata_payloads,
     library_metadata_payload,
     metadata_to_attachment_rows,
     metadata_to_note_row,
     metadata_to_revision_row,
 )
+from personal_data_warehouse.objectstore import ObjectListing
 
 
 class FakeLogger:
@@ -43,13 +45,34 @@ class FakeWarehouse:
         self.attachments.extend(rows)
 
 
-class FakePromoter:
-    def __init__(self) -> None:
-        self.payloads: list[dict[str, object]] = []
+class FakeObjectStore:
+    backend = "google_drive"
 
-    def promote(self, payload) -> int:
-        self.payloads.append(payload)
-        return 3
+    def __init__(self, *, listings_by_kind=None, json_by_id=None) -> None:
+        self.listings_by_kind = listings_by_kind or {}
+        self.json_by_id = dict(json_by_id or {})
+        self.list_calls: list[dict] = []
+        self.moved: list[tuple[str, str]] = []
+
+    def list_objects(self, *, kind, stage=None, properties=None):
+        self.list_calls.append({"kind": kind, "stage": stage, "properties": properties})
+        return list(self.listings_by_kind.get(kind, []))
+
+    def find_object(self, *, kind, stage=None, properties=None):
+        listings = self.listings_by_kind.get(kind, [])
+        return listings[0] if listings else None
+
+    def get_object(self, ref):
+        return json.dumps(self.json_by_id[str(ref["storage_file_id"])]).encode("utf-8")
+
+    def move_object(self, ref, *, new_object_key, app_properties=None):
+        self.moved.append((str(ref.get("storage_file_id", "")), new_object_key))
+        return {
+            "storage_backend": self.backend,
+            "storage_key": new_object_key,
+            "storage_file_id": str(ref.get("storage_file_id", "")),
+            "storage_url": "https://drive/promoted",
+        }
 
 
 def decorated_metadata_payload() -> dict[str, object]:
@@ -108,6 +131,24 @@ def decorated_metadata_payload() -> dict[str, object]:
     }
 
 
+def raw_metadata_payload() -> dict[str, object]:
+    payload = clean_metadata_payload(decorated_metadata_payload())
+    return payload
+
+
+def _listing(kind_id: str, app_properties: dict, filename: str = "") -> ObjectListing:
+    return ObjectListing(
+        ref={
+            "storage_backend": "google_drive",
+            "storage_key": "",
+            "storage_file_id": kind_id,
+            "storage_url": f"https://drive/{kind_id}",
+        },
+        app_properties=app_properties,
+        filename=filename,
+    )
+
+
 def test_metadata_to_rows_maps_latest_revision_and_attachment_rows() -> None:
     ingested_at = datetime(2026, 5, 21, 12, 10, tzinfo=UTC)
     payload = decorated_metadata_payload()
@@ -138,14 +179,58 @@ def test_library_metadata_payload_rewrites_storage_keys() -> None:
     )
 
 
+def test_iter_metadata_payloads_joins_html_and_attachments_via_object_store() -> None:
+    store = FakeObjectStore(
+        listings_by_kind={
+            "apple_note_revision_metadata": [
+                _listing("metadata-file", {"note_id": "note-1", "revision_id": "rev-1", "content_sha256": "metadata-sha"})
+            ],
+            "apple_note_body_html": [
+                _listing("html-file", {"note_id": "note-1", "revision_id": "rev-1", "content_sha256": "html-sha"})
+            ],
+            "apple_note_attachment": [
+                _listing(
+                    "attachment-file",
+                    {"note_id": "note-1", "revision_id": "rev-1", "attachment_id": "att-1", "content_sha256": "att-sha"},
+                )
+            ],
+        },
+        json_by_id={"metadata-file": raw_metadata_payload()},
+    )
+
+    payloads = list(iter_metadata_payloads(object_store=store))
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["metadata_file"]["storage_key"] == "apple-notes/inbox/2026/05/note-1/rev-1.json"
+    assert payload["metadata_file"]["storage_file_id"] == "metadata-file"
+    assert payload["html_file"]["storage_key"] == "apple-notes/inbox/2026/05/note-1/rev-1.html"
+    attachment_file = payload["note"]["attachments"][0]["file"]
+    assert attachment_file["storage_key"] == "apple-notes/inbox/2026/05/note-1/rev-1/attachments/att-1-att-sha.txt"
+    assert attachment_file["storage_file_id"] == "attachment-file"
+    # metadata listed with stage; attachments listed without stage (any).
+    metadata_call = next(call for call in store.list_calls if call["kind"] == "apple_note_revision_metadata")
+    attachment_call = next(call for call in store.list_calls if call["kind"] == "apple_note_attachment")
+    assert metadata_call["stage"] == "inbox"
+    assert attachment_call["stage"] == ""
+
+
+def test_has_metadata_payloads_uses_find_object() -> None:
+    store = FakeObjectStore(
+        listings_by_kind={"apple_note_revision_metadata": [_listing("metadata-file", {})]}
+    )
+    assert has_metadata_payloads(object_store=store) is True
+    assert has_metadata_payloads(object_store=FakeObjectStore()) is False
+
+
 def test_drive_ingest_runner_writes_rows_and_promotes() -> None:
     warehouse = FakeWarehouse()
-    promoter = FakePromoter()
+    store = FakeObjectStore()
 
     summary = AppleNotesDriveIngestRunner(
         warehouse=warehouse,
         metadata_source=lambda: [decorated_metadata_payload()],
-        promoter=promoter,
+        object_store=store,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 12, 10, tzinfo=UTC),
     ).sync()
@@ -155,11 +240,16 @@ def test_drive_ingest_runner_writes_rows_and_promotes() -> None:
     assert summary.notes_written == 1
     assert summary.revisions_written == 1
     assert summary.attachments_written == 1
-    assert summary.files_promoted == 3
+    assert summary.files_promoted == 3  # metadata + html + attachment
     assert warehouse.notes[0]["metadata_storage_key"].startswith("apple-notes/library/")
     assert warehouse.revisions[0]["revision_id"] == "rev-1"
     assert warehouse.attachments[0]["content_sha256"] == "att-sha"
-    assert promoter.payloads == [decorated_metadata_payload()]
+    assert ("metadata-file", "apple-notes/library/2026/05/note-1/rev-1.json") in store.moved
+    assert ("html-file", "apple-notes/library/2026/05/note-1/rev-1.html") in store.moved
+    assert (
+        "attachment-file",
+        "apple-notes/library/2026/05/note-1/rev-1/attachments/att-1-att-sha.txt",
+    ) in store.moved
 
 
 def test_drive_ingest_runner_dedupes_latest_rows_but_keeps_revisions() -> None:
@@ -184,32 +274,23 @@ def test_drive_ingest_runner_dedupes_latest_rows_but_keeps_revisions() -> None:
     assert {row["revision_id"] for row in warehouse.revisions} == {"rev-1", "rev-2"}
 
 
-def test_drive_ingest_runner_can_promote_with_factory_workers() -> None:
+def test_drive_ingest_runner_promotes_with_object_store_factory_workers() -> None:
     warehouse = FakeWarehouse()
-    promoters: list[FakePromoter] = []
+    stores: list[FakeObjectStore] = []
 
-    def promoter_factory() -> FakePromoter:
-        promoter = FakePromoter()
-        promoters.append(promoter)
-        return promoter
+    def object_store_factory() -> FakeObjectStore:
+        store = FakeObjectStore()
+        stores.append(store)
+        return store
 
     summary = AppleNotesDriveIngestRunner(
         warehouse=warehouse,
         metadata_source=lambda: [decorated_metadata_payload(), decorated_metadata_payload()],
-        promoter_factory=promoter_factory,
+        object_store_factory=object_store_factory,
         promotion_workers=2,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 12, 10, tzinfo=UTC),
     ).sync()
 
-    assert summary.files_promoted == 6
-    assert sum(len(promoter.payloads) for promoter in promoters) == 2
-
-
-def test_drive_metadata_query_targets_apple_notes_inbox() -> None:
-    query = drive_metadata_files_query(folder_id="root-folder", stage="inbox")
-
-    assert "pdw_source' and value='apple_notes" in query
-    assert "pdw_kind' and value='apple_note_revision_metadata" in query
-    assert "pdw_stage' and value='inbox" in query
-    assert "pdw_root_folder_id" in query
+    assert summary.files_promoted == 6  # 2 payloads x 3 files
+    assert sum(len(store.moved) for store in stores) == 6

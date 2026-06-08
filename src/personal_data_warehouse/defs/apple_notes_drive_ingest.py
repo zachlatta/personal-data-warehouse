@@ -18,18 +18,30 @@ from dagster import (
 
 from personal_data_warehouse.apple_notes_drive_ingest import (
     AppleNotesDriveIngestRunner,
-    GoogleDriveAppleNotesPromoter,
-    build_google_drive_service,
-    has_drive_metadata_payloads,
-    iter_drive_metadata_payloads,
+    has_metadata_payloads,
+    iter_metadata_payloads,
 )
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 APPLE_NOTES_DRIVE_INGEST_POSTGRES_LOCK_ID = 8_407_112_439
 APPLE_NOTES_SENSOR_INTERVAL_SECONDS = 60
+
+
+def _apple_notes_object_store(settings):
+    return build_object_store(
+        google_drive_spec(
+            folder_id=settings.apple_notes.google_drive_folder_id,
+            account=settings.apple_notes.google_drive_account,
+            source="apple_notes",
+            blob_kind="apple_note_body_html",
+            metadata_kind="apple_note_revision_metadata",
+        ),
+        settings=settings,
+    )
 
 
 @asset(
@@ -50,25 +62,15 @@ def apple_notes_drive_ingest(context) -> MaterializeResult:
             context.log.warning("Skipping Apple Notes Drive ingest because another run is already active")
             summary = None
         else:
-            service = build_google_drive_service(account=settings.apple_notes.google_drive_account, settings=settings)
+            object_store = _apple_notes_object_store(settings)
             summary = AppleNotesDriveIngestRunner(
                 warehouse=warehouse,
-                metadata_source=lambda: iter_drive_metadata_payloads(
-                    service=service,
-                    folder_id=settings.apple_notes.google_drive_folder_id,
-                    download_service_factory=lambda: build_google_drive_service(
-                        account=settings.apple_notes.google_drive_account,
-                        settings=settings,
-                    ),
+                metadata_source=lambda: iter_metadata_payloads(
+                    object_store=object_store,
+                    object_store_factory=lambda: _apple_notes_object_store(settings),
                     download_workers=int(os.getenv("APPLE_NOTES_DRIVE_INGEST_DOWNLOAD_WORKERS", "8")),
                 ),
-                promoter_factory=lambda: GoogleDriveAppleNotesPromoter(
-                    service=build_google_drive_service(
-                        account=settings.apple_notes.google_drive_account,
-                        settings=settings,
-                    ),
-                    folder_id=settings.apple_notes.google_drive_folder_id,
-                ),
+                object_store_factory=lambda: _apple_notes_object_store(settings),
                 promotion_workers=int(os.getenv("APPLE_NOTES_DRIVE_INGEST_PROMOTION_WORKERS", "8")),
                 logger=context.log,
             ).sync()
@@ -103,13 +105,8 @@ def apple_notes_drive_inbox_sensor(context):
     settings = load_settings(require_gmail=False, require_apple_notes=True)
     if settings.apple_notes is None:
         raise RuntimeError("Apple Notes sync is not configured")
-    service = build_google_drive_service(account=settings.apple_notes.google_drive_account, settings=settings)
-    if not has_drive_metadata_payloads(
-        service=service,
-        folder_id=settings.apple_notes.google_drive_folder_id,
-        stage="inbox",
-    ):
-        return SkipReason("No Apple Notes inbox metadata found in Google Drive.")
+    if not has_metadata_payloads(object_store=_apple_notes_object_store(settings), stage="inbox"):
+        return SkipReason("No Apple Notes inbox metadata found in object storage.")
 
     return RunRequest(tags={"apple_notes_trigger": "drive_inbox"})
 

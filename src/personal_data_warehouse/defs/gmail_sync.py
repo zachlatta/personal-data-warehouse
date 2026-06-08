@@ -31,10 +31,8 @@ from personal_data_warehouse.gmail_sync import (
     attachment_ai_fallback_config_from_settings,
 )
 from personal_data_warehouse.ollama_resource import OllamaResource
+from personal_data_warehouse.objectstore import ObjectStore, build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
-from personal_data_warehouse_voice_memos.cli import build_google_drive_service
-from personal_data_warehouse_voice_memos.google_drive_storage import GoogleDriveObjectStore
-from personal_data_warehouse_voice_memos.storage import ObjectStore
 
 
 def ollama_resource_from_env() -> OllamaResource:
@@ -89,14 +87,15 @@ def build_attachment_object_store_factory(*, settings: Settings, logger):
 
     def factory(account: GmailAccount) -> ObjectStore:
         upload_account = drive_account or account.email_address
-        service = build_google_drive_service(account=upload_account, settings=settings)
-        return GoogleDriveObjectStore(
-            folder_id=folder_id,
-            service=service,
-            source=GMAIL_ATTACHMENT_STORAGE_SOURCE,
-            legacy_sources=(),
-            audio_kind=GMAIL_ATTACHMENT_STORAGE_KIND,
-            metadata_kind=GMAIL_ATTACHMENT_STORAGE_METADATA_KIND,
+        return build_object_store(
+            google_drive_spec(
+                folder_id=folder_id,
+                account=upload_account,
+                source=GMAIL_ATTACHMENT_STORAGE_SOURCE,
+                blob_kind=GMAIL_ATTACHMENT_STORAGE_KIND,
+                metadata_kind=GMAIL_ATTACHMENT_STORAGE_METADATA_KIND,
+            ),
+            settings=settings,
         )
 
     logger.info(

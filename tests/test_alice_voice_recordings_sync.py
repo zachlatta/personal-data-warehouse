@@ -13,7 +13,7 @@ from personal_data_warehouse_alice_voice_recordings.sync import (
     media_url_from_recording,
     recording_id_from_upload_request,
 )
-from personal_data_warehouse_voice_memos.storage import ObjectPresence
+from personal_data_warehouse.objectstore import ObjectPresence
 
 
 class FakeLogger:

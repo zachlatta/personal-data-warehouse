@@ -1,5 +1,19 @@
+"""Google Drive backend for the object storage abstraction.
+
+Objects are stored under a configured Drive folder (the "namespace"/root) and
+tagged with ``appProperties`` (``pdw_source``, ``pdw_kind``,
+``pdw_root_folder_id``, ``pdw_stage``, ``content_sha256``) so the upload
+pipelines can deduplicate by content hash without a separate index. Filenames
+and MIME types are preserved on upload.
+
+This module also owns construction of the authenticated Drive ``service`` so the
+factory can build a Drive-backed store from settings alone, keeping
+Drive-specific concepts out of application call sites.
+"""
+
 from __future__ import annotations
 
+from collections.abc import Mapping
 from io import BytesIO
 from pathlib import Path
 import json
@@ -7,10 +21,22 @@ import threading
 import time
 from typing import Any
 
+import google_auth_httplib2
+import httplib2
+from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 
-from personal_data_warehouse_voice_memos.storage import ObjectPresence, StoredObject
+from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE
+from personal_data_warehouse.google_auth import load_google_credentials
+from personal_data_warehouse.objectstore.base import (
+    ObjectListing,
+    ObjectMetadata,
+    ObjectNotFoundError,
+    ObjectPresence,
+    StoredObject,
+    stored_object_from_mapping,
+)
 
 _FOLDER_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _FOLDER_LOCKS_LOCK = threading.Lock()
@@ -20,6 +46,24 @@ APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY = (
     "or appProperties has { key='pdw_source' and value='voice_memos' }"
     ")"
 )
+
+
+def build_google_drive_service(*, account: str, settings, request_timeout_seconds: int = 30):
+    credentials = load_google_credentials(
+        email_address=account,
+        settings=settings,
+        scopes=(GOOGLE_DRIVE_SCOPE,),
+        service_name="Google Drive",
+        request_timeout_seconds=request_timeout_seconds,
+    )
+    http = build_google_drive_http(credentials=credentials, timeout_seconds=request_timeout_seconds)
+    return build("drive", "v3", http=http, cache_discovery=False)
+
+
+def build_google_drive_http(*, credentials, timeout_seconds: int):
+    http = httplib2.Http(timeout=timeout_seconds)
+    http.redirect_codes = frozenset(code for code in http.redirect_codes if code != 308)
+    return google_auth_httplib2.AuthorizedHttp(credentials, http=http)
 
 
 class GoogleDriveObjectStore:
@@ -190,6 +234,234 @@ class GoogleDriveObjectStore:
         )
         return self._stored_object(response, object_key)
 
+    def get_object(self, ref: Mapping[str, object]) -> bytes:
+        file_id = self._file_id(ref)
+        buffer = BytesIO()
+        self._download(file_id, buffer)
+        return buffer.getvalue()
+
+    def download_to_path(self, ref: Mapping[str, object], path: Path) -> None:
+        file_id = self._file_id(ref)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as output:
+            self._download(file_id, output)
+
+    def object_exists(self, ref: Mapping[str, object]) -> bool:
+        file_id = self._file_id(ref)
+        try:
+            response = self._request(
+                lambda: self._service.files()
+                .get(fileId=file_id, fields="id,trashed", supportsAllDrives=True)
+                .execute()
+            )
+        except HttpError as exc:
+            if _http_status(exc) == 404:
+                return False
+            raise
+        return not (isinstance(response, dict) and response.get("trashed", False))
+
+    def delete_object(self, ref: Mapping[str, object]) -> None:
+        file_id = self._file_id(ref)
+        try:
+            self._request(
+                lambda: self._service.files()
+                .delete(fileId=file_id, supportsAllDrives=True)
+                .execute()
+            )
+        except HttpError as exc:
+            if _http_status(exc) == 404:
+                return
+            raise
+
+    def get_metadata(self, ref: Mapping[str, object]) -> ObjectMetadata:
+        stored = stored_object_from_mapping(ref)
+        file_id = self._file_id(stored)
+        try:
+            response = self._request(
+                lambda: self._service.files()
+                .get(
+                    fileId=file_id,
+                    fields="id,name,mimeType,size,createdTime,modifiedTime,webViewLink,appProperties",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+        except HttpError as exc:
+            if _http_status(exc) == 404:
+                raise ObjectNotFoundError(f"Drive object {file_id} not found") from exc
+            raise
+        response = response if isinstance(response, dict) else {}
+        app_properties = response.get("appProperties") or {}
+        size = response.get("size")
+        return ObjectMetadata(
+            backend=self.backend,
+            storage_key=stored["storage_key"],
+            storage_file_id=str(response.get("id", file_id)),
+            content_type=str(response.get("mimeType", "")),
+            size_bytes=int(size) if isinstance(size, (str, int)) and str(size).isdigit() else None,
+            content_sha256=app_properties.get("content_sha256") if isinstance(app_properties, dict) else None,
+            filename=response.get("name"),
+            created_time=response.get("createdTime"),
+            modified_time=response.get("modifiedTime"),
+            storage_url=str(response.get("webViewLink", "") or stored["storage_url"]),
+        )
+
+    def list_objects(
+        self,
+        *,
+        kind: str,
+        stage: str | None = None,
+        properties: Mapping[str, str] | None = None,
+    ) -> list[ObjectListing]:
+        listings: list[ObjectListing] = []
+        page_token: str | None = None
+        query = self._objects_query(kind=kind, stage=stage, properties=properties)
+        while True:
+            token = page_token
+            response = self._execute(
+                lambda token=token: self._service.files()
+                .list(
+                    q=query,
+                    pageSize=1000,
+                    pageToken=token,
+                    fields="nextPageToken,files(id,name,webViewLink,appProperties)",
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+            )
+            files = response.get("files", []) if isinstance(response, dict) else []
+            for file in files:
+                if isinstance(file, dict) and file.get("id"):
+                    listings.append(self._listing_from_file(file))
+            page_token = response.get("nextPageToken") if isinstance(response, dict) else None
+            if not page_token:
+                return listings
+
+    def find_object(
+        self,
+        *,
+        kind: str,
+        stage: str | None = None,
+        properties: Mapping[str, str] | None = None,
+    ) -> ObjectListing | None:
+        query = self._objects_query(kind=kind, stage=stage, properties=properties)
+        response = self._execute(
+            lambda: self._service.files()
+            .list(
+                q=query,
+                pageSize=1,
+                fields="files(id,name,webViewLink,appProperties)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        files = response.get("files", []) if isinstance(response, dict) else []
+        first = files[0] if files else None
+        return self._listing_from_file(first) if isinstance(first, dict) and first.get("id") else None
+
+    def move_object(
+        self,
+        ref: Mapping[str, object],
+        *,
+        new_object_key: str,
+        app_properties: Mapping[str, str] | None = None,
+    ) -> StoredObject:
+        file_id = self._file_id(ref)
+        if not new_object_key:
+            raise ValueError("move_object requires a non-empty new_object_key")
+        parent_id = self._ensure_parent_folder(new_object_key)
+        existing = self._execute(
+            lambda: self._service.files()
+            .get(fileId=file_id, fields="parents", supportsAllDrives=True)
+            .execute()
+        )
+        old_parents = [str(parent) for parent in existing.get("parents", [])] if isinstance(existing, dict) else []
+        remove_parents = [parent for parent in old_parents if parent != parent_id]
+        body = {
+            "name": drive_name_from_object_key(new_object_key),
+            "appProperties": {"pdw_stage": object_stage(new_object_key), **dict(app_properties or {})},
+        }
+        response = self._execute(
+            lambda: self._service.files()
+            .update(
+                fileId=file_id,
+                body=body,
+                addParents=parent_id,
+                removeParents=",".join(remove_parents),
+                fields="id,webViewLink,appProperties",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        return {
+            "storage_backend": self.backend,
+            "storage_key": new_object_key,
+            "storage_file_id": str(response.get("id", file_id)) if isinstance(response, dict) else file_id,
+            "storage_url": str(response.get("webViewLink", "")) if isinstance(response, dict) else "",
+        }
+
+    def get_share_url(self, ref: Mapping[str, object]) -> str | None:
+        stored = stored_object_from_mapping(ref)
+        if stored["storage_url"]:
+            return stored["storage_url"]
+        url = self.get_metadata(ref).storage_url
+        return url or None
+
+    def _objects_query(
+        self,
+        *,
+        kind: str,
+        stage: str | None,
+        properties: Mapping[str, str] | None,
+    ) -> str:
+        query = (
+            "trashed = false "
+            f"and {self._source_query()} "
+            f"and appProperties has {{ key='pdw_root_folder_id' and value='{escape_query_value(self._folder_id)}' }} "
+            f"and appProperties has {{ key='pdw_kind' and value='{escape_query_value(kind)}' }} "
+        )
+        if stage:
+            query += f"and appProperties has {{ key='pdw_stage' and value='{escape_query_value(stage)}' }} "
+        for key, value in (properties or {}).items():
+            query += (
+                f"and appProperties has {{ key='{escape_query_value(key)}' "
+                f"and value='{escape_query_value(value)}' }} "
+            )
+        return query.strip()
+
+    def _listing_from_file(self, file: dict[str, Any]) -> ObjectListing:
+        app_properties = file.get("appProperties")
+        normalized = (
+            {str(key): str(value) for key, value in app_properties.items()}
+            if isinstance(app_properties, dict)
+            else {}
+        )
+        return ObjectListing(
+            ref={
+                "storage_backend": self.backend,
+                "storage_key": "",
+                "storage_file_id": str(file.get("id", "")),
+                "storage_url": str(file.get("webViewLink", "")),
+            },
+            app_properties=normalized,
+            filename=str(file.get("name", "")),
+        )
+
+    def _download(self, file_id: str, output) -> None:
+        request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        downloader = MediaIoBaseDownload(output, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk(num_retries=2)
+
+    def _file_id(self, ref: Mapping[str, object]) -> str:
+        file_id = str(ref.get("storage_file_id", "")) if isinstance(ref, Mapping) else ""
+        if not file_id:
+            raise ObjectNotFoundError("StoredObject reference is missing storage_file_id")
+        return file_id
+
     def _find_by_app_property(self, *, key: str, value: str, kind: str) -> dict[str, Any] | None:
         query = (
             "trashed = false "
@@ -341,6 +613,28 @@ class GoogleDriveObjectStore:
                     break
                 time.sleep(min(30, attempt))
         raise RuntimeError(f"Google Drive request failed after {self._max_attempts} attempts: {last_exc}") from last_exc
+
+    def _request(self, operation):
+        """Execute an idempotent request, retrying only on transient errors.
+
+        Unlike :meth:`_execute` (used by the write/dedup paths, which retry on
+        any exception), this surfaces non-transient errors immediately so that
+        callers can distinguish e.g. a 404 from a flaky network.
+        """
+        last_exc = None
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                return operation()
+            except Exception as exc:
+                last_exc = exc
+                if not is_transient_google_error(exc) or attempt == self._max_attempts:
+                    raise
+                time.sleep(min(30, attempt))
+        raise last_exc  # pragma: no cover - loop always returns or raises
+
+
+def _http_status(exc: HttpError) -> int | None:
+    return getattr(getattr(exc, "resp", None), "status", None)
 
 
 def is_transient_google_error(exc: Exception) -> bool:

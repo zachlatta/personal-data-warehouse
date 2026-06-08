@@ -4,6 +4,7 @@ import logging
 
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs import gmail_sync as gmail_sync_defs
+from personal_data_warehouse.objectstore import google_drive as objectstore_google_drive
 
 LOGGER = logging.getLogger("test_gmail_sync_defs")
 
@@ -40,11 +41,11 @@ def test_factory_uses_configured_drive_account_for_every_mailbox(monkeypatch) ->
 
     captured: list[str] = []
 
-    def fake_build_drive(*, account, settings):  # noqa: ANN001
+    def fake_build_drive(*, account, settings, request_timeout_seconds=30):  # noqa: ANN001
         captured.append(account)
         return object()
 
-    monkeypatch.setattr(gmail_sync_defs, "build_google_drive_service", fake_build_drive)
+    monkeypatch.setattr(objectstore_google_drive, "build_google_drive_service", fake_build_drive)
 
     factory = gmail_sync_defs.build_attachment_object_store_factory(settings=settings, logger=LOGGER)
     assert factory is not None
@@ -71,11 +72,11 @@ def test_factory_uses_shared_voice_memos_account_when_attachment_account_unset(m
 
     captured: list[str] = []
 
-    def fake_build_drive(*, account, settings):  # noqa: ANN001
+    def fake_build_drive(*, account, settings, request_timeout_seconds=30):  # noqa: ANN001
         captured.append(account)
         return object()
 
-    monkeypatch.setattr(gmail_sync_defs, "build_google_drive_service", fake_build_drive)
+    monkeypatch.setattr(objectstore_google_drive, "build_google_drive_service", fake_build_drive)
 
     factory = gmail_sync_defs.build_attachment_object_store_factory(settings=settings, logger=LOGGER)
     assert factory is not None

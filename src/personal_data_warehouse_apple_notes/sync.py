@@ -11,7 +11,7 @@ import json
 import threading
 import tempfile
 
-from personal_data_warehouse_voice_memos.storage import ObjectStore
+from personal_data_warehouse.objectstore import ObjectStore
 from personal_data_warehouse_apple_notes.scanner import (
     AppleNote,
     AppleNoteAttachment,

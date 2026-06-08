@@ -12,7 +12,7 @@ import re
 import threading
 import tempfile
 
-from personal_data_warehouse_voice_memos.storage import ObjectStore, StoredObject
+from personal_data_warehouse.objectstore import ObjectStore, StoredObject
 from personal_data_warehouse_apple_messages.body import decode_message_body
 from personal_data_warehouse_apple_messages.scanner import (
     AppleMessage,

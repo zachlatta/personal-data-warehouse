@@ -15,7 +15,7 @@ import re
 
 import requests
 
-from personal_data_warehouse_voice_memos.storage import ObjectPresence, ObjectStore
+from personal_data_warehouse.objectstore import ObjectPresence, ObjectStore
 
 SOURCE = "alice_app_voice_recordings"
 OBJECT_PREFIX = "alice-app-voice-recordings"

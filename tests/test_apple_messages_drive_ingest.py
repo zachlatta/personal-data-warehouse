@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, datetime
+import gzip
+import json
 
 from personal_data_warehouse.apple_messages_drive_ingest import (
     AppleMessagesDriveIngestRunner,
-    drive_batch_files_query,
+    has_batch_payloads,
+    iter_batch_payloads,
     library_batch_payload,
     record_to_attachment_row,
     record_to_message_row,
 )
+from personal_data_warehouse.objectstore import ObjectListing
 
 
 class FakeLogger:
@@ -52,13 +56,33 @@ class FakeWarehouse:
         self.attachments.extend(rows)
 
 
-class FakePromoter:
-    def __init__(self) -> None:
-        self.payloads: list[dict[str, object]] = []
+class FakeObjectStore:
+    backend = "google_drive"
 
-    def promote(self, payload) -> int:
-        self.payloads.append(payload)
-        return 2
+    def __init__(self, *, batch_listings=None, gz_by_id=None) -> None:
+        self.batch_listings = list(batch_listings or [])
+        self.gz_by_id = dict(gz_by_id or {})
+        self.moved: list[tuple[str, str]] = []
+
+    def list_objects(self, *, kind, stage=None, properties=None):
+        return list(self.batch_listings) if kind == "apple_message_export_batch" else []
+
+    def find_object(self, *, kind, stage=None, properties=None):
+        if kind == "apple_message_export_batch" and self.batch_listings:
+            return self.batch_listings[0]
+        return None
+
+    def get_object(self, ref):
+        return self.gz_by_id[str(ref["storage_file_id"])]
+
+    def move_object(self, ref, *, new_object_key, app_properties=None):
+        self.moved.append((str(ref.get("storage_file_id", "")), new_object_key))
+        return {
+            "storage_backend": self.backend,
+            "storage_key": new_object_key,
+            "storage_file_id": str(ref.get("storage_file_id", "")),
+            "storage_url": "https://drive/promoted",
+        }
 
 
 def decorated_batch_payload() -> dict[str, object]:
@@ -87,28 +111,6 @@ def decorated_batch_payload() -> dict[str, object]:
                 },
             ),
             envelope(
-                "chat",
-                {
-                    "chat_id": "chat-guid",
-                    "chat_rowid": 1,
-                    "guid": "chat-guid",
-                    "chat_identifier": "+15551234567",
-                    "service_name": "iMessage",
-                    "display_name": "Test Chat",
-                    "room_name": "",
-                    "account_login": "zach@example.com",
-                    "style": 45,
-                    "state": 0,
-                    "is_archived": False,
-                    "is_filtered": False,
-                    "is_recovered": False,
-                    "is_pending_review": False,
-                    "last_read_message_at": "2026-05-21T12:00:00+00:00",
-                    "raw": {},
-                },
-            ),
-            envelope("chat_handle", {"chat_id": "chat-guid", "handle_id": "1", "raw": {}}),
-            envelope(
                 "message",
                 {
                     "message_id": "message-guid",
@@ -119,55 +121,8 @@ def decorated_batch_payload() -> dict[str, object]:
                     "body_text": "Hello",
                     "body_source": "text",
                     "body_decode_status": "ok",
-                    "body_decode_error": "",
-                    "attributed_body_sha256": "",
-                    "subject": "",
-                    "country": "US",
-                    "message_type": 0,
-                    "item_type": 0,
-                    "is_from_me": False,
-                    "is_read": True,
-                    "is_sent": True,
-                    "is_delivered": True,
-                    "is_finished": True,
-                    "is_system_message": False,
-                    "is_service_message": False,
-                    "is_forward": False,
-                    "is_empty": False,
-                    "is_audio_message": False,
-                    "is_played": False,
-                    "cache_has_attachments": True,
-                    "has_unseen_mention": False,
-                    "is_spam": False,
-                    "reply_to_guid": "",
-                    "associated_message_guid": "",
-                    "associated_message_type": 0,
-                    "associated_message_emoji": "",
-                    "balloon_bundle_id": "",
-                    "group_title": "",
-                    "group_action_type": 0,
-                    "message_action_type": 0,
-                    "message_source": 0,
-                    "expressive_send_style_id": "",
                     "message_at": "2026-05-21T12:00:00+00:00",
-                    "date_ns": 801748800000000000,
-                    "date_read": "1970-01-01T00:00:00+00:00",
-                    "date_delivered": "1970-01-01T00:00:00+00:00",
-                    "date_played": "1970-01-01T00:00:00+00:00",
-                    "date_edited": "1970-01-01T00:00:00+00:00",
-                    "date_retracted": "1970-01-01T00:00:00+00:00",
-                    "date_recovered": "1970-01-01T00:00:00+00:00",
                     "is_deleted": False,
-                    "raw": {},
-                },
-            ),
-            envelope(
-                "chat_message",
-                {
-                    "chat_id": "chat-guid",
-                    "message_id": "message-guid",
-                    "message_date": "2026-05-21T12:00:00+00:00",
-                    "message_date_ns": 801748800000000000,
                     "raw": {},
                 },
             ),
@@ -183,7 +138,6 @@ def attachment_record() -> dict[str, object]:
         "attachment_rowid": 1,
         "message_id": "message-guid",
         "guid": "attachment-guid",
-        "original_guid": "",
         "filename": "Attachments/photo.txt",
         "transfer_name": "photo.txt",
         "content_type": "text/plain",
@@ -194,10 +148,6 @@ def attachment_record() -> dict[str, object]:
         "content_sha256": "",
         "is_missing": False,
         "error": "",
-        "is_outgoing": False,
-        "is_sticker": False,
-        "hide_attachment": False,
-        "transfer_state": 5,
         "created_at": "2026-05-21T12:00:00+00:00",
         "start_at": "2026-05-21T12:00:00+00:00",
         "raw": {},
@@ -228,7 +178,7 @@ def test_record_mappers_preserve_message_body_and_attachment_storage() -> None:
     ingested_at = datetime(2026, 5, 21, 14, tzinfo=UTC)
     batch = decorated_batch_payload()
 
-    message_row = record_to_message_row(batch["records"][3], ingested_at=ingested_at)
+    message_row = record_to_message_row(batch["records"][1], ingested_at=ingested_at)
     attachment_row = record_to_attachment_row(batch["records"][-1], ingested_at=ingested_at)
 
     assert message_row["message_id"] == "message-guid"
@@ -248,14 +198,49 @@ def test_library_batch_payload_rewrites_batch_and_attachment_storage_keys() -> N
     )
 
 
+def test_iter_batch_payloads_decompresses_via_object_store() -> None:
+    records = [envelope("handle", {"handle_id": "1", "raw": {}}), envelope("message", {"message_id": "m", "raw": {}})]
+    gz = gzip.compress("\n".join(json.dumps(record) for record in records).encode("utf-8"))
+    listing = ObjectListing(
+        ref={
+            "storage_backend": "google_drive",
+            "storage_key": "",
+            "storage_file_id": "batch-file",
+            "storage_url": "https://drive/batch",
+        },
+        app_properties={"content_sha256": "batch-sha", "exported_at": "2026-05-21T13:00:00+00:00"},
+        filename="batch.jsonl.gz",
+    )
+    store = FakeObjectStore(batch_listings=[listing], gz_by_id={"batch-file": gz})
+
+    payloads = list(iter_batch_payloads(object_store=store))
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["batch_file"]["storage_key"] == "apple-messages/inbox/batches/2026/05/batch.jsonl.gz"
+    assert payload["batch_file"]["storage_file_id"] == "batch-file"
+    assert payload["batch_file"]["content_sha256"] == "batch-sha"
+    assert [record["record_type"] for record in payload["records"]] == ["handle", "message"]
+
+
+def test_has_batch_payloads_uses_find_object() -> None:
+    listing = ObjectListing(
+        ref={"storage_backend": "google_drive", "storage_key": "", "storage_file_id": "batch-file", "storage_url": ""},
+        app_properties={},
+        filename="batch.jsonl.gz",
+    )
+    assert has_batch_payloads(object_store=FakeObjectStore(batch_listings=[listing])) is True
+    assert has_batch_payloads(object_store=FakeObjectStore()) is False
+
+
 def test_drive_ingest_runner_dedupes_attachment_updates_and_promotes() -> None:
     warehouse = FakeWarehouse()
-    promoter = FakePromoter()
+    store = FakeObjectStore()
 
     summary = AppleMessagesDriveIngestRunner(
         warehouse=warehouse,
         batch_source=lambda: [decorated_batch_payload()],
-        promoter=promoter,
+        object_store=store,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 14, tzinfo=UTC),
     ).sync()
@@ -264,18 +249,22 @@ def test_drive_ingest_runner_dedupes_attachment_updates_and_promotes() -> None:
     assert summary.batches_seen == 1
     assert summary.messages_written == 1
     assert summary.attachments_written == 1
-    assert summary.files_promoted == 2
+    assert summary.files_promoted == 2  # batch file + one attachment with a stored file
     assert warehouse.messages[0]["body_text"] == "Hello"
     assert warehouse.attachments[0]["content_sha256"] == "att-sha"
     assert warehouse.attachments[0]["storage_key"].startswith("apple-messages/library/")
-    assert promoter.payloads == [decorated_batch_payload()]
+    assert ("batch-file", "apple-messages/library/batches/2026/05/batch.jsonl.gz") in store.moved
+    assert (
+        "attachment-file",
+        "apple-messages/library/attachments/2026/05/2026-05-21-attachment-guid-att-sha.txt",
+    ) in store.moved
 
 
 def test_drive_ingest_runner_prefers_latest_duplicate_message_record() -> None:
     older = decorated_batch_payload()
     newer = deepcopy(older)
-    newer["records"][3]["exported_at"] = "2026-05-21T13:05:00+00:00"
-    newer["records"][3]["record"]["body_text"] = "New body"
+    newer["records"][1]["exported_at"] = "2026-05-21T13:05:00+00:00"
+    newer["records"][1]["record"]["body_text"] = "New body"
     warehouse = FakeWarehouse()
 
     summary = AppleMessagesDriveIngestRunner(
@@ -287,12 +276,3 @@ def test_drive_ingest_runner_prefers_latest_duplicate_message_record() -> None:
 
     assert summary.messages_written == 1
     assert warehouse.messages[0]["body_text"] == "New body"
-
-
-def test_drive_batch_query_targets_apple_messages_inbox() -> None:
-    query = drive_batch_files_query(folder_id="root-folder", stage="inbox")
-
-    assert "pdw_source' and value='apple_messages" in query
-    assert "pdw_kind' and value='apple_message_export_batch" in query
-    assert "pdw_stage' and value='inbox" in query
-    assert "pdw_root_folder_id" in query

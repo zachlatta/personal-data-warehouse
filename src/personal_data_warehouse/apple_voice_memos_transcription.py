@@ -11,8 +11,9 @@ import tempfile
 import time
 from typing import Any
 
-from googleapiclient.http import MediaIoBaseDownload
 import requests
+
+from personal_data_warehouse.objectstore import ObjectStore
 
 
 ASSEMBLYAI_PROVIDER = "assemblyai"
@@ -162,8 +163,10 @@ def assemblyai_transcript_request(
 
 
 class GoogleDriveVoiceMemoAudioSource:
-    def __init__(self, *, service) -> None:
-        self._service = service
+    """Fetch Voice Memo audio for transcription via the object storage abstraction."""
+
+    def __init__(self, *, object_store: ObjectStore) -> None:
+        self._object_store = object_store
 
     @contextmanager
     def audio_file(self, recording: Mapping[str, Any]) -> Iterator[Path]:
@@ -173,12 +176,7 @@ class GoogleDriveVoiceMemoAudioSource:
         filename = str(recording.get("filename", "")) or f"{recording.get('recording_id', 'recording')}.audio"
         with tempfile.TemporaryDirectory(prefix="voice-memo-audio-") as directory:
             path = Path(directory) / filename
-            request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
-            with path.open("wb") as output:
-                downloader = MediaIoBaseDownload(output, request)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk(num_retries=2)
+            self._object_store.download_to_path(recording, path)
             yield path
 
 

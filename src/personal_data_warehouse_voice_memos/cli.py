@@ -7,13 +7,9 @@ from pathlib import Path
 import os
 import sys
 
-import google_auth_httplib2
-import httplib2
-from googleapiclient.discovery import build
-
-from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
-from personal_data_warehouse.google_auth import load_google_credentials
-from personal_data_warehouse_voice_memos.google_drive_storage import GoogleDriveObjectStore, is_transient_google_error
+from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
+from personal_data_warehouse.objectstore.google_drive import is_transient_google_error
 from personal_data_warehouse_voice_memos.network import NetworkPolicy, preflight_google_drive
 from personal_data_warehouse_voice_memos.state import VoiceMemosUploadState, default_state_file
 from personal_data_warehouse_voice_memos.sync import VoiceMemosUploadRunner
@@ -86,13 +82,17 @@ def main() -> None:
                     account=settings.voice_memos.account,
                     recordings_path=settings.voice_memos.recordings_path,
                     extensions=settings.voice_memos.extensions,
-                    object_store_factory=lambda: GoogleDriveObjectStore(
-                        folder_id=settings.voice_memos.google_drive_folder_id,
-                        service=build_google_drive_service(
+                    object_store_factory=lambda: build_object_store(
+                        google_drive_spec(
+                            folder_id=settings.voice_memos.google_drive_folder_id,
                             account=settings.voice_memos.account,
-                            settings=settings,
+                            source="apple_voice_memos",
+                            blob_kind="voice_memo_audio",
+                            metadata_kind="voice_memo_metadata",
+                            legacy_sources=("voice_memos",),
                             request_timeout_seconds=request_timeout_seconds,
                         ),
+                        settings=settings,
                     ),
                     logger=logger,
                     limit=args.limit or None,
@@ -119,24 +119,6 @@ def main() -> None:
         f"deferred={summary.recordings_deferred} "
         f"metadata={summary.metadata_uploaded}"
     )
-
-
-def build_google_drive_service(*, account: str, settings, request_timeout_seconds: int = 30):
-    credentials = load_google_credentials(
-        email_address=account,
-        settings=settings,
-        scopes=(GOOGLE_DRIVE_SCOPE,),
-        service_name="Google Drive",
-        request_timeout_seconds=request_timeout_seconds,
-    )
-    http = build_google_drive_http(credentials=credentials, timeout_seconds=request_timeout_seconds)
-    return build("drive", "v3", http=http, cache_discovery=False)
-
-
-def build_google_drive_http(*, credentials, timeout_seconds: int):
-    http = httplib2.Http(timeout=timeout_seconds)
-    http.redirect_codes = frozenset(code for code in http.redirect_codes if code != 308)
-    return google_auth_httplib2.AuthorizedHttp(credentials, http=http)
 
 
 def build_before_upload_check(*, preflight_timeout_seconds: float):

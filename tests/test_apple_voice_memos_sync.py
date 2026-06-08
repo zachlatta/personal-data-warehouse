@@ -7,7 +7,7 @@ import sqlite3
 from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
 from personal_data_warehouse_voice_memos.scanner import recording_from_path, scan_voice_memo_file_candidates, scan_voice_memos
 from personal_data_warehouse_voice_memos.state import VoiceMemosUploadState
-from personal_data_warehouse_voice_memos.storage import ObjectPresence
+from personal_data_warehouse.objectstore import ObjectPresence
 from personal_data_warehouse_voice_memos.sync import VoiceMemosUploadRunner
 
 

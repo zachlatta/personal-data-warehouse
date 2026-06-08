@@ -16,7 +16,7 @@ from personal_data_warehouse_voice_memos.scanner import (
     scan_voice_memo_file_candidates,
 )
 from personal_data_warehouse_voice_memos.state import VoiceMemosUploadState
-from personal_data_warehouse_voice_memos.storage import ObjectPresence, ObjectStore
+from personal_data_warehouse.objectstore import ObjectPresence, ObjectStore
 
 OBJECT_PREFIX = "apple-voice-memos"
 INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox"

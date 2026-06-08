@@ -18,9 +18,9 @@ from dagster import (
 
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs.apple_voice_memos_drive_ingest import apple_voice_memos_drive_ingest
+from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
-from personal_data_warehouse.apple_voice_memos_drive_ingest import build_google_drive_service
 from personal_data_warehouse.apple_voice_memos_transcription import (
     ASSEMBLYAI_PROVIDER,
     AssemblyAIClient,
@@ -62,10 +62,20 @@ def apple_voice_memos_transcription(context) -> MaterializeResult:
             context.log.warning("Skipping Voice Memos transcription because another run is already active")
             summary = None
         else:
-            service = build_google_drive_service(account=settings.voice_memos.account, settings=settings)
+            object_store = build_object_store(
+                google_drive_spec(
+                    folder_id=settings.voice_memos.google_drive_folder_id,
+                    account=settings.voice_memos.account,
+                    source="apple_voice_memos",
+                    blob_kind="voice_memo_audio",
+                    metadata_kind="voice_memo_metadata",
+                    legacy_sources=("voice_memos",),
+                ),
+                settings=settings,
+            )
             summary = VoiceMemosTranscriptionRunner(
                 warehouse=warehouse,
-                audio_source=GoogleDriveVoiceMemoAudioSource(service=service),
+                audio_source=GoogleDriveVoiceMemoAudioSource(object_store=object_store),
                 transcription_client=AssemblyAIClient(
                     api_key=settings.assemblyai.api_key,
                     base_url=settings.assemblyai.base_url,

@@ -8,8 +8,8 @@ import os
 import sys
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse_voice_memos.cli import build_google_drive_service
-from personal_data_warehouse_voice_memos.google_drive_storage import GoogleDriveObjectStore, is_transient_google_error
+from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
+from personal_data_warehouse.objectstore.google_drive import is_transient_google_error
 from personal_data_warehouse_voice_memos.network import NetworkPolicy, preflight_google_drive
 from personal_data_warehouse_apple_messages.state import AppleMessagesUploadState, default_state_file
 from personal_data_warehouse_apple_messages.sync import AppleMessagesUploadRunner
@@ -111,18 +111,16 @@ def main() -> None:
 
 
 def build_google_drive_object_store(*, account: str, settings, folder_id: str, request_timeout_seconds: int):
-    service = build_google_drive_service(
-        account=account,
+    return build_object_store(
+        google_drive_spec(
+            folder_id=folder_id,
+            account=account,
+            source="apple_messages",
+            blob_kind="apple_message_attachment",
+            metadata_kind="apple_message_export_batch",
+            request_timeout_seconds=request_timeout_seconds,
+        ),
         settings=settings,
-        request_timeout_seconds=request_timeout_seconds,
-    )
-    return GoogleDriveObjectStore(
-        folder_id=folder_id,
-        service=service,
-        source="apple_messages",
-        legacy_sources=(),
-        audio_kind="apple_message_attachment",
-        metadata_kind="apple_message_export_batch",
     )
 
 

@@ -36,12 +36,12 @@ def test_apple_voice_memos_drive_inbox_sensor_skips_when_inbox_is_empty(monkeypa
     )
     monkeypatch.setattr(
         apple_voice_memos_drive_ingest_defs,
-        "build_google_drive_service",
-        lambda **_kwargs: object(),
+        "_voice_memos_object_store",
+        lambda _settings: object(),
     )
     monkeypatch.setattr(
         apple_voice_memos_drive_ingest_defs,
-        "has_drive_metadata_payloads",
+        "has_metadata_payloads",
         lambda **_kwargs: False,
     )
 
@@ -60,12 +60,12 @@ def test_apple_voice_memos_drive_inbox_sensor_launches_when_inbox_has_metadata(m
     )
     monkeypatch.setattr(
         apple_voice_memos_drive_ingest_defs,
-        "build_google_drive_service",
-        lambda **_kwargs: object(),
+        "_voice_memos_object_store",
+        lambda _settings: object(),
     )
     monkeypatch.setattr(
         apple_voice_memos_drive_ingest_defs,
-        "has_drive_metadata_payloads",
+        "has_metadata_payloads",
         lambda **_kwargs: True,
     )
 

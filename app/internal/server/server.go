@@ -135,12 +135,13 @@ func NewMCPServerWithMutations(runner query.Runner, opts query.Options, mutation
 // tool.Registry that both surfaces (MCP and HTTP) consume. The query.Service
 // is returned so callers that want the cache (e.g. NewMux for shutdown) can
 // hold onto it; passing it back also makes the shared-cache contract obvious.
-func buildRegistry(runner query.Runner, opts query.Options, mutationSvc *mutations.Service, _ *slog.Logger) (*tool.Registry, *query.Service) {
+func buildRegistry(runner query.Runner, opts query.Options, mutationSvc *mutations.Service, _ *slog.Logger, extra ...tool.Tool) (*tool.Registry, *query.Service) {
 	svc := query.NewService(runner, opts)
 	tools := readOnlyTools(svc)
 	if opts.DebugCacheTool {
 		tools = append(tools, debugCacheStatusTool(svc))
 	}
+	tools = append(tools, extra...)
 	return tool.NewRegistry(tools, mutations.Tools(mutationSvc)), svc
 }
 
@@ -196,7 +197,14 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	})
 
 	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}
-	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default())
+	var extra []tool.Tool
+	if store, enabled, err := objectStoreFromConfig(cfg); err != nil {
+		logger.Error("object storage configured but failed to initialize; get_object tool disabled", "error", err.Error())
+	} else if enabled {
+		logger.Info("object storage enabled", "backend", cfg.ObjectStoreBackend, "folder", cfg.ObjectStoreGoogleDriveFolderID)
+		extra = append(extra, getObjectTool(store, cfg.ObjectStoreMaxObjectBytes))
+	}
+	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default(), extra...)
 	mcpServer := newMCPServerFromRegistry(registry, slog.Default())
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{
 		JSONResponse:   true,

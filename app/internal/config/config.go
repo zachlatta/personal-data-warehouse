@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strconv"
@@ -28,6 +29,22 @@ type Config struct {
 	GmailAccounts           []string
 	ContactGoogleAccounts   []string
 	CalendarAccounts        []string
+
+	// Object storage (optional). When configured, the app can read blob objects
+	// (Gmail attachments, Apple Notes/Messages attachments, Voice Memo audio,
+	// ...) directly through its object storage layer.
+	ObjectStoreBackend             string
+	ObjectStoreGoogleDriveFolderID string
+	ObjectStoreGoogleTokenJSON     string
+	ObjectStoreMaxObjectBytes      int64
+}
+
+// ObjectStoreEnabled reports whether enough is configured to build the app's
+// object storage layer (Google Drive backend).
+func (c Config) ObjectStoreEnabled() bool {
+	return c.ObjectStoreBackend == "google_drive" &&
+		c.ObjectStoreGoogleDriveFolderID != "" &&
+		c.ObjectStoreGoogleTokenJSON != ""
 }
 
 func LoadFromEnv(getenv func(string) string) (Config, error) {
@@ -84,6 +101,14 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("MCP_QUERY_CACHE_TTL must be a positive Go duration")
 		}
 	}
+	cfg.ObjectStoreBackend = valueOrDefault(getenv("PDW_OBJECT_STORE_BACKEND"), "google_drive")
+	cfg.ObjectStoreGoogleDriveFolderID = strings.TrimSpace(getenv("PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID"))
+	cfg.ObjectStoreGoogleTokenJSON = jsonEnvValue(getenv, "PDW_OBJECT_STORE_GOOGLE_TOKEN_JSON")
+	cfg.ObjectStoreMaxObjectBytes = 5 * 1024 * 1024
+	if cfg.ObjectStoreMaxObjectBytes, err = parsePositiveInt64(getenv("PDW_OBJECT_STORE_MAX_OBJECT_BYTES"), cfg.ObjectStoreMaxObjectBytes, "PDW_OBJECT_STORE_MAX_OBJECT_BYTES"); err != nil {
+		return Config{}, err
+	}
+
 	cfg.DebugCacheTool = parseBool(getenv("MCP_DEBUG_CACHE_TOOL"))
 	if raw := strings.TrimSpace(getenv("MCP_QUERY_TIMEOUT")); raw != "" {
 		cfg.QueryTimeout, err = time.ParseDuration(raw)
@@ -163,6 +188,23 @@ func parseBool(raw string) bool {
 	default:
 		return false
 	}
+}
+
+// jsonEnvValue reads a JSON value from name, or from name+"_B64" (base64) if the
+// plain var is empty. Mirrors the Python _json_env_value/_B64 convention.
+func jsonEnvValue(getenv func(string) string, name string) string {
+	if value := strings.TrimSpace(getenv(name)); value != "" {
+		return value
+	}
+	encoded := strings.TrimSpace(getenv(name + "_B64"))
+	if encoded == "" {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(decoded))
 }
 
 func parseCSV(raw string) []string {

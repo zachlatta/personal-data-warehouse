@@ -12,7 +12,7 @@ import tempfile
 from typing import Any
 
 from personal_data_warehouse.gmail_sync import attachment_content_bytes
-from personal_data_warehouse_voice_memos.storage import ObjectStore, StoredObject
+from personal_data_warehouse.objectstore import ObjectStore, StoredObject
 
 from .sync import OBJECT_PREFIX, SOURCE, extension_for_content_type, safe_object_key_part
 

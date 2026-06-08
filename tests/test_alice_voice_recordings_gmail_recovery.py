@@ -15,7 +15,7 @@ from personal_data_warehouse_alice_voice_recordings.gmail_recovery import (
     metadata_field,
     recording_guid_from_text,
 )
-from personal_data_warehouse_voice_memos.storage import ObjectPresence
+from personal_data_warehouse.objectstore import ObjectPresence
 
 
 class FakeLogger:

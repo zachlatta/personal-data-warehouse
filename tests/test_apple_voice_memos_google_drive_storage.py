@@ -6,8 +6,10 @@ import threading
 
 from httplib2.error import RedirectMissingLocation
 
-from personal_data_warehouse_voice_memos.google_drive_storage import GoogleDriveObjectStore
-from personal_data_warehouse_voice_memos.cli import build_google_drive_http
+from personal_data_warehouse.objectstore.google_drive import (
+    GoogleDriveObjectStore,
+    build_google_drive_http,
+)
 
 
 class FakeRequest:

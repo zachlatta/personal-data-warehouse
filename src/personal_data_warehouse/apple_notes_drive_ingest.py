@@ -1,25 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from io import BytesIO
 import json
+import re
 import threading
-import time
 from typing import Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from googleapiclient.http import MediaIoBaseDownload
-
-from personal_data_warehouse.apple_voice_memos_drive_ingest import (
-    build_google_drive_service,
-    drive_name_from_object_key,
-    escape_drive_query_value,
-    execute_drive_request,
-    parse_datetime,
-)
+from personal_data_warehouse.apple_voice_memos_drive_ingest import parse_datetime
+from personal_data_warehouse.objectstore import ObjectListing, ObjectStore
 
 
 @dataclass(frozen=True)
@@ -34,10 +26,9 @@ class AppleNotesDriveIngestSummary:
 OBJECT_PREFIX = "apple-notes"
 INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox/"
 LIBRARY_PREFIX = f"{OBJECT_PREFIX}/library/"
-APPLE_NOTES_DRIVE_SOURCE_QUERY = "appProperties has { key='pdw_source' and value='apple_notes' }"
-_PROMOTER_FOLDER_CACHE: dict[tuple[str, str], str] = {}
-_PROMOTER_FOLDER_LOCKS: dict[tuple[str, str], threading.Lock] = {}
-_PROMOTER_FOLDER_LOCKS_LOCK = threading.Lock()
+METADATA_KIND = "apple_note_revision_metadata"
+HTML_KIND = "apple_note_body_html"
+ATTACHMENT_KIND = "apple_note_attachment"
 
 
 class AppleNotesDriveIngestRunner:
@@ -46,18 +37,18 @@ class AppleNotesDriveIngestRunner:
         *,
         warehouse,
         metadata_source: Callable[[], Iterable[Mapping[str, Any]]],
-        promoter=None,
-        promoter_factory: Callable[[], Any] | None = None,
+        object_store: ObjectStore | None = None,
+        object_store_factory: Callable[[], ObjectStore] | None = None,
         promotion_workers: int = 1,
         logger,
         now: Callable[[], datetime] | None = None,
     ) -> None:
-        if promoter is not None and promoter_factory is not None:
-            raise ValueError("pass only one of promoter or promoter_factory")
+        if object_store is not None and object_store_factory is not None:
+            raise ValueError("pass only one of object_store or object_store_factory")
         self._warehouse = warehouse
         self._metadata_source = metadata_source
-        self._promoter = promoter
-        self._promoter_factory = promoter_factory
+        self._object_store = object_store
+        self._object_store_factory = object_store_factory
         self._promotion_workers = max(1, promotion_workers)
         self._thread_local = threading.local()
         self._logger = logger
@@ -67,8 +58,8 @@ class AppleNotesDriveIngestRunner:
         self._warehouse.ensure_apple_notes_tables()
         ingested_at = self._now()
         metadata = list(self._metadata_source())
-        should_record_library_keys = self._promoter is not None or self._promoter_factory is not None
-        row_metadata = [library_metadata_payload(payload) for payload in metadata] if should_record_library_keys else metadata
+        promote = self._object_store is not None or self._object_store_factory is not None
+        row_metadata = [library_metadata_payload(payload) for payload in metadata] if promote else metadata
         latest_note_metadata = latest_metadata_payloads(row_metadata)
         note_rows = [metadata_to_note_row(payload, ingested_at=ingested_at) for payload in latest_note_metadata]
         revision_rows = [metadata_to_revision_row(payload, ingested_at=ingested_at) for payload in row_metadata]
@@ -81,7 +72,7 @@ class AppleNotesDriveIngestRunner:
         self._warehouse.insert_apple_note_revisions(revision_rows)
         self._warehouse.insert_apple_note_attachments(attachment_rows)
         promoted = 0
-        if self._promoter or self._promoter_factory:
+        if promote:
             self._logger.info(
                 "Promoting %s Apple Notes Drive metadata payloads with %s worker(s)",
                 len(metadata),
@@ -107,305 +98,142 @@ class AppleNotesDriveIngestRunner:
         )
 
     def _promote_payload(self, payload: Mapping[str, Any]) -> int:
-        return self._promoter_for_thread().promote(payload)
+        return promote_payload(self._object_store_for_thread(), payload)
 
-    def _promoter_for_thread(self):
-        if self._promoter is not None:
-            return self._promoter
-        promoter = getattr(self._thread_local, "promoter", None)
-        if promoter is None:
-            if self._promoter_factory is None:
-                raise RuntimeError("promoter_factory is not configured")
-            promoter = self._promoter_factory()
-            self._thread_local.promoter = promoter
-        return promoter
+    def _object_store_for_thread(self) -> ObjectStore:
+        if self._object_store is not None:
+            return self._object_store
+        store = getattr(self._thread_local, "object_store", None)
+        if store is None:
+            if self._object_store_factory is None:
+                raise RuntimeError("object_store_factory is not configured")
+            store = self._object_store_factory()
+            self._thread_local.object_store = store
+        return store
 
 
-class GoogleDriveAppleNotesPromoter:
-    def __init__(self, *, service, folder_id: str, max_attempts: int = 3) -> None:
-        self._service = service
-        self._folder_id = folder_id
-        self._max_attempts = max_attempts
-        self._folder_cache: dict[tuple[str, str], str] = {}
-
-    def promote(self, payload: Mapping[str, Any]) -> int:
-        promoted = 0
-        library_payload = library_metadata_payload(payload)
-        for source, target in stored_files_for_promotion(payload, library_payload):
-            if self._promote_stored_file(source=source, target=target):
-                promoted += 1
-        return promoted
-
-    def _promote_stored_file(self, *, source: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
+def promote_payload(object_store: ObjectStore, payload: Mapping[str, Any]) -> int:
+    promoted = 0
+    library_payload = library_metadata_payload(payload)
+    for source, target in stored_files_for_promotion(payload, library_payload):
         file_id = str(source.get("storage_file_id", ""))
-        storage_key = str(target.get("storage_key", ""))
-        if not file_id or not storage_key:
-            return False
-        parent_id = self._ensure_parent_folder(storage_key)
-        existing = self._execute(
-            self._service.files().get(fileId=file_id, fields="parents", supportsAllDrives=True)
-        )
-        old_parent_ids = [str(parent_id) for parent_id in existing.get("parents", [])]
-        remove_parent_ids = [old_parent_id for old_parent_id in old_parent_ids if old_parent_id != parent_id]
-        self._execute(
-            self._service.files().update(
-                fileId=file_id,
-                body={
-                    "name": drive_name_from_object_key(storage_key),
-                    "appProperties": {"pdw_stage": storage_stage(storage_key)},
-                },
-                addParents=parent_id,
-                removeParents=",".join(remove_parent_ids),
-                fields="id,webViewLink,appProperties",
-                supportsAllDrives=True,
-            )
-        )
-        return True
-
-    def _ensure_parent_folder(self, object_key: str) -> str:
-        parts = [part for part in object_key.split("/")[:-1] if part]
-        parent_id = self._folder_id
-        for part in parts:
-            parent_id = self._ensure_folder(parent_id=parent_id, name=part)
-        return parent_id
-
-    def _ensure_folder(self, *, parent_id: str, name: str) -> str:
-        cache_key = (parent_id, name)
-        if cache_key in self._folder_cache:
-            return self._folder_cache[cache_key]
-        if cache_key in _PROMOTER_FOLDER_CACHE:
-            folder_id = _PROMOTER_FOLDER_CACHE[cache_key]
-            self._folder_cache[cache_key] = folder_id
-            return folder_id
-        with promoter_folder_lock(cache_key):
-            if cache_key in _PROMOTER_FOLDER_CACHE:
-                folder_id = _PROMOTER_FOLDER_CACHE[cache_key]
-                self._folder_cache[cache_key] = folder_id
-                return folder_id
-            response = self._execute(
-                self._service.files().list(
-                    q=(
-                        f"'{escape_drive_query_value(parent_id)}' in parents and trashed = false "
-                        "and mimeType = 'application/vnd.google-apps.folder' "
-                        f"and name = '{escape_drive_query_value(name)}'"
-                    ),
-                    pageSize=1,
-                    fields="files(id,webViewLink)",
-                    supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
-                )
-            )
-            files = response.get("files", []) if isinstance(response, dict) else []
-            first = files[0] if files else None
-            if isinstance(first, dict) and first.get("id"):
-                folder_id = str(first["id"])
-            else:
-                created = self._execute(
-                    self._service.files().create(
-                        body={
-                            "name": name,
-                            "parents": [parent_id],
-                            "mimeType": "application/vnd.google-apps.folder",
-                            "appProperties": {
-                                "pdw_source": "apple_notes",
-                                "pdw_kind": "object_storage_prefix",
-                                "pdw_root_folder_id": self._folder_id,
-                                "pdw_stage": storage_stage_from_folder_name(name),
-                            },
-                        },
-                        fields="id,webViewLink",
-                        supportsAllDrives=True,
-                    )
-                )
-                folder_id = str(created.get("id", ""))
-            _PROMOTER_FOLDER_CACHE[cache_key] = folder_id
-            self._folder_cache[cache_key] = folder_id
-            return folder_id
-
-    def _execute(self, request):
-        last_exc = None
-        for attempt in range(1, self._max_attempts + 1):
-            try:
-                try:
-                    return request.execute(num_retries=2)
-                except TypeError:
-                    return request.execute()
-            except Exception as exc:
-                last_exc = exc
-                if attempt == self._max_attempts:
-                    break
-                time.sleep(min(10, attempt * 2))
-        raise RuntimeError(f"Google Drive promotion request failed after {self._max_attempts} attempts: {last_exc}") from last_exc
+        target_key = str(target.get("storage_key", ""))
+        if not file_id or not target_key:
+            continue
+        object_store.move_object(source, new_object_key=target_key)
+        promoted += 1
+    return promoted
 
 
-def iter_drive_metadata_payloads(
+def iter_metadata_payloads(
     *,
-    service,
-    folder_id: str,
+    object_store: ObjectStore,
     stage: str = "inbox",
-    download_service_factory: Callable[[], Any] | None = None,
+    object_store_factory: Callable[[], ObjectStore] | None = None,
     download_workers: int = 1,
 ) -> Iterable[Mapping[str, Any]]:
-    metadata_files = list(iter_drive_files_by_kind(service=service, folder_id=folder_id, kind="apple_note_revision_metadata", stage=stage))
-    html_files_by_revision = {
-        drive_note_revision_key(file): file
-        for file in iter_drive_files_by_kind(service=service, folder_id=folder_id, kind="apple_note_body_html", stage=stage)
+    metadata_listings = object_store.list_objects(kind=METADATA_KIND, stage=stage)
+    html_by_revision = {
+        revision_key(listing): listing
+        for listing in object_store.list_objects(kind=HTML_KIND, stage=stage)
     }
-    attachment_files_by_revision: dict[tuple[str, str, str], Mapping[str, Any]] = {}
-    attachment_files_by_sha: dict[str, Mapping[str, Any]] = {}
-    for file in iter_drive_files_by_kind(service=service, folder_id=folder_id, kind="apple_note_attachment", stage=""):
-        properties = nested_mapping(file, "appProperties")
+    attachment_by_revision: dict[tuple[str, str, str], ObjectListing] = {}
+    attachment_by_sha: dict[str, ObjectListing] = {}
+    for listing in object_store.list_objects(kind=ATTACHMENT_KIND, stage=""):
+        properties = listing.app_properties
         note_id = str(properties.get("note_id", ""))
         revision_id = str(properties.get("revision_id", ""))
         attachment_id = str(properties.get("attachment_id", ""))
         content_sha256 = str(properties.get("content_sha256", ""))
         if note_id and revision_id and attachment_id:
-            attachment_files_by_revision[(note_id, revision_id, attachment_id)] = file
+            attachment_by_revision[(note_id, revision_id, attachment_id)] = listing
         if content_sha256:
-            attachment_files_by_sha.setdefault(content_sha256, file)
+            attachment_by_sha.setdefault(content_sha256, listing)
 
     download_workers = max(1, download_workers)
-    if download_workers == 1 or len(metadata_files) <= 1:
-        for file in metadata_files:
-            yield attach_drive_metadata_file(
-                file=file,
-                service=service,
-                folder_id=folder_id,
+    if download_workers == 1 or len(metadata_listings) <= 1:
+        for listing in metadata_listings:
+            yield attach_metadata_listing(
+                listing=listing,
+                object_store=object_store,
                 stage=stage,
-                html_files_by_revision=html_files_by_revision,
-                attachment_files_by_revision=attachment_files_by_revision,
-                attachment_files_by_sha=attachment_files_by_sha,
+                html_by_revision=html_by_revision,
+                attachment_by_revision=attachment_by_revision,
+                attachment_by_sha=attachment_by_sha,
             )
         return
 
     thread_local = threading.local()
 
-    def service_for_thread():
-        if download_service_factory is None:
-            return service
-        thread_service = getattr(thread_local, "service", None)
-        if thread_service is None:
-            thread_service = download_service_factory()
-            thread_local.service = thread_service
-        return thread_service
+    def store_for_thread() -> ObjectStore:
+        if object_store_factory is None:
+            return object_store
+        store = getattr(thread_local, "object_store", None)
+        if store is None:
+            store = object_store_factory()
+            thread_local.object_store = store
+        return store
 
-    def download_file(file: Mapping[str, Any]) -> Mapping[str, Any]:
-        return attach_drive_metadata_file(
-            file=file,
-            service=service_for_thread(),
-            folder_id=folder_id,
+    def download(listing: ObjectListing) -> Mapping[str, Any]:
+        return attach_metadata_listing(
+            listing=listing,
+            object_store=store_for_thread(),
             stage=stage,
-            html_files_by_revision=html_files_by_revision,
-            attachment_files_by_revision=attachment_files_by_revision,
-            attachment_files_by_sha=attachment_files_by_sha,
+            html_by_revision=html_by_revision,
+            attachment_by_revision=attachment_by_revision,
+            attachment_by_sha=attachment_by_sha,
         )
 
     with ThreadPoolExecutor(max_workers=download_workers, thread_name_prefix="apple-notes-download") as executor:
-        futures = [executor.submit(download_file, file) for file in metadata_files]
+        futures = [executor.submit(download, listing) for listing in metadata_listings]
         for future in as_completed(futures):
             yield future.result()
 
 
-def attach_drive_metadata_file(
+def attach_metadata_listing(
     *,
-    file: Mapping[str, Any],
-    service,
-    folder_id: str,
+    listing: ObjectListing,
+    object_store: ObjectStore,
     stage: str,
-    html_files_by_revision: Mapping[tuple[str, str], Mapping[str, Any]],
-    attachment_files_by_revision: Mapping[tuple[str, str, str], Mapping[str, Any]],
-    attachment_files_by_sha: Mapping[str, Mapping[str, Any]],
+    html_by_revision: Mapping[tuple[str, str], ObjectListing],
+    attachment_by_revision: Mapping[tuple[str, str, str], ObjectListing],
+    attachment_by_sha: Mapping[str, ObjectListing],
 ) -> Mapping[str, Any]:
-    file_id = str(file.get("id", ""))
-    if file_id:
-        payload = dict(download_drive_json(service=service, file_id=file_id))
-        return attach_storage_context(
-            payload,
-            service=service,
-            folder_id=folder_id,
-            stage=stage,
-            metadata_file=file,
-            html_files_by_revision=html_files_by_revision,
-            attachment_files_by_revision=attachment_files_by_revision,
-            attachment_files_by_sha=attachment_files_by_sha,
-        )
-    return {}
-
-
-def iter_drive_files_by_kind(
-    *,
-    service,
-    folder_id: str,
-    kind: str,
-    stage: str,
-) -> Iterable[Mapping[str, Any]]:
-    page_token: str | None = None
-    while True:
-        response = execute_drive_request(
-            service.files().list(
-                q=drive_files_query(folder_id=folder_id, kind=kind, stage=stage),
-                pageSize=1000,
-                pageToken=page_token,
-                fields="nextPageToken,files(id,name,webViewLink,appProperties)",
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            )
-        )
-        for file in response.get("files", []):
-            if isinstance(file, Mapping):
-                yield file
-        page_token = response.get("nextPageToken")
-        if not page_token:
-            return
-
-
-def has_drive_metadata_payloads(*, service, folder_id: str, stage: str = "inbox") -> bool:
-    response = execute_drive_request(
-        service.files().list(
-            q=drive_metadata_files_query(folder_id=folder_id, stage=stage),
-            pageSize=1,
-            fields="files(id)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
+    payload = dict(load_json_object(object_store, listing.ref))
+    return attach_storage_context(
+        payload,
+        stage=stage,
+        metadata_listing=listing,
+        html_by_revision=html_by_revision,
+        attachment_by_revision=attachment_by_revision,
+        attachment_by_sha=attachment_by_sha,
     )
-    return bool(response.get("files", [])) if isinstance(response, Mapping) else False
 
 
-def drive_metadata_files_query(*, folder_id: str, stage: str) -> str:
-    return drive_files_query(folder_id=folder_id, kind="apple_note_revision_metadata", stage=stage)
+def has_metadata_payloads(*, object_store: ObjectStore, stage: str = "inbox") -> bool:
+    return object_store.find_object(kind=METADATA_KIND, stage=stage) is not None
 
 
-def drive_files_query(*, folder_id: str, kind: str, stage: str) -> str:
-    query = (
-        "trashed = false "
-        f"and {APPLE_NOTES_DRIVE_SOURCE_QUERY} "
-        f"and appProperties has {{ key='pdw_root_folder_id' and value='{escape_drive_query_value(folder_id)}' }} "
-        f"and appProperties has {{ key='pdw_kind' and value='{escape_drive_query_value(kind)}' }} "
-    )
-    if stage:
-        query += f"and appProperties has {{ key='pdw_stage' and value='{escape_drive_query_value(stage)}' }}"
-    return query
+def load_json_object(object_store: ObjectStore, ref: Mapping[str, Any]) -> Mapping[str, Any]:
+    payload = json.loads(object_store.get_object(ref).decode("utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("Stored object did not contain a JSON object")
+    return payload
 
 
-def drive_note_revision_key(file: Mapping[str, Any]) -> tuple[str, str]:
-    properties = nested_mapping(file, "appProperties")
-    return (
-        str(properties.get("note_id", "")),
-        str(properties.get("revision_id", "")),
-    )
+def revision_key(listing: ObjectListing) -> tuple[str, str]:
+    properties = listing.app_properties
+    return (str(properties.get("note_id", "")), str(properties.get("revision_id", "")))
 
 
 def attach_storage_context(
     payload: Mapping[str, Any],
     *,
-    service,
-    folder_id: str,
     stage: str,
-    metadata_file: Mapping[str, Any],
-    html_files_by_revision: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
-    attachment_files_by_revision: Mapping[tuple[str, str, str], Mapping[str, Any]] | None = None,
-    attachment_files_by_sha: Mapping[str, Mapping[str, Any]] | None = None,
+    metadata_listing: ObjectListing,
+    html_by_revision: Mapping[tuple[str, str], ObjectListing],
+    attachment_by_revision: Mapping[tuple[str, str, str], ObjectListing],
+    attachment_by_sha: Mapping[str, ObjectListing],
 ) -> dict[str, Any]:
     decorated = clean_metadata_payload(payload)
     note = nested_mapping(decorated, "note")
@@ -413,26 +241,16 @@ def attach_storage_context(
     note_id = str(note.get("note_id", ""))
     decorated["metadata_file"] = stored_file_context(
         storage_key=metadata_storage_key(decorated, stage=stage),
-        file=metadata_file,
-        extra={"content_sha256": str(nested_mapping(metadata_file, "appProperties").get("content_sha256", ""))},
+        listing=metadata_listing,
+        extra={"content_sha256": str(metadata_listing.app_properties.get("content_sha256", ""))},
     )
     if not bool(note.get("is_deleted", False)):
-        html_file = (
-            html_files_by_revision.get((note_id, revision_id), {})
-            if html_files_by_revision is not None
-            else find_drive_object(
-                service=service,
-                folder_id=folder_id,
-                kind="apple_note_body_html",
-                stage=stage,
-                properties={"note_id": note_id, "revision_id": revision_id},
-            )
-        )
-        if html_file:
+        html_listing = html_by_revision.get((note_id, revision_id))
+        if html_listing is not None:
             decorated["html_file"] = stored_file_context(
                 storage_key=html_storage_key(decorated, stage=stage),
-                file=html_file,
-                extra={"content_sha256": str(nested_mapping(html_file, "appProperties").get("content_sha256", ""))},
+                listing=html_listing,
+                extra={"content_sha256": str(html_listing.app_properties.get("content_sha256", ""))},
             )
     attachments: list[dict[str, Any]] = []
     for raw_attachment in note.get("attachments", []):
@@ -441,39 +259,31 @@ def attach_storage_context(
         attachment = deepcopy(dict(raw_attachment))
         attachment_id = str(attachment.get("attachment_id", ""))
         content_sha256 = str(attachment.get("content_sha256", ""))
-        file = {}
-        if attachment_files_by_revision is not None:
-            file = attachment_files_by_revision.get((note_id, revision_id, attachment_id), {})
-        else:
-            file = find_drive_object(
-                service=service,
-                folder_id=folder_id,
-                kind="apple_note_attachment",
-                stage=stage,
-                properties={"note_id": note_id, "revision_id": revision_id, "attachment_id": attachment_id},
-            )
-        if not file and content_sha256:
-            file = (
-                attachment_files_by_sha.get(content_sha256, {})
-                if attachment_files_by_sha is not None
-                else find_drive_object(
-                    service=service,
-                    folder_id=folder_id,
-                    kind="apple_note_attachment",
-                    stage="",
-                    properties={"content_sha256": content_sha256},
-                )
-            )
-        if file:
+        listing = attachment_by_revision.get((note_id, revision_id, attachment_id))
+        if listing is None and content_sha256:
+            listing = attachment_by_sha.get(content_sha256)
+        if listing is not None:
             attachment["file"] = stored_file_context(
                 storage_key=attachment_storage_key(decorated, attachment, stage=stage),
-                file=file,
+                listing=listing,
             )
         attachments.append(attachment)
     note_copy = dict(note)
     note_copy["attachments"] = attachments
     decorated["note"] = note_copy
     return decorated
+
+
+def stored_file_context(
+    *,
+    storage_key: str,
+    listing: ObjectListing,
+    extra: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    context = dict(listing.ref)
+    context["storage_key"] = storage_key
+    context.update(extra or {})
+    return context
 
 
 def clean_metadata_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -651,67 +461,6 @@ def clean_attachments(note: Mapping[str, Any]) -> list[dict[str, Any]]:
     return attachments
 
 
-def download_drive_json(*, service, file_id: str) -> Mapping[str, Any]:
-    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-    buffer = BytesIO()
-    downloader = MediaIoBaseDownload(buffer, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk(num_retries=2)
-    payload = json.loads(buffer.getvalue().decode("utf-8"))
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"Drive file {file_id} did not contain a JSON object")
-    return payload
-
-
-def find_drive_object(
-    *,
-    service,
-    folder_id: str,
-    kind: str,
-    stage: str,
-    properties: Mapping[str, str],
-) -> Mapping[str, Any]:
-    query = (
-        "trashed = false "
-        f"and {APPLE_NOTES_DRIVE_SOURCE_QUERY} "
-        f"and appProperties has {{ key='pdw_root_folder_id' and value='{escape_drive_query_value(folder_id)}' }} "
-        f"and appProperties has {{ key='pdw_kind' and value='{escape_drive_query_value(kind)}' }} "
-    )
-    if stage:
-        query += f"and appProperties has {{ key='pdw_stage' and value='{escape_drive_query_value(stage)}' }} "
-    for key, value in properties.items():
-        query += f"and appProperties has {{ key='{escape_drive_query_value(key)}' and value='{escape_drive_query_value(value)}' }} "
-    response = execute_drive_request(
-        service.files().list(
-            q=query,
-            pageSize=1,
-            fields="files(id,name,webViewLink,appProperties)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-    )
-    files = response.get("files", []) if isinstance(response, dict) else []
-    first = files[0] if files else None
-    return first if isinstance(first, Mapping) else {}
-
-
-def stored_file_context(
-    *,
-    storage_key: str,
-    file: Mapping[str, Any],
-    extra: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    context = {
-        "storage_backend": "google_drive",
-        "storage_key": storage_key,
-        "storage_file_id": str(file.get("id", "")),
-        "storage_url": str(file.get("webViewLink", "")),
-    }
-    context.update(extra or {})
-    return context
-
-
 def metadata_storage_key(payload: Mapping[str, Any], *, stage: str) -> str:
     return object_storage_key(payload, stage=stage, extension=".json")
 
@@ -748,34 +497,12 @@ def library_storage_key(storage_key: str) -> str:
     return storage_key
 
 
-def storage_stage(storage_key: str) -> str:
-    parts = [part for part in storage_key.split("/") if part]
-    if len(parts) > 1 and parts[1] in {"inbox", "library"}:
-        return parts[1]
-    return ""
-
-
-def storage_stage_from_folder_name(name: str) -> str:
-    return name if name in {"inbox", "library"} else ""
-
-
-def promoter_folder_lock(cache_key: tuple[str, str]) -> threading.Lock:
-    with _PROMOTER_FOLDER_LOCKS_LOCK:
-        lock = _PROMOTER_FOLDER_LOCKS.get(cache_key)
-        if lock is None:
-            lock = threading.Lock()
-            _PROMOTER_FOLDER_LOCKS[cache_key] = lock
-        return lock
-
-
 def nested_mapping(value: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     nested = value.get(key)
     return nested if isinstance(nested, Mapping) else {}
 
 
 def safe_object_key_part(value: str) -> str:
-    import re
-
     return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")[:120] or "untitled"
 
 

@@ -22,8 +22,8 @@ def test_apple_notes_drive_inbox_sensor_runs_every_minute() -> None:
 
 def test_apple_notes_drive_inbox_sensor_skips_when_inbox_is_empty(monkeypatch) -> None:
     monkeypatch.setattr(apple_notes_defs, "load_settings", lambda **_kwargs: FakeSettings())
-    monkeypatch.setattr(apple_notes_defs, "build_google_drive_service", lambda **_kwargs: object())
-    monkeypatch.setattr(apple_notes_defs, "has_drive_metadata_payloads", lambda **_kwargs: False)
+    monkeypatch.setattr(apple_notes_defs, "_apple_notes_object_store", lambda _settings: object())
+    monkeypatch.setattr(apple_notes_defs, "has_metadata_payloads", lambda **_kwargs: False)
 
     with DagsterInstance.ephemeral() as instance:
         result = apple_notes_defs.apple_notes_drive_inbox_sensor(build_sensor_context(instance=instance))
@@ -34,8 +34,8 @@ def test_apple_notes_drive_inbox_sensor_skips_when_inbox_is_empty(monkeypatch) -
 
 def test_apple_notes_drive_inbox_sensor_launches_when_inbox_has_metadata(monkeypatch) -> None:
     monkeypatch.setattr(apple_notes_defs, "load_settings", lambda **_kwargs: FakeSettings())
-    monkeypatch.setattr(apple_notes_defs, "build_google_drive_service", lambda **_kwargs: object())
-    monkeypatch.setattr(apple_notes_defs, "has_drive_metadata_payloads", lambda **_kwargs: True)
+    monkeypatch.setattr(apple_notes_defs, "_apple_notes_object_store", lambda _settings: object())
+    monkeypatch.setattr(apple_notes_defs, "has_metadata_payloads", lambda **_kwargs: True)
 
     with DagsterInstance.ephemeral() as instance:
         result = apple_notes_defs.apple_notes_drive_inbox_sensor(build_sensor_context(instance=instance))

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 
 from personal_data_warehouse.apple_voice_memos_drive_ingest import (
-    GoogleDriveVoiceMemosPromoter,
     VoiceMemosDriveIngestRunner,
     attach_storage_context,
     clean_metadata_payload,
+    has_metadata_payloads,
+    iter_metadata_payloads,
     library_metadata_payload,
-    iter_drive_metadata_payloads,
     metadata_to_row,
 )
+from personal_data_warehouse.objectstore import ObjectListing
 
 
 class FakeLogger:
@@ -33,82 +35,38 @@ class FakeWarehouse:
         self.rows.extend(rows)
 
 
-class FakePromoter:
-    def __init__(self) -> None:
-        self.payloads: list[dict[str, object]] = []
+class FakeObjectStore:
+    """Minimal ObjectStore for ingest tests (no Google Drive)."""
 
-    def promote(self, payload) -> None:
-        self.payloads.append(payload)
+    backend = "google_drive"
 
+    def __init__(self, *, metadata_listings=None, audio_listing=None, json_by_id=None) -> None:
+        self.metadata_listings = list(metadata_listings or [])
+        self.audio_listing = audio_listing
+        self.json_by_id = dict(json_by_id or {})
+        self.moved: list[tuple[str, str]] = []
 
-class FakeDriveRequest:
-    def __init__(self, response) -> None:
-        self.response = response
+    def list_objects(self, *, kind, stage=None, properties=None):
+        return list(self.metadata_listings) if kind == "voice_memo_metadata" else []
 
-    def execute(self):
-        return self.response
+    def find_object(self, *, kind, stage=None, properties=None):
+        if kind == "voice_memo_metadata":
+            return self.metadata_listings[0] if self.metadata_listings else None
+        if kind == "voice_memo_audio":
+            return self.audio_listing
+        return None
 
+    def get_object(self, ref):
+        return json.dumps(self.json_by_id[str(ref["storage_file_id"])]).encode("utf-8")
 
-class FakeDriveFiles:
-    def __init__(self) -> None:
-        self.list_calls: list[dict[str, object]] = []
-        self.media_requests: list[str] = []
-
-    def list(self, **kwargs):
-        self.list_calls.append(kwargs)
-        return FakeDriveRequest({"files": []})
-
-    def get_media(self, **kwargs):
-        self.media_requests.append(str(kwargs["fileId"]))
-        return object()
-
-
-class FakeDriveService:
-    def __init__(self) -> None:
-        self.files_resource = FakeDriveFiles()
-
-    def files(self):
-        return self.files_resource
-
-
-class FakePromoteDriveRequest:
-    def __init__(self, response) -> None:
-        self.response = response
-
-    def execute(self):
-        return self.response
-
-
-class FakePromoteDriveFiles:
-    def __init__(self) -> None:
-        self.list_calls: list[dict[str, object]] = []
-        self.create_calls: list[dict[str, object]] = []
-        self.get_calls: list[dict[str, object]] = []
-        self.update_calls: list[dict[str, object]] = []
-
-    def list(self, **kwargs):
-        self.list_calls.append(kwargs)
-        return FakePromoteDriveRequest({"files": []})
-
-    def create(self, **kwargs):
-        self.create_calls.append(kwargs)
-        return FakePromoteDriveRequest({"id": f"folder-{kwargs['body']['name']}"})
-
-    def get(self, **kwargs):
-        self.get_calls.append(kwargs)
-        return FakePromoteDriveRequest({"parents": ["old-parent"]})
-
-    def update(self, **kwargs):
-        self.update_calls.append(kwargs)
-        return FakePromoteDriveRequest({"id": kwargs["fileId"], "webViewLink": "https://drive/promoted"})
-
-
-class FakePromoteDriveService:
-    def __init__(self) -> None:
-        self.files_resource = FakePromoteDriveFiles()
-
-    def files(self):
-        return self.files_resource
+    def move_object(self, ref, *, new_object_key, app_properties=None):
+        self.moved.append((str(ref.get("storage_file_id", "")), new_object_key))
+        return {
+            "storage_backend": self.backend,
+            "storage_key": new_object_key,
+            "storage_file_id": str(ref.get("storage_file_id", "")),
+            "storage_url": "https://drive/promoted",
+        }
 
 
 def metadata_payload() -> dict[str, object]:
@@ -155,47 +113,49 @@ def decorated_metadata_payload() -> dict[str, object]:
     return payload
 
 
-def test_attach_storage_context_derives_google_drive_keys_without_json_storage_fields() -> None:
+def metadata_listing() -> ObjectListing:
+    return ObjectListing(
+        ref={
+            "storage_backend": "google_drive",
+            "storage_key": "",
+            "storage_file_id": "drive-metadata-file-id",
+            "storage_url": "https://drive/metadata",
+        },
+        app_properties={"content_sha256": "metadata-sha"},
+        filename="2026-03-25-abc123.json",
+    )
+
+
+def audio_listing() -> ObjectListing:
+    return ObjectListing(
+        ref={
+            "storage_backend": "google_drive",
+            "storage_key": "",
+            "storage_file_id": "drive-file-id",
+            "storage_url": "https://drive/audio",
+        },
+        app_properties={"content_sha256": "abc123"},
+        filename="2026-03-25-abc123.qta",
+    )
+
+
+def test_attach_storage_context_derives_keys_from_listings() -> None:
     payload = attach_storage_context(
         metadata_payload(),
         stage="inbox",
-        metadata_file={
-            "id": "drive-metadata-file-id",
-            "webViewLink": "https://drive/metadata",
-            "appProperties": {"content_sha256": "metadata-sha"},
-        },
-        audio_file={
-            "id": "drive-file-id",
-            "webViewLink": "https://drive/audio",
-        },
+        metadata_listing=metadata_listing(),
+        audio_listing=audio_listing(),
     )
 
     assert payload["audio_file"]["storage_key"] == "apple-voice-memos/inbox/2026/03/2026-03-25-abc123.qta"
+    assert payload["audio_file"]["storage_file_id"] == "drive-file-id"
     assert payload["metadata_file"]["storage_key"] == "apple-voice-memos/inbox/2026/03/2026-03-25-abc123.json"
+    assert payload["metadata_file"]["content_sha256"] == "metadata-sha"
     assert "audio_file" not in clean_metadata_payload(payload)
     assert "metadata_file" not in clean_metadata_payload(payload)
 
 
-def legacy_metadata_payload() -> dict[str, object]:
-    return {
-        **metadata_payload(),
-        "audio_file": {
-            "storage_backend": "google_drive",
-            "storage_key": "apple-voice-memos/inbox/2026/03/2026-03-25-abc123.qta",
-            "storage_file_id": "drive-file-id",
-            "storage_url": "https://drive/audio",
-        },
-        "metadata_file": {
-            "storage_backend": "google_drive",
-            "storage_key": "apple-voice-memos/inbox/2026/03/2026-03-25-abc123.json",
-            "storage_file_id": "drive-metadata-file-id",
-            "storage_url": "https://drive/metadata",
-            "content_sha256": "metadata-sha",
-        },
-    }
-
-
-def test_metadata_to_row_maps_drive_metadata_to_row() -> None:
+def test_metadata_to_row_maps_metadata_to_row() -> None:
     row = metadata_to_row(decorated_metadata_payload(), ingested_at=datetime(2026, 4, 27, 13, tzinfo=UTC))
 
     assert row["account"] == "zach@example.com"
@@ -217,14 +177,36 @@ def test_library_metadata_payload_rewrites_inbox_storage_keys() -> None:
     assert payload["metadata_file"]["content_sha256"] == "metadata-sha"
 
 
-def test_drive_ingest_runner_writes_metadata_rows() -> None:
+def test_iter_metadata_payloads_reads_through_object_store() -> None:
+    store = FakeObjectStore(
+        metadata_listings=[metadata_listing()],
+        audio_listing=audio_listing(),
+        json_by_id={"drive-metadata-file-id": metadata_payload()},
+    )
+
+    payloads = list(iter_metadata_payloads(object_store=store))
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["audio_file"]["storage_key"] == "apple-voice-memos/inbox/2026/03/2026-03-25-abc123.qta"
+    assert payload["audio_file"]["storage_file_id"] == "drive-file-id"
+    assert payload["metadata_file"]["storage_key"] == "apple-voice-memos/inbox/2026/03/2026-03-25-abc123.json"
+    assert payload["metadata_file"]["content_sha256"] == "metadata-sha"
+
+
+def test_has_metadata_payloads_uses_find_object() -> None:
+    assert has_metadata_payloads(object_store=FakeObjectStore(metadata_listings=[metadata_listing()])) is True
+    assert has_metadata_payloads(object_store=FakeObjectStore()) is False
+
+
+def test_drive_ingest_runner_writes_rows_and_promotes_via_object_store() -> None:
     warehouse = FakeWarehouse()
-    promoter = FakePromoter()
+    store = FakeObjectStore()
 
     summary = VoiceMemosDriveIngestRunner(
         warehouse=warehouse,
         metadata_source=lambda: [decorated_metadata_payload()],
-        promoter=promoter,
+        object_store=store,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 4, 27, 13, tzinfo=UTC),
     ).sync()
@@ -233,52 +215,24 @@ def test_drive_ingest_runner_writes_metadata_rows() -> None:
     assert summary.metadata_seen == 1
     assert summary.rows_written == 1
     assert summary.recordings_promoted == 1
-    assert warehouse.rows[0]["content_sha256"] == "abc123"
+    # Rows record post-promotion (library) keys.
     assert warehouse.rows[0]["storage_key"] == "apple-voice-memos/library/2026/03/2026-03-25-abc123.qta"
-    assert promoter.payloads == [decorated_metadata_payload()]
-
-
-def test_drive_metadata_listing_uses_root_folder_app_property_not_direct_parent() -> None:
-    service = FakeDriveService()
-
-    assert list(iter_drive_metadata_payloads(service=service, folder_id="root-folder")) == []
-
-    query = service.files_resource.list_calls[0]["q"]
-    assert "'root-folder' in parents" not in query
-    assert "pdw_root_folder_id" in query
-    assert "root-folder" in query
-    assert "value='apple_voice_memos'" in query
-    assert "value='voice_memos'" in query
-    assert "pdw_stage' and value='inbox" in query
-
-
-def test_drive_metadata_listing_can_target_library_stage() -> None:
-    service = FakeDriveService()
-
-    assert list(iter_drive_metadata_payloads(service=service, folder_id="root-folder", stage="library")) == []
-
-    query = service.files_resource.list_calls[0]["q"]
-    assert "pdw_stage' and value='library" in query
-
-
-def test_google_drive_promoter_moves_audio_and_metadata_to_library() -> None:
-    service = FakePromoteDriveService()
-
-    GoogleDriveVoiceMemosPromoter(service=service, folder_id="root-folder").promote(decorated_metadata_payload())
-
-    created_folders = [call["body"]["name"] for call in service.files_resource.create_calls]
-    assert created_folders == ["apple-voice-memos", "library", "2026", "03"]
-    assert [call["fileId"] for call in service.files_resource.update_calls] == [
-        "drive-file-id",
-        "drive-metadata-file-id",
+    # Both audio + metadata blobs moved to their library keys.
+    assert store.moved == [
+        ("drive-file-id", "apple-voice-memos/library/2026/03/2026-03-25-abc123.qta"),
+        ("drive-metadata-file-id", "apple-voice-memos/library/2026/03/2026-03-25-abc123.json"),
     ]
-    audio_update = service.files_resource.update_calls[0]
-    metadata_update = service.files_resource.update_calls[1]
-    assert audio_update["addParents"] == "folder-03"
-    assert audio_update["removeParents"] == "old-parent"
-    assert audio_update["body"]["name"] == "2026-03-25-abc123.qta"
-    assert audio_update["body"]["appProperties"]["pdw_stage"] == "library"
-    assert "storage_key" not in audio_update["body"]["appProperties"]
-    assert metadata_update["body"]["name"] == "2026-03-25-abc123.json"
-    assert "storage_key" not in metadata_update["body"]["appProperties"]
-    assert "media_body" not in metadata_update
+
+
+def test_drive_ingest_runner_without_object_store_keeps_inbox_keys() -> None:
+    warehouse = FakeWarehouse()
+
+    summary = VoiceMemosDriveIngestRunner(
+        warehouse=warehouse,
+        metadata_source=lambda: [decorated_metadata_payload()],
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 4, 27, 13, tzinfo=UTC),
+    ).sync()
+
+    assert summary.recordings_promoted == 0
+    assert warehouse.rows[0]["storage_key"] == "apple-voice-memos/inbox/2026/03/2026-03-25-abc123.qta"

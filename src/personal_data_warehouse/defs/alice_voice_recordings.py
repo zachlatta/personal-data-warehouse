@@ -14,6 +14,7 @@ from dagster import (
 
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.gmail_sync import build_gmail_service
+from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse_alice_voice_recordings.api import AliceApiClient
@@ -22,11 +23,23 @@ from personal_data_warehouse_alice_voice_recordings.gmail_recovery import (
     load_alice_gmail_transcript_emails,
 )
 from personal_data_warehouse_alice_voice_recordings.sync import SOURCE, AliceVoiceRecordingsImportRunner
-from personal_data_warehouse_voice_memos.cli import build_google_drive_service
-from personal_data_warehouse_voice_memos.google_drive_storage import GoogleDriveObjectStore
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 ALICE_VOICE_RECORDINGS_IMPORT_POSTGRES_LOCK_ID = 7_403_111_840
+
+
+def _alice_object_store(config, settings):
+    return build_object_store(
+        google_drive_spec(
+            folder_id=config.google_drive_folder_id,
+            account=config.google_drive_account,
+            source=SOURCE,
+            blob_kind="voice_recording_audio",
+            metadata_kind="voice_recording_metadata",
+            request_timeout_seconds=config.request_timeout_seconds,
+        ),
+        settings=settings,
+    )
 
 
 @asset(
@@ -57,22 +70,10 @@ def alice_voice_recordings_import(context) -> MaterializeResult:
                 base_url=config.base_url,
                 timeout_seconds=config.request_timeout_seconds,
             )
-            service = build_google_drive_service(
-                account=config.google_drive_account,
-                settings=settings,
-                request_timeout_seconds=config.request_timeout_seconds,
-            )
             summary = AliceVoiceRecordingsImportRunner(
                 account=config.account,
                 upload_requests=client.iter_recordings(),
-                object_store=GoogleDriveObjectStore(
-                    folder_id=config.google_drive_folder_id,
-                    service=service,
-                    source=SOURCE,
-                    legacy_sources=(),
-                    audio_kind="voice_recording_audio",
-                    metadata_kind="voice_recording_metadata",
-                ),
+                object_store=_alice_object_store(config, settings),
                 logger=context.log,
                 mode="incremental",
                 stage="library",
@@ -121,21 +122,9 @@ def alice_voice_recordings_gmail_recovery(context) -> MaterializeResult:
                 for account in settings.gmail_accounts
                 if any(email.account == account.email_address for email in emails)
             }
-            drive_service = build_google_drive_service(
-                account=config.google_drive_account,
-                settings=settings,
-                request_timeout_seconds=config.request_timeout_seconds,
-            )
             summary = AliceGmailRecoveryRunner(
                 emails=emails,
-                object_store=GoogleDriveObjectStore(
-                    folder_id=config.google_drive_folder_id,
-                    service=drive_service,
-                    source=SOURCE,
-                    legacy_sources=(),
-                    audio_kind="voice_recording_audio",
-                    metadata_kind="voice_recording_metadata",
-                ),
+                object_store=_alice_object_store(config, settings),
                 gmail_services_by_account=gmail_services,
                 logger=context.log,
                 stage="library",

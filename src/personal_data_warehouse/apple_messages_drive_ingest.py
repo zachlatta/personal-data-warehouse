@@ -5,22 +5,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from io import BytesIO
 import gzip
 import json
 import threading
-import time
 from typing import Any
 
-from googleapiclient.http import MediaIoBaseDownload
-
-from personal_data_warehouse.apple_voice_memos_drive_ingest import (
-    build_google_drive_service,
-    drive_name_from_object_key,
-    escape_drive_query_value,
-    execute_drive_request,
-    parse_datetime,
-)
+from personal_data_warehouse.apple_voice_memos_drive_ingest import parse_datetime
+from personal_data_warehouse.objectstore import ObjectListing, ObjectStore
 
 
 @dataclass(frozen=True)
@@ -38,12 +29,8 @@ class AppleMessagesDriveIngestSummary:
 OBJECT_PREFIX = "apple-messages"
 INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox/"
 LIBRARY_PREFIX = f"{OBJECT_PREFIX}/library/"
-APPLE_MESSAGES_DRIVE_SOURCE_QUERY = "appProperties has { key='pdw_source' and value='apple_messages' }"
 BATCH_KIND = "apple_message_export_batch"
 ATTACHMENT_KIND = "apple_message_attachment"
-_PROMOTER_FOLDER_CACHE: dict[tuple[str, str], str] = {}
-_PROMOTER_FOLDER_LOCKS: dict[tuple[str, str], threading.Lock] = {}
-_PROMOTER_FOLDER_LOCKS_LOCK = threading.Lock()
 
 
 class AppleMessagesDriveIngestRunner:
@@ -52,18 +39,18 @@ class AppleMessagesDriveIngestRunner:
         *,
         warehouse,
         batch_source: Callable[[], Iterable[Mapping[str, Any]]],
-        promoter=None,
-        promoter_factory: Callable[[], Any] | None = None,
+        object_store: ObjectStore | None = None,
+        object_store_factory: Callable[[], ObjectStore] | None = None,
         promotion_workers: int = 1,
         logger,
         now: Callable[[], datetime] | None = None,
     ) -> None:
-        if promoter is not None and promoter_factory is not None:
-            raise ValueError("pass only one of promoter or promoter_factory")
+        if object_store is not None and object_store_factory is not None:
+            raise ValueError("pass only one of object_store or object_store_factory")
         self._warehouse = warehouse
         self._batch_source = batch_source
-        self._promoter = promoter
-        self._promoter_factory = promoter_factory
+        self._object_store = object_store
+        self._object_store_factory = object_store_factory
         self._promotion_workers = max(1, promotion_workers)
         self._thread_local = threading.local()
         self._logger = logger
@@ -73,8 +60,8 @@ class AppleMessagesDriveIngestRunner:
         self._warehouse.ensure_apple_messages_tables()
         ingested_at = self._now()
         batches = list(self._batch_source())
-        should_record_library_keys = self._promoter is not None or self._promoter_factory is not None
-        row_batches = [library_batch_payload(batch) for batch in batches] if should_record_library_keys else batches
+        promote = self._object_store is not None or self._object_store_factory is not None
+        row_batches = [library_batch_payload(batch) for batch in batches] if promote else batches
         records = sorted(
             [record for batch in row_batches for record in batch_records(batch)],
             key=record_exported_at,
@@ -129,13 +116,13 @@ class AppleMessagesDriveIngestRunner:
         self._warehouse.insert_apple_message_attachments(attachment_rows)
 
         promoted = 0
-        if self._promoter or self._promoter_factory:
+        if promote:
             self._logger.info(
                 "Promoting %s Apple Messages Drive batch(es) with %s worker(s)",
                 len(batches),
                 self._promotion_workers,
             )
-            if self._promoter_factory is not None and self._promotion_workers > 1:
+            if self._object_store_factory is not None and self._promotion_workers > 1:
                 promoted = self._promote_stored_files_parallel(batches)
             elif self._promotion_workers == 1 or len(batches) <= 1:
                 promoted = sum(self._promote_batch(batch) for batch in batches)
@@ -162,7 +149,7 @@ class AppleMessagesDriveIngestRunner:
         )
 
     def _promote_batch(self, batch: Mapping[str, Any]) -> int:
-        return self._promoter_for_thread().promote(batch)
+        return promote_batch(self._object_store_for_thread(), batch)
 
     def _promote_stored_files_parallel(self, batches: list[Mapping[str, Any]]) -> int:
         pairs: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
@@ -173,203 +160,59 @@ class AppleMessagesDriveIngestRunner:
             return sum(1 for future in as_completed(futures) if future.result())
 
     def _promote_stored_file(self, source: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
-        return self._promoter_for_thread().promote_stored_file(source=source, target=target)
+        return promote_stored_file(self._object_store_for_thread(), source=source, target=target)
 
-    def _promoter_for_thread(self):
-        if self._promoter is not None:
-            return self._promoter
-        promoter = getattr(self._thread_local, "promoter", None)
-        if promoter is None:
-            if self._promoter_factory is None:
-                raise RuntimeError("promoter_factory is not configured")
-            promoter = self._promoter_factory()
-            self._thread_local.promoter = promoter
-        return promoter
-
-
-class GoogleDriveAppleMessagesPromoter:
-    def __init__(self, *, service, folder_id: str, max_attempts: int = 3) -> None:
-        self._service = service
-        self._folder_id = folder_id
-        self._max_attempts = max_attempts
-        self._folder_cache: dict[tuple[str, str], str] = {}
-
-    def promote(self, batch: Mapping[str, Any]) -> int:
-        promoted = 0
-        library_batch = library_batch_payload(batch)
-        for source, target in stored_files_for_promotion(batch, library_batch):
-            if self.promote_stored_file(source=source, target=target):
-                promoted += 1
-        return promoted
-
-    def promote_stored_file(self, *, source: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
-        return self._promote_stored_file(source=source, target=target)
-
-    def _promote_stored_file(self, *, source: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
-        file_id = str(source.get("storage_file_id", ""))
-        storage_key = str(target.get("storage_key", ""))
-        if not file_id or not storage_key:
-            return False
-        parent_id = self._ensure_parent_folder(storage_key)
-        existing = self._execute(self._service.files().get(fileId=file_id, fields="parents", supportsAllDrives=True))
-        old_parent_ids = [str(parent_id) for parent_id in existing.get("parents", [])]
-        remove_parent_ids = [old_parent_id for old_parent_id in old_parent_ids if old_parent_id != parent_id]
-        self._execute(
-            self._service.files().update(
-                fileId=file_id,
-                body={"name": drive_name_from_object_key(storage_key), "appProperties": {"pdw_stage": storage_stage(storage_key)}},
-                addParents=parent_id,
-                removeParents=",".join(remove_parent_ids),
-                fields="id,webViewLink,appProperties",
-                supportsAllDrives=True,
-            )
-        )
-        return True
-
-    def _ensure_parent_folder(self, object_key: str) -> str:
-        parts = [part for part in object_key.split("/")[:-1] if part]
-        parent_id = self._folder_id
-        for part in parts:
-            parent_id = self._ensure_folder(parent_id=parent_id, name=part)
-        return parent_id
-
-    def _ensure_folder(self, *, parent_id: str, name: str) -> str:
-        cache_key = (parent_id, name)
-        if cache_key in self._folder_cache:
-            return self._folder_cache[cache_key]
-        if cache_key in _PROMOTER_FOLDER_CACHE:
-            folder_id = _PROMOTER_FOLDER_CACHE[cache_key]
-            self._folder_cache[cache_key] = folder_id
-            return folder_id
-        with promoter_folder_lock(cache_key):
-            if cache_key in _PROMOTER_FOLDER_CACHE:
-                folder_id = _PROMOTER_FOLDER_CACHE[cache_key]
-                self._folder_cache[cache_key] = folder_id
-                return folder_id
-            response = self._execute(
-                self._service.files().list(
-                    q=(
-                        f"'{escape_drive_query_value(parent_id)}' in parents and trashed = false "
-                        "and mimeType = 'application/vnd.google-apps.folder' "
-                        f"and name = '{escape_drive_query_value(name)}'"
-                    ),
-                    pageSize=1,
-                    fields="files(id,webViewLink)",
-                    supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
-                )
-            )
-            files = response.get("files", []) if isinstance(response, dict) else []
-            first = files[0] if files else None
-            if isinstance(first, dict) and first.get("id"):
-                folder_id = str(first["id"])
-            else:
-                created = self._execute(
-                    self._service.files().create(
-                        body={
-                            "name": name,
-                            "parents": [parent_id],
-                            "mimeType": "application/vnd.google-apps.folder",
-                            "appProperties": {
-                                "pdw_source": "apple_messages",
-                                "pdw_kind": "object_storage_prefix",
-                                "pdw_root_folder_id": self._folder_id,
-                                "pdw_stage": storage_stage_from_folder_name(name),
-                            },
-                        },
-                        fields="id,webViewLink",
-                        supportsAllDrives=True,
-                    )
-                )
-                folder_id = str(created.get("id", ""))
-            _PROMOTER_FOLDER_CACHE[cache_key] = folder_id
-            self._folder_cache[cache_key] = folder_id
-            return folder_id
-
-    def _execute(self, request):
-        last_exc = None
-        for attempt in range(1, self._max_attempts + 1):
-            try:
-                try:
-                    return request.execute(num_retries=2)
-                except TypeError:
-                    return request.execute()
-            except Exception as exc:
-                last_exc = exc
-                if attempt == self._max_attempts:
-                    break
-                time.sleep(min(10, attempt * 2))
-        raise RuntimeError(f"Google Drive promotion request failed after {self._max_attempts} attempts: {last_exc}") from last_exc
+    def _object_store_for_thread(self) -> ObjectStore:
+        if self._object_store is not None:
+            return self._object_store
+        store = getattr(self._thread_local, "object_store", None)
+        if store is None:
+            if self._object_store_factory is None:
+                raise RuntimeError("object_store_factory is not configured")
+            store = self._object_store_factory()
+            self._thread_local.object_store = store
+        return store
 
 
-def iter_drive_batch_payloads(*, service, folder_id: str, stage: str = "inbox") -> Iterable[Mapping[str, Any]]:
-    page_token: str | None = None
-    while True:
-        response = execute_drive_request(
-            service.files().list(
-                q=drive_batch_files_query(folder_id=folder_id, stage=stage),
-                pageSize=1000,
-                pageToken=page_token,
-                fields="nextPageToken,files(id,name,webViewLink,appProperties)",
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            )
-        )
-        for file in response.get("files", []):
-            if isinstance(file, Mapping) and file.get("id"):
-                records = list(download_drive_jsonl_gz(service=service, file_id=str(file["id"])))
-                yield {
-                    "schema_version": 1,
-                    "source": "apple_messages",
-                    "batch_file": stored_file_context(
-                        storage_key=batch_storage_key(file=file, stage=stage),
-                        file=file,
-                        extra={"content_sha256": str(nested_mapping(file, "appProperties").get("content_sha256", ""))},
-                    ),
-                    "records": records,
-                }
-        page_token = response.get("nextPageToken")
-        if not page_token:
-            return
+def promote_batch(object_store: ObjectStore, batch: Mapping[str, Any]) -> int:
+    promoted = 0
+    library_batch = library_batch_payload(batch)
+    for source, target in stored_files_for_promotion(batch, library_batch):
+        if promote_stored_file(object_store, source=source, target=target):
+            promoted += 1
+    return promoted
 
 
-def has_drive_batch_payloads(*, service, folder_id: str, stage: str = "inbox") -> bool:
-    response = execute_drive_request(
-        service.files().list(
-            q=drive_batch_files_query(folder_id=folder_id, stage=stage),
-            pageSize=1,
-            fields="files(id)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-    )
-    return bool(response.get("files", [])) if isinstance(response, Mapping) else False
+def promote_stored_file(object_store: ObjectStore, *, source: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
+    file_id = str(source.get("storage_file_id", ""))
+    target_key = str(target.get("storage_key", ""))
+    if not file_id or not target_key:
+        return False
+    object_store.move_object(source, new_object_key=target_key)
+    return True
 
 
-def drive_batch_files_query(*, folder_id: str, stage: str) -> str:
-    return drive_files_query(folder_id=folder_id, kind=BATCH_KIND, stage=stage)
+def iter_batch_payloads(*, object_store: ObjectStore, stage: str = "inbox") -> Iterable[Mapping[str, Any]]:
+    for listing in object_store.list_objects(kind=BATCH_KIND, stage=stage):
+        records = list(load_jsonl_gz_object(object_store, listing.ref))
+        yield {
+            "schema_version": 1,
+            "source": "apple_messages",
+            "batch_file": stored_file_context(
+                storage_key=batch_storage_key(listing=listing, stage=stage),
+                listing=listing,
+                extra={"content_sha256": str(listing.app_properties.get("content_sha256", ""))},
+            ),
+            "records": records,
+        }
 
 
-def drive_files_query(*, folder_id: str, kind: str, stage: str) -> str:
-    query = (
-        "trashed = false "
-        f"and {APPLE_MESSAGES_DRIVE_SOURCE_QUERY} "
-        f"and appProperties has {{ key='pdw_root_folder_id' and value='{escape_drive_query_value(folder_id)}' }} "
-        f"and appProperties has {{ key='pdw_kind' and value='{escape_drive_query_value(kind)}' }} "
-    )
-    if stage:
-        query += f"and appProperties has {{ key='pdw_stage' and value='{escape_drive_query_value(stage)}' }}"
-    return query
+def has_batch_payloads(*, object_store: ObjectStore, stage: str = "inbox") -> bool:
+    return object_store.find_object(kind=BATCH_KIND, stage=stage) is not None
 
 
-def download_drive_jsonl_gz(*, service, file_id: str) -> Iterable[Mapping[str, Any]]:
-    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-    buffer = BytesIO()
-    downloader = MediaIoBaseDownload(buffer, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk(num_retries=2)
-    content = gzip.decompress(buffer.getvalue()).decode("utf-8")
+def load_jsonl_gz_object(object_store: ObjectStore, ref: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
+    content = gzip.decompress(object_store.get_object(ref)).decode("utf-8")
     for line in content.splitlines():
         if not line.strip():
             continue
@@ -690,9 +533,9 @@ def clean_attachment_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return clean
 
 
-def batch_storage_key(*, file: Mapping[str, Any], stage: str) -> str:
-    name = str(file.get("name", ""))
-    exported = str(nested_mapping(file, "appProperties").get("exported_at", ""))
+def batch_storage_key(*, listing: ObjectListing, stage: str) -> str:
+    name = listing.filename
+    exported = str(listing.app_properties.get("exported_at", ""))
     exported_at = parse_datetime(exported) if exported else datetime.fromtimestamp(0, tz=UTC)
     if exported_at.year > 1970:
         return f"{OBJECT_PREFIX}/{stage}/batches/{exported_at.year:04d}/{exported_at.month:02d}/{name}"
@@ -702,15 +545,11 @@ def batch_storage_key(*, file: Mapping[str, Any], stage: str) -> str:
 def stored_file_context(
     *,
     storage_key: str,
-    file: Mapping[str, Any],
+    listing: ObjectListing,
     extra: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    context = {
-        "storage_backend": "google_drive",
-        "storage_key": storage_key,
-        "storage_file_id": str(file.get("id", "")),
-        "storage_url": str(file.get("webViewLink", "")),
-    }
+    context = dict(listing.ref)
+    context["storage_key"] = storage_key
     context.update(extra or {})
     return context
 
@@ -719,26 +558,6 @@ def library_storage_key(storage_key: str) -> str:
     if storage_key.startswith(INBOX_PREFIX):
         return f"{LIBRARY_PREFIX}{storage_key[len(INBOX_PREFIX):]}"
     return storage_key
-
-
-def storage_stage(storage_key: str) -> str:
-    parts = [part for part in storage_key.split("/") if part]
-    if len(parts) > 1 and parts[1] in {"inbox", "library"}:
-        return parts[1]
-    return ""
-
-
-def storage_stage_from_folder_name(name: str) -> str:
-    return name if name in {"inbox", "library"} else ""
-
-
-def promoter_folder_lock(cache_key: tuple[str, str]) -> threading.Lock:
-    with _PROMOTER_FOLDER_LOCKS_LOCK:
-        lock = _PROMOTER_FOLDER_LOCKS.get(cache_key)
-        if lock is None:
-            lock = threading.Lock()
-            _PROMOTER_FOLDER_LOCKS[cache_key] = lock
-        return lock
 
 
 def nested_mapping(value: Mapping[str, Any], key: str) -> Mapping[str, Any]:
