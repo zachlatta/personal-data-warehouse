@@ -19,6 +19,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --group dev --no-install-project
 
 COPY README.md ./
+COPY workspace.yaml ./
 COPY src ./src
 COPY docker/agent.Dockerfile docker/agent.Dockerfile
 COPY docker/agent-entrypoint.sh docker/agent-entrypoint.sh

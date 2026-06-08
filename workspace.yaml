@@ -1,0 +1,11 @@
+load_from:
+  # The daemon and webserver connect to a single long-lived gRPC code server
+  # (started in docker/start-dagster.sh) instead of each spawning their own
+  # managed, heartbeat-supervised code server from a `-m` module target. Under
+  # host load the managed servers miss their 20s heartbeats and self-terminate,
+  # reloading all definitions in a tight loop; a standalone server started
+  # without --heartbeat does not self-terminate, which removes that churn.
+  - grpc_server:
+      host: 127.0.0.1
+      port: 4000
+      location_name: personal_data_warehouse
