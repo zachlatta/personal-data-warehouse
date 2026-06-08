@@ -1135,6 +1135,58 @@ def test_runner_freshness_priority_can_use_cached_conversations_for_fast_polls(m
     assert warehouse.conversation_payload_calls[0]["include_archived"] is False
 
 
+def test_runner_freshness_priority_stops_gracefully_when_rate_limit_budget_is_exceeded(monkeypatch):
+    # Regression: the freshness stage (slack_workspace_sync) was the only Slack job
+    # that hard-failed when the per-runner rate-limit budget was exhausted, because
+    # _sync_account_freshness_priority let SlackRateLimitBudgetExceeded propagate out
+    # of sync_all (~33% of prod runs failed this way). With skip_known_errors=True it
+    # now stops gracefully, persisting the history cursor so the next pass resumes.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    sleeps = []
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "D_SLOW", "user": "U1", "is_im": True, "latest": {"ts": "1999.000000"}},
+        {"id": "D_NOT_REACHED", "user": "U2", "is_im": True, "latest": {"ts": "1999.000000"}},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                SlackRateLimitedError(retry_after=2),
+                SlackRateLimitedError(retry_after=2),
+            ],
+        }
+    )
+
+    summary = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        skip_known_errors=True,
+        sync_thread_replies=False,
+        sleep=sleeps.append,
+        max_rate_limit_sleep_seconds=3,
+    ).sync_all()[0]
+
+    assert sleeps == [2]
+    assert summary.sync_type == "freshness_priority"
+    assert summary.conversations_seen == 1
+    # Stopped before touching the second conversation rather than failing the run.
+    history_channels = [params["channel"] for method, params in client.calls if method == "conversations.history"]
+    assert set(history_channels) == {"D_SLOW"}
+    assert "D_NOT_REACHED" not in history_channels
+
+
 def test_runner_freshness_priority_fetches_thread_replies_inline(monkeypatch):
     # Regression: the freshness sync used to skip replies (sync_thread_replies=False),
     # so brand-new threads landed in the warehouse as a lone parent and their replies

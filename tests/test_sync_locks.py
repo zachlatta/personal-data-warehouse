@@ -113,6 +113,8 @@ def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
     assert all(call["sync_members"] is False for call in calls)
     # Freshness fetches replies inline so brand-new threads are captured complete.
     assert all(call["sync_thread_replies"] is True for call in calls[:4])
+    # A rate-limit budget hit stops the pass gracefully instead of failing the run.
+    assert all(call["skip_known_errors"] is True for call in calls[:4])
 
 
 def test_slack_freshness_sync_piggybacks_read_state(monkeypatch) -> None:

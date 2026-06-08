@@ -496,16 +496,41 @@ class SlackSyncRunner:
                     cursor_ts=_conversation_cursor_ts(conversation),
                 ):
                     continue
-                result = self._sync_conversation_messages(
-                    account=account.account,
-                    team_id=team_id,
-                    conversation_id=str(conversation["id"]),
-                    client=client,
-                    synced_at=synced_at,
-                    sync_version=sync_version,
-                    oldest_ts=oldest_ts,
-                )
                 conversations_seen += 1
+                try:
+                    result = self._sync_conversation_messages(
+                        account=account.account,
+                        team_id=team_id,
+                        conversation_id=str(conversation["id"]),
+                        client=client,
+                        synced_at=synced_at,
+                        sync_version=sync_version,
+                        oldest_ts=oldest_ts,
+                    )
+                except SlackRateLimitBudgetExceeded as exc:
+                    if not self._skip_known_errors:
+                        raise
+                    # The per-runner rate-limit budget is shared, so once it is
+                    # exhausted every remaining conversation in this pass would
+                    # also trip it. Stop gracefully instead of failing the run:
+                    # each conversation persists its history cursor as it goes
+                    # (see _sync_conversation_messages), so the next freshness
+                    # pass resumes from where this one left off.
+                    self._logger.warning(
+                        "Stopping Slack freshness sync for %s after rate limit budget was exhausted at %s: %s",
+                        account.account,
+                        conversation["id"],
+                        exc,
+                    )
+                    return SlackSyncSummary(
+                        account=account.account,
+                        team_id=team_id,
+                        sync_type="freshness_priority",
+                        conversations_seen=conversations_seen,
+                        messages_written=messages_written,
+                        users_written=0,
+                        files_written=files_written,
+                    )
                 messages_written += result["messages_written"]
                 files_written += result["files_written"]
                 group_written += result["messages_written"]

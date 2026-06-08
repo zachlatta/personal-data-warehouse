@@ -57,6 +57,12 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
                 use_existing_conversations=True,
                 conversation_types=conversation_types,
                 conversation_limit=conversation_limit,
+                # Stop gracefully when the rate-limit budget is exhausted instead of
+                # failing the run. The history cursor is persisted per conversation as
+                # the pass proceeds, so the next freshness run resumes from there. (This
+                # mirrors coverage and thread syncs, which already pass this flag; the
+                # freshness stage was the only Slack job that hard-failed on a budget hit.)
+                skip_known_errors=True,
                 # Fetch replies inline for thread parents that land in the recent
                 # window so brand-new threads are captured complete on first pass.
                 # Bounded to parents within the freshness window and still capped by
