@@ -49,15 +49,39 @@ Once you have confirmed you are on `crobat` or `porygon`, useful starting points
 ~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs \
   --format-logs --since 1h '{job="coolify",server="rotom"}'
 
-# Filter to a specific container, e.g. the Dagster app.
+# Filter to a specific container by resource UUID (see warning below).
 ~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs \
   --format-logs --since 1h \
-  '{job="coolify",server="rotom"} | json | container_name =~ "(?i).*dagster.*"'
+  '{job="coolify",server="rotom"} | json | container_name =~ "(?i).*<resource-uuid>.*"'
 
 # Host-level system logs for rotom itself.
 ~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs \
   --format-logs --since 1h '{job="machine",server="rotom"}'
 ```
+
+### Pin to the right deployment before reading logs
+
+The `rotom` Coolify server hosts many apps, several with confusingly similar
+names. A loose name filter like `container_name =~ ".*dagster.*"` can silently
+match more than one and return logs for the wrong app. Don't filter by guessed
+names — first ask the Coolify API for the deployment's exact resource UUID, then
+filter on that. Coolify names each container `<resource-uuid>-<deploy-timestamp>`,
+so the UUID is an unambiguous key.
+
+The Coolify API URL and key live in the `sysadmin` repo's gitignored `.env`
+(`~/dev/zachlatta/sysadmin/.env`) as `COOLIFY_URL` and `COOLIFY_API_KEY`:
+
+```bash
+set -a && source ~/dev/zachlatta/sysadmin/.env && set +a
+curl -fsS -H "Authorization: Bearer $COOLIFY_API_KEY" \
+  "$COOLIFY_URL/api/v1/applications" \
+  | jq -r '.[] | "\(.uuid)\t\(.name)\t\(.fqdn // "-")"'
+```
+
+Find the UUID for the exact app name you want, plug it into the
+`container_name` filter above, then sanity-check the output: every line's
+`coolify[...]` tag should share one `<resource-uuid>-<deploy-timestamp>` prefix.
+More than one prefix means the filter is still too broad.
 
 See `~/dev/zachlatta/sysadmin/README.md` and the script's `--help` for the
 full set of selectors and flags.
