@@ -17,6 +17,18 @@ from personal_data_warehouse.config import Settings, SlackAccount, load_settings
 SLACK_CONVERSATION_TYPES = "public_channel,private_channel,mpim,im"
 DEFAULT_SLACK_API_TIMEOUT_SECONDS = 30
 
+# Slack error codes returned by conversations.* when a channel is no longer
+# reachable for this account: it was deleted, archived, or we are no longer a
+# member (e.g. left or were removed from a private channel). These are not
+# transient, so when one is hit we mark the conversation inactive (archived) to
+# stop re-polling it every freshness/coverage cycle. A later conversations.list
+# refresh re-activates it (is_archived=0) if it ever comes back. Note: renames
+# are not in this set; Slack keys conversations by immutable id, so a renamed
+# channel keeps syncing without interruption.
+SLACK_CONVERSATION_GONE_CODES = frozenset(
+    {"channel_not_found", "is_archived", "channel_is_archived", "not_in_channel"}
+)
+
 
 class SlackRateLimitedError(Exception):
     def __init__(self, *, retry_after: int) -> None:
@@ -29,7 +41,9 @@ class SlackRateLimitBudgetExceeded(Exception):
 
 
 class SlackApiCallError(Exception):
-    pass
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class SlackTransientError(Exception):
@@ -61,13 +75,15 @@ class SlackWebApiClient:
             if exc.response.status_code == 429:
                 retry_after = int(exc.response.headers.get("Retry-After", "60"))
                 raise SlackRateLimitedError(retry_after=retry_after) from exc
-            raise SlackApiCallError(f"{method} failed: {exc.response.get('error', exc)}") from exc
+            error_code = exc.response.get("error")
+            raise SlackApiCallError(f"{method} failed: {error_code or exc}", code=error_code) from exc
         except (SlackRequestError, TimeoutError, OSError) as exc:
             raise SlackTransientError(f"{method} transient request failure: {exc}") from exc
 
         data = dict(response.data)
         if not data.get("ok", False):
-            raise SlackApiCallError(f"{method} failed: {data.get('error', 'unknown_error')}")
+            error_code = data.get("error", "unknown_error")
+            raise SlackApiCallError(f"{method} failed: {error_code}", code=error_code)
         return data
 
 
@@ -373,16 +389,15 @@ class SlackSyncRunner:
                         )
                     raise
                 except SlackApiCallError as exc:
-                    self._record_conversation_error(
+                    self._handle_conversation_sync_error(
                         account=account.account,
                         team_id=team_id,
                         conversation_id=conversation_id,
                         sync_type="partial" if oldest_ts is not None else "full",
-                        error=str(exc),
+                        exc=exc,
                         synced_at=synced_at,
                         sync_version=sync_version,
                     )
-                    self._logger.warning("Could not sync Slack conversation %s: %s", conversation_id, exc)
                     continue
                 messages_written += result["messages_written"]
                 files_written += result["files_written"]
@@ -426,6 +441,48 @@ class SlackSyncRunner:
             updated_at=synced_at,
             sync_version=sync_version,
         )
+
+    def _handle_conversation_sync_error(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+        sync_type: str,
+        exc: SlackApiCallError,
+        synced_at: datetime,
+        sync_version: int,
+    ) -> None:
+        """Record a per-conversation Slack API failure and keep the run going.
+
+        A single bad conversation (e.g. a deleted/archived channel returning
+        channel_not_found) must never abort the whole sync window. We persist the
+        error to slack_sync_state and, when the error means the channel is gone
+        for good, mark it inactive so later passes stop polling it.
+        """
+        self._record_conversation_error(
+            account=account,
+            team_id=team_id,
+            conversation_id=conversation_id,
+            sync_type=sync_type,
+            error=str(exc),
+            synced_at=synced_at,
+            sync_version=sync_version,
+        )
+        if exc.code in SLACK_CONVERSATION_GONE_CODES:
+            self._warehouse.mark_slack_conversation_inactive(
+                account=account,
+                team_id=team_id,
+                conversation_id=conversation_id,
+            )
+            self._logger.warning(
+                "Marked Slack conversation %s inactive after %s: %s",
+                conversation_id,
+                exc.code,
+                exc,
+            )
+        else:
+            self._logger.warning("Could not sync Slack conversation %s: %s", conversation_id, exc)
 
     def _sync_account_freshness_priority(
         self,
@@ -531,6 +588,20 @@ class SlackSyncRunner:
                         users_written=0,
                         files_written=files_written,
                     )
+                except SlackApiCallError as exc:
+                    # A single unreachable channel (deleted/archived/left) must not
+                    # abort the whole freshness window: record it, mark it inactive
+                    # if it is gone for good, and move on to the next conversation.
+                    self._handle_conversation_sync_error(
+                        account=account.account,
+                        team_id=team_id,
+                        conversation_id=str(conversation["id"]),
+                        sync_type="partial",
+                        exc=exc,
+                        synced_at=synced_at,
+                        sync_version=sync_version,
+                    )
+                    continue
                 messages_written += result["messages_written"]
                 files_written += result["files_written"]
                 group_written += result["messages_written"]

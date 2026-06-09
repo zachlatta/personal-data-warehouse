@@ -72,6 +72,7 @@ class FakeWarehouse:
         self.files = []
         self.state_updates = []
         self.account_state_refreshes = []
+        self.inactivated_conversations = []
         self.existing_message_ids: set[str] = set()
 
     def ensure_slack_tables(self):
@@ -269,6 +270,11 @@ class FakeWarehouse:
 
     def insert_slack_sync_state(self, **kwargs):
         self.state_updates.append(kwargs)
+
+    def mark_slack_conversation_inactive(self, *, account, team_id, conversation_id):
+        self.inactivated_conversations.append(
+            {"account": account, "team_id": team_id, "conversation_id": conversation_id}
+        )
 
     def refresh_slack_account_state_items(self, **kwargs):
         self.account_state_refreshes.append(kwargs)
@@ -1036,6 +1042,147 @@ def test_runner_records_conversation_errors_and_continues(monkeypatch):
         for update in warehouse.state_updates
     )
     assert warehouse.messages[0]["conversation_id"] == "C_OK"
+    # The error was constructed without a Slack error code, so we cannot tell it is
+    # permanently gone and must leave the channel active for a later retry.
+    assert warehouse.inactivated_conversations == []
+
+
+def test_runner_full_sync_marks_gone_channel_inactive(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "C_GONE", "name": "gone", "is_channel": True},
+        {"id": "C_OK", "name": "ok", "is_channel": True},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                SlackApiCallError("conversations.history failed: channel_not_found", code="channel_not_found"),
+                {"ok": True, "messages": [{"ts": "1713974400.000100", "user": "U1", "text": "ok"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert any(
+        update["object_id"] == "C_GONE" and update["status"] == "error"
+        for update in warehouse.state_updates
+    )
+    assert warehouse.inactivated_conversations == [
+        {"account": "zrl", "team_id": "T1", "conversation_id": "C_GONE"}
+    ]
+    # The run keeps going and still syncs the healthy channel.
+    assert warehouse.messages[0]["conversation_id"] == "C_OK"
+
+
+def test_runner_full_sync_keeps_transient_error_channel_active(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "C_FLAKY", "name": "flaky", "is_channel": True},
+        {"id": "C_OK", "name": "ok", "is_channel": True},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                SlackApiCallError("conversations.history failed: internal_error", code="internal_error"),
+                {"ok": True, "messages": [{"ts": "1713974400.000100", "user": "U1", "text": "ok"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert any(
+        update["object_id"] == "C_FLAKY" and update["status"] == "error"
+        for update in warehouse.state_updates
+    )
+    # A non-"gone" error is potentially transient; never deactivate the channel.
+    assert warehouse.inactivated_conversations == []
+    assert warehouse.messages[0]["conversation_id"] == "C_OK"
+
+
+def test_runner_freshness_priority_skips_and_deactivates_gone_channel(monkeypatch):
+    # Regression: a single channel_not_found in the freshness window used to
+    # propagate out of _sync_account_freshness_priority -> sync_all and fail the
+    # entire 5-minute run, discarding the window. It must now be skipped, recorded,
+    # and the dead channel marked inactive while the rest of the window syncs.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "C_GONE", "name": "gone", "is_channel": True, "latest": {"ts": "1999.000000"}},
+        {"id": "C_OK", "name": "ok", "is_channel": True, "latest": {"ts": "1995.000000"}},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                SlackApiCallError("conversations.history failed: channel_not_found", code="channel_not_found"),
+                {"ok": True, "messages": [{"ts": "1995.000000", "user": "U4", "text": "public"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    summary = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()[0]
+
+    history_channels = [params["channel"] for method, params in client.calls if method == "conversations.history"]
+    assert history_channels == ["C_GONE", "C_OK"]
+    assert summary.sync_type == "freshness_priority"
+    # Only the healthy channel's message is written; the run did not abort.
+    assert summary.messages_written == 1
+    assert warehouse.messages[0]["conversation_id"] == "C_OK"
+    assert warehouse.inactivated_conversations == [
+        {"account": "zrl", "team_id": "T1", "conversation_id": "C_GONE"}
+    ]
+    assert any(
+        update["object_id"] == "C_GONE" and update["status"] == "error"
+        for update in warehouse.state_updates
+    )
 
 
 def test_runner_freshness_priority_refreshes_conversations_and_syncs_ui_order(monkeypatch):

@@ -3428,6 +3428,33 @@ class PostgresWarehouse:
             preserved_rows.append(row)
         return preserved_rows
 
+    def mark_slack_conversation_inactive(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+    ) -> None:
+        """Flag a conversation as archived/inactive after Slack reports it gone.
+
+        Freshness and coverage passes filter on ``is_archived = 0``, so this stops
+        a deleted/archived/left channel from being re-polled every cycle once
+        Slack starts returning channel_not_found (etc.) for it. A later
+        conversations.list refresh re-inserts the channel with its live
+        ``is_archived`` value, so a conversation that becomes reachable again
+        self-heals back to active.
+        """
+        self._command(
+            """
+            UPDATE slack_conversations
+               SET is_archived = 1
+             WHERE account = %s
+               AND team_id = %s
+               AND conversation_id = %s
+            """,
+            (account, team_id, conversation_id),
+        )
+
     def load_slack_conversation_payloads(
         self,
         *,

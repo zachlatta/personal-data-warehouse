@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from dotenv import load_dotenv
+
+from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.slack_sync import SlackApiCallError, SlackSyncRunner
 
 from personal_data_warehouse.schema import (
     APPLE_NOTE_ATTACHMENT_COLUMNS,
@@ -1038,6 +1042,122 @@ def test_postgres_slack_conversation_loader_uses_stats_for_zero_message_filter(
     )
 
     assert payloads == [{"id": "C-empty"}]
+
+
+def test_postgres_mark_slack_conversation_inactive_excludes_it_from_active_loads(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(conversation_id="C-gone", raw_json='{"id":"C-gone"}'),
+            _slack_conversation_row(conversation_id="C-live", raw_json='{"id":"C-live"}'),
+        ]
+    )
+
+    warehouse.mark_slack_conversation_inactive(account="zrl", team_id="T1", conversation_id="C-gone")
+
+    active = warehouse.load_slack_conversation_payloads(account="zrl", team_id="T1")
+    assert active == [{"id": "C-live"}]
+
+    archived = warehouse.load_slack_conversation_payloads(
+        account="zrl", team_id="T1", archived_only=True
+    )
+    assert archived == [{"id": "C-gone"}]
+
+    # Re-discovering the channel as active (is_archived=0) self-heals it.
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C-gone", raw_json='{"id":"C-gone"}')]
+    )
+    healed = warehouse.load_slack_conversation_payloads(account="zrl", team_id="T1")
+    assert {payload["id"] for payload in healed} == {"C-gone", "C-live"}
+
+
+class _RecordingSlackClient:
+    """Minimal Slack client for end-to-end runner tests against a real warehouse."""
+
+    def __init__(self, responses):
+        self._responses = {method: list(values) for method, values in responses.items()}
+        self.calls = []
+
+    def call(self, method, **params):
+        self.calls.append((method, params))
+        values = self._responses.get(method)
+        if not values:
+            raise AssertionError(f"Unexpected Slack call: {method} {params}")
+        value = values.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def test_freshness_sync_end_to_end_archives_gone_channel_in_real_warehouse(
+    warehouse: PostgresWarehouse, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # End-to-end: drive the real SlackSyncRunner freshness path through the real
+    # PostgresWarehouse. A channel_not_found on one channel must not abort the run;
+    # the channel must be archived in the DB and the next channel must still sync.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(
+                conversation_id="C_GONE",
+                conversation_type="public_channel",
+                raw_json=json.dumps({"id": "C_GONE", "is_channel": True, "latest": {"ts": "1999.000000"}}),
+            ),
+            _slack_conversation_row(
+                conversation_id="C_OK",
+                conversation_type="public_channel",
+                raw_json=json.dumps({"id": "C_OK", "is_channel": True, "latest": {"ts": "1995.000000"}}),
+            ),
+        ]
+    )
+    client = _RecordingSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                SlackApiCallError("conversations.history failed: channel_not_found", code="channel_not_found"),
+                {"ok": True, "messages": [{"ts": "1995.000000", "user": "U4", "text": "hi"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    summary = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=logging.getLogger("test-freshness-e2e"),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()[0]
+
+    assert summary.messages_written == 1
+
+    # The dead channel is archived in the real DB; the healthy channel stays active.
+    archived = warehouse._query(
+        "SELECT conversation_id, is_archived FROM slack_conversations ORDER BY conversation_id"
+    )
+    assert dict(archived) == {"C_GONE": 1, "C_OK": 0}
+
+    # Subsequent active loads now skip the archived channel entirely.
+    active_ids = {p["id"] for p in warehouse.load_slack_conversation_payloads(account="zrl", team_id="T1")}
+    assert active_ids == {"C_OK"}
+
+    # The healthy channel's message was persisted.
+    persisted = warehouse._query(
+        "SELECT conversation_id FROM slack_messages WHERE is_deleted = 0 ORDER BY conversation_id"
+    )
+    assert [row[0] for row in persisted] == ["C_OK"]
 
 
 def test_postgres_slack_conversation_loader_query_uses_stats_not_message_grouping(
