@@ -16,10 +16,10 @@ const DriveScope = "https://www.googleapis.com/auth/drive"
 const defaultGoogleTokenURL = "https://oauth2.googleapis.com/token"
 
 // authorizedUserToken is the Python-compatible OAuth token JSON written by the
-// Python google_auth flow (an "authorized user" credential).
+// Python google_auth flow (an "authorized user" credential). The JSON also
+// carries a short-lived access token (token/access_token), deliberately not
+// parsed here — see HTTPClientFromAuthorizedUserJSON.
 type authorizedUserToken struct {
-	Token        string `json:"token"`
-	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	TokenURI     string `json:"token_uri"`
 	ClientID     string `json:"client_id"`
@@ -51,10 +51,10 @@ func HTTPClientFromAuthorizedUserJSON(ctx context.Context, tokenJSON string) (*h
 		Endpoint:     oauth2.Endpoint{TokenURL: tokenURL},
 		Scopes:       []string{DriveScope},
 	}
-	accessToken := parsed.AccessToken
-	if accessToken == "" {
-		accessToken = parsed.Token
-	}
-	token := &oauth2.Token{AccessToken: accessToken, RefreshToken: parsed.RefreshToken}
+	// Ignore any stored access token: a Token without Expiry never refreshes
+	// (oauth2 treats zero Expiry as non-expiring), so a stale access token
+	// would be replayed forever. Leaving it empty forces a refresh-token
+	// exchange on first use, after which oauth2 caches the fresh token.
+	token := &oauth2.Token{RefreshToken: parsed.RefreshToken}
 	return config.Client(ctx, token), nil
 }

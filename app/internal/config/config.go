@@ -36,7 +36,11 @@ type Config struct {
 	ObjectStoreBackend             string
 	ObjectStoreGoogleDriveFolderID string
 	ObjectStoreGoogleTokenJSON     string
-	ObjectStoreMaxObjectBytes      int64
+	// ObjectStoreMaxObjectBytes caps how large an object the signed download
+	// endpoint will serve; the Drive backend buffers whole objects in memory.
+	ObjectStoreMaxObjectBytes int64
+	// ObjectStoreURLTTL is how long signed object download links stay valid.
+	ObjectStoreURLTTL time.Duration
 }
 
 // ObjectStoreEnabled reports whether enough is configured to build the app's
@@ -104,9 +108,16 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	cfg.ObjectStoreBackend = valueOrDefault(getenv("PDW_OBJECT_STORE_BACKEND"), "google_drive")
 	cfg.ObjectStoreGoogleDriveFolderID = strings.TrimSpace(getenv("PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID"))
 	cfg.ObjectStoreGoogleTokenJSON = jsonEnvValue(getenv, "PDW_OBJECT_STORE_GOOGLE_TOKEN_JSON")
-	cfg.ObjectStoreMaxObjectBytes = 5 * 1024 * 1024
+	cfg.ObjectStoreMaxObjectBytes = 100 * 1024 * 1024
 	if cfg.ObjectStoreMaxObjectBytes, err = parsePositiveInt64(getenv("PDW_OBJECT_STORE_MAX_OBJECT_BYTES"), cfg.ObjectStoreMaxObjectBytes, "PDW_OBJECT_STORE_MAX_OBJECT_BYTES"); err != nil {
 		return Config{}, err
+	}
+	cfg.ObjectStoreURLTTL = time.Hour
+	if raw := strings.TrimSpace(getenv("PDW_OBJECT_URL_TTL")); raw != "" {
+		cfg.ObjectStoreURLTTL, err = time.ParseDuration(raw)
+		if err != nil || cfg.ObjectStoreURLTTL <= 0 {
+			return Config{}, fmt.Errorf("PDW_OBJECT_URL_TTL must be a positive Go duration")
+		}
 	}
 
 	cfg.DebugCacheTool = parseBool(getenv("MCP_DEBUG_CACHE_TOOL"))

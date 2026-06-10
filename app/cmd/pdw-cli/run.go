@@ -56,6 +56,14 @@ COMMANDS
   columns <table>            List a table's column names and types. Use this (or
                              schema) before writing SQL so you don't guess column
                              names.
+  download <storage_file_id> [--output PATH]
+                             Download a stored blob (Gmail attachment, Apple
+                             Notes/Messages attachment, Voice Memo audio, ...)
+                             to a local file. Pass the storage_file_id from a
+                             warehouse row's storage_* columns; the content hash
+                             is verified when the server reports one.
+                               --output PATH  Destination file (defaults to the
+                                              object's own filename).
   schema                     Run schema_overview and print the warehouse schema
                              (same as running pdw with no command).
   version                    Print the build version.
@@ -184,6 +192,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		return runSQL(client, rest, stdin, stdout, stderr)
 	case "columns":
 		return runColumns(client, rest, stdout, stderr)
+	case "download":
+		return runDownload(client, rest, stdout, stderr)
 	case "schema":
 		return runSchema(client, rest, stdout, stderr)
 	default:

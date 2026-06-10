@@ -2,10 +2,14 @@ package server
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
+	"net/url"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
 )
 
@@ -13,9 +17,10 @@ import (
 // test. Only the read methods the tool uses are meaningful; the rest return
 // ErrNotImplemented.
 type fakeObjectStore struct {
-	meta     objectstore.ObjectMetadata
-	content  []byte
-	notFound bool
+	meta      objectstore.ObjectMetadata
+	content   []byte
+	notFound  bool
+	getCalled bool
 }
 
 func (f *fakeObjectStore) Backend() string { return "google_drive" }
@@ -38,6 +43,7 @@ func (f *fakeObjectStore) PutJSON(context.Context, objectstore.PutJSONInput) (ob
 	return objectstore.StoredObject{}, objectstore.ErrNotImplemented
 }
 func (f *fakeObjectStore) GetObject(context.Context, objectstore.StoredObject) ([]byte, error) {
+	f.getCalled = true
 	if f.notFound {
 		return nil, objectstore.ErrNotFound
 	}
@@ -68,13 +74,22 @@ func (f *fakeObjectStore) MoveObject(context.Context, objectstore.StoredObject, 
 	return objectstore.StoredObject{}, objectstore.ErrNotImplemented
 }
 
-func invokeGetObject(t *testing.T, store objectstore.ObjectStore, maxBytes int64, in getObjectInput) getObjectOutput {
+const objectsTestBaseURL = "http://example.test"
+
+var objectsTestNow = time.Unix(1_700_000_000, 0)
+
+func objectsTestSigner() *pdwauth.Service {
+	return pdwauth.NewService([]byte("0123456789abcdef0123456789abcdef"), func() time.Time { return objectsTestNow })
+}
+
+func invokeGetObject(t *testing.T, store objectstore.ObjectStore, in getObjectInput) getObjectOutput {
 	t.Helper()
 	raw, err := json.Marshal(in)
 	if err != nil {
 		t.Fatalf("marshal input: %v", err)
 	}
-	out, isErr, err := getObjectTool(store, maxBytes).Invoke(context.Background(), raw)
+	tl := getObjectTool(store, objectsTestSigner(), objectsTestBaseURL, time.Hour, func() time.Time { return objectsTestNow })
+	out, isErr, err := tl.Invoke(context.Background(), raw)
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
@@ -88,7 +103,7 @@ func invokeGetObject(t *testing.T, store objectstore.ObjectStore, maxBytes int64
 	return result
 }
 
-func TestGetObjectToolReturnsContent(t *testing.T) {
+func TestGetObjectToolReturnsSignedDownloadURL(t *testing.T) {
 	store := &fakeObjectStore{
 		meta: objectstore.ObjectMetadata{
 			Backend: "google_drive", StorageFileID: "fid", ContentType: "audio/mp4",
@@ -96,36 +111,44 @@ func TestGetObjectToolReturnsContent(t *testing.T) {
 		},
 		content: []byte("data"),
 	}
-	out := invokeGetObject(t, store, 5*1024*1024, getObjectInput{StorageFileID: "fid", StorageKey: "k"})
+	out := invokeGetObject(t, store, getObjectInput{StorageFileID: "fid", StorageKey: "k"})
 	if !out.Exists || out.ContentType != "audio/mp4" || out.Filename != "memo.m4a" {
 		t.Fatalf("unexpected metadata: %+v", out)
 	}
-	decoded, err := base64.StdEncoding.DecodeString(out.ContentBase64)
-	if err != nil || string(decoded) != "data" {
-		t.Fatalf("content mismatch: %q err=%v", decoded, err)
+	if store.getCalled {
+		t.Fatal("tool must not download object content")
 	}
-}
-
-func TestGetObjectToolOmitsLargeContent(t *testing.T) {
-	store := &fakeObjectStore{
-		meta:    objectstore.ObjectMetadata{StorageFileID: "fid", SizeBytes: 10_000_000},
-		content: []byte("data"),
+	wantExp := objectsTestNow.Add(time.Hour)
+	if out.ExpiresAt != wantExp.UTC().Format(time.RFC3339) {
+		t.Fatalf("unexpected expires_at: %q", out.ExpiresAt)
 	}
-	out := invokeGetObject(t, store, 1024, getObjectInput{StorageFileID: "fid"})
-	if !out.Exists || !out.ContentOmitted || out.ContentBase64 != "" {
-		t.Fatalf("expected content omitted: %+v", out)
+	if !strings.HasPrefix(out.DownloadURL, objectsTestBaseURL+"/objects/fid?") {
+		t.Fatalf("unexpected download_url: %q", out.DownloadURL)
+	}
+	parsed, err := url.Parse(out.DownloadURL)
+	if err != nil {
+		t.Fatalf("parse download_url: %v", err)
+	}
+	if got := parsed.Query().Get("exp"); got != strconv.FormatInt(wantExp.Unix(), 10) {
+		t.Fatalf("unexpected exp: %q", got)
+	}
+	if err := objectsTestSigner().VerifyObjectDownload("fid", parsed.Query().Get("exp"), parsed.Query().Get("sig")); err != nil {
+		t.Fatalf("signature does not verify: %v", err)
 	}
 }
 
 func TestGetObjectToolMissingObject(t *testing.T) {
-	out := invokeGetObject(t, &fakeObjectStore{notFound: true}, 1024, getObjectInput{StorageFileID: "gone"})
+	out := invokeGetObject(t, &fakeObjectStore{notFound: true}, getObjectInput{StorageFileID: "gone"})
 	if out.Exists {
 		t.Fatalf("expected exists=false: %+v", out)
+	}
+	if out.DownloadURL != "" {
+		t.Fatalf("expected no download_url for missing object: %+v", out)
 	}
 }
 
 func TestGetObjectToolRequiresFileID(t *testing.T) {
-	out := invokeGetObject(t, &fakeObjectStore{}, 1024, getObjectInput{})
+	out := invokeGetObject(t, &fakeObjectStore{}, getObjectInput{})
 	if out.Error == "" {
 		t.Fatalf("expected error for missing storage_file_id")
 	}

@@ -201,8 +201,9 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	if store, enabled, err := objectStoreFromConfig(cfg); err != nil {
 		logger.Error("object storage configured but failed to initialize; get_object tool disabled", "error", err.Error())
 	} else if enabled {
-		logger.Info("object storage enabled", "backend", cfg.ObjectStoreBackend, "folder", cfg.ObjectStoreGoogleDriveFolderID)
-		extra = append(extra, getObjectTool(store, cfg.ObjectStoreMaxObjectBytes))
+		logger.Info("object storage enabled", "backend", cfg.ObjectStoreBackend, "folder", cfg.ObjectStoreGoogleDriveFolderID, "url_ttl", cfg.ObjectStoreURLTTL)
+		extra = append(extra, getObjectTool(store, authSvc, baseURL, cfg.ObjectStoreURLTTL, time.Now))
+		mux.Handle(objectsPathPrefix, objectDownloadHandler(store, authSvc, cfg.ObjectStoreMaxObjectBytes, logger))
 	}
 	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default(), extra...)
 	mcpServer := newMCPServerFromRegistry(registry, slog.Default())

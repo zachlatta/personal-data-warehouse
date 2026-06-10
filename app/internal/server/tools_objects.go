@@ -2,14 +2,18 @@ package server
 
 import (
 	"context"
-	"encoding/base64"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
 
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
-const getObjectDescription = "Fetch a stored blob object (Gmail attachment, Apple Notes/Messages attachment, Voice Memo audio, ...) by its storage reference. Pass the storage_file_id from a warehouse row's storage_* columns. Returns object metadata and, when within the size cap, the base64-encoded content."
+const getObjectDescription = "Fetch a stored blob object (Gmail attachment, Apple Notes/Messages attachment, Voice Memo audio, ...) by its storage reference. Pass the storage_file_id from a warehouse row's storage_* columns. Returns object metadata and a signed, time-limited download_url that fetches the raw file bytes without further authentication."
 
 type getObjectInput struct {
 	StorageFileID  string `json:"storage_file_id" jsonschema:"the storage_file_id from a warehouse row (storage_file_id / metadata_storage_file_id / html_storage_file_id)"`
@@ -18,18 +22,18 @@ type getObjectInput struct {
 }
 
 type getObjectOutput struct {
-	StorageFileID  string `json:"storage_file_id"`
-	StorageKey     string `json:"storage_key,omitempty"`
-	Backend        string `json:"storage_backend"`
-	Exists         bool   `json:"exists"`
-	ContentType    string `json:"content_type,omitempty"`
-	SizeBytes      int64  `json:"size_bytes,omitempty"`
-	ContentSHA256  string `json:"content_sha256,omitempty"`
-	Filename       string `json:"filename,omitempty"`
-	StorageURL     string `json:"storage_url,omitempty"`
-	ContentBase64  string `json:"content_base64,omitempty"`
-	ContentOmitted bool   `json:"content_omitted,omitempty"`
-	Error          string `json:"error,omitempty"`
+	StorageFileID string `json:"storage_file_id"`
+	StorageKey    string `json:"storage_key,omitempty"`
+	Backend       string `json:"storage_backend"`
+	Exists        bool   `json:"exists"`
+	ContentType   string `json:"content_type,omitempty"`
+	SizeBytes     int64  `json:"size_bytes,omitempty"`
+	ContentSHA256 string `json:"content_sha256,omitempty"`
+	Filename      string `json:"filename,omitempty"`
+	StorageURL    string `json:"storage_url,omitempty"`
+	DownloadURL   string `json:"download_url,omitempty"`
+	ExpiresAt     string `json:"expires_at,omitempty"`
+	Error         string `json:"error,omitempty"`
 }
 
 // objectStoreFromConfig builds the app's object storage layer from config, or
@@ -56,7 +60,13 @@ func objectStoreFromConfig(cfg config.Config) (objectstore.ObjectStore, bool, er
 	return store, true, nil
 }
 
-func getObjectTool(store objectstore.ObjectStore, maxBytes int64) tool.Tool {
+func signedObjectDownloadURL(signer *pdwauth.Service, baseURL, fileID string, exp time.Time) string {
+	return strings.TrimRight(baseURL, "/") + objectsPathPrefix + url.PathEscape(fileID) +
+		"?exp=" + strconv.FormatInt(exp.Unix(), 10) +
+		"&sig=" + signer.SignObjectDownload(fileID, exp)
+}
+
+func getObjectTool(store objectstore.ObjectStore, signer *pdwauth.Service, baseURL string, ttl time.Duration, now func() time.Time) tool.Tool {
 	return &tool.Typed[getObjectInput, getObjectOutput]{
 		NameStr:        "get_object",
 		TitleStr:       "Get Stored Object",
@@ -87,20 +97,9 @@ func getObjectTool(store objectstore.ObjectStore, maxBytes int64) tool.Tool {
 			out.ContentSHA256 = meta.ContentSHA256
 			out.Filename = meta.Filename
 			out.StorageURL = meta.StorageURL
-			if maxBytes > 0 && meta.SizeBytes > maxBytes {
-				out.ContentOmitted = true
-				return out, nil
-			}
-			data, err := store.GetObject(ctx, ref)
-			if err != nil {
-				out.Error = err.Error()
-				return out, nil
-			}
-			if maxBytes > 0 && int64(len(data)) > maxBytes {
-				out.ContentOmitted = true
-				return out, nil
-			}
-			out.ContentBase64 = base64.StdEncoding.EncodeToString(data)
+			exp := now().Add(ttl)
+			out.DownloadURL = signedObjectDownloadURL(signer, baseURL, in.StorageFileID, exp)
+			out.ExpiresAt = exp.UTC().Format(time.RFC3339)
 			return out, nil
 		},
 		IsError: func(o getObjectOutput) bool { return o.Error != "" },
