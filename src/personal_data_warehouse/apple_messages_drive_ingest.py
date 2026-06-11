@@ -31,6 +31,13 @@ INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox/"
 LIBRARY_PREFIX = f"{OBJECT_PREFIX}/library/"
 BATCH_KIND = "apple_message_export_batch"
 ATTACHMENT_KIND = "apple_message_attachment"
+ATTACHMENT_STORAGE_COLUMNS = (
+    "content_sha256",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+)
 
 
 class AppleMessagesDriveIngestRunner:
@@ -106,6 +113,7 @@ class AppleMessagesDriveIngestRunner:
                 if record_type(record) == "attachment"
             ],
             ("account", "attachment_id", "message_id"),
+            preserve_columns=ATTACHMENT_STORAGE_COLUMNS,
         )
 
         self._warehouse.insert_apple_message_handles(handle_rows)
@@ -226,10 +234,30 @@ def batch_records(batch: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [record for record in records if isinstance(record, Mapping)]
 
 
-def dedupe_rows(rows: list[dict[str, Any]], key_columns: tuple[str, ...]) -> list[dict[str, Any]]:
+def dedupe_rows(
+    rows: list[dict[str, Any]],
+    key_columns: tuple[str, ...],
+    *,
+    preserve_columns: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    """Collapse rows sharing key_columns, keeping the newest row per key.
+
+    Rows arrive sorted oldest-first. A newer record can legitimately omit
+    values an older one carried (an attachment manifest re-export has no
+    storage info, while the blob-backfill record for the same attachment
+    does). For preserve_columns, keep the previous row's value when the
+    newer row's is empty — mirroring the preserve-non-empty upsert that
+    protects those columns once they reach the warehouse.
+    """
     by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows:
-        by_key[tuple(row.get(column) for column in key_columns)] = row
+        key = tuple(row.get(column) for column in key_columns)
+        previous = by_key.get(key)
+        if previous is not None:
+            for column in preserve_columns:
+                if not row.get(column) and previous.get(column):
+                    row[column] = previous[column]
+        by_key[key] = row
     return list(by_key.values())
 
 

@@ -260,6 +260,29 @@ def test_drive_ingest_runner_dedupes_attachment_updates_and_promotes() -> None:
     ) in store.moved
 
 
+def test_drive_ingest_runner_preserves_attachment_storage_from_older_records() -> None:
+    older = decorated_batch_payload()
+    manifest = envelope("attachment", attachment_record())
+    manifest["exported_at"] = "2026-05-21T13:05:00+00:00"
+    newer = deepcopy(older)
+    newer["records"] = [manifest]
+    warehouse = FakeWarehouse()
+
+    summary = AppleMessagesDriveIngestRunner(
+        warehouse=warehouse,
+        batch_source=lambda: [older, newer],
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 5, 21, 14, tzinfo=UTC),
+    ).sync()
+
+    assert summary.attachments_written == 1
+    row = warehouse.attachments[0]
+    assert row["content_sha256"] == "att-sha"
+    assert row["storage_backend"] == "google_drive"
+    assert row["storage_file_id"] == "attachment-file"
+    assert row["storage_key"] == "apple-messages/inbox/attachments/2026/05/2026-05-21-attachment-guid-att-sha.txt"
+
+
 def test_drive_ingest_runner_prefers_latest_duplicate_message_record() -> None:
     older = decorated_batch_payload()
     newer = deepcopy(older)
