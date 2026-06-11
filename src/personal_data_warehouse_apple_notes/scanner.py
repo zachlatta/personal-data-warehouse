@@ -29,6 +29,15 @@ UTI_CONTENT_TYPES = {
     "public.plain-text": "text/plain",
     "public.tiff": "image/tiff",
 }
+# Attachment types that never have their own file on disk; their content lives
+# in the note body, in other attachments, or in the attachment's raw metadata.
+NO_FILE_ATTACHMENT_ERRORS = {
+    "public.url": "link attachment has no file; the URL is in raw metadata (ZURLSTRING)",
+    "com.apple.notes.table": "table attachment has no file; the table is embedded in the note body",
+    "com.apple.notes.gallery": "gallery attachment has no file; its pages are separate attachments",
+}
+INLINE_ATTACHMENT_UTI_PREFIX = "com.apple.notes.inlinetextattachment"
+INLINE_ATTACHMENT_ERROR = "inline text attachment has no file; its text is in raw metadata (ZALTTEXT)"
 
 
 class AppleNotesSchemaError(RuntimeError):
@@ -286,6 +295,13 @@ def _core_data_attachments_by_note(
         if not note_pk:
             continue
         media = media_files.get(_string_value(row, ("ZMEDIA",)))
+        path_override = media.path if media else None
+        filename_override = media.filename if media else ""
+        if path_override is None:
+            fallback_path = _resolve_core_data_fallback_path(row, root=root)
+            if fallback_path is not None:
+                path_override = fallback_path
+                filename_override = _fallback_attachment_filename(row, fallback_path)
         attachment = _attachment_from_row(
             row,
             note_id=note_pk,
@@ -294,8 +310,9 @@ def _core_data_attachments_by_note(
             path_columns=("ZFILEURL", "ZURL", "ZPATH", "ZFILENAME", "ZTITLE"),
             filename_columns=("ZFILENAME", "ZTITLE", "ZNAME"),
             content_type_columns=("ZMIMETYPE", "ZTYPEUTI", "ZUTI", "ZCONTENTTYPE"),
-            path_override=media.path if media else None,
-            filename_override=media.filename if media else "",
+            path_override=path_override,
+            filename_override=filename_override,
+            missing_error=_no_file_attachment_error(row) if path_override is None else "",
             raw_extra={
                 "ZMEDIA_IDENTIFIER": media.identifier,
                 "ZMEDIA_FILENAME": media.filename,
@@ -345,6 +362,7 @@ def _attachment_from_row(
     content_type_columns: tuple[str, ...],
     path_override: Path | None = None,
     filename_override: str = "",
+    missing_error: str = "",
     raw_extra: Mapping[str, object] | None = None,
 ) -> AppleNoteAttachment:
     attachment_id = _string_value(row, id_columns) or _string_value(row, ("Z_PK",)) or "attachment"
@@ -361,7 +379,7 @@ def _attachment_from_row(
         is_missing = False
     elif not is_missing:
         is_missing = True
-        error = error or "attachment file is not locally available"
+        error = error or missing_error or "attachment file is not locally available"
     return AppleNoteAttachment(
         attachment_id=attachment_id,
         note_id=note_id,
@@ -546,13 +564,9 @@ def _resolve_attachment_path(value: str, root: Path | None) -> Path | None:
 
 
 def _resolve_core_data_media_path(*, root: Path | None, identifier: str, filename: str) -> Path | None:
-    if root is None or not identifier:
+    if not identifier:
         return None
-    media_roots = [path for path in (root / "Accounts").glob("*/Media") if path.is_dir()]
-    direct_media_root = root / "Media"
-    if direct_media_root.is_dir():
-        media_roots.append(direct_media_root)
-    for media_root in media_roots:
+    for media_root in _account_asset_dirs(root, "Media"):
         media_dir = media_root / identifier
         if not media_dir.is_dir():
             continue
@@ -564,6 +578,57 @@ def _resolve_core_data_media_path(*, root: Path | None, identifier: str, filenam
         if len(files) == 1:
             return files[0]
     return None
+
+
+def _resolve_core_data_fallback_path(row: sqlite3.Row, *, root: Path | None) -> Path | None:
+    # Drawings and scanned documents have no ICMedia row; Notes renders them to
+    # FallbackImages/<identifier>/<generation>/ and FallbackPDFs/<identifier>/<generation>/.
+    identifier = _string_value(row, ("ZIDENTIFIER", "ZUUID"))
+    if not identifier:
+        return None
+    for dir_name, generation_column in (
+        ("FallbackImages", "ZFALLBACKIMAGEGENERATION"),
+        ("FallbackPDFs", "ZFALLBACKPDFGENERATION"),
+    ):
+        generation = _string_value(row, (generation_column,))
+        if not generation:
+            continue
+        for fallback_root in _account_asset_dirs(root, dir_name):
+            generation_dir = fallback_root / identifier / generation
+            if not generation_dir.is_dir():
+                continue
+            files = [candidate for candidate in generation_dir.rglob("*") if candidate.is_file()]
+            if len(files) == 1:
+                return files[0]
+    return None
+
+
+def _account_asset_dirs(root: Path | None, name: str) -> list[Path]:
+    if root is None:
+        return []
+    dirs = [path for path in (root / "Accounts").glob(f"*/{name}") if path.is_dir()]
+    direct = root / name
+    if direct.is_dir():
+        dirs.append(direct)
+    return dirs
+
+
+def _fallback_attachment_filename(row: sqlite3.Row, path: Path) -> str:
+    base = _string_value(row, ("ZFILENAME", "ZTITLE", "ZNAME")).strip()
+    if not base.strip("."):
+        base = _string_value(row, ("ZIDENTIFIER", "ZUUID")) or path.stem
+    if path.suffix and not base.lower().endswith(path.suffix.lower()):
+        base += path.suffix
+    return base
+
+
+def _no_file_attachment_error(row: sqlite3.Row) -> str:
+    uti = _string_value(row, ("ZTYPEUTI", "ZTYPEUTI1"))
+    if uti in NO_FILE_ATTACHMENT_ERRORS:
+        return NO_FILE_ATTACHMENT_ERRORS[uti]
+    if uti.startswith(INLINE_ATTACHMENT_UTI_PREFIX):
+        return INLINE_ATTACHMENT_ERROR
+    return ""
 
 
 def _decode_note_blob(value: bytes) -> str:
