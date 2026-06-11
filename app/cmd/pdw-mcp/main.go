@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/buildinfo"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
@@ -23,7 +24,7 @@ func main() {
 		logger.Error("configuration failed", "error", err)
 		os.Exit(1)
 	}
-	logger.Info("configuration loaded", "addr", cfg.Addr, "base_url", cfg.BaseURL, "max_rows", cfg.MaxRows, "max_field_chars", cfg.MaxFieldChars, "query_timeout", cfg.QueryTimeout)
+	logger.Info("configuration loaded", "addr", cfg.Addr, "base_url", cfg.BaseURL, "max_rows", cfg.MaxRows, "max_field_chars", cfg.MaxFieldChars, "query_timeout", cfg.QueryTimeout, "git_sha", buildinfo.GitSHA())
 	runner, err := query.NewPostgresRunner(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
 	if err != nil {
 		logger.Error("connect to Postgres failed", "error", err)

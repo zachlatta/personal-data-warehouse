@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 
 from dagster import DagsterInstance, DagsterRunStatus, RunsFilter
 
+from personal_data_warehouse.build_info import build_metadata
+
 BOOT_CLEAR_STATUSES = (
     DagsterRunStatus.STARTING,
     DagsterRunStatus.STARTED,
@@ -72,6 +74,9 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def main() -> None:
+    metadata = build_metadata()
+    print(f"Personal Data Warehouse Dagster build metadata: git_sha={metadata['git_sha']}")
+
     if not _env_bool("DAGSTER_BOOT_CLEAR_IN_PROGRESS_RUNS", True):
         print("Dagster boot cleanup is disabled by DAGSTER_BOOT_CLEAR_IN_PROGRESS_RUNS")
         return

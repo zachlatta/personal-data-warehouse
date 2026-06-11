@@ -2,6 +2,13 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 WORKDIR /app
 
+ARG PDW_GIT_SHA=""
+ARG GIT_SHA=""
+ARG SOURCE_COMMIT=""
+ARG GIT_COMMIT=""
+ARG COMMIT_SHA=""
+ARG COOLIFY_GIT_COMMIT=""
+
 ENV DAGSTER_HOME=/app/.dagster \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
@@ -26,7 +33,9 @@ COPY docker/agent-entrypoint.sh docker/agent-entrypoint.sh
 COPY docker/dagster.yaml "$DAGSTER_HOME/dagster.yaml"
 COPY docker/entrypoint.sh /usr/local/bin/personal-data-warehouse-entrypoint
 COPY docker/start-dagster.sh /usr/local/bin/personal-data-warehouse-start-dagster
-RUN uv sync --frozen --group dev \
+RUN git_sha="${PDW_GIT_SHA:-${SOURCE_COMMIT:-${GIT_SHA:-${GIT_COMMIT:-${COMMIT_SHA:-${COOLIFY_GIT_COMMIT:-unknown}}}}}}" \
+    && printf '{"git_sha":"%s"}\n' "$git_sha" > /app/build-info.json \
+    && uv sync --frozen --group dev \
     && chmod +x /usr/local/bin/personal-data-warehouse-entrypoint \
     && chmod +x /usr/local/bin/personal-data-warehouse-start-dagster
 

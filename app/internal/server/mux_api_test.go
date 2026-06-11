@@ -69,6 +69,26 @@ func TestAPIRequiresBearer(t *testing.T) {
 	}
 }
 
+func TestRootShowsGitSHA(t *testing.T) {
+	t.Setenv("PDW_GIT_SHA", "test-sha")
+	runner := fakeRunner{results: map[string]query.RawResult{}}
+	authSvc := pdwauth.NewService([]byte(muxAPITestSecret), func() time.Time { return time.Unix(0, 0) })
+	cfg := config.Config{Addr: ":0", SecretToken: muxAPITestSecret}
+	mux := NewMux(cfg, authSvc, runner)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	mux.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d", resp.Code)
+	}
+	body := resp.Body.String()
+	if !strings.Contains(body, "Git SHA: test-sha") {
+		t.Fatalf("body missing git SHA: %s", body)
+	}
+}
+
 func TestAPIListsTools(t *testing.T) {
 	srv := newMuxAPITestServer(t)
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/api/tools", nil)

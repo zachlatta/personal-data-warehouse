@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import personal_data_warehouse.defs.slack_sync as slack_defs
 from personal_data_warehouse.config import Settings
 from personal_data_warehouse.defs.slack_sync import (
+    _run_locked_slack_stage,
     run_intelligent_slack_sync,
     run_slack_coverage_sync,
     run_slack_freshness_sync,
@@ -44,7 +45,7 @@ def test_slack_sync_schedule_runs_every_five_minutes_by_default() -> None:
     assert slack_workspace_coverage_sync_every_seven_minutes.default_status.value == "RUNNING"
     assert slack_workspace_metadata_sync_every_fifteen_minutes.cron_schedule == "*/15 * * * *"
     assert slack_workspace_metadata_sync_every_fifteen_minutes.default_status.value == "RUNNING"
-    assert slack_workspace_user_sync_hourly.cron_schedule == "0 * * * *"
+    assert slack_workspace_user_sync_hourly.cron_schedule == "11 * * * *"
     assert slack_workspace_user_sync_hourly.default_status.value == "RUNNING"
     assert slack_workspace_thread_sync_every_five_minutes.cron_schedule == "*/5 * * * *"
     assert slack_workspace_thread_sync_every_five_minutes.default_status.value == "RUNNING"
@@ -331,6 +332,32 @@ def test_slack_user_sync_refreshes_all_users_without_messages(monkeypatch) -> No
     assert calls[0]["use_existing_conversations"] is True
     assert calls[0]["conversation_limit"] == 0
     assert calls[0]["sync_thread_replies"] is False
+
+
+def test_slack_user_sync_lock_contention_raises_for_retry(monkeypatch) -> None:
+    @contextmanager
+    def fake_lock(**_kwargs):
+        yield False
+
+    class FakeLog:
+        def warning(self, *_args):
+            pass
+
+    monkeypatch.setattr(slack_defs, "exclusive_sync_lock", fake_lock)
+    monkeypatch.setattr(slack_defs, "load_settings", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(slack_defs, "warehouse_from_settings", lambda _settings: SimpleNamespace())
+
+    try:
+        _run_locked_slack_stage(
+            SimpleNamespace(log=FakeLog()),
+            stage_name="users",
+            run_fn=lambda **_kwargs: [],
+            fail_on_lock_contention=True,
+        )
+    except RuntimeError as exc:
+        assert "could not acquire" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
 
 
 def test_slack_thread_sync_backfills_known_threads_conservatively(monkeypatch) -> None:

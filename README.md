@@ -268,7 +268,9 @@ Slack sync splits freshness, coverage, and metadata into separate schedules. The
 `slack_workspace_coverage_sync_every_seven_minutes` backfills incomplete cached conversations
 with smaller batches, and `slack_workspace_metadata_sync_every_fifteen_minutes` refreshes one
 capped page of active conversation metadata at a time. `slack_workspace_user_sync_hourly`
-refreshes the full Slack user list outside the more frequent metadata path.
+refreshes the full Slack user list outside the more frequent metadata path. It runs at minute 11
+and retries lock contention, so it does not silently report success while another Slack stage holds
+the shared sync lock.
 `slack_workspace_thread_sync_every_five_minutes` backfills `conversations.replies` for known
 thread parents. It defaults to one thread per run and only revisits completed threads when the
 parent's `latest_reply_ts` has advanced beyond the stored thread cursor, so it remains gentle on
@@ -284,9 +286,21 @@ on a separate read-state run winning the scheduler race. Configure it with
 `SLACK_ASSET_READ_STATE_LIMIT`.
 Freshness stages also poll capped sets of cached conversations per type, ordered by recent
 activity, so each scheduled run remains bounded.
-All Slack schedules share a nonblocking Slack lock, so a scheduled tick skips if another Slack
-sync stage is still running.
+All Slack schedules share a nonblocking Slack lock, so most scheduled ticks skip if another Slack
+sync stage is still running. The hourly Slack user sync is stricter: lock contention raises and
+lets Dagster retry because a skipped user refresh is otherwise easy to miss.
 Calendar sync runs through `calendar_event_sync_every_five_minutes` with its own nonblocking lock.
+
+## Deployment Metadata
+
+The Docker images expose the deployed Git commit through `PDW_GIT_SHA`. Both the Dagster service
+and the MCP/API service also accept common platform names such as `SOURCE_COMMIT`, `GIT_SHA`,
+`GIT_COMMIT`, `COMMIT_SHA`, and `COOLIFY_GIT_COMMIT`; the Dockerfiles accept the same names as
+build args and bake the selected value into the image. Startup logs and the app root endpoint print
+the resolved SHA, and Slack Dagster materializations include it as `git_sha` metadata.
+
+For Coolify Dockerfile apps, enable the Advanced setting that includes `SOURCE_COMMIT` in Docker
+build arguments. Coolify excludes it by default to preserve build cache reuse.
 
 ## Docker / Coolify
 

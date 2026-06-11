@@ -15,6 +15,7 @@ from dagster import (
     schedule,
 )
 
+from personal_data_warehouse.build_info import build_metadata
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.slack_sync import SlackSyncRunner, SlackSyncSummary
@@ -347,13 +348,14 @@ def slack_workspace_metadata_sync(context) -> MaterializeResult:
 
 @asset(
     group_name="slack",
-    retry_policy=RetryPolicy(max_retries=3, delay=60),
+    retry_policy=RetryPolicy(max_retries=10, delay=60),
 )
 def slack_workspace_user_sync(context) -> MaterializeResult:
     return _run_locked_slack_stage(
         context,
         stage_name="users",
         run_fn=run_slack_user_sync,
+        fail_on_lock_contention=True,
     )
 
 
@@ -405,21 +407,31 @@ def slack_workspace_member_sync(context) -> MaterializeResult:
     )
 
 
-def _run_locked_slack_stage(context, *, stage_name: str, run_fn) -> MaterializeResult:
+def _run_locked_slack_stage(
+    context,
+    *,
+    stage_name: str,
+    run_fn,
+    fail_on_lock_contention: bool = False,
+) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_slack=True)
     warehouse = warehouse_from_settings(settings)
     with exclusive_sync_lock(name="slack", postgres_lock_id=SLACK_SYNC_POSTGRES_LOCK_ID) as acquired:
         if not acquired:
             context.log.warning("Skipping Slack %s sync because another Slack sync is already running", stage_name)
+            if fail_on_lock_contention:
+                raise RuntimeError(f"Slack {stage_name} sync could not acquire the shared Slack sync lock")
             summaries = []
         else:
             summaries = run_fn(settings=settings, warehouse=warehouse, logger=context.log)
 
+    deployment = build_metadata()
     return MaterializeResult(
         metadata={
             "sync_stage": stage_name,
             "lock_acquired": acquired,
             "skipped_due_to_lock": not acquired,
+            "git_sha": deployment["git_sha"],
             "workspaces": MetadataValue.json(
                 [
                     {
@@ -510,7 +522,7 @@ def slack_workspace_metadata_sync_every_fifteen_minutes(context):
 
 
 @schedule(
-    cron_schedule="0 * * * *",
+    cron_schedule="11 * * * *",
     job=slack_workspace_user_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )

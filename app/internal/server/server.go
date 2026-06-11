@@ -12,6 +12,7 @@ import (
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/api"
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/buildinfo"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
@@ -173,7 +174,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	if len(mutationSvcs) > 0 {
 		mutationSvc = mutationSvcs[0]
 	}
-	logger.Info("registering HTTP handlers", "base_url", baseURL)
+	logger.Info("registering HTTP handlers", "base_url", baseURL, "git_sha", buildinfo.GitSHA())
 	authSvc.RegisterHandlers(mux, baseURL)
 	if mutationSvc != nil {
 		mux.Handle(mutations.ReviewPath+"/", mutationSvc.HTTPHandler())
@@ -186,7 +187,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		body := "Personal Data Warehouse app\nMCP endpoint: /mcp\nHTTP API: /api/tools\n"
+		body := "Personal Data Warehouse app\nMCP endpoint: /mcp\nHTTP API: /api/tools\nGit SHA: " + buildinfo.GitSHA() + "\n"
 		if mutationSvc != nil {
 			body += "Mutation review UI: " + mutations.ReviewPath + "\n"
 		}
