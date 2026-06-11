@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -41,6 +42,27 @@ type Config struct {
 	ObjectStoreMaxObjectBytes int64
 	// ObjectStoreURLTTL is how long signed object download links stay valid.
 	ObjectStoreURLTTL time.Duration
+
+	// SlackAccounts are the Slack workspaces whose files the app can fetch
+	// live from the Slack API (slack_files rows only record metadata). Parsed
+	// from the same SLACK_ACCOUNTS / SLACK_<SLUG>_TOKEN env vars as the Python
+	// sync; accounts without a token are skipped.
+	SlackAccounts []SlackAccount
+}
+
+// SlackAccount is one Slack workspace the app holds an API token for.
+type SlackAccount struct {
+	Name  string
+	Token string
+}
+
+// SlackTokens returns the configured Slack API tokens in account order.
+func (c Config) SlackTokens() []string {
+	tokens := make([]string, 0, len(c.SlackAccounts))
+	for _, account := range c.SlackAccounts {
+		tokens = append(tokens, account.Token)
+	}
+	return tokens
 }
 
 // ObjectStoreEnabled reports whether enough is configured to build the app's
@@ -117,6 +139,12 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		cfg.ObjectStoreURLTTL, err = time.ParseDuration(raw)
 		if err != nil || cfg.ObjectStoreURLTTL <= 0 {
 			return Config{}, fmt.Errorf("PDW_OBJECT_URL_TTL must be a positive Go duration")
+		}
+	}
+
+	for _, name := range parseCSV(getenv("SLACK_ACCOUNTS")) {
+		if token := strings.TrimSpace(getenv("SLACK_" + envSlug(name) + "_TOKEN")); token != "" {
+			cfg.SlackAccounts = append(cfg.SlackAccounts, SlackAccount{Name: name, Token: token})
 		}
 	}
 
@@ -217,6 +245,18 @@ func jsonEnvValue(getenv func(string) string, name string) string {
 	}
 	return strings.TrimSpace(string(decoded))
 }
+
+// envSlug mirrors the Python env_slug: non-alphanumeric runs become "_",
+// trimmed and uppercased, so SLACK_<SLUG>_TOKEN names match the Python sync.
+func envSlug(value string) string {
+	slug := strings.Trim(nonAlphanumericRun.ReplaceAllString(value, "_"), "_")
+	if slug == "" {
+		return "ACCOUNT"
+	}
+	return strings.ToUpper(slug)
+}
+
+var nonAlphanumericRun = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 
 func parseCSV(raw string) []string {
 	parts := strings.Split(raw, ",")

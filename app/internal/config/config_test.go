@@ -141,3 +141,43 @@ func TestLoadFromEnvRejectsWeakSecretToken(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestLoadFromEnvParsesSlackAccounts(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL":   "postgres://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":        "0123456789abcdef0123456789abcdef",
+		"SLACK_ACCOUNTS":          "hackclub, My-Personal, tokenless",
+		"SLACK_HACKCLUB_TOKEN":    "xoxp-hackclub",
+		"SLACK_MY_PERSONAL_TOKEN": "xoxp-personal",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv returned error: %v", err)
+	}
+	if len(cfg.SlackAccounts) != 2 {
+		t.Fatalf("SlackAccounts = %#v", cfg.SlackAccounts)
+	}
+	if cfg.SlackAccounts[0] != (SlackAccount{Name: "hackclub", Token: "xoxp-hackclub"}) {
+		t.Fatalf("SlackAccounts[0] = %#v", cfg.SlackAccounts[0])
+	}
+	if cfg.SlackAccounts[1] != (SlackAccount{Name: "my-personal", Token: "xoxp-personal"}) {
+		t.Fatalf("SlackAccounts[1] = %#v", cfg.SlackAccounts[1])
+	}
+	if strings.Join(cfg.SlackTokens(), ",") != "xoxp-hackclub,xoxp-personal" {
+		t.Fatalf("SlackTokens = %#v", cfg.SlackTokens())
+	}
+}
+
+func TestLoadFromEnvNoSlackAccounts(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL": "postgres://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":      "0123456789abcdef0123456789abcdef",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv returned error: %v", err)
+	}
+	if len(cfg.SlackAccounts) != 0 || len(cfg.SlackTokens()) != 0 {
+		t.Fatalf("expected no slack accounts, got %#v", cfg.SlackAccounts)
+	}
+}

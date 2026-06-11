@@ -15,6 +15,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/buildinfo"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
@@ -199,10 +200,23 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 
 	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}
 	var extra []tool.Tool
-	if store, enabled, err := objectStoreFromConfig(cfg); err != nil {
-		logger.Error("object storage configured but failed to initialize; get_object tool disabled", "error", err.Error())
-	} else if enabled {
+	store, storeEnabled, err := objectStoreFromConfig(cfg)
+	if err != nil {
+		logger.Error("object storage configured but failed to initialize; stored-object reads disabled", "error", err.Error())
+		store, storeEnabled = nil, false
+	} else if storeEnabled {
 		logger.Info("object storage enabled", "backend", cfg.ObjectStoreBackend, "folder", cfg.ObjectStoreGoogleDriveFolderID, "url_ttl", cfg.ObjectStoreURLTTL)
+	}
+	if tokens := cfg.SlackTokens(); len(tokens) > 0 {
+		slackStore := objectstore.NewSlackFileStore(objectstore.SlackFileStoreOptions{Tokens: tokens})
+		if storeEnabled {
+			store = objectstore.WithSlackFiles(store, slackStore)
+		} else {
+			store, storeEnabled = slackStore, true
+		}
+		logger.Info("slack file fetching enabled", "accounts", len(cfg.SlackAccounts))
+	}
+	if storeEnabled {
 		extra = append(extra, getObjectTool(store, authSvc, baseURL, cfg.ObjectStoreURLTTL, time.Now))
 		mux.Handle(objectsPathPrefix, objectDownloadHandler(store, authSvc, cfg.ObjectStoreMaxObjectBytes, logger))
 	}

@@ -137,6 +137,22 @@ func TestGetObjectToolReturnsSignedDownloadURL(t *testing.T) {
 	}
 }
 
+func TestGetObjectToolReportsBackendFromMetadata(t *testing.T) {
+	store := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			Backend: "slack", StorageFileID: "F0123ABCDEF", ContentType: "image/png",
+			SizeBytes: 10, Filename: "screenshot.png",
+		},
+	}
+	out := invokeGetObject(t, store, getObjectInput{StorageFileID: "F0123ABCDEF"})
+	if !out.Exists || out.Backend != "slack" {
+		t.Fatalf("unexpected output: %+v", out)
+	}
+	if !strings.HasPrefix(out.DownloadURL, objectsTestBaseURL+"/objects/F0123ABCDEF?") {
+		t.Fatalf("unexpected download_url: %q", out.DownloadURL)
+	}
+}
+
 func TestGetObjectToolMissingObject(t *testing.T) {
 	out := invokeGetObject(t, &fakeObjectStore{notFound: true}, getObjectInput{StorageFileID: "gone"})
 	if out.Exists {

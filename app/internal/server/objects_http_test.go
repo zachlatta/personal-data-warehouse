@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,6 +120,75 @@ func TestObjectDownloadOversizeObject(t *testing.T) {
 	rec := serveObjectRequest(t, store, 1024, http.MethodGet, signedObjectPath("fid", objectsTestNow.Add(time.Hour)))
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+// TestObjectDownloadServesSlackFileViaRouter exercises the full Slack path:
+// a signed /objects/{slack file id} link routed through WithSlackFiles to a
+// SlackFileStore backed by a fake Slack API.
+func TestObjectDownloadServesSlackFileViaRouter(t *testing.T) {
+	const fileID = "F0123ABCDEF"
+	urlPrivate := "https://files.slack.com/files-pri/T01-" + fileID + "/notes.pdf"
+	slackStore := objectstore.NewSlackFileStore(objectstore.SlackFileStoreOptions{
+		Tokens: []string{"tok"},
+		HTTPClient: &slackAPIFake{
+			fileID:     fileID,
+			urlPrivate: urlPrivate,
+			content:    []byte("slack-bytes"),
+		},
+	})
+	store := objectstore.WithSlackFiles(&fakeObjectStore{notFound: true}, slackStore)
+	rec := serveObjectRequest(t, store, 1024, http.MethodGet, signedObjectPath(fileID, objectsTestNow.Add(time.Hour)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != "slack-bytes" {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/pdf" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := rec.Header().Get("Content-Disposition"); got != `inline; filename=notes.pdf` {
+		t.Fatalf("Content-Disposition = %q", got)
+	}
+}
+
+// slackAPIFake simulates files.info and the url_private download for a single file.
+type slackAPIFake struct {
+	fileID     string
+	urlPrivate string
+	content    []byte
+}
+
+func (f *slackAPIFake) Do(req *http.Request) (*http.Response, error) {
+	if req.Header.Get("Authorization") != "Bearer tok" {
+		return &http.Response{StatusCode: http.StatusForbidden, Body: io.NopCloser(strings.NewReader("bad auth"))}, nil
+	}
+	if strings.HasSuffix(req.URL.Path, "/files.info") {
+		if req.URL.Query().Get("file") != f.fileID {
+			return slackFakeJSON(`{"ok":false,"error":"file_not_found"}`), nil
+		}
+		payload, _ := json.Marshal(map[string]any{"ok": true, "file": map[string]any{
+			"id": f.fileID, "name": "notes.pdf", "mimetype": "application/pdf",
+			"size": len(f.content), "url_private": f.urlPrivate,
+		}})
+		return slackFakeJSON(string(payload)), nil
+	}
+	if req.URL.String() != f.urlPrivate {
+		return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("not found"))}, nil
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/pdf"}},
+		Body:       io.NopCloser(bytes.NewReader(f.content)),
+	}, nil
+}
+
+func slackFakeJSON(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 }
 

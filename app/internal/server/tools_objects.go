@@ -13,10 +13,10 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
-const getObjectDescription = "Fetch a stored blob object (Gmail attachment, Apple Notes/Messages attachment, Voice Memo audio, ...) by its storage reference. Pass the storage_file_id from a warehouse row's storage_* columns. Returns object metadata and a signed, time-limited download_url that fetches the raw file bytes without further authentication."
+const getObjectDescription = "Fetch a stored blob object (Gmail attachment, Apple Notes/Messages attachment, Voice Memo audio, ...) by its storage reference, or a Slack attachment by its Slack file id. Pass the storage_file_id from a warehouse row's storage_* columns, or a slack_files.file_id (F...) to fetch the file live from the Slack API. Returns object metadata and a signed, time-limited download_url that fetches the raw file bytes without further authentication."
 
 type getObjectInput struct {
-	StorageFileID  string `json:"storage_file_id" jsonschema:"the storage_file_id from a warehouse row (storage_file_id / metadata_storage_file_id / html_storage_file_id)"`
+	StorageFileID  string `json:"storage_file_id" jsonschema:"the storage_file_id from a warehouse row (storage_file_id / metadata_storage_file_id / html_storage_file_id), or a Slack file id from slack_files.file_id"`
 	StorageBackend string `json:"storage_backend,omitempty" jsonschema:"optional storage_backend from the same row; defaults to the configured backend"`
 	StorageKey     string `json:"storage_key,omitempty" jsonschema:"optional storage_key for context; not required to fetch"`
 }
@@ -92,6 +92,9 @@ func getObjectTool(store objectstore.ObjectStore, signer *pdwauth.Service, baseU
 				return out, nil
 			}
 			out.Exists = true
+			if meta.Backend != "" {
+				out.Backend = meta.Backend
+			}
 			out.ContentType = meta.ContentType
 			out.SizeBytes = meta.SizeBytes
 			out.ContentSHA256 = meta.ContentSHA256
