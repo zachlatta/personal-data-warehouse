@@ -252,6 +252,35 @@ def test_dedupe_conflict_rows_collapses_duplicate_primary_keys() -> None:
     assert winners == {"100.1": "tie-last-wins", "200.2": "distinct-key"}
 
 
+def test_dedupe_conflict_rows_preserves_storage_columns_from_losing_rows() -> None:
+    columns = ATTACHMENT_COLUMNS
+    spec = POSTGRES_TABLES["gmail_attachments"]
+
+    def _row(*, sync_version: int, **overrides) -> tuple:
+        values = _default_row(
+            columns,
+            account="zach@example.test",
+            message_id="m1",
+            part_id="p1",
+            sync_version=sync_version,
+            **overrides,
+        )
+        return tuple(values[column] for column in columns)
+
+    rows = [
+        _row(sync_version=1, content_sha256="sha-1", storage_backend="google_drive", storage_file_id="file-1"),
+        _row(sync_version=2),
+    ]
+
+    deduped = _dedupe_conflict_rows(rows, columns, spec, table="gmail_attachments")
+
+    assert len(deduped) == 1
+    winner = deduped[0]
+    assert winner[columns.index("sync_version")] == 2
+    assert winner[columns.index("storage_backend")] == "google_drive"
+    assert winner[columns.index("storage_file_id")] == "file-1"
+
+
 def test_dedupe_conflict_rows_leaves_unique_batch_untouched() -> None:
     columns = SLACK_MESSAGE_COLUMNS
     spec = POSTGRES_TABLES["slack_messages"]

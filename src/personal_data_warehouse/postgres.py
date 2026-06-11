@@ -4655,7 +4655,7 @@ class PostgresWarehouse:
         if not rows:
             return
         spec = POSTGRES_TABLES[table]
-        rows = _dedupe_conflict_rows(rows, columns, spec)
+        rows = _dedupe_conflict_rows(rows, columns, spec, table=table)
         column_sql = ", ".join(_identifier(column) for column in columns)
         template = "(" + ", ".join(["%s"] * len(columns)) + ")"
         sql = f"""
@@ -4711,10 +4711,33 @@ def _is_jsonb_column(table: str | None, column: str) -> bool:
     return bool(table and column in JSONB_COLUMNS_BY_TABLE.get(table, set()))
 
 
+# Columns that an ``ON CONFLICT DO UPDATE`` keeps from the existing row when
+# the incoming row's value is empty (see _upsert_assignment). In-batch dedupe
+# applies the same merge so collapsing rows cannot drop these values.
+PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
+    "apple_message_attachments": (
+        "content_sha256",
+        "storage_backend",
+        "storage_key",
+        "storage_file_id",
+        "storage_url",
+    ),
+    "gmail_attachments": (
+        "storage_backend",
+        "storage_key",
+        "storage_file_id",
+        "storage_url",
+        "storage_status",
+    ),
+}
+
+
 def _dedupe_conflict_rows(
     rows: list[tuple[Any, ...]],
     columns: tuple[str, ...],
     spec: TableSpec,
+    *,
+    table: str = "",
 ) -> list[tuple[Any, ...]]:
     """Collapse rows that share an ON CONFLICT key within a single batch.
 
@@ -4726,7 +4749,10 @@ def _dedupe_conflict_rows(
 
     Keep the row that the version guard (``table.version <= EXCLUDED.version``)
     would leave persisted: the highest ``version_column`` value, and the last
-    occurrence on ties. First-seen order of distinct keys is preserved.
+    occurrence on ties. First-seen order of distinct keys is preserved. For
+    the table's preserve-non-empty columns, the winner inherits values the
+    losing rows carried when its own are empty — collapsing in-process must
+    not drop data the SQL upsert would have preserved.
     """
     primary_key = spec.primary_key
     if len(rows) <= 1 or not primary_key:
@@ -4738,16 +4764,43 @@ def _dedupe_conflict_rows(
         # full key we can't dedupe safely, so leave the batch untouched.
         return rows
     version_index = columns.index(spec.version_column) if spec.version_column in columns else None
+    preserve_indexes = tuple(
+        columns.index(column)
+        for column in PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE.get(table, ())
+        if column in columns
+    )
 
     winners: dict[tuple[Any, ...], tuple[Any, ...]] = {}
     for row in rows:
         key = tuple(row[index] for index in key_indexes)
         existing = winners.get(key)
-        if existing is None or _conflict_row_wins(row, existing, version_index):
+        if existing is None:
             winners[key] = row
+            continue
+        if _conflict_row_wins(row, existing, version_index):
+            winner, loser = row, existing
+        else:
+            winner, loser = existing, row
+        winners[key] = _merge_preserved_columns(winner, loser, preserve_indexes)
     if len(winners) == len(rows):
         return rows
     return list(winners.values())
+
+
+def _merge_preserved_columns(
+    winner: tuple[Any, ...],
+    loser: tuple[Any, ...],
+    preserve_indexes: tuple[int, ...],
+) -> tuple[Any, ...]:
+    if not preserve_indexes:
+        return winner
+    merged = list(winner)
+    changed = False
+    for index in preserve_indexes:
+        if not merged[index] and loser[index]:
+            merged[index] = loser[index]
+            changed = True
+    return tuple(merged) if changed else winner
 
 
 def _conflict_row_wins(
@@ -4776,22 +4829,7 @@ def _upsert_clause(table: str, spec: TableSpec, columns: tuple[str, ...] | None 
     conflict_columns = ", ".join(_identifier(column) for column in spec.primary_key)
     if not update_columns:
         return f"ON CONFLICT ({conflict_columns}) DO NOTHING"
-    preserve_non_empty_columns = {
-        "apple_message_attachments": {
-            "content_sha256",
-            "storage_backend",
-            "storage_key",
-            "storage_file_id",
-            "storage_url",
-        },
-        "gmail_attachments": {
-            "storage_backend",
-            "storage_key",
-            "storage_file_id",
-            "storage_url",
-            "storage_status",
-        },
-    }.get(table, set())
+    preserve_non_empty_columns = PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE.get(table, ())
     assignments = ", ".join(
         _upsert_assignment(table=table, column=column, preserve_non_empty=column in preserve_non_empty_columns)
         for column in update_columns
