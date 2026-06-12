@@ -112,6 +112,7 @@ class IndexSpec:
     table: str
     sql: str
     requires_pg_trgm: bool = False
+    requires_pg_textsearch: bool = False
 
 
 POSTGRES_TABLES: dict[str, TableSpec] = {
@@ -273,10 +274,46 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_body_html_trgm_idx ON gmail_messages USING gin (body_html public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
+    # BM25 relevance-ranked word search (pg_textsearch). Full-coverage,
+    # single-column indexes so callers can use the implicit
+    # ORDER BY col <@> 'query' LIMIT n syntax; partial bm25 indexes would
+    # force the explicit to_bm25query() form. body_html is skipped on
+    # purpose: markup tokens pollute the BM25 lexicon and
+    # body_markdown_clean already covers that content.
+    IndexSpec(
+        "gmail_messages_subject_bm25_idx",
+        "gmail_messages",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_subject_bm25_idx ON gmail_messages USING bm25 (subject) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "gmail_messages_body_text_bm25_idx",
+        "gmail_messages",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_body_text_bm25_idx ON gmail_messages USING bm25 (body_text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "gmail_messages_body_markdown_bm25_idx",
+        "gmail_messages",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_body_markdown_bm25_idx ON gmail_messages USING bm25 (body_markdown_clean) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
     IndexSpec(
         "gmail_attachments_message_idx",
         "gmail_attachments",
         "CREATE INDEX IF NOT EXISTS gmail_attachments_message_idx ON gmail_attachments (account, message_id)",
+    ),
+    IndexSpec(
+        "gmail_attachment_enrichments_text_bm25_idx",
+        "gmail_attachment_enrichments",
+        "CREATE INDEX IF NOT EXISTS gmail_attachment_enrichments_text_bm25_idx ON gmail_attachment_enrichments USING bm25 (text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "gmail_attachment_enrichments_text_trgm_idx",
+        "gmail_attachment_enrichments",
+        "CREATE INDEX IF NOT EXISTS gmail_attachment_enrichments_text_trgm_idx ON gmail_attachment_enrichments USING gin (text public.gin_trgm_ops)",
+        requires_pg_trgm=True,
     ),
     IndexSpec(
         "calendar_events_time_idx",
@@ -314,9 +351,45 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS voice_memo_files_recorded_idx ON apple_voice_memos_files (recorded_at DESC)",
     ),
     IndexSpec(
+        "apple_voice_memos_transcript_bm25_idx",
+        "apple_voice_memos_enrichments",
+        "CREATE INDEX IF NOT EXISTS apple_voice_memos_transcript_bm25_idx ON apple_voice_memos_enrichments USING bm25 (transcript) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "apple_voice_memos_transcript_trgm_idx",
+        "apple_voice_memos_enrichments",
+        "CREATE INDEX IF NOT EXISTS apple_voice_memos_transcript_trgm_idx ON apple_voice_memos_enrichments USING gin (transcript public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
         "apple_notes_modified_idx",
         "apple_notes",
         "CREATE INDEX IF NOT EXISTS apple_notes_modified_idx ON apple_notes (modified_at DESC) WHERE is_deleted = 0",
+    ),
+    IndexSpec(
+        "apple_notes_title_bm25_idx",
+        "apple_notes",
+        "CREATE INDEX IF NOT EXISTS apple_notes_title_bm25_idx ON apple_notes USING bm25 (title) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "apple_notes_body_bm25_idx",
+        "apple_notes",
+        "CREATE INDEX IF NOT EXISTS apple_notes_body_bm25_idx ON apple_notes USING bm25 (body_text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "apple_notes_title_trgm_idx",
+        "apple_notes",
+        "CREATE INDEX IF NOT EXISTS apple_notes_title_trgm_idx ON apple_notes USING gin (title public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "apple_notes_body_trgm_idx",
+        "apple_notes",
+        "CREATE INDEX IF NOT EXISTS apple_notes_body_trgm_idx ON apple_notes USING gin (body_text public.gin_trgm_ops)",
+        requires_pg_trgm=True,
     ),
     IndexSpec(
         "apple_note_revisions_note_idx",
@@ -338,6 +411,14 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "apple_messages",
         "CREATE INDEX IF NOT EXISTS apple_messages_body_trgm_idx ON apple_messages USING gin (body_text public.gin_trgm_ops) WHERE is_deleted = 0",
         requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        # Full coverage (no is_deleted filter) so the implicit <@> syntax
+        # stays index-backed; callers filter is_deleted in SQL.
+        "apple_messages_body_bm25_idx",
+        "apple_messages",
+        "CREATE INDEX IF NOT EXISTS apple_messages_body_bm25_idx ON apple_messages USING bm25 (body_text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
     ),
     IndexSpec(
         "apple_message_chat_messages_chat_time_idx",
@@ -400,6 +481,15 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "slack_messages",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_text_trgm_idx ON slack_messages USING gin (text public.gin_trgm_ops)",
         requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        # pg_textsearch has no CONCURRENTLY support, so a cold build here
+        # write-blocks slack_messages for the build duration. Pre-build this
+        # one manually before deploying to fresh large datasets.
+        "slack_messages_text_bm25_idx",
+        "slack_messages",
+        "CREATE INDEX IF NOT EXISTS slack_messages_text_bm25_idx ON slack_messages USING bm25 (text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
     ),
     IndexSpec(
         "slack_conversations_scope_idx",
@@ -614,6 +704,7 @@ class PostgresWarehouse:
         self._connection.autocommit = True
         self._ensured_index_names: set[str] = set()
         self._pg_trgm_ensured = False
+        self._pg_textsearch_ensured = False
         self._command(f"CREATE SCHEMA IF NOT EXISTS {_identifier(self._schema)}")
         self._command(f"SET search_path TO {_identifier(self._schema)}")
 
@@ -2778,6 +2869,11 @@ class PostgresWarehouse:
                 if index.requires_pg_trgm and not self._pg_trgm_ensured:
                     self._command("CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public")
                     self._pg_trgm_ensured = True
+                if index.requires_pg_textsearch and not self._pg_textsearch_ensured:
+                    # Fails (and is harmlessly skipped, like missing-table indexes)
+                    # on hosts whose Postgres lacks the pg_textsearch preload.
+                    self._command("CREATE EXTENSION IF NOT EXISTS pg_textsearch WITH SCHEMA public")
+                    self._pg_textsearch_ensured = True
                 self._command(index.sql)
                 self._ensured_index_names.add(index.name)
             except Exception:

@@ -230,6 +230,16 @@ SQL starting points:
   `apple_voice_memos_transcript_segments`, `clean_calendar_with_transcripts`,
   `clean_transcripts_no_calendar_match`
 
+Searching text columns (the schema overview lists which columns carry which indexes):
+
+- Relevance-ranked word search (BM25, `pg_textsearch`):
+  `SELECT ..., text <@> 'launch plans' AS score FROM slack_messages ORDER BY text <@> 'launch plans' LIMIT 20`.
+  Scores are negative (more negative = better). Always include the `ORDER BY col <@> ... LIMIT n`
+  pair — without a LIMIT the bm25 index is not used. No phrase queries or typo tolerance.
+- Fuzzy / typo-tolerant search (trigram): `WHERE text %> 'kubernets'
+  ORDER BY word_similarity('kubernets', text) DESC LIMIT 20` matches misspelled terms
+  via the same `gin_trgm_ops` indexes that accelerate `ILIKE '%substring%'`.
+
 ### `query`
 
 Executes read-only Postgres SQL, caches each result under a generated `query_id`, and returns a preview.

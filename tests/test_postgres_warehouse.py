@@ -623,6 +623,84 @@ def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehous
     assert "gmail_messages_body_html_trgm_idx" in index_names
 
 
+def _pg_textsearch_usable(warehouse: PostgresWarehouse) -> bool:
+    # The extension files must be installed AND the library preloaded;
+    # CREATE EXTENSION fails without both.
+    rows = warehouse._query(
+        "SELECT 1 FROM pg_available_extensions WHERE name = 'pg_textsearch'"
+        " AND current_setting('shared_preload_libraries') LIKE '%pg_textsearch%'"
+    )
+    return bool(rows)
+
+
+def test_postgres_slack_tables_create_bm25_index_and_rank_matches(warehouse: PostgresWarehouse) -> None:
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    warehouse.ensure_slack_tables()
+
+    rows = warehouse._query(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
+        "AND tablename = 'slack_messages' AND indexname = 'slack_messages_text_bm25_idx'"
+    )
+    assert rows, "bm25 index should be created when pg_textsearch is usable"
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=message_datetime,
+                text="deploying the staging cluster today",
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.2",
+                message_datetime=message_datetime,
+                text="lunch plans for friday",
+            ),
+        ]
+    )
+
+    # pg_textsearch resolves its helper functions and the implicit
+    # col <@> 'query' index lookup through the search_path, and the implicit
+    # form only finds indexes in the default (public) schema. Production runs
+    # with schema=public so the bare implicit syntax works there; in this
+    # schema-isolated test, put public on the search_path and name the index
+    # explicitly via to_bm25query.
+    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+    rows = warehouse._query(
+        "SELECT text FROM slack_messages "
+        "ORDER BY text <@> to_bm25query('staging cluster deploy', 'slack_messages_text_bm25_idx') LIMIT 1"
+    )
+    assert rows == [("deploying the staging cluster today",)]
+
+
+def test_postgres_ensure_indexes_tolerates_missing_pg_textsearch(warehouse: PostgresWarehouse, monkeypatch) -> None:
+    original_command = warehouse._command
+
+    def failing_command(sql, params=None):
+        if "CREATE EXTENSION IF NOT EXISTS pg_textsearch" in sql:
+            raise RuntimeError("pg_textsearch unavailable")
+        return original_command(sql, params)
+
+    monkeypatch.setattr(warehouse, "_command", failing_command)
+
+    # Must not raise: hosts without the extension skip bm25 indexes but keep
+    # creating everything else.
+    warehouse.ensure_slack_tables()
+
+    index_names = {
+        row[0]
+        for row in warehouse._query(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'slack_messages'"
+        )
+    }
+    assert "slack_messages_text_bm25_idx" not in index_names
+    assert "slack_messages_text_trgm_idx" in index_names
+
+
 def test_postgres_contacts_tables_use_jsonb_without_changing_existing_raw_json(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_contacts_tables()
     warehouse.ensure_slack_tables()
