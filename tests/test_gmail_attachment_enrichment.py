@@ -204,6 +204,7 @@ def test_runner_marks_non_useful_images_without_search_text() -> None:
             "visible_text": [],
             "entities": [],
             "search_keywords": [],
+            "uncertainties": [],
         }
     )
 

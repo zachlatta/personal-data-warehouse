@@ -453,6 +453,8 @@ def render_pdf_pages(
 
 
 def attachment_vision_schema() -> dict[str, Any]:
+    # Codex enforces OpenAI strict structured outputs: every property must be
+    # listed in `required`, so uncertainties is required too (an empty array is fine).
     return {
         "type": "object",
         "additionalProperties": False,
@@ -463,6 +465,7 @@ def attachment_vision_schema() -> dict[str, Any]:
             "visible_text",
             "entities",
             "search_keywords",
+            "uncertainties",
         ],
         "properties": {
             "is_useful": {"type": "boolean"},
@@ -509,7 +512,7 @@ def validate_attachment_vision_result(result: Mapping[str, Any]) -> list[str]:
     for key in ("document_type", "summary"):
         if not isinstance(result.get(key), str):
             issues.append(f"{key} must be a string")
-    for key in ("visible_text", "entities", "search_keywords"):
+    for key in ("visible_text", "entities", "search_keywords", "uncertainties"):
         value = result.get(key)
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
             issues.append(f"{key} must be an array of strings")
