@@ -563,7 +563,7 @@ _C_RAW = "raw upstream payload mirror"
 _C_STORE = "content hash or object-storage pointer"
 _C_META = "non-content metadata (some surfaced as view context/who columns)"
 _C_DUP = "alternate representation of an included column"
-_C_IDENTITY = "identity field; covered by the person_identities view"
+_C_IDENTITY = "identity field (name/email/phone), not free text"
 _C_FILEMETA = "attachment metadata; binary content not text-searchable"
 
 SEARCHABLE_TEXT_COVERAGE: dict[str, dict[str, str]] = {
@@ -4902,7 +4902,6 @@ class PostgresWarehouse:
         "upstream_mutations",
         "upstream_mutation_requests",
     )
-    _PERSON_IDENTITIES_TABLES = ("contact_cards", "slack_users", "apple_message_handles")
 
     def _assert_searchable_text_coverage_live(self) -> None:
         """Diff SEARCHABLE_TEXT_COVERAGE against the live catalog; fail loudly on drift.
@@ -4944,24 +4943,9 @@ class PostgresWarehouse:
 
     def _ensure_search_views_if_possible(self) -> None:
         self._assert_searchable_text_coverage_live()
-        if all(self._relation_exists(table) for table in self._PERSON_IDENTITIES_TABLES):
-            self._command(
-                """
-                CREATE OR REPLACE VIEW person_identities AS
-                SELECT 'contact'::text AS source, display_name AS name, primary_email AS email,
-                       primary_phone AS phone, ''::text AS slack_user_id, account, card_id AS ref
-                FROM contact_cards WHERE is_deleted = 0
-                UNION ALL
-                SELECT 'slack', COALESCE(NULLIF(real_name, ''), name), email, '', user_id, account, user_id
-                FROM slack_users WHERE is_deleted = 0 AND is_bot = 0
-                UNION ALL
-                SELECT 'imessage_handle', '',
-                       CASE WHEN address LIKE '%@%' THEN address ELSE '' END,
-                       CASE WHEN address LIKE '%@%' THEN '' ELSE address END,
-                       '', account, handle_id
-                FROM apple_message_handles
-                """
-            )
+        # The person_identities view was removed; drop any copy left behind by
+        # deployments that created it.
+        self._command("DROP VIEW IF EXISTS person_identities")
         if all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
             # One row per (source table, text column) acknowledged as "view:" in
             # SEARCHABLE_TEXT_COVERAGE. Each branch exposes its text as a bare

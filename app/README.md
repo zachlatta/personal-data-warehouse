@@ -239,9 +239,6 @@ Searching text columns (the schema overview lists which columns carry which inde
   table via `ref`. Coverage is enforced: every text column in the warehouse is either a
   view branch or explicitly excluded with a reason in `SEARCHABLE_TEXT_COVERAGE`
   (`src/personal_data_warehouse/postgres.py`), and schema drift fails loudly at startup.
-- Person resolution: fuzzy-match the `person_identities` view
-  (`name %> 'zach lata' ORDER BY word_similarity(...) DESC`) to get emails, Slack user
-  ids, and phone numbers, then filter sources by identifier.
 - Relevance-ranked word search (BM25, `pg_textsearch`):
   `SELECT ..., text <@> 'launch plans' AS score FROM slack_messages ORDER BY text <@> 'launch plans' LIMIT 20`.
   Scores are negative (more negative = better). Always include the `ORDER BY col <@> ... LIMIT n`

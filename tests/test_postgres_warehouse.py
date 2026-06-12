@@ -854,20 +854,6 @@ def test_searchable_text_view_spans_sources_and_pushes_predicates(warehouse: Pos
     assert ("slack", "private_channel") in rows
 
 
-def test_person_identities_view_resolves_fuzzy_names(warehouse: PostgresWarehouse) -> None:
-    _ensure_all_table_groups(warehouse)
-    warehouse.insert_contact_cards(
-        [_contact_card_row(card_id="c1", display_name="Zach Latta", sync_version=1)]
-    )
-
-    rows = warehouse._query(
-        "SELECT source, name FROM person_identities "
-        "WHERE name OPERATOR(public.%>) 'zach lata' "
-        "ORDER BY public.word_similarity('zach lata', name) DESC LIMIT 1"
-    )
-    assert rows == [("contact", "Zach Latta")]
-
-
 def test_searchable_text_live_coverage_fails_on_unacknowledged_column(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_slack_tables()
     warehouse._command("ALTER TABLE slack_messages ADD COLUMN rogue_note text NOT NULL DEFAULT ''")
