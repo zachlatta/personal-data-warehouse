@@ -774,7 +774,7 @@ SEARCHABLE_TEXT_COVERAGE: dict[str, dict[str, str]] = {
         "provider": _C_ID,
         "provider_transcript_id": _C_ID,
         "speaker_label": _C_META,
-        "text": "per-segment drill-down; full transcript included via apple_voice_memos_enrichments.transcript",
+        "text": "per-segment drill-down; the latest transcript per recording is searchable via the clean transcript views",
         "words_json": _C_RAW,
     },
     "apple_voice_memos_transcription_runs": {
@@ -4891,7 +4891,12 @@ class PostgresWarehouse:
         "apple_messages",
         "apple_message_handles",
         "apple_voice_memos_enrichments",
+        "apple_voice_memos_files",
         "calendar_events",
+        # The transcript branches read the clean transcript views (latest
+        # enrichment per recording) rather than the raw enrichments table.
+        "clean_calendar_with_transcripts",
+        "clean_transcripts_no_calendar_match",
         "contact_cards",
         "agent_run_events",
         "upstream_mutations",
@@ -4967,6 +4972,19 @@ class PostgresWarehouse:
             self._command(
                 """
                 CREATE OR REPLACE VIEW searchable_text AS
+                WITH clean_transcripts AS (
+                    -- Canonical transcript layer: the clean views already pick
+                    -- the latest enrichment per recording, so search never sees
+                    -- stale prompt-version duplicates or intermediate tables.
+                    SELECT recording_account AS account, recording_id, title,
+                           organizer_email AS who, start_at,
+                           participants_json, transcript, summary, action_items_json
+                    FROM clean_calendar_with_transcripts
+                    UNION ALL
+                    SELECT account, recording_id, title, ''::text, start_at,
+                           participants_json, transcript, summary, action_items_json
+                    FROM clean_transcripts_no_calendar_match
+                )
                 SELECT 'gmail'::text AS source, 'subject'::text AS subsource, ''::text AS context,
                        from_address AS who, internal_date AS occurred_at, account,
                        account || ':' || message_id AS ref, subject AS text
@@ -5017,20 +5035,20 @@ class PostgresWarehouse:
                        team_id || ':' || file_id, title
                 FROM slack_files WHERE is_deleted = 0 AND title != ''
                 UNION ALL
-                SELECT 'transcript', 'transcript', title, '', start_at, account, recording_id, transcript
-                FROM apple_voice_memos_enrichments
+                SELECT 'transcript', 'transcript', title, who, start_at, account, recording_id, transcript
+                FROM clean_transcripts WHERE transcript != ''
                 UNION ALL
-                SELECT 'transcript', 'title', '', '', start_at, account, recording_id, title
-                FROM apple_voice_memos_enrichments WHERE title != ''
+                SELECT 'transcript', 'title', '', who, start_at, account, recording_id, title
+                FROM clean_transcripts WHERE title != ''
                 UNION ALL
-                SELECT 'transcript', 'summary', title, '', start_at, account, recording_id, summary
-                FROM apple_voice_memos_enrichments WHERE summary != ''
+                SELECT 'transcript', 'summary', title, who, start_at, account, recording_id, summary
+                FROM clean_transcripts WHERE summary != ''
                 UNION ALL
-                SELECT 'transcript', 'participants', title, '', start_at, account, recording_id, participants_json
-                FROM apple_voice_memos_enrichments WHERE participants_json NOT IN ('', '[]')
+                SELECT 'transcript', 'participants', title, who, start_at, account, recording_id, participants_json
+                FROM clean_transcripts WHERE participants_json NOT IN ('', '[]')
                 UNION ALL
-                SELECT 'transcript', 'action_items', title, '', start_at, account, recording_id, action_items_json
-                FROM apple_voice_memos_enrichments WHERE action_items_json NOT IN ('', '[]')
+                SELECT 'transcript', 'action_items', title, who, start_at, account, recording_id, action_items_json
+                FROM clean_transcripts WHERE action_items_json NOT IN ('', '[]')
                 UNION ALL
                 SELECT 'note', 'title', folder_path, title, modified_at, account, note_id, title
                 FROM apple_notes WHERE is_deleted = 0
