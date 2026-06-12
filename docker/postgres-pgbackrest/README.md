@@ -10,6 +10,32 @@ image layout: mount persistent storage at `/var/lib/postgresql`, not directly at
 `/var/lib/postgresql/data`. The default `PGDATA` is
 `/var/lib/postgresql/18/docker`.
 
+## Bundled Extensions
+
+Beyond the contrib modules that ship with the official image (`pg_trgm`,
+`unaccent`, `pg_stat_statements`, ...), the image installs:
+
+- [`pg_textsearch`](https://github.com/timescale/pg_textsearch) (BM25 full-text
+  search), pinned by version and SHA-256 in the Dockerfile.
+
+Installing the image only ships the extension files. To enable `pg_textsearch`
+in a deployment:
+
+1. Add `pg_textsearch` to `shared_preload_libraries` in the deployment-managed
+   config (production passes `-c config_file=/etc/postgresql/postgresql.conf`
+   through Coolify; edit that file), for example:
+
+   ```text
+   shared_preload_libraries = 'pg_stat_statements,pg_textsearch'
+   ```
+
+2. Restart the database container.
+3. Run `CREATE EXTENSION pg_textsearch;` in the target database.
+
+`pg_trgm` needs no preload entry; the warehouse application creates the
+extension on demand (`CREATE EXTENSION IF NOT EXISTS pg_trgm`) when it ensures
+its trigram indexes.
+
 ## Build
 
 ```bash
