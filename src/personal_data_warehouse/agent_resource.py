@@ -119,6 +119,7 @@ class AgentResource(ConfigurableResource):
             provider=request.provider or self.provider,
             model=request.model if request.model is not None else self.model,
             extra_env=request.extra_env,
+            input_files=request.input_files,
         )
 
     def _raise_if_unconfigured(self) -> None:

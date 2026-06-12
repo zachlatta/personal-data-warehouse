@@ -15,11 +15,7 @@ ENV DAGSTER_HOME=/app/.dagster \
     UV_LINK_MODE=copy
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl docker.io poppler-utils tesseract-ocr zstd \
-    && arch="$(dpkg --print-architecture)" \
-    && curl -fsSL "https://ollama.com/download/ollama-linux-${arch}.tar.zst" \
-        | zstd -d \
-        | tar -x -C /usr/local \
+    && apt-get install -y --no-install-recommends ca-certificates curl docker.io poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock ./

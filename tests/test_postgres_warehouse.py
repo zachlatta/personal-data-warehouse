@@ -339,7 +339,6 @@ def _gmail_attachment_payload(*, message_id: str) -> str:
 def test_postgres_backfill_candidates_include_storage_pending(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     account = "zach@example.test"
-    provider, model, version = "ollama", "qwen3-vl:2b", "gmail-attachment-ai-v20"
     now = datetime(2026, 5, 1, tzinfo=UTC)
 
     def insert_message(message_id: str) -> None:
@@ -355,9 +354,6 @@ def test_postgres_backfill_candidates_include_storage_pending(warehouse: Postgre
                     account=account,
                     message_id=message_id,
                     status="ok",
-                    ai_provider=provider,
-                    ai_model=model,
-                    ai_prompt_version=version,
                     updated_at=now,
                     sync_version=1,
                 )
@@ -397,31 +393,146 @@ def test_postgres_backfill_candidates_include_storage_pending(warehouse: Postgre
     insert_message("m_toolarge")
     mark_enriched("m_toolarge")
     insert_attachment("m_toolarge", size=10 * 1024 * 1024, storage_status="")
-    # Brand-new message, not yet enriched -> normal AI candidate either way.
+    # Brand-new message, never backfilled -> normal candidate either way.
     insert_message("m_new")
 
     without_storage = warehouse.load_attachment_backfill_candidate_messages(
         account=account,
         limit=10,
-        ai_provider=provider,
-        ai_model=model,
-        ai_prompt_version=version,
     )
-    # Reproduces the stall: enriched-but-unstored history is invisible to the AI-only gate.
+    # Reproduces the stall: backfilled-but-unstored history is invisible to the text-only gate.
     assert {message["id"] for message in without_storage} == {"m_new"}
 
     with_storage = warehouse.load_attachment_backfill_candidate_messages(
         account=account,
         limit=10,
-        ai_provider=provider,
-        ai_model=model,
-        ai_prompt_version=version,
         include_storage_pending=True,
         storage_max_bytes=storage_max_bytes,
     )
     # Storage-pending history is reclaimed without dropping normal AI candidates,
     # and already-stored / too-large attachments stay excluded.
     assert {message["id"] for message in with_storage} == {"m_new", "m_pending"}
+
+
+def test_postgres_attachment_enrichment_candidates_select_stored_images(warehouse: PostgresWarehouse) -> None:
+    from personal_data_warehouse.agent_runner import AgentRunResult, agent_run_row
+    from personal_data_warehouse.gmail_attachment_enrichment import (
+        AGENT_ATTACHMENT_PROMPT_VERSION,
+        AGENT_ATTACHMENT_TASK_TYPE,
+        load_attachment_enrichment_candidates,
+    )
+    from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS
+
+    warehouse.ensure_tables()
+    warehouse.ensure_agent_tables()
+    account = "zach@example.test"
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    provider, model, version = "agent_codex", "", AGENT_ATTACHMENT_PROMPT_VERSION
+
+    def insert_attachment(message_id: str, *, sha: str, filename: str, mime_type: str, **overrides) -> None:
+        defaults = dict(
+            account=account,
+            message_id=message_id,
+            part_id="1",
+            filename=filename,
+            mime_type=mime_type,
+            content_sha256=sha,
+            size=2048,
+            storage_backend="google_drive",
+            storage_key=f"gmail-attachments/library/{sha}",
+            storage_file_id=f"drive-{sha}",
+            storage_status="stored",
+            internal_date=now,
+            is_deleted=0,
+            synced_at=now,
+            sync_version=1,
+        )
+        defaults.update(overrides)
+        warehouse.insert_attachments([_default_row(ATTACHMENT_COLUMNS, **defaults)])
+
+    def insert_enrichment(sha: str, *, ai_provider: str, ai_model: str, ai_prompt_version: str, status: str) -> None:
+        warehouse.insert_attachment_enrichments(
+            [
+                _default_row(
+                    ATTACHMENT_ENRICHMENT_COLUMNS,
+                    content_sha256=sha,
+                    ai_provider=ai_provider,
+                    ai_model=ai_model,
+                    ai_prompt_version=ai_prompt_version,
+                    text_extraction_status=status,
+                    updated_at=now,
+                    sync_version=1,
+                )
+            ]
+        )
+
+    # Pending image attachment: stored blob, deterministic 'unsupported' row -> candidate.
+    insert_attachment("m1", sha="sha-pending", filename="logo.png", mime_type="image/png")
+    insert_enrichment("sha-pending", ai_provider="", ai_model="", ai_prompt_version="", status="unsupported")
+    # Already agent-enriched -> excluded.
+    insert_attachment("m2", sha="sha-done", filename="chart.png", mime_type="image/png")
+    insert_enrichment("sha-done", ai_provider=provider, ai_model=model, ai_prompt_version=version, status="agent_ok")
+    # Plain text attachment -> never a vision candidate.
+    insert_attachment("m3", sha="sha-text", filename="notes.txt", mime_type="text/plain")
+    # Scanned PDF whose deterministic extraction was empty -> candidate.
+    insert_attachment("m4", sha="sha-pdf", filename="scan.pdf", mime_type="application/pdf")
+    insert_enrichment("sha-pdf", ai_provider="", ai_model="", ai_prompt_version="", status="empty")
+    # Text PDF (deterministic ok) -> excluded.
+    insert_attachment("m5", sha="sha-pdf-ok", filename="report.pdf", mime_type="application/pdf")
+    insert_enrichment("sha-pdf-ok", ai_provider="", ai_model="", ai_prompt_version="", status="ok")
+    # Image not yet in the object store -> excluded.
+    insert_attachment("m6", sha="sha-unstored", filename="photo.jpg", mime_type="image/jpeg", storage_status="")
+    # Image whose agent runs keep failing -> excluded after the attempt budget.
+    insert_attachment("m7", sha="sha-flaky", filename="flaky.png", mime_type="image/png")
+    for attempt in range(3):
+        warehouse.insert_agent_runs(
+            [
+                agent_run_row(
+                    AgentRunResult(
+                        run_id=f"run-{attempt}",
+                        provider="codex",
+                        model="",
+                        task_type=AGENT_ATTACHMENT_TASK_TYPE,
+                        subject_id="sha-flaky",
+                        prompt_version=version,
+                        input_sha256="x",
+                        status="error",
+                        final_output_json={},
+                        error="boom",
+                        exit_code=1,
+                        started_at=now,
+                        completed_at=now + timedelta(seconds=attempt + 1),
+                        events=[],
+                    )
+                )
+            ]
+        )
+
+    candidates = load_attachment_enrichment_candidates(
+        warehouse,
+        provider=provider,
+        model=model,
+        prompt_version=version,
+        limit=10,
+        max_error_attempts=3,
+    )
+
+    assert {candidate["content_sha256"] for candidate in candidates} == {"sha-pending", "sha-pdf"}
+    by_sha = {candidate["content_sha256"]: candidate for candidate in candidates}
+    assert by_sha["sha-pending"]["source_status"] == "unsupported"
+    assert by_sha["sha-pending"]["storage_file_id"] == "drive-sha-pending"
+    assert by_sha["sha-pdf"]["source_status"] == "empty"
+
+    # Raising the attempt budget brings the flaky attachment back.
+    retried = load_attachment_enrichment_candidates(
+        warehouse,
+        provider=provider,
+        model=model,
+        prompt_version=version,
+        limit=10,
+        max_error_attempts=5,
+    )
+    assert "sha-flaky" in {candidate["content_sha256"] for candidate in retried}
 
 
 def test_postgres_insert_normalizes_nul_text_values() -> None:

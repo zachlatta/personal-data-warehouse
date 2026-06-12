@@ -76,10 +76,16 @@ class AgentRunRequest:
     provider: str | None = None
     model: str | None = None
     extra_env: Mapping[str, str] = field(default_factory=dict)
-    input_files: Mapping[str, str] = field(default_factory=dict)
+    input_files: Mapping[str, str | bytes] = field(default_factory=dict)
 
     @property
     def input_sha256(self) -> str:
+        # Binary input files are folded in as their content hash so the payload
+        # stays JSON-serializable; text inputs keep hashing their literal content.
+        input_files = {
+            name: hashlib.sha256(content).hexdigest() if isinstance(content, bytes) else content
+            for name, content in self.input_files.items()
+        }
         payload = json.dumps(
             {
                 "prompt": self.prompt,
@@ -89,7 +95,7 @@ class AgentRunRequest:
                 "prompt_version": self.prompt_version,
                 "provider": self.provider,
                 "model": self.model,
-                "input_files": self.input_files,
+                "input_files": input_files,
             },
             sort_keys=True,
             default=str,
@@ -303,7 +309,10 @@ class ContainerAgentRunner:
             for relative_path, content in request.input_files.items():
                 input_path = safe_agent_input_path(inputs_dir, relative_path)
                 input_path.parent.mkdir(parents=True, exist_ok=True)
-                input_path.write_text(content, encoding="utf-8")
+                if isinstance(content, bytes):
+                    input_path.write_bytes(content)
+                else:
+                    input_path.write_text(content, encoding="utf-8")
         (run_dir / "request.json").write_text(
             json.dumps(
                 {

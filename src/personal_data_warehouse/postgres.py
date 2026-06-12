@@ -3595,14 +3595,14 @@ class PostgresWarehouse:
         *,
         account: str,
         limit: int,
-        ai_provider: str = "",
-        ai_model: str = "",
-        ai_prompt_version: str = "",
         include_storage_pending: bool = False,
         storage_max_bytes: int = 0,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
+        # Historical state rows carry the ai_provider/model/prompt_version of the
+        # removed inline Ollama fallback; any successful backfill counts now that
+        # sync-time extraction is deterministic-only.
         ai_pending_clause = """
               NOT EXISTS (
                   SELECT 1
@@ -3610,11 +3610,8 @@ class PostgresWarehouse:
                   WHERE state.account = gmail_messages.account
                     AND state.message_id = gmail_messages.message_id
                     AND state.status = 'ok'
-                    AND state.ai_provider = %s
-                    AND state.ai_model = %s
-                    AND state.ai_prompt_version = %s
               )"""
-        params: list[Any] = [account, ai_provider, ai_model, ai_prompt_version]
+        params: list[Any] = [account]
         pending_clause = ai_pending_clause
         if include_storage_pending and storage_max_bytes > 0:
             pending_clause = f"""({ai_pending_clause}

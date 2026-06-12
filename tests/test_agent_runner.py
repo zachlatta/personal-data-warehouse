@@ -191,6 +191,39 @@ def test_container_agent_runner_writes_input_files_and_exports_input_dir(tmp_pat
     ]
 
 
+def test_container_agent_runner_writes_binary_input_files(tmp_path) -> None:
+    volume_copy_calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal volume_copy_calls
+        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+            volume_copy_calls += 1
+            if volume_copy_calls == 2:
+                (tmp_path / "run-1" / "final.json").write_text('{"ok":true}', encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    config = AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path)
+    image_bytes = b"\x89PNG\r\n\x1a\n binary image data"
+    request = AgentRunRequest(
+        prompt="View the image",
+        schema={"type": "object"},
+        run_id="run-1",
+        input_files={"attachment.png": image_bytes},
+    )
+
+    result = ContainerAgentRunner(config, runner=fake_run).run(request)
+
+    assert result.status == "completed"
+    assert (tmp_path / "run-1" / "inputs" / "attachment.png").read_bytes() == image_bytes
+    # The request hash must be derived from the binary content without crashing.
+    assert request.input_sha256 == AgentRunRequest(
+        prompt="View the image",
+        schema={"type": "object"},
+        run_id="other-run",
+        input_files={"attachment.png": image_bytes},
+    ).input_sha256
+
+
 def test_container_agent_runner_rejects_unsafe_input_file_paths(tmp_path) -> None:
     config = AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path)
     request = AgentRunRequest(

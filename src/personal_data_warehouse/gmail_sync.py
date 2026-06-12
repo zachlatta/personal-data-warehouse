@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import base64
 import fcntl
@@ -11,23 +11,16 @@ import hashlib
 import json
 import logging
 import mimetypes
-import multiprocessing
 import os
-import queue
 import re
-import signal
 import ssl
 from email.utils import getaddresses, parseaddr
 from io import BytesIO
 from pathlib import Path
-import shutil
-import subprocess
 import tempfile
 import threading
 import time
 from typing import Callable, Protocol, TypeVar
-import urllib.error
-import urllib.request
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -36,7 +29,6 @@ from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from markdownify import markdownify as html_to_markdown
-from PIL import Image, ImageOps, UnidentifiedImageError
 import warnings
 import zlib
 
@@ -63,50 +55,7 @@ GMAIL_ATTACHMENT_STORAGE_METADATA_KIND = "gmail_attachment_metadata"
 GMAIL_ATTACHMENT_STORAGE_PREFIX = "gmail-attachments"
 GMAIL_ATTACHMENT_STORAGE_STAGE = "library"
 GMAIL_ATTACHMENT_STORAGE_MAX_EXTENSION_LEN = 16
-ATTACHMENT_AI_PROVIDER = "ollama"
-ATTACHMENT_AI_PROMPT_VERSION = "gmail-attachment-ai-v20"
-ATTACHMENT_AI_GENERATION_OPTIONS = {
-    "temperature": 0,
-    "num_predict": 320,
-}
-ATTACHMENT_AI_RESPONSE_FORMAT = "prompted_json"
-ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE = 1280
-ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY = 85
-ATTACHMENT_AI_OCR_ONLY_MIN_ALNUM_CHARS = 40
-ATTACHMENT_AI_OCR_ONLY_MIN_LINES = 2
-ATTACHMENT_AI_MODEL_ATTEMPT_LIMIT = 2
-ATTACHMENT_AI_PROMPT = """Extract searchable metadata from this real Gmail attachment image.
-
-Return only concise JSON with this schema:
-{
-  "is_useful": true,
-  "document_type": "logo|slide|screenshot|ad|poster|photo|chart|illustration|receipt|invoice|form|floor_plan|diagram|unknown",
-  "summary": "one faithful sentence about the whole image",
-  "visible_text": ["exact readable text chunks from anywhere in the image"],
-  "entities": ["brands, orgs, people, products, places"],
-  "search_keywords": ["specific useful search terms"],
-  "uncertainties": ["short notes for hard-to-read text"]
-}
-
-Use arrays for visible_text, entities, search_keywords, and uncertainties, even when there is only one item.
-
-OCR first: extract titles, headings, bullets, labels, legends, names, dates, orgs, brands, numbers, and calls to action before writing a caption. For charts, include axis labels, legends, and visible values. For logos and wordmarks, inspect every text region, including small text at the bottom or edges, and include the full visible phrase rather than only the largest words. For photos, briefly describe people, setting, activity, and objects, and extract readable signs/posters/slides.
-
-If any readable text exists anywhere in the image, is_useful must be true. Logos and wordmarks are useful: set document_type to "logo", put all exact brand text in visible_text, and put the normalized brand/org name in entities. Ads, banners, posters, screenshots, charts, and slides are useful when they contain readable text or meaningful visual context.
-
-Never call the image a Gmail placeholder or Gmail interface unless Gmail UI or a literal Gmail attachment placeholder is visible. Do not infer visible text from the filename or from these instructions. Preserve acronyms and capitalization exactly as they appear. Only include text that is visibly printed in the image; do not turn incidental shapes, shadows, monitors, or decorative marks into OCR text. If no text is visible, visible_text must be [] rather than ["unknown"], ["none"], or prose. If text is partially uncertain, include your best reading and add "(uncertain)" or an uncertainties note. Avoid generic keywords such as image, attachment, photo, and Gmail unless they are literally visible or specifically useful.
-
-If deterministic OCR hints are provided, treat them as weak hints, not ground truth. Ignore OCR-looking noise made of random single letters, punctuation, texture artifacts, or decorative marks. Use OCR hints only when they align with visibly printed text in the image.
-
-Keep the JSON concise enough to finish quickly: prefer at most 12 visible_text chunks, 10 entities, 10 search_keywords, and 5 uncertainties, while still preserving all important names, titles, dates, numbers, and readable sign/poster text.
-
-Use false for is_useful only for blank/decorative/tracking images or literal placeholders with no useful visible text. Do not invent details."""
-ATTACHMENT_AI_FALLBACK_STATUSES = {"unsupported", "empty", "invalid_pdf"}
-ATTACHMENT_AI_MIN_IMAGE_BYTES = 256
-IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 T = TypeVar("T")
-ATTACHMENT_AI_FALLBACK_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -129,69 +78,12 @@ class AttachmentTextExtraction:
     text: str
     status: str
     error: str = ""
-    ai_provider: str = ""
-    ai_model: str = ""
-    ai_base_url: str = ""
-    ai_prompt_version: str = ""
-    ai_prompt_sha256: str = ""
-    ai_prompt: str = ""
-    ai_source_status: str = ""
-    ai_elapsed_ms: int = 0
-    ai_processed_at: datetime = EPOCH_UTC
 
 
 class AttachmentEnrichmentCache(Protocol):
     def get(self, content_sha256: str) -> AttachmentTextExtraction | None: ...
 
     def put(self, content_sha256: str, extraction: AttachmentTextExtraction) -> None: ...
-
-
-@dataclass(frozen=True)
-class AttachmentAiFallbackConfig:
-    provider: str
-    base_url: str
-    model: str
-    timeout_seconds: int
-    pdf_max_pages: int
-    pull_model: bool = True
-    client: AttachmentVisionClient | None = None
-    model_attempt_budget: AttachmentAiModelAttemptBudget | None = None
-
-
-@dataclass
-class AttachmentAiModelAttemptBudget:
-    limit: int
-    attempts: int = 0
-    lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def acquire(self) -> int | None:
-        if self.limit < 1:
-            return None
-        with self.lock:
-            if self.attempts >= self.limit:
-                return None
-            self.attempts += 1
-            return self.attempts
-
-
-@dataclass(frozen=True)
-class AttachmentAiFormattedResponse:
-    text: str
-    model_content_status: str
-
-
-class AttachmentVisionClient(Protocol):
-    def generate(
-        self,
-        *,
-        model: str,
-        prompt: str,
-        images: Sequence[bytes],
-        format: str | None = None,
-        options: Mapping[str, object] | None = None,
-        think: bool = False,
-        timeout_seconds: int | None = None,
-    ) -> str: ...
 
 
 class AttachmentTextUnavailable(Exception):
@@ -273,21 +165,12 @@ class GmailSyncRunner:
         settings: Settings,
         warehouse: PostgresWarehouse,
         logger,
-        attachment_ai_client: AttachmentVisionClient | None = None,
-        attachment_ai_fallback: AttachmentAiFallbackConfig | None | object = ATTACHMENT_AI_FALLBACK_UNSET,
         attachment_object_store_factory: Callable[[GmailAccount], ObjectStore | None] | None = None,
     ) -> None:
         self._settings = settings
         self._warehouse = warehouse
         self._logger = logger
         self._attachment_object_store_factory = attachment_object_store_factory
-        if attachment_ai_fallback is ATTACHMENT_AI_FALLBACK_UNSET:
-            self._attachment_ai_fallback = attachment_ai_fallback_config_from_settings(
-                settings,
-                client=attachment_ai_client,
-            )
-        else:
-            self._attachment_ai_fallback = attachment_ai_fallback
 
     def sync_all(self) -> list[MailboxSyncSummary]:
         with exclusive_gmail_sync_lock() as acquired:
@@ -528,7 +411,6 @@ class GmailSyncRunner:
                             existing_keys=existing_attachment_keys,
                             max_bytes=self._settings.gmail_attachment_max_bytes,
                             text_max_chars=self._settings.gmail_attachment_text_max_chars,
-                            ai_fallback=self._attachment_ai_fallback,
                             enrichment_cache=enrichment_cache,
                             object_store=object_store,
                         )
@@ -588,7 +470,6 @@ class GmailSyncRunner:
                     max_bytes=self._settings.gmail_attachment_max_bytes,
                     text_max_chars=self._settings.gmail_attachment_text_max_chars,
                     force_reprocess=force_reprocess,
-                    ai_fallback=self._attachment_ai_fallback,
                     enrichment_cache=enrichment_cache,
                     object_store=object_store,
                 )
@@ -632,15 +513,9 @@ class GmailSyncRunner:
         if limit <= 0:
             return (0, 0, 0, 0)
 
-        ai_provider = self._attachment_ai_fallback.provider if self._attachment_ai_fallback else ""
-        ai_model = self._attachment_ai_fallback.model if self._attachment_ai_fallback else ""
-        ai_prompt_version = ATTACHMENT_AI_PROMPT_VERSION if self._attachment_ai_fallback else ""
         messages = self._warehouse.load_attachment_backfill_candidate_messages(
             account=account.email_address,
             limit=limit,
-            ai_provider=ai_provider,
-            ai_model=ai_model,
-            ai_prompt_version=ai_prompt_version,
             include_storage_pending=object_store is not None,
             storage_max_bytes=self._settings.gmail_attachment_max_bytes,
         )
@@ -649,14 +524,12 @@ class GmailSyncRunner:
             return (0, 0, 0, 0)
 
         candidates = len(messages)
-        ai_identity = (ai_provider, ai_model, ai_prompt_version)
         concurrency = max(1, self._settings.gmail_attachment_backfill_concurrency)
         if concurrency > 1 and len(messages) > 1 and self._supports_parallel_backfill():
             rows_written, text_chars, stored = self._backfill_messages_parallel(
                 account=account,
                 messages=messages,
                 object_store=object_store,
-                ai_identity=ai_identity,
                 concurrency=min(concurrency, len(messages)),
             )
         else:
@@ -665,7 +538,6 @@ class GmailSyncRunner:
                 service=service,
                 messages=messages,
                 object_store=object_store,
-                ai_identity=ai_identity,
             )
 
         self._logger.info(
@@ -691,7 +563,6 @@ class GmailSyncRunner:
         service,
         messages: list[Mapping[str, object]],
         object_store: ObjectStore | None,
-        ai_identity: tuple[str, str, str],
     ) -> tuple[int, int, int]:
         enrichment_cache = self._attachment_enrichment_cache()
         rows_written = 0
@@ -705,7 +576,6 @@ class GmailSyncRunner:
                 object_store=object_store,
                 warehouse=self._warehouse,
                 enrichment_cache=enrichment_cache,
-                ai_identity=ai_identity,
             )
             rows_written += written
             text_chars += chars
@@ -718,7 +588,6 @@ class GmailSyncRunner:
         account: GmailAccount,
         messages: list[Mapping[str, object]],
         object_store: ObjectStore | None,
-        ai_identity: tuple[str, str, str],
         concurrency: int,
     ) -> tuple[int, int, int]:
         # Google API clients and psycopg2 connections are not thread-safe, so each
@@ -753,7 +622,6 @@ class GmailSyncRunner:
                 object_store=store,
                 warehouse=warehouse,
                 enrichment_cache=cache,
-                ai_identity=ai_identity,
             )
 
         try:
@@ -784,10 +652,8 @@ class GmailSyncRunner:
         object_store: ObjectStore | None,
         warehouse,
         enrichment_cache: AttachmentEnrichmentCache | None,
-        ai_identity: tuple[str, str, str],
     ) -> tuple[int, int, int]:
         message_id = str(message.get("id", ""))
-        ai_provider, ai_model, ai_prompt_version = ai_identity
         synced_at = datetime.now(tz=UTC)
         try:
             existing_keys = warehouse.existing_attachment_keys(
@@ -803,7 +669,6 @@ class GmailSyncRunner:
                 max_bytes=self._settings.gmail_attachment_max_bytes,
                 text_max_chars=self._settings.gmail_attachment_text_max_chars,
                 force_reprocess=True,
-                ai_fallback=self._attachment_ai_fallback,
                 enrichment_cache=enrichment_cache,
                 object_store=object_store,
             )
@@ -816,9 +681,6 @@ class GmailSyncRunner:
                         status="ok",
                         attachment_rows_written=len(rows),
                         error="",
-                        ai_provider=ai_provider,
-                        ai_model=ai_model,
-                        ai_prompt_version=ai_prompt_version,
                         updated_at=synced_at,
                     )
                 ]
@@ -832,9 +694,6 @@ class GmailSyncRunner:
                         status="failed",
                         attachment_rows_written=0,
                         error=truncate_error(str(exc)),
-                        ai_provider=ai_provider,
-                        ai_model=ai_model,
-                        ai_prompt_version=ai_prompt_version,
                         updated_at=datetime.now(tz=UTC),
                     )
                 ]
@@ -859,37 +718,22 @@ class GmailSyncRunner:
             warehouse, "insert_attachment_enrichments"
         ):
             return None
-        return WarehouseAttachmentEnrichmentCache(
-            warehouse=warehouse,
-            config=self._attachment_ai_fallback,
-        )
-
-
-def attachment_ai_fallback_config_from_settings(
-    settings: Settings,
-    *,
-    client: AttachmentVisionClient | None = None,
-) -> AttachmentAiFallbackConfig | None:
-    if not settings.gmail_attachment_ai_fallback_enabled:
-        return None
-    return AttachmentAiFallbackConfig(
-        provider=ATTACHMENT_AI_PROVIDER,
-        base_url=settings.gmail_attachment_ai_fallback_base_url.rstrip("/"),
-        model=settings.gmail_attachment_ai_fallback_model,
-        timeout_seconds=settings.gmail_attachment_ai_fallback_timeout_seconds,
-        pdf_max_pages=settings.gmail_attachment_ai_fallback_pdf_max_pages,
-        pull_model=settings.gmail_attachment_ai_fallback_pull_model,
-        client=client,
-        model_attempt_budget=AttachmentAiModelAttemptBudget(ATTACHMENT_AI_MODEL_ATTEMPT_LIMIT),
-    )
+        return WarehouseAttachmentEnrichmentCache(warehouse=warehouse)
 
 
 class WarehouseAttachmentEnrichmentCache:
+    """Content-addressed cache of deterministic text extraction results.
+
+    Rows are keyed by (content_sha256, ai_provider, ai_model, ai_prompt_version);
+    sync-time deterministic extraction always uses the empty AI identity. Agent
+    vision enrichment writes its own identity rows separately (see
+    gmail_attachment_enrichment.py) and is intentionally not consulted here.
+    """
+
     _MISSING = object()
 
-    def __init__(self, *, warehouse, config: AttachmentAiFallbackConfig | None) -> None:
+    def __init__(self, *, warehouse) -> None:
         self._warehouse = warehouse
-        self._config = config
         self._cache: dict[str, AttachmentTextExtraction | object] = {}
 
     def get(self, content_sha256: str) -> AttachmentTextExtraction | None:
@@ -903,23 +747,11 @@ class WarehouseAttachmentEnrichmentCache:
 
         rows = self._warehouse.load_attachment_enrichments(
             content_sha256s=[content_sha256],
-            ai_provider=self._config.provider if self._config is not None else "",
-            ai_model=self._config.model if self._config is not None else "",
-            ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION if self._config is not None else "",
+            ai_provider="",
+            ai_model="",
+            ai_prompt_version="",
         )
         row = rows.get(content_sha256)
-        if row is None and self._config is not None:
-            deterministic_rows = self._warehouse.load_attachment_enrichments(
-                content_sha256s=[content_sha256],
-                ai_provider="",
-                ai_model="",
-                ai_prompt_version="",
-            )
-            deterministic_row = deterministic_rows.get(content_sha256)
-            if deterministic_row is not None and str(
-                deterministic_row.get("text_extraction_status", "")
-            ) not in ATTACHMENT_AI_FALLBACK_STATUSES:
-                row = deterministic_row
         if row is None:
             self._cache[content_sha256] = self._MISSING
             return None
@@ -949,28 +781,14 @@ def attachment_enrichment_is_cacheable(extraction: AttachmentTextExtraction) -> 
         "fetch_error",
         "too_large",
         "no_content",
-        "ai_model_failed",
-        "ai_model_skipped",
     }
 
 
 def attachment_text_extraction_from_enrichment_row(row: Mapping[str, object]) -> AttachmentTextExtraction:
-    ai_processed_at = row.get("ai_processed_at", EPOCH_UTC)
-    if not isinstance(ai_processed_at, datetime):
-        ai_processed_at = EPOCH_UTC
     return AttachmentTextExtraction(
         text=str(row.get("text", "")),
         status=str(row.get("text_extraction_status", "")),
         error=str(row.get("text_extraction_error", "")),
-        ai_provider=str(row.get("ai_provider", "")),
-        ai_model=str(row.get("ai_model", "")),
-        ai_base_url=str(row.get("ai_base_url", "")),
-        ai_prompt_version=str(row.get("ai_prompt_version", "")),
-        ai_prompt_sha256=str(row.get("ai_prompt_sha256", "")),
-        ai_prompt=str(row.get("ai_prompt", "")),
-        ai_source_status=str(row.get("ai_source_status", "")),
-        ai_elapsed_ms=int(row.get("ai_elapsed_ms", 0) or 0),
-        ai_processed_at=ai_processed_at,
     )
 
 
@@ -982,18 +800,18 @@ def attachment_enrichment_row(
 ) -> dict[str, object]:
     return {
         "content_sha256": content_sha256,
-        "ai_provider": extraction.ai_provider,
-        "ai_model": extraction.ai_model,
-        "ai_prompt_version": extraction.ai_prompt_version,
+        "ai_provider": "",
+        "ai_model": "",
+        "ai_prompt_version": "",
         "text": extraction.text,
         "text_extraction_status": extraction.status,
         "text_extraction_error": extraction.error,
-        "ai_base_url": extraction.ai_base_url,
-        "ai_prompt_sha256": extraction.ai_prompt_sha256,
-        "ai_prompt": extraction.ai_prompt,
-        "ai_source_status": extraction.ai_source_status,
-        "ai_elapsed_ms": extraction.ai_elapsed_ms,
-        "ai_processed_at": extraction.ai_processed_at,
+        "ai_base_url": "",
+        "ai_prompt_sha256": "",
+        "ai_prompt": "",
+        "ai_source_status": "",
+        "ai_elapsed_ms": 0,
+        "ai_processed_at": EPOCH_UTC,
         "updated_at": updated_at,
         "sync_version": int(updated_at.timestamp() * 1000),
     }
@@ -1201,7 +1019,6 @@ def attachment_rows_for_message(
     max_bytes: int,
     text_max_chars: int,
     force_reprocess: bool = False,
-    ai_fallback: AttachmentAiFallbackConfig | None = None,
     enrichment_cache: AttachmentEnrichmentCache | None = None,
     object_store: ObjectStore | None = None,
 ) -> list[dict[str, object]]:
@@ -1224,7 +1041,6 @@ def attachment_rows_for_message(
                 synced_at=synced_at,
                 max_bytes=max_bytes,
                 text_max_chars=text_max_chars,
-                ai_fallback=ai_fallback,
                 enrichment_cache=enrichment_cache,
                 object_store=object_store,
             )
@@ -1301,15 +1117,6 @@ def deleted_attachment_row(
         "text": "",
         "text_extraction_status": "deleted",
         "text_extraction_error": "",
-        "ai_provider": "",
-        "ai_model": "",
-        "ai_base_url": "",
-        "ai_prompt_version": "",
-        "ai_prompt_sha256": "",
-        "ai_prompt": "",
-        "ai_source_status": "",
-        "ai_elapsed_ms": 0,
-        "ai_processed_at": EPOCH_UTC,
         "is_deleted": 1,
         "part_json": "{}",
         "synced_at": synced_at,
@@ -1324,9 +1131,6 @@ def attachment_backfill_state_row(
     status: str,
     attachment_rows_written: int,
     error: str,
-    ai_provider: str = "",
-    ai_model: str = "",
-    ai_prompt_version: str = "",
     updated_at: datetime,
 ) -> dict[str, object]:
     return {
@@ -1335,9 +1139,9 @@ def attachment_backfill_state_row(
         "status": status,
         "attachment_rows_written": int(attachment_rows_written),
         "error": error,
-        "ai_provider": ai_provider,
-        "ai_model": ai_model,
-        "ai_prompt_version": ai_prompt_version,
+        "ai_provider": "",
+        "ai_model": "",
+        "ai_prompt_version": "",
         "updated_at": updated_at,
         "sync_version": int(updated_at.timestamp() * 1000),
     }
@@ -1423,7 +1227,6 @@ def attachment_part_to_row(
     synced_at: datetime,
     max_bytes: int,
     text_max_chars: int,
-    ai_fallback: AttachmentAiFallbackConfig | None = None,
     enrichment_cache: AttachmentEnrichmentCache | None = None,
     object_store: ObjectStore | None = None,
 ) -> dict[str, object]:
@@ -1514,14 +1317,6 @@ def attachment_part_to_row(
                         filename=filename,
                         max_chars=text_max_chars,
                     )
-                    extraction = apply_attachment_ai_fallback(
-                        extraction=extraction,
-                        content=content,
-                        mime_type=mime_type,
-                        filename=filename,
-                        max_chars=text_max_chars,
-                        config=ai_fallback,
-                    )
                     if enrichment_cache is not None:
                         enrichment_cache.put(content_sha256, extraction)
 
@@ -1548,15 +1343,6 @@ def attachment_part_to_row(
         "text": extraction.text,
         "text_extraction_status": extraction.status,
         "text_extraction_error": extraction.error,
-        "ai_provider": extraction.ai_provider,
-        "ai_model": extraction.ai_model,
-        "ai_base_url": extraction.ai_base_url,
-        "ai_prompt_version": extraction.ai_prompt_version,
-        "ai_prompt_sha256": extraction.ai_prompt_sha256,
-        "ai_prompt": extraction.ai_prompt,
-        "ai_source_status": extraction.ai_source_status,
-        "ai_elapsed_ms": extraction.ai_elapsed_ms,
-        "ai_processed_at": extraction.ai_processed_at,
         "is_deleted": 0,
         "part_json": attachment_part_json(part),
         "synced_at": synced_at,
@@ -1648,923 +1434,6 @@ def extract_attachment_text(
     if len(text) > max_chars:
         return AttachmentTextExtraction(text=text[:max_chars], status="truncated")
     return AttachmentTextExtraction(text=text, status="ok")
-
-
-def apply_attachment_ai_fallback(
-    *,
-    extraction: AttachmentTextExtraction,
-    content: bytes,
-    mime_type: str,
-    filename: str,
-    max_chars: int,
-    config: AttachmentAiFallbackConfig | None,
-) -> AttachmentTextExtraction:
-    if config is None or extraction.status not in ATTACHMENT_AI_FALLBACK_STATUSES:
-        return extraction
-    started_at = time.monotonic()
-    try:
-        images = attachment_ai_fallback_images(
-            content=content,
-            mime_type=mime_type,
-            filename=filename,
-            pdf_max_pages=config.pdf_max_pages,
-            timeout_seconds=config.timeout_seconds,
-        )
-        if not images:
-            return extraction
-        supporting_ocr_text = attachment_ai_supporting_ocr_text(
-            images=images,
-            timeout_seconds=config.timeout_seconds,
-        )
-        prompt = attachment_ai_prompt(supporting_ocr_text=supporting_ocr_text)
-        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        metadata = attachment_ai_metadata(
-            extraction=extraction,
-            config=config,
-            prompt_sha256=prompt_sha256,
-        )
-        if attachment_ai_supporting_ocr_is_enough(supporting_ocr_text):
-            elapsed_ms = int((time.monotonic() - started_at) * 1000)
-            metadata["model_content_status"] = "ocr_only_pre_model"
-            metadata["model_call_skipped"] = True
-            text = normalize_markdown(
-                "\n\n".join(
-                    (
-                        "AI attachment extraction",
-                        f"Deterministic OCR text:\n{supporting_ocr_text.strip()}",
-                    )
-                )
-            )
-            status = "ai_ocr_only"
-            if len(text) > max_chars:
-                text = text[:max_chars]
-                status = "ai_truncated"
-            return AttachmentTextExtraction(
-                text=text,
-                status=status,
-                error=truncate_error(json.dumps(metadata, sort_keys=True, separators=(",", ":"))),
-                ai_provider=config.provider,
-                ai_model=config.model,
-                ai_base_url=config.base_url,
-                ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION,
-                ai_prompt_sha256=prompt_sha256,
-                ai_prompt=prompt,
-                ai_source_status=extraction.status,
-                ai_elapsed_ms=elapsed_ms,
-                ai_processed_at=datetime.now(tz=UTC),
-            )
-
-        model_attempt_index = attachment_ai_model_attempt_index(config)
-        if model_attempt_index is None:
-            elapsed_ms = int((time.monotonic() - started_at) * 1000)
-            metadata["model_content_status"] = "model_attempt_limit_exceeded"
-            metadata["model_call_skipped"] = True
-            metadata["model_attempt_limit"] = attachment_ai_model_attempt_limit(config)
-            return AttachmentTextExtraction(
-                text="",
-                status="ai_model_skipped",
-                error=truncate_error(json.dumps(metadata, sort_keys=True, separators=(",", ":"))),
-                ai_provider=config.provider,
-                ai_model=config.model,
-                ai_base_url=config.base_url,
-                ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION,
-                ai_prompt_sha256=prompt_sha256,
-                ai_prompt=prompt,
-                ai_source_status=extraction.status,
-                ai_elapsed_ms=elapsed_ms,
-                ai_processed_at=datetime.now(tz=UTC),
-            )
-
-        model_images = attachment_ai_model_images(images)
-        LOGGER.info(
-            "Starting Gmail attachment AI fallback model=%s source_status=%s mime_type=%s content_bytes=%s image_count=%s model_image_bytes=%s ocr_chars=%s timeout_seconds=%s model_attempt=%s",
-            config.model,
-            extraction.status,
-            mime_type,
-            len(content),
-            len(images),
-            sum(len(image) for image in model_images),
-            len(supporting_ocr_text),
-            config.timeout_seconds,
-            model_attempt_index,
-        )
-        response_text = call_ollama_attachment_vision_model(
-            images=model_images,
-            config=config,
-            prompt=prompt,
-        )
-        elapsed_ms = int((time.monotonic() - started_at) * 1000)
-    except Exception as exc:
-        elapsed_ms = int((time.monotonic() - started_at) * 1000)
-        LOGGER.warning(
-            "Gmail attachment AI fallback failed model=%s source_status=%s mime_type=%s elapsed_ms=%s: %s",
-            config.model,
-            extraction.status,
-            mime_type,
-            elapsed_ms,
-            exc,
-        )
-        if "prompt_sha256" in locals() and "prompt" in locals() and "metadata" in locals():
-            metadata["model_content_status"] = "model_failed"
-            metadata["model_call_skipped"] = False
-            metadata["model_error"] = str(exc)
-            if "model_attempt_index" in locals():
-                metadata["model_attempt_index"] = model_attempt_index
-            metadata["model_attempt_limit"] = attachment_ai_model_attempt_limit(config)
-            return AttachmentTextExtraction(
-                text="",
-                status="ai_model_failed",
-                error=truncate_error(json.dumps(metadata, sort_keys=True, separators=(",", ":"))),
-                ai_provider=config.provider,
-                ai_model=config.model,
-                ai_base_url=config.base_url,
-                ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION,
-                ai_prompt_sha256=prompt_sha256,
-                ai_prompt=prompt,
-                ai_source_status=extraction.status,
-                ai_elapsed_ms=elapsed_ms,
-                ai_processed_at=datetime.now(tz=UTC),
-            )
-        return replace(
-            extraction,
-            error=truncate_error(
-                "; ".join(
-                    part
-                    for part in (
-                        extraction.error,
-                        f"AI fallback failed: {exc}",
-                    )
-                    if part
-                )
-            ),
-        )
-
-    metadata = attachment_ai_metadata(
-        extraction=extraction,
-        config=config,
-        prompt_sha256=prompt_sha256,
-    )
-
-    formatted = format_attachment_ai_response_details(
-        response_text,
-        supporting_ocr_text=supporting_ocr_text,
-    )
-    text = normalize_markdown(formatted.text)
-    metadata["model_content_status"] = formatted.model_content_status
-    metadata["model_call_skipped"] = False
-    metadata["model_attempt_index"] = model_attempt_index
-    metadata["model_attempt_limit"] = attachment_ai_model_attempt_limit(config)
-    status = "ai_ok"
-    if formatted.model_content_status == "ocr_only" and text:
-        status = "ai_ocr_only"
-    elif not text:
-        status = "ai_empty"
-    elif len(text) > max_chars:
-        text = text[:max_chars]
-        status = "ai_truncated"
-
-    return AttachmentTextExtraction(
-        text=text,
-        status=status,
-        error=truncate_error(json.dumps(metadata, sort_keys=True, separators=(",", ":"))),
-        ai_provider=config.provider,
-        ai_model=config.model,
-        ai_base_url=config.base_url,
-        ai_prompt_version=ATTACHMENT_AI_PROMPT_VERSION,
-        ai_prompt_sha256=prompt_sha256,
-        ai_prompt=prompt,
-        ai_source_status=extraction.status,
-        ai_elapsed_ms=elapsed_ms,
-        ai_processed_at=datetime.now(tz=UTC),
-    )
-
-
-def attachment_ai_metadata(
-    *,
-    extraction: AttachmentTextExtraction,
-    config: AttachmentAiFallbackConfig,
-    prompt_sha256: str,
-) -> dict[str, object]:
-    return {
-        "source_status": extraction.status,
-        "source_error": extraction.error,
-        "provider": config.provider,
-        "model": config.model,
-        "base_url": config.base_url,
-        "prompt_version": ATTACHMENT_AI_PROMPT_VERSION,
-        "prompt_sha256": prompt_sha256,
-        "generation_options": ATTACHMENT_AI_GENERATION_OPTIONS,
-        "response_format": ATTACHMENT_AI_RESPONSE_FORMAT,
-        "model_image_preprocessing": {
-            "format": "jpeg",
-            "max_edge": ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE,
-            "quality": ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY,
-        },
-    }
-
-
-def attachment_ai_supporting_ocr_is_enough(text: str) -> bool:
-    lines = [line for line in text.splitlines() if line.strip()]
-    alnum_chars = re.findall(r"[A-Za-z0-9]", text)
-    return (
-        len(alnum_chars) >= ATTACHMENT_AI_OCR_ONLY_MIN_ALNUM_CHARS
-        and len(lines) >= ATTACHMENT_AI_OCR_ONLY_MIN_LINES
-    )
-
-
-def attachment_ai_model_attempt_index(config: AttachmentAiFallbackConfig) -> int | None:
-    if config.model_attempt_budget is None:
-        return 1
-    return config.model_attempt_budget.acquire()
-
-
-def attachment_ai_model_attempt_limit(config: AttachmentAiFallbackConfig) -> int | None:
-    if config.model_attempt_budget is None:
-        return None
-    return config.model_attempt_budget.limit
-
-
-def format_attachment_ai_response(
-    response_text: str,
-    *,
-    supporting_ocr_text: str = "",
-) -> str:
-    return format_attachment_ai_response_details(
-        response_text,
-        supporting_ocr_text=supporting_ocr_text,
-    ).text
-
-
-def format_attachment_ai_response_details(
-    response_text: str,
-    *,
-    supporting_ocr_text: str = "",
-) -> AttachmentAiFormattedResponse:
-    payload = parse_attachment_ai_json_response(response_text)
-    ocr_text = supporting_ocr_text.strip()
-    if not payload:
-        model_text = response_text.strip()
-        if attachment_ai_unstructured_response_is_non_useful(model_text):
-            model_text = ""
-        text = "\n\n".join(
-            part
-            for part in (
-                model_text,
-                f"Deterministic OCR text:\n{ocr_text}".strip(),
-            )
-            if part and not part.endswith(":")
-        )
-        if model_text:
-            return AttachmentAiFormattedResponse(text=text, model_content_status="unstructured")
-        if ocr_text:
-            return AttachmentAiFormattedResponse(text=text, model_content_status="ocr_only")
-        return AttachmentAiFormattedResponse(text="", model_content_status="empty")
-
-    if not attachment_ai_response_is_useful(payload):
-        if not ocr_text:
-            return AttachmentAiFormattedResponse(text="", model_content_status="empty")
-        return AttachmentAiFormattedResponse(
-            text="\n\n".join(
-                (
-                    "AI attachment extraction",
-                    f"Deterministic OCR text:\n{ocr_text}".strip(),
-                )
-            ),
-            model_content_status="ocr_only",
-        )
-
-    document_type = attachment_ai_response_field(payload, "document_type", "likely_document_type")
-    summary = attachment_ai_response_field(payload, "summary", "scene_summary")
-    document_context = attachment_ai_response_field(payload, "document_context")
-    visible_text_value = attachment_ai_response_indexable_text(payload.get("visible_text", ""), separator="\n")
-    entities = attachment_ai_response_indexable_text(payload.get("entities", ""), separator=", ")
-    search_keywords = attachment_ai_response_indexable_text(
-        attachment_ai_response_first(payload, "search_keywords", "useful_for_search"),
-        separator=", ",
-    )
-    uncertainties = attachment_ai_response_text(payload.get("uncertainties", ""), separator="\n")
-
-    text = "\n\n".join(
-        part
-        for part in (
-            "AI attachment extraction",
-            f"Document type: {document_type}".strip(),
-            f"Summary: {summary}".strip(),
-            f"Document context: {document_context}".strip(),
-            f"Visible text:\n{visible_text_value}".strip(),
-            f"Entities: {entities}".strip(),
-            f"Search keywords: {search_keywords}".strip(),
-            f"Uncertainties:\n{uncertainties}".strip(),
-            f"Deterministic OCR text:\n{ocr_text}".strip(),
-        )
-        if part and not part.endswith(":")
-    )
-    return AttachmentAiFormattedResponse(text=text, model_content_status="structured")
-
-
-def attachment_ai_unstructured_response_is_non_useful(response_text: str) -> bool:
-    normalized = response_text.strip().lower()
-    if not normalized:
-        return True
-    return bool(
-        re.search(
-            r"\b(no readable text|no visible text|no useful content|placeholder|generic gmail attachment|blank image)\b",
-            normalized,
-        )
-    )
-
-
-def attachment_ai_fallback_images(
-    *,
-    content: bytes,
-    mime_type: str,
-    filename: str,
-    pdf_max_pages: int,
-    timeout_seconds: int,
-) -> list[bytes]:
-    extension = Path(filename.lower()).suffix
-    if is_supported_image_attachment(content=content, mime_type=mime_type, extension=extension):
-        return [content]
-    if mime_type == "application/pdf" or extension == ".pdf" or looks_like_pdf(content):
-        if not looks_like_pdf(content):
-            return []
-        return render_pdf_attachment_pages(
-            content=content,
-            max_pages=pdf_max_pages,
-            timeout_seconds=timeout_seconds,
-        )
-    return []
-
-
-def attachment_ai_model_images(images: Sequence[bytes]) -> list[bytes]:
-    return [attachment_ai_model_image(image) for image in images]
-
-
-def attachment_ai_model_image(image: bytes) -> bytes:
-    try:
-        with Image.open(BytesIO(image)) as original:
-            rendered = ImageOps.exif_transpose(original)
-            width, height = rendered.size
-            scale = min(ATTACHMENT_AI_MODEL_IMAGE_MAX_EDGE / max(width, height), 1)
-            if scale < 1:
-                rendered = rendered.resize(
-                    (max(1, int(width * scale)), max(1, int(height * scale))),
-                    Image.Resampling.LANCZOS,
-                )
-            if rendered.mode not in {"RGB", "L"}:
-                rendered = rendered.convert("RGB")
-            output = BytesIO()
-            rendered.save(output, format="JPEG", quality=ATTACHMENT_AI_MODEL_IMAGE_JPEG_QUALITY, optimize=True)
-            return output.getvalue()
-    except (OSError, UnidentifiedImageError):
-        return image
-
-
-def is_supported_image_attachment(*, content: bytes, mime_type: str, extension: str) -> bool:
-    if len(content) < ATTACHMENT_AI_MIN_IMAGE_BYTES:
-        return False
-    if mime_type in IMAGE_MIME_TYPES or extension in IMAGE_EXTENSIONS:
-        return looks_like_supported_image(content)
-    return looks_like_supported_image(content)
-
-
-def looks_like_supported_image(content: bytes) -> bool:
-    return (
-        content.startswith(b"\x89PNG\r\n\x1a\n")
-        or content.startswith(b"\xff\xd8\xff")
-        or content.startswith(b"RIFF") and content[8:12] == b"WEBP"
-    )
-
-
-def render_pdf_attachment_pages(*, content: bytes, max_pages: int, timeout_seconds: int) -> list[bytes]:
-    pdftoppm = shutil.which("pdftoppm")
-    if not pdftoppm:
-        raise RuntimeError("pdftoppm is not installed; cannot render image-only PDF for AI fallback")
-
-    with tempfile.TemporaryDirectory() as directory:
-        tempdir = Path(directory)
-        input_path = tempdir / "attachment.pdf"
-        output_prefix = tempdir / "page"
-        input_path.write_bytes(content)
-        command = [
-            pdftoppm,
-            "-png",
-            "-r",
-            "160",
-            "-f",
-            "1",
-            "-l",
-            str(max_pages),
-            str(input_path),
-            str(output_prefix),
-        ]
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"pdftoppm failed: {stderr or result.returncode}")
-        return [path.read_bytes() for path in sorted(tempdir.glob("page-*.png"))]
-
-
-def attachment_ai_prompt(*, supporting_ocr_text: str = "") -> str:
-    ocr_text = supporting_ocr_text.strip()
-    if not ocr_text:
-        return ATTACHMENT_AI_PROMPT
-    return "\n\n".join(
-        (
-            ATTACHMENT_AI_PROMPT,
-            "Deterministic OCR hints from the same image, before model reasoning:",
-            ocr_text,
-            (
-                "Use these OCR hints as weak evidence only. Correct obvious OCR errors by looking at the image, "
-                "keep uncertain readings marked uncertain, and ignore OCR tokens that are not visibly supported "
-                "or that look like random texture/punctuation artifacts."
-            ),
-        )
-    )
-
-
-def call_ollama_attachment_vision_model(
-    *,
-    images: Sequence[bytes],
-    config: AttachmentAiFallbackConfig,
-    prompt: str,
-) -> str:
-    if config.client is not None and config.client.__class__.__name__ != "OllamaResource":
-        return run_attachment_ai_call_with_timeout(
-            lambda: config.client.generate(
-                model=config.model,
-                prompt=prompt,
-                images=images,
-                format=None,
-                options=ATTACHMENT_AI_GENERATION_OPTIONS,
-                think=False,
-                timeout_seconds=config.timeout_seconds,
-            ),
-            timeout_seconds=config.timeout_seconds,
-        )
-
-    image_payload = [base64.b64encode(image).decode("ascii") for image in images]
-    payload = {
-        "model": config.model,
-        "prompt": prompt,
-        "images": image_payload,
-        "stream": False,
-        "think": False,
-        "options": ATTACHMENT_AI_GENERATION_OPTIONS,
-    }
-    request = urllib.request.Request(
-        f"{config.base_url}/api/generate",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-
-    response_data = run_ollama_generate_request_with_process_timeout(
-        request,
-        timeout_seconds=config.timeout_seconds,
-    )
-    return str(response_data.get("response", ""))
-
-
-def run_ollama_generate_request_with_process_timeout(
-    request: urllib.request.Request,
-    *,
-    timeout_seconds: int,
-) -> dict[str, object]:
-    context = multiprocessing.get_context("spawn")
-    results: multiprocessing.Queue[tuple[bool, dict[str, object] | str]] = context.Queue(maxsize=1)
-    process = context.Process(
-        target=ollama_generate_request_worker,
-        args=(request.full_url, bytes(request.data or b""), dict(request.headers), timeout_seconds, results),
-        daemon=True,
-    )
-    started_at = time.monotonic()
-    process.start()
-    LOGGER.info(
-        "Started Gmail attachment Ollama generate worker pid=%s timeout_seconds=%s",
-        process.pid,
-        timeout_seconds,
-    )
-    process.join(timeout_seconds)
-    if process.is_alive():
-        elapsed_ms = int((time.monotonic() - started_at) * 1000)
-        LOGGER.warning(
-            "Terminating Gmail attachment Ollama generate worker pid=%s elapsed_ms=%s timeout_seconds=%s",
-            process.pid,
-            elapsed_ms,
-            timeout_seconds,
-        )
-        process.terminate()
-        process.join(timeout=5)
-        if process.is_alive():
-            process.kill()
-            process.join(timeout=5)
-        terminated_runners = terminate_ollama_runner_processes()
-        if terminated_runners:
-            LOGGER.warning(
-                "Terminated %s Ollama runner process(es) after Gmail attachment AI timeout",
-                terminated_runners,
-            )
-        raise TimeoutError(f"AI attachment fallback timed out after {timeout_seconds:g} seconds")
-    if results.empty():
-        LOGGER.warning("Gmail attachment Ollama generate worker exited without a result: code=%s", process.exitcode)
-        raise RuntimeError(f"Ollama generate worker exited with code {process.exitcode}")
-    ok, value = results.get_nowait()
-    if ok and isinstance(value, dict):
-        return value
-    terminated_runners = terminate_ollama_runner_processes()
-    if terminated_runners:
-        LOGGER.warning(
-            "Terminated %s Ollama runner process(es) after Gmail attachment Ollama worker error",
-            terminated_runners,
-        )
-    raise RuntimeError(str(value))
-
-
-def ollama_generate_request_worker(
-    url: str,
-    data: bytes,
-    headers: Mapping[str, str],
-    timeout_seconds: int,
-    results,
-) -> None:
-    reset_ollama_generate_worker_signal_handlers()
-    request = urllib.request.Request(url, data=data, headers=dict(headers))
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            payload = json.loads(response.read())
-        if not isinstance(payload, dict):
-            raise RuntimeError("Ollama returned a non-object JSON response")
-        results.put((True, payload), block=False)
-    except BaseException as exc:
-        results.put((False, str(exc)), block=False)
-
-
-def reset_ollama_generate_worker_signal_handlers() -> None:
-    for signum in (signal.SIGTERM, signal.SIGINT):
-        try:
-            signal.signal(signum, signal.SIG_DFL)
-        except (AttributeError, OSError, ValueError):
-            continue
-
-
-def terminate_ollama_runner_processes(proc_root: Path = Path("/proc")) -> int:
-    pids = ollama_runner_pids(proc_root=proc_root)
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            LOGGER.warning("Could not terminate Ollama runner pid=%s: permission denied", pid)
-    time.sleep(0.2)
-    killed = 0
-    for pid in pids:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            killed += 1
-            continue
-        except PermissionError:
-            continue
-        try:
-            os.kill(pid, signal.SIGKILL)
-            killed += 1
-        except ProcessLookupError:
-            killed += 1
-        except PermissionError:
-            LOGGER.warning("Could not kill Ollama runner pid=%s: permission denied", pid)
-    return killed
-
-
-def ollama_runner_pids(proc_root: Path = Path("/proc")) -> list[int]:
-    pids: list[int] = []
-    try:
-        entries = list(proc_root.iterdir())
-    except OSError:
-        return pids
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            cmdline = (entry / "cmdline").read_bytes()
-        except OSError:
-            continue
-        args = [arg.decode("utf-8", errors="replace") for arg in cmdline.split(b"\0") if arg]
-        if len(args) >= 2 and Path(args[0]).name == "ollama" and args[1] == "runner":
-            pids.append(int(entry.name))
-    return pids
-
-
-def attachment_ai_supporting_ocr_text(*, images: Sequence[bytes], timeout_seconds: int) -> str:
-    tesseract = shutil.which("tesseract")
-    if not tesseract:
-        return ""
-
-    lines: list[str] = []
-    seen: set[str] = set()
-    with tempfile.TemporaryDirectory() as directory:
-        tempdir = Path(directory)
-        for index, image in enumerate(images, start=1):
-            image_path = tempdir / f"attachment-page-{index}.png"
-            image_path.write_bytes(image)
-            try:
-                result = subprocess.run(
-                    [tesseract, str(image_path), "stdout", "--psm", "6", "tsv"],
-                    capture_output=True,
-                    check=False,
-                    timeout=max(1, min(timeout_seconds, 20)),
-                )
-            except Exception:
-                continue
-            if result.returncode != 0:
-                continue
-            for line in attachment_ai_ocr_lines_from_tsv(result.stdout.decode("utf-8", errors="replace")):
-                normalized_line = attachment_ai_clean_ocr_line(line)
-                if not normalized_line:
-                    continue
-                key = normalized_line.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                lines.append(normalized_line)
-    return "\n".join(lines)
-
-
-def attachment_ai_ocr_lines_from_tsv(tsv_text: str) -> list[str]:
-    lines: dict[tuple[str, str, str, str], list[tuple[float, str]]] = {}
-    for row in tsv_text.splitlines()[1:]:
-        columns = row.split("\t")
-        if len(columns) < 12 or columns[0] != "5":
-            continue
-        try:
-            confidence = float(columns[10])
-        except ValueError:
-            continue
-        if confidence < 55:
-            continue
-        word = columns[11].strip()
-        if not word:
-            continue
-        key = (columns[1], columns[2], columns[3], columns[4])
-        lines.setdefault(key, []).append((confidence, word))
-
-    cleaned_lines: list[str] = []
-    for words in lines.values():
-        if not words:
-            continue
-        average_confidence = sum(confidence for confidence, _word in words) / len(words)
-        text = " ".join(word for _confidence, word in words)
-        cleaned = attachment_ai_clean_ocr_line(text)
-        if not cleaned:
-            continue
-        if average_confidence < 65:
-            continue
-        if len(cleaned) > 240 and average_confidence < 70:
-            continue
-        cleaned_lines.append(cleaned)
-    return cleaned_lines
-
-
-def attachment_ai_clean_ocr_line(line: str) -> str:
-    normalized_line = " ".join(line.split()).strip(" |!\"'`.,:;[]{}()<>“”‘’")
-    letters = re.findall(r"[A-Za-z]", normalized_line)
-    digits = re.findall(r"\d", normalized_line)
-    if len(letters) < 3 and len(digits) < 3:
-        return ""
-    non_space_chars = re.findall(r"\S", normalized_line)
-    alnum_chars = re.findall(r"[A-Za-z0-9]", normalized_line)
-    if non_space_chars and len(alnum_chars) / len(non_space_chars) < 0.55:
-        return ""
-    tokens = re.findall(r"[A-Za-z0-9]+", normalized_line)
-    if len(tokens) >= 4:
-        if max(len(token) for token in tokens) <= 3:
-            return ""
-        single_character_tokens = [token for token in tokens if len(token) == 1]
-        if len(single_character_tokens) / len(tokens) > 0.4:
-            return ""
-    return normalized_line
-
-
-def run_attachment_ai_call_with_timeout[T](call: Callable[[], T], *, timeout_seconds: float) -> T:
-    if timeout_seconds <= 0:
-        return call()
-    if threading.current_thread() is threading.main_thread() and hasattr(signal, "setitimer"):
-        return run_attachment_ai_call_with_signal_timeout(call, timeout_seconds=timeout_seconds)
-
-    results: queue.Queue[tuple[bool, T | BaseException]] = queue.Queue(maxsize=1)
-
-    def target() -> None:
-        try:
-            results.put((True, call()), block=False)
-        except BaseException as exc:
-            results.put((False, exc), block=False)
-
-    thread = threading.Thread(target=target, name="gmail-attachment-ai-call", daemon=True)
-    thread.start()
-    thread.join(timeout_seconds)
-    if thread.is_alive():
-        raise TimeoutError(f"AI attachment fallback timed out after {timeout_seconds:g} seconds")
-
-    ok, value = results.get_nowait()
-    if ok:
-        return value  # type: ignore[return-value]
-    raise value
-
-
-def run_attachment_ai_call_with_signal_timeout[T](call: Callable[[], T], *, timeout_seconds: float) -> T:
-    previous_handler = signal.getsignal(signal.SIGALRM)
-    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0)
-    started_at = time.monotonic()
-
-    def timeout_handler(_signum, _frame) -> None:
-        raise TimeoutError(f"AI attachment fallback timed out after {timeout_seconds:g} seconds")
-
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-    try:
-        return call()
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
-        if previous_timer[0] > 0:
-            elapsed = time.monotonic() - started_at
-            remaining = max(previous_timer[0] - max(elapsed, 0), 0)
-            signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
-
-
-def format_attachment_ai_response(response_text: str, *, supporting_ocr_text: str = "") -> str:
-    payload = parse_attachment_ai_json_response(response_text)
-    if not payload:
-        return "\n\n".join(
-            part
-            for part in (
-                response_text.strip(),
-                f"Deterministic OCR text:\n{supporting_ocr_text}".strip(),
-            )
-            if part and not part.endswith(":")
-        )
-    if not attachment_ai_response_is_useful(payload):
-        if not supporting_ocr_text.strip():
-            return ""
-        return "\n\n".join(
-            (
-                "AI attachment extraction",
-                f"Deterministic OCR text:\n{supporting_ocr_text}".strip(),
-            )
-        )
-
-    document_type = attachment_ai_response_field(payload, "document_type", "likely_document_type")
-    summary = attachment_ai_response_field(payload, "summary", "scene_summary")
-    document_context = attachment_ai_response_field(payload, "document_context")
-    visible_text_value = attachment_ai_response_indexable_text(payload.get("visible_text", ""), separator="\n")
-    entities = attachment_ai_response_indexable_text(payload.get("entities", ""), separator=", ")
-    search_keywords = attachment_ai_response_indexable_text(
-        attachment_ai_response_first(payload, "search_keywords", "useful_for_search"),
-        separator=", ",
-    )
-    uncertainties = attachment_ai_response_text(payload.get("uncertainties", ""), separator="\n")
-
-    return "\n\n".join(
-        part
-        for part in (
-            "AI attachment extraction",
-            f"Document type: {document_type}".strip(),
-            f"Summary: {summary}".strip(),
-            f"Document context: {document_context}".strip(),
-            f"Visible text:\n{visible_text_value}".strip(),
-            f"Entities: {entities}".strip(),
-            f"Search keywords: {search_keywords}".strip(),
-            f"Uncertainties:\n{uncertainties}".strip(),
-            f"Deterministic OCR text:\n{supporting_ocr_text}".strip(),
-        )
-        if part and not part.endswith(":")
-    )
-
-
-def parse_attachment_ai_json_response(response_text: str) -> dict[str, object] | None:
-    text = response_text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(payload, str) and payload.strip() != text:
-        return parse_attachment_ai_json_response(payload)
-    if isinstance(payload, dict):
-        return payload
-    return None
-
-
-def attachment_ai_response_is_useful(payload: Mapping[str, object]) -> bool:
-    if attachment_ai_response_is_generic_placeholder(payload):
-        return False
-    value = payload.get("is_useful")
-    if isinstance(value, bool):
-        return value or attachment_ai_response_has_indexable_content(payload)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"false", "no", "0"}:
-            return attachment_ai_response_has_indexable_content(payload)
-        if normalized in {"true", "yes", "1"}:
-            return True
-    return True
-
-
-def attachment_ai_response_is_generic_placeholder(payload: Mapping[str, object]) -> bool:
-    summary = attachment_ai_response_field(payload, "scene_summary", "summary")
-    visible_text = attachment_ai_response_text(payload.get("visible_text", ""))
-    likely_document_type = attachment_ai_response_field(payload, "document_type", "likely_document_type")
-    document_context = attachment_ai_response_field(payload, "document_context")
-    entities = attachment_ai_response_text(payload.get("entities", ""))
-    useful_for_search = attachment_ai_response_text(
-        attachment_ai_response_first(payload, "search_keywords", "useful_for_search")
-    )
-    combined = " ".join(
-        part
-        for part in (summary, visible_text, likely_document_type, document_context, entities, useful_for_search)
-        if part
-    ).lower()
-    if not combined:
-        return False
-    if not re.search(r"\b(placeholder|no discernible content|no useful content|generic gmail attachment)\b", combined):
-        return False
-
-    searchable = " ".join(part for part in (visible_text, entities, useful_for_search) if part).lower()
-    searchable_words = set(re.findall(r"[a-z0-9]+", searchable))
-    generic_words = {
-        "attachment",
-        "blank",
-        "content",
-        "decorative",
-        "generic",
-        "gmail",
-        "image",
-        "none",
-        "no",
-        "placeholder",
-        "unknown",
-    }
-    return searchable_words <= generic_words
-
-
-def attachment_ai_response_first(payload: Mapping[str, object], *names: str) -> object:
-    for name in names:
-        value = payload.get(name, "")
-        if attachment_ai_response_text(value):
-            return value
-    return ""
-
-
-def attachment_ai_response_field(payload: Mapping[str, object], *names: str) -> str:
-    for name in names:
-        text = attachment_ai_response_text(payload.get(name, ""))
-        if text:
-            return text
-    return ""
-
-
-def attachment_ai_response_text(value: object, *, separator: str = " ") -> str:
-    if isinstance(value, list):
-        return separator.join(str(item).strip() for item in value if str(item).strip())
-    return str(value).strip()
-
-
-def attachment_ai_response_indexable_text(value: object, *, separator: str = " ") -> str:
-    if isinstance(value, list):
-        return separator.join(
-            item
-            for item in (str(item).strip() for item in value)
-            if item and not attachment_ai_response_value_is_non_indexable(item)
-        )
-    text = str(value).strip()
-    if attachment_ai_response_value_is_non_indexable(text):
-        return ""
-    return text
-
-
-def attachment_ai_response_value_is_non_indexable(value: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
-    return normalized in {
-        "",
-        "n a",
-        "no readable text",
-        "no text",
-        "none",
-        "not applicable",
-        "unknown",
-    }
-
-
-def attachment_ai_response_has_indexable_content(payload: Mapping[str, object]) -> bool:
-    text = attachment_ai_response_indexable_text(payload.get("visible_text", ""))
-    return bool(re.search(r"[A-Za-z0-9]", text))
 
 
 def raw_attachment_text(
