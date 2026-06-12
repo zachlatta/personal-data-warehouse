@@ -701,6 +701,87 @@ def test_postgres_ensure_indexes_tolerates_missing_pg_textsearch(warehouse: Post
     assert "slack_messages_text_trgm_idx" in index_names
 
 
+def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_tables()
+    warehouse.ensure_calendar_tables()
+    warehouse.ensure_contacts_tables()
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    warehouse.ensure_apple_notes_tables()
+    warehouse.ensure_apple_messages_tables()
+    warehouse.ensure_slack_tables()
+    warehouse.ensure_upstream_mutation_tables()
+
+
+def test_searchable_text_view_spans_sources_and_pushes_predicates(warehouse: PostgresWarehouse) -> None:
+    _ensure_all_table_groups(warehouse)
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=message_datetime,
+                text="discussing the zanzibar rollout",
+            )
+        ]
+    )
+    warehouse.insert_messages([_message_row(message_id="m1", subject="zanzibar kickoff", labels=["INBOX"], sync_version=1)])
+
+    rows = warehouse._query(
+        "SELECT source, subsource FROM searchable_text WHERE text ~* '\\mzanzibar\\M' ORDER BY source, subsource"
+    )
+    assert ("gmail", "subject") in rows
+    # The slack branch requires the conversation row to exist (INNER JOIN), so
+    # the slack hit only appears for known conversations — insert one and retry.
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    rows = warehouse._query(
+        "SELECT source, subsource FROM searchable_text WHERE text ~* '\\mzanzibar\\M' ORDER BY source, subsource"
+    )
+    assert ("slack", "private_channel") in rows
+
+
+def test_person_identities_view_resolves_fuzzy_names(warehouse: PostgresWarehouse) -> None:
+    _ensure_all_table_groups(warehouse)
+    warehouse.insert_contact_cards(
+        [_contact_card_row(card_id="c1", display_name="Zach Latta", sync_version=1)]
+    )
+
+    rows = warehouse._query(
+        "SELECT source, name FROM person_identities "
+        "WHERE name OPERATOR(public.%>) 'zach lata' "
+        "ORDER BY public.word_similarity('zach lata', name) DESC LIMIT 1"
+    )
+    assert rows == [("contact", "Zach Latta")]
+
+
+def test_searchable_text_live_coverage_fails_on_unacknowledged_column(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_slack_tables()
+    warehouse._command("ALTER TABLE slack_messages ADD COLUMN rogue_note text NOT NULL DEFAULT ''")
+
+    with pytest.raises(RuntimeError, match=r"slack_messages\.rogue_note"):
+        warehouse.ensure_slack_tables()
+
+
+def test_searchable_text_static_coverage_fails_on_unregistered_schema_change(monkeypatch) -> None:
+    import personal_data_warehouse.postgres as postgres_module
+
+    # Simulate a schema change (new text column in code) that nobody acknowledged.
+    monkeypatch.delitem(postgres_module.SEARCHABLE_TEXT_COVERAGE["gmail_messages"], "subject")
+    with pytest.raises(RuntimeError, match=r"gmail_messages\.subject"):
+        postgres_module.validate_searchable_text_coverage()
+
+    monkeypatch.setitem(
+        postgres_module.SEARCHABLE_TEXT_COVERAGE,
+        "imaginary_table",
+        {"ghost_column": "left behind after a table delete"},
+    )
+    with pytest.raises(RuntimeError, match=r"imaginary_table"):
+        postgres_module.validate_searchable_text_coverage()
+
+
 def test_postgres_contacts_tables_use_jsonb_without_changing_existing_raw_json(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_contacts_tables()
     warehouse.ensure_slack_tables()

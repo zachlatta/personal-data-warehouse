@@ -535,6 +535,655 @@ POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
     ("slack_messages_text_trgm_live_idx", "slack_messages"),
 )
 
+# ---------------------------------------------------------------------------
+# searchable_text coverage registry
+#
+# Every text-bearing column (text, text[], jsonb) of every warehouse table must
+# appear here, either as "view:<source>/<subsource>" (included in the
+# searchable_text view) or as a human-readable reason it is deliberately not
+# searchable. Two enforcement points keep this honest as the schema evolves:
+#
+#   1. validate_searchable_text_coverage() runs at module import and diffs this
+#      registry against POSTGRES_TABLES + _RAW_DDL_TEXT_COLUMNS. Adding or
+#      removing a table or text column in code without updating this registry
+#      (and the searchable_text view when relevant) fails everything at startup.
+#   2. PostgresWarehouse._assert_searchable_text_coverage() runs on every
+#      ensure_* call and diffs the registry against the LIVE database catalog,
+#      catching drift introduced by raw DDL, ad-hoc ALTERs, or legacy tables.
+#
+# If you are here because one of those checks failed: decide whether the new
+# column/table belongs in the searchable_text view. If yes, add a branch to
+# _ensure_search_views_if_possible AND a "view:..." entry here. If no, add an
+# exclusion entry with a real reason. Do not silence the check any other way.
+_C_ID = "identifier or foreign key"
+_C_ENUM = "status/enum/type marker"
+_C_OPS = "sync/operational state"
+_C_ERR = "operational error text"
+_C_RAW = "raw upstream payload mirror"
+_C_STORE = "content hash or object-storage pointer"
+_C_META = "non-content metadata (some surfaced as view context/who columns)"
+_C_DUP = "alternate representation of an included column"
+_C_IDENTITY = "identity field; covered by the person_identities view"
+_C_FILEMETA = "attachment metadata; binary content not text-searchable"
+
+SEARCHABLE_TEXT_COVERAGE: dict[str, dict[str, str]] = {
+    "agent_run_events": {
+        "run_id": _C_ID,
+        "stream": _C_META,
+        "event_type": _C_META,
+        "event_json": _C_RAW,
+        "text": "view:agent/event",
+    },
+    "agent_run_tool_calls": {
+        "run_id": _C_ID,
+        "tool_name": _C_META,
+        "arguments_json": _C_RAW,
+        "result_json": _C_RAW,
+        "error": _C_ERR,
+    },
+    "agent_runs": {
+        "run_id": _C_ID,
+        "provider": _C_META,
+        "model": _C_META,
+        "task_type": _C_META,
+        "subject_id": _C_ID,
+        "prompt_version": _C_META,
+        "status": _C_ENUM,
+        "input_sha256": _C_STORE,
+        "final_output_json": "agent output; streamed text covered via agent_run_events.text",
+        "error": _C_ERR,
+    },
+    "apple_message_attachments": {
+        "account": _C_ID,
+        "attachment_id": _C_ID,
+        "message_id": _C_ID,
+        "guid": _C_ID,
+        "original_guid": _C_ID,
+        "filename": _C_FILEMETA,
+        "transfer_name": _C_FILEMETA,
+        "content_type": _C_ENUM,
+        "uti": _C_ENUM,
+        "mime_type": _C_ENUM,
+        "content_sha256": _C_STORE,
+        "error": _C_ERR,
+        "storage_backend": _C_STORE,
+        "storage_key": _C_STORE,
+        "storage_file_id": _C_STORE,
+        "storage_url": _C_STORE,
+        "raw_metadata_json": _C_RAW,
+    },
+    "apple_message_chat_handles": {
+        "account": _C_ID,
+        "chat_id": _C_ID,
+        "handle_id": _C_ID,
+        "raw_metadata_json": _C_RAW,
+    },
+    "apple_message_chat_messages": {
+        "account": _C_ID,
+        "chat_id": _C_ID,
+        "message_id": _C_ID,
+        "raw_metadata_json": _C_RAW,
+    },
+    "apple_message_chats": {
+        "account": _C_ID,
+        "chat_id": _C_ID,
+        "guid": _C_ID,
+        "chat_identifier": _C_ID,
+        "service_name": _C_ENUM,
+        "display_name": "chat name; message group_title is surfaced as imessage view context",
+        "room_name": _C_META,
+        "account_login": _C_ID,
+        "raw_metadata_json": _C_RAW,
+    },
+    "apple_message_handles": {
+        "account": _C_ID,
+        "handle_id": _C_ID,
+        "address": _C_IDENTITY,
+        "country": _C_ENUM,
+        "service": _C_ENUM,
+        "uncanonicalized_id": _C_IDENTITY,
+        "person_centric_id": _C_ID,
+        "raw_metadata_json": _C_RAW,
+    },
+    "apple_messages": {
+        "account": _C_ID,
+        "message_id": _C_ID,
+        "handle_id": _C_ID,
+        "service": _C_ENUM,
+        "message_account": _C_ID,
+        "body_text": "view:imessage/body",
+        "body_source": _C_ENUM,
+        "body_decode_status": _C_ENUM,
+        "body_decode_error": _C_ERR,
+        "attributed_body_sha256": _C_STORE,
+        "subject": "rarely-populated iMessage subject; body_text branch covers content",
+        "country": _C_ENUM,
+        "reply_to_guid": _C_ID,
+        "associated_message_guid": _C_ID,
+        "associated_message_emoji": _C_META,
+        "balloon_bundle_id": _C_META,
+        "group_title": _C_META,
+        "expressive_send_style_id": _C_META,
+        "raw_metadata_json": _C_RAW,
+    },
+    "apple_note_attachments": {
+        "account": _C_ID,
+        "note_id": _C_ID,
+        "revision_id": _C_ID,
+        "attachment_id": _C_ID,
+        "filename": _C_FILEMETA,
+        "content_type": _C_ENUM,
+        "content_sha256": _C_STORE,
+        "error": _C_ERR,
+        "storage_backend": _C_STORE,
+        "storage_key": _C_STORE,
+        "storage_file_id": _C_STORE,
+        "storage_url": _C_STORE,
+        "raw_metadata_json": _C_RAW,
+    },
+    "apple_note_revisions": {
+        "account": _C_ID,
+        "note_id": _C_ID,
+        "revision_id": _C_ID,
+        "title": "historic title surfaced as view who; current title included via apple_notes.title",
+        "folder_id": _C_ID,
+        "folder_path": _C_META,
+        "apple_account_id": _C_ID,
+        "apple_account_name": _C_META,
+        "body_text": "view:note/revision",
+        "body_html": _C_DUP,
+        "body_markdown": _C_DUP,
+        "content_sha256": _C_STORE,
+        "attachments_json": _C_RAW,
+        "storage_backend": _C_STORE,
+        "metadata_storage_key": _C_STORE,
+        "metadata_storage_file_id": _C_STORE,
+        "metadata_storage_url": _C_STORE,
+        "metadata_content_sha256": _C_STORE,
+        "html_storage_key": _C_STORE,
+        "html_storage_file_id": _C_STORE,
+        "html_storage_url": _C_STORE,
+        "html_content_sha256": _C_STORE,
+        "raw_metadata_json": _C_RAW,
+    },
+    "apple_notes": {
+        "account": _C_ID,
+        "note_id": _C_ID,
+        "latest_revision_id": _C_ID,
+        "title": "view:note/title",
+        "folder_id": _C_ID,
+        "folder_path": _C_META,
+        "apple_account_id": _C_ID,
+        "apple_account_name": _C_META,
+        "body_text": "view:note/body",
+        "body_html": _C_DUP,
+        "body_markdown": _C_DUP,
+        "content_sha256": _C_STORE,
+        "attachments_json": _C_RAW,
+        "storage_backend": _C_STORE,
+        "metadata_storage_key": _C_STORE,
+        "metadata_storage_file_id": _C_STORE,
+        "metadata_storage_url": _C_STORE,
+        "metadata_content_sha256": _C_STORE,
+        "html_storage_key": _C_STORE,
+        "html_storage_file_id": _C_STORE,
+        "html_storage_url": _C_STORE,
+        "html_content_sha256": _C_STORE,
+        "raw_metadata_json": _C_RAW,
+    },
+    "apple_voice_memos_enrichments": {
+        "account": _C_ID,
+        "recording_id": _C_ID,
+        "content_sha256": _C_STORE,
+        "provider": _C_META,
+        "model": _C_META,
+        "prompt_version": _C_META,
+        "status": _C_ENUM,
+        "error": _C_ERR,
+        "calendar_event_id": _C_ID,
+        "title": "view:transcript/title",
+        "participants_json": "view:transcript/participants",
+        "transcript": "view:transcript/transcript",
+        "summary": "view:transcript/summary",
+        "action_items_json": "view:transcript/action_items",
+        "evidence_json": _C_RAW,
+        "raw_result_json": _C_RAW,
+    },
+    "apple_voice_memos_files": {
+        "account": _C_ID,
+        "recording_id": _C_ID,
+        "title": "raw recording title; enriched meeting title included via apple_voice_memos_enrichments.title",
+        "original_path": _C_FILEMETA,
+        "filename": _C_FILEMETA,
+        "extension": _C_FILEMETA,
+        "content_type": _C_ENUM,
+        "content_sha256": _C_STORE,
+        "storage_backend": _C_STORE,
+        "storage_key": _C_STORE,
+        "storage_file_id": _C_STORE,
+        "storage_url": _C_STORE,
+        "metadata_storage_key": _C_STORE,
+        "metadata_storage_file_id": _C_STORE,
+        "metadata_storage_url": _C_STORE,
+        "metadata_content_sha256": _C_STORE,
+        "raw_metadata_json": _C_RAW,
+    },
+    "apple_voice_memos_transcript_segments": {
+        "account": _C_ID,
+        "recording_id": _C_ID,
+        "provider": _C_ID,
+        "provider_transcript_id": _C_ID,
+        "speaker_label": _C_META,
+        "text": "per-segment drill-down; full transcript included via apple_voice_memos_enrichments.transcript",
+        "words_json": _C_RAW,
+    },
+    "apple_voice_memos_transcription_runs": {
+        "account": _C_ID,
+        "recording_id": _C_ID,
+        "content_sha256": _C_STORE,
+        "provider": _C_META,
+        "provider_transcript_id": _C_ID,
+        "model": _C_META,
+        "status": _C_ENUM,
+        "error": _C_ERR,
+        "transcript_text": _C_DUP,
+        "raw_result_json": _C_RAW,
+    },
+    "calendar_events": {
+        "account": _C_ID,
+        "calendar_id": _C_ID,
+        "event_id": _C_ID,
+        "recurring_event_id": _C_ID,
+        "i_cal_uid": _C_ID,
+        "status": _C_ENUM,
+        "summary": "view:calendar/summary",
+        "description": "view:calendar/description",
+        "location": "view:calendar/location",
+        "creator_email": _C_IDENTITY,
+        "organizer_email": _C_IDENTITY,
+        "start_date": _C_META,
+        "end_date": _C_META,
+        "html_link": _C_META,
+        "attendees_json": "view:calendar/attendees",
+        "reminders_json": _C_RAW,
+        "recurrence": _C_META,
+        "event_type": _C_ENUM,
+        "raw_json": _C_RAW,
+    },
+    "calendar_sync_state": {
+        "account": _C_ID,
+        "calendar_id": _C_ID,
+        "sync_token": _C_OPS,
+        "last_sync_type": _C_ENUM,
+        "status": _C_ENUM,
+        "error": _C_ERR,
+    },
+    "contact_cards": {
+        "source": _C_ID,
+        "account": _C_ID,
+        "source_kind": _C_ID,
+        "address_book_id": _C_ID,
+        "card_id": _C_ID,
+        "etag": _C_ID,
+        "source_uid": _C_ID,
+        "display_name": "view:contact/name",
+        "given_name": _C_DUP,
+        "family_name": _C_DUP,
+        "organization": "view:contact/organization",
+        "job_title": "view:contact/job_title",
+        "primary_email": _C_IDENTITY,
+        "primary_phone": _C_IDENTITY,
+        "emails": _C_IDENTITY,
+        "phones": _C_IDENTITY,
+        "addresses": _C_IDENTITY,
+        "organizations": _C_RAW,
+        "urls": _C_META,
+        "groups": _C_META,
+        "dates": _C_META,
+        "photos": _C_META,
+        "notes": "view:contact/notes",
+        "raw_json": _C_RAW,
+    },
+    "contact_sync_state": {
+        "source": _C_ID,
+        "account": _C_ID,
+        "source_kind": _C_ID,
+        "address_book_id": _C_ID,
+        "sync_token": _C_OPS,
+        "last_sync_type": _C_ENUM,
+        "status": _C_ENUM,
+        "error": _C_ERR,
+    },
+    "gmail_attachment_backfill_state": {
+        "account": _C_ID,
+        "message_id": _C_ID,
+        "status": _C_ENUM,
+        "error": _C_ERR,
+        "ai_provider": _C_META,
+        "ai_model": _C_META,
+        "ai_prompt_version": _C_META,
+    },
+    "gmail_attachment_enrichments": {
+        "content_sha256": _C_STORE,
+        "ai_provider": _C_META,
+        "ai_model": _C_META,
+        "ai_prompt_version": _C_META,
+        "text": "view:gmail_attachment/content",
+        "text_extraction_status": _C_ENUM,
+        "text_extraction_error": _C_ERR,
+        "ai_base_url": _C_META,
+        "ai_prompt_sha256": _C_STORE,
+        "ai_prompt": "enrichment prompt, not user content",
+        "ai_source_status": _C_ENUM,
+    },
+    "gmail_attachments": {
+        "account": _C_ID,
+        "message_id": _C_ID,
+        "thread_id": _C_ID,
+        "part_id": _C_ID,
+        "attachment_id": _C_ID,
+        "filename": "view:gmail_attachment/filename",
+        "mime_type": _C_ENUM,
+        "content_id": _C_ID,
+        "content_disposition": _C_META,
+        "content_sha256": _C_STORE,
+        "part_json": _C_RAW,
+        "storage_backend": _C_STORE,
+        "storage_key": _C_STORE,
+        "storage_file_id": _C_STORE,
+        "storage_url": _C_STORE,
+        "storage_status": _C_ENUM,
+    },
+    "gmail_messages": {
+        "account": _C_ID,
+        "message_id": _C_ID,
+        "thread_id": _C_ID,
+        "label_ids": _C_META,
+        "snippet": _C_DUP,
+        "subject": "view:gmail/subject",
+        "from_address": _C_IDENTITY,
+        "to_addresses": _C_IDENTITY,
+        "cc_addresses": _C_IDENTITY,
+        "bcc_addresses": _C_IDENTITY,
+        "delivered_to": _C_IDENTITY,
+        "rfc822_message_id": _C_ID,
+        "date_header": _C_META,
+        "body_text": "view:gmail/body",
+        "body_html": _C_DUP,
+        "body_markdown": _C_DUP,
+        "body_markdown_full": _C_DUP,
+        "body_markdown_clean": _C_DUP,
+        "payload_json": _C_RAW,
+    },
+    "gmail_sync_state": {
+        "account": _C_ID,
+        "last_sync_type": _C_ENUM,
+        "status": _C_ENUM,
+        "error": _C_ERR,
+    },
+    "slack_account_identities": {
+        "account": _C_ID,
+        "team_id": _C_ID,
+        "user_id": _C_ID,
+        "team_name": _C_META,
+        "url": _C_META,
+        "raw_json": _C_RAW,
+    },
+    "slack_account_state_item_rows": {
+        "source": _C_ID,
+        "account": _C_ID,
+        "scope_id": _C_ID,
+        "item_id": _C_ID,
+        "item_type": _C_ENUM,
+        "item_state": _C_ENUM,
+        "container_id": _C_ID,
+        "container_name": _C_META,
+        "thread_id": _C_ID,
+        "message_id": _C_ID,
+        "actor_id": _C_ID,
+        "actor_name": _C_META,
+        "title": "derived inbox state; underlying messages are included",
+        "preview": "derived inbox state; underlying messages are included",
+        "reason": "derived inbox state; underlying messages are included",
+        "source_table": _C_META,
+        "drilldown_hint": _C_META,
+    },
+    "slack_conversation_members": {
+        "account": _C_ID,
+        "team_id": _C_ID,
+        "conversation_id": _C_ID,
+        "user_id": _C_ID,
+    },
+    "slack_conversation_stats": {
+        "account": _C_ID,
+        "team_id": _C_ID,
+        "conversation_id": _C_ID,
+    },
+    "slack_conversations": {
+        "account": _C_ID,
+        "team_id": _C_ID,
+        "conversation_id": _C_ID,
+        "conversation_type": _C_ENUM,
+        "name": "view:slack_channel/name",
+        "creator": _C_ID,
+        "topic": "view:slack_channel/topic",
+        "purpose": "view:slack_channel/purpose",
+        "raw_json": _C_RAW,
+    },
+    "slack_files": {
+        "account": _C_ID,
+        "team_id": _C_ID,
+        "file_id": _C_ID,
+        "conversation_id": _C_ID,
+        "message_ts": _C_ID,
+        "user_id": _C_ID,
+        "name": "view:slack_file/name",
+        "title": "view:slack_file/title",
+        "mimetype": _C_ENUM,
+        "filetype": _C_ENUM,
+        "url_private": _C_META,
+        "raw_json": _C_RAW,
+    },
+    "slack_message_reactions": {
+        "account": _C_ID,
+        "team_id": _C_ID,
+        "conversation_id": _C_ID,
+        "message_ts": _C_ID,
+        "reaction_name": _C_META,
+        "user_id": _C_ID,
+        "raw_json": _C_RAW,
+    },
+    "slack_messages": {
+        "account": _C_ID,
+        "team_id": _C_ID,
+        "conversation_id": _C_ID,
+        "message_ts": _C_ID,
+        "thread_ts": _C_ID,
+        "parent_message_ts": _C_ID,
+        "user_id": _C_ID,
+        "bot_id": _C_ID,
+        "username": _C_DUP,
+        "type": _C_ENUM,
+        "subtype": _C_ENUM,
+        "text": "view:slack/message",
+        "blocks_json": _C_RAW,
+        "attachments_json": _C_RAW,
+        "latest_reply_ts": _C_ID,
+        "edited_ts": _C_ID,
+        "client_msg_id": _C_ID,
+        "raw_json": _C_RAW,
+    },
+    "slack_sync_state": {
+        "account": _C_ID,
+        "team_id": _C_ID,
+        "object_type": _C_ENUM,
+        "object_id": _C_ID,
+        "cursor_ts": _C_OPS,
+        "last_sync_type": _C_ENUM,
+        "status": _C_ENUM,
+        "error": _C_ERR,
+    },
+    "slack_teams": {
+        "account": _C_ID,
+        "team_id": _C_ID,
+        "team_name": _C_META,
+        "domain": _C_META,
+        "enterprise_id": _C_ID,
+        "raw_json": _C_RAW,
+    },
+    "slack_users": {
+        "account": _C_ID,
+        "team_id": _C_ID,
+        "user_id": _C_ID,
+        "team_user_id": _C_ID,
+        "name": _C_IDENTITY,
+        "real_name": _C_IDENTITY,
+        "display_name": _C_IDENTITY,
+        "email": _C_IDENTITY,
+        "tz": _C_META,
+        "raw_json": _C_RAW,
+    },
+    "upstream_mutation_events": {
+        "mutation_id": _C_ID,
+        "event_type": _C_ENUM,
+        "actor_type": _C_ENUM,
+        "actor_id": _C_ID,
+        "event_json": _C_RAW,
+    },
+    "upstream_mutation_request_events": {
+        "request_id": _C_ID,
+        "event_type": _C_ENUM,
+        "actor_type": _C_ENUM,
+        "actor_id": _C_ID,
+        "event_json": _C_RAW,
+    },
+    "upstream_mutation_requests": {
+        "id": _C_ID,
+        "status": _C_ENUM,
+        "title": "view:mutation_request/title",
+        "reason": "view:mutation_request/reason",
+        "context_json": _C_RAW,
+        "result_json": _C_RAW,
+        "error": _C_ERR,
+        "idempotency_key": _C_ID,
+        "requested_by": _C_META,
+        "approved_by": _C_META,
+    },
+    "upstream_mutations": {
+        "id": _C_ID,
+        "request_id": _C_ID,
+        "provider": _C_META,
+        "operation": _C_META,
+        "account": _C_ID,
+        "status": _C_ENUM,
+        "title": "view:mutation/title",
+        "reason": "review rationale; title and payload branches cover search needs",
+        "payload_json": "view:mutation/payload",
+        "preview_json": _C_RAW,
+        "result_json": _C_RAW,
+        "error": _C_ERR,
+        "idempotency_key": _C_ID,
+        "requested_by": _C_META,
+        "approved_by": _C_META,
+        "claimed_by": _C_META,
+    },
+}
+
+# Text-bearing columns of tables created via raw DDL in
+# ensure_upstream_mutation_tables (not represented in POSTGRES_TABLES). The
+# live-catalog check still covers them; this static list lets the import-time
+# check cover them too.
+_RAW_DDL_TEXT_COLUMNS: dict[str, frozenset[str]] = {
+    "upstream_mutation_requests": frozenset(
+        {
+            "id",
+            "status",
+            "title",
+            "reason",
+            "context_json",
+            "result_json",
+            "error",
+            "idempotency_key",
+            "requested_by",
+            "approved_by",
+        }
+    ),
+    "upstream_mutations": frozenset(
+        {
+            "id",
+            "request_id",
+            "provider",
+            "operation",
+            "account",
+            "status",
+            "title",
+            "reason",
+            "payload_json",
+            "preview_json",
+            "result_json",
+            "error",
+            "idempotency_key",
+            "requested_by",
+            "approved_by",
+            "claimed_by",
+        }
+    ),
+    "upstream_mutation_events": frozenset(
+        {"mutation_id", "event_type", "actor_type", "actor_id", "event_json"}
+    ),
+    "upstream_mutation_request_events": frozenset(
+        {"request_id", "event_type", "actor_type", "actor_id", "event_json"}
+    ),
+}
+
+_SEARCHABLE_TYPE_NAMES = ("text", "text[]", "jsonb")
+
+
+def _coverage_problems_for(table: str, text_columns: set[str]) -> list[str]:
+    registered = SEARCHABLE_TEXT_COVERAGE.get(table)
+    if registered is None:
+        return [
+            f"table {table!r} has text columns {sorted(text_columns)} but no SEARCHABLE_TEXT_COVERAGE entry"
+        ]
+    problems = [
+        f"new text column {table}.{column} is not acknowledged in SEARCHABLE_TEXT_COVERAGE"
+        for column in sorted(text_columns - registered.keys())
+    ]
+    problems.extend(
+        f"SEARCHABLE_TEXT_COVERAGE lists {table}.{column}, which no longer exists"
+        for column in sorted(registered.keys() - text_columns)
+    )
+    return problems
+
+
+def validate_searchable_text_coverage() -> None:
+    """Fail loudly at import time if the schema in code and the coverage registry diverge."""
+    problems: list[str] = []
+    expected_tables: dict[str, set[str]] = {
+        table: {
+            column
+            for column in spec.columns
+            if _postgres_type(column, table=table) in _SEARCHABLE_TYPE_NAMES
+        }
+        for table, spec in POSTGRES_TABLES.items()
+    }
+    for table, columns in _RAW_DDL_TEXT_COLUMNS.items():
+        expected_tables[table] = set(columns)
+    for table, text_columns in sorted(expected_tables.items()):
+        problems.extend(_coverage_problems_for(table, text_columns))
+    for table in sorted(SEARCHABLE_TEXT_COVERAGE.keys() - expected_tables.keys()):
+        problems.append(
+            f"SEARCHABLE_TEXT_COVERAGE lists table {table!r}, which is not defined in "
+            "POSTGRES_TABLES or _RAW_DDL_TEXT_COLUMNS (was it deleted?)"
+        )
+    if problems:
+        raise RuntimeError(
+            "searchable_text coverage registry is out of date with the warehouse schema.\n"
+            "Every text-bearing column must be either included in the searchable_text view "
+            "or explicitly excluded with a reason (see SEARCHABLE_TEXT_COVERAGE in postgres.py).\n- "
+            + "\n- ".join(problems)
+        )
+
 
 POSTGRES_INSERT_PAGE_SIZES = {
     "apple_notes": 50,
@@ -727,14 +1376,17 @@ class PostgresWarehouse:
                 f"ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS {_identifier(column)} text NOT NULL DEFAULT ''"
             )
         self._ensure_clean_gmail_inbox_view()
+        self._ensure_search_views_if_possible()
 
     def ensure_calendar_tables(self) -> None:
         self._ensure_table_group(["calendar_events", "calendar_sync_state"])
         self._ensure_clean_calendar_transcript_views_if_possible()
+        self._ensure_search_views_if_possible()
 
     def ensure_contacts_tables(self) -> None:
         self._ensure_table_group(["contact_cards", "contact_sync_state"])
         self._ensure_clean_contacts_view()
+        self._ensure_search_views_if_possible()
 
     def ensure_apple_voice_memos_tables(self, *, backfill_content_hashes: bool = True) -> None:
         self._ensure_table_group(
@@ -752,12 +1404,14 @@ class PostgresWarehouse:
             self._backfill_voice_memo_transcription_run_content_hashes()
             self._backfill_voice_memo_enrichment_content_hashes()
         self._ensure_clean_calendar_transcript_views_if_possible()
+        self._ensure_search_views_if_possible()
 
     def ensure_voice_memos_tables(self) -> None:
         self.ensure_apple_voice_memos_tables()
 
     def ensure_apple_notes_tables(self) -> None:
         self._ensure_table_group(["apple_notes", "apple_note_revisions", "apple_note_attachments"])
+        self._ensure_search_views_if_possible()
 
     def ensure_apple_messages_tables(self) -> None:
         self._ensure_table_group(
@@ -770,12 +1424,14 @@ class PostgresWarehouse:
                 "apple_message_attachments",
             ]
         )
+        self._ensure_search_views_if_possible()
 
     def ensure_voice_memo_transcription_tables(self) -> None:
         self.ensure_apple_voice_memos_tables()
 
     def ensure_agent_tables(self) -> None:
         self._ensure_table_group(["agent_runs", "agent_run_events", "agent_run_tool_calls"])
+        self._ensure_search_views_if_possible()
 
     def ensure_slack_tables(self) -> None:
         self._ensure_table_group(
@@ -795,6 +1451,7 @@ class PostgresWarehouse:
         )
         self._ensure_slack_conversation_stats_backfilled()
         self._ensure_clean_slack_inbox_view()
+        self._ensure_search_views_if_possible()
 
     def drop_personal_finance_schema(self) -> None:
         for view in REMOVED_PERSONAL_FINANCE_VIEWS:
@@ -896,6 +1553,7 @@ class PostgresWarehouse:
             "CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON upstream_mutation_events (mutation_id, event_index)",
         ):
             self._command(sql)
+        self._ensure_search_views_if_possible()
 
     def gmail_archive_thread_previews(self, *, account: str, thread_ids: Sequence[str]) -> list[dict[str, Any]]:
         normalized_thread_ids = _normalize_thread_ids(thread_ids)
@@ -4220,6 +4878,233 @@ class PostgresWarehouse:
             """
         )
 
+    # Tables the cross-source search views read. The views are only (re)created
+    # once every referenced table exists, so partial test schemas and staged
+    # rollouts of new source groups degrade to "view not there yet".
+    _SEARCHABLE_TEXT_TABLES = (
+        "gmail_messages",
+        "gmail_attachments",
+        "gmail_attachment_enrichments",
+        "slack_messages",
+        "slack_conversations",
+        "slack_users",
+        "slack_files",
+        "apple_notes",
+        "apple_note_revisions",
+        "apple_messages",
+        "apple_message_handles",
+        "apple_voice_memos_enrichments",
+        "calendar_events",
+        "contact_cards",
+        "agent_run_events",
+        "upstream_mutations",
+        "upstream_mutation_requests",
+    )
+    _PERSON_IDENTITIES_TABLES = ("contact_cards", "slack_users", "apple_message_handles")
+
+    def _assert_searchable_text_coverage_live(self) -> None:
+        """Diff SEARCHABLE_TEXT_COVERAGE against the live catalog; fail loudly on drift.
+
+        Complements the import-time validate_searchable_text_coverage(): this
+        side catches schema changes that never went through POSTGRES_TABLES or
+        _RAW_DDL_TEXT_COLUMNS (ad-hoc ALTERs, raw DDL, legacy tables). Tables
+        that do not exist yet are skipped so partial test schemas and staged
+        rollouts still work; their code-side definitions are already enforced
+        at import time.
+        """
+        rows = self._query(
+            """
+            SELECT c.relname, a.attname
+            FROM pg_class AS c
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            INNER JOIN pg_attribute AS a ON a.attrelid = c.oid
+            INNER JOIN pg_type AS t ON t.oid = a.atttypid
+            WHERE n.nspname = current_schema()
+              AND c.relkind = 'r'
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND t.typname IN ('text', '_text', 'jsonb')
+            """
+        )
+        live: dict[str, set[str]] = {}
+        for table, column in rows:
+            live.setdefault(table, set()).add(column)
+        problems: list[str] = []
+        for table, text_columns in sorted(live.items()):
+            problems.extend(_coverage_problems_for(table, text_columns))
+        if problems:
+            raise RuntimeError(
+                "searchable_text coverage registry is out of date with the LIVE database schema.\n"
+                "Every text-bearing column must be either included in the searchable_text view "
+                "or explicitly excluded with a reason (see SEARCHABLE_TEXT_COVERAGE in postgres.py).\n- "
+                + "\n- ".join(problems)
+            )
+
+    def _ensure_search_views_if_possible(self) -> None:
+        self._assert_searchable_text_coverage_live()
+        if all(self._relation_exists(table) for table in self._PERSON_IDENTITIES_TABLES):
+            self._command(
+                """
+                CREATE OR REPLACE VIEW person_identities AS
+                SELECT 'contact'::text AS source, display_name AS name, primary_email AS email,
+                       primary_phone AS phone, ''::text AS slack_user_id, account, card_id AS ref
+                FROM contact_cards WHERE is_deleted = 0
+                UNION ALL
+                SELECT 'slack', COALESCE(NULLIF(real_name, ''), name), email, '', user_id, account, user_id
+                FROM slack_users WHERE is_deleted = 0 AND is_bot = 0
+                UNION ALL
+                SELECT 'imessage_handle', '',
+                       CASE WHEN address LIKE '%@%' THEN address ELSE '' END,
+                       CASE WHEN address LIKE '%@%' THEN '' ELSE address END,
+                       '', account, handle_id
+                FROM apple_message_handles
+                """
+            )
+        if all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
+            # One row per (source table, text column) acknowledged as "view:" in
+            # SEARCHABLE_TEXT_COVERAGE. Each branch exposes its text as a bare
+            # column reference so search predicates push down through the
+            # UNION ALL and use that table's trgm index where one exists.
+            # Ranked BM25 search stays per-table (pg_textsearch cannot serve
+            # <@> through a view).
+            self._command(
+                """
+                CREATE OR REPLACE VIEW searchable_text AS
+                SELECT 'gmail'::text AS source, 'subject'::text AS subsource, ''::text AS context,
+                       from_address AS who, internal_date AS occurred_at, account,
+                       account || ':' || message_id AS ref, subject AS text
+                FROM gmail_messages WHERE is_deleted = 0
+                UNION ALL
+                SELECT 'gmail', 'body', '', from_address, internal_date, account,
+                       account || ':' || message_id, body_text
+                FROM gmail_messages WHERE is_deleted = 0
+                UNION ALL
+                SELECT 'gmail_attachment', 'content', a.filename, '', a.internal_date, a.account,
+                       a.account || ':' || a.message_id || ':' || a.content_sha256, e.text
+                FROM gmail_attachment_enrichments e
+                JOIN gmail_attachments a USING (content_sha256)
+                WHERE a.is_deleted = 0
+                UNION ALL
+                SELECT 'gmail_attachment', 'filename', mime_type, '', internal_date, account,
+                       account || ':' || message_id || ':' || content_sha256, filename
+                FROM gmail_attachments WHERE is_deleted = 0
+                UNION ALL
+                SELECT 'slack', c.conversation_type, c.name,
+                       COALESCE(NULLIF(u.real_name, ''), NULLIF(u.name, ''), m.user_id),
+                       m.message_datetime, m.account,
+                       m.team_id || ':' || m.conversation_id || ':' || m.message_ts, m.text
+                FROM slack_messages m
+                JOIN slack_conversations c
+                  ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id
+                LEFT JOIN slack_users u
+                  ON u.account = m.account AND u.team_id = m.team_id AND u.user_id = m.user_id
+                WHERE m.is_deleted = 0
+                UNION ALL
+                SELECT 'slack_channel', 'name', conversation_type, '', synced_at, account,
+                       team_id || ':' || conversation_id, name
+                FROM slack_conversations
+                UNION ALL
+                SELECT 'slack_channel', 'topic', name, '', synced_at, account,
+                       team_id || ':' || conversation_id, topic
+                FROM slack_conversations WHERE topic != ''
+                UNION ALL
+                SELECT 'slack_channel', 'purpose', name, '', synced_at, account,
+                       team_id || ':' || conversation_id, purpose
+                FROM slack_conversations WHERE purpose != ''
+                UNION ALL
+                SELECT 'slack_file', 'name', mimetype, user_id, created_at, account,
+                       team_id || ':' || file_id, name
+                FROM slack_files WHERE is_deleted = 0
+                UNION ALL
+                SELECT 'slack_file', 'title', mimetype, user_id, created_at, account,
+                       team_id || ':' || file_id, title
+                FROM slack_files WHERE is_deleted = 0 AND title != ''
+                UNION ALL
+                SELECT 'transcript', 'transcript', title, '', start_at, account, recording_id, transcript
+                FROM apple_voice_memos_enrichments
+                UNION ALL
+                SELECT 'transcript', 'title', '', '', start_at, account, recording_id, title
+                FROM apple_voice_memos_enrichments WHERE title != ''
+                UNION ALL
+                SELECT 'transcript', 'summary', title, '', start_at, account, recording_id, summary
+                FROM apple_voice_memos_enrichments WHERE summary != ''
+                UNION ALL
+                SELECT 'transcript', 'participants', title, '', start_at, account, recording_id, participants_json
+                FROM apple_voice_memos_enrichments WHERE participants_json NOT IN ('', '[]')
+                UNION ALL
+                SELECT 'transcript', 'action_items', title, '', start_at, account, recording_id, action_items_json
+                FROM apple_voice_memos_enrichments WHERE action_items_json NOT IN ('', '[]')
+                UNION ALL
+                SELECT 'note', 'title', folder_path, title, modified_at, account, note_id, title
+                FROM apple_notes WHERE is_deleted = 0
+                UNION ALL
+                SELECT 'note', 'body', folder_path, title, modified_at, account, note_id, body_text
+                FROM apple_notes WHERE is_deleted = 0
+                UNION ALL
+                SELECT 'note', 'revision', folder_path, title, modified_at, account,
+                       note_id || '@' || revision_id, body_text
+                FROM apple_note_revisions
+                UNION ALL
+                SELECT 'imessage', m.service, m.group_title,
+                       CASE WHEN m.is_from_me = 1 THEN 'me' ELSE COALESCE(h.address, '') END,
+                       m.message_at, m.account, m.message_id, m.body_text
+                FROM apple_messages m
+                LEFT JOIN apple_message_handles h
+                  ON h.account = m.account AND h.handle_id = m.handle_id
+                WHERE m.is_deleted = 0
+                UNION ALL
+                SELECT 'calendar', 'summary', '', organizer_email, start_at, account,
+                       calendar_id || ':' || event_id, summary
+                FROM calendar_events WHERE is_deleted = 0
+                UNION ALL
+                SELECT 'calendar', 'description', summary, organizer_email, start_at, account,
+                       calendar_id || ':' || event_id, description
+                FROM calendar_events WHERE is_deleted = 0 AND description != ''
+                UNION ALL
+                SELECT 'calendar', 'location', summary, organizer_email, start_at, account,
+                       calendar_id || ':' || event_id, location
+                FROM calendar_events WHERE is_deleted = 0 AND location != ''
+                UNION ALL
+                SELECT 'calendar', 'attendees', summary, organizer_email, start_at, account,
+                       calendar_id || ':' || event_id, attendees_json
+                FROM calendar_events WHERE is_deleted = 0 AND attendees_json NOT IN ('', '[]')
+                UNION ALL
+                SELECT 'contact', 'name', source_kind, primary_email, source_updated_at, account,
+                       card_id, display_name
+                FROM contact_cards WHERE is_deleted = 0
+                UNION ALL
+                SELECT 'contact', 'organization', display_name, primary_email, source_updated_at, account,
+                       card_id, organization
+                FROM contact_cards WHERE is_deleted = 0 AND organization != ''
+                UNION ALL
+                SELECT 'contact', 'job_title', display_name, primary_email, source_updated_at, account,
+                       card_id, job_title
+                FROM contact_cards WHERE is_deleted = 0 AND job_title != ''
+                UNION ALL
+                SELECT 'contact', 'notes', display_name, primary_email, source_updated_at, account,
+                       card_id, notes
+                FROM contact_cards WHERE is_deleted = 0 AND notes != ''
+                UNION ALL
+                SELECT 'agent', event_type, stream, run_id, created_at, '',
+                       run_id || ':' || event_index::text, text
+                FROM agent_run_events
+                UNION ALL
+                SELECT 'mutation', status, operation, requested_by, created_at, account, id, title
+                FROM upstream_mutations
+                UNION ALL
+                SELECT 'mutation', status, operation, requested_by, created_at, account,
+                       id || ':payload', payload_json::text
+                FROM upstream_mutations
+                UNION ALL
+                SELECT 'mutation_request', status, '', requested_by, created_at, '', id, title
+                FROM upstream_mutation_requests
+                UNION ALL
+                SELECT 'mutation_request', status, title, requested_by, created_at, '',
+                       id || ':reason', reason
+                FROM upstream_mutation_requests WHERE reason != ''
+                """
+            )
+
     def _ensure_clean_gmail_inbox_view(self) -> None:
         self._ensure_utf8_byte_prefix_function()
         self._command(
@@ -5286,3 +6171,8 @@ def _numeric_ts(expression: str) -> str:
 
 def _json_numeric(expression: str, field: str) -> str:
     return f"COALESCE(NULLIF(({expression}::jsonb ->> '{field}'), '')::numeric, 0)"
+
+
+# Runs at import so any schema/coverage divergence fails everything, loudly,
+# before a single asset or server query executes.
+validate_searchable_text_coverage()

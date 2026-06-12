@@ -232,6 +232,16 @@ SQL starting points:
 
 Searching text columns (the schema overview lists which columns carry which indexes):
 
+- Cross-source coverage: the `searchable_text` view unions every searchable text column
+  in the warehouse into `(source, subsource, context, who, occurred_at, account, ref, text)`.
+  Start broad (`SELECT source, subsource, count(*) FROM searchable_text WHERE text ~* '\mterm\M'
+  GROUP BY 1, 2`), refine with ordinary `WHERE` clauses, then drill into the underlying
+  table via `ref`. Coverage is enforced: every text column in the warehouse is either a
+  view branch or explicitly excluded with a reason in `SEARCHABLE_TEXT_COVERAGE`
+  (`src/personal_data_warehouse/postgres.py`), and schema drift fails loudly at startup.
+- Person resolution: fuzzy-match the `person_identities` view
+  (`name %> 'zach lata' ORDER BY word_similarity(...) DESC`) to get emails, Slack user
+  ids, and phone numbers, then filter sources by identifier.
 - Relevance-ranked word search (BM25, `pg_textsearch`):
   `SELECT ..., text <@> 'launch plans' AS score FROM slack_messages ORDER BY text <@> 'launch plans' LIMIT 20`.
   Scores are negative (more negative = better). Always include the `ORDER BY col <@> ... LIMIT n`
