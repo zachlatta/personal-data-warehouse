@@ -28,6 +28,7 @@ from personal_data_warehouse.gmail_attachment_enrichment import (
     AGENT_ATTACHMENT_PROMPT_VERSION,
     DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     GmailAttachmentEnrichmentRunner,
+    has_attachment_enrichment_candidate,
     load_attachment_enrichment_candidates,
 )
 from personal_data_warehouse.schedule_guards import skip_if_job_active, skip_if_job_in_progress
@@ -103,15 +104,14 @@ def gmail_attachment_enrichment_backlog_sensor(context):
 
     settings = load_settings(require_gmail=False, require_agent=True)
     warehouse = warehouse_from_settings(settings)
-    candidates = load_attachment_enrichment_candidates(
+    has_candidate = has_attachment_enrichment_candidate(
         warehouse,
         provider=f"agent_{settings.agent.provider}",
         model=settings.agent.model,
         prompt_version=AGENT_ATTACHMENT_PROMPT_VERSION,
-        limit=1,
         max_error_attempts=gmail_attachment_enrichment_max_error_attempts(),
     )
-    if not candidates:
+    if not has_candidate:
         return SkipReason("No Gmail attachments are waiting for agent enrichment.")
 
     return RunRequest(tags={"gmail_attachment_trigger": "enrichment_backlog"})

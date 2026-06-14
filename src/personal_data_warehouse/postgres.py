@@ -474,6 +474,11 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS whatsapp_media_items_hash_idx ON whatsapp_media_items (content_sha256)",
     ),
     IndexSpec(
+        "agent_runs_task_status_subject_idx",
+        "agent_runs",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_runs_task_status_subject_idx ON agent_runs (task_type, status, subject_id)",
+    ),
+    IndexSpec(
         "agent_run_events_created_idx",
         "agent_run_events",
         "CREATE INDEX IF NOT EXISTS agent_run_events_created_idx ON agent_run_events (created_at DESC)",

@@ -420,6 +420,7 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
     from personal_data_warehouse.gmail_attachment_enrichment import (
         AGENT_ATTACHMENT_PROMPT_VERSION,
         AGENT_ATTACHMENT_TASK_TYPE,
+        has_attachment_enrichment_candidate,
         load_attachment_enrichment_candidates,
     )
     from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS
@@ -509,6 +510,14 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
             ]
         )
 
+    assert has_attachment_enrichment_candidate(
+        warehouse,
+        provider=provider,
+        model=model,
+        prompt_version=version,
+        max_error_attempts=3,
+    )
+
     candidates = load_attachment_enrichment_candidates(
         warehouse,
         provider=provider,
@@ -534,6 +543,23 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
         max_error_attempts=5,
     )
     assert "sha-flaky" in {candidate["content_sha256"] for candidate in retried}
+
+    insert_enrichment("sha-pending", ai_provider=provider, ai_model=model, ai_prompt_version=version, status="agent_ok")
+    insert_enrichment("sha-pdf", ai_provider=provider, ai_model=model, ai_prompt_version=version, status="agent_ok")
+    assert not has_attachment_enrichment_candidate(
+        warehouse,
+        provider=provider,
+        model=model,
+        prompt_version=version,
+        max_error_attempts=3,
+    )
+    assert has_attachment_enrichment_candidate(
+        warehouse,
+        provider=provider,
+        model=model,
+        prompt_version=version,
+        max_error_attempts=5,
+    )
 
 
 def test_postgres_insert_normalizes_nul_text_values() -> None:
@@ -733,6 +759,22 @@ def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehous
     assert "gmail_messages_body_text_trgm_idx" in index_names
     assert "gmail_messages_body_markdown_trgm_idx" in index_names
     assert "gmail_messages_body_html_trgm_idx" in index_names
+
+
+def test_postgres_agent_tables_create_run_lookup_index(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_agent_tables()
+
+    rows = warehouse._query(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND tablename = 'agent_runs'
+        """
+    )
+
+    index_names = {row[0] for row in rows}
+    assert "agent_runs_task_status_subject_idx" in index_names
 
 
 def _pg_textsearch_usable(warehouse: PostgresWarehouse) -> bool:

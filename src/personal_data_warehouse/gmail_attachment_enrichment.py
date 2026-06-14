@@ -294,7 +294,9 @@ def load_attachment_enrichment_candidates(
     )
     limit_sql = "LIMIT %s" if limit is not None and limit > 0 else ""
     params: list[Any] = [
+        AGENT_ATTACHMENT_TASK_TYPE,
         MIN_IMAGE_BYTES,
+        int(max_error_attempts),
         image_mime_types,
         image_extension_patterns,
         list(PDF_VISION_SOURCE_STATUSES),
@@ -302,13 +304,18 @@ def load_attachment_enrichment_candidates(
         model,
         prompt_version,
         list(COMPLETED_STATUSES),
-        AGENT_ATTACHMENT_TASK_TYPE,
-        int(max_error_attempts),
     ]
     if limit_sql:
         params.append(int(limit))
     rows = warehouse._query(
         f"""
+        WITH failed_runs AS (
+            SELECT subject_id, count(*) AS error_attempts
+            FROM agent_runs
+            WHERE task_type = %s
+              AND status = 'error'
+            GROUP BY subject_id
+        )
         SELECT account, content_sha256, filename, mime_type, size,
                storage_backend, storage_key, storage_file_id, storage_url, source_status
         FROM (
@@ -330,10 +337,13 @@ def load_attachment_enrichment_candidates(
                   AND det.ai_provider = ''
                   AND det.ai_model = ''
                   AND det.ai_prompt_version = ''
+            LEFT JOIN failed_runs runs
+                ON runs.subject_id = a.content_sha256
             WHERE a.is_deleted = 0
               AND a.content_sha256 <> ''
               AND a.storage_status = 'stored'
               AND a.size >= %s
+              AND COALESCE(runs.error_attempts, 0) < %s
               AND (
                   lower(a.mime_type) = ANY(%s)
                   OR lower(a.filename) LIKE ANY(%s)
@@ -351,13 +361,6 @@ def load_attachment_enrichment_candidates(
                     AND done.ai_prompt_version = %s
                     AND done.text_extraction_status = ANY(%s)
               )
-              AND (
-                  SELECT count(*)
-                  FROM agent_runs runs
-                  WHERE runs.task_type = %s
-                    AND runs.subject_id = a.content_sha256
-                    AND runs.status = 'error'
-              ) < %s
             ORDER BY a.content_sha256, a.internal_date DESC
         ) AS candidates
         ORDER BY internal_date DESC
@@ -366,6 +369,75 @@ def load_attachment_enrichment_candidates(
         tuple(params),
     )
     return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
+def has_attachment_enrichment_candidate(
+    warehouse,
+    *,
+    provider: str,
+    model: str,
+    prompt_version: str,
+    max_error_attempts: int = DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
+) -> bool:
+    """Return whether at least one stored attachment needs agent enrichment."""
+    image_mime_types = list(IMAGE_MIME_TYPES)
+    image_extension_patterns = [f"%{extension}" for extension in IMAGE_EXTENSIONS]
+    rows = warehouse._query(
+        """
+        WITH failed_runs AS (
+            SELECT subject_id, count(*) AS error_attempts
+            FROM agent_runs
+            WHERE task_type = %s
+              AND status = 'error'
+            GROUP BY subject_id
+        )
+        SELECT 1
+        FROM gmail_attachments a
+        LEFT JOIN gmail_attachment_enrichments det
+            ON det.content_sha256 = a.content_sha256
+              AND det.ai_provider = ''
+              AND det.ai_model = ''
+              AND det.ai_prompt_version = ''
+        LEFT JOIN failed_runs runs
+            ON runs.subject_id = a.content_sha256
+        WHERE a.is_deleted = 0
+          AND a.content_sha256 <> ''
+          AND a.storage_status = 'stored'
+          AND a.size >= %s
+          AND COALESCE(runs.error_attempts, 0) < %s
+          AND (
+              lower(a.mime_type) = ANY(%s)
+              OR lower(a.filename) LIKE ANY(%s)
+              OR (
+                  (lower(a.mime_type) = 'application/pdf' OR lower(a.filename) LIKE '%%.pdf')
+                  AND COALESCE(det.text_extraction_status, '') = ANY(%s)
+              )
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM gmail_attachment_enrichments done
+              WHERE done.content_sha256 = a.content_sha256
+                AND done.ai_provider = %s
+                AND done.ai_model = %s
+                AND done.ai_prompt_version = %s
+                AND done.text_extraction_status = ANY(%s)
+          )
+        LIMIT 1
+        """,
+        (
+            AGENT_ATTACHMENT_TASK_TYPE,
+            MIN_IMAGE_BYTES,
+            int(max_error_attempts),
+            image_mime_types,
+            image_extension_patterns,
+            list(PDF_VISION_SOURCE_STATUSES),
+            provider,
+            model,
+            prompt_version,
+            list(COMPLETED_STATUSES),
+        ),
+    )
+    return bool(rows)
 
 
 def attachment_storage_ref(candidate: Mapping[str, Any]) -> dict[str, str]:
