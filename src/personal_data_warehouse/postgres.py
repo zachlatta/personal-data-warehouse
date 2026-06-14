@@ -17,6 +17,7 @@ from personal_data_warehouse.schema import (
     AGENT_RUN_COLUMNS,
     AGENT_RUN_EVENT_COLUMNS,
     AGENT_RUN_TOOL_CALL_COLUMNS,
+    AGENT_SESSION_EVENT_COLUMNS,
     ATTACHMENT_BACKFILL_STATE_COLUMNS,
     ATTACHMENT_COLUMNS,
     ATTACHMENT_ENRICHMENT_COLUMNS,
@@ -188,6 +189,16 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "whatsapp_media_items": TableSpec(
         WHATSAPP_MEDIA_ITEM_COLUMNS,
         ("account", "chat_id", "message_id"),
+    ),
+    "agent_session_events": TableSpec(
+        AGENT_SESSION_EVENT_COLUMNS,
+        ("source", "session_id", "event_uuid"),
+        storage_parameters=(
+            ("autovacuum_analyze_scale_factor", "0"),
+            ("autovacuum_analyze_threshold", "50000"),
+            ("autovacuum_vacuum_scale_factor", "0"),
+            ("autovacuum_vacuum_threshold", "100000"),
+        ),
     ),
     "agent_runs": TableSpec(AGENT_RUN_COLUMNS, ("run_id",)),
     "agent_run_events": TableSpec(AGENT_RUN_EVENT_COLUMNS, ("run_id", "event_index")),
@@ -479,6 +490,28 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_runs_task_status_subject_idx ON agent_runs (task_type, status, subject_id)",
     ),
     IndexSpec(
+        "agent_session_events_session_seq_idx",
+        "agent_session_events",
+        "CREATE INDEX IF NOT EXISTS agent_session_events_session_seq_idx ON agent_session_events (source, session_id, seq)",
+    ),
+    IndexSpec(
+        "agent_session_events_time_idx",
+        "agent_session_events",
+        "CREATE INDEX IF NOT EXISTS agent_session_events_time_idx ON agent_session_events (occurred_at DESC)",
+    ),
+    IndexSpec(
+        "agent_session_events_text_trgm_idx",
+        "agent_session_events",
+        "CREATE INDEX IF NOT EXISTS agent_session_events_text_trgm_idx ON agent_session_events USING gin (text public.gin_trgm_ops) WHERE text != ''",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "agent_session_events_text_bm25_idx",
+        "agent_session_events",
+        "CREATE INDEX IF NOT EXISTS agent_session_events_text_bm25_idx ON agent_session_events USING bm25 (text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
         "agent_run_events_created_idx",
         "agent_run_events",
         "CREATE INDEX IF NOT EXISTS agent_run_events_created_idx ON agent_run_events (created_at DESC)",
@@ -615,6 +648,31 @@ _C_IDENTITY = "identity field (name/email/phone), not free text"
 _C_FILEMETA = "attachment metadata; binary content not text-searchable"
 
 SEARCHABLE_TEXT_COVERAGE: dict[str, dict[str, str]] = {
+    "agent_session_events": {
+        "source": _C_ENUM,
+        "session_id": _C_ID,
+        "event_uuid": _C_ID,
+        "account": _C_ID,
+        "device": _C_META,
+        "role": _C_ENUM,
+        "event_type": _C_ENUM,
+        "subtype": _C_ENUM,
+        "parent_uuid": _C_ID,
+        "turn_id": _C_ID,
+        "model": _C_META,
+        "cwd": _C_META,
+        "git_branch": _C_META,
+        "git_commit": _C_ID,
+        "repo_url": _C_META,
+        "cli_version": _C_META,
+        "entrypoint": _C_ENUM,
+        "session_title": "view:agent_session/title",
+        "text": "view:agent_session/text",
+        "tool_name": _C_META,
+        "tool_input_json": _C_RAW,
+        "tool_result_json": _C_RAW,
+        "raw_json": _C_RAW,
+    },
     "agent_run_events": {
         "run_id": _C_ID,
         "stream": _C_META,
@@ -1294,6 +1352,7 @@ POSTGRES_INSERT_PAGE_SIZES = {
     "apple_message_attachments": 500,
     "whatsapp_messages": 500,
     "whatsapp_media_items": 500,
+    "agent_session_events": 500,
 }
 
 
@@ -1367,9 +1426,16 @@ TIMESTAMP_COLUMNS = {
     "ai_processed_at",
     "last_message_at",
     "edited_at",
+    "occurred_at",
 }
 
 INTEGER_COLUMNS = {
+    "seq",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+    "is_sidechain",
     "history_id",
     "is_deleted",
     "size_estimate",
@@ -1545,6 +1611,11 @@ class PostgresWarehouse:
     def ensure_whatsapp_tables(self) -> None:
         self._ensure_table_group(_WHATSAPP_TABLES)
         self.ensure_whatsapp_client_session_table()
+        self._ensure_search_views_if_possible()
+
+    def ensure_agent_sessions_tables(self) -> None:
+        self._ensure_table_group(["agent_session_events"])
+        self._ensure_clean_agent_sessions_view()
         self._ensure_search_views_if_possible()
 
     def ensure_whatsapp_client_session_table(self) -> None:
@@ -4173,6 +4244,9 @@ class PostgresWarehouse:
     def insert_whatsapp_media_items(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("whatsapp_media_items", rows, WHATSAPP_MEDIA_ITEM_COLUMNS)
 
+    def insert_agent_session_events(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("agent_session_events", rows, AGENT_SESSION_EVENT_COLUMNS)
+
     def insert_agent_runs(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_runs", rows, AGENT_RUN_COLUMNS)
 
@@ -5134,6 +5208,7 @@ class PostgresWarehouse:
         "clean_transcripts_no_calendar_match",
         "contact_cards",
         "agent_run_events",
+        "agent_session_events",
         "upstream_mutations",
         "upstream_mutation_requests",
     )
@@ -5343,6 +5418,16 @@ class PostgresWarehouse:
                        run_id || ':' || event_index::text, text
                 FROM agent_run_events
                 UNION ALL
+                SELECT 'agent_session', source, role, account, occurred_at, account,
+                       source || ':' || session_id || ':' || event_uuid, text
+                FROM agent_session_events
+                WHERE text != '' AND role IN ('user', 'assistant')
+                UNION ALL
+                SELECT 'agent_session', 'title', source, account, occurred_at, account,
+                       source || ':' || session_id || ':' || event_uuid || ':title', session_title
+                FROM agent_session_events
+                WHERE session_title != ''
+                UNION ALL
                 SELECT 'mutation', status, operation, requested_by, created_at, account, id, title
                 FROM upstream_mutations
                 UNION ALL
@@ -5492,6 +5577,42 @@ class PostgresWarehouse:
                 raw_json
             FROM contact_cards
             WHERE is_deleted = 0
+            """
+        )
+
+    def _ensure_clean_agent_sessions_view(self) -> None:
+        # Session-level roll-up over the per-line event log. Header fields take
+        # the first/last non-empty value seen so a session split across batches
+        # converges; counts and token sums aggregate the whole session, which a
+        # stored-aggregate upsert could not do correctly across batches.
+        self._command(
+            """
+            CREATE OR REPLACE VIEW clean_agent_sessions AS
+            SELECT
+                source,
+                session_id,
+                max(account) AS account,
+                max(device) AS device,
+                (array_agg(session_title ORDER BY seq) FILTER (WHERE session_title != ''))[1] AS title,
+                (array_agg(cwd ORDER BY seq) FILTER (WHERE cwd != ''))[1] AS cwd,
+                (array_agg(git_branch ORDER BY seq DESC) FILTER (WHERE git_branch != ''))[1] AS git_branch,
+                (array_agg(git_commit ORDER BY seq DESC) FILTER (WHERE git_commit != ''))[1] AS git_commit,
+                (array_agg(repo_url ORDER BY seq) FILTER (WHERE repo_url != ''))[1] AS repo_url,
+                (array_agg(model ORDER BY seq DESC) FILTER (WHERE model != ''))[1] AS model,
+                (array_agg(cli_version ORDER BY seq DESC) FILTER (WHERE cli_version != ''))[1] AS cli_version,
+                (array_agg(entrypoint ORDER BY seq) FILTER (WHERE entrypoint != ''))[1] AS entrypoint,
+                (array_agg(text ORDER BY seq) FILTER (WHERE role = 'user' AND text != ''))[1] AS first_prompt,
+                min(occurred_at) FILTER (WHERE occurred_at > '1970-01-01 00:00:00+00'::timestamptz) AS started_at,
+                max(occurred_at) FILTER (WHERE occurred_at > '1970-01-01 00:00:00+00'::timestamptz) AS ended_at,
+                count(*)::bigint AS event_count,
+                count(*) FILTER (WHERE role = 'user')::bigint AS user_event_count,
+                count(*) FILTER (WHERE role = 'assistant')::bigint AS assistant_event_count,
+                sum(input_tokens)::bigint AS input_tokens,
+                sum(output_tokens)::bigint AS output_tokens,
+                sum(cache_read_tokens)::bigint AS cache_read_tokens,
+                sum(cache_creation_tokens)::bigint AS cache_creation_tokens
+            FROM agent_session_events
+            GROUP BY source, session_id
             """
         )
 

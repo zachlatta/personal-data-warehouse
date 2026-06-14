@@ -29,6 +29,7 @@ personal-data-warehouse-voice-memos-upload = "personal_data_warehouse_voice_memo
 personal-data-warehouse-apple-notes-upload = "personal_data_warehouse_apple_notes.cli:main"
 personal-data-warehouse-apple-messages-upload = "personal_data_warehouse_apple_messages.cli:main"
 personal-data-warehouse-whatsapp-client = "personal_data_warehouse_whatsapp.cli:main"
+personal-data-warehouse-agent-sessions-upload = "personal_data_warehouse_agent_sessions.cli:main"
 personal-data-warehouse-agent-auth = "personal_data_warehouse.agent_runner:auth_main"
 
 [dependency-groups]
@@ -45,6 +46,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = [
     "src/personal_data_warehouse",
+    "src/personal_data_warehouse_agent_sessions",
     "src/personal_data_warehouse_alice_voice_recordings",
     "src/personal_data_warehouse_apple_messages",
     "src/personal_data_warehouse_apple_notes",

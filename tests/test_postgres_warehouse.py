@@ -863,6 +863,7 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_apple_notes_tables()
     warehouse.ensure_apple_messages_tables()
     warehouse.ensure_whatsapp_tables()
+    warehouse.ensure_agent_sessions_tables()
     warehouse.ensure_slack_tables()
     warehouse.ensure_upstream_mutation_tables()
 

@@ -615,6 +615,44 @@ AGENT_RUN_TOOL_CALL_COLUMNS = (
     "sync_version",
 )
 
+# AI agent CLI session logs (Claude Code, Codex, ...). One row per raw JSONL
+# line from a session/rollout transcript; the session-level roll-up lives in the
+# clean_agent_sessions view so cross-batch counts and token sums stay correct.
+AGENT_SESSION_EVENT_COLUMNS = (
+    "source",
+    "session_id",
+    "event_uuid",
+    "account",
+    "device",
+    "seq",
+    "occurred_at",
+    "role",
+    "event_type",
+    "subtype",
+    "parent_uuid",
+    "turn_id",
+    "model",
+    "cwd",
+    "git_branch",
+    "git_commit",
+    "repo_url",
+    "cli_version",
+    "entrypoint",
+    "session_title",
+    "text",
+    "tool_name",
+    "tool_input_json",
+    "tool_result_json",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+    "is_sidechain",
+    "raw_json",
+    "ingested_at",
+    "sync_version",
+)
+
 SLACK_TEAM_COLUMNS = (
     "account",
     "team_id",

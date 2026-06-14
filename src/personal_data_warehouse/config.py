@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import base64
 import os
 import re
+import socket
 
 from dotenv import load_dotenv
 
@@ -52,6 +53,9 @@ DEFAULT_WHATSAPP_FLUSH_INTERVAL_SECONDS = 60
 # max_runtime_seconds (14400 in docker/dagster.yaml) so runs end cleanly and
 # the keepalive sensor relaunches them.
 DEFAULT_WHATSAPP_CLIENT_RUN_SECONDS = 10800
+DEFAULT_AGENT_SESSIONS_STORAGE_BACKEND = "google_drive"
+DEFAULT_AGENT_SESSIONS_CLAUDE_PROJECTS_DIR = "~/.claude/projects"
+DEFAULT_AGENT_SESSIONS_CODEX_SESSIONS_DIR = "~/.codex/sessions"
 DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
 DEFAULT_ALICE_STORAGE_BACKEND = "google_drive"
 DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS = 120
@@ -83,6 +87,13 @@ def _parse_bool_env(value: str | None, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _local_device_name() -> str:
+    # The short hostname identifies which machine an agent session was recorded
+    # on, so logs from every device coexist in one warehouse.
+    name = socket.gethostname().strip()
+    return name.split(".")[0] if name else "unknown-device"
 
 
 def _parse_optional_int_env(name: str, default: int | None) -> int | None:
@@ -188,6 +199,17 @@ class WhatsAppConfig:
 
 
 @dataclass(frozen=True)
+class AgentSessionsConfig:
+    account: str
+    device: str
+    storage_backend: str
+    google_drive_account: str
+    google_drive_folder_id: str
+    claude_projects_dir: str
+    codex_sessions_dir: str
+
+
+@dataclass(frozen=True)
 class AliceVoiceRecordingsConfig:
     account: str
     key_id: str
@@ -269,6 +291,7 @@ class Settings:
     apple_notes: AppleNotesConfig | None = None
     apple_messages: AppleMessagesConfig | None = None
     whatsapp: WhatsAppConfig | None = None
+    agent_sessions: AgentSessionsConfig | None = None
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
@@ -328,6 +351,8 @@ class Settings:
             configured_domains.add(email_domain(self.apple_messages.google_drive_account))
         if self.whatsapp is not None:
             configured_domains.add(email_domain(self.whatsapp.google_drive_account))
+        if self.agent_sessions is not None:
+            configured_domains.add(email_domain(self.agent_sessions.google_drive_account))
         if len(configured_domains) <= 1:
             return self.gmail_oauth_client_secrets_json
         return None
@@ -347,6 +372,7 @@ def load_settings(
     require_apple_notes: bool = False,
     require_apple_messages: bool = False,
     require_whatsapp: bool = False,
+    require_agent_sessions: bool = False,
     require_alice_voice_recordings: bool = False,
     require_assemblyai: bool = False,
     require_agent: bool = False,
@@ -798,6 +824,64 @@ def load_settings(
             download_history_media=_parse_bool_env(os.getenv("WHATSAPP_DOWNLOAD_HISTORY_MEDIA"), False),
         )
 
+    agent_sessions_account = (
+        os.getenv("AGENT_SESSIONS_ACCOUNT")
+        or os.getenv("APPLE_MESSAGES_ACCOUNT")
+        or os.getenv("VOICE_MEMOS_ACCOUNT")
+        or default_voice_memos_account
+    ).strip()
+    agent_sessions_device = os.getenv("AGENT_SESSIONS_DEVICE", "").strip() or _local_device_name()
+    agent_sessions_storage_backend = os.getenv(
+        "AGENT_SESSIONS_STORAGE_BACKEND",
+        DEFAULT_AGENT_SESSIONS_STORAGE_BACKEND,
+    ).strip()
+    agent_sessions_google_drive_account = (
+        os.getenv("AGENT_SESSIONS_GOOGLE_DRIVE_ACCOUNT")
+        or agent_sessions_account
+        or apple_messages_google_drive_account
+        or voice_memos_account
+    ).strip()
+    agent_sessions_google_drive_folder_id = (
+        os.getenv("AGENT_SESSIONS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
+        or ""
+    ).strip()
+    agent_sessions_claude_projects_dir = os.path.expanduser(
+        os.getenv("AGENT_SESSIONS_CLAUDE_PROJECTS_DIR", DEFAULT_AGENT_SESSIONS_CLAUDE_PROJECTS_DIR)
+    )
+    agent_sessions_codex_sessions_dir = os.path.expanduser(
+        os.getenv("AGENT_SESSIONS_CODEX_SESSIONS_DIR", DEFAULT_AGENT_SESSIONS_CODEX_SESSIONS_DIR)
+    )
+    agent_sessions: AgentSessionsConfig | None = None
+    if (
+        require_agent_sessions
+        or os.getenv("AGENT_SESSIONS_ACCOUNT")
+        or os.getenv("AGENT_SESSIONS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("AGENT_SESSIONS_ENABLED")
+    ):
+        if not agent_sessions_account:
+            raise ValueError("AGENT_SESSIONS_ACCOUNT or GMAIL_ACCOUNTS must be set for agent session sync")
+        if agent_sessions_storage_backend not in {"google_drive"}:
+            raise ValueError("AGENT_SESSIONS_STORAGE_BACKEND currently supports: google_drive")
+        if not agent_sessions_google_drive_account:
+            raise ValueError("AGENT_SESSIONS_GOOGLE_DRIVE_ACCOUNT or AGENT_SESSIONS_ACCOUNT must be set")
+        if not agent_sessions_google_drive_folder_id:
+            raise ValueError(
+                "AGENT_SESSIONS_GOOGLE_DRIVE_FOLDER_ID, APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
+        agent_sessions = AgentSessionsConfig(
+            account=agent_sessions_account,
+            device=agent_sessions_device,
+            storage_backend=agent_sessions_storage_backend,
+            google_drive_account=agent_sessions_google_drive_account,
+            google_drive_folder_id=agent_sessions_google_drive_folder_id,
+            claude_projects_dir=agent_sessions_claude_projects_dir,
+            codex_sessions_dir=agent_sessions_codex_sessions_dir,
+        )
+
     alice_account = os.getenv("ALICE_VOICE_RECORDINGS_ACCOUNT", "").strip()
     alice_key_id = os.getenv("ALICE_API_KEY_ID", "").strip()
     alice_secret_key = os.getenv("ALICE_API_SECRET_KEY", "").strip()
@@ -987,6 +1071,7 @@ def load_settings(
         apple_notes=apple_notes,
         apple_messages=apple_messages,
         whatsapp=whatsapp,
+        agent_sessions=agent_sessions,
         alice_voice_recordings=alice_voice_recordings,
         assemblyai=assemblyai,
         agent=agent,
