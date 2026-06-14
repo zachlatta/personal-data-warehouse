@@ -15,6 +15,8 @@ dependencies = [
     "python-dotenv>=1.1.0",
     "requests>=2.32.0",
     "slack-sdk>=3.41.0",
+    "neonize==0.3.17.post0",
+    "qrcode>=8.2",
 ]
 
 [project.scripts]
@@ -26,6 +28,7 @@ personal-data-warehouse-apple-voice-memos-upload = "personal_data_warehouse_voic
 personal-data-warehouse-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"
 personal-data-warehouse-apple-notes-upload = "personal_data_warehouse_apple_notes.cli:main"
 personal-data-warehouse-apple-messages-upload = "personal_data_warehouse_apple_messages.cli:main"
+personal-data-warehouse-whatsapp-client = "personal_data_warehouse_whatsapp.cli:main"
 personal-data-warehouse-agent-auth = "personal_data_warehouse.agent_runner:auth_main"
 
 [dependency-groups]
@@ -46,6 +49,7 @@ packages = [
     "src/personal_data_warehouse_apple_messages",
     "src/personal_data_warehouse_apple_notes",
     "src/personal_data_warehouse_voice_memos",
+    "src/personal_data_warehouse_whatsapp",
 ]
 force-include = { "pyproject.toml" = "pyproject.toml" }
 

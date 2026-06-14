@@ -42,6 +42,16 @@ DEFAULT_APPLE_MESSAGES_STORAGE_BACKEND = "google_drive"
 DEFAULT_APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN = 512 * 1024 * 1024
 DEFAULT_APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN = 200
 DEFAULT_APPLE_MESSAGES_UPLOAD_WORKERS = 4
+DEFAULT_WHATSAPP_SESSION_PATH = "~/.cache/personal-data-warehouse/whatsapp-session.sqlite3"
+DEFAULT_WHATSAPP_SESSION_KEY = "default"
+DEFAULT_WHATSAPP_STORAGE_BACKEND = "google_drive"
+DEFAULT_WHATSAPP_MEDIA_BYTES_PER_FLUSH = 512 * 1024 * 1024
+DEFAULT_WHATSAPP_MEDIA_COUNT_PER_FLUSH = 200
+DEFAULT_WHATSAPP_FLUSH_INTERVAL_SECONDS = 60
+# Bounded client run window; must stay below Dagster run_monitoring
+# max_runtime_seconds (14400 in docker/dagster.yaml) so runs end cleanly and
+# the keepalive sensor relaunches them.
+DEFAULT_WHATSAPP_CLIENT_RUN_SECONDS = 10800
 DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
 DEFAULT_ALICE_STORAGE_BACKEND = "google_drive"
 DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS = 120
@@ -160,6 +170,24 @@ class AppleMessagesConfig:
 
 
 @dataclass(frozen=True)
+class WhatsAppConfig:
+    account: str
+    session_path: str
+    session_key: str
+    client_id: str
+    storage_backend: str
+    google_drive_account: str
+    google_drive_folder_id: str
+    client_enabled: bool = False
+    pair_phone: str = ""
+    flush_interval_seconds: int = DEFAULT_WHATSAPP_FLUSH_INTERVAL_SECONDS
+    client_run_seconds: int = DEFAULT_WHATSAPP_CLIENT_RUN_SECONDS
+    media_bytes_per_flush: int = DEFAULT_WHATSAPP_MEDIA_BYTES_PER_FLUSH
+    media_count_per_flush: int = DEFAULT_WHATSAPP_MEDIA_COUNT_PER_FLUSH
+    download_history_media: bool = False
+
+
+@dataclass(frozen=True)
 class AliceVoiceRecordingsConfig:
     account: str
     key_id: str
@@ -240,6 +268,7 @@ class Settings:
     voice_memos: VoiceMemosConfig | None = None
     apple_notes: AppleNotesConfig | None = None
     apple_messages: AppleMessagesConfig | None = None
+    whatsapp: WhatsAppConfig | None = None
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
@@ -297,6 +326,8 @@ class Settings:
             configured_domains.add(email_domain(self.apple_notes.google_drive_account))
         if self.apple_messages is not None:
             configured_domains.add(email_domain(self.apple_messages.google_drive_account))
+        if self.whatsapp is not None:
+            configured_domains.add(email_domain(self.whatsapp.google_drive_account))
         if len(configured_domains) <= 1:
             return self.gmail_oauth_client_secrets_json
         return None
@@ -315,6 +346,7 @@ def load_settings(
     require_voice_memos: bool = False,
     require_apple_notes: bool = False,
     require_apple_messages: bool = False,
+    require_whatsapp: bool = False,
     require_alice_voice_recordings: bool = False,
     require_assemblyai: bool = False,
     require_agent: bool = False,
@@ -670,6 +702,102 @@ def load_settings(
             upload_workers=apple_messages_upload_workers,
         )
 
+    whatsapp_account = (
+        os.getenv("WHATSAPP_ACCOUNT")
+        or os.getenv("APPLE_MESSAGES_ACCOUNT")
+        or os.getenv("APPLE_NOTES_ACCOUNT")
+        or os.getenv("VOICE_MEMOS_ACCOUNT")
+        or default_voice_memos_account
+    ).strip()
+    whatsapp_session_path = os.path.expanduser(
+        os.getenv("WHATSAPP_SESSION_PATH", DEFAULT_WHATSAPP_SESSION_PATH)
+    )
+    whatsapp_session_key = os.getenv("WHATSAPP_SESSION_KEY", DEFAULT_WHATSAPP_SESSION_KEY).strip()
+    whatsapp_client_id = os.getenv("WHATSAPP_CLIENT_ID", "").strip()
+    whatsapp_storage_backend = os.getenv(
+        "WHATSAPP_STORAGE_BACKEND",
+        DEFAULT_WHATSAPP_STORAGE_BACKEND,
+    ).strip()
+    whatsapp_google_drive_account = (
+        os.getenv("WHATSAPP_GOOGLE_DRIVE_ACCOUNT")
+        or whatsapp_account
+        or apple_messages_google_drive_account
+        or voice_memos_account
+    ).strip()
+    whatsapp_google_drive_folder_id = (
+        os.getenv("WHATSAPP_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
+        or ""
+    ).strip()
+    whatsapp_media_bytes_per_flush = int(
+        os.getenv(
+            "WHATSAPP_MEDIA_BYTES_PER_FLUSH",
+            str(DEFAULT_WHATSAPP_MEDIA_BYTES_PER_FLUSH),
+        )
+    )
+    whatsapp_media_count_per_flush = int(
+        os.getenv(
+            "WHATSAPP_MEDIA_COUNT_PER_FLUSH",
+            str(DEFAULT_WHATSAPP_MEDIA_COUNT_PER_FLUSH),
+        )
+    )
+    whatsapp_flush_interval_seconds = int(
+        os.getenv("WHATSAPP_FLUSH_INTERVAL_SECONDS", str(DEFAULT_WHATSAPP_FLUSH_INTERVAL_SECONDS))
+    )
+    whatsapp_client_run_seconds = int(
+        os.getenv("WHATSAPP_CLIENT_RUN_SECONDS", str(DEFAULT_WHATSAPP_CLIENT_RUN_SECONDS))
+    )
+    whatsapp: WhatsAppConfig | None = None
+    if (
+        require_whatsapp
+        or os.getenv("WHATSAPP_ACCOUNT")
+        or os.getenv("WHATSAPP_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("WHATSAPP_SESSION_PATH")
+        or os.getenv("WHATSAPP_SESSION_KEY")
+        or os.getenv("WHATSAPP_CLIENT_ID")
+        or os.getenv("WHATSAPP_CLIENT_ENABLED")
+        or os.getenv("WHATSAPP_PAIR_PHONE")
+    ):
+        if not whatsapp_account:
+            raise ValueError("WHATSAPP_ACCOUNT or GMAIL_ACCOUNTS must be set for WhatsApp sync")
+        if whatsapp_storage_backend not in {"google_drive"}:
+            raise ValueError("WHATSAPP_STORAGE_BACKEND currently supports: google_drive")
+        if not whatsapp_google_drive_account:
+            raise ValueError("WHATSAPP_GOOGLE_DRIVE_ACCOUNT or WHATSAPP_ACCOUNT must be set")
+        if not whatsapp_google_drive_folder_id:
+            raise ValueError(
+                "WHATSAPP_GOOGLE_DRIVE_FOLDER_ID, APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
+        if whatsapp_media_bytes_per_flush < 0:
+            raise ValueError("WHATSAPP_MEDIA_BYTES_PER_FLUSH must be greater than or equal to 0")
+        if whatsapp_media_count_per_flush < 0:
+            raise ValueError("WHATSAPP_MEDIA_COUNT_PER_FLUSH must be greater than or equal to 0")
+        if whatsapp_flush_interval_seconds < 1:
+            raise ValueError("WHATSAPP_FLUSH_INTERVAL_SECONDS must be at least 1")
+        if whatsapp_client_run_seconds < 60:
+            raise ValueError("WHATSAPP_CLIENT_RUN_SECONDS must be at least 60")
+        if not whatsapp_session_key:
+            raise ValueError("WHATSAPP_SESSION_KEY must not be empty")
+        whatsapp = WhatsAppConfig(
+            account=whatsapp_account,
+            session_path=whatsapp_session_path,
+            session_key=whatsapp_session_key,
+            client_id=whatsapp_client_id,
+            storage_backend=whatsapp_storage_backend,
+            google_drive_account=whatsapp_google_drive_account,
+            google_drive_folder_id=whatsapp_google_drive_folder_id,
+            client_enabled=_parse_bool_env(os.getenv("WHATSAPP_CLIENT_ENABLED"), False),
+            pair_phone=os.getenv("WHATSAPP_PAIR_PHONE", "").strip(),
+            flush_interval_seconds=whatsapp_flush_interval_seconds,
+            client_run_seconds=whatsapp_client_run_seconds,
+            media_bytes_per_flush=whatsapp_media_bytes_per_flush,
+            media_count_per_flush=whatsapp_media_count_per_flush,
+            download_history_media=_parse_bool_env(os.getenv("WHATSAPP_DOWNLOAD_HISTORY_MEDIA"), False),
+        )
+
     alice_account = os.getenv("ALICE_VOICE_RECORDINGS_ACCOUNT", "").strip()
     alice_key_id = os.getenv("ALICE_API_KEY_ID", "").strip()
     alice_secret_key = os.getenv("ALICE_API_SECRET_KEY", "").strip()
@@ -808,6 +936,8 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if apple_messages and apple_messages.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if whatsapp and whatsapp.storage_backend == "google_drive":
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if alice_voice_recordings and alice_voice_recordings.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if gmail_attachment_storage_backend == "google_drive" and gmail_attachment_google_drive_folder_id:
@@ -856,6 +986,7 @@ def load_settings(
         voice_memos=voice_memos,
         apple_notes=apple_notes,
         apple_messages=apple_messages,
+        whatsapp=whatsapp,
         alice_voice_recordings=alice_voice_recordings,
         assemblyai=assemblyai,
         agent=agent,

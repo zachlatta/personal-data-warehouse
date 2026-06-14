@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -819,6 +820,7 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
     warehouse.ensure_apple_notes_tables()
     warehouse.ensure_apple_messages_tables()
+    warehouse.ensure_whatsapp_tables()
     warehouse.ensure_slack_tables()
     warehouse.ensure_upstream_mutation_tables()
 
@@ -852,6 +854,27 @@ def test_searchable_text_view_spans_sources_and_pushes_predicates(warehouse: Pos
         "SELECT source, subsource FROM searchable_text WHERE text ~* '\\mzanzibar\\M' ORDER BY source, subsource"
     )
     assert ("slack", "private_channel") in rows
+
+
+def test_whatsapp_client_session_round_trips_binary_snapshot(warehouse: PostgresWarehouse) -> None:
+    now = datetime(2026, 6, 14, 12, tzinfo=UTC)
+    payload = b"SQLite format 3\x00binary\x00session"
+
+    summary = warehouse.upsert_whatsapp_client_session(
+        account="zach@example.com",
+        session_key="default",
+        client_id="client-id",
+        database_bytes=payload,
+        updated_at=now,
+    )
+    row = warehouse.get_whatsapp_client_session(account="zach@example.com", session_key="default")
+
+    assert summary["database_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert row is not None
+    assert row["client_id"] == "client-id"
+    assert row["database_bytes"] == payload
+    assert row["database_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert row["database_bytes_size"] == len(payload)
 
 
 def test_searchable_text_live_coverage_fails_on_unacknowledged_column(warehouse: PostgresWarehouse) -> None:

@@ -509,6 +509,72 @@ APPLE_MESSAGE_ATTACHMENT_COLUMNS = (
     "sync_version",
 )
 
+WHATSAPP_CHAT_COLUMNS = (
+    "account",
+    "chat_id",
+    "name",
+    "chat_type",
+    "is_archived",
+    "last_message_at",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+WHATSAPP_CONTACT_COLUMNS = (
+    "account",
+    "jid",
+    "push_name",
+    "first_name",
+    "full_name",
+    "business_name",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+WHATSAPP_MESSAGE_COLUMNS = (
+    "account",
+    "chat_id",
+    "message_id",
+    "sender_jid",
+    "push_name",
+    "is_from_me",
+    "body_text",
+    "message_kind",
+    "media_type",
+    "quoted_message_id",
+    "message_at",
+    "edited_at",
+    "is_deleted",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+WHATSAPP_MEDIA_ITEM_COLUMNS = (
+    "account",
+    "chat_id",
+    "message_id",
+    "media_type",
+    "filename",
+    "mime_type",
+    "total_bytes",
+    "size_bytes",
+    "file_sha256",
+    "content_sha256",
+    "is_missing",
+    "error",
+    "message_at",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
 AGENT_RUN_COLUMNS = (
     "run_id",
     "provider",

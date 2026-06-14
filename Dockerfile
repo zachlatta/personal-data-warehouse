@@ -15,7 +15,7 @@ ENV DAGSTER_HOME=/app/.dagster \
     UV_LINK_MODE=copy
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl docker.io poppler-utils \
+    && apt-get install -y --no-install-recommends ca-certificates curl docker.io poppler-utils libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock ./
@@ -32,6 +32,7 @@ COPY docker/start-dagster.sh /usr/local/bin/personal-data-warehouse-start-dagste
 RUN git_sha="${PDW_GIT_SHA:-${SOURCE_COMMIT:-${GIT_SHA:-${GIT_COMMIT:-${COMMIT_SHA:-${COOLIFY_GIT_COMMIT:-unknown}}}}}}" \
     && printf '{"git_sha":"%s"}\n' "$git_sha" > /app/build-info.json \
     && uv sync --frozen --group dev \
+    && uv run --no-sync python -c "import neonize.client" \
     && chmod +x /usr/local/bin/personal-data-warehouse-entrypoint \
     && chmod +x /usr/local/bin/personal-data-warehouse-start-dagster
 

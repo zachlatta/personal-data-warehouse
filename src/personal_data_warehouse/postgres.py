@@ -10,6 +10,7 @@ from typing import Any
 import uuid
 
 import psycopg2
+from psycopg2 import Binary
 from psycopg2.extras import Json, execute_values
 
 from personal_data_warehouse.schema import (
@@ -50,6 +51,10 @@ from personal_data_warehouse.schema import (
     VOICE_MEMO_FILE_COLUMNS,
     VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
     VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS,
+    WHATSAPP_CHAT_COLUMNS,
+    WHATSAPP_CONTACT_COLUMNS,
+    WHATSAPP_MEDIA_ITEM_COLUMNS,
+    WHATSAPP_MESSAGE_COLUMNS,
     SyncState,
 )
 from personal_data_warehouse.config import normalize_postgres_url
@@ -174,6 +179,15 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "apple_message_attachments": TableSpec(
         APPLE_MESSAGE_ATTACHMENT_COLUMNS,
         ("account", "attachment_id", "message_id"),
+    ),
+    "whatsapp_chats": TableSpec(WHATSAPP_CHAT_COLUMNS, ("account", "chat_id")),
+    "whatsapp_contacts": TableSpec(WHATSAPP_CONTACT_COLUMNS, ("account", "jid")),
+    # Protocol message IDs are sender-generated, so they are only unique
+    # within a chat; the chat JID is part of the key.
+    "whatsapp_messages": TableSpec(WHATSAPP_MESSAGE_COLUMNS, ("account", "chat_id", "message_id")),
+    "whatsapp_media_items": TableSpec(
+        WHATSAPP_MEDIA_ITEM_COLUMNS,
+        ("account", "chat_id", "message_id"),
     ),
     "agent_runs": TableSpec(AGENT_RUN_COLUMNS, ("run_id",)),
     "agent_run_events": TableSpec(AGENT_RUN_EVENT_COLUMNS, ("run_id", "event_index")),
@@ -429,6 +443,35 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "apple_message_attachments_hash_idx",
         "apple_message_attachments",
         "CREATE INDEX IF NOT EXISTS apple_message_attachments_hash_idx ON apple_message_attachments (content_sha256)",
+    ),
+    IndexSpec(
+        "whatsapp_messages_time_idx",
+        "whatsapp_messages",
+        "CREATE INDEX IF NOT EXISTS whatsapp_messages_time_idx ON whatsapp_messages (message_at DESC) WHERE is_deleted = 0",
+    ),
+    IndexSpec(
+        "whatsapp_messages_chat_time_idx",
+        "whatsapp_messages",
+        "CREATE INDEX IF NOT EXISTS whatsapp_messages_chat_time_idx ON whatsapp_messages (account, chat_id, message_at DESC)",
+    ),
+    IndexSpec(
+        "whatsapp_messages_body_trgm_idx",
+        "whatsapp_messages",
+        "CREATE INDEX IF NOT EXISTS whatsapp_messages_body_trgm_idx ON whatsapp_messages USING gin (body_text public.gin_trgm_ops) WHERE is_deleted = 0",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        # Full coverage (no is_deleted filter) so the implicit <@> syntax
+        # stays index-backed; callers filter is_deleted in SQL.
+        "whatsapp_messages_body_bm25_idx",
+        "whatsapp_messages",
+        "CREATE INDEX IF NOT EXISTS whatsapp_messages_body_bm25_idx ON whatsapp_messages USING bm25 (body_text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "whatsapp_media_items_hash_idx",
+        "whatsapp_media_items",
+        "CREATE INDEX IF NOT EXISTS whatsapp_media_items_hash_idx ON whatsapp_media_items (content_sha256)",
     ),
     IndexSpec(
         "agent_run_events_created_idx",
@@ -1087,6 +1130,56 @@ SEARCHABLE_TEXT_COVERAGE: dict[str, dict[str, str]] = {
         "approved_by": _C_META,
         "claimed_by": _C_META,
     },
+    "whatsapp_chats": {
+        "account": _C_ID,
+        "chat_id": _C_ID,
+        "name": "view:whatsapp_chat/name",
+        "chat_type": _C_ENUM,
+        "raw_metadata_json": _C_RAW,
+    },
+    "whatsapp_contacts": {
+        "account": _C_ID,
+        "jid": _C_ID,
+        "push_name": _C_IDENTITY,
+        "first_name": _C_IDENTITY,
+        "full_name": _C_IDENTITY,
+        "business_name": _C_IDENTITY,
+        "raw_metadata_json": _C_RAW,
+    },
+    "whatsapp_media_items": {
+        "account": _C_ID,
+        "chat_id": _C_ID,
+        "message_id": _C_ID,
+        "media_type": _C_ENUM,
+        "filename": "view:whatsapp_media/filename",
+        "mime_type": _C_ENUM,
+        "file_sha256": _C_STORE,
+        "content_sha256": _C_STORE,
+        "error": _C_ERR,
+        "storage_backend": _C_STORE,
+        "storage_key": _C_STORE,
+        "storage_file_id": _C_STORE,
+        "storage_url": _C_STORE,
+        "raw_metadata_json": _C_RAW,
+    },
+    "whatsapp_messages": {
+        "account": _C_ID,
+        "chat_id": _C_ID,
+        "message_id": _C_ID,
+        "sender_jid": _C_ID,
+        "push_name": _C_IDENTITY,
+        "body_text": "view:whatsapp/body",
+        "message_kind": _C_ENUM,
+        "media_type": _C_ENUM,
+        "quoted_message_id": _C_ID,
+        "raw_metadata_json": _C_RAW,
+    },
+    "whatsapp_client_sessions": {
+        "account": _C_ID,
+        "session_key": _C_ID,
+        "client_id": _C_ID,
+        "database_sha256": _C_STORE,
+    },
 }
 
 # Text-bearing columns of tables created via raw DDL in
@@ -1133,6 +1226,9 @@ _RAW_DDL_TEXT_COLUMNS: dict[str, frozenset[str]] = {
     ),
     "upstream_mutation_request_events": frozenset(
         {"request_id", "event_type", "actor_type", "actor_id", "event_json"}
+    ),
+    "whatsapp_client_sessions": frozenset(
+        {"account", "session_key", "client_id", "database_sha256"}
     ),
 }
 
@@ -1191,6 +1287,8 @@ POSTGRES_INSERT_PAGE_SIZES = {
     "apple_note_attachments": 250,
     "apple_messages": 500,
     "apple_message_attachments": 500,
+    "whatsapp_messages": 500,
+    "whatsapp_media_items": 500,
 }
 
 
@@ -1262,6 +1360,8 @@ TIMESTAMP_COLUMNS = {
     "date_retracted",
     "date_recovered",
     "ai_processed_at",
+    "last_message_at",
+    "edited_at",
 }
 
 INTEGER_COLUMNS = {
@@ -1341,6 +1441,13 @@ FLOAT_COLUMNS = {
     "confidence",
     "calendar_confidence",
 }
+
+_WHATSAPP_TABLES = (
+    "whatsapp_chats",
+    "whatsapp_contacts",
+    "whatsapp_messages",
+    "whatsapp_media_items",
+)
 
 
 class PostgresWarehouse:
@@ -1424,7 +1531,114 @@ class PostgresWarehouse:
                 "apple_message_attachments",
             ]
         )
+        # The WhatsApp tables ride along here so the searchable_text view,
+        # which references them, stays recreatable on deployments where the
+        # WhatsApp ingest has not run yet.
+        self._ensure_table_group(_WHATSAPP_TABLES)
         self._ensure_search_views_if_possible()
+
+    def ensure_whatsapp_tables(self) -> None:
+        self._ensure_table_group(_WHATSAPP_TABLES)
+        self.ensure_whatsapp_client_session_table()
+        self._ensure_search_views_if_possible()
+
+    def ensure_whatsapp_client_session_table(self) -> None:
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS whatsapp_client_sessions (
+                account text NOT NULL,
+                session_key text NOT NULL DEFAULT 'default',
+                client_id text NOT NULL DEFAULT '',
+                database_bytes bytea NOT NULL DEFAULT ''::bytea,
+                database_sha256 text NOT NULL DEFAULT '',
+                database_bytes_size bigint NOT NULL DEFAULT 0,
+                restored_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                sync_version bigint NOT NULL DEFAULT 1,
+                PRIMARY KEY (account, session_key)
+            )
+            """
+        )
+        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS client_id text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS database_bytes bytea NOT NULL DEFAULT ''::bytea")
+        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS database_sha256 text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS database_bytes_size bigint NOT NULL DEFAULT 0")
+        self._command(
+            "ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS restored_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
+        )
+        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()")
+        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS sync_version bigint NOT NULL DEFAULT 1")
+
+    def get_whatsapp_client_session(self, *, account: str, session_key: str) -> dict[str, Any] | None:
+        self.ensure_whatsapp_client_session_table()
+        rows = self._query_dicts(
+            """
+            SELECT account, session_key, client_id, database_bytes, database_sha256,
+                   database_bytes_size, restored_at, updated_at, sync_version
+            FROM whatsapp_client_sessions
+            WHERE account = %s AND session_key = %s
+            """,
+            (account, session_key),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        row["database_bytes"] = bytes(row["database_bytes"])
+        return row
+
+    def upsert_whatsapp_client_session(
+        self,
+        *,
+        account: str,
+        session_key: str,
+        client_id: str,
+        database_bytes: bytes,
+        restored_at: datetime | None = None,
+        updated_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_whatsapp_client_session_table()
+        now = updated_at or datetime.now(tz=UTC)
+        restored = restored_at or datetime(1970, 1, 1, tzinfo=UTC)
+        database_sha256 = hashlib.sha256(database_bytes).hexdigest()
+        sync_version = int(now.astimezone(UTC).timestamp() * 1_000_000)
+        self._command(
+            """
+            INSERT INTO whatsapp_client_sessions (
+                account, session_key, client_id, database_bytes, database_sha256,
+                database_bytes_size, restored_at, updated_at, sync_version
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (account, session_key) DO UPDATE SET
+                client_id = EXCLUDED.client_id,
+                database_bytes = EXCLUDED.database_bytes,
+                database_sha256 = EXCLUDED.database_sha256,
+                database_bytes_size = EXCLUDED.database_bytes_size,
+                restored_at = EXCLUDED.restored_at,
+                updated_at = EXCLUDED.updated_at,
+                sync_version = EXCLUDED.sync_version
+            """,
+            (
+                account,
+                session_key,
+                client_id,
+                Binary(database_bytes),
+                database_sha256,
+                len(database_bytes),
+                restored,
+                now,
+                sync_version,
+            ),
+        )
+        return {
+            "account": account,
+            "session_key": session_key,
+            "client_id": client_id,
+            "database_sha256": database_sha256,
+            "database_bytes_size": len(database_bytes),
+            "restored_at": restored,
+            "updated_at": now,
+            "sync_version": sync_version,
+        }
 
     def ensure_voice_memo_transcription_tables(self) -> None:
         self.ensure_apple_voice_memos_tables()
@@ -3942,6 +4156,18 @@ class PostgresWarehouse:
     def insert_apple_message_attachments(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("apple_message_attachments", rows, APPLE_MESSAGE_ATTACHMENT_COLUMNS)
 
+    def insert_whatsapp_chats(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whatsapp_chats", rows, WHATSAPP_CHAT_COLUMNS)
+
+    def insert_whatsapp_contacts(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whatsapp_contacts", rows, WHATSAPP_CONTACT_COLUMNS)
+
+    def insert_whatsapp_messages(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whatsapp_messages", rows, WHATSAPP_MESSAGE_COLUMNS)
+
+    def insert_whatsapp_media_items(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whatsapp_media_items", rows, WHATSAPP_MEDIA_ITEM_COLUMNS)
+
     def insert_agent_runs(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_runs", rows, AGENT_RUN_COLUMNS)
 
@@ -4890,6 +5116,10 @@ class PostgresWarehouse:
         "apple_note_revisions",
         "apple_messages",
         "apple_message_handles",
+        "whatsapp_messages",
+        "whatsapp_chats",
+        "whatsapp_contacts",
+        "whatsapp_media_items",
         "apple_voice_memos_enrichments",
         "apple_voice_memos_files",
         "calendar_events",
@@ -5051,6 +5281,26 @@ class PostgresWarehouse:
                 LEFT JOIN apple_message_handles h
                   ON h.account = m.account AND h.handle_id = m.handle_id
                 WHERE m.is_deleted = 0
+                UNION ALL
+                SELECT 'whatsapp', 'body', COALESCE(NULLIF(c.name, ''), m.chat_id),
+                       CASE WHEN m.is_from_me = 1 THEN 'me'
+                            ELSE COALESCE(NULLIF(ct.full_name, ''), NULLIF(ct.push_name, ''),
+                                          NULLIF(m.push_name, ''), m.sender_jid) END,
+                       m.message_at, m.account, m.chat_id || ':' || m.message_id, m.body_text
+                FROM whatsapp_messages m
+                LEFT JOIN whatsapp_chats c
+                  ON c.account = m.account AND c.chat_id = m.chat_id
+                LEFT JOIN whatsapp_contacts ct
+                  ON ct.account = m.account AND ct.jid = m.sender_jid
+                WHERE m.is_deleted = 0
+                UNION ALL
+                SELECT 'whatsapp_chat', 'name', chat_type, '', last_message_at, account,
+                       chat_id, name
+                FROM whatsapp_chats WHERE name != ''
+                UNION ALL
+                SELECT 'whatsapp_media', 'filename', mime_type, '', message_at, account,
+                       chat_id || ':' || message_id, filename
+                FROM whatsapp_media_items WHERE filename != ''
                 UNION ALL
                 SELECT 'calendar', 'summary', '', organizer_email, start_at, account,
                        calendar_id || ':' || event_id, summary
@@ -5708,6 +5958,20 @@ PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
         "storage_file_id",
         "storage_url",
         "storage_status",
+    ),
+    "whatsapp_media_items": (
+        "content_sha256",
+        "storage_backend",
+        "storage_key",
+        "storage_file_id",
+        "storage_url",
+    ),
+    # Pushname-only updates must not wipe fuller names from contact-store dumps.
+    "whatsapp_contacts": (
+        "push_name",
+        "first_name",
+        "full_name",
+        "business_name",
     ),
 }
 

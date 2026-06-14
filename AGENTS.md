@@ -215,3 +215,56 @@ kickstart the LaunchAgent again.
 Apple Messages SQL starting points are `apple_messages`, `apple_message_chats`,
 `apple_message_handles`, `apple_message_chat_handles`, `apple_message_chat_messages`, and
 `apple_message_attachments`.
+
+## WhatsApp Client (linked device)
+
+WhatsApp syncs through a real WhatsApp Web multidevice client (neonize, Python bindings over
+whatsmeow), not a local-store scanner. The client registers as a linked device on Zach's
+WhatsApp account, holds a persistent connection, and receives live messages plus history sync.
+
+It runs in-process with the production Dagster deployment; no separate image or service:
+
+- Asset/job: `whatsapp_client` / `whatsapp_client_job` (`src/personal_data_warehouse/defs/whatsapp_client.py`)
+- The client runs in bounded windows (`WHATSAPP_CLIENT_RUN_SECONDS`, default 10800s) so it
+  never trips Dagster run monitoring (`max_runtime_seconds: 14400`); the
+  `whatsapp_client_keepalive_sensor` relaunches it whenever no run is active. WhatsApp queues
+  messages for offline linked devices, so the seconds between windows lose nothing.
+- A Postgres advisory lock prevents two concurrent connections on one session, which would
+  corrupt the device state.
+- Records flow exactly like Apple Messages: the client batches JSONL.gz envelopes to
+  `whatsapp/inbox/batches/` and media blobs to `whatsapp/inbox/media/` in Google Drive; the
+  `whatsapp_drive_inbox_sensor` + `whatsapp_drive_ingest` asset consume and promote them.
+- Session state is canonical in Postgres table `whatsapp_client_sessions` as a bytea SQLite
+  snapshot keyed by `WHATSAPP_ACCOUNT` + `WHATSAPP_SESSION_KEY` (default `default`). neonize
+  still requires a SQLite filename at runtime, so `WHATSAPP_SESSION_PATH` is only a disposable
+  cache path restored from Postgres before each run and snapshotted back after pairing,
+  connect, contact dumps, flushes, and shutdown.
+
+Enabling and pairing (first time):
+
+1. Set `WHATSAPP_CLIENT_ENABLED=1` on the Coolify app. `WHATSAPP_SESSION_PATH` may be left as
+   the default runtime cache path; it does not need a persistent volume. Optionally set
+   `WHATSAPP_PAIR_PHONE=<E.164 number without +>` to pair with an 8-character code instead of
+   a QR.
+2. Wait for the keepalive sensor to launch `whatsapp_client_job` (or launch it from the
+   Dagster UI) and open the run logs.
+3. Scan the QR printed in the logs (WhatsApp > Settings > Linked Devices > Link a Device), or
+   enter the logged pairing code. After pairing, the client snapshots the session into Postgres
+   and history sync chunks arrive automatically.
+
+Other env vars: `WHATSAPP_ACCOUNT`, `WHATSAPP_GOOGLE_DRIVE_FOLDER_ID` (both fall back to the
+Apple Messages values), `WHATSAPP_SESSION_KEY`, `WHATSAPP_CLIENT_ID` (normally leave unset),
+`WHATSAPP_FLUSH_INTERVAL_SECONDS`, `WHATSAPP_MEDIA_BYTES_PER_FLUSH`,
+`WHATSAPP_MEDIA_COUNT_PER_FLUSH`, `WHATSAPP_DOWNLOAD_HISTORY_MEDIA` (default off; live media is
+always downloaded, history-sync media is metadata-only unless enabled).
+
+For local pairing/debugging there is a CLI: `uv run personal-data-warehouse-whatsapp-client`
+(requires `brew install libmagic` on macOS). It requires `POSTGRES_DATABASE_URL` because
+Postgres is the session source of truth. `--session-file` only selects the runtime cache file.
+
+Caveats: unofficial clients violate WhatsApp ToS and carry a small account-ban risk. neonize is
+pinned to 0.3.17.post0 because newer releases need protobuf>=7, which dagster pins below; its
+Go shared library is pre-fetched in the Dockerfile (`import neonize.client` at build).
+
+WhatsApp SQL starting points are `whatsapp_messages`, `whatsapp_chats`, `whatsapp_contacts`,
+and `whatsapp_media_items`.
