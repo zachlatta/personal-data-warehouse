@@ -216,6 +216,56 @@ Apple Messages SQL starting points are `apple_messages`, `apple_message_chats`,
 `apple_message_handles`, `apple_message_chat_handles`, `apple_message_chat_messages`, and
 `apple_message_attachments`.
 
+## Local Agent Sessions Upload Scheduler
+
+Captures AI agent CLI session transcripts (Claude Code + Codex) so every device's sessions are
+queryable in the warehouse. The append-only transcripts are tailed and shipped, line by line,
+through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.agent-sessions-upload`
+- Installed plist: `~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist`
+- Wrapper script: `bin/agent-sessions-upload-launchd`
+- Run cadence: every 300 seconds with `RunAtLoad`
+- Command: `/opt/homebrew/bin/uv run personal-data-warehouse-agent-sessions-upload --mode incremental`
+- Main run log: `~/Library/Logs/personal-data-warehouse/agent-sessions-upload.run.log`
+- Heartbeat file: `~/Library/Logs/personal-data-warehouse/agent-sessions-upload.heartbeat`
+- Status helper: `bin/agent-sessions-upload-status`
+
+Use these commands when inspecting or repairing it:
+
+```bash
+bin/agent-sessions-upload-status
+launchctl print gui/$(id -u)/com.zachlatta.personal-data-warehouse.agent-sessions-upload
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.agent-sessions-upload
+tail -80 ~/Library/Logs/personal-data-warehouse/agent-sessions-upload.run.log
+cat ~/Library/Logs/personal-data-warehouse/agent-sessions-upload.heartbeat
+```
+
+If the plist changes, reinstall it with:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.agent-sessions-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.agent-sessions-upload
+```
+
+The uploader reads `~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/**/rollout-*.jsonl`
+(override with `AGENT_SESSIONS_CLAUDE_PROJECTS_DIR` / `AGENT_SESSIONS_CODEX_SESSIONS_DIR`),
+tracks a byte offset per file, and uploads new lines as gzipped JSONL batches to
+`agent-sessions/inbox/` on Drive. It reuses the Apple Messages / Voice Memos Drive folder and
+account by default (set `AGENT_SESSIONS_GOOGLE_DRIVE_FOLDER_ID` / `AGENT_SESSIONS_ACCOUNT` to
+override). The `--limit` flag bounds a run (useful for a first backfill). In Dagster, the
+`agent_sessions_drive_inbox_sensor` + `agent_sessions_drive_ingest` asset consume the batches.
+
+Agent sessions SQL starting points are the `agent_session_events` table (one row per transcript
+line; `source` is `claude_code` or `codex`, `device` tags the machine) and the
+`clean_agent_sessions` view (per-session roll-up: counts, token sums, title, cwd/git, first
+prompt). Free-text content is also in the unified `searchable_text` view under
+`source = 'agent_session'`. (Not to be confused with `agent_runs`/`agent_run_events`, which log
+the warehouse's own internal enrichment agent.)
+
 ## WhatsApp Client (linked device)
 
 WhatsApp syncs through a real WhatsApp Web multidevice client (neonize, Python bindings over
