@@ -176,7 +176,6 @@ def test_load_settings_builds_whatsapp_client_config(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
     monkeypatch.setenv("WHATSAPP_ACCOUNT", "zach@example.com")
     monkeypatch.setenv("WHATSAPP_GOOGLE_DRIVE_FOLDER_ID", "folder-id")
-    monkeypatch.setenv("WHATSAPP_CLIENT_ENABLED", "1")
     monkeypatch.setenv("WHATSAPP_PAIR_PHONE", "15551234567")
 
     settings = load_settings(require_postgres=False, require_gmail=False, require_whatsapp=True)
@@ -190,6 +189,18 @@ def test_load_settings_builds_whatsapp_client_config(monkeypatch) -> None:
     assert settings.whatsapp.client_run_seconds == 10800
     assert settings.whatsapp.session_path.endswith("whatsapp-session.sqlite3")
     assert GOOGLE_DRIVE_SCOPE in settings.google_scopes
+
+
+def test_load_settings_can_disable_whatsapp_client(monkeypatch) -> None:
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.com")
+    monkeypatch.setenv("WHATSAPP_ACCOUNT", "zach@example.com")
+    monkeypatch.setenv("WHATSAPP_GOOGLE_DRIVE_FOLDER_ID", "folder-id")
+    monkeypatch.setenv("WHATSAPP_CLIENT_ENABLED", "0")
+
+    settings = load_settings(require_postgres=False, require_gmail=False, require_whatsapp=True)
+
+    assert settings.whatsapp is not None
+    assert settings.whatsapp.client_enabled is False
 
 
 def test_postgres_session_store_imports_and_restores_sqlite_snapshot(tmp_path) -> None:

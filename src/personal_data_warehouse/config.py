@@ -53,6 +53,7 @@ DEFAULT_WHATSAPP_FLUSH_INTERVAL_SECONDS = 60
 # max_runtime_seconds (14400 in docker/dagster.yaml) so runs end cleanly and
 # the keepalive sensor relaunches them.
 DEFAULT_WHATSAPP_CLIENT_RUN_SECONDS = 10800
+DEFAULT_WHATSAPP_CLIENT_ENABLED = True
 DEFAULT_AGENT_SESSIONS_STORAGE_BACKEND = "google_drive"
 DEFAULT_AGENT_SESSIONS_CLAUDE_PROJECTS_DIR = "~/.claude/projects"
 DEFAULT_AGENT_SESSIONS_CODEX_SESSIONS_DIR = "~/.codex/sessions"
@@ -815,7 +816,10 @@ def load_settings(
             storage_backend=whatsapp_storage_backend,
             google_drive_account=whatsapp_google_drive_account,
             google_drive_folder_id=whatsapp_google_drive_folder_id,
-            client_enabled=_parse_bool_env(os.getenv("WHATSAPP_CLIENT_ENABLED"), False),
+            client_enabled=_parse_bool_env(
+                os.getenv("WHATSAPP_CLIENT_ENABLED"),
+                DEFAULT_WHATSAPP_CLIENT_ENABLED,
+            ),
             pair_phone=os.getenv("WHATSAPP_PAIR_PHONE", "").strip(),
             flush_interval_seconds=whatsapp_flush_interval_seconds,
             client_run_seconds=whatsapp_client_run_seconds,

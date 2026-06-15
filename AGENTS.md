@@ -292,10 +292,11 @@ It runs in-process with the production Dagster deployment; no separate image or 
 
 Enabling and pairing (first time):
 
-1. Set `WHATSAPP_CLIENT_ENABLED=1` on the Coolify app. `WHATSAPP_SESSION_PATH` may be left as
-   the default runtime cache path; it does not need a persistent volume. Optionally set
-   `WHATSAPP_PAIR_PHONE=<E.164 number without +>` to pair with an 8-character code instead of
-   a QR.
+1. The client is enabled by default once WhatsApp is configured; leave
+   `WHATSAPP_CLIENT_ENABLED` unset or set it to `1`. Set it to `0` only when the client needs
+   to be paused. `WHATSAPP_SESSION_PATH` may be left as the default runtime cache path; it does
+   not need a persistent volume. Optionally set `WHATSAPP_PAIR_PHONE=<E.164 number without +>`
+   to pair with an 8-character code instead of a QR.
 2. Wait for the keepalive sensor to launch `whatsapp_client_job` (or launch it from the
    Dagster UI) and open the run logs.
 3. Scan the QR printed in the logs (WhatsApp > Settings > Linked Devices > Link a Device), or

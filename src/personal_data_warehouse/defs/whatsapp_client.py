@@ -7,9 +7,10 @@ and a keepalive sensor relaunches it whenever no run is active. WhatsApp
 queues messages for offline linked devices, so the seconds between windows
 lose nothing.
 
-First-time pairing: set WHATSAPP_CLIENT_ENABLED=1 (and optionally
-WHATSAPP_PAIR_PHONE for a pairing code instead of a QR), then watch the
-whatsapp_client run logs for the QR / pairing code.
+First-time pairing: the client is enabled by default once WhatsApp is
+configured. Optionally set WHATSAPP_PAIR_PHONE for a pairing code instead of a
+QR, then watch the whatsapp_client run logs for the QR / pairing code. Set
+WHATSAPP_CLIENT_ENABLED=0 when the client needs to be paused.
 """
 
 from __future__ import annotations
@@ -147,7 +148,10 @@ def whatsapp_client_keepalive_sensor(context):
     except ValueError as exc:
         return SkipReason(f"WhatsApp is not configured: {exc}")
     if settings.whatsapp is None or not settings.whatsapp.client_enabled:
-        return SkipReason("WhatsApp client is disabled; set WHATSAPP_CLIENT_ENABLED=1 to start it.")
+        return SkipReason(
+            "WhatsApp client is disabled by WHATSAPP_CLIENT_ENABLED=0; unset it or set "
+            "WHATSAPP_CLIENT_ENABLED=1 to start it."
+        )
 
     return RunRequest(tags={"whatsapp_trigger": "keepalive"})
 
