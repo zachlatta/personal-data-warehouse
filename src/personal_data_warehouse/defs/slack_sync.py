@@ -29,6 +29,15 @@ def _rate_limit_budget_seconds() -> int:
     return _int_env("SLACK_ASSET_RATE_LIMIT_BUDGET_SECONDS", 120)
 
 
+def _user_sync_lock_wait_seconds() -> int:
+    # The full-workspace users.list refresh holds the shared Slack lock for a
+    # long time (a large directory can take hours), so it must wait for the lock
+    # to free rather than racing the high-frequency message stages and failing.
+    # The wait comfortably exceeds the longest message-stage hold, so a timeout
+    # here means a stage is genuinely stuck and the run should surface a failure.
+    return _int_env("SLACK_USER_SYNC_LOCK_WAIT_SECONDS", 1800)
+
+
 def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
     summaries: list[SlackSyncSummary] = []
 
@@ -348,7 +357,7 @@ def slack_workspace_metadata_sync(context) -> MaterializeResult:
 
 @asset(
     group_name="slack",
-    retry_policy=RetryPolicy(max_retries=10, delay=60),
+    retry_policy=RetryPolicy(max_retries=2, delay=60),
 )
 def slack_workspace_user_sync(context) -> MaterializeResult:
     return _run_locked_slack_stage(
@@ -356,6 +365,7 @@ def slack_workspace_user_sync(context) -> MaterializeResult:
         stage_name="users",
         run_fn=run_slack_user_sync,
         fail_on_lock_contention=True,
+        lock_wait_seconds=_user_sync_lock_wait_seconds(),
     )
 
 
@@ -413,10 +423,15 @@ def _run_locked_slack_stage(
     stage_name: str,
     run_fn,
     fail_on_lock_contention: bool = False,
+    lock_wait_seconds: float | None = None,
 ) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_slack=True)
     warehouse = warehouse_from_settings(settings)
-    with exclusive_sync_lock(name="slack", postgres_lock_id=SLACK_SYNC_POSTGRES_LOCK_ID) as acquired:
+    with exclusive_sync_lock(
+        name="slack",
+        postgres_lock_id=SLACK_SYNC_POSTGRES_LOCK_ID,
+        wait_seconds=lock_wait_seconds,
+    ) as acquired:
         if not acquired:
             context.log.warning("Skipping Slack %s sync because another Slack sync is already running", stage_name)
             if fail_on_lock_contention:
@@ -521,12 +536,17 @@ def slack_workspace_metadata_sync_every_fifteen_minutes(context):
     return skip_if_job_active(context, job_name="slack_workspace_metadata_sync_job")
 
 
+# Daily, not hourly: a full users.list refresh of a large workspace can take a
+# couple of hours and holds the shared Slack lock the whole time, so it cannot fit
+# an hourly cadence without starving message ingestion. Runs in the early-morning
+# low-traffic window (08:11 UTC) to minimise the message-sync gap while it holds
+# the lock.
 @schedule(
-    cron_schedule="11 * * * *",
+    cron_schedule="11 8 * * *",
     job=slack_workspace_user_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def slack_workspace_user_sync_hourly(context):
+def slack_workspace_user_sync_daily(context):
     return skip_if_job_active(context, job_name="slack_workspace_user_sync_job")
 
 
@@ -593,7 +613,7 @@ def defs() -> Definitions:
             slack_workspace_sync_every_five_minutes,
             slack_workspace_coverage_sync_every_seven_minutes,
             slack_workspace_metadata_sync_every_fifteen_minutes,
-            slack_workspace_user_sync_hourly,
+            slack_workspace_user_sync_daily,
             slack_workspace_thread_sync_every_five_minutes,
             slack_workspace_thread_backfill_sync_every_five_minutes,
             slack_workspace_read_state_sync_every_five_minutes,

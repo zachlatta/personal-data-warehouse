@@ -23,7 +23,7 @@ from personal_data_warehouse.defs.slack_sync import (
     slack_workspace_read_state_sync_every_five_minutes,
     slack_workspace_sync_every_five_minutes,
     slack_workspace_thread_sync_every_five_minutes,
-    slack_workspace_user_sync_hourly,
+    slack_workspace_user_sync_daily,
 )
 from personal_data_warehouse.slack_sync import SlackSyncSummary
 from personal_data_warehouse.sync_locks import (
@@ -45,8 +45,8 @@ def test_slack_sync_schedule_runs_every_five_minutes_by_default() -> None:
     assert slack_workspace_coverage_sync_every_seven_minutes.default_status.value == "RUNNING"
     assert slack_workspace_metadata_sync_every_fifteen_minutes.cron_schedule == "*/15 * * * *"
     assert slack_workspace_metadata_sync_every_fifteen_minutes.default_status.value == "RUNNING"
-    assert slack_workspace_user_sync_hourly.cron_schedule == "11 * * * *"
-    assert slack_workspace_user_sync_hourly.default_status.value == "RUNNING"
+    assert slack_workspace_user_sync_daily.cron_schedule == "11 8 * * *"
+    assert slack_workspace_user_sync_daily.default_status.value == "RUNNING"
     assert slack_workspace_thread_sync_every_five_minutes.cron_schedule == "*/5 * * * *"
     assert slack_workspace_thread_sync_every_five_minutes.default_status.value == "RUNNING"
     assert slack_workspace_read_state_sync_every_five_minutes.cron_schedule == "2-59/5 * * * *"
@@ -360,6 +360,43 @@ def test_slack_user_sync_lock_contention_raises_for_retry(monkeypatch) -> None:
         raise AssertionError("expected RuntimeError")
 
 
+def test_run_locked_slack_stage_forwards_lock_wait_seconds(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    @contextmanager
+    def fake_lock(**kwargs):
+        captured.update(kwargs)
+        yield True
+
+    class FakeLog:
+        def info(self, *_args, **_kwargs):
+            pass
+
+        def warning(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(slack_defs, "exclusive_sync_lock", fake_lock)
+    monkeypatch.setattr(slack_defs, "load_settings", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(slack_defs, "warehouse_from_settings", lambda _settings: SimpleNamespace())
+    monkeypatch.setattr(slack_defs, "build_metadata", lambda: {"git_sha": "test"})
+
+    _run_locked_slack_stage(
+        SimpleNamespace(log=FakeLog()),
+        stage_name="users",
+        run_fn=lambda **_kwargs: [],
+        lock_wait_seconds=1800,
+    )
+
+    assert captured["wait_seconds"] == 1800
+
+
+def test_user_sync_lock_wait_seconds_default_and_override(monkeypatch) -> None:
+    monkeypatch.delenv("SLACK_USER_SYNC_LOCK_WAIT_SECONDS", raising=False)
+    assert slack_defs._user_sync_lock_wait_seconds() == 1800
+    monkeypatch.setenv("SLACK_USER_SYNC_LOCK_WAIT_SECONDS", "600")
+    assert slack_defs._user_sync_lock_wait_seconds() == 600
+
+
 def test_slack_thread_sync_backfills_known_threads_conservatively(monkeypatch) -> None:
     calls = []
 
@@ -639,11 +676,11 @@ def test_exclusive_process_lock_is_non_blocking(tmp_path) -> None:
 
 
 def test_exclusive_sync_lock_uses_named_postgres_url(monkeypatch) -> None:
-    calls: list[tuple[str, int]] = []
+    calls: list[tuple[str, int, float | None]] = []
 
     @contextmanager
-    def fake_postgres_lock(postgres_url: str, lock_id: int):
-        calls.append((postgres_url, lock_id))
+    def fake_postgres_lock(postgres_url: str, lock_id: int, *, wait_seconds: float | None = None):
+        calls.append((postgres_url, lock_id, wait_seconds))
         yield True
 
     monkeypatch.setenv("SLACK_SYNC_LOCK_POSTGRES_URL", "postgresql://postgres/slack")
@@ -655,4 +692,56 @@ def test_exclusive_sync_lock_uses_named_postgres_url(monkeypatch) -> None:
     with exclusive_sync_lock(name="slack", postgres_lock_id=1234) as acquired:
         assert acquired
 
-    assert calls == [("postgresql://postgres/slack", 1234)]
+    assert calls == [("postgresql://postgres/slack", 1234, None)]
+
+
+def test_exclusive_sync_lock_forwards_wait_seconds(monkeypatch) -> None:
+    calls: list[tuple[str, int, float | None]] = []
+
+    @contextmanager
+    def fake_postgres_lock(postgres_url: str, lock_id: int, *, wait_seconds: float | None = None):
+        calls.append((postgres_url, lock_id, wait_seconds))
+        yield True
+
+    monkeypatch.setenv("SLACK_SYNC_LOCK_POSTGRES_URL", "postgresql://postgres/slack")
+    monkeypatch.setattr(
+        "personal_data_warehouse.sync_locks.exclusive_postgres_advisory_lock",
+        fake_postgres_lock,
+    )
+
+    with exclusive_sync_lock(name="slack", postgres_lock_id=1234, wait_seconds=42) as acquired:
+        assert acquired
+
+    assert calls == [("postgresql://postgres/slack", 1234, 42)]
+
+
+def test_exclusive_process_lock_times_out_when_held(tmp_path) -> None:
+    lock_path = tmp_path / "sync.lock"
+
+    with exclusive_process_lock(lock_path) as first_acquired:
+        assert first_acquired
+        # A bounded wait gives up and reports failure when the holder never releases.
+        with exclusive_process_lock(lock_path, wait_seconds=0.2) as second_acquired:
+            assert not second_acquired
+
+
+def test_exclusive_process_lock_waits_for_release(tmp_path) -> None:
+    import threading
+    import time
+
+    lock_path = tmp_path / "sync.lock"
+    holder = exclusive_process_lock(lock_path)
+    assert holder.__enter__() is True
+
+    def release_after_delay() -> None:
+        time.sleep(0.2)
+        holder.__exit__(None, None, None)
+
+    releaser = threading.Thread(target=release_after_delay)
+    releaser.start()
+    try:
+        # The blocking waiter queues behind the holder and acquires once it frees.
+        with exclusive_process_lock(lock_path, wait_seconds=5) as acquired:
+            assert acquired
+    finally:
+        releaser.join()
