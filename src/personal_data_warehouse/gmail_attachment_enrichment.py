@@ -26,6 +26,7 @@ from typing import Any, Callable
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from personal_data_warehouse.agent_runner import (
+    DEFAULT_AGENT_INPUTS_DIR_NAME,
     AgentRunRequest,
     AgentRunResult,
     agent_run_event_rows,
@@ -552,13 +553,23 @@ def attachment_vision_schema() -> dict[str, Any]:
 
 
 def attachment_vision_prompt(*, image_name: str, candidate: Mapping[str, Any]) -> str:
+    # The image path is given relative to the agent's working directory (the run
+    # dir), which is exactly where the inputs/ subdir lives. Image-viewing tools
+    # such as codex's view_image receive this string verbatim and do NOT perform
+    # shell/env expansion, so advertising "$AGENT_INPUT_DIR/..." led the model to
+    # guess the expansion and drop the "inputs/" segment, opening a nonexistent
+    # "<workdir>/attachment.jpg". A concrete relative path needs no expansion.
+    relative_image_path = f"{DEFAULT_AGENT_INPUTS_DIR_NAME}/{image_name}"
     payload = {
         "task": "Extract searchable metadata from one Gmail attachment image.",
         "image": {
-            "path": f"$AGENT_INPUT_DIR/{image_name}",
+            "path": relative_image_path,
             "how_to_view": (
-                "Open the image file with your image-viewing capability "
-                "(codex: the view_image tool; claude: the Read tool) before answering."
+                "Open this exact image path with your image-viewing capability "
+                "(codex: the view_image tool; claude: the Read tool) before answering. "
+                "The path is relative to your current working directory: pass it "
+                "verbatim and do not shorten it to the bare filename or drop the "
+                "leading directory."
             ),
             "original_filename": str(candidate.get("filename", "")),
             "original_mime_type": str(candidate.get("mime_type", "")),

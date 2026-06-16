@@ -276,7 +276,13 @@ def test_attachment_vision_prompt_points_agent_at_input_file() -> None:
     )
     payload = json.loads(prompt)
 
-    assert payload["image"]["path"] == "$AGENT_INPUT_DIR/attachment.jpg"
+    # The path must be a concrete working-directory-relative path that needs no
+    # shell/env expansion. Image-viewing tools (e.g. codex's view_image) receive
+    # this string verbatim; advertising "$AGENT_INPUT_DIR/..." made the model
+    # guess the expansion and drop the "inputs/" segment, so the agent opened a
+    # nonexistent "<workdir>/attachment.jpg" ("unable to locate image").
+    assert payload["image"]["path"] == "inputs/attachment.jpg"
+    assert "$AGENT_INPUT_DIR" not in prompt
     assert payload["image"]["original_filename"] == "logo.png"
     assert payload["final_output_contract"]["schema"] == attachment_vision_schema()
     assert "view_image" in payload["image"]["how_to_view"]
