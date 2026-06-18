@@ -26,6 +26,7 @@ from personal_data_warehouse.defs.gmail_sync import (
 )
 from personal_data_warehouse.gmail_attachment_enrichment import (
     AGENT_ATTACHMENT_PROMPT_VERSION,
+    DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
     DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     GmailAttachmentEnrichmentRunner,
     has_attachment_enrichment_candidate,
@@ -40,6 +41,7 @@ DEFAULT_GMAIL_ATTACHMENT_ENRICHMENT_BATCH_SIZE = 25
 GMAIL_ATTACHMENT_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 120
 GMAIL_ATTACHMENT_ENRICHMENT_BATCH_SIZE_ENV = "GMAIL_ATTACHMENT_ENRICHMENT_BATCH_SIZE"
 GMAIL_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV = "GMAIL_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS"
+GMAIL_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS_ENV = "GMAIL_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS"
 
 
 @asset(
@@ -110,6 +112,7 @@ def gmail_attachment_enrichment_backlog_sensor(context):
         model=settings.agent.model,
         prompt_version=AGENT_ATTACHMENT_PROMPT_VERSION,
         max_error_attempts=gmail_attachment_enrichment_max_error_attempts(),
+        error_window_days=gmail_attachment_enrichment_error_window_days(),
     )
     if not has_candidate:
         return SkipReason("No Gmail attachments are waiting for agent enrichment.")
@@ -137,6 +140,7 @@ def gmail_attachment_enrichment_runner(
         prompt_version=AGENT_ATTACHMENT_PROMPT_VERSION,
         text_max_chars=settings.gmail_attachment_text_max_chars,
         max_error_attempts=gmail_attachment_enrichment_max_error_attempts(),
+        error_window_days=gmail_attachment_enrichment_error_window_days(),
     )
 
 
@@ -171,6 +175,16 @@ def gmail_attachment_enrichment_max_error_attempts() -> int:
     if attempts < 0:
         raise ValueError(f"{GMAIL_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV} must be non-negative")
     return attempts
+
+
+def gmail_attachment_enrichment_error_window_days() -> int:
+    value = os.getenv(GMAIL_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS_ENV, "").strip()
+    if not value:
+        return DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS
+    days = int(value)
+    if days < 0:
+        raise ValueError(f"{GMAIL_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS_ENV} must be non-negative")
+    return days
 
 
 @definitions

@@ -510,12 +510,17 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
             ]
         )
 
+    # This test isolates the attempt-budget dimension, so disable the rolling
+    # error window (error_window_days=0) and count every historical failure.
+    # The flaky runs are stamped at the fixed 2026-06-01 base time, which a
+    # real-clock window would otherwise age out. Windowing has its own test.
     assert has_attachment_enrichment_candidate(
         warehouse,
         provider=provider,
         model=model,
         prompt_version=version,
         max_error_attempts=3,
+        error_window_days=0,
     )
 
     candidates = load_attachment_enrichment_candidates(
@@ -525,6 +530,7 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
         prompt_version=version,
         limit=10,
         max_error_attempts=3,
+        error_window_days=0,
     )
 
     assert {candidate["content_sha256"] for candidate in candidates} == {"sha-pending", "sha-pdf"}
@@ -541,6 +547,7 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
         prompt_version=version,
         limit=10,
         max_error_attempts=5,
+        error_window_days=0,
     )
     assert "sha-flaky" in {candidate["content_sha256"] for candidate in retried}
 
@@ -552,6 +559,7 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
         model=model,
         prompt_version=version,
         max_error_attempts=3,
+        error_window_days=0,
     )
     assert has_attachment_enrichment_candidate(
         warehouse,
@@ -559,7 +567,127 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
         model=model,
         prompt_version=version,
         max_error_attempts=5,
+        error_window_days=0,
     )
+
+
+def test_postgres_attachment_enrichment_error_window_ages_out_stale_failures(warehouse: PostgresWarehouse) -> None:
+    """Stale failures (e.g. attempts exhausted on a since-fixed bug) age out of
+    the rolling window so the attachment can be retried, while recent failures
+    still count against the per-attachment attempt budget."""
+    from datetime import datetime as _datetime
+
+    from personal_data_warehouse.agent_runner import AgentRunResult, agent_run_row
+    from personal_data_warehouse.gmail_attachment_enrichment import (
+        AGENT_ATTACHMENT_PROMPT_VERSION,
+        AGENT_ATTACHMENT_TASK_TYPE,
+        load_attachment_enrichment_candidates,
+    )
+    from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS
+
+    warehouse.ensure_tables()
+    warehouse.ensure_agent_tables()
+    account = "zach@example.test"
+    base = datetime(2026, 6, 1, tzinfo=UTC)
+    provider, model, version = "agent_codex", "", AGENT_ATTACHMENT_PROMPT_VERSION
+    # Failure timestamps are measured against the database's real now(), so use a
+    # real-clock anchor rather than the fixed base time the rows are stamped with.
+    real_now = _datetime.now(tz=UTC)
+
+    def insert_attachment(message_id: str, *, sha: str) -> None:
+        warehouse.insert_attachments(
+            [
+                _default_row(
+                    ATTACHMENT_COLUMNS,
+                    account=account,
+                    message_id=message_id,
+                    part_id="1",
+                    filename=f"{sha}.png",
+                    mime_type="image/png",
+                    content_sha256=sha,
+                    size=2048,
+                    storage_backend="google_drive",
+                    storage_key=f"gmail-attachments/library/{sha}",
+                    storage_file_id=f"drive-{sha}",
+                    storage_status="stored",
+                    internal_date=base,
+                    is_deleted=0,
+                    synced_at=base,
+                    sync_version=1,
+                )
+            ]
+        )
+        warehouse.insert_attachment_enrichments(
+            [
+                _default_row(
+                    ATTACHMENT_ENRICHMENT_COLUMNS,
+                    content_sha256=sha,
+                    ai_provider="",
+                    ai_model="",
+                    ai_prompt_version="",
+                    text_extraction_status="unsupported",
+                    updated_at=base,
+                    sync_version=1,
+                )
+            ]
+        )
+
+    def insert_failures(sha: str, *, started_at: datetime, count: int) -> None:
+        for attempt in range(count):
+            warehouse.insert_agent_runs(
+                [
+                    agent_run_row(
+                        AgentRunResult(
+                            run_id=f"{sha}-run-{attempt}",
+                            provider="codex",
+                            model="",
+                            task_type=AGENT_ATTACHMENT_TASK_TYPE,
+                            subject_id=sha,
+                            prompt_version=version,
+                            input_sha256="x",
+                            status="error",
+                            final_output_json={},
+                            error="unable to locate image",
+                            exit_code=1,
+                            started_at=started_at + timedelta(seconds=attempt),
+                            completed_at=started_at + timedelta(seconds=attempt + 1),
+                            events=[],
+                        )
+                    )
+                ]
+            )
+
+    # Exhausted its 3 attempts 40 days ago on a since-fixed bug -> should re-enter
+    # the pool once those failures fall outside a 14-day window.
+    insert_attachment("m-stale", sha="sha-stale")
+    insert_failures("sha-stale", started_at=real_now - timedelta(days=40), count=3)
+    # Exhausted its 3 attempts yesterday -> still inside the window, stays excluded.
+    insert_attachment("m-recent", sha="sha-recent")
+    insert_failures("sha-recent", started_at=real_now - timedelta(days=1), count=3)
+
+    def candidate_shas(*, error_window_days: int) -> set[str]:
+        return {
+            candidate["content_sha256"]
+            for candidate in load_attachment_enrichment_candidates(
+                warehouse,
+                provider=provider,
+                model=model,
+                prompt_version=version,
+                limit=10,
+                max_error_attempts=3,
+                error_window_days=error_window_days,
+            )
+        }
+
+    windowed = candidate_shas(error_window_days=14)
+    assert "sha-stale" in windowed
+    assert "sha-recent" not in windowed
+
+    # Disabling the window restores the old "count every failure forever" behavior:
+    # both attachments are at the attempt cap, so neither is a candidate.
+    unwindowed = candidate_shas(error_window_days=0)
+    assert "sha-stale" not in unwindowed
+    assert "sha-recent" not in unwindowed
 
 
 def test_postgres_insert_normalizes_nul_text_values() -> None:

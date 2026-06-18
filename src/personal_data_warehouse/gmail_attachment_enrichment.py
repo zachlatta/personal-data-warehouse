@@ -38,6 +38,13 @@ AGENT_ATTACHMENT_TASK_TYPE = "gmail_attachment_enrichment"
 AGENT_ATTACHMENT_PROMPT_VERSION = "gmail-attachment-agent-v1"
 AGENT_ATTACHMENT_INPUT_BASENAME = "attachment"
 DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 3
+# Only errors within this rolling window count toward the per-attachment retry
+# cap. Without it, errors accumulate forever, so attachments that exhausted
+# their attempts on a since-fixed bug (e.g. a harness "unable to locate image"
+# failure) would stay permanently excluded even after the bug is gone. The
+# window lets those attachments re-enter the candidate pool once the stale
+# failures age out. Set the window to 0 to count every historical error.
+DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS = 14
 
 STATUS_OK = "agent_ok"
 STATUS_NOT_USEFUL = "agent_not_useful"
@@ -95,6 +102,7 @@ class GmailAttachmentEnrichmentRunner:
         prompt_version: str = AGENT_ATTACHMENT_PROMPT_VERSION,
         text_max_chars: int = 20_000,
         max_error_attempts: int = DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
+        error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._warehouse = warehouse
@@ -106,6 +114,7 @@ class GmailAttachmentEnrichmentRunner:
         self._prompt_version = prompt_version
         self._text_max_chars = text_max_chars
         self._max_error_attempts = max_error_attempts
+        self._error_window_days = error_window_days
         self._now = now or (lambda: datetime.now(tz=UTC))
         self._object_stores: dict[str, Any] = {}
 
@@ -123,6 +132,7 @@ class GmailAttachmentEnrichmentRunner:
             prompt_version=self._prompt_version,
             limit=limit,
             max_error_attempts=self._max_error_attempts,
+            error_window_days=self._error_window_days,
         )
         enriched = 0
         not_useful = 0
@@ -268,6 +278,17 @@ class GmailAttachmentEnrichmentRunner:
         return store
 
 
+def _error_window_clause(error_window_days: int) -> tuple[str, list[Any]]:
+    """SQL fragment + params that limit the failed-run count to a recent window.
+
+    Returns an empty fragment (count every historical error) when the window is
+    zero or negative, matching the "disabled" semantics of ``max_error_attempts``.
+    """
+    if error_window_days and int(error_window_days) > 0:
+        return "AND started_at > now() - make_interval(days => %s)", [int(error_window_days)]
+    return "", []
+
+
 def load_attachment_enrichment_candidates(
     warehouse,
     *,
@@ -276,11 +297,13 @@ def load_attachment_enrichment_candidates(
     prompt_version: str,
     limit: int | None,
     max_error_attempts: int = DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
+    error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
 ) -> list[dict[str, Any]]:
     """Image (or scanned-PDF) attachments stored in the object store that have
     no completed agent enrichment for this provider/model/prompt identity."""
     image_mime_types = list(IMAGE_MIME_TYPES)
     image_extension_patterns = [f"%{extension}" for extension in IMAGE_EXTENSIONS]
+    error_window_sql, error_window_params = _error_window_clause(error_window_days)
     columns = (
         "account",
         "content_sha256",
@@ -296,6 +319,7 @@ def load_attachment_enrichment_candidates(
     limit_sql = "LIMIT %s" if limit is not None and limit > 0 else ""
     params: list[Any] = [
         AGENT_ATTACHMENT_TASK_TYPE,
+        *error_window_params,
         MIN_IMAGE_BYTES,
         int(max_error_attempts),
         image_mime_types,
@@ -315,6 +339,7 @@ def load_attachment_enrichment_candidates(
             FROM agent_runs
             WHERE task_type = %s
               AND status = 'error'
+              {error_window_sql}
             GROUP BY subject_id
         )
         SELECT account, content_sha256, filename, mime_type, size,
@@ -379,17 +404,20 @@ def has_attachment_enrichment_candidate(
     model: str,
     prompt_version: str,
     max_error_attempts: int = DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
+    error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
 ) -> bool:
     """Return whether at least one stored attachment needs agent enrichment."""
     image_mime_types = list(IMAGE_MIME_TYPES)
     image_extension_patterns = [f"%{extension}" for extension in IMAGE_EXTENSIONS]
+    error_window_sql, error_window_params = _error_window_clause(error_window_days)
     rows = warehouse._query(
-        """
+        f"""
         WITH failed_runs AS (
             SELECT subject_id, count(*) AS error_attempts
             FROM agent_runs
             WHERE task_type = %s
               AND status = 'error'
+              {error_window_sql}
             GROUP BY subject_id
         )
         SELECT 1
@@ -427,6 +455,7 @@ def has_attachment_enrichment_candidate(
         """,
         (
             AGENT_ATTACHMENT_TASK_TYPE,
+            *error_window_params,
             MIN_IMAGE_BYTES,
             int(max_error_attempts),
             image_mime_types,
