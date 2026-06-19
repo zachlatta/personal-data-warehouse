@@ -2685,8 +2685,10 @@ class PostgresWarehouse:
         *,
         stale_after: timedelta,
         idempotent_operations: Sequence[tuple[str, str]],
+        ensure_tables: bool = True,
     ) -> int:
-        self.ensure_upstream_mutation_tables()
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
         if not idempotent_operations:
             return 0
         cutoff = datetime.now(tz=UTC) - stale_after
@@ -2842,8 +2844,9 @@ class PostgresWarehouse:
         if mutation and mutation.get("request_id"):
             self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
 
-    def approved_upstream_mutation_count(self) -> int:
-        self.ensure_upstream_mutation_tables()
+    def approved_upstream_mutation_count(self, *, ensure_tables: bool = True) -> int:
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
         rows = self._query(
             """
             SELECT count(*)::bigint

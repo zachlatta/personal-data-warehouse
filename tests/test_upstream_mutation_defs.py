@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
 from dagster import DagsterInstance, RunRequest, SkipReason, build_sensor_context
 
 from personal_data_warehouse.defs import upstream_mutations as upstream_mutation_defs
@@ -36,20 +37,28 @@ class FakeWarehouse:
         self.claim_limit = None
         self.claimed_by = None
         self.ensure_called = False
+        self.ensure_call_count = 0
         self.message_id_lookups = []
         self.reclaimed_count = reclaimed
         self.reclaim_calls = []
         self.stale_reclaimable_count = stale_reclaimable_count
         self.stale_reclaimable_calls = []
+        self.approved_count_ensure_flags = []
+        self.stale_reclaimable_ensure_flags = []
 
     def ensure_upstream_mutation_tables(self) -> None:
         self.ensure_called = True
+        self.ensure_call_count += 1
 
-    def approved_upstream_mutation_count(self) -> int:
+    def approved_upstream_mutation_count(self, *, ensure_tables: bool = True) -> int:
+        self.approved_count_ensure_flags.append(ensure_tables)
         return self.approved_count
 
-    def stale_reclaimable_upstream_mutation_count(self, *, stale_after, idempotent_operations) -> int:
+    def stale_reclaimable_upstream_mutation_count(
+        self, *, stale_after, idempotent_operations, ensure_tables: bool = True
+    ) -> int:
         self.stale_reclaimable_calls.append((stale_after, tuple(idempotent_operations)))
+        self.stale_reclaimable_ensure_flags.append(ensure_tables)
         return self.stale_reclaimable_count
 
     def observe_succeeded_gmail_archive_mutations(self) -> int:
@@ -125,6 +134,15 @@ class FakeGmailExecutor(FakeExecutor):
         return self.batch_results.pop(0)
 
 
+@pytest.fixture(autouse=True)
+def _reset_sensor_table_bootstrap():
+    # The sensor bootstraps the upstream-mutation tables once per process via a
+    # module-level guard; reset it so each test starts from a clean slate.
+    upstream_mutation_defs._upstream_mutation_tables_ensured = False
+    yield
+    upstream_mutation_defs._upstream_mutation_tables_ensured = False
+
+
 def test_upstream_mutation_sensor_runs_every_ten_seconds() -> None:
     sensor = upstream_mutation_defs.upstream_mutation_sensor
 
@@ -198,6 +216,41 @@ def test_upstream_mutation_sensor_skips_when_no_approved_or_reclaimable_work(mon
     assert result.skip_message == "No approved or stale reclaimable upstream mutations found."
     assert len(warehouse.stale_reclaimable_calls) == 1
     assert warehouse.closed is True
+
+
+def test_upstream_mutation_sensor_does_not_run_ddl_on_the_count_hot_path(monkeypatch) -> None:
+    warehouse = FakeWarehouse()
+    monkeypatch.setattr(upstream_mutation_defs, "load_settings", lambda **_kwargs: object())
+    monkeypatch.setattr(upstream_mutation_defs, "warehouse_from_settings", lambda _settings: warehouse)
+
+    with DagsterInstance.ephemeral() as instance:
+        upstream_mutation_defs.upstream_mutation_sensor(build_sensor_context(instance=instance))
+
+    # The count queries must not trigger the expensive table/view DDL.
+    assert warehouse.approved_count_ensure_flags == [False]
+    assert warehouse.stale_reclaimable_ensure_flags == [False]
+
+
+def test_upstream_mutation_sensor_bootstraps_tables_only_once_per_process(monkeypatch) -> None:
+    warehouses: list[FakeWarehouse] = []
+
+    def build_warehouse(_settings):
+        warehouse = FakeWarehouse()
+        warehouses.append(warehouse)
+        return warehouse
+
+    monkeypatch.setattr(upstream_mutation_defs, "load_settings", lambda **_kwargs: object())
+    monkeypatch.setattr(upstream_mutation_defs, "warehouse_from_settings", build_warehouse)
+
+    with DagsterInstance.ephemeral() as instance:
+        upstream_mutation_defs.upstream_mutation_sensor(build_sensor_context(instance=instance))
+        upstream_mutation_defs.upstream_mutation_sensor(build_sensor_context(instance=instance))
+
+    # First tick bootstraps the tables; subsequent ticks reuse them and never
+    # re-run the per-tick DDL that was timing out in production.
+    assert warehouses[0].ensure_call_count == 1
+    assert warehouses[1].ensure_call_count == 0
+    assert all(wh.closed for wh in warehouses)
 
 
 def test_process_upstream_mutation_batch_completes_and_fails_claimed_rows() -> None:
