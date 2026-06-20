@@ -307,7 +307,7 @@ func (s *Service) Execute(ctx context.Context, statements []Statement, previewRo
 		s.logger.DebugContext(ctx, "query started", "question", statement.Question, "sql", statement.SQL)
 		raw, err := s.runner.Query(ctx, statement.SQL, s.opts.MaxRows+1)
 		if err != nil {
-			result.Error = err.Error()
+			result.Error = queryErrorWithHint(err.Error())
 			results = append(results, result)
 			s.logger.ErrorContext(ctx, "query failed", "question", statement.Question, "sql", statement.SQL, "error", err, "duration", time.Since(queryStarted))
 			continue
@@ -519,7 +519,7 @@ func (s *Service) ExecuteFull(ctx context.Context, question, sql, format string)
 	s.logger.InfoContext(ctx, "sql started", "question", question, "sql", sql, "format", format, "row_cap", FullQueryRowCap)
 	raw, err := s.runner.Query(ctx, sql, FullQueryRowCap+1)
 	if err != nil {
-		resp.Error = err.Error()
+		resp.Error = queryErrorWithHint(err.Error())
 		s.logger.ErrorContext(ctx, "sql failed", "question", question, "sql", sql, "error", err, "duration", time.Since(started))
 		return resp
 	}
@@ -675,6 +675,7 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 	out.WriteString(database)
 	out.WriteString(".\").\n")
 	out.WriteString("-- Each column header below is annotated with its Postgres type in parentheses, e.g. is_deleted (bigint), to_addresses (text[]).\n")
+	out.WriteString("-- Datetime columns: each source names its primary time column differently, so do not guess — whatsapp_messages.message_at, apple_messages.message_at, slack_messages.message_datetime, gmail_messages.internal_date, and all four are timestamp with time zone. Filter and compare timestamptz columns against timestamps, never epoch integers: message_at >= '2026-01-01', not message_at > 1700000000 (which errors with \"operator does not exist: timestamp with time zone > integer\"). Some neighbouring time columns are NOT timestamps and need converting before comparison: slack_messages.message_ts/edited_ts and gmail_messages.date_header are text, and apple_messages.date_ns is a bigint epoch in NANOseconds. There is no `timestamp` or `date_unix` column on any of these tables; when unsure, the column header's (type) annotation is authoritative.\n")
 	out.WriteString("-- Each table lists its indexes. A gin (col gin_trgm_ops) index makes ILIKE and ~/~* substring search fast on that one column: match the column directly, e.g. body_text ILIKE '%x%' OR subject ILIKE '%x%'. Wrapping columns in lower(a || b || ...) or casting (to_addresses::text) bypasses every index and forces a full table scan, so search each indexed column separately and keep un-indexed expressions out of the same OR.\n")
 	out.WriteString("-- A bm25 (col) index supports relevance-ranked word search: SELECT ..., col <@> 'search terms' AS score FROM t ORDER BY col <@> 'search terms' LIMIT 20. Scores are negative (more negative = better; non-matches score 0); ALWAYS pair <@> with that ORDER BY plus a LIMIT, otherwise the index is not used. BM25 matches stemmed whole words only — no phrase queries and no typo tolerance — so for possibly-misspelled terms switch to the trigram indexes: WHERE col %> 'qery' ORDER BY word_similarity('qery', col) DESC LIMIT 20. Rule of thumb: <@> for topics and wording you trust, %> for fuzzy/typo'd terms, ILIKE for exact substrings.\n")
 	out.WriteString("-- Cross-source search (the default way to find things across the warehouse): SELECT * FROM search_text('offer letter', 50). It fans out to the per-table BM25 indexes and returns (source, subsource, context, who, occurred_at, account, ref, text, score) ranked across EVERY source — gmail, gmail attachments, slack messages/channels/files, apple notes, imessage, whatsapp, meeting transcripts, calendar, contacts, agent runs/sessions, and mutations — with score lower (more negative) = better. Optional args: search_text(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01'). Use it for any broad 'find every mention of X' question; then drill into the underlying table via ref for full rows. (There is no cross-source view to scan with ILIKE — single-table BM25 <@> / trigram %> / ILIKE are for when you already know the table.)\n")
@@ -992,6 +993,37 @@ func csvValue(value any) string {
 		}
 		return fmt.Sprint(value)
 	}
+}
+
+// queryErrorWithHint appends a one-line recovery hint to a Postgres error
+// message when the error matches a common agent mistake against this warehouse.
+// Agents repeatedly guess the wrong datetime column name (each source names its
+// primary time column differently) or compare a timestamptz column to an epoch
+// integer; both surface as opaque Postgres errors with no recovery path. The
+// hint points back at schema_overview and names the canonical time columns so
+// the next attempt is correct instead of another blind guess. When the error is
+// not one of these shapes the message is returned unchanged.
+func queryErrorWithHint(message string) string {
+	if hint := datetimeErrorHint(message); hint != "" {
+		return message + " " + hint
+	}
+	return message
+}
+
+func datetimeErrorHint(message string) string {
+	// Comparing a timestamptz column to an epoch int, e.g. message_at > 1700000000.
+	// Postgres reports SQLSTATE 42883 ("operator does not exist") naming both sides.
+	if strings.Contains(message, "operator does not exist") &&
+		strings.Contains(message, "timestamp with time zone") &&
+		(strings.Contains(message, "integer") || strings.Contains(message, "bigint") || strings.Contains(message, "numeric")) {
+		return "(hint: that column is timestamp with time zone — compare it to a timestamp, not an epoch integer, e.g. message_at >= '2026-01-01' instead of message_at > 1700000000.)"
+	}
+	// A guessed column that does not exist (SQLSTATE 42703), e.g. `timestamp` or
+	// `date_unix` on a messages table.
+	if strings.Contains(message, "does not exist") && strings.Contains(message, "42703") {
+		return "(hint: column names differ per source — run schema_overview (or `columns <table>`) for the exact columns and their (type) annotations. The primary time column is message_at on whatsapp_messages and apple_messages, message_datetime on slack_messages, and internal_date on gmail_messages, all timestamp with time zone.)"
+	}
+	return ""
 }
 
 func errorCSV(message string) string {

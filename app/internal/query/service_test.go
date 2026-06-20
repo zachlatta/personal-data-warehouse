@@ -170,6 +170,7 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	wantCSV := strings.Join([]string{
 		"-- Reference these tables by their bare name in FROM/JOIN (e.g. FROM gmail_messages). Do not prefix them with the database name (\"default.\").",
 		"-- Each column header below is annotated with its Postgres type in parentheses, e.g. is_deleted (bigint), to_addresses (text[]).",
+		"-- Datetime columns: each source names its primary time column differently, so do not guess — whatsapp_messages.message_at, apple_messages.message_at, slack_messages.message_datetime, gmail_messages.internal_date, and all four are timestamp with time zone. Filter and compare timestamptz columns against timestamps, never epoch integers: message_at >= '2026-01-01', not message_at > 1700000000 (which errors with \"operator does not exist: timestamp with time zone > integer\"). Some neighbouring time columns are NOT timestamps and need converting before comparison: slack_messages.message_ts/edited_ts and gmail_messages.date_header are text, and apple_messages.date_ns is a bigint epoch in NANOseconds. There is no `timestamp` or `date_unix` column on any of these tables; when unsure, the column header's (type) annotation is authoritative.",
 		"-- Each table lists its indexes. A gin (col gin_trgm_ops) index makes ILIKE and ~/~* substring search fast on that one column: match the column directly, e.g. body_text ILIKE '%x%' OR subject ILIKE '%x%'. Wrapping columns in lower(a || b || ...) or casting (to_addresses::text) bypasses every index and forces a full table scan, so search each indexed column separately and keep un-indexed expressions out of the same OR.",
 		"-- A bm25 (col) index supports relevance-ranked word search: SELECT ..., col <@> 'search terms' AS score FROM t ORDER BY col <@> 'search terms' LIMIT 20. Scores are negative (more negative = better; non-matches score 0); ALWAYS pair <@> with that ORDER BY plus a LIMIT, otherwise the index is not used. BM25 matches stemmed whole words only — no phrase queries and no typo tolerance — so for possibly-misspelled terms switch to the trigram indexes: WHERE col %> 'qery' ORDER BY word_similarity('qery', col) DESC LIMIT 20. Rule of thumb: <@> for topics and wording you trust, %> for fuzzy/typo'd terms, ILIKE for exact substrings.",
 		"-- Cross-source search (the default way to find things across the warehouse): SELECT * FROM search_text('offer letter', 50). It fans out to the per-table BM25 indexes and returns (source, subsource, context, who, occurred_at, account, ref, text, score) ranked across EVERY source — gmail, gmail attachments, slack messages/channels/files, apple notes, imessage, whatsapp, meeting transcripts, calendar, contacts, agent runs/sessions, and mutations — with score lower (more negative) = better. Optional args: search_text(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01'). Use it for any broad 'find every mention of X' question; then drill into the underlying table via ref for full rows. (There is no cross-source view to scan with ILIKE — single-table BM25 <@> / trigram %> / ILIKE are for when you already know the table.)",
@@ -385,6 +386,90 @@ func TestServiceExecuteReportsPerQueryErrors(t *testing.T) {
 	}
 	if !strings.Contains(resp.Results[2].Error, "read-only") {
 		t.Fatalf("third error = %q", resp.Results[2].Error)
+	}
+}
+
+func TestDatetimeErrorHint(t *testing.T) {
+	cases := []struct {
+		name    string
+		message string
+		want    string
+	}{
+		{
+			name:    "missing column",
+			message: `ERROR: column "date_unix" does not exist (SQLSTATE 42703)`,
+			want:    "schema_overview",
+		},
+		{
+			name:    "missing timestamp column",
+			message: `ERROR: column "timestamp" does not exist (SQLSTATE 42703)`,
+			want:    "schema_overview",
+		},
+		{
+			name:    "timestamptz compared to integer",
+			message: "ERROR: operator does not exist: timestamp with time zone > integer (SQLSTATE 42883)",
+			want:    "compare it to a timestamp",
+		},
+		{
+			name:    "timestamptz compared to bigint",
+			message: "ERROR: operator does not exist: timestamp with time zone >= bigint (SQLSTATE 42883)",
+			want:    "compare it to a timestamp",
+		},
+		{
+			name:    "unrelated error gets no hint",
+			message: "ERROR: syntax error at or near \"FROM\" (SQLSTATE 42601)",
+			want:    "",
+		},
+		{
+			name:    "unrelated operator error gets no hint",
+			message: "ERROR: operator does not exist: text > integer (SQLSTATE 42883)",
+			want:    "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := datetimeErrorHint(c.message)
+			if c.want == "" {
+				if got != "" {
+					t.Fatalf("datetimeErrorHint(%q) = %q, want empty", c.message, got)
+				}
+				return
+			}
+			if !strings.Contains(got, c.want) {
+				t.Fatalf("datetimeErrorHint(%q) = %q, want it to contain %q", c.message, got, c.want)
+			}
+			// The hint must be appended to the original message, not replace it.
+			if combined := queryErrorWithHint(c.message); !strings.HasPrefix(combined, c.message) || !strings.Contains(combined, got) {
+				t.Fatalf("queryErrorWithHint(%q) = %q, want original message plus hint", c.message, combined)
+			}
+		})
+	}
+}
+
+func TestServiceExecuteAppendsDatetimeHintToError(t *testing.T) {
+	const sql = "SELECT count(*) FROM whatsapp_messages WHERE message_at > 1700000000"
+	svc := NewService(fakeRunner{
+		errs: map[string]error{sql: errors.New("ERROR: operator does not exist: timestamp with time zone > integer (SQLSTATE 42883)")},
+	}, Options{MaxRows: 5, MaxFieldChars: 100})
+
+	resp := svc.Execute(context.Background(), []Statement{statement("How many recent WhatsApp messages?", sql)}, 20, "csv")
+	if len(resp.Results) != 1 {
+		t.Fatalf("results length = %d, want 1", len(resp.Results))
+	}
+	if !strings.Contains(resp.Results[0].Error, "compare it to a timestamp") {
+		t.Fatalf("error = %q, want it to contain the datetime hint", resp.Results[0].Error)
+	}
+}
+
+func TestServiceExecuteFullAppendsMissingColumnHintToError(t *testing.T) {
+	const sql = "SELECT count(*) FROM apple_messages WHERE date_unix > 1700000000"
+	svc := NewService(fakeRunner{
+		errs: map[string]error{sql: errors.New(`ERROR: column "date_unix" does not exist (SQLSTATE 42703)`)},
+	}, Options{MaxRows: 5, MaxFieldChars: 100})
+
+	resp := svc.ExecuteFull(context.Background(), "How many recent iMessages?", sql, "csv")
+	if !strings.Contains(resp.Error, "schema_overview") {
+		t.Fatalf("error = %q, want it to contain the missing-column hint", resp.Error)
 	}
 }
 
