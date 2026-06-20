@@ -70,6 +70,13 @@ COMMANDS
                                                   $PDW_REPO or zachlatta/personal-data-warehouse).
   help                       Show this message.
 
+AUTO-UPDATE
+  Every invocation also kicks off a throttled background self-update (at most
+  once every 5 minutes) so the binary stays current without running "update"
+  by hand. It runs detached and never blocks or fails the command; the new
+  binary is picked up on the next invocation. Set PDW_NO_AUTO_UPDATE=1 to
+  disable it.
+
 CONFIGURATION
   Values resolve in this order: --flag > environment > config file > default.
   Run "pdw login" once to write $XDG_CONFIG_HOME/pdw/config.json
@@ -81,6 +88,7 @@ ENVIRONMENT
   PDW_CLIENT_NAME    Client identifier sent on every request. Default: pdw.
   PDW_REPO           GitHub repo for self-update. Default: zachlatta/personal-data-warehouse.
                      (The legacy PDW_CLI_REPO name is still honored.)
+  PDW_NO_AUTO_UPDATE Set to 1/true to disable the background auto-update.
   XDG_CONFIG_HOME    Overrides the config directory root.
 
 EXAMPLES
@@ -140,6 +148,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	} else {
 		cmd, rest = rest[0], rest[1:]
 	}
+
+	// The hidden background worker performs the throttled self-update and
+	// exits. Dispatch it before maybeAutoUpdate so it never spawns another.
+	if cmd == autoUpdateCommand {
+		return runAutoUpdateWorker(rest, getenv)
+	}
+	// Best-effort, non-blocking: kick a debounced background self-update so
+	// the binary keeps itself current without a manual `pdw update`.
+	maybeAutoUpdate(cmd, getenv)
 
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		fmt.Fprint(stdout, usage)

@@ -513,6 +513,22 @@ Override the GitHub repo with `PDW_REPO` or `--repo` (legacy `PDW_CLI_REPO`
 is still honored; the test suite uses both `--repo` and `--github-api` to
 drive end-to-end fakes).
 
+#### Background auto-update
+
+You rarely need to run `pdw update` by hand: every invocation also kicks off a
+throttled background self-update. On each run `pdw` checks a stamp file next to
+its config (`$XDG_CONFIG_HOME/pdw/auto-update.json`); if more than five minutes
+have passed since the last attempt, it records a fresh stamp and spawns a
+detached copy of itself running the hidden `__auto-update` worker, which does
+the same download-verify-replace as `pdw update`. The foreground command never
+blocks on it and never fails because of it — the refreshed binary is simply
+picked up on the next invocation. The five-minute debounce means a burst of
+calls (e.g. an agent firing many queries) costs at most one GitHub check.
+
+Auto-update is skipped for local `dev` builds (so a hand-built binary is never
+clobbered), for the `update`/`version`/`help` commands, and whenever
+`PDW_NO_AUTO_UPDATE=1` (or `true`/`yes`/`on`) is set.
+
 ## Verify
 
 ```bash
