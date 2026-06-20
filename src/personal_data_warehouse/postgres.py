@@ -5180,19 +5180,35 @@ class PostgresWarehouse:
         # DDL or DML at call time — only EXECUTE ... SELECT and array building.
         # Each branch's rows are array_agg'd into the search_text_hit row type;
         # we then unnest, filter, rank, and limit across every source that
-        # succeeded. The row type + function are dropped and recreated together so
-        # a column change stays clean.
+        # succeeded.
+        #
+        # The row type is created ONLY if absent (stable OID), never dropped on a
+        # routine ensure. ensure_* runs constantly, and dropping + recreating the
+        # type each time churns its OID — the already-compiled function (which
+        # binds search_text_hit by OID) and any cached plan then fail mid-call
+        # with "cache lookup failed for type <stale oid>". The function is
+        # CREATE OR REPLACE'd (stable OID, same return type) over that fixed type.
+        # Changing search_text_hit's columns therefore needs a manual
+        # DROP TYPE ... CASCADE first (rare; the column set is stable).
         branch_array = ",\n                        ".join(f"$b${b}$b$" for b in branches)
         self._command(
             r"""
-            DROP FUNCTION IF EXISTS search_text(text, integer, text[], timestamptz);
-            DROP TYPE IF EXISTS search_text_hit;
-            CREATE TYPE search_text_hit AS (
-                source text, subsource text, context text, who text,
-                occurred_at timestamptz, account text, ref text,
-                text text, score real
-            );
-            CREATE FUNCTION search_text(
+            DO $do$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_type t
+                    JOIN pg_namespace n ON n.oid = t.typnamespace
+                    WHERE t.typname = 'search_text_hit' AND n.nspname = current_schema()
+                ) THEN
+                    CREATE TYPE search_text_hit AS (
+                        source text, subsource text, context text, who text,
+                        occurred_at timestamptz, account text, ref text,
+                        text text, score real
+                    );
+                END IF;
+            END
+            $do$;
+            CREATE OR REPLACE FUNCTION search_text(
                 query text,
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
