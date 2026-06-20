@@ -43,13 +43,17 @@ COMMANDS
                              "call sql" / "call query".
                                --data JSON   Inline JSON input
                                              (aliases: --args, --input, --json).
-  sql [--output FMT] <QUESTION> [SQL]
-                             The one way to run read-only SQL. QUESTION is a
-                             concise plain-English description of what the SQL
-                             answers; it is required so server logs capture the
-                             caller's intent. The SQL itself may be passed as the
-                             second argument, read from --file, or piped on stdin
-                             (which avoids shell-quoting multi-line SQL).
+  sql [--output FMT] [-q QUESTION] [--file PATH] [SQL]
+                             The one way to run read-only SQL. The SQL is the
+                             single positional argument; it may instead be read
+                             from --file or piped on stdin (which avoids
+                             shell-quoting multi-line SQL).
+                               -q, --question TEXT  Concise plain-English
+                                             description of what the SQL answers,
+                                             logged server-side as the caller's
+                                             intent. Optional; when omitted a
+                                             generic "no intent given" marker is
+                                             logged instead.
                                --output FMT  csv, json, or nd-json. If omitted,
                                              defaults to csv and prints a note.
                                --file PATH   Read the SQL statement from a file.
@@ -85,10 +89,11 @@ EXAMPLES
   pdw describe sql
   pdw call schema_overview
   pdw columns gmail_messages
-  pdw sql 'What is one?' 'SELECT 1'
-  pdw sql --output json 'What time is it?' 'SELECT now()'
-  pdw sql --file query.sql 'Find calendar transcripts mentioning Vercel'
-  pdw sql 'Recent Slack messages in a channel' < query.sql
+  pdw sql 'SELECT 1'
+  pdw sql -q 'How many rows?' 'SELECT count(*) FROM gmail_messages'
+  pdw sql --output json -q 'What time is it?' 'SELECT now()'
+  pdw sql -q 'Find calendar transcripts mentioning Vercel' --file query.sql
+  pdw sql -q 'Recent Slack messages in a channel' < query.sql
   pdw config show
   pdw version
   pdw update --check
@@ -253,6 +258,8 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 	fs.SetOutput(io.Discard)
 	output := fs.String("output", "", "output format: csv, json, or nd-json")
 	file := fs.String("file", "", "read the SQL statement from this file instead of an argument")
+	questionFlag := fs.String("question", "", "plain-English description of what the SQL answers, logged server-side as intent")
+	questionShort := fs.String("q", "", "alias for --question")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(stdout, usage)
@@ -267,7 +274,7 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 		fmt.Fprintln(stderr, "pdw sql:", err)
 		return 2
 	}
-	question, sql, code := resolveSQLInput(fs.Args(), *file, stdin, stderr)
+	question, sql, code := resolveSQLInput(fs.Args(), firstNonEmpty(*questionFlag, *questionShort), *file, stdin, stderr)
 	if code != 0 {
 		return code
 	}
@@ -301,59 +308,57 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 	return printSQLRows(payload.Rows, format, stdout)
 }
 
-// resolveSQLInput determines the question and SQL for the sql command. The
-// question is always a positional argument; the SQL body may come from a
-// second positional arg, a --file path, or stdin, so callers can avoid
-// wrapping multi-line, quote-heavy SQL in shell quotes.
-func resolveSQLInput(positional []string, file string, stdin io.Reader, stderr io.Writer) (question, sql string, code int) {
+// Copy-pasteable examples embedded in sql error messages so a failed call
+// recovers in one line instead of sending the caller back to `pdw --help`.
+const (
+	sqlExample      = `pdw sql -q "why you're asking" "SELECT 1"`
+	sqlStdinExample = `pdw sql -q "why you're asking" < query.sql`
+	sqlFileExample  = `pdw sql -q "why you're asking" --file query.sql`
+)
+
+// defaultSQLQuestion is logged as the caller's intent when -q/--question is
+// omitted. It keeps the server-side intent field populated (the server rejects
+// an empty question) while honestly flagging that no intent was stated.
+const defaultSQLQuestion = "(ad-hoc pdw CLI query; no -q intent given)"
+
+// resolveSQLInput determines the question and SQL for the sql command. The SQL
+// is the single positional argument, but may instead come from --file or
+// stdin so callers can avoid wrapping multi-line, quote-heavy SQL in shell
+// quotes. The question is the optional -q/--question flag; when blank it falls
+// back to defaultSQLQuestion so server logs always carry an intent field.
+func resolveSQLInput(positional []string, questionFlag, file string, stdin io.Reader, stderr io.Writer) (question, sql string, code int) {
+	question = strings.TrimSpace(questionFlag)
+	if question == "" {
+		question = defaultSQLQuestion
+	}
 	file = strings.TrimSpace(file)
 	switch {
 	case file != "":
-		if len(positional) == 0 {
-			fmt.Fprintln(stderr, "pdw sql: a plain-English question is required (usage: pdw sql --file QUERY.sql <QUESTION>)")
+		if len(positional) > 0 {
+			fmt.Fprintf(stderr, "pdw sql: SQL came from --file, so don't also pass it as an argument. Example: %s\n", sqlFileExample)
 			return "", "", 2
 		}
-		if len(positional) > 1 {
-			fmt.Fprintln(stderr, "pdw sql: SQL came from --file, so pass only the question as a positional argument")
-			return "", "", 2
-		}
-		question = strings.TrimSpace(positional[0])
 		b, err := os.ReadFile(file)
 		if err != nil {
 			fmt.Fprintln(stderr, "pdw sql: read --file:", err)
 			return "", "", 2
 		}
 		sql = strings.TrimSpace(string(b))
-	case len(positional) >= 2:
-		if len(positional) > 2 {
-			fmt.Fprintln(stderr, "pdw sql: unexpected extra arguments; pass the question and SQL as two quoted positional args (or use --file / stdin for the SQL)")
-			return "", "", 2
-		}
-		question = strings.TrimSpace(positional[0])
-		sql = strings.TrimSpace(positional[1])
+	case len(positional) > 1:
+		fmt.Fprintf(stderr, "pdw sql: too many arguments; SQL is the single positional arg now and the question moved to -q. Example: %s\n", sqlExample)
+		return "", "", 2
 	case len(positional) == 1:
-		// Question given as the only positional arg; SQL is read from stdin.
-		question = strings.TrimSpace(positional[0])
+		sql = strings.TrimSpace(positional[0])
+	default:
 		b, err := io.ReadAll(stdin)
 		if err != nil {
 			fmt.Fprintln(stderr, "pdw sql: read stdin:", err)
 			return "", "", 2
 		}
 		sql = strings.TrimSpace(string(b))
-		if sql == "" {
-			fmt.Fprintln(stderr, "pdw sql: SQL query is required; pass it as the second argument, via --file, or on stdin")
-			return "", "", 2
-		}
-	default:
-		fmt.Fprintln(stderr, "pdw sql: both an English question and a SQL query are required (usage: pdw sql [--output FMT] <QUESTION> <SQL>)")
-		return "", "", 2
-	}
-	if question == "" {
-		fmt.Fprintln(stderr, "pdw sql: question must be a concise plain-English question this SQL statement is trying to answer")
-		return "", "", 2
 	}
 	if sql == "" {
-		fmt.Fprintln(stderr, "pdw sql: SQL query is required")
+		fmt.Fprintf(stderr, "pdw sql: no SQL given; pass it as an argument, via --file, or on stdin. Example: %s  (or pipe it: %s)\n", sqlExample, sqlStdinExample)
 		return "", "", 2
 	}
 	return question, sql, 0
@@ -583,9 +588,9 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 	// of accepting a second, quoting-prone JSON route through `call`.
 	if name == "sql" || name == "query" {
 		fmt.Fprintln(stderr, "pdw call: run SQL with the dedicated `sql` command, not `call`:")
-		fmt.Fprintln(stderr, "  pdw sql '<question>' '<sql>'")
-		fmt.Fprintln(stderr, "  pdw sql --file query.sql '<question>'   # SQL from a file")
-		fmt.Fprintln(stderr, "  pdw sql '<question>' < query.sql         # SQL from stdin")
+		fmt.Fprintln(stderr, "  pdw sql -q '<question>' '<sql>'")
+		fmt.Fprintln(stderr, "  pdw sql -q '<question>' --file query.sql   # SQL from a file")
+		fmt.Fprintln(stderr, "  pdw sql -q '<question>' < query.sql        # SQL from stdin")
 		fmt.Fprintln(stderr, "This avoids JSON/shell quoting; `call` is only for non-SQL tools.")
 		return 2
 	}

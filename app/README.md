@@ -454,11 +454,12 @@ go build -o /tmp/pdw ./cmd/pdw-cli
 /tmp/pdw describe sql             # title + description + input JSON Schema
 /tmp/pdw call schema_overview     # zero-input NON-SQL tool
 /tmp/pdw columns gmail_messages   # column names + types for one table
-/tmp/pdw sql 'What is one?' 'SELECT 1'  # defaults to CSV and prints an output-format note
-/tmp/pdw sql --output json 'What time is it?' 'SELECT now()'
-/tmp/pdw sql --output nd-json 'Which recent Gmail messages exist?' 'SELECT * FROM gmail_messages LIMIT 3'
-/tmp/pdw sql --file query.sql 'Find calendar transcripts mentioning Vercel'  # SQL from a file
-/tmp/pdw sql 'Recent Slack messages' < query.sql                             # SQL from stdin
+/tmp/pdw sql 'SELECT 1'                  # SQL is the only positional; defaults to CSV + an output-format note
+/tmp/pdw sql -q 'What is one?' 'SELECT 1'  # -q records the caller's intent in server logs
+/tmp/pdw sql --output json -q 'What time is it?' 'SELECT now()'
+/tmp/pdw sql --output nd-json -q 'Which recent Gmail messages exist?' 'SELECT * FROM gmail_messages LIMIT 3'
+/tmp/pdw sql -q 'Find calendar transcripts mentioning Vercel' --file query.sql  # SQL from a file
+/tmp/pdw sql -q 'Recent Slack messages' < query.sql                            # SQL from stdin
 /tmp/pdw config show              # prints config with the token redacted
 /tmp/pdw logout                   # removes the config file
 ```

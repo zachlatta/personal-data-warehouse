@@ -85,7 +85,7 @@ func TestSQLCommandDefaultOutputsNoteAndCSV(t *testing.T) {
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 
-	out, errOut, code := runCLI(t, srv.URL, "", "sql", "How many rows do we get?", "SELECT 1 AS n")
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "-q", "How many rows do we get?", "SELECT 1 AS n")
 	if code != 0 {
 		t.Fatalf("expected zero exit, got %d (stderr=%s)", code, errOut)
 	}
@@ -102,7 +102,7 @@ func TestSQLCommandExplicitJSONOmitsDefaultNote(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"question":"What is one?","sql":"SELECT 1 AS n","format":"json","rows":[{"n":1}],"total_rows":1}}`)
 	})
-	out, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "json", "What is one?", "SELECT 1 AS n")
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "json", "-q", "What is one?", "SELECT 1 AS n")
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
 	}
@@ -128,7 +128,7 @@ func TestSQLCommandNDJSONFlagMapsToToolFormat(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"sql":"SELECT 1 AS n","format":"ndjson","rows":"{\"n\":1}\n{\"n\":2}","total_rows":2}}`)
 	})
-	out, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "nd-json", "Which rows come back?", "SELECT 1 AS n")
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "nd-json", "-q", "Which rows come back?", "SELECT 1 AS n")
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
 	}
@@ -148,7 +148,7 @@ func TestSQLCommandRejectsInvalidOutputFormat(t *testing.T) {
 	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
 		t.Fatal("server should not be hit")
 	})
-	_, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "table", "Whatever?", "SELECT 1")
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "--output", "table", "SELECT 1")
 	if code == 0 {
 		t.Fatalf("expected non-zero exit")
 	}
@@ -161,7 +161,7 @@ func TestSQLCommandReturnsDomainErrorsOnStderr(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"question":"Delete everything?","sql":"DELETE FROM gmail_messages","format":"csv","error":"query tool is read-only"}}`)
 	})
-	out, errOut, code := runCLI(t, srv.URL, "", "sql", "Delete everything?", "DELETE FROM gmail_messages")
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "-q", "Delete everything?", "DELETE FROM gmail_messages")
 	if code == 0 {
 		t.Fatalf("expected non-zero exit")
 	}
@@ -173,24 +173,119 @@ func TestSQLCommandReturnsDomainErrorsOnStderr(t *testing.T) {
 	}
 }
 
-func TestSQLCommandRequiresQuestionAndSQL(t *testing.T) {
+// TestSQLCommandSQLOnlyPositionalSucceeds covers the headline ergonomics fix:
+// `pdw sql "SELECT 1"` with no question runs, and the server still receives a
+// populated intent field (the defaultSQLQuestion marker) so intent logging is
+// preserved even when -q is omitted.
+func TestSQLCommandSQLOnlyPositionalSucceeds(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"rows":"n\n1"}}`)
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "SELECT 1 AS n")
+	if code != 0 {
+		t.Fatalf("expected zero exit for SQL-only positional, got %d (stderr=%s)", code, errOut)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if input["sql"] != "SELECT 1 AS n" {
+		t.Fatalf("sql = %q", input["sql"])
+	}
+	if strings.TrimSpace(input["question"]) == "" {
+		t.Fatalf("question must stay populated for server intent logging, got %q", input["question"])
+	}
+	if input["question"] != defaultSQLQuestion {
+		t.Fatalf("omitted question should fall back to the default marker, got %q", input["question"])
+	}
+}
+
+// TestSQLCommandQuestionFlagReachesServer verifies both -q and --question send
+// the caller's intent through to the server unchanged.
+func TestSQLCommandQuestionFlagReachesServer(t *testing.T) {
+	for _, flagName := range []string{"-q", "--question"} {
+		srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"data":{"rows":"n\n1"}}`)
+		})
+		_, errOut, code := runCLI(t, srv.URL, "", "sql", flagName, "How many?", "SELECT 1 AS n")
+		if code != 0 {
+			t.Fatalf("%s exit = %d, stderr=%s", flagName, code, errOut)
+		}
+		var input map[string]string
+		if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+			t.Fatalf("%s body not JSON: %v\n%s", flagName, err, srv.lastBody)
+		}
+		if input["question"] != "How many?" || input["sql"] != "SELECT 1 AS n" {
+			t.Fatalf("%s input = %#v", flagName, input)
+		}
+	}
+}
+
+// TestSQLCommandTooManyArgsErrorIsOneLineWithExample covers the old
+// two-positional footgun: passing question + SQL positionally now fails with a
+// single actionable line that points at -q, never the full usage blob.
+func TestSQLCommandTooManyArgsErrorIsOneLineWithExample(t *testing.T) {
 	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
 		t.Fatal("server should not be hit")
 	})
-	_, errOut, code := runCLI(t, srv.URL, "", "sql", "SELECT 1")
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "What is one?", "SELECT 1")
 	if code == 0 {
-		t.Fatalf("expected non-zero exit when the question is given but no SQL (no stdin)")
+		t.Fatalf("expected non-zero exit for two positional args")
 	}
-	if !strings.Contains(errOut, "SQL query is required") {
-		t.Fatalf("stderr should mention the missing SQL: %s", errOut)
+	assertSQLErrorErgonomic(t, errOut)
+	if !strings.Contains(errOut, "-q") {
+		t.Fatalf("too-many-args error should point at -q: %s", errOut)
 	}
+	if !strings.Contains(errOut, sqlExample) {
+		t.Fatalf("error should embed a copy-pasteable example: %s", errOut)
+	}
+}
 
-	_, errOut, code = runCLI(t, srv.URL, "", "sql", "", "SELECT 1")
+// TestSQLCommandNoSQLErrorIsOneLineWithExample covers an empty invocation (no
+// positional, empty stdin): one actionable line with a copy-pasteable example.
+func TestSQLCommandNoSQLErrorIsOneLineWithExample(t *testing.T) {
+	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be hit")
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "sql")
 	if code == 0 {
-		t.Fatalf("expected non-zero exit when question is blank")
+		t.Fatalf("expected non-zero exit when no SQL is provided")
 	}
-	if !strings.Contains(errOut, "question") {
-		t.Fatalf("stderr should mention blank question: %s", errOut)
+	assertSQLErrorErgonomic(t, errOut)
+	if !strings.Contains(errOut, sqlExample) || !strings.Contains(errOut, sqlStdinExample) {
+		t.Fatalf("no-SQL error should embed copy-pasteable examples: %s", errOut)
+	}
+}
+
+// TestSQLCommandFileAndPositionalConflict covers passing SQL both via --file
+// and as a positional: a single actionable line, not the usage blob.
+func TestSQLCommandFileAndPositionalConflict(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "q.sql")
+	if err := os.WriteFile(path, []byte("SELECT 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be hit")
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "--file", path, "SELECT 2")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit when SQL comes from both --file and a positional")
+	}
+	assertSQLErrorErgonomic(t, errOut)
+	if !strings.Contains(errOut, "--file") {
+		t.Fatalf("conflict error should mention --file: %s", errOut)
+	}
+}
+
+// assertSQLErrorErgonomic enforces the contract that sql errors are a single
+// actionable line and never dump the full usage blob.
+func assertSQLErrorErgonomic(t *testing.T, errOut string) {
+	t.Helper()
+	if strings.Contains(errOut, "USAGE") || strings.Contains(errOut, "COMMANDS") || strings.Contains(errOut, "EXAMPLES") {
+		t.Fatalf("sql error must not dump the full usage blob:\n%s", errOut)
+	}
+	if lines := strings.Count(strings.TrimRight(errOut, "\n"), "\n"); lines != 0 {
+		t.Fatalf("sql error should be a single line, got %d newlines:\n%s", lines, errOut)
 	}
 }
 
@@ -478,7 +573,7 @@ func TestSQLCommandReadsSQLFromStdin(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"rows":"n\n1"}}`)
 	})
-	_, errOut, code := runCLI(t, srv.URL, "SELECT 1 AS n", "sql", "What is one?")
+	_, errOut, code := runCLI(t, srv.URL, "SELECT 1 AS n", "sql", "-q", "What is one?")
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
 	}
@@ -491,6 +586,26 @@ func TestSQLCommandReadsSQLFromStdin(t *testing.T) {
 	}
 }
 
+// TestSQLCommandReadsMultiLineSQLFromStdin confirms piped multi-line SQL works
+// without -q, exercising the stdin path agents use to dodge shell quoting.
+func TestSQLCommandReadsMultiLineSQLFromStdin(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"rows":"n\n1"}}`)
+	})
+	multiLine := "SELECT 1 AS n\nFROM (VALUES (1)) AS t(x)\n"
+	_, errOut, code := runCLI(t, srv.URL, multiLine, "sql")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if input["sql"] != strings.TrimSpace(multiLine) {
+		t.Fatalf("sql = %q", input["sql"])
+	}
+}
+
 func TestSQLCommandReadsSQLFromFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "q.sql")
 	if err := os.WriteFile(path, []byte("SELECT 1 AS n\n"), 0o644); err != nil {
@@ -499,7 +614,7 @@ func TestSQLCommandReadsSQLFromFile(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"rows":"n\n1"}}`)
 	})
-	_, errOut, code := runCLI(t, srv.URL, "", "sql", "--file", path, "What is one?")
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "--file", path, "-q", "What is one?")
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
 	}
