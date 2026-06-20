@@ -1497,6 +1497,65 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     assert ("gmail", "subject") in survived_sources
 
 
+def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWarehouse) -> None:
+    # agent_run_events holds the warehouse's OWN internal enrichment-agent
+    # operational logs: its `text` column is raw JSON / stderr for every event
+    # type (item.completed, turn.started, error, ...), never human-readable
+    # content. Surfacing it in the cross-source search_text() only injects raw
+    # JSON noise that crowds out real matches. The agent's actual output is
+    # already searchable via the enrichment tables and the agent_session source,
+    # so the internal agent branch must be excluded entirely.
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+
+    created_at = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    # Raw-JSON event text mirroring what production stores in agent_run_events.
+    warehouse.insert_agent_run_events(
+        [
+            {
+                "run_id": "agent-zzz",
+                "event_index": 0,
+                "stream": "stdout",
+                "event_type": "item.completed",
+                "event_json": '{"type":"item.completed"}',
+                "text": '{"type":"item.completed","item":{"text":"zanzibar rollout plan"}}',
+                "created_at": created_at,
+                "sync_version": 1,
+            }
+        ]
+    )
+    # A real human source carrying the same term, to prove search still works.
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="200.1",
+                message_datetime=created_at,
+                text="planning the zanzibar rollout schedule",
+            )
+        ]
+    )
+
+    matched = warehouse._query(
+        "SELECT DISTINCT source FROM search_text('zanzibar rollout', 50) WHERE score < 0"
+    )
+    sources = {row[0] for row in matched}
+    assert "slack" in sources
+    assert "agent" not in sources
+
+    # Explicitly requesting the 'agent' source returns nothing (branch removed).
+    agent_only = warehouse._query(
+        "SELECT count(*) FROM search_text('zanzibar', 50, ARRAY['agent']) WHERE score < 0"
+    )
+    assert agent_only == [(0,)]
+
+
 def test_whatsapp_client_session_round_trips_binary_snapshot(warehouse: PostgresWarehouse) -> None:
     now = datetime(2026, 6, 14, 12, tzinfo=UTC)
     payload = b"SQLite format 3\x00binary\x00session"

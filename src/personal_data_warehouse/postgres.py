@@ -4909,10 +4909,12 @@ class PostgresWarehouse:
         # text, score); drill into the underlying table via `ref` for full rows.
         # Coverage mirrors what the old view searched — every BM25-indexable text
         # column across gmail, slack, attachments, transcripts, notes, imessage,
-        # whatsapp, calendar, contacts, agent runs/sessions, and mutations. The
-        # only deliberate omission is upstream_mutations.payload_json (raw jsonb;
-        # a structured blob with marginal full-text value); the mutation title is
-        # still covered. Transcript branches read the raw enrichments table (where
+        # whatsapp, calendar, contacts, agent sessions, and mutations. Deliberate
+        # omissions: upstream_mutations.payload_json (raw jsonb; a structured blob
+        # with marginal full-text value, though the mutation title is still
+        # covered) and agent_run_events (the internal enrichment agent's raw-JSON
+        # operational logs — see the NOTE on its dropped branch below).
+        # Transcript branches read the raw enrichments table (where
         # the BM25 index lives) rather than the de-duplicated clean view, so they
         # can surface more than one prompt-version row per recording.
         #
@@ -5159,11 +5161,15 @@ class PostgresWarehouse:
                 "account", "card_id", "contact_cards", "notes", "contact_cards_notes_bm25_idx",
                 where="is_deleted = 0 AND notes != ''",
             ),
-            branch(
-                "'agent'", "event_type", "stream", "run_id", "created_at", "''",
-                "run_id || ':' || event_index::text", "agent_run_events", "text",
-                "agent_run_events_text_bm25_idx",
-            ),
+            # NOTE: agent_run_events (the warehouse's own internal
+            # enrichment-agent operational logs) is deliberately NOT searched
+            # here. Its `text` column is raw JSON / stderr for every event type
+            # (item.completed, turn.started, error, ...), never human-readable
+            # content, so it only injects raw-JSON noise that crowds out real
+            # cross-source matches. The agent's actual output is already
+            # searchable via the enrichment tables (voice-memo summaries, file
+            # attachments) and the user-facing agent_session source below. The
+            # agent_run_events_text_bm25_idx index is kept for direct queries.
             branch(
                 "'agent_session'", "source", "role", "account", "occurred_at", "account",
                 "source || ':' || session_id || ':' || event_uuid", "agent_session_events", "text",
