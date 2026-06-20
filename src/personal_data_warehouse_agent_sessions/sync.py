@@ -11,7 +11,7 @@ un-acknowledged tail next time (ingest dedupes by primary key).
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 import gzip
@@ -83,30 +83,36 @@ class AgentSessionsUploadRunner:
             openclaw_sessions_dir=self._openclaw_sessions_dir,
         )
         self._logger.info("Discovered %s agent session transcript file(s)", len(files))
+        # One buffer spanning all files so many small transcripts (OpenClaw can
+        # have thousands of ~5-line sessions) coalesce into full-size batches
+        # instead of one tiny Drive upload per file. A file's offset is only
+        # committed once the batch carrying its lines is uploaded, so a crash
+        # re-ships the un-acknowledged tail (ingest dedupes by primary key).
+        batch = _PendingBatch(batch_size=self._batch_size)
         remaining = self._limit
         files_with_new = 0
         lines_selected = 0
         lines_skipped = 0
-        batches = 0
         skipped_for_limit = False
 
         for session_file in files:
             if remaining is not None and remaining <= 0:
                 skipped_for_limit = True
                 break
-            file_result = self._sync_file(session_file, remaining=remaining)
+            file_result = self._read_file(session_file, batch, remaining=remaining)
             if file_result is None:
                 continue
             if file_result.lines_selected:
                 files_with_new += 1
             lines_selected += file_result.lines_selected
             lines_skipped += file_result.lines_skipped
-            batches += file_result.batches_uploaded
             if remaining is not None:
                 remaining -= file_result.lines_selected
             if file_result.deferred:
                 skipped_for_limit = True
                 break
+
+        self._flush(batch)  # trailing partial batch
 
         self._logger.info(
             "Agent sessions upload summary: files=%s new=%s lines=%s skipped=%s batches=%s%s",
@@ -114,7 +120,7 @@ class AgentSessionsUploadRunner:
             files_with_new,
             lines_selected,
             lines_skipped,
-            batches,
+            batch.batches,
             " (run limit reached; remaining lines deferred to next run)" if skipped_for_limit else "",
         )
         return AgentSessionsUploadSummary(
@@ -122,10 +128,12 @@ class AgentSessionsUploadRunner:
             files_with_new_lines=files_with_new,
             lines_selected=lines_selected,
             lines_skipped=lines_skipped,
-            batches_uploaded=batches,
+            batches_uploaded=batch.batches,
         )
 
-    def _sync_file(self, session_file: SessionFile, *, remaining: int | None) -> "_FileResult | None":
+    def _read_file(
+        self, session_file: SessionFile, batch: "_PendingBatch", *, remaining: int | None
+    ) -> "_FileResult | None":
         path = session_file.path
         try:
             size = path.stat().st_size
@@ -134,7 +142,7 @@ class AgentSessionsUploadRunner:
 
         start_offset, start_line = self._start_position(path, size)
         if size <= start_offset:
-            return _FileResult(lines_selected=0, lines_skipped=0, batches_uploaded=0, deferred=False)
+            return _FileResult(lines_selected=0, lines_skipped=0, deferred=False)
 
         with path.open("rb") as handle:
             handle.seek(start_offset)
@@ -144,9 +152,7 @@ class AgentSessionsUploadRunner:
         line_no = start_line
         selected = 0
         skipped = 0
-        batches = 0
         deferred = False
-        buffer: list[dict[str, object]] = []
 
         for raw_line in _complete_lines(data):
             if remaining is not None and remaining - selected <= 0:
@@ -168,22 +174,29 @@ class AgentSessionsUploadRunner:
             if not isinstance(parsed, dict):
                 skipped += 1
                 continue
-            buffer.append(self._envelope(session_file, seq=seq, line=parsed))
+            batch.add(self._envelope(session_file, seq=seq, line=parsed), path=str(path), offset=offset, line_no=line_no)
             selected += 1
-            if len(buffer) >= self._batch_size:
-                self._upload_and_commit(path, buffer, offset=offset, line_no=line_no)
-                batches += 1
-                buffer = []
+            if batch.full():
+                self._flush(batch)
 
-        if buffer:
-            self._upload_and_commit(path, buffer, offset=offset, line_no=line_no)
-            batches += 1
-        elif offset != start_offset:
-            # Consumed only skipped/blank lines; still advance so we do not
-            # reprocess them next run.
+        if selected == 0 and offset != start_offset:
+            # Consumed only skipped/blank lines; advance so we do not reprocess
+            # them next run. (Files with selected lines commit via _flush.)
             self._commit(path, offset=offset, line_no=line_no)
 
-        return _FileResult(lines_selected=selected, lines_skipped=skipped, batches_uploaded=batches, deferred=deferred)
+        return _FileResult(lines_selected=selected, lines_skipped=skipped, deferred=deferred)
+
+    def _flush(self, batch: "_PendingBatch") -> None:
+        if not batch.records:
+            return
+        self._run_network_check()
+        stored = self._upload_batch(batch.records)
+        # Commit only after the upload succeeds; pending offsets correspond to
+        # lines whose records are in this just-uploaded batch.
+        for path, (offset, line_no) in batch.pending.items():
+            self._commit(path, offset=offset, line_no=line_no)
+        self._logger.info("Uploaded agent-sessions batch %s with %s records", stored["storage_key"], len(batch.records))
+        batch.reset()
 
     def _start_position(self, path: Path, size: int) -> tuple[int, int]:
         if self._mode != "incremental" or self._upload_state is None:
@@ -193,12 +206,6 @@ class AgentSessionsUploadRunner:
             # File was truncated/rotated; re-read from the beginning.
             return 0, 0
         return progress.uploaded_offset, progress.uploaded_lines
-
-    def _upload_and_commit(self, path: Path, records: list[dict[str, object]], *, offset: int, line_no: int) -> None:
-        self._run_network_check()
-        stored = self._upload_batch(records)
-        self._commit(path, offset=offset, line_no=line_no)
-        self._logger.info("Uploaded agent-sessions batch %s with %s records", stored["storage_key"], len(records))
 
     def _commit(self, path: Path, *, offset: int, line_no: int) -> None:
         if self._upload_state is not None:
@@ -245,8 +252,34 @@ class UploadBlockedError(RuntimeError):
 class _FileResult:
     lines_selected: int
     lines_skipped: int
-    batches_uploaded: int
     deferred: bool
+
+
+@dataclass
+class _PendingBatch:
+    """A batch of envelopes accumulating across files until it reaches batch_size.
+
+    ``pending`` maps each contributing file path to the (offset, line_no) of its
+    last buffered line, so a flush commits every file's progress in lockstep
+    with the upload that durably stores those lines.
+    """
+
+    batch_size: int
+    records: list[dict[str, object]] = field(default_factory=list)
+    pending: dict[str, tuple[int, int]] = field(default_factory=dict)
+    batches: int = 0
+
+    def add(self, record: dict[str, object], *, path: str, offset: int, line_no: int) -> None:
+        self.records.append(record)
+        self.pending[path] = (offset, line_no)
+
+    def full(self) -> bool:
+        return len(self.records) >= self.batch_size
+
+    def reset(self) -> None:
+        self.records = []
+        self.pending = {}
+        self.batches += 1
 
 
 def _complete_lines(data: bytes) -> list[bytes]:

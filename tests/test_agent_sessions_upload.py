@@ -237,6 +237,46 @@ def test_runner_full_mode_reuploads_everything(tmp_path: Path) -> None:
     state.close()
 
 
+def test_runner_coalesces_small_files_into_one_batch(tmp_path: Path) -> None:
+    proj = tmp_path / "claude" / "-proj"
+    proj.mkdir(parents=True)
+    for name, uid in (("a", "ua"), ("b", "ub")):
+        (proj / f"sess-{name}.jsonl").write_text(json.dumps({"type": "user", "uuid": uid}) + "\n")
+    store = FakeBatchUploader()
+    state = AgentSessionsUploadState.open(tmp_path / "state.sqlite", account="zach@example.com")
+
+    summary = _runner(tmp_path, store, state).sync()
+    # Two single-line files coalesce into ONE batch (not one upload per file).
+    assert summary.lines_selected == 2
+    assert summary.batches_uploaded == 1
+    assert {r["record"]["line"]["uuid"] for r in store.batches[0]} == {"ua", "ub"}
+
+    # Both files' offsets were committed, so a re-run uploads nothing.
+    summary2 = _runner(tmp_path, store, state).sync()
+    assert summary2.lines_selected == 0
+    assert len(store.batches) == 1
+    state.close()
+
+
+def test_runner_batch_boundary_spans_files_commits_each(tmp_path: Path) -> None:
+    proj = tmp_path / "claude" / "-proj"
+    proj.mkdir(parents=True)
+    (proj / "sess-a.jsonl").write_text(
+        json.dumps({"type": "user", "uuid": "a1"}) + "\n" + json.dumps({"type": "user", "uuid": "a2"}) + "\n"
+    )
+    (proj / "sess-b.jsonl").write_text(json.dumps({"type": "user", "uuid": "b1"}) + "\n")
+    store = FakeBatchUploader()
+    state = AgentSessionsUploadState.open(tmp_path / "state.sqlite", account="zach@example.com")
+
+    # batch_size 2: first batch fills with a1,a2; b1 lands in the trailing batch.
+    summary = _runner(tmp_path, store, state, batch_size=2).sync()
+    assert summary.lines_selected == 3
+    assert [len(b) for b in store.batches] == [2, 1]
+    # Every file's offset committed regardless of where the batch boundary fell.
+    assert _runner(tmp_path, store, state, batch_size=2).sync().lines_selected == 0
+    state.close()
+
+
 def test_runner_chunks_into_multiple_batches(tmp_path: Path) -> None:
     _claude_file(tmp_path, *[{"type": "user", "uuid": f"u{i}"} for i in range(5)])
     store = FakeBatchUploader()
