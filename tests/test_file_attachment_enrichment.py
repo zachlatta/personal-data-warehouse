@@ -9,10 +9,12 @@ import pytest
 from PIL import Image
 
 from personal_data_warehouse.agent_runner import AgentRunRequest, AgentRunResult
-from personal_data_warehouse.gmail_attachment_enrichment import (
+from personal_data_warehouse.file_attachment_enrichment import (
     AGENT_ATTACHMENT_PROMPT_VERSION,
     AGENT_ATTACHMENT_TASK_TYPE,
-    GmailAttachmentEnrichmentRunner,
+    GMAIL_SOURCE,
+    WHATSAPP_SOURCE,
+    FileAttachmentEnrichmentRunner,
     STATUS_ERROR,
     STATUS_NOT_USEFUL,
     STATUS_OK,
@@ -47,7 +49,7 @@ class FakeWarehouse:
         self.agent_run_events: list[dict] = []
         self.agent_run_tool_calls: list[dict] = []
 
-    def ensure_tables(self) -> None:
+    def ensure_file_attachment_enrichment_tables(self) -> None:
         pass
 
     def ensure_agent_tables(self) -> None:
@@ -141,8 +143,9 @@ def useful_output() -> dict:
     }
 
 
-def make_runner(warehouse, agent, store) -> GmailAttachmentEnrichmentRunner:
-    return GmailAttachmentEnrichmentRunner(
+def make_runner(warehouse, agent, store, *, source=GMAIL_SOURCE) -> FileAttachmentEnrichmentRunner:
+    return FileAttachmentEnrichmentRunner(
+        source=source,
         warehouse=warehouse,
         agent=agent,
         object_store_factory=lambda account: store,
@@ -191,6 +194,26 @@ def test_runner_enriches_image_attachment_and_records_agent_run() -> None:
     assert row["ai_source_status"] == "unsupported"
     assert "SPACEX" in row["text"]
     assert "Summary: The SpaceX wordmark in dark blue." in row["text"]
+
+
+def test_runner_uses_source_identity_for_whatsapp_media() -> None:
+    content = png_bytes()
+    warehouse = FakeWarehouse([candidate_row(content)])
+    agent = FakeAgent(useful_output())
+
+    summary = make_runner(warehouse, agent, FakeObjectStore(content), source=WHATSAPP_SOURCE).sync(limit=10)
+
+    assert summary.attachments_enriched == 1
+    request = agent.requests[0]
+    # The WhatsApp source carries its own task_type + prompt_version so its agent
+    # runs and enrichment rows are scoped independently from Gmail's.
+    assert request.task_type == WHATSAPP_SOURCE.task_type == "whatsapp_media_enrichment"
+    assert request.prompt_version == WHATSAPP_SOURCE.prompt_version == "whatsapp-media-agent-v1"
+    assert warehouse.agent_runs[0]["task_type"] == "whatsapp_media_enrichment"
+    row = warehouse.enrichment_rows[0]
+    assert row["ai_prompt_version"] == "whatsapp-media-agent-v1"
+    assert "WhatsApp media attachment" in row["ai_prompt"]
+    assert "SPACEX" in row["text"]
 
 
 def test_runner_marks_non_useful_images_without_search_text() -> None:

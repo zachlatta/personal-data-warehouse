@@ -202,7 +202,7 @@ class WhatsAppConfig:
     client_run_seconds: int = DEFAULT_WHATSAPP_CLIENT_RUN_SECONDS
     media_bytes_per_flush: int = DEFAULT_WHATSAPP_MEDIA_BYTES_PER_FLUSH
     media_count_per_flush: int = DEFAULT_WHATSAPP_MEDIA_COUNT_PER_FLUSH
-    download_history_media: bool = False
+    download_history_media: bool = True
 
 
 @dataclass(frozen=True)
@@ -880,7 +880,7 @@ def load_settings(
             client_run_seconds=whatsapp_client_run_seconds,
             media_bytes_per_flush=whatsapp_media_bytes_per_flush,
             media_count_per_flush=whatsapp_media_count_per_flush,
-            download_history_media=_parse_bool_env(os.getenv("WHATSAPP_DOWNLOAD_HISTORY_MEDIA"), False),
+            download_history_media=_parse_bool_env(os.getenv("WHATSAPP_DOWNLOAD_HISTORY_MEDIA"), True),
         )
 
     agent_sessions_account = (

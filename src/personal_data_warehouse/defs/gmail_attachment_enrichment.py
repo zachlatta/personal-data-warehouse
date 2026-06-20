@@ -24,13 +24,12 @@ from personal_data_warehouse.defs.gmail_sync import (
     build_attachment_object_store_factory,
     gmail_mailbox_sync,
 )
-from personal_data_warehouse.gmail_attachment_enrichment import (
-    AGENT_ATTACHMENT_PROMPT_VERSION,
+from personal_data_warehouse.file_attachment_enrichment import (
     DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
     DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
-    GmailAttachmentEnrichmentRunner,
-    has_attachment_enrichment_candidate,
-    load_attachment_enrichment_candidates,
+    GMAIL_SOURCE,
+    FileAttachmentEnrichmentRunner,
+    has_file_enrichment_candidate,
 )
 from personal_data_warehouse.schedule_guards import skip_if_job_active, skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
@@ -54,6 +53,9 @@ def gmail_attachment_enrichment(context, agent: AgentResource) -> MaterializeRes
 
     batch_size = gmail_attachment_enrichment_batch_size()
     warehouse = warehouse_from_settings(settings)
+    # The candidate scan reads gmail_attachments; ensure the source tables exist
+    # even when the Gmail sync schedule has not run on a fresh deployment.
+    warehouse.ensure_tables()
     with exclusive_sync_lock(
         name="gmail_attachment_enrichment",
         postgres_lock_id=GMAIL_ATTACHMENT_ENRICHMENT_POSTGRES_LOCK_ID,
@@ -106,11 +108,12 @@ def gmail_attachment_enrichment_backlog_sensor(context):
 
     settings = load_settings(require_gmail=False, require_agent=True)
     warehouse = warehouse_from_settings(settings)
-    has_candidate = has_attachment_enrichment_candidate(
+    has_candidate = has_file_enrichment_candidate(
         warehouse,
+        source=GMAIL_SOURCE,
         provider=f"agent_{settings.agent.provider}",
         model=settings.agent.model,
-        prompt_version=AGENT_ATTACHMENT_PROMPT_VERSION,
+        prompt_version=GMAIL_SOURCE.prompt_version,
         max_error_attempts=gmail_attachment_enrichment_max_error_attempts(),
         error_window_days=gmail_attachment_enrichment_error_window_days(),
     )
@@ -126,18 +129,18 @@ def gmail_attachment_enrichment_runner(
     warehouse,
     logger,
     agent: AgentResource | None = None,
-) -> GmailAttachmentEnrichmentRunner:
+) -> FileAttachmentEnrichmentRunner:
     if settings.agent is None:
         raise RuntimeError("Agent runner is not configured")
     agent_resource = agent if agent is not None and agent.is_configured else AgentResource.from_config(settings.agent)
-    return GmailAttachmentEnrichmentRunner(
+    return FileAttachmentEnrichmentRunner(
+        source=GMAIL_SOURCE,
         warehouse=warehouse,
         agent=agent_resource,
         object_store_factory=gmail_attachment_object_store_factory(settings=settings, logger=logger),
         logger=logger,
         provider=settings.agent.provider,
         model=settings.agent.model,
-        prompt_version=AGENT_ATTACHMENT_PROMPT_VERSION,
         text_max_chars=settings.gmail_attachment_text_max_chars,
         max_error_attempts=gmail_attachment_enrichment_max_error_attempts(),
         error_window_days=gmail_attachment_enrichment_error_window_days(),

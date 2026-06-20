@@ -141,7 +141,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ATTACHMENT_BACKFILL_STATE_COLUMNS,
         ("account", "message_id"),
     ),
-    "gmail_attachment_enrichments": TableSpec(
+    "file_attachment_enrichments": TableSpec(
         ATTACHMENT_ENRICHMENT_COLUMNS,
         ("content_sha256", "ai_provider", "ai_model", "ai_prompt_version"),
     ),
@@ -355,15 +355,15 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS gmail_attachments_message_idx ON gmail_attachments (account, message_id)",
     ),
     IndexSpec(
-        "gmail_attachment_enrichments_text_bm25_idx",
-        "gmail_attachment_enrichments",
-        "CREATE INDEX IF NOT EXISTS gmail_attachment_enrichments_text_bm25_idx ON gmail_attachment_enrichments USING bm25 (text) WITH (text_config='english')",
+        "file_attachment_enrichments_text_bm25_idx",
+        "file_attachment_enrichments",
+        "CREATE INDEX IF NOT EXISTS file_attachment_enrichments_text_bm25_idx ON file_attachment_enrichments USING bm25 (text) WITH (text_config='english')",
         requires_pg_textsearch=True,
     ),
     IndexSpec(
-        "gmail_attachment_enrichments_text_trgm_idx",
-        "gmail_attachment_enrichments",
-        "CREATE INDEX IF NOT EXISTS gmail_attachment_enrichments_text_trgm_idx ON gmail_attachment_enrichments USING gin (text public.gin_trgm_ops)",
+        "file_attachment_enrichments_text_trgm_idx",
+        "file_attachment_enrichments",
+        "CREATE INDEX IF NOT EXISTS file_attachment_enrichments_text_trgm_idx ON file_attachment_enrichments USING gin (text public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
@@ -1057,13 +1057,14 @@ class PostgresWarehouse:
 
     def ensure_tables(self) -> None:
         self.drop_personal_finance_schema()
+        self._migrate_file_attachment_enrichments_rename()
         self._ensure_table_group(
             [
                 "gmail_messages",
                 "gmail_attachments",
                 "gmail_sync_state",
                 "gmail_attachment_backfill_state",
-                "gmail_attachment_enrichments",
+                "file_attachment_enrichments",
             ]
         )
         for column in ("storage_backend", "storage_key", "storage_file_id", "storage_url", "storage_status"):
@@ -1072,6 +1073,28 @@ class PostgresWarehouse:
             )
         self._ensure_clean_gmail_inbox_view()
         self._ensure_search_views_if_possible()
+
+    def ensure_file_attachment_enrichment_tables(self) -> None:
+        """Ensure the shared file_attachment_enrichments table exists.
+
+        Used by the source-agnostic attachment enrichment runner so it can write
+        results without depending on any one source's ensure_* path.
+        """
+        self._migrate_file_attachment_enrichments_rename()
+        self._ensure_table_group(["file_attachment_enrichments"])
+        self._ensure_search_views_if_possible()
+
+    def _migrate_file_attachment_enrichments_rename(self) -> None:
+        # gmail_attachment_enrichments became the shared file_attachment_enrichments
+        # table (Gmail + WhatsApp + any future source). Rename in place to preserve
+        # existing enrichments, and drop the old-named bm25/trgm indexes so the
+        # ensure step rebuilds them under the new names. Idempotent: once renamed,
+        # the IF EXISTS / IF NOT EXISTS clauses no-op on every later deploy.
+        self._command(
+            "ALTER TABLE IF EXISTS gmail_attachment_enrichments RENAME TO file_attachment_enrichments"
+        )
+        self._command("DROP INDEX IF EXISTS gmail_attachment_enrichments_text_bm25_idx")
+        self._command("DROP INDEX IF EXISTS gmail_attachment_enrichments_text_trgm_idx")
 
     def ensure_calendar_tables(self) -> None:
         self._ensure_table_group(["calendar_events", "calendar_sync_state"])
@@ -3497,7 +3520,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT {", ".join(_identifier(column) for column in columns)}
-            FROM gmail_attachment_enrichments
+            FROM file_attachment_enrichments
             WHERE content_sha256 = ANY(%s)
               AND ai_provider = %s
               AND ai_model = %s
@@ -3508,7 +3531,7 @@ class PostgresWarehouse:
         return {str(row[0]): dict(zip(columns, row, strict=True)) for row in rows}
 
     def insert_attachment_enrichments(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("gmail_attachment_enrichments", rows, ATTACHMENT_ENRICHMENT_COLUMNS)
+        self._insert_rows("file_attachment_enrichments", rows, ATTACHMENT_ENRICHMENT_COLUMNS)
 
     def ensure_google_drive_source_tables(self) -> None:
         self._ensure_table_group(
@@ -4826,7 +4849,7 @@ class PostgresWarehouse:
     _SEARCHABLE_TEXT_TABLES = (
         "gmail_messages",
         "gmail_attachments",
-        "gmail_attachment_enrichments",
+        "file_attachment_enrichments",
         "slack_messages",
         "slack_conversations",
         "slack_users",
@@ -4944,17 +4967,19 @@ class PostgresWarehouse:
                 "account || ':' || message_id", "gmail_messages", "body_text",
                 "gmail_messages_body_text_bm25_idx", where="is_deleted = 0",
             ),
-            # gmail attachment content: bm25 top-k on enrichment text, then join
-            # the attachment row for filename/account/date.
+            # gmail attachment content: bm25 top-k on the shared enrichment text,
+            # then join the gmail attachment row for filename/account/date. The
+            # inner join to gmail_attachments naturally restricts the shared
+            # file_attachment_enrichments table to gmail-origin rows.
             join_branch(
                 "SELECT 'gmail_attachment' AS source, 'content' AS subsource, a.filename AS context, "
                 "'' AS who, a.internal_date AS occurred_at, a.account AS account, "
                 "a.account || ':' || a.message_id || ':' || a.content_sha256 AS ref, "
                 "m.text AS text, m.score AS score",
                 "SELECT content_sha256, text, "
-                "(text <@> to_bm25query(%1$L, 'gmail_attachment_enrichments_text_bm25_idx'))::real AS score "
-                "FROM gmail_attachment_enrichments "
-                "ORDER BY text <@> to_bm25query(%1$L, 'gmail_attachment_enrichments_text_bm25_idx') LIMIT %2$s",
+                "(text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx'))::real AS score "
+                "FROM file_attachment_enrichments "
+                "ORDER BY text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx') LIMIT %2$s",
                 "JOIN gmail_attachments a USING (content_sha256)",
                 where="a.is_deleted = 0",
             ),
@@ -5077,6 +5102,21 @@ class PostgresWarehouse:
                 "'whatsapp_media'", "'filename'", "mime_type", "''", "message_at", "account",
                 "chat_id || ':' || message_id", "whatsapp_media_items", "filename",
                 "whatsapp_media_items_filename_bm25_idx", where="filename != ''",
+            ),
+            # whatsapp media content: bm25 top-k on the shared enrichment text,
+            # then join the media row for filename/account/date. The inner join to
+            # whatsapp_media_items restricts the shared enrichment table to
+            # whatsapp-origin rows.
+            join_branch(
+                "SELECT 'whatsapp_media' AS source, 'content' AS subsource, a.filename AS context, "
+                "'' AS who, a.message_at AS occurred_at, a.account AS account, "
+                "a.chat_id || ':' || a.message_id AS ref, "
+                "m.text AS text, m.score AS score",
+                "SELECT content_sha256, text, "
+                "(text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx'))::real AS score "
+                "FROM file_attachment_enrichments "
+                "ORDER BY text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx') LIMIT %2$s",
+                "JOIN whatsapp_media_items a USING (content_sha256)",
             ),
             branch(
                 "'calendar'", "'summary'", "''", "organizer_email", "start_at", "account",

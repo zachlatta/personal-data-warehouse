@@ -395,8 +395,11 @@ Enabling and pairing (first time):
 Other env vars: `WHATSAPP_ACCOUNT`, `WHATSAPP_GOOGLE_DRIVE_FOLDER_ID` (both fall back to the
 Apple Messages values), `WHATSAPP_SESSION_KEY`, `WHATSAPP_CLIENT_ID` (normally leave unset),
 `WHATSAPP_FLUSH_INTERVAL_SECONDS`, `WHATSAPP_MEDIA_BYTES_PER_FLUSH`,
-`WHATSAPP_MEDIA_COUNT_PER_FLUSH`, `WHATSAPP_DOWNLOAD_HISTORY_MEDIA` (default off; live media is
-always downloaded, history-sync media is metadata-only unless enabled).
+`WHATSAPP_MEDIA_COUNT_PER_FLUSH`, `WHATSAPP_DOWNLOAD_HISTORY_MEDIA` (default **on**: all
+attachments — live and history-sync — are downloaded to object storage. Set it to `0` as an
+escape hatch if the history-media backfill causes load/ban-risk issues; WhatsApp often will not
+serve very old media, so expect some `whatsapp_media_items.is_missing = true` rows for old
+messages even with it on).
 
 For local pairing/debugging there is a CLI: `uv run personal-data-warehouse-whatsapp-client`
 (requires `brew install libmagic` on macOS). It requires `POSTGRES_DATABASE_URL` because
@@ -411,3 +414,24 @@ WhatsApp SQL starting points are `whatsapp_messages`, `whatsapp_chats`,
 `whatsapp_contacts`, and `whatsapp_media_items`. Group subjects and rosters are populated by
 a once-per-run-window `get_joined_groups()` dump in the client (history sync never carries
 them); `whatsapp_chats.name` is preserved against later empty-name history rows.
+
+Downloaded WhatsApp image (and document-PDF) media is enriched the same way Gmail attachments
+are: the `whatsapp_media_enrichment` asset (`defs/whatsapp_media_enrichment.py`) scans
+`whatsapp_media_items` for stored blobs (`is_missing = 0`), runs each through the agent-container
+vision pipeline, and upserts the structured text into the shared `file_attachment_enrichments`
+table — the renamed, source-agnostic successor to `gmail_attachment_enrichments` that both Gmail
+and WhatsApp write to (keyed by `content_sha256` + `ai_provider`/`ai_model`/`ai_prompt_version`,
+each source under its own `task_type`/`prompt_version`). The runner, image prep, agent prompt,
+and candidate query all live in `file_attachment_enrichment.py`; each source is a
+`FileEnrichmentSource` descriptor. That enrichment text is surfaced by `search_text()` under
+`source = 'whatsapp_media'`, `subsource = 'content'`.
+
+## Shared file-attachment enrichment
+
+`gmail_attachment_enrichments` was renamed to `file_attachment_enrichments` and generalized into
+a single source-agnostic enrichment pipeline (`file_attachment_enrichment.py`). To add a new
+attachment source, define a `FileEnrichmentSource` (its table, sha/filename/mime/size/order
+columns, a `stored_predicate`, and whether PDFs need a prior deterministic-extraction step), then
+wire a Dagster asset/sensor that runs `FileAttachmentEnrichmentRunner` with that source — see
+`defs/gmail_attachment_enrichment.py` and `defs/whatsapp_media_enrichment.py`. The table rename
+migrates in place via `ensure_*` (`ALTER TABLE IF EXISTS … RENAME`), preserving existing rows.

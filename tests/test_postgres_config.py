@@ -91,6 +91,34 @@ def test_local_upload_configs_use_app_ingest_without_drive_folders(monkeypatch) 
     assert config.GOOGLE_DRIVE_SCOPE not in settings.google_scopes
 
 
+def test_whatsapp_downloads_history_media_by_default(monkeypatch) -> None:
+    monkeypatch.setattr(config, "load_dotenv", lambda: None)
+    monkeypatch.delenv("WHATSAPP_DOWNLOAD_HISTORY_MEDIA", raising=False)
+    monkeypatch.setenv("WHATSAPP_ACCOUNT", "zach@example.test")
+    monkeypatch.setenv("WHATSAPP_STORAGE_BACKEND", "http_app")
+    monkeypatch.setenv("MCP_BASE_URL", "https://pdw.example.test")
+
+    settings = load_settings(require_postgres=False, require_gmail=False, require_whatsapp=True)
+
+    assert settings.whatsapp is not None
+    # All attachments (live + history sync) are downloaded to object storage by
+    # default; the env var is only an escape hatch to turn it back off.
+    assert settings.whatsapp.download_history_media is True
+
+
+def test_whatsapp_history_media_download_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(config, "load_dotenv", lambda: None)
+    monkeypatch.setenv("WHATSAPP_DOWNLOAD_HISTORY_MEDIA", "0")
+    monkeypatch.setenv("WHATSAPP_ACCOUNT", "zach@example.test")
+    monkeypatch.setenv("WHATSAPP_STORAGE_BACKEND", "http_app")
+    monkeypatch.setenv("MCP_BASE_URL", "https://pdw.example.test")
+
+    settings = load_settings(require_postgres=False, require_gmail=False, require_whatsapp=True)
+
+    assert settings.whatsapp is not None
+    assert settings.whatsapp.download_history_media is False
+
+
 def test_drive_reader_folder_keeps_drive_scope_with_app_url(monkeypatch) -> None:
     monkeypatch.setattr(config, "load_dotenv", lambda: None)
     monkeypatch.delenv("VOICE_MEMOS_STORAGE_BACKEND", raising=False)

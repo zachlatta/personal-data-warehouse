@@ -417,11 +417,12 @@ def test_postgres_backfill_candidates_include_storage_pending(warehouse: Postgre
 
 def test_postgres_attachment_enrichment_candidates_select_stored_images(warehouse: PostgresWarehouse) -> None:
     from personal_data_warehouse.agent_runner import AgentRunResult, agent_run_row
-    from personal_data_warehouse.gmail_attachment_enrichment import (
+    from personal_data_warehouse.file_attachment_enrichment import (
         AGENT_ATTACHMENT_PROMPT_VERSION,
         AGENT_ATTACHMENT_TASK_TYPE,
-        has_attachment_enrichment_candidate,
-        load_attachment_enrichment_candidates,
+        GMAIL_SOURCE,
+        has_file_enrichment_candidate,
+        load_file_enrichment_candidates,
     )
     from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS
 
@@ -514,8 +515,9 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
     # error window (error_window_days=0) and count every historical failure.
     # The flaky runs are stamped at the fixed 2026-06-01 base time, which a
     # real-clock window would otherwise age out. Windowing has its own test.
-    assert has_attachment_enrichment_candidate(
+    assert has_file_enrichment_candidate(
         warehouse,
+        source=GMAIL_SOURCE,
         provider=provider,
         model=model,
         prompt_version=version,
@@ -523,8 +525,9 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
         error_window_days=0,
     )
 
-    candidates = load_attachment_enrichment_candidates(
+    candidates = load_file_enrichment_candidates(
         warehouse,
+        source=GMAIL_SOURCE,
         provider=provider,
         model=model,
         prompt_version=version,
@@ -540,8 +543,9 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
     assert by_sha["sha-pdf"]["source_status"] == "empty"
 
     # Raising the attempt budget brings the flaky attachment back.
-    retried = load_attachment_enrichment_candidates(
+    retried = load_file_enrichment_candidates(
         warehouse,
+        source=GMAIL_SOURCE,
         provider=provider,
         model=model,
         prompt_version=version,
@@ -553,16 +557,18 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
 
     insert_enrichment("sha-pending", ai_provider=provider, ai_model=model, ai_prompt_version=version, status="agent_ok")
     insert_enrichment("sha-pdf", ai_provider=provider, ai_model=model, ai_prompt_version=version, status="agent_ok")
-    assert not has_attachment_enrichment_candidate(
+    assert not has_file_enrichment_candidate(
         warehouse,
+        source=GMAIL_SOURCE,
         provider=provider,
         model=model,
         prompt_version=version,
         max_error_attempts=3,
         error_window_days=0,
     )
-    assert has_attachment_enrichment_candidate(
+    assert has_file_enrichment_candidate(
         warehouse,
+        source=GMAIL_SOURCE,
         provider=provider,
         model=model,
         prompt_version=version,
@@ -578,10 +584,11 @@ def test_postgres_attachment_enrichment_error_window_ages_out_stale_failures(war
     from datetime import datetime as _datetime
 
     from personal_data_warehouse.agent_runner import AgentRunResult, agent_run_row
-    from personal_data_warehouse.gmail_attachment_enrichment import (
+    from personal_data_warehouse.file_attachment_enrichment import (
         AGENT_ATTACHMENT_PROMPT_VERSION,
         AGENT_ATTACHMENT_TASK_TYPE,
-        load_attachment_enrichment_candidates,
+        GMAIL_SOURCE,
+        load_file_enrichment_candidates,
     )
     from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS
 
@@ -668,8 +675,9 @@ def test_postgres_attachment_enrichment_error_window_ages_out_stale_failures(war
     def candidate_shas(*, error_window_days: int) -> set[str]:
         return {
             candidate["content_sha256"]
-            for candidate in load_attachment_enrichment_candidates(
+            for candidate in load_file_enrichment_candidates(
                 warehouse,
+                source=GMAIL_SOURCE,
                 provider=provider,
                 model=model,
                 prompt_version=version,
@@ -688,6 +696,166 @@ def test_postgres_attachment_enrichment_error_window_ages_out_stale_failures(war
     unwindowed = candidate_shas(error_window_days=0)
     assert "sha-stale" not in unwindowed
     assert "sha-recent" not in unwindowed
+
+
+def test_postgres_whatsapp_media_enrichment_candidates_select_downloaded_blobs(
+    warehouse: PostgresWarehouse,
+) -> None:
+    from personal_data_warehouse.file_attachment_enrichment import (
+        WHATSAPP_SOURCE,
+        has_file_enrichment_candidate,
+        load_file_enrichment_candidates,
+    )
+    from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS, WHATSAPP_MEDIA_ITEM_COLUMNS
+
+    warehouse.ensure_whatsapp_tables()
+    warehouse.ensure_file_attachment_enrichment_tables()
+    warehouse.ensure_agent_tables()
+    account = "zach@example.test"
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    provider, model, version = "agent_codex", "", WHATSAPP_SOURCE.prompt_version
+
+    def insert_media(message_id: str, *, sha: str, filename: str, mime_type: str, **overrides) -> None:
+        defaults = dict(
+            account=account,
+            chat_id="chat-1",
+            message_id=message_id,
+            media_type="image",
+            filename=filename,
+            mime_type=mime_type,
+            content_sha256=sha,
+            size_bytes=2048,
+            is_missing=0,
+            storage_backend="google_drive",
+            storage_key=f"whatsapp/library/media/{sha}",
+            storage_file_id=f"drive-{sha}",
+            storage_url="https://drive.example/x",
+            message_at=now,
+            ingested_at=now,
+            sync_version=1,
+        )
+        defaults.update(overrides)
+        warehouse.insert_whatsapp_media_items([_default_row(WHATSAPP_MEDIA_ITEM_COLUMNS, **defaults)])
+
+    def insert_enrichment(sha: str, *, ai_provider: str, ai_prompt_version: str, status: str) -> None:
+        warehouse.insert_attachment_enrichments(
+            [
+                _default_row(
+                    ATTACHMENT_ENRICHMENT_COLUMNS,
+                    content_sha256=sha,
+                    ai_provider=ai_provider,
+                    ai_model=model,
+                    ai_prompt_version=ai_prompt_version,
+                    text_extraction_status=status,
+                    updated_at=now,
+                    sync_version=1,
+                )
+            ]
+        )
+
+    # Downloaded image -> candidate.
+    insert_media("m1", sha="wa-image", filename="photo.jpg", mime_type="image/jpeg")
+    # Downloaded document PDF -> candidate (WhatsApp has no deterministic extraction step).
+    insert_media("m2", sha="wa-pdf", filename="invoice.pdf", mime_type="application/pdf", media_type="document")
+    # History-only metadata row (bytes never downloaded) -> excluded.
+    insert_media("m3", sha="wa-missing", filename="missing.jpg", mime_type="image/jpeg", is_missing=1)
+    # Non-image document (e.g. audio voice note) -> not a vision candidate.
+    insert_media("m4", sha="wa-audio", filename="note.ogg", mime_type="audio/ogg", media_type="voice")
+    # Already agent-enriched under this identity -> excluded.
+    insert_media("m5", sha="wa-done", filename="done.png", mime_type="image/png")
+    insert_enrichment("wa-done", ai_provider=provider, ai_prompt_version=version, status="agent_ok")
+    # Enriched only under the Gmail identity (different prompt_version) -> still a candidate.
+    insert_media("m6", sha="wa-other-source", filename="shared.png", mime_type="image/png")
+    insert_enrichment("wa-other-source", ai_provider=provider, ai_prompt_version="gmail-attachment-agent-v1", status="agent_ok")
+
+    assert has_file_enrichment_candidate(
+        warehouse,
+        source=WHATSAPP_SOURCE,
+        provider=provider,
+        model=model,
+        prompt_version=version,
+    )
+    candidates = load_file_enrichment_candidates(
+        warehouse,
+        source=WHATSAPP_SOURCE,
+        provider=provider,
+        model=model,
+        prompt_version=version,
+        limit=10,
+    )
+    assert {candidate["content_sha256"] for candidate in candidates} == {"wa-image", "wa-pdf", "wa-other-source"}
+    by_sha = {candidate["content_sha256"]: candidate for candidate in candidates}
+    assert by_sha["wa-image"]["storage_file_id"] == "drive-wa-image"
+    # size_bytes is projected through the shared "size" candidate column.
+    assert by_sha["wa-image"]["size"] == 2048
+
+    insert_enrichment("wa-image", ai_provider=provider, ai_prompt_version=version, status="agent_ok")
+    insert_enrichment("wa-pdf", ai_provider=provider, ai_prompt_version=version, status="agent_not_useful")
+    insert_enrichment("wa-other-source", ai_provider=provider, ai_prompt_version=version, status="agent_ok")
+    assert not has_file_enrichment_candidate(
+        warehouse,
+        source=WHATSAPP_SOURCE,
+        provider=provider,
+        model=model,
+        prompt_version=version,
+    )
+
+
+def test_postgres_renames_legacy_gmail_attachment_enrichments_table(warehouse: PostgresWarehouse) -> None:
+    """The shared file_attachment_enrichments table is the renamed
+    gmail_attachment_enrichments. The migration must preserve existing rows and
+    leave only the new-named relation + indexes behind."""
+    from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS
+
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    warehouse.ensure_file_attachment_enrichment_tables()
+    warehouse.insert_attachment_enrichments(
+        [
+            _default_row(
+                ATTACHMENT_ENRICHMENT_COLUMNS,
+                content_sha256="legacy-sha",
+                ai_provider="agent_codex",
+                ai_model="",
+                ai_prompt_version="gmail-attachment-agent-v1",
+                text="legacy enrichment text",
+                text_extraction_status="agent_ok",
+                updated_at=now,
+                sync_version=1,
+            )
+        ]
+    )
+
+    # Simulate a pre-generalization deployment: the table and its indexes still
+    # carry the old gmail_attachment_enrichments names.
+    warehouse._command("ALTER TABLE file_attachment_enrichments RENAME TO gmail_attachment_enrichments")
+    warehouse._command(
+        "ALTER INDEX IF EXISTS file_attachment_enrichments_text_bm25_idx "
+        "RENAME TO gmail_attachment_enrichments_text_bm25_idx"
+    )
+    warehouse._command(
+        "ALTER INDEX IF EXISTS file_attachment_enrichments_text_trgm_idx "
+        "RENAME TO gmail_attachment_enrichments_text_trgm_idx"
+    )
+    assert warehouse._relation_exists("gmail_attachment_enrichments")
+    assert not warehouse._relation_exists("file_attachment_enrichments")
+
+    warehouse.ensure_file_attachment_enrichment_tables()
+
+    assert warehouse._relation_exists("file_attachment_enrichments")
+    assert not warehouse._relation_exists("gmail_attachment_enrichments")
+    preserved = warehouse._query(
+        "SELECT text FROM file_attachment_enrichments WHERE content_sha256 = %s",
+        ("legacy-sha",),
+    )
+    assert preserved == [("legacy enrichment text",)]
+    index_names = {
+        row[0]
+        for row in warehouse._query(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'file_attachment_enrichments'",
+            (),
+        )
+    }
+    assert not any(name.startswith("gmail_attachment_enrichments") for name in index_names)
 
 
 def test_postgres_insert_normalizes_nul_text_values() -> None:
@@ -1236,6 +1404,46 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
         [_message_row(message_id="m1", subject="zanzibar kickoff", labels=["INBOX"], sync_version=1)]
     )
 
+    # A downloaded WhatsApp media blob whose agent enrichment text mentions the
+    # query term must surface through the whatsapp_media content branch, which
+    # bm25-ranks the shared file_attachment_enrichments table then joins the media
+    # row. This covers the new branch end to end (function compiles + returns).
+    from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS, WHATSAPP_MEDIA_ITEM_COLUMNS
+
+    warehouse.insert_whatsapp_media_items(
+        [
+            _default_row(
+                WHATSAPP_MEDIA_ITEM_COLUMNS,
+                account="zach@example.com",
+                chat_id="chat-1",
+                message_id="wamid-1",
+                media_type="image",
+                filename="poster.jpg",
+                mime_type="image/jpeg",
+                content_sha256="wa-zan-sha",
+                is_missing=0,
+                message_at=message_datetime,
+                ingested_at=message_datetime,
+                sync_version=1,
+            )
+        ]
+    )
+    warehouse.insert_attachment_enrichments(
+        [
+            _default_row(
+                ATTACHMENT_ENRICHMENT_COLUMNS,
+                content_sha256="wa-zan-sha",
+                ai_provider="agent_codex",
+                ai_model="",
+                ai_prompt_version="whatsapp-media-agent-v1",
+                text="zanzibar rollout launch poster",
+                text_extraction_status="agent_ok",
+                updated_at=message_datetime,
+                sync_version=1,
+            )
+        ]
+    )
+
     # BM25 non-matches score 0; matches score negative. Isolate matches with score < 0
     # so the assertions hold regardless of how few total rows the fixture has.
     matched = warehouse._query(
@@ -1245,7 +1453,9 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     matched_refs = {row[2] for row in matched}
     assert ("slack", "private_channel") in matched_sources
     assert ("gmail", "subject") in matched_sources
+    assert ("whatsapp_media", "content") in matched_sources
     assert any("100.1" in ref for ref in matched_refs)  # the zanzibar slack message
+    assert any("chat-1:wamid-1" == ref for ref in matched_refs)  # the whatsapp media content row
     assert all("100.2" not in ref for ref in matched_refs)  # the unrelated lunch message
 
     # sources filter restricts the fan-out.

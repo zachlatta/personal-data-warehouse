@@ -1,12 +1,16 @@
-"""Agent-container vision enrichment for Gmail attachments.
+"""Agent-container vision enrichment for stored file attachments.
 
-Replaces the removed inline Ollama fallback: instead of calling a local vision
-model during Gmail sync, a separate pipeline scans for image (and scanned-PDF)
-attachments whose deterministic text extraction produced nothing useful, runs
-each through the sandboxed agent container (codex/claude CLI), and upserts the
-structured result into ``gmail_attachment_enrichments`` under its own
-``ai_provider``/``ai_model``/``ai_prompt_version`` identity. Existing search
-indexes on that table pick the text up automatically.
+A single source-agnostic pipeline scans a source's attachment table for image
+(and scanned-PDF) blobs that have no useful searchable text yet, runs each
+through the sandboxed agent container (codex/claude CLI), and upserts the
+structured result into the shared ``file_attachment_enrichments`` table under
+its own ``ai_provider``/``ai_model``/``ai_prompt_version`` identity. The BM25
+indexes on that table feed ``search_text()`` automatically.
+
+Each source (Gmail attachments, WhatsApp media, …) is described by a
+:class:`FileEnrichmentSource` that names its candidate table and the columns the
+generic candidate query reads. The runner, image preparation, agent prompt,
+validation, and text composition are entirely shared.
 """
 
 from __future__ import annotations
@@ -34,9 +38,8 @@ from personal_data_warehouse.agent_runner import (
     agent_run_tool_call_rows,
 )
 
-AGENT_ATTACHMENT_TASK_TYPE = "gmail_attachment_enrichment"
-AGENT_ATTACHMENT_PROMPT_VERSION = "gmail-attachment-agent-v1"
-AGENT_ATTACHMENT_INPUT_BASENAME = "attachment"
+ENRICHMENT_TABLE = "file_attachment_enrichments"
+
 DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 3
 # Only errors within this rolling window count toward the per-attachment retry
 # cap. Without it, errors accumulate forever, so attachments that exhausted
@@ -61,6 +64,9 @@ IMAGE_MIME_TYPES = (
     "image/tiff",
 )
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".tif")
+# Source-status values (from a source's deterministic text-extraction row) that
+# mark a PDF as worth a vision pass. Only consulted for sources that run a
+# deterministic extraction first (see FileEnrichmentSource.pdf_requires_prior_extraction).
 PDF_VISION_SOURCE_STATUSES = ("empty", "invalid_pdf")
 MIN_IMAGE_BYTES = 256
 MODEL_IMAGE_MAX_EDGE = 1280
@@ -68,50 +74,105 @@ MODEL_IMAGE_JPEG_QUALITY = 85
 PDF_RENDER_MAX_PAGES = 1
 PDF_RENDER_TIMEOUT_SECONDS = 60
 
-ATTACHMENT_VISION_INSTRUCTIONS = """Extract searchable metadata from this real Gmail attachment image.
-
-Look at the image first: extract titles, headings, bullets, labels, legends, names, dates, orgs, brands, numbers, and calls to action before writing a caption. For charts, include axis labels, legends, and visible values. For logos and wordmarks, inspect every text region, including small text at the bottom or edges, and include the full visible phrase rather than only the largest words. For photos, briefly describe people, setting, activity, and objects, and extract readable signs/posters/slides.
-
-If any readable text exists anywhere in the image, is_useful must be true. Logos and wordmarks are useful: set document_type to "logo", put all exact brand text in visible_text, and put the normalized brand/org name in entities. Ads, banners, posters, screenshots, charts, and slides are useful when they contain readable text or meaningful visual context.
-
-Never call the image a Gmail placeholder or Gmail interface unless Gmail UI or a literal Gmail attachment placeholder is visible. Do not infer visible text from the filename or from these instructions. Preserve acronyms and capitalization exactly as they appear. Only include text that is visibly printed in the image. If no text is visible, visible_text must be [] rather than ["unknown"], ["none"], or prose. If text is partially uncertain, include your best reading and add "(uncertain)" or an uncertainties note. Avoid generic keywords such as image, attachment, photo, and Gmail unless they are literally visible or specifically useful.
-
-Keep the output concise: prefer at most 12 visible_text chunks, 10 entities, 10 search_keywords, and 5 uncertainties, while still preserving all important names, titles, dates, numbers, and readable sign/poster text.
-
-Use false for is_useful only for blank/decorative/tracking images or literal placeholders with no useful visible text. Do not invent details."""
+AGENT_ATTACHMENT_INPUT_BASENAME = "attachment"
 
 
 @dataclass(frozen=True)
-class GmailAttachmentEnrichmentSummary:
+class FileEnrichmentSource:
+    """Describes one attachment source the shared enrichment runner can scan.
+
+    ``table`` is the source's attachment table; the column names map the generic
+    candidate query onto it. ``stored_predicate`` is a SQL fragment (using table
+    alias ``a``) that selects only rows whose blob is in the object store. Every
+    source's storage columns are assumed to be the standard
+    ``storage_backend``/``storage_key``/``storage_file_id``/``storage_url``.
+    """
+
+    name: str
+    label: str
+    task_type: str
+    prompt_version: str
+    table: str
+    stored_predicate: str
+    sha_column: str = "content_sha256"
+    filename_column: str = "filename"
+    mime_column: str = "mime_type"
+    size_column: str = "size"
+    order_column: str = "internal_date"
+    # When True, a PDF is only a vision candidate once the source's own
+    # deterministic extraction produced no useful text (status in
+    # PDF_VISION_SOURCE_STATUSES). When False, any PDF is eligible directly —
+    # used by sources that have no deterministic extraction step.
+    pdf_requires_prior_extraction: bool = True
+
+
+GMAIL_SOURCE = FileEnrichmentSource(
+    name="gmail",
+    label="Gmail attachment",
+    # Kept stable so this source's historical agent_runs still count toward the
+    # per-attachment error budget after the generalization rename.
+    task_type="gmail_attachment_enrichment",
+    prompt_version="gmail-attachment-agent-v1",
+    table="gmail_attachments",
+    stored_predicate="a.is_deleted = 0 AND a.content_sha256 <> '' AND a.storage_status = 'stored'",
+    size_column="size",
+    order_column="internal_date",
+    pdf_requires_prior_extraction=True,
+)
+
+WHATSAPP_SOURCE = FileEnrichmentSource(
+    name="whatsapp",
+    label="WhatsApp media attachment",
+    task_type="whatsapp_media_enrichment",
+    prompt_version="whatsapp-media-agent-v1",
+    table="whatsapp_media_items",
+    # is_missing is stored as an integer flag (0/1). A downloaded media blob has
+    # is_missing=0 and a content hash; metadata-only history rows (is_missing=1)
+    # carry no bytes to enrich.
+    stored_predicate="a.is_missing = 0 AND a.content_sha256 <> ''",
+    size_column="size_bytes",
+    order_column="message_at",
+    pdf_requires_prior_extraction=False,
+)
+
+# Backwards-friendly aliases retained for the Gmail-specific call sites/tests
+# that predate the generalization.
+AGENT_ATTACHMENT_PROMPT_VERSION = GMAIL_SOURCE.prompt_version
+AGENT_ATTACHMENT_TASK_TYPE = GMAIL_SOURCE.task_type
+
+
+@dataclass(frozen=True)
+class FileAttachmentEnrichmentSummary:
     attachments_seen: int
     attachments_enriched: int
     attachments_not_useful: int
     attachments_failed: int
 
 
-class GmailAttachmentEnrichmentRunner:
+class FileAttachmentEnrichmentRunner:
     def __init__(
         self,
         *,
+        source: FileEnrichmentSource,
         warehouse,
         agent,
         object_store_factory: Callable[[str], Any],
         logger,
         provider: str,
         model: str = "",
-        prompt_version: str = AGENT_ATTACHMENT_PROMPT_VERSION,
         text_max_chars: int = 20_000,
         max_error_attempts: int = DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
         error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
         now: Callable[[], datetime] | None = None,
     ) -> None:
+        self._source = source
         self._warehouse = warehouse
         self._agent = agent
         self._object_store_factory = object_store_factory
         self._logger = logger
         self._provider = provider
         self._model = model
-        self._prompt_version = prompt_version
+        self._prompt_version = source.prompt_version
         self._text_max_chars = text_max_chars
         self._max_error_attempts = max_error_attempts
         self._error_window_days = error_window_days
@@ -122,11 +183,12 @@ class GmailAttachmentEnrichmentRunner:
     def enrichment_provider(self) -> str:
         return f"agent_{self._provider}"
 
-    def sync(self, *, limit: int | None) -> GmailAttachmentEnrichmentSummary:
-        self._warehouse.ensure_tables()
+    def sync(self, *, limit: int | None) -> FileAttachmentEnrichmentSummary:
+        self._warehouse.ensure_file_attachment_enrichment_tables()
         self._warehouse.ensure_agent_tables()
-        candidates = load_attachment_enrichment_candidates(
+        candidates = load_file_enrichment_candidates(
             self._warehouse,
+            source=self._source,
             provider=self.enrichment_provider,
             model=self._model,
             prompt_version=self._prompt_version,
@@ -141,7 +203,9 @@ class GmailAttachmentEnrichmentRunner:
             content_sha256 = str(candidate.get("content_sha256", ""))
             label = f"{candidate.get('filename') or '<unnamed>'} ({content_sha256[:12]})"
             try:
-                self._logger.info("[%s/%s] enriching Gmail attachment %s", index, len(candidates), label)
+                self._logger.info(
+                    "[%s/%s] enriching %s %s", index, len(candidates), self._source.label, label
+                )
                 status = self._enrich_candidate(candidate)
             except Exception as exc:
                 failed += 1
@@ -152,7 +216,7 @@ class GmailAttachmentEnrichmentRunner:
                 enriched += 1
             else:
                 not_useful += 1
-        return GmailAttachmentEnrichmentSummary(
+        return FileAttachmentEnrichmentSummary(
             attachments_seen=len(candidates),
             attachments_enriched=enriched,
             attachments_not_useful=not_useful,
@@ -168,11 +232,13 @@ class GmailAttachmentEnrichmentRunner:
             mime_type=str(candidate.get("mime_type", "")),
             filename=str(candidate.get("filename", "")),
         )
-        prompt = attachment_vision_prompt(image_name=image_name, candidate=candidate)
+        prompt = attachment_vision_prompt(
+            image_name=image_name, candidate=candidate, source_label=self._source.label
+        )
         request = AgentRunRequest(
             prompt=prompt,
             schema=attachment_vision_schema(),
-            task_type=AGENT_ATTACHMENT_TASK_TYPE,
+            task_type=self._source.task_type,
             subject_id=str(candidate.get("content_sha256", "")),
             prompt_version=self._prompt_version,
             provider=self._provider,
@@ -222,7 +288,8 @@ class GmailAttachmentEnrichmentRunner:
             )
         except Exception as exc:
             self._logger.warning(
-                "Could not record Gmail attachment enrichment failure for %s: %s",
+                "Could not record %s enrichment failure for %s: %s",
+                self._source.label,
                 candidate.get("content_sha256", ""),
                 exc,
             )
@@ -289,9 +356,88 @@ def _error_window_clause(error_window_days: int) -> tuple[str, list[Any]]:
     return "", []
 
 
-def load_attachment_enrichment_candidates(
+def _candidate_query(source: FileEnrichmentSource, *, projection: str, tail: str) -> str:
+    """Build a candidate-selection query for ``source``.
+
+    ``projection`` is the SELECT list of the inner per-attachment scan and
+    ``tail`` is appended after it (e.g. an ORDER BY / LIMIT wrapper, or a bare
+    ``LIMIT 1`` existence probe). Image/PDF eligibility, the stored predicate,
+    the attempt-budget join, and the not-yet-enriched guard are identical across
+    sources; only the table, column names, and PDF rule vary.
+    """
+    sha = source.sha_column
+    filename = source.filename_column
+    mime = source.mime_column
+    size = source.size_column
+    pdf_is_match = f"(lower(a.{mime}) = 'application/pdf' OR lower(a.{filename}) LIKE '%%.pdf')"
+    if source.pdf_requires_prior_extraction:
+        pdf_clause = f"({pdf_is_match} AND COALESCE(det.text_extraction_status, '') = ANY(%s))"
+    else:
+        pdf_clause = pdf_is_match
+    return f"""
+        WITH failed_runs AS (
+            SELECT subject_id, count(*) AS error_attempts
+            FROM agent_runs
+            WHERE task_type = %s
+              AND status = 'error'
+              {{error_window_sql}}
+            GROUP BY subject_id
+        )
+        {projection}
+        FROM {source.table} a
+        LEFT JOIN {ENRICHMENT_TABLE} det
+            ON det.content_sha256 = a.{sha}
+              AND det.ai_provider = '' AND det.ai_model = '' AND det.ai_prompt_version = ''
+        LEFT JOIN failed_runs runs
+            ON runs.subject_id = a.{sha}
+        WHERE {source.stored_predicate}
+          AND a.{size} >= %s
+          AND COALESCE(runs.error_attempts, 0) < %s
+          AND (
+              lower(a.{mime}) = ANY(%s)
+              OR lower(a.{filename}) LIKE ANY(%s)
+              OR {pdf_clause}
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM {ENRICHMENT_TABLE} done
+              WHERE done.content_sha256 = a.{sha}
+                AND done.ai_provider = %s
+                AND done.ai_model = %s
+                AND done.ai_prompt_version = %s
+                AND done.text_extraction_status = ANY(%s)
+          )
+        {tail}
+        """
+
+
+def _candidate_params(
+    source: FileEnrichmentSource,
+    *,
+    provider: str,
+    model: str,
+    prompt_version: str,
+    max_error_attempts: int,
+    error_window_params: list[Any],
+) -> list[Any]:
+    params: list[Any] = [
+        source.task_type,
+        *error_window_params,
+        MIN_IMAGE_BYTES,
+        int(max_error_attempts),
+        list(IMAGE_MIME_TYPES),
+        [f"%{extension}" for extension in IMAGE_EXTENSIONS],
+    ]
+    if source.pdf_requires_prior_extraction:
+        params.append(list(PDF_VISION_SOURCE_STATUSES))
+    params.extend([provider, model, prompt_version, list(COMPLETED_STATUSES)])
+    return params
+
+
+def load_file_enrichment_candidates(
     warehouse,
     *,
+    source: FileEnrichmentSource,
     provider: str,
     model: str,
     prompt_version: str,
@@ -301,8 +447,6 @@ def load_attachment_enrichment_candidates(
 ) -> list[dict[str, Any]]:
     """Image (or scanned-PDF) attachments stored in the object store that have
     no completed agent enrichment for this provider/model/prompt identity."""
-    image_mime_types = list(IMAGE_MIME_TYPES)
-    image_extension_patterns = [f"%{extension}" for extension in IMAGE_EXTENSIONS]
     error_window_sql, error_window_params = _error_window_clause(error_window_days)
     columns = (
         "account",
@@ -317,79 +461,38 @@ def load_attachment_enrichment_candidates(
         "source_status",
     )
     limit_sql = "LIMIT %s" if limit is not None and limit > 0 else ""
-    params: list[Any] = [
-        AGENT_ATTACHMENT_TASK_TYPE,
-        *error_window_params,
-        MIN_IMAGE_BYTES,
-        int(max_error_attempts),
-        image_mime_types,
-        image_extension_patterns,
-        list(PDF_VISION_SOURCE_STATUSES),
-        provider,
-        model,
-        prompt_version,
-        list(COMPLETED_STATUSES),
-    ]
+    projection = (
+        f"SELECT DISTINCT ON (a.{source.sha_column}) "
+        f"a.account, "
+        f"a.{source.sha_column} AS content_sha256, "
+        f"a.{source.filename_column} AS filename, "
+        f"a.{source.mime_column} AS mime_type, "
+        f"a.{source.size_column} AS size, "
+        f"a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url, "
+        f"COALESCE(det.text_extraction_status, '') AS source_status, "
+        f"a.{source.order_column} AS order_at"
+    )
+    inner = _candidate_query(
+        source,
+        projection=projection,
+        tail=f"ORDER BY a.{source.sha_column}, a.{source.order_column} DESC",
+    ).format(error_window_sql=error_window_sql)
+    params = _candidate_params(
+        source,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        max_error_attempts=max_error_attempts,
+        error_window_params=error_window_params,
+    )
     if limit_sql:
         params.append(int(limit))
     rows = warehouse._query(
         f"""
-        WITH failed_runs AS (
-            SELECT subject_id, count(*) AS error_attempts
-            FROM agent_runs
-            WHERE task_type = %s
-              AND status = 'error'
-              {error_window_sql}
-            GROUP BY subject_id
-        )
         SELECT account, content_sha256, filename, mime_type, size,
                storage_backend, storage_key, storage_file_id, storage_url, source_status
-        FROM (
-            SELECT DISTINCT ON (a.content_sha256)
-                a.account,
-                a.content_sha256,
-                a.filename,
-                a.mime_type,
-                a.size,
-                a.storage_backend,
-                a.storage_key,
-                a.storage_file_id,
-                a.storage_url,
-                COALESCE(det.text_extraction_status, '') AS source_status,
-                a.internal_date
-            FROM gmail_attachments a
-            LEFT JOIN gmail_attachment_enrichments det
-                ON det.content_sha256 = a.content_sha256
-                  AND det.ai_provider = ''
-                  AND det.ai_model = ''
-                  AND det.ai_prompt_version = ''
-            LEFT JOIN failed_runs runs
-                ON runs.subject_id = a.content_sha256
-            WHERE a.is_deleted = 0
-              AND a.content_sha256 <> ''
-              AND a.storage_status = 'stored'
-              AND a.size >= %s
-              AND COALESCE(runs.error_attempts, 0) < %s
-              AND (
-                  lower(a.mime_type) = ANY(%s)
-                  OR lower(a.filename) LIKE ANY(%s)
-                  OR (
-                      (lower(a.mime_type) = 'application/pdf' OR lower(a.filename) LIKE '%%.pdf')
-                      AND COALESCE(det.text_extraction_status, '') = ANY(%s)
-                  )
-              )
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM gmail_attachment_enrichments done
-                  WHERE done.content_sha256 = a.content_sha256
-                    AND done.ai_provider = %s
-                    AND done.ai_model = %s
-                    AND done.ai_prompt_version = %s
-                    AND done.text_extraction_status = ANY(%s)
-              )
-            ORDER BY a.content_sha256, a.internal_date DESC
-        ) AS candidates
-        ORDER BY internal_date DESC
+        FROM ( {inner} ) AS candidates
+        ORDER BY order_at DESC
         {limit_sql}
         """,
         tuple(params),
@@ -397,9 +500,10 @@ def load_attachment_enrichment_candidates(
     return [dict(zip(columns, row, strict=True)) for row in rows]
 
 
-def has_attachment_enrichment_candidate(
+def has_file_enrichment_candidate(
     warehouse,
     *,
+    source: FileEnrichmentSource,
     provider: str,
     model: str,
     prompt_version: str,
@@ -407,66 +511,21 @@ def has_attachment_enrichment_candidate(
     error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
 ) -> bool:
     """Return whether at least one stored attachment needs agent enrichment."""
-    image_mime_types = list(IMAGE_MIME_TYPES)
-    image_extension_patterns = [f"%{extension}" for extension in IMAGE_EXTENSIONS]
     error_window_sql, error_window_params = _error_window_clause(error_window_days)
-    rows = warehouse._query(
-        f"""
-        WITH failed_runs AS (
-            SELECT subject_id, count(*) AS error_attempts
-            FROM agent_runs
-            WHERE task_type = %s
-              AND status = 'error'
-              {error_window_sql}
-            GROUP BY subject_id
-        )
-        SELECT 1
-        FROM gmail_attachments a
-        LEFT JOIN gmail_attachment_enrichments det
-            ON det.content_sha256 = a.content_sha256
-              AND det.ai_provider = ''
-              AND det.ai_model = ''
-              AND det.ai_prompt_version = ''
-        LEFT JOIN failed_runs runs
-            ON runs.subject_id = a.content_sha256
-        WHERE a.is_deleted = 0
-          AND a.content_sha256 <> ''
-          AND a.storage_status = 'stored'
-          AND a.size >= %s
-          AND COALESCE(runs.error_attempts, 0) < %s
-          AND (
-              lower(a.mime_type) = ANY(%s)
-              OR lower(a.filename) LIKE ANY(%s)
-              OR (
-                  (lower(a.mime_type) = 'application/pdf' OR lower(a.filename) LIKE '%%.pdf')
-                  AND COALESCE(det.text_extraction_status, '') = ANY(%s)
-              )
-          )
-          AND NOT EXISTS (
-              SELECT 1
-              FROM gmail_attachment_enrichments done
-              WHERE done.content_sha256 = a.content_sha256
-                AND done.ai_provider = %s
-                AND done.ai_model = %s
-                AND done.ai_prompt_version = %s
-                AND done.text_extraction_status = ANY(%s)
-          )
-        LIMIT 1
-        """,
-        (
-            AGENT_ATTACHMENT_TASK_TYPE,
-            *error_window_params,
-            MIN_IMAGE_BYTES,
-            int(max_error_attempts),
-            image_mime_types,
-            image_extension_patterns,
-            list(PDF_VISION_SOURCE_STATUSES),
-            provider,
-            model,
-            prompt_version,
-            list(COMPLETED_STATUSES),
-        ),
+    query = _candidate_query(
+        source,
+        projection="SELECT 1",
+        tail="LIMIT 1",
+    ).format(error_window_sql=error_window_sql)
+    params = _candidate_params(
+        source,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        max_error_attempts=max_error_attempts,
+        error_window_params=error_window_params,
     )
+    rows = warehouse._query(query, tuple(params))
     return bool(rows)
 
 
@@ -581,7 +640,23 @@ def attachment_vision_schema() -> dict[str, Any]:
     }
 
 
-def attachment_vision_prompt(*, image_name: str, candidate: Mapping[str, Any]) -> str:
+def attachment_vision_instructions(source_label: str) -> str:
+    return f"""Extract searchable metadata from this real {source_label} image.
+
+Look at the image first: extract titles, headings, bullets, labels, legends, names, dates, orgs, brands, numbers, and calls to action before writing a caption. For charts, include axis labels, legends, and visible values. For logos and wordmarks, inspect every text region, including small text at the bottom or edges, and include the full visible phrase rather than only the largest words. For photos, briefly describe people, setting, activity, and objects, and extract readable signs/posters/slides.
+
+If any readable text exists anywhere in the image, is_useful must be true. Logos and wordmarks are useful: set document_type to "logo", put all exact brand text in visible_text, and put the normalized brand/org name in entities. Ads, banners, posters, screenshots, charts, and slides are useful when they contain readable text or meaningful visual context.
+
+Never claim the image is a placeholder or app interface unless a literal placeholder or app UI is actually visible. Do not infer visible text from the filename or from these instructions. Preserve acronyms and capitalization exactly as they appear. Only include text that is visibly printed in the image. If no text is visible, visible_text must be [] rather than ["unknown"], ["none"], or prose. If text is partially uncertain, include your best reading and add "(uncertain)" or an uncertainties note. Avoid generic keywords such as image, attachment, and photo unless they are literally visible or specifically useful.
+
+Keep the output concise: prefer at most 12 visible_text chunks, 10 entities, 10 search_keywords, and 5 uncertainties, while still preserving all important names, titles, dates, numbers, and readable sign/poster text.
+
+Use false for is_useful only for blank/decorative/tracking images or literal placeholders with no useful visible text. Do not invent details."""
+
+
+def attachment_vision_prompt(
+    *, image_name: str, candidate: Mapping[str, Any], source_label: str = "attachment"
+) -> str:
     # The image path is given relative to the agent's working directory (the run
     # dir), which is exactly where the inputs/ subdir lives. Image-viewing tools
     # such as codex's view_image receive this string verbatim and do NOT perform
@@ -590,7 +665,7 @@ def attachment_vision_prompt(*, image_name: str, candidate: Mapping[str, Any]) -
     # "<workdir>/attachment.jpg". A concrete relative path needs no expansion.
     relative_image_path = f"{DEFAULT_AGENT_INPUTS_DIR_NAME}/{image_name}"
     payload = {
-        "task": "Extract searchable metadata from one Gmail attachment image.",
+        "task": f"Extract searchable metadata from one {source_label} image.",
         "image": {
             "path": relative_image_path,
             "how_to_view": (
@@ -603,7 +678,7 @@ def attachment_vision_prompt(*, image_name: str, candidate: Mapping[str, Any]) -
             "original_filename": str(candidate.get("filename", "")),
             "original_mime_type": str(candidate.get("mime_type", "")),
         },
-        "instructions": ATTACHMENT_VISION_INSTRUCTIONS,
+        "instructions": attachment_vision_instructions(source_label),
         "final_output_contract": {
             "format": "Return one JSON object and no prose.",
             "schema": attachment_vision_schema(),
@@ -634,7 +709,7 @@ def validate_attachment_vision_result(result: Mapping[str, Any]) -> list[str]:
 
 
 def attachment_enrichment_text(result: Mapping[str, Any]) -> str:
-    """Compose the searchable text block stored in gmail_attachment_enrichments.
+    """Compose the searchable text block stored in file_attachment_enrichments.
 
     Mirrors the layout the previous pipeline produced so the BM25/trigram search
     behavior stays consistent across old and new rows.

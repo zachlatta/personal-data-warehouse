@@ -286,8 +286,8 @@ are enriched asynchronously by the `gmail_attachment_enrichment` asset, which ru
 each attachment through the sandboxed agent container (the same Codex/Claude CLI
 runner used for Voice Memos enrichment). The agent views the image and returns
 structured metadata (summary, exact visible text, entities, search keywords) that
-is upserted into `gmail_attachment_enrichments` under the `agent_<provider>`
-identity. An hourly schedule plus a backlog sensor drain candidates in batches of
+is upserted into the shared `file_attachment_enrichments` table under the
+`agent_<provider>` identity. An hourly schedule plus a backlog sensor drain candidates in batches of
 `GMAIL_ATTACHMENT_ENRICHMENT_BATCH_SIZE` (default 25); attachments whose agent
 runs keep erroring are retried up to `GMAIL_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS`
 (default 3) times. Enrichment reads attachment bytes from the Gmail attachment
@@ -985,12 +985,16 @@ The warehouse also creates clean views for current inbox and transcript state:
 Attachments are stored in `gmail_attachments`, keyed by `(account, message_id, part_id, filename)`.
 The sync stores attachment metadata, content hashes, text extraction status, and extracted text for searchable formats.
 Supported text extraction includes plain text-like files, HTML, PDF, ZIP contents, and Office Open XML files such as `.docx`, `.pptx`, and `.xlsx`.
-Agent vision enrichment stores successful output in `gmail_attachment_enrichments` with
-`text_extraction_status = 'agent_ok'` (or `agent_not_useful` for blank/decorative images),
-alongside the provider, model, exact prompt, prompt hash, prompt version, source extraction
-status, elapsed time, and processing timestamp. Rows produced by the removed inline Ollama
-fallback (`ai_ok`, `ai_ocr_only`, ...) remain for search but are no longer written.
+Agent vision enrichment stores successful output in the shared `file_attachment_enrichments`
+table with `text_extraction_status = 'agent_ok'` (or `agent_not_useful` for blank/decorative
+images), alongside the provider, model, exact prompt, prompt hash, prompt version, source
+extraction status, elapsed time, and processing timestamp. Rows produced by the removed inline
+Ollama fallback (`ai_ok`, `ai_ocr_only`, ...) remain for search but are no longer written.
 Attachments that cannot be extracted still get metadata rows with `text_extraction_status`.
+`file_attachment_enrichments` is the renamed, source-agnostic successor to
+`gmail_attachment_enrichments`: the same agent-vision pipeline now also enriches downloaded
+WhatsApp image/PDF media (the `whatsapp_media_enrichment` asset), keyed by `content_sha256`
+under each source's own `task_type`/`prompt_version`. See `file_attachment_enrichment.py`.
 
 ## Verification
 
