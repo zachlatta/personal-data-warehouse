@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from personal_data_warehouse_voice_memos.network import NetworkPolicy
+from personal_data_warehouse_voice_memos.network import NetworkPolicy, parse_proc_net_route
 
 
 def test_network_policy_blocks_inflight_wifi_ssid() -> None:
@@ -19,6 +19,40 @@ def test_network_policy_blocks_inflight_wifi_ssid() -> None:
 
     assert decision.allowed is False
     assert "blocked Wi-Fi SSID" in decision.reason
+
+
+def test_parse_proc_net_route_picks_lowest_metric_default() -> None:
+    # Real-ish /proc/net/route: a non-default route, then two defaults
+    # (Destination 00000000) on different interfaces with different metrics.
+    text = (
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+        "enp1s0\t0000FEA9\t00000000\t0001\t0\t0\t1000\t0000FFFF\t0\t0\t0\n"
+        "wlp2s0\t00000000\t0102000A\t0003\t0\t0\t600\t00000000\t0\t0\t0\n"
+        "enp1s0\t00000000\t0102000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+    )
+    assert parse_proc_net_route(text) == "enp1s0"
+
+
+def test_parse_proc_net_route_no_default_returns_empty() -> None:
+    text = (
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+        "enp1s0\t0000FEA9\t00000000\t0001\t0\t0\t1000\t0000FFFF\t0\t0\t0\n"
+    )
+    assert parse_proc_net_route(text) == ""
+
+
+def test_network_policy_allows_linux_default_route(monkeypatch) -> None:
+    # On Linux there is no BSD `route`/`networksetup`; the guard must still pass
+    # when the kernel routing table shows a real default route.
+    import personal_data_warehouse_voice_memos.network as network
+
+    def runner(args: list[str]) -> str:
+        return ""  # macOS commands unavailable
+
+    monkeypatch.setattr(network, "linux_default_route_interface", lambda: "enp1s0")
+    decision = NetworkPolicy(runner=runner).check()
+    assert decision.allowed is True
+    assert "enp1s0" in decision.reason
 
 
 def test_network_policy_blocks_tethered_hardware_port() -> None:

@@ -129,12 +129,49 @@ class NetworkPolicy:
 
 
 def default_route_interface(runner: Callable[[list[str]], str]) -> str:
+    # macOS: `route -n get default` prints an "interface:" line.
     output = runner(["route", "-n", "get", "default"])
     for line in output.splitlines():
         stripped = line.strip()
         if stripped.startswith("interface:"):
             return stripped.split(":", 1)[1].strip()
-    return ""
+    # Linux (e.g. the openclaw VM) has no BSD `route` command; fall back to the
+    # kernel routing table so the guard still recognizes a real default route.
+    return linux_default_route_interface()
+
+
+def linux_default_route_interface() -> str:
+    try:
+        with open("/proc/net/route", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        return ""
+    return parse_proc_net_route(text)
+
+
+def parse_proc_net_route(text: str) -> str:
+    """Return the interface backing the default route in /proc/net/route text.
+
+    Each row is tab/space separated: Iface Destination Gateway Flags ... Metric.
+    The default route is the row whose hex Destination is all zeros; when more
+    than one exists, prefer the lowest metric (matching kernel selection).
+    """
+    best_iface = ""
+    best_metric = None
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 8:
+            continue
+        iface, destination = fields[0], fields[1]
+        if destination != "00000000":
+            continue
+        try:
+            metric = int(fields[6])
+        except ValueError:
+            metric = 0
+        if best_metric is None or metric < best_metric:
+            best_iface, best_metric = iface, metric
+    return best_iface
 
 
 def hardware_ports_by_device(runner: Callable[[list[str]], str]) -> dict[str, str]:
