@@ -1260,6 +1260,18 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     )
     assert after_cutoff == [(0,)]
 
+    # Resilience: a missing/unusable bm25 index must drop only its own source,
+    # not break the whole function. Dropping unrelated bm25 indexes must leave
+    # the slack + gmail matches intact and must not raise.
+    warehouse._command("DROP INDEX apple_voice_memos_title_bm25_idx")
+    warehouse._command("DROP INDEX contact_cards_name_bm25_idx")
+    survived = warehouse._query(
+        "SELECT source, subsource FROM search_text('zanzibar rollout', 20) WHERE score < 0"
+    )
+    survived_sources = {(row[0], row[1]) for row in survived}
+    assert ("slack", "private_channel") in survived_sources
+    assert ("gmail", "subject") in survived_sources
+
 
 def test_whatsapp_client_session_round_trips_binary_snapshot(warehouse: PostgresWarehouse) -> None:
     now = datetime(2026, 6, 14, 12, tzinfo=UTC)

@@ -5166,7 +5166,16 @@ class PostgresWarehouse:
             ),
         ]
 
-        hits = "\n                        UNION ALL\n                        ".join(branches)
+        # Run each branch as its own statement (dollar-quoted in a plpgsql array)
+        # so a single missing or unusable bm25 index drops only that one source
+        # instead of failing the entire function. Without this, the whole UNION
+        # errors with "index ... does not exist" the moment any one branch's
+        # index is absent (e.g. a not-yet-built index right after a deploy, a
+        # failed/half-built index, or a future source whose index never built) —
+        # making the preferred cross-source search path 100% unusable on a single
+        # bad index. Per-branch results collect in a temp table, then we rank and
+        # limit across every source that succeeded.
+        branch_array = ",\n                        ".join(f"$b${b}$b$" for b in branches)
         self._command(
             r"""
             CREATE OR REPLACE FUNCTION search_text(
@@ -5181,24 +5190,39 @@ class PostgresWarehouse:
                 text text, score real
             )
             LANGUAGE plpgsql
-            STABLE
+            VOLATILE
             AS $fn$
             DECLARE
                 per_source integer := greatest(coalesce(max_results, 50), 1);
+                branch text;
             BEGIN
-                RETURN QUERY EXECUTE format($sql$
-                    WITH hits AS (
+                CREATE TEMP TABLE IF NOT EXISTS _search_text_hits (
+                    source text, subsource text, context text, who text,
+                    occurred_at timestamptz, account text, ref text,
+                    text text, score real
+                );
+                TRUNCATE _search_text_hits;
+                FOREACH branch IN ARRAY ARRAY[
                         """
-            + hits
+            + branch_array
             + r"""
-                    )
-                    SELECT source, subsource, context, who, occurred_at, account, ref, text, score
-                    FROM hits
-                    WHERE (%3$L::text[] IS NULL OR source = ANY (%3$L::text[]))
-                      AND (%4$L::timestamptz IS NULL OR occurred_at >= %4$L::timestamptz)
-                    ORDER BY score ASC NULLS LAST
-                    LIMIT %2$s
-                $sql$, query, per_source, sources, since);
+                ] LOOP
+                    BEGIN
+                        EXECUTE format('INSERT INTO _search_text_hits ' || branch, query, per_source);
+                    EXCEPTION WHEN OTHERS THEN
+                        -- Missing/unusable bm25 index (or any branch error): skip
+                        -- this source; the rest of the search still returns.
+                        NULL;
+                    END;
+                END LOOP;
+                RETURN QUERY
+                    SELECT h.source, h.subsource, h.context, h.who, h.occurred_at,
+                           h.account, h.ref, h.text, h.score
+                    FROM _search_text_hits h
+                    WHERE (sources IS NULL OR h.source = ANY (sources))
+                      AND (since IS NULL OR h.occurred_at >= since)
+                    ORDER BY h.score ASC NULLS LAST
+                    LIMIT per_source;
             END;
             $fn$;
             """
