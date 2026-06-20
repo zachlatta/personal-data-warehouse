@@ -414,8 +414,8 @@ PDW_SECRET_TOKEN=<same-secret-as-pdw-app>
 VOICE_MEMOS_EXTENSIONS=.m4a,.qta
 ```
 
-Explicit `PDW_INGEST_BASE_URL` / `PDW_INGEST_SIGNING_KEY` aliases still work
-and take precedence for deployments that need to pin a separate ingest target.
+The legacy `MCP_BASE_URL` / `MCP_SECRET_TOKEN` names are still accepted as
+aliases for `PDW_API_URL` / `PDW_SECRET_TOKEN`.
 
 Configure the app/Dagster object store with the shared Drive folder and re-authorize that Google
 account so the token includes Drive scope:

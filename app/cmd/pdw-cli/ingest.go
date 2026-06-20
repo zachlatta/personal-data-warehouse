@@ -167,27 +167,28 @@ func resolveIngestWarehouse(getenv func(string) string, flagBaseURL, flagToken s
 
 // ingestEnvAdditions feeds pdw's own warehouse config to the uploader so there
 // is no separate ingest base URL to manage: the uploader's app URL is the main
-// API URL, and its HMAC signing key is the app secret token pdw already holds.
-// It avoids clobbering explicit PDW_INGEST_*/MCP_* environment overrides for
-// env/config-derived values, but root flags still win as they do for other pdw
-// commands.
+// API URL (PDW_API_URL), and its HMAC signing key is the app secret token
+// (PDW_SECRET_TOKEN) pdw already holds — the exact names the Python client
+// reads. Values pulled from env are already inherited by the child, so we only
+// append a value when it came from a root flag or the login config file. A root
+// flag is always appended so it wins over an inherited env value (Go's exec
+// dedups duplicate env keys keeping the last entry).
 func ingestEnvAdditions(getenv func(string) string, flagBaseURL, flagToken string) []string {
 	baseURL, token := resolveIngestWarehouse(getenv, flagBaseURL, flagToken)
 	flagBaseURL = strings.TrimSpace(flagBaseURL)
 	flagToken = strings.TrimSpace(flagToken)
 	var add []string
 	if flagBaseURL != "" {
-		add = append(add, "PDW_INGEST_BASE_URL="+baseURL)
-	} else if baseURL != "" && getenv("PDW_INGEST_BASE_URL") == "" && getenv("MCP_BASE_URL") == "" {
-		add = append(add, "PDW_INGEST_BASE_URL="+baseURL)
+		add = append(add, "PDW_API_URL="+baseURL)
+	} else if baseURL != "" && getenv("PDW_API_URL") == "" && getenv("MCP_BASE_URL") == "" {
+		add = append(add, "PDW_API_URL="+baseURL)
 	}
 	if flagToken != "" {
-		add = append(add, "PDW_INGEST_SIGNING_KEY="+token)
+		add = append(add, "PDW_SECRET_TOKEN="+token)
 	} else if token != "" &&
-		getenv("PDW_INGEST_SIGNING_KEY") == "" &&
 		getenv("PDW_SECRET_TOKEN") == "" &&
 		getenv("MCP_SECRET_TOKEN") == "" {
-		add = append(add, "PDW_INGEST_SIGNING_KEY="+token)
+		add = append(add, "PDW_SECRET_TOKEN="+token)
 	}
 	return add
 }

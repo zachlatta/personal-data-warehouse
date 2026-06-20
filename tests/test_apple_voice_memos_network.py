@@ -210,18 +210,17 @@ def test_app_ingest_preflight_uses_configured_app_host() -> None:
 
 
 def test_ingest_base_url_uses_main_api_url(monkeypatch) -> None:
-    monkeypatch.delenv("PDW_INGEST_BASE_URL", raising=False)
     monkeypatch.delenv("MCP_BASE_URL", raising=False)
     monkeypatch.setenv("PDW_API_URL", "https://warehouse.example.test")
 
     assert ingest_base_url_from_env() == "https://warehouse.example.test"
 
 
-def test_ingest_base_url_prefers_explicit_ingest_alias(monkeypatch) -> None:
-    monkeypatch.setenv("PDW_INGEST_BASE_URL", "https://ingest.example.test")
-    monkeypatch.setenv("PDW_API_URL", "https://warehouse.example.test")
+def test_ingest_base_url_accepts_mcp_base_url_alias(monkeypatch) -> None:
+    monkeypatch.delenv("PDW_API_URL", raising=False)
+    monkeypatch.setenv("MCP_BASE_URL", "https://legacy.example.test")
 
-    assert ingest_base_url_from_env() == "https://ingest.example.test"
+    assert ingest_base_url_from_env() == "https://legacy.example.test"
 
 
 def test_app_ingest_preflight_rejects_missing_base_url() -> None:

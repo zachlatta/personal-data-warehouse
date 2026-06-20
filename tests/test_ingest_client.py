@@ -174,10 +174,8 @@ def test_runner_requires_batch_uploader(tmp_path: Path) -> None:
 # --- ingest_client_from_env: warehouse URL/token resolution -----------------
 
 _INGEST_ENV_VARS = (
-    "PDW_INGEST_BASE_URL",
     "PDW_API_URL",
     "MCP_BASE_URL",
-    "PDW_INGEST_SIGNING_KEY",
     "PDW_SECRET_TOKEN",
     "MCP_SECRET_TOKEN",
 )
@@ -199,13 +197,12 @@ def test_from_env_uses_main_api_url(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client._signing_key == b"tok"
 
 
-def test_from_env_prefers_explicit_ingest_url_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_from_env_accepts_mcp_base_url_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_ingest_env(monkeypatch)
-    monkeypatch.setenv("PDW_INGEST_BASE_URL", "https://explicit.example")
-    monkeypatch.setenv("PDW_API_URL", "https://warehouse.example")
+    monkeypatch.setenv("MCP_BASE_URL", "https://legacy.example")
     monkeypatch.setenv("PDW_SECRET_TOKEN", "tok")
     client = ingest_client_from_env()
-    assert client._base_url == "https://explicit.example"
+    assert client._base_url == "https://legacy.example"
 
 
 def test_from_env_requires_a_base_url(monkeypatch: pytest.MonkeyPatch) -> None:

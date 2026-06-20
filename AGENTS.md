@@ -289,11 +289,9 @@ Every uploader therefore needs the warehouse URL and the app secret token. The c
 is pdw's own config: because the uploaders run via `pdw ingest <source>`, the pdw CLI resolves the
 URL + token the way it does for every other command (`pdw login`, then `PDW_API_URL` /
 `PDW_SECRET_TOKEN`) and passes them down — so a single `pdw login` configures uploads too, with no
-separate ingest URL to manage. The client reads `PDW_API_URL` (aliases: `PDW_INGEST_BASE_URL`,
-`MCP_BASE_URL`) for the URL and `PDW_SECRET_TOKEN` (aliases: `PDW_INGEST_SIGNING_KEY`,
-`MCP_SECRET_TOKEN`) for the signing key; an explicit alias still wins (e.g. the openclaw VM pins
-`PDW_INGEST_BASE_URL` + `PDW_INGEST_SIGNING_KEY` in its `.env`). Without any of them the uploader
-fails fast. On the app side, ingestion turns on automatically when the object
+separate ingest URL to manage. The client reads `PDW_API_URL` (legacy alias: `MCP_BASE_URL`) for
+the URL and `PDW_SECRET_TOKEN` (legacy alias: `MCP_SECRET_TOKEN`) for the signing key. Without any
+of them the uploader fails fast. On the app side, ingestion turns on automatically when the object
 store is configured; per-source folders default to `PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID` and
 can be overridden with `PDW_INGEST_<SOURCE>_FOLDER_ID` (e.g.
 `PDW_INGEST_AGENT_SESSIONS_FOLDER_ID`). Uploads are authenticated with the same HMAC scheme as
@@ -321,8 +319,8 @@ a **systemd user timer** (zrl has `Linger=yes`, so user units run without an act
   deploy key; `core.sshCommand` points at `~/.ssh/pdw_deploy_key`); runs via `uv`
   (`~/.local/bin/uv`).
 - Env: `~/dev/zachlatta/personal-data-warehouse/.env` holds the **app-ingest** config (the VM has
-  no Drive credential): `PDW_INGEST_BASE_URL` (the app, `https://data-warehouse-mcp.zachlatta.com`),
-  `PDW_INGEST_SIGNING_KEY` (= the app's `PDW_SECRET_TOKEN`/`MCP_SECRET_TOKEN`),
+  no Drive credential): `PDW_API_URL` (the app, `https://data-warehouse-mcp.zachlatta.com`),
+  `PDW_SECRET_TOKEN` (= the app's `PDW_SECRET_TOKEN`/`MCP_SECRET_TOKEN`),
   `AGENT_SESSIONS_STORAGE_BACKEND=http_app`, and `AGENT_SESSIONS_ACCOUNT=zach@zachlatta.com`
   (tags the envelope `account` + keys the upload-offset state DB — keep it stable).
   `AGENT_SESSIONS_CLAUDE_PROJECTS_DIR=`/`AGENT_SESSIONS_CODEX_SESSIONS_DIR=` are blanked so the

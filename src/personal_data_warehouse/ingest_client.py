@@ -299,29 +299,26 @@ def ingest_client_from_env(
 
     The app base URL is the warehouse's main API URL: ``PDW_API_URL`` is the
     canonical name (the same URL pdw uses for queries; ``pdw ingest`` passes it
-    and the token down automatically), with ``PDW_INGEST_BASE_URL`` /
-    ``MCP_BASE_URL`` accepted as aliases. The signing key is the app secret
-    token (``PDW_SECRET_TOKEN``), also accepted as ``PDW_INGEST_SIGNING_KEY`` /
-    ``MCP_SECRET_TOKEN``. Folder ids and the Drive credential are deliberately
-    NOT read here; those live only in the app.
+    and the token down automatically), with ``MCP_BASE_URL`` accepted as an
+    alias. The signing key is the app secret token (``PDW_SECRET_TOKEN``), also
+    accepted as ``MCP_SECRET_TOKEN``. Folder ids and the Drive credential are
+    deliberately NOT read here; those live only in the app.
     """
 
     base_url = (
-        os.getenv("PDW_INGEST_BASE_URL")
-        or os.getenv("PDW_API_URL")
+        os.getenv("PDW_API_URL")
         or os.getenv("MCP_BASE_URL")
         or ""
     ).strip()
     if not base_url:
-        raise ValueError("PDW_API_URL (or PDW_INGEST_BASE_URL / MCP_BASE_URL) must be set for http_app uploads")
+        raise ValueError("PDW_API_URL (or MCP_BASE_URL) must be set for http_app uploads")
     secret = (
-        os.getenv("PDW_INGEST_SIGNING_KEY")
-        or os.getenv("PDW_SECRET_TOKEN")
+        os.getenv("PDW_SECRET_TOKEN")
         or os.getenv("MCP_SECRET_TOKEN")
         or ""
     ).strip()
     if not secret:
         raise ValueError(
-            "PDW_INGEST_SIGNING_KEY or PDW_SECRET_TOKEN (or MCP_SECRET_TOKEN) must be set for http_app uploads"
+            "PDW_SECRET_TOKEN (or MCP_SECRET_TOKEN) must be set for http_app uploads"
         )
     return IngestClient(base_url=base_url, signing_key=secret.encode("utf-8"), now=now, session=session)

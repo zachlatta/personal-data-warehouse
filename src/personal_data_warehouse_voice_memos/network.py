@@ -268,7 +268,7 @@ def swift_string_literal_value(value: str) -> str:
 
 
 def ingest_base_url_from_env() -> str:
-    return (os.getenv("PDW_INGEST_BASE_URL") or os.getenv("PDW_API_URL") or os.getenv("MCP_BASE_URL") or "").strip()
+    return (os.getenv("PDW_API_URL") or os.getenv("MCP_BASE_URL") or "").strip()
 
 
 def preflight_app_ingest(
@@ -279,7 +279,7 @@ def preflight_app_ingest(
 ) -> NetworkDecision:
     raw_base_url = (base_url if base_url is not None else ingest_base_url_from_env()).strip()
     if not raw_base_url:
-        return NetworkDecision(False, "PDW_API_URL (or PDW_INGEST_BASE_URL / MCP_BASE_URL) is not set")
+        return NetworkDecision(False, "PDW_API_URL (or MCP_BASE_URL) is not set")
     parsed = urlsplit(raw_base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return NetworkDecision(False, f"invalid ingest base URL: {raw_base_url}")

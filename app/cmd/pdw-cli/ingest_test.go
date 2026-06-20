@@ -204,41 +204,27 @@ func TestIngestPassesUploaderHelpThrough(t *testing.T) {
 	}
 }
 
-func TestIngestInjectsBaseURLFromMainAPIURL(t *testing.T) {
-	// The uploader's ingest base URL is the warehouse's main API URL: pdw
-	// passes PDW_API_URL down so there's no separate ingest URL to configure.
+func TestIngestInheritsBaseURLFromEnv(t *testing.T) {
+	// When PDW_API_URL is already in the environment the child inherits it
+	// directly, so pdw must not re-inject a duplicate.
 	cap := withStubIngestExec(t, 0)
 	env := map[string]string{"PDW_API_URL": "https://warehouse.example"}
 	var out, errOut bytes.Buffer
 	runIngest([]string{"voice-memos"}, strings.NewReader(""), &out, &errOut, func(k string) string { return env[k] })
-	got, ok := envValue(cap.extraEnv, "PDW_INGEST_BASE_URL")
-	if !ok || got != "https://warehouse.example" {
-		t.Fatalf("PDW_INGEST_BASE_URL not injected from PDW_API_URL: %#v", cap.extraEnv)
+	if _, ok := envValue(cap.extraEnv, "PDW_API_URL"); ok {
+		t.Fatalf("must not re-inject PDW_API_URL already present in env: %#v", cap.extraEnv)
 	}
 }
 
-func TestIngestInjectsTokenFromSecretToken(t *testing.T) {
+func TestIngestInheritsTokenFromEnv(t *testing.T) {
 	// PDW_SECRET_TOKEN is already in the Python client's signing-key chain, so
 	// pdw need not re-inject it; it just inherits via the process environment.
 	cap := withStubIngestExec(t, 0)
 	env := map[string]string{"PDW_API_URL": "https://warehouse.example", "PDW_SECRET_TOKEN": "tok"}
 	var out, errOut bytes.Buffer
 	runIngest([]string{"voice-memos"}, strings.NewReader(""), &out, &errOut, func(k string) string { return env[k] })
-	if _, ok := envValue(cap.extraEnv, "PDW_INGEST_SIGNING_KEY"); ok {
-		t.Fatalf("must not inject a signing key when PDW_SECRET_TOKEN is already set: %#v", cap.extraEnv)
-	}
-}
-
-func TestIngestDoesNotClobberExplicitIngestBaseURL(t *testing.T) {
-	cap := withStubIngestExec(t, 0)
-	env := map[string]string{
-		"PDW_API_URL":         "https://warehouse.example",
-		"PDW_INGEST_BASE_URL": "https://explicit.example",
-	}
-	var out, errOut bytes.Buffer
-	runIngest([]string{"voice-memos"}, strings.NewReader(""), &out, &errOut, func(k string) string { return env[k] })
-	if _, ok := envValue(cap.extraEnv, "PDW_INGEST_BASE_URL"); ok {
-		t.Fatalf("must not override an explicit PDW_INGEST_BASE_URL: %#v", cap.extraEnv)
+	if _, ok := envValue(cap.extraEnv, "PDW_SECRET_TOKEN"); ok {
+		t.Fatalf("must not re-inject a token when PDW_SECRET_TOKEN is already set: %#v", cap.extraEnv)
 	}
 }
 
@@ -261,10 +247,10 @@ func TestIngestRootFlagsOverrideEnvForUploaderConfig(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr=%s", code, errOut.String())
 	}
-	if got, ok := envValue(cap.extraEnv, "PDW_INGEST_BASE_URL"); !ok || got != "https://flag.example" {
+	if got, ok := envValue(cap.extraEnv, "PDW_API_URL"); !ok || got != "https://flag.example" {
 		t.Fatalf("base URL flag not passed to uploader: %#v", cap.extraEnv)
 	}
-	if got, ok := envValue(cap.extraEnv, "PDW_INGEST_SIGNING_KEY"); !ok || got != "flag-token" {
+	if got, ok := envValue(cap.extraEnv, "PDW_SECRET_TOKEN"); !ok || got != "flag-token" {
 		t.Fatalf("token flag not passed to uploader: %#v", cap.extraEnv)
 	}
 }
@@ -286,10 +272,10 @@ func TestIngestInjectsFromLoginConfigFile(t *testing.T) {
 	cap := withStubIngestExec(t, 0)
 	var out, errOut bytes.Buffer
 	runIngest([]string{"agent-sessions"}, strings.NewReader(""), &out, &errOut, getenv)
-	if got, ok := envValue(cap.extraEnv, "PDW_INGEST_BASE_URL"); !ok || got != "https://login.example" {
+	if got, ok := envValue(cap.extraEnv, "PDW_API_URL"); !ok || got != "https://login.example" {
 		t.Fatalf("base URL not taken from login config: %#v", cap.extraEnv)
 	}
-	if got, ok := envValue(cap.extraEnv, "PDW_INGEST_SIGNING_KEY"); !ok || got != "login-token" {
+	if got, ok := envValue(cap.extraEnv, "PDW_SECRET_TOKEN"); !ok || got != "login-token" {
 		t.Fatalf("signing key not taken from login config: %#v", cap.extraEnv)
 	}
 }
@@ -327,10 +313,10 @@ func TestRunDispatchesIngestWithRootConfigFlags(t *testing.T) {
 	if !cap.called {
 		t.Fatal("run() did not dispatch ingest")
 	}
-	if got, ok := envValue(cap.extraEnv, "PDW_INGEST_BASE_URL"); !ok || got != "https://flag.example" {
+	if got, ok := envValue(cap.extraEnv, "PDW_API_URL"); !ok || got != "https://flag.example" {
 		t.Fatalf("base URL flag not passed to uploader: %#v", cap.extraEnv)
 	}
-	if got, ok := envValue(cap.extraEnv, "PDW_INGEST_SIGNING_KEY"); !ok || got != "flag-token" {
+	if got, ok := envValue(cap.extraEnv, "PDW_SECRET_TOKEN"); !ok || got != "flag-token" {
 		t.Fatalf("token flag not passed to uploader: %#v", cap.extraEnv)
 	}
 }

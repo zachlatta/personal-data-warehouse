@@ -122,7 +122,6 @@ def test_whatsapp_history_media_download_can_be_disabled(monkeypatch) -> None:
 def test_local_upload_configs_use_main_api_url_without_drive_folders(monkeypatch) -> None:
     monkeypatch.setattr(config, "load_dotenv", lambda: None)
     for name in (
-        "PDW_INGEST_BASE_URL",
         "MCP_BASE_URL",
         "VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID",
         "VOICE_MEMOS_DRIVE_FOLDER_ID",
