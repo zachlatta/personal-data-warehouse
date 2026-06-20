@@ -1288,12 +1288,10 @@ class PostgresWarehouse:
             "CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON upstream_mutation_events (mutation_id, event_index)",
         ):
             self._command(sql)
-        # These raw-DDL tables also carry BM25 IndexSpecs (for search_text); build
-        # them through _ensure_indexes so they get the pg_textsearch bootstrap and
-        # graceful-skip on hosts without the extension.
-        self._ensure_indexes(
-            ["upstream_mutations", "upstream_mutation_requests"]
-        )
+        # These raw-DDL tables also carry BM25 IndexSpecs (for search_text); they
+        # get built (with the pg_textsearch bootstrap + graceful-skip) by
+        # _ensure_search_views_if_possible, which builds every searchable table's
+        # indexes before recreating the function.
         self._ensure_search_views_if_possible()
 
     def gmail_archive_thread_previews(self, *, account: str, thread_ids: Sequence[str]) -> list[dict[str, Any]]:
@@ -4717,6 +4715,16 @@ class PostgresWarehouse:
         # behind so it cannot be used as a slow fallback.
         self._command("DROP VIEW IF EXISTS searchable_text")
         if all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
+            # Build every bm25 index search_text() references BEFORE (re)creating
+            # the function, so it can never point at a not-yet-built index.
+            # ensure_* builds indexes lazily per table group, but the function
+            # references all sources at once. Without this, the first group to run
+            # after a deploy recreates the function while other groups' bm25
+            # indexes are still missing, and every search_text() call fails with
+            # "index ... does not exist" until those (often sensor/new-data-driven)
+            # groups happen to tick. The gate above guarantees all referenced
+            # tables exist, so building all their indexes here is safe.
+            self._ensure_indexes(self._SEARCHABLE_TEXT_TABLES)
             self._ensure_search_text_function()
 
     def _ensure_search_text_function(self) -> None:
