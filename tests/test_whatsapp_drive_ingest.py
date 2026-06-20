@@ -10,6 +10,7 @@ from personal_data_warehouse.whatsapp_drive_ingest import (
     has_batch_payloads,
     iter_batch_payloads,
     library_batch_payload,
+    record_to_chat_participant_row,
     record_to_contact_row,
     record_to_media_item_row,
     record_to_message_row,
@@ -29,6 +30,7 @@ class FakeWarehouse:
     def __init__(self) -> None:
         self.ensure_called = False
         self.chats: list[dict[str, object]] = []
+        self.chat_participants: list[dict[str, object]] = []
         self.contacts: list[dict[str, object]] = []
         self.messages: list[dict[str, object]] = []
         self.media_items: list[dict[str, object]] = []
@@ -38,6 +40,9 @@ class FakeWarehouse:
 
     def insert_whatsapp_chats(self, rows) -> None:
         self.chats.extend(rows)
+
+    def insert_whatsapp_chat_participants(self, rows) -> None:
+        self.chat_participants.extend(rows)
 
     def insert_whatsapp_contacts(self, rows) -> None:
         self.contacts.extend(rows)
@@ -79,6 +84,7 @@ class FakeObjectStore:
 
 
 CHAT_JID = "15551234567@s.whatsapp.net"
+GROUP_JID = "120363274447440808@g.us"
 
 
 def decorated_batch_payload() -> dict[str, object]:
@@ -123,6 +129,19 @@ def decorated_batch_payload() -> dict[str, object]:
                 },
             ),
             envelope("contact", {"jid": CHAT_JID, "push_name": "Tester", "first_name": "", "full_name": "", "business_name": "", "raw": {}}),
+            envelope(
+                "chat_participant",
+                {
+                    "chat_id": GROUP_JID,
+                    "participant_jid": "15550000001@s.whatsapp.net",
+                    "phone_jid": "",
+                    "lid_jid": "",
+                    "display_name": "Alice",
+                    "is_admin": True,
+                    "is_super_admin": False,
+                    "raw": {"source": "group_info"},
+                },
+            ),
             envelope("media_item", media_item_record()),
             envelope("media_item", {**media_item_record(), "content_sha256": "media-sha", "is_missing": False, "file": media_item_file()}),
         ],
@@ -185,6 +204,70 @@ def test_record_mappers_preserve_message_body_and_media_storage() -> None:
     assert media_item_row["storage_file_id"] == "media-file"
 
 
+def test_record_to_chat_participant_row_maps_roles() -> None:
+    ingested_at = datetime(2026, 5, 21, 14, tzinfo=UTC)
+    record = decorated_batch_payload()["records"][3]
+
+    row = record_to_chat_participant_row(record, ingested_at=ingested_at)
+
+    assert row["chat_id"] == GROUP_JID
+    assert row["participant_jid"] == "15550000001@s.whatsapp.net"
+    assert row["display_name"] == "Alice"
+    assert row["is_admin"] == 1
+    assert row["is_super_admin"] == 0
+
+
+def test_drive_ingest_writes_chat_participants() -> None:
+    warehouse = FakeWarehouse()
+
+    WhatsAppDriveIngestRunner(
+        warehouse=warehouse,
+        batch_source=lambda: [decorated_batch_payload()],
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 5, 21, 14, tzinfo=UTC),
+    ).sync()
+
+    assert len(warehouse.chat_participants) == 1
+    row = warehouse.chat_participants[0]
+    assert row["chat_id"] == GROUP_JID
+    assert row["participant_jid"] == "15550000001@s.whatsapp.net"
+    assert row["display_name"] == "Alice"
+    assert row["is_admin"] == 1
+
+
+def test_drive_ingest_preserves_group_name_against_empty_history_row() -> None:
+    named = decorated_batch_payload()
+    named["records"] = [
+        envelope(
+            "chat",
+            {
+                "chat_id": GROUP_JID,
+                "name": "Founders Group",
+                "chat_type": "group",
+                "is_archived": False,
+                "last_message_at": "1970-01-01T00:00:00+00:00",
+                "raw": {"source": "group_info"},
+            },
+        )
+    ]
+    # A later history-sync chunk reports the same group with no subject.
+    blank = deepcopy(named)
+    blank["records"][0]["exported_at"] = "2026-05-21T13:05:00+00:00"
+    blank["records"][0]["record"]["name"] = ""
+    blank["records"][0]["record"]["raw"] = {"source": "history_sync"}
+    warehouse = FakeWarehouse()
+
+    WhatsAppDriveIngestRunner(
+        warehouse=warehouse,
+        batch_source=lambda: [named, blank],
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 5, 21, 14, tzinfo=UTC),
+    ).sync()
+
+    assert len(warehouse.chats) == 1
+    assert warehouse.chats[0]["name"] == "Founders Group"
+
+
 def test_library_batch_payload_rewrites_batch_and_media_storage_keys() -> None:
     payload = library_batch_payload(decorated_batch_payload())
 
@@ -245,6 +328,7 @@ def test_drive_ingest_runner_dedupes_media_updates_and_promotes() -> None:
     assert warehouse.ensure_called
     assert summary.batches_seen == 1
     assert summary.chats_written == 1
+    assert summary.chat_participants_written == 1
     assert summary.contacts_written == 1
     assert summary.messages_written == 1
     assert summary.media_items_written == 1

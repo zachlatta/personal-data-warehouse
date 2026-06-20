@@ -408,6 +408,72 @@ def chat_payload_from_conversation(conversation) -> dict[str, Any] | None:
     }
 
 
+def chat_payload_from_group_info(group_info) -> dict[str, Any] | None:
+    """Build a whatsapp_chats payload from a live GroupInfo proto.
+
+    History sync delivers group conversations with an empty ``name``; the real
+    subject only comes from querying joined groups. The payload carries the
+    subject, topic, owner, and member count so the warehouse chat row stops
+    being an unnamed placeholder.
+    """
+    chat_id = normalize_jid_string(jid_to_string(getattr(group_info, "JID", None)))
+    if not chat_id:
+        return None
+    name = str(getattr(getattr(group_info, "GroupName", None), "Name", "") or "")
+    topic = str(getattr(getattr(group_info, "GroupTopic", None), "Topic", "") or "")
+    owner_jid = normalize_jid_string(jid_to_string(getattr(group_info, "OwnerJID", None)))
+    return {
+        "chat_id": chat_id,
+        "name": name,
+        "chat_type": chat_type_for_jid(chat_id),
+        "is_archived": False,
+        # GroupInfo carries no last-activity time; that column is owned by the
+        # message/history path, so leave it at the epoch sentinel here.
+        "last_message_at": EPOCH.isoformat(),
+        "raw": {
+            "source": "group_info",
+            "topic": topic,
+            "owner_jid": owner_jid,
+            "participant_count": len(getattr(group_info, "Participants", []) or []),
+            # GroupCreated is a 32-bit float in the proto, so this is only
+            # accurate to roughly the minute; keep it as soft metadata.
+            "created_at": timestamp_to_datetime(getattr(group_info, "GroupCreated", 0)).isoformat(),
+            "is_announce": bool(getattr(getattr(group_info, "GroupAnnounce", None), "IsAnnounce", False)),
+            "is_locked": bool(getattr(getattr(group_info, "GroupLocked", None), "isLocked", False)),
+        },
+    }
+
+
+def participant_payloads_from_group_info(group_info) -> list[dict[str, Any]]:
+    """Build whatsapp_chat_participants payloads from a GroupInfo proto."""
+    chat_id = normalize_jid_string(jid_to_string(getattr(group_info, "JID", None)))
+    if not chat_id:
+        return []
+    payloads: list[dict[str, Any]] = []
+    for participant in getattr(group_info, "Participants", []) or []:
+        participant_jid = normalize_jid_string(jid_to_string(getattr(participant, "JID", None)))
+        phone_jid = normalize_jid_string(jid_to_string(getattr(participant, "PhoneNumber", None)))
+        lid_jid = normalize_jid_string(jid_to_string(getattr(participant, "LID", None)))
+        # Fall back to the phone/LID address when the primary JID is unset so a
+        # participant is never silently dropped for lacking a canonical JID.
+        canonical = participant_jid or phone_jid or lid_jid
+        if not canonical:
+            continue
+        payloads.append(
+            {
+                "chat_id": chat_id,
+                "participant_jid": canonical,
+                "phone_jid": phone_jid,
+                "lid_jid": lid_jid,
+                "display_name": str(getattr(participant, "DisplayName", "") or ""),
+                "is_admin": bool(getattr(participant, "IsAdmin", False)),
+                "is_super_admin": bool(getattr(participant, "IsSuperAdmin", False)),
+                "raw": {"source": "group_info", "error": int(getattr(participant, "Error", 0) or 0)},
+            }
+        )
+    return payloads
+
+
 def contact_payload_from_pushname(pushname) -> dict[str, Any] | None:
     jid = normalize_jid_string(str(pushname.ID or ""))
     if not jid:

@@ -18,6 +18,7 @@ from personal_data_warehouse.objectstore import ObjectListing, ObjectStore
 class WhatsAppDriveIngestSummary:
     batches_seen: int
     chats_written: int
+    chat_participants_written: int
     contacts_written: int
     messages_written: int
     media_items_written: int
@@ -83,6 +84,16 @@ class WhatsAppDriveIngestRunner:
         chat_rows = dedupe_rows(
             [record_to_chat_row(record, ingested_at=ingested_at) for record in records if record_type(record) == "chat"],
             ("account", "chat_id"),
+            preserve_columns=("name",),
+        )
+        chat_participant_rows = dedupe_rows(
+            [
+                record_to_chat_participant_row(record, ingested_at=ingested_at)
+                for record in records
+                if record_type(record) == "chat_participant"
+            ],
+            ("account", "chat_id", "participant_jid"),
+            preserve_columns=("display_name",),
         )
         contact_rows = dedupe_rows(
             [
@@ -112,6 +123,7 @@ class WhatsAppDriveIngestRunner:
         )
 
         self._warehouse.insert_whatsapp_chats(chat_rows)
+        self._warehouse.insert_whatsapp_chat_participants(chat_participant_rows)
         self._warehouse.insert_whatsapp_contacts(contact_rows)
         self._warehouse.insert_whatsapp_messages(message_rows)
         self._warehouse.insert_whatsapp_media_items(media_item_rows)
@@ -141,6 +153,7 @@ class WhatsAppDriveIngestRunner:
         return WhatsAppDriveIngestSummary(
             batches_seen=len(batches),
             chats_written=len(chat_rows),
+            chat_participants_written=len(chat_participant_rows),
             contacts_written=len(contact_rows),
             messages_written=len(message_rows),
             media_items_written=len(media_item_rows),
@@ -279,6 +292,23 @@ def record_to_chat_row(record: Mapping[str, Any], *, ingested_at: datetime) -> d
         "chat_type": str(payload.get("chat_type", "")),
         "is_archived": int(bool(payload.get("is_archived", False))),
         "last_message_at": parse_datetime(str(payload.get("last_message_at", ""))),
+        "raw_metadata_json": raw_json(payload),
+        "ingested_at": ingested_at,
+        "sync_version": sync_version(ingested_at),
+    }
+
+
+def record_to_chat_participant_row(record: Mapping[str, Any], *, ingested_at: datetime) -> dict[str, Any]:
+    payload = record_payload(record)
+    return {
+        "account": record_account(record),
+        "chat_id": str(payload.get("chat_id", "")),
+        "participant_jid": str(payload.get("participant_jid", "")),
+        "phone_jid": str(payload.get("phone_jid", "")),
+        "lid_jid": str(payload.get("lid_jid", "")),
+        "display_name": str(payload.get("display_name", "")),
+        "is_admin": int(bool(payload.get("is_admin", False))),
+        "is_super_admin": int(bool(payload.get("is_super_admin", False))),
         "raw_metadata_json": raw_json(payload),
         "ingested_at": ingested_at,
         "sync_version": sync_version(ingested_at),

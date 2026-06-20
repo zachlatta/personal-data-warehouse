@@ -737,6 +737,78 @@ def test_gmail_attachment_upsert_preserves_existing_storage_when_record_is_blank
     ) in clause
 
 
+def test_whatsapp_chat_upsert_preserves_group_name_when_record_is_blank() -> None:
+    clause = _upsert_clause("whatsapp_chats", POSTGRES_TABLES["whatsapp_chats"])
+
+    assert (
+        "\"name\" = COALESCE(NULLIF(EXCLUDED.\"name\", ''), \"whatsapp_chats\".\"name\")"
+    ) in clause
+
+
+def test_whatsapp_chat_participant_upsert_preserves_display_name_when_blank() -> None:
+    clause = _upsert_clause("whatsapp_chat_participants", POSTGRES_TABLES["whatsapp_chat_participants"])
+
+    assert (
+        "\"display_name\" = COALESCE(NULLIF(EXCLUDED.\"display_name\", ''), "
+        "\"whatsapp_chat_participants\".\"display_name\")"
+    ) in clause
+
+
+def test_postgres_whatsapp_chat_name_survives_later_blank_history_row(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_whatsapp_tables()
+    base = datetime(2026, 5, 21, 12, tzinfo=UTC)
+
+    def chat_row(*, name: str, sync_version: int) -> dict:
+        return {
+            "account": "zach@example.test",
+            "chat_id": "120363274447440808@g.us",
+            "name": name,
+            "chat_type": "group",
+            "is_archived": 0,
+            "last_message_at": base,
+            "raw_metadata_json": "{}",
+            "ingested_at": base,
+            "sync_version": sync_version,
+        }
+
+    warehouse.insert_whatsapp_chats([chat_row(name="Founders Group", sync_version=1)])
+    # A newer history-sync row with no subject must not blank the real name.
+    warehouse.insert_whatsapp_chats([chat_row(name="", sync_version=2)])
+
+    rows = warehouse._query(
+        "SELECT name FROM whatsapp_chats WHERE chat_id = '120363274447440808@g.us'"
+    )
+    assert [row[0] for row in rows] == ["Founders Group"]
+
+
+def test_postgres_whatsapp_chat_participants_roundtrip(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_whatsapp_tables()
+    base = datetime(2026, 5, 21, 12, tzinfo=UTC)
+    warehouse.insert_whatsapp_chat_participants(
+        [
+            {
+                "account": "zach@example.test",
+                "chat_id": "120363274447440808@g.us",
+                "participant_jid": "15550000001@s.whatsapp.net",
+                "phone_jid": "",
+                "lid_jid": "",
+                "display_name": "Alice",
+                "is_admin": 1,
+                "is_super_admin": 0,
+                "raw_metadata_json": "{}",
+                "ingested_at": base,
+                "sync_version": 1,
+            }
+        ]
+    )
+
+    rows = warehouse._query(
+        "SELECT display_name, is_admin FROM whatsapp_chat_participants "
+        "WHERE chat_id = '120363274447440808@g.us'"
+    )
+    assert rows == [("Alice", 1)]
+
+
 def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     warehouse.ensure_calendar_tables()

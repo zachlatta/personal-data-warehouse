@@ -84,6 +84,10 @@ class WhatsAppBatcher:
     def add_chat(self, payload: dict[str, Any]) -> None:
         self._enqueue("chat", str(payload.get("chat_id", "")), payload)
 
+    def add_chat_participant(self, payload: dict[str, Any]) -> None:
+        source_id = f"{payload.get('chat_id', '')}:{payload.get('participant_jid', '')}"
+        self._enqueue("chat_participant", source_id, payload)
+
     def add_contact(self, payload: dict[str, Any]) -> None:
         self._enqueue("contact", str(payload.get("jid", "")), payload)
 

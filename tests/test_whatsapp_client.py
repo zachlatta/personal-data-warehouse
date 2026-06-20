@@ -11,10 +11,12 @@ from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
 from personal_data_warehouse_whatsapp.batcher import WhatsAppBatcher
 from personal_data_warehouse_whatsapp.client import WhatsAppClientRunner, write_qr_artifacts
 from personal_data_warehouse_whatsapp.events import (
+    chat_payload_from_group_info,
     chat_type_for_jid,
     history_sync_records,
     message_record_from_event,
     normalize_jid_string,
+    participant_payloads_from_group_info,
     timestamp_to_datetime,
 )
 from personal_data_warehouse_whatsapp.state import WhatsAppUploadState
@@ -406,6 +408,116 @@ def test_history_sync_records_extract_chats_messages_and_pushnames() -> None:
     assert records.messages[0].payload["message_id"] == "hist-1"
     assert records.messages[0].payload["body_text"] == "old message"
     assert records.messages[0].payload["message_at"] == MESSAGE_AT.isoformat()
+
+
+def _group_info() -> "N.GroupInfo":
+    return N.GroupInfo(
+        JID=N.JID(User="120363274447440808", Server="g.us"),
+        OwnerJID=N.JID(User="15550000001", Server="s.whatsapp.net"),
+        GroupName=N.GroupName(Name="Founders Group"),
+        GroupTopic=N.GroupTopic(Topic="intros & deals"),
+        GroupCreated=UNIX_TS,
+        Participants=[
+            N.GroupParticipant(
+                JID=N.JID(User="15550000001", Server="s.whatsapp.net"),
+                DisplayName="Alice",
+                IsSuperAdmin=True,
+            ),
+            N.GroupParticipant(
+                JID=N.JID(User="15550000002", Server="s.whatsapp.net"),
+                DisplayName="Bob",
+                IsAdmin=True,
+            ),
+            N.GroupParticipant(
+                JID=N.JID(User="15550000003", Server="s.whatsapp.net"),
+                PhoneNumber=N.JID(User="15550000003", Server="s.whatsapp.net"),
+            ),
+        ],
+    )
+
+
+def test_chat_payload_from_group_info_extracts_subject_and_metadata() -> None:
+    chat = chat_payload_from_group_info(_group_info())
+
+    assert chat is not None
+    assert chat["chat_id"] == "120363274447440808@g.us"
+    assert chat["name"] == "Founders Group"
+    assert chat["chat_type"] == "group"
+    assert chat["last_message_at"] == datetime.fromtimestamp(0, tz=UTC).isoformat()
+    assert chat["raw"]["source"] == "group_info"
+    assert chat["raw"]["topic"] == "intros & deals"
+    assert chat["raw"]["owner_jid"] == "15550000001@s.whatsapp.net"
+    assert chat["raw"]["participant_count"] == 3
+
+
+def test_participant_payloads_from_group_info_capture_roles() -> None:
+    participants = participant_payloads_from_group_info(_group_info())
+
+    assert [p["participant_jid"] for p in participants] == [
+        "15550000001@s.whatsapp.net",
+        "15550000002@s.whatsapp.net",
+        "15550000003@s.whatsapp.net",
+    ]
+    assert participants[0]["display_name"] == "Alice"
+    assert participants[0]["is_super_admin"] is True
+    assert participants[0]["is_admin"] is False
+    assert participants[1]["is_admin"] is True
+    assert participants[2]["phone_jid"] == "15550000003@s.whatsapp.net"
+    assert all(p["chat_id"] == "120363274447440808@g.us" for p in participants)
+
+
+def test_group_info_without_jid_is_skipped() -> None:
+    assert chat_payload_from_group_info(N.GroupInfo(GroupName=N.GroupName(Name="x"))) is None
+    assert participant_payloads_from_group_info(N.GroupInfo()) == []
+
+
+class FakeGroupsClient:
+    def __init__(self, groups) -> None:
+        self._groups = groups
+        self.calls = 0
+
+    def get_joined_groups(self):
+        self.calls += 1
+        return self._groups
+
+
+def test_dump_groups_queues_named_chats_and_participants(tmp_path) -> None:
+    runner = WhatsAppClientRunner(
+        account="zach@example.com",
+        session_path=tmp_path / "session.sqlite",
+        object_store=FakeObjectStore(),
+        upload_state=None,
+        logger=FakeLogger(),
+    )
+    client = FakeGroupsClient([_group_info()])
+
+    runner._dump_groups(client)  # noqa: SLF001 - exercises the joined-groups dump
+
+    pending, _ = runner._batcher.pending_counts()  # noqa: SLF001
+    assert pending == 4  # one chat + three participants
+    assert runner._totals["chats_received"] == 1  # noqa: SLF001
+    assert runner._totals["participants_received"] == 3  # noqa: SLF001
+    assert runner._groups_dumped is True  # noqa: SLF001
+
+
+def test_dump_groups_retries_after_failure(tmp_path) -> None:
+    class BoomClient:
+        def get_joined_groups(self):
+            raise RuntimeError("not connected yet")
+
+    runner = WhatsAppClientRunner(
+        account="zach@example.com",
+        session_path=tmp_path / "session.sqlite",
+        object_store=FakeObjectStore(),
+        upload_state=None,
+        logger=FakeLogger(),
+    )
+
+    runner._dump_groups(BoomClient())  # noqa: SLF001
+
+    # A transient failure must leave the flag clear so the next flush retries.
+    assert runner._groups_dumped is False  # noqa: SLF001
+    assert runner._batcher.pending_counts()[0] == 0  # noqa: SLF001
 
 
 def test_batcher_flushes_batch_with_media_then_skips_unchanged(tmp_path) -> None:

@@ -20,9 +20,11 @@ from typing import Any
 from personal_data_warehouse.objectstore import ObjectStore
 from personal_data_warehouse_whatsapp.batcher import WhatsAppBatcher
 from personal_data_warehouse_whatsapp.events import (
+    chat_payload_from_group_info,
     contact_payload_from_store_contact,
     history_sync_records,
     message_record_from_event,
+    participant_payloads_from_group_info,
 )
 from personal_data_warehouse_whatsapp.state import WhatsAppUploadState
 
@@ -72,11 +74,13 @@ class WhatsAppClientRunner:
         self._stop_event = threading.Event()
         self._connected_event = threading.Event()
         self._contacts_dumped = False
+        self._groups_dumped = False
         self._totals = {
             "messages_received": 0,
             "history_messages_received": 0,
             "chats_received": 0,
             "contacts_received": 0,
+            "participants_received": 0,
             "records_selected": 0,
             "records_skipped": 0,
             "batches_uploaded": 0,
@@ -253,6 +257,8 @@ class WhatsAppClientRunner:
         while not self._stop_event.wait(self._flush_interval_seconds):
             if self._connected_event.is_set() and not self._contacts_dumped:
                 self._dump_contacts(client)
+            if self._connected_event.is_set() and not self._groups_dumped:
+                self._dump_groups(client)
             self._flush_once()
 
     def _flush_once(self) -> None:
@@ -286,6 +292,36 @@ class WhatsAppClientRunner:
             self._totals["contacts_received"] += count
         self._logger.info("Queued %s WhatsApp contact-store entries", count)
         self._snapshot_session("contact dump")
+
+    def _dump_groups(self, client) -> None:
+        # History sync never carries group subjects/members, so query the joined
+        # groups once per run window to give every group chat a real name and a
+        # participant roster.
+        self._groups_dumped = True
+        try:
+            groups = client.get_joined_groups()
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("WhatsApp joined-groups dump failed: %s", exc)
+            self._groups_dumped = False
+            return
+        chat_count = 0
+        participant_count = 0
+        for group in groups:
+            chat = chat_payload_from_group_info(group)
+            if chat is None:
+                continue
+            self._batcher.add_chat(chat)
+            chat_count += 1
+            for participant in participant_payloads_from_group_info(group):
+                self._batcher.add_chat_participant(participant)
+                participant_count += 1
+        with self._totals_lock:
+            self._totals["chats_received"] += chat_count
+            self._totals["participants_received"] += participant_count
+        self._logger.info(
+            "Queued %s WhatsApp group chats with %s participants", chat_count, participant_count
+        )
+        self._snapshot_session("group dump")
 
     def _snapshot_session(self, reason: str) -> None:
         if self._session_snapshot_callback is None:

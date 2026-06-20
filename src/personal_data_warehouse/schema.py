@@ -521,6 +521,20 @@ WHATSAPP_CHAT_COLUMNS = (
     "sync_version",
 )
 
+WHATSAPP_CHAT_PARTICIPANT_COLUMNS = (
+    "account",
+    "chat_id",
+    "participant_jid",
+    "phone_jid",
+    "lid_jid",
+    "display_name",
+    "is_admin",
+    "is_super_admin",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
 WHATSAPP_CONTACT_COLUMNS = (
     "account",
     "jid",

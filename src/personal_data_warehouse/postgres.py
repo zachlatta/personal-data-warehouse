@@ -53,6 +53,7 @@ from personal_data_warehouse.schema import (
     VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
     VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS,
     WHATSAPP_CHAT_COLUMNS,
+    WHATSAPP_CHAT_PARTICIPANT_COLUMNS,
     WHATSAPP_CONTACT_COLUMNS,
     WHATSAPP_MEDIA_ITEM_COLUMNS,
     WHATSAPP_MESSAGE_COLUMNS,
@@ -182,6 +183,10 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("account", "attachment_id", "message_id"),
     ),
     "whatsapp_chats": TableSpec(WHATSAPP_CHAT_COLUMNS, ("account", "chat_id")),
+    "whatsapp_chat_participants": TableSpec(
+        WHATSAPP_CHAT_PARTICIPANT_COLUMNS,
+        ("account", "chat_id", "participant_jid"),
+    ),
     "whatsapp_contacts": TableSpec(WHATSAPP_CONTACT_COLUMNS, ("account", "jid")),
     # Protocol message IDs are sender-generated, so they are only unique
     # within a chat; the chat JID is part of the key.
@@ -1200,6 +1205,15 @@ SEARCHABLE_TEXT_COVERAGE: dict[str, dict[str, str]] = {
         "chat_type": _C_ENUM,
         "raw_metadata_json": _C_RAW,
     },
+    "whatsapp_chat_participants": {
+        "account": _C_ID,
+        "chat_id": _C_ID,
+        "participant_jid": _C_ID,
+        "phone_jid": _C_ID,
+        "lid_jid": _C_ID,
+        "display_name": _C_IDENTITY,
+        "raw_metadata_json": _C_RAW,
+    },
     "whatsapp_contacts": {
         "account": _C_ID,
         "jid": _C_ID,
@@ -1506,6 +1520,8 @@ INTEGER_COLUMNS = {
     "is_filtered",
     "is_recovered",
     "is_pending_review",
+    "is_admin",
+    "is_super_admin",
 }
 
 FLOAT_COLUMNS = {
@@ -1515,6 +1531,7 @@ FLOAT_COLUMNS = {
 
 _WHATSAPP_TABLES = (
     "whatsapp_chats",
+    "whatsapp_chat_participants",
     "whatsapp_contacts",
     "whatsapp_messages",
     "whatsapp_media_items",
@@ -4238,6 +4255,9 @@ class PostgresWarehouse:
     def insert_whatsapp_chats(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("whatsapp_chats", rows, WHATSAPP_CHAT_COLUMNS)
 
+    def insert_whatsapp_chat_participants(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whatsapp_chat_participants", rows, WHATSAPP_CHAT_PARTICIPANT_COLUMNS)
+
     def insert_whatsapp_contacts(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("whatsapp_contacts", rows, WHATSAPP_CONTACT_COLUMNS)
 
@@ -6102,6 +6122,11 @@ PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
         "full_name",
         "business_name",
     ),
+    # Empty-name history-sync chat rows must not wipe a real group subject that
+    # only the live joined-groups dump can supply.
+    "whatsapp_chats": ("name",),
+    # A later participant snapshot that drops a display name must not blank it.
+    "whatsapp_chat_participants": ("display_name",),
 }
 
 

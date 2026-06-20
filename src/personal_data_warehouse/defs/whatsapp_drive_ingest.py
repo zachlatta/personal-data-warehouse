@@ -75,6 +75,7 @@ def whatsapp_drive_ingest(context) -> MaterializeResult:
         metadata={
             "batches_seen": MetadataValue.int(summary.batches_seen if summary else 0),
             "chats_written": MetadataValue.int(summary.chats_written if summary else 0),
+            "chat_participants_written": MetadataValue.int(summary.chat_participants_written if summary else 0),
             "contacts_written": MetadataValue.int(summary.contacts_written if summary else 0),
             "messages_written": MetadataValue.int(summary.messages_written if summary else 0),
             "media_items_written": MetadataValue.int(summary.media_items_written if summary else 0),

@@ -317,5 +317,8 @@ Caveats: unofficial clients violate WhatsApp ToS and carry a small account-ban r
 pinned to 0.3.17.post0 because newer releases need protobuf>=7, which dagster pins below; its
 Go shared library is pre-fetched in the Dockerfile (`import neonize.client` at build).
 
-WhatsApp SQL starting points are `whatsapp_messages`, `whatsapp_chats`, `whatsapp_contacts`,
-and `whatsapp_media_items`.
+WhatsApp SQL starting points are `whatsapp_messages`, `whatsapp_chats`,
+`whatsapp_chat_participants` (group rosters: one row per member with admin flags),
+`whatsapp_contacts`, and `whatsapp_media_items`. Group subjects and rosters are populated by
+a once-per-run-window `get_joined_groups()` dump in the client (history sync never carries
+them); `whatsapp_chats.name` is preserved against later empty-name history rows.

@@ -117,6 +117,7 @@ def whatsapp_client(context) -> MaterializeResult:
                 "history_messages_received",
                 "chats_received",
                 "contacts_received",
+                "participants_received",
                 "records_selected",
                 "records_skipped",
                 "batches_uploaded",
