@@ -210,6 +210,55 @@ Dagster exposes `google_contacts_sync` in the `contacts` group, scheduled hourly
 `contacts_sync_hourly`. The sync writes `contact_cards` and `contact_sync_state`, with
 `clean_contacts` as the current non-deleted view.
 
+## Google Drive Source Sync
+
+Mirrors your Google Drive *files* (metadata + extracted text) into the warehouse so they
+surface through the unified `search_text()` function. This is Drive **as a data source**, distinct
+from the Drive folders the storage backends above use as a transport/inbox — those transport
+folders are excluded automatically so the warehouse never re-ingests its own staging blobs.
+
+```bash
+# Enabled by default for every GMAIL_ACCOUNTS mailbox; set to 0 to disable.
+# GOOGLE_DRIVE_SOURCE_ENABLED=0
+# Or list accounts explicitly instead of using every Gmail account.
+# GOOGLE_DRIVE_SOURCE_ACCOUNTS=you@work.example,you@personal.example
+
+# Additional folder IDs to exclude (unioned with the auto-detected transport folders),
+# and optional path-prefix globs against the resolved "/My Drive/..." path.
+# GOOGLE_DRIVE_EXCLUDE_FOLDER_IDS=0AExampleFolderId,0AAnotherFolderId
+# GOOGLE_DRIVE_EXCLUDE_PATH_GLOBS=/Backups/*,/Archive/*
+
+# Corpora (default: owned "My Drive" only). Opt into the noisier corpora as needed.
+# GOOGLE_DRIVE_SOURCE_INCLUDE_SHARED_WITH_ME=0
+# GOOGLE_DRIVE_SOURCE_INCLUDE_SHARED_DRIVES=0
+
+# Tuning.
+# GOOGLE_DRIVE_SOURCE_TEXT_MAX_CHARS=5000000
+# GOOGLE_DRIVE_SOURCE_EXTRACT_MAX_BYTES=26214400
+# GOOGLE_DRIVE_SOURCE_BINARY_EXTRACTION=0   # PDF/Office (Phase 3, not yet implemented)
+# GOOGLE_DRIVE_SOURCE_FILES_PER_RUN=5000
+```
+
+Re-authorize each account so its token carries the full Drive scope (existing Drive-transport
+accounts already have it):
+
+```bash
+uv run personal-data-warehouse-google-auth --email you@work.example --write-env
+```
+
+Dagster exposes `google_drive_source_sync` in the `google_drive` group, scheduled every 30
+minutes by `google_drive_source_sync_every_thirty_minutes`. The first run does a full
+`files.list` crawl and records a Drive Changes `startPageToken`; later runs read
+`changes.list` incrementally. Text comes from Google-native exports (Docs→text, Sheets→CSV,
+Slides→text) and already-text files (`.md`, `.txt`, `.json`, source code, ...). The sync writes
+`google_drive_files`, `google_drive_file_texts`, and `google_drive_sync_state`.
+
+File bytes are **not** copied into the warehouse: rows carry `storage_backend='google_drive_source'`
+and `storage_file_id=<Drive file id>`. The Go app's `get_object` MCP tool mints an account-aware,
+time-limited `download_url` (`/objects/{id}?account=...&exp=...&sig=...`) that streams the file
+live from the owning account's Drive. The Go app resolves each account's token from the same
+`GOOGLE_<SLUG>_TOKEN_JSON[_B64]` / `GMAIL_<SLUG>_...` env vars the sync uses.
+
 ## Running The Sync
 
 Start Dagster:

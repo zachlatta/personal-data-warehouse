@@ -1155,6 +1155,7 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_agent_sessions_tables()
     warehouse.ensure_slack_tables()
     warehouse.ensure_upstream_mutation_tables()
+    warehouse.ensure_google_drive_source_tables()
 
 
 def _search_text_index_names() -> set[str]:

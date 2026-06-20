@@ -11,6 +11,24 @@ LOGGER = logging.getLogger("test_gmail_sync_defs")
 
 def _settings(monkeypatch, **env):
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com,zach@zachlatta.com")
+    defaults = {
+        "GOOGLE_DRIVE_SOURCE_ENABLED": "0",
+        "VOICE_MEMOS_ACCOUNT": None,
+        "VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID": None,
+        "VOICE_MEMOS_DRIVE_FOLDER_ID": None,
+        "ALICE_VOICE_RECORDINGS_ACCOUNT": None,
+        "ALICE_API_KEY_ID": None,
+        "ALICE_API_SECRET_KEY": None,
+        "ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_ACCOUNT": None,
+        "ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_FOLDER_ID": None,
+    }
+    for name, value in defaults.items():
+        if name in env:
+            continue
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
     for name, value in env.items():
         if value is None:
             monkeypatch.delenv(name, raising=False)

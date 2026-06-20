@@ -3,6 +3,7 @@ package objectstore
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -30,15 +31,44 @@ func TestBuildGoogleDriveStore(t *testing.T) {
 	}
 }
 
-func TestBuildGoogleDriveRequiresNamespace(t *testing.T) {
-	_, err := BuildObjectStore(Spec{Backend: GoogleDriveBackend, GoogleDrive: &GoogleDriveConnection{HTTPClient: &driveFake{}}})
-	if err == nil {
-		t.Fatal("expected error for missing namespace")
+func TestBuildGoogleDriveAllowsEmptyNamespaceForDirectFileReads(t *testing.T) {
+	store, err := BuildObjectStore(Spec{Backend: GoogleDriveBackend, GoogleDrive: &GoogleDriveConnection{HTTPClient: &driveFake{}}})
+	if err != nil {
+		t.Fatalf("BuildObjectStore: %v", err)
+	}
+	drive, ok := store.(*GoogleDriveStore)
+	if !ok {
+		t.Fatalf("expected *GoogleDriveStore, got %T", store)
+	}
+	if drive.folderID != "" {
+		t.Fatalf("folderID = %q, want empty", drive.folderID)
+	}
+}
+
+func TestGoogleDriveEmptyNamespaceRejectsManagedOperations(t *testing.T) {
+	store, err := BuildObjectStore(Spec{Backend: GoogleDriveBackend, GoogleDrive: &GoogleDriveConnection{HTTPClient: &driveFake{}}})
+	if err != nil {
+		t.Fatalf("BuildObjectStore: %v", err)
+	}
+	_, err = store.PutJSON(context.Background(), PutJSONInput{ObjectKey: "x.json", Payload: []byte("{}")})
+	if err == nil || !strings.Contains(err.Error(), "requires a folder id") {
+		t.Fatalf("PutJSON error = %v", err)
+	}
+	_, err = store.ListObjects(context.Background(), ListQuery{Kind: "metadata"})
+	if err == nil || !strings.Contains(err.Error(), "requires a folder id") {
+		t.Fatalf("ListObjects error = %v", err)
 	}
 }
 
 func TestBuildGoogleDriveRequiresConnection(t *testing.T) {
 	_, err := BuildObjectStore(Spec{Backend: GoogleDriveBackend, Namespace: "folder"})
+	if err == nil {
+		t.Fatal("expected error for missing connection")
+	}
+}
+
+func TestBuildGoogleDriveEmptyNamespaceStillRequiresConnection(t *testing.T) {
+	_, err := BuildObjectStore(Spec{Backend: GoogleDriveBackend})
 	if err == nil {
 		t.Fatal("expected error for missing connection")
 	}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,13 +17,17 @@ import (
 )
 
 func objectsTestHandler(store objectstore.ObjectStore, maxBytes int64) http.Handler {
-	return objectDownloadHandler(store, objectsTestSigner(), maxBytes, slog.Default())
+	return objectDownloadHandler(store, nil, objectsTestSigner(), maxBytes, slog.Default())
+}
+
+func objectsTestHandlerWithDrive(store objectstore.ObjectStore, driveStores map[string]objectstore.ObjectStore, maxBytes int64) http.Handler {
+	return objectDownloadHandler(store, driveStores, objectsTestSigner(), maxBytes, slog.Default())
 }
 
 func signedObjectPath(fileID string, exp time.Time) string {
 	return objectsPathPrefix + fileID +
 		"?exp=" + strconv.FormatInt(exp.Unix(), 10) +
-		"&sig=" + objectsTestSigner().SignObjectDownload(fileID, exp)
+		"&sig=" + objectsTestSigner().SignObjectDownload(fileID, "", exp)
 }
 
 func serveObjectRequest(t *testing.T, store objectstore.ObjectStore, maxBytes int64, method, target string) *httptest.ResponseRecorder {
@@ -30,6 +35,82 @@ func serveObjectRequest(t *testing.T, store objectstore.ObjectStore, maxBytes in
 	rec := httptest.NewRecorder()
 	objectsTestHandler(store, maxBytes).ServeHTTP(rec, httptest.NewRequest(method, target, nil))
 	return rec
+}
+
+func TestObjectDownloadServesDriveSourceByAccount(t *testing.T) {
+	primary := &fakeObjectStore{content: []byte("primary")}
+	driveStore := &fakeObjectStore{
+		meta:    objectstore.ObjectMetadata{StorageFileID: "DRIVEID", ContentType: "image/png", SizeBytes: 5},
+		content: []byte("image"),
+	}
+	driveStores := map[string]objectstore.ObjectStore{"zach@hackclub.com": driveStore}
+	exp := objectsTestNow.Add(time.Hour)
+	target := objectsPathPrefix + "DRIVEID?exp=" + strconv.FormatInt(exp.Unix(), 10) +
+		"&account=" + url.QueryEscape("zach@hackclub.com") +
+		"&sig=" + objectsTestSigner().SignObjectDownload("DRIVEID", "zach@hackclub.com", exp)
+
+	rec := httptest.NewRecorder()
+	objectsTestHandlerWithDrive(primary, driveStores, 1024).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if body, _ := io.ReadAll(rec.Body); string(body) != "image" {
+		t.Fatalf("served wrong store: %q", body)
+	}
+	if primary.getCalled {
+		t.Fatal("primary store must not serve a drive-source file")
+	}
+
+	// Same link, swapped account -> signature mismatch (403).
+	bad := objectsPathPrefix + "DRIVEID?exp=" + strconv.FormatInt(exp.Unix(), 10) +
+		"&account=" + url.QueryEscape("zach@zachlatta.com") +
+		"&sig=" + objectsTestSigner().SignObjectDownload("DRIVEID", "zach@hackclub.com", exp)
+	rec2 := httptest.NewRecorder()
+	objectsTestHandlerWithDrive(primary, driveStores, 1024).ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, bad, nil))
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("account-swapped link status = %d", rec2.Code)
+	}
+
+	// Valid signature but unknown account -> 404.
+	unknown := objectsPathPrefix + "DRIVEID?exp=" + strconv.FormatInt(exp.Unix(), 10) +
+		"&account=" + url.QueryEscape("ghost@nowhere.com") +
+		"&sig=" + objectsTestSigner().SignObjectDownload("DRIVEID", "ghost@nowhere.com", exp)
+	rec3 := httptest.NewRecorder()
+	objectsTestHandlerWithDrive(primary, driveStores, 1024).ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, unknown, nil))
+	if rec3.Code != http.StatusNotFound {
+		t.Fatalf("unknown-account link status = %d", rec3.Code)
+	}
+}
+
+func TestObjectDownloadDriveSourceDoesNotLeakStoreToNextRequest(t *testing.T) {
+	primary := &fakeObjectStore{
+		meta:    objectstore.ObjectMetadata{StorageFileID: "fid", ContentType: "text/plain", SizeBytes: 7},
+		content: []byte("primary"),
+	}
+	driveStore := &fakeObjectStore{
+		meta:    objectstore.ObjectMetadata{StorageFileID: "DRIVEID", ContentType: "text/plain", SizeBytes: 5},
+		content: []byte("drive"),
+	}
+	handler := objectsTestHandlerWithDrive(
+		primary,
+		map[string]objectstore.ObjectStore{"zach@hackclub.com": driveStore},
+		1024,
+	)
+	exp := objectsTestNow.Add(time.Hour)
+	driveTarget := objectsPathPrefix + "DRIVEID?exp=" + strconv.FormatInt(exp.Unix(), 10) +
+		"&account=" + url.QueryEscape("zach@hackclub.com") +
+		"&sig=" + objectsTestSigner().SignObjectDownload("DRIVEID", "zach@hackclub.com", exp)
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, driveTarget, nil))
+	if rec1.Code != http.StatusOK || rec1.Body.String() != "drive" {
+		t.Fatalf("drive-source response = %d %q", rec1.Code, rec1.Body.String())
+	}
+
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, signedObjectPath("fid", exp), nil))
+	if rec2.Code != http.StatusOK || rec2.Body.String() != "primary" {
+		t.Fatalf("primary response after drive-source request = %d %q", rec2.Code, rec2.Body.String())
+	}
 }
 
 func TestObjectDownloadServesContent(t *testing.T) {
@@ -101,7 +182,7 @@ func TestObjectDownloadRejectsSigForOtherFile(t *testing.T) {
 	store := &fakeObjectStore{content: []byte("data")}
 	exp := objectsTestNow.Add(time.Hour)
 	target := objectsPathPrefix + "other?exp=" + strconv.FormatInt(exp.Unix(), 10) +
-		"&sig=" + objectsTestSigner().SignObjectDownload("fid", exp)
+		"&sig=" + objectsTestSigner().SignObjectDownload("fid", "", exp)
 	rec := serveObjectRequest(t, store, 1024, http.MethodGet, target)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d", rec.Code)

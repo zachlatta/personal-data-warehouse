@@ -28,6 +28,19 @@ const (
 	driveFolderMimeType       = "application/vnd.google-apps.folder"
 )
 
+var googleNativeExportMimes = map[string]string{
+	"application/vnd.google-apps.document":     "text/plain",
+	"application/vnd.google-apps.presentation": "text/plain",
+	"application/vnd.google-apps.spreadsheet":  "text/csv",
+}
+
+// GoogleNativeExportMime returns the text export MIME type used when a Google
+// native file is fetched through the object-download proxy.
+func GoogleNativeExportMime(mimeType string) (string, bool) {
+	exportMime, ok := googleNativeExportMimes[mimeType]
+	return exportMime, ok
+}
+
 // GoogleDriveOptions configures a GoogleDriveStore. The HTTPClient must be
 // authenticated for the Drive scope (see credentials.go); APIBaseURL and
 // UploadBaseURL default to the public Google endpoints and exist for testing.
@@ -326,6 +339,9 @@ func (s *GoogleDriveStore) findByAppProperty(ctx context.Context, key, value, ki
 // --- writes -----------------------------------------------------------------
 
 func (s *GoogleDriveStore) PutFile(ctx context.Context, in PutFileInput) (StoredObject, error) {
+	if err := s.requireFolderID("PutFile"); err != nil {
+		return StoredObject{}, err
+	}
 	kind := in.Kind
 	if kind == "" {
 		kind = s.audioKind
@@ -367,6 +383,9 @@ func (s *GoogleDriveStore) PutFile(ctx context.Context, in PutFileInput) (Stored
 }
 
 func (s *GoogleDriveStore) PutJSON(ctx context.Context, in PutJSONInput) (StoredObject, error) {
+	if err := s.requireFolderID("PutJSON"); err != nil {
+		return StoredObject{}, err
+	}
 	kind := in.Kind
 	if kind == "" {
 		kind = s.metadataKind
@@ -477,6 +496,22 @@ func (s *GoogleDriveStore) GetObject(ctx context.Context, ref StoredObject) ([]b
 	if ref.StorageFileID == "" {
 		return nil, ErrNotFound
 	}
+	if metadata, err := s.GetMetadata(ctx, ref); err == nil {
+		if exportMime, ok := GoogleNativeExportMime(metadata.ContentType); ok {
+			values := url.Values{}
+			values.Set("mimeType", exportMime)
+			data, err := s.doRequest(ctx, http.MethodGet, s.apiBaseURL+"/files/"+url.PathEscape(ref.StorageFileID)+"/export?"+values.Encode(), nil, nil)
+			if err != nil {
+				if driveStatus(err) == http.StatusNotFound {
+					return nil, ErrNotFound
+				}
+				return nil, err
+			}
+			return data, nil
+		}
+	} else if err != ErrNotFound {
+		return nil, err
+	}
 	values := url.Values{}
 	values.Set("alt", "media")
 	values.Set("supportsAllDrives", "true")
@@ -574,6 +609,9 @@ func (s *GoogleDriveStore) GetShareURL(ctx context.Context, ref StoredObject) (s
 // --- discovery / relocation -------------------------------------------------
 
 func (s *GoogleDriveStore) ListObjects(ctx context.Context, q ListQuery) ([]ObjectListing, error) {
+	if err := s.requireFolderID("ListObjects"); err != nil {
+		return nil, err
+	}
 	query := s.objectsQuery(q)
 	var listings []ObjectListing
 	pageToken := ""
@@ -596,6 +634,9 @@ func (s *GoogleDriveStore) ListObjects(ctx context.Context, q ListQuery) ([]Obje
 }
 
 func (s *GoogleDriveStore) FindObject(ctx context.Context, q ListQuery) (*ObjectListing, error) {
+	if err := s.requireFolderID("FindObject"); err != nil {
+		return nil, err
+	}
 	query := s.objectsQuery(q)
 	list, err := s.listFiles(ctx, query, 1, "")
 	if err != nil {
@@ -609,6 +650,9 @@ func (s *GoogleDriveStore) FindObject(ctx context.Context, q ListQuery) (*Object
 }
 
 func (s *GoogleDriveStore) MoveObject(ctx context.Context, ref StoredObject, newObjectKey string, appProperties map[string]string) (StoredObject, error) {
+	if err := s.requireFolderID("MoveObject"); err != nil {
+		return StoredObject{}, err
+	}
 	if ref.StorageFileID == "" {
 		return StoredObject{}, ErrNotFound
 	}
@@ -708,6 +752,13 @@ func (s *GoogleDriveStore) storedObject(file driveFile, objectKey string) Stored
 		StorageFileID:  file.ID,
 		StorageURL:     file.WebViewLink,
 	}
+}
+
+func (s *GoogleDriveStore) requireFolderID(operation string) error {
+	if s.folderID == "" {
+		return fmt.Errorf("objectstore: google_drive %s requires a folder id", operation)
+	}
+	return nil
 }
 
 func (s *GoogleDriveStore) sourceQuery() string {

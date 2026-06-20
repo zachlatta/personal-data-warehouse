@@ -66,6 +66,7 @@ def test_local_upload_configs_use_app_ingest_without_drive_folders(monkeypatch) 
     monkeypatch.setenv("APPLE_MESSAGES_ACCOUNT", "zach@example.test")
     monkeypatch.setenv("WHATSAPP_ACCOUNT", "zach@example.test")
     monkeypatch.setenv("AGENT_SESSIONS_ACCOUNT", "zach@example.test")
+    monkeypatch.setenv("GOOGLE_DRIVE_SOURCE_ENABLED", "0")
 
     settings = load_settings(
         require_postgres=False,

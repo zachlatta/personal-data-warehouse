@@ -216,9 +216,16 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		}
 		logger.Info("slack file fetching enabled", "accounts", len(cfg.SlackAccounts))
 	}
-	if storeEnabled {
-		extra = append(extra, getObjectTool(store, authSvc, baseURL, cfg.ObjectStoreURLTTL, time.Now))
-		mux.Handle(objectsPathPrefix, objectDownloadHandler(store, authSvc, cfg.ObjectStoreMaxObjectBytes, logger))
+	driveStores, err := driveSourceStoresFromConfig(cfg)
+	if err != nil {
+		logger.Error("google drive source stores failed to initialize; drive-source downloads disabled", "error", err.Error())
+		driveStores = nil
+	} else if len(driveStores) > 0 {
+		logger.Info("google drive source downloads enabled", "accounts", len(driveStores))
+	}
+	if storeEnabled || len(driveStores) > 0 {
+		extra = append(extra, getObjectTool(store, driveStores, authSvc, baseURL, cfg.ObjectStoreURLTTL, time.Now))
+		mux.Handle(objectsPathPrefix, objectDownloadHandler(store, driveStores, authSvc, cfg.ObjectStoreMaxObjectBytes, logger))
 	}
 	ingestSvc, ingestEnabled, err := newIngestService(cfg, authSvc, time.Now, logger)
 	if err != nil {

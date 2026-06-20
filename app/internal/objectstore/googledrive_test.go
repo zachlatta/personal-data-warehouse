@@ -25,6 +25,7 @@ type driveFake struct {
 	nextTokens     []string
 	fileByID       map[string]driveFile
 	mediaByID      map[string][]byte
+	exportByID     map[string][]byte
 	folderCreateID func(name string) string
 	calls          []recordedCall
 	pageIdx        int
@@ -46,6 +47,13 @@ func (f *driveFake) Do(req *http.Request) (*http.Response, error) {
 	switch {
 	case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/files") && q.Get("alt") != "media":
 		return f.handleList(q)
+	case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/export"):
+		id := segmentBeforeLast(req.URL.Path)
+		data, ok := f.exportByID[id]
+		if !ok {
+			return jsonResp(404, map[string]string{"error": "not found"})
+		}
+		return rawResp(200, data)
 	case req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/upload/"):
 		return jsonResp(200, driveFile{ID: "uploaded-file", WebViewLink: "https://drive/uploaded"})
 	case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/files"):
@@ -108,6 +116,16 @@ func lastSegment(path string) string {
 		return path
 	}
 	return path[idx+1:]
+}
+
+func segmentBeforeLast(path string) string {
+	trimmed := strings.TrimRight(path, "/")
+	idx := strings.LastIndex(trimmed, "/")
+	if idx < 0 {
+		return trimmed
+	}
+	parent := trimmed[:idx]
+	return lastSegment(parent)
 }
 
 func jsonResp(status int, v any) (*http.Response, error) {
@@ -229,6 +247,31 @@ func TestGetObjectReturnsBytes(t *testing.T) {
 	}
 	if string(data) != "audio-bytes" {
 		t.Fatalf("unexpected bytes: %q", data)
+	}
+}
+
+func TestGetObjectExportsGoogleNativeDocument(t *testing.T) {
+	fake := &driveFake{
+		fileByID: map[string]driveFile{
+			"doc": {ID: "doc", Name: "Doc", MimeType: "application/vnd.google-apps.document"},
+		},
+		exportByID: map[string][]byte{"doc": []byte("exported text")},
+	}
+	store := voiceMemosStore(fake)
+	data, err := store.GetObject(context.Background(), StoredObject{StorageFileID: "doc"})
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	if string(data) != "exported text" {
+		t.Fatalf("unexpected export bytes: %q", data)
+	}
+	last := fake.calls[len(fake.calls)-1]
+	gotMime := ""
+	if vals := last.Query["mimeType"]; len(vals) > 0 {
+		gotMime = vals[0]
+	}
+	if !strings.HasSuffix(last.Path, "/files/doc/export") || gotMime != "text/plain" {
+		t.Fatalf("unexpected export request: %+v", last)
 	}
 }
 

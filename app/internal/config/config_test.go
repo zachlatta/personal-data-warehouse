@@ -219,3 +219,46 @@ func TestLoadFromEnvNoSlackAccounts(t *testing.T) {
 		t.Fatalf("expected no slack accounts, got %#v", cfg.SlackAccounts)
 	}
 }
+
+func TestLoadFromEnvDriveSourceTokensByAccount(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL": "postgres://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":      "0123456789abcdef0123456789abcdef",
+		"GMAIL_ACCOUNTS":        "zach@hackclub.com, zach@zachlatta.com",
+		// hackclub via the GOOGLE_<SLUG>_TOKEN_JSON form, zachlatta via the
+		// GMAIL_<SLUG>_TOKEN_JSON_B64 alias, to cover both lookups.
+		"GOOGLE_ZACH_HACKCLUB_COM_TOKEN_JSON":     `{"token":"hc"}`,
+		"GMAIL_ZACH_ZACHLATTA_COM_TOKEN_JSON_B64": "eyJ0b2tlbiI6Inp6In0=",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv: %v", err)
+	}
+	if got := cfg.DriveSourceTokensByAccount["zach@hackclub.com"]; got != `{"token":"hc"}` {
+		t.Fatalf("hackclub token = %q", got)
+	}
+	if got := cfg.DriveSourceTokensByAccount["zach@zachlatta.com"]; got != `{"token":"zz"}` {
+		t.Fatalf("zachlatta token = %q", got)
+	}
+}
+
+func TestLoadFromEnvDriveSourceAccountsOverrideGmail(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL":               "postgres://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":                    "0123456789abcdef0123456789abcdef",
+		"GMAIL_ACCOUNTS":                      "zach@hackclub.com",
+		"GOOGLE_DRIVE_SOURCE_ACCOUNTS":        "work@example.test",
+		"GOOGLE_WORK_EXAMPLE_TEST_TOKEN_JSON": `{"token":"w"}`,
+		"GOOGLE_ZACH_HACKCLUB_COM_TOKEN_JSON": `{"token":"hc"}`,
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv: %v", err)
+	}
+	if _, ok := cfg.DriveSourceTokensByAccount["zach@hackclub.com"]; ok {
+		t.Fatal("gmail account must not be used when GOOGLE_DRIVE_SOURCE_ACCOUNTS is set")
+	}
+	if got := cfg.DriveSourceTokensByAccount["work@example.test"]; got != `{"token":"w"}` {
+		t.Fatalf("work token = %q", got)
+	}
+}

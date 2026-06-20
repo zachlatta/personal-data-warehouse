@@ -19,6 +19,7 @@ import zipfile
 from googleapiclient.errors import HttpError
 from httplib2 import Response
 from PIL import Image
+import pytest
 from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
 from personal_data_warehouse.defs.gmail_sync import (
     gmail_mailbox_sync_every_fifteen_minutes,
@@ -51,6 +52,21 @@ from personal_data_warehouse.gmail_sync import (
     message_to_row,
     strip_quoted_history,
 )
+
+
+_ALICE_ENV_VARS = (
+    "ALICE_VOICE_RECORDINGS_ACCOUNT",
+    "ALICE_API_KEY_ID",
+    "ALICE_API_SECRET_KEY",
+    "ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_ACCOUNT",
+    "ALICE_VOICE_RECORDINGS_GOOGLE_DRIVE_FOLDER_ID",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_unrelated_alice_env(monkeypatch):
+    for name in _ALICE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 def _gmail_data(content: bytes) -> str:
@@ -299,8 +315,12 @@ def test_load_settings_accepts_gmail_attachment_limits(monkeypatch) -> None:
 def test_load_settings_disables_attachment_storage_without_folder(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
     monkeypatch.delenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", raising=False)
+    monkeypatch.delenv("VOICE_MEMOS_ACCOUNT", raising=False)
     monkeypatch.delenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID", raising=False)
     monkeypatch.delenv("VOICE_MEMOS_DRIVE_FOLDER_ID", raising=False)
+    # Isolate the attachment-storage scope contribution from the (default-on)
+    # Google Drive source, which adds the Drive scope independently.
+    monkeypatch.setenv("GOOGLE_DRIVE_SOURCE_ENABLED", "0")
 
     settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 
@@ -337,6 +357,12 @@ def test_load_settings_attachment_storage_can_be_disabled(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@hackclub.com")
     monkeypatch.setenv("GMAIL_ATTACHMENT_STORAGE_BACKEND", "none")
     monkeypatch.setenv("GMAIL_ATTACHMENT_GOOGLE_DRIVE_FOLDER_ID", "folder-123")
+    monkeypatch.delenv("VOICE_MEMOS_ACCOUNT", raising=False)
+    monkeypatch.delenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID", raising=False)
+    monkeypatch.delenv("VOICE_MEMOS_DRIVE_FOLDER_ID", raising=False)
+    # Isolate from the default-on Google Drive source, which adds the Drive
+    # scope independently of attachment storage.
+    monkeypatch.setenv("GOOGLE_DRIVE_SOURCE_ENABLED", "0")
 
     settings = load_settings(require_postgres=False, require_gmail_client_secrets=False)
 

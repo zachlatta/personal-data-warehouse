@@ -61,6 +61,11 @@ DEFAULT_AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR = "~/.openclaw/agents/main/sessions
 DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
 DEFAULT_ALICE_STORAGE_BACKEND = "google_drive"
 DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS = 120
+DEFAULT_GOOGLE_DRIVE_SOURCE_ENABLED = True
+DEFAULT_GOOGLE_DRIVE_SOURCE_TEXT_MAX_CHARS = 5_000_000
+DEFAULT_GOOGLE_DRIVE_SOURCE_EXTRACT_MAX_BYTES = 25 * 1024 * 1024
+DEFAULT_GOOGLE_DRIVE_SOURCE_FILES_PER_RUN = 5000
+DEFAULT_GOOGLE_DRIVE_SOURCE_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com"
 DEFAULT_ASSEMBLYAI_POLL_INTERVAL_SECONDS = 5
 DEFAULT_ASSEMBLYAI_TIMEOUT_SECONDS = 1800
@@ -225,6 +230,20 @@ class AliceVoiceRecordingsConfig:
 
 
 @dataclass(frozen=True)
+class GoogleDriveSourceConfig:
+    accounts: tuple[str, ...]
+    exclude_folder_ids: tuple[str, ...] = ()
+    exclude_path_globs: tuple[str, ...] = ()
+    include_shared_with_me: bool = False
+    include_shared_drives: bool = False
+    text_max_chars: int = DEFAULT_GOOGLE_DRIVE_SOURCE_TEXT_MAX_CHARS
+    extract_max_bytes: int = DEFAULT_GOOGLE_DRIVE_SOURCE_EXTRACT_MAX_BYTES
+    binary_extraction_enabled: bool = False
+    files_per_run: int = DEFAULT_GOOGLE_DRIVE_SOURCE_FILES_PER_RUN
+    request_timeout_seconds: int = DEFAULT_GOOGLE_DRIVE_SOURCE_REQUEST_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True)
 class AssemblyAIConfig:
     api_key: str
     base_url: str = DEFAULT_ASSEMBLYAI_BASE_URL
@@ -296,6 +315,7 @@ class Settings:
     whatsapp: WhatsAppConfig | None = None
     agent_sessions: AgentSessionsConfig | None = None
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
+    google_drive_source: GoogleDriveSourceConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
     postgres_database_url: str | None = None
@@ -394,6 +414,7 @@ def load_settings(
     require_whatsapp: bool = False,
     require_agent_sessions: bool = False,
     require_alice_voice_recordings: bool = False,
+    require_google_drive_source: bool = False,
     require_assemblyai: bool = False,
     require_agent: bool = False,
 ) -> Settings:
@@ -984,6 +1005,70 @@ def load_settings(
             request_timeout_seconds=alice_request_timeout_seconds,
         )
 
+    # Google Drive as an ingested data source (distinct from Drive-as-transport,
+    # which the storage backends above use). Files in the warehouse's own
+    # transport folders are excluded by default so we never re-ingest our own
+    # staging blobs.
+    google_drive_source_accounts = _parse_csv_env(os.getenv("GOOGLE_DRIVE_SOURCE_ACCOUNTS")) or account_emails
+    transport_folder_ids = tuple(
+        folder_id
+        for folder_id in (
+            voice_memos_google_drive_folder_id,
+            gmail_attachment_google_drive_folder_id,
+            apple_notes_google_drive_folder_id,
+            apple_messages_google_drive_folder_id,
+            whatsapp_google_drive_folder_id,
+            agent_sessions_google_drive_folder_id,
+            alice_google_drive_folder_id,
+        )
+        if folder_id
+    )
+    google_drive_exclude_folder_ids = tuple(
+        dict.fromkeys((*_parse_csv_env(os.getenv("GOOGLE_DRIVE_EXCLUDE_FOLDER_IDS")), *transport_folder_ids))
+    )
+    # Enabled by default whenever there are accounts to sync (no opt-in env var);
+    # set GOOGLE_DRIVE_SOURCE_ENABLED=0 to turn it off.
+    google_drive_source_enabled = _parse_bool_env(
+        os.getenv("GOOGLE_DRIVE_SOURCE_ENABLED"), DEFAULT_GOOGLE_DRIVE_SOURCE_ENABLED
+    )
+    google_drive_source: GoogleDriveSourceConfig | None = None
+    if (require_google_drive_source or google_drive_source_enabled) and google_drive_source_accounts:
+        google_drive_source_text_max_chars = int(
+            os.getenv("GOOGLE_DRIVE_SOURCE_TEXT_MAX_CHARS", str(DEFAULT_GOOGLE_DRIVE_SOURCE_TEXT_MAX_CHARS))
+        )
+        if google_drive_source_text_max_chars < 1:
+            raise ValueError("GOOGLE_DRIVE_SOURCE_TEXT_MAX_CHARS must be at least 1")
+        google_drive_source_extract_max_bytes = int(
+            os.getenv("GOOGLE_DRIVE_SOURCE_EXTRACT_MAX_BYTES", str(DEFAULT_GOOGLE_DRIVE_SOURCE_EXTRACT_MAX_BYTES))
+        )
+        if google_drive_source_extract_max_bytes < 1:
+            raise ValueError("GOOGLE_DRIVE_SOURCE_EXTRACT_MAX_BYTES must be at least 1")
+        google_drive_source_files_per_run = int(
+            os.getenv("GOOGLE_DRIVE_SOURCE_FILES_PER_RUN", str(DEFAULT_GOOGLE_DRIVE_SOURCE_FILES_PER_RUN))
+        )
+        if google_drive_source_files_per_run < 1:
+            raise ValueError("GOOGLE_DRIVE_SOURCE_FILES_PER_RUN must be at least 1")
+        google_drive_source_request_timeout_seconds = int(
+            os.getenv(
+                "GOOGLE_DRIVE_SOURCE_REQUEST_TIMEOUT_SECONDS",
+                str(DEFAULT_GOOGLE_DRIVE_SOURCE_REQUEST_TIMEOUT_SECONDS),
+            )
+        )
+        if google_drive_source_request_timeout_seconds < 1:
+            raise ValueError("GOOGLE_DRIVE_SOURCE_REQUEST_TIMEOUT_SECONDS must be at least 1")
+        google_drive_source = GoogleDriveSourceConfig(
+            accounts=tuple(google_drive_source_accounts),
+            exclude_folder_ids=google_drive_exclude_folder_ids,
+            exclude_path_globs=_parse_csv_env(os.getenv("GOOGLE_DRIVE_EXCLUDE_PATH_GLOBS")),
+            include_shared_with_me=_parse_bool_env(os.getenv("GOOGLE_DRIVE_SOURCE_INCLUDE_SHARED_WITH_ME"), False),
+            include_shared_drives=_parse_bool_env(os.getenv("GOOGLE_DRIVE_SOURCE_INCLUDE_SHARED_DRIVES"), False),
+            text_max_chars=google_drive_source_text_max_chars,
+            extract_max_bytes=google_drive_source_extract_max_bytes,
+            binary_extraction_enabled=_parse_bool_env(os.getenv("GOOGLE_DRIVE_SOURCE_BINARY_EXTRACTION"), False),
+            files_per_run=google_drive_source_files_per_run,
+            request_timeout_seconds=google_drive_source_request_timeout_seconds,
+        )
+
     assemblyai_api_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
     assemblyai: AssemblyAIConfig | None = None
     if require_assemblyai or assemblyai_api_key:
@@ -1074,6 +1159,8 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if gmail_attachment_storage_backend == "google_drive" and gmail_attachment_google_drive_folder_id:
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if google_drive_source and google_drive_source.accounts:
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
 
     return Settings(
         gmail_accounts=gmail_accounts,
@@ -1121,6 +1208,7 @@ def load_settings(
         whatsapp=whatsapp,
         agent_sessions=agent_sessions,
         alice_voice_recordings=alice_voice_recordings,
+        google_drive_source=google_drive_source,
         assemblyai=assemblyai,
         agent=agent,
         postgres_database_url=postgres_database_url,

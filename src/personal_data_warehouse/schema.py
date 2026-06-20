@@ -848,6 +848,72 @@ SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS = (
     "sync_version",
 )
 
+GOOGLE_DRIVE_FILE_COLUMNS = (
+    "account",
+    "file_id",
+    "drive_id",
+    "name",
+    "mime_type",
+    "is_google_native",
+    "parents_json",
+    "folder_path",
+    "parent_folder_id",
+    "size_bytes",
+    "md5_checksum",
+    "content_sha256",
+    "web_view_link",
+    "icon_link",
+    "owners_json",
+    "last_modifying_user",
+    "created_time",
+    "modified_time",
+    "viewed_by_me_time",
+    "starred",
+    "shared",
+    "trashed",
+    "is_excluded",
+    "exclude_reason",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "storage_status",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+GOOGLE_DRIVE_FILE_TEXT_COLUMNS = (
+    "account",
+    "file_id",
+    "content_sha256",
+    "extractor",
+    "extractor_version",
+    "text",
+    "text_extraction_status",
+    "text_extraction_error",
+    "char_count",
+    "truncated",
+    "source_modified_time",
+    "extracted_at",
+    "sync_version",
+)
+
+GOOGLE_DRIVE_SYNC_STATE_COLUMNS = (
+    "account",
+    "start_page_token",
+    "last_page_token",
+    "drive_id",
+    "last_sync_type",
+    "status",
+    "error",
+    "full_crawled_at",
+    "files_seen",
+    "updated_at",
+    "sync_version",
+)
+
+
 @dataclass(frozen=True)
 class SyncState:
     account: str
@@ -856,3 +922,16 @@ class SyncState:
     status: str
     error: str
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class GoogleDriveSyncState:
+    account: str
+    start_page_token: str
+    last_page_token: str
+    drive_id: str
+    last_sync_type: str
+    status: str
+    error: str
+    full_crawled_at: datetime
+    files_seen: int

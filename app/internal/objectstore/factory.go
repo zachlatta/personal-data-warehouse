@@ -31,7 +31,7 @@ type GoogleDriveConnection struct {
 // BuildObjectStore. It mirrors the Python ObjectStoreSpec.
 type Spec struct {
 	Backend       string
-	Namespace     string // Drive folder id, or S3 bucket/prefix root
+	Namespace     string // Drive folder id for managed stores, or S3 bucket/prefix root
 	Source        string
 	BlobKind      string
 	MetadataKind  string
@@ -59,9 +59,6 @@ func GoogleDriveSpec(folderID, source, blobKind, metadataKind string, legacySour
 func BuildObjectStore(spec Spec) (ObjectStore, error) {
 	switch spec.Backend {
 	case GoogleDriveBackend:
-		if spec.Namespace == "" {
-			return nil, fmt.Errorf("objectstore: google_drive backend requires a folder id (spec.Namespace)")
-		}
 		if spec.GoogleDrive == nil {
 			return nil, fmt.Errorf("objectstore: google_drive backend requires spec.GoogleDrive connection")
 		}

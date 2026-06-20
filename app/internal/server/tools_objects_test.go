@@ -17,10 +17,11 @@ import (
 // test. Only the read methods the tool uses are meaningful; the rest return
 // ErrNotImplemented.
 type fakeObjectStore struct {
-	meta      objectstore.ObjectMetadata
-	content   []byte
-	notFound  bool
-	getCalled bool
+	meta       objectstore.ObjectMetadata
+	content    []byte
+	notFound   bool
+	getCalled  bool
+	metaCalled bool
 }
 
 func (f *fakeObjectStore) Backend() string { return "google_drive" }
@@ -56,6 +57,7 @@ func (f *fakeObjectStore) DeleteObject(context.Context, objectstore.StoredObject
 	return objectstore.ErrNotImplemented
 }
 func (f *fakeObjectStore) GetMetadata(context.Context, objectstore.StoredObject) (objectstore.ObjectMetadata, error) {
+	f.metaCalled = true
 	if f.notFound {
 		return objectstore.ObjectMetadata{}, objectstore.ErrNotFound
 	}
@@ -85,12 +87,16 @@ func objectsTestSigner() *pdwauth.Service {
 }
 
 func invokeGetObject(t *testing.T, store objectstore.ObjectStore, in getObjectInput) getObjectOutput {
+	return invokeGetObjectWithDrive(t, store, nil, in)
+}
+
+func invokeGetObjectWithDrive(t *testing.T, store objectstore.ObjectStore, driveStores map[string]objectstore.ObjectStore, in getObjectInput) getObjectOutput {
 	t.Helper()
 	raw, err := json.Marshal(in)
 	if err != nil {
 		t.Fatalf("marshal input: %v", err)
 	}
-	tl := getObjectTool(store, objectsTestSigner(), objectsTestBaseURL, time.Hour, func() time.Time { return objectsTestNow })
+	tl := getObjectTool(store, driveStores, objectsTestSigner(), objectsTestBaseURL, time.Hour, func() time.Time { return objectsTestNow })
 	out, isErr, err := tl.Invoke(context.Background(), raw)
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
@@ -134,8 +140,112 @@ func TestGetObjectToolReturnsSignedDownloadURL(t *testing.T) {
 	if got := parsed.Query().Get("exp"); got != strconv.FormatInt(wantExp.Unix(), 10) {
 		t.Fatalf("unexpected exp: %q", got)
 	}
-	if err := objectsTestSigner().VerifyObjectDownload("fid", parsed.Query().Get("exp"), parsed.Query().Get("sig")); err != nil {
+	if err := objectsTestSigner().VerifyObjectDownload("fid", "", parsed.Query().Get("exp"), parsed.Query().Get("sig")); err != nil {
 		t.Fatalf("signature does not verify: %v", err)
+	}
+}
+
+func TestGetObjectToolRoutesDriveSourceByAccount(t *testing.T) {
+	primary := &fakeObjectStore{meta: objectstore.ObjectMetadata{Backend: "google_drive"}}
+	driveStore := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			Backend: "google_drive", StorageFileID: "DRIVEID", ContentType: "application/pdf",
+			SizeBytes: 9, Filename: "doc.pdf", StorageURL: "https://drive/DRIVEID",
+		},
+		content: []byte("pdfbytes"),
+	}
+	driveStores := map[string]objectstore.ObjectStore{"zach@hackclub.com": driveStore}
+
+	out := invokeGetObjectWithDrive(t, primary, driveStores, getObjectInput{
+		StorageFileID: "DRIVEID", StorageBackend: "google_drive_source", Account: "zach@hackclub.com",
+	})
+	if !out.Exists || out.Filename != "doc.pdf" {
+		t.Fatalf("unexpected metadata: %+v", out)
+	}
+	if primary.metaCalled {
+		t.Fatal("primary store must not be consulted for a drive-source file")
+	}
+	parsed, err := url.Parse(out.DownloadURL)
+	if err != nil {
+		t.Fatalf("parse download_url: %v", err)
+	}
+	if got := parsed.Query().Get("account"); got != "zach@hackclub.com" {
+		t.Fatalf("download_url missing account: %q", out.DownloadURL)
+	}
+	// The link is bound to the account and verifies only with it.
+	q := parsed.Query()
+	if err := objectsTestSigner().VerifyObjectDownload("DRIVEID", "zach@hackclub.com", q.Get("exp"), q.Get("sig")); err != nil {
+		t.Fatalf("account-bound signature does not verify: %v", err)
+	}
+	if err := objectsTestSigner().VerifyObjectDownload("DRIVEID", "", q.Get("exp"), q.Get("sig")); err == nil {
+		t.Fatal("expected account-bound link to fail without account")
+	}
+}
+
+func TestGetObjectToolDriveSourceDoesNotLeakStoreToNextInvocation(t *testing.T) {
+	primary := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			Backend: "google_drive", StorageFileID: "fid", ContentType: "text/plain",
+			SizeBytes: 7, Filename: "primary.txt",
+		},
+	}
+	driveStore := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			Backend: "google_drive", StorageFileID: "DRIVEID", ContentType: "text/plain",
+			SizeBytes: 5, Filename: "drive.txt",
+		},
+	}
+	tl := getObjectTool(
+		primary,
+		map[string]objectstore.ObjectStore{"zach@hackclub.com": driveStore},
+		objectsTestSigner(),
+		objectsTestBaseURL,
+		time.Hour,
+		func() time.Time { return objectsTestNow },
+	)
+	invoke := func(in getObjectInput) getObjectOutput {
+		t.Helper()
+		raw, err := json.Marshal(in)
+		if err != nil {
+			t.Fatalf("marshal input: %v", err)
+		}
+		out, _, err := tl.Invoke(context.Background(), raw)
+		if err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		result, ok := out.(getObjectOutput)
+		if !ok {
+			t.Fatalf("unexpected output type %T", out)
+		}
+		return result
+	}
+
+	driveOut := invoke(getObjectInput{
+		StorageFileID: "DRIVEID", StorageBackend: "google_drive_source", Account: "zach@hackclub.com",
+	})
+	if !driveOut.Exists || driveOut.Filename != "drive.txt" {
+		t.Fatalf("unexpected drive output: %+v", driveOut)
+	}
+	if primary.metaCalled {
+		t.Fatal("primary store must not be consulted for drive-source invocation")
+	}
+
+	primaryOut := invoke(getObjectInput{StorageFileID: "fid"})
+	if !primaryOut.Exists || primaryOut.Filename != "primary.txt" {
+		t.Fatalf("unexpected primary output after drive-source invocation: %+v", primaryOut)
+	}
+	if !primary.metaCalled {
+		t.Fatal("primary store was not consulted for normal invocation")
+	}
+}
+
+func TestGetObjectToolUnknownDriveAccount(t *testing.T) {
+	primary := &fakeObjectStore{meta: objectstore.ObjectMetadata{Backend: "google_drive"}}
+	out := invokeGetObjectWithDrive(t, primary, map[string]objectstore.ObjectStore{}, getObjectInput{
+		StorageFileID: "DRIVEID", StorageBackend: "google_drive_source", Account: "nobody@nowhere.com",
+	})
+	if out.Error == "" {
+		t.Fatal("expected error for unknown drive account")
 	}
 }
 

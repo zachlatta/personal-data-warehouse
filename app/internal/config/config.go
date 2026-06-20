@@ -61,6 +61,14 @@ type Config struct {
 	// from the same SLACK_ACCOUNTS / SLACK_<SLUG>_TOKEN env vars as the Python
 	// sync; accounts without a token are skipped.
 	SlackAccounts []SlackAccount
+
+	// DriveSourceTokensByAccount maps a Google Drive *source* account email to
+	// its OAuth token JSON, so the account-aware download proxy can stream a
+	// google_drive_source file live from the account that owns it. Populated
+	// from GOOGLE_DRIVE_SOURCE_ACCOUNTS (falling back to GMAIL_ACCOUNTS) plus
+	// the per-account GOOGLE_<SLUG>_TOKEN_JSON[_B64] / GMAIL_<SLUG>_... env vars
+	// the Python sync uses; accounts without a token are skipped.
+	DriveSourceTokensByAccount map[string]string
 }
 
 // SlackAccount is one Slack workspace the app holds an API token for.
@@ -197,6 +205,17 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		}
 	}
 
+	driveSourceAccounts := parseCSV(getenv("GOOGLE_DRIVE_SOURCE_ACCOUNTS"))
+	if len(driveSourceAccounts) == 0 {
+		driveSourceAccounts = cfg.GmailAccounts
+	}
+	cfg.DriveSourceTokensByAccount = map[string]string{}
+	for _, account := range driveSourceAccounts {
+		if token := googleTokenJSONForAccount(getenv, account); token != "" {
+			cfg.DriveSourceTokensByAccount[account] = token
+		}
+	}
+
 	cfg.DebugCacheTool = parseBool(getenv("MCP_DEBUG_CACHE_TOOL"))
 	if raw := strings.TrimSpace(getenv("MCP_QUERY_TIMEOUT")); raw != "" {
 		cfg.QueryTimeout, err = time.ParseDuration(raw)
@@ -293,6 +312,19 @@ func jsonEnvValue(getenv func(string) string, name string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(decoded))
+}
+
+// googleTokenJSONForAccount resolves an account's Google OAuth token JSON from
+// the same env names the Python sync writes (GOOGLE_<SLUG>_TOKEN_JSON[_B64] and
+// the GMAIL_<SLUG>_... aliases), so the Go app reuses tokens without new config.
+func googleTokenJSONForAccount(getenv func(string) string, account string) string {
+	slug := envSlug(account)
+	for _, name := range []string{"GOOGLE_" + slug + "_TOKEN_JSON", "GMAIL_" + slug + "_TOKEN_JSON"} {
+		if token := jsonEnvValue(getenv, name); token != "" {
+			return token
+		}
+	}
+	return ""
 }
 
 // envSlug mirrors the Python env_slug: non-alphanumeric runs become "_",

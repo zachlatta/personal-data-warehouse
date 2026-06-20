@@ -34,6 +34,9 @@ from personal_data_warehouse.schema import (
     CALENDAR_SYNC_STATE_COLUMNS,
     CONTACT_CARD_COLUMNS,
     CONTACT_SYNC_STATE_COLUMNS,
+    GOOGLE_DRIVE_FILE_COLUMNS,
+    GOOGLE_DRIVE_FILE_TEXT_COLUMNS,
+    GOOGLE_DRIVE_SYNC_STATE_COLUMNS,
     MESSAGE_COLUMNS,
     RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS,
     SLACK_ACCOUNT_IDENTITY_COLUMNS,
@@ -57,6 +60,7 @@ from personal_data_warehouse.schema import (
     WHATSAPP_CONTACT_COLUMNS,
     WHATSAPP_MEDIA_ITEM_COLUMNS,
     WHATSAPP_MESSAGE_COLUMNS,
+    GoogleDriveSyncState,
     SyncState,
 )
 from personal_data_warehouse.config import normalize_postgres_url
@@ -249,6 +253,23 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "slack_account_state_item_rows": TableSpec(
         SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS,
         ("source", "account", "scope_id", "item_id"),
+    ),
+    "google_drive_files": TableSpec(
+        GOOGLE_DRIVE_FILE_COLUMNS,
+        ("account", "file_id"),
+        storage_parameters=(
+            ("autovacuum_analyze_scale_factor", "0.02"),
+            ("autovacuum_vacuum_scale_factor", "0.05"),
+        ),
+    ),
+    "google_drive_file_texts": TableSpec(
+        GOOGLE_DRIVE_FILE_TEXT_COLUMNS,
+        ("account", "file_id", "extractor"),
+    ),
+    "google_drive_sync_state": TableSpec(
+        GOOGLE_DRIVE_SYNC_STATE_COLUMNS,
+        ("account",),
+        "updated_at",
     ),
 }
 
@@ -774,6 +795,35 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_reason_bm25_idx ON upstream_mutation_requests USING bm25 (reason) WITH (text_config='english')",
         requires_pg_textsearch=True,
     ),
+    IndexSpec(
+        "google_drive_files_modified_idx",
+        "google_drive_files",
+        "CREATE INDEX IF NOT EXISTS google_drive_files_modified_idx ON google_drive_files (account, modified_time DESC) WHERE trashed = 0 AND is_excluded = 0",
+    ),
+    IndexSpec(
+        "google_drive_files_name_bm25_idx",
+        "google_drive_files",
+        "CREATE INDEX IF NOT EXISTS google_drive_files_name_bm25_idx ON google_drive_files USING bm25 (name) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "google_drive_files_name_trgm_idx",
+        "google_drive_files",
+        "CREATE INDEX IF NOT EXISTS google_drive_files_name_trgm_idx ON google_drive_files USING gin (name public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "google_drive_file_texts_text_bm25_idx",
+        "google_drive_file_texts",
+        "CREATE INDEX IF NOT EXISTS google_drive_file_texts_text_bm25_idx ON google_drive_file_texts USING bm25 (text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "google_drive_file_texts_text_trgm_idx",
+        "google_drive_file_texts",
+        "CREATE INDEX IF NOT EXISTS google_drive_file_texts_text_trgm_idx ON google_drive_file_texts USING gin (text public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
 )
 
 # Indexes that used to exist but have been superseded. Dropped idempotently
@@ -817,6 +867,11 @@ JSONB_COLUMNS_BY_TABLE = {
         "photos",
         "raw_json",
     },
+    "google_drive_files": {
+        "parents_json",
+        "owners_json",
+        "raw_metadata_json",
+    },
 }
 
 JSONB_ARRAY_COLUMNS_BY_TABLE = {
@@ -828,6 +883,10 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
         "urls",
         "groups",
         "photos",
+    },
+    "google_drive_files": {
+        "parents_json",
+        "owners_json",
     },
 }
 
@@ -868,6 +927,12 @@ TIMESTAMP_COLUMNS = {
     "last_message_at",
     "edited_at",
     "occurred_at",
+    "created_time",
+    "modified_time",
+    "viewed_by_me_time",
+    "source_modified_time",
+    "full_crawled_at",
+    "extracted_at",
 }
 
 INTEGER_COLUMNS = {
@@ -949,6 +1014,14 @@ INTEGER_COLUMNS = {
     "is_pending_review",
     "is_admin",
     "is_super_admin",
+    "is_google_native",
+    "starred",
+    "shared",
+    "trashed",
+    "is_excluded",
+    "truncated",
+    "char_count",
+    "files_seen",
 }
 
 FLOAT_COLUMNS = {
@@ -3437,6 +3510,77 @@ class PostgresWarehouse:
     def insert_attachment_enrichments(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("gmail_attachment_enrichments", rows, ATTACHMENT_ENRICHMENT_COLUMNS)
 
+    def ensure_google_drive_source_tables(self) -> None:
+        self._ensure_table_group(
+            [
+                "google_drive_files",
+                "google_drive_file_texts",
+                "google_drive_sync_state",
+            ]
+        )
+        self._ensure_search_views_if_possible()
+
+    def insert_google_drive_files(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("google_drive_files", rows, GOOGLE_DRIVE_FILE_COLUMNS)
+
+    def insert_google_drive_file_texts(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("google_drive_file_texts", rows, GOOGLE_DRIVE_FILE_TEXT_COLUMNS)
+
+    def upsert_google_drive_sync_state(self, row: dict[str, Any]) -> None:
+        self._insert_rows("google_drive_sync_state", [row], GOOGLE_DRIVE_SYNC_STATE_COLUMNS)
+
+    def load_google_drive_text_state(self, account: str) -> dict[str, tuple[datetime, str]]:
+        rows = self._query(
+            """
+            SELECT file_id, source_modified_time, content_sha256
+            FROM google_drive_file_texts
+            WHERE account = %s AND text_extraction_status = 'ok'
+            """,
+            (account,),
+        )
+        return {str(row[0]): (row[1], str(row[2])) for row in rows}
+
+    def load_google_drive_text_modified_times(self, account: str) -> dict[str, datetime]:
+        return {file_id: state[0] for file_id, state in self.load_google_drive_text_state(account).items()}
+
+    def mark_google_drive_files_trashed(
+        self, *, account: str, file_ids: Sequence[str], sync_version: int
+    ) -> None:
+        if not file_ids:
+            return
+        self._command(
+            """
+            UPDATE google_drive_files
+            SET trashed = 1,
+                sync_version = GREATEST(sync_version + 1, %s)
+            WHERE account = %s AND file_id = ANY(%s)
+            """,
+            (sync_version, account, list(file_ids)),
+        )
+
+    def load_google_drive_sync_state(self) -> dict[str, GoogleDriveSyncState]:
+        rows = self._query(
+            """
+            SELECT account, start_page_token, last_page_token, drive_id,
+                   last_sync_type, status, error, full_crawled_at, files_seen
+            FROM google_drive_sync_state
+            """
+        )
+        return {
+            str(row[0]): GoogleDriveSyncState(
+                account=str(row[0]),
+                start_page_token=str(row[1]),
+                last_page_token=str(row[2]),
+                drive_id=str(row[3]),
+                last_sync_type=str(row[4]),
+                status=str(row[5]),
+                error=str(row[6]),
+                full_crawled_at=row[7],
+                files_seen=int(row[8]),
+            )
+            for row in rows
+        }
+
     def insert_calendar_events(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("calendar_events", rows, CALENDAR_EVENT_COLUMNS)
 
@@ -4702,6 +4846,8 @@ class PostgresWarehouse:
         "agent_session_events",
         "upstream_mutations",
         "upstream_mutation_requests",
+        "google_drive_files",
+        "google_drive_file_texts",
     )
 
     def _ensure_search_views_if_possible(self) -> None:
@@ -5000,6 +5146,23 @@ class PostgresWarehouse:
                 "'mutation_request'", "status", "title", "requested_by", "created_at", "''",
                 "id || ':reason'", "upstream_mutation_requests", "reason",
                 "upstream_mutation_requests_reason_bm25_idx", where="reason != ''",
+            ),
+            branch(
+                "'google_drive'", "'filename'", "folder_path", "last_modifying_user", "modified_time",
+                "account", "account || ':' || file_id", "google_drive_files", "name",
+                "google_drive_files_name_bm25_idx", where="trashed = 0 AND is_excluded = 0",
+            ),
+            join_branch(
+                "SELECT 'google_drive' AS source, 'content' AS subsource, f.folder_path AS context, "
+                "f.last_modifying_user AS who, f.modified_time AS occurred_at, f.account AS account, "
+                "f.account || ':' || f.file_id AS ref, m.text AS text, m.score AS score",
+                "SELECT account, file_id, text, "
+                "(text <@> to_bm25query(%1$L, 'google_drive_file_texts_text_bm25_idx'))::real AS score "
+                "FROM google_drive_file_texts "
+                "WHERE text_extraction_status = 'ok' AND text != '' "
+                "ORDER BY text <@> to_bm25query(%1$L, 'google_drive_file_texts_text_bm25_idx') LIMIT %2$s",
+                "JOIN google_drive_files f USING (account, file_id)",
+                where="f.trashed = 0 AND f.is_excluded = 0",
             ),
         ]
 
@@ -6217,4 +6380,3 @@ def _numeric_ts(expression: str) -> str:
 
 def _json_numeric(expression: str, field: str) -> str:
     return f"COALESCE(NULLIF(({expression}::jsonb ->> '{field}'), '')::numeric, 0)"
-
