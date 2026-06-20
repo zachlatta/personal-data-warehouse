@@ -5168,47 +5168,59 @@ class PostgresWarehouse:
 
         # Run each branch as its own statement (dollar-quoted in a plpgsql array)
         # so a single missing or unusable bm25 index drops only that one source
-        # instead of failing the entire function. Without this, the whole UNION
-        # errors with "index ... does not exist" the moment any one branch's
-        # index is absent (e.g. a not-yet-built index right after a deploy, a
-        # failed/half-built index, or a future source whose index never built) —
-        # making the preferred cross-source search path 100% unusable on a single
-        # bad index. Per-branch results collect in a temp table, then we rank and
-        # limit across every source that succeeded.
+        # instead of failing the entire function. Without this, one bad branch
+        # ("index ... does not exist" — a not-yet-built index right after a
+        # deploy, a failed/half-built index, or a future source whose index never
+        # built) makes the whole cross-source search path 100% unusable.
+        #
+        # Results accumulate in a plpgsql array (NOT a temp table): the function
+        # must run on the read-only query surface (app/internal/query enforces
+        # read-only by statement parsing today, but the function must stay correct
+        # under a genuine read-only transaction / read replica too), so it does no
+        # DDL or DML at call time — only EXECUTE ... SELECT and array building.
+        # Each branch's rows are array_agg'd into the search_text_hit row type;
+        # we then unnest, filter, rank, and limit across every source that
+        # succeeded. The row type + function are dropped and recreated together so
+        # a column change stays clean.
         branch_array = ",\n                        ".join(f"$b${b}$b$" for b in branches)
         self._command(
             r"""
-            CREATE OR REPLACE FUNCTION search_text(
+            DROP FUNCTION IF EXISTS search_text(text, integer, text[], timestamptz);
+            DROP TYPE IF EXISTS search_text_hit;
+            CREATE TYPE search_text_hit AS (
+                source text, subsource text, context text, who text,
+                occurred_at timestamptz, account text, ref text,
+                text text, score real
+            );
+            CREATE FUNCTION search_text(
                 query text,
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
                 since timestamptz DEFAULT NULL
             )
-            RETURNS TABLE (
-                source text, subsource text, context text, who text,
-                occurred_at timestamptz, account text, ref text,
-                text text, score real
-            )
+            RETURNS SETOF search_text_hit
             LANGUAGE plpgsql
-            VOLATILE
+            STABLE
             AS $fn$
             DECLARE
                 per_source integer := greatest(coalesce(max_results, 50), 1);
                 branch text;
+                hits search_text_hit[] := '{}';
+                branch_hits search_text_hit[];
             BEGIN
-                CREATE TEMP TABLE IF NOT EXISTS _search_text_hits (
-                    source text, subsource text, context text, who text,
-                    occurred_at timestamptz, account text, ref text,
-                    text text, score real
-                );
-                TRUNCATE _search_text_hits;
                 FOREACH branch IN ARRAY ARRAY[
                         """
             + branch_array
             + r"""
                 ] LOOP
                     BEGIN
-                        EXECUTE format('INSERT INTO _search_text_hits ' || branch, query, per_source);
+                        EXECUTE format(
+                            'SELECT array_agg(x::search_text_hit) FROM (' || branch || ') x',
+                            query, per_source
+                        ) INTO branch_hits;
+                        IF branch_hits IS NOT NULL THEN
+                            hits := hits || branch_hits;
+                        END IF;
                     EXCEPTION WHEN OTHERS THEN
                         -- Missing/unusable bm25 index (or any branch error): skip
                         -- this source; the rest of the search still returns.
@@ -5218,7 +5230,7 @@ class PostgresWarehouse:
                 RETURN QUERY
                     SELECT h.source, h.subsource, h.context, h.who, h.occurred_at,
                            h.account, h.ref, h.text, h.score
-                    FROM _search_text_hits h
+                    FROM unnest(hits) AS h
                     WHERE (sources IS NULL OR h.source = ANY (sources))
                       AND (since IS NULL OR h.occurred_at >= since)
                     ORDER BY h.score ASC NULLS LAST

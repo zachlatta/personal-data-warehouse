@@ -1260,6 +1260,20 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     )
     assert after_cutoff == [(0,)]
 
+    # search_text() must run on the read-only query surface (the MCP/CLI tool is
+    # read-only), so it may not do DDL/DML at call time. Run it under a genuine
+    # read-only transaction and assert it still returns the matches.
+    warehouse._command("SET default_transaction_read_only = on")
+    try:
+        read_only = warehouse._query(
+            "SELECT source, subsource FROM search_text('zanzibar rollout', 20) WHERE score < 0"
+        )
+    finally:
+        warehouse._command("SET default_transaction_read_only = off")
+    read_only_sources = {(row[0], row[1]) for row in read_only}
+    assert ("slack", "private_channel") in read_only_sources
+    assert ("gmail", "subject") in read_only_sources
+
     # Resilience: a missing/unusable bm25 index must drop only its own source,
     # not break the whole function. Dropping unrelated bm25 indexes must leave
     # the slack + gmail matches intact and must not raise.
