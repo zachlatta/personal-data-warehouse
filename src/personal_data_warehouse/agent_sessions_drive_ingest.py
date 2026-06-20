@@ -32,7 +32,7 @@ INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox/"
 LIBRARY_PREFIX = f"{OBJECT_PREFIX}/library/"
 BATCH_KIND = "agent_sessions_export_batch"
 
-# Roles that carry conversational content worth surfacing in searchable_text.
+# Roles that carry conversational content worth surfacing in search_text().
 _TEXT_SEARCH_ROLES = ("user", "assistant")
 
 

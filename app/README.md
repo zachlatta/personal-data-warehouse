@@ -245,14 +245,19 @@ SQL starting points:
 
 Searching text columns (the schema overview lists which columns carry which indexes):
 
-- Cross-source coverage: the `searchable_text` view unions every searchable text column
-  in the warehouse into `(source, subsource, context, who, occurred_at, account, ref, text)`.
-  Start broad (`SELECT source, subsource, count(*) FROM searchable_text WHERE text ~* '\mterm\M'
-  GROUP BY 1, 2`), refine with ordinary `WHERE` clauses, then drill into the underlying
-  table via `ref`. Coverage is enforced: every text column in the warehouse is either a
-  view branch or explicitly excluded with a reason in `SEARCHABLE_TEXT_COVERAGE`
-  (`src/personal_data_warehouse/postgres.py`), and schema drift fails loudly at startup.
-- Relevance-ranked word search (BM25, `pg_textsearch`):
+- Cross-source search (the default): `SELECT * FROM search_text('offer letter', 50)`
+  fans out to the per-table BM25 indexes and returns
+  `(source, subsource, context, who, occurred_at, account, ref, text, score)` ranked across
+  **every** source — gmail, gmail attachments, slack messages/channels/files, apple notes,
+  imessage, whatsapp, meeting transcripts, calendar, contacts, agent runs/sessions, and
+  mutations (`score` lower / more negative = better). Optional args:
+  `search_text(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')`.
+  Use it for any broad "find every mention of X" question, then drill into the underlying
+  table via `ref` for full rows. (`pg_textsearch`'s `<@>` operator cannot run through a view,
+  so there is no cross-source view to `ILIKE`; `search_text()` is the cross-source path and
+  reuses the per-table indexes directly — no extra storage.) New BM25-indexed text columns are
+  picked up by adding a branch to `_ensure_search_text_function` (`src/personal_data_warehouse/postgres.py`).
+- Relevance-ranked word search on a single table (BM25, `pg_textsearch`):
   `SELECT ..., text <@> 'launch plans' AS score FROM slack_messages ORDER BY text <@> 'launch plans' LIMIT 20`.
   Scores are negative (more negative = better). Always include the `ORDER BY col <@> ... LIMIT n`
   pair — without a LIMIT the bm25 index is not used. No phrase queries or typo tolerance.

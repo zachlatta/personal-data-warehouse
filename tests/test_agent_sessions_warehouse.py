@@ -152,8 +152,15 @@ def test_clean_agent_sessions_view_rolls_up_session(warehouse) -> None:
     assert ended == datetime(2026, 6, 14, 17, 2, tzinfo=UTC)
 
 
-def test_searchable_text_includes_agent_session_branches(warehouse) -> None:
-    # All source tables must exist for the searchable_text view to build.
+def test_search_text_includes_agent_session_branches(warehouse) -> None:
+    usable = warehouse._query(
+        "SELECT 1 FROM pg_available_extensions WHERE name = 'pg_textsearch'"
+        " AND current_setting('shared_preload_libraries') LIKE '%pg_textsearch%'"
+    )
+    if not usable:
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    # All source tables must exist for search_text() (and its bm25 indexes) to build.
     warehouse.ensure_tables()
     warehouse.ensure_calendar_tables()
     warehouse.ensure_contacts_tables()
@@ -186,8 +193,12 @@ def test_searchable_text_includes_agent_session_branches(warehouse) -> None:
         ]
     )
 
+    # search_text() uses the explicit to_bm25query() form + public-schema bm25
+    # helpers; the schema-isolated test connection needs public on the path.
+    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
     rows = warehouse._query(
-        "SELECT subsource FROM searchable_text WHERE source = 'agent_session' AND text ~* '\\mzanzibar\\M' ORDER BY subsource"
+        "SELECT DISTINCT subsource FROM search_text('zanzibar', 50, ARRAY['agent_session']) "
+        "WHERE score < 0 ORDER BY subsource"
     )
     subsources = [r[0] for r in rows]
     # user content branch (subsource = source = 'claude_code') and title branch.

@@ -1157,35 +1157,107 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_upstream_mutation_tables()
 
 
-def test_searchable_text_view_spans_sources_and_pushes_predicates(warehouse: PostgresWarehouse) -> None:
+def _search_text_index_names() -> set[str]:
+    """The bm25 index names search_text() references via to_bm25query(), pulled
+    straight from the generated function SQL (no DB needed)."""
+    import re
+
+    import personal_data_warehouse.postgres as postgres_module
+
+    captured: list[str] = []
+
+    class _Capture:
+        def _command(self, sql: str) -> None:
+            captured.append(sql)
+
+    postgres_module.PostgresWarehouse._ensure_search_text_function(_Capture())
+    return set(re.findall(r"to_bm25query\([^,]+,\s*'([a-z0-9_]+)'\)", captured[0]))
+
+
+def test_search_text_only_references_defined_bm25_indexes() -> None:
+    import personal_data_warehouse.postgres as postgres_module
+
+    defined = {
+        ix.name
+        for ix in postgres_module.POSTGRES_INDEXES
+        if getattr(ix, "requires_pg_textsearch", False)
+    }
+    referenced = _search_text_index_names()
+    assert referenced, "expected search_text() to reference bm25 indexes"
+    undefined = sorted(referenced - defined)
+    assert not undefined, f"search_text() references undefined bm25 indexes: {undefined}"
+
+
+def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse) -> None:
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
     _ensure_all_table_groups(warehouse)
+    # search_text() uses the explicit to_bm25query('q', 'index_name') form plus the
+    # public-schema bm25 helpers; the schema-isolated test connection needs public on
+    # the search_path for them to resolve (production runs with schema=public).
+    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+
+    # Guard: every bm25 index search_text() names via to_bm25query must actually be
+    # built. _ensure_indexes swallows DDL errors, so a missing/typo'd index would
+    # otherwise only blow up (UndefinedObject) when the function is called.
+    referenced = _search_text_index_names()
+    built = {
+        row[0]
+        for row in warehouse._query(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()"
+        )
+    }
+    missing = sorted(name for name in referenced if name not in built)
+    assert not missing, f"search_text() references bm25 indexes that were not built: {missing}"
 
     message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
     warehouse.insert_slack_messages(
         [
             _slack_message_row(
                 conversation_id="C1",
                 message_ts="100.1",
                 message_datetime=message_datetime,
-                text="discussing the zanzibar rollout",
-            )
+                text="planning the zanzibar rollout schedule",
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.2",
+                message_datetime=message_datetime,
+                text="lunch plans for friday",
+            ),
         ]
     )
-    warehouse.insert_messages([_message_row(message_id="m1", subject="zanzibar kickoff", labels=["INBOX"], sync_version=1)])
+    warehouse.insert_messages(
+        [_message_row(message_id="m1", subject="zanzibar kickoff", labels=["INBOX"], sync_version=1)]
+    )
 
-    rows = warehouse._query(
-        "SELECT source, subsource FROM searchable_text WHERE text ~* '\\mzanzibar\\M' ORDER BY source, subsource"
+    # BM25 non-matches score 0; matches score negative. Isolate matches with score < 0
+    # so the assertions hold regardless of how few total rows the fixture has.
+    matched = warehouse._query(
+        "SELECT source, subsource, ref FROM search_text('zanzibar rollout', 20) WHERE score < 0"
     )
-    assert ("gmail", "subject") in rows
-    # The slack branch requires the conversation row to exist (INNER JOIN), so
-    # the slack hit only appears for known conversations — insert one and retry.
-    warehouse.insert_slack_conversations(
-        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    matched_sources = {(row[0], row[1]) for row in matched}
+    matched_refs = {row[2] for row in matched}
+    assert ("slack", "private_channel") in matched_sources
+    assert ("gmail", "subject") in matched_sources
+    assert any("100.1" in ref for ref in matched_refs)  # the zanzibar slack message
+    assert all("100.2" not in ref for ref in matched_refs)  # the unrelated lunch message
+
+    # sources filter restricts the fan-out.
+    gmail_only = warehouse._query(
+        "SELECT DISTINCT source FROM search_text('zanzibar', 20, ARRAY['gmail']) WHERE score < 0"
     )
-    rows = warehouse._query(
-        "SELECT source, subsource FROM searchable_text WHERE text ~* '\\mzanzibar\\M' ORDER BY source, subsource"
+    assert gmail_only == [("gmail",)]
+
+    # since filter excludes rows dated before the cutoff (fixtures are 2026-05-19).
+    after_cutoff = warehouse._query(
+        "SELECT count(*) FROM search_text('zanzibar', 20, NULL, '2027-01-01'::timestamptz) WHERE score < 0"
     )
-    assert ("slack", "private_channel") in rows
+    assert after_cutoff == [(0,)]
 
 
 def test_whatsapp_client_session_round_trips_binary_snapshot(warehouse: PostgresWarehouse) -> None:
@@ -1207,31 +1279,6 @@ def test_whatsapp_client_session_round_trips_binary_snapshot(warehouse: Postgres
     assert row["database_bytes"] == payload
     assert row["database_sha256"] == hashlib.sha256(payload).hexdigest()
     assert row["database_bytes_size"] == len(payload)
-
-
-def test_searchable_text_live_coverage_fails_on_unacknowledged_column(warehouse: PostgresWarehouse) -> None:
-    warehouse.ensure_slack_tables()
-    warehouse._command("ALTER TABLE slack_messages ADD COLUMN rogue_note text NOT NULL DEFAULT ''")
-
-    with pytest.raises(RuntimeError, match=r"slack_messages\.rogue_note"):
-        warehouse.ensure_slack_tables()
-
-
-def test_searchable_text_static_coverage_fails_on_unregistered_schema_change(monkeypatch) -> None:
-    import personal_data_warehouse.postgres as postgres_module
-
-    # Simulate a schema change (new text column in code) that nobody acknowledged.
-    monkeypatch.delitem(postgres_module.SEARCHABLE_TEXT_COVERAGE["gmail_messages"], "subject")
-    with pytest.raises(RuntimeError, match=r"gmail_messages\.subject"):
-        postgres_module.validate_searchable_text_coverage()
-
-    monkeypatch.setitem(
-        postgres_module.SEARCHABLE_TEXT_COVERAGE,
-        "imaginary_table",
-        {"ghost_column": "left behind after a table delete"},
-    )
-    with pytest.raises(RuntimeError, match=r"imaginary_table"):
-        postgres_module.validate_searchable_text_coverage()
 
 
 def test_postgres_contacts_tables_use_jsonb_without_changing_existing_raw_json(warehouse: PostgresWarehouse) -> None:

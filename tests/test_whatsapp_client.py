@@ -361,7 +361,7 @@ def test_device_sent_wrapper_is_unwrapped() -> None:
     assert record.payload["body_text"] == "from my phone"
     assert record.payload["is_from_me"] is True
     # Live events report the sender JID (our own) even for from-me messages;
-    # the searchable_text view maps is_from_me rows to who='me'.
+    # search_text() maps is_from_me rows to who='me'.
     assert record.payload["sender_jid"] == "15551234567@s.whatsapp.net"
 
 

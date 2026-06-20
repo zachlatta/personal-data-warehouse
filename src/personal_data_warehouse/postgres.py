@@ -612,6 +612,168 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "slack_account_state_item_rows",
         "CREATE INDEX IF NOT EXISTS slack_account_state_live_scope_idx ON slack_account_state_item_rows (account, scope_id, priority_rank, latest_activity_at DESC) WHERE is_deleted = 0",
     ),
+    # BM25 indexes backing the cross-source search_text() function for every
+    # source the (removed) searchable_text view used to cover. Full coverage (no
+    # partial WHERE) so the implicit/explicit <@> top-k stays index-backed;
+    # search_text() applies is_deleted / non-empty filters in SQL. The heavy
+    # sources (gmail/slack/messages/notes/whatsapp/transcripts/agent sessions)
+    # already have their bm25 indexes above; these add the remaining columns.
+    IndexSpec(
+        "gmail_attachments_filename_bm25_idx",
+        "gmail_attachments",
+        "CREATE INDEX IF NOT EXISTS gmail_attachments_filename_bm25_idx ON gmail_attachments USING bm25 (filename) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "slack_conversations_name_bm25_idx",
+        "slack_conversations",
+        "CREATE INDEX IF NOT EXISTS slack_conversations_name_bm25_idx ON slack_conversations USING bm25 (name) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "slack_conversations_topic_bm25_idx",
+        "slack_conversations",
+        "CREATE INDEX IF NOT EXISTS slack_conversations_topic_bm25_idx ON slack_conversations USING bm25 (topic) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "slack_conversations_purpose_bm25_idx",
+        "slack_conversations",
+        "CREATE INDEX IF NOT EXISTS slack_conversations_purpose_bm25_idx ON slack_conversations USING bm25 (purpose) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "slack_files_name_bm25_idx",
+        "slack_files",
+        "CREATE INDEX IF NOT EXISTS slack_files_name_bm25_idx ON slack_files USING bm25 (name) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "slack_files_title_bm25_idx",
+        "slack_files",
+        "CREATE INDEX IF NOT EXISTS slack_files_title_bm25_idx ON slack_files USING bm25 (title) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "apple_voice_memos_title_bm25_idx",
+        "apple_voice_memos_enrichments",
+        "CREATE INDEX IF NOT EXISTS apple_voice_memos_title_bm25_idx ON apple_voice_memos_enrichments USING bm25 (title) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "apple_voice_memos_summary_bm25_idx",
+        "apple_voice_memos_enrichments",
+        "CREATE INDEX IF NOT EXISTS apple_voice_memos_summary_bm25_idx ON apple_voice_memos_enrichments USING bm25 (summary) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "apple_voice_memos_participants_bm25_idx",
+        "apple_voice_memos_enrichments",
+        "CREATE INDEX IF NOT EXISTS apple_voice_memos_participants_bm25_idx ON apple_voice_memos_enrichments USING bm25 (participants_json) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "apple_voice_memos_action_items_bm25_idx",
+        "apple_voice_memos_enrichments",
+        "CREATE INDEX IF NOT EXISTS apple_voice_memos_action_items_bm25_idx ON apple_voice_memos_enrichments USING bm25 (action_items_json) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "apple_note_revisions_body_bm25_idx",
+        "apple_note_revisions",
+        "CREATE INDEX IF NOT EXISTS apple_note_revisions_body_bm25_idx ON apple_note_revisions USING bm25 (body_text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "whatsapp_chats_name_bm25_idx",
+        "whatsapp_chats",
+        "CREATE INDEX IF NOT EXISTS whatsapp_chats_name_bm25_idx ON whatsapp_chats USING bm25 (name) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "whatsapp_media_items_filename_bm25_idx",
+        "whatsapp_media_items",
+        "CREATE INDEX IF NOT EXISTS whatsapp_media_items_filename_bm25_idx ON whatsapp_media_items USING bm25 (filename) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "calendar_events_summary_bm25_idx",
+        "calendar_events",
+        "CREATE INDEX IF NOT EXISTS calendar_events_summary_bm25_idx ON calendar_events USING bm25 (summary) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "calendar_events_description_bm25_idx",
+        "calendar_events",
+        "CREATE INDEX IF NOT EXISTS calendar_events_description_bm25_idx ON calendar_events USING bm25 (description) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "calendar_events_location_bm25_idx",
+        "calendar_events",
+        "CREATE INDEX IF NOT EXISTS calendar_events_location_bm25_idx ON calendar_events USING bm25 (location) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "calendar_events_attendees_bm25_idx",
+        "calendar_events",
+        "CREATE INDEX IF NOT EXISTS calendar_events_attendees_bm25_idx ON calendar_events USING bm25 (attendees_json) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "contact_cards_name_bm25_idx",
+        "contact_cards",
+        "CREATE INDEX IF NOT EXISTS contact_cards_name_bm25_idx ON contact_cards USING bm25 (display_name) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "contact_cards_organization_bm25_idx",
+        "contact_cards",
+        "CREATE INDEX IF NOT EXISTS contact_cards_organization_bm25_idx ON contact_cards USING bm25 (organization) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "contact_cards_job_title_bm25_idx",
+        "contact_cards",
+        "CREATE INDEX IF NOT EXISTS contact_cards_job_title_bm25_idx ON contact_cards USING bm25 (job_title) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "contact_cards_notes_bm25_idx",
+        "contact_cards",
+        "CREATE INDEX IF NOT EXISTS contact_cards_notes_bm25_idx ON contact_cards USING bm25 (notes) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "agent_run_events_text_bm25_idx",
+        "agent_run_events",
+        "CREATE INDEX IF NOT EXISTS agent_run_events_text_bm25_idx ON agent_run_events USING bm25 (text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "agent_session_events_title_bm25_idx",
+        "agent_session_events",
+        "CREATE INDEX IF NOT EXISTS agent_session_events_title_bm25_idx ON agent_session_events USING bm25 (session_title) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "upstream_mutations_title_bm25_idx",
+        "upstream_mutations",
+        "CREATE INDEX IF NOT EXISTS upstream_mutations_title_bm25_idx ON upstream_mutations USING bm25 (title) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "upstream_mutation_requests_title_bm25_idx",
+        "upstream_mutation_requests",
+        "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_title_bm25_idx ON upstream_mutation_requests USING bm25 (title) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "upstream_mutation_requests_reason_bm25_idx",
+        "upstream_mutation_requests",
+        "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_reason_bm25_idx ON upstream_mutation_requests USING bm25 (reason) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
 )
 
 # Indexes that used to exist but have been superseded. Dropped idempotently
@@ -621,741 +783,6 @@ POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
     ("slack_messages_text_trgm_live_idx", "slack_messages"),
 )
 
-# ---------------------------------------------------------------------------
-# searchable_text coverage registry
-#
-# Every text-bearing column (text, text[], jsonb) of every warehouse table must
-# appear here, either as "view:<source>/<subsource>" (included in the
-# searchable_text view) or as a human-readable reason it is deliberately not
-# searchable. Two enforcement points keep this honest as the schema evolves:
-#
-#   1. validate_searchable_text_coverage() runs at module import and diffs this
-#      registry against POSTGRES_TABLES + _RAW_DDL_TEXT_COLUMNS. Adding or
-#      removing a table or text column in code without updating this registry
-#      (and the searchable_text view when relevant) fails everything at startup.
-#   2. PostgresWarehouse._assert_searchable_text_coverage() runs on every
-#      ensure_* call and diffs the registry against the LIVE database catalog,
-#      catching drift introduced by raw DDL, ad-hoc ALTERs, or legacy tables.
-#
-# If you are here because one of those checks failed: decide whether the new
-# column/table belongs in the searchable_text view. If yes, add a branch to
-# _ensure_search_views_if_possible AND a "view:..." entry here. If no, add an
-# exclusion entry with a real reason. Do not silence the check any other way.
-_C_ID = "identifier or foreign key"
-_C_ENUM = "status/enum/type marker"
-_C_OPS = "sync/operational state"
-_C_ERR = "operational error text"
-_C_RAW = "raw upstream payload mirror"
-_C_STORE = "content hash or object-storage pointer"
-_C_META = "non-content metadata (some surfaced as view context/who columns)"
-_C_DUP = "alternate representation of an included column"
-_C_IDENTITY = "identity field (name/email/phone), not free text"
-_C_FILEMETA = "attachment metadata; binary content not text-searchable"
-
-SEARCHABLE_TEXT_COVERAGE: dict[str, dict[str, str]] = {
-    "agent_session_events": {
-        "source": _C_ENUM,
-        "session_id": _C_ID,
-        "event_uuid": _C_ID,
-        "account": _C_ID,
-        "device": _C_META,
-        "role": _C_ENUM,
-        "event_type": _C_ENUM,
-        "subtype": _C_ENUM,
-        "parent_uuid": _C_ID,
-        "turn_id": _C_ID,
-        "model": _C_META,
-        "cwd": _C_META,
-        "git_branch": _C_META,
-        "git_commit": _C_ID,
-        "repo_url": _C_META,
-        "cli_version": _C_META,
-        "entrypoint": _C_ENUM,
-        "session_title": "view:agent_session/title",
-        "text": "view:agent_session/text",
-        "tool_name": _C_META,
-        "tool_input_json": _C_RAW,
-        "tool_result_json": _C_RAW,
-        "raw_json": _C_RAW,
-    },
-    "agent_run_events": {
-        "run_id": _C_ID,
-        "stream": _C_META,
-        "event_type": _C_META,
-        "event_json": _C_RAW,
-        "text": "view:agent/event",
-    },
-    "agent_run_tool_calls": {
-        "run_id": _C_ID,
-        "tool_name": _C_META,
-        "arguments_json": _C_RAW,
-        "result_json": _C_RAW,
-        "error": _C_ERR,
-    },
-    "agent_runs": {
-        "run_id": _C_ID,
-        "provider": _C_META,
-        "model": _C_META,
-        "task_type": _C_META,
-        "subject_id": _C_ID,
-        "prompt_version": _C_META,
-        "status": _C_ENUM,
-        "input_sha256": _C_STORE,
-        "final_output_json": "agent output; streamed text covered via agent_run_events.text",
-        "error": _C_ERR,
-    },
-    "apple_message_attachments": {
-        "account": _C_ID,
-        "attachment_id": _C_ID,
-        "message_id": _C_ID,
-        "guid": _C_ID,
-        "original_guid": _C_ID,
-        "filename": _C_FILEMETA,
-        "transfer_name": _C_FILEMETA,
-        "content_type": _C_ENUM,
-        "uti": _C_ENUM,
-        "mime_type": _C_ENUM,
-        "content_sha256": _C_STORE,
-        "error": _C_ERR,
-        "storage_backend": _C_STORE,
-        "storage_key": _C_STORE,
-        "storage_file_id": _C_STORE,
-        "storage_url": _C_STORE,
-        "raw_metadata_json": _C_RAW,
-    },
-    "apple_message_chat_handles": {
-        "account": _C_ID,
-        "chat_id": _C_ID,
-        "handle_id": _C_ID,
-        "raw_metadata_json": _C_RAW,
-    },
-    "apple_message_chat_messages": {
-        "account": _C_ID,
-        "chat_id": _C_ID,
-        "message_id": _C_ID,
-        "raw_metadata_json": _C_RAW,
-    },
-    "apple_message_chats": {
-        "account": _C_ID,
-        "chat_id": _C_ID,
-        "guid": _C_ID,
-        "chat_identifier": _C_ID,
-        "service_name": _C_ENUM,
-        "display_name": "chat name; message group_title is surfaced as imessage view context",
-        "room_name": _C_META,
-        "account_login": _C_ID,
-        "raw_metadata_json": _C_RAW,
-    },
-    "apple_message_handles": {
-        "account": _C_ID,
-        "handle_id": _C_ID,
-        "address": _C_IDENTITY,
-        "country": _C_ENUM,
-        "service": _C_ENUM,
-        "uncanonicalized_id": _C_IDENTITY,
-        "person_centric_id": _C_ID,
-        "raw_metadata_json": _C_RAW,
-    },
-    "apple_messages": {
-        "account": _C_ID,
-        "message_id": _C_ID,
-        "handle_id": _C_ID,
-        "service": _C_ENUM,
-        "message_account": _C_ID,
-        "body_text": "view:imessage/body",
-        "body_source": _C_ENUM,
-        "body_decode_status": _C_ENUM,
-        "body_decode_error": _C_ERR,
-        "attributed_body_sha256": _C_STORE,
-        "subject": "rarely-populated iMessage subject; body_text branch covers content",
-        "country": _C_ENUM,
-        "reply_to_guid": _C_ID,
-        "associated_message_guid": _C_ID,
-        "associated_message_emoji": _C_META,
-        "balloon_bundle_id": _C_META,
-        "group_title": _C_META,
-        "expressive_send_style_id": _C_META,
-        "raw_metadata_json": _C_RAW,
-    },
-    "apple_note_attachments": {
-        "account": _C_ID,
-        "note_id": _C_ID,
-        "revision_id": _C_ID,
-        "attachment_id": _C_ID,
-        "filename": _C_FILEMETA,
-        "content_type": _C_ENUM,
-        "content_sha256": _C_STORE,
-        "error": _C_ERR,
-        "storage_backend": _C_STORE,
-        "storage_key": _C_STORE,
-        "storage_file_id": _C_STORE,
-        "storage_url": _C_STORE,
-        "raw_metadata_json": _C_RAW,
-    },
-    "apple_note_revisions": {
-        "account": _C_ID,
-        "note_id": _C_ID,
-        "revision_id": _C_ID,
-        "title": "historic title surfaced as view who; current title included via apple_notes.title",
-        "folder_id": _C_ID,
-        "folder_path": _C_META,
-        "apple_account_id": _C_ID,
-        "apple_account_name": _C_META,
-        "body_text": "view:note/revision",
-        "body_html": _C_DUP,
-        "body_markdown": _C_DUP,
-        "content_sha256": _C_STORE,
-        "attachments_json": _C_RAW,
-        "storage_backend": _C_STORE,
-        "metadata_storage_key": _C_STORE,
-        "metadata_storage_file_id": _C_STORE,
-        "metadata_storage_url": _C_STORE,
-        "metadata_content_sha256": _C_STORE,
-        "html_storage_key": _C_STORE,
-        "html_storage_file_id": _C_STORE,
-        "html_storage_url": _C_STORE,
-        "html_content_sha256": _C_STORE,
-        "raw_metadata_json": _C_RAW,
-    },
-    "apple_notes": {
-        "account": _C_ID,
-        "note_id": _C_ID,
-        "latest_revision_id": _C_ID,
-        "title": "view:note/title",
-        "folder_id": _C_ID,
-        "folder_path": _C_META,
-        "apple_account_id": _C_ID,
-        "apple_account_name": _C_META,
-        "body_text": "view:note/body",
-        "body_html": _C_DUP,
-        "body_markdown": _C_DUP,
-        "content_sha256": _C_STORE,
-        "attachments_json": _C_RAW,
-        "storage_backend": _C_STORE,
-        "metadata_storage_key": _C_STORE,
-        "metadata_storage_file_id": _C_STORE,
-        "metadata_storage_url": _C_STORE,
-        "metadata_content_sha256": _C_STORE,
-        "html_storage_key": _C_STORE,
-        "html_storage_file_id": _C_STORE,
-        "html_storage_url": _C_STORE,
-        "html_content_sha256": _C_STORE,
-        "raw_metadata_json": _C_RAW,
-    },
-    "apple_voice_memos_enrichments": {
-        "account": _C_ID,
-        "recording_id": _C_ID,
-        "content_sha256": _C_STORE,
-        "provider": _C_META,
-        "model": _C_META,
-        "prompt_version": _C_META,
-        "status": _C_ENUM,
-        "error": _C_ERR,
-        "calendar_event_id": _C_ID,
-        "title": "view:transcript/title",
-        "participants_json": "view:transcript/participants",
-        "transcript": "view:transcript/transcript",
-        "summary": "view:transcript/summary",
-        "action_items_json": "view:transcript/action_items",
-        "evidence_json": _C_RAW,
-        "raw_result_json": _C_RAW,
-    },
-    "apple_voice_memos_files": {
-        "account": _C_ID,
-        "recording_id": _C_ID,
-        "title": "raw recording title; enriched meeting title included via apple_voice_memos_enrichments.title",
-        "original_path": _C_FILEMETA,
-        "filename": _C_FILEMETA,
-        "extension": _C_FILEMETA,
-        "content_type": _C_ENUM,
-        "content_sha256": _C_STORE,
-        "storage_backend": _C_STORE,
-        "storage_key": _C_STORE,
-        "storage_file_id": _C_STORE,
-        "storage_url": _C_STORE,
-        "metadata_storage_key": _C_STORE,
-        "metadata_storage_file_id": _C_STORE,
-        "metadata_storage_url": _C_STORE,
-        "metadata_content_sha256": _C_STORE,
-        "raw_metadata_json": _C_RAW,
-    },
-    "apple_voice_memos_transcript_segments": {
-        "account": _C_ID,
-        "recording_id": _C_ID,
-        "provider": _C_ID,
-        "provider_transcript_id": _C_ID,
-        "speaker_label": _C_META,
-        "text": "per-segment drill-down; the latest transcript per recording is searchable via the clean transcript views",
-        "words_json": _C_RAW,
-    },
-    "apple_voice_memos_transcription_runs": {
-        "account": _C_ID,
-        "recording_id": _C_ID,
-        "content_sha256": _C_STORE,
-        "provider": _C_META,
-        "provider_transcript_id": _C_ID,
-        "model": _C_META,
-        "status": _C_ENUM,
-        "error": _C_ERR,
-        "transcript_text": _C_DUP,
-        "raw_result_json": _C_RAW,
-    },
-    "calendar_events": {
-        "account": _C_ID,
-        "calendar_id": _C_ID,
-        "event_id": _C_ID,
-        "recurring_event_id": _C_ID,
-        "i_cal_uid": _C_ID,
-        "status": _C_ENUM,
-        "summary": "view:calendar/summary",
-        "description": "view:calendar/description",
-        "location": "view:calendar/location",
-        "creator_email": _C_IDENTITY,
-        "organizer_email": _C_IDENTITY,
-        "start_date": _C_META,
-        "end_date": _C_META,
-        "html_link": _C_META,
-        "attendees_json": "view:calendar/attendees",
-        "reminders_json": _C_RAW,
-        "recurrence": _C_META,
-        "event_type": _C_ENUM,
-        "raw_json": _C_RAW,
-    },
-    "calendar_sync_state": {
-        "account": _C_ID,
-        "calendar_id": _C_ID,
-        "sync_token": _C_OPS,
-        "last_sync_type": _C_ENUM,
-        "status": _C_ENUM,
-        "error": _C_ERR,
-    },
-    "contact_cards": {
-        "source": _C_ID,
-        "account": _C_ID,
-        "source_kind": _C_ID,
-        "address_book_id": _C_ID,
-        "card_id": _C_ID,
-        "etag": _C_ID,
-        "source_uid": _C_ID,
-        "display_name": "view:contact/name",
-        "given_name": _C_DUP,
-        "family_name": _C_DUP,
-        "organization": "view:contact/organization",
-        "job_title": "view:contact/job_title",
-        "primary_email": _C_IDENTITY,
-        "primary_phone": _C_IDENTITY,
-        "emails": _C_IDENTITY,
-        "phones": _C_IDENTITY,
-        "addresses": _C_IDENTITY,
-        "organizations": _C_RAW,
-        "urls": _C_META,
-        "groups": _C_META,
-        "dates": _C_META,
-        "photos": _C_META,
-        "notes": "view:contact/notes",
-        "raw_json": _C_RAW,
-    },
-    "contact_sync_state": {
-        "source": _C_ID,
-        "account": _C_ID,
-        "source_kind": _C_ID,
-        "address_book_id": _C_ID,
-        "sync_token": _C_OPS,
-        "last_sync_type": _C_ENUM,
-        "status": _C_ENUM,
-        "error": _C_ERR,
-    },
-    "gmail_attachment_backfill_state": {
-        "account": _C_ID,
-        "message_id": _C_ID,
-        "status": _C_ENUM,
-        "error": _C_ERR,
-        "ai_provider": _C_META,
-        "ai_model": _C_META,
-        "ai_prompt_version": _C_META,
-    },
-    "gmail_attachment_enrichments": {
-        "content_sha256": _C_STORE,
-        "ai_provider": _C_META,
-        "ai_model": _C_META,
-        "ai_prompt_version": _C_META,
-        "text": "view:gmail_attachment/content",
-        "text_extraction_status": _C_ENUM,
-        "text_extraction_error": _C_ERR,
-        "ai_base_url": _C_META,
-        "ai_prompt_sha256": _C_STORE,
-        "ai_prompt": "enrichment prompt, not user content",
-        "ai_source_status": _C_ENUM,
-    },
-    "gmail_attachments": {
-        "account": _C_ID,
-        "message_id": _C_ID,
-        "thread_id": _C_ID,
-        "part_id": _C_ID,
-        "attachment_id": _C_ID,
-        "filename": "view:gmail_attachment/filename",
-        "mime_type": _C_ENUM,
-        "content_id": _C_ID,
-        "content_disposition": _C_META,
-        "content_sha256": _C_STORE,
-        "part_json": _C_RAW,
-        "storage_backend": _C_STORE,
-        "storage_key": _C_STORE,
-        "storage_file_id": _C_STORE,
-        "storage_url": _C_STORE,
-        "storage_status": _C_ENUM,
-    },
-    "gmail_messages": {
-        "account": _C_ID,
-        "message_id": _C_ID,
-        "thread_id": _C_ID,
-        "label_ids": _C_META,
-        "snippet": _C_DUP,
-        "subject": "view:gmail/subject",
-        "from_address": _C_IDENTITY,
-        "to_addresses": _C_IDENTITY,
-        "cc_addresses": _C_IDENTITY,
-        "bcc_addresses": _C_IDENTITY,
-        "delivered_to": _C_IDENTITY,
-        "rfc822_message_id": _C_ID,
-        "date_header": _C_META,
-        "body_text": "view:gmail/body",
-        "body_html": _C_DUP,
-        "body_markdown": _C_DUP,
-        "body_markdown_full": _C_DUP,
-        "body_markdown_clean": _C_DUP,
-        "payload_json": _C_RAW,
-    },
-    "gmail_sync_state": {
-        "account": _C_ID,
-        "last_sync_type": _C_ENUM,
-        "status": _C_ENUM,
-        "error": _C_ERR,
-    },
-    "slack_account_identities": {
-        "account": _C_ID,
-        "team_id": _C_ID,
-        "user_id": _C_ID,
-        "team_name": _C_META,
-        "url": _C_META,
-        "raw_json": _C_RAW,
-    },
-    "slack_account_state_item_rows": {
-        "source": _C_ID,
-        "account": _C_ID,
-        "scope_id": _C_ID,
-        "item_id": _C_ID,
-        "item_type": _C_ENUM,
-        "item_state": _C_ENUM,
-        "container_id": _C_ID,
-        "container_name": _C_META,
-        "thread_id": _C_ID,
-        "message_id": _C_ID,
-        "actor_id": _C_ID,
-        "actor_name": _C_META,
-        "title": "derived inbox state; underlying messages are included",
-        "preview": "derived inbox state; underlying messages are included",
-        "reason": "derived inbox state; underlying messages are included",
-        "source_table": _C_META,
-        "drilldown_hint": _C_META,
-    },
-    "slack_conversation_members": {
-        "account": _C_ID,
-        "team_id": _C_ID,
-        "conversation_id": _C_ID,
-        "user_id": _C_ID,
-    },
-    "slack_conversation_stats": {
-        "account": _C_ID,
-        "team_id": _C_ID,
-        "conversation_id": _C_ID,
-    },
-    "slack_conversations": {
-        "account": _C_ID,
-        "team_id": _C_ID,
-        "conversation_id": _C_ID,
-        "conversation_type": _C_ENUM,
-        "name": "view:slack_channel/name",
-        "creator": _C_ID,
-        "topic": "view:slack_channel/topic",
-        "purpose": "view:slack_channel/purpose",
-        "raw_json": _C_RAW,
-    },
-    "slack_files": {
-        "account": _C_ID,
-        "team_id": _C_ID,
-        "file_id": _C_ID,
-        "conversation_id": _C_ID,
-        "message_ts": _C_ID,
-        "user_id": _C_ID,
-        "name": "view:slack_file/name",
-        "title": "view:slack_file/title",
-        "mimetype": _C_ENUM,
-        "filetype": _C_ENUM,
-        "url_private": _C_META,
-        "raw_json": _C_RAW,
-    },
-    "slack_message_reactions": {
-        "account": _C_ID,
-        "team_id": _C_ID,
-        "conversation_id": _C_ID,
-        "message_ts": _C_ID,
-        "reaction_name": _C_META,
-        "user_id": _C_ID,
-        "raw_json": _C_RAW,
-    },
-    "slack_messages": {
-        "account": _C_ID,
-        "team_id": _C_ID,
-        "conversation_id": _C_ID,
-        "message_ts": _C_ID,
-        "thread_ts": _C_ID,
-        "parent_message_ts": _C_ID,
-        "user_id": _C_ID,
-        "bot_id": _C_ID,
-        "username": _C_DUP,
-        "type": _C_ENUM,
-        "subtype": _C_ENUM,
-        "text": "view:slack/message",
-        "blocks_json": _C_RAW,
-        "attachments_json": _C_RAW,
-        "latest_reply_ts": _C_ID,
-        "edited_ts": _C_ID,
-        "client_msg_id": _C_ID,
-        "raw_json": _C_RAW,
-    },
-    "slack_sync_state": {
-        "account": _C_ID,
-        "team_id": _C_ID,
-        "object_type": _C_ENUM,
-        "object_id": _C_ID,
-        "cursor_ts": _C_OPS,
-        "last_sync_type": _C_ENUM,
-        "status": _C_ENUM,
-        "error": _C_ERR,
-    },
-    "slack_teams": {
-        "account": _C_ID,
-        "team_id": _C_ID,
-        "team_name": _C_META,
-        "domain": _C_META,
-        "enterprise_id": _C_ID,
-        "raw_json": _C_RAW,
-    },
-    "slack_users": {
-        "account": _C_ID,
-        "team_id": _C_ID,
-        "user_id": _C_ID,
-        "team_user_id": _C_ID,
-        "name": _C_IDENTITY,
-        "real_name": _C_IDENTITY,
-        "display_name": _C_IDENTITY,
-        "email": _C_IDENTITY,
-        "tz": _C_META,
-        "raw_json": _C_RAW,
-    },
-    "upstream_mutation_events": {
-        "mutation_id": _C_ID,
-        "event_type": _C_ENUM,
-        "actor_type": _C_ENUM,
-        "actor_id": _C_ID,
-        "event_json": _C_RAW,
-    },
-    "upstream_mutation_request_events": {
-        "request_id": _C_ID,
-        "event_type": _C_ENUM,
-        "actor_type": _C_ENUM,
-        "actor_id": _C_ID,
-        "event_json": _C_RAW,
-    },
-    "upstream_mutation_requests": {
-        "id": _C_ID,
-        "status": _C_ENUM,
-        "title": "view:mutation_request/title",
-        "reason": "view:mutation_request/reason",
-        "context_json": _C_RAW,
-        "result_json": _C_RAW,
-        "error": _C_ERR,
-        "idempotency_key": _C_ID,
-        "requested_by": _C_META,
-        "approved_by": _C_META,
-    },
-    "upstream_mutations": {
-        "id": _C_ID,
-        "request_id": _C_ID,
-        "provider": _C_META,
-        "operation": _C_META,
-        "account": _C_ID,
-        "status": _C_ENUM,
-        "title": "view:mutation/title",
-        "reason": "review rationale; title and payload branches cover search needs",
-        "payload_json": "view:mutation/payload",
-        "preview_json": _C_RAW,
-        "result_json": _C_RAW,
-        "error": _C_ERR,
-        "idempotency_key": _C_ID,
-        "requested_by": _C_META,
-        "approved_by": _C_META,
-        "claimed_by": _C_META,
-    },
-    "whatsapp_chats": {
-        "account": _C_ID,
-        "chat_id": _C_ID,
-        "name": "view:whatsapp_chat/name",
-        "chat_type": _C_ENUM,
-        "raw_metadata_json": _C_RAW,
-    },
-    "whatsapp_chat_participants": {
-        "account": _C_ID,
-        "chat_id": _C_ID,
-        "participant_jid": _C_ID,
-        "phone_jid": _C_ID,
-        "lid_jid": _C_ID,
-        "display_name": _C_IDENTITY,
-        "raw_metadata_json": _C_RAW,
-    },
-    "whatsapp_contacts": {
-        "account": _C_ID,
-        "jid": _C_ID,
-        "push_name": _C_IDENTITY,
-        "first_name": _C_IDENTITY,
-        "full_name": _C_IDENTITY,
-        "business_name": _C_IDENTITY,
-        "raw_metadata_json": _C_RAW,
-    },
-    "whatsapp_media_items": {
-        "account": _C_ID,
-        "chat_id": _C_ID,
-        "message_id": _C_ID,
-        "media_type": _C_ENUM,
-        "filename": "view:whatsapp_media/filename",
-        "mime_type": _C_ENUM,
-        "file_sha256": _C_STORE,
-        "content_sha256": _C_STORE,
-        "error": _C_ERR,
-        "storage_backend": _C_STORE,
-        "storage_key": _C_STORE,
-        "storage_file_id": _C_STORE,
-        "storage_url": _C_STORE,
-        "raw_metadata_json": _C_RAW,
-    },
-    "whatsapp_messages": {
-        "account": _C_ID,
-        "chat_id": _C_ID,
-        "message_id": _C_ID,
-        "sender_jid": _C_ID,
-        "push_name": _C_IDENTITY,
-        "body_text": "view:whatsapp/body",
-        "message_kind": _C_ENUM,
-        "media_type": _C_ENUM,
-        "quoted_message_id": _C_ID,
-        "raw_metadata_json": _C_RAW,
-    },
-    "whatsapp_client_sessions": {
-        "account": _C_ID,
-        "session_key": _C_ID,
-        "client_id": _C_ID,
-        "database_sha256": _C_STORE,
-    },
-}
-
-# Text-bearing columns of tables created via raw DDL in
-# ensure_upstream_mutation_tables (not represented in POSTGRES_TABLES). The
-# live-catalog check still covers them; this static list lets the import-time
-# check cover them too.
-_RAW_DDL_TEXT_COLUMNS: dict[str, frozenset[str]] = {
-    "upstream_mutation_requests": frozenset(
-        {
-            "id",
-            "status",
-            "title",
-            "reason",
-            "context_json",
-            "result_json",
-            "error",
-            "idempotency_key",
-            "requested_by",
-            "approved_by",
-        }
-    ),
-    "upstream_mutations": frozenset(
-        {
-            "id",
-            "request_id",
-            "provider",
-            "operation",
-            "account",
-            "status",
-            "title",
-            "reason",
-            "payload_json",
-            "preview_json",
-            "result_json",
-            "error",
-            "idempotency_key",
-            "requested_by",
-            "approved_by",
-            "claimed_by",
-        }
-    ),
-    "upstream_mutation_events": frozenset(
-        {"mutation_id", "event_type", "actor_type", "actor_id", "event_json"}
-    ),
-    "upstream_mutation_request_events": frozenset(
-        {"request_id", "event_type", "actor_type", "actor_id", "event_json"}
-    ),
-    "whatsapp_client_sessions": frozenset(
-        {"account", "session_key", "client_id", "database_sha256"}
-    ),
-}
-
-_SEARCHABLE_TYPE_NAMES = ("text", "text[]", "jsonb")
-
-
-def _coverage_problems_for(table: str, text_columns: set[str]) -> list[str]:
-    registered = SEARCHABLE_TEXT_COVERAGE.get(table)
-    if registered is None:
-        return [
-            f"table {table!r} has text columns {sorted(text_columns)} but no SEARCHABLE_TEXT_COVERAGE entry"
-        ]
-    problems = [
-        f"new text column {table}.{column} is not acknowledged in SEARCHABLE_TEXT_COVERAGE"
-        for column in sorted(text_columns - registered.keys())
-    ]
-    problems.extend(
-        f"SEARCHABLE_TEXT_COVERAGE lists {table}.{column}, which no longer exists"
-        for column in sorted(registered.keys() - text_columns)
-    )
-    return problems
-
-
-def validate_searchable_text_coverage() -> None:
-    """Fail loudly at import time if the schema in code and the coverage registry diverge."""
-    problems: list[str] = []
-    expected_tables: dict[str, set[str]] = {
-        table: {
-            column
-            for column in spec.columns
-            if _postgres_type(column, table=table) in _SEARCHABLE_TYPE_NAMES
-        }
-        for table, spec in POSTGRES_TABLES.items()
-    }
-    for table, columns in _RAW_DDL_TEXT_COLUMNS.items():
-        expected_tables[table] = set(columns)
-    for table, text_columns in sorted(expected_tables.items()):
-        problems.extend(_coverage_problems_for(table, text_columns))
-    for table in sorted(SEARCHABLE_TEXT_COVERAGE.keys() - expected_tables.keys()):
-        problems.append(
-            f"SEARCHABLE_TEXT_COVERAGE lists table {table!r}, which is not defined in "
-            "POSTGRES_TABLES or _RAW_DDL_TEXT_COLUMNS (was it deleted?)"
-        )
-    if problems:
-        raise RuntimeError(
-            "searchable_text coverage registry is out of date with the warehouse schema.\n"
-            "Every text-bearing column must be either included in the searchable_text view "
-            "or explicitly excluded with a reason (see SEARCHABLE_TEXT_COVERAGE in postgres.py).\n- "
-            + "\n- ".join(problems)
-        )
 
 
 POSTGRES_INSERT_PAGE_SIZES = {
@@ -1619,8 +1046,8 @@ class PostgresWarehouse:
                 "apple_message_attachments",
             ]
         )
-        # The WhatsApp tables ride along here so the searchable_text view,
-        # which references them, stays recreatable on deployments where the
+        # The WhatsApp tables ride along here so the search_text() function,
+        # whose gate references them, stays recreatable on deployments where the
         # WhatsApp ingest has not run yet.
         self._ensure_table_group(_WHATSAPP_TABLES)
         self._ensure_search_views_if_possible()
@@ -1861,6 +1288,12 @@ class PostgresWarehouse:
             "CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON upstream_mutation_events (mutation_id, event_index)",
         ):
             self._command(sql)
+        # These raw-DDL tables also carry BM25 IndexSpecs (for search_text); build
+        # them through _ensure_indexes so they get the pg_textsearch bootstrap and
+        # graceful-skip on hosts without the extension.
+        self._ensure_indexes(
+            ["upstream_mutations", "upstream_mutation_requests"]
+        )
         self._ensure_search_views_if_possible()
 
     def gmail_archive_thread_previews(self, *, account: str, thread_ids: Sequence[str]) -> list[dict[str, Any]]:
@@ -5265,12 +4698,7 @@ class PostgresWarehouse:
         "whatsapp_contacts",
         "whatsapp_media_items",
         "apple_voice_memos_enrichments",
-        "apple_voice_memos_files",
         "calendar_events",
-        # The transcript branches read the clean transcript views (latest
-        # enrichment per recording) rather than the raw enrichments table.
-        "clean_calendar_with_transcripts",
-        "clean_transcripts_no_calendar_match",
         "contact_cards",
         "agent_run_events",
         "agent_session_events",
@@ -5278,236 +4706,332 @@ class PostgresWarehouse:
         "upstream_mutation_requests",
     )
 
-    def _assert_searchable_text_coverage_live(self) -> None:
-        """Diff SEARCHABLE_TEXT_COVERAGE against the live catalog; fail loudly on drift.
-
-        Complements the import-time validate_searchable_text_coverage(): this
-        side catches schema changes that never went through POSTGRES_TABLES or
-        _RAW_DDL_TEXT_COLUMNS (ad-hoc ALTERs, raw DDL, legacy tables). Tables
-        that do not exist yet are skipped so partial test schemas and staged
-        rollouts still work; their code-side definitions are already enforced
-        at import time.
-        """
-        rows = self._query(
-            """
-            SELECT c.relname, a.attname
-            FROM pg_class AS c
-            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
-            INNER JOIN pg_attribute AS a ON a.attrelid = c.oid
-            INNER JOIN pg_type AS t ON t.oid = a.atttypid
-            WHERE n.nspname = current_schema()
-              AND c.relkind = 'r'
-              AND a.attnum > 0
-              AND NOT a.attisdropped
-              AND t.typname IN ('text', '_text', 'jsonb')
-            """
-        )
-        live: dict[str, set[str]] = {}
-        for table, column in rows:
-            live.setdefault(table, set()).add(column)
-        problems: list[str] = []
-        for table, text_columns in sorted(live.items()):
-            problems.extend(_coverage_problems_for(table, text_columns))
-        if problems:
-            raise RuntimeError(
-                "searchable_text coverage registry is out of date with the LIVE database schema.\n"
-                "Every text-bearing column must be either included in the searchable_text view "
-                "or explicitly excluded with a reason (see SEARCHABLE_TEXT_COVERAGE in postgres.py).\n- "
-                + "\n- ".join(problems)
-            )
-
     def _ensure_search_views_if_possible(self) -> None:
-        self._assert_searchable_text_coverage_live()
         # The person_identities view was removed; drop any copy left behind by
         # deployments that created it.
         self._command("DROP VIEW IF EXISTS person_identities")
+        # The legacy cross-source searchable_text view (a ~30-branch UNION that
+        # callers scanned with ILIKE/~*, often OR-ing the un-indexable computed
+        # `who` column, and which therefore timed out) has been replaced by the
+        # BM25 search_text() function. Drop any copy older deployments left
+        # behind so it cannot be used as a slow fallback.
+        self._command("DROP VIEW IF EXISTS searchable_text")
         if all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
-            # One row per (source table, text column) acknowledged as "view:" in
-            # SEARCHABLE_TEXT_COVERAGE. Each branch exposes its text as a bare
-            # column reference so search predicates push down through the
-            # UNION ALL and use that table's trgm index where one exists.
-            # Ranked BM25 search stays per-table (pg_textsearch cannot serve
-            # <@> through a view).
-            self._command(
-                """
-                CREATE OR REPLACE VIEW searchable_text AS
-                WITH clean_transcripts AS (
-                    -- Canonical transcript layer: the clean views already pick
-                    -- the latest enrichment per recording, so search never sees
-                    -- stale prompt-version duplicates or intermediate tables.
-                    SELECT recording_account AS account, recording_id, title,
-                           organizer_email AS who, start_at,
-                           participants_json, transcript, summary, action_items_json
-                    FROM clean_calendar_with_transcripts
-                    UNION ALL
-                    SELECT account, recording_id, title, ''::text, start_at,
-                           participants_json, transcript, summary, action_items_json
-                    FROM clean_transcripts_no_calendar_match
-                )
-                SELECT 'gmail'::text AS source, 'subject'::text AS subsource, ''::text AS context,
-                       from_address AS who, internal_date AS occurred_at, account,
-                       account || ':' || message_id AS ref, subject AS text
-                FROM gmail_messages WHERE is_deleted = 0
-                UNION ALL
-                SELECT 'gmail', 'body', '', from_address, internal_date, account,
-                       account || ':' || message_id, body_text
-                FROM gmail_messages WHERE is_deleted = 0
-                UNION ALL
-                SELECT 'gmail_attachment', 'content', a.filename, '', a.internal_date, a.account,
-                       a.account || ':' || a.message_id || ':' || a.content_sha256, e.text
-                FROM gmail_attachment_enrichments e
-                JOIN gmail_attachments a USING (content_sha256)
-                WHERE a.is_deleted = 0
-                UNION ALL
-                SELECT 'gmail_attachment', 'filename', mime_type, '', internal_date, account,
-                       account || ':' || message_id || ':' || content_sha256, filename
-                FROM gmail_attachments WHERE is_deleted = 0
-                UNION ALL
-                SELECT 'slack', c.conversation_type, c.name,
-                       COALESCE(NULLIF(u.real_name, ''), NULLIF(u.name, ''), m.user_id),
-                       m.message_datetime, m.account,
-                       m.team_id || ':' || m.conversation_id || ':' || m.message_ts, m.text
-                FROM slack_messages m
-                JOIN slack_conversations c
-                  ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id
-                LEFT JOIN slack_users u
-                  ON u.account = m.account AND u.team_id = m.team_id AND u.user_id = m.user_id
-                WHERE m.is_deleted = 0
-                UNION ALL
-                SELECT 'slack_channel', 'name', conversation_type, '', synced_at, account,
-                       team_id || ':' || conversation_id, name
-                FROM slack_conversations
-                UNION ALL
-                SELECT 'slack_channel', 'topic', name, '', synced_at, account,
-                       team_id || ':' || conversation_id, topic
-                FROM slack_conversations WHERE topic != ''
-                UNION ALL
-                SELECT 'slack_channel', 'purpose', name, '', synced_at, account,
-                       team_id || ':' || conversation_id, purpose
-                FROM slack_conversations WHERE purpose != ''
-                UNION ALL
-                SELECT 'slack_file', 'name', mimetype, user_id, created_at, account,
-                       team_id || ':' || file_id, name
-                FROM slack_files WHERE is_deleted = 0
-                UNION ALL
-                SELECT 'slack_file', 'title', mimetype, user_id, created_at, account,
-                       team_id || ':' || file_id, title
-                FROM slack_files WHERE is_deleted = 0 AND title != ''
-                UNION ALL
-                SELECT 'transcript', 'transcript', title, who, start_at, account, recording_id, transcript
-                FROM clean_transcripts WHERE transcript != ''
-                UNION ALL
-                SELECT 'transcript', 'title', '', who, start_at, account, recording_id, title
-                FROM clean_transcripts WHERE title != ''
-                UNION ALL
-                SELECT 'transcript', 'summary', title, who, start_at, account, recording_id, summary
-                FROM clean_transcripts WHERE summary != ''
-                UNION ALL
-                SELECT 'transcript', 'participants', title, who, start_at, account, recording_id, participants_json
-                FROM clean_transcripts WHERE participants_json NOT IN ('', '[]')
-                UNION ALL
-                SELECT 'transcript', 'action_items', title, who, start_at, account, recording_id, action_items_json
-                FROM clean_transcripts WHERE action_items_json NOT IN ('', '[]')
-                UNION ALL
-                SELECT 'note', 'title', folder_path, title, modified_at, account, note_id, title
-                FROM apple_notes WHERE is_deleted = 0
-                UNION ALL
-                SELECT 'note', 'body', folder_path, title, modified_at, account, note_id, body_text
-                FROM apple_notes WHERE is_deleted = 0
-                UNION ALL
-                SELECT 'note', 'revision', folder_path, title, modified_at, account,
-                       note_id || '@' || revision_id, body_text
-                FROM apple_note_revisions
-                UNION ALL
-                SELECT 'imessage', m.service, m.group_title,
-                       CASE WHEN m.is_from_me = 1 THEN 'me' ELSE COALESCE(h.address, '') END,
-                       m.message_at, m.account, m.message_id, m.body_text
-                FROM apple_messages m
-                LEFT JOIN apple_message_handles h
-                  ON h.account = m.account AND h.handle_id = m.handle_id
-                WHERE m.is_deleted = 0
-                UNION ALL
-                SELECT 'whatsapp', 'body', COALESCE(NULLIF(c.name, ''), m.chat_id),
-                       CASE WHEN m.is_from_me = 1 THEN 'me'
-                            ELSE COALESCE(NULLIF(ct.full_name, ''), NULLIF(ct.push_name, ''),
-                                          NULLIF(m.push_name, ''), m.sender_jid) END,
-                       m.message_at, m.account, m.chat_id || ':' || m.message_id, m.body_text
-                FROM whatsapp_messages m
-                LEFT JOIN whatsapp_chats c
-                  ON c.account = m.account AND c.chat_id = m.chat_id
-                LEFT JOIN whatsapp_contacts ct
-                  ON ct.account = m.account AND ct.jid = m.sender_jid
-                WHERE m.is_deleted = 0
-                UNION ALL
-                SELECT 'whatsapp_chat', 'name', chat_type, '', last_message_at, account,
-                       chat_id, name
-                FROM whatsapp_chats WHERE name != ''
-                UNION ALL
-                SELECT 'whatsapp_media', 'filename', mime_type, '', message_at, account,
-                       chat_id || ':' || message_id, filename
-                FROM whatsapp_media_items WHERE filename != ''
-                UNION ALL
-                SELECT 'calendar', 'summary', '', organizer_email, start_at, account,
-                       calendar_id || ':' || event_id, summary
-                FROM calendar_events WHERE is_deleted = 0
-                UNION ALL
-                SELECT 'calendar', 'description', summary, organizer_email, start_at, account,
-                       calendar_id || ':' || event_id, description
-                FROM calendar_events WHERE is_deleted = 0 AND description != ''
-                UNION ALL
-                SELECT 'calendar', 'location', summary, organizer_email, start_at, account,
-                       calendar_id || ':' || event_id, location
-                FROM calendar_events WHERE is_deleted = 0 AND location != ''
-                UNION ALL
-                SELECT 'calendar', 'attendees', summary, organizer_email, start_at, account,
-                       calendar_id || ':' || event_id, attendees_json
-                FROM calendar_events WHERE is_deleted = 0 AND attendees_json NOT IN ('', '[]')
-                UNION ALL
-                SELECT 'contact', 'name', source_kind, primary_email, source_updated_at, account,
-                       card_id, display_name
-                FROM contact_cards WHERE is_deleted = 0
-                UNION ALL
-                SELECT 'contact', 'organization', display_name, primary_email, source_updated_at, account,
-                       card_id, organization
-                FROM contact_cards WHERE is_deleted = 0 AND organization != ''
-                UNION ALL
-                SELECT 'contact', 'job_title', display_name, primary_email, source_updated_at, account,
-                       card_id, job_title
-                FROM contact_cards WHERE is_deleted = 0 AND job_title != ''
-                UNION ALL
-                SELECT 'contact', 'notes', display_name, primary_email, source_updated_at, account,
-                       card_id, notes
-                FROM contact_cards WHERE is_deleted = 0 AND notes != ''
-                UNION ALL
-                SELECT 'agent', event_type, stream, run_id, created_at, '',
-                       run_id || ':' || event_index::text, text
-                FROM agent_run_events
-                UNION ALL
-                SELECT 'agent_session', source, role, account, occurred_at, account,
-                       source || ':' || session_id || ':' || event_uuid, text
-                FROM agent_session_events
-                WHERE text != '' AND role IN ('user', 'assistant')
-                UNION ALL
-                SELECT 'agent_session', 'title', source, account, occurred_at, account,
-                       source || ':' || session_id || ':' || event_uuid || ':title', session_title
-                FROM agent_session_events
-                WHERE session_title != ''
-                UNION ALL
-                SELECT 'mutation', status, operation, requested_by, created_at, account, id, title
-                FROM upstream_mutations
-                UNION ALL
-                SELECT 'mutation', status, operation, requested_by, created_at, account,
-                       id || ':payload', payload_json::text
-                FROM upstream_mutations
-                UNION ALL
-                SELECT 'mutation_request', status, '', requested_by, created_at, '', id, title
-                FROM upstream_mutation_requests
-                UNION ALL
-                SELECT 'mutation_request', status, title, requested_by, created_at, '',
-                       id || ':reason', reason
-                FROM upstream_mutation_requests WHERE reason != ''
-                """
+            self._ensure_search_text_function()
+
+    def _ensure_search_text_function(self) -> None:
+        # search_text() is the single, default cross-source search path. It fans
+        # out to the per-table BM25 (pg_textsearch) indexes — one index-backed
+        # top-k scan per source/column (ORDER BY col <@> to_bm25query(...) LIMIT
+        # n) — then merges and re-ranks. This replaces the old searchable_text
+        # view: pg_textsearch's <@> operator cannot run through a view, so broad
+        # cross-source searches used to fall back to ILIKE/~* full scans over the
+        # whole UNION and time out.
+        #
+        # Output is (source, subsource, context, who, occurred_at, account, ref,
+        # text, score); drill into the underlying table via `ref` for full rows.
+        # Coverage mirrors what the old view searched — every BM25-indexable text
+        # column across gmail, slack, attachments, transcripts, notes, imessage,
+        # whatsapp, calendar, contacts, agent runs/sessions, and mutations. The
+        # only deliberate omission is upstream_mutations.payload_json (raw jsonb;
+        # a structured blob with marginal full-text value); the mutation title is
+        # still covered. Transcript branches read the raw enrichments table (where
+        # the BM25 index lives) rather than the de-duplicated clean view, so they
+        # can surface more than one prompt-version row per recording.
+        #
+        # Two pg_textsearch facts shape the SQL: (1) the explicit
+        # to_bm25query('query', 'index_name') form names the index directly, so it
+        # works regardless of search_path schema (the implicit col <@> 'query'
+        # form only resolves indexes in the default schema); (2) BM25 scores are
+        # per-corpus, so cross-source ranking is approximate — good for recall
+        # ("find every mention"), not a global relevance guarantee. Requires
+        # `public` on search_path for the operator/helpers (true in production).
+
+        def branch(
+            source: str,
+            subsource: str,
+            context: str,
+            who: str,
+            occurred: str,
+            account: str,
+            ref: str,
+            from_sql: str,
+            col: str,
+            idx: str,
+            where: str = "",
+        ) -> str:
+            # One bm25-indexed text column -> one index-backed top-k subquery.
+            where_sql = f" WHERE {where}" if where else ""
+            rank = f"{col} <@> to_bm25query(%1$L, '{idx}')"
+            return (
+                f"( SELECT {source} AS source, {subsource} AS subsource, "
+                f"{context} AS context, {who} AS who, {occurred} AS occurred_at, "
+                f"{account} AS account, {ref} AS ref, {col} AS text, "
+                f"({rank})::real AS score "
+                f"FROM {from_sql}{where_sql} ORDER BY {rank} LIMIT %2$s )"
             )
+
+        def join_branch(select_sql: str, inner_sql: str, joins_sql: str, where: str = "") -> str:
+            # Branches whose metadata needs joins keep the bm25 top-k on the base
+            # table (inner_sql), then join for context/who; the join runs over
+            # only the top-k rows.
+            where_sql = f" WHERE {where}" if where else ""
+            return f"( {select_sql} FROM ( {inner_sql} ) m {joins_sql}{where_sql} )"
+
+        branches = [
+            branch(
+                "'gmail'::text", "'subject'::text", "''::text", "from_address",
+                "internal_date", "account", "account || ':' || message_id",
+                "gmail_messages", "subject", "gmail_messages_subject_bm25_idx",
+                where="is_deleted = 0",
+            ),
+            branch(
+                "'gmail'", "'body'", "''", "from_address", "internal_date", "account",
+                "account || ':' || message_id", "gmail_messages", "body_text",
+                "gmail_messages_body_text_bm25_idx", where="is_deleted = 0",
+            ),
+            # gmail attachment content: bm25 top-k on enrichment text, then join
+            # the attachment row for filename/account/date.
+            join_branch(
+                "SELECT 'gmail_attachment' AS source, 'content' AS subsource, a.filename AS context, "
+                "'' AS who, a.internal_date AS occurred_at, a.account AS account, "
+                "a.account || ':' || a.message_id || ':' || a.content_sha256 AS ref, "
+                "m.text AS text, m.score AS score",
+                "SELECT content_sha256, text, "
+                "(text <@> to_bm25query(%1$L, 'gmail_attachment_enrichments_text_bm25_idx'))::real AS score "
+                "FROM gmail_attachment_enrichments "
+                "ORDER BY text <@> to_bm25query(%1$L, 'gmail_attachment_enrichments_text_bm25_idx') LIMIT %2$s",
+                "JOIN gmail_attachments a USING (content_sha256)",
+                where="a.is_deleted = 0",
+            ),
+            branch(
+                "'gmail_attachment'", "'filename'", "mime_type", "''", "internal_date", "account",
+                "account || ':' || message_id || ':' || content_sha256", "gmail_attachments",
+                "filename", "gmail_attachments_filename_bm25_idx", where="is_deleted = 0",
+            ),
+            # slack message: bm25 top-k on the message text, then join conversation
+            # (for name/type) and user (for who).
+            join_branch(
+                "SELECT 'slack' AS source, c.conversation_type AS subsource, c.name AS context, "
+                "COALESCE(NULLIF(u.real_name, ''), NULLIF(u.name, ''), m.user_id) AS who, "
+                "m.message_datetime AS occurred_at, m.account AS account, "
+                "m.team_id || ':' || m.conversation_id || ':' || m.message_ts AS ref, "
+                "m.text AS text, m.score AS score",
+                "SELECT account, team_id, conversation_id, user_id, message_ts, message_datetime, text, "
+                "(text <@> to_bm25query(%1$L, 'slack_messages_text_bm25_idx'))::real AS score "
+                "FROM slack_messages WHERE is_deleted = 0 "
+                "ORDER BY text <@> to_bm25query(%1$L, 'slack_messages_text_bm25_idx') LIMIT %2$s",
+                "JOIN slack_conversations c "
+                "ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id "
+                "LEFT JOIN slack_users u "
+                "ON u.account = m.account AND u.team_id = m.team_id AND u.user_id = m.user_id",
+            ),
+            branch(
+                "'slack_channel'", "'name'", "conversation_type", "''", "synced_at", "account",
+                "team_id || ':' || conversation_id", "slack_conversations", "name",
+                "slack_conversations_name_bm25_idx",
+            ),
+            branch(
+                "'slack_channel'", "'topic'", "name", "''", "synced_at", "account",
+                "team_id || ':' || conversation_id", "slack_conversations", "topic",
+                "slack_conversations_topic_bm25_idx", where="topic != ''",
+            ),
+            branch(
+                "'slack_channel'", "'purpose'", "name", "''", "synced_at", "account",
+                "team_id || ':' || conversation_id", "slack_conversations", "purpose",
+                "slack_conversations_purpose_bm25_idx", where="purpose != ''",
+            ),
+            branch(
+                "'slack_file'", "'name'", "mimetype", "user_id", "created_at", "account",
+                "team_id || ':' || file_id", "slack_files", "name",
+                "slack_files_name_bm25_idx", where="is_deleted = 0",
+            ),
+            branch(
+                "'slack_file'", "'title'", "mimetype", "user_id", "created_at", "account",
+                "team_id || ':' || file_id", "slack_files", "title",
+                "slack_files_title_bm25_idx", where="is_deleted = 0 AND title != ''",
+            ),
+            branch(
+                "'transcript'", "'transcript'", "title", "''", "start_at", "account", "recording_id",
+                "apple_voice_memos_enrichments", "transcript", "apple_voice_memos_transcript_bm25_idx",
+                where="transcript != ''",
+            ),
+            branch(
+                "'transcript'", "'title'", "''", "''", "start_at", "account", "recording_id",
+                "apple_voice_memos_enrichments", "title", "apple_voice_memos_title_bm25_idx",
+                where="title != ''",
+            ),
+            branch(
+                "'transcript'", "'summary'", "title", "''", "start_at", "account", "recording_id",
+                "apple_voice_memos_enrichments", "summary", "apple_voice_memos_summary_bm25_idx",
+                where="summary != ''",
+            ),
+            branch(
+                "'transcript'", "'participants'", "title", "''", "start_at", "account", "recording_id",
+                "apple_voice_memos_enrichments", "participants_json",
+                "apple_voice_memos_participants_bm25_idx", where="participants_json NOT IN ('', '[]')",
+            ),
+            branch(
+                "'transcript'", "'action_items'", "title", "''", "start_at", "account", "recording_id",
+                "apple_voice_memos_enrichments", "action_items_json",
+                "apple_voice_memos_action_items_bm25_idx", where="action_items_json NOT IN ('', '[]')",
+            ),
+            branch(
+                "'note'", "'title'", "folder_path", "title", "modified_at", "account", "note_id",
+                "apple_notes", "title", "apple_notes_title_bm25_idx", where="is_deleted = 0",
+            ),
+            branch(
+                "'note'", "'body'", "folder_path", "title", "modified_at", "account", "note_id",
+                "apple_notes", "body_text", "apple_notes_body_bm25_idx", where="is_deleted = 0",
+            ),
+            branch(
+                "'note'", "'revision'", "folder_path", "title", "modified_at", "account",
+                "note_id || '@' || revision_id", "apple_note_revisions", "body_text",
+                "apple_note_revisions_body_bm25_idx",
+            ),
+            # imessage: bm25 top-k on the message body, then join the handle for who.
+            join_branch(
+                "SELECT 'imessage' AS source, m.service AS subsource, m.group_title AS context, "
+                "CASE WHEN m.is_from_me = 1 THEN 'me' ELSE COALESCE(h.address, '') END AS who, "
+                "m.message_at AS occurred_at, m.account AS account, m.message_id AS ref, "
+                "m.body_text AS text, m.score AS score",
+                "SELECT account, handle_id, is_from_me, service, group_title, message_at, message_id, body_text, "
+                "(body_text <@> to_bm25query(%1$L, 'apple_messages_body_bm25_idx'))::real AS score "
+                "FROM apple_messages WHERE is_deleted = 0 "
+                "ORDER BY body_text <@> to_bm25query(%1$L, 'apple_messages_body_bm25_idx') LIMIT %2$s",
+                "LEFT JOIN apple_message_handles h ON h.account = m.account AND h.handle_id = m.handle_id",
+            ),
+            # whatsapp body: bm25 top-k on the message body, then join chat + contact.
+            join_branch(
+                "SELECT 'whatsapp' AS source, 'body' AS subsource, COALESCE(NULLIF(c.name, ''), m.chat_id) AS context, "
+                "CASE WHEN m.is_from_me = 1 THEN 'me' ELSE COALESCE(NULLIF(ct.full_name, ''), "
+                "NULLIF(ct.push_name, ''), NULLIF(m.push_name, ''), m.sender_jid) END AS who, "
+                "m.message_at AS occurred_at, m.account AS account, m.chat_id || ':' || m.message_id AS ref, "
+                "m.body_text AS text, m.score AS score",
+                "SELECT account, chat_id, sender_jid, push_name, is_from_me, message_at, message_id, body_text, "
+                "(body_text <@> to_bm25query(%1$L, 'whatsapp_messages_body_bm25_idx'))::real AS score "
+                "FROM whatsapp_messages WHERE is_deleted = 0 "
+                "ORDER BY body_text <@> to_bm25query(%1$L, 'whatsapp_messages_body_bm25_idx') LIMIT %2$s",
+                "LEFT JOIN whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id "
+                "LEFT JOIN whatsapp_contacts ct ON ct.account = m.account AND ct.jid = m.sender_jid",
+            ),
+            branch(
+                "'whatsapp_chat'", "'name'", "chat_type", "''", "last_message_at", "account", "chat_id",
+                "whatsapp_chats", "name", "whatsapp_chats_name_bm25_idx", where="name != ''",
+            ),
+            branch(
+                "'whatsapp_media'", "'filename'", "mime_type", "''", "message_at", "account",
+                "chat_id || ':' || message_id", "whatsapp_media_items", "filename",
+                "whatsapp_media_items_filename_bm25_idx", where="filename != ''",
+            ),
+            branch(
+                "'calendar'", "'summary'", "''", "organizer_email", "start_at", "account",
+                "calendar_id || ':' || event_id", "calendar_events", "summary",
+                "calendar_events_summary_bm25_idx", where="is_deleted = 0",
+            ),
+            branch(
+                "'calendar'", "'description'", "summary", "organizer_email", "start_at", "account",
+                "calendar_id || ':' || event_id", "calendar_events", "description",
+                "calendar_events_description_bm25_idx", where="is_deleted = 0 AND description != ''",
+            ),
+            branch(
+                "'calendar'", "'location'", "summary", "organizer_email", "start_at", "account",
+                "calendar_id || ':' || event_id", "calendar_events", "location",
+                "calendar_events_location_bm25_idx", where="is_deleted = 0 AND location != ''",
+            ),
+            branch(
+                "'calendar'", "'attendees'", "summary", "organizer_email", "start_at", "account",
+                "calendar_id || ':' || event_id", "calendar_events", "attendees_json",
+                "calendar_events_attendees_bm25_idx",
+                where="is_deleted = 0 AND attendees_json NOT IN ('', '[]')",
+            ),
+            branch(
+                "'contact'", "'name'", "source_kind", "primary_email", "source_updated_at", "account",
+                "card_id", "contact_cards", "display_name", "contact_cards_name_bm25_idx",
+                where="is_deleted = 0",
+            ),
+            branch(
+                "'contact'", "'organization'", "display_name", "primary_email", "source_updated_at",
+                "account", "card_id", "contact_cards", "organization",
+                "contact_cards_organization_bm25_idx", where="is_deleted = 0 AND organization != ''",
+            ),
+            branch(
+                "'contact'", "'job_title'", "display_name", "primary_email", "source_updated_at",
+                "account", "card_id", "contact_cards", "job_title", "contact_cards_job_title_bm25_idx",
+                where="is_deleted = 0 AND job_title != ''",
+            ),
+            branch(
+                "'contact'", "'notes'", "display_name", "primary_email", "source_updated_at",
+                "account", "card_id", "contact_cards", "notes", "contact_cards_notes_bm25_idx",
+                where="is_deleted = 0 AND notes != ''",
+            ),
+            branch(
+                "'agent'", "event_type", "stream", "run_id", "created_at", "''",
+                "run_id || ':' || event_index::text", "agent_run_events", "text",
+                "agent_run_events_text_bm25_idx",
+            ),
+            branch(
+                "'agent_session'", "source", "role", "account", "occurred_at", "account",
+                "source || ':' || session_id || ':' || event_uuid", "agent_session_events", "text",
+                "agent_session_events_text_bm25_idx", where="text != '' AND role IN ('user', 'assistant')",
+            ),
+            branch(
+                "'agent_session'", "'title'", "source", "account", "occurred_at", "account",
+                "source || ':' || session_id || ':' || event_uuid || ':title'", "agent_session_events",
+                "session_title", "agent_session_events_title_bm25_idx", where="session_title != ''",
+            ),
+            branch(
+                "'mutation'", "status", "operation", "requested_by", "created_at", "account", "id",
+                "upstream_mutations", "title", "upstream_mutations_title_bm25_idx",
+            ),
+            branch(
+                "'mutation_request'", "status", "''", "requested_by", "created_at", "''", "id",
+                "upstream_mutation_requests", "title", "upstream_mutation_requests_title_bm25_idx",
+            ),
+            branch(
+                "'mutation_request'", "status", "title", "requested_by", "created_at", "''",
+                "id || ':reason'", "upstream_mutation_requests", "reason",
+                "upstream_mutation_requests_reason_bm25_idx", where="reason != ''",
+            ),
+        ]
+
+        hits = "\n                        UNION ALL\n                        ".join(branches)
+        self._command(
+            r"""
+            CREATE OR REPLACE FUNCTION search_text(
+                query text,
+                max_results integer DEFAULT 50,
+                sources text[] DEFAULT NULL,
+                since timestamptz DEFAULT NULL
+            )
+            RETURNS TABLE (
+                source text, subsource text, context text, who text,
+                occurred_at timestamptz, account text, ref text,
+                text text, score real
+            )
+            LANGUAGE plpgsql
+            STABLE
+            AS $fn$
+            DECLARE
+                per_source integer := greatest(coalesce(max_results, 50), 1);
+            BEGIN
+                RETURN QUERY EXECUTE format($sql$
+                    WITH hits AS (
+                        """
+            + hits
+            + r"""
+                    )
+                    SELECT source, subsource, context, who, occurred_at, account, ref, text, score
+                    FROM hits
+                    WHERE (%3$L::text[] IS NULL OR source = ANY (%3$L::text[]))
+                      AND (%4$L::timestamptz IS NULL OR occurred_at >= %4$L::timestamptz)
+                    ORDER BY score ASC NULLS LAST
+                    LIMIT %2$s
+                $sql$, query, per_source, sources, since);
+            END;
+            $fn$;
+            """
+        )
 
     def _ensure_clean_gmail_inbox_view(self) -> None:
         self._ensure_utf8_byte_prefix_function()
@@ -6686,7 +6210,3 @@ def _numeric_ts(expression: str) -> str:
 def _json_numeric(expression: str, field: str) -> str:
     return f"COALESCE(NULLIF(({expression}::jsonb ->> '{field}'), '')::numeric, 0)"
 
-
-# Runs at import so any schema/coverage divergence fails everything, loudly,
-# before a single asset or server query executes.
-validate_searchable_text_coverage()
