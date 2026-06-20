@@ -267,11 +267,10 @@ The uploader reads `~/.claude/projects/**/*.jsonl`, `~/.codex/sessions/**/rollou
 `AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR`; set one to empty to disable that tool on a host). Each
 tool's directory that doesn't exist on a given machine is simply skipped, so the same uploader
 binary works everywhere. The OpenClaw scan ignores the `<sessionId>.trajectory.jsonl` runtime
-trace and the `.json` sidecars next to each transcript. It tracks a byte offset per file and
-uploads new lines as gzipped JSONL batches to `agent-sessions/inbox/` on Drive, reusing the
-Apple Messages / Voice Memos Drive folder and account by default (set
-`AGENT_SESSIONS_GOOGLE_DRIVE_FOLDER_ID` / `AGENT_SESSIONS_ACCOUNT` to override). The `--limit`
-flag bounds a run (useful for a first backfill). In Dagster, the
+trace and the `.json` sidecars next to each transcript. It tracks a byte offset per file,
+coalesces new lines across files into full-size gzipped JSONL batches, and posts them through the
+app's ingest endpoint (see below), which writes them into the `agent-sessions/inbox/` Drive
+folder. The `--limit` flag bounds a run (useful for a first backfill). In Dagster, the
 `agent_sessions_drive_inbox_sensor` + `agent_sessions_drive_ingest` asset consume the batches.
 
 ## Client uploads via the app (the only write path)
@@ -312,11 +311,18 @@ time out, a known rotom-side issue). It writes one JSONL transcript per session 
 `~/.openclaw/agents/main/sessions/`. Because the VM is Linux (no launchd), the uploader runs as
 a **systemd user timer** (zrl has `Linger=yes`, so user units run without an active login).
 
-- Checkout: `~/dev/zachlatta/personal-data-warehouse` (clone of `main`); runs via `uv`
+- Checkout: `~/dev/zachlatta/personal-data-warehouse` (clone of `main` via a read-only GitHub
+  deploy key; `core.sshCommand` points at `~/.ssh/pdw_deploy_key`); runs via `uv`
   (`~/.local/bin/uv`).
-- Env: `~/dev/zachlatta/personal-data-warehouse/.env` holds `GMAIL_ACCOUNTS`, the matching
-  `GOOGLE_<slug>_TOKEN_JSON_B64` Drive token, and a Drive folder id (reuses
-  `VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID`). `device` auto-resolves to the hostname `openclaw`.
+- Env: `~/dev/zachlatta/personal-data-warehouse/.env` holds the **app-ingest** config (the VM has
+  no Drive credential): `PDW_INGEST_BASE_URL` (the app, `https://data-warehouse-mcp.zachlatta.com`),
+  `PDW_INGEST_SIGNING_KEY` (= the app's `PDW_SECRET_TOKEN`/`MCP_SECRET_TOKEN`),
+  `AGENT_SESSIONS_STORAGE_BACKEND=http_app`, and `AGENT_SESSIONS_ACCOUNT=zach@zachlatta.com`
+  (tags the envelope `account` + keys the upload-offset state DB — keep it stable).
+  `AGENT_SESSIONS_CLAUDE_PROJECTS_DIR=`/`AGENT_SESSIONS_CODEX_SESSIONS_DIR=` are blanked so the
+  VM uploads only OpenClaw sessions. `device` auto-resolves to the hostname `openclaw`. Uploads
+  POST to the app, which writes the batch into the Drive inbox the Dagster ingest reads — see
+  [Client uploads via the app](#client-uploads-via-the-app-the-only-write-path).
 - Systemd unit: `personal-data-warehouse-agent-sessions-upload.{service,timer}` (user scope).
 - Checked-in templates: `ops/systemd/personal-data-warehouse-agent-sessions-upload.{service,timer}`.
 - Wrapper: `bin/agent-sessions-upload-systemd`; status helper: `bin/agent-sessions-upload-status-systemd`.
@@ -343,9 +349,11 @@ systemctl --user daemon-reload
 systemctl --user enable --now personal-data-warehouse-agent-sessions-upload.timer
 ```
 
-To pull new code: `cd ~/dev/zachlatta/personal-data-warehouse && git pull && uv sync`. The
-openclaw uploader only ships data the prod Dagster ingest already understands once
-`openclaw_event_row` is deployed, so land/deploy code changes before enabling the timer.
+To pull new code: `cd ~/dev/zachlatta/personal-data-warehouse && git pull && uv sync`. Because
+uploads go through the app, end-to-end also depends on the **app** (`/ingest/agent-sessions/batch`)
+and the **prod Dagster** reader both running `main` (the app writes the object tags the Dagster
+reader expects, and the reader carries `openclaw_event_row`). Land/deploy code on both before
+relying on the timer.
 
 ## WhatsApp Client (linked device)
 
