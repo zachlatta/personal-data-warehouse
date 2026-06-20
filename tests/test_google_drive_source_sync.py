@@ -70,6 +70,31 @@ class FakeDriveClient:
         return self.downloads[file_id]
 
 
+class RecordingWarehouse:
+    def __init__(self):
+        self.file_batches: list[int] = []
+        self.text_batches: list[int] = []
+        self.sync_states: list[dict] = []
+
+    def ensure_google_drive_source_tables(self):
+        pass
+
+    def load_google_drive_sync_state(self):
+        return {}
+
+    def load_google_drive_text_state(self, account):
+        return {}
+
+    def insert_google_drive_files(self, rows):
+        self.file_batches.append(len(rows))
+
+    def insert_google_drive_file_texts(self, rows):
+        self.text_batches.append(len(rows))
+
+    def upsert_google_drive_sync_state(self, row):
+        self.sync_states.append(row)
+
+
 def _settings(**overrides) -> Settings:
     config = GoogleDriveSourceConfig(
         accounts=("zach@hackclub.com",),
@@ -269,6 +294,34 @@ def test_full_crawl_records_skip_status_for_unsupported_files(warehouse):
     assert warehouse._query(
         "SELECT extractor, text_extraction_status, text FROM google_drive_file_texts WHERE file_id = 'pdf'"
     ) == [("none", "unsupported", "")]
+
+
+def test_full_crawl_flushes_batches_to_bound_memory():
+    files = [
+        {
+            "id": f"f{i}",
+            "name": f"note-{i}.txt",
+            "mimeType": "text/plain",
+            "parents": ["root"],
+            "size": "10",
+            "modifiedTime": "2026-06-01T00:00:00Z",
+        }
+        for i in range(30)
+    ]
+    client = FakeDriveClient(
+        folders=[{"id": "root", "name": "My Drive", "parents": []}],
+        files=files,
+        downloads={f"f{i}": b"body" for i in range(30)},
+    )
+    warehouse = RecordingWarehouse()
+
+    summary = _runner(warehouse, client).sync_all()[0]
+
+    assert summary.files_written == 30
+    assert summary.texts_written == 30
+    assert warehouse.file_batches == [25, 5]
+    assert warehouse.text_batches == [25, 5]
+    assert warehouse.sync_states[-1]["status"] == "ok"
 
 
 # --- incremental -----------------------------------------------------------

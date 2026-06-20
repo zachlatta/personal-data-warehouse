@@ -68,6 +68,10 @@ FILE_FIELDS = (
     "lastModifyingUser(displayName,emailAddress),trashed,shared,starred,driveId"
 )
 
+MAX_BUFFERED_FILE_ROWS = 200
+MAX_BUFFERED_TEXT_ROWS = 25
+MAX_BUFFERED_TEXT_CHARS = 10_000_000
+
 
 def _is_plain_text(mime_type: str, name: str) -> bool:
     if mime_type.startswith("text/"):
@@ -245,10 +249,18 @@ class GoogleDriveSourceSyncRunner:
         file_rows: list[dict[str, Any]] = []
         text_rows: list[dict[str, Any]] = []
         seen = 0
+        files_written = 0
+        texts_written = 0
         for file in client.iter_files():
             seen += 1
             self._process_file(account, client, file, tree, known_text_state, synced_at, file_rows, text_rows)
-        self._flush(file_rows, text_rows)
+            if self._should_flush(file_rows, text_rows):
+                files, texts = self._flush_buffer(file_rows, text_rows)
+                files_written += files
+                texts_written += texts
+        files, texts = self._flush_buffer(file_rows, text_rows)
+        files_written += files
+        texts_written += texts
         self._warehouse.upsert_google_drive_sync_state(
             self._state_row(
                 account=account,
@@ -260,7 +272,7 @@ class GoogleDriveSourceSyncRunner:
                 synced_at=synced_at,
             )
         )
-        return AccountSyncSummary(account, "ok", "full_crawl", seen, len(file_rows), len(text_rows))
+        return AccountSyncSummary(account, "ok", "full_crawl", seen, files_written, texts_written)
 
     def _incremental(self, account: str, client: DriveClient, state: Any) -> AccountSyncSummary:
         synced_at = self._now()
@@ -274,6 +286,8 @@ class GoogleDriveSourceSyncRunner:
         text_rows: list[dict[str, Any]] = []
         trashed_ids: list[str] = []
         seen = 0
+        files_written = 0
+        texts_written = 0
         for change in changes:
             seen += 1
             file = change.get("file")
@@ -285,7 +299,13 @@ class GoogleDriveSourceSyncRunner:
             if file.get("mimeType") == FOLDER_MIME:
                 continue
             self._process_file(account, client, file, tree, known_text_state, synced_at, file_rows, text_rows)
-        self._flush(file_rows, text_rows)
+            if self._should_flush(file_rows, text_rows):
+                files, texts = self._flush_buffer(file_rows, text_rows)
+                files_written += files
+                texts_written += texts
+        files, texts = self._flush_buffer(file_rows, text_rows)
+        files_written += files
+        texts_written += texts
         self._warehouse.mark_google_drive_files_trashed(
             account=account, file_ids=trashed_ids, sync_version=int(synced_at.timestamp() * 1000)
         )
@@ -301,7 +321,7 @@ class GoogleDriveSourceSyncRunner:
                 synced_at=synced_at,
             )
         )
-        return AccountSyncSummary(account, "ok", "incremental", seen, len(file_rows), len(text_rows))
+        return AccountSyncSummary(account, "ok", "incremental", seen, files_written, texts_written)
 
     def _process_file(
         self,
@@ -394,11 +414,22 @@ class GoogleDriveSourceSyncRunner:
         status = "ok" if text.strip() else "empty"
         return text, status, "", content_sha256, truncated
 
-    def _flush(self, file_rows: list[dict[str, Any]], text_rows: list[dict[str, Any]]) -> None:
+    def _should_flush(self, file_rows: list[dict[str, Any]], text_rows: list[dict[str, Any]]) -> bool:
+        if len(file_rows) >= MAX_BUFFERED_FILE_ROWS or len(text_rows) >= MAX_BUFFERED_TEXT_ROWS:
+            return True
+        text_chars = sum(len(str(row.get("text", ""))) for row in text_rows)
+        return text_chars >= MAX_BUFFERED_TEXT_CHARS
+
+    def _flush_buffer(self, file_rows: list[dict[str, Any]], text_rows: list[dict[str, Any]]) -> tuple[int, int]:
+        files_written = len(file_rows)
+        texts_written = len(text_rows)
         if text_rows:
             self._warehouse.insert_google_drive_file_texts(text_rows)
         if file_rows:
             self._warehouse.insert_google_drive_files(file_rows)
+        file_rows.clear()
+        text_rows.clear()
+        return files_written, texts_written
 
     def _file_row(
         self,
