@@ -5,7 +5,8 @@
 Before committing or pushing, review the complete staged diff line by line for secrets,
 credentials, tokens, private URLs, personal data, generated artifacts, and anything else
 that should not be public. If there is even a smidgen of doubt about whether a change is
-safe to commit or push, stop and check with Zach before proceeding.
+safe to commit or push, stop and check with Zach before proceeding. Never
+include other people's names in code, even if their names are public.
 
 Always assume other agents may be running in the same worktree. Before committing, carefully
 verify the staged changes and commit only the changes made in the current session unless Zach
