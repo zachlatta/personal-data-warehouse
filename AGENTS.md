@@ -1,5 +1,10 @@
 # Agent Notes
 
+Development practices:
+
+* We use TDD for this repo and follow good code practices
+* When asked to refactor or change existing code flows, please plan to completely replace the old legacy flow with the new requested flow - including ripping out any and all legacy code
+
 ## Commit and Push Safety
 
 Before committing or pushing, review the complete staged diff line by line for secrets,
