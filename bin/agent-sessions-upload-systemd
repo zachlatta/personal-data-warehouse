@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Linux/systemd counterpart of bin/agent-sessions-upload-launchd.
+#
+# Runs the incremental agent-sessions uploader once. Used by the
+# personal-data-warehouse-agent-sessions-upload.service systemd user unit on
+# Linux hosts (e.g. the openclaw VM, which syncs ~/.openclaw agent sessions).
+# Self-locating: it derives the repo root from its own path, so the same script
+# works regardless of where the checkout lives.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+UV="${UV_BIN:-$HOME/.local/bin/uv}"
+[ -x "$UV" ] || UV="$(command -v uv || echo uv)"
+
+LOG_DIR="${PDW_LOG_DIR:-$HOME/.local/state/personal-data-warehouse}"
+LOG_FILE="$LOG_DIR/agent-sessions-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/agent-sessions-upload.heartbeat"
+
+mkdir -p "$LOG_DIR"
+
+started_at_epoch="$(date +%s)"
+started_at_iso="$(date -Iseconds)"
+
+echo "[$started_at_iso] starting agent sessions upload" >> "$LOG_FILE"
+
+if ! cd "$REPO_DIR"; then
+  exit_code=1
+  echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
+else
+  "$UV" run personal-data-warehouse-agent-sessions-upload --mode incremental >> "$LOG_FILE" 2>&1
+  exit_code=$?
+fi
+
+finished_at_epoch="$(date +%s)"
+finished_at_iso="$(date -Iseconds)"
+duration_seconds="$((finished_at_epoch - started_at_epoch))"
+
+printf "%s\n" "$finished_at_iso" > "$HEARTBEAT_FILE"
+echo "[$finished_at_iso] finished agent sessions upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
+
+exit "$exit_code"

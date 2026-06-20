@@ -1,8 +1,9 @@
-"""Ingest AI agent CLI session logs (Claude Code, Codex) from the Drive inbox.
+"""Ingest AI agent CLI session logs (Claude Code, Codex, OpenClaw) from Drive.
 
 A per-device uploader tails the append-only JSONL transcripts each tool writes
-(``~/.claude/projects/**/*.jsonl`` and ``~/.codex/sessions/**/rollout-*.jsonl``)
-and batches new lines into ``agent-sessions/inbox/batches/`` as gzipped JSONL
+(``~/.claude/projects/**/*.jsonl``, ``~/.codex/sessions/**/rollout-*.jsonl``,
+and ``~/.openclaw/agents/main/sessions/<sessionId>.jsonl``) and batches new
+lines into ``agent-sessions/inbox/batches/`` as gzipped JSONL
 envelopes. This module consumes those batches, normalizes each raw line into an
 ``agent_session_events`` row (lossless ``raw_json`` plus queryable columns), and
 promotes processed batch files into ``agent-sessions/library/``.
@@ -192,7 +193,7 @@ def record_to_event_row(record: Mapping[str, Any], *, ingested_at: datetime) -> 
     line = line if isinstance(line, Mapping) else {}
     account = str(record.get("account", ""))
     device = str(record.get("device", ""))
-    builder = codex_event_row if tool == "codex" else claude_code_event_row
+    builder = _EVENT_ROW_BUILDERS.get(tool, claude_code_event_row)
     return builder(
         line,
         session_id=session_id,
@@ -414,6 +415,125 @@ def _codex_role(role: str) -> str:
     return "meta"
 
 
+def openclaw_event_row(
+    line: Mapping[str, Any],
+    *,
+    session_id: str,
+    account: str,
+    device: str,
+    seq: int,
+    ingested_at: datetime,
+) -> dict[str, Any]:
+    """Normalize one line of an OpenClaw "<sessionId>.jsonl" transcript.
+
+    OpenClaw writes one JSON object per line: a ``session`` header, then a
+    ``message`` per turn whose nested ``message`` carries ``role``
+    (``user``/``assistant``/``toolResult``), string-or-block ``content``, and —
+    on assistant turns — ``model``, ``provider`` and a ``usage`` token block.
+    """
+    event_type = str(line.get("type", ""))
+    uuid = str(line.get("id") or f"{session_id}#{seq}")
+    row = _base_row(
+        source="openclaw",
+        session_id=session_id,
+        account=account,
+        device=device,
+        seq=seq,
+        line=line,
+        event_uuid=uuid,
+        occurred_at=parse_datetime(str(line.get("timestamp", ""))),
+        ingested_at=ingested_at,
+    )
+    row["parent_uuid"] = str(line.get("parentId") or "")
+
+    if event_type == "session":
+        row["cwd"] = str(line.get("cwd", ""))
+        row["cli_version"] = str(line.get("version", ""))
+        return row
+
+    if event_type != "message":
+        return row
+
+    message = line.get("message") if isinstance(line.get("message"), Mapping) else {}
+    role = str(message.get("role", ""))
+    content = message.get("content")
+
+    if role == "user":
+        row["role"] = "user"
+        row["subtype"] = "message"
+        row["text"] = _openclaw_text(content)
+    elif role == "assistant":
+        row["role"] = "assistant"
+        row["model"] = str(message.get("model", ""))
+        row["entrypoint"] = str(message.get("provider", ""))
+        row["text"] = _openclaw_text(content)
+        tool_block = _openclaw_block(content, "toolCall")
+        if tool_block is not None:
+            row["subtype"] = "tool_use"
+            row["tool_name"] = str(tool_block.get("name", ""))
+            row["tool_input_json"] = _as_json_text(
+                tool_block.get("arguments") if tool_block.get("arguments") is not None else tool_block.get("input")
+            )
+            row["turn_id"] = str(tool_block.get("id", ""))
+        elif row["text"]:
+            row["subtype"] = "message"
+        else:
+            row["subtype"] = "thinking"
+        _apply_openclaw_usage(row, message.get("usage"))
+    elif role == "toolResult":
+        row["role"] = "tool"
+        row["subtype"] = "tool_result"
+        row["tool_name"] = str(message.get("toolName", ""))
+        row["turn_id"] = str(message.get("toolCallId", ""))
+        row["text"] = _openclaw_tool_result_text(content)
+        row["tool_result_json"] = raw_json({"content": content}) if content is not None else ""
+    else:
+        row["role"] = "meta"
+        row["subtype"] = role
+
+    return row
+
+
+def _openclaw_text(content: Any) -> str:
+    return _join_text_blocks(content, text_types=("text",))
+
+
+def _openclaw_tool_result_text(content: Any) -> str:
+    # OpenClaw tool results are blocks of type "toolResult" (camelCase) carrying
+    # a "text"/"content" payload, so the generic text-block joiner skips them.
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            continue
+        value = block.get("text")
+        if value is None:
+            value = block.get("content")
+        parts.append(_stringify(value))
+    return "\n".join(part for part in parts if part)
+
+
+def _openclaw_block(content: Any, block_type: str) -> Mapping[str, Any] | None:
+    if not isinstance(content, list):
+        return None
+    return next(
+        (block for block in content if isinstance(block, Mapping) and block.get("type") == block_type),
+        None,
+    )
+
+
+def _apply_openclaw_usage(row: dict[str, Any], usage: Any) -> None:
+    if not isinstance(usage, Mapping):
+        return
+    row["input_tokens"] = _int(usage.get("input"))
+    row["output_tokens"] = _int(usage.get("output"))
+    row["cache_read_tokens"] = _int(usage.get("cacheRead"))
+    row["cache_creation_tokens"] = _int(usage.get("cacheWrite"))
+
+
 def _join_text_blocks(content: Any, *, text_types: tuple[str, ...] = ("text", "input_text", "output_text")) -> str:
     if isinstance(content, str):
         return content
@@ -467,6 +587,13 @@ def _int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+_EVENT_ROW_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
+    "claude_code": claude_code_event_row,
+    "codex": codex_event_row,
+    "openclaw": openclaw_event_row,
+}
 
 
 # --- object key helpers -----------------------------------------------------

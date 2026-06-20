@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Linux/systemd counterpart of bin/agent-sessions-upload-status.
+# Shows the systemd user timer/service state plus the latest heartbeat and run log.
+set -u
+
+UNIT="personal-data-warehouse-agent-sessions-upload"
+LOG_DIR="${PDW_LOG_DIR:-$HOME/.local/state/personal-data-warehouse}"
+RUN_LOG="$LOG_DIR/agent-sessions-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/agent-sessions-upload.heartbeat"
+
+echo "Timer:"
+systemctl --user list-timers "$UNIT.timer" --all --no-pager 2>/dev/null || echo "  (timer not loaded)"
+
+echo
+echo "Service (last run):"
+systemctl --user status "$UNIT.service" --no-pager 2>/dev/null | sed -n '1,12p' || echo "  (service not loaded)"
+
+echo
+echo "Heartbeat:"
+if [ -f "$HEARTBEAT_FILE" ]; then
+  cat "$HEARTBEAT_FILE"
+else
+  echo "missing"
+fi
+
+echo
+echo "Recent run log:"
+if [ -f "$RUN_LOG" ]; then
+  tail -40 "$RUN_LOG"
+else
+  echo "missing: $RUN_LOG"
+fi

@@ -45,6 +45,7 @@ class AgentSessionsUploadRunner:
         device: str,
         claude_projects_dir: Path | str | None,
         codex_sessions_dir: Path | str | None,
+        openclaw_sessions_dir: Path | str | None = None,
         object_store: ObjectStore | None = None,
         object_store_factory: Callable[[], ObjectStore] | None = None,
         logger,
@@ -65,6 +66,7 @@ class AgentSessionsUploadRunner:
         self._device = device
         self._claude_projects_dir = claude_projects_dir
         self._codex_sessions_dir = codex_sessions_dir
+        self._openclaw_sessions_dir = openclaw_sessions_dir
         self._object_store = object_store
         self._object_store_factory = object_store_factory
         self._logger = logger
@@ -80,6 +82,7 @@ class AgentSessionsUploadRunner:
         files = discover_session_files(
             claude_projects_dir=self._claude_projects_dir,
             codex_sessions_dir=self._codex_sessions_dir,
+            openclaw_sessions_dir=self._openclaw_sessions_dir,
         )
         self._logger.info("Discovered %s agent session transcript file(s)", len(files))
         remaining = self._limit

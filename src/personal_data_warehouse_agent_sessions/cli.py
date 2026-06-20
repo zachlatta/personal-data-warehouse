@@ -69,6 +69,7 @@ def main() -> None:
                 device=config.device,
                 claude_projects_dir=config.claude_projects_dir,
                 codex_sessions_dir=config.codex_sessions_dir,
+                openclaw_sessions_dir=config.openclaw_sessions_dir,
                 object_store_factory=lambda: build_object_store(
                     google_drive_spec(
                         folder_id=config.google_drive_folder_id,

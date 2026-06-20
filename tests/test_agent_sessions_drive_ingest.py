@@ -10,6 +10,7 @@ from personal_data_warehouse.agent_sessions_drive_ingest import (
     codex_event_row,
     has_batch_payloads,
     iter_batch_payloads,
+    openclaw_event_row,
     record_to_event_row,
 )
 from personal_data_warehouse.objectstore import ObjectListing
@@ -67,6 +68,7 @@ class FakeObjectStore:
 INGESTED_AT = datetime(2026, 6, 14, 18, tzinfo=UTC)
 CLAUDE_SESSION = "bd51eaa0-f030-4b13-96d9-37c8c1bda53d"
 CODEX_SESSION = "019ec722-5a03-7980-bd45-f34ba5bd9502"
+OPENCLAW_SESSION = "ebf9f4b8-4f8e-442c-84a7-d5015f64fdb7"
 
 
 def envelope(record: dict, *, tool: str, record_type: str | None = None) -> dict:
@@ -87,6 +89,10 @@ def claude_record(line: dict, *, seq: int) -> dict:
 
 def codex_record(line: dict, *, seq: int) -> dict:
     return {"tool": "codex", "session_id": CODEX_SESSION, "seq": seq, "line": line}
+
+
+def openclaw_record(line: dict, *, seq: int) -> dict:
+    return {"tool": "openclaw", "session_id": OPENCLAW_SESSION, "seq": seq, "line": line}
 
 
 # --- Claude Code normalizer -------------------------------------------------
@@ -334,6 +340,94 @@ def test_codex_turn_context_model() -> None:
     assert row["turn_id"] == "turn-1"
 
 
+# --- OpenClaw normalizer ----------------------------------------------------
+
+
+def test_openclaw_session_header_row() -> None:
+    line = {
+        "type": "session",
+        "version": 3,
+        "id": "466d43a9-22cf-40dd-b31b-a2e0e44d63e8",
+        "timestamp": "2026-06-20T04:25:43.832Z",
+        "cwd": "/home/zrl",
+    }
+    row = openclaw_event_row(line, session_id=OPENCLAW_SESSION, account="a", device="openclaw", seq=0, ingested_at=INGESTED_AT)
+    assert row["source"] == "openclaw"
+    assert row["event_type"] == "session"
+    assert row["cwd"] == "/home/zrl"
+    assert row["cli_version"] == "3"
+
+
+def test_openclaw_user_message_row() -> None:
+    line = {
+        "type": "message",
+        "id": "a1b7592a-ce52-4b4d-a72c-fff42c17ff4c",
+        "parentId": None,
+        "timestamp": "2026-06-20T04:25:43.832Z",
+        "message": {"role": "user", "content": "run the hook"},
+    }
+    row = openclaw_event_row(line, session_id=OPENCLAW_SESSION, account="a", device="openclaw", seq=1, ingested_at=INGESTED_AT)
+    assert row["role"] == "user"
+    assert row["subtype"] == "message"
+    assert row["text"] == "run the hook"
+    assert row["event_uuid"] == "a1b7592a-ce52-4b4d-a72c-fff42c17ff4c"
+
+
+def test_openclaw_assistant_toolcall_and_tokens_row() -> None:
+    line = {
+        "type": "message",
+        "id": "b3a13e24-0578-443a-a076-3503a2e8b649",
+        "parentId": "a1b7592a-ce52-4b4d-a72c-fff42c17ff4c",
+        "timestamp": "2026-06-20T04:26:02.135Z",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Running it now."},
+                {"type": "toolCall", "id": "call_1Rvx", "name": "bash", "arguments": {"command": "ls"}, "input": {"command": "ls"}},
+            ],
+            "provider": "codex",
+            "model": "gpt-5.5",
+            "usage": {"input": 120, "output": 30, "cacheRead": 10, "cacheWrite": 5, "totalTokens": 165},
+        },
+    }
+    row = openclaw_event_row(line, session_id=OPENCLAW_SESSION, account="a", device="openclaw", seq=2, ingested_at=INGESTED_AT)
+    assert row["role"] == "assistant"
+    assert row["model"] == "gpt-5.5"
+    assert row["entrypoint"] == "codex"
+    assert row["subtype"] == "tool_use"
+    assert row["tool_name"] == "bash"
+    assert json.loads(row["tool_input_json"]) == {"command": "ls"}
+    assert row["turn_id"] == "call_1Rvx"
+    assert row["text"] == "Running it now."
+    assert row["input_tokens"] == 120
+    assert row["output_tokens"] == 30
+    assert row["cache_read_tokens"] == 10
+    assert row["cache_creation_tokens"] == 5
+
+
+def test_openclaw_tool_result_row() -> None:
+    line = {
+        "type": "message",
+        "id": "55a2de34-e73f-4611-81e0-12f5af79f33d",
+        "parentId": "b3a13e24-0578-443a-a076-3503a2e8b649",
+        "timestamp": "2026-06-20T04:26:02.137Z",
+        "message": {
+            "role": "toolResult",
+            "toolCallId": "call_1Rvx",
+            "toolName": "bash",
+            "isError": False,
+            "content": [{"type": "toolResult", "toolCallId": "call_1Rvx", "content": "done", "text": "done"}],
+        },
+    }
+    row = openclaw_event_row(line, session_id=OPENCLAW_SESSION, account="a", device="openclaw", seq=3, ingested_at=INGESTED_AT)
+    assert row["role"] == "tool"
+    assert row["subtype"] == "tool_result"
+    assert row["tool_name"] == "bash"
+    assert row["turn_id"] == "call_1Rvx"
+    assert row["text"] == "done"
+    assert json.loads(row["tool_result_json"])["content"][0]["content"] == "done"
+
+
 # --- dispatch + batch plumbing ----------------------------------------------
 
 
@@ -346,8 +440,13 @@ def test_record_to_event_row_dispatches_on_tool() -> None:
         codex_record({"type": "session_meta", "payload": {"id": CODEX_SESSION}}, seq=0),
         tool="codex",
     )
+    openclaw = envelope(
+        openclaw_record({"type": "message", "id": "m1", "message": {"role": "user", "content": "hi"}}, seq=0),
+        tool="openclaw",
+    )
     assert record_to_event_row(claude, ingested_at=INGESTED_AT)["source"] == "claude_code"
     assert record_to_event_row(codex, ingested_at=INGESTED_AT)["source"] == "codex"
+    assert record_to_event_row(openclaw, ingested_at=INGESTED_AT)["source"] == "openclaw"
 
 
 def test_iter_batch_payloads_decompresses() -> None:

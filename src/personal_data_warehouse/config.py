@@ -57,6 +57,7 @@ DEFAULT_WHATSAPP_CLIENT_ENABLED = True
 DEFAULT_AGENT_SESSIONS_STORAGE_BACKEND = "google_drive"
 DEFAULT_AGENT_SESSIONS_CLAUDE_PROJECTS_DIR = "~/.claude/projects"
 DEFAULT_AGENT_SESSIONS_CODEX_SESSIONS_DIR = "~/.codex/sessions"
+DEFAULT_AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR = "~/.openclaw/agents/main/sessions"
 DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
 DEFAULT_ALICE_STORAGE_BACKEND = "google_drive"
 DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS = 120
@@ -208,6 +209,7 @@ class AgentSessionsConfig:
     google_drive_folder_id: str
     claude_projects_dir: str
     codex_sessions_dir: str
+    openclaw_sessions_dir: str
 
 
 @dataclass(frozen=True)
@@ -859,6 +861,9 @@ def load_settings(
     agent_sessions_codex_sessions_dir = os.path.expanduser(
         os.getenv("AGENT_SESSIONS_CODEX_SESSIONS_DIR", DEFAULT_AGENT_SESSIONS_CODEX_SESSIONS_DIR)
     )
+    agent_sessions_openclaw_sessions_dir = os.path.expanduser(
+        os.getenv("AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR", DEFAULT_AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR)
+    )
     agent_sessions: AgentSessionsConfig | None = None
     if (
         require_agent_sessions
@@ -884,6 +889,7 @@ def load_settings(
             google_drive_folder_id=agent_sessions_google_drive_folder_id,
             claude_projects_dir=agent_sessions_claude_projects_dir,
             codex_sessions_dir=agent_sessions_codex_sessions_dir,
+            openclaw_sessions_dir=agent_sessions_openclaw_sessions_dir,
         )
 
     alice_account = os.getenv("ALICE_VOICE_RECORDINGS_ACCOUNT", "").strip()

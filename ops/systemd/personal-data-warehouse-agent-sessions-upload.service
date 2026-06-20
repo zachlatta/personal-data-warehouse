@@ -1,0 +1,16 @@
+[Unit]
+Description=Upload local AI agent session transcripts (openclaw/Claude Code/Codex) to the Drive inbox
+# Don't fail loudly when the box is briefly offline; the next timer tick retries.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Self-locating wrapper: derives the repo root from its own path. Installed copy
+# lives at the checkout below; update WorkingDirectory/ExecStart if you relocate it.
+WorkingDirectory=%h/dev/zachlatta/personal-data-warehouse
+ExecStart=%h/dev/zachlatta/personal-data-warehouse/bin/agent-sessions-upload-systemd
+# A run that walks ~/.openclaw/agents/main/sessions should finish in well under
+# this; the cap just stops a wedged run from blocking the next tick forever.
+TimeoutStartSec=1800
+Nice=10

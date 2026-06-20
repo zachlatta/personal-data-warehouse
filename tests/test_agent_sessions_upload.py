@@ -10,6 +10,7 @@ from personal_data_warehouse_agent_sessions.scanner import (
     claude_session_id,
     codex_session_id,
     discover_session_files,
+    openclaw_session_id,
 )
 from personal_data_warehouse_agent_sessions.state import AgentSessionsUploadState
 from personal_data_warehouse_agent_sessions.sync import AgentSessionsUploadRunner
@@ -76,8 +77,37 @@ def test_discover_finds_both_tools_and_ignores_wakatime(tmp_path: Path) -> None:
     assert by_tool["codex"].session_id == "019ec722-5a03-7980-bd45-f34ba5bd9502"
 
 
+def test_openclaw_session_id_from_filename() -> None:
+    assert openclaw_session_id(Path("/x/ebf9f4b8-4f8e-442c-84a7-d5015f64fdb7.jsonl")) == "ebf9f4b8-4f8e-442c-84a7-d5015f64fdb7"
+
+
+def test_discover_openclaw_ignores_trajectory_and_json_sidecars(tmp_path: Path) -> None:
+    sessions = tmp_path / "openclaw" / "agents" / "main" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "sess-oc.jsonl").write_text("{}\n")
+    # Sidecars that must NOT be treated as transcripts.
+    (sessions / "sess-oc.trajectory.jsonl").write_text("{}\n")
+    (sessions / "sess-oc.trajectory-path.json").write_text("{}\n")
+    (sessions / "sess-oc.jsonl.codex-app-server.json").write_text("{}\n")
+    (sessions / "sessions.json").write_text("{}\n")
+
+    files = discover_session_files(
+        claude_projects_dir=None,
+        codex_sessions_dir=None,
+        openclaw_sessions_dir=sessions,
+    )
+    assert [(f.tool, f.session_id) for f in files] == [("openclaw", "sess-oc")]
+
+
 def test_discover_handles_missing_dirs(tmp_path: Path) -> None:
-    assert discover_session_files(claude_projects_dir=tmp_path / "nope", codex_sessions_dir=None) == []
+    assert (
+        discover_session_files(
+            claude_projects_dir=tmp_path / "nope",
+            codex_sessions_dir=None,
+            openclaw_sessions_dir=tmp_path / "nope-oc",
+        )
+        == []
+    )
 
 
 # --- state ------------------------------------------------------------------

@@ -219,9 +219,13 @@ Apple Messages SQL starting points are `apple_messages`, `apple_message_chats`,
 
 ## Local Agent Sessions Upload Scheduler
 
-Captures AI agent CLI session transcripts (Claude Code + Codex) so every device's sessions are
-queryable in the warehouse. The append-only transcripts are tailed and shipped, line by line,
-through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
+Captures AI agent CLI session transcripts (Claude Code + Codex + OpenClaw) so every device's
+sessions are queryable in the warehouse. The append-only transcripts are tailed and shipped,
+line by line, through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
+
+> The macOS LaunchAgent below runs on Zach's Macs (crobat, porygon) for Claude Code/Codex. The
+> **openclaw VM** runs the same uploader for OpenClaw sessions via a systemd user timer — see
+> [OpenClaw Agent Sessions](#openclaw-agent-sessions-openclaw-vm) below.
 
 - LaunchAgent label: `com.zachlatta.personal-data-warehouse.agent-sessions-upload`
 - Installed plist: `~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist`
@@ -252,20 +256,68 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-d
 launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.agent-sessions-upload
 ```
 
-The uploader reads `~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/**/rollout-*.jsonl`
-(override with `AGENT_SESSIONS_CLAUDE_PROJECTS_DIR` / `AGENT_SESSIONS_CODEX_SESSIONS_DIR`),
-tracks a byte offset per file, and uploads new lines as gzipped JSONL batches to
-`agent-sessions/inbox/` on Drive. It reuses the Apple Messages / Voice Memos Drive folder and
-account by default (set `AGENT_SESSIONS_GOOGLE_DRIVE_FOLDER_ID` / `AGENT_SESSIONS_ACCOUNT` to
-override). The `--limit` flag bounds a run (useful for a first backfill). In Dagster, the
+The uploader reads `~/.claude/projects/**/*.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl`, and
+`~/.openclaw/agents/main/sessions/<sessionId>.jsonl` (override with
+`AGENT_SESSIONS_CLAUDE_PROJECTS_DIR` / `AGENT_SESSIONS_CODEX_SESSIONS_DIR` /
+`AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR`; set one to empty to disable that tool on a host). Each
+tool's directory that doesn't exist on a given machine is simply skipped, so the same uploader
+binary works everywhere. The OpenClaw scan ignores the `<sessionId>.trajectory.jsonl` runtime
+trace and the `.json` sidecars next to each transcript. It tracks a byte offset per file and
+uploads new lines as gzipped JSONL batches to `agent-sessions/inbox/` on Drive, reusing the
+Apple Messages / Voice Memos Drive folder and account by default (set
+`AGENT_SESSIONS_GOOGLE_DRIVE_FOLDER_ID` / `AGENT_SESSIONS_ACCOUNT` to override). The `--limit`
+flag bounds a run (useful for a first backfill). In Dagster, the
 `agent_sessions_drive_inbox_sensor` + `agent_sessions_drive_ingest` asset consume the batches.
 
 Agent sessions SQL starting points are the `agent_session_events` table (one row per transcript
-line; `source` is `claude_code` or `codex`, `device` tags the machine) and the
+line; `source` is `claude_code`, `codex`, or `openclaw`, `device` tags the machine) and the
 `clean_agent_sessions` view (per-session roll-up: counts, token sums, title, cwd/git, first
 prompt). Free-text content is also in the unified `searchable_text` view under
 `source = 'agent_session'`. (Not to be confused with `agent_runs`/`agent_run_events`, which log
 the warehouse's own internal enrichment agent.)
+
+### OpenClaw Agent Sessions (openclaw VM)
+
+OpenClaw runs on the `openclaw` Ubuntu VM (libvirt/KVM guest on `rotom`; reach it with
+`ssh openclaw`, or `ssh -J rotom openclaw` when direct TCP is wedged — pings work but SSH can
+time out, a known rotom-side issue). It writes one JSONL transcript per session under
+`~/.openclaw/agents/main/sessions/`. Because the VM is Linux (no launchd), the uploader runs as
+a **systemd user timer** (zrl has `Linger=yes`, so user units run without an active login).
+
+- Checkout: `~/dev/zachlatta/personal-data-warehouse` (clone of `main`); runs via `uv`
+  (`~/.local/bin/uv`).
+- Env: `~/dev/zachlatta/personal-data-warehouse/.env` holds `GMAIL_ACCOUNTS`, the matching
+  `GOOGLE_<slug>_TOKEN_JSON_B64` Drive token, and a Drive folder id (reuses
+  `VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID`). `device` auto-resolves to the hostname `openclaw`.
+- Systemd unit: `personal-data-warehouse-agent-sessions-upload.{service,timer}` (user scope).
+- Checked-in templates: `ops/systemd/personal-data-warehouse-agent-sessions-upload.{service,timer}`.
+- Wrapper: `bin/agent-sessions-upload-systemd`; status helper: `bin/agent-sessions-upload-status-systemd`.
+- Run cadence: every 300s (`OnUnitActiveSec=300s`, `Persistent=true`), mirroring the macOS cadence.
+- Run log: `~/.local/state/personal-data-warehouse/agent-sessions-upload.run.log`;
+  heartbeat: `~/.local/state/personal-data-warehouse/agent-sessions-upload.heartbeat`.
+
+Inspect or repair it (from `ssh -J rotom openclaw`):
+
+```bash
+~/dev/zachlatta/personal-data-warehouse/bin/agent-sessions-upload-status-systemd
+systemctl --user list-timers personal-data-warehouse-agent-sessions-upload.timer --all
+systemctl --user start personal-data-warehouse-agent-sessions-upload.service   # run once now
+journalctl --user -u personal-data-warehouse-agent-sessions-upload.service -n 80 --no-pager
+tail -80 ~/.local/state/personal-data-warehouse/agent-sessions-upload.run.log
+```
+
+Install / reinstall the units after editing the templates:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ops/systemd/personal-data-warehouse-agent-sessions-upload.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now personal-data-warehouse-agent-sessions-upload.timer
+```
+
+To pull new code: `cd ~/dev/zachlatta/personal-data-warehouse && git pull && uv sync`. The
+openclaw uploader only ships data the prod Dagster ingest already understands once
+`openclaw_event_row` is deployed, so land/deploy code changes before enabling the timer.
 
 ## WhatsApp Client (linked device)
 
