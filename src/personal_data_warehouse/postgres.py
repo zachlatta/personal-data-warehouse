@@ -1628,6 +1628,7 @@ class PostgresWarehouse:
     def ensure_whatsapp_tables(self) -> None:
         self._ensure_table_group(_WHATSAPP_TABLES)
         self.ensure_whatsapp_client_session_table()
+        self._ensure_clean_whatsapp_messages_view()
         self._ensure_search_views_if_possible()
 
     def ensure_agent_sessions_tables(self) -> None:
@@ -4258,6 +4259,47 @@ class PostgresWarehouse:
     def insert_whatsapp_chat_participants(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("whatsapp_chat_participants", rows, WHATSAPP_CHAT_PARTICIPANT_COLUMNS)
 
+    def backfill_whatsapp_chats_from_messages(self) -> int:
+        """Ensure every chat_id seen in messages has a whatsapp_chats row.
+
+        History/group sync never emit a chat row for some chat_ids (notably the
+        status@broadcast feed), so a message->chat join falls through to NULL and
+        a status post is indistinguishable from a DM. This fills only the gaps:
+        ON CONFLICT DO NOTHING never touches a real chat row (its name, type,
+        etc.). chat_type is derived from the JID to match
+        ``events.chat_type_for_jid``. Returns the number of rows inserted.
+        """
+        rows = self._query(
+            """
+            INSERT INTO whatsapp_chats (
+                account, chat_id, name, chat_type, is_archived,
+                last_message_at, raw_metadata_json, ingested_at, sync_version
+            )
+            SELECT m.account, m.chat_id, '',
+                CASE
+                    WHEN m.chat_id = 'status@broadcast' THEN 'status'
+                    WHEN m.chat_id LIKE '%@s.whatsapp.net' THEN 'user'
+                    WHEN m.chat_id LIKE '%@lid' THEN 'user'
+                    WHEN m.chat_id LIKE '%@g.us' THEN 'group'
+                    WHEN m.chat_id LIKE '%@broadcast' THEN 'broadcast'
+                    WHEN m.chat_id LIKE '%@newsletter' THEN 'newsletter'
+                    WHEN position('@' in m.chat_id) > 0 THEN split_part(m.chat_id, '@', 2)
+                    ELSE 'unknown'
+                END,
+                0,
+                '1970-01-01 00:00:00+00'::timestamptz,
+                '{"source":"synthesized_from_message"}',
+                now(),
+                1
+            FROM (SELECT DISTINCT account, chat_id FROM whatsapp_messages) m
+            LEFT JOIN whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id
+            WHERE c.chat_id IS NULL AND m.chat_id <> ''
+            ON CONFLICT (account, chat_id) DO NOTHING
+            RETURNING 1
+            """
+        )
+        return len(rows)
+
     def insert_whatsapp_contacts(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("whatsapp_contacts", rows, WHATSAPP_CONTACT_COLUMNS)
 
@@ -5600,6 +5642,61 @@ class PostgresWarehouse:
                 raw_json
             FROM contact_cards
             WHERE is_deleted = 0
+            """
+        )
+
+    def _ensure_clean_whatsapp_messages_view(self) -> None:
+        # Ergonomic layer over whatsapp_messages: a single chat_kind so callers
+        # never re-derive "is this a DM / group / status post" from chat_id, plus
+        # resolved sender_name and chat_name. chat_kind reads the (now complete)
+        # whatsapp_chats.chat_type, falling back to a JID-derived value so the
+        # view is correct even before the chat backfill runs. The fallback CASE
+        # mirrors events.chat_type_for_jid.
+        self._command(
+            """
+            CREATE OR REPLACE VIEW clean_whatsapp_messages AS
+            SELECT
+                m.account,
+                m.chat_id,
+                m.message_id,
+                COALESCE(
+                    NULLIF(c.chat_type, ''),
+                    CASE
+                        WHEN m.chat_id = 'status@broadcast' THEN 'status'
+                        WHEN m.chat_id LIKE '%@s.whatsapp.net' THEN 'user'
+                        WHEN m.chat_id LIKE '%@lid' THEN 'user'
+                        WHEN m.chat_id LIKE '%@g.us' THEN 'group'
+                        WHEN m.chat_id LIKE '%@broadcast' THEN 'broadcast'
+                        WHEN m.chat_id LIKE '%@newsletter' THEN 'newsletter'
+                        WHEN position('@' in m.chat_id) > 0 THEN split_part(m.chat_id, '@', 2)
+                        ELSE 'unknown'
+                    END
+                ) AS chat_kind,
+                CASE
+                    WHEN m.chat_id = 'status@broadcast' THEN 'Status'
+                    WHEN m.chat_id LIKE '%@g.us' THEN NULLIF(c.name, '')
+                    ELSE COALESCE(NULLIF(cc.full_name, ''), NULLIF(cc.push_name, ''), m.chat_id)
+                END AS chat_name,
+                m.sender_jid,
+                m.is_from_me,
+                CASE
+                    WHEN m.is_from_me = 1 THEN 'me'
+                    ELSE COALESCE(
+                        NULLIF(ct.full_name, ''), NULLIF(ct.push_name, ''),
+                        NULLIF(m.push_name, ''), m.sender_jid
+                    )
+                END AS sender_name,
+                m.body_text,
+                m.message_kind,
+                m.media_type,
+                m.quoted_message_id,
+                m.message_at,
+                m.edited_at,
+                m.is_deleted
+            FROM whatsapp_messages m
+            LEFT JOIN whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id
+            LEFT JOIN whatsapp_contacts cc ON cc.account = m.account AND cc.jid = m.chat_id
+            LEFT JOIN whatsapp_contacts ct ON ct.account = m.account AND ct.jid = m.sender_jid
             """
         )
 

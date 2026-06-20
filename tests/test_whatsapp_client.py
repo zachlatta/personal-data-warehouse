@@ -265,6 +265,10 @@ def test_jid_and_timestamp_helpers() -> None:
     assert normalize_jid_string("15551234567:12@s.whatsapp.net") == "15551234567@s.whatsapp.net"
     assert chat_type_for_jid("15551234567@s.whatsapp.net") == "user"
     assert chat_type_for_jid("12345-67890@g.us") == "group"
+    assert chat_type_for_jid("9999@lid") == "user"
+    # The status feed is its own kind, distinct from broadcast lists.
+    assert chat_type_for_jid("status@broadcast") == "status"
+    assert chat_type_for_jid("12345@broadcast") == "broadcast"
     assert timestamp_to_datetime(UNIX_TS) == MESSAGE_AT
     assert timestamp_to_datetime(UNIX_TS * 1000) == MESSAGE_AT
     assert timestamp_to_datetime(0) == datetime.fromtimestamp(0, tz=UTC)

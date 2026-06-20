@@ -19,6 +19,7 @@ class WhatsAppDriveIngestSummary:
     batches_seen: int
     chats_written: int
     chat_participants_written: int
+    chats_backfilled: int
     contacts_written: int
     messages_written: int
     media_items_written: int
@@ -128,6 +129,11 @@ class WhatsAppDriveIngestRunner:
         self._warehouse.insert_whatsapp_messages(message_rows)
         self._warehouse.insert_whatsapp_media_items(media_item_rows)
 
+        # Some chat_ids (notably status@broadcast) never get a chat row from
+        # history/group sync; synthesize the gaps so chat_type is reliable and a
+        # status post can't masquerade as a DM in a message->chat join.
+        chats_backfilled = self._warehouse.backfill_whatsapp_chats_from_messages()
+
         promoted = 0
         if promote:
             self._logger.info(
@@ -154,6 +160,7 @@ class WhatsAppDriveIngestRunner:
             batches_seen=len(batches),
             chats_written=len(chat_rows),
             chat_participants_written=len(chat_participant_rows),
+            chats_backfilled=chats_backfilled,
             contacts_written=len(contact_rows),
             messages_written=len(message_rows),
             media_items_written=len(media_item_rows),

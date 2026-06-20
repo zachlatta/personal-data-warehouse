@@ -89,6 +89,10 @@ def normalize_jid_string(value: str) -> str:
 
 
 def chat_type_for_jid(chat_jid: str) -> str:
+    # The status feed shares the @broadcast server with broadcast lists but is a
+    # distinct, passive "stories" channel, so give it its own kind.
+    if chat_jid == "status@broadcast":
+        return "status"
     server = chat_jid.rpartition("@")[2]
     return {
         "s.whatsapp.net": "user",

@@ -809,6 +809,95 @@ def test_postgres_whatsapp_chat_participants_roundtrip(warehouse: PostgresWareho
     assert rows == [("Alice", 1)]
 
 
+def _wa_message_row(*, chat_id: str, message_id: str, sender_jid: str = "", is_from_me: int = 0,
+                    push_name: str = "", body_text: str = "", sync_version: int = 1) -> dict:
+    base = datetime(2026, 6, 1, 12, tzinfo=UTC)
+    return {
+        "account": "zach@example.test",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "sender_jid": sender_jid or chat_id,
+        "push_name": push_name,
+        "is_from_me": is_from_me,
+        "body_text": body_text,
+        "message_kind": "text",
+        "media_type": "",
+        "quoted_message_id": "",
+        "message_at": base,
+        "edited_at": datetime.fromtimestamp(0, tz=UTC),
+        "is_deleted": 0,
+        "raw_metadata_json": "{}",
+        "ingested_at": base,
+        "sync_version": sync_version,
+    }
+
+
+def test_backfill_whatsapp_chats_fills_gaps_without_clobbering(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_whatsapp_tables()
+    base = datetime(2026, 6, 1, 12, tzinfo=UTC)
+    # A real, named group chat already exists; backfill must not touch it.
+    warehouse.insert_whatsapp_chats([
+        {
+            "account": "zach@example.test", "chat_id": "111@g.us", "name": "Real Group",
+            "chat_type": "group", "is_archived": 0, "last_message_at": base,
+            "raw_metadata_json": "{}", "ingested_at": base, "sync_version": 5,
+        }
+    ])
+    warehouse.insert_whatsapp_messages([
+        _wa_message_row(chat_id="111@g.us", message_id="g1"),                  # has a chat row
+        _wa_message_row(chat_id="status@broadcast", message_id="s1"),         # no chat row -> status
+        _wa_message_row(chat_id="222@g.us", message_id="g2"),                 # no chat row -> group
+        _wa_message_row(chat_id="15550001@s.whatsapp.net", message_id="d1"),  # -> user
+        _wa_message_row(chat_id="98765@lid", message_id="d2"),               # -> user
+    ])
+
+    inserted = warehouse.backfill_whatsapp_chats_from_messages()
+
+    assert inserted == 4  # everything except the already-present 111@g.us
+    kinds = dict(warehouse._query(
+        "SELECT chat_id, chat_type FROM whatsapp_chats WHERE account='zach@example.test'"
+    ))
+    assert kinds["status@broadcast"] == "status"
+    assert kinds["222@g.us"] == "group"
+    assert kinds["15550001@s.whatsapp.net"] == "user"
+    assert kinds["98765@lid"] == "user"
+    # Existing named group untouched.
+    name = warehouse._query("SELECT name FROM whatsapp_chats WHERE chat_id='111@g.us'")[0][0]
+    assert name == "Real Group"
+    # Idempotent: a second pass inserts nothing.
+    assert warehouse.backfill_whatsapp_chats_from_messages() == 0
+
+
+def test_clean_whatsapp_messages_view_classifies_and_resolves(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_whatsapp_tables()
+    base = datetime(2026, 6, 1, 12, tzinfo=UTC)
+    warehouse.insert_whatsapp_contacts([
+        {
+            "account": "zach@example.test", "jid": "15550001@s.whatsapp.net",
+            "push_name": "Pushy", "first_name": "", "full_name": "Alice Example",
+            "business_name": "", "raw_metadata_json": "{}", "ingested_at": base, "sync_version": 1,
+        }
+    ])
+    warehouse.insert_whatsapp_messages([
+        _wa_message_row(chat_id="status@broadcast", message_id="s1", sender_jid="15559999@s.whatsapp.net", push_name="Statusy"),
+        _wa_message_row(chat_id="333@g.us", message_id="g1", sender_jid="15550001@s.whatsapp.net"),
+        _wa_message_row(chat_id="15550001@s.whatsapp.net", message_id="d1", sender_jid="15550001@s.whatsapp.net"),
+    ])
+    warehouse.backfill_whatsapp_chats_from_messages()
+
+    rows = dict(warehouse._query(
+        "SELECT message_id, chat_kind FROM clean_whatsapp_messages WHERE account='zach@example.test'"
+    ))
+    assert rows["s1"] == "status"
+    assert rows["g1"] == "group"
+    assert rows["d1"] == "user"
+    # sender_name resolves via whatsapp_contacts (full_name wins over push_name).
+    sender = warehouse._query(
+        "SELECT sender_name FROM clean_whatsapp_messages WHERE message_id='d1'"
+    )[0][0]
+    assert sender == "Alice Example"
+
+
 def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     warehouse.ensure_calendar_tables()

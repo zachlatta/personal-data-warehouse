@@ -29,6 +29,7 @@ class FakeLogger:
 class FakeWarehouse:
     def __init__(self) -> None:
         self.ensure_called = False
+        self.backfill_called = False
         self.chats: list[dict[str, object]] = []
         self.chat_participants: list[dict[str, object]] = []
         self.contacts: list[dict[str, object]] = []
@@ -52,6 +53,10 @@ class FakeWarehouse:
 
     def insert_whatsapp_media_items(self, rows) -> None:
         self.media_items.extend(rows)
+
+    def backfill_whatsapp_chats_from_messages(self) -> int:
+        self.backfill_called = True
+        return 0
 
 
 class FakeObjectStore:
@@ -326,6 +331,7 @@ def test_drive_ingest_runner_dedupes_media_updates_and_promotes() -> None:
     ).sync()
 
     assert warehouse.ensure_called
+    assert warehouse.backfill_called
     assert summary.batches_seen == 1
     assert summary.chats_written == 1
     assert summary.chat_participants_written == 1
