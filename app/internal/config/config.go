@@ -37,11 +37,24 @@ type Config struct {
 	ObjectStoreBackend             string
 	ObjectStoreGoogleDriveFolderID string
 	ObjectStoreGoogleTokenJSON     string
+	// Drive REST base-URL overrides and an auth bypass, for local integration
+	// testing against a fake Drive. Never set in production.
+	ObjectStoreGoogleDriveAPIBaseURL    string
+	ObjectStoreGoogleDriveUploadBaseURL string
+	ObjectStoreGoogleDriveDisableAuth   bool
 	// ObjectStoreMaxObjectBytes caps how large an object the signed download
 	// endpoint will serve; the Drive backend buffers whole objects in memory.
 	ObjectStoreMaxObjectBytes int64
 	// ObjectStoreURLTTL is how long signed object download links stay valid.
 	ObjectStoreURLTTL time.Duration
+
+	// IngestFolderIDs is the Drive folder id each ingestion source writes into,
+	// keyed by source slug (e.g. "agent_sessions"). The app owns these so client
+	// devices never hold a folder id or credential. Each falls back to
+	// ObjectStoreGoogleDriveFolderID when its per-source override is unset.
+	IngestFolderIDs map[string]string
+	// IngestMaxObjectBytes caps the body size the ingestion endpoints accept.
+	IngestMaxObjectBytes int64
 
 	// SlackAccounts are the Slack workspaces whose files the app can fetch
 	// live from the Slack API (slack_files rows only record metadata). Parsed
@@ -70,7 +83,25 @@ func (c Config) SlackTokens() []string {
 func (c Config) ObjectStoreEnabled() bool {
 	return c.ObjectStoreBackend == "google_drive" &&
 		c.ObjectStoreGoogleDriveFolderID != "" &&
-		c.ObjectStoreGoogleTokenJSON != ""
+		(c.ObjectStoreGoogleTokenJSON != "" || c.ObjectStoreGoogleDriveDisableAuth)
+}
+
+// ingestSourceEnvInfix maps each ingestion source slug to the infix used in its
+// per-source folder override env var (PDW_INGEST_<INFIX>_FOLDER_ID).
+var ingestSourceEnvInfix = map[string]string{
+	"agent_sessions":    "AGENT_SESSIONS",
+	"apple_messages":    "APPLE_MESSAGES",
+	"whatsapp":          "WHATSAPP",
+	"apple_voice_memos": "VOICE_MEMOS",
+	"apple_notes":       "APPLE_NOTES",
+}
+
+// IngestEnabled reports whether the app can accept client uploads: it needs the
+// Drive credential (the same one the read path uses) so it can write on behalf
+// of clients.
+func (c Config) IngestEnabled() bool {
+	return c.ObjectStoreBackend == "google_drive" &&
+		(c.ObjectStoreGoogleTokenJSON != "" || c.ObjectStoreGoogleDriveDisableAuth)
 }
 
 func LoadFromEnv(getenv func(string) string) (Config, error) {
@@ -130,6 +161,9 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	cfg.ObjectStoreBackend = valueOrDefault(getenv("PDW_OBJECT_STORE_BACKEND"), "google_drive")
 	cfg.ObjectStoreGoogleDriveFolderID = strings.TrimSpace(getenv("PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID"))
 	cfg.ObjectStoreGoogleTokenJSON = jsonEnvValue(getenv, "PDW_OBJECT_STORE_GOOGLE_TOKEN_JSON")
+	cfg.ObjectStoreGoogleDriveAPIBaseURL = strings.TrimSpace(getenv("PDW_OBJECT_STORE_GOOGLE_DRIVE_API_BASE_URL"))
+	cfg.ObjectStoreGoogleDriveUploadBaseURL = strings.TrimSpace(getenv("PDW_OBJECT_STORE_GOOGLE_DRIVE_UPLOAD_BASE_URL"))
+	cfg.ObjectStoreGoogleDriveDisableAuth = parseBool(getenv("PDW_OBJECT_STORE_GOOGLE_DRIVE_DISABLE_AUTH"))
 	cfg.ObjectStoreMaxObjectBytes = 100 * 1024 * 1024
 	if cfg.ObjectStoreMaxObjectBytes, err = parsePositiveInt64(getenv("PDW_OBJECT_STORE_MAX_OBJECT_BYTES"), cfg.ObjectStoreMaxObjectBytes, "PDW_OBJECT_STORE_MAX_OBJECT_BYTES"); err != nil {
 		return Config{}, err
@@ -140,6 +174,21 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		if err != nil || cfg.ObjectStoreURLTTL <= 0 {
 			return Config{}, fmt.Errorf("PDW_OBJECT_URL_TTL must be a positive Go duration")
 		}
+	}
+
+	cfg.IngestFolderIDs = map[string]string{}
+	for slug, infix := range ingestSourceEnvInfix {
+		folder := firstNonEmpty(
+			getenv("PDW_INGEST_"+infix+"_FOLDER_ID"),
+			cfg.ObjectStoreGoogleDriveFolderID,
+		)
+		if folder := strings.TrimSpace(folder); folder != "" {
+			cfg.IngestFolderIDs[slug] = folder
+		}
+	}
+	cfg.IngestMaxObjectBytes = 512 * 1024 * 1024
+	if cfg.IngestMaxObjectBytes, err = parsePositiveInt64(getenv("PDW_INGEST_MAX_OBJECT_BYTES"), cfg.IngestMaxObjectBytes, "PDW_INGEST_MAX_OBJECT_BYTES"); err != nil {
+		return Config{}, err
 	}
 
 	for _, name := range parseCSV(getenv("SLACK_ACCOUNTS")) {

@@ -14,13 +14,15 @@ Current ingestion path:
 - Google Contacts syncs intentionally saved contacts for configured Google accounts through the
   People API. It mirrors source cards with raw JSON payloads, sync tokens, and tombstones; it does
   not import Gmail autocomplete/Other Contacts or infer people across sources.
-- Voice Memos use a two-stage path: a local macOS uploader writes audio files and JSON metadata
-  to Google Drive, then a Dagster asset ingests those metadata into Postgres.
+- Voice Memos use a two-stage path: a local macOS uploader posts audio files and JSON metadata
+  to the app's `/ingest/...` endpoints; the app writes Google Drive inbox objects, then Dagster
+  ingests those metadata into Postgres.
 - Apple Notes use the same two-stage local Mac path: a LaunchAgent snapshots the local Notes
-  SQLite store, uploads immutable note revision sidecars to Google Drive, and Dagster ingests them.
-- Apple Messages use the same local Mac object-store path: a LaunchAgent snapshots `chat.db`,
-  uploads compressed message batches plus bounded attachment backfill objects to Google Drive,
-  and Dagster ingests them into normalized Postgres tables.
+  SQLite store, posts immutable note revision payloads to the app, and Dagster ingests the
+  app-written Drive objects.
+- Apple Messages use the same local Mac app-ingest path: a LaunchAgent snapshots `chat.db`,
+  posts compressed message batches plus bounded attachment backfill objects to the app, and
+  Dagster ingests them into normalized Postgres tables.
 
 ## CLI: `pdw`
 
@@ -103,13 +105,10 @@ CONTACT_GOOGLE_ACCOUNTS=you@work.example,you@personal.example
 CONTACT_PAGE_SIZE=1000
 CONTACT_FORCE_FULL_SYNC=false
 VOICE_MEMOS_ACCOUNT=you@example.com
-VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
-VOICE_MEMOS_STORAGE_BACKEND=google_drive
+PDW_INGEST_BASE_URL=https://your-public-pdw-app
+PDW_INGEST_SIGNING_KEY=<same-secret-as-pdw-app>
 VOICE_MEMOS_EXTENSIONS=.m4a,.qta
 APPLE_MESSAGES_ACCOUNT=you@example.com
-APPLE_MESSAGES_GOOGLE_DRIVE_ACCOUNT=you@example.com
-APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
-APPLE_MESSAGES_STORAGE_BACKEND=google_drive
 APPLE_MESSAGES_STORE_PATH=~/Library/Messages/chat.db
 APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN=536870912
 APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN=200
@@ -179,9 +178,10 @@ GMAIL_DOMAIN_ZACHLATTA_COM_OAUTH_CLIENT_SECRETS_JSON_B64=...
 uv run personal-data-warehouse-google-auth --email zach@zachlatta.com --write-env
 ```
 
-If Contacts are configured, the auth flow also requests Google Contacts readonly access. If Voice
-Memos, Apple Notes, or Apple Messages are configured, the auth flow also requests Google Drive
-access so the local uploader and Drive ingest asset can use the same account token.
+If Contacts are configured, the auth flow also requests Google Contacts readonly access. Google
+Drive access is needed only for server-side object-store readers/writers such as the app ingest
+service, Drive ingest assets, Gmail attachment blob storage, and Alice archival; local device
+uploaders do not hold Drive credentials.
 
 ## Google Contacts Sync
 
@@ -345,25 +345,31 @@ uv run python -c "from dagster import materialize; from personal_data_warehouse.
 
 ## Voice Memos Sync
 
-Voice Memos are split across two processes so the Mac never talks to the warehouse directly:
+Voice Memos are split across three responsibilities so the Mac never talks to the warehouse or
+Google Drive directly:
 
 1. A local macOS CLI scans Apple's Voice Memos recordings directory and uploads new `.m4a`
-   and `.qta` audio files to the Google Drive inbox, alongside one JSON metadata file per audio file.
-2. The remote Dagster asset reads inbox metadata, writes metadata rows to Postgres, then promotes
+   and `.qta` audio payloads to the app's semantic ingest endpoints, alongside one JSON metadata
+   payload per audio file.
+2. The app verifies the upload signature and writes byte-identical Google Drive inbox objects.
+3. The remote Dagster asset reads inbox metadata, writes metadata rows to Postgres, then promotes
    the audio and JSON objects into the library prefix.
 
-Configure the shared Drive folder:
+Configure the local Mac uploader with the app URL and signing secret:
 
 ```bash
 VOICE_MEMOS_ACCOUNT=you@example.com
-VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
-VOICE_MEMOS_STORAGE_BACKEND=google_drive
+PDW_INGEST_BASE_URL=https://your-public-pdw-app
+PDW_INGEST_SIGNING_KEY=<same-secret-as-pdw-app>
 VOICE_MEMOS_EXTENSIONS=.m4a,.qta
 ```
 
-Re-authorize the Google account after adding Voice Memos config so the token includes Drive scope:
+Configure the app/Dagster object store with the shared Drive folder and re-authorize that Google
+account so the token includes Drive scope:
 
 ```bash
+PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
+VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
 uv run personal-data-warehouse-google-auth --email you@example.com --write-env
 ```
 
@@ -375,8 +381,8 @@ uv run personal-data-warehouse-apple-voice-memos-upload
 
 The uploader defaults to a lightweight incremental mode for scheduled background runs. Incremental mode keeps local
 state in `~/Library/Application Support/personal-data-warehouse/voice-memos-upload-state.json`;
-unchanged recordings that already uploaded both audio and metadata are skipped before hashing,
-network checks, OAuth refresh, or Drive API calls. Use full mode for periodic repair/backfill:
+unchanged recordings that already uploaded both audio and metadata are skipped before hashing or
+network calls. Use full mode for periodic repair/backfill:
 
 ```bash
 uv run personal-data-warehouse-apple-voice-memos-upload --mode full
@@ -458,28 +464,32 @@ A future S3 backend can keep the same metadata format and swap only the object-s
 
 ## Apple Notes Sync
 
-Apple Notes follows the Voice Memos split so the Mac never talks to the warehouse directly:
+Apple Notes follows the Voice Memos split so the Mac never talks to the warehouse or Google Drive
+directly:
 
 1. A local macOS CLI snapshots `NoteStore.sqlite`, extracts notes, folders, readable HTML/text, and
-   locally available attachments, then uploads immutable revision sidecars to the Google Drive inbox.
-2. A Dagster asset reads inbox metadata, writes latest-note, revision-history, and attachment rows
+   locally available attachments, then posts immutable revision payloads to the app.
+2. The app verifies the upload signature and writes the Google Drive inbox objects.
+3. A Dagster asset reads inbox metadata, writes latest-note, revision-history, and attachment rows
    to Postgres, then promotes the Drive objects into the library prefix.
 
-Configure the shared Drive folder:
+Configure the local Mac uploader with the app URL and signing secret:
 
 ```bash
 APPLE_NOTES_ACCOUNT=you@example.com
-APPLE_NOTES_GOOGLE_DRIVE_ACCOUNT=you@example.com
-APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
-APPLE_NOTES_STORAGE_BACKEND=google_drive
+PDW_INGEST_BASE_URL=https://your-public-pdw-app
+PDW_INGEST_SIGNING_KEY=<same-secret-as-pdw-app>
 APPLE_NOTES_STORE_PATH=~/Library/Group\ Containers/group.com.apple.notes/NoteStore.sqlite
 ```
 
-If `APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID` is omitted, the sync falls back to
-`VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID`. Re-authorize the Google account after adding Apple Notes
-config so the token includes Drive scope:
+Configure the app/Dagster object store with the shared Drive folder. If
+`APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID` is omitted, the reader falls back to
+`VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID`. Re-authorize that Google account after adding Apple Notes
+reader config so the token includes Drive scope:
 
 ```bash
+PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
+APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
 uv run personal-data-warehouse-google-auth --email you@example.com --write-env
 ```
 
@@ -549,29 +559,31 @@ The Apple Notes uploader uses the same network guard as Voice Memos. Apple Notes
 ## Apple Messages Sync
 
 Apple Messages follows the same local-Apple-data path as Apple Notes: the Mac never talks directly
-to Postgres. The local uploader snapshots `~/Library/Messages/chat.db`, streams iMessage, SMS, RCS,
-chat, handle, join, deletion, and attachment metadata into compressed JSONL batches, and uploads
-those batches to Google Drive. Attachment binaries are uploaded separately in bounded backfill runs
-so message text can land quickly while large media catches up.
+to Postgres or Google Drive. The local uploader snapshots `~/Library/Messages/chat.db`, streams
+iMessage, SMS, RCS, chat, handle, join, deletion, and attachment metadata into compressed JSONL
+batches, and posts those batches to the app. Attachment binaries are posted separately in bounded
+backfill runs so message text can land quickly while large media catches up.
 
-Configure the shared Drive folder:
+Configure the local Mac uploader with the app URL and signing secret:
 
 ```bash
 APPLE_MESSAGES_ACCOUNT=you@example.com
-APPLE_MESSAGES_GOOGLE_DRIVE_ACCOUNT=you@example.com
-APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
-APPLE_MESSAGES_STORAGE_BACKEND=google_drive
+PDW_INGEST_BASE_URL=https://your-public-pdw-app
+PDW_INGEST_SIGNING_KEY=<same-secret-as-pdw-app>
 APPLE_MESSAGES_STORE_PATH=~/Library/Messages/chat.db
 APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN=536870912
 APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN=200
 APPLE_MESSAGES_UPLOAD_WORKERS=4
 ```
 
-If `APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID` is omitted, the sync falls back to
-`APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID`, then `VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID`. Re-authorize the
-Google account after adding Apple Messages config so the token includes Drive scope:
+Configure the app/Dagster object store with the shared Drive folder. If
+`APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID` is omitted, the reader falls back to
+`APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID`, then `VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID`. Re-authorize that
+Google account after adding Apple Messages reader config so the token includes Drive scope:
 
 ```bash
+PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
+APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
 uv run personal-data-warehouse-google-auth --email you@example.com --write-env
 ```
 
@@ -582,14 +594,14 @@ uv run personal-data-warehouse-apple-messages-upload
 ```
 
 Incremental mode keeps local state in
-`~/Library/Application Support/personal-data-warehouse/apple-messages-upload-state.sqlite`. Message,
-chat, handle, join, deletion, and attachment metadata batches are written under:
+`~/Library/Application Support/personal-data-warehouse/apple-messages-upload-state.sqlite`. The app
+writes message, chat, handle, join, deletion, and attachment metadata batches under:
 
 ```text
 apple-messages/inbox/batches/YYYY/MM/<exported-at>-<batch-sha256>.jsonl.gz
 ```
 
-Attachment binaries are uploaded under:
+The app writes attachment binaries under:
 
 ```text
 apple-messages/inbox/attachments/YYYY/MM/<message-date>-<attachment-guid>-<content-sha256>.<ext>

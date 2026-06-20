@@ -38,6 +38,13 @@ MCP_QUERY_TIMEOUT=300s
 PDW_MUTATION_UI_PASSWORD=...
 PDW_MUTATION_UI_SESSION_SECRET=...
 PDW_MUTATION_UI_SESSION_TTL_SECONDS=43200
+PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
+PDW_OBJECT_STORE_GOOGLE_TOKEN_JSON_B64=<authorized-user-token-json>
+PDW_INGEST_AGENT_SESSIONS_FOLDER_ID=<optional-source-folder-id>
+PDW_INGEST_APPLE_MESSAGES_FOLDER_ID=<optional-source-folder-id>
+PDW_INGEST_WHATSAPP_FOLDER_ID=<optional-source-folder-id>
+PDW_INGEST_VOICE_MEMOS_FOLDER_ID=<optional-source-folder-id>
+PDW_INGEST_APPLE_NOTES_FOLDER_ID=<optional-source-folder-id>
 ```
 
 `PDW_SECRET_TOKEN` is the shared secret. It does triple duty: signing key for
@@ -59,6 +66,12 @@ Set `PDW_MUTATION_UI_PASSWORD` to enable the mutation proposal tools and the rev
 `/mutation-review`. `PDW_MUTATION_UI_SESSION_SECRET` should be a separate high-entropy value; if it
 is omitted, the process generates an ephemeral signing secret and browser sessions are invalidated
 on restart.
+
+Set `PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID` and `PDW_OBJECT_STORE_GOOGLE_TOKEN_JSON` (or
+`_B64`) to enable object downloads and client upload ingestion. Local uploaders POST signed domain
+payloads to `/ingest/...`; the app owns the Drive credential, object keys, `kind` values, and
+`pdw_*` tags. Per-source `PDW_INGEST_<SOURCE>_FOLDER_ID` vars are optional and otherwise fall back
+to the shared object-store folder.
 
 ## Run Locally
 

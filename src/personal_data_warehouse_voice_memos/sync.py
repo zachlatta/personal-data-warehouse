@@ -5,8 +5,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-import hashlib
-import json
 import threading
 
 from personal_data_warehouse_voice_memos.scanner import (
@@ -16,10 +14,7 @@ from personal_data_warehouse_voice_memos.scanner import (
     scan_voice_memo_file_candidates,
 )
 from personal_data_warehouse_voice_memos.state import VoiceMemosUploadState
-from personal_data_warehouse.objectstore import ObjectPresence, ObjectStore
 
-OBJECT_PREFIX = "apple-voice-memos"
-INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox"
 PARTIAL_LOCAL_DURATION_TOLERANCE_SECONDS = 5.0
 
 
@@ -54,8 +49,7 @@ class VoiceMemosUploadRunner:
         account: str,
         recordings_path: Path | str,
         extensions: tuple[str, ...],
-        object_store: ObjectStore | None = None,
-        object_store_factory: Callable[[], ObjectStore] | None = None,
+        ingest_client,
         logger,
         now=None,
         limit: int | None = None,
@@ -65,16 +59,13 @@ class VoiceMemosUploadRunner:
         min_file_age_seconds: int = 0,
         before_upload_check: Callable[[], str | None] | None = None,
     ) -> None:
-        if object_store is None and object_store_factory is None:
-            raise ValueError("object_store or object_store_factory must be provided")
-        if object_store is not None and object_store_factory is not None:
-            raise ValueError("pass only one of object_store or object_store_factory")
+        # Uploads go through the app's ingest endpoints only.
+        if ingest_client is None:
+            raise ValueError("ingest_client is required")
         self._account = account
         self._recordings_path = Path(recordings_path).expanduser()
         self._extensions = extensions
-        self._object_store = object_store
-        self._object_store_factory = object_store_factory
-        self._thread_local = threading.local()
+        self._ingest_client = ingest_client
         self._state_lock = threading.Lock()
         self._logger = logger
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -338,88 +329,42 @@ class VoiceMemosUploadRunner:
         return bool(entry is not None and entry.complete and entry.matches(candidate))
 
     def _sync_recording(self, *, index: int, total: int, recording: VoiceMemoRecording) -> _RecordingSyncResult:
-        object_store = self._object_store_for_thread()
-        presence = object_presence(object_store, content_sha256=recording.content_sha256)
-        audio_exists = presence.audio_exists
-        metadata_exists = presence.metadata_exists
-        audio_key = audio_object_key(recording)
-        metadata_key = metadata_object_key(recording)
-        if audio_exists and metadata_exists:
-            self._logger.info(
-                "[%s/%s] skip %s (%s, sha256=%s): audio and metadata already present",
-                index,
-                total,
-                recording.filename,
-                format_bytes(recording.size_bytes),
-                short_sha256(recording.content_sha256),
-            )
-            return _RecordingSyncResult(
-                uploaded=0,
-                skipped=1,
-                metadata_uploaded=0,
-                bytes_uploaded=0,
-                bytes_skipped=recording.size_bytes,
-                audio_present=True,
-                metadata_present=True,
-            )
-
+        # The app owns object keys, kinds, and pdw_* tags and dedups by content
+        # sha, so we always send and let the app collapse duplicates.
+        recorded_at = recording.recorded_at.isoformat()
         self._logger.info(
-            "[%s/%s] upload %s (%s, sha256=%s) -> %s",
+            "[%s/%s] upload %s (%s, sha256=%s) -> app",
             index,
             total,
             recording.filename,
             format_bytes(recording.size_bytes),
             short_sha256(recording.content_sha256),
-            audio_key,
         )
-        if not audio_exists:
-            object_store.put_file(
-                path=recording.path,
-                object_key=audio_key,
-                content_sha256=recording.content_sha256,
-                content_type=recording.content_type,
-                skip_existing_check=True,
-            )
+        self._ingest_client.upload_voice_memo_audio(
+            recording.path.read_bytes(),
+            recorded_at=recorded_at,
+            extension=recording.extension,
+            content_type=recording.content_type,
+        )
         metadata_payload = build_metadata(
             account=self._account,
             recording=recording,
             uploaded_at=self._now(),
         )
-        self._logger.info(
-            "[%s/%s] metadata %s -> %s",
-            index,
-            total,
-            recording.filename,
-            metadata_key,
+        self._ingest_client.upload_voice_memo_metadata(
+            metadata_payload,
+            recorded_at=recorded_at,
+            audio_content_sha256=recording.content_sha256,
         )
-        if not metadata_exists:
-            object_store.put_json(
-                object_key=metadata_key,
-                payload=metadata_payload,
-                content_sha256=json_sha256(metadata_payload),
-                source_content_sha256=recording.content_sha256,
-                skip_existing_check=True,
-            )
         return _RecordingSyncResult(
             uploaded=1,
             skipped=0,
-            metadata_uploaded=0 if metadata_exists else 1,
-            bytes_uploaded=0 if audio_exists else recording.size_bytes,
+            metadata_uploaded=1,
+            bytes_uploaded=recording.size_bytes,
             bytes_skipped=0,
             audio_present=True,
             metadata_present=True,
         )
-
-    def _object_store_for_thread(self) -> ObjectStore:
-        if self._object_store is not None:
-            return self._object_store
-        store = getattr(self._thread_local, "object_store", None)
-        if store is None:
-            if self._object_store_factory is None:
-                raise RuntimeError("object_store_factory is not configured")
-            store = self._object_store_factory()
-            self._thread_local.object_store = store
-        return store
 
 
 def build_metadata(
@@ -460,37 +405,6 @@ def voice_memo_candidate_is_partially_materialized(candidate: VoiceMemoFileCandi
     if candidate.duration_seconds > 0 and candidate.local_duration_seconds <= 0:
         return True
     return candidate.duration_seconds > candidate.local_duration_seconds + PARTIAL_LOCAL_DURATION_TOLERANCE_SECONDS
-
-
-def object_presence(object_store: ObjectStore, *, content_sha256: str) -> ObjectPresence:
-    presence = getattr(object_store, "presence", None)
-    if callable(presence):
-        return presence(content_sha256=content_sha256)
-    return ObjectPresence(
-        audio_exists=object_store.has_blob(content_sha256=content_sha256),
-        metadata_exists=object_store.has_metadata(content_sha256=content_sha256),
-    )
-
-
-def audio_object_key(recording: VoiceMemoRecording) -> str:
-    year = f"{recording.recorded_at.year:04d}"
-    month = f"{recording.recorded_at.month:02d}"
-    return f"{INBOX_PREFIX}/{year}/{month}/{dated_object_basename(recording)}{recording.extension}"
-
-
-def metadata_object_key(recording: VoiceMemoRecording) -> str:
-    year = f"{recording.recorded_at.year:04d}"
-    month = f"{recording.recorded_at.month:02d}"
-    return f"{INBOX_PREFIX}/{year}/{month}/{dated_object_basename(recording)}.json"
-
-
-def dated_object_basename(recording: VoiceMemoRecording) -> str:
-    return f"{recording.recorded_at.date().isoformat()}-{recording.content_sha256}"
-
-
-def json_sha256(payload: dict[str, object]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def short_sha256(value: str) -> str:

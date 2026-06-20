@@ -8,9 +8,12 @@ import os
 import sys
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
-from personal_data_warehouse.objectstore.google_drive import is_transient_google_error
-from personal_data_warehouse_voice_memos.network import NetworkPolicy, preflight_google_drive
+from personal_data_warehouse.ingest_client import ingest_client_from_env
+from personal_data_warehouse_voice_memos.network import (
+    NetworkPolicy,
+    is_transient_upload_error,
+    preflight_app_ingest,
+)
 from personal_data_warehouse_apple_messages.state import AppleMessagesUploadState, default_state_file
 from personal_data_warehouse_apple_messages.sync import AppleMessagesUploadRunner
 
@@ -24,7 +27,7 @@ class CliLogger:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload local macOS Apple Messages batches to Google Drive.")
+    parser = argparse.ArgumentParser(description="Upload local macOS Apple Messages batches through the app ingest API.")
     parser.add_argument("--mode", choices=("incremental", "full"), default="incremental", help="Upload mode")
     parser.add_argument("--state-file", type=Path, default=default_state_file(), help="Incremental upload state path")
     parser.add_argument(
@@ -54,11 +57,8 @@ def main() -> None:
     settings = load_settings(require_postgres=False, require_gmail=False, require_apple_messages=True)
     if settings.apple_messages is None:
         raise RuntimeError("Apple Messages sync is not configured")
-    if settings.apple_messages.storage_backend != "google_drive":
-        raise RuntimeError(f"Unsupported Apple Messages storage backend: {settings.apple_messages.storage_backend}")
 
     logger = CliLogger()
-    request_timeout_seconds = int(os.getenv("APPLE_MESSAGES_UPLOAD_REQUEST_TIMEOUT_SECONDS", "30"))
     preflight_timeout_seconds = float(os.getenv("APPLE_MESSAGES_UPLOAD_PREFLIGHT_TIMEOUT_SECONDS", "5"))
     workers = args.workers or settings.apple_messages.upload_workers
     workers = max(1, workers)
@@ -75,12 +75,7 @@ def main() -> None:
             summary = AppleMessagesUploadRunner(
                 account=settings.apple_messages.account,
                 store_path=settings.apple_messages.store_path,
-                object_store_factory=lambda: build_google_drive_object_store(
-                    account=settings.apple_messages.google_drive_account,
-                    settings=settings,
-                    folder_id=settings.apple_messages.google_drive_folder_id,
-                    request_timeout_seconds=request_timeout_seconds,
-                ),
+                ingest_client=ingest_client_from_env(),
                 logger=logger,
                 upload_state=state,
                 mode=args.mode,
@@ -110,20 +105,6 @@ def main() -> None:
     )
 
 
-def build_google_drive_object_store(*, account: str, settings, folder_id: str, request_timeout_seconds: int):
-    return build_object_store(
-        google_drive_spec(
-            folder_id=folder_id,
-            account=account,
-            source="apple_messages",
-            blob_kind="apple_message_attachment",
-            metadata_kind="apple_message_export_batch",
-            request_timeout_seconds=request_timeout_seconds,
-        ),
-        settings=settings,
-    )
-
-
 def build_before_upload_check(*, preflight_timeout_seconds: float):
     policy = NetworkPolicy.from_env(
         prefix="APPLE_MESSAGES_UPLOAD",
@@ -134,7 +115,7 @@ def build_before_upload_check(*, preflight_timeout_seconds: float):
         decision = policy.check()
         if not decision.allowed:
             return decision.reason
-        preflight = preflight_google_drive(timeout_seconds=preflight_timeout_seconds)
+        preflight = preflight_app_ingest(timeout_seconds=preflight_timeout_seconds)
         if not preflight.allowed:
             return preflight.reason
         return None
@@ -179,7 +160,7 @@ def exclusive_lock(path: Path):
 def is_transient_exception(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None:
-        if isinstance(current, Exception) and is_transient_google_error(current):
+        if isinstance(current, Exception) and is_transient_upload_error(current):
             return True
         current = current.__cause__ or current.__context__
     return False

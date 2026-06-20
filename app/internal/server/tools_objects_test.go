@@ -78,8 +78,10 @@ const objectsTestBaseURL = "http://example.test"
 
 var objectsTestNow = time.Unix(1_700_000_000, 0)
 
+const objectsTestSecret = "0123456789abcdef0123456789abcdef"
+
 func objectsTestSigner() *pdwauth.Service {
-	return pdwauth.NewService([]byte("0123456789abcdef0123456789abcdef"), func() time.Time { return objectsTestNow })
+	return pdwauth.NewService([]byte(objectsTestSecret), func() time.Time { return objectsTestNow })
 }
 
 func invokeGetObject(t *testing.T, store objectstore.ObjectStore, in getObjectInput) getObjectOutput {

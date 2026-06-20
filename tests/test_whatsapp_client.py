@@ -45,51 +45,37 @@ class FakeLogger:
         self.messages.append(args[0] % args[1:] if len(args) > 1 else str(args[0]))
 
 
-class FakeObjectStore:
-    backend = "fake"
+class FakeIngestClient:
+    """Stands in for the app ingest client; records batch + media posts in
+    file_uploads (tagged by kind), with the posted bytes."""
 
     def __init__(self) -> None:
         self.file_uploads: list[dict[str, object]] = []
 
-    def put_file(
-        self,
-        *,
-        path: Path,
-        object_key: str,
-        content_sha256: str,
-        content_type: str,
-        skip_existing_check: bool = False,
-        app_properties: dict[str, str] | None = None,
-        kind: str | None = None,
-    ):
+    def _stored(self) -> dict:
+        return {"storage_backend": "google_drive", "storage_key": "k", "storage_file_id": "fid", "storage_url": ""}
+
+    def upload_whatsapp_batch(self, gzip_bytes, *, exported_at):
+        self.file_uploads.append({"kind": "whatsapp_export_batch", "bytes": gzip_bytes, "exported_at": exported_at})
+        return self._stored()
+
+    def upload_whatsapp_media(self, content, *, chat_id, message_id, content_type, message_at, filename, mime_type):
         self.file_uploads.append(
-            {
-                "object_key": object_key,
-                "content_sha256": content_sha256,
-                "content_type": content_type,
-                "kind": kind or "file",
-                "app_properties": app_properties or {},
-                "bytes": path.read_bytes(),
-            }
+            {"kind": "whatsapp_media_item", "bytes": content, "chat_id": chat_id, "message_id": message_id, "content_type": content_type}
         )
-        return {
-            "storage_backend": self.backend,
-            "storage_key": object_key,
-            "storage_file_id": f"file-{content_sha256[:8]}",
-            "storage_url": f"https://example.test/{object_key}",
-        }
+        return self._stored()
 
 
-class FailOnceBatchObjectStore(FakeObjectStore):
+class FailOnceBatchIngestClient(FakeIngestClient):
     def __init__(self) -> None:
         super().__init__()
         self.fail_next_batch = True
 
-    def put_file(self, **kwargs):
-        if kwargs.get("kind") == "whatsapp_export_batch" and self.fail_next_batch:
+    def upload_whatsapp_batch(self, gzip_bytes, *, exported_at):
+        if self.fail_next_batch:
             self.fail_next_batch = False
             raise RuntimeError("transient batch upload failure")
-        return super().put_file(**kwargs)
+        return super().upload_whatsapp_batch(gzip_bytes, exported_at=exported_at)
 
 
 class FakeSessionWarehouse:
@@ -248,7 +234,7 @@ def test_client_registers_noop_handlers_for_unhandled_neonize_events(tmp_path) -
     runner = WhatsAppClientRunner(
         account="zach@example.com",
         session_path=tmp_path / "session.sqlite",
-        object_store=FakeObjectStore(),
+        ingest_client=FakeIngestClient(),
         upload_state=None,
         logger=FakeLogger(),
     )
@@ -485,7 +471,7 @@ def test_dump_groups_queues_named_chats_and_participants(tmp_path) -> None:
     runner = WhatsAppClientRunner(
         account="zach@example.com",
         session_path=tmp_path / "session.sqlite",
-        object_store=FakeObjectStore(),
+        ingest_client=FakeIngestClient(),
         upload_state=None,
         logger=FakeLogger(),
     )
@@ -508,7 +494,7 @@ def test_dump_groups_retries_after_failure(tmp_path) -> None:
     runner = WhatsAppClientRunner(
         account="zach@example.com",
         session_path=tmp_path / "session.sqlite",
-        object_store=FakeObjectStore(),
+        ingest_client=FakeIngestClient(),
         upload_state=None,
         logger=FakeLogger(),
     )
@@ -522,10 +508,10 @@ def test_dump_groups_retries_after_failure(tmp_path) -> None:
 
 def test_batcher_flushes_batch_with_media_then_skips_unchanged(tmp_path) -> None:
     state = WhatsAppUploadState.open(tmp_path / "state.sqlite", account="zach@example.com", store_path="session")
-    object_store = FakeObjectStore()
+    ingest = FakeIngestClient()
     batcher = WhatsAppBatcher(
         account="zach@example.com",
-        object_store=object_store,
+        ingest_client=ingest,
         upload_state=state,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 13, tzinfo=UTC),
@@ -553,12 +539,14 @@ def test_batcher_flushes_batch_with_media_then_skips_unchanged(tmp_path) -> None
 
         assert summary.batches_uploaded == 1
         assert summary.media_uploaded == 1
-        batch_uploads = [u for u in object_store.file_uploads if u["kind"] == "whatsapp_export_batch"]
-        media_uploads = [u for u in object_store.file_uploads if u["kind"] == "whatsapp_media_item"]
+        batch_uploads = [u for u in ingest.file_uploads if u["kind"] == "whatsapp_export_batch"]
+        media_uploads = [u for u in ingest.file_uploads if u["kind"] == "whatsapp_media_item"]
         assert len(batch_uploads) == 1
         assert len(media_uploads) == 1
         assert media_uploads[0]["bytes"] == b"media body"
-        assert media_uploads[0]["object_key"].startswith("whatsapp/inbox/media/2026/05/")
+        # The app owns the object key now; the client sends the domain ids.
+        assert media_uploads[0]["chat_id"]
+        assert media_uploads[0]["message_id"]
         records = [
             json.loads(line)
             for line in gzip.decompress(batch_uploads[0]["bytes"]).decode("utf-8").splitlines()
@@ -592,10 +580,10 @@ def test_batcher_flushes_batch_with_media_then_skips_unchanged(tmp_path) -> None
 
 
 def test_batcher_requeues_records_when_batch_upload_fails() -> None:
-    object_store = FailOnceBatchObjectStore()
+    ingest = FailOnceBatchIngestClient()
     batcher = WhatsAppBatcher(
         account="zach@example.com",
-        object_store=object_store,
+        ingest_client=ingest,
         upload_state=None,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 13, tzinfo=UTC),
@@ -615,5 +603,5 @@ def test_batcher_requeues_records_when_batch_upload_fails() -> None:
     summary = batcher.flush()
 
     assert summary.batches_uploaded == 1
-    batch_uploads = [u for u in object_store.file_uploads if u["kind"] == "whatsapp_export_batch"]
+    batch_uploads = [u for u in ingest.file_uploads if u["kind"] == "whatsapp_export_batch"]
     assert len(batch_uploads) == 1

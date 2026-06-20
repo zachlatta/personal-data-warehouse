@@ -8,10 +8,9 @@ from pathlib import Path
 import hashlib
 from html import escape
 import json
-import threading
 import tempfile
+import threading
 
-from personal_data_warehouse.objectstore import ObjectStore
 from personal_data_warehouse_apple_notes.scanner import (
     AppleNote,
     AppleNoteAttachment,
@@ -20,9 +19,6 @@ from personal_data_warehouse_apple_notes.scanner import (
     snapshot_apple_notes_store,
 )
 from personal_data_warehouse_apple_notes.state import AppleNotesUploadState
-
-OBJECT_PREFIX = "apple-notes"
-INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox"
 
 
 @dataclass(frozen=True)
@@ -63,8 +59,7 @@ class AppleNotesUploadRunner:
         *,
         account: str,
         store_path: Path | str,
-        object_store: ObjectStore | None = None,
-        object_store_factory: Callable[[], ObjectStore] | None = None,
+        ingest_client,
         logger,
         upload_state: AppleNotesUploadState | None = None,
         now: Callable[[], datetime] | None = None,
@@ -73,21 +68,17 @@ class AppleNotesUploadRunner:
         limit: int | None = None,
         workers: int = 1,
         state_save_callback: Callable[[], None] | None = None,
-        check_remote_existing: bool = False,
     ) -> None:
-        if object_store is None and object_store_factory is None:
-            raise ValueError("object_store or object_store_factory must be provided")
-        if object_store is not None and object_store_factory is not None:
-            raise ValueError("pass only one of object_store or object_store_factory")
+        # Uploads go through the app's ingest endpoints only.
+        if ingest_client is None:
+            raise ValueError("ingest_client is required")
         if mode not in {"full", "incremental"}:
             raise ValueError("mode must be 'full' or 'incremental'")
         if limit is not None and limit < 0:
             raise ValueError("limit must be nonnegative")
         self._account = account
         self._store_path = Path(store_path).expanduser()
-        self._object_store = object_store
-        self._object_store_factory = object_store_factory
-        self._thread_local = threading.local()
+        self._ingest_client = ingest_client
         self._state_lock = threading.Lock()
         self._logger = logger
         self._upload_state = upload_state
@@ -97,7 +88,6 @@ class AppleNotesUploadRunner:
         self._limit = limit
         self._workers = max(1, workers)
         self._state_save_callback = state_save_callback
-        self._check_remote_existing = check_remote_existing
 
     def sync(self) -> AppleNotesUploadSummary:
         self._logger.info("Snapshotting Apple Notes store at %s", self._store_path)
@@ -221,35 +211,14 @@ class AppleNotesUploadRunner:
 
     def _sync_revision(self, *, index: int, total: int, revision: AppleNoteRevision) -> AppleNoteUploadResult:
         try:
-            object_store = self._object_store_for_thread()
-            if self._check_remote_existing and object_store.has_object(
-                kind="apple_note_revision_metadata",
-                key="revision_id",
-                value=revision.revision_id,
-            ):
-                self._logger.info(
-                    "[%s/%s] skip Apple Note %s revision %s: metadata already present in Drive",
-                    index,
-                    total,
-                    revision.note.note_id,
-                    short_sha256(revision.revision_id),
-                )
-                result = AppleNoteUploadResult(
-                    revision_uploaded=0,
-                    metadata_uploaded=0,
-                    html_uploaded=0,
-                    attachments_uploaded=0,
-                    attachments_missing=sum(1 for attachment in revision.note.attachments if attachment.is_missing),
-                )
-            else:
-                self._logger.info(
-                    "[%s/%s] upload Apple Note %s revision %s",
-                    index,
-                    total,
-                    revision.note.note_id,
-                    short_sha256(revision.revision_id),
-                )
-                result = self._upload_revision(revision, object_store=object_store)
+            self._logger.info(
+                "[%s/%s] upload Apple Note %s revision %s -> app",
+                index,
+                total,
+                revision.note.note_id,
+                short_sha256(revision.revision_id),
+            )
+            result = self._upload_revision(revision)
             self._mark_success(revision=revision, result=result)
             return result
         except Exception as exc:
@@ -287,20 +256,14 @@ class AppleNotesUploadRunner:
             if self._state_save_callback is not None:
                 self._state_save_callback()
 
-    def _object_store_for_thread(self) -> ObjectStore:
-        if self._object_store is not None:
-            return self._object_store
-        store = getattr(self._thread_local, "object_store", None)
-        if store is None:
-            if self._object_store_factory is None:
-                raise RuntimeError("object_store_factory is not configured")
-            store = self._object_store_factory()
-            self._thread_local.object_store = store
-        return store
 
-    def _upload_revision(self, revision: AppleNoteRevision, *, object_store: ObjectStore) -> AppleNoteUploadResult:
+    def _upload_revision(self, revision: AppleNoteRevision) -> AppleNoteUploadResult:
+        # The app owns object keys, kinds, and pdw_* tags; we send only the
+        # revision's domain fields and bytes.
         payload = metadata_payload(account=self._account, revision=revision, exported_at=self._now())
-        base_key = revision_object_key_base(revision)
+        modified_at = revision.note.modified_at.astimezone(UTC).isoformat()
+        note_id = revision.note.note_id
+        revision_id = revision.revision_id
         html_uploaded = 0
         attachment_uploads = 0
         attachment_missing = sum(1 for attachment in revision.note.attachments if attachment.is_missing)
@@ -308,52 +271,33 @@ class AppleNotesUploadRunner:
         if not revision.note.is_deleted:
             html = revision.note.body_html or html_document_for_note(revision.note)
             if html:
-                html_sha = text_sha256(html)
-                with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".html") as file:
-                    file.write(html)
-                    file.flush()
-                    object_store.put_file(
-                        path=Path(file.name),
-                        object_key=f"{base_key}.html",
-                        content_sha256=html_sha,
-                        content_type="text/html",
-                        skip_existing_check=True,
-                        kind="apple_note_body_html",
-                        app_properties={
-                            "note_id": revision.note.note_id,
-                            "revision_id": revision.revision_id,
-                        },
-                    )
+                self._ingest_client.upload_apple_notes_body(
+                    html.encode("utf-8"),
+                    note_id=note_id,
+                    revision_id=revision_id,
+                    modified_at=modified_at,
+                )
                 html_uploaded = 1
-
             for attachment in revision.note.attachments:
                 if attachment.is_missing or attachment.path is None or not attachment.content_sha256:
                     continue
-                object_store.put_file(
-                    path=attachment.path,
-                    object_key=attachment_object_key(revision, attachment),
-                    content_sha256=attachment.content_sha256,
+                self._ingest_client.upload_apple_notes_attachment(
+                    Path(attachment.path).read_bytes(),
+                    note_id=note_id,
+                    revision_id=revision_id,
+                    modified_at=modified_at,
+                    attachment_id=attachment.attachment_id,
+                    filename=attachment.filename,
                     content_type=attachment.content_type,
-                    kind="apple_note_attachment",
-                    app_properties={
-                        "note_id": revision.note.note_id,
-                        "revision_id": revision.revision_id,
-                        "attachment_id": attachment.attachment_id,
-                    },
                 )
                 attachment_uploads += 1
 
-        object_store.put_json(
-            object_key=f"{base_key}.json",
-            payload=payload,
-            content_sha256=json_sha256(payload),
-            skip_existing_check=True,
-            kind="apple_note_revision_metadata",
-            app_properties={
-                "note_id": revision.note.note_id,
-                "revision_id": revision.revision_id,
-                "note_content_sha256": revision.fingerprint,
-            },
+        self._ingest_client.upload_apple_notes_revision(
+            payload,
+            note_id=note_id,
+            revision_id=revision_id,
+            modified_at=modified_at,
+            note_content_sha256=revision.fingerprint,
         )
         return AppleNoteUploadResult(
             revision_uploaded=1,
@@ -416,46 +360,15 @@ def metadata_payload(*, account: str, revision: AppleNoteRevision, exported_at: 
     }
 
 
-def revision_object_key_base(revision: AppleNoteRevision, *, stage: str = "inbox") -> str:
-    modified = revision.note.modified_at.astimezone(UTC)
-    return (
-        f"{OBJECT_PREFIX}/{stage}/{modified.year:04d}/{modified.month:02d}/"
-        f"{safe_object_key_part(revision.note.note_id)}/{revision.revision_id}"
-    )
-
-
-def attachment_object_key(revision: AppleNoteRevision, attachment: AppleNoteAttachment, *, stage: str = "inbox") -> str:
-    extension = Path(attachment.filename).suffix
-    suffix = extension if extension else ".bin"
-    return (
-        f"{revision_object_key_base(revision, stage=stage)}/attachments/"
-        f"{safe_object_key_part(attachment.attachment_id)}-{attachment.content_sha256}{suffix}"
-    )
-
-
 def html_document_for_note(note: AppleNote) -> str:
     title = escape(note.title or note.note_id)
     body = note.body_html or ("<pre>" + escape(note.body_text) + "</pre>")
     return f"<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body>{body}</body></html>"
 
 
-def safe_object_key_part(value: str) -> str:
-    return re_sub_invalid(value)[:120] or "untitled"
-
-
-def re_sub_invalid(value: str) -> str:
-    import re
-
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")
-
-
 def json_sha256(payload: dict[str, object]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def text_sha256(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def short_sha256(value: str) -> str:

@@ -7,6 +7,7 @@ import re
 import socket
 import subprocess
 from typing import Callable
+from urllib.parse import urlsplit
 
 DEFAULT_BLOCKED_HARDWARE_PORT_PATTERNS = (
     r"iphone",
@@ -266,12 +267,54 @@ def swift_string_literal_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def preflight_google_drive(timeout_seconds: float) -> NetworkDecision:
+def ingest_base_url_from_env() -> str:
+    return (os.getenv("PDW_INGEST_BASE_URL") or os.getenv("MCP_BASE_URL") or "").strip()
+
+
+def preflight_app_ingest(
+    timeout_seconds: float,
+    *,
+    base_url: str | None = None,
+    connector: Callable[[tuple[str, int], float], object] = socket.create_connection,
+) -> NetworkDecision:
+    raw_base_url = (base_url if base_url is not None else ingest_base_url_from_env()).strip()
+    if not raw_base_url:
+        return NetworkDecision(False, "PDW_INGEST_BASE_URL (or MCP_BASE_URL) is not set")
+    parsed = urlsplit(raw_base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return NetworkDecision(False, f"invalid ingest base URL: {raw_base_url}")
     try:
-        socket.create_connection(("www.googleapis.com", 443), timeout=timeout_seconds).close()
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return NetworkDecision(False, f"invalid ingest base URL: {raw_base_url}")
+    try:
+        connection = connector((parsed.hostname, port), timeout_seconds)
     except OSError as exc:
-        return NetworkDecision(False, f"Google Drive preflight failed: {exc}")
-    return NetworkDecision(True, "Google Drive preflight succeeded")
+        return NetworkDecision(False, f"app ingest preflight failed: {exc}")
+    close = getattr(connection, "close", None)
+    if callable(close):
+        close()
+    return NetworkDecision(True, "app ingest preflight succeeded")
+
+
+def is_transient_upload_error(exc: Exception) -> bool:
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in {408, 429, 500, 502, 503, 504}:
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "timed out",
+            "timeout",
+            "temporary failure",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "network is unreachable",
+            "name or service not known",
+        )
+    )
 
 
 def patterns_from_env(name: str, default: tuple[str, ...], *, fallback_name: str | None = None) -> tuple[str, ...]:

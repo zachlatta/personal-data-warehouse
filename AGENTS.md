@@ -274,6 +274,29 @@ Apple Messages / Voice Memos Drive folder and account by default (set
 flag bounds a run (useful for a first backfill). In Dagster, the
 `agent_sessions_drive_inbox_sensor` + `agent_sessions_drive_ingest` asset consume the batches.
 
+## Client uploads via the app (the only write path)
+
+Every uploader (agent-sessions, voice-memos, apple-notes, apple-messages, and the in-process
+whatsapp client) writes through the app — there is no longer a direct-to-Drive write path in the
+clients. Each device POSTs domain payloads to the app's semantic ingestion endpoints
+(`POST /ingest/<source>/<type>`, e.g. `/ingest/agent-sessions/batch`,
+`/ingest/apple-messages/batch` + `/attachment`, `/ingest/whatsapp/batch` + `/media`,
+`/ingest/voice-memos/audio` + `/metadata`, `/ingest/apple-notes/body` + `/attachment` +
+`/revision`). The app owns the Drive credential, folder ids, object keys, `kind` values, and
+`pdw_*` tags; the device holds none of that. The app writes byte-identical Drive objects, so the
+Dagster `*_drive_ingest` readers are unchanged.
+
+Every uploader therefore requires `PDW_INGEST_BASE_URL` (or `MCP_BASE_URL`) and the app secret
+token for signing (`PDW_INGEST_SIGNING_KEY`, or `PDW_SECRET_TOKEN` / `MCP_SECRET_TOKEN`); without
+them the uploader fails fast. On the app side, ingestion turns on automatically when the object
+store is configured; per-source folders default to `PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID` and
+can be overridden with `PDW_INGEST_<SOURCE>_FOLDER_ID` (e.g.
+`PDW_INGEST_AGENT_SESSIONS_FOLDER_ID`). Uploads are authenticated with the same HMAC scheme as
+signed download links, bound to the endpoint and the body's sha256, and the app dedups by stable
+content sha. `<SOURCE>_STORAGE_BACKEND` / `<SOURCE>_GOOGLE_DRIVE_FOLDER_ID` now only provision the
+Dagster reader's Drive access (the reader still reads Drive directly); they no longer affect how
+clients write.
+
 Agent sessions SQL starting points are the `agent_session_events` table (one row per transcript
 line; `source` is `claude_code`, `codex`, or `openclaw`, `device` tags the machine) and the
 `clean_agent_sessions` view (per-session roll-up: counts, token sums, title, cwd/git, first

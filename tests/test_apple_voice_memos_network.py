@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from personal_data_warehouse_voice_memos.network import NetworkPolicy, parse_proc_net_route
+from personal_data_warehouse_voice_memos.network import NetworkPolicy, parse_proc_net_route, preflight_app_ingest
 
 
 def test_network_policy_blocks_inflight_wifi_ssid() -> None:
@@ -181,3 +181,31 @@ def test_network_policy_can_require_wifi_ssid() -> None:
 
     assert decision.allowed is False
     assert decision.reason == "Wi-Fi SSID unavailable"
+
+
+def test_app_ingest_preflight_uses_configured_app_host() -> None:
+    calls: list[tuple[tuple[str, int], float]] = []
+
+    class Connection:
+        def close(self) -> None:
+            pass
+
+    def connector(address: tuple[str, int], timeout: float) -> Connection:
+        calls.append((address, timeout))
+        return Connection()
+
+    decision = preflight_app_ingest(
+        timeout_seconds=2.5,
+        base_url="https://pdw.example.test/base",
+        connector=connector,
+    )
+
+    assert decision.allowed is True
+    assert calls == [(("pdw.example.test", 443), 2.5)]
+
+
+def test_app_ingest_preflight_rejects_missing_base_url() -> None:
+    decision = preflight_app_ingest(timeout_seconds=1, base_url="")
+
+    assert decision.allowed is False
+    assert "PDW_INGEST_BASE_URL" in decision.reason

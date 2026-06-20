@@ -2,7 +2,7 @@
 
 Registers as a linked device via neonize (Python bindings over whatsmeow),
 receives live messages + history sync over a persistent connection, and
-flushes records to the Drive inbox through WhatsAppBatcher. Runs inside the
+flushes records through app ingest via WhatsAppBatcher. Runs inside the
 Dagster deployment as a bounded job (see defs/whatsapp_client.py) so it never
 trips run monitoring; WhatsApp queues messages while no run is active.
 """
@@ -17,7 +17,6 @@ import io
 import threading
 from typing import Any
 
-from personal_data_warehouse.objectstore import ObjectStore
 from personal_data_warehouse_whatsapp.batcher import WhatsAppBatcher
 from personal_data_warehouse_whatsapp.events import (
     chat_payload_from_group_info,
@@ -35,8 +34,7 @@ class WhatsAppClientRunner:
         *,
         account: str,
         session_path: Path | str,
-        object_store: ObjectStore | None = None,
-        object_store_factory: Callable[[], ObjectStore] | None = None,
+        ingest_client,
         upload_state: WhatsAppUploadState | None,
         logger,
         run_seconds: int = 10800,
@@ -63,8 +61,7 @@ class WhatsAppClientRunner:
         self._now = now or (lambda: datetime.now(tz=UTC))
         self._batcher = WhatsAppBatcher(
             account=account,
-            object_store=object_store,
-            object_store_factory=object_store_factory,
+            ingest_client=ingest_client,
             upload_state=upload_state,
             logger=logger,
             now=self._now,

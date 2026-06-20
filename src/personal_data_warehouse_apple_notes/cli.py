@@ -8,9 +8,12 @@ import os
 import sys
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
-from personal_data_warehouse.objectstore.google_drive import is_transient_google_error
-from personal_data_warehouse_voice_memos.network import NetworkPolicy, preflight_google_drive
+from personal_data_warehouse.ingest_client import ingest_client_from_env
+from personal_data_warehouse_voice_memos.network import (
+    NetworkPolicy,
+    is_transient_upload_error,
+    preflight_app_ingest,
+)
 from personal_data_warehouse_apple_notes.state import AppleNotesUploadState, default_state_file
 from personal_data_warehouse_apple_notes.sync import AppleNotesUploadRunner
 
@@ -24,7 +27,7 @@ class CliLogger:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload local macOS Apple Notes revisions to Google Drive.")
+    parser = argparse.ArgumentParser(description="Upload local macOS Apple Notes revisions through the app ingest API.")
     parser.add_argument("--mode", choices=("incremental", "full"), default="incremental", help="Upload mode")
     parser.add_argument("--state-file", type=Path, default=default_state_file(), help="Incremental upload state path")
     parser.add_argument(
@@ -50,11 +53,6 @@ def main() -> None:
         default=0,
         help="Number of parallel upload workers; 0 uses APPLE_NOTES_UPLOAD_WORKERS or 4",
     )
-    parser.add_argument(
-        "--check-remote-existing",
-        action="store_true",
-        help="Check Drive for already uploaded revision metadata before uploading; useful after an interrupted run",
-    )
     args = parser.parse_args()
     if args.limit is not None and args.limit < 0:
         parser.error("--limit must be greater than or equal to 0")
@@ -72,8 +70,6 @@ def main() -> None:
     )
     if settings.apple_notes is None:
         raise RuntimeError("Apple Notes sync is not configured")
-    if settings.apple_notes.storage_backend != "google_drive":
-        raise RuntimeError(f"Unsupported Apple Notes storage backend: {settings.apple_notes.storage_backend}")
 
     logger = CliLogger()
     state = AppleNotesUploadState.load(
@@ -81,16 +77,9 @@ def main() -> None:
         account=settings.apple_notes.account,
         store_path=settings.apple_notes.store_path,
     )
-    request_timeout_seconds = int(os.getenv("APPLE_NOTES_UPLOAD_REQUEST_TIMEOUT_SECONDS", "30"))
     preflight_timeout_seconds = float(os.getenv("APPLE_NOTES_UPLOAD_PREFLIGHT_TIMEOUT_SECONDS", "5"))
     workers = args.workers or int(os.getenv("APPLE_NOTES_UPLOAD_WORKERS", "4"))
     workers = max(1, workers)
-    check_remote_existing = args.check_remote_existing or os.getenv("APPLE_NOTES_UPLOAD_CHECK_REMOTE_EXISTING", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "y",
-    }
 
     try:
         with exclusive_lock(args.lock_file) as acquired:
@@ -101,19 +90,13 @@ def main() -> None:
                 summary = AppleNotesUploadRunner(
                     account=settings.apple_notes.account,
                     store_path=settings.apple_notes.store_path,
-                    object_store_factory=lambda: build_google_drive_object_store(
-                        account=settings.apple_notes.google_drive_account,
-                        settings=settings,
-                        folder_id=settings.apple_notes.google_drive_folder_id,
-                        request_timeout_seconds=request_timeout_seconds,
-                    ),
+                    ingest_client=ingest_client_from_env(),
                     logger=logger,
                     upload_state=state,
                     mode=args.mode,
                     limit=args.limit or None,
                     workers=workers,
                     state_save_callback=lambda: state.save(args.state_file),
-                    check_remote_existing=check_remote_existing,
                     before_upload_check=build_before_upload_check(preflight_timeout_seconds=preflight_timeout_seconds),
                 ).sync()
             finally:
@@ -137,20 +120,6 @@ def main() -> None:
     )
 
 
-def build_google_drive_object_store(*, account: str, settings, folder_id: str, request_timeout_seconds: int):
-    return build_object_store(
-        google_drive_spec(
-            folder_id=folder_id,
-            account=account,
-            source="apple_notes",
-            blob_kind="apple_note_body_html",
-            metadata_kind="apple_note_revision_metadata",
-            request_timeout_seconds=request_timeout_seconds,
-        ),
-        settings=settings,
-    )
-
-
 def build_before_upload_check(*, preflight_timeout_seconds: float):
     policy = NetworkPolicy.from_env(
         prefix="APPLE_NOTES_UPLOAD",
@@ -161,7 +130,7 @@ def build_before_upload_check(*, preflight_timeout_seconds: float):
         decision = policy.check()
         if not decision.allowed:
             return decision.reason
-        preflight = preflight_google_drive(timeout_seconds=preflight_timeout_seconds)
+        preflight = preflight_app_ingest(timeout_seconds=preflight_timeout_seconds)
         if not preflight.allowed:
             return preflight.reason
         return None
@@ -206,7 +175,7 @@ def exclusive_lock(path: Path):
 def is_transient_exception(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None:
-        if isinstance(current, Exception) and is_transient_google_error(current):
+        if isinstance(current, Exception) and is_transient_upload_error(current):
             return True
         current = current.__cause__ or current.__context__
     return False

@@ -7,7 +7,6 @@ import sqlite3
 from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
 from personal_data_warehouse_voice_memos.scanner import recording_from_path, scan_voice_memo_file_candidates, scan_voice_memos
 from personal_data_warehouse_voice_memos.state import VoiceMemosUploadState
-from personal_data_warehouse.objectstore import ObjectPresence
 from personal_data_warehouse_voice_memos.sync import VoiceMemosUploadRunner
 
 
@@ -22,70 +21,25 @@ class FakeLogger:
         self.messages.append(args[0] % args[1:] if len(args) > 1 else str(args[0]))
 
 
-class FakeObjectStore:
-    backend = "fake"
+class FakeIngestClient:
+    """Stands in for the app ingest client: records the audio + metadata the
+    runner posts. The app dedups server-side, so the client always sends."""
 
-    def __init__(
-        self,
-        existing_sha256: set[str] | None = None,
-        existing_metadata_sha256: set[str] | None = None,
-    ) -> None:
-        self.existing_sha256 = existing_sha256 or set()
-        self.existing_metadata_sha256 = existing_metadata_sha256 or set()
-        self.file_uploads: list[tuple[Path, str]] = []
-        self.json_uploads: list[tuple[str, dict[str, object]]] = []
-        self.presence_calls: list[str] = []
+    def __init__(self) -> None:
+        self.audio_uploads: list[dict] = []
+        self.metadata_uploads: list[dict] = []
 
-    def has_blob(self, *, content_sha256: str) -> bool:
-        return content_sha256 in self.existing_sha256
-
-    def has_metadata(self, *, content_sha256: str) -> bool:
-        return content_sha256 in self.existing_metadata_sha256
-
-    def presence(self, *, content_sha256: str) -> ObjectPresence:
-        self.presence_calls.append(content_sha256)
-        return ObjectPresence(
-            audio_exists=content_sha256 in self.existing_sha256,
-            metadata_exists=content_sha256 in self.existing_metadata_sha256,
+    def upload_voice_memo_audio(self, content, *, recorded_at, extension, content_type):
+        self.audio_uploads.append(
+            {"content": content, "recorded_at": recorded_at, "extension": extension, "content_type": content_type}
         )
+        return {"storage_backend": "google_drive", "storage_key": "audio", "storage_file_id": "fid-a", "storage_url": ""}
 
-    def put_file(
-        self,
-        *,
-        path: Path,
-        object_key: str,
-        content_sha256: str,
-        content_type: str,
-        skip_existing_check: bool = False,
-    ):
-        if content_sha256 not in self.existing_sha256:
-            self.file_uploads.append((path, object_key))
-        self.existing_sha256.add(content_sha256)
-        return {
-            "storage_backend": self.backend,
-            "storage_key": object_key,
-            "storage_file_id": f"file-{content_sha256[:8]}",
-            "storage_url": f"https://example.test/{object_key}",
-        }
-
-    def put_json(
-        self,
-        *,
-        object_key: str,
-        payload: dict[str, object],
-        content_sha256: str,
-        source_content_sha256: str | None = None,
-        skip_existing_check: bool = False,
-    ):
-        self.json_uploads.append((object_key, payload))
-        if source_content_sha256:
-            self.existing_metadata_sha256.add(source_content_sha256)
-        return {
-            "storage_backend": self.backend,
-            "storage_key": object_key,
-            "storage_file_id": f"metadata-{content_sha256[:8]}",
-            "storage_url": f"https://example.test/{object_key}",
-        }
+    def upload_voice_memo_metadata(self, payload, *, recorded_at, audio_content_sha256):
+        self.metadata_uploads.append(
+            {"payload": payload, "recorded_at": recorded_at, "audio_content_sha256": audio_content_sha256}
+        )
+        return {"storage_backend": "google_drive", "storage_key": "meta", "storage_file_id": "fid-m", "storage_url": ""}
 
 
 def test_load_settings_adds_drive_scope_when_voice_memos_uses_google_drive(monkeypatch) -> None:
@@ -145,14 +99,14 @@ def test_mac_runner_defers_partially_materialized_voice_memos(tmp_path) -> None:
         duration=9349.66,
         local_duration=6228.63,
     )
-    object_store = FakeObjectStore()
+    ingest = FakeIngestClient()
     logger = FakeLogger()
 
     summary = VoiceMemosUploadRunner(
         account="zach@example.com",
         recordings_path=tmp_path,
         extensions=(".qta",),
-        object_store=object_store,
+        ingest_client=ingest,
         logger=logger,
         mode="incremental",
         upload_state=VoiceMemosUploadState.empty(account="zach@example.com", recordings_path=tmp_path),
@@ -163,8 +117,8 @@ def test_mac_runner_defers_partially_materialized_voice_memos(tmp_path) -> None:
     assert summary.recordings_selected == 0
     assert summary.recordings_uploaded == 0
     assert summary.recordings_deferred == 1
-    assert object_store.file_uploads == []
-    assert object_store.json_uploads == []
+    assert ingest.audio_uploads == []
+    assert ingest.metadata_uploads == []
     assert any("Deferring 20260430 110736-8BB8E57D.qta" in message for message in logger.messages)
 
 
@@ -177,13 +131,13 @@ def test_mac_runner_defers_short_zero_local_duration_voice_memos(tmp_path) -> No
         duration=2.68,
         local_duration=0,
     )
-    object_store = FakeObjectStore()
+    ingest = FakeIngestClient()
 
     summary = VoiceMemosUploadRunner(
         account="zach@example.com",
         recordings_path=tmp_path,
         extensions=(".m4a",),
-        object_store=object_store,
+        ingest_client=ingest,
         logger=FakeLogger(),
         mode="incremental",
         upload_state=VoiceMemosUploadState.empty(account="zach@example.com", recordings_path=tmp_path),
@@ -191,63 +145,65 @@ def test_mac_runner_defers_short_zero_local_duration_voice_memos(tmp_path) -> No
     ).sync()
 
     assert summary.recordings_deferred == 1
-    assert object_store.file_uploads == []
+    assert ingest.audio_uploads == []
 
 
 def test_mac_runner_uploads_audio_files_and_metadata(tmp_path) -> None:
-    existing = tmp_path / "20260427 100004-40DC0200.m4a"
+    # The app dedups server-side, so the client posts every recording's audio
+    # and metadata; it no longer probes for "already present".
+    first = tmp_path / "20260427 100004-40DC0200.m4a"
     fresh = tmp_path / "20260325 145019-DAAC9394.qta"
-    existing.write_bytes(b"already-synced")
+    first.write_bytes(b"already-synced")
     fresh.write_bytes(b"new-recording")
-    existing_sha = recording_from_path(existing).content_sha256
-    object_store = FakeObjectStore(existing_sha256={existing_sha}, existing_metadata_sha256={existing_sha})
+    fresh_sha = recording_from_path(fresh).content_sha256
+    ingest = FakeIngestClient()
 
     logger = FakeLogger()
     summary = VoiceMemosUploadRunner(
         account="zach@example.com",
         recordings_path=tmp_path,
         extensions=(".m4a", ".qta"),
-        object_store=object_store,
+        ingest_client=ingest,
         logger=logger,
         now=lambda: datetime(2026, 4, 27, 12, tzinfo=UTC),
     ).sync()
 
     assert summary.recordings_seen == 2
-    assert summary.recordings_uploaded == 1
-    assert summary.metadata_uploaded == 1
-    assert object_store.file_uploads == [(fresh, "apple-voice-memos/inbox/2026/03/2026-03-25-9ae3313949541803350fcf20aa8c1493edcb7d53577ee8572c726616545c60a3.qta")]
-    assert object_store.json_uploads[0][0] == "apple-voice-memos/inbox/2026/03/2026-03-25-9ae3313949541803350fcf20aa8c1493edcb7d53577ee8572c726616545c60a3.json"
-    metadata = object_store.json_uploads[0][1]
-    assert metadata["schema_version"] == 1
-    assert metadata["account"] == "zach@example.com"
-    assert "audio_file" not in metadata
-    assert "metadata_file" not in metadata
-    assert metadata["recording"]["content_sha256"] not in {existing_sha}
+    assert summary.recordings_uploaded == 2
+    assert summary.metadata_uploaded == 2
+    assert len(ingest.audio_uploads) == 2
+    assert len(ingest.metadata_uploads) == 2
+    fresh_audio = next(u for u in ingest.audio_uploads if u["content"] == b"new-recording")
+    assert fresh_audio["extension"] == ".qta"
+    fresh_meta = next(m for m in ingest.metadata_uploads if m["audio_content_sha256"] == fresh_sha)
+    payload = fresh_meta["payload"]
+    assert payload["schema_version"] == 1
+    assert payload["account"] == "zach@example.com"
+    assert "audio_file" not in payload
+    assert "metadata_file" not in payload
     assert any("Scanning Voice Memos" in message for message in logger.messages)
     assert any("Found 2 Voice Memos recordings" in message for message in logger.messages)
-    assert any("] skip" in message for message in logger.messages)
     assert any("] upload" in message for message in logger.messages)
     assert any("Voice Memos upload summary" in message for message in logger.messages)
 
 
-def test_mac_runner_recovers_when_audio_exists_but_metadata_is_missing(tmp_path) -> None:
+def test_mac_runner_uploads_audio_and_metadata_for_each_recording(tmp_path) -> None:
     recording = tmp_path / "20260427 100004-40DC0200.m4a"
-    recording.write_bytes(b"audio-exists")
-    recording_sha = recording_from_path(recording).content_sha256
-    object_store = FakeObjectStore(existing_sha256={recording_sha})
+    recording.write_bytes(b"audio-bytes")
+    ingest = FakeIngestClient()
 
     summary = VoiceMemosUploadRunner(
         account="zach@example.com",
         recordings_path=tmp_path,
         extensions=(".m4a", ".qta"),
-        object_store=object_store,
+        ingest_client=ingest,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 4, 27, 12, tzinfo=UTC),
     ).sync()
 
     assert summary.recordings_uploaded == 1
-    assert object_store.file_uploads == []
-    assert len(object_store.json_uploads) == 1
+    assert len(ingest.audio_uploads) == 1
+    assert len(ingest.metadata_uploads) == 1
 
 
 def test_mac_runner_supports_parallel_workers(tmp_path) -> None:
@@ -255,13 +211,13 @@ def test_mac_runner_supports_parallel_workers(tmp_path) -> None:
     second = tmp_path / "20260428 100004-40DC0200.m4a"
     first.write_bytes(b"first")
     second.write_bytes(b"second")
-    object_store = FakeObjectStore()
+    ingest = FakeIngestClient()
 
     summary = VoiceMemosUploadRunner(
         account="zach@example.com",
         recordings_path=tmp_path,
         extensions=(".m4a", ".qta"),
-        object_store=object_store,
+        ingest_client=ingest,
         logger=FakeLogger(),
         workers=2,
     ).sync()
@@ -269,15 +225,15 @@ def test_mac_runner_supports_parallel_workers(tmp_path) -> None:
     assert summary.recordings_seen == 2
     assert summary.recordings_uploaded == 2
     assert summary.metadata_uploaded == 2
-    assert len(object_store.file_uploads) == 2
-    assert len(object_store.json_uploads) == 2
+    assert len(ingest.audio_uploads) == 2
+    assert len(ingest.metadata_uploads) == 2
 
 
 def test_incremental_runner_skips_unchanged_state_complete_files_without_drive_calls(tmp_path) -> None:
     recording = tmp_path / "20260427 100004-40DC0200.m4a"
     recording.write_bytes(b"already-synced")
     full_recording = recording_from_path(recording)
-    object_store = FakeObjectStore()
+    ingest = FakeIngestClient()
     state = VoiceMemosUploadState.empty(account="zach@example.com", recordings_path=tmp_path)
     candidate = next(iter(scan_voice_memo_file_candidates(tmp_path, extensions=(".m4a",))))
     state.mark_success(
@@ -298,7 +254,7 @@ def test_incremental_runner_skips_unchanged_state_complete_files_without_drive_c
         account="zach@example.com",
         recordings_path=tmp_path,
         extensions=(".m4a",),
-        object_store=object_store,
+        ingest_client=ingest,
         logger=FakeLogger(),
         mode="incremental",
         upload_state=state,
@@ -309,23 +265,22 @@ def test_incremental_runner_skips_unchanged_state_complete_files_without_drive_c
     assert summary.recordings_seen == 1
     assert summary.recordings_selected == 0
     assert summary.recordings_skipped == 1
-    assert object_store.presence_calls == []
-    assert object_store.file_uploads == []
-    assert object_store.json_uploads == []
+    assert ingest.audio_uploads == []
+    assert ingest.metadata_uploads == []
     assert network_checks == 0
 
 
 def test_incremental_runner_defers_upload_when_network_guard_blocks_before_drive_calls(tmp_path) -> None:
     recording = tmp_path / "20260427 100004-40DC0200.m4a"
     recording.write_bytes(b"new-recording")
-    object_store = FakeObjectStore()
+    ingest = FakeIngestClient()
     state = VoiceMemosUploadState.empty(account="zach@example.com", recordings_path=tmp_path)
 
     summary = VoiceMemosUploadRunner(
         account="zach@example.com",
         recordings_path=tmp_path,
         extensions=(".m4a",),
-        object_store=object_store,
+        ingest_client=ingest,
         logger=FakeLogger(),
         mode="incremental",
         upload_state=state,
@@ -336,9 +291,8 @@ def test_incremental_runner_defers_upload_when_network_guard_blocks_before_drive
     assert summary.recordings_seen == 1
     assert summary.recordings_selected == 1
     assert summary.recordings_deferred == 1
-    assert object_store.presence_calls == []
-    assert object_store.file_uploads == []
-    assert object_store.json_uploads == []
+    assert ingest.audio_uploads == []
+    assert ingest.metadata_uploads == []
 
 
 def create_cloud_recordings_db(tmp_path: Path, *, filename: str, duration: float, local_duration: float) -> None:

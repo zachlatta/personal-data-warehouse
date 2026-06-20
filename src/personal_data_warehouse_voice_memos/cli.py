@@ -8,9 +8,12 @@ import os
 import sys
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
-from personal_data_warehouse.objectstore.google_drive import is_transient_google_error
-from personal_data_warehouse_voice_memos.network import NetworkPolicy, preflight_google_drive
+from personal_data_warehouse.ingest_client import ingest_client_from_env
+from personal_data_warehouse_voice_memos.network import (
+    NetworkPolicy,
+    is_transient_upload_error,
+    preflight_app_ingest,
+)
 from personal_data_warehouse_voice_memos.state import VoiceMemosUploadState, default_state_file
 from personal_data_warehouse_voice_memos.sync import VoiceMemosUploadRunner
 
@@ -24,7 +27,7 @@ class CliLogger:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload local macOS Voice Memos files to Google Drive.")
+    parser = argparse.ArgumentParser(description="Upload local macOS Voice Memos files through the app ingest API.")
     parser.add_argument("--limit", type=int, default=0, help="Maximum recordings to upload; 0 means no limit")
     parser.add_argument("--workers", type=int, default=0, help="Number of parallel upload workers; 0 picks a mode-specific default")
     parser.add_argument("--mode", choices=("incremental", "full"), default="incremental", help="Upload mode")
@@ -59,8 +62,6 @@ def main() -> None:
     )
     if settings.voice_memos is None:
         raise RuntimeError("Voice Memos sync is not configured")
-    if settings.voice_memos.storage_backend != "google_drive":
-        raise RuntimeError(f"Unsupported Voice Memos storage backend: {settings.voice_memos.storage_backend}")
 
     logger = CliLogger()
     state = VoiceMemosUploadState.load(
@@ -68,7 +69,6 @@ def main() -> None:
         account=settings.voice_memos.account,
         recordings_path=settings.voice_memos.recordings_path,
     )
-    request_timeout_seconds = int(os.getenv("VOICE_MEMOS_UPLOAD_REQUEST_TIMEOUT_SECONDS", "30"))
     preflight_timeout_seconds = float(os.getenv("VOICE_MEMOS_UPLOAD_PREFLIGHT_TIMEOUT_SECONDS", "5"))
     workers = args.workers or (1 if args.mode == "incremental" else 8)
 
@@ -82,18 +82,7 @@ def main() -> None:
                     account=settings.voice_memos.account,
                     recordings_path=settings.voice_memos.recordings_path,
                     extensions=settings.voice_memos.extensions,
-                    object_store_factory=lambda: build_object_store(
-                        google_drive_spec(
-                            folder_id=settings.voice_memos.google_drive_folder_id,
-                            account=settings.voice_memos.account,
-                            source="apple_voice_memos",
-                            blob_kind="voice_memo_audio",
-                            metadata_kind="voice_memo_metadata",
-                            legacy_sources=("voice_memos",),
-                            request_timeout_seconds=request_timeout_seconds,
-                        ),
-                        settings=settings,
-                    ),
+                    ingest_client=ingest_client_from_env(),
                     logger=logger,
                     limit=args.limit or None,
                     workers=workers,
@@ -128,7 +117,7 @@ def build_before_upload_check(*, preflight_timeout_seconds: float):
         decision = policy.check()
         if not decision.allowed:
             return decision.reason
-        preflight = preflight_google_drive(timeout_seconds=preflight_timeout_seconds)
+        preflight = preflight_app_ingest(timeout_seconds=preflight_timeout_seconds)
         if not preflight.allowed:
             return preflight.reason
         return None
@@ -173,7 +162,7 @@ def exclusive_lock(path: Path):
 def is_transient_exception(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None:
-        if isinstance(current, Exception) and is_transient_google_error(current):
+        if isinstance(current, Exception) and is_transient_upload_error(current):
             return True
         current = current.__cause__ or current.__context__
     return False

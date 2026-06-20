@@ -8,11 +8,8 @@ from pathlib import Path
 import gzip
 import hashlib
 import json
-import re
-import threading
 import tempfile
 
-from personal_data_warehouse.objectstore import ObjectStore, StoredObject
 from personal_data_warehouse_apple_messages.body import decode_message_body
 from personal_data_warehouse_apple_messages.scanner import (
     AppleMessage,
@@ -29,10 +26,9 @@ from personal_data_warehouse_apple_messages.scanner import (
 )
 from personal_data_warehouse_apple_messages.state import AppleMessagesUploadState
 
-OBJECT_PREFIX = "apple-messages"
-INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox"
-BATCH_RECORD_KIND = "apple_message_export_batch"
-ATTACHMENT_KIND = "apple_message_attachment"
+# Storage reference returned by the ingest client (mirrors the warehouse
+# storage_* columns); the app owns the keys and tags behind it.
+StoredObject = dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -62,7 +58,6 @@ class PendingStateMark:
 class PendingAttachmentUpload:
     attachment: AppleMessageAttachment
     content_sha256: str
-    object_key: str
     size_bytes: int
 
 
@@ -80,8 +75,7 @@ class AppleMessagesUploadRunner:
         *,
         account: str,
         store_path: Path | str,
-        object_store: ObjectStore | None = None,
-        object_store_factory: Callable[[], ObjectStore] | None = None,
+        ingest_client,
         logger,
         upload_state: AppleMessagesUploadState | None = None,
         now: Callable[[], datetime] | None = None,
@@ -92,17 +86,14 @@ class AppleMessagesUploadRunner:
         workers: int = 1,
         before_upload_check: Callable[[], str | None] | None = None,
     ) -> None:
-        if object_store is None and object_store_factory is None:
-            raise ValueError("object_store or object_store_factory must be provided")
-        if object_store is not None and object_store_factory is not None:
-            raise ValueError("pass only one of object_store or object_store_factory")
+        # Uploads go through the app's ingest endpoints only.
+        if ingest_client is None:
+            raise ValueError("ingest_client is required")
         if mode not in {"full", "incremental"}:
             raise ValueError("mode must be 'full' or 'incremental'")
         self._account = account
         self._store_path = Path(store_path).expanduser()
-        self._object_store = object_store
-        self._object_store_factory = object_store_factory
-        self._thread_local = threading.local()
+        self._ingest_client = ingest_client
         self._logger = logger
         self._upload_state = upload_state
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -253,12 +244,10 @@ class AppleMessagesUploadRunner:
                 fingerprint=blob_fingerprint,
             ):
                 continue
-            object_key = attachment_object_key(attachment, content_sha256=content_sha256)
             selected.append(
                 PendingAttachmentUpload(
                     attachment=attachment,
                     content_sha256=content_sha256,
-                    object_key=object_key,
                     size_bytes=size_bytes,
                 )
             )
@@ -333,16 +322,14 @@ class AppleMessagesUploadRunner:
         attachment = upload.attachment
         if attachment.resolved_path is None:
             raise RuntimeError(f"Attachment {attachment.attachment_id} has no local file path")
-        stored = self._object_store_for_thread().put_file(
-            path=attachment.resolved_path,
-            object_key=upload.object_key,
-            content_sha256=upload.content_sha256,
+        # The app owns the object key, kind, and pdw_* tags.
+        stored = self._ingest_client.upload_apple_messages_attachment(
+            Path(attachment.resolved_path).read_bytes(),
+            attachment_guid=attachment.attachment_id,
+            message_guid=attachment.message_id,
             content_type=attachment.content_type,
-            kind=ATTACHMENT_KIND,
-            app_properties={
-                "attachment_guid": attachment.attachment_id,
-                "message_guid": attachment.message_id,
-            },
+            created_at=attachment.created_at.astimezone(UTC).isoformat(),
+            filename=attachment.filename,
         )
         return AttachmentUploadResult(
             attachment=attachment,
@@ -353,30 +340,9 @@ class AppleMessagesUploadRunner:
 
     def _upload_batch(self, *, records: list[dict[str, object]], exported_at: datetime) -> StoredObject:
         encoded = gzip_jsonl(records)
-        batch_sha = hashlib.sha256(encoded).hexdigest()
-        object_key = batch_object_key(exported_at=exported_at, batch_sha256=batch_sha)
-        with tempfile.NamedTemporaryFile(suffix=".jsonl.gz") as file:
-            file.write(encoded)
-            file.flush()
-            return self._object_store_for_thread().put_file(
-                path=Path(file.name),
-                object_key=object_key,
-                content_sha256=batch_sha,
-                content_type="application/gzip",
-                kind=BATCH_RECORD_KIND,
-                app_properties={"batch_sha256": batch_sha, "exported_at": exported_at.astimezone(UTC).isoformat()},
-            )
-
-    def _object_store_for_thread(self) -> ObjectStore:
-        if self._object_store is not None:
-            return self._object_store
-        store = getattr(self._thread_local, "object_store", None)
-        if store is None:
-            if self._object_store_factory is None:
-                raise RuntimeError("object_store_factory is not configured")
-            store = self._object_store_factory()
-            self._thread_local.object_store = store
-        return store
+        return self._ingest_client.upload_apple_messages_batch(
+            encoded, exported_at=exported_at.astimezone(UTC).isoformat()
+        )
 
     def _is_complete(self, *, source_type: str, source_id: str, fingerprint: str) -> bool:
         if self._upload_state is None:
@@ -636,24 +602,3 @@ def gzip_jsonl(records: list[dict[str, object]]) -> bytes:
 def json_sha256(payload: dict[str, object]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def batch_object_key(*, exported_at: datetime, batch_sha256: str) -> str:
-    exported = exported_at.astimezone(UTC)
-    stamp = exported.strftime("%Y%m%dT%H%M%SZ")
-    return f"{INBOX_PREFIX}/batches/{exported.year:04d}/{exported.month:02d}/{stamp}-{batch_sha256}.jsonl.gz"
-
-
-def attachment_object_key(attachment: AppleMessageAttachment, *, content_sha256: str) -> str:
-    created = attachment.created_at.astimezone(UTC)
-    if created.year == 1970:
-        created = datetime.now(tz=UTC)
-    suffix = Path(attachment.filename).suffix or ".bin"
-    return (
-        f"{INBOX_PREFIX}/attachments/{created.year:04d}/{created.month:02d}/"
-        f"{created.date().isoformat()}-{safe_object_key_part(attachment.attachment_id)}-{content_sha256}{suffix}"
-    )
-
-
-def safe_object_key_part(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")[:120] or "untitled"

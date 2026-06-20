@@ -1,10 +1,11 @@
-"""Upload new lines from local agent session transcripts to the Drive inbox.
+"""Upload new lines from local agent session transcripts through app ingest.
 
 The transcripts append over time, so each run reads only the bytes past the
 last committed offset, wraps every new JSONL line in an envelope, and ships them
-as gzipped JSONL batches into ``agent-sessions/inbox/batches/``. A file's offset
-only advances after its lines are durably uploaded, so a crash mid-run simply
-re-ships the un-acknowledged tail next time (ingest dedupes by primary key).
+as gzipped JSONL batches to the app. The app writes
+``agent-sessions/inbox/batches/`` objects. A file's offset only advances after
+its lines are durably uploaded, so a crash mid-run simply re-ships the
+un-acknowledged tail next time (ingest dedupes by primary key).
 """
 
 from __future__ import annotations
@@ -14,18 +15,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 import gzip
-import hashlib
 import json
 import tempfile
 
-from personal_data_warehouse.objectstore import ObjectStore, StoredObject
 from personal_data_warehouse_agent_sessions.scanner import SessionFile, discover_session_files
 from personal_data_warehouse_agent_sessions.state import AgentSessionsUploadState
 
-OBJECT_PREFIX = "agent-sessions"
-INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox"
-BATCH_KIND = "agent_sessions_export_batch"
 DEFAULT_BATCH_SIZE = 20000
+
+# Storage reference returned by the ingest client (mirrors the warehouse
+# storage_* columns); the app owns the keys and tags behind it.
+StoredObject = dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -46,8 +46,7 @@ class AgentSessionsUploadRunner:
         claude_projects_dir: Path | str | None,
         codex_sessions_dir: Path | str | None,
         openclaw_sessions_dir: Path | str | None = None,
-        object_store: ObjectStore | None = None,
-        object_store_factory: Callable[[], ObjectStore] | None = None,
+        batch_uploader: Callable[[bytes, datetime], StoredObject],
         logger,
         upload_state: AgentSessionsUploadState | None = None,
         now: Callable[[], datetime] | None = None,
@@ -56,10 +55,10 @@ class AgentSessionsUploadRunner:
         batch_size: int = DEFAULT_BATCH_SIZE,
         before_upload_check: Callable[[], str | None] | None = None,
     ) -> None:
-        if object_store is None and object_store_factory is None:
-            raise ValueError("object_store or object_store_factory must be provided")
-        if object_store is not None and object_store_factory is not None:
-            raise ValueError("pass only one of object_store or object_store_factory")
+        # Uploads go through the app's ingest endpoint only; batch_uploader posts
+        # a gzipped batch and returns its stored reference.
+        if batch_uploader is None:
+            raise ValueError("batch_uploader is required")
         if mode not in {"full", "incremental"}:
             raise ValueError("mode must be 'full' or 'incremental'")
         self._account = account
@@ -67,8 +66,7 @@ class AgentSessionsUploadRunner:
         self._claude_projects_dir = claude_projects_dir
         self._codex_sessions_dir = codex_sessions_dir
         self._openclaw_sessions_dir = openclaw_sessions_dir
-        self._object_store = object_store
-        self._object_store_factory = object_store_factory
+        self._batch_uploader = batch_uploader
         self._logger = logger
         self._upload_state = upload_state
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -217,28 +215,10 @@ class AgentSessionsUploadRunner:
             raise UploadBlockedError(reason)
 
     def _upload_batch(self, records: list[dict[str, object]]) -> StoredObject:
-        exported_at = self._now()
+        # The app owns the object key, kind, and pdw_* tags; we send only the
+        # gzipped batch and its export time.
         encoded = _gzip_jsonl(records)
-        batch_sha = hashlib.sha256(encoded).hexdigest()
-        object_key = _batch_object_key(exported_at=exported_at, batch_sha256=batch_sha)
-        with tempfile.NamedTemporaryFile(suffix=".jsonl.gz") as file:
-            file.write(encoded)
-            file.flush()
-            return self._object_store_instance().put_file(
-                path=Path(file.name),
-                object_key=object_key,
-                content_sha256=batch_sha,
-                content_type="application/gzip",
-                kind=BATCH_KIND,
-                app_properties={"batch_sha256": batch_sha, "exported_at": exported_at.astimezone(UTC).isoformat()},
-            )
-
-    def _object_store_instance(self) -> ObjectStore:
-        if self._object_store is None:
-            if self._object_store_factory is None:
-                raise RuntimeError("object_store_factory is not configured")
-            self._object_store = self._object_store_factory()
-        return self._object_store
+        return self._batch_uploader(encoded, self._now())
 
     def _envelope(self, session_file: SessionFile, *, seq: int, line: dict[str, object]) -> dict[str, object]:
         return {
@@ -297,9 +277,3 @@ def _gzip_jsonl(records: list[dict[str, object]]) -> bytes:
         file.flush()
         file.seek(0)
         return file.read()
-
-
-def _batch_object_key(*, exported_at: datetime, batch_sha256: str) -> str:
-    exported = exported_at.astimezone(UTC)
-    stamp = exported.strftime("%Y%m%dT%H%M%SZ")
-    return f"{INBOX_PREFIX}/batches/{exported.year:04d}/{exported.month:02d}/{stamp}-{batch_sha256}.jsonl.gz"

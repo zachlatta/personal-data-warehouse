@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -36,13 +37,34 @@ type getObjectOutput struct {
 	Error         string `json:"error,omitempty"`
 }
 
+// driveConnectionFromConfig builds the Google Drive connection (HTTP client and
+// REST base URLs) shared by the read store and the per-source ingest stores.
+// When ObjectStoreGoogleDriveDisableAuth is set (local integration testing
+// against a fake Drive) it uses a plain client instead of the OAuth one.
+func driveConnectionFromConfig(cfg config.Config) (objectstore.GoogleDriveConnection, error) {
+	conn := objectstore.GoogleDriveConnection{
+		APIBaseURL:    cfg.ObjectStoreGoogleDriveAPIBaseURL,
+		UploadBaseURL: cfg.ObjectStoreGoogleDriveUploadBaseURL,
+	}
+	if cfg.ObjectStoreGoogleDriveDisableAuth {
+		conn.HTTPClient = http.DefaultClient
+		return conn, nil
+	}
+	client, err := objectstore.HTTPClientFromAuthorizedUserJSON(context.Background(), cfg.ObjectStoreGoogleTokenJSON)
+	if err != nil {
+		return objectstore.GoogleDriveConnection{}, err
+	}
+	conn.HTTPClient = client
+	return conn, nil
+}
+
 // objectStoreFromConfig builds the app's object storage layer from config, or
 // returns (nil, false) when object storage is not configured.
 func objectStoreFromConfig(cfg config.Config) (objectstore.ObjectStore, bool, error) {
 	if !cfg.ObjectStoreEnabled() {
 		return nil, false, nil
 	}
-	client, err := objectstore.HTTPClientFromAuthorizedUserJSON(context.Background(), cfg.ObjectStoreGoogleTokenJSON)
+	conn, err := driveConnectionFromConfig(cfg)
 	if err != nil {
 		return nil, false, err
 	}
@@ -52,7 +74,7 @@ func objectStoreFromConfig(cfg config.Config) (objectstore.ObjectStore, bool, er
 		"object_blob",
 		"object_metadata",
 		nil,
-		objectstore.GoogleDriveConnection{HTTPClient: client},
+		conn,
 	))
 	if err != nil {
 		return nil, false, err

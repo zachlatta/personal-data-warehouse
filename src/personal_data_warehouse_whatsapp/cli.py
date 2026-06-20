@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
+from personal_data_warehouse.ingest_client import ingest_client_from_env
 from personal_data_warehouse_whatsapp.client import WhatsAppClientRunner
 from personal_data_warehouse.warehouse import warehouse_from_settings
 from personal_data_warehouse_whatsapp.session_store import PostgresWhatsAppSessionStore
@@ -24,7 +24,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Run the WhatsApp linked-device client: pair via QR/phone code, receive "
-            "messages, and upload batches to the Drive inbox. In production this runs "
+            "messages, and upload batches through the app ingest API. In production this runs "
             "as the whatsapp_client Dagster job; this CLI is for pairing and debugging."
         )
     )
@@ -40,8 +40,6 @@ def main() -> None:
     settings = load_settings(require_gmail=False, require_whatsapp=True)
     if settings.whatsapp is None:
         raise RuntimeError("WhatsApp sync is not configured")
-    if settings.whatsapp.storage_backend != "google_drive":
-        raise RuntimeError(f"Unsupported WhatsApp storage backend: {settings.whatsapp.storage_backend}")
 
     session_path = args.session_file or Path(settings.whatsapp.session_path)
     warehouse = warehouse_from_settings(settings)
@@ -61,16 +59,7 @@ def main() -> None:
         summary = WhatsAppClientRunner(
             account=settings.whatsapp.account,
             session_path=session_path,
-            object_store_factory=lambda: build_object_store(
-                google_drive_spec(
-                    folder_id=settings.whatsapp.google_drive_folder_id,
-                    account=settings.whatsapp.google_drive_account,
-                    source="whatsapp",
-                    blob_kind="whatsapp_media_item",
-                    metadata_kind="whatsapp_export_batch",
-                ),
-                settings=settings,
-            ),
+            ingest_client=ingest_client_from_env(),
             upload_state=state,
             logger=CliLogger(),
             run_seconds=args.run_seconds or settings.whatsapp.client_run_seconds,

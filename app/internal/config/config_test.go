@@ -73,6 +73,44 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvIngestFolderResolution(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL":                   "postgres://d:s@example.com/d",
+		"MCP_SECRET_TOKEN":                        "0123456789abcdef0123456789abcdef",
+		"PDW_OBJECT_STORE_GOOGLE_TOKEN_JSON":      `{"type":"authorized_user"}`,
+		"PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID": "shared-folder",
+		"PDW_INGEST_AGENT_SESSIONS_FOLDER_ID":     "agent-folder",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv returned error: %v", err)
+	}
+	if !cfg.IngestEnabled() {
+		t.Fatal("IngestEnabled() = false, want true when token is set")
+	}
+	if got := cfg.IngestFolderIDs["agent_sessions"]; got != "agent-folder" {
+		t.Fatalf("agent_sessions folder = %q, want per-source override", got)
+	}
+	// Sources without an override fall back to the shared object-store folder.
+	if got := cfg.IngestFolderIDs["whatsapp"]; got != "shared-folder" {
+		t.Fatalf("whatsapp folder = %q, want shared fallback", got)
+	}
+}
+
+func TestLoadFromEnvIngestDisabledWithoutToken(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL": "postgres://d:s@example.com/d",
+		"MCP_SECRET_TOKEN":      "0123456789abcdef0123456789abcdef",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv returned error: %v", err)
+	}
+	if cfg.IngestEnabled() {
+		t.Fatal("IngestEnabled() = true, want false without a Drive token")
+	}
+}
+
 func TestLoadFromEnvPrefersPDWSecretTokenOverMCPSecretToken(t *testing.T) {
 	env := map[string]string{
 		"POSTGRES_DATABASE_URL": "postgresql://default:secret@example.com/default",

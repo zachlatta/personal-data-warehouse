@@ -31,59 +31,31 @@ class FakeLogger:
         self.messages.append(args[0] % args[1:] if len(args) > 1 else str(args[0]))
 
 
-class FakeObjectStore:
-    backend = "fake"
+class FakeIngestClient:
+    """Stands in for the app ingest client; records batch + attachment posts in
+    file_uploads (tagged by kind), with the posted bytes."""
 
     def __init__(self) -> None:
         self.file_uploads: list[dict[str, object]] = []
-        self.objects: set[tuple[str, str, str]] = set()
 
-    def has_blob(self, *, content_sha256: str) -> bool:
-        return ("apple_message_attachment", "content_sha256", content_sha256) in self.objects
+    def _stored(self) -> dict:
+        return {"storage_backend": "google_drive", "storage_key": "k", "storage_file_id": "fid", "storage_url": ""}
 
-    def has_metadata(self, *, content_sha256: str) -> bool:
-        return ("apple_message_export_batch", "content_sha256", content_sha256) in self.objects
+    def upload_apple_messages_batch(self, gzip_bytes, *, exported_at):
+        self.file_uploads.append({"kind": "apple_message_export_batch", "bytes": gzip_bytes, "exported_at": exported_at})
+        return self._stored()
 
-    def has_object(self, *, kind: str, key: str, value: str) -> bool:
-        return (kind, key, value) in self.objects
-
-    def presence(self, *, content_sha256: str):
-        raise NotImplementedError
-
-    def put_json(self, **kwargs):
-        raise NotImplementedError
-
-    def put_file(
-        self,
-        *,
-        path: Path,
-        object_key: str,
-        content_sha256: str,
-        content_type: str,
-        skip_existing_check: bool = False,
-        app_properties: dict[str, str] | None = None,
-        kind: str | None = None,
-    ):
-        object_kind = kind or "file"
-        uploaded = {
-            "path": path,
-            "object_key": object_key,
-            "content_sha256": content_sha256,
-            "content_type": content_type,
-            "kind": object_kind,
-            "app_properties": app_properties or {},
-            "bytes": path.read_bytes(),
-        }
-        self.file_uploads.append(uploaded)
-        self.objects.add((object_kind, "content_sha256", content_sha256))
-        for key, value in (app_properties or {}).items():
-            self.objects.add((object_kind, key, value))
-        return {
-            "storage_backend": self.backend,
-            "storage_key": object_key,
-            "storage_file_id": f"file-{content_sha256[:8]}",
-            "storage_url": f"https://example.test/{object_key}",
-        }
+    def upload_apple_messages_attachment(self, content, *, attachment_guid, message_guid, content_type, created_at, filename):
+        self.file_uploads.append(
+            {
+                "kind": "apple_message_attachment",
+                "bytes": content,
+                "attachment_guid": attachment_guid,
+                "message_guid": message_guid,
+                "content_type": content_type,
+            }
+        )
+        return self._stored()
 
 
 def test_load_settings_adds_drive_scope_when_apple_messages_uses_google_drive(monkeypatch) -> None:
@@ -150,12 +122,12 @@ def test_scan_apple_messages_synthetic_store_extracts_messages_chats_and_attachm
 def test_apple_messages_runner_uploads_batch_manifest_and_attachment_then_skips_unchanged(tmp_path) -> None:
     store = create_messages_store(tmp_path)
     state = AppleMessagesUploadState.open(tmp_path / "state.sqlite", account="zach@example.com", store_path=store)
-    object_store = FakeObjectStore()
+    ingest = FakeIngestClient()
     try:
         first_summary = AppleMessagesUploadRunner(
             account="zach@example.com",
             store_path=store,
-            object_store=object_store,
+            ingest_client=ingest,
             upload_state=state,
             logger=FakeLogger(),
             now=lambda: datetime(2026, 5, 21, 13, tzinfo=UTC),
@@ -165,8 +137,8 @@ def test_apple_messages_runner_uploads_batch_manifest_and_attachment_then_skips_
 
         assert first_summary.messages_seen == 1
         assert first_summary.attachments_uploaded == 1
-        batch_uploads = [upload for upload in object_store.file_uploads if upload["kind"] == "apple_message_export_batch"]
-        attachment_uploads = [upload for upload in object_store.file_uploads if upload["kind"] == "apple_message_attachment"]
+        batch_uploads = [upload for upload in ingest.file_uploads if upload["kind"] == "apple_message_export_batch"]
+        attachment_uploads = [upload for upload in ingest.file_uploads if upload["kind"] == "apple_message_attachment"]
         assert len(batch_uploads) == 1
         assert len(attachment_uploads) == 1
         records = [
@@ -181,7 +153,7 @@ def test_apple_messages_runner_uploads_batch_manifest_and_attachment_then_skips_
         second_summary = AppleMessagesUploadRunner(
             account="zach@example.com",
             store_path=store,
-            object_store=FakeObjectStore(),
+            ingest_client=FakeIngestClient(),
             upload_state=state,
             logger=FakeLogger(),
             now=lambda: datetime(2026, 5, 21, 14, tzinfo=UTC),

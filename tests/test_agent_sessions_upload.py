@@ -24,22 +24,19 @@ class FakeLogger:
         pass
 
 
-class FakeObjectStore:
-    backend = "google_drive"
+class FakeBatchUploader:
+    """Stands in for the app's ingest client: decodes the gzipped batch the
+    runner posts and records the envelopes."""
 
     def __init__(self) -> None:
         self.batches: list[list[dict]] = []
 
-    def put_file(self, *, path, object_key, content_sha256, content_type, kind=None, app_properties=None, skip_existing_check=False):
-        records = []
-        with gzip.open(path, "rt", encoding="utf-8") as handle:
-            for line in handle:
-                if line.strip():
-                    records.append(json.loads(line))
+    def __call__(self, encoded: bytes, exported_at) -> dict:
+        records = [json.loads(line) for line in gzip.decompress(encoded).decode("utf-8").splitlines() if line.strip()]
         self.batches.append(records)
         return {
-            "storage_backend": self.backend,
-            "storage_key": object_key,
+            "storage_backend": "google_drive",
+            "storage_key": f"agent-sessions/inbox/batches/batch-{len(self.batches)}.jsonl.gz",
             "storage_file_id": f"file-{len(self.batches)}",
             "storage_url": "https://drive/batch",
         }
@@ -152,7 +149,7 @@ def _runner(tmp_path, store, state, *, mode="incremental", limit=None, batch_siz
         device="porygon",
         claude_projects_dir=tmp_path / "claude",
         codex_sessions_dir=None,
-        object_store=store,
+        batch_uploader=store,
         logger=FakeLogger(),
         upload_state=state,
         now=lambda: NOW,
@@ -168,7 +165,7 @@ def test_runner_uploads_new_lines_then_only_appended_lines(tmp_path: Path) -> No
         {"type": "user", "message": {"role": "user", "content": "one"}, "uuid": "u1"},
         {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "two"}]}, "uuid": "u2"},
     )
-    store = FakeObjectStore()
+    store = FakeBatchUploader()
     state = AgentSessionsUploadState.open(tmp_path / "state.sqlite", account="zach@example.com")
 
     summary = _runner(tmp_path, store, state).sync()
@@ -196,7 +193,7 @@ def test_runner_ignores_trailing_partial_line(tmp_path: Path) -> None:
     path = proj / "sess-1.jsonl"
     # second line has no trailing newline yet (still being written)
     path.write_text(json.dumps({"type": "user", "uuid": "u1"}) + "\n" + json.dumps({"type": "user", "uuid": "u2"}))
-    store = FakeObjectStore()
+    store = FakeBatchUploader()
     state = AgentSessionsUploadState.open(tmp_path / "state.sqlite", account="zach@example.com")
 
     summary = _runner(tmp_path, store, state).sync()
@@ -219,7 +216,7 @@ def test_runner_respects_limit_and_defers_remainder(tmp_path: Path) -> None:
         {"type": "user", "uuid": "u2"},
         {"type": "user", "uuid": "u3"},
     )
-    store = FakeObjectStore()
+    store = FakeBatchUploader()
     state = AgentSessionsUploadState.open(tmp_path / "state.sqlite", account="zach@example.com")
 
     summary = _runner(tmp_path, store, state, limit=2).sync()
@@ -232,7 +229,7 @@ def test_runner_respects_limit_and_defers_remainder(tmp_path: Path) -> None:
 
 def test_runner_full_mode_reuploads_everything(tmp_path: Path) -> None:
     _claude_file(tmp_path, {"type": "user", "uuid": "u1"}, {"type": "user", "uuid": "u2"})
-    store = FakeObjectStore()
+    store = FakeBatchUploader()
     state = AgentSessionsUploadState.open(tmp_path / "state.sqlite", account="zach@example.com")
     _runner(tmp_path, store, state).sync()
     summary = _runner(tmp_path, store, state, mode="full").sync()
@@ -242,7 +239,7 @@ def test_runner_full_mode_reuploads_everything(tmp_path: Path) -> None:
 
 def test_runner_chunks_into_multiple_batches(tmp_path: Path) -> None:
     _claude_file(tmp_path, *[{"type": "user", "uuid": f"u{i}"} for i in range(5)])
-    store = FakeObjectStore()
+    store = FakeBatchUploader()
     state = AgentSessionsUploadState.open(tmp_path / "state.sqlite", account="zach@example.com")
     summary = _runner(tmp_path, store, state, batch_size=2).sync()
     assert summary.lines_selected == 5

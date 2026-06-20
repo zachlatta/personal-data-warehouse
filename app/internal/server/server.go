@@ -220,6 +220,13 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		extra = append(extra, getObjectTool(store, authSvc, baseURL, cfg.ObjectStoreURLTTL, time.Now))
 		mux.Handle(objectsPathPrefix, objectDownloadHandler(store, authSvc, cfg.ObjectStoreMaxObjectBytes, logger))
 	}
+	ingestSvc, ingestEnabled, err := newIngestService(cfg, authSvc, time.Now, logger)
+	if err != nil {
+		logger.Error("ingestion configured but failed to initialize; client uploads disabled", "error", err.Error())
+	} else if ingestEnabled {
+		mux.Handle(ingestPathPrefix, ingestSvc.handler())
+		logger.Info("client upload ingestion enabled", "endpoints", len(ingestSvc.artifacts))
+	}
 	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default(), extra...)
 	mcpServer := newMCPServerFromRegistry(registry, slog.Default())
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{

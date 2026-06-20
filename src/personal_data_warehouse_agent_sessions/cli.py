@@ -6,10 +6,15 @@ import fcntl
 from pathlib import Path
 import sys
 
+from datetime import UTC
+
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
-from personal_data_warehouse.objectstore.google_drive import is_transient_google_error
-from personal_data_warehouse_voice_memos.network import NetworkPolicy, preflight_google_drive
+from personal_data_warehouse.ingest_client import ingest_client_from_env
+from personal_data_warehouse_voice_memos.network import (
+    NetworkPolicy,
+    is_transient_upload_error,
+    preflight_app_ingest,
+)
 from personal_data_warehouse_agent_sessions.state import AgentSessionsUploadState, default_state_file
 from personal_data_warehouse_agent_sessions.sync import AgentSessionsUploadRunner, UploadBlockedError
 
@@ -23,7 +28,7 @@ class CliLogger:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload local AI agent CLI session transcripts to Google Drive.")
+    parser = argparse.ArgumentParser(description="Upload local AI agent CLI session transcripts through the app ingest API.")
     parser.add_argument("--mode", choices=("incremental", "full"), default="incremental", help="Upload mode")
     parser.add_argument("--state-file", type=Path, default=default_state_file(), help="Incremental upload state path")
     parser.add_argument(
@@ -54,8 +59,6 @@ def main() -> None:
     if settings.agent_sessions is None:
         raise RuntimeError("Agent sessions sync is not configured")
     config = settings.agent_sessions
-    if config.storage_backend != "google_drive":
-        raise RuntimeError(f"Unsupported agent sessions storage backend: {config.storage_backend}")
 
     logger = CliLogger()
     state = AgentSessionsUploadState.open(args.state_file, account=config.account)
@@ -64,21 +67,18 @@ def main() -> None:
             if not acquired:
                 print("Agent sessions upload skipped: another uploader run is active")
                 return
+            # Uploads always go through the app, which owns the Drive credential,
+            # folder, object keys, kinds, and pdw_* tags. The device holds none of
+            # that: only the app URL and signing key.
+            ingest = ingest_client_from_env()
             summary = AgentSessionsUploadRunner(
                 account=config.account,
                 device=config.device,
                 claude_projects_dir=config.claude_projects_dir,
                 codex_sessions_dir=config.codex_sessions_dir,
                 openclaw_sessions_dir=config.openclaw_sessions_dir,
-                object_store_factory=lambda: build_object_store(
-                    google_drive_spec(
-                        folder_id=config.google_drive_folder_id,
-                        account=config.google_drive_account,
-                        source="agent_sessions",
-                        blob_kind="agent_sessions_blob",
-                        metadata_kind="agent_sessions_export_batch",
-                    ),
-                    settings=settings,
+                batch_uploader=lambda encoded, exported_at: ingest.upload_agent_sessions_batch(
+                    encoded, exported_at=exported_at.astimezone(UTC).isoformat()
                 ),
                 logger=logger,
                 upload_state=state,
@@ -115,7 +115,7 @@ def build_before_upload_check(*, preflight_timeout_seconds: float = 5.0):
         decision = policy.check()
         if not decision.allowed:
             return decision.reason
-        preflight = preflight_google_drive(timeout_seconds=preflight_timeout_seconds)
+        preflight = preflight_app_ingest(timeout_seconds=preflight_timeout_seconds)
         if not preflight.allowed:
             return preflight.reason
         return None
@@ -141,7 +141,7 @@ def exclusive_lock(path: Path):
 def is_transient_exception(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None:
-        if isinstance(current, Exception) and is_transient_google_error(current):
+        if isinstance(current, Exception) and is_transient_upload_error(current):
             return True
         current = current.__cause__ or current.__context__
     return False

@@ -22,95 +22,39 @@ class FakeLogger:
         self.messages.append(args[0] % args[1:] if len(args) > 1 else str(args[0]))
 
 
-class FakeObjectStore:
-    backend = "fake"
+class FakeIngestClient:
+    """Stands in for the app ingest client; records body/attachment/revision
+    posts. file_uploads holds blob posts (with their kind), json_uploads holds
+    revision metadata posts."""
 
     def __init__(self) -> None:
         self.file_uploads: list[dict[str, object]] = []
         self.json_uploads: list[dict[str, object]] = []
-        self.objects: set[tuple[str, str, str]] = set()
 
-    def has_blob(self, *, content_sha256: str) -> bool:
-        return ("apple_note_body_html", "content_sha256", content_sha256) in self.objects
+    def upload_apple_notes_body(self, html, *, note_id, revision_id, modified_at):
+        self.file_uploads.append(
+            {"kind": "apple_note_body_html", "content": html, "note_id": note_id, "revision_id": revision_id}
+        )
+        return {"storage_backend": "google_drive", "storage_key": "body", "storage_file_id": "fid-b", "storage_url": ""}
 
-    def has_metadata(self, *, content_sha256: str) -> bool:
-        return ("apple_note_revision_metadata", "content_sha256", content_sha256) in self.objects
-
-    def has_object(self, *, kind: str, key: str, value: str) -> bool:
-        return (kind, key, value) in self.objects
-
-    def presence(self, *, content_sha256: str):
-        raise NotImplementedError
-
-    def put_file(
-        self,
-        *,
-        path: Path,
-        object_key: str,
-        content_sha256: str,
-        content_type: str,
-        skip_existing_check: bool = False,
-        app_properties: dict[str, str] | None = None,
-        kind: str | None = None,
-    ):
-        object_kind = kind or "blob"
-        if not skip_existing_check and self.has_object(kind=object_kind, key="content_sha256", value=content_sha256):
-            return {
-                "storage_backend": self.backend,
-                "storage_key": object_key,
-                "storage_file_id": f"existing-{content_sha256[:8]}",
-                "storage_url": f"https://example.test/{object_key}",
-            }
+    def upload_apple_notes_attachment(self, content, *, note_id, revision_id, modified_at, attachment_id, filename, content_type):
         self.file_uploads.append(
             {
-                "path": path,
-                "object_key": object_key,
-                "content_sha256": content_sha256,
+                "kind": "apple_note_attachment",
+                "content": content,
+                "note_id": note_id,
+                "revision_id": revision_id,
+                "attachment_id": attachment_id,
                 "content_type": content_type,
-                "kind": object_kind,
-                "app_properties": app_properties or {},
             }
         )
-        self.objects.add((object_kind, "content_sha256", content_sha256))
-        for key, value in (app_properties or {}).items():
-            self.objects.add((object_kind, key, value))
-        return {
-            "storage_backend": self.backend,
-            "storage_key": object_key,
-            "storage_file_id": f"file-{content_sha256[:8]}",
-            "storage_url": f"https://example.test/{object_key}",
-        }
+        return {"storage_backend": "google_drive", "storage_key": "att", "storage_file_id": "fid-at", "storage_url": ""}
 
-    def put_json(
-        self,
-        *,
-        object_key: str,
-        payload: dict[str, object],
-        content_sha256: str,
-        source_content_sha256: str | None = None,
-        skip_existing_check: bool = False,
-        app_properties: dict[str, str] | None = None,
-        kind: str | None = None,
-    ):
-        object_kind = kind or "metadata"
+    def upload_apple_notes_revision(self, payload, *, note_id, revision_id, modified_at, note_content_sha256):
         self.json_uploads.append(
-            {
-                "object_key": object_key,
-                "payload": payload,
-                "content_sha256": content_sha256,
-                "kind": object_kind,
-                "app_properties": app_properties or {},
-            }
+            {"payload": payload, "note_id": note_id, "revision_id": revision_id, "note_content_sha256": note_content_sha256}
         )
-        self.objects.add((object_kind, "content_sha256", content_sha256))
-        for key, value in (app_properties or {}).items():
-            self.objects.add((object_kind, key, value))
-        return {
-            "storage_backend": self.backend,
-            "storage_key": object_key,
-            "storage_file_id": f"metadata-{content_sha256[:8]}",
-            "storage_url": f"https://example.test/{object_key}",
-        }
+        return {"storage_backend": "google_drive", "storage_key": "rev", "storage_file_id": "fid-r", "storage_url": ""}
 
 
 def test_load_settings_adds_drive_scope_when_apple_notes_uses_google_drive(monkeypatch) -> None:
@@ -289,13 +233,13 @@ def test_decode_note_blob_prefers_gzipped_protobuf_note_text() -> None:
 
 def test_apple_notes_runner_uploads_revision_html_attachment_and_metadata(tmp_path) -> None:
     store = create_notes_store(tmp_path, body_html="<p>Hello</p>")
-    object_store = FakeObjectStore()
+    object_store = FakeIngestClient()
     state = AppleNotesUploadState.empty(account="zach@example.com", store_path=store)
 
     summary = AppleNotesUploadRunner(
         account="zach@example.com",
         store_path=store,
-        object_store=object_store,
+        ingest_client=object_store,
         upload_state=state,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 12, tzinfo=UTC),
@@ -325,13 +269,13 @@ def test_apple_notes_runner_limit_defers_remaining_changed_notes(tmp_path) -> No
         modified_at="2026-05-21T13:00:00+00:00",
         body_html="<p>Later</p>",
     )
-    object_store = FakeObjectStore()
+    object_store = FakeIngestClient()
     state = AppleNotesUploadState.empty(account="zach@example.com", store_path=store)
 
     summary = AppleNotesUploadRunner(
         account="zach@example.com",
         store_path=store,
-        object_store=object_store,
+        ingest_client=object_store,
         upload_state=state,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 14, tzinfo=UTC),
@@ -345,54 +289,25 @@ def test_apple_notes_runner_limit_defers_remaining_changed_notes(tmp_path) -> No
     assert len(state.entries) == 1
 
 
-def test_apple_notes_runner_remote_existing_check_marks_state_without_upload(tmp_path) -> None:
-    store = create_notes_store(tmp_path, body_html="<p>Hello</p>")
-    [note] = scan_apple_notes_store(store, attachments_root=tmp_path)
-    revision = revision_from_note(note)
-    object_store = FakeObjectStore()
-    object_store.objects.add(("apple_note_revision_metadata", "revision_id", revision.revision_id))
-    state = AppleNotesUploadState.empty(account="zach@example.com", store_path=store)
-    saves: list[int] = []
-
-    summary = AppleNotesUploadRunner(
-        account="zach@example.com",
-        store_path=store,
-        object_store=object_store,
-        upload_state=state,
-        logger=FakeLogger(),
-        now=lambda: datetime(2026, 5, 21, 12, tzinfo=UTC),
-        check_remote_existing=True,
-        state_save_callback=lambda: saves.append(len(state.entries)),
-    ).sync()
-
-    assert summary.notes_selected == 1
-    assert summary.revisions_uploaded == 0
-    assert summary.metadata_uploaded == 0
-    assert object_store.file_uploads == []
-    assert object_store.json_uploads == []
-    assert state.entries["note-1"].complete is True
-    assert saves == [1]
-
-
 def test_apple_notes_runner_skips_unchanged_notes_from_state(tmp_path) -> None:
     store = create_notes_store(tmp_path, body_html="<p>Hello</p>")
     state = AppleNotesUploadState.empty(account="zach@example.com", store_path=store)
-    first_store = FakeObjectStore()
+    first_store = FakeIngestClient()
 
     AppleNotesUploadRunner(
         account="zach@example.com",
         store_path=store,
-        object_store=first_store,
+        ingest_client=first_store,
         upload_state=state,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 12, tzinfo=UTC),
     ).sync()
-    second_store = FakeObjectStore()
+    second_store = FakeIngestClient()
 
     summary = AppleNotesUploadRunner(
         account="zach@example.com",
         store_path=store,
-        object_store=second_store,
+        ingest_client=second_store,
         upload_state=state,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 12, 5, tzinfo=UTC),
@@ -407,23 +322,23 @@ def test_apple_notes_runner_skips_unchanged_notes_from_state(tmp_path) -> None:
 def test_apple_notes_runner_emits_tombstone_for_deleted_note(tmp_path) -> None:
     store = create_notes_store(tmp_path, body_html="<p>Hello</p>")
     state = AppleNotesUploadState.empty(account="zach@example.com", store_path=store)
-    first_store = FakeObjectStore()
+    first_store = FakeIngestClient()
 
     AppleNotesUploadRunner(
         account="zach@example.com",
         store_path=store,
-        object_store=first_store,
+        ingest_client=first_store,
         upload_state=state,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 12, tzinfo=UTC),
     ).sync()
     clear_notes(store)
-    second_store = FakeObjectStore()
+    second_store = FakeIngestClient()
 
     summary = AppleNotesUploadRunner(
         account="zach@example.com",
         store_path=store,
-        object_store=second_store,
+        ingest_client=second_store,
         upload_state=state,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 13, tzinfo=UTC),

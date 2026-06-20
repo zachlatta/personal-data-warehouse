@@ -361,6 +361,23 @@ class Settings:
         return None
 
 
+def _default_upload_backend(legacy_default: str = "google_drive", *, google_drive_folder_id: str = "") -> str:
+    """Pick the compatibility backend label for local upload settings.
+
+    The upload CLIs always write through the app's ingest endpoints. When a
+    device has an ingest base URL but no Drive reader folder, mark that config
+    as ``http_app`` so the local uploader does not require Drive folder/account
+    settings. When a Drive folder is configured, preserve the historical label so
+    Dagster reader configs still request Drive scope. The CLIs still fail fast
+    in ``ingest_client_from_env`` rather than writing to Drive directly. An
+    explicit ``*_STORAGE_BACKEND`` env var always overrides this label.
+    """
+
+    if (os.getenv("PDW_INGEST_BASE_URL") or os.getenv("MCP_BASE_URL") or "").strip() and not google_drive_folder_id:
+        return "http_app"
+    return legacy_default
+
+
 def load_settings(
     *,
     require_postgres: bool = True,
@@ -548,10 +565,6 @@ def load_settings(
 
     default_voice_memos_account = account_emails[0] if account_emails else ""
     voice_memos_account = os.getenv("VOICE_MEMOS_ACCOUNT", default_voice_memos_account).strip()
-    voice_memos_storage_backend = os.getenv(
-        "VOICE_MEMOS_STORAGE_BACKEND",
-        DEFAULT_VOICE_MEMOS_STORAGE_BACKEND,
-    ).strip()
     voice_memos_recordings_path = os.path.expanduser(
         os.getenv(
             "VOICE_MEMOS_RECORDINGS_PATH",
@@ -569,6 +582,13 @@ def load_settings(
         os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
         or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
         or ""
+    ).strip()
+    voice_memos_storage_backend = os.getenv(
+        "VOICE_MEMOS_STORAGE_BACKEND",
+        _default_upload_backend(
+            DEFAULT_VOICE_MEMOS_STORAGE_BACKEND,
+            google_drive_folder_id=voice_memos_google_drive_folder_id,
+        ),
     ).strip()
 
     # Gmail attachments share the same object store as the other Drive pipelines by
@@ -591,8 +611,8 @@ def load_settings(
     if require_voice_memos or os.getenv("VOICE_MEMOS_ACCOUNT") or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID"):
         if not voice_memos_account:
             raise ValueError("VOICE_MEMOS_ACCOUNT or GMAIL_ACCOUNTS must be set for Voice Memos sync")
-        if voice_memos_storage_backend not in {"google_drive"}:
-            raise ValueError("VOICE_MEMOS_STORAGE_BACKEND currently supports: google_drive")
+        if voice_memos_storage_backend not in {"google_drive", "http_app"}:
+            raise ValueError("VOICE_MEMOS_STORAGE_BACKEND currently supports: google_drive, http_app")
         if voice_memos_transcription_provider not in {"assemblyai"}:
             raise ValueError("VOICE_MEMOS_TRANSCRIPTION_PROVIDER currently supports: assemblyai")
         if voice_memos_storage_backend == "google_drive" and not voice_memos_google_drive_folder_id:
@@ -616,10 +636,6 @@ def load_settings(
     apple_notes_store_path = os.path.expanduser(
         os.getenv("APPLE_NOTES_STORE_PATH", DEFAULT_APPLE_NOTES_STORE_PATH)
     )
-    apple_notes_storage_backend = os.getenv(
-        "APPLE_NOTES_STORAGE_BACKEND",
-        DEFAULT_APPLE_NOTES_STORAGE_BACKEND,
-    ).strip()
     apple_notes_google_drive_account = (
         os.getenv("APPLE_NOTES_GOOGLE_DRIVE_ACCOUNT")
         or apple_notes_account
@@ -631,6 +647,13 @@ def load_settings(
         or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
         or ""
     ).strip()
+    apple_notes_storage_backend = os.getenv(
+        "APPLE_NOTES_STORAGE_BACKEND",
+        _default_upload_backend(
+            DEFAULT_APPLE_NOTES_STORAGE_BACKEND,
+            google_drive_folder_id=apple_notes_google_drive_folder_id,
+        ),
+    ).strip()
     apple_notes: AppleNotesConfig | None = None
     if (
         require_apple_notes
@@ -640,14 +663,15 @@ def load_settings(
     ):
         if not apple_notes_account:
             raise ValueError("APPLE_NOTES_ACCOUNT or GMAIL_ACCOUNTS must be set for Apple Notes sync")
-        if apple_notes_storage_backend not in {"google_drive"}:
-            raise ValueError("APPLE_NOTES_STORAGE_BACKEND currently supports: google_drive")
-        if not apple_notes_google_drive_account:
-            raise ValueError("APPLE_NOTES_GOOGLE_DRIVE_ACCOUNT or APPLE_NOTES_ACCOUNT must be set")
-        if not apple_notes_google_drive_folder_id:
-            raise ValueError(
-                "APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
-            )
+        if apple_notes_storage_backend not in {"google_drive", "http_app"}:
+            raise ValueError("APPLE_NOTES_STORAGE_BACKEND currently supports: google_drive, http_app")
+        if apple_notes_storage_backend == "google_drive":
+            if not apple_notes_google_drive_account:
+                raise ValueError("APPLE_NOTES_GOOGLE_DRIVE_ACCOUNT or APPLE_NOTES_ACCOUNT must be set")
+            if not apple_notes_google_drive_folder_id:
+                raise ValueError(
+                    "APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+                )
         apple_notes = AppleNotesConfig(
             account=apple_notes_account,
             store_path=apple_notes_store_path,
@@ -665,10 +689,6 @@ def load_settings(
     apple_messages_store_path = os.path.expanduser(
         os.getenv("APPLE_MESSAGES_STORE_PATH", DEFAULT_APPLE_MESSAGES_STORE_PATH)
     )
-    apple_messages_storage_backend = os.getenv(
-        "APPLE_MESSAGES_STORAGE_BACKEND",
-        DEFAULT_APPLE_MESSAGES_STORAGE_BACKEND,
-    ).strip()
     apple_messages_google_drive_account = (
         os.getenv("APPLE_MESSAGES_GOOGLE_DRIVE_ACCOUNT")
         or apple_messages_account
@@ -681,6 +701,13 @@ def load_settings(
         or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
         or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
         or ""
+    ).strip()
+    apple_messages_storage_backend = os.getenv(
+        "APPLE_MESSAGES_STORAGE_BACKEND",
+        _default_upload_backend(
+            DEFAULT_APPLE_MESSAGES_STORAGE_BACKEND,
+            google_drive_folder_id=apple_messages_google_drive_folder_id,
+        ),
     ).strip()
     apple_messages_attachment_bytes_per_run = int(
         os.getenv(
@@ -706,14 +733,15 @@ def load_settings(
     ):
         if not apple_messages_account:
             raise ValueError("APPLE_MESSAGES_ACCOUNT or GMAIL_ACCOUNTS must be set for Apple Messages sync")
-        if apple_messages_storage_backend not in {"google_drive"}:
-            raise ValueError("APPLE_MESSAGES_STORAGE_BACKEND currently supports: google_drive")
-        if not apple_messages_google_drive_account:
-            raise ValueError("APPLE_MESSAGES_GOOGLE_DRIVE_ACCOUNT or APPLE_MESSAGES_ACCOUNT must be set")
-        if not apple_messages_google_drive_folder_id:
-            raise ValueError(
-                "APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
-            )
+        if apple_messages_storage_backend not in {"google_drive", "http_app"}:
+            raise ValueError("APPLE_MESSAGES_STORAGE_BACKEND currently supports: google_drive, http_app")
+        if apple_messages_storage_backend == "google_drive":
+            if not apple_messages_google_drive_account:
+                raise ValueError("APPLE_MESSAGES_GOOGLE_DRIVE_ACCOUNT or APPLE_MESSAGES_ACCOUNT must be set")
+            if not apple_messages_google_drive_folder_id:
+                raise ValueError(
+                    "APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+                )
         if apple_messages_attachment_bytes_per_run < 0:
             raise ValueError("APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN must be greater than or equal to 0")
         if apple_messages_attachment_count_per_run < 0:
@@ -743,10 +771,6 @@ def load_settings(
     )
     whatsapp_session_key = os.getenv("WHATSAPP_SESSION_KEY", DEFAULT_WHATSAPP_SESSION_KEY).strip()
     whatsapp_client_id = os.getenv("WHATSAPP_CLIENT_ID", "").strip()
-    whatsapp_storage_backend = os.getenv(
-        "WHATSAPP_STORAGE_BACKEND",
-        DEFAULT_WHATSAPP_STORAGE_BACKEND,
-    ).strip()
     whatsapp_google_drive_account = (
         os.getenv("WHATSAPP_GOOGLE_DRIVE_ACCOUNT")
         or whatsapp_account
@@ -760,6 +784,13 @@ def load_settings(
         or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
         or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
         or ""
+    ).strip()
+    whatsapp_storage_backend = os.getenv(
+        "WHATSAPP_STORAGE_BACKEND",
+        _default_upload_backend(
+            DEFAULT_WHATSAPP_STORAGE_BACKEND,
+            google_drive_folder_id=whatsapp_google_drive_folder_id,
+        ),
     ).strip()
     whatsapp_media_bytes_per_flush = int(
         os.getenv(
@@ -792,14 +823,15 @@ def load_settings(
     ):
         if not whatsapp_account:
             raise ValueError("WHATSAPP_ACCOUNT or GMAIL_ACCOUNTS must be set for WhatsApp sync")
-        if whatsapp_storage_backend not in {"google_drive"}:
-            raise ValueError("WHATSAPP_STORAGE_BACKEND currently supports: google_drive")
-        if not whatsapp_google_drive_account:
-            raise ValueError("WHATSAPP_GOOGLE_DRIVE_ACCOUNT or WHATSAPP_ACCOUNT must be set")
-        if not whatsapp_google_drive_folder_id:
-            raise ValueError(
-                "WHATSAPP_GOOGLE_DRIVE_FOLDER_ID, APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
-            )
+        if whatsapp_storage_backend not in {"google_drive", "http_app"}:
+            raise ValueError("WHATSAPP_STORAGE_BACKEND currently supports: google_drive, http_app")
+        if whatsapp_storage_backend == "google_drive":
+            if not whatsapp_google_drive_account:
+                raise ValueError("WHATSAPP_GOOGLE_DRIVE_ACCOUNT or WHATSAPP_ACCOUNT must be set")
+            if not whatsapp_google_drive_folder_id:
+                raise ValueError(
+                    "WHATSAPP_GOOGLE_DRIVE_FOLDER_ID, APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+                )
         if whatsapp_media_bytes_per_flush < 0:
             raise ValueError("WHATSAPP_MEDIA_BYTES_PER_FLUSH must be greater than or equal to 0")
         if whatsapp_media_count_per_flush < 0:
@@ -837,10 +869,6 @@ def load_settings(
         or default_voice_memos_account
     ).strip()
     agent_sessions_device = os.getenv("AGENT_SESSIONS_DEVICE", "").strip() or _local_device_name()
-    agent_sessions_storage_backend = os.getenv(
-        "AGENT_SESSIONS_STORAGE_BACKEND",
-        DEFAULT_AGENT_SESSIONS_STORAGE_BACKEND,
-    ).strip()
     agent_sessions_google_drive_account = (
         os.getenv("AGENT_SESSIONS_GOOGLE_DRIVE_ACCOUNT")
         or agent_sessions_account
@@ -854,6 +882,13 @@ def load_settings(
         or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
         or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
         or ""
+    ).strip()
+    agent_sessions_storage_backend = os.getenv(
+        "AGENT_SESSIONS_STORAGE_BACKEND",
+        _default_upload_backend(
+            DEFAULT_AGENT_SESSIONS_STORAGE_BACKEND,
+            google_drive_folder_id=agent_sessions_google_drive_folder_id,
+        ),
     ).strip()
     agent_sessions_claude_projects_dir = os.path.expanduser(
         os.getenv("AGENT_SESSIONS_CLAUDE_PROJECTS_DIR", DEFAULT_AGENT_SESSIONS_CLAUDE_PROJECTS_DIR)
@@ -873,14 +908,17 @@ def load_settings(
     ):
         if not agent_sessions_account:
             raise ValueError("AGENT_SESSIONS_ACCOUNT or GMAIL_ACCOUNTS must be set for agent session sync")
-        if agent_sessions_storage_backend not in {"google_drive"}:
-            raise ValueError("AGENT_SESSIONS_STORAGE_BACKEND currently supports: google_drive")
-        if not agent_sessions_google_drive_account:
-            raise ValueError("AGENT_SESSIONS_GOOGLE_DRIVE_ACCOUNT or AGENT_SESSIONS_ACCOUNT must be set")
-        if not agent_sessions_google_drive_folder_id:
-            raise ValueError(
-                "AGENT_SESSIONS_GOOGLE_DRIVE_FOLDER_ID, APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
-            )
+        if agent_sessions_storage_backend not in {"google_drive", "http_app"}:
+            raise ValueError("AGENT_SESSIONS_STORAGE_BACKEND currently supports: google_drive, http_app")
+        # The http_app backend uploads through the app, which owns the Drive
+        # credential and folder; the device needs neither.
+        if agent_sessions_storage_backend == "google_drive":
+            if not agent_sessions_google_drive_account:
+                raise ValueError("AGENT_SESSIONS_GOOGLE_DRIVE_ACCOUNT or AGENT_SESSIONS_ACCOUNT must be set")
+            if not agent_sessions_google_drive_folder_id:
+                raise ValueError(
+                    "AGENT_SESSIONS_GOOGLE_DRIVE_FOLDER_ID, APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+                )
         agent_sessions = AgentSessionsConfig(
             account=agent_sessions_account,
             device=agent_sessions_device,
