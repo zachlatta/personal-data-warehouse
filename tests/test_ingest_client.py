@@ -7,7 +7,13 @@ import json
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from personal_data_warehouse.ingest_client import IngestClient, sign_object_upload
+import pytest
+
+from personal_data_warehouse.ingest_client import (
+    IngestClient,
+    ingest_client_from_env,
+    sign_object_upload,
+)
 from personal_data_warehouse_agent_sessions.state import AgentSessionsUploadState
 from personal_data_warehouse_agent_sessions.sync import AgentSessionsUploadRunner
 
@@ -163,3 +169,47 @@ def test_runner_requires_batch_uploader(tmp_path: Path) -> None:
         assert raised
     finally:
         state.close()
+
+
+# --- ingest_client_from_env: warehouse URL/token resolution -----------------
+
+_INGEST_ENV_VARS = (
+    "PDW_INGEST_BASE_URL",
+    "PDW_API_URL",
+    "MCP_BASE_URL",
+    "PDW_INGEST_SIGNING_KEY",
+    "PDW_SECRET_TOKEN",
+    "MCP_SECRET_TOKEN",
+)
+
+
+def _clear_ingest_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _INGEST_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_from_env_uses_main_api_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The uploader's base URL is the warehouse's main API URL; no separate
+    # ingest URL is required.
+    _clear_ingest_env(monkeypatch)
+    monkeypatch.setenv("PDW_API_URL", "https://warehouse.example")
+    monkeypatch.setenv("PDW_SECRET_TOKEN", "tok")
+    client = ingest_client_from_env()
+    assert client._base_url == "https://warehouse.example"
+    assert client._signing_key == b"tok"
+
+
+def test_from_env_prefers_explicit_ingest_url_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_ingest_env(monkeypatch)
+    monkeypatch.setenv("PDW_INGEST_BASE_URL", "https://explicit.example")
+    monkeypatch.setenv("PDW_API_URL", "https://warehouse.example")
+    monkeypatch.setenv("PDW_SECRET_TOKEN", "tok")
+    client = ingest_client_from_env()
+    assert client._base_url == "https://explicit.example"
+
+
+def test_from_env_requires_a_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_ingest_env(monkeypatch)
+    monkeypatch.setenv("PDW_SECRET_TOKEN", "tok")
+    with pytest.raises(ValueError, match="PDW_API_URL"):
+        ingest_client_from_env()

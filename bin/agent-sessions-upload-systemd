@@ -12,6 +12,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 UV="${UV_BIN:-$HOME/.local/bin/uv}"
 [ -x "$UV" ] || UV="$(command -v uv || echo uv)"
+# The uploader now runs through the pdw CLI: `pdw ingest agent-sessions` execs
+# `uv run python -m <module>`. Resolve pdw (override with PDW_BIN) and pin uv +
+# the repo so pdw finds them under the minimal systemd environment.
+PDW="${PDW_BIN:-$HOME/.local/bin/pdw}"
+[ -x "$PDW" ] || PDW="$(command -v pdw 2>/dev/null || echo "$PDW")"
+export PDW_UV_BIN="$UV"
+export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
 
 LOG_DIR="${PDW_LOG_DIR:-$HOME/.local/state/personal-data-warehouse}"
 LOG_FILE="$LOG_DIR/agent-sessions-upload.run.log"
@@ -28,7 +35,7 @@ if ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
-  "$UV" run personal-data-warehouse-agent-sessions-upload --mode incremental >> "$LOG_FILE" 2>&1
+  "$PDW" ingest agent-sessions --mode incremental >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi
 

@@ -3,6 +3,13 @@ set -u
 
 REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
 UV="/opt/homebrew/bin/uv"
+# The uploaders now run through the pdw CLI: `pdw ingest <source>` execs
+# `uv run python -m <module>`. Pin uv + the repo so pdw finds them under the
+# minimal launchd environment. Override the pdw binary with PDW_BIN if needed.
+PDW="${PDW_BIN:-$HOME/.local/bin/pdw}"
+[ -x "$PDW" ] || PDW="$(command -v pdw 2>/dev/null || echo "$PDW")"
+export PDW_UV_BIN="$UV"
+export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
 LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
 LOG_FILE="$LOG_DIR/apple-messages-upload.run.log"
 HEARTBEAT_FILE="$LOG_DIR/apple-messages-upload.heartbeat"
@@ -18,7 +25,7 @@ if ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
-  "$UV" run personal-data-warehouse-apple-messages-upload --mode incremental >> "$LOG_FILE" 2>&1
+  "$PDW" ingest apple-messages --mode incremental >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi
 

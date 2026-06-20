@@ -62,6 +62,11 @@ COMMANDS
                              names.
   schema                     Run schema_overview and print the warehouse schema
                              (same as running pdw with no command).
+  ingest <source> [flags]    Run a local data-warehouse uploader through pdw.
+                             Sources: voice-memos, apple-notes, apple-messages,
+                             agent-sessions. Flags after <source> are forwarded
+                             to the uploader (e.g. --mode incremental|full,
+                             --limit N). See "pdw ingest --help".
   version                    Print the build version.
   update                     Replace this binary with the latest GitHub release.
                                --check  Only report whether an update is available.
@@ -161,6 +166,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		fmt.Fprint(stdout, usage)
 		return 0
+	}
+	// ingest runs local uploaders and never talks to /api/tools, so dispatch
+	// it here: before the generic help check (so `pdw ingest <src> --help`
+	// forwards --help to the uploader) and before the API-config resolution
+	// (so it needs no warehouse URL/token).
+	if cmd == "ingest" {
+		return runIngestWithConfig(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
 	}
 	if hasHelpArg(rest) {
 		fmt.Fprint(stdout, usage)

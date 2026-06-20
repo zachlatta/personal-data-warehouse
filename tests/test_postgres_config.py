@@ -119,6 +119,28 @@ def test_whatsapp_history_media_download_can_be_disabled(monkeypatch) -> None:
     assert settings.whatsapp.download_history_media is False
 
 
+def test_local_upload_configs_use_main_api_url_without_drive_folders(monkeypatch) -> None:
+    monkeypatch.setattr(config, "load_dotenv", lambda: None)
+    for name in (
+        "PDW_INGEST_BASE_URL",
+        "MCP_BASE_URL",
+        "VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID",
+        "VOICE_MEMOS_DRIVE_FOLDER_ID",
+        "VOICE_MEMOS_STORAGE_BACKEND",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PDW_API_URL", "https://pdw.example.test")
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "zach@example.test")
+    monkeypatch.setenv("VOICE_MEMOS_ACCOUNT", "zach@example.test")
+    monkeypatch.setenv("GOOGLE_DRIVE_SOURCE_ENABLED", "0")
+
+    settings = load_settings(require_postgres=False, require_gmail=False, require_voice_memos=True)
+
+    assert settings.voice_memos is not None
+    assert settings.voice_memos.storage_backend == "http_app"
+    assert config.GOOGLE_DRIVE_SCOPE not in settings.google_scopes
+
+
 def test_drive_reader_folder_keeps_drive_scope_with_app_url(monkeypatch) -> None:
     monkeypatch.setattr(config, "load_dotenv", lambda: None)
     monkeypatch.delenv("VOICE_MEMOS_STORAGE_BACKEND", raising=False)

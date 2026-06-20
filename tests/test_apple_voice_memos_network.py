@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from personal_data_warehouse_voice_memos.network import NetworkPolicy, parse_proc_net_route, preflight_app_ingest
+from personal_data_warehouse_voice_memos.network import (
+    NetworkPolicy,
+    ingest_base_url_from_env,
+    parse_proc_net_route,
+    preflight_app_ingest,
+)
 
 
 def test_network_policy_blocks_inflight_wifi_ssid() -> None:
@@ -204,8 +209,23 @@ def test_app_ingest_preflight_uses_configured_app_host() -> None:
     assert calls == [(("pdw.example.test", 443), 2.5)]
 
 
+def test_ingest_base_url_uses_main_api_url(monkeypatch) -> None:
+    monkeypatch.delenv("PDW_INGEST_BASE_URL", raising=False)
+    monkeypatch.delenv("MCP_BASE_URL", raising=False)
+    monkeypatch.setenv("PDW_API_URL", "https://warehouse.example.test")
+
+    assert ingest_base_url_from_env() == "https://warehouse.example.test"
+
+
+def test_ingest_base_url_prefers_explicit_ingest_alias(monkeypatch) -> None:
+    monkeypatch.setenv("PDW_INGEST_BASE_URL", "https://ingest.example.test")
+    monkeypatch.setenv("PDW_API_URL", "https://warehouse.example.test")
+
+    assert ingest_base_url_from_env() == "https://ingest.example.test"
+
+
 def test_app_ingest_preflight_rejects_missing_base_url() -> None:
     decision = preflight_app_ingest(timeout_seconds=1, base_url="")
 
     assert decision.allowed is False
-    assert "PDW_INGEST_BASE_URL" in decision.reason
+    assert "PDW_API_URL" in decision.reason

@@ -101,7 +101,7 @@ This Mac is intended to run the local Voice Memos uploader through a user Launch
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.voice-memos-upload.plist`
 - Wrapper script: `bin/voice-memos-upload-launchd`
 - Run cadence: every 300 seconds with `RunAtLoad`
-- Command: `/opt/homebrew/bin/uv run personal-data-warehouse-voice-memos-upload --mode incremental`
+- Command: `pdw ingest voice-memos --mode incremental` (the wrapper runs the pdw CLI, which execs `uv run python -m personal_data_warehouse_voice_memos.cli`)
 - Main run log: `~/Library/Logs/personal-data-warehouse/voice-memos-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/voice-memos-upload.heartbeat`
 - Status helper: `bin/voice-memos-upload-status`
@@ -131,7 +131,7 @@ behave better for user-session jobs and are easier to inspect with `launchctl`.
 If the run log shows `PermissionError: [Errno 1] Operation not permitted` for
 `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings`, the LaunchAgent is
 loaded correctly but macOS Full Disk Access is blocking the background process. Grant Full Disk
-Access to the executable chain used by the job, especially `/bin/zsh`, `/opt/homebrew/bin/uv`, and
+Access to the executable chain used by the job, especially `/bin/zsh`, the `pdw` binary (`~/.local/bin/pdw`), `/opt/homebrew/bin/uv`, and
 `/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. Its current real path is
 `/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`. Then
 kickstart the LaunchAgent again.
@@ -145,7 +145,7 @@ This Mac is intended to run the local Apple Notes uploader through a user Launch
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist`
 - Wrapper script: `bin/apple-notes-upload-launchd`
 - Run cadence: every 300 seconds with `RunAtLoad`
-- Command: `/opt/homebrew/bin/uv run personal-data-warehouse-apple-notes-upload --mode incremental`
+- Command: `pdw ingest apple-notes --mode incremental` (the wrapper runs the pdw CLI, which execs `uv run python -m personal_data_warehouse_apple_notes.cli`)
 - Main run log: `~/Library/Logs/personal-data-warehouse/apple-notes-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/apple-notes-upload.heartbeat`
 - Status helper: `bin/apple-notes-upload-status`
@@ -172,7 +172,7 @@ launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-
 If the run log shows `PermissionError` or SQLite `authorization denied` for
 `~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`, the LaunchAgent is loaded
 correctly but macOS Full Disk Access is blocking the background process. Grant Full Disk Access to
-the executable chain used by the job, especially `/bin/zsh`, `/opt/homebrew/bin/uv`, and
+the executable chain used by the job, especially `/bin/zsh`, the `pdw` binary (`~/.local/bin/pdw`), `/opt/homebrew/bin/uv`, and
 `/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. Its current real path is
 `/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`. Then
 kickstart the LaunchAgent again.
@@ -186,7 +186,7 @@ This Mac is intended to run the local Apple Messages uploader through a user Lau
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist`
 - Wrapper script: `bin/apple-messages-upload-launchd`
 - Run cadence: every 300 seconds with `RunAtLoad`
-- Command: `/opt/homebrew/bin/uv run personal-data-warehouse-apple-messages-upload --mode incremental`
+- Command: `pdw ingest apple-messages --mode incremental` (the wrapper runs the pdw CLI, which execs `uv run python -m personal_data_warehouse_apple_messages.cli`)
 - Main run log: `~/Library/Logs/personal-data-warehouse/apple-messages-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/apple-messages-upload.heartbeat`
 - Status helper: `bin/apple-messages-upload-status`
@@ -213,7 +213,7 @@ launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messag
 If the run log shows `PermissionError` or SQLite `authorization denied` for
 `~/Library/Messages/chat.db`, the LaunchAgent is loaded correctly but macOS Full Disk Access is
 blocking the background process. Grant Full Disk Access to the executable chain used by the job,
-especially `/bin/zsh`, `/opt/homebrew/bin/uv`, and
+especially `/bin/zsh`, the `pdw` binary (`~/.local/bin/pdw`), `/opt/homebrew/bin/uv`, and
 `/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. Its current real path is
 `/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`. Then
 kickstart the LaunchAgent again.
@@ -237,7 +237,7 @@ line by line, through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist`
 - Wrapper script: `bin/agent-sessions-upload-launchd`
 - Run cadence: every 300 seconds with `RunAtLoad`
-- Command: `/opt/homebrew/bin/uv run personal-data-warehouse-agent-sessions-upload --mode incremental`
+- Command: `pdw ingest agent-sessions --mode incremental` (the wrapper runs the pdw CLI, which execs `uv run python -m personal_data_warehouse_agent_sessions.cli`)
 - Main run log: `~/Library/Logs/personal-data-warehouse/agent-sessions-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/agent-sessions-upload.heartbeat`
 - Status helper: `bin/agent-sessions-upload-status`
@@ -285,9 +285,15 @@ clients. Each device POSTs domain payloads to the app's semantic ingestion endpo
 `pdw_*` tags; the device holds none of that. The app writes byte-identical Drive objects, so the
 Dagster `*_drive_ingest` readers are unchanged.
 
-Every uploader therefore requires `PDW_INGEST_BASE_URL` (or `MCP_BASE_URL`) and the app secret
-token for signing (`PDW_INGEST_SIGNING_KEY`, or `PDW_SECRET_TOKEN` / `MCP_SECRET_TOKEN`); without
-them the uploader fails fast. On the app side, ingestion turns on automatically when the object
+Every uploader therefore needs the warehouse URL and the app secret token. The canonical source
+is pdw's own config: because the uploaders run via `pdw ingest <source>`, the pdw CLI resolves the
+URL + token the way it does for every other command (`pdw login`, then `PDW_API_URL` /
+`PDW_SECRET_TOKEN`) and passes them down — so a single `pdw login` configures uploads too, with no
+separate ingest URL to manage. The client reads `PDW_API_URL` (aliases: `PDW_INGEST_BASE_URL`,
+`MCP_BASE_URL`) for the URL and `PDW_SECRET_TOKEN` (aliases: `PDW_INGEST_SIGNING_KEY`,
+`MCP_SECRET_TOKEN`) for the signing key; an explicit alias still wins (e.g. the openclaw VM pins
+`PDW_INGEST_BASE_URL` + `PDW_INGEST_SIGNING_KEY` in its `.env`). Without any of them the uploader
+fails fast. On the app side, ingestion turns on automatically when the object
 store is configured; per-source folders default to `PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID` and
 can be overridden with `PDW_INGEST_<SOURCE>_FOLDER_ID` (e.g.
 `PDW_INGEST_AGENT_SESSIONS_FOLDER_ID`). Uploads are authenticated with the same HMAC scheme as

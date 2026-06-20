@@ -105,8 +105,8 @@ CONTACT_GOOGLE_ACCOUNTS=you@work.example,you@personal.example
 CONTACT_PAGE_SIZE=1000
 CONTACT_FORCE_FULL_SYNC=false
 VOICE_MEMOS_ACCOUNT=you@example.com
-PDW_INGEST_BASE_URL=https://your-public-pdw-app
-PDW_INGEST_SIGNING_KEY=<same-secret-as-pdw-app>
+PDW_API_URL=https://your-public-pdw-app
+PDW_SECRET_TOKEN=<same-secret-as-pdw-app>
 VOICE_MEMOS_EXTENSIONS=.m4a,.qta
 APPLE_MESSAGES_ACCOUNT=you@example.com
 APPLE_MESSAGES_STORE_PATH=~/Library/Messages/chat.db
@@ -404,14 +404,18 @@ Google Drive directly:
 3. The remote Dagster asset reads inbox metadata, writes metadata rows to Postgres, then promotes
    the audio and JSON objects into the library prefix.
 
-Configure the local Mac uploader with the app URL and signing secret:
+Configure the local Mac uploader with the app URL and signing secret by running
+`pdw login` once, or by setting the same env vars pdw uses:
 
 ```bash
 VOICE_MEMOS_ACCOUNT=you@example.com
-PDW_INGEST_BASE_URL=https://your-public-pdw-app
-PDW_INGEST_SIGNING_KEY=<same-secret-as-pdw-app>
+PDW_API_URL=https://your-public-pdw-app
+PDW_SECRET_TOKEN=<same-secret-as-pdw-app>
 VOICE_MEMOS_EXTENSIONS=.m4a,.qta
 ```
+
+Explicit `PDW_INGEST_BASE_URL` / `PDW_INGEST_SIGNING_KEY` aliases still work
+and take precedence for deployments that need to pin a separate ingest target.
 
 Configure the app/Dagster object store with the shared Drive folder and re-authorize that Google
 account so the token includes Drive scope:
@@ -425,7 +429,7 @@ uv run personal-data-warehouse-google-auth --email you@example.com --write-env
 Run the local Mac uploader:
 
 ```bash
-uv run personal-data-warehouse-apple-voice-memos-upload
+pdw ingest voice-memos
 ```
 
 The uploader defaults to a lightweight incremental mode for scheduled background runs. Incremental mode keeps local
@@ -434,7 +438,7 @@ unchanged recordings that already uploaded both audio and metadata are skipped b
 network calls. Use full mode for periodic repair/backfill:
 
 ```bash
-uv run personal-data-warehouse-apple-voice-memos-upload --mode full
+pdw ingest voice-memos --mode full
 ```
 
 On Zach's MacBook Pro, the local uploader is managed by a per-user macOS LaunchAgent
@@ -491,7 +495,7 @@ unavailable or redacted SSID until the launching app/process has location permis
 uploader can see with:
 
 ```bash
-uv run personal-data-warehouse-apple-voice-memos-upload --network-diagnostics
+pdw ingest voice-memos --network-diagnostics
 ```
 
 If it reports `SSID unavailable`, grant Location Services permission to the app launching the
@@ -522,12 +526,13 @@ directly:
 3. A Dagster asset reads inbox metadata, writes latest-note, revision-history, and attachment rows
    to Postgres, then promotes the Drive objects into the library prefix.
 
-Configure the local Mac uploader with the app URL and signing secret:
+Configure the local Mac uploader with the app URL and signing secret by running
+`pdw login` once, or by setting the same env vars pdw uses:
 
 ```bash
 APPLE_NOTES_ACCOUNT=you@example.com
-PDW_INGEST_BASE_URL=https://your-public-pdw-app
-PDW_INGEST_SIGNING_KEY=<same-secret-as-pdw-app>
+PDW_API_URL=https://your-public-pdw-app
+PDW_SECRET_TOKEN=<same-secret-as-pdw-app>
 APPLE_NOTES_STORE_PATH=~/Library/Group\ Containers/group.com.apple.notes/NoteStore.sqlite
 ```
 
@@ -545,7 +550,7 @@ uv run personal-data-warehouse-google-auth --email you@example.com --write-env
 Run the local Mac uploader:
 
 ```bash
-uv run personal-data-warehouse-apple-notes-upload
+pdw ingest apple-notes
 ```
 
 Incremental mode keeps local state in
@@ -613,12 +618,13 @@ iMessage, SMS, RCS, chat, handle, join, deletion, and attachment metadata into c
 batches, and posts those batches to the app. Attachment binaries are posted separately in bounded
 backfill runs so message text can land quickly while large media catches up.
 
-Configure the local Mac uploader with the app URL and signing secret:
+Configure the local Mac uploader with the app URL and signing secret by running
+`pdw login` once, or by setting the same env vars pdw uses:
 
 ```bash
 APPLE_MESSAGES_ACCOUNT=you@example.com
-PDW_INGEST_BASE_URL=https://your-public-pdw-app
-PDW_INGEST_SIGNING_KEY=<same-secret-as-pdw-app>
+PDW_API_URL=https://your-public-pdw-app
+PDW_SECRET_TOKEN=<same-secret-as-pdw-app>
 APPLE_MESSAGES_STORE_PATH=~/Library/Messages/chat.db
 APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN=536870912
 APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN=200
@@ -639,7 +645,7 @@ uv run personal-data-warehouse-google-auth --email you@example.com --write-env
 Run the local Mac uploader:
 
 ```bash
-uv run personal-data-warehouse-apple-messages-upload
+pdw ingest apple-messages
 ```
 
 Incremental mode keeps local state in

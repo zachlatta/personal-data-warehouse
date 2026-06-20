@@ -393,7 +393,8 @@ def _default_upload_backend(legacy_default: str = "google_drive", *, google_driv
     explicit ``*_STORAGE_BACKEND`` env var always overrides this label.
     """
 
-    if (os.getenv("PDW_INGEST_BASE_URL") or os.getenv("MCP_BASE_URL") or "").strip() and not google_drive_folder_id:
+    app_base_url = os.getenv("PDW_INGEST_BASE_URL") or os.getenv("PDW_API_URL") or os.getenv("MCP_BASE_URL")
+    if app_base_url and app_base_url.strip() and not google_drive_folder_id:
         return "http_app"
     return legacy_default
 

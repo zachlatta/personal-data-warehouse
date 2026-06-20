@@ -25,12 +25,13 @@ personal-data-warehouse-google-auth = "personal_data_warehouse.gmail_auth:main"
 personal-data-warehouse-contacts-sync = "personal_data_warehouse.contacts_sync:main"
 personal-data-warehouse-google-drive-source-sync = "personal_data_warehouse.google_drive_source_sync:main"
 personal-data-warehouse-slack-sync = "personal_data_warehouse.slack_sync:main"
-personal-data-warehouse-apple-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"
-personal-data-warehouse-voice-memos-upload = "personal_data_warehouse_voice_memos.cli:main"
-personal-data-warehouse-apple-notes-upload = "personal_data_warehouse_apple_notes.cli:main"
-personal-data-warehouse-apple-messages-upload = "personal_data_warehouse_apple_messages.cli:main"
+# The four scheduled client uploaders are no longer standalone console scripts:
+# they run through the pdw CLI as `pdw ingest <source>` (voice-memos,
+# apple-notes, apple-messages, agent-sessions), which execs `uv run python -m
+# <module>`. whatsapp-client stays a console script because it is a local
+# pairing/debug tool, not a scheduled uploader (WhatsApp ingests in-process in
+# the production Dagster deployment).
 personal-data-warehouse-whatsapp-client = "personal_data_warehouse_whatsapp.cli:main"
-personal-data-warehouse-agent-sessions-upload = "personal_data_warehouse_agent_sessions.cli:main"
 personal-data-warehouse-agent-auth = "personal_data_warehouse.agent_runner:auth_main"
 
 [dependency-groups]
