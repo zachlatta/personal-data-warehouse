@@ -31,7 +31,10 @@ from dagster import (
 )
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.ingest_client import ingest_client_from_env
+from personal_data_warehouse.ingest_client import (
+    ingest_client_from_env,
+    ingest_upload_config_problem,
+)
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
@@ -139,6 +142,16 @@ def whatsapp_client_keepalive_sensor(context):
         return SkipReason(
             "WhatsApp client is disabled by WHATSAPP_CLIENT_ENABLED=0; unset it or set "
             "WHATSAPP_CLIENT_ENABLED=1 to start it."
+        )
+
+    # The client uploads through the app's ingest endpoint. Without that config
+    # every run would crash instantly, and the keepalive cadence would turn one
+    # misconfiguration into a flood of failed runs. Skip with a clear reason
+    # instead so the misconfig surfaces once, in the sensor tick.
+    upload_problem = ingest_upload_config_problem()
+    if upload_problem:
+        return SkipReason(
+            f"WhatsApp client cannot upload — http_app ingest is not configured: {upload_problem}"
         )
 
     return RunRequest(tags={"whatsapp_trigger": "keepalive"})

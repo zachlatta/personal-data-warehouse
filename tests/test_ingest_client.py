@@ -12,6 +12,7 @@ import pytest
 from personal_data_warehouse.ingest_client import (
     IngestClient,
     ingest_client_from_env,
+    ingest_upload_config_problem,
     sign_object_upload,
 )
 from personal_data_warehouse_agent_sessions.state import AgentSessionsUploadState
@@ -210,3 +211,26 @@ def test_from_env_requires_a_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PDW_SECRET_TOKEN", "tok")
     with pytest.raises(ValueError, match="PDW_API_URL"):
         ingest_client_from_env()
+
+
+def test_config_problem_none_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_ingest_env(monkeypatch)
+    monkeypatch.setenv("PDW_API_URL", "https://warehouse.example")
+    monkeypatch.setenv("PDW_SECRET_TOKEN", "tok")
+    assert ingest_upload_config_problem() is None
+
+
+def test_config_problem_reports_missing_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_ingest_env(monkeypatch)
+    monkeypatch.setenv("PDW_SECRET_TOKEN", "tok")
+    problem = ingest_upload_config_problem()
+    assert problem is not None
+    assert "PDW_API_URL" in problem
+
+
+def test_config_problem_reports_missing_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_ingest_env(monkeypatch)
+    monkeypatch.setenv("PDW_API_URL", "https://warehouse.example")
+    problem = ingest_upload_config_problem()
+    assert problem is not None
+    assert "PDW_SECRET_TOKEN" in problem

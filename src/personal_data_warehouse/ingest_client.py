@@ -290,6 +290,23 @@ class IngestClient:
         )
 
 
+def ingest_upload_config_problem() -> str | None:
+    """Return a human-readable reason http_app upload env is missing, else None.
+
+    Mirrors the env names :func:`ingest_client_from_env` reads so callers can
+    detect a misconfigured deployment *before* doing any work. Long-running
+    clients launched by a keepalive sensor (e.g. the WhatsApp client) use this
+    to skip launching a run that would only crash-loop on missing config,
+    turning silent run-failure floods into one clear skip reason.
+    """
+
+    if not (os.getenv("PDW_API_URL") or os.getenv("MCP_BASE_URL") or "").strip():
+        return "PDW_API_URL (or MCP_BASE_URL) must be set for http_app uploads"
+    if not (os.getenv("PDW_SECRET_TOKEN") or os.getenv("MCP_SECRET_TOKEN") or "").strip():
+        return "PDW_SECRET_TOKEN (or MCP_SECRET_TOKEN) must be set for http_app uploads"
+    return None
+
+
 def ingest_client_from_env(
     *,
     now: Callable[[], float] = time.time,
@@ -305,20 +322,17 @@ def ingest_client_from_env(
     deliberately NOT read here; those live only in the app.
     """
 
+    problem = ingest_upload_config_problem()
+    if problem:
+        raise ValueError(problem)
     base_url = (
         os.getenv("PDW_API_URL")
         or os.getenv("MCP_BASE_URL")
         or ""
     ).strip()
-    if not base_url:
-        raise ValueError("PDW_API_URL (or MCP_BASE_URL) must be set for http_app uploads")
     secret = (
         os.getenv("PDW_SECRET_TOKEN")
         or os.getenv("MCP_SECRET_TOKEN")
         or ""
     ).strip()
-    if not secret:
-        raise ValueError(
-            "PDW_SECRET_TOKEN (or MCP_SECRET_TOKEN) must be set for http_app uploads"
-        )
     return IngestClient(base_url=base_url, signing_key=secret.encode("utf-8"), now=now, session=session)
