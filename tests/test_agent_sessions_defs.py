@@ -21,6 +21,11 @@ def test_drive_inbox_sensor_runs_every_minute() -> None:
     assert sensor.default_status.value == "RUNNING"
 
 
+def test_drive_ingest_does_not_take_postgres_advisory_lock() -> None:
+    assert not hasattr(agent_defs, "exclusive_sync_lock")
+    assert not hasattr(agent_defs, "AGENT_SESSIONS_DRIVE_INGEST_POSTGRES_LOCK_ID")
+
+
 def test_drive_inbox_sensor_skips_when_inbox_is_empty(monkeypatch) -> None:
     monkeypatch.setattr(agent_defs, "load_settings", lambda **_kwargs: FakeSettings())
     monkeypatch.setattr(agent_defs, "_agent_sessions_object_store", lambda _settings: object())

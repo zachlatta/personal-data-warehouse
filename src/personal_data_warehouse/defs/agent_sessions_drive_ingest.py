@@ -24,10 +24,8 @@ from personal_data_warehouse.agent_sessions_drive_ingest import (
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
-from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
-AGENT_SESSIONS_DRIVE_INGEST_POSTGRES_LOCK_ID = 8_407_112_442
 AGENT_SESSIONS_SENSOR_INTERVAL_SECONDS = 60
 
 
@@ -53,23 +51,17 @@ def agent_sessions_drive_ingest(context) -> MaterializeResult:
     if settings.agent_sessions is None:
         raise RuntimeError("Agent sessions sync is not configured")
     warehouse = warehouse_from_settings(settings)
-
-    with exclusive_sync_lock(
-        name="agent_sessions_drive_ingest",
-        postgres_lock_id=AGENT_SESSIONS_DRIVE_INGEST_POSTGRES_LOCK_ID,
-    ) as acquired:
-        if not acquired:
-            context.log.warning("Skipping agent sessions Drive ingest because another run is already active")
-            summary = None
-        else:
-            object_store = _agent_sessions_object_store(settings)
-            summary = AgentSessionsDriveIngestRunner(
-                warehouse=warehouse,
-                batch_source=lambda: iter_batch_payloads(object_store=object_store),
-                object_store_factory=lambda: _agent_sessions_object_store(settings),
-                promotion_workers=int(os.getenv("AGENT_SESSIONS_DRIVE_INGEST_PROMOTION_WORKERS", "8")),
-                logger=context.log,
-            ).sync()
+    try:
+        object_store = _agent_sessions_object_store(settings)
+        summary = AgentSessionsDriveIngestRunner(
+            warehouse=warehouse,
+            batch_source=lambda: iter_batch_payloads(object_store=object_store),
+            object_store_factory=lambda: _agent_sessions_object_store(settings),
+            promotion_workers=int(os.getenv("AGENT_SESSIONS_DRIVE_INGEST_PROMOTION_WORKERS", "8")),
+            logger=context.log,
+        ).sync()
+    finally:
+        warehouse.close()
 
     return MaterializeResult(
         metadata={
