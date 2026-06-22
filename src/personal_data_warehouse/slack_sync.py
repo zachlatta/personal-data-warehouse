@@ -547,12 +547,21 @@ class SlackSyncRunner:
             for conversation in group_conversations:
                 if not conversation.get("id"):
                     continue
+                cursor_ts = _conversation_cursor_ts(conversation)
                 if not conversation_may_have_activity_since(
                     conversation,
                     oldest_ts,
-                    cursor_ts=_conversation_cursor_ts(conversation),
+                    cursor_ts=cursor_ts,
                 ):
                     continue
+                # Resume from our own cursor when it predates the freshness window so a
+                # conversation that fell behind (e.g. was skipped while its cached
+                # latest.ts was stale) is caught up in full, not just over the last
+                # window. For healthy conversations the cursor sits inside the window, so
+                # this is the normal window fetch.
+                conversation_oldest_ts = oldest_ts
+                if cursor_ts is not None and 0 < cursor_ts < oldest_ts:
+                    conversation_oldest_ts = cursor_ts
                 conversations_seen += 1
                 try:
                     result = self._sync_conversation_messages(
@@ -562,7 +571,7 @@ class SlackSyncRunner:
                         client=client,
                         synced_at=synced_at,
                         sync_version=sync_version,
-                        oldest_ts=oldest_ts,
+                        oldest_ts=conversation_oldest_ts,
                     )
                 except SlackRateLimitBudgetExceeded as exc:
                     if not self._skip_known_errors:
@@ -1642,19 +1651,21 @@ def conversation_may_have_activity_since(
     *,
     cursor_ts: float | None = None,
 ) -> bool:
-    # `latest.ts` (from conversations.list/info) is authoritative when present, but Slack
-    # omits it for nearly all channels. `updated` tracks channel-property edits (topic,
-    # purpose, members), NOT message activity; using it as a freshness gate silently
-    # skips any channel whose metadata hasn't changed recently. Use our own cursor_ts
-    # instead; fall back to "include" rather than to `updated`.
+    # Our own cursor_ts is the only trustworthy record of how far we have synced. A
+    # cached `latest.ts` (from an earlier conversations.list/info) can be arbitrarily
+    # stale because the stored conversation payload is only refreshed periodically, so it
+    # must never be used to *exclude* a conversation we already track: a `latest.ts` older
+    # than the freshness window would skip the conversation on every pass and freeze its
+    # cursor forever (this stranded ~40 quiet DMs weeks behind). When we hold a cursor,
+    # always include and let the conversation_limit cap bound the work.
+    if cursor_ts is not None and cursor_ts > 0:
+        return True
+    # No cursor yet (never synced): Slack's `latest.ts` is the only activity hint we have,
+    # so honour it when present; otherwise include. `updated` tracks channel-property edits
+    # (topic, purpose, members), NOT message activity, so it is never used as a gate.
     latest = conversation.get("latest")
     if isinstance(latest, Mapping) and latest.get("ts"):
         return float(str(latest["ts"])) >= oldest_ts
-    if cursor_ts is not None and cursor_ts > 0:
-        # We know exactly the ts of our last-synced message. If we're behind the
-        # window we definitely need to sync; if we're ahead, new messages may have
-        # arrived since, so let the conversation_limit cap bound the work.
-        return True
     return True
 
 

@@ -442,6 +442,11 @@ def test_conversation_recency_uses_latest_or_cursor_state():
     # or ahead; the conversation_limit cap bounds the work.
     assert conversation_may_have_activity_since({}, 100.0, cursor_ts=50.0)
     assert conversation_may_have_activity_since({}, 100.0, cursor_ts=200.0)
+    # A cached `latest.ts` can be arbitrarily stale (the stored payload is only
+    # refreshed periodically), so it must NOT exclude a conversation we already
+    # track via our own cursor. A stale latest.ts older than the window used to
+    # freeze the conversation on every pass; our cursor must win.
+    assert conversation_may_have_activity_since({"latest": {"ts": "100.000001"}}, 101.0, cursor_ts=50.0)
 
     # Sort key prefers cursor_ts (truthful) over Slack hints.
     assert conversation_activity_ts({"latest": {"ts": "120.000001"}}) == pytest.approx(120.000001)
@@ -1449,6 +1454,67 @@ def test_runner_freshness_priority_syncs_stuck_channel_without_latest_metadata(m
 
     history_channels = [params["channel"] for method, params in client.calls if method == "conversations.history"]
     assert history_channels == ["C_STUCK"]
+
+
+def test_runner_freshness_priority_syncs_frozen_dm_with_stale_latest_metadata(monkeypatch):
+    # Regression (stale-latest DM freeze): some IM payloads carry a `latest.ts` from an
+    # earlier conversations.info read. That cached `latest.ts` goes stale because the
+    # stored payload is only refreshed periodically, and the activity filter used it to
+    # *exclude* the DM on every freshness pass (latest.ts < freshness window), freezing
+    # its cursor forever. A DM whose cached latest.ts predates the window must still be
+    # synced when we hold our own cursor, and it must resume from that cursor so the gap
+    # that accumulated while it was frozen is backfilled, not just the last window.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        # Stale `latest.ts` (900) is far before the freshness window (oldest_ts=1400).
+        # Under the old behavior the activity filter returned latest.ts < oldest_ts and
+        # skipped the DM on every pass, never advancing its cursor.
+        {"id": "D_FROZEN", "user": "U1", "is_im": True, "latest": {"ts": "900.000000"}},
+    ]
+    warehouse.states = {
+        ("zrl", "T1", "conversation", "D_FROZEN"): {
+            "cursor_ts": "1000.000000",
+            "last_sync_type": "partial",
+            "status": "ok",
+        }
+    }
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [{"ts": "1500.000000", "user": "U1", "text": "missed while frozen"}],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    history_calls = [params for method, params in client.calls if method == "conversations.history"]
+    assert [params["channel"] for params in history_calls] == ["D_FROZEN"]
+    # Resumes from the stored cursor (1000), not just the freshness window start (1400),
+    # so messages that accumulated while the DM was frozen are backfilled.
+    assert float(history_calls[0]["oldest"]) == pytest.approx(1000.0)
 
 
 def test_runner_freshness_priority_can_refresh_one_conversation_type(monkeypatch):
