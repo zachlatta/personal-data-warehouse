@@ -14,14 +14,17 @@ from personal_data_warehouse.file_attachment_enrichment import (
     AGENT_ATTACHMENT_TASK_TYPE,
     GMAIL_SOURCE,
     WHATSAPP_SOURCE,
+    AttachmentPreparationError,
     FileAttachmentEnrichmentRunner,
     STATUS_ERROR,
     STATUS_NOT_USEFUL,
     STATUS_OK,
+    STATUS_UNREADABLE,
     attachment_enrichment_text,
     attachment_storage_ref,
     attachment_vision_prompt,
     attachment_vision_schema,
+    load_file_enrichment_candidates,
     normalized_model_image,
     prepare_attachment_image,
     validate_attachment_vision_result,
@@ -252,6 +255,91 @@ def test_runner_records_error_row_when_agent_fails() -> None:
     assert row["text_extraction_status"] == STATUS_ERROR
     assert "container exploded" in row["text_extraction_error"]
     assert row["text"] == ""
+
+
+def test_runner_records_unreadable_status_for_corrupt_bytes_without_agent_run() -> None:
+    # Bytes that PIL cannot decode fail in prepare_attachment_image, before the
+    # agent ever runs. Such failures are permanent for a content-addressed blob,
+    # so they must be recorded as STATUS_UNREADABLE (not STATUS_ERROR) and must
+    # NOT create an agent_runs row — otherwise the old behavior recycled them
+    # through the candidate query on every run forever.
+    content = b"this is definitely not an image"
+    warehouse = FakeWarehouse([candidate_row(content)])
+    agent = FakeAgent(useful_output())
+
+    summary = make_runner(warehouse, agent, FakeObjectStore(content)).sync(limit=None)
+
+    assert summary.attachments_failed == 1
+    assert agent.requests == []  # the agent never ran
+    assert warehouse.agent_runs == []  # so nothing counts toward the agent-error cap
+    row = warehouse.enrichment_rows[0]
+    assert row["text_extraction_status"] == STATUS_UNREADABLE
+    assert "not a decodable image" in row["text_extraction_error"]
+    assert row["text"] == ""
+
+
+def test_prepare_attachment_image_raises_preparation_error_subtype() -> None:
+    # The preparation failure is an AttachmentPreparationError (a RuntimeError
+    # subclass, so existing `pytest.raises(RuntimeError)` call sites still pass)
+    # which is how sync() tells permanent decode failures apart from transient
+    # agent failures.
+    with pytest.raises(AttachmentPreparationError, match="not a decodable image"):
+        prepare_attachment_image(content=b"not an image", mime_type="image/png", filename="x.png")
+
+
+def test_normalized_model_image_salvages_truncated_image() -> None:
+    # A JPEG with its trailing bytes lopped off (a common email/WhatsApp artifact)
+    # used to raise "image file is truncated"; with truncated loading enabled the
+    # decodable portion is recovered into a valid JPEG instead of failing forever.
+    full = BytesIO()
+    Image.new("RGB", (256, 256), color=(10, 120, 200)).save(full, format="JPEG", quality=90)
+    truncated = full.getvalue()[:-32]
+
+    image = normalized_model_image(truncated)
+
+    with Image.open(BytesIO(image)) as rendered:
+        assert rendered.format == "JPEG"
+        assert rendered.size == (256, 256)
+
+
+def test_candidate_query_excludes_recent_unreadable_attachments() -> None:
+    warehouse = FakeWarehouse([])
+    load_file_enrichment_candidates(
+        warehouse,
+        source=GMAIL_SOURCE,
+        provider="agent_codex",
+        model="",
+        prompt_version=GMAIL_SOURCE.prompt_version,
+        limit=5,
+        error_window_days=14,
+    )
+    sql, params = warehouse.queries[0]
+    # The query must carry a dedicated unreadable-exclusion guard, scoped to the
+    # rolling window so a since-fixed preparation pipeline lets the attachment
+    # back in once its stale failure ages out.
+    assert "unreadable.text_extraction_status = %s" in sql
+    assert "unreadable.updated_at > now()" in sql
+    assert STATUS_UNREADABLE in params
+
+
+@pytest.mark.parametrize("source", [GMAIL_SOURCE, WHATSAPP_SOURCE])
+@pytest.mark.parametrize("error_window_days", [14, 0])
+def test_candidate_query_placeholder_count_matches_params(source, error_window_days) -> None:
+    # Guards against parameter/placeholder drift across the several %s groups
+    # (cap CTE, eligibility, completed-exclusion, unreadable-exclusion, windows,
+    # limit), which would otherwise raise at execution time in production.
+    warehouse = FakeWarehouse([])
+    load_file_enrichment_candidates(
+        warehouse,
+        source=source,
+        provider="agent_codex",
+        model="",
+        prompt_version=source.prompt_version,
+        limit=5,
+        error_window_days=error_window_days,
+    )
+    sql, params = warehouse.queries[0]
+    assert sql.count("%s") == len(params)
 
 
 def test_runner_rejects_output_missing_required_fields() -> None:

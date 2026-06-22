@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 from typing import Any, Callable
 
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageFile, ImageOps, UnidentifiedImageError
 
 from personal_data_warehouse.agent_runner import (
     DEFAULT_AGENT_INPUTS_DIR_NAME,
@@ -37,6 +37,14 @@ from personal_data_warehouse.agent_runner import (
     agent_run_row,
     agent_run_tool_call_rows,
 )
+
+# Many real email/WhatsApp images arrive slightly truncated (a few trailing
+# bytes lost in transit or storage). Without this, PIL raises "image file is
+# truncated" and the attachment can never be enriched even though the bulk of
+# the picture is intact and readable. Allowing truncated loads lets PIL decode
+# the available scanlines (gray-filling any missing tail) so the agent can still
+# extract whatever text/content is present.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 ENRICHMENT_TABLE = "file_attachment_enrichments"
 
@@ -52,7 +60,25 @@ DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS = 14
 STATUS_OK = "agent_ok"
 STATUS_NOT_USEFUL = "agent_not_useful"
 STATUS_ERROR = "agent_error"
+# A deterministic preparation failure: the stored bytes could not be turned into
+# an image at all (undecodable/corrupt image, unrenderable PDF). Distinct from
+# STATUS_ERROR (a transient agent-run failure) because the failure is permanent
+# for a content-addressed blob — the same bytes always fail the same way — so it
+# must not be retried on every run the way the recycling agent_error rows were.
+STATUS_UNREADABLE = "agent_unreadable"
 COMPLETED_STATUSES = (STATUS_OK, STATUS_NOT_USEFUL)
+
+
+class AttachmentPreparationError(RuntimeError):
+    """The stored attachment bytes could not be turned into an image to view.
+
+    Raised when image decoding or PDF rendering fails on the source bytes
+    themselves (as opposed to a transient agent/container failure). Because
+    attachments are content-addressed by sha256 the bytes never change, so this
+    failure is permanent for the current preparation pipeline. The runner records
+    it as STATUS_UNREADABLE and the candidate query excludes such attachments for
+    a rolling window instead of re-downloading and re-failing them every run.
+    """
 
 IMAGE_MIME_TYPES = (
     "image/png",
@@ -207,9 +233,19 @@ class FileAttachmentEnrichmentRunner:
                     "[%s/%s] enriching %s %s", index, len(candidates), self._source.label, label
                 )
                 status = self._enrich_candidate(candidate)
+            except AttachmentPreparationError as exc:
+                # Permanent: the bytes can't be decoded/rendered. Record it as
+                # unreadable so the candidate query stops re-selecting it every
+                # run (it re-enters only after the rolling error window).
+                failed += 1
+                self._record_failure(candidate, error=str(exc), status=STATUS_UNREADABLE)
+                self._logger.warning(
+                    "[%s/%s] unreadable %s: %s", index, len(candidates), label, exc
+                )
+                continue
             except Exception as exc:
                 failed += 1
-                self._record_failure(candidate, error=str(exc))
+                self._record_failure(candidate, error=str(exc), status=STATUS_ERROR)
                 self._logger.warning("[%s/%s] failed %s: %s", index, len(candidates), label, exc)
                 continue
             if status == STATUS_OK:
@@ -272,14 +308,16 @@ class FileAttachmentEnrichmentRunner:
         )
         return status
 
-    def _record_failure(self, candidate: Mapping[str, Any], *, error: str) -> None:
+    def _record_failure(
+        self, candidate: Mapping[str, Any], *, error: str, status: str = STATUS_ERROR
+    ) -> None:
         try:
             self._warehouse.insert_attachment_enrichments(
                 [
                     self._enrichment_row(
                         candidate,
                         text="",
-                        status=STATUS_ERROR,
+                        status=status,
                         error=error[:2000],
                         prompt="",
                         result=None,
@@ -345,14 +383,20 @@ class FileAttachmentEnrichmentRunner:
         return store
 
 
-def _error_window_clause(error_window_days: int) -> tuple[str, list[Any]]:
-    """SQL fragment + params that limit the failed-run count to a recent window.
+def _error_window_clause(
+    error_window_days: int, *, column: str = "started_at"
+) -> tuple[str, list[Any]]:
+    """SQL fragment + params that limit a failure record to a recent window.
 
-    Returns an empty fragment (count every historical error) when the window is
-    zero or negative, matching the "disabled" semantics of ``max_error_attempts``.
+    ``column`` is the timestamp column compared against the window (``started_at``
+    on agent_runs for the agent-failure cap; ``unreadable.updated_at`` on the
+    enrichment table for the unreadable-attachment exclusion). Returns an empty
+    fragment (count every historical failure, i.e. exclude forever) when the
+    window is zero or negative, matching the "disabled" semantics of
+    ``max_error_attempts``.
     """
     if error_window_days and int(error_window_days) > 0:
-        return "AND started_at > now() - make_interval(days => %s)", [int(error_window_days)]
+        return f"AND {column} > now() - make_interval(days => %s)", [int(error_window_days)]
     return "", []
 
 
@@ -407,6 +451,16 @@ def _candidate_query(source: FileEnrichmentSource, *, projection: str, tail: str
                 AND done.ai_prompt_version = %s
                 AND done.text_extraction_status = ANY(%s)
           )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM {ENRICHMENT_TABLE} unreadable
+              WHERE unreadable.content_sha256 = a.{sha}
+                AND unreadable.ai_provider = %s
+                AND unreadable.ai_model = %s
+                AND unreadable.ai_prompt_version = %s
+                AND unreadable.text_extraction_status = %s
+                {{unreadable_window_sql}}
+          )
         {tail}
         """
 
@@ -419,6 +473,7 @@ def _candidate_params(
     prompt_version: str,
     max_error_attempts: int,
     error_window_params: list[Any],
+    unreadable_window_params: list[Any],
 ) -> list[Any]:
     params: list[Any] = [
         source.task_type,
@@ -431,6 +486,7 @@ def _candidate_params(
     if source.pdf_requires_prior_extraction:
         params.append(list(PDF_VISION_SOURCE_STATUSES))
     params.extend([provider, model, prompt_version, list(COMPLETED_STATUSES)])
+    params.extend([provider, model, prompt_version, STATUS_UNREADABLE, *unreadable_window_params])
     return params
 
 
@@ -448,6 +504,9 @@ def load_file_enrichment_candidates(
     """Image (or scanned-PDF) attachments stored in the object store that have
     no completed agent enrichment for this provider/model/prompt identity."""
     error_window_sql, error_window_params = _error_window_clause(error_window_days)
+    unreadable_window_sql, unreadable_window_params = _error_window_clause(
+        error_window_days, column="unreadable.updated_at"
+    )
     columns = (
         "account",
         "content_sha256",
@@ -476,7 +535,7 @@ def load_file_enrichment_candidates(
         source,
         projection=projection,
         tail=f"ORDER BY a.{source.sha_column}, a.{source.order_column} DESC",
-    ).format(error_window_sql=error_window_sql)
+    ).format(error_window_sql=error_window_sql, unreadable_window_sql=unreadable_window_sql)
     params = _candidate_params(
         source,
         provider=provider,
@@ -484,6 +543,7 @@ def load_file_enrichment_candidates(
         prompt_version=prompt_version,
         max_error_attempts=max_error_attempts,
         error_window_params=error_window_params,
+        unreadable_window_params=unreadable_window_params,
     )
     if limit_sql:
         params.append(int(limit))
@@ -512,11 +572,14 @@ def has_file_enrichment_candidate(
 ) -> bool:
     """Return whether at least one stored attachment needs agent enrichment."""
     error_window_sql, error_window_params = _error_window_clause(error_window_days)
+    unreadable_window_sql, unreadable_window_params = _error_window_clause(
+        error_window_days, column="unreadable.updated_at"
+    )
     query = _candidate_query(
         source,
         projection="SELECT 1",
         tail="LIMIT 1",
-    ).format(error_window_sql=error_window_sql)
+    ).format(error_window_sql=error_window_sql, unreadable_window_sql=unreadable_window_sql)
     params = _candidate_params(
         source,
         provider=provider,
@@ -524,6 +587,7 @@ def has_file_enrichment_candidate(
         prompt_version=prompt_version,
         max_error_attempts=max_error_attempts,
         error_window_params=error_window_params,
+        unreadable_window_params=unreadable_window_params,
     )
     rows = warehouse._query(query, tuple(params))
     return bool(rows)
@@ -549,7 +613,7 @@ def prepare_attachment_image(*, content: bytes, mime_type: str, filename: str) -
     if mime_type.lower() == "application/pdf" or extension == ".pdf" or content.startswith(b"%PDF-"):
         pages = render_pdf_pages(content=content, max_pages=PDF_RENDER_MAX_PAGES)
         if not pages:
-            raise RuntimeError("PDF rendered no pages")
+            raise AttachmentPreparationError("PDF rendered no pages")
         return pages[0], f"{AGENT_ATTACHMENT_INPUT_BASENAME}.png"
     return normalized_model_image(content), f"{AGENT_ATTACHMENT_INPUT_BASENAME}.jpg"
 
@@ -571,7 +635,7 @@ def normalized_model_image(content: bytes) -> bytes:
             rendered.save(output, format="JPEG", quality=MODEL_IMAGE_JPEG_QUALITY, optimize=True)
             return output.getvalue()
     except (OSError, UnidentifiedImageError) as exc:
-        raise RuntimeError(f"attachment is not a decodable image: {exc}") from exc
+        raise AttachmentPreparationError(f"attachment is not a decodable image: {exc}") from exc
 
 
 def render_pdf_pages(
@@ -609,7 +673,11 @@ def render_pdf_pages(
         )
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"pdftoppm failed: {stderr or result.returncode}")
+            # A non-zero pdftoppm exit means the PDF bytes themselves can't be
+            # rendered (corrupt/encrypted/not-really-a-PDF). That is permanent for
+            # this content-addressed blob, unlike the "pdftoppm is not installed"
+            # environment error above which is transient and stays a RuntimeError.
+            raise AttachmentPreparationError(f"pdftoppm failed: {stderr or result.returncode}")
         return [path.read_bytes() for path in sorted(tempdir.glob("page-*.png"))]
 
 
