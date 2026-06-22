@@ -88,7 +88,10 @@ def exclusive_postgres_advisory_lock(
         yield acquired
     finally:
         if acquired:
-            cursor.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
+            # The lock connection is dedicated to this context. Release every
+            # advisory lock it holds so repeated acquisition on the same session
+            # cannot leave a session-level lock behind after the job succeeds.
+            cursor.execute("SELECT pg_advisory_unlock_all()")
         cursor.close()
         connection.close()
 

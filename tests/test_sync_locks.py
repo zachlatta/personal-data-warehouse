@@ -27,6 +27,7 @@ from personal_data_warehouse.defs.slack_sync import (
 )
 from personal_data_warehouse.slack_sync import SlackSyncSummary
 from personal_data_warehouse.sync_locks import (
+    exclusive_postgres_advisory_lock,
     exclusive_process_lock,
     exclusive_sync_lock,
     lock_env_prefix,
@@ -713,6 +714,40 @@ def test_exclusive_sync_lock_forwards_wait_seconds(monkeypatch) -> None:
         assert acquired
 
     assert calls == [("postgresql://postgres/slack", 1234, 42)]
+
+
+def test_exclusive_postgres_advisory_lock_releases_all_session_locks(monkeypatch) -> None:
+    import psycopg2
+
+    commands: list[str] = []
+
+    class FakeCursor:
+        def execute(self, sql, params=None) -> None:
+            commands.append(sql)
+
+        def fetchone(self):
+            return (True,)
+
+        def close(self) -> None:
+            commands.append("cursor.close")
+
+    class FakeConnection:
+        autocommit = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self) -> None:
+            commands.append("connection.close")
+
+    monkeypatch.setattr(psycopg2, "connect", lambda postgres_url: FakeConnection())
+
+    with exclusive_postgres_advisory_lock("postgresql://postgres/locks", 1234) as acquired:
+        assert acquired
+
+    assert "SELECT pg_try_advisory_lock(%s)" in commands
+    assert "SELECT pg_advisory_unlock_all()" in commands
+    assert commands[-2:] == ["cursor.close", "connection.close"]
 
 
 def test_exclusive_process_lock_times_out_when_held(tmp_path) -> None:
