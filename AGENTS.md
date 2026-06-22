@@ -301,7 +301,8 @@ Dagster reader's Drive access (the reader still reads Drive directly); they no l
 clients write.
 
 Agent sessions SQL starting points are the `agent_session_events` table (one row per transcript
-line; `source` is `claude_code`, `codex`, or `openclaw`, `device` tags the machine) and the
+line; `source` is `claude_code`, `codex`, `openclaw`, or `claude_desktop` (see the Claude Desktop
+section below), `device` tags the machine) and the
 `clean_agent_sessions` view (per-session roll-up: counts, token sums, title, cwd/git, first
 prompt). Free-text content is also in the unified `searchable_text` view under
 `source = 'agent_session'`. (Not to be confused with `agent_runs`/`agent_run_events`, which log
@@ -358,6 +359,95 @@ uploads go through the app, end-to-end also depends on the **app** (`/ingest/age
 and the **prod Dagster** reader both running `main` (the app writes the object tags the Dagster
 reader expects, and the reader carries `openclaw_event_row`). Land/deploy code on both before
 relying on the timer.
+
+## Claude Desktop Sessions (claude.ai)
+
+Captures normal Claude conversations from the Claude Desktop app so they're queryable in
+the warehouse alongside the agent-CLI sources. They land in the SAME `agent_session_events` table
+under `source = 'claude_desktop'` (and the `clean_agent_sessions` view + cross-source `search_text`),
+normalized by `claude_desktop_event_row` in `agent_sessions_drive_ingest.py`.
+
+Unlike Claude Code/Codex/OpenClaw, **the desktop app keeps no transcripts on disk** - it is a
+claude.ai wrapper; conversations live server-side. So this source is **authed clientside, polled
+serverside**:
+
+- **Clientside auth (native Go in the `pdw` CLI - all local-machine logic lives in the CLI, not
+  Python):** `pdw ingest claude-desktop` decrypts the desktop app's `sessionKey` cookie (Chromium
+  cookie store + macOS Keychain AES key) and pushes the session credential
+  (`account`/`session_key`/`org_id`) to the app's HMAC-signed `/ingest/claude-desktop/credential`
+  endpoint. Implementation: `app/cmd/pdw-cli/claudedesktop.go` (Keychain via `security`, cookie DB
+  via the macOS-bundled `sqlite3`, AES/PBKDF2 from the Go stdlib). `--dry-run` prints what would be
+  pushed without contacting the app.
+- **App credential endpoint (Go):** `app/internal/server/credential_ingest.go` verifies the same
+  object-upload HMAC as the other ingest endpoints and upserts the credential into the
+  `claude_desktop_credentials` Postgres table (keyed by account). Registered in `NewMux` whenever
+  `POSTGRES_DATABASE_URL` is set.
+- **Serverside poller (Dagster):** `defs/claude_desktop_client.py` - the `claude_desktop_client`
+  asset + `claude_desktop_client_keepalive_sensor` (5-min cadence) read the credential from
+  Postgres and poll the claude.ai API (`personal_data_warehouse_claude_desktop/{api,sync,state}.py`).
+  The `sessionKey` alone authenticates the API, so it works from prod's IP - no Cloudflare cookies
+  needed. It fetches conversations changed since the per-conversation `updated_at` cursor
+  (`claude_desktop_conversation_state`, Postgres-durable) and ships one `conversation` header line +
+  one `message` line per turn through the SAME `/ingest/agent-sessions/batch` path as the other
+  agent sources. Re-shipping a whole conversation when it gains a turn is cheap (warehouse dedupes
+  by `(source, session_id, event_uuid)`).
+
+The `sessionKey` rotates ~monthly; the desktop app refreshes it, and the clientside LaunchAgent
+re-pushes it hourly so the server's copy stays fresh.
+
+Env: `CLAUDE_DESKTOP_ACCOUNT` (keys the credential + cursor; falls back to
+`AGENT_SESSIONS_ACCOUNT`/`APPLE_MESSAGES_ACCOUNT`/`VOICE_MEMOS_ACCOUNT`/`GMAIL_ACCOUNTS[0]` - must
+match between the clientside push and the serverside poller), `CLAUDE_DESKTOP_ENABLED` (default on;
+set `0` to pause the poller), `CLAUDE_DESKTOP_ORG_ID` (override the org from the cookie),
+`CLAUDE_DESKTOP_BASE_URL` (default `https://claude.ai`), and clientside-only
+`CLAUDE_DESKTOP_COOKIES_PATH` / `CLAUDE_DESKTOP_KEYCHAIN_SERVICE` / `CLAUDE_DESKTOP_KEYCHAIN_ACCOUNT`.
+
+> End-to-end depends on the **app** (`/ingest/claude-desktop/credential` + `/ingest/agent-sessions/batch`)
+> and **prod Dagster** (the poller + the `claude_desktop_event_row` reader) both running `main`. Land
+> and deploy code on both before relying on the LaunchAgent. The serverside poller is unofficial-API
+> access to claude.ai; treat it like the WhatsApp linked-device client (small ToS/account risk).
+
+### Local Claude Desktop Auth Scheduler
+
+The Mac with the Claude Desktop app pushes the credential through a user LaunchAgent:
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.claude-desktop-auth`
+- Installed plist: `~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.claude-desktop-auth.plist`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.claude-desktop-auth.plist`
+- Wrapper script: `bin/claude-desktop-auth-launchd` (sources the repo `.env`, then runs
+  `pdw ingest claude-desktop`; the Go command does not load `.env` itself)
+- Run cadence: every 3600 seconds with `RunAtLoad`
+- Main run log: `~/Library/Logs/personal-data-warehouse/claude-desktop-auth.run.log`
+- Heartbeat file: `~/Library/Logs/personal-data-warehouse/claude-desktop-auth.heartbeat`
+- Status helper: `bin/claude-desktop-auth-status`
+
+Inspect or repair it:
+
+```bash
+bin/claude-desktop-auth-status
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.claude-desktop-auth
+tail -80 ~/Library/Logs/personal-data-warehouse/claude-desktop-auth.run.log
+pdw ingest claude-desktop --dry-run   # verify cookie decryption without pushing
+```
+
+Install / reinstall the plist after editing the template:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.claude-desktop-auth.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.claude-desktop-auth 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.claude-desktop-auth.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.claude-desktop-auth
+```
+
+If `pdw ingest claude-desktop` fails reading the Keychain or cookie store, macOS Full Disk Access
+is likely blocking the background process from
+`~/Library/Application Support/Claude/Cookies` or the `Claude Safe Storage` Keychain item. Grant
+Full Disk Access to `/bin/zsh` and the `pdw` binary (`~/.local/bin/pdw`), then kickstart again.
+
+Claude Desktop SQL starting points are the same as the other agent sources: `agent_session_events`
++ `clean_agent_sessions` filtered to `source = 'claude_desktop'` (one `meta` row per conversation
+carrying the title/model, then `user`/`assistant` rows per turn; `session_id` is the claude.ai
+conversation uuid). Free-text is in `search_text()` under `source = 'agent_session'`.
 
 ## WhatsApp Client (linked device)
 

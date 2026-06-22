@@ -246,6 +246,26 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 			mux.Handle(chatgptsession.Endpoint, chatgptsession.NewService(sessionStore, authSvc, time.Now, logger).Handler())
 			logger.Info("chatgpt session publishing enabled", "endpoint", chatgptsession.Endpoint)
 		}
+
+		// The Claude Desktop credential endpoint persists a secret in Postgres
+		// instead of writing a Drive object, so it is independent of the object-store
+		// ingest service: it needs only Postgres + the HMAC signer. The exact path
+		// takes precedence over the "/ingest/" subtree handler above.
+		credStore, credErr := newClaudeDesktopCredentialStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+		if credErr != nil {
+			logger.Error("claude desktop credential store failed to initialize; credential push disabled", "error", credErr.Error())
+		} else {
+			credSvc := &credentialIngestService{
+				store:    credStore,
+				signer:   authSvc,
+				maxBytes: cfg.IngestMaxObjectBytes,
+				timeout:  cfg.QueryTimeout,
+				now:      time.Now,
+				logger:   logger,
+			}
+			mux.Handle(claudeDesktopCredentialEndpoint, credSvc.handler())
+			logger.Info("claude desktop credential ingestion enabled", "endpoint", claudeDesktopCredentialEndpoint)
+		}
 	}
 	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default(), extra...)
 	mcpServer := newMCPServerFromRegistry(registry, slog.Default())

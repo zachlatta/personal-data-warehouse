@@ -51,6 +51,7 @@ packages = [
     "src/personal_data_warehouse",
     "src/personal_data_warehouse_agent_sessions",
     "src/personal_data_warehouse_chatgpt",
+    "src/personal_data_warehouse_claude_desktop",
     "src/personal_data_warehouse_alice_voice_recordings",
     "src/personal_data_warehouse_apple_messages",
     "src/personal_data_warehouse_apple_notes",

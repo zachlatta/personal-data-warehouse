@@ -1,0 +1,143 @@
+"""Minimal client for claude.ai's conversation API.
+
+The Claude Desktop app talks to the same private claude.ai endpoints the web app
+uses. We reuse the desktop app's login cookies (see :mod:`.cookies`) to:
+
+* page through ``/chat_conversations`` for the conversation list (each summary
+  carries an ``updated_at`` we use as the incremental cursor), and
+* fetch ``/chat_conversations/{uuid}?tree=True&rendering_mode=messages`` for a
+  conversation's full message tree.
+
+This is an unofficial endpoint, so we send browser-like headers and retry
+transient failures, but we deliberately keep the surface tiny.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+import time
+from typing import Any
+
+import requests
+
+DEFAULT_BASE_URL = "https://claude.ai"
+DEFAULT_TIMEOUT_SECONDS = 60.0
+DEFAULT_PAGE_SIZE = 50
+# A current-ish desktop/Chrome UA; claude.ai rejects obviously-bot user agents.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+)
+
+
+class ClaudeAiApiError(RuntimeError):
+    """Raised when a claude.ai API call fails after retries."""
+
+
+class ClaudeAiClient:
+    def __init__(
+        self,
+        *,
+        cookie_header: str,
+        org_id: str,
+        base_url: str = DEFAULT_BASE_URL,
+        session: requests.Session | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        user_agent: str = DEFAULT_USER_AGENT,
+        max_retries: int = 3,
+        retry_backoff_seconds: float = 1.5,
+        sleep=time.sleep,
+    ) -> None:
+        if not cookie_header:
+            raise ValueError("cookie_header is required")
+        if not org_id:
+            raise ValueError("org_id is required")
+        self._cookie_header = cookie_header
+        self._base_url = base_url.rstrip("/")
+        self._org_id = org_id
+        self._session = session or requests.Session()
+        self._timeout = timeout
+        self._user_agent = user_agent
+        self._max_retries = max(1, max_retries)
+        self._retry_backoff_seconds = retry_backoff_seconds
+        self._sleep = sleep
+
+    def _headers(self, *, referer: str) -> dict[str, str]:
+        return {
+            "Cookie": self._cookie_header,
+            "User-Agent": self._user_agent,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": referer,
+            "Origin": self._base_url,
+            "anthropic-client-platform": "web_claude_ai",
+        }
+
+    def _get(self, path: str, *, referer: str, params: dict[str, str] | None = None) -> Any:
+        url = f"{self._base_url}{path}"
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries):
+            try:
+                response = self._session.get(
+                    url,
+                    headers=self._headers(referer=referer),
+                    params=params,
+                    timeout=self._timeout,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+            else:
+                if response.status_code == 200:
+                    return response.json()
+                # 429/5xx are worth retrying; 401/403 are auth/cloudflare and
+                # will not improve on retry, so fail fast with a clear message.
+                if response.status_code in (401, 403):
+                    raise ClaudeAiApiError(
+                        f"claude.ai returned {response.status_code} for {path}; "
+                        "the desktop login may have expired or Cloudflare is blocking - "
+                        "open the Claude Desktop app and sign in again"
+                    )
+                if response.status_code < 500 and response.status_code != 429:
+                    raise ClaudeAiApiError(
+                        f"claude.ai returned {response.status_code} for {path}: {response.text[:200]}"
+                    )
+                last_error = ClaudeAiApiError(
+                    f"claude.ai returned {response.status_code} for {path}"
+                )
+            if attempt < self._max_retries - 1:
+                self._sleep(self._retry_backoff_seconds * (attempt + 1))
+        raise ClaudeAiApiError(f"claude.ai request to {path} failed after {self._max_retries} attempts: {last_error}")
+
+    def iter_conversations(self, *, page_size: int = DEFAULT_PAGE_SIZE) -> Iterator[dict[str, Any]]:
+        """Yield conversation summaries newest-first, paging until exhausted."""
+        offset = 0
+        page_size = max(1, page_size)
+        while True:
+            page = self._get(
+                f"/api/organizations/{self._org_id}/chat_conversations",
+                referer=f"{self._base_url}/recents",
+                params={"limit": str(page_size), "offset": str(offset)},
+            )
+            if not isinstance(page, list) or not page:
+                return
+            for summary in page:
+                if isinstance(summary, dict):
+                    yield summary
+            if len(page) < page_size:
+                return
+            offset += len(page)
+
+    def get_conversation(self, conversation_id: str) -> dict[str, Any]:
+        """Fetch a conversation's full message tree."""
+        conversation = self._get(
+            f"/api/organizations/{self._org_id}/chat_conversations/{conversation_id}",
+            referer=f"{self._base_url}/chat/{conversation_id}",
+            params={
+                "tree": "True",
+                "rendering_mode": "messages",
+                "render_all_tools": "true",
+            },
+        )
+        if not isinstance(conversation, dict):
+            raise ClaudeAiApiError(f"unexpected conversation payload for {conversation_id}")
+        return conversation

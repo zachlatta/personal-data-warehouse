@@ -66,6 +66,9 @@ func TestIngestResolvesKnownSources(t *testing.T) {
 	if _, ok := resolveIngestModule("whatsapp"); ok {
 		t.Fatalf("whatsapp is server-side and must not be an ingest source")
 	}
+	if _, ok := resolveIngestModule("claude-desktop"); ok {
+		t.Fatalf("claude-desktop is native Go auth push and must not resolve to a Python module")
+	}
 	if _, ok := resolveIngestModule("bogus"); ok {
 		t.Fatalf("unknown source must not resolve")
 	}
@@ -147,7 +150,7 @@ func TestIngestUnknownSourceErrors(t *testing.T) {
 	if !strings.Contains(errOut.String(), "bogus") {
 		t.Fatalf("stderr should name the bad source: %s", errOut.String())
 	}
-	for _, s := range []string{"voice-memos", "apple-notes", "apple-messages", "agent-sessions"} {
+	for _, s := range []string{"voice-memos", "apple-notes", "apple-messages", "agent-sessions", "claude-desktop"} {
 		if !strings.Contains(errOut.String(), s) {
 			t.Fatalf("stderr should list valid source %q: %s", s, errOut.String())
 		}

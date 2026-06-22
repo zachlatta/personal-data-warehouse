@@ -17,9 +17,15 @@ import (
 // (it has an `if __name__ == "__main__"` guard) and parses its own flags, so
 // pdw forwards every flag after the source verbatim.
 //
-// Only the four scheduled, device-side client uploaders live here. WhatsApp is
-// deliberately absent: it runs in-process inside the production Dagster
-// deployment, not as a launchd/systemd uploader.
+// The scheduled, device-side client uploaders that delegate to a Python module
+// live here. WhatsApp is deliberately absent: it runs in-process inside the
+// production Dagster deployment, not as a launchd/systemd uploader.
+//
+// "claude-desktop" is also absent: it is the clientside *auth* pusher and is
+// implemented natively in Go (see claudedesktop.go), not as a Python module,
+// because all local-machine logic lives in this CLI binary. runIngestWithConfig
+// dispatches it before this map. (Its actual conversation polling runs
+// serverside in Dagster.)
 var ingestModules = map[string]string{
 	"voice-memos":    "personal_data_warehouse_voice_memos.cli",
 	"apple-notes":    "personal_data_warehouse_apple_notes.cli",
@@ -41,10 +47,11 @@ func resolveIngestModule(source string) (string, bool) {
 // ingestSourceNames returns the known source names in stable, sorted order for
 // help and error messages.
 func ingestSourceNames() []string {
-	names := make([]string, 0, len(ingestModules))
+	names := make([]string, 0, len(ingestModules)+1)
 	for name := range ingestModules {
 		names = append(names, name)
 	}
+	names = append(names, claudeDesktopSource)
 	sort.Strings(names)
 	return names
 }
@@ -89,6 +96,7 @@ SOURCES
   apple-notes      Upload local Apple Notes
   apple-messages   Upload local Apple Messages (iMessage/SMS/RCS)
   agent-sessions   Upload AI agent CLI session transcripts
+  claude-desktop   Push the Claude Desktop (claude.ai) session credential
 
 The uploader posts to the warehouse over the same URL + token pdw uses for
 everything else: run "pdw login" once (or set PDW_API_URL + PDW_SECRET_TOKEN)
@@ -131,6 +139,12 @@ func runIngestWithConfig(
 	if source == "-h" || source == "--help" {
 		fmt.Fprint(stdout, ingestUsage)
 		return 0
+	}
+	// claude-desktop is implemented natively in this Go binary (all local-machine
+	// logic lives here), not as a Python uploader module, so dispatch it before
+	// the module lookup below.
+	if source == claudeDesktopSource {
+		return runClaudeDesktopAuth(args[1:], stdout, stderr, getenv, flagBaseURL, flagToken)
 	}
 	module, ok := resolveIngestModule(source)
 	if !ok {

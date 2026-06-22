@@ -1,0 +1,39 @@
+#!/bin/zsh
+set -u
+
+REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
+# The Claude Desktop auth pusher is native to the pdw CLI (Go): it decrypts the
+# claude.ai sessionKey from the local desktop app and pushes it to the warehouse
+# app, which stores it for the serverside poller. Unlike the Python uploaders it
+# does NOT load .env itself, so source it here for CLAUDE_DESKTOP_ACCOUNT /
+# GMAIL_ACCOUNTS (the warehouse URL + token come from `pdw login`).
+PDW="${PDW_BIN:-$HOME/.local/bin/pdw}"
+[ -x "$PDW" ] || PDW="$(command -v pdw 2>/dev/null || echo "$PDW")"
+LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
+LOG_FILE="$LOG_DIR/claude-desktop-auth.run.log"
+HEARTBEAT_FILE="$LOG_DIR/claude-desktop-auth.heartbeat"
+
+mkdir -p "$LOG_DIR"
+
+if [ -f "$REPO_DIR/.env" ]; then
+  set -a
+  source "$REPO_DIR/.env"
+  set +a
+fi
+
+started_at_iso="$(date -Iseconds)"
+echo "[$started_at_iso] starting claude desktop auth push" >> "$LOG_FILE"
+
+if ! cd "$REPO_DIR"; then
+  exit_code=1
+  echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
+else
+  "$PDW" ingest claude-desktop >> "$LOG_FILE" 2>&1
+  exit_code=$?
+fi
+
+finished_at_iso="$(date -Iseconds)"
+printf "%s\n" "$finished_at_iso" > "$HEARTBEAT_FILE"
+echo "[$finished_at_iso] finished claude desktop auth push exit_code=$exit_code" >> "$LOG_FILE"
+
+exit "$exit_code"

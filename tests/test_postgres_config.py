@@ -145,6 +145,31 @@ def test_chatgpt_sync_can_be_disabled(monkeypatch) -> None:
     assert settings.chatgpt.client_enabled is False
 
 
+def test_claude_desktop_sync_is_enabled_by_default(monkeypatch) -> None:
+    monkeypatch.setattr(config, "load_dotenv", lambda: None)
+    monkeypatch.delenv("CLAUDE_DESKTOP_ACCOUNT", raising=False)
+    monkeypatch.delenv("CLAUDE_DESKTOP_ENABLED", raising=False)
+    monkeypatch.setenv("GMAIL_ACCOUNTS", "account@example.test,other@example.test")
+
+    settings = load_settings(require_postgres=False, require_gmail=False, require_claude_desktop=True)
+
+    assert settings.claude_desktop is not None
+    assert settings.claude_desktop.account == "account@example.test"
+    assert settings.claude_desktop.enabled is True
+    assert settings.claude_desktop.base_url == config.DEFAULT_CLAUDE_DESKTOP_BASE_URL
+
+
+def test_claude_desktop_sync_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(config, "load_dotenv", lambda: None)
+    monkeypatch.setenv("CLAUDE_DESKTOP_ACCOUNT", "account@example.test")
+    monkeypatch.setenv("CLAUDE_DESKTOP_ENABLED", "0")
+
+    settings = load_settings(require_postgres=False, require_gmail=False, require_claude_desktop=True)
+
+    assert settings.claude_desktop is not None
+    assert settings.claude_desktop.enabled is False
+
+
 def test_local_upload_configs_use_main_api_url_without_drive_folders(monkeypatch) -> None:
     monkeypatch.setattr(config, "load_dotenv", lambda: None)
     for name in (

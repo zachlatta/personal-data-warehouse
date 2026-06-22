@@ -63,6 +63,8 @@ DEFAULT_CHATGPT_PAGE_SIZE = 28
 DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com"
 DEFAULT_CHATGPT_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_CHATGPT_CLIENT_ENABLED = True
+DEFAULT_CLAUDE_DESKTOP_BASE_URL = "https://claude.ai"
+DEFAULT_CLAUDE_DESKTOP_ENABLED = True
 DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
 DEFAULT_ALICE_STORAGE_BACKEND = "google_drive"
 DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS = 120
@@ -242,6 +244,25 @@ class ChatGPTConfig:
 
 
 @dataclass(frozen=True)
+class ClaudeDesktopConfig:
+    """Serverside config for the Claude Desktop (claude.ai) conversation poller.
+
+    Auth happens clientside in the Go ``pdw`` CLI (it extracts the sessionKey
+    from the desktop app's cookie jar and pushes it to the app), so the cookie
+    path / Keychain knobs live there, not here. This config drives the serverside
+    Dagster poller: ``account`` keys the stored credential + cursor, ``org_id``
+    optionally overrides the org from the credential, and ``base_url``/``enabled``
+    control polling.
+    """
+
+    account: str
+    device: str
+    base_url: str
+    enabled: bool
+    org_id: str
+
+
+@dataclass(frozen=True)
 class AliceVoiceRecordingsConfig:
     account: str
     key_id: str
@@ -339,6 +360,7 @@ class Settings:
     whatsapp: WhatsAppConfig | None = None
     agent_sessions: AgentSessionsConfig | None = None
     chatgpt: ChatGPTConfig | None = None
+    claude_desktop: ClaudeDesktopConfig | None = None
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
@@ -440,6 +462,7 @@ def load_settings(
     require_whatsapp: bool = False,
     require_agent_sessions: bool = False,
     require_chatgpt: bool = False,
+    require_claude_desktop: bool = False,
     require_alice_voice_recordings: bool = False,
     require_google_drive_source: bool = False,
     require_assemblyai: bool = False,
@@ -1021,6 +1044,29 @@ def load_settings(
             ),
         )
 
+    claude_desktop_account = (
+        os.getenv("CLAUDE_DESKTOP_ACCOUNT")
+        or os.getenv("AGENT_SESSIONS_ACCOUNT")
+        or os.getenv("APPLE_MESSAGES_ACCOUNT")
+        or os.getenv("VOICE_MEMOS_ACCOUNT")
+        or default_voice_memos_account
+    ).strip()
+    claude_desktop: ClaudeDesktopConfig | None = None
+    if (
+        require_claude_desktop
+        or os.getenv("CLAUDE_DESKTOP_ACCOUNT")
+        or os.getenv("CLAUDE_DESKTOP_ENABLED")
+    ):
+        if not claude_desktop_account:
+            raise ValueError("CLAUDE_DESKTOP_ACCOUNT or GMAIL_ACCOUNTS must be set for Claude Desktop sync")
+        claude_desktop = ClaudeDesktopConfig(
+            account=claude_desktop_account,
+            device=os.getenv("CLAUDE_DESKTOP_DEVICE", "").strip() or _local_device_name(),
+            base_url=os.getenv("CLAUDE_DESKTOP_BASE_URL", DEFAULT_CLAUDE_DESKTOP_BASE_URL).strip(),
+            enabled=_parse_bool_env(os.getenv("CLAUDE_DESKTOP_ENABLED"), DEFAULT_CLAUDE_DESKTOP_ENABLED),
+            org_id=os.getenv("CLAUDE_DESKTOP_ORG_ID", "").strip(),
+        )
+
     alice_account = os.getenv("ALICE_VOICE_RECORDINGS_ACCOUNT", "").strip()
     alice_key_id = os.getenv("ALICE_API_KEY_ID", "").strip()
     alice_secret_key = os.getenv("ALICE_API_SECRET_KEY", "").strip()
@@ -1278,6 +1324,7 @@ def load_settings(
         whatsapp=whatsapp,
         agent_sessions=agent_sessions,
         chatgpt=chatgpt,
+        claude_desktop=claude_desktop,
         alice_voice_recordings=alice_voice_recordings,
         google_drive_source=google_drive_source,
         assemblyai=assemblyai,

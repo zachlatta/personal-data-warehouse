@@ -1160,6 +1160,77 @@ class PostgresWarehouse:
         self._ensure_clean_agent_sessions_view()
         self._ensure_search_views_if_possible()
 
+    def ensure_claude_desktop_tables(self) -> None:
+        """Tables for the serverside Claude Desktop poller.
+
+        ``claude_desktop_credentials`` is *also* created by the Go app (the
+        clientside auth pusher writes it through ``/ingest/claude-desktop/credential``);
+        both use the identical idempotent DDL so whichever runs first wins. The
+        poller only reads it. ``claude_desktop_conversation_state`` is the
+        Postgres-durable per-conversation ``updated_at`` cursor so the poller does
+        not re-fetch every conversation after a deploy.
+        """
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS claude_desktop_credentials (
+                account text PRIMARY KEY,
+                session_key text NOT NULL,
+                org_id text NOT NULL DEFAULT '',
+                expires_at timestamptz NULL,
+                captured_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS claude_desktop_conversation_state (
+                account text NOT NULL,
+                conversation_id text NOT NULL,
+                updated_at text NOT NULL DEFAULT '',
+                last_synced_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (account, conversation_id)
+            )
+            """
+        )
+
+    def read_claude_desktop_credential(self, *, account: str) -> dict[str, Any] | None:
+        self.ensure_claude_desktop_tables()
+        rows = self._query_dicts(
+            """
+            SELECT account, session_key, org_id, expires_at, captured_at, updated_at
+            FROM claude_desktop_credentials
+            WHERE account = %s
+            """,
+            (account,),
+        )
+        return rows[0] if rows else None
+
+    def claude_desktop_cursor(self, *, account: str, conversation_id: str) -> str:
+        rows = self._query(
+            """
+            SELECT updated_at FROM claude_desktop_conversation_state
+            WHERE account = %s AND conversation_id = %s
+            """,
+            (account, conversation_id),
+        )
+        return str(rows[0][0]) if rows else ""
+
+    def record_claude_desktop_cursor(
+        self, *, account: str, conversation_id: str, updated_at: str, now: datetime | None = None
+    ) -> None:
+        synced = now or datetime.now(tz=UTC)
+        self._command(
+            """
+            INSERT INTO claude_desktop_conversation_state (account, conversation_id, updated_at, last_synced_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (account, conversation_id) DO UPDATE SET
+                updated_at = EXCLUDED.updated_at,
+                last_synced_at = EXCLUDED.last_synced_at
+            """,
+            (account, conversation_id, updated_at, synced),
+        )
+
     def ensure_whatsapp_client_session_table(self) -> None:
         self._command(
             """

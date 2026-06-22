@@ -1,6 +1,6 @@
 """Ingest AI agent session logs into ``agent_session_events``.
 
-Two transports feed the same row schema:
+Three transports feed the same row schema:
 
 * The CLI tools (Claude Code, Codex, OpenClaw) write append-only JSONL
   transcripts that a per-device uploader tails and batches into
@@ -8,6 +8,10 @@ Two transports feed the same row schema:
   consumes those batches and normalizes each raw line into a row (lossless
   ``raw_json`` plus queryable columns), then promotes processed batch files into
   ``agent-sessions/library/``.
+* Claude Desktop is polled server-side from claude.ai using a credential pushed
+  from the local desktop app. It ships ``claude_desktop_event`` envelopes through
+  the same Drive inbox, and ``claude_desktop_event_row`` normalizes them into
+  ``source = 'claude_desktop'`` rows.
 * ChatGPT (the consumer product) is polled server-side from its backend API,
   which returns each conversation as a node-tree. ``chatgpt_conversation_to_event_rows``
   linearizes that tree into the same ``agent_session_events`` rows
@@ -336,6 +340,122 @@ def claude_code_event_row(
     return row
 
 
+def claude_desktop_event_row(
+    line: Mapping[str, Any],
+    *,
+    session_id: str,
+    account: str,
+    device: str,
+    seq: int,
+    ingested_at: datetime,
+) -> dict[str, Any]:
+    """Normalize one Claude Desktop (claude.ai) conversation line.
+
+    The uploader emits a synthetic ``conversation`` header line per conversation
+    followed by one ``message`` line per turn (the raw claude.ai message tagged
+    with ``type="message"``). A message's ``content`` is a list of typed blocks
+    (``text``/``thinking``/``tool_use``/``tool_result``); the human-or-assistant
+    ``sender`` maps to the row role. claude.ai returns the model at the
+    conversation level only, so the uploader copies it onto assistant messages.
+    """
+    event_type = str(line.get("type", ""))
+
+    if event_type == "conversation":
+        row = _base_row(
+            source="claude_desktop",
+            session_id=session_id,
+            account=account,
+            device=device,
+            seq=seq,
+            line=line,
+            event_uuid=str(line.get("uuid") or f"{session_id}#{seq}"),
+            occurred_at=parse_datetime(str(line.get("created_at", ""))),
+            ingested_at=ingested_at,
+        )
+        row["event_type"] = "conversation"
+        row["session_title"] = str(line.get("name") or "")
+        row["model"] = str(line.get("model") or "")
+        return row
+
+    row = _base_row(
+        source="claude_desktop",
+        session_id=session_id,
+        account=account,
+        device=device,
+        seq=seq,
+        line=line,
+        event_uuid=str(line.get("uuid") or f"{session_id}#{seq}"),
+        occurred_at=parse_datetime(str(line.get("created_at", ""))),
+        ingested_at=ingested_at,
+    )
+    if event_type != "message":
+        return row
+
+    row["parent_uuid"] = str(line.get("parent_message_uuid") or "")
+    sender = str(line.get("sender", ""))
+    content = line.get("content")
+
+    if sender == "human":
+        row["role"] = "user"
+        row["subtype"] = "message"
+        row["text"] = _claude_desktop_text(line)
+    elif sender == "assistant":
+        row["role"] = "assistant"
+        row["model"] = str(line.get("model") or "")
+        row["text"] = _claude_desktop_text(line)
+        tool_block = _claude_desktop_block(content, "tool_use")
+        if tool_block is not None:
+            row["subtype"] = "tool_use"
+            row["tool_name"] = str(tool_block.get("name", ""))
+            row["tool_input_json"] = _as_json_text(tool_block.get("input"))
+            row["turn_id"] = str(tool_block.get("id", ""))
+        elif row["text"]:
+            row["subtype"] = "message"
+        else:
+            row["subtype"] = "thinking"
+    else:
+        row["role"] = "meta"
+        row["subtype"] = sender
+
+    return row
+
+
+def _claude_desktop_text(line: Mapping[str, Any]) -> str:
+    """Conversational text of a claude.ai message: its ``text`` content blocks,
+    falling back to the flattened top-level ``text`` the API also returns, then
+    any attachment-extracted text so uploaded docs stay searchable."""
+    content = line.get("content")
+    text = _join_text_blocks(content, text_types=("text",))
+    if not text:
+        text = str(line.get("text") or "")
+    extracted = _claude_desktop_attachment_text(line.get("attachments"))
+    if extracted:
+        text = f"{text}\n{extracted}" if text else extracted
+    return text
+
+
+def _claude_desktop_attachment_text(attachments: Any) -> str:
+    if not isinstance(attachments, list):
+        return ""
+    parts: list[str] = []
+    for attachment in attachments:
+        if not isinstance(attachment, Mapping):
+            continue
+        extracted = attachment.get("extracted_content")
+        if isinstance(extracted, str) and extracted.strip():
+            parts.append(extracted)
+    return "\n".join(parts)
+
+
+def _claude_desktop_block(content: Any, block_type: str) -> Mapping[str, Any] | None:
+    if not isinstance(content, list):
+        return None
+    return next(
+        (block for block in content if isinstance(block, Mapping) and block.get("type") == block_type),
+        None,
+    )
+
+
 def codex_event_row(
     line: Mapping[str, Any],
     *,
@@ -599,6 +719,7 @@ _EVENT_ROW_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
     "claude_code": claude_code_event_row,
     "codex": codex_event_row,
     "openclaw": openclaw_event_row,
+    "claude_desktop": claude_desktop_event_row,
 }
 
 
