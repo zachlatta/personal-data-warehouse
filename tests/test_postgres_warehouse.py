@@ -1331,6 +1331,11 @@ def _search_text_index_names() -> set[str]:
     straight from the generated function SQL (no DB needed)."""
     import re
 
+    sql = _search_text_function_sql()
+    return set(re.findall(r"to_bm25query\([^,]+,\s*'([a-z0-9_]+)'\)", sql))
+
+
+def _search_text_function_sql() -> str:
     import personal_data_warehouse.postgres as postgres_module
 
     captured: list[str] = []
@@ -1340,7 +1345,15 @@ def _search_text_index_names() -> set[str]:
             captured.append(sql)
 
     postgres_module.PostgresWarehouse._ensure_search_text_function(_Capture())
-    return set(re.findall(r"to_bm25query\([^,]+,\s*'([a-z0-9_]+)'\)", captured[0]))
+    return captured[0]
+
+
+def test_search_text_sources_filter_skips_unrequested_branches() -> None:
+    sql = _search_text_function_sql()
+    assert "branch_sources text[]" in sql
+    assert "branch_sqls text[]" in sql
+    assert "IF sources IS NOT NULL AND NOT branch_source = ANY (sources) THEN" in sql
+    assert "CONTINUE;" in sql
 
 
 def test_search_text_only_references_defined_bm25_indexes() -> None:

@@ -5166,11 +5166,12 @@ class PostgresWarehouse:
             col: str,
             idx: str,
             where: str = "",
-        ) -> str:
+        ) -> tuple[str, str]:
             # One bm25-indexed text column -> one index-backed top-k subquery.
             where_sql = f" WHERE {where}" if where else ""
             rank = f"{col} <@> to_bm25query(%1$L, '{idx}')"
             return (
+                source_literal_name(source),
                 f"( SELECT {source} AS source, {subsource} AS subsource, "
                 f"{context} AS context, {who} AS who, {occurred} AS occurred_at, "
                 f"{account} AS account, {ref} AS ref, {col} AS text, "
@@ -5178,12 +5179,18 @@ class PostgresWarehouse:
                 f"FROM {from_sql}{where_sql} ORDER BY {rank} LIMIT %2$s )"
             )
 
-        def join_branch(select_sql: str, inner_sql: str, joins_sql: str, where: str = "") -> str:
+        def join_branch(source_name: str, select_sql: str, inner_sql: str, joins_sql: str, where: str = "") -> tuple[str, str]:
             # Branches whose metadata needs joins keep the bm25 top-k on the base
             # table (inner_sql), then join for context/who; the join runs over
             # only the top-k rows.
             where_sql = f" WHERE {where}" if where else ""
-            return f"( {select_sql} FROM ( {inner_sql} ) m {joins_sql}{where_sql} )"
+            return source_name, f"( {select_sql} FROM ( {inner_sql} ) m {joins_sql}{where_sql} )"
+
+        def source_literal_name(source: str) -> str:
+            # All search_text branches use literal source labels. Keep the label
+            # alongside the branch SQL so search_text(sources := ...) can avoid
+            # executing unrelated branches instead of filtering only afterward.
+            return source.split("::", 1)[0].strip().strip("'")
 
         branches = [
             branch(
@@ -5202,6 +5209,7 @@ class PostgresWarehouse:
             # inner join to gmail_attachments naturally restricts the shared
             # file_attachment_enrichments table to gmail-origin rows.
             join_branch(
+                "gmail_attachment",
                 "SELECT 'gmail_attachment' AS source, 'content' AS subsource, a.filename AS context, "
                 "'' AS who, a.internal_date AS occurred_at, a.account AS account, "
                 "a.account || ':' || a.message_id || ':' || a.content_sha256 AS ref, "
@@ -5221,6 +5229,7 @@ class PostgresWarehouse:
             # slack message: bm25 top-k on the message text, then join conversation
             # (for name/type) and user (for who).
             join_branch(
+                "slack",
                 "SELECT 'slack' AS source, c.conversation_type AS subsource, c.name AS context, "
                 "COALESCE(NULLIF(u.real_name, ''), NULLIF(u.name, ''), m.user_id) AS who, "
                 "m.message_datetime AS occurred_at, m.account AS account, "
@@ -5300,6 +5309,7 @@ class PostgresWarehouse:
             ),
             # imessage: bm25 top-k on the message body, then join the handle for who.
             join_branch(
+                "imessage",
                 "SELECT 'imessage' AS source, m.service AS subsource, m.group_title AS context, "
                 "CASE WHEN m.is_from_me = 1 THEN 'me' ELSE COALESCE(h.address, '') END AS who, "
                 "m.message_at AS occurred_at, m.account AS account, m.message_id AS ref, "
@@ -5312,6 +5322,7 @@ class PostgresWarehouse:
             ),
             # whatsapp body: bm25 top-k on the message body, then join chat + contact.
             join_branch(
+                "whatsapp",
                 "SELECT 'whatsapp' AS source, 'body' AS subsource, COALESCE(NULLIF(c.name, ''), m.chat_id) AS context, "
                 "CASE WHEN m.is_from_me = 1 THEN 'me' ELSE COALESCE(NULLIF(ct.full_name, ''), "
                 "NULLIF(ct.push_name, ''), NULLIF(m.push_name, ''), m.sender_jid) END AS who, "
@@ -5338,6 +5349,7 @@ class PostgresWarehouse:
             # whatsapp_media_items restricts the shared enrichment table to
             # whatsapp-origin rows.
             join_branch(
+                "whatsapp_media",
                 "SELECT 'whatsapp_media' AS source, 'content' AS subsource, a.filename AS context, "
                 "'' AS who, a.message_at AS occurred_at, a.account AS account, "
                 "a.chat_id || ':' || a.message_id AS ref, "
@@ -5427,6 +5439,7 @@ class PostgresWarehouse:
                 "google_drive_files_name_bm25_idx", where="trashed = 0 AND is_excluded = 0",
             ),
             join_branch(
+                "google_drive",
                 "SELECT 'google_drive' AS source, 'content' AS subsource, f.folder_path AS context, "
                 "f.last_modifying_user AS who, f.modified_time AS occurred_at, f.account AS account, "
                 "f.account || ':' || f.file_id AS ref, m.text AS text, m.score AS score",
@@ -5464,7 +5477,8 @@ class PostgresWarehouse:
         # CREATE OR REPLACE'd (stable OID, same return type) over that fixed type.
         # Changing search_text_hit's columns therefore needs a manual
         # DROP TYPE ... CASCADE first (rare; the column set is stable).
-        branch_array = ",\n                        ".join(f"$b${b}$b$" for b in branches)
+        branch_sources_array = ", ".join(f"'{source}'" for source, _ in branches)
+        branch_sql_array = ",\n                        ".join(f"$b${sql}$b$" for _, sql in branches)
         self._command(
             r"""
             DO $do$
@@ -5494,15 +5508,28 @@ class PostgresWarehouse:
             AS $fn$
             DECLARE
                 per_source integer := greatest(coalesce(max_results, 50), 1);
+                branch_sources text[] := ARRAY[
+                        """
+            + branch_sources_array
+            + r"""
+                ];
+                branch_sqls text[] := ARRAY[
+                        """
+            + branch_sql_array
+            + r"""
+                ];
+                branch_source text;
                 branch text;
+                branch_idx integer;
                 hits search_text_hit[] := '{}';
                 branch_hits search_text_hit[];
             BEGIN
-                FOREACH branch IN ARRAY ARRAY[
-                        """
-            + branch_array
-            + r"""
-                ] LOOP
+                FOR branch_idx IN 1..coalesce(array_length(branch_sqls, 1), 0) LOOP
+                    branch_source := branch_sources[branch_idx];
+                    IF sources IS NOT NULL AND NOT branch_source = ANY (sources) THEN
+                        CONTINUE;
+                    END IF;
+                    branch := branch_sqls[branch_idx];
                     BEGIN
                         EXECUTE format(
                             'SELECT array_agg(x::search_text_hit) FROM (' || branch || ') x',
