@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import gzip
 import json
 
+from personal_data_warehouse_claude_desktop.api import ClaudeAiRateLimitError
 from personal_data_warehouse_claude_desktop.state import ClaudeDesktopSyncState
 from personal_data_warehouse_claude_desktop.sync import (
     ClaudeDesktopUploadRunner,
@@ -203,6 +204,51 @@ def test_runner_commits_cursor_only_after_upload(tmp_path) -> None:
         pass
     # Cursor not advanced because the upload failed.
     assert state.updated_at_for("c1") == ""
+    state.close()
+
+
+def test_runner_rate_limited_on_fetch_defers_gracefully(tmp_path) -> None:
+    # c0 fetches fine; c1 is throttled (429). The runner should stop, ship the
+    # already-buffered c0, commit only c0's cursor, and flag rate_limited - so
+    # the next keepalive tick resumes at c1 rather than the run going red.
+    summaries = [{"uuid": f"c{i}", "updated_at": "2026-06-02T00:00:00Z"} for i in range(3)]
+    trees = {f"c{i}": _tree(f"c{i}", "2026-06-02T00:00:00Z", [_msg(f"m{i}", "human", "hi")]) for i in range(3)}
+
+    class RateLimitedClient(FakeClient):
+        def get_conversation(self, conversation_id: str) -> dict:
+            if conversation_id == "c1":
+                raise ClaudeAiRateLimitError("429", retry_after_seconds=7)
+            return super().get_conversation(conversation_id)
+
+    client = RateLimitedClient(summaries, trees)
+    store = FakeBatchUploader()
+    state = ClaudeDesktopSyncState.open(tmp_path / "s.sqlite", account="account@example.com")
+
+    summary = _runner(client, store, state).sync()
+
+    assert summary.rate_limited is True
+    assert summary.conversations_changed == 1  # only c0 completed
+    # c0 fetched fine; c1 raised (so it never reached super().fetched); c2 never attempted.
+    assert client.fetched == ["c0"]
+    assert state.updated_at_for("c0") == "2026-06-02T00:00:00Z"
+    assert state.updated_at_for("c1") == ""  # not committed
+    state.close()
+
+
+def test_runner_rate_limited_on_listing_defers_gracefully(tmp_path) -> None:
+    class ListingRateLimitedClient(FakeClient):
+        def iter_conversations(self, *, page_size: int = 50):
+            raise ClaudeAiRateLimitError("429")
+
+    client = ListingRateLimitedClient([], {})
+    store = FakeBatchUploader()
+    state = ClaudeDesktopSyncState.open(tmp_path / "s.sqlite", account="account@example.com")
+
+    summary = _runner(client, store, state).sync()
+
+    assert summary.rate_limited is True
+    assert summary.conversations_seen == 0
+    assert summary.batches_uploaded == 0
     state.close()
 
 

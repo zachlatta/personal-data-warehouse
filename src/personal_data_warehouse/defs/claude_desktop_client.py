@@ -105,17 +105,19 @@ def claude_desktop_client(context) -> MaterializeResult:
             finally:
                 warehouse.close()
 
-    return MaterializeResult(
-        metadata={
-            key: MetadataValue.int(getattr(summary, key, 0) if summary else 0)
-            for key in (
-                "conversations_seen",
-                "conversations_changed",
-                "messages_uploaded",
-                "batches_uploaded",
-            )
-        }
+    metadata = {
+        key: MetadataValue.int(getattr(summary, key, 0) if summary else 0)
+        for key in (
+            "conversations_seen",
+            "conversations_changed",
+            "messages_uploaded",
+            "batches_uploaded",
+        )
+    }
+    metadata["rate_limited"] = MetadataValue.bool(
+        bool(getattr(summary, "rate_limited", False)) if summary else False
     )
+    return MaterializeResult(metadata=metadata)
 
 
 claude_desktop_client_job = define_asset_job(

@@ -34,6 +34,19 @@ class ClaudeAiApiError(RuntimeError):
     """Raised when a claude.ai API call fails after retries."""
 
 
+class ClaudeAiRateLimitError(ClaudeAiApiError):
+    """The backend returned 429; stop this poll and continue on the next tick.
+
+    Mirrors ``ChatGPTRateLimitError``: a 429 is not retried inline (that would
+    only hammer an already-throttled endpoint); instead the poller stops
+    gracefully and the keepalive sensor retries on its next tick.
+    """
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 class ClaudeAiClient:
     def __init__(
         self,
@@ -89,18 +102,27 @@ class ClaudeAiClient:
             else:
                 if response.status_code == 200:
                     return response.json()
-                # 429/5xx are worth retrying; 401/403 are auth/cloudflare and
-                # will not improve on retry, so fail fast with a clear message.
+                # 401/403 are auth/cloudflare and will not improve on retry, so
+                # fail fast with a clear message.
                 if response.status_code in (401, 403):
                     raise ClaudeAiApiError(
                         f"claude.ai returned {response.status_code} for {path}; "
                         "the desktop login may have expired or Cloudflare is blocking - "
                         "open the Claude Desktop app and sign in again"
                     )
-                if response.status_code < 500 and response.status_code != 429:
+                # 429 means throttled: don't retry inline (that only hammers an
+                # already-rate-limited endpoint); surface it so the poller stops
+                # and the keepalive sensor retries on its next tick.
+                if response.status_code == 429:
+                    raise ClaudeAiRateLimitError(
+                        f"claude.ai returned 429 for {path}",
+                        retry_after_seconds=_retry_after_seconds(response),
+                    )
+                if response.status_code < 500:
                     raise ClaudeAiApiError(
                         f"claude.ai returned {response.status_code} for {path}: {response.text[:200]}"
                     )
+                # 5xx is transient and worth retrying.
                 last_error = ClaudeAiApiError(
                     f"claude.ai returned {response.status_code} for {path}"
                 )
@@ -141,3 +163,14 @@ class ClaudeAiClient:
         if not isinstance(conversation, dict):
             raise ClaudeAiApiError(f"unexpected conversation payload for {conversation_id}")
         return conversation
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    headers = getattr(response, "headers", {}) or {}
+    raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None

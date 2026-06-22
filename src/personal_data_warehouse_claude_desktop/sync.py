@@ -26,7 +26,7 @@ import json
 import tempfile
 from typing import Any
 
-from personal_data_warehouse_claude_desktop.api import ClaudeAiClient
+from personal_data_warehouse_claude_desktop.api import ClaudeAiClient, ClaudeAiRateLimitError
 from personal_data_warehouse_claude_desktop.state import ClaudeDesktopSyncState
 
 TOOL = "claude_desktop"
@@ -47,6 +47,7 @@ class ClaudeDesktopUploadSummary:
     messages_uploaded: int
     batches_uploaded: int
     deferred_for_limit: bool
+    rate_limited: bool = False
 
 
 class ClaudeDesktopUploadRunner:
@@ -91,43 +92,63 @@ class ClaudeDesktopUploadRunner:
         messages_uploaded = 0
         remaining = self._limit
         deferred = False
+        rate_limited = False
 
-        for summary in self._client.iter_conversations(page_size=self._page_size):
-            conversation_id = str(summary.get("uuid", "")).strip()
-            if not conversation_id:
-                continue
-            conversations_seen += 1
-            updated_at = str(summary.get("updated_at", ""))
-            if self._is_unchanged(conversation_id, updated_at):
-                continue
-            if remaining is not None and remaining <= 0:
-                deferred = True
-                break
+        try:
+            for summary in self._client.iter_conversations(page_size=self._page_size):
+                conversation_id = str(summary.get("uuid", "")).strip()
+                if not conversation_id:
+                    continue
+                conversations_seen += 1
+                updated_at = str(summary.get("updated_at", ""))
+                if self._is_unchanged(conversation_id, updated_at):
+                    continue
+                if remaining is not None and remaining <= 0:
+                    deferred = True
+                    break
 
-            conversation = self._client.get_conversation(conversation_id)
-            effective_updated_at = str(conversation.get("updated_at", "") or updated_at)
-            for seq, line in enumerate(conversation_lines(conversation)):
-                batch.add(self._envelope(conversation_id=conversation_id, seq=seq, line=line))
-                if line.get("type") == "message":
-                    messages_uploaded += 1
-                if batch.full():
-                    self._flush(batch)
-            # Cursor only after the whole conversation is buffered, so it commits
-            # in lockstep with the flush that durably stores its final message.
-            batch.register_cursor(conversation_id, effective_updated_at)
-            conversations_changed += 1
-            if remaining is not None:
-                remaining -= 1
+                try:
+                    conversation = self._client.get_conversation(conversation_id)
+                except ClaudeAiRateLimitError as exc:
+                    rate_limited = True
+                    self._logger.warning(
+                        "claude.ai rate limited while fetching conversation %s%s; "
+                        "stopping this poll and continuing on the next tick",
+                        conversation_id,
+                        _retry_suffix(exc),
+                    )
+                    break
+                effective_updated_at = str(conversation.get("updated_at", "") or updated_at)
+                for seq, line in enumerate(conversation_lines(conversation)):
+                    batch.add(self._envelope(conversation_id=conversation_id, seq=seq, line=line))
+                    if line.get("type") == "message":
+                        messages_uploaded += 1
+                    if batch.full():
+                        self._flush(batch)
+                # Cursor only after the whole conversation is buffered, so it commits
+                # in lockstep with the flush that durably stores its final message.
+                batch.register_cursor(conversation_id, effective_updated_at)
+                conversations_changed += 1
+                if remaining is not None:
+                    remaining -= 1
+        except ClaudeAiRateLimitError as exc:
+            rate_limited = True
+            self._logger.warning(
+                "claude.ai rate limited while listing conversations%s; "
+                "stopping this poll and continuing on the next tick",
+                _retry_suffix(exc),
+            )
 
         self._flush(batch)  # trailing partial batch + any pending cursors
 
         self._logger.info(
-            "Claude Desktop upload summary: seen=%s changed=%s messages=%s batches=%s%s",
+            "Claude Desktop upload summary: seen=%s changed=%s messages=%s batches=%s%s%s",
             conversations_seen,
             conversations_changed,
             messages_uploaded,
             batch.batches,
             " (run limit reached; remaining conversations deferred to next run)" if deferred else "",
+            " (rate limited)" if rate_limited else "",
         )
         return ClaudeDesktopUploadSummary(
             conversations_seen=conversations_seen,
@@ -135,6 +156,7 @@ class ClaudeDesktopUploadRunner:
             messages_uploaded=messages_uploaded,
             batches_uploaded=batch.batches,
             deferred_for_limit=deferred,
+            rate_limited=rate_limited,
         )
 
     def _is_unchanged(self, conversation_id: str, updated_at: str) -> bool:
@@ -193,6 +215,12 @@ class ClaudeDesktopUploadRunner:
                 "line": line,
             },
         }
+
+
+def _retry_suffix(exc: ClaudeAiRateLimitError) -> str:
+    if exc.retry_after_seconds is None:
+        return ""
+    return f" (retry_after={exc.retry_after_seconds:g}s)"
 
 
 def conversation_lines(conversation: dict[str, Any]) -> list[dict[str, Any]]:

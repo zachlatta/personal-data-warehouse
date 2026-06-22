@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import pytest
 
-from personal_data_warehouse_claude_desktop.api import ClaudeAiClient, ClaudeAiApiError
+from personal_data_warehouse_claude_desktop.api import (
+    ClaudeAiApiError,
+    ClaudeAiClient,
+    ClaudeAiRateLimitError,
+)
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload=None, text: str = "") -> None:
+    def __init__(self, status_code: int, payload=None, text: str = "", headers=None) -> None:
         self.status_code = status_code
         self._payload = payload
         self.text = text
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -87,3 +92,26 @@ def test_server_error_is_retried_then_succeeds() -> None:
     result = client.get_conversation("c1")
     assert result["uuid"] == "c1"
     assert len(session.calls) == 2
+
+
+def test_rate_limit_raises_without_retry() -> None:
+    # A 429 is throttling, not a transient blip: surface it immediately (like the
+    # ChatGPT backend client) so the poller defers rather than hammering it.
+    session = FakeSession(
+        [FakeResponse(429, headers={"Retry-After": "12"}), FakeResponse(200, {"uuid": "c1"})]
+    )
+    client = _client(session, max_retries=3)
+    with pytest.raises(ClaudeAiRateLimitError) as exc:
+        client.get_conversation("c1")
+    assert exc.value.retry_after_seconds == 12.0
+    assert len(session.calls) == 1  # not retried
+    # It is also a ClaudeAiApiError so existing broad handlers still catch it.
+    assert isinstance(exc.value, ClaudeAiApiError)
+
+
+def test_rate_limit_without_retry_after_header() -> None:
+    session = FakeSession([FakeResponse(429)])
+    client = _client(session)
+    with pytest.raises(ClaudeAiRateLimitError) as exc:
+        client.get_conversation("c1")
+    assert exc.value.retry_after_seconds is None
