@@ -4,7 +4,11 @@ from datetime import UTC, datetime
 
 import pytest
 
-from personal_data_warehouse.chatgpt_backend import ChatGPTAuthError, ConversationRef
+from personal_data_warehouse.chatgpt_backend import (
+    ChatGPTAuthError,
+    ChatGPTRateLimitError,
+    ConversationRef,
+)
 from personal_data_warehouse.chatgpt_backend_ingest import ChatGPTBackendIngestRunner
 
 INGESTED_AT = datetime(2026, 6, 22, 18, tzinfo=UTC)
@@ -62,18 +66,24 @@ def _convo(convo_id, *, title="t", user_text="hi"):
 
 
 class FakeClient:
-    def __init__(self, refs, conversations, *, fail_on=None):
+    def __init__(self, refs, conversations, *, fail_on=None, rate_limit_on=None, rate_limit_listing=False):
         self._refs = refs
         self._conversations = conversations
         self._fail_on = fail_on
+        self._rate_limit_on = rate_limit_on
+        self._rate_limit_listing = rate_limit_listing
         self.fetched: list[str] = []
 
     def iter_conversation_refs(self, *, page_size=28):
+        if self._rate_limit_listing:
+            raise ChatGPTRateLimitError("list returned 429", retry_after_seconds=3)
         yield from self._refs
 
     def get_conversation(self, conversation_id):
         if self._fail_on == conversation_id:
             raise ChatGPTAuthError("session expired")
+        if self._rate_limit_on == conversation_id:
+            raise ChatGPTRateLimitError("detail returned 429", retry_after_seconds=7)
         self.fetched.append(conversation_id)
         return self._conversations[conversation_id]
 
@@ -128,6 +138,39 @@ def test_max_conversations_per_run_bounds_fetches():
     assert summary.conversations_fetched == 2
     assert summary.reached_run_limit is True
     assert len(client.fetched) == 2
+
+
+def test_rate_limit_while_fetching_detail_stops_gracefully_after_recording_progress():
+    refs = [
+        ConversationRef("c1", "one", 1.0, 200.0),
+        ConversationRef("c2", "two", 2.0, 150.0),
+        ConversationRef("c3", "three", 3.0, 125.0),
+    ]
+    convos = {"c1": _convo("c1"), "c2": _convo("c2"), "c3": _convo("c3")}
+    wh = FakeWarehouse()
+    client = FakeClient(refs, convos, rate_limit_on="c2")
+    summary = runner(wh, client).sync()
+
+    assert client.fetched == ["c1"]
+    assert [r["session_id"] for r in wh.recorded] == ["c1"]
+    assert summary.conversations_seen == 2
+    assert summary.conversations_fetched == 1
+    assert summary.events_written == 1
+    assert summary.rate_limited is True
+    assert summary.reached_run_limit is False
+
+
+def test_rate_limit_while_listing_stops_gracefully_without_writes():
+    wh = FakeWarehouse()
+    client = FakeClient([], {}, rate_limit_listing=True)
+    summary = runner(wh, client).sync()
+
+    assert client.fetched == []
+    assert wh.recorded == []
+    assert summary.conversations_seen == 0
+    assert summary.conversations_fetched == 0
+    assert summary.events_written == 0
+    assert summary.rate_limited is True
 
 
 def test_auth_error_propagates_for_loud_failure():

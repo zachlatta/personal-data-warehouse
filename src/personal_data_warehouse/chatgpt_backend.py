@@ -37,6 +37,14 @@ class ChatGPTBackendError(RuntimeError):
     """A non-auth backend failure (network, 5xx, malformed payload)."""
 
 
+class ChatGPTRateLimitError(ChatGPTBackendError):
+    """The backend returned 429; stop this poll and continue on the next tick."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 @dataclass(frozen=True)
 class ConversationRef:
     id: str
@@ -91,6 +99,11 @@ class ChatGPTBackendClient:
             raise ChatGPTAuthError(
                 f"/api/auth/session returned {response.status_code}: session expired"
             )
+        if response.status_code == 429:
+            raise ChatGPTRateLimitError(
+                "/api/auth/session returned 429",
+                retry_after_seconds=_retry_after_seconds(response),
+            )
         if response.status_code >= 400:
             raise ChatGPTBackendError(f"/api/auth/session returned {response.status_code}")
         try:
@@ -125,6 +138,11 @@ class ChatGPTBackendClient:
         )
         if response.status_code in (401, 403):
             raise ChatGPTAuthError(f"{path} returned {response.status_code}: session expired")
+        if response.status_code == 429:
+            raise ChatGPTRateLimitError(
+                f"{path} returned 429",
+                retry_after_seconds=_retry_after_seconds(response),
+            )
         if response.status_code >= 400:
             raise ChatGPTBackendError(f"{path} returned {response.status_code}")
         try:
@@ -188,6 +206,17 @@ def _parse_expiry(expires: Any, *, now: float) -> float:
             pass
     # Unknown expiry: assume a short validity so we re-fetch the token soon.
     return now + 300.0
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    headers = getattr(response, "headers", {}) or {}
+    raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 def _epoch(value: Any) -> float:

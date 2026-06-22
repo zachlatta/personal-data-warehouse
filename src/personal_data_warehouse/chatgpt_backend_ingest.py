@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from personal_data_warehouse.agent_sessions_drive_ingest import (
     chatgpt_conversation_to_event_rows,
 )
-from personal_data_warehouse.chatgpt_backend import ChatGPTBackendClient
+from personal_data_warehouse.chatgpt_backend import ChatGPTBackendClient, ChatGPTRateLimitError
 
 # A conversation is re-fetched when its backend ``update_time`` exceeds the
 # synced value by more than this slack, which absorbs float-rounding noise.
@@ -33,6 +33,7 @@ class ChatGPTBackendIngestSummary:
     conversations_fetched: int
     events_written: int
     reached_run_limit: bool
+    rate_limited: bool = False
 
 
 class ChatGPTBackendIngestRunner:
@@ -66,51 +67,80 @@ class ChatGPTBackendIngestRunner:
         conversations_fetched = 0
         events_written = 0
         reached_limit = False
+        rate_limited = False
 
-        for ref in self._client.iter_conversation_refs(page_size=self._page_size):
-            conversations_seen += 1
-            if not ref.id:
-                continue
-            previous = synced.get(ref.id)
-            if previous is not None and ref.update_time <= previous + _UPDATE_EPSILON_SECONDS:
-                continue
+        try:
+            refs = self._client.iter_conversation_refs(page_size=self._page_size)
+            for ref in refs:
+                conversations_seen += 1
+                if not ref.id:
+                    continue
+                previous = synced.get(ref.id)
+                if previous is not None and ref.update_time <= previous + _UPDATE_EPSILON_SECONDS:
+                    continue
 
-            conversation = self._client.get_conversation(ref.id)
-            rows = chatgpt_conversation_to_event_rows(
-                conversation,
-                account=self._account,
-                device=self._device,
-                ingested_at=ingested_at,
-            )
-            if rows:
-                self._warehouse.insert_agent_session_events(rows)
-                events_written += len(rows)
-            self._warehouse.record_chatgpt_conversation_synced(
-                account=self._account,
-                session_id=ref.id,
-                update_time=ref.update_time,
-                event_count=len(rows),
-                synced_at=ingested_at,
-            )
-            conversations_fetched += 1
+                try:
+                    conversation = self._client.get_conversation(ref.id)
+                except ChatGPTRateLimitError as exc:
+                    rate_limited = True
+                    self._logger.warning(
+                        "ChatGPT backend rate limited while fetching conversation %s%s; "
+                        "stopping this poll and continuing on the next tick",
+                        ref.id,
+                        _retry_suffix(exc),
+                    )
+                    break
 
-            if self._max_conversations_per_run and conversations_fetched >= self._max_conversations_per_run:
-                reached_limit = True
-                self._logger.info(
-                    "Reached CHATGPT_MAX_CONVERSATIONS_PER_RUN=%s; deferring the rest to the next run",
-                    self._max_conversations_per_run,
+                rows = chatgpt_conversation_to_event_rows(
+                    conversation,
+                    account=self._account,
+                    device=self._device,
+                    ingested_at=ingested_at,
                 )
-                break
+                if rows:
+                    self._warehouse.insert_agent_session_events(rows)
+                    events_written += len(rows)
+                self._warehouse.record_chatgpt_conversation_synced(
+                    account=self._account,
+                    session_id=ref.id,
+                    update_time=ref.update_time,
+                    event_count=len(rows),
+                    synced_at=ingested_at,
+                )
+                conversations_fetched += 1
+
+                if self._max_conversations_per_run and conversations_fetched >= self._max_conversations_per_run:
+                    reached_limit = True
+                    self._logger.info(
+                        "Reached CHATGPT_MAX_CONVERSATIONS_PER_RUN=%s; deferring the rest to the next run",
+                        self._max_conversations_per_run,
+                    )
+                    break
+        except ChatGPTRateLimitError as exc:
+            rate_limited = True
+            self._logger.warning(
+                "ChatGPT backend rate limited while listing conversations%s; "
+                "stopping this poll and continuing on the next tick",
+                _retry_suffix(exc),
+            )
 
         self._logger.info(
-            "ChatGPT sync: saw %s conversations, fetched %s, wrote %s events",
+            "ChatGPT sync: saw %s conversations, fetched %s, wrote %s events%s",
             conversations_seen,
             conversations_fetched,
             events_written,
+            " (rate limited)" if rate_limited else "",
         )
         return ChatGPTBackendIngestSummary(
             conversations_seen=conversations_seen,
             conversations_fetched=conversations_fetched,
             events_written=events_written,
             reached_run_limit=reached_limit,
+            rate_limited=rate_limited,
         )
+
+
+def _retry_suffix(exc: ChatGPTRateLimitError) -> str:
+    if exc.retry_after_seconds is None:
+        return ""
+    return f" (retry_after={exc.retry_after_seconds:g}s)"

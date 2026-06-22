@@ -6,13 +6,15 @@ from personal_data_warehouse.chatgpt_backend import (
     ChatGPTAuthError,
     ChatGPTBackendClient,
     ChatGPTBackendError,
+    ChatGPTRateLimitError,
 )
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, payload=None):
+    def __init__(self, status_code=200, payload=None, headers=None):
         self.status_code = status_code
         self._payload = payload if payload is not None else {}
+        self.headers = headers or {}
 
     def json(self):
         if self._payload is _NOT_JSON:
@@ -99,6 +101,18 @@ def test_backend_500_raises_backend_error():
     )
     with pytest.raises(ChatGPTBackendError):
         list(c.iter_conversation_refs())
+
+
+def test_backend_429_raises_rate_limit_error_with_retry_after():
+    c = client(
+        {
+            AUTH: [FakeResponse(200, {"accessToken": "tok", "expires": "2999-01-01T00:00:00Z"})],
+            "/backend-api/conversation/abc": [FakeResponse(429, {}, headers={"Retry-After": "12"})],
+        }
+    )
+    with pytest.raises(ChatGPTRateLimitError) as exc_info:
+        c.get_conversation("abc")
+    assert exc_info.value.retry_after_seconds == 12
 
 
 def test_iter_conversation_refs_paginates_until_total():

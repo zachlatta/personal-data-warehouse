@@ -107,6 +107,7 @@ def chatgpt_backend_ingest(context) -> MaterializeResult:
             "conversations_fetched": MetadataValue.int(summary.conversations_fetched),
             "events_written": MetadataValue.int(summary.events_written),
             "reached_run_limit": MetadataValue.bool(summary.reached_run_limit),
+            "rate_limited": MetadataValue.bool(summary.rate_limited),
         }
     )
 
