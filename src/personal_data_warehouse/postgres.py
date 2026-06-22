@@ -1156,6 +1156,7 @@ class PostgresWarehouse:
 
     def ensure_agent_sessions_tables(self) -> None:
         self._ensure_table_group(["agent_session_events"])
+        self.ensure_chatgpt_tables()
         self._ensure_clean_agent_sessions_view()
         self._ensure_search_views_if_possible()
 
@@ -1253,6 +1254,121 @@ class PostgresWarehouse:
             "database_sha256": database_sha256,
             "database_bytes_size": len(database_bytes),
             "restored_at": restored,
+            "updated_at": now,
+            "sync_version": sync_version,
+        }
+
+    def ensure_chatgpt_tables(self) -> None:
+        self.ensure_chatgpt_session_table()
+        self.ensure_chatgpt_conversation_sync_table()
+
+    def ensure_chatgpt_session_table(self) -> None:
+        """Server-side store for the chatgpt.com web session credential.
+
+        The local ``pdw chatgpt publish-session`` helper captures the session
+        cookie from a browser and POSTs it to the app, which upserts it here;
+        the Dagster poller reads it to authenticate the backend API. Mirrors
+        ``whatsapp_client_sessions`` but holds an opaque token string rather than
+        a SQLite snapshot.
+        """
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS chatgpt_sessions (
+                account text NOT NULL,
+                session_key text NOT NULL DEFAULT 'default',
+                session_token text NOT NULL DEFAULT '',
+                source_browser text NOT NULL DEFAULT '',
+                token_sha256 text NOT NULL DEFAULT '',
+                published_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                sync_version bigint NOT NULL DEFAULT 1,
+                PRIMARY KEY (account, session_key)
+            )
+            """
+        )
+        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS source_browser text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS token_sha256 text NOT NULL DEFAULT ''")
+        self._command(
+            "ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS published_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
+        )
+        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()")
+        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS sync_version bigint NOT NULL DEFAULT 1")
+
+    def ensure_chatgpt_conversation_sync_table(self) -> None:
+        """Per-conversation incremental sync watermark for the ChatGPT poller."""
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS chatgpt_conversation_sync (
+                account text NOT NULL,
+                session_id text NOT NULL,
+                update_time double precision NOT NULL DEFAULT 0,
+                event_count integer NOT NULL DEFAULT 0,
+                synced_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (account, session_id)
+            )
+            """
+        )
+
+    def get_chatgpt_session(self, *, account: str, session_key: str) -> dict[str, Any] | None:
+        self.ensure_chatgpt_session_table()
+        rows = self._query_dicts(
+            """
+            SELECT account, session_key, session_token, source_browser, token_sha256,
+                   published_at, updated_at, sync_version
+            FROM chatgpt_sessions
+            WHERE account = %s AND session_key = %s
+            """,
+            (account, session_key),
+        )
+        return rows[0] if rows else None
+
+    def upsert_chatgpt_session(
+        self,
+        *,
+        account: str,
+        session_key: str,
+        session_token: str,
+        source_browser: str = "",
+        published_at: datetime | None = None,
+        updated_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        self.ensure_chatgpt_session_table()
+        now = updated_at or datetime.now(tz=UTC)
+        published = published_at or now
+        token_sha256 = hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+        sync_version = int(now.astimezone(UTC).timestamp() * 1_000_000)
+        self._command(
+            """
+            INSERT INTO chatgpt_sessions (
+                account, session_key, session_token, source_browser, token_sha256,
+                published_at, updated_at, sync_version
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (account, session_key) DO UPDATE SET
+                session_token = EXCLUDED.session_token,
+                source_browser = EXCLUDED.source_browser,
+                token_sha256 = EXCLUDED.token_sha256,
+                published_at = EXCLUDED.published_at,
+                updated_at = EXCLUDED.updated_at,
+                sync_version = EXCLUDED.sync_version
+            """,
+            (
+                account,
+                session_key,
+                session_token,
+                source_browser,
+                token_sha256,
+                published,
+                now,
+                sync_version,
+            ),
+        )
+        return {
+            "account": account,
+            "session_key": session_key,
+            "source_browser": source_browser,
+            "token_sha256": token_sha256,
+            "published_at": published,
             "updated_at": now,
             "sync_version": sync_version,
         }
@@ -3909,6 +4025,47 @@ class PostgresWarehouse:
 
     def insert_agent_session_events(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_session_events", rows, AGENT_SESSION_EVENT_COLUMNS)
+
+    def chatgpt_conversation_sync_map(self, *, account: str) -> dict[str, float]:
+        """Return ``{session_id: update_time}`` already synced for ``account``.
+
+        The poller skips any backend conversation whose ``update_time`` is not
+        newer than its recorded value (and re-fetches the rest). Re-ingest is
+        idempotent, so this only ever bounds wasted work.
+        """
+        self.ensure_chatgpt_conversation_sync_table()
+        rows = self._query_dicts(
+            """
+            SELECT session_id, update_time
+            FROM chatgpt_conversation_sync
+            WHERE account = %s
+            """,
+            (account,),
+        )
+        return {str(row["session_id"]): float(row["update_time"] or 0.0) for row in rows}
+
+    def record_chatgpt_conversation_synced(
+        self,
+        *,
+        account: str,
+        session_id: str,
+        update_time: float,
+        event_count: int,
+        synced_at: datetime | None = None,
+    ) -> None:
+        self.ensure_chatgpt_conversation_sync_table()
+        synced = synced_at or datetime.now(tz=UTC)
+        self._command(
+            """
+            INSERT INTO chatgpt_conversation_sync (account, session_id, update_time, event_count, synced_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (account, session_id) DO UPDATE SET
+                update_time = EXCLUDED.update_time,
+                event_count = EXCLUDED.event_count,
+                synced_at = EXCLUDED.synced_at
+            """,
+            (account, session_id, float(update_time), int(event_count), synced),
+        )
 
     def insert_agent_runs(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_runs", rows, AGENT_RUN_COLUMNS)

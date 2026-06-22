@@ -22,6 +22,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Mapping
+from typing import Any
 from urllib.parse import urlencode
 
 import requests
@@ -93,14 +94,14 @@ class IngestClient:
         body = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         return self._post(endpoint, body=body, content_type="application/json", params=params)
 
-    def _post(
+    def _signed_post(
         self,
         endpoint: str,
         *,
         body: bytes,
         content_type: str,
         params: Mapping[str, str | None],
-    ) -> StoredObjectDict:
+    ) -> Any:
         content_sha256 = hashlib.sha256(body).hexdigest()
         exp_unix = int(self._now()) + self._link_ttl_seconds
         signature = sign_object_upload(self._signing_key, endpoint, content_sha256, exp_unix)
@@ -116,13 +117,51 @@ class IngestClient:
             timeout=self._timeout,
         )
         response.raise_for_status()
-        payload = response.json()
+        return response.json()
+
+    def _post(
+        self,
+        endpoint: str,
+        *,
+        body: bytes,
+        content_type: str,
+        params: Mapping[str, str | None],
+    ) -> StoredObjectDict:
+        payload = self._signed_post(endpoint, body=body, content_type=content_type, params=params)
         return {
             "storage_backend": str(payload.get("storage_backend", "")),
             "storage_key": str(payload.get("storage_key", "")),
             "storage_file_id": str(payload.get("storage_file_id", "")),
             "storage_url": str(payload.get("storage_url", "")),
         }
+
+    # --- chatgpt session credential ----------------------------------------
+    def publish_chatgpt_session(
+        self,
+        *,
+        account: str,
+        session_token: str,
+        session_key: str = "default",
+        source_browser: str = "",
+    ) -> Mapping[str, Any]:
+        """Publish a captured chatgpt.com web session to the app (Postgres-backed).
+
+        Returns the app's acknowledgement (account/session_key/token_sha256/...);
+        the token itself is never echoed back.
+        """
+        payload = {
+            "account": account,
+            "session_key": session_key,
+            "session_token": session_token,
+            "source_browser": source_browser,
+        }
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return self._signed_post(
+            "/ingest/chatgpt/session",
+            body=body,
+            content_type="application/json",
+            params={},
+        )
 
     # --- agent sessions -----------------------------------------------------
     def upload_agent_sessions_batch(self, gzip_bytes: bytes, *, exported_at: str) -> StoredObjectDict:

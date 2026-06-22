@@ -1410,6 +1410,7 @@ name = "personal-data-warehouse"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "dagster" },
     { name = "dagster-postgres" },
     { name = "google-api-python-client" },
@@ -1435,6 +1436,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=42.0.0" },
     { name = "dagster", specifier = "==1.12.22" },
     { name = "dagster-postgres", specifier = ">=0.28.22" },
     { name = "google-api-python-client", specifier = ">=2.169.0" },

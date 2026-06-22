@@ -99,6 +99,46 @@ def test_post_signs_body_and_sends_expected_query() -> None:
     assert q["sig"] == expected_sig
 
 
+class _FakeJSONSession:
+    def __init__(self, payload: dict) -> None:
+        self.calls: list[dict] = []
+        self._payload = payload
+
+    def post(self, url, *, data, headers, timeout):
+        self.calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
+        return _FakeResponse(self._payload)
+
+
+def test_publish_chatgpt_session_signs_json_body() -> None:
+    session = _FakeJSONSession({"account": "user@example.com", "session_key": "default", "token_sha256": "abc"})
+    client = IngestClient(
+        base_url="https://app.example.test/",
+        signing_key=b"0123456789abcdef0123456789abcdef",
+        session=session,
+        now=lambda: 1700000000.0,
+        link_ttl_seconds=900,
+    )
+    ack = client.publish_chatgpt_session(
+        account="user@example.com",
+        session_token="__Secure-next-auth.session-token=tok; cf_clearance=cf",
+        source_browser="Google Chrome",
+    )
+    assert ack["token_sha256"] == "abc"
+    call = session.calls[0]
+    assert call["headers"]["Content-Type"] == "application/json"
+    parts = urlsplit(call["url"])
+    assert parts.path == "/ingest/chatgpt/session"
+    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    expected_sha = hashlib.sha256(call["data"]).hexdigest()
+    assert q["content_sha256"] == expected_sha
+    assert q["sig"] == sign_object_upload(
+        b"0123456789abcdef0123456789abcdef", "/ingest/chatgpt/session", expected_sha, 1700000000 + 900
+    )
+    # The body is canonical JSON carrying the credential.
+    assert b'"account":"user@example.com"' in call["data"]
+    assert b"__Secure-next-auth.session-token=tok" in call["data"]
+
+
 # Object keys are now built only by the app (Go); see
 # app/internal/server/ingest_test.go for the key/tag assertions.
 

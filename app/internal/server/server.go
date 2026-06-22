@@ -13,6 +13,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/api"
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/buildinfo"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/chatgptsession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
@@ -233,6 +234,18 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	} else if ingestEnabled {
 		mux.Handle(ingestPathPrefix, ingestSvc.handler())
 		logger.Info("client upload ingestion enabled", "endpoints", len(ingestSvc.artifacts))
+	}
+	// The ChatGPT session-publish endpoint writes to Postgres (not object
+	// storage), so it is independent of Drive ingestion. The exact path wins
+	// over the "/ingest/" subtree handler above.
+	if cfg.PostgresDatabaseURL != "" {
+		sessionStore, serr := chatgptsession.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+		if serr != nil {
+			logger.Error("chatgpt session store failed to initialize; session publishing disabled", "error", serr.Error())
+		} else {
+			mux.Handle(chatgptsession.Endpoint, chatgptsession.NewService(sessionStore, authSvc, time.Now, logger).Handler())
+			logger.Info("chatgpt session publishing enabled", "endpoint", chatgptsession.Endpoint)
+		}
 	}
 	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default(), extra...)
 	mcpServer := newMCPServerFromRegistry(registry, slog.Default())

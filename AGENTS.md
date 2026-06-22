@@ -430,6 +430,55 @@ and candidate query all live in `file_attachment_enrichment.py`; each source is 
 `FileEnrichmentSource` descriptor. That enrichment text is surfaced by `search_text()` under
 `source = 'whatsapp_media'`, `subsource = 'content'`.
 
+## ChatGPT (consumer) - server-side backend poll
+
+Normal ChatGPT conversations (the consumer product, not the API) land in `agent_session_events`
+as a fourth agent-sessions source (`source = 'chatgpt'`), alongside `claude_code`/`codex`/`openclaw`,
+and roll up through the same `clean_agent_sessions` view + `search_text()` (`subsource = 'chatgpt'`).
+
+Why this one is different: the **ChatGPT desktop app** (`~/Library/Application Support/com.openai.chat`)
+stores conversations **encrypted** (`conversations-v3-*/*.data`), and both the decryption key and
+the app's auth token live in the macOS **data-protection keychain** under OpenAI's team access
+group (`2DC432GLL2.com.openai.chat`). That is an `errSecMissingEntitlement` wall: a code-signing
+check on the calling binary, not a user-consent gate, so no local helper can read them. We
+therefore do **not** read the desktop app. Instead the warehouse polls ChatGPT's backend API
+**server-side** using a chatgpt.com **web session** captured from a browser.
+
+Two pieces:
+
+- **Client-side setup (manual, interactive): `pdw chatgpt publish-session`.** Reads the
+  chatgpt.com session cookie from a local Chrome-family browser (Chrome/Brave/Edge/Arc; auto-detected
+  or `--browser`), decrypting it with the browser's *legacy*, consent-readable "<Browser> Safe
+  Storage" keychain item (a one-time "allow" prompt); see `chatgpt_cookies.py`. It validates the
+  session against `/api/auth/session`, then POSTs the full cookie header (HMAC-signed, like every
+  other ingest) to the app endpoint `POST /ingest/chatgpt/session`, which upserts it into Postgres
+  `chatgpt_sessions` (`app/internal/chatgptsession`). The cookie never goes to Drive. Re-run this
+  whenever the server reports the session expired. Flags: `--account` (defaults through the same
+  account fallback), `--session-key`, `--dry-run`.
+- **Server-side poll (Dagster): `chatgpt_backend_ingest` asset + `chatgpt_backend_ingest_sensor`.**
+  The sensor fires every `CHATGPT_POLL_INTERVAL_SECONDS` (default 300) once a session is published
+  (it *skips* with a "run publish-session" reason before first setup, so a missing session never
+  floods failures). The asset reads the stored session, exchanges it for a short-lived `accessToken`
+  (`chatgpt_backend.py`), walks `backend-api/conversations` newest-first, fetches each conversation
+  whose `update_time` is newer than the per-conversation watermark in `chatgpt_conversation_sync`,
+  and normalizes the message tree via `chatgpt_conversation_to_event_rows`
+  (`agent_sessions_drive_ingest.py`; depth-first `seq`, `tool`/`tool_use` detection, `model_slug`,
+  reasoning -> `thinking`). Re-ingest is idempotent (PK `source,session_id,event_uuid`).
+
+**Fail-loud / self-heal:** when the session is rejected (logout/expiry), the backend client raises
+`ChatGPTAuthError`, the asset re-raises it with *"run `pdw chatgpt publish-session`"* and the run
+goes **red** in monitoring; never a silent skip. The fix is one local re-run of publish-session.
+
+Prod config (Coolify, on the **Dagster** deployment): ChatGPT polling is enabled by default once
+an account label is available (`CHATGPT_ACCOUNT`, falling back to the agent-sessions/gmail
+account); `CHATGPT_CLIENT_ENABLED=0` pauses it. Optional:
+`CHATGPT_POLL_INTERVAL_SECONDS`, `CHATGPT_PAGE_SIZE`, `CHATGPT_MAX_CONVERSATIONS_PER_RUN` (bound a
+first backfill), `CHATGPT_SESSION_KEY`, `CHATGPT_BASE_URL`. The **app** auto-exposes
+`/ingest/chatgpt/session` whenever it has Postgres; no extra config. This is an unofficial API
+(same ToS/ban-risk class as the WhatsApp client); it reads only the configured account. ChatGPT SQL
+starting points: `agent_session_events`/`clean_agent_sessions` filtered to `source = 'chatgpt'`,
+and `chatgpt_sessions` (credential) / `chatgpt_conversation_sync` (per-conversation watermark).
+
 ## Shared file-attachment enrichment
 
 `gmail_attachment_enrichments` was renamed to `file_attachment_enrichments` and generalized into

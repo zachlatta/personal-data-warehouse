@@ -58,6 +58,11 @@ DEFAULT_AGENT_SESSIONS_STORAGE_BACKEND = "google_drive"
 DEFAULT_AGENT_SESSIONS_CLAUDE_PROJECTS_DIR = "~/.claude/projects"
 DEFAULT_AGENT_SESSIONS_CODEX_SESSIONS_DIR = "~/.codex/sessions"
 DEFAULT_AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR = "~/.openclaw/agents/main/sessions"
+DEFAULT_CHATGPT_POLL_INTERVAL_SECONDS = 300
+DEFAULT_CHATGPT_PAGE_SIZE = 28
+DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com"
+DEFAULT_CHATGPT_REQUEST_TIMEOUT_SECONDS = 30
+DEFAULT_CHATGPT_CLIENT_ENABLED = True
 DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
 DEFAULT_ALICE_STORAGE_BACKEND = "google_drive"
 DEFAULT_ALICE_REQUEST_TIMEOUT_SECONDS = 120
@@ -218,6 +223,25 @@ class AgentSessionsConfig:
 
 
 @dataclass(frozen=True)
+class ChatGPTConfig:
+    """Server-side polling of the consumer ChatGPT backend API.
+
+    The session credential itself is not held here; it lives in the
+    ``chatgpt_sessions`` Postgres table, published by ``pdw chatgpt
+    publish-session``. This is just the poller's behavior knobs.
+    """
+
+    account: str
+    session_key: str = "default"
+    client_enabled: bool = True
+    poll_interval_seconds: int = DEFAULT_CHATGPT_POLL_INTERVAL_SECONDS
+    page_size: int = DEFAULT_CHATGPT_PAGE_SIZE
+    max_conversations_per_run: int = 0
+    base_url: str = DEFAULT_CHATGPT_BASE_URL
+    request_timeout_seconds: int = DEFAULT_CHATGPT_REQUEST_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True)
 class AliceVoiceRecordingsConfig:
     account: str
     key_id: str
@@ -314,6 +338,7 @@ class Settings:
     apple_messages: AppleMessagesConfig | None = None
     whatsapp: WhatsAppConfig | None = None
     agent_sessions: AgentSessionsConfig | None = None
+    chatgpt: ChatGPTConfig | None = None
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
@@ -414,6 +439,7 @@ def load_settings(
     require_apple_messages: bool = False,
     require_whatsapp: bool = False,
     require_agent_sessions: bool = False,
+    require_chatgpt: bool = False,
     require_alice_voice_recordings: bool = False,
     require_google_drive_source: bool = False,
     require_assemblyai: bool = False,
@@ -952,6 +978,49 @@ def load_settings(
             openclaw_sessions_dir=agent_sessions_openclaw_sessions_dir,
         )
 
+    chatgpt_account = (
+        os.getenv("CHATGPT_ACCOUNT")
+        or agent_sessions_account
+        or default_voice_memos_account
+    ).strip()
+    chatgpt: ChatGPTConfig | None = None
+    if (
+        require_chatgpt
+        or chatgpt_account
+        or os.getenv("CHATGPT_ACCOUNT")
+        or os.getenv("CHATGPT_CLIENT_ENABLED")
+        or os.getenv("CHATGPT_SESSION_KEY")
+    ):
+        if not chatgpt_account:
+            raise ValueError("CHATGPT_ACCOUNT or GMAIL_ACCOUNTS must be set for ChatGPT sync")
+        chatgpt_session_key = os.getenv("CHATGPT_SESSION_KEY", "default").strip() or "default"
+        chatgpt_poll_interval = int(
+            os.getenv("CHATGPT_POLL_INTERVAL_SECONDS", str(DEFAULT_CHATGPT_POLL_INTERVAL_SECONDS))
+        )
+        if chatgpt_poll_interval < 30:
+            raise ValueError("CHATGPT_POLL_INTERVAL_SECONDS must be at least 30")
+        chatgpt_page_size = int(os.getenv("CHATGPT_PAGE_SIZE", str(DEFAULT_CHATGPT_PAGE_SIZE)))
+        if chatgpt_page_size < 1:
+            raise ValueError("CHATGPT_PAGE_SIZE must be at least 1")
+        chatgpt_max_conversations = int(os.getenv("CHATGPT_MAX_CONVERSATIONS_PER_RUN", "0"))
+        if chatgpt_max_conversations < 0:
+            raise ValueError("CHATGPT_MAX_CONVERSATIONS_PER_RUN must be greater than or equal to 0")
+        chatgpt = ChatGPTConfig(
+            account=chatgpt_account,
+            session_key=chatgpt_session_key,
+            client_enabled=_parse_bool_env(
+                os.getenv("CHATGPT_CLIENT_ENABLED"), DEFAULT_CHATGPT_CLIENT_ENABLED
+            ),
+            poll_interval_seconds=chatgpt_poll_interval,
+            page_size=chatgpt_page_size,
+            max_conversations_per_run=chatgpt_max_conversations,
+            base_url=os.getenv("CHATGPT_BASE_URL", DEFAULT_CHATGPT_BASE_URL).strip()
+            or DEFAULT_CHATGPT_BASE_URL,
+            request_timeout_seconds=int(
+                os.getenv("CHATGPT_REQUEST_TIMEOUT_SECONDS", str(DEFAULT_CHATGPT_REQUEST_TIMEOUT_SECONDS))
+            ),
+        )
+
     alice_account = os.getenv("ALICE_VOICE_RECORDINGS_ACCOUNT", "").strip()
     alice_key_id = os.getenv("ALICE_API_KEY_ID", "").strip()
     alice_secret_key = os.getenv("ALICE_API_SECRET_KEY", "").strip()
@@ -1208,6 +1277,7 @@ def load_settings(
         apple_messages=apple_messages,
         whatsapp=whatsapp,
         agent_sessions=agent_sessions,
+        chatgpt=chatgpt,
         alice_voice_recordings=alice_voice_recordings,
         google_drive_source=google_drive_source,
         assemblyai=assemblyai,

@@ -1,16 +1,22 @@
-"""Ingest AI agent CLI session logs (Claude Code, Codex, OpenClaw) from Drive.
+"""Ingest AI agent session logs into ``agent_session_events``.
 
-A per-device uploader tails the append-only JSONL transcripts each tool writes
-(``~/.claude/projects/**/*.jsonl``, ``~/.codex/sessions/**/rollout-*.jsonl``,
-and ``~/.openclaw/agents/main/sessions/<sessionId>.jsonl``) and batches new
-lines into ``agent-sessions/inbox/batches/`` as gzipped JSONL
-envelopes. This module consumes those batches, normalizes each raw line into an
-``agent_session_events`` row (lossless ``raw_json`` plus queryable columns), and
-promotes processed batch files into ``agent-sessions/library/``.
+Two transports feed the same row schema:
+
+* The CLI tools (Claude Code, Codex, OpenClaw) write append-only JSONL
+  transcripts that a per-device uploader tails and batches into
+  ``agent-sessions/inbox/batches/`` as gzipped JSONL envelopes. This module
+  consumes those batches and normalizes each raw line into a row (lossless
+  ``raw_json`` plus queryable columns), then promotes processed batch files into
+  ``agent-sessions/library/``.
+* ChatGPT (the consumer product) is polled server-side from its backend API,
+  which returns each conversation as a node-tree. ``chatgpt_conversation_to_event_rows``
+  linearizes that tree into the same ``agent_session_events`` rows
+  (``source = 'chatgpt'``); see ``defs/chatgpt_backend_ingest.py``.
 
 The session-level roll-up (counts, token sums, header) is the
 ``clean_agent_sessions`` view over these events, so it stays correct no matter
-how a session's lines are split across batches over time.
+how a session's lines are split across batches over time, and treats every
+``source`` uniformly.
 """
 
 from __future__ import annotations
@@ -594,6 +600,225 @@ _EVENT_ROW_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
     "codex": codex_event_row,
     "openclaw": openclaw_event_row,
 }
+
+
+# --- ChatGPT conversation-tree normalization --------------------------------
+#
+# The ChatGPT backend (``backend-api/conversation/<id>``) and the official data
+# export (``conversations.json``) share one shape: a ``mapping`` of node-id ->
+# ``{id, message, parent, children}`` forming a tree (branches appear when a
+# turn is edited or regenerated). We linearize the tree depth-first from its
+# root(s), following each node's ``children`` in order, and emit one
+# ``agent_session_events`` row per message-bearing node. ``seq`` is the
+# depth-first position, so it is deterministic across idempotent re-pulls and
+# never depends on the (sometimes-null) ``create_time``.
+
+_CHATGPT_EPOCH = datetime.fromtimestamp(0, tz=UTC)
+
+
+def chatgpt_conversation_to_event_rows(
+    conversation: Mapping[str, Any],
+    *,
+    account: str,
+    device: str,
+    ingested_at: datetime,
+) -> list[dict[str, Any]]:
+    """Normalize one ChatGPT conversation tree into ``agent_session_events`` rows."""
+    mapping = conversation.get("mapping")
+    mapping = mapping if isinstance(mapping, Mapping) else {}
+    session_id = str(conversation.get("conversation_id") or conversation.get("id") or "")
+    title = str(conversation.get("title") or "")
+    gizmo = str(conversation.get("gizmo_id") or "")
+
+    rows: list[dict[str, Any]] = []
+    seq = 0
+    for node_id, node in _chatgpt_linear_nodes(mapping):
+        message = node.get("message") if isinstance(node.get("message"), Mapping) else None
+        if not message:
+            continue
+        rows.append(
+            _chatgpt_event_row(
+                message,
+                node=node,
+                node_id=node_id,
+                session_id=session_id,
+                account=account,
+                device=device,
+                seq=seq,
+                ingested_at=ingested_at,
+                title=title,
+                gizmo=gizmo,
+            )
+        )
+        seq += 1
+    return rows
+
+
+def _chatgpt_linear_nodes(mapping: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:
+    """Return ``(node_id, node)`` pairs in depth-first, children-order traversal."""
+    nodes = {nid: node for nid, node in mapping.items() if isinstance(node, Mapping)}
+    roots = [
+        nid
+        for nid, node in nodes.items()
+        if not node.get("parent") or node.get("parent") not in nodes
+    ]
+    roots.sort(key=lambda nid: _chatgpt_root_sort_key(nodes[nid], nid))
+
+    ordered: list[tuple[str, Mapping[str, Any]]] = []
+    visited: set[str] = set()
+    stack = list(reversed(roots))
+    while stack:
+        nid = stack.pop()
+        if nid in visited or nid not in nodes:
+            continue
+        visited.add(nid)
+        node = nodes[nid]
+        ordered.append((nid, node))
+        children = node.get("children")
+        children = children if isinstance(children, list) else []
+        for child in reversed([c for c in children if isinstance(c, str)]):
+            if child not in visited:
+                stack.append(child)
+    # Any nodes unreachable from a root (malformed trees) still get emitted, in a
+    # stable order, so nothing is silently dropped.
+    for nid, node in nodes.items():
+        if nid not in visited:
+            visited.add(nid)
+            ordered.append((nid, node))
+    return ordered
+
+
+def _chatgpt_root_sort_key(node: Mapping[str, Any], node_id: str) -> tuple[float, str]:
+    message = node.get("message") if isinstance(node.get("message"), Mapping) else {}
+    create_time = message.get("create_time")
+    ts = float(create_time) if isinstance(create_time, (int, float)) else 0.0
+    return (ts, node_id)
+
+
+def _chatgpt_event_row(
+    message: Mapping[str, Any],
+    *,
+    node: Mapping[str, Any],
+    node_id: str,
+    session_id: str,
+    account: str,
+    device: str,
+    seq: int,
+    ingested_at: datetime,
+    title: str,
+    gizmo: str,
+) -> dict[str, Any]:
+    author = message.get("author") if isinstance(message.get("author"), Mapping) else {}
+    role_raw = str(author.get("role") or "")
+    content = message.get("content") if isinstance(message.get("content"), Mapping) else {}
+    content_type = str(content.get("content_type") or "")
+    metadata = message.get("metadata") if isinstance(message.get("metadata"), Mapping) else {}
+    recipient = str(message.get("recipient") or "all")
+    event_uuid = str(message.get("id") or node_id or f"{session_id}#{seq}")
+
+    row = _base_row(
+        source="chatgpt",
+        session_id=session_id,
+        account=account,
+        device=device,
+        seq=seq,
+        line=node,
+        event_uuid=event_uuid,
+        occurred_at=_chatgpt_time(message.get("create_time")),
+        ingested_at=ingested_at,
+    )
+    row["event_type"] = role_raw or content_type
+    row["parent_uuid"] = str(node.get("parent") or "")
+    row["session_title"] = title
+    row["entrypoint"] = gizmo
+    row["model"] = str(metadata.get("model_slug") or metadata.get("default_model_slug") or "")
+
+    text = _chatgpt_content_text(content)
+    role = _chatgpt_role(role_raw)
+    # ChatGPT injects the user-profile / custom-instructions block as a
+    # visually-hidden ``user`` message (content_type ``user_editable_context``).
+    # It is context, not a turn, so demote it to ``system``; otherwise it
+    # becomes the session's ``first_prompt`` and inflates the user-turn count.
+    # Hidden ``assistant`` messages (tool calls, model context) stay assistant:
+    # they are real model actions.
+    if role == "user" and bool(metadata.get("is_visually_hidden_from_conversation")):
+        role = "system"
+    row["role"] = role
+    if role == "tool":
+        row["subtype"] = "tool_result"
+        row["tool_name"] = str(author.get("name") or "")
+        row["text"] = text
+        row["tool_result_json"] = raw_json(content) if content else ""
+    elif role == "assistant" and recipient != "all":
+        # Assistant turn addressed to a tool (e.g. ``python``/``browser``) is the
+        # tool invocation; its content is the call payload.
+        row["subtype"] = "tool_use"
+        row["tool_name"] = recipient
+        row["tool_input_json"] = _as_json_text(text or content)
+        row["text"] = text
+    elif role == "assistant" and content_type in ("thoughts", "reasoning_recap"):
+        row["subtype"] = "thinking"
+        row["text"] = text
+    elif role == "assistant":
+        row["subtype"] = "message"
+        row["text"] = text
+    elif role == "user":
+        row["subtype"] = "message"
+        row["text"] = text
+    else:
+        row["subtype"] = content_type or role_raw
+        row["text"] = text
+    return row
+
+
+def _chatgpt_role(role_raw: str) -> str:
+    if role_raw in ("user", "assistant", "system", "tool"):
+        return role_raw
+    return "meta"
+
+
+def _chatgpt_time(value: Any) -> datetime:
+    if value is None or value == "":
+        return _CHATGPT_EPOCH
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return _CHATGPT_EPOCH
+    return parse_datetime(str(value))
+
+
+def _chatgpt_content_text(content: Any) -> str:
+    if not isinstance(content, Mapping):
+        return ""
+    content_type = str(content.get("content_type") or "")
+    parts = content.get("parts")
+    if isinstance(parts, list):
+        text = "\n".join(part for part in parts if isinstance(part, str) and part)
+        if text:
+            return text
+    if content_type == "thoughts":
+        thoughts = content.get("thoughts")
+        if isinstance(thoughts, list):
+            chunks = []
+            for thought in thoughts:
+                if not isinstance(thought, Mapping):
+                    continue
+                summary = str(thought.get("summary") or "")
+                body = str(thought.get("content") or "")
+                chunk = "\n".join(piece for piece in (summary, body) if piece)
+                if chunk:
+                    chunks.append(chunk)
+            return "\n\n".join(chunks)
+    if content_type == "user_editable_context":
+        profile = str(content.get("user_profile") or "")
+        instructions = str(content.get("user_instructions") or "")
+        return "\n".join(piece for piece in (profile, instructions) if piece)
+    for key in ("text", "result", "content"):
+        value = content.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 # --- object key helpers -----------------------------------------------------

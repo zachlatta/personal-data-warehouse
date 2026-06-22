@@ -174,6 +174,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	if cmd == "ingest" {
 		return runIngestWithConfig(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
 	}
+	// chatgpt runs a local setup helper (read browser cookie, publish session)
+	// and posts to the app's signed endpoint, like ingest. Dispatch it here so
+	// it forwards --help to the uploader and needs no /api/tools client.
+	if cmd == "chatgpt" {
+		return runChatGPT(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
+	}
 	if hasHelpArg(rest) {
 		fmt.Fprint(stdout, usage)
 		return 0
