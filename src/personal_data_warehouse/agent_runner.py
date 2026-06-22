@@ -993,7 +993,7 @@ def auth_docker_command(*, provider: str, action: str, config: AgentContainerCon
         ("codex", "login"): "codex login --device-auth",
         ("codex", "status"): "codex login status",
         ("claude", "login"): "claude",
-        ("claude", "status"): "claude doctor",
+        ("claude", "status"): "claude auth status",
     }[(provider, action)]
     shell_command = (
         "mkdir -p \"$CODEX_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$HOME\""

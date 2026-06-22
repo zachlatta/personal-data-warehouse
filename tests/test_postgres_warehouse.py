@@ -2548,7 +2548,8 @@ def test_postgres_apple_notes_revision_history_keeps_latest_state(warehouse: Pos
 
 
 def test_postgres_slack_account_state_uses_empty_actor_for_missing_user(warehouse: PostgresWarehouse) -> None:
-    now = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    now = datetime.now(tz=UTC)
+    message_ts = f"{int(now.timestamp())}.000001"
     warehouse.ensure_slack_tables()
     warehouse.insert_slack_account_identities(
         [
@@ -2587,9 +2588,9 @@ def test_postgres_slack_account_state_uses_empty_actor_for_missing_user(warehous
                 account="zrl",
                 team_id="T1",
                 conversation_id="C1",
-                message_ts="1770000000.000001",
+                message_ts=message_ts,
                 message_datetime=now,
-                thread_ts="1770000000.000001",
+                thread_ts=message_ts,
                 user_id="U_MISSING",
                 text="hello",
                 raw_json="{}",

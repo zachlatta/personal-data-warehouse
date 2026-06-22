@@ -89,6 +89,24 @@ func TestRootShowsGitSHA(t *testing.T) {
 	}
 }
 
+func TestHealthzReturnsNoContent(t *testing.T) {
+	runner := fakeRunner{results: map[string]query.RawResult{}}
+	authSvc := pdwauth.NewService([]byte(muxAPITestSecret), func() time.Time { return time.Unix(0, 0) })
+	cfg := config.Config{Addr: ":0", SecretToken: muxAPITestSecret}
+	mux := NewMux(cfg, authSvc, runner)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	mux.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", resp.Code)
+	}
+	if resp.Body.Len() != 0 {
+		t.Fatalf("body = %q", resp.Body.String())
+	}
+}
+
 func TestAPIListsTools(t *testing.T) {
 	srv := newMuxAPITestServer(t)
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/api/tools", nil)

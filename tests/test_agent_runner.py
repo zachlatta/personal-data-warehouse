@@ -374,6 +374,21 @@ def test_auth_command_uses_subscription_volume_without_api_keys() -> None:
     assert "codex login --device-auth" in command[-1]
 
 
+def test_claude_status_command_checks_auth_not_updater_doctor() -> None:
+    command = auth_docker_command(
+        provider="claude",
+        action="status",
+        config=AgentContainerConfig(image="pdw-agent:latest"),
+        interactive=False,
+    )
+
+    assert command[:3] == ["docker", "run", "--rm"]
+    assert "-it" not in command
+    assert "type=volume,src=pdw-agent-auth,dst=/agent-auth" in command
+    assert "claude auth status" in command[-1]
+    assert "claude doctor" not in command[-1]
+
+
 def test_default_agent_docker_image_uses_agent_image_inputs_hash(tmp_path) -> None:
     dockerfile = tmp_path / "agent.Dockerfile"
     entrypoint = tmp_path / "agent-entrypoint.sh"
