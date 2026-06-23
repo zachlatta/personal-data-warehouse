@@ -66,6 +66,15 @@ from personal_data_warehouse.schema import (
 from personal_data_warehouse.config import normalize_postgres_url
 
 POSTGRES_TEXT_NUL_REPLACEMENT = "\\u0000"
+# A search_text() hit's `text` is a relevance PREVIEW, not the full document.
+# Some branches read multi-megabyte columns (Google Drive doc text averages ~40 kB
+# and reaches ~5 MB; email/attachment bodies can be large too). search_text()
+# array_agg's the top-k `text` of every branch into an intermediate plpgsql array
+# before the final cross-source rank+limit, so carrying untrimmed text makes a
+# single common-term query move tens of MB through that array — slow enough to trip
+# the gateway timeout. Capping each branch's contributed text keeps the array small
+# while preserving a generous preview; the caller fetches full content via `ref`.
+SEARCH_TEXT_PREVIEW_CHARS = 8000
 SLACK_CONVERSATION_STATS_COLUMNS = (
     "account",
     "team_id",
@@ -5570,8 +5579,17 @@ class PostgresWarehouse:
                     END IF;
                     branch := branch_sqls[branch_idx];
                     BEGIN
+                        -- Cap each branch's contributed text to a bounded preview
+                        -- (SEARCH_TEXT_PREVIEW_CHARS). bm25 already ranked the branch
+                        -- on the FULL column (the ORDER BY inside `branch`), so the
+                        -- preview never changes relevance; it only stops a branch that
+                        -- reads multi-megabyte text (Google Drive docs, big email /
+                        -- attachment bodies) from array_agg'ing tens of MB into `hits`.
                         EXECUTE format(
-                            'SELECT array_agg(x::search_text_hit) FROM (' || branch || ') x',
+                            'SELECT array_agg(ROW(x.source, x.subsource, x.context, '
+                            'x.who, x.occurred_at, x.account, x.ref, left(x.text, """
+            + str(SEARCH_TEXT_PREVIEW_CHARS)
+            + r"""), x.score)::search_text_hit) FROM (' || branch || ') x',
                             query, per_source
                         ) INTO branch_hits;
                         IF branch_hits IS NOT NULL THEN

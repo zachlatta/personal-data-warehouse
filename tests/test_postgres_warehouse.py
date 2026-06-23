@@ -34,6 +34,7 @@ from personal_data_warehouse.postgres import (
     FLOAT_COLUMNS,
     INTEGER_COLUMNS,
     POSTGRES_TABLES,
+    SEARCH_TEXT_PREVIEW_CHARS,
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
     _dedupe_conflict_rows,
@@ -1567,6 +1568,58 @@ def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWareh
         "SELECT count(*) FROM search_text('zanzibar', 50, ARRAY['agent']) WHERE score < 0"
     )
     assert agent_only == [(0,)]
+
+
+def test_search_text_caps_hit_text_to_preview(warehouse: PostgresWarehouse) -> None:
+    # A search hit's `text` is a relevance PREVIEW, not the full document. Some
+    # branches read multi-megabyte columns (Google Drive doc text, large email /
+    # attachment bodies); carrying them untrimmed makes search_text() array_agg
+    # tens of MB per branch into its intermediate plpgsql array, slow enough to
+    # trip the gateway timeout for common terms. Every branch must therefore cap
+    # the text it contributes to SEARCH_TEXT_PREVIEW_CHARS.
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+
+    created_at = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    long_body = "zanzibar " + ("padding " * (SEARCH_TEXT_PREVIEW_CHARS // 4))
+    assert len(long_body) > SEARCH_TEXT_PREVIEW_CHARS
+    short_body = "zanzibar rollout quick note"
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="300.1",
+                message_datetime=created_at,
+                text=long_body,
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="300.2",
+                message_datetime=created_at,
+                text=short_body,
+            ),
+        ]
+    )
+
+    rows = warehouse._query(
+        "SELECT ref, text FROM search_text('zanzibar', 50, ARRAY['slack']) WHERE score < 0"
+    )
+    by_ref = {row[0]: row[1] for row in rows}
+    long_ref = next(ref for ref in by_ref if ref.endswith("300.1"))
+    short_ref = next(ref for ref in by_ref if ref.endswith("300.2"))
+
+    # The oversized hit is truncated to exactly the preview cap, and the preview
+    # is a genuine prefix of the stored text (no corruption, no padding).
+    assert len(by_ref[long_ref]) == SEARCH_TEXT_PREVIEW_CHARS
+    assert long_body.startswith(by_ref[long_ref])
+    # A normal-length hit is returned untouched — the cap never shortens it.
+    assert by_ref[short_ref] == short_body
 
 
 def test_whatsapp_client_session_round_trips_binary_snapshot(warehouse: PostgresWarehouse) -> None:
