@@ -74,6 +74,9 @@ class FakeWarehouse:
         self.account_state_refreshes = []
         self.inactivated_conversations = []
         self.existing_message_ids: set[str] = set()
+        # (account, team_id, conversation_id) -> high-water message ts, used to
+        # derive a fallback cursor for conversations whose stored cursor was lost.
+        self.message_high_water: dict[tuple[str, str, str], float] = {}
 
     def ensure_slack_tables(self):
         self.ensure_calls += 1
@@ -285,6 +288,14 @@ class FakeWarehouse:
         # would cause every reply in the window to be tombstoned. Tests set
         # `existing_message_ids` to the set this returns.
         return set(self.existing_message_ids)
+
+    def load_slack_conversation_message_high_water(self, *, account, team_id, conversation_ids):
+        wanted = {str(conversation_id) for conversation_id in conversation_ids}
+        return {
+            conversation_id: high_water
+            for (state_account, state_team_id, conversation_id), high_water in self.message_high_water.items()
+            if state_account == account and state_team_id == team_id and conversation_id in wanted
+        }
 
 
 def test_slack_web_api_client_uses_bounded_timeout(monkeypatch):
@@ -1514,6 +1525,70 @@ def test_runner_freshness_priority_syncs_frozen_dm_with_stale_latest_metadata(mo
     assert [params["channel"] for params in history_calls] == ["D_FROZEN"]
     # Resumes from the stored cursor (1000), not just the freshness window start (1400),
     # so messages that accumulated while the DM was frozen are backfilled.
+    assert float(history_calls[0]["oldest"]) == pytest.approx(1000.0)
+
+
+def test_runner_freshness_priority_derives_cursor_for_cleared_dm_from_message_high_water(monkeypatch):
+    # Regression (cleared-cursor DM freeze): a DM whose stored cursor was wiped to ''
+    # (the pre-"Preserve Slack cursor on empty partial sync" empty-window bug overwrote
+    # real cursors with an empty string) has no cursor to trust, so the activity sort and
+    # gate fall back to a stale cached `latest.ts`/`updated`. That buries the DM below the
+    # conversation_limit and freezes it forever even though we have its history on disk.
+    # The runner must derive a fallback cursor from the high-water mark of the messages we
+    # already stored, so the DM is ranked by real progress and backfilled from that mark.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        # No `latest.ts`; a stale `updated` (900) that predates our real progress. Under
+        # the old behavior the sort key fell back to `updated`, ranking the DM as if it
+        # were last active at 900 and burying it.
+        {"id": "D_CLEARED", "user": "U1", "is_im": True, "updated": 900_000},
+    ]
+    warehouse.states = {
+        ("zrl", "T1", "conversation", "D_CLEARED"): {
+            # Cursor was clobbered to '' — the exact state that strands a DM.
+            "cursor_ts": "",
+            "last_sync_type": "partial",
+            "status": "ok",
+        }
+    }
+    # We have history on disk up to ts 1000; that high-water mark is the cursor we lost.
+    warehouse.message_high_water = {("zrl", "T1", "D_CLEARED"): 1000.0}
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [{"ts": "1500.000000", "user": "U1", "text": "missed while stranded"}],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    history_calls = [params for method, params in client.calls if method == "conversations.history"]
+    assert [params["channel"] for params in history_calls] == ["D_CLEARED"]
+    # Resumes from the derived high-water mark (1000), not the freshness window start
+    # (1400), so the gap that accumulated while the DM was stranded is backfilled.
     assert float(history_calls[0]["oldest"]) == pytest.approx(1000.0)
 
 

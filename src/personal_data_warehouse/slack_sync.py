@@ -512,12 +512,45 @@ class SlackSyncRunner:
                 synced_at=synced_at,
             )
 
+        # Conversations whose own cursor was lost — e.g. clobbered to '' by the
+        # pre-"Preserve Slack cursor on empty partial sync" empty-window bug, which
+        # overwrote real cursors with an empty string — have no cursor to trust, so the
+        # activity sort and gate below fall back to a stale cached `latest.ts`/`updated`.
+        # That buries the conversation under the conversation_limit and (for IMs, whose
+        # only message path is this freshness pass) freezes it forever even though we
+        # already hold its history. Derive a fallback cursor from the high-water mark of
+        # the messages we have stored so such a conversation self-heals: it is ranked by
+        # real progress, included by the activity gate, and backfilled from that mark.
+        missing_cursor_ids = [
+            str(conversation["id"])
+            for conversation in conversations
+            if isinstance(conversation, Mapping)
+            and conversation.get("id")
+            and self._state_cursor_ts(
+                state_by_key.get((account.account, team_id, "conversation", str(conversation["id"])))
+            )
+            is None
+        ]
+        derived_cursors: dict[str, float] = {}
+        if missing_cursor_ids and hasattr(self._warehouse, "load_slack_conversation_message_high_water"):
+            derived_cursors = self._warehouse.load_slack_conversation_message_high_water(
+                account=account.account,
+                team_id=team_id,
+                conversation_ids=missing_cursor_ids,
+            )
+
         def _conversation_cursor_ts(conversation: Mapping[str, object]) -> float | None:
             conversation_id = conversation.get("id")
             if not conversation_id:
                 return None
             state = state_by_key.get((account.account, team_id, "conversation", str(conversation_id)))
-            return self._state_cursor_ts(state)
+            cursor_ts = self._state_cursor_ts(state)
+            if cursor_ts is not None and cursor_ts > 0:
+                return cursor_ts
+            # No stored cursor (never synced, or clobbered): use the high-water mark of
+            # messages we already have, if any. A never-synced conversation has no
+            # messages and so no derived cursor, preserving its latest.ts-gated behavior.
+            return derived_cursors.get(str(conversation_id))
 
         priority_groups = (
             ("im",),

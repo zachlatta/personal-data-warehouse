@@ -5043,6 +5043,45 @@ class PostgresWarehouse:
         )
         return {str(row[0]) for row in rows}
 
+    def load_slack_conversation_message_high_water(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_ids: Sequence[str],
+    ) -> dict[str, float]:
+        # Highest top-level message ts we have stored per conversation. Used to
+        # reconstruct a freshness cursor for conversations whose stored cursor was lost
+        # (see _sync_account_freshness_priority). Restrict to is_thread_reply = 0 to
+        # mirror the cursor the partial sync advances on (conversations.history, which
+        # never returns thread replies).
+        unique_ids = sorted({str(conversation_id) for conversation_id in conversation_ids})
+        if not unique_ids:
+            return {}
+        rows = self._query(
+            f"""
+            SELECT conversation_id, MAX({_numeric_ts("message_ts")}) AS high_water
+            FROM slack_messages
+            WHERE account = %s
+              AND team_id = %s
+              AND conversation_id = ANY(%s)
+              AND is_thread_reply = 0
+            GROUP BY conversation_id
+            """,
+            (account, team_id, unique_ids),
+        )
+        high_water: dict[str, float] = {}
+        for conversation_id, value in rows:
+            if value is None:
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if numeric > 0:
+                high_water[str(conversation_id)] = numeric
+        return high_water
+
     def _backfill_voice_memo_transcription_run_content_hashes(self) -> None:
         self._command(
             """
