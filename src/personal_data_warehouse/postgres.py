@@ -5527,6 +5527,15 @@ class PostgresWarehouse:
         # DROP TYPE ... CASCADE first (rare; the column set is stable).
         branch_sources_array = ", ".join(f"'{source}'" for source, _ in branches)
         branch_sql_array = ",\n                        ".join(f"$b${sql}$b$" for _, sql in branches)
+        # The canonical, de-duplicated set of labels accepted by search_text()'s
+        # `sources` argument, derived from the SAME `branches` list so the two can
+        # never drift. search_text_sources() (defined below) exposes this set so a
+        # caller can discover the exact tokens to pass — the labels are terse
+        # (`note`, `transcript`, `agent_session`, `mutation`/`mutation_request`, ...)
+        # and do not match the prose names in the tool help, and an unknown label
+        # is silently ignored (returns nothing), so guessing fails quietly.
+        distinct_sources = sorted({source for source, _ in branches})
+        search_text_sources_values = ", ".join(f"('{source}')" for source in distinct_sources)
         self._command(
             r"""
             DO $do$
@@ -5611,6 +5620,17 @@ class PostgresWarehouse:
                     LIMIT per_source;
             END;
             $fn$;
+            CREATE OR REPLACE FUNCTION search_text_sources()
+            RETURNS TABLE (source text)
+            LANGUAGE sql
+            IMMUTABLE
+            AS $sources$
+                SELECT s.source
+                FROM (VALUES """
+            + search_text_sources_values
+            + r""") AS s(source)
+                ORDER BY s.source
+            $sources$;
             """
         )
 

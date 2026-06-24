@@ -1349,6 +1349,50 @@ def _search_text_function_sql() -> str:
     return captured[0]
 
 
+def _search_text_branch_source_labels() -> list[str]:
+    """The per-branch source labels search_text() filters on, parsed from the
+    generated `branch_sources` array in the function SQL (no DB needed)."""
+    import re
+
+    sql = _search_text_function_sql()
+    match = re.search(r"branch_sources text\[\] := ARRAY\[(.*?)\]", sql, re.DOTALL)
+    assert match, "expected search_text() to declare a branch_sources array"
+    return re.findall(r"'([a-z0-9_]+)'", match.group(1))
+
+
+def _search_text_sources_helper_labels() -> list[str]:
+    """The labels enumerated by the search_text_sources() helper, parsed from its
+    VALUES list in the generated SQL (no DB needed)."""
+    import re
+
+    sql = _search_text_function_sql()
+    match = re.search(
+        r"CREATE OR REPLACE FUNCTION search_text_sources\(\).*?\$sources\$(.*?)\$sources\$",
+        sql,
+        re.DOTALL,
+    )
+    assert match, "expected search_text_sources() to be defined alongside search_text()"
+    return re.findall(r"\('([a-z0-9_]+)'\)", match.group(1))
+
+
+def test_search_text_sources_helper_matches_branch_labels() -> None:
+    # search_text_sources() exists so a caller can discover the exact (terse)
+    # tokens search_text()'s `sources` arg accepts. The labels are terse and do
+    # not match the tool-help prose names (apple notes => 'note', meeting
+    # transcripts => 'transcript', ...), and an unknown token is silently ignored
+    # (returns nothing) rather than erroring, so guessing fails quietly. The
+    # helper must therefore enumerate exactly the distinct set of branch labels
+    # search_text() filters on, sorted, with no drift.
+    branch_labels = _search_text_branch_source_labels()
+    assert branch_labels, "expected search_text() to declare branch source labels"
+
+    helper_labels = _search_text_sources_helper_labels()
+    assert helper_labels == sorted(set(branch_labels)), (
+        "search_text_sources() must list every distinct search_text() source label, "
+        f"sorted: branches={sorted(set(branch_labels))} helper={helper_labels}"
+    )
+
+
 def test_search_text_sources_filter_skips_unrequested_branches() -> None:
     sql = _search_text_function_sql()
     assert "branch_sources text[]" in sql
@@ -1509,6 +1553,40 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     survived_sources = {(row[0], row[1]) for row in survived}
     assert ("slack", "private_channel") in survived_sources
     assert ("gmail", "subject") in survived_sources
+
+
+def test_search_text_sources_lists_accepted_filter_tokens(warehouse: PostgresWarehouse) -> None:
+    # search_text_sources() must return, on the read-only query surface, exactly
+    # the tokens search_text()'s `sources` filter accepts — the discoverable
+    # source of truth for the terse labels (note/transcript/agent_session/...).
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+
+    expected = sorted(set(_search_text_branch_source_labels()))
+    assert expected, "expected search_text() to declare branch source labels"
+
+    # The MCP/CLI tool is read-only, so search_text_sources() must run under a
+    # genuine read-only transaction (no DDL/DML at call time).
+    warehouse._command("SET default_transaction_read_only = on")
+    try:
+        rows = warehouse._query("SELECT source FROM search_text_sources() ORDER BY source")
+    finally:
+        warehouse._command("SET default_transaction_read_only = off")
+    assert [row[0] for row in rows] == expected
+
+    # Every label search_text_sources() advertises must actually be a token
+    # search_text()'s sources filter recognizes (i.e. it does not skip every
+    # branch and return nothing for a label it claims to accept). Use a term that
+    # cannot match real fixtures so the branch executes but the assertion is about
+    # the function compiling/accepting the token, not about hit counts.
+    for label in expected:
+        warehouse._query(
+            "SELECT count(*) FROM search_text('zzqqxx', 5, ARRAY[%s])",
+            (label,),
+        )
 
 
 def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWarehouse) -> None:
