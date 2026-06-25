@@ -63,11 +63,29 @@ class ChatGPTBackendIngestRunner:
         ingested_at = self._now()
         synced = self._warehouse.chatgpt_conversation_sync_map(account=self._account)
 
+        # Conversations are listed newest-first by ``update_time`` (``order=updated``),
+        # and every conversation that needs fetching - brand new or freshly edited -
+        # sorts to the top with an ``update_time`` greater than anything we have
+        # already synced. So once we reach a conversation at or below the newest
+        # update_time we have on record, everything further down is older and already
+        # synced, and we can stop paging instead of walking the account's entire
+        # history every tick (which otherwise lists deep enough to trip the backend's
+        # rate limiter on every run, so the poll never makes progress).
+        #
+        # The early stop is disabled during an explicit historical backfill
+        # (``max_conversations_per_run > 0``), where we intentionally page *down*
+        # through already-synced conversations across runs to reach older, not-yet
+        # -synced ones below the high-water mark.
+        high_water: float | None = None
+        if not self._max_conversations_per_run and synced:
+            high_water = max(synced.values())
+
         conversations_seen = 0
         conversations_fetched = 0
         events_written = 0
         reached_limit = False
         rate_limited = False
+        stopped_at_high_water = False
 
         try:
             refs = self._client.iter_conversation_refs(page_size=self._page_size)
@@ -75,6 +93,9 @@ class ChatGPTBackendIngestRunner:
                 conversations_seen += 1
                 if not ref.id:
                     continue
+                if high_water is not None and ref.update_time <= high_water + _UPDATE_EPSILON_SECONDS:
+                    stopped_at_high_water = True
+                    break
                 previous = synced.get(ref.id)
                 if previous is not None and ref.update_time <= previous + _UPDATE_EPSILON_SECONDS:
                     continue
@@ -125,11 +146,12 @@ class ChatGPTBackendIngestRunner:
             )
 
         self._logger.info(
-            "ChatGPT sync: saw %s conversations, fetched %s, wrote %s events%s",
+            "ChatGPT sync: saw %s conversations, fetched %s, wrote %s events%s%s",
             conversations_seen,
             conversations_fetched,
             events_written,
             " (rate limited)" if rate_limited else "",
+            " (caught up)" if stopped_at_high_water else "",
         )
         return ChatGPTBackendIngestSummary(
             conversations_seen=conversations_seen,

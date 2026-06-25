@@ -114,9 +114,11 @@ def test_fetches_all_new_conversations_and_writes_events():
 
 
 def test_skips_conversations_not_updated_since_last_sync():
+    # Listed newest-first by update_time: the freshly-updated c2 (999) sorts above
+    # the unchanged c1 (200, == its last synced value).
     refs = [
-        ConversationRef("c1", "one", 1.0, 200.0),  # unchanged (synced at 200)
         ConversationRef("c2", "two", 2.0, 999.0),  # updated since synced (150)
+        ConversationRef("c1", "one", 1.0, 200.0),  # unchanged (synced at 200)
     ]
     convos = {"c1": _convo("c1"), "c2": _convo("c2")}
     wh = FakeWarehouse(sync_map={"c1": 200.0, "c2": 150.0})
@@ -124,7 +126,64 @@ def test_skips_conversations_not_updated_since_last_sync():
     summary = runner(wh, client).sync()
 
     assert client.fetched == ["c2"]
-    assert summary.conversations_seen == 2
+    assert summary.conversations_fetched == 1
+
+
+def test_stops_paging_once_caught_up_to_high_water():
+    # Steady state: the whole list is already synced and unchanged. The walk must
+    # stop at the first (newest) conversation instead of paging the full history,
+    # which is what otherwise trips the backend rate limiter on every tick.
+    refs = [
+        ConversationRef("c3", "three", 3.0, 300.0),
+        ConversationRef("c2", "two", 2.0, 200.0),
+        ConversationRef("c1", "one", 1.0, 100.0),
+    ]
+    convos = {cid: _convo(cid) for cid in ("c1", "c2", "c3")}
+    wh = FakeWarehouse(sync_map={"c1": 100.0, "c2": 200.0, "c3": 300.0})
+    client = FakeClient(refs, convos)
+    summary = runner(wh, client).sync()
+
+    assert client.fetched == []
+    assert summary.conversations_seen == 1  # stopped at the newest, no deep paging
+    assert summary.conversations_fetched == 0
+    assert summary.events_written == 0
+    assert summary.rate_limited is False
+
+
+def test_fetches_new_top_conversations_then_stops_at_high_water():
+    # A new conversation (c4, above the high-water mark) and an edited one (c3,
+    # bumped above the mark) sort to the top; everything at/below the previous
+    # high-water mark (c2) is left untouched.
+    refs = [
+        ConversationRef("c4", "four", 4.0, 400.0),   # brand new
+        ConversationRef("c3", "three", 3.0, 350.0),  # edited (synced at 300)
+        ConversationRef("c2", "two", 2.0, 200.0),    # unchanged at high-water
+        ConversationRef("c1", "one", 1.0, 100.0),
+    ]
+    convos = {cid: _convo(cid) for cid in ("c1", "c2", "c3", "c4")}
+    wh = FakeWarehouse(sync_map={"c1": 100.0, "c2": 200.0, "c3": 300.0})
+    client = FakeClient(refs, convos)
+    summary = runner(wh, client).sync()
+
+    assert client.fetched == ["c4", "c3"]
+    assert summary.conversations_fetched == 2
+
+
+def test_backfill_mode_disables_high_water_stop():
+    # With max_conversations_per_run set (explicit backfill), the early stop is
+    # disabled so we can page *down* past already-synced conversations to reach
+    # older, not-yet-synced ones below the high-water mark.
+    refs = [
+        ConversationRef("c3", "three", 3.0, 300.0),  # synced
+        ConversationRef("c2", "two", 2.0, 200.0),    # synced
+        ConversationRef("c1", "one", 1.0, 100.0),    # NOT synced (older backlog)
+    ]
+    convos = {cid: _convo(cid) for cid in ("c1", "c2", "c3")}
+    wh = FakeWarehouse(sync_map={"c2": 200.0, "c3": 300.0})
+    client = FakeClient(refs, convos)
+    summary = runner(wh, client, max_conversations_per_run=5).sync()
+
+    assert client.fetched == ["c1"]
     assert summary.conversations_fetched == 1
 
 
