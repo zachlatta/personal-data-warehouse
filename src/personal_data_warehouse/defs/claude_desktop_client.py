@@ -47,7 +47,11 @@ CLAUDE_DESKTOP_SENSOR_INTERVAL_SECONDS = 300
 def claude_desktop_client(context) -> MaterializeResult:
     from datetime import UTC
 
-    from personal_data_warehouse_claude_desktop.api import ClaudeAiClient
+    from personal_data_warehouse_claude_desktop.api import (
+        ClaudeAiApiError,
+        ClaudeAiClient,
+        resolve_sync_account,
+    )
     from personal_data_warehouse_claude_desktop.state import WarehouseSyncState
     from personal_data_warehouse_claude_desktop.sync import ClaudeDesktopUploadRunner
 
@@ -57,6 +61,8 @@ def claude_desktop_client(context) -> MaterializeResult:
     config = settings.claude_desktop
 
     summary = None
+    sync_account = ""
+    account_source = "none"
     with exclusive_sync_lock(
         name="claude_desktop_client",
         postgres_lock_id=CLAUDE_DESKTOP_POSTGRES_LOCK_ID,
@@ -67,22 +73,24 @@ def claude_desktop_client(context) -> MaterializeResult:
             warehouse = warehouse_from_settings(settings)
             try:
                 warehouse.ensure_claude_desktop_tables()
-                credential = warehouse.read_claude_desktop_credential(account=config.account)
+                # Read whichever credential the clientside pusher last wrote; the
+                # account is resolved from the live session below, not from env.
+                credential = warehouse.read_latest_claude_desktop_credential()
                 if not credential or not str(credential.get("session_key", "")).strip():
                     context.log.warning(
-                        "No Claude Desktop credential stored for %s yet; run "
-                        "`pdw ingest claude-desktop` on the Mac with the desktop app to push one.",
-                        config.account,
+                        "No Claude Desktop credential stored yet; run "
+                        "`pdw ingest claude-desktop` on the Mac with the desktop app to push one."
                     )
                 else:
                     from datetime import datetime
 
+                    credential_label = str(credential.get("account", "")).strip()
                     expires_at = credential.get("expires_at")
                     if expires_at is not None and expires_at < datetime.now(tz=UTC):
                         context.log.warning(
-                            "Stored Claude Desktop credential for %s expired at %s; attempting anyway. "
+                            "Stored Claude Desktop credential (%s) expired at %s; attempting anyway. "
                             "Re-run `pdw ingest claude-desktop` on the Mac to refresh it.",
-                            config.account,
+                            credential_label or "unknown account",
                             expires_at,
                         )
                     org_id = config.org_id or str(credential.get("org_id", ""))
@@ -91,15 +99,44 @@ def claude_desktop_client(context) -> MaterializeResult:
                         org_id=org_id,
                         base_url=config.base_url,
                     )
+                    # The account is whatever the session actually belongs to -
+                    # ask the live API (authoritative). Best-effort: a verify
+                    # failure (e.g. transient Cloudflare block) must never stop the
+                    # sync, so we fall back to the stored label, then env.
+                    try:
+                        session_account = client.account_email()
+                    except ClaudeAiApiError as exc:
+                        session_account = ""
+                        context.log.debug("Could not verify Claude Desktop account: %s", exc)
+                    sync_account, account_source = resolve_sync_account(
+                        session_email=session_account,
+                        credential_label=credential_label,
+                        configured=config.account,
+                    )
+                    if account_source == "session":
+                        context.log.info("Claude Desktop syncing as %s (verified)", sync_account)
+                    else:
+                        # Couldn't confirm the account against the live session, so
+                        # we're tagging under a fallback label that may be wrong -
+                        # the exact failure mode that silently synced a near-empty
+                        # account. Loud, but only when verification actually fails.
+                        context.log.warning(
+                            "Could not verify the Claude Desktop account from the live session; "
+                            "tagging conversations under the unverified %s label %r. If synced "
+                            "conversations look wrong, confirm the desktop app is signed into the "
+                            "intended account and re-push with `pdw ingest claude-desktop`.",
+                            account_source,
+                            sync_account or "unknown",
+                        )
                     runner = ClaudeDesktopUploadRunner(
-                        account=config.account,
+                        account=sync_account,
                         device=config.device,
                         client=client,
                         batch_uploader=lambda encoded, exported_at: ingest_client_from_env().upload_agent_sessions_batch(
                             encoded, exported_at=exported_at.astimezone(UTC).isoformat()
                         ),
                         logger=context.log,
-                        upload_state=WarehouseSyncState(warehouse=warehouse, account=config.account),
+                        upload_state=WarehouseSyncState(warehouse=warehouse, account=sync_account),
                     )
                     summary = runner.sync()
             finally:
@@ -117,6 +154,8 @@ def claude_desktop_client(context) -> MaterializeResult:
     metadata["rate_limited"] = MetadataValue.bool(
         bool(getattr(summary, "rate_limited", False)) if summary else False
     )
+    metadata["account"] = MetadataValue.text(sync_account or "unknown")
+    metadata["account_source"] = MetadataValue.text(account_source)
     return MaterializeResult(metadata=metadata)
 
 

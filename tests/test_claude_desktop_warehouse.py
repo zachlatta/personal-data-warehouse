@@ -163,6 +163,32 @@ def test_read_credential_after_manual_insert(warehouse) -> None:
     assert cred["org_id"] == "org-1"
 
 
+def test_read_latest_credential_ignores_account_and_picks_newest(warehouse) -> None:
+    warehouse.ensure_claude_desktop_tables()
+    assert warehouse.read_latest_claude_desktop_credential() is None
+    # An older credential under one label, then a newer one under another label:
+    # the poller resolves the real account from the session, so it just wants the
+    # most recently pushed credential regardless of label.
+    warehouse._command(
+        """
+        INSERT INTO claude_desktop_credentials (account, session_key, org_id, captured_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        ("stale@example.com", "sk-old", "org-old", INGESTED, datetime(2026, 6, 22, 18, tzinfo=UTC)),
+    )
+    warehouse._command(
+        """
+        INSERT INTO claude_desktop_credentials (account, session_key, org_id, captured_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        ("fresh@example.com", "sk-new", "org-new", INGESTED, datetime(2026, 6, 24, 20, tzinfo=UTC)),
+    )
+    latest = warehouse.read_latest_claude_desktop_credential()
+    assert latest is not None
+    assert latest["session_key"] == "sk-new"
+    assert latest["org_id"] == "org-new"
+
+
 def test_claude_desktop_persists_end_to_end(warehouse) -> None:
     def _envelope(seq, line):
         return {

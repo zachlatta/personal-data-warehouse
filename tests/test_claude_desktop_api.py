@@ -6,6 +6,7 @@ from personal_data_warehouse_claude_desktop.api import (
     ClaudeAiApiError,
     ClaudeAiClient,
     ClaudeAiRateLimitError,
+    resolve_sync_account,
 )
 
 
@@ -115,3 +116,50 @@ def test_rate_limit_without_retry_after_header() -> None:
     with pytest.raises(ClaudeAiRateLimitError) as exc:
         client.get_conversation("c1")
     assert exc.value.retry_after_seconds is None
+
+
+def test_account_email_returns_verified_email() -> None:
+    session = FakeSession([FakeResponse(200, {"account": {"email_address": "verified@example.com"}})])
+    client = _client(session)
+    assert client.account_email() == "verified@example.com"
+    url, _ = session.calls[0]
+    assert url.endswith("/api/account")
+
+
+def test_account_email_reads_top_level_email() -> None:
+    # Some shapes return the email at the top level rather than nested under "account".
+    session = FakeSession([FakeResponse(200, {"email": "verified@example.com"})])
+    client = _client(session)
+    assert client.account_email() == "verified@example.com"
+
+
+def test_account_email_returns_empty_when_absent() -> None:
+    session = FakeSession([FakeResponse(200, {"account": {}})])
+    client = _client(session)
+    assert client.account_email() == ""
+
+
+def test_resolve_sync_account_prefers_live_session() -> None:
+    account, source = resolve_sync_account(
+        session_email="verified@example.com",
+        credential_label="labelled@example.com",
+        configured="labelled@example.com",
+    )
+    assert account == "verified@example.com"
+    assert source == "session"
+
+
+def test_resolve_sync_account_falls_back_to_credential_then_config() -> None:
+    account, source = resolve_sync_account(
+        session_email="  ", credential_label="labelled@example.com", configured="env@example.com"
+    )
+    assert (account, source) == ("labelled@example.com", "credential")
+
+    account, source = resolve_sync_account(
+        session_email="", credential_label="", configured="env@example.com"
+    )
+    assert (account, source) == ("env@example.com", "config")
+
+
+def test_resolve_sync_account_empty_when_nothing_known() -> None:
+    assert resolve_sync_account(session_email="", credential_label="", configured="") == ("", "none")

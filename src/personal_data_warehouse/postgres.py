@@ -1215,6 +1215,27 @@ class PostgresWarehouse:
         )
         return rows[0] if rows else None
 
+    def read_latest_claude_desktop_credential(self) -> dict[str, Any] | None:
+        """Return the most recently pushed credential, regardless of its account label.
+
+        The serverside poller resolves the *real* account from the live session
+        (see ``ClaudeAiClient.account_email``), so it does not need to know the
+        account up front - it reads whichever credential the clientside pusher
+        last wrote. This keeps the account out of serverside env entirely (the
+        stored label is only a fallback). Single Claude Desktop login in practice,
+        so "latest" is unambiguous.
+        """
+        self.ensure_claude_desktop_tables()
+        rows = self._query_dicts(
+            """
+            SELECT account, session_key, org_id, expires_at, captured_at, updated_at
+            FROM claude_desktop_credentials
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        )
+        return rows[0] if rows else None
+
     def claude_desktop_cursor(self, *, account: str, conversation_id: str) -> str:
         rows = self._query(
             """

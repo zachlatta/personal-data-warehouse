@@ -149,6 +149,24 @@ class ClaudeAiClient:
                 return
             offset += len(page)
 
+    def account_email(self) -> str:
+        """Return the verified email of the account this session belongs to.
+
+        Used to detect a credential that was captured from the *wrong* claude.ai
+        login (the failure mode that silently synced a near-empty account): the
+        ``sessionKey`` authenticates whatever account the desktop app was logged
+        into, which need not be the account label the credential is keyed by.
+        Best-effort - the caller treats an empty string as "could not verify".
+        """
+        data = self._get("/api/account", referer=f"{self._base_url}/")
+        if not isinstance(data, dict):
+            return ""
+        account = data.get("account")
+        if not isinstance(account, dict):
+            account = data
+        email = account.get("email_address") or account.get("email") or ""
+        return str(email).strip()
+
     def get_conversation(self, conversation_id: str) -> dict[str, Any]:
         """Fetch a conversation's full message tree."""
         conversation = self._get(
@@ -163,6 +181,25 @@ class ClaudeAiClient:
         if not isinstance(conversation, dict):
             raise ClaudeAiApiError(f"unexpected conversation payload for {conversation_id}")
         return conversation
+
+
+def resolve_sync_account(*, session_email: str, credential_label: str, configured: str) -> tuple[str, str]:
+    """Pick the account to sync and tag events under, and report where it came from.
+
+    Precedence: the live session's verified email (authoritative - it is the
+    account the ``sessionKey`` actually belongs to) > the stored credential's
+    label > the env-configured fallback. Returns ``(account, source)`` with
+    ``source`` one of ``"session"``, ``"credential"``, ``"config"`` or ``"none"``.
+    """
+    for value, source in (
+        (session_email, "session"),
+        (credential_label, "credential"),
+        (configured, "config"),
+    ):
+        cleaned = (value or "").strip()
+        if cleaned:
+            return cleaned, source
+    return "", "none"
 
 
 def _retry_after_seconds(response: Any) -> float | None:
