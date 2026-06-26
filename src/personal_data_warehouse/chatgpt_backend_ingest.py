@@ -34,6 +34,44 @@ class ChatGPTBackendIngestSummary:
     events_written: int
     reached_run_limit: bool
     rate_limited: bool = False
+    stopped_at_high_water: bool = False
+
+
+def chatgpt_poll_stall_reason(
+    summary: ChatGPTBackendIngestSummary, *, max_conversations_per_run: int
+) -> str | None:
+    """Return an actionable message when a steady-state poll is pathologically stalled.
+
+    With the high-water early stop, a healthy steady-state poll lists a single page
+    and stops at the high-water mark, so it is essentially never rate limited. The
+    dangerous state - the one behind the multi-day "saw N, fetched 0, wrote 0 (rate
+    limited)" freeze - is a poll that gets throttled, writes nothing, and never even
+    reaches the high-water mark to confirm it is caught up. In the run status that is
+    indistinguishable from a healthy idle poll (both write nothing), so a persistent
+    throttle silently ingests nothing while the asset reports success.
+
+    Surface it as a loud failure, but only for that exact pathological shape: rate
+    limited, zero conversations fetched, and not caught up. A poll that made any
+    progress (fetched >= 1) or confirmed it was caught up is healthy and self-heals on
+    the next tick. An explicit historical backfill (``max_conversations_per_run > 0``)
+    deliberately pages down past synced conversations and is expected to trip the rate
+    limiter, so it is never treated as a stall.
+    """
+    if max_conversations_per_run > 0:
+        return None
+    if (
+        summary.rate_limited
+        and summary.conversations_fetched == 0
+        and not summary.stopped_at_high_water
+    ):
+        return (
+            "ChatGPT backend poll was rate limited, fetched 0 conversations, and never "
+            "reached the high-water mark to confirm it is caught up - it is ingesting "
+            "nothing. The account or IP is likely throttled. If this persists, re-run "
+            "`pdw chatgpt publish-session` to refresh the session and check for a "
+            "deep-history re-walk regression in the poller."
+        )
+    return None
 
 
 class ChatGPTBackendIngestRunner:
@@ -159,6 +197,7 @@ class ChatGPTBackendIngestRunner:
             events_written=events_written,
             reached_run_limit=reached_limit,
             rate_limited=rate_limited,
+            stopped_at_high_water=stopped_at_high_water,
         )
 
 

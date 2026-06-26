@@ -9,7 +9,11 @@ from personal_data_warehouse.chatgpt_backend import (
     ChatGPTRateLimitError,
     ConversationRef,
 )
-from personal_data_warehouse.chatgpt_backend_ingest import ChatGPTBackendIngestRunner
+from personal_data_warehouse.chatgpt_backend_ingest import (
+    ChatGPTBackendIngestRunner,
+    ChatGPTBackendIngestSummary,
+    chatgpt_poll_stall_reason,
+)
 
 INGESTED_AT = datetime(2026, 6, 22, 18, tzinfo=UTC)
 
@@ -148,6 +152,9 @@ def test_stops_paging_once_caught_up_to_high_water():
     assert summary.conversations_fetched == 0
     assert summary.events_written == 0
     assert summary.rate_limited is False
+    assert summary.stopped_at_high_water is True
+    # Caught up and idle is healthy, not a stall.
+    assert chatgpt_poll_stall_reason(summary, max_conversations_per_run=0) is None
 
 
 def test_fetches_new_top_conversations_then_stops_at_high_water():
@@ -238,3 +245,50 @@ def test_auth_error_propagates_for_loud_failure():
     client = FakeClient(refs, {"c1": _convo("c1")}, fail_on="c1")
     with pytest.raises(ChatGPTAuthError):
         runner(wh, client).sync()
+
+
+def test_rate_limited_listing_with_no_progress_is_a_stall():
+    # Throttled before reaching the high-water mark and wrote nothing: this is the
+    # silent-freeze shape, so the run must surface it loudly rather than report success.
+    wh = FakeWarehouse(sync_map={"c1": 100.0})
+    client = FakeClient([], {}, rate_limit_listing=True)
+    summary = runner(wh, client).sync()
+
+    assert summary.rate_limited is True
+    assert summary.conversations_fetched == 0
+    assert summary.stopped_at_high_water is False
+    reason = chatgpt_poll_stall_reason(summary, max_conversations_per_run=0)
+    assert reason is not None
+    assert "rate limited" in reason
+    assert "publish-session" in reason
+
+
+def _summary(**kwargs) -> ChatGPTBackendIngestSummary:
+    base = dict(
+        conversations_seen=0,
+        conversations_fetched=0,
+        events_written=0,
+        reached_run_limit=False,
+        rate_limited=False,
+        stopped_at_high_water=False,
+    )
+    base.update(kwargs)
+    return ChatGPTBackendIngestSummary(**base)
+
+
+def test_stall_reason_silent_when_progress_made():
+    # Fetched at least one conversation before being throttled: self-heals next tick.
+    summary = _summary(conversations_fetched=1, rate_limited=True)
+    assert chatgpt_poll_stall_reason(summary, max_conversations_per_run=0) is None
+
+
+def test_stall_reason_silent_when_not_rate_limited():
+    summary = _summary(conversations_seen=3, rate_limited=False)
+    assert chatgpt_poll_stall_reason(summary, max_conversations_per_run=0) is None
+
+
+def test_stall_reason_silent_during_backfill():
+    # A historical backfill deliberately pages past synced conversations and is
+    # expected to hit the rate limiter; never treat that as a stall.
+    summary = _summary(conversations_seen=140, rate_limited=True)
+    assert chatgpt_poll_stall_reason(summary, max_conversations_per_run=50) is None

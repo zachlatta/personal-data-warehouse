@@ -35,7 +35,10 @@ from personal_data_warehouse.chatgpt_backend import (
     ChatGPTAuthError,
     ChatGPTBackendClient,
 )
-from personal_data_warehouse.chatgpt_backend_ingest import ChatGPTBackendIngestRunner
+from personal_data_warehouse.chatgpt_backend_ingest import (
+    ChatGPTBackendIngestRunner,
+    chatgpt_poll_stall_reason,
+)
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
@@ -101,6 +104,17 @@ def chatgpt_backend_ingest(context) -> MaterializeResult:
         finally:
             warehouse.close()
 
+    # A poll that is rate limited, writes nothing, and never confirms it is caught up
+    # looks identical to a healthy idle poll in the run status, so a persistent throttle
+    # silently ingests nothing while reporting success (the multi-day 06-20 freeze). Fail
+    # loudly on that exact shape so it surfaces in run monitoring; a poll that made
+    # progress or confirmed it was caught up stays green and self-heals on the next tick.
+    stall_reason = chatgpt_poll_stall_reason(
+        summary, max_conversations_per_run=config.max_conversations_per_run
+    )
+    if stall_reason is not None:
+        raise RuntimeError(stall_reason)
+
     return MaterializeResult(
         metadata={
             "conversations_seen": MetadataValue.int(summary.conversations_seen),
@@ -108,6 +122,7 @@ def chatgpt_backend_ingest(context) -> MaterializeResult:
             "events_written": MetadataValue.int(summary.events_written),
             "reached_run_limit": MetadataValue.bool(summary.reached_run_limit),
             "rate_limited": MetadataValue.bool(summary.rate_limited),
+            "stopped_at_high_water": MetadataValue.bool(summary.stopped_at_high_water),
         }
     )
 
