@@ -132,9 +132,13 @@ If the run log shows `PermissionError: [Errno 1] Operation not permitted` for
 `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings`, the LaunchAgent is
 loaded correctly but macOS Full Disk Access is blocking the background process. Grant Full Disk
 Access to the executable chain used by the job, especially `/bin/zsh`, the `pdw` binary (`~/.local/bin/pdw`), `/opt/homebrew/bin/uv`, and
-`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. Its current real path is
-`/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`. Then
-kickstart the LaunchAgent again.
+`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. The python lives under a
+versioned uv directory, so its real path **drifts on every uv python patch bump** (e.g.
+`cpython-3.12.12-…` → `cpython-3.12.13-…`), silently breaking the previously-granted FDA. Don't
+hardcode it — derive the current target with
+`uv run python -c 'import sys,os;print(os.path.realpath(sys.executable))'`, grant FDA to that, then
+kickstart the LaunchAgent again. Because the path changes under you, re-check it whenever an
+uploader starts failing with a permission error after working fine before.
 
 ## Local Apple Notes Upload Scheduler
 
@@ -173,9 +177,13 @@ If the run log shows `PermissionError` or SQLite `authorization denied` for
 `~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`, the LaunchAgent is loaded
 correctly but macOS Full Disk Access is blocking the background process. Grant Full Disk Access to
 the executable chain used by the job, especially `/bin/zsh`, the `pdw` binary (`~/.local/bin/pdw`), `/opt/homebrew/bin/uv`, and
-`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. Its current real path is
-`/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`. Then
-kickstart the LaunchAgent again.
+`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. The python lives under a
+versioned uv directory, so its real path **drifts on every uv python patch bump** (e.g.
+`cpython-3.12.12-…` → `cpython-3.12.13-…`), silently breaking the previously-granted FDA. Don't
+hardcode it — derive the current target with
+`uv run python -c 'import sys,os;print(os.path.realpath(sys.executable))'`, grant FDA to that, then
+kickstart the LaunchAgent again. Because the path changes under you, re-check it whenever an
+uploader starts failing with a permission error after working fine before.
 
 ## Local Apple Messages Upload Scheduler
 
@@ -214,9 +222,13 @@ If the run log shows `PermissionError` or SQLite `authorization denied` for
 `~/Library/Messages/chat.db`, the LaunchAgent is loaded correctly but macOS Full Disk Access is
 blocking the background process. Grant Full Disk Access to the executable chain used by the job,
 especially `/bin/zsh`, the `pdw` binary (`~/.local/bin/pdw`), `/opt/homebrew/bin/uv`, and
-`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. Its current real path is
-`/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`. Then
-kickstart the LaunchAgent again.
+`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. The python lives under a
+versioned uv directory, so its real path **drifts on every uv python patch bump** (e.g.
+`cpython-3.12.12-…` → `cpython-3.12.13-…`), silently breaking the previously-granted FDA. Don't
+hardcode it — derive the current target with
+`uv run python -c 'import sys,os;print(os.path.realpath(sys.executable))'`, grant FDA to that, then
+kickstart the LaunchAgent again. Because the path changes under you, re-check it whenever an
+uploader starts failing with a permission error after working fine before.
 
 Apple Messages SQL starting points are `apple_messages`, `apple_message_chats`,
 `apple_message_handles`, `apple_message_chat_handles`, `apple_message_chat_messages`, and

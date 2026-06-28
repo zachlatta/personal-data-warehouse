@@ -16,12 +16,8 @@ echo "Service (last run):"
 systemctl --user status "$UNIT.service" --no-pager 2>/dev/null | sed -n '1,12p' || echo "  (service not loaded)"
 
 echo
-echo "Heartbeat:"
-if [ -f "$HEARTBEAT_FILE" ]; then
-  cat "$HEARTBEAT_FILE"
-else
-  echo "missing"
-fi
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_pdw-upload-lib.sh"
+pdw_print_health "$HEARTBEAT_FILE"
 
 echo
 echo "Recent run log:"

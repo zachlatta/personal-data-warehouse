@@ -43,7 +43,8 @@ finished_at_epoch="$(date +%s)"
 finished_at_iso="$(date -Iseconds)"
 duration_seconds="$((finished_at_epoch - started_at_epoch))"
 
-printf "%s\n" "$finished_at_iso" > "$HEARTBEAT_FILE"
+. "$SCRIPT_DIR/_pdw-upload-lib.sh"
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
 echo "[$finished_at_iso] finished agent sessions upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
 
 exit "$exit_code"

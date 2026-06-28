@@ -10,12 +10,8 @@ echo "LaunchAgent:"
 launchctl print "gui/$(id -u)/$LABEL" | sed -n '1,45p'
 
 echo
-echo "Heartbeat:"
-if [[ -f "$HEARTBEAT_FILE" ]]; then
-  cat "$HEARTBEAT_FILE"
-else
-  echo "missing"
-fi
+. "$(cd "$(dirname "$0")" && pwd)/_pdw-upload-lib.sh"
+pdw_print_health "$HEARTBEAT_FILE"
 
 echo
 echo "Recent run log:"

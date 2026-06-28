@@ -33,7 +33,8 @@ else
 fi
 
 finished_at_iso="$(date -Iseconds)"
-printf "%s\n" "$finished_at_iso" > "$HEARTBEAT_FILE"
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
 echo "[$finished_at_iso] finished claude desktop auth push exit_code=$exit_code" >> "$LOG_FILE"
 
 exit "$exit_code"
