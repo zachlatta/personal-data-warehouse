@@ -58,10 +58,20 @@ class VoiceMemosUploadRunner:
         upload_state: VoiceMemosUploadState | None = None,
         min_file_age_seconds: int = 0,
         before_upload_check: Callable[[], str | None] | None = None,
+        max_upload_bytes: int | None = None,
     ) -> None:
         # Uploads go through the app's ingest endpoints only.
         if ingest_client is None:
             raise ValueError("ingest_client is required")
+        # Recordings larger than what the chosen upload route can deliver (the
+        # app's cap, or Cloudflare's 100 MiB edge limit on the public host) are
+        # deferred rather than retried forever: a single oversized memo would
+        # otherwise 413 on every run and, because the failure re-raises, wedge
+        # the whole sync so newer memos never upload. Default to the client's
+        # advertised ceiling so the limit tracks the route actually in use.
+        if max_upload_bytes is None:
+            max_upload_bytes = getattr(ingest_client, "effective_max_upload_bytes", None)
+        self._max_upload_bytes = max_upload_bytes if (max_upload_bytes and max_upload_bytes > 0) else None
         self._account = account
         self._recordings_path = Path(recordings_path).expanduser()
         self._extensions = extensions
@@ -184,11 +194,21 @@ class VoiceMemosUploadRunner:
         state_skipped = 0
         age_deferred = 0
         partial_deferred = 0
+        oversize_deferred = 0
         now = self._now()
 
         for candidate in candidates:
             if self._min_file_age_seconds and (now - candidate.file_modified_at).total_seconds() < self._min_file_age_seconds:
                 age_deferred += 1
+                continue
+            if self._max_upload_bytes is not None and candidate.size_bytes > self._max_upload_bytes:
+                oversize_deferred += 1
+                self._logger.warning(
+                    "Deferring %s (%s): exceeds the %s upload ceiling for the current route",
+                    candidate.filename,
+                    format_bytes(candidate.size_bytes),
+                    format_bytes(self._max_upload_bytes),
+                )
                 continue
             if voice_memo_candidate_is_partially_materialized(candidate):
                 partial_deferred += 1
@@ -209,7 +229,7 @@ class VoiceMemosUploadRunner:
             "Incremental selection: selected=%s skipped=%s deferred=%s",
             len(selected),
             state_skipped,
-            age_deferred + partial_deferred,
+            age_deferred + partial_deferred + oversize_deferred,
         )
         if not selected:
             return VoiceMemosUploadSummary(
@@ -221,7 +241,7 @@ class VoiceMemosUploadRunner:
                 bytes_uploaded=0,
                 bytes_skipped=sum(candidate.size_bytes for candidate in candidates if self._is_state_complete(candidate)),
                 recordings_selected=0,
-                recordings_deferred=age_deferred + partial_deferred,
+                recordings_deferred=age_deferred + partial_deferred + oversize_deferred,
             )
 
         if self._before_upload_check is not None:
@@ -237,7 +257,7 @@ class VoiceMemosUploadRunner:
                     bytes_uploaded=0,
                     bytes_skipped=sum(candidate.size_bytes for candidate in candidates if self._is_state_complete(candidate)),
                     recordings_selected=len(selected),
-                    recordings_deferred=len(selected) + age_deferred + partial_deferred,
+                    recordings_deferred=len(selected) + age_deferred + partial_deferred + oversize_deferred,
                 )
 
         self._logger.info("Uploading with %s worker(s)", self._workers)
@@ -277,7 +297,7 @@ class VoiceMemosUploadRunner:
             bytes_uploaded=bytes_uploaded,
             bytes_skipped=bytes_skipped,
             recordings_selected=len(selected),
-            recordings_deferred=age_deferred + partial_deferred,
+            recordings_deferred=age_deferred + partial_deferred + oversize_deferred,
         )
         self._logger.info(
             "Voice Memos upload summary: seen=%s (%s), selected=%s, uploaded=%s (%s), skipped=%s (%s), deferred=%s, metadata=%s",

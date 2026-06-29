@@ -18,12 +18,15 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
+import shutil
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import requests
 
@@ -32,6 +35,18 @@ OBJECT_UPLOAD_KIND = "object-upload"
 
 DEFAULT_LINK_TTL_SECONDS = 900
 DEFAULT_TIMEOUT_SECONDS = 120.0
+
+# The app accepts bodies up to PDW_INGEST_MAX_OBJECT_BYTES (Go default 512 MiB).
+# Mirror that default so size-aware clients (e.g. voice memos) can defer a file
+# that the app would only 413 anyway instead of wedging the whole run on it.
+DEFAULT_INGEST_MAX_OBJECT_BYTES = 512 * 1024 * 1024
+# Cloudflare (which fronts the public app hostname) hard-caps request bodies at
+# 100 MiB on non-Enterprise plans, so an upload that goes through the public URL
+# is really limited to this regardless of the app's own cap. The Tailscale-direct
+# origin reaches the app behind Cloudflare and lifts the body to the app cap.
+CLOUDFLARE_MAX_BODY_BYTES = 100 * 1024 * 1024
+
+_logger = logging.getLogger(__name__)
 
 StoredObjectDict = dict[str, str]
 
@@ -60,18 +75,42 @@ class IngestClient:
         link_ttl_seconds: int = DEFAULT_LINK_TTL_SECONDS,
         session: requests.Session | None = None,
         now: Callable[[], float] = time.time,
+        upload_base_url: str | None = None,
+        max_object_bytes: int = DEFAULT_INGEST_MAX_OBJECT_BYTES,
     ) -> None:
         if not base_url:
             raise ValueError("base_url is required")
         if not signing_key:
             raise ValueError("signing_key is required")
         self._base_url = base_url.rstrip("/")
+        # Uploads may be routed to a different origin (e.g. the app reached
+        # directly over Tailscale, bypassing Cloudflare's body-size cap) while
+        # still authenticating as the public host. The HMAC signature covers
+        # only the endpoint path + body sha + expiry, never the host, so the
+        # app verifies an upload identically no matter which origin served it.
+        self._upload_base_url = (upload_base_url or base_url).rstrip("/")
+        self._host_header = urlsplit(self._base_url).netloc if upload_base_url else None
+        self._max_object_bytes = max_object_bytes
         self._signing_key = signing_key
         self._timeout = timeout
         self._link_ttl_seconds = link_ttl_seconds
         self._session = session
         self._thread_local = threading.local()
         self._now = now
+
+    @property
+    def effective_max_upload_bytes(self) -> int:
+        """Largest body this client can actually deliver on its chosen route.
+
+        When uploads go straight to the app (Tailscale-direct), the ceiling is
+        the app's own cap. When they traverse the public host, Cloudflare's
+        100 MiB body limit applies first, so callers that can defer oversized
+        items (e.g. voice memos) should honor the smaller of the two.
+        """
+
+        if self._host_header is not None:
+            return self._max_object_bytes
+        return min(self._max_object_bytes, CLOUDFLARE_MAX_BODY_BYTES)
 
     def _session_for_thread(self) -> requests.Session:
         if self._session is not None:
@@ -109,11 +148,16 @@ class IngestClient:
         query["content_sha256"] = content_sha256
         query["exp"] = str(exp_unix)
         query["sig"] = signature
-        url = f"{self._base_url}{endpoint}?{urlencode(query)}"
+        url = f"{self._upload_base_url}{endpoint}?{urlencode(query)}"
+        headers = {"Content-Type": content_type}
+        if self._host_header is not None:
+            # Route to the direct origin but keep the public Host so Traefik
+            # still maps the request to the app's router.
+            headers["Host"] = self._host_header
         response = self._session_for_thread().post(
             url,
             data=body,
-            headers={"Content-Type": content_type},
+            headers=headers,
             timeout=self._timeout,
         )
         response.raise_for_status()
@@ -346,10 +390,102 @@ def ingest_upload_config_problem() -> str | None:
     return None
 
 
+def _tailscale_binary() -> str | None:
+    """Locate the ``tailscale`` CLI (env override, common installs, then PATH)."""
+
+    override = (os.getenv("PDW_TAILSCALE_BIN") or "").strip()
+    if override:
+        return override if os.path.isfile(override) else None
+    for candidate in (
+        "/opt/homebrew/bin/tailscale",
+        "/usr/local/bin/tailscale",
+        "/usr/bin/tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return shutil.which("tailscale")
+
+
+def _tailscale_ipv4(host: str, *, runner: Callable[[list[str]], str] | None = None) -> str | None:
+    """Return ``host``'s tailnet IPv4 via ``tailscale ip -4 <host>``, or None."""
+
+    binary = _tailscale_binary()
+    if not binary:
+        return None
+    run = runner or (
+        lambda argv: subprocess.run(
+            argv, capture_output=True, text=True, timeout=5, check=True
+        ).stdout
+    )
+    try:
+        out = run([binary, "ip", "-4", host])
+    except Exception:  # noqa: BLE001 - any failure just means "no direct route"
+        return None
+    for line in out.splitlines():
+        ip = line.strip()
+        if ip.count(".") == 3 and all(part.isdigit() for part in ip.split(".")):
+            return ip
+    return None
+
+
+def _probe_direct_origin(direct_url: str, host_header: str, *, timeout: float = 3.0) -> bool:
+    """True when ``direct_url`` answers ``/healthz`` as the app for ``host_header``."""
+
+    try:
+        resp = requests.get(
+            f"{direct_url.rstrip('/')}/healthz",
+            headers={"Host": host_header},
+            timeout=timeout,
+        )
+    except requests.RequestException:
+        return False
+    return resp.status_code < 400
+
+
+def resolve_direct_ingest_origin(
+    base_url: str,
+    *,
+    explicit_direct_url: str | None,
+    tailscale_host: str | None,
+    ipv4_resolver: Callable[[str], str | None] = _tailscale_ipv4,
+    probe: Callable[[str, str], bool] = _probe_direct_origin,
+    logger: logging.Logger = _logger,
+) -> str | None:
+    """Pick a same-app origin reachable off the public (Cloudflare) path, if any.
+
+    Prefers an explicit ``PDW_INGEST_DIRECT_URL``; otherwise, when
+    ``PDW_INGEST_TAILSCALE_HOST`` names a tailnet node, resolves that node's
+    current tailnet IPv4 and targets it over plain HTTP (Tailscale is the
+    transport encryption). The candidate is only used when it actually answers
+    ``/healthz`` as the app, so an off-tailnet host transparently falls back to
+    the public URL. Returns the direct base URL or None.
+    """
+
+    host_header = urlsplit(base_url).netloc
+    candidate = (explicit_direct_url or "").strip()
+    if not candidate and tailscale_host:
+        ip = ipv4_resolver(tailscale_host)
+        if ip:
+            candidate = f"http://{ip}"
+    if not candidate:
+        return None
+    if not probe(candidate, host_header):
+        logger.info("Tailscale-direct ingest origin %s not reachable; using %s", candidate, base_url)
+        return None
+    logger.info(
+        "Preferring Tailscale-direct ingest origin %s for %s (bypasses the Cloudflare body-size cap)",
+        candidate,
+        host_header,
+    )
+    return candidate
+
+
 def ingest_client_from_env(
     *,
     now: Callable[[], float] = time.time,
     session: requests.Session | None = None,
+    resolve_direct: Callable[..., str | None] = resolve_direct_ingest_origin,
 ) -> IngestClient:
     """Build an IngestClient from the shared app env.
 
@@ -359,6 +495,12 @@ def ingest_client_from_env(
     alias. The signing key is the app secret token (``PDW_SECRET_TOKEN``), also
     accepted as ``MCP_SECRET_TOKEN``. Folder ids and the Drive credential are
     deliberately NOT read here; those live only in the app.
+
+    Large uploads (voice memos, attachments, media) can exceed Cloudflare's
+    100 MiB body cap on the public host. When ``PDW_INGEST_TAILSCALE_HOST`` (a
+    tailnet node name, e.g. ``rotom``) or ``PDW_INGEST_DIRECT_URL`` is set and
+    actually reachable, uploads are sent straight to that origin instead, which
+    lifts the ceiling to the app's own ``PDW_INGEST_MAX_OBJECT_BYTES`` cap.
     """
 
     problem = ingest_upload_config_problem()
@@ -374,4 +516,28 @@ def ingest_client_from_env(
         or os.getenv("MCP_SECRET_TOKEN")
         or ""
     ).strip()
-    return IngestClient(base_url=base_url, signing_key=secret.encode("utf-8"), now=now, session=session)
+    max_object_bytes = _positive_int_env("PDW_INGEST_MAX_OBJECT_BYTES", DEFAULT_INGEST_MAX_OBJECT_BYTES)
+    upload_base_url = resolve_direct(
+        base_url,
+        explicit_direct_url=(os.getenv("PDW_INGEST_DIRECT_URL") or "").strip() or None,
+        tailscale_host=(os.getenv("PDW_INGEST_TAILSCALE_HOST") or "").strip() or None,
+    )
+    return IngestClient(
+        base_url=base_url,
+        signing_key=secret.encode("utf-8"),
+        now=now,
+        session=session,
+        upload_base_url=upload_base_url,
+        max_object_bytes=max_object_bytes,
+    )
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default

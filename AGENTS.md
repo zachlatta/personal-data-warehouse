@@ -312,6 +312,30 @@ content sha. `<SOURCE>_STORAGE_BACKEND` / `<SOURCE>_GOOGLE_DRIVE_FOLDER_ID` now 
 Dagster reader's Drive access (the reader still reads Drive directly); they no longer affect how
 clients write.
 
+### Large uploads and the Cloudflare 100 MiB cap
+
+The public app hostnames are fronted by **Cloudflare**, which hard-caps request bodies at **100
+MiB** on non-Enterprise plans (it answers `413 Payload Too Large` before the request reaches the
+app, whose own cap is `PDW_INGEST_MAX_OBJECT_BYTES`, default 512 MiB). Voice memos in particular
+routinely exceed 100 MiB, so a client posting to the Cloudflare URL silently fails on big files —
+and because a per-file failure used to re-raise, a single oversized memo wedged the whole run.
+
+The upload client (`ingest_client.py`, shared by every uploader) handles this two ways:
+
+- **Prefer a Tailscale-direct origin.** When `PDW_INGEST_TAILSCALE_HOST` names a tailnet node
+  (e.g. `rotom`, the Coolify host) — or `PDW_INGEST_DIRECT_URL` gives an explicit base — the client
+  resolves that node's current tailnet IPv4 via the `tailscale` CLI and, if it answers `/healthz`
+  as the app, sends uploads straight there over plain HTTP (Tailscale/WireGuard is the transport
+  encryption) with the public `Host:` header so Traefik still routes to the app. That bypasses
+  Cloudflare entirely and lifts the ceiling to the app's 512 MiB cap. Off-tailnet (probe fails) it
+  transparently falls back to the public `PDW_API_URL`. These are set in the gitignored repo `.env`
+  on the tailnet machines, so the committed repo stays generic. `PDW_TAILSCALE_BIN` overrides the
+  CLI path.
+- **Defer what the route still can't carry.** `IngestClient.effective_max_upload_bytes` reports the
+  real ceiling for the chosen route (512 MiB direct, else min(app cap, 100 MiB)). The voice-memos
+  runner defers any recording above it (like its partial/age deferrals) instead of 413-ing and
+  wedging — so e.g. a lone 588 MiB memo is skipped while every other memo uploads.
+
 Agent sessions SQL starting points are the `agent_session_events` table (one row per transcript
 line; `source` is `claude_code`, `codex`, `openclaw`, or `claude_desktop` (see the Claude Desktop
 section below), `device` tags the machine) and the
