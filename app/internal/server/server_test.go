@@ -446,54 +446,6 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 			Columns: []string{"name", "type"},
 			Rows:    []map[string]any{{"name": "transcript", "type": "text"}, {"name": "summary", "type": "text"}},
 		},
-		"SELECT substring(\"thread_id\"::text from 1 for 15) AS \"thread_id\", char_length(\"thread_id\"::text) AS \"__pdw_preview_len_0\", substring(\"latest_subject\"::text from 1 for 15) AS \"latest_subject\", char_length(\"latest_subject\"::text) AS \"__pdw_preview_len_1\" FROM \"clean_gmail_inbox\" LIMIT 3": {
-			Columns: []string{"thread_id", "__pdw_preview_len_0", "latest_subject", "__pdw_preview_len_1"},
-			Rows:    []map[string]any{{"thread_id": "thread-1", "__pdw_preview_len_0": 8, "latest_subject": "hello inbox", "__pdw_preview_len_1": 11}},
-		},
-		"SELECT substring(\"subject\"::text from 1 for 15) AS \"subject\", char_length(\"subject\"::text) AS \"__pdw_preview_len_0\" FROM \"gmail_messages\" LIMIT 3": {
-			Columns: []string{"subject", "__pdw_preview_len_0"},
-			Rows:    []map[string]any{{"subject": "hello", "__pdw_preview_len_0": 5}},
-		},
-		"SELECT substring(\"transcript\"::text from 1 for 15) AS \"transcript\", char_length(\"transcript\"::text) AS \"__pdw_preview_len_0\", substring(\"summary\"::text from 1 for 15) AS \"summary\", char_length(\"summary\"::text) AS \"__pdw_preview_len_1\" FROM \"apple_voice_memos_enrichments\" LIMIT 3": {
-			Columns: []string{"transcript", "__pdw_preview_len_0", "summary", "__pdw_preview_len_1"},
-			Rows:    []map[string]any{{"transcript": "meeting words", "__pdw_preview_len_0": 13, "summary": "recap", "__pdw_preview_len_1": 5}},
-		},
-		"SELECT substring(\"message_id\"::text from 1 for 15) AS \"message_id\", char_length(\"message_id\"::text) AS \"__pdw_preview_len_0\", substring(\"message_at\"::text from 1 for 15) AS \"message_at\", char_length(\"message_at\"::text) AS \"__pdw_preview_len_1\", substring(\"service\"::text from 1 for 15) AS \"service\", char_length(\"service\"::text) AS \"__pdw_preview_len_2\", substring(\"handle_id\"::text from 1 for 15) AS \"handle_id\", char_length(\"handle_id\"::text) AS \"__pdw_preview_len_3\", substring(\"body_text\"::text from 1 for 15) AS \"body_text\", char_length(\"body_text\"::text) AS \"__pdw_preview_len_4\", substring(\"is_from_me\"::text from 1 for 15) AS \"is_from_me\", char_length(\"is_from_me\"::text) AS \"__pdw_preview_len_5\", substring(\"is_deleted\"::text from 1 for 15) AS \"is_deleted\", char_length(\"is_deleted\"::text) AS \"__pdw_preview_len_6\" FROM \"apple_messages\" LIMIT 3": {
-			Columns: []string{"message_id", "__pdw_preview_len_0", "message_at", "__pdw_preview_len_1", "service", "__pdw_preview_len_2", "handle_id", "__pdw_preview_len_3", "body_text", "__pdw_preview_len_4", "is_from_me", "__pdw_preview_len_5", "is_deleted", "__pdw_preview_len_6"},
-			Rows: []map[string]any{{
-				"message_id":          "message-1",
-				"__pdw_preview_len_0": 9,
-				"message_at":          "2026-05-21T12",
-				"__pdw_preview_len_1": 13,
-				"service":             "iMessage",
-				"__pdw_preview_len_2": 8,
-				"handle_id":           "1",
-				"__pdw_preview_len_3": 1,
-				"body_text":           "hello message",
-				"__pdw_preview_len_4": 13,
-				"is_from_me":          "0",
-				"__pdw_preview_len_5": 1,
-				"is_deleted":          "0",
-				"__pdw_preview_len_6": 1,
-			}},
-		},
-		"SELECT substring(\"note_id\"::text from 1 for 15) AS \"note_id\", char_length(\"note_id\"::text) AS \"__pdw_preview_len_0\", substring(\"title\"::text from 1 for 15) AS \"title\", char_length(\"title\"::text) AS \"__pdw_preview_len_1\", substring(\"modified_at\"::text from 1 for 15) AS \"modified_at\", char_length(\"modified_at\"::text) AS \"__pdw_preview_len_2\", substring(\"body_text\"::text from 1 for 15) AS \"body_text\", char_length(\"body_text\"::text) AS \"__pdw_preview_len_3\", substring(\"body_html\"::text from 1 for 15) AS \"body_html\", char_length(\"body_html\"::text) AS \"__pdw_preview_len_4\", substring(\"is_deleted\"::text from 1 for 15) AS \"is_deleted\", char_length(\"is_deleted\"::text) AS \"__pdw_preview_len_5\" FROM \"apple_notes\" LIMIT 3": {
-			Columns: []string{"note_id", "__pdw_preview_len_0", "title", "__pdw_preview_len_1", "modified_at", "__pdw_preview_len_2", "body_text", "__pdw_preview_len_3", "body_html", "__pdw_preview_len_4", "is_deleted", "__pdw_preview_len_5"},
-			Rows: []map[string]any{{
-				"note_id":             "note-1",
-				"__pdw_preview_len_0": 6,
-				"title":               "Trip plan",
-				"__pdw_preview_len_1": 9,
-				"modified_at":         "2026-05-21T12",
-				"__pdw_preview_len_2": 13,
-				"body_text":           "Pack charger",
-				"__pdw_preview_len_3": 12,
-				"body_html":           "<p>Pack charger",
-				"__pdw_preview_len_4": 15,
-				"is_deleted":          "0",
-				"__pdw_preview_len_5": 1,
-			}},
-		},
 		"SELECT subject FROM gmail_messages LIMIT 1": {
 			Columns: []string{"subject"},
 			Rows:    []map[string]any{{"subject": "hello"}},
@@ -552,11 +504,15 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	if !ok {
 		t.Fatalf("content type = %T", result.Content[0])
 	}
-	if !strings.Contains(text.Text, "# clean_gmail_inbox") || !strings.Contains(text.Text, "thread_id (text),latest_subject (text)\nthread-1,hello inbox") {
+	if !strings.Contains(text.Text, "# clean_gmail_inbox") || !strings.Contains(text.Text, "thread_id (text),latest_subject (text)") {
 		t.Fatalf("schema overview did not include clean view: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# gmail_messages") || !strings.Contains(text.Text, "subject (text)\nhello") {
+	if !strings.Contains(text.Text, "# gmail_messages") || !strings.Contains(text.Text, "subject (text)") {
 		t.Fatalf("unexpected schema overview text: %q", text.Text)
+	}
+	// The overview is a column catalog only — no sampled data rows.
+	if strings.Contains(text.Text, "thread-1,hello inbox") || strings.Contains(text.Text, "hello message") {
+		t.Fatalf("schema overview should not include sampled row values: %q", text.Text)
 	}
 	if !strings.Contains(text.Text, "# apple_notes") || !strings.Contains(text.Text, "note_id (text),title (text),modified_at (timestamp with time zone),body_text (text),body_html (text),is_deleted (bigint)") {
 		t.Fatalf("schema overview did not include Apple Notes table: %q", text.Text)
