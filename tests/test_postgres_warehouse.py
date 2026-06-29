@@ -7,6 +7,7 @@ import os
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import psycopg2
 import pytest
 from dotenv import load_dotenv
 
@@ -1415,6 +1416,51 @@ def test_search_text_only_references_defined_bm25_indexes() -> None:
     assert not undefined, f"search_text() references undefined bm25 indexes: {undefined}"
 
 
+def test_search_text_caps_per_branch_topk_for_broad_search() -> None:
+    # The score column recomputes the bm25 operator per returned row (the one
+    # form correct on every corpus size: a non-match scores 0). Its cost is
+    # rows x tokenize(text), so on the huge Google-Drive/attachment-content
+    # branches scoring max_results (50) multi-kB docs is the dominant query
+    # latency. A broad (unscoped) search never needs that depth — the merge keeps
+    # only each source's top-floor plus a global fill — so the function must cap
+    # each branch's top-k for broad searches (SEARCH_TEXT_BROAD_PER_BRANCH_CAP)
+    # while leaving a scoped (sources => ARRAY[...]) search at full max_results.
+    sql = _search_text_function_sql()
+    assert "per_branch_limit" in sql and "WHEN sources IS NULL THEN least(per_source," in sql, (
+        "search_text() must cap each branch's top-k for broad (unscoped) searches "
+        "via per_branch_limit = least(per_source, SEARCH_TEXT_BROAD_PER_BRANCH_CAP)"
+    )
+    assert "query, per_branch_limit" in sql, (
+        "each branch's EXECUTE must use per_branch_limit (the broad cap), not the "
+        "full per_source, as its LIMIT"
+    )
+    # The score must be the operator recompute, NOT bm25_get_current_score():
+    # that helper returns a garbage constant whenever the planner doesn't run a
+    # bm25 index scan (small/new tables or any join above the scan), which leaks
+    # wrong scores silently — the failure class this function exists to avoid.
+    assert "bm25_get_current_score" not in sql, (
+        "search_text() must not use bm25_get_current_score() (unreliable off the "
+        "index-scan path); recompute the bm25 operator in the SELECT list instead"
+    )
+
+
+def test_search_text_merge_guarantees_per_source_floor() -> None:
+    # BM25 scores are not comparable across corpora, so the final merge must not
+    # be a flat global `ORDER BY score LIMIT` — that buries a low-volume source
+    # (one matching contact card / Drive doc) under a high-volume one (dozens of
+    # gmail/slack hits). The merge must rank within each source and guarantee
+    # every source's top-N hits ahead of the global cut.
+    sql = _search_text_function_sql()
+    assert "row_number() OVER (" in sql and "PARTITION BY h.source" in sql, (
+        "search_text() merge must rank hits per source with "
+        "row_number() OVER (PARTITION BY source ...)"
+    )
+    assert "src_rank >" in sql, (
+        "search_text() merge must order a per-source floor (src_rank > N) ahead "
+        "of the global score fill"
+    )
+
+
 def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse) -> None:
     if not _pg_textsearch_usable(warehouse):
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
@@ -1589,6 +1635,32 @@ def test_search_text_sources_lists_accepted_filter_tokens(warehouse: PostgresWar
         )
 
 
+def test_search_text_rejects_unknown_source_tokens(warehouse: PostgresWarehouse) -> None:
+    # An unknown `sources` token must RAISE (pointing the caller at
+    # search_text_sources()), NOT silently return nothing. The accepted tokens
+    # are terse and differ from the prose source names, so callers reliably guess
+    # wrong ('apple_messages'/'file_attachment'/'whatsapp_media' instead of the
+    # real 'imessage'/'gmail_attachment'/'whatsapp'). A silent empty result reads
+    # as "nothing matched" and yields confident wrong answers; the failure must
+    # be loud and self-correcting.
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+
+    with pytest.raises(psycopg2.Error, match="unknown source"):
+        warehouse._query("SELECT * FROM search_text('zzqqxx', 5, ARRAY['apple_messages'])")
+
+    # A mix of one valid and one invalid token still raises (no partial silent
+    # drop of the unknown one).
+    with pytest.raises(psycopg2.Error, match="unknown source"):
+        warehouse._query("SELECT * FROM search_text('zzqqxx', 5, ARRAY['imessage', 'bogus'])")
+
+    # A valid token is unaffected.
+    warehouse._query("SELECT count(*) FROM search_text('zzqqxx', 5, ARRAY['imessage'])")
+
+
 def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWarehouse) -> None:
     # agent_run_events holds the warehouse's OWN internal enrichment-agent
     # operational logs: its `text` column is raw JSON / stderr for every event
@@ -1641,11 +1713,12 @@ def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWareh
     assert "slack" in sources
     assert "agent" not in sources
 
-    # Explicitly requesting the 'agent' source returns nothing (branch removed).
-    agent_only = warehouse._query(
-        "SELECT count(*) FROM search_text('zanzibar', 50, ARRAY['agent']) WHERE score < 0"
-    )
-    assert agent_only == [(0,)]
+    # 'agent' is not a valid source token — the internal agent branch was removed
+    # and the agent *sessions* token is 'agent_session' — so explicitly
+    # requesting it now raises (unknown-source guard) rather than silently
+    # returning nothing.
+    with pytest.raises(psycopg2.Error, match="unknown source"):
+        warehouse._query("SELECT count(*) FROM search_text('zanzibar', 50, ARRAY['agent'])")
 
 
 def test_search_text_caps_hit_text_to_preview(warehouse: PostgresWarehouse) -> None:
@@ -1698,6 +1771,56 @@ def test_search_text_caps_hit_text_to_preview(warehouse: PostgresWarehouse) -> N
     assert long_body.startswith(by_ref[long_ref])
     # A normal-length hit is returned untouched — the cap never shortens it.
     assert by_ref[short_ref] == short_body
+
+
+def test_search_text_low_volume_source_survives_high_volume_source(warehouse: PostgresWarehouse) -> None:
+    # A low-volume source (one matching contact card) must surface in a bare
+    # cross-source search even when a high-volume source (many slack hits) would
+    # dominate a flat global score LIMIT. BM25 scores are not comparable across
+    # corpora, so the merge guarantees each source's top hits ahead of the cut;
+    # without that, the single contact card ranked far down the global list and a
+    # "who is X" question wrongly returned nothing from contacts.
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+
+    created_at = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    # Many slack hits for the term — the high-volume source.
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts=f"500.{i}",
+                message_datetime=created_at,
+                text="zanzibar zanzibar rollout planning thread",
+            )
+            for i in range(8)
+        ]
+    )
+    # Exactly one matching contact card — the low-volume source that a flat
+    # global score LIMIT would bury under the slack hits.
+    warehouse.insert_contact_cards(
+        [_contact_card_row(card_id="card-zan", display_name="Zanzibar Person", sync_version=1)]
+    )
+
+    # A small max_results makes the global race tight: the per-source floor must
+    # still let the lone contact hit through.
+    sources = {
+        row[0]
+        for row in warehouse._query(
+            "SELECT source FROM search_text('zanzibar', 4) WHERE score < 0"
+        )
+    }
+    assert "contact" in sources, (
+        "low-volume 'contact' source was starved out of the cross-source merge by "
+        "the high-volume 'slack' source"
+    )
+    assert "slack" in sources
 
 
 def test_whatsapp_client_session_round_trips_binary_snapshot(warehouse: PostgresWarehouse) -> None:

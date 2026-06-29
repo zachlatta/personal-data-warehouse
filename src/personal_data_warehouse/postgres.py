@@ -75,6 +75,26 @@ POSTGRES_TEXT_NUL_REPLACEMENT = "\\u0000"
 # the gateway timeout. Capping each branch's contributed text keeps the array small
 # while preserving a generous preview; the caller fetches full content via `ref`.
 SEARCH_TEXT_PREVIEW_CHARS = 8000
+# search_text() merges hits from ~30 BM25 branches whose scores are NOT comparable
+# across corpora (a gmail-body match and a contact-card match score on different
+# vocabularies/lengths). A single flat `ORDER BY score LIMIT n` therefore lets a
+# high-volume source (gmail/slack, dozens of strongly-scored hits) crowd out the one
+# matching contact card or Google-Drive doc, which ranks far down the global list and
+# is cut — the documented cause of "who is X -> nothing" and "doc not indexed" false
+# negatives. The merge instead guarantees each source's top-SEARCH_TEXT_SOURCE_FLOOR
+# hits survive the cut (recall for low-volume sources), then fills the remaining slots
+# by score (precision for whatever source the query truly concentrates in).
+SEARCH_TEXT_SOURCE_FLOOR = 3
+# Per-branch top-k cap for a BROAD (unscoped) search_text() call. The score
+# column recomputes the bm25 operator per returned row, whose cost is
+# rows x tokenize(text); on the huge Google-Drive / attachment-content branches
+# scoring 50 multi-kB docs is the dominant query latency (~3 s). A broad search
+# never needs that depth -- the cross-source merge keeps only each source's
+# top-SEARCH_TEXT_SOURCE_FLOOR hits plus a global score fill -- so capping each
+# branch to this many rows bounds the recompute with no change to the merged
+# output. A scoped search (sources => ARRAY[...]) bypasses the cap and uses the
+# full max_results so a single-source deep search still returns everything.
+SEARCH_TEXT_BROAD_PER_BRANCH_CAP = 12
 SLACK_CONVERSATION_STATS_COLUMNS = (
     "account",
     "team_id",
@@ -5237,6 +5257,23 @@ class PostgresWarehouse:
             where: str = "",
         ) -> tuple[str, str]:
             # One bm25-indexed text column -> one index-backed top-k subquery.
+            #
+            # The score is the bm25 operator `col <@> to_bm25query(...)` spelled
+            # in BOTH the ORDER BY (index-answered top-k) and the SELECT list.
+            # The SELECT copy is recomputed as an ordinary expression, which is
+            # the one form that stays correct on EVERY corpus size: a true
+            # non-match scores 0 (so WHERE score < 0 filters it), and the value
+            # never depends on the chosen plan. The faster-looking alternatives
+            # were tried and rejected: bm25_get_current_score() returns a garbage
+            # constant whenever the planner doesn't run a bm25 index scan (small
+            # / new tables, or any join above the scan), and a rank-derived score
+            # can't tell a non-match from a match on a small corpus -- both leak
+            # wrong rows / scores SILENTLY, which is exactly the failure class
+            # this function exists to avoid. The recompute is cheap for the
+            # short-text columns; the only expensive case (huge Google-Drive /
+            # attachment docs) is bounded instead by capping each branch's top-k
+            # for broad searches (see per_branch_limit below), so no branch ever
+            # re-tokenizes 50 multi-kB docs.
             where_sql = f" WHERE {where}" if where else ""
             rank = f"{col} <@> to_bm25query(%1$L, '{idx}')"
             return (
@@ -5507,6 +5544,11 @@ class PostgresWarehouse:
                 "account", "account || ':' || file_id", "google_drive_files", "name",
                 "google_drive_files_name_bm25_idx", where="trashed = 0 AND is_excluded = 0",
             ),
+            # google_drive content: bm25 top-k on the doc text, then join the
+            # file row for folder/user/modified. These docs are huge (avg ~40 kB,
+            # max ~5 MB), so the SELECT-list score recompute is the most expensive
+            # branch; the per-broad-search top-k cap (per_branch_limit) keeps it
+            # from re-tokenizing 50 multi-kB docs on every broad query.
             join_branch(
                 "google_drive",
                 "SELECT 'google_drive' AS source, 'content' AS subsource, f.folder_path AS context, "
@@ -5586,6 +5628,23 @@ class PostgresWarehouse:
             AS $fn$
             DECLARE
                 per_source integer := greatest(coalesce(max_results, 50), 1);
+                -- Top-k each branch scans/scores. A broad (unscoped) search does
+                -- NOT need max_results rows from every branch: the merge keeps
+                -- only each source's top-SEARCH_TEXT_SOURCE_FLOOR plus a global
+                -- score fill, so a handful per branch already covers any
+                -- max_results-row output. Capping the per-branch top-k for broad
+                -- searches bounds the SELECT-list bm25 score recompute (the cost
+                -- is rows x tokenize(text), and the huge Google-Drive/attachment
+                -- docs make that the dominant latency) WITHOUT dropping any
+                -- result the merge would have shown. A scoped search
+                -- (sources => ARRAY[...]) keeps the full max_results so a
+                -- single-source "find every mention in X" still goes deep.
+                per_branch_limit integer := CASE
+                    WHEN sources IS NULL THEN least(per_source, """
+            + str(SEARCH_TEXT_BROAD_PER_BRANCH_CAP)
+            + r""")
+                    ELSE per_source
+                END;
                 branch_sources text[] := ARRAY[
                         """
             + branch_sources_array
@@ -5602,6 +5661,23 @@ class PostgresWarehouse:
                 hits search_text_hit[] := '{}';
                 branch_hits search_text_hit[];
             BEGIN
+                -- Fail LOUD on an unknown source token instead of silently
+                -- returning nothing. The accepted tokens are terse
+                -- (note/transcript/agent_session/imessage/...) and do not match
+                -- the prose source names, so callers reliably guess wrong
+                -- ('apple_messages', 'file_attachment', 'gmail' for attachments
+                -- vs the real 'imessage'/'gmail_attachment'); a silent empty
+                -- result then reads as "nothing matched" and produces confident
+                -- wrong answers. Erroring with a pointer to search_text_sources()
+                -- turns that trap into a one-step self-correction.
+                IF sources IS NOT NULL THEN
+                    FOREACH branch_source IN ARRAY sources LOOP
+                        IF NOT branch_source = ANY (branch_sources) THEN
+                            RAISE EXCEPTION 'search_text: unknown source %', branch_source
+                                USING HINT = 'call search_text_sources() to list the valid source tokens';
+                        END IF;
+                    END LOOP;
+                END IF;
                 FOR branch_idx IN 1..coalesce(array_length(branch_sqls, 1), 0) LOOP
                     branch_source := branch_sources[branch_idx];
                     IF sources IS NOT NULL AND NOT branch_source = ANY (sources) THEN
@@ -5620,7 +5696,7 @@ class PostgresWarehouse:
                             'x.who, x.occurred_at, x.account, x.ref, left(x.text, """
             + str(SEARCH_TEXT_PREVIEW_CHARS)
             + r"""), x.score)::search_text_hit) FROM (' || branch || ') x',
-                            query, per_source
+                            query, per_branch_limit
                         ) INTO branch_hits;
                         IF branch_hits IS NOT NULL THEN
                             hits := hits || branch_hits;
@@ -5631,13 +5707,32 @@ class PostgresWarehouse:
                         NULL;
                     END;
                 END LOOP;
+                -- Fair cross-source merge. BM25 scores are per-corpus and NOT
+                -- comparable across sources, so a flat global ORDER BY score lets
+                -- a high-volume source bury a low-volume one (a single matching
+                -- contact card or Drive doc lost to dozens of gmail/slack hits and
+                -- got cut). Rank each source's hits internally, GUARANTEE every
+                -- source's top-SEARCH_TEXT_SOURCE_FLOOR hits ahead of the global
+                -- cut, then fill the rest by score. src_rank > floor sorts FALSE
+                -- (floor hits) before TRUE (everything else); score orders within
+                -- each tier.
                 RETURN QUERY
-                    SELECT h.source, h.subsource, h.context, h.who, h.occurred_at,
-                           h.account, h.ref, h.text, h.score
-                    FROM unnest(hits) AS h
-                    WHERE (sources IS NULL OR h.source = ANY (sources))
-                      AND (since IS NULL OR h.occurred_at >= since)
-                    ORDER BY h.score ASC NULLS LAST
+                    WITH ranked AS (
+                        SELECT h.source, h.subsource, h.context, h.who, h.occurred_at,
+                               h.account, h.ref, h.text, h.score,
+                               row_number() OVER (
+                                   PARTITION BY h.source ORDER BY h.score ASC NULLS LAST
+                               ) AS src_rank
+                        FROM unnest(hits) AS h
+                        WHERE (sources IS NULL OR h.source = ANY (sources))
+                          AND (since IS NULL OR h.occurred_at >= since)
+                    )
+                    SELECT r.source, r.subsource, r.context, r.who, r.occurred_at,
+                           r.account, r.ref, r.text, r.score
+                    FROM ranked r
+                    ORDER BY (r.src_rank > """
+            + str(SEARCH_TEXT_SOURCE_FLOOR)
+            + r""") ASC, r.score ASC NULLS LAST
                     LIMIT per_source;
             END;
             $fn$;

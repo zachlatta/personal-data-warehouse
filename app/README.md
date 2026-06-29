@@ -252,8 +252,14 @@ Searching text columns (the schema overview lists which columns carry which inde
   imessage, whatsapp, meeting transcripts, calendar, contacts, agent runs/sessions, and
   mutations (`score` lower / more negative = better). Optional args:
   `search_text(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')`.
-  Use it for any broad "find every mention of X" question, then drill into the underlying
-  table via `ref` for full rows. (`pg_textsearch`'s `<@>` operator cannot run through a view,
+  The `sources` tokens are terse and differ from the prose names (`note`, `transcript`,
+  `agent_session`, `imessage`, `gmail_attachment`, ...); an unknown token **raises** an error
+  listing the valid set, so call `SELECT * FROM search_text_sources()` to discover them rather
+  than guessing. Ranking is OR'd, stemmed whole-word BM25 with per-source (not globally
+  comparable) scores, so a noisy top-N never proves absence — for "find every mention of X"
+  (especially a person, who may appear by first name only or misspelled) raise `max_results`
+  and fall back to single-table trigram `%>` / `ILIKE` for name variants. Then drill into the
+  underlying table via `ref` for full rows. (`pg_textsearch`'s `<@>` operator cannot run through a view,
   so there is no cross-source view to `ILIKE`; `search_text()` is the cross-source path and
   reuses the per-table indexes directly — no extra storage.) New BM25-indexed text columns are
   picked up by adding a branch to `_ensure_search_text_function` (`src/personal_data_warehouse/postgres.py`).
