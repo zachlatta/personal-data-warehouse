@@ -65,8 +65,6 @@ type Service struct {
 	cache  *queryCache
 }
 
-const schemaSampleRows = 3
-const schemaSampleFieldChars = 15
 const schemaSampleConcurrency = 16
 
 type Response struct {
@@ -307,7 +305,7 @@ func (s *Service) Execute(ctx context.Context, statements []Statement, previewRo
 		s.logger.DebugContext(ctx, "query started", "question", statement.Question, "sql", statement.SQL)
 		raw, err := s.runner.Query(ctx, statement.SQL, s.opts.MaxRows+1)
 		if err != nil {
-			result.Error = queryErrorWithHint(err.Error())
+			result.Error = queryErrorWithHint(err.Error(), statement.SQL)
 			results = append(results, result)
 			s.logger.ErrorContext(ctx, "query failed", "question", statement.Question, "sql", statement.SQL, "error", err, "duration", time.Since(queryStarted))
 			continue
@@ -519,7 +517,7 @@ func (s *Service) ExecuteFull(ctx context.Context, question, sql, format string)
 	s.logger.InfoContext(ctx, "sql started", "question", question, "sql", sql, "format", format, "row_cap", FullQueryRowCap)
 	raw, err := s.runner.Query(ctx, sql, FullQueryRowCap+1)
 	if err != nil {
-		resp.Error = queryErrorWithHint(err.Error())
+		resp.Error = queryErrorWithHint(err.Error(), sql)
 		s.logger.ErrorContext(ctx, "sql failed", "question", question, "sql", sql, "error", err, "duration", time.Since(started))
 		return resp
 	}
@@ -675,18 +673,19 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 	out.WriteString(database)
 	out.WriteString(".\").\n")
 	out.WriteString("-- Each column header below is annotated with its Postgres type in parentheses, e.g. is_deleted (bigint), to_addresses (text[]).\n")
-	out.WriteString("-- Datetime columns: each source names its primary time column differently, so do not guess — whatsapp_messages.message_at, apple_messages.message_at, slack_messages.message_datetime, gmail_messages.internal_date, and all four are timestamp with time zone. Filter and compare timestamptz columns against timestamps, never epoch integers: message_at >= '2026-01-01', not message_at > 1700000000 (which errors with \"operator does not exist: timestamp with time zone > integer\"). Some neighbouring time columns are NOT timestamps and need converting before comparison: slack_messages.message_ts/edited_ts and gmail_messages.date_header are text, and apple_messages.date_ns is a bigint epoch in NANOseconds. There is no `timestamp` or `date_unix` column on any of these tables; when unsure, the column header's (type) annotation is authoritative.\n")
+	out.WriteString("-- Datetime columns: each source names its primary time column differently, so do not guess — gmail_messages.internal_date, slack_messages.message_datetime, apple_messages.message_at, apple_message_chat_messages.message_date, whatsapp_messages.message_at, agent_session_events.occurred_at, calendar_events.start_at, apple_notes.modified_at, apple_voice_memos_files.recorded_at, contact_cards.source_updated_at, google_drive_files.modified_time — all timestamp with time zone. There is no ts/created_at/timestamp/synced_at event-time column on the message tables. Filter and compare timestamptz columns against timestamps, never epoch integers: message_at >= '2026-01-01', not message_at > 1700000000 (which errors with \"operator does not exist: timestamp with time zone > integer\"). Some neighbouring time columns are NOT timestamps and need converting before comparison: slack_messages.message_ts/edited_ts and gmail_messages.date_header are text, and apple_messages.date_ns is a bigint epoch in NANOseconds. When unsure, the column header's (type) annotation is authoritative.\n")
+	out.WriteString("-- Slack uses a 3-table model with names that trip up guesses: the channels/DMs table is slack_conversations (not slack_channels) keyed by conversation_id (not channel_id); messages live in slack_messages; sync bookkeeping is slack_sync_state keyed by object_id with cursor_ts (text, often '' — guard ::numeric with NULLIF(cursor_ts,'')). raw_json columns are text, not jsonb (cast raw_json::jsonb before -> / ->>).\n")
 	out.WriteString("-- Each table lists its indexes. A gin (col gin_trgm_ops) index makes ILIKE and ~/~* substring search fast on that one column: match the column directly, e.g. body_text ILIKE '%x%' OR subject ILIKE '%x%'. Wrapping columns in lower(a || b || ...) or casting (to_addresses::text) bypasses every index and forces a full table scan, so search each indexed column separately and keep un-indexed expressions out of the same OR.\n")
 	out.WriteString("-- A bm25 (col) index supports relevance-ranked word search: SELECT ..., col <@> 'search terms' AS score FROM t ORDER BY col <@> 'search terms' LIMIT 20. Scores are negative (more negative = better; non-matches score 0); ALWAYS pair <@> with that ORDER BY plus a LIMIT, otherwise the index is not used. BM25 matches stemmed whole words only — no phrase queries and no typo tolerance — so for possibly-misspelled terms switch to the trigram indexes: WHERE col %> 'qery' ORDER BY word_similarity('qery', col) DESC LIMIT 20. Rule of thumb: <@> for topics and wording you trust, %> for fuzzy/typo'd terms, ILIKE for exact substrings.\n")
 	out.WriteString("-- Cross-source search (the default way to find things across the warehouse): SELECT * FROM search_text('offer letter', 50). It fans out to the per-table BM25 indexes and returns (source, subsource, context, who, occurred_at, account, ref, text, score) ranked across EVERY source — gmail, gmail attachments, slack messages/channels/files, apple notes, imessage, whatsapp, google drive docs, meeting transcripts, calendar, contacts, agent runs/sessions, and mutations — with score lower (more negative) = better. Optional args: search_text(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01'). The `sources` filter takes terse tokens that differ from the prose names above (apple notes => 'note', meeting transcripts => 'transcript', agent sessions => 'agent_session', mutations => 'mutation'/'mutation_request'; also 'gmail_attachment', 'slack_channel', 'slack_file', 'imessage', 'whatsapp'/'whatsapp_chat'/'whatsapp_media', 'google_drive', 'calendar', 'contact'). An unknown token RAISES an error listing the valid set (it does not silently return nothing) — run SELECT * FROM search_text_sources() to get the exact accepted tokens before filtering. Ranking caveats that cause MISSED answers: terms are OR'd, stemmed WHOLE words (no phrase/AND match, no typo tolerance) and scores are per-source, so cross-source order is only approximate — a noisy or short top-N does NOT mean a thing is absent. For 'find every mention of X' (especially a person): raise max_results well past the obvious noise, and try the term BOTH alone and with context — people are often addressed by first name only (e.g. 'Hi Mickey', no surname) or misspelled, which exact BM25 will rank low or miss, so also fall back to single-table trigram %> / ILIKE for name variants. Then drill into the underlying table via ref for full rows. (There is no cross-source view to scan with ILIKE — single-table BM25 <@> / trigram %> / ILIKE are for when you already know the table.)\n")
 	out.WriteString("-- For meetings, search_text(query, sources => ARRAY['transcript']) ranks the raw transcripts and surfaces the per-recording 'action_items' and 'summary' subsources (enrichment already extracted the commitments — read those first). Summaries are lossy, though: before reporting an email request as unanswered or a question as open, search the full transcript text (and Slack DMs) dated AFTER the request — decisions are often made on calls and appear only in raw transcripts.\n")
-	out.WriteString(fmt.Sprintf("-- Sample values below are previews truncated to %d characters; query a table directly for full values.\n\n", schemaSampleFieldChars))
-	sampleResults := s.sampleTables(ctx, tables)
+	out.WriteString("-- Each table below lists its row estimate, indexes, and the full column catalog as `name (type)`. To see actual row values, query the table directly (e.g. SELECT * FROM <table> LIMIT 5).\n\n")
+	tableResults := s.describeTables(ctx, tables)
 	for i, table := range tables {
-		sample := sampleResults[i]
-		if sample.Error != "" {
-			schemaResult.Error = sample.Error
-			schemaResult.CSV = sample.CSV
+		described := tableResults[i]
+		if described.Error != "" {
+			schemaResult.Error = described.Error
+			schemaResult.CSV = described.CSV
 			return Response{Results: []Result{schemaResult}}
 		}
 		if i > 0 {
@@ -709,16 +708,16 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 			}
 		}
 		out.WriteString("\n")
-		out.WriteString(sample.CSV)
+		out.WriteString(described.CSV)
 		out.WriteString("\n")
 	}
 
-	// Deliberately leave schemaResult.Truncated empty. Every sample value is
-	// truncated to schemaSampleFieldChars by design, so a per-field truncation
-	// table would be one noise row per sampled field across every table
-	// (~1k+ rows, dwarfing the schema itself) and the overview isn't cached, so
-	// there is no query_id to fetch fuller values with anyway. The preview note
-	// above states the cap once instead.
+	// schemaResult.Truncated stays empty: the overview now emits only the column
+	// catalog (one header row per table, no sampled values), so there is nothing
+	// to truncate. Dropping the per-table sample rows roughly halved the response
+	// — at 15 chars/field the samples were near-noise yet were ~45% of the bytes,
+	// pushing the whole overview past MCP token limits so callers could not read
+	// it at all. Column names + exact types are what actually stop guessing.
 	schemaResult.CSV = out.String()
 	s.logger.InfoContext(ctx, "schema overview completed", "database", database, "tables", len(tables), "duration", time.Since(started))
 	return Response{Results: []Result{schemaResult}}
@@ -830,7 +829,7 @@ func formatRowCount(n int64) string {
 	return b.String()
 }
 
-func (s *Service) sampleTables(ctx context.Context, tables []string) []Result {
+func (s *Service) describeTables(ctx context.Context, tables []string) []Result {
 	results := make([]Result, len(tables))
 	sem := make(chan struct{}, schemaSampleConcurrency)
 	var wg sync.WaitGroup
@@ -846,15 +845,21 @@ func (s *Service) sampleTables(ctx context.Context, tables []string) []Result {
 				results[i] = Result{Error: ctx.Err().Error(), CSV: errorCSV(ctx.Err().Error())}
 				return
 			}
-			results[i] = s.sampleRows(ctx, table)
+			results[i] = s.describeTable(ctx, table)
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-func (s *Service) sampleRows(ctx context.Context, table string) Result {
-	tableIdentifier := quotePostgresIdentifier(table)
+// describeTable returns a table's column catalog: a single CSV header row of
+// `name (type)` columns and no data rows. The overview deliberately does NOT
+// sample row values — at the previous 15-char-per-field truncation the samples
+// were close to noise yet were ~45% of the response, pushing the whole overview
+// past MCP token limits so callers could not even read it. The column names and
+// their exact Postgres types are the part that stops guessing; for real values,
+// query the table directly.
+func (s *Service) describeTable(ctx context.Context, table string) Result {
 	// Pull each column's precise type via format_type (e.g. text[], bigint,
 	// timestamp with time zone) rather than information_schema.data_type, which
 	// collapses every array to the unhelpful "ARRAY". Callers use these types to
@@ -881,30 +886,17 @@ func (s *Service) sampleRows(ctx context.Context, table string) Result {
 	columnTypes := describedColumnTypes(describeResult)
 	if len(columns) == 0 {
 		result.CSV = ""
-		s.logger.DebugContext(ctx, "schema overview sample skipped empty table schema", "table", table, "duration", time.Since(started))
+		s.logger.DebugContext(ctx, "schema overview describe skipped empty table schema", "table", table, "duration", time.Since(started))
 		return result
 	}
-
-	sampleSQL := previewSampleSQL(tableIdentifier, columns)
-	result.SQL = sampleSQL
-	s.logger.DebugContext(ctx, "schema overview sample started", "table", table, "sql", sampleSQL)
-	raw, err := s.runner.Query(ctx, sampleSQL, schemaSampleRows)
+	result.CSV, err = rowsToCSVWithHeaders(columnHeadersWithTypes(columns, columnTypes), columns, nil)
 	if err != nil {
 		result.Error = err.Error()
 		result.CSV = errorCSV(result.Error)
-		s.logger.ErrorContext(ctx, "schema overview sample failed", "table", table, "sql", sampleSQL, "error", err, "duration", time.Since(started))
+		s.logger.ErrorContext(ctx, "schema overview describe encoding failed", "table", table, "error", err, "duration", time.Since(started))
 		return result
 	}
-	rows, trunc := previewRows(columns, raw.Rows)
-	result.Truncated = trunc
-	result.CSV, err = rowsToCSVWithHeaders(columnHeadersWithTypes(columns, columnTypes), columns, rows)
-	if err != nil {
-		result.Error = err.Error()
-		result.CSV = errorCSV(result.Error)
-		s.logger.ErrorContext(ctx, "schema overview sample encoding failed", "table", table, "sql", sampleSQL, "error", err, "duration", time.Since(started))
-		return result
-	}
-	s.logger.InfoContext(ctx, "schema overview table sampled", "table", table, "rows", len(rows), "columns", len(columns), "truncated_fields", len(trunc.Fields), "duration", time.Since(started))
+	s.logger.DebugContext(ctx, "schema overview table described", "table", table, "columns", len(columns), "duration", time.Since(started))
 	return result
 }
 
@@ -997,33 +989,195 @@ func csvValue(value any) string {
 
 // queryErrorWithHint appends a one-line recovery hint to a Postgres error
 // message when the error matches a common agent mistake against this warehouse.
-// Agents repeatedly guess the wrong datetime column name (each source names its
-// primary time column differently) or compare a timestamptz column to an epoch
-// integer; both surface as opaque Postgres errors with no recovery path. The
-// hint points back at schema_overview and names the canonical time columns so
-// the next attempt is correct instead of another blind guess. When the error is
-// not one of these shapes the message is returned unchanged.
-func queryErrorWithHint(message string) string {
-	if hint := datetimeErrorHint(message); hint != "" {
+// Schema-guessing is the recurring tax: agents guess the wrong per-source time
+// column, the wrong Slack table/column names (slack_channels/channel_id instead
+// of slack_conversations/conversation_id), compare a timestamptz column to an
+// epoch integer, or ::numeric-cast the text cursor_ts. Each surfaces as an
+// opaque Postgres error with no recovery path, so the *next* attempt is another
+// blind guess. The hint names the correct table/column at the moment of the
+// error — in the agent's own context, every time, regardless of whether it read
+// schema_overview — which is the only thing that actually gets it learned. When
+// the error is not one of these shapes the message is returned unchanged. The
+// originating SQL is threaded in so the hint can name the exact column for the
+// table actually queried instead of reciting the whole per-source map.
+func queryErrorWithHint(message, sql string) string {
+	if hint := schemaErrorHint(message, sql); hint != "" {
 		return message + " " + hint
 	}
 	return message
 }
 
-func datetimeErrorHint(message string) string {
-	// Comparing a timestamptz column to an epoch int, e.g. message_at > 1700000000.
-	// Postgres reports SQLSTATE 42883 ("operator does not exist") naming both sides.
+// timeColumns maps each event-bearing warehouse table to its canonical primary
+// time column. Every column here is timestamp with time zone. Sources name this
+// column differently, which is the single most common wrong guess, so the order
+// is preserved to render a stable per-source list in the fallback hint.
+var timeColumns = []struct{ table, column string }{
+	{"gmail_messages", "internal_date"},
+	{"slack_messages", "message_datetime"},
+	{"apple_messages", "message_at"},
+	{"apple_message_chat_messages", "message_date"},
+	{"whatsapp_messages", "message_at"},
+	{"agent_session_events", "occurred_at"},
+	{"calendar_events", "start_at"},
+	{"apple_notes", "modified_at"},
+	{"apple_note_revisions", "modified_at"},
+	{"apple_voice_memos_files", "recorded_at"},
+	{"contact_cards", "source_updated_at"},
+	{"google_drive_files", "modified_time"},
+}
+
+// timeGuessColumns are the generic names agents reach for when they want a
+// table's event time. None of them is the real column on the table being
+// queried whenever a 42703 fires, so seeing one means "they wanted the time
+// column" and we answer with the real one. updated_at/synced_at/created_at are
+// included because, while real bookkeeping columns on some tables, an agent
+// using them as the event time on a table that lacks them is the same mistake.
+var timeGuessColumns = map[string]bool{
+	"ts": true, "ts_utc": true, "tsutc": true, "timestamp": true, "timestamptz": true,
+	"time": true, "datetime": true, "date": true, "date_unix": true, "date_utc": true,
+	"date_ns": true, "created": true, "created_at": true, "created_date": true,
+	"createddate": true, "create_time": true, "creation_time": true, "inserted_at": true,
+	"event_time": true, "event_at": true, "event_date": true, "sent_at": true,
+	"sent_date": true, "received_at": true, "received_date": true, "start_time": true,
+	"starttime": true, "last_seen_at": true, "last_seen": true, "occurred": true,
+	"occurred_date": true, "message_time": true, "msg_time": true, "epoch": true,
+	"unix_time": true, "unix_ts": true, "updated": true, "updated_at": true,
+	"synced": true, "synced_at": true,
+}
+
+// columnRemaps point a specific wrong column name at the right one. These are
+// structural renames (not time columns) that recur across sessions.
+var columnRemaps = map[string]string{
+	"channel_id": "Slack tables use conversation_id, and the channels table is named slack_conversations (not slack_channels)",
+	"channel":    "Slack tables use conversation_id, and the channels table is named slack_conversations (not slack_channels)",
+	"chat_jid":   "use chat_id — apple_messages/whatsapp_messages and their chat tables key on chat_id, not chat_jid",
+}
+
+// tableRemaps point a wrong table name at the right one.
+var tableRemaps = map[string]string{
+	"slack_channels":     "slack_conversations",
+	"slack_channel":      "slack_conversations",
+	"slack_conversation": "slack_conversations",
+	"slack_message":      "slack_messages",
+	"gmail_message":      "gmail_messages",
+	"apple_message":      "apple_messages",
+}
+
+var quotedIdentifierRe = regexp.MustCompile(`"([^"]+)"`)
+
+func schemaErrorHint(message, sql string) string {
+	if hint := datetimeOperatorHint(message); hint != "" {
+		return hint
+	}
+	if hint := undefinedTableHint(message); hint != "" {
+		return hint
+	}
+	if hint := undefinedColumnHint(message, sql); hint != "" {
+		return hint
+	}
+	if hint := numericCastHint(message, sql); hint != "" {
+		return hint
+	}
+	return ""
+}
+
+// datetimeOperatorHint fires when a timestamptz column is compared to an epoch
+// int, e.g. message_at > 1700000000. Postgres reports SQLSTATE 42883
+// ("operator does not exist") naming both sides.
+func datetimeOperatorHint(message string) string {
 	if strings.Contains(message, "operator does not exist") &&
 		strings.Contains(message, "timestamp with time zone") &&
 		(strings.Contains(message, "integer") || strings.Contains(message, "bigint") || strings.Contains(message, "numeric")) {
 		return "(hint: that column is timestamp with time zone — compare it to a timestamp, not an epoch integer, e.g. message_at >= '2026-01-01' instead of message_at > 1700000000.)"
 	}
-	// A guessed column that does not exist (SQLSTATE 42703), e.g. `timestamp` or
-	// `date_unix` on a messages table.
-	if strings.Contains(message, "does not exist") && strings.Contains(message, "42703") {
-		return "(hint: column names differ per source — run schema_overview (or `columns <table>`) for the exact columns and their (type) annotations. The primary time column is message_at on whatsapp_messages and apple_messages, message_datetime on slack_messages, and internal_date on gmail_messages, all timestamp with time zone.)"
-	}
 	return ""
+}
+
+// undefinedTableHint fires on a missing relation (SQLSTATE 42P01). A known
+// wrong name (slack_channels) is mapped to the right one; anything else points
+// at schema_overview for the canonical table list.
+func undefinedTableHint(message string) string {
+	if !strings.Contains(message, "42P01") || !strings.Contains(message, "does not exist") {
+		return ""
+	}
+	rel := strings.ToLower(quotedIdentifier(message))
+	if remap, ok := tableRemaps[rel]; ok {
+		return fmt.Sprintf("(hint: there is no %s table — use %s. Run schema_overview for the exact table names.)", rel, remap)
+	}
+	return "(hint: no such table — run schema_overview for the exact table names before querying.)"
+}
+
+// undefinedColumnHint fires on a missing column (SQLSTATE 42703). A structural
+// rename is corrected by name; a time-column guess is answered with the exact
+// time column for the table actually queried (or the full per-source list when
+// the table is ambiguous); anything else points at schema_overview.
+func undefinedColumnHint(message, sql string) string {
+	if !strings.Contains(message, "42703") || !strings.Contains(message, "does not exist") {
+		return ""
+	}
+	col := strings.ToLower(quotedIdentifier(message))
+	if remap, ok := columnRemaps[col]; ok {
+		return "(hint: " + remap + ". Run schema_overview or `columns <table>` for the full column list.)"
+	}
+	if timeGuessColumns[col] {
+		if table, column := soleTimeTable(sql); table != "" {
+			return fmt.Sprintf("(hint: the primary time column on %s is %s (timestamp with time zone) — sources name it differently, so don't guess. Run schema_overview or `columns %s` for the rest.)", table, column, table)
+		}
+		return "(hint: each source names its primary time column differently — " + timeColumnsList() + ", all timestamp with time zone. Run schema_overview or `columns <table>` for the exact columns.)"
+	}
+	return "(hint: column names differ per source — run schema_overview (or `columns <table>`) for the exact columns and their (type) annotations.)"
+}
+
+// numericCastHint catches the classic Slack sync-state trap: cursor_ts is text
+// and is often the empty string, so ::numeric raises SQLSTATE 22P02 on it.
+func numericCastHint(message, sql string) string {
+	if !strings.Contains(message, "22P02") || !strings.Contains(message, "numeric") {
+		return ""
+	}
+	if !strings.Contains(strings.ToLower(sql), "cursor_ts") {
+		return ""
+	}
+	return "(hint: slack_sync_state.cursor_ts is text and is often '' (empty), which breaks ::numeric — guard it with NULLIF(cursor_ts, '')::numeric.)"
+}
+
+// soleTimeTable returns the table and its primary time column when the SQL
+// references exactly one known event-bearing table. When zero or several
+// appear (e.g. a join), it returns empty so the caller falls back to the full
+// per-source list rather than risk naming the wrong table's column.
+func soleTimeTable(sql string) (string, string) {
+	lower := strings.ToLower(sql)
+	table, column := "", ""
+	for _, tc := range timeColumns {
+		if !containsWord(lower, tc.table) {
+			continue
+		}
+		if table != "" && table != tc.table {
+			return "", ""
+		}
+		table, column = tc.table, tc.column
+	}
+	return table, column
+}
+
+func containsWord(haystack, word string) bool {
+	re := regexp.MustCompile(`(^|[^a-z0-9_])` + regexp.QuoteMeta(word) + `($|[^a-z0-9_])`)
+	return re.MatchString(haystack)
+}
+
+func timeColumnsList() string {
+	parts := make([]string, 0, len(timeColumns))
+	for _, tc := range timeColumns {
+		parts = append(parts, tc.table+"."+tc.column)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func quotedIdentifier(message string) string {
+	m := quotedIdentifierRe.FindStringSubmatch(message)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
 }
 
 func errorCSV(message string) string {
@@ -1089,46 +1243,6 @@ func columnHeadersWithTypes(columns []string, types map[string]string) []string 
 	return headers
 }
 
-func previewSampleSQL(tableIdentifier string, columns []string) string {
-	expressions := make([]string, 0, 2*len(columns))
-	for i, column := range columns {
-		identifier := quotePostgresIdentifier(column)
-		lengthAlias := quotePostgresIdentifier(previewLengthColumn(i))
-		expressions = append(expressions,
-			fmt.Sprintf("substring(%s::text from 1 for %d) AS %s", identifier, schemaSampleFieldChars, identifier),
-			fmt.Sprintf("char_length(%s::text) AS %s", identifier, lengthAlias),
-		)
-	}
-	return fmt.Sprintf("SELECT %s FROM %s LIMIT %d", strings.Join(expressions, ", "), tableIdentifier, schemaSampleRows)
-}
-
-func previewRows(columns []string, rows []map[string]any) ([]map[string]any, Truncation) {
-	trunc := Truncation{MaxRows: schemaSampleRows, MaxFieldChars: schemaSampleFieldChars}
-	out := make([]map[string]any, 0, len(rows))
-	for rowIndex, row := range rows {
-		copied := make(map[string]any, len(columns))
-		for columnIndex, column := range columns {
-			preview := csvValue(row[column])
-			copied[column] = preview
-			originalChars := intValue(row[previewLengthColumn(columnIndex)])
-			if originalChars > schemaSampleFieldChars {
-				trunc.Fields = append(trunc.Fields, FieldTruncation{
-					Row:      rowIndex,
-					Column:   column,
-					Returned: utf8.RuneCountInString(preview),
-					Total:    originalChars,
-				})
-			}
-		}
-		out = append(out, copied)
-	}
-	return out, trunc
-}
-
-func previewLengthColumn(index int) string {
-	return fmt.Sprintf("__pdw_preview_len_%d", index)
-}
-
 func currentDatabaseName(result RawResult) string {
 	if len(result.Rows) == 0 {
 		return ""
@@ -1150,43 +1264,6 @@ func rowString(row map[string]any, column string) string {
 
 func quotePostgresIdentifier(identifier string) string {
 	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
-}
-
-func intValue(value any) int {
-	switch v := value.(type) {
-	case int:
-		return v
-	case int8:
-		return int(v)
-	case int16:
-		return int(v)
-	case int32:
-		return int(v)
-	case int64:
-		return int(v)
-	case uint:
-		return int(v)
-	case uint8:
-		return int(v)
-	case uint16:
-		return int(v)
-	case uint32:
-		return int(v)
-	case uint64:
-		return int(v)
-	case float32:
-		return int(v)
-	case float64:
-		return int(v)
-	case json.Number:
-		n, _ := v.Int64()
-		return int(n)
-	case string:
-		n, _ := strconv.Atoi(v)
-		return n
-	default:
-		return 0
-	}
 }
 
 type queryCache struct {

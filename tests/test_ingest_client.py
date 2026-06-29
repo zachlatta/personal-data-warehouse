@@ -13,6 +13,7 @@ from personal_data_warehouse.ingest_client import (
     IngestClient,
     ingest_client_from_env,
     ingest_upload_config_problem,
+    resolve_direct_ingest_origin,
     sign_object_upload,
 )
 from personal_data_warehouse_agent_sessions.state import AgentSessionsUploadState
@@ -274,3 +275,161 @@ def test_config_problem_reports_missing_secret(monkeypatch: pytest.MonkeyPatch) 
     problem = ingest_upload_config_problem()
     assert problem is not None
     assert "PDW_SECRET_TOKEN" in problem
+
+
+# --- Tailscale-direct upload routing ---------------------------------------
+
+
+def test_direct_upload_uses_direct_origin_with_public_host_header() -> None:
+    session = _FakeSession()
+    client = IngestClient(
+        base_url="https://pdw.example.com/",
+        signing_key=b"0123456789abcdef0123456789abcdef",
+        session=session,
+        now=lambda: 1700000000.0,
+        upload_base_url="http://100.115.245.118",
+    )
+    body = b"audio-bytes"
+    client.upload_agent_sessions_batch(body, exported_at="2026-06-19T12:34:56+00:00")
+    call = session.calls[0]
+    # Connects to the direct origin...
+    assert call["url"].startswith("http://100.115.245.118/ingest/agent-sessions/batch")
+    # ...but presents the public Host so Traefik still routes to the app,
+    # and the signature (host-independent) is unchanged.
+    assert call["headers"]["Host"] == "pdw.example.com"
+    parts = urlsplit(call["url"])
+    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    assert q["sig"] == sign_object_upload(
+        b"0123456789abcdef0123456789abcdef",
+        "/ingest/agent-sessions/batch",
+        hashlib.sha256(body).hexdigest(),
+        1700000000 + 900,
+    )
+
+
+def test_no_host_header_without_direct_origin() -> None:
+    session = _FakeSession()
+    client = IngestClient(
+        base_url="https://pdw.example.com/",
+        signing_key=b"k" * 32,
+        session=session,
+        now=lambda: 1700000000.0,
+    )
+    client.upload_agent_sessions_batch(b"x", exported_at="2026-06-19T12:34:56+00:00")
+    call = session.calls[0]
+    assert call["url"].startswith("https://pdw.example.com/")
+    assert "Host" not in call["headers"]
+
+
+def test_effective_max_upload_bytes_reflects_route() -> None:
+    direct = IngestClient(
+        base_url="https://pdw.example.com",
+        signing_key=b"k" * 32,
+        upload_base_url="http://100.64.0.1",
+        max_object_bytes=512 * 1024 * 1024,
+    )
+    # Direct to the app: the app's own cap applies.
+    assert direct.effective_max_upload_bytes == 512 * 1024 * 1024
+    public = IngestClient(
+        base_url="https://pdw.example.com",
+        signing_key=b"k" * 32,
+        max_object_bytes=512 * 1024 * 1024,
+    )
+    # Via Cloudflare: clamped to the 100 MiB edge limit.
+    assert public.effective_max_upload_bytes == 100 * 1024 * 1024
+
+
+def test_resolve_direct_prefers_explicit_url_when_reachable() -> None:
+    seen = {}
+
+    def probe(url, host):
+        seen["url"], seen["host"] = url, host
+        return True
+
+    out = resolve_direct_ingest_origin(
+        "https://pdw.example.com",
+        explicit_direct_url="http://10.0.0.5",
+        tailscale_host="rotom",
+        ipv4_resolver=lambda h: (_ for _ in ()).throw(AssertionError("should not resolve")),
+        probe=probe,
+    )
+    assert out == "http://10.0.0.5"
+    assert seen == {"url": "http://10.0.0.5", "host": "pdw.example.com"}
+
+
+def test_resolve_direct_uses_tailscale_ip_when_no_explicit() -> None:
+    out = resolve_direct_ingest_origin(
+        "https://pdw.example.com",
+        explicit_direct_url=None,
+        tailscale_host="rotom",
+        ipv4_resolver=lambda h: "100.115.245.118" if h == "rotom" else None,
+        probe=lambda url, host: True,
+    )
+    assert out == "http://100.115.245.118"
+
+
+def test_resolve_direct_falls_back_when_unreachable() -> None:
+    out = resolve_direct_ingest_origin(
+        "https://pdw.example.com",
+        explicit_direct_url=None,
+        tailscale_host="rotom",
+        ipv4_resolver=lambda h: "100.115.245.118",
+        probe=lambda url, host: False,
+    )
+    assert out is None
+
+
+def test_resolve_direct_none_when_unconfigured() -> None:
+    out = resolve_direct_ingest_origin(
+        "https://pdw.example.com",
+        explicit_direct_url=None,
+        tailscale_host=None,
+        ipv4_resolver=lambda h: (_ for _ in ()).throw(AssertionError("should not resolve")),
+        probe=lambda url, host: (_ for _ in ()).throw(AssertionError("should not probe")),
+    )
+    assert out is None
+
+
+def test_tailscale_ipv4_parses_first_ipv4(monkeypatch) -> None:
+    import personal_data_warehouse.ingest_client as ic
+
+    monkeypatch.setattr(ic, "_tailscale_binary", lambda: "/usr/bin/tailscale")
+    ip = ic._tailscale_ipv4("rotom", runner=lambda argv: "fd7a::1\n100.115.245.118\n")
+    assert ip == "100.115.245.118"
+
+
+def test_tailscale_ipv4_none_when_binary_missing(monkeypatch) -> None:
+    import personal_data_warehouse.ingest_client as ic
+
+    monkeypatch.setattr(ic, "_tailscale_binary", lambda: None)
+    assert ic._tailscale_ipv4("rotom") is None
+
+
+# --- size-aware upload timeout ---------------------------------------------
+
+
+def test_upload_timeout_scales_with_body_size() -> None:
+    client = IngestClient(
+        base_url="https://pdw.example.com",
+        signing_key=b"k" * 32,
+        timeout=120.0,
+    )
+    # Small bodies keep the base timeout...
+    assert client._upload_timeout(1024) == 120.0
+    # ...large ones get at least ~1 MiB/s of headroom so a multi-hundred-MiB
+    # upload to object storage does not trip the fixed 120 s default.
+    assert client._upload_timeout(300 * 1024 * 1024) == float(300 * 1024 * 1024) / (1024 * 1024)
+
+
+def test_upload_timeout_applied_to_post() -> None:
+    session = _FakeSession()
+    client = IngestClient(
+        base_url="https://pdw.example.com",
+        signing_key=b"k" * 32,
+        session=session,
+        now=lambda: 1700000000.0,
+        timeout=120.0,
+    )
+    big = b"x" * (200 * 1024 * 1024)
+    client.upload_agent_sessions_batch(big, exported_at="2026-06-19T12:34:56+00:00")
+    assert session.calls[0]["timeout"] == 200.0

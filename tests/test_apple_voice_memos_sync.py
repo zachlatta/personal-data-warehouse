@@ -122,6 +122,59 @@ def test_mac_runner_defers_partially_materialized_voice_memos(tmp_path) -> None:
     assert any("Deferring 20260430 110736-8BB8E57D.qta" in message for message in logger.messages)
 
 
+def test_incremental_runner_defers_files_over_upload_ceiling(tmp_path) -> None:
+    # A memo larger than the route's ceiling must be deferred, not uploaded,
+    # so it cannot 413 and (because the failure re-raises) wedge the whole run.
+    small = tmp_path / "20260101 100000-AAAA0001.m4a"
+    big = tmp_path / "20260101 110000-BBBB0002.m4a"
+    small.write_bytes(b"a" * 10)
+    big.write_bytes(b"b" * 5000)
+    ingest = FakeIngestClient()
+    logger = FakeLogger()
+
+    summary = VoiceMemosUploadRunner(
+        account="zach@example.com",
+        recordings_path=tmp_path,
+        extensions=(".m4a",),
+        ingest_client=ingest,
+        logger=logger,
+        mode="incremental",
+        upload_state=VoiceMemosUploadState.empty(account="zach@example.com", recordings_path=tmp_path),
+        now=lambda: datetime(2026, 1, 2, tzinfo=UTC),
+        max_upload_bytes=1000,
+    ).sync()
+
+    assert summary.recordings_selected == 1  # only the small memo
+    assert summary.recordings_uploaded == 1
+    assert summary.recordings_deferred == 1  # the oversized one
+    assert [u["recorded_at"] for u in ingest.audio_uploads] == ["2026-01-01T10:00:00+00:00"]
+    assert any("exceeds the" in m and "BBBB0002" in m for m in logger.messages)
+
+
+def test_runner_inherits_ceiling_from_ingest_client(tmp_path) -> None:
+    big = tmp_path / "20260101 110000-BBBB0002.m4a"
+    big.write_bytes(b"b" * 5000)
+
+    class CappedIngestClient(FakeIngestClient):
+        effective_max_upload_bytes = 1000
+
+    ingest = CappedIngestClient()
+    summary = VoiceMemosUploadRunner(
+        account="zach@example.com",
+        recordings_path=tmp_path,
+        extensions=(".m4a",),
+        ingest_client=ingest,
+        logger=FakeLogger(),
+        mode="incremental",
+        upload_state=VoiceMemosUploadState.empty(account="zach@example.com", recordings_path=tmp_path),
+        now=lambda: datetime(2026, 1, 2, tzinfo=UTC),
+    ).sync()
+
+    assert summary.recordings_uploaded == 0
+    assert summary.recordings_deferred == 1
+    assert ingest.audio_uploads == []
+
+
 def test_mac_runner_defers_short_zero_local_duration_voice_memos(tmp_path) -> None:
     recording = tmp_path / "20250310 210228-0C9BF035.m4a"
     recording.write_bytes(b"")
@@ -314,3 +367,41 @@ def create_cloud_recordings_db(tmp_path: Path, *, filename: str, duration: float
         connection.commit()
     finally:
         connection.close()
+
+
+def test_incremental_runner_continues_past_a_failing_upload_then_raises(tmp_path) -> None:
+    # One memo's upload fails (e.g. a timeout); the rest must still upload, and
+    # the run must re-raise at the end so it is marked failed (FAILING), while
+    # the successful uploads are recorded so the next run resumes past them.
+    import pytest
+
+    for name in ("20260101 100000-AAAA0001.m4a", "20260101 110000-BBBB0002.m4a", "20260101 120000-CCCC0003.m4a"):
+        (tmp_path / name).write_bytes(b"audio")
+
+    class FlakyIngestClient(FakeIngestClient):
+        def upload_voice_memo_audio(self, content, *, recorded_at, extension, content_type):
+            if recorded_at == "2026-01-01T11:00:00+00:00":
+                raise RuntimeError("499 simulated timeout")
+            return super().upload_voice_memo_audio(
+                content, recorded_at=recorded_at, extension=extension, content_type=content_type
+            )
+
+    ingest = FlakyIngestClient()
+    state = VoiceMemosUploadState.empty(account="zach@example.com", recordings_path=tmp_path)
+    runner = VoiceMemosUploadRunner(
+        account="zach@example.com",
+        recordings_path=tmp_path,
+        extensions=(".m4a",),
+        ingest_client=ingest,
+        logger=FakeLogger(),
+        mode="incremental",
+        upload_state=state,
+        now=lambda: datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    with pytest.raises(RuntimeError, match="499 simulated timeout"):
+        runner.sync()
+
+    # The two good memos uploaded despite the middle one failing mid-batch
+    # (before this fix, the first failure re-raised and aborted the rest).
+    uploaded_at = {u["recorded_at"] for u in ingest.audio_uploads}
+    assert uploaded_at == {"2026-01-01T10:00:00+00:00", "2026-01-01T12:00:00+00:00"}

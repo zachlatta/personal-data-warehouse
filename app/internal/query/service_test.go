@@ -107,10 +107,6 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 				{"name": "latest_subject", "type": "String"},
 			},
 		},
-		"SELECT substring(\"thread_id\"::text from 1 for 15) AS \"thread_id\", char_length(\"thread_id\"::text) AS \"__pdw_preview_len_0\", substring(\"latest_subject\"::text from 1 for 15) AS \"latest_subject\", char_length(\"latest_subject\"::text) AS \"__pdw_preview_len_1\" FROM \"clean_gmail_inbox\" LIMIT 3": {
-			Columns: []string{"thread_id", "__pdw_preview_len_0", "latest_subject", "__pdw_preview_len_1"},
-			Rows:    []map[string]any{{"thread_id": "thread-1", "__pdw_preview_len_0": 8, "latest_subject": "hello inbox", "__pdw_preview_len_1": 11}},
-		},
 		describeGmailSQL: {
 			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
 			Rows: []map[string]any{
@@ -118,22 +114,11 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 				{"name": "body", "type": "String"},
 			},
 		},
-		"SELECT substring(\"id\"::text from 1 for 15) AS \"id\", char_length(\"id\"::text) AS \"__pdw_preview_len_0\", substring(\"body\"::text from 1 for 15) AS \"body\", char_length(\"body\"::text) AS \"__pdw_preview_len_1\" FROM \"gmail_messages\" LIMIT 3": {
-			Columns: []string{"id", "__pdw_preview_len_0", "body", "__pdw_preview_len_1"},
-			Rows: []map[string]any{
-				{"id": "msg-1", "__pdw_preview_len_0": 5, "body": "abcdefghijklmno", "__pdw_preview_len_1": 26},
-				{"id": "msg-2", "__pdw_preview_len_0": 5, "body": "short", "__pdw_preview_len_1": 5},
-			},
-		},
 		describeSlackSQL: {
 			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
 			Rows: []map[string]any{
 				{"name": "channel_id", "type": "String"},
 			},
-		},
-		"SELECT substring(\"channel_id\"::text from 1 for 15) AS \"channel_id\", char_length(\"channel_id\"::text) AS \"__pdw_preview_len_0\" FROM \"slack\"\"messages\" LIMIT 3": {
-			Columns: []string{"channel_id", "__pdw_preview_len_0"},
-			Rows:    []map[string]any{{"channel_id": "C123", "__pdw_preview_len_0": 4}},
 		},
 	}}
 	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
@@ -150,19 +135,15 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	if strings.Join(runner.queries[:4], "\n") != strings.Join(wantQueries, "\n") {
 		t.Fatalf("first queries = %#v, want %#v", runner.queries[:4], wantQueries)
 	}
-	wantSampleQueries := []string{
-		describeCleanGmailSQL,
-		"SELECT substring(\"thread_id\"::text from 1 for 15) AS \"thread_id\", char_length(\"thread_id\"::text) AS \"__pdw_preview_len_0\", substring(\"latest_subject\"::text from 1 for 15) AS \"latest_subject\", char_length(\"latest_subject\"::text) AS \"__pdw_preview_len_1\" FROM \"clean_gmail_inbox\" LIMIT 3",
-		describeGmailSQL,
-		"SELECT substring(\"id\"::text from 1 for 15) AS \"id\", char_length(\"id\"::text) AS \"__pdw_preview_len_0\", substring(\"body\"::text from 1 for 15) AS \"body\", char_length(\"body\"::text) AS \"__pdw_preview_len_1\" FROM \"gmail_messages\" LIMIT 3",
-		describeSlackSQL,
-		"SELECT substring(\"channel_id\"::text from 1 for 15) AS \"channel_id\", char_length(\"channel_id\"::text) AS \"__pdw_preview_len_0\" FROM \"slack\"\"messages\" LIMIT 3",
-	}
-	gotSampleQueries := append([]string(nil), runner.queries[4:]...)
-	slices.Sort(gotSampleQueries)
-	slices.Sort(wantSampleQueries)
-	if strings.Join(gotSampleQueries, "\n") != strings.Join(wantSampleQueries, "\n") {
-		t.Fatalf("sample queries = %#v, want %#v", gotSampleQueries, wantSampleQueries)
+	// The overview describes each table's columns (concurrently, so the order is
+	// nondeterministic) and runs NO per-row sample queries — dropping those is
+	// what roughly halved the response size.
+	wantDescribeQueries := []string{describeCleanGmailSQL, describeGmailSQL, describeSlackSQL}
+	gotDescribeQueries := append([]string(nil), runner.queries[4:]...)
+	slices.Sort(gotDescribeQueries)
+	slices.Sort(wantDescribeQueries)
+	if strings.Join(gotDescribeQueries, "\n") != strings.Join(wantDescribeQueries, "\n") {
+		t.Fatalf("describe queries = %#v, want %#v", gotDescribeQueries, wantDescribeQueries)
 	}
 	if len(resp.Results) != 1 {
 		t.Fatalf("results length = %d, want 1", len(resp.Results))
@@ -170,17 +151,17 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	wantCSV := strings.Join([]string{
 		"-- Reference these tables by their bare name in FROM/JOIN (e.g. FROM gmail_messages). Do not prefix them with the database name (\"default.\").",
 		"-- Each column header below is annotated with its Postgres type in parentheses, e.g. is_deleted (bigint), to_addresses (text[]).",
-		"-- Datetime columns: each source names its primary time column differently, so do not guess — whatsapp_messages.message_at, apple_messages.message_at, slack_messages.message_datetime, gmail_messages.internal_date, and all four are timestamp with time zone. Filter and compare timestamptz columns against timestamps, never epoch integers: message_at >= '2026-01-01', not message_at > 1700000000 (which errors with \"operator does not exist: timestamp with time zone > integer\"). Some neighbouring time columns are NOT timestamps and need converting before comparison: slack_messages.message_ts/edited_ts and gmail_messages.date_header are text, and apple_messages.date_ns is a bigint epoch in NANOseconds. There is no `timestamp` or `date_unix` column on any of these tables; when unsure, the column header's (type) annotation is authoritative.",
+		"-- Datetime columns: each source names its primary time column differently, so do not guess — gmail_messages.internal_date, slack_messages.message_datetime, apple_messages.message_at, apple_message_chat_messages.message_date, whatsapp_messages.message_at, agent_session_events.occurred_at, calendar_events.start_at, apple_notes.modified_at, apple_voice_memos_files.recorded_at, contact_cards.source_updated_at, google_drive_files.modified_time — all timestamp with time zone. There is no ts/created_at/timestamp/synced_at event-time column on the message tables. Filter and compare timestamptz columns against timestamps, never epoch integers: message_at >= '2026-01-01', not message_at > 1700000000 (which errors with \"operator does not exist: timestamp with time zone > integer\"). Some neighbouring time columns are NOT timestamps and need converting before comparison: slack_messages.message_ts/edited_ts and gmail_messages.date_header are text, and apple_messages.date_ns is a bigint epoch in NANOseconds. When unsure, the column header's (type) annotation is authoritative.",
+		"-- Slack uses a 3-table model with names that trip up guesses: the channels/DMs table is slack_conversations (not slack_channels) keyed by conversation_id (not channel_id); messages live in slack_messages; sync bookkeeping is slack_sync_state keyed by object_id with cursor_ts (text, often '' — guard ::numeric with NULLIF(cursor_ts,'')). raw_json columns are text, not jsonb (cast raw_json::jsonb before -> / ->>).",
 		"-- Each table lists its indexes. A gin (col gin_trgm_ops) index makes ILIKE and ~/~* substring search fast on that one column: match the column directly, e.g. body_text ILIKE '%x%' OR subject ILIKE '%x%'. Wrapping columns in lower(a || b || ...) or casting (to_addresses::text) bypasses every index and forces a full table scan, so search each indexed column separately and keep un-indexed expressions out of the same OR.",
 		"-- A bm25 (col) index supports relevance-ranked word search: SELECT ..., col <@> 'search terms' AS score FROM t ORDER BY col <@> 'search terms' LIMIT 20. Scores are negative (more negative = better; non-matches score 0); ALWAYS pair <@> with that ORDER BY plus a LIMIT, otherwise the index is not used. BM25 matches stemmed whole words only — no phrase queries and no typo tolerance — so for possibly-misspelled terms switch to the trigram indexes: WHERE col %> 'qery' ORDER BY word_similarity('qery', col) DESC LIMIT 20. Rule of thumb: <@> for topics and wording you trust, %> for fuzzy/typo'd terms, ILIKE for exact substrings.",
 		"-- Cross-source search (the default way to find things across the warehouse): SELECT * FROM search_text('offer letter', 50). It fans out to the per-table BM25 indexes and returns (source, subsource, context, who, occurred_at, account, ref, text, score) ranked across EVERY source — gmail, gmail attachments, slack messages/channels/files, apple notes, imessage, whatsapp, google drive docs, meeting transcripts, calendar, contacts, agent runs/sessions, and mutations — with score lower (more negative) = better. Optional args: search_text(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01'). The `sources` filter takes terse tokens that differ from the prose names above (apple notes => 'note', meeting transcripts => 'transcript', agent sessions => 'agent_session', mutations => 'mutation'/'mutation_request'; also 'gmail_attachment', 'slack_channel', 'slack_file', 'imessage', 'whatsapp'/'whatsapp_chat'/'whatsapp_media', 'google_drive', 'calendar', 'contact'). An unknown token RAISES an error listing the valid set (it does not silently return nothing) — run SELECT * FROM search_text_sources() to get the exact accepted tokens before filtering. Ranking caveats that cause MISSED answers: terms are OR'd, stemmed WHOLE words (no phrase/AND match, no typo tolerance) and scores are per-source, so cross-source order is only approximate — a noisy or short top-N does NOT mean a thing is absent. For 'find every mention of X' (especially a person): raise max_results well past the obvious noise, and try the term BOTH alone and with context — people are often addressed by first name only (e.g. 'Hi Mickey', no surname) or misspelled, which exact BM25 will rank low or miss, so also fall back to single-table trigram %> / ILIKE for name variants. Then drill into the underlying table via ref for full rows. (There is no cross-source view to scan with ILIKE — single-table BM25 <@> / trigram %> / ILIKE are for when you already know the table.)",
 		"-- For meetings, search_text(query, sources => ARRAY['transcript']) ranks the raw transcripts and surfaces the per-recording 'action_items' and 'summary' subsources (enrichment already extracted the commitments — read those first). Summaries are lossy, though: before reporting an email request as unanswered or a question as open, search the full transcript text (and Slack DMs) dated AFTER the request — decisions are often made on calls and appear only in raw transcripts.",
-		"-- Sample values below are previews truncated to 15 characters; query a table directly for full values.",
+		"-- Each table below lists its row estimate, indexes, and the full column catalog as `name (type)`. To see actual row values, query the table directly (e.g. SELECT * FROM <table> LIMIT 5).",
 		"",
 		"# clean_gmail_inbox",
 		"",
 		"thread_id (String),latest_subject (String)",
-		"thread-1,hello inbox",
 		"",
 		"# gmail_messages (~1,234,567 rows, estimated)",
 		"# indexes:",
@@ -188,8 +169,6 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		"#   gin (body_text gin_trgm_ops)",
 		"",
 		"id (String),body (String)",
-		"msg-1,abcdefghijklmno",
-		"msg-2,short",
 		"",
 		"# slack\"messages (~42 rows, estimated)",
 		"# indexes:",
@@ -198,7 +177,6 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		"#   gin (text gin_trgm_ops)",
 		"",
 		"channel_id (String)",
-		"C123",
 	}, "\n") + "\n"
 	result := resp.Results[0]
 	if result.Error != "" {
@@ -207,10 +185,8 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	if result.CSV != wantCSV {
 		t.Fatalf("CSV = %q, want %q", result.CSV, wantCSV)
 	}
-	// The schema overview deliberately emits no per-field truncation table:
-	// every sample value is a fixed-width preview, so a truncation row per
-	// field would be pure noise (and there is no cached query_id to fetch
-	// fuller values with). The leading note states the preview cap instead.
+	// The overview emits only the column catalog (one header row per table, no
+	// sampled values), so there is nothing to truncate.
 	if !result.Truncated.Empty() {
 		t.Fatalf("schema overview should not emit a truncation table, got %#v", result.Truncated)
 	}
@@ -389,57 +365,128 @@ func TestServiceExecuteReportsPerQueryErrors(t *testing.T) {
 	}
 }
 
-func TestDatetimeErrorHint(t *testing.T) {
+func TestSchemaErrorHint(t *testing.T) {
 	cases := []struct {
-		name    string
-		message string
-		want    string
+		name     string
+		message  string
+		sql      string
+		want     []string // all must be present
+		wantNone []string // none may be present
 	}{
-		{
-			name:    "missing column",
-			message: `ERROR: column "date_unix" does not exist (SQLSTATE 42703)`,
-			want:    "schema_overview",
-		},
-		{
-			name:    "missing timestamp column",
-			message: `ERROR: column "timestamp" does not exist (SQLSTATE 42703)`,
-			want:    "schema_overview",
-		},
 		{
 			name:    "timestamptz compared to integer",
 			message: "ERROR: operator does not exist: timestamp with time zone > integer (SQLSTATE 42883)",
-			want:    "compare it to a timestamp",
+			sql:     "SELECT 1 FROM slack_messages WHERE message_datetime > 1700000000",
+			want:    []string{"compare it to a timestamp"},
 		},
 		{
 			name:    "timestamptz compared to bigint",
 			message: "ERROR: operator does not exist: timestamp with time zone >= bigint (SQLSTATE 42883)",
-			want:    "compare it to a timestamp",
+			sql:     "SELECT 1 FROM apple_messages WHERE message_at >= 1700000000",
+			want:    []string{"compare it to a timestamp"},
 		},
 		{
-			name:    "unrelated error gets no hint",
-			message: "ERROR: syntax error at or near \"FROM\" (SQLSTATE 42601)",
-			want:    "",
+			name:    "time guess on a known single table names that table's column",
+			message: `ERROR: column "ts" does not exist (SQLSTATE 42703)`,
+			sql:     "SELECT ts FROM slack_messages LIMIT 1",
+			want:    []string{"slack_messages", "message_datetime", "schema_overview"},
 		},
 		{
-			name:    "unrelated operator error gets no hint",
-			message: "ERROR: operator does not exist: text > integer (SQLSTATE 42883)",
-			want:    "",
+			name:    "time guess on agent_session_events names occurred_at",
+			message: `ERROR: column "created_at" does not exist (SQLSTATE 42703)`,
+			sql:     "SELECT created_at FROM agent_session_events LIMIT 1",
+			want:    []string{"agent_session_events", "occurred_at"},
+		},
+		{
+			name:     "time guess with ambiguous join falls back to full list",
+			message:  `ERROR: column "ts" does not exist (SQLSTATE 42703)`,
+			sql:      "SELECT ts FROM slack_messages JOIN gmail_messages ON true",
+			want:     []string{"slack_messages.message_datetime", "gmail_messages.internal_date"},
+			wantNone: []string{"the primary time column on"},
+		},
+		{
+			name:     "structural column remap names the right column, not a time hint",
+			message:  `ERROR: column "channel_id" does not exist (SQLSTATE 42703)`,
+			sql:      "SELECT channel_id FROM slack_messages LIMIT 1",
+			want:     []string{"conversation_id", "slack_conversations"},
+			wantNone: []string{"primary time column", "message_datetime"},
+		},
+		{
+			name:    "chat_jid remap",
+			message: `ERROR: column "chat_jid" does not exist (SQLSTATE 42703)`,
+			sql:     "SELECT chat_jid FROM whatsapp_messages LIMIT 1",
+			want:    []string{"chat_id"},
+		},
+		{
+			name:     "non-time unknown column gets generic schema_overview hint only",
+			message:  `ERROR: column "frobnicate" does not exist (SQLSTATE 42703)`,
+			sql:      "SELECT frobnicate FROM gmail_messages LIMIT 1",
+			want:     []string{"schema_overview"},
+			wantNone: []string{"primary time column", "conversation_id"},
+		},
+		{
+			name:    "wrong table name remaps slack_channels",
+			message: `ERROR: relation "slack_channels" does not exist (SQLSTATE 42P01)`,
+			sql:     "SELECT * FROM slack_channels LIMIT 1",
+			want:    []string{"slack_conversations", "schema_overview"},
+		},
+		{
+			name:    "unknown table points at schema_overview",
+			message: `ERROR: relation "made_up_table" does not exist (SQLSTATE 42P01)`,
+			sql:     "SELECT * FROM made_up_table LIMIT 1",
+			want:    []string{"schema_overview"},
+		},
+		{
+			name:    "numeric cast of empty cursor_ts",
+			message: `ERROR: invalid input syntax for type numeric: "" (SQLSTATE 22P02)`,
+			sql:     "SELECT cursor_ts::numeric FROM slack_sync_state WHERE cursor_ts = ''",
+			want:    []string{"cursor_ts", "NULLIF"},
+		},
+		{
+			name:     "unrelated syntax error gets no hint",
+			message:  "ERROR: syntax error at or near \"FROM\" (SQLSTATE 42601)",
+			sql:      "SELECT FROM gmail_messages",
+			wantNone: []string{"hint"},
+		},
+		{
+			name:     "unrelated operator error gets no hint",
+			message:  "ERROR: operator does not exist: text > integer (SQLSTATE 42883)",
+			sql:      "SELECT 1 FROM gmail_messages WHERE subject > 1",
+			wantNone: []string{"hint"},
+		},
+		{
+			name:     "numeric cast unrelated to cursor_ts gets no hint",
+			message:  `ERROR: invalid input syntax for type numeric: "abc" (SQLSTATE 22P02)`,
+			sql:      "SELECT 'abc'::numeric",
+			wantNone: []string{"hint"},
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := datetimeErrorHint(c.message)
-			if c.want == "" {
+			got := schemaErrorHint(c.message, c.sql)
+			for _, want := range c.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("schemaErrorHint(%q) = %q, want it to contain %q", c.message, got, want)
+				}
+			}
+			for _, none := range c.wantNone {
+				if got != "" && strings.Contains(got, none) {
+					t.Fatalf("schemaErrorHint(%q) = %q, want it to NOT contain %q", c.message, got, none)
+				}
+			}
+			if len(c.want) == 0 {
 				if got != "" {
-					t.Fatalf("datetimeErrorHint(%q) = %q, want empty", c.message, got)
+					t.Fatalf("schemaErrorHint(%q) = %q, want empty", c.message, got)
+				}
+				// No hint means queryErrorWithHint returns the message unchanged.
+				if combined := queryErrorWithHint(c.message, c.sql); combined != c.message {
+					t.Fatalf("queryErrorWithHint(%q) = %q, want unchanged", c.message, combined)
 				}
 				return
 			}
-			if !strings.Contains(got, c.want) {
-				t.Fatalf("datetimeErrorHint(%q) = %q, want it to contain %q", c.message, got, c.want)
-			}
 			// The hint must be appended to the original message, not replace it.
-			if combined := queryErrorWithHint(c.message); !strings.HasPrefix(combined, c.message) || !strings.Contains(combined, got) {
+			combined := queryErrorWithHint(c.message, c.sql)
+			if !strings.HasPrefix(combined, c.message) || !strings.Contains(combined, got) {
 				t.Fatalf("queryErrorWithHint(%q) = %q, want original message plus hint", c.message, combined)
 			}
 		})
