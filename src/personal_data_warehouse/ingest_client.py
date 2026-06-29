@@ -35,6 +35,11 @@ OBJECT_UPLOAD_KIND = "object-upload"
 
 DEFAULT_LINK_TTL_SECONDS = 900
 DEFAULT_TIMEOUT_SECONDS = 120.0
+# Floor throughput used to scale the upload timeout with body size, so a large
+# blob gets proportionally longer to finish streaming to object storage instead
+# of tripping the fixed base timeout. ~1 MiB/s is deliberately pessimistic
+# (a 512 MiB body → ~512 s) to tolerate slow Drive writes.
+_MIN_UPLOAD_BYTES_PER_SEC = 1024 * 1024
 
 # The app accepts bodies up to PDW_INGEST_MAX_OBJECT_BYTES (Go default 512 MiB).
 # Mirror that default so size-aware clients (e.g. voice memos) can defer a file
@@ -158,10 +163,23 @@ class IngestClient:
             url,
             data=body,
             headers=headers,
-            timeout=self._timeout,
+            timeout=self._upload_timeout(len(body)),
         )
         response.raise_for_status()
         return response.json()
+
+    def _upload_timeout(self, body_bytes: int) -> float:
+        """Scale the request timeout with body size.
+
+        The fixed 120 s default is fine for batches and small blobs but too
+        short for large voice-memo audio: the app streams the whole body to
+        object storage before responding, so a few-hundred-MiB upload routinely
+        ran past 120 s and the client aborted it (the server then logged a 499,
+        which re-raised and wedged the run). Allow at least
+        ``_MIN_UPLOAD_BYTES_PER_SEC`` of throughput on top of the base timeout.
+        """
+
+        return max(self._timeout, body_bytes / _MIN_UPLOAD_BYTES_PER_SEC)
 
     def _post(
         self,

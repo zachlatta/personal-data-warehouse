@@ -403,3 +403,33 @@ def test_tailscale_ipv4_none_when_binary_missing(monkeypatch) -> None:
 
     monkeypatch.setattr(ic, "_tailscale_binary", lambda: None)
     assert ic._tailscale_ipv4("rotom") is None
+
+
+# --- size-aware upload timeout ---------------------------------------------
+
+
+def test_upload_timeout_scales_with_body_size() -> None:
+    client = IngestClient(
+        base_url="https://pdw.example.com",
+        signing_key=b"k" * 32,
+        timeout=120.0,
+    )
+    # Small bodies keep the base timeout...
+    assert client._upload_timeout(1024) == 120.0
+    # ...large ones get at least ~1 MiB/s of headroom so a multi-hundred-MiB
+    # upload to object storage does not trip the fixed 120 s default.
+    assert client._upload_timeout(300 * 1024 * 1024) == float(300 * 1024 * 1024) / (1024 * 1024)
+
+
+def test_upload_timeout_applied_to_post() -> None:
+    session = _FakeSession()
+    client = IngestClient(
+        base_url="https://pdw.example.com",
+        signing_key=b"k" * 32,
+        session=session,
+        now=lambda: 1700000000.0,
+        timeout=120.0,
+    )
+    big = b"x" * (200 * 1024 * 1024)
+    client.upload_agent_sessions_batch(big, exported_at="2026-06-19T12:34:56+00:00")
+    assert session.calls[0]["timeout"] == 200.0

@@ -367,3 +367,41 @@ def create_cloud_recordings_db(tmp_path: Path, *, filename: str, duration: float
         connection.commit()
     finally:
         connection.close()
+
+
+def test_incremental_runner_continues_past_a_failing_upload_then_raises(tmp_path) -> None:
+    # One memo's upload fails (e.g. a timeout); the rest must still upload, and
+    # the run must re-raise at the end so it is marked failed (FAILING), while
+    # the successful uploads are recorded so the next run resumes past them.
+    import pytest
+
+    for name in ("20260101 100000-AAAA0001.m4a", "20260101 110000-BBBB0002.m4a", "20260101 120000-CCCC0003.m4a"):
+        (tmp_path / name).write_bytes(b"audio")
+
+    class FlakyIngestClient(FakeIngestClient):
+        def upload_voice_memo_audio(self, content, *, recorded_at, extension, content_type):
+            if recorded_at == "2026-01-01T11:00:00+00:00":
+                raise RuntimeError("499 simulated timeout")
+            return super().upload_voice_memo_audio(
+                content, recorded_at=recorded_at, extension=extension, content_type=content_type
+            )
+
+    ingest = FlakyIngestClient()
+    state = VoiceMemosUploadState.empty(account="zach@example.com", recordings_path=tmp_path)
+    runner = VoiceMemosUploadRunner(
+        account="zach@example.com",
+        recordings_path=tmp_path,
+        extensions=(".m4a",),
+        ingest_client=ingest,
+        logger=FakeLogger(),
+        mode="incremental",
+        upload_state=state,
+        now=lambda: datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    with pytest.raises(RuntimeError, match="499 simulated timeout"):
+        runner.sync()
+
+    # The two good memos uploaded despite the middle one failing mid-batch
+    # (before this fix, the first failure re-raised and aborted the rest).
+    uploaded_at = {u["recorded_at"] for u in ingest.audio_uploads}
+    assert uploaded_at == {"2026-01-01T10:00:00+00:00", "2026-01-01T12:00:00+00:00"}

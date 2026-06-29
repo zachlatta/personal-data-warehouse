@@ -262,24 +262,36 @@ class VoiceMemosUploadRunner:
 
         self._logger.info("Uploading with %s worker(s)", self._workers)
         recordings = [(candidate, recording_from_candidate(candidate)) for candidate in selected]
+        # Per-file failures are collected, not raised mid-batch: a single memo
+        # that errors (e.g. a slow upload that trips a timeout) must not abort
+        # the rest of the run. Successful uploads are recorded in upload_state,
+        # so the next run resumes past them; we re-raise once at the end so the
+        # run still exits non-zero (and the status helper shows FAILING).
+        failures: list[tuple[str, Exception]] = []
+
+        def _attempt(index: int, candidate, recording) -> _RecordingSyncResult | None:
+            try:
+                return self._sync_candidate(
+                    index=index, total=len(recordings), candidate=candidate, recording=recording
+                )
+            except Exception as exc:  # noqa: BLE001 - keep going; surfaced after the batch
+                self._logger.warning("Failed to upload %s: %s", candidate.filename, exc)
+                failures.append((candidate.filename, exc))
+                return None
+
         if self._workers == 1 or len(recordings) <= 1:
             results = [
-                self._sync_candidate(index=index, total=len(recordings), candidate=candidate, recording=recording)
+                result
                 for index, (candidate, recording) in enumerate(recordings, start=1)
+                if (result := _attempt(index, candidate, recording)) is not None
             ]
         else:
             with ThreadPoolExecutor(max_workers=self._workers, thread_name_prefix="voice-memos") as executor:
                 futures = [
-                    executor.submit(
-                        self._sync_candidate,
-                        index=index,
-                        total=len(recordings),
-                        candidate=candidate,
-                        recording=recording,
-                    )
+                    executor.submit(_attempt, index, candidate, recording)
                     for index, (candidate, recording) in enumerate(recordings, start=1)
                 ]
-                results = [future.result() for future in as_completed(futures)]
+                results = [result for future in as_completed(futures) if (result := future.result()) is not None]
 
         uploaded = sum(result.uploaded for result in results)
         skipped = state_skipped + sum(result.skipped for result in results)
@@ -311,6 +323,15 @@ class VoiceMemosUploadRunner:
             summary.recordings_deferred,
             summary.metadata_uploaded,
         )
+        if failures:
+            self._logger.warning(
+                "Voice Memos upload finished with %s failed recording(s) after uploading %s; "
+                "re-raising the first so the run is marked failed (successful uploads are recorded, "
+                "so the next run resumes past them)",
+                len(failures),
+                summary.recordings_uploaded,
+            )
+            raise failures[0][1]
         return summary
 
     def _sync_candidate(
