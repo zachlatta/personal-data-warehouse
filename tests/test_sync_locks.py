@@ -169,8 +169,28 @@ def test_slack_freshness_sync_piggybacks_read_state(monkeypatch) -> None:
     assert calls[-1]["conversation_limit"] == 25
 
 
-def test_slack_coverage_sync_runs_current_stage(monkeypatch) -> None:
-    calls = []
+def _coverage_test_settings() -> Settings:
+    return Settings(
+        gmail_accounts=(),
+        gmail_oauth_client_secrets_json=None,
+        gmail_scopes=(),
+        gmail_page_size=500,
+        gmail_include_spam_trash=True,
+        gmail_force_full_sync=False,
+        gmail_full_sync_query=None,
+        gmail_attachment_max_bytes=25 * 1024 * 1024,
+        gmail_attachment_text_max_chars=1_000_000,
+        gmail_attachment_backfill_batch_size=100,
+        slack_accounts=(),
+        slack_page_size=200,
+        slack_lookback_days=14,
+        slack_thread_audit_days=30,
+        slack_force_full_sync=False,
+    )
+
+
+def _record_coverage_runner_calls(monkeypatch) -> list[dict]:
+    calls: list[dict] = []
 
     class FakeRunner:
         def __init__(self, **kwargs):
@@ -190,29 +210,20 @@ def test_slack_coverage_sync_runs_current_stage(monkeypatch) -> None:
             ]
 
     monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
-    settings = Settings(
-        gmail_accounts=(),
-        gmail_oauth_client_secrets_json=None,
-        gmail_scopes=(),
-        gmail_page_size=500,
-        gmail_include_spam_trash=True,
-        gmail_force_full_sync=False,
-        gmail_full_sync_query=None,
-        gmail_attachment_max_bytes=25 * 1024 * 1024,
-        gmail_attachment_text_max_chars=1_000_000,
-        gmail_attachment_backfill_batch_size=100,
-        slack_accounts=(),
-        slack_page_size=200,
-        slack_lookback_days=14,
-        slack_thread_audit_days=30,
-        slack_force_full_sync=False,
-    )
+    return calls
 
+
+def test_slack_coverage_sync_runs_current_stage(monkeypatch) -> None:
+    calls = _record_coverage_runner_calls(monkeypatch)
+    settings = _coverage_test_settings()
+
+    # The coverage job fires every 7 minutes, so stages rotate over minute // 7.
+    # Fire-slot 1 (minutes 7..13) is the mpim stage.
     summaries = run_slack_coverage_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
         logger=SimpleNamespace(),
-        now=datetime(2026, 4, 24, 17, 1, tzinfo=UTC),
+        now=datetime(2026, 4, 24, 17, 7, tzinfo=UTC),
     )
 
     assert len(summaries) == 1
@@ -228,6 +239,52 @@ def test_slack_coverage_sync_runs_current_stage(monkeypatch) -> None:
     # before any progress could be recorded.
     assert coverage_call["settings"] is settings
     assert coverage_call["settings"].slack_force_full_sync is False
+
+
+def test_slack_coverage_sync_includes_im_backfill_stage(monkeypatch) -> None:
+    # IMs (DMs) have no path other than coverage to backfill history that predates
+    # the freshness window, so the rotation must include an `im` stage. Fire-slot 6
+    # (minutes 42..48) is that stage.
+    calls = _record_coverage_runner_calls(monkeypatch)
+    settings = _coverage_test_settings()
+
+    summaries = run_slack_coverage_sync(
+        settings=settings,
+        warehouse=SimpleNamespace(),
+        logger=SimpleNamespace(),
+        now=datetime(2026, 4, 24, 17, 42, tzinfo=UTC),
+    )
+
+    assert len(summaries) == 1
+    coverage_call = calls[0]
+    assert coverage_call["conversation_types"] == ("im",)
+    assert coverage_call["not_full_only"] is True
+    assert coverage_call["skip_known_errors"] is True
+    assert coverage_call["conversation_limit"] == 50
+
+
+def test_slack_coverage_rotation_reaches_every_stage_under_seven_minute_cron(monkeypatch) -> None:
+    # Regression: stage selection must rotate across all conversation kinds when
+    # driven by the */7 cron. A naive minute % 7 collapses to a single stage (every
+    # */7 fire-minute is congruent to 0 mod 7); minute // 7 cycles through them.
+    settings = _coverage_test_settings()
+    fire_minutes = [m for m in range(60) if m % 7 == 0]  # 0,7,14,...,56
+    seen_types: set[tuple[str, ...]] = set()
+
+    for minute in fire_minutes:
+        calls = _record_coverage_runner_calls(monkeypatch)
+        run_slack_coverage_sync(
+            settings=settings,
+            warehouse=SimpleNamespace(),
+            logger=SimpleNamespace(),
+            now=datetime(2026, 4, 24, 17, minute, tzinfo=UTC),
+        )
+        seen_types.add(calls[0]["conversation_types"])
+
+    assert ("im",) in seen_types
+    assert ("mpim",) in seen_types
+    assert ("private_channel",) in seen_types
+    assert ("public_channel",) in seen_types
 
 
 def test_slack_metadata_sync_refreshes_one_conversation_type(monkeypatch) -> None:

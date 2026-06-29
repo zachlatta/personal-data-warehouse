@@ -263,7 +263,12 @@ def run_intelligent_slack_sync(*, settings, warehouse, logger, now: datetime | N
 
 
 def _coverage_stage_for_time(now: datetime) -> dict[str, object] | None:
-    stage = now.minute % 6
+    # The coverage job fires every 7 minutes (*/7), so rotate stages over the
+    # fire-slot index within the hour (minute // 7), not minute % N. A plain
+    # minute % 7 would collapse to a single stage forever because every */7
+    # fire-minute is congruent to 0 (mod 7); minute // 7 advances by one on each
+    # fire, cycling through every stage instead.
+    stage = (now.minute // 7) % 7
     if stage == 1:
         return {
             "conversation_types": ("mpim",),
@@ -298,6 +303,21 @@ def _coverage_stage_for_time(now: datetime) -> dict[str, object] | None:
             "archived_only": True,
             "zero_messages_only": False,
             "limit": _int_env("SLACK_ASSET_ARCHIVED_PUBLIC_COVERAGE_LIMIT", 25),
+        }
+    if stage == 6:
+        # Direct messages have no other backfill path: the freshness pass only
+        # fetches IMs active within its short recent window, so a DM whose last
+        # activity predates that window is otherwise never pulled — leaving a large
+        # backlog of never-synced IMs (and stale ones) whose history we never grab.
+        # Mirror the mpim stage to walk their history; not_full_only (set by
+        # run_slack_coverage_sync) scopes this to IMs not yet fully synced, and the
+        # activity gate is skipped for never-synced conversations so their full
+        # history is backfilled.
+        return {
+            "conversation_types": ("im",),
+            "archived_only": False,
+            "zero_messages_only": False,
+            "limit": _int_env("SLACK_ASSET_IM_COVERAGE_LIMIT", 50),
         }
     return {
         "conversation_types": ("public_channel",),
