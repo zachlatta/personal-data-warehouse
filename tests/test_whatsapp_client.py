@@ -8,7 +8,20 @@ import sqlite3
 import warnings
 
 from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
-from personal_data_warehouse_whatsapp.batcher import WhatsAppBatcher
+from personal_data_warehouse.ingest_client import CLOUDFLARE_MAX_BODY_BYTES
+from personal_data_warehouse.objectstore import ObjectListing
+from personal_data_warehouse.objectstore.google_drive import object_stage
+from personal_data_warehouse.whatsapp_drive_ingest import (
+    WhatsAppDriveIngestRunner,
+    iter_batch_payloads,
+)
+from personal_data_warehouse_whatsapp.batcher import (
+    BATCH_RECORD_KIND,
+    MEDIA_KIND,
+    WhatsAppBatcher,
+    batch_object_key,
+    media_object_key,
+)
 from personal_data_warehouse_whatsapp.client import WhatsAppClientRunner, write_qr_artifacts
 from personal_data_warehouse_whatsapp.events import (
     chat_payload_from_group_info,
@@ -45,37 +58,54 @@ class FakeLogger:
         self.messages.append(args[0] % args[1:] if len(args) > 1 else str(args[0]))
 
 
-class FakeIngestClient:
-    """Stands in for the app ingest client; records batch + media posts in
-    file_uploads (tagged by kind), with the posted bytes."""
+class FakeObjectStore:
+    """Stands in for the Drive ObjectStore; records every put_file (tagged by
+    kind), with the written object key, app properties, and bytes."""
+
+    backend = "google_drive"
 
     def __init__(self) -> None:
         self.file_uploads: list[dict[str, object]] = []
 
-    def _stored(self) -> dict:
-        return {"storage_backend": "google_drive", "storage_key": "k", "storage_file_id": "fid", "storage_url": ""}
-
-    def upload_whatsapp_batch(self, gzip_bytes, *, exported_at):
-        self.file_uploads.append({"kind": "whatsapp_export_batch", "bytes": gzip_bytes, "exported_at": exported_at})
-        return self._stored()
-
-    def upload_whatsapp_media(self, content, *, chat_id, message_id, content_type, message_at, filename, mime_type):
+    def put_file(
+        self,
+        *,
+        path: Path,
+        object_key: str,
+        content_sha256: str,
+        content_type: str,
+        skip_existing_check: bool = False,
+        app_properties: dict[str, str] | None = None,
+        kind: str | None = None,
+    ):
         self.file_uploads.append(
-            {"kind": "whatsapp_media_item", "bytes": content, "chat_id": chat_id, "message_id": message_id, "content_type": content_type}
+            {
+                "object_key": object_key,
+                "content_sha256": content_sha256,
+                "content_type": content_type,
+                "kind": kind or "file",
+                "app_properties": app_properties or {},
+                "bytes": path.read_bytes(),
+            }
         )
-        return self._stored()
+        return {
+            "storage_backend": self.backend,
+            "storage_key": object_key,
+            "storage_file_id": f"file-{content_sha256[:8]}",
+            "storage_url": f"https://example.test/{object_key}",
+        }
 
 
-class FailOnceBatchIngestClient(FakeIngestClient):
+class FailOnceBatchObjectStore(FakeObjectStore):
     def __init__(self) -> None:
         super().__init__()
         self.fail_next_batch = True
 
-    def upload_whatsapp_batch(self, gzip_bytes, *, exported_at):
-        if self.fail_next_batch:
+    def put_file(self, **kwargs):
+        if kwargs.get("kind") == "whatsapp_export_batch" and self.fail_next_batch:
             self.fail_next_batch = False
             raise RuntimeError("transient batch upload failure")
-        return super().upload_whatsapp_batch(gzip_bytes, exported_at=exported_at)
+        return super().put_file(**kwargs)
 
 
 class FakeSessionWarehouse:
@@ -234,7 +264,7 @@ def test_client_registers_noop_handlers_for_unhandled_neonize_events(tmp_path) -
     runner = WhatsAppClientRunner(
         account="zach@example.com",
         session_path=tmp_path / "session.sqlite",
-        ingest_client=FakeIngestClient(),
+        object_store=FakeObjectStore(),
         upload_state=None,
         logger=FakeLogger(),
     )
@@ -475,7 +505,7 @@ def test_dump_groups_queues_named_chats_and_participants(tmp_path) -> None:
     runner = WhatsAppClientRunner(
         account="zach@example.com",
         session_path=tmp_path / "session.sqlite",
-        ingest_client=FakeIngestClient(),
+        object_store=FakeObjectStore(),
         upload_state=None,
         logger=FakeLogger(),
     )
@@ -498,7 +528,7 @@ def test_dump_groups_retries_after_failure(tmp_path) -> None:
     runner = WhatsAppClientRunner(
         account="zach@example.com",
         session_path=tmp_path / "session.sqlite",
-        ingest_client=FakeIngestClient(),
+        object_store=FakeObjectStore(),
         upload_state=None,
         logger=FakeLogger(),
     )
@@ -512,10 +542,10 @@ def test_dump_groups_retries_after_failure(tmp_path) -> None:
 
 def test_batcher_flushes_batch_with_media_then_skips_unchanged(tmp_path) -> None:
     state = WhatsAppUploadState.open(tmp_path / "state.sqlite", account="zach@example.com", store_path="session")
-    ingest = FakeIngestClient()
+    store = FakeObjectStore()
     batcher = WhatsAppBatcher(
         account="zach@example.com",
-        ingest_client=ingest,
+        object_store=store,
         upload_state=state,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 13, tzinfo=UTC),
@@ -543,14 +573,16 @@ def test_batcher_flushes_batch_with_media_then_skips_unchanged(tmp_path) -> None
 
         assert summary.batches_uploaded == 1
         assert summary.media_uploaded == 1
-        batch_uploads = [u for u in ingest.file_uploads if u["kind"] == "whatsapp_export_batch"]
-        media_uploads = [u for u in ingest.file_uploads if u["kind"] == "whatsapp_media_item"]
+        batch_uploads = [u for u in store.file_uploads if u["kind"] == "whatsapp_export_batch"]
+        media_uploads = [u for u in store.file_uploads if u["kind"] == "whatsapp_media_item"]
         assert len(batch_uploads) == 1
         assert len(media_uploads) == 1
         assert media_uploads[0]["bytes"] == b"media body"
-        # The app owns the object key now; the client sends the domain ids.
-        assert media_uploads[0]["chat_id"]
-        assert media_uploads[0]["message_id"]
+        # The client builds the object key + tags directly for the Drive writer.
+        assert media_uploads[0]["object_key"].startswith("whatsapp/inbox/media/2026/05/")
+        assert media_uploads[0]["app_properties"]["chat_id"]
+        assert media_uploads[0]["app_properties"]["message_id"]
+        assert batch_uploads[0]["object_key"].startswith("whatsapp/inbox/batches/2026/05/")
         records = [
             json.loads(line)
             for line in gzip.decompress(batch_uploads[0]["bytes"]).decode("utf-8").splitlines()
@@ -584,10 +616,10 @@ def test_batcher_flushes_batch_with_media_then_skips_unchanged(tmp_path) -> None
 
 
 def test_batcher_requeues_records_when_batch_upload_fails() -> None:
-    ingest = FailOnceBatchIngestClient()
+    store = FailOnceBatchObjectStore()
     batcher = WhatsAppBatcher(
         account="zach@example.com",
-        ingest_client=ingest,
+        object_store=store,
         upload_state=None,
         logger=FakeLogger(),
         now=lambda: datetime(2026, 5, 21, 13, tzinfo=UTC),
@@ -607,5 +639,256 @@ def test_batcher_requeues_records_when_batch_upload_fails() -> None:
     summary = batcher.flush()
 
     assert summary.batches_uploaded == 1
-    batch_uploads = [u for u in ingest.file_uploads if u["kind"] == "whatsapp_export_batch"]
+    batch_uploads = [u for u in store.file_uploads if u["kind"] == "whatsapp_export_batch"]
     assert len(batch_uploads) == 1
+
+
+def _image_media_record():
+    image = E.Message(
+        imageMessage=E.ImageMessage(mimetype="image/jpeg", caption="pic", fileLength=9, fileSHA256=b"\x09")
+    )
+    record = message_record_from_event(message_event(message=image))
+    assert record is not None and record.media is not None
+    return record
+
+
+def test_batcher_writes_drive_objects_with_reader_contract_tags(tmp_path) -> None:
+    """The client must write objects whose kind/stage/key/app_properties exactly
+    match what the whatsapp_drive_ingest reader queries by (no app-HTTP hop)."""
+    state = WhatsAppUploadState.open(tmp_path / "state.sqlite", account="zach@example.com", store_path="session")
+    store = FakeObjectStore()
+    exported_at = datetime(2026, 5, 21, 13, 30, 5, tzinfo=UTC)
+    batcher = WhatsAppBatcher(
+        account="zach@example.com",
+        object_store=store,
+        upload_state=state,
+        logger=FakeLogger(),
+        now=lambda: exported_at,
+    )
+    try:
+        record = _image_media_record()
+        batcher.add_message(record.payload)
+        batcher.add_media(record.media, downloader=lambda _msg: b"media body")
+        batcher.flush()
+    finally:
+        state.close()
+
+    batch = next(u for u in store.file_uploads if u["kind"] == BATCH_RECORD_KIND)
+    media = next(u for u in store.file_uploads if u["kind"] == MEDIA_KIND)
+
+    # Batch object: key, kind, content_type, and the app_properties the reader
+    # (and the GoogleDriveObjectStore) rely on. content_sha256 is the gzip sha.
+    import hashlib
+
+    batch_sha = hashlib.sha256(batch["bytes"]).hexdigest()
+    assert batch["object_key"] == batch_object_key(exported_at=exported_at, batch_sha256=batch_sha)
+    assert batch["object_key"].startswith("whatsapp/inbox/batches/2026/05/")
+    assert object_stage(batch["object_key"]) == "inbox"
+    assert batch["content_type"] == "application/gzip"
+    assert batch["content_sha256"] == batch_sha
+    assert batch["app_properties"] == {
+        "batch_sha256": batch_sha,
+        "exported_at": exported_at.isoformat(),
+    }
+
+    # Media object: key uses message_at date + safe(chat-message) + sha + suffix;
+    # tags carry chat_id/message_id; content_sha256 is the blob sha.
+    media_sha = hashlib.sha256(b"media body").hexdigest()
+    payload = dict(record.media.payload)
+    assert media["object_key"] == media_object_key(payload, content_sha256=media_sha, fallback_now=exported_at)
+    assert object_stage(media["object_key"]) == "inbox"
+    assert media["content_sha256"] == media_sha
+    assert media["app_properties"]["chat_id"] == payload["chat_id"]
+    assert media["app_properties"]["message_id"] == payload["message_id"]
+
+
+def test_batcher_uploads_media_larger_than_cloudflare_cap(tmp_path) -> None:
+    """Writing straight to Drive has no Cloudflare 100 MiB body cap: a >100 MiB
+    media item uploads in one shot instead of being 413'd or deferred."""
+    store = FakeObjectStore()
+    batcher = WhatsAppBatcher(
+        account="zach@example.com",
+        object_store=store,
+        upload_state=None,
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 5, 21, 13, tzinfo=UTC),
+    )
+    record = _image_media_record()
+    big = b"\0" * (CLOUDFLARE_MAX_BODY_BYTES + 1)
+    batcher.add_message(record.payload)
+    batcher.add_media(record.media, downloader=lambda _msg: big)
+
+    summary = batcher.flush()
+
+    assert summary.media_uploaded == 1
+    assert summary.media_deferred == 0
+    media = next(u for u in store.file_uploads if u["kind"] == MEDIA_KIND)
+    assert len(media["bytes"]) == CLOUDFLARE_MAX_BODY_BYTES + 1
+
+
+class InMemoryDriveStore:
+    """In-memory ObjectStore that mirrors GoogleDriveObjectStore tag derivation,
+    so a batcher write can be consumed by whatsapp_drive_ingest unchanged."""
+
+    backend = "google_drive"
+
+    def __init__(self, *, folder_id: str = "folder", source: str = "whatsapp") -> None:
+        self._folder_id = folder_id
+        self._source = source
+        self._objects: dict[str, dict[str, object]] = {}
+        self._counter = 0
+
+    def put_file(
+        self,
+        *,
+        path: Path,
+        object_key: str,
+        content_sha256: str,
+        content_type: str,
+        skip_existing_check: bool = False,
+        app_properties: dict[str, str] | None = None,
+        kind: str | None = None,
+    ):
+        for fid, obj in self._objects.items():  # dedup by (content_sha256, kind)
+            props = obj["app_properties"]
+            if props.get("content_sha256") == content_sha256 and props.get("pdw_kind") == kind:
+                return self._ref(fid)
+        self._counter += 1
+        fid = f"file-{self._counter}"
+        props = {
+            "pdw_source": self._source,
+            "pdw_kind": kind or "",
+            "pdw_root_folder_id": self._folder_id,
+            "pdw_stage": object_stage(object_key),
+            "content_sha256": content_sha256,
+            **(app_properties or {}),
+        }
+        self._objects[fid] = {
+            "bytes": path.read_bytes(),
+            "key": object_key,
+            "app_properties": props,
+            "filename": object_key.rsplit("/", 1)[-1],
+        }
+        return self._ref(fid)
+
+    def _ref(self, fid: str):
+        obj = self._objects[fid]
+        return {
+            "storage_backend": self.backend,
+            "storage_key": obj["key"],
+            "storage_file_id": fid,
+            "storage_url": "",
+        }
+
+    def _listing(self, fid: str) -> ObjectListing:
+        obj = self._objects[fid]
+        return ObjectListing(
+            ref={"storage_backend": self.backend, "storage_key": "", "storage_file_id": fid, "storage_url": ""},
+            app_properties=dict(obj["app_properties"]),
+            filename=str(obj["filename"]),
+        )
+
+    def list_objects(self, *, kind, stage=None, properties=None):
+        out = []
+        for fid, obj in self._objects.items():
+            props = obj["app_properties"]
+            if props.get("pdw_kind") != kind:
+                continue
+            if stage and props.get("pdw_stage") != stage:
+                continue
+            out.append(self._listing(fid))
+        return out
+
+    def find_object(self, *, kind, stage=None, properties=None):
+        matches = self.list_objects(kind=kind, stage=stage, properties=properties)
+        return matches[0] if matches else None
+
+    def get_object(self, ref):
+        return self._objects[str(ref["storage_file_id"])]["bytes"]
+
+    def move_object(self, ref, *, new_object_key, app_properties=None):
+        fid = str(ref["storage_file_id"])
+        obj = self._objects[fid]
+        obj["key"] = new_object_key
+        obj["filename"] = new_object_key.rsplit("/", 1)[-1]
+        obj["app_properties"]["pdw_stage"] = object_stage(new_object_key)
+        obj["app_properties"].update(app_properties or {})
+        return self._ref(fid)
+
+
+class RoundTripWarehouse:
+    def __init__(self) -> None:
+        self.chats: list[dict] = []
+        self.messages: list[dict] = []
+        self.media_items: list[dict] = []
+
+    def ensure_whatsapp_tables(self) -> None:
+        pass
+
+    def insert_whatsapp_chats(self, rows) -> None:
+        self.chats.extend(rows)
+
+    def insert_whatsapp_chat_participants(self, rows) -> None:
+        pass
+
+    def insert_whatsapp_contacts(self, rows) -> None:
+        pass
+
+    def insert_whatsapp_messages(self, rows) -> None:
+        self.messages.extend(rows)
+
+    def insert_whatsapp_media_items(self, rows) -> None:
+        self.media_items.extend(rows)
+
+    def backfill_whatsapp_chats_from_messages(self) -> int:
+        return 0
+
+
+def test_batcher_output_is_consumed_by_drive_ingest_unchanged(tmp_path) -> None:
+    """End-to-end: the client writes batch + media straight to the store, then
+    whatsapp_drive_ingest reads and promotes them with NO reader changes."""
+    state = WhatsAppUploadState.open(tmp_path / "state.sqlite", account="zach@example.com", store_path="session")
+    store = InMemoryDriveStore()
+    batcher = WhatsAppBatcher(
+        account="zach@example.com",
+        object_store=store,
+        upload_state=state,
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 5, 21, 13, tzinfo=UTC),
+    )
+    try:
+        record = _image_media_record()
+        batcher.add_message(record.payload)
+        batcher.add_media(record.media, downloader=lambda _msg: b"media body")
+        batcher.flush()
+    finally:
+        state.close()
+
+    warehouse = RoundTripWarehouse()
+    summary = WhatsAppDriveIngestRunner(
+        warehouse=warehouse,
+        batch_source=lambda: iter_batch_payloads(object_store=store),
+        object_store=store,
+        logger=FakeLogger(),
+    ).sync()
+
+    assert summary.batches_seen == 1
+    assert summary.messages_written == 1
+    assert summary.media_items_written == 1
+    assert summary.files_promoted == 2  # batch + media promoted inbox -> library
+
+    media_row = warehouse.media_items[0]
+    assert media_row["content_sha256"] == hashlib_sha256(b"media body")
+    assert media_row["is_missing"] == 0
+    # Promotion relocates the blob from inbox to library; the row records the
+    # library key the reader rewrote it to.
+    assert media_row["storage_key"].startswith("whatsapp/library/media/")
+    assert media_row["storage_backend"] == "google_drive"
+    # Every promoted object now carries the library stage tag.
+    assert all(obj["app_properties"]["pdw_stage"] == "library" for obj in store._objects.values())
+
+
+def hashlib_sha256(content: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(content).hexdigest()

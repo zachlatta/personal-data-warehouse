@@ -92,8 +92,8 @@ func TestLoadFromEnvIngestFolderResolution(t *testing.T) {
 		t.Fatalf("agent_sessions folder = %q, want per-source override", got)
 	}
 	// Sources without an override fall back to the shared object-store folder.
-	if got := cfg.IngestFolderIDs["whatsapp"]; got != "shared-folder" {
-		t.Fatalf("whatsapp folder = %q, want shared fallback", got)
+	if got := cfg.IngestFolderIDs["apple_messages"]; got != "shared-folder" {
+		t.Fatalf("apple_messages folder = %q, want shared fallback", got)
 	}
 }
 

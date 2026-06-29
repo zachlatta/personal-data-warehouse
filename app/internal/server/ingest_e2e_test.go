@@ -144,7 +144,6 @@ func e2eCases() []e2eCase {
 	sha := func(b []byte) string { return sha256Hex(b) }
 	batchBody := []byte("gzipped-batch")
 	att := []byte("attachment-bytes")
-	media := []byte("media-bytes")
 	audio := []byte("audio-bytes")
 	meta := []byte(`{"schema_version":1}`)
 	html := []byte("<html>x</html>")
@@ -169,18 +168,6 @@ func e2eCases() []e2eCase {
 			extra:    url.Values{"attachment_guid": {"A1"}, "message_guid": {"M1"}, "content_type": {"image/jpeg"}, "created_at": {"2025-03-04T00:00:00+00:00"}, "filename": {"p.jpg"}},
 			wantName: "2025-03-04-A1-" + sha(att) + ".jpg", wantMime: "image/jpeg",
 			wantProps: map[string]string{"pdw_kind": "apple_message_attachment", "attachment_guid": "A1", "message_guid": "M1"},
-		},
-		{
-			name: "whatsapp/batch", endpoint: "/ingest/whatsapp/batch", body: batchBody,
-			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
-			wantName: "20260619T123456Z-" + sha(batchBody) + ".jsonl.gz", wantMime: "application/gzip",
-			wantProps: map[string]string{"pdw_kind": "whatsapp_export_batch", "pdw_source": "whatsapp"},
-		},
-		{
-			name: "whatsapp/media", endpoint: "/ingest/whatsapp/media", body: media,
-			extra:    url.Values{"chat_id": {"C1"}, "message_id": {"M9"}, "content_type": {"image/png"}, "message_at": {"2024-12-31T00:00:00+00:00"}, "filename": {"i.png"}, "mime_type": {"image/png"}},
-			wantName: "2024-12-31-C1-M9-" + sha(media) + ".png", wantMime: "image/png",
-			wantProps: map[string]string{"pdw_kind": "whatsapp_media_item", "chat_id": "C1", "message_id": "M9"},
 		},
 		{
 			name: "voice-memos/audio", endpoint: "/ingest/voice-memos/audio", body: audio,

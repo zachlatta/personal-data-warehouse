@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"net/url"
 	"path"
@@ -42,7 +41,6 @@ type ingestSourceDef struct {
 var ingestSourceDefs = map[string]ingestSourceDef{
 	"agent_sessions":    {source: "agent_sessions", blobKind: "agent_sessions_blob", metadataKind: "agent_sessions_export_batch"},
 	"apple_messages":    {source: "apple_messages", blobKind: "apple_message_attachment", metadataKind: "apple_message_export_batch"},
-	"whatsapp":          {source: "whatsapp", blobKind: "whatsapp_media_item", metadataKind: "whatsapp_export_batch"},
 	"apple_voice_memos": {source: "apple_voice_memos", blobKind: "voice_memo_audio", metadataKind: "voice_memo_metadata", legacySources: []string{"voice_memos"}},
 	"apple_notes":       {source: "apple_notes", blobKind: "apple_note_body_html", metadataKind: "apple_note_revision_metadata"},
 }
@@ -275,8 +273,8 @@ func parseTimestamp(value string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unparseable timestamp %q", value)
 }
 
-// batchObjectKey builds the inbox batch key shared by agent-sessions,
-// apple-messages, and whatsapp:
+// batchObjectKey builds the inbox batch key shared by agent-sessions and
+// apple-messages:
 // <prefix>/batches/YYYY/MM/<YYYYMMDDTHHMMSSZ>-<sha>.jsonl.gz
 func batchObjectKey(prefix string, exportedAt time.Time, sha string) string {
 	e := exportedAt.UTC()
@@ -317,7 +315,6 @@ func ingestArtifacts() []ingestArtifact {
 	return []ingestArtifact{
 		batch("/ingest/agent-sessions/batch", "agent_sessions", "agent-sessions/inbox", "agent_sessions_export_batch"),
 		batch("/ingest/apple-messages/batch", "apple_messages", "apple-messages/inbox", "apple_message_export_batch"),
-		batch("/ingest/whatsapp/batch", "whatsapp", "whatsapp/inbox", "whatsapp_export_batch"),
 		{
 			endpoint:   "/ingest/apple-messages/attachment",
 			sourceSlug: "apple_messages",
@@ -343,37 +340,6 @@ func ingestArtifacts() []ingestArtifact {
 					objectKey:     key,
 					contentType:   contentType,
 					appProperties: map[string]string{"attachment_guid": attachmentGUID, "message_guid": messageGUID},
-				}, nil
-			},
-		},
-		{
-			endpoint:   "/ingest/whatsapp/media",
-			sourceSlug: "whatsapp",
-			kind:       "whatsapp_media_item",
-			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
-				chatID := q.Get("chat_id")
-				messageID := q.Get("message_id")
-				contentType := q.Get("content_type")
-				occurred, err := parseTimestampUTC(q.Get("message_at"))
-				if err != nil || occurred.Year() <= 1970 {
-					occurred = now
-				}
-				suffix := pythonSuffix(q.Get("filename"))
-				if suffix == "" {
-					if exts, _ := mime.ExtensionsByType(q.Get("mime_type")); len(exts) > 0 {
-						suffix = exts[0]
-					}
-				}
-				if suffix == "" {
-					suffix = ".bin"
-				}
-				part := safeObjectKeyPart(chatID + "-" + messageID)
-				key := fmt.Sprintf("whatsapp/inbox/media/%04d/%02d/%s-%s-%s%s",
-					occurred.Year(), int(occurred.Month()), occurred.Format("2006-01-02"), part, sha, suffix)
-				return ingestBuildResult{
-					objectKey:     key,
-					contentType:   contentType,
-					appProperties: map[string]string{"chat_id": chatID, "message_id": messageID},
 				}, nil
 			},
 		},

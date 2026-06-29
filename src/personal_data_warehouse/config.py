@@ -856,12 +856,11 @@ def load_settings(
         or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
         or ""
     ).strip()
+    # The in-Dagster WhatsApp client writes objects straight to Drive (it holds
+    # the Drive credential), so this source is always google_drive — there is no
+    # http_app write path for it like the remote-device uploaders have.
     whatsapp_storage_backend = os.getenv(
-        "WHATSAPP_STORAGE_BACKEND",
-        _default_upload_backend(
-            DEFAULT_WHATSAPP_STORAGE_BACKEND,
-            google_drive_folder_id=whatsapp_google_drive_folder_id,
-        ),
+        "WHATSAPP_STORAGE_BACKEND", DEFAULT_WHATSAPP_STORAGE_BACKEND
     ).strip()
     whatsapp_media_bytes_per_flush = int(
         os.getenv(
@@ -894,15 +893,14 @@ def load_settings(
     ):
         if not whatsapp_account:
             raise ValueError("WHATSAPP_ACCOUNT or GMAIL_ACCOUNTS must be set for WhatsApp sync")
-        if whatsapp_storage_backend not in {"google_drive", "http_app"}:
-            raise ValueError("WHATSAPP_STORAGE_BACKEND currently supports: google_drive, http_app")
-        if whatsapp_storage_backend == "google_drive":
-            if not whatsapp_google_drive_account:
-                raise ValueError("WHATSAPP_GOOGLE_DRIVE_ACCOUNT or WHATSAPP_ACCOUNT must be set")
-            if not whatsapp_google_drive_folder_id:
-                raise ValueError(
-                    "WHATSAPP_GOOGLE_DRIVE_FOLDER_ID, APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
-                )
+        if whatsapp_storage_backend != "google_drive":
+            raise ValueError("WHATSAPP_STORAGE_BACKEND currently supports: google_drive")
+        if not whatsapp_google_drive_account:
+            raise ValueError("WHATSAPP_GOOGLE_DRIVE_ACCOUNT or WHATSAPP_ACCOUNT must be set")
+        if not whatsapp_google_drive_folder_id:
+            raise ValueError(
+                "WHATSAPP_GOOGLE_DRIVE_FOLDER_ID, APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
         if whatsapp_media_bytes_per_flush < 0:
             raise ValueError("WHATSAPP_MEDIA_BYTES_PER_FLUSH must be greater than or equal to 0")
         if whatsapp_media_count_per_flush < 0:

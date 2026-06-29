@@ -46,7 +46,7 @@ func TestObjectUploadVerifyWrongEndpoint(t *testing.T) {
 	svc := uploadTestService()
 	exp := svc.now().Add(time.Hour)
 	sig := svc.SignObjectUpload("/ingest/agent-sessions/batch", "abc123", exp)
-	if err := svc.VerifyObjectUpload("/ingest/whatsapp/media", "abc123", strconv.FormatInt(exp.Unix(), 10), sig); err == nil {
+	if err := svc.VerifyObjectUpload("/ingest/apple-messages/attachment", "abc123", strconv.FormatInt(exp.Unix(), 10), sig); err == nil {
 		t.Fatal("expected signature for a different endpoint to be rejected")
 	}
 }

@@ -31,16 +31,28 @@ from dagster import (
 )
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.ingest_client import (
-    ingest_client_from_env,
-    ingest_upload_config_problem,
-)
+from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 WHATSAPP_CLIENT_POSTGRES_LOCK_ID = 8_407_112_442
 WHATSAPP_CLIENT_SENSOR_INTERVAL_SECONDS = 60
+
+
+def _whatsapp_object_store(settings):
+    # Same spec the whatsapp_drive_ingest reader builds, so the client writes
+    # byte/tag-identical objects into the folder the reader promotes from.
+    return build_object_store(
+        google_drive_spec(
+            folder_id=settings.whatsapp.google_drive_folder_id,
+            account=settings.whatsapp.google_drive_account,
+            source="whatsapp",
+            blob_kind="whatsapp_media_item",
+            metadata_kind="whatsapp_export_batch",
+        ),
+        settings=settings,
+    )
 
 
 @asset(group_name="whatsapp")
@@ -83,7 +95,7 @@ def whatsapp_client(context) -> MaterializeResult:
                 summary = WhatsAppClientRunner(
                     account=settings.whatsapp.account,
                     session_path=session_path,
-                    ingest_client=ingest_client_from_env(),
+                    object_store_factory=lambda: _whatsapp_object_store(settings),
                     upload_state=state,
                     logger=context.log,
                     run_seconds=settings.whatsapp.client_run_seconds,
@@ -144,16 +156,10 @@ def whatsapp_client_keepalive_sensor(context):
             "WHATSAPP_CLIENT_ENABLED=1 to start it."
         )
 
-    # The client uploads through the app's ingest endpoint. Without that config
-    # every run would crash instantly, and the keepalive cadence would turn one
-    # misconfiguration into a flood of failed runs. Skip with a clear reason
-    # instead so the misconfig surfaces once, in the sensor tick.
-    upload_problem = ingest_upload_config_problem()
-    if upload_problem:
-        return SkipReason(
-            f"WhatsApp client cannot upload — http_app ingest is not configured: {upload_problem}"
-        )
-
+    # The client writes directly to object storage (Drive). load_settings above
+    # already raises (-> SkipReason) when the Drive folder/account is missing, so
+    # a misconfiguration surfaces once in the sensor tick rather than as a flood
+    # of failed runs from the keepalive cadence.
     return RunRequest(tags={"whatsapp_trigger": "keepalive"})
 
 

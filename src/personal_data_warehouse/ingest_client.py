@@ -266,40 +266,6 @@ class IngestClient:
             },
         )
 
-    # --- whatsapp -----------------------------------------------------------
-    def upload_whatsapp_batch(self, gzip_bytes: bytes, *, exported_at: str) -> StoredObjectDict:
-        return self._post(
-            "/ingest/whatsapp/batch",
-            body=gzip_bytes,
-            content_type="application/gzip",
-            params={"exported_at": exported_at},
-        )
-
-    def upload_whatsapp_media(
-        self,
-        content: bytes,
-        *,
-        chat_id: str,
-        message_id: str,
-        content_type: str,
-        message_at: str,
-        filename: str,
-        mime_type: str,
-    ) -> StoredObjectDict:
-        return self._post(
-            "/ingest/whatsapp/media",
-            body=content,
-            content_type=content_type or "application/octet-stream",
-            params={
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "content_type": content_type,
-                "message_at": message_at,
-                "filename": filename,
-                "mime_type": mime_type,
-            },
-        )
-
     # --- voice memos --------------------------------------------------------
     def upload_voice_memo_audio(
         self,

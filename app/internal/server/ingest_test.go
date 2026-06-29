@@ -450,29 +450,3 @@ func TestIngestAppleNotesBodyAttachmentRevisionKeys(t *testing.T) {
 		t.Fatalf("revision props = %v", r.AppProperties)
 	}
 }
-
-func TestIngestWhatsAppMediaKey(t *testing.T) {
-	svc, stores := ingestTestService()
-	body := []byte("media-bytes")
-	extra := url.Values{
-		"chat_id":      {"123@g.us"},
-		"message_id":   {"MID1"},
-		"content_type": {"image/png"},
-		"message_at":   {"2024-12-31T23:59:00+00:00"},
-		"filename":     {"img.png"},
-		"mime_type":    {"image/png"},
-	}
-	target := signedIngestTarget("/ingest/whatsapp/media", body, extra)
-	rec := postIngest(t, svc, target, body)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
-	}
-	put := stores["whatsapp"].lastFile
-	wantKey := "whatsapp/inbox/media/2024/12/2024-12-31-123-g.us-MID1-" + sha256Hex(body) + ".png"
-	if put.ObjectKey != wantKey {
-		t.Fatalf("object key = %q, want %q", put.ObjectKey, wantKey)
-	}
-	if put.AppProperties["chat_id"] != "123@g.us" || put.AppProperties["message_id"] != "MID1" {
-		t.Fatalf("app properties = %v", put.AppProperties)
-	}
-}

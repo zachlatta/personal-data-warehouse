@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.ingest_client import ingest_client_from_env
+from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse_whatsapp.client import WhatsAppClientRunner
 from personal_data_warehouse.warehouse import warehouse_from_settings
 from personal_data_warehouse_whatsapp.session_store import PostgresWhatsAppSessionStore
@@ -24,8 +24,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Run the WhatsApp linked-device client: pair via QR/phone code, receive "
-            "messages, and upload batches through the app ingest API. In production this runs "
-            "as the whatsapp_client Dagster job; this CLI is for pairing and debugging."
+            "messages, and write batches + media straight to object storage (Drive). In "
+            "production this runs as the whatsapp_client Dagster job; this CLI is for pairing "
+            "and debugging."
         )
     )
     parser.add_argument("--run-seconds", type=int, default=0, help="Run window; 0 uses WHATSAPP_CLIENT_RUN_SECONDS")
@@ -43,6 +44,21 @@ def main() -> None:
 
     session_path = args.session_file or Path(settings.whatsapp.session_path)
     warehouse = warehouse_from_settings(settings)
+
+    def build_whatsapp_object_store():
+        # Same spec the whatsapp_drive_ingest reader builds, so the client writes
+        # byte/tag-identical objects into the folder the reader promotes from.
+        return build_object_store(
+            google_drive_spec(
+                folder_id=settings.whatsapp.google_drive_folder_id,
+                account=settings.whatsapp.google_drive_account,
+                source="whatsapp",
+                blob_kind="whatsapp_media_item",
+                metadata_kind="whatsapp_export_batch",
+            ),
+            settings=settings,
+        )
+
     session_store = PostgresWhatsAppSessionStore(
         warehouse=warehouse,
         account=settings.whatsapp.account,
@@ -59,7 +75,7 @@ def main() -> None:
         summary = WhatsAppClientRunner(
             account=settings.whatsapp.account,
             session_path=session_path,
-            ingest_client=ingest_client_from_env(),
+            object_store_factory=build_whatsapp_object_store,
             upload_state=state,
             logger=CliLogger(),
             run_seconds=args.run_seconds or settings.whatsapp.client_run_seconds,

@@ -1,9 +1,11 @@
-"""Buffer WhatsApp client records and flush them through app ingest.
+"""Buffer WhatsApp client records and flush them as Drive inbox batches.
 
-Mirrors the Apple Messages upload format: JSONL.gz envelope batches and media
-blobs are posted to the app, which writes ``whatsapp/inbox/batches/`` and
-``whatsapp/inbox/media/`` objects consumed by the whatsapp_drive_ingest Dagster
-sensor.
+Mirrors the Apple Messages upload format: JSONL.gz envelope batches under
+``whatsapp/inbox/batches/`` and media blobs under ``whatsapp/inbox/media/``,
+consumed by the whatsapp_drive_ingest Dagster sensor. The client runs in-process
+with the trusted Dagster deployment and holds the Drive read+write credential,
+so it writes objects straight to object storage (no app-HTTP ingest hop); the
+objects are byte/tag-identical to what the reader's ObjectStore expects.
 """
 
 from __future__ import annotations
@@ -11,19 +13,24 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 import gzip
 import hashlib
 import json
+import mimetypes
+import re
 import tempfile
 import threading
 from typing import Any
 
+from personal_data_warehouse.objectstore import ObjectStore, StoredObject
 from personal_data_warehouse_whatsapp.events import MediaRecord
 from personal_data_warehouse_whatsapp.state import WhatsAppUploadState
 
-# Storage reference returned by the ingest client (mirrors the warehouse
-# storage_* columns); the app owns the keys and tags behind it.
-StoredObject = dict[str, str]
+OBJECT_PREFIX = "whatsapp"
+INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox"
+BATCH_RECORD_KIND = "whatsapp_export_batch"
+MEDIA_KIND = "whatsapp_media_item"
 
 
 @dataclass(frozen=True)
@@ -53,18 +60,23 @@ class WhatsAppBatcher:
         self,
         *,
         account: str,
-        ingest_client,
+        object_store: ObjectStore | None = None,
+        object_store_factory: Callable[[], ObjectStore] | None = None,
         upload_state: WhatsAppUploadState | None,
         logger,
         now: Callable[[], datetime] | None = None,
         media_bytes_per_flush: int = 512 * 1024 * 1024,
         media_count_per_flush: int = 200,
     ) -> None:
-        # Uploads go through the app's ingest endpoints only.
-        if ingest_client is None:
-            raise ValueError("ingest_client is required")
+        # The client writes objects directly to object storage (Drive); it runs
+        # in the trusted Dagster deployment and holds the Drive credential.
+        if object_store is None and object_store_factory is None:
+            raise ValueError("object_store or object_store_factory must be provided")
+        if object_store is not None and object_store_factory is not None:
+            raise ValueError("pass only one of object_store or object_store_factory")
         self._account = account
-        self._ingest_client = ingest_client
+        self._object_store = object_store
+        self._object_store_factory = object_store_factory
         self._upload_state = upload_state
         self._logger = logger
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -221,8 +233,11 @@ class WhatsAppBatcher:
                 self._requeue_media(pending_media[index:])
                 break
             content_sha256 = hashlib.sha256(content).hexdigest()
+            object_key = media_object_key(payload, content_sha256=content_sha256, fallback_now=exported_at)
             stored = self._put_media_bytes(
                 content,
+                object_key=object_key,
+                content_sha256=content_sha256,
                 content_type=str(payload.get("mime_type", "")) or "application/octet-stream",
                 payload=payload,
             )
@@ -250,25 +265,47 @@ class WhatsAppBatcher:
         self,
         content: bytes,
         *,
+        object_key: str,
+        content_sha256: str,
         content_type: str,
         payload: dict[str, Any],
     ) -> StoredObject:
-        # The app owns the object key, kind, and pdw_* tags.
-        return self._ingest_client.upload_whatsapp_media(
-            content,
-            chat_id=str(payload.get("chat_id", "")),
-            message_id=str(payload.get("message_id", "")),
-            content_type=content_type,
-            message_at=str(payload.get("message_at", "")),
-            filename=str(payload.get("filename", "")),
-            mime_type=str(payload.get("mime_type", "")),
-        )
+        with tempfile.NamedTemporaryFile() as file:
+            file.write(content)
+            file.flush()
+            return self._store().put_file(
+                path=Path(file.name),
+                object_key=object_key,
+                content_sha256=content_sha256,
+                content_type=content_type,
+                kind=MEDIA_KIND,
+                app_properties={
+                    "chat_id": str(payload.get("chat_id", "")),
+                    "message_id": str(payload.get("message_id", "")),
+                },
+            )
 
     def _upload_batch(self, *, records: list[dict[str, Any]], exported_at: datetime) -> StoredObject:
         encoded = gzip_jsonl(records)
-        return self._ingest_client.upload_whatsapp_batch(
-            encoded, exported_at=exported_at.astimezone(UTC).isoformat()
-        )
+        batch_sha = hashlib.sha256(encoded).hexdigest()
+        object_key = batch_object_key(exported_at=exported_at, batch_sha256=batch_sha)
+        with tempfile.NamedTemporaryFile(suffix=".jsonl.gz") as file:
+            file.write(encoded)
+            file.flush()
+            return self._store().put_file(
+                path=Path(file.name),
+                object_key=object_key,
+                content_sha256=batch_sha,
+                content_type="application/gzip",
+                kind=BATCH_RECORD_KIND,
+                app_properties={"batch_sha256": batch_sha, "exported_at": exported_at.astimezone(UTC).isoformat()},
+            )
+
+    def _store(self) -> ObjectStore:
+        if self._object_store is None:
+            assert self._object_store_factory is not None
+            self._object_store = self._object_store_factory()
+        return self._object_store
 
     def _is_complete(self, *, source_type: str, source_id: str, fingerprint: str) -> bool:
         if self._upload_state is None:
@@ -321,3 +358,41 @@ def gzip_jsonl(records: list[dict[str, Any]]) -> bytes:
 def json_sha256(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def batch_object_key(*, exported_at: datetime, batch_sha256: str) -> str:
+    exported = exported_at.astimezone(UTC)
+    stamp = exported.strftime("%Y%m%dT%H%M%SZ")
+    return f"{INBOX_PREFIX}/batches/{exported.year:04d}/{exported.month:02d}/{stamp}-{batch_sha256}.jsonl.gz"
+
+
+def media_object_key(payload: dict[str, Any], *, content_sha256: str, fallback_now: datetime) -> str:
+    occurred = parse_iso_datetime(str(payload.get("message_at", ""))) or fallback_now
+    occurred = occurred.astimezone(UTC)
+    if occurred.year <= 1970:
+        occurred = fallback_now.astimezone(UTC)
+    filename = str(payload.get("filename", ""))
+    suffix = Path(filename).suffix if filename else ""
+    if not suffix:
+        suffix = mimetypes.guess_extension(str(payload.get("mime_type", "")) or "") or ".bin"
+    part = safe_object_key_part(f"{payload.get('chat_id', '')}-{payload.get('message_id', '')}")
+    return (
+        f"{INBOX_PREFIX}/media/{occurred.year:04d}/{occurred.month:02d}/"
+        f"{occurred.date().isoformat()}-{part}-{content_sha256}{suffix}"
+    )
+
+
+def parse_iso_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def safe_object_key_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")[:120] or "untitled"

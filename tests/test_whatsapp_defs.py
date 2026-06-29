@@ -72,14 +72,8 @@ def test_whatsapp_client_keepalive_sensor_skips_when_unconfigured(monkeypatch) -
     assert "not configured" in result.skip_message
 
 
-def _set_ingest_env(monkeypatch) -> None:
-    monkeypatch.setenv("PDW_API_URL", "https://app.example.test")
-    monkeypatch.setenv("PDW_SECRET_TOKEN", "tok")
-
-
 def test_whatsapp_client_keepalive_sensor_launches_when_enabled(monkeypatch) -> None:
     monkeypatch.setattr(whatsapp_client_defs, "load_settings", lambda **_kwargs: FakeSettings(client_enabled=True))
-    _set_ingest_env(monkeypatch)
 
     with DagsterInstance.ephemeral() as instance:
         result = whatsapp_client_defs.whatsapp_client_keepalive_sensor(build_sensor_context(instance=instance))
@@ -88,10 +82,10 @@ def test_whatsapp_client_keepalive_sensor_launches_when_enabled(monkeypatch) -> 
     assert result.tags == {"whatsapp_trigger": "keepalive"}
 
 
-def test_whatsapp_client_keepalive_sensor_skips_when_ingest_unconfigured(monkeypatch) -> None:
-    # Enabled + WhatsApp-configured, but the http_app upload env is missing.
-    # The keepalive sensor must skip rather than launch a run that would only
-    # crash-loop (the 2026-06-20 prod incident: ~1000 failed runs/day).
+def test_whatsapp_client_keepalive_sensor_launches_without_ingest_env(monkeypatch) -> None:
+    # The client writes batches + media straight to Drive now, so the keepalive
+    # sensor no longer depends on any http_app ingest env (PDW_API_URL/token).
+    # Enabled + WhatsApp-configured is enough to launch.
     monkeypatch.setattr(whatsapp_client_defs, "load_settings", lambda **_kwargs: FakeSettings(client_enabled=True))
     for name in ("PDW_API_URL", "MCP_BASE_URL", "PDW_SECRET_TOKEN", "MCP_SECRET_TOKEN"):
         monkeypatch.delenv(name, raising=False)
@@ -99,9 +93,8 @@ def test_whatsapp_client_keepalive_sensor_skips_when_ingest_unconfigured(monkeyp
     with DagsterInstance.ephemeral() as instance:
         result = whatsapp_client_defs.whatsapp_client_keepalive_sensor(build_sensor_context(instance=instance))
 
-    assert isinstance(result, SkipReason)
-    assert "http_app ingest is not configured" in result.skip_message
-    assert "PDW_API_URL" in result.skip_message
+    assert isinstance(result, RunRequest)
+    assert result.tags == {"whatsapp_trigger": "keepalive"}
 
 
 class FakeSettings:

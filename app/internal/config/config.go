@@ -99,7 +99,6 @@ func (c Config) ObjectStoreEnabled() bool {
 var ingestSourceEnvInfix = map[string]string{
 	"agent_sessions":    "AGENT_SESSIONS",
 	"apple_messages":    "APPLE_MESSAGES",
-	"whatsapp":          "WHATSAPP",
 	"apple_voice_memos": "VOICE_MEMOS",
 	"apple_notes":       "APPLE_NOTES",
 }

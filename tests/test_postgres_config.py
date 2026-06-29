@@ -64,29 +64,27 @@ def test_local_upload_configs_use_app_ingest_without_drive_folders(monkeypatch) 
     monkeypatch.setenv("VOICE_MEMOS_ACCOUNT", "zach@example.test")
     monkeypatch.setenv("APPLE_NOTES_ACCOUNT", "zach@example.test")
     monkeypatch.setenv("APPLE_MESSAGES_ACCOUNT", "zach@example.test")
-    monkeypatch.setenv("WHATSAPP_ACCOUNT", "zach@example.test")
     monkeypatch.setenv("AGENT_SESSIONS_ACCOUNT", "zach@example.test")
     monkeypatch.setenv("GOOGLE_DRIVE_SOURCE_ENABLED", "0")
 
+    # WhatsApp is intentionally excluded: its in-Dagster client writes straight
+    # to Drive, so it has no http_app upload path and always needs a Drive folder.
     settings = load_settings(
         require_postgres=False,
         require_gmail=False,
         require_voice_memos=True,
         require_apple_notes=True,
         require_apple_messages=True,
-        require_whatsapp=True,
         require_agent_sessions=True,
     )
 
     assert settings.voice_memos is not None
     assert settings.apple_notes is not None
     assert settings.apple_messages is not None
-    assert settings.whatsapp is not None
     assert settings.agent_sessions is not None
     assert settings.voice_memos.storage_backend == "http_app"
     assert settings.apple_notes.storage_backend == "http_app"
     assert settings.apple_messages.storage_backend == "http_app"
-    assert settings.whatsapp.storage_backend == "http_app"
     assert settings.agent_sessions.storage_backend == "http_app"
     assert config.GOOGLE_DRIVE_SCOPE not in settings.google_scopes
 
@@ -95,8 +93,7 @@ def test_whatsapp_downloads_history_media_by_default(monkeypatch) -> None:
     monkeypatch.setattr(config, "load_dotenv", lambda: None)
     monkeypatch.delenv("WHATSAPP_DOWNLOAD_HISTORY_MEDIA", raising=False)
     monkeypatch.setenv("WHATSAPP_ACCOUNT", "zach@example.test")
-    monkeypatch.setenv("WHATSAPP_STORAGE_BACKEND", "http_app")
-    monkeypatch.setenv("MCP_BASE_URL", "https://pdw.example.test")
+    monkeypatch.setenv("WHATSAPP_GOOGLE_DRIVE_FOLDER_ID", "drive-folder")
 
     settings = load_settings(require_postgres=False, require_gmail=False, require_whatsapp=True)
 
@@ -110,8 +107,7 @@ def test_whatsapp_history_media_download_can_be_disabled(monkeypatch) -> None:
     monkeypatch.setattr(config, "load_dotenv", lambda: None)
     monkeypatch.setenv("WHATSAPP_DOWNLOAD_HISTORY_MEDIA", "0")
     monkeypatch.setenv("WHATSAPP_ACCOUNT", "zach@example.test")
-    monkeypatch.setenv("WHATSAPP_STORAGE_BACKEND", "http_app")
-    monkeypatch.setenv("MCP_BASE_URL", "https://pdw.example.test")
+    monkeypatch.setenv("WHATSAPP_GOOGLE_DRIVE_FOLDER_ID", "drive-folder")
 
     settings = load_settings(require_postgres=False, require_gmail=False, require_whatsapp=True)
 

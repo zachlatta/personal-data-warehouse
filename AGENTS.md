@@ -285,17 +285,27 @@ app's ingest endpoint (see below), which writes them into the `agent-sessions/in
 folder. The `--limit` flag bounds a run (useful for a first backfill). In Dagster, the
 `agent_sessions_drive_inbox_sensor` + `agent_sessions_drive_ingest` asset consume the batches.
 
-## Client uploads via the app (the only write path)
+## Client uploads via the app (the write path for remote devices)
 
-Every uploader (agent-sessions, voice-memos, apple-notes, apple-messages, and the in-process
-whatsapp client) writes through the app — there is no longer a direct-to-Drive write path in the
-clients. Each device POSTs domain payloads to the app's semantic ingestion endpoints
-(`POST /ingest/<source>/<type>`, e.g. `/ingest/agent-sessions/batch`,
-`/ingest/apple-messages/batch` + `/attachment`, `/ingest/whatsapp/batch` + `/media`,
+Every *remote-device* uploader (agent-sessions, voice-memos, apple-notes, apple-messages) writes
+through the app — those devices are untrusted and must not hold the Drive credential. Each device
+POSTs domain payloads to the app's semantic ingestion endpoints (`POST /ingest/<source>/<type>`,
+e.g. `/ingest/agent-sessions/batch`, `/ingest/apple-messages/batch` + `/attachment`,
 `/ingest/voice-memos/audio` + `/metadata`, `/ingest/apple-notes/body` + `/attachment` +
 `/revision`). The app owns the Drive credential, folder ids, object keys, `kind` values, and
 `pdw_*` tags; the device holds none of that. The app writes byte-identical Drive objects, so the
 Dagster `*_drive_ingest` readers are unchanged.
+
+**Exception — the in-process WhatsApp client writes directly to Drive.** It runs *inside* the
+trusted prod Dagster deployment (co-located with the app on rotom) and already holds the full
+Drive read+write credential the readers use, so the app indirection buys nothing and only re-adds
+a Cloudflare 100 MiB body cap on its large media (WhatsApp videos). It builds the same Drive
+`ObjectStore` the `whatsapp_drive_ingest` reader builds and writes `whatsapp/inbox/batches/` +
+`whatsapp/inbox/media/` objects itself (byte/tag-identical to what the app would have written),
+deduping by content sha. There is **no** `/ingest/whatsapp/*` endpoint — see
+[WhatsApp Client](#whatsapp-client-linked-device). (Note `claude_desktop_client` also runs in
+Dagster but still posts to the shared `/ingest/agent-sessions/batch`: small payloads, no cap
+problem.)
 
 Every uploader therefore needs the warehouse URL and the app secret token. The canonical source
 is pdw's own config: because the uploaders run via `pdw ingest <source>`, the pdw CLI resolves the
@@ -500,9 +510,15 @@ It runs in-process with the production Dagster deployment; no separate image or 
   messages for offline linked devices, so the seconds between windows lose nothing.
 - A Postgres advisory lock prevents two concurrent connections on one session, which would
   corrupt the device state.
-- Records flow exactly like Apple Messages: the client batches JSONL.gz envelopes to
-  `whatsapp/inbox/batches/` and media blobs to `whatsapp/inbox/media/` in Google Drive; the
-  `whatsapp_drive_inbox_sensor` + `whatsapp_drive_ingest` asset consume and promote them.
+- Records land in the same Drive layout as Apple Messages, but the WhatsApp client writes them
+  **directly** (it holds the Drive credential), not through the app's ingest endpoints: it builds
+  the same `ObjectStore` the reader uses (`google_drive_spec(..., source="whatsapp")`) and writes
+  JSONL.gz envelope batches to `whatsapp/inbox/batches/` and media blobs to `whatsapp/inbox/media/`
+  itself (kind `whatsapp_export_batch` / `whatsapp_media_item`, deduped by content sha). Because
+  the write skips Cloudflare, large media (videos) over the 100 MiB public-body cap upload fine.
+  The `whatsapp_drive_inbox_sensor` + `whatsapp_drive_ingest` asset consume and promote them
+  unchanged. The batch/media object keys + `pdw_*` tags live in
+  `src/personal_data_warehouse_whatsapp/batcher.py`.
 - Session state is canonical in Postgres table `whatsapp_client_sessions` as a bytea SQLite
   snapshot keyed by `WHATSAPP_ACCOUNT` + `WHATSAPP_SESSION_KEY` (default `default`). neonize
   still requires a SQLite filename at runtime, so `WHATSAPP_SESSION_PATH` is only a disposable
