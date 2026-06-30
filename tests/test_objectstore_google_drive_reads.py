@@ -202,3 +202,83 @@ def test_get_share_url_falls_back_to_metadata() -> None:
 
     assert url == "https://drive/looked-up"
     assert files.get_calls  # metadata was fetched
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("application/pdf", "application/pdf"),
+        ("image/svg+xml", "image/svg+xml"),
+        ("application/vnd.ms-excel", "application/vnd.ms-excel"),
+        ("TEXT/Plain; charset=utf-8", "TEXT/Plain"),
+        # The production bug: a bare top-level type with no subtype.
+        ("application", "application/octet-stream"),
+        ("", "application/octet-stream"),
+        ("   ", "application/octet-stream"),
+        ("not a mime type", "application/octet-stream"),
+        ("application/", "application/octet-stream"),
+        ("/octet-stream", "application/octet-stream"),
+        ("a/b/c", "application/octet-stream"),
+    ],
+)
+def test_sanitize_media_type(raw: str, expected: str) -> None:
+    assert gd.sanitize_media_type(raw) == expected
+
+
+class CaptureCreateFiles:
+    """Captures the body + media passed to files().create()."""
+
+    def __init__(self) -> None:
+        self.body: dict | None = None
+
+    def create(self, *, body, media_body, fields, supportsAllDrives):
+        self.body = body
+        self.media_mimetype = getattr(media_body, "mimetype", None)
+        return FakeRequest(result={"id": "new-id", "webViewLink": "https://drive/new-id"})
+
+
+class FakeMediaFileUpload:
+    def __init__(self, path, *, mimetype, resumable):
+        self.path = path
+        self.mimetype = mimetype
+        self.resumable = resumable
+
+
+def test_put_file_coerces_malformed_media_type(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(gd, "MediaFileUpload", FakeMediaFileUpload)
+    files = CaptureCreateFiles()
+    store = make_store(files)
+    blob = tmp_path / "broken.bin"
+    blob.write_bytes(b"data")
+
+    stored = store.put_file(
+        path=blob,
+        object_key="broken.bin",
+        content_sha256="sha",
+        content_type="application",  # malformed: Drive would 400 on this
+        skip_existing_check=True,
+    )
+
+    # Both the upload media type and the stored metadata mimeType are coerced.
+    assert files.media_mimetype == "application/octet-stream"
+    assert files.body["mimeType"] == "application/octet-stream"
+    assert stored["storage_file_id"] == "new-id"
+
+
+def test_put_file_preserves_valid_media_type(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(gd, "MediaFileUpload", FakeMediaFileUpload)
+    files = CaptureCreateFiles()
+    store = make_store(files)
+    blob = tmp_path / "doc.pdf"
+    blob.write_bytes(b"%PDF-1.4")
+
+    store.put_file(
+        path=blob,
+        object_key="doc.pdf",
+        content_sha256="sha2",
+        content_type="application/pdf",
+        skip_existing_check=True,
+    )
+
+    assert files.media_mimetype == "application/pdf"
+    assert files.body["mimeType"] == "application/pdf"

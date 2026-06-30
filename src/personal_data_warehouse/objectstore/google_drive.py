@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from io import BytesIO
 from pathlib import Path
 import json
+import re
 import threading
 import time
 from typing import Any
@@ -40,6 +41,35 @@ from personal_data_warehouse.objectstore.base import (
 
 _FOLDER_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _FOLDER_LOCKS_LOCK = threading.Lock()
+
+# Google Drive's upload API rejects a malformed media type (e.g. a bare
+# ``application`` with no subtype) with HTTP 400 ``badContent``
+# ("Media type 'application' is not supported. Valid media types: [*/*]").
+# Some upstream sources carry such malformed MIME types verbatim — notably Gmail
+# attachment parts whose ``mimeType`` header is broken in the original email — so
+# anything that is not a well-formed ``type/subtype`` is coerced to this default.
+_DEFAULT_MEDIA_TYPE = "application/octet-stream"
+# RFC 6838-ish token for the type and subtype; permissive enough for real-world
+# media types (``application/vnd.ms-excel``, ``image/svg+xml``) but requiring a
+# non-empty type and subtype separated by a single slash.
+_MEDIA_TYPE_TOKEN = r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*"
+_MEDIA_TYPE_RE = re.compile(rf"^{_MEDIA_TYPE_TOKEN}/{_MEDIA_TYPE_TOKEN}$")
+
+
+def sanitize_media_type(content_type: str) -> str:
+    """Return a Drive-acceptable media type, falling back to octet-stream.
+
+    Strips any ``;``-delimited parameters, then validates that what remains is a
+    well-formed ``type/subtype``. Malformed or empty values become
+    ``application/octet-stream`` so a single broken attachment can no longer
+    fail its Drive upload (and, before this, retry forever).
+    """
+    candidate = (content_type or "").split(";", 1)[0].strip()
+    if _MEDIA_TYPE_RE.match(candidate):
+        return candidate
+    return _DEFAULT_MEDIA_TYPE
+
+
 APPLE_VOICE_MEMOS_DRIVE_SOURCE_QUERY = (
     "("
     "appProperties has { key='pdw_source' and value='apple_voice_memos' } "
@@ -153,16 +183,17 @@ class GoogleDriveObjectStore:
             "content_sha256": content_sha256,
         }
         object_app_properties.update(app_properties or {})
+        media_type = sanitize_media_type(content_type)
         body = {
             "name": drive_name_from_object_key(object_key),
             "parents": [self._folder_id],
-            "mimeType": content_type,
+            "mimeType": media_type,
             "appProperties": object_app_properties,
         }
         parent_id = self._ensure_parent_folder(object_key)
         body["name"] = drive_name_from_object_key(object_key)
         body["parents"] = [parent_id]
-        media = MediaFileUpload(str(path), mimetype=content_type, resumable=True)
+        media = MediaFileUpload(str(path), mimetype=media_type, resumable=True)
         response = self._execute(
             lambda: self._service.files()
             .create(
