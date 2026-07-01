@@ -797,6 +797,18 @@ class SlackSyncRunner:
                     updated_at=synced_at,
                     sync_version=sync_version,
                 )
+                if exc.code in SLACK_CONVERSATION_GONE_CODES:
+                    self._warehouse.mark_slack_conversation_inactive(
+                        account=account.account,
+                        team_id=team_id,
+                        conversation_id=conversation_id,
+                    )
+                    self._logger.warning(
+                        "Marked Slack conversation %s inactive after %s: %s",
+                        conversation_id,
+                        exc.code,
+                        exc,
+                    )
                 continue
             messages_written += result["messages_written"]
             files_written += result["files_written"]

@@ -1781,6 +1781,58 @@ def test_runner_thread_replies_only_can_skip_known_errors(monkeypatch):
     assert [params["channel"] for method, params in client.calls if method == "conversations.replies"] == ["C_OK"]
 
 
+def test_runner_thread_replies_marks_gone_channel_inactive(monkeypatch):
+    # Regression: conversations.replies failing with channel_not_found (etc.) used
+    # to just record a per-thread error and move on, so every other not-yet-tried
+    # thread in the same dead channel wasted its own API call on the same
+    # guaranteed failure, one by one, forever. It must instead deactivate the
+    # channel immediately, like the conversation-level sync passes already do.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.thread_refs = [
+        {"conversation_id": "C_GONE", "thread_ts": "1713974400.000100", "reply_count": 1, "latest_reply_ts": "1713974500.000100"},
+        {"conversation_id": "C_OK", "thread_ts": "1713974600.000100", "reply_count": 1, "latest_reply_ts": "1713974700.000100"},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.replies": [
+                SlackApiCallError("conversations.replies failed: channel_not_found", code="channel_not_found"),
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1713974600.000100", "user": "U1", "text": "root", "reply_count": 1},
+                        {"ts": "1713974700.000100", "thread_ts": "1713974600.000100", "user": "U2", "text": "reply"},
+                    ],
+                    "response_metadata": {},
+                },
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_thread_replies_only=True,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.inactivated_conversations == [
+        {"account": "zrl", "team_id": "T1", "conversation_id": "C_GONE"}
+    ]
+    assert any(
+        update["object_type"] == "thread" and update["status"] == "error" and update["object_id"] == "C_GONE:1713974400.000100"
+        for update in warehouse.state_updates
+    )
+    # The run keeps going and still syncs the healthy thread.
+    assert [params["channel"] for method, params in client.calls if method == "conversations.replies"] == ["C_GONE", "C_OK"]
+
+
 def test_runner_thread_replies_only_can_select_missing_replies(monkeypatch):
     warehouse = FakeWarehouse()
     warehouse.thread_refs = [

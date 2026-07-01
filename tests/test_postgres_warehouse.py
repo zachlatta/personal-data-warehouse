@@ -2458,6 +2458,44 @@ def test_postgres_slack_thread_missing_replies_filter_ignores_tombstones(
     assert captured["params"] == ("zrl", "T1", 5)
 
 
+def test_postgres_slack_thread_parent_refs_exclude_gone_conversations(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # Once a conversation is marked inactive (channel_not_found etc.), none of its
+    # thread parents should ever be offered up for backfill again — trying them
+    # wastes an API call that is guaranteed to fail the exact same way every time.
+    warehouse.ensure_slack_tables()
+    now = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(conversation_id="C-gone", raw_json='{"id":"C-gone"}'),
+            _slack_conversation_row(conversation_id="C-live", raw_json='{"id":"C-live"}'),
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C-gone",
+                message_ts="1770000000.000001",
+                message_datetime=now,
+                reply_count=1,
+            ),
+            _slack_message_row(
+                conversation_id="C-live",
+                message_ts="1770000000.000002",
+                message_datetime=now,
+                reply_count=1,
+            ),
+        ]
+    )
+
+    warehouse.mark_slack_conversation_inactive(account="zrl", team_id="T1", conversation_id="C-gone")
+
+    refs = warehouse.load_slack_thread_parent_refs(account="zrl", team_id="T1")
+
+    assert [ref["conversation_id"] for ref in refs] == ["C-live"]
+
+
 def test_postgres_slack_read_state_candidates_use_stats_latest_message_at(
     warehouse: PostgresWarehouse,
 ) -> None:

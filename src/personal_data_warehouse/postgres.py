@@ -4534,6 +4534,10 @@ class PostgresWarehouse:
             "m.is_deleted = 0",
             "m.reply_count > 0",
             "m.is_thread_reply = 0",
+            # A conversation already known gone (channel_not_found etc.) will fail
+            # conversations.replies for every one of its threads identically, so
+            # never offer up a never-before-tried thread from it either.
+            "COALESCE(c.is_archived, 0) = 0",
         ]
         params: list[Any] = [account, team_id]
         if since_ts is not None:
@@ -4582,6 +4586,10 @@ class PostgresWarehouse:
              AND m.team_id = s.team_id
              AND s.object_type = 'thread'
              AND m.conversation_id || ':' || m.message_ts = s.object_id
+            LEFT JOIN slack_conversations AS c
+              ON m.account = c.account
+             AND m.team_id = c.team_id
+             AND m.conversation_id = c.conversation_id
             WHERE {" AND ".join(where)}
             ORDER BY {order_by}
             {limit_clause}
