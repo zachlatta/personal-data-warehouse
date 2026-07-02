@@ -35,6 +35,7 @@ from personal_data_warehouse.postgres import (
     FLOAT_COLUMNS,
     INTEGER_COLUMNS,
     POSTGRES_TABLES,
+    SEARCH_SCHEMA_REFRESH_LOCK_ID,
     SEARCH_TEXT_PREVIEW_CHARS,
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
@@ -92,6 +93,38 @@ def _message_row(*, message_id: str, subject: str, labels: list[str], sync_versi
         "synced_at": now,
         "sync_version": sync_version,
     }
+
+
+def test_search_view_refresh_takes_advisory_lock(monkeypatch) -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    commands: list[tuple[str, tuple | None]] = []
+
+    monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: commands.append((sql, params)))
+    monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: False)
+
+    warehouse._ensure_search_views_if_possible()
+
+    assert commands[0] == ("SELECT pg_advisory_lock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+    assert commands[-1] == ("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+    assert ("DROP VIEW IF EXISTS searchable_text", None) in commands
+
+
+def test_search_view_refresh_releases_advisory_lock_on_error(monkeypatch) -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    commands: list[tuple[str, tuple | None]] = []
+
+    def command(sql, params=None):
+        commands.append((sql, params))
+        if sql == "DROP VIEW IF EXISTS searchable_text":
+            raise RuntimeError("ddl failed")
+
+    monkeypatch.setattr(warehouse, "_command", command)
+    monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: False)
+
+    with pytest.raises(RuntimeError, match="ddl failed"):
+        warehouse._ensure_search_views_if_possible()
+
+    assert commands[-1] == ("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
 
 
 def _default_row(columns: tuple[str, ...], **overrides):

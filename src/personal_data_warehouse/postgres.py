@@ -132,6 +132,7 @@ REMOVED_PERSONAL_FINANCE_TABLES = (
     "finance_accounts",
     "finance_items",
 )
+SEARCH_SCHEMA_REFRESH_LOCK_ID = 8_407_112_465
 
 
 @dataclass(frozen=True)
@@ -5206,6 +5207,17 @@ class PostgresWarehouse:
     )
 
     def _ensure_search_views_if_possible(self) -> None:
+        # Several Dagster assets can call ensure_* concurrently on deploy. The
+        # shared search_text() function/index refresh mutates global Postgres
+        # catalog rows, so serialize it to avoid "tuple concurrently updated"
+        # races between otherwise-idempotent DDL statements.
+        self._command("SELECT pg_advisory_lock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+        try:
+            self._ensure_search_views_if_possible_locked()
+        finally:
+            self._command("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+
+    def _ensure_search_views_if_possible_locked(self) -> None:
         # The person_identities view was removed; drop any copy left behind by
         # deployments that created it.
         self._command("DROP VIEW IF EXISTS person_identities")
