@@ -747,6 +747,12 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         requires_pg_textsearch=True,
     ),
     IndexSpec(
+        "apple_message_attachments_filename_bm25_idx",
+        "apple_message_attachments",
+        "CREATE INDEX IF NOT EXISTS apple_message_attachments_filename_bm25_idx ON apple_message_attachments USING bm25 (filename) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
         "calendar_events_summary_bm25_idx",
         "calendar_events",
         "CREATE INDEX IF NOT EXISTS calendar_events_summary_bm25_idx ON calendar_events USING bm25 (summary) WITH (text_config='english')",
@@ -5183,6 +5189,7 @@ class PostgresWarehouse:
         "apple_note_revisions",
         "apple_messages",
         "apple_message_handles",
+        "apple_message_attachments",
         "whatsapp_messages",
         "whatsapp_chats",
         "whatsapp_contacts",
@@ -5433,6 +5440,29 @@ class PostgresWarehouse:
                 "FROM apple_messages WHERE is_deleted = 0 "
                 "ORDER BY body_text <@> to_bm25query(%1$L, 'apple_messages_body_bm25_idx') LIMIT %2$s",
                 "LEFT JOIN apple_message_handles h ON h.account = m.account AND h.handle_id = m.handle_id",
+            ),
+            branch(
+                "'apple_message_media'", "'filename'", "mime_type", "''", "created_at", "account",
+                "message_id || ':' || attachment_id", "apple_message_attachments", "filename",
+                "apple_message_attachments_filename_bm25_idx", where="filename != ''",
+            ),
+            # imessage attachment content: bm25 top-k on the shared enrichment
+            # text, then join the attachment row for filename/account/date. The
+            # inner join to apple_message_attachments restricts the shared
+            # file_attachment_enrichments table to iMessage-origin rows. Covers
+            # both vision-OCR'd images/PDFs and cleaned-up audio transcripts,
+            # since both write into the same shared table.
+            join_branch(
+                "apple_message_media",
+                "SELECT 'apple_message_media' AS source, 'content' AS subsource, a.filename AS context, "
+                "'' AS who, a.created_at AS occurred_at, a.account AS account, "
+                "a.message_id || ':' || a.attachment_id AS ref, "
+                "m.text AS text, m.score AS score",
+                "SELECT content_sha256, text, "
+                "(text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx'))::real AS score "
+                "FROM file_attachment_enrichments "
+                "ORDER BY text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx') LIMIT %2$s",
+                "JOIN apple_message_attachments a USING (content_sha256)",
             ),
             # whatsapp body: bm25 top-k on the message body, then join chat + contact.
             join_branch(

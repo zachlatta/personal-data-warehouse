@@ -128,6 +128,23 @@ class AssemblyAIClient:
             self._sleep(self._poll_interval_seconds)
 
 
+def assemblyai_client_from_settings(settings) -> AssemblyAIClient:
+    return AssemblyAIClient(
+        api_key=settings.assemblyai.api_key,
+        base_url=settings.assemblyai.base_url,
+        poll_interval_seconds=settings.assemblyai.poll_interval_seconds,
+        timeout_seconds=settings.assemblyai.timeout_seconds,
+        speaker_options={
+            key: value
+            for key, value in {
+                "min_speakers_expected": settings.assemblyai.min_speakers_expected,
+                "max_speakers_expected": settings.assemblyai.max_speakers_expected,
+            }.items()
+            if value is not None
+        },
+    )
+
+
 def _raise_for_status_with_body(response) -> None:
     try:
         response.raise_for_status()

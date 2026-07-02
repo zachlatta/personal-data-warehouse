@@ -27,6 +27,7 @@ import subprocess
 import tempfile
 from typing import Any, Callable
 
+import pillow_heif
 from PIL import Image, ImageFile, ImageOps, UnidentifiedImageError
 
 from personal_data_warehouse.agent_runner import (
@@ -45,6 +46,12 @@ from personal_data_warehouse.agent_runner import (
 # the available scanlines (gray-filling any missing tail) so the agent can still
 # extract whatever text/content is present.
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# Registers a PIL plugin so Image.open() can decode HEIC/HEIF, the default
+# iPhone camera format. Without this, iMessage's large HEIC majority is
+# structurally excluded from the vision pipeline (PIL raises
+# UnidentifiedImageError on the raw bytes).
+pillow_heif.register_heif_opener()
 
 ENRICHMENT_TABLE = "file_attachment_enrichments"
 
@@ -88,8 +95,10 @@ IMAGE_MIME_TYPES = (
     "image/gif",
     "image/bmp",
     "image/tiff",
+    "image/heic",
+    "image/heif",
 )
-IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".tif")
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".tif", ".heic", ".heif")
 # Source-status values (from a source's deterministic text-extraction row) that
 # mark a PDF as worth a vision pass. Only consulted for sources that run a
 # deterministic extraction first (see FileEnrichmentSource.pdf_requires_prior_extraction).
@@ -158,6 +167,23 @@ WHATSAPP_SOURCE = FileEnrichmentSource(
     stored_predicate="a.is_missing = 0 AND a.content_sha256 <> ''",
     size_column="size_bytes",
     order_column="message_at",
+    pdf_requires_prior_extraction=False,
+)
+
+APPLE_MESSAGES_SOURCE = FileEnrichmentSource(
+    name="apple_messages",
+    label="iMessage attachment",
+    task_type="apple_messages_attachment_enrichment",
+    prompt_version="apple-messages-attachment-agent-v1",
+    table="apple_message_attachments",
+    # Same shape as WhatsApp: is_missing=0 marks a blob that was actually
+    # uploaded to the object store; metadata-only rows (never downloaded) carry
+    # no bytes to enrich.
+    stored_predicate="a.is_missing = 0 AND a.content_sha256 <> ''",
+    size_column="size_bytes",
+    order_column="created_at",
+    # No deterministic PDF text-extraction stage exists for iMessage, same as
+    # WhatsApp, so any PDF is directly eligible.
     pdf_requires_prior_extraction=False,
 )
 

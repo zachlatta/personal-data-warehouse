@@ -18,6 +18,7 @@ dependencies = [
     "slack-sdk>=3.41.0",
     "neonize==0.3.17.post0",
     "qrcode>=8.2",
+    "pillow-heif>=1.4.0",
 ]
 
 [project.scripts]

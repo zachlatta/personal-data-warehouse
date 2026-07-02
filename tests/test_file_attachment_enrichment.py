@@ -5,6 +5,7 @@ import hashlib
 from io import BytesIO
 import json
 
+import pillow_heif
 import pytest
 from PIL import Image
 
@@ -12,7 +13,10 @@ from personal_data_warehouse.agent_runner import AgentRunRequest, AgentRunResult
 from personal_data_warehouse.file_attachment_enrichment import (
     AGENT_ATTACHMENT_PROMPT_VERSION,
     AGENT_ATTACHMENT_TASK_TYPE,
+    APPLE_MESSAGES_SOURCE,
     GMAIL_SOURCE,
+    IMAGE_EXTENSIONS,
+    IMAGE_MIME_TYPES,
     WHATSAPP_SOURCE,
     AttachmentPreparationError,
     FileAttachmentEnrichmentRunner,
@@ -119,6 +123,12 @@ def png_bytes(size: tuple[int, int] = (32, 32)) -> bytes:
     return output.getvalue()
 
 
+def heic_bytes(size: tuple[int, int] = (32, 32)) -> bytes:
+    output = BytesIO()
+    pillow_heif.from_pillow(Image.new("RGB", size, color=(120, 30, 30))).save(output, format="HEIF")
+    return output.getvalue()
+
+
 def candidate_row(content: bytes, *, filename: str = "logo.png", mime_type: str = "image/png") -> tuple:
     return (
         "zach@example.com",
@@ -217,6 +227,36 @@ def test_runner_uses_source_identity_for_whatsapp_media() -> None:
     assert row["ai_prompt_version"] == "whatsapp-media-agent-v1"
     assert "WhatsApp media attachment" in row["ai_prompt"]
     assert "SPACEX" in row["text"]
+
+
+def test_runner_uses_source_identity_for_apple_messages() -> None:
+    content = png_bytes()
+    warehouse = FakeWarehouse([candidate_row(content)])
+    agent = FakeAgent(useful_output())
+
+    summary = make_runner(
+        warehouse, agent, FakeObjectStore(content), source=APPLE_MESSAGES_SOURCE
+    ).sync(limit=10)
+
+    assert summary.attachments_enriched == 1
+    request = agent.requests[0]
+    # The Apple Messages source carries its own task_type + prompt_version so its
+    # agent runs and enrichment rows are scoped independently from Gmail/WhatsApp.
+    assert request.task_type == APPLE_MESSAGES_SOURCE.task_type == "apple_messages_attachment_enrichment"
+    assert request.prompt_version == APPLE_MESSAGES_SOURCE.prompt_version == "apple-messages-attachment-agent-v1"
+    assert warehouse.agent_runs[0]["task_type"] == "apple_messages_attachment_enrichment"
+    row = warehouse.enrichment_rows[0]
+    assert row["ai_prompt_version"] == "apple-messages-attachment-agent-v1"
+    assert "iMessage attachment" in row["ai_prompt"]
+    assert "SPACEX" in row["text"]
+
+
+def test_apple_messages_source_has_no_prior_pdf_extraction_gate() -> None:
+    # Same as WhatsApp: there is no deterministic PDF text-extraction stage for
+    # iMessage attachments, so any PDF is directly eligible for the vision pass.
+    assert APPLE_MESSAGES_SOURCE.pdf_requires_prior_extraction is False
+    assert APPLE_MESSAGES_SOURCE.table == "apple_message_attachments"
+    assert APPLE_MESSAGES_SOURCE.size_column == "size_bytes"
 
 
 def test_runner_marks_non_useful_images_without_search_text() -> None:
@@ -322,7 +362,7 @@ def test_candidate_query_excludes_recent_unreadable_attachments() -> None:
     assert STATUS_UNREADABLE in params
 
 
-@pytest.mark.parametrize("source", [GMAIL_SOURCE, WHATSAPP_SOURCE])
+@pytest.mark.parametrize("source", [GMAIL_SOURCE, WHATSAPP_SOURCE, APPLE_MESSAGES_SOURCE])
 @pytest.mark.parametrize("error_window_days", [14, 0])
 def test_candidate_query_placeholder_count_matches_params(source, error_window_days) -> None:
     # Guards against parameter/placeholder drift across the several %s groups
@@ -378,6 +418,31 @@ def test_normalized_model_image_keeps_small_images_decodable() -> None:
     image = normalized_model_image(png_bytes((16, 16)))
     with Image.open(BytesIO(image)) as rendered:
         assert rendered.size == (16, 16)
+
+
+def test_heic_is_a_recognized_image_kind() -> None:
+    # Nearly half of iMessage's stored image blobs are HEIC (the default iPhone
+    # camera format); without this the candidate query silently excludes them.
+    assert "image/heic" in IMAGE_MIME_TYPES
+    assert "image/heif" in IMAGE_MIME_TYPES
+    assert ".heic" in IMAGE_EXTENSIONS
+    assert ".heif" in IMAGE_EXTENSIONS
+
+
+def test_normalized_model_image_decodes_heic() -> None:
+    image = normalized_model_image(heic_bytes())
+    with Image.open(BytesIO(image)) as rendered:
+        assert rendered.format == "JPEG"
+        assert rendered.size == (32, 32)
+
+
+def test_prepare_attachment_image_normalizes_heic_to_jpeg() -> None:
+    image, name = prepare_attachment_image(
+        content=heic_bytes(), mime_type="image/heic", filename="IMG_0001.HEIC"
+    )
+    assert name == "attachment.jpg"
+    with Image.open(BytesIO(image)) as rendered:
+        assert rendered.format == "JPEG"
 
 
 def test_attachment_vision_prompt_points_agent_at_input_file() -> None:

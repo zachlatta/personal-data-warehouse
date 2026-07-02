@@ -1548,6 +1548,47 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
         ]
     )
 
+    # An iMessage attachment whose agent enrichment text mentions the query term
+    # (either vision-OCR'd or a cleaned-up audio transcript - both land in the
+    # same shared table) must surface through the apple_message_media content
+    # branch, which bm25-ranks file_attachment_enrichments then joins the
+    # attachment row.
+    from personal_data_warehouse.schema import APPLE_MESSAGE_ATTACHMENT_COLUMNS
+
+    warehouse.insert_apple_message_attachments(
+        [
+            _default_row(
+                APPLE_MESSAGE_ATTACHMENT_COLUMNS,
+                account="user@example.test",
+                attachment_id="att-1",
+                message_id="imsg-1",
+                filename="zanzibar_photo.heic",
+                mime_type="image/heic",
+                content_sha256="im-zan-sha",
+                is_missing=0,
+                created_at=message_datetime,
+                start_at=message_datetime,
+                ingested_at=message_datetime,
+                sync_version=1,
+            )
+        ]
+    )
+    warehouse.insert_attachment_enrichments(
+        [
+            _default_row(
+                ATTACHMENT_ENRICHMENT_COLUMNS,
+                content_sha256="im-zan-sha",
+                ai_provider="agent_codex",
+                ai_model="",
+                ai_prompt_version="apple-messages-attachment-agent-v1",
+                text="zanzibar rollout launch photo",
+                text_extraction_status="agent_ok",
+                updated_at=message_datetime,
+                sync_version=1,
+            )
+        ]
+    )
+
     # BM25 non-matches score 0; matches score negative. Isolate matches with score < 0
     # so the assertions hold regardless of how few total rows the fixture has.
     matched = warehouse._query(
@@ -1558,8 +1599,10 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     assert ("slack", "private_channel") in matched_sources
     assert ("gmail", "subject") in matched_sources
     assert ("whatsapp_media", "content") in matched_sources
+    assert ("apple_message_media", "content") in matched_sources
     assert any("100.1" in ref for ref in matched_refs)  # the zanzibar slack message
     assert any("chat-1:wamid-1" == ref for ref in matched_refs)  # the whatsapp media content row
+    assert any("imsg-1:att-1" == ref for ref in matched_refs)  # the iMessage attachment content row
     assert all("100.2" not in ref for ref in matched_refs)  # the unrelated lunch message
 
     # sources filter restricts the fan-out.

@@ -23,9 +23,9 @@ from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.apple_voice_memos_transcription import (
     ASSEMBLYAI_PROVIDER,
-    AssemblyAIClient,
     GoogleDriveVoiceMemoAudioSource,
     VoiceMemosTranscriptionRunner,
+    assemblyai_client_from_settings,
 )
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
@@ -76,20 +76,7 @@ def apple_voice_memos_transcription(context) -> MaterializeResult:
             summary = VoiceMemosTranscriptionRunner(
                 warehouse=warehouse,
                 audio_source=GoogleDriveVoiceMemoAudioSource(object_store=object_store),
-                transcription_client=AssemblyAIClient(
-                    api_key=settings.assemblyai.api_key,
-                    base_url=settings.assemblyai.base_url,
-                    poll_interval_seconds=settings.assemblyai.poll_interval_seconds,
-                    timeout_seconds=settings.assemblyai.timeout_seconds,
-                    speaker_options={
-                        key: value
-                        for key, value in {
-                            "min_speakers_expected": settings.assemblyai.min_speakers_expected,
-                            "max_speakers_expected": settings.assemblyai.max_speakers_expected,
-                        }.items()
-                        if value is not None
-                    },
-                ),
+                transcription_client=assemblyai_client_from_settings(settings),
                 logger=context.log,
             ).sync(limit=batch_size)
 
