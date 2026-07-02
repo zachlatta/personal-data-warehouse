@@ -156,15 +156,41 @@ def useful_output() -> dict:
     }
 
 
-def make_runner(warehouse, agent, store, *, source=GMAIL_SOURCE) -> FileAttachmentEnrichmentRunner:
+def make_runner(warehouse, agent, store, *, source=GMAIL_SOURCE, logger=None) -> FileAttachmentEnrichmentRunner:
     return FileAttachmentEnrichmentRunner(
         source=source,
         warehouse=warehouse,
         agent=agent,
         object_store_factory=lambda account: store,
-        logger=FakeLogger(),
+        logger=logger or FakeLogger(),
         provider="codex",
         model="",
+    )
+
+
+def test_sync_logs_summary_line_with_counts() -> None:
+    content = png_bytes()
+    warehouse = FakeWarehouse([candidate_row(content)])
+    logger = FakeLogger()
+    runner = make_runner(warehouse, FakeAgent(useful_output()), FakeObjectStore(content), logger=logger)
+
+    runner.sync(limit=10)
+
+    assert (
+        "Gmail attachment enrichment: saw 1 attachments, enriched 1, "
+        "not useful 0, failed 0" in logger.infos
+    )
+
+
+def test_sync_logs_summary_line_when_idle() -> None:
+    logger = FakeLogger()
+    runner = make_runner(FakeWarehouse([]), FakeAgent(useful_output()), FakeObjectStore(b""), logger=logger)
+
+    runner.sync(limit=10)
+
+    assert (
+        "Gmail attachment enrichment: saw 0 attachments, enriched 0, "
+        "not useful 0, failed 0" in logger.infos
     )
 
 

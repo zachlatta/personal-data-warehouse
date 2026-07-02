@@ -148,7 +148,7 @@ def useful_output() -> dict:
 
 
 def make_runner(
-    warehouse, agent, store, transcription_client, *, source=APPLE_MESSAGES_AUDIO_SOURCE
+    warehouse, agent, store, transcription_client, *, source=APPLE_MESSAGES_AUDIO_SOURCE, logger=None
 ) -> AudioAttachmentTranscriptionRunner:
     return AudioAttachmentTranscriptionRunner(
         source=source,
@@ -156,9 +156,47 @@ def make_runner(
         agent=agent,
         object_store_factory=lambda account: store,
         transcription_client=transcription_client,
-        logger=FakeLogger(),
+        logger=logger or FakeLogger(),
         provider="codex",
         model="",
+    )
+
+
+def test_sync_logs_summary_line_with_counts() -> None:
+    content = b"fake m4a bytes"
+    warehouse = FakeWarehouse([candidate_row(content)])
+    logger = FakeLogger()
+    runner = make_runner(
+        warehouse,
+        FakeAgent(useful_output()),
+        FakeObjectStore(content),
+        FakeTranscriptionClient(text="hey are we still on for dinner tonight"),
+        logger=logger,
+    )
+
+    runner.sync(limit=10)
+
+    assert (
+        "iMessage voice message transcription: saw 1 attachments, enriched 1, "
+        "not useful 0, failed 0" in logger.infos
+    )
+
+
+def test_sync_logs_summary_line_when_idle() -> None:
+    logger = FakeLogger()
+    runner = make_runner(
+        FakeWarehouse([]),
+        FakeAgent(useful_output()),
+        FakeObjectStore(b""),
+        FakeTranscriptionClient(text=""),
+        logger=logger,
+    )
+
+    runner.sync(limit=10)
+
+    assert (
+        "iMessage voice message transcription: saw 0 attachments, enriched 0, "
+        "not useful 0, failed 0" in logger.infos
     )
 
 

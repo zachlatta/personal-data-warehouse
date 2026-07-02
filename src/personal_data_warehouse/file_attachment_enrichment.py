@@ -278,6 +278,14 @@ class FileAttachmentEnrichmentRunner:
                 enriched += 1
             else:
                 not_useful += 1
+        self._logger.info(
+            "%s enrichment: saw %s attachments, enriched %s, not useful %s, failed %s",
+            self._source.label,
+            len(candidates),
+            enriched,
+            not_useful,
+            failed,
+        )
         return FileAttachmentEnrichmentSummary(
             attachments_seen=len(candidates),
             attachments_enriched=enriched,

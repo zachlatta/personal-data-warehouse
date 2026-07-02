@@ -208,6 +208,14 @@ class AudioAttachmentTranscriptionRunner:
                 enriched += 1
             else:
                 not_useful += 1
+        self._logger.info(
+            "%s transcription: saw %s attachments, enriched %s, not useful %s, failed %s",
+            self._source.label,
+            len(candidates),
+            enriched,
+            not_useful,
+            failed,
+        )
         return AudioAttachmentEnrichmentSummary(
             attachments_seen=len(candidates),
             attachments_enriched=enriched,
