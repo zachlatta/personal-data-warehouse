@@ -270,8 +270,48 @@ func TestGetObjectExportsGoogleNativeDocument(t *testing.T) {
 	if vals := last.Query["mimeType"]; len(vals) > 0 {
 		gotMime = vals[0]
 	}
-	if !strings.HasSuffix(last.Path, "/files/doc/export") || gotMime != "text/plain" {
+	wantMime := "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	if !strings.HasSuffix(last.Path, "/files/doc/export") || gotMime != wantMime {
 		t.Fatalf("unexpected export request: %+v", last)
+	}
+}
+
+func TestGoogleNativeExportMimeCoversDocsSlidesSheets(t *testing.T) {
+	cases := map[string]string{
+		"application/vnd.google-apps.document":     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		"application/vnd.google-apps.presentation": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		"application/vnd.google-apps.spreadsheet":  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	}
+	for mimeType, want := range cases {
+		got, ok := GoogleNativeExportMime(mimeType)
+		if !ok || got != want {
+			t.Fatalf("GoogleNativeExportMime(%q) = (%q, %v), want (%q, true)", mimeType, got, ok, want)
+		}
+	}
+	if _, ok := GoogleNativeExportMime("application/pdf"); ok {
+		t.Fatalf("GoogleNativeExportMime should not match non-native mime types")
+	}
+}
+
+func TestGoogleNativeExportFilenameAppendsExtension(t *testing.T) {
+	cases := []struct {
+		mimeType string
+		in       string
+		want     string
+	}{
+		{"application/vnd.google-apps.document", "MOU Draft", "MOU Draft.docx"},
+		{"application/vnd.google-apps.presentation", "Pitch Deck", "Pitch Deck.pptx"},
+		{"application/vnd.google-apps.spreadsheet", "Budget", "Budget.xlsx"},
+		// Already has the right extension: don't double it up.
+		{"application/vnd.google-apps.document", "MOU Draft.docx", "MOU Draft.docx"},
+		// Non-native mime types and empty filenames pass through unchanged.
+		{"application/pdf", "Report", "Report"},
+		{"application/vnd.google-apps.document", "", ""},
+	}
+	for _, c := range cases {
+		if got := GoogleNativeExportFilename(c.mimeType, c.in); got != c.want {
+			t.Fatalf("GoogleNativeExportFilename(%q, %q) = %q, want %q", c.mimeType, c.in, got, c.want)
+		}
 	}
 }
 

@@ -194,6 +194,10 @@ func getObjectTool(store objectstore.ObjectStore, driveStores map[string]objects
 			out.SizeBytes = meta.SizeBytes
 			out.ContentSHA256 = meta.ContentSHA256
 			out.Filename = meta.Filename
+			if exportMime, ok := objectstore.GoogleNativeExportMime(meta.ContentType); ok {
+				out.Filename = objectstore.GoogleNativeExportFilename(meta.ContentType, meta.Filename)
+				out.ContentType = exportMime
+			}
 			out.StorageURL = meta.StorageURL
 			exp := now().Add(ttl)
 			out.DownloadURL = signedObjectDownloadURL(signer, baseURL, in.StorageFileID, account, exp)

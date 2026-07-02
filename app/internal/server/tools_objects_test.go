@@ -145,6 +145,22 @@ func TestGetObjectToolReturnsSignedDownloadURL(t *testing.T) {
 	}
 }
 
+func TestGetObjectToolReportsGoogleNativeDocAsDocx(t *testing.T) {
+	store := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			Backend: "google_drive", StorageFileID: "doc", ContentType: "application/vnd.google-apps.document",
+			Filename: "MOU <Draft>", StorageURL: "https://drive/doc",
+		},
+	}
+	out := invokeGetObject(t, store, getObjectInput{StorageFileID: "doc"})
+	if got, want := out.ContentType, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"; got != want {
+		t.Fatalf("ContentType = %q, want %q", got, want)
+	}
+	if got, want := out.Filename, "MOU <Draft>.docx"; got != want {
+		t.Fatalf("Filename = %q, want %q", got, want)
+	}
+}
+
 func TestGetObjectToolRoutesDriveSourceByAccount(t *testing.T) {
 	primary := &fakeObjectStore{meta: objectstore.ObjectMetadata{Backend: "google_drive"}}
 	driveStore := &fakeObjectStore{

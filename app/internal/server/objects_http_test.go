@@ -143,6 +143,26 @@ func TestObjectDownloadServesContent(t *testing.T) {
 	}
 }
 
+func TestObjectDownloadExportsGoogleNativeDocAsDocx(t *testing.T) {
+	store := &fakeObjectStore{
+		meta: objectstore.ObjectMetadata{
+			StorageFileID: "doc", ContentType: "application/vnd.google-apps.document",
+			Filename: "MOU <Draft>",
+		},
+		content: []byte("docx-bytes"),
+	}
+	rec := serveObjectRequest(t, store, 1024, http.MethodGet, signedObjectPath("doc", objectsTestNow.Add(time.Hour)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if got, want := rec.Header().Get("Content-Type"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"; got != want {
+		t.Fatalf("Content-Type = %q, want %q", got, want)
+	}
+	if got, want := rec.Header().Get("Content-Disposition"), `inline; filename="MOU <Draft>.docx"`; got != want {
+		t.Fatalf("Content-Disposition = %q, want %q", got, want)
+	}
+}
+
 func TestObjectDownloadHead(t *testing.T) {
 	store := &fakeObjectStore{
 		meta:    objectstore.ObjectMetadata{StorageFileID: "fid", ContentType: "image/png", SizeBytes: 4},

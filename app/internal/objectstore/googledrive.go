@@ -29,16 +29,38 @@ const (
 )
 
 var googleNativeExportMimes = map[string]string{
-	"application/vnd.google-apps.document":     "text/plain",
-	"application/vnd.google-apps.presentation": "text/plain",
-	"application/vnd.google-apps.spreadsheet":  "text/csv",
+	"application/vnd.google-apps.document":     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	"application/vnd.google-apps.presentation": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	"application/vnd.google-apps.spreadsheet":  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 
-// GoogleNativeExportMime returns the text export MIME type used when a Google
-// native file is fetched through the object-download proxy.
+var googleNativeExportExtensions = map[string]string{
+	"application/vnd.google-apps.document":     ".docx",
+	"application/vnd.google-apps.presentation": ".pptx",
+	"application/vnd.google-apps.spreadsheet":  ".xlsx",
+}
+
+// GoogleNativeExportMime returns the Office Open XML export MIME type used
+// when a Google native file (Docs/Slides/Sheets) is fetched through the
+// object-download proxy, so callers get a .docx/.pptx/.xlsx they can hand
+// straight to a Word/PowerPoint/Excel-compatible reader instead of lossy
+// plain text/CSV.
 func GoogleNativeExportMime(mimeType string) (string, bool) {
 	exportMime, ok := googleNativeExportMimes[mimeType]
 	return exportMime, ok
+}
+
+// GoogleNativeExportFilename appends the file extension matching
+// GoogleNativeExportMime's export format (.docx/.pptx/.xlsx) to filename, so
+// a served or downloaded export carries the right extension for its actual
+// bytes. Non-native mime types and filenames that already end with the
+// extension are returned unchanged.
+func GoogleNativeExportFilename(mimeType, filename string) string {
+	ext, ok := googleNativeExportExtensions[mimeType]
+	if !ok || filename == "" || strings.HasSuffix(strings.ToLower(filename), ext) {
+		return filename
+	}
+	return filename + ext
 }
 
 // GoogleDriveOptions configures a GoogleDriveStore. The HTTPClient must be

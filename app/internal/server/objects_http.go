@@ -71,7 +71,9 @@ func objectDownloadHandler(store objectstore.ObjectStore, driveStores map[string
 			return
 		}
 		contentType := meta.ContentType
+		filename := meta.Filename
 		if exportMime, ok := objectstore.GoogleNativeExportMime(contentType); ok {
+			filename = objectstore.GoogleNativeExportFilename(contentType, filename)
 			contentType = exportMime
 		}
 		if contentType == "" {
@@ -80,8 +82,8 @@ func objectDownloadHandler(store objectstore.ObjectStore, driveStores map[string
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Cache-Control", "private, no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if meta.Filename != "" {
-			w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": meta.Filename}))
+		if filename != "" {
+			w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": filename}))
 		}
 		if meta.SizeBytes > 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(meta.SizeBytes, 10))
