@@ -600,6 +600,110 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	<-serverErr
 }
 
+func TestMCPQueryAcceptsStringifiedQueriesArgument(t *testing.T) {
+	runner := fakeRunner{results: map[string]query.RawResult{
+		"SELECT 1 AS n": {
+			Columns: []string{"n"},
+			Rows:    []map[string]any{{"n": 1}},
+		},
+		"SELECT 2 AS n": {
+			Columns: []string{"n"},
+			Rows:    []map[string]any{{"n": 2}},
+		},
+	}}
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	srv := NewMCPServer(runner, query.Options{MaxRows: 5, MaxFieldChars: 100})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- srv.Run(ctx, serverTransport)
+	}()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect failed: %v", err)
+	}
+	defer session.Close()
+
+	stringifiedQueries := `[{"question":"ping","sql":"SELECT 1 AS n"}]`
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query", Arguments: map[string]any{
+		"queries":      stringifiedQueries,
+		"preview_rows": 1,
+		"format":       "csv",
+	}})
+	if err != nil {
+		t.Fatalf("query CallTool failed: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	var payload struct {
+		Results []struct {
+			QueryID   string `json:"query_id"`
+			Preview   string `json:"preview"`
+			TotalRows int    `json:"total_rows"`
+			Error     string `json:"error"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("query response was not JSON: %v\n%s", err, text)
+	}
+	if result.IsError ||
+		len(payload.Results) != 1 ||
+		payload.Results[0].QueryID == "" ||
+		payload.Results[0].Preview != "n\n1" ||
+		payload.Results[0].TotalRows != 1 ||
+		payload.Results[0].Error != "" {
+		t.Fatalf("unexpected query response for stringified queries: isError=%v payload=%#v text=%s", result.IsError, payload, text)
+	}
+
+	stringifiedMultiQueries := `[{"question":"one","sql":"SELECT 1 AS n"},{"question":"two","sql":"SELECT 2 AS n"}]`
+	multiResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query", Arguments: map[string]any{
+		"queries":      stringifiedMultiQueries,
+		"preview_rows": 1,
+		"format":       "csv",
+	}})
+	if err != nil {
+		t.Fatalf("multi-query CallTool failed: %v", err)
+	}
+	multiText := multiResult.Content[0].(*mcp.TextContent).Text
+	var multiPayload struct {
+		Results []struct {
+			QueryID string `json:"query_id"`
+			Preview string `json:"preview"`
+			Error   string `json:"error"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(multiText), &multiPayload); err != nil {
+		t.Fatalf("multi-query response was not JSON: %v\n%s", err, multiText)
+	}
+	if multiResult.IsError ||
+		len(multiPayload.Results) != 2 ||
+		multiPayload.Results[0].QueryID == "" ||
+		multiPayload.Results[1].QueryID == "" ||
+		multiPayload.Results[0].Preview != "n\n1" ||
+		multiPayload.Results[1].Preview != "n\n2" ||
+		multiPayload.Results[0].Error != "" ||
+		multiPayload.Results[1].Error != "" {
+		t.Fatalf("unexpected multi-query response: isError=%v payload=%#v text=%s", multiResult.IsError, multiPayload, multiText)
+	}
+
+	nullResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query", Arguments: map[string]any{
+		"queries": nil,
+	}})
+	if err != nil {
+		t.Fatalf("null queries CallTool failed: %v", err)
+	}
+	nullText := nullResult.Content[0].(*mcp.TextContent).Text
+	if !nullResult.IsError || !strings.Contains(nullText, "queries must contain at least one") {
+		t.Fatalf("queries:null should reach query validation, got isError=%v text=%s", nullResult.IsError, nullText)
+	}
+
+	cancel()
+	<-serverErr
+}
+
 func TestMcpToolHooksOnResultLogsFullOutputOnSuccess(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))

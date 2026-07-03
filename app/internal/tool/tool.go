@@ -43,10 +43,9 @@ type Tool interface {
 	// HTTP tool listings and MCP tool listings stay aligned.
 	InputSchema() (*jsonschema.Schema, error)
 
-	// RegisterMCP registers the tool against an MCP server using mcp.AddTool
-	// so the SDK's schema reflection runs on the concrete input type. Hooks
-	// lets the caller observe each call without the tool package depending
-	// on a specific logger.
+	// RegisterMCP registers the tool against an MCP server. Hooks lets the
+	// caller observe each call without the tool package depending on a specific
+	// logger.
 	RegisterMCP(server *mcp.Server, hooks Hooks)
 }
 

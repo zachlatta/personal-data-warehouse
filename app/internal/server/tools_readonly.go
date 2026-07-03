@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -29,8 +31,37 @@ func queryTool(svc *query.Service) tool.Tool {
 		Handle: func(ctx context.Context, in queryInput) (query.QueryResponse, error) {
 			return svc.Execute(ctx, queryStatementsFromInput(in.Queries), in.PreviewRows, in.Format), nil
 		},
-		IsError: queryResponseHasError,
+		IsError:               queryResponseHasError,
+		NormalizeMCPArguments: normalizeStringifiedQueriesArgument,
 	}
+}
+
+func normalizeStringifiedQueriesArgument(input json.RawMessage) (json.RawMessage, error) {
+	if len(input) == 0 {
+		return input, nil
+	}
+	var args map[string]json.RawMessage
+	if err := json.Unmarshal(input, &args); err != nil {
+		return input, nil
+	}
+	rawQueries, ok := args["queries"]
+	if !ok {
+		return input, nil
+	}
+	var stringifiedQueries string
+	if err := json.Unmarshal(rawQueries, &stringifiedQueries); err != nil {
+		return input, nil
+	}
+	var decodedQueries json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stringifiedQueries)), &decodedQueries); err != nil {
+		return input, nil
+	}
+	args["queries"] = decodedQueries
+	normalized, err := json.Marshal(args)
+	if err != nil {
+		return nil, err
+	}
+	return normalized, nil
 }
 
 func getRowsTool(svc *query.Service) tool.Tool {
