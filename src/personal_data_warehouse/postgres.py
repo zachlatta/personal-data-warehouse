@@ -1421,6 +1421,11 @@ class PostgresWarehouse:
         )
         self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()")
         self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS sync_version bigint NOT NULL DEFAULT 1")
+        # A poll that gets a 401 marks the current token expired here so the sensor can
+        # skip instead of relaunching doomed runs; keyed to the token's sha so a fresh
+        # publish (which rotates the sha) clears it automatically.
+        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_at timestamptz")
+        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_token_sha256 text NOT NULL DEFAULT ''")
 
     def ensure_chatgpt_conversation_sync_table(self) -> None:
         """Per-conversation incremental sync watermark for the ChatGPT poller."""
@@ -1442,13 +1447,53 @@ class PostgresWarehouse:
         rows = self._query_dicts(
             """
             SELECT account, session_key, session_token, source_browser, token_sha256,
-                   published_at, updated_at, sync_version
+                   published_at, updated_at, sync_version, expired_at, expired_token_sha256
             FROM chatgpt_sessions
             WHERE account = %s AND session_key = %s
             """,
             (account, session_key),
         )
         return rows[0] if rows else None
+
+    def mark_chatgpt_session_expired(
+        self,
+        *,
+        account: str,
+        session_key: str,
+        token_sha256: str,
+        when: datetime | None = None,
+    ) -> None:
+        """Record that the stored session token was rejected (HTTP 401).
+
+        Guarded on ``token_sha256`` so a concurrent re-publish (which rotates the
+        token and its hash) is never clobbered: only the exact token that failed is
+        marked. A later publish changes ``token_sha256`` so it no longer matches
+        ``expired_token_sha256`` and the poller resumes on its own.
+        """
+        if not token_sha256:
+            return
+        self.ensure_chatgpt_session_table()
+        when = when or datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE chatgpt_sessions
+            SET expired_at = %s, expired_token_sha256 = %s
+            WHERE account = %s AND session_key = %s AND token_sha256 = %s
+            """,
+            (when, token_sha256, account, session_key, token_sha256),
+        )
+
+    def clear_chatgpt_session_expired(self, *, account: str, session_key: str) -> None:
+        """Clear a prior expiry mark after a poll succeeds (a transient 401 recovered)."""
+        self.ensure_chatgpt_session_table()
+        self._command(
+            """
+            UPDATE chatgpt_sessions
+            SET expired_at = NULL, expired_token_sha256 = ''
+            WHERE account = %s AND session_key = %s AND expired_at IS NOT NULL
+            """,
+            (account, session_key),
+        )
 
     def upsert_chatgpt_session(
         self,

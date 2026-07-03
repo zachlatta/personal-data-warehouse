@@ -91,7 +91,11 @@ class FakeClient:
         self.fetched: list[str] = []
 
     def iter_conversation_refs(self, *, page_size=28):
-        for cid, convo in self._c.items():
+        # The real backend lists conversations newest-first (order=updated), which the
+        # runner's high-water early stop relies on; mirror that contract here.
+        for cid, convo in sorted(
+            self._c.items(), key=lambda kv: kv[1]["update_time"], reverse=True
+        ):
             yield ConversationRef(cid, convo["title"], convo.get("create_time", 0.0), convo["update_time"])
 
     def get_conversation(self, cid):
@@ -152,8 +156,10 @@ def test_full_ingest_view_and_idempotency(warehouse):
     assert client2.fetched == []
     assert _chatgpt_row_count(warehouse) == 10
 
-    # An updated conversation is re-fetched; only its new turns net new rows.
-    convos["conv-aaa"]["update_time"] = 1_750_000_000.0 + 100
+    # An updated conversation is re-fetched; only its new turns net new rows. Editing
+    # it floats it to the top of the newest-first list (above conv-bbb's high-water
+    # mark), exactly as the backend's order=updated listing would.
+    convos["conv-aaa"]["update_time"] = 1_750_100_000.0 + 1000
     convos["conv-aaa"]["mapping"]["a3"]["children"] = ["u2"]
     convos["conv-aaa"]["mapping"]["u2"] = _node(
         "u2", "a3", ["a4"], _msg("conv-aaa-u2", "user", parts=["thanks"], create_time=1_750_000_090.0)
@@ -186,6 +192,55 @@ def test_credential_store_roundtrip(warehouse):
     refreshed = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
     assert refreshed["session_token"] == "rotated"
     assert refreshed["source_browser"] == "Brave"
+
+
+def test_expiry_mark_roundtrip_and_clears_on_republish(warehouse):
+    from personal_data_warehouse.chatgpt_backend_ingest import chatgpt_session_is_marked_expired
+
+    warehouse.upsert_chatgpt_session(
+        account=ACCOUNT, session_key="default", session_token="cookie-header", source_browser="Chrome"
+    )
+    row = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    assert row["expired_at"] is None
+    assert row["expired_token_sha256"] == ""
+    assert chatgpt_session_is_marked_expired(row) is False
+
+    # A poll rejected this token: mark it expired (keyed to its sha).
+    warehouse.mark_chatgpt_session_expired(
+        account=ACCOUNT, session_key="default", token_sha256=row["token_sha256"]
+    )
+    marked = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    assert marked["expired_at"] is not None
+    assert marked["expired_token_sha256"] == row["token_sha256"]
+    assert chatgpt_session_is_marked_expired(marked) is True
+
+    # A stale mark against a *different* token is a no-op (guards a concurrent publish).
+    warehouse.mark_chatgpt_session_expired(
+        account=ACCOUNT, session_key="default", token_sha256="some-other-sha"
+    )
+    still = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    assert still["expired_token_sha256"] == row["token_sha256"]
+
+    # Re-publishing a fresh cookie rotates the sha, so the row reads healthy again
+    # without any explicit clear.
+    warehouse.upsert_chatgpt_session(
+        account=ACCOUNT, session_key="default", session_token="rotated-cookie", source_browser="Chrome"
+    )
+    republished = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    assert chatgpt_session_is_marked_expired(republished) is False
+
+    # Explicit clear (e.g. a transient 401 that recovered on the re-probe) also resets.
+    warehouse.mark_chatgpt_session_expired(
+        account=ACCOUNT, session_key="default", token_sha256=republished["token_sha256"]
+    )
+    assert chatgpt_session_is_marked_expired(
+        warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    ) is True
+    warehouse.clear_chatgpt_session_expired(account=ACCOUNT, session_key="default")
+    cleared = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    assert cleared["expired_at"] is None
+    assert cleared["expired_token_sha256"] == ""
+    assert chatgpt_session_is_marked_expired(cleared) is False
 
 
 def _chatgpt_row_count(warehouse) -> int:

@@ -8,9 +8,14 @@ local ``pdw chatgpt publish-session`` helper and stored in ``chatgpt_sessions``.
 
 Fail-loud by design: if the stored session is rejected (expired / logged out),
 the asset raises ``ChatGPTAuthError`` and the run goes red with instructions to
-re-publish, rather than silently ingesting nothing. Before a session is ever
-published the sensor simply skips with the same instruction (nothing to heal
-yet), so a misconfiguration never becomes a flood of failing runs.
+re-publish, rather than silently ingesting nothing. That first failure also marks
+the token expired in ``chatgpt_sessions``, so the sensor then *skips* (with the
+same instruction) instead of relaunching a doomed run every tick - one loud
+failure, not hundreds a day. It still fires a slow re-probe (see
+``CHATGPT_EXPIRED_REPROBE_SECONDS``) so a recovered session heals and a broken one
+keeps a heartbeat of red, and a fresh publish rotates the token hash and resumes
+immediately. Before a session is ever published the sensor likewise just skips
+(nothing to heal yet), so a misconfiguration never becomes a flood of failing runs.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from personal_data_warehouse.chatgpt_backend import (
 from personal_data_warehouse.chatgpt_backend_ingest import (
     ChatGPTBackendIngestRunner,
     chatgpt_poll_stall_reason,
+    chatgpt_session_expiry_skip,
 )
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
@@ -46,6 +52,11 @@ from personal_data_warehouse.warehouse import warehouse_from_settings
 
 CHATGPT_BACKEND_POSTGRES_LOCK_ID = 8_407_112_461
 CHATGPT_SENSOR_TICK_SECONDS = 60
+# While a published session is marked expired, the sensor skips (instead of
+# relaunching doomed runs every tick) but fires one re-probe run this often, so a
+# recovered/re-published session resumes and a still-broken one keeps a slow
+# heartbeat of red runs rather than going silent.
+CHATGPT_EXPIRED_REPROBE_SECONDS = 3600
 
 _REPUBLISH_HINT = (
     "Run `pdw chatgpt publish-session` on a machine logged into chatgpt.com to refresh it."
@@ -99,8 +110,23 @@ def chatgpt_backend_ingest(context) -> MaterializeResult:
                     logger=context.log,
                 ).sync()
             except ChatGPTAuthError as exc:
-                # Surface a loud, actionable failure instead of a silent skip.
+                # Surface a loud, actionable failure instead of a silent skip, and
+                # record that this exact token was rejected so the sensor stops
+                # relaunching doomed runs until it is re-published (the first failure
+                # still goes red, so monitoring catches the expiry).
+                warehouse.mark_chatgpt_session_expired(
+                    account=config.account,
+                    session_key=config.session_key,
+                    token_sha256=str((session_row or {}).get("token_sha256") or ""),
+                )
                 raise ChatGPTAuthError(f"{exc} {_REPUBLISH_HINT}") from exc
+            else:
+                # A poll succeeded, so any prior expiry mark (e.g. a transient 401 that
+                # has since recovered) no longer applies.
+                if (session_row or {}).get("expired_at"):
+                    warehouse.clear_chatgpt_session_expired(
+                        account=config.account, session_key=config.session_key
+                    )
         finally:
             warehouse.close()
 
@@ -166,9 +192,22 @@ def chatgpt_backend_ingest_sensor(context):
     if not session_row or not str(session_row.get("session_token") or ""):
         return SkipReason(f"No ChatGPT session published yet. {_REPUBLISH_HINT}")
 
+    now = time.time()
+
+    # If a prior poll marked this exact token expired, skip instead of relaunching
+    # runs that would 401 the same way every tick. A re-probe still fires periodically
+    # (see CHATGPT_EXPIRED_REPROBE_SECONDS), and a fresh publish resumes immediately.
+    expiry_skip = chatgpt_session_expiry_skip(
+        session_row,
+        now=now,
+        reprobe_after_seconds=CHATGPT_EXPIRED_REPROBE_SECONDS,
+        republish_hint=_REPUBLISH_HINT,
+    )
+    if expiry_skip is not None:
+        return SkipReason(expiry_skip)
+
     # Honor the configured poll interval on top of the 60s sensor tick.
     last_run = float(context.cursor) if context.cursor else 0.0
-    now = time.time()
     if now - last_run < config.poll_interval_seconds:
         return SkipReason(
             f"Waiting for poll interval ({config.poll_interval_seconds}s) since last ChatGPT poll."

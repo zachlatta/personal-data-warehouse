@@ -13,9 +13,10 @@ re-publish, rather than silently ingesting nothing.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from personal_data_warehouse.agent_sessions_drive_ingest import (
     chatgpt_conversation_to_event_rows,
@@ -72,6 +73,65 @@ def chatgpt_poll_stall_reason(
             "deep-history re-walk regression in the poller."
         )
     return None
+
+
+def _as_epoch(value: Any) -> float | None:
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def chatgpt_session_is_marked_expired(session_row: Mapping[str, Any] | None) -> bool:
+    """True when the *currently stored* session token is the one a poll marked expired.
+
+    Expiry is keyed to ``token_sha256`` rather than a plain boolean so it clears
+    itself: re-publishing a fresh cookie rotates ``token_sha256``, which no longer
+    matches ``expired_token_sha256``, so the session reads as healthy again with no
+    separate clear step. A row with no expiry mark (empty ``expired_token_sha256``)
+    is never expired.
+    """
+    if not session_row:
+        return False
+    token_sha = str(session_row.get("token_sha256") or "")
+    expired_sha = str(session_row.get("expired_token_sha256") or "")
+    return bool(token_sha) and token_sha == expired_sha
+
+
+def chatgpt_session_expiry_skip(
+    session_row: Mapping[str, Any] | None,
+    *,
+    now: float,
+    reprobe_after_seconds: float,
+    republish_hint: str,
+) -> str | None:
+    """Return a sensor skip message while an expired session should stay quiet.
+
+    Once a poll marks the stored token expired (rejected with HTTP 401), the sensor
+    would otherwise keep launching runs that fail the same way every tick - a flood
+    of red runs for a condition only a human can clear by re-publishing. Skip those
+    ticks instead, but not forever: after ``reprobe_after_seconds`` return ``None`` so
+    the sensor fires a single re-probe run. That probe catches a transient 401 that
+    has since recovered, and keeps a slow heartbeat of red runs so a genuinely broken
+    session is never silently forgotten. A fresh publish rotates ``token_sha256`` and
+    is picked up immediately (this returns ``None``), independent of the re-probe.
+    """
+    if not chatgpt_session_is_marked_expired(session_row):
+        return None
+    assert session_row is not None  # narrowed by the guard above
+    expired_ts = _as_epoch(session_row.get("expired_at"))
+    if expired_ts is None:
+        # Malformed mark (no timestamp): let a run re-establish it rather than
+        # skipping forever.
+        return None
+    if now - expired_ts >= reprobe_after_seconds:
+        return None
+    remaining = max(0, int(reprobe_after_seconds - (now - expired_ts)))
+    return (
+        "ChatGPT session was rejected as expired; skipping polls to avoid a flood of "
+        f"failing runs. {republish_hint} Re-probing in ~{remaining}s if still expired."
+    )
 
 
 class ChatGPTBackendIngestRunner:
