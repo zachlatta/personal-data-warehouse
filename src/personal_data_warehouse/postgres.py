@@ -51,6 +51,8 @@ from personal_data_warehouse.schema import (
     SLACK_TEAM_COLUMNS,
     SLACK_USER_COLUMNS,
     SYNC_STATE_COLUMNS,
+    TIMELINE_EVENT_COLUMNS,
+    TIMELINE_SYNC_STATE_COLUMNS,
     VOICE_MEMO_ENRICHMENT_COLUMNS,
     VOICE_MEMO_FILE_COLUMNS,
     VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
@@ -301,6 +303,21 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("account",),
         "updated_at",
     ),
+    # Unified timeline (personal_data_warehouse/timeline.py). Row volume tracks
+    # the sum of every event source (slack_messages dominates), so it gets the
+    # same append-heavy autovacuum thresholds.
+    "timeline_events": TableSpec(
+        TIMELINE_EVENT_COLUMNS,
+        ("adapter", "event_id"),
+        "updated_at",
+        storage_parameters=(
+            ("autovacuum_analyze_scale_factor", "0"),
+            ("autovacuum_analyze_threshold", "50000"),
+            ("autovacuum_vacuum_scale_factor", "0"),
+            ("autovacuum_vacuum_threshold", "100000"),
+        ),
+    ),
+    "timeline_sync_state": TableSpec(TIMELINE_SYNC_STATE_COLUMNS, ("adapter",), "updated_at"),
 }
 
 POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
@@ -860,6 +877,89 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS google_drive_file_texts_text_trgm_idx ON google_drive_file_texts USING gin (text public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
+    # Unified timeline read paths: keyset pagination by event time (with seq as
+    # the tiebreak), per-source/kind filtered scans, and arrival-order scans for
+    # "what's new since seq N" consumers.
+    IndexSpec(
+        "timeline_events_time_idx",
+        "timeline_events",
+        "CREATE INDEX IF NOT EXISTS timeline_events_time_idx ON timeline_events (event_ts DESC, seq DESC)",
+    ),
+    IndexSpec(
+        "timeline_events_source_time_idx",
+        "timeline_events",
+        "CREATE INDEX IF NOT EXISTS timeline_events_source_time_idx ON timeline_events (source, event_ts DESC, seq DESC)",
+    ),
+    IndexSpec(
+        "timeline_events_kind_time_idx",
+        "timeline_events",
+        "CREATE INDEX IF NOT EXISTS timeline_events_kind_time_idx ON timeline_events (kind, event_ts DESC, seq DESC)",
+    ),
+    IndexSpec(
+        "timeline_events_seq_idx",
+        "timeline_events",
+        "CREATE INDEX IF NOT EXISTS timeline_events_seq_idx ON timeline_events (seq)",
+    ),
+    # Ingestion-timestamp indexes on the larger event sources so the timeline's
+    # incremental sync (WHERE ingest_ts > watermark) never falls back to a
+    # per-tick sequential scan. Created CONCURRENTLY where the table is big in
+    # production. Small event sources (upstream_mutations, agent_runs, ...) are
+    # cheap to scan and get no index.
+    IndexSpec(
+        "gmail_messages_synced_at_idx",
+        "gmail_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_synced_at_idx ON gmail_messages (synced_at)",
+    ),
+    IndexSpec(
+        "agent_session_events_ingested_at_idx",
+        "agent_session_events",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_session_events_ingested_at_idx ON agent_session_events (ingested_at)",
+    ),
+    IndexSpec(
+        "slack_files_synced_at_idx",
+        "slack_files",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_files_synced_at_idx ON slack_files (synced_at)",
+    ),
+    IndexSpec(
+        "slack_files_created_at_idx",
+        "slack_files",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_files_created_at_idx ON slack_files (created_at DESC)",
+    ),
+    IndexSpec(
+        "apple_messages_ingested_at_idx",
+        "apple_messages",
+        "CREATE INDEX IF NOT EXISTS apple_messages_ingested_at_idx ON apple_messages (ingested_at)",
+    ),
+    IndexSpec(
+        "google_drive_files_ingested_at_idx",
+        "google_drive_files",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS google_drive_files_ingested_at_idx ON google_drive_files (ingested_at)",
+    ),
+    IndexSpec(
+        "calendar_events_synced_at_idx",
+        "calendar_events",
+        "CREATE INDEX IF NOT EXISTS calendar_events_synced_at_idx ON calendar_events (synced_at)",
+    ),
+    IndexSpec(
+        "contact_cards_synced_at_idx",
+        "contact_cards",
+        "CREATE INDEX IF NOT EXISTS contact_cards_synced_at_idx ON contact_cards (synced_at)",
+    ),
+    IndexSpec(
+        "apple_note_revisions_ingested_at_idx",
+        "apple_note_revisions",
+        "CREATE INDEX IF NOT EXISTS apple_note_revisions_ingested_at_idx ON apple_note_revisions (ingested_at)",
+    ),
+    IndexSpec(
+        "apple_voice_memos_files_ingested_at_idx",
+        "apple_voice_memos_files",
+        "CREATE INDEX IF NOT EXISTS apple_voice_memos_files_ingested_at_idx ON apple_voice_memos_files (ingested_at)",
+    ),
+    IndexSpec(
+        "whatsapp_messages_ingested_at_idx",
+        "whatsapp_messages",
+        "CREATE INDEX IF NOT EXISTS whatsapp_messages_ingested_at_idx ON whatsapp_messages (ingested_at)",
+    ),
 )
 
 # Indexes that used to exist but have been superseded. Dropped idempotently
@@ -907,6 +1007,10 @@ JSONB_COLUMNS_BY_TABLE = {
         "parents_json",
         "owners_json",
         "raw_metadata_json",
+    },
+    "timeline_events": {
+        "source_pk",
+        "metadata",
     },
 }
 
@@ -969,6 +1073,13 @@ TIMESTAMP_COLUMNS = {
     "source_modified_time",
     "full_crawled_at",
     "extracted_at",
+    "event_ts",
+    "end_ts",
+    "ingest_ts",
+    "first_seen_at",
+    "backfill_cursor_event_ts",
+    "watermark_ingest_ts",
+    "last_run_at",
 }
 
 INTEGER_COLUMNS = {
@@ -1058,6 +1169,9 @@ INTEGER_COLUMNS = {
     "truncated",
     "char_count",
     "files_seen",
+    "backfill_done",
+    "backfill_rows",
+    "incremental_rows",
 }
 
 FLOAT_COLUMNS = {
@@ -1195,6 +1309,22 @@ class PostgresWarehouse:
         self.ensure_chatgpt_tables()
         self._ensure_clean_agent_sessions_view()
         self._ensure_search_views_if_possible()
+
+    def ensure_timeline_tables(self) -> None:
+        """Tables for the unified timeline (personal_data_warehouse/timeline.py).
+
+        ``seq`` is served by a dedicated sequence rather than the generic
+        integer default so it survives upsert churn: the timeline upsert bumps
+        it via nextval() whenever a row's content changes, giving consumers a
+        durable arrival/change order that a plain event-time sort cannot
+        provide (late backfills land in the past by event_ts but in the
+        present by seq).
+        """
+        self._ensure_table_group(["timeline_events", "timeline_sync_state"])
+        self._command("CREATE SEQUENCE IF NOT EXISTS timeline_events_seq")
+        self._command("ALTER TABLE timeline_events ALTER COLUMN seq SET DEFAULT nextval('timeline_events_seq')")
+        self._command("ALTER TABLE timeline_events ALTER COLUMN first_seen_at SET DEFAULT now()")
+        self._command("ALTER TABLE timeline_events ALTER COLUMN updated_at SET DEFAULT now()")
 
     def ensure_claude_desktop_tables(self) -> None:
         """Tables for the serverside Claude Desktop poller.

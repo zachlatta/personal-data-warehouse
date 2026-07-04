@@ -13,9 +13,14 @@ import (
 const MinSecretTokenLength = 32
 
 type Config struct {
-	Addr                    string
-	BaseURL                 string
-	PostgresDatabaseURL     string
+	Addr                string
+	BaseURL             string
+	PostgresDatabaseURL string
+	// TimelineDatabaseURL is where the unified timeline tables live. Unset in
+	// production (they share the warehouse database); a local development app
+	// can point it at a locally-built timeline while detail views still read
+	// source rows from PostgresDatabaseURL.
+	TimelineDatabaseURL     string
 	SecretToken             string
 	MaxRows                 int
 	MaxFieldChars           int
@@ -116,6 +121,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		Addr:                    valueOrDefault(getenv("MCP_ADDR"), ":8080"),
 		BaseURL:                 strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
 		PostgresDatabaseURL:     normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
+		TimelineDatabaseURL:     normalizePostgresURL(getenv("PDW_TIMELINE_DATABASE_URL")),
 		SecretToken:             firstNonEmpty(getenv("PDW_SECRET_TOKEN"), getenv("MCP_SECRET_TOKEN")),
 		MaxRows:                 100000,
 		MaxFieldChars:           4000,

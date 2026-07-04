@@ -52,10 +52,17 @@ func (r *PostgresRunner) Close() error {
 }
 
 func (r *PostgresRunner) Query(ctx context.Context, statement string, maxRows int) (RawResult, error) {
+	return r.QueryArgs(ctx, statement, nil, maxRows)
+}
+
+// QueryArgs runs a parameterized statement ($1-style placeholders). App-owned
+// SQL (like the timeline endpoints) uses this so caller-supplied values ride
+// as bind parameters instead of being spliced into SQL text.
+func (r *PostgresRunner) QueryArgs(ctx context.Context, statement string, args []any, maxRows int) (RawResult, error) {
 	logger := slog.Default().With("component", "postgres")
 	started := time.Now()
 	logger.DebugContext(ctx, "Postgres query dispatch", "sql", statement, "max_rows", maxRows)
-	rows, err := r.db.QueryContext(ctx, statement)
+	rows, err := r.db.QueryContext(ctx, statement, args...)
 	if err != nil {
 		logger.ErrorContext(ctx, "Postgres query dispatch failed", "sql", statement, "error", err, "duration", time.Since(started))
 		return RawResult{}, err

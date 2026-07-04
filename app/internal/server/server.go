@@ -282,6 +282,29 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	mux.Handle("/api/tools", apiProtected)
 	mux.Handle("/api/tools/", apiProtected)
 
+	// Unified timeline: JSON API + browser page. The endpoints need
+	// parameterized queries, so they register only when the runner supports
+	// them (the real Postgres runner does; bare test fakes may not).
+	timelineRunner, timelineEnabled := runner.(timelineQuerier)
+	if cfg.TimelineDatabaseURL != "" && cfg.TimelineDatabaseURL != cfg.PostgresDatabaseURL {
+		dedicated, terr := query.NewPostgresRunner(cfg.TimelineDatabaseURL, cfg.QueryTimeout)
+		if terr != nil {
+			logger.Error("timeline database configured but failed to initialize; timeline disabled", "error", terr.Error())
+			timelineEnabled = false
+		} else {
+			timelineRunner, timelineEnabled = dedicated, true
+		}
+	}
+	if timelineEnabled {
+		sourceRunner, ok := runner.(timelineQuerier)
+		if !ok {
+			sourceRunner = timelineRunner
+		}
+		timelineSvc := newTimelineService(timelineRunner, sourceRunner, logger)
+		timelineSvc.registerRoutes(mux, authSvc.RequireStaticBearer())
+		logger.Info("timeline endpoints enabled", "dedicated_database", cfg.TimelineDatabaseURL != "")
+	}
+
 	return logRequests(logger, mux)
 }
 

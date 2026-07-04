@@ -899,6 +899,44 @@ GOOGLE_DRIVE_FILE_TEXT_COLUMNS = (
     "sync_version",
 )
 
+# Unified timeline: one normalized row per unit of activity anywhere in the
+# warehouse (see personal_data_warehouse/timeline.py). `seq` is assigned from
+# the timeline_events_seq sequence and bumped on every content change, giving
+# consumers a durable "what's new since I last looked" arrival order.
+TIMELINE_EVENT_COLUMNS = (
+    "adapter",
+    "event_id",
+    "source",
+    "kind",
+    "event_ts",
+    "end_ts",
+    "actor",
+    "title",
+    "snippet",
+    "context",
+    "source_table",
+    "source_pk",
+    "metadata",
+    "ingest_ts",
+    "seq",
+    "first_seen_at",
+    "updated_at",
+)
+
+TIMELINE_SYNC_STATE_COLUMNS = (
+    "adapter",
+    "backfill_cursor_event_ts",
+    "backfill_cursor_event_id",
+    "backfill_done",
+    "backfill_rows",
+    "incremental_rows",
+    "watermark_ingest_ts",
+    "watermark_event_id",
+    "last_run_at",
+    "last_error",
+    "updated_at",
+)
+
 GOOGLE_DRIVE_SYNC_STATE_COLUMNS = (
     "account",
     "start_page_token",
