@@ -300,9 +300,23 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		if !ok {
 			sourceRunner = timelineRunner
 		}
-		timelineSvc := newTimelineService(timelineRunner, sourceRunner, logger)
+		// Inline media links are signed for (and served by) this app unless a
+		// media override points at another app that holds the object-store
+		// credential (local dev signing for the production /objects endpoint).
+		mediaSigner := authSvc
+		if cfg.TimelineMediaSigningKey != "" {
+			mediaSigner = pdwauth.NewService([]byte(cfg.TimelineMediaSigningKey), time.Now)
+		}
+		mediaBase := cfg.TimelineMediaBaseURL
+		if mediaBase == "" {
+			mediaBase = strings.TrimRight(baseURL, "/")
+		}
+		media := &timelineMediaSigner{baseURL: mediaBase, signer: mediaSigner, ttl: cfg.ObjectStoreURLTTL, now: time.Now}
+		timelineSvc := newTimelineService(timelineRunner, sourceRunner, media, logger)
 		timelineSvc.registerRoutes(mux, authSvc.RequireStaticBearer())
-		logger.Info("timeline endpoints enabled", "dedicated_database", cfg.TimelineDatabaseURL != "")
+		logger.Info("timeline endpoints enabled",
+			"dedicated_database", cfg.TimelineDatabaseURL != "",
+			"media_base_url", mediaBase)
 	}
 
 	return logRequests(logger, mux)

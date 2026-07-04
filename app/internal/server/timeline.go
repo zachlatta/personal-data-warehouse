@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 )
 
@@ -32,21 +33,43 @@ const (
 	timelineChildRowFieldChar = 4000
 )
 
+// timelineMediaSigner mints signed /objects/ download links for inline media
+// in the timeline UI. The links are verified by whichever app baseURL points
+// at, so the signer's key must be that app's secret: in production this app
+// signs for itself; a local development app can sign for the production app
+// (which holds the object-store credential) instead.
+type timelineMediaSigner struct {
+	baseURL string
+	signer  *pdwauth.Service
+	ttl     time.Duration
+	now     func() time.Time
+}
+
+func (m *timelineMediaSigner) signURL(fileID string) string {
+	if m == nil || m.signer == nil || m.baseURL == "" || fileID == "" {
+		return ""
+	}
+	exp := m.now().Add(m.ttl)
+	sig := m.signer.SignObjectDownload(fileID, "", exp)
+	return fmt.Sprintf("%s/objects/%s?exp=%d&sig=%s", m.baseURL, fileID, exp.Unix(), sig)
+}
+
 type timelineService struct {
 	// timeline holds timeline_events/timeline_sync_state; source holds the
 	// authoritative per-source tables for detail views. In production they are
 	// the same database.
 	timeline timelineQuerier
 	source   timelineQuerier
+	media    *timelineMediaSigner
 	logger   *slog.Logger
 
-	mu              sync.Mutex
-	sourcesPayload  []byte
-	sourcesFetched  time.Time
+	mu             sync.Mutex
+	sourcesPayload []byte
+	sourcesFetched time.Time
 }
 
-func newTimelineService(timeline, source timelineQuerier, logger *slog.Logger) *timelineService {
-	return &timelineService{timeline: timeline, source: source, logger: logger}
+func newTimelineService(timeline, source timelineQuerier, media *timelineMediaSigner, logger *slog.Logger) *timelineService {
+	return &timelineService{timeline: timeline, source: source, media: media, logger: logger}
 }
 
 // --- list -------------------------------------------------------------------
@@ -242,7 +265,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 		{
 			name:   "attachments",
 			params: []string{"account", "message_id"},
-			sql: `SELECT part_id, filename, mime_type, size, storage_status, content_sha256
+			sql: `SELECT part_id, filename, mime_type, size, storage_status, storage_file_id, content_sha256
 			      FROM gmail_attachments WHERE account = $1 AND message_id = $2
 			      ORDER BY part_id LIMIT 50`,
 		},
@@ -277,12 +300,24 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			        AND m.is_deleted = 0
 			      ORDER BY m.message_datetime LIMIT 50`,
 		},
+		{
+			// slack_files.file_id is a valid /objects/ file id: the app's Slack
+			// store fetches it live from the Slack API.
+			name:   "files",
+			params: []string{"account", "team_id", "conversation_id", "message_ts"},
+			sql: `SELECT file_id AS storage_file_id, name AS filename, title, mimetype AS mime_type, size
+			      FROM slack_files
+			      WHERE account = $1 AND team_id = $2 AND conversation_id = $3 AND message_ts = $4
+			        AND is_deleted = 0
+			      ORDER BY file_id LIMIT 20`,
+		},
 	},
 	"apple_messages": {
 		{
 			name:   "attachments",
 			params: []string{"account", "message_id"},
-			sql: `SELECT attachment_id, transfer_name, mime_type, total_bytes, is_missing, content_sha256
+			sql: `SELECT attachment_id, transfer_name AS filename, mime_type, total_bytes, is_missing,
+			             storage_file_id, content_sha256
 			      FROM apple_message_attachments WHERE account = $1 AND message_id = $2
 			      ORDER BY attachment_id LIMIT 50`,
 		},
@@ -291,7 +326,8 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 		{
 			name:   "media",
 			params: []string{"account", "chat_id", "message_id"},
-			sql: `SELECT media_type, filename, mime_type, size_bytes, is_missing, content_sha256
+			sql: `SELECT media_type, filename, mime_type, size_bytes, is_missing,
+			             storage_file_id, content_sha256
 			      FROM whatsapp_media_items
 			      WHERE account = $1 AND chat_id = $2 AND message_id = $3 LIMIT 20`,
 		},
@@ -316,7 +352,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 		{
 			name:   "attachments",
 			params: []string{"account", "note_id", "revision_id"},
-			sql: `SELECT attachment_id, filename, content_type, size_bytes, is_missing
+			sql: `SELECT attachment_id, filename, content_type, size_bytes, is_missing, storage_file_id
 			      FROM apple_note_attachments
 			      WHERE account = $1 AND note_id = $2 AND revision_id = $3 LIMIT 50`,
 		},
@@ -462,10 +498,98 @@ func (s *timelineService) handleItem(w http.ResponseWriter, r *http.Request) {
 			childResults[child.name] = map[string]any{"error": childErr.Error()}
 			continue
 		}
+		for _, childRow := range childRows.Rows {
+			s.attachMedia(childRow)
+		}
 		childResults[child.name] = nonNilRows(childRows.Rows)
 	}
 	response["children"] = childResults
+	if media := s.itemMedia(sourceTable, response["source_row"]); media != nil {
+		response["item_media"] = media
+	}
 	writeJSON(w, response)
+}
+
+// attachMedia decorates a row that references a stored blob with a signed
+// download URL and a coarse render kind for the UI.
+func (s *timelineService) attachMedia(row map[string]any) {
+	fileID, _ := row["storage_file_id"].(string)
+	if fileID == "" {
+		return
+	}
+	if missing, ok := row["is_missing"].(int64); ok && missing != 0 {
+		return
+	}
+	url := s.media.signURL(fileID)
+	if url == "" {
+		return
+	}
+	contentType := ""
+	for _, key := range []string{"mime_type", "content_type", "mimetype"} {
+		if value, ok := row[key].(string); ok && value != "" {
+			contentType = value
+			break
+		}
+	}
+	row["media_url"] = url
+	row["media_kind"] = timelineMediaKind(contentType)
+}
+
+func timelineMediaKind(contentType string) string {
+	switch {
+	case strings.HasPrefix(contentType, "image/"):
+		return "image"
+	case strings.HasPrefix(contentType, "audio/"):
+		return "audio"
+	case strings.HasPrefix(contentType, "video/"):
+		return "video"
+	case contentType == "application/pdf":
+		return "pdf"
+	default:
+		return "file"
+	}
+}
+
+// itemMedia surfaces the event's own blob (a voice memo's audio, a Slack
+// file share's file, a Drive file's stored copy) from the fetched source row.
+var timelineItemMediaColumns = map[string][2]string{
+	"apple_voice_memos_files": {"storage_file_id", "content_type"},
+	"slack_files":             {"file_id", "mimetype"},
+	"google_drive_files":      {"storage_file_id", "mime_type"},
+}
+
+func (s *timelineService) itemMedia(sourceTable string, sourceRow any) map[string]any {
+	columns, ok := timelineItemMediaColumns[sourceTable]
+	if !ok {
+		return nil
+	}
+	raw, ok := sourceRow.(json.RawMessage)
+	if !ok {
+		return nil
+	}
+	var row map[string]any
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return nil
+	}
+	fileID, _ := row[columns[0]].(string)
+	if fileID == "" {
+		return nil
+	}
+	url := s.media.signURL(fileID)
+	if url == "" {
+		return nil
+	}
+	contentType, _ := row[columns[1]].(string)
+	filename, _ := row["filename"].(string)
+	if filename == "" {
+		filename, _ = row["name"].(string)
+	}
+	return map[string]any{
+		"media_url":  url,
+		"media_kind": timelineMediaKind(contentType),
+		"mime_type":  contentType,
+		"filename":   filename,
+	}
 }
 
 func (s *timelineService) fetchSourceRow(ctx context.Context, table string, pk map[string]any) (json.RawMessage, error) {

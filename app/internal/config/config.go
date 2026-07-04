@@ -20,7 +20,14 @@ type Config struct {
 	// production (they share the warehouse database); a local development app
 	// can point it at a locally-built timeline while detail views still read
 	// source rows from PostgresDatabaseURL.
-	TimelineDatabaseURL     string
+	TimelineDatabaseURL string
+	// TimelineMediaBaseURL/TimelineMediaSigningKey control which app serves the
+	// timeline UI's inline media through signed /objects/ links. Unset in
+	// production (this app signs and serves its own); a local development app
+	// without object-store credentials points these at the production app and
+	// its secret so media still streams through the pdw proxy.
+	TimelineMediaBaseURL    string
+	TimelineMediaSigningKey string
 	SecretToken             string
 	MaxRows                 int
 	MaxFieldChars           int
@@ -122,6 +129,8 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		BaseURL:                 strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
 		PostgresDatabaseURL:     normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
 		TimelineDatabaseURL:     normalizePostgresURL(getenv("PDW_TIMELINE_DATABASE_URL")),
+		TimelineMediaBaseURL:    strings.TrimRight(strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_BASE_URL")), "/"),
+		TimelineMediaSigningKey: strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_SIGNING_KEY")),
 		SecretToken:             firstNonEmpty(getenv("PDW_SECRET_TOKEN"), getenv("MCP_SECRET_TOKEN")),
 		MaxRows:                 100000,
 		MaxFieldChars:           4000,

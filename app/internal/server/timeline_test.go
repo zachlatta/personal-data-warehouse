@@ -61,13 +61,18 @@ func timelineEventRow(eventID string, seq int64, ts string) map[string]any {
 	}
 }
 
+const timelineTestMediaBase = "http://media.example.test"
+
 func newTimelineTestServer(t *testing.T, runner *fakeTimelineRunner) *httptest.Server {
 	t.Helper()
 	authSvc := pdwauth.NewService([]byte(muxAPITestSecret), func() time.Time { return time.Unix(0, 0) })
 	cfg := config.Config{
-		Addr:        ":0",
-		BaseURL:     "http://example.test",
-		SecretToken: muxAPITestSecret,
+		Addr:                    ":0",
+		BaseURL:                 "http://example.test",
+		SecretToken:             muxAPITestSecret,
+		TimelineMediaBaseURL:    timelineTestMediaBase,
+		TimelineMediaSigningKey: "media-signing-key-at-least-32-chars-long",
+		ObjectStoreURLTTL:       time.Hour,
 	}
 	mux := NewMux(cfg, authSvc, runner)
 	srv := httptest.NewServer(mux)
@@ -328,6 +333,93 @@ func TestParseTimelineCursor(t *testing.T) {
 	for _, bad := range []string{"x", "|1", "2026-06-01T11:00:00Z|", "nope|1"} {
 		if _, _, err := parseTimelineCursor(bad); err == nil {
 			t.Fatalf("cursor %q should be rejected", bad)
+		}
+	}
+}
+
+func TestTimelineChildRowsGetSignedMediaURLs(t *testing.T) {
+	item := timelineEventRow("e1", 20, "2026-06-01T12:00:00Z")
+	item["adapter"] = "whatsapp_message"
+	item["source_table"] = "whatsapp_messages"
+	item["source_pk"] = `{"account": "z@x.test", "chat_id": "c1", "message_id": "wm1"}`
+	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
+		"FROM timeline_events": {Rows: []map[string]any{item}},
+		"FROM whatsapp_media_items": {Rows: []map[string]any{
+			{"filename": "photo.jpg", "mime_type": "image/jpeg", "is_missing": int64(0), "storage_file_id": "blob123"},
+			{"filename": "gone.jpg", "mime_type": "image/jpeg", "is_missing": int64(1), "storage_file_id": "blob999"},
+		}},
+		"row_to_json": {Rows: []map[string]any{{"row": `{"account":"z@x.test"}`}}},
+	}}
+	srv := newTimelineTestServer(t, runner)
+	resp, body := timelineGET(t, srv, "/api/timeline/item?adapter=whatsapp_message&event_id=x", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d: %s", resp.StatusCode, body)
+	}
+	var payload struct {
+		Children map[string][]map[string]any `json:"children"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	media := payload.Children["media"]
+	if len(media) != 2 {
+		t.Fatalf("media rows = %#v", media)
+	}
+	stored := media[0]
+	url, _ := stored["media_url"].(string)
+	if !strings.HasPrefix(url, timelineTestMediaBase+"/objects/blob123?exp=") || !strings.Contains(url, "&sig=") {
+		t.Fatalf("media_url = %q", url)
+	}
+	if stored["media_kind"] != "image" {
+		t.Fatalf("media_kind = %v", stored["media_kind"])
+	}
+	if _, ok := media[1]["media_url"]; ok {
+		t.Fatalf("missing blob must not get a media_url: %#v", media[1])
+	}
+}
+
+func TestTimelineVoiceMemoGetsItemMedia(t *testing.T) {
+	item := timelineEventRow("e1", 20, "2026-06-01T12:00:00Z")
+	item["adapter"] = "voice_memo"
+	item["source_table"] = "apple_voice_memos_files"
+	item["source_pk"] = `{"account": "z@x.test", "recording_id": "rec1"}`
+	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
+		"FROM timeline_events": {Rows: []map[string]any{item}},
+		"row_to_json": {Rows: []map[string]any{
+			{"row": `{"account":"z@x.test","recording_id":"rec1","storage_file_id":"audio42","content_type":"audio/mp4","filename":"standup.m4a"}`},
+		}},
+	}}
+	srv := newTimelineTestServer(t, runner)
+	resp, body := timelineGET(t, srv, "/api/timeline/item?adapter=voice_memo&event_id=x", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d: %s", resp.StatusCode, body)
+	}
+	var payload struct {
+		ItemMedia map[string]any `json:"item_media"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ItemMedia == nil {
+		t.Fatalf("item_media missing: %s", body)
+	}
+	url, _ := payload.ItemMedia["media_url"].(string)
+	if !strings.HasPrefix(url, timelineTestMediaBase+"/objects/audio42?exp=") {
+		t.Fatalf("item media url = %q", url)
+	}
+	if payload.ItemMedia["media_kind"] != "audio" || payload.ItemMedia["filename"] != "standup.m4a" {
+		t.Fatalf("item_media = %#v", payload.ItemMedia)
+	}
+}
+
+func TestTimelineMediaKindClassification(t *testing.T) {
+	cases := map[string]string{
+		"image/jpeg": "image", "image/heic": "image", "audio/mp4": "audio",
+		"video/quicktime": "video", "application/pdf": "pdf", "text/plain": "file", "": "file",
+	}
+	for contentType, want := range cases {
+		if got := timelineMediaKind(contentType); got != want {
+			t.Fatalf("timelineMediaKind(%q) = %q, want %q", contentType, got, want)
 		}
 	}
 }

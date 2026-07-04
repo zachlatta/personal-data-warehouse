@@ -165,6 +165,14 @@ pre.blob {
 .childrow:first-of-type { border-top: 0; }
 .childrow .m { color: var(--faint); font-size: 10px; }
 .bigtext { white-space: pre-wrap; word-break: break-word; color: var(--dim); font-size: 11.5px; }
+img.thumb {
+  display: block; max-width: 100%; max-height: 360px; border-radius: 4px;
+  border: 1px solid var(--line2); margin: 6px 0; cursor: zoom-in; background: var(--bg);
+}
+audio.player, video.player { display: block; width: 100%; margin: 6px 0; }
+video.player { max-height: 380px; border-radius: 4px; border: 1px solid var(--line2); background: var(--bg); }
+a.filelink { color: var(--amber); text-decoration: none; font-size: 11.5px; }
+a.filelink:hover { text-decoration: underline; }
 #dclose { margin-left: auto; }
 
 /* ---- token overlay ---- */
@@ -539,6 +547,41 @@ pre.blob {
     return table;
   }
 
+  /* Inline media rendered through the pdw object proxy (signed, expiring
+     /objects/ links minted server-side). Images click through to the raw
+     file; anything a browser can't render inline falls back to a link. */
+  function mediaNode(row, label) {
+    if (!row || !row.media_url) return null;
+    var wrap = h("div");
+    var name = label || row.filename || row.title || "";
+    if (row.media_kind === "image") {
+      var img = h("img", "thumb");
+      img.loading = "lazy";
+      img.src = row.media_url;
+      img.alt = name;
+      img.addEventListener("click", function () { window.open(row.media_url, "_blank"); });
+      img.addEventListener("error", function () {
+        var link = h("a", "filelink", "⇗ " + (name || "open file") + " (preview unavailable)");
+        link.href = row.media_url; link.target = "_blank";
+        wrap.replaceChild(link, img);
+      });
+      wrap.appendChild(img);
+    } else if (row.media_kind === "audio") {
+      var audio = h("audio", "player");
+      audio.controls = true; audio.preload = "none"; audio.src = row.media_url;
+      wrap.appendChild(audio);
+    } else if (row.media_kind === "video") {
+      var video = h("video", "player");
+      video.controls = true; video.preload = "none"; video.src = row.media_url;
+      wrap.appendChild(video);
+    } else {
+      var anchor = h("a", "filelink", "⇗ " + (name || "open file"));
+      anchor.href = row.media_url; anchor.target = "_blank";
+      wrap.appendChild(anchor);
+    }
+    return wrap;
+  }
+
   function openItem(item) {
     var drawer = el("drawer");
     drawer.classList.add("open");
@@ -574,6 +617,12 @@ pre.blob {
 
     api("/api/timeline/item", { adapter: item.adapter, event_id: item.event_id }).then(function (detail) {
       body.removeChild(loading);
+      if (detail.item_media) {
+        var mediaSect = section("media");
+        var node = mediaNode(detail.item_media, detail.item_media.filename);
+        if (node) mediaSect.appendChild(node);
+        body.insertBefore(mediaSect, body.children[1] || null);
+      }
       var children = detail.children || {};
       Object.keys(children).sort().forEach(function (name) {
         var rows = children[name];
@@ -581,10 +630,13 @@ pre.blob {
         var sect = section(name.replace(/_/g, " ") + " · " + rows.length, rows);
         rows.forEach(function (childRow) {
           var node = h("div", "childrow");
-          var text = childRow.text || childRow.summary || childRow.filename || childRow.name || "";
+          var media = mediaNode(childRow);
+          if (media) node.appendChild(media);
+          var text = childRow.text || childRow.summary || "";
+          if (!media && !text) text = childRow.filename || childRow.name || "";
           var metaBits = [];
           for (var key in childRow) {
-            if (key === "text" || key === "summary") continue;
+            if (key === "text" || key === "summary" || key === "media_url" || key === "storage_file_id") continue;
             var val = childRow[key];
             if (val === "" || val === null || val === 0) continue;
             metaBits.push(key + "=" + String(val).slice(0, 60));
