@@ -80,6 +80,9 @@ func TestObjectDownloadServesDriveSourceByAccount(t *testing.T) {
 	if rec3.Code != http.StatusNotFound {
 		t.Fatalf("unknown-account link status = %d", rec3.Code)
 	}
+	if got := strings.TrimSpace(rec3.Body.String()); got != "storage for this link's account is not configured" {
+		t.Fatalf("unknown-account body = %q", got)
+	}
 }
 
 func TestObjectDownloadDriveSourceDoesNotLeakStoreToNextRequest(t *testing.T) {
@@ -213,6 +216,27 @@ func TestObjectDownloadMissingObject(t *testing.T) {
 	rec := serveObjectRequest(t, &fakeObjectStore{notFound: true}, 1024, http.MethodGet, signedObjectPath("gone", objectsTestNow.Add(time.Hour)))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != "object no longer exists in storage" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+// TestObjectDownloadDeletedSlackFile: a valid signed link to a Slack file that
+// Slack no longer resolves (deleted/tombstoned) explains itself instead of
+// answering with the generic body that reads like a route typo.
+func TestObjectDownloadDeletedSlackFile(t *testing.T) {
+	slackStore := objectstore.NewSlackFileStore(objectstore.SlackFileStoreOptions{
+		Tokens:     []string{"tok"},
+		HTTPClient: &slackAPIFake{fileID: "F0123ABCDEF"},
+	})
+	store := objectstore.WithSlackFiles(&fakeObjectStore{notFound: true}, slackStore)
+	rec := serveObjectRequest(t, store, 1024, http.MethodGet, signedObjectPath("FGONE123456", objectsTestNow.Add(time.Hour)))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != "file no longer exists in Slack" {
+		t.Fatalf("body = %q", got)
 	}
 }
 

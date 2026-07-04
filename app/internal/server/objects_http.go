@@ -46,19 +46,27 @@ func objectDownloadHandler(store objectstore.ObjectStore, driveStores map[string
 			driveStore, ok := driveStores[account]
 			if !ok {
 				logger.WarnContext(r.Context(), "object download for unknown drive source account", "account", account)
-				http.NotFound(w, r)
+				http.Error(w, "storage for this link's account is not configured", http.StatusNotFound)
 				return
 			}
 			selectedStore = driveStore
 			ref.StorageBackend = driveSourceBackend
 		}
 		if selectedStore == nil {
-			http.NotFound(w, r)
+			http.Error(w, "object storage is not configured", http.StatusNotFound)
 			return
 		}
 		meta, err := selectedStore.GetMetadata(r.Context(), ref)
 		if err == objectstore.ErrNotFound {
-			http.NotFound(w, r)
+			// The link's signature already verified, so this is a real object
+			// reference whose target is gone — say so instead of the generic
+			// body that reads like a mistyped URL. Slack files are served live
+			// from the Slack API, so not-found there means deleted in Slack.
+			if objectstore.IsSlackFileID(fileID) {
+				http.Error(w, "file no longer exists in Slack", http.StatusNotFound)
+				return
+			}
+			http.Error(w, "object no longer exists in storage", http.StatusNotFound)
 			return
 		}
 		if err != nil {
