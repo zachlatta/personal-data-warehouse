@@ -558,6 +558,8 @@ func (s *timelineService) registerRoutes(mux *http.ServeMux, requireAuth func(ht
 	mux.Handle("/api/timeline/item", requireAuth(http.HandlerFunc(s.handleItem)))
 	mux.HandleFunc("/timeline", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// The shell is tiny and iterated on; never let a browser cache a stale copy.
+		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write([]byte(timelinePageHTML))
 	})
 }

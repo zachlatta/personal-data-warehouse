@@ -250,12 +250,19 @@ pre.blob {
   };
   function hue(src) { return HUES[src] || "#8b94a1"; }
 
-  // Accept a one-time token handoff via the URL fragment (#token=...): the
-  // fragment never reaches the server or its logs, and it is stripped from
-  // the address bar immediately after being stored.
+  // Accept a one-time token handoff via the URL fragment (#token=...) or, as
+  // a fallback for terminals that cut links at the "#", a ?token= query
+  // param. Either way it is stored and immediately stripped from the address
+  // bar. (The request logger records only the path, not the query string.)
   if (location.hash.indexOf("#token=") === 0) {
     localStorage.setItem("pdw_timeline_token", decodeURIComponent(location.hash.slice(7)));
     history.replaceState(null, "", location.pathname);
+  } else if (location.search.indexOf("token=") !== -1) {
+    var qtoken = new URLSearchParams(location.search).get("token");
+    if (qtoken) {
+      localStorage.setItem("pdw_timeline_token", qtoken);
+      history.replaceState(null, "", location.pathname);
+    }
   }
 
   var state = {
@@ -369,9 +376,19 @@ pre.blob {
     loadSources().then(resetAndLoad);
   });
 
-  /* ---- ledger ---- */
-  function fmtTime(ts) { return ts ? ts.slice(11, 16) : "—"; }
-  function dayOf(ts) { return ts ? ts.slice(0, 10) : "unknown"; }
+  /* ---- ledger (all display times are the browser's local timezone) ---- */
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  function fmtTime(ts) {
+    if (!ts) return "—";
+    var d = new Date(ts);
+    return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  }
+  function dayOf(ts) {
+    if (!ts) return "unknown";
+    var d = new Date(ts);
+    return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+  }
+  function fmtFull(ts) { return ts ? new Date(ts).toLocaleString() : ""; }
   var WEEKDAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
   function appendItems(items) {
@@ -383,7 +400,7 @@ pre.blob {
         var head = h("div", "day");
         head.appendChild(h("span", "d", day));
         var weekday = "";
-        try { weekday = WEEKDAYS[new Date(day + "T12:00:00Z").getUTCDay()]; } catch (e) {}
+        try { weekday = WEEKDAYS[new Date(item.event_ts).getDay()]; } catch (e) {}
         head.appendChild(h("span", "w", weekday));
         head.appendChild(h("span", "rule"));
         rowsNode.appendChild(head);
@@ -447,9 +464,9 @@ pre.blob {
       kinds: activeCSV(state.kinds),
       limit: 80
     };
-    // Default the first page to just past now so the ledger opens at today;
+    // Default the first page to now so the ledger opens at the present moment;
     // future items (upcoming calendar events) are reachable via jump.
-    if (!state.cursor) params.jump = state.jump || new Date(Date.now() + 86400000).toISOString();
+    if (!state.cursor) params.jump = state.jump || new Date().toISOString();
     api("/api/timeline", params).then(function (body) {
       appendItems(body.items || []);
       if (body.next_cursor) { state.cursor = body.next_cursor; } else { state.exhausted = true; }
@@ -482,7 +499,10 @@ pre.blob {
   observer.observe(el("sentinel"));
 
   el("jump").addEventListener("change", function () {
-    state.jump = el("jump").value || "";
+    // The picker gives a plain date; jump to that day's local end-of-day so
+    // the page opens with the whole selected day visible.
+    var picked = el("jump").value;
+    state.jump = picked ? new Date(picked + "T23:59:59.999").toISOString() : "";
     resetAndLoad();
   });
   el("latest").addEventListener("click", function () {
@@ -531,7 +551,7 @@ pre.blob {
 
     var head = section("event");
     head.appendChild(kvTable([
-      ["when", item.event_ts], ["until", isReal(item.end_ts) ? item.end_ts : ""],
+      ["when", fmtFull(item.event_ts)], ["until", isReal(item.end_ts) ? fmtFull(item.end_ts) : ""],
       ["actor", item.actor], ["context", item.context],
       ["adapter", item.adapter], ["event id", item.event_id],
       ["seq", item.seq], ["source table", item.source_table]
