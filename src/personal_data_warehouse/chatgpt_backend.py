@@ -14,8 +14,10 @@ than silently degrade.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+import json
 import time
 from typing import Any
 
@@ -114,8 +116,22 @@ class ChatGPTBackendClient:
         if not token:
             # A logged-out session returns ``{}``; treat that as auth failure.
             raise ChatGPTAuthError("auth session response had no accessToken: session expired")
+        now = self._now()
+        token_exp = _jwt_exp(token)
+        if token_exp is not None and token_exp <= now:
+            # ``/api/auth/session`` returns a *cached, already-expired* access
+            # token when the underlying browser session can no longer refresh it
+            # (the JWT lasts ~10 days; the session cookie ~90). Sending it just
+            # earns an opaque backend 401, so fail here with the auth-expiry
+            # classification callers act on (``publish-session`` refuses to
+            # publish a dead session; the poller marks it expired and skips).
+            raise ChatGPTAuthError("auth session accessToken is expired: session expired")
         self._access_token = token
-        self._access_expiry = _parse_expiry(data.get("expires"), now=self._now())
+        # The JWT ``exp`` is authoritative for the bearer we send; fall back to
+        # the session ``expires`` only for opaque (non-JWT) tokens.
+        self._access_expiry = (
+            token_exp if token_exp is not None else _parse_expiry(data.get("expires"), now=now)
+        )
         return data if isinstance(data, dict) else {}
 
     def _ensure_access_token(self) -> None:
@@ -191,6 +207,28 @@ def _cookie_header(credential: str) -> str:
         # Already a full Cookie header (one or more name=value pairs).
         return credential
     return f"__Secure-next-auth.session-token={credential}"
+
+
+def _jwt_exp(token: str) -> float | None:
+    """Return a JWT access token's ``exp`` (epoch seconds), or ``None``.
+
+    The ChatGPT ``accessToken`` is an RS256 JWT whose ``exp`` (~10 days) is far
+    shorter than the NextAuth *session* ``expires`` (~90 days), and only the JWT
+    ``exp`` bounds how long the bearer actually authorizes backend calls. Returns
+    ``None`` for opaque (non-JWT) tokens so callers fall back to the session
+    expiry. Best-effort: any decode failure yields ``None``.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+    exp = claims.get("exp") if isinstance(claims, dict) else None
+    return float(exp) if isinstance(exp, (int, float)) else None
 
 
 def _parse_expiry(expires: Any, *, now: float) -> float:

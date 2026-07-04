@@ -31,20 +31,34 @@ class FakeRequest:
         return self._result
 
 
+def abusive_http_error() -> HttpError:
+    content = (
+        b'{"error":{"errors":[{"reason":"cannotDownloadAbusiveFile"}],"code":403,'
+        b'"message":"This file has been identified as malware or spam and cannot be downloaded."}}'
+    )
+    return HttpError(FakeResp(403), content)
+
+
 class FakeMediaRequest:
-    def __init__(self, content: bytes) -> None:
+    def __init__(self, content: bytes = b"", *, error: Exception | None = None) -> None:
         self.content = content
+        self.error = error
 
 
 class FakeFiles:
-    def __init__(self, *, media=None, get=None, delete_error=None) -> None:
+    def __init__(self, *, media=None, get=None, delete_error=None, media_abusive=None) -> None:
         self._media = media or {}
         self._get = get or {}
         self._delete_error = delete_error
+        self._media_abusive = set(media_abusive or ())
         self.deleted: list[str] = []
         self.get_calls: list[dict] = []
+        self.get_media_calls: list[dict] = []
 
-    def get_media(self, *, fileId, supportsAllDrives):
+    def get_media(self, *, fileId, supportsAllDrives, acknowledgeAbuse=False):
+        self.get_media_calls.append({"fileId": fileId, "acknowledgeAbuse": acknowledgeAbuse})
+        if fileId in self._media_abusive and not acknowledgeAbuse:
+            return FakeMediaRequest(error=abusive_http_error())
         return FakeMediaRequest(self._media[fileId])
 
     def get(self, *, fileId, fields, supportsAllDrives):
@@ -77,6 +91,8 @@ class FakeDownloader:
         self._request = request
 
     def next_chunk(self, num_retries: int = 0):
+        if getattr(self._request, "error", None) is not None:
+            raise self._request.error
         self._output.write(self._request.content)
         return (None, True)
 
@@ -100,6 +116,35 @@ def test_download_to_path_writes_file(monkeypatch, tmp_path: Path) -> None:
     store.download_to_path({"storage_file_id": "fid"}, target)
 
     assert target.read_bytes() == b"hello"
+
+
+def test_download_retries_with_acknowledge_abuse_on_malware_403(monkeypatch) -> None:
+    # Drive refuses alt=media for objects it flags as malware/spam unless the
+    # owner acknowledges the risk. These are our own stored blobs (e.g. a
+    # phishing PDF a contact texted us), so acknowledge and retry rather than
+    # failing the download every enrichment run forever.
+    monkeypatch.setattr(gd, "MediaIoBaseDownload", FakeDownloader)
+    files = FakeFiles(media={"fid": b"phish-pdf"}, media_abusive={"fid"})
+    store = make_store(files)
+
+    assert store.get_object({"storage_file_id": "fid"}) == b"phish-pdf"
+    assert [c["acknowledgeAbuse"] for c in files.get_media_calls] == [False, True]
+
+
+def test_download_non_abusive_403_propagates(monkeypatch) -> None:
+    # A 403 that is not the malware/abuse case must not be swallowed or retried.
+    monkeypatch.setattr(gd, "MediaIoBaseDownload", FakeDownloader)
+
+    class Generic403Files(FakeFiles):
+        def get_media(self, *, fileId, supportsAllDrives, acknowledgeAbuse=False):
+            self.get_media_calls.append({"fileId": fileId, "acknowledgeAbuse": acknowledgeAbuse})
+            return FakeMediaRequest(error=http_error(403))
+
+    files = Generic403Files()
+    store = make_store(files)
+    with pytest.raises(HttpError):
+        store.get_object({"storage_file_id": "fid"})
+    assert len(files.get_media_calls) == 1  # not retried
 
 
 def test_missing_file_id_raises() -> None:

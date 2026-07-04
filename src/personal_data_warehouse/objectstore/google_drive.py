@@ -481,7 +481,23 @@ class GoogleDriveObjectStore:
         )
 
     def _download(self, file_id: str, output) -> None:
-        request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        try:
+            self._download_media(file_id, output, acknowledge_abuse=False)
+        except HttpError as exc:
+            if not _is_abusive_file_error(exc):
+                raise
+            # Drive refuses alt=media for objects it has flagged as malware or
+            # spam unless the owner acknowledges the risk. These are our own
+            # stored blobs (e.g. a phishing PDF a contact texted us), captured
+            # deliberately for enrichment, so acknowledge and retry rather than
+            # letting the attachment fail its download on every run forever.
+            _rewind(output)
+            self._download_media(file_id, output, acknowledge_abuse=True)
+
+    def _download_media(self, file_id: str, output, *, acknowledge_abuse: bool) -> None:
+        request = self._service.files().get_media(
+            fileId=file_id, supportsAllDrives=True, acknowledgeAbuse=acknowledge_abuse
+        )
         downloader = MediaIoBaseDownload(output, request)
         done = False
         while not done:
@@ -666,6 +682,31 @@ class GoogleDriveObjectStore:
 
 def _http_status(exc: HttpError) -> int | None:
     return getattr(getattr(exc, "resp", None), "status", None)
+
+
+def _rewind(output) -> None:
+    """Reset a partially-written, seekable output before a download retry."""
+    try:
+        if output.seekable():
+            output.seek(0)
+            output.truncate()
+    except (AttributeError, OSError):  # pragma: no cover - non-seekable stream
+        pass
+
+
+def _is_abusive_file_error(exc: HttpError) -> bool:
+    """True for Drive's 403 refusing to serve a malware/abuse-flagged file.
+
+    Downloading such a file requires ``acknowledgeAbuse=true``; the API signals
+    the condition with HTTP 403 and reason ``cannotDownloadAbusiveFile``.
+    """
+    if _http_status(exc) != 403:
+        return False
+    content = getattr(exc, "content", b"") or b""
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", "replace")
+    text = str(content).lower()
+    return "cannotdownloadabusivefile" in text or "malware or spam" in text
 
 
 def is_transient_google_error(exc: Exception) -> bool:

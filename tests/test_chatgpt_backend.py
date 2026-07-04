@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import json
+
 import pytest
 
 from personal_data_warehouse.chatgpt_backend import (
@@ -8,6 +11,15 @@ from personal_data_warehouse.chatgpt_backend import (
     ChatGPTBackendError,
     ChatGPTRateLimitError,
 )
+
+
+def _jwt(exp: float) -> str:
+    """Build a JWT-shaped access token whose payload carries ``exp``."""
+
+    def _b64(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{_b64({'alg': 'RS256'})}.{_b64({'exp': exp})}.sig"
 
 
 class FakeResponse:
@@ -152,3 +164,32 @@ def test_bare_token_is_wrapped_into_cookie():
 def test_missing_credential_raises():
     with pytest.raises(ChatGPTAuthError):
         ChatGPTBackendClient(session_credential="", session=FakeSession({}))
+
+
+def test_expired_jwt_access_token_raises_auth_error():
+    # /api/auth/session can return 200 with a *cached, already-expired* access
+    # token when the browser session can no longer refresh it (the JWT lasts
+    # ~10 days; the session cookie ~90). Treat that as an auth failure rather
+    # than sending a dead bearer and getting an opaque backend 401.
+    c = client({AUTH: [FakeResponse(200, {"accessToken": _jwt(500.0), "expires": "2999-01-01T00:00:00Z"})]})
+    with pytest.raises(ChatGPTAuthError):
+        c.fetch_auth_session()
+
+
+def test_fresh_jwt_access_token_expiry_tracks_jwt_not_session():
+    # A healthy session: the JWT exp (9000) is authoritative for the bearer, so
+    # cache freshness keys off it, not the far-future session ``expires``.
+    c = client(
+        {AUTH: [FakeResponse(200, {"accessToken": _jwt(9000.0), "expires": "2999-01-01T00:00:00Z"})]}
+    )
+    c.fetch_auth_session()
+    assert c._access_expiry == 9000.0
+
+
+def test_opaque_access_token_falls_back_to_session_expiry():
+    # A non-JWT (opaque) token can't be introspected, so we fall back to the
+    # session ``expires`` and accept the token as before.
+    c = client({AUTH: [FakeResponse(200, {"accessToken": "opaque-tok", "expires": "2999-01-01T00:00:00Z"})]})
+    c.fetch_auth_session()
+    assert c._access_token == "opaque-tok"
+    assert c._access_expiry > 1_000.0
