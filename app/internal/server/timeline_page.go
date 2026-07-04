@@ -113,6 +113,19 @@ button.primary { color: #10131a; background: var(--amber); border-color: var(--a
 @keyframes rowin { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 .row:hover { background: var(--surface); }
 .row.sel { background: var(--surface2); outline: 1px solid var(--line2); }
+/* Priority weighting: tier 1/2 read at full strength, peripheral and noise
+   tiers recede, background machinery almost disappears until hovered. */
+.row.p3 { opacity: .82; }
+.row.p4 { opacity: .55; }
+.row.p5 { opacity: .38; }
+.row.p4:hover, .row.p5:hover, .row.p3:hover { opacity: 1; }
+.row.p1 .title, .row.p2 .title { font-weight: 600; }
+.pbadge {
+  display: inline-block; font-size: 8.5px; letter-spacing: .1em; border-radius: 2px;
+  padding: 1px 4px; border: 1px solid var(--line2); color: var(--faint); text-transform: uppercase;
+}
+.row.p1 .pbadge { color: var(--amber); border-color: var(--amber-dim); }
+.row.p2 .pbadge { color: var(--text); }
 .row .t { color: var(--faint); font-size: 11px; text-align: right; }
 .row .tick { align-self: stretch; border-radius: 1px; opacity: .85; min-height: 30px; }
 .row .who { overflow: hidden; }
@@ -208,7 +221,9 @@ a.filelink:hover { text-decoration: underline; }
     <button id="lock" title="change access token">⌁ token</button>
   </div>
   <div id="rail">
-    <div class="rail-h">sources <span class="clear" id="clearsrc">reset</span></div>
+    <div class="rail-h">priority <span class="clear" id="clearsrc">reset</span></div>
+    <div id="prioritylist"></div>
+    <div class="rail-h">sources</div>
     <div id="srclist"></div>
     <div class="rail-h">kinds</div>
     <div id="kindlist"></div>
@@ -276,8 +291,13 @@ a.filelink:hover { text-decoration: underline; }
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
     cursor: "", exhausted: false, loading: false,
-    sources: {}, kinds: {}, lastDay: "", selected: null, count: 0
+    sources: {}, kinds: {}, priorities: {}, lastDay: "", selected: null, count: 0
   };
+
+  var PRIORITY_LABELS = {
+    "1": "self", "2": "direct", "3": "cc'd", "4": "noise", "5": "background", "0": "unclassified"
+  };
+  function priorityLabel(p) { return PRIORITY_LABELS[String(p)] || ("p" + p); }
 
   function el(id) { return document.getElementById(id); }
   function h(tag, cls, text) {
@@ -326,7 +346,7 @@ a.filelink:hover { text-decoration: underline; }
       var dot = h("span", "dot");
       dot.style.background = colorize ? hue(entry.name) : "var(--line2)";
       chip.appendChild(dot);
-      chip.appendChild(h("span", "nm", entry.name));
+      chip.appendChild(h("span", "nm", entry.label || entry.name));
       chip.appendChild(h("span", "ct", entry.count.toLocaleString()));
       chip.addEventListener("click", function () {
         map[entry.name] = !map[entry.name];
@@ -355,6 +375,14 @@ a.filelink:hover { text-decoration: underline; }
       }
       renderChips(el("srclist"), toCatalog(bySource), state.sources, true);
       renderChips(el("kindlist"), toCatalog(byKind), state.kinds, false);
+      var priorityCatalog = (body.priorities || []).map(function (row) {
+        return {
+          name: String(row.priority),
+          label: priorityLabel(row.priority),
+          count: row.count
+        };
+      });
+      renderChips(el("prioritylist"), priorityCatalog, state.priorities, false);
       el("stats").innerHTML = "<b>" + total.toLocaleString() + "</b> events · " +
         (oldest ? oldest.slice(0, 10) : "—") + " → " + (newest ? newest.slice(0, 10) : "—");
 
@@ -380,7 +408,7 @@ a.filelink:hover { text-decoration: underline; }
   }
 
   el("clearsrc").addEventListener("click", function () {
-    state.sources = {}; state.kinds = {};
+    state.sources = {}; state.kinds = {}; state.priorities = {};
     loadSources().then(resetAndLoad);
   });
 
@@ -413,7 +441,7 @@ a.filelink:hover { text-decoration: underline; }
         head.appendChild(h("span", "rule"));
         rowsNode.appendChild(head);
       }
-      var row = h("div", "row");
+      var row = h("div", "row p" + (item.priority || 0));
       row.style.animationDelay = Math.min(index, 12) * 12 + "ms";
       row.appendChild(h("div", "t", fmtTime(item.event_ts)));
       var tick = h("div", "tick");
@@ -441,7 +469,10 @@ a.filelink:hover { text-decoration: underline; }
 
       var right = h("div");
       right.appendChild(h("div", "ctx", item.context || ""));
-      if (flags.length) right.appendChild(h("div", "flags", flags.join(" · ")));
+      var badges = h("div", "flags");
+      badges.appendChild(h("span", "pbadge", priorityLabel(item.priority)));
+      if (flags.length) badges.appendChild(document.createTextNode(" " + flags.join(" · ")));
+      right.appendChild(badges);
       row.appendChild(right);
 
       row.addEventListener("click", function () {
@@ -470,6 +501,7 @@ a.filelink:hover { text-decoration: underline; }
       before: state.cursor,
       sources: activeCSV(state.sources),
       kinds: activeCSV(state.kinds),
+      priorities: activeCSV(state.priorities),
       limit: 80
     };
     // Default the first page to now so the ledger opens at the present moment;
@@ -596,6 +628,7 @@ a.filelink:hover { text-decoration: underline; }
     head.appendChild(kvTable([
       ["when", fmtFull(item.event_ts)], ["until", isReal(item.end_ts) ? fmtFull(item.end_ts) : ""],
       ["actor", item.actor], ["context", item.context],
+      ["priority", priorityLabel(item.priority) + " (" + item.priority + ")"],
       ["adapter", item.adapter], ["event id", item.event_id],
       ["seq", item.seq], ["source table", item.source_table]
     ]));

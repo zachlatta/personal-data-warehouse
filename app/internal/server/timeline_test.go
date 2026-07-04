@@ -52,6 +52,7 @@ func (f *fakeTimelineRunner) QueryArgs(_ context.Context, sql string, args []any
 func timelineEventRow(eventID string, seq int64, ts string) map[string]any {
 	return map[string]any{
 		"adapter": "gmail_email", "event_id": eventID, "source": "gmail", "kind": "email",
+		"priority": int64(2),
 		"event_ts": ts, "end_ts": "1970-01-01T00:00:00Z", "actor": "alice@example.test",
 		"title": "Hello", "snippet": "hi there", "context": "z@x.test",
 		"source_table": "gmail_messages",
@@ -170,8 +171,24 @@ func TestTimelineListReturnsItemsAndCursor(t *testing.T) {
 	if call.Args[0] != "gmail,slack" {
 		t.Fatalf("sources arg = %#v", call.Args[0])
 	}
-	if fmt.Sprint(call.Args[2]) != "infinity" {
-		t.Fatalf("first page cursor ts = %#v", call.Args[2])
+	if fmt.Sprint(call.Args[3]) != "infinity" {
+		t.Fatalf("first page cursor ts = %#v", call.Args[3])
+	}
+}
+
+func TestTimelineListPassesPriorityFilter(t *testing.T) {
+	runner := &fakeTimelineRunner{}
+	srv := newTimelineTestServer(t, runner)
+	resp, _ := timelineGET(t, srv, "/api/timeline?priorities=1,2", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d", resp.StatusCode)
+	}
+	if runner.calls[0].Args[2] != "1,2" {
+		t.Fatalf("priorities arg = %#v", runner.calls[0].Args[2])
+	}
+	resp, _ = timelineGET(t, srv, "/api/timeline?priorities=1%3BDROP", true)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad priorities filter: got %d, want 400", resp.StatusCode)
 	}
 }
 
@@ -184,7 +201,7 @@ func TestTimelineListSecondPageUsesCursor(t *testing.T) {
 		t.Fatalf("got %d", resp.StatusCode)
 	}
 	call := runner.calls[0]
-	if fmt.Sprint(call.Args[2]) != "2026-06-01T11:00:00Z" || fmt.Sprint(call.Args[3]) != "10" {
+	if fmt.Sprint(call.Args[3]) != "2026-06-01T11:00:00Z" || fmt.Sprint(call.Args[4]) != "10" {
 		t.Fatalf("cursor args = %#v", call.Args)
 	}
 }

@@ -900,6 +900,11 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "timeline_events",
         "CREATE INDEX IF NOT EXISTS timeline_events_seq_idx ON timeline_events (seq)",
     ),
+    IndexSpec(
+        "timeline_events_priority_time_idx",
+        "timeline_events",
+        "CREATE INDEX IF NOT EXISTS timeline_events_priority_time_idx ON timeline_events (priority, event_ts DESC, seq DESC)",
+    ),
     # Ingestion-timestamp indexes on the larger event sources so the timeline's
     # incremental sync (WHERE ingest_ts > watermark) never falls back to a
     # per-tick sequential scan. Created CONCURRENTLY where the table is big in
@@ -1172,6 +1177,7 @@ INTEGER_COLUMNS = {
     "backfill_done",
     "backfill_rows",
     "incremental_rows",
+    "priority",
 }
 
 FLOAT_COLUMNS = {
@@ -1325,6 +1331,9 @@ class PostgresWarehouse:
         self._command("ALTER TABLE timeline_events ALTER COLUMN seq SET DEFAULT nextval('timeline_events_seq')")
         self._command("ALTER TABLE timeline_events ALTER COLUMN first_seen_at SET DEFAULT now()")
         self._command("ALTER TABLE timeline_events ALTER COLUMN updated_at SET DEFAULT now()")
+        # Additive migration for timelines created before the priority tier
+        # existed; 0 means "not yet classified" and re-syncing fills it in.
+        self._command("ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS priority bigint NOT NULL DEFAULT 0")
 
     def ensure_claude_desktop_tables(self) -> None:
         """Tables for the serverside Claude Desktop poller.

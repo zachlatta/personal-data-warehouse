@@ -908,6 +908,7 @@ TIMELINE_EVENT_COLUMNS = (
     "event_id",
     "source",
     "kind",
+    "priority",
     "event_ts",
     "end_ts",
     "actor",

@@ -56,6 +56,16 @@ TIMELINE_SNIPPET_CHARS = 500
 TIMELINE_TITLE_CHARS = 300
 TIMELINE_DEFAULT_BATCH_SIZE = 2000
 
+# Priority tiers, classified per row at sync time (1 = highest). The lines
+# between tiers are heuristics and expected to be tuned; changing an
+# adapter's classification and re-running the backfill reclassifies rows
+# (priority participates in the content guard, so seq bumps on change).
+TIMELINE_PRIORITY_SELF = 1  # actions Zach initiated (his messages, sessions, memos, notes)
+TIMELINE_PRIORITY_DIRECT = 2  # real people reaching him directly (DMs, direct email, small groups)
+TIMELINE_PRIORITY_CC = 3  # real-people activity he is peripheral to (cc'd, channels, big groups)
+TIMELINE_PRIORITY_NOISE = 4  # bulk/automated traffic (newsletters, bots, non-member channels)
+TIMELINE_PRIORITY_BACKGROUND = 5  # the warehouse's own machinery (enrichment, mutation workers)
+
 _EPOCH = "'1970-01-01 00:00:00+00'::timestamptz"
 # Sentinel guard: house style stores "no timestamp" as the epoch, so anything
 # at or before this is treated as absent.
@@ -80,6 +90,7 @@ TIMELINE_NORMALIZED_COLUMNS = (
     "source_pk",
     "metadata",
     "ingest_ts",
+    "priority",
 )
 
 
@@ -129,6 +140,7 @@ def _simple_adapter(
     snippet: str = "''",
     context: str = "''",
     metadata: str = "'{}'::jsonb",
+    priority: str = str(TIMELINE_PRIORITY_CC),
     where: str = "TRUE",
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE,
 ) -> TimelineAdapter:
@@ -151,7 +163,8 @@ def _simple_adapter(
             COALESCE(({context}), '') AS context,
             ({source_pk})::text AS source_pk,
             COALESCE(({metadata}), '{{}}'::jsonb)::text AS metadata,
-            ({ingest_ts}) AS ingest_ts
+            ({ingest_ts}) AS ingest_ts,
+            COALESCE(({priority}), {TIMELINE_PRIORITY_CC}) AS priority
         FROM {from_sql}
         WHERE ({where})
     """
@@ -188,6 +201,20 @@ def _snippet(expr: str) -> str:
     return f"left({expr}, {TIMELINE_SNIPPET_CHARS})"
 
 
+# Sender-pattern fallbacks for mail Gmail's categorizer misses (it labels
+# most modern bulk mail, but pre-2016 history and some transactional senders
+# carry no category). Hard-bulk senders are one-way broadcast -> noise;
+# soft-automation senders are machine-written but often worth a glance
+# (receipts, signature notices, GitHub) -> cc tier.
+_GMAIL_BULK_SENDER_PATTERN = (
+    "'(no-?reply|donotreply|do-not-reply|mailer|postmaster|bounce|"
+    "newsletter|marketing@|promo)'"
+)
+_GMAIL_AUTOMATED_SENDER_PATTERN = (
+    "'(notifications?@|digest@|updates@|alerts?@|billing@|receipts?@|invoice|"
+    "bank@|hcb@|sign@|bot@|replies\\+|info@|contact@|hello@|support@)'"
+)
+
 _GMAIL_EMAIL = _simple_adapter(
     name="gmail_email",
     source_table="gmail_messages",
@@ -213,6 +240,27 @@ _GMAIL_EMAIL = _simple_adapter(
         "'labels', to_jsonb(t.label_ids), "
         "'deleted', t.is_deleted <> 0)"
     ),
+    # Sent by me > spam/bulk (Gmail's own categorizer) > starred > automated
+    # senders that escaped the categorizer > addressed to me > cc'd/other.
+    # "Directly addressed" alone is not enough for tier 2: plenty of garbage
+    # is addressed straight to the account, so the bulk/automation checks
+    # deliberately run first.
+    priority=(
+        "CASE "
+        # Mail from any of my synced mailboxes is my own action, including the
+        # copy that lands in a different account (cross-account forwards).
+        "WHEN t.from_address ILIKE '%%' || t.account || '%%' "
+        "  OR EXISTS (SELECT 1 FROM gmail_sync_state self "
+        "             WHERE self.account <> '' AND t.from_address ILIKE '%%' || self.account || '%%') THEN 1 "
+        "WHEN 'SPAM' = ANY(t.label_ids) OR 'TRASH' = ANY(t.label_ids) THEN 4 "
+        "WHEN 'CATEGORY_PROMOTIONS' = ANY(t.label_ids) OR 'CATEGORY_UPDATES' = ANY(t.label_ids) "
+        "  OR 'CATEGORY_FORUMS' = ANY(t.label_ids) OR 'CATEGORY_SOCIAL' = ANY(t.label_ids) THEN 4 "
+        "WHEN 'STARRED' = ANY(t.label_ids) THEN 2 "
+        f"WHEN t.from_address ~* {_GMAIL_BULK_SENDER_PATTERN} THEN 4 "
+        f"WHEN t.from_address ~* {_GMAIL_AUTOMATED_SENDER_PATTERN} THEN 3 "
+        "WHEN EXISTS (SELECT 1 FROM unnest(t.to_addresses) rcpt WHERE rcpt ILIKE '%%' || t.account || '%%') THEN 2 "
+        "ELSE 3 END"
+    ),
 )
 
 _SLACK_JOINS = """
@@ -220,11 +268,52 @@ _SLACK_JOINS = """
         ON u.account = t.account AND u.team_id = t.team_id AND u.user_id = t.user_id
     LEFT JOIN slack_conversations c
         ON c.account = t.account AND c.team_id = t.team_id AND c.conversation_id = t.conversation_id
+    LEFT JOIN slack_account_identities ident
+        ON ident.account = t.account AND ident.team_id = t.team_id
 """
+
+# A reply in a thread Zach has posted in is directed at him even without a
+# mention; probes slack_messages_thread_idx once per threaded row.
+_SLACK_MY_THREAD = (
+    "(t.thread_ts <> '' AND EXISTS ("
+    "SELECT 1 FROM slack_messages z "
+    "WHERE z.account = t.account AND z.team_id = t.team_id "
+    "  AND z.conversation_id = t.conversation_id AND z.thread_ts = t.thread_ts "
+    "  AND z.user_id = ident.user_id AND z.is_deleted = 0))"
+)
+
+# Mine > bots > DM / mention / my thread / small-group DM > member channels
+# (ambient activity in Zach's spaces) > the rest of the workspace firehose.
+# Sampling note: an earlier draft promoted "channels I post in a lot" to the
+# direct tier, which flooded it with #lounge-style community chatter; channel
+# talk is never direct unless it names Zach or joins one of his threads.
+_SLACK_MESSAGE_PRIORITY = (
+    "CASE "
+    "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 1 "
+    # USLACK% covers Slack's own system accounts (USLACKBOT, USLACKSECURITY).
+    "WHEN t.bot_id <> '' OR t.user_id LIKE 'USLACK%%' OR u.is_bot = 1 THEN 4 "
+    "WHEN c.is_im = 1 THEN 2 "
+    "WHEN ident.user_id <> '' AND t.text LIKE '%%<@' || ident.user_id || '>%%' THEN 2 "
+    "WHEN c.is_mpim = 1 THEN 2 "
+    f"WHEN {_SLACK_MY_THREAD} THEN 2 "
+    "WHEN c.is_member = 1 THEN 3 "
+    "ELSE 4 END"
+)
+
+_SLACK_FILE_PRIORITY = (
+    "CASE "
+    "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 1 "
+    "WHEN u.is_bot = 1 THEN 4 "
+    "WHEN c.is_im = 1 OR c.is_mpim = 1 THEN 2 "
+    "WHEN c.is_member = 1 THEN 3 "
+    "ELSE 4 END"
+)
+# IM/MPIM checks come first: slack stores a user-id-ish "name" on DM
+# conversations, which otherwise renders as a channel called #U0xxxx.
 _SLACK_CONTEXT = (
-    "CASE WHEN NULLIF(c.name, '') IS NOT NULL THEN '#' || c.name "
-    "WHEN c.is_im = 1 THEN 'DM' "
+    "CASE WHEN c.is_im = 1 THEN 'DM' "
     "WHEN c.is_mpim = 1 THEN 'group DM' "
+    "WHEN NULLIF(c.name, '') IS NOT NULL THEN '#' || c.name "
     "ELSE t.conversation_id END"
 )
 
@@ -258,6 +347,7 @@ _SLACK_MESSAGE = _simple_adapter(
         "'edited', t.edited_ts <> '', "
         "'deleted', t.is_deleted <> 0)"
     ),
+    priority=_SLACK_MESSAGE_PRIORITY,
     batch_size=5000,
 )
 
@@ -287,6 +377,7 @@ _SLACK_FILE = _simple_adapter(
         "'size', t.size, "
         "'deleted', t.is_deleted <> 0)"
     ),
+    priority=_SLACK_FILE_PRIORITY,
 )
 
 _APPLE_MESSAGE = _simple_adapter(
@@ -304,7 +395,12 @@ _APPLE_MESSAGE = _simple_adapter(
         FROM apple_message_chat_messages
         GROUP BY account, message_id
     ) cm ON cm.account = t.account AND cm.message_id = t.message_id
-    LEFT JOIN apple_message_chats c ON c.account = t.account AND c.chat_id = cm.chat_id""",
+    LEFT JOIN apple_message_chats c ON c.account = t.account AND c.chat_id = cm.chat_id
+    LEFT JOIN (
+        SELECT account, chat_id, count(*) AS n
+        FROM apple_message_chat_handles
+        GROUP BY account, chat_id
+    ) roster ON roster.account = t.account AND roster.chat_id = cm.chat_id""",
     event_id="concat_ws('|', t.account, t.message_id)",
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
     ingest_ts="t.ingested_at",
@@ -329,6 +425,22 @@ _APPLE_MESSAGE = _simple_adapter(
         "'audio', t.is_audio_message <> 0, "
         "'deleted', t.is_deleted <> 0)"
     ),
+    # chat.db style: 45 = 1:1 conversation, 43 = group. The roster count is
+    # other participants (my own handle is not in it), so <= 3 means a group
+    # of at most four people. A sender that is neither a phone number nor an
+    # email address is a business/RCS token (airlines, delivery bots), and
+    # 3-6 digit senders are SMS shortcodes — automated, not a person.
+    priority=(
+        "CASE "
+        "WHEN t.is_from_me = 1 THEN 1 "
+        "WHEN t.is_system_message = 1 OR t.is_service_message = 1 OR t.is_spam = 1 THEN 4 "
+        "WHEN h.address ~ '^[0-9]{3,6}$' "
+        "  OR (h.address <> '' AND h.address NOT LIKE '+%%' AND h.address NOT LIKE '%%@%%') THEN 4 "
+        "WHEN c.style = 45 THEN 2 "
+        "WHEN c.style = 43 AND COALESCE(roster.n, 0) <= 3 THEN 2 "
+        "WHEN c.style = 43 THEN 3 "
+        "ELSE 2 END"
+    ),
 )
 
 _WHATSAPP_MESSAGE = _simple_adapter(
@@ -338,7 +450,12 @@ _WHATSAPP_MESSAGE = _simple_adapter(
     kind="message",
     from_sql="""whatsapp_messages t
     LEFT JOIN whatsapp_chats c ON c.account = t.account AND c.chat_id = t.chat_id
-    LEFT JOIN whatsapp_contacts ct ON ct.account = t.account AND ct.jid = t.sender_jid""",
+    LEFT JOIN whatsapp_contacts ct ON ct.account = t.account AND ct.jid = t.sender_jid
+    LEFT JOIN (
+        SELECT account, chat_id, count(*) AS n
+        FROM whatsapp_chat_participants
+        GROUP BY account, chat_id
+    ) roster ON roster.account = t.account AND roster.chat_id = t.chat_id""",
     event_id="concat_ws('|', t.account, t.chat_id, t.message_id)",
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
     ingest_ts="t.ingested_at",
@@ -360,6 +477,15 @@ _WHATSAPP_MESSAGE = _simple_adapter(
         f"'edited', t.edited_at > {_EPOCH_GUARD}, "
         "'deleted', t.is_deleted <> 0)"
     ),
+    # Group roster counts include me, so <= 4 is a group of at most four.
+    priority=(
+        "CASE "
+        "WHEN t.is_from_me = 1 THEN 1 "
+        "WHEN c.chat_type = 'status' THEN 4 "
+        "WHEN c.chat_type = 'group' OR t.chat_id LIKE '%%@g.us' THEN "
+        "  CASE WHEN COALESCE(roster.n, 99) <= 4 THEN 2 ELSE 3 END "
+        "ELSE 2 END"
+    ),
 )
 
 _APPLE_NOTE_REVISION = _simple_adapter(
@@ -379,6 +505,7 @@ _APPLE_NOTE_REVISION = _simple_adapter(
         "jsonb_build_object('account', t.account, 'note_id', t.note_id, 'revision_id', t.revision_id)"
     ),
     metadata="jsonb_build_object('note_id', t.note_id, 'deleted', t.is_deleted <> 0)",
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _VOICE_MEMO = _simple_adapter(
@@ -409,6 +536,7 @@ _VOICE_MEMO = _simple_adapter(
         "'size_bytes', t.size_bytes, "
         "'deleted', t.is_deleted <> 0)"
     ),
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _DATE_ONLY = r"'^\d{4}-\d{2}-\d{2}$'"
@@ -446,6 +574,9 @@ _CALENDAR_EVENT = _simple_adapter(
         "'all_day', t.is_all_day <> 0, "
         "'deleted', t.is_deleted <> 0)"
     ),
+    priority=(
+        "CASE WHEN t.organizer_email ILIKE '%%' || t.account || '%%' THEN 1 ELSE 2 END"
+    ),
 )
 
 _DRIVE_FILE = _simple_adapter(
@@ -470,6 +601,27 @@ _DRIVE_FILE = _simple_adapter(
         "'starred', t.starred <> 0, "
         "'trashed', t.trashed <> 0, "
         "'excluded', t.is_excluded <> 0)"
+    ),
+    # My own files edited by me are my actions; my files edited by someone
+    # else are directed at me; the rest of the corpus is ambient. Ownership
+    # matches the account email inside owners_json (the raw metadata's
+    # lastModifyingUser.me flag is not stored), and "edited by me" means the
+    # last modifier is the owning identity's display name.
+    priority=(
+        "CASE "
+        # Excluded files are the warehouse's own storage folders (attachment
+        # blobs and export shards it writes to Drive) — machinery, not
+        # activity. Sampling showed thousands of them per window at the noise
+        # tier drowning real events.
+        "WHEN t.is_excluded <> 0 THEN 5 "
+        "WHEN t.trashed <> 0 THEN 4 "
+        "WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(t.owners_json) o "
+        "             WHERE o->>'emailAddress' ILIKE t.account "
+        "               AND (t.last_modifying_user = '' OR t.last_modifying_user = o->>'displayName')) THEN 1 "
+        "WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(t.owners_json) o "
+        "             WHERE o->>'emailAddress' ILIKE t.account) THEN 2 "
+        "WHEN t.starred <> 0 THEN 2 "
+        "ELSE 3 END"
     ),
 )
 
@@ -499,6 +651,7 @@ _CONTACT_UPDATE = _simple_adapter(
         "'primary_phone', t.primary_phone, "
         "'deleted', t.is_deleted <> 0)"
     ),
+    priority=str(TIMELINE_PRIORITY_NOISE),
 )
 
 _MUTATION = _simple_adapter(
@@ -524,6 +677,7 @@ _MUTATION = _simple_adapter(
         "'request_id', t.request_id, "
         "'has_error', t.error <> '')"
     ),
+    priority=str(TIMELINE_PRIORITY_BACKGROUND),
 )
 
 _MUTATION_REQUEST = _simple_adapter(
@@ -540,6 +694,7 @@ _MUTATION_REQUEST = _simple_adapter(
     snippet=_snippet("t.reason"),
     source_pk="jsonb_build_object('id', t.id)",
     metadata=("jsonb_build_object('status', t.status, 'has_error', t.error <> '')"),
+    priority=str(TIMELINE_PRIORITY_BACKGROUND),
 )
 
 _ENRICHMENT_RUN = _simple_adapter(
@@ -564,6 +719,7 @@ _ENRICHMENT_RUN = _simple_adapter(
         "'prompt_version', t.prompt_version, "
         "'exit_code', t.exit_code)"
     ),
+    priority=str(TIMELINE_PRIORITY_BACKGROUND),
 )
 
 
@@ -606,7 +762,9 @@ def _agent_session_adapter() -> TimelineAdapter:
                 'repo_url', ru.repo_url,
                 'output_tokens', s.output_tokens
             ))::text AS metadata,
-            s.ingest_ts AS ingest_ts
+            s.ingest_ts AS ingest_ts,
+            CASE WHEN COALESCE(NULLIF(st.session_title, ''), fp.text, '') LIKE '[cron:%%'
+                 THEN {TIMELINE_PRIORITY_BACKGROUND} ELSE {TIMELINE_PRIORITY_SELF} END AS priority
         FROM (
             SELECT
                 e.source,
@@ -850,6 +1008,7 @@ _TIMELINE_UPSERT_COLUMNS = (
     "event_id",
     "source",
     "kind",
+    "priority",
     "event_ts",
     "end_ts",
     "actor",
@@ -864,10 +1023,12 @@ _TIMELINE_UPSERT_COLUMNS = (
 
 # Content columns participating in the change guard: a re-sync that only
 # bumps the source's ingestion timestamp must NOT bump seq, or arrival-order
-# consumers would see every re-synced row as new.
+# consumers would see every re-synced row as new. priority IS content: a
+# reclassification should surface to arrival-order consumers.
 _TIMELINE_CONTENT_COLUMNS = (
     "source",
     "kind",
+    "priority",
     "event_ts",
     "end_ts",
     "actor",
@@ -896,7 +1057,7 @@ def timeline_upsert_sql() -> str:
 
 
 _TIMELINE_INSERT_TEMPLATE = (
-    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)"
+    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)"
 )
 
 
@@ -1073,8 +1234,8 @@ class TimelineSyncEngine:
         for row in rows:
             deduped[row[0]] = row
         values = [
-            (adapter.name, row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7],
-             row[8], adapter.source_table, row[9], row[10], row[11])
+            (adapter.name, row[0], row[1], row[2], row[12], row[3], row[4], row[5], row[6],
+             row[7], row[8], adapter.source_table, row[9], row[10], row[11])
             for row in deduped.values()
         ]
         with self._dest_conn.cursor() as cursor:

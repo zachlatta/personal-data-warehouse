@@ -234,10 +234,11 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     wh._command(
         """
         INSERT INTO gmail_messages (account, message_id, thread_id, internal_date, subject,
-                                    from_address, snippet, synced_at)
-        VALUES ('z@x.test', 'm1', 'th1', %s, 'Hello world', 'alice@example.test', 'hi there', %s)
+                                    from_address, to_addresses, snippet, synced_at)
+        VALUES ('z@x.test', 'm1', 'th1', %s, 'Hello world', 'alice@example.test',
+                %s, 'hi there', %s)
         """,
-        (_NOW - timedelta(hours=1), _NOW),
+        (_NOW - timedelta(hours=1), ["Zach <z@x.test>"], _NOW),
     )
     wh._command(
         """
@@ -247,8 +248,14 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO slack_conversations (account, team_id, conversation_id, name)
-        VALUES ('z', 'T1', 'C1', 'general')
+        INSERT INTO slack_account_identities (account, team_id, user_id)
+        VALUES ('z', 'T1', 'UME')
+        """
+    )
+    wh._command(
+        """
+        INSERT INTO slack_conversations (account, team_id, conversation_id, name, is_member)
+        VALUES ('z', 'T1', 'C1', 'general', 1)
         """
     )
     wh._command(
@@ -394,6 +401,29 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
 
 
+# The seeded fixture rows exercise one classification branch per adapter:
+# gmail addressed directly to the account (2), a member-channel slack message
+# from someone else (3), a 1:1-ish iMessage (2), a big whatsapp group (3),
+# a session Zach prompted (1), his own notes/memos (1), a calendar event he
+# organizes (1), an unstarred drive file (3), contact churn (4), and the
+# warehouse's own machinery (5).
+EXPECTED_SEEDED_PRIORITIES = {
+    "gmail_email": 2,
+    "slack_message": 3,
+    "slack_file": 3,
+    "apple_message": 2,
+    "whatsapp_message": 3,
+    "agent_session": 1,
+    "apple_note_revision": 1,
+    "voice_memo": 1,
+    "calendar_event": 1,
+    "drive_file": 3,
+    "contact_update": 4,
+    "mutation": 5,
+    "mutation_request": 5,
+    "enrichment_run": 5,
+}
+
 EXPECTED_SEEDED_EVENTS = {
     "gmail_email": 1,
     "slack_message": 1,
@@ -465,6 +495,9 @@ def test_backfill_normalizes_every_source(warehouse):
     cal = next(r for r in rows if r["adapter"] == "calendar_event")
     assert cal["end_ts"] > cal["event_ts"]
 
+    priorities = {row["adapter"]: row["priority"] for row in rows}
+    assert priorities == EXPECTED_SEEDED_PRIORITIES
+
     # Second run is a no-op: nothing new, no seq churn.
     seqs_before = {row["event_id"]: row["seq"] for row in rows}
     engine2 = _engine(warehouse)
@@ -475,6 +508,166 @@ def test_backfill_normalizes_every_source(warehouse):
     assert all(s.backfill_rows == 0 and s.incremental_rows == 0 for s in stats2)
     rows_after = warehouse._query_dicts("SELECT event_id, seq FROM timeline_events")
     assert {r["event_id"]: r["seq"] for r in rows_after} == seqs_before
+
+
+def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    # My own slack message -> self.
+    warehouse._command(
+        """
+        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+                                    message_datetime, user_id, text, synced_at)
+        VALUES ('z', 'T1', 'C1', '3000.1', %s, 'UME', 'shipping it', %s)
+        """,
+        (_NOW, _NOW),
+    )
+    # A mention of me in a member channel -> direct.
+    warehouse._command(
+        """
+        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+                                    message_datetime, user_id, text, synced_at)
+        VALUES ('z', 'T1', 'C1', '3000.2', %s, 'U1', 'hey <@UME> take a look', %s)
+        """,
+        (_NOW, _NOW),
+    )
+    # A DM from a real person -> direct.
+    warehouse._command(
+        """
+        INSERT INTO slack_conversations (account, team_id, conversation_id, is_im)
+        VALUES ('z', 'T1', 'D1', 1)
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+                                    message_datetime, user_id, text, synced_at)
+        VALUES ('z', 'T1', 'D1', '3000.3', %s, 'U1', 'lunch?', %s)
+        """,
+        (_NOW, _NOW),
+    )
+    # A bot post in the member channel -> noise.
+    warehouse._command(
+        """
+        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+                                    message_datetime, user_id, bot_id, text, synced_at)
+        VALUES ('z', 'T1', 'C1', '3000.4', %s, '', 'B1', 'deploy finished', %s)
+        """,
+        (_NOW, _NOW),
+    )
+    # A promo email addressed directly to me is still bulk -> noise.
+    warehouse._command(
+        """
+        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+                                    to_addresses, label_ids, synced_at)
+        VALUES ('z@x.test', 'm-promo', %s, 'SALE', 'deals@shop.example',
+                %s, %s, %s)
+        """,
+        (_NOW, ["z@x.test"], ["CATEGORY_PROMOTIONS", "INBOX"], _NOW),
+    )
+    # A reply by someone else in a thread I participated in -> direct.
+    warehouse._command(
+        """
+        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts, thread_ts,
+                                    message_datetime, user_id, text, synced_at)
+        VALUES ('z', 'T1', 'C1', '4000.1', '4000.1', %s, 'UME', 'starting a thread', %s),
+               ('z', 'T1', 'C1', '4000.2', '4000.1', %s, 'U1', 'replying to zach', %s)
+        """,
+        (_NOW, _NOW, _NOW, _NOW),
+    )
+    # A drive file I own and last modified myself -> self; my file edited by
+    # someone else -> direct.
+    warehouse._command(
+        """
+        INSERT INTO google_drive_files (account, file_id, name, owners_json,
+                                        last_modifying_user, modified_time, ingested_at)
+        VALUES ('z@x.test', 'f-mine', 'journal.txt',
+                '[{"displayName": "Zach Latta", "emailAddress": "z@x.test"}]'::jsonb,
+                'Zach Latta', %s, %s),
+               ('z@x.test', 'f-shared', 'proposal.doc',
+                '[{"displayName": "Zach Latta", "emailAddress": "z@x.test"}]'::jsonb,
+                'Someone Else', %s, %s)
+        """,
+        (_NOW, _NOW, _NOW, _NOW),
+    )
+    # Uncategorized automation: broadcast senders -> noise; transactional
+    # senders -> cc tier; both even when addressed straight to me.
+    warehouse._command(
+        """
+        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+                                    to_addresses, synced_at)
+        VALUES ('z@x.test', 'm-noreply', %s, 'Weekly digest', 'noreply@service.example', %s, %s),
+               ('z@x.test', 'm-notify', %s, 'Receipt attached', 'receipts@service.example', %s, %s)
+        """,
+        (_NOW, ["z@x.test"], _NOW, _NOW, ["z@x.test"], _NOW),
+    )
+    warehouse._command(
+        """
+        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+                                    to_addresses, label_ids, synced_at)
+        VALUES ('z@x.test', 'm-starred', %s, 'Contract', 'lawyer@firm.example', %s, %s, %s)
+        """,
+        (_NOW, ["z@x.test"], ["STARRED", "INBOX"], _NOW),
+    )
+    # A business/RCS sender (not a phone number, not an email) -> noise.
+    warehouse._command(
+        """
+        INSERT INTO apple_message_handles (account, handle_id, address)
+        VALUES ('z@x.test', 'h-biz', 'some_airline_dsqx1')
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO apple_messages (account, message_id, handle_id, body_text, message_at,
+                                    is_from_me, ingested_at)
+        VALUES ('z@x.test', 'am-biz', 'h-biz', 'Your flight changed', %s, 0, %s)
+        """,
+        (_NOW, _NOW),
+    )
+    # The warehouse's own excluded Drive storage blobs -> background.
+    warehouse._command(
+        """
+        INSERT INTO google_drive_files (account, file_id, name, is_excluded, modified_time, ingested_at)
+        VALUES ('z@x.test', 'f-excluded', 'blob-shard.bin', 1, %s, %s)
+        """,
+        (_NOW, _NOW),
+    )
+    # An openclaw cron heartbeat session -> background.
+    for seq, (role, text) in enumerate([("user", "[cron:abc123 Monitor things] Run checks"), ("assistant", "ok")]):
+        warehouse._command(
+            """
+            INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+                                              role, text, ingested_at)
+            VALUES ('openclaw', 'cron-sess', %s, %s, %s, %s, %s, %s)
+            """,
+            (f"c{seq}", seq, _NOW, role, text, _NOW),
+        )
+
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+
+    def priority_of(event_id: str) -> int:
+        return warehouse._query(
+            "SELECT priority FROM timeline_events WHERE event_id = %s", (event_id,)
+        )[0][0]
+
+    assert priority_of("z|T1|C1|3000.1") == 1, "my own message is self-priority"
+    assert priority_of("z|T1|C1|3000.2") == 2, "a mention of me is direct"
+    assert priority_of("z|T1|D1|3000.3") == 2, "a DM is direct"
+    assert priority_of("z|T1|C1|3000.4") == 4, "bot posts are noise"
+    assert priority_of("z|T1|C1|4000.2") == 2, "a reply in my thread is direct"
+    assert priority_of("z@x.test|f-mine") == 1, "my own drive edits are self"
+    assert priority_of("z@x.test|f-shared") == 2, "someone editing my file is direct"
+    assert priority_of("z@x.test|am-biz") == 4, "business/RCS senders are noise"
+    assert priority_of("z@x.test|f-excluded") == 5, "warehouse-excluded drive blobs are background"
+    assert priority_of("z@x.test|m-promo") == 4, "promos are noise even when addressed to me"
+    assert priority_of("z@x.test|m-noreply") == 4, "broadcast senders are noise"
+    assert priority_of("z@x.test|m-notify") == 3, "transactional senders cap at the cc tier"
+    assert priority_of("z@x.test|m-starred") == 2, "starred email is direct"
+    assert priority_of("openclaw|cron-sess") == 5, "cron heartbeat sessions are background"
 
 
 def test_incremental_picks_up_new_and_changed_rows(warehouse):

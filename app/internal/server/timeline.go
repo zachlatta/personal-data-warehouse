@@ -75,14 +75,15 @@ func newTimelineService(timeline, source timelineQuerier, media *timelineMediaSi
 // --- list -------------------------------------------------------------------
 
 const timelineListSQL = `
-SELECT adapter, event_id, source, kind, event_ts, end_ts, actor, title, snippet, context,
+SELECT adapter, event_id, source, kind, priority, event_ts, end_ts, actor, title, snippet, context,
        source_table, source_pk::text AS source_pk, metadata::text AS metadata, seq
 FROM timeline_events
 WHERE ($1 = '' OR source = ANY(string_to_array($1, ',')))
   AND ($2 = '' OR kind = ANY(string_to_array($2, ',')))
-  AND (event_ts, seq) < ($3::timestamptz, $4::bigint)
+  AND ($3 = '' OR priority = ANY(string_to_array($3, ',')::bigint[]))
+  AND (event_ts, seq) < ($4::timestamptz, $5::bigint)
 ORDER BY event_ts DESC, seq DESC
-LIMIT $5`
+LIMIT $6`
 
 func parseTimelineCursor(raw string) (string, int64, error) {
 	if raw == "" {
@@ -103,7 +104,10 @@ func parseTimelineCursor(raw string) (string, int64, error) {
 	return ts, seq, nil
 }
 
-var timelineTokenListPattern = regexp.MustCompile(`^[a-z0-9_,-]*$`)
+var (
+	timelineTokenListPattern    = regexp.MustCompile(`^[a-z0-9_,-]*$`)
+	timelinePriorityListPattern = regexp.MustCompile(`^[0-9,]*$`)
+)
 
 func (s *timelineService) handleList(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -122,6 +126,11 @@ func (s *timelineService) handleList(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid sources/kinds filter")
 		return
 	}
+	priorities := strings.TrimSpace(q.Get("priorities"))
+	if !timelinePriorityListPattern.MatchString(priorities) {
+		httpError(w, http.StatusBadRequest, "invalid priorities filter")
+		return
+	}
 	cursorTS, cursorSeq, err := parseTimelineCursor(q.Get("before"))
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
@@ -138,7 +147,7 @@ func (s *timelineService) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := s.timeline.QueryArgs(r.Context(), timelineListSQL,
-		[]any{sources, kinds, cursorTS, cursorSeq, limit}, limit)
+		[]any{sources, kinds, priorities, cursorTS, cursorSeq, limit}, limit)
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "timeline list query failed", "error", err)
 		httpError(w, http.StatusInternalServerError, "timeline query failed")
@@ -195,6 +204,12 @@ FROM timeline_events
 GROUP BY source, kind
 ORDER BY source, kind`
 
+const timelinePrioritiesSQL = `
+SELECT priority, count(*)::bigint AS count
+FROM timeline_events
+GROUP BY priority
+ORDER BY priority`
+
 const timelineSyncStateSQL = `
 SELECT adapter, backfill_done, backfill_cursor_event_ts, backfill_rows, incremental_rows,
        watermark_ingest_ts, last_run_at, last_error
@@ -224,9 +239,16 @@ func (s *timelineService) handleSources(w http.ResponseWriter, r *http.Request) 
 		httpError(w, http.StatusInternalServerError, "timeline sync state query failed")
 		return
 	}
+	priorities, err := s.timeline.QueryArgs(r.Context(), timelinePrioritiesSQL, nil, 100)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "timeline priorities query failed", "error", err)
+		httpError(w, http.StatusInternalServerError, "timeline priorities query failed")
+		return
+	}
 	payload, err := json.Marshal(map[string]any{
-		"sources": nonNilRows(sources.Rows),
-		"sync":    nonNilRows(sync.Rows),
+		"sources":    nonNilRows(sources.Rows),
+		"sync":       nonNilRows(sync.Rows),
+		"priorities": nonNilRows(priorities.Rows),
 	})
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "encode failed")
@@ -430,7 +452,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 }
 
 const timelineItemSQL = `
-SELECT adapter, event_id, source, kind, event_ts, end_ts, actor, title, snippet, context,
+SELECT adapter, event_id, source, kind, priority, event_ts, end_ts, actor, title, snippet, context,
        source_table, source_pk::text AS source_pk, metadata::text AS metadata, seq,
        ingest_ts, first_seen_at, updated_at
 FROM timeline_events
