@@ -354,6 +354,16 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_body_html_trgm_idx ON gmail_messages USING gin (body_html public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
+    IndexSpec(
+        "gmail_messages_recipients_array_idx",
+        "gmail_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_recipients_array_idx ON gmail_messages USING gin ((to_addresses || cc_addresses || bcc_addresses)) WHERE is_deleted = 0",
+    ),
+    IndexSpec(
+        "gmail_messages_attachment_candidates_idx",
+        "gmail_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_attachment_candidates_idx ON gmail_messages (account, internal_date DESC) WHERE is_deleted = 0 AND (position('\"attachmentId\"' in payload_json) > 0 OR payload_json ~ '\"filename\":\"[^\"]+\"' OR position(lower('Content-Disposition') in lower(payload_json)) > 0)",
+    ),
     # BM25 relevance-ranked word search (pg_textsearch). Full-coverage,
     # single-column indexes so callers can use the implicit
     # ORDER BY col <@> 'query' LIMIT n syntax; partial bm25 indexes would
@@ -555,6 +565,17 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS agent_session_events_time_idx ON agent_session_events (occurred_at DESC)",
     ),
     IndexSpec(
+        "agent_session_events_cwd_session_time_idx",
+        "agent_session_events",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_session_events_cwd_session_time_idx ON agent_session_events (cwd, source, session_id, occurred_at DESC) WHERE cwd <> ''",
+    ),
+    IndexSpec(
+        "agent_session_events_cwd_trgm_idx",
+        "agent_session_events",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_session_events_cwd_trgm_idx ON agent_session_events USING gin (cwd public.gin_trgm_ops) WHERE cwd <> ''",
+        requires_pg_trgm=True,
+    ),
+    IndexSpec(
         "agent_session_events_text_trgm_idx",
         "agent_session_events",
         "CREATE INDEX IF NOT EXISTS agent_session_events_text_trgm_idx ON agent_session_events USING gin (text public.gin_trgm_ops) WHERE text != ''",
@@ -608,6 +629,11 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "slack_messages_thread_idx",
         "slack_messages",
         "CREATE INDEX IF NOT EXISTS slack_messages_thread_idx ON slack_messages (account, team_id, conversation_id, thread_ts)",
+    ),
+    IndexSpec(
+        "slack_messages_live_human_thread_scan_idx",
+        "slack_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_live_human_thread_scan_idx ON slack_messages (account, team_id, conversation_id, message_datetime DESC, thread_ts, user_id) WHERE is_deleted = 0 AND thread_ts <> '' AND user_id <> '' AND user_id <> 'USLACKBOT' AND bot_id = ''",
     ),
     IndexSpec(
         # Full-coverage trgm index on slack_messages.text. Replaces the
@@ -3587,8 +3613,30 @@ class PostgresWarehouse:
             """
         )
         if spec.storage_parameters:
-            settings = ", ".join(f"{key} = {value}" for key, value in spec.storage_parameters)
-            self._command(f"ALTER TABLE {_identifier(table)} SET ({settings})")
+            self._ensure_storage_parameters(table, spec.storage_parameters)
+
+    def _ensure_storage_parameters(self, table: str, storage_parameters: Sequence[tuple[str, str]]) -> None:
+        if self._storage_parameters_match(table, storage_parameters):
+            return
+        settings = ", ".join(f"{key} = {value}" for key, value in storage_parameters)
+        self._command(f"ALTER TABLE {_identifier(table)} SET ({settings})")
+
+    def _storage_parameters_match(self, table: str, storage_parameters: Sequence[tuple[str, str]]) -> bool:
+        rows = self._query(
+            """
+            SELECT COALESCE(c.reloptions, ARRAY[]::text[])
+            FROM pg_class AS c
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = current_schema()
+              AND c.relname = %s
+            """,
+            (table,),
+        )
+        if not rows:
+            return False
+        current_options = set(rows[0][0] or [])
+        expected_options = {f"{key}={value}" for key, value in storage_parameters}
+        return expected_options.issubset(current_options)
 
     def _ensure_indexes(self, tables: Sequence[str]) -> None:
         table_names = set(tables)

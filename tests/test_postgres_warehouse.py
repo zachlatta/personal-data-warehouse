@@ -34,6 +34,7 @@ from personal_data_warehouse.postgres import (
     ATTACHMENT_COLUMNS,
     FLOAT_COLUMNS,
     INTEGER_COLUMNS,
+    POSTGRES_INDEXES,
     POSTGRES_TABLES,
     SEARCH_TEXT_PREVIEW_CHARS,
     TIMESTAMP_COLUMNS,
@@ -1137,6 +1138,7 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     assert "slack_messages_recent_thread_time_idx" in index_names
     assert "slack_messages_user_time_idx" in index_names
     assert "slack_messages_time_idx" in index_names
+    assert "slack_messages_live_human_thread_scan_idx" in index_names
     assert "slack_messages_text_trgm_idx" in index_names
     # The earlier partial trgm index has been superseded by the full-coverage one.
     assert "slack_messages_text_trgm_live_idx" not in index_names
@@ -1218,6 +1220,52 @@ def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehous
     assert "gmail_messages_body_text_trgm_idx" in index_names
     assert "gmail_messages_body_markdown_trgm_idx" in index_names
     assert "gmail_messages_body_html_trgm_idx" in index_names
+    assert "gmail_messages_recipients_array_idx" in index_names
+    assert "gmail_messages_attachment_candidates_idx" in index_names
+
+
+def test_postgres_latest_timestamp_index_specs_cover_query_sources() -> None:
+    index_names = {index.name for index in POSTGRES_INDEXES}
+
+    assert {
+        "gmail_messages_internal_date_idx",
+        "slack_messages_time_idx",
+        "apple_messages_time_idx",
+        "whatsapp_messages_time_idx",
+        "agent_session_events_time_idx",
+        "agent_session_events_cwd_session_time_idx",
+        "calendar_events_time_idx",
+        "apple_notes_modified_idx",
+        "voice_memo_files_recorded_idx",
+        "contact_cards_source_updated_idx",
+        "google_drive_files_modified_idx",
+    } <= index_names
+
+
+def test_postgres_slow_query_remediation_indexes_are_concurrent() -> None:
+    index_sql = {index.name: index.sql for index in POSTGRES_INDEXES}
+
+    assert "CREATE INDEX CONCURRENTLY" in index_sql["gmail_messages_recipients_array_idx"]
+    assert "CREATE INDEX CONCURRENTLY" in index_sql["gmail_messages_attachment_candidates_idx"]
+    assert "CREATE INDEX CONCURRENTLY" in index_sql["slack_messages_live_human_thread_scan_idx"]
+    assert "CREATE INDEX CONCURRENTLY" in index_sql["agent_session_events_cwd_session_time_idx"]
+    assert "CREATE INDEX CONCURRENTLY" in index_sql["agent_session_events_cwd_trgm_idx"]
+
+
+def test_postgres_storage_parameters_skip_noop_alter(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_slack_tables()
+
+    commands: list[str] = []
+    original_command = warehouse._command
+
+    def recording_command(sql: str, params=None) -> None:
+        commands.append(sql)
+        original_command(sql, params)
+
+    warehouse._command = recording_command
+    warehouse.ensure_slack_tables()
+
+    assert not any('ALTER TABLE "slack_messages" SET' in command for command in commands)
 
 
 def test_postgres_agent_tables_create_run_lookup_index(warehouse: PostgresWarehouse) -> None:
@@ -1234,6 +1282,19 @@ def test_postgres_agent_tables_create_run_lookup_index(warehouse: PostgresWareho
 
     index_names = {row[0] for row in rows}
     assert "agent_runs_task_status_subject_idx" in index_names
+
+    event_rows = warehouse._query(
+        """
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND tablename = 'agent_session_events'
+        """
+    )
+
+    event_index_names = {row[0] for row in event_rows}
+    assert "agent_session_events_cwd_session_time_idx" in event_index_names
+    assert "agent_session_events_cwd_trgm_idx" in event_index_names
 
 
 def _pg_textsearch_usable(warehouse: PostgresWarehouse) -> bool:

@@ -105,11 +105,11 @@ type sqlInput struct {
 // happen: clients searching for "Slack" or "Gmail" hit this paragraph. The
 // per-tool descriptions stay deliberately short; the rich content lives in
 // the schema_overview response.
-const serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Apple Notes, Apple Messages (iMessage/SMS/RCS), and Apple Voice Memo transcripts. Always call schema_overview first to learn the tables and columns; then write read-only Postgres SQL with query."
+const serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Apple Notes, Apple Messages (iMessage/SMS/RCS), and Apple Voice Memo transcripts. Always call schema_overview first to learn the tables, columns, fast paths, and never-do query shapes; then write read-only Postgres SQL with query."
 
 const schemaFirstReminder = "Call schema_overview first."
 
-const queryDescription = "Run read-only Postgres SQL against the personal data warehouse and cache the result under a query_id. " + schemaFirstReminder + " Each SQL statement must be paired with question, a concise plain-English question this SQL statement is trying to answer."
+const queryDescription = "Run read-only Postgres SQL against the personal data warehouse and cache the result under a query_id. " + schemaFirstReminder + " Use indexed/source-scoped fast paths from schema_overview and avoid global scans on large tables. Each SQL statement must be paired with question, a concise plain-English question this SQL statement is trying to answer."
 
 const getRowsDescription = "Return a row slice from a cached query result by query_id. " + schemaFirstReminder
 
@@ -117,9 +117,9 @@ const getFieldDescription = "Return a character chunk from a single cell in a ca
 
 const grepRowsDescription = "Regex-search a cached query result and return match context. " + schemaFirstReminder
 
-const schemaOverviewDescription = "Required first call. Lists the warehouse's tables, views, columns, and compact samples so the caller can pick the right tables before writing SQL. Each base table heading includes an approximate row count from planner statistics, formatted as `(~N rows, estimated)`; use that estimate for sizing decisions instead of running SELECT COUNT(*) over large tables."
+const schemaOverviewDescription = "Required first call. Lists the warehouse's tables, views, columns, indexes, fast path examples, and never-do examples so the caller can pick the right indexed query shape before writing SQL. Each base table heading includes an approximate row count from planner statistics, formatted as `(~N rows, estimated)`; use that estimate for sizing decisions instead of running SELECT COUNT(*) over large tables."
 
-const sqlDescription = "Run a read-only Postgres SQL statement and return its full result, like a psql session. Skips the query cache, pagination, and field truncation that the MCP query tool applies. Refuses write SQL and caps the response at 1,000,000 rows. Each call must include question, a concise plain-English question this SQL statement is trying to answer, so server logs capture the caller's intent."
+const sqlDescription = "Run a read-only Postgres SQL statement and return its full result, like a psql session. Skips the query cache, pagination, and field truncation that the MCP query tool applies. Refuses write SQL and caps the response at 1,000,000 rows. Use indexed/source-scoped fast paths from schema_overview and avoid global scans on large tables. Each call must include question, a concise plain-English question this SQL statement is trying to answer, so server logs capture the caller's intent."
 
 func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	return NewMCPServerWithMutations(runner, opts, nil)
