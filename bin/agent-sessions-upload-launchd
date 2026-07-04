@@ -25,7 +25,7 @@ if ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
-  "$PDW" ingest agent-sessions --mode incremental >> "$LOG_FILE" 2>&1
+  "$PDW" ingest agent-sessions --mode incremental --limit "${AGENT_SESSIONS_UPLOAD_LIMIT:-50}" --batch-size "${AGENT_SESSIONS_UPLOAD_BATCH_SIZE:-50}" >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi
 
