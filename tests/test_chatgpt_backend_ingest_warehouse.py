@@ -12,10 +12,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import hashlib
 import os
-import uuid
 
 import pytest
 from dotenv import load_dotenv
+
+from tests.conftest import make_test_schema
 
 from personal_data_warehouse.chatgpt_backend import ConversationRef
 from personal_data_warehouse.chatgpt_backend_ingest import ChatGPTBackendIngestRunner
@@ -35,7 +36,7 @@ def _postgres_url() -> str:
 
 @pytest.fixture()
 def warehouse():
-    schema = "pdw_test_" + uuid.uuid4().hex
+    schema = make_test_schema()
     wh = PostgresWarehouse(_postgres_url(), schema=schema)
     try:
         yield wh

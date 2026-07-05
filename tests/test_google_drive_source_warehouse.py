@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
-import uuid
 from datetime import UTC, datetime
 
 import pytest
 from dotenv import load_dotenv
+
+from tests.conftest import make_test_schema
 
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.schema import (
@@ -25,7 +26,7 @@ def _postgres_url() -> str:
 
 @pytest.fixture()
 def warehouse():
-    schema = "pdw_test_" + uuid.uuid4().hex
+    schema = make_test_schema()
     wh = PostgresWarehouse(_postgres_url(), schema=schema)
     try:
         yield wh

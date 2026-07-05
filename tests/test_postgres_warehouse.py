@@ -4,12 +4,13 @@ import hashlib
 import json
 import logging
 import os
-import uuid
 from datetime import UTC, datetime, timedelta
 
 import psycopg2
 import pytest
 from dotenv import load_dotenv
+
+from tests.conftest import make_test_schema
 
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.slack_sync import SlackApiCallError, SlackSyncRunner
@@ -55,7 +56,7 @@ def _postgres_url() -> str:
 
 @pytest.fixture()
 def warehouse():
-    schema = "pdw_test_" + uuid.uuid4().hex
+    schema = make_test_schema()
     wh = PostgresWarehouse(_postgres_url(), schema=schema)
     try:
         yield wh
