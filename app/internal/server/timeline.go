@@ -63,9 +63,10 @@ type timelineService struct {
 	media    *timelineMediaSigner
 	logger   *slog.Logger
 
-	mu             sync.Mutex
-	sourcesPayload []byte
-	sourcesFetched time.Time
+	mu                sync.Mutex
+	sourcesPayload    []byte
+	sourcesFetched    time.Time
+	sourcesRefreshing bool
 }
 
 func newTimelineService(timeline, source timelineQuerier, media *timelineMediaSigner, logger *slog.Logger) *timelineService {
@@ -216,50 +217,83 @@ SELECT adapter, backfill_done, backfill_cursor_event_ts, backfill_rows, incremen
 FROM timeline_sync_state
 ORDER BY adapter`
 
+// handleSources serves the sidebar's counts. The aggregates behind them scan
+// the whole timeline (minutes on a cold multi-GB table), so the handler never
+// makes a request wait for them: it serves the cached payload (refreshing in
+// the background once stale), and before the first aggregate completes it
+// serves a "warming" payload carrying just the fast sync-state rows so the
+// page renders immediately and retries for counts.
 func (s *timelineService) handleSources(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	cached := s.sourcesPayload
-	fresh := time.Since(s.sourcesFetched) < timelineSourcesCacheTTL
+	stale := time.Since(s.sourcesFetched) >= timelineSourcesCacheTTL
 	s.mu.Unlock()
-	if cached != nil && fresh && r.URL.Query().Get("refresh") == "" {
+
+	if cached == nil || stale || r.URL.Query().Get("refresh") != "" {
+		s.refreshSourcesAsync()
+	}
+	if cached != nil {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(cached)
 		return
 	}
-
-	sources, err := s.timeline.QueryArgs(r.Context(), timelineSourcesSQL, nil, 10000)
-	if err != nil {
-		s.logger.ErrorContext(r.Context(), "timeline sources query failed", "error", err)
-		httpError(w, http.StatusInternalServerError, "timeline sources query failed")
-		return
-	}
-	sync, err := s.timeline.QueryArgs(r.Context(), timelineSyncStateSQL, nil, 1000)
+	syncRows, err := s.timeline.QueryArgs(r.Context(), timelineSyncStateSQL, nil, 1000)
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "timeline sync state query failed", "error", err)
 		httpError(w, http.StatusInternalServerError, "timeline sync state query failed")
 		return
 	}
-	priorities, err := s.timeline.QueryArgs(r.Context(), timelinePrioritiesSQL, nil, 100)
-	if err != nil {
-		s.logger.ErrorContext(r.Context(), "timeline priorities query failed", "error", err)
-		httpError(w, http.StatusInternalServerError, "timeline priorities query failed")
+	writeJSON(w, map[string]any{
+		"sources":    []any{},
+		"sync":       nonNilRows(syncRows.Rows),
+		"priorities": []any{},
+		"warming":    true,
+	})
+}
+
+func (s *timelineService) refreshSourcesAsync() {
+	s.mu.Lock()
+	if s.sourcesRefreshing {
+		s.mu.Unlock()
 		return
 	}
-	payload, err := json.Marshal(map[string]any{
+	s.sourcesRefreshing = true
+	s.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
+		payload, err := s.buildSourcesPayload(ctx)
+		s.mu.Lock()
+		s.sourcesRefreshing = false
+		if err == nil {
+			s.sourcesPayload = payload
+			s.sourcesFetched = time.Now()
+		}
+		s.mu.Unlock()
+		if err != nil {
+			s.logger.Error("timeline sources refresh failed", "error", err)
+		}
+	}()
+}
+
+func (s *timelineService) buildSourcesPayload(ctx context.Context) ([]byte, error) {
+	sources, err := s.timeline.QueryArgs(ctx, timelineSourcesSQL, nil, 10000)
+	if err != nil {
+		return nil, fmt.Errorf("sources aggregate: %w", err)
+	}
+	syncRows, err := s.timeline.QueryArgs(ctx, timelineSyncStateSQL, nil, 1000)
+	if err != nil {
+		return nil, fmt.Errorf("sync state: %w", err)
+	}
+	priorities, err := s.timeline.QueryArgs(ctx, timelinePrioritiesSQL, nil, 100)
+	if err != nil {
+		return nil, fmt.Errorf("priorities aggregate: %w", err)
+	}
+	return json.Marshal(map[string]any{
 		"sources":    nonNilRows(sources.Rows),
-		"sync":       nonNilRows(sync.Rows),
+		"sync":       nonNilRows(syncRows.Rows),
 		"priorities": nonNilRows(priorities.Rows),
 	})
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "encode failed")
-		return
-	}
-	s.mu.Lock()
-	s.sourcesPayload = payload
-	s.sourcesFetched = time.Now()
-	s.mu.Unlock()
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(payload)
 }
 
 func nonNilRows(rows []map[string]any) []map[string]any {

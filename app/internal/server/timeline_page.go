@@ -359,6 +359,20 @@ a.filelink:hover { text-decoration: underline; }
 
   function loadSources() {
     return api("/api/timeline/sources", {}).then(function (body) {
+      // Counts are aggregated in the background server-side; retry until the
+      // first aggregate lands, rendering the sync panel in the meantime.
+      if (body.warming && !loadSources.retry) {
+        loadSources.retry = setTimeout(function () {
+          loadSources.retry = null;
+          loadSources().catch(function () {});
+        }, 8000);
+      }
+      if (!body.warming) renderCounts(body);
+      renderSync(body);
+    });
+  }
+
+  function renderCounts(body) {
       var bySource = {}, byKind = {}, total = 0, oldest = "", newest = "";
       (body.sources || []).forEach(function (row) {
         total += row.count;
@@ -385,7 +399,9 @@ a.filelink:hover { text-decoration: underline; }
       renderChips(el("prioritylist"), priorityCatalog, state.priorities, false);
       el("stats").innerHTML = "<b>" + total.toLocaleString() + "</b> events · " +
         (oldest ? oldest.slice(0, 10) : "—") + " → " + (newest ? newest.slice(0, 10) : "—");
+  }
 
+  function renderSync(body) {
       var syncNode = el("synclist");
       syncNode.textContent = "";
       (body.sync || []).forEach(function (row) {
@@ -404,7 +420,6 @@ a.filelink:hover { text-decoration: underline; }
         item.appendChild(bar);
         syncNode.appendChild(item);
       });
-    });
   }
 
   el("clearsrc").addEventListener("click", function () {
@@ -707,8 +722,10 @@ a.filelink:hover { text-decoration: underline; }
   /* ---- boot ---- */
   function boot() {
     if (!state.token) { openGate(false); return; }
-    loadSources().then(resetAndLoad).catch(function () {});
-    if (!boot.timer) boot.timer = setInterval(function () { loadSources().catch(function () {}); }, 60000);
+    // The ledger must never wait on the sidebar's aggregates.
+    resetAndLoad();
+    loadSources().catch(function () {});
+    if (!boot.timer) boot.timer = setInterval(function () { loadSources().catch(function () {}); }, 120000);
   }
   boot();
 })();

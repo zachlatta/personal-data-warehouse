@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 // endpoint without depending on exact whitespace.
 type fakeTimelineRunner struct {
 	fakeRunner
+	mu         sync.Mutex
 	argResults map[string]query.RawResult
 	argErrs    map[string]error
 	calls      []fakeArgsCall
@@ -31,8 +33,22 @@ type fakeArgsCall struct {
 	Args []any
 }
 
+func (f *fakeTimelineRunner) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+func (f *fakeTimelineRunner) call(i int) fakeArgsCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls[i]
+}
+
 func (f *fakeTimelineRunner) QueryArgs(_ context.Context, sql string, args []any, maxRows int) (query.RawResult, error) {
+	f.mu.Lock()
 	f.calls = append(f.calls, fakeArgsCall{SQL: sql, Args: args})
+	f.mu.Unlock()
 	for fragment, err := range f.argErrs {
 		if strings.Contains(sql, fragment) {
 			return query.RawResult{}, err
@@ -167,7 +183,7 @@ func TestTimelineListReturnsItemsAndCursor(t *testing.T) {
 		t.Fatalf("source_pk not decoded as JSON: %#v", payload.Items[0]["source_pk"])
 	}
 	// The filters must ride as bind args, not spliced SQL.
-	call := runner.calls[0]
+	call := runner.call(0)
 	if call.Args[0] != "gmail,slack" {
 		t.Fatalf("sources arg = %#v", call.Args[0])
 	}
@@ -183,8 +199,8 @@ func TestTimelineListPassesPriorityFilter(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("got %d", resp.StatusCode)
 	}
-	if runner.calls[0].Args[2] != "1,2" {
-		t.Fatalf("priorities arg = %#v", runner.calls[0].Args[2])
+	if runner.call(0).Args[2] != "1,2" {
+		t.Fatalf("priorities arg = %#v", runner.call(0).Args[2])
 	}
 	resp, _ = timelineGET(t, srv, "/api/timeline?priorities=1%3BDROP", true)
 	if resp.StatusCode != http.StatusBadRequest {
@@ -200,7 +216,7 @@ func TestTimelineListSecondPageUsesCursor(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("got %d", resp.StatusCode)
 	}
-	call := runner.calls[0]
+	call := runner.call(0)
 	if fmt.Sprint(call.Args[3]) != "2026-06-01T11:00:00Z" || fmt.Sprint(call.Args[4]) != "10" {
 		t.Fatalf("cursor args = %#v", call.Args)
 	}
@@ -261,7 +277,8 @@ func TestTimelineItemReturnsDetailWithChildrenAndSourceRow(t *testing.T) {
 	// The source-row query must be built from the jsonb primary key with
 	// parameter placeholders only.
 	found := false
-	for _, call := range runner.calls {
+	for i := 0; i < runner.callCount(); i++ {
+		call := runner.call(i)
 		if strings.Contains(call.SQL, "row_to_json") {
 			found = true
 			if !strings.Contains(call.SQL, "FROM gmail_messages t WHERE account = $1 AND message_id = $2") {
@@ -295,27 +312,54 @@ func TestTimelineSourcesAggregatesAndCaches(t *testing.T) {
 		}},
 	}}
 	srv := newTimelineTestServer(t, runner)
+	type sourcesPayload struct {
+		Sources    []map[string]any `json:"sources"`
+		Sync       []map[string]any `json:"sync"`
+		Priorities []map[string]any `json:"priorities"`
+		Warming    bool             `json:"warming"`
+	}
+
+	// The aggregates never block a request: the first call returns a warming
+	// payload carrying only the fast sync rows while the aggregate builds in
+	// the background.
 	resp, body := timelineGET(t, srv, "/api/timeline/sources", true)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("got %d", resp.StatusCode)
 	}
-	var payload struct {
-		Sources []map[string]any `json:"sources"`
-		Sync    []map[string]any `json:"sync"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	var first sourcesPayload
+	if err := json.Unmarshal(body, &first); err != nil {
 		t.Fatal(err)
 	}
-	if len(payload.Sources) != 1 || len(payload.Sync) != 1 {
-		t.Fatalf("payload = %s", body)
+	if !first.Warming || len(first.Sync) != 1 || len(first.Sources) != 0 {
+		t.Fatalf("first payload should be warming with sync rows only: %s", body)
 	}
-	callsAfterFirst := len(runner.calls)
+
+	var warmed sourcesPayload
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, body = timelineGET(t, srv, "/api/timeline/sources", true)
+		if err := json.Unmarshal(body, &warmed); err != nil {
+			t.Fatal(err)
+		}
+		if !warmed.Warming {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sources cache never warmed: %s", body)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(warmed.Sources) != 1 || len(warmed.Sync) != 1 {
+		t.Fatalf("warmed payload = %s", body)
+	}
+
+	callsAfterWarm := runner.callCount()
 	resp2, _ := timelineGET(t, srv, "/api/timeline/sources", true)
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("got %d", resp2.StatusCode)
 	}
-	if len(runner.calls) != callsAfterFirst {
-		t.Fatalf("second read should be served from cache; calls %d -> %d", callsAfterFirst, len(runner.calls))
+	if runner.callCount() != callsAfterWarm {
+		t.Fatalf("cached read must not re-query; calls %d -> %d", callsAfterWarm, runner.callCount())
 	}
 }
 
