@@ -39,7 +39,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import logging
 import time
@@ -115,6 +115,12 @@ class TimelineAdapter:
     incremental_sql: str
     max_ingest_sql: str
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE
+    # When > 0, every sync pass re-walks rows whose event_ts falls in the last
+    # N hours and re-upserts them. Classification signals that look forward or
+    # arrive late (Zach replying in a chat promotes the surrounding window;
+    # his answer to an email promotes the thread) converge through this window
+    # instead of freezing at first-ingest values.
+    refresh_hours: float = 0.0
 
 
 def _real_ts(*exprs: str) -> str:
@@ -143,6 +149,7 @@ def _simple_adapter(
     priority: str = str(TIMELINE_PRIORITY_CC),
     where: str = "TRUE",
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE,
+    refresh_hours: float = 0.0,
 ) -> TimelineAdapter:
     # event_ts and ingest_ts are used raw (no defensive COALESCE): they are the
     # ORDER BY / keyset expressions, and wrapping a bare indexed column in a
@@ -194,6 +201,7 @@ def _simple_adapter(
         incremental_sql=incremental_sql,
         max_ingest_sql=max_ingest_sql,
         batch_size=batch_size,
+        refresh_hours=refresh_hours,
     )
 
 
@@ -203,16 +211,112 @@ def _snippet(expr: str) -> str:
 
 # Sender-pattern fallbacks for mail Gmail's categorizer misses (it labels
 # most modern bulk mail, but pre-2016 history and some transactional senders
-# carry no category). Hard-bulk senders are one-way broadcast -> noise;
-# soft-automation senders are machine-written but often worth a glance
-# (receipts, signature notices, GitHub) -> cc tier.
+# carry no category). Benchmark-tuned (sampling/ 2026-07): pure machine mail
+# is noise; the only automated senders kept above noise are ones RELAYING a
+# real person's activity (GitHub comments, Docs comments, list mail).
 _GMAIL_BULK_SENDER_PATTERN = (
     "'(no-?reply|donotreply|do-not-reply|mailer|postmaster|bounce|"
     "newsletter|marketing@|promo)'"
 )
 _GMAIL_AUTOMATED_SENDER_PATTERN = (
     "'(notifications?@|digest@|updates@|alerts?@|billing@|receipts?@|invoice|"
-    "bank@|hcb@|sign@|bot@|replies\\+|info@|contact@|hello@|support@)'"
+    "statements?@|bank@|hcb@|sign@|bot@|replies\\+|info@|contact@|hello@|"
+    "support@|feedback@|service@|security@|account@|verify|apply@|jobs@|"
+    "calendar-notification@|\\mmail@|menu@|reports?@|"
+    "@(email|mail|msg|notify|alert|news|marketing|info|update)[\\w-]*\\.|"
+    "^(education|announce(ments)?|events?|press|community|news)@)'"
+)
+# Automated senders that carry a human's words to Zach (code-review comments,
+# issue replies, list discussion) stay at the cc tier instead of noise.
+_GMAIL_RELAY_SENDER_PATTERN = (
+    "'(notifications@github\\.com|@noreply\\.github\\.com|gitlab@|"
+    "comments-noreply@docs\\.google|notify@aur\\.archlinux)'"
+)
+_GMAIL_OTP_SUBJECT_PATTERN = (
+    "'(login code|verification code|security code|one.?time|password reset|"
+    "identification code|2fa)'"
+)
+_GMAIL_RSVP_SUBJECT_PATTERN = (
+    "'^(accepted|declined|tentatively accepted|updated invitation|"
+    "canceled event|invitation)[: ]'"
+)
+_GMAIL_RELAYED_BOT_BODY_PATTERN = (
+    "'(\\[bot\\] left a comment|latest updates on your projects|dependabot)'"
+)
+_GMAIL_CI_SUBJECT_PATTERN = (
+    "'(run failed|workflow run|deploy(ment)? (failed|succeeded)|build failed)'"
+)
+# Normalized subject prefix used to spot mail-merge blasts: strip reply/fwd
+# prefixes, lowercase, first 24 chars. Must match the expression index
+# gmail_messages_merge_prefix_idx exactly.
+_GMAIL_MERGE_PREFIX = (
+    "left(regexp_replace(lower({col}), '^((re|fwd|fw)(\\[\\d+\\])?:\\s*)+', ''), 24)"
+)
+
+# From-address belongs to one of Zach's synced mailboxes (any account).
+_GMAIL_FROM_SELF = (
+    "(t.from_address ILIKE '%%' || t.account || '%%' "
+    " OR 'SENT' = ANY(t.label_ids) "
+    " OR EXISTS (SELECT 1 FROM gmail_sync_state self "
+    "            WHERE self.account <> '' AND t.from_address ILIKE '%%' || self.account || '%%'))"
+)
+# Addressed to Zach himself: a synced account or his personal domain in To.
+_GMAIL_ADDRESSED = (
+    "EXISTS (SELECT 1 FROM unnest(t.to_addresses) rcpt "
+    "        WHERE rcpt ILIKE '%%' || t.account || '%%' "
+    "           OR lower(rcpt) LIKE '%%@zachlatta.com%%' "
+    "           OR EXISTS (SELECT 1 FROM gmail_sync_state self "
+    "                      WHERE self.account <> '' AND rcpt ILIKE '%%' || self.account || '%%'))"
+)
+# >=30 self-sent messages sharing a normalized subject prefix within +/-3 days
+# = a mail-merge blast (quote-shopping batches stay under the threshold).
+_GMAIL_MERGE_CLUSTER = (
+    "(SELECT count(*) FROM ("
+    " SELECT 1 FROM gmail_messages g2"
+    f" WHERE {_GMAIL_MERGE_PREFIX.format(col='g2.subject')} = {_GMAIL_MERGE_PREFIX.format(col='t.subject')}"
+    "  AND g2.internal_date BETWEEN t.internal_date - interval '3 days'"
+    "                           AND t.internal_date + interval '3 days'"
+    "  AND g2.from_address ILIKE '%%' || g2.account || '%%'"
+    " LIMIT 30) merge_probe) >= 30"
+)
+_GMAIL_THREAD_INBOUND_BEFORE = (
+    "EXISTS (SELECT 1 FROM gmail_messages g3 "
+    "        WHERE g3.thread_id = t.thread_id "
+    "          AND g3.internal_date < t.internal_date "
+    "          AND g3.from_address NOT ILIKE '%%' || g3.account || '%%' "
+    "          AND NOT EXISTS (SELECT 1 FROM gmail_sync_state s3 "
+    "                          WHERE s3.account <> '' AND g3.from_address ILIKE '%%' || s3.account || '%%'))"
+)
+# Zach answered this thread after the message arrived (within 48h): the
+# strongest "this conversation has his attention" signal.
+_GMAIL_MY_REPLY_AFTER = (
+    "EXISTS (SELECT 1 FROM gmail_messages g4 "
+    "        WHERE g4.thread_id = t.thread_id "
+    "          AND g4.internal_date > t.internal_date "
+    "          AND g4.internal_date < t.internal_date + interval '48 hours' "
+    "          AND g4.from_address ILIKE '%%' || g4.account || '%%')"
+)
+_GMAIL_I_POSTED_IN_THREAD = (
+    "EXISTS (SELECT 1 FROM gmail_messages g5 "
+    "        WHERE g5.thread_id = t.thread_id "
+    "          AND g5.from_address ILIKE '%%' || g5.account || '%%')"
+)
+# Sender is someone Zach has written to at least twice (relationship signal;
+# the table is timeline-owned state refreshed by the sync engine).
+_GMAIL_KNOWN_CORRESPONDENT = (
+    "EXISTS (SELECT 1 FROM timeline_gmail_correspondents gc "
+    "        WHERE gc.addr = lower(COALESCE(NULLIF(substring(t.from_address FROM '<([^>]+)>'), ''), "
+    "                                       t.from_address)) "
+    "          AND gc.n_sent_to >= 2)"
+)
+_GMAIL_BULK_CATEGORY = (
+    "('CATEGORY_PROMOTIONS' = ANY(t.label_ids) OR 'CATEGORY_UPDATES' = ANY(t.label_ids) "
+    " OR 'CATEGORY_FORUMS' = ANY(t.label_ids) OR 'CATEGORY_SOCIAL' = ANY(t.label_ids))"
+)
+_GMAIL_AUTOMATED_FROM = (
+    f"(t.from_address ~* {_GMAIL_BULK_SENDER_PATTERN} "
+    f" OR t.from_address ~* {_GMAIL_AUTOMATED_SENDER_PATTERN} "
+    " OR t.from_address ~* '\\[bot\\]')"
 )
 
 _GMAIL_EMAIL = _simple_adapter(
@@ -240,27 +344,43 @@ _GMAIL_EMAIL = _simple_adapter(
         "'labels', to_jsonb(t.label_ids), "
         "'deleted', t.is_deleted <> 0)"
     ),
-    # Sent by me > spam/bulk (Gmail's own categorizer) > starred > automated
-    # senders that escaped the categorizer > addressed to me > cc'd/other.
-    # "Directly addressed" alone is not enough for tier 2: plenty of garbage
-    # is addressed straight to the account, so the bulk/automation checks
-    # deliberately run first.
+    # Benchmark-tuned ordering (sampling/rubric.md, 2026-07). Broadly:
+    # my own mail (minus mail-merge blasts) > relayed-human notifications at
+    # the cc tier > threads I engage with > known humans addressed to me >
+    # starred > bulk/automated > addressed to me > everything else at cc.
     priority=(
         "CASE "
         # Mail from any of my synced mailboxes is my own action, including the
-        # copy that lands in a different account (cross-account forwards).
-        "WHEN t.from_address ILIKE '%%' || t.account || '%%' "
-        "  OR EXISTS (SELECT 1 FROM gmail_sync_state self "
-        "             WHERE self.account <> '' AND t.from_address ILIKE '%%' || self.account || '%%') THEN 1 "
+        # copy that lands in a different account (cross-account forwards) —
+        # unless it is one send of a mail-merge blast nobody had replied to.
+        f"WHEN {_GMAIL_FROM_SELF} THEN "
+        f"  CASE WHEN {_GMAIL_MERGE_CLUSTER} AND NOT {_GMAIL_THREAD_INBOUND_BEFORE} THEN 4 ELSE 1 END "
         "WHEN 'SPAM' = ANY(t.label_ids) OR 'TRASH' = ANY(t.label_ids) THEN 4 "
-        "WHEN 'CATEGORY_PROMOTIONS' = ANY(t.label_ids) OR 'CATEGORY_UPDATES' = ANY(t.label_ids) "
-        "  OR 'CATEGORY_FORUMS' = ANY(t.label_ids) OR 'CATEGORY_SOCIAL' = ANY(t.label_ids) THEN 4 "
-        "WHEN 'STARRED' = ANY(t.label_ids) THEN 2 "
-        f"WHEN t.from_address ~* {_GMAIL_BULK_SENDER_PATTERN} THEN 4 "
-        f"WHEN t.from_address ~* {_GMAIL_AUTOMATED_SENDER_PATTERN} THEN 3 "
-        "WHEN EXISTS (SELECT 1 FROM unnest(t.to_addresses) rcpt WHERE rcpt ILIKE '%%' || t.account || '%%') THEN 2 "
+        # Relay services carrying a human's activity: mention/author copies are
+        # directed at me; bot-authored payloads (CI, deploy status) are noise;
+        # the rest is skim-worthy cc.
+        f"WHEN t.from_address ~* {_GMAIL_RELAY_SENDER_PATTERN} THEN "
+        "  CASE WHEN EXISTS (SELECT 1 FROM unnest(t.to_addresses || t.cc_addresses) a "
+        "                    WHERE a ILIKE '%%mention@noreply.github.com%%' "
+        "                       OR a ILIKE '%%author@noreply.github.com%%') THEN 2 "
+        f"       WHEN t.from_address ~* '\\[bot\\]' OR t.subject ~* {_GMAIL_CI_SUBJECT_PATTERN} "
+        f"         OR t.snippet ~* {_GMAIL_RELAYED_BOT_BODY_PATTERN} THEN 4 "
+        "       ELSE 3 END "
+        f"WHEN t.subject ~* {_GMAIL_RSVP_SUBJECT_PATTERN} THEN 3 "
+        f"WHEN 'CATEGORY_FORUMS' = ANY(t.label_ids) AND t.from_address !~* {_GMAIL_BULK_SENDER_PATTERN} THEN 3 "
+        f"WHEN t.subject ~* {_GMAIL_OTP_SUBJECT_PATTERN} THEN 4 "
+        f"WHEN {_GMAIL_AUTOMATED_FROM} AND t.subject ~* '^(re: )?new comment' THEN 3 "
+        f"WHEN NOT {_GMAIL_AUTOMATED_FROM} AND {_GMAIL_MY_REPLY_AFTER} THEN 2 "
+        f"WHEN NOT {_GMAIL_AUTOMATED_FROM} AND {_GMAIL_I_POSTED_IN_THREAD} THEN "
+        f"  CASE WHEN {_GMAIL_ADDRESSED} THEN 2 ELSE 3 END "
+        f"WHEN NOT {_GMAIL_AUTOMATED_FROM} AND {_GMAIL_KNOWN_CORRESPONDENT} AND {_GMAIL_ADDRESSED} THEN 2 "
+        f"WHEN 'STARRED' = ANY(t.label_ids) AND NOT {_GMAIL_AUTOMATED_FROM} "
+        f"  AND NOT {_GMAIL_BULK_CATEGORY} THEN 2 "
+        f"WHEN {_GMAIL_BULK_CATEGORY} OR {_GMAIL_AUTOMATED_FROM} THEN 4 "
+        f"WHEN {_GMAIL_ADDRESSED} THEN 2 "
         "ELSE 3 END"
     ),
+    refresh_hours=72,
 )
 
 _SLACK_JOINS = """
@@ -272,31 +392,115 @@ _SLACK_JOINS = """
         ON ident.account = t.account AND ident.team_id = t.team_id
 """
 
-# A reply in a thread Zach has posted in is directed at him even without a
-# mention; probes slack_messages_thread_idx once per threaded row.
-_SLACK_MY_THREAD = (
-    "(t.thread_ts <> '' AND EXISTS ("
+# The root of this thread is one of Zach's own messages: a reply to him.
+# A single primary-key probe per threaded row.
+_SLACK_THREAD_ROOT_MINE = (
+    "(t.thread_ts <> '' AND ident.user_id <> '' AND EXISTS ("
     "SELECT 1 FROM slack_messages z "
     "WHERE z.account = t.account AND z.team_id = t.team_id "
-    "  AND z.conversation_id = t.conversation_id AND z.thread_ts = t.thread_ts "
+    "  AND z.conversation_id = t.conversation_id AND z.message_ts = t.thread_ts "
     "  AND z.user_id = ident.user_id AND z.is_deleted = 0))"
 )
+# Zach posted in this thread within the preceding 12 hours: the reply lands in
+# a conversation he is actively part of. (Unbounded thread participation
+# over-promoted: RSVP piles in announcement threads and day-old ship threads
+# read as ambient, per the labeled benchmark.)
+_SLACK_MY_THREAD_RECENT = (
+    "(t.thread_ts <> '' AND ident.user_id <> '' AND EXISTS ("
+    "SELECT 1 FROM slack_messages z "
+    "WHERE z.user_id = ident.user_id "
+    "  AND z.message_datetime BETWEEN t.message_datetime - interval '12 hours' "
+    "                             AND t.message_datetime "
+    "  AND z.account = t.account AND z.team_id = t.team_id "
+    "  AND z.conversation_id = t.conversation_id AND z.thread_ts = t.thread_ts "
+    "  AND z.is_deleted = 0))"
+)
 
-# Mine > bots > DM / mention / my thread / small-group DM > member channels
-# (ambient activity in Zach's spaces) > the rest of the workspace firehose.
-# Sampling note: an earlier draft promoted "channels I post in a lot" to the
-# direct tier, which flooded it with #lounge-style community chatter; channel
-# talk is never direct unless it names Zach or joins one of his threads.
+
+def _slack_my_msgs_in_window(*, before: str, after: str, limit: int) -> str:
+    """Count (capped) of Zach's own messages in this conversation around the
+    row's time; rides slack_messages_user_time_idx so each probe is a short
+    range scan of his messages only. Lazy inside CASE branches, so the
+    firehose rows that resolve earlier never pay for it."""
+    return (
+        "(SELECT count(*) FROM ("
+        " SELECT 1 FROM slack_messages z"
+        " WHERE z.user_id = ident.user_id"
+        f"  AND z.message_datetime BETWEEN t.message_datetime - interval '{before}'"
+        f"                             AND t.message_datetime + interval '{after}'"
+        "  AND z.account = t.account AND z.team_id = t.team_id"
+        "  AND z.conversation_id = t.conversation_id AND z.is_deleted = 0"
+        f" LIMIT {limit}) win) "
+    )
+
+
+_SLACK_W6H = _slack_my_msgs_in_window(before="6 hours", after="6 hours", limit=4)
+_SLACK_P3D = _slack_my_msgs_in_window(before="3 days", after="0 hours", limit=3)
+_SLACK_P24H = _slack_my_msgs_in_window(before="24 hours", after="0 hours", limit=1)
+
+# Channel velocity: messages from anyone in the 24h before this row. The
+# "is this channel a firehose" signal — slack_conversations.num_members flaps
+# to 0 in production syncs, so size cannot be trusted; behavior can.
+_SLACK_CONV_VELOCITY_24H = (
+    "(SELECT count(*) FROM ("
+    " SELECT 1 FROM slack_messages v"
+    " WHERE v.account = t.account AND v.team_id = t.team_id"
+    "  AND v.conversation_id = t.conversation_id AND v.is_deleted = 0"
+    "  AND v.message_datetime BETWEEN t.message_datetime - interval '24 hours'"
+    "                             AND t.message_datetime"
+    " LIMIT 151) vel) "
+)
+
+_SLACK_DISPLAY_NAME = (
+    "COALESCE(NULLIF(u.display_name, ''), NULLIF(u.real_name, ''), "
+    "NULLIF(u.name, ''), t.username)"
+)
+_SLACK_IS_BOT = (
+    "(t.bot_id <> '' OR t.user_id LIKE 'USLACK%%' OR u.is_bot = 1 "
+    " OR t.subtype LIKE 'bot%%' OR (t.user_id = '' AND t.username <> '') "
+    f" OR {_SLACK_DISPLAY_NAME} ~* 'bot\\M')"
+)
+_SLACK_SYSTEM_SUBTYPES = (
+    "('channel_join', 'channel_leave', 'channel_archive', 'channel_name', "
+    "'channel_purpose', 'channel_topic', 'group_join', 'group_leave')"
+)
+_SLACK_MPIM_ROSTER = (
+    "GREATEST(c.num_members, (SELECT count(*) FROM slack_conversation_members m "
+    "WHERE m.account = t.account AND m.team_id = t.team_id "
+    "  AND m.conversation_id = t.conversation_id AND m.is_deleted = 0))"
+)
+
+# Benchmark-tuned ordering (sampling/rubric.md, 2026-07). Mine > bots (app DMs
+# relaying a human's action stay skim-worthy) > system messages > DMs >
+# mentions and name references > replies to/with him in threads > group DMs he
+# is engaged in > channel conversations he is actively part of > ambient
+# member channels > the workspace firehose. Two standing reversals from
+# sampling: "channels I post in a lot" must NOT promote (lounge-chatter
+# flood), and one drive-by message must not promote a busy channel's +/-6h —
+# participation means at least two of his messages in the window.
 _SLACK_MESSAGE_PRIORITY = (
     "CASE "
     "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 1 "
-    # USLACK% covers Slack's own system accounts (USLACKBOT, USLACKSECURITY).
-    "WHEN t.bot_id <> '' OR t.user_id LIKE 'USLACK%%' OR u.is_bot = 1 THEN 4 "
+    f"WHEN {_SLACK_IS_BOT} THEN "
+    "  CASE WHEN c.is_im = 1 AND t.text ~* '(commented on|shared an item|replied to|"
+    "mentioned you|upgrade request|invited you|assigned you)' THEN 3 ELSE 4 END "
+    f"WHEN t.subtype IN {_SLACK_SYSTEM_SUBTYPES} THEN 4 "
     "WHEN c.is_im = 1 THEN 2 "
     "WHEN ident.user_id <> '' AND t.text LIKE '%%<@' || ident.user_id || '>%%' THEN 2 "
-    "WHEN c.is_mpim = 1 THEN 2 "
-    f"WHEN {_SLACK_MY_THREAD} THEN 2 "
-    "WHEN c.is_member = 1 THEN 3 "
+    "WHEN t.text ~* '\\m(zrl|latta|zach latta|zachlatta)\\M' THEN 2 "
+    "WHEN t.text ~* '\\mzach\\M' AND (c.is_private = 1 "
+    f"  OR c.num_members <= 1000 OR {_SLACK_W6H} >= 1) THEN 2 "
+    f"WHEN {_SLACK_THREAD_ROOT_MINE} THEN 2 "
+    f"WHEN {_SLACK_MY_THREAD_RECENT} THEN 2 "
+    f"WHEN c.is_mpim = 1 THEN "
+    f"  CASE WHEN {_SLACK_W6H} >= 1 OR {_SLACK_MPIM_ROSTER} BETWEEN 1 AND 5 "
+    f"        OR {_SLACK_P3D} >= 3 THEN 2 ELSE 3 END "
+    "WHEN c.is_member = 1 THEN "
+    f"  CASE WHEN {_SLACK_W6H} >= 2 AND ({_SLACK_CONV_VELOCITY_24H} <= 150 "
+    f"         OR ({_SLACK_W6H} >= 3 AND {_SLACK_P3D} >= 2)) THEN 2 "
+    f"       WHEN c.is_private = 1 AND {_SLACK_MPIM_ROSTER} <= 20 "
+    f"         AND {_SLACK_P24H} >= 1 THEN 2 "
+    "       ELSE 3 END "
     "ELSE 4 END"
 )
 
@@ -304,8 +508,23 @@ _SLACK_FILE_PRIORITY = (
     "CASE "
     "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 1 "
     "WHEN u.is_bot = 1 THEN 4 "
-    "WHEN c.is_im = 1 OR c.is_mpim = 1 THEN 2 "
-    "WHEN c.is_member = 1 THEN 3 "
+    "WHEN c.is_im = 1 THEN 2 "
+    f"WHEN c.is_mpim = 1 THEN "
+    "  CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM slack_messages z "
+    "       WHERE z.user_id = ident.user_id "
+    "         AND z.message_datetime BETWEEN t.created_at - interval '6 hours' "
+    "                                    AND t.created_at + interval '6 hours' "
+    "         AND z.account = t.account AND z.team_id = t.team_id "
+    "         AND z.conversation_id = t.conversation_id AND z.is_deleted = 0 "
+    f"       LIMIT 1) fw) >= 1 OR {_SLACK_MPIM_ROSTER} BETWEEN 1 AND 5 THEN 2 ELSE 3 END "
+    "WHEN c.is_member = 1 THEN "
+    "  CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM slack_messages z "
+    "       WHERE z.user_id = ident.user_id "
+    "         AND z.message_datetime BETWEEN t.created_at - interval '6 hours' "
+    "                                    AND t.created_at + interval '6 hours' "
+    "         AND z.account = t.account AND z.team_id = t.team_id "
+    "         AND z.conversation_id = t.conversation_id AND z.is_deleted = 0 "
+    "       LIMIT 2) fw) >= 2 THEN 2 ELSE 3 END "
     "ELSE 4 END"
 )
 # IM/MPIM checks come first: slack stores a user-id-ish "name" on DM
@@ -349,6 +568,9 @@ _SLACK_MESSAGE = _simple_adapter(
     ),
     priority=_SLACK_MESSAGE_PRIORITY,
     batch_size=5000,
+    # 12h covers the +/-6h engagement window with margin while keeping the
+    # per-tick re-walk (~9k rows with window probes) inside the work budget.
+    refresh_hours=12,
 )
 
 _SLACK_FILE = _simple_adapter(
@@ -378,6 +600,7 @@ _SLACK_FILE = _simple_adapter(
         "'deleted', t.is_deleted <> 0)"
     ),
     priority=_SLACK_FILE_PRIORITY,
+    refresh_hours=48,
 )
 
 _APPLE_MESSAGE = _simple_adapter(
@@ -397,9 +620,14 @@ _APPLE_MESSAGE = _simple_adapter(
     ) cm ON cm.account = t.account AND cm.message_id = t.message_id
     LEFT JOIN apple_message_chats c ON c.account = t.account AND c.chat_id = cm.chat_id
     LEFT JOIN (
-        SELECT account, chat_id, count(*) AS n
-        FROM apple_message_chat_handles
-        GROUP BY account, chat_id
+        -- Distinct people, not handle rows: device re-syncs leave duplicate
+        -- handle records for the same address in chat rosters.
+        SELECT ch.account, ch.chat_id,
+               count(DISTINCT COALESCE(NULLIF(rh.address, ''), ch.handle_id)) AS n
+        FROM apple_message_chat_handles ch
+        LEFT JOIN apple_message_handles rh
+            ON rh.account = ch.account AND rh.handle_id = ch.handle_id
+        GROUP BY ch.account, ch.chat_id
     ) roster ON roster.account = t.account AND roster.chat_id = cm.chat_id""",
     event_id="concat_ws('|', t.account, t.message_id)",
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
@@ -425,22 +653,39 @@ _APPLE_MESSAGE = _simple_adapter(
         "'audio', t.is_audio_message <> 0, "
         "'deleted', t.is_deleted <> 0)"
     ),
-    # chat.db style: 45 = 1:1 conversation, 43 = group. The roster count is
-    # other participants (my own handle is not in it), so <= 3 means a group
-    # of at most four people. A sender that is neither a phone number nor an
-    # email address is a business/RCS token (airlines, delivery bots), and
-    # 3-6 digit senders are SMS shortcodes — automated, not a person.
+    # chat.db style: 45 = 1:1 conversation, 43 = group. The roster counts
+    # distinct participant addresses excluding Zach's own handle. People
+    # accumulate 2-3 numbers/emails over the years, so <= 9 addresses is what
+    # actually covers the family/friend-sized groups the benchmark put at the
+    # attention tier (the main family chat counts 9 addresses for ~4 humans).
+    # A sender that is neither a phone number nor an email address is a
+    # business/RCS token (airlines, delivery bots); 3-6 digit senders and
+    # shortcode-named group chats are SMS blasts; +1 toll-free numbers are
+    # automated services; a 1:1 chat Zach has never once replied to is a
+    # one-way broadcast, not a conversation.
     priority=(
         "CASE "
         "WHEN t.is_from_me = 1 THEN 1 "
         "WHEN t.is_system_message = 1 OR t.is_service_message = 1 OR t.is_spam = 1 THEN 4 "
         "WHEN h.address ~ '^[0-9]{3,6}$' "
         "  OR (h.address <> '' AND h.address NOT LIKE '+%%' AND h.address NOT LIKE '%%@%%') THEN 4 "
-        "WHEN c.style = 45 THEN 2 "
-        "WHEN c.style = 43 AND COALESCE(roster.n, 0) <= 3 THEN 2 "
-        "WHEN c.style = 43 THEN 3 "
-        "ELSE 2 END"
+        "WHEN c.display_name ~ '^[0-9]{3,6}$' OR c.chat_identifier ~ '^[0-9]{3,6}$' THEN 4 "
+        "WHEN h.address ~ '^\\+1(800|833|844|855|866|877|888)' THEN 4 "
+        "WHEN c.style = 45 OR COALESCE(roster.n, 0) <= 1 THEN "
+        "  CASE WHEN EXISTS (SELECT 1 FROM apple_message_chat_messages zc "
+        "                    JOIN apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
+        "                    WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
+        "                      AND z.is_from_me = 1) THEN 2 ELSE 4 END "
+        "WHEN COALESCE(roster.n, 0) <= 9 THEN 2 "
+        "WHEN EXISTS (SELECT 1 FROM apple_message_chat_messages zc "
+        "             JOIN apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
+        "             WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
+        "               AND zc.message_date BETWEEN t.message_at - interval '6 hours' "
+        "                                       AND t.message_at + interval '6 hours' "
+        "               AND z.is_from_me = 1) THEN 2 "
+        "ELSE 3 END"
     ),
+    refresh_hours=48,
 )
 
 _WHATSAPP_MESSAGE = _simple_adapter(
@@ -477,15 +722,34 @@ _WHATSAPP_MESSAGE = _simple_adapter(
         f"'edited', t.edited_at > {_EPOCH_GUARD}, "
         "'deleted', t.is_deleted <> 0)"
     ),
-    # Group roster counts include me, so <= 4 is a group of at most four.
+    # Group roster counts include me, so <= 5 is a group of at most five.
+    # Business accounts (incl. Zach's own WhatsApp-bridged agent) are
+    # automated; contentless rows with a group-jid "sender" are E2E/system
+    # stubs; big groups are attention only while Zach is actively in the
+    # conversation (his own message within +/-6 hours).
     priority=(
         "CASE "
         "WHEN t.is_from_me = 1 THEN 1 "
         "WHEN c.chat_type = 'status' THEN 4 "
+        "WHEN EXISTS (SELECT 1 FROM whatsapp_contacts b "
+        "             WHERE b.account = t.account AND b.jid = t.sender_jid "
+        "               AND b.business_name <> '') THEN 4 "
+        "WHEN t.body_text = '' AND COALESCE(t.media_type, '') IN ('', 'none', 'unknown') "
+        "  AND (t.sender_jid = t.chat_id OR t.sender_jid = '' "
+        "       OR COALESCE(c.chat_type, '') <> 'group' "
+        "       OR COALESCE(NULLIF(ct.full_name, ''), NULLIF(ct.push_name, ''), "
+        "                   NULLIF(t.push_name, '')) IS NULL) THEN 4 "
         "WHEN c.chat_type = 'group' OR t.chat_id LIKE '%%@g.us' THEN "
-        "  CASE WHEN COALESCE(roster.n, 99) <= 4 THEN 2 ELSE 3 END "
+        "  CASE WHEN COALESCE(roster.n, 99) <= 5 THEN 2 "
+        "       WHEN EXISTS (SELECT 1 FROM whatsapp_messages z "
+        "                    WHERE z.account = t.account AND z.chat_id = t.chat_id "
+        "                      AND z.is_from_me = 1 "
+        "                      AND z.message_at BETWEEN t.message_at - interval '6 hours' "
+        "                                           AND t.message_at + interval '6 hours') THEN 2 "
+        "       ELSE 3 END "
         "ELSE 2 END"
     ),
+    refresh_hours=48,
 )
 
 _APPLE_NOTE_REVISION = _simple_adapter(
@@ -574,8 +838,21 @@ _CALENDAR_EVENT = _simple_adapter(
         "'all_day', t.is_all_day <> 0, "
         "'deleted', t.is_deleted <> 0)"
     ),
+    # Subscribed feeds (yoga studios, holidays) and marketing-mail invites
+    # (their descriptions carry the invisible-padding chars marketing HTML
+    # uses) are noise; events any of Zach's identities organized are his own
+    # actions, except Flighty's auto-created ✈-titled flight events; real
+    # invites from humans are attention.
     priority=(
-        "CASE WHEN t.organizer_email ILIKE '%%' || t.account || '%%' THEN 1 ELSE 2 END"
+        "CASE "
+        "WHEN t.organizer_email ILIKE '%%group.calendar.google.com%%' "
+        "  OR t.organizer_email ILIKE '%%holiday%%' THEN 4 "
+        "WHEN t.description LIKE '%%͏%%' OR t.description LIKE '%%­%%' THEN 4 "
+        "WHEN t.organizer_email ILIKE '%%' || t.account || '%%' "
+        "  OR EXISTS (SELECT 1 FROM gmail_sync_state self "
+        "             WHERE self.account <> '' AND t.organizer_email ILIKE '%%' || self.account || '%%') THEN "
+        "  CASE WHEN t.summary LIKE '✈%%' THEN 4 ELSE 1 END "
+        "ELSE 2 END"
     ),
 )
 
@@ -615,6 +892,12 @@ _DRIVE_FILE = _simple_adapter(
         # tier drowning real events.
         "WHEN t.is_excluded <> 0 THEN 5 "
         "WHEN t.trashed <> 0 THEN 4 "
+        # Google-Forms response uploads and shared-with-organizers intake
+        # folders are pipeline traffic, not someone reaching Zach; shortcut
+        # churn likewise reads as ambient.
+        "WHEN t.folder_path LIKE '%%(File responses)%%' "
+        "  OR t.folder_path ~* 'shared with|shared w/' THEN 3 "
+        "WHEN t.mime_type = 'application/vnd.google-apps.shortcut' THEN 3 "
         "WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(t.owners_json) o "
         "             WHERE o->>'emailAddress' ILIKE t.account "
         "               AND (t.last_modifying_user = '' OR t.last_modifying_user = o->>'displayName')) THEN 1 "
@@ -651,7 +934,8 @@ _CONTACT_UPDATE = _simple_adapter(
         "'primary_phone', t.primary_phone, "
         "'deleted', t.is_deleted <> 0)"
     ),
-    priority=str(TIMELINE_PRIORITY_NOISE),
+    # Contact-card churn is sync machinery, not traffic aimed at Zach.
+    priority=str(TIMELINE_PRIORITY_BACKGROUND),
 )
 
 _MUTATION = _simple_adapter(
@@ -755,6 +1039,7 @@ def _agent_session_adapter() -> TimelineAdapter:
                 'events', s.event_count,
                 'user_events', s.user_event_count,
                 'assistant_events', s.assistant_event_count,
+                'entrypoint', s.entrypoint,
                 'model', md.model,
                 'device', s.device,
                 'account', s.account,
@@ -763,8 +1048,21 @@ def _agent_session_adapter() -> TimelineAdapter:
                 'output_tokens', s.output_tokens
             ))::text AS metadata,
             s.ingest_ts AS ingest_ts,
-            CASE WHEN COALESCE(NULLIF(st.session_title, ''), fp.text, '') LIKE '[cron:%%'
-                 THEN {TIMELINE_PRIORITY_BACKGROUND} ELSE {TIMELINE_PRIORITY_SELF} END AS priority
+            -- Interactive vs background (benchmark-tuned, sampling/ 2026-07).
+            -- chatgpt/claude_desktop are always human conversations, and some
+            -- sync as a header row with zero user events. Cron/inter-session
+            -- prompts, programmatic entrypoints, zero-user-turn transcripts,
+            -- and sidechain-only subagent transcripts are machinery.
+            CASE WHEN s.source IN ('chatgpt', 'claude_desktop') THEN {TIMELINE_PRIORITY_SELF}
+                 WHEN COALESCE(NULLIF(st.session_title, ''), fp.text, '') LIKE '[cron:%%'
+                   OR COALESCE(fp.text, '') LIKE '[cron:%%'
+                   OR COALESCE(fp.text, '') LIKE '[Inter-session message]%%'
+                   THEN {TIMELINE_PRIORITY_BACKGROUND}
+                 WHEN s.entrypoint IN ('sdk-cli', 'codex_exec', 'zrl-claw')
+                   THEN {TIMELINE_PRIORITY_BACKGROUND}
+                 WHEN s.user_event_count = 0 THEN {TIMELINE_PRIORITY_BACKGROUND}
+                 WHEN s.non_sidechain_count = 0 THEN {TIMELINE_PRIORITY_BACKGROUND}
+                 ELSE {TIMELINE_PRIORITY_SELF} END AS priority
         FROM (
             SELECT
                 e.source,
@@ -775,9 +1073,11 @@ def _agent_session_adapter() -> TimelineAdapter:
                          {_EPOCH}) AS end_ts,
                 max(NULLIF(e.device, '')) AS device,
                 max(NULLIF(e.account, '')) AS account,
+                COALESCE(min(NULLIF(e.entrypoint, '')), '') AS entrypoint,
                 count(*) AS event_count,
                 count(*) FILTER (WHERE e.role = 'user') AS user_event_count,
                 count(*) FILTER (WHERE e.role = 'assistant') AS assistant_event_count,
+                count(*) FILTER (WHERE e.is_sidechain = 0) AS non_sidechain_count,
                 sum(e.output_tokens) AS output_tokens,
                 max(e.ingested_at) AS ingest_ts
             FROM agent_session_events e
@@ -985,12 +1285,16 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # The timeline itself
     "timeline_events": _state("the unified timeline"),
     "timeline_sync_state": _state("per-adapter sync cursors"),
+    "timeline_gmail_correspondents": _state(
+        "addresses Zach has written to; feeds the gmail known-correspondent rule"
+    ),
 }
 
 # Raw-DDL tables created outside POSTGRES_TABLES; kept in sync by the live
 # schema test, which enumerates information_schema after running every
 # ensure_* method.
 RAW_DDL_TABLES: tuple[str, ...] = (
+    "timeline_gmail_correspondents",
     "claude_desktop_credentials",
     "claude_desktop_conversation_state",
     "whatsapp_client_sessions",
@@ -1066,6 +1370,7 @@ class AdapterSyncStats:
     adapter: str
     backfill_rows: int = 0
     incremental_rows: int = 0
+    refreshed_rows: int = 0
     backfill_done: bool = False
     error: str = ""
 
@@ -1275,6 +1580,78 @@ class TimelineSyncEngine:
                 break
         return total
 
+    def _run_refresh(self, adapter: TimelineAdapter, deadline: float | None) -> int:
+        """Re-walk (and re-upsert) the adapter's recent event window.
+
+        Reuses the newest-first backfill query with a local cursor; upserts
+        only bump seq when the normalized content (including priority)
+        actually changed, so a converged window is close to free.
+        """
+        cutoff = datetime.now(tz=UTC) - timedelta(hours=adapter.refresh_hours)
+        cursor_ts: datetime = BACKFILL_CURSOR_START
+        cursor_id = ""
+        total = 0
+        limit = self._batch_limit(adapter)
+        while not _past(deadline):
+            rows = self._fetch(
+                adapter.backfill_sql,
+                {"cursor_ts": cursor_ts, "cursor_id": cursor_id, "limit": limit},
+            )
+            if not rows:
+                break
+            fresh = [row for row in rows if row[3] >= cutoff]
+            self._upsert(adapter, fresh)
+            total += len(fresh)
+            if len(fresh) < len(rows) or len(rows) < limit:
+                break
+            last = rows[-1]
+            cursor_ts, cursor_id = last[3], last[0]
+        return total
+
+    def _refresh_gmail_correspondents(self) -> None:
+        """Maintain the addresses-Zach-has-written-to relationship table.
+
+        Timeline-owned state (created by ensure_timeline_tables) consumed by
+        the gmail adapter's known-correspondent rule. Refreshed from the
+        source at most once per day; skipped when the source has no gmail.
+        """
+        with self._dest_conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT to_regclass('timeline_gmail_correspondents') IS NOT NULL"
+            )
+            if not cursor.fetchone()[0]:
+                return
+            cursor.execute("SELECT max(refreshed_at) FROM timeline_gmail_correspondents")
+            last = cursor.fetchone()[0]
+        if last is not None and datetime.now(tz=UTC) - last < timedelta(hours=24):
+            return
+        with self._source_conn.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('gmail_messages') IS NOT NULL")
+            if not cursor.fetchone()[0]:
+                return
+            cursor.execute(
+                """
+                SELECT lower(COALESCE(NULLIF(substring(rcpt FROM '<([^>]+)>'), ''), rcpt)) AS addr,
+                       count(*) AS n_sent_to,
+                       max(m.internal_date) AS last_sent_at
+                FROM gmail_messages m
+                CROSS JOIN LATERAL unnest(m.to_addresses) AS rcpt
+                WHERE m.from_address ILIKE '%%' || m.account || '%%'
+                   OR EXISTS (SELECT 1 FROM gmail_sync_state s
+                              WHERE s.account <> '' AND m.from_address ILIKE '%%' || s.account || '%%')
+                GROUP BY 1
+                """
+            )
+            rows = cursor.fetchall()
+        with self._dest_conn.cursor() as cursor:
+            cursor.execute("DELETE FROM timeline_gmail_correspondents")
+            execute_values(
+                cursor,
+                "INSERT INTO timeline_gmail_correspondents (addr, n_sent_to, last_sent_at) "
+                "VALUES %s ON CONFLICT (addr) DO NOTHING",
+                rows,
+            )
+
     def _run_backfill_batch(self, adapter: TimelineAdapter, state: _AdapterState) -> int:
         limit = self._batch_limit(adapter)
         rows = self._fetch(
@@ -1305,11 +1682,18 @@ class TimelineSyncEngine:
         states: dict[str, _AdapterState] = {}
         failed: list[str] = []
 
+        try:
+            self._refresh_gmail_correspondents()
+        except Exception:  # noqa: BLE001 - the gmail adapter degrades, others run
+            logger.exception("timeline gmail correspondent refresh failed")
+
         for adapter in self._adapters:
             try:
                 state = self._load_state(adapter)
                 states[adapter.name] = state
                 stats[adapter.name].incremental_rows = self._run_incremental(adapter, state, deadline)
+                if adapter.refresh_hours > 0 and state.backfill_done:
+                    stats[adapter.name].refreshed_rows = self._run_refresh(adapter, deadline)
                 stats[adapter.name].backfill_done = state.backfill_done
             except Exception as exc:  # noqa: BLE001 - keep other adapters running
                 logger.exception("timeline incremental sync failed for %s", adapter.name)

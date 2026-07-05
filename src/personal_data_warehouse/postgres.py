@@ -326,6 +326,16 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "gmail_messages",
         "CREATE INDEX IF NOT EXISTS gmail_messages_thread_idx ON gmail_messages (account, thread_id, internal_date DESC)",
     ),
+    # Normalized-subject-prefix lookups for the timeline's mail-merge
+    # detection (timeline.py _GMAIL_MERGE_CLUSTER); the expression must match
+    # that probe's expression exactly.
+    IndexSpec(
+        "gmail_messages_merge_prefix_idx",
+        "gmail_messages",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_merge_prefix_idx ON gmail_messages "
+        "(account, (left(regexp_replace(lower(subject), '^((re|fwd|fw)(\\[\\d+\\])?:\\s*)+', ''), 24)), "
+        "internal_date)",
+    ),
     IndexSpec(
         "gmail_messages_internal_date_idx",
         "gmail_messages",
@@ -1334,6 +1344,19 @@ class PostgresWarehouse:
         # Additive migration for timelines created before the priority tier
         # existed; 0 means "not yet classified" and re-syncing fills it in.
         self._command("ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS priority bigint NOT NULL DEFAULT 0")
+        # Addresses Zach has ever written to, with counts — the relationship
+        # signal the gmail adapter's known-correspondent rule reads. Refreshed
+        # by TimelineSyncEngine at most once per day.
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS timeline_gmail_correspondents (
+                addr text PRIMARY KEY,
+                n_sent_to bigint NOT NULL DEFAULT 0,
+                last_sent_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                refreshed_at timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
 
     def ensure_claude_desktop_tables(self) -> None:
         """Tables for the serverside Claude Desktop poller.

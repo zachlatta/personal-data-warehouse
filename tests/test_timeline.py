@@ -301,6 +301,23 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
         """,
         (_NOW - timedelta(hours=4), _NOW),
     )
+    # Zach has replied in this chat, so it reads as a conversation rather
+    # than a one-way broadcast.
+    wh._command(
+        """
+        INSERT INTO apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
+        VALUES ('z@x.test', 'c1', 'am0', %s, %s)
+        """,
+        (_NOW - timedelta(hours=3), _NOW),
+    )
+    wh._command(
+        """
+        INSERT INTO apple_messages (account, message_id, handle_id, body_text, message_at,
+                                    is_from_me, ingested_at)
+        VALUES ('z@x.test', 'am0', '', 'sounds good!', %s, 1, %s)
+        """,
+        (_NOW - timedelta(hours=3), _NOW),
+    )
     wh._command(
         """
         INSERT INTO whatsapp_chats (account, chat_id, name)
@@ -403,9 +420,10 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
 
 # The seeded fixture rows exercise one classification branch per adapter:
 # gmail addressed directly to the account (2), a member-channel slack message
-# from someone else (3), a 1:1-ish iMessage (2), a big whatsapp group (3),
-# a session Zach prompted (1), his own notes/memos (1), a calendar event he
-# organizes (1), an unstarred drive file (3), contact churn (4), and the
+# from someone else (3), a 1:1 iMessage in a chat Zach replies in (2, plus
+# his own reply at 1), an unknown-roster whatsapp group (3), a session Zach
+# prompted (1), his own notes/memos (1), a calendar event he organizes (1),
+# an unstarred drive file (3), contact churn (5: sync machinery), and the
 # warehouse's own machinery (5).
 EXPECTED_SEEDED_PRIORITIES = {
     "gmail_email": 2,
@@ -418,7 +436,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "voice_memo": 1,
     "calendar_event": 1,
     "drive_file": 3,
-    "contact_update": 4,
+    "contact_update": 5,
     "mutation": 5,
     "mutation_request": 5,
     "enrichment_run": 5,
@@ -428,7 +446,7 @@ EXPECTED_SEEDED_EVENTS = {
     "gmail_email": 1,
     "slack_message": 1,
     "slack_file": 1,
-    "apple_message": 1,
+    "apple_message": 2,
     "whatsapp_message": 1,
     "agent_session": 1,
     "apple_note_revision": 1,
@@ -477,7 +495,10 @@ def test_backfill_normalizes_every_source(warehouse):
     assert slack["context"] == "#general"
     assert slack["snippet"] == "slack says hi"
 
-    imsg = next(r for r in rows if r["adapter"] == "apple_message")
+    imsg = next(
+        r for r in rows
+        if r["adapter"] == "apple_message" and not r["metadata"]["from_me"]
+    )
     assert imsg["actor"] == "+15551234567"
     assert imsg["context"] == "Family"
 
@@ -665,9 +686,418 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     assert priority_of("z@x.test|f-excluded") == 5, "warehouse-excluded drive blobs are background"
     assert priority_of("z@x.test|m-promo") == 4, "promos are noise even when addressed to me"
     assert priority_of("z@x.test|m-noreply") == 4, "broadcast senders are noise"
-    assert priority_of("z@x.test|m-notify") == 3, "transactional senders cap at the cc tier"
+    assert priority_of("z@x.test|m-notify") == 4, "pure machine mail is noise"
     assert priority_of("z@x.test|m-starred") == 2, "starred email is direct"
     assert priority_of("openclaw|cron-sess") == 5, "cron heartbeat sessions are background"
+
+
+def test_priority_separates_conversations_automation_and_machinery(warehouse):
+    """The benchmark-tuned heuristics (sampling/, 2026-07): active-window and
+    thread-root promotion in chats, mail-merge and correspondent rules in
+    gmail, interactive-vs-programmatic agent sessions, calendar and drive
+    pipeline demotions."""
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+
+    # --- slack: engagement windows, name mentions, group DMs ----------------
+    warehouse._command(
+        """
+        INSERT INTO slack_conversations (account, team_id, conversation_id, name, is_member,
+                                         num_members, is_mpim, is_private)
+        VALUES ('z', 'T1', 'CBIG', 'lounge', 1, 40000, 0, 0),
+               ('z', 'T1', 'G1', 'mpdm-group', 1, 7, 1, 0),
+               ('z', 'T1', 'G2', 'mpdm-small', 1, 4, 1, 0)
+        """
+    )
+    # Zach posts twice in #general around _NOW -> surrounding messages are a
+    # conversation he is in; a single drive-by post in #lounge is not.
+    warehouse._command(
+        """
+        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+                                    message_datetime, user_id, text, synced_at)
+        VALUES ('z', 'T1', 'C1', '5000.1', %s, 'UME', 'working on it', %s),
+               ('z', 'T1', 'C1', '5000.2', %s, 'UME', 'done', %s),
+               ('z', 'T1', 'C1', '5000.3', %s, 'U1', 'nice work everyone', %s),
+               ('z', 'T1', 'CBIG', '5000.4', %s, 'UME', 'hello lounge', %s),
+               ('z', 'T1', 'CBIG', '5000.5', %s, 'U1', 'ambient chatter', %s),
+               ('z', 'T1', 'CBIG', '5000.6', %s, 'U1', 'they should ask zach latta', %s),
+               ('z', 'T1', 'G1', '5000.7', %s, 'U1', 'big group dm chatter', %s),
+               ('z', 'T1', 'G2', '5000.8', %s, 'U1', 'small group dm', %s)
+        """,
+        (
+            _NOW - timedelta(hours=1), _NOW,
+            _NOW + timedelta(hours=1), _NOW,
+            _NOW, _NOW,
+            _NOW, _NOW,
+            _NOW + timedelta(hours=2), _NOW,
+            _NOW + timedelta(hours=3), _NOW,
+            _NOW, _NOW,
+            _NOW, _NOW,
+        ),
+    )
+    # A legacy integration posting with a username and no user account.
+    warehouse._command(
+        """
+        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+                                    message_datetime, user_id, username, text, synced_at)
+        VALUES ('z', 'T1', 'C1', '5000.9', %s, '', 'streambot', 'streaming activity', %s)
+        """,
+        (_NOW, _NOW),
+    )
+
+    # --- gmail: merge blasts, replies, relays, OTP, RSVP --------------------
+    merge_rows = []
+    for i in range(31):
+        merge_rows.append(
+            (
+                "z@x.test", f"merge-{i}", f"mth-{i}",
+                _NOW - timedelta(minutes=i), "join the program?",
+                "Zach <z@x.test>", [f"school{i}@example.test"], _NOW,
+            )
+        )
+    for row in merge_rows:
+        warehouse._command(
+            """
+            INSERT INTO gmail_messages (account, message_id, thread_id, internal_date,
+                                        subject, from_address, to_addresses, synced_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            row,
+        )
+    # A personal reply in a thread someone else wrote in first stays his.
+    warehouse._command(
+        """
+        INSERT INTO gmail_messages (account, message_id, thread_id, internal_date,
+                                    subject, from_address, to_addresses, synced_at)
+        VALUES ('z@x.test', 'inbound-1', 'mth-5', %s, 'Re: join the program?',
+                'school5@example.test', %s, %s),
+               ('z@x.test', 'my-reply', 'mth-5', %s, 'join the program?',
+                'Zach <z@x.test>', %s, %s)
+        """,
+        (
+            _NOW - timedelta(minutes=30), ["z@x.test"], _NOW,
+            _NOW - timedelta(minutes=2), ["school5@example.test"], _NOW,
+        ),
+    )
+    # Human mail he answered within 48h -> attention, even unaddressed.
+    warehouse._command(
+        """
+        INSERT INTO gmail_messages (account, message_id, thread_id, internal_date,
+                                    subject, from_address, to_addresses, synced_at)
+        VALUES ('z@x.test', 'm-replied', 'th-conv', %s, 'quick question',
+                'friend@example.test', %s, %s),
+               ('z@x.test', 'm-my-answer', 'th-conv', %s, 'Re: quick question',
+                'Zach <z@x.test>', %s, %s)
+        """,
+        (
+            _NOW - timedelta(hours=3), ["z@x.test"], _NOW,
+            _NOW - timedelta(hours=2), ["friend@example.test"], _NOW,
+        ),
+    )
+    # Relay notifications: a mention copy is direct; a bot payload is noise;
+    # a plain relayed comment is cc.
+    warehouse._command(
+        """
+        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+                                    to_addresses, cc_addresses, snippet, synced_at)
+        VALUES ('z@x.test', 'gh-mention', %s, 'Re: [org/repo] fix (PR #1)',
+                'notifications@github.com', %s, %s, 'someone: @zach take a look', %s),
+               ('z@x.test', 'gh-bot', %s, 'Re: [org/repo] bump deps (PR #2)',
+                'notifications@github.com', %s, %s,
+                'vercel[bot] left a comment (org/repo#2)', %s),
+               ('z@x.test', 'gh-plain', %s, 'Re: [org/repo] discussion (Issue #3)',
+                'notifications@github.com', %s, %s, 'a human wrote words here', %s)
+        """,
+        (
+            _NOW, ["z@x.test"], ["mention@noreply.github.com"], _NOW,
+            _NOW, ["z@x.test"], ["push@noreply.github.com"], _NOW,
+            _NOW, ["z@x.test"], ["subscribed@noreply.github.com"], _NOW,
+        ),
+    )
+    warehouse._command(
+        """
+        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+                                    to_addresses, synced_at)
+        VALUES ('z@x.test', 'm-otp', %s, 'Your login code: 123-456', 'human.sounding@bank.example', %s, %s),
+               ('z@x.test', 'm-rsvp', %s, 'Accepted: 1:1 @ Fri (zach)', 'colleague@example.test', %s, %s)
+        """,
+        (_NOW, ["z@x.test"], _NOW, _NOW, ["z@x.test"], _NOW),
+    )
+    # A known correspondent whose mail Gmail mis-categorized as bulk.
+    warehouse._command(
+        """
+        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+                                    to_addresses, label_ids, synced_at)
+        VALUES ('z@x.test', 'm-corr', %s, 'travel receipts', 'friend@example.test', %s,
+                %s, %s)
+        """,
+        (_NOW, ["z@x.test"], ["CATEGORY_UPDATES", "INBOX"], _NOW),
+    )
+    warehouse._command(
+        """
+        INSERT INTO timeline_gmail_correspondents (addr, n_sent_to, last_sent_at, refreshed_at)
+        VALUES ('friend@example.test', 12, %s, now())
+        """,
+        (_NOW,),
+    )
+
+    # --- apple: one-way broadcasts, toll-free, shortcode groups, windows ----
+    warehouse._command(
+        """
+        INSERT INTO apple_message_handles (account, handle_id, address)
+        VALUES ('z@x.test', 'h-oneway', '+15559990000'),
+               ('z@x.test', 'h-tollfree', '+18335551234'),
+               ('z@x.test', 'h-group', '+15558887777')
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO apple_message_chats (account, chat_id, display_name, style)
+        VALUES ('z@x.test', 'c-oneway', '', 45),
+               ('z@x.test', 'c-shortcode', '56789', 43),
+               ('z@x.test', 'c-biggroup', 'Trip Crew', 43)
+        """
+    )
+    for chat_id, handle, mid, offset in (
+        ("c-oneway", "h-oneway", "am-oneway", 0),
+        ("c-shortcode", "h-group", "am-shortcode", 0),
+        ("c-biggroup", "h-group", "am-group-active", 0),
+        ("c-biggroup", "h-group", "am-group-idle", 90),
+    ):
+        warehouse._command(
+            """
+            INSERT INTO apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
+            VALUES ('z@x.test', %s, %s, %s, %s)
+            """,
+            (chat_id, mid, _NOW - timedelta(days=offset), _NOW),
+        )
+        warehouse._command(
+            """
+            INSERT INTO apple_messages (account, message_id, handle_id, body_text, message_at,
+                                        is_from_me, ingested_at)
+            VALUES ('z@x.test', %s, %s, 'hello', %s, 0, %s)
+            """,
+            (mid, handle, _NOW - timedelta(days=offset), _NOW),
+        )
+    # Eleven other participants make c-biggroup a big group (the attention
+    # threshold is nine distinct addresses); Zach posted in it near _NOW
+    # (active window) but not near the idle message.
+    for i in range(11):
+        warehouse._command(
+            """
+            INSERT INTO apple_message_chat_handles (account, chat_id, handle_id)
+            VALUES ('z@x.test', 'c-biggroup', %s)
+            """,
+            (f"h-g{i}",),
+        )
+    warehouse._command(
+        """
+        INSERT INTO apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
+        VALUES ('z@x.test', 'c-biggroup', 'am-group-mine', %s, %s)
+        """,
+        (_NOW - timedelta(hours=2), _NOW),
+    )
+    warehouse._command(
+        """
+        INSERT INTO apple_messages (account, message_id, handle_id, body_text, message_at,
+                                    is_from_me, ingested_at)
+        VALUES ('z@x.test', 'am-group-mine', '', 'on my way', %s, 1, %s)
+        """,
+        (_NOW - timedelta(hours=2), _NOW),
+    )
+
+    # --- whatsapp: business senders and E2E stubs ----------------------------
+    warehouse._command(
+        """
+        INSERT INTO whatsapp_contacts (account, jid, push_name, business_name)
+        VALUES ('z@x.test', 'agent@lid', 'Agent', 'Agent Service')
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO whatsapp_messages (account, chat_id, message_id, sender_jid, push_name,
+                                       body_text, message_at, is_from_me, ingested_at)
+        VALUES ('z@x.test', 'agent@lid', 'wm-agent', 'agent@lid', 'Agent',
+                'task finished', %s, 0, %s),
+               ('z@x.test', 'chat@g.us', 'wm-stub', 'chat@g.us', '', '', %s, 0, %s)
+        """,
+        (_NOW, _NOW, _NOW, _NOW),
+    )
+
+    # --- agent sessions: programmatic entrypoints and empty transcripts -----
+    for sess, entrypoint, rows in (
+        ("sdk-sess", "sdk-cli", [("user", "Reply with ONLY minified JSON")]),
+        ("empty-sess", "", []),
+        ("desktop-conv", "", []),
+    ):
+        source = "claude_desktop" if sess == "desktop-conv" else "claude_code"
+        if not rows:
+            warehouse._command(
+                """
+                INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+                                                  role, event_type, session_title, entrypoint, ingested_at)
+                VALUES (%s, %s, 'meta0', 0, %s, 'meta', 'conversation', 'A titled conversation', %s, %s)
+                """,
+                (source, sess, _NOW, entrypoint, _NOW),
+            )
+        for seq, (role, text) in enumerate(rows):
+            warehouse._command(
+                """
+                INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+                                                  role, text, entrypoint, ingested_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (source, sess, f"e{seq}", seq, _NOW, role, text, entrypoint, _NOW),
+            )
+    # A sidechain-only subagent transcript is machinery even with user rows.
+    for seq, (role, text) in enumerate(
+        [("user", "You are a code-review finder"), ("assistant", "findings: [] ")]
+    ):
+        warehouse._command(
+            """
+            INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+                                              role, text, is_sidechain, ingested_at)
+            VALUES ('claude_code', 'side-sess', %s, %s, %s, %s, %s, 1, %s)
+            """,
+            (f"s{seq}", seq, _NOW, role, text, _NOW),
+        )
+
+    # --- calendar: feeds, promo invites, flighty ------------------------------
+    warehouse._command(
+        """
+        INSERT INTO calendar_events (account, calendar_id, event_id, summary, description,
+                                     organizer_email, start_at, updated_at, synced_at)
+        VALUES ('z@x.test', 'cal1', 'ev-feed', 'Vinyasa Flow', '',
+                'studio_x1@group.calendar.google.com', %s, %s, %s),
+               ('z@x.test', 'cal1', 'ev-promo', 'Free Ticket!', 'come along ͏ ­͏ ­',
+                'random@gmail.example', %s, %s, %s),
+               ('z@x.test', 'cal1', 'ev-flight', '✈ BTV→IAD • UA 4178', '',
+                'z@x.test', %s, %s, %s),
+               ('z@x.test', 'cal1', 'ev-invite', 'Coffee', '',
+                'human@example.test', %s, %s, %s)
+        """,
+        (_NOW, _NOW, _NOW) * 4,
+    )
+
+    # --- drive: form pipelines and shortcuts ---------------------------------
+    warehouse._command(
+        """
+        INSERT INTO google_drive_files (account, file_id, name, mime_type, folder_path,
+                                        last_modifying_user, modified_time, ingested_at)
+        VALUES ('z@x.test', 'f-form', 'logo - applicant.png', 'image/png',
+                '/apps form/Application (File responses)/Upload Logo (File responses)',
+                'applicant', %s, %s),
+               ('z@x.test', 'f-shortcut', 'Old Report', 'application/vnd.google-apps.shortcut',
+                '/My Drive', 'someone', %s, %s)
+        """,
+        (_NOW, _NOW, _NOW, _NOW),
+    )
+
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+
+    def priority_of(event_id: str) -> int:
+        return warehouse._query(
+            "SELECT priority FROM timeline_events WHERE event_id = %s", (event_id,)
+        )[0][0]
+
+    # slack
+    assert priority_of("z|T1|C1|5000.3") == 2, "channel msg inside his two-post window is a conversation"
+    assert priority_of("z|T1|CBIG|5000.5") == 3, "one drive-by post does not promote a 40k channel"
+    assert priority_of("z|T1|CBIG|5000.6") == 2, "naming him promotes anywhere"
+    assert priority_of("z|T1|G1|5000.7") == 3, "a big group DM he is not engaged in is peripheral"
+    assert priority_of("z|T1|G2|5000.8") == 2, "small group DMs are attention"
+    assert priority_of("z|T1|C1|5000.9") == 4, "username-only legacy integrations are bots"
+    # gmail
+    assert priority_of("z@x.test|merge-20") == 4, "mail-merge blast sends are not his actions"
+    assert priority_of("z@x.test|my-reply") == 1, "a personal reply after inbound mail stays his"
+    assert priority_of("z@x.test|m-replied") == 2, "mail he answered within 48h has his attention"
+    assert priority_of("z@x.test|gh-mention") == 2, "github mention copies are direct"
+    assert priority_of("z@x.test|gh-bot") == 4, "relayed bot payloads are noise"
+    assert priority_of("z@x.test|gh-plain") == 3, "relayed human comments are cc"
+    assert priority_of("z@x.test|m-otp") == 4, "login codes are noise"
+    assert priority_of("z@x.test|m-rsvp") == 3, "auto-RSVP notices are cc"
+    assert priority_of("z@x.test|m-corr") == 2, "known correspondents beat gmail's bulk category"
+    # apple
+    assert priority_of("z@x.test|am-oneway") == 4, "a 1:1 chat he never answers is a broadcast"
+    assert priority_of("z@x.test|am-shortcode") == 4, "shortcode-named group blasts are noise"
+    assert priority_of("z@x.test|am-group-active") == 2, "big group during his active window"
+    assert priority_of("z@x.test|am-group-idle") == 3, "big group outside his window is peripheral"
+    # whatsapp
+    assert priority_of("z@x.test|agent@lid|wm-agent") == 4, "business/bot accounts are automated"
+    assert priority_of("z@x.test|chat@g.us|wm-stub") == 4, "contentless E2E stubs are noise"
+    # agent sessions
+    assert priority_of("claude_code|sdk-sess") == 5, "sdk-cli runs are machinery"
+    assert priority_of("claude_code|empty-sess") == 5, "zero-user-turn transcripts are machinery"
+    assert priority_of("claude_desktop|desktop-conv") == 1, "desktop conversations are his even header-only"
+    assert priority_of("claude_code|side-sess") == 5, "sidechain-only subagent transcripts are machinery"
+    # calendar
+    assert priority_of("z@x.test|cal1|ev-feed") == 4, "subscribed calendar feeds are noise"
+    assert priority_of("z@x.test|cal1|ev-promo") == 4, "promo-invite blasts are noise"
+    assert priority_of("z@x.test|cal1|ev-flight") == 4, "flighty auto-events are not his actions"
+    assert priority_of("z@x.test|cal1|ev-invite") == 2, "human invites are attention"
+    # drive
+    assert priority_of("z@x.test|f-form") == 3, "form-response uploads are pipeline traffic"
+    assert priority_of("z@x.test|f-shortcut") == 3, "shortcut churn is ambient"
+
+
+def test_refresh_window_converges_late_signals(warehouse):
+    """A chat message classified before Zach replied is upgraded once the
+    refresh window re-walks it (his reply promotes the surrounding window)."""
+    _ensure_all_source_tables(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        "INSERT INTO slack_account_identities (account, team_id, user_id) VALUES ('z', 'T1', 'UME')"
+    )
+    warehouse._command(
+        """
+        INSERT INTO slack_conversations (account, team_id, conversation_id, name, is_member, num_members)
+        VALUES ('z', 'T1', 'C9', 'work', 1, 30)
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+                                    message_datetime, user_id, text, synced_at)
+        VALUES ('z', 'T1', 'C9', '9000.1', %s, 'U1', 'question for the room', %s)
+        """,
+        (now - timedelta(hours=2), now - timedelta(hours=2)),
+    )
+    adapter = adapter_by_name("slack_message")
+    engine = _engine(warehouse, adapters=[adapter])
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    row = warehouse._query(
+        "SELECT priority FROM timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
+    )
+    assert row[0][0] == 3, "no engagement yet: ambient member channel"
+
+    # Zach replies twice; the original message predates the watermark so only
+    # the refresh re-walk can reclassify it.
+    warehouse._command(
+        """
+        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+                                    message_datetime, user_id, text, synced_at)
+        VALUES ('z', 'T1', 'C9', '9000.2', %s, 'UME', 'on it', %s),
+               ('z', 'T1', 'C9', '9000.3', %s, 'UME', 'fixed', %s)
+        """,
+        (now - timedelta(hours=1), now, now - timedelta(minutes=30), now),
+    )
+    engine = _engine(warehouse, adapters=[adapter])
+    try:
+        stats = engine.run()
+    finally:
+        engine.close()
+    assert stats[0].refreshed_rows > 0
+    row = warehouse._query(
+        "SELECT priority FROM timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
+    )
+    assert row[0][0] == 2, "his replies retroactively promote the conversation window"
 
 
 def test_incremental_picks_up_new_and_changed_rows(warehouse):
