@@ -1269,6 +1269,12 @@ class PostgresWarehouse:
         )
         self._command("DROP INDEX IF EXISTS gmail_attachment_enrichments_text_bm25_idx")
         self._command("DROP INDEX IF EXISTS gmail_attachment_enrichments_text_trgm_idx")
+        # ALTER TABLE ... RENAME does not rename the table's indexes, so a
+        # renamed deployment keeps serving its primary key under the old name.
+        self._command(
+            "ALTER INDEX IF EXISTS gmail_attachment_enrichments_pkey "
+            "RENAME TO file_attachment_enrichments_pkey"
+        )
 
     def ensure_calendar_tables(self) -> None:
         self._ensure_table_group(["calendar_events", "calendar_sync_state"])
@@ -6015,9 +6021,25 @@ class PostgresWarehouse:
             """
         )
 
+    def _ensure_view(self, view: str, create_sql: str) -> None:
+        # CREATE OR REPLACE VIEW refuses to drop, rename, or retype an existing
+        # view's columns, and this database is shared: another checkout running
+        # a different revision can leave a view whose columns no longer match
+        # this code's definition, wedging every ensure until the definitions
+        # converge again. Views are derived state, so recreate from scratch when
+        # in-place replacement is impossible. Plain DROP (no CASCADE) so a view
+        # that grew dependent objects still fails loudly instead of silently
+        # dropping them.
+        try:
+            self._command(create_sql)
+        except psycopg2.errors.InvalidTableDefinition:
+            self._command(f"DROP VIEW IF EXISTS {_identifier(view)}")
+            self._command(create_sql)
+
     def _ensure_clean_gmail_inbox_view(self) -> None:
         self._ensure_utf8_byte_prefix_function()
-        self._command(
+        self._ensure_view(
+            "clean_gmail_inbox",
             """
             CREATE OR REPLACE VIEW clean_gmail_inbox AS
             SELECT
@@ -6090,7 +6112,8 @@ class PostgresWarehouse:
         )
 
     def _ensure_clean_slack_inbox_view(self) -> None:
-        self._command(
+        self._ensure_view(
+            "clean_slack_inbox",
             """
             CREATE OR REPLACE VIEW clean_slack_inbox AS
             SELECT
@@ -6116,7 +6139,8 @@ class PostgresWarehouse:
         )
 
     def _ensure_clean_contacts_view(self) -> None:
-        self._command(
+        self._ensure_view(
+            "clean_contacts",
             """
             CREATE OR REPLACE VIEW clean_contacts AS
             SELECT
@@ -6158,7 +6182,8 @@ class PostgresWarehouse:
         # whatsapp_chats.chat_type, falling back to a JID-derived value so the
         # view is correct even before the chat backfill runs. The fallback CASE
         # mirrors events.chat_type_for_jid.
-        self._command(
+        self._ensure_view(
+            "clean_whatsapp_messages",
             """
             CREATE OR REPLACE VIEW clean_whatsapp_messages AS
             SELECT
@@ -6211,7 +6236,8 @@ class PostgresWarehouse:
         # the first/last non-empty value seen so a session split across batches
         # converges; counts and token sums aggregate the whole session, which a
         # stored-aggregate upsert could not do correctly across batches.
-        self._command(
+        self._ensure_view(
+            "clean_agent_sessions",
             """
             CREATE OR REPLACE VIEW clean_agent_sessions AS
             SELECT
@@ -6248,7 +6274,8 @@ class PostgresWarehouse:
             for table in ("calendar_events", "apple_voice_memos_files", "apple_voice_memos_enrichments")
         ):
             return
-        self._command(
+        self._ensure_view(
+            "clean_calendar_with_transcripts",
             """
             CREATE OR REPLACE VIEW clean_calendar_with_transcripts AS
             WITH latest_calendar_events AS (
@@ -6319,7 +6346,8 @@ class PostgresWarehouse:
             WHERE e.calendar_event_id != ''
             """
         )
-        self._command(
+        self._ensure_view(
+            "clean_transcripts_no_calendar_match",
             """
             CREATE OR REPLACE VIEW clean_transcripts_no_calendar_match AS
             WITH latest_calendar_events AS (

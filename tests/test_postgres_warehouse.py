@@ -871,6 +871,10 @@ def test_postgres_renames_legacy_gmail_attachment_enrichments_table(warehouse: P
         "ALTER INDEX IF EXISTS file_attachment_enrichments_text_trgm_idx "
         "RENAME TO gmail_attachment_enrichments_text_trgm_idx"
     )
+    warehouse._command(
+        "ALTER INDEX IF EXISTS file_attachment_enrichments_pkey "
+        "RENAME TO gmail_attachment_enrichments_pkey"
+    )
     assert warehouse._relation_exists("gmail_attachment_enrichments")
     assert not warehouse._relation_exists("file_attachment_enrichments")
 
@@ -886,7 +890,8 @@ def test_postgres_renames_legacy_gmail_attachment_enrichments_table(warehouse: P
     index_names = {
         row[0]
         for row in warehouse._query(
-            "SELECT indexname FROM pg_indexes WHERE tablename = 'file_attachment_enrichments'",
+            "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
+            "AND tablename = 'file_attachment_enrichments'",
             (),
         )
     }
@@ -2027,6 +2032,51 @@ def test_postgres_contact_card_incremental_delete_removes_card_from_clean_contac
 
     assert rows == [(1, "true")]
     assert clean_rows == [(0,)]
+
+
+def test_ensure_view_replaces_view_whose_columns_cannot_be_dropped(warehouse: PostgresWarehouse) -> None:
+    warehouse._command("CREATE VIEW ensure_view_fixture AS SELECT 1 AS a, 2 AS b")
+
+    warehouse._ensure_view(
+        "ensure_view_fixture",
+        "CREATE OR REPLACE VIEW ensure_view_fixture AS SELECT 1 AS a",
+    )
+
+    assert warehouse._query("SELECT * FROM ensure_view_fixture") == [(1,)]
+
+
+def test_postgres_ensure_contacts_recovers_when_existing_view_has_extra_columns(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_contacts_tables()
+
+    # Reproduce out-of-band drift: another checkout ran a newer definition
+    # against the shared database, leaving clean_contacts with a trailing
+    # column this code's definition does not select. CREATE OR REPLACE VIEW
+    # cannot drop view columns, so every ensure used to fail until the
+    # definitions matched again.
+    viewdef = warehouse._query("SELECT pg_get_viewdef('clean_contacts'::regclass)")[0][0]
+    warehouse._command("DROP VIEW clean_contacts")
+    warehouse._command(
+        "CREATE VIEW clean_contacts AS "
+        f"SELECT base.*, '[]'::jsonb AS nicknames FROM ({viewdef.strip().rstrip(';')}) AS base"
+    )
+
+    warehouse.ensure_contacts_tables()
+
+    columns = [
+        row[0]
+        for row in warehouse._query(
+            """
+            SELECT attname
+            FROM pg_attribute
+            WHERE attrelid = 'clean_contacts'::regclass AND attnum > 0 AND NOT attisdropped
+            ORDER BY attnum
+            """
+        )
+    ]
+    assert "nicknames" not in columns
+    assert columns[-1] == "raw_json"
 
 
 def test_postgres_mark_missing_contact_cards_deleted_tombstones_only_scope(warehouse: PostgresWarehouse) -> None:
