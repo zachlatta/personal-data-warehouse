@@ -15,7 +15,7 @@ def noop_job() -> None:
     noop_op()
 
 
-def test_clear_in_progress_runs_at_boot_marks_active_runs_terminal() -> None:
+def test_clear_in_progress_runs_at_boot_marks_active_runs_canceled() -> None:
     with DagsterInstance.ephemeral() as instance:
         started = instance.create_run_for_job(noop_job, status=DagsterRunStatus.STARTED)
         starting = instance.create_run_for_job(noop_job, status=DagsterRunStatus.STARTING)
@@ -24,10 +24,9 @@ def test_clear_in_progress_runs_at_boot_marks_active_runs_terminal() -> None:
 
         summary = clear_in_progress_runs_at_boot(instance)
 
-        assert set(summary.failed_run_ids) == {started.run_id, starting.run_id}
-        assert summary.canceled_run_ids == [canceling.run_id]
-        assert instance.get_run_by_id(started.run_id).status == DagsterRunStatus.FAILURE
-        assert instance.get_run_by_id(starting.run_id).status == DagsterRunStatus.FAILURE
+        assert set(summary.canceled_run_ids) == {started.run_id, starting.run_id, canceling.run_id}
+        assert instance.get_run_by_id(started.run_id).status == DagsterRunStatus.CANCELED
+        assert instance.get_run_by_id(starting.run_id).status == DagsterRunStatus.CANCELED
         assert instance.get_run_by_id(canceling.run_id).status == DagsterRunStatus.CANCELED
         assert instance.get_run_by_id(successful.run_id).status == DagsterRunStatus.SUCCESS
 
@@ -39,5 +38,5 @@ def test_clear_in_progress_runs_at_boot_is_idempotent() -> None:
         first_summary = clear_in_progress_runs_at_boot(instance)
         second_summary = clear_in_progress_runs_at_boot(instance)
 
-        assert first_summary.failed_run_ids == [started.run_id]
+        assert first_summary.canceled_run_ids == [started.run_id]
         assert second_summary.cleared_count == 0

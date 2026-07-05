@@ -16,13 +16,12 @@ BOOT_CLEAR_STATUSES = (
 
 @dataclass(frozen=True)
 class BootRunCleanupSummary:
-    failed_run_ids: list[str] = field(default_factory=list)
     canceled_run_ids: list[str] = field(default_factory=list)
     skipped_run_ids: list[str] = field(default_factory=list)
 
     @property
     def cleared_count(self) -> int:
-        return len(self.failed_run_ids) + len(self.canceled_run_ids)
+        return len(self.canceled_run_ids)
 
 
 def clear_in_progress_runs_at_boot(instance: DagsterInstance) -> BootRunCleanupSummary:
@@ -30,7 +29,6 @@ def clear_in_progress_runs_at_boot(instance: DagsterInstance) -> BootRunCleanupS
         filters=RunsFilter(statuses=BOOT_CLEAR_STATUSES),
         ascending=True,
     )
-    failed_run_ids: list[str] = []
     canceled_run_ids: list[str] = []
     skipped_run_ids: list[str] = []
 
@@ -40,27 +38,21 @@ def clear_in_progress_runs_at_boot(instance: DagsterInstance) -> BootRunCleanupS
             skipped_run_ids.append(record.dagster_run.run_id)
             continue
 
-        if run.status == DagsterRunStatus.CANCELING:
-            instance.report_run_canceled(
-                run,
-                message=(
-                    "Marked canceled during Dagster boot cleanup because this run was still "
-                    "canceling before the container started."
-                ),
-            )
-            canceled_run_ids.append(run.run_id)
-        else:
-            instance.report_run_failed(
-                run,
-                message=(
-                    "Marked failed during Dagster boot cleanup because this run was still "
-                    "in progress before the container started."
-                ),
-            )
-            failed_run_ids.append(run.run_id)
+        # A container swap (every push to main auto-deploys) is an external
+        # interruption, not a failure of the run itself. Report CANCELED, not
+        # FAILURE, so failure dashboards and run-status queries only carry
+        # runs that actually errored; the keepalive/schedule sensors relaunch
+        # interrupted work either way.
+        instance.report_run_canceled(
+            run,
+            message=(
+                "Marked canceled during Dagster boot cleanup because this run was still "
+                "in progress before the container started."
+            ),
+        )
+        canceled_run_ids.append(run.run_id)
 
     return BootRunCleanupSummary(
-        failed_run_ids=failed_run_ids,
         canceled_run_ids=canceled_run_ids,
         skipped_run_ids=skipped_run_ids,
     )
@@ -83,9 +75,8 @@ def main() -> None:
 
     summary = clear_in_progress_runs_at_boot(DagsterInstance.get())
     print(
-        "Dagster boot cleanup cleared "
-        f"{summary.cleared_count} in-progress runs "
-        f"({len(summary.failed_run_ids)} failed, {len(summary.canceled_run_ids)} canceled)."
+        "Dagster boot cleanup canceled "
+        f"{summary.cleared_count} in-progress runs."
     )
 
 
