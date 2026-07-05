@@ -961,6 +961,18 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
             """,
             (f"s{seq}", seq, _NOW, role, text, _NOW),
         )
+    # The same long opening prompt recurring across sessions = a scheduled
+    # routine, not a human typing it four days in a row.
+    monitor_prompt = "Monitor and debug the example service in production, checking dashboards"
+    for day in range(4):
+        warehouse._command(
+            """
+            INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+                                              role, text, entrypoint, ingested_at)
+            VALUES ('claude_code', %s, 'r0', 0, %s, 'user', %s, 'cli', %s)
+            """,
+            (f"routine-{day}", _NOW - timedelta(days=day), monitor_prompt, _NOW),
+        )
 
     # --- calendar: feeds, promo invites, flighty ------------------------------
     warehouse._command(
@@ -1034,6 +1046,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("claude_code|empty-sess") == 5, "zero-user-turn transcripts are machinery"
     assert priority_of("claude_desktop|desktop-conv") == 1, "desktop conversations are his even header-only"
     assert priority_of("claude_code|side-sess") == 5, "sidechain-only subagent transcripts are machinery"
+    assert priority_of("claude_code|routine-0") == 5, "recurring template prompts are scheduled routines"
     # calendar
     assert priority_of("z@x.test|cal1|ev-feed") == 4, "subscribed calendar feeds are noise"
     assert priority_of("z@x.test|cal1|ev-promo") == 4, "promo-invite blasts are noise"

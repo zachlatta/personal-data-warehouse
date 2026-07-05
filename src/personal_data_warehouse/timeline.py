@@ -365,7 +365,8 @@ _GMAIL_EMAIL = _simple_adapter(
         "                    WHERE a ILIKE '%%mention@noreply.github.com%%' "
         "                       OR a ILIKE '%%author@noreply.github.com%%') THEN 2 "
         f"       WHEN t.from_address ~* '\\[bot\\]' OR t.subject ~* {_GMAIL_CI_SUBJECT_PATTERN} "
-        f"         OR t.snippet ~* {_GMAIL_RELAYED_BOT_BODY_PATTERN} THEN 4 "
+        f"         OR t.snippet ~* {_GMAIL_RELAYED_BOT_BODY_PATTERN} "
+        "         OR t.subject ~* '^(re: )?\\[[^\\]]+\\] bump ' THEN 4 "
         "       ELSE 3 END "
         f"WHEN t.subject ~* {_GMAIL_RSVP_SUBJECT_PATTERN} THEN 3 "
         f"WHEN 'CATEGORY_FORUMS' = ANY(t.label_ids) AND t.from_address !~* {_GMAIL_BULK_SENDER_PATTERN} THEN 3 "
@@ -1077,6 +1078,15 @@ def _agent_session_adapter() -> TimelineAdapter:
                    THEN {TIMELINE_PRIORITY_BACKGROUND}
                  WHEN s.user_event_count = 0 THEN {TIMELINE_PRIORITY_BACKGROUND}
                  WHEN s.non_sidechain_count = 0 THEN {TIMELINE_PRIORITY_BACKGROUND}
+                 -- The same long opening prompt recurring across sessions is a
+                 -- scheduled routine (daily monitor runs), not a human typing.
+                 WHEN length(COALESCE(fp.text, '')) > 40 AND (
+                      SELECT count(*) FROM (
+                          SELECT 1 FROM agent_session_events rep
+                          WHERE rep.role = 'user' AND rep.seq <= 5
+                            AND left(rep.text, 64) = left(fp.text, 64)
+                          LIMIT 4) reps) >= 4
+                   THEN {TIMELINE_PRIORITY_BACKGROUND}
                  ELSE {TIMELINE_PRIORITY_SELF} END AS priority
         FROM (
             SELECT

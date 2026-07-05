@@ -336,6 +336,14 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "(account, (left(regexp_replace(lower(subject), '^((re|fwd|fw)(\\[\\d+\\])?:\\s*)+', ''), 24)), "
         "internal_date)",
     ),
+    # First-prompt template lookups for the timeline's scheduled-session
+    # detection (the agent_session adapter); expression must match the probe.
+    IndexSpec(
+        "agent_session_events_first_prompt_idx",
+        "agent_session_events",
+        "CREATE INDEX IF NOT EXISTS agent_session_events_first_prompt_idx ON agent_session_events "
+        "((left(text, 64))) WHERE role = 'user' AND seq <= 5",
+    ),
     IndexSpec(
         "gmail_messages_internal_date_idx",
         "gmail_messages",
