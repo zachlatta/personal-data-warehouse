@@ -248,6 +248,7 @@ class VoiceMemosEnrichmentRunner:
                     result=result,
                     contact_alias_hints=contact_alias_hints,
                 )
+                result = withhold_low_confidence_resolved_speaker_names(result)
                 self._warehouse.insert_apple_voice_memos_enrichments(
                     [
                         enrichment_row(
@@ -673,6 +674,143 @@ def _rewrite_contact_alias_text(text: str, replacements: Sequence[tuple[str, str
             pattern = re.compile(rf"(?<![A-Za-z]){re.escape(alias)}(?![A-Za-z])(?!(?:\s+[A-Z][a-z]+))")
         rewritten = pattern.sub(replacement, rewritten)
     return rewritten
+
+
+LOW_CONFIDENCE_RESOLVED_SPEAKER_THRESHOLD = 0.9
+LOW_CONFIDENCE_SPEAKER_EVIDENCE = (
+    "Withheld a low-confidence resolved speaker name; keep this diarization label unresolved until identity is verified."
+)
+
+
+def withhold_low_confidence_resolved_speaker_names(result: Mapping[str, Any]) -> dict[str, Any]:
+    speaker_map = result.get("speaker_map")
+    if not isinstance(speaker_map, list):
+        return dict(result)
+
+    replacements: list[tuple[str, str, str]] = []
+    updated_speaker_map: list[Any] = []
+    changed = False
+    for item in speaker_map:
+        if not isinstance(item, Mapping):
+            updated_speaker_map.append(item)
+            continue
+        name = str(item.get("speaker_name") or "").strip()
+        confidence = float(item.get("confidence") or 0)
+        label = str(item.get("speaker_label") or "").strip()
+        if not low_confidence_resolved_speaker_name(name=name, confidence=confidence):
+            updated_speaker_map.append(dict(item))
+            continue
+
+        changed = True
+        unresolved_name = unresolved_speaker_label(label)
+        prose_name = first_name_for_low_confidence_speaker(name) or unresolved_name
+        replacements.append((name, prose_name, unresolved_name))
+        updated_item = dict(item)
+        updated_item["speaker_name"] = unresolved_name
+        updated_item["evidence"] = LOW_CONFIDENCE_SPEAKER_EVIDENCE
+        updated_speaker_map.append(updated_item)
+
+    if not changed:
+        return dict(result)
+
+    current = _rewrite_low_confidence_speaker_value(dict(result), replacements)
+    current["speaker_map"] = _rewrite_low_confidence_speaker_value(updated_speaker_map, replacements)
+    current["participants"] = dedupe_preserving_order(
+        _rewrite_low_confidence_speaker_value(result_participants(current), replacements)
+    )
+    current["transcript"] = rewrite_low_confidence_speaker_transcript(result_transcript(result), replacements)
+
+    issues = current.get("__validation_issues")
+    if isinstance(issues, list):
+        current["__validation_issues"] = [
+            issue for issue in issues if not low_confidence_issue_for_withheld_name(str(issue), replacements)
+        ]
+        if not current["__validation_issues"]:
+            current.pop("__validation_issues", None)
+
+    evidence = current.get("evidence")
+    if isinstance(evidence, list) and LOW_CONFIDENCE_SPEAKER_EVIDENCE not in evidence:
+        evidence.append(LOW_CONFIDENCE_SPEAKER_EVIDENCE)
+    return current
+
+
+def low_confidence_resolved_speaker_name(*, name: str, confidence: float) -> bool:
+    if confidence >= LOW_CONFIDENCE_RESOLVED_SPEAKER_THRESHOLD:
+        return False
+    if unresolved_speaker_name_for_enrichment(name):
+        return False
+    return looks_like_full_or_initial_person_name(name)
+
+
+def looks_like_full_or_initial_person_name(name: str) -> bool:
+    parts = [part.strip(".,") for part in name.split() if part.strip(".,")]
+    return len(parts) >= 2
+
+
+def unresolved_speaker_label(label: str) -> str:
+    return f"Unresolved speaker (label {label})" if label else "Unresolved speaker"
+
+
+def first_name_for_low_confidence_speaker(name: str) -> str:
+    first = name.split()[0].strip(".,") if name.split() else ""
+    return first if first else ""
+
+
+def _rewrite_low_confidence_speaker_value(value: Any, replacements: Sequence[tuple[str, str, str]]) -> Any:
+    if isinstance(value, str):
+        rewritten = value
+        for original, prose_name, _unresolved_name in replacements:
+            rewritten = replace_person_name_phrase(rewritten, original=original, replacement=prose_name)
+        return rewritten
+    if isinstance(value, Mapping):
+        return {key: _rewrite_low_confidence_speaker_value(item, replacements) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rewrite_low_confidence_speaker_value(item, replacements) for item in value]
+    return value
+
+
+def replace_person_name_phrase(text: str, *, original: str, replacement: str) -> str:
+    if not original or original == replacement:
+        return text
+    pattern = re.compile(rf"(?<![A-Za-z]){re.escape(original)}(?![A-Za-z])")
+    return pattern.sub(replacement, text)
+
+
+def rewrite_low_confidence_speaker_transcript(
+    transcript: str,
+    replacements: Sequence[tuple[str, str, str]],
+) -> str:
+    rewritten = transcript
+    for original, _prose_name, unresolved_name in replacements:
+        pattern = re.compile(rf"(?m)^{re.escape(original)}:")
+        rewritten = pattern.sub(f"{unresolved_name}:", rewritten)
+    for original, prose_name, _unresolved_name in replacements:
+        rewritten = replace_person_name_phrase(rewritten, original=original, replacement=prose_name)
+    return rewritten
+
+
+def low_confidence_issue_for_withheld_name(issue: str, replacements: Sequence[tuple[str, str, str]]) -> bool:
+    normalized = issue.lower()
+    if "low confidence" not in normalized:
+        return False
+    return any(
+        original.lower() in normalized or prose_name.lower() in normalized
+        for original, prose_name, _unresolved_name in replacements
+    )
+
+
+def dedupe_preserving_order(values: Any) -> list[Any]:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray)):
+        return []
+    deduped: list[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        key = str(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value)
+    return deduped
 
 
 def parse_attendee_summaries(attendees_json: str) -> list[str]:

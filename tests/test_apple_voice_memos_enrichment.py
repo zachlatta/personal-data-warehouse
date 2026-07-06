@@ -24,6 +24,7 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
     possible_identity_names_from_text,
     recording_time_interpretations,
     validate_enrichment_result,
+    withhold_low_confidence_resolved_speaker_names,
 )
 from personal_data_warehouse.agent_runner import AgentRunResult
 
@@ -250,6 +251,64 @@ def test_validate_enrichment_result_flags_low_confidence_resolved_speaker_names(
 
     assert any("Jordan Ellis" in issue and "low confidence" in issue for issue in issues)
     assert any("ambiguous speaker_name" in issue for issue in issues)
+
+
+def test_withhold_low_confidence_resolved_speaker_names_removes_unsafe_surnames() -> None:
+    result = withhold_low_confidence_resolved_speaker_names(
+        {
+            "__validation_issues": [
+                "speaker A maps to resolved name 'Candidate Alpha' with low confidence 0.58",
+            ],
+            "participants": ["Candidate Alpha", "Verified Beta"],
+            "speaker_map": [
+                {
+                    "speaker_label": "A",
+                    "speaker_name": "Candidate Alpha",
+                    "confidence": 0.58,
+                    "evidence": "First-name-only lookup found Candidate Alpha.",
+                },
+                {
+                    "speaker_label": "B",
+                    "speaker_name": "Verified Beta",
+                    "confidence": 0.95,
+                    "evidence": "Direct self-introduction.",
+                },
+            ],
+            "transcript": "Candidate Alpha: I can help.\nVerified Beta: Thanks Candidate Alpha.",
+            "summary": "Candidate Alpha and Verified Beta discussed the plan.",
+            "action_items": ["Candidate Alpha will follow up."],
+            "evidence": ["Warehouse lookup weakly suggested Candidate Alpha."],
+        }
+    )
+
+    assert result["participants"] == ["Candidate", "Verified Beta"]
+    assert result["speaker_map"][0]["speaker_name"] == "Unresolved speaker (label A)"
+    assert result["speaker_map"][0]["evidence"].startswith("Withheld a low-confidence")
+    assert result["transcript"].splitlines()[0] == "Unresolved speaker (label A): I can help."
+    assert "Verified Beta: Thanks Candidate." in result["transcript"]
+    assert "Candidate Alpha" not in str(result)
+    assert "__validation_issues" not in result
+
+
+def test_withhold_low_confidence_resolved_speaker_names_leaves_first_names() -> None:
+    result = withhold_low_confidence_resolved_speaker_names(
+        {
+            "participants": ["Candidate"],
+            "speaker_map": [
+                {
+                    "speaker_label": "A",
+                    "speaker_name": "Candidate",
+                    "confidence": 0.58,
+                    "evidence": "Only first name known.",
+                },
+            ],
+            "transcript": "Candidate: Hello.",
+        }
+    )
+
+    assert result["participants"] == ["Candidate"]
+    assert result["speaker_map"][0]["speaker_name"] == "Candidate"
+    assert result["transcript"] == "Candidate: Hello."
 
 
 def test_validate_enrichment_result_flags_slash_separated_candidate_speaker_names() -> None:
