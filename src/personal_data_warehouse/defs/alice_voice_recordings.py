@@ -25,7 +25,7 @@ from personal_data_warehouse_alice_voice_recordings.gmail_recovery import (
 from personal_data_warehouse_alice_voice_recordings.sync import SOURCE, AliceVoiceRecordingsImportRunner
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
-ALICE_VOICE_RECORDINGS_IMPORT_POSTGRES_LOCK_ID = 7_403_111_840
+ALICE_VOICE_RECORDINGS_IMPORT_POSTGRES_LOCK_ID = 7_403_111_845
 
 
 def _alice_object_store(config, settings):

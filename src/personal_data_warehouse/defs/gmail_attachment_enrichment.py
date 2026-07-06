@@ -35,7 +35,7 @@ from personal_data_warehouse.schedule_guards import skip_if_job_active, skip_if_
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
-GMAIL_ATTACHMENT_ENRICHMENT_POSTGRES_LOCK_ID = 7_403_111_842
+GMAIL_ATTACHMENT_ENRICHMENT_POSTGRES_LOCK_ID = 7_403_111_844
 DEFAULT_GMAIL_ATTACHMENT_ENRICHMENT_BATCH_SIZE = 25
 GMAIL_ATTACHMENT_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 120
 GMAIL_ATTACHMENT_ENRICHMENT_BATCH_SIZE_ENV = "GMAIL_ATTACHMENT_ENRICHMENT_BATCH_SIZE"

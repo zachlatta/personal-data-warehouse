@@ -35,7 +35,7 @@ from personal_data_warehouse.schedule_guards import skip_if_job_active, skip_if_
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
-WHATSAPP_MEDIA_ENRICHMENT_POSTGRES_LOCK_ID = 8_407_112_443
+WHATSAPP_MEDIA_ENRICHMENT_POSTGRES_LOCK_ID = 8_407_112_467
 DEFAULT_WHATSAPP_MEDIA_ENRICHMENT_BATCH_SIZE = 25
 WHATSAPP_MEDIA_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 120
 WHATSAPP_MEDIA_ENRICHMENT_BATCH_SIZE_ENV = "WHATSAPP_MEDIA_ENRICHMENT_BATCH_SIZE"

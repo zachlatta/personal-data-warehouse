@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import personal_data_warehouse.defs.slack_sync as slack_defs
@@ -32,6 +34,39 @@ from personal_data_warehouse.sync_locks import (
     exclusive_sync_lock,
     lock_env_prefix,
 )
+
+
+def test_advisory_lock_ids_are_unique() -> None:
+    source_dir = (
+        Path(__file__).resolve().parents[1] / "src" / "personal_data_warehouse"
+    )
+    assert source_dir.is_dir()
+
+    constant_pattern = re.compile(r"^([A-Z_]*LOCK_ID)\s*=\s*([0-9_]+)", re.MULTILINE)
+    derived_pattern = re.compile(
+        r"postgres_lock_id\s*=\s*([A-Z_]*LOCK_ID)\s*\+\s*(\d+)"
+    )
+    by_id: dict[int, list[str]] = {}
+
+    for path in sorted(source_dir.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        relative_path = path.relative_to(source_dir.parent)
+        constants: dict[str, int] = {}
+
+        for name, raw in constant_pattern.findall(text):
+            value = int(raw.replace("_", ""))
+            constants[name] = value
+            by_id.setdefault(value, []).append(f"{relative_path}:{name}")
+
+        for name, offset in derived_pattern.findall(text):
+            assert name in constants, (
+                f"unresolved advisory-lock id expression: {relative_path}:{name}"
+            )
+            value = constants[name] + int(offset)
+            by_id.setdefault(value, []).append(f"{relative_path}:{name} + {offset}")
+
+    collisions = {value: names for value, names in by_id.items() if len(names) > 1}
+    assert not collisions, f"advisory-lock id collisions: {collisions}"
 
 
 def test_lock_env_prefix_normalizes_names() -> None:
