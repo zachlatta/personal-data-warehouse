@@ -29,6 +29,12 @@ PROMPT_TRANSCRIPT_WITH_SEGMENTS_MAX_CHARS = 8_000
 PROMPT_TRANSCRIPT_WITHOUT_SEGMENTS_MAX_CHARS = 60_000
 PROMPT_CONTACT_ALIAS_HINTS_LIMIT = 20
 PROMPT_CONTACT_ALIAS_TERMS_LIMIT = 40
+PROMPT_EVENT_IDENTITY_TERMS_LIMIT = 8
+PROMPT_EVENT_IDENTITY_FIRST_NAMES_LIMIT = 12
+PROMPT_EVENT_IDENTITY_HINTS_LIMIT = 18
+PROMPT_EVENT_IDENTITY_SOURCE_LIMIT = 6
+PROMPT_EVENT_IDENTITY_CONTEXT_CHARS = 1600
+PROMPT_EVENT_IDENTITY_SNIPPET_CHARS = 600
 
 
 def _sql_string(value: str) -> str:
@@ -207,6 +213,12 @@ class VoiceMemosEnrichmentRunner:
                     recording=recording,
                     transcript_segments=transcript_segments,
                 )
+                event_identity_hints = load_event_identity_hints(
+                    self._warehouse,
+                    recording=recording,
+                    calendar_candidates=calendar_candidates,
+                    transcript_segments=transcript_segments,
+                )
                 prompt = enrichment_user_prompt(
                     input_file=AGENT_USER_PROMPT_INPUT_FILE,
                 )
@@ -215,6 +227,7 @@ class VoiceMemosEnrichmentRunner:
                     calendar_candidates=calendar_candidates,
                     transcript_segments=transcript_segments,
                     contact_alias_hints=contact_alias_hints,
+                    event_identity_hints=event_identity_hints,
                 )
                 result = self._client.create_agentic_structured(
                     system_prompt=enrichment_system_prompt(),
@@ -616,6 +629,522 @@ def nickname_values_from_json(value: str) -> list[str]:
         if alias and alias not in aliases:
             aliases.append(alias)
     return aliases
+
+
+def load_event_identity_hints(
+    warehouse,
+    *,
+    recording: Mapping[str, Any],
+    calendar_candidates: Sequence[Mapping[str, Any]],
+    transcript_segments: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    event_terms = event_identity_terms(
+        recording=recording,
+        calendar_candidates=calendar_candidates,
+        transcript_segments=transcript_segments,
+    )
+    first_name_terms = event_identity_first_names(
+        recording=recording,
+        transcript_segments=transcript_segments,
+        event_terms=event_terms,
+    )
+    hints: dict[str, Any] = {
+        "event_terms": event_terms,
+        "first_name_terms": first_name_terms,
+        "warehouse_snippets": [],
+    }
+    if not event_terms:
+        return hints
+
+    snippets: list[dict[str, Any]] = []
+    snippets.extend(load_drive_event_identity_snippets(warehouse, event_terms, first_name_terms))
+    snippets.extend(load_gmail_event_identity_snippets(warehouse, recording, event_terms, first_name_terms))
+    snippets.extend(load_slack_event_identity_snippets(warehouse, recording, event_terms, first_name_terms))
+    hints["warehouse_snippets"] = dedupe_event_identity_snippets(snippets)[:PROMPT_EVENT_IDENTITY_HINTS_LIMIT]
+    return hints
+
+
+def event_identity_terms(
+    *,
+    recording: Mapping[str, Any],
+    calendar_candidates: Sequence[Mapping[str, Any]],
+    transcript_segments: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def add(term: str) -> None:
+        normalized = normalize_event_identity_term(term)
+        if not normalized:
+            return
+        key = normalized.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        terms.append(normalized)
+
+    for candidate in calendar_candidates[:5]:
+        summary = str(candidate.get("summary") or "")
+        summary_phrases = event_context_phrases(summary)
+        for phrase in summary_phrases:
+            add(phrase)
+        if not summary_phrases:
+            for part in re.split(r"\s+(?:[-:|/]|–|—)\s+|,", summary):
+                add(part)
+
+    text_parts = [
+        str(recording.get("title") or ""),
+        str(recording.get("transcript_text") or "")[:PROMPT_TRANSCRIPT_WITH_SEGMENTS_MAX_CHARS],
+    ]
+    text_parts.extend(str(segment.get("text") or "") for segment in transcript_segments[:400])
+    for phrase in event_context_phrases("\n".join(text_parts)):
+        add(phrase)
+
+    return terms[:PROMPT_EVENT_IDENTITY_TERMS_LIMIT]
+
+
+def event_identity_first_names(
+    *,
+    recording: Mapping[str, Any],
+    transcript_segments: Sequence[Mapping[str, Any]],
+    event_terms: Sequence[str] = (),
+) -> list[str]:
+    event_words = {
+        word.casefold()
+        for term in event_terms
+        for word in re.findall(r"[A-Za-z][A-Za-z'-]*", term)
+    }
+    first_names: list[str] = []
+    seen: set[str] = set()
+    for term in contact_alias_terms(recording=recording, transcript_segments=transcript_segments):
+        normalized = term.casefold()
+        if normalized in seen or normalized in event_words or normalized in EVENT_IDENTITY_FIRST_NAME_STOPWORDS:
+            continue
+        if not re.fullmatch(r"[A-Z][A-Za-z'-]{2,30}", term):
+            continue
+        seen.add(normalized)
+        first_names.append(term)
+        if len(first_names) >= PROMPT_EVENT_IDENTITY_FIRST_NAMES_LIMIT:
+            break
+    return first_names
+
+
+def event_context_phrases(text: str) -> list[str]:
+    phrases: list[str] = []
+    proper_phrase = r"[A-Z][A-Za-z0-9&'.-]*(?:\s+[A-Z][A-Za-z0-9&'.-]*){0,3}"
+    patterns = [
+        rf"\b(?:at|during|inside|planning|organizing|running|hosting|staffing)\s+({proper_phrase})",
+        rf"\b({proper_phrase}\s+(?:team|staff|organizers?|organising team|organizing team|event|camp|summit|conference|retreat|week))\b",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            phrases.append(match.group(1))
+    return phrases
+
+
+def normalize_event_identity_term(value: str) -> str:
+    term = re.sub(r"\s+", " ", value.strip(" \t\r\n:;,.!?()[]{}\"'"))
+    if not term:
+        return ""
+    words = re.findall(r"[A-Za-z][A-Za-z0-9&'.-]*", term)
+    if not words:
+        return ""
+    normalized = " ".join(words[:4])
+    key = normalized.casefold()
+    if key in EVENT_IDENTITY_TERM_STOPWORDS:
+        return ""
+    if all(word.casefold() in EVENT_IDENTITY_TERM_STOPWORDS for word in words):
+        return ""
+    if words[0].casefold() in EVENT_IDENTITY_GENERIC_LEADING_STOPWORDS:
+        return ""
+    if len(normalized) < 4 and len(words) == 1:
+        return ""
+    return normalized
+
+
+EVENT_IDENTITY_TERM_STOPWORDS = {
+    "agenda",
+    "ai",
+    "all",
+    "and",
+    "asr",
+    "at",
+    "birthday",
+    "breakfast",
+    "briefing",
+    "call",
+    "catch",
+    "chat",
+    "check",
+    "checkin",
+    "coffee",
+    "daily",
+    "debrief",
+    "discussion",
+    "draft",
+    "email",
+    "event",
+    "follow",
+    "friday",
+    "fwd",
+    "google",
+    "hack",
+    "club",
+    "hangout",
+    "hello",
+    "intro",
+    "lunch",
+    "meeting",
+    "monday",
+    "notes",
+    "one",
+    "planning",
+    "prep",
+    "re",
+    "review",
+    "saturday",
+    "slack",
+    "standup",
+    "sunday",
+    "sync",
+    "team",
+    "thursday",
+    "tuesday",
+    "utc",
+    "wednesday",
+    "weekly",
+    "with",
+    "zoom",
+}
+
+
+EVENT_IDENTITY_GENERIC_LEADING_STOPWORDS = {
+    "agenda",
+    "breakfast",
+    "briefing",
+    "call",
+    "catch",
+    "chat",
+    "check",
+    "checkin",
+    "coffee",
+    "daily",
+    "debrief",
+    "discussion",
+    "draft",
+    "email",
+    "follow",
+    "hangout",
+    "hello",
+    "intro",
+    "lunch",
+    "meeting",
+    "notes",
+    "planning",
+    "prep",
+    "re",
+    "review",
+    "standup",
+    "sync",
+    "weekly",
+    "zoom",
+}
+
+
+EVENT_IDENTITY_FIRST_NAME_STOPWORDS = CONTACT_ALIAS_STOPWORDS | {
+    "actually",
+    "again",
+    "almost",
+    "also",
+    "and",
+    "april",
+    "august",
+    "because",
+    "but",
+    "candidate",
+    "china",
+    "club",
+    "cool",
+    "definitely",
+    "december",
+    "else",
+    "everyone",
+    "everything",
+    "february",
+    "great",
+    "guess",
+    "has",
+    "hey",
+    "hospital",
+    "however",
+    "it",
+    "it's",
+    "january",
+    "july",
+    "june",
+    "hello",
+    "monday",
+    "like",
+    "mandarin",
+    "march",
+    "may",
+    "maybe",
+    "mcs",
+    "nice",
+    "november",
+    "october",
+    "okay",
+    "otherwise",
+    "pcp",
+    "please",
+    "probably",
+    "really",
+    "right",
+    "saturday",
+    "september",
+    "she",
+    "should",
+    "someone",
+    "something",
+    "sometimes",
+    "sorry",
+    "sunday",
+    "sure",
+    "that",
+    "that's",
+    "thanks",
+    "the",
+    "there",
+    "they",
+    "thing",
+    "think",
+    "this",
+    "thursday",
+    "then",
+    "tuesday",
+    "today",
+    "tomorrow",
+    "wednesday",
+    "verified",
+    "you",
+    "yeah",
+    "yep",
+    "yesterday",
+}
+
+
+EVENT_IDENTITY_TEAM_CONTEXT_TERMS = (
+    "team",
+    "staff",
+    "organizer",
+    "organizers",
+    "organizing",
+    "crew",
+    "roster",
+    "running",
+    "hosting",
+)
+
+
+def load_drive_event_identity_snippets(
+    warehouse,
+    event_terms: Sequence[str],
+    first_name_terms: Sequence[str],
+) -> list[dict[str, Any]]:
+    try:
+        rows = warehouse._query(
+            f"""
+            SELECT
+                COALESCE(f.modified_time, t.source_modified_time) AS occurred_at,
+                f.name,
+                left(COALESCE(t.text, ''), {PROMPT_EVENT_IDENTITY_CONTEXT_CHARS}) AS text
+            FROM google_drive_file_texts AS t
+            INNER JOIN google_drive_files AS f
+              ON f.account = t.account
+             AND f.file_id = t.file_id
+            WHERE t.text_extraction_status = 'ok'
+              AND f.trashed = 0
+              AND f.is_excluded = 0
+              AND {event_identity_match_sql("COALESCE(f.name, '') || ' ' || COALESCE(t.text, '')", event_terms)}
+              AND {event_identity_person_or_team_match_sql("COALESCE(f.name, '') || ' ' || COALESCE(t.text, '')", first_name_terms)}
+            ORDER BY COALESCE(f.modified_time, t.source_modified_time) DESC NULLS LAST
+            LIMIT {PROMPT_EVENT_IDENTITY_SOURCE_LIMIT}
+            """
+        )
+    except Exception:
+        return []
+    snippets: list[dict[str, Any]] = []
+    for occurred_at, title, text in rows:
+        snippets.append(
+            event_identity_snippet(
+                source="google_drive_file_texts",
+                occurred_at=occurred_at,
+                title=str(title),
+                text=str(text),
+                event_terms=event_terms,
+                first_name_terms=first_name_terms,
+            )
+        )
+    return snippets
+
+
+def load_gmail_event_identity_snippets(
+    warehouse,
+    recording: Mapping[str, Any],
+    event_terms: Sequence[str],
+    first_name_terms: Sequence[str],
+) -> list[dict[str, Any]]:
+    try:
+        rows = warehouse._query(
+            f"""
+            SELECT
+                internal_date,
+                from_address,
+                subject,
+                COALESCE(snippet, '') || ' ' || left(COALESCE(body_text, ''), {PROMPT_EVENT_IDENTITY_CONTEXT_CHARS}) AS text
+            FROM gmail_messages
+            WHERE is_deleted = 0
+              AND {event_identity_time_window_sql(recording, "internal_date")}
+              AND {event_identity_match_sql("COALESCE(from_address, '') || ' ' || COALESCE(subject, '') || ' ' || COALESCE(snippet, '') || ' ' || COALESCE(body_text, '')", event_terms)}
+              AND {event_identity_person_or_team_match_sql("COALESCE(from_address, '') || ' ' || COALESCE(subject, '') || ' ' || COALESCE(snippet, '') || ' ' || COALESCE(body_text, '')", first_name_terms)}
+            ORDER BY internal_date DESC
+            LIMIT {PROMPT_EVENT_IDENTITY_SOURCE_LIMIT}
+            """
+        )
+    except Exception:
+        return []
+    snippets: list[dict[str, Any]] = []
+    for occurred_at, from_address, subject, text in rows:
+        snippets.append(
+            event_identity_snippet(
+                source="gmail_messages",
+                occurred_at=occurred_at,
+                title=f"{subject} ({from_address})",
+                text=str(text),
+                event_terms=event_terms,
+                first_name_terms=first_name_terms,
+            )
+        )
+    return snippets
+
+
+def load_slack_event_identity_snippets(
+    warehouse,
+    recording: Mapping[str, Any],
+    event_terms: Sequence[str],
+    first_name_terms: Sequence[str],
+) -> list[dict[str, Any]]:
+    try:
+        rows = warehouse._query(
+            f"""
+            SELECT
+                m.message_datetime,
+                COALESCE(NULLIF(u.real_name, ''), NULLIF(u.display_name, ''), NULLIF(u.name, ''), m.username, '') AS speaker,
+                m.text
+            FROM slack_messages AS m
+            LEFT JOIN slack_users AS u
+              ON u.account = m.account
+             AND u.team_id = m.team_id
+             AND u.user_id = m.user_id
+            WHERE m.is_deleted = 0
+              AND {event_identity_time_window_sql(recording, "m.message_datetime")}
+              AND {event_identity_match_sql("COALESCE(m.text, '')", event_terms)}
+              AND {event_identity_person_or_team_match_sql("COALESCE(m.text, '')", first_name_terms)}
+            ORDER BY m.message_datetime DESC
+            LIMIT {PROMPT_EVENT_IDENTITY_SOURCE_LIMIT}
+            """
+        )
+    except Exception:
+        return []
+    snippets: list[dict[str, Any]] = []
+    for occurred_at, speaker, text in rows:
+        snippets.append(
+            event_identity_snippet(
+                source="slack_messages",
+                occurred_at=occurred_at,
+                title=str(speaker),
+                text=str(text),
+                event_terms=event_terms,
+                first_name_terms=first_name_terms,
+            )
+        )
+    return snippets
+
+
+def event_identity_match_sql(field_sql: str, terms: Sequence[str]) -> str:
+    clauses = [f"{field_sql} ILIKE {_sql_like_contains(term)} ESCAPE E'\\\\'" for term in terms if term]
+    return "(" + " OR ".join(clauses) + ")" if clauses else "FALSE"
+
+
+def event_identity_person_or_team_match_sql(field_sql: str, first_name_terms: Sequence[str]) -> str:
+    candidates = [*first_name_terms, *EVENT_IDENTITY_TEAM_CONTEXT_TERMS]
+    clauses = [f"{field_sql} ILIKE {_sql_like_contains(candidate)} ESCAPE E'\\\\'" for candidate in candidates if candidate]
+    return "(" + " OR ".join(clauses) + ")" if clauses else "FALSE"
+
+
+def event_identity_time_window_sql(recording: Mapping[str, Any], field_sql: str) -> str:
+    recorded_at = recording.get("recorded_at")
+    if not isinstance(recorded_at, datetime):
+        return "TRUE"
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=UTC)
+    start = recorded_at.astimezone(UTC) - timedelta(days=90)
+    end = recorded_at.astimezone(UTC) + timedelta(days=14)
+    return (
+        f"{field_sql} >= {_sql_string(start.isoformat())}::timestamptz "
+        f"AND {field_sql} <= {_sql_string(end.isoformat())}::timestamptz"
+    )
+
+
+def event_identity_snippet(
+    *,
+    source: str,
+    occurred_at: Any,
+    title: str,
+    text: str,
+    event_terms: Sequence[str],
+    first_name_terms: Sequence[str],
+) -> dict[str, Any]:
+    snippet_terms = [*first_name_terms, *event_terms, *EVENT_IDENTITY_TEAM_CONTEXT_TERMS]
+    snippet = focused_text_snippet(text, snippet_terms, max_chars=PROMPT_EVENT_IDENTITY_SNIPPET_CHARS)
+    return {
+        "source": source,
+        "occurred_at": occurred_at.isoformat() if hasattr(occurred_at, "isoformat") else str(occurred_at or ""),
+        "title": title[:240],
+        "snippet": snippet,
+    }
+
+
+def focused_text_snippet(text: str, terms: Sequence[str], *, max_chars: int) -> str:
+    compacted = re.sub(r"\s+", " ", text).strip()
+    if len(compacted) <= max_chars:
+        return compacted
+    lowered = compacted.casefold()
+    indexes = [lowered.find(term.casefold()) for term in terms if term and lowered.find(term.casefold()) >= 0]
+    center = min(indexes) if indexes else 0
+    start = max(0, center - max_chars // 3)
+    end = min(len(compacted), start + max_chars)
+    start = max(0, end - max_chars)
+    prefix = "..." if start else ""
+    suffix = "..." if end < len(compacted) else ""
+    return f"{prefix}{compacted[start:end]}{suffix}"
+
+
+def dedupe_event_identity_snippets(snippets: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for snippet in snippets:
+        compact = prompt_event_identity_snippet(snippet)
+        key = (
+            compact.get("source", ""),
+            compact.get("title", ""),
+            compact.get("snippet", "")[:160],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(compact)
+    return deduped
 
 
 def apply_contact_alias_corrections(
@@ -1465,6 +1994,7 @@ def enrichment_user_prompt(*, input_file: str = AGENT_USER_PROMPT_INPUT_FILE) ->
                     "recorded_at_interpretations",
                     "calendar_candidates with compact attendee identity hints",
                     "contact_alias_hints from human-edited contact nicknames when transcript names match",
+                    "event_identity_hints with compact Slack/Gmail/Drive snippets for event-specific team and first-name resolution",
                     "truncated source transcript",
                     "diarized_segments",
                 ],
@@ -1497,6 +2027,7 @@ def enrichment_task_input(
     calendar_candidates: Sequence[Mapping[str, Any]],
     transcript_segments: Sequence[Mapping[str, Any]] = (),
     contact_alias_hints: Sequence[Mapping[str, Any]] = (),
+    event_identity_hints: Mapping[str, Any] | None = None,
 ) -> str:
     source_transcript = str(recording.get("transcript_text", ""))
     sanitized_segments = [prompt_transcript_segment(segment) for segment in transcript_segments]
@@ -1523,6 +2054,7 @@ def enrichment_task_input(
             else [],
             "calendar_candidates": [prompt_calendar_candidate(candidate) for candidate in calendar_candidates],
             "contact_alias_hints": [prompt_contact_alias_hint(hint) for hint in contact_alias_hints],
+            "event_identity_hints": prompt_event_identity_hints(event_identity_hints or {}),
             "transcript": transcript,
             "diarized_segments": sanitized_segments,
         },
@@ -1542,6 +2074,9 @@ def enrichment_instructions() -> list[str]:
         "Do not stop at a one-token name like a Slack display_name or calendar first name. Search Gmail/calendar/Slack context around the event title, email local part, usernames, candidate briefs, and prior messages until you find a full preferred/legal name or have clear evidence none is available.",
         "When a speaker is identified only by a first name, use calendar attendee emails plus Slack/email identity evidence to resolve the full name.",
         "Calendar candidates may include identity_hints for attendee emails. Use possible_names from identity_hints for attendee and speaker names when supported by transcript evidence.",
+        "When transcript, title, or calendar context names an event, program, trip, or retreat, use event_identity_hints and focused warehouse queries to identify the event's likely team, staff, organizers, roster, and attendees before accepting a full name for a first-name-only speaker.",
+        "For event recordings, search the event term together with the spoken first name across Slack, Gmail, Google Drive text, calendar, and contacts. Prefer event-specific organizer/team/roster evidence over broad global Slack first-name matches.",
+        "A global first-name Slack user result is not enough to assign a surname when event-specific context has not been checked or points to another person.",
         "Normalize spoken name mentions in transcript to verified participant spellings when ASR produces a close variant, especially in greetings and introductions.",
         "If the transcript says a person or organization name differently than the calendar candidate, query for that spoken name/project before deciding.",
         "contact_alias_hints come from human-edited Google Contacts nicknames. Use them as a source-of-truth candidate for bare first-name references, nicknames, and ASR name variants, then verify with recent Slack/Gmail/calendar context before expanding the name in summary, action items, evidence, or transcript.",
@@ -1649,6 +2184,29 @@ def prompt_contact_alias_hint(hint: Mapping[str, Any]) -> dict[str, Any]:
         "source_kind": str(hint.get("source_kind") or ""),
         "account": str(hint.get("account") or ""),
         "card_id": str(hint.get("card_id") or ""),
+    }
+
+
+def prompt_event_identity_hints(hints: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "event_terms": [str(term) for term in list(hints.get("event_terms") or [])[:PROMPT_EVENT_IDENTITY_TERMS_LIMIT]],
+        "first_name_terms": [
+            str(term) for term in list(hints.get("first_name_terms") or [])[:PROMPT_EVENT_IDENTITY_FIRST_NAMES_LIMIT]
+        ],
+        "warehouse_snippets": [
+            prompt_event_identity_snippet(snippet)
+            for snippet in list(hints.get("warehouse_snippets") or [])[:PROMPT_EVENT_IDENTITY_HINTS_LIMIT]
+            if isinstance(snippet, Mapping)
+        ],
+    }
+
+
+def prompt_event_identity_snippet(snippet: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "source": str(snippet.get("source") or ""),
+        "occurred_at": str(snippet.get("occurred_at") or ""),
+        "title": str(snippet.get("title") or "")[:240],
+        "snippet": str(snippet.get("snippet") or "")[:PROMPT_EVENT_IDENTITY_SNIPPET_CHARS],
     }
 
 

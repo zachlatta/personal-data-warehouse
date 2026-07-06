@@ -14,11 +14,14 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
     enrichment_schema,
     enrichment_task_input,
     enrichment_user_prompt,
+    event_identity_first_names,
+    event_identity_terms,
     load_calendar_candidates,
     canonicalize_text_verified_name_mentions,
     load_attendee_identity_hints,
     load_contact_alias_hints,
     load_enrichment_candidates,
+    load_event_identity_hints,
     normalize_corrected_transcript_prefixes,
     parse_attendee_summaries,
     possible_identity_names_from_text,
@@ -585,6 +588,10 @@ def test_enrichment_user_prompt_includes_task_rules_and_input_file_reference() -
     assert "Hard requirements: accurate date/time" in prompt
     assert "full name can be resolved" in prompt
     assert "calendar attendee emails plus Slack/email identity evidence" in prompt
+    assert "event_identity_hints" in prompt
+    assert "event's likely team, staff, organizers, roster, and attendees" in prompt
+    assert "Prefer event-specific organizer/team/roster evidence" in prompt
+    assert "global first-name Slack user result is not enough" in prompt
     assert "relevant_tables" not in prompt
     assert "calendar_events(account" not in prompt
     assert "identity_hints" in prompt
@@ -628,6 +635,18 @@ def test_enrichment_task_input_includes_diarized_segments_and_recording_context(
                 "card_id": "people/c1",
             }
         ],
+        event_identity_hints={
+            "event_terms": ["Launch Week"],
+            "first_name_terms": ["Nova"],
+            "warehouse_snippets": [
+                {
+                    "source": "google_drive_file_texts",
+                    "occurred_at": "2026-04-20T10:00:00+00:00",
+                    "title": "Launch Week Team Plan",
+                    "snippet": "Nova is listed with the Launch Week organizing team.",
+                }
+            ],
+        },
     )
 
     assert '"speaker_label": "A"' in task_input
@@ -635,6 +654,8 @@ def test_enrichment_task_input_includes_diarized_segments_and_recording_context(
     assert "diarized_segments" in task_input
     assert "contact_alias_hints" in task_input
     assert "Taylor Example" in task_input
+    assert "event_identity_hints" in task_input
+    assert "Launch Week Team Plan" in task_input
     assert "source of truth for speaker turns" not in task_input
 
 
@@ -682,6 +703,20 @@ def test_enrichment_task_input_omits_raw_provider_payload_fields() -> None:
                 "raw_result_json": "LEAK_SEGMENT_RAW",
             }
         ],
+        event_identity_hints={
+            "event_terms": ["Launch Week"],
+            "first_name_terms": ["Nova"],
+            "warehouse_snippets": [
+                {
+                    "source": "gmail_messages",
+                    "occurred_at": "2026-04-20T10:00:00+00:00",
+                    "title": "Launch Week",
+                    "snippet": "Nova is coordinating Launch Week.",
+                    "raw_result_json": "LEAK_EVENT_HINT_RAW",
+                }
+            ],
+            "raw_result_json": "LEAK_EVENT_HINT_ROOT",
+        },
     )
 
     assert "LEAK_" not in task_input
@@ -689,6 +724,99 @@ def test_enrichment_task_input_omits_raw_provider_payload_fields() -> None:
     assert "raw_result_json" not in task_input
     assert "subject 0" in task_input
     assert "subject 3" not in task_input
+
+
+def test_event_identity_terms_and_first_names_use_event_context() -> None:
+    recording = {
+        "title": "Voice memo",
+        "transcript_text": "At Launch Week, Nova asks Quill about the organizing team.",
+    }
+    transcript_segments = [
+        {
+            "segment_index": 0,
+            "speaker_label": "A",
+            "start_ms": 0,
+            "end_ms": 1000,
+            "confidence": 0.9,
+            "text": "At Launch Week, Nova asks Quill about the organizing team.",
+        }
+    ]
+
+    terms = event_identity_terms(
+        recording=recording,
+        calendar_candidates=[{"summary": "Launch Week - Team Dinner"}],
+        transcript_segments=transcript_segments,
+    )
+    first_names = event_identity_first_names(
+        recording=recording,
+        transcript_segments=transcript_segments,
+        event_terms=terms,
+    )
+
+    assert "Launch Week" in terms
+    assert "Nova" in first_names
+    assert "Quill" in first_names
+    assert "Launch" not in first_names
+
+
+def test_load_event_identity_hints_queries_event_specific_context() -> None:
+    queries = []
+
+    class Warehouse:
+        def _query(self, sql):
+            queries.append(sql)
+            if "FROM google_drive_file_texts" in sql:
+                return [
+                    (
+                        datetime(2026, 4, 20, tzinfo=UTC),
+                        "Launch Week Team Plan",
+                        "Nova and Quill are listed on the Launch Week organizing team.",
+                    )
+                ]
+            if "FROM gmail_messages" in sql:
+                return [
+                    (
+                        datetime(2026, 4, 21, tzinfo=UTC),
+                        "lead@example.com",
+                        "Launch Week roster",
+                        "Nova is coordinating Launch Week.",
+                    )
+                ]
+            if "FROM slack_messages" in sql:
+                return [
+                    (
+                        datetime(2026, 4, 22, tzinfo=UTC),
+                        "Coordinator",
+                        "Quill is helping staff Launch Week.",
+                    )
+                ]
+            return []
+
+    hints = load_event_identity_hints(
+        Warehouse(),
+        recording={
+            "recording_id": "rec1",
+            "recorded_at": datetime(2026, 4, 27, tzinfo=UTC),
+            "title": "Voice memo",
+            "transcript_text": "At Launch Week, Nova asks Quill about the plan.",
+        },
+        calendar_candidates=[{"summary": "Launch Week - Team Dinner"}],
+        transcript_segments=[],
+    )
+
+    assert "Launch Week" in hints["event_terms"]
+    assert "Nova" in hints["first_name_terms"]
+    assert "Quill" in hints["first_name_terms"]
+    assert {snippet["source"] for snippet in hints["warehouse_snippets"]} == {
+        "google_drive_file_texts",
+        "gmail_messages",
+        "slack_messages",
+    }
+    assert any("google_drive_file_texts" in query for query in queries)
+    assert any("gmail_messages" in query for query in queries)
+    assert any("slack_messages" in query for query in queries)
+    assert all("Launch Week" in query for query in queries)
+    assert all("Nova" in query for query in queries)
 
 
 def test_load_contact_alias_hints_reads_human_edited_contact_nicknames() -> None:
