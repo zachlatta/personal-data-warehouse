@@ -1021,6 +1021,7 @@ JSONB_COLUMNS_BY_TABLE = {
         "addresses",
         "organizations",
         "urls",
+        "nicknames",
         "groups",
         "dates",
         "photos",
@@ -1044,6 +1045,7 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
         "addresses",
         "organizations",
         "urls",
+        "nicknames",
         "groups",
         "photos",
     },
@@ -1283,6 +1285,7 @@ class PostgresWarehouse:
 
     def ensure_contacts_tables(self) -> None:
         self._ensure_table_group(["contact_cards", "contact_sync_state"])
+        self._command("ALTER TABLE contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
         self._ensure_clean_contacts_view()
         self._ensure_search_views_if_possible()
 
@@ -3713,7 +3716,7 @@ class PostgresWarehouse:
                     return False
                 expected_result = _operation_result_for_resource(result, resource_name)
                 result_etag = str(expected_result.get("etag") or "")
-                if result_etag and str(row["etag"]) != result_etag:
+                if result_etag and str(row["etag"]) != result_etag and not _contact_update_fields_observed(row, operation):
                     return False
             elif op == "delete_contact":
                 if self._contact_card(account=account, resource_name=resource_name) is not None:
@@ -6169,7 +6172,8 @@ class PostgresWarehouse:
                 notes,
                 source_updated_at,
                 synced_at,
-                raw_json
+                raw_json,
+                nicknames
             FROM contact_cards
             WHERE is_deleted = 0
             """
@@ -7126,6 +7130,23 @@ def _contact_update_fields(value: Any) -> list[str]:
     if unsupported:
         raise ValueError(f"unsupported update_person_fields: {', '.join(unsupported)}")
     return list(dict.fromkeys(normalized))
+
+
+def _contact_update_fields_observed(row: Mapping[str, Any], operation: Mapping[str, Any]) -> bool:
+    fields = {str(field) for field in operation.get("update_person_fields") or []}
+    person = _json_mapping(operation.get("person"))
+    if fields == {"nicknames"}:
+        expected = _contact_nickname_values(_json_list(person.get("nicknames")))
+        observed = _contact_nickname_values(_json_list(row.get("nicknames")))
+        observed.update(_contact_nickname_values(_json_list(_as_json_dict(row.get("raw_json")).get("nicknames"))))
+        if expected:
+            return expected <= observed
+        return not observed
+    return False
+
+
+def _contact_nickname_values(items: Sequence[Mapping[str, Any]]) -> set[str]:
+    return {str(item.get("value") or "").strip().casefold() for item in items if str(item.get("value") or "").strip()}
 
 
 def _contact_person_summary(person: Mapping[str, Any]) -> dict[str, Any]:

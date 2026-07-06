@@ -7,17 +7,19 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
     AGENT_ENRICHMENT_PROMPT_VERSION,
     ContainerAgentStructuredClient,
     LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+    apply_contact_alias_corrections,
     apply_segment_preserving_transcript_fallback,
     ensure_recording_level_fields,
     enrichment_row,
     enrichment_schema,
     enrichment_task_input,
     enrichment_user_prompt,
-    load_enrichment_candidates,
     load_calendar_candidates,
-    normalize_corrected_transcript_prefixes,
     canonicalize_text_verified_name_mentions,
     load_attendee_identity_hints,
+    load_contact_alias_hints,
+    load_enrichment_candidates,
+    normalize_corrected_transcript_prefixes,
     parse_attendee_summaries,
     possible_identity_names_from_text,
     recording_time_interpretations,
@@ -553,11 +555,27 @@ def test_enrichment_task_input_includes_diarized_segments_and_recording_context(
                 "text": "Hello",
             }
         ],
+        contact_alias_hints=[
+            {
+                "mention": "Ace",
+                "canonical_name": "Taylor Example",
+                "given_name": "Taylor",
+                "family_name": "Example",
+                "aliases": ["Ace"],
+                "primary_email": "taylor@example.com",
+                "source": "google_people",
+                "source_kind": "google_contacts",
+                "account": "account@example.com",
+                "card_id": "people/c1",
+            }
+        ],
     )
 
     assert '"speaker_label": "A"' in task_input
     assert "recorded_at_interpretations" in task_input
     assert "diarized_segments" in task_input
+    assert "contact_alias_hints" in task_input
+    assert "Taylor Example" in task_input
     assert "source of truth for speaker turns" not in task_input
 
 
@@ -612,6 +630,80 @@ def test_enrichment_task_input_omits_raw_provider_payload_fields() -> None:
     assert "raw_result_json" not in task_input
     assert "subject 0" in task_input
     assert "subject 3" not in task_input
+
+
+def test_load_contact_alias_hints_reads_human_edited_contact_nicknames() -> None:
+    queries = []
+
+    class Warehouse:
+        def _query(self, sql):
+            queries.append(sql)
+            return [
+                (
+                    "Ace",
+                    "google_people",
+                    "account@example.com",
+                    "google_contacts",
+                    "people/c1",
+                    "Taylor Example",
+                    "Taylor",
+                    "Example",
+                    "taylor@example.com",
+                    "",
+                    "",
+                    '[{"value":"Ace"}]',
+                )
+            ]
+
+    hints = load_contact_alias_hints(
+        Warehouse(),
+        recording={"title": "Call", "transcript_text": "Talked to Ace about launch."},
+        transcript_segments=[],
+    )
+
+    assert "jsonb_array_elements(c.nicknames)" in queries[0]
+    assert hints == [
+        {
+            "mention": "Ace",
+            "canonical_name": "Taylor Example",
+            "given_name": "Taylor",
+            "family_name": "Example",
+            "primary_email": "taylor@example.com",
+            "organization": "",
+            "job_title": "",
+            "aliases": ["Ace"],
+            "source": "google_people",
+            "source_kind": "google_contacts",
+            "account": "account@example.com",
+            "card_id": "people/c1",
+        }
+    ]
+
+
+def test_apply_contact_alias_corrections_rewrites_final_output_aliases() -> None:
+    corrected = apply_contact_alias_corrections(
+        result={
+            "summary": "Ace will send the draft. Ace Cooper is a different full-name phrase.",
+            "action_items": ["Ask Ace to follow up."],
+            "evidence": ["Contact alias data maps 'Ace' to Taylor Example."],
+            "transcript": "Jordan Example: I talked to Ace about it.",
+            "speaker_map": [{"speaker_label": "B", "speaker_name": "Taylor Example", "evidence": "Ace appears in ASR."}],
+        },
+        contact_alias_hints=[
+            {
+                "mention": "Ace",
+                "canonical_name": "Taylor Example",
+                "given_name": "Taylor",
+                "aliases": ["Ace"],
+            }
+        ],
+    )
+
+    assert corrected["summary"] == "Taylor will send the draft. Ace Cooper is a different full-name phrase."
+    assert corrected["action_items"] == ["Ask Taylor to follow up."]
+    assert corrected["evidence"] == ["Contact alias data maps 'Taylor' to Taylor Example."]
+    assert corrected["transcript"] == "Jordan Example: I talked to Taylor about it."
+    assert corrected["speaker_map"][0]["evidence"] == "Taylor appears in ASR."
 
 
 def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit() -> None:

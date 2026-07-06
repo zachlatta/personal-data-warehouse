@@ -125,6 +125,7 @@ def google_person(resource_name: str = "people/c1") -> dict:
         "phoneNumbers": [{"value": "(555) 0100", "canonicalForm": "+15550100", "metadata": {"primary": True}}],
         "organizations": [{"name": "Example Org", "title": "Founder", "metadata": {"primary": True}}],
         "biographies": [{"value": "met at HQ", "metadata": {"primary": True}}],
+        "nicknames": [{"value": "Ace", "type": "DEFAULT"}],
         "memberships": [{"contactGroupMembership": {"contactGroupResourceName": "contactGroups/myContacts"}}],
         "birthdays": [{"date": {"month": 5, "day": 20}}],
         "events": [{"date": {"year": 2020, "month": 1, "day": 2}, "type": "anniversary"}],
@@ -169,6 +170,7 @@ def test_person_to_contact_card_row_maps_queryable_fields_and_raw_json() -> None
     assert row["primary_email"] == "alex@example.com"
     assert row["primary_phone"] == "+15550100"
     assert row["notes"] == "met at HQ"
+    assert row["nicknames"] == person["nicknames"]
     assert row["groups"] == person["memberships"]
     assert row["dates"]["birthdays"] == person["birthdays"]
     assert row["raw_json"]["resourceName"] == "people/c1"

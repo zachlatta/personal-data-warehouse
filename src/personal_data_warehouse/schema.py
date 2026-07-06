@@ -159,6 +159,7 @@ CONTACT_CARD_COLUMNS = (
     "addresses",
     "organizations",
     "urls",
+    "nicknames",
     "groups",
     "dates",
     "photos",

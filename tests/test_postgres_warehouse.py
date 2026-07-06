@@ -231,6 +231,7 @@ def _contact_card_row(*, card_id: str, display_name: str, sync_version: int, is_
         addresses=[],
         organizations=[],
         urls=[],
+        nicknames=[],
         groups=[],
         dates={"birthdays": [], "events": []},
         photos=[],
@@ -1936,7 +1937,7 @@ def test_postgres_contacts_tables_use_jsonb_without_changing_existing_raw_json(w
         FROM information_schema.columns
         WHERE table_schema = current_schema()
           AND (
-            (table_name = 'contact_cards' AND column_name IN ('emails', 'raw_json'))
+            (table_name = 'contact_cards' AND column_name IN ('emails', 'nicknames', 'raw_json'))
             OR (table_name = 'slack_conversations' AND column_name = 'raw_json')
           )
         ORDER BY table_name, column_name
@@ -1945,16 +1946,79 @@ def test_postgres_contacts_tables_use_jsonb_without_changing_existing_raw_json(w
 
     assert rows == [
         ("contact_cards", "emails", "jsonb"),
+        ("contact_cards", "nicknames", "jsonb"),
         ("contact_cards", "raw_json", "jsonb"),
         ("slack_conversations", "raw_json", "text"),
     ]
+
+
+def test_postgres_contacts_view_appends_new_nicknames_column_on_existing_view(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse._ensure_table_group(["contact_cards", "contact_sync_state"])
+    warehouse._command("ALTER TABLE contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
+    warehouse._command(
+        """
+        CREATE OR REPLACE VIEW clean_contacts AS
+        SELECT
+            source,
+            account,
+            source_kind,
+            address_book_id,
+            card_id,
+            etag,
+            source_uid,
+            display_name,
+            given_name,
+            family_name,
+            organization,
+            job_title,
+            primary_email,
+            primary_phone,
+            emails,
+            phones,
+            addresses,
+            organizations,
+            urls,
+            groups,
+            dates,
+            photos,
+            notes,
+            source_updated_at,
+            synced_at,
+            raw_json
+        FROM contact_cards
+        WHERE is_deleted = 0
+        """
+    )
+
+    warehouse.ensure_contacts_tables()
+
+    columns = [
+        row[0]
+        for row in warehouse._query(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'clean_contacts'
+            ORDER BY ordinal_position
+            """
+        )
+    ]
+    assert columns[-2:] == ["raw_json", "nicknames"]
 
 
 def test_postgres_contact_cards_upsert_jsonb_and_clean_view(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_contacts_tables()
 
     warehouse.insert_contact_cards([
-        _contact_card_row(card_id="people/c1", display_name="New Name", sync_version=20)
+        _contact_card_row(
+            card_id="people/c1",
+            display_name="New Name",
+            sync_version=20,
+            nicknames=[{"value": "N"}],
+        )
     ])
     warehouse.insert_contact_cards([
         _contact_card_row(card_id="people/c1", display_name="Old Name", sync_version=10)
@@ -1965,13 +2029,13 @@ def test_postgres_contact_cards_upsert_jsonb_and_clean_view(warehouse: PostgresW
 
     rows = warehouse._query(
         """
-        SELECT display_name, emails #>> '{0,value}', raw_json ->> 'resourceName'
+        SELECT display_name, emails #>> '{0,value}', nicknames #>> '{0,value}', raw_json ->> 'resourceName'
         FROM clean_contacts
         ORDER BY card_id
         """
     )
 
-    assert rows == [("New Name", "people/c1@example.test", "people/c1")]
+    assert rows == [("New Name", "people/c1@example.test", "N", "people/c1")]
 
 
 def test_postgres_contact_card_edit_replaces_existing_active_card(warehouse: PostgresWarehouse) -> None:

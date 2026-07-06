@@ -19,7 +19,7 @@ from personal_data_warehouse.agent_runner import (
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
-AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v4"
+AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v6"
 DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
 DEFAULT_ENRICHMENT_RECORDED_AFTER = datetime(2024, 12, 1, tzinfo=UTC)
 DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 5
@@ -27,6 +27,8 @@ LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
 LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS = 12_000
 PROMPT_TRANSCRIPT_WITH_SEGMENTS_MAX_CHARS = 8_000
 PROMPT_TRANSCRIPT_WITHOUT_SEGMENTS_MAX_CHARS = 60_000
+PROMPT_CONTACT_ALIAS_HINTS_LIMIT = 20
+PROMPT_CONTACT_ALIAS_TERMS_LIMIT = 40
 
 
 def _sql_string(value: str) -> str:
@@ -200,6 +202,11 @@ class VoiceMemosEnrichmentRunner:
                 self._logger.info("[%s/%s] enriching %s", index, len(recordings), recording_id)
                 calendar_candidates = load_calendar_candidates(self._warehouse, recording)
                 transcript_segments = load_transcript_segments(self._warehouse, recording)
+                contact_alias_hints = load_contact_alias_hints(
+                    self._warehouse,
+                    recording=recording,
+                    transcript_segments=transcript_segments,
+                )
                 prompt = enrichment_user_prompt(
                     input_file=AGENT_USER_PROMPT_INPUT_FILE,
                 )
@@ -207,6 +214,7 @@ class VoiceMemosEnrichmentRunner:
                     recording=recording,
                     calendar_candidates=calendar_candidates,
                     transcript_segments=transcript_segments,
+                    contact_alias_hints=contact_alias_hints,
                 )
                 result = self._client.create_agentic_structured(
                     system_prompt=enrichment_system_prompt(),
@@ -235,6 +243,10 @@ class VoiceMemosEnrichmentRunner:
                     recording=recording,
                     transcript_segments=transcript_segments,
                     result=result,
+                )
+                result = apply_contact_alias_corrections(
+                    result=result,
+                    contact_alias_hints=contact_alias_hints,
                 )
                 self._warehouse.insert_apple_voice_memos_enrichments(
                     [
@@ -449,6 +461,218 @@ def load_transcript_segments(warehouse, recording: Mapping[str, Any]) -> list[di
         }
         for segment_index, speaker_label, start_ms, end_ms, confidence, text in rows
     ]
+
+
+def load_contact_alias_hints(
+    warehouse,
+    *,
+    recording: Mapping[str, Any],
+    transcript_segments: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    terms = contact_alias_terms(recording=recording, transcript_segments=transcript_segments)
+    if not terms:
+        return []
+    terms_sql = "VALUES " + ", ".join(f"({_sql_string(term.lower())}, {_sql_string(term)})" for term in terms)
+    try:
+        rows = warehouse._query(
+            f"""
+            WITH mention_terms(normalized_term, mention) AS (
+                {terms_sql}
+            ),
+            nickname_matches AS (
+                SELECT
+                    mt.mention,
+                    c.source,
+                    c.account,
+                    c.source_kind,
+                    c.card_id,
+                    c.display_name,
+                    c.given_name,
+                    c.family_name,
+                    c.primary_email,
+                    c.organization,
+                    c.job_title,
+                    c.nicknames,
+                    c.source_updated_at
+                FROM mention_terms mt
+                INNER JOIN clean_contacts c
+                  ON EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(c.nicknames) AS nickname
+                    WHERE lower(COALESCE(nickname->>'value', nickname->>'displayName', '')) = mt.normalized_term
+                  )
+                WHERE c.display_name != ''
+                ORDER BY mt.mention, c.source_updated_at DESC, c.display_name
+                LIMIT {PROMPT_CONTACT_ALIAS_HINTS_LIMIT}
+            )
+            SELECT
+                mention,
+                source,
+                account,
+                source_kind,
+                card_id,
+                display_name,
+                given_name,
+                family_name,
+                primary_email,
+                organization,
+                job_title,
+                nicknames::text
+            FROM nickname_matches
+            """
+        )
+    except Exception:
+        return []
+
+    hints: list[dict[str, Any]] = []
+    for (
+        mention,
+        source,
+        account,
+        source_kind,
+        card_id,
+        display_name,
+        given_name,
+        family_name,
+        primary_email,
+        organization,
+        job_title,
+        nicknames_json,
+    ) in rows:
+        hints.append(
+            {
+                "mention": str(mention),
+                "canonical_name": str(display_name),
+                "given_name": str(given_name),
+                "family_name": str(family_name),
+                "primary_email": str(primary_email),
+                "organization": str(organization),
+                "job_title": str(job_title),
+                "aliases": nickname_values_from_json(str(nicknames_json)),
+                "source": str(source),
+                "source_kind": str(source_kind),
+                "account": str(account),
+                "card_id": str(card_id),
+            }
+        )
+    return hints
+
+
+def contact_alias_terms(
+    *,
+    recording: Mapping[str, Any],
+    transcript_segments: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    text_parts = [str(recording.get("title") or ""), str(recording.get("transcript_text") or "")]
+    text_parts.extend(str(segment.get("text") or "") for segment in transcript_segments)
+    text = "\n".join(text_parts)
+    terms: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"\b[A-Z][A-Za-z][A-Za-z'-]{1,40}\b", text):
+        term = match.group(0).strip("'")
+        normalized = term.lower()
+        if normalized in seen or normalized in CONTACT_ALIAS_STOPWORDS:
+            continue
+        seen.add(normalized)
+        terms.append(term)
+        if len(terms) >= PROMPT_CONTACT_ALIAS_TERMS_LIMIT:
+            break
+    return terms
+
+
+CONTACT_ALIAS_STOPWORDS = {
+    "ai",
+    "asr",
+    "cc",
+    "ceo",
+    "cfo",
+    "cto",
+    "def",
+    "fwd",
+    "gmail",
+    "google",
+    "hack",
+    "re",
+    "slack",
+    "utc",
+    "wise",
+    "zoom",
+}
+
+
+def nickname_values_from_json(value: str) -> list[str]:
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    aliases: list[str] = []
+    for item in payload:
+        if not isinstance(item, Mapping):
+            continue
+        alias = str(item.get("value") or item.get("displayName") or "").strip()
+        if alias and alias not in aliases:
+            aliases.append(alias)
+    return aliases
+
+
+def apply_contact_alias_corrections(
+    *,
+    result: Mapping[str, Any],
+    contact_alias_hints: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    replacements = contact_alias_replacements(contact_alias_hints)
+    if not replacements:
+        return dict(result)
+    return _rewrite_contact_alias_value(dict(result), replacements)
+
+
+def contact_alias_replacements(contact_alias_hints: Sequence[Mapping[str, Any]]) -> list[tuple[str, str]]:
+    replacements: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for hint in contact_alias_hints:
+        canonical_name = str(hint.get("canonical_name") or "").strip()
+        given_name = str(hint.get("given_name") or "").strip() or canonical_name.split(" ", 1)[0]
+        if not canonical_name and not given_name:
+            continue
+        aliases = [str(hint.get("mention") or "").strip()]
+        raw_aliases = hint.get("aliases") or []
+        if isinstance(raw_aliases, str):
+            aliases.append(raw_aliases.strip())
+        elif isinstance(raw_aliases, Sequence):
+            aliases.extend(str(alias).strip() for alias in raw_aliases)
+        for alias in aliases:
+            if not alias:
+                continue
+            replacement = canonical_name if " " in alias else given_name
+            key = alias.casefold()
+            if key in seen or alias == replacement:
+                continue
+            seen.add(key)
+            replacements.append((alias, replacement))
+    return replacements
+
+
+def _rewrite_contact_alias_value(value: Any, replacements: Sequence[tuple[str, str]]) -> Any:
+    if isinstance(value, str):
+        return _rewrite_contact_alias_text(value, replacements)
+    if isinstance(value, Mapping):
+        return {key: _rewrite_contact_alias_value(item, replacements) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rewrite_contact_alias_value(item, replacements) for item in value]
+    return value
+
+
+def _rewrite_contact_alias_text(text: str, replacements: Sequence[tuple[str, str]]) -> str:
+    rewritten = text
+    for alias, replacement in replacements:
+        if " " in alias.strip():
+            pattern = re.compile(rf"(?<![A-Za-z]){re.escape(alias)}(?![A-Za-z])")
+        else:
+            pattern = re.compile(rf"(?<![A-Za-z]){re.escape(alias)}(?![A-Za-z])(?!(?:\s+[A-Z][a-z]+))")
+        rewritten = pattern.sub(replacement, rewritten)
+    return rewritten
 
 
 def parse_attendee_summaries(attendees_json: str) -> list[str]:
@@ -1102,6 +1326,7 @@ def enrichment_user_prompt(*, input_file: str = AGENT_USER_PROMPT_INPUT_FILE) ->
                     "recording metadata and transcript length fields",
                     "recorded_at_interpretations",
                     "calendar_candidates with compact attendee identity hints",
+                    "contact_alias_hints from human-edited contact nicknames when transcript names match",
                     "truncated source transcript",
                     "diarized_segments",
                 ],
@@ -1133,6 +1358,7 @@ def enrichment_task_input(
     recording: Mapping[str, Any],
     calendar_candidates: Sequence[Mapping[str, Any]],
     transcript_segments: Sequence[Mapping[str, Any]] = (),
+    contact_alias_hints: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     source_transcript = str(recording.get("transcript_text", ""))
     sanitized_segments = [prompt_transcript_segment(segment) for segment in transcript_segments]
@@ -1158,6 +1384,7 @@ def enrichment_task_input(
             if isinstance(recording.get("recorded_at"), datetime)
             else [],
             "calendar_candidates": [prompt_calendar_candidate(candidate) for candidate in calendar_candidates],
+            "contact_alias_hints": [prompt_contact_alias_hint(hint) for hint in contact_alias_hints],
             "transcript": transcript,
             "diarized_segments": sanitized_segments,
         },
@@ -1179,6 +1406,9 @@ def enrichment_instructions() -> list[str]:
         "Calendar candidates may include identity_hints for attendee emails. Use possible_names from identity_hints for attendee and speaker names when supported by transcript evidence.",
         "Normalize spoken name mentions in transcript to verified participant spellings when ASR produces a close variant, especially in greetings and introductions.",
         "If the transcript says a person or organization name differently than the calendar candidate, query for that spoken name/project before deciding.",
+        "contact_alias_hints come from human-edited Google Contacts nicknames. Use them as a source-of-truth candidate for bare first-name references, nicknames, and ASR name variants, then verify with recent Slack/Gmail/calendar context before expanding the name in summary, action items, evidence, or transcript.",
+        "Do not expand a bare first-name third-party reference to a stale or merely exact contact match when a human-edited contact alias points to another current person.",
+        "After resolving a contact alias, use the canonical name or appropriate given name in final summary, action items, evidence, transcript, speaker_map, and participants. Do not carry the raw alias string into final fields unless a provenance note explicitly requires the original wording.",
         "For technical/product terms that are unclear or unfamiliar, query Slack/Gmail for likely spelling variants and use the spelling supported by warehouse evidence.",
         "Correct ASR domain-term errors in transcript, for example Hack Club not Hat Club, Hackatime not Hackertime/Hacker Time, Stardance not Start Dance, OpenRouter, OpenAI, Anthropic, Congressional App Challenge, Challenger, Framework, Spindrift, and Pellegrino.",
         "The source timestamp may be a local wall-clock time incorrectly tagged as UTC. Use recorded_at_interpretations and transcript evidence when matching calendar events.",
@@ -1265,6 +1495,23 @@ def prompt_identity_hints(identity_hints: Mapping[str, Any]) -> dict[str, Any]:
             ],
         }
     return compacted
+
+
+def prompt_contact_alias_hint(hint: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "mention": str(hint.get("mention") or ""),
+        "canonical_name": str(hint.get("canonical_name") or ""),
+        "given_name": str(hint.get("given_name") or ""),
+        "family_name": str(hint.get("family_name") or ""),
+        "aliases": [str(alias) for alias in hint.get("aliases") or []],
+        "primary_email": str(hint.get("primary_email") or ""),
+        "organization": str(hint.get("organization") or ""),
+        "job_title": str(hint.get("job_title") or ""),
+        "source": str(hint.get("source") or ""),
+        "source_kind": str(hint.get("source_kind") or ""),
+        "account": str(hint.get("account") or ""),
+        "card_id": str(hint.get("card_id") or ""),
+    }
 
 
 def prompt_slack_user(user: Mapping[str, Any]) -> dict[str, str]:

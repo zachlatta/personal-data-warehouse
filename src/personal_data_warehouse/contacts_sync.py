@@ -324,6 +324,7 @@ def person_to_contact_card_row(
         "addresses": mapping_list(person.get("addresses")),
         "organizations": mapping_list(person.get("organizations")),
         "urls": mapping_list(person.get("urls")),
+        "nicknames": mapping_list(person.get("nicknames")),
         "groups": mapping_list(person.get("memberships")),
         "dates": {
             "birthdays": mapping_list(person.get("birthdays")),

@@ -718,6 +718,71 @@ def test_contact_mutation_proposal_edit_and_observe(warehouse: PostgresWarehouse
     assert warehouse.get_upstream_mutation_request(mutation["id"])["status"] == "observed"
 
 
+def test_contact_nickname_update_observes_synced_value_when_response_etag_differs(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_contacts_tables()
+    warehouse.insert_contact_cards(
+        [
+            _contact_card_row(card_id="people/update", etag="etag-before", display_name="Update Me"),
+        ]
+    )
+
+    mutation = warehouse.propose_mutation(
+        title="Add nickname",
+        reason="test nickname update",
+        mutations=[
+            {
+                "type": "google_people.contacts",
+                "account": "zach@example.test",
+                "operations": [
+                    {
+                        "op": "update_contact",
+                        "client_op_id": "update-1",
+                        "resource_name": "people/update",
+                        "etag": "etag-before",
+                        "update_person_fields": ["nicknames"],
+                        "person": {"nicknames": [{"value": "Ace", "type": "DEFAULT"}]},
+                    }
+                ],
+            }
+        ],
+    )
+    child = mutation["mutations"][0]
+    warehouse.approve_upstream_mutation_request(mutation["id"], actor_id="zach")
+    claimed = warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker")
+    assert claimed[0]["id"] == child["id"]
+    warehouse.complete_upstream_mutation(
+        child["id"],
+        result_json={
+            "operation_results": [
+                {"op": "update_contact", "resource_name": "people/update", "etag": "etag-response"}
+            ]
+        },
+        actor_id="worker",
+    )
+
+    warehouse.insert_contact_cards(
+        [
+            _contact_card_row(
+                card_id="people/update",
+                etag="etag-from-sync",
+                display_name="Update Me",
+                nicknames=[{"value": "Ace", "metadata": {"primary": True}}],
+                raw_json={
+                    "resourceName": "people/update",
+                    "etag": "etag-from-sync",
+                    "nicknames": [{"value": "Ace", "metadata": {"primary": True}}],
+                },
+                sync_version=2,
+            ),
+        ]
+    )
+
+    assert warehouse.observe_succeeded_contact_mutations() == 1
+    assert warehouse.get_upstream_mutation_request(mutation["id"])["status"] == "observed"
+
+
 def test_calendar_event_mutation_proposal_and_observe(warehouse: PostgresWarehouse) -> None:
     mutation = warehouse.propose_mutation(
         title="Schedule planning",
