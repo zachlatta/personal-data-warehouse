@@ -118,22 +118,25 @@ def whatsapp_media_enrichment_backlog_sensor(context):
 
     warehouse = warehouse_from_settings(settings)
     try:
-        has_candidate = has_file_enrichment_candidate(
-            warehouse,
-            source=WHATSAPP_SOURCE,
-            provider=f"agent_{settings.agent.provider}",
-            model=settings.agent.model,
-            prompt_version=WHATSAPP_SOURCE.prompt_version,
-            max_error_attempts=whatsapp_media_enrichment_max_error_attempts(),
-            error_window_days=whatsapp_media_enrichment_error_window_days(),
-        )
-    except Exception as exc:
-        # The media/enrichment tables may not exist yet on a brand-new deploy
-        # (the WhatsApp ingest creates them on first promotion). Skip until then
-        # rather than failing the sensor tick; never run DDL from a sensor.
-        return SkipReason(f"WhatsApp media enrichment tables are not ready yet: {exc}")
-    if not has_candidate:
-        return SkipReason("No WhatsApp media is waiting for agent enrichment.")
+        try:
+            has_candidate = has_file_enrichment_candidate(
+                warehouse,
+                source=WHATSAPP_SOURCE,
+                provider=f"agent_{settings.agent.provider}",
+                model=settings.agent.model,
+                prompt_version=WHATSAPP_SOURCE.prompt_version,
+                max_error_attempts=whatsapp_media_enrichment_max_error_attempts(),
+                error_window_days=whatsapp_media_enrichment_error_window_days(),
+            )
+        except Exception as exc:
+            # The media/enrichment tables may not exist yet on a brand-new deploy
+            # (the WhatsApp ingest creates them on first promotion). Skip until then
+            # rather than failing the sensor tick; never run DDL from a sensor.
+            return SkipReason(f"WhatsApp media enrichment tables are not ready yet: {exc}")
+        if not has_candidate:
+            return SkipReason("No WhatsApp media is waiting for agent enrichment.")
+    finally:
+        warehouse.close()
 
     return RunRequest(tags={"whatsapp_media_trigger": "enrichment_backlog"})
 

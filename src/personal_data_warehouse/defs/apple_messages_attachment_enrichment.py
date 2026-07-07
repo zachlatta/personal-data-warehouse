@@ -119,23 +119,26 @@ def apple_messages_attachment_enrichment_backlog_sensor(context):
 
     warehouse = warehouse_from_settings(settings)
     try:
-        has_candidate = has_file_enrichment_candidate(
-            warehouse,
-            source=APPLE_MESSAGES_SOURCE,
-            provider=f"agent_{settings.agent.provider}",
-            model=settings.agent.model,
-            prompt_version=APPLE_MESSAGES_SOURCE.prompt_version,
-            max_error_attempts=apple_messages_attachment_enrichment_max_error_attempts(),
-            error_window_days=apple_messages_attachment_enrichment_error_window_days(),
-        )
-    except Exception as exc:
-        # The attachment/enrichment tables may not exist yet on a brand-new
-        # deploy (Apple Messages ingest creates them on first promotion). Skip
-        # until then rather than failing the sensor tick; never run DDL from a
-        # sensor.
-        return SkipReason(f"Apple Messages attachment enrichment tables are not ready yet: {exc}")
-    if not has_candidate:
-        return SkipReason("No Apple Messages attachments are waiting for agent enrichment.")
+        try:
+            has_candidate = has_file_enrichment_candidate(
+                warehouse,
+                source=APPLE_MESSAGES_SOURCE,
+                provider=f"agent_{settings.agent.provider}",
+                model=settings.agent.model,
+                prompt_version=APPLE_MESSAGES_SOURCE.prompt_version,
+                max_error_attempts=apple_messages_attachment_enrichment_max_error_attempts(),
+                error_window_days=apple_messages_attachment_enrichment_error_window_days(),
+            )
+        except Exception as exc:
+            # The attachment/enrichment tables may not exist yet on a brand-new
+            # deploy (Apple Messages ingest creates them on first promotion). Skip
+            # until then rather than failing the sensor tick; never run DDL from a
+            # sensor.
+            return SkipReason(f"Apple Messages attachment enrichment tables are not ready yet: {exc}")
+        if not has_candidate:
+            return SkipReason("No Apple Messages attachments are waiting for agent enrichment.")
+    finally:
+        warehouse.close()
 
     return RunRequest(tags={"apple_messages_attachment_trigger": "enrichment_backlog"})
 

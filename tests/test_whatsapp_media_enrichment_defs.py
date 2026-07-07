@@ -54,8 +54,9 @@ def test_whatsapp_media_enrichment_max_error_attempts_env(monkeypatch) -> None:
 
 def test_whatsapp_media_enrichment_backlog_sensor_skips_when_backlog_is_empty(monkeypatch) -> None:
     calls = []
+    warehouse = FakeWarehouse()
     monkeypatch.setattr(whatsapp_media_enrichment_defs, "load_settings", lambda **_kwargs: FakeSettings())
-    monkeypatch.setattr(whatsapp_media_enrichment_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(whatsapp_media_enrichment_defs, "warehouse_from_settings", lambda _settings: warehouse)
     monkeypatch.setattr(
         whatsapp_media_enrichment_defs,
         "has_file_enrichment_candidate",
@@ -71,11 +72,13 @@ def test_whatsapp_media_enrichment_backlog_sensor_skips_when_backlog_is_empty(mo
     assert "No WhatsApp media" in result.skip_message
     assert calls[0][1]["source"] is WHATSAPP_SOURCE
     assert calls[0][1]["prompt_version"] == WHATSAPP_SOURCE.prompt_version
+    assert warehouse.closed
 
 
 def test_whatsapp_media_enrichment_backlog_sensor_launches_when_backlog_exists(monkeypatch) -> None:
+    warehouse = FakeWarehouse()
     monkeypatch.setattr(whatsapp_media_enrichment_defs, "load_settings", lambda **_kwargs: FakeSettings())
-    monkeypatch.setattr(whatsapp_media_enrichment_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(whatsapp_media_enrichment_defs, "warehouse_from_settings", lambda _settings: warehouse)
     monkeypatch.setattr(
         whatsapp_media_enrichment_defs,
         "has_file_enrichment_candidate",
@@ -89,11 +92,13 @@ def test_whatsapp_media_enrichment_backlog_sensor_launches_when_backlog_exists(m
 
     assert isinstance(result, RunRequest)
     assert result.tags == {"whatsapp_media_trigger": "enrichment_backlog"}
+    assert warehouse.closed
 
 
 def test_whatsapp_media_enrichment_backlog_sensor_skips_when_tables_missing(monkeypatch) -> None:
+    warehouse = FakeWarehouse()
     monkeypatch.setattr(whatsapp_media_enrichment_defs, "load_settings", lambda **_kwargs: FakeSettings())
-    monkeypatch.setattr(whatsapp_media_enrichment_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(whatsapp_media_enrichment_defs, "warehouse_from_settings", lambda _settings: warehouse)
 
     def boom(*_args, **_kwargs):
         raise RuntimeError('relation "whatsapp_media_items" does not exist')
@@ -107,6 +112,7 @@ def test_whatsapp_media_enrichment_backlog_sensor_skips_when_tables_missing(monk
 
     assert isinstance(result, SkipReason)
     assert "not ready yet" in result.skip_message
+    assert warehouse.closed
 
 
 class FakeSettings:
@@ -116,3 +122,11 @@ class FakeSettings:
         (),
         {"provider": "codex", "model": "gpt-agent"},
     )()
+
+
+class FakeWarehouse:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True

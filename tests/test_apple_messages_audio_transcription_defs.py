@@ -59,8 +59,9 @@ def test_apple_messages_audio_transcription_max_error_attempts_env(monkeypatch) 
 
 def test_apple_messages_audio_transcription_backlog_sensor_skips_when_backlog_is_empty(monkeypatch) -> None:
     calls = []
+    warehouse = FakeWarehouse()
     monkeypatch.setattr(apple_messages_audio_transcription_defs, "load_settings", lambda **_kwargs: FakeSettings())
-    monkeypatch.setattr(apple_messages_audio_transcription_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(apple_messages_audio_transcription_defs, "warehouse_from_settings", lambda _settings: warehouse)
     monkeypatch.setattr(
         apple_messages_audio_transcription_defs,
         "has_audio_enrichment_candidate",
@@ -76,11 +77,13 @@ def test_apple_messages_audio_transcription_backlog_sensor_skips_when_backlog_is
     assert "No Apple Messages voice messages" in result.skip_message
     assert calls[0][1]["source"] is APPLE_MESSAGES_AUDIO_SOURCE
     assert calls[0][1]["prompt_version"] == APPLE_MESSAGES_AUDIO_SOURCE.prompt_version
+    assert warehouse.closed
 
 
 def test_apple_messages_audio_transcription_backlog_sensor_launches_when_backlog_exists(monkeypatch) -> None:
+    warehouse = FakeWarehouse()
     monkeypatch.setattr(apple_messages_audio_transcription_defs, "load_settings", lambda **_kwargs: FakeSettings())
-    monkeypatch.setattr(apple_messages_audio_transcription_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(apple_messages_audio_transcription_defs, "warehouse_from_settings", lambda _settings: warehouse)
     monkeypatch.setattr(
         apple_messages_audio_transcription_defs,
         "has_audio_enrichment_candidate",
@@ -94,11 +97,13 @@ def test_apple_messages_audio_transcription_backlog_sensor_launches_when_backlog
 
     assert isinstance(result, RunRequest)
     assert result.tags == {"apple_messages_audio_trigger": "transcription_backlog"}
+    assert warehouse.closed
 
 
 def test_apple_messages_audio_transcription_backlog_sensor_skips_when_tables_missing(monkeypatch) -> None:
+    warehouse = FakeWarehouse()
     monkeypatch.setattr(apple_messages_audio_transcription_defs, "load_settings", lambda **_kwargs: FakeSettings())
-    monkeypatch.setattr(apple_messages_audio_transcription_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(apple_messages_audio_transcription_defs, "warehouse_from_settings", lambda _settings: warehouse)
 
     def boom(*_args, **_kwargs):
         raise RuntimeError('relation "apple_message_attachments" does not exist')
@@ -112,6 +117,7 @@ def test_apple_messages_audio_transcription_backlog_sensor_skips_when_tables_mis
 
     assert isinstance(result, SkipReason)
     assert "not ready yet" in result.skip_message
+    assert warehouse.closed
 
 
 class FakeSettings:
@@ -133,3 +139,11 @@ class FakeSettings:
         (),
         {"provider": "codex", "model": "gpt-agent"},
     )()
+
+
+class FakeWarehouse:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True

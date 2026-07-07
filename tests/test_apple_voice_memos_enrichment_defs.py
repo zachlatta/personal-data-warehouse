@@ -132,13 +132,14 @@ def test_apple_voice_memos_enrichment_backlog_sensor_runs_every_minute() -> None
 def test_apple_voice_memos_enrichment_backlog_sensor_skips_when_backlog_is_empty(monkeypatch) -> None:
     calls = []
     settings_calls = []
+    warehouse = FakeWarehouse()
     monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER", raising=False)
     monkeypatch.setattr(
         apple_voice_memos_enrichment_defs,
         "load_settings",
         lambda **kwargs: settings_calls.append(kwargs) or FakeSettings(),
     )
-    monkeypatch.setattr(apple_voice_memos_enrichment_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(apple_voice_memos_enrichment_defs, "warehouse_from_settings", lambda _settings: warehouse)
     monkeypatch.setattr(
         apple_voice_memos_enrichment_defs,
         "load_enrichment_candidates",
@@ -158,16 +159,18 @@ def test_apple_voice_memos_enrichment_backlog_sensor_skips_when_backlog_is_empty
     assert calls[0][1]["recorded_after"] == datetime(2024, 12, 1, tzinfo=UTC)
     assert calls[0][1]["force_prompt_version"] is False
     assert calls[0][1]["max_error_attempts"] == 5
+    assert warehouse.closed
 
 
 def test_apple_voice_memos_enrichment_backlog_sensor_launches_when_backlog_exists(monkeypatch) -> None:
+    warehouse = FakeWarehouse()
     monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER", raising=False)
     monkeypatch.setattr(
         apple_voice_memos_enrichment_defs,
         "load_settings",
         lambda **_kwargs: FakeSettings(),
     )
-    monkeypatch.setattr(apple_voice_memos_enrichment_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(apple_voice_memos_enrichment_defs, "warehouse_from_settings", lambda _settings: warehouse)
     monkeypatch.setattr(
         apple_voice_memos_enrichment_defs,
         "load_enrichment_candidates",
@@ -181,6 +184,7 @@ def test_apple_voice_memos_enrichment_backlog_sensor_launches_when_backlog_exist
 
     assert isinstance(result, RunRequest)
     assert result.tags == {"apple_voice_memos_trigger": "enrichment_backlog"}
+    assert warehouse.closed
 
 
 class FakeSettings:
@@ -204,3 +208,11 @@ class FakeSettings:
             "tool_proxy_public_host": "127.0.0.1",
         },
     )()
+
+
+class FakeWarehouse:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True

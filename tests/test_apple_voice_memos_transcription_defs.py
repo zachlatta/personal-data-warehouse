@@ -58,9 +58,11 @@ def test_apple_voice_memos_transcription_backlog_sensor_skips_when_backlog_is_em
     assert "No untranscribed Voice Memos" in result.skip_message
     assert fake_warehouse.provider == "assemblyai"
     assert fake_warehouse.limit == 1
+    assert fake_warehouse.closed
 
 
 def test_apple_voice_memos_transcription_backlog_sensor_launches_when_backlog_exists(monkeypatch) -> None:
+    fake_warehouse = FakeWarehouse([{"recording_id": "memo-1"}])
     monkeypatch.setattr(
         apple_voice_memos_transcription_defs,
         "load_settings",
@@ -69,7 +71,7 @@ def test_apple_voice_memos_transcription_backlog_sensor_launches_when_backlog_ex
     monkeypatch.setattr(
         apple_voice_memos_transcription_defs,
         "warehouse_from_settings",
-        lambda _settings: FakeWarehouse([{"recording_id": "memo-1"}]),
+        lambda _settings: fake_warehouse,
     )
 
     with DagsterInstance.ephemeral() as instance:
@@ -79,6 +81,7 @@ def test_apple_voice_memos_transcription_backlog_sensor_launches_when_backlog_ex
 
     assert isinstance(result, RunRequest)
     assert result.tags == {"apple_voice_memos_trigger": "transcription_backlog"}
+    assert fake_warehouse.closed
 
 
 class FakeSettings:
@@ -90,8 +93,12 @@ class FakeWarehouse:
         self.rows = rows
         self.provider = None
         self.limit = None
+        self.closed = False
 
     def load_untranscribed_apple_voice_memos_files(self, *, provider: str, limit: int):
         self.provider = provider
         self.limit = limit
         return self.rows
+
+    def close(self) -> None:
+        self.closed = True

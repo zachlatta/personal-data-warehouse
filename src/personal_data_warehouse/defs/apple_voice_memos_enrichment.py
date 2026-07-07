@@ -128,18 +128,21 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
 
     recorded_after = apple_voice_memos_enrichment_recorded_after()
     warehouse = warehouse_from_settings(settings)
-    candidates = load_enrichment_candidates(
-        warehouse,
-        provider=apple_voice_memos_enrichment_provider(settings),
-        model=apple_voice_memos_enrichment_model(settings),
-        prompt_version=apple_voice_memos_enrichment_prompt_version(),
-        limit=1,
-        recorded_after=recorded_after,
-        force_prompt_version=apple_voice_memos_enrichment_force_prompt_version(),
-        max_error_attempts=apple_voice_memos_enrichment_max_error_attempts(),
-    )
-    if not candidates:
-        return SkipReason("No unenriched Voice Memos transcripts found in Postgres.")
+    try:
+        candidates = load_enrichment_candidates(
+            warehouse,
+            provider=apple_voice_memos_enrichment_provider(settings),
+            model=apple_voice_memos_enrichment_model(settings),
+            prompt_version=apple_voice_memos_enrichment_prompt_version(),
+            limit=1,
+            recorded_after=recorded_after,
+            force_prompt_version=apple_voice_memos_enrichment_force_prompt_version(),
+            max_error_attempts=apple_voice_memos_enrichment_max_error_attempts(),
+        )
+        if not candidates:
+            return SkipReason("No unenriched Voice Memos transcripts found in Postgres.")
+    finally:
+        warehouse.close()
 
     return RunRequest(tags={"apple_voice_memos_trigger": "enrichment_backlog"})
 

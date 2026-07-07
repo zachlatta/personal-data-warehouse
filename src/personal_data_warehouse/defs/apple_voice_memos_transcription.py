@@ -108,8 +108,11 @@ def apple_voice_memos_transcription_backlog_sensor(context):
 
     settings = load_settings(require_gmail=False, require_assemblyai=True)
     warehouse = warehouse_from_settings(settings)
-    if not warehouse.load_untranscribed_apple_voice_memos_files(provider=ASSEMBLYAI_PROVIDER, limit=1):
-        return SkipReason("No untranscribed Voice Memos found in Postgres.")
+    try:
+        if not warehouse.load_untranscribed_apple_voice_memos_files(provider=ASSEMBLYAI_PROVIDER, limit=1):
+            return SkipReason("No untranscribed Voice Memos found in Postgres.")
+    finally:
+        warehouse.close()
 
     return RunRequest(tags={"apple_voice_memos_trigger": "transcription_backlog"})
 

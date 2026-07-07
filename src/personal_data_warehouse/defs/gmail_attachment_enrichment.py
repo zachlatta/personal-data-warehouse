@@ -108,17 +108,20 @@ def gmail_attachment_enrichment_backlog_sensor(context):
 
     settings = load_settings(require_gmail=False, require_agent=True)
     warehouse = warehouse_from_settings(settings)
-    has_candidate = has_file_enrichment_candidate(
-        warehouse,
-        source=GMAIL_SOURCE,
-        provider=f"agent_{settings.agent.provider}",
-        model=settings.agent.model,
-        prompt_version=GMAIL_SOURCE.prompt_version,
-        max_error_attempts=gmail_attachment_enrichment_max_error_attempts(),
-        error_window_days=gmail_attachment_enrichment_error_window_days(),
-    )
-    if not has_candidate:
-        return SkipReason("No Gmail attachments are waiting for agent enrichment.")
+    try:
+        has_candidate = has_file_enrichment_candidate(
+            warehouse,
+            source=GMAIL_SOURCE,
+            provider=f"agent_{settings.agent.provider}",
+            model=settings.agent.model,
+            prompt_version=GMAIL_SOURCE.prompt_version,
+            max_error_attempts=gmail_attachment_enrichment_max_error_attempts(),
+            error_window_days=gmail_attachment_enrichment_error_window_days(),
+        )
+        if not has_candidate:
+            return SkipReason("No Gmail attachments are waiting for agent enrichment.")
+    finally:
+        warehouse.close()
 
     return RunRequest(tags={"gmail_attachment_trigger": "enrichment_backlog"})
 
