@@ -874,6 +874,7 @@ def _contact_card_row(
     display_name: str,
     sync_version: int = 1,
     is_deleted: int = 0,
+    **overrides,
 ):
     now = datetime(2026, 5, 22, 12, tzinfo=UTC)
     row = _default_row(
@@ -893,6 +894,7 @@ def _contact_card_row(
         addresses=[],
         organizations=[],
         urls=[],
+        nicknames=[],
         groups=[],
         dates={"birthdays": [], "events": []},
         photos=[],
@@ -907,6 +909,7 @@ def _contact_card_row(
             "emailAddresses": [{"value": f"{card_id.replace('/', '-')}@example.test"}],
         },
     )
+    row.update(overrides)
     return row
 
 
