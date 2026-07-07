@@ -2124,7 +2124,7 @@ def test_postgres_ensure_contacts_recovers_when_existing_view_has_extra_columns(
     warehouse._command("DROP VIEW clean_contacts")
     warehouse._command(
         "CREATE VIEW clean_contacts AS "
-        f"SELECT base.*, '[]'::jsonb AS nicknames FROM ({viewdef.strip().rstrip(';')}) AS base"
+        f"SELECT base.*, 'drift'::text AS drift_extra FROM ({viewdef.strip().rstrip(';')}) AS base"
     )
 
     warehouse.ensure_contacts_tables()
@@ -2140,8 +2140,8 @@ def test_postgres_ensure_contacts_recovers_when_existing_view_has_extra_columns(
             """
         )
     ]
-    assert "nicknames" not in columns
-    assert columns[-1] == "raw_json"
+    assert "drift_extra" not in columns
+    assert columns[-2:] == ["raw_json", "nicknames"]
 
 
 def test_postgres_mark_missing_contact_cards_deleted_tombstones_only_scope(warehouse: PostgresWarehouse) -> None:
@@ -2246,6 +2246,45 @@ def test_postgres_replace_slack_conversation_members_tombstones_missing_members(
         ("G1", "U3", 0, new_sync, 2),
         ("G2", "U9", 0, old_sync, 1),
     ]
+
+
+def test_postgres_slack_sync_state_preserves_cursor_ts_when_error_write_has_empty_cursor(
+    warehouse: PostgresWarehouse,
+) -> None:
+    first_sync = datetime(2026, 5, 18, 12, tzinfo=UTC)
+    error_sync = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    key = ("zrl", "T1", "conversation", "C-cursor")
+    warehouse.ensure_slack_tables()
+
+    warehouse.insert_slack_sync_state(
+        account=key[0],
+        team_id=key[1],
+        object_type=key[2],
+        object_id=key[3],
+        cursor_ts="1700.0001",
+        last_sync_type="messages",
+        status="ok",
+        error="",
+        updated_at=first_sync,
+        sync_version=1,
+    )
+    warehouse.insert_slack_sync_state(
+        account=key[0],
+        team_id=key[1],
+        object_type=key[2],
+        object_id=key[3],
+        cursor_ts="",
+        last_sync_type="messages",
+        status="error",
+        error="channel_not_found",
+        updated_at=error_sync,
+        sync_version=2,
+    )
+
+    state = warehouse.load_slack_sync_state()[key]
+    assert state["cursor_ts"] == "1700.0001"
+    assert state["status"] == "error"
+    assert state["error"] == "channel_not_found"
 
 
 def test_postgres_member_sync_candidates_prioritize_never_synced_private_channels(warehouse: PostgresWarehouse) -> None:

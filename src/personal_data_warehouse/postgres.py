@@ -6762,6 +6762,9 @@ PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
     "whatsapp_chats": ("name",),
     # A later participant snapshot that drops a display name must not blank it.
     "whatsapp_chat_participants": ("display_name",),
+    # Per-conversation Slack errors record status/error with an empty cursor;
+    # do not let that wipe the high-water mark from the last successful page.
+    "slack_sync_state": ("cursor_ts",),
 }
 
 
