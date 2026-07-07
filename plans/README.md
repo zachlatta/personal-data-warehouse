@@ -16,7 +16,7 @@ and a verification gate come first.
 |------|-------|----------|--------|------------|--------|
 | 001 | Give every Dagster job a unique advisory-lock id | P1 | S | — | DONE |
 | 002 | Stop a transient Slack error wiping a conversation's cursor | P1 | S | — | DONE |
-| 003 | Run the agent SQL proxy on a dedicated read-only connection | P1 | M | — | TODO |
+| 003 | Run the agent SQL proxy on a dedicated read-only connection | P1 | M | — | DONE |
 | 004 | Close the connection each enrichment/transcription sensor opens per tick | P2 | M | — | DONE |
 | 005 | CI gate: run Python (with Postgres) + full Go suite before merge | P1 | M | — | TODO |
 

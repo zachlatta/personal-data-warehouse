@@ -127,6 +127,21 @@ def test_container_agent_runner_builds_missing_managed_image_before_run(tmp_path
 
 
 def test_container_agent_runner_can_inject_postgres_proxy_without_raw_url(tmp_path) -> None:
+    class FakeReadOnlyConnection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeWarehouse:
+        def __init__(self, connection: FakeReadOnlyConnection) -> None:
+            self.connection = connection
+
+        def read_only_connection(self) -> FakeReadOnlyConnection:
+            return self.connection
+
+    fake_connection = FakeReadOnlyConnection()
     volume_copy_calls = 0
     agent_command = []
 
@@ -148,11 +163,12 @@ def test_container_agent_runner_can_inject_postgres_proxy_without_raw_url(tmp_pa
     )
     result = ContainerAgentRunner(config, runner=fake_run).run_with_warehouse(
         AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1"),
-        warehouse=object(),
+        warehouse=FakeWarehouse(fake_connection),
     )
 
     joined = " ".join(agent_command)
     assert result.status == "completed"
+    assert fake_connection.closed is True
     assert "PDW_AGENT_TOOL_PROXY_URL=http://127.0.0.1:" in joined
     assert "PDW_AGENT_TOOL_PROXY_TOKEN=" in joined
     assert "PDW_POSTGRES_QUERY=" in joined

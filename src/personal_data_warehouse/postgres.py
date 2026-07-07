@@ -1219,6 +1219,7 @@ class PostgresWarehouse:
         normalized = normalize_postgres_url(postgres_database_url)
         if not normalized:
             raise ValueError("POSTGRES_DATABASE_URL must be set")
+        self._database_url = normalized
         self._schema = _validate_identifier(schema)
         self._connection = psycopg2.connect(normalized)
         self._connection.autocommit = True
@@ -1230,6 +1231,17 @@ class PostgresWarehouse:
 
     def close(self) -> None:
         self._connection.close()
+
+    def read_only_connection(self):
+        """Open a dedicated connection for untrusted read-only SQL."""
+        connection = psycopg2.connect(
+            self._database_url,
+            options="-c default_transaction_read_only=on -c statement_timeout=30000",
+        )
+        connection.autocommit = True
+        with connection.cursor() as cursor:
+            cursor.execute(f"SET search_path TO {_identifier(self._schema)}")
+        return connection
 
     def ensure_tables(self) -> None:
         self.drop_personal_finance_schema()

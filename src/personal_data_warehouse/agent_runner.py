@@ -253,17 +253,21 @@ class ContainerAgentRunner:
         max_rows: int = 50,
         max_field_chars: int = 3000,
     ) -> AgentRunResult:
+        runner = PostgresReadOnlyRunner(warehouse)
         query_service = PostgresReadOnlyService(
-            PostgresReadOnlyRunner(warehouse),
+            runner,
             max_rows=max_rows,
             max_field_chars=max_field_chars,
         )
-        with run_agent_tool_proxy(
-            query_service=query_service,
-            bind_host=self._config.tool_proxy_bind_host,
-            public_host=self._config.tool_proxy_public_host,
-        ) as tool_env:
-            return self.run(request.with_extra_env(tool_env))
+        try:
+            with run_agent_tool_proxy(
+                query_service=query_service,
+                bind_host=self._config.tool_proxy_bind_host,
+                public_host=self._config.tool_proxy_public_host,
+            ) as tool_env:
+                return self.run(request.with_extra_env(tool_env))
+        finally:
+            runner.close()
 
     def _ensure_managed_image(self) -> None:
         if self._config.image != default_agent_docker_image():

@@ -27,10 +27,10 @@ SCHEMA_SAMPLE_EXCLUDED_TABLES = frozenset({"agent_run_events", "agent_run_tool_c
 class PostgresReadOnlyRunner:
     def __init__(self, warehouse) -> None:
         self._warehouse = warehouse
+        self._connection = warehouse.read_only_connection()
 
     def query(self, sql: str, *, max_rows: int) -> RawResult:
-        with self._warehouse._connection.cursor() as cursor:
-            cursor.execute("SET LOCAL statement_timeout = '30s'")
+        with self._connection.cursor() as cursor:
             cursor.execute(sql)
             columns = [description.name for description in cursor.description or ()]
             if max_rows > 0:
@@ -38,6 +38,12 @@ class PostgresReadOnlyRunner:
             else:
                 rows = cursor.fetchall()
         return rows_to_raw_result(columns, rows)
+
+    def close(self) -> None:
+        try:
+            self._connection.close()
+        except Exception:
+            pass
 
 
 class PostgresReadOnlyService:
