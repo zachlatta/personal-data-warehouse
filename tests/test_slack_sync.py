@@ -865,6 +865,65 @@ def test_runner_retries_transient_slack_request_failures(monkeypatch):
     assert sleeps == [5]
 
 
+def test_call_raises_after_transient_attempts_exceed_cap(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    sleeps = []
+    client = FakeSlackClient(
+        {
+            "some.method": [
+                SlackTransientError("read timed out"),
+                SlackTransientError("read timed out"),
+                SlackTransientError("read timed out"),
+            ],
+        }
+    )
+
+    runner = SlackSyncRunner(
+        settings=settings,
+        warehouse=FakeWarehouse(),
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sleep=sleeps.append,
+        max_transient_attempts=3,
+    )
+
+    with pytest.raises(SlackTransientError):
+        runner._call(client, "some.method")
+
+    assert sleeps == [5, 10]
+
+
+def test_call_recovers_from_transient_failure_before_cap(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    sleeps = []
+    client = FakeSlackClient(
+        {
+            "some.method": [
+                SlackTransientError("read timed out"),
+                {"ok": True, "value": "recovered"},
+            ],
+        }
+    )
+
+    runner = SlackSyncRunner(
+        settings=settings,
+        warehouse=FakeWarehouse(),
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sleep=sleeps.append,
+        max_transient_attempts=3,
+    )
+
+    result = runner._call(client, "some.method")
+
+    assert result == {"ok": True, "value": "recovered"}
+    assert sleeps == [5]
+
+
 def test_runner_can_backfill_archived_cached_conversations(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")

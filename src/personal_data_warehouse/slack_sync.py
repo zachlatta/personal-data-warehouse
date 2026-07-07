@@ -123,6 +123,7 @@ class SlackSyncRunner:
         thread_since_days: int | None = None,
         thread_missing_replies_only: bool = False,
         max_rate_limit_sleep_seconds: int | None = None,
+        max_transient_attempts: int = 8,
     ) -> None:
         self._settings = settings
         self._warehouse = warehouse
@@ -157,6 +158,7 @@ class SlackSyncRunner:
         self._thread_missing_replies_only = thread_missing_replies_only
         self._max_rate_limit_sleep_seconds = max_rate_limit_sleep_seconds
         self._rate_limit_sleep_seconds = 0
+        self._max_transient_attempts = max_transient_attempts
 
     def sync_all(self) -> list[SlackSyncSummary]:
         self._warehouse.ensure_slack_tables()
@@ -1402,8 +1404,17 @@ class SlackSyncRunner:
                 self._sleep(exc.retry_after)
             except SlackTransientError as exc:
                 transient_attempts += 1
+                if transient_attempts >= self._max_transient_attempts:
+                    self._logger.warning(
+                        "Slack transient failure %s exceeded %s attempts; giving up: %s",
+                        method, self._max_transient_attempts, exc,
+                    )
+                    raise
                 sleep_seconds = min(60, 5 * transient_attempts)
-                self._logger.warning("Slack transient failure %s; retrying in %ss: %s", method, sleep_seconds, exc)
+                self._logger.warning(
+                    "Slack transient failure %s; retrying in %ss (attempt %s/%s): %s",
+                    method, sleep_seconds, transient_attempts, self._max_transient_attempts, exc,
+                )
                 self._sleep(sleep_seconds)
 
 
