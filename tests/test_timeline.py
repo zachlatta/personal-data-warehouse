@@ -820,9 +820,16 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
         INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
                                     to_addresses, synced_at)
         VALUES ('z@x.test', 'm-otp', %s, 'Your login code: 123-456', 'human.sounding@bank.example', %s, %s),
-               ('z@x.test', 'm-rsvp', %s, 'Accepted: 1:1 @ Fri (zach)', 'colleague@example.test', %s, %s)
+               ('z@x.test', 'm-confirm-code', %s, '123456 is your confirmation code', 'human.sounding@example.test', %s, %s),
+               ('z@x.test', 'm-rsvp', %s, 'Accepted: 1:1 @ Fri (owner)', 'colleague@example.test', %s, %s),
+               ('z@x.test', 'm-shipment-confirmation', %s, 'Shipment Confirmation', 'dinobox@example.test', %s, %s)
         """,
-        (_NOW, ["z@x.test"], _NOW, _NOW, ["z@x.test"], _NOW),
+        (
+            _NOW, ["z@x.test"], _NOW,
+            _NOW, ["z@x.test"], _NOW,
+            _NOW, ["z@x.test"], _NOW,
+            _NOW, ["z+recipient@x.test"], _NOW,
+        ),
     )
     # A known correspondent whose mail Gmail mis-categorized as bulk.
     warehouse._command(
@@ -840,6 +847,56 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
         VALUES ('friend@example.test', 12, %s, now())
         """,
         (_NOW,),
+    )
+    # Gmail's Forums bucket mixes real list discussion with broadcast digests
+    # and newsletters. Individual human posts to work aliases remain cc, but
+    # digest/newsletter/list-announcement shapes are noise.
+    warehouse._command(
+        """
+        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+                                    to_addresses, label_ids, snippet, synced_at)
+        VALUES ('z@x.test', 'm-forum-human', %s, 'WFH today', 'teammate@example.test', %s,
+                %s, 'Hi, I will be working from home today. -- You received this message because you are subscribed.', %s),
+               ('z@x.test', 'm-forum-digest', %s, 'Digest for ops@example.test - 8 updates in 6 topics',
+                'ops@example.test', %s, %s,
+                'ops@example.test Google Groups Logo Google Groups Topic digest View all topics', %s),
+               ('z@x.test', 'm-forum-newsletter', %s, 'Recommendations from your newsletters',
+                'news@example.test', %s, %s,
+                'View in browser ͏ ͏ ͏ weekly reading recommendations', %s),
+               ('z@x.test', 'm-forum-announcement', %s, '[publiclist] Funding opportunities',
+                'person@example.test', %s, %s,
+                'Here are several announcements for subscribers.', %s),
+               ('z@x.test', 'm-forum-new-comment', %s, 'New comment on Budget',
+                'notify@example.test', %s, %s,
+                'A person left a new comment on the document.', %s),
+               ('z@x.test', 'm-figma-upgrade', %s, 'Upgrade request from teammate',
+                'no-reply@email.figma.com', %s, %s,
+                'teammate is requesting a Full seat.', %s),
+               ('z@x.test', 'm-airtable-access', %s, 'teammate (teammate@example.test) requested access to Ops - Airtable',
+                'noreply@airtable.com', %s, %s,
+                'teammate would like to access the Ops base. Grant Access', %s),
+               ('z@x.test', 'm-sign-request', %s, 'Example Agreement: Signature Request from Example Org',
+                'mail@signnow.com', %s, %s,
+                'You were invited to review and sign a document Example Org invited you to sign', %s),
+               ('z@x.test', 'm-drive-share', %s, 'Document shared with you: "Plan"',
+                'drive-shares-dm-noreply@google.com', %s, %s,
+                'teammate shared a document teammate has invited you to edit the following document', %s),
+               ('z@x.test', 'm-vercel-access', %s, '[Access Request] teammate requested access to app.example.dev',
+                'notifications@vercel.com', %s, %s,
+                'Access request Hello, teammate@example.test wants access to a URL', %s)
+        """,
+        (
+            _NOW, ["timeoff@example.test"], ["CATEGORY_FORUMS", "INBOX"], _NOW,
+            _NOW, ["ops@example.test"], ["CATEGORY_FORUMS", "INBOX"], _NOW,
+            _NOW, ["news@example.test"], ["CATEGORY_FORUMS", "INBOX"], _NOW,
+            _NOW, ["publiclist@googlegroups.com"], ["CATEGORY_FORUMS", "INBOX"], _NOW,
+            _NOW, ["z@x.test"], ["CATEGORY_FORUMS", "INBOX"], _NOW,
+            _NOW, ["z@x.test"], ["CATEGORY_UPDATES", "INBOX"], _NOW,
+            _NOW, ["z@x.test"], ["CATEGORY_UPDATES", "INBOX"], _NOW,
+            _NOW, ["z@x.test"], ["CATEGORY_UPDATES", "INBOX"], _NOW,
+            _NOW, ["z@x.test"], ["CATEGORY_UPDATES", "INBOX"], _NOW,
+            _NOW, ["z@x.test"], ["CATEGORY_UPDATES", "INBOX"], _NOW,
+        ),
     )
 
     # --- apple: one-way broadcasts, toll-free, shortcode groups, windows ----
@@ -1032,8 +1089,20 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("z@x.test|gh-bot") == 4, "relayed bot payloads are noise"
     assert priority_of("z@x.test|gh-plain") == 3, "relayed human comments are cc"
     assert priority_of("z@x.test|m-otp") == 4, "login codes are noise"
+    assert priority_of("z@x.test|m-confirm-code") == 4, "confirmation codes are noise"
     assert priority_of("z@x.test|m-rsvp") == 3, "auto-RSVP notices are cc"
+    assert priority_of("z@x.test|m-shipment-confirmation") == 4, "shipment automations are noise"
     assert priority_of("z@x.test|m-corr") == 2, "known correspondents beat gmail's bulk category"
+    assert priority_of("z@x.test|m-forum-human") == 3, "human work-list posts are cc"
+    assert priority_of("z@x.test|m-forum-digest") == 4, "forum digests are noise"
+    assert priority_of("z@x.test|m-forum-newsletter") == 4, "forum newsletters are noise"
+    assert priority_of("z@x.test|m-forum-announcement") == 4, "public-list announcements are noise"
+    assert priority_of("z@x.test|m-forum-new-comment") == 3, "automated human comment relays remain cc"
+    assert priority_of("z@x.test|m-figma-upgrade") == 3, "seat requests are human-action relays"
+    assert priority_of("z@x.test|m-airtable-access") == 3, "access requests are human-action relays"
+    assert priority_of("z@x.test|m-sign-request") == 3, "signature requests are human-action relays"
+    assert priority_of("z@x.test|m-drive-share") == 3, "drive shares are human-action relays"
+    assert priority_of("z@x.test|m-vercel-access") == 3, "app access requests are human-action relays"
     # apple
     assert priority_of("z@x.test|am-oneway") == 4, "a 1:1 chat he never answers is a broadcast"
     assert priority_of("z@x.test|am-shortcode") == 4, "shortcode-named group blasts are noise"

@@ -220,7 +220,7 @@ _GMAIL_BULK_SENDER_PATTERN = (
 )
 _GMAIL_AUTOMATED_SENDER_PATTERN = (
     "'(notifications?@|digest@|updates@|alerts?@|billing@|receipts?@|invoice|"
-    "statements?@|bank@|hcb@|sign@|bot@|replies\\+|info@|contact@|hello@|"
+    "statements?@|bank@|hcb@|dinobox@|sign@|bot@|replies\\+|info@|contact@|hello@|"
     "support@|feedback@|service@|security@|account@|verify|apply@|jobs@|"
     "calendar-notification@|\\mmail@|menu@|reports?@|abuse@|coolify@|deploy@|"
     "\\mci@|build@|@members\\.|"
@@ -233,9 +233,22 @@ _GMAIL_RELAY_SENDER_PATTERN = (
     "'(notifications@github\\.com|@noreply\\.github\\.com|gitlab@|"
     "comments-noreply@docs\\.google|notify@aur\\.archlinux)'"
 )
+# Whitelisted product notifications that relay a specific person's request or
+# share to the account owner. They are still generated mail, so keep them at cc
+# instead of direct, but they are not newsletter/automation noise.
+_GMAIL_HUMAN_ACTION_RELAY = (
+    "(t.from_address ~* '(drive-shares-dm-noreply@google\\.com|"
+    "no-reply@email\\.figma\\.com|noreply@airtable\\.com|mail@signnow\\.com|"
+    "notifications@vercel\\.com|notifications@letsjelly\\.com|"
+    "notifications@mail\\.granola\\.ai|feedback@slack\\.com)' "
+    " AND (t.subject || ' ' || t.snippet) ~* '(upgrade request|requested access|"
+    "access request|signature request|shared (a |the )?(document|folder|form|file|meeting notes)|"
+    "shared with you|invited you to (edit|comment|sign|review|join|build)|"
+    "has invited you|wants access|action required|deletion request)')"
+)
 _GMAIL_OTP_SUBJECT_PATTERN = (
-    "'(login code|verification code|security code|one.?time|password reset|"
-    "identification code|2fa)'"
+    "'(login code|verification code|security code|confirmation code|authentication code|"
+    "confirm(ation)? code|one.?time|password reset|identification code|2fa)'"
 )
 _GMAIL_RSVP_SUBJECT_PATTERN = (
     "'^(accepted|declined|tentatively accepted|updated invitation|"
@@ -314,6 +327,18 @@ _GMAIL_BULK_CATEGORY = (
     "('CATEGORY_PROMOTIONS' = ANY(t.label_ids) OR 'CATEGORY_UPDATES' = ANY(t.label_ids) "
     " OR 'CATEGORY_FORUMS' = ANY(t.label_ids) OR 'CATEGORY_SOCIAL' = ANY(t.label_ids))"
 )
+# Gmail's CATEGORY_FORUMS bucket spans both real human list discussion and
+# newsletter/digest/list-announcement traffic. Preserve the former at cc, but
+# demote common broadcast shapes found while sampling the live timeline.
+_GMAIL_FORUMS_NOISE = (
+    "(t.subject ~* '(digest for .* updates? in .* topics?|recommendations from your substacks)' "
+    " OR (t.subject ~* '^\\[[^\\]]+\\]' AND EXISTS ("
+    "      SELECT 1 FROM unnest(t.to_addresses || t.cc_addresses) forum_addr "
+    "      WHERE forum_addr ~* 'googlegroups\\.com')) "
+    " OR t.snippet ~* '(google groups (logo|topic digest)|view all topics|view in browser|"
+    "dear .{0,60}(members|newlisters|craigs?newlisters))' "
+    " OR t.snippet LIKE '%%͏%%' OR t.snippet LIKE '%%­%%' OR t.snippet LIKE '%%‌%%')"
+)
 _GMAIL_AUTOMATED_FROM = (
     f"(t.from_address ~* {_GMAIL_BULK_SENDER_PATTERN} "
     f" OR t.from_address ~* {_GMAIL_AUTOMATED_SENDER_PATTERN} "
@@ -369,9 +394,11 @@ _GMAIL_EMAIL = _simple_adapter(
         "         OR t.subject ~* '^(re: )?\\[[^\\]]+\\] bump ' THEN 4 "
         "       ELSE 3 END "
         f"WHEN t.subject ~* {_GMAIL_RSVP_SUBJECT_PATTERN} THEN 3 "
-        f"WHEN 'CATEGORY_FORUMS' = ANY(t.label_ids) AND t.from_address !~* {_GMAIL_BULK_SENDER_PATTERN} THEN 3 "
         f"WHEN t.subject ~* {_GMAIL_OTP_SUBJECT_PATTERN} THEN 4 "
         f"WHEN {_GMAIL_AUTOMATED_FROM} AND t.subject ~* '^(re: )?new comment' THEN 3 "
+        f"WHEN {_GMAIL_HUMAN_ACTION_RELAY} THEN 3 "
+        f"WHEN 'CATEGORY_FORUMS' = ANY(t.label_ids) AND ({_GMAIL_AUTOMATED_FROM} OR {_GMAIL_FORUMS_NOISE}) THEN 4 "
+        f"WHEN 'CATEGORY_FORUMS' = ANY(t.label_ids) AND t.from_address !~* {_GMAIL_BULK_SENDER_PATTERN} THEN 3 "
         f"WHEN NOT {_GMAIL_AUTOMATED_FROM} AND {_GMAIL_MY_REPLY_AFTER} THEN 2 "
         f"WHEN NOT {_GMAIL_AUTOMATED_FROM} AND {_GMAIL_I_POSTED_IN_THREAD} THEN "
         f"  CASE WHEN {_GMAIL_ADDRESSED} THEN 2 ELSE 3 END "
