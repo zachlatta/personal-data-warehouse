@@ -11,14 +11,17 @@ import (
 	"fmt"
 	"html"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type PostgresStore struct {
-	db      *sql.DB
-	timeout time.Duration
+	db       *sql.DB
+	timeout  time.Duration
+	ensureMu sync.Mutex
+	ensured  bool
 }
 
 type storedMutation struct {
@@ -79,6 +82,19 @@ func (s *PostgresStore) Close() error {
 }
 
 func (s *PostgresStore) EnsureTables(ctx context.Context) error {
+	s.ensureMu.Lock()
+	defer s.ensureMu.Unlock()
+	if s.ensured {
+		return nil
+	}
+	if err := s.ensureTablesNow(ctx); err != nil {
+		return err
+	}
+	s.ensured = true
+	return nil
+}
+
+func (s *PostgresStore) ensureTablesNow(ctx context.Context) error {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 	for _, statement := range upstreamMutationSchemaStatements {

@@ -1,10 +1,21 @@
 package mutations
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestEnsureTablesLatchesAfterSuccess(t *testing.T) {
+	s := &PostgresStore{ensured: true}
+	if err := s.EnsureTables(context.Background()); err != nil {
+		t.Fatalf("expected latched EnsureTables to no-op, got %v", err)
+	}
+	if err := s.EnsureTables(context.Background()); err != nil {
+		t.Fatalf("expected second latched EnsureTables to no-op, got %v", err)
+	}
+}
 
 func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
 	mutations, err := normalizeForStorage(CreateRequestInput{

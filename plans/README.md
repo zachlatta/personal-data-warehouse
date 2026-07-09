@@ -22,7 +22,7 @@ come first.
 | 005 | CI gate: run Python (with Postgres) + full Go suite before merge | P1 | M | — | REJECTED (operator opted out 2026-07-07 — no CI gate wanted) |
 | 006 | Enforce read-only + a real timeout on the Go MCP/query SQL path | P1 | M | — | DONE |
 | 007 | Cap Slack transient-error retries instead of retrying forever | P1 | S | — | DONE (implemented, reviewed, and landed on `main`) |
-| 008 | Run the Go mutation store's schema DDL once per process, not per request | P2 | S | — | TODO |
+| 008 | Run the Go mutation store's schema DDL once per process, not per request | P2 | S | — | DONE |
 | 009 | Skip the `search_text()` recompile when its generated DDL is unchanged | P2 | M | — | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
