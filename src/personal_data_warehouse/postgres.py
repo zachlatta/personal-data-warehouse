@@ -1507,6 +1507,11 @@ class PostgresWarehouse:
                 """,
                 (source,),
             )
+        # Old deployments may have left public.clean_agent_sessions depending on
+        # the legacy public.agent_session_events table. Drop the legacy view before
+        # dropping the copied table; the canonical marts.ai_conversation_sessions
+        # view is recreated below by _ensure_clean_agent_sessions_view().
+        self._drop_legacy_view_if_present("clean_agent_sessions")
         self._raw_command(f"DROP TABLE {_identifier(legacy_schema)}.{_identifier(legacy_table)}")
 
     def ensure_timeline_tables(self) -> None:

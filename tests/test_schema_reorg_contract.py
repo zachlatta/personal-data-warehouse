@@ -313,6 +313,14 @@ def _create_legacy_agent_session_events_table(warehouse: PostgresWarehouse) -> N
 
 def test_old_layout_mixed_ai_events_migrate_to_source_tables_without_legacy_view(warehouse: PostgresWarehouse) -> None:
     _create_legacy_agent_session_events_table(warehouse)
+    warehouse._raw_command(
+        f"""
+        CREATE VIEW "{warehouse.schema_namespace}".clean_agent_sessions AS
+        SELECT source, session_id, count(*) AS event_count
+        FROM "{warehouse.schema_namespace}".agent_session_events
+        GROUP BY source, session_id
+        """
+    )
     legacy_row = _agent_event_row(source="claude_code", session_id="legacy-session", event_uuid="legacy-event", seq=1)
     columns = AGENT_SESSION_EVENT_COLUMNS
     placeholders = ", ".join(["%s"] * len(columns))
@@ -345,11 +353,11 @@ def test_old_layout_mixed_ai_events_migrate_to_source_tables_without_legacy_view
         """
         SELECT table_name
         FROM information_schema.tables
-        WHERE table_schema = %s AND table_name = 'agent_session_events'
+        WHERE table_schema = %s AND table_name IN ('agent_session_events', 'clean_agent_sessions')
         UNION ALL
         SELECT table_name
         FROM information_schema.views
-        WHERE table_schema = %s AND table_name = 'agent_session_events'
+        WHERE table_schema = %s AND table_name IN ('agent_session_events', 'clean_agent_sessions')
         """,
         (warehouse.schema_namespace, warehouse.schema_namespace),
     )
