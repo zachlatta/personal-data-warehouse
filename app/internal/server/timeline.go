@@ -218,6 +218,33 @@ SELECT adapter, backfill_done, backfill_cursor_event_ts, backfill_rows, incremen
 FROM ` + warehouse.SQLRelation("timeline_sync_state") + `
 ORDER BY adapter`
 
+type timelineFilterCatalogEntry struct {
+	source string
+	kind   string
+}
+
+// A cheap static catalog keeps the sidebar usable while the expensive exact
+// count aggregates warm in the background. Keep this list in step with the
+// Python timeline adapter registry in src/personal_data_warehouse/timeline.py.
+var timelineFilterCatalog = []timelineFilterCatalogEntry{
+	{source: "gmail", kind: "email"},
+	{source: "slack", kind: "message"},
+	{source: "slack", kind: "file_share"},
+	{source: "apple_messages", kind: "message"},
+	{source: "whatsapp", kind: "message"},
+	{source: "apple_notes", kind: "note_edit"},
+	{source: "voice_memos", kind: "voice_memo"},
+	{source: "calendar", kind: "event"},
+	{source: "google_drive", kind: "file_change"},
+	{source: "contacts", kind: "contact_update"},
+	{source: "mutations", kind: "mutation"},
+	{source: "mutations", kind: "mutation_request"},
+	{source: "warehouse", kind: "enrichment_run"},
+	{source: "agent_sessions", kind: "agent_session"},
+}
+
+var timelinePriorityCatalog = []int64{1, 2, 3, 4, 5}
+
 // handleSources serves the sidebar's counts. The aggregates behind them scan
 // the whole timeline (minutes on a cold multi-GB table), so the handler never
 // makes a request wait for them: it serves the cached payload (refreshing in
@@ -245,11 +272,33 @@ func (s *timelineService) handleSources(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, map[string]any{
-		"sources":    []any{},
+		"sources":    timelineFilterCatalogRows(),
 		"sync":       nonNilRows(syncRows.Rows),
-		"priorities": []any{},
+		"priorities": timelinePriorityCatalogRows(),
 		"warming":    true,
 	})
+}
+
+func timelineFilterCatalogRows() []map[string]any {
+	rows := make([]map[string]any, 0, len(timelineFilterCatalog))
+	for _, entry := range timelineFilterCatalog {
+		rows = append(rows, map[string]any{
+			"source": entry.source,
+			"kind":   entry.kind,
+			"count":  nil,
+			"oldest": nil,
+			"newest": nil,
+		})
+	}
+	return rows
+}
+
+func timelinePriorityCatalogRows() []map[string]any {
+	rows := make([]map[string]any, 0, len(timelinePriorityCatalog))
+	for _, priority := range timelinePriorityCatalog {
+		rows = append(rows, map[string]any{"priority": priority, "count": nil})
+	}
+	return rows
 }
 
 func (s *timelineService) refreshSourcesAsync() {

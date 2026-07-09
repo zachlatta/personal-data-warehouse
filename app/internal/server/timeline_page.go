@@ -291,7 +291,8 @@ a.filelink:hover { text-decoration: underline; }
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
     cursor: "", exhausted: false, loading: false,
-    sources: {}, kinds: {}, priorities: {}, lastDay: "", selected: null, count: 0
+    sources: {}, kinds: {}, priorities: {}, haveCounts: false,
+    lastDay: "", selected: null, count: 0
   };
 
   var PRIORITY_LABELS = {
@@ -339,6 +340,9 @@ a.filelink:hover { text-decoration: underline; }
     for (var key in map) if (map[key]) on.push(key);
     return on.join(",");
   }
+  function countLabel(count) {
+    return (typeof count === "number" && isFinite(count)) ? count.toLocaleString() : "…";
+  }
   function renderChips(listNode, catalog, map, colorize) {
     listNode.textContent = "";
     catalog.forEach(function (entry) {
@@ -347,7 +351,7 @@ a.filelink:hover { text-decoration: underline; }
       dot.style.background = colorize ? hue(entry.name) : "var(--line2)";
       chip.appendChild(dot);
       chip.appendChild(h("span", "nm", entry.label || entry.name));
-      chip.appendChild(h("span", "ct", entry.count.toLocaleString()));
+      chip.appendChild(h("span", "ct", countLabel(entry.count)));
       chip.addEventListener("click", function () {
         map[entry.name] = !map[entry.name];
         chip.classList.toggle("on");
@@ -367,24 +371,38 @@ a.filelink:hover { text-decoration: underline; }
           loadSources().catch(function () {});
         }, 8000);
       }
-      if (!body.warming) renderCounts(body);
+      if (!body.warming || !state.haveCounts) renderCounts(body);
       renderSync(body);
     });
   }
 
   function renderCounts(body) {
       var bySource = {}, byKind = {}, total = 0, oldest = "", newest = "";
+      function addBucket(buckets, key, rowCount, known) {
+        if (!buckets[key]) buckets[key] = { count: 0, known: false };
+        if (known) {
+          buckets[key].count += rowCount;
+          buckets[key].known = true;
+        }
+      }
       (body.sources || []).forEach(function (row) {
-        total += row.count;
-        bySource[row.source] = (bySource[row.source] || 0) + row.count;
-        byKind[row.kind] = (byKind[row.kind] || 0) + row.count;
-        if (!oldest || row.oldest < oldest) oldest = row.oldest;
-        if (!newest || row.newest > newest) newest = row.newest;
+        var known = typeof row.count === "number" && isFinite(row.count);
+        var rowCount = known ? row.count : 0;
+        if (known) total += rowCount;
+        addBucket(bySource, row.source, rowCount, known);
+        addBucket(byKind, row.kind, rowCount, known);
+        if (row.oldest && (!oldest || row.oldest < oldest)) oldest = row.oldest;
+        if (row.newest && (!newest || row.newest > newest)) newest = row.newest;
       });
       function toCatalog(counts) {
         var list = [];
-        for (var key in counts) list.push({ name: key, count: counts[key] });
-        list.sort(function (a, b) { return b.count - a.count; });
+        for (var key in counts) list.push({ name: key, count: counts[key].known ? counts[key].count : null });
+        list.sort(function (a, b) {
+          var ak = typeof a.count === "number", bk = typeof b.count === "number";
+          if (ak && bk && a.count !== b.count) return b.count - a.count;
+          if (ak !== bk) return ak ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        });
         return list;
       }
       renderChips(el("srclist"), toCatalog(bySource), state.sources, true);
@@ -397,8 +415,13 @@ a.filelink:hover { text-decoration: underline; }
         };
       });
       renderChips(el("prioritylist"), priorityCatalog, state.priorities, false);
-      el("stats").innerHTML = "<b>" + total.toLocaleString() + "</b> events · " +
-        (oldest ? oldest.slice(0, 10) : "—") + " → " + (newest ? newest.slice(0, 10) : "—");
+      if (body.warming) {
+        el("stats").textContent = "warming filter counts…";
+      } else {
+        state.haveCounts = true;
+        el("stats").innerHTML = "<b>" + total.toLocaleString() + "</b> events · " +
+          (oldest ? oldest.slice(0, 10) : "—") + " → " + (newest ? newest.slice(0, 10) : "—");
+      }
   }
 
   function renderSync(body) {

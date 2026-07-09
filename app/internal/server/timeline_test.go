@@ -331,8 +331,14 @@ func TestTimelineSourcesAggregatesAndCaches(t *testing.T) {
 	if err := json.Unmarshal(body, &first); err != nil {
 		t.Fatal(err)
 	}
-	if !first.Warming || len(first.Sync) != 1 || len(first.Sources) != 0 {
-		t.Fatalf("first payload should be warming with sync rows only: %s", body)
+	if !first.Warming || len(first.Sync) != 1 {
+		t.Fatalf("first payload should be warming with sync rows: %s", body)
+	}
+	if !timelinePayloadHasSourceKind(first.Sources, "gmail", "email") || !timelinePayloadHasSourceKind(first.Sources, "slack", "message") {
+		t.Fatalf("warming payload should include filter catalog so the sidebar is usable immediately: %s", body)
+	}
+	if !timelinePayloadHasPriority(first.Priorities, 1) || !timelinePayloadHasPriority(first.Priorities, 5) {
+		t.Fatalf("warming payload should include priority catalog: %s", body)
 	}
 
 	var warmed sourcesPayload
@@ -362,6 +368,24 @@ func TestTimelineSourcesAggregatesAndCaches(t *testing.T) {
 	if runner.callCount() != callsAfterWarm {
 		t.Fatalf("cached read must not re-query; calls %d -> %d", callsAfterWarm, runner.callCount())
 	}
+}
+
+func timelinePayloadHasSourceKind(rows []map[string]any, source, kind string) bool {
+	for _, row := range rows {
+		if row["source"] == source && row["kind"] == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func timelinePayloadHasPriority(rows []map[string]any, priority int64) bool {
+	for _, row := range rows {
+		if fmt.Sprint(row["priority"]) == fmt.Sprint(priority) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestTimelineChildQueriesCoverEveryEventTable(t *testing.T) {
