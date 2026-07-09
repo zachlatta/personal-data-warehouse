@@ -15,6 +15,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 // claudeDesktopCredentialEndpoint is the one non-object-store ingest endpoint:
@@ -60,7 +61,9 @@ func (s *claudeDesktopCredentialStore) Close() error {
 	return s.db.Close()
 }
 
-const claudeDesktopCredentialDDL = `CREATE TABLE IF NOT EXISTS claude_desktop_credentials (
+const privateSchemaDDL = `CREATE SCHEMA IF NOT EXISTS "private"`
+
+var claudeDesktopCredentialDDL = `CREATE TABLE IF NOT EXISTS ` + warehouse.SQLRelation("claude_desktop_credentials") + ` (
 	account text PRIMARY KEY,
 	session_key text NOT NULL,
 	org_id text NOT NULL DEFAULT '',
@@ -70,6 +73,9 @@ const claudeDesktopCredentialDDL = `CREATE TABLE IF NOT EXISTS claude_desktop_cr
 )`
 
 func (s *claudeDesktopCredentialStore) ensure(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, privateSchemaDDL); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, claudeDesktopCredentialDDL)
 	return err
 }
@@ -95,7 +101,7 @@ func (s *claudeDesktopCredentialStore) upsert(ctx context.Context, cred claudeDe
 		capturedAt = time.Now().UTC()
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO claude_desktop_credentials (account, session_key, org_id, expires_at, captured_at, updated_at)
+		INSERT INTO `+warehouse.SQLRelation("claude_desktop_credentials")+` (account, session_key, org_id, expires_at, captured_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, now())
 		ON CONFLICT (account) DO UPDATE SET
 			session_key = EXCLUDED.session_key,

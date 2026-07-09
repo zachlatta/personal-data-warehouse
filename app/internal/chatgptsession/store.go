@@ -16,6 +16,8 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 // Ack is the (secret-free) acknowledgement returned to the client.
@@ -53,8 +55,10 @@ func NewPostgresStore(databaseURL string, timeout time.Duration) (*PostgresStore
 
 func (s *PostgresStore) Close() error { return s.db.Close() }
 
-const createTableSQL = `
-CREATE TABLE IF NOT EXISTS chatgpt_sessions (
+const createSchemaSQL = `CREATE SCHEMA IF NOT EXISTS "private"`
+
+var createTableSQL = `
+CREATE TABLE IF NOT EXISTS ` + warehouse.SQLRelation("chatgpt_sessions") + ` (
     account text NOT NULL,
     session_key text NOT NULL DEFAULT 'default',
     session_token text NOT NULL DEFAULT '',
@@ -66,8 +70,8 @@ CREATE TABLE IF NOT EXISTS chatgpt_sessions (
     PRIMARY KEY (account, session_key)
 )`
 
-const upsertSQL = `
-INSERT INTO chatgpt_sessions (
+var upsertSQL = `
+INSERT INTO ` + warehouse.SQLRelation("chatgpt_sessions") + ` (
     account, session_key, session_token, source_browser, token_sha256,
     published_at, updated_at, sync_version
 ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7)
@@ -82,6 +86,9 @@ ON CONFLICT (account, session_key) DO UPDATE SET
 func (s *PostgresStore) Upsert(ctx context.Context, account, sessionKey, sessionToken, sourceBrowser string, now time.Time) (Ack, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
+	if _, err := s.db.ExecContext(ctx, createSchemaSQL); err != nil {
+		return Ack{}, fmt.Errorf("ensure private schema: %w", err)
+	}
 	if _, err := s.db.ExecContext(ctx, createTableSQL); err != nil {
 		return Ack{}, fmt.Errorf("ensure chatgpt_sessions: %w", err)
 	}

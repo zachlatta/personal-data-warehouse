@@ -57,7 +57,7 @@ COMMANDS
                                --output FMT  csv, json, or nd-json. If omitted,
                                              defaults to csv and prints a note.
                                --file PATH   Read the SQL statement from a file.
-  columns <table>            List a table's column names and types. Use this (or
+  columns <schema.table>     List a relation's column names and types. Use this (or
                              schema) before writing SQL so you don't guess column
                              names.
   schema                     Run schema_overview and print the warehouse schema
@@ -101,9 +101,9 @@ EXAMPLES
   pdw list
   pdw describe sql
   pdw call schema_overview
-  pdw columns gmail_messages
+  pdw columns gmail.messages
   pdw sql 'SELECT 1'
-  pdw sql -q 'How many rows?' 'SELECT count(*) FROM gmail_messages'
+  pdw sql -q 'How many rows?' 'SELECT count(*) FROM gmail.messages'
   pdw sql --output json -q 'What time is it?' 'SELECT now()'
   pdw sql -q 'Find calendar transcripts mentioning Vercel' --file query.sql
   pdw sql -q 'Recent Slack messages in a channel' < query.sql
@@ -410,14 +410,15 @@ func runColumns(client *cliclient.Client, args []string, stdout, stderr io.Write
 		fmt.Fprintln(stderr, "pdw columns: unexpected extra arguments; pass a single table name")
 		return 2
 	}
-	table := strings.TrimSpace(args[0])
-	if !validIdentifier(table) {
-		fmt.Fprintln(stderr, "pdw columns: table name must be a bare identifier (letters, digits, underscores)")
+	relation := strings.TrimSpace(args[0])
+	schema, table, ok := parseSchemaQualifiedIdentifier(relation)
+	if !ok {
+		fmt.Fprintln(stderr, "pdw columns: table name must be a schema-qualified identifier like gmail.messages")
 		return 2
 	}
 	sql := "SELECT column_name, data_type, is_nullable FROM information_schema.columns " +
-		"WHERE table_schema = current_schema() AND table_name = '" + table + "' ORDER BY ordinal_position"
-	input, err := json.Marshal(sqlCommandInput{Question: "What columns does the " + table + " table have?", SQL: sql, Format: "csv"})
+		"WHERE table_schema = '" + schema + "' AND table_name = '" + table + "' ORDER BY ordinal_position"
+	input, err := json.Marshal(sqlCommandInput{Question: "What columns does the " + relation + " table have?", SQL: sql, Format: "csv"})
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw columns:", err)
 		return 1
@@ -442,6 +443,14 @@ func runColumns(client *cliclient.Client, args []string, stdout, stderr io.Write
 		return 1
 	}
 	return printSQLRows(payload.Rows, "csv", stdout)
+}
+
+func parseSchemaQualifiedIdentifier(s string) (schema string, table string, ok bool) {
+	parts := strings.Split(s, ".")
+	if len(parts) != 2 || !validIdentifier(parts[0]) || !validIdentifier(parts[1]) {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 func validIdentifier(s string) bool {

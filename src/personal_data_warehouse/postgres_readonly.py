@@ -75,28 +75,30 @@ class PostgresReadOnlyService:
             database = current_database_name(database_result) or "postgres"
             tables_result = self._runner.query(
                 """
-                SELECT table_name AS name
+                SELECT table_schema AS schema, table_name AS name
                 FROM information_schema.tables
-                WHERE table_schema = current_schema()
+                WHERE table_schema = ANY(current_schemas(false))
+                  AND table_schema <> 'public'
                   AND table_type = 'BASE TABLE'
-                ORDER BY table_name
+                ORDER BY table_schema, table_name
                 """,
                 max_rows=0,
             )
-            tables = table_names(tables_result)
+            tables = table_refs(tables_result)
 
             sections: list[str] = []
             fields: list[FieldTruncation] = []
-            for table in tables:
-                columns = self._describe_columns(table=table)
+            for schema, table in tables:
+                relation_name = f"{schema}.{table}"
+                columns = self._describe_columns(schema=schema, table=table)
                 if table in SCHEMA_SAMPLE_EXCLUDED_TABLES:
                     if columns:
-                        sections.append(f"# {database}.{table}\n\n{rows_to_csv(['column'], [{'column': column} for column in columns])}")
+                        sections.append(f"# {database}.{relation_name}\n\n{rows_to_csv(['column'], [{'column': column} for column in columns])}")
                     continue
-                sample = self._sample_table(table=table, columns=columns)
+                sample = self._sample_table(schema=schema, table=table, columns=columns)
                 if sample.error:
                     return sample
-                sections.append(f"# {database}.{table}\n\n{sample.csv}")
+                sections.append(f"# {database}.{relation_name}\n\n{sample.csv}")
                 fields.extend(sample.truncated.fields)
             return ReadOnlyQueryResult(
                 sql=result_sql,
@@ -112,12 +114,12 @@ class PostgresReadOnlyService:
             message = str(exc)
             return ReadOnlyQueryResult(sql=result_sql, csv=rows_to_csv(["error"], [{"error": message}]), error=message)
 
-    def _describe_columns(self, *, table: str) -> list[str]:
+    def _describe_columns(self, *, schema: str, table: str) -> list[str]:
         result = self._runner.query(
             f"""
             SELECT column_name AS name
             FROM information_schema.columns
-            WHERE table_schema = current_schema()
+            WHERE table_schema = '{schema.replace("'", "''")}'
               AND table_name = '{table.replace("'", "''")}'
             ORDER BY ordinal_position
             """,
@@ -125,10 +127,11 @@ class PostgresReadOnlyService:
         )
         return described_column_names(result)
 
-    def _sample_table(self, *, table: str, columns: Sequence[str]) -> ReadOnlyQueryResult:
+    def _sample_table(self, *, schema: str, table: str, columns: Sequence[str]) -> ReadOnlyQueryResult:
+        table_identifier = f"{quote_postgres_identifier(schema)}.{quote_postgres_identifier(table)}"
         if not columns:
-            return ReadOnlyQueryResult(sql=f"SELECT * FROM {quote_postgres_identifier(table)} LIMIT 0", csv="")
-        sample_sql = preview_sample_sql(quote_postgres_identifier(table), columns)
+            return ReadOnlyQueryResult(sql=f"SELECT * FROM {table_identifier} LIMIT 0", csv="")
+        sample_sql = preview_sample_sql(table_identifier, columns)
         raw = self._runner.query(sample_sql, max_rows=SCHEMA_SAMPLE_ROWS)
         rows, truncation = preview_rows(columns, raw.rows)
         return ReadOnlyQueryResult(sql=sample_sql, csv=rows_to_csv(columns, rows), truncated=truncation)
@@ -191,11 +194,14 @@ def current_database_name(result: RawResult) -> str:
     return str(result.rows[0].get(result.columns[0]) or "")
 
 
-def table_names(result: RawResult) -> list[str]:
+def table_refs(result: RawResult) -> list[tuple[str, str]]:
     if not result.columns:
         return []
-    first_column = result.columns[0]
-    return [str(row.get(first_column) or "") for row in result.rows if row.get(first_column)]
+    return [
+        (str(row.get("schema") or ""), str(row.get("name") or ""))
+        for row in result.rows
+        if row.get("schema") and row.get("name")
+    ]
 
 
 def quote_postgres_identifier(identifier: str) -> str:

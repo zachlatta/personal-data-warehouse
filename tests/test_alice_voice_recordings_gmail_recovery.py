@@ -157,7 +157,7 @@ def test_alice_gmail_recovery_archives_email_body_attachments_and_metadata() -> 
     assert summary.attachments_uploaded == 2
     assert {file["kind"] for file in store.files} == {EMAIL_BODY_KIND, TRANSCRIPT_KIND, AUDIO_KIND}
     assert store.json_files[0]["kind"] == EMAIL_METADATA_KIND
-    assert all(str(file["object_key"]).startswith("alice-app-voice-recordings/library/2024/12/") for file in store.files)
+    assert all(str(file["object_key"]).startswith("alice-voice-recordings/library/2024/12/") for file in store.files)
     metadata = store.json_files[0]["payload"]
     assert metadata["recording"]["recording_id"] == "alice-guid-1"
     assert metadata["recording"]["title"] == "Lost Recording"

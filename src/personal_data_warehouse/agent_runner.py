@@ -729,7 +729,7 @@ Run one read-only Postgres query through the per-run tool proxy. The raw Postgre
 Usage:
 
 ```bash
-"$PDW_POSTGRES_QUERY" "SELECT * FROM calendar_events LIMIT 5"
+"$PDW_POSTGRES_QUERY" "SELECT * FROM google_calendar.events LIMIT 5"
 cat query.sql | "$PDW_POSTGRES_QUERY"
 ```
 """

@@ -49,6 +49,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 
 from personal_data_warehouse.config import normalize_postgres_url
+from personal_data_warehouse.relations import physical_schema_names, qualify_sql_relations
 
 logger = logging.getLogger(__name__)
 
@@ -1051,11 +1052,11 @@ _ENRICHMENT_RUN = _simple_adapter(
 
 
 def _agent_session_adapter() -> TimelineAdapter:
-    """Session-level roll-up over agent_session_events.
+    """Session-level roll-up over marts.ai_conversation_events.
 
     One timeline row per session/conversation (Claude Code, Codex, OpenClaw,
     Claude Desktop, ChatGPT — the row's ``source`` is the per-session source
-    value), mirroring the clean_agent_sessions view. Individual transcript
+    value), matching the marts.ai_conversation_sessions roll-up. Individual transcript
     lines are surfaced through the session's detail view, not as separate
     timeline entries.
 
@@ -1303,8 +1304,13 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "whatsapp_contacts": _entity("sender dimension joined into message events"),
     "whatsapp_media_items": _detail("whatsapp_messages"),
     "whatsapp_client_sessions": _state("linked-device session snapshot"),
-    # Agent sessions (Claude Code / Codex / OpenClaw / Claude Desktop / ChatGPT)
-    "agent_session_events": _events("rolled up to one timeline row per session"),
+    # AI conversations (source-owned raw tables, unified through marts.ai_conversation_events)
+    "agent_session_events": _state("legacy mixed table name; migrated into source-owned AI event tables"),
+    "chatgpt_events": _events("rolled up to one timeline row per conversation"),
+    "claude_desktop_events": _events("rolled up to one timeline row per conversation"),
+    "claude_code_events": _events("rolled up to one timeline row per session"),
+    "codex_events": _events("rolled up to one timeline row per session"),
+    "openclaw_events": _events("rolled up to one timeline row per session"),
     "chatgpt_sessions": _state("chatgpt.com web-session credential"),
     "chatgpt_conversation_sync": _state("per-conversation poll watermark"),
     "claude_desktop_credentials": _state("claude.ai session credential"),
@@ -1334,6 +1340,8 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "upstream_mutation_requests": _events(),
     "upstream_mutation_events": _detail("upstream_mutations"),
     "upstream_mutation_request_events": _detail("upstream_mutation_requests"),
+    # Search surfaces
+    "search_schema_state": _state("search_text DDL signature cache"),
     # The timeline itself
     "timeline_events": _state("the unified timeline"),
     "timeline_sync_state": _state("per-adapter sync cursors"),
@@ -1356,6 +1364,7 @@ RAW_DDL_TABLES: tuple[str, ...] = (
     "upstream_mutations",
     "upstream_mutation_events",
     "upstream_mutation_request_events",
+    "search_schema_state",
 )
 
 
@@ -1397,16 +1406,16 @@ _TIMELINE_CONTENT_COLUMNS = (
 )
 
 
-def timeline_upsert_sql() -> str:
+def timeline_upsert_sql(*, table_ref: str = "timeline_events", sequence_ref: str = "timeline_events_seq") -> str:
     assignments = ", ".join(f"{col} = EXCLUDED.{col}" for col in _TIMELINE_UPSERT_COLUMNS[2:])
-    current = ", ".join(f"timeline_events.{col}" for col in _TIMELINE_CONTENT_COLUMNS)
+    current = ", ".join(f"target.{col}" for col in _TIMELINE_CONTENT_COLUMNS)
     incoming = ", ".join(f"EXCLUDED.{col}" for col in _TIMELINE_CONTENT_COLUMNS)
     return f"""
-        INSERT INTO timeline_events ({", ".join(_TIMELINE_UPSERT_COLUMNS)})
+        INSERT INTO {table_ref} AS target ({", ".join(_TIMELINE_UPSERT_COLUMNS)})
         VALUES %s
         ON CONFLICT (adapter, event_id) DO UPDATE SET
             {assignments},
-            seq = nextval('timeline_events_seq'),
+            seq = nextval('{sequence_ref}'),
             updated_at = now()
         WHERE ({current}) IS DISTINCT FROM ({incoming})
     """
@@ -1470,13 +1479,27 @@ class TimelineSyncEngine:
 
     # -- connections ---------------------------------------------------------
 
+    def _search_path_sql(self, namespace: str) -> str:
+        parts = ['"' + schema.replace('"', '""') + '"' for schema in physical_schema_names(namespace=namespace)]
+        parts.append("public")
+        return "SET search_path TO " + ", ".join(parts)
+
+    def _source_sql(self, sql: str) -> str:
+        return qualify_sql_relations(sql, namespace=self._source_schema)
+
+    def _dest_sql(self, sql: str) -> str:
+        return qualify_sql_relations(sql, namespace=self._dest_schema)
+
+    def _qualified_regclass(self, logical_name: str, *, namespace: str) -> str:
+        return qualify_sql_relations(logical_name, namespace=namespace)
+
     def _connect(self) -> None:
         if self._source_conn is None:
             self._source_conn = psycopg2.connect(self._source_url)
             self._source_conn.autocommit = True
             with self._source_conn.cursor() as cursor:
                 cursor.execute("SET default_transaction_read_only = on")
-                cursor.execute(f'SET search_path TO "{self._source_schema}"')
+                cursor.execute(self._search_path_sql(self._source_schema))
         if self._dest_conn is None:
             # Import here to avoid a module cycle (postgres.py is the DDL layer).
             from personal_data_warehouse.postgres import PostgresWarehouse
@@ -1487,7 +1510,7 @@ class TimelineSyncEngine:
             self._dest_conn = psycopg2.connect(self._dest_url)
             self._dest_conn.autocommit = True
             with self._dest_conn.cursor() as cursor:
-                cursor.execute(f'SET search_path TO "{self._dest_schema}"')
+                cursor.execute(self._search_path_sql(self._dest_schema))
 
     def close(self) -> None:
         for conn in (self._source_conn, self._dest_conn):
@@ -1501,12 +1524,14 @@ class TimelineSyncEngine:
     def _load_state(self, adapter: TimelineAdapter) -> _AdapterState:
         with self._dest_conn.cursor() as cursor:
             cursor.execute(
-                """
-                SELECT backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
-                       watermark_ingest_ts, watermark_event_id
-                FROM timeline_sync_state
-                WHERE adapter = %s
-                """,
+                self._dest_sql(
+                    """
+                    SELECT backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
+                           watermark_ingest_ts, watermark_event_id
+                    FROM timeline_sync_state
+                    WHERE adapter = %s
+                    """
+                ),
                 (adapter.name,),
             )
             row = cursor.fetchone()
@@ -1522,7 +1547,7 @@ class TimelineSyncEngine:
         # current ingestion high-water so incremental only tails NEW rows,
         # and let the backfill (newest-first) load everything already there.
         with self._source_conn.cursor() as cursor:
-            cursor.execute(adapter.max_ingest_sql)
+            cursor.execute(self._source_sql(adapter.max_ingest_sql))
             max_ingest = cursor.fetchone()[0]
         state = _AdapterState(
             backfill_cursor_ts=BACKFILL_CURSOR_START,
@@ -1537,22 +1562,24 @@ class TimelineSyncEngine:
     def _save_state(self, adapter: TimelineAdapter, state: _AdapterState, error: str = "") -> None:
         with self._dest_conn.cursor() as cursor:
             cursor.execute(
-                """
-                INSERT INTO timeline_sync_state (
-                    adapter, backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
-                    watermark_ingest_ts, watermark_event_id, last_run_at, last_error, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, now(), %s, now())
-                ON CONFLICT (adapter) DO UPDATE SET
-                    backfill_cursor_event_ts = EXCLUDED.backfill_cursor_event_ts,
-                    backfill_cursor_event_id = EXCLUDED.backfill_cursor_event_id,
-                    backfill_done = EXCLUDED.backfill_done,
-                    watermark_ingest_ts = EXCLUDED.watermark_ingest_ts,
-                    watermark_event_id = EXCLUDED.watermark_event_id,
-                    last_run_at = now(),
-                    last_error = EXCLUDED.last_error,
-                    updated_at = now()
-                """,
+                self._dest_sql(
+                    """
+                    INSERT INTO timeline_sync_state (
+                        adapter, backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
+                        watermark_ingest_ts, watermark_event_id, last_run_at, last_error, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, now(), %s, now())
+                    ON CONFLICT (adapter) DO UPDATE SET
+                        backfill_cursor_event_ts = EXCLUDED.backfill_cursor_event_ts,
+                        backfill_cursor_event_id = EXCLUDED.backfill_cursor_event_id,
+                        backfill_done = EXCLUDED.backfill_done,
+                        watermark_ingest_ts = EXCLUDED.watermark_ingest_ts,
+                        watermark_event_id = EXCLUDED.watermark_event_id,
+                        last_run_at = now(),
+                        last_error = EXCLUDED.last_error,
+                        updated_at = now()
+                    """
+                ),
                 (
                     adapter.name,
                     state.backfill_cursor_ts,
@@ -1570,8 +1597,10 @@ class TimelineSyncEngine:
         assert column in ("backfill_rows", "incremental_rows")
         with self._dest_conn.cursor() as cursor:
             cursor.execute(
-                f"UPDATE timeline_sync_state SET {column} = {column} + %s, updated_at = now() "
-                "WHERE adapter = %s",
+                self._dest_sql(
+                    f"UPDATE timeline_sync_state SET {column} = {column} + %s, updated_at = now() "
+                    "WHERE adapter = %s"
+                ),
                 (amount, adapter.name),
             )
 
@@ -1579,7 +1608,7 @@ class TimelineSyncEngine:
 
     def _fetch(self, sql: str, params: dict[str, Any]) -> list[tuple[Any, ...]]:
         with self._source_conn.cursor() as cursor:
-            cursor.execute(sql, params)
+            cursor.execute(self._source_sql(sql), params)
             return cursor.fetchall()
 
     def _upsert(self, adapter: TimelineAdapter, rows: list[tuple[Any, ...]]) -> None:
@@ -1598,7 +1627,10 @@ class TimelineSyncEngine:
         with self._dest_conn.cursor() as cursor:
             execute_values(
                 cursor,
-                timeline_upsert_sql(),
+                timeline_upsert_sql(
+                    table_ref=self._dest_sql("timeline_events"),
+                    sequence_ref=self._dest_sql("timeline_events_seq"),
+                ),
                 values,
                 template=_TIMELINE_INSERT_TEMPLATE,
                 page_size=1000,
@@ -1667,40 +1699,44 @@ class TimelineSyncEngine:
         the gmail adapter's known-correspondent rule. Refreshed from the
         source at most once per day; skipped when the source has no gmail.
         """
+        timeline_correspondents = self._qualified_regclass("timeline_gmail_correspondents", namespace=self._dest_schema)
         with self._dest_conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT to_regclass('timeline_gmail_correspondents') IS NOT NULL"
-            )
+            cursor.execute("SELECT to_regclass(%s) IS NOT NULL", (timeline_correspondents,))
             if not cursor.fetchone()[0]:
                 return
-            cursor.execute("SELECT max(refreshed_at) FROM timeline_gmail_correspondents")
+            cursor.execute(self._dest_sql("SELECT max(refreshed_at) FROM timeline_gmail_correspondents"))
             last = cursor.fetchone()[0]
         if last is not None and datetime.now(tz=UTC) - last < timedelta(hours=24):
             return
+        gmail_messages = self._qualified_regclass("gmail_messages", namespace=self._source_schema)
         with self._source_conn.cursor() as cursor:
-            cursor.execute("SELECT to_regclass('gmail_messages') IS NOT NULL")
+            cursor.execute("SELECT to_regclass(%s) IS NOT NULL", (gmail_messages,))
             if not cursor.fetchone()[0]:
                 return
             cursor.execute(
-                """
-                SELECT lower(COALESCE(NULLIF(substring(rcpt FROM '<([^>]+)>'), ''), rcpt)) AS addr,
-                       count(*) AS n_sent_to,
-                       max(m.internal_date) AS last_sent_at
-                FROM gmail_messages m
-                CROSS JOIN LATERAL unnest(m.to_addresses) AS rcpt
-                WHERE m.from_address ILIKE '%%' || m.account || '%%'
-                   OR EXISTS (SELECT 1 FROM gmail_sync_state s
-                              WHERE s.account <> '' AND m.from_address ILIKE '%%' || s.account || '%%')
-                GROUP BY 1
-                """
+                self._source_sql(
+                    """
+                    SELECT lower(COALESCE(NULLIF(substring(rcpt FROM '<([^>]+)>'), ''), rcpt)) AS addr,
+                           count(*) AS n_sent_to,
+                           max(m.internal_date) AS last_sent_at
+                    FROM gmail_messages m
+                    CROSS JOIN LATERAL unnest(m.to_addresses) AS rcpt
+                    WHERE m.from_address ILIKE '%%' || m.account || '%%'
+                       OR EXISTS (SELECT 1 FROM gmail_sync_state s
+                                  WHERE s.account <> '' AND m.from_address ILIKE '%%' || s.account || '%%')
+                    GROUP BY 1
+                    """
+                )
             )
             rows = cursor.fetchall()
         with self._dest_conn.cursor() as cursor:
-            cursor.execute("DELETE FROM timeline_gmail_correspondents")
+            cursor.execute(self._dest_sql("DELETE FROM timeline_gmail_correspondents"))
             execute_values(
                 cursor,
-                "INSERT INTO timeline_gmail_correspondents (addr, n_sent_to, last_sent_at) "
-                "VALUES %s ON CONFLICT (addr) DO NOTHING",
+                self._dest_sql(
+                    "INSERT INTO timeline_gmail_correspondents (addr, n_sent_to, last_sent_at) "
+                    "VALUES %s ON CONFLICT (addr) DO NOTHING"
+                ),
                 rows,
             )
 

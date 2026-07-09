@@ -131,6 +131,10 @@ def api_recording() -> dict[str, object]:
     }
 
 
+def test_alice_archive_source_uses_canonical_schema_source_name() -> None:
+    assert SOURCE == "alice_voice_recordings"
+
+
 def test_alice_api_recording_shape_maps_to_archive_identity() -> None:
     assert recording_id_from_upload_request(api_recording(), recording_url="") == "alice-guid-1"
     assert media_url_from_recording(api_recording()).endswith("/download_media_file")
@@ -179,9 +183,9 @@ def test_alice_import_writes_voice_memos_style_audio_and_json_sidecar() -> None:
     assert summary.metadata_uploaded == 1
     audio_key = store.files[0]["object_key"]
     metadata_key = store.json_files[0]["object_key"]
-    assert str(audio_key).startswith("alice-app-voice-recordings/library/2026/05/2026-05-12-")
+    assert str(audio_key).startswith("alice-voice-recordings/library/2026/05/2026-05-12-")
     assert str(audio_key).endswith(".mp3")
-    assert str(metadata_key).startswith("alice-app-voice-recordings/library/2026/05/2026-05-12-")
+    assert str(metadata_key).startswith("alice-voice-recordings/library/2026/05/2026-05-12-")
     assert str(metadata_key).endswith(".json")
     assert store.files[0]["app_properties"] == {"alice_upload_id": "alice-upload-1"}
     assert store.json_files[0]["source_content_sha256"] == store.files[0]["content_sha256"]
@@ -227,7 +231,7 @@ def test_alice_import_preserves_metadata_when_audio_url_is_missing() -> None:
     assert summary.metadata_uploaded == 1
     assert store.files == []
     metadata_key = store.json_files[0]["object_key"]
-    assert metadata_key == "alice-app-voice-recordings/library/2026/05/2026-05-12-alice-alice-upload-1.json"
+    assert metadata_key == "alice-voice-recordings/library/2026/05/2026-05-12-alice-alice-upload-1.json"
     assert store.json_files[0]["source_content_sha256"] is None
 
 

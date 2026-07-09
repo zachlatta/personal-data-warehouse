@@ -12,9 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 // fakeTimelineRunner satisfies both query.Runner and timelineQuerier. QueryArgs
@@ -156,7 +157,7 @@ func TestTimelineListReturnsItemsAndCursor(t *testing.T) {
 	rows = append(rows, timelineEventRow("e1", 20, "2026-06-01T12:00:00Z"))
 	rows = append(rows, timelineEventRow("e2", 10, "2026-06-01T11:00:00Z"))
 	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
-		"FROM timeline_events": {Columns: []string{"adapter"}, Rows: rows},
+		"FROM " + warehouse.SQLRelation("timeline_events"): {Columns: []string{"adapter"}, Rows: rows},
 	}}
 	srv := newTimelineTestServer(t, runner)
 
@@ -240,8 +241,8 @@ func TestTimelineListRejectsBadInput(t *testing.T) {
 
 func TestTimelineItemReturnsDetailWithChildrenAndSourceRow(t *testing.T) {
 	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
-		"FROM timeline_events": {Rows: []map[string]any{timelineEventRow("e1", 20, "2026-06-01T12:00:00Z")}},
-		"FROM gmail_attachments WHERE": {Rows: []map[string]any{
+		"FROM " + warehouse.SQLRelation("timeline_events"): {Rows: []map[string]any{timelineEventRow("e1", 20, "2026-06-01T12:00:00Z")}},
+		"FROM " + warehouse.SQLRelation("gmail_attachments") + " WHERE": {Rows: []map[string]any{
 			{"filename": "doc.pdf", "mime_type": "application/pdf", "size": int64(1234)},
 		}},
 		"row_to_json": {Rows: []map[string]any{
@@ -254,8 +255,8 @@ func TestTimelineItemReturnsDetailWithChildrenAndSourceRow(t *testing.T) {
 		t.Fatalf("got %d: %s", resp.StatusCode, body)
 	}
 	var payload struct {
-		Item      map[string]any            `json:"item"`
-		SourceRow map[string]any            `json:"source_row"`
+		Item      map[string]any             `json:"item"`
+		SourceRow map[string]any             `json:"source_row"`
 		Children  map[string]json.RawMessage `json:"children"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -281,7 +282,7 @@ func TestTimelineItemReturnsDetailWithChildrenAndSourceRow(t *testing.T) {
 		call := runner.call(i)
 		if strings.Contains(call.SQL, "row_to_json") {
 			found = true
-			if !strings.Contains(call.SQL, "FROM gmail_messages t WHERE account = $1 AND message_id = $2") {
+			if !strings.Contains(call.SQL, "FROM "+warehouse.SQLRelation("gmail_messages")+" t WHERE \"account\" = $1 AND \"message_id\" = $2") {
 				t.Fatalf("source row SQL = %q", call.SQL)
 			}
 			if call.Args[0] != "z@x.test" || call.Args[1] != "m1" {
@@ -307,7 +308,7 @@ func TestTimelineSourcesAggregatesAndCaches(t *testing.T) {
 		"GROUP BY source, kind": {Rows: []map[string]any{
 			{"source": "gmail", "kind": "email", "count": int64(10), "oldest": "2020-01-01T00:00:00Z", "newest": "2026-06-01T00:00:00Z"},
 		}},
-		"FROM timeline_sync_state": {Rows: []map[string]any{
+		"FROM " + warehouse.SQLRelation("timeline_sync_state"): {Rows: []map[string]any{
 			{"adapter": "gmail_email", "backfill_done": int64(1), "backfill_rows": int64(10)},
 		}},
 	}}
@@ -404,8 +405,8 @@ func TestTimelineChildRowsGetSignedMediaURLs(t *testing.T) {
 	item["source_table"] = "whatsapp_messages"
 	item["source_pk"] = `{"account": "z@x.test", "chat_id": "c1", "message_id": "wm1"}`
 	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
-		"FROM timeline_events": {Rows: []map[string]any{item}},
-		"FROM whatsapp_media_items": {Rows: []map[string]any{
+		"FROM " + warehouse.SQLRelation("timeline_events"): {Rows: []map[string]any{item}},
+		"FROM " + warehouse.SQLRelation("whatsapp_media_items"): {Rows: []map[string]any{
 			{"filename": "photo.jpg", "mime_type": "image/jpeg", "is_missing": int64(0), "storage_file_id": "blob123"},
 			{"filename": "gone.jpg", "mime_type": "image/jpeg", "is_missing": int64(1), "storage_file_id": "blob999"},
 		}},
@@ -445,7 +446,7 @@ func TestTimelineVoiceMemoGetsItemMedia(t *testing.T) {
 	item["source_table"] = "apple_voice_memos_files"
 	item["source_pk"] = `{"account": "z@x.test", "recording_id": "rec1"}`
 	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
-		"FROM timeline_events": {Rows: []map[string]any{item}},
+		"FROM " + warehouse.SQLRelation("timeline_events"): {Rows: []map[string]any{item}},
 		"row_to_json": {Rows: []map[string]any{
 			{"row": `{"account":"z@x.test","recording_id":"rec1","storage_file_id":"audio42","content_type":"audio/mp4","filename":"standup.m4a"}`},
 		}},

@@ -67,6 +67,14 @@ from personal_data_warehouse.schema import (
     SyncState,
 )
 from personal_data_warehouse.config import normalize_postgres_url
+from personal_data_warehouse.relations import (
+    CANONICAL_RELATIONS,
+    QUERYABLE_SCHEMAS,
+    physical_schema_name,
+    physical_schema_names,
+    qualify_sql_relations,
+    query_relation,
+)
 
 POSTGRES_TEXT_NUL_REPLACEMENT = "\\u0000"
 # A search_text() hit's `text` is a relevance PREVIEW, not the full document.
@@ -232,6 +240,9 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         WHATSAPP_MEDIA_ITEM_COLUMNS,
         ("account", "chat_id", "message_id"),
     ),
+    # Legacy logical name retained only so old-layout migrations can understand
+    # the historical mixed table. Runtime writes split into the source-owned
+    # *_events tables below and read through marts.ai_conversation_events.
     "agent_session_events": TableSpec(
         AGENT_SESSION_EVENT_COLUMNS,
         ("source", "session_id", "event_uuid"),
@@ -242,6 +253,20 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
             ("autovacuum_vacuum_threshold", "100000"),
         ),
     ),
+    "chatgpt_events": TableSpec(
+        AGENT_SESSION_EVENT_COLUMNS,
+        ("source", "session_id", "event_uuid"),
+        storage_parameters=(
+            ("autovacuum_analyze_scale_factor", "0"),
+            ("autovacuum_analyze_threshold", "50000"),
+            ("autovacuum_vacuum_scale_factor", "0"),
+            ("autovacuum_vacuum_threshold", "100000"),
+        ),
+    ),
+    "claude_desktop_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
+    "claude_code_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
+    "codex_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
+    "openclaw_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
     "agent_runs": TableSpec(AGENT_RUN_COLUMNS, ("run_id",)),
     "agent_run_events": TableSpec(AGENT_RUN_EVENT_COLUMNS, ("run_id", "event_index")),
     "agent_run_tool_calls": TableSpec(AGENT_RUN_TOOL_CALL_COLUMNS, ("run_id", "event_index", "tool_name")),
@@ -1004,6 +1029,11 @@ POSTGRES_INSERT_PAGE_SIZES = {
     "whatsapp_messages": 500,
     "whatsapp_media_items": 500,
     "agent_session_events": 500,
+    "chatgpt_events": 500,
+    "claude_desktop_events": 500,
+    "claude_code_events": 500,
+    "codex_events": 500,
+    "openclaw_events": 500,
 }
 
 
@@ -1214,6 +1244,22 @@ _WHATSAPP_TABLES = (
     "whatsapp_media_items",
 )
 
+_AI_CONVERSATION_EVENT_TABLES = (
+    "chatgpt_events",
+    "claude_desktop_events",
+    "claude_code_events",
+    "codex_events",
+    "openclaw_events",
+)
+
+_AI_EVENT_TABLE_BY_SOURCE = {
+    "chatgpt": "chatgpt_events",
+    "claude_desktop": "claude_desktop_events",
+    "claude_code": "claude_code_events",
+    "codex": "codex_events",
+    "openclaw": "openclaw_events",
+}
+
 
 class PostgresWarehouse:
     def __init__(self, postgres_database_url: str, *, schema: str = "public") -> None:
@@ -1221,17 +1267,58 @@ class PostgresWarehouse:
         if not normalized:
             raise ValueError("POSTGRES_DATABASE_URL must be set")
         self._database_url = normalized
+        # `schema` is a namespace prefix for test/alternate deployments. In the
+        # normal production case (`public`) canonical schemas are named exactly
+        # gmail, slack, marts, private, ... . In tests we use e.g.
+        # pdw_test_x_gmail, pdw_test_x_slack, ... so independent tests do not
+        # collide in the shared Postgres database.
         self._schema = _validate_identifier(schema)
         self._connection = psycopg2.connect(normalized)
         self._connection.autocommit = True
         self._ensured_index_names: set[str] = set()
         self._pg_trgm_ensured = False
         self._pg_textsearch_ensured = False
-        self._command(f"CREATE SCHEMA IF NOT EXISTS {_identifier(self._schema)}")
-        self._command(f"SET search_path TO {_identifier(self._schema)}")
+        self._ensure_canonical_schemas()
+        self._set_search_path()
+
+    @property
+    def schema_namespace(self) -> str:
+        return self._schema
+
+    def physical_schema_names(self, *, include_private: bool = False) -> list[str]:
+        return physical_schema_names(namespace=self._schema, include_private=include_private)
+
+    def physical_schema_name(self, schema: str) -> str:
+        return physical_schema_name(schema, namespace=self._schema)
+
+    def sql_relation(self, logical_name: str) -> str:
+        return query_relation(logical_name).sql(namespace=self._schema)
 
     def close(self) -> None:
         self._connection.close()
+
+    def _ensure_canonical_schemas(self) -> None:
+        with self._connection.cursor() as cursor:
+            if self._schema != "public":
+                cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_identifier(self._schema)}")
+            for schema in self.physical_schema_names(include_private=True):
+                cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_identifier(schema)}")
+
+    def _search_path_sql(self) -> str:
+        # Include every queryable schema so unqualified function/operator helper
+        # references continue to resolve internally, but callers should use
+        # schema-qualified relation names because many schemas now have tables
+        # named `messages`, `sync_state`, etc.
+        parts = [
+            _identifier(self.physical_schema_name(schema))
+            for schema in QUERYABLE_SCHEMAS
+        ]
+        parts.append("public")  # extensions such as pg_trgm / pg_textsearch live here.
+        return "SET search_path TO " + ", ".join(parts)
+
+    def _set_search_path(self) -> None:
+        with self._connection.cursor() as cursor:
+            cursor.execute(self._search_path_sql())
 
     def read_only_connection(self):
         """Open a dedicated connection for untrusted read-only SQL."""
@@ -1241,7 +1328,7 @@ class PostgresWarehouse:
         )
         connection.autocommit = True
         with connection.cursor() as cursor:
-            cursor.execute(f"SET search_path TO {_identifier(self._schema)}")
+            cursor.execute(self._search_path_sql())
         return connection
 
     def ensure_tables(self) -> None:
@@ -1279,16 +1366,31 @@ class PostgresWarehouse:
         # existing enrichments, and drop the old-named bm25/trgm indexes so the
         # ensure step rebuilds them under the new names. Idempotent: once renamed,
         # the IF EXISTS / IF NOT EXISTS clauses no-op on every later deploy.
-        self._command(
-            "ALTER TABLE IF EXISTS gmail_attachment_enrichments RENAME TO file_attachment_enrichments"
-        )
-        self._command("DROP INDEX IF EXISTS gmail_attachment_enrichments_text_bm25_idx")
-        self._command("DROP INDEX IF EXISTS gmail_attachment_enrichments_text_trgm_idx")
+        target = query_relation("file_attachment_enrichments").with_namespace(self._schema)
+        legacy_locations = (self._schema, target.schema)
+        for legacy_schema in legacy_locations:
+            if not self._physical_table_exists(schema=legacy_schema, table="gmail_attachment_enrichments"):
+                continue
+            if self._physical_table_exists(schema=target.schema, table=target.name):
+                raise RuntimeError(
+                    f"cannot migrate legacy table {legacy_schema}.gmail_attachment_enrichments: "
+                    f"target {target.schema}.{target.name} already exists"
+                )
+            if legacy_schema != target.schema:
+                self._raw_command(
+                    f"ALTER TABLE {_identifier(legacy_schema)}.{_identifier('gmail_attachment_enrichments')} SET SCHEMA {_identifier(target.schema)}"
+                )
+            self._raw_command(
+                f"ALTER TABLE {_identifier(target.schema)}.{_identifier('gmail_attachment_enrichments')} RENAME TO {_identifier(target.name)}"
+            )
+            break
+        self._raw_command(f"DROP INDEX IF EXISTS {_identifier(target.schema)}.{_identifier('gmail_attachment_enrichments_text_bm25_idx')}")
+        self._raw_command(f"DROP INDEX IF EXISTS {_identifier(target.schema)}.{_identifier('gmail_attachment_enrichments_text_trgm_idx')}")
         # ALTER TABLE ... RENAME does not rename the table's indexes, so a
         # renamed deployment keeps serving its primary key under the old name.
-        self._command(
-            "ALTER INDEX IF EXISTS gmail_attachment_enrichments_pkey "
-            "RENAME TO file_attachment_enrichments_pkey"
+        self._raw_command(
+            f"ALTER INDEX IF EXISTS {_identifier(target.schema)}.{_identifier('gmail_attachment_enrichments_pkey')} "
+            f"RENAME TO {_identifier('file_attachment_enrichments_pkey')}"
         )
 
     def ensure_calendar_tables(self) -> None:
@@ -1351,10 +1453,61 @@ class PostgresWarehouse:
         self._ensure_search_views_if_possible()
 
     def ensure_agent_sessions_tables(self) -> None:
-        self._ensure_table_group(["agent_session_events"])
+        self._ensure_table_group(_AI_CONVERSATION_EVENT_TABLES)
+        self._migrate_legacy_agent_session_events_if_present()
         self.ensure_chatgpt_tables()
+        self.ensure_claude_desktop_tables()
+        self._ensure_ai_conversation_events_view()
         self._ensure_clean_agent_sessions_view()
         self._ensure_search_views_if_possible()
+
+    def _migrate_legacy_agent_session_events_if_present(self) -> None:
+        legacy_schema = self._schema
+        legacy_table = "agent_session_events"
+        if not self._physical_table_exists(schema=legacy_schema, table=legacy_table):
+            return
+        column_sql = ", ".join(_identifier(column) for column in AGENT_SESSION_EVENT_COLUMNS)
+        for source, table in _AI_EVENT_TABLE_BY_SOURCE.items():
+            self._command(
+                f"""
+                INSERT INTO {self.sql_relation(table)} ({column_sql})
+                SELECT {column_sql}
+                FROM {_identifier(legacy_schema)}.{_identifier(legacy_table)}
+                WHERE source = %s
+                ON CONFLICT (source, session_id, event_uuid) DO UPDATE SET
+                    account = EXCLUDED.account,
+                    device = EXCLUDED.device,
+                    seq = EXCLUDED.seq,
+                    occurred_at = EXCLUDED.occurred_at,
+                    role = EXCLUDED.role,
+                    event_type = EXCLUDED.event_type,
+                    subtype = EXCLUDED.subtype,
+                    parent_uuid = EXCLUDED.parent_uuid,
+                    turn_id = EXCLUDED.turn_id,
+                    model = EXCLUDED.model,
+                    cwd = EXCLUDED.cwd,
+                    git_branch = EXCLUDED.git_branch,
+                    git_commit = EXCLUDED.git_commit,
+                    repo_url = EXCLUDED.repo_url,
+                    cli_version = EXCLUDED.cli_version,
+                    entrypoint = EXCLUDED.entrypoint,
+                    session_title = EXCLUDED.session_title,
+                    text = EXCLUDED.text,
+                    tool_name = EXCLUDED.tool_name,
+                    tool_input_json = EXCLUDED.tool_input_json,
+                    tool_result_json = EXCLUDED.tool_result_json,
+                    input_tokens = EXCLUDED.input_tokens,
+                    output_tokens = EXCLUDED.output_tokens,
+                    cache_read_tokens = EXCLUDED.cache_read_tokens,
+                    cache_creation_tokens = EXCLUDED.cache_creation_tokens,
+                    is_sidechain = EXCLUDED.is_sidechain,
+                    raw_json = EXCLUDED.raw_json,
+                    ingested_at = EXCLUDED.ingested_at,
+                    sync_version = EXCLUDED.sync_version
+                """,
+                (source,),
+            )
+        self._raw_command(f"DROP TABLE {_identifier(legacy_schema)}.{_identifier(legacy_table)}")
 
     def ensure_timeline_tables(self) -> None:
         """Tables for the unified timeline (personal_data_warehouse/timeline.py).
@@ -1367,8 +1520,9 @@ class PostgresWarehouse:
         present by seq).
         """
         self._ensure_table_group(["timeline_events", "timeline_sync_state"])
+        sequence_ref = self.sql_relation("timeline_events_seq")
         self._command("CREATE SEQUENCE IF NOT EXISTS timeline_events_seq")
-        self._command("ALTER TABLE timeline_events ALTER COLUMN seq SET DEFAULT nextval('timeline_events_seq')")
+        self._command(f"ALTER TABLE timeline_events ALTER COLUMN seq SET DEFAULT nextval('{sequence_ref}')")
         self._command("ALTER TABLE timeline_events ALTER COLUMN first_seen_at SET DEFAULT now()")
         self._command("ALTER TABLE timeline_events ALTER COLUMN updated_at SET DEFAULT now()")
         # Additive migration for timelines created before the priority tier
@@ -3816,6 +3970,7 @@ class PostgresWarehouse:
         self._ensure_indexes(tables)
 
     def _ensure_table(self, table: str) -> None:
+        self._migrate_legacy_table_if_present(table)
         spec = POSTGRES_TABLES[table]
         column_sql = [
             f"{_identifier(column)} {_postgres_type(column, table=table)} NOT NULL DEFAULT {_default_sql(column, table=table)}"
@@ -3824,7 +3979,7 @@ class PostgresWarehouse:
         primary_key = ", ".join(_identifier(column) for column in spec.primary_key)
         self._command(
             f"""
-            CREATE TABLE IF NOT EXISTS {_identifier(table)} (
+            CREATE TABLE IF NOT EXISTS {self.sql_relation(table)} (
                 {", ".join(column_sql)},
                 PRIMARY KEY ({primary_key})
             )
@@ -3832,7 +3987,40 @@ class PostgresWarehouse:
         )
         if spec.storage_parameters:
             settings = ", ".join(f"{key} = {value}" for key, value in spec.storage_parameters)
-            self._command(f"ALTER TABLE {_identifier(table)} SET ({settings})")
+            self._command(f"ALTER TABLE {self.sql_relation(table)} SET ({settings})")
+
+    def _migrate_legacy_table_if_present(self, table: str) -> None:
+        if table not in CANONICAL_RELATIONS:
+            return
+        rel = query_relation(table).with_namespace(self._schema)
+        if rel.schema == self._schema and rel.name == table:
+            return
+        if not self._legacy_table_exists(table):
+            return
+        if self._physical_table_exists(schema=rel.schema, table=rel.name):
+            raise RuntimeError(
+                f"cannot migrate legacy table {self._schema}.{table}: target {rel.schema}.{rel.name} already exists"
+            )
+        self._raw_command(
+            f"ALTER TABLE {_identifier(self._schema)}.{_identifier(table)} SET SCHEMA {_identifier(rel.schema)}"
+        )
+        if rel.name != table:
+            self._raw_command(f"ALTER TABLE {_identifier(rel.schema)}.{_identifier(table)} RENAME TO {_identifier(rel.name)}")
+
+    def _legacy_table_exists(self, table: str) -> bool:
+        return self._physical_table_exists(schema=self._schema, table=table)
+
+    def _physical_table_exists(self, *, schema: str, table: str) -> bool:
+        rows = self._query(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s
+            LIMIT 1
+            """,
+            (schema, table),
+        )
+        return bool(rows)
 
     def _ensure_indexes(self, tables: Sequence[str]) -> None:
         table_names = set(tables)
@@ -3873,14 +4061,14 @@ class PostgresWarehouse:
             FROM pg_class AS c
             INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
             INNER JOIN pg_index AS i ON i.indexrelid = c.oid
-            WHERE n.nspname = %s
+            WHERE n.nspname = ANY(%s)
               AND c.relname = %s
               AND c.relkind = 'i'
               AND i.indisvalid
               AND i.indisready
             LIMIT 1
             """,
-            (self._schema, index_name),
+            (self.physical_schema_names(include_private=True), index_name),
         )
         return bool(rows)
 
@@ -3926,8 +4114,8 @@ class PostgresWarehouse:
               NOT EXISTS (
                   SELECT 1
                   FROM gmail_attachment_backfill_state state
-                  WHERE state.account = gmail_messages.account
-                    AND state.message_id = gmail_messages.message_id
+                  WHERE state.account = gm.account
+                    AND state.message_id = gm.message_id
                     AND state.status = 'ok'
               )"""
         params: list[Any] = [account]
@@ -3937,8 +4125,8 @@ class PostgresWarehouse:
               OR EXISTS (
                   SELECT 1
                   FROM gmail_attachments pending
-                  WHERE pending.account = gmail_messages.account
-                    AND pending.message_id = gmail_messages.message_id
+                  WHERE pending.account = gm.account
+                    AND pending.message_id = gm.message_id
                     AND pending.is_deleted = 0
                     AND pending.size > 0
                     AND pending.size <= %s
@@ -3949,7 +4137,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT payload_json
-            FROM gmail_messages
+            FROM gmail_messages AS gm
             WHERE account = %s
               AND is_deleted = 0
               AND {_postgres_gmail_attachment_candidate_clause()}
@@ -4389,7 +4577,15 @@ class PostgresWarehouse:
         self._insert_rows("whatsapp_media_items", rows, WHATSAPP_MEDIA_ITEM_COLUMNS)
 
     def insert_agent_session_events(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("agent_session_events", rows, AGENT_SESSION_EVENT_COLUMNS)
+        rows_by_table: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            source = str(row.get("source") or "")
+            table = _AI_EVENT_TABLE_BY_SOURCE.get(source)
+            if table is None:
+                raise ValueError(f"unknown AI conversation event source: {source!r}")
+            rows_by_table.setdefault(table, []).append(row)
+        for table, table_rows in rows_by_table.items():
+            self._insert_rows(table, table_rows, AGENT_SESSION_EVENT_COLUMNS)
 
     def chatgpt_conversation_sync_map(self, *, account: str) -> dict[str, float]:
         """Return ``{session_id: update_time}`` already synced for ``account``.
@@ -5112,23 +5308,25 @@ class PostgresWarehouse:
         with self._connection.cursor() as cursor:
             execute_values(
                 cursor,
-                """
-                WITH incoming(account, team_id, conversation_id, message_ts) AS (VALUES %s)
-                SELECT
-                    m.account,
-                    m.team_id,
-                    m.conversation_id,
-                    m.message_ts,
-                    m.is_deleted,
-                    m.message_datetime,
-                    m.sync_version
-                FROM slack_messages AS m
-                INNER JOIN incoming AS i
-                  ON m.account = i.account
-                 AND m.team_id = i.team_id
-                 AND m.conversation_id = i.conversation_id
-                 AND m.message_ts = i.message_ts
-                """,
+                self._qualify_sql(
+                    """
+                    WITH incoming(account, team_id, conversation_id, message_ts) AS (VALUES %s)
+                    SELECT
+                        m.account,
+                        m.team_id,
+                        m.conversation_id,
+                        m.message_ts,
+                        m.is_deleted,
+                        m.message_datetime,
+                        m.sync_version
+                    FROM slack_messages AS m
+                    INNER JOIN incoming AS i
+                      ON m.account = i.account
+                     AND m.team_id = i.team_id
+                     AND m.conversation_id = i.conversation_id
+                     AND m.message_ts = i.message_ts
+                    """
+                ),
                 keys,
                 template="(%s, %s, %s, %s)",
                 page_size=max(len(keys), 1),
@@ -5174,24 +5372,26 @@ class PostgresWarehouse:
         with self._connection.cursor() as cursor:
             execute_values(
                 cursor,
-                """
-                INSERT INTO slack_conversation_stats (
-                    account,
-                    team_id,
-                    conversation_id,
-                    message_count,
-                    latest_message_at,
-                    updated_at
-                )
-                VALUES %s
-                ON CONFLICT (account, team_id, conversation_id) DO UPDATE SET
-                    message_count = slack_conversation_stats.message_count + EXCLUDED.message_count,
-                    latest_message_at = GREATEST(
-                        slack_conversation_stats.latest_message_at,
-                        EXCLUDED.latest_message_at
-                    ),
-                    updated_at = EXCLUDED.updated_at
-                """,
+                self._qualify_sql(
+                    """
+                    INSERT INTO slack_conversation_stats AS target (
+                        account,
+                        team_id,
+                        conversation_id,
+                        message_count,
+                        latest_message_at,
+                        updated_at
+                    )
+                    VALUES %s
+                    ON CONFLICT (account, team_id, conversation_id) DO UPDATE SET
+                        message_count = target.message_count + EXCLUDED.message_count,
+                        latest_message_at = GREATEST(
+                            target.latest_message_at,
+                            EXCLUDED.latest_message_at
+                        ),
+                        updated_at = EXCLUDED.updated_at
+                    """
+                ),
                 [
                     (
                         account,
@@ -5213,45 +5413,49 @@ class PostgresWarehouse:
             with self._connection.cursor() as cursor:
                 execute_values(
                     cursor,
-                    """
-                    WITH affected(account, team_id, conversation_id) AS (VALUES %s)
-                    DELETE FROM slack_conversation_stats AS s
-                    USING affected AS a
-                    WHERE s.account = a.account
-                      AND s.team_id = a.team_id
-                      AND s.conversation_id = a.conversation_id
-                    """,
+                    self._qualify_sql(
+                        """
+                        WITH affected(account, team_id, conversation_id) AS (VALUES %s)
+                        DELETE FROM slack_conversation_stats AS s
+                        USING affected AS a
+                        WHERE s.account = a.account
+                          AND s.team_id = a.team_id
+                          AND s.conversation_id = a.conversation_id
+                        """
+                    ),
                     keys,
                     template="(%s, %s, %s)",
                     page_size=1000,
                 )
                 execute_values(
                     cursor,
-                    """
-                    WITH affected(account, team_id, conversation_id) AS (VALUES %s)
-                    INSERT INTO slack_conversation_stats (
-                        account,
-                        team_id,
-                        conversation_id,
-                        message_count,
-                        latest_message_at,
-                        updated_at
-                    )
-                    SELECT
-                        m.account,
-                        m.team_id,
-                        m.conversation_id,
-                        count(*)::bigint AS message_count,
-                        max(m.message_datetime) AS latest_message_at,
-                        clock_timestamp() AS updated_at
-                    FROM slack_messages AS m
-                    INNER JOIN affected AS a
-                      ON m.account = a.account
-                     AND m.team_id = a.team_id
-                     AND m.conversation_id = a.conversation_id
-                    WHERE m.is_deleted = 0
-                    GROUP BY m.account, m.team_id, m.conversation_id
-                    """,
+                    self._qualify_sql(
+                        """
+                        WITH affected(account, team_id, conversation_id) AS (VALUES %s)
+                        INSERT INTO slack_conversation_stats (
+                            account,
+                            team_id,
+                            conversation_id,
+                            message_count,
+                            latest_message_at,
+                            updated_at
+                        )
+                        SELECT
+                            m.account,
+                            m.team_id,
+                            m.conversation_id,
+                            count(*)::bigint AS message_count,
+                            max(m.message_datetime) AS latest_message_at,
+                            clock_timestamp() AS updated_at
+                        FROM slack_messages AS m
+                        INNER JOIN affected AS a
+                          ON m.account = a.account
+                         AND m.team_id = a.team_id
+                         AND m.conversation_id = a.conversation_id
+                        WHERE m.is_deleted = 0
+                        GROUP BY m.account, m.team_id, m.conversation_id
+                        """
+                    ),
                     keys,
                     template="(%s, %s, %s)",
                     page_size=1000,
@@ -5296,9 +5500,9 @@ class PostgresWarehouse:
         )
         self._command(
             f"""
-            INSERT INTO slack_account_state_item_rows ({columns})
+            INSERT INTO slack_account_state_item_rows AS target ({columns})
             {self._slack_account_state_items_select_sql()}
-            {_upsert_clause("slack_account_state_item_rows", POSTGRES_TABLES["slack_account_state_item_rows"])}
+            {_upsert_clause("slack_account_state_item_rows", POSTGRES_TABLES["slack_account_state_item_rows"], target_alias="target")}
             """,
             (account, team_id, synced_at, sync_version + 1),
         )
@@ -5443,7 +5647,7 @@ class PostgresWarehouse:
         "google_drive_file_texts",
     )
 
-    _SEARCH_SCHEMA_MARKER_TABLE = "pdw_search_schema_state"
+    _SEARCH_SCHEMA_MARKER_TABLE = "search_schema_state"
 
     def _ensure_search_views_if_possible(self) -> None:
         # Several Dagster assets can call ensure_* concurrently on deploy. The
@@ -5516,7 +5720,7 @@ class PostgresWarehouse:
         self._command(
             f"CREATE TABLE IF NOT EXISTS {_identifier(self._SEARCH_SCHEMA_MARKER_TABLE)} "
             "(id smallint PRIMARY KEY DEFAULT 1, signature text NOT NULL, "
-            "CONSTRAINT pdw_search_schema_state_single_row CHECK (id = 1))"
+            "CONSTRAINT search_schema_state_single_row CHECK (id = 1))"
         )
         rows = self._query(
             f"SELECT signature FROM {_identifier(self._SEARCH_SCHEMA_MARKER_TABLE)} WHERE id = 1"
@@ -5539,9 +5743,10 @@ class PostgresWarehouse:
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE p.proname = 'search_text'
-              AND n.nspname = current_schema()
+              AND n.nspname = %s
             LIMIT 1
-            """
+            """,
+            (self.physical_schema_name("search"),),
         )
         return bool(rows)
 
@@ -5954,15 +6159,14 @@ class PostgresWarehouse:
         # is silently ignored (returns nothing), so guessing fails quietly.
         distinct_sources = sorted({source for source, _ in branches})
         search_text_sources_values = ", ".join(f"('{source}')" for source in distinct_sources)
+        search_schema_name = self.physical_schema_name("search") if hasattr(self, "physical_schema_name") else "search"
         self._command(
             r"""
             DO $do$
             BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_type t
-                    JOIN pg_namespace n ON n.oid = t.typnamespace
-                    WHERE t.typname = 'search_text_hit' AND n.nspname = current_schema()
-                ) THEN
+                IF to_regtype('"""
+            + search_schema_name
+            + r""".text_hit') IS NULL THEN
                     CREATE TYPE search_text_hit AS (
                         source text, subsource text, context text, who text,
                         occurred_at timestamptz, account text, ref text,
@@ -6106,6 +6310,7 @@ class PostgresWarehouse:
         )
 
     def _ensure_view(self, view: str, create_sql: str) -> None:
+        self._drop_legacy_view_if_present(view)
         # CREATE OR REPLACE VIEW refuses to drop, rename, or retype an existing
         # view's columns, and this database is shared: another checkout running
         # a different revision can leave a view whose columns no longer match
@@ -6117,11 +6322,35 @@ class PostgresWarehouse:
         try:
             self._command(create_sql)
         except psycopg2.errors.InvalidTableDefinition:
-            self._command(f"DROP VIEW IF EXISTS {_identifier(view)}")
+            try:
+                view_ref = self.sql_relation(view)
+            except KeyError:
+                view_ref = _identifier(view)
+            self._command(f"DROP VIEW IF EXISTS {view_ref}")
             self._command(create_sql)
+
+    def _drop_legacy_view_if_present(self, view: str) -> None:
+        try:
+            rel = query_relation(view).with_namespace(self._schema)
+        except KeyError:
+            return
+        if rel.schema == self._schema and rel.name == view:
+            return
+        rows = self._query(
+            """
+            SELECT 1
+            FROM information_schema.views
+            WHERE table_schema = %s AND table_name = %s
+            LIMIT 1
+            """,
+            (self._schema, view),
+        )
+        if rows:
+            self._raw_command(f"DROP VIEW IF EXISTS {_identifier(self._schema)}.{_identifier(view)}")
 
     def _ensure_clean_gmail_inbox_view(self) -> None:
         self._ensure_utf8_byte_prefix_function()
+        util_prefix_fn = f"{_identifier(self.physical_schema_name('util'))}.utf8_byte_prefix"
         self._ensure_view(
             "clean_gmail_inbox",
             """
@@ -6132,7 +6361,7 @@ class PostgresWarehouse:
                 max(internal_date) AS latest_at,
                 (array_agg(from_address ORDER BY internal_date DESC, message_id ASC))[1] AS latest_from_address,
                 (array_agg(subject ORDER BY internal_date DESC, message_id ASC))[1] AS subject,
-                pdw_utf8_byte_prefix(
+                __UTF8_PREFIX_FN__(
                     (array_agg(
                         COALESCE(NULLIF(body_markdown_clean, ''), NULLIF(body_markdown, ''), NULLIF(body_text, ''), snippet)
                         ORDER BY internal_date DESC, message_id ASC
@@ -6162,13 +6391,14 @@ class PostgresWarehouse:
               AND NOT ('TRASH' = ANY(label_ids))
               AND NOT ('SPAM' = ANY(label_ids))
             GROUP BY account, thread_id
-            """
+            """.replace("__UTF8_PREFIX_FN__", util_prefix_fn)
         )
 
     def _ensure_utf8_byte_prefix_function(self) -> None:
+        util_prefix_fn = f"{_identifier(self.physical_schema_name('util'))}.utf8_byte_prefix"
         self._command(
-            """
-            CREATE OR REPLACE FUNCTION pdw_utf8_byte_prefix(value text, max_bytes integer)
+            f"""
+            CREATE OR REPLACE FUNCTION {util_prefix_fn}(value text, max_bytes integer)
             RETURNS text
             LANGUAGE plpgsql
             IMMUTABLE
@@ -6313,6 +6543,59 @@ class PostgresWarehouse:
             LEFT JOIN whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id
             LEFT JOIN whatsapp_contacts cc ON cc.account = m.account AND cc.jid = m.chat_id
             LEFT JOIN whatsapp_contacts ct ON ct.account = m.account AND ct.jid = m.sender_jid
+            """
+        )
+
+    def _ensure_ai_conversation_events_view(self) -> None:
+        union_sql = "\n            UNION ALL\n            ".join(
+            f"SELECT * FROM {self.sql_relation(table)}" for table in _AI_CONVERSATION_EVENT_TABLES
+        )
+        self._ensure_view(
+            "ai_conversation_events",
+            f"""
+            CREATE OR REPLACE VIEW ai_conversation_events AS
+            {union_sql}
+            """,
+        )
+        self._ensure_ai_conversation_events_insert_trigger()
+
+    def _ensure_ai_conversation_events_insert_trigger(self) -> None:
+        columns = AGENT_SESSION_EVENT_COLUMNS
+        column_sql = ", ".join(_identifier(column) for column in columns)
+        branches = []
+        for source, table in _AI_EVENT_TABLE_BY_SOURCE.items():
+            values_sql = ", ".join(
+                f"COALESCE(NEW.{_identifier(column)}, {_default_sql(column, table=table)})"
+                for column in columns
+            )
+            branches.append(
+                f"""
+                IF NEW.source = '{source}' THEN
+                    INSERT INTO {self.sql_relation(table)} AS target ({column_sql})
+                    VALUES ({values_sql})
+                    {_upsert_clause(table, POSTGRES_TABLES[table], columns, target_alias="target")};
+                    RETURN NULL;
+                END IF;
+                """
+            )
+        trigger_schema = _identifier(self.physical_schema_name("marts"))
+        trigger_function = f"{trigger_schema}.{_identifier('ai_conversation_events_insert')}"
+        view_ref = self.sql_relation("ai_conversation_events")
+        self._command(
+            f"""
+            CREATE OR REPLACE FUNCTION {trigger_function}()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                {''.join(branches)}
+                RAISE EXCEPTION 'unknown AI conversation event source: %', NEW.source;
+            END;
+            $$;
+            DROP TRIGGER IF EXISTS ai_conversation_events_insert ON {view_ref};
+            CREATE TRIGGER ai_conversation_events_insert
+            INSTEAD OF INSERT ON {view_ref}
+            FOR EACH ROW EXECUTE FUNCTION {trigger_function}();
             """
         )
 
@@ -6494,21 +6777,29 @@ class PostgresWarehouse:
             """
         )
 
-    def _relation_exists(self, relation: str) -> bool:
+    def _relation_exists(self, relation_name: str) -> bool:
+        try:
+            rel = query_relation(relation_name).with_namespace(self._schema)
+        except KeyError:
+            schemas = self.physical_schema_names(include_private=True) + [self._schema]
+            name = relation_name
+        else:
+            schemas = [rel.schema]
+            name = rel.name
         rows = self._query(
             """
             SELECT 1
             FROM information_schema.tables
-            WHERE table_schema = %s
+            WHERE table_schema = ANY(%s)
               AND table_name = %s
             UNION ALL
             SELECT 1
             FROM information_schema.views
-            WHERE table_schema = %s
+            WHERE table_schema = ANY(%s)
               AND table_name = %s
             LIMIT 1
             """,
-            (self._schema, relation, self._schema, relation),
+            (schemas, name, schemas, name),
         )
         return bool(rows)
 
@@ -6731,18 +7022,25 @@ class PostgresWarehouse:
             GROUP BY vars.synced_at, vars.sync_version, c.account, c.team_id, c.conversation_id, c.name
         """
 
-    def _command(self, sql: str, params: Sequence[Any] | None = None) -> None:
+    def _qualify_sql(self, sql: str) -> str:
+        return qualify_sql_relations(sql, namespace=self._schema)
+
+    def _raw_command(self, sql: str, params: Sequence[Any] | None = None) -> None:
         with self._connection.cursor() as cursor:
             cursor.execute(sql, params)
 
+    def _command(self, sql: str, params: Sequence[Any] | None = None) -> None:
+        with self._connection.cursor() as cursor:
+            cursor.execute(self._qualify_sql(sql), params)
+
     def _query(self, sql: str, params: Sequence[Any] | None = None) -> list[tuple[Any, ...]]:
         with self._connection.cursor() as cursor:
-            cursor.execute(sql, params)
+            cursor.execute(self._qualify_sql(sql), params)
             return cursor.fetchall()
 
     def _query_dicts(self, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
         with self._connection.cursor() as cursor:
-            cursor.execute(sql, params)
+            cursor.execute(self._qualify_sql(sql), params)
             columns = [description[0] for description in cursor.description]
             return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
@@ -6754,12 +7052,12 @@ class PostgresWarehouse:
         column_sql = ", ".join(_identifier(column) for column in columns)
         template = "(" + ", ".join(["%s"] * len(columns)) + ")"
         sql = f"""
-            INSERT INTO {_identifier(table)} ({column_sql})
+            INSERT INTO {self.sql_relation(table)} AS target ({column_sql})
             VALUES %s
-            {_upsert_clause(table, spec, columns)}
+            {_upsert_clause(table, spec, columns, target_alias="target")}
         """
         with self._connection.cursor() as cursor:
-            execute_values(cursor, sql, rows, template=template, page_size=POSTGRES_INSERT_PAGE_SIZES.get(table, 1000))
+            execute_values(cursor, self._qualify_sql(sql), rows, template=template, page_size=POSTGRES_INSERT_PAGE_SIZES.get(table, 1000))
 
     def _insert_rows(self, table: str, rows: list[dict[str, Any]], columns: tuple[str, ...]) -> None:
         self._insert(
@@ -6940,29 +7238,40 @@ def _conflict_row_wins(
         return True
 
 
-def _upsert_clause(table: str, spec: TableSpec, columns: tuple[str, ...] | None = None) -> str:
+def _upsert_clause(
+    table: str,
+    spec: TableSpec,
+    columns: tuple[str, ...] | None = None,
+    *,
+    target_alias: str | None = None,
+) -> str:
     columns = columns or spec.columns
     update_columns = [column for column in columns if column not in spec.primary_key]
     conflict_columns = ", ".join(_identifier(column) for column in spec.primary_key)
     if not update_columns:
         return f"ON CONFLICT ({conflict_columns}) DO NOTHING"
     preserve_non_empty_columns = PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE.get(table, ())
+    target_ref = _identifier(target_alias) if target_alias else _identifier(table)
     assignments = ", ".join(
-        _upsert_assignment(table=table, column=column, preserve_non_empty=column in preserve_non_empty_columns)
+        _upsert_assignment(
+            target_ref=target_ref,
+            column=column,
+            preserve_non_empty=column in preserve_non_empty_columns,
+        )
         for column in update_columns
     )
     version_column = spec.version_column
     return (
         f"ON CONFLICT ({conflict_columns}) DO UPDATE SET {assignments} "
-        f"WHERE {_identifier(table)}.{_identifier(version_column)} <= EXCLUDED.{_identifier(version_column)}"
+        f"WHERE {target_ref}.{_identifier(version_column)} <= EXCLUDED.{_identifier(version_column)}"
     )
 
 
-def _upsert_assignment(*, table: str, column: str, preserve_non_empty: bool) -> str:
+def _upsert_assignment(*, target_ref: str, column: str, preserve_non_empty: bool) -> str:
     quoted_column = _identifier(column)
     excluded_column = f"EXCLUDED.{quoted_column}"
     if preserve_non_empty:
-        return f"{quoted_column} = COALESCE(NULLIF({excluded_column}, ''), {_identifier(table)}.{quoted_column})"
+        return f"{quoted_column} = COALESCE(NULLIF({excluded_column}, ''), {target_ref}.{quoted_column})"
     return f"{quoted_column} = {excluded_column}"
 
 

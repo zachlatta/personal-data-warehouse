@@ -15,6 +15,8 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 type PostgresStore struct {
@@ -81,6 +83,30 @@ func (s *PostgresStore) Close() error {
 	return s.db.Close()
 }
 
+type sqlExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+type sqlQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+type sqlQueryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func execContext(ctx context.Context, execer sqlExecer, statement string, args ...any) (sql.Result, error) {
+	return execer.ExecContext(ctx, warehouse.QualifySQL(statement), args...)
+}
+
+func queryContext(ctx context.Context, queryer sqlQueryer, statement string, args ...any) (*sql.Rows, error) {
+	return queryer.QueryContext(ctx, warehouse.QualifySQL(statement), args...)
+}
+
+func queryRowContext(ctx context.Context, queryer sqlQueryRower, statement string, args ...any) *sql.Row {
+	return queryer.QueryRowContext(ctx, warehouse.QualifySQL(statement), args...)
+}
+
 func (s *PostgresStore) EnsureTables(ctx context.Context) error {
 	s.ensureMu.Lock()
 	defer s.ensureMu.Unlock()
@@ -97,8 +123,15 @@ func (s *PostgresStore) EnsureTables(ctx context.Context) error {
 func (s *PostgresStore) ensureTablesNow(ctx context.Context) error {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
+	// This is schema DDL, not relation DDL: do not pass it through
+	// warehouse.QualifySQL, because the schema name intentionally matches the
+	// legacy logical relation key "upstream_mutations" (now
+	// upstream_mutations.operations).
+	if _, err := s.db.ExecContext(ctx, upstreamMutationSchemaCreateStatement); err != nil {
+		return err
+	}
 	for _, statement := range upstreamMutationSchemaStatements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := execContext(ctx, s.db, statement); err != nil {
 			return err
 		}
 	}
@@ -144,7 +177,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if err != nil {
 		return Request{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := execContext(ctx, tx, `
 		INSERT INTO upstream_mutation_requests (
 			id, status, title, reason, context_json, result_json, idempotency_key,
 			requested_by, created_at, updated_at
@@ -166,7 +199,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 		if err != nil {
 			return Request{}, err
 		}
-		if _, err := tx.ExecContext(ctx, `
+		if _, err := execContext(ctx, tx, `
 			INSERT INTO upstream_mutations (
 				id, request_id, request_index, provider, operation, account, status, title, reason,
 				payload_json, preview_json, result_json, idempotency_key,
@@ -215,7 +248,7 @@ func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) 
 		where = "WHERE request.status IN (" + strings.Join(placeholders, ", ") + ")"
 	}
 	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+	rows, err := queryContext(ctx, s.db, fmt.Sprintf(`
 		SELECT request.id, request.status, request.title, request.reason, request.context_json,
 		       request.result_json, request.error, request.idempotency_key, request.revision,
 		       request.requested_by, request.approved_by, request.created_at, request.updated_at,
@@ -331,7 +364,7 @@ func (s *PostgresStore) UpdateGmailEmailMutation(ctx context.Context, requestID 
 		preview = enriched[0].Preview
 	}
 	now := time.Now().UTC()
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := execContext(ctx, tx, `
 		UPDATE upstream_mutations
 		   SET title = $1,
 		       payload_json = $2::jsonb,
@@ -342,7 +375,7 @@ func (s *PostgresStore) UpdateGmailEmailMutation(ctx context.Context, requestID 
 	`, title, jsonString(payload), jsonString(preview), now, mutationID); err != nil {
 		return Mutation{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := execContext(ctx, tx, `
 		UPDATE upstream_mutation_requests
 		   SET revision = revision + 1,
 		       updated_at = $1
@@ -424,7 +457,7 @@ func (s *PostgresStore) RemoveMutation(ctx context.Context, requestID string, mu
 	}
 	const removalError = "removed during review"
 	now := time.Now().UTC()
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := execContext(ctx, tx, `
 		UPDATE upstream_mutations
 		   SET status = 'rejected',
 		       error = $1,
@@ -433,7 +466,7 @@ func (s *PostgresStore) RemoveMutation(ctx context.Context, requestID string, mu
 	`, removalError, now, mutationID); err != nil {
 		return Mutation{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := execContext(ctx, tx, `
 		UPDATE upstream_mutation_requests
 		   SET revision = revision + 1,
 		       updated_at = $1
@@ -491,14 +524,14 @@ func (s *PostgresStore) ApproveRequest(ctx context.Context, id string, actor str
 		return Request{}, errors.New("cannot approve a request without pending mutations")
 	}
 	now := time.Now().UTC()
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := execContext(ctx, tx, `
 		UPDATE upstream_mutation_requests
 		   SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $3
 		 WHERE id = $4
 	`, actor, now, now, id); err != nil {
 		return Request{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := execContext(ctx, tx, `
 		UPDATE upstream_mutations
 		   SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $3
 		 WHERE request_id = $4 AND status = 'pending_review'
@@ -551,14 +584,14 @@ func (s *PostgresStore) RejectRequest(ctx context.Context, id string, actor stri
 		return Request{}, err
 	}
 	now := time.Now().UTC()
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := execContext(ctx, tx, `
 		UPDATE upstream_mutation_requests
 		   SET status = 'rejected', error = $1, updated_at = $2
 		 WHERE id = $3
 	`, reason, now, id); err != nil {
 		return Request{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := execContext(ctx, tx, `
 		UPDATE upstream_mutations
 		   SET status = 'rejected', error = $1, updated_at = $2
 		 WHERE request_id = $3 AND status = 'pending_review'
@@ -582,7 +615,7 @@ func (s *PostgresStore) RejectRequest(ctx context.Context, id string, actor stri
 
 func (s *PostgresStore) getRequestByIdempotencyKey(ctx context.Context, key string) (Request, error) {
 	var id string
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM upstream_mutation_requests WHERE idempotency_key = $1`, key).Scan(&id)
+	err := queryRowContext(ctx, s.db, `SELECT id FROM upstream_mutation_requests WHERE idempotency_key = $1`, key).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Request{}, nil
 	}
@@ -593,7 +626,7 @@ func (s *PostgresStore) getRequestByIdempotencyKey(ctx context.Context, key stri
 }
 
 func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := queryRowContext(ctx, s.db, `
 		SELECT request.id, request.status, request.title, request.reason, request.context_json,
 		       request.result_json, request.error, request.idempotency_key, request.revision,
 		       request.requested_by, request.approved_by, request.created_at, request.updated_at,
@@ -612,7 +645,7 @@ func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, err
 }
 
 func (s *PostgresStore) listMutationsForRequest(ctx context.Context, requestID string) ([]Mutation, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := queryContext(ctx, s.db, `
 		SELECT id, request_id, request_index, provider, operation, account, status, title, reason,
 		       payload_json, preview_json, result_json, error, idempotency_key, revision, attempt_count,
 		       requested_by, approved_by, claimed_by, claimed_at, created_at, updated_at, approved_at,
@@ -651,7 +684,7 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 		values = append(values, fmt.Sprintf("($%d, $%d)", len(args)-1, len(args)))
 	}
 
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+	rows, err := queryContext(ctx, s.db, fmt.Sprintf(`
 		WITH wanted(account, thread_id) AS (
 			VALUES %s
 		)
@@ -742,7 +775,7 @@ func (s *PostgresStore) enrichGmailEmailReplyHeaders(ctx context.Context, mutati
 		values = append(values, fmt.Sprintf("($%d, $%d)", len(args)-1, len(args)))
 	}
 
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+	rows, err := queryContext(ctx, s.db, fmt.Sprintf(`
 		WITH wanted(account, thread_id) AS (
 			VALUES %s
 		),
@@ -956,7 +989,7 @@ func (s *PostgresStore) enrichGmailEmailReplyQuotes(ctx context.Context, mutatio
 		values = append(values, fmt.Sprintf("($%d, $%d)", len(args)-1, len(args)))
 	}
 
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+	rows, err := queryContext(ctx, s.db, fmt.Sprintf(`
 		WITH wanted(account, thread_id) AS (
 			VALUES %s
 		),
@@ -1190,7 +1223,7 @@ func (s *PostgresStore) enrichGmailEmailSignatures(ctx context.Context, mutation
 
 func (s *PostgresStore) latestGmailSignature(ctx context.Context, account string) (gmailSignature, error) {
 	var bodyHTML, bodyText string
-	err := s.db.QueryRowContext(ctx, `
+	err := queryRowContext(ctx, s.db, `
 		SELECT COALESCE(body_html, ''), COALESCE(body_text, '')
 		FROM gmail_messages
 		WHERE account = $1
@@ -2018,7 +2051,7 @@ func randomID(prefix string) (string, error) {
 
 func requestStatusForUpdate(ctx context.Context, tx *sql.Tx, id string) (string, error) {
 	var status string
-	err := tx.QueryRowContext(ctx, `SELECT status FROM upstream_mutation_requests WHERE id = $1 FOR UPDATE`, id).Scan(&status)
+	err := queryRowContext(ctx, tx, `SELECT status FROM upstream_mutation_requests WHERE id = $1 FOR UPDATE`, id).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -2026,7 +2059,7 @@ func requestStatusForUpdate(ctx context.Context, tx *sql.Tx, id string) (string,
 }
 
 func pendingMutationIDsForUpdate(ctx context.Context, tx *sql.Tx, requestID string) ([]string, error) {
-	rows, err := tx.QueryContext(ctx, `
+	rows, err := queryContext(ctx, tx, `
 		SELECT id
 		FROM upstream_mutations
 		WHERE request_id = $1 AND status = 'pending_review'
@@ -2052,7 +2085,7 @@ func pendingMutationIDsForUpdate(ctx context.Context, tx *sql.Tx, requestID stri
 }
 
 func mutationForUpdate(ctx context.Context, tx *sql.Tx, requestID string, mutationID string) (Mutation, error) {
-	row := tx.QueryRowContext(ctx, `
+	row := queryRowContext(ctx, tx, `
 		SELECT id, request_id, request_index, provider, operation, account, status, title, reason,
 		       payload_json, preview_json, result_json, error, idempotency_key, revision, attempt_count,
 		       requested_by, approved_by, claimed_by, claimed_at, created_at, updated_at, approved_at,
@@ -2070,10 +2103,10 @@ func mutationForUpdate(ctx context.Context, tx *sql.Tx, requestID string, mutati
 
 func appendRequestEvent(ctx context.Context, tx *sql.Tx, requestID string, eventType string, actorType string, actorID string, event map[string]any) error {
 	var index int64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(event_index), -1) + 1 FROM upstream_mutation_request_events WHERE request_id = $1`, requestID).Scan(&index); err != nil {
+	if err := queryRowContext(ctx, tx, `SELECT COALESCE(MAX(event_index), -1) + 1 FROM upstream_mutation_request_events WHERE request_id = $1`, requestID).Scan(&index); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `
+	_, err := execContext(ctx, tx, `
 		INSERT INTO upstream_mutation_request_events (request_id, event_index, event_type, actor_type, actor_id, event_json)
 		VALUES ($1, $2, $3, $4, $5, $6::jsonb)
 	`, requestID, index, eventType, actorType, actorID, jsonString(event))
@@ -2082,10 +2115,10 @@ func appendRequestEvent(ctx context.Context, tx *sql.Tx, requestID string, event
 
 func appendMutationEvent(ctx context.Context, tx *sql.Tx, mutationID string, eventType string, actorType string, actorID string, event map[string]any) error {
 	var index int64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(event_index), -1) + 1 FROM upstream_mutation_events WHERE mutation_id = $1`, mutationID).Scan(&index); err != nil {
+	if err := queryRowContext(ctx, tx, `SELECT COALESCE(MAX(event_index), -1) + 1 FROM upstream_mutation_events WHERE mutation_id = $1`, mutationID).Scan(&index); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `
+	_, err := execContext(ctx, tx, `
 		INSERT INTO upstream_mutation_events (mutation_id, event_index, event_type, actor_type, actor_id, event_json)
 		VALUES ($1, $2, $3, $4, $5, $6::jsonb)
 	`, mutationID, index, eventType, actorType, actorID, jsonString(event))
@@ -2126,6 +2159,8 @@ func decodeJSONStringArray(value string) []string {
 	}
 	return stringSliceFromAny(anyValues)
 }
+
+const upstreamMutationSchemaCreateStatement = `CREATE SCHEMA IF NOT EXISTS "upstream_mutations"`
 
 var upstreamMutationSchemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS upstream_mutation_requests (

@@ -159,9 +159,9 @@ func TestSQLCommandRejectsInvalidOutputFormat(t *testing.T) {
 
 func TestSQLCommandReturnsDomainErrorsOnStderr(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{"question":"Delete everything?","sql":"DELETE FROM gmail_messages","format":"csv","error":"query tool is read-only"}}`)
+		_, _ = io.WriteString(w, `{"data":{"question":"Delete everything?","sql":"DELETE FROM gmail.messages","format":"csv","error":"query tool is read-only"}}`)
 	})
-	out, errOut, code := runCLI(t, srv.URL, "", "sql", "-q", "Delete everything?", "DELETE FROM gmail_messages")
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "-q", "Delete everything?", "DELETE FROM gmail.messages")
 	if code == 0 {
 		t.Fatalf("expected non-zero exit")
 	}
@@ -306,7 +306,7 @@ func TestHelpExitsZero(t *testing.T) {
 
 func TestNoArgsRunsSchemaOverview(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{"results":[{"sql":"SCHEMA","csv":"# default.slack_messages\nuser_id,conversation_id\nU09,C0\n"}]}}`)
+		_, _ = io.WriteString(w, `{"data":{"results":[{"sql":"SCHEMA","csv":"# default.slack.messages\nuser_id,conversation_id\nU09,C0\n"}]}}`)
 	})
 	out, errOut, code := runCLI(t, srv.URL, "")
 	if code != 0 {
@@ -315,14 +315,14 @@ func TestNoArgsRunsSchemaOverview(t *testing.T) {
 	if srv.lastPath != "/api/tools/schema_overview" || srv.lastMethod != http.MethodPost {
 		t.Fatalf("expected POST /api/tools/schema_overview, got %s %s", srv.lastMethod, srv.lastPath)
 	}
-	if !strings.Contains(out, "default.slack_messages") || !strings.Contains(out, "user_id,conversation_id") {
+	if !strings.Contains(out, "default.slack.messages") || !strings.Contains(out, "user_id,conversation_id") {
 		t.Fatalf("schema CSV not printed:\n%s", out)
 	}
 }
 
 func TestSchemaCommandRunsSchemaOverview(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{"results":[{"sql":"SCHEMA","csv":"# default.gmail_messages\nsubject\nhello\n"}]}}`)
+		_, _ = io.WriteString(w, `{"data":{"results":[{"sql":"SCHEMA","csv":"# default.gmail.messages\nsubject\nhello\n"}]}}`)
 	})
 	out, errOut, code := runCLI(t, srv.URL, "", "schema")
 	if code != 0 {
@@ -331,7 +331,7 @@ func TestSchemaCommandRunsSchemaOverview(t *testing.T) {
 	if srv.lastPath != "/api/tools/schema_overview" || srv.lastMethod != http.MethodPost {
 		t.Fatalf("expected POST /api/tools/schema_overview, got %s %s", srv.lastMethod, srv.lastPath)
 	}
-	if !strings.Contains(out, "default.gmail_messages") || !strings.Contains(out, "subject") {
+	if !strings.Contains(out, "default.gmail.messages") || !strings.Contains(out, "subject") {
 		t.Fatalf("schema CSV not printed:\n%s", out)
 	}
 }
@@ -533,11 +533,11 @@ func TestCallRedirectsSQLToolsToSQLCommand(t *testing.T) {
 	}
 }
 
-func TestColumnsCommandUsesSQLTool(t *testing.T) {
+func TestColumnsCommandUsesSQLToolWithSchemaQualifiedRelation(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"rows":"column_name,data_type,is_nullable\nid,text,NO"}}`)
 	})
-	out, errOut, code := runCLI(t, srv.URL, "", "columns", "gmail_messages")
+	out, errOut, code := runCLI(t, srv.URL, "", "columns", "gmail.messages")
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
 	}
@@ -548,8 +548,13 @@ func TestColumnsCommandUsesSQLTool(t *testing.T) {
 	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
 		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
 	}
-	if !strings.Contains(input["sql"], "information_schema.columns") || !strings.Contains(input["sql"], "'gmail_messages'") {
+	if !strings.Contains(input["sql"], "information_schema.columns") ||
+		!strings.Contains(input["sql"], "table_schema = 'gmail'") ||
+		!strings.Contains(input["sql"], "table_name = 'messages'") {
 		t.Fatalf("columns SQL = %q", input["sql"])
+	}
+	if !strings.Contains(input["question"], "gmail.messages") {
+		t.Fatalf("columns question = %q", input["question"])
 	}
 	if !strings.Contains(out, "column_name,data_type,is_nullable") || !strings.Contains(out, "id,text,NO") {
 		t.Fatalf("columns output:\n%s", out)
@@ -564,7 +569,7 @@ func TestColumnsCommandRejectsBadIdentifier(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("expected non-zero exit for an injection-y table name")
 	}
-	if !strings.Contains(errOut, "bare identifier") {
+	if !strings.Contains(errOut, "schema-qualified identifier") {
 		t.Fatalf("stderr = %s", errOut)
 	}
 }

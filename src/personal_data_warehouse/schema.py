@@ -630,9 +630,10 @@ AGENT_RUN_TOOL_CALL_COLUMNS = (
     "sync_version",
 )
 
-# AI agent CLI session logs (Claude Code, Codex, ...). One row per raw JSONL
-# line from a session/rollout transcript; the session-level roll-up lives in the
-# clean_agent_sessions view so cross-batch counts and token sums stay correct.
+# AI conversation logs (Claude Code, Codex, OpenClaw, Claude Desktop, ChatGPT).
+# One row per raw transcript/conversation event; source-owned physical tables
+# share this row shape, and marts.ai_conversation_sessions provides the
+# session-level roll-up so cross-batch counts and token sums stay correct.
 AGENT_SESSION_EVENT_COLUMNS = (
     "source",
     "session_id",

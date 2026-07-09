@@ -1,26 +1,28 @@
-"""Ingest AI agent session logs into ``agent_session_events``.
+"""Ingest AI agent session logs into source-owned AI event tables.
 
 Three transports feed the same row schema:
 
 * The CLI tools (Claude Code, Codex, OpenClaw) write append-only JSONL
   transcripts that a per-device uploader tails and batches into
   ``agent-sessions/inbox/batches/`` as gzipped JSONL envelopes. This module
-  consumes those batches and normalizes each raw line into a row (lossless
+  consumes those batches and normalizes each raw line into source-owned rows
+  (``claude_code.events``, ``codex.events``, or ``openclaw.events``; lossless
   ``raw_json`` plus queryable columns), then promotes processed batch files into
   ``agent-sessions/library/``.
 * Claude Desktop is polled server-side from claude.ai using a credential pushed
   from the local desktop app. It ships ``claude_desktop_event`` envelopes through
   the same Drive inbox, and ``claude_desktop_event_row`` normalizes them into
-  ``source = 'claude_desktop'`` rows.
+  ``claude_desktop.events`` rows.
 * ChatGPT (the consumer product) is polled server-side from its backend API,
   which returns each conversation as a node-tree. ``chatgpt_conversation_to_event_rows``
-  linearizes that tree into the same ``agent_session_events`` rows
-  (``source = 'chatgpt'``); see ``defs/chatgpt_backend_ingest.py``.
+  linearizes that tree into ``chatgpt.events`` rows; see
+  ``defs/chatgpt_backend_ingest.py``.
 
-The session-level roll-up (counts, token sums, header) is the
-``clean_agent_sessions`` view over these events, so it stays correct no matter
-how a session's lines are split across batches over time, and treats every
-``source`` uniformly.
+The unified raw event surface is ``marts.ai_conversation_events``. The
+session-level roll-up (counts, token sums, header) is
+``marts.ai_conversation_sessions``, so it stays correct no matter how a
+session's lines are split across batches over time, and treats every ``source``
+uniformly.
 """
 
 from __future__ import annotations
@@ -729,10 +731,10 @@ _EVENT_ROW_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
 # export (``conversations.json``) share one shape: a ``mapping`` of node-id ->
 # ``{id, message, parent, children}`` forming a tree (branches appear when a
 # turn is edited or regenerated). We linearize the tree depth-first from its
-# root(s), following each node's ``children`` in order, and emit one
-# ``agent_session_events`` row per message-bearing node. ``seq`` is the
-# depth-first position, so it is deterministic across idempotent re-pulls and
-# never depends on the (sometimes-null) ``create_time``.
+# root(s), following each node's ``children`` in order, and emit one source-owned
+# AI event row per message-bearing node. ``seq`` is the depth-first position, so
+# it is deterministic across idempotent re-pulls and never depends on the
+# (sometimes-null) ``create_time``.
 
 _CHATGPT_EPOCH = datetime.fromtimestamp(0, tz=UTC)
 
@@ -744,7 +746,7 @@ def chatgpt_conversation_to_event_rows(
     device: str,
     ingested_at: datetime,
 ) -> list[dict[str, Any]]:
-    """Normalize one ChatGPT conversation tree into ``agent_session_events`` rows."""
+    """Normalize one ChatGPT conversation tree into ``chatgpt.events`` rows."""
     mapping = conversation.get("mapping")
     mapping = mapping if isinstance(mapping, Mapping) else {}
     session_id = str(conversation.get("conversation_id") or conversation.get("id") or "")

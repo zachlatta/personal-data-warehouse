@@ -706,22 +706,23 @@ Voice Memos sidecar shape. The importer writes a raw recording file plus one sto
 JSON metadata file with the same dated content-hash basename when audio is available:
 
 ```text
-alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-<sha256>.<ext>
-alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-<sha256>.json
+alice-voice-recordings/library/YYYY/MM/YYYY-MM-DD-<sha256>.<ext>
+alice-voice-recordings/library/YYYY/MM/YYYY-MM-DD-<sha256>.json
 ```
 
-Alice is treated as an archive source, so the importer preserves whatever the API still exposes.
-Older Alice items may no longer have a raw media file; those still get a durable metadata sidecar:
+Alice is treated as an archive source named `alice_voice_recordings`, so the importer preserves
+whatever the API still exposes and tags Drive object metadata with that source name. Older Alice
+items may no longer have a raw media file; those still get a durable metadata sidecar:
 
 ```text
-alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<alice-id>.json
+alice-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<alice-id>.json
 ```
 
 If Alice returns a recording webpage rather than raw media, the page is archived too, because it may
 contain the only remaining transcript/source artifact:
 
 ```text
-alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-<sha256-or-alice-id>.html
+alice-voice-recordings/library/YYYY/MM/YYYY-MM-DD-<sha256-or-alice-id>.html
 ```
 
 Alice transcript emails from Gmail are also treated as recovery artifacts. This covers recordings
@@ -730,11 +731,11 @@ the only remaining source. The Gmail recovery asset writes the email body, trans
 and any attached audio beside the recording metadata:
 
 ```text
-alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.email.md
-alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.email.json
-alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.transcript.txt
-alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.transcript-formatted.docx
-alice-app-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.audio.<ext>
+alice-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.email.md
+alice-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.email.json
+alice-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.transcript.txt
+alice-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.transcript-formatted.docx
+alice-voice-recordings/library/YYYY/MM/YYYY-MM-DD-alice-<guid>-<title>.audio.<ext>
 ```
 
 Configure Alice API credentials and the Drive object-storage root:

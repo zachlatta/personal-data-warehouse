@@ -15,6 +15,7 @@ import (
 
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 // timelineQuerier is the parameterized-query capability the timeline endpoints
@@ -75,10 +76,10 @@ func newTimelineService(timeline, source timelineQuerier, media *timelineMediaSi
 
 // --- list -------------------------------------------------------------------
 
-const timelineListSQL = `
+var timelineListSQL = `
 SELECT adapter, event_id, source, kind, priority, event_ts, end_ts, actor, title, snippet, context,
        source_table, source_pk::text AS source_pk, metadata::text AS metadata, seq
-FROM timeline_events
+FROM ` + warehouse.SQLRelation("timeline_events") + `
 WHERE ($1 = '' OR source = ANY(string_to_array($1, ',')))
   AND ($2 = '' OR kind = ANY(string_to_array($2, ',')))
   AND ($3 = '' OR priority = ANY(string_to_array($3, ',')::bigint[]))
@@ -199,22 +200,22 @@ func timelineItemJSON(row map[string]any) map[string]any {
 
 // --- sources / sync status ----------------------------------------------------
 
-const timelineSourcesSQL = `
+var timelineSourcesSQL = `
 SELECT source, kind, count(*)::bigint AS count, min(event_ts) AS oldest, max(event_ts) AS newest
-FROM timeline_events
+FROM ` + warehouse.SQLRelation("timeline_events") + `
 GROUP BY source, kind
 ORDER BY source, kind`
 
-const timelinePrioritiesSQL = `
+var timelinePrioritiesSQL = `
 SELECT priority, count(*)::bigint AS count
-FROM timeline_events
+FROM ` + warehouse.SQLRelation("timeline_events") + `
 GROUP BY priority
 ORDER BY priority`
 
-const timelineSyncStateSQL = `
+var timelineSyncStateSQL = `
 SELECT adapter, backfill_done, backfill_cursor_event_ts, backfill_rows, incremental_rows,
        watermark_ingest_ts, last_run_at, last_error
-FROM timeline_sync_state
+FROM ` + warehouse.SQLRelation("timeline_sync_state") + `
 ORDER BY adapter`
 
 // handleSources serves the sidebar's counts. The aggregates behind them scan
@@ -322,15 +323,15 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			name:   "attachments",
 			params: []string{"account", "message_id"},
 			sql: `SELECT part_id, filename, mime_type, size, storage_status, storage_file_id, content_sha256
-			      FROM gmail_attachments WHERE account = $1 AND message_id = $2
+			      FROM ` + warehouse.SQLRelation("gmail_attachments") + ` WHERE account = $1 AND message_id = $2
 			      ORDER BY part_id LIMIT 50`,
 		},
 		{
 			name:   "attachment_enrichments",
 			params: []string{"account", "message_id"},
 			sql: `SELECT e.content_sha256, e.ai_model, left(e.text, 4000) AS text
-			      FROM file_attachment_enrichments e
-			      JOIN gmail_attachments a ON a.content_sha256 = e.content_sha256
+			      FROM ` + warehouse.SQLRelation("file_attachment_enrichments") + ` e
+			      JOIN ` + warehouse.SQLRelation("gmail_attachments") + ` a ON a.content_sha256 = e.content_sha256
 			      WHERE a.account = $1 AND a.message_id = $2 LIMIT 20`,
 		},
 	},
@@ -339,7 +340,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			name:   "reactions",
 			params: []string{"account", "team_id", "conversation_id", "message_ts"},
 			sql: `SELECT reaction_name, user_id, reaction_count
-			      FROM slack_message_reactions
+			      FROM ` + warehouse.SQLRelation("slack_message_reactions") + `
 			      WHERE account = $1 AND team_id = $2 AND conversation_id = $3 AND message_ts = $4
 			        AND is_deleted = 0
 			      ORDER BY reaction_name LIMIT 100`,
@@ -350,8 +351,8 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			sql: `SELECT m.message_ts, m.message_datetime, m.user_id,
 			             COALESCE(NULLIF(u.display_name, ''), NULLIF(u.real_name, ''), m.user_id) AS actor,
 			             left(m.text, 1000) AS text
-			      FROM slack_messages m
-			      LEFT JOIN slack_users u ON u.account = m.account AND u.team_id = m.team_id AND u.user_id = m.user_id
+			      FROM ` + warehouse.SQLRelation("slack_messages") + ` m
+			      LEFT JOIN ` + warehouse.SQLRelation("slack_users") + ` u ON u.account = m.account AND u.team_id = m.team_id AND u.user_id = m.user_id
 			      WHERE m.account = $1 AND m.team_id = $2 AND m.conversation_id = $3 AND m.thread_ts = $4
 			        AND m.is_deleted = 0
 			      ORDER BY m.message_datetime LIMIT 50`,
@@ -362,7 +363,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			name:   "files",
 			params: []string{"account", "team_id", "conversation_id", "message_ts"},
 			sql: `SELECT file_id AS storage_file_id, name AS filename, title, mimetype AS mime_type, size
-			      FROM slack_files
+			      FROM ` + warehouse.SQLRelation("slack_files") + `
 			      WHERE account = $1 AND team_id = $2 AND conversation_id = $3 AND message_ts = $4
 			        AND is_deleted = 0
 			      ORDER BY file_id LIMIT 20`,
@@ -374,7 +375,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			params: []string{"account", "message_id"},
 			sql: `SELECT attachment_id, transfer_name AS filename, mime_type, total_bytes, is_missing,
 			             storage_file_id, content_sha256
-			      FROM apple_message_attachments WHERE account = $1 AND message_id = $2
+			      FROM ` + warehouse.SQLRelation("apple_message_attachments") + ` WHERE account = $1 AND message_id = $2
 			      ORDER BY attachment_id LIMIT 50`,
 		},
 	},
@@ -384,7 +385,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			params: []string{"account", "chat_id", "message_id"},
 			sql: `SELECT media_type, filename, mime_type, size_bytes, is_missing,
 			             storage_file_id, content_sha256
-			      FROM whatsapp_media_items
+			      FROM ` + warehouse.SQLRelation("whatsapp_media_items") + `
 			      WHERE account = $1 AND chat_id = $2 AND message_id = $3 LIMIT 20`,
 		},
 	},
@@ -393,14 +394,14 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			name:   "events_head",
 			params: []string{"source", "session_id"},
 			sql: `SELECT seq, occurred_at, role, event_type, tool_name, left(text, 700) AS text
-			      FROM agent_session_events WHERE source = $1 AND session_id = $2
+			      FROM ` + warehouse.SQLRelation("agent_session_events") + ` WHERE source = $1 AND session_id = $2
 			      ORDER BY seq LIMIT 100`,
 		},
 		{
 			name:   "events_tail",
 			params: []string{"source", "session_id"},
 			sql: `SELECT seq, occurred_at, role, event_type, tool_name, left(text, 700) AS text
-			      FROM agent_session_events WHERE source = $1 AND session_id = $2
+			      FROM ` + warehouse.SQLRelation("agent_session_events") + ` WHERE source = $1 AND session_id = $2
 			      ORDER BY seq DESC LIMIT 50`,
 		},
 	},
@@ -409,7 +410,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			name:   "attachments",
 			params: []string{"account", "note_id", "revision_id"},
 			sql: `SELECT attachment_id, filename, content_type, size_bytes, is_missing, storage_file_id
-			      FROM apple_note_attachments
+			      FROM ` + warehouse.SQLRelation("apple_note_attachments") + `
 			      WHERE account = $1 AND note_id = $2 AND revision_id = $3 LIMIT 50`,
 		},
 	},
@@ -419,21 +420,21 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			params: []string{"account", "recording_id"},
 			sql: `SELECT provider, model, status, title, left(summary, 4000) AS summary,
 			             action_items_json, calendar_event_id
-			      FROM apple_voice_memos_enrichments
+			      FROM ` + warehouse.SQLRelation("apple_voice_memos_enrichments") + `
 			      WHERE account = $1 AND recording_id = $2 ORDER BY created_at DESC LIMIT 5`,
 		},
 		{
 			name:   "transcription_runs",
 			params: []string{"account", "recording_id"},
 			sql: `SELECT provider, model, status, requested_at, completed_at, left(error, 500) AS error
-			      FROM apple_voice_memos_transcription_runs
+			      FROM ` + warehouse.SQLRelation("apple_voice_memos_transcription_runs") + `
 			      WHERE account = $1 AND recording_id = $2 LIMIT 10`,
 		},
 		{
 			name:   "transcript_segments",
 			params: []string{"account", "recording_id"},
 			sql: `SELECT segment_index, speaker_label, start_ms, end_ms, left(text, 700) AS text
-			      FROM apple_voice_memos_transcript_segments
+			      FROM ` + warehouse.SQLRelation("apple_voice_memos_transcript_segments") + `
 			      WHERE account = $1 AND recording_id = $2 ORDER BY segment_index LIMIT 100`,
 		},
 	},
@@ -442,7 +443,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			name:   "extracted_texts",
 			params: []string{"account", "file_id"},
 			sql: `SELECT extractor, char_count, truncated, left(text, 4000) AS text
-			      FROM google_drive_file_texts
+			      FROM ` + warehouse.SQLRelation("google_drive_file_texts") + `
 			      WHERE account = $1 AND file_id = $2 LIMIT 5`,
 		},
 	},
@@ -452,7 +453,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			params: []string{"id"},
 			sql: `SELECT event_index, event_type, actor_type, actor_id, created_at,
 			             left(event_json::text, 2000) AS event_json
-			      FROM upstream_mutation_events WHERE mutation_id = $1
+			      FROM ` + warehouse.SQLRelation("upstream_mutation_events") + ` WHERE mutation_id = $1
 			      ORDER BY event_index LIMIT 100`,
 		},
 	},
@@ -462,7 +463,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			params: []string{"id"},
 			sql: `SELECT event_index, event_type, actor_type, actor_id, created_at,
 			             left(event_json::text, 2000) AS event_json
-			      FROM upstream_mutation_request_events WHERE request_id = $1
+			      FROM ` + warehouse.SQLRelation("upstream_mutation_request_events") + ` WHERE request_id = $1
 			      ORDER BY event_index LIMIT 100`,
 		},
 	},
@@ -471,25 +472,25 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			name:   "tool_calls",
 			params: []string{"run_id"},
 			sql: `SELECT event_index, tool_name, started_at, completed_at, left(error, 500) AS error
-			      FROM agent_run_tool_calls WHERE run_id = $1 ORDER BY event_index LIMIT 100`,
+			      FROM ` + warehouse.SQLRelation("agent_run_tool_calls") + ` WHERE run_id = $1 ORDER BY event_index LIMIT 100`,
 		},
 		{
 			name:   "events_head",
 			params: []string{"run_id"},
 			sql: `SELECT event_index, stream, event_type, created_at, left(text, 700) AS text
-			      FROM agent_run_events WHERE run_id = $1 ORDER BY event_index LIMIT 100`,
+			      FROM ` + warehouse.SQLRelation("agent_run_events") + ` WHERE run_id = $1 ORDER BY event_index LIMIT 100`,
 		},
 	},
-	"slack_files":                {},
-	"calendar_events":            {},
-	"contact_cards":              {},
+	"slack_files":     {},
+	"calendar_events": {},
+	"contact_cards":   {},
 }
 
-const timelineItemSQL = `
+var timelineItemSQL = `
 SELECT adapter, event_id, source, kind, priority, event_ts, end_ts, actor, title, snippet, context,
        source_table, source_pk::text AS source_pk, metadata::text AS metadata, seq,
        ingest_ts, first_seen_at, updated_at
-FROM timeline_events
+FROM ` + warehouse.SQLRelation("timeline_events") + `
 WHERE adapter = $1 AND event_id = $2`
 
 func (s *timelineService) handleItem(w http.ResponseWriter, r *http.Request) {
@@ -663,12 +664,15 @@ func (s *timelineService) fetchSourceRow(ctx context.Context, table string, pk m
 	sortStrings(keys)
 	clauses := make([]string, 0, len(keys))
 	args := make([]any, 0, len(keys))
+	if _, ok := warehouse.Relations[table]; !ok {
+		return nil, fmt.Errorf("unknown source table %q", table)
+	}
 	for i, key := range keys {
-		clauses = append(clauses, fmt.Sprintf("%s = $%d", key, i+1))
+		clauses = append(clauses, fmt.Sprintf("%s = $%d", warehouse.QuoteIdent(key), i+1))
 		args = append(args, pk[key])
 	}
 	sql := fmt.Sprintf("SELECT row_to_json(t)::text AS row FROM %s t WHERE %s LIMIT 1",
-		table, strings.Join(clauses, " AND "))
+		warehouse.SQLRelation(table), strings.Join(clauses, " AND "))
 	result, err := s.source.QueryArgs(ctx, sql, args, 1)
 	if err != nil {
 		return nil, err

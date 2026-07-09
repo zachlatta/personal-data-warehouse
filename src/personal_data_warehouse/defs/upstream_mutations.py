@@ -53,8 +53,8 @@ RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
 # Bootstrap guard for the sensor's table-ensure. The sensor evaluates every
 # UPSTREAM_MUTATION_SENSOR_INTERVAL_SECONDS in the long-lived user-code server,
 # and ensure_upstream_mutation_tables() runs heavy DDL — CREATE TABLE/INDEX IF
-# NOT EXISTS plus a CREATE OR REPLACE VIEW of the global searchable_text view —
-# which takes ACCESS EXCLUSIVE locks. Running that on every tick intermittently
+# NOT EXISTS plus search.search_text support refreshes — which can take ACCESS
+# EXCLUSIVE locks. Running that on every tick intermittently
 # blocked the tick behind concurrent searches/ingestion past Dagster's 60s
 # sensor timeout (~170 failed ticks/day in prod). We bootstrap the tables once
 # per process instead; the worker job still re-ensures them whenever it runs.

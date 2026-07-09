@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from tests.conftest import make_test_schema
 
 from personal_data_warehouse.postgres import POSTGRES_INDEXES, POSTGRES_TABLES, PostgresWarehouse
+from personal_data_warehouse.relations import AI_EVENT_SOURCE_RELATIONS, CANONICAL_RELATIONS, physical_schema_names
 from personal_data_warehouse.timeline import (
     RAW_DDL_TABLES,
     TIMELINE_ADAPTERS,
@@ -37,7 +38,8 @@ def warehouse():
     try:
         yield wh
     finally:
-        wh._command(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        for schema_name in wh.physical_schema_names(include_private=True) + [schema]:
+            wh._raw_command(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
         wh.close()
 
 
@@ -70,7 +72,12 @@ def test_every_registered_table_is_classified():
 
 
 def test_adapter_source_tables_are_classified_as_events():
-    adapter_tables = {adapter.source_table for adapter in TIMELINE_ADAPTERS}
+    adapter_tables: set[str] = set()
+    for adapter in TIMELINE_ADAPTERS:
+        if adapter.source_table == "agent_session_events":
+            adapter_tables.update(AI_EVENT_SOURCE_RELATIONS.values())
+        else:
+            adapter_tables.add(adapter.source_table)
     event_tables = {
         table for table, coverage in TIMELINE_TABLE_COVERAGE.items() if coverage.role == "events"
     }
@@ -142,21 +149,36 @@ def test_live_schema_has_no_unclassified_tables(warehouse):
     _ensure_all_source_tables(warehouse)
     rows = warehouse._query(
         """
-        SELECT table_name
+        SELECT table_schema, table_name
         FROM information_schema.tables
-        WHERE table_schema = %s AND table_type = 'BASE TABLE'
+        WHERE table_schema = ANY(%s) AND table_type = 'BASE TABLE'
         """,
-        (warehouse._schema,),
+        (warehouse.physical_schema_names(include_private=True),),
     )
-    live_tables = {row[0] for row in rows}
+    physical_to_logical = {
+        (rel.with_namespace(warehouse.schema_namespace).schema, rel.name): logical
+        for logical, rel in CANONICAL_RELATIONS.items()
+        if logical in TIMELINE_TABLE_COVERAGE
+    }
+    live_tables = {physical_to_logical.get((schema, table), f"{schema}.{table}") for schema, table in rows}
     unclassified = live_tables - set(TIMELINE_TABLE_COVERAGE)
     assert unclassified == set(), (
-        "tables exist in the warehouse schema without a timeline classification; "
+        "tables exist in canonical warehouse schemas without a timeline classification; "
         "add them to TIMELINE_TABLE_COVERAGE (and an adapter if they hold activity): "
         f"{sorted(unclassified)}"
     )
-    # And the classification list should not reference tables that no longer exist.
-    stale = set(TIMELINE_TABLE_COVERAGE) - live_tables
+    # And the classification list should not reference canonical tables that no longer exist.
+    expected_physical = {
+        (rel.with_namespace(warehouse.schema_namespace).schema, rel.name): logical
+        for logical, rel in CANONICAL_RELATIONS.items()
+        if logical in (set(POSTGRES_TABLES) | set(RAW_DDL_TABLES))
+    }
+    live_physical = set(rows)
+    stale = {
+        logical
+        for physical, logical in expected_physical.items()
+        if physical not in live_physical and logical != "agent_session_events"
+    }
     assert stale == set(), f"classified tables missing from the live schema: {sorted(stale)}"
 
 
@@ -164,8 +186,8 @@ def test_ensure_timeline_tables_is_idempotent_and_indexed(warehouse):
     warehouse.ensure_timeline_tables()
     warehouse.ensure_timeline_tables()
     rows = warehouse._query(
-        "SELECT indexname FROM pg_indexes WHERE schemaname = %s AND tablename = 'timeline_events'",
-        (warehouse._schema,),
+        "SELECT indexname FROM pg_indexes WHERE schemaname = %s AND tablename = 'events'",
+        (warehouse.physical_schema_name("timeline"),),
     )
     names = {row[0] for row in rows}
     assert "timeline_events_time_idx" in names
@@ -206,7 +228,7 @@ def test_adapter_queries_run_against_the_real_schema(warehouse):
             assert incremental == []
             with engine._source_conn.cursor() as cursor:
                 cursor.execute(
-                    adapter.backfill_sql,
+                    engine._source_sql(adapter.backfill_sql),
                     {"cursor_ts": BACKFILL_CURSOR_START, "cursor_id": "", "limit": 5},
                 )
                 columns = [d[0] for d in cursor.description]
@@ -1273,17 +1295,18 @@ def test_engine_pumps_into_a_separate_destination_schema(warehouse):
     try:
         engine.run()
         with engine._dest_conn.cursor() as cursor:
-            cursor.execute("SELECT count(*) FROM timeline_events")
+            cursor.execute(engine._dest_sql("SELECT count(*) FROM timeline_events"))
             count = cursor.fetchone()[0]
         assert count == sum(EXPECTED_SEEDED_EVENTS.values())
         # Nothing was written into the source schema.
         assert not warehouse._query(
-            "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = 'timeline_events' LIMIT 1",
-            (warehouse._schema,),
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = 'events' LIMIT 1",
+            (warehouse.physical_schema_name("timeline"),),
         ) or warehouse._query("SELECT count(*) FROM timeline_events")[0][0] == 0
     finally:
         with engine._dest_conn.cursor() as cursor:
-            cursor.execute(f'DROP SCHEMA IF EXISTS "{dest_schema}" CASCADE')
+            for schema_name in physical_schema_names(namespace=dest_schema, include_private=True) + [dest_schema]:
+                cursor.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
         engine.close()
 
 

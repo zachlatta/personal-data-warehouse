@@ -17,8 +17,8 @@ import requests
 
 from personal_data_warehouse.objectstore import ObjectPresence, ObjectStore
 
-SOURCE = "alice_app_voice_recordings"
-OBJECT_PREFIX = "alice-app-voice-recordings"
+SOURCE = "alice_voice_recordings"
+OBJECT_PREFIX = "alice-voice-recordings"
 INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox"
 LIBRARY_PREFIX = f"{OBJECT_PREFIX}/library"
 DEFAULT_AUDIO_EXTENSION = ".mp3"

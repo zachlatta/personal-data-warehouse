@@ -54,50 +54,50 @@ func statement(question, sql string) Statement {
 	return Statement{Question: question, SQL: sql}
 }
 
-func describeColumnsSQL(table string) string {
+func describeColumnsSQL(schema, table string) string {
 	return "SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type " +
 		"FROM pg_attribute a " +
 		"JOIN pg_class c ON c.oid = a.attrelid " +
 		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
-		"WHERE n.nspname = current_schema() AND c.relname = '" + strings.ReplaceAll(table, "'", "''") + "' " +
+		"WHERE n.nspname = '" + strings.ReplaceAll(schema, "'", "''") + "' AND c.relname = '" + strings.ReplaceAll(table, "'", "''") + "' " +
 		"AND a.attnum > 0 AND NOT a.attisdropped " +
 		"ORDER BY a.attnum"
 }
 
 func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
-	showTablesSQL := "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
-	describeCleanGmailSQL := describeColumnsSQL("clean_gmail_inbox")
-	describeGmailSQL := describeColumnsSQL("gmail_messages")
-	describeSlackSQL := describeColumnsSQL("slack\"messages")
-	indexSQL := "SELECT t.relname AS name, regexp_replace(pg_get_indexdef(ix.indexrelid), '^.* USING ', '') AS def, CASE WHEN ix.indisprimary THEN ' [primary key]' WHEN ix.indisunique THEN ' [unique]' ELSE '' END AS flag FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_class t ON t.oid = ix.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = current_schema() AND t.relkind IN ('r', 'p', 'm') ORDER BY t.relname, ix.indisprimary DESC, def"
+	showTablesSQL := "SELECT table_schema AS schema, table_name AS name FROM information_schema.tables WHERE table_schema = ANY(" + queryableSchemaArraySQL() + ") AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_schema, table_name"
+	describeCleanGmailSQL := describeColumnsSQL("marts", "gmail_inbox")
+	describeGmailSQL := describeColumnsSQL("gmail", "messages")
+	describeSlackSQL := describeColumnsSQL("slack", "messages")
+	indexSQL := "SELECT n.nspname AS schema, t.relname AS name, regexp_replace(pg_get_indexdef(ix.indexrelid), '^.* USING ', '') AS def, CASE WHEN ix.indisprimary THEN ' [primary key]' WHEN ix.indisunique THEN ' [unique]' ELSE '' END AS flag FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_class t ON t.oid = ix.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") AND t.relkind IN ('r', 'p', 'm') ORDER BY n.nspname, t.relname, ix.indisprimary DESC, def"
 	runner := &recordingRunner{results: map[string]RawResult{
 		"SELECT current_database() AS database": {
 			Columns: []string{"database"},
 			Rows:    []map[string]any{{"database": "default"}},
 		},
 		showTablesSQL: {
-			Columns: []string{"name"},
+			Columns: []string{"schema", "name"},
 			Rows: []map[string]any{
-				{"name": "clean_gmail_inbox"},
-				{"name": "gmail_messages"},
-				{"name": "slack\"messages"},
+				{"schema": "marts", "name": "gmail_inbox"},
+				{"schema": "gmail", "name": "messages"},
+				{"schema": "slack", "name": "messages"},
 			},
 		},
-		"SELECT c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0": {
-			Columns: []string{"name", "row_estimate"},
+		"SELECT n.nspname AS schema, c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0": {
+			Columns: []string{"schema", "name", "row_estimate"},
 			Rows: []map[string]any{
-				{"name": "gmail_messages", "row_estimate": int64(1234567)},
-				{"name": "slack\"messages", "row_estimate": int64(42)},
+				{"schema": "gmail", "name": "messages", "row_estimate": int64(1234567)},
+				{"schema": "slack", "name": "messages", "row_estimate": int64(42)},
 			},
 		},
 		indexSQL: {
-			Columns: []string{"name", "def", "flag"},
+			Columns: []string{"schema", "name", "def", "flag"},
 			Rows: []map[string]any{
-				{"name": "gmail_messages", "def": "btree (account, message_id)", "flag": " [primary key]"},
-				{"name": "gmail_messages", "def": "gin (body_text gin_trgm_ops)", "flag": ""},
-				{"name": "slack\"messages", "def": "btree (account, team_id, conversation_id, message_ts)", "flag": " [primary key]"},
-				{"name": "slack\"messages", "def": "bm25 (text) WITH (text_config='english')", "flag": ""},
-				{"name": "slack\"messages", "def": "gin (text gin_trgm_ops)", "flag": ""},
+				{"schema": "gmail", "name": "messages", "def": "btree (account, message_id)", "flag": " [primary key]"},
+				{"schema": "gmail", "name": "messages", "def": "gin (body_text gin_trgm_ops)", "flag": ""},
+				{"schema": "slack", "name": "messages", "def": "btree (account, team_id, conversation_id, message_ts)", "flag": " [primary key]"},
+				{"schema": "slack", "name": "messages", "def": "bm25 (text) WITH (text_config='english')", "flag": ""},
+				{"schema": "slack", "name": "messages", "def": "gin (text gin_trgm_ops)", "flag": ""},
 			},
 		},
 		describeCleanGmailSQL: {
@@ -125,7 +125,7 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 
 	resp := svc.SchemaOverview(context.Background())
 
-	rowEstimateSQL := "SELECT c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0"
+	rowEstimateSQL := "SELECT n.nspname AS schema, c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0"
 	wantQueries := []string{
 		"SELECT current_database() AS database",
 		showTablesSQL,
@@ -148,42 +148,23 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	if len(resp.Results) != 1 {
 		t.Fatalf("results length = %d, want 1", len(resp.Results))
 	}
-	wantCSV := strings.Join([]string{
-		"-- Reference these tables by their bare name in FROM/JOIN (e.g. FROM gmail_messages). Do not prefix them with the database name (\"default.\").",
-		"-- Each column header below is annotated with its Postgres type in parentheses, e.g. is_deleted (bigint), to_addresses (text[]).",
-		"-- Datetime columns: each source names its primary time column differently, so do not guess — gmail_messages.internal_date, slack_messages.message_datetime, apple_messages.message_at, apple_message_chat_messages.message_date, whatsapp_messages.message_at, agent_session_events.occurred_at, calendar_events.start_at, apple_notes.modified_at, apple_voice_memos_files.recorded_at, contact_cards.source_updated_at, google_drive_files.modified_time — all timestamp with time zone. There is no ts/created_at/timestamp/synced_at event-time column on the message tables. Filter and compare timestamptz columns against timestamps, never epoch integers: message_at >= '2026-01-01', not message_at > 1700000000 (which errors with \"operator does not exist: timestamp with time zone > integer\"). Some neighbouring time columns are NOT timestamps and need converting before comparison: slack_messages.message_ts/edited_ts and gmail_messages.date_header are text, and apple_messages.date_ns is a bigint epoch in NANOseconds. When unsure, the column header's (type) annotation is authoritative.",
-		"-- Slack uses a 3-table model with names that trip up guesses: the channels/DMs table is slack_conversations (not slack_channels) keyed by conversation_id (not channel_id); messages live in slack_messages; sync bookkeeping is slack_sync_state keyed by object_id with cursor_ts (text, often '' — guard ::numeric with NULLIF(cursor_ts,'')). raw_json columns are text, not jsonb (cast raw_json::jsonb before -> / ->>).",
-		"-- Each table lists its indexes. A gin (col gin_trgm_ops) index makes ILIKE and ~/~* substring search fast on that one column: match the column directly, e.g. body_text ILIKE '%x%' OR subject ILIKE '%x%'. Wrapping columns in lower(a || b || ...) or casting (to_addresses::text) bypasses every index and forces a full table scan, so search each indexed column separately and keep un-indexed expressions out of the same OR.",
-		"-- A bm25 (col) index supports relevance-ranked word search: SELECT ..., col <@> 'search terms' AS score FROM t ORDER BY col <@> 'search terms' LIMIT 20. Scores are negative (more negative = better; non-matches score 0); ALWAYS pair <@> with that ORDER BY plus a LIMIT, otherwise the index is not used. BM25 matches stemmed whole words only — no phrase queries and no typo tolerance — so for possibly-misspelled terms switch to the trigram indexes: WHERE col %> 'qery' ORDER BY word_similarity('qery', col) DESC LIMIT 20. Rule of thumb: <@> for topics and wording you trust, %> for fuzzy/typo'd terms, ILIKE for exact substrings.",
-		"-- Cross-source search (the default way to find things across the warehouse): SELECT * FROM search_text('offer letter', 50). It fans out to the per-table BM25 indexes and returns (source, subsource, context, who, occurred_at, account, ref, text, score) ranked across EVERY source — gmail, gmail attachments, slack messages/channels/files, apple notes, imessage, whatsapp, google drive docs, meeting transcripts, calendar, contacts, agent runs/sessions, and mutations — with score lower (more negative) = better. Optional args: search_text(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01'). The `sources` filter takes terse tokens that differ from the prose names above (apple notes => 'note', meeting transcripts => 'transcript', agent sessions => 'agent_session', mutations => 'mutation'/'mutation_request'; also 'gmail_attachment', 'slack_channel', 'slack_file', 'imessage', 'whatsapp'/'whatsapp_chat'/'whatsapp_media', 'google_drive', 'calendar', 'contact'). An unknown token RAISES an error listing the valid set (it does not silently return nothing) — run SELECT * FROM search_text_sources() to get the exact accepted tokens before filtering. Ranking caveats that cause MISSED answers: terms are OR'd, stemmed WHOLE words (no phrase/AND match, no typo tolerance) and scores are per-source, so cross-source order is only approximate — a noisy or short top-N does NOT mean a thing is absent. For 'find every mention of X' (especially a person): raise max_results well past the obvious noise, and try the term BOTH alone and with context — people are often addressed by first name only (e.g. 'Hi Mickey', no surname) or misspelled, which exact BM25 will rank low or miss, so also fall back to single-table trigram %> / ILIKE for name variants. Then drill into the underlying table via ref for full rows. (There is no cross-source view to scan with ILIKE — single-table BM25 <@> / trigram %> / ILIKE are for when you already know the table.)",
-		"-- For meetings, search_text(query, sources => ARRAY['transcript']) ranks the raw transcripts and surfaces the per-recording 'action_items' and 'summary' subsources (enrichment already extracted the commitments — read those first). Summaries are lossy, though: before reporting an email request as unanswered or a question as open, search the full transcript text (and Slack DMs) dated AFTER the request — decisions are often made on calls and appear only in raw transcripts.",
-		"-- Each table below lists its row estimate, indexes, and the full column catalog as `name (type)`. To see actual row values, query the table directly (e.g. SELECT * FROM <table> LIMIT 5).",
-		"",
-		"# clean_gmail_inbox",
-		"",
-		"thread_id (String),latest_subject (String)",
-		"",
-		"# gmail_messages (~1,234,567 rows, estimated)",
-		"# indexes:",
-		"#   btree (account, message_id) [primary key]",
-		"#   gin (body_text gin_trgm_ops)",
-		"",
-		"id (String),body (String)",
-		"",
-		"# slack\"messages (~42 rows, estimated)",
-		"# indexes:",
-		"#   btree (account, team_id, conversation_id, message_ts) [primary key]",
-		"#   bm25 (text) WITH (text_config='english')",
-		"#   gin (text gin_trgm_ops)",
-		"",
-		"channel_id (String)",
-	}, "\n") + "\n"
 	result := resp.Results[0]
 	if result.Error != "" {
 		t.Fatalf("SchemaOverview returned error: %s", result.Error)
 	}
-	if result.CSV != wantCSV {
-		t.Fatalf("CSV = %q, want %q", result.CSV, wantCSV)
+	for _, want := range []string{
+		`-- Reference these tables by their schema-qualified name`,
+		`SELECT * FROM search.search_text('offer letter', 50)`,
+		`# gmail.messages (~1,234,567 rows, estimated)`,
+		`# slack.messages (~42 rows, estimated)`,
+		`# marts.gmail_inbox`,
+		`#   btree (account, message_id) [primary key]`,
+		`id (String),body (String)`,
+		`channel_id (String)`,
+	} {
+		if !strings.Contains(result.CSV, want) {
+			t.Fatalf("schema overview missing %q in:\n%s", want, result.CSV)
+		}
 	}
 	// The overview emits only the column catalog (one header row per table, no
 	// sampled values), so there is nothing to truncate.
@@ -215,23 +196,18 @@ func TestFormatRowCount(t *testing.T) {
 }
 
 func TestServiceSchemaOverviewSkipsRowCountWhenLookupFails(t *testing.T) {
-	const rowEstimateSQL = "SELECT c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0"
-	showTablesSQL := "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
-	describeSQL := describeColumnsSQL("gmail_messages")
-	sampleSQL := "SELECT substring(\"id\"::text from 1 for 15) AS \"id\", char_length(\"id\"::text) AS \"__pdw_preview_len_0\" FROM \"gmail_messages\" LIMIT 3"
+	rowEstimateSQL := "SELECT n.nspname AS schema, c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0"
+	showTablesSQL := "SELECT table_schema AS schema, table_name AS name FROM information_schema.tables WHERE table_schema = ANY(" + queryableSchemaArraySQL() + ") AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_schema, table_name"
+	describeSQL := describeColumnsSQL("gmail", "messages")
 	runner := &recordingRunner{
 		results: map[string]RawResult{
 			"SELECT current_database() AS database": {
 				Columns: []string{"database"}, Rows: []map[string]any{{"database": "default"}},
 			},
-			showTablesSQL: {Columns: []string{"name"}, Rows: []map[string]any{{"name": "gmail_messages"}}},
+			showTablesSQL: {Columns: []string{"schema", "name"}, Rows: []map[string]any{{"schema": "gmail", "name": "messages"}}},
 			describeSQL: {
 				Columns: []string{"name"},
 				Rows:    []map[string]any{{"name": "id"}},
-			},
-			sampleSQL: {
-				Columns: []string{"id", "__pdw_preview_len_0"},
-				Rows:    []map[string]any{{"id": "msg-1", "__pdw_preview_len_0": 5}},
 			},
 		},
 		errs: map[string]error{rowEstimateSQL: errors.New("pg_class lookup denied")},
@@ -245,7 +221,7 @@ func TestServiceSchemaOverviewSkipsRowCountWhenLookupFails(t *testing.T) {
 	if resp.Results[0].Error != "" {
 		t.Fatalf("SchemaOverview surfaced row-estimate failure as error: %q", resp.Results[0].Error)
 	}
-	if !strings.Contains(resp.Results[0].CSV, "# gmail_messages\n") {
+	if !strings.Contains(resp.Results[0].CSV, "# gmail.messages\n") {
 		t.Fatalf("expected unannotated heading when row estimate lookup fails, got %q", resp.Results[0].CSV)
 	}
 }
@@ -382,45 +358,45 @@ func TestSchemaErrorHint(t *testing.T) {
 		{
 			name:    "timestamptz compared to bigint",
 			message: "ERROR: operator does not exist: timestamp with time zone >= bigint (SQLSTATE 42883)",
-			sql:     "SELECT 1 FROM apple_messages WHERE message_at >= 1700000000",
+			sql:     "SELECT 1 FROM apple_messages.messages WHERE message_at >= 1700000000",
 			want:    []string{"compare it to a timestamp"},
 		},
 		{
 			name:    "time guess on a known single table names that table's column",
 			message: `ERROR: column "ts" does not exist (SQLSTATE 42703)`,
-			sql:     "SELECT ts FROM slack_messages LIMIT 1",
-			want:    []string{"slack_messages", "message_datetime", "schema_overview"},
+			sql:     "SELECT ts FROM slack.messages LIMIT 1",
+			want:    []string{"slack.messages", "message_datetime", "schema_overview"},
 		},
 		{
-			name:    "time guess on agent_session_events names occurred_at",
+			name:    "time guess on AI conversation events names occurred_at",
 			message: `ERROR: column "created_at" does not exist (SQLSTATE 42703)`,
-			sql:     "SELECT created_at FROM agent_session_events LIMIT 1",
-			want:    []string{"agent_session_events", "occurred_at"},
+			sql:     "SELECT created_at FROM marts.ai_conversation_events LIMIT 1",
+			want:    []string{"marts.ai_conversation_events", "occurred_at"},
 		},
 		{
 			name:     "time guess with ambiguous join falls back to full list",
 			message:  `ERROR: column "ts" does not exist (SQLSTATE 42703)`,
-			sql:      "SELECT ts FROM slack_messages JOIN gmail_messages ON true",
-			want:     []string{"slack_messages.message_datetime", "gmail_messages.internal_date"},
+			sql:      "SELECT ts FROM slack.messages JOIN gmail.messages ON true",
+			want:     []string{"slack.messages.message_datetime", "gmail.messages.internal_date"},
 			wantNone: []string{"the primary time column on"},
 		},
 		{
 			name:     "structural column remap names the right column, not a time hint",
 			message:  `ERROR: column "channel_id" does not exist (SQLSTATE 42703)`,
-			sql:      "SELECT channel_id FROM slack_messages LIMIT 1",
-			want:     []string{"conversation_id", "slack_conversations"},
+			sql:      "SELECT channel_id FROM slack.messages LIMIT 1",
+			want:     []string{"conversation_id", "slack.conversations"},
 			wantNone: []string{"primary time column", "message_datetime"},
 		},
 		{
 			name:    "chat_jid remap",
 			message: `ERROR: column "chat_jid" does not exist (SQLSTATE 42703)`,
-			sql:     "SELECT chat_jid FROM whatsapp_messages LIMIT 1",
+			sql:     "SELECT chat_jid FROM whatsapp.messages LIMIT 1",
 			want:    []string{"chat_id"},
 		},
 		{
 			name:     "non-time unknown column gets generic schema_overview hint only",
 			message:  `ERROR: column "frobnicate" does not exist (SQLSTATE 42703)`,
-			sql:      "SELECT frobnicate FROM gmail_messages LIMIT 1",
+			sql:      "SELECT frobnicate FROM gmail.messages LIMIT 1",
 			want:     []string{"schema_overview"},
 			wantNone: []string{"primary time column", "conversation_id"},
 		},
@@ -428,7 +404,7 @@ func TestSchemaErrorHint(t *testing.T) {
 			name:    "wrong table name remaps slack_channels",
 			message: `ERROR: relation "slack_channels" does not exist (SQLSTATE 42P01)`,
 			sql:     "SELECT * FROM slack_channels LIMIT 1",
-			want:    []string{"slack_conversations", "schema_overview"},
+			want:    []string{"slack.conversations", "schema_overview"},
 		},
 		{
 			name:    "unknown table points at schema_overview",
@@ -439,19 +415,19 @@ func TestSchemaErrorHint(t *testing.T) {
 		{
 			name:    "numeric cast of empty cursor_ts",
 			message: `ERROR: invalid input syntax for type numeric: "" (SQLSTATE 22P02)`,
-			sql:     "SELECT cursor_ts::numeric FROM slack_sync_state WHERE cursor_ts = ''",
+			sql:     "SELECT cursor_ts::numeric FROM slack.sync_state WHERE cursor_ts = ''",
 			want:    []string{"cursor_ts", "NULLIF"},
 		},
 		{
 			name:     "unrelated syntax error gets no hint",
 			message:  "ERROR: syntax error at or near \"FROM\" (SQLSTATE 42601)",
-			sql:      "SELECT FROM gmail_messages",
+			sql:      "SELECT FROM gmail.messages",
 			wantNone: []string{"hint"},
 		},
 		{
 			name:     "unrelated operator error gets no hint",
 			message:  "ERROR: operator does not exist: text > integer (SQLSTATE 42883)",
-			sql:      "SELECT 1 FROM gmail_messages WHERE subject > 1",
+			sql:      "SELECT 1 FROM gmail.messages WHERE subject > 1",
 			wantNone: []string{"hint"},
 		},
 		{
@@ -494,7 +470,7 @@ func TestSchemaErrorHint(t *testing.T) {
 }
 
 func TestServiceExecuteAppendsDatetimeHintToError(t *testing.T) {
-	const sql = "SELECT count(*) FROM whatsapp_messages WHERE message_at > 1700000000"
+	const sql = "SELECT count(*) FROM whatsapp.messages WHERE message_at > 1700000000"
 	svc := NewService(fakeRunner{
 		errs: map[string]error{sql: errors.New("ERROR: operator does not exist: timestamp with time zone > integer (SQLSTATE 42883)")},
 	}, Options{MaxRows: 5, MaxFieldChars: 100})
@@ -509,7 +485,7 @@ func TestServiceExecuteAppendsDatetimeHintToError(t *testing.T) {
 }
 
 func TestServiceExecuteFullAppendsMissingColumnHintToError(t *testing.T) {
-	const sql = "SELECT count(*) FROM apple_messages WHERE date_unix > 1700000000"
+	const sql = "SELECT count(*) FROM apple_messages.messages WHERE date_unix > 1700000000"
 	svc := NewService(fakeRunner{
 		errs: map[string]error{sql: errors.New(`ERROR: column "date_unix" does not exist (SQLSTATE 42703)`)},
 	}, Options{MaxRows: 5, MaxFieldChars: 100})

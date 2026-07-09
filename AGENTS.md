@@ -346,13 +346,14 @@ The upload client (`ingest_client.py`, shared by every uploader) handles this tw
   runner defers any recording above it (like its partial/age deferrals) instead of 413-ing and
   wedging — so e.g. a lone 588 MiB memo is skipped while every other memo uploads.
 
-Agent sessions SQL starting points are the `agent_session_events` table (one row per transcript
-line; `source` is `claude_code`, `codex`, `openclaw`, or `claude_desktop` (see the Claude Desktop
-section below), `device` tags the machine) and the
-`clean_agent_sessions` view (per-session roll-up: counts, token sums, title, cwd/git, first
-prompt). Free-text content is also in the unified `searchable_text` view under
-`source = 'agent_session'`. (Not to be confused with `agent_runs`/`agent_run_events`, which log
-the warehouse's own internal enrichment agent.)
+Agent-session SQL starting points are the source-owned raw event tables
+`claude_code.events`, `codex.events`, `openclaw.events`, `claude_desktop.events`, and
+`chatgpt.events` (one row per transcript/conversation line; `device` tags the machine where
+applicable). Cross-source querying uses `marts.ai_conversation_events`, and per-session roll-ups
+(counts, token sums, title, cwd/git, first prompt) use `marts.ai_conversation_sessions`. Free-text
+content is available through `search.search_text()` with `source = 'agent_session'`. (Not to be
+confused with `ai_processing.agent_runs` / `ai_processing.agent_run_events`, which log the
+warehouse's own internal enrichment agent.)
 
 ### OpenClaw Agent Sessions (openclaw VM)
 
@@ -409,9 +410,10 @@ relying on the timer.
 ## Claude Desktop Sessions (claude.ai)
 
 Captures normal Claude conversations from the Claude Desktop app so they're queryable in
-the warehouse alongside the agent-CLI sources. They land in the SAME `agent_session_events` table
-under `source = 'claude_desktop'` (and the `clean_agent_sessions` view + cross-source `search_text`),
-normalized by `claude_desktop_event_row` in `agent_sessions_drive_ingest.py`.
+the warehouse alongside the agent-CLI sources. They land in the source-owned
+`claude_desktop.events` raw table and are also exposed through `marts.ai_conversation_events`,
+`marts.ai_conversation_sessions`, and `search.search_text()`, normalized by
+`claude_desktop_event_row` in `agent_sessions_drive_ingest.py`.
 
 Unlike Claude Code/Codex/OpenClaw, **the desktop app keeps no transcripts on disk** - it is a
 claude.ai wrapper; conversations live server-side. So this source is **authed clientside, polled
@@ -426,17 +428,17 @@ serverside**:
   pushed without contacting the app.
 - **App credential endpoint (Go):** `app/internal/server/credential_ingest.go` verifies the same
   object-upload HMAC as the other ingest endpoints and upserts the credential into the
-  `claude_desktop_credentials` Postgres table (keyed by account). Registered in `NewMux` whenever
-  `POSTGRES_DATABASE_URL` is set.
+  `private.claude_desktop_credentials` Postgres table (keyed by account). Registered in `NewMux`
+  whenever `POSTGRES_DATABASE_URL` is set.
 - **Serverside poller (Dagster):** `defs/claude_desktop_client.py` - the `claude_desktop_client`
   asset + `claude_desktop_client_keepalive_sensor` (5-min cadence) read the credential from
   Postgres and poll the claude.ai API (`personal_data_warehouse_claude_desktop/{api,sync,state}.py`).
   The `sessionKey` alone authenticates the API, so it works from prod's IP - no Cloudflare cookies
   needed. It fetches conversations changed since the per-conversation `updated_at` cursor
-  (`claude_desktop_conversation_state`, Postgres-durable) and ships one `conversation` header line +
+  (`claude_desktop.conversation_state`, Postgres-durable) and ships one `conversation` header line +
   one `message` line per turn through the SAME `/ingest/agent-sessions/batch` path as the other
   agent sources. Re-shipping a whole conversation when it gains a turn is cheap (warehouse dedupes
-  by `(source, session_id, event_uuid)`).
+  by `(source, session_id, event_uuid)` into `claude_desktop.events`).
 
 The `sessionKey` rotates ~monthly; the desktop app refreshes it, and the clientside LaunchAgent
 re-pushes it hourly so the server's copy stays fresh.
@@ -490,10 +492,11 @@ is likely blocking the background process from
 `~/Library/Application Support/Claude/Cookies` or the `Claude Safe Storage` Keychain item. Grant
 Full Disk Access to `/bin/zsh` and the `pdw` binary (`~/.local/bin/pdw`), then kickstart again.
 
-Claude Desktop SQL starting points are the same as the other agent sources: `agent_session_events`
-+ `clean_agent_sessions` filtered to `source = 'claude_desktop'` (one `meta` row per conversation
-carrying the title/model, then `user`/`assistant` rows per turn; `session_id` is the claude.ai
-conversation uuid). Free-text is in `search_text()` under `source = 'agent_session'`.
+Claude Desktop SQL starting points are `claude_desktop.events` for raw rows and
+`marts.ai_conversation_events` / `marts.ai_conversation_sessions` filtered to
+`source = 'claude_desktop'` for unified querying (one `meta` row per conversation carrying the
+title/model, then `user`/`assistant` rows per turn; `session_id` is the claude.ai conversation
+uuid). Free-text is in `search.search_text()` under `source = 'agent_session'`.
 
 ## WhatsApp Client (linked device)
 
@@ -574,9 +577,10 @@ and candidate query all live in `file_attachment_enrichment.py`; each source is 
 
 ## ChatGPT (consumer) - server-side backend poll
 
-Normal ChatGPT conversations (the consumer product, not the API) land in `agent_session_events`
-as a fourth agent-sessions source (`source = 'chatgpt'`), alongside `claude_code`/`codex`/`openclaw`,
-and roll up through the same `clean_agent_sessions` view + `search_text()` (`subsource = 'chatgpt'`).
+Normal ChatGPT conversations (the consumer product, not the API) land in the source-owned
+`chatgpt.events` raw table (`source = 'chatgpt'`), alongside the other AI conversation sources,
+and roll up through `marts.ai_conversation_sessions` with free-text in `search.search_text()`
+(`subsource = 'chatgpt'`).
 
 Why this one is different: the **ChatGPT desktop app** (`~/Library/Application Support/com.openai.chat`)
 stores conversations **encrypted** (`conversations-v3-*/*.data`), and both the decryption key and
@@ -594,18 +598,19 @@ Two pieces:
   Storage" keychain item (a one-time "allow" prompt); see `chatgpt_cookies.py`. It validates the
   session against `/api/auth/session`, then POSTs the full cookie header (HMAC-signed, like every
   other ingest) to the app endpoint `POST /ingest/chatgpt/session`, which upserts it into Postgres
-  `chatgpt_sessions` (`app/internal/chatgptsession`). The cookie never goes to Drive. Re-run this
-  whenever the server reports the session expired. Flags: `--account` (defaults through the same
-  account fallback), `--session-key`, `--dry-run`.
+  `private.chatgpt_sessions` (`app/internal/chatgptsession`). The cookie never goes to Drive. Re-run
+  this whenever the server reports the session expired. Flags: `--account` (defaults through the
+  same account fallback), `--session-key`, `--dry-run`.
 - **Server-side poll (Dagster): `chatgpt_backend_ingest` asset + `chatgpt_backend_ingest_sensor`.**
   The sensor fires every `CHATGPT_POLL_INTERVAL_SECONDS` (default 300) once a session is published
   (it *skips* with a "run publish-session" reason before first setup, so a missing session never
   floods failures). The asset reads the stored session, exchanges it for a short-lived `accessToken`
   (`chatgpt_backend.py`), walks `backend-api/conversations` newest-first, fetches each conversation
-  whose `update_time` is newer than the per-conversation watermark in `chatgpt_conversation_sync`,
+  whose `update_time` is newer than the per-conversation watermark in `chatgpt.conversation_sync`,
   and normalizes the message tree via `chatgpt_conversation_to_event_rows`
   (`agent_sessions_drive_ingest.py`; depth-first `seq`, `tool`/`tool_use` detection, `model_slug`,
-  reasoning -> `thinking`). Re-ingest is idempotent (PK `source,session_id,event_uuid`).
+  reasoning -> `thinking`). Re-ingest is idempotent in `chatgpt.events` (PK
+  `source,session_id,event_uuid`).
 
 **Fail-loud / self-heal:** when the session is rejected (logout/expiry), the backend client raises
 `ChatGPTAuthError`, the asset re-raises it with *"run `pdw chatgpt publish-session`"* and the run
@@ -618,8 +623,9 @@ account); `CHATGPT_CLIENT_ENABLED=0` pauses it. Optional:
 first backfill), `CHATGPT_SESSION_KEY`, `CHATGPT_BASE_URL`. The **app** auto-exposes
 `/ingest/chatgpt/session` whenever it has Postgres; no extra config. This is an unofficial API
 (same ToS/ban-risk class as the WhatsApp client); it reads only the configured account. ChatGPT SQL
-starting points: `agent_session_events`/`clean_agent_sessions` filtered to `source = 'chatgpt'`,
-and `chatgpt_sessions` (credential) / `chatgpt_conversation_sync` (per-conversation watermark).
+starting points: `chatgpt.events` plus `marts.ai_conversation_events` /
+`marts.ai_conversation_sessions` filtered to `source = 'chatgpt'`, and `private.chatgpt_sessions`
+(credential) / `chatgpt.conversation_sync` (per-conversation watermark).
 
 ## Shared file-attachment enrichment
 

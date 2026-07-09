@@ -13,6 +13,7 @@ import (
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 type fakeRunner struct {
@@ -27,12 +28,20 @@ func (f fakeRunner) Query(_ context.Context, sql string, maxRows int) (query.Raw
 	return result, nil
 }
 
-func describeColumnsSQL(table string) string {
+func queryableSchemaArraySQL() string {
+	quoted := make([]string, 0, len(warehouse.QueryableSchemas))
+	for _, schema := range warehouse.QueryableSchemas {
+		quoted = append(quoted, warehouse.SQLString(schema))
+	}
+	return "ARRAY[" + strings.Join(quoted, ",") + "]"
+}
+
+func describeColumnsSQL(schema, table string) string {
 	return "SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type " +
 		"FROM pg_attribute a " +
 		"JOIN pg_class c ON c.oid = a.attrelid " +
 		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
-		"WHERE n.nspname = current_schema() AND c.relname = '" + strings.ReplaceAll(table, "'", "''") + "' " +
+		"WHERE n.nspname = '" + strings.ReplaceAll(schema, "'", "''") + "' AND c.relname = '" + strings.ReplaceAll(table, "'", "''") + "' " +
 		"AND a.attnum > 0 AND NOT a.attisdropped " +
 		"ORDER BY a.attnum"
 }
@@ -401,17 +410,17 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 			Columns: []string{"database"},
 			Rows:    []map[string]any{{"database": "default"}},
 		},
-		"SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name": {
-			Columns: []string{"name"},
+		"SELECT table_schema AS schema, table_name AS name FROM information_schema.tables WHERE table_schema = ANY(" + queryableSchemaArraySQL() + ") AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_schema, table_name": {
+			Columns: []string{"schema", "name"},
 			Rows: []map[string]any{
-				{"name": "apple_messages"},
-				{"name": "apple_notes"},
-				{"name": "apple_voice_memos_enrichments"},
-				{"name": "clean_gmail_inbox"},
-				{"name": "gmail_messages"},
+				{"schema": "apple_messages", "name": "messages"},
+				{"schema": "apple_notes", "name": "notes"},
+				{"schema": "apple_voice_memos", "name": "enrichments"},
+				{"schema": "marts", "name": "gmail_inbox"},
+				{"schema": "gmail", "name": "messages"},
 			},
 		},
-		describeColumnsSQL("apple_messages"): {
+		describeColumnsSQL("apple_messages", "messages"): {
 			Columns: []string{"name", "type"},
 			Rows: []map[string]any{
 				{"name": "message_id", "type": "text"},
@@ -423,7 +432,7 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 				{"name": "is_deleted", "type": "bigint"},
 			},
 		},
-		describeColumnsSQL("apple_notes"): {
+		describeColumnsSQL("apple_notes", "notes"): {
 			Columns: []string{"name", "type"},
 			Rows: []map[string]any{
 				{"name": "note_id", "type": "text"},
@@ -434,15 +443,15 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 				{"name": "is_deleted", "type": "bigint"},
 			},
 		},
-		describeColumnsSQL("clean_gmail_inbox"): {
+		describeColumnsSQL("marts", "gmail_inbox"): {
 			Columns: []string{"name", "type"},
 			Rows:    []map[string]any{{"name": "thread_id", "type": "text"}, {"name": "latest_subject", "type": "text"}},
 		},
-		describeColumnsSQL("gmail_messages"): {
+		describeColumnsSQL("gmail", "messages"): {
 			Columns: []string{"name", "type"},
 			Rows:    []map[string]any{{"name": "subject", "type": "text"}},
 		},
-		describeColumnsSQL("apple_voice_memos_enrichments"): {
+		describeColumnsSQL("apple_voice_memos", "enrichments"): {
 			Columns: []string{"name", "type"},
 			Rows:    []map[string]any{{"name": "transcript", "type": "text"}, {"name": "summary", "type": "text"}},
 		},
@@ -504,17 +513,17 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	if !ok {
 		t.Fatalf("content type = %T", result.Content[0])
 	}
-	if !strings.Contains(text.Text, "# clean_gmail_inbox") || !strings.Contains(text.Text, "thread_id (text),latest_subject (text)") {
+	if !strings.Contains(text.Text, "# marts.gmail_inbox") || !strings.Contains(text.Text, "thread_id (text),latest_subject (text)") {
 		t.Fatalf("schema overview did not include clean view: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# gmail_messages") || !strings.Contains(text.Text, "subject (text)") {
+	if !strings.Contains(text.Text, "# gmail.messages") || !strings.Contains(text.Text, "subject (text)") {
 		t.Fatalf("unexpected schema overview text: %q", text.Text)
 	}
 	// The overview is a column catalog only — no sampled data rows.
 	if strings.Contains(text.Text, "thread-1,hello inbox") || strings.Contains(text.Text, "hello message") {
 		t.Fatalf("schema overview should not include sampled row values: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# apple_notes") || !strings.Contains(text.Text, "note_id (text),title (text),modified_at (timestamp with time zone),body_text (text),body_html (text),is_deleted (bigint)") {
+	if !strings.Contains(text.Text, "# apple_notes.notes") || !strings.Contains(text.Text, "note_id (text),title (text),modified_at (timestamp with time zone),body_text (text),body_html (text),is_deleted (bigint)") {
 		t.Fatalf("schema overview did not include Apple Notes table: %q", text.Text)
 	}
 	if !strings.Contains(text.Text, "# apple_messages") || !strings.Contains(text.Text, "message_id (text),message_at (timestamp with time zone),service (text),handle_id (text),body_text (text),is_from_me (bigint),is_deleted (bigint)") {

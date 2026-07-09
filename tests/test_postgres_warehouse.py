@@ -29,6 +29,7 @@ from personal_data_warehouse.schema import (
     VOICE_MEMO_FILE_COLUMNS,
     VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
 )
+from personal_data_warehouse.relations import query_relation
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
     ATTACHMENT_BACKFILL_STATE_COLUMNS,
@@ -61,8 +62,24 @@ def warehouse():
     try:
         yield wh
     finally:
-        wh._command(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        for schema_name in wh.physical_schema_names(include_private=True) + [schema]:
+            wh._raw_command(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
         wh.close()
+
+
+def _physical_relation(warehouse: PostgresWarehouse, logical_name: str):
+    return query_relation(logical_name).with_namespace(warehouse.schema_namespace)
+
+
+def _index_names(warehouse: PostgresWarehouse, logical_name: str) -> set[str]:
+    rel = _physical_relation(warehouse, logical_name)
+    return {
+        row[0]
+        for row in warehouse._query(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = %s AND tablename = %s",
+            (rel.schema, rel.name),
+        )
+    }
 
 
 def _message_row(*, message_id: str, subject: str, labels: list[str], sync_version: int, is_deleted: int = 0):
@@ -149,7 +166,7 @@ def test_search_schema_rebuild_is_skipped_when_unchanged(warehouse: PostgresWare
         "search_text() was recompiled even though its DDL was unchanged"
     )
 
-    warehouse._command(f'DELETE FROM "{warehouse._SEARCH_SCHEMA_MARKER_TABLE}" WHERE id = 1')
+    warehouse._command(f"DELETE FROM {warehouse.sql_relation('search_schema_state')} WHERE id = 1")
     issued.clear()
     warehouse._command = spy
     try:
@@ -923,14 +940,7 @@ def test_postgres_renames_legacy_gmail_attachment_enrichments_table(warehouse: P
         ("legacy-sha",),
     )
     assert preserved == [("legacy enrichment text",)]
-    index_names = {
-        row[0]
-        for row in warehouse._query(
-            "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
-            "AND tablename = 'file_attachment_enrichments'",
-            (),
-        )
-    }
+    index_names = _index_names(warehouse, "file_attachment_enrichments")
     assert not any(name.startswith("gmail_attachment_enrichments") for name in index_names)
 
 
@@ -1151,20 +1161,7 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
     warehouse.ensure_apple_messages_tables()
     warehouse.ensure_slack_tables()
 
-    rows = warehouse._query(
-        """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = current_schema()
-          AND table_name IN (
-            'gmail_messages', 'calendar_events', 'slack_messages', 'apple_voice_memos_files',
-            'apple_notes', 'apple_messages', 'contact_cards'
-          )
-        ORDER BY table_name
-        """
-    )
-
-    assert [row[0] for row in rows] == [
+    expected = [
         "apple_messages",
         "apple_notes",
         "apple_voice_memos_files",
@@ -1173,6 +1170,19 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
         "gmail_messages",
         "slack_messages",
     ]
+    physical = [_physical_relation(warehouse, logical) for logical in expected]
+    rows = warehouse._query(
+        """
+        SELECT table_schema, table_name
+        FROM information_schema.tables
+        WHERE table_schema = ANY(%s) AND table_name = ANY(%s)
+        ORDER BY table_schema, table_name
+        """,
+        (sorted({rel.schema for rel in physical}), sorted({rel.name for rel in physical})),
+    )
+
+    found = {(schema, table) for schema, table in rows}
+    assert {(rel.schema, rel.name) for rel in physical} <= found
 
 
 def test_postgres_warehouse_drops_removed_personal_finance_schema(warehouse: PostgresWarehouse) -> None:
@@ -1197,16 +1207,7 @@ def test_postgres_warehouse_drops_removed_personal_finance_schema(warehouse: Pos
 def test_postgres_slack_tables_create_recent_message_indexes(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_slack_tables()
 
-    rows = warehouse._query(
-        """
-        SELECT indexname
-        FROM pg_indexes
-        WHERE schemaname = current_schema()
-          AND tablename = 'slack_messages'
-        """
-    )
-
-    index_names = {row[0] for row in rows}
+    index_names = _index_names(warehouse, "slack_messages")
     assert "slack_messages_recent_scope_time_idx" in index_names
     assert "slack_messages_recent_thread_time_idx" in index_names
     assert "slack_messages_user_time_idx" in index_names
@@ -1215,15 +1216,7 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     # The earlier partial trgm index has been superseded by the full-coverage one.
     assert "slack_messages_text_trgm_live_idx" not in index_names
 
-    slack_user_indexes = warehouse._query(
-        """
-        SELECT indexname
-        FROM pg_indexes
-        WHERE schemaname = current_schema()
-          AND tablename = 'slack_users'
-        """
-    )
-    slack_user_index_names = {row[0] for row in slack_user_indexes}
+    slack_user_index_names = _index_names(warehouse, "slack_users")
     assert "slack_users_email_lower_idx" in slack_user_index_names
 
     extension_rows = warehouse._query("SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'")
@@ -1233,14 +1226,16 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
 def test_postgres_slack_messages_set_autovacuum_storage_parameters(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_slack_tables()
 
+    rel = _physical_relation(warehouse, "slack_messages")
     rows = warehouse._query(
         """
         SELECT unnest(c.reloptions)
         FROM pg_class AS c
         INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
-        WHERE n.nspname = current_schema()
-          AND c.relname = 'slack_messages'
-        """
+        WHERE n.nspname = %s
+          AND c.relname = %s
+        """,
+        (rel.schema, rel.name),
     )
     reloptions = {row[0] for row in rows}
     assert "autovacuum_analyze_scale_factor=0" in reloptions
@@ -1257,17 +1252,20 @@ def test_postgres_ensure_indexes_drops_obsolete_indexes(warehouse: PostgresWareh
         "CREATE INDEX IF NOT EXISTS slack_messages_text_trgm_live_idx "
         "ON slack_messages USING gin (text public.gin_trgm_ops) WHERE is_deleted = 0"
     )
+    rel = _physical_relation(warehouse, "slack_messages")
     pre_rows = warehouse._query(
-        "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
-        "AND tablename = 'slack_messages' AND indexname = 'slack_messages_text_trgm_live_idx'"
+        "SELECT indexname FROM pg_indexes WHERE schemaname = %s "
+        "AND tablename = %s AND indexname = 'slack_messages_text_trgm_live_idx'",
+        (rel.schema, rel.name),
     )
     assert pre_rows, "test setup failed: legacy index should exist before re-running ensure"
 
     warehouse.ensure_slack_tables()
 
     post_rows = warehouse._query(
-        "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
-        "AND tablename = 'slack_messages' AND indexname = 'slack_messages_text_trgm_live_idx'"
+        "SELECT indexname FROM pg_indexes WHERE schemaname = %s "
+        "AND tablename = %s AND indexname = 'slack_messages_text_trgm_live_idx'",
+        (rel.schema, rel.name),
     )
     assert post_rows == []
 
@@ -1275,16 +1273,7 @@ def test_postgres_ensure_indexes_drops_obsolete_indexes(warehouse: PostgresWareh
 def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
 
-    rows = warehouse._query(
-        """
-        SELECT indexname
-        FROM pg_indexes
-        WHERE schemaname = current_schema()
-          AND tablename = 'gmail_messages'
-        """
-    )
-
-    index_names = {row[0] for row in rows}
+    index_names = _index_names(warehouse, "gmail_messages")
     assert "gmail_messages_internal_date_idx" in index_names
     assert "gmail_messages_from_trgm_idx" in index_names
     assert "gmail_messages_subject_trgm_idx" in index_names
@@ -1297,16 +1286,7 @@ def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehous
 def test_postgres_agent_tables_create_run_lookup_index(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_agent_tables()
 
-    rows = warehouse._query(
-        """
-        SELECT indexname
-        FROM pg_indexes
-        WHERE schemaname = current_schema()
-          AND tablename = 'agent_runs'
-        """
-    )
-
-    index_names = {row[0] for row in rows}
+    index_names = _index_names(warehouse, "agent_runs")
     assert "agent_runs_task_status_subject_idx" in index_names
 
 
@@ -1326,9 +1306,11 @@ def test_postgres_slack_tables_create_bm25_index_and_rank_matches(warehouse: Pos
 
     warehouse.ensure_slack_tables()
 
+    rel = _physical_relation(warehouse, "slack_messages")
     rows = warehouse._query(
-        "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
-        "AND tablename = 'slack_messages' AND indexname = 'slack_messages_text_bm25_idx'"
+        "SELECT indexname FROM pg_indexes WHERE schemaname = %s "
+        "AND tablename = %s AND indexname = 'slack_messages_text_bm25_idx'",
+        (rel.schema, rel.name),
     )
     assert rows, "bm25 index should be created when pg_textsearch is usable"
 
@@ -1378,12 +1360,7 @@ def test_postgres_ensure_indexes_tolerates_missing_pg_textsearch(warehouse: Post
     # creating everything else.
     warehouse.ensure_slack_tables()
 
-    index_names = {
-        row[0]
-        for row in warehouse._query(
-            "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'slack_messages'"
-        )
-    }
+    index_names = _index_names(warehouse, "slack_messages")
     assert "slack_messages_text_bm25_idx" not in index_names
     assert "slack_messages_text_trgm_idx" in index_names
 
@@ -1541,9 +1518,9 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
 
     _ensure_all_table_groups(warehouse)
     # search_text() uses the explicit to_bm25query('q', 'index_name') form plus the
-    # public-schema bm25 helpers; the schema-isolated test connection needs public on
-    # the search_path for them to resolve (production runs with schema=public).
-    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+    # public-schema bm25 helpers; the schema-isolated test connection keeps public on
+    # the canonical multi-schema search_path for them to resolve.
+    warehouse._set_search_path()
 
     # Guard: every bm25 index search_text() names via to_bm25query must actually be
     # built. _ensure_indexes swallows DDL errors, so a missing/typo'd index would
@@ -1552,7 +1529,8 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     built = {
         row[0]
         for row in warehouse._query(
-            "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()"
+            "SELECT indexname FROM pg_indexes WHERE schemaname = ANY(%s)",
+            (warehouse.physical_schema_names(include_private=True),),
         )
     }
     missing = sorted(name for name in referenced if name not in built)
@@ -1965,17 +1943,32 @@ def test_postgres_contacts_tables_use_jsonb_without_changing_existing_raw_json(w
     warehouse.ensure_contacts_tables()
     warehouse.ensure_slack_tables()
 
-    rows = warehouse._query(
+    contact_rel = _physical_relation(warehouse, "contact_cards")
+    slack_rel = _physical_relation(warehouse, "slack_conversations")
+    raw_rows = warehouse._query(
         """
-        SELECT table_name, column_name, data_type
+        SELECT table_schema, table_name, column_name, data_type
         FROM information_schema.columns
-        WHERE table_schema = current_schema()
-          AND (
-            (table_name = 'contact_cards' AND column_name IN ('emails', 'nicknames', 'raw_json'))
-            OR (table_name = 'slack_conversations' AND column_name = 'raw_json')
+        WHERE (
+            table_schema = %s AND table_name = %s AND column_name IN ('emails', 'nicknames', 'raw_json')
+          ) OR (
+            table_schema = %s AND table_name = %s AND column_name = 'raw_json'
           )
-        ORDER BY table_name, column_name
-        """
+        ORDER BY table_schema, table_name, column_name
+        """,
+        (contact_rel.schema, contact_rel.name, slack_rel.schema, slack_rel.name),
+    )
+    logical_by_physical = {
+        (contact_rel.schema, contact_rel.name): "contact_cards",
+        (slack_rel.schema, slack_rel.name): "slack_conversations",
+    }
+    rows = sorted(
+        (
+            logical_by_physical[(schema, table)],
+            column,
+            data_type,
+        )
+        for schema, table, column, data_type in raw_rows
     )
 
     assert rows == [
@@ -2034,10 +2027,11 @@ def test_postgres_contacts_view_appends_new_nicknames_column_on_existing_view(
             """
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = 'clean_contacts'
+            WHERE table_schema = %s
+              AND table_name = %s
             ORDER BY ordinal_position
-            """
+            """,
+            (_physical_relation(warehouse, "clean_contacts").schema, _physical_relation(warehouse, "clean_contacts").name),
         )
     ]
     assert columns[-2:] == ["raw_json", "nicknames"]
@@ -2154,7 +2148,10 @@ def test_postgres_ensure_contacts_recovers_when_existing_view_has_extra_columns(
     # column this code's definition does not select. CREATE OR REPLACE VIEW
     # cannot drop view columns, so every ensure used to fail until the
     # definitions matched again.
-    viewdef = warehouse._query("SELECT pg_get_viewdef('clean_contacts'::regclass)")[0][0]
+    viewdef = warehouse._query(
+        "SELECT pg_get_viewdef(to_regclass(%s))",
+        (warehouse.sql_relation("clean_contacts"),),
+    )[0][0]
     warehouse._command("DROP VIEW clean_contacts")
     warehouse._command(
         "CREATE VIEW clean_contacts AS "
@@ -2169,9 +2166,10 @@ def test_postgres_ensure_contacts_recovers_when_existing_view_has_extra_columns(
             """
             SELECT attname
             FROM pg_attribute
-            WHERE attrelid = 'clean_contacts'::regclass AND attnum > 0 AND NOT attisdropped
+            WHERE attrelid = to_regclass(%s) AND attnum > 0 AND NOT attisdropped
             ORDER BY attnum
-            """
+            """,
+            (warehouse.sql_relation("clean_contacts"),),
         )
     ]
     assert "drift_extra" not in columns
@@ -2222,14 +2220,16 @@ def test_postgres_mark_missing_contact_cards_deleted_tombstones_only_scope(wareh
 def test_postgres_slack_tables_create_conversation_stats_table(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_slack_tables()
 
+    rel = _physical_relation(warehouse, "slack_conversation_stats")
     rows = warehouse._query(
         """
         SELECT column_name
         FROM information_schema.columns
-        WHERE table_schema = current_schema()
-          AND table_name = 'slack_conversation_stats'
+        WHERE table_schema = %s
+          AND table_name = %s
         ORDER BY ordinal_position
-        """
+        """,
+        (rel.schema, rel.name),
     )
 
     assert [row[0] for row in rows] == [

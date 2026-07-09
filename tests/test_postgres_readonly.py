@@ -46,13 +46,14 @@ def test_postgres_readonly_service_schema_overview_uses_information_schema() -> 
             if normalized == "SELECT current_database() AS database":
                 return RawResult(columns=["database"], rows=[{"database": "pdw"}])
             if normalized == (
-                "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() "
-                "AND table_type = 'BASE TABLE' ORDER BY table_name"
+                "SELECT table_schema AS schema, table_name AS name FROM information_schema.tables "
+                "WHERE table_schema = ANY(current_schemas(false)) AND table_schema <> 'public' "
+                "AND table_type = 'BASE TABLE' ORDER BY table_schema, table_name"
             ):
-                return RawResult(columns=["name"], rows=[{"name": "calendar_events"}])
+                return RawResult(columns=["schema", "name"], rows=[{"schema": "google_calendar", "name": "events"}])
             if normalized == (
-                "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() "
-                "AND table_name = 'calendar_events' ORDER BY ordinal_position"
+                "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = 'google_calendar' "
+                "AND table_name = 'events' ORDER BY ordinal_position"
             ):
                 return RawResult(columns=["name"], rows=[{"name": "event_id"}, {"name": "summary"}])
             if normalized.startswith('SELECT substring("event_id"::text'):
@@ -74,9 +75,9 @@ def test_postgres_readonly_service_schema_overview_uses_information_schema() -> 
     result = PostgresReadOnlyService(runner).schema_overview()
 
     assert result.error == ""
-    assert result.csv == "# pdw.calendar_events\n\nevent_id,summary\nevent-1,very long summa"
+    assert result.csv == "# pdw.google_calendar.events\n\nevent_id,summary\nevent-1,very long summa"
     assert runner.sql[0] == ("SELECT current_database() AS database", 1)
-    assert runner.sql[1][0].startswith("SELECT table_name AS name FROM information_schema.tables")
+    assert runner.sql[1][0].startswith("SELECT table_schema AS schema, table_name AS name FROM information_schema.tables")
     assert runner.sql[2][0].startswith("SELECT column_name AS name FROM information_schema.columns")
     assert 'char_length("summary"::text) AS "__pdw_len_1"' in runner.sql[3][0]
     assert result.truncated.max_rows == 3
@@ -109,5 +110,6 @@ def test_postgres_readonly_runner_uses_dedicated_read_only_connection() -> None:
             assert cursor.fetchone()[0] in ("30s", "30000ms", "30000")
     finally:
         runner.close()
-        warehouse._command(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        for schema_name in warehouse.physical_schema_names(include_private=True) + [schema]:
+            warehouse._raw_command(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
         warehouse.close()

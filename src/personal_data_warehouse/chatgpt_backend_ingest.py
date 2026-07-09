@@ -1,9 +1,9 @@
-"""Poll the ChatGPT backend API and write conversations to ``agent_session_events``.
+"""Poll the ChatGPT backend API and write conversations to ``chatgpt.events``.
 
 Server-side counterpart to the CLI agent-session uploader: instead of tailing
 local transcripts, this lists the account's conversations newest-first, fetches
 each one that is new or updated since the last sync (tracked in
-``chatgpt_conversation_sync``), and normalizes its message tree via
+``chatgpt.conversation_sync``), and normalizes its message tree via
 ``chatgpt_conversation_to_event_rows``.
 
 Auth errors are intentionally *not* swallowed: ``ChatGPTAuthError`` propagates
