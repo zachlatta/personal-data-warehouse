@@ -4,6 +4,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
+import inspect
 import json
 import re
 from typing import Any
@@ -5442,6 +5443,8 @@ class PostgresWarehouse:
         "google_drive_file_texts",
     )
 
+    _SEARCH_SCHEMA_MARKER_TABLE = "pdw_search_schema_state"
+
     def _ensure_search_views_if_possible(self) -> None:
         # Several Dagster assets can call ensure_* concurrently on deploy. The
         # shared search_text() function/index refresh mutates global Postgres
@@ -5463,18 +5466,84 @@ class PostgresWarehouse:
         # BM25 search_text() function. Drop any copy older deployments left
         # behind so it cannot be used as a slow fallback.
         self._command("DROP VIEW IF EXISTS searchable_text")
-        if all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
-            # Build every bm25 index search_text() references BEFORE (re)creating
-            # the function, so it can never point at a not-yet-built index.
-            # ensure_* builds indexes lazily per table group, but the function
-            # references all sources at once. Without this, the first group to run
-            # after a deploy recreates the function while other groups' bm25
-            # indexes are still missing, and every search_text() call fails with
-            # "index ... does not exist" until those (often sensor/new-data-driven)
-            # groups happen to tick. The gate above guarantees all referenced
-            # tables exist, so building all their indexes here is safe.
-            self._ensure_indexes(self._SEARCHABLE_TEXT_TABLES)
-            self._ensure_search_text_function()
+        if not all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
+            return
+        # Build every bm25 index search_text() references BEFORE (re)creating
+        # the function, so it can never point at a not-yet-built index.
+        # ensure_* builds indexes lazily per table group, but the function
+        # references all sources at once. Without this, the first group to run
+        # after a deploy recreates the function while other groups' bm25
+        # indexes are still missing, and every search_text() call fails with
+        # "index ... does not exist" until those (often sensor/new-data-driven)
+        # groups happen to tick. The gate above guarantees all referenced
+        # tables exist, so building all their indexes here is safe.
+        self._ensure_indexes(self._SEARCHABLE_TEXT_TABLES)
+        signature = self._search_schema_signature()
+        if (
+            signature
+            and self._stored_search_schema_signature() == signature
+            and self._search_text_function_exists()
+        ):
+            # Generated search DDL unchanged since the last build and the
+            # function is present — skip the CREATE OR REPLACE recompile.
+            return
+        self._ensure_search_text_function()
+        self._write_search_schema_signature(signature)
+
+    def _search_schema_signature(self) -> str:
+        """Signature of everything that determines the generated search DDL.
+
+        Derived from the source code of the generator method plus the searched
+        table set and the source floor, so edits to search_text() DDL, adding a
+        source, or changing the source floor force a one-time rebuild. If source
+        introspection is unavailable, return an empty signature so the guard
+        never matches and safely degrades to the old always-rebuild behavior.
+        """
+        try:
+            source = inspect.getsource(type(self)._ensure_search_text_function)
+        except (OSError, TypeError):
+            return ""
+        payload = "\n".join(
+            [
+                source,
+                ",".join(sorted(self._SEARCHABLE_TEXT_TABLES)),
+                str(SEARCH_TEXT_SOURCE_FLOOR),
+            ]
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _stored_search_schema_signature(self) -> str | None:
+        self._command(
+            f"CREATE TABLE IF NOT EXISTS {_identifier(self._SEARCH_SCHEMA_MARKER_TABLE)} "
+            "(id smallint PRIMARY KEY DEFAULT 1, signature text NOT NULL, "
+            "CONSTRAINT pdw_search_schema_state_single_row CHECK (id = 1))"
+        )
+        rows = self._query(
+            f"SELECT signature FROM {_identifier(self._SEARCH_SCHEMA_MARKER_TABLE)} WHERE id = 1"
+        )
+        if not rows:
+            return None
+        return rows[0][0]
+
+    def _write_search_schema_signature(self, signature: str) -> None:
+        self._command(
+            f"INSERT INTO {_identifier(self._SEARCH_SCHEMA_MARKER_TABLE)} (id, signature) "
+            "VALUES (1, %s) ON CONFLICT (id) DO UPDATE SET signature = EXCLUDED.signature",
+            (signature,),
+        )
+
+    def _search_text_function_exists(self) -> bool:
+        rows = self._query(
+            """
+            SELECT 1
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE p.proname = 'search_text'
+              AND n.nspname = current_schema()
+            LIMIT 1
+            """
+        )
+        return bool(rows)
 
     def _ensure_search_text_function(self) -> None:
         # search_text() is the single, default cross-source search path. It fans

@@ -23,7 +23,7 @@ come first.
 | 006 | Enforce read-only + a real timeout on the Go MCP/query SQL path | P1 | M | — | DONE |
 | 007 | Cap Slack transient-error retries instead of retrying forever | P1 | S | — | DONE (implemented, reviewed, and landed on `main`) |
 | 008 | Run the Go mutation store's schema DDL once per process, not per request | P2 | S | — | DONE |
-| 009 | Skip the `search_text()` recompile when its generated DDL is unchanged | P2 | M | — | TODO |
+| 009 | Skip the `search_text()` recompile when its generated DDL is unchanged | P2 | M | — | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
 

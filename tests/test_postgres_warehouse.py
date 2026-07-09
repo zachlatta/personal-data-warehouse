@@ -128,6 +128,40 @@ def test_search_view_refresh_releases_advisory_lock_on_error(monkeypatch) -> Non
     assert commands[-1] == ("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
 
 
+def test_search_schema_rebuild_is_skipped_when_unchanged(warehouse: PostgresWarehouse) -> None:
+    _ensure_all_table_groups(warehouse)
+    assert warehouse._search_text_function_exists()
+
+    issued: list[str] = []
+    original_command = warehouse._command
+
+    def spy(sql, params=None):
+        issued.append(sql)
+        return original_command(sql, params)
+
+    warehouse._command = spy
+    try:
+        warehouse._ensure_search_views_if_possible()
+    finally:
+        warehouse._command = original_command
+
+    assert not any("CREATE OR REPLACE FUNCTION search_text(" in sql for sql in issued), (
+        "search_text() was recompiled even though its DDL was unchanged"
+    )
+
+    warehouse._command(f'DELETE FROM "{warehouse._SEARCH_SCHEMA_MARKER_TABLE}" WHERE id = 1')
+    issued.clear()
+    warehouse._command = spy
+    try:
+        warehouse._ensure_search_views_if_possible()
+    finally:
+        warehouse._command = original_command
+
+    assert any("CREATE OR REPLACE FUNCTION search_text(" in sql for sql in issued), (
+        "search_text() was not rebuilt after the signature marker was cleared"
+    )
+
+
 def _default_row(columns: tuple[str, ...], **overrides):
     epoch = datetime(1970, 1, 1, tzinfo=UTC)
     row = {}
