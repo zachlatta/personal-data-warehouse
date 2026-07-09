@@ -23,6 +23,8 @@ func TestValidateReadOnlySQLRejectsMutationsAndMultipleStatements(t *testing.T) 
 		"INSERT INTO gmail_messages SELECT * FROM other",
 		"DELETE FROM gmail_messages WHERE 1",
 		"ALTER TABLE gmail_messages DELETE WHERE 1",
+		"SELECT * INTO evil_table FROM gmail_messages",
+		"select id into other from slack_messages",
 		"SELECT 1; SELECT 2",
 		"",
 		"   ",

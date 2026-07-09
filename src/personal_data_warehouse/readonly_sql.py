@@ -20,6 +20,7 @@ FORBIDDEN_KEYWORDS = {
     "DROP",
     "GRANT",
     "INSERT",
+    "INTO",
     "KILL",
     "OPTIMIZE",
     "RENAME",

@@ -23,6 +23,7 @@ var forbiddenKeywords = map[string]bool{
 	"DROP":     true,
 	"GRANT":    true,
 	"INSERT":   true,
+	"INTO":     true,
 	"KILL":     true,
 	"OPTIMIZE": true,
 	"RENAME":   true,

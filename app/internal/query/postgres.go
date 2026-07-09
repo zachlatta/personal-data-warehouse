@@ -12,7 +12,8 @@ import (
 )
 
 type PostgresRunner struct {
-	db *sql.DB
+	db           *sql.DB
+	queryTimeout time.Duration
 }
 
 func NewPostgresRunner(databaseURL string, timeout time.Duration) (*PostgresRunner, error) {
@@ -24,10 +25,11 @@ func NewPostgresRunner(databaseURL string, timeout time.Duration) (*PostgresRunn
 		logger.Error("Postgres open failed", "error", err)
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	if timeout <= 0 {
-		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+	effectiveTimeout := timeout
+	if effectiveTimeout <= 0 {
+		effectiveTimeout = 30 * time.Second
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), effectiveTimeout)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
@@ -35,7 +37,7 @@ func NewPostgresRunner(databaseURL string, timeout time.Duration) (*PostgresRunn
 		return nil, err
 	}
 	logger.Info("Postgres connection ready", "duration", time.Since(started))
-	return &PostgresRunner{db: db}, nil
+	return &PostgresRunner{db: db, queryTimeout: effectiveTimeout}, nil
 }
 
 func (r *PostgresRunner) Close() error {
@@ -62,7 +64,26 @@ func (r *PostgresRunner) QueryArgs(ctx context.Context, statement string, args [
 	logger := slog.Default().With("component", "postgres")
 	started := time.Now()
 	logger.DebugContext(ctx, "Postgres query dispatch", "sql", statement, "max_rows", maxRows)
-	rows, err := r.db.QueryContext(ctx, statement, args...)
+
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		logger.ErrorContext(ctx, "Postgres begin read-only tx failed", "error", err, "duration", time.Since(started))
+		return RawResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	timeoutMs := r.queryTimeout.Milliseconds()
+	if timeoutMs <= 0 {
+		timeoutMs = 30000
+	}
+	// SET LOCAL is effective here because every query runs inside an explicit
+	// transaction; under autocommit it would only affect the SET statement.
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", timeoutMs)); err != nil {
+		logger.ErrorContext(ctx, "Postgres set statement_timeout failed", "error", err, "duration", time.Since(started))
+		return RawResult{}, err
+	}
+
+	rows, err := tx.QueryContext(ctx, statement, args...)
 	if err != nil {
 		logger.ErrorContext(ctx, "Postgres query dispatch failed", "sql", statement, "error", err, "duration", time.Since(started))
 		return RawResult{}, err
