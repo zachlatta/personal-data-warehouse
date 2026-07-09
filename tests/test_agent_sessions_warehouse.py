@@ -14,6 +14,7 @@ from personal_data_warehouse.agent_sessions_drive_ingest import (
 )
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
+from personal_data_warehouse.timeline import TimelineSyncEngine
 
 
 def _postgres_url() -> str:
@@ -41,6 +42,18 @@ class FakeLogger:
 
     def warning(self, *args, **kwargs) -> None:
         pass
+
+
+def _sync_timeline(warehouse: PostgresWarehouse) -> None:
+    engine = TimelineSyncEngine(
+        source_url=_postgres_url(),
+        source_schema=warehouse._schema,
+        dest_schema=warehouse._schema,
+    )
+    try:
+        engine.run()
+    finally:
+        engine.close()
 
 
 def _event_row(**overrides) -> dict:
@@ -161,7 +174,7 @@ def test_search_text_includes_agent_session_branches(warehouse) -> None:
     if not usable:
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
 
-    # All source tables must exist for search_text() (and its bm25 indexes) to build.
+    # Build the full schema so the timeline-backed search_text() function exists.
     warehouse.ensure_tables()
     warehouse.ensure_calendar_tables()
     warehouse.ensure_contacts_tables()
@@ -173,6 +186,7 @@ def test_search_text_includes_agent_session_branches(warehouse) -> None:
     warehouse.ensure_upstream_mutation_tables()
     warehouse.ensure_agent_sessions_tables()
     warehouse.ensure_google_drive_source_tables()
+    warehouse.ensure_timeline_tables()
 
     warehouse.insert_agent_session_events(
         [
@@ -195,18 +209,19 @@ def test_search_text_includes_agent_session_branches(warehouse) -> None:
         ]
     )
 
-    # search_text() uses the explicit to_bm25query() form + public-schema bm25
-    # helpers; the schema-isolated test connection needs public on the path.
+    _sync_timeline(warehouse)
+
+    # search_text() uses pg_textsearch helpers; the schema-isolated test
+    # connection needs public on the path.
     warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
     rows = warehouse._query(
         "SELECT DISTINCT subsource FROM search_text('zanzibar', 50, ARRAY['agent_session']) "
         "WHERE score < 0 ORDER BY subsource"
     )
     subsources = [r[0] for r in rows]
-    # user content branch (subsource = source = 'claude_code') and title branch.
-    assert "claude_code" in subsources
-    assert "title" in subsources
-    # tool-result text is stored but excluded from search.
+    # The timeline-backed agent_session branch returns the underlying agent source.
+    assert subsources == ["claude_code"]
+    # tool-result text is stored but excluded from the timeline search document.
     assert all(s != "tool" for s in subsources)
 
 

@@ -7,9 +7,9 @@ through the sandboxed agent container (codex/claude CLI) for cleanup/summary,
 mirroring how ``file_attachment_enrichment.py`` cleans up vision output. The
 result is upserted into the SAME shared ``file_attachment_enrichments`` table
 under its own ``ai_provider``/``ai_model``/``ai_prompt_version`` identity, so
-AssemblyAI is an invisible intermediate step (like ``pdftoppm`` is for PDFs)
-and the existing BM25 search branches that join that table pick up transcripts
-automatically.
+AssemblyAI is an invisible intermediate step (like ``pdftoppm`` is for PDFs);
+timeline adapters fold those enrichment rows into the parent message's search
+document automatically.
 
 Each source (Apple Messages voice messages, WhatsApp voice notes, etc.) is
 described by an :class:`AudioEnrichmentSource` that names its candidate table

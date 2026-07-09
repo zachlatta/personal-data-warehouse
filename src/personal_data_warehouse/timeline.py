@@ -90,6 +90,7 @@ TIMELINE_NORMALIZED_COLUMNS = (
     "context",
     "source_pk",
     "metadata",
+    "search_text",
     "ingest_ts",
     "priority",
 )
@@ -147,11 +148,15 @@ def _simple_adapter(
     snippet: str = "''",
     context: str = "''",
     metadata: str = "'{}'::jsonb",
+    search_text: str | None = None,
     priority: str = str(TIMELINE_PRIORITY_CC),
     where: str = "TRUE",
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE,
     refresh_hours: float = 0.0,
 ) -> TimelineAdapter:
+    if search_text is None:
+        search_text = _search_concat(title, snippet, context, actor)
+
     # event_ts and ingest_ts are used raw (no defensive COALESCE): they are the
     # ORDER BY / keyset expressions, and wrapping a bare indexed column in a
     # function forces a full sort of the source table on every backfill batch
@@ -171,6 +176,7 @@ def _simple_adapter(
             COALESCE(({context}), '') AS context,
             ({source_pk})::text AS source_pk,
             COALESCE(({metadata}), '{{}}'::jsonb)::text AS metadata,
+            COALESCE(({search_text}), '') AS search_text,
             ({ingest_ts}) AS ingest_ts,
             COALESCE(({priority}), {TIMELINE_PRIORITY_CC}) AS priority
         FROM {from_sql}
@@ -189,7 +195,7 @@ def _simple_adapter(
           AND ({ingest_ts}) >= %(watermark_ts)s
           AND (({ingest_ts}), COALESCE(({event_id}), ''))
               > (%(watermark_ts)s, %(watermark_id)s)
-        ORDER BY 12 ASC, 1 ASC
+        ORDER BY 13 ASC, 1 ASC
         LIMIT %(limit)s
     """
     max_ingest_sql = f"SELECT max({ingest_ts}) FROM {from_sql} WHERE ({where})"
@@ -208,6 +214,12 @@ def _simple_adapter(
 
 def _snippet(expr: str) -> str:
     return f"left({expr}, {TIMELINE_SNIPPET_CHARS})"
+
+
+def _search_concat(*exprs: str) -> str:
+    """Build a newline-separated, BM25-indexed document for one timeline row."""
+    parts = ", ".join(f"NULLIF(({expr})::text, '')" for expr in exprs)
+    return f"concat_ws(E'\\n', {parts})"
 
 
 # Sender-pattern fallbacks for mail Gmail's categorizer misses (it labels
@@ -351,7 +363,18 @@ _GMAIL_EMAIL = _simple_adapter(
     source_table="gmail_messages",
     source="gmail",
     kind="email",
-    from_sql="gmail_messages t",
+    from_sql="""gmail_messages t
+    LEFT JOIN LATERAL (
+        SELECT
+            string_agg(
+                concat_ws(E'\n', NULLIF(a.filename, ''), NULLIF(e.text, '')),
+                E'\n' ORDER BY a.part_id, e.updated_at DESC
+            ) AS attachment_search_text,
+            max(GREATEST(a.synced_at, COALESCE(e.updated_at, a.synced_at))) AS attachment_ingest_ts
+        FROM gmail_attachments a
+        LEFT JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
+        WHERE a.account = t.account AND a.message_id = t.message_id AND a.is_deleted = 0
+    ) att ON TRUE""",
     event_id="concat_ws('|', t.account, t.message_id)",
     # Bare column, not a COALESCE chain: event_ts is the backfill's ORDER BY
     # and keyset key, and only a plain column keeps the scan on
@@ -359,7 +382,7 @@ _GMAIL_EMAIL = _simple_adapter(
     # The handful of rows with an epoch-sentinel internal_date land at 1970,
     # which reads as "date unknown" rather than inventing a sync-time date.
     event_ts="t.internal_date",
-    ingest_ts="t.synced_at",
+    ingest_ts="GREATEST(t.synced_at, COALESCE(att.attachment_ingest_ts, t.synced_at))",
     actor="t.from_address",
     title="t.subject",
     snippet=_snippet("t.snippet"),
@@ -370,6 +393,15 @@ _GMAIL_EMAIL = _simple_adapter(
         "'thread_id', t.thread_id, "
         "'labels', to_jsonb(t.label_ids), "
         "'deleted', t.is_deleted <> 0)"
+    ),
+    search_text=_search_concat(
+        "t.subject",
+        "t.from_address",
+        "array_to_string(t.to_addresses || t.cc_addresses || t.bcc_addresses, ' ')",
+        "t.snippet",
+        "t.body_text",
+        "t.body_markdown_clean",
+        "att.attachment_search_text",
     ),
     # Benchmark-tuned ordering (sampling/rubric.md, 2026-07). Broadly:
     # my own mail (minus mail-merge blasts) > relayed-human notifications at
@@ -596,6 +628,7 @@ _SLACK_MESSAGE = _simple_adapter(
         "'edited', t.edited_ts <> '', "
         "'deleted', t.is_deleted <> 0)"
     ),
+    search_text=_search_concat(_SLACK_DISPLAY_NAME, _SLACK_CONTEXT, "t.text"),
     priority=_SLACK_MESSAGE_PRIORITY,
     batch_size=5000,
     # 12h covers the +/-6h engagement window with margin while keeping the
@@ -629,6 +662,7 @@ _SLACK_FILE = _simple_adapter(
         "'size', t.size, "
         "'deleted', t.is_deleted <> 0)"
     ),
+    search_text=_search_concat("t.name", "t.title", "t.mimetype", _SLACK_DISPLAY_NAME, _SLACK_CONTEXT),
     priority=_SLACK_FILE_PRIORITY,
     refresh_hours=48,
 )
@@ -658,10 +692,21 @@ _APPLE_MESSAGE = _simple_adapter(
         LEFT JOIN apple_message_handles rh
             ON rh.account = ch.account AND rh.handle_id = ch.handle_id
         GROUP BY ch.account, ch.chat_id
-    ) roster ON roster.account = t.account AND roster.chat_id = cm.chat_id""",
+    ) roster ON roster.account = t.account AND roster.chat_id = cm.chat_id
+    LEFT JOIN LATERAL (
+        SELECT
+            string_agg(
+                concat_ws(E'\n', COALESCE(NULLIF(a.filename, ''), NULLIF(a.transfer_name, '')), NULLIF(e.text, '')),
+                E'\n' ORDER BY a.attachment_id, e.updated_at DESC
+            ) AS attachment_search_text,
+            max(GREATEST(a.ingested_at, COALESCE(e.updated_at, a.ingested_at))) AS attachment_ingest_ts
+        FROM apple_message_attachments a
+        LEFT JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
+        WHERE a.account = t.account AND a.message_id = t.message_id
+    ) att ON TRUE""",
     event_id="concat_ws('|', t.account, t.message_id)",
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
-    ingest_ts="t.ingested_at",
+    ingest_ts="GREATEST(t.ingested_at, COALESCE(att.attachment_ingest_ts, t.ingested_at))",
     actor=(
         "CASE WHEN t.is_from_me = 1 THEN 'me' "
         "ELSE COALESCE(NULLIF(h.address, ''), NULLIF(t.handle_id, ''), '') END"
@@ -682,6 +727,13 @@ _APPLE_MESSAGE = _simple_adapter(
         "'tapback', t.associated_message_type <> 0, "
         "'audio', t.is_audio_message <> 0, "
         "'deleted', t.is_deleted <> 0)"
+    ),
+    search_text=_search_concat(
+        "t.subject",
+        "t.body_text",
+        "COALESCE(NULLIF(c.display_name, ''), NULLIF(c.chat_identifier, ''), NULLIF(h.address, ''), t.service)",
+        "CASE WHEN t.is_from_me = 1 THEN 'me' ELSE COALESCE(NULLIF(h.address, ''), NULLIF(t.handle_id, ''), '') END",
+        "att.attachment_search_text",
     ),
     # chat.db style: 45 = 1:1 conversation, 43 = group. The roster counts
     # distinct participant addresses excluding Zach's own handle. People
@@ -744,10 +796,21 @@ _WHATSAPP_MESSAGE = _simple_adapter(
         SELECT account, chat_id, count(*) AS n
         FROM whatsapp_chat_participants
         GROUP BY account, chat_id
-    ) roster ON roster.account = t.account AND roster.chat_id = t.chat_id""",
+    ) roster ON roster.account = t.account AND roster.chat_id = t.chat_id
+    LEFT JOIN LATERAL (
+        SELECT
+            string_agg(
+                concat_ws(E'\n', NULLIF(m.filename, ''), NULLIF(e.text, '')),
+                E'\n' ORDER BY m.media_type, e.updated_at DESC
+            ) AS media_search_text,
+            max(GREATEST(m.ingested_at, COALESCE(e.updated_at, m.ingested_at))) AS media_ingest_ts
+        FROM whatsapp_media_items m
+        LEFT JOIN file_attachment_enrichments e ON e.content_sha256 = m.content_sha256
+        WHERE m.account = t.account AND m.chat_id = t.chat_id AND m.message_id = t.message_id
+    ) media ON TRUE""",
     event_id="concat_ws('|', t.account, t.chat_id, t.message_id)",
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
-    ingest_ts="t.ingested_at",
+    ingest_ts="GREATEST(t.ingested_at, COALESCE(media.media_ingest_ts, t.ingested_at))",
     actor=(
         "CASE WHEN t.is_from_me = 1 THEN 'me' "
         "ELSE COALESCE(NULLIF(ct.full_name, ''), NULLIF(ct.push_name, ''), "
@@ -765,6 +828,12 @@ _WHATSAPP_MESSAGE = _simple_adapter(
         "'from_me', t.is_from_me <> 0, "
         f"'edited', t.edited_at > {_EPOCH_GUARD}, "
         "'deleted', t.is_deleted <> 0)"
+    ),
+    search_text=_search_concat(
+        "t.body_text",
+        "COALESCE(NULLIF(c.name, ''), t.chat_id)",
+        "CASE WHEN t.is_from_me = 1 THEN 'me' ELSE COALESCE(NULLIF(ct.full_name, ''), NULLIF(ct.push_name, ''), NULLIF(t.push_name, ''), NULLIF(t.sender_jid, ''), '') END",
+        "media.media_search_text",
     ),
     # Group roster counts include me, so <= 5 is a group of at most five.
     # Business accounts (incl. Zach's own WhatsApp-bridged agent) are
@@ -813,6 +882,7 @@ _APPLE_NOTE_REVISION = _simple_adapter(
         "jsonb_build_object('account', t.account, 'note_id', t.note_id, 'revision_id', t.revision_id)"
     ),
     metadata="jsonb_build_object('note_id', t.note_id, 'deleted', t.is_deleted <> 0)",
+    search_text=_search_concat("t.title", "t.folder_path", "t.body_text"),
     priority=str(TIMELINE_PRIORITY_SELF),
 )
 
@@ -829,10 +899,22 @@ _VOICE_MEMO = _simple_adapter(
           AND (NULLIF(en.title, '') IS NOT NULL OR NULLIF(en.summary, '') IS NOT NULL)
         ORDER BY en.created_at DESC
         LIMIT 1
-    ) en ON TRUE""",
+    ) en ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT
+            string_agg(
+                concat_ws(E'\n', NULLIF(en2.title, ''), NULLIF(en2.summary, ''),
+                          NULLIF(en2.transcript, ''), NULLIF(en2.participants_json, ''),
+                          NULLIF(en2.action_items_json, '')),
+                E'\n' ORDER BY en2.created_at DESC
+            ) AS enrichment_search_text,
+            max(en2.created_at) AS enrichment_ingest_ts
+        FROM apple_voice_memos_enrichments en2
+        WHERE en2.account = t.account AND en2.recording_id = t.recording_id
+    ) ens ON TRUE""",
     event_id="concat_ws('|', t.account, t.recording_id)",
     event_ts=_real_ts("t.recorded_at", "t.file_created_at", "t.ingested_at"),
-    ingest_ts="t.ingested_at",
+    ingest_ts="GREATEST(t.ingested_at, COALESCE(ens.enrichment_ingest_ts, t.ingested_at))",
     actor="'me'",
     title="COALESCE(NULLIF(en.en_title, ''), NULLIF(t.title, ''), t.filename)",
     snippet=_snippet("COALESCE(en.en_summary, '')"),
@@ -844,6 +926,7 @@ _VOICE_MEMO = _simple_adapter(
         "'size_bytes', t.size_bytes, "
         "'deleted', t.is_deleted <> 0)"
     ),
+    search_text=_search_concat("t.title", "t.filename", "ens.enrichment_search_text"),
     priority=str(TIMELINE_PRIORITY_SELF),
 )
 
@@ -882,6 +965,7 @@ _CALENDAR_EVENT = _simple_adapter(
         "'all_day', t.is_all_day <> 0, "
         "'deleted', t.is_deleted <> 0)"
     ),
+    search_text=_search_concat("t.summary", "t.description", "t.location", "t.organizer_email", "t.attendees_json"),
     # Subscribed feeds (yoga studios, holidays) and marketing-mail invites
     # (their descriptions carry the invisible-padding chars marketing HTML
     # uses) are noise; events any of Zach's identities organized are his own
@@ -905,10 +989,18 @@ _DRIVE_FILE = _simple_adapter(
     source_table="google_drive_files",
     source="google_drive",
     kind="file_change",
-    from_sql="google_drive_files t",
+    from_sql="""google_drive_files t
+    LEFT JOIN LATERAL (
+        SELECT
+            string_agg(ft.text, E'\n' ORDER BY ft.extracted_at DESC) AS extracted_search_text,
+            max(ft.extracted_at) AS extracted_ingest_ts
+        FROM google_drive_file_texts ft
+        WHERE ft.account = t.account AND ft.file_id = t.file_id
+          AND ft.text_extraction_status = 'ok' AND ft.text != ''
+    ) txt ON TRUE""",
     event_id="concat_ws('|', t.account, t.file_id)",
     event_ts=_real_ts("t.modified_time", "t.created_time", "t.ingested_at"),
-    ingest_ts="t.ingested_at",
+    ingest_ts="GREATEST(t.ingested_at, COALESCE(txt.extracted_ingest_ts, t.ingested_at))",
     actor="t.last_modifying_user",
     title="t.name",
     context="t.folder_path",
@@ -923,6 +1015,7 @@ _DRIVE_FILE = _simple_adapter(
         "'trashed', t.trashed <> 0, "
         "'excluded', t.is_excluded <> 0)"
     ),
+    search_text=_search_concat("t.name", "t.folder_path", "t.last_modifying_user", "txt.extracted_search_text"),
     # My own files edited by me are my actions; my files edited by someone
     # else are directed at me; the rest of the corpus is ambient. Ownership
     # matches the account email inside owners_json (the raw metadata's
@@ -977,6 +1070,10 @@ _CONTACT_UPDATE = _simple_adapter(
         "'primary_email', t.primary_email, "
         "'primary_phone', t.primary_phone, "
         "'deleted', t.is_deleted <> 0)"
+    ),
+    search_text=_search_concat(
+        "t.display_name", "t.organization", "t.job_title", "t.primary_email", "t.primary_phone",
+        "t.notes", "t.emails", "t.phones", "t.addresses", "t.urls", "t.nicknames"
     ),
     # Contact-card churn is sync machinery, not traffic aimed at Zach.
     priority=str(TIMELINE_PRIORITY_BACKGROUND),
@@ -1061,10 +1158,9 @@ def _agent_session_adapter() -> TimelineAdapter:
     timeline entries.
 
     The GROUP BY aggregates only cheap scalars; first/last text-ish fields
-    (title, first prompt, model, cwd, ...) come from per-session LATERAL
-    probes on the (source, session_id, seq) index. An array_agg-of-text
-    roll-up would materialize every session's transcript text in one
-    aggregation — hundreds of MB on the production table.
+    (title, first prompt, model, cwd, ...) and the BM25 search document come
+    from per-session LATERAL probes on the (source, session_id, seq) index so
+    the normalized timeline row can be the primary search hit.
     """
     rollup = f"""
         SELECT
@@ -1091,6 +1187,9 @@ def _agent_session_adapter() -> TimelineAdapter:
                 'repo_url', ru.repo_url,
                 'output_tokens', s.output_tokens
             ))::text AS metadata,
+            concat_ws(E'\n', NULLIF(st.session_title, ''), NULLIF(fp.text, ''),
+                      NULLIF(cw.cwd, ''), NULLIF(gb.git_branch, ''), NULLIF(ru.repo_url, ''),
+                      NULLIF(tx.transcript_text, '')) AS search_text,
             s.ingest_ts AS ingest_ts,
             -- Interactive vs background (benchmark-tuned, sampling/ 2026-07).
             -- chatgpt/claude_desktop are always human conversations, and some
@@ -1168,6 +1267,12 @@ def _agent_session_adapter() -> TimelineAdapter:
             WHERE e2.source = s.source AND e2.session_id = s.session_id AND e2.repo_url != ''
             ORDER BY e2.seq LIMIT 1
         ) ru ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT string_agg(e2.text, E'\n' ORDER BY e2.seq) AS transcript_text
+            FROM agent_session_events e2
+            WHERE e2.source = s.source AND e2.session_id = s.session_id
+              AND e2.text != '' AND e2.role IN ('user', 'assistant')
+        ) tx ON TRUE
     """
     backfill_sql = f"""
         SELECT * FROM ({rollup.format(changed_join="")}) roll
@@ -1383,6 +1488,7 @@ _TIMELINE_UPSERT_COLUMNS = (
     "source_table",
     "source_pk",
     "metadata",
+    "search_text",
     "ingest_ts",
 )
 
@@ -1403,6 +1509,7 @@ _TIMELINE_CONTENT_COLUMNS = (
     "source_table",
     "source_pk",
     "metadata",
+    "search_text",
 )
 
 
@@ -1422,7 +1529,7 @@ def timeline_upsert_sql(*, table_ref: str = "timeline_events", sequence_ref: str
 
 
 _TIMELINE_INSERT_TEMPLATE = (
-    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)"
+    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s)"
 )
 
 
@@ -1620,8 +1727,8 @@ class TimelineSyncEngine:
         for row in rows:
             deduped[row[0]] = row
         values = [
-            (adapter.name, row[0], row[1], row[2], row[12], row[3], row[4], row[5], row[6],
-             row[7], row[8], adapter.source_table, row[9], row[10], row[11])
+            (adapter.name, row[0], row[1], row[2], row[13], row[3], row[4], row[5], row[6],
+             row[7], row[8], adapter.source_table, row[9], row[10], row[11], row[12])
             for row in deduped.values()
         ]
         with self._dest_conn.cursor() as cursor:
@@ -1655,7 +1762,7 @@ class TimelineSyncEngine:
                 break
             self._upsert(adapter, rows)
             last = rows[-1]
-            state.watermark_ts = last[11]
+            state.watermark_ts = last[12]
             state.watermark_id = last[0]
             self._save_state(adapter, state)
             self._bump_counter(adapter, "incremental_rows", len(rows))

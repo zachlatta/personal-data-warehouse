@@ -920,6 +920,7 @@ TIMELINE_EVENT_COLUMNS = (
     "source_table",
     "source_pk",
     "metadata",
+    "search_text",
     "ingest_ts",
     "seq",
     "first_seen_at",

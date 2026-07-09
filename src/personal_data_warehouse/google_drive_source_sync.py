@@ -2,8 +2,8 @@
 
 This is Google Drive *as a data source*, distinct from Drive-as-transport used
 by the object-storage backends. Files are mirrored into ``google_drive_files``
-and their text into ``google_drive_file_texts`` so they surface through the unified
-``search_text()`` function. Bytes are not copied: rows carry the Drive file id so
+and their text into ``google_drive_file_texts``; the timeline adapter folds that
+text into the unified ``search_text()`` document. Bytes are not copied: rows carry the Drive file id so
 the Go app's account-aware download proxy can stream them on demand.
 
 Incremental sync uses the Drive Changes API: a full ``files.list`` crawl on the

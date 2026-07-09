@@ -78,30 +78,26 @@ from personal_data_warehouse.relations import (
 
 POSTGRES_TEXT_NUL_REPLACEMENT = "\\u0000"
 # A search_text() hit's `text` is a relevance PREVIEW, not the full document.
-# Some branches read multi-megabyte columns (Google Drive doc text averages ~40 kB
-# and reaches ~5 MB; email/attachment bodies can be large too). search_text()
-# array_agg's the top-k `text` of every branch into an intermediate plpgsql array
-# before the final cross-source rank+limit, so carrying untrimmed text makes a
-# single common-term query move tens of MB through that array — slow enough to trip
-# the gateway timeout. Capping each branch's contributed text keeps the array small
-# while preserving a generous preview; the caller fetches full content via `ref`.
+# Timeline search documents can include multi-megabyte source/detail text
+# (Google Drive docs, transcripts, email bodies, attachment enrichments).
+# search_text() array_agg's each source branch's top-k text into an intermediate
+# plpgsql array before the final cross-source rank+limit, so carrying untrimmed
+# text can move tens of MB through that array. Capping each branch's contributed
+# text keeps the array small while preserving a generous preview; the caller
+# fetches full content via the returned timeline `ref`.
 SEARCH_TEXT_PREVIEW_CHARS = 8000
-# search_text() merges hits from ~30 BM25 branches whose scores are NOT comparable
-# across corpora (a gmail-body match and a contact-card match score on different
-# vocabularies/lengths). A single flat `ORDER BY score LIMIT n` therefore lets a
-# high-volume source (gmail/slack, dozens of strongly-scored hits) crowd out the one
-# matching contact card or Google-Drive doc, which ranks far down the global list and
-# is cut — the documented cause of "who is X -> nothing" and "doc not indexed" false
-# negatives. The merge instead guarantees each source's top-SEARCH_TEXT_SOURCE_FLOOR
-# hits survive the cut (recall for low-volume sources), then fills the remaining slots
-# by score (precision for whatever source the query truly concentrates in).
+# search_text() still runs one timeline branch per coarse source. Even though
+# those branches share one BM25 corpus, a single flat `ORDER BY score LIMIT n`
+# would let high-volume sources (gmail/slack) crowd out one matching contact card
+# or Drive doc. The merge guarantees each source's top-SEARCH_TEXT_SOURCE_FLOOR
+# hits survive the cut, then fills the remaining slots by score.
 SEARCH_TEXT_SOURCE_FLOOR = 3
 # Per-branch top-k cap for a BROAD (unscoped) search_text() call. The score
 # column recomputes the bm25 operator per returned row, whose cost is
-# rows x tokenize(text); on the huge Google-Drive / attachment-content branches
-# scoring 50 multi-kB docs is the dominant query latency (~3 s). A broad search
-# never needs that depth -- the cross-source merge keeps only each source's
-# top-SEARCH_TEXT_SOURCE_FLOOR hits plus a global score fill -- so capping each
+# rows x tokenize(text); on huge timeline documents (Drive docs, transcripts,
+# attachment/media enrichments) scoring 50 multi-kB docs dominates latency. A
+# broad search never needs that depth -- the cross-source merge keeps only each
+# source's top-SEARCH_TEXT_SOURCE_FLOOR hits plus a global score fill -- so capping each
 # branch to this many rows bounds the recompute with no change to the merged
 # output. A scoped search (sources => ARRAY[...]) bypasses the cap and uses the
 # full max_results so a single-source deep search still returns everything.
@@ -416,40 +412,10 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_body_html_trgm_idx ON gmail_messages USING gin (body_html public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
-    # BM25 relevance-ranked word search (pg_textsearch). Full-coverage,
-    # single-column indexes so callers can use the implicit
-    # ORDER BY col <@> 'query' LIMIT n syntax; partial bm25 indexes would
-    # force the explicit to_bm25query() form. body_html is skipped on
-    # purpose: markup tokens pollute the BM25 lexicon and
-    # body_markdown_clean already covers that content.
-    IndexSpec(
-        "gmail_messages_subject_bm25_idx",
-        "gmail_messages",
-        "CREATE INDEX IF NOT EXISTS gmail_messages_subject_bm25_idx ON gmail_messages USING bm25 (subject) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "gmail_messages_body_text_bm25_idx",
-        "gmail_messages",
-        "CREATE INDEX IF NOT EXISTS gmail_messages_body_text_bm25_idx ON gmail_messages USING bm25 (body_text) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "gmail_messages_body_markdown_bm25_idx",
-        "gmail_messages",
-        "CREATE INDEX IF NOT EXISTS gmail_messages_body_markdown_bm25_idx ON gmail_messages USING bm25 (body_markdown_clean) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
     IndexSpec(
         "gmail_attachments_message_idx",
         "gmail_attachments",
         "CREATE INDEX IF NOT EXISTS gmail_attachments_message_idx ON gmail_attachments (account, message_id)",
-    ),
-    IndexSpec(
-        "file_attachment_enrichments_text_bm25_idx",
-        "file_attachment_enrichments",
-        "CREATE INDEX IF NOT EXISTS file_attachment_enrichments_text_bm25_idx ON file_attachment_enrichments USING bm25 (text) WITH (text_config='english')",
-        requires_pg_textsearch=True,
     ),
     IndexSpec(
         "file_attachment_enrichments_text_trgm_idx",
@@ -493,12 +459,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS voice_memo_files_recorded_idx ON apple_voice_memos_files (recorded_at DESC)",
     ),
     IndexSpec(
-        "apple_voice_memos_transcript_bm25_idx",
-        "apple_voice_memos_enrichments",
-        "CREATE INDEX IF NOT EXISTS apple_voice_memos_transcript_bm25_idx ON apple_voice_memos_enrichments USING bm25 (transcript) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
         "apple_voice_memos_transcript_trgm_idx",
         "apple_voice_memos_enrichments",
         "CREATE INDEX IF NOT EXISTS apple_voice_memos_transcript_trgm_idx ON apple_voice_memos_enrichments USING gin (transcript public.gin_trgm_ops)",
@@ -508,18 +468,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "apple_notes_modified_idx",
         "apple_notes",
         "CREATE INDEX IF NOT EXISTS apple_notes_modified_idx ON apple_notes (modified_at DESC) WHERE is_deleted = 0",
-    ),
-    IndexSpec(
-        "apple_notes_title_bm25_idx",
-        "apple_notes",
-        "CREATE INDEX IF NOT EXISTS apple_notes_title_bm25_idx ON apple_notes USING bm25 (title) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "apple_notes_body_bm25_idx",
-        "apple_notes",
-        "CREATE INDEX IF NOT EXISTS apple_notes_body_bm25_idx ON apple_notes USING bm25 (body_text) WITH (text_config='english')",
-        requires_pg_textsearch=True,
     ),
     IndexSpec(
         "apple_notes_title_trgm_idx",
@@ -555,14 +503,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         requires_pg_trgm=True,
     ),
     IndexSpec(
-        # Full coverage (no is_deleted filter) so the implicit <@> syntax
-        # stays index-backed; callers filter is_deleted in SQL.
-        "apple_messages_body_bm25_idx",
-        "apple_messages",
-        "CREATE INDEX IF NOT EXISTS apple_messages_body_bm25_idx ON apple_messages USING bm25 (body_text) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
         "apple_message_chat_messages_chat_time_idx",
         "apple_message_chat_messages",
         "CREATE INDEX IF NOT EXISTS apple_message_chat_messages_chat_time_idx ON apple_message_chat_messages (account, chat_id, message_date DESC)",
@@ -589,14 +529,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         requires_pg_trgm=True,
     ),
     IndexSpec(
-        # Full coverage (no is_deleted filter) so the implicit <@> syntax
-        # stays index-backed; callers filter is_deleted in SQL.
-        "whatsapp_messages_body_bm25_idx",
-        "whatsapp_messages",
-        "CREATE INDEX IF NOT EXISTS whatsapp_messages_body_bm25_idx ON whatsapp_messages USING bm25 (body_text) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
         "whatsapp_media_items_hash_idx",
         "whatsapp_media_items",
         "CREATE INDEX IF NOT EXISTS whatsapp_media_items_hash_idx ON whatsapp_media_items (content_sha256)",
@@ -621,12 +553,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "agent_session_events",
         "CREATE INDEX IF NOT EXISTS agent_session_events_text_trgm_idx ON agent_session_events USING gin (text public.gin_trgm_ops) WHERE text != ''",
         requires_pg_trgm=True,
-    ),
-    IndexSpec(
-        "agent_session_events_text_bm25_idx",
-        "agent_session_events",
-        "CREATE INDEX IF NOT EXISTS agent_session_events_text_bm25_idx ON agent_session_events USING bm25 (text) WITH (text_config='english')",
-        requires_pg_textsearch=True,
     ),
     IndexSpec(
         "agent_run_events_created_idx",
@@ -681,15 +607,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         requires_pg_trgm=True,
     ),
     IndexSpec(
-        # pg_textsearch has no CONCURRENTLY support, so a cold build here
-        # write-blocks slack_messages for the build duration. Pre-build this
-        # one manually before deploying to fresh large datasets.
-        "slack_messages_text_bm25_idx",
-        "slack_messages",
-        "CREATE INDEX IF NOT EXISTS slack_messages_text_bm25_idx ON slack_messages USING bm25 (text) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
         "slack_conversations_scope_idx",
         "slack_conversations",
         "CREATE INDEX IF NOT EXISTS slack_conversations_scope_idx ON slack_conversations (account, team_id, conversation_type)",
@@ -724,196 +641,16 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "slack_account_state_item_rows",
         "CREATE INDEX IF NOT EXISTS slack_account_state_live_scope_idx ON slack_account_state_item_rows (account, scope_id, priority_rank, latest_activity_at DESC) WHERE is_deleted = 0",
     ),
-    # BM25 indexes backing the cross-source search_text() function for every
-    # source the (removed) searchable_text view used to cover. Full coverage (no
-    # partial WHERE) so the implicit/explicit <@> top-k stays index-backed;
-    # search_text() applies is_deleted / non-empty filters in SQL. The heavy
-    # sources (gmail/slack/messages/notes/whatsapp/transcripts/agent sessions)
-    # already have their bm25 indexes above; these add the remaining columns.
-    IndexSpec(
-        "gmail_attachments_filename_bm25_idx",
-        "gmail_attachments",
-        "CREATE INDEX IF NOT EXISTS gmail_attachments_filename_bm25_idx ON gmail_attachments USING bm25 (filename) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "slack_conversations_name_bm25_idx",
-        "slack_conversations",
-        "CREATE INDEX IF NOT EXISTS slack_conversations_name_bm25_idx ON slack_conversations USING bm25 (name) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "slack_conversations_topic_bm25_idx",
-        "slack_conversations",
-        "CREATE INDEX IF NOT EXISTS slack_conversations_topic_bm25_idx ON slack_conversations USING bm25 (topic) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "slack_conversations_purpose_bm25_idx",
-        "slack_conversations",
-        "CREATE INDEX IF NOT EXISTS slack_conversations_purpose_bm25_idx ON slack_conversations USING bm25 (purpose) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "slack_files_name_bm25_idx",
-        "slack_files",
-        "CREATE INDEX IF NOT EXISTS slack_files_name_bm25_idx ON slack_files USING bm25 (name) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "slack_files_title_bm25_idx",
-        "slack_files",
-        "CREATE INDEX IF NOT EXISTS slack_files_title_bm25_idx ON slack_files USING bm25 (title) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "apple_voice_memos_title_bm25_idx",
-        "apple_voice_memos_enrichments",
-        "CREATE INDEX IF NOT EXISTS apple_voice_memos_title_bm25_idx ON apple_voice_memos_enrichments USING bm25 (title) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "apple_voice_memos_summary_bm25_idx",
-        "apple_voice_memos_enrichments",
-        "CREATE INDEX IF NOT EXISTS apple_voice_memos_summary_bm25_idx ON apple_voice_memos_enrichments USING bm25 (summary) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "apple_voice_memos_participants_bm25_idx",
-        "apple_voice_memos_enrichments",
-        "CREATE INDEX IF NOT EXISTS apple_voice_memos_participants_bm25_idx ON apple_voice_memos_enrichments USING bm25 (participants_json) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "apple_voice_memos_action_items_bm25_idx",
-        "apple_voice_memos_enrichments",
-        "CREATE INDEX IF NOT EXISTS apple_voice_memos_action_items_bm25_idx ON apple_voice_memos_enrichments USING bm25 (action_items_json) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "apple_note_revisions_body_bm25_idx",
-        "apple_note_revisions",
-        "CREATE INDEX IF NOT EXISTS apple_note_revisions_body_bm25_idx ON apple_note_revisions USING bm25 (body_text) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "whatsapp_chats_name_bm25_idx",
-        "whatsapp_chats",
-        "CREATE INDEX IF NOT EXISTS whatsapp_chats_name_bm25_idx ON whatsapp_chats USING bm25 (name) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "whatsapp_media_items_filename_bm25_idx",
-        "whatsapp_media_items",
-        "CREATE INDEX IF NOT EXISTS whatsapp_media_items_filename_bm25_idx ON whatsapp_media_items USING bm25 (filename) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "apple_message_attachments_filename_bm25_idx",
-        "apple_message_attachments",
-        "CREATE INDEX IF NOT EXISTS apple_message_attachments_filename_bm25_idx ON apple_message_attachments USING bm25 (filename) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "calendar_events_summary_bm25_idx",
-        "calendar_events",
-        "CREATE INDEX IF NOT EXISTS calendar_events_summary_bm25_idx ON calendar_events USING bm25 (summary) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "calendar_events_description_bm25_idx",
-        "calendar_events",
-        "CREATE INDEX IF NOT EXISTS calendar_events_description_bm25_idx ON calendar_events USING bm25 (description) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "calendar_events_location_bm25_idx",
-        "calendar_events",
-        "CREATE INDEX IF NOT EXISTS calendar_events_location_bm25_idx ON calendar_events USING bm25 (location) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "calendar_events_attendees_bm25_idx",
-        "calendar_events",
-        "CREATE INDEX IF NOT EXISTS calendar_events_attendees_bm25_idx ON calendar_events USING bm25 (attendees_json) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "contact_cards_name_bm25_idx",
-        "contact_cards",
-        "CREATE INDEX IF NOT EXISTS contact_cards_name_bm25_idx ON contact_cards USING bm25 (display_name) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "contact_cards_organization_bm25_idx",
-        "contact_cards",
-        "CREATE INDEX IF NOT EXISTS contact_cards_organization_bm25_idx ON contact_cards USING bm25 (organization) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "contact_cards_job_title_bm25_idx",
-        "contact_cards",
-        "CREATE INDEX IF NOT EXISTS contact_cards_job_title_bm25_idx ON contact_cards USING bm25 (job_title) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "contact_cards_notes_bm25_idx",
-        "contact_cards",
-        "CREATE INDEX IF NOT EXISTS contact_cards_notes_bm25_idx ON contact_cards USING bm25 (notes) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "agent_run_events_text_bm25_idx",
-        "agent_run_events",
-        "CREATE INDEX IF NOT EXISTS agent_run_events_text_bm25_idx ON agent_run_events USING bm25 (text) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "agent_session_events_title_bm25_idx",
-        "agent_session_events",
-        "CREATE INDEX IF NOT EXISTS agent_session_events_title_bm25_idx ON agent_session_events USING bm25 (session_title) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "upstream_mutations_title_bm25_idx",
-        "upstream_mutations",
-        "CREATE INDEX IF NOT EXISTS upstream_mutations_title_bm25_idx ON upstream_mutations USING bm25 (title) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "upstream_mutation_requests_title_bm25_idx",
-        "upstream_mutation_requests",
-        "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_title_bm25_idx ON upstream_mutation_requests USING bm25 (title) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
-        "upstream_mutation_requests_reason_bm25_idx",
-        "upstream_mutation_requests",
-        "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_reason_bm25_idx ON upstream_mutation_requests USING bm25 (reason) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
     IndexSpec(
         "google_drive_files_modified_idx",
         "google_drive_files",
         "CREATE INDEX IF NOT EXISTS google_drive_files_modified_idx ON google_drive_files (account, modified_time DESC) WHERE trashed = 0 AND is_excluded = 0",
     ),
     IndexSpec(
-        "google_drive_files_name_bm25_idx",
-        "google_drive_files",
-        "CREATE INDEX IF NOT EXISTS google_drive_files_name_bm25_idx ON google_drive_files USING bm25 (name) WITH (text_config='english')",
-        requires_pg_textsearch=True,
-    ),
-    IndexSpec(
         "google_drive_files_name_trgm_idx",
         "google_drive_files",
         "CREATE INDEX IF NOT EXISTS google_drive_files_name_trgm_idx ON google_drive_files USING gin (name public.gin_trgm_ops)",
         requires_pg_trgm=True,
-    ),
-    IndexSpec(
-        "google_drive_file_texts_text_bm25_idx",
-        "google_drive_file_texts",
-        "CREATE INDEX IF NOT EXISTS google_drive_file_texts_text_bm25_idx ON google_drive_file_texts USING bm25 (text) WITH (text_config='english')",
-        requires_pg_textsearch=True,
     ),
     IndexSpec(
         "google_drive_file_texts_text_trgm_idx",
@@ -948,6 +685,18 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "timeline_events_priority_time_idx",
         "timeline_events",
         "CREATE INDEX IF NOT EXISTS timeline_events_priority_time_idx ON timeline_events (priority, event_ts DESC, seq DESC)",
+    ),
+    IndexSpec(
+        "timeline_events_search_text_bm25_idx",
+        "timeline_events",
+        "CREATE INDEX IF NOT EXISTS timeline_events_search_text_bm25_idx ON timeline_events USING bm25 (search_text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "timeline_events_search_text_trgm_idx",
+        "timeline_events",
+        "CREATE INDEX IF NOT EXISTS timeline_events_search_text_trgm_idx ON timeline_events USING gin (search_text public.gin_trgm_ops)",
+        requires_pg_trgm=True,
     ),
     # Ingestion-timestamp indexes on the larger event sources so the timeline's
     # incremental sync (WHERE ingest_ts > watermark) never falls back to a
@@ -1016,6 +765,48 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
 POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
     # Replaced by the full-coverage slack_messages_text_trgm_idx.
     ("slack_messages_text_trgm_live_idx", "slack_messages"),
+    # Legacy per-source BM25 indexes from the pre-timeline cross-source search.
+    ("gmail_messages_subject_bm25_idx", "gmail_messages"),
+    ("gmail_messages_body_text_bm25_idx", "gmail_messages"),
+    ("gmail_messages_body_markdown_bm25_idx", "gmail_messages"),
+    ("gmail_attachments_filename_bm25_idx", "gmail_attachments"),
+    ("gmail_attachment_enrichments_text_bm25_idx", "file_attachment_enrichments"),
+    ("file_attachment_enrichments_text_bm25_idx", "file_attachment_enrichments"),
+    ("slack_messages_text_bm25_idx", "slack_messages"),
+    ("slack_conversations_name_bm25_idx", "slack_conversations"),
+    ("slack_conversations_topic_bm25_idx", "slack_conversations"),
+    ("slack_conversations_purpose_bm25_idx", "slack_conversations"),
+    ("slack_files_name_bm25_idx", "slack_files"),
+    ("slack_files_title_bm25_idx", "slack_files"),
+    ("apple_notes_title_bm25_idx", "apple_notes"),
+    ("apple_notes_body_bm25_idx", "apple_notes"),
+    ("apple_note_revisions_body_bm25_idx", "apple_note_revisions"),
+    ("apple_messages_body_bm25_idx", "apple_messages"),
+    ("apple_message_attachments_filename_bm25_idx", "apple_message_attachments"),
+    ("whatsapp_messages_body_bm25_idx", "whatsapp_messages"),
+    ("whatsapp_chats_name_bm25_idx", "whatsapp_chats"),
+    ("whatsapp_media_items_filename_bm25_idx", "whatsapp_media_items"),
+    ("apple_voice_memos_transcript_bm25_idx", "apple_voice_memos_enrichments"),
+    ("apple_voice_memos_title_bm25_idx", "apple_voice_memos_enrichments"),
+    ("apple_voice_memos_summary_bm25_idx", "apple_voice_memos_enrichments"),
+    ("apple_voice_memos_participants_bm25_idx", "apple_voice_memos_enrichments"),
+    ("apple_voice_memos_action_items_bm25_idx", "apple_voice_memos_enrichments"),
+    ("calendar_events_summary_bm25_idx", "calendar_events"),
+    ("calendar_events_description_bm25_idx", "calendar_events"),
+    ("calendar_events_location_bm25_idx", "calendar_events"),
+    ("calendar_events_attendees_bm25_idx", "calendar_events"),
+    ("contact_cards_name_bm25_idx", "contact_cards"),
+    ("contact_cards_organization_bm25_idx", "contact_cards"),
+    ("contact_cards_job_title_bm25_idx", "contact_cards"),
+    ("contact_cards_notes_bm25_idx", "contact_cards"),
+    ("agent_session_events_text_bm25_idx", "agent_session_events"),
+    ("agent_session_events_title_bm25_idx", "agent_session_events"),
+    ("agent_run_events_text_bm25_idx", "agent_run_events"),
+    ("upstream_mutations_title_bm25_idx", "upstream_mutations"),
+    ("upstream_mutation_requests_title_bm25_idx", "upstream_mutation_requests"),
+    ("upstream_mutation_requests_reason_bm25_idx", "upstream_mutation_requests"),
+    ("google_drive_files_name_bm25_idx", "google_drive_files"),
+    ("google_drive_file_texts_text_bm25_idx", "google_drive_file_texts"),
 )
 
 
@@ -1440,10 +1231,6 @@ class PostgresWarehouse:
                 "apple_message_attachments",
             ]
         )
-        # The WhatsApp tables ride along here so the search_text() function,
-        # whose gate references them, stays recreatable on deployments where the
-        # WhatsApp ingest has not run yet.
-        self._ensure_table_group(_WHATSAPP_TABLES)
         self._ensure_search_views_if_possible()
 
     def ensure_whatsapp_tables(self) -> None:
@@ -1525,15 +1312,44 @@ class PostgresWarehouse:
         present by seq).
         """
         self._ensure_table_group(["timeline_events", "timeline_sync_state"])
+        timeline_rel = query_relation("timeline_events").with_namespace(self._schema)
+        had_search_text = bool(
+            self._query(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s AND column_name = 'search_text'
+                LIMIT 1
+                """,
+                (timeline_rel.schema, timeline_rel.name),
+            )
+        )
         self._migrate_legacy_named_table_if_present("timeline_gmail_correspondents", "timeline_gmail_correspondents")
         sequence_ref = self.sql_relation("timeline_events_seq")
         self._command("CREATE SEQUENCE IF NOT EXISTS timeline_events_seq")
         self._command(f"ALTER TABLE timeline_events ALTER COLUMN seq SET DEFAULT nextval('{sequence_ref}')")
         self._command("ALTER TABLE timeline_events ALTER COLUMN first_seen_at SET DEFAULT now()")
         self._command("ALTER TABLE timeline_events ALTER COLUMN updated_at SET DEFAULT now()")
-        # Additive migration for timelines created before the priority tier
-        # existed; 0 means "not yet classified" and re-syncing fills it in.
+        # Additive migrations for timelines created before later normalized
+        # fields existed. `search_text` is the full BM25 document backing the
+        # general search function; re-syncing fills it in for old rows.
         self._command("ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS priority bigint NOT NULL DEFAULT 0")
+        self._command("ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS search_text text NOT NULL DEFAULT ''")
+        if not had_search_text:
+            # Existing timelines need a full re-walk so every historical row gets
+            # the full adapter-owned search document. New installs already start
+            # their backfill from scratch; this only resets pre-search timelines.
+            self._command(
+                """
+                UPDATE timeline_sync_state
+                SET backfill_cursor_event_ts = '9999-01-01 00:00:00+00'::timestamptz,
+                    backfill_cursor_event_id = '',
+                    backfill_done = 0,
+                    last_error = '',
+                    updated_at = now()
+                WHERE EXISTS (SELECT 1 FROM timeline_events LIMIT 1)
+                """
+            )
         # Addresses Zach has ever written to, with counts — the relationship
         # signal the gmail adapter's known-correspondent rule reads. Refreshed
         # by TimelineSyncEngine at most once per day.
@@ -1547,6 +1363,7 @@ class PostgresWarehouse:
             )
             """
         )
+        self._ensure_search_views_if_possible()
 
     def ensure_claude_desktop_tables(self) -> None:
         """Tables for the serverside Claude Desktop poller.
@@ -2037,10 +1854,9 @@ class PostgresWarehouse:
             "CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON upstream_mutation_events (mutation_id, event_index)",
         ):
             self._command(sql)
-        # These raw-DDL tables also carry BM25 IndexSpecs (for search_text); they
-        # get built (with the pg_textsearch bootstrap + graceful-skip) by
-        # _ensure_search_views_if_possible, which builds every searchable table's
-        # indexes before recreating the function.
+        # Recreate search_text() if needed; general search now reads the
+        # timeline, but mutation ensure still participates in the shared search
+        # schema convergence path.
         self._ensure_search_views_if_possible()
 
     def gmail_archive_thread_previews(self, *, account: str, thread_ids: Sequence[str]) -> list[dict[str, Any]]:
@@ -5676,36 +5492,10 @@ class PostgresWarehouse:
             """
         )
 
-    # Tables the cross-source search views read. The views are only (re)created
-    # once every referenced table exists, so partial test schemas and staged
-    # rollouts of new source groups degrade to "view not there yet".
-    _SEARCHABLE_TEXT_TABLES = (
-        "gmail_messages",
-        "gmail_attachments",
-        "file_attachment_enrichments",
-        "slack_messages",
-        "slack_conversations",
-        "slack_users",
-        "slack_files",
-        "apple_notes",
-        "apple_note_revisions",
-        "apple_messages",
-        "apple_message_handles",
-        "apple_message_attachments",
-        "whatsapp_messages",
-        "whatsapp_chats",
-        "whatsapp_contacts",
-        "whatsapp_media_items",
-        "apple_voice_memos_enrichments",
-        "calendar_events",
-        "contact_cards",
-        "agent_run_events",
-        "agent_session_events",
-        "upstream_mutations",
-        "upstream_mutation_requests",
-        "google_drive_files",
-        "google_drive_file_texts",
-    )
+    # Tables the cross-source search function reads. General search is backed
+    # by the unified timeline's BM25 document, so callers search one normalized
+    # stream instead of fanning out across source-specific text columns.
+    _SEARCHABLE_TEXT_TABLES = ("timeline_events",)
 
     _SEARCH_SCHEMA_MARKER_TABLE = "search_schema_state"
 
@@ -5732,15 +5522,9 @@ class PostgresWarehouse:
         self._command("DROP VIEW IF EXISTS searchable_text")
         if not all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
             return
-        # Build every bm25 index search_text() references BEFORE (re)creating
-        # the function, so it can never point at a not-yet-built index.
-        # ensure_* builds indexes lazily per table group, but the function
-        # references all sources at once. Without this, the first group to run
-        # after a deploy recreates the function while other groups' bm25
-        # indexes are still missing, and every search_text() call fails with
-        # "index ... does not exist" until those (often sensor/new-data-driven)
-        # groups happen to tick. The gate above guarantees all referenced
-        # tables exist, so building all their indexes here is safe.
+        # Build the timeline BM25 index search_text() references BEFORE
+        # (re)creating the function, so it can never point at a not-yet-built
+        # index. The gate above guarantees the referenced timeline table exists.
         self._ensure_indexes(self._SEARCHABLE_TEXT_TABLES)
         signature = self._search_schema_signature()
         if (
@@ -5812,412 +5596,68 @@ class PostgresWarehouse:
         return bool(rows)
 
     def _ensure_search_text_function(self) -> None:
-        # search_text() is the single, default cross-source search path. It fans
-        # out to the per-table BM25 (pg_textsearch) indexes — one index-backed
-        # top-k scan per source/column (ORDER BY col <@> to_bm25query(...) LIMIT
-        # n) — then merges and re-ranks. This replaces the old searchable_text
-        # view: pg_textsearch's <@> operator cannot run through a view, so broad
-        # cross-source searches used to fall back to ILIKE/~* full scans over the
-        # whole UNION and time out.
+        # search_text() is the single, default cross-source search path. It now
+        # searches the unified timeline's `search_text` BM25 document, rather
+        # than fanning out over source-specific tables. Timeline adapters own
+        # the hard normalization work: they pick the event timestamp, actor,
+        # context, priority, stable ref, and full text document (including
+        # detail text like Drive extracts, transcripts, and media enrichments).
         #
-        # Output is (source, subsource, context, who, occurred_at, account, ref,
-        # text, score); drill into the underlying table via `ref` for full rows.
-        # Coverage mirrors what the old view searched — every BM25-indexable text
-        # column across gmail, slack, attachments, transcripts, notes, imessage,
-        # whatsapp, calendar, contacts, agent sessions, and mutations. Deliberate
-        # omissions: upstream_mutations.payload_json (raw jsonb; a structured blob
-        # with marginal full-text value, though the mutation title is still
-        # covered) and agent_run_events (the internal enrichment agent's raw-JSON
-        # operational logs — see the NOTE on its dropped branch below).
-        # Transcript branches read the raw enrichments table (where
-        # the BM25 index lives) rather than the de-duplicated clean view, so they
-        # can surface more than one prompt-version row per recording.
+        # Output remains (source, subsource, context, who, occurred_at, account,
+        # ref, text, score) so existing agents can keep calling
+        # search.search_text(...). `ref` is now a timeline ref of the form
+        # `<adapter>:<event_id>`; drill into timeline.events by adapter/event_id
+        # (or use source_table/source_pk from that row) for source-specific rows.
         #
-        # Two pg_textsearch facts shape the SQL: (1) the explicit
-        # to_bm25query('query', 'index_name') form names the index directly, so it
-        # works regardless of search_path schema (the implicit col <@> 'query'
-        # form only resolves indexes in the default schema); (2) BM25 scores are
-        # per-corpus, so cross-source ranking is approximate — good for recall
-        # ("find every mention"), not a global relevance guarantee. Requires
-        # `public` on search_path for the operator/helpers (true in production).
+        # The function still executes one BM25 top-k branch per coarse source so
+        # broad searches cannot starve low-volume sources. All branches read the
+        # same timeline_events_search_text_bm25_idx index and differ only in the
+        # adapter filter and source label they return.
 
-        def branch(
-            source: str,
-            subsource: str,
-            context: str,
-            who: str,
-            occurred: str,
-            account: str,
-            ref: str,
-            from_sql: str,
-            col: str,
-            idx: str,
-            where: str = "",
-        ) -> tuple[str, str]:
-            # One bm25-indexed text column -> one index-backed top-k subquery.
-            #
-            # The score is the bm25 operator `col <@> to_bm25query(...)` spelled
-            # in BOTH the ORDER BY (index-answered top-k) and the SELECT list.
-            # The SELECT copy is recomputed as an ordinary expression, which is
-            # the one form that stays correct on EVERY corpus size: a true
-            # non-match scores 0 (so WHERE score < 0 filters it), and the value
-            # never depends on the chosen plan. The faster-looking alternatives
-            # were tried and rejected: bm25_get_current_score() returns a garbage
-            # constant whenever the planner doesn't run a bm25 index scan (small
-            # / new tables, or any join above the scan), and a rank-derived score
-            # can't tell a non-match from a match on a small corpus -- both leak
-            # wrong rows / scores SILENTLY, which is exactly the failure class
-            # this function exists to avoid. The recompute is cheap for the
-            # short-text columns; the only expensive case (huge Google-Drive /
-            # attachment docs) is bounded instead by capping each branch's top-k
-            # for broad searches (see per_branch_limit below), so no branch ever
-            # re-tokenizes 50 multi-kB docs.
-            where_sql = f" WHERE {where}" if where else ""
-            rank = f"{col} <@> to_bm25query(%1$L, '{idx}')"
+        def branch(source: str, where: str, subsource: str = "t.kind") -> tuple[str, str]:
+            rank = "t.search_text <@> to_bm25query(%1$L, 'timeline_events_search_text_bm25_idx')"
+            where_sql = (
+                f"({where}) "
+                "AND t.search_text != '' "
+                "AND NOT COALESCE((t.metadata->>'deleted')::boolean, false)"
+            )
+            if source == "google_drive":
+                where_sql += (
+                    " AND NOT COALESCE((t.metadata->>'trashed')::boolean, false)"
+                    " AND NOT COALESCE((t.metadata->>'excluded')::boolean, false)"
+                )
             return (
-                source_literal_name(source),
-                f"( SELECT {source} AS source, {subsource} AS subsource, "
-                f"{context} AS context, {who} AS who, {occurred} AS occurred_at, "
-                f"{account} AS account, {ref} AS ref, {col} AS text, "
-                f"({rank})::real AS score "
-                f"FROM {from_sql}{where_sql} ORDER BY {rank} LIMIT %2$s )"
+                source,
+                f"( SELECT '{source}'::text AS source, {subsource} AS subsource, "
+                "t.context AS context, t.actor AS who, t.event_ts AS occurred_at, "
+                "COALESCE(t.source_pk->>'account', t.metadata->>'account', '') AS account, "
+                "t.adapter || ':' || t.event_id AS ref, t.search_text AS text, "
+                f"({rank})::real AS score FROM timeline_events t "
+                f"WHERE {where_sql} ORDER BY {rank} LIMIT %2$s )"
             )
 
-        def join_branch(source_name: str, select_sql: str, inner_sql: str, joins_sql: str, where: str = "") -> tuple[str, str]:
-            # Branches whose metadata needs joins keep the bm25 top-k on the base
-            # table (inner_sql), then join for context/who; the join runs over
-            # only the top-k rows.
-            where_sql = f" WHERE {where}" if where else ""
-            return source_name, f"( {select_sql} FROM ( {inner_sql} ) m {joins_sql}{where_sql} )"
-
-        def source_literal_name(source: str) -> str:
-            # All search_text branches use literal source labels. Keep the label
-            # alongside the branch SQL so search_text(sources := ...) can avoid
-            # executing unrelated branches instead of filtering only afterward.
-            return source.split("::", 1)[0].strip().strip("'")
-
         branches = [
-            branch(
-                "'gmail'::text", "'subject'::text", "''::text", "from_address",
-                "internal_date", "account", "account || ':' || message_id",
-                "gmail_messages", "subject", "gmail_messages_subject_bm25_idx",
-                where="is_deleted = 0",
-            ),
-            branch(
-                "'gmail'", "'body'", "''", "from_address", "internal_date", "account",
-                "account || ':' || message_id", "gmail_messages", "body_text",
-                "gmail_messages_body_text_bm25_idx", where="is_deleted = 0",
-            ),
-            # gmail attachment content: bm25 top-k on the shared enrichment text,
-            # then join the gmail attachment row for filename/account/date. The
-            # inner join to gmail_attachments naturally restricts the shared
-            # file_attachment_enrichments table to gmail-origin rows.
-            join_branch(
-                "gmail_attachment",
-                "SELECT 'gmail_attachment' AS source, 'content' AS subsource, a.filename AS context, "
-                "'' AS who, a.internal_date AS occurred_at, a.account AS account, "
-                "a.account || ':' || a.message_id || ':' || a.content_sha256 AS ref, "
-                "m.text AS text, m.score AS score",
-                "SELECT content_sha256, text, "
-                "(text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx'))::real AS score "
-                "FROM file_attachment_enrichments "
-                "ORDER BY text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx') LIMIT %2$s",
-                "JOIN gmail_attachments a USING (content_sha256)",
-                where="a.is_deleted = 0",
-            ),
-            branch(
-                "'gmail_attachment'", "'filename'", "mime_type", "''", "internal_date", "account",
-                "account || ':' || message_id || ':' || content_sha256", "gmail_attachments",
-                "filename", "gmail_attachments_filename_bm25_idx", where="is_deleted = 0",
-            ),
-            # slack message: bm25 top-k on the message text, then join conversation
-            # (for name/type) and user (for who).
-            join_branch(
-                "slack",
-                "SELECT 'slack' AS source, c.conversation_type AS subsource, c.name AS context, "
-                "COALESCE(NULLIF(u.real_name, ''), NULLIF(u.name, ''), m.user_id) AS who, "
-                "m.message_datetime AS occurred_at, m.account AS account, "
-                "m.team_id || ':' || m.conversation_id || ':' || m.message_ts AS ref, "
-                "m.text AS text, m.score AS score",
-                "SELECT account, team_id, conversation_id, user_id, message_ts, message_datetime, text, "
-                "(text <@> to_bm25query(%1$L, 'slack_messages_text_bm25_idx'))::real AS score "
-                "FROM slack_messages WHERE is_deleted = 0 "
-                "ORDER BY text <@> to_bm25query(%1$L, 'slack_messages_text_bm25_idx') LIMIT %2$s",
-                "JOIN slack_conversations c "
-                "ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id "
-                "LEFT JOIN slack_users u "
-                "ON u.account = m.account AND u.team_id = m.team_id AND u.user_id = m.user_id",
-            ),
-            branch(
-                "'slack_channel'", "'name'", "conversation_type", "''", "synced_at", "account",
-                "team_id || ':' || conversation_id", "slack_conversations", "name",
-                "slack_conversations_name_bm25_idx",
-            ),
-            branch(
-                "'slack_channel'", "'topic'", "name", "''", "synced_at", "account",
-                "team_id || ':' || conversation_id", "slack_conversations", "topic",
-                "slack_conversations_topic_bm25_idx", where="topic != ''",
-            ),
-            branch(
-                "'slack_channel'", "'purpose'", "name", "''", "synced_at", "account",
-                "team_id || ':' || conversation_id", "slack_conversations", "purpose",
-                "slack_conversations_purpose_bm25_idx", where="purpose != ''",
-            ),
-            branch(
-                "'slack_file'", "'name'", "mimetype", "user_id", "created_at", "account",
-                "team_id || ':' || file_id", "slack_files", "name",
-                "slack_files_name_bm25_idx", where="is_deleted = 0",
-            ),
-            branch(
-                "'slack_file'", "'title'", "mimetype", "user_id", "created_at", "account",
-                "team_id || ':' || file_id", "slack_files", "title",
-                "slack_files_title_bm25_idx", where="is_deleted = 0 AND title != ''",
-            ),
-            branch(
-                "'transcript'", "'transcript'", "title", "''", "start_at", "account", "recording_id",
-                "apple_voice_memos_enrichments", "transcript", "apple_voice_memos_transcript_bm25_idx",
-                where="transcript != ''",
-            ),
-            branch(
-                "'transcript'", "'title'", "''", "''", "start_at", "account", "recording_id",
-                "apple_voice_memos_enrichments", "title", "apple_voice_memos_title_bm25_idx",
-                where="title != ''",
-            ),
-            branch(
-                "'transcript'", "'summary'", "title", "''", "start_at", "account", "recording_id",
-                "apple_voice_memos_enrichments", "summary", "apple_voice_memos_summary_bm25_idx",
-                where="summary != ''",
-            ),
-            branch(
-                "'transcript'", "'participants'", "title", "''", "start_at", "account", "recording_id",
-                "apple_voice_memos_enrichments", "participants_json",
-                "apple_voice_memos_participants_bm25_idx", where="participants_json NOT IN ('', '[]')",
-            ),
-            branch(
-                "'transcript'", "'action_items'", "title", "''", "start_at", "account", "recording_id",
-                "apple_voice_memos_enrichments", "action_items_json",
-                "apple_voice_memos_action_items_bm25_idx", where="action_items_json NOT IN ('', '[]')",
-            ),
-            branch(
-                "'note'", "'title'", "folder_path", "title", "modified_at", "account", "note_id",
-                "apple_notes", "title", "apple_notes_title_bm25_idx", where="is_deleted = 0",
-            ),
-            branch(
-                "'note'", "'body'", "folder_path", "title", "modified_at", "account", "note_id",
-                "apple_notes", "body_text", "apple_notes_body_bm25_idx", where="is_deleted = 0",
-            ),
-            branch(
-                "'note'", "'revision'", "folder_path", "title", "modified_at", "account",
-                "note_id || '@' || revision_id", "apple_note_revisions", "body_text",
-                "apple_note_revisions_body_bm25_idx",
-            ),
-            # imessage: bm25 top-k on the message body, then join the handle for who.
-            join_branch(
-                "imessage",
-                "SELECT 'imessage' AS source, m.service AS subsource, m.group_title AS context, "
-                "CASE WHEN m.is_from_me = 1 THEN 'me' ELSE COALESCE(h.address, '') END AS who, "
-                "m.message_at AS occurred_at, m.account AS account, m.message_id AS ref, "
-                "m.body_text AS text, m.score AS score",
-                "SELECT account, handle_id, is_from_me, service, group_title, message_at, message_id, body_text, "
-                "(body_text <@> to_bm25query(%1$L, 'apple_messages_body_bm25_idx'))::real AS score "
-                "FROM apple_messages WHERE is_deleted = 0 "
-                "ORDER BY body_text <@> to_bm25query(%1$L, 'apple_messages_body_bm25_idx') LIMIT %2$s",
-                "LEFT JOIN apple_message_handles h ON h.account = m.account AND h.handle_id = m.handle_id",
-            ),
-            branch(
-                "'apple_message_media'", "'filename'", "mime_type", "''", "created_at", "account",
-                "message_id || ':' || attachment_id", "apple_message_attachments", "filename",
-                "apple_message_attachments_filename_bm25_idx", where="filename != ''",
-            ),
-            # imessage attachment content: bm25 top-k on the shared enrichment
-            # text, then join the attachment row for filename/account/date. The
-            # inner join to apple_message_attachments restricts the shared
-            # file_attachment_enrichments table to iMessage-origin rows. Covers
-            # both vision-OCR'd images/PDFs and cleaned-up audio transcripts,
-            # since both write into the same shared table.
-            join_branch(
-                "apple_message_media",
-                "SELECT 'apple_message_media' AS source, 'content' AS subsource, a.filename AS context, "
-                "'' AS who, a.created_at AS occurred_at, a.account AS account, "
-                "a.message_id || ':' || a.attachment_id AS ref, "
-                "m.text AS text, m.score AS score",
-                "SELECT content_sha256, text, "
-                "(text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx'))::real AS score "
-                "FROM file_attachment_enrichments "
-                "ORDER BY text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx') LIMIT %2$s",
-                "JOIN apple_message_attachments a USING (content_sha256)",
-            ),
-            # whatsapp body: bm25 top-k on the message body, then join chat + contact.
-            join_branch(
-                "whatsapp",
-                "SELECT 'whatsapp' AS source, 'body' AS subsource, COALESCE(NULLIF(c.name, ''), m.chat_id) AS context, "
-                "CASE WHEN m.is_from_me = 1 THEN 'me' ELSE COALESCE(NULLIF(ct.full_name, ''), "
-                "NULLIF(ct.push_name, ''), NULLIF(m.push_name, ''), m.sender_jid) END AS who, "
-                "m.message_at AS occurred_at, m.account AS account, m.chat_id || ':' || m.message_id AS ref, "
-                "m.body_text AS text, m.score AS score",
-                "SELECT account, chat_id, sender_jid, push_name, is_from_me, message_at, message_id, body_text, "
-                "(body_text <@> to_bm25query(%1$L, 'whatsapp_messages_body_bm25_idx'))::real AS score "
-                "FROM whatsapp_messages WHERE is_deleted = 0 "
-                "ORDER BY body_text <@> to_bm25query(%1$L, 'whatsapp_messages_body_bm25_idx') LIMIT %2$s",
-                "LEFT JOIN whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id "
-                "LEFT JOIN whatsapp_contacts ct ON ct.account = m.account AND ct.jid = m.sender_jid",
-            ),
-            branch(
-                "'whatsapp_chat'", "'name'", "chat_type", "''", "last_message_at", "account", "chat_id",
-                "whatsapp_chats", "name", "whatsapp_chats_name_bm25_idx", where="name != ''",
-            ),
-            branch(
-                "'whatsapp_media'", "'filename'", "mime_type", "''", "message_at", "account",
-                "chat_id || ':' || message_id", "whatsapp_media_items", "filename",
-                "whatsapp_media_items_filename_bm25_idx", where="filename != ''",
-            ),
-            # whatsapp media content: bm25 top-k on the shared enrichment text,
-            # then join the media row for filename/account/date. The inner join to
-            # whatsapp_media_items restricts the shared enrichment table to
-            # whatsapp-origin rows.
-            join_branch(
-                "whatsapp_media",
-                "SELECT 'whatsapp_media' AS source, 'content' AS subsource, a.filename AS context, "
-                "'' AS who, a.message_at AS occurred_at, a.account AS account, "
-                "a.chat_id || ':' || a.message_id AS ref, "
-                "m.text AS text, m.score AS score",
-                "SELECT content_sha256, text, "
-                "(text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx'))::real AS score "
-                "FROM file_attachment_enrichments "
-                "ORDER BY text <@> to_bm25query(%1$L, 'file_attachment_enrichments_text_bm25_idx') LIMIT %2$s",
-                "JOIN whatsapp_media_items a USING (content_sha256)",
-            ),
-            branch(
-                "'calendar'", "'summary'", "''", "organizer_email", "start_at", "account",
-                "calendar_id || ':' || event_id", "calendar_events", "summary",
-                "calendar_events_summary_bm25_idx", where="is_deleted = 0",
-            ),
-            branch(
-                "'calendar'", "'description'", "summary", "organizer_email", "start_at", "account",
-                "calendar_id || ':' || event_id", "calendar_events", "description",
-                "calendar_events_description_bm25_idx", where="is_deleted = 0 AND description != ''",
-            ),
-            branch(
-                "'calendar'", "'location'", "summary", "organizer_email", "start_at", "account",
-                "calendar_id || ':' || event_id", "calendar_events", "location",
-                "calendar_events_location_bm25_idx", where="is_deleted = 0 AND location != ''",
-            ),
-            branch(
-                "'calendar'", "'attendees'", "summary", "organizer_email", "start_at", "account",
-                "calendar_id || ':' || event_id", "calendar_events", "attendees_json",
-                "calendar_events_attendees_bm25_idx",
-                where="is_deleted = 0 AND attendees_json NOT IN ('', '[]')",
-            ),
-            branch(
-                "'contact'", "'name'", "source_kind", "primary_email", "source_updated_at", "account",
-                "card_id", "contact_cards", "display_name", "contact_cards_name_bm25_idx",
-                where="is_deleted = 0",
-            ),
-            branch(
-                "'contact'", "'organization'", "display_name", "primary_email", "source_updated_at",
-                "account", "card_id", "contact_cards", "organization",
-                "contact_cards_organization_bm25_idx", where="is_deleted = 0 AND organization != ''",
-            ),
-            branch(
-                "'contact'", "'job_title'", "display_name", "primary_email", "source_updated_at",
-                "account", "card_id", "contact_cards", "job_title", "contact_cards_job_title_bm25_idx",
-                where="is_deleted = 0 AND job_title != ''",
-            ),
-            branch(
-                "'contact'", "'notes'", "display_name", "primary_email", "source_updated_at",
-                "account", "card_id", "contact_cards", "notes", "contact_cards_notes_bm25_idx",
-                where="is_deleted = 0 AND notes != ''",
-            ),
-            # NOTE: agent_run_events (the warehouse's own internal
-            # enrichment-agent operational logs) is deliberately NOT searched
-            # here. Its `text` column is raw JSON / stderr for every event type
-            # (item.completed, turn.started, error, ...), never human-readable
-            # content, so it only injects raw-JSON noise that crowds out real
-            # cross-source matches. The agent's actual output is already
-            # searchable via the enrichment tables (voice-memo summaries, file
-            # attachments) and the user-facing agent_session source below. The
-            # agent_run_events_text_bm25_idx index is kept for direct queries.
-            branch(
-                "'agent_session'", "source", "role", "account", "occurred_at", "account",
-                "source || ':' || session_id || ':' || event_uuid", "agent_session_events", "text",
-                "agent_session_events_text_bm25_idx", where="text != '' AND role IN ('user', 'assistant')",
-            ),
-            branch(
-                "'agent_session'", "'title'", "source", "account", "occurred_at", "account",
-                "source || ':' || session_id || ':' || event_uuid || ':title'", "agent_session_events",
-                "session_title", "agent_session_events_title_bm25_idx", where="session_title != ''",
-            ),
-            branch(
-                "'mutation'", "status", "operation", "requested_by", "created_at", "account", "id",
-                "upstream_mutations", "title", "upstream_mutations_title_bm25_idx",
-            ),
-            branch(
-                "'mutation_request'", "status", "''", "requested_by", "created_at", "''", "id",
-                "upstream_mutation_requests", "title", "upstream_mutation_requests_title_bm25_idx",
-            ),
-            branch(
-                "'mutation_request'", "status", "title", "requested_by", "created_at", "''",
-                "id || ':reason'", "upstream_mutation_requests", "reason",
-                "upstream_mutation_requests_reason_bm25_idx", where="reason != ''",
-            ),
-            branch(
-                "'google_drive'", "'filename'", "folder_path", "last_modifying_user", "modified_time",
-                "account", "account || ':' || file_id", "google_drive_files", "name",
-                "google_drive_files_name_bm25_idx", where="trashed = 0 AND is_excluded = 0",
-            ),
-            # google_drive content: bm25 top-k on the doc text, then join the
-            # file row for folder/user/modified. These docs are huge (avg ~40 kB,
-            # max ~5 MB), so the SELECT-list score recompute is the most expensive
-            # branch; the per-broad-search top-k cap (per_branch_limit) keeps it
-            # from re-tokenizing 50 multi-kB docs on every broad query.
-            join_branch(
-                "google_drive",
-                "SELECT 'google_drive' AS source, 'content' AS subsource, f.folder_path AS context, "
-                "f.last_modifying_user AS who, f.modified_time AS occurred_at, f.account AS account, "
-                "f.account || ':' || f.file_id AS ref, m.text AS text, m.score AS score",
-                "SELECT account, file_id, text, "
-                "(text <@> to_bm25query(%1$L, 'google_drive_file_texts_text_bm25_idx'))::real AS score "
-                "FROM google_drive_file_texts "
-                "WHERE text_extraction_status = 'ok' AND text != '' "
-                "ORDER BY text <@> to_bm25query(%1$L, 'google_drive_file_texts_text_bm25_idx') LIMIT %2$s",
-                "JOIN google_drive_files f USING (account, file_id)",
-                where="f.trashed = 0 AND f.is_excluded = 0",
-            ),
+            branch("agent_session", "t.adapter = 'agent_session'", "t.source"),
+            branch("calendar", "t.adapter = 'calendar_event'"),
+            branch("contact", "t.adapter = 'contact_update'"),
+            branch("gmail", "t.adapter = 'gmail_email'"),
+            branch("google_drive", "t.adapter = 'drive_file'"),
+            branch("imessage", "t.adapter = 'apple_message'"),
+            branch("mutation", "t.adapter = 'mutation'", "COALESCE(t.metadata->>'status', t.kind)"),
+            branch("mutation_request", "t.adapter = 'mutation_request'", "COALESCE(t.metadata->>'status', t.kind)"),
+            branch("note", "t.adapter = 'apple_note_revision'"),
+            branch("slack", "t.adapter = 'slack_message'"),
+            branch("slack_file", "t.adapter = 'slack_file'"),
+            branch("transcript", "t.adapter = 'voice_memo'"),
+            branch("warehouse", "t.adapter = 'enrichment_run'"),
+            branch("whatsapp", "t.adapter = 'whatsapp_message'"),
         ]
 
-        # Run each branch as its own statement (dollar-quoted in a plpgsql array)
-        # so a single missing or unusable bm25 index drops only that one source
-        # instead of failing the entire function. Without this, one bad branch
-        # ("index ... does not exist" — a not-yet-built index right after a
-        # deploy, a failed/half-built index, or a future source whose index never
-        # built) makes the whole cross-source search path 100% unusable.
-        #
-        # Results accumulate in a plpgsql array (NOT a temp table): the function
-        # must run on the read-only query surface (app/internal/query enforces
-        # read-only by statement parsing today, but the function must stay correct
-        # under a genuine read-only transaction / read replica too), so it does no
-        # DDL or DML at call time — only EXECUTE ... SELECT and array building.
-        # Each branch's rows are array_agg'd into the search_text_hit row type;
-        # we then unnest, filter, rank, and limit across every source that
-        # succeeded.
-        #
-        # The row type is created ONLY if absent (stable OID), never dropped on a
-        # routine ensure. ensure_* runs constantly, and dropping + recreating the
-        # type each time churns its OID — the already-compiled function (which
-        # binds search_text_hit by OID) and any cached plan then fail mid-call
-        # with "cache lookup failed for type <stale oid>". The function is
-        # CREATE OR REPLACE'd (stable OID, same return type) over that fixed type.
-        # Changing search_text_hit's columns therefore needs a manual
-        # DROP TYPE ... CASCADE first (rare; the column set is stable).
+        # Run each source branch independently so a missing/unusable BM25 index
+        # (for example during a deploy before the timeline index finishes) drops
+        # search results rather than making the read-only query surface error.
         branch_sources_array = ", ".join(f"'{source}'" for source, _ in branches)
         branch_sql_array = ",\n                        ".join(f"$b${sql}$b$" for _, sql in branches)
-        # The canonical, de-duplicated set of labels accepted by search_text()'s
-        # `sources` argument, derived from the SAME `branches` list so the two can
-        # never drift. search_text_sources() (defined below) exposes this set so a
-        # caller can discover the exact tokens to pass — the labels are terse
-        # (`note`, `transcript`, `agent_session`, `mutation`/`mutation_request`, ...)
-        # and do not match the prose names in the tool help, and an unknown label
-        # is silently ignored (returns nothing), so guessing fails quietly.
         distinct_sources = sorted({source for source, _ in branches})
         search_text_sources_values = ", ".join(f"('{source}')" for source in distinct_sources)
         search_schema_name = self.physical_schema_name("search") if hasattr(self, "physical_schema_name") else "search"
@@ -6248,17 +5688,6 @@ class PostgresWarehouse:
             AS $fn$
             DECLARE
                 per_source integer := greatest(coalesce(max_results, 50), 1);
-                -- Top-k each branch scans/scores. A broad (unscoped) search does
-                -- NOT need max_results rows from every branch: the merge keeps
-                -- only each source's top-SEARCH_TEXT_SOURCE_FLOOR plus a global
-                -- score fill, so a handful per branch already covers any
-                -- max_results-row output. Capping the per-branch top-k for broad
-                -- searches bounds the SELECT-list bm25 score recompute (the cost
-                -- is rows x tokenize(text), and the huge Google-Drive/attachment
-                -- docs make that the dominant latency) WITHOUT dropping any
-                -- result the merge would have shown. A scoped search
-                -- (sources => ARRAY[...]) keeps the full max_results so a
-                -- single-source "find every mention in X" still goes deep.
                 per_branch_limit integer := CASE
                     WHEN sources IS NULL THEN least(per_source, """
             + str(SEARCH_TEXT_BROAD_PER_BRANCH_CAP)
@@ -6281,15 +5710,6 @@ class PostgresWarehouse:
                 hits search_text_hit[] := '{}';
                 branch_hits search_text_hit[];
             BEGIN
-                -- Fail LOUD on an unknown source token instead of silently
-                -- returning nothing. The accepted tokens are terse
-                -- (note/transcript/agent_session/imessage/...) and do not match
-                -- the prose source names, so callers reliably guess wrong
-                -- ('apple_messages', 'file_attachment', 'gmail' for attachments
-                -- vs the real 'imessage'/'gmail_attachment'); a silent empty
-                -- result then reads as "nothing matched" and produces confident
-                -- wrong answers. Erroring with a pointer to search_text_sources()
-                -- turns that trap into a one-step self-correction.
                 IF sources IS NOT NULL THEN
                     FOREACH branch_source IN ARRAY sources LOOP
                         IF NOT branch_source = ANY (branch_sources) THEN
@@ -6305,12 +5725,6 @@ class PostgresWarehouse:
                     END IF;
                     branch := branch_sqls[branch_idx];
                     BEGIN
-                        -- Cap each branch's contributed text to a bounded preview
-                        -- (SEARCH_TEXT_PREVIEW_CHARS). bm25 already ranked the branch
-                        -- on the FULL column (the ORDER BY inside `branch`), so the
-                        -- preview never changes relevance; it only stops a branch that
-                        -- reads multi-megabyte text (Google Drive docs, big email /
-                        -- attachment bodies) from array_agg'ing tens of MB into `hits`.
                         EXECUTE format(
                             'SELECT array_agg(ROW(x.source, x.subsource, x.context, '
                             'x.who, x.occurred_at, x.account, x.ref, left(x.text, """
@@ -6322,20 +5736,9 @@ class PostgresWarehouse:
                             hits := hits || branch_hits;
                         END IF;
                     EXCEPTION WHEN OTHERS THEN
-                        -- Missing/unusable bm25 index (or any branch error): skip
-                        -- this source; the rest of the search still returns.
                         NULL;
                     END;
                 END LOOP;
-                -- Fair cross-source merge. BM25 scores are per-corpus and NOT
-                -- comparable across sources, so a flat global ORDER BY score lets
-                -- a high-volume source bury a low-volume one (a single matching
-                -- contact card or Drive doc lost to dozens of gmail/slack hits and
-                -- got cut). Rank each source's hits internally, GUARANTEE every
-                -- source's top-SEARCH_TEXT_SOURCE_FLOOR hits ahead of the global
-                -- cut, then fill the rest by score. src_rank > floor sorts FALSE
-                -- (floor hits) before TRUE (everything else); score orders within
-                -- each tier.
                 RETURN QUERY
                     WITH ranked AS (
                         SELECT h.source, h.subsource, h.context, h.who, h.occurred_at,
@@ -6346,6 +5749,7 @@ class PostgresWarehouse:
                         FROM unnest(hits) AS h
                         WHERE (sources IS NULL OR h.source = ANY (sources))
                           AND (since IS NULL OR h.occurred_at >= since)
+                          AND h.score < 0
                     )
                     SELECT r.source, r.subsource, r.context, r.who, r.occurred_at,
                            r.account, r.ref, r.text, r.score

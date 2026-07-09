@@ -139,6 +139,7 @@ def test_timeline_indexes_are_registered_for_timeline_tables():
         "timeline_events_source_time_idx",
         "timeline_events_kind_time_idx",
         "timeline_events_seq_idx",
+        "timeline_events_search_text_bm25_idx",
     } <= names
 
 
@@ -512,11 +513,14 @@ def test_backfill_normalizes_every_source(warehouse):
     assert gmail["source_table"] == "gmail_messages"
     assert gmail["source_pk"] == {"account": "z@x.test", "message_id": "m1"}
     assert gmail["metadata"]["thread_id"] == "th1"
+    assert "Hello world" in gmail["search_text"]
+    assert "hi there" in gmail["search_text"]
 
     slack = next(r for r in rows if r["adapter"] == "slack_message")
     assert slack["actor"] == "alice"
     assert slack["context"] == "#general"
     assert slack["snippet"] == "slack says hi"
+    assert "slack says hi" in slack["search_text"]
 
     imsg = next(
         r for r in rows
@@ -531,6 +535,8 @@ def test_backfill_normalizes_every_source(warehouse):
     assert session["context"] == "/repo"
     assert session["metadata"]["events"] == 2
     assert session["end_ts"] > session["event_ts"]
+    assert "fix the bug" in session["search_text"]
+    assert "done" in session["search_text"]
 
     memo = next(r for r in rows if r["adapter"] == "voice_memo")
     assert memo["title"] == "Standup notes"

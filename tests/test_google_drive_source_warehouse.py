@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from tests.conftest import make_test_schema
 
 from personal_data_warehouse.postgres import PostgresWarehouse
+from personal_data_warehouse.timeline import TimelineSyncEngine
 from personal_data_warehouse.schema import (
     GOOGLE_DRIVE_FILE_COLUMNS,
     GOOGLE_DRIVE_FILE_TEXT_COLUMNS,
@@ -48,6 +49,19 @@ def _ensure_all_table_groups(wh: PostgresWarehouse) -> None:
     wh.ensure_slack_tables()
     wh.ensure_upstream_mutation_tables()
     wh.ensure_google_drive_source_tables()
+    wh.ensure_timeline_tables()
+
+
+def _sync_timeline(warehouse: PostgresWarehouse) -> None:
+    engine = TimelineSyncEngine(
+        source_url=_postgres_url(),
+        source_schema=warehouse._schema,
+        dest_schema=warehouse._schema,
+    )
+    try:
+        engine.run()
+    finally:
+        engine.close()
 
 
 def _require_pg_textsearch(warehouse: PostgresWarehouse) -> None:
@@ -127,18 +141,19 @@ def test_files_and_text_surface_in_search_text(warehouse):
     _ensure_all_table_groups(warehouse)
     warehouse.insert_google_drive_files([_file_row()])
     warehouse.insert_google_drive_file_texts([_text_row()])
+    _sync_timeline(warehouse)
 
     name_hits = warehouse._query(
         "SELECT context, who, ref FROM search_text('quarterly', 20, ARRAY['google_drive']) "
-        "WHERE score < 0 AND subsource = 'filename'"
+        "WHERE score < 0 AND subsource = 'file_change'"
     )
-    assert name_hits == [("/My Drive/Docs", "Zach", "zach@hackclub.com:f1")]
+    assert name_hits == [("/My Drive/Docs", "Zach", "drive_file:zach@hackclub.com|f1")]
 
     content_hits = warehouse._query(
         "SELECT ref FROM search_text('pineapple', 20, ARRAY['google_drive']) "
-        "WHERE score < 0 AND subsource = 'content'"
+        "WHERE score < 0 AND subsource = 'file_change'"
     )
-    assert content_hits == [("zach@hackclub.com:f1",)]
+    assert content_hits == [("drive_file:zach@hackclub.com|f1",)]
 
 
 def test_excluded_and_trashed_files_hidden_from_search(warehouse):
@@ -156,6 +171,7 @@ def test_excluded_and_trashed_files_hidden_from_search(warehouse):
             _text_row(file_id="tr1", text="hidden trashed text"),
         ]
     )
+    _sync_timeline(warehouse)
     hits = warehouse._query(
         "SELECT text FROM search_text('hidden', 20, ARRAY['google_drive']) WHERE score < 0"
     )

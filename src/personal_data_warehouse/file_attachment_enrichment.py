@@ -4,8 +4,9 @@ A single source-agnostic pipeline scans a source's attachment table for image
 (and scanned-PDF) blobs that have no useful searchable text yet, runs each
 through the sandboxed agent container (codex/claude CLI), and upserts the
 structured result into the shared ``file_attachment_enrichments`` table under
-its own ``ai_provider``/``ai_model``/``ai_prompt_version`` identity. The BM25
-indexes on that table feed ``search_text()`` automatically.
+its own ``ai_provider``/``ai_model``/``ai_prompt_version`` identity. Timeline
+adapters fold those enrichment rows into the parent event's search document,
+which is what feeds ``search_text()``.
 
 Each source (Gmail attachments, WhatsApp media, …) is described by a
 :class:`FileEnrichmentSource` that names its candidate table and the columns the
@@ -813,8 +814,8 @@ def validate_attachment_vision_result(result: Mapping[str, Any]) -> list[str]:
 def attachment_enrichment_text(result: Mapping[str, Any]) -> str:
     """Compose the searchable text block stored in file_attachment_enrichments.
 
-    Mirrors the layout the previous pipeline produced so the BM25/trigram search
-    behavior stays consistent across old and new rows.
+    Mirrors the previous enrichment layout so timeline search documents stay
+    consistent across old and new rows.
     """
     if result.get("is_useful") is not True:
         return ""

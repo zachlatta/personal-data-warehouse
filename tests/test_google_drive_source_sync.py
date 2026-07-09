@@ -136,6 +136,7 @@ def _ensure_all_table_groups(wh: PostgresWarehouse) -> None:
     wh.ensure_slack_tables()
     wh.ensure_upstream_mutation_tables()
     wh.ensure_google_drive_source_tables()
+    wh.ensure_timeline_tables()
 
 
 def _now():

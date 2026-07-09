@@ -572,8 +572,8 @@ table — the renamed, source-agnostic successor to `gmail_attachment_enrichment
 and WhatsApp write to (keyed by `content_sha256` + `ai_provider`/`ai_model`/`ai_prompt_version`,
 each source under its own `task_type`/`prompt_version`). The runner, image prep, agent prompt,
 and candidate query all live in `file_attachment_enrichment.py`; each source is a
-`FileEnrichmentSource` descriptor. That enrichment text is surfaced by `search_text()` under
-`source = 'whatsapp_media'`, `subsource = 'content'`.
+`FileEnrichmentSource` descriptor. That enrichment text is folded into the parent WhatsApp
+message's timeline search document and surfaced by `search_text()` under `source = 'whatsapp'`.
 
 ## ChatGPT (consumer) - server-side backend poll
 

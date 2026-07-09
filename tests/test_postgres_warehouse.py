@@ -30,6 +30,7 @@ from personal_data_warehouse.schema import (
     VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
 )
 from personal_data_warehouse.relations import query_relation
+from personal_data_warehouse.timeline import TimelineSyncEngine
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
     ATTACHMENT_BACKFILL_STATE_COLUMNS,
@@ -1300,50 +1301,19 @@ def _pg_textsearch_usable(warehouse: PostgresWarehouse) -> bool:
     return bool(rows)
 
 
-def test_postgres_slack_tables_create_bm25_index_and_rank_matches(warehouse: PostgresWarehouse) -> None:
+def test_postgres_timeline_tables_create_only_timeline_bm25_index(warehouse: PostgresWarehouse) -> None:
     if not _pg_textsearch_usable(warehouse):
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
 
-    warehouse.ensure_slack_tables()
+    _ensure_all_table_groups(warehouse)
 
-    rel = _physical_relation(warehouse, "slack_messages")
-    rows = warehouse._query(
-        "SELECT indexname FROM pg_indexes WHERE schemaname = %s "
-        "AND tablename = %s AND indexname = 'slack_messages_text_bm25_idx'",
-        (rel.schema, rel.name),
-    )
-    assert rows, "bm25 index should be created when pg_textsearch is usable"
+    timeline_indexes = _index_names(warehouse, "timeline_events")
+    assert "timeline_events_search_text_bm25_idx" in timeline_indexes
 
-    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
-    warehouse.insert_slack_messages(
-        [
-            _slack_message_row(
-                conversation_id="C1",
-                message_ts="100.1",
-                message_datetime=message_datetime,
-                text="deploying the staging cluster today",
-            ),
-            _slack_message_row(
-                conversation_id="C1",
-                message_ts="100.2",
-                message_datetime=message_datetime,
-                text="lunch plans for friday",
-            ),
-        ]
-    )
-
-    # pg_textsearch resolves its helper functions and the implicit
-    # col <@> 'query' index lookup through the search_path, and the implicit
-    # form only finds indexes in the default (public) schema. Production runs
-    # with schema=public so the bare implicit syntax works there; in this
-    # schema-isolated test, put public on the search_path and name the index
-    # explicitly via to_bm25query.
-    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
-    rows = warehouse._query(
-        "SELECT text FROM slack_messages "
-        "ORDER BY text <@> to_bm25query('staging cluster deploy', 'slack_messages_text_bm25_idx') LIMIT 1"
-    )
-    assert rows == [("deploying the staging cluster today",)]
+    # The legacy source-table BM25 fan-out indexes should not be recreated; the
+    # flow is search.search_text() on timeline -> detailed SQL on source tables.
+    assert "slack_messages_text_bm25_idx" not in _index_names(warehouse, "slack_messages")
+    assert "gmail_messages_subject_bm25_idx" not in _index_names(warehouse, "gmail_messages")
 
 
 def test_postgres_ensure_indexes_tolerates_missing_pg_textsearch(warehouse: PostgresWarehouse, monkeypatch) -> None:
@@ -1356,13 +1326,13 @@ def test_postgres_ensure_indexes_tolerates_missing_pg_textsearch(warehouse: Post
 
     monkeypatch.setattr(warehouse, "_command", failing_command)
 
-    # Must not raise: hosts without the extension skip bm25 indexes but keep
-    # creating everything else.
-    warehouse.ensure_slack_tables()
+    # Must not raise: hosts without the extension skip the timeline BM25 index
+    # but keep creating everything else.
+    warehouse.ensure_timeline_tables()
 
-    index_names = _index_names(warehouse, "slack_messages")
-    assert "slack_messages_text_bm25_idx" not in index_names
-    assert "slack_messages_text_trgm_idx" in index_names
+    index_names = _index_names(warehouse, "timeline_events")
+    assert "timeline_events_search_text_bm25_idx" not in index_names
+    assert "timeline_events_time_idx" in index_names
 
 
 def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
@@ -1377,6 +1347,19 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_slack_tables()
     warehouse.ensure_upstream_mutation_tables()
     warehouse.ensure_google_drive_source_tables()
+    warehouse.ensure_timeline_tables()
+
+
+def _sync_timeline(warehouse: PostgresWarehouse) -> None:
+    engine = TimelineSyncEngine(
+        source_url=_postgres_url(),
+        source_schema=warehouse._schema,
+        dest_schema=warehouse._schema,
+    )
+    try:
+        engine.run()
+    finally:
+        engine.close()
 
 
 def _search_text_index_names() -> set[str]:
@@ -1430,9 +1413,9 @@ def _search_text_sources_helper_labels() -> list[str]:
 def test_search_text_sources_helper_matches_branch_labels() -> None:
     # search_text_sources() exists so a caller can discover the exact (terse)
     # tokens search_text()'s `sources` arg accepts. The labels are terse and do
-    # not match the tool-help prose names (apple notes => 'note', meeting
-    # transcripts => 'transcript', ...), and an unknown token is silently ignored
-    # (returns nothing) rather than erroring, so guessing fails quietly. The
+    # not always match source-table names (apple messages => 'imessage', voice
+    # memos => 'transcript', ...), and an unknown token must raise rather than
+    # silently returning nothing. The
     # helper must therefore enumerate exactly the distinct set of branch labels
     # search_text() filters on, sorted, with no drift.
     branch_labels = _search_text_branch_source_labels()
@@ -1451,6 +1434,17 @@ def test_search_text_sources_filter_skips_unrequested_branches() -> None:
     assert "branch_sqls text[]" in sql
     assert "IF sources IS NOT NULL AND NOT branch_source = ANY (sources) THEN" in sql
     assert "CONTINUE;" in sql
+
+
+def test_only_timeline_bm25_index_is_registered() -> None:
+    import personal_data_warehouse.postgres as postgres_module
+
+    bm25_indexes = {
+        ix.name
+        for ix in postgres_module.POSTGRES_INDEXES
+        if getattr(ix, "requires_pg_textsearch", False)
+    }
+    assert bm25_indexes == {"timeline_events_search_text_bm25_idx"}
 
 
 def test_search_text_only_references_defined_bm25_indexes() -> None:
@@ -1496,9 +1490,8 @@ def test_search_text_caps_per_branch_topk_for_broad_search() -> None:
 
 
 def test_search_text_merge_guarantees_per_source_floor() -> None:
-    # BM25 scores are not comparable across corpora, so the final merge must not
-    # be a flat global `ORDER BY score LIMIT` — that buries a low-volume source
-    # (one matching contact card / Drive doc) under a high-volume one (dozens of
+    # A flat global `ORDER BY score LIMIT` can bury a low-volume source (one
+    # matching contact card / Drive doc) under a high-volume one (dozens of
     # gmail/slack hits). The merge must rank within each source and guarantee
     # every source's top-N hits ahead of the global cut.
     sql = _search_text_function_sql()
@@ -1561,11 +1554,29 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     )
 
     # A downloaded WhatsApp media blob whose agent enrichment text mentions the
-    # query term must surface through the whatsapp_media content branch, which
-    # bm25-ranks the shared file_attachment_enrichments table then joins the media
-    # row. This covers the new branch end to end (function compiles + returns).
-    from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS, WHATSAPP_MEDIA_ITEM_COLUMNS
+    # query term must surface through the parent timeline message's search_text.
+    from personal_data_warehouse.schema import (
+        APPLE_MESSAGE_ATTACHMENT_COLUMNS,
+        APPLE_MESSAGE_COLUMNS,
+        ATTACHMENT_ENRICHMENT_COLUMNS,
+        WHATSAPP_MEDIA_ITEM_COLUMNS,
+        WHATSAPP_MESSAGE_COLUMNS,
+    )
 
+    warehouse.insert_whatsapp_messages(
+        [
+            _default_row(
+                WHATSAPP_MESSAGE_COLUMNS,
+                account="zach@example.com",
+                chat_id="chat-1",
+                message_id="wamid-1",
+                body_text="",
+                message_at=message_datetime,
+                ingested_at=message_datetime,
+                sync_version=1,
+            )
+        ]
+    )
     warehouse.insert_whatsapp_media_items(
         [
             _default_row(
@@ -1602,11 +1613,20 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
 
     # An iMessage attachment whose agent enrichment text mentions the query term
     # (either vision-OCR'd or a cleaned-up audio transcript - both land in the
-    # same shared table) must surface through the apple_message_media content
-    # branch, which bm25-ranks file_attachment_enrichments then joins the
-    # attachment row.
-    from personal_data_warehouse.schema import APPLE_MESSAGE_ATTACHMENT_COLUMNS
-
+    # same shared table) must surface through the parent timeline message.
+    warehouse.insert_apple_messages(
+        [
+            _default_row(
+                APPLE_MESSAGE_COLUMNS,
+                account="user@example.test",
+                message_id="imsg-1",
+                body_text="",
+                message_at=message_datetime,
+                ingested_at=message_datetime,
+                sync_version=1,
+            )
+        ]
+    )
     warehouse.insert_apple_message_attachments(
         [
             _default_row(
@@ -1641,6 +1661,8 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
         ]
     )
 
+    _sync_timeline(warehouse)
+
     # BM25 non-matches score 0; matches score negative. Isolate matches with score < 0
     # so the assertions hold regardless of how few total rows the fixture has.
     matched = warehouse._query(
@@ -1648,13 +1670,13 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     )
     matched_sources = {(row[0], row[1]) for row in matched}
     matched_refs = {row[2] for row in matched}
-    assert ("slack", "private_channel") in matched_sources
-    assert ("gmail", "subject") in matched_sources
-    assert ("whatsapp_media", "content") in matched_sources
-    assert ("apple_message_media", "content") in matched_sources
-    assert any("100.1" in ref for ref in matched_refs)  # the zanzibar slack message
-    assert any("chat-1:wamid-1" == ref for ref in matched_refs)  # the whatsapp media content row
-    assert any("imsg-1:att-1" == ref for ref in matched_refs)  # the iMessage attachment content row
+    assert ("slack", "message") in matched_sources
+    assert ("gmail", "email") in matched_sources
+    assert ("whatsapp", "message") in matched_sources
+    assert ("imessage", "message") in matched_sources
+    assert any(ref.endswith("100.1") for ref in matched_refs)  # the zanzibar slack message
+    assert any(ref == "whatsapp_message:zach@example.com|chat-1|wamid-1" for ref in matched_refs)
+    assert any(ref == "apple_message:user@example.test|imsg-1" for ref in matched_refs)
     assert all("100.2" not in ref for ref in matched_refs)  # the unrelated lunch message
 
     # sources filter restricts the fan-out.
@@ -1680,20 +1702,19 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     finally:
         warehouse._command("SET default_transaction_read_only = off")
     read_only_sources = {(row[0], row[1]) for row in read_only}
-    assert ("slack", "private_channel") in read_only_sources
-    assert ("gmail", "subject") in read_only_sources
+    assert ("slack", "message") in read_only_sources
+    assert ("gmail", "email") in read_only_sources
 
-    # Resilience: a missing/unusable bm25 index must drop only its own source,
-    # not break the whole function. Dropping unrelated bm25 indexes must leave
-    # the slack + gmail matches intact and must not raise.
-    warehouse._command("DROP INDEX apple_voice_memos_title_bm25_idx")
-    warehouse._command("DROP INDEX contact_cards_name_bm25_idx")
+    # Legacy source-table BM25 indexes are no longer part of the general search
+    # path. Dropping any leftovers must leave timeline search intact.
+    warehouse._command("DROP INDEX IF EXISTS apple_voice_memos_title_bm25_idx")
+    warehouse._command("DROP INDEX IF EXISTS contact_cards_name_bm25_idx")
     survived = warehouse._query(
         "SELECT source, subsource FROM search_text('zanzibar rollout', 20) WHERE score < 0"
     )
     survived_sources = {(row[0], row[1]) for row in survived}
-    assert ("slack", "private_channel") in survived_sources
-    assert ("gmail", "subject") in survived_sources
+    assert ("slack", "message") in survived_sources
+    assert ("gmail", "email") in survived_sources
 
 
 def test_search_text_sources_lists_accepted_filter_tokens(warehouse: PostgresWarehouse) -> None:
@@ -1733,9 +1754,9 @@ def test_search_text_sources_lists_accepted_filter_tokens(warehouse: PostgresWar
 def test_search_text_rejects_unknown_source_tokens(warehouse: PostgresWarehouse) -> None:
     # An unknown `sources` token must RAISE (pointing the caller at
     # search_text_sources()), NOT silently return nothing. The accepted tokens
-    # are terse and differ from the prose source names, so callers reliably guess
+    # are terse and differ from some table/source names, so callers reliably guess
     # wrong ('apple_messages'/'file_attachment'/'whatsapp_media' instead of the
-    # real 'imessage'/'gmail_attachment'/'whatsapp'). A silent empty result reads
+    # real timeline search tokens like 'imessage'/'gmail'/'whatsapp'). A silent empty result reads
     # as "nothing matched" and yields confident wrong answers; the failure must
     # be loud and self-correcting.
     if not _pg_textsearch_usable(warehouse):
@@ -1800,6 +1821,7 @@ def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWareh
             )
         ]
     )
+    _sync_timeline(warehouse)
 
     matched = warehouse._query(
         "SELECT DISTINCT source FROM search_text('zanzibar rollout', 50) WHERE score < 0"
@@ -1852,6 +1874,7 @@ def test_search_text_caps_hit_text_to_preview(warehouse: PostgresWarehouse) -> N
             ),
         ]
     )
+    _sync_timeline(warehouse)
 
     rows = warehouse._query(
         "SELECT ref, text FROM search_text('zanzibar', 50, ARRAY['slack']) WHERE score < 0"
@@ -1863,16 +1886,17 @@ def test_search_text_caps_hit_text_to_preview(warehouse: PostgresWarehouse) -> N
     # The oversized hit is truncated to exactly the preview cap, and the preview
     # is a genuine prefix of the stored text (no corruption, no padding).
     assert len(by_ref[long_ref]) == SEARCH_TEXT_PREVIEW_CHARS
-    assert long_body.startswith(by_ref[long_ref])
-    # A normal-length hit is returned untouched — the cap never shortens it.
-    assert by_ref[short_ref] == short_body
+    assert long_body[:100] in by_ref[long_ref]
+    # A normal-length hit is returned with timeline context and is not truncated.
+    assert short_body in by_ref[short_ref]
+    assert len(by_ref[short_ref]) < SEARCH_TEXT_PREVIEW_CHARS
 
 
 def test_search_text_low_volume_source_survives_high_volume_source(warehouse: PostgresWarehouse) -> None:
     # A low-volume source (one matching contact card) must surface in a bare
     # cross-source search even when a high-volume source (many slack hits) would
-    # dominate a flat global score LIMIT. BM25 scores are not comparable across
-    # corpora, so the merge guarantees each source's top hits ahead of the cut;
+    # dominate a flat global score LIMIT. The merge guarantees each source's top
+    # hits ahead of the cut;
     # without that, the single contact card ranked far down the global list and a
     # "who is X" question wrongly returned nothing from contacts.
     if not _pg_textsearch_usable(warehouse):
@@ -1902,6 +1926,7 @@ def test_search_text_low_volume_source_survives_high_volume_source(warehouse: Po
     warehouse.insert_contact_cards(
         [_contact_card_row(card_id="card-zan", display_name="Zanzibar Person", sync_version=1)]
     )
+    _sync_timeline(warehouse)
 
     # A small max_results makes the global race tight: the per-source floor must
     # still let the lone contact hit through.

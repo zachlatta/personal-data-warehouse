@@ -243,31 +243,25 @@ SQL starting points:
   `apple_voice_memos_transcript_segments`, `clean_calendar_with_transcripts`,
   `clean_transcripts_no_calendar_match`
 
-Searching text columns (the schema overview lists which columns carry which indexes):
+General search flow for pdw clients:
 
 - Cross-source search (the default): `SELECT * FROM search_text('offer letter', 50)`
-  fans out to the per-table BM25 indexes and returns
+  searches the unified timeline BM25 document and returns
   `(source, subsource, context, who, occurred_at, account, ref, text, score)` ranked across
-  **every** source — gmail, gmail attachments, slack messages/channels/files, apple notes,
-  imessage, whatsapp, meeting transcripts, calendar, contacts, agent runs/sessions, and
-  mutations (`score` lower / more negative = better). Optional args:
+  **every** timeline source (`score` lower / more negative = better). `ref` is now a
+  timeline ref (`<adapter>:<event_id>`); join to `timeline.events` and then use
+  `source_table`/`source_pk` for full source rows. Optional args:
   `search_text(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')`.
-  The `sources` tokens are terse and differ from the prose names (`note`, `transcript`,
-  `agent_session`, `imessage`, `gmail_attachment`, ...); an unknown token **raises** an error
-  listing the valid set, so call `SELECT * FROM search_text_sources()` to discover them rather
-  than guessing. Ranking is OR'd, stemmed whole-word BM25 with per-source (not globally
-  comparable) scores, so a noisy top-N never proves absence — for "find every mention of X"
-  (especially a person, who may appear by first name only or misspelled) raise `max_results`
-  and fall back to single-table trigram `%>` / `ILIKE` for name variants. Then drill into the
-  underlying table via `ref` for full rows. (`pg_textsearch`'s `<@>` operator cannot run through a view,
-  so there is no cross-source view to `ILIKE`; `search_text()` is the cross-source path and
-  reuses the per-table indexes directly — no extra storage.) New BM25-indexed text columns are
-  picked up by adding a branch to `_ensure_search_text_function` (`src/personal_data_warehouse/postgres.py`).
-- Relevance-ranked word search on a single table (BM25, `pg_textsearch`):
-  `SELECT ..., text <@> 'launch plans' AS score FROM slack_messages ORDER BY text <@> 'launch plans' LIMIT 20`.
-  Scores are negative (more negative = better). Always include the `ORDER BY col <@> ... LIMIT n`
-  pair — without a LIMIT the bm25 index is not used. No phrase queries or typo tolerance.
-- Fuzzy / typo-tolerant search (trigram): `WHERE text %> 'kubernets'
+  Call `SELECT * FROM search_text_sources()` to discover valid source tokens. Attachment/media
+  enrichments, Drive extracts, transcripts, and other detail text are folded into the parent
+  timeline event's `search_text` document. Ranking is OR'd, stemmed whole-word BM25, so a noisy
+  top-N never proves absence — for "find every mention of X" raise `max_results` and fall back to
+  single-table trigram `%>` / `ILIKE` for variants once you know the table. New cross-source text
+  is picked up by adding it to the relevant timeline adapter's search document.
+- Detailed follow-up: use the timeline hit's `source_table`/`source_pk` to query the canonical
+  source tables directly for complete rows, joins, attachments, thread context, etc. Do not use
+  source-table BM25 for general search; those legacy indexes were removed.
+- Fuzzy / typo-tolerant table search (trigram): once you know the table, `WHERE text %> 'kubernets'
   ORDER BY word_similarity('kubernets', text) DESC LIMIT 20` matches misspelled terms
   via the same `gin_trgm_ops` indexes that accelerate `ILIKE '%substring%'`.
 
