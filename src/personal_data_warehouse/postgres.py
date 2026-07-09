@@ -4041,7 +4041,7 @@ class PostgresWarehouse:
                 ON CONFLICT DO NOTHING
                 """
             )
-        self._raw_command(f"DROP TABLE {_identifier(self._schema)}.{_identifier(legacy_table)}")
+        self._raw_command(f"DROP TABLE IF EXISTS {_identifier(self._schema)}.{_identifier(legacy_table)}")
 
     def _common_table_columns(
         self,
