@@ -132,6 +132,12 @@ def test_discover_handles_missing_dirs(tmp_path: Path) -> None:
     )
 
 
+def test_launchd_uploader_default_limit_keeps_up_with_active_pi_sessions() -> None:
+    wrapper = (Path(__file__).parents[1] / "bin" / "agent-sessions-upload-launchd").read_text()
+    assert 'AGENT_SESSIONS_UPLOAD_LIMIT:-2000' in wrapper
+    assert 'AGENT_SESSIONS_UPLOAD_BATCH_SIZE:-2000' in wrapper
+
+
 # --- state ------------------------------------------------------------------
 
 

@@ -25,7 +25,10 @@ if ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
-  "$PDW" ingest agent-sessions --mode incremental --limit "${AGENT_SESSIONS_UPLOAD_LIMIT:-50}" --batch-size "${AGENT_SESSIONS_UPLOAD_BATCH_SIZE:-50}" >> "$LOG_FILE" 2>&1
+  # Active pi sessions can append hundreds of tool/message records between
+  # five-minute runs. Keep the run bounded without letting that normal volume
+  # build an ever-growing backlog.
+  "$PDW" ingest agent-sessions --mode incremental --limit "${AGENT_SESSIONS_UPLOAD_LIMIT:-2000}" --batch-size "${AGENT_SESSIONS_UPLOAD_BATCH_SIZE:-2000}" >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi
 
