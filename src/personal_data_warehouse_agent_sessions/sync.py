@@ -46,6 +46,7 @@ class AgentSessionsUploadRunner:
         claude_projects_dir: Path | str | None,
         codex_sessions_dir: Path | str | None,
         openclaw_sessions_dir: Path | str | None = None,
+        pi_sessions_dir: Path | str | None = None,
         batch_uploader: Callable[[bytes, datetime], StoredObject],
         logger,
         upload_state: AgentSessionsUploadState | None = None,
@@ -66,6 +67,7 @@ class AgentSessionsUploadRunner:
         self._claude_projects_dir = claude_projects_dir
         self._codex_sessions_dir = codex_sessions_dir
         self._openclaw_sessions_dir = openclaw_sessions_dir
+        self._pi_sessions_dir = pi_sessions_dir
         self._batch_uploader = batch_uploader
         self._logger = logger
         self._upload_state = upload_state
@@ -81,6 +83,7 @@ class AgentSessionsUploadRunner:
             claude_projects_dir=self._claude_projects_dir,
             codex_sessions_dir=self._codex_sessions_dir,
             openclaw_sessions_dir=self._openclaw_sessions_dir,
+            pi_sessions_dir=self._pi_sessions_dir,
         )
         self._logger.info("Discovered %s agent session transcript file(s)", len(files))
         # One buffer spanning all files so many small transcripts (OpenClaw can

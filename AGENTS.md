@@ -236,11 +236,11 @@ Apple Messages SQL starting points are `apple_messages`, `apple_message_chats`,
 
 ## Local Agent Sessions Upload Scheduler
 
-Captures AI agent CLI session transcripts (Claude Code + Codex + OpenClaw) so every device's
+Captures AI agent CLI session transcripts (Claude Code + Codex + OpenClaw + pi) so every device's
 sessions are queryable in the warehouse. The append-only transcripts are tailed and shipped,
 line by line, through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
 
-> The macOS LaunchAgent below runs on Zach's Macs (crobat, porygon) for Claude Code/Codex. The
+> The macOS LaunchAgent below runs on Zach's Macs (crobat, porygon) for Claude Code/Codex/pi. The
 > **openclaw VM** runs the same uploader for OpenClaw sessions via a systemd user timer — see
 > [OpenClaw Agent Sessions](#openclaw-agent-sessions-openclaw-vm) below.
 
@@ -273,10 +273,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-d
 launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.agent-sessions-upload
 ```
 
-The uploader reads `~/.claude/projects/**/*.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl`, and
-`~/.openclaw/agents/main/sessions/<sessionId>.jsonl` (override with
-`AGENT_SESSIONS_CLAUDE_PROJECTS_DIR` / `AGENT_SESSIONS_CODEX_SESSIONS_DIR` /
-`AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR`; set one to empty to disable that tool on a host). Each
+The uploader reads `~/.claude/projects/**/*.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl`,
+`~/.openclaw/agents/main/sessions/<sessionId>.jsonl`, and
+`~/.pi/agent/sessions/**/*.jsonl` (override with `AGENT_SESSIONS_CLAUDE_PROJECTS_DIR` /
+`AGENT_SESSIONS_CODEX_SESSIONS_DIR` / `AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR` /
+`AGENT_SESSIONS_PI_SESSIONS_DIR`; set one to empty to disable that tool on a host). Each
 tool's directory that doesn't exist on a given machine is simply skipped, so the same uploader
 binary works everywhere. The OpenClaw scan ignores the `<sessionId>.trajectory.jsonl` runtime
 trace and the `.json` sidecars next to each transcript. It tracks a byte offset per file,
@@ -347,7 +348,7 @@ The upload client (`ingest_client.py`, shared by every uploader) handles this tw
   wedging — so e.g. a lone 588 MiB memo is skipped while every other memo uploads.
 
 Agent-session SQL starting points are the source-owned raw event tables
-`claude_code.events`, `codex.events`, `openclaw.events`, `claude_desktop.events`, and
+`claude_code.events`, `codex.events`, `openclaw.events`, `pi.events`, `claude_desktop.events`, and
 `chatgpt.events` (one row per transcript/conversation line; `device` tags the machine where
 applicable). Cross-source querying uses `marts.ai_conversation_events`, and per-session roll-ups
 (counts, token sums, title, cwd/git, first prompt) use `marts.ai_conversation_sessions`. Free-text

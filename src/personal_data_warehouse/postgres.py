@@ -263,6 +263,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "claude_code_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
     "codex_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
     "openclaw_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
+    "pi_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
     "agent_runs": TableSpec(AGENT_RUN_COLUMNS, ("run_id",)),
     "agent_run_events": TableSpec(AGENT_RUN_EVENT_COLUMNS, ("run_id", "event_index")),
     "agent_run_tool_calls": TableSpec(AGENT_RUN_TOOL_CALL_COLUMNS, ("run_id", "event_index", "tool_name")),
@@ -825,6 +826,7 @@ POSTGRES_INSERT_PAGE_SIZES = {
     "claude_code_events": 500,
     "codex_events": 500,
     "openclaw_events": 500,
+    "pi_events": 500,
 }
 
 
@@ -1041,6 +1043,7 @@ _AI_CONVERSATION_EVENT_TABLES = (
     "claude_code_events",
     "codex_events",
     "openclaw_events",
+    "pi_events",
 )
 
 _AI_EVENT_TABLE_BY_SOURCE = {
@@ -1049,6 +1052,7 @@ _AI_EVENT_TABLE_BY_SOURCE = {
     "claude_code": "claude_code_events",
     "codex": "codex_events",
     "openclaw": "openclaw_events",
+    "pi": "pi_events",
 }
 
 

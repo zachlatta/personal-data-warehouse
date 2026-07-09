@@ -11,6 +11,7 @@ from personal_data_warehouse.agent_sessions_drive_ingest import (
     has_batch_payloads,
     iter_batch_payloads,
     openclaw_event_row,
+    pi_event_row,
     record_to_event_row,
 )
 from personal_data_warehouse.objectstore import ObjectListing
@@ -34,6 +35,27 @@ class FakeWarehouse:
 
     def insert_agent_session_events(self, rows) -> None:
         self.events.extend(rows)
+
+
+def test_pi_event_row_normalizes_session_messages_and_tools() -> None:
+    session = pi_event_row(
+        {"type": "session", "id": "session-1", "timestamp": "2026-07-09T19:45:23Z", "cwd": "/work", "version": "1.2.3"},
+        session_id="session-1", account="a", device="d", seq=0, ingested_at=datetime(2026, 7, 9, 20, tzinfo=UTC),
+    )
+    user = pi_event_row(
+        {"type": "message", "id": "user-1", "parentId": "session-1", "timestamp": "2026-07-09T19:46:02Z", "message": {"role": "user", "content": [{"type": "text", "text": "ship it"}]}},
+        session_id="session-1", account="a", device="d", seq=1, ingested_at=datetime(2026, 7, 9, 20, tzinfo=UTC),
+    )
+    assistant = pi_event_row(
+        {"type": "message", "id": "assistant-1", "timestamp": "2026-07-09T19:46:09Z", "message": {"role": "assistant", "provider": "provider", "model": "model", "content": [{"type": "toolCall", "id": "call-1", "name": "read", "arguments": {"path": "README.md"}}], "usage": {"input": 10, "output": 4, "cacheRead": 3, "cacheWrite": 2}}},
+        session_id="session-1", account="a", device="d", seq=2, ingested_at=datetime(2026, 7, 9, 20, tzinfo=UTC),
+    )
+
+    assert (session["source"], session["cwd"], session["cli_version"]) == ("pi", "/work", "1.2.3")
+    assert (user["role"], user["text"], user["parent_uuid"]) == ("user", "ship it", "session-1")
+    assert (assistant["role"], assistant["subtype"], assistant["tool_name"]) == ("assistant", "tool_use", "read")
+    assert (assistant["model"], assistant["entrypoint"]) == ("model", "provider")
+    assert (assistant["input_tokens"], assistant["output_tokens"], assistant["cache_read_tokens"], assistant["cache_creation_tokens"]) == (10, 4, 3, 2)
 
 
 class FakeObjectStore:

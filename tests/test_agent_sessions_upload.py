@@ -11,6 +11,7 @@ from personal_data_warehouse_agent_sessions.scanner import (
     codex_session_id,
     discover_session_files,
     openclaw_session_id,
+    pi_session_id,
 )
 from personal_data_warehouse_agent_sessions.state import AgentSessionsUploadState
 from personal_data_warehouse_agent_sessions.sync import AgentSessionsUploadRunner
@@ -96,12 +97,36 @@ def test_discover_openclaw_ignores_trajectory_and_json_sidecars(tmp_path: Path) 
     assert [(f.tool, f.session_id) for f in files] == [("openclaw", "sess-oc")]
 
 
+def test_pi_session_id_extracts_uuid_after_timestamp() -> None:
+    path = Path("/x/2026-07-09T19-45-23-783Z_019f4869-d747-7feb-935a-e4432e94496e.jsonl")
+    assert pi_session_id(path) == "019f4869-d747-7feb-935a-e4432e94496e"
+
+
+def test_discover_pi_sessions(tmp_path: Path) -> None:
+    sessions = tmp_path / "pi" / "sessions" / "--project--"
+    sessions.mkdir(parents=True)
+    transcript = sessions / "2026-07-09T19-45-23-783Z_019f4869-d747-7feb-935a-e4432e94496e.jsonl"
+    transcript.write_text("{}\n")
+
+    files = discover_session_files(
+        claude_projects_dir=None,
+        codex_sessions_dir=None,
+        openclaw_sessions_dir=None,
+        pi_sessions_dir=tmp_path / "pi" / "sessions",
+    )
+
+    assert [(f.tool, f.session_id, f.path) for f in files] == [
+        ("pi", "019f4869-d747-7feb-935a-e4432e94496e", transcript)
+    ]
+
+
 def test_discover_handles_missing_dirs(tmp_path: Path) -> None:
     assert (
         discover_session_files(
             claude_projects_dir=tmp_path / "nope",
             codex_sessions_dir=None,
             openclaw_sessions_dir=tmp_path / "nope-oc",
+            pi_sessions_dir=tmp_path / "nope-pi",
         )
         == []
     )

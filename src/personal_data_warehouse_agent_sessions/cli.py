@@ -77,6 +77,7 @@ def main() -> None:
                 claude_projects_dir=config.claude_projects_dir,
                 codex_sessions_dir=config.codex_sessions_dir,
                 openclaw_sessions_dir=config.openclaw_sessions_dir,
+                pi_sessions_dir=config.pi_sessions_dir,
                 batch_uploader=lambda encoded, exported_at: ingest.upload_agent_sessions_batch(
                     encoded, exported_at=exported_at.astimezone(UTC).isoformat()
                 ),

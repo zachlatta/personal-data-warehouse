@@ -88,6 +88,7 @@ def test_relation_registry_encodes_source_owned_raw_schemas() -> None:
         "claude_code",
         "codex",
         "openclaw",
+        "pi",
     )
 
     expected = {
@@ -106,6 +107,7 @@ def test_relation_registry_encodes_source_owned_raw_schemas() -> None:
         "claude_code_events": ("claude_code", "events"),
         "codex_events": ("codex", "events"),
         "openclaw_events": ("openclaw", "events"),
+        "pi_events": ("pi", "events"),
         "file_attachment_enrichments": ("enrichment", "file_attachment_enrichments"),
         "agent_runs": ("ai_processing", "agent_runs"),
         "upstream_mutations": ("upstream_mutations", "operations"),
@@ -166,6 +168,7 @@ def test_fresh_warehouse_creates_source_owned_and_derived_schemas(warehouse: Pos
         (physical_schema_name("claude_code", namespace=warehouse.schema_namespace), "events"),
         (physical_schema_name("codex", namespace=warehouse.schema_namespace), "events"),
         (physical_schema_name("openclaw", namespace=warehouse.schema_namespace), "events"),
+        (physical_schema_name("pi", namespace=warehouse.schema_namespace), "events"),
         (physical_schema_name("marts", namespace=warehouse.schema_namespace), "ai_conversation_events"),
         (physical_schema_name("marts", namespace=warehouse.schema_namespace), "ai_conversation_sessions"),
         (physical_schema_name("timeline", namespace=warehouse.schema_namespace), "events"),
@@ -269,11 +272,12 @@ def test_ai_events_split_by_source_and_reunified_in_marts(warehouse: PostgresWar
         _agent_event_row(source="claude_code", session_id="claude-code-1", event_uuid="event-claude-code", seq=1),
         _agent_event_row(source="codex", session_id="codex-1", event_uuid="event-codex", seq=1),
         _agent_event_row(source="openclaw", session_id="openclaw-1", event_uuid="event-openclaw", seq=1),
+        _agent_event_row(source="pi", session_id="pi-1", event_uuid="event-pi", seq=1),
     ]
     warehouse.insert_agent_session_events(rows)
     warehouse.insert_agent_session_events(rows)  # idempotent upsert into per-source tables.
 
-    for source in ("chatgpt", "claude_desktop", "claude_code", "codex", "openclaw"):
+    for source in ("chatgpt", "claude_desktop", "claude_code", "codex", "openclaw", "pi"):
         source_rows = warehouse._query(
             f"SELECT source, session_id, text FROM {warehouse.sql_relation(source + '_events')}"
         )
@@ -286,8 +290,8 @@ def test_ai_events_split_by_source_and_reunified_in_marts(warehouse: PostgresWar
         ORDER BY source
         """
     )
-    assert len(unified) == 5
-    assert {row[0] for row in unified} == {"chatgpt", "claude_desktop", "claude_code", "codex", "openclaw"}
+    assert len(unified) == 6
+    assert {row[0] for row in unified} == {"chatgpt", "claude_desktop", "claude_code", "codex", "openclaw", "pi"}
 
     sessions = warehouse._query(
         f"""

@@ -21,6 +21,7 @@ SOURCE_RAW_SCHEMAS: tuple[str, ...] = (
     "claude_code",
     "codex",
     "openclaw",
+    "pi",
 )
 
 DERIVED_SCHEMAS: tuple[str, ...] = (
@@ -106,6 +107,7 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("claude_code_events", "claude_code", "events"),
     ("codex_events", "codex", "events"),
     ("openclaw_events", "openclaw", "events"),
+    ("pi_events", "pi", "events"),
     # Slack
     ("slack_teams", "slack", "teams"),
     ("slack_account_identities", "slack", "account_identities"),
@@ -167,6 +169,7 @@ AI_EVENT_SOURCE_RELATIONS: dict[str, str] = {
     "claude_code": "claude_code_events",
     "codex": "codex_events",
     "openclaw": "openclaw_events",
+    "pi": "pi_events",
 }
 
 

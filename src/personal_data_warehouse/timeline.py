@@ -1511,6 +1511,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "claude_code_events": _events("rolled up to one timeline row per session"),
     "codex_events": _events("rolled up to one timeline row per session"),
     "openclaw_events": _events("rolled up to one timeline row per session"),
+    "pi_events": _events("rolled up to one timeline row per session"),
     "chatgpt_sessions": _state("chatgpt.com web-session credential"),
     "chatgpt_conversation_sync": _state("per-conversation poll watermark"),
     "claude_desktop_credentials": _state("claude.ai session credential"),

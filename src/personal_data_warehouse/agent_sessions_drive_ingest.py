@@ -2,11 +2,11 @@
 
 Three transports feed the same row schema:
 
-* The CLI tools (Claude Code, Codex, OpenClaw) write append-only JSONL
+* The CLI tools (Claude Code, Codex, OpenClaw, pi) write append-only JSONL
   transcripts that a per-device uploader tails and batches into
   ``agent-sessions/inbox/batches/`` as gzipped JSONL envelopes. This module
   consumes those batches and normalizes each raw line into source-owned rows
-  (``claude_code.events``, ``codex.events``, or ``openclaw.events``; lossless
+  (``claude_code.events``, ``codex.events``, ``openclaw.events``, or ``pi.events``; lossless
   ``raw_json`` plus queryable columns), then promotes processed batch files into
   ``agent-sessions/library/``.
 * Claude Desktop is polled server-side from claude.ai using a credential pushed
@@ -622,6 +622,79 @@ def openclaw_event_row(
     return row
 
 
+def pi_event_row(
+    line: Mapping[str, Any],
+    *,
+    session_id: str,
+    account: str,
+    device: str,
+    seq: int,
+    ingested_at: datetime,
+) -> dict[str, Any]:
+    """Normalize one pi coding-agent session JSONL line."""
+    event_type = str(line.get("type", ""))
+    row = _base_row(
+        source="pi",
+        session_id=session_id,
+        account=account,
+        device=device,
+        seq=seq,
+        line=line,
+        event_uuid=str(line.get("id") or f"{session_id}#{seq}"),
+        occurred_at=parse_datetime(str(line.get("timestamp", ""))),
+        ingested_at=ingested_at,
+    )
+    row["parent_uuid"] = str(line.get("parentId") or "")
+
+    if event_type == "session":
+        row["cwd"] = str(line.get("cwd", ""))
+        row["cli_version"] = str(line.get("version", ""))
+        return row
+    if event_type == "session_info":
+        row["session_title"] = str(line.get("name", ""))
+        return row
+    if event_type == "model_change":
+        row["entrypoint"] = str(line.get("provider", ""))
+        row["model"] = str(line.get("modelId", ""))
+        return row
+    if event_type != "message":
+        return row
+
+    message = line.get("message") if isinstance(line.get("message"), Mapping) else {}
+    role = str(message.get("role", ""))
+    content = message.get("content")
+    if role == "user":
+        row["role"] = "user"
+        row["subtype"] = "message"
+        row["text"] = _openclaw_text(content)
+    elif role == "assistant":
+        row["role"] = "assistant"
+        row["model"] = str(message.get("model", ""))
+        row["entrypoint"] = str(message.get("provider", ""))
+        row["text"] = _openclaw_text(content)
+        tool_block = _openclaw_block(content, "toolCall")
+        if tool_block is not None:
+            row["subtype"] = "tool_use"
+            row["tool_name"] = str(tool_block.get("name", ""))
+            row["tool_input_json"] = _as_json_text(tool_block.get("arguments"))
+            row["turn_id"] = str(tool_block.get("id", ""))
+        elif row["text"]:
+            row["subtype"] = "message"
+        else:
+            row["subtype"] = "thinking"
+        _apply_openclaw_usage(row, message.get("usage"))
+    elif role == "toolResult":
+        row["role"] = "tool"
+        row["subtype"] = "tool_result"
+        row["tool_name"] = str(message.get("toolName", ""))
+        row["turn_id"] = str(message.get("toolCallId", ""))
+        row["text"] = _openclaw_tool_result_text(content)
+        row["tool_result_json"] = raw_json({"content": content}) if content is not None else ""
+    else:
+        row["subtype"] = role
+    return row
+
+
 def _openclaw_text(content: Any) -> str:
     return _join_text_blocks(content, text_types=("text",))
 
@@ -721,6 +794,7 @@ _EVENT_ROW_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
     "claude_code": claude_code_event_row,
     "codex": codex_event_row,
     "openclaw": openclaw_event_row,
+    "pi": pi_event_row,
     "claude_desktop": claude_desktop_event_row,
 }
 
