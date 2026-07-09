@@ -17,6 +17,7 @@ from personal_data_warehouse.relations import (
     QUERYABLE_SCHEMAS,
     SOURCE_RAW_SCHEMAS,
     physical_schema_name,
+    qualify_sql_relations,
     relation,
 )
 
@@ -53,6 +54,21 @@ def test_agent_documentation_uses_new_ai_query_surfaces() -> None:
     assert "marts.ai_conversation_events" in docs
     assert "marts.ai_conversation_sessions" in docs
     assert "search.search_text()" in docs
+
+
+def test_relation_qualification_distinguishes_search_function_from_column() -> None:
+    sql = """
+        CREATE TABLE timeline_events ("search_text" text NOT NULL);
+        CREATE INDEX idx ON timeline_events (search_text);
+        SELECT * FROM search_text('needle', 10);
+    """
+
+    qualified = qualify_sql_relations(sql, namespace="pdw_test")
+
+    assert '"search_text" text NOT NULL' in qualified
+    assert "(search_text)" in qualified
+    assert 'FROM "pdw_test_search"."search_text"(' in qualified
+    assert qualified.count('"pdw_test_timeline"."events"') == 2
 
 
 def test_relation_registry_encodes_source_owned_raw_schemas() -> None:

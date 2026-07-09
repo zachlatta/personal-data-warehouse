@@ -222,6 +222,23 @@ def _search_concat(*exprs: str) -> str:
     return f"concat_ws(E'\\n', {parts})"
 
 
+def _html_unescape(expr: str) -> str:
+    """Decode the common HTML entities Gmail leaves in snippets/subjects."""
+    result = expr
+    semicolon = " || chr(59)"
+    for needle, replacement in (
+        ("'&#39'" + semicolon, "chr(39)"),
+        ("'&#x27'" + semicolon, "chr(39)"),
+        ("'&quot'" + semicolon, "chr(34)"),
+        ("'&lt'" + semicolon, "'<'"),
+        ("'&gt'" + semicolon, "'>'"),
+        ("'&nbsp'" + semicolon, "' '"),
+        ("'&amp'" + semicolon, "'&'"),
+    ):
+        result = f"replace({result}, {needle}, {replacement})"
+    return result
+
+
 # Sender-pattern fallbacks for mail Gmail's categorizer misses (it labels
 # most modern bulk mail, but pre-2016 history and some transactional senders
 # carry no category). Benchmark-tuned (sampling/ 2026-07): pure machine mail
@@ -384,8 +401,8 @@ _GMAIL_EMAIL = _simple_adapter(
     event_ts="t.internal_date",
     ingest_ts="GREATEST(t.synced_at, COALESCE(att.attachment_ingest_ts, t.synced_at))",
     actor="t.from_address",
-    title="t.subject",
-    snippet=_snippet("t.snippet"),
+    title=_html_unescape("t.subject"),
+    snippet=_snippet(_html_unescape("t.snippet")),
     context="t.account",
     source_pk="jsonb_build_object('account', t.account, 'message_id', t.message_id)",
     metadata=(
@@ -531,6 +548,37 @@ _SLACK_MPIM_ROSTER = (
     "WHERE m.account = t.account AND m.team_id = t.team_id "
     "  AND m.conversation_id = t.conversation_id AND m.is_deleted = 0))"
 )
+_SLACK_ATTACHMENT_ONLY_MESSAGE = (
+    "(t.text = '' AND t.raw_json LIKE '%%\"files\":[%%' AND t.raw_json NOT LIKE '%%\"files\":[]%%')"
+)
+_SLACK_INACCESSIBLE_FILE_STUB = (
+    "(COALESCE(NULLIF(t.title, ''), NULLIF(t.name, '')) IS NULL "
+    " AND COALESCE(t.size, 0) = 0 "
+    " AND (t.raw_json LIKE '%%\"file_access\":\"not_visible\"%%' "
+    "      OR t.raw_json LIKE '%%\"file_access\":\"file_not_found\"%%' "
+    "      OR t.filetype = 'quip'))"
+)
+_SLACK_MESSAGE_TS_AS_TIMESTAMPTZ = (
+    "(CASE WHEN t.message_ts ~ '^[0-9]+(\\.[0-9]+)?$' "
+    "THEN to_timestamp(t.message_ts::numeric) ELSE NULL END)"
+)
+_SLACK_DM_CONTEXT = (
+    "(SELECT 'DM with ' || COALESCE(NULLIF(peer.display_name, ''), NULLIF(peer.real_name, ''), "
+    "                               NULLIF(peer.name, ''), NULLIF(peer.email, ''), dm_peer.user_id) "
+    " FROM ("
+    "   SELECT m.user_id, 0 AS source_order "
+    "   FROM slack_conversation_members m "
+    "   WHERE m.account = t.account AND m.team_id = t.team_id "
+    "     AND m.conversation_id = t.conversation_id AND m.is_deleted = 0 "
+    "     AND (ident.user_id = '' OR m.user_id <> ident.user_id) "
+    "   UNION ALL "
+    "   SELECT c.name AS user_id, 1 AS source_order WHERE c.name <> ''"
+    " ) dm_peer "
+    " LEFT JOIN slack_users peer "
+    "   ON peer.account = t.account AND peer.team_id = t.team_id AND peer.user_id = dm_peer.user_id "
+    " WHERE dm_peer.user_id <> '' "
+    " ORDER BY dm_peer.source_order, dm_peer.user_id LIMIT 1)"
+)
 
 # Benchmark-tuned ordering (sampling/rubric.md, 2026-07). Mine > bots (app DMs
 # relaying a human's action stay skim-worthy) > system messages > DMs >
@@ -542,6 +590,7 @@ _SLACK_MPIM_ROSTER = (
 # participation means at least two of his messages in the window.
 _SLACK_MESSAGE_PRIORITY = (
     "CASE "
+    f"WHEN {_SLACK_ATTACHMENT_ONLY_MESSAGE} THEN {TIMELINE_PRIORITY_BACKGROUND} "
     "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 1 "
     f"WHEN {_SLACK_IS_BOT} THEN "
     "  CASE WHEN c.is_im = 1 AND t.text ~* '(commented on|shared an item|replied to|"
@@ -568,6 +617,7 @@ _SLACK_MESSAGE_PRIORITY = (
 
 _SLACK_FILE_PRIORITY = (
     "CASE "
+    f"WHEN {_SLACK_INACCESSIBLE_FILE_STUB} THEN {TIMELINE_PRIORITY_BACKGROUND} "
     "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 1 "
     "WHEN u.is_bot = 1 THEN 4 "
     "WHEN c.is_im = 1 THEN 2 "
@@ -592,7 +642,7 @@ _SLACK_FILE_PRIORITY = (
 # IM/MPIM checks come first: slack stores a user-id-ish "name" on DM
 # conversations, which otherwise renders as a channel called #U0xxxx.
 _SLACK_CONTEXT = (
-    "CASE WHEN c.is_im = 1 THEN 'DM' "
+    f"CASE WHEN c.is_im = 1 THEN COALESCE({_SLACK_DM_CONTEXT}, 'DM') "
     "WHEN c.is_mpim = 1 THEN 'group DM' "
     "WHEN NULLIF(c.name, '') IS NOT NULL THEN '#' || c.name "
     "ELSE t.conversation_id END"
@@ -643,7 +693,7 @@ _SLACK_FILE = _simple_adapter(
     kind="file_share",
     from_sql="slack_files t" + _SLACK_JOINS,
     event_id="concat_ws('|', t.account, t.team_id, t.file_id, t.conversation_id, t.message_ts)",
-    event_ts=_real_ts("t.created_at", "t.synced_at"),
+    event_ts=_real_ts("t.created_at", _SLACK_MESSAGE_TS_AS_TIMESTAMPTZ, "t.synced_at"),
     ingest_ts="t.synced_at",
     actor=(
         "COALESCE(NULLIF(u.display_name, ''), NULLIF(u.real_name, ''), NULLIF(u.name, ''), "
@@ -662,7 +712,13 @@ _SLACK_FILE = _simple_adapter(
         "'size', t.size, "
         "'deleted', t.is_deleted <> 0)"
     ),
-    search_text=_search_concat("t.name", "t.title", "t.mimetype", _SLACK_DISPLAY_NAME, _SLACK_CONTEXT),
+    search_text=_search_concat(
+        "t.name",
+        "t.title",
+        "t.mimetype",
+        "COALESCE(NULLIF(u.display_name, ''), NULLIF(u.real_name, ''), NULLIF(u.name, ''), NULLIF(t.user_id, ''), '')",
+        _SLACK_CONTEXT,
+    ),
     priority=_SLACK_FILE_PRIORITY,
     refresh_hours=48,
 )
@@ -703,7 +759,19 @@ _APPLE_MESSAGE = _simple_adapter(
         FROM apple_message_attachments a
         LEFT JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
         WHERE a.account = t.account AND a.message_id = t.message_id
-    ) att ON TRUE""",
+    ) att ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT count(*) AS attachment_count,
+               string_agg(label, ', ' ORDER BY label) AS attachment_labels
+        FROM (
+            SELECT DISTINCT COALESCE(
+                NULLIF(a.transfer_name, ''), NULLIF(regexp_replace(a.filename, '^.*/', ''), ''),
+                NULLIF(a.mime_type, ''), NULLIF(a.content_type, ''), 'attachment'
+            ) AS label
+            FROM apple_message_attachments a
+            WHERE a.account = t.account AND a.message_id = t.message_id AND a.is_missing = 0
+        ) labels
+    ) att_labels ON TRUE""",
     event_id="concat_ws('|', t.account, t.message_id)",
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
     ingest_ts="GREATEST(t.ingested_at, COALESCE(att.attachment_ingest_ts, t.ingested_at))",
@@ -712,7 +780,17 @@ _APPLE_MESSAGE = _simple_adapter(
         "ELSE COALESCE(NULLIF(h.address, ''), NULLIF(t.handle_id, ''), '') END"
     ),
     title="t.subject",
-    snippet=_snippet("t.body_text"),
+    snippet=_snippet(
+        "CASE "
+        "WHEN NULLIF(regexp_replace(t.body_text, '^' || chr(65532) || '+', ''), '') IS NOT NULL "
+        "  THEN regexp_replace(t.body_text, '^' || chr(65532) || '+', '') "
+        "WHEN COALESCE(att_labels.attachment_count, 0) = 1 "
+        "  THEN '[attachment: ' || COALESCE(att_labels.attachment_labels, 'attachment') || ']' "
+        "WHEN COALESCE(att_labels.attachment_count, 0) > 1 "
+        "  THEN '[' || att_labels.attachment_count::text || ' attachments: ' || left(att_labels.attachment_labels, 120) || ']' "
+        "WHEN t.cache_has_attachments <> 0 THEN '[attachment]' "
+        "ELSE '' END"
+    ),
     context=(
         "COALESCE(NULLIF(c.display_name, ''), NULLIF(c.chat_identifier, ''), "
         "NULLIF(h.address, ''), t.service)"
@@ -784,6 +862,13 @@ _APPLE_MESSAGE = _simple_adapter(
     refresh_hours=48,
 )
 
+_WHATSAPP_MESSAGE_SNIPPET = (
+    "CASE WHEN NULLIF(t.body_text, '') IS NOT NULL THEN t.body_text "
+    "WHEN COALESCE(NULLIF(t.media_type, ''), NULLIF(t.message_kind, '')) IS NOT NULL "
+    "  THEN '[' || COALESCE(NULLIF(t.media_type, ''), NULLIF(t.message_kind, '')) || ' message]' "
+    "ELSE '' END"
+)
+
 _WHATSAPP_MESSAGE = _simple_adapter(
     name="whatsapp_message",
     source_table="whatsapp_messages",
@@ -792,6 +877,7 @@ _WHATSAPP_MESSAGE = _simple_adapter(
     from_sql="""whatsapp_messages t
     LEFT JOIN whatsapp_chats c ON c.account = t.account AND c.chat_id = t.chat_id
     LEFT JOIN whatsapp_contacts ct ON ct.account = t.account AND ct.jid = t.sender_jid
+    LEFT JOIN whatsapp_contacts chat_ct ON chat_ct.account = t.account AND chat_ct.jid = t.chat_id
     LEFT JOIN (
         SELECT account, chat_id, count(*) AS n
         FROM whatsapp_chat_participants
@@ -816,8 +902,11 @@ _WHATSAPP_MESSAGE = _simple_adapter(
         "ELSE COALESCE(NULLIF(ct.full_name, ''), NULLIF(ct.push_name, ''), "
         "NULLIF(t.push_name, ''), NULLIF(t.sender_jid, ''), '') END"
     ),
-    snippet=_snippet("t.body_text"),
-    context="COALESCE(NULLIF(c.name, ''), t.chat_id)",
+    snippet=_snippet(_WHATSAPP_MESSAGE_SNIPPET),
+    context=(
+        "COALESCE(NULLIF(c.name, ''), NULLIF(chat_ct.full_name, ''), "
+        "NULLIF(chat_ct.push_name, ''), NULLIF(chat_ct.business_name, ''), t.chat_id)"
+    ),
     source_pk=(
         "jsonb_build_object('account', t.account, 'chat_id', t.chat_id, 'message_id', t.message_id)"
     ),
@@ -931,6 +1020,11 @@ _VOICE_MEMO = _simple_adapter(
 )
 
 _DATE_ONLY = r"'^\d{4}-\d{2}-\d{2}$'"
+_CALENDAR_START_TS = (
+    f"COALESCE(NULLIF(t.start_at, {_EPOCH}), "
+    f"CASE WHEN t.start_date ~ {_DATE_ONLY} THEN t.start_date::date::timestamptz ELSE NULL END, "
+    "t.synced_at)"
+)
 
 _CALENDAR_EVENT = _simple_adapter(
     name="calendar_event",
@@ -939,11 +1033,7 @@ _CALENDAR_EVENT = _simple_adapter(
     kind="event",
     from_sql="calendar_events t",
     event_id="concat_ws('|', t.account, t.calendar_id, t.event_id)",
-    event_ts=(
-        f"COALESCE(NULLIF(t.start_at, {_EPOCH}), "
-        f"CASE WHEN t.start_date ~ {_DATE_ONLY} THEN t.start_date::date::timestamptz ELSE NULL END, "
-        "t.synced_at)"
-    ),
+    event_ts=_CALENDAR_START_TS,
     end_ts=(
         f"COALESCE(NULLIF(t.end_at, {_EPOCH}), "
         f"CASE WHEN t.end_date ~ {_DATE_ONLY} THEN t.end_date::date::timestamptz ELSE NULL END, "
@@ -968,11 +1058,14 @@ _CALENDAR_EVENT = _simple_adapter(
     search_text=_search_concat("t.summary", "t.description", "t.location", "t.organizer_email", "t.attendees_json"),
     # Subscribed feeds (yoga studios, holidays) and marketing-mail invites
     # (their descriptions carry the invisible-padding chars marketing HTML
-    # uses) are noise; events any of Zach's identities organized are his own
-    # actions, except Flighty's auto-created ✈-titled flight events; real
-    # invites from humans are attention.
+    # uses) are noise; cancelled/deleted and not-yet-started rows are not
+    # self activity for past-window reviews; events any of Zach's identities
+    # organized are his own actions, except Flighty's auto-created ✈-titled
+    # flight events; real invites from humans are attention.
     priority=(
         "CASE "
+        "WHEN t.is_deleted <> 0 OR t.status = 'cancelled' THEN 4 "
+        f"WHEN ({_CALENDAR_START_TS}) > t.synced_at THEN 3 "
         "WHEN t.organizer_email ILIKE '%%group.calendar.google.com%%' "
         "  OR t.organizer_email ILIKE '%%holiday%%' THEN 4 "
         "WHEN t.description LIKE '%%͏%%' OR t.description LIKE '%%­%%' THEN 4 "
@@ -1200,6 +1293,8 @@ def _agent_session_adapter() -> TimelineAdapter:
                  WHEN COALESCE(NULLIF(st.session_title, ''), fp.text, '') LIKE '[cron:%%'
                    OR COALESCE(fp.text, '') LIKE '[cron:%%'
                    OR COALESCE(fp.text, '') LIKE '[Inter-session message]%%'
+                   OR COALESCE(NULLIF(st.session_title, ''), fp.text, '') LIKE '[Subagent Context]%%'
+                   OR COALESCE(fp.text, '') LIKE '[Subagent Context]%%'
                    THEN {TIMELINE_PRIORITY_BACKGROUND}
                  WHEN s.entrypoint IN ('sdk-cli', 'codex_exec', 'zrl-claw')
                    THEN {TIMELINE_PRIORITY_BACKGROUND}

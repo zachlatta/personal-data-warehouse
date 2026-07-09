@@ -236,6 +236,11 @@ def qualify_sql_relations(sql: str, *, namespace: str = "public") -> str:
                 i += 1
             quoted_name = "".join(buf)
             replacement = mapped(quoted_name)
+            # search_text is both the public search function's logical name and
+            # a timeline column. Quoted identifiers here are columns/types, not
+            # function calls, so never rewrite the quoted column name.
+            if quoted_name == "search_text":
+                replacement = None
             if replacement and not _adjacent_to_dot(sql, start, i):
                 out.append(replacement)
             else:
@@ -266,6 +271,11 @@ def qualify_sql_relations(sql: str, *, namespace: str = "public") -> str:
                 i += 1
             token = sql[start:i]
             replacement = mapped(token)
+            # search_text is also a timeline column. Only its function-call
+            # spelling should resolve to search.search_text; bare/quoted column
+            # definitions and index expressions must remain untouched.
+            if token == "search_text" and not _followed_by_open_paren(sql, i):
+                replacement = None
             if replacement and not _adjacent_to_dot(sql, start, i):
                 out.append(replacement)
             else:
@@ -318,6 +328,13 @@ def _is_ident_start(ch: str) -> bool:
 
 def _is_ident_part(ch: str) -> bool:
     return ch == "_" or ch.isalpha() or ch.isdigit()
+
+
+def _followed_by_open_paren(sql: str, end: int) -> bool:
+    after = end
+    while after < len(sql) and sql[after].isspace():
+        after += 1
+    return after < len(sql) and sql[after] == "("
 
 
 def _adjacent_to_dot(sql: str, start: int, end: int) -> bool:

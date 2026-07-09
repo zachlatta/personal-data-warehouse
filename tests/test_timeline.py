@@ -1155,6 +1155,239 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("z@x.test|f-shortcut") == 3, "shortcut churn is ambient"
 
 
+def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
+    _ensure_all_source_tables(warehouse)
+    now = datetime.now(tz=UTC)
+
+    # Slack DMs should identify the other participant; attachment-only
+    # message shells and inaccessible file stubs should not surface as self
+    # activity, and stale file stubs should use the Slack message timestamp
+    # rather than the sync timestamp.
+    warehouse._command(
+        """
+        INSERT INTO slack_users (account, team_id, user_id, display_name)
+        VALUES ('z', 'T1', 'UME', 'self'),
+               ('z', 'T1', 'U1', 'Teammate One'),
+               ('z', 'T1', 'U2', 'Teammate Two')
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO slack_account_identities (account, team_id, user_id)
+        VALUES ('z', 'T1', 'UME')
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO slack_conversations (account, team_id, conversation_id, name, is_im)
+        VALUES ('z', 'T1', 'D1', '', 1),
+               ('z', 'T1', 'D2', 'U2', 1)
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO slack_conversation_members (account, team_id, conversation_id, user_id)
+        VALUES ('z', 'T1', 'D1', 'UME'),
+               ('z', 'T1', 'D1', 'U1')
+        """
+    )
+    stale_message_ts = f"{(now - timedelta(hours=1)).timestamp():.6f}"
+    warehouse._command(
+        """
+        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+                                    message_datetime, user_id, text, raw_json, synced_at)
+        VALUES ('z', 'T1', 'D1', 'dm-1', %s, 'UME', 'hello there', '{}', %s),
+               ('z', 'T1', 'D1', 'dm-file-shell', %s, 'UME', '',
+                '{"files":[{"id":"FREAL"}]}', %s),
+               ('z', 'T1', 'D2', 'dm-name-fallback', %s, 'UME', 'named fallback', '{}', %s)
+        """,
+        (now, now, now, now, now, now),
+    )
+    warehouse._command(
+        """
+        INSERT INTO slack_files (account, team_id, file_id, conversation_id, message_ts,
+                                 user_id, created_at, name, title, filetype, size, raw_json, synced_at)
+        VALUES ('z', 'T1', 'FSTUB', 'D1', %s, 'UME', '1970-01-01', '', '',
+                'jpg', 0, '{"file_access":"file_not_found"}', %s)
+        """,
+        (stale_message_ts, now),
+    )
+
+    # WhatsApp 1:1 chats should use contact names for context, and voice rows
+    # with stored media should have a readable placeholder instead of a blank
+    # snippet.
+    warehouse._command(
+        """
+        INSERT INTO whatsapp_contacts (account, jid, push_name)
+        VALUES ('z@x.test', 'friend@lid', 'Saved Contact')
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO whatsapp_messages (account, chat_id, message_id, sender_jid, body_text,
+                                       message_kind, media_type, message_at, is_from_me, ingested_at)
+        VALUES ('z@x.test', 'friend@lid', 'voice-1', '', '', 'voice', 'voice', %s, 1, %s)
+        """,
+        (now, now),
+    )
+
+    # Gmail should decode common HTML entities in timeline display fields.
+    warehouse._command(
+        """
+        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+                                    snippet, synced_at)
+        VALUES ('z@x.test', 'html-1', %s, 'Re: &lt;Plan&gt;', 'Zach <z@x.test>',
+                'I&#39;m ready &amp; excited &lt;3', %s)
+        """,
+        (now, now),
+    )
+
+    # iMessage attachment-only rows should show attachment labels instead of
+    # the object-replacement placeholder character.
+    warehouse._command(
+        """
+        INSERT INTO apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
+        VALUES ('z@x.test', 'chat-attach', 'im-attach', %s, %s)
+        """,
+        (now, now),
+    )
+    warehouse._command(
+        """
+        INSERT INTO apple_messages (account, message_id, body_text, message_at,
+                                    is_from_me, cache_has_attachments, ingested_at)
+        VALUES ('z@x.test', 'im-attach', '￼', %s, 1, 1, %s)
+        """,
+        (now, now),
+    )
+    warehouse._command(
+        """
+        INSERT INTO apple_message_attachments (account, attachment_id, message_id, filename,
+                                               mime_type, is_missing, ingested_at)
+        VALUES ('z@x.test', 'att-1', 'im-attach', '~/Library/Messages/Attachments/x/photo.jpg',
+                'image/jpeg', 0, %s)
+        """,
+        (now,),
+    )
+
+    # Cancelled/deleted calendar events and future own-calendar entries should
+    # not classify as self activity in a recent-self review.
+    warehouse._command(
+        """
+        INSERT INTO calendar_events (account, calendar_id, event_id, summary, organizer_email,
+                                     start_at, status, is_deleted, updated_at, synced_at)
+        VALUES ('z@x.test', 'primary', 'cancelled', 'Cancelled haircut', 'z@x.test',
+                %s, 'cancelled', 1, %s, %s),
+               ('z@x.test', 'primary', 'future', 'Future office', 'z@x.test',
+                %s, 'confirmed', 0, %s, %s)
+        """,
+        (now - timedelta(hours=1), now, now, now + timedelta(days=1), now, now),
+    )
+
+    # OpenClaw subagent/cron monitor sessions are background machinery even
+    # when they contain a user row.
+    warehouse._command(
+        """
+        INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+                                          role, text, device, ingested_at)
+        VALUES ('openclaw', 'subagent-cron', 'u0', 0, %s, 'user',
+                '[Subagent Context] You are running as a subagent.\n\n[Subagent Task]\nCron monitor subtask.',
+                'openclaw', %s)
+        """,
+        (now, now),
+    )
+
+    adapters = [
+        adapter_by_name(name)
+        for name in (
+            "slack_message",
+            "slack_file",
+            "whatsapp_message",
+            "gmail_email",
+            "apple_message",
+            "calendar_event",
+            "agent_session",
+        )
+    ]
+    engine = _engine(warehouse, adapters=adapters)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+
+    by_event_id = {
+        row["event_id"]: row
+        for row in warehouse._query_dicts("SELECT * FROM timeline_events")
+    }
+
+    assert by_event_id["z|T1|D1|dm-1"]["context"] == "DM with Teammate One"
+    assert by_event_id["z|T1|D2|dm-name-fallback"]["context"] == "DM with Teammate Two"
+    assert by_event_id["z|T1|D1|dm-file-shell"]["priority"] == 5
+    stale_file = by_event_id[f"z|T1|FSTUB|D1|{stale_message_ts}"]
+    assert stale_file["priority"] == 5
+    assert stale_file["event_ts"] < now - timedelta(minutes=30)
+
+    whatsapp = by_event_id["z@x.test|friend@lid|voice-1"]
+    assert whatsapp["context"] == "Saved Contact"
+    assert whatsapp["snippet"] == "[voice message]"
+
+    gmail = by_event_id["z@x.test|html-1"]
+    assert gmail["title"] == "Re: <Plan>"
+    assert gmail["snippet"] == "I'm ready & excited <3"
+
+    imessage = by_event_id["z@x.test|im-attach"]
+    assert imessage["snippet"] == "[attachment: photo.jpg]"
+
+    assert by_event_id["z@x.test|primary|cancelled"]["priority"] != 1
+    assert by_event_id["z@x.test|primary|future"]["priority"] != 1
+    assert by_event_id["openclaw|subagent-cron"]["priority"] == 5
+
+
+def test_voice_memo_timeline_refreshes_when_enrichment_arrives_later(warehouse):
+    _ensure_all_source_tables(warehouse)
+    adapter = adapter_by_name("voice_memo")
+    warehouse._command(
+        """
+        INSERT INTO apple_voice_memos_files (account, recording_id, title, filename,
+                                             recorded_at, ingested_at)
+        VALUES ('z@x.test', 'rec-late', '20260709 raw title', 'raw.m4a', %s, %s)
+        """,
+        (_NOW, _NOW),
+    )
+
+    engine = _engine(warehouse, adapters=[adapter])
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    before = warehouse._query_dicts(
+        "SELECT title, snippet FROM timeline_events WHERE event_id = 'z@x.test|rec-late'"
+    )[0]
+    assert before["title"] == "20260709 raw title"
+    assert before["snippet"] == ""
+
+    warehouse._command(
+        """
+        INSERT INTO apple_voice_memos_enrichments (account, recording_id, provider, model,
+                                                   prompt_version, status, title, summary, created_at)
+        VALUES ('z@x.test', 'rec-late', 'p', 'm', 'v1', 'completed',
+                'Readable memo title', 'Readable memo summary', %s)
+        """,
+        (_NOW + timedelta(minutes=5),),
+    )
+
+    engine = _engine(warehouse, adapters=[adapter])
+    try:
+        stats = engine.run()
+    finally:
+        engine.close()
+    assert stats[0].incremental_rows == 1
+    after = warehouse._query_dicts(
+        "SELECT title, snippet FROM timeline_events WHERE event_id = 'z@x.test|rec-late'"
+    )[0]
+    assert after["title"] == "Readable memo title"
+    assert after["snippet"] == "Readable memo summary"
+
+
 def test_refresh_window_converges_late_signals(warehouse):
     """A chat message classified before Zach replied is upgraded once the
     refresh window re-walks it (his reply promotes the surrounding window)."""
