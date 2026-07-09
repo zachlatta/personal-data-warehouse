@@ -1525,6 +1525,7 @@ class PostgresWarehouse:
         present by seq).
         """
         self._ensure_table_group(["timeline_events", "timeline_sync_state"])
+        self._migrate_legacy_named_table_if_present("timeline_gmail_correspondents", "timeline_gmail_correspondents")
         sequence_ref = self.sql_relation("timeline_events_seq")
         self._command("CREATE SEQUENCE IF NOT EXISTS timeline_events_seq")
         self._command(f"ALTER TABLE timeline_events ALTER COLUMN seq SET DEFAULT nextval('{sequence_ref}')")
@@ -1557,6 +1558,8 @@ class PostgresWarehouse:
         Postgres-durable per-conversation ``updated_at`` cursor so the poller does
         not re-fetch every conversation after a deploy.
         """
+        self._migrate_legacy_named_table_if_present("claude_desktop_credentials", "claude_desktop_credentials")
+        self._migrate_legacy_named_table_if_present("claude_desktop_conversation_state", "claude_desktop_conversation_state")
         self._command(
             """
             CREATE TABLE IF NOT EXISTS claude_desktop_credentials (
@@ -1640,6 +1643,7 @@ class PostgresWarehouse:
         )
 
     def ensure_whatsapp_client_session_table(self) -> None:
+        self._migrate_legacy_named_table_if_present("whatsapp_client_sessions", "whatsapp_client_sessions")
         self._command(
             """
             CREATE TABLE IF NOT EXISTS whatsapp_client_sessions (
@@ -1750,6 +1754,7 @@ class PostgresWarehouse:
         ``whatsapp_client_sessions`` but holds an opaque token string rather than
         a SQLite snapshot.
         """
+        self._migrate_legacy_named_table_if_present("chatgpt_sessions", "chatgpt_sessions")
         self._command(
             """
             CREATE TABLE IF NOT EXISTS chatgpt_sessions (
@@ -1780,6 +1785,7 @@ class PostgresWarehouse:
 
     def ensure_chatgpt_conversation_sync_table(self) -> None:
         """Per-conversation incremental sync watermark for the ChatGPT poller."""
+        self._migrate_legacy_named_table_if_present("chatgpt_conversation_sync", "chatgpt_conversation_sync")
         self._command(
             """
             CREATE TABLE IF NOT EXISTS chatgpt_conversation_sync (
@@ -1931,6 +1937,13 @@ class PostgresWarehouse:
             self._command(f"DROP TABLE IF EXISTS {_identifier(table)} CASCADE")
 
     def ensure_upstream_mutation_tables(self) -> None:
+        for legacy_table in (
+            "upstream_mutation_requests",
+            "upstream_mutations",
+            "upstream_mutation_events",
+            "upstream_mutation_request_events",
+        ):
+            self._migrate_legacy_named_table_if_present(legacy_table, legacy_table)
         self._command(
             """
             CREATE TABLE IF NOT EXISTS upstream_mutation_requests (
@@ -3995,22 +4008,64 @@ class PostgresWarehouse:
             self._command(f"ALTER TABLE {self.sql_relation(table)} SET ({settings})")
 
     def _migrate_legacy_table_if_present(self, table: str) -> None:
-        if table not in CANONICAL_RELATIONS:
+        self._migrate_legacy_named_table_if_present(table, table)
+
+    def _migrate_legacy_named_table_if_present(self, legacy_table: str, logical_name: str) -> None:
+        if logical_name not in CANONICAL_RELATIONS:
             return
-        rel = query_relation(table).with_namespace(self._schema)
-        if rel.schema == self._schema and rel.name == table:
+        rel = query_relation(logical_name).with_namespace(self._schema)
+        if rel.schema == self._schema and rel.name == legacy_table:
             return
-        if not self._legacy_table_exists(table):
+        if not self._physical_table_exists(schema=self._schema, table=legacy_table):
             return
-        if self._physical_table_exists(schema=rel.schema, table=rel.name):
-            raise RuntimeError(
-                f"cannot migrate legacy table {self._schema}.{table}: target {rel.schema}.{rel.name} already exists"
+        if not self._physical_table_exists(schema=rel.schema, table=rel.name):
+            self._raw_command(
+                f"ALTER TABLE {_identifier(self._schema)}.{_identifier(legacy_table)} SET SCHEMA {_identifier(rel.schema)}"
             )
-        self._raw_command(
-            f"ALTER TABLE {_identifier(self._schema)}.{_identifier(table)} SET SCHEMA {_identifier(rel.schema)}"
+            if rel.name != legacy_table:
+                self._raw_command(f"ALTER TABLE {_identifier(rel.schema)}.{_identifier(legacy_table)} RENAME TO {_identifier(rel.name)}")
+            return
+        common_columns = self._common_table_columns(
+            source_schema=self._schema,
+            source_table=legacy_table,
+            target_schema=rel.schema,
+            target_table=rel.name,
         )
-        if rel.name != table:
-            self._raw_command(f"ALTER TABLE {_identifier(rel.schema)}.{_identifier(table)} RENAME TO {_identifier(rel.name)}")
+        if common_columns:
+            column_sql = ", ".join(_identifier(column) for column in common_columns)
+            self._raw_command(
+                f"""
+                INSERT INTO {_identifier(rel.schema)}.{_identifier(rel.name)} ({column_sql})
+                SELECT {column_sql}
+                FROM {_identifier(self._schema)}.{_identifier(legacy_table)}
+                ON CONFLICT DO NOTHING
+                """
+            )
+        self._raw_command(f"DROP TABLE {_identifier(self._schema)}.{_identifier(legacy_table)}")
+
+    def _common_table_columns(
+        self,
+        *,
+        source_schema: str,
+        source_table: str,
+        target_schema: str,
+        target_table: str,
+    ) -> list[str]:
+        rows = self._query(
+            """
+            SELECT source.column_name
+            FROM information_schema.columns AS source
+            INNER JOIN information_schema.columns AS target
+              ON target.column_name = source.column_name
+             AND target.table_schema = %s
+             AND target.table_name = %s
+            WHERE source.table_schema = %s
+              AND source.table_name = %s
+            ORDER BY source.ordinal_position
+            """,
+            (target_schema, target_table, source_schema, source_table),
+        )
+        return [row[0] for row in rows]
 
     def _legacy_table_exists(self, table: str) -> bool:
         return self._physical_table_exists(schema=self._schema, table=table)
@@ -5722,6 +5777,7 @@ class PostgresWarehouse:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _stored_search_schema_signature(self) -> str | None:
+        self._migrate_legacy_named_table_if_present("pdw_search_schema_state", self._SEARCH_SCHEMA_MARKER_TABLE)
         self._command(
             f"CREATE TABLE IF NOT EXISTS {_identifier(self._SEARCH_SCHEMA_MARKER_TABLE)} "
             "(id smallint PRIMARY KEY DEFAULT 1, signature text NOT NULL, "

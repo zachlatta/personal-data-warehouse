@@ -364,6 +364,60 @@ def test_old_layout_mixed_ai_events_migrate_to_source_tables_without_legacy_view
     assert legacy_rows == []
 
 
+def test_old_layout_raw_control_tables_migrate_without_public_leftovers(warehouse: PostgresWarehouse) -> None:
+    warehouse._raw_command(
+        f"""
+        CREATE TABLE "{warehouse.schema_namespace}".chatgpt_sessions (
+            account text NOT NULL,
+            session_key text NOT NULL DEFAULT 'default',
+            session_token text NOT NULL DEFAULT '',
+            source_browser text NOT NULL DEFAULT '',
+            token_sha256 text NOT NULL DEFAULT '',
+            published_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+            updated_at timestamptz NOT NULL DEFAULT now(),
+            sync_version bigint NOT NULL DEFAULT 1,
+            PRIMARY KEY (account, session_key)
+        )
+        """
+    )
+    warehouse._raw_command(
+        f"""
+        INSERT INTO "{warehouse.schema_namespace}".chatgpt_sessions (account, session_key, session_token, token_sha256)
+        VALUES ('zach@example.test', 'default', 'token-redacted', 'sha')
+        """
+    )
+    warehouse._raw_command(
+        f"""
+        CREATE TABLE "{warehouse.schema_namespace}".pdw_search_schema_state (
+            id smallint PRIMARY KEY DEFAULT 1,
+            signature text NOT NULL,
+            CONSTRAINT pdw_search_schema_state_single_row CHECK (id = 1)
+        )
+        """
+    )
+    warehouse._raw_command(
+        f"INSERT INTO \"{warehouse.schema_namespace}\".pdw_search_schema_state (id, signature) VALUES (1, 'legacy-signature')"
+    )
+
+    warehouse.ensure_chatgpt_session_table()
+    assert warehouse._stored_search_schema_signature() == "legacy-signature"
+
+    chatgpt_rows = warehouse._query(
+        f"SELECT account, session_key, session_token FROM {warehouse.sql_relation('chatgpt_sessions')}"
+    )
+    assert chatgpt_rows == [("zach@example.test", "default", "token-redacted")]
+    legacy_rows = warehouse._query(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = %s AND table_name IN ('chatgpt_sessions', 'pdw_search_schema_state')
+        ORDER BY table_name
+        """,
+        (warehouse.schema_namespace,),
+    )
+    assert legacy_rows == []
+
+
 def test_old_layout_sync_state_migrates_without_legacy_public_view(warehouse: PostgresWarehouse) -> None:
     warehouse._raw_command(
         f"""
