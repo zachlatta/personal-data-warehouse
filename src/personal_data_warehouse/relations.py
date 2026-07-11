@@ -15,6 +15,7 @@ SOURCE_RAW_SCHEMAS: tuple[str, ...] = (
     "apple_messages",
     "apple_voice_memos",
     "alice_voice_recordings",
+    "whoop",
     "whatsapp",
     "chatgpt",
     "claude_desktop",
@@ -75,6 +76,14 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("google_drive_files", "google_drive", "files"),
     ("google_drive_file_texts", "google_drive", "file_texts"),
     ("google_drive_sync_state", "google_drive", "sync_state"),
+    # WHOOP
+    ("whoop_profiles", "whoop", "profiles"),
+    ("whoop_body_measurements", "whoop", "body_measurements"),
+    ("whoop_cycles", "whoop", "cycles"),
+    ("whoop_recoveries", "whoop", "recoveries"),
+    ("whoop_sleeps", "whoop", "sleeps"),
+    ("whoop_workouts", "whoop", "workouts"),
+    ("whoop_sync_state", "whoop", "sync_state"),
     # Apple Voice Memos
     ("apple_voice_memos_files", "apple_voice_memos", "files"),
     ("apple_voice_memos_transcription_runs", "apple_voice_memos", "transcription_runs"),
@@ -149,6 +158,7 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("chatgpt_sessions", "private", "chatgpt_sessions"),
     ("claude_desktop_credentials", "private", "claude_desktop_credentials"),
     ("whatsapp_client_sessions", "private", "whatsapp_client_sessions"),
+    ("whoop_oauth_tokens", "private", "whoop_oauth_tokens"),
 )
 
 CANONICAL_RELATIONS: dict[str, Relation] = {

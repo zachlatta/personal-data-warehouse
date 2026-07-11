@@ -1172,6 +1172,131 @@ _CONTACT_UPDATE = _simple_adapter(
     priority=str(TIMELINE_PRIORITY_BACKGROUND),
 )
 
+_WHOOP_CYCLE = _simple_adapter(
+    name="whoop_cycle",
+    source_table="whoop_cycles",
+    source="whoop",
+    kind="health_cycle",
+    from_sql="whoop_cycles t",
+    event_id="concat_ws('|', t.account, t.cycle_id)",
+    event_ts=_real_ts("t.start_at", "t.created_at", "t.synced_at"),
+    end_ts="t.end_at",
+    ingest_ts="t.synced_at",
+    actor="'me'",
+    title="'WHOOP cycle'",
+    snippet="concat('Strain ', t.strain::text, ', average HR ', t.average_heart_rate::text)",
+    context="t.account",
+    source_pk="jsonb_build_object('account', t.account, 'cycle_id', t.cycle_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'score_state', t.score_state, "
+        "'strain', t.strain, "
+        "'kilojoule', t.kilojoule, "
+        "'average_heart_rate', t.average_heart_rate, "
+        "'max_heart_rate', t.max_heart_rate)"
+    ),
+    search_text=_search_concat("t.score_state", "t.strain", "t.average_heart_rate", "t.max_heart_rate"),
+    priority=str(TIMELINE_PRIORITY_SELF),
+)
+
+_WHOOP_RECOVERY = _simple_adapter(
+    name="whoop_recovery",
+    source_table="whoop_recoveries",
+    source="whoop",
+    kind="recovery",
+    from_sql=(
+        "whoop_recoveries t LEFT JOIN whoop_cycles c "
+        "ON c.account = t.account AND c.cycle_id = t.cycle_id"
+    ),
+    event_id="concat_ws('|', t.account, t.cycle_id)",
+    event_ts=_real_ts("c.start_at", "t.updated_at", "t.created_at", "t.synced_at"),
+    end_ts="c.end_at",
+    ingest_ts="t.synced_at",
+    actor="'me'",
+    title="'WHOOP recovery'",
+    snippet=(
+        "concat('Recovery ', t.recovery_score::text, '%%, RHR ', "
+        "t.resting_heart_rate::text, ', HRV ', t.hrv_rmssd_milli::text)"
+    ),
+    context="t.account",
+    source_pk="jsonb_build_object('account', t.account, 'cycle_id', t.cycle_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'sleep_id', t.sleep_id, "
+        "'score_state', t.score_state, "
+        "'recovery_score', t.recovery_score, "
+        "'resting_heart_rate', t.resting_heart_rate, "
+        "'hrv_rmssd_milli', t.hrv_rmssd_milli, "
+        "'spo2_percentage', t.spo2_percentage, "
+        "'skin_temp_celsius', t.skin_temp_celsius)"
+    ),
+    search_text=_search_concat("t.score_state", "t.recovery_score", "t.resting_heart_rate", "t.hrv_rmssd_milli"),
+    priority=str(TIMELINE_PRIORITY_SELF),
+)
+
+_WHOOP_SLEEP = _simple_adapter(
+    name="whoop_sleep",
+    source_table="whoop_sleeps",
+    source="whoop",
+    kind="sleep",
+    from_sql="whoop_sleeps t",
+    event_id="concat_ws('|', t.account, t.sleep_id)",
+    event_ts=_real_ts("t.start_at", "t.created_at", "t.synced_at"),
+    end_ts="t.end_at",
+    ingest_ts="t.synced_at",
+    actor="'me'",
+    title="CASE WHEN t.nap <> 0 THEN 'WHOOP nap' ELSE 'WHOOP sleep' END",
+    snippet=(
+        "concat('Performance ', t.sleep_performance_percentage::text, '%%, efficiency ', "
+        "t.sleep_efficiency_percentage::text, '%%, respiratory rate ', t.respiratory_rate::text)"
+    ),
+    context="t.account",
+    source_pk="jsonb_build_object('account', t.account, 'sleep_id', t.sleep_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'cycle_id', t.cycle_id, "
+        "'nap', t.nap <> 0, "
+        "'score_state', t.score_state, "
+        "'sleep_performance_percentage', t.sleep_performance_percentage, "
+        "'sleep_efficiency_percentage', t.sleep_efficiency_percentage, "
+        "'respiratory_rate', t.respiratory_rate)"
+    ),
+    search_text=_search_concat("t.score_state", "t.sleep_performance_percentage", "t.respiratory_rate"),
+    priority=str(TIMELINE_PRIORITY_SELF),
+)
+
+_WHOOP_WORKOUT = _simple_adapter(
+    name="whoop_workout",
+    source_table="whoop_workouts",
+    source="whoop",
+    kind="workout",
+    from_sql="whoop_workouts t",
+    event_id="concat_ws('|', t.account, t.workout_id)",
+    event_ts=_real_ts("t.start_at", "t.created_at", "t.synced_at"),
+    end_ts="t.end_at",
+    ingest_ts="t.synced_at",
+    actor="'me'",
+    title="concat('WHOOP workout: ', COALESCE(NULLIF(t.sport_name, ''), 'activity'))",
+    snippet=(
+        "concat('Strain ', t.strain::text, ', average HR ', t.average_heart_rate::text, "
+        "', distance ', t.distance_meter::text, ' m')"
+    ),
+    context="t.account",
+    source_pk="jsonb_build_object('account', t.account, 'workout_id', t.workout_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'sport_name', t.sport_name, "
+        "'sport_id', t.sport_id, "
+        "'score_state', t.score_state, "
+        "'strain', t.strain, "
+        "'average_heart_rate', t.average_heart_rate, "
+        "'max_heart_rate', t.max_heart_rate, "
+        "'distance_meter', t.distance_meter)"
+    ),
+    search_text=_search_concat("t.sport_name", "t.score_state", "t.strain", "t.average_heart_rate"),
+    priority=str(TIMELINE_PRIORITY_SELF),
+)
+
 _MUTATION = _simple_adapter(
     name="mutation",
     source_table="upstream_mutations",
@@ -1415,6 +1540,10 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _CALENDAR_EVENT,
     _DRIVE_FILE,
     _CONTACT_UPDATE,
+    _WHOOP_CYCLE,
+    _WHOOP_RECOVERY,
+    _WHOOP_SLEEP,
+    _WHOOP_WORKOUT,
     _MUTATION,
     _MUTATION_REQUEST,
     _ENRICHMENT_RUN,
@@ -1536,6 +1665,15 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "google_drive_files": _events(),
     "google_drive_file_texts": _detail("google_drive_files"),
     "google_drive_sync_state": _state("drive sync cursor"),
+    # WHOOP
+    "whoop_profiles": _entity("current WHOOP user profile"),
+    "whoop_body_measurements": _entity("current WHOOP body measurements"),
+    "whoop_cycles": _events(),
+    "whoop_recoveries": _events(),
+    "whoop_sleeps": _events(),
+    "whoop_workouts": _events(),
+    "whoop_sync_state": _state("per-collection WHOOP scan watermark"),
+    "whoop_oauth_tokens": _state("rotating WHOOP OAuth credential"),
     # Upstream mutations (the warehouse acting on the world)
     "upstream_mutations": _events(),
     "upstream_mutation_requests": _events(),

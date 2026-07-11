@@ -63,6 +63,14 @@ from personal_data_warehouse.schema import (
     WHATSAPP_CONTACT_COLUMNS,
     WHATSAPP_MEDIA_ITEM_COLUMNS,
     WHATSAPP_MESSAGE_COLUMNS,
+    WHOOP_BODY_MEASUREMENT_COLUMNS,
+    WHOOP_CYCLE_COLUMNS,
+    WHOOP_OAUTH_TOKEN_COLUMNS,
+    WHOOP_PROFILE_COLUMNS,
+    WHOOP_RECOVERY_COLUMNS,
+    WHOOP_SLEEP_COLUMNS,
+    WHOOP_SYNC_STATE_COLUMNS,
+    WHOOP_WORKOUT_COLUMNS,
     GoogleDriveSyncState,
     SyncState,
 )
@@ -326,6 +334,14 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("account",),
         "updated_at",
     ),
+    "whoop_profiles": TableSpec(WHOOP_PROFILE_COLUMNS, ("account",)),
+    "whoop_body_measurements": TableSpec(WHOOP_BODY_MEASUREMENT_COLUMNS, ("account",)),
+    "whoop_cycles": TableSpec(WHOOP_CYCLE_COLUMNS, ("account", "cycle_id")),
+    "whoop_recoveries": TableSpec(WHOOP_RECOVERY_COLUMNS, ("account", "cycle_id")),
+    "whoop_sleeps": TableSpec(WHOOP_SLEEP_COLUMNS, ("account", "sleep_id")),
+    "whoop_workouts": TableSpec(WHOOP_WORKOUT_COLUMNS, ("account", "workout_id")),
+    "whoop_sync_state": TableSpec(WHOOP_SYNC_STATE_COLUMNS, ("account", "collection")),
+    "whoop_oauth_tokens": TableSpec(WHOOP_OAUTH_TOKEN_COLUMNS, ("account",), "updated_at"),
     # Unified timeline (personal_data_warehouse/timeline.py). Row volume tracks
     # the sum of every event source (slack_messages dominates), so it gets the
     # same append-heavy autovacuum thresholds.
@@ -659,6 +675,26 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS google_drive_file_texts_text_trgm_idx ON google_drive_file_texts USING gin (text public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
+    IndexSpec(
+        "whoop_cycles_start_idx",
+        "whoop_cycles",
+        "CREATE INDEX IF NOT EXISTS whoop_cycles_start_idx ON whoop_cycles (account, start_at DESC)",
+    ),
+    IndexSpec(
+        "whoop_sleeps_start_idx",
+        "whoop_sleeps",
+        "CREATE INDEX IF NOT EXISTS whoop_sleeps_start_idx ON whoop_sleeps (account, start_at DESC)",
+    ),
+    IndexSpec(
+        "whoop_workouts_start_idx",
+        "whoop_workouts",
+        "CREATE INDEX IF NOT EXISTS whoop_workouts_start_idx ON whoop_workouts (account, start_at DESC)",
+    ),
+    IndexSpec(
+        "whoop_recoveries_updated_idx",
+        "whoop_recoveries",
+        "CREATE INDEX IF NOT EXISTS whoop_recoveries_updated_idx ON whoop_recoveries (account, updated_at DESC)",
+    ),
     # Unified timeline read paths: keyset pagination by event time (with seq as
     # the tiebreak), per-source/kind filtered scans, and arrival-order scans for
     # "what's new since seq N" consumers.
@@ -860,6 +896,12 @@ JSONB_COLUMNS_BY_TABLE = {
         "source_pk",
         "metadata",
     },
+    "whoop_profiles": {"raw_json"},
+    "whoop_body_measurements": {"raw_json"},
+    "whoop_cycles": {"score_json", "raw_json"},
+    "whoop_recoveries": {"score_json", "raw_json"},
+    "whoop_sleeps": {"stage_summary_json", "sleep_needed_json", "score_json", "raw_json"},
+    "whoop_workouts": {"zone_durations_json", "score_json", "raw_json"},
 }
 
 JSONB_ARRAY_COLUMNS_BY_TABLE = {
@@ -929,6 +971,7 @@ TIMESTAMP_COLUMNS = {
     "backfill_cursor_event_ts",
     "watermark_ingest_ts",
     "last_run_at",
+    "watermark_updated_at",
 }
 
 INTEGER_COLUMNS = {
@@ -1022,11 +1065,43 @@ INTEGER_COLUMNS = {
     "backfill_rows",
     "incremental_rows",
     "priority",
+    "whoop_user_id",
+    "average_heart_rate",
+    "max_heart_rate",
+    "resting_heart_rate",
+    "recovery_score",
+    "user_calibrating",
+    "nap",
+    "v1_id",
+    "sport_id",
+    "total_in_bed_time_milli",
+    "total_awake_time_milli",
+    "total_no_data_time_milli",
+    "total_light_sleep_time_milli",
+    "total_slow_wave_sleep_time_milli",
+    "total_rem_sleep_time_milli",
+    "sleep_cycle_count",
+    "disturbance_count",
 }
 
 FLOAT_COLUMNS = {
     "confidence",
     "calendar_confidence",
+    "height_meter",
+    "weight_kilogram",
+    "strain",
+    "kilojoule",
+    "hrv_rmssd_milli",
+    "spo2_percentage",
+    "skin_temp_celsius",
+    "respiratory_rate",
+    "sleep_performance_percentage",
+    "sleep_consistency_percentage",
+    "sleep_efficiency_percentage",
+    "percent_recorded",
+    "distance_meter",
+    "altitude_gain_meter",
+    "altitude_change_meter",
 }
 
 _WHATSAPP_TABLES = (
@@ -1242,6 +1317,20 @@ class PostgresWarehouse:
         self.ensure_whatsapp_client_session_table()
         self._ensure_clean_whatsapp_messages_view()
         self._ensure_search_views_if_possible()
+
+    def ensure_whoop_tables(self) -> None:
+        self._ensure_table_group(
+            [
+                "whoop_profiles",
+                "whoop_body_measurements",
+                "whoop_cycles",
+                "whoop_recoveries",
+                "whoop_sleeps",
+                "whoop_workouts",
+                "whoop_sync_state",
+                "whoop_oauth_tokens",
+            ]
+        )
 
     def ensure_agent_sessions_tables(self) -> None:
         self._ensure_table_group(_AI_CONVERSATION_EVENT_TABLES)
@@ -4160,6 +4249,68 @@ class PostgresWarehouse:
             )
             for row in rows
         }
+
+    def insert_whoop_profiles(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_profiles", rows, WHOOP_PROFILE_COLUMNS)
+
+    def insert_whoop_body_measurements(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_body_measurements", rows, WHOOP_BODY_MEASUREMENT_COLUMNS)
+
+    def insert_whoop_cycles(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_cycles", rows, WHOOP_CYCLE_COLUMNS)
+
+    def insert_whoop_recoveries(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_recoveries", rows, WHOOP_RECOVERY_COLUMNS)
+
+    def insert_whoop_sleeps(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_sleeps", rows, WHOOP_SLEEP_COLUMNS)
+
+    def insert_whoop_workouts(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_workouts", rows, WHOOP_WORKOUT_COLUMNS)
+
+    def load_whoop_sync_state(self) -> dict[tuple[str, str], dict[str, Any]]:
+        columns = WHOOP_SYNC_STATE_COLUMNS
+        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM whoop_sync_state")
+        return {(str(row[0]), str(row[1])): dict(zip(columns, row, strict=True)) for row in rows}
+
+    def load_whoop_oauth_token(self, *, account: str) -> str:
+        rows = self._query("SELECT token_json FROM whoop_oauth_tokens WHERE account = %s", (account,))
+        return str(rows[0][0]) if rows else ""
+
+    def upsert_whoop_oauth_token(self, *, account: str, token_json: str, updated_at: datetime) -> None:
+        self._insert(
+            "whoop_oauth_tokens",
+            [(account, token_json, updated_at)],
+            WHOOP_OAUTH_TOKEN_COLUMNS,
+        )
+
+    def insert_whoop_sync_state(
+        self,
+        *,
+        account: str,
+        collection: str,
+        watermark_updated_at: datetime,
+        last_sync_type: str,
+        status: str,
+        error: str,
+        updated_at: datetime,
+    ) -> None:
+        self._insert(
+            "whoop_sync_state",
+            [
+                (
+                    account,
+                    collection,
+                    watermark_updated_at,
+                    last_sync_type,
+                    status,
+                    error,
+                    updated_at,
+                    int(_ensure_utc(updated_at).timestamp() * 1_000_000),
+                )
+            ],
+            WHOOP_SYNC_STATE_COLUMNS,
+        )
 
     def insert_calendar_events(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("calendar_events", rows, CALENDAR_EVENT_COLUMNS)

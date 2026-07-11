@@ -82,6 +82,7 @@ def test_relation_registry_encodes_source_owned_raw_schemas() -> None:
         "apple_messages",
         "apple_voice_memos",
         "alice_voice_recordings",
+        "whoop",
         "whatsapp",
         "chatgpt",
         "claude_desktop",

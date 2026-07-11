@@ -1,0 +1,113 @@
+{
+  "command": "uv run personal-data-warehouse-whoop-sync --validate",
+  "redaction": "Only endpoint status, record count, and response field names are retained. No response values, account identifiers, authorization codes, client credentials, or OAuth tokens are recorded.",
+  "result": {
+    "account_configured": true,
+    "body_measurement_endpoint": "ok",
+    "body_measurement_fields": [
+      "height_meter",
+      "max_heart_rate",
+      "weight_kilogram"
+    ],
+    "collection_endpoints": {
+      "cycles": {
+        "record_count": 1,
+        "record_fields": [
+          "created_at",
+          "end",
+          "id",
+          "score",
+          "score_state",
+          "start",
+          "timezone_offset",
+          "updated_at",
+          "user_id"
+        ],
+        "status": "ok"
+      },
+      "recovery": {
+        "record_count": 1,
+        "record_fields": [
+          "created_at",
+          "cycle_id",
+          "score",
+          "score_state",
+          "sleep_id",
+          "updated_at",
+          "user_id"
+        ],
+        "status": "ok"
+      },
+      "sleep": {
+        "record_count": 1,
+        "record_fields": [
+          "created_at",
+          "cycle_id",
+          "end",
+          "id",
+          "nap",
+          "score",
+          "score_state",
+          "start",
+          "timezone_offset",
+          "updated_at",
+          "user_id",
+          "v1_id"
+        ],
+        "status": "ok"
+      },
+      "workout": {
+        "record_count": 1,
+        "record_fields": [
+          "created_at",
+          "end",
+          "id",
+          "score",
+          "score_state",
+          "sport_id",
+          "sport_name",
+          "start",
+          "timezone_offset",
+          "updated_at",
+          "user_id",
+          "v1_id"
+        ],
+        "status": "ok"
+      }
+    },
+    "profile_endpoint": "ok",
+    "profile_fields": [
+      "email",
+      "first_name",
+      "last_name",
+      "user_id"
+    ]
+  },
+  "test_verification": {
+    "full_python_suite": {
+      "command": "uv run pytest -q",
+      "result": "897 passed, 125 skipped, 0 failed"
+    },
+    "go_warehouse_query": {
+      "command": "cd app && go test ./internal/warehouse ./internal/query",
+      "result": "passed"
+    },
+    "whoop_with_real_postgres": {
+      "command": "POSTGRES_DATABASE_URL=<configured> uv run pytest tests/test_whoop_*.py -q",
+      "database_safety": "Postgres tests create and drop isolated temporary schemas.",
+      "result": "33 passed, 0 failed"
+    }
+  },
+  "user_assisted_oauth": true,
+  "verification": "live_whoop_v2_read_only_api",
+  "verified_at": "2026-07-11T10:46:50Z",
+  "verified_scopes": [
+    "offline",
+    "read:profile",
+    "read:body_measurement",
+    "read:cycles",
+    "read:recovery",
+    "read:sleep",
+    "read:workout"
+  ]
+}

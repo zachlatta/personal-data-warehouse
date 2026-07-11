@@ -64,6 +64,24 @@ DEFAULT_CHATGPT_PAGE_SIZE = 28
 DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com"
 DEFAULT_CHATGPT_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_CHATGPT_CLIENT_ENABLED = True
+DEFAULT_WHOOP_BASE_URL = "https://api.prod.whoop.com/developer"
+DEFAULT_WHOOP_AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
+DEFAULT_WHOOP_TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
+DEFAULT_WHOOP_REDIRECT_URI = "http://localhost:8080/callback"
+DEFAULT_WHOOP_SCOPES = (
+    "offline",
+    "read:profile",
+    "read:body_measurement",
+    "read:cycles",
+    "read:recovery",
+    "read:sleep",
+    "read:workout",
+)
+DEFAULT_WHOOP_PAGE_SIZE = 25
+DEFAULT_WHOOP_INCREMENTAL_LOOKBACK_DAYS = 14
+DEFAULT_WHOOP_REQUEST_TIMEOUT_SECONDS = 30
+DEFAULT_WHOOP_MAX_RATE_LIMIT_SLEEP_SECONDS = 120
+DEFAULT_WHOOP_ENABLED = True
 DEFAULT_CLAUDE_DESKTOP_BASE_URL = "https://claude.ai"
 DEFAULT_CLAUDE_DESKTOP_ENABLED = True
 DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
@@ -277,6 +295,26 @@ class AliceVoiceRecordingsConfig:
 
 
 @dataclass(frozen=True)
+class WhoopConfig:
+    account: str
+    token_json: str
+    client_id: str = ""
+    client_secret: str = ""
+    redirect_uri: str = DEFAULT_WHOOP_REDIRECT_URI
+    scopes: tuple[str, ...] = DEFAULT_WHOOP_SCOPES
+    base_url: str = DEFAULT_WHOOP_BASE_URL
+    auth_url: str = DEFAULT_WHOOP_AUTH_URL
+    token_url: str = DEFAULT_WHOOP_TOKEN_URL
+    page_size: int = DEFAULT_WHOOP_PAGE_SIZE
+    incremental_lookback_days: int = DEFAULT_WHOOP_INCREMENTAL_LOOKBACK_DAYS
+    full_sync_start: str = ""
+    force_full_sync: bool = False
+    request_timeout_seconds: int = DEFAULT_WHOOP_REQUEST_TIMEOUT_SECONDS
+    max_rate_limit_sleep_seconds: int = DEFAULT_WHOOP_MAX_RATE_LIMIT_SLEEP_SECONDS
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class GoogleDriveSourceConfig:
     accounts: tuple[str, ...]
     exclude_folder_ids: tuple[str, ...] = ()
@@ -364,6 +402,7 @@ class Settings:
     chatgpt: ChatGPTConfig | None = None
     claude_desktop: ClaudeDesktopConfig | None = None
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
+    whoop: WhoopConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
@@ -466,6 +505,8 @@ def load_settings(
     require_chatgpt: bool = False,
     require_claude_desktop: bool = False,
     require_alice_voice_recordings: bool = False,
+    require_whoop: bool = False,
+    require_whoop_client_secrets: bool = False,
     require_google_drive_source: bool = False,
     require_assemblyai: bool = False,
     require_agent: bool = False,
@@ -1125,6 +1166,67 @@ def load_settings(
             request_timeout_seconds=alice_request_timeout_seconds,
         )
 
+    whoop_account = (os.getenv("WHOOP_ACCOUNT") or default_voice_memos_account).strip()
+    whoop_token_json = _json_env_value("WHOOP_TOKEN_JSON") or ""
+    whoop_client_id = os.getenv("WHOOP_CLIENT_ID", "").strip()
+    whoop_client_secret = os.getenv("WHOOP_CLIENT_SECRET", "").strip()
+    whoop_redirect_uri = os.getenv("WHOOP_REDIRECT_URI", DEFAULT_WHOOP_REDIRECT_URI).strip() or DEFAULT_WHOOP_REDIRECT_URI
+    whoop_scopes = _parse_csv_env(os.getenv("WHOOP_SCOPES")) or DEFAULT_WHOOP_SCOPES
+    whoop_page_size = int(os.getenv("WHOOP_PAGE_SIZE", str(DEFAULT_WHOOP_PAGE_SIZE)))
+    whoop_incremental_lookback_days = int(
+        os.getenv("WHOOP_INCREMENTAL_LOOKBACK_DAYS", str(DEFAULT_WHOOP_INCREMENTAL_LOOKBACK_DAYS))
+    )
+    whoop_request_timeout_seconds = int(
+        os.getenv("WHOOP_REQUEST_TIMEOUT_SECONDS", str(DEFAULT_WHOOP_REQUEST_TIMEOUT_SECONDS))
+    )
+    whoop_max_rate_limit_sleep_seconds = int(
+        os.getenv("WHOOP_MAX_RATE_LIMIT_SLEEP_SECONDS", str(DEFAULT_WHOOP_MAX_RATE_LIMIT_SLEEP_SECONDS))
+    )
+    whoop: WhoopConfig | None = None
+    if (
+        require_whoop
+        or require_whoop_client_secrets
+        or os.getenv("WHOOP_ACCOUNT")
+        or whoop_token_json
+        or whoop_client_id
+        or whoop_client_secret
+        or os.getenv("WHOOP_ENABLED")
+    ):
+        if not whoop_account:
+            raise ValueError("WHOOP_ACCOUNT or GMAIL_ACCOUNTS must be set for WHOOP sync")
+        if require_whoop and not whoop_token_json:
+            raise ValueError("WHOOP_TOKEN_JSON or WHOOP_TOKEN_JSON_B64 must be set for WHOOP sync")
+        if (require_whoop or require_whoop_client_secrets) and (not whoop_client_id or not whoop_client_secret):
+            raise ValueError("WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET must be set for WHOOP OAuth and token refresh")
+        if whoop_page_size < 1 or whoop_page_size > 25:
+            raise ValueError("WHOOP_PAGE_SIZE must be between 1 and 25")
+        if whoop_incremental_lookback_days < 0:
+            raise ValueError("WHOOP_INCREMENTAL_LOOKBACK_DAYS must be greater than or equal to 0")
+        if whoop_request_timeout_seconds < 1:
+            raise ValueError("WHOOP_REQUEST_TIMEOUT_SECONDS must be at least 1")
+        if whoop_max_rate_limit_sleep_seconds < 0:
+            raise ValueError("WHOOP_MAX_RATE_LIMIT_SLEEP_SECONDS must be greater than or equal to 0")
+        if not whoop_scopes:
+            raise ValueError("WHOOP_SCOPES must include at least one scope")
+        whoop = WhoopConfig(
+            account=whoop_account,
+            token_json=whoop_token_json,
+            client_id=whoop_client_id,
+            client_secret=whoop_client_secret,
+            redirect_uri=whoop_redirect_uri,
+            scopes=tuple(dict.fromkeys(whoop_scopes)),
+            base_url=os.getenv("WHOOP_BASE_URL", DEFAULT_WHOOP_BASE_URL).strip().rstrip("/") or DEFAULT_WHOOP_BASE_URL,
+            auth_url=os.getenv("WHOOP_AUTH_URL", DEFAULT_WHOOP_AUTH_URL).strip() or DEFAULT_WHOOP_AUTH_URL,
+            token_url=os.getenv("WHOOP_TOKEN_URL", DEFAULT_WHOOP_TOKEN_URL).strip() or DEFAULT_WHOOP_TOKEN_URL,
+            page_size=whoop_page_size,
+            incremental_lookback_days=whoop_incremental_lookback_days,
+            full_sync_start=os.getenv("WHOOP_FULL_SYNC_START", "").strip(),
+            force_full_sync=_parse_bool_env(os.getenv("WHOOP_FORCE_FULL_SYNC"), False),
+            request_timeout_seconds=whoop_request_timeout_seconds,
+            max_rate_limit_sleep_seconds=whoop_max_rate_limit_sleep_seconds,
+            enabled=_parse_bool_env(os.getenv("WHOOP_ENABLED"), DEFAULT_WHOOP_ENABLED),
+        )
+
     # Google Drive as an ingested data source (distinct from Drive-as-transport,
     # which the storage backends above use). Files in the warehouse's own
     # transport folders are excluded by default so we never re-ingest our own
@@ -1330,6 +1432,7 @@ def load_settings(
         chatgpt=chatgpt,
         claude_desktop=claude_desktop,
         alice_voice_recordings=alice_voice_recordings,
+        whoop=whoop,
         google_drive_source=google_drive_source,
         assemblyai=assemblyai,
         agent=agent,

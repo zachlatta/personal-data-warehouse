@@ -9,6 +9,14 @@ func TestQualifySQLDoesNotRewriteCreateSchemaNames(t *testing.T) {
 	}
 }
 
+func TestQualifySQLRewritesWhoopRelationReferences(t *testing.T) {
+	got := QualifySQL(`SELECT sleep_id FROM whoop_sleeps ORDER BY start_at DESC`)
+	want := `SELECT sleep_id FROM "whoop"."sleeps" ORDER BY start_at DESC`
+	if got != want {
+		t.Fatalf("qualified SQL mismatch\nwant: %s\n got: %s", want, got)
+	}
+}
+
 func TestQualifySQLRewritesUpstreamMutationRelationReferences(t *testing.T) {
 	got := QualifySQL(`SELECT id FROM upstream_mutations WHERE status = 'pending_review'`)
 	want := `SELECT id FROM "upstream_mutations"."operations" WHERE status = 'pending_review'`
