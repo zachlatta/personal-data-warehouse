@@ -3919,7 +3919,15 @@ class PostgresWarehouse:
                     # on hosts whose Postgres lacks the pg_textsearch preload.
                     self._command("CREATE EXTENSION IF NOT EXISTS pg_textsearch WITH SCHEMA public")
                     self._pg_textsearch_ensured = True
-                self._command(index.sql)
+                index_sql = index.sql
+                if self._schema.startswith("pdw_test_"):
+                    # CONCURRENTLY waits for every older transaction in the
+                    # shared database, including unrelated long-running
+                    # read-only jobs. Throwaway test tables are private and
+                    # empty, so ordinary index creation is both safe and keeps
+                    # integration tests isolated from those global snapshots.
+                    index_sql = index_sql.replace("CREATE INDEX CONCURRENTLY", "CREATE INDEX", 1)
+                self._command(index_sql)
                 self._ensured_index_names.add(index.name)
             except Exception:
                 # Tests often create only a subset of tables. Missing-table index failures

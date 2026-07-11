@@ -1284,6 +1284,30 @@ def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehous
     assert "gmail_messages_body_html_trgm_idx" in index_names
 
 
+@pytest.mark.parametrize(
+    ("schema", "expects_concurrent"),
+    [("public", True), ("alternate_deployment", True), ("pdw_test_example", False)],
+)
+def test_postgres_concurrent_indexes_are_disabled_only_in_test_namespaces(
+    monkeypatch: pytest.MonkeyPatch,
+    schema: str,
+    expects_concurrent: bool,
+) -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    warehouse._schema = schema
+    warehouse._ensured_index_names = set()
+    warehouse._pg_trgm_ensured = False
+    warehouse._pg_textsearch_ensured = False
+    commands: list[str] = []
+    monkeypatch.setattr(warehouse, "_index_exists", lambda _name: False)
+    monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: commands.append(sql))
+
+    warehouse._ensure_indexes(["gmail_messages"])
+
+    [date_index_sql] = [sql for sql in commands if "gmail_messages_internal_date_idx" in sql]
+    assert ("CREATE INDEX CONCURRENTLY" in date_index_sql) is expects_concurrent
+
+
 def test_postgres_agent_tables_create_run_lookup_index(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_agent_tables()
 

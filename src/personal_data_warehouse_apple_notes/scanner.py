@@ -377,6 +377,13 @@ def _attachment_from_row(
         size_bytes = path.stat().st_size
         content_sha256 = content_sha256 or file_sha256(path)
         is_missing = False
+    elif missing_error:
+        # Links, tables, galleries, and inline text attachments are logical
+        # Notes attachments whose payload lives in metadata, the note body, or
+        # child attachment rows. They never own a standalone file, so counting
+        # them as missing makes a fully materialized Notes store look unhealthy.
+        is_missing = False
+        error = error or missing_error
     elif not is_missing:
         is_missing = True
         error = error or missing_error or "attachment file is not locally available"

@@ -211,9 +211,12 @@ def test_search_text_includes_agent_session_branches(warehouse) -> None:
 
     _sync_timeline(warehouse)
 
-    # search_text() uses pg_textsearch helpers; the schema-isolated test
-    # connection needs public on the path.
-    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+    # search_text() resolves both the timeline BM25 index and pg_textsearch
+    # helpers by name. Keep every physical source schema plus public on the
+    # path; the old pre-schema-reorganization path (namespace + public only)
+    # silently hid the BM25 index and made the function's guarded branch return
+    # no hits.
+    warehouse._set_search_path()
     rows = warehouse._query(
         "SELECT DISTINCT subsource FROM search_text('zanzibar', 50, ARRAY['agent_session']) "
         "WHERE score < 0 ORDER BY subsource"

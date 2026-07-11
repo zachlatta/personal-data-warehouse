@@ -192,13 +192,13 @@ def test_scan_apple_notes_core_data_store_labels_attachments_without_file_payloa
 
     attachments = {attachment.attachment_id: attachment for attachment in note.attachments}
     link = attachments["LINK-1"]
-    assert link.is_missing is True
     assert "URL" in link.error
     assert link.raw is not None and link.raw["ZURLSTRING"] == "https://example.com/post"
     assert "note body" in attachments["TABLE-1"].error
     assert "separate attachments" in attachments["GALLERY-1"].error
     assert "inline" in attachments["TAG-1"].error
     for attachment_id in ("LINK-1", "TABLE-1", "GALLERY-1", "TAG-1"):
+        assert attachments[attachment_id].is_missing is False
         assert "not locally available" not in attachments[attachment_id].error
 
 
