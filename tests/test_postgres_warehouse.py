@@ -1866,6 +1866,36 @@ def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWareh
         warehouse._query("SELECT count(*) FROM search_text('zanzibar', 50, ARRAY['agent'])")
 
 
+def test_search_text_returns_hits_under_default_search_path(warehouse: PostgresWarehouse) -> None:
+    # The app's Go query sessions (pdw sql, the MCP connector, the timeline UI)
+    # never set a search path, so the function must not depend on the caller's:
+    # to_bm25query() resolves the timeline BM25 index by name and the EXECUTE'd
+    # branch SQL resolves the search_text_hit row type through search_path. The
+    # function pins its own path (proconfig); without that, the per-branch
+    # exception guard swallows the lookup errors and every search silently
+    # returns zero rows.
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._command(
+        """
+        INSERT INTO timeline_events (adapter, event_id, source, kind, event_ts, source_table,
+                                     search_text, priority, actor, title, snippet, context)
+        VALUES ('slack_message', 'dp1', 'slack', 'message', now(), 'slack_messages',
+                'zanzibar default path probe', 3, 'a', 't', 's', 'c')
+        """
+    )
+    warehouse._command('SET search_path TO "$user", public')
+    try:
+        rows = warehouse._query(
+            "SELECT ref FROM search_text('zanzibar', 10, ARRAY['slack']) WHERE score < 0"
+        )
+    finally:
+        warehouse._set_search_path()
+    assert rows == [("slack_message:dp1",)]
+
+
 def test_search_text_caps_hit_text_to_preview(warehouse: PostgresWarehouse) -> None:
     # A search hit's `text` is a relevance PREVIEW, not the full document. Some
     # branches read multi-megabyte columns (Google Drive doc text, large email /

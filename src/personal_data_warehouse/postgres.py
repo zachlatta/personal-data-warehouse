@@ -6486,6 +6486,20 @@ class PostgresWarehouse:
             $sources$;
             """
         )
+        # to_bm25query() resolves the timeline BM25 index by NAME, and the
+        # EXECUTE'd branch SQL resolves the search_text_hit row type, both
+        # through the CALLER's search_path. App/API query sessions run with
+        # the default path ('"$user", public'), which stopped covering those
+        # objects when the schema reorganization moved them out of public —
+        # the per-branch exception guard then swallowed the lookup errors and
+        # every search through the app silently returned zero rows. Pin the
+        # function's own search_path so resolution never depends on the
+        # session.
+        function_path = self._search_path_sql().removeprefix("SET search_path TO ")
+        self._command(
+            "ALTER FUNCTION search_text(text, integer, text[], timestamptz) "
+            f"SET search_path TO {function_path}"
+        )
 
     def _ensure_view(self, view: str, create_sql: str) -> None:
         self._drop_legacy_view_if_present(view)
