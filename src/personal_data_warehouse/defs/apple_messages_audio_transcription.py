@@ -131,7 +131,6 @@ def apple_messages_audio_transcription_backlog_sensor(context):
                 warehouse,
                 source=APPLE_MESSAGES_AUDIO_SOURCE,
                 provider=f"agent_{settings.agent.provider}",
-                model=settings.agent.model,
                 prompt_version=APPLE_MESSAGES_AUDIO_SOURCE.prompt_version,
                 max_error_attempts=apple_messages_audio_transcription_max_error_attempts(),
                 error_window_days=apple_messages_audio_transcription_error_window_days(),

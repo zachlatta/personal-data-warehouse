@@ -6,10 +6,11 @@ AssemblyAI, and - when the raw transcript is non-empty - runs the transcript
 through the sandboxed agent container (codex/claude CLI) for cleanup/summary,
 mirroring how ``file_attachment_enrichment.py`` cleans up vision output. The
 result is upserted into the SAME shared ``file_attachment_enrichments`` table
-under its own ``ai_provider``/``ai_model``/``ai_prompt_version`` identity, so
-AssemblyAI is an invisible intermediate step (like ``pdftoppm`` is for PDFs);
-timeline adapters fold those enrichment rows into the parent message's search
-document automatically.
+with its provider, model, and prompt version preserved for audit. Candidate
+completion is keyed by provider + prompt version, so changing the runtime model
+does not silently retranscribe the historical corpus. AssemblyAI is an invisible
+intermediate step (like ``pdftoppm`` is for PDFs); timeline adapters fold those
+enrichment rows into the parent message's search document automatically.
 
 Each source (Apple Messages voice messages, WhatsApp voice notes, etc.) is
 described by an :class:`AudioEnrichmentSource` that names its candidate table
@@ -182,7 +183,6 @@ class AudioAttachmentTranscriptionRunner:
             self._warehouse,
             source=self._source,
             provider=self.enrichment_provider,
-            model=self._model,
             prompt_version=self._prompt_version,
             limit=limit,
             max_error_attempts=self._max_error_attempts,
@@ -382,7 +382,6 @@ def _audio_candidate_query(source: AudioEnrichmentSource, *, projection: str, ta
             SELECT content_sha256 AS subject_id, count(*) AS error_attempts
             FROM {ENRICHMENT_TABLE}
             WHERE ai_provider = %s
-              AND ai_model = %s
               AND ai_prompt_version = %s
               AND text_extraction_status = %s
               {{error_window_sql}}
@@ -404,7 +403,6 @@ def _audio_candidate_query(source: AudioEnrichmentSource, *, projection: str, ta
               FROM {ENRICHMENT_TABLE} done
               WHERE done.content_sha256 = a.{sha}
                 AND done.ai_provider = %s
-                AND done.ai_model = %s
                 AND done.ai_prompt_version = %s
                 AND done.text_extraction_status = ANY(%s)
           )
@@ -415,14 +413,12 @@ def _audio_candidate_query(source: AudioEnrichmentSource, *, projection: str, ta
 def _audio_candidate_params(
     *,
     provider: str,
-    model: str,
     prompt_version: str,
     max_error_attempts: int,
     error_window_params: list[Any],
 ) -> list[Any]:
     return [
         provider,
-        model,
         prompt_version,
         STATUS_ERROR,
         *error_window_params,
@@ -431,7 +427,6 @@ def _audio_candidate_params(
         list(AUDIO_MIME_LIKE_PATTERNS),
         [f"%{extension}" for extension in AUDIO_EXTENSIONS],
         provider,
-        model,
         prompt_version,
         list(COMPLETED_STATUSES),
     ]
@@ -442,14 +437,13 @@ def load_audio_enrichment_candidates(
     *,
     source: AudioEnrichmentSource,
     provider: str,
-    model: str,
     prompt_version: str,
     limit: int | None,
     max_error_attempts: int = DEFAULT_AUDIO_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     error_window_days: int = DEFAULT_AUDIO_ENRICHMENT_ERROR_WINDOW_DAYS,
 ) -> list[dict[str, Any]]:
     """Audio attachments stored in the object store that have no completed
-    transcription+cleanup enrichment for this provider/model/prompt identity."""
+    transcription+cleanup enrichment for this provider/prompt identity."""
     error_window_sql, error_window_params = _error_window_clause(error_window_days, column="updated_at")
     columns = (
         "account",
@@ -480,7 +474,6 @@ def load_audio_enrichment_candidates(
     ).format(error_window_sql=error_window_sql)
     params = _audio_candidate_params(
         provider=provider,
-        model=model,
         prompt_version=prompt_version,
         max_error_attempts=max_error_attempts,
         error_window_params=error_window_params,
@@ -505,7 +498,6 @@ def has_audio_enrichment_candidate(
     *,
     source: AudioEnrichmentSource,
     provider: str,
-    model: str,
     prompt_version: str,
     max_error_attempts: int = DEFAULT_AUDIO_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     error_window_days: int = DEFAULT_AUDIO_ENRICHMENT_ERROR_WINDOW_DAYS,
@@ -519,7 +511,6 @@ def has_audio_enrichment_candidate(
     ).format(error_window_sql=error_window_sql)
     params = _audio_candidate_params(
         provider=provider,
-        model=model,
         prompt_version=prompt_version,
         max_error_attempts=max_error_attempts,
         error_window_params=error_window_params,

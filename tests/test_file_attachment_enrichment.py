@@ -374,7 +374,6 @@ def test_candidate_query_excludes_recent_unreadable_attachments() -> None:
         warehouse,
         source=GMAIL_SOURCE,
         provider="agent_codex",
-        model="",
         prompt_version=GMAIL_SOURCE.prompt_version,
         limit=5,
         error_window_days=14,
@@ -388,6 +387,22 @@ def test_candidate_query_excludes_recent_unreadable_attachments() -> None:
     assert STATUS_UNREADABLE in params
 
 
+def test_candidate_completion_identity_ignores_model() -> None:
+    warehouse = FakeWarehouse([])
+
+    load_file_enrichment_candidates(
+        warehouse,
+        source=GMAIL_SOURCE,
+        provider="agent_codex",
+        prompt_version=GMAIL_SOURCE.prompt_version,
+        limit=5,
+    )
+
+    sql, _params = warehouse.queries[0]
+    assert "done.ai_model" not in sql
+    assert "unreadable.ai_model" not in sql
+
+
 @pytest.mark.parametrize("source", [GMAIL_SOURCE, WHATSAPP_SOURCE, APPLE_MESSAGES_SOURCE])
 @pytest.mark.parametrize("error_window_days", [14, 0])
 def test_candidate_query_placeholder_count_matches_params(source, error_window_days) -> None:
@@ -399,7 +414,6 @@ def test_candidate_query_placeholder_count_matches_params(source, error_window_d
         warehouse,
         source=source,
         provider="agent_codex",
-        model="",
         prompt_version=source.prompt_version,
         limit=5,
         error_window_days=error_window_days,

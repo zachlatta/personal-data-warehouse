@@ -904,7 +904,6 @@ def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit
     load_enrichment_candidates(
         Warehouse(),
         provider="agent_codex",
-        model="test-model",
         prompt_version="test-prompt",
         limit=None,
         recorded_after=datetime(2026, 3, 3, tzinfo=UTC),
@@ -933,7 +932,6 @@ def test_load_enrichment_candidates_keeps_limit_when_configured() -> None:
     load_enrichment_candidates(
         Warehouse(),
         provider="agent_codex",
-        model="test-model",
         prompt_version="test-prompt",
         limit=12,
         recorded_after=None,
@@ -953,13 +951,30 @@ def test_load_enrichment_candidates_can_force_current_prompt_version() -> None:
     load_enrichment_candidates(
         Warehouse(),
         provider="agent_codex",
-        model="test-model",
         prompt_version="test-prompt",
         limit=1,
         force_prompt_version=True,
     )
 
     assert "AND prompt_version = 'test-prompt'\n              AND status = 'completed'" in queries[0]
+
+
+def test_load_enrichment_candidates_does_not_use_model_for_completion_and_failure_identity() -> None:
+    queries = []
+
+    class Warehouse:
+        def _query(self, sql):
+            queries.append(sql)
+            return []
+
+    load_enrichment_candidates(
+        Warehouse(),
+        provider="agent_codex",
+        prompt_version="test-prompt",
+        limit=1,
+    )
+
+    assert "model =" not in queries[0]
 
 
 def test_load_enrichment_candidates_uses_agent_error_budget() -> None:
@@ -973,7 +988,6 @@ def test_load_enrichment_candidates_uses_agent_error_budget() -> None:
     load_enrichment_candidates(
         Warehouse(),
         provider="agent_codex",
-        model="test-model",
         prompt_version="test-prompt",
         limit=1,
         max_error_attempts=7,
@@ -998,7 +1012,6 @@ def test_load_enrichment_candidates_can_disable_agent_error_budget() -> None:
     load_enrichment_candidates(
         Warehouse(),
         provider="agent_codex",
-        model="test-model",
         prompt_version="test-prompt",
         limit=1,
         max_error_attempts=0,

@@ -126,7 +126,6 @@ def whatsapp_audio_transcription_backlog_sensor(context):
                 warehouse,
                 source=WHATSAPP_AUDIO_SOURCE,
                 provider=f"agent_{settings.agent.provider}",
-                model=settings.agent.model,
                 prompt_version=WHATSAPP_AUDIO_SOURCE.prompt_version,
                 max_error_attempts=whatsapp_audio_transcription_max_error_attempts(),
                 error_window_days=whatsapp_audio_transcription_error_window_days(),

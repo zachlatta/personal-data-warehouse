@@ -132,21 +132,6 @@ CALENDAR_EVENT_OPERATIONS = (
     CALENDAR_UPDATE_EVENT_OPERATION,
     CALENDAR_DELETE_EVENT_OPERATION,
 )
-REMOVED_PERSONAL_FINANCE_VIEWS = (
-    "clean_finance_accounts",
-    "clean_finance_transactions",
-    "clean_finance_holdings",
-)
-REMOVED_PERSONAL_FINANCE_TABLES = (
-    "finance_sync_state",
-    "finance_liabilities",
-    "finance_investment_transactions",
-    "finance_investment_securities",
-    "finance_investment_holdings",
-    "finance_transactions",
-    "finance_accounts",
-    "finance_items",
-)
 SEARCH_SCHEMA_REFRESH_LOCK_ID = 8_407_112_465
 
 
@@ -1202,7 +1187,6 @@ class PostgresWarehouse:
         return connection
 
     def ensure_tables(self) -> None:
-        self.drop_personal_finance_schema()
         self._migrate_file_attachment_enrichments_rename()
         self._ensure_table_group(
             [
@@ -1839,12 +1823,6 @@ class PostgresWarehouse:
         self._ensure_slack_conversation_stats_backfilled()
         self._ensure_clean_slack_inbox_view()
         self._ensure_search_views_if_possible()
-
-    def drop_personal_finance_schema(self) -> None:
-        for view in REMOVED_PERSONAL_FINANCE_VIEWS:
-            self._command(f"DROP VIEW IF EXISTS {_identifier(view)} CASCADE")
-        for table in REMOVED_PERSONAL_FINANCE_TABLES:
-            self._command(f"DROP TABLE IF EXISTS {_identifier(table)} CASCADE")
 
     def ensure_upstream_mutation_tables(self) -> None:
         for legacy_table in (

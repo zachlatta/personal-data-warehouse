@@ -378,7 +378,6 @@ def test_candidate_query_placeholder_count_matches_params(source, error_window_d
         warehouse,
         source=source,
         provider="agent_codex",
-        model="",
         prompt_version=source.prompt_version,
         limit=5,
         error_window_days=error_window_days,
@@ -395,7 +394,6 @@ def test_candidate_query_matches_whatsapp_mime_with_codec_suffix() -> None:
         warehouse,
         source=WHATSAPP_AUDIO_SOURCE,
         provider="agent_codex",
-        model="",
         prompt_version=WHATSAPP_AUDIO_SOURCE.prompt_version,
         limit=5,
     )
@@ -411,7 +409,6 @@ def test_has_audio_enrichment_candidate_returns_bool() -> None:
         warehouse,
         source=APPLE_MESSAGES_AUDIO_SOURCE,
         provider="agent_codex",
-        model="",
         prompt_version=APPLE_MESSAGES_AUDIO_SOURCE.prompt_version,
     ) is True
 
@@ -420,7 +417,6 @@ def test_has_audio_enrichment_candidate_returns_bool() -> None:
         warehouse_empty,
         source=APPLE_MESSAGES_AUDIO_SOURCE,
         provider="agent_codex",
-        model="",
         prompt_version=APPLE_MESSAGES_AUDIO_SOURCE.prompt_version,
     ) is False
 
@@ -431,12 +427,26 @@ def test_candidate_query_excludes_already_completed_rows() -> None:
         warehouse,
         source=APPLE_MESSAGES_AUDIO_SOURCE,
         provider="agent_codex",
-        model="",
         prompt_version=APPLE_MESSAGES_AUDIO_SOURCE.prompt_version,
         limit=5,
     )
-    sql, params = warehouse.queries[0]
+    sql, _params = warehouse.queries[0]
     assert "text_extraction_status = ANY(%s)" in sql
+
+
+def test_candidate_completion_and_failure_identity_ignore_model() -> None:
+    warehouse = FakeWarehouse([])
+
+    load_audio_enrichment_candidates(
+        warehouse,
+        source=APPLE_MESSAGES_AUDIO_SOURCE,
+        provider="agent_codex",
+        prompt_version=APPLE_MESSAGES_AUDIO_SOURCE.prompt_version,
+        limit=5,
+    )
+
+    sql, _params = warehouse.queries[0]
+    assert "ai_model = %s" not in sql
 
 
 def test_candidate_query_retry_cap_counts_transcription_stage_failures() -> None:
@@ -452,7 +462,6 @@ def test_candidate_query_retry_cap_counts_transcription_stage_failures() -> None
         warehouse,
         source=APPLE_MESSAGES_AUDIO_SOURCE,
         provider="agent_codex",
-        model="",
         prompt_version=APPLE_MESSAGES_AUDIO_SOURCE.prompt_version,
         limit=5,
         max_error_attempts=3,
@@ -470,7 +479,6 @@ def test_candidate_query_error_window_applies_to_failed_runs_cte() -> None:
         warehouse,
         source=APPLE_MESSAGES_AUDIO_SOURCE,
         provider="agent_codex",
-        model="",
         prompt_version=APPLE_MESSAGES_AUDIO_SOURCE.prompt_version,
         limit=5,
         error_window_days=14,

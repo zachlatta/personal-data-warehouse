@@ -193,7 +193,6 @@ class VoiceMemosEnrichmentRunner:
         recordings = load_enrichment_candidates(
             self._warehouse,
             provider=self._provider,
-            model=self._client.model,
             prompt_version=self._prompt_version,
             limit=limit,
             recorded_after=recorded_after,
@@ -303,7 +302,6 @@ def load_enrichment_candidates(
     warehouse,
     *,
     provider: str,
-    model: str,
     prompt_version: str,
     limit: int | None,
     recorded_after: datetime | None = None,
@@ -336,13 +334,11 @@ def load_enrichment_candidates(
                 FROM agent_runs
                 WHERE task_type = 'apple_voice_memo_enrichment'
                   AND provider = {_sql_string(agent_run_provider)}
-                  AND model = {_sql_string(model)}
                   AND status = 'error'
                 UNION ALL
                 SELECT recording_id AS subject_id
                 FROM apple_voice_memos_enrichments
                 WHERE provider = {_sql_string(provider)}
-                  AND model = {_sql_string(model)}
                   AND status = 'error'
             )
             GROUP BY subject_id
@@ -368,7 +364,6 @@ def load_enrichment_candidates(
             SELECT account, recording_id, content_sha256, created_at
             FROM apple_voice_memos_enrichments
             WHERE provider = {_sql_string(provider)}
-              AND model = {_sql_string(model)}
               {completed_prompt_filter}
               AND status = 'completed'
         ) AS e

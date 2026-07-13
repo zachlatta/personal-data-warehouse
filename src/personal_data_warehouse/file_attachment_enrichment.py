@@ -4,9 +4,11 @@ A single source-agnostic pipeline scans a source's attachment table for image
 (and scanned-PDF) blobs that have no useful searchable text yet, runs each
 through the sandboxed agent container (codex/claude CLI), and upserts the
 structured result into the shared ``file_attachment_enrichments`` table under
-its own ``ai_provider``/``ai_model``/``ai_prompt_version`` identity. Timeline
-adapters fold those enrichment rows into the parent event's search document,
-which is what feeds ``search_text()``.
+its own ``ai_provider``/``ai_model``/``ai_prompt_version`` audit row. Candidate
+completion is keyed by provider + prompt version, so changing the runtime model
+does not silently reprocess the entire historical corpus. Timeline adapters fold
+those enrichment rows into the parent event's search document, which is what
+feeds ``search_text()``.
 
 Each source (Gmail attachments, WhatsApp media, …) is described by a
 :class:`FileEnrichmentSource` that names its candidate table and the columns the
@@ -243,7 +245,6 @@ class FileAttachmentEnrichmentRunner:
             self._warehouse,
             source=self._source,
             provider=self.enrichment_provider,
-            model=self._model,
             prompt_version=self._prompt_version,
             limit=limit,
             max_error_attempts=self._max_error_attempts,
@@ -482,7 +483,6 @@ def _candidate_query(source: FileEnrichmentSource, *, projection: str, tail: str
               FROM {ENRICHMENT_TABLE} done
               WHERE done.content_sha256 = a.{sha}
                 AND done.ai_provider = %s
-                AND done.ai_model = %s
                 AND done.ai_prompt_version = %s
                 AND done.text_extraction_status = ANY(%s)
           )
@@ -491,7 +491,6 @@ def _candidate_query(source: FileEnrichmentSource, *, projection: str, tail: str
               FROM {ENRICHMENT_TABLE} unreadable
               WHERE unreadable.content_sha256 = a.{sha}
                 AND unreadable.ai_provider = %s
-                AND unreadable.ai_model = %s
                 AND unreadable.ai_prompt_version = %s
                 AND unreadable.text_extraction_status = %s
                 {{unreadable_window_sql}}
@@ -504,7 +503,6 @@ def _candidate_params(
     source: FileEnrichmentSource,
     *,
     provider: str,
-    model: str,
     prompt_version: str,
     max_error_attempts: int,
     error_window_params: list[Any],
@@ -520,8 +518,8 @@ def _candidate_params(
     ]
     if source.pdf_requires_prior_extraction:
         params.append(list(PDF_VISION_SOURCE_STATUSES))
-    params.extend([provider, model, prompt_version, list(COMPLETED_STATUSES)])
-    params.extend([provider, model, prompt_version, STATUS_UNREADABLE, *unreadable_window_params])
+    params.extend([provider, prompt_version, list(COMPLETED_STATUSES)])
+    params.extend([provider, prompt_version, STATUS_UNREADABLE, *unreadable_window_params])
     return params
 
 
@@ -530,14 +528,13 @@ def load_file_enrichment_candidates(
     *,
     source: FileEnrichmentSource,
     provider: str,
-    model: str,
     prompt_version: str,
     limit: int | None,
     max_error_attempts: int = DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
 ) -> list[dict[str, Any]]:
     """Image (or scanned-PDF) attachments stored in the object store that have
-    no completed agent enrichment for this provider/model/prompt identity."""
+    no completed agent enrichment for this provider/prompt identity."""
     error_window_sql, error_window_params = _error_window_clause(error_window_days)
     unreadable_window_sql, unreadable_window_params = _error_window_clause(
         error_window_days, column="unreadable.updated_at"
@@ -574,7 +571,6 @@ def load_file_enrichment_candidates(
     params = _candidate_params(
         source,
         provider=provider,
-        model=model,
         prompt_version=prompt_version,
         max_error_attempts=max_error_attempts,
         error_window_params=error_window_params,
@@ -600,7 +596,6 @@ def has_file_enrichment_candidate(
     *,
     source: FileEnrichmentSource,
     provider: str,
-    model: str,
     prompt_version: str,
     max_error_attempts: int = DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
@@ -618,7 +613,6 @@ def has_file_enrichment_candidate(
     params = _candidate_params(
         source,
         provider=provider,
-        model=model,
         prompt_version=prompt_version,
         max_error_attempts=max_error_attempts,
         error_window_params=error_window_params,

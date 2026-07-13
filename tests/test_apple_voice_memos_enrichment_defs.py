@@ -15,7 +15,6 @@ from personal_data_warehouse.defs.apple_voice_memos_enrichment import (
     apple_voice_memos_enrichment_job,
     apple_voice_memos_enrichment_hourly,
     apple_voice_memos_enrichment_max_error_attempts,
-    apple_voice_memos_enrichment_model,
     apple_voice_memos_enrichment_prompt_version,
     apple_voice_memos_enrichment_provider,
     defs,
@@ -52,11 +51,10 @@ def test_apple_voice_memos_enrichment_recorded_after_env_accepts_date(monkeypatc
     )
 
 
-def test_apple_voice_memos_enrichment_uses_agent_provider_model_and_prompt() -> None:
+def test_apple_voice_memos_enrichment_uses_agent_provider_and_prompt() -> None:
     settings = FakeSettings()
 
     assert apple_voice_memos_enrichment_provider(settings) == "agent_codex"
-    assert apple_voice_memos_enrichment_model(settings) == "gpt-agent"
     assert apple_voice_memos_enrichment_prompt_version() == AGENT_ENRICHMENT_PROMPT_VERSION
 
 
@@ -155,7 +153,7 @@ def test_apple_voice_memos_enrichment_backlog_sensor_skips_when_backlog_is_empty
     assert "No unenriched Voice Memos" in result.skip_message
     assert settings_calls[0]["require_agent"] is True
     assert calls[0][1]["limit"] == 1
-    assert calls[0][1]["model"] == "gpt-agent"
+    assert "model" not in calls[0][1]
     assert calls[0][1]["recorded_after"] == datetime(2024, 12, 1, tzinfo=UTC)
     assert calls[0][1]["force_prompt_version"] is False
     assert calls[0][1]["max_error_attempts"] == 5

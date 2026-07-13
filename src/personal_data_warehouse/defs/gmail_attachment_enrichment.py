@@ -113,7 +113,6 @@ def gmail_attachment_enrichment_backlog_sensor(context):
             warehouse,
             source=GMAIL_SOURCE,
             provider=f"agent_{settings.agent.provider}",
-            model=settings.agent.model,
             prompt_version=GMAIL_SOURCE.prompt_version,
             max_error_attempts=gmail_attachment_enrichment_max_error_attempts(),
             error_window_days=gmail_attachment_enrichment_error_window_days(),

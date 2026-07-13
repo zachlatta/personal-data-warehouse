@@ -124,7 +124,6 @@ def apple_messages_attachment_enrichment_backlog_sensor(context):
                 warehouse,
                 source=APPLE_MESSAGES_SOURCE,
                 provider=f"agent_{settings.agent.provider}",
-                model=settings.agent.model,
                 prompt_version=APPLE_MESSAGES_SOURCE.prompt_version,
                 max_error_attempts=apple_messages_attachment_enrichment_max_error_attempts(),
                 error_window_days=apple_messages_attachment_enrichment_error_window_days(),

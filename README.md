@@ -932,6 +932,10 @@ and transcript. For long recordings, the model returns metadata and speaker/term
 then the pipeline assembles the detailed speaker-labeled transcript locally from diarized segments
 to avoid large model responses timing out.
 
+Agent enrichment completion is keyed by provider and prompt version, not model. Changing
+`AGENT_MODEL` affects new work without reprocessing the historical corpus; intentionally
+re-enriching existing content requires a prompt-version change.
+
 Run enrichment:
 
 ```bash

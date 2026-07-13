@@ -132,7 +132,6 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
         candidates = load_enrichment_candidates(
             warehouse,
             provider=apple_voice_memos_enrichment_provider(settings),
-            model=apple_voice_memos_enrichment_model(settings),
             prompt_version=apple_voice_memos_enrichment_prompt_version(),
             limit=1,
             recorded_after=recorded_after,
@@ -166,10 +165,6 @@ def apple_voice_memos_enrichment_recorded_after() -> datetime:
 
 def apple_voice_memos_enrichment_provider(settings) -> str:
     return f"agent_{settings.agent.provider}"
-
-
-def apple_voice_memos_enrichment_model(settings) -> str:
-    return settings.agent.model
 
 
 def apple_voice_memos_enrichment_prompt_version() -> str:

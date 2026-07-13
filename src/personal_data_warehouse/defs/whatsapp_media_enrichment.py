@@ -123,7 +123,6 @@ def whatsapp_media_enrichment_backlog_sensor(context):
                 warehouse,
                 source=WHATSAPP_SOURCE,
                 provider=f"agent_{settings.agent.provider}",
-                model=settings.agent.model,
                 prompt_version=WHATSAPP_SOURCE.prompt_version,
                 max_error_attempts=whatsapp_media_enrichment_max_error_attempts(),
                 error_window_days=whatsapp_media_enrichment_error_window_days(),

@@ -519,7 +519,7 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
     warehouse.ensure_agent_tables()
     account = "zach@example.test"
     now = datetime(2026, 6, 1, tzinfo=UTC)
-    provider, model, version = "agent_codex", "", AGENT_ATTACHMENT_PROMPT_VERSION
+    provider, current_model, version = "agent_codex", "current-model", AGENT_ATTACHMENT_PROMPT_VERSION
 
     def insert_attachment(message_id: str, *, sha: str, filename: str, mime_type: str, **overrides) -> None:
         defaults = dict(
@@ -563,7 +563,13 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
     insert_enrichment("sha-pending", ai_provider="", ai_model="", ai_prompt_version="", status="unsupported")
     # Already agent-enriched -> excluded.
     insert_attachment("m2", sha="sha-done", filename="chart.png", mime_type="image/png")
-    insert_enrichment("sha-done", ai_provider=provider, ai_model=model, ai_prompt_version=version, status="agent_ok")
+    insert_enrichment(
+        "sha-done",
+        ai_provider=provider,
+        ai_model="previous-model",
+        ai_prompt_version=version,
+        status="agent_ok",
+    )
     # Plain text attachment -> never a vision candidate.
     insert_attachment("m3", sha="sha-text", filename="notes.txt", mime_type="text/plain")
     # Scanned PDF whose deterministic extraction was empty -> candidate.
@@ -608,7 +614,6 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
         warehouse,
         source=GMAIL_SOURCE,
         provider=provider,
-        model=model,
         prompt_version=version,
         max_error_attempts=3,
         error_window_days=0,
@@ -618,7 +623,6 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
         warehouse,
         source=GMAIL_SOURCE,
         provider=provider,
-        model=model,
         prompt_version=version,
         limit=10,
         max_error_attempts=3,
@@ -636,7 +640,6 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
         warehouse,
         source=GMAIL_SOURCE,
         provider=provider,
-        model=model,
         prompt_version=version,
         limit=10,
         max_error_attempts=5,
@@ -644,13 +647,16 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
     )
     assert "sha-flaky" in {candidate["content_sha256"] for candidate in retried}
 
-    insert_enrichment("sha-pending", ai_provider=provider, ai_model=model, ai_prompt_version=version, status="agent_ok")
-    insert_enrichment("sha-pdf", ai_provider=provider, ai_model=model, ai_prompt_version=version, status="agent_ok")
+    insert_enrichment(
+        "sha-pending", ai_provider=provider, ai_model=current_model, ai_prompt_version=version, status="agent_ok"
+    )
+    insert_enrichment(
+        "sha-pdf", ai_provider=provider, ai_model=current_model, ai_prompt_version=version, status="agent_ok"
+    )
     assert not has_file_enrichment_candidate(
         warehouse,
         source=GMAIL_SOURCE,
         provider=provider,
-        model=model,
         prompt_version=version,
         max_error_attempts=3,
         error_window_days=0,
@@ -659,7 +665,6 @@ def test_postgres_attachment_enrichment_candidates_select_stored_images(warehous
         warehouse,
         source=GMAIL_SOURCE,
         provider=provider,
-        model=model,
         prompt_version=version,
         max_error_attempts=5,
         error_window_days=0,
@@ -768,7 +773,6 @@ def test_postgres_attachment_enrichment_error_window_ages_out_stale_failures(war
                 warehouse,
                 source=GMAIL_SOURCE,
                 provider=provider,
-                model=model,
                 prompt_version=version,
                 limit=10,
                 max_error_attempts=3,
@@ -861,14 +865,12 @@ def test_postgres_whatsapp_media_enrichment_candidates_select_downloaded_blobs(
         warehouse,
         source=WHATSAPP_SOURCE,
         provider=provider,
-        model=model,
         prompt_version=version,
     )
     candidates = load_file_enrichment_candidates(
         warehouse,
         source=WHATSAPP_SOURCE,
         provider=provider,
-        model=model,
         prompt_version=version,
         limit=10,
     )
@@ -885,7 +887,6 @@ def test_postgres_whatsapp_media_enrichment_candidates_select_downloaded_blobs(
         warehouse,
         source=WHATSAPP_SOURCE,
         provider=provider,
-        model=model,
         prompt_version=version,
     )
 
@@ -1186,23 +1187,23 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
     assert {(rel.schema, rel.name) for rel in physical} <= found
 
 
-def test_postgres_warehouse_drops_removed_personal_finance_schema(warehouse: PostgresWarehouse) -> None:
+def test_postgres_warehouse_does_not_mutate_unrelated_legacy_relations(warehouse: PostgresWarehouse) -> None:
     warehouse._command("CREATE TABLE finance_accounts (id text PRIMARY KEY)")
-    warehouse._command("CREATE VIEW clean_finance_accounts AS SELECT id FROM finance_accounts")
+    warehouse._command("CREATE VIEW finance_liabilities AS SELECT id FROM finance_accounts")
 
     warehouse.ensure_tables()
 
     rows = warehouse._query(
         """
-        SELECT table_name
+        SELECT table_name, table_type
         FROM information_schema.tables
         WHERE table_schema = current_schema()
-          AND table_name IN ('finance_accounts', 'clean_finance_accounts')
-        ORDER BY table_name
+          AND table_name IN ('finance_accounts', 'finance_liabilities')
+        ORDER BY table_name, table_type
         """
     )
 
-    assert rows == []
+    assert rows == [("finance_accounts", "BASE TABLE"), ("finance_liabilities", "VIEW")]
 
 
 def test_postgres_slack_tables_create_recent_message_indexes(warehouse: PostgresWarehouse) -> None:
