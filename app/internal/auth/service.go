@@ -61,8 +61,23 @@ func NewService(secret []byte, now func() time.Time) *Service {
 func (s *Service) RegisterHandlers(mux *http.ServeMux, baseURL string) {
 	baseURL = strings.TrimRight(baseURL, "/")
 	s.logger.Info("registering OAuth handlers", "base_url", baseURL)
-	mux.HandleFunc("/.well-known/oauth-protected-resource", s.protectedResourceMetadata(baseURL))
-	mux.HandleFunc("/.well-known/oauth-authorization-server", s.authServerMetadata(baseURL))
+	// Clients derive discovery URLs from the /mcp endpoint in several shapes:
+	// the plain root documents, the RFC 8414/9728 path-inserted forms
+	// (/.well-known/<doc>/mcp), the path-appended forms
+	// (/mcp/.well-known/<doc>), and the OpenID Connect discovery equivalents.
+	// Claude's connector probes these when recovering from a 401 and gives up
+	// on the server if they 404, so every variant serves the same document.
+	resourceMeta := s.protectedResourceMetadata(baseURL)
+	mux.HandleFunc("/.well-known/oauth-protected-resource", resourceMeta)
+	mux.HandleFunc("/.well-known/oauth-protected-resource/", resourceMeta)
+	mux.HandleFunc("/mcp/.well-known/oauth-protected-resource", resourceMeta)
+	authMeta := s.authServerMetadata(baseURL)
+	mux.HandleFunc("/.well-known/oauth-authorization-server", authMeta)
+	mux.HandleFunc("/.well-known/oauth-authorization-server/", authMeta)
+	mux.HandleFunc("/mcp/.well-known/oauth-authorization-server", authMeta)
+	mux.HandleFunc("/.well-known/openid-configuration", authMeta)
+	mux.HandleFunc("/.well-known/openid-configuration/", authMeta)
+	mux.HandleFunc("/mcp/.well-known/openid-configuration", authMeta)
 	mux.HandleFunc("/oauth/register", s.registerClient)
 	mux.HandleFunc("/oauth/authorize", s.authorize)
 	mux.HandleFunc("/oauth/token", s.token)

@@ -156,6 +156,65 @@ func TestProtectedResourceMetadataNamesAppleMessagesAndIMessage(t *testing.T) {
 	}
 }
 
+// Claude's connector recovery probes OAuth discovery at path-inserted
+// (RFC 8414/9728) and path-appended well-known URIs derived from the /mcp
+// endpoint, plus the OpenID Connect discovery equivalents. Serving them only
+// at the root made every probe 404, so an expired access token could never be
+// refreshed and the connector's tools silently failed to load.
+func TestOAuthDiscoveryServedAtMCPPathVariants(t *testing.T) {
+	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
+	mux := http.NewServeMux()
+	svc.RegisterHandlers(mux, "https://mcp.example.com")
+
+	authServerPaths := []string{
+		"/.well-known/oauth-authorization-server",
+		"/.well-known/oauth-authorization-server/mcp",
+		"/mcp/.well-known/oauth-authorization-server",
+		"/.well-known/openid-configuration",
+		"/.well-known/openid-configuration/mcp",
+		"/mcp/.well-known/openid-configuration",
+	}
+	for _, path := range authServerPaths {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		var meta struct {
+			Issuer        string `json:"issuer"`
+			TokenEndpoint string `json:"token_endpoint"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		if meta.Issuer != "https://mcp.example.com" || meta.TokenEndpoint != "https://mcp.example.com/oauth/token" {
+			t.Fatalf("GET %s metadata = %+v", path, meta)
+		}
+	}
+
+	resourcePaths := []string{
+		"/.well-known/oauth-protected-resource",
+		"/.well-known/oauth-protected-resource/mcp",
+		"/mcp/.well-known/oauth-protected-resource",
+	}
+	for _, path := range resourcePaths {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		var meta struct {
+			Resource string `json:"resource"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		if meta.Resource != "https://mcp.example.com/mcp" {
+			t.Fatalf("GET %s resource = %q", path, meta.Resource)
+		}
+	}
+}
+
 func TestAuthorizeAllowsLoopbackPortVariation(t *testing.T) {
 	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
 	mux := http.NewServeMux()

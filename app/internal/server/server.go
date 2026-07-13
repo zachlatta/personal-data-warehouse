@@ -269,10 +269,15 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	}
 	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default(), extra...)
 	mcpServer := newMCPServerFromRegistry(registry, slog.Default())
+	// Stateless: every tool here is a self-contained request/response, and
+	// clients (notably the Claude connector) reuse their Mcp-Session-Id across
+	// redeploys and long idle gaps. A stateful handler answered those with
+	// "session not found" 404s, which the connector treated as the server
+	// being down, so its tools never loaded for that conversation.
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{
-		JSONResponse:   true,
-		Logger:         slog.Default().With("component", "mcp_streamable"),
-		SessionTimeout: 30 * time.Minute,
+		JSONResponse: true,
+		Stateless:    true,
+		Logger:       slog.Default().With("component", "mcp_streamable"),
 	})
 	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(mcpHandler)
 	mux.Handle("/mcp", protected)
