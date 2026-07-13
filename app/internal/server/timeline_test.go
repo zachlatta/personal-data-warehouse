@@ -138,6 +138,9 @@ func TestTimelinePageIsServedWithoutAuth(t *testing.T) {
 	if !strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
 		t.Fatalf("timeline page content type = %q", resp.Header.Get("Content-Type"))
 	}
+	if !strings.Contains(string(body), `whoop: "#`) {
+		t.Fatal("timeline page is missing a distinct WHOOP source hue")
+	}
 }
 
 func TestTimelineEndpointsAbsentWithoutArgsRunner(t *testing.T) {
@@ -295,6 +298,58 @@ func TestTimelineItemReturnsDetailWithChildrenAndSourceRow(t *testing.T) {
 	}
 }
 
+func TestTimelineWhoopItemReturnsAuthoritativeSourceRow(t *testing.T) {
+	item := timelineEventRow("whoop-event", 21, "2026-01-02T03:04:05Z")
+	item["adapter"] = "whoop_recovery"
+	item["source"] = "whoop"
+	item["kind"] = "recovery"
+	item["source_table"] = "whoop_recoveries"
+	item["source_pk"] = `{"account":"z@x.test","cycle_id":"cycle-1"}`
+
+	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
+		"FROM " + warehouse.SQLRelation("timeline_events"): {Rows: []map[string]any{item}},
+		"row_to_json": {Rows: []map[string]any{
+			{"row": `{"cycle_id":"cycle-1","recovery_score":70,"resting_heart_rate":60}`},
+		}},
+	}}
+	srv := newTimelineTestServer(t, runner)
+	resp, body := timelineGET(t, srv, "/api/timeline/item?adapter=whoop_recovery&event_id=whoop-event", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d: %s", resp.StatusCode, body)
+	}
+	var payload struct {
+		SourceRow map[string]any             `json:"source_row"`
+		Children  map[string]json.RawMessage `json:"children"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.SourceRow["recovery_score"] != float64(70) {
+		t.Fatalf("source_row = %#v", payload.SourceRow)
+	}
+	if len(payload.Children) != 0 {
+		t.Fatalf("WHOOP recovery should not have child tables: %#v", payload.Children)
+	}
+
+	found := false
+	for i := 0; i < runner.callCount(); i++ {
+		call := runner.call(i)
+		if !strings.Contains(call.SQL, "row_to_json") {
+			continue
+		}
+		found = true
+		if !strings.Contains(call.SQL, "FROM "+warehouse.SQLRelation("whoop_recoveries")+" t WHERE \"account\" = $1 AND \"cycle_id\" = $2") {
+			t.Fatalf("WHOOP source row SQL = %q", call.SQL)
+		}
+		if call.Args[0] != "z@x.test" || call.Args[1] != "cycle-1" {
+			t.Fatalf("WHOOP source row args = %#v", call.Args)
+		}
+	}
+	if !found {
+		t.Fatal("WHOOP source row query never ran")
+	}
+}
+
 func TestTimelineItemNotFound(t *testing.T) {
 	srv := newTimelineTestServer(t, &fakeTimelineRunner{})
 	resp, _ := timelineGET(t, srv, "/api/timeline/item?adapter=gmail_email&event_id=missing", true)
@@ -336,6 +391,11 @@ func TestTimelineSourcesAggregatesAndCaches(t *testing.T) {
 	}
 	if !timelinePayloadHasSourceKind(first.Sources, "gmail", "email") || !timelinePayloadHasSourceKind(first.Sources, "slack", "message") {
 		t.Fatalf("warming payload should include filter catalog so the sidebar is usable immediately: %s", body)
+	}
+	for _, kind := range []string{"health_cycle", "recovery", "sleep", "workout"} {
+		if !timelinePayloadHasSourceKind(first.Sources, "whoop", kind) {
+			t.Fatalf("warming payload should expose WHOOP %s filters immediately: %s", kind, body)
+		}
 	}
 	if !timelinePayloadHasPriority(first.Priorities, 1) || !timelinePayloadHasPriority(first.Priorities, 5) {
 		t.Fatalf("warming payload should include priority catalog: %s", body)
@@ -395,7 +455,8 @@ func TestTimelineChildQueriesCoverEveryEventTable(t *testing.T) {
 		"gmail_messages", "slack_messages", "slack_files", "apple_messages",
 		"whatsapp_messages", "agent_session_events", "apple_note_revisions",
 		"apple_voice_memos_files", "calendar_events", "google_drive_files",
-		"contact_cards", "upstream_mutations", "upstream_mutation_requests", "agent_runs",
+		"contact_cards", "whoop_cycles", "whoop_recoveries", "whoop_sleeps",
+		"whoop_workouts", "upstream_mutations", "upstream_mutation_requests", "agent_runs",
 	}
 	for _, table := range expected {
 		if _, ok := timelineChildQueries[table]; !ok {

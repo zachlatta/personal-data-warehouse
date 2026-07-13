@@ -267,7 +267,7 @@ a.filelink:hover { text-decoration: underline; }
   var HUES = {
     gmail: "#e06c5f", slack: "#5fb0e0", apple_messages: "#62c98d", whatsapp: "#45c07a",
     apple_notes: "#e8975a", voice_memos: "#e05f9a", calendar: "#e8b45a",
-    google_drive: "#d9c95f", contacts: "#7fd0c4", mutations: "#c46be0", warehouse: "#8b94a1",
+    google_drive: "#d9c95f", contacts: "#7fd0c4", whoop: "#b8d84e", mutations: "#c46be0", warehouse: "#8b94a1",
     claude_code: "#b78ae8", codex: "#9a8ae8", openclaw: "#8aa6e8", pi: "#7b93df", claude_desktop: "#cf8ae8", chatgpt: "#8ae8c9",
     agent_sessions: "#b78ae8"
   };

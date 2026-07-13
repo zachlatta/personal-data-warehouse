@@ -237,6 +237,10 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "calendar", kind: "event"},
 	{source: "google_drive", kind: "file_change"},
 	{source: "contacts", kind: "contact_update"},
+	{source: "whoop", kind: "health_cycle"},
+	{source: "whoop", kind: "recovery"},
+	{source: "whoop", kind: "sleep"},
+	{source: "whoop", kind: "workout"},
 	{source: "mutations", kind: "mutation"},
 	{source: "mutations", kind: "mutation_request"},
 	{source: "warehouse", kind: "enrichment_run"},
@@ -530,9 +534,13 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			      FROM ` + warehouse.SQLRelation("agent_run_events") + ` WHERE run_id = $1 ORDER BY event_index LIMIT 100`,
 		},
 	},
-	"slack_files":     {},
-	"calendar_events": {},
-	"contact_cards":   {},
+	"slack_files":      {},
+	"calendar_events":  {},
+	"contact_cards":    {},
+	"whoop_cycles":     {},
+	"whoop_recoveries": {},
+	"whoop_sleeps":     {},
+	"whoop_workouts":   {},
 }
 
 var timelineItemSQL = `
