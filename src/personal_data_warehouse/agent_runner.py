@@ -31,6 +31,8 @@ DEFAULT_AGENT_MEMORY = "4g"
 DEFAULT_AGENT_CPUS = "2"
 DEFAULT_AGENT_PIDS_LIMIT = 512
 DEFAULT_AGENT_NETWORK = "bridge"
+DEFAULT_AGENT_MODEL = "gpt-5.6-sol"
+DEFAULT_AGENT_REASONING_EFFORT = "medium"
 DEFAULT_AGENT_IMAGE_REPOSITORY = "personal-data-warehouse-agent"
 DEFAULT_AGENT_DOCKERFILE_PATH = Path(__file__).resolve().parents[2] / "docker" / "agent.Dockerfile"
 DEFAULT_AGENT_ENTRYPOINT_PATH = Path(__file__).resolve().parents[2] / "docker" / "agent-entrypoint.sh"
@@ -45,6 +47,7 @@ class AgentContainerConfig:
     image: str
     provider: str = "codex"
     model: str = ""
+    reasoning_effort: str = DEFAULT_AGENT_REASONING_EFFORT
     auth_volume: str = DEFAULT_AGENT_AUTH_VOLUME
     runs_volume: str = DEFAULT_AGENT_RUNS_VOLUME
     runs_dir: Path = Path(DEFAULT_AGENT_RUNS_DIR)
@@ -167,7 +170,8 @@ class ContainerAgentRunner:
         provider = (request.provider or self._config.normalized_provider).strip().lower()
         if provider not in {"codex", "claude"}:
             raise ValueError("agent provider must be codex or claude")
-        model = request.model if request.model is not None else self._config.model
+        configured_model = request.model if request.model is not None else self._config.model
+        model = configured_model.strip() or default_agent_model(provider)
         prompt_too_large = agent_prompt_size_error(request.prompt, self._config.max_prompt_chars)
         if prompt_too_large:
             now = datetime.now(tz=UTC)
@@ -342,6 +346,8 @@ class ContainerAgentRunner:
             f"AGENT_PROVIDER={provider}",
             "--env",
             f"AGENT_MODEL={model}",
+            "--env",
+            f"AGENT_REASONING_EFFORT={self._config.reasoning_effort}",
             "--env",
             f"AGENT_RUN_ID={request.run_id}",
             "--env",
@@ -915,10 +921,14 @@ def provider_auth_lock(provider: str):
 
 def agent_config_from_env() -> AgentContainerConfig:
     network = os.getenv("AGENT_DOCKER_NETWORK", DEFAULT_AGENT_NETWORK)
+    provider = os.getenv("AGENT_PROVIDER", "codex")
     return AgentContainerConfig(
         image=default_agent_docker_image(),
-        provider=os.getenv("AGENT_PROVIDER", "codex"),
-        model=os.getenv("AGENT_MODEL", ""),
+        provider=provider,
+        model=(os.getenv("AGENT_MODEL") or default_agent_model(provider)).strip(),
+        reasoning_effort=(
+            os.getenv("AGENT_REASONING_EFFORT") or DEFAULT_AGENT_REASONING_EFFORT
+        ).strip(),
         auth_volume=os.getenv("AGENT_AUTH_VOLUME", DEFAULT_AGENT_AUTH_VOLUME),
         runs_volume=os.getenv("AGENT_RUNS_VOLUME", DEFAULT_AGENT_RUNS_VOLUME),
         runs_dir=Path(os.getenv("AGENT_RUNS_DIR", DEFAULT_AGENT_RUNS_DIR)),
@@ -933,6 +943,10 @@ def agent_config_from_env() -> AgentContainerConfig:
             default_agent_tool_proxy_public_host(network),
         ),
     )
+
+
+def default_agent_model(provider: str) -> str:
+    return DEFAULT_AGENT_MODEL if provider.strip().lower() == "codex" else ""
 
 
 def default_agent_tool_proxy_public_host(network: str) -> str:
@@ -1037,6 +1051,7 @@ def auth_main(argv: Sequence[str] | None = None) -> int:
         image=image,
         provider=config.provider,
         model=config.model,
+        reasoning_effort=config.reasoning_effort,
         auth_volume=config.auth_volume,
         runs_volume=config.runs_volume,
         runs_dir=config.runs_dir,

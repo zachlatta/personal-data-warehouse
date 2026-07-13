@@ -56,6 +56,8 @@ def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> N
     assert "OPENAI_API_KEY" not in " ".join(command)
     assert "ANTHROPIC_API_KEY" not in " ".join(command)
     assert "POSTGRES_DATABASE_URL" not in " ".join(command)
+    assert "AGENT_MODEL=gpt-test" in command
+    assert "AGENT_REASONING_EFFORT=medium" in command
     assert "type=volume,src=pdw-agent-auth,dst=/agent-auth" in command
     assert "type=volume,src=pdw-agent-runs,dst=/agent-runs" in command
     assert "--add-host" in command
@@ -441,6 +443,26 @@ def test_agent_config_uses_container_hostname_for_non_bridge_proxy(monkeypatch) 
     assert default_agent_tool_proxy_public_host("bridge") == "host.docker.internal"
 
 
+def test_agent_config_defaults_codex_to_gpt_5_6_sol_with_medium_reasoning(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_PROVIDER", "codex")
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.delenv("AGENT_REASONING_EFFORT", raising=False)
+
+    config = agent_config_from_env()
+
+    assert config.model == "gpt-5.6-sol"
+    assert config.reasoning_effort == "medium"
+
+
+def test_agent_config_keeps_claude_model_unset_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_PROVIDER", "claude")
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+
+    config = agent_config_from_env()
+
+    assert config.model == ""
+
+
 def test_ensure_agent_image_skips_build_when_derived_image_exists() -> None:
     calls = []
 
@@ -485,6 +507,8 @@ def test_agent_entrypoint_skips_codex_git_repo_check() -> None:
     assert "codex exec --json --skip-git-repo-check" in entrypoint
     assert "--dangerously-bypass-approvals-and-sandbox" in entrypoint
     assert "shell_environment_policy.inherit=all" in entrypoint
+    assert 'model_reasoning_effort="$reasoning_effort"' in entrypoint
+    assert 'model="${model:-gpt-5.6-sol}"' in entrypoint
     assert 'export PATH="$tools_dir:$PATH"' in entrypoint
     assert '< "$prompt_path"' in entrypoint
 
@@ -643,6 +667,7 @@ def test_builtin_cli_tools_reject_invalid_json_shape(tmp_path) -> None:
 def test_load_settings_reads_agent_config_without_api_keys(monkeypatch) -> None:
     monkeypatch.setenv("AGENT_PROVIDER", "claude")
     monkeypatch.setenv("AGENT_MODEL", "claude-test")
+    monkeypatch.setenv("AGENT_REASONING_EFFORT", "high")
     monkeypatch.setenv("AGENT_TOOL_PROXY_PUBLIC_HOST", "dagster")
 
     settings = load_settings(require_postgres=False, require_gmail=False, require_agent=True)
@@ -650,15 +675,22 @@ def test_load_settings_reads_agent_config_without_api_keys(monkeypatch) -> None:
     assert settings.agent is not None
     assert settings.agent.provider == "claude"
     assert settings.agent.model == "claude-test"
+    assert settings.agent.reasoning_effort == "high"
     assert settings.agent.docker_image.startswith("personal-data-warehouse-agent:")
     assert settings.agent.runs_dir == ".agent-runs"
     assert settings.agent.tool_proxy_public_host == "dagster"
 
 
 def test_load_settings_derives_agent_image_when_required(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_PROVIDER", "codex")
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.delenv("AGENT_REASONING_EFFORT", raising=False)
+
     settings = load_settings(require_postgres=False, require_gmail=False, require_agent=True)
 
     assert settings.agent is not None
+    assert settings.agent.model == "gpt-5.6-sol"
+    assert settings.agent.reasoning_effort == "medium"
     assert settings.agent.docker_image.startswith("personal-data-warehouse-agent:")
     assert len(settings.agent.docker_image.rsplit(":", 1)[1]) == 6
 
@@ -679,6 +711,7 @@ def test_agent_resource_builds_container_config() -> None:
         docker_image="pdw-agent:latest",
         provider="claude",
         model="claude-test",
+        reasoning_effort="high",
         auth_volume="auth-vol",
         runs_volume="runs-vol",
         runs_dir="/tmp/runs",
@@ -691,6 +724,7 @@ def test_agent_resource_builds_container_config() -> None:
     assert config.image == "pdw-agent:latest"
     assert config.provider == "claude"
     assert config.model == "claude-test"
+    assert config.reasoning_effort == "high"
     assert config.auth_volume == "auth-vol"
     assert config.runs_volume == "runs-vol"
     assert str(config.runs_dir) == "/tmp/runs"

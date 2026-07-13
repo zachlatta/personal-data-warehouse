@@ -8,6 +8,8 @@ import subprocess
 import pytest
 
 from personal_data_warehouse.agent_runner import (
+    DEFAULT_AGENT_MODEL,
+    DEFAULT_AGENT_REASONING_EFFORT,
     AgentContainerConfig,
     AgentRunRequest,
     ContainerAgentRunner,
@@ -29,7 +31,8 @@ def live_agent_config(tmp_path) -> AgentContainerConfig:
     return AgentContainerConfig(
         image=image,
         provider=os.getenv("AGENT_PROVIDER", "codex"),
-        model=os.getenv("AGENT_MODEL", ""),
+        model=os.getenv("AGENT_MODEL", DEFAULT_AGENT_MODEL),
+        reasoning_effort=os.getenv("AGENT_REASONING_EFFORT", DEFAULT_AGENT_REASONING_EFFORT),
         auth_volume=os.getenv("AGENT_AUTH_VOLUME", "pdw-agent-auth"),
         runs_volume=os.getenv("AGENT_RUNS_VOLUME", "pdw-agent-runs"),
         runs_dir=tmp_path,

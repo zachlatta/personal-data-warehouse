@@ -11,6 +11,7 @@ from personal_data_warehouse.agent_runner import (
     DEFAULT_AGENT_MEMORY,
     DEFAULT_AGENT_NETWORK,
     DEFAULT_AGENT_PIDS_LIMIT,
+    DEFAULT_AGENT_REASONING_EFFORT,
     DEFAULT_AGENT_RUNS_DIR,
     DEFAULT_AGENT_RUNS_VOLUME,
     AgentContainerConfig,
@@ -27,6 +28,7 @@ class AgentResource(ConfigurableResource):
     enabled: bool = True
     provider: str = "codex"
     model: str = ""
+    reasoning_effort: str = DEFAULT_AGENT_REASONING_EFFORT
     docker_image: str = ""
     auth_volume: str = DEFAULT_AGENT_AUTH_VOLUME
     runs_volume: str = DEFAULT_AGENT_RUNS_VOLUME
@@ -49,6 +51,7 @@ class AgentResource(ConfigurableResource):
             docker_image=config.docker_image,
             provider=config.provider,
             model=config.model,
+            reasoning_effort=config.reasoning_effort,
             auth_volume=config.auth_volume,
             runs_volume=config.runs_volume,
             runs_dir=config.runs_dir,
@@ -71,6 +74,7 @@ class AgentResource(ConfigurableResource):
             image=self.docker_image,
             provider=self.provider,
             model=self.model,
+            reasoning_effort=self.reasoning_effort,
             auth_volume=self.auth_volume,
             runs_volume=self.runs_volume,
             runs_dir=Path(self.runs_dir),

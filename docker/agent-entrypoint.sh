@@ -7,6 +7,7 @@ fi
 
 provider="${AGENT_PROVIDER:-codex}"
 model="${AGENT_MODEL:-}"
+reasoning_effort="${AGENT_REASONING_EFFORT:-medium}"
 prompt_path="${AGENT_PROMPT_PATH:-/agent-runs/prompt.txt}"
 schema_path="${AGENT_SCHEMA_PATH:-/agent-runs/schema.json}"
 final_json_path="${AGENT_FINAL_JSON_PATH:-/agent-runs/final.json}"
@@ -29,11 +30,8 @@ fi
 
 case "$provider" in
   codex)
-    if [ -n "$model" ]; then
-      codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c shell_environment_policy.inherit=all --model "$model" --output-last-message "$final_message_path" --output-schema "$schema_path" - < "$prompt_path"
-    else
-      codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c shell_environment_policy.inherit=all --output-last-message "$final_message_path" --output-schema "$schema_path" - < "$prompt_path"
-    fi
+    model="${model:-gpt-5.6-sol}"
+    codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c shell_environment_policy.inherit=all -c model_reasoning_effort="$reasoning_effort" --model "$model" --output-last-message "$final_message_path" --output-schema "$schema_path" - < "$prompt_path"
     if [ -f "$final_message_path" ]; then
       python3 - "$final_message_path" "$final_json_path" <<'PY'
 import json

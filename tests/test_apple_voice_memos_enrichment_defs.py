@@ -195,6 +195,7 @@ class FakeSettings:
         {
             "provider": "codex",
             "model": "gpt-agent",
+            "reasoning_effort": "medium",
             "docker_image": "pdw-agent:latest",
             "auth_volume": "auth-vol",
             "runs_volume": "runs-vol",

@@ -8,7 +8,12 @@ import socket
 
 from dotenv import load_dotenv
 
-from personal_data_warehouse.agent_runner import default_agent_docker_image, default_agent_tool_proxy_public_host
+from personal_data_warehouse.agent_runner import (
+    DEFAULT_AGENT_REASONING_EFFORT,
+    default_agent_docker_image,
+    default_agent_model,
+    default_agent_tool_proxy_public_host,
+)
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
@@ -343,6 +348,7 @@ class AgentConfig:
     provider: str
     model: str
     docker_image: str
+    reasoning_effort: str = DEFAULT_AGENT_REASONING_EFFORT
     auth_volume: str = DEFAULT_AGENT_AUTH_VOLUME
     runs_volume: str = DEFAULT_AGENT_RUNS_VOLUME
     runs_dir: str = DEFAULT_AGENT_RUNS_DIR
@@ -1349,8 +1355,11 @@ def load_settings(
             raise ValueError("AGENT_DOCKER_PIDS_LIMIT must be at least 1")
         agent = AgentConfig(
             provider=agent_provider,
-            model=os.getenv("AGENT_MODEL", "").strip(),
+            model=(os.getenv("AGENT_MODEL") or default_agent_model(agent_provider)).strip(),
             docker_image=default_agent_docker_image(),
+            reasoning_effort=(
+                os.getenv("AGENT_REASONING_EFFORT") or DEFAULT_AGENT_REASONING_EFFORT
+            ).strip(),
             auth_volume=os.getenv("AGENT_AUTH_VOLUME", DEFAULT_AGENT_AUTH_VOLUME),
             runs_volume=os.getenv("AGENT_RUNS_VOLUME", DEFAULT_AGENT_RUNS_VOLUME),
             runs_dir=os.getenv("AGENT_RUNS_DIR", DEFAULT_AGENT_RUNS_DIR),
