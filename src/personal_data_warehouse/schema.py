@@ -752,6 +752,100 @@ class PlaidLinkedItem:
     institution_id: str = ""
     institution_name: str = ""
 
+# Photos: every photo source (apple_photos now; google_photos / photo_imports
+# later) lands raw file rows with this exact shared shape in its own
+# source-named schema (<source>.files). Cross-source identity lives in the
+# derived photos.* tables below; raw rows never learn about identity.
+PHOTO_SOURCE_FILE_COLUMNS = (
+    "source",
+    "account",
+    "source_native_id",
+    "role",
+    "filename",
+    "mime_type",
+    "size_bytes",
+    "width",
+    "height",
+    "content_sha256",
+    "captured_at",
+    "capture_tz_offset",
+    "camera_make",
+    "camera_model",
+    "raw_metadata_json",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "metadata_storage_key",
+    "metadata_storage_file_id",
+    "metadata_storage_url",
+    "metadata_content_sha256",
+    "is_deleted",
+    "ingested_at",
+    "sync_version",
+)
+
+# One row per logical photo (photos.assets): the deduplicated identity that
+# renditions from every source resolve into. Canonical fields are re-resolved
+# by the identity runner whenever a new rendition links in.
+PHOTO_ASSET_COLUMNS = (
+    "photo_id",
+    "account",
+    "kind",
+    "capture_ts",
+    "capture_tz_offset",
+    "latitude",
+    "longitude",
+    "camera_make",
+    "camera_model",
+    "width",
+    "height",
+    "best_file_sha256",
+    "best_file_mime_type",
+    "best_file_filename",
+    "best_file_size_bytes",
+    "thumbnail_content_sha256",
+    "thumbnail_content_type",
+    "thumbnail_size_bytes",
+    "thumbnail_storage_backend",
+    "thumbnail_storage_key",
+    "thumbnail_storage_file_id",
+    "thumbnail_storage_url",
+    "created_at",
+    "updated_at",
+    "sync_version",
+)
+
+# Identity link + dedup audit (photos.asset_files): one row per raw file row,
+# recording which asset it resolved into and why (match_method/match_score).
+# Merges never mutate raw rows; deleting these links and re-running the
+# identity asset replays every decision.
+PHOTO_ASSET_FILE_COLUMNS = (
+    "source",
+    "account",
+    "source_native_id",
+    "role",
+    "content_sha256",
+    "photo_id",
+    "match_method",
+    "match_score",
+    "created_at",
+    "sync_version",
+)
+
+# Perceptual-hash cache (enrichment.media_fingerprints), keyed by content sha
+# so any blob in the warehouse can be fingerprinted once. Deliberately not
+# photo-named: a future linker may fingerprint message/mail attachments into
+# the same table.
+MEDIA_FINGERPRINT_COLUMNS = (
+    "content_sha256",
+    "hash_version",
+    "dhash",
+    "width",
+    "height",
+    "created_at",
+    "sync_version",
+)
 
 AGENT_RUN_COLUMNS = (
     "run_id",

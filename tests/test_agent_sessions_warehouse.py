@@ -182,10 +182,12 @@ def test_search_text_includes_agent_session_branches(warehouse) -> None:
     warehouse.ensure_apple_notes_tables()
     warehouse.ensure_apple_messages_tables()
     warehouse.ensure_whatsapp_tables()
+    warehouse.ensure_photos_tables()
     warehouse.ensure_slack_tables()
     warehouse.ensure_upstream_mutation_tables()
     warehouse.ensure_agent_sessions_tables()
     warehouse.ensure_google_drive_source_tables()
+    warehouse.ensure_whoop_tables()
     warehouse.ensure_timeline_tables()
 
     warehouse.insert_agent_session_events(

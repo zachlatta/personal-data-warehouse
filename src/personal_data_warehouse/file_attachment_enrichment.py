@@ -142,6 +142,9 @@ class FileEnrichmentSource:
     # PDF_VISION_SOURCE_STATUSES). When False, any PDF is eligible directly —
     # used by sources that have no deterministic extraction step.
     pdf_requires_prior_extraction: bool = True
+    # Optional source-tuned instructions block; empty means the generic
+    # document-oriented attachment_vision_instructions(label).
+    vision_instructions: str = ""
 
 
 GMAIL_SOURCE = FileEnrichmentSource(
@@ -188,6 +191,36 @@ APPLE_MESSAGES_SOURCE = FileEnrichmentSource(
     # No deterministic PDF text-extraction stage exists for iMessage, same as
     # WhatsApp, so any PDF is directly eligible.
     pdf_requires_prior_extraction=False,
+)
+
+def photo_vision_instructions() -> str:
+    """Personal-photo emphasis: the goal is finding the photo again later
+    ("the whiteboard in Vermont", "dinner with the red bicycle"), not document
+    extraction."""
+    return """Describe this personal photo so its owner can find it again by search.
+
+Look at the image first. Lead with a specific one-sentence summary of the scene: who/what is pictured, doing what, where (e.g. "Two people cooking pasta in a small home kitchen at night"). Then capture: the setting and location cues (indoor/outdoor, urban/nature, storefront names, street signs, landmarks, skylines, license-plate regions), the number of people and coarse descriptions (adult/child, clothing colors — do NOT guess identities), the main objects, animals, food, vehicles, or products, and the activity or occasion if evident (birthday, hike, concert, whiteboard session, screenshot).
+
+Extract ALL readable text anywhere in the image into visible_text exactly as printed: signs, menus, labels, whiteboards, slides, book covers, screenshots. Put place names, business names, brands, and event names in entities. Fill search_keywords with the concrete nouns and scene words someone would type to find this photo (e.g. beach, sunset, golden retriever, whiteboard, ramen).
+
+Set document_type to a short scene category: "photo: <category>" (e.g. "photo: outdoor landscape", "photo: group at dinner", "photo: whiteboard", "photo: screenshot", "photo: document"). Nearly every real photo is_useful=true; use false only for fully black/blank/corrupted frames. Do not infer anything from the filename. Do not invent details. Keep at most 12 visible_text chunks, 10 entities, 12 search_keywords, and 5 uncertainties."""
+
+
+# One enrichable still per LOGICAL photo (the identity layer's 1280px JPEG
+# thumbnail, via marts.photo_canonical_renditions) — never per rendition, so a
+# photo arriving from three sources is enriched once.
+PHOTOS_SOURCE = FileEnrichmentSource(
+    name="photos",
+    label="personal photo",
+    task_type="photo_enrichment",
+    prompt_version="photo-agent-v1",
+    table="photo_canonical_renditions",
+    stored_predicate="a.content_sha256 <> '' AND a.storage_file_id <> ''",
+    size_column="size_bytes",
+    order_column="capture_ts",
+    # No deterministic PDF stage; the canonical rendition is always a JPEG.
+    pdf_requires_prior_extraction=False,
+    vision_instructions=photo_vision_instructions(),
 )
 
 # Backwards-friendly aliases retained for the Gmail-specific call sites/tests
@@ -305,7 +338,10 @@ class FileAttachmentEnrichmentRunner:
             filename=str(candidate.get("filename", "")),
         )
         prompt = attachment_vision_prompt(
-            image_name=image_name, candidate=candidate, source_label=self._source.label
+            image_name=image_name,
+            candidate=candidate,
+            source_label=self._source.label,
+            instructions=self._source.vision_instructions or None,
         )
         request = AgentRunRequest(
             prompt=prompt,
@@ -752,7 +788,11 @@ Use false for is_useful only for blank/decorative/tracking images or literal pla
 
 
 def attachment_vision_prompt(
-    *, image_name: str, candidate: Mapping[str, Any], source_label: str = "attachment"
+    *,
+    image_name: str,
+    candidate: Mapping[str, Any],
+    source_label: str = "attachment",
+    instructions: str | None = None,
 ) -> str:
     # The image path is given relative to the agent's working directory (the run
     # dir), which is exactly where the inputs/ subdir lives. Image-viewing tools
@@ -775,7 +815,7 @@ def attachment_vision_prompt(
             "original_filename": str(candidate.get("filename", "")),
             "original_mime_type": str(candidate.get("mime_type", "")),
         },
-        "instructions": attachment_vision_instructions(source_label),
+        "instructions": instructions or attachment_vision_instructions(source_label),
         "final_output_contract": {
             "format": "Return one JSON object and no prose.",
             "schema": attachment_vision_schema(),

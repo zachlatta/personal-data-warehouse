@@ -45,6 +45,8 @@ DEFAULT_APPLE_NOTES_STORE_PATH = "~/Library/Group Containers/group.com.apple.not
 DEFAULT_APPLE_NOTES_STORAGE_BACKEND = "google_drive"
 DEFAULT_APPLE_MESSAGES_STORE_PATH = "~/Library/Messages/chat.db"
 DEFAULT_APPLE_MESSAGES_STORAGE_BACKEND = "google_drive"
+DEFAULT_APPLE_PHOTOS_LIBRARY_PATH = "~/Pictures/Photos Library.photoslibrary"
+DEFAULT_PHOTOS_STORAGE_BACKEND = "google_drive"
 DEFAULT_APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN = 512 * 1024 * 1024
 DEFAULT_APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN = 200
 DEFAULT_APPLE_MESSAGES_UPLOAD_WORKERS = 4
@@ -224,6 +226,15 @@ class AppleMessagesConfig:
     attachment_bytes_per_run: int = DEFAULT_APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN
     attachment_count_per_run: int = DEFAULT_APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN
     upload_workers: int = DEFAULT_APPLE_MESSAGES_UPLOAD_WORKERS
+
+
+@dataclass(frozen=True)
+class PhotosConfig:
+    account: str
+    library_path: str
+    storage_backend: str
+    google_drive_account: str
+    google_drive_folder_id: str
 
 
 @dataclass(frozen=True)
@@ -428,6 +439,7 @@ class Settings:
     voice_memos: VoiceMemosConfig | None = None
     apple_notes: AppleNotesConfig | None = None
     apple_messages: AppleMessagesConfig | None = None
+    photos: PhotosConfig | None = None
     whatsapp: WhatsAppConfig | None = None
     agent_sessions: AgentSessionsConfig | None = None
     chatgpt: ChatGPTConfig | None = None
@@ -532,6 +544,7 @@ def load_settings(
     require_voice_memos: bool = False,
     require_apple_notes: bool = False,
     require_apple_messages: bool = False,
+    require_photos: bool = False,
     require_whatsapp: bool = False,
     require_agent_sessions: bool = False,
     require_chatgpt: bool = False,
@@ -904,6 +917,60 @@ def load_settings(
             attachment_bytes_per_run=apple_messages_attachment_bytes_per_run,
             attachment_count_per_run=apple_messages_attachment_count_per_run,
             upload_workers=apple_messages_upload_workers,
+        )
+
+    photos_account = (
+        os.getenv("PHOTOS_ACCOUNT")
+        or os.getenv("APPLE_MESSAGES_ACCOUNT")
+        or os.getenv("APPLE_NOTES_ACCOUNT")
+        or os.getenv("VOICE_MEMOS_ACCOUNT")
+        or default_voice_memos_account
+    ).strip()
+    photos_library_path = os.path.expanduser(
+        os.getenv("APPLE_PHOTOS_LIBRARY_PATH", DEFAULT_APPLE_PHOTOS_LIBRARY_PATH)
+    )
+    photos_google_drive_account = (
+        os.getenv("PHOTOS_GOOGLE_DRIVE_ACCOUNT")
+        or photos_account
+        or voice_memos_account
+    ).strip()
+    photos_google_drive_folder_id = (
+        os.getenv("PHOTOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
+        or ""
+    ).strip()
+    photos_storage_backend = os.getenv(
+        "PHOTOS_STORAGE_BACKEND",
+        _default_upload_backend(
+            DEFAULT_PHOTOS_STORAGE_BACKEND,
+            google_drive_folder_id=photos_google_drive_folder_id,
+        ),
+    ).strip()
+    photos: PhotosConfig | None = None
+    if (
+        require_photos
+        or os.getenv("PHOTOS_ACCOUNT")
+        or os.getenv("PHOTOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_PHOTOS_LIBRARY_PATH")
+    ):
+        if not photos_account:
+            raise ValueError("PHOTOS_ACCOUNT or GMAIL_ACCOUNTS must be set for photo sync")
+        if photos_storage_backend not in {"google_drive", "http_app"}:
+            raise ValueError("PHOTOS_STORAGE_BACKEND currently supports: google_drive, http_app")
+        if photos_storage_backend == "google_drive":
+            if not photos_google_drive_account:
+                raise ValueError("PHOTOS_GOOGLE_DRIVE_ACCOUNT or PHOTOS_ACCOUNT must be set")
+            if not photos_google_drive_folder_id:
+                raise ValueError(
+                    "PHOTOS_GOOGLE_DRIVE_FOLDER_ID or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+                )
+        photos = PhotosConfig(
+            account=photos_account,
+            library_path=photos_library_path,
+            storage_backend=photos_storage_backend,
+            google_drive_account=photos_google_drive_account,
+            google_drive_folder_id=photos_google_drive_folder_id,
         )
 
     whatsapp_account = (
@@ -1535,6 +1602,7 @@ def load_settings(
         voice_memos=voice_memos,
         apple_notes=apple_notes,
         apple_messages=apple_messages,
+        photos=photos,
         whatsapp=whatsapp,
         agent_sessions=agent_sessions,
         chatgpt=chatgpt,

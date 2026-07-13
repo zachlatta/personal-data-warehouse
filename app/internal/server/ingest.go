@@ -43,6 +43,11 @@ var ingestSourceDefs = map[string]ingestSourceDef{
 	"apple_messages":    {source: "apple_messages", blobKind: "apple_message_attachment", metadataKind: "apple_message_export_batch"},
 	"apple_voice_memos": {source: "apple_voice_memos", blobKind: "voice_memo_audio", metadataKind: "voice_memo_metadata", legacySources: []string{"voice_memos"}},
 	"apple_notes":       {source: "apple_notes", blobKind: "apple_note_body_html", metadataKind: "apple_note_revision_metadata"},
+	// One shared transport for every photo source (apple_photos now;
+	// google_photos / photo_imports later): the metadata envelope carries the
+	// photo source slug and the Dagster reader routes rows into that source's
+	// raw table.
+	"photos": {source: "photos", blobKind: "photo_file", metadataKind: "photo_metadata"},
 }
 
 // ingestBuildResult is what an artifact's build step resolves from the request's
@@ -383,6 +388,58 @@ func ingestArtifacts() []ingestArtifact {
 				key := fmt.Sprintf("apple-voice-memos/inbox/%04d/%02d/%s-%s.json",
 					recordedAt.Year(), int(recordedAt.Month()), recordedAt.Format("2006-01-02"), audioSHA)
 				return ingestBuildResult{objectKey: key, sourceContentSHA: audioSHA, appProperties: map[string]string{}}, nil
+			},
+		},
+		// --- photos: original/rendition blob + JSON metadata envelope --------
+		{
+			endpoint:   "/ingest/photos/file",
+			sourceSlug: "photos",
+			kind:       "photo_file",
+			// Deduped by content sha (stable): the same original arriving again
+			// (re-run, or a second photo source holding identical bytes) is a
+			// no-op; the per-source provenance lives in the metadata envelopes.
+			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
+				// captured_at is used as wall-clock (like voice-memos
+				// recorded_at) so the key's date matches the shot.
+				capturedAt, err := parseTimestamp(q.Get("captured_at"))
+				if err != nil {
+					return ingestBuildResult{}, fmt.Errorf("invalid captured_at: %w", err)
+				}
+				key := fmt.Sprintf("photos/inbox/%04d/%02d/%s-%s%s",
+					capturedAt.Year(), int(capturedAt.Month()), capturedAt.Format("2006-01-02"), sha, q.Get("extension"))
+				return ingestBuildResult{objectKey: key, contentType: q.Get("content_type"), appProperties: map[string]string{}}, nil
+			},
+		},
+		{
+			endpoint:   "/ingest/photos/metadata",
+			sourceSlug: "photos",
+			kind:       "photo_metadata",
+			isJSON:     true,
+			// Deduped by the PROVENANCE sha — sha256 over
+			// (source|account|native_id|role|file_sha) — not the file sha: the
+			// same bytes can arrive from two photo sources and both envelopes
+			// must survive, while a re-run of one source (whose envelope JSON
+			// differs only in uploaded_at) must not dup.
+			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
+				fileSHA, err := required(q, "file_content_sha256")
+				if err != nil {
+					return ingestBuildResult{}, err
+				}
+				dedupSHA, err := required(q, "metadata_dedup_sha256")
+				if err != nil {
+					return ingestBuildResult{}, err
+				}
+				capturedAt, err := parseTimestamp(q.Get("captured_at"))
+				if err != nil {
+					return ingestBuildResult{}, fmt.Errorf("invalid captured_at: %w", err)
+				}
+				key := fmt.Sprintf("photos/inbox/%04d/%02d/%s-%s.json",
+					capturedAt.Year(), int(capturedAt.Month()), capturedAt.Format("2006-01-02"), dedupSHA)
+				return ingestBuildResult{
+					objectKey:        key,
+					sourceContentSHA: dedupSHA,
+					appProperties:    map[string]string{"file_content_sha256": fileSHA},
+				}, nil
 			},
 		},
 		// --- apple notes: body HTML + attachments + JSON revision metadata

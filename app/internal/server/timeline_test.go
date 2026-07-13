@@ -455,8 +455,9 @@ func TestTimelineChildQueriesCoverEveryEventTable(t *testing.T) {
 		"gmail_messages", "slack_messages", "slack_files", "apple_messages",
 		"whatsapp_messages", "agent_session_events", "apple_note_revisions",
 		"apple_voice_memos_files", "calendar_events", "google_drive_files",
-		"contact_cards", "whoop_cycles", "whoop_recoveries", "whoop_sleeps",
-		"whoop_workouts", "upstream_mutations", "upstream_mutation_requests", "agent_runs",
+		"photo_assets", "contact_cards", "whoop_cycles", "whoop_recoveries",
+		"whoop_sleeps", "whoop_workouts", "upstream_mutations",
+		"upstream_mutation_requests", "agent_runs",
 	}
 	for _, table := range expected {
 		if _, ok := timelineChildQueries[table]; !ok {
@@ -555,6 +556,40 @@ func TestTimelineVoiceMemoGetsItemMedia(t *testing.T) {
 		t.Fatalf("item media url = %q", url)
 	}
 	if payload.ItemMedia["media_kind"] != "audio" || payload.ItemMedia["filename"] != "standup.m4a" {
+		t.Fatalf("item_media = %#v", payload.ItemMedia)
+	}
+}
+
+func TestTimelinePhotoGetsItemMedia(t *testing.T) {
+	item := timelineEventRow("e1", 20, "2026-06-01T12:00:00Z")
+	item["adapter"] = "photo"
+	item["source_table"] = "photo_assets"
+	item["source_pk"] = `{"photo_id": "ph1"}`
+	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
+		"FROM " + warehouse.SQLRelation("timeline_events"): {Rows: []map[string]any{item}},
+		"row_to_json": {Rows: []map[string]any{
+			{"row": `{"photo_id":"ph1","thumbnail_storage_file_id":"thumb42","thumbnail_content_type":"image/jpeg","best_file_filename":"IMG_0001.HEIC"}`},
+		}},
+	}}
+	srv := newTimelineTestServer(t, runner)
+	resp, body := timelineGET(t, srv, "/api/timeline/item?adapter=photo&event_id=ph1", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d: %s", resp.StatusCode, body)
+	}
+	var payload struct {
+		ItemMedia map[string]any `json:"item_media"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ItemMedia == nil {
+		t.Fatalf("item_media missing: %s", body)
+	}
+	url, _ := payload.ItemMedia["media_url"].(string)
+	if !strings.HasPrefix(url, timelineTestMediaBase+"/objects/thumb42?exp=") {
+		t.Fatalf("item media url = %q", url)
+	}
+	if payload.ItemMedia["media_kind"] != "image" {
 		t.Fatalf("item_media = %#v", payload.ItemMedia)
 	}
 }

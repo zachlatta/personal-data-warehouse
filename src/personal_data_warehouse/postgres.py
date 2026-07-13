@@ -49,7 +49,11 @@ from personal_data_warehouse.schema import (
     GOOGLE_DRIVE_FILE_COLUMNS,
     GOOGLE_DRIVE_FILE_TEXT_COLUMNS,
     GOOGLE_DRIVE_SYNC_STATE_COLUMNS,
+    MEDIA_FINGERPRINT_COLUMNS,
     MESSAGE_COLUMNS,
+    PHOTO_ASSET_COLUMNS,
+    PHOTO_ASSET_FILE_COLUMNS,
+    PHOTO_SOURCE_FILE_COLUMNS,
     RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS,
     SLACK_ACCOUNT_IDENTITY_COLUMNS,
     SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS,
@@ -88,6 +92,7 @@ from personal_data_warehouse.schema import (
 from personal_data_warehouse.config import normalize_postgres_url
 from personal_data_warehouse.relations import (
     CANONICAL_RELATIONS,
+    PHOTO_SOURCE_RELATIONS,
     QUERYABLE_SCHEMAS,
     physical_schema_name,
     physical_schema_names,
@@ -255,6 +260,20 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         WHATSAPP_MEDIA_ITEM_COLUMNS,
         ("account", "chat_id", "message_id"),
     ),
+    # Photos: one raw file table per source (all sharing
+    # PHOTO_SOURCE_FILE_COLUMNS — see PHOTO_SOURCE_RELATIONS in relations.py),
+    # unified by the derived photos.assets/asset_files identity tables and the
+    # marts.photo_files / marts.photos / marts.photo_canonical_renditions views.
+    "apple_photos_files": TableSpec(
+        PHOTO_SOURCE_FILE_COLUMNS,
+        ("source", "account", "source_native_id", "content_sha256"),
+    ),
+    "photo_assets": TableSpec(PHOTO_ASSET_COLUMNS, ("photo_id",)),
+    "photo_asset_files": TableSpec(
+        PHOTO_ASSET_FILE_COLUMNS,
+        ("source", "account", "source_native_id", "content_sha256"),
+    ),
+    "media_fingerprints": TableSpec(MEDIA_FINGERPRINT_COLUMNS, ("content_sha256", "hash_version")),
     # Legacy logical name retained only so old-layout migrations can understand
     # the historical mixed table. Runtime writes split into the source-owned
     # *_events tables below and read through marts.ai_conversation_events.
@@ -485,6 +504,26 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "voice_memo_files_recorded_idx",
         "apple_voice_memos_files",
         "CREATE INDEX IF NOT EXISTS voice_memo_files_recorded_idx ON apple_voice_memos_files (recorded_at DESC)",
+    ),
+    IndexSpec(
+        "apple_photos_files_ingested_at_idx",
+        "apple_photos_files",
+        "CREATE INDEX IF NOT EXISTS apple_photos_files_ingested_at_idx ON apple_photos_files (ingested_at)",
+    ),
+    IndexSpec(
+        "apple_photos_files_content_sha256_idx",
+        "apple_photos_files",
+        "CREATE INDEX IF NOT EXISTS apple_photos_files_content_sha256_idx ON apple_photos_files (content_sha256)",
+    ),
+    IndexSpec(
+        "photo_assets_capture_ts_idx",
+        "photo_assets",
+        "CREATE INDEX IF NOT EXISTS photo_assets_capture_ts_idx ON photo_assets (capture_ts DESC)",
+    ),
+    IndexSpec(
+        "photo_asset_files_photo_id_idx",
+        "photo_asset_files",
+        "CREATE INDEX IF NOT EXISTS photo_asset_files_photo_id_idx ON photo_asset_files (photo_id)",
     ),
     IndexSpec(
         "apple_voice_memos_transcript_trgm_idx",
@@ -911,6 +950,7 @@ JSONB_COLUMNS_BY_TABLE = {
         "owners_json",
         "raw_metadata_json",
     },
+    "apple_photos_files": {"raw_metadata_json"},
     "timeline_events": {
         "source_pk",
         "metadata",
@@ -1008,6 +1048,8 @@ TIMESTAMP_COLUMNS = {
     "transaction_at",
     "next_payment_due_at",
     "last_synced_at",
+    "captured_at",
+    "capture_ts",
 }
 
 INTEGER_COLUMNS = {
@@ -1121,6 +1163,10 @@ INTEGER_COLUMNS = {
     "total_rem_sleep_time_milli",
     "sleep_cycle_count",
     "disturbance_count",
+    "width",
+    "height",
+    "best_file_size_bytes",
+    "thumbnail_size_bytes",
 }
 
 FLOAT_COLUMNS = {
@@ -1157,6 +1203,9 @@ FLOAT_COLUMNS = {
     "minimum_payment_amount",
     "origination_principal_amount",
     "outstanding_interest_amount",
+    "latitude",
+    "longitude",
+    "match_score",
 }
 
 _WHATSAPP_TABLES = (
@@ -1165,6 +1214,20 @@ _WHATSAPP_TABLES = (
     "whatsapp_contacts",
     "whatsapp_messages",
     "whatsapp_media_items",
+)
+
+_PHOTO_TABLES = tuple(PHOTO_SOURCE_RELATIONS.values()) + (
+    "photo_assets",
+    "photo_asset_files",
+    "media_fingerprints",
+    # The marts.photos caption join reads the shared enrichment table and the
+    # enrichment candidate query counts agent_runs failures, so the photos
+    # ensure must be able to run first on a fresh schema (voice-memos
+    # precedent).
+    "file_attachment_enrichments",
+    "agent_runs",
+    "agent_run_events",
+    "agent_run_tool_calls",
 )
 
 _AI_CONVERSATION_EVENT_TABLES = (
@@ -1541,6 +1604,11 @@ class PostgresWarehouse:
         self._ensure_table_group(_WHATSAPP_TABLES)
         self.ensure_whatsapp_client_session_table()
         self._ensure_clean_whatsapp_messages_view()
+        self._ensure_search_views_if_possible()
+
+    def ensure_photos_tables(self) -> None:
+        self._ensure_table_group(_PHOTO_TABLES)
+        self._ensure_photo_marts_views()
         self._ensure_search_views_if_possible()
 
     def ensure_whoop_tables(self) -> None:
@@ -4993,6 +5061,26 @@ class PostgresWarehouse:
     def insert_voice_memo_enrichments(self, rows: list[dict[str, Any]]) -> None:
         self.insert_apple_voice_memos_enrichments(rows)
 
+    def insert_photo_source_files(self, table: str, rows: list[dict[str, Any]]) -> None:
+        """Insert raw photo file rows into one source's files table.
+
+        ``table`` must be a registered PHOTO_SOURCE_RELATIONS value; routing by
+        envelope source happens in the drive-ingest layer, which fails loud on
+        unknown sources.
+        """
+        if table not in PHOTO_SOURCE_RELATIONS.values():
+            raise ValueError(f"unknown photo source table {table!r}")
+        self._insert_rows(table, rows, PHOTO_SOURCE_FILE_COLUMNS)
+
+    def insert_photo_assets(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("photo_assets", rows, PHOTO_ASSET_COLUMNS)
+
+    def insert_photo_asset_files(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("photo_asset_files", rows, PHOTO_ASSET_FILE_COLUMNS)
+
+    def insert_media_fingerprints(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("media_fingerprints", rows, MEDIA_FINGERPRINT_COLUMNS)
+
     def insert_apple_notes(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("apple_notes", rows, APPLE_NOTE_COLUMNS)
 
@@ -6270,6 +6358,7 @@ class PostgresWarehouse:
             branch("mutation", "t.adapter = 'mutation'", "COALESCE(t.metadata->>'status', t.kind)"),
             branch("mutation_request", "t.adapter = 'mutation_request'", "COALESCE(t.metadata->>'status', t.kind)"),
             branch("note", "t.adapter = 'apple_note_revision'"),
+            branch("photo", "t.adapter = 'photo'"),
             branch("slack", "t.adapter = 'slack_message'"),
             branch("slack_file", "t.adapter = 'slack_file'"),
             branch("transcript", "t.adapter = 'voice_memo'"),
@@ -6633,6 +6722,110 @@ class PostgresWarehouse:
             LEFT JOIN whatsapp_contacts cc ON cc.account = m.account AND cc.jid = m.chat_id
             LEFT JOIN whatsapp_contacts ct ON ct.account = m.account AND ct.jid = m.sender_jid
             """
+        )
+
+    def _ensure_photo_marts_views(self) -> None:
+        # marts.photo_files: every rendition from every photo source, one
+        # relation. Generated from PHOTO_SOURCE_RELATIONS so registering a new
+        # photo source automatically adds its raw table to the union.
+        per_source_selects = []
+        for table in PHOTO_SOURCE_RELATIONS.values():
+            per_source_selects.append(
+                f"""
+            SELECT
+                f.source, f.account, f.source_native_id, f.role, f.filename,
+                f.mime_type, f.size_bytes, f.width, f.height, f.content_sha256,
+                f.captured_at, f.capture_tz_offset, f.camera_make, f.camera_model,
+                f.storage_backend, f.storage_key, f.storage_file_id, f.storage_url,
+                f.is_deleted, f.ingested_at,
+                COALESCE(l.photo_id, '') AS photo_id,
+                COALESCE(l.match_method, '') AS match_method,
+                COALESCE(l.match_score, 0) AS match_score
+            FROM {table} f
+            LEFT JOIN photo_asset_files l
+              ON l.source = f.source AND l.account = f.account
+             AND l.source_native_id = f.source_native_id
+             AND l.content_sha256 = f.content_sha256
+                """
+            )
+        union_sql = "\n            UNION ALL\n            ".join(per_source_selects)
+        self._ensure_view(
+            "photo_files",
+            f"""
+            CREATE OR REPLACE VIEW photo_files AS
+            {union_sql}
+            """,
+        )
+        # marts.photos: one row per logical photo, with rendition/source counts
+        # and the newest AI caption (enrichment keyed by the thumbnail or best
+        # file sha).
+        self._ensure_view(
+            "clean_photos",
+            """
+            CREATE OR REPLACE VIEW clean_photos AS
+            SELECT
+                a.photo_id,
+                a.account,
+                a.kind,
+                a.capture_ts,
+                a.capture_tz_offset,
+                a.latitude,
+                a.longitude,
+                a.camera_make,
+                a.camera_model,
+                a.width,
+                a.height,
+                a.best_file_sha256,
+                a.best_file_mime_type,
+                a.best_file_filename,
+                a.thumbnail_content_sha256,
+                a.thumbnail_content_type,
+                a.thumbnail_storage_file_id,
+                COALESCE(l.rendition_count, 0) AS rendition_count,
+                COALESCE(l.source_count, 0) AS source_count,
+                COALESCE(e.caption, '') AS caption,
+                a.created_at,
+                a.updated_at
+            FROM photo_assets a
+            LEFT JOIN (
+                SELECT photo_id, count(*) AS rendition_count, count(DISTINCT source) AS source_count
+                FROM photo_asset_files
+                GROUP BY photo_id
+            ) l ON l.photo_id = a.photo_id
+            LEFT JOIN LATERAL (
+                SELECT e.text AS caption
+                FROM file_attachment_enrichments e
+                WHERE e.content_sha256 != ''
+                  AND e.content_sha256 IN (a.thumbnail_content_sha256, a.best_file_sha256)
+                  AND e.text != ''
+                ORDER BY e.updated_at DESC
+                LIMIT 1
+            ) e ON TRUE
+            """,
+        )
+        # marts.photo_canonical_renditions: exactly one enrichable still per
+        # logical photo — the identity runner's 1280px JPEG thumbnail — shaped
+        # for FileEnrichmentSource's default column names. Video-only assets
+        # and assets whose thumbnail has not been generated yet are excluded.
+        self._ensure_view(
+            "photo_canonical_renditions",
+            """
+            CREATE OR REPLACE VIEW photo_canonical_renditions AS
+            SELECT
+                a.photo_id,
+                a.account,
+                a.thumbnail_content_sha256 AS content_sha256,
+                COALESCE(NULLIF(a.best_file_filename, ''), a.photo_id || '.jpg') AS filename,
+                a.thumbnail_content_type AS mime_type,
+                a.thumbnail_size_bytes AS size_bytes,
+                a.thumbnail_storage_backend AS storage_backend,
+                a.thumbnail_storage_key AS storage_key,
+                a.thumbnail_storage_file_id AS storage_file_id,
+                a.thumbnail_storage_url AS storage_url,
+                a.capture_ts
+            FROM photo_assets a
+            WHERE a.kind = 'image' AND a.thumbnail_content_sha256 != ''
+            """,
         )
 
     def _ensure_ai_conversation_events_view(self) -> None:

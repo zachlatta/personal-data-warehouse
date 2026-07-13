@@ -73,3 +73,59 @@ def audio_sha(data: bytes) -> str:
     import hashlib
 
     return hashlib.sha256(data).hexdigest()
+
+
+class _FakePhotoIngestClient:
+    def __init__(self) -> None:
+        self.files: list[dict] = []
+        self.metadata: list[dict] = []
+
+    def upload_photo_file(self, content, *, captured_at, extension, content_type):
+        self.files.append(
+            {"content": content, "captured_at": captured_at, "extension": extension, "content_type": content_type}
+        )
+        return {"storage_backend": "google_drive", "storage_key": "k", "storage_file_id": "fid", "storage_url": ""}
+
+    def upload_photo_metadata(self, payload, *, captured_at, file_content_sha256, metadata_dedup_sha256):
+        self.metadata.append(
+            {
+                "payload": payload,
+                "captured_at": captured_at,
+                "file_content_sha256": file_content_sha256,
+                "metadata_dedup_sha256": metadata_dedup_sha256,
+            }
+        )
+        return {"storage_backend": "google_drive", "storage_key": "k", "storage_file_id": "fid", "storage_url": ""}
+
+
+def test_photos_runner_uploads_via_ingest_client(tmp_path: Path) -> None:
+    from personal_data_warehouse_photos.envelope import provenance_dedup_sha256
+    from personal_data_warehouse_photos.sync import PhotosUploadRunner
+    from tests.test_photos_scanner import _build_fixture_library
+
+    library = _build_fixture_library(tmp_path)
+    client = _FakePhotoIngestClient()
+
+    summary = PhotosUploadRunner(
+        account="zach@example.com",
+        library_path=library,
+        ingest_client=client,
+        logger=_CaptureLogger(),
+        now=lambda: datetime(2026, 6, 2, 12, tzinfo=UTC),
+    ).sync()
+
+    assert summary.files_uploaded == 3
+    assert len(client.files) == 3 and len(client.metadata) == 3
+    still = next(m for m in client.metadata if m["payload"]["file"]["role"] == "original" and m["payload"]["file"]["mime_type"] == "image/heic")
+    # The envelope carries the source slug the Dagster reader routes on, and
+    # the metadata dedup key is the provenance sha (not the file sha).
+    assert still["payload"]["schema_version"] == 1
+    assert still["payload"]["source"] == "apple_photos"
+    assert still["metadata_dedup_sha256"] == provenance_dedup_sha256(
+        source="apple_photos",
+        account="zach@example.com",
+        native_id=still["payload"]["file"]["native_id"],
+        role="original",
+        file_content_sha256=still["file_content_sha256"],
+    )
+    assert still["file_content_sha256"] == audio_sha(b"still-bytes")

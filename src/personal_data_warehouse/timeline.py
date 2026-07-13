@@ -1138,6 +1138,59 @@ _DRIVE_FILE = _simple_adapter(
     ),
 )
 
+_PHOTO = _simple_adapter(
+    name="photo",
+    source_table="photo_assets",
+    source="photos",
+    kind="photo",
+    # One event per logical photo (photos.assets), not per rendition — the
+    # identity layer has already deduplicated cross-source copies. The AI
+    # caption is keyed by the thumbnail's (or best file's) content sha in the
+    # shared file_attachment_enrichments table and arrives after the asset
+    # row, so ingest_ts folds the enrichment timestamp in and refresh_hours
+    # re-walks recent events until the caption lands.
+    from_sql="""photo_assets t
+    LEFT JOIN LATERAL (
+        SELECT
+            string_agg(e.text, E'\n' ORDER BY e.updated_at DESC) AS enrichment_search_text,
+            max(GREATEST(e.updated_at, e.ai_processed_at)) AS enrichment_ingest_ts
+        FROM file_attachment_enrichments e
+        WHERE e.content_sha256 != ''
+          AND e.content_sha256 IN (t.thumbnail_content_sha256, t.best_file_sha256)
+          AND e.text != ''
+    ) enr ON TRUE""",
+    event_id="t.photo_id",
+    event_ts=_real_ts("t.capture_ts", "t.created_at"),
+    ingest_ts="GREATEST(t.updated_at, COALESCE(enr.enrichment_ingest_ts, t.updated_at))",
+    actor="'me'",
+    title="COALESCE(NULLIF(t.best_file_filename, ''), t.photo_id)",
+    snippet=_snippet("COALESCE(enr.enrichment_search_text, '')"),
+    context="t.camera_model",
+    source_pk="jsonb_build_object('photo_id', t.photo_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'account', t.account, "
+        "'kind', t.kind, "
+        "'lat', t.latitude, "
+        "'lon', t.longitude, "
+        "'camera_make', t.camera_make, "
+        "'camera_model', t.camera_model, "
+        "'width', t.width, "
+        "'height', t.height, "
+        "'mime_type', t.best_file_mime_type, "
+        "'thumbnail_file_id', t.thumbnail_storage_file_id)"
+    ),
+    search_text=_search_concat(
+        "t.best_file_filename",
+        "t.camera_make",
+        "t.camera_model",
+        "enr.enrichment_search_text",
+    ),
+    # Photos Zach took are his own actions.
+    priority=str(TIMELINE_PRIORITY_SELF),
+    refresh_hours=48,
+)
+
 _CONTACT_UPDATE = _simple_adapter(
     name="contact_update",
     source_table="contact_cards",
@@ -1539,6 +1592,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _VOICE_MEMO,
     _CALENDAR_EVENT,
     _DRIVE_FILE,
+    _PHOTO,
     _CONTACT_UPDATE,
     _WHOOP_CYCLE,
     _WHOOP_RECOVERY,
@@ -1626,6 +1680,12 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "apple_message_chat_handles": _entity("chat membership"),
     "apple_message_chat_messages": _detail("apple_messages", "chat<->message join rows"),
     "apple_message_attachments": _detail("apple_messages"),
+    # Photos (per-source raw tables unified by the photos.* identity layer;
+    # one timeline event per logical photo)
+    "photo_assets": _events("one event per deduplicated logical photo"),
+    "apple_photos_files": _detail("photo_assets", "raw Apple Photos renditions in the photo's detail view"),
+    "photo_asset_files": _detail("photo_assets", "identity links + dedup audit (match_method/match_score)"),
+    "media_fingerprints": _state("perceptual-hash cache keyed by content sha"),
     # WhatsApp
     "whatsapp_messages": _events(),
     "whatsapp_chats": _entity("chat dimension joined into message events"),

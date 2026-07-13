@@ -1368,10 +1368,13 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_apple_notes_tables()
     warehouse.ensure_apple_messages_tables()
     warehouse.ensure_whatsapp_tables()
+    warehouse.ensure_photos_tables()
     warehouse.ensure_agent_sessions_tables()
     warehouse.ensure_slack_tables()
     warehouse.ensure_upstream_mutation_tables()
     warehouse.ensure_google_drive_source_tables()
+    warehouse.ensure_whoop_tables()
+    warehouse.ensure_plaid_tables()
     warehouse.ensure_timeline_tables()
 
 
@@ -1750,7 +1753,7 @@ def test_search_text_sources_lists_accepted_filter_tokens(warehouse: PostgresWar
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
 
     _ensure_all_table_groups(warehouse)
-    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+    warehouse._set_search_path()
 
     expected = sorted(set(_search_text_branch_source_labels()))
     assert expected, "expected search_text() to declare branch source labels"
@@ -1788,7 +1791,7 @@ def test_search_text_rejects_unknown_source_tokens(warehouse: PostgresWarehouse)
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
 
     _ensure_all_table_groups(warehouse)
-    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+    warehouse._set_search_path()
 
     with pytest.raises(psycopg2.Error, match="unknown source"):
         warehouse._query("SELECT * FROM search_text('zzqqxx', 5, ARRAY['apple_messages'])")
@@ -1814,7 +1817,7 @@ def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWareh
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
 
     _ensure_all_table_groups(warehouse)
-    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+    warehouse._set_search_path()
 
     created_at = datetime(2026, 5, 19, 12, tzinfo=UTC)
     # Raw-JSON event text mirroring what production stores in agent_run_events.
@@ -1874,7 +1877,7 @@ def test_search_text_caps_hit_text_to_preview(warehouse: PostgresWarehouse) -> N
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
 
     _ensure_all_table_groups(warehouse)
-    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+    warehouse._set_search_path()
 
     created_at = datetime(2026, 5, 19, 12, tzinfo=UTC)
     long_body = "zanzibar " + ("padding " * (SEARCH_TEXT_PREVIEW_CHARS // 4))
@@ -1928,7 +1931,7 @@ def test_search_text_low_volume_source_survives_high_volume_source(warehouse: Po
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
 
     _ensure_all_table_groups(warehouse)
-    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+    warehouse._set_search_path()
 
     created_at = datetime(2026, 5, 19, 12, tzinfo=UTC)
     warehouse.insert_slack_conversations(

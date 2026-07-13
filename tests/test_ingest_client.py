@@ -100,6 +100,42 @@ def test_post_signs_body_and_sends_expected_query() -> None:
     assert q["sig"] == expected_sig
 
 
+def test_upload_photo_file_and_metadata_send_expected_queries() -> None:
+    session = _FakeSession()
+    client = IngestClient(
+        base_url="https://app.example.test/",
+        signing_key=b"0123456789abcdef0123456789abcdef",
+        session=session,
+        now=lambda: 1700000000.0,
+        link_ttl_seconds=900,
+    )
+    body = b"heic-bytes"
+    client.upload_photo_file(body, captured_at="2026-06-01T14:30:00", extension=".heic", content_type="image/heic")
+    call = session.calls[0]
+    parts = urlsplit(call["url"])
+    assert parts.path == "/ingest/photos/file"
+    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    assert q["captured_at"] == "2026-06-01T14:30:00"
+    assert q["extension"] == ".heic"
+    assert q["content_type"] == "image/heic"
+    assert q["content_sha256"] == hashlib.sha256(body).hexdigest()
+    assert call["headers"]["Content-Type"] == "image/heic"
+
+    client.upload_photo_metadata(
+        {"schema_version": 1, "source": "apple_photos"},
+        captured_at="2026-06-01T14:30:00",
+        file_content_sha256="filesha",
+        metadata_dedup_sha256="dedupsha",
+    )
+    call = session.calls[1]
+    parts = urlsplit(call["url"])
+    assert parts.path == "/ingest/photos/metadata"
+    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    assert q["file_content_sha256"] == "filesha"
+    assert q["metadata_dedup_sha256"] == "dedupsha"
+    assert call["headers"]["Content-Type"] == "application/json"
+
+
 class _FakeJSONSession:
     def __init__(self, payload: dict) -> None:
         self.calls: list[dict] = []

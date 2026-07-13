@@ -52,6 +52,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_apple_notes_tables()
     wh.ensure_apple_messages_tables()
     wh.ensure_whatsapp_tables()
+    wh.ensure_photos_tables()
     wh.ensure_agent_sessions_tables()
     wh.ensure_claude_desktop_tables()
     wh.ensure_agent_tables()
@@ -59,6 +60,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_upstream_mutation_tables()
     wh.ensure_google_drive_source_tables()
     wh.ensure_whoop_tables()
+    wh.ensure_plaid_tables()
     wh.ensure_timeline_tables()
 
 
@@ -418,6 +420,36 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
+        INSERT INTO photo_assets (photo_id, account, kind, capture_ts, camera_make, camera_model,
+                                  width, height, best_file_sha256, best_file_mime_type,
+                                  best_file_filename, thumbnail_content_sha256,
+                                  thumbnail_content_type, thumbnail_storage_file_id,
+                                  created_at, updated_at)
+        VALUES ('ph1', 'z@x.test', 'image', %s, 'Apple', 'iPhone 16 Pro', 4284, 5712,
+                'stillsha', 'image/heic', 'IMG_0001.HEIC', 'thumbsha', 'image/jpeg', 'drive-th1',
+                %s, %s)
+        """,
+        (_NOW - timedelta(hours=10, minutes=30), _NOW, _NOW),
+    )
+    wh._command(
+        """
+        INSERT INTO photo_asset_files (source, account, source_native_id, role, content_sha256,
+                                       photo_id, match_method, created_at)
+        VALUES ('apple_photos', 'z@x.test', 'UUID-1', 'original', 'stillsha', 'ph1', 'new', %s)
+        """,
+        (_NOW,),
+    )
+    wh._command(
+        """
+        INSERT INTO file_attachment_enrichments (content_sha256, ai_provider, ai_model,
+                                                 ai_prompt_version, text, updated_at)
+        VALUES ('thumbsha', 'agent_codex', 'm', 'photo-agent-v1',
+                'A golden retriever on a beach at sunset', %s)
+        """,
+        (_NOW,),
+    )
+    wh._command(
+        """
         INSERT INTO upstream_mutations (id, provider, operation, status, title, reason,
                                         requested_by, executed_at, created_at, updated_at)
         VALUES ('mut1', 'slack', 'chat.postMessage', 'executed', 'Send standup reminder',
@@ -461,6 +493,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "voice_memo": 1,
     "calendar_event": 1,
     "drive_file": 3,
+    "photo": 1,
     "contact_update": 5,
     "mutation": 5,
     "mutation_request": 5,
@@ -478,6 +511,7 @@ EXPECTED_SEEDED_EVENTS = {
     "voice_memo": 1,
     "calendar_event": 1,
     "drive_file": 1,
+    "photo": 1,
     "contact_update": 1,
     "mutation": 1,
     "mutation_request": 1,
@@ -545,6 +579,19 @@ def test_backfill_normalizes_every_source(warehouse):
 
     cal = next(r for r in rows if r["adapter"] == "calendar_event")
     assert cal["end_ts"] > cal["event_ts"]
+
+    photo = next(r for r in rows if r["adapter"] == "photo")
+    assert photo["source"] == "photos"
+    assert photo["kind"] == "photo"
+    assert photo["actor"] == "me"
+    assert photo["title"] == "IMG_0001.HEIC"
+    assert photo["source_table"] == "photo_assets"
+    assert photo["source_pk"] == {"photo_id": "ph1"}
+    assert photo["metadata"]["thumbnail_file_id"] == "drive-th1"
+    assert photo["metadata"]["camera_model"] == "iPhone 16 Pro"
+    # The AI caption (keyed by the thumbnail sha) is the snippet and searchable.
+    assert "golden retriever" in photo["snippet"]
+    assert "golden retriever" in photo["search_text"]
 
     priorities = {row["adapter"]: row["priority"] for row in rows}
     assert priorities == EXPECTED_SEEDED_PRIORITIES

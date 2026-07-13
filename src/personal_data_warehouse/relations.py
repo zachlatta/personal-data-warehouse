@@ -15,6 +15,7 @@ SOURCE_RAW_SCHEMAS: tuple[str, ...] = (
     "apple_notes",
     "apple_messages",
     "apple_voice_memos",
+    "apple_photos",
     "alice_voice_recordings",
     "whoop",
     "whatsapp",
@@ -31,6 +32,7 @@ DERIVED_SCHEMAS: tuple[str, ...] = (
     "timeline",
     "search",
     "enrichment",
+    "photos",
     "ai_processing",
     "upstream_mutations",
     "util",
@@ -101,6 +103,13 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("apple_messages", "apple_messages", "messages"),
     ("apple_message_chat_messages", "apple_messages", "chat_messages"),
     ("apple_message_attachments", "apple_messages", "attachments"),
+    # Photos: per-source raw file tables (apple_photos now; each future photo
+    # source adds its own <source>.files row here) unified through the derived
+    # photos.* identity tables and the marts views below.
+    ("apple_photos_files", "apple_photos", "files"),
+    ("photo_assets", "photos", "assets"),
+    ("photo_asset_files", "photos", "asset_files"),
+    ("media_fingerprints", "enrichment", "media_fingerprints"),
     # WhatsApp
     ("whatsapp_chats", "whatsapp", "chats"),
     ("whatsapp_chat_participants", "whatsapp", "chat_participants"),
@@ -146,6 +155,9 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("clean_whatsapp_messages", "marts", "whatsapp_messages"),
     ("clean_agent_sessions", "marts", "ai_conversation_sessions"),
     ("ai_conversation_events", "marts", "ai_conversation_events"),
+    ("photo_files", "marts", "photo_files"),
+    ("clean_photos", "marts", "photos"),
+    ("photo_canonical_renditions", "marts", "photo_canonical_renditions"),
     ("clean_calendar_with_transcripts", "marts", "google_calendar_with_apple_voice_memos"),
     ("clean_transcripts_no_calendar_match", "marts", "apple_voice_memos_without_calendar_match"),
     ("file_attachment_enrichments", "enrichment", "file_attachment_enrichments"),
@@ -191,6 +203,19 @@ AI_EVENT_SOURCE_RELATIONS: dict[str, str] = {
     "codex": "codex_events",
     "openclaw": "openclaw_events",
     "pi": "pi_events",
+}
+
+# THE extension point for photo sources. Maps a photo source slug (the
+# `source` field every /ingest/photos/* envelope carries) to its raw file
+# table. This single registry drives Drive-inbox ingest routing, the identity
+# runner's unresolved-row scan, and the marts.photo_files union — adding a
+# photo source is: a new <source>.files TableSpec (reusing
+# PHOTO_SOURCE_FILE_COLUMNS) + relation rows above, one entry here, an
+# uploader that posts the shared photo envelope with its own `source`, and a
+# TIMELINE_TABLE_COVERAGE entry. Identity, dedup, thumbnails, enrichment,
+# timeline, and search then follow automatically.
+PHOTO_SOURCE_RELATIONS: dict[str, str] = {
+    "apple_photos": "apple_photos_files",
 }
 
 

@@ -1,0 +1,22 @@
+#!/bin/zsh
+set -u
+
+LABEL="com.zachlatta.personal-data-warehouse.photos-upload"
+LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
+RUN_LOG="$LOG_DIR/photos-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/photos-upload.heartbeat"
+
+echo "LaunchAgent:"
+launchctl print "gui/$(id -u)/$LABEL" | sed -n '1,45p'
+
+echo
+. "$(cd "$(dirname "$0")" && pwd)/_pdw-upload-lib.sh"
+pdw_print_health "$HEARTBEAT_FILE"
+
+echo
+echo "Recent run log:"
+if [[ -f "$RUN_LOG" ]]; then
+  tail -40 "$RUN_LOG"
+else
+  echo "missing: $RUN_LOG"
+fi

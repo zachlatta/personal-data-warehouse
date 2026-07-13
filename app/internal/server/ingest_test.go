@@ -397,6 +397,56 @@ func TestIngestVoiceMemosAudioAndMetadataKeys(t *testing.T) {
 	}
 }
 
+func TestIngestPhotosFileAndMetadataKeys(t *testing.T) {
+	svc, stores := ingestTestService()
+	photo := []byte("heic-bytes")
+	photoSHA := sha256Hex(photo)
+	// File blob: captured_at is wall-clock (no UTC shift), extension verbatim.
+	target := signedIngestTarget("/ingest/photos/file", photo, url.Values{
+		"captured_at":  {"2026-06-01T14:30:00"},
+		"extension":    {".heic"},
+		"content_type": {"image/heic"},
+	})
+	if rec := postIngest(t, svc, target, photo); rec.Code != http.StatusOK {
+		t.Fatalf("file status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	put := stores["photos"].lastFile
+	wantFileKey := "photos/inbox/2026/06/2026-06-01-" + photoSHA + ".heic"
+	if put.ObjectKey != wantFileKey {
+		t.Fatalf("file key = %q, want %q", put.ObjectKey, wantFileKey)
+	}
+	if put.Kind != "photo_file" || put.SkipExistingCheck || put.ContentType != "image/heic" {
+		t.Fatalf("file put = %+v", put)
+	}
+
+	// Metadata envelope: deduped by the PROVENANCE sha, not the file sha, so
+	// the same bytes arriving from a second photo source keep both envelopes.
+	meta := []byte(`{"schema_version":1,"source":"apple_photos"}`)
+	dedupSHA := sha256Hex([]byte("apple_photos|z@x.test|UUID-1|original|" + photoSHA))
+	target = signedIngestTarget("/ingest/photos/metadata", meta, url.Values{
+		"captured_at":           {"2026-06-01T14:30:00"},
+		"file_content_sha256":   {photoSHA},
+		"metadata_dedup_sha256": {dedupSHA},
+	})
+	if rec := postIngest(t, svc, target, meta); rec.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	pj := stores["photos"].lastJSON
+	wantMetaKey := "photos/inbox/2026/06/2026-06-01-" + dedupSHA + ".json"
+	if pj.ObjectKey != wantMetaKey {
+		t.Fatalf("metadata key = %q, want %q", pj.ObjectKey, wantMetaKey)
+	}
+	if pj.Kind != "photo_metadata" || pj.SourceContentSHA256 != dedupSHA || pj.SkipExistingCheck {
+		t.Fatalf("metadata put = %+v", pj)
+	}
+	if pj.AppProperties["file_content_sha256"] != photoSHA {
+		t.Fatalf("metadata app properties = %+v, want file_content_sha256 %q", pj.AppProperties, photoSHA)
+	}
+	if string(pj.Payload) != string(meta) {
+		t.Fatalf("metadata payload = %q", pj.Payload)
+	}
+}
+
 func TestIngestAppleNotesBodyAttachmentRevisionKeys(t *testing.T) {
 	svc, stores := ingestTestService()
 	common := url.Values{"note_id": {"note/123"}, "revision_id": {"rev-9"}, "modified_at": {"2026-01-02T03:04:05+00:00"}}

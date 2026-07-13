@@ -8,6 +8,7 @@ import hashlib
 import sys
 
 from personal_data_warehouse.ingest_client import IngestClient
+from personal_data_warehouse_photos.envelope import provenance_dedup_sha256
 
 
 def main() -> int:
@@ -19,16 +20,22 @@ def main() -> int:
         print(f"OK  {name} -> {stored['storage_key']}")
 
     audio_sha = hashlib.sha256(b"audio-bytes").hexdigest()
+    photo_sha = hashlib.sha256(b"heic-bytes").hexdigest()
+    photo_dedup_sha = provenance_dedup_sha256(
+        source="apple_photos", account="z@x.test", native_id="UUID-1", role="original",
+        file_content_sha256=photo_sha,
+    )
 
     check("agent-sessions/batch", client.upload_agent_sessions_batch(b"gzipped-batch", exported_at="2026-06-19T12:34:56+00:00"))
     check("apple-messages/batch", client.upload_apple_messages_batch(b"gzipped-batch", exported_at="2026-06-19T12:34:56+00:00"))
     check("apple-messages/attachment", client.upload_apple_messages_attachment(
         b"attachment-bytes", attachment_guid="A1", message_guid="M1",
         content_type="image/jpeg", created_at="2025-03-04T00:00:00+00:00", filename="p.jpg"))
-    check("whatsapp/batch", client.upload_whatsapp_batch(b"gzipped-batch", exported_at="2026-06-19T12:34:56+00:00"))
-    check("whatsapp/media", client.upload_whatsapp_media(
-        b"media-bytes", chat_id="C1", message_id="M9", content_type="image/png",
-        message_at="2024-12-31T00:00:00+00:00", filename="i.png", mime_type="image/png"))
+    check("photos/file", client.upload_photo_file(
+        b"heic-bytes", captured_at="2026-06-01T14:30:00", extension=".heic", content_type="image/heic"))
+    check("photos/metadata", client.upload_photo_metadata(
+        {"schema_version": 1, "source": "apple_photos"}, captured_at="2026-06-01T14:30:00",
+        file_content_sha256=photo_sha, metadata_dedup_sha256=photo_dedup_sha))
     check("voice-memos/audio", client.upload_voice_memo_audio(
         b"audio-bytes", recorded_at="2025-07-15T09:00:00", extension=".m4a", content_type="audio/m4a"))
     check("voice-memos/metadata", client.upload_voice_memo_metadata(

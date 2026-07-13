@@ -45,10 +45,13 @@ def _ensure_all_table_groups(wh: PostgresWarehouse) -> None:
     wh.ensure_apple_notes_tables()
     wh.ensure_apple_messages_tables()
     wh.ensure_whatsapp_tables()
+    wh.ensure_photos_tables()
     wh.ensure_agent_sessions_tables()
     wh.ensure_slack_tables()
     wh.ensure_upstream_mutation_tables()
     wh.ensure_google_drive_source_tables()
+    wh.ensure_whoop_tables()
+    wh.ensure_plaid_tables()
     wh.ensure_timeline_tables()
 
 
@@ -71,7 +74,7 @@ def _require_pg_textsearch(warehouse: PostgresWarehouse) -> None:
     )
     if not rows:
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
-    warehouse._command(f'SET search_path TO "{warehouse._schema}", public')
+    warehouse._set_search_path()
 
 
 def _file_row(**overrides):

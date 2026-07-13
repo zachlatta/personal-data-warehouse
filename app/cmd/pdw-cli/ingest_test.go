@@ -54,6 +54,7 @@ func TestIngestResolvesKnownSources(t *testing.T) {
 		"apple-messages": "personal_data_warehouse_apple_messages.cli",
 		"agent-sessions": "personal_data_warehouse_agent_sessions.cli",
 		"plaid":          "personal_data_warehouse_plaid.cli",
+		"apple-photos":   "personal_data_warehouse_photos.cli",
 	}
 	for source, module := range want {
 		got, ok := resolveIngestModule(source)

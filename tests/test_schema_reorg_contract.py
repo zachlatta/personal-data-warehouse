@@ -82,6 +82,7 @@ def test_relation_registry_encodes_source_owned_raw_schemas() -> None:
         "apple_notes",
         "apple_messages",
         "apple_voice_memos",
+        "apple_photos",
         "alice_voice_recordings",
         "whoop",
         "whatsapp",
@@ -107,6 +108,13 @@ def test_relation_registry_encodes_source_owned_raw_schemas() -> None:
         "apple_notes": ("apple_notes", "notes"),
         "apple_messages": ("apple_messages", "messages"),
         "apple_voice_memos_files": ("apple_voice_memos", "files"),
+        "apple_photos_files": ("apple_photos", "files"),
+        "photo_assets": ("photos", "assets"),
+        "photo_asset_files": ("photos", "asset_files"),
+        "media_fingerprints": ("enrichment", "media_fingerprints"),
+        "photo_files": ("marts", "photo_files"),
+        "clean_photos": ("marts", "photos"),
+        "photo_canonical_renditions": ("marts", "photo_canonical_renditions"),
         "whatsapp_messages": ("whatsapp", "messages"),
         "chatgpt_events": ("chatgpt", "events"),
         "claude_desktop_events": ("claude_desktop", "events"),
@@ -143,6 +151,7 @@ def test_fresh_warehouse_creates_source_owned_and_derived_schemas(warehouse: Pos
     warehouse.ensure_apple_messages_tables()
     warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
     warehouse.ensure_whatsapp_tables()
+    warehouse.ensure_photos_tables()
     warehouse.ensure_agent_sessions_tables()
     warehouse.ensure_timeline_tables()
     warehouse.ensure_upstream_mutation_tables()
@@ -168,6 +177,13 @@ def test_fresh_warehouse_creates_source_owned_and_derived_schemas(warehouse: Pos
         (physical_schema_name("apple_notes", namespace=warehouse.schema_namespace), "notes"),
         (physical_schema_name("apple_messages", namespace=warehouse.schema_namespace), "messages"),
         (physical_schema_name("apple_voice_memos", namespace=warehouse.schema_namespace), "files"),
+        (physical_schema_name("apple_photos", namespace=warehouse.schema_namespace), "files"),
+        (physical_schema_name("photos", namespace=warehouse.schema_namespace), "assets"),
+        (physical_schema_name("photos", namespace=warehouse.schema_namespace), "asset_files"),
+        (physical_schema_name("enrichment", namespace=warehouse.schema_namespace), "media_fingerprints"),
+        (physical_schema_name("marts", namespace=warehouse.schema_namespace), "photo_files"),
+        (physical_schema_name("marts", namespace=warehouse.schema_namespace), "photos"),
+        (physical_schema_name("marts", namespace=warehouse.schema_namespace), "photo_canonical_renditions"),
         (physical_schema_name("whatsapp", namespace=warehouse.schema_namespace), "messages"),
         (physical_schema_name("chatgpt", namespace=warehouse.schema_namespace), "events"),
         (physical_schema_name("claude_desktop", namespace=warehouse.schema_namespace), "events"),
@@ -306,7 +322,7 @@ def test_ai_events_split_by_source_and_reunified_in_marts(warehouse: PostgresWar
         ORDER BY source
         """
     )
-    assert len(sessions) == 5
+    assert len(sessions) == 6
     assert {row[4] for row in sessions} == {1}
 
     old_mixed_rows = warehouse._query(

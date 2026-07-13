@@ -1,0 +1,41 @@
+#!/bin/zsh
+set -u
+
+REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
+UV="/opt/homebrew/bin/uv"
+# The uploaders run through the pdw CLI: `pdw ingest apple-photos` execs
+# `uv run python -m personal_data_warehouse_photos.cli`. Pin uv + the repo so
+# pdw finds them under the minimal launchd environment. Override the pdw
+# binary with PDW_BIN if needed.
+PDW="${PDW_BIN:-$HOME/.local/bin/pdw}"
+[ -x "$PDW" ] || PDW="$(command -v pdw 2>/dev/null || echo "$PDW")"
+export PDW_UV_BIN="$UV"
+export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
+LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
+LOG_FILE="$LOG_DIR/photos-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/photos-upload.heartbeat"
+
+mkdir -p "$LOG_DIR"
+
+started_at_epoch="$(date +%s)"
+started_at_iso="$(date -Iseconds)"
+
+echo "[$started_at_iso] starting photos upload" >> "$LOG_FILE"
+
+if ! cd "$REPO_DIR"; then
+  exit_code=1
+  echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
+else
+  "$PDW" ingest apple-photos --mode incremental >> "$LOG_FILE" 2>&1
+  exit_code=$?
+fi
+
+finished_at_epoch="$(date +%s)"
+finished_at_iso="$(date -Iseconds)"
+duration_seconds="$((finished_at_epoch - started_at_epoch))"
+
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+echo "[$finished_at_iso] finished photos upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
+
+exit "$exit_code"

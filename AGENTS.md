@@ -234,6 +234,90 @@ Apple Messages SQL starting points are `apple_messages`, `apple_message_chats`,
 `apple_message_handles`, `apple_message_chat_handles`, `apple_message_chat_messages`, and
 `apple_message_attachments`.
 
+## Local Apple Photos Upload Scheduler
+
+This Mac is intended to run the local Apple Photos uploader through a user LaunchAgent:
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.photos-upload`
+- Installed plist: `~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.photos-upload.plist`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.photos-upload.plist`
+- Wrapper script: `bin/photos-upload-launchd`
+- Run cadence: every 1800 seconds with `RunAtLoad`
+- Command: `pdw ingest apple-photos --mode incremental` (the wrapper runs the pdw CLI, which execs `uv run python -m personal_data_warehouse_photos.cli`)
+- Main run log: `~/Library/Logs/personal-data-warehouse/photos-upload.run.log`
+- Heartbeat file: `~/Library/Logs/personal-data-warehouse/photos-upload.heartbeat`
+- Status helper: `bin/photos-upload-status`
+
+Use these commands when inspecting or repairing it:
+
+```bash
+bin/photos-upload-status
+launchctl print gui/$(id -u)/com.zachlatta.personal-data-warehouse.photos-upload
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.photos-upload
+tail -80 ~/Library/Logs/personal-data-warehouse/photos-upload.run.log
+cat ~/Library/Logs/personal-data-warehouse/photos-upload.heartbeat
+```
+
+If the plist changes, reinstall it with:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.photos-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.photos-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.photos-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.photos-upload
+```
+
+If the run log shows `PermissionError` for `~/Pictures/Photos Library.photoslibrary`, the
+LaunchAgent is loaded correctly but macOS Full Disk Access is blocking the background process —
+the same FDA/uv-python-path-drift story as the other uploaders above.
+
+The uploader snapshots `Photos.sqlite` (never reads the live DB), uploads each present original
+(plus a Live Photo's `<uuid>_3.mov` motion sibling, under the still's ZUUID with
+`role=live_video`) through `POST /ingest/photos/file` + `/ingest/photos/metadata`, and reports
+**coverage** every run: in an "Optimize Mac Storage" library most originals are cloud-only
+placeholders, so expect `missing=` counts — those defer and re-check every run, never error.
+Files above the route's upload ceiling defer likewise; edited renditions are not uploaded yet
+(originals only; the run log counts assets with adjustments). First backfill ramp:
+`pdw ingest apple-photos --mode full --limit N`.
+
+Serverside, `photos_drive_inbox_sensor` + `photos_drive_ingest` consume the inbox into
+`apple_photos.files`; the `photo_identity` asset dedups renditions into logical photos
+(`photos.assets` + `photos.asset_files` link/audit rows, 256-bit dhash fingerprints in
+`enrichment.media_fingerprints`, 1280px JPEG thumbnails in Drive); `photo_enrichment` runs the
+vision agent once per logical photo over `marts.photo_canonical_renditions`; the `photo`
+timeline adapter emits one event per photo with the AI caption in `search_text`.
+
+Photos SQL starting points are `apple_photos.files` (raw renditions), `photos.assets` (one row
+per deduplicated logical photo), `photos.asset_files` (identity links + `match_method`/
+`match_score` dedup audit), `marts.photos` (assets + caption + rendition counts),
+`marts.photo_files` (all renditions across sources), and timeline `source = 'photos'`. Free-text
+search: `search.search_text()` with `sources => ARRAY['photo']`.
+
+### Adding a photo source (google_photos Takeout import, manual imports, ...)
+
+The photos pipeline is multi-source by construction; Apple Photos is just the first source.
+`PHOTO_SOURCE_RELATIONS` in `src/personal_data_warehouse/relations.py` is THE extension point —
+it drives Drive-ingest routing, the identity runner's scan, and the `marts.photo_files` union.
+To add a source:
+
+1. **Raw table**: add `<source>` to `SOURCE_RAW_SCHEMAS`, a `("<source>_files", "<source>",
+   "files")` relation row, and a `TableSpec(PHOTO_SOURCE_FILE_COLUMNS, ...)` in `postgres.py`
+   (same shared column list and provenance primary key as `apple_photos_files`), then add the
+   table to `_PHOTO_TABLES` and `TIMELINE_TABLE_COVERAGE` (a `detail` of `photo_assets`).
+2. **Registry**: one entry in `PHOTO_SOURCE_RELATIONS` (`"<source>": "<source>_files"`). Unknown
+   sources fail loud at ingest — register before uploading.
+3. **Uploader**: post the shared envelope (`personal_data_warehouse_photos/envelope.py`,
+   `source="<source>"`, native id + role per file, raw record under a source-named key like
+   `takeout_sidecar`) to the existing `/ingest/photos/file` + `/ingest/photos/metadata`
+   endpoints via `IngestClient.upload_photo_file`/`upload_photo_metadata`. Live/motion
+   components upload under the same native id with `role=live_video`; edited outputs use
+   `role=edited`.
+4. **Precedence**: slot the source into `PHOTO_SOURCE_PRECEDENCE`
+   (`src/personal_data_warehouse/photo_identity.py`) so canonical-field resolution knows who
+   wins when renditions disagree.
+5. Nothing else: identity/dedup (incl. the burst guard and cross-source perceptual merge),
+   thumbnails, enrichment, timeline, and search all follow automatically from the registry.
+
 ## Local Agent Sessions Upload Scheduler
 
 Captures AI agent CLI session transcripts (Claude Code + Codex + OpenClaw + pi) so every device's

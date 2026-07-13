@@ -295,6 +295,40 @@ class IngestClient:
             params={"recorded_at": recorded_at, "audio_content_sha256": audio_content_sha256},
         )
 
+    # --- photos (all photo sources share these two endpoints) ---------------
+    def upload_photo_file(
+        self,
+        content: bytes,
+        *,
+        captured_at: str,
+        extension: str,
+        content_type: str,
+    ) -> StoredObjectDict:
+        return self._post(
+            "/ingest/photos/file",
+            body=content,
+            content_type=content_type or "application/octet-stream",
+            params={"captured_at": captured_at, "extension": extension, "content_type": content_type},
+        )
+
+    def upload_photo_metadata(
+        self,
+        payload: Mapping[str, object],
+        *,
+        captured_at: str,
+        file_content_sha256: str,
+        metadata_dedup_sha256: str,
+    ) -> StoredObjectDict:
+        return self._post_json(
+            "/ingest/photos/metadata",
+            payload=payload,
+            params={
+                "captured_at": captured_at,
+                "file_content_sha256": file_content_sha256,
+                "metadata_dedup_sha256": metadata_dedup_sha256,
+            },
+        )
+
     # --- apple notes --------------------------------------------------------
     def upload_apple_notes_body(
         self,

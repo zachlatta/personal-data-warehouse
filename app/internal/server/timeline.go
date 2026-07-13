@@ -236,6 +236,7 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "voice_memos", kind: "voice_memo"},
 	{source: "calendar", kind: "event"},
 	{source: "google_drive", kind: "file_change"},
+	{source: "photos", kind: "photo"},
 	{source: "contacts", kind: "contact_update"},
 	{source: "whoop", kind: "health_cycle"},
 	{source: "whoop", kind: "recovery"},
@@ -500,6 +501,27 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			      WHERE account = $1 AND file_id = $2 LIMIT 5`,
 		},
 	},
+	"photo_assets": {
+		{
+			// Every rendition of the logical photo across sources; rows carry
+			// storage_file_id + mime_type so attachMedia signs inline URLs.
+			name:   "renditions",
+			params: []string{"photo_id"},
+			sql: `SELECT source, source_native_id, role, filename, mime_type, size_bytes,
+			             width, height, content_sha256, storage_file_id, match_method, match_score
+			      FROM ` + warehouse.SQLRelation("photo_files") + `
+			      WHERE photo_id = $1 ORDER BY source, role LIMIT 50`,
+		},
+		{
+			name:   "enrichments",
+			params: []string{"photo_id"},
+			sql: `SELECT e.content_sha256, e.ai_model, left(e.text, 4000) AS text
+			      FROM ` + warehouse.SQLRelation("file_attachment_enrichments") + ` e
+			      JOIN ` + warehouse.SQLRelation("photo_assets") + ` a
+			        ON e.content_sha256 IN (a.thumbnail_content_sha256, a.best_file_sha256)
+			      WHERE a.photo_id = $1 AND e.text != '' LIMIT 5`,
+		},
+	},
 	"upstream_mutations": {
 		{
 			name:   "events",
@@ -670,6 +692,7 @@ var timelineItemMediaColumns = map[string][2]string{
 	"apple_voice_memos_files": {"storage_file_id", "content_type"},
 	"slack_files":             {"file_id", "mimetype"},
 	"google_drive_files":      {"storage_file_id", "mime_type"},
+	"photo_assets":            {"thumbnail_storage_file_id", "thumbnail_content_type"},
 }
 
 func (s *timelineService) itemMedia(sourceTable string, sourceRow any) map[string]any {

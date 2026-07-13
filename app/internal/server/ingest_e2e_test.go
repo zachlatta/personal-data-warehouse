@@ -150,6 +150,10 @@ func e2eCases() []e2eCase {
 	noteAtt := []byte("note-attachment")
 	revision := []byte(`{"schema_version":1,"source":"apple_notes"}`)
 	audioSHA := sha(audio)
+	photo := []byte("heic-bytes")
+	photoSHA := sha(photo)
+	photoMeta := []byte(`{"schema_version":1,"source":"apple_photos"}`)
+	photoDedupSHA := sha([]byte("apple_photos|z@x.test|UUID-1|original|" + photoSHA))
 	return []e2eCase{
 		{
 			name: "agent-sessions/batch", endpoint: "/ingest/agent-sessions/batch", body: batchBody,
@@ -180,6 +184,22 @@ func e2eCases() []e2eCase {
 			extra:    url.Values{"recorded_at": {"2025-07-15T09:00:00"}, "audio_content_sha256": {audioSHA}},
 			wantName: "2025-07-15-" + audioSHA + ".json", wantMime: "application/json",
 			wantProps: map[string]string{"pdw_kind": "voice_memo_metadata", "audio_content_sha256": audioSHA},
+		},
+		{
+			name: "photos/file", endpoint: "/ingest/photos/file", body: photo,
+			extra:    url.Values{"captured_at": {"2026-06-01T14:30:00"}, "extension": {".heic"}, "content_type": {"image/heic"}},
+			wantName: "2026-06-01-" + photoSHA + ".heic", wantMime: "image/heic",
+			wantProps: map[string]string{"pdw_kind": "photo_file", "pdw_stage": "inbox", "pdw_source": "photos"},
+		},
+		{
+			name: "photos/metadata", endpoint: "/ingest/photos/metadata", body: photoMeta,
+			extra: url.Values{
+				"captured_at":           {"2026-06-01T14:30:00"},
+				"file_content_sha256":   {photoSHA},
+				"metadata_dedup_sha256": {photoDedupSHA},
+			},
+			wantName: "2026-06-01-" + photoDedupSHA + ".json", wantMime: "application/json",
+			wantProps: map[string]string{"pdw_kind": "photo_metadata", "file_content_sha256": photoSHA},
 		},
 		{
 			name: "apple-notes/body", endpoint: "/ingest/apple-notes/body", body: html,

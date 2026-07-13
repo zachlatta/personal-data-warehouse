@@ -32,6 +32,7 @@ var ingestModules = map[string]string{
 	"apple-messages": "personal_data_warehouse_apple_messages.cli",
 	"agent-sessions": "personal_data_warehouse_agent_sessions.cli",
 	"plaid":          "personal_data_warehouse_plaid.cli",
+	"apple-photos":   "personal_data_warehouse_photos.cli",
 }
 
 // ingestExec runs the resolved uploader command. It's a package var so tests
@@ -97,6 +98,7 @@ SOURCES
   apple-notes      Upload local Apple Notes
   apple-messages   Upload local Apple Messages (iMessage/SMS/RCS)
   agent-sessions   Upload AI agent CLI session transcripts
+  apple-photos     Upload local Apple Photos originals + metadata
   claude-desktop   Push the Claude Desktop (claude.ai) session credential
   plaid            Link Plaid items and sync personal financial data
 
