@@ -29,6 +29,7 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 		"MCP_QUERY_CACHE_TTL":                 "15m",
 		"MCP_DEBUG_CACHE_TOOL":                "true",
 		"MCP_QUERY_TIMEOUT":                   "42s",
+		"PDW_QUERY_POSTGRES_ROLE":             "warehouse_reader",
 		"PDW_MUTATION_UI_PASSWORD":            "review-password",
 		"PDW_MUTATION_UI_SESSION_SECRET":      "0123456789abcdef0123456789abcdef",
 		"PDW_MUTATION_UI_SESSION_TTL_SECONDS": "7200",
@@ -56,6 +57,9 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	if cfg.QueryTimeout != 42*time.Second {
 		t.Fatalf("QueryTimeout = %s", cfg.QueryTimeout)
 	}
+	if cfg.QueryPostgresRole != "warehouse_reader" {
+		t.Fatalf("QueryPostgresRole = %q", cfg.QueryPostgresRole)
+	}
 	if cfg.MutationUIPassword != "review-password" || cfg.MutationUISessionSecret != "0123456789abcdef0123456789abcdef" || cfg.MutationUISessionTTL != 2*time.Hour {
 		t.Fatalf("mutation UI config = password %q ttl %s secret_len %d", cfg.MutationUIPassword, cfg.MutationUISessionTTL, len(cfg.MutationUISessionSecret))
 	}
@@ -70,6 +74,31 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.PostgresDatabaseURL != "postgresql://default:secret@example.com/default" {
 		t.Fatalf("PostgresDatabaseURL = %q", cfg.PostgresDatabaseURL)
+	}
+}
+
+func TestLoadFromEnvDefaultsQueryPostgresRole(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL": "postgres://d:s@example.com/d",
+		"MCP_SECRET_TOKEN":      "0123456789abcdef0123456789abcdef",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv: %v", err)
+	}
+	if cfg.QueryPostgresRole != "pdw_query" {
+		t.Fatalf("QueryPostgresRole = %q, want pdw_query", cfg.QueryPostgresRole)
+	}
+}
+
+func TestLoadFromEnvRejectsUnsafeQueryPostgresRole(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL":   "postgres://d:s@example.com/d",
+		"MCP_SECRET_TOKEN":        "0123456789abcdef0123456789abcdef",
+		"PDW_QUERY_POSTGRES_ROLE": `pdw_query"; RESET ROLE; --`,
+	}
+	if _, err := LoadFromEnv(func(key string) string { return env[key] }); err == nil {
+		t.Fatal("expected unsafe query role to be rejected")
 	}
 }
 

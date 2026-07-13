@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import inspect
 import json
+import os
 import re
 from typing import Any
 import uuid
@@ -35,6 +36,16 @@ from personal_data_warehouse.schema import (
     CALENDAR_SYNC_STATE_COLUMNS,
     CONTACT_CARD_COLUMNS,
     CONTACT_SYNC_STATE_COLUMNS,
+    PLAID_ACCOUNT_COLUMNS,
+    PLAID_INVESTMENT_HOLDING_COLUMNS,
+    PLAID_INVESTMENT_SECURITY_COLUMNS,
+    PLAID_INVESTMENT_TRANSACTION_COLUMNS,
+    PLAID_ITEM_COLUMNS,
+    PLAID_LIABILITY_COLUMNS,
+    PLAID_ITEM_TOKEN_COLUMNS,
+    PLAID_SYNC_STATE_COLUMNS,
+    PLAID_TRANSACTION_COLUMNS,
+    PlaidLinkedItem,
     GOOGLE_DRIVE_FILE_COLUMNS,
     GOOGLE_DRIVE_FILE_TEXT_COLUMNS,
     GOOGLE_DRIVE_SYNC_STATE_COLUMNS,
@@ -185,6 +196,21 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         CONTACT_SYNC_STATE_COLUMNS,
         ("source", "account", "source_kind", "address_book_id"),
     ),
+    "plaid_items": TableSpec(PLAID_ITEM_COLUMNS, ("account", "item_id")),
+    "plaid_item_tokens": TableSpec(PLAID_ITEM_TOKEN_COLUMNS, ("account", "item_id")),
+    "plaid_accounts": TableSpec(PLAID_ACCOUNT_COLUMNS, ("account", "account_id")),
+    "plaid_transactions": TableSpec(PLAID_TRANSACTION_COLUMNS, ("account", "transaction_id")),
+    "plaid_investment_securities": TableSpec(PLAID_INVESTMENT_SECURITY_COLUMNS, ("account", "security_id")),
+    "plaid_investment_holdings": TableSpec(
+        PLAID_INVESTMENT_HOLDING_COLUMNS,
+        ("account", "account_id", "security_id"),
+    ),
+    "plaid_investment_transactions": TableSpec(
+        PLAID_INVESTMENT_TRANSACTION_COLUMNS,
+        ("account", "investment_transaction_id"),
+    ),
+    "plaid_liabilities": TableSpec(PLAID_LIABILITY_COLUMNS, ("account", "account_id", "liability_type")),
+    "plaid_sync_state": TableSpec(PLAID_SYNC_STATE_COLUMNS, ("account", "item_id", "product"), "updated_at"),
     "apple_voice_memos_files": TableSpec(VOICE_MEMO_FILE_COLUMNS, ("account", "recording_id")),
     "apple_voice_memos_transcription_runs": TableSpec(
         VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
@@ -848,6 +874,12 @@ POSTGRES_INSERT_PAGE_SIZES = {
     "codex_events": 500,
     "openclaw_events": 500,
     "pi_events": 500,
+    "plaid_accounts": 500,
+    "plaid_transactions": 500,
+    "plaid_investment_securities": 500,
+    "plaid_investment_holdings": 500,
+    "plaid_investment_transactions": 500,
+    "plaid_liabilities": 500,
 }
 
 
@@ -857,6 +889,8 @@ ARRAY_COLUMNS = {
     "cc_addresses",
     "bcc_addresses",
     "recurrence",
+    "available_products",
+    "billed_products",
 }
 
 JSONB_COLUMNS_BY_TABLE = {
@@ -887,6 +921,13 @@ JSONB_COLUMNS_BY_TABLE = {
     "whoop_recoveries": {"score_json", "raw_json"},
     "whoop_sleeps": {"stage_summary_json", "sleep_needed_json", "score_json", "raw_json"},
     "whoop_workouts": {"zone_durations_json", "score_json", "raw_json"},
+    "plaid_items": {"error_json", "raw_json"},
+    "plaid_accounts": {"raw_json"},
+    "plaid_transactions": {"category_json", "raw_json"},
+    "plaid_investment_securities": {"raw_json"},
+    "plaid_investment_holdings": {"raw_json"},
+    "plaid_investment_transactions": {"raw_json"},
+    "plaid_liabilities": {"raw_json"},
 }
 
 JSONB_ARRAY_COLUMNS_BY_TABLE = {
@@ -904,6 +945,7 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
         "parents_json",
         "owners_json",
     },
+    "plaid_transactions": {"category_json"},
 }
 
 TIMESTAMP_COLUMNS = {
@@ -957,6 +999,15 @@ TIMESTAMP_COLUMNS = {
     "watermark_ingest_ts",
     "last_run_at",
     "watermark_updated_at",
+    "linked_at",
+    "consent_expiration_time",
+    "posted_at",
+    "authorized_at",
+    "close_price_as_of",
+    "institution_price_as_of",
+    "transaction_at",
+    "next_payment_due_at",
+    "last_synced_at",
 }
 
 INTEGER_COLUMNS = {
@@ -1038,6 +1089,9 @@ INTEGER_COLUMNS = {
     "is_pending_review",
     "is_admin",
     "is_super_admin",
+    "is_removed",
+    "pending",
+    "is_overdue",
     "is_google_native",
     "starred",
     "shared",
@@ -1087,6 +1141,22 @@ FLOAT_COLUMNS = {
     "distance_meter",
     "altitude_gain_meter",
     "altitude_change_meter",
+    "available_balance",
+    "current_balance",
+    "limit_balance",
+    "amount",
+    "close_price",
+    "quantity",
+    "institution_value",
+    "institution_price",
+    "cost_basis",
+    "price",
+    "fees",
+    "last_payment_amount",
+    "last_statement_balance",
+    "minimum_payment_amount",
+    "origination_principal_amount",
+    "outstanding_interest_amount",
 }
 
 _WHATSAPP_TABLES = (
@@ -1128,6 +1198,7 @@ class PostgresWarehouse:
         # pdw_test_x_gmail, pdw_test_x_slack, ... so independent tests do not
         # collide in the shared Postgres database.
         self._schema = _validate_identifier(schema)
+        self._query_role = _validate_identifier(os.getenv("PDW_QUERY_POSTGRES_ROLE", "pdw_query"))
         self._connection = psycopg2.connect(normalized)
         self._connection.autocommit = True
         self._ensured_index_names: set[str] = set()
@@ -1135,10 +1206,15 @@ class PostgresWarehouse:
         self._pg_textsearch_ensured = False
         self._ensure_canonical_schemas()
         self._set_search_path()
+        self._ensure_query_role()
 
     @property
     def schema_namespace(self) -> str:
         return self._schema
+
+    @property
+    def query_role(self) -> str:
+        return self._query_role
 
     def physical_schema_names(self, *, include_private: bool = False) -> list[str]:
         return physical_schema_names(namespace=self._schema, include_private=include_private)
@@ -1184,6 +1260,7 @@ class PostgresWarehouse:
         connection.autocommit = True
         with connection.cursor() as cursor:
             cursor.execute(self._search_path_sql())
+            cursor.execute(f"SET ROLE {_identifier(self._query_role)}")
         return connection
 
     def ensure_tables(self) -> None:
@@ -1257,6 +1334,170 @@ class PostgresWarehouse:
         self._command("ALTER TABLE contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
         self._ensure_clean_contacts_view()
         self._ensure_search_views_if_possible()
+
+    def ensure_plaid_tables(self) -> None:
+        self._ensure_table_group(
+            [
+                "plaid_items",
+                "plaid_item_tokens",
+                "plaid_accounts",
+                "plaid_transactions",
+                "plaid_investment_securities",
+                "plaid_investment_holdings",
+                "plaid_investment_transactions",
+                "plaid_liabilities",
+                "plaid_sync_state",
+            ]
+        )
+        self._ensure_plaid_finance_mart_views()
+
+    def _ensure_query_role(self) -> None:
+        role = _identifier(self._query_role)
+        role_literal = self._query_role.replace("'", "''")
+        self._raw_command(
+            f"""
+            DO $role$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role_literal}') THEN
+                    CREATE ROLE {role} NOLOGIN NOINHERIT;
+                END IF;
+            END
+            $role$
+            """
+        )
+        current_user = str(self._query("SELECT current_user")[0][0])
+        self._raw_command(f"GRANT {role} TO {_identifier(current_user)}")
+
+        private_schema = _identifier(self.physical_schema_name("private"))
+        self._raw_command(f"REVOKE ALL ON SCHEMA {private_schema} FROM PUBLIC")
+        self._raw_command(f"REVOKE ALL ON ALL TABLES IN SCHEMA {private_schema} FROM PUBLIC")
+        self._raw_command(f"REVOKE ALL ON SCHEMA {private_schema} FROM {role}")
+        self._raw_command(f"REVOKE ALL ON ALL TABLES IN SCHEMA {private_schema} FROM {role}")
+
+        for schema_name in self.physical_schema_names():
+            schema = _identifier(schema_name)
+            self._raw_command(f"GRANT USAGE ON SCHEMA {schema} TO {role}")
+            self._raw_command(f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role}")
+            self._raw_command(f"GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {schema} TO {role}")
+            self._raw_command(f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT ON TABLES TO {role}")
+            self._raw_command(f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT EXECUTE ON FUNCTIONS TO {role}")
+
+    def _ensure_plaid_finance_mart_views(self) -> None:
+        plaid = _identifier(self.physical_schema_name("plaid"))
+        marts = _identifier(self.physical_schema_name("marts"))
+        view_sql = [
+            f"""
+            CREATE OR REPLACE VIEW {marts}.finance_accounts AS
+            SELECT
+                account,
+                item_id,
+                account_id,
+                name,
+                official_name,
+                mask,
+                type,
+                subtype,
+                available_balance,
+                current_balance,
+                limit_balance,
+                iso_currency_code,
+                unofficial_currency_code,
+                synced_at
+            FROM {plaid}.accounts
+            WHERE is_removed = 0
+            """,
+            f"""
+            CREATE OR REPLACE VIEW {marts}.finance_transactions AS
+            SELECT
+                account,
+                item_id,
+                account_id,
+                transaction_id,
+                posted_at,
+                authorized_at,
+                name,
+                merchant_name,
+                amount,
+                iso_currency_code,
+                unofficial_currency_code,
+                category_json,
+                payment_channel,
+                pending,
+                synced_at
+            FROM {plaid}.transactions
+            WHERE is_removed = 0
+            """,
+            f"""
+            CREATE OR REPLACE VIEW {marts}.finance_investment_holdings AS
+            SELECT
+                h.account,
+                h.item_id,
+                h.account_id,
+                h.security_id,
+                s.ticker_symbol,
+                s.name AS security_name,
+                s.type AS security_type,
+                h.quantity,
+                h.institution_value,
+                h.institution_price,
+                h.institution_price_as_of,
+                h.cost_basis,
+                h.iso_currency_code,
+                h.unofficial_currency_code,
+                h.synced_at
+            FROM {plaid}.investment_holdings AS h
+            LEFT JOIN {plaid}.investment_securities AS s
+              ON s.account = h.account
+             AND s.security_id = h.security_id
+            """,
+            f"""
+            CREATE OR REPLACE VIEW {marts}.finance_investment_transactions AS
+            SELECT
+                t.account,
+                t.item_id,
+                t.account_id,
+                t.investment_transaction_id,
+                t.security_id,
+                s.ticker_symbol,
+                s.name AS security_name,
+                t.transaction_at,
+                t.name,
+                t.quantity,
+                t.amount,
+                t.price,
+                t.fees,
+                t.type,
+                t.subtype,
+                t.iso_currency_code,
+                t.unofficial_currency_code,
+                t.synced_at
+            FROM {plaid}.investment_transactions AS t
+            LEFT JOIN {plaid}.investment_securities AS s
+              ON s.account = t.account
+             AND s.security_id = t.security_id
+            """,
+            f"""
+            CREATE OR REPLACE VIEW {marts}.finance_liabilities AS
+            SELECT
+                account,
+                item_id,
+                account_id,
+                liability_type,
+                last_payment_amount,
+                last_statement_balance,
+                minimum_payment_amount,
+                next_payment_due_at,
+                origination_principal_amount,
+                outstanding_interest_amount,
+                is_overdue,
+                iso_currency_code,
+                unofficial_currency_code,
+                synced_at
+            FROM {plaid}.liabilities
+            """,
+        ]
+        for sql in view_sql:
+            self._raw_command(sql)
 
     def ensure_apple_voice_memos_tables(self, *, backfill_content_hashes: bool = True) -> None:
         self._ensure_table_group(
@@ -4445,6 +4686,248 @@ class PostgresWarehouse:
                 )
             ],
             CONTACT_SYNC_STATE_COLUMNS,
+        )
+
+    def upsert_plaid_item_token(
+        self,
+        *,
+        account: str,
+        item_id: str,
+        access_token: str,
+        institution_id: str = "",
+        institution_name: str = "",
+        linked_at: datetime,
+    ) -> None:
+        self._insert_rows(
+            "plaid_item_tokens",
+            [
+                {
+                    "account": account,
+                    "item_id": item_id,
+                    "access_token": access_token,
+                    "institution_id": institution_id,
+                    "institution_name": institution_name,
+                    "linked_at": linked_at,
+                    "updated_at": linked_at,
+                    "sync_version": int(_ensure_utc(linked_at).timestamp() * 1_000_000),
+                }
+            ],
+            PLAID_ITEM_TOKEN_COLUMNS,
+        )
+
+    def load_plaid_item_tokens(self) -> list[PlaidLinkedItem]:
+        rows = self._query(
+            """
+            SELECT account, item_id, access_token, institution_id, institution_name
+            FROM plaid_item_tokens
+            ORDER BY account, institution_name, item_id
+            """
+        )
+        return [
+            PlaidLinkedItem(
+                account=str(row[0]),
+                item_id=str(row[1]),
+                access_token=str(row[2]),
+                institution_id=str(row[3]),
+                institution_name=str(row[4]),
+            )
+            for row in rows
+        ]
+
+    def load_plaid_sync_state(self) -> dict[tuple[str, str, str], dict[str, Any]]:
+        columns = PLAID_SYNC_STATE_COLUMNS
+        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM plaid_sync_state")
+        return {
+            (str(row[0]), str(row[1]), str(row[2])): dict(zip(columns, row, strict=True))
+            for row in rows
+        }
+
+    def insert_plaid_items(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("plaid_items", rows, PLAID_ITEM_COLUMNS)
+
+    def insert_plaid_accounts(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("plaid_accounts", rows, PLAID_ACCOUNT_COLUMNS)
+
+    def mark_missing_plaid_accounts_removed(
+        self,
+        *,
+        account: str,
+        item_id: str,
+        active_account_ids: set[str],
+        synced_at: datetime,
+    ) -> int:
+        params: list[Any] = [account, item_id]
+        active_filter = ""
+        if active_account_ids:
+            active_filter = "AND NOT (account_id = ANY(%s))"
+            params.append(sorted(active_account_ids))
+        rows = self._query(
+            f"""
+            SELECT {", ".join(_identifier(column) for column in PLAID_ACCOUNT_COLUMNS)}
+            FROM plaid_accounts
+            WHERE account = %s
+              AND item_id = %s
+              AND is_removed = 0
+              {active_filter}
+            """,
+            tuple(params),
+        )
+        sync_version = int(_ensure_utc(synced_at).timestamp() * 1_000_000)
+        tombstones: list[dict[str, Any]] = []
+        for row in rows:
+            tombstone = dict(zip(PLAID_ACCOUNT_COLUMNS, row, strict=True))
+            tombstone["is_removed"] = 1
+            tombstone["synced_at"] = synced_at
+            tombstone["sync_version"] = sync_version
+            tombstones.append(tombstone)
+        self.insert_plaid_accounts(tombstones)
+        return len(tombstones)
+
+    def insert_plaid_transactions(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("plaid_transactions", rows, PLAID_TRANSACTION_COLUMNS)
+
+    def mark_plaid_transactions_removed(
+        self,
+        *,
+        account: str,
+        item_id: str,
+        transaction_ids: list[str],
+        synced_at: datetime,
+    ) -> int:
+        if not transaction_ids:
+            return 0
+        rows = self._query(
+            f"""
+            SELECT {", ".join(_identifier(column) for column in PLAID_TRANSACTION_COLUMNS)}
+            FROM plaid_transactions
+            WHERE account = %s
+              AND item_id = %s
+              AND transaction_id = ANY(%s)
+              AND is_removed = 0
+            """,
+            (account, item_id, transaction_ids),
+        )
+        tombstones: list[dict[str, Any]] = []
+        sync_version = int(_ensure_utc(synced_at).timestamp() * 1_000_000)
+        for row in rows:
+            tombstone = dict(zip(PLAID_TRANSACTION_COLUMNS, row, strict=True))
+            tombstone["is_removed"] = 1
+            tombstone["synced_at"] = synced_at
+            tombstone["sync_version"] = sync_version
+            tombstones.append(tombstone)
+        self.insert_plaid_transactions(tombstones)
+        return len(tombstones)
+
+    def insert_plaid_investment_securities(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("plaid_investment_securities", rows, PLAID_INVESTMENT_SECURITY_COLUMNS)
+
+    def insert_plaid_investment_holdings(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("plaid_investment_holdings", rows, PLAID_INVESTMENT_HOLDING_COLUMNS)
+
+    def delete_missing_plaid_investment_holdings(
+        self,
+        *,
+        account: str,
+        item_id: str,
+        active_holding_keys: set[tuple[str, str]],
+    ) -> int:
+        return self._delete_missing_plaid_snapshot_rows(
+            table="plaid_investment_holdings",
+            account=account,
+            item_id=item_id,
+            key_columns=("account_id", "security_id"),
+            active_keys=active_holding_keys,
+        )
+
+    def insert_plaid_investment_transactions(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("plaid_investment_transactions", rows, PLAID_INVESTMENT_TRANSACTION_COLUMNS)
+
+    def insert_plaid_liabilities(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("plaid_liabilities", rows, PLAID_LIABILITY_COLUMNS)
+
+    def delete_missing_plaid_liabilities(
+        self,
+        *,
+        account: str,
+        item_id: str,
+        active_liability_keys: set[tuple[str, str]],
+    ) -> int:
+        return self._delete_missing_plaid_snapshot_rows(
+            table="plaid_liabilities",
+            account=account,
+            item_id=item_id,
+            key_columns=("account_id", "liability_type"),
+            active_keys=active_liability_keys,
+        )
+
+    def _delete_missing_plaid_snapshot_rows(
+        self,
+        *,
+        table: str,
+        account: str,
+        item_id: str,
+        key_columns: tuple[str, str],
+        active_keys: set[tuple[str, str]],
+    ) -> int:
+        if table not in {"plaid_investment_holdings", "plaid_liabilities"}:
+            raise ValueError(f"unsupported Plaid snapshot table: {table}")
+        first_key, second_key = key_columns
+        rows = self._query(
+            f"""
+            SELECT {_identifier(first_key)}, {_identifier(second_key)}
+            FROM {self.sql_relation(table)}
+            WHERE account = %s AND item_id = %s
+            """,
+            (account, item_id),
+        )
+        stale_keys = [(str(row[0]), str(row[1])) for row in rows if (str(row[0]), str(row[1])) not in active_keys]
+        if not stale_keys:
+            return 0
+        predicates = " OR ".join(
+            f"({_identifier(first_key)} = %s AND {_identifier(second_key)} = %s)"
+            for _ in stale_keys
+        )
+        params: list[Any] = [account, item_id]
+        for first, second in stale_keys:
+            params.extend((first, second))
+        self._command(
+            f"""
+            DELETE FROM {self.sql_relation(table)}
+            WHERE account = %s AND item_id = %s
+              AND ({predicates})
+            """,
+            tuple(params),
+        )
+        return len(stale_keys)
+
+    def insert_plaid_sync_state(
+        self,
+        *,
+        account: str,
+        item_id: str,
+        product: str,
+        cursor: str = "",
+        status: str,
+        error: str = "",
+        last_synced_at: datetime,
+        updated_at: datetime,
+    ) -> None:
+        self._insert_rows(
+            "plaid_sync_state",
+            [
+                {
+                    "account": account,
+                    "item_id": item_id,
+                    "product": product,
+                    "cursor": cursor,
+                    "status": status,
+                    "error": error,
+                    "last_synced_at": last_synced_at,
+                    "updated_at": updated_at,
+                    "sync_version": int(_ensure_utc(updated_at).timestamp() * 1_000_000),
+                }
+            ],
+            PLAID_SYNC_STATE_COLUMNS,
         )
 
     def mark_missing_contact_cards_deleted(

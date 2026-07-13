@@ -628,6 +628,33 @@ starting points: `chatgpt.events` plus `marts.ai_conversation_events` /
 `marts.ai_conversation_sessions` filtered to `source = 'chatgpt'`, and `private.chatgpt_sessions`
 (credential) / `chatgpt.conversation_sync` (per-conversation watermark).
 
+## Plaid Finance
+
+Personal financial data is linked through Plaid and stored in the source-owned `plaid` schema.
+Raw/query tables are `plaid.items`, `plaid.accounts`, `plaid.transactions`,
+`plaid.investment_securities`, `plaid.investment_holdings`, `plaid.investment_transactions`,
+`plaid.liabilities`, and `plaid.sync_state`. Finance-domain read views are
+`marts.finance_accounts`, `marts.finance_transactions`, `marts.finance_investment_holdings`,
+`marts.finance_investment_transactions`, and `marts.finance_liabilities`. Access tokens are
+isolated in `private.plaid_item_tokens`. Warehouse initialization provisions the NOLOGIN
+`PDW_QUERY_POSTGRES_ROLE` (default `pdw_query`), revokes `private` from it/`PUBLIC`, and both Go and
+Python read-only query runners assume that role for every user-authored query; never bypass this
+boundary or expose the token table through normal query surfaces.
+
+Configure `PLAID_ACCOUNT`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, and `PLAID_ENV` on the machine doing
+interactive linking and in the production Dagster deployment. `pdw ingest plaid link` opens the
+localhost Plaid Link flow and persists the exchanged token; repeat it once per institution.
+`pdw ingest plaid sync` performs an immediate pull. Production uses the `plaid_finance_sync` asset
+and `plaid_finance_sync_every_thirty_minutes` schedule. Account, holding, and liability responses
+are authoritative snapshots: reconcile missing accounts/holdings/liabilities rather than leaving
+stale current rows. Product errors must persist a redacted failed `plaid.sync_state` row before the
+run fails. Optional products default to read-only `transactions,investments,liabilities`; no
+payment/money-movement Plaid products are requested.
+Run `uv run python scripts/plaid_linking_report.py` after linking/live verification to refresh the
+mode-0600, gitignored `reports/plaid-linking-report.private.md` artifact with every institution and
+anonymous account status plus last-pull evidence. See the README's **Plaid Finance Sync** section
+for all settings and safe aggregate verification queries.
+
 ## Shared file-attachment enrichment
 
 `gmail_attachment_enrichments` was renamed to `file_attachment_enrichments` and generalized into

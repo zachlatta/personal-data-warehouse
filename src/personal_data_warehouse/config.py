@@ -97,6 +97,14 @@ DEFAULT_GOOGLE_DRIVE_SOURCE_TEXT_MAX_CHARS = 5_000_000
 DEFAULT_GOOGLE_DRIVE_SOURCE_EXTRACT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_GOOGLE_DRIVE_SOURCE_FILES_PER_RUN = 5000
 DEFAULT_GOOGLE_DRIVE_SOURCE_REQUEST_TIMEOUT_SECONDS = 30
+DEFAULT_PLAID_ENVIRONMENT = "development"
+DEFAULT_PLAID_PRODUCTS = ("transactions", "investments", "liabilities")
+DEFAULT_PLAID_COUNTRY_CODES = ("US",)
+DEFAULT_PLAID_CLIENT_NAME = "Personal Data Warehouse"
+DEFAULT_PLAID_REQUEST_TIMEOUT_SECONDS = 30
+DEFAULT_PLAID_TRANSACTIONS_LOOKBACK_DAYS = 730
+PLAID_ENVIRONMENTS = ("sandbox", "development", "production")
+PLAID_SUPPORTED_PRODUCTS = ("transactions", "investments", "liabilities")
 DEFAULT_ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com"
 DEFAULT_ASSEMBLYAI_POLL_INTERVAL_SECONDS = 5
 DEFAULT_ASSEMBLYAI_TIMEOUT_SECONDS = 1800
@@ -334,6 +342,23 @@ class GoogleDriveSourceConfig:
 
 
 @dataclass(frozen=True)
+class PlaidConfig:
+    account: str
+    client_id: str
+    secret: str
+    environment: str = DEFAULT_PLAID_ENVIRONMENT
+    products: tuple[str, ...] = DEFAULT_PLAID_PRODUCTS
+    country_codes: tuple[str, ...] = DEFAULT_PLAID_COUNTRY_CODES
+    client_name: str = DEFAULT_PLAID_CLIENT_NAME
+    language: str = "en"
+    redirect_uri: str = ""
+    webhook: str = ""
+    base_url: str = ""
+    request_timeout_seconds: int = DEFAULT_PLAID_REQUEST_TIMEOUT_SECONDS
+    transactions_lookback_days: int = DEFAULT_PLAID_TRANSACTIONS_LOOKBACK_DAYS
+
+
+@dataclass(frozen=True)
 class AssemblyAIConfig:
     api_key: str
     base_url: str = DEFAULT_ASSEMBLYAI_BASE_URL
@@ -410,6 +435,7 @@ class Settings:
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
     whoop: WhoopConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
+    plaid: PlaidConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
     postgres_database_url: str | None = None
@@ -514,6 +540,7 @@ def load_settings(
     require_whoop: bool = False,
     require_whoop_client_secrets: bool = False,
     require_google_drive_source: bool = False,
+    require_plaid: bool = False,
     require_assemblyai: bool = False,
     require_agent: bool = False,
 ) -> Settings:
@@ -1297,6 +1324,78 @@ def load_settings(
             request_timeout_seconds=google_drive_source_request_timeout_seconds,
         )
 
+    plaid_account = (
+        os.getenv("PLAID_ACCOUNT")
+        or os.getenv("AGENT_SESSIONS_ACCOUNT")
+        or os.getenv("APPLE_MESSAGES_ACCOUNT")
+        or os.getenv("VOICE_MEMOS_ACCOUNT")
+        or default_voice_memos_account
+    ).strip()
+    plaid_client_id = os.getenv("PLAID_CLIENT_ID", "").strip()
+    plaid_secret = os.getenv("PLAID_SECRET", "").strip()
+    plaid_env_present = any(
+        os.getenv(name)
+        for name in (
+            "PLAID_ACCOUNT",
+            "PLAID_CLIENT_ID",
+            "PLAID_SECRET",
+            "PLAID_ENV",
+            "PLAID_PRODUCTS",
+            "PLAID_COUNTRY_CODES",
+        )
+    )
+    plaid: PlaidConfig | None = None
+    if require_plaid or plaid_env_present:
+        missing = []
+        if not plaid_account:
+            missing.append("PLAID_ACCOUNT")
+        if not plaid_client_id:
+            missing.append("PLAID_CLIENT_ID")
+        if not plaid_secret:
+            missing.append("PLAID_SECRET")
+        if missing:
+            raise ValueError(", ".join(missing) + " must be set for Plaid finance sync")
+        plaid_environment = os.getenv("PLAID_ENV", DEFAULT_PLAID_ENVIRONMENT).strip().lower()
+        if plaid_environment not in PLAID_ENVIRONMENTS:
+            raise ValueError(f"PLAID_ENV must be one of: {', '.join(PLAID_ENVIRONMENTS)}")
+        plaid_products = tuple(product.lower() for product in (_parse_csv_env(os.getenv("PLAID_PRODUCTS")) or DEFAULT_PLAID_PRODUCTS))
+        unsupported_products = sorted(set(plaid_products) - set(PLAID_SUPPORTED_PRODUCTS))
+        if unsupported_products:
+            raise ValueError(
+                "PLAID_PRODUCTS currently supports read-only products: "
+                + ", ".join(PLAID_SUPPORTED_PRODUCTS)
+                + f" (unsupported: {', '.join(unsupported_products)})"
+            )
+        plaid_country_codes = tuple(code.upper() for code in (_parse_csv_env(os.getenv("PLAID_COUNTRY_CODES")) or DEFAULT_PLAID_COUNTRY_CODES))
+        if not plaid_country_codes:
+            raise ValueError("PLAID_COUNTRY_CODES must include at least one country code")
+        plaid_request_timeout_seconds = int(
+            os.getenv("PLAID_REQUEST_TIMEOUT_SECONDS", str(DEFAULT_PLAID_REQUEST_TIMEOUT_SECONDS))
+        )
+        if plaid_request_timeout_seconds < 1:
+            raise ValueError("PLAID_REQUEST_TIMEOUT_SECONDS must be at least 1")
+        plaid_transactions_lookback_days = int(
+            os.getenv("PLAID_TRANSACTIONS_LOOKBACK_DAYS", str(DEFAULT_PLAID_TRANSACTIONS_LOOKBACK_DAYS))
+        )
+        if plaid_transactions_lookback_days < 1:
+            raise ValueError("PLAID_TRANSACTIONS_LOOKBACK_DAYS must be at least 1")
+        plaid = PlaidConfig(
+            account=plaid_account,
+            client_id=plaid_client_id,
+            secret=plaid_secret,
+            environment=plaid_environment,
+            products=plaid_products,
+            country_codes=plaid_country_codes,
+            client_name=os.getenv("PLAID_CLIENT_NAME", DEFAULT_PLAID_CLIENT_NAME).strip()
+            or DEFAULT_PLAID_CLIENT_NAME,
+            language=os.getenv("PLAID_LANGUAGE", "en").strip() or "en",
+            redirect_uri=os.getenv("PLAID_REDIRECT_URI", "").strip(),
+            webhook=os.getenv("PLAID_WEBHOOK", "").strip(),
+            base_url=os.getenv("PLAID_BASE_URL", "").strip().rstrip("/"),
+            request_timeout_seconds=plaid_request_timeout_seconds,
+            transactions_lookback_days=plaid_transactions_lookback_days,
+        )
+
     assemblyai_api_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
     assemblyai: AssemblyAIConfig | None = None
     if require_assemblyai or assemblyai_api_key:
@@ -1443,6 +1542,7 @@ def load_settings(
         alice_voice_recordings=alice_voice_recordings,
         whoop=whoop,
         google_drive_source=google_drive_source,
+        plaid=plaid,
         assemblyai=assemblyai,
         agent=agent,
         postgres_database_url=postgres_database_url,

@@ -10,6 +10,7 @@ SOURCE_RAW_SCHEMAS: tuple[str, ...] = (
     "google_calendar",
     "google_contacts",
     "google_drive",
+    "plaid",
     "slack",
     "apple_notes",
     "apple_messages",
@@ -117,6 +118,15 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("codex_events", "codex", "events"),
     ("openclaw_events", "openclaw", "events"),
     ("pi_events", "pi", "events"),
+    # Plaid source data
+    ("plaid_items", "plaid", "items"),
+    ("plaid_accounts", "plaid", "accounts"),
+    ("plaid_transactions", "plaid", "transactions"),
+    ("plaid_investment_securities", "plaid", "investment_securities"),
+    ("plaid_investment_holdings", "plaid", "investment_holdings"),
+    ("plaid_investment_transactions", "plaid", "investment_transactions"),
+    ("plaid_liabilities", "plaid", "liabilities"),
+    ("plaid_sync_state", "plaid", "sync_state"),
     # Slack
     ("slack_teams", "slack", "teams"),
     ("slack_account_identities", "slack", "account_identities"),
@@ -159,6 +169,7 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("claude_desktop_credentials", "private", "claude_desktop_credentials"),
     ("whatsapp_client_sessions", "private", "whatsapp_client_sessions"),
     ("whoop_oauth_tokens", "private", "whoop_oauth_tokens"),
+    ("plaid_item_tokens", "private", "plaid_item_tokens"),
 )
 
 CANONICAL_RELATIONS: dict[str, Relation] = {

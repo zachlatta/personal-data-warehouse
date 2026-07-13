@@ -53,6 +53,7 @@ func TestIngestResolvesKnownSources(t *testing.T) {
 		"apple-notes":    "personal_data_warehouse_apple_notes.cli",
 		"apple-messages": "personal_data_warehouse_apple_messages.cli",
 		"agent-sessions": "personal_data_warehouse_agent_sessions.cli",
+		"plaid":          "personal_data_warehouse_plaid.cli",
 	}
 	for source, module := range want {
 		got, ok := resolveIngestModule(source)
@@ -150,7 +151,7 @@ func TestIngestUnknownSourceErrors(t *testing.T) {
 	if !strings.Contains(errOut.String(), "bogus") {
 		t.Fatalf("stderr should name the bad source: %s", errOut.String())
 	}
-	for _, s := range []string{"voice-memos", "apple-notes", "apple-messages", "agent-sessions", "claude-desktop"} {
+	for _, s := range []string{"voice-memos", "apple-notes", "apple-messages", "agent-sessions", "claude-desktop", "plaid"} {
 		if !strings.Contains(errOut.String(), s) {
 			t.Fatalf("stderr should list valid source %q: %s", s, errOut.String())
 		}

@@ -61,6 +61,7 @@ packages = [
     "src/personal_data_warehouse_apple_notes",
     "src/personal_data_warehouse_voice_memos",
     "src/personal_data_warehouse_whatsapp",
+    "src/personal_data_warehouse_plaid",
 ]
 force-include = { "pyproject.toml" = "pyproject.toml" }
 

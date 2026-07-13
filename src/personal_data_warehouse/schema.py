@@ -590,6 +590,169 @@ WHATSAPP_MEDIA_ITEM_COLUMNS = (
     "sync_version",
 )
 
+PLAID_ITEM_COLUMNS = (
+    "account",
+    "item_id",
+    "institution_id",
+    "institution_name",
+    "available_products",
+    "billed_products",
+    "webhook",
+    "consent_expiration_time",
+    "error_json",
+    "raw_json",
+    "linked_at",
+    "synced_at",
+    "sync_version",
+)
+
+PLAID_ITEM_TOKEN_COLUMNS = (
+    "account",
+    "item_id",
+    "access_token",
+    "institution_id",
+    "institution_name",
+    "linked_at",
+    "updated_at",
+    "sync_version",
+)
+
+PLAID_ACCOUNT_COLUMNS = (
+    "account",
+    "item_id",
+    "account_id",
+    "name",
+    "official_name",
+    "mask",
+    "type",
+    "subtype",
+    "available_balance",
+    "current_balance",
+    "limit_balance",
+    "iso_currency_code",
+    "unofficial_currency_code",
+    "is_removed",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+PLAID_TRANSACTION_COLUMNS = (
+    "account",
+    "item_id",
+    "account_id",
+    "transaction_id",
+    "posted_at",
+    "authorized_at",
+    "name",
+    "merchant_name",
+    "amount",
+    "iso_currency_code",
+    "unofficial_currency_code",
+    "category_json",
+    "payment_channel",
+    "pending",
+    "pending_transaction_id",
+    "is_removed",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+PLAID_INVESTMENT_SECURITY_COLUMNS = (
+    "account",
+    "security_id",
+    "name",
+    "ticker_symbol",
+    "type",
+    "close_price",
+    "close_price_as_of",
+    "iso_currency_code",
+    "unofficial_currency_code",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+PLAID_INVESTMENT_HOLDING_COLUMNS = (
+    "account",
+    "item_id",
+    "account_id",
+    "security_id",
+    "quantity",
+    "institution_value",
+    "institution_price",
+    "institution_price_as_of",
+    "cost_basis",
+    "iso_currency_code",
+    "unofficial_currency_code",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+PLAID_INVESTMENT_TRANSACTION_COLUMNS = (
+    "account",
+    "item_id",
+    "account_id",
+    "investment_transaction_id",
+    "security_id",
+    "transaction_at",
+    "name",
+    "quantity",
+    "amount",
+    "price",
+    "fees",
+    "type",
+    "subtype",
+    "iso_currency_code",
+    "unofficial_currency_code",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+PLAID_LIABILITY_COLUMNS = (
+    "account",
+    "item_id",
+    "account_id",
+    "liability_type",
+    "last_payment_amount",
+    "last_statement_balance",
+    "minimum_payment_amount",
+    "next_payment_due_at",
+    "origination_principal_amount",
+    "outstanding_interest_amount",
+    "is_overdue",
+    "iso_currency_code",
+    "unofficial_currency_code",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+PLAID_SYNC_STATE_COLUMNS = (
+    "account",
+    "item_id",
+    "product",
+    "cursor",
+    "status",
+    "error",
+    "last_synced_at",
+    "updated_at",
+    "sync_version",
+)
+
+
+@dataclass(frozen=True)
+class PlaidLinkedItem:
+    account: str
+    item_id: str
+    access_token: str
+    institution_id: str = ""
+    institution_name: str = ""
+
+
 AGENT_RUN_COLUMNS = (
     "run_id",
     "provider",

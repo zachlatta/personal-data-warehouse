@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -14,9 +15,17 @@ import (
 type PostgresRunner struct {
 	db           *sql.DB
 	queryTimeout time.Duration
+	queryRole    string
 }
 
 func NewPostgresRunner(databaseURL string, timeout time.Duration) (*PostgresRunner, error) {
+	return NewPostgresRunnerWithRole(databaseURL, timeout, "")
+}
+
+func NewPostgresRunnerWithRole(databaseURL string, timeout time.Duration, queryRole string) (*PostgresRunner, error) {
+	if _, err := queryRoleSQL(queryRole); err != nil {
+		return nil, err
+	}
 	logger := slog.Default().With("component", "postgres")
 	started := time.Now()
 	logger.Info("opening Postgres connection", "timeout", timeout)
@@ -37,7 +46,7 @@ func NewPostgresRunner(databaseURL string, timeout time.Duration) (*PostgresRunn
 		return nil, err
 	}
 	logger.Info("Postgres connection ready", "duration", time.Since(started))
-	return &PostgresRunner{db: db, queryTimeout: effectiveTimeout}, nil
+	return &PostgresRunner{db: db, queryTimeout: effectiveTimeout, queryRole: queryRole}, nil
 }
 
 func (r *PostgresRunner) Close() error {
@@ -82,6 +91,14 @@ func (r *PostgresRunner) QueryArgs(ctx context.Context, statement string, args [
 		logger.ErrorContext(ctx, "Postgres set statement_timeout failed", "error", err, "duration", time.Since(started))
 		return RawResult{}, err
 	}
+	if roleSQL, err := queryRoleSQL(r.queryRole); err != nil {
+		return RawResult{}, err
+	} else if roleSQL != "" {
+		if _, err := tx.ExecContext(ctx, roleSQL); err != nil {
+			logger.ErrorContext(ctx, "Postgres assume query role failed", "role", r.queryRole, "error", err, "duration", time.Since(started))
+			return RawResult{}, err
+		}
+	}
 
 	rows, err := tx.QueryContext(ctx, statement, args...)
 	if err != nil {
@@ -121,6 +138,18 @@ func (r *PostgresRunner) QueryArgs(ctx context.Context, statement string, args [
 	}
 	logger.DebugContext(ctx, "Postgres query returned", "sql", statement, "rows", len(result.Rows), "columns", len(result.Columns), "duration", time.Since(started))
 	return result, nil
+}
+
+var postgresRoleIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func queryRoleSQL(role string) (string, error) {
+	if role == "" {
+		return "", nil
+	}
+	if !postgresRoleIdentifier.MatchString(role) {
+		return "", fmt.Errorf("query Postgres role must be a valid identifier")
+	}
+	return `SET LOCAL ROLE "` + role + `"`, nil
 }
 
 func normalizeValue(value any) any {

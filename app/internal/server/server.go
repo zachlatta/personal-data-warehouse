@@ -105,7 +105,7 @@ type sqlInput struct {
 // happen: clients searching for "Slack" or "Gmail" hit this paragraph. The
 // per-tool descriptions stay deliberately short; the rich content lives in
 // the schema_overview response.
-const serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Apple Notes, Apple Messages (iMessage/SMS/RCS), and Apple Voice Memo transcripts. Always call schema_overview first to learn the tables and columns; then write read-only Postgres SQL with query."
+const serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, and Plaid-backed finance data. Always call schema_overview first to learn the tables and columns; then write read-only Postgres SQL with query."
 
 const schemaFirstReminder = "Call schema_overview first."
 
@@ -292,7 +292,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	// them (the real Postgres runner does; bare test fakes may not).
 	timelineRunner, timelineEnabled := runner.(timelineQuerier)
 	if cfg.TimelineDatabaseURL != "" && cfg.TimelineDatabaseURL != cfg.PostgresDatabaseURL {
-		dedicated, terr := query.NewPostgresRunner(cfg.TimelineDatabaseURL, cfg.QueryTimeout)
+		dedicated, terr := query.NewPostgresRunnerWithRole(cfg.TimelineDatabaseURL, cfg.QueryTimeout, cfg.QueryPostgresRole)
 		if terr != nil {
 			logger.Error("timeline database configured but failed to initialize; timeline disabled", "error", terr.Error())
 			timelineEnabled = false

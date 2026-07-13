@@ -38,6 +38,9 @@ pip-delete-this-directory.txt
 
 # Unit test / coverage reports
 htmlcov/
+
+# Local reports that may describe private linked accounts; never commit.
+*.private.md
 .tox/
 .nox/
 .coverage

@@ -31,6 +31,7 @@ var ingestModules = map[string]string{
 	"apple-notes":    "personal_data_warehouse_apple_notes.cli",
 	"apple-messages": "personal_data_warehouse_apple_messages.cli",
 	"agent-sessions": "personal_data_warehouse_agent_sessions.cli",
+	"plaid":          "personal_data_warehouse_plaid.cli",
 }
 
 // ingestExec runs the resolved uploader command. It's a package var so tests
@@ -97,6 +98,7 @@ SOURCES
   apple-messages   Upload local Apple Messages (iMessage/SMS/RCS)
   agent-sessions   Upload AI agent CLI session transcripts
   claude-desktop   Push the Claude Desktop (claude.ai) session credential
+  plaid            Link Plaid items and sync personal financial data
 
 The uploader posts to the warehouse over the same URL + token pdw uses for
 everything else: run "pdw login" once (or set PDW_API_URL + PDW_SECRET_TOKEN)
@@ -112,6 +114,8 @@ EXAMPLES
   pdw ingest voice-memos --mode incremental
   pdw ingest apple-notes --mode full
   pdw ingest agent-sessions --limit 1000
+  pdw ingest plaid link
+  pdw ingest plaid sync
 `
 
 // runIngest parses `pdw ingest` arguments and runs the matching uploader. It

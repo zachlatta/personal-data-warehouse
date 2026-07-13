@@ -25,7 +25,7 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("configuration loaded", "addr", cfg.Addr, "base_url", cfg.BaseURL, "max_rows", cfg.MaxRows, "max_field_chars", cfg.MaxFieldChars, "query_timeout", cfg.QueryTimeout, "git_sha", buildinfo.GitSHA())
-	runner, err := query.NewPostgresRunner(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+	runner, err := query.NewPostgresRunnerWithRole(cfg.PostgresDatabaseURL, cfg.QueryTimeout, cfg.QueryPostgresRole)
 	if err != nil {
 		logger.Error("connect to Postgres failed", "error", err)
 		os.Exit(1)

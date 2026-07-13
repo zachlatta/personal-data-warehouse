@@ -24,3 +24,11 @@ func TestQualifySQLRewritesUpstreamMutationRelationReferences(t *testing.T) {
 		t.Fatalf("qualified SQL mismatch\nwant: %s\n got: %s", want, got)
 	}
 }
+
+func TestQualifySQLRewritesPlaidRelations(t *testing.T) {
+	got := QualifySQL(`SELECT account_id FROM plaid_accounts WHERE is_removed = 0`)
+	want := `SELECT account_id FROM "plaid"."accounts" WHERE is_removed = 0`
+	if got != want {
+		t.Fatalf("qualified SQL mismatch\nwant: %s\n got: %s", want, got)
+	}
+}

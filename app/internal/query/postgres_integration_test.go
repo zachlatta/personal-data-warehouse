@@ -17,6 +17,22 @@ func postgresURLForIntegrationTest(t *testing.T) string {
 	return postgresURL
 }
 
+func TestQueryRoleSQLQuotesValidatedRole(t *testing.T) {
+	got, err := queryRoleSQL("pdw_query")
+	if err != nil {
+		t.Fatalf("queryRoleSQL: %v", err)
+	}
+	if got != `SET LOCAL ROLE "pdw_query"` {
+		t.Fatalf("queryRoleSQL = %q", got)
+	}
+}
+
+func TestQueryRoleSQLRejectsInjection(t *testing.T) {
+	if _, err := queryRoleSQL(`pdw_query"; RESET ROLE; --`); err == nil {
+		t.Fatal("expected unsafe role to be rejected")
+	}
+}
+
 func TestPostgresRunnerUsesRealPostgresDatabaseURL(t *testing.T) {
 	runner, err := NewPostgresRunner(postgresURLForIntegrationTest(t), 5*time.Second)
 	if err != nil {
@@ -32,6 +48,32 @@ func TestPostgresRunnerUsesRealPostgresDatabaseURL(t *testing.T) {
 	}
 	if len(result.Rows) != 1 || result.Rows[0]["ok"] == nil {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestPostgresRunnerAssumesRestrictedRoleAndCannotReadPrivatePlaidTokens(t *testing.T) {
+	role := os.Getenv("PDW_QUERY_POSTGRES_ROLE")
+	if role == "" {
+		t.Skip("PDW_QUERY_POSTGRES_ROLE is not set")
+	}
+	runner, err := NewPostgresRunnerWithRole(postgresURLForIntegrationTest(t), 5*time.Second, role)
+	if err != nil {
+		t.Fatalf("NewPostgresRunnerWithRole returned error: %v", err)
+	}
+	defer runner.Close()
+
+	result, err := runner.Query(context.Background(), "SELECT current_user AS role", 1)
+	if err != nil {
+		t.Fatalf("query through restricted role failed: %v", err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["role"] != role {
+		t.Fatalf("query ran as %#v, want %q", result.Rows, role)
+	}
+	if _, err := runner.Query(context.Background(), "SELECT count(*) FROM plaid.accounts", 1); err != nil {
+		t.Fatalf("restricted query role could not read a queryable Plaid table: %v", err)
+	}
+	if _, err := runner.Query(context.Background(), "SELECT access_token FROM private.plaid_item_tokens LIMIT 1", 1); err == nil {
+		t.Fatal("restricted query role could select private Plaid tokens")
 	}
 }
 

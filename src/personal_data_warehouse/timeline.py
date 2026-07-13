@@ -1674,6 +1674,17 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "whoop_workouts": _events(),
     "whoop_sync_state": _state("per-collection WHOOP scan watermark"),
     "whoop_oauth_tokens": _state("rotating WHOOP OAuth credential"),
+    # Plaid finance data is queryable through plaid.* and marts.finance_* but
+    # deliberately excluded from the general communications/activity timeline.
+    "plaid_items": _entity("institution dimension for Plaid finance queries"),
+    "plaid_accounts": _entity("account and current balance state"),
+    "plaid_transactions": _entity("finance query surface; excluded from the general timeline"),
+    "plaid_investment_securities": _entity("security dimension"),
+    "plaid_investment_holdings": _entity("current investment holding state"),
+    "plaid_investment_transactions": _entity("finance query surface; excluded from the general timeline"),
+    "plaid_liabilities": _entity("current liability state"),
+    "plaid_sync_state": _state("per-item/product sync cursor"),
+    "plaid_item_tokens": _state("private Plaid access tokens"),
     # Upstream mutations (the warehouse acting on the world)
     "upstream_mutations": _events(),
     "upstream_mutation_requests": _events(),

@@ -1,6 +1,6 @@
 # personal_data_warehouse
 
-This project syncs Gmail mailbox data, Google Calendar events, Slack data, WHOOP health data, Apple Notes, Apple Messages, and Voice Memos into Postgres through Dagster.
+This project syncs Gmail mailbox data, Google Calendar events, Slack data, WHOOP health data, Apple Notes, Apple Messages, Voice Memos, and Plaid-backed personal finance data into Postgres through Dagster.
 
 Current ingestion path:
 
@@ -25,6 +25,9 @@ Current ingestion path:
   Dagster ingests them into normalized Postgres tables.
 - WHOOP syncs read-only health data through the WHOOP v2 OAuth API: profile, body measurements,
   cycles, recovery, sleep, and workouts land in source-owned `whoop.*` Postgres tables.
+- Plaid uses an interactive local Link flow to authorize personal institutions. Access tokens stay
+  in the private Postgres schema; a Dagster asset incrementally syncs account/balance,
+  transaction, investment, and liability data into the source-owned `plaid` schema.
 
 ## CLI: `pdw`
 
@@ -447,6 +450,91 @@ All Slack schedules share a nonblocking Slack lock, so most scheduled ticks skip
 sync stage is still running. The hourly Slack user sync is stricter: lock contention raises and
 lets Dagster retry because a skipped user refresh is otherwise easy to miss.
 Calendar sync runs through `calendar_event_sync_every_five_minutes` with its own nonblocking lock.
+
+## Plaid Finance Sync
+
+Plaid raw data is source-owned: physical relations live under `plaid.*`, not a generic
+`finance` source schema. Stable finance-domain read views live under `marts.finance_*`.
+Access tokens are isolated in `private.plaid_item_tokens`; normal read-only schema discovery and
+query surfaces do not expose the private schema. Plaid's legacy public key is not used by the
+modern Link-token API.
+
+Configure the `PLAID_*` variables below and ensure `POSTGRES_DATABASE_URL` points at the target
+warehouse:
+
+```bash
+PLAID_ACCOUNT=you@example.com
+PLAID_CLIENT_ID=...
+PLAID_SECRET=...
+PLAID_ENV=production                 # sandbox, development, or production
+PLAID_PRODUCTS=transactions,investments,liabilities
+PLAID_COUNTRY_CODES=US
+PDW_QUERY_POSTGRES_ROLE=pdw_query      # NOLOGIN role assumed by user-authored SQL
+# PLAID_REDIRECT_URI=https://registered.example/plaid/oauth-return
+```
+
+Keep the client secret in uncommitted environment/config only. Link one institution at a time:
+
+```bash
+pdw ingest plaid link
+# If running directly from a checkout before updating the pdw binary:
+uv run python -m personal_data_warehouse_plaid.cli link
+```
+
+The command creates a short-lived Link token, opens a localhost page, and prompts through Plaid
+Link/OAuth/MFA. The browser returns only the one-time public token to localhost; the CLI exchanges
+it server-side and writes the resulting access token directly to the private Postgres table. User
+cancellation and Plaid errors stop the local server and return an actionable CLI error. OAuth
+redirects resume the same Link token via Plaid's `receivedRedirectUri`; configure a fixed
+`--host`/`--port` whose callback URL matches the redirect registered in the Plaid dashboard (or
+route the registered HTTPS URL to it). Never paste access/public tokens into logs, issues, or
+committed files. Repeat `link` for each personal institution, then sync all linked items:
+
+```bash
+pdw ingest plaid sync
+# Direct checkout equivalent:
+uv run python -m personal_data_warehouse_plaid.cli sync
+```
+
+The `plaid_finance_sync` Dagster asset performs the same sync. Its enabled
+`plaid_finance_sync_every_thirty_minutes` schedule uses a nonblocking Postgres advisory lock and
+runs every 30 minutes. Production must provide `PLAID_ACCOUNT`, `PLAID_CLIENT_ID`, `PLAID_SECRET`,
+`PLAID_ENV`, and `POSTGRES_DATABASE_URL` to the Dagster process. Set `PLAID_REDIRECT_URI` to an
+HTTPS URI registered in the Plaid dashboard before linking OAuth institutions that require a
+redirect URI. Optional tuning: `PLAID_CLIENT_NAME`, `PLAID_PRODUCTS`, `PLAID_COUNTRY_CODES`,
+`PLAID_LANGUAGE`, `PLAID_WEBHOOK`, `PLAID_REQUEST_TIMEOUT_SECONDS`, and
+`PLAID_TRANSACTIONS_LOOKBACK_DAYS`. Account, holding, and liability endpoints are authoritative
+snapshots: accounts absent from a later snapshot are tombstoned, while absent holdings and
+liabilities are removed. Product failures are written to `plaid.sync_state` with a redacted error
+before the overall run fails, so an old `ok` cannot mask a broken credential/product.
+
+Warehouse initialization provisions the NOLOGIN role named by `PDW_QUERY_POSTGRES_ROLE` (default
+`pdw_query`), grants it read access only to queryable schemas, and revokes `private` from both that
+role and `PUBLIC`. The Go MCP/HTTP SQL runner and Python `PostgresReadOnlyRunner` assume this role
+for every user-authored query; startup/query execution therefore fails closed if the restricted
+role has not been provisioned. Sync and credential writers continue to use the owner connection
+without assuming the restricted role.
+
+Generate the private per-institution/per-account linking report after each linking or verification
+session. It contains status/presence flags and last-pull timestamps but no IDs, masks, balances,
+transaction details, holdings values, or tokens; `*.private.md` is gitignored:
+
+```bash
+uv run python scripts/plaid_linking_report.py
+# writes reports/plaid-linking-report.private.md with mode 0600
+```
+
+Safe ad-hoc verification queries should avoid selecting masks, balances, transaction details,
+holdings, raw JSON, or private tokens. Useful aggregate/status surfaces are:
+
+```sql
+SELECT product, status, last_synced_at FROM plaid.sync_state ORDER BY product;
+SELECT count(*) FROM marts.finance_accounts;
+SELECT count(*) FROM marts.finance_transactions;
+SELECT count(*) FROM marts.finance_investment_holdings;
+SELECT count(*) FROM marts.finance_investment_transactions;
+SELECT count(*) FROM marts.finance_liabilities;
+```
 
 ## Deployment Metadata
 
@@ -1094,6 +1182,14 @@ The sync creates and maintains:
 - `apple_message_attachments`: attachment metadata and staged Drive storage pointers
 - `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
+- `plaid.items`, `plaid.accounts`, `plaid.transactions`, `plaid.investment_securities`,
+  `plaid.investment_holdings`, `plaid.investment_transactions`, and `plaid.liabilities`: raw,
+  source-owned Plaid metadata and financial records
+- `plaid.sync_state`: per-item/product cursor, status, and last successful sync timestamp
+- `private.plaid_item_tokens`: private Plaid access-token storage; excluded from normal read surfaces
+- `marts.finance_accounts`, `marts.finance_transactions`, `marts.finance_investment_holdings`,
+  `marts.finance_investment_transactions`, and `marts.finance_liabilities`: stable finance-domain
+  views over the Plaid source tables
 
 The warehouse also creates clean views for current inbox and transcript state:
 

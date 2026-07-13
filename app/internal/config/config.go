@@ -16,6 +16,10 @@ type Config struct {
 	Addr                string
 	BaseURL             string
 	PostgresDatabaseURL string
+	// QueryPostgresRole is the NOLOGIN database role assumed for every
+	// user-authored read-only query. It has SELECT on queryable schemas but no
+	// USAGE/SELECT on the private schema.
+	QueryPostgresRole string
 	// TimelineDatabaseURL is where the unified timeline tables live. Unset in
 	// production (they share the warehouse database); a local development app
 	// can point it at a locally-built timeline while detail views still read
@@ -128,6 +132,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		Addr:                    valueOrDefault(getenv("MCP_ADDR"), ":8080"),
 		BaseURL:                 strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
 		PostgresDatabaseURL:     normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
+		QueryPostgresRole:       valueOrDefault(strings.TrimSpace(getenv("PDW_QUERY_POSTGRES_ROLE")), "pdw_query"),
 		TimelineDatabaseURL:     normalizePostgresURL(getenv("PDW_TIMELINE_DATABASE_URL")),
 		TimelineMediaBaseURL:    strings.TrimRight(strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_BASE_URL")), "/"),
 		TimelineMediaSigningKey: strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_SIGNING_KEY")),
@@ -159,6 +164,9 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	}
 	if len(cfg.SecretToken) < MinSecretTokenLength {
 		return Config{}, fmt.Errorf("PDW_SECRET_TOKEN (or legacy MCP_SECRET_TOKEN) must be at least %d characters", MinSecretTokenLength)
+	}
+	if matched, _ := regexp.MatchString(`^[A-Za-z_][A-Za-z0-9_]*$`, cfg.QueryPostgresRole); !matched {
+		return Config{}, fmt.Errorf("PDW_QUERY_POSTGRES_ROLE must be a Postgres identifier")
 	}
 
 	var err error
