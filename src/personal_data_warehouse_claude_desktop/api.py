@@ -10,6 +10,12 @@ uses. We reuse the desktop app's login cookies (see :mod:`.cookies`) to:
 
 This is an unofficial endpoint, so we send browser-like headers and retry
 transient failures, but we deliberately keep the surface tiny.
+
+Cloudflare in front of claude.ai bot-challenges non-browser TLS fingerprints
+(every request from plain ``requests``/``curl`` gets a 403 "Just a moment..."
+interstitial, observed from 2026-07-12), so the default transport is a
+``curl_cffi`` session that impersonates Chrome's TLS fingerprint. The
+User-Agent below must stay in step with the impersonation target.
 """
 
 from __future__ import annotations
@@ -18,15 +24,17 @@ from collections.abc import Iterator
 import time
 from typing import Any
 
-import requests
+from curl_cffi import requests as cffi_requests
 
 DEFAULT_BASE_URL = "https://claude.ai"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_PAGE_SIZE = 50
-# A current-ish desktop/Chrome UA; claude.ai rejects obviously-bot user agents.
+# The Chrome build curl_cffi impersonates at the TLS layer; the UA header
+# matches so the two fingerprints tell the same story to Cloudflare.
+DEFAULT_IMPERSONATE = "chrome131"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 
@@ -54,7 +62,7 @@ class ClaudeAiClient:
         cookie_header: str,
         org_id: str,
         base_url: str = DEFAULT_BASE_URL,
-        session: requests.Session | None = None,
+        session: Any | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         user_agent: str = DEFAULT_USER_AGENT,
         max_retries: int = 3,
@@ -68,7 +76,7 @@ class ClaudeAiClient:
         self._cookie_header = cookie_header
         self._base_url = base_url.rstrip("/")
         self._org_id = org_id
-        self._session = session or requests.Session()
+        self._session = session or cffi_requests.Session(impersonate=DEFAULT_IMPERSONATE)
         self._timeout = timeout
         self._user_agent = user_agent
         self._max_retries = max(1, max_retries)
@@ -97,7 +105,7 @@ class ClaudeAiClient:
                     params=params,
                     timeout=self._timeout,
                 )
-            except requests.RequestException as exc:
+            except cffi_requests.exceptions.RequestException as exc:
                 last_error = exc
             else:
                 if response.status_code == 200:

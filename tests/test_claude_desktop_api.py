@@ -163,3 +163,16 @@ def test_resolve_sync_account_falls_back_to_credential_then_config() -> None:
 
 def test_resolve_sync_account_empty_when_nothing_known() -> None:
     assert resolve_sync_account(session_email="", credential_label="", configured="") == ("", "none")
+
+
+def test_default_session_impersonates_a_browser_tls_fingerprint() -> None:
+    # claude.ai's Cloudflare bot-challenges plain-requests TLS fingerprints
+    # with a 403 "Just a moment..." interstitial (started 2026-07-12), so the
+    # default transport must be a curl_cffi session impersonating Chrome. An
+    # injected session (as in the tests above) still bypasses this entirely.
+    from curl_cffi import requests as cffi_requests
+
+    client = ClaudeAiClient(cookie_header="sessionKey=sk-test", org_id="org-1")
+
+    assert isinstance(client._session, cffi_requests.Session)
+    assert str(client._session.impersonate).startswith("chrome")

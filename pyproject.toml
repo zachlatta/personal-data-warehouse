@@ -19,6 +19,7 @@ dependencies = [
     "neonize==0.3.17.post0",
     "qrcode>=8.2",
     "pillow-heif>=1.4.0",
+    "curl-cffi>=0.13",
 ]
 
 [project.scripts]
