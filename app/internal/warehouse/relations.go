@@ -32,6 +32,7 @@ var QueryableSchemas = []string{
 	"search",
 	"enrichment",
 	"photos",
+	"finance",
 	"ai_processing",
 	"upstream_mutations",
 	"util",

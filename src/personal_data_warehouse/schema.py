@@ -752,6 +752,59 @@ class PlaidLinkedItem:
     institution_id: str = ""
     institution_name: str = ""
 
+
+# Finance ledger (derived `finance` schema): the cross-source stocks-and-flows
+# layer. Every finance source (plaid now; manual_finance documents next) is a
+# witness to one of two fact types — a flow (money moved) or a stock (something
+# was worth X at time T). Raw source rows never learn about ledger identity
+# (photos pattern): the finance_ledger asset resolves them into logical
+# accounts via finance.account_links and appends observations. Facts only:
+# categories and other opinions live in future enrichment tables, never here.
+FINANCE_ACCOUNT_COLUMNS = (
+    "account_id",
+    "account",
+    "name",
+    "kind",
+    "side",
+    "currency",
+    "institution",
+    "mask",
+    "created_at",
+    "updated_at",
+    "sync_version",
+)
+
+# Source-account → ledger-account resolution audit (finance.account_links):
+# one row per source account, recording which logical account it resolved
+# into and why. Deleting links and re-running the ledger asset replays every
+# decision.
+FINANCE_ACCOUNT_LINK_COLUMNS = (
+    "source",
+    "account",
+    "source_account_key",
+    "account_id",
+    "match_method",
+    "match_score",
+    "created_at",
+    "sync_version",
+)
+
+# Append-only point-in-time values (finance.observations): one row per
+# account per day per kind per source. `balance` (bank/credit/brokerage),
+# `valuation` (property/vehicle/private funds), `principal` (loans). Net
+# worth is the latest observation per account summed by account side.
+FINANCE_OBSERVATION_COLUMNS = (
+    "account_id",
+    "as_of",
+    "kind",
+    "value",
+    "currency",
+    "source",
+    "observed_at",
+    "sync_version",
+)
+
+
 # Photos: every photo source (apple_photos now; google_photos / photo_imports
 # later) lands raw file rows with this exact shared shape in its own
 # source-named schema (<source>.files). Cross-source identity lives in the

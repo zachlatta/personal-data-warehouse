@@ -1745,6 +1745,12 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "plaid_liabilities": _entity("current liability state"),
     "plaid_sync_state": _state("per-item/product sync cursor"),
     "plaid_item_tokens": _state("private Plaid access tokens"),
+    # Finance ledger (derived stocks-and-flows layer over the finance
+    # sources): queryable through finance.* and marts.finance_*, excluded
+    # from the general activity timeline like the raw plaid tables.
+    "finance_accounts": _entity("logical account/asset/liability dimension"),
+    "finance_account_links": _state("source-account → ledger-account resolution audit"),
+    "finance_observations": _entity("append-only balance/valuation history; excluded from the general timeline"),
     # Upstream mutations (the warehouse acting on the world)
     "upstream_mutations": _events(),
     "upstream_mutation_requests": _events(),

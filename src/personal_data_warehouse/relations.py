@@ -33,6 +33,7 @@ DERIVED_SCHEMAS: tuple[str, ...] = (
     "search",
     "enrichment",
     "photos",
+    "finance",
     "ai_processing",
     "upstream_mutations",
     "util",
@@ -160,6 +161,13 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("photo_canonical_renditions", "marts", "photo_canonical_renditions"),
     ("clean_calendar_with_transcripts", "marts", "google_calendar_with_apple_voice_memos"),
     ("clean_transcripts_no_calendar_match", "marts", "apple_voice_memos_without_calendar_match"),
+    # Finance ledger: the derived stocks-and-flows layer (accounts resolved
+    # across sources via account_links, append-only observations). Raw finance
+    # sources (plaid.*) stay source-owned; marts.finance_* views are the read
+    # surface.
+    ("finance_accounts", "finance", "accounts"),
+    ("finance_account_links", "finance", "account_links"),
+    ("finance_observations", "finance", "observations"),
     ("file_attachment_enrichments", "enrichment", "file_attachment_enrichments"),
     ("agent_runs", "ai_processing", "agent_runs"),
     ("agent_run_events", "ai_processing", "agent_run_events"),

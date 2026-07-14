@@ -36,6 +36,9 @@ from personal_data_warehouse.schema import (
     CALENDAR_SYNC_STATE_COLUMNS,
     CONTACT_CARD_COLUMNS,
     CONTACT_SYNC_STATE_COLUMNS,
+    FINANCE_ACCOUNT_COLUMNS,
+    FINANCE_ACCOUNT_LINK_COLUMNS,
+    FINANCE_OBSERVATION_COLUMNS,
     PLAID_ACCOUNT_COLUMNS,
     PLAID_INVESTMENT_HOLDING_COLUMNS,
     PLAID_INVESTMENT_SECURITY_COLUMNS,
@@ -216,6 +219,19 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     ),
     "plaid_liabilities": TableSpec(PLAID_LIABILITY_COLUMNS, ("account", "account_id", "liability_type")),
     "plaid_sync_state": TableSpec(PLAID_SYNC_STATE_COLUMNS, ("account", "item_id", "product"), "updated_at"),
+    # Finance ledger: derived stocks-and-flows layer (see finance_ledger.py).
+    # Accounts are logical cross-source identities; observations are
+    # append-only per-day values (the PK makes re-syncs upsert in place while
+    # history accrues across days).
+    "finance_accounts": TableSpec(FINANCE_ACCOUNT_COLUMNS, ("account_id",)),
+    "finance_account_links": TableSpec(
+        FINANCE_ACCOUNT_LINK_COLUMNS,
+        ("source", "account", "source_account_key"),
+    ),
+    "finance_observations": TableSpec(
+        FINANCE_OBSERVATION_COLUMNS,
+        ("account_id", "as_of", "kind", "source"),
+    ),
     "apple_voice_memos_files": TableSpec(VOICE_MEMO_FILE_COLUMNS, ("account", "recording_id")),
     "apple_voice_memos_transcription_runs": TableSpec(
         VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
@@ -988,6 +1004,25 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
     "plaid_transactions": {"category_json"},
 }
 
+# Money in the finance ledger is exact NUMERIC, never double precision. The
+# classification is per-table (like JSONB_COLUMNS_BY_TABLE) because several
+# ledger column names ("amount", "value") collide with raw-source columns
+# that are already claimed by the global FLOAT_COLUMNS set; the per-table
+# check runs first in _postgres_type/_default_sql.
+NUMERIC_COLUMNS_BY_TABLE = {
+    "finance_observations": {"value"},
+}
+
+# Day-granularity columns (DATE, not timestamptz): an observation is "the
+# value on this day", not an instant.
+DATE_COLUMNS = {
+    "as_of",
+}
+
+
+def _is_numeric_column(table: str | None, column: str) -> bool:
+    return column in NUMERIC_COLUMNS_BY_TABLE.get(table or "", set())
+
 TIMESTAMP_COLUMNS = {
     "internal_date",
     "synced_at",
@@ -1050,6 +1085,7 @@ TIMESTAMP_COLUMNS = {
     "last_synced_at",
     "captured_at",
     "capture_ts",
+    "observed_at",
 }
 
 INTEGER_COLUMNS = {
@@ -1561,6 +1597,96 @@ class PostgresWarehouse:
         ]
         for sql in view_sql:
             self._raw_command(sql)
+
+    def ensure_finance_tables(self) -> None:
+        self._ensure_table_group(
+            [
+                "finance_accounts",
+                "finance_account_links",
+                "finance_observations",
+            ]
+        )
+        self._ensure_finance_ledger_mart_views()
+
+    def _ensure_finance_ledger_mart_views(self) -> None:
+        finance = _identifier(self.physical_schema_name("finance"))
+        marts = _identifier(self.physical_schema_name("marts"))
+        # Each account contributes its single latest observation. Same-day
+        # ties resolve by kind: balance (institution-authoritative) beats
+        # principal beats valuation.
+        kind_rank = "CASE o.kind WHEN 'balance' THEN 0 WHEN 'principal' THEN 1 ELSE 2 END"
+        self._ensure_physical_view(
+            f"{marts}.finance_net_worth",
+            f"""
+            CREATE OR REPLACE VIEW {marts}.finance_net_worth AS
+            SELECT
+                a.account_id,
+                a.account,
+                a.name,
+                a.kind,
+                a.side,
+                a.currency,
+                a.institution,
+                a.mask,
+                o.kind AS observation_kind,
+                o.as_of,
+                o.value,
+                o.source,
+                o.observed_at,
+                CASE WHEN a.side = 'liability' THEN -o.value ELSE o.value END AS signed_value
+            FROM {finance}.accounts AS a
+            JOIN LATERAL (
+                SELECT o.kind, o.as_of, o.value, o.source, o.observed_at
+                FROM {finance}.observations AS o
+                WHERE o.account_id = a.account_id
+                ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
+                LIMIT 1
+            ) AS o ON TRUE
+            """,
+        )
+        self._ensure_physical_view(
+            f"{marts}.finance_net_worth_history",
+            f"""
+            CREATE OR REPLACE VIEW {marts}.finance_net_worth_history AS
+            WITH days AS (
+                SELECT generate_series(
+                    (SELECT min(as_of) FROM {finance}.observations),
+                    CURRENT_DATE,
+                    interval '1 day'
+                )::date AS day
+            ),
+            account_days AS (
+                SELECT d.day, a.side, o.value
+                FROM days AS d
+                CROSS JOIN {finance}.accounts AS a
+                LEFT JOIN LATERAL (
+                    SELECT o.value
+                    FROM {finance}.observations AS o
+                    WHERE o.account_id = a.account_id AND o.as_of <= d.day
+                    ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
+                    LIMIT 1
+                ) AS o ON TRUE
+            )
+            SELECT
+                day,
+                SUM(CASE WHEN side = 'asset' THEN value ELSE 0 END) AS assets,
+                SUM(CASE WHEN side = 'liability' THEN value ELSE 0 END) AS liabilities,
+                SUM(CASE WHEN side = 'liability' THEN -value ELSE value END) AS net_worth
+            FROM account_days
+            WHERE value IS NOT NULL
+            GROUP BY day
+            """,
+        )
+
+    def _ensure_physical_view(self, qualified_view: str, create_sql: str) -> None:
+        # Same shared-database drift rationale as _ensure_view, for marts views
+        # addressed by physical name (they are not registered logical
+        # relations). Plain DROP, no CASCADE: dependents fail loudly.
+        try:
+            self._raw_command(create_sql)
+        except psycopg2.errors.InvalidTableDefinition:
+            self._raw_command(f"DROP VIEW IF EXISTS {qualified_view}")
+            self._raw_command(create_sql)
 
     def ensure_apple_voice_memos_tables(self, *, backfill_content_hashes: bool = True) -> None:
         self._ensure_table_group(
@@ -4998,6 +5124,15 @@ class PostgresWarehouse:
             PLAID_SYNC_STATE_COLUMNS,
         )
 
+    def insert_finance_accounts(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("finance_accounts", rows, FINANCE_ACCOUNT_COLUMNS)
+
+    def insert_finance_account_links(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("finance_account_links", rows, FINANCE_ACCOUNT_LINK_COLUMNS)
+
+    def insert_finance_observations(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("finance_observations", rows, FINANCE_OBSERVATION_COLUMNS)
+
     def mark_missing_contact_cards_deleted(
         self,
         *,
@@ -7382,6 +7517,12 @@ def _postgres_type(column: str, *, table: str | None = None) -> str:
         return "jsonb"
     if column in ARRAY_COLUMNS:
         return "text[]"
+    # Per-table NUMERIC/DATE run before the global name sets: ledger column
+    # names collide with raw-source float columns.
+    if _is_numeric_column(table, column):
+        return "numeric"
+    if column in DATE_COLUMNS:
+        return "date"
     if column in TIMESTAMP_COLUMNS:
         return "timestamptz"
     if column in FLOAT_COLUMNS:
@@ -7398,6 +7539,10 @@ def _default_sql(column: str, *, table: str | None = None) -> str:
         return "'{}'::jsonb"
     if column in ARRAY_COLUMNS:
         return "'{}'::text[]"
+    if _is_numeric_column(table, column):
+        return "0"
+    if column in DATE_COLUMNS:
+        return "'1970-01-01'::date"
     if column in TIMESTAMP_COLUMNS:
         return "'1970-01-01 00:00:00+00'::timestamptz"
     if column in FLOAT_COLUMNS:
