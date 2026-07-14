@@ -239,6 +239,14 @@ class PhotosConfig:
 
 
 @dataclass(frozen=True)
+class ManualFinanceConfig:
+    account: str
+    storage_backend: str
+    google_drive_account: str
+    google_drive_folder_id: str
+
+
+@dataclass(frozen=True)
 class WhatsAppConfig:
     account: str
     session_path: str
@@ -441,6 +449,7 @@ class Settings:
     apple_notes: AppleNotesConfig | None = None
     apple_messages: AppleMessagesConfig | None = None
     photos: PhotosConfig | None = None
+    manual_finance: ManualFinanceConfig | None = None
     whatsapp: WhatsAppConfig | None = None
     agent_sessions: AgentSessionsConfig | None = None
     chatgpt: ChatGPTConfig | None = None
@@ -546,6 +555,7 @@ def load_settings(
     require_apple_notes: bool = False,
     require_apple_messages: bool = False,
     require_photos: bool = False,
+    require_manual_finance: bool = False,
     require_whatsapp: bool = False,
     require_agent_sessions: bool = False,
     require_chatgpt: bool = False,
@@ -972,6 +982,51 @@ def load_settings(
             storage_backend=photos_storage_backend,
             google_drive_account=photos_google_drive_account,
             google_drive_folder_id=photos_google_drive_folder_id,
+        )
+
+    manual_finance_account = (
+        os.getenv("MANUAL_FINANCE_ACCOUNT")
+        or photos_account
+    ).strip()
+    manual_finance_google_drive_account = (
+        os.getenv("MANUAL_FINANCE_GOOGLE_DRIVE_ACCOUNT")
+        or manual_finance_account
+    ).strip()
+    manual_finance_google_drive_folder_id = (
+        os.getenv("MANUAL_FINANCE_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
+        or ""
+    ).strip()
+    manual_finance_storage_backend = os.getenv(
+        "MANUAL_FINANCE_STORAGE_BACKEND",
+        _default_upload_backend(
+            "google_drive",
+            google_drive_folder_id=manual_finance_google_drive_folder_id,
+        ),
+    ).strip()
+    manual_finance: ManualFinanceConfig | None = None
+    if (
+        require_manual_finance
+        or os.getenv("MANUAL_FINANCE_ACCOUNT")
+        or os.getenv("MANUAL_FINANCE_GOOGLE_DRIVE_FOLDER_ID")
+    ):
+        if not manual_finance_account:
+            raise ValueError("MANUAL_FINANCE_ACCOUNT or GMAIL_ACCOUNTS must be set for manual finance uploads")
+        if manual_finance_storage_backend not in {"google_drive", "http_app"}:
+            raise ValueError("MANUAL_FINANCE_STORAGE_BACKEND currently supports: google_drive, http_app")
+        if manual_finance_storage_backend == "google_drive":
+            if not manual_finance_google_drive_account:
+                raise ValueError("MANUAL_FINANCE_GOOGLE_DRIVE_ACCOUNT or MANUAL_FINANCE_ACCOUNT must be set")
+            if not manual_finance_google_drive_folder_id:
+                raise ValueError(
+                    "MANUAL_FINANCE_GOOGLE_DRIVE_FOLDER_ID or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+                )
+        manual_finance = ManualFinanceConfig(
+            account=manual_finance_account,
+            storage_backend=manual_finance_storage_backend,
+            google_drive_account=manual_finance_google_drive_account,
+            google_drive_folder_id=manual_finance_google_drive_folder_id,
         )
 
     whatsapp_account = (
@@ -1608,6 +1663,7 @@ def load_settings(
         apple_notes=apple_notes,
         apple_messages=apple_messages,
         photos=photos,
+        manual_finance=manual_finance,
         whatsapp=whatsapp,
         agent_sessions=agent_sessions,
         chatgpt=chatgpt,

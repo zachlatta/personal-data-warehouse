@@ -447,6 +447,68 @@ func TestIngestPhotosFileAndMetadataKeys(t *testing.T) {
 	}
 }
 
+func TestIngestManualFinanceFileAndMetadataKeys(t *testing.T) {
+	svc, stores := ingestTestService()
+	doc := []byte("%PDF-1.7 statement bytes")
+	docSHA := sha256Hex(doc)
+	// File blob: account-keyed folder segment (sanitized), content-addressed name.
+	target := signedIngestTarget("/ingest/manual-finance/file", doc, url.Values{
+		"modified_at":    {"2026-06-30T10:00:00"},
+		"account_folder": {"Acme-Checking-0001"},
+		"extension":      {".pdf"},
+		"content_type":   {"application/pdf"},
+	})
+	if rec := postIngest(t, svc, target, doc); rec.Code != http.StatusOK {
+		t.Fatalf("file status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	put := stores["manual_finance"].lastFile
+	wantFileKey := "manual-finance/inbox/acme-checking-0001/2026-06-30-" + docSHA + ".pdf"
+	if put.ObjectKey != wantFileKey {
+		t.Fatalf("file key = %q, want %q", put.ObjectKey, wantFileKey)
+	}
+	if put.Kind != "manual_finance_document" || put.SkipExistingCheck || put.ContentType != "application/pdf" {
+		t.Fatalf("file put = %+v", put)
+	}
+
+	// Metadata envelope: provenance-sha dedup (photos pattern); a missing or
+	// unsafe account_folder falls back to "unsorted".
+	meta := []byte(`{"schema_version":1,"source":"manual_finance"}`)
+	dedupSHA := sha256Hex([]byte("manual|z@x.test|" + docSHA + "|" + docSHA))
+	target = signedIngestTarget("/ingest/manual-finance/metadata", meta, url.Values{
+		"modified_at":           {"2026-06-30T10:00:00"},
+		"file_content_sha256":   {docSHA},
+		"metadata_dedup_sha256": {dedupSHA},
+	})
+	if rec := postIngest(t, svc, target, meta); rec.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	pj := stores["manual_finance"].lastJSON
+	wantMetaKey := "manual-finance/inbox/unsorted/2026-06-30-" + dedupSHA + ".json"
+	if pj.ObjectKey != wantMetaKey {
+		t.Fatalf("metadata key = %q, want %q", pj.ObjectKey, wantMetaKey)
+	}
+	if pj.Kind != "manual_finance_metadata" || pj.SourceContentSHA256 != dedupSHA || pj.SkipExistingCheck {
+		t.Fatalf("metadata put = %+v", pj)
+	}
+	if pj.AppProperties["file_content_sha256"] != docSHA {
+		t.Fatalf("metadata app properties = %+v, want file_content_sha256 %q", pj.AppProperties, docSHA)
+	}
+}
+
+func TestSanitizeAccountFolder(t *testing.T) {
+	cases := map[string]string{
+		"Acme-Checking-0001":  "acme-checking-0001",
+		"":                    "unsorted",
+		"../../etc":           "etc",
+		"weird name / slash!": "weird-name-slash",
+	}
+	for input, want := range cases {
+		if got := sanitizeAccountFolder(input); got != want {
+			t.Fatalf("sanitizeAccountFolder(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestIngestAppleNotesBodyAttachmentRevisionKeys(t *testing.T) {
 	svc, stores := ingestTestService()
 	common := url.Values{"note_id": {"note/123"}, "revision_id": {"rev-9"}, "modified_at": {"2026-01-02T03:04:05+00:00"}}

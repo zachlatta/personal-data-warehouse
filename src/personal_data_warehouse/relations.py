@@ -25,6 +25,7 @@ SOURCE_RAW_SCHEMAS: tuple[str, ...] = (
     "codex",
     "openclaw",
     "pi",
+    "manual_finance",
 )
 
 DERIVED_SCHEMAS: tuple[str, ...] = (
@@ -128,6 +129,9 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("codex_events", "codex", "events"),
     ("openclaw_events", "openclaw", "events"),
     ("pi_events", "pi", "events"),
+    # Manually uploaded finance documents (statements, valuations, exports)
+    ("manual_finance_documents", "manual_finance", "documents"),
+    ("manual_finance_extractions", "manual_finance", "extractions"),
     # Plaid source data
     ("plaid_items", "plaid", "items"),
     ("plaid_accounts", "plaid", "accounts"),

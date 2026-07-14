@@ -27,6 +27,7 @@ var QueryableSchemas = []string{
 	"codex",
 	"openclaw",
 	"pi",
+	"manual_finance",
 	"marts",
 	"timeline",
 	"search",

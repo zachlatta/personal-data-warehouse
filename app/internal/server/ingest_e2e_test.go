@@ -154,6 +154,10 @@ func e2eCases() []e2eCase {
 	photoSHA := sha(photo)
 	photoMeta := []byte(`{"schema_version":1,"source":"apple_photos"}`)
 	photoDedupSHA := sha([]byte("apple_photos|z@x.test|UUID-1|original|" + photoSHA))
+	statement := []byte("%PDF-statement-bytes")
+	statementSHA := sha(statement)
+	financeMeta := []byte(`{"schema_version":1,"source":"manual"}`)
+	financeDedupSHA := sha([]byte("manual|z@x.test|" + statementSHA + "|" + statementSHA))
 	return []e2eCase{
 		{
 			name: "agent-sessions/batch", endpoint: "/ingest/agent-sessions/batch", body: batchBody,
@@ -200,6 +204,28 @@ func e2eCases() []e2eCase {
 			},
 			wantName: "2026-06-01-" + photoDedupSHA + ".json", wantMime: "application/json",
 			wantProps: map[string]string{"pdw_kind": "photo_metadata", "file_content_sha256": photoSHA},
+		},
+		{
+			name: "manual-finance/file", endpoint: "/ingest/manual-finance/file", body: statement,
+			extra: url.Values{
+				"modified_at":    {"2026-06-30T10:00:00"},
+				"account_folder": {"Acme-Checking-0001"},
+				"extension":      {".pdf"},
+				"content_type":   {"application/pdf"},
+			},
+			wantName: "2026-06-30-" + statementSHA + ".pdf", wantMime: "application/pdf",
+			wantProps: map[string]string{"pdw_kind": "manual_finance_document", "pdw_stage": "inbox", "pdw_source": "manual_finance"},
+		},
+		{
+			name: "manual-finance/metadata", endpoint: "/ingest/manual-finance/metadata", body: financeMeta,
+			extra: url.Values{
+				"modified_at":           {"2026-06-30T10:00:00"},
+				"account_folder":        {"Acme-Checking-0001"},
+				"file_content_sha256":   {statementSHA},
+				"metadata_dedup_sha256": {financeDedupSHA},
+			},
+			wantName: "2026-06-30-" + financeDedupSHA + ".json", wantMime: "application/json",
+			wantProps: map[string]string{"pdw_kind": "manual_finance_metadata", "file_content_sha256": statementSHA},
 		},
 		{
 			name: "apple-notes/body", endpoint: "/ingest/apple-notes/body", body: html,

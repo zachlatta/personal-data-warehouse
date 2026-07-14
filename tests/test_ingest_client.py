@@ -136,6 +136,50 @@ def test_upload_photo_file_and_metadata_send_expected_queries() -> None:
     assert call["headers"]["Content-Type"] == "application/json"
 
 
+def test_upload_manual_finance_document_and_metadata_send_expected_queries() -> None:
+    session = _FakeSession()
+    client = IngestClient(
+        base_url="https://app.example.test/",
+        signing_key=b"0123456789abcdef0123456789abcdef",
+        session=session,
+        now=lambda: 1700000000.0,
+        link_ttl_seconds=900,
+    )
+    body = b"%PDF-statement"
+    client.upload_manual_finance_document(
+        body,
+        modified_at="2026-06-30T10:00:00",
+        account_folder="acme-checking-0001",
+        extension=".pdf",
+        content_type="application/pdf",
+    )
+    call = session.calls[0]
+    parts = urlsplit(call["url"])
+    assert parts.path == "/ingest/manual-finance/file"
+    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    assert q["modified_at"] == "2026-06-30T10:00:00"
+    assert q["account_folder"] == "acme-checking-0001"
+    assert q["extension"] == ".pdf"
+    assert q["content_sha256"] == hashlib.sha256(body).hexdigest()
+    assert call["headers"]["Content-Type"] == "application/pdf"
+
+    client.upload_manual_finance_metadata(
+        {"schema_version": 1, "source": "manual"},
+        modified_at="2026-06-30T10:00:00",
+        account_folder="acme-checking-0001",
+        file_content_sha256="filesha",
+        metadata_dedup_sha256="dedupsha",
+    )
+    call = session.calls[1]
+    parts = urlsplit(call["url"])
+    assert parts.path == "/ingest/manual-finance/metadata"
+    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    assert q["account_folder"] == "acme-checking-0001"
+    assert q["file_content_sha256"] == "filesha"
+    assert q["metadata_dedup_sha256"] == "dedupsha"
+    assert call["headers"]["Content-Type"] == "application/json"
+
+
 class _FakeJSONSession:
     def __init__(self, payload: dict) -> None:
         self.calls: list[dict] = []

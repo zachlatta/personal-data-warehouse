@@ -118,6 +118,7 @@ var ingestSourceEnvInfix = map[string]string{
 	"apple_voice_memos": "VOICE_MEMOS",
 	"apple_notes":       "APPLE_NOTES",
 	"photos":            "PHOTOS",
+	"manual_finance":    "MANUAL_FINANCE",
 }
 
 // IngestEnabled reports whether the app can accept client uploads: it needs the

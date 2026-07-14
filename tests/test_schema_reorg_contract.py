@@ -90,6 +90,7 @@ def test_relation_registry_encodes_source_owned_raw_schemas() -> None:
         "codex",
         "openclaw",
         "pi",
+        "manual_finance",
     )
 
     expected = {

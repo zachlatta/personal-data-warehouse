@@ -772,6 +772,62 @@ mode-0600, gitignored `reports/plaid-linking-report.private.md` artifact with ev
 anonymous account status plus last-pull evidence. See the README's **Plaid Finance Sync** section
 for all settings and safe aggregate verification queries.
 
+## Finance Ledger (stocks and flows)
+
+The derived `finance` schema is the cross-source ledger over the finance sources (Plaid +
+manual_finance). Every source is a witness to one of two fact types: a **flow** (money moved: a
+transaction) or a **stock** (something was worth X at time T: a balance, valuation, or principal).
+The ledger stores **facts only** — no categories or other opinions; categorization is a future
+enrichment layer.
+
+- `finance.accounts` — one row per logical account/asset/liability (kinds incl.
+  checking/credit/brokerage/ira/mortgage/property/vehicle/private_fund), resolved across sources
+  via `finance.account_links` (photos-identity pattern: raw rows never learn about identity;
+  deterministic `fa_<sha>` ids; delete links + rerun replays every decision).
+- `finance.observations` — append-only per-day values (PK account_id/as_of/kind/source; NUMERIC
+  money, DATE days). The `finance_ledger` asset (schedule `7,37 * * * *`, after each `*/30` Plaid
+  sync) snapshots every live Plaid account's balance daily — Plaid itself only keeps
+  current-state, so this table IS the balance history.
+- Net worth: `marts.finance_net_worth` (latest observation per account, signed by side; net worth
+  = `SUM(signed_value)`) and `marts.finance_net_worth_history` (forward-filled daily
+  assets/liabilities/net series).
+
+## Manual Finance Documents (manual_finance)
+
+Manually uploaded finance documents — bank/credit/brokerage/mortgage statements, property/vehicle
+valuation screenshots, private-fund position docs, CSV/OFX/QFX exports — land in
+`manual_finance.documents` (one row per doc, native id = content sha) with agent extractions in
+`manual_finance.extractions`. The mortgage servicer is not Plaid-supported, so mortgage
+statements are the mortgage's only source.
+
+- Upload: `pdw ingest manual-finance <files-or-dir>` (uploader package
+  `src/personal_data_warehouse_manual_finance/`). The folder-per-account organization
+  (`<institution>-<name>-<mask>/statement.pdf`) is preserved as `original_path` (the primary
+  account-resolution hint) and as the object key's account segment:
+  `manual-finance/inbox/<account-folder>/<date>-<sha><ext>`. Content-sha dedup + sha-keyed local
+  state make re-runs cheap; `--limit`, `--mode full`, `--root` supported.
+- Transport: `/ingest/manual-finance/file` + `/metadata` (photos pattern, HMAC-signed,
+  provenance-sha metadata dedup that excludes `original_path` — moving a file updates the hint
+  instead of duplicating). Dagster `manual_finance_drive_inbox_sensor` + `manual_finance_drive_ingest`
+  consume the inbox and promote objects to `manual-finance/library/` keeping the account segment.
+- **Agent-first extraction** (`manual_finance_extraction.py`): bank files are structured in
+  terrible ways, so there are NO format-specific parsers and no deterministic path that bypasses
+  the agent. Input prep only chooses what the agent sees (pypdf text layer when rich; pdftoppm
+  page renders — `MANUAL_FINANCE_RENDER_MAX_PAGES`, default 10 — when scanned; raw text for
+  CSV/OFX/RTF; normalized JPEG for screenshots). The agent runs with read-only warehouse access
+  (`run_with_warehouse`), gets known `finance.accounts` + `original_path` as context, and returns
+  a strict-schema payload (transactions[]/balances[]/valuations[] with decimal-string money)
+  mapped into typed columns; bumping `PROMPT_VERSION` re-extracts without clobbering. Retry cap:
+  agent failures count per run in `agent_runs`; permanent input-prep failures record status
+  `unreadable` and are excluded within the error window.
+- Config: folder ids fall back to the shared Drive folder; set
+  `PDW_INGEST_MANUAL_FINANCE_FOLDER_ID` (app) + `MANUAL_FINANCE_GOOGLE_DRIVE_FOLDER_ID` (Dagster
+  reader) to use a dedicated `manual-finance` subfolder inside the existing PDW Drive folder.
+
+Finance SQL starting points: `marts.finance_net_worth`, `marts.finance_net_worth_history`,
+`finance.accounts`, `finance.observations`, `manual_finance.documents`,
+`manual_finance.extractions`, plus the existing `plaid.*` / `marts.finance_*` views.
+
 ## Shared file-attachment enrichment
 
 `gmail_attachment_enrichments` was renamed to `file_attachment_enrichments` and generalized into

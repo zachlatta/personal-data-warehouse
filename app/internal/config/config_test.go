@@ -109,6 +109,7 @@ func TestLoadFromEnvIngestFolderResolution(t *testing.T) {
 		"PDW_OBJECT_STORE_GOOGLE_TOKEN_JSON":      `{"type":"authorized_user"}`,
 		"PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID": "shared-folder",
 		"PDW_INGEST_AGENT_SESSIONS_FOLDER_ID":     "agent-folder",
+		"PDW_INGEST_MANUAL_FINANCE_FOLDER_ID":     "manual-finance-folder",
 	}
 	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
 	if err != nil {
@@ -119,6 +120,9 @@ func TestLoadFromEnvIngestFolderResolution(t *testing.T) {
 	}
 	if got := cfg.IngestFolderIDs["agent_sessions"]; got != "agent-folder" {
 		t.Fatalf("agent_sessions folder = %q, want per-source override", got)
+	}
+	if got := cfg.IngestFolderIDs["manual_finance"]; got != "manual-finance-folder" {
+		t.Fatalf("manual_finance folder = %q, want per-source override", got)
 	}
 	// Sources without an override fall back to the shared object-store folder.
 	if got := cfg.IngestFolderIDs["apple_messages"]; got != "shared-folder" {

@@ -804,6 +804,70 @@ FINANCE_OBSERVATION_COLUMNS = (
     "sync_version",
 )
 
+# manual_finance: manually uploaded finance documents (bank/mortgage
+# statements, Zillow screenshots, fund position docs, CSV/OFX exports). One
+# row per uploaded document; `source` is 'manual', the native id is the
+# content sha (a document IS its bytes), and `original_path` preserves the
+# uploader's folder organization as an account-resolution hint (the folder
+# name carries institution + account name + mask).
+MANUAL_FINANCE_DOCUMENT_COLUMNS = (
+    "source",
+    "account",
+    "source_native_id",
+    "filename",
+    "original_path",
+    "mime_type",
+    "size_bytes",
+    "content_sha256",
+    "file_modified_at",
+    "raw_metadata_json",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "metadata_storage_key",
+    "metadata_storage_file_id",
+    "metadata_storage_url",
+    "metadata_content_sha256",
+    "is_deleted",
+    "ingested_at",
+    "sync_version",
+)
+
+# Agent-first structured extraction per document (voice-memos structured
+# pattern): typed columns for the ledger-relevant facts plus the full agent
+# payload in raw_result_json. Keyed by content sha + model/prompt version so
+# a prompt bump re-extracts without clobbering prior results. The ledger
+# consumes the explicit dated entries in transactions/balances/valuations
+# arrays; the scalar closing_balance is a query convenience mirroring the
+# period_end balance entry.
+MANUAL_FINANCE_EXTRACTION_COLUMNS = (
+    "content_sha256",
+    "ai_provider",
+    "ai_model",
+    "ai_prompt_version",
+    "status",
+    "error",
+    "document_type",
+    "institution",
+    "account_name_hint",
+    "account_mask",
+    "period_start",
+    "period_end",
+    "currency",
+    "closing_balance",
+    "transactions_json",
+    "balances_json",
+    "valuations_json",
+    "summary",
+    "uncertainties_json",
+    "raw_result_json",
+    "ai_elapsed_ms",
+    "ai_processed_at",
+    "created_at",
+    "sync_version",
+)
+
 
 # Photos: every photo source (apple_photos now; google_photos / photo_imports
 # later) lands raw file rows with this exact shared shape in its own

@@ -39,6 +39,8 @@ from personal_data_warehouse.schema import (
     FINANCE_ACCOUNT_COLUMNS,
     FINANCE_ACCOUNT_LINK_COLUMNS,
     FINANCE_OBSERVATION_COLUMNS,
+    MANUAL_FINANCE_DOCUMENT_COLUMNS,
+    MANUAL_FINANCE_EXTRACTION_COLUMNS,
     PLAID_ACCOUNT_COLUMNS,
     PLAID_INVESTMENT_HOLDING_COLUMNS,
     PLAID_INVESTMENT_SECURITY_COLUMNS,
@@ -231,6 +233,15 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "finance_observations": TableSpec(
         FINANCE_OBSERVATION_COLUMNS,
         ("account_id", "as_of", "kind", "source"),
+    ),
+    # Manually uploaded finance documents + their structured extractions.
+    "manual_finance_documents": TableSpec(
+        MANUAL_FINANCE_DOCUMENT_COLUMNS,
+        ("source", "account", "source_native_id", "content_sha256"),
+    ),
+    "manual_finance_extractions": TableSpec(
+        MANUAL_FINANCE_EXTRACTION_COLUMNS,
+        ("content_sha256", "ai_provider", "ai_model", "ai_prompt_version"),
     ),
     "apple_voice_memos_files": TableSpec(VOICE_MEMO_FILE_COLUMNS, ("account", "recording_id")),
     "apple_voice_memos_transcription_runs": TableSpec(
@@ -984,6 +995,14 @@ JSONB_COLUMNS_BY_TABLE = {
     "plaid_investment_holdings": {"raw_json"},
     "plaid_investment_transactions": {"raw_json"},
     "plaid_liabilities": {"raw_json"},
+    "manual_finance_documents": {"raw_metadata_json"},
+    "manual_finance_extractions": {
+        "transactions_json",
+        "balances_json",
+        "valuations_json",
+        "uncertainties_json",
+        "raw_result_json",
+    },
 }
 
 JSONB_ARRAY_COLUMNS_BY_TABLE = {
@@ -1002,6 +1021,12 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
         "owners_json",
     },
     "plaid_transactions": {"category_json"},
+    "manual_finance_extractions": {
+        "transactions_json",
+        "balances_json",
+        "valuations_json",
+        "uncertainties_json",
+    },
 }
 
 # Money in the finance ledger is exact NUMERIC, never double precision. The
@@ -1011,12 +1036,15 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
 # check runs first in _postgres_type/_default_sql.
 NUMERIC_COLUMNS_BY_TABLE = {
     "finance_observations": {"value"},
+    "manual_finance_extractions": {"closing_balance"},
 }
 
 # Day-granularity columns (DATE, not timestamptz): an observation is "the
-# value on this day", not an instant.
+# value on this day", not an instant; a statement period is a day range.
 DATE_COLUMNS = {
     "as_of",
+    "period_start",
+    "period_end",
 }
 
 
@@ -1676,6 +1704,19 @@ class PostgresWarehouse:
             WHERE value IS NOT NULL
             GROUP BY day
             """,
+        )
+
+    def ensure_manual_finance_tables(self) -> None:
+        self._ensure_table_group(
+            [
+                "manual_finance_documents",
+                "manual_finance_extractions",
+                # The extraction candidate/retry queries must work on a fresh
+                # schema (photos/voice-memos precedent).
+                "agent_runs",
+                "agent_run_events",
+                "agent_run_tool_calls",
+            ]
         )
 
     def _ensure_physical_view(self, qualified_view: str, create_sql: str) -> None:
@@ -5132,6 +5173,12 @@ class PostgresWarehouse:
 
     def insert_finance_observations(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("finance_observations", rows, FINANCE_OBSERVATION_COLUMNS)
+
+    def insert_manual_finance_documents(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("manual_finance_documents", rows, MANUAL_FINANCE_DOCUMENT_COLUMNS)
+
+    def insert_manual_finance_extractions(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("manual_finance_extractions", rows, MANUAL_FINANCE_EXTRACTION_COLUMNS)
 
     def mark_missing_contact_cards_deleted(
         self,

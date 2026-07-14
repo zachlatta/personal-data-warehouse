@@ -33,6 +33,7 @@ var ingestModules = map[string]string{
 	"agent-sessions": "personal_data_warehouse_agent_sessions.cli",
 	"plaid":          "personal_data_warehouse_plaid.cli",
 	"apple-photos":   "personal_data_warehouse_photos.cli",
+	"manual-finance": "personal_data_warehouse_manual_finance.cli",
 }
 
 // ingestExec runs the resolved uploader command. It's a package var so tests
@@ -101,6 +102,7 @@ SOURCES
   apple-photos     Upload local Apple Photos originals + metadata
   claude-desktop   Push the Claude Desktop (claude.ai) session credential
   plaid            Link Plaid items and sync personal financial data
+  manual-finance   Upload finance documents (statements, valuations, exports)
 
 The uploader posts to the warehouse over the same URL + token pdw uses for
 everything else: run "pdw login" once (or set PDW_API_URL + PDW_SECRET_TOKEN)
@@ -118,6 +120,7 @@ EXAMPLES
   pdw ingest agent-sessions --limit 1000
   pdw ingest plaid link
   pdw ingest plaid sync
+  pdw ingest manual-finance ~/Desktop/accounts
 `
 
 // runIngest parses `pdw ingest` arguments and runs the matching uploader. It

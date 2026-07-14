@@ -1751,6 +1751,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "finance_accounts": _entity("logical account/asset/liability dimension"),
     "finance_account_links": _state("source-account → ledger-account resolution audit"),
     "finance_observations": _entity("append-only balance/valuation history; excluded from the general timeline"),
+    # Manually uploaded finance documents: finance query surface, not
+    # activity (the upload moment is not a life event).
+    "manual_finance_documents": _entity("uploaded financial document inventory"),
+    "manual_finance_extractions": _entity("structured agent extraction per document"),
     # Upstream mutations (the warehouse acting on the world)
     "upstream_mutations": _events(),
     "upstream_mutation_requests": _events(),

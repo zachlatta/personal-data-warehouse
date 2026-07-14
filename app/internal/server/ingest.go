@@ -48,6 +48,8 @@ var ingestSourceDefs = map[string]ingestSourceDef{
 	// photo source slug and the Dagster reader routes rows into that source's
 	// raw table.
 	"photos": {source: "photos", blobKind: "photo_file", metadataKind: "photo_metadata"},
+	// Manually uploaded finance documents (statements, valuations, exports).
+	"manual_finance": {source: "manual_finance", blobKind: "manual_finance_document", metadataKind: "manual_finance_metadata"},
 }
 
 // ingestBuildResult is what an artifact's build step resolves from the request's
@@ -235,6 +237,17 @@ func safeObjectKeyPart(value string) string {
 		return "untitled"
 	}
 	return trimmed
+}
+
+// sanitizeAccountFolder normalizes the uploader-supplied account folder
+// segment for manual-finance object keys (lowercase, safe key characters,
+// "unsorted" when absent or fully unsafe).
+func sanitizeAccountFolder(value string) string {
+	part := safeObjectKeyPart(strings.ToLower(strings.TrimSpace(value)))
+	if part == "untitled" {
+		return "unsorted"
+	}
+	return part
 }
 
 // pythonSuffix mirrors pathlib.PurePath(filename).suffix: the extension
@@ -435,6 +448,56 @@ func ingestArtifacts() []ingestArtifact {
 				}
 				key := fmt.Sprintf("photos/inbox/%04d/%02d/%s-%s.json",
 					capturedAt.Year(), int(capturedAt.Month()), capturedAt.Format("2006-01-02"), dedupSHA)
+				return ingestBuildResult{
+					objectKey:        key,
+					sourceContentSHA: dedupSHA,
+					appProperties:    map[string]string{"file_content_sha256": fileSHA},
+				}, nil
+			},
+		},
+		// --- manual finance: uploaded document blob + JSON metadata envelope
+		{
+			endpoint:   "/ingest/manual-finance/file",
+			sourceSlug: "manual_finance",
+			kind:       "manual_finance_document",
+			// Deduped by content sha: re-uploading the same statement is a
+			// no-op. Keys are account-keyed (the uploader's folder-per-account
+			// organization) with a content-addressed suffix.
+			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
+				modifiedAt, err := parseTimestamp(q.Get("modified_at"))
+				if err != nil {
+					return ingestBuildResult{}, fmt.Errorf("invalid modified_at: %w", err)
+				}
+				folder := sanitizeAccountFolder(q.Get("account_folder"))
+				key := fmt.Sprintf("manual-finance/inbox/%s/%s-%s%s",
+					folder, modifiedAt.Format("2006-01-02"), sha, q.Get("extension"))
+				return ingestBuildResult{objectKey: key, contentType: q.Get("content_type"), appProperties: map[string]string{}}, nil
+			},
+		},
+		{
+			endpoint:   "/ingest/manual-finance/metadata",
+			sourceSlug: "manual_finance",
+			kind:       "manual_finance_metadata",
+			isJSON:     true,
+			// Deduped by the provenance sha (photos pattern): a re-upload of
+			// the same document claim (envelope differing only in uploaded_at
+			// or original_path) must not dup.
+			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
+				fileSHA, err := required(q, "file_content_sha256")
+				if err != nil {
+					return ingestBuildResult{}, err
+				}
+				dedupSHA, err := required(q, "metadata_dedup_sha256")
+				if err != nil {
+					return ingestBuildResult{}, err
+				}
+				modifiedAt, err := parseTimestamp(q.Get("modified_at"))
+				if err != nil {
+					return ingestBuildResult{}, fmt.Errorf("invalid modified_at: %w", err)
+				}
+				folder := sanitizeAccountFolder(q.Get("account_folder"))
+				key := fmt.Sprintf("manual-finance/inbox/%s/%s-%s.json",
+					folder, modifiedAt.Format("2006-01-02"), dedupSHA)
 				return ingestBuildResult{
 					objectKey:        key,
 					sourceContentSHA: dedupSHA,

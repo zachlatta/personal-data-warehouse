@@ -329,6 +329,48 @@ class IngestClient:
             },
         )
 
+    # --- manual finance documents --------------------------------------------
+    def upload_manual_finance_document(
+        self,
+        content: bytes,
+        *,
+        modified_at: str,
+        account_folder: str,
+        extension: str,
+        content_type: str,
+    ) -> StoredObjectDict:
+        return self._post(
+            "/ingest/manual-finance/file",
+            body=content,
+            content_type=content_type or "application/octet-stream",
+            params={
+                "modified_at": modified_at,
+                "account_folder": account_folder,
+                "extension": extension,
+                "content_type": content_type,
+            },
+        )
+
+    def upload_manual_finance_metadata(
+        self,
+        payload: Mapping[str, object],
+        *,
+        modified_at: str,
+        account_folder: str,
+        file_content_sha256: str,
+        metadata_dedup_sha256: str,
+    ) -> StoredObjectDict:
+        return self._post_json(
+            "/ingest/manual-finance/metadata",
+            payload=payload,
+            params={
+                "modified_at": modified_at,
+                "account_folder": account_folder,
+                "file_content_sha256": file_content_sha256,
+                "metadata_dedup_sha256": metadata_dedup_sha256,
+            },
+        )
+
     # --- apple notes --------------------------------------------------------
     def upload_apple_notes_body(
         self,
