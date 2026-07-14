@@ -268,6 +268,12 @@ class FinanceLedgerRunner:
         doc_link_rows: list[dict[str, Any]] = []
         doc_accounts: dict[str, str] = {}  # extraction sha -> ledger account id
         doc_account_kinds: dict[str, str] = {}
+        # Group extractions per logical account key first: one folder can span
+        # an account-number change (Robinhood's Apex-era statements carry a
+        # different mask than its later ones), so resolution must consider
+        # EVERY mask the group's documents report — not whichever document
+        # happened to process first.
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for extraction in extractions:
             key = document_account_key(
                 original_path=str(extraction["original_path"]),
@@ -275,17 +281,21 @@ class FinanceLedgerRunner:
                 mask=str(extraction["account_mask"]),
                 filename=str(extraction["filename"]),
             )
-            owner = str(extraction["account"])
+            groups.setdefault((str(extraction["account"]), key), []).append(extraction)
+
+        for (owner, key), group in sorted(groups.items()):
+            group.sort(key=lambda e: str(e["content_sha256"]))
             link_key = (owner, key)
             account_id = manual_links.get(link_key)
             if account_id is None:
-                account_id, match_method, match_score = self._resolve_document_account(
-                    extraction, account_index=account_index
+                account_id, match_method, match_score = self._resolve_document_account_group(
+                    group, account_index=account_index
                 )
                 if match_method == "new":
+                    founding = group[0]
                     kind, side = document_kind_side(
-                        str(extraction["document_type"]),
-                        name_hint=str(extraction["account_name_hint"]),
+                        str(founding["document_type"]),
+                        name_hint=str(founding["account_name_hint"]),
                         account_folder=key,
                     )
                     account_id = stable_finance_account_id(LEDGER_SOURCE_MANUAL, owner, key)
@@ -293,12 +303,12 @@ class FinanceLedgerRunner:
                         {
                             "account_id": account_id,
                             "account": owner,
-                            "name": str(extraction["account_name_hint"]) or key,
+                            "name": str(founding["account_name_hint"]) or key,
                             "kind": kind,
                             "side": side,
-                            "currency": str(extraction["currency"]),
-                            "institution": str(extraction["institution"]),
-                            "mask": str(extraction["account_mask"]),
+                            "currency": str(founding["currency"]),
+                            "institution": str(founding["institution"]),
+                            "mask": _group_primary_mask(group),
                             "created_at": now,
                             "updated_at": now,
                             "sync_version": sync_version,
@@ -307,8 +317,8 @@ class FinanceLedgerRunner:
                     account_index.append(
                         {
                             "account_id": account_id,
-                            "mask": str(extraction["account_mask"]),
-                            "institution": str(extraction["institution"]),
+                            "mask": _group_primary_mask(group),
+                            "institution": str(founding["institution"]),
                             "kind": kind,
                             "side": side,
                         }
@@ -330,8 +340,7 @@ class FinanceLedgerRunner:
                 )
                 manual_links[link_key] = account_id
                 links_created += 1
-            doc_accounts[str(extraction["content_sha256"])] = account_id
-            doc_account_kinds[str(extraction["content_sha256"])] = next(
+            account_kind = next(
                 (
                     str(entry.get("kind", ""))
                     for entry in account_index
@@ -339,6 +348,9 @@ class FinanceLedgerRunner:
                 ),
                 "",
             )
+            for extraction in group:
+                doc_accounts[str(extraction["content_sha256"])] = account_id
+                doc_account_kinds[str(extraction["content_sha256"])] = account_kind
 
         self._warehouse.insert_finance_accounts(doc_account_rows)
         self._warehouse.insert_finance_account_links(doc_link_rows)
@@ -603,22 +615,32 @@ class FinanceLedgerRunner:
 
     # --- documents -> accounts/observations ------------------------------------
 
-    def _resolve_document_account(
-        self, extraction: dict[str, Any], *, account_index: list[dict[str, Any]]
+    def _resolve_document_account_group(
+        self, group: list[dict[str, Any]], *, account_index: list[dict[str, Any]]
     ) -> tuple[str, str, float]:
-        """Match a document to an existing ledger account by mask (+ institution
-        tiebreak). Returns (account_id, match_method, match_score); method
-        'new' means the caller must create the account."""
-        mask = str(extraction["account_mask"]).strip()
-        institution = str(extraction["institution"]).strip().lower()
-        if mask:
+        """Match a document group to an existing ledger account by any of the
+        masks its documents report (most common first, institution tiebreak).
+        Returns (account_id, match_method, match_score); method 'new' means
+        the caller must create the account."""
+        for mask in _group_masks_by_frequency(group):
+            institutions = {
+                str(extraction["institution"]).strip().lower()
+                for extraction in group
+                if str(extraction["account_mask"]).strip() == mask
+            }
             matches = [entry for entry in account_index if str(entry.get("mask", "")).strip() == mask]
-            if len(matches) > 1 and institution:
+            if len(matches) > 1 and institutions:
                 narrowed = [
                     entry
                     for entry in matches
-                    if institution in str(entry.get("institution", "")).lower()
-                    or str(entry.get("institution", "")).lower() in institution
+                    if any(
+                        institution
+                        and (
+                            institution in str(entry.get("institution", "")).lower()
+                            or str(entry.get("institution", "")).lower() in institution
+                        )
+                        for institution in institutions
+                    )
                 ]
                 matches = narrowed or matches
             if len(matches) == 1:
@@ -803,6 +825,20 @@ def has_pending_finance_observations(warehouse: PostgresWarehouse) -> bool:
         (LEDGER_SOURCE_PLAID, LEDGER_SOURCE_PLAID, OBSERVATION_KIND_BALANCE),
     )
     return bool(rows)
+
+
+def _group_masks_by_frequency(group: list[dict[str, Any]]) -> list[str]:
+    counts: dict[str, int] = {}
+    for extraction in group:
+        mask = str(extraction["account_mask"]).strip()
+        if mask:
+            counts[mask] = counts.get(mask, 0) + 1
+    return sorted(counts, key=lambda mask: (-counts[mask], mask))
+
+
+def _group_primary_mask(group: list[dict[str, Any]]) -> str:
+    masks = _group_masks_by_frequency(group)
+    return masks[0] if masks else ""
 
 
 def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:

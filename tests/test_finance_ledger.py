@@ -580,6 +580,55 @@ def test_multi_entity_valuation_doc_prefers_total_else_first(warehouse):
     ]
 
 
+def test_folder_spanning_account_number_change_resolves_by_any_mask(warehouse):
+    # One folder holds statements across a clearing migration: the OLDEST
+    # document carries a retired mask, later ones carry the mask plaid knows.
+    # Resolution must consider every mask in the group, not the founding
+    # document's — otherwise the folder founds a duplicate account.
+    _seed_plaid(warehouse, [_plaid_account_row(type="brokerage", subtype="brokerage", mask="2700")])
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-apex-era",
+            source_native_id="sha-apex-era",
+            original_path="broker-individual-5270/statement-2018-11.pdf",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-apex-era",
+            document_type="brokerage_statement",
+            institution="Broker / Old Clearing Corp",
+            account_mask="5270",
+            balances_json=[{"date": "2018-11-30", "balance": "100.00"}],
+        ),
+    )
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-modern",
+            source_native_id="sha-modern",
+            original_path="broker-individual-5270/statement-2026-03.pdf",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-modern",
+            document_type="brokerage_statement",
+            institution="Broker",
+            account_mask="2700",
+            balances_json=[{"date": "2026-03-31", "balance": "200.00"}],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    # No duplicate account: the folder resolved to the existing plaid account.
+    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(1,)]
+    links = dict(
+        warehouse._query(
+            "SELECT source_account_key, match_method FROM finance_account_links WHERE source = 'manual_finance'"
+        )
+    )
+    assert links == {"broker-individual-5270": "mask"}
+    # Both eras' balances land on the one account.
+    assert warehouse._query("SELECT count(*) FROM finance_observations WHERE source='manual_finance'") == [(2,)]
+
+
 def test_valuation_documents_found_asset_accounts(warehouse):
     warehouse.ensure_plaid_tables()
     _seed_document(
