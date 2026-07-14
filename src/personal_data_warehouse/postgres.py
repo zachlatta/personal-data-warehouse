@@ -6495,9 +6495,20 @@ class PostgresWarehouse:
         # every search through the app silently returned zero rows. Pin the
         # function's own search_path so resolution never depends on the
         # session.
+        #
+        # Executed RAW: this statement quotes schema names, and in the public
+        # namespace several of them ("apple_notes", "apple_messages", ...) are
+        # ALSO canonical logical relation names, which _command's qualifier
+        # would rewrite into schema.table references mid-list (a syntax
+        # error). Everything here is already physical, so qualification is
+        # both unnecessary and harmful.
+        self._raw_command(self._search_text_alter_sql())
+
+    def _search_text_alter_sql(self) -> str:
         function_path = self._search_path_sql().removeprefix("SET search_path TO ")
-        self._command(
-            "ALTER FUNCTION search_text(text, integer, text[], timestamptz) "
+        search_schema = _identifier(self.physical_schema_name("search"))
+        return (
+            f'ALTER FUNCTION {search_schema}."search_text"(text, integer, text[], timestamptz) '
             f"SET search_path TO {function_path}"
         )
 

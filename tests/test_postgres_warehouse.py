@@ -1866,6 +1866,32 @@ def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWareh
         warehouse._query("SELECT count(*) FROM search_text('zanzibar', 50, ARRAY['agent'])")
 
 
+def test_search_text_alter_sql_is_prequalified_and_executed_raw() -> None:
+    # The ALTER that pins search_text()'s search_path quotes schema names, and
+    # in the PUBLIC namespace several of them ("apple_notes", "apple_messages")
+    # are also canonical logical relation names. Feeding the statement through
+    # _command's SQL qualifier rewrote them into schema.table references
+    # mid-list — a syntax error that crashed every ensure in production (test
+    # namespaces prefix their schema names, so namespaced runs could not catch
+    # it). The statement must be fully physical up front and executed through
+    # _raw_command, never _command.
+    import inspect
+
+    from personal_data_warehouse.relations import qualify_sql_relations
+
+    wh = PostgresWarehouse.__new__(PostgresWarehouse)
+    wh._schema = "public"
+    statement = wh._search_text_alter_sql()
+    assert statement.startswith('ALTER FUNCTION "search"."search_text"(')
+    assert "SET search_path TO" in statement
+    # Under the public namespace the qualifier WOULD corrupt this statement —
+    # that is exactly why it must go through _raw_command.
+    assert qualify_sql_relations(statement, namespace="public") != statement
+    assert "_raw_command(self._search_text_alter_sql())" in inspect.getsource(
+        PostgresWarehouse._ensure_search_text_function
+    )
+
+
 def test_search_text_returns_hits_under_default_search_path(warehouse: PostgresWarehouse) -> None:
     # The app's Go query sessions (pdw sql, the MCP connector, the timeline UI)
     # never set a search path, so the function must not depend on the caller's:
