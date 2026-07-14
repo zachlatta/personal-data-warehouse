@@ -735,10 +735,13 @@ stale current rows. Product errors must persist a redacted failed `plaid.sync_st
 run fails. Optional products default to read-only `transactions,investments,liabilities`; no
 payment/money-movement Plaid products are requested.
 New Links request `PLAID_TRANSACTIONS_LOOKBACK_DAYS` of Transactions history, defaulting to Plaid's
-730-day maximum; the same setting controls the Investments transaction query window. Plaid cannot
-expand an existing Item's Transactions history grant, so Items created with a shorter window must
-be removed and linked again. Preserve and verify warehouse history during that migration before
-deleting rows belonging to the old Item.
+730-day maximum; the same setting controls the Investments transaction query window. Transactions
+is the required Link product, while configured Investments and Liabilities are additional
+consented products so partial-product institutions remain linkable. Sync marks products absent
+from an Item's Plaid product metadata as `unsupported` without failing supported products. Plaid
+cannot expand an existing Item's Transactions history grant, so Items created with a shorter
+window must be removed and linked again. Preserve and verify warehouse history during that
+migration before deleting rows belonging to the old Item.
 Run `uv run python scripts/plaid_linking_report.py` after linking/live verification to refresh the
 mode-0600, gitignored `reports/plaid-linking-report.private.md` artifact with every institution and
 anonymous account status plus last-pull evidence. See the README's **Plaid Finance Sync** section

@@ -493,9 +493,12 @@ committed files. Repeat `link` for each personal institution, then sync all link
 
 When Transactions is enabled, Link requests `PLAID_TRANSACTIONS_LOOKBACK_DAYS` of history. The
 setting defaults to Plaid's maximum of 730 days and also controls the Investments transaction
-query window. Plaid fixes the Transactions history grant when an Item is first initialized, so
-changing this setting cannot expand an existing Item: remove the old Item through Plaid and run
-the Link flow again. The institution may return less than the requested maximum.
+query window. Transactions is the required Link product; configured Investments and Liabilities
+are requested as additional consented products so institutions that do not support them remain
+available. Sync records unsupported products per Item without failing the supported products.
+Plaid fixes the Transactions history grant when an Item is first initialized, so changing this
+setting cannot expand an existing Item: remove the old Item through Plaid and run the Link flow
+again. The institution may return less than the requested maximum.
 
 ```bash
 pdw ingest plaid sync

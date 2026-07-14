@@ -58,13 +58,18 @@ class PlaidClient:
     def create_link_token(self, *, account: str | None = None) -> dict[str, Any]:
         account_label = account or self._config.account
         digest = hashlib.sha256(account_label.encode("utf-8")).hexdigest()
+        configured_products = list(self._config.products)
+        required_products = ["transactions"] if "transactions" in configured_products else configured_products
         payload: dict[str, Any] = {
             "client_name": self._config.client_name,
             "user": {"client_user_id": f"pdw-{digest}"},
-            "products": list(self._config.products),
+            "products": required_products,
             "country_codes": list(self._config.country_codes),
             "language": self._config.language,
         }
+        additional_products = [product for product in configured_products if product not in required_products]
+        if additional_products:
+            payload["additional_consented_products"] = additional_products
         if "transactions" in self._config.products:
             payload["transactions"] = {"days_requested": self._config.transactions_lookback_days}
         if self._config.redirect_uri:
@@ -190,6 +195,17 @@ class PlaidSyncRunner:
         plaid_item = dict(item_response.get("item") or {})
         item_id = str(plaid_item.get("item_id") or item.item_id)
         institution_id = str(plaid_item.get("institution_id") or item.institution_id)
+        product_fields = ("available_products", "billed_products", "products")
+        has_product_metadata = any(field in plaid_item for field in product_fields)
+        item_products = {
+            product
+            for field in product_fields
+            for product in _string_list(plaid_item.get(field))
+        }
+
+        def supports(product: str) -> bool:
+            return not has_product_metadata or product in item_products
+
         self._warehouse.insert_plaid_items(
             [
                 {
@@ -226,7 +242,10 @@ class PlaidSyncRunner:
             summary = _merge_summary(summary, PlaidSyncSummary(accounts=account_count))
             self._record_state(item.account, item_id, "accounts", "", "ok", "", synced_at)
 
-        if "transactions" in self._config.products:
+        if "transactions" in self._config.products and not supports("transactions"):
+            cursor = str(state.get((item.account, item_id, "transactions"), {}).get("cursor") or "")
+            self._record_state(item.account, item_id, "transactions", cursor, "unsupported", "", synced_at)
+        elif "transactions" in self._config.products:
             try:
                 transaction_count, removed_count, next_cursor = self._sync_transactions(
                     item=item,
@@ -246,7 +265,9 @@ class PlaidSyncRunner:
                     PlaidSyncSummary(transactions=transaction_count, removed_transactions=removed_count),
                 )
 
-        if "investments" in self._config.products:
+        if "investments" in self._config.products and not supports("investments"):
+            self._record_state(item.account, item_id, "investments", "", "unsupported", "", synced_at)
+        elif "investments" in self._config.products:
             try:
                 investments_summary = self._sync_investments(
                     item=item,
@@ -262,7 +283,9 @@ class PlaidSyncRunner:
                 self._record_state(item.account, item_id, "investments", "", "ok", "", synced_at)
                 summary = _merge_summary(summary, investments_summary)
 
-        if "liabilities" in self._config.products:
+        if "liabilities" in self._config.products and not supports("liabilities"):
+            self._record_state(item.account, item_id, "liabilities", "", "unsupported", "", synced_at)
+        elif "liabilities" in self._config.products:
             try:
                 liability_count = self._sync_liabilities(
                     item=item,

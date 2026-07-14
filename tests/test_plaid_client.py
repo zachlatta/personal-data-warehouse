@@ -54,7 +54,8 @@ def test_plaid_client_creates_link_token_with_read_only_products() -> None:
     assert request["timeout"] == 12
     assert request["json"]["client_id"] == "client-id"
     assert request["json"]["secret"] == "secret"
-    assert request["json"]["products"] == ["transactions", "investments"]
+    assert request["json"]["products"] == ["transactions"]
+    assert request["json"]["additional_consented_products"] == ["investments"]
     assert request["json"]["transactions"] == {"days_requested": 730}
     assert request["json"]["country_codes"] == ["US"]
     client_user_id = request["json"]["user"]["client_user_id"]

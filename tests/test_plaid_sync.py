@@ -284,6 +284,49 @@ def test_plaid_sync_runner_pulls_all_supported_plaid_products() -> None:
     assert summary.liabilities == 1
 
 
+def test_plaid_sync_skips_products_not_available_for_item() -> None:
+    class TransactionsAndLiabilitiesClient(FakePlaidClient):
+        def item_get(self, access_token: str):
+            response = super().item_get(access_token)
+            response["item"]["available_products"] = ["liabilities"]
+            response["item"]["billed_products"] = ["transactions"]
+            response["item"]["consented_products"] = ["transactions", "investments", "liabilities"]
+            return response
+
+        def investments_holdings_get(self, access_token: str):
+            raise AssertionError("unsupported Investments product must not be called")
+
+    config = PlaidConfig(
+        account="user@example.com",
+        client_id="client-id",
+        secret="secret",
+        environment="sandbox",
+        products=("transactions", "investments", "liabilities"),
+        country_codes=("US",),
+        client_name="Personal Data Warehouse",
+    )
+    warehouse = FakePlaidWarehouse()
+
+    summary = PlaidSyncRunner(
+        config=config,
+        warehouse=warehouse,
+        plaid_client=TransactionsAndLiabilitiesClient(),
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 7, 9, 12, tzinfo=UTC),
+    ).sync_all()
+
+    states = {row["product"]: row["status"] for row in warehouse.sync_state_rows or []}
+    assert states == {
+        "accounts": "ok",
+        "transactions": "ok",
+        "investments": "unsupported",
+        "liabilities": "ok",
+    }
+    assert summary.transactions == 1
+    assert summary.investment_transactions == 0
+    assert summary.liabilities == 1
+
+
 def test_plaid_sync_records_product_failure_without_token_leak_and_continues_other_products() -> None:
     class FailingTransactionsClient(FakePlaidClient):
         def transactions_sync(self, access_token: str, *, cursor: str | None, count: int):
