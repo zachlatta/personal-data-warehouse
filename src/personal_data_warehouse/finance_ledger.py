@@ -647,21 +647,31 @@ class FinanceLedgerRunner:
                 if doc_account_kinds.get(sha) == "mortgage"
                 else OBSERVATION_KIND_BALANCE
             )
-            entries: list[tuple[dict[str, Any], str, str]] = [
-                (entry, balance_kind, "balance") for entry in extraction["balances_json"] or []
-            ] + [
-                (entry, OBSERVATION_KIND_VALUATION, "value")
-                for entry in extraction["valuations_json"] or []
-            ]
-            for entry, kind, value_key in entries:
+            for entry in extraction["balances_json"] or []:
                 as_of = _parse_iso_date(str(entry.get("date", "")))
-                value = _parse_money(str(entry.get(value_key, "")))
+                value = _parse_money(str(entry.get("balance", "")))
                 if as_of is None or value is None:
                     continue
-                rows[(account_id, as_of, kind)] = {
+                rows[(account_id, as_of, balance_kind)] = {
                     "account_id": account_id,
                     "as_of": as_of,
-                    "kind": kind,
+                    "kind": balance_kind,
+                    "value": value,
+                    "currency": currency,
+                    "source": LEDGER_SOURCE_MANUAL,
+                    "observed_at": now,
+                    "sync_version": sync_version,
+                }
+            # A valuation document may report several positions for one day
+            # (e.g. a fund export listing every entity plus a totals row, all
+            # attributed to the folder's account): the account's value for the
+            # day is the explicit total when one exists, else the sum of the
+            # parts.
+            for (as_of, value) in _daily_valuations(extraction["valuations_json"] or []):
+                rows[(account_id, as_of, OBSERVATION_KIND_VALUATION)] = {
+                    "account_id": account_id,
+                    "as_of": as_of,
+                    "kind": OBSERVATION_KIND_VALUATION,
                     "value": value,
                     "currency": currency,
                     "source": LEDGER_SOURCE_MANUAL,
@@ -793,6 +803,28 @@ def has_pending_finance_observations(warehouse: PostgresWarehouse) -> bool:
         (LEDGER_SOURCE_PLAID, LEDGER_SOURCE_PLAID, OBSERVATION_KIND_BALANCE),
     )
     return bool(rows)
+
+
+def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:
+    """Collapse a document's valuation entries to one value per day: an entry
+    described as a total wins; otherwise the parts sum."""
+    by_day: dict[date, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        as_of = _parse_iso_date(str(entry.get("date", "")))
+        value = _parse_money(str(entry.get("value", "")))
+        if as_of is None or value is None:
+            continue
+        day = by_day.setdefault(as_of, {"sum": Decimal(0), "total": None})
+        day["sum"] += value
+        is_total = "total" in str(entry.get("description", "")).lower()
+        if is_total and day["total"] is None:
+            day["total"] = value
+    return [
+        (as_of, day["total"] if day["total"] is not None else day["sum"])
+        for as_of, day in sorted(by_day.items())
+    ]
 
 
 def _parse_iso_date(value: str) -> date | None:

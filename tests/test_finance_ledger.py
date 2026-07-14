@@ -533,6 +533,44 @@ def test_mortgage_statement_founds_account_and_principal_observations(warehouse)
     assert total == [(Decimal("123.45") - Decimal("412345.67"),)]
 
 
+def test_multi_entity_valuation_doc_prefers_total_else_sums(warehouse):
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-fund",
+            source_native_id="sha-fund",
+            filename="positions.rtf",
+            original_path="examplefund-i-lp/positions.rtf",
+            mime_type="text/rtf",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-fund",
+            document_type="fund_positions",
+            institution="Carta",
+            account_name_hint="Fund I LP",
+            account_mask="",
+            valuations_json=[
+                {"date": "2026-04-11", "value": "5241.59", "description": "SPV A — NAV"},
+                {"date": "2026-04-11", "value": "6561.81", "description": "Fund I — NAV"},
+                {"date": "2026-04-11", "value": "4993.98", "description": "SPV B — NAV"},
+                {"date": "2026-04-11", "value": "16797.38", "description": "Totals — NAV"},
+                # A parts-only day sums.
+                {"date": "2026-05-11", "value": "10.00", "description": "SPV A — NAV"},
+                {"date": "2026-05-11", "value": "20.00", "description": "SPV B — NAV"},
+            ],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    rows = warehouse._query(
+        "SELECT as_of, value FROM finance_observations WHERE kind = 'valuation' ORDER BY as_of"
+    )
+    assert rows == [
+        (date(2026, 4, 11), Decimal("16797.38")),
+        (date(2026, 5, 11), Decimal("30.00")),
+    ]
+
+
 def test_valuation_documents_found_asset_accounts(warehouse):
     warehouse.ensure_plaid_tables()
     _seed_document(
