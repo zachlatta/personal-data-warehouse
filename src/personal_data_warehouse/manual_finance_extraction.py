@@ -547,7 +547,7 @@ def _extraction_candidate_query(*, error_window_sql: str, unreadable_window_sql:
         FROM manual_finance_documents d
         LEFT JOIN failed_runs runs ON runs.subject_id = d.content_sha256
         WHERE d.is_deleted = 0
-          AND d.storage_key <> ''
+          AND d.storage_file_id <> ''
           AND COALESCE(runs.error_attempts, 0) < %s
           AND NOT EXISTS (
               SELECT 1

@@ -72,7 +72,10 @@ def _document_row(**overrides) -> dict:
         "file_modified_at": _TS,
         "raw_metadata_json": {},
         "storage_backend": "google_drive",
-        "storage_key": "manual-finance/library/acme-checking-0001/x.pdf",
+        # The real Drive store's listing refs carry only the file id; rows land
+        # with an empty storage_key (photos precedent) — candidates must gate
+        # on storage_file_id.
+        "storage_key": "",
         "storage_file_id": "drive-1",
         "storage_url": "",
         "metadata_storage_key": "",
