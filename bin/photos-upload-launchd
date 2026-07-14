@@ -3,14 +3,19 @@ set -u
 
 REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
 UV="/opt/homebrew/bin/uv"
-# The uploaders run through the pdw CLI: `pdw ingest apple-photos` execs
-# `uv run python -m personal_data_warehouse_photos.cli`. Pin uv + the repo so
-# pdw finds them under the minimal launchd environment. Override the pdw
-# binary with PDW_BIN if needed.
-PDW="${PDW_BIN:-$HOME/.local/bin/pdw}"
-[ -x "$PDW" ] || PDW="$(command -v pdw 2>/dev/null || echo "$PDW")"
-export PDW_UV_BIN="$UV"
-export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
+# Run the Python uploader module DIRECTLY (not through `pdw ingest`): pdw
+# self-updates on every release, and each binary replacement invalidates the
+# TCC grants attributed to it — first Full Disk Access, then the
+# kTCCServicePhotos grant this uploader relies on. With pdw out of the exec
+# chain, macOS attributes the Photos-library permission to the stable
+# binaries (zsh / uv / the venv python), so one approval survives releases.
+# Credentials still come from pdw's own config file, so `pdw login` remains
+# the single setup step.
+PDW_CONFIG="$HOME/.config/pdw/config.json"
+if [ -r "$PDW_CONFIG" ]; then
+  export PDW_API_URL="${PDW_API_URL:-$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["base_url"])' "$PDW_CONFIG" 2>/dev/null)}"
+  export PDW_SECRET_TOKEN="${PDW_SECRET_TOKEN:-$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' "$PDW_CONFIG" 2>/dev/null)}"
+fi
 LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
 LOG_FILE="$LOG_DIR/photos-upload.run.log"
 HEARTBEAT_FILE="$LOG_DIR/photos-upload.heartbeat"
@@ -26,7 +31,7 @@ if ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
-  "$PDW" ingest apple-photos --mode incremental >> "$LOG_FILE" 2>&1
+  "$UV" run python -m personal_data_warehouse_photos.cli --mode incremental >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi
 

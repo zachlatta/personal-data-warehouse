@@ -268,7 +268,7 @@ This Mac is intended to run the local Apple Photos uploader through a user Launc
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.photos-upload.plist`
 - Wrapper script: `bin/photos-upload-launchd`
 - Run cadence: every 1800 seconds with `RunAtLoad`
-- Command: `pdw ingest apple-photos --mode incremental` (the wrapper runs the pdw CLI, which execs `uv run python -m personal_data_warehouse_photos.cli`)
+- Command: `uv run python -m personal_data_warehouse_photos.cli --mode incremental` (the wrapper runs uv DIRECTLY — pdw self-updates invalidate TCC grants attributed to it, so it must stay out of every uploader exec chain; credentials are read from `~/.config/pdw/config.json`)
 - Main run log: `~/Library/Logs/personal-data-warehouse/photos-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/photos-upload.heartbeat`
 - Status helper: `bin/photos-upload-status`
