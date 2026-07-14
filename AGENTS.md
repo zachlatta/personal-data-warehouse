@@ -107,6 +107,22 @@ This Mac is intended to run the local Voice Memos uploader through a user Launch
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/voice-memos-upload.heartbeat`
 - Status helper: `bin/voice-memos-upload-status`
 
+Each run also performs the **enriched-title write-back**: memos that still carry an
+app-assigned name ("New Recording N" / geocoded location names — detected by the
+`0x1000` auto-named bit in `ZFLAGS`, or the literal `New Recording N` pattern for
+pre-flag-era rows) are renamed in the Voice Memos app to the newest completed
+`apple_voice_memos.enrichments` title. Hand-typed titles are never overwritten (the
+gate is enforced at plan time and re-checked inside the write transaction). The rename
+is a proper Core Data save against `CloudRecordings.db` via PyObjC
+(`writeback.py` + `store_writer.py`): the model comes from the store's own
+`Z_MODELCACHE`, migration is disabled (incompatible future stores fail loudly), and the
+save records persistent history under the author
+`com.zachlatta.pdw.voice-memo-writeback`, which `voicememod` exports to CloudKit so the
+rename syncs to all devices. Kill switch: `VOICE_MEMOS_WRITEBACK_ENABLED=0`. Manual
+runs: `pdw ingest voice-memos --writeback-only [--writeback-dry-run] [--writeback-limit N]`,
+`--no-writeback` for upload-only. Titles are fetched from the app's `/api/tools/sql`
+endpoint with the same `PDW_API_URL`/`PDW_SECRET_TOKEN` the uploader already uses.
+
 Use these commands when inspecting or repairing it:
 
 ```bash

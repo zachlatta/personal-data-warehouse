@@ -16,6 +16,7 @@ from personal_data_warehouse_voice_memos.network import (
 )
 from personal_data_warehouse_voice_memos.state import VoiceMemosUploadState, default_state_file
 from personal_data_warehouse_voice_memos.sync import VoiceMemosUploadRunner
+from personal_data_warehouse_voice_memos.writeback import VoiceMemosWritebackRunner
 
 
 class CliLogger:
@@ -49,6 +50,27 @@ def main() -> None:
         action="store_true",
         help="Print network guard diagnostics and exit",
     )
+    parser.add_argument(
+        "--no-writeback",
+        action="store_true",
+        help="Skip the enriched-title write-back into the Voice Memos app after uploading",
+    )
+    parser.add_argument(
+        "--writeback-only",
+        action="store_true",
+        help="Run only the enriched-title write-back, skipping the upload phase",
+    )
+    parser.add_argument(
+        "--writeback-dry-run",
+        action="store_true",
+        help="Log the renames write-back would apply without writing to the Voice Memos store",
+    )
+    parser.add_argument(
+        "--writeback-limit",
+        type=int,
+        default=0,
+        help="Maximum renames to apply per run; 0 means no limit",
+    )
     args = parser.parse_args()
 
     if args.network_diagnostics:
@@ -72,42 +94,92 @@ def main() -> None:
     preflight_timeout_seconds = float(os.getenv("VOICE_MEMOS_UPLOAD_PREFLIGHT_TIMEOUT_SECONDS", "5"))
     workers = args.workers or (1 if args.mode == "incremental" else 8)
 
+    run_upload = not args.writeback_only
+    run_title_writeback = args.writeback_only or (not args.no_writeback and writeback_enabled_from_env())
+
+    summary = None
+    writeback_summary = None
     try:
         with exclusive_lock(args.lock_file) as acquired:
             if not acquired:
                 print("Voice Memos upload skipped: another uploader run is active")
                 return
-            try:
-                summary = VoiceMemosUploadRunner(
-                    account=settings.voice_memos.account,
-                    recordings_path=settings.voice_memos.recordings_path,
-                    extensions=settings.voice_memos.extensions,
-                    ingest_client=ingest_client_from_env(),
+            if run_upload:
+                try:
+                    summary = VoiceMemosUploadRunner(
+                        account=settings.voice_memos.account,
+                        recordings_path=settings.voice_memos.recordings_path,
+                        extensions=settings.voice_memos.extensions,
+                        ingest_client=ingest_client_from_env(),
+                        logger=logger,
+                        limit=args.limit or None,
+                        workers=workers,
+                        mode=args.mode,
+                        upload_state=state,
+                        min_file_age_seconds=args.min_file_age_seconds if args.mode == "incremental" else 0,
+                        before_upload_check=build_before_upload_check(preflight_timeout_seconds=preflight_timeout_seconds),
+                    ).sync()
+                finally:
+                    state.save(args.state_file)
+            if run_title_writeback:
+                writeback_summary = run_writeback(
+                    settings=settings,
                     logger=logger,
-                    limit=args.limit or None,
-                    workers=workers,
-                    mode=args.mode,
-                    upload_state=state,
-                    min_file_age_seconds=args.min_file_age_seconds if args.mode == "incremental" else 0,
-                    before_upload_check=build_before_upload_check(preflight_timeout_seconds=preflight_timeout_seconds),
-                ).sync()
-            finally:
-                state.save(args.state_file)
+                    dry_run=args.writeback_dry_run,
+                    limit=args.writeback_limit or None,
+                )
     except Exception as exc:
         if is_transient_exception(exc):
-            print(f"Voice Memos upload skipped after transient network failure: {exc}")
+            print(f"Voice Memos run skipped after transient network failure: {exc}")
             return
         raise
 
-    print(
-        "Voice Memos upload complete: "
-        f"seen={summary.recordings_seen} "
-        f"selected={summary.recordings_selected} "
-        f"uploaded={summary.recordings_uploaded} "
-        f"skipped={summary.recordings_skipped} "
-        f"deferred={summary.recordings_deferred} "
-        f"metadata={summary.metadata_uploaded}"
-    )
+    if summary is not None:
+        print(
+            "Voice Memos upload complete: "
+            f"seen={summary.recordings_seen} "
+            f"selected={summary.recordings_selected} "
+            f"uploaded={summary.recordings_uploaded} "
+            f"skipped={summary.recordings_skipped} "
+            f"deferred={summary.recordings_deferred} "
+            f"metadata={summary.metadata_uploaded}"
+        )
+    if writeback_summary is not None:
+        print(
+            "Voice Memos write-back complete: "
+            f"local={writeback_summary.local_recordings} "
+            f"auto_named={writeback_summary.auto_named} "
+            f"titles={writeback_summary.enriched_titles} "
+            f"planned={writeback_summary.planned} "
+            f"renamed={writeback_summary.renamed} "
+            f"skipped={writeback_summary.skipped}"
+            f"{' (dry run)' if writeback_summary.dry_run else ''}"
+        )
+
+
+def writeback_enabled_from_env(getenv=os.getenv) -> bool:
+    raw = (getenv("VOICE_MEMOS_WRITEBACK_ENABLED") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def run_writeback(*, settings, logger, dry_run: bool, limit: int | None):
+    base_url = (os.getenv("PDW_API_URL") or os.getenv("MCP_BASE_URL") or "").strip()
+    secret_token = (os.getenv("PDW_SECRET_TOKEN") or os.getenv("MCP_SECRET_TOKEN") or "").strip()
+    if not base_url or not secret_token:
+        raise RuntimeError(
+            "Voice Memos write-back requires PDW_API_URL and PDW_SECRET_TOKEN (or their MCP_* aliases)"
+        )
+    client_name = (os.getenv("PDW_CLIENT_NAME") or "").strip() or "pdw"
+    return VoiceMemosWritebackRunner(
+        recordings_path=settings.voice_memos.recordings_path,
+        account=settings.voice_memos.account,
+        base_url=base_url,
+        secret_token=secret_token,
+        client_name=client_name,
+        logger=logger,
+        limit=limit,
+        dry_run=dry_run,
+    ).run()
 
 
 def build_before_upload_check(*, preflight_timeout_seconds: float):

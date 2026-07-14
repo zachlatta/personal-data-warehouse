@@ -652,6 +652,43 @@ network calls. Use full mode for periodic repair/backfill:
 pdw ingest voice-memos --mode full
 ```
 
+### Enriched-title write-back
+
+After the warehouse transcribes and enriches a memo, the same uploader run renames the
+recording inside the Voice Memos app so the library shows the AI title instead of
+"New Recording 12" or a geocoded street address. Renames sync to the user's other
+devices through iCloud exactly like a rename typed in the app.
+
+- **Only auto-named memos are ever renamed.** Voice Memos keeps a flag bit set while a
+  recording still carries the name the app assigned and clears it when the user types a
+  title; the write-back only touches memos with that bit set (or, for pre-flag-era
+  memos, a literal `New Recording N` title). A hand-typed name is never overwritten —
+  enforced twice, once when planning and again inside the write transaction.
+- The rename is a real Core Data save against `CloudRecordings.db`, using the managed
+  object model cached inside the store itself and an explicit persistent-history
+  transaction author (`com.zachlatta.pdw.voice-memo-writeback`). The `voicememod`
+  daemon picks the change up like any other cross-process write and exports it to
+  CloudKit. Automatic migration is disabled, so an incompatible future store fails
+  loudly instead of being mutated.
+- Enriched titles come from the app's authenticated HTTP tool API (the same
+  static-bearer `sql` tool the pdw CLI uses): the newest completed
+  `apple_voice_memos.enrichments` title per recording, joined to local recordings by
+  filename stem.
+
+The write-back runs by default after every upload. Control it with
+`VOICE_MEMOS_WRITEBACK_ENABLED=0` (env kill switch) or per run:
+
+```bash
+pdw ingest voice-memos --no-writeback           # upload only
+pdw ingest voice-memos --writeback-only         # rename only, skip uploading
+pdw ingest voice-memos --writeback-only --writeback-dry-run   # log planned renames
+pdw ingest voice-memos --writeback-limit 20     # bound renames per run
+```
+
+On the app/warehouse side no new surface is involved; the client needs the usual
+`PDW_API_URL` + `PDW_SECRET_TOKEN`. The write requires the same Full Disk Access grant
+the uploader already has (it runs in the same python process).
+
 On Zach's MacBook Pro, the local uploader is managed by a per-user macOS LaunchAgent
 instead of cron. The checked-in plist template lives at
 `ops/launchd/com.zachlatta.personal-data-warehouse.voice-memos-upload.plist` and runs

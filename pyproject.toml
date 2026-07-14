@@ -20,6 +20,9 @@ dependencies = [
     "qrcode>=8.2",
     "pillow-heif>=1.4.0",
     "curl-cffi>=0.13",
+    # Voice Memos write-back drives Core Data on the client Mac; never
+    # installed on the Linux prod deployment.
+    "pyobjc-framework-CoreData>=10.3; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
