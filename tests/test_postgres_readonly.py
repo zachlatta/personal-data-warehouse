@@ -6,7 +6,7 @@ import psycopg2
 import pytest
 from dotenv import load_dotenv
 
-from tests.conftest import make_test_schema
+from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.postgres_readonly import (
@@ -110,6 +110,4 @@ def test_postgres_readonly_runner_uses_dedicated_read_only_connection() -> None:
             assert cursor.fetchone()[0] in ("30s", "30000ms", "30000")
     finally:
         runner.close()
-        for schema_name in warehouse.physical_schema_names(include_private=True) + [schema]:
-            warehouse._raw_command(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
-        warehouse.close()
+        cleanup_test_warehouse(warehouse)

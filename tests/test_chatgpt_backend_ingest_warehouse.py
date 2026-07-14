@@ -16,7 +16,7 @@ import os
 import pytest
 from dotenv import load_dotenv
 
-from tests.conftest import make_test_schema
+from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.chatgpt_backend import ConversationRef
 from personal_data_warehouse.chatgpt_backend_ingest import ChatGPTBackendIngestRunner
@@ -41,8 +41,7 @@ def warehouse():
     try:
         yield wh
     finally:
-        wh._command(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        wh.close()
+        cleanup_test_warehouse(wh)
 
 
 class FakeLogger:

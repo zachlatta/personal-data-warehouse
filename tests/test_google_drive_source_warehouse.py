@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 import pytest
 from dotenv import load_dotenv
 
-from tests.conftest import make_test_schema
+from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.timeline import TimelineSyncEngine
@@ -32,7 +32,7 @@ def warehouse():
     try:
         yield wh
     finally:
-        wh._command(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        cleanup_test_warehouse(wh)
 
 
 def _ensure_all_table_groups(wh: PostgresWarehouse) -> None:

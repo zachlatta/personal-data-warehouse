@@ -7,7 +7,7 @@ import psycopg2
 import pytest
 from dotenv import load_dotenv
 
-from tests.conftest import make_test_schema
+from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.postgres import POSTGRES_TABLES, PostgresWarehouse
 from personal_data_warehouse.postgres_readonly import PostgresReadOnlyRunner
@@ -44,9 +44,7 @@ def warehouse():
     try:
         yield wh
     finally:
-        for schema_name in wh.physical_schema_names(include_private=True) + [schema]:
-            wh._raw_command(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
-        wh.close()
+        cleanup_test_warehouse(wh)
 
 
 def _relation_exists(warehouse: PostgresWarehouse, logical_name: str) -> bool:

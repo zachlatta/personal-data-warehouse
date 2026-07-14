@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 import pytest
 from dotenv import load_dotenv
 
-from tests.conftest import make_test_schema
+from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.config import GoogleDriveSourceConfig, Settings
 from personal_data_warehouse.google_drive_source_sync import (
@@ -32,7 +32,7 @@ def warehouse():
     try:
         yield wh
     finally:
-        wh._command(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        cleanup_test_warehouse(wh)
 
 
 # --- Fake Drive client -----------------------------------------------------

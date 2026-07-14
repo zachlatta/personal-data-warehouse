@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from tests.conftest import make_test_schema, reap_stale_test_schemas
+from tests.conftest import cleanup_test_warehouse, make_test_schema, reap_stale_test_schemas
 from tests.test_postgres_warehouse import _postgres_url
 
 
@@ -35,6 +35,36 @@ def test_make_test_schema_supports_a_label() -> None:
     assert parts[0] == "pdw"
     assert parts[1] == "test"
     assert parts[3] == "dest"
+
+
+def test_cleanup_test_warehouse_drops_every_physical_schema_and_base_namespace() -> None:
+    class FakeWarehouse:
+        schema_namespace = "pdw_test_20260714000000_deadbeef"
+
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+            self.closed = False
+
+        def physical_schema_names(self, *, include_private: bool = False) -> list[str]:
+            assert include_private is True
+            return [f"{self.schema_namespace}_gmail", f"{self.schema_namespace}_private"]
+
+        def _raw_command(self, command: str) -> None:
+            self.commands.append(command)
+
+        def close(self) -> None:
+            self.closed = True
+
+    warehouse = FakeWarehouse()
+
+    cleanup_test_warehouse(warehouse)
+
+    assert warehouse.commands == [
+        'DROP SCHEMA IF EXISTS "pdw_test_20260714000000_deadbeef_gmail" CASCADE',
+        'DROP SCHEMA IF EXISTS "pdw_test_20260714000000_deadbeef_private" CASCADE',
+        'DROP SCHEMA IF EXISTS "pdw_test_20260714000000_deadbeef" CASCADE',
+    ]
+    assert warehouse.closed is True
 
 
 def test_reap_drops_only_stale_timestamped_schemas(connection) -> None:

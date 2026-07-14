@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from dotenv import load_dotenv
 
-from tests.conftest import make_test_schema
+from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.postgres import POSTGRES_TABLES, PostgresWarehouse, _default_sql, _identifier, _postgres_type
 from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
@@ -37,9 +37,7 @@ def warehouse():
     try:
         yield wh
     finally:
-        for schema in wh.physical_schema_names(include_private=True) + [wh.schema_namespace]:
-            wh._raw_command(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        wh.close()
+        cleanup_test_warehouse(wh)
 
 
 def test_alice_archive_source_uses_source_owned_name() -> None:

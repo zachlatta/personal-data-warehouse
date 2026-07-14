@@ -6,7 +6,7 @@ import os
 import pytest
 from dotenv import load_dotenv
 
-from tests.conftest import make_test_schema
+from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.agent_sessions_drive_ingest import (
     AgentSessionsDriveIngestRunner,
@@ -123,8 +123,7 @@ def warehouse():
     try:
         yield wh
     finally:
-        wh._command(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        wh.close()
+        cleanup_test_warehouse(wh)
 
 
 class FakeLogger:

@@ -7,7 +7,7 @@ import os
 import pytest
 from dotenv import load_dotenv
 
-from tests.conftest import make_test_schema
+from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.schema import CALENDAR_EVENT_COLUMNS, CONTACT_CARD_COLUMNS, MESSAGE_COLUMNS
 from personal_data_warehouse.postgres import (
@@ -34,8 +34,7 @@ def warehouse():
     try:
         yield wh
     finally:
-        wh._command(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        wh.close()
+        cleanup_test_warehouse(wh)
 
 
 def test_upstream_mutation_request_validation_idempotency_and_review(warehouse: PostgresWarehouse) -> None:

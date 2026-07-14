@@ -10,7 +10,7 @@ import psycopg2
 import pytest
 from dotenv import load_dotenv
 
-from tests.conftest import make_test_schema
+from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.slack_sync import SlackApiCallError, SlackSyncRunner
@@ -63,9 +63,7 @@ def warehouse():
     try:
         yield wh
     finally:
-        for schema_name in wh.physical_schema_names(include_private=True) + [schema]:
-            wh._raw_command(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
-        wh.close()
+        cleanup_test_warehouse(wh)
 
 
 def _physical_relation(warehouse: PostgresWarehouse, logical_name: str):

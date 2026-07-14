@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from dotenv import load_dotenv
 
-from tests.conftest import make_test_schema
+from tests.conftest import cleanup_test_warehouse, make_test_schema
 from tests.test_photo_fingerprint import image_bytes, synthetic_photo
 from tests.test_photos_warehouse import _photo_file_row
 
@@ -222,9 +222,7 @@ def warehouse():
     try:
         yield wh
     finally:
-        for schema_name in wh.physical_schema_names(include_private=True) + [schema]:
-            wh._raw_command(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
-        wh.close()
+        cleanup_test_warehouse(wh)
 
 
 class _Logger:
