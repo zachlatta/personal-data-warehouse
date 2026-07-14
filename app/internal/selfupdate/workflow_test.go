@@ -163,6 +163,53 @@ func TestWorkflowAssignsMonotonicVersionPerCommit(t *testing.T) {
 	}
 }
 
+func TestWorkflowSignsDarwinBinariesWithStableIdentity(t *testing.T) {
+	body := readWorkflow(t)
+	// macOS TCC keys Full Disk Access to the binary's code-signing designated
+	// requirement. Unsigned (ad-hoc) darwin release binaries carry a per-build
+	// cdhash requirement, so every self-update would silently invalidate the
+	// grant. The workflow must sign darwin binaries with the stable identity
+	// so the requirement never changes across releases.
+	if !strings.Contains(body, "rcodesign sign") {
+		t.Fatal("workflow must sign darwin binaries with rcodesign")
+	}
+	if !strings.Contains(body, "--binary-identifier com.zachlatta.pdw") {
+		t.Fatal("darwin binaries must be signed under the stable identifier com.zachlatta.pdw (TCC grants are keyed to it)")
+	}
+	for _, secret := range []string{"secrets.PDW_CODESIGN_KEY", "secrets.PDW_CODESIGN_CERT"} {
+		if !strings.Contains(body, secret) {
+			t.Fatalf("workflow must read the signing identity from %s", secret)
+		}
+	}
+}
+
+func TestWorkflowSignsBeforePackaging(t *testing.T) {
+	body := readWorkflow(t)
+	// SHA256SUMS is computed from the packaged tarballs, and selfupdate
+	// verifies downloads against it. Signing must therefore happen before the
+	// Package step or the published checksums wouldn't cover the signed bytes.
+	sign := strings.Index(body, "rcodesign sign")
+	pack := strings.Index(body, "name: Package")
+	if sign == -1 || pack == -1 {
+		t.Fatalf("missing steps: sign@%d package@%d", sign, pack)
+	}
+	if sign > pack {
+		t.Fatal("darwin signing must run before the Package step so SHA256SUMS covers the signed binary")
+	}
+}
+
+func TestWorkflowPinsRcodesignBySha256(t *testing.T) {
+	body := readWorkflow(t)
+	// The signer is downloaded at release time; a pinned checksum keeps a
+	// hijacked or moved download from silently signing (or not) our binaries.
+	if !strings.Contains(body, "RCODESIGN_SHA256") {
+		t.Fatal("workflow must pin the rcodesign download by sha256")
+	}
+	if !strings.Contains(body, "sha256sum -c") {
+		t.Fatal("workflow must verify the rcodesign download against the pinned sha256")
+	}
+}
+
 // Local sanity: the platform we're testing on is one selfupdate can install.
 func TestCurrentPlatformIsSupported(t *testing.T) {
 	for _, p := range supportedPlatforms {

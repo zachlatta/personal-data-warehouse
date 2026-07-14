@@ -93,6 +93,43 @@ More than one prefix means the filter is still too broad.
 See `~/dev/zachlatta/sysadmin/README.md` and the script's `--help` for the
 full set of selectors and flags.
 
+## pdw CLI Full Disk Access vs self-updates (macOS)
+
+macOS TCC keys a Full Disk Access grant to the binary's code-signing designated
+requirement. Unsigned darwin binaries only carry the Go linker's ad-hoc signature, whose
+requirement is the cdhash of that exact build — so every pdw self-update used to silently
+invalidate pdw's FDA grant (System Settings still showed the toggle on). Fixed by signing
+release binaries with a stable identity **in the release workflow**:
+
+- **The `pdw-cli-release.yml` build job signs both darwin binaries** with a pinned,
+  sha256-verified `rcodesign` (signs Mach-O from plain PEM files on the Linux runner — no
+  macOS runner, keychain, or trust settings involved), using the self-signed 100-year
+  `pdw-codesign` certificate from the repo Actions secrets `PDW_CODESIGN_KEY` /
+  `PDW_CODESIGN_CERT`, under the stable identifier `com.zachlatta.pdw`. The designated
+  requirement — `identifier "com.zachlatta.pdw" and certificate root = H"<cert hash>"` — is
+  therefore identical for every release, so TCC grants survive self-updates. Signing runs
+  before packaging so `SHA256SUMS` covers the signed bytes; a release build with missing
+  secrets **fails loudly** (only unreleased fork-PR dry-runs may skip signing), and
+  `selfupdate/workflow_test.go` pins the whole contract.
+- **Per-Mac setup is just the grant itself**: install a released binary (`pdw update
+  --force` or a release tarball), then toggle pdw on once in System Settings → Privacy &
+  Security → Full Disk Access. Done forever on that Mac. Granted on porygon 2026-07-14.
+- **If pdw's FDA breaks anyway**, check `codesign -d --verbose=2 ~/.local/bin/pdw`: it must
+  show `Identifier=com.zachlatta.pdw` and `Authority=pdw-codesign`. `Signature=adhoc` means
+  a local `go build` or pre-signing binary is installed — replace it with a release
+  (`pdw update --force`); the existing grant starts matching again with no new GUI toggle.
+- **The signing identity must never be regenerated casually**: a new certificate is a new
+  requirement, which means a new manual FDA toggle on every Mac that granted against it.
+  The canonical copy lives in the GitHub Actions secrets; the original key/cert (plus the
+  rcodesign used to mint them) are kept as a local backup in `~/.config/pdw/codesign/` on
+  porygon. If the key is ever lost, generate a new one (openssl self-signed cert with the
+  `codeSigning` EKU), update both secrets, and expect one re-toggle per Mac.
+
+This covers pdw's own grant (needed by `pdw ingest claude-desktop`). The uploader
+LaunchAgents dodge the problem differently — they exec `uv run python` directly without pdw
+in the chain — and their `/bin/zsh`/`uv`/venv-python grants (including the uv python
+path-drift gotcha described below) are unchanged.
+
 ## Local Voice Memos Upload Scheduler
 
 This Mac is intended to run the local Voice Memos uploader through a user LaunchAgent:
@@ -601,6 +638,10 @@ If `pdw ingest claude-desktop` fails reading the Keychain or cookie store, macOS
 is likely blocking the background process from
 `~/Library/Application Support/Claude/Cookies` or the `Claude Safe Storage` Keychain item. Grant
 Full Disk Access to `/bin/zsh` and the `pdw` binary (`~/.local/bin/pdw`), then kickstart again.
+pdw's grant survives self-updates only because release binaries are signed with the stable
+identity — see
+[pdw CLI Full Disk Access vs self-updates](#pdw-cli-full-disk-access-vs-self-updates-macos);
+if it breaks, make sure a signed release build is installed (`pdw update --force`).
 
 Claude Desktop SQL starting points are `claude_desktop.events` for raw rows and
 `marts.ai_conversation_events` / `marts.ai_conversation_sessions` filtered to

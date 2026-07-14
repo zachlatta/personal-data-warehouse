@@ -120,6 +120,53 @@ jobs:
           go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
             -o "../dist/staging/pdw-cli" ./cmd/pdw-cli
 
+      # macOS TCC keys Full Disk Access to the binary's code-signing
+      # designated requirement. An unsigned darwin binary only carries the Go
+      # linker's ad-hoc signature — a per-build cdhash — so installing it via
+      # self-update silently invalidates the FDA grant on every Mac. Signing
+      # every release with the same certificate + identifier keeps the
+      # requirement constant, so grants survive updates. This must run before
+      # Package so SHA256SUMS covers the signed bytes. rcodesign signs Mach-O
+      # from plain PEM files on Linux; no macOS runner or keychain needed.
+      - name: Sign darwin binary with the stable pdw identity
+        if: matrix.goos == 'darwin'
+        env:
+          PDW_CODESIGN_KEY: ${{ secrets.PDW_CODESIGN_KEY }}
+          PDW_CODESIGN_CERT: ${{ secrets.PDW_CODESIGN_CERT }}
+          KIND: ${{ needs.version.outputs.kind }}
+          # PDW_ prefix required: rcodesign treats RCODESIGN_* env vars as its
+          # own config keys and errors on unknown fields.
+          PDW_RCODESIGN_VERSION: "0.29.0"
+          PDW_RCODESIGN_SHA256: "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002"
+        run: |
+          set -euo pipefail
+          if [[ -z "${PDW_CODESIGN_KEY}" || -z "${PDW_CODESIGN_CERT}" ]]; then
+            if [[ "${KIND}" == "dry-run" ]]; then
+              echo "::warning::PDW_CODESIGN_* secrets unavailable (fork PR?); skipping darwin signing on a build that will not be released"
+              exit 0
+            fi
+            echo "::error::PDW_CODESIGN_KEY / PDW_CODESIGN_CERT secrets are required: an unsigned darwin release would break Full Disk Access on every Mac at the next self-update"
+            exit 1
+          fi
+          rc_name="apple-codesign-${PDW_RCODESIGN_VERSION}-x86_64-unknown-linux-musl"
+          curl -fsSL -o "${RUNNER_TEMP}/rcodesign.tar.gz" \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${PDW_RCODESIGN_VERSION}/${rc_name}.tar.gz"
+          echo "${PDW_RCODESIGN_SHA256}  ${RUNNER_TEMP}/rcodesign.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/rcodesign.tar.gz" -C "${RUNNER_TEMP}"
+          key="$(mktemp)"; cert="$(mktemp)"
+          printf '%s\n' "${PDW_CODESIGN_KEY}" > "$key"
+          printf '%s\n' "${PDW_CODESIGN_CERT}" > "$cert"
+          "${RUNNER_TEMP}/${rc_name}/rcodesign" sign \
+            --pem-file "$key" \
+            --pem-file "$cert" \
+            --binary-identifier com.zachlatta.pdw \
+            --timestamp-url none \
+            dist/staging/pdw-cli
+          rm -f "$key" "$cert"
+          "${RUNNER_TEMP}/${rc_name}/rcodesign" print-signature-info dist/staging/pdw-cli \
+            | grep -q "com.zachlatta.pdw" \
+            || { echo "::error::signed binary is missing the expected identifier"; exit 1; }
+
       - name: Package
         working-directory: dist
         env:
