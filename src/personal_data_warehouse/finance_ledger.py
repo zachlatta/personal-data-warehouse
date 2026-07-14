@@ -12,8 +12,14 @@ per account summed by side — read through `marts.finance_net_worth` /
 `marts.finance_transactions`.
 
 Sign convention: ledger amounts are signed NUMERIC, **positive = inflow to
-the account**. Plaid reports positive-out, so Plaid amounts are negated at
-ingest; document transactions carry an explicit in/out direction.
+the account**. Plaid reports positive-out (in both the transactions and the
+investments products), so Plaid amounts are negated at ingest; document
+transactions carry an explicit in/out direction.
+
+Plaid contributes two flow feeds: `plaid_transactions` (depository/credit
+accounts) and `plaid_investment_transactions` (brokerage/IRA accounts, whose
+entire activity — cash movements and trades — arrives via the investments
+product). Each account's movements arrive via exactly one feed.
 
 The ledger stores facts only. Categories and other opinions belong to future
 enrichment layers, never to these tables.
@@ -499,6 +505,60 @@ class FinanceLedgerRunner:
                 }
             )
 
+        # Investment-product flows: brokerage accounts (cash-management
+        # brokerages et al.) report ALL their activity — deposits,
+        # withdrawals, interest, dividends, and trades — through the
+        # investments product, never the transactions product, so these ARE
+        # those accounts' flow facts. Same positive-out sign convention as
+        # transactions. The two Plaid feeds are assumed disjoint per account
+        # (an account's movements arrive via exactly one feed); there is no
+        # cross-feed dedup.
+        for row in self._load_plaid_investment_transactions():
+            owner = str(row["account"])
+            source_row_key = f"{owner}|investment|{row['investment_transaction_id']}"
+            account_id = plaid_account_map.get((owner, str(row["account_id"])))
+            if account_id is None:
+                skipped += 1
+                continue
+            transaction_id = stable_finance_transaction_id(LEDGER_SOURCE_PLAID, source_row_key)
+            amount = -_as_decimal(row["amount"])
+            transaction_rows[transaction_id] = {
+                "transaction_id": transaction_id,
+                "account_id": account_id,
+                "posted_at": row["transaction_at"],
+                "amount": amount,
+                "currency": str(row["iso_currency_code"]),
+                "description": str(row["name"]),
+                "merchant": "",
+                "pending": 0,
+                "source": LEDGER_SOURCE_PLAID,
+                "created_at": now,
+                "sync_version": sync_version,
+            }
+            link_rows.append(
+                self._link_row(
+                    source=LEDGER_SOURCE_PLAID,
+                    account="",
+                    source_account_key="",
+                    account_id="",
+                    match_method="source_id",
+                    match_score=1.0,
+                    now=now,
+                    sync_version=sync_version,
+                    as_transaction=True,
+                    source_row_key=source_row_key,
+                    transaction_id=transaction_id,
+                )
+            )
+            pool.setdefault((account_id, amount), []).append(
+                {
+                    "transaction_id": transaction_id,
+                    "posted_on": _as_date(row["transaction_at"]),
+                    "description": str(row["name"]),
+                    "used": False,
+                }
+            )
+
         # Document flows: merge into the Plaid pool where possible (the
         # statement/Plaid overlap seam), otherwise found new ledger rows.
         for extraction in sorted(extractions, key=lambda e: str(e["content_sha256"])):
@@ -727,6 +787,16 @@ class FinanceLedgerRunner:
             FROM plaid_transactions
             WHERE is_removed = 0
             ORDER BY posted_at, transaction_id
+            """
+        )
+
+    def _load_plaid_investment_transactions(self) -> list[dict[str, Any]]:
+        return self._warehouse._query_dicts(
+            """
+            SELECT account, account_id, investment_transaction_id,
+                   transaction_at, name, amount, iso_currency_code
+            FROM plaid_investment_transactions
+            ORDER BY transaction_at, investment_transaction_id
             """
         )
 

@@ -127,6 +127,43 @@ def _plaid_transaction_row(**overrides) -> dict:
     return row
 
 
+def _plaid_investment_transaction_row(**overrides) -> dict:
+    row = {
+        "account": "z@x.test",
+        "item_id": "item-1",
+        "account_id": "acc-b",
+        "investment_transaction_id": "itx-1",
+        "security_id": "",
+        "transaction_at": _TS,
+        "name": "TRANSFERRED FROM VS (Cash)",
+        "quantity": 0.0,
+        "amount": -100.0,  # plaid investments: positive = cash out (same as transactions)
+        "price": 0.0,
+        "fees": 0.0,
+        "type": "cash",
+        "subtype": "deposit",
+        "iso_currency_code": "USD",
+        "unofficial_currency_code": "",
+        "raw_json": {},
+        "synced_at": _TS,
+        "sync_version": 1,
+    }
+    row.update(overrides)
+    return row
+
+
+def _plaid_brokerage_account_row(**overrides) -> dict:
+    return _plaid_account_row(
+        account_id="acc-b",
+        name="Wheel Fund",
+        official_name="Acme Cash Management Brokerage",
+        mask="0002",
+        type="brokerage",
+        subtype="brokerage",
+        **overrides,
+    )
+
+
 def _extraction_row(**overrides) -> dict:
     from decimal import Decimal as D
 
@@ -330,8 +367,9 @@ def test_has_pending_finance_observations(warehouse):
 
 
 def test_replay_rebuilds_identically(warehouse):
-    _seed_plaid(warehouse, [_plaid_account_row()])
+    _seed_plaid(warehouse, [_plaid_account_row(), _plaid_brokerage_account_row()])
     warehouse.insert_plaid_transactions([_plaid_transaction_row()])
+    warehouse.insert_plaid_investment_transactions([_plaid_investment_transaction_row()])
     _seed_document(
         warehouse,
         extraction=_extraction_row(
@@ -467,6 +505,112 @@ def test_pending_row_merges_into_posted_successor_and_reconciles(warehouse):
         )
     )
     assert links == {"z@x.test|tx-p2": "pending_id"}
+
+
+def test_plaid_investment_transactions_become_signed_ledger_rows(warehouse):
+    # Brokerage accounts (cash-management brokerages et al.) report ALL their
+    # activity through the investments product; those flows are ledger facts
+    # exactly like transactions-product flows.
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    warehouse.insert_plaid_investment_transactions(
+        [
+            _plaid_investment_transaction_row(),  # deposit: -100 = cash in
+            _plaid_investment_transaction_row(
+                investment_transaction_id="itx-2",
+                name="FDIC PURCHASE INTO CORE ACCOUNT",
+                type="buy",
+                subtype="buy",
+                amount=100.0,
+                quantity=100.0,
+                price=1.0,
+            ),
+            _plaid_investment_transaction_row(
+                investment_transaction_id="itx-3",
+                name="FDIC INTEREST EARNED",
+                subtype="interest",
+                amount=-1.67,
+            ),
+        ]
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert summary.transactions_upserted == 3
+    rows = warehouse._query(
+        "SELECT description, amount, source, pending FROM finance_transactions ORDER BY amount"
+    )
+    # Plaid positive-out flips to ledger negative (outflow); inflow is positive.
+    assert rows == [
+        ("FDIC PURCHASE INTO CORE ACCOUNT", Decimal("-100"), "plaid", 0),
+        ("FDIC INTEREST EARNED", Decimal("1.67"), "plaid", 0),
+        ("TRANSFERRED FROM VS (Cash)", Decimal("100"), "plaid", 0),
+    ]
+    links = dict(
+        warehouse._query(
+            "SELECT source_row_key, match_method FROM finance_transaction_links ORDER BY source_row_key"
+        )
+    )
+    # Investment rows live in their own source_row_key namespace.
+    assert links == {
+        "z@x.test|investment|itx-1": "source_id",
+        "z@x.test|investment|itx-2": "source_id",
+        "z@x.test|investment|itx-3": "source_id",
+    }
+
+
+def test_investment_and_transaction_feed_ids_never_collide(warehouse):
+    # The two Plaid feeds have independent id spaces; the same raw id in both
+    # must found two ledger rows, not overwrite one.
+    _seed_plaid(warehouse, [_plaid_account_row(), _plaid_brokerage_account_row()])
+    warehouse.insert_plaid_transactions([_plaid_transaction_row(transaction_id="tx-1")])
+    warehouse.insert_plaid_investment_transactions(
+        [_plaid_investment_transaction_row(investment_transaction_id="tx-1")]
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert summary.transactions_upserted == 2
+    assert warehouse._query("SELECT count(*) FROM finance_transactions") == [(2,)]
+
+
+def test_document_transactions_dedup_against_investment_overlap(warehouse):
+    # A brokerage statement's rows merge into investment-founded ledger rows
+    # at the statement/plaid overlap seam, same as depository statements do
+    # against transactions-product rows.
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    warehouse.insert_plaid_investment_transactions([_plaid_investment_transaction_row()])
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-brokerage",
+            source_native_id="sha-brokerage",
+            original_path="acme-wheel-fund-0002/statement.csv",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-brokerage",
+            document_type="brokerage_statement",
+            institution="Acme Bank",
+            account_name_hint="Wheel Fund",
+            account_mask="0002",
+            transactions_json=[
+                # Same account (mask 0002), same amount, one day off: merges.
+                {"date": "2026-07-12", "description": "Transferred From", "amount": "100.00", "direction": "in"},
+                # Outside plaid's window: founds a new ledger row.
+                {"date": "2024-01-05", "description": "OLD TRANSFER", "amount": "50.00", "direction": "in"},
+            ],
+        ),
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert summary.transactions_merged == 1
+    rows = warehouse._query("SELECT description, amount, source FROM finance_transactions ORDER BY posted_at")
+    assert rows == [
+        ("OLD TRANSFER", Decimal("50.00"), "manual_finance"),
+        ("TRANSFERRED FROM VS (Cash)", Decimal("100"), "plaid"),
+    ]
+    # The doc's account resolved to the EXISTING plaid account by mask: no new account.
+    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(1,)]
+    links = dict(
+        warehouse._query(
+            "SELECT source_row_key, match_method FROM finance_transaction_links WHERE source = 'manual_finance'"
+        )
+    )
+    assert links == {"sha-brokerage|0": "fuzzy_amount_date", "sha-brokerage|1": "source_id"}
 
 
 def test_document_transactions_dedup_against_plaid_overlap(warehouse):
