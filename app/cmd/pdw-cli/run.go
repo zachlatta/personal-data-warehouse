@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/cliclient"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/cliconfig"
@@ -43,11 +44,12 @@ COMMANDS
                              "call sql" / "call query".
                                --data JSON   Inline JSON input
                                              (aliases: --args, --input, --json).
-  sql [--output FMT] [-q QUESTION] [--file PATH] [SQL]
+  sql [--output FMT] [-q QUESTION] [--file PATH] [--no-timeout] [SQL]
                              The one way to run read-only SQL. The SQL is the
                              single positional argument; it may instead be read
                              from --file or piped on stdin (which avoids
-                             shell-quoting multi-line SQL).
+                             shell-quoting multi-line SQL). Queries time out
+                             after 10 seconds by default.
                                -q, --question TEXT  Concise plain-English
                                              description of what the SQL answers,
                                              logged server-side as the caller's
@@ -57,6 +59,7 @@ COMMANDS
                                --output FMT  csv, json, or nd-json. If omitted,
                                              defaults to csv and prints a note.
                                --file PATH   Read the SQL statement from a file.
+                               --no-timeout  Wait indefinitely for a long query.
   columns <schema.table>     List a relation's column names and types. Use this (or
                              schema) before writing SQL so you don't guess column
                              names.
@@ -105,6 +108,7 @@ EXAMPLES
   pdw sql 'SELECT 1'
   pdw sql -q 'How many rows?' 'SELECT count(*) FROM gmail.messages'
   pdw sql --output json -q 'What time is it?' 'SELECT now()'
+  pdw sql --no-timeout -q 'Run a long query' 'SELECT ...'
   pdw sql -q 'Find calendar transcripts mentioning Vercel' --file query.sql
   pdw sql -q 'Recent Slack messages in a channel' < query.sql
   pdw config show
@@ -277,6 +281,8 @@ func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer
 
 const sqlOutputHint = "note: use --output [csv|json|nd-json] to specify output format"
 
+const defaultSQLTimeout = 10 * time.Second
+
 type sqlCommandInput struct {
 	Question string `json:"question"`
 	SQL      string `json:"sql"`
@@ -295,6 +301,7 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 	file := fs.String("file", "", "read the SQL statement from this file instead of an argument")
 	questionFlag := fs.String("question", "", "plain-English description of what the SQL answers, logged server-side as intent")
 	questionShort := fs.String("q", "", "alias for --question")
+	noTimeout := fs.Bool("no-timeout", false, "wait indefinitely for the query")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(stdout, usage)
@@ -318,8 +325,19 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 		fmt.Fprintln(stderr, "pdw sql:", err)
 		return 1
 	}
-	out, err := client.CallTool(context.Background(), "sql", input)
+	ctx := context.Background()
+	cancel := func() {}
+	if !*noTimeout {
+		ctx, cancel = context.WithTimeout(ctx, defaultSQLTimeout)
+	}
+	defer cancel()
+
+	out, err := client.CallTool(ctx, "sql", input)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			fmt.Fprintf(stderr, "pdw sql: query timed out after %s; rerun with --no-timeout to wait indefinitely\n", defaultSQLTimeout)
+			return 1
+		}
 		var apiErr *cliclient.APIError
 		if errors.As(err, &apiErr) {
 			fmt.Fprintf(stderr, "pdw sql: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)

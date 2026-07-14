@@ -15,6 +15,7 @@ import (
 	"time"
 
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/cliclient"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	pdwserver "github.com/zachlatta/personal-data-warehouse/app/internal/server"
@@ -71,6 +72,82 @@ func runCLI(t *testing.T, baseURL string, stdin string, args ...string) (stdout,
 	}
 	code = run(args, strings.NewReader(stdin), &outBuf, &errBuf, func(k string) string { return env[k] })
 	return outBuf.String(), errBuf.String(), code
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func newTransportClient(t *testing.T, transport http.RoundTripper) *cliclient.Client {
+	t.Helper()
+	client, err := cliclient.New("http://example.test", "pdw-cli-test", cliTestToken)
+	if err != nil {
+		t.Fatalf("new CLI client: %v", err)
+	}
+	client.SetHTTPClient(&http.Client{Transport: transport})
+	return client
+}
+
+func successfulSQLResponse(req *http.Request) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"data":{"rows":"n\n1"}}`)),
+		Request:    req,
+	}
+}
+
+func TestSQLCommandUsesTenSecondDeadlineByDefault(t *testing.T) {
+	var remaining time.Duration
+	client := newTransportClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		deadline, ok := req.Context().Deadline()
+		if !ok {
+			t.Fatal("default SQL request context has no deadline")
+		}
+		remaining = time.Until(deadline)
+		return successfulSQLResponse(req), nil
+	}))
+
+	var stdout, stderr bytes.Buffer
+	code := runSQL(client, []string{"SELECT 1"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if remaining < 9*time.Second || remaining > 10*time.Second {
+		t.Fatalf("SQL deadline remaining = %s, want approximately 10s", remaining)
+	}
+}
+
+func TestSQLCommandNoTimeoutLeavesRequestWithoutDeadline(t *testing.T) {
+	client := newTransportClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if deadline, ok := req.Context().Deadline(); ok {
+			t.Fatalf("--no-timeout request has deadline %s", deadline)
+		}
+		return successfulSQLResponse(req), nil
+	}))
+
+	var stdout, stderr bytes.Buffer
+	code := runSQL(client, []string{"--no-timeout", "SELECT 1"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
+	}
+}
+
+func TestSQLCommandTimeoutErrorPointsToNoTimeoutFlag(t *testing.T) {
+	client := newTransportClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	}))
+
+	var stdout, stderr bytes.Buffer
+	code := runSQL(client, []string{"SELECT 1"}, strings.NewReader(""), &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("expected timeout to return a non-zero exit code")
+	}
+	if !strings.Contains(stderr.String(), "timed out after 10s") || !strings.Contains(stderr.String(), "--no-timeout") {
+		t.Fatalf("timeout error is not actionable: %s", stderr.String())
+	}
 }
 
 func TestSQLCommandDefaultOutputsNoteAndCSV(t *testing.T) {
@@ -297,7 +374,7 @@ func TestHelpExitsZero(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d", code)
 	}
-	for _, want := range []string{"list", "describe", "call", "PDW_API_URL", "PDW_SECRET_TOKEN"} {
+	for _, want := range []string{"list", "describe", "call", "--no-timeout", "PDW_API_URL", "PDW_SECRET_TOKEN"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("help missing %q in output:\n%s", want, out)
 		}

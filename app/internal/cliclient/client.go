@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 // Client talks to the warehouse HTTP API.
@@ -75,7 +74,7 @@ func New(baseURL, clientName, token string) (*Client, error) {
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		clientName: clientName,
 		token:      token,
-		http:       &http.Client{Timeout: 5 * time.Minute},
+		http:       &http.Client{},
 	}, nil
 }
 

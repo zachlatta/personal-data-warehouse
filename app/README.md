@@ -458,6 +458,7 @@ go build -o /tmp/pdw ./cmd/pdw-cli
 /tmp/pdw sql -q 'What is one?' 'SELECT 1'  # -q records the caller's intent in server logs
 /tmp/pdw sql --output json -q 'What time is it?' 'SELECT now()'
 /tmp/pdw sql --output nd-json -q 'Which recent Gmail messages exist?' 'SELECT * FROM gmail_messages LIMIT 3'
+/tmp/pdw sql --no-timeout -q 'Run a long query' 'SELECT ...'  # opt out of the default 10-second timeout
 /tmp/pdw sql -q 'Find calendar transcripts mentioning Vercel' --file query.sql  # SQL from a file
 /tmp/pdw sql -q 'Recent Slack messages' < query.sql                            # SQL from stdin
 /tmp/pdw config show              # prints config with the token redacted
@@ -468,6 +469,8 @@ Running SQL has exactly one path: the `sql` command. The read-only query tool
 is named `sql` over the CLI/HTTP API and `query` over MCP, so `pdw call sql`
 and `pdw call query` are both rejected with a pointer to `pdw sql`. This
 keeps SQL off the JSON-quoting `call` path. `call` is for non-SQL tools only.
+`pdw sql` cancels a query after 10 seconds by default; pass `--no-timeout` for
+a long-running query that should wait indefinitely on the client side.
 
 Values resolve in this order: **`--flag` > environment variable > config
 file > default**. Env vars (`PDW_API_URL`, `PDW_SECRET_TOKEN`,
