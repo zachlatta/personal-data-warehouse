@@ -328,7 +328,13 @@ class ManualFinanceExtractionRunner:
         error_window_days: int = DEFAULT_ERROR_WINDOW_DAYS,
         render_max_pages: int = DEFAULT_RENDER_MAX_PAGES,
         now: Callable[[], datetime] | None = None,
+        workers: int = 1,
+        warehouse_factory: Callable[[], Any] | None = None,
     ) -> None:
+        # Postgres connections are not thread-safe, so parallel workers each
+        # need their own warehouse: workers > 1 requires warehouse_factory.
+        if workers > 1 and warehouse_factory is None:
+            raise ValueError("workers > 1 requires a warehouse_factory (one connection per worker)")
         self._warehouse = warehouse
         self._agent = agent
         self._object_store_factory = object_store_factory
@@ -340,6 +346,8 @@ class ManualFinanceExtractionRunner:
         self._render_max_pages = render_max_pages
         self._now = now or (lambda: datetime.now(tz=UTC))
         self._object_store: Any = None
+        self._workers = max(1, int(workers))
+        self._warehouse_factory = warehouse_factory
 
     @property
     def enrichment_provider(self) -> str:
@@ -355,30 +363,25 @@ class ManualFinanceExtractionRunner:
             max_error_attempts=self._max_error_attempts,
             error_window_days=self._error_window_days,
         )
-        extracted = 0
-        not_useful = 0
-        failed = 0
-        unreadable = 0
         known_accounts = self._known_accounts()
-        for index, candidate in enumerate(candidates, start=1):
-            label = f"{candidate.get('original_path') or candidate.get('filename') or '<unnamed>'}"
-            try:
-                self._logger.info("[%s/%s] extracting %s", index, len(candidates), label)
-                status = self._extract_candidate(candidate, known_accounts=known_accounts)
-            except AttachmentPreparationError as exc:
-                unreadable += 1
-                self._record_failure(candidate, error=str(exc), status=STATUS_UNREADABLE)
-                self._logger.warning("[%s/%s] unreadable %s: %s", index, len(candidates), label, exc)
-                continue
-            except Exception as exc:
-                failed += 1
-                self._record_failure(candidate, error=str(exc), status=STATUS_ERROR)
-                self._logger.warning("[%s/%s] failed %s: %s", index, len(candidates), label, exc)
-                continue
-            if status == STATUS_OK:
-                extracted += 1
-            else:
-                not_useful += 1
+        if self._workers > 1 and len(candidates) > 1:
+            statuses = self._process_parallel(candidates, known_accounts=known_accounts)
+        else:
+            statuses = [
+                self._process_candidate(
+                    self._warehouse,
+                    self._store(),
+                    candidate,
+                    known_accounts=known_accounts,
+                    index=index,
+                    total=len(candidates),
+                )
+                for index, candidate in enumerate(candidates, start=1)
+            ]
+        extracted = statuses.count(STATUS_OK)
+        not_useful = statuses.count(STATUS_NOT_USEFUL)
+        failed = statuses.count(STATUS_ERROR)
+        unreadable = statuses.count(STATUS_UNREADABLE)
         self._logger.info(
             "Manual finance extraction: saw %s document(s), extracted %s, not useful %s, failed %s, unreadable %s",
             len(candidates),
@@ -395,10 +398,95 @@ class ManualFinanceExtractionRunner:
             documents_unreadable=unreadable,
         )
 
-    def _extract_candidate(
-        self, candidate: Mapping[str, Any], *, known_accounts: Sequence[Mapping[str, Any]]
+    def _process_parallel(
+        self, candidates: list[dict[str, Any]], *, known_accounts: Sequence[Mapping[str, Any]]
+    ) -> list[str]:
+        """Run candidates through a bounded worker pool.
+
+        The long pole per document is its sandboxed agent container, which
+        parallelizes cleanly (one docker run each); every worker thread gets
+        its own warehouse connection + object store, created lazily and
+        closed after the batch.
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        thread_resources = threading.local()
+        created_warehouses: list[Any] = []
+        creation_lock = threading.Lock()
+
+        def resources() -> tuple[Any, Any]:
+            if not hasattr(thread_resources, "warehouse"):
+                # Serialized: concurrent PostgresWarehouse construction races
+                # on the shared role GRANTs ("tuple concurrently updated").
+                with creation_lock:
+                    warehouse = self._warehouse_factory()
+                    created_warehouses.append(warehouse)
+                thread_resources.warehouse = warehouse
+                thread_resources.store = self._object_store_factory()
+            return thread_resources.warehouse, thread_resources.store
+
+        def process(index: int, candidate: dict[str, Any]) -> str:
+            warehouse, store = resources()
+            return self._process_candidate(
+                warehouse,
+                store,
+                candidate,
+                known_accounts=known_accounts,
+                index=index,
+                total=len(candidates),
+            )
+
+        self._logger.info(
+            "Extracting %s document(s) with %s parallel workers", len(candidates), self._workers
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=self._workers) as pool:
+                statuses = list(
+                    pool.map(process, range(1, len(candidates) + 1), candidates)
+                )
+        finally:
+            for warehouse in created_warehouses:
+                try:
+                    warehouse.close()
+                except Exception:  # noqa: BLE001 - cleanup only
+                    pass
+        return statuses
+
+    def _process_candidate(
+        self,
+        warehouse,
+        store,
+        candidate: Mapping[str, Any],
+        *,
+        known_accounts: Sequence[Mapping[str, Any]],
+        index: int,
+        total: int,
     ) -> str:
-        content = self._store().get_object(document_storage_ref(candidate))
+        label = f"{candidate.get('original_path') or candidate.get('filename') or '<unnamed>'}"
+        try:
+            self._logger.info("[%s/%s] extracting %s", index, total, label)
+            return self._extract_candidate(
+                warehouse, store, candidate, known_accounts=known_accounts
+            )
+        except AttachmentPreparationError as exc:
+            self._record_failure(warehouse, candidate, error=str(exc), status=STATUS_UNREADABLE)
+            self._logger.warning("[%s/%s] unreadable %s: %s", index, total, label, exc)
+            return STATUS_UNREADABLE
+        except Exception as exc:  # noqa: BLE001 - recorded and counted
+            self._record_failure(warehouse, candidate, error=str(exc), status=STATUS_ERROR)
+            self._logger.warning("[%s/%s] failed %s: %s", index, total, label, exc)
+            return STATUS_ERROR
+
+    def _extract_candidate(
+        self,
+        warehouse,
+        store,
+        candidate: Mapping[str, Any],
+        *,
+        known_accounts: Sequence[Mapping[str, Any]],
+    ) -> str:
+        content = store.get_object(document_storage_ref(candidate))
         inputs = prepare_document_inputs(
             content=content,
             mime_type=str(candidate.get("mime_type", "")),
@@ -420,8 +508,8 @@ class ManualFinanceExtractionRunner:
         )
         # Read-only warehouse access: the agent can look up known accounts or
         # prior extractions while it works.
-        result = self._agent.run_with_warehouse(request, warehouse=self._warehouse)
-        self._record_agent_result(result)
+        result = self._agent.run_with_warehouse(request, warehouse=warehouse)
+        self._record_agent_result(warehouse, result)
         if result.status != "completed":
             raise RuntimeError(result.error or f"agent run {result.run_id} failed")
         output = dict(result.final_output_json)
@@ -430,14 +518,16 @@ class ManualFinanceExtractionRunner:
             raise RuntimeError("agent output failed validation: " + "; ".join(issues[:5]))
 
         status = STATUS_OK if output.get("is_financial") else STATUS_NOT_USEFUL
-        self._warehouse.insert_manual_finance_extractions(
+        warehouse.insert_manual_finance_extractions(
             [self._extraction_row(candidate, output=output, status=status, error="", result=result)]
         )
         return status
 
-    def _record_failure(self, candidate: Mapping[str, Any], *, error: str, status: str) -> None:
+    def _record_failure(
+        self, warehouse, candidate: Mapping[str, Any], *, error: str, status: str
+    ) -> None:
         try:
-            self._warehouse.insert_manual_finance_extractions(
+            warehouse.insert_manual_finance_extractions(
                 [self._extraction_row(candidate, output={}, status=status, error=error[:2000], result=None)]
             )
         except Exception as exc:
@@ -489,14 +579,14 @@ class ManualFinanceExtractionRunner:
             "sync_version": int(created_at.timestamp() * 1_000_000),
         }
 
-    def _record_agent_result(self, result: AgentRunResult) -> None:
-        self._warehouse.insert_agent_runs([agent_run_row(result)])
+    def _record_agent_result(self, warehouse, result: AgentRunResult) -> None:
+        warehouse.insert_agent_runs([agent_run_row(result)])
         event_rows = agent_run_event_rows(result)
         if event_rows:
-            self._warehouse.insert_agent_run_events(event_rows)
+            warehouse.insert_agent_run_events(event_rows)
         tool_call_rows = agent_run_tool_call_rows(result)
         if tool_call_rows:
-            self._warehouse.insert_agent_run_tool_calls(tool_call_rows)
+            warehouse.insert_agent_run_tool_calls(tool_call_rows)
 
     def _known_accounts(self) -> list[dict[str, Any]]:
         try:

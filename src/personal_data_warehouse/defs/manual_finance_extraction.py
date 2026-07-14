@@ -40,7 +40,12 @@ from personal_data_warehouse.warehouse import warehouse_from_settings
 MANUAL_FINANCE_EXTRACTION_POSTGRES_LOCK_ID = 7_403_111_853
 MANUAL_FINANCE_EXTRACTION_SENSOR_INTERVAL_SECONDS = 120
 DEFAULT_MANUAL_FINANCE_EXTRACTION_BATCH_SIZE = 25
+DEFAULT_MANUAL_FINANCE_EXTRACTION_WORKERS = 1
+# Each worker holds one 4g/2cpu agent container; size against the Dagster
+# host's free memory before raising.
+MAX_MANUAL_FINANCE_EXTRACTION_WORKERS = 4
 MANUAL_FINANCE_EXTRACTION_BATCH_SIZE_ENV = "MANUAL_FINANCE_EXTRACTION_BATCH_SIZE"
+MANUAL_FINANCE_EXTRACTION_WORKERS_ENV = "MANUAL_FINANCE_EXTRACTION_WORKERS"
 MANUAL_FINANCE_EXTRACTION_MAX_ERROR_ATTEMPTS_ENV = "MANUAL_FINANCE_EXTRACTION_MAX_ERROR_ATTEMPTS"
 MANUAL_FINANCE_EXTRACTION_ERROR_WINDOW_DAYS_ENV = "MANUAL_FINANCE_EXTRACTION_ERROR_WINDOW_DAYS"
 MANUAL_FINANCE_RENDER_MAX_PAGES_ENV = "MANUAL_FINANCE_RENDER_MAX_PAGES"
@@ -159,6 +164,8 @@ def manual_finance_extraction_runner(
         max_error_attempts=manual_finance_extraction_max_error_attempts(),
         error_window_days=manual_finance_extraction_error_window_days(),
         render_max_pages=manual_finance_render_max_pages(),
+        workers=manual_finance_extraction_workers(),
+        warehouse_factory=lambda: warehouse_from_settings(settings),
     )
 
 
@@ -169,6 +176,18 @@ def manual_finance_extraction_batch_size() -> int:
             str(DEFAULT_MANUAL_FINANCE_EXTRACTION_BATCH_SIZE),
         )
     )
+
+
+def manual_finance_extraction_workers() -> int:
+    value = os.getenv(MANUAL_FINANCE_EXTRACTION_WORKERS_ENV, "").strip()
+    if not value:
+        return DEFAULT_MANUAL_FINANCE_EXTRACTION_WORKERS
+    workers = int(value)
+    if not 1 <= workers <= MAX_MANUAL_FINANCE_EXTRACTION_WORKERS:
+        raise ValueError(
+            f"{MANUAL_FINANCE_EXTRACTION_WORKERS_ENV} must be between 1 and {MAX_MANUAL_FINANCE_EXTRACTION_WORKERS}"
+        )
+    return workers
 
 
 def manual_finance_extraction_max_error_attempts() -> int:

@@ -307,13 +307,13 @@ def test_candidates_and_retry_cap(warehouse):
         now=lambda: _TS,
     )
     # A permanent input-prep failure (UNREADABLE) excludes without any agent run.
-    runner._record_failure(_document_row(), error="corrupt pdf", status=STATUS_UNREADABLE)
+    runner._record_failure(warehouse, _document_row(), error="corrupt pdf", status=STATUS_UNREADABLE)
     assert candidates() == []
     warehouse._command("DELETE FROM manual_finance_extractions")
 
     # A plain ERROR row does NOT exclude on its own (transient pre-agent
     # failures retry; only agent_runs counting and UNREADABLE bind).
-    runner._record_failure(_document_row(), error="drive hiccup", status=STATUS_ERROR)
+    runner._record_failure(warehouse, _document_row(), error="drive hiccup", status=STATUS_ERROR)
     assert [c["content_sha256"] for c in candidates()] == ["sha-doc-1"]
     warehouse._command("DELETE FROM manual_finance_extractions")
 
@@ -367,6 +367,51 @@ def test_runner_extracts_and_writes_typed_row(warehouse):
     assert not has_extraction_candidate(
         warehouse, provider="agent_codex", prompt_version=PROMPT_VERSION
     )
+
+
+def test_runner_parallel_workers_extract_all_candidates(warehouse):
+    warehouse.ensure_manual_finance_tables()
+    warehouse.ensure_finance_tables()
+    docs = [
+        _document_row(
+            content_sha256=f"sha-{i}",
+            source_native_id=f"sha-{i}",
+            filename=f"export-{i}.csv",
+            mime_type="text/csv",
+            original_path=f"acme-checking-0001/export-{i}.csv",
+        )
+        for i in range(5)
+    ]
+    warehouse.insert_manual_finance_documents(docs)
+    agent = FakeAgent(_agent_output())
+    summary = ManualFinanceExtractionRunner(
+        warehouse=warehouse,
+        agent=agent,
+        object_store_factory=lambda: FakeObjectStore(b"Date,Amount\n2026-06-05,-4.50\n"),
+        logger=Logger(),
+        provider="codex",
+        now=lambda: _TS,
+        workers=3,
+        warehouse_factory=lambda: PostgresWarehouse(_postgres_url(), schema=warehouse.schema_namespace),
+    ).sync(limit=None)
+    assert summary.documents_seen == 5
+    assert summary.documents_extracted == 5
+    assert summary.documents_failed == 0
+    assert warehouse._query("SELECT count(*) FROM manual_finance_extractions WHERE status = 'ok'") == [(5,)]
+    # Every agent run got a warehouse handle (its read-only tool proxy).
+    assert len(agent.warehouses) == 5
+
+
+def test_runner_parallel_requires_warehouse_factory():
+    with pytest.raises(ValueError, match="warehouse_factory"):
+        ManualFinanceExtractionRunner(
+            warehouse=None,
+            agent=None,
+            object_store_factory=lambda: None,
+            logger=Logger(),
+            provider="codex",
+            workers=3,
+        )
 
 
 def test_runner_records_unreadable_and_not_useful(warehouse):
