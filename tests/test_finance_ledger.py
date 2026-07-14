@@ -562,6 +562,10 @@ def test_multi_entity_valuation_doc_prefers_total_else_first(warehouse):
                 {"date": "2026-05-11", "value": "445000", "description": "Estimated sale price — low"},
                 {"date": "2026-05-11", "value": "539000", "description": "Estimated sale price — high"},
                 {"date": "2026-05-11", "value": "1905", "description": "Rental estimate per month"},
+                # Negative entries are deltas (depreciation), never values —
+                # even when their description matches the totals heuristic.
+                {"date": "2026-06-11", "value": "-11330", "description": "Total depreciation over five years"},
+                {"date": "2026-06-11", "value": "16835", "description": "Trade-in range — low"},
             ],
         ),
     )
@@ -572,6 +576,7 @@ def test_multi_entity_valuation_doc_prefers_total_else_first(warehouse):
     assert rows == [
         (date(2026, 4, 11), Decimal("16797.38")),
         (date(2026, 5, 11), Decimal("468000")),
+        (date(2026, 6, 11), Decimal("16835")),
     ]
 
 

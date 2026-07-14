@@ -825,6 +825,11 @@ def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:
         value = _parse_money(str(entry.get("value", "")))
         if as_of is None or value is None:
             continue
+        # Negative "valuations" are deltas, not asset values (an Edmunds
+        # appraisal's "total depreciation over five years: -11,330" both went
+        # negative AND matched the totals heuristic). Assets are worth >= 0.
+        if value < 0:
+            continue
         day = by_day.setdefault(as_of, {"first": value, "total": None})
         is_total = "total" in str(entry.get("description", "")).lower()
         if is_total and day["total"] is None:
