@@ -43,10 +43,63 @@ def test_photo_enrichment_source_targets_canonical_renditions() -> None:
     # task_type + prompt_version and a photo-tuned instructions block.
     assert PHOTOS_SOURCE.table == "photo_canonical_renditions"
     assert PHOTOS_SOURCE.task_type == "photo_enrichment"
-    assert PHOTOS_SOURCE.prompt_version == "photo-agent-v1"
+    assert PHOTOS_SOURCE.prompt_version == "photo-agent-v2"
     assert PHOTOS_SOURCE.order_column == "capture_ts"
     assert not PHOTOS_SOURCE.pdf_requires_prior_extraction
     assert "personal photo" in PHOTOS_SOURCE.vision_instructions
+    assert "capture_context" in PHOTOS_SOURCE.vision_instructions
+    assert PHOTOS_SOURCE.extra_columns == ("photo_id",)
+
+
+def test_photo_enrichment_runner_wires_capture_context(monkeypatch) -> None:
+    # The runner must receive the photo context builder so captions can say
+    # "taken at <calendar event>"; context failures degrade, never block.
+    import personal_data_warehouse.defs.photo_enrichment as defs_module
+    from personal_data_warehouse.photo_context import photo_enrichment_context
+
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(defs_module, "FileAttachmentEnrichmentRunner", FakeRunner)
+    monkeypatch.setattr(
+        defs_module, "photo_object_store_factory", lambda *, settings: (lambda _account: object())
+    )
+
+    class FakeAgent:
+        is_configured = True
+
+    defs_module.photo_enrichment_runner(
+        settings=FakeSettings(), warehouse=object(), logger=object(), agent=FakeAgent()
+    )
+    assert captured["context_builder"] is photo_enrichment_context
+    assert captured["source"] is PHOTOS_SOURCE
+
+
+def test_attachment_vision_prompt_embeds_capture_context() -> None:
+    import json
+
+    from personal_data_warehouse.file_attachment_enrichment import attachment_vision_prompt
+
+    payload = json.loads(
+        attachment_vision_prompt(
+            image_name="attachment.jpg",
+            candidate={"filename": "IMG_0001.HEIC", "mime_type": "image/heic"},
+            source_label="personal photo",
+            context={"captured_at_local": "2026-06-01T14:30:00-07:00", "gps": {"latitude": 1.0, "longitude": 2.0}},
+        )
+    )
+    assert payload["capture_context"]["captured_at_local"] == "2026-06-01T14:30:00-07:00"
+    # And without context the key is absent entirely (other sources unchanged).
+    bare = json.loads(
+        attachment_vision_prompt(
+            image_name="attachment.jpg",
+            candidate={"filename": "x.png", "mime_type": "image/png"},
+        )
+    )
+    assert "capture_context" not in bare
 
 
 def test_photo_enrichment_batch_size_defaults(monkeypatch) -> None:

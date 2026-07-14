@@ -145,6 +145,11 @@ class FileEnrichmentSource:
     # Optional source-tuned instructions block; empty means the generic
     # document-oriented attachment_vision_instructions(label).
     vision_instructions: str = ""
+    # Extra columns selected onto each candidate row (as a.<col>), for sources
+    # whose runner needs more than the standard blob fields — e.g. photos
+    # select photo_id so the context builder can look up capture time/GPS and
+    # nearby calendar events.
+    extra_columns: tuple[str, ...] = ()
 
 
 GMAIL_SOURCE = FileEnrichmentSource(
@@ -203,7 +208,9 @@ Look at the image first. Lead with a specific one-sentence summary of the scene:
 
 Extract ALL readable text anywhere in the image into visible_text exactly as printed: signs, menus, labels, whiteboards, slides, book covers, screenshots. Put place names, business names, brands, and event names in entities. Fill search_keywords with the concrete nouns and scene words someone would type to find this photo (e.g. beach, sunset, golden retriever, whiteboard, ramen).
 
-Set document_type to a short scene category: "photo: <category>" (e.g. "photo: outdoor landscape", "photo: group at dinner", "photo: whiteboard", "photo: screenshot", "photo: document"). Nearly every real photo is_useful=true; use false only for fully black/blank/corrupted frames. Do not infer anything from the filename. Do not invent details. Keep at most 12 visible_text chunks, 10 entities, 12 search_keywords, and 5 uncertainties."""
+Set document_type to a short scene category: "photo: <category>" (e.g. "photo: outdoor landscape", "photo: group at dinner", "photo: whiteboard", "photo: screenshot", "photo: document"). Nearly every real photo is_useful=true; use false only for fully black/blank/corrupted frames. Do not infer anything from the filename. Do not invent details. Keep at most 12 visible_text chunks, 10 entities, 12 search_keywords, and 5 uncertainties.
+
+When the prompt includes capture_context, use it to GROUND the description, never to override what you see. It may carry the local capture time and weekday (say "evening"/"Saturday afternoon" style language when the light and scene agree), GPS coordinates (if you recognize the region from coordinates, you may name the city/area at the confidence the coordinates support — put it in entities and search_keywords, e.g. "Vermont", "Lake Champlain area"), and calendar_events_near_capture — the owner's calendar entries around the moment the photo was taken. If exactly one calendar event plausibly matches the scene (time overlaps and the visuals are consistent with the event's title/location), treat the photo as taken AT that event: name the event in the summary and add its title and location to entities and search_keywords. If several events could match, pick none and mention the ambiguity in uncertainties. If the visuals contradict the calendar (an indoor meeting on the calendar but a beach in the photo), ignore the event and note the mismatch in uncertainties. Never invent an event, and never name people from attendee lists or context — describe only who is visible."""
 
 
 # One enrichable still per LOGICAL photo (the identity layer's 1280px JPEG
@@ -213,7 +220,9 @@ PHOTOS_SOURCE = FileEnrichmentSource(
     name="photos",
     label="personal photo",
     task_type="photo_enrichment",
-    prompt_version="photo-agent-v1",
+    # v2: capture_context (local time, GPS, nearby calendar events) grounds
+    # the caption — bumping the version re-enriches earlier context-free rows.
+    prompt_version="photo-agent-v2",
     table="photo_canonical_renditions",
     stored_predicate="a.content_sha256 <> '' AND a.storage_file_id <> ''",
     size_column="size_bytes",
@@ -221,6 +230,8 @@ PHOTOS_SOURCE = FileEnrichmentSource(
     # No deterministic PDF stage; the canonical rendition is always a JPEG.
     pdf_requires_prior_extraction=False,
     vision_instructions=photo_vision_instructions(),
+    # photo_id lets the context builder join back to photos.assets.
+    extra_columns=("photo_id",),
 )
 
 # Backwards-friendly aliases retained for the Gmail-specific call sites/tests
@@ -252,6 +263,7 @@ class FileAttachmentEnrichmentRunner:
         max_error_attempts: int = DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
         error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
         now: Callable[[], datetime] | None = None,
+        context_builder: Callable[[Any, Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
     ) -> None:
         self._source = source
         self._warehouse = warehouse
@@ -265,6 +277,12 @@ class FileAttachmentEnrichmentRunner:
         self._max_error_attempts = max_error_attempts
         self._error_window_days = error_window_days
         self._now = now or (lambda: datetime.now(tz=UTC))
+        # Optional (warehouse, candidate) -> mapping hook: sources that know
+        # more than the blob (photos: capture time, GPS, nearby calendar
+        # events) surface it to the vision agent as capture_context. Context
+        # failures never block the vision pass — the enrichment degrades to
+        # context-free rather than erroring.
+        self._context_builder = context_builder
         self._object_stores: dict[str, Any] = {}
 
     @property
@@ -328,6 +346,19 @@ class FileAttachmentEnrichmentRunner:
             attachments_failed=failed,
         )
 
+    def _candidate_context(self, candidate: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        if self._context_builder is None:
+            return None
+        try:
+            return self._context_builder(self._warehouse, candidate)
+        except Exception as exc:  # noqa: BLE001 - context is additive, never blocking
+            self._logger.warning(
+                "capture-context lookup failed for %s: %s",
+                candidate.get("content_sha256", ""),
+                exc,
+            )
+            return None
+
     def _enrich_candidate(self, candidate: Mapping[str, Any]) -> str:
         content = self._object_store(str(candidate.get("account", ""))).get_object(
             attachment_storage_ref(candidate)
@@ -342,6 +373,7 @@ class FileAttachmentEnrichmentRunner:
             candidate=candidate,
             source_label=self._source.label,
             instructions=self._source.vision_instructions or None,
+            context=self._candidate_context(candidate),
         )
         request = AgentRunRequest(
             prompt=prompt,
@@ -586,6 +618,7 @@ def load_file_enrichment_candidates(
         "storage_file_id",
         "storage_url",
         "source_status",
+        *source.extra_columns,
     )
     limit_sql = "LIMIT %s" if limit is not None and limit > 0 else ""
     projection = (
@@ -597,7 +630,8 @@ def load_file_enrichment_candidates(
         f"a.{source.size_column} AS size, "
         f"a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url, "
         f"COALESCE(det.text_extraction_status, '') AS source_status, "
-        f"a.{source.order_column} AS order_at"
+        + "".join(f"a.{column}, " for column in source.extra_columns)
+        + f"a.{source.order_column} AS order_at"
     )
     inner = _candidate_query(
         source,
@@ -614,10 +648,11 @@ def load_file_enrichment_candidates(
     )
     if limit_sql:
         params.append(int(limit))
+    extra_select = "".join(f", {column}" for column in source.extra_columns)
     rows = warehouse._query(
         f"""
         SELECT account, content_sha256, filename, mime_type, size,
-               storage_backend, storage_key, storage_file_id, storage_url, source_status
+               storage_backend, storage_key, storage_file_id, storage_url, source_status{extra_select}
         FROM ( {inner} ) AS candidates
         ORDER BY order_at DESC
         {limit_sql}
@@ -793,6 +828,7 @@ def attachment_vision_prompt(
     candidate: Mapping[str, Any],
     source_label: str = "attachment",
     instructions: str | None = None,
+    context: Mapping[str, Any] | None = None,
 ) -> str:
     # The image path is given relative to the agent's working directory (the run
     # dir), which is exactly where the inputs/ subdir lives. Image-viewing tools
@@ -820,6 +856,7 @@ def attachment_vision_prompt(
             "format": "Return one JSON object and no prose.",
             "schema": attachment_vision_schema(),
         },
+        **({"capture_context": dict(context)} if context else {}),
         "agent_runtime_notes": [
             "You are running as a one-off CLI agent inside an isolated Docker container.",
             "You MUST actually view the image before producing output; never answer from the filename alone.",

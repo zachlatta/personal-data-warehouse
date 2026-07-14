@@ -276,6 +276,9 @@ def test_photo_canonical_renditions_feed_the_enrichment_candidate_query(warehous
     assert [c["content_sha256"] for c in found] == ["sha-thumb"]
     assert found[0]["mime_type"] == "image/jpeg"
     assert found[0]["storage_file_id"] == "drive-th1"
+    # The photos source selects photo_id (extra_columns) so the enrichment
+    # context builder can join back to the asset.
+    assert found[0]["photo_id"] == "ph1"
 
     # A completed enrichment for the thumbnail sha removes the candidate: one
     # vision pass per logical photo.

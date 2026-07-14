@@ -29,6 +29,7 @@ from personal_data_warehouse.file_attachment_enrichment import (
     FileAttachmentEnrichmentRunner,
     has_file_enrichment_candidate,
 )
+from personal_data_warehouse.photo_context import photo_enrichment_context
 from personal_data_warehouse.schedule_guards import skip_if_job_active, skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
@@ -159,6 +160,9 @@ def photo_enrichment_runner(
         text_max_chars=PHOTO_TEXT_MAX_CHARS,
         max_error_attempts=photo_enrichment_max_error_attempts(),
         error_window_days=photo_enrichment_error_window_days(),
+        # Time / GPS / nearby-calendar context so the agent can recognize
+        # "this photo was taken at <event>" from the rest of the warehouse.
+        context_builder=photo_enrichment_context,
     )
 
 
