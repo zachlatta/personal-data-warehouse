@@ -11,7 +11,9 @@ and re-checks every run — never an error.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -59,6 +61,46 @@ class ApplePhotosSchemaError(RuntimeError):
     pass
 
 
+PROBE_TIMEOUT_SECONDS = 15.0
+
+
+def _probe_openable(path: Path, timeout_seconds: float = PROBE_TIMEOUT_SECONDS) -> None:
+    """Fail fast when opening the Photos library would hang.
+
+    Unlike ~/Library/Messages (where a launchd process without Full Disk
+    Access gets an immediate EPERM), open(2) on the Photos-library files can
+    BLOCK indefinitely inside macOS TCC. A hung run holds the uploader lock
+    forever, never writes a heartbeat exit code, and reads as healthy — the
+    exact silent-failure mode the heartbeat work exists to prevent. Probe the
+    open in a daemon thread and convert a stall into the same loud
+    PermissionError the other uploaders raise.
+    """
+    outcome: list[BaseException | None] = []
+
+    def attempt() -> None:
+        try:
+            handle = os.open(path, os.O_RDONLY)
+            os.close(handle)
+            outcome.append(None)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below with guidance
+            outcome.append(exc)
+
+    thread = threading.Thread(target=attempt, name="photos-open-probe", daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if not outcome:
+        raise PermissionError(
+            f"Opening {path} blocked for {timeout_seconds:.0f}s — macOS TCC is stalling this "
+            "process. Grant Full Disk Access to the launching executable chain "
+            "(see the Apple Photos section of AGENTS.md) and retry."
+        )
+    if isinstance(outcome[0], BaseException):
+        raise PermissionError(
+            f"Could not open Apple Photos store at {path}. Grant Full Disk Access to the "
+            "launching executable chain and retry."
+        ) from outcome[0]
+
+
 @dataclass(frozen=True)
 class PhotoFileCandidate:
     """One uploadable file claim: an asset's original or its live-video sibling."""
@@ -94,6 +136,7 @@ def snapshot_photos_store(library_path: Path | str, destination_dir: Path | str)
     """Copy Photos.sqlite via the sqlite backup API (repo precedent: apple-messages)."""
     source_path = Path(library_path).expanduser() / "database" / "Photos.sqlite"
     destination = Path(destination_dir) / "Photos.sqlite"
+    _probe_openable(source_path)
     source_uri = source_path.resolve().as_uri() + "?mode=ro"
     try:
         source = sqlite3.connect(source_uri, uri=True)

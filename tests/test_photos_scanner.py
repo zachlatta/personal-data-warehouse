@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -139,6 +140,36 @@ def test_scanner_resolves_wall_clock_capture_and_camera(tmp_path):
     # Inferred tz offset is the fallback when the explicit one is absent... but
     # an explicit 0 wins (UTC is a real answer).
     assert missing.capture_tz_offset == "+00:00"
+
+
+def test_snapshot_fails_fast_when_open_blocks(tmp_path):
+    # macOS TCC can BLOCK open(2) on Photos-library files indefinitely for a
+    # launchd process without Full Disk Access; a hung run holds the uploader
+    # lock and looks healthy. A FIFO reproduces the blocking-open behavior:
+    # O_RDONLY on a writerless FIFO parks in the kernel exactly like the TCC
+    # stall, and the probe must convert it into a loud PermissionError.
+    import pytest
+
+    from personal_data_warehouse_photos.scanner import _probe_openable
+
+    fifo = tmp_path / "blocking-open"
+    os.mkfifo(fifo)
+    with pytest.raises(PermissionError, match="blocked for"):
+        _probe_openable(fifo, timeout_seconds=0.5)
+
+
+def test_snapshot_probe_errors_convert_to_permission_error(tmp_path):
+    import pytest
+
+    from personal_data_warehouse_photos.scanner import _probe_openable
+
+    # A readable file passes silently.
+    readable = tmp_path / "ok.sqlite"
+    readable.write_bytes(b"x")
+    _probe_openable(readable, timeout_seconds=2)
+    # A missing/denied file raises the same guidance the other uploaders give.
+    with pytest.raises(PermissionError, match="Full Disk Access"):
+        _probe_openable(tmp_path / "missing.sqlite", timeout_seconds=2)
 
 
 def test_scanner_orders_newest_first_and_fingerprints_disk_facts(tmp_path):
