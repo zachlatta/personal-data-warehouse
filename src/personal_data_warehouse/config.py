@@ -105,6 +105,7 @@ DEFAULT_PLAID_COUNTRY_CODES = ("US",)
 DEFAULT_PLAID_CLIENT_NAME = "Personal Data Warehouse"
 DEFAULT_PLAID_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_PLAID_TRANSACTIONS_LOOKBACK_DAYS = 730
+MAX_PLAID_TRANSACTIONS_LOOKBACK_DAYS = 730
 PLAID_ENVIRONMENTS = ("sandbox", "development", "production")
 PLAID_SUPPORTED_PRODUCTS = ("transactions", "investments", "liabilities")
 DEFAULT_ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com"
@@ -1446,6 +1447,10 @@ def load_settings(
         )
         if plaid_transactions_lookback_days < 1:
             raise ValueError("PLAID_TRANSACTIONS_LOOKBACK_DAYS must be at least 1")
+        if plaid_transactions_lookback_days > MAX_PLAID_TRANSACTIONS_LOOKBACK_DAYS:
+            raise ValueError(
+                f"PLAID_TRANSACTIONS_LOOKBACK_DAYS must be at most {MAX_PLAID_TRANSACTIONS_LOOKBACK_DAYS}"
+            )
         plaid = PlaidConfig(
             account=plaid_account,
             client_id=plaid_client_id,

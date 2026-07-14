@@ -55,6 +55,7 @@ def test_plaid_client_creates_link_token_with_read_only_products() -> None:
     assert request["json"]["client_id"] == "client-id"
     assert request["json"]["secret"] == "secret"
     assert request["json"]["products"] == ["transactions", "investments"]
+    assert request["json"]["transactions"] == {"days_requested": 730}
     assert request["json"]["country_codes"] == ["US"]
     client_user_id = request["json"]["user"]["client_user_id"]
     assert client_user_id.startswith("pdw-")

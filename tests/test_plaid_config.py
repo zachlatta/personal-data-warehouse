@@ -38,3 +38,17 @@ def test_load_settings_requires_plaid_credentials_for_finance(monkeypatch) -> No
         assert "PLAID_SECRET" in str(exc)
     else:
         raise AssertionError("missing Plaid credentials should fail fast")
+
+
+def test_load_settings_rejects_plaid_transaction_lookback_above_maximum(monkeypatch) -> None:
+    monkeypatch.setenv("PLAID_ACCOUNT", "user@example.com")
+    monkeypatch.setenv("PLAID_CLIENT_ID", "client-id")
+    monkeypatch.setenv("PLAID_SECRET", "secret")
+    monkeypatch.setenv("PLAID_TRANSACTIONS_LOOKBACK_DAYS", "731")
+
+    try:
+        load_settings(require_postgres=False, require_gmail=False, require_plaid=True)
+    except ValueError as exc:
+        assert "PLAID_TRANSACTIONS_LOOKBACK_DAYS must be at most 730" in str(exc)
+    else:
+        raise AssertionError("Plaid transaction lookback above the API maximum should fail fast")

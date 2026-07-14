@@ -469,6 +469,7 @@ PLAID_SECRET=...
 PLAID_ENV=production                 # sandbox, development, or production
 PLAID_PRODUCTS=transactions,investments,liabilities
 PLAID_COUNTRY_CODES=US
+PLAID_TRANSACTIONS_LOOKBACK_DAYS=730 # Plaid's maximum transaction history window
 PDW_QUERY_POSTGRES_ROLE=pdw_query      # NOLOGIN role assumed by user-authored SQL
 # PLAID_REDIRECT_URI=https://registered.example/plaid/oauth-return
 ```
@@ -489,6 +490,12 @@ redirects resume the same Link token via Plaid's `receivedRedirectUri`; configur
 `--host`/`--port` whose callback URL matches the redirect registered in the Plaid dashboard (or
 route the registered HTTPS URL to it). Never paste access/public tokens into logs, issues, or
 committed files. Repeat `link` for each personal institution, then sync all linked items:
+
+When Transactions is enabled, Link requests `PLAID_TRANSACTIONS_LOOKBACK_DAYS` of history. The
+setting defaults to Plaid's maximum of 730 days and also controls the Investments transaction
+query window. Plaid fixes the Transactions history grant when an Item is first initialized, so
+changing this setting cannot expand an existing Item: remove the old Item through Plaid and run
+the Link flow again. The institution may return less than the requested maximum.
 
 ```bash
 pdw ingest plaid sync

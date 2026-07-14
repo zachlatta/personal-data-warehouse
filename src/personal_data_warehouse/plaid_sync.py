@@ -65,6 +65,8 @@ class PlaidClient:
             "country_codes": list(self._config.country_codes),
             "language": self._config.language,
         }
+        if "transactions" in self._config.products:
+            payload["transactions"] = {"days_requested": self._config.transactions_lookback_days}
         if self._config.redirect_uri:
             payload["redirect_uri"] = self._config.redirect_uri
         if self._config.webhook:
