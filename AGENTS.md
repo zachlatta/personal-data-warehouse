@@ -4,6 +4,7 @@ Development practices:
 
 * We use TDD for this repo and follow good code practices
 * When asked to refactor or change existing code flows, please plan to completely replace the old legacy flow with the new requested flow - including ripping out any and all legacy code
+* When querying the database, you can use the pdw CLI
 
 ## Commit and Push Safety
 
