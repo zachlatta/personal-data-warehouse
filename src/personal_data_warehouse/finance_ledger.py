@@ -806,8 +806,17 @@ def has_pending_finance_observations(warehouse: PostgresWarehouse) -> bool:
 
 
 def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:
-    """Collapse a document's valuation entries to one value per day: an entry
-    described as a total wins; otherwise the parts sum."""
+    """Collapse a document's valuation entries to one value per day.
+
+    An entry described as a total wins (a fund export listing every entity
+    plus a totals row). Otherwise the FIRST entry of the day wins: valuation
+    documents usually restate the same asset several ways (point estimate,
+    low/high bounds, rental estimates, assessed-value variants) with the
+    primary figure listed first, and summing alternative measures of one
+    asset inflates it catastrophically. A parts-only multi-entity document
+    without a totals row undercounts to its first position — a visible,
+    benign failure the extraction's totals coverage makes rare.
+    """
     by_day: dict[date, dict[str, Any]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
@@ -816,13 +825,12 @@ def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:
         value = _parse_money(str(entry.get("value", "")))
         if as_of is None or value is None:
             continue
-        day = by_day.setdefault(as_of, {"sum": Decimal(0), "total": None})
-        day["sum"] += value
+        day = by_day.setdefault(as_of, {"first": value, "total": None})
         is_total = "total" in str(entry.get("description", "")).lower()
         if is_total and day["total"] is None:
             day["total"] = value
     return [
-        (as_of, day["total"] if day["total"] is not None else day["sum"])
+        (as_of, day["total"] if day["total"] is not None else day["first"])
         for as_of, day in sorted(by_day.items())
     ]
 

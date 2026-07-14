@@ -533,7 +533,7 @@ def test_mortgage_statement_founds_account_and_principal_observations(warehouse)
     assert total == [(Decimal("123.45") - Decimal("412345.67"),)]
 
 
-def test_multi_entity_valuation_doc_prefers_total_else_sums(warehouse):
+def test_multi_entity_valuation_doc_prefers_total_else_first(warehouse):
     warehouse.ensure_plaid_tables()
     _seed_document(
         warehouse,
@@ -555,9 +555,13 @@ def test_multi_entity_valuation_doc_prefers_total_else_sums(warehouse):
                 {"date": "2026-04-11", "value": "6561.81", "description": "Fund I — NAV"},
                 {"date": "2026-04-11", "value": "4993.98", "description": "SPV B — NAV"},
                 {"date": "2026-04-11", "value": "16797.38", "description": "Totals — NAV"},
-                # A parts-only day sums.
-                {"date": "2026-05-11", "value": "10.00", "description": "SPV A — NAV"},
-                {"date": "2026-05-11", "value": "20.00", "description": "SPV B — NAV"},
+                # A same-day set WITHOUT a totals row restates one asset
+                # (estimate + low/high bounds + rental): the primary figure is
+                # listed first and alternatives must never sum.
+                {"date": "2026-05-11", "value": "468000", "description": "Estimate"},
+                {"date": "2026-05-11", "value": "445000", "description": "Estimated sale price — low"},
+                {"date": "2026-05-11", "value": "539000", "description": "Estimated sale price — high"},
+                {"date": "2026-05-11", "value": "1905", "description": "Rental estimate per month"},
             ],
         ),
     )
@@ -567,7 +571,7 @@ def test_multi_entity_valuation_doc_prefers_total_else_sums(warehouse):
     )
     assert rows == [
         (date(2026, 4, 11), Decimal("16797.38")),
-        (date(2026, 5, 11), Decimal("30.00")),
+        (date(2026, 5, 11), Decimal("468000")),
     ]
 
 
