@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import argparse
+import base64
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -12,6 +13,8 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import threading
+import time
 import uuid
 from typing import Any
 
@@ -28,6 +31,18 @@ DEFAULT_AGENT_TOOLS_DIR_NAME = "tools"
 DEFAULT_AGENT_INPUTS_DIR_NAME = "inputs"
 DEFAULT_AGENT_TOOL_MANIFEST_NAME = "TOOLS.md"
 DEFAULT_AGENT_MEMORY = "4g"
+
+# AGENT_AUTH_LOCK_MODE governs how agent runs share the provider credential:
+# "exclusive" (default) keeps the historical one-run-at-a-time behavior;
+# "auto" lets runs overlap (shared flock) while the codex access token is
+# comfortably far from expiry, going exclusive within the refresh margin so
+# a token refresh (which rotates the refresh token) never races.
+AGENT_AUTH_LOCK_MODE_ENV = "AGENT_AUTH_LOCK_MODE"
+AGENT_AUTH_REFRESH_MARGIN_SECONDS_ENV = "AGENT_AUTH_REFRESH_MARGIN_SECONDS"
+DEFAULT_AGENT_AUTH_REFRESH_MARGIN_SECONDS = 90 * 60
+_AUTH_EXP_CACHE_TTL_SECONDS = 600
+_AUTH_EXP_CACHE: dict[tuple[str, str], tuple[float | None, float]] = {}
+_AUTH_EXP_CACHE_LOCK = threading.Lock()
 DEFAULT_AGENT_CPUS = "2"
 DEFAULT_AGENT_PIDS_LIMIT = 512
 DEFAULT_AGENT_NETWORK = "bridge"
@@ -199,7 +214,7 @@ class ContainerAgentRunner:
         events: list[AgentRunEvent] = []
         error = ""
         exit_code = 0
-        with provider_auth_lock(provider):
+        with provider_auth_lock(provider, exclusive=self._auth_lock_must_be_exclusive(provider)):
             try:
                 completed = self._runner(
                     command,
@@ -248,6 +263,61 @@ class ContainerAgentRunner:
             completed_at=completed_at,
             events=events,
         )
+
+    def _auth_lock_must_be_exclusive(self, provider: str) -> bool:
+        mode = (os.getenv(AGENT_AUTH_LOCK_MODE_ENV) or "exclusive").strip().lower()
+        if mode != "auto":
+            return True
+        if provider != "codex":
+            # Only codex's auth expiry is understood; other providers keep the
+            # historical one-run-at-a-time behavior.
+            return True
+        exp = self._shared_auth_token_exp(provider)
+        if exp is None:
+            return True
+        margin = int(
+            os.getenv(AGENT_AUTH_REFRESH_MARGIN_SECONDS_ENV)
+            or DEFAULT_AGENT_AUTH_REFRESH_MARGIN_SECONDS
+        )
+        return time.time() >= exp - margin
+
+    def _shared_auth_token_exp(self, provider: str) -> float | None:
+        key = (self._config.auth_volume, provider)
+        now = time.time()
+        with _AUTH_EXP_CACHE_LOCK:
+            cached = _AUTH_EXP_CACHE.get(key)
+            if cached and now - cached[1] < _AUTH_EXP_CACHE_TTL_SECONDS:
+                return cached[0]
+        exp = self._read_codex_auth_exp()
+        with _AUTH_EXP_CACHE_LOCK:
+            _AUTH_EXP_CACHE[key] = (exp, now)
+        return exp
+
+    def _read_codex_auth_exp(self) -> float | None:
+        """Access-token expiry from the shared auth volume, via a helper
+        container (the volume is not mounted into this process)."""
+        command = [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "cat",
+            "--mount",
+            f"type=volume,src={self._config.auth_volume},dst=/agent-auth,readonly",
+            self._config.image,
+            "/agent-auth/codex/auth.json",
+        ]
+        try:
+            completed = self._runner(command, capture_output=True, text=True, timeout=60, check=False)
+            if int(getattr(completed, "returncode", 1)) != 0:
+                return None
+            payload = json.loads(completed.stdout or "")
+            tokens = payload.get("tokens") or {}
+            return jwt_expiry_epoch(str(tokens.get("access_token") or ""))
+        except Exception:  # noqa: BLE001 - unknown expiry falls back to exclusive
+            return None
 
     def run_with_warehouse(
         self,
@@ -906,13 +976,35 @@ if __name__ == "__main__":
 """
 
 
+def jwt_expiry_epoch(token: str) -> float | None:
+    """The `exp` claim of a JWT, without signature verification."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+        exp = claims.get("exp")
+        return float(exp) if exp else None
+    except Exception:  # noqa: BLE001 - malformed token means unknown expiry
+        return None
+
+
 @contextmanager
-def provider_auth_lock(provider: str):
+def provider_auth_lock(provider: str, *, exclusive: bool = True):
+    """Serialize provider auth across agent containers.
+
+    Runs normally hold the lock SHARED (they only read the provider's
+    credential, so they may overlap); a run that might trigger a token
+    refresh takes it EXCLUSIVE and executes alone — ChatGPT-mode codex
+    rotates refresh tokens, so two containers refreshing concurrently can
+    invalidate the shared credential and force a manual re-login.
+    """
     lock_path = Path(os.getenv("AGENT_AUTH_LOCK_DIR", "/tmp")) / f"pdw-agent-{docker_safe_name(provider)}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("a+")
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         yield
     finally:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

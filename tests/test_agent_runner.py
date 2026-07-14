@@ -742,3 +742,70 @@ def test_agent_resource_disabled_fails_with_clear_error() -> None:
         assert "AgentResource is not configured" in str(exc)
     else:
         raise AssertionError("disabled AgentResource should not build a container config")
+
+
+def test_jwt_expiry_epoch_parses_and_rejects() -> None:
+    from personal_data_warehouse.agent_runner import jwt_expiry_epoch
+    import base64 as b64
+
+    def jwt(claims: dict) -> str:
+        payload = b64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        return f"eyJhbGciOiJIUzI1NiJ9.{payload}.sig"
+
+    assert jwt_expiry_epoch(jwt({"exp": 1800000000})) == 1800000000.0
+    assert jwt_expiry_epoch(jwt({"sub": "x"})) is None
+    assert jwt_expiry_epoch("not-a-jwt") is None
+    assert jwt_expiry_epoch("") is None
+
+
+def test_provider_auth_lock_shared_holders_overlap(tmp_path, monkeypatch) -> None:
+    from personal_data_warehouse.agent_runner import provider_auth_lock
+
+    monkeypatch.setenv("AGENT_AUTH_LOCK_DIR", str(tmp_path))
+    entered = threading.Event()
+    release = threading.Event()
+    overlapped = threading.Event()
+
+    def hold_shared() -> None:
+        with provider_auth_lock("codex", exclusive=False):
+            entered.set()
+            release.wait(timeout=10)
+
+    holder = threading.Thread(target=hold_shared)
+    holder.start()
+    assert entered.wait(timeout=5)
+    # A second SHARED holder gets in while the first still holds the lock.
+    with provider_auth_lock("codex", exclusive=False):
+        overlapped.set()
+    assert overlapped.is_set()
+    release.set()
+    holder.join(timeout=5)
+
+
+def test_auth_lock_mode_auto_shares_far_from_expiry(tmp_path, monkeypatch) -> None:
+    from personal_data_warehouse import agent_runner as ar
+
+    config = AgentContainerConfig(image="img", provider="codex")
+    runner = ContainerAgentRunner(config)
+    monkeypatch.setattr(ar.ContainerAgentRunner, "_read_codex_auth_exp", lambda self: time.time() + 6 * 3600)
+    ar._AUTH_EXP_CACHE.clear()
+
+    # Default (exclusive) mode never shares.
+    monkeypatch.delenv("AGENT_AUTH_LOCK_MODE", raising=False)
+    assert runner._auth_lock_must_be_exclusive("codex") is True
+
+    monkeypatch.setenv("AGENT_AUTH_LOCK_MODE", "auto")
+    assert runner._auth_lock_must_be_exclusive("codex") is False
+    # Non-codex providers stay exclusive even in auto mode.
+    assert runner._auth_lock_must_be_exclusive("claude") is True
+
+    # Near expiry (inside the refresh margin) goes exclusive so the refresh
+    # runs alone.
+    monkeypatch.setattr(ar.ContainerAgentRunner, "_read_codex_auth_exp", lambda self: time.time() + 60)
+    ar._AUTH_EXP_CACHE.clear()
+    assert runner._auth_lock_must_be_exclusive("codex") is True
+
+    # Unknown expiry (helper failed) is treated as exclusive.
+    monkeypatch.setattr(ar.ContainerAgentRunner, "_read_codex_auth_exp", lambda self: None)
+    ar._AUTH_EXP_CACHE.clear()
+    assert runner._auth_lock_must_be_exclusive("codex") is True
