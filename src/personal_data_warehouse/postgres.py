@@ -156,6 +156,8 @@ CALENDAR_EVENT_OPERATIONS = (
     CALENDAR_DELETE_EVENT_OPERATION,
 )
 SEARCH_SCHEMA_REFRESH_LOCK_ID = 8_407_112_465
+# Serializes _ensure_query_role's shared GRANT/REVOKEs across processes.
+QUERY_ROLE_SETUP_LOCK_ID = 8_407_112_466
 
 
 @dataclass(frozen=True)
@@ -1493,6 +1495,22 @@ class PostgresWarehouse:
         self._ensure_plaid_finance_mart_views()
 
     def _ensure_query_role(self) -> None:
+        # Concurrent warehouse constructions (parallel extraction workers,
+        # simultaneous sensor ticks) race on these shared GRANT/REVOKEs and
+        # Postgres surfaces the collision as "tuple concurrently updated".
+        # Serialize the whole role setup across every process with a
+        # transaction-scoped advisory lock.
+        with self._connection.cursor() as cursor:
+            cursor.execute("BEGIN")
+            try:
+                cursor.execute("SELECT pg_advisory_xact_lock(%s)", (QUERY_ROLE_SETUP_LOCK_ID,))
+                self._ensure_query_role_locked()
+                cursor.execute("COMMIT")
+            except Exception:
+                cursor.execute("ROLLBACK")
+                raise
+
+    def _ensure_query_role_locked(self) -> None:
         role = _identifier(self._query_role)
         role_literal = self._query_role.replace("'", "''")
         self._raw_command(
