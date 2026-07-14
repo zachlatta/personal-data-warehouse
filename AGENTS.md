@@ -190,6 +190,14 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-d
 launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload
 ```
 
+The uploader only sees this Mac's local NoteStore, and macOS only pulls Notes iCloud changes
+while Notes.app is running — with the app quit, the store silently freezes and the uploader
+reports healthy `selected=0` runs while edits made on other devices never arrive. Each run
+therefore ensures Notes.app is running (launched hidden via `open -g -j -a Notes`; see
+`notes_app.py`). Set `APPLE_NOTES_OPEN_NOTES_APP=0` to disable. If apple_notes data looks
+stale despite healthy runs, check the `NoteStore.sqlite-wal` mtime — days old means iCloud
+delivery is stalled, not the uploader.
+
 If the run log shows `PermissionError` or SQLite `authorization denied` for
 `~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`, the LaunchAgent is loaded
 correctly but macOS Full Disk Access is blocking the background process. Grant Full Disk Access to

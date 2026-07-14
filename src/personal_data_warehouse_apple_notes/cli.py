@@ -14,6 +14,7 @@ from personal_data_warehouse_voice_memos.network import (
     is_transient_upload_error,
     preflight_app_ingest,
 )
+from personal_data_warehouse_apple_notes.notes_app import ensure_notes_app_running
 from personal_data_warehouse_apple_notes.state import AppleNotesUploadState, default_state_file
 from personal_data_warehouse_apple_notes.sync import AppleNotesUploadRunner
 
@@ -72,6 +73,7 @@ def main() -> None:
         raise RuntimeError("Apple Notes sync is not configured")
 
     logger = CliLogger()
+    ensure_notes_app_running(settings.apple_notes.store_path, logger)
     state = AppleNotesUploadState.load(
         args.state_file,
         account=settings.apple_notes.account,
