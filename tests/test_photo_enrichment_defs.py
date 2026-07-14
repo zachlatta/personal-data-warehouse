@@ -118,6 +118,61 @@ def test_photo_enrichment_max_error_attempts_env(monkeypatch) -> None:
     assert photo_enrichment_max_error_attempts() == 9
 
 
+def test_photo_agent_config_override(monkeypatch) -> None:
+    import dataclasses
+
+    from personal_data_warehouse.config import AgentConfig
+    from personal_data_warehouse.defs.photo_enrichment import photo_agent_config
+
+    base = AgentConfig(provider="codex", model="gpt-5.6-sol", docker_image="img")
+    monkeypatch.delenv("PHOTO_ENRICHMENT_MODEL", raising=False)
+    monkeypatch.delenv("PHOTO_ENRICHMENT_REASONING_EFFORT", raising=False)
+    # Unset: the exact fleet config object comes back (shared resource reused).
+    assert photo_agent_config(base) is base
+
+    monkeypatch.setenv("PHOTO_ENRICHMENT_MODEL", "gpt-5.6-luna")
+    monkeypatch.setenv("PHOTO_ENRICHMENT_REASONING_EFFORT", "xhigh")
+    overridden = photo_agent_config(base)
+    assert overridden.model == "gpt-5.6-luna"
+    assert overridden.reasoning_effort == "xhigh"
+    # Everything else inherits the fleet config.
+    assert dataclasses.replace(overridden, model=base.model, reasoning_effort=base.reasoning_effort) == base
+
+
+def test_photo_enrichment_runner_applies_model_override(monkeypatch) -> None:
+    import personal_data_warehouse.defs.photo_enrichment as defs_module
+    from personal_data_warehouse.config import AgentConfig
+
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(defs_module, "FileAttachmentEnrichmentRunner", FakeRunner)
+    monkeypatch.setattr(
+        defs_module, "photo_object_store_factory", lambda *, settings: (lambda _account: object())
+    )
+    monkeypatch.setenv("PHOTO_ENRICHMENT_MODEL", "gpt-5.6-luna")
+    monkeypatch.setenv("PHOTO_ENRICHMENT_REASONING_EFFORT", "xhigh")
+
+    class Settings:
+        agent = AgentConfig(provider="codex", model="gpt-5.6-sol", docker_image="img")
+
+    class SharedFleetAgent:
+        is_configured = True
+        model = "gpt-5.6-sol"
+
+    defs_module.photo_enrichment_runner(
+        settings=Settings(), warehouse=object(), logger=object(), agent=SharedFleetAgent()
+    )
+    # The shared fleet resource (sol) must NOT be reused when the override is
+    # set, and the recorded ai_model must be the override.
+    assert captured["model"] == "gpt-5.6-luna"
+    assert captured["agent"].model == "gpt-5.6-luna"
+    assert captured["agent"].reasoning_effort == "xhigh"
+
+
 def test_photo_enrichment_backlog_sensor_skips_when_backlog_is_empty(monkeypatch) -> None:
     calls = []
     warehouse = FakeWarehouse()

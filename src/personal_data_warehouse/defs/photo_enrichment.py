@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 
 from dagster import (
@@ -40,7 +41,27 @@ PHOTO_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 120
 PHOTO_ENRICHMENT_BATCH_SIZE_ENV = "PHOTO_ENRICHMENT_BATCH_SIZE"
 PHOTO_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV = "PHOTO_ENRICHMENT_MAX_ERROR_ATTEMPTS"
 PHOTO_ENRICHMENT_ERROR_WINDOW_DAYS_ENV = "PHOTO_ENRICHMENT_ERROR_WINDOW_DAYS"
+# Photos-only model/effort override. Captioning 11k photos does not need the
+# fleet default (gpt-5.6-sol, which also serves Gmail/WhatsApp/iMessage
+# enrichment): the 2026-07-14 benchmark (scripts/photo_caption_benchmark.py)
+# showed gpt-5.6-luna:xhigh matches sol's grounding and text reading with
+# zero overreach at a quarter of the cost. Unset = fleet default.
+PHOTO_ENRICHMENT_MODEL_ENV = "PHOTO_ENRICHMENT_MODEL"
+PHOTO_ENRICHMENT_EFFORT_ENV = "PHOTO_ENRICHMENT_REASONING_EFFORT"
 PHOTO_TEXT_MAX_CHARS = 20_000
+
+
+def photo_agent_config(base):
+    """The fleet AgentConfig with the photos-only model/effort override applied."""
+    model = os.getenv(PHOTO_ENRICHMENT_MODEL_ENV, "").strip()
+    effort = os.getenv(PHOTO_ENRICHMENT_EFFORT_ENV, "").strip()
+    if not model and not effort:
+        return base
+    return dataclasses.replace(
+        base,
+        model=model or base.model,
+        reasoning_effort=effort or base.reasoning_effort,
+    )
 
 
 @asset(
@@ -148,15 +169,24 @@ def photo_enrichment_runner(
 ) -> FileAttachmentEnrichmentRunner:
     if settings.agent is None:
         raise RuntimeError("Agent runner is not configured")
-    agent_resource = agent if agent is not None and agent.is_configured else AgentResource.from_config(settings.agent)
+    config = photo_agent_config(settings.agent)
+    if config is settings.agent and agent is not None and agent.is_configured:
+        # No override: reuse the shared fleet resource as before.
+        agent_resource = agent
+    else:
+        # Override set (or no shared resource): build a photos-specific
+        # resource — the injected fleet resource carries the fleet model, so
+        # it cannot be reused here.
+        agent_resource = AgentResource.from_config(config)
     return FileAttachmentEnrichmentRunner(
         source=PHOTOS_SOURCE,
         warehouse=warehouse,
         agent=agent_resource,
         object_store_factory=photo_object_store_factory(settings=settings),
         logger=logger,
-        provider=settings.agent.provider,
-        model=settings.agent.model,
+        provider=config.provider,
+        # Recorded as ai_model on enrichment rows — must match what runs.
+        model=config.model,
         text_max_chars=PHOTO_TEXT_MAX_CHARS,
         max_error_attempts=photo_enrichment_max_error_attempts(),
         error_window_days=photo_enrichment_error_window_days(),
