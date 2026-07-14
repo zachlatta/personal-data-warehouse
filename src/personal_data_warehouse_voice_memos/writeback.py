@@ -45,6 +45,13 @@ class LocalRecordingTitle:
     recording_id: str
     title: str
     flags: int
+    filename: str = ""
+
+
+@dataclass(frozen=True)
+class EnrichedTitles:
+    by_recording_id: dict[str, str]
+    by_content_sha256: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -108,9 +115,35 @@ def load_local_recording_titles(recordings_path: Path | str) -> list[LocalRecord
                 recording_id=filename.rsplit(".", 1)[0],
                 title=str(title or ""),
                 flags=int(flags or 0),
+                filename=filename,
             )
         )
     return titles
+
+
+def resolve_effective_titles(
+    local: Sequence[LocalRecordingTitle],
+    titles: EnrichedTitles,
+    sha_by_filename: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Map each local recording's stem to its enriched title.
+
+    Stems normally match `enrichments.recording_id` directly, but Voice Memos
+    rebases filename timestamps when the timezone changes, leaving the
+    warehouse knowing a memo only under an older stem. The audio content sha
+    (cached per filename in the uploader's state) still identifies it, so it
+    serves as the fallback join key.
+    """
+    effective: dict[str, str] = {}
+    for recording in local:
+        title = titles.by_recording_id.get(recording.recording_id)
+        if title is None and sha_by_filename:
+            sha = sha_by_filename.get(recording.filename)
+            if sha:
+                title = titles.by_content_sha256.get(sha)
+        if title is not None:
+            effective[recording.recording_id] = title
+    return effective
 
 
 def build_rename_plan(
@@ -149,15 +182,16 @@ def fetch_enriched_titles(
     client_name: str = "pdw",
     session: requests.Session | None = None,
     timeout: float = 30.0,
-) -> dict[str, str]:
+) -> EnrichedTitles:
     """Fetch the newest completed enrichment title per recording from the app.
 
     Uses the same static-bearer HTTP tool API the pdw CLI's `sql` command
-    uses, so no new server surface is involved.
+    uses, so no new server surface is involved. Titles come back keyed by
+    recording_id and by audio content sha (the drift-proof identity).
     """
     escaped_account = account.replace("'", "''")
     sql = (
-        "SELECT DISTINCT ON (recording_id) recording_id, title "
+        "SELECT DISTINCT ON (recording_id) recording_id, content_sha256, title "
         "FROM apple_voice_memos.enrichments "
         "WHERE status = 'completed' AND title IS NOT NULL "
         f"AND account = '{escaped_account}' "
@@ -181,7 +215,8 @@ def fetch_enriched_titles(
     error = data.get("error")
     if error:
         raise RuntimeError(f"enriched title query failed: {error}")
-    titles: dict[str, str] = {}
+    by_recording_id: dict[str, str] = {}
+    by_content_sha256: dict[str, str] = {}
     for line in (data.get("rows") or "").splitlines():
         line = line.strip()
         if not line:
@@ -189,9 +224,13 @@ def fetch_enriched_titles(
         row = json.loads(line)
         recording_id = row.get("recording_id")
         title = row.get("title")
-        if recording_id and title:
-            titles[str(recording_id)] = str(title)
-    return titles
+        if not recording_id or not title:
+            continue
+        by_recording_id[str(recording_id)] = str(title)
+        sha = row.get("content_sha256")
+        if sha:
+            by_content_sha256.setdefault(str(sha), str(title))
+    return EnrichedTitles(by_recording_id=by_recording_id, by_content_sha256=by_content_sha256)
 
 
 def _default_writer(store_path, items, *, author, dry_run=False):
@@ -214,6 +253,7 @@ class VoiceMemosWritebackRunner:
         session: requests.Session | None = None,
         limit: int | None = None,
         dry_run: bool = False,
+        sha_by_filename: Mapping[str, str] | None = None,
     ) -> None:
         self._recordings_path = Path(recordings_path).expanduser()
         self._account = account
@@ -225,6 +265,7 @@ class VoiceMemosWritebackRunner:
         self._session = session
         self._limit = limit
         self._dry_run = dry_run
+        self._sha_by_filename = sha_by_filename
 
     def run(self) -> WritebackSummary:
         local = load_local_recording_titles(self._recordings_path)
@@ -237,16 +278,18 @@ class VoiceMemosWritebackRunner:
         if not auto_named:
             return self._summary(local=local, auto_named=auto_named, enriched_titles={}, plan=[], results=[])
 
-        enriched_titles = fetch_enriched_titles(
+        titles = fetch_enriched_titles(
             base_url=self._base_url,
             secret_token=self._secret_token,
             account=self._account,
             client_name=self._client_name,
             session=self._session,
         )
+        enriched_titles = resolve_effective_titles(local, titles, self._sha_by_filename)
         plan = build_rename_plan(local, enriched_titles, limit=self._limit)
         self._logger.info(
-            "Voice Memos write-back: %s enriched titles available, %s renames planned",
+            "Voice Memos write-back: %s enriched titles available (%s matched locally), %s renames planned",
+            len(titles.by_recording_id),
             len(enriched_titles),
             len(plan),
         )

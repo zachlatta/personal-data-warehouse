@@ -127,6 +127,7 @@ def main() -> None:
                     logger=logger,
                     dry_run=args.writeback_dry_run,
                     limit=args.writeback_limit or None,
+                    upload_state=state,
                 )
     except Exception as exc:
         if is_transient_exception(exc):
@@ -162,7 +163,7 @@ def writeback_enabled_from_env(getenv=os.getenv) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
-def run_writeback(*, settings, logger, dry_run: bool, limit: int | None):
+def run_writeback(*, settings, logger, dry_run: bool, limit: int | None, upload_state=None):
     base_url = (os.getenv("PDW_API_URL") or os.getenv("MCP_BASE_URL") or "").strip()
     secret_token = (os.getenv("PDW_SECRET_TOKEN") or os.getenv("MCP_SECRET_TOKEN") or "").strip()
     if not base_url or not secret_token:
@@ -170,6 +171,15 @@ def run_writeback(*, settings, logger, dry_run: bool, limit: int | None):
             "Voice Memos write-back requires PDW_API_URL and PDW_SECRET_TOKEN (or their MCP_* aliases)"
         )
     client_name = (os.getenv("PDW_CLIENT_NAME") or "").strip() or "pdw"
+    # The uploader's state caches each filename's audio sha; the write-back
+    # uses it to re-identify memos whose filenames drifted (timezone rebases).
+    sha_by_filename = None
+    if upload_state is not None:
+        sha_by_filename = {
+            filename: entry.content_sha256
+            for filename, entry in upload_state.entries.items()
+            if entry.content_sha256
+        }
     return VoiceMemosWritebackRunner(
         recordings_path=settings.voice_memos.recordings_path,
         account=settings.voice_memos.account,
@@ -179,6 +189,7 @@ def run_writeback(*, settings, logger, dry_run: bool, limit: int | None):
         logger=logger,
         limit=limit,
         dry_run=dry_run,
+        sha_by_filename=sha_by_filename,
     ).run()
 
 
