@@ -1751,6 +1751,8 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "finance_accounts": _entity("logical account/asset/liability dimension"),
     "finance_account_links": _state("source-account → ledger-account resolution audit"),
     "finance_observations": _entity("append-only balance/valuation history; excluded from the general timeline"),
+    "finance_transactions": _entity("unified deduped transaction ledger; excluded from the general timeline"),
+    "finance_transaction_links": _state("source-row → ledger-transaction resolution audit"),
     # Manually uploaded finance documents: finance query surface, not
     # activity (the upload moment is not a life event).
     "manual_finance_documents": _entity("uploaded financial document inventory"),

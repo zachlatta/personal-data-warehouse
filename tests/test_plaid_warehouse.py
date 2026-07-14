@@ -91,12 +91,16 @@ def test_ensure_plaid_tables_creates_raw_private_and_finance_mart_views(warehous
         assert _relation_exists(warehouse, logical_name), logical_name
 
     for view_name in (
-        "finance_accounts",
-        "finance_transactions",
         "finance_investment_holdings",
         "finance_investment_transactions",
         "finance_liabilities",
     ):
+        assert _view_exists(warehouse, "marts", view_name), view_name
+
+    # marts.finance_accounts / marts.finance_transactions are ledger views
+    # owned by ensure_finance_tables now (they read finance.*, not plaid.*).
+    warehouse.ensure_finance_tables()
+    for view_name in ("finance_accounts", "finance_transactions"):
         assert _view_exists(warehouse, "marts", view_name), view_name
 
 

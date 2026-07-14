@@ -172,6 +172,8 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("finance_accounts", "finance", "accounts"),
     ("finance_account_links", "finance", "account_links"),
     ("finance_observations", "finance", "observations"),
+    ("finance_transactions", "finance", "transactions"),
+    ("finance_transaction_links", "finance", "transaction_links"),
     ("file_attachment_enrichments", "enrichment", "file_attachment_enrichments"),
     ("agent_runs", "ai_processing", "agent_runs"),
     ("agent_run_events", "ai_processing", "agent_run_events"),

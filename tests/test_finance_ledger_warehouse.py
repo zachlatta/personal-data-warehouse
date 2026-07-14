@@ -172,6 +172,61 @@ def test_finance_money_is_numeric_and_days_are_dates(warehouse):
     assert types["value"] == "numeric"
     assert types["as_of"] == "date"
     assert types["observed_at"] == "timestamp with time zone"
+    rows = warehouse._query(
+        """
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = 'transactions'
+        """,
+        (warehouse.physical_schema_name("finance"),),
+    )
+    assert dict(rows)["amount"] == "numeric"
+
+
+def test_finance_transactions_mart_reads_the_ledger(warehouse):
+    from datetime import datetime as dt
+
+    warehouse.ensure_finance_tables()
+    warehouse.insert_finance_accounts([_account_row()])
+    warehouse.insert_finance_transactions(
+        [
+            {
+                "transaction_id": "ft_1",
+                "account_id": "fa_1",
+                "posted_at": _TS,
+                "amount": Decimal("-4.50"),
+                "currency": "USD",
+                "description": "COFFEE SHOP",
+                "merchant": "Coffee Shop",
+                "pending": 0,
+                "source": "plaid",
+                "created_at": _TS,
+                "sync_version": 1,
+            }
+        ]
+    )
+    marts = warehouse.physical_schema_name("marts")
+    rows = warehouse._query(
+        f'SELECT transaction_id, account_name, institution, amount, source FROM "{marts}".finance_transactions'
+    )
+    assert rows == [("ft_1", "Checking ...0001", "Acme Bank", Decimal("-4.50"), "plaid")]
+
+
+def test_finance_accounts_mart_carries_latest_observation(warehouse):
+    warehouse.ensure_finance_tables()
+    warehouse.insert_finance_accounts([_account_row()])
+    marts = warehouse.physical_schema_name("marts")
+    # Accounts without observations still appear (latest_value NULL).
+    rows = warehouse._query(f'SELECT account_id, latest_value FROM "{marts}".finance_accounts')
+    assert rows == [("fa_1", None)]
+    warehouse.insert_finance_observations(
+        [
+            _observation_row(value=Decimal("100.00")),
+            _observation_row(as_of=date(2026, 6, 1), value=Decimal("999.99")),
+        ]
+    )
+    rows = warehouse._query(f'SELECT latest_value, latest_as_of FROM "{marts}".finance_accounts')
+    assert rows == [(Decimal("100.00"), date(2026, 7, 1))]
 
 
 def test_observation_upsert_is_idempotent_per_account_day(warehouse):

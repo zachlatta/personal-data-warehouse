@@ -39,6 +39,8 @@ from personal_data_warehouse.schema import (
     FINANCE_ACCOUNT_COLUMNS,
     FINANCE_ACCOUNT_LINK_COLUMNS,
     FINANCE_OBSERVATION_COLUMNS,
+    FINANCE_TRANSACTION_COLUMNS,
+    FINANCE_TRANSACTION_LINK_COLUMNS,
     MANUAL_FINANCE_DOCUMENT_COLUMNS,
     MANUAL_FINANCE_EXTRACTION_COLUMNS,
     PLAID_ACCOUNT_COLUMNS,
@@ -234,6 +236,11 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         FINANCE_OBSERVATION_COLUMNS,
         ("account_id", "as_of", "kind", "source"),
     ),
+    "finance_transactions": TableSpec(FINANCE_TRANSACTION_COLUMNS, ("transaction_id",)),
+    "finance_transaction_links": TableSpec(
+        FINANCE_TRANSACTION_LINK_COLUMNS,
+        ("source", "source_row_key"),
+    ),
     # Manually uploaded finance documents + their structured extractions.
     "manual_finance_documents": TableSpec(
         MANUAL_FINANCE_DOCUMENT_COLUMNS,
@@ -417,6 +424,12 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
 }
 
 POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
+    IndexSpec(
+        "finance_transactions_account_time_idx",
+        "finance_transactions",
+        "CREATE INDEX IF NOT EXISTS finance_transactions_account_time_idx "
+        "ON finance_transactions (account_id, posted_at DESC)",
+    ),
     IndexSpec(
         "gmail_messages_thread_idx",
         "gmail_messages",
@@ -1036,6 +1049,7 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
 # check runs first in _postgres_type/_default_sql.
 NUMERIC_COLUMNS_BY_TABLE = {
     "finance_observations": {"value"},
+    "finance_transactions": {"amount"},
     "manual_finance_extractions": {"closing_balance"},
 }
 
@@ -1510,50 +1524,12 @@ class PostgresWarehouse:
             self._raw_command(f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT EXECUTE ON FUNCTIONS TO {role}")
 
     def _ensure_plaid_finance_mart_views(self) -> None:
+        # marts.finance_accounts / marts.finance_transactions are ledger views
+        # now (see _ensure_finance_ledger_mart_views); only the plaid-specific
+        # investment/liability passthroughs remain here.
         plaid = _identifier(self.physical_schema_name("plaid"))
         marts = _identifier(self.physical_schema_name("marts"))
         view_sql = [
-            f"""
-            CREATE OR REPLACE VIEW {marts}.finance_accounts AS
-            SELECT
-                account,
-                item_id,
-                account_id,
-                name,
-                official_name,
-                mask,
-                type,
-                subtype,
-                available_balance,
-                current_balance,
-                limit_balance,
-                iso_currency_code,
-                unofficial_currency_code,
-                synced_at
-            FROM {plaid}.accounts
-            WHERE is_removed = 0
-            """,
-            f"""
-            CREATE OR REPLACE VIEW {marts}.finance_transactions AS
-            SELECT
-                account,
-                item_id,
-                account_id,
-                transaction_id,
-                posted_at,
-                authorized_at,
-                name,
-                merchant_name,
-                amount,
-                iso_currency_code,
-                unofficial_currency_code,
-                category_json,
-                payment_channel,
-                pending,
-                synced_at
-            FROM {plaid}.transactions
-            WHERE is_removed = 0
-            """,
             f"""
             CREATE OR REPLACE VIEW {marts}.finance_investment_holdings AS
             SELECT
@@ -1632,6 +1608,8 @@ class PostgresWarehouse:
                 "finance_accounts",
                 "finance_account_links",
                 "finance_observations",
+                "finance_transactions",
+                "finance_transaction_links",
             ]
         )
         self._ensure_finance_ledger_mart_views()
@@ -1703,6 +1681,64 @@ class PostgresWarehouse:
             FROM account_days
             WHERE value IS NOT NULL
             GROUP BY day
+            """,
+        )
+        # The ledger read surface REPLACES the old plaid passthrough views of
+        # the same names (different columns — _ensure_physical_view drops and
+        # recreates when CREATE OR REPLACE refuses).
+        self._ensure_physical_view(
+            f"{marts}.finance_accounts",
+            f"""
+            CREATE OR REPLACE VIEW {marts}.finance_accounts AS
+            SELECT
+                a.account_id,
+                a.account,
+                a.name,
+                a.kind,
+                a.side,
+                a.currency,
+                a.institution,
+                a.mask,
+                o.value AS latest_value,
+                o.as_of AS latest_as_of,
+                o.kind AS latest_observation_kind,
+                o.source AS latest_observation_source,
+                a.created_at,
+                a.updated_at
+            FROM {finance}.accounts AS a
+            LEFT JOIN LATERAL (
+                SELECT o.kind, o.as_of, o.value, o.source
+                FROM {finance}.observations AS o
+                WHERE o.account_id = a.account_id
+                ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
+                LIMIT 1
+            ) AS o ON TRUE
+            """,
+        )
+        self._ensure_physical_view(
+            f"{marts}.finance_transactions",
+            f"""
+            CREATE OR REPLACE VIEW {marts}.finance_transactions AS
+            SELECT
+                t.transaction_id,
+                t.account_id,
+                a.account,
+                a.name AS account_name,
+                a.kind AS account_kind,
+                a.side,
+                a.institution,
+                a.mask,
+                t.posted_at,
+                -- Signed: positive = inflow to the account (Plaid's
+                -- positive-out amounts were negated at ledger ingest).
+                t.amount,
+                t.currency,
+                t.description,
+                t.merchant,
+                t.pending,
+                t.source
+            FROM {finance}.transactions AS t
+            JOIN {finance}.accounts AS a ON a.account_id = t.account_id
             """,
         )
 
@@ -5173,6 +5209,38 @@ class PostgresWarehouse:
 
     def insert_finance_observations(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("finance_observations", rows, FINANCE_OBSERVATION_COLUMNS)
+
+    def insert_finance_transactions(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("finance_transactions", rows, FINANCE_TRANSACTION_COLUMNS)
+
+    def insert_finance_transaction_links(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("finance_transaction_links", rows, FINANCE_TRANSACTION_LINK_COLUMNS)
+
+    def reconcile_finance_transactions(self, *, transaction_ids: list[str], link_keys: list[str]) -> int:
+        """Hard-delete ledger transactions/links absent from the desired set.
+
+        The ledger is derived state rebuilt from raw source rows each run
+        (e.g. a Plaid pending row tombstones once its posted row arrives, and
+        its ledger row must go with it). Raw rows are never touched.
+        Link keys are compared as ``source|source_row_key`` strings.
+        """
+        removed = self._query(
+            """
+            WITH removed_links AS (
+                DELETE FROM finance_transaction_links
+                WHERE (source || '|' || source_row_key) <> ALL(%s)
+                RETURNING 1
+            ),
+            removed_transactions AS (
+                DELETE FROM finance_transactions
+                WHERE transaction_id <> ALL(%s)
+                RETURNING 1
+            )
+            SELECT (SELECT count(*) FROM removed_links) + (SELECT count(*) FROM removed_transactions)
+            """,
+            (link_keys, transaction_ids),
+        )
+        return int(removed[0][0]) if removed else 0
 
     def insert_manual_finance_documents(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("manual_finance_documents", rows, MANUAL_FINANCE_DOCUMENT_COLUMNS)

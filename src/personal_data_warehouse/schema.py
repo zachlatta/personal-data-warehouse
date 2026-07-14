@@ -804,6 +804,41 @@ FINANCE_OBSERVATION_COLUMNS = (
     "sync_version",
 )
 
+# Unified deduped flow ledger (finance.transactions): one row per real-world
+# money movement, resolved across sources (a Plaid transaction and the same
+# transaction on an uploaded statement merge into one row; every source row
+# gets a finance.transaction_links audit row). Amounts are signed NUMERIC,
+# positive = inflow to the account (Plaid's positive-out amounts are negated
+# at ingest). Facts only — categorization is a future enrichment layer. The
+# ledger build reconciles this table to the current source rows each run and
+# is fully replayable (deterministic ft_<sha> ids from the founding row).
+FINANCE_TRANSACTION_COLUMNS = (
+    "transaction_id",
+    "account_id",
+    "posted_at",
+    "amount",
+    "currency",
+    "description",
+    "merchant",
+    "pending",
+    "source",
+    "created_at",
+    "sync_version",
+)
+
+# Source-row → ledger-transaction resolution audit (finance.transaction_links):
+# one row per source transaction row, recording which ledger row it resolved
+# into and why (source_id / pending_id / fuzzy_amount_date / new).
+FINANCE_TRANSACTION_LINK_COLUMNS = (
+    "source",
+    "source_row_key",
+    "transaction_id",
+    "match_method",
+    "match_score",
+    "created_at",
+    "sync_version",
+)
+
 # manual_finance: manually uploaded finance documents (bank/mortgage
 # statements, Zillow screenshots, fund position docs, CSV/OFX exports). One
 # row per uploaded document; `source` is 'manual', the native id is the

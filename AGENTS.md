@@ -788,9 +788,23 @@ enrichment layer.
   money, DATE days). The `finance_ledger` asset (schedule `7,37 * * * *`, after each `*/30` Plaid
   sync) snapshots every live Plaid account's balance daily — Plaid itself only keeps
   current-state, so this table IS the balance history.
+- `finance.transactions` — the unified deduped flow ledger (+
+  `finance.transaction_links` audit): one row per real-world money movement across Plaid and
+  uploaded statements. Amounts are signed NUMERIC, **positive = inflow to the account** (Plaid's
+  positive-out is negated at ingest; document rows carry explicit in/out). Cross-source dedup at
+  the Plaid/statement overlap seam: same account + exact amount + dates within ±3 days merge
+  (Plaid wins field precedence; `match_method` records source_id/pending_id/fuzzy_amount_date).
+  Pending Plaid rows merge into their posted successor via `pending_transaction_id`; the
+  transactions table is reconciled to current source rows every run (derived state — raw rows
+  never touched). Statement balances become `balance` observations (`principal` on mortgage
+  accounts); valuation docs (Zillow screenshots, fund positions) become `valuation` observations
+  and found property/vehicle/private_fund accounts.
 - Net worth: `marts.finance_net_worth` (latest observation per account, signed by side; net worth
   = `SUM(signed_value)`) and `marts.finance_net_worth_history` (forward-filled daily
-  assets/liabilities/net series).
+  assets/liabilities/net series). `marts.finance_accounts` (accounts + latest observation) and
+  `marts.finance_transactions` (the ledger joined to accounts) REPLACED the old Plaid passthrough
+  views of the same names; the plaid-specific `marts.finance_investment_*` / `finance_liabilities`
+  passthroughs remain.
 
 ## Manual Finance Documents (manual_finance)
 
