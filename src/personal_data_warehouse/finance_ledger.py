@@ -55,7 +55,7 @@ ACCOUNT_SIDE_ASSET = "asset"
 ACCOUNT_SIDE_LIABILITY = "liability"
 
 # Logical account kinds. Plaid covers the linked-institution kinds; manual
-# documents introduce property / vehicle / private_fund accounts.
+# documents introduce property / vehicle / private_fund / receivable accounts.
 ACCOUNT_KINDS = (
     "checking",
     "savings",
@@ -66,6 +66,7 @@ ACCOUNT_KINDS = (
     "property",
     "vehicle",
     "private_fund",
+    "receivable",
     "other",
 )
 
@@ -135,6 +136,11 @@ def document_kind_side(document_type: str, *, name_hint: str = "", account_folde
         return ("checking", ACCOUNT_SIDE_ASSET)
     if "savings" in hint:
         return ("savings", ACCOUNT_SIDE_ASSET)
+    # Money owed TO the owner (personal loans, debt records). Keyed on the
+    # explicit "receivable" wording only — a bare "debt"/"loan" doesn't say
+    # which side of it the owner is on.
+    if "receivable" in doc_type or "receivable" in hint:
+        return ("receivable", ACCOUNT_SIDE_ASSET)
     return ("other", ACCOUNT_SIDE_ASSET)
 
 

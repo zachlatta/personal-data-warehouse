@@ -822,7 +822,7 @@ The ledger stores **facts only** — no categories or other opinions; categoriza
 enrichment layer.
 
 - `finance.accounts` — one row per logical account/asset/liability (kinds incl.
-  checking/credit/brokerage/ira/mortgage/property/vehicle/private_fund), resolved across sources
+  checking/credit/brokerage/ira/mortgage/property/vehicle/private_fund/receivable), resolved across sources
   via `finance.account_links` (photos-identity pattern: raw rows never learn about identity;
   deterministic `fa_<sha>` ids; delete links + rerun replays every decision).
 - `finance.observations` — append-only per-day values (PK account_id/as_of/kind/source; NUMERIC

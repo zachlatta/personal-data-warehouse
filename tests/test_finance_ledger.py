@@ -420,6 +420,9 @@ def test_stable_transaction_id_is_deterministic():
         ("bank_statement", "Checking", "", ("checking", "asset")),
         ("other", "", "vehicle-2020-truck", ("vehicle", "asset")),
         ("receipt", "", "", ("other", "asset")),
+        ("other", "Personal receivable owed to Zach Latta", "", ("receivable", "asset")),
+        ("receivable_record", "", "", ("receivable", "asset")),
+        ("other", "", "personal-loan-receivable", ("receivable", "asset")),
     ],
 )
 def test_document_kind_side(document_type, hint, folder, expected):
