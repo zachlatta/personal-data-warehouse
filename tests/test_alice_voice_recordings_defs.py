@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dagster import build_asset_context, build_schedule_context
 
+from personal_data_warehouse.alice_voice_recordings_drive_ingest import (
+    AliceVoiceRecordingsDriveIngestSummary,
+)
 from personal_data_warehouse.definitions import defs
 from personal_data_warehouse.defs import alice_voice_recordings as alice_defs
-from personal_data_warehouse_alice_voice_recordings.sync import AliceVoiceRecordingsImportSummary
 from personal_data_warehouse_alice_voice_recordings.gmail_recovery import AliceGmailRecoverySummary
+from personal_data_warehouse_alice_voice_recordings.sync import AliceVoiceRecordingsImportSummary
 
 
 def test_alice_voice_recordings_defs_are_registered() -> None:
@@ -49,6 +52,21 @@ def test_alice_voice_recordings_asset_writes_summary_metadata(monkeypatch) -> No
     assert metadata["recordings_seen"].value == 2
     assert metadata["recordings_uploaded"].value == 1
     assert metadata["metadata_uploaded"].value == 2
+
+
+def test_alice_archive_materialization_writes_summary_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(alice_defs, "load_settings", lambda **_kwargs: FakeSettings())
+    monkeypatch.setattr(alice_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(alice_defs, "_alice_object_store", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(alice_defs, "iter_archive_payloads", lambda **_kwargs: [])
+    monkeypatch.setattr(alice_defs, "exclusive_sync_lock", fake_exclusive_sync_lock)
+    monkeypatch.setattr(alice_defs, "AliceVoiceRecordingsDriveIngestRunner", FakeDriveIngestRunner)
+
+    result = alice_defs.alice_voice_recordings_drive_ingest(build_asset_context())
+
+    assert result.metadata["metadata_seen"].value == 5
+    assert result.metadata["recordings_written"].value == 3
+    assert result.metadata["artifacts_written"].value == 8
 
 
 def test_alice_gmail_recovery_asset_writes_summary_metadata(monkeypatch) -> None:
@@ -120,6 +138,18 @@ class FakeGmailRecoveryRunner:
             attachments_uploaded=4,
             metadata_uploaded=3,
             bytes_uploaded=789,
+        )
+
+
+class FakeDriveIngestRunner:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+
+    def sync(self) -> AliceVoiceRecordingsDriveIngestSummary:
+        return AliceVoiceRecordingsDriveIngestSummary(
+            metadata_seen=5,
+            recordings_written=3,
+            artifacts_written=8,
         )
 
 

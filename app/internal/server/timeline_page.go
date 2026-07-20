@@ -268,6 +268,7 @@ a.filelink:hover { text-decoration: underline; }
     gmail: "#e06c5f", slack: "#5fb0e0", apple_messages: "#62c98d", whatsapp: "#45c07a",
     apple_notes: "#e8975a", voice_memos: "#e05f9a", calendar: "#e8b45a",
     google_drive: "#d9c95f", contacts: "#7fd0c4", whoop: "#b8d84e", mutations: "#c46be0", warehouse: "#8b94a1",
+    alice_voice_recordings: "#de7eb6", finance: "#6fcf97",
     photos: "#e8a06b",
     claude_code: "#b78ae8", codex: "#9a8ae8", openclaw: "#8aa6e8", pi: "#7b93df", claude_desktop: "#cf8ae8", chatgpt: "#8ae8c9",
     agent_sessions: "#b78ae8"
@@ -653,6 +654,68 @@ a.filelink:hover { text-decoration: underline; }
     return wrap;
   }
 
+  function childRowNode(childRow) {
+    var node = h("div", "childrow");
+    var media = mediaNode(childRow);
+    if (media) node.appendChild(media);
+    var text = childRow.text || childRow.summary || "";
+    if (!media && !text) text = childRow.filename || childRow.name || "";
+    var metaBits = [];
+    for (var key in childRow) {
+      if (key === "text" || key === "summary" || key === "media_url" || key === "storage_file_id") continue;
+      var val = childRow[key];
+      if (val === "" || val === null || val === 0) continue;
+      metaBits.push(key + "=" + String(val).slice(0, 60));
+    }
+    if (text) node.appendChild(h("div", "bigtext", String(text)));
+    node.appendChild(h("div", "m", metaBits.join("  ")));
+    return node;
+  }
+
+  function appendChildSection(body, item, name, rows, initialMeta) {
+    var sect = section(name.replace(/_/g, " "));
+    var status = h("div", "m");
+    var loaded = rows.length;
+    var meta = initialMeta || { has_more: false, next_offset: loaded };
+    sect.appendChild(status);
+    rows.forEach(function (row) { sect.appendChild(childRowNode(row)); });
+    var more = h("button", "", "load more");
+
+    function refreshStatus() {
+      status.textContent = loaded + " loaded" + (meta.has_more ? " · more available" : " · complete");
+      if (meta.has_more) {
+        if (!more.parentNode) sect.appendChild(more);
+      } else if (more.parentNode) {
+        more.parentNode.removeChild(more);
+      }
+    }
+
+    more.addEventListener("click", function () {
+      more.disabled = true;
+      more.textContent = "loading…";
+      api("/api/timeline/item/children", {
+        adapter: item.adapter,
+        event_id: item.event_id,
+        child: name,
+        offset: meta.next_offset
+      }).then(function (page) {
+        (page.rows || []).forEach(function (row) {
+          sect.insertBefore(childRowNode(row), more.parentNode ? more : null);
+        });
+        loaded += (page.rows || []).length;
+        meta = page;
+        more.disabled = false;
+        more.textContent = "load more";
+        refreshStatus();
+      }).catch(function (err) {
+        more.disabled = false;
+        more.textContent = "retry: " + err.message;
+      });
+    });
+    refreshStatus();
+    body.appendChild(sect);
+  }
+
   function openItem(item) {
     var drawer = el("drawer");
     drawer.classList.add("open");
@@ -696,28 +759,11 @@ a.filelink:hover { text-decoration: underline; }
         body.insertBefore(mediaSect, body.children[1] || null);
       }
       var children = detail.children || {};
+      var childrenMeta = detail.children_meta || {};
       Object.keys(children).sort().forEach(function (name) {
         var rows = children[name];
         if (!rows || rows.error || !rows.length) return;
-        var sect = section(name.replace(/_/g, " ") + " · " + rows.length, rows);
-        rows.forEach(function (childRow) {
-          var node = h("div", "childrow");
-          var media = mediaNode(childRow);
-          if (media) node.appendChild(media);
-          var text = childRow.text || childRow.summary || "";
-          if (!media && !text) text = childRow.filename || childRow.name || "";
-          var metaBits = [];
-          for (var key in childRow) {
-            if (key === "text" || key === "summary" || key === "media_url" || key === "storage_file_id") continue;
-            var val = childRow[key];
-            if (val === "" || val === null || val === 0) continue;
-            metaBits.push(key + "=" + String(val).slice(0, 60));
-          }
-          if (text) node.appendChild(h("div", "bigtext", String(text)));
-          node.appendChild(h("div", "m", metaBits.join("  ")));
-          sect.appendChild(node);
-        });
-        body.appendChild(sect);
+        appendChildSection(body, item, name, rows, childrenMeta[name]);
       });
       if (detail.source_row) {
         var raw = section("source row (full record)", detail.source_row);

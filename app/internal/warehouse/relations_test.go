@@ -32,3 +32,20 @@ func TestQualifySQLRewritesPlaidRelations(t *testing.T) {
 		t.Fatalf("qualified SQL mismatch\nwant: %s\n got: %s", want, got)
 	}
 }
+
+func TestTimelineDetailRelationsUseCanonicalSchemas(t *testing.T) {
+	cases := map[string]string{
+		"alice_voice_recordings":          `"alice_voice_recordings"."recordings"`,
+		"alice_voice_recording_artifacts": `"alice_voice_recordings"."artifacts"`,
+		"finance_transactions":            `"finance"."transactions"`,
+		"finance_observations":            `"finance"."observations"`,
+		"manual_finance_documents":        `"manual_finance"."documents"`,
+		"manual_finance_extractions":      `"manual_finance"."extractions"`,
+		"apple_message_chats":             `"apple_messages"."chats"`,
+	}
+	for logical, want := range cases {
+		if got := SQLRelation(logical); got != want {
+			t.Fatalf("SQLRelation(%q) = %s, want %s", logical, got, want)
+		}
+	}
+}

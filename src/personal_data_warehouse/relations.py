@@ -112,6 +112,9 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("photo_assets", "photos", "assets"),
     ("photo_asset_files", "photos", "asset_files"),
     ("media_fingerprints", "enrichment", "media_fingerprints"),
+    # Alice voice-recording archive materialized from Drive library sidecars.
+    ("alice_voice_recordings", "alice_voice_recordings", "recordings"),
+    ("alice_voice_recording_artifacts", "alice_voice_recordings", "artifacts"),
     # WhatsApp
     ("whatsapp_chats", "whatsapp", "chats"),
     ("whatsapp_chat_participants", "whatsapp", "chat_participants"),

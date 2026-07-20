@@ -16,6 +16,8 @@ from psycopg2 import Binary
 from psycopg2.extras import Json, execute_values
 
 from personal_data_warehouse.schema import (
+    ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS,
+    ALICE_VOICE_RECORDING_COLUMNS,
     AGENT_RUN_COLUMNS,
     AGENT_RUN_EVENT_COLUMNS,
     AGENT_RUN_TOOL_CALL_COLUMNS,
@@ -264,6 +266,14 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "apple_voice_memos_enrichments": TableSpec(
         VOICE_MEMO_ENRICHMENT_COLUMNS,
         ("account", "recording_id", "provider", "model", "prompt_version"),
+    ),
+    "alice_voice_recordings": TableSpec(
+        ALICE_VOICE_RECORDING_COLUMNS,
+        ("account", "recording_id"),
+    ),
+    "alice_voice_recording_artifacts": TableSpec(
+        ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS,
+        ("account", "recording_id", "artifact_id"),
     ),
     "apple_notes": TableSpec(APPLE_NOTE_COLUMNS, ("account", "note_id")),
     "apple_note_revisions": TableSpec(APPLE_NOTE_REVISION_COLUMNS, ("account", "note_id", "revision_id")),
@@ -548,6 +558,16 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS voice_memo_files_recorded_idx ON apple_voice_memos_files (recorded_at DESC)",
     ),
     IndexSpec(
+        "alice_voice_recordings_recorded_idx",
+        "alice_voice_recordings",
+        "CREATE INDEX IF NOT EXISTS alice_voice_recordings_recorded_idx ON alice_voice_recordings (recorded_at DESC)",
+    ),
+    IndexSpec(
+        "alice_voice_recording_artifacts_recording_idx",
+        "alice_voice_recording_artifacts",
+        "CREATE INDEX IF NOT EXISTS alice_voice_recording_artifacts_recording_idx ON alice_voice_recording_artifacts (account, recording_id, kind)",
+    ),
+    IndexSpec(
         "apple_photos_files_ingested_at_idx",
         "apple_photos_files",
         "CREATE INDEX IF NOT EXISTS apple_photos_files_ingested_at_idx ON apple_photos_files (ingested_at)",
@@ -615,6 +635,11 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "apple_message_chat_messages_chat_time_idx",
         "apple_message_chat_messages",
         "CREATE INDEX IF NOT EXISTS apple_message_chat_messages_chat_time_idx ON apple_message_chat_messages (account, chat_id, message_date DESC)",
+    ),
+    IndexSpec(
+        "apple_message_chat_messages_message_idx",
+        "apple_message_chat_messages",
+        "CREATE INDEX IF NOT EXISTS apple_message_chat_messages_message_idx ON apple_message_chat_messages (account, message_id, chat_id)",
     ),
     IndexSpec(
         "apple_message_attachments_hash_idx",
@@ -883,6 +908,11 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS apple_voice_memos_files_ingested_at_idx ON apple_voice_memos_files (ingested_at)",
     ),
     IndexSpec(
+        "alice_voice_recordings_ingested_at_idx",
+        "alice_voice_recordings",
+        "CREATE INDEX IF NOT EXISTS alice_voice_recordings_ingested_at_idx ON alice_voice_recordings (ingested_at)",
+    ),
+    IndexSpec(
         "whatsapp_messages_ingested_at_idx",
         "whatsapp_messages",
         "CREATE INDEX IF NOT EXISTS whatsapp_messages_ingested_at_idx ON whatsapp_messages (ingested_at)",
@@ -1018,6 +1048,8 @@ JSONB_COLUMNS_BY_TABLE = {
         "uncertainties_json",
         "raw_result_json",
     },
+    "alice_voice_recordings": {"raw_metadata_json"},
+    "alice_voice_recording_artifacts": {"raw_metadata_json"},
 }
 
 JSONB_ARRAY_COLUMNS_BY_TABLE = {
@@ -1247,6 +1279,7 @@ INTEGER_COLUMNS = {
     "height",
     "best_file_size_bytes",
     "thumbnail_size_bytes",
+    "duration_seconds",
 }
 
 FLOAT_COLUMNS = {
@@ -1799,6 +1832,15 @@ class PostgresWarehouse:
             self._backfill_voice_memo_transcription_run_content_hashes()
             self._backfill_voice_memo_enrichment_content_hashes()
         self._ensure_clean_calendar_transcript_views_if_possible()
+        self._ensure_search_views_if_possible()
+
+    def ensure_alice_voice_recordings_tables(self) -> None:
+        self._ensure_table_group(
+            [
+                "alice_voice_recordings",
+                "alice_voice_recording_artifacts",
+            ]
+        )
         self._ensure_search_views_if_possible()
 
     def ensure_voice_memos_tables(self) -> None:
@@ -5308,6 +5350,16 @@ class PostgresWarehouse:
     def insert_apple_voice_memos_files(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("apple_voice_memos_files", rows, VOICE_MEMO_FILE_COLUMNS)
 
+    def insert_alice_voice_recordings(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("alice_voice_recordings", rows, ALICE_VOICE_RECORDING_COLUMNS)
+
+    def insert_alice_voice_recording_artifacts(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows(
+            "alice_voice_recording_artifacts",
+            rows,
+            ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS,
+        )
+
     def insert_voice_memo_files(self, rows: list[dict[str, Any]]) -> None:
         self.insert_apple_voice_memos_files(rows)
 
@@ -6618,11 +6670,16 @@ class PostgresWarehouse:
 
         branches = [
             branch("agent_session", "t.adapter = 'agent_session'", "t.source"),
+            branch("alice_voice_recording", "t.adapter = 'alice_voice_recording'"),
             branch("calendar", "t.adapter = 'calendar_event'"),
             branch("contact", "t.adapter = 'contact_update'"),
             branch("gmail", "t.adapter = 'gmail_email'"),
             branch("google_drive", "t.adapter = 'drive_file'"),
             branch("imessage", "t.adapter = 'apple_message'"),
+            branch(
+                "finance",
+                "t.adapter IN ('finance_transaction', 'finance_observation', 'manual_finance_document')",
+            ),
             branch("mutation", "t.adapter = 'mutation'", "COALESCE(t.metadata->>'status', t.kind)"),
             branch("mutation_request", "t.adapter = 'mutation_request'", "COALESCE(t.metadata->>'status', t.kind)"),
             branch("note", "t.adapter = 'apple_note_revision'"),

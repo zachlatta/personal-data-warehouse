@@ -459,6 +459,11 @@ Access tokens are isolated in `private.plaid_item_tokens`; normal read-only sche
 query surfaces do not expose the private schema. Plaid's legacy public key is not used by the
 modern Link-token API.
 
+The activity timeline reads the deduplicated ledger rather than the raw Plaid tables: it emits
+`finance.transaction` events from `finance.transactions`, `finance.balance_observation` events
+from `finance.observations`, and `finance.document` events from `manual_finance.documents`. This
+keeps finance visible without showing the same transaction once per source witness.
+
 Configure the `PLAID_*` variables below and ensure `POSTGRES_DATABASE_URL` points at the target
 warehouse:
 
@@ -1005,10 +1010,12 @@ Drive scope, using the same auth flow as Voice Memos:
 uv run personal-data-warehouse-google-auth --email you@example.com --write-env
 ```
 
-Dagster exposes `alice_voice_recordings_import` and `alice_voice_recordings_gmail_recovery` in the
-`alice_voice_recordings` group, with `alice_voice_recordings_import_job` scheduled daily at
-04:17 UTC. This is the scheduler of record for regular Alice archival. To run the API import
-manually:
+Dagster exposes `alice_voice_recordings_import`, `alice_voice_recordings_gmail_recovery`, and
+`alice_voice_recordings_drive_ingest` in the `alice_voice_recordings` group. The final asset
+materializes the merged API/recovery archive into `alice_voice_recordings.recordings` and
+`alice_voice_recordings.artifacts`, which makes recordings searchable and adds one recording event
+to the timeline. `alice_voice_recordings_import_job` runs all three assets daily at 04:17 UTC. This
+is the scheduler of record for regular Alice archival. To run the API import manually:
 
 ```bash
 uv run python -c "from dagster import materialize; from personal_data_warehouse.defs.alice_voice_recordings import alice_voice_recordings_import; raise SystemExit(0 if materialize([alice_voice_recordings_import]).success else 1)"

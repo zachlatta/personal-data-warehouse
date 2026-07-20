@@ -212,6 +212,54 @@ VOICE_MEMO_FILE_COLUMNS = (
     "sync_version",
 )
 
+
+# Alice recordings are archived independently from Apple Voice Memos. Keep
+# their source identity and recovery artifacts intact instead of folding them
+# into apple_voice_memos.files, whose primary key has no source component.
+ALICE_VOICE_RECORDING_COLUMNS = (
+    "account",
+    "recording_id",
+    "title",
+    "filename",
+    "content_type",
+    "size_bytes",
+    "content_sha256",
+    "recorded_at",
+    "duration_seconds",
+    "recording_page_url",
+    "recovery_source",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "metadata_storage_key",
+    "metadata_storage_file_id",
+    "metadata_storage_url",
+    "metadata_content_sha256",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+
+ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS = (
+    "account",
+    "recording_id",
+    "artifact_id",
+    "kind",
+    "filename",
+    "content_type",
+    "size_bytes",
+    "content_sha256",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
 VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS = (
     "account",
     "recording_id",

@@ -1418,6 +1418,140 @@ _ENRICHMENT_RUN = _simple_adapter(
     priority=str(TIMELINE_PRIORITY_BACKGROUND),
 )
 
+_ALICE_VOICE_RECORDING = _simple_adapter(
+    name="alice_voice_recording",
+    source_table="alice_voice_recordings",
+    source="alice_voice_recordings",
+    kind="voice_recording",
+    from_sql="alice_voice_recordings t",
+    event_id="concat_ws('|', t.account, t.recording_id)",
+    event_ts="t.recorded_at",
+    ingest_ts="t.ingested_at",
+    actor="'me'",
+    title="COALESCE(NULLIF(t.title, ''), t.filename)",
+    snippet="CASE WHEN t.duration_seconds > 0 THEN concat(t.duration_seconds, ' seconds') ELSE '' END",
+    context="t.account",
+    source_pk="jsonb_build_object('account', t.account, 'recording_id', t.recording_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'duration_seconds', t.duration_seconds, "
+        "'content_type', t.content_type, "
+        "'recovery_source', t.recovery_source)"
+    ),
+    search_text=_search_concat("t.title", "t.filename", "t.raw_metadata_json"),
+    priority=str(TIMELINE_PRIORITY_SELF),
+)
+
+_FINANCE_TRANSACTION = _simple_adapter(
+    name="finance_transaction",
+    source_table="finance_transactions",
+    source="finance",
+    kind="transaction",
+    from_sql=(
+        "finance_transactions t "
+        "LEFT JOIN finance_accounts a ON a.account_id = t.account_id"
+    ),
+    event_id="t.transaction_id",
+    event_ts="t.posted_at",
+    ingest_ts="to_timestamp(t.sync_version / 1000000.0)",
+    actor="COALESCE(NULLIF(t.merchant, ''), t.description)",
+    title="COALESCE(NULLIF(t.merchant, ''), NULLIF(t.description, ''), 'Transaction')",
+    snippet="concat(t.amount::text, ' ', t.currency)",
+    context="concat_ws(' · ', NULLIF(a.institution, ''), NULLIF(a.name, ''))",
+    source_pk="jsonb_build_object('transaction_id', t.transaction_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'account_id', t.account_id, "
+        "'amount', t.amount, "
+        "'currency', t.currency, "
+        "'pending', t.pending <> 0, "
+        "'source', t.source, "
+        "'side', a.side)"
+    ),
+    search_text=_search_concat(
+        "t.description", "t.merchant", "t.amount", "t.currency", "a.name", "a.institution"
+    ),
+    priority=str(TIMELINE_PRIORITY_SELF),
+)
+
+_FINANCE_OBSERVATION = _simple_adapter(
+    name="finance_observation",
+    source_table="finance_observations",
+    source="finance",
+    kind="balance_observation",
+    from_sql=(
+        "finance_observations t "
+        "LEFT JOIN finance_accounts a ON a.account_id = t.account_id"
+    ),
+    event_id="concat_ws('|', t.account_id, t.as_of::text, t.kind, t.source)",
+    event_ts="t.as_of::timestamp AT TIME ZONE 'UTC'",
+    ingest_ts="to_timestamp(t.sync_version / 1000000.0)",
+    actor="'me'",
+    title="concat(COALESCE(NULLIF(a.name, ''), t.account_id), ' ', t.kind)",
+    snippet="concat(t.value::text, ' ', t.currency)",
+    context="COALESCE(a.institution, '')",
+    source_pk=(
+        "jsonb_build_object('account_id', t.account_id, 'as_of', t.as_of, "
+        "'kind', t.kind, 'source', t.source)"
+    ),
+    metadata=(
+        "jsonb_build_object("
+        "'account_id', t.account_id, "
+        "'value', t.value, "
+        "'currency', t.currency, "
+        "'source', t.source, "
+        "'side', a.side)"
+    ),
+    search_text=_search_concat("a.name", "a.institution", "t.kind", "t.value", "t.currency"),
+    priority=str(TIMELINE_PRIORITY_SELF),
+)
+
+_MANUAL_FINANCE_DOCUMENT = _simple_adapter(
+    name="manual_finance_document",
+    source_table="manual_finance_documents",
+    source="finance",
+    kind="document",
+    from_sql="""manual_finance_documents t
+    LEFT JOIN LATERAL (
+        SELECT e.document_type, e.institution, e.account_name_hint, e.period_start,
+               e.period_end, e.currency, e.closing_balance, e.summary, e.created_at
+        FROM manual_finance_extractions e
+        WHERE e.content_sha256 = t.content_sha256
+        ORDER BY e.created_at DESC LIMIT 1
+    ) ex ON TRUE""",
+    event_id="concat_ws('|', t.source, t.account, t.source_native_id)",
+    event_ts=(
+        "COALESCE(ex.period_end::timestamp AT TIME ZONE 'UTC', "
+        "t.file_modified_at, t.ingested_at)"
+    ),
+    ingest_ts="GREATEST(t.ingested_at, COALESCE(ex.created_at, t.ingested_at))",
+    actor="'me'",
+    title="t.filename",
+    snippet=_snippet("COALESCE(ex.summary, '')"),
+    context="COALESCE(NULLIF(ex.institution, ''), t.original_path)",
+    source_pk=(
+        "jsonb_build_object('source', t.source, 'account', t.account, "
+        "'source_native_id', t.source_native_id)"
+    ),
+    metadata=(
+        "jsonb_build_object("
+        "'document_type', ex.document_type, "
+        "'institution', ex.institution, "
+        "'account_name_hint', ex.account_name_hint, "
+        "'period_start', ex.period_start, "
+        "'period_end', ex.period_end, "
+        "'currency', ex.currency, "
+        "'closing_balance', ex.closing_balance, "
+        "'mime_type', t.mime_type, "
+        "'size_bytes', t.size_bytes, "
+        "'deleted', t.is_deleted <> 0)"
+    ),
+    search_text=_search_concat(
+        "t.filename", "t.original_path", "ex.institution", "ex.account_name_hint", "ex.summary"
+    ),
+    priority=str(TIMELINE_PRIORITY_SELF),
+)
+
 
 def _agent_session_adapter() -> TimelineAdapter:
     """Session-level roll-up over marts.ai_conversation_events.
@@ -1590,6 +1724,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _AGENT_SESSION,
     _APPLE_NOTE_REVISION,
     _VOICE_MEMO,
+    _ALICE_VOICE_RECORDING,
     _CALENDAR_EVENT,
     _DRIVE_FILE,
     _PHOTO,
@@ -1598,6 +1733,9 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _WHOOP_RECOVERY,
     _WHOOP_SLEEP,
     _WHOOP_WORKOUT,
+    _FINANCE_TRANSACTION,
+    _FINANCE_OBSERVATION,
+    _MANUAL_FINANCE_DOCUMENT,
     _MUTATION,
     _MUTATION_REQUEST,
     _ENRICHMENT_RUN,
@@ -1668,6 +1806,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "apple_voice_memos_transcription_runs": _detail("apple_voice_memos_files"),
     "apple_voice_memos_transcript_segments": _detail("apple_voice_memos_files"),
     "apple_voice_memos_enrichments": _detail("apple_voice_memos_files"),
+    # Alice Voice Recordings
+    "alice_voice_recordings": _events(),
+    "alice_voice_recording_artifacts": _detail("alice_voice_recordings"),
     # Apple Notes: every note has revision rows (the note row is the current
     # state; the revisions are the edit activity).
     "apple_notes": _entity("current note state; edits surface via apple_note_revisions"),
@@ -1745,18 +1886,15 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "plaid_liabilities": _entity("current liability state"),
     "plaid_sync_state": _state("per-item/product sync cursor"),
     "plaid_item_tokens": _state("private Plaid access tokens"),
-    # Finance ledger (derived stocks-and-flows layer over the finance
-    # sources): queryable through finance.* and marts.finance_*, excluded
-    # from the general activity timeline like the raw plaid tables.
+    # Finance ledger. Raw Plaid rows remain source state; their deduplicated
+    # ledger transactions and point-in-time observations are timeline events.
     "finance_accounts": _entity("logical account/asset/liability dimension"),
     "finance_account_links": _state("source-account → ledger-account resolution audit"),
-    "finance_observations": _entity("append-only balance/valuation history; excluded from the general timeline"),
-    "finance_transactions": _entity("unified deduped transaction ledger; excluded from the general timeline"),
-    "finance_transaction_links": _state("source-row → ledger-transaction resolution audit"),
-    # Manually uploaded finance documents: finance query surface, not
-    # activity (the upload moment is not a life event).
-    "manual_finance_documents": _entity("uploaded financial document inventory"),
-    "manual_finance_extractions": _entity("structured agent extraction per document"),
+    "finance_observations": _events("append-only balance and valuation history"),
+    "finance_transactions": _events("one event per deduplicated real-world transaction"),
+    "finance_transaction_links": _detail("finance_transactions", "source-row resolution audit"),
+    "manual_finance_documents": _events("uploaded statements and financial records"),
+    "manual_finance_extractions": _detail("manual_finance_documents", "structured extraction history"),
     # Upstream mutations (the warehouse acting on the world)
     "upstream_mutations": _events(),
     "upstream_mutation_requests": _events(),

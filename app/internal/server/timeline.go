@@ -245,7 +245,16 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "mutations", kind: "mutation"},
 	{source: "mutations", kind: "mutation_request"},
 	{source: "warehouse", kind: "enrichment_run"},
-	{source: "agent_sessions", kind: "agent_session"},
+	{source: "alice_voice_recordings", kind: "voice_recording"},
+	{source: "finance", kind: "transaction"},
+	{source: "finance", kind: "balance_observation"},
+	{source: "finance", kind: "document"},
+	{source: "chatgpt", kind: "agent_session"},
+	{source: "claude_code", kind: "agent_session"},
+	{source: "claude_desktop", kind: "agent_session"},
+	{source: "codex", kind: "agent_session"},
+	{source: "openclaw", kind: "agent_session"},
+	{source: "pi", kind: "agent_session"},
 }
 
 var timelinePriorityCatalog = []int64{1, 2, 3, 4, 5}
@@ -366,9 +375,10 @@ var timelineIdentifierPattern = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 // parent event's inspector. Keep in sync with TIMELINE_TABLE_COVERAGE in
 // src/personal_data_warehouse/timeline.py.
 type timelineChildQuery struct {
-	name   string
-	params []string
-	sql    string
+	name     string
+	params   []string
+	pageSize int
+	sql      string
 }
 
 var timelineChildQueries = map[string][]timelineChildQuery{
@@ -378,7 +388,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			params: []string{"account", "message_id"},
 			sql: `SELECT part_id, filename, mime_type, size, storage_status, storage_file_id, content_sha256
 			      FROM ` + warehouse.SQLRelation("gmail_attachments") + ` WHERE account = $1 AND message_id = $2
-			      ORDER BY part_id LIMIT 50`,
+			      ORDER BY part_id`,
 		},
 		{
 			name:   "attachment_enrichments",
@@ -386,7 +396,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			sql: `SELECT e.content_sha256, e.ai_model, left(e.text, 4000) AS text
 			      FROM ` + warehouse.SQLRelation("file_attachment_enrichments") + ` e
 			      JOIN ` + warehouse.SQLRelation("gmail_attachments") + ` a ON a.content_sha256 = e.content_sha256
-			      WHERE a.account = $1 AND a.message_id = $2 LIMIT 20`,
+			      WHERE a.account = $1 AND a.message_id = $2 ORDER BY e.updated_at DESC`,
 		},
 	},
 	"slack_messages": {
@@ -397,7 +407,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			      FROM ` + warehouse.SQLRelation("slack_message_reactions") + `
 			      WHERE account = $1 AND team_id = $2 AND conversation_id = $3 AND message_ts = $4
 			        AND is_deleted = 0
-			      ORDER BY reaction_name LIMIT 100`,
+			      ORDER BY reaction_name`,
 		},
 		{
 			name:   "thread_replies",
@@ -409,7 +419,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			      LEFT JOIN ` + warehouse.SQLRelation("slack_users") + ` u ON u.account = m.account AND u.team_id = m.team_id AND u.user_id = m.user_id
 			      WHERE m.account = $1 AND m.team_id = $2 AND m.conversation_id = $3 AND m.thread_ts = $4
 			        AND m.is_deleted = 0
-			      ORDER BY m.message_datetime LIMIT 50`,
+			      ORDER BY m.message_datetime`,
 		},
 		{
 			// slack_files.file_id is a valid /objects/ file id: the app's Slack
@@ -420,17 +430,39 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			      FROM ` + warehouse.SQLRelation("slack_files") + `
 			      WHERE account = $1 AND team_id = $2 AND conversation_id = $3 AND message_ts = $4
 			        AND is_deleted = 0
-			      ORDER BY file_id LIMIT 20`,
+			      ORDER BY file_id`,
 		},
 	},
 	"apple_messages": {
 		{
 			name:   "attachments",
 			params: []string{"account", "message_id"},
-			sql: `SELECT attachment_id, transfer_name AS filename, mime_type, total_bytes, is_missing,
+			sql: `SELECT attachment_id, transfer_name AS filename,
+			             COALESCE(NULLIF(content_type, ''), mime_type) AS content_type,
+			             mime_type, total_bytes, is_missing,
 			             storage_file_id, content_sha256
 			      FROM ` + warehouse.SQLRelation("apple_message_attachments") + ` WHERE account = $1 AND message_id = $2
-			      ORDER BY attachment_id LIMIT 50`,
+			      ORDER BY attachment_id`,
+		},
+		{
+			name:   "chats",
+			params: []string{"account", "message_id"},
+			sql: `SELECT c.chat_id, c.display_name, c.chat_identifier, c.style
+			      FROM ` + warehouse.SQLRelation("apple_message_chat_messages") + ` cm
+			      JOIN ` + warehouse.SQLRelation("apple_message_chats") + ` c
+			        ON c.account = cm.account AND c.chat_id = cm.chat_id
+			      WHERE cm.account = $1 AND cm.message_id = $2
+			      ORDER BY c.display_name, c.chat_id`,
+		},
+		{
+			name:   "attachment_enrichments",
+			params: []string{"account", "message_id"},
+			sql: `SELECT e.content_sha256, e.ai_model, left(e.text, 4000) AS text
+			      FROM ` + warehouse.SQLRelation("file_attachment_enrichments") + ` e
+			      JOIN ` + warehouse.SQLRelation("apple_message_attachments") + ` a
+			        ON a.content_sha256 = e.content_sha256
+			      WHERE a.account = $1 AND a.message_id = $2
+			      ORDER BY e.updated_at DESC`,
 		},
 	},
 	"whatsapp_messages": {
@@ -440,23 +472,27 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			sql: `SELECT media_type, filename, mime_type, size_bytes, is_missing,
 			             storage_file_id, content_sha256
 			      FROM ` + warehouse.SQLRelation("whatsapp_media_items") + `
-			      WHERE account = $1 AND chat_id = $2 AND message_id = $3 LIMIT 20`,
+			      WHERE account = $1 AND chat_id = $2 AND message_id = $3 ORDER BY media_type, filename`,
+		},
+		{
+			name:   "attachment_enrichments",
+			params: []string{"account", "chat_id", "message_id"},
+			sql: `SELECT e.content_sha256, e.ai_model, left(e.text, 4000) AS text
+			      FROM ` + warehouse.SQLRelation("file_attachment_enrichments") + ` e
+			      JOIN ` + warehouse.SQLRelation("whatsapp_media_items") + ` m
+			        ON m.content_sha256 = e.content_sha256
+			      WHERE m.account = $1 AND m.chat_id = $2 AND m.message_id = $3
+			      ORDER BY e.updated_at DESC`,
 		},
 	},
 	"agent_session_events": {
 		{
-			name:   "events_head",
-			params: []string{"source", "session_id"},
+			name:     "events",
+			params:   []string{"source", "session_id"},
+			pageSize: 100,
 			sql: `SELECT seq, occurred_at, role, event_type, tool_name, left(text, 700) AS text
 			      FROM ` + warehouse.SQLRelation("agent_session_events") + ` WHERE source = $1 AND session_id = $2
-			      ORDER BY seq LIMIT 100`,
-		},
-		{
-			name:   "events_tail",
-			params: []string{"source", "session_id"},
-			sql: `SELECT seq, occurred_at, role, event_type, tool_name, left(text, 700) AS text
-			      FROM ` + warehouse.SQLRelation("agent_session_events") + ` WHERE source = $1 AND session_id = $2
-			      ORDER BY seq DESC LIMIT 50`,
+			      ORDER BY seq`,
 		},
 	},
 	"apple_note_revisions": {
@@ -465,7 +501,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			params: []string{"account", "note_id", "revision_id"},
 			sql: `SELECT attachment_id, filename, content_type, size_bytes, is_missing, storage_file_id
 			      FROM ` + warehouse.SQLRelation("apple_note_attachments") + `
-			      WHERE account = $1 AND note_id = $2 AND revision_id = $3 LIMIT 50`,
+			      WHERE account = $1 AND note_id = $2 AND revision_id = $3 ORDER BY attachment_id`,
 		},
 	},
 	"apple_voice_memos_files": {
@@ -475,21 +511,22 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			sql: `SELECT provider, model, status, title, left(summary, 4000) AS summary,
 			             action_items_json, calendar_event_id
 			      FROM ` + warehouse.SQLRelation("apple_voice_memos_enrichments") + `
-			      WHERE account = $1 AND recording_id = $2 ORDER BY created_at DESC LIMIT 5`,
+			      WHERE account = $1 AND recording_id = $2 ORDER BY created_at DESC`,
 		},
 		{
 			name:   "transcription_runs",
 			params: []string{"account", "recording_id"},
 			sql: `SELECT provider, model, status, requested_at, completed_at, left(error, 500) AS error
 			      FROM ` + warehouse.SQLRelation("apple_voice_memos_transcription_runs") + `
-			      WHERE account = $1 AND recording_id = $2 LIMIT 10`,
+			      WHERE account = $1 AND recording_id = $2 ORDER BY requested_at DESC`,
 		},
 		{
-			name:   "transcript_segments",
-			params: []string{"account", "recording_id"},
+			name:     "transcript_segments",
+			params:   []string{"account", "recording_id"},
+			pageSize: 100,
 			sql: `SELECT segment_index, speaker_label, start_ms, end_ms, left(text, 700) AS text
 			      FROM ` + warehouse.SQLRelation("apple_voice_memos_transcript_segments") + `
-			      WHERE account = $1 AND recording_id = $2 ORDER BY segment_index LIMIT 100`,
+			      WHERE account = $1 AND recording_id = $2 ORDER BY segment_index`,
 		},
 	},
 	"google_drive_files": {
@@ -498,7 +535,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			params: []string{"account", "file_id"},
 			sql: `SELECT extractor, char_count, truncated, left(text, 4000) AS text
 			      FROM ` + warehouse.SQLRelation("google_drive_file_texts") + `
-			      WHERE account = $1 AND file_id = $2 LIMIT 5`,
+			      WHERE account = $1 AND file_id = $2 ORDER BY extractor`,
 		},
 	},
 	"photo_assets": {
@@ -510,7 +547,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			sql: `SELECT source, source_native_id, role, filename, mime_type, size_bytes,
 			             width, height, content_sha256, storage_file_id, match_method, match_score
 			      FROM ` + warehouse.SQLRelation("photo_files") + `
-			      WHERE photo_id = $1 ORDER BY source, role LIMIT 50`,
+			      WHERE photo_id = $1 ORDER BY source, role`,
 		},
 		{
 			name:   "enrichments",
@@ -519,7 +556,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			      FROM ` + warehouse.SQLRelation("file_attachment_enrichments") + ` e
 			      JOIN ` + warehouse.SQLRelation("photo_assets") + ` a
 			        ON e.content_sha256 IN (a.thumbnail_content_sha256, a.best_file_sha256)
-			      WHERE a.photo_id = $1 AND e.text != '' LIMIT 5`,
+			      WHERE a.photo_id = $1 AND e.text != '' ORDER BY e.updated_at DESC`,
 		},
 	},
 	"upstream_mutations": {
@@ -529,7 +566,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			sql: `SELECT event_index, event_type, actor_type, actor_id, created_at,
 			             left(event_json::text, 2000) AS event_json
 			      FROM ` + warehouse.SQLRelation("upstream_mutation_events") + ` WHERE mutation_id = $1
-			      ORDER BY event_index LIMIT 100`,
+			      ORDER BY event_index`,
 		},
 	},
 	"upstream_mutation_requests": {
@@ -539,7 +576,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			sql: `SELECT event_index, event_type, actor_type, actor_id, created_at,
 			             left(event_json::text, 2000) AS event_json
 			      FROM ` + warehouse.SQLRelation("upstream_mutation_request_events") + ` WHERE request_id = $1
-			      ORDER BY event_index LIMIT 100`,
+			      ORDER BY event_index`,
 		},
 	},
 	"agent_runs": {
@@ -547,13 +584,46 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			name:   "tool_calls",
 			params: []string{"run_id"},
 			sql: `SELECT event_index, tool_name, started_at, completed_at, left(error, 500) AS error
-			      FROM ` + warehouse.SQLRelation("agent_run_tool_calls") + ` WHERE run_id = $1 ORDER BY event_index LIMIT 100`,
+			      FROM ` + warehouse.SQLRelation("agent_run_tool_calls") + ` WHERE run_id = $1 ORDER BY event_index`,
 		},
 		{
-			name:   "events_head",
+			name:   "events",
 			params: []string{"run_id"},
 			sql: `SELECT event_index, stream, event_type, created_at, left(text, 700) AS text
-			      FROM ` + warehouse.SQLRelation("agent_run_events") + ` WHERE run_id = $1 ORDER BY event_index LIMIT 100`,
+			      FROM ` + warehouse.SQLRelation("agent_run_events") + ` WHERE run_id = $1 ORDER BY event_index`,
+		},
+	},
+	"alice_voice_recordings": {
+		{
+			name:   "artifacts",
+			params: []string{"account", "recording_id"},
+			sql: `SELECT artifact_id, kind, filename, content_type, size_bytes,
+			             content_sha256, storage_file_id
+			      FROM ` + warehouse.SQLRelation("alice_voice_recording_artifacts") + `
+			      WHERE account = $1 AND recording_id = $2 ORDER BY kind, artifact_id`,
+		},
+	},
+	"finance_transactions": {
+		{
+			name:   "source_links",
+			params: []string{"transaction_id"},
+			sql: `SELECT source, source_row_key, match_method, match_score, created_at
+			      FROM ` + warehouse.SQLRelation("finance_transaction_links") + `
+			      WHERE transaction_id = $1 ORDER BY source, source_row_key`,
+		},
+	},
+	"finance_observations": {},
+	"manual_finance_documents": {
+		{
+			name:   "extractions",
+			params: []string{"source_native_id"},
+			sql: `SELECT ai_provider, ai_model, ai_prompt_version, status, error,
+			             document_type, institution, account_name_hint, account_mask,
+			             period_start, period_end, currency, closing_balance,
+			             left(summary, 4000) AS summary, uncertainties_json,
+			             ai_processed_at, created_at
+			      FROM ` + warehouse.SQLRelation("manual_finance_extractions") + `
+			      WHERE content_sha256 = $1 ORDER BY created_at DESC`,
 		},
 	},
 	"slack_files":      {},
@@ -571,6 +641,80 @@ SELECT adapter, event_id, source, kind, priority, event_ts, end_ts, actor, title
        ingest_ts, first_seen_at, updated_at
 FROM ` + warehouse.SQLRelation("timeline_events") + `
 WHERE adapter = $1 AND event_id = $2`
+
+type timelineChildPage struct {
+	Rows       []map[string]any `json:"rows"`
+	HasMore    bool             `json:"has_more"`
+	NextOffset int              `json:"next_offset"`
+}
+
+func timelineSourcePointer(row map[string]any) (string, map[string]any) {
+	sourceTable, _ := row["source_table"].(string)
+	pkRaw, _ := row["source_pk"].(string)
+	pk := map[string]any{}
+	if err := json.Unmarshal([]byte(pkRaw), &pk); err != nil {
+		pk = map[string]any{}
+	}
+	return sourceTable, pk
+}
+
+func timelineChildByName(children []timelineChildQuery, name string) (timelineChildQuery, bool) {
+	for _, child := range children {
+		if child.name == name {
+			return child, true
+		}
+	}
+	return timelineChildQuery{}, false
+}
+
+func timelineChildArgs(child timelineChildQuery, pk map[string]any) ([]any, bool) {
+	args := make([]any, 0, len(child.params))
+	for _, param := range child.params {
+		value, ok := pk[param]
+		if !ok {
+			return nil, false
+		}
+		args = append(args, value)
+	}
+	return args, true
+}
+
+func (s *timelineService) fetchChildPage(
+	ctx context.Context,
+	child timelineChildQuery,
+	pk map[string]any,
+	offset int,
+) (timelineChildPage, error) {
+	args, ok := timelineChildArgs(child, pk)
+	if !ok {
+		return timelineChildPage{}, fmt.Errorf("source primary key is missing fields for %s", child.name)
+	}
+	pageSize := child.pageSize
+	if pageSize <= 0 {
+		pageSize = 50
+	}
+	limitParam := len(args) + 1
+	offsetParam := len(args) + 2
+	statement := fmt.Sprintf("%s LIMIT $%d OFFSET $%d", child.sql, limitParam, offsetParam)
+	args = append(args, pageSize+1, offset)
+	result, err := s.source.QueryArgs(ctx, statement, args, pageSize+1)
+	if err != nil {
+		return timelineChildPage{}, err
+	}
+	hasMore := len(result.Rows) > pageSize
+	rows := result.Rows
+	if hasMore {
+		rows = rows[:pageSize]
+	}
+	for _, row := range rows {
+		s.attachMedia(row)
+	}
+	return timelineChildPage{
+		Rows:       nonNilRows(rows),
+		HasMore:    hasMore,
+		NextOffset: offset + len(rows),
+	}, nil
+}
 
 func (s *timelineService) handleItem(w http.ResponseWriter, r *http.Request) {
 	adapter := r.URL.Query().Get("adapter")
@@ -591,12 +735,7 @@ func (s *timelineService) handleItem(w http.ResponseWriter, r *http.Request) {
 	}
 	row := result.Rows[0]
 	item := timelineItemJSON(row)
-	sourceTable, _ := row["source_table"].(string)
-	pkRaw, _ := row["source_pk"].(string)
-	var pk map[string]any
-	if err := json.Unmarshal([]byte(pkRaw), &pk); err != nil {
-		pk = map[string]any{}
-	}
+	sourceTable, pk := timelineSourcePointer(row)
 
 	response := map[string]any{"item": item}
 	children, known := timelineChildQueries[sourceTable]
@@ -615,35 +754,70 @@ func (s *timelineService) handleItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	childResults := map[string]any{}
+	childMetadata := map[string]any{}
 	for _, child := range children {
-		args := make([]any, 0, len(child.params))
-		missing := false
-		for _, param := range child.params {
-			value, ok := pk[param]
-			if !ok {
-				missing = true
-				break
-			}
-			args = append(args, value)
-		}
-		if missing {
+		if _, ok := timelineChildArgs(child, pk); !ok {
 			continue
 		}
-		childRows, childErr := s.source.QueryArgs(r.Context(), child.sql, args, 500)
+		page, childErr := s.fetchChildPage(r.Context(), child, pk, 0)
 		if childErr != nil {
 			childResults[child.name] = map[string]any{"error": childErr.Error()}
 			continue
 		}
-		for _, childRow := range childRows.Rows {
-			s.attachMedia(childRow)
+		childResults[child.name] = page.Rows
+		childMetadata[child.name] = map[string]any{
+			"has_more":    page.HasMore,
+			"next_offset": page.NextOffset,
 		}
-		childResults[child.name] = nonNilRows(childRows.Rows)
 	}
 	response["children"] = childResults
+	response["children_meta"] = childMetadata
 	if media := s.itemMedia(sourceTable, response["source_row"]); media != nil {
 		response["item_media"] = media
 	}
 	writeJSON(w, response)
+}
+
+func (s *timelineService) handleItemChildren(w http.ResponseWriter, r *http.Request) {
+	adapter := r.URL.Query().Get("adapter")
+	eventID := r.URL.Query().Get("event_id")
+	childName := r.URL.Query().Get("child")
+	if adapter == "" || eventID == "" || childName == "" {
+		httpError(w, http.StatusBadRequest, "adapter, event_id, and child are required")
+		return
+	}
+	offset := 0
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			httpError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return
+		}
+		offset = parsed
+	}
+	result, err := s.timeline.QueryArgs(r.Context(), timelineItemSQL, []any{adapter, eventID}, 1)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "timeline item query failed", "error", err)
+		httpError(w, http.StatusInternalServerError, "timeline item query failed")
+		return
+	}
+	if len(result.Rows) == 0 {
+		httpError(w, http.StatusNotFound, "timeline item not found")
+		return
+	}
+	sourceTable, pk := timelineSourcePointer(result.Rows[0])
+	child, ok := timelineChildByName(timelineChildQueries[sourceTable], childName)
+	if !ok {
+		httpError(w, http.StatusNotFound, "timeline child collection not found")
+		return
+	}
+	page, err := s.fetchChildPage(r.Context(), child, pk, offset)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "timeline child query failed", "error", err)
+		httpError(w, http.StatusInternalServerError, "timeline child query failed")
+		return
+	}
+	writeJSON(w, page)
 }
 
 // attachMedia decorates a row that references a stored blob with a signed
@@ -661,7 +835,9 @@ func (s *timelineService) attachMedia(row map[string]any) {
 		return
 	}
 	contentType := ""
-	for _, key := range []string{"mime_type", "content_type", "mimetype"} {
+	// content_type is the normalized value for sources such as iMessage;
+	// prefer it over a generic provider mime_type fallback.
+	for _, key := range []string{"content_type", "mime_type", "mimetype"} {
 		if value, ok := row[key].(string); ok && value != "" {
 			contentType = value
 			break
@@ -689,10 +865,12 @@ func timelineMediaKind(contentType string) string {
 // itemMedia surfaces the event's own blob (a voice memo's audio, a Slack
 // file share's file, a Drive file's stored copy) from the fetched source row.
 var timelineItemMediaColumns = map[string][2]string{
-	"apple_voice_memos_files": {"storage_file_id", "content_type"},
-	"slack_files":             {"file_id", "mimetype"},
-	"google_drive_files":      {"storage_file_id", "mime_type"},
-	"photo_assets":            {"thumbnail_storage_file_id", "thumbnail_content_type"},
+	"apple_voice_memos_files":  {"storage_file_id", "content_type"},
+	"alice_voice_recordings":   {"storage_file_id", "content_type"},
+	"manual_finance_documents": {"storage_file_id", "mime_type"},
+	"slack_files":              {"file_id", "mimetype"},
+	"google_drive_files":       {"storage_file_id", "mime_type"},
+	"photo_assets":             {"thumbnail_storage_file_id", "thumbnail_content_type"},
 }
 
 func (s *timelineService) itemMedia(sourceTable string, sourceRow any) map[string]any {
@@ -820,6 +998,7 @@ func (s *timelineService) registerRoutes(mux *http.ServeMux, requireAuth func(ht
 	mux.Handle("/api/timeline", requireAuth(http.HandlerFunc(s.handleList)))
 	mux.Handle("/api/timeline/sources", requireAuth(http.HandlerFunc(s.handleSources)))
 	mux.Handle("/api/timeline/item", requireAuth(http.HandlerFunc(s.handleItem)))
+	mux.Handle("/api/timeline/item/children", requireAuth(http.HandlerFunc(s.handleItemChildren)))
 	mux.HandleFunc("/timeline", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		// The shell is tiny and iterated on; never let a browser cache a stale copy.

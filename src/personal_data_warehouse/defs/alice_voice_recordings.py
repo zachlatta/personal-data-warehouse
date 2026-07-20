@@ -12,6 +12,10 @@ from dagster import (
     schedule,
 )
 
+from personal_data_warehouse.alice_voice_recordings_drive_ingest import (
+    AliceVoiceRecordingsDriveIngestRunner,
+    iter_archive_payloads,
+)
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.gmail_sync import build_gmail_service
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
@@ -26,6 +30,7 @@ from personal_data_warehouse_alice_voice_recordings.sync import SOURCE, AliceVoi
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 ALICE_VOICE_RECORDINGS_IMPORT_POSTGRES_LOCK_ID = 7_403_111_845
+ALICE_VOICE_RECORDINGS_DRIVE_INGEST_POSTGRES_LOCK_ID = 7_403_111_854
 
 
 def _alice_object_store(config, settings):
@@ -143,9 +148,52 @@ def alice_voice_recordings_gmail_recovery(context) -> MaterializeResult:
     )
 
 
+@asset(
+    deps=[alice_voice_recordings_import, alice_voice_recordings_gmail_recovery],
+    group_name="alice_voice_recordings",
+    retry_policy=RetryPolicy(max_retries=3, delay=60),
+)
+def alice_voice_recordings_drive_ingest(context) -> MaterializeResult:
+    """Materialize the immutable Alice Drive archive into canonical tables."""
+    settings = load_settings(
+        require_gmail=False,
+        require_alice_voice_recordings=True,
+    )
+    if settings.alice_voice_recordings is None:
+        raise RuntimeError("Alice voice recordings import is not configured")
+    config = settings.alice_voice_recordings
+
+    with exclusive_sync_lock(
+        name="alice_voice_recordings_drive_ingest",
+        postgres_lock_id=ALICE_VOICE_RECORDINGS_DRIVE_INGEST_POSTGRES_LOCK_ID,
+    ) as acquired:
+        if not acquired:
+            context.log.warning("Skipping Alice Drive ingest because another run is already active")
+            summary = None
+        else:
+            object_store = _alice_object_store(config, settings)
+            summary = AliceVoiceRecordingsDriveIngestRunner(
+                warehouse=warehouse_from_settings(settings),
+                metadata_source=lambda: iter_archive_payloads(object_store=object_store),
+                logger=context.log,
+            ).sync()
+
+    return MaterializeResult(
+        metadata={
+            "metadata_seen": MetadataValue.int(summary.metadata_seen if summary else 0),
+            "recordings_written": MetadataValue.int(summary.recordings_written if summary else 0),
+            "artifacts_written": MetadataValue.int(summary.artifacts_written if summary else 0),
+        }
+    )
+
+
 alice_voice_recordings_import_job = define_asset_job(
     "alice_voice_recordings_import_job",
-    selection=[alice_voice_recordings_import, alice_voice_recordings_gmail_recovery],
+    selection=[
+        alice_voice_recordings_import,
+        alice_voice_recordings_gmail_recovery,
+        alice_voice_recordings_drive_ingest,
+    ],
 )
 
 
@@ -161,7 +209,11 @@ def alice_voice_recordings_import_daily(context):
 @definitions
 def defs() -> Definitions:
     return Definitions(
-        assets=[alice_voice_recordings_import, alice_voice_recordings_gmail_recovery],
+        assets=[
+            alice_voice_recordings_import,
+            alice_voice_recordings_gmail_recovery,
+            alice_voice_recordings_drive_ingest,
+        ],
         jobs=[alice_voice_recordings_import_job],
         schedules=[alice_voice_recordings_import_daily],
     )

@@ -118,7 +118,12 @@ func timelineGET(t *testing.T, srv *httptest.Server, path string, authed bool) (
 
 func TestTimelineAPIRequiresBearer(t *testing.T) {
 	srv := newTimelineTestServer(t, &fakeTimelineRunner{})
-	for _, path := range []string{"/api/timeline", "/api/timeline/sources", "/api/timeline/item?adapter=a&event_id=b"} {
+	for _, path := range []string{
+		"/api/timeline",
+		"/api/timeline/sources",
+		"/api/timeline/item?adapter=a&event_id=b",
+		"/api/timeline/item/children?adapter=a&event_id=b&child=c",
+	} {
 		resp, _ := timelineGET(t, srv, path, false)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("%s without bearer: got %d, want 401", path, resp.StatusCode)
@@ -140,6 +145,9 @@ func TestTimelinePageIsServedWithoutAuth(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `whoop: "#`) {
 		t.Fatal("timeline page is missing a distinct WHOOP source hue")
+	}
+	if !strings.Contains(string(body), `api("/api/timeline/item/children"`) || !strings.Contains(string(body), "load more") {
+		t.Fatal("timeline page is missing pageable child controls")
 	}
 }
 
@@ -397,6 +405,25 @@ func TestTimelineSourcesAggregatesAndCaches(t *testing.T) {
 			t.Fatalf("warming payload should expose WHOOP %s filters immediately: %s", kind, body)
 		}
 	}
+	for _, pair := range [][2]string{
+		{"alice_voice_recordings", "voice_recording"},
+		{"finance", "transaction"},
+		{"finance", "balance_observation"},
+		{"finance", "document"},
+		{"chatgpt", "agent_session"},
+		{"claude_code", "agent_session"},
+		{"claude_desktop", "agent_session"},
+		{"codex", "agent_session"},
+		{"openclaw", "agent_session"},
+		{"pi", "agent_session"},
+	} {
+		if !timelinePayloadHasSourceKind(first.Sources, pair[0], pair[1]) {
+			t.Fatalf("warming payload missing %s/%s: %s", pair[0], pair[1], body)
+		}
+	}
+	if timelinePayloadHasSourceKind(first.Sources, "agent_sessions", "agent_session") {
+		t.Fatalf("warming payload must not expose synthetic agent_sessions source: %s", body)
+	}
 	if !timelinePayloadHasPriority(first.Priorities, 1) || !timelinePayloadHasPriority(first.Priorities, 5) {
 		t.Fatalf("warming payload should include priority catalog: %s", body)
 	}
@@ -457,7 +484,8 @@ func TestTimelineChildQueriesCoverEveryEventTable(t *testing.T) {
 		"apple_voice_memos_files", "calendar_events", "google_drive_files",
 		"photo_assets", "contact_cards", "whoop_cycles", "whoop_recoveries",
 		"whoop_sleeps", "whoop_workouts", "upstream_mutations",
-		"upstream_mutation_requests", "agent_runs",
+		"upstream_mutation_requests", "agent_runs", "alice_voice_recordings",
+		"finance_transactions", "finance_observations", "manual_finance_documents",
 	}
 	for _, table := range expected {
 		if _, ok := timelineChildQueries[table]; !ok {
@@ -466,6 +494,89 @@ func TestTimelineChildQueriesCoverEveryEventTable(t *testing.T) {
 	}
 	if len(timelineChildQueries) != len(expected) {
 		t.Fatalf("timelineChildQueries has %d entries, want %d", len(timelineChildQueries), len(expected))
+	}
+}
+
+func TestTimelineDetailQueriesExposeEveryKnownRelationship(t *testing.T) {
+	apple := timelineChildQueries["apple_messages"]
+	whatsapp := timelineChildQueries["whatsapp_messages"]
+	joined := func(queries []timelineChildQuery) string {
+		parts := make([]string, 0, len(queries))
+		for _, query := range queries {
+			parts = append(parts, query.name+" "+query.sql)
+		}
+		return strings.Join(parts, "\n")
+	}
+	appleSQL := joined(apple)
+	for _, required := range []string{"content_type", "chats", "attachment_enrichments"} {
+		if !strings.Contains(appleSQL, required) {
+			t.Fatalf("Apple Messages detail queries missing %q: %s", required, appleSQL)
+		}
+	}
+	if !strings.Contains(joined(whatsapp), "attachment_enrichments") {
+		t.Fatalf("WhatsApp detail queries must expose attachment enrichment text")
+	}
+	if queries := timelineChildQueries["agent_session_events"]; len(queries) != 1 || queries[0].name != "events" {
+		t.Fatalf("agent session detail must use one pageable event stream: %#v", queries)
+	}
+	for table, queries := range timelineChildQueries {
+		for _, query := range queries {
+			if strings.Contains(strings.ToUpper(query.sql), " LIMIT ") {
+				t.Fatalf("%s/%s still has a fixed detail cap: %s", table, query.name, query.sql)
+			}
+		}
+	}
+}
+
+func TestTimelineItemChildrenArePageable(t *testing.T) {
+	item := timelineEventRow("e1", 20, "2026-06-01T12:00:00Z")
+	rows := make([]map[string]any, 0, 51)
+	for i := 0; i < 51; i++ {
+		rows = append(rows, map[string]any{"part_id": fmt.Sprintf("p-%02d", i)})
+	}
+	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
+		"FROM " + warehouse.SQLRelation("timeline_events"):   {Rows: []map[string]any{item}},
+		"FROM " + warehouse.SQLRelation("gmail_attachments"): {Rows: rows},
+		"row_to_json": {Rows: []map[string]any{{"row": `{"account":"z@x.test"}`}}},
+	}}
+	srv := newTimelineTestServer(t, runner)
+
+	resp, body := timelineGET(t, srv, "/api/timeline/item?adapter=gmail_email&event_id=e1", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("item got %d: %s", resp.StatusCode, body)
+	}
+	var detail struct {
+		Children     map[string][]map[string]any `json:"children"`
+		ChildrenMeta map[string]struct {
+			HasMore    bool `json:"has_more"`
+			NextOffset int  `json:"next_offset"`
+		} `json:"children_meta"`
+	}
+	if err := json.Unmarshal(body, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Children["attachments"]) != 50 || !detail.ChildrenMeta["attachments"].HasMore || detail.ChildrenMeta["attachments"].NextOffset != 50 {
+		t.Fatalf("first attachment page = %#v, meta = %#v", detail.Children["attachments"], detail.ChildrenMeta["attachments"])
+	}
+
+	resp, body = timelineGET(t, srv, "/api/timeline/item/children?adapter=gmail_email&event_id=e1&child=attachments&offset=50", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("children got %d: %s", resp.StatusCode, body)
+	}
+	var page struct {
+		Rows       []map[string]any `json:"rows"`
+		HasMore    bool             `json:"has_more"`
+		NextOffset int              `json:"next_offset"`
+	}
+	if err := json.Unmarshal(body, &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Rows) != 50 || !page.HasMore || page.NextOffset != 100 {
+		t.Fatalf("child page = %#v", page)
+	}
+	last := runner.call(runner.callCount() - 1)
+	if !strings.Contains(last.SQL, "LIMIT $3 OFFSET $4") || fmt.Sprint(last.Args) != "[z@x.test m1 51 50]" {
+		t.Fatalf("page query = %q args=%#v", last.SQL, last.Args)
 	}
 }
 
@@ -495,6 +606,7 @@ func TestTimelineChildRowsGetSignedMediaURLs(t *testing.T) {
 		"FROM " + warehouse.SQLRelation("whatsapp_media_items"): {Rows: []map[string]any{
 			{"filename": "photo.jpg", "mime_type": "image/jpeg", "is_missing": int64(0), "storage_file_id": "blob123"},
 			{"filename": "gone.jpg", "mime_type": "image/jpeg", "is_missing": int64(1), "storage_file_id": "blob999"},
+			{"filename": "voice.caf", "mime_type": "application/octet-stream", "content_type": "audio/x-caf", "is_missing": int64(0), "storage_file_id": "audio123"},
 		}},
 		"row_to_json": {Rows: []map[string]any{{"row": `{"account":"z@x.test"}`}}},
 	}}
@@ -510,7 +622,7 @@ func TestTimelineChildRowsGetSignedMediaURLs(t *testing.T) {
 		t.Fatal(err)
 	}
 	media := payload.Children["media"]
-	if len(media) != 2 {
+	if len(media) != 3 {
 		t.Fatalf("media rows = %#v", media)
 	}
 	stored := media[0]
@@ -523,6 +635,9 @@ func TestTimelineChildRowsGetSignedMediaURLs(t *testing.T) {
 	}
 	if _, ok := media[1]["media_url"]; ok {
 		t.Fatalf("missing blob must not get a media_url: %#v", media[1])
+	}
+	if media[2]["media_kind"] != "audio" {
+		t.Fatalf("normalized content_type must win over generic mime_type: %#v", media[2])
 	}
 }
 

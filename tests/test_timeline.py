@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from dotenv import load_dotenv
@@ -47,6 +49,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_calendar_tables()
     wh.ensure_contacts_tables()
     wh.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    wh.ensure_alice_voice_recordings_tables()
     wh.ensure_apple_notes_tables()
     wh.ensure_apple_messages_tables()
     wh.ensure_whatsapp_tables()
@@ -96,6 +99,19 @@ def test_adapter_names_are_unique_and_resolvable():
         adapter_by_name("nope")
 
 
+def test_timeline_includes_alice_and_finance_activity_adapters():
+    requested = {
+        "alice_voice_recording": ("alice_voice_recordings", "voice_recording"),
+        "finance_transaction": ("finance", "transaction"),
+        "finance_observation": ("finance", "balance_observation"),
+        "manual_finance_document": ("finance", "document"),
+    }
+
+    for adapter_name, expected_source_kind in requested.items():
+        adapter = adapter_by_name(adapter_name)
+        assert (adapter.source, adapter.kind) == expected_source_kind
+
+
 def test_detail_coverage_points_at_covered_tables():
     for table, coverage in TIMELINE_TABLE_COVERAGE.items():
         if coverage.role != "detail":
@@ -105,6 +121,31 @@ def test_detail_coverage_points_at_covered_tables():
         assert parent.role in ("events", "detail"), (
             f"{table} detail parent {coverage.parent!r} must chain to an events table"
         )
+
+        seen = {table}
+        cursor = coverage
+        while cursor.role == "detail":
+            assert cursor.parent not in seen, f"detail coverage cycle: {seen} -> {cursor.parent}"
+            seen.add(cursor.parent)
+            cursor = TIMELINE_TABLE_COVERAGE[cursor.parent]
+        assert cursor.role == "events", f"{table} does not ultimately belong to a timeline event"
+
+
+def test_go_warming_filter_catalog_matches_runtime_event_sources():
+    go_source = (
+        Path(__file__).resolve().parents[1] / "app" / "internal" / "server" / "timeline.go"
+    ).read_text()
+    catalog_block = go_source.split("var timelineFilterCatalog", 1)[1].split(
+        "var timelinePriorityCatalog", 1
+    )[0]
+    actual = set(re.findall(r'\{source: "([^"]+)", kind: "([^"]+)"\}', catalog_block))
+    expected = {
+        (adapter.source, adapter.kind)
+        for adapter in TIMELINE_ADAPTERS
+        if adapter.name != "agent_session"
+    }
+    expected.update((source, "agent_session") for source in AI_EVENT_SOURCE_RELATIONS)
+    assert actual == expected
 
 
 def test_coverage_roles_are_valid():
@@ -394,6 +435,15 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
+        INSERT INTO alice_voice_recordings (account, recording_id, title, filename,
+                                            content_type, recorded_at, duration_seconds, ingested_at)
+        VALUES ('z@x.test', 'alice-rec1', 'Alice walk', 'alice-walk.m4a',
+                'audio/mp4', %s, 321, %s)
+        """,
+        (_NOW - timedelta(hours=8, minutes=30), _NOW),
+    )
+    wh._command(
+        """
         INSERT INTO calendar_events (account, calendar_id, event_id, summary, description,
                                      organizer_email, start_at, end_at, updated_at, synced_at)
         VALUES ('z@x.test', 'cal1', 'ev1', 'Team sync', 'weekly', 'z@x.test', %s, %s, %s, %s)
@@ -473,6 +523,53 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
         """,
         (_NOW - timedelta(hours=14), _NOW - timedelta(hours=13, minutes=50)),
     )
+    sync_version = int(_NOW.timestamp() * 1_000_000)
+    wh._command(
+        """
+        INSERT INTO finance_accounts (account_id, account, name, kind, side, currency,
+                                      institution, created_at, updated_at, sync_version)
+        VALUES ('fa1', 'z@x.test', 'Checking', 'checking', 'asset', 'USD',
+                'Example Bank', %s, %s, %s)
+        """,
+        (_NOW, _NOW, sync_version),
+    )
+    wh._command(
+        """
+        INSERT INTO finance_transactions (transaction_id, account_id, posted_at, amount,
+                                          currency, description, merchant, pending, source,
+                                          created_at, sync_version)
+        VALUES ('ft1', 'fa1', %s, -12.34, 'USD', 'Lunch', 'Cafe', 0, 'plaid', %s, %s)
+        """,
+        (_NOW - timedelta(hours=15), _NOW, sync_version),
+    )
+    wh._command(
+        """
+        INSERT INTO finance_observations (account_id, as_of, kind, value, currency,
+                                          source, observed_at, sync_version)
+        VALUES ('fa1', '2026-05-31', 'balance', 1234.56, 'USD', 'plaid', %s, %s)
+        """,
+        (_NOW, sync_version),
+    )
+    wh._command(
+        """
+        INSERT INTO manual_finance_documents (source, account, source_native_id, filename,
+                                              original_path, mime_type, content_sha256,
+                                              file_modified_at, ingested_at, sync_version)
+        VALUES ('manual', 'z@x.test', 'docsha', 'statement.pdf', 'Bank/Checking',
+                'application/pdf', 'docsha', %s, %s, %s)
+        """,
+        (_NOW - timedelta(hours=16), _NOW, sync_version),
+    )
+    wh._command(
+        """
+        INSERT INTO manual_finance_extractions (content_sha256, ai_provider, ai_model,
+                                                ai_prompt_version, status, institution,
+                                                period_end, summary, created_at, sync_version)
+        VALUES ('docsha', 'agent_codex', 'm', 'v1', 'completed', 'Example Bank',
+                '2026-06-01', 'Monthly checking statement', %s, %s)
+        """,
+        (_NOW, sync_version),
+    )
 
 
 # The seeded fixture rows exercise one classification branch per adapter:
@@ -491,10 +588,14 @@ EXPECTED_SEEDED_PRIORITIES = {
     "agent_session": 1,
     "apple_note_revision": 1,
     "voice_memo": 1,
+    "alice_voice_recording": 1,
     "calendar_event": 1,
     "drive_file": 3,
     "photo": 1,
     "contact_update": 5,
+    "finance_transaction": 1,
+    "finance_observation": 1,
+    "manual_finance_document": 1,
     "mutation": 5,
     "mutation_request": 5,
     "enrichment_run": 5,
@@ -509,10 +610,14 @@ EXPECTED_SEEDED_EVENTS = {
     "agent_session": 1,
     "apple_note_revision": 1,
     "voice_memo": 1,
+    "alice_voice_recording": 1,
     "calendar_event": 1,
     "drive_file": 1,
     "photo": 1,
     "contact_update": 1,
+    "finance_transaction": 1,
+    "finance_observation": 1,
+    "manual_finance_document": 1,
     "mutation": 1,
     "mutation_request": 1,
     "enrichment_run": 1,
@@ -536,9 +641,9 @@ def test_backfill_normalizes_every_source(warehouse):
         "SELECT * FROM timeline_events ORDER BY event_ts DESC"
     )
     assert len(rows) == sum(EXPECTED_SEEDED_EVENTS.values())
-    # Newest first: gmail (NOW-1h) ... enrichment run (NOW-14h).
+    # Newest first: gmail (NOW-1h); finance observations include older days.
     assert rows[0]["adapter"] == "gmail_email"
-    assert rows[-1]["adapter"] == "enrichment_run"
+    assert rows[-1]["adapter"] == "finance_observation"
 
     gmail = rows[0]
     assert gmail["source"] == "gmail"
@@ -576,6 +681,23 @@ def test_backfill_normalizes_every_source(warehouse):
     memo = next(r for r in rows if r["adapter"] == "voice_memo")
     assert memo["title"] == "Standup notes"
     assert memo["snippet"] == "we discussed things"
+
+    alice = next(r for r in rows if r["adapter"] == "alice_voice_recording")
+    assert alice["title"] == "Alice walk"
+    assert alice["snippet"] == "321 seconds"
+
+    transaction = next(r for r in rows if r["adapter"] == "finance_transaction")
+    assert transaction["title"] == "Cafe"
+    assert transaction["snippet"] == "-12.34 USD"
+    assert transaction["context"] == "Example Bank · Checking"
+
+    observation = next(r for r in rows if r["adapter"] == "finance_observation")
+    assert observation["title"] == "Checking balance"
+    assert observation["snippet"] == "1234.56 USD"
+
+    document = next(r for r in rows if r["adapter"] == "manual_finance_document")
+    assert document["title"] == "statement.pdf"
+    assert document["snippet"] == "Monthly checking statement"
 
     cal = next(r for r in rows if r["adapter"] == "calendar_event")
     assert cal["end_ts"] > cal["event_ts"]
