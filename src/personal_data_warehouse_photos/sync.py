@@ -1,13 +1,9 @@
 """Apple Photos upload runner.
 
-Snapshot the library DB, resolve file candidates, and upload each present,
-not-yet-uploaded file through the app's shared photo endpoints (blob +
-envelope). Coverage is a first-class output: in an "Optimize Mac Storage"
-library most originals are cloud-only placeholders, so every run reports
-present/missing counts instead of pretending the local disk is the library.
-Missing files simply defer — they upload on a later run once Photos
-materializes them (or arrive at full resolution via a future Google Photos
-Takeout import, which the identity layer dedups against).
+Snapshot the library DB, resolve original-resource candidates, export each
+selected resource through PhotoKit with iCloud network access enabled, and
+upload its complete bytes through the app's shared photo endpoints (blob +
+envelope). The local ``originals/`` cache is never used as a source of truth.
 """
 
 from __future__ import annotations
@@ -19,9 +15,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from personal_data_warehouse_photos.envelope import build_photo_metadata, provenance_dedup_sha256
+from personal_data_warehouse_photos.exporter import ExportedPhotoFile, PhotoKitAssetExporter
 from personal_data_warehouse_photos.scanner import (
     PhotoFileCandidate,
-    default_originals_root,
     scan_photo_file_candidates,
     snapshot_photos_store,
 )
@@ -34,14 +30,13 @@ PHOTO_SOURCE = "apple_photos"
 class PhotosUploadSummary:
     assets_seen: int
     files_seen: int
-    files_present: int
-    files_missing: int
     files_selected: int
     files_skipped: int
+    files_exported: int
     files_uploaded: int
     metadata_uploaded: int
     files_deferred_oversize: int
-    bytes_present: int = 0
+    bytes_exported: int = 0
     bytes_uploaded: int = 0
 
 
@@ -59,6 +54,7 @@ class PhotosUploadRunner:
         upload_state: PhotosUploadState | None = None,
         before_upload_check=None,
         max_upload_bytes: int | None = None,
+        resource_exporter=None,
     ) -> None:
         if ingest_client is None:
             raise ValueError("ingest_client is required")
@@ -79,32 +75,28 @@ class PhotosUploadRunner:
         self._mode = mode
         self._upload_state = upload_state
         self._before_upload_check = before_upload_check
+        self._resource_exporter = resource_exporter or PhotoKitAssetExporter()
 
     def sync(self) -> PhotosUploadSummary:
         self._logger.info("Scanning Apple Photos library at %s", self._library_path)
-        with tempfile.TemporaryDirectory(prefix="pdw-photos-") as snapshot_dir:
-            snapshot = snapshot_photos_store(self._library_path, snapshot_dir)
-            candidates = scan_photo_file_candidates(
-                snapshot, originals_root=default_originals_root(self._library_path)
-            )
+        with tempfile.TemporaryDirectory(prefix="pdw-photos-") as working_dir:
+            snapshot = snapshot_photos_store(self._library_path, working_dir)
+            candidates = scan_photo_file_candidates(snapshot)
+            return self._sync_candidates(candidates, export_dir=Path(working_dir) / "exports")
 
+    def _sync_candidates(
+        self,
+        candidates: list[PhotoFileCandidate],
+        *,
+        export_dir: Path,
+    ) -> PhotosUploadSummary:
+        export_dir.mkdir(parents=True, exist_ok=True)
         assets_seen = len({candidate.native_id for candidate in candidates})
-        present = [candidate for candidate in candidates if candidate.present]
-        missing = len(candidates) - len(present)
-        bytes_present = sum(candidate.size_bytes for candidate in present)
         self._logger.info(
-            "Library coverage: assets=%s files=%s present=%s missing=%s (%s local)",
+            "Apple Photos inventory: assets=%s original_resources=%s (full bytes exported via PhotoKit)",
             assets_seen,
             len(candidates),
-            len(present),
-            missing,
-            format_bytes(bytes_present),
         )
-        if missing:
-            self._logger.info(
-                "Missing originals are cloud-only placeholders (Optimize Mac Storage); "
-                "they defer and re-check every run"
-            )
         # v1 uploads originals only; edited renditions (Photos' adjusted
         # output under resources/renders) are a known follow-up. Keep the
         # count visible so the gap never reads as complete coverage.
@@ -124,16 +116,7 @@ class PhotosUploadRunner:
         selected: list[PhotoFileCandidate] = []
         state_skipped = 0
         oversize_deferred = 0
-        for candidate in present:
-            if self._max_upload_bytes is not None and candidate.size_bytes > self._max_upload_bytes:
-                oversize_deferred += 1
-                self._logger.warning(
-                    "Deferring %s (%s): exceeds the %s upload ceiling for the current route",
-                    candidate.filename,
-                    format_bytes(candidate.size_bytes),
-                    format_bytes(self._max_upload_bytes),
-                )
-                continue
+        for candidate in candidates:
             if self._mode == "incremental" and self._is_state_complete(candidate):
                 state_skipped += 1
                 continue
@@ -157,14 +140,12 @@ class PhotosUploadRunner:
                 return PhotosUploadSummary(
                     assets_seen=assets_seen,
                     files_seen=len(candidates),
-                    files_present=len(present),
-                    files_missing=missing,
                     files_selected=len(selected),
                     files_skipped=state_skipped,
+                    files_exported=0,
                     files_uploaded=0,
                     metadata_uploaded=0,
                     files_deferred_oversize=oversize_deferred,
-                    bytes_present=bytes_present,
                 )
 
         # Per-file failures are collected, not raised mid-batch (voice-memos
@@ -174,10 +155,40 @@ class PhotosUploadRunner:
         failures: list[tuple[str, Exception]] = []
         uploaded = 0
         metadata_uploaded = 0
+        exported_count = 0
+        bytes_exported = 0
         bytes_uploaded = 0
         for index, candidate in enumerate(selected, start=1):
+            exported: ExportedPhotoFile | None = None
             try:
-                self._upload_candidate(index=index, total=len(selected), candidate=candidate)
+                self._logger.info(
+                    "[%s/%s] Exporting full original %s (%s) through PhotoKit",
+                    index,
+                    len(selected),
+                    candidate.filename,
+                    candidate.role,
+                )
+                exported = self._resource_exporter.export(candidate, export_dir)
+                exported_count += 1
+                bytes_exported += exported.size_bytes
+                if (
+                    self._max_upload_bytes is not None
+                    and exported.size_bytes > self._max_upload_bytes
+                ):
+                    oversize_deferred += 1
+                    self._logger.warning(
+                        "Deferring %s (%s): exceeds the %s upload ceiling for the current route",
+                        exported.filename,
+                        format_bytes(exported.size_bytes),
+                        format_bytes(self._max_upload_bytes),
+                    )
+                    continue
+                self._upload_candidate(
+                    index=index,
+                    total=len(selected),
+                    candidate=candidate,
+                    exported=exported,
+                )
             except Exception as exc:  # noqa: BLE001 - surfaced after the batch
                 self._logger.warning("Failed to upload %s: %s", candidate.filename, exc)
                 failures.append((candidate.filename, exc))
@@ -190,31 +201,40 @@ class PhotosUploadRunner:
                         now=self._now(),
                     )
                 continue
+            finally:
+                if exported is not None:
+                    try:
+                        exported.path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        self._logger.warning(
+                            "Could not remove temporary PhotoKit export %s: %s",
+                            exported.path,
+                            exc,
+                        )
             uploaded += 1
             metadata_uploaded += 1
-            bytes_uploaded += candidate.size_bytes
+            bytes_uploaded += exported.size_bytes
 
         summary = PhotosUploadSummary(
             assets_seen=assets_seen,
             files_seen=len(candidates),
-            files_present=len(present),
-            files_missing=missing,
             files_selected=len(selected),
             files_skipped=state_skipped,
+            files_exported=exported_count,
             files_uploaded=uploaded,
             metadata_uploaded=metadata_uploaded,
             files_deferred_oversize=oversize_deferred,
-            bytes_present=bytes_present,
+            bytes_exported=bytes_exported,
             bytes_uploaded=bytes_uploaded,
         )
         self._logger.info(
-            "Photo upload summary: assets=%s files=%s present=%s missing=%s selected=%s "
+            "Photo upload summary: assets=%s original_resources=%s selected=%s exported=%s (%s) "
             "uploaded=%s (%s) skipped=%s oversize_deferred=%s",
             summary.assets_seen,
             summary.files_seen,
-            summary.files_present,
-            summary.files_missing,
             summary.files_selected,
+            summary.files_exported,
+            format_bytes(summary.bytes_exported),
             summary.files_uploaded,
             format_bytes(summary.bytes_uploaded),
             summary.files_skipped,
@@ -240,31 +260,38 @@ class PhotosUploadRunner:
             fingerprint=candidate.fingerprint,
         )
 
-    def _upload_candidate(self, *, index: int, total: int, candidate: PhotoFileCandidate) -> None:
-        content = candidate.path.read_bytes()
+    def _upload_candidate(
+        self,
+        *,
+        index: int,
+        total: int,
+        candidate: PhotoFileCandidate,
+        exported: ExportedPhotoFile,
+    ) -> None:
+        content = exported.path.read_bytes()
         content_sha256 = hashlib.sha256(content).hexdigest()
         captured_at = candidate.captured_at or self._now().strftime("%Y-%m-%dT%H:%M:%S")
         self._logger.info(
             "[%s/%s] Uploading %s (%s, %s)",
             index,
             total,
-            candidate.filename,
+            exported.filename,
             candidate.role,
             format_bytes(len(content)),
         )
         stored = self._ingest_client.upload_photo_file(
             content,
             captured_at=captured_at,
-            extension=candidate.extension,
-            content_type=candidate.mime_type,
+            extension=exported.extension,
+            content_type=exported.mime_type,
         )
         envelope = build_photo_metadata(
             source=PHOTO_SOURCE,
             account=self._account,
             native_id=candidate.native_id,
             role=candidate.role,
-            filename=candidate.filename,
-            mime_type=candidate.mime_type,
+            filename=exported.filename,
+            mime_type=exported.mime_type,
             size_bytes=len(content),
             content_sha256=content_sha256,
             uploaded_at=self._now().isoformat(),

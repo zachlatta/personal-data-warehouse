@@ -16,6 +16,7 @@ from personal_data_warehouse_voice_memos.network import (
     is_transient_upload_error,
     preflight_app_ingest,
 )
+from personal_data_warehouse_photos.exporter import PHOTOS_AUTHORIZED_STATUS, PhotoKitAssetExporter
 from personal_data_warehouse_photos.state import PhotosUploadState, default_state_file
 from personal_data_warehouse_photos.sync import PhotosUploadRunner
 
@@ -29,7 +30,9 @@ class CliLogger:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload local Apple Photos originals through the app ingest API.")
+    parser = argparse.ArgumentParser(
+        description="Download and upload full Apple Photos originals through the app ingest API."
+    )
     parser.add_argument("--limit", type=int, default=0, help="Maximum files to upload this run; 0 means no limit")
     parser.add_argument("--mode", choices=("incremental", "full"), default="incremental", help="Upload mode")
     parser.add_argument("--state-file", type=Path, default=default_state_file(), help="Incremental upload state path")
@@ -40,11 +43,26 @@ def main() -> None:
         help="Nonblocking lock path used to avoid overlapping scheduled runs",
     )
     parser.add_argument(
+        "--authorize",
+        action="store_true",
+        help="Request one-time macOS Photos library access and exit",
+    )
+    parser.add_argument(
         "--network-diagnostics",
         action="store_true",
         help="Print network guard diagnostics and exit",
     )
     args = parser.parse_args()
+
+    if args.authorize:
+        status = PhotoKitAssetExporter(timeout_seconds=300).request_authorization()
+        if status != PHOTOS_AUTHORIZED_STATUS:
+            raise RuntimeError(
+                "Full Photos library access was not granted. Allow Full Access in "
+                "System Settings → Privacy & Security → Photos."
+            )
+        print("Photos library access granted")
+        return
 
     if args.network_diagnostics:
         print_network_diagnostics()
@@ -96,9 +114,8 @@ def main() -> None:
         "Photo upload complete: "
         f"assets={summary.assets_seen} "
         f"files={summary.files_seen} "
-        f"present={summary.files_present} "
-        f"missing={summary.files_missing} "
         f"selected={summary.files_selected} "
+        f"exported={summary.files_exported} "
         f"uploaded={summary.files_uploaded} "
         f"skipped={summary.files_skipped} "
         f"oversize_deferred={summary.files_deferred_oversize}"

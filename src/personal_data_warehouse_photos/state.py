@@ -1,9 +1,9 @@
 """Per-file upload state for the Apple Photos uploader.
 
-Sqlite state DB keyed by (source_type, source_id) with a disk-facts
-fingerprint (size|mtime_ns) — the apple-messages pattern. The metadata table
-wipes state whenever the account/library/schema changes so stale completeness
-never suppresses uploads against a different library.
+Sqlite state DB keyed by (source_type, source_id) with a stable Photos-metadata
+fingerprint. The metadata table wipes state whenever the account/library/schema
+changes so stale completeness never suppresses uploads against a different
+library.
 """
 
 from __future__ import annotations

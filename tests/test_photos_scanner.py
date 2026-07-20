@@ -20,7 +20,6 @@ def _build_fixture_library(root: Path) -> Path:
     """A minimal .photoslibrary with the schema subset the scanner reads."""
     library = root / "Fixture.photoslibrary"
     (library / "database").mkdir(parents=True)
-    (library / "originals" / "A").mkdir(parents=True)
     db = library / "database" / "Photos.sqlite"
     connection = sqlite3.connect(db)
     connection.executescript(
@@ -48,11 +47,11 @@ def _build_fixture_library(root: Path) -> Path:
         """
     )
     rows = [
-        # Present live photo still (kind 0, subtype 2) with GPS + camera.
+        # Live photo still (kind 0, subtype 2) with GPS + camera.
         (1, "UUID-LIVE", "A", "UUID-LIVE.heic", 0, 2, "public.heic",
          _CAPTURE_COCOA, _CAPTURE_COCOA + 10, _CAPTURE_COCOA + 10,
          4284, 5712, 45.5, -122.6, 0, 0, 0, 0),
-        # Plain photo whose original is cloud-only (no file on disk).
+        # Plain photo whose original is cloud-only.
         (2, "UUID-MISSING", "A", "UUID-MISSING.heic", 0, 0, "public.heic",
          _CAPTURE_COCOA - 100, _CAPTURE_COCOA, _CAPTURE_COCOA,
          4032, 3024, -180.0, -180.0, 0, 0, 0, 0),
@@ -81,28 +80,26 @@ def _build_fixture_library(root: Path) -> Path:
     connection.commit()
     connection.close()
 
-    (library / "originals" / "A" / "UUID-LIVE.heic").write_bytes(b"still-bytes")
-    (library / "originals" / "A" / "UUID-LIVE_3.mov").write_bytes(b"live-video-bytes")
-    (library / "originals" / "A" / "UUID-VIDEO.mov").write_bytes(b"video-bytes")
-    # UUID-MISSING deliberately has no file (cloud-only placeholder).
     return library
 
 
 def _scan(tmp_path: Path):
     library = _build_fixture_library(tmp_path)
     snapshot = snapshot_photos_store(library, tmp_path / "snap")
-    return scan_photo_file_candidates(snapshot, originals_root=library / "originals")
+    return scan_photo_file_candidates(snapshot)
 
 
-def test_scanner_excludes_trashed_and_classifies_missing(tmp_path):
+def test_scanner_excludes_trashed_and_includes_icloud_only_assets(tmp_path):
     (tmp_path / "snap").mkdir()
     candidates = _scan(tmp_path)
     by_id = {(c.native_id, c.role): c for c in candidates}
     assert ("UUID-TRASHED", "original") not in by_id
-    missing = by_id[("UUID-MISSING", "original")]
-    assert missing.present is False
-    assert missing.size_bytes == 0
-    # Missing is a classification, never an exception.
+    cloud_only = by_id[("UUID-MISSING", "original")]
+    assert cloud_only.filename == "IMG_0002.HEIC"
+    assert cloud_only.expected_size_bytes == 2_000_000
+    # Local disk presence is deliberately not part of the scanner contract.
+    assert not hasattr(cloud_only, "present")
+    assert not hasattr(cloud_only, "path")
 
 
 def test_scanner_emits_live_video_sibling_under_the_stills_native_id(tmp_path):
@@ -111,10 +108,9 @@ def test_scanner_emits_live_video_sibling_under_the_stills_native_id(tmp_path):
     by_id = {(c.native_id, c.role): c for c in candidates}
     still = by_id[("UUID-LIVE", "original")]
     live = by_id[("UUID-LIVE", "live_video")]
-    assert still.present and live.present
     assert still.mime_type == "image/heic"
     assert live.mime_type == "video/quicktime"
-    assert live.filename == "UUID-LIVE_3.mov"
+    assert live.filename == "IMG_0001.MOV"
     # Same native id is the contract that attaches the .mov to the still.
     assert live.native_id == still.native_id
     # The non-live, non-video assets get no sibling.
@@ -172,11 +168,12 @@ def test_snapshot_probe_errors_convert_to_permission_error(tmp_path):
         _probe_openable(tmp_path / "missing.sqlite", timeout_seconds=2)
 
 
-def test_scanner_orders_newest_first_and_fingerprints_disk_facts(tmp_path):
+def test_scanner_orders_newest_first_and_fingerprints_photos_metadata(tmp_path):
     (tmp_path / "snap").mkdir()
     candidates = _scan(tmp_path)
     originals = [c for c in candidates if c.role == "original"]
     assert [c.native_id for c in originals] == ["UUID-LIVE", "UUID-MISSING", "UUID-VIDEO"]
     still = originals[0]
-    assert still.fingerprint == f"{still.size_bytes}|{still.file_modified_ns}"
+    assert still.fingerprint.startswith("photokit-v2|")
+    assert len(still.fingerprint) == len("photokit-v2|") + 64
     assert still.state_id == "UUID-LIVE|original"

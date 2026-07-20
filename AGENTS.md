@@ -305,7 +305,7 @@ This Mac is intended to run the local Apple Photos uploader through a user Launc
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.photos-upload.plist`
 - Wrapper script: `bin/photos-upload-launchd`
 - Run cadence: every 1800 seconds with `RunAtLoad`
-- Command: `uv run python -m personal_data_warehouse_photos.cli --mode incremental` (the wrapper runs uv DIRECTLY — pdw self-updates invalidate TCC grants attributed to it, so it must stay out of every uploader exec chain; credentials are read from `~/.config/pdw/config.json`)
+- Command: `uv run python -m personal_data_warehouse_photos.cli --mode incremental --limit 100` (override the bounded-run default with `PHOTOS_UPLOAD_LIMIT`; the wrapper runs uv DIRECTLY — pdw self-updates invalidate TCC grants attributed to it, so it must stay out of every uploader exec chain; credentials are read from `~/.config/pdw/config.json`)
 - Main run log: `~/Library/Logs/personal-data-warehouse/photos-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/photos-upload.heartbeat`
 - Status helper: `bin/photos-upload-status`
@@ -333,14 +333,30 @@ If the run log shows `PermissionError` for `~/Pictures/Photos Library.photoslibr
 LaunchAgent is loaded correctly but macOS Full Disk Access is blocking the background process —
 the same FDA/uv-python-path-drift story as the other uploaders above.
 
-The uploader snapshots `Photos.sqlite` (never reads the live DB), uploads each present original
-(plus a Live Photo's `<uuid>_3.mov` motion sibling, under the still's ZUUID with
-`role=live_video`) through `POST /ingest/photos/file` + `/ingest/photos/metadata`, and reports
-**coverage** every run: in an "Optimize Mac Storage" library most originals are cloud-only
-placeholders, so expect `missing=` counts — those defer and re-check every run, never error.
-Files above the route's upload ceiling defer likewise; edited renditions are not uploaded yet
-(originals only; the run log counts assets with adjustments). First backfill ramp:
-`pdw ingest apple-photos --mode full --limit N`.
+The uploader also needs the macOS Photos privacy grant used by PhotoKit. PhotoKit runs in a tiny
+native helper cached at `~/Library/Application Support/personal-data-warehouse/photos-helper/`;
+the helper has a stable identifier and an embedded `NSPhotoLibraryUsageDescription` (an
+unbundled Python process cannot reliably request this permission). Request access once from an
+interactive terminal with `uv run python -m personal_data_warehouse_photos.cli --authorize`,
+grant **Full Access** (Selected Photos is insufficient), and then kickstart the LaunchAgent. The
+helper is rebuilt only when its checked-in Swift source or privacy plist changes; because it is
+ad-hoc signed, such a change requires running `--authorize` again. If a run reports that Photos
+access was denied or limited, repair it in System Settings → Privacy & Security → Photos.
+
+The uploader snapshots `Photos.sqlite` (never reads the live DB) for metadata and candidate
+selection, but deliberately never reads `Photos Library.photoslibrary/originals` for media:
+under Optimize Mac Storage that tree is only an incomplete cache. Every selected resource is
+exported through PhotoKit with iCloud network access enabled, so Photos downloads the complete
+original before upload. Photo and video assets request PhotoKit's original resource type; Live
+Photos also request the original paired-video resource under the still's ZUUID with
+`role=live_video`. A missing asset, failed iCloud download, empty export, or size mismatch is a
+loud run failure that retries later—never a successful local-only coverage count. Complete bytes
+then go through `POST /ingest/photos/file` + `/ingest/photos/metadata`. Files above the route's
+upload ceiling defer after export; edited renditions are not uploaded yet (originals only; the
+run log counts assets with adjustments). The scheduled 100-resource limit bounds disk/network
+work and still walks the backlog because incremental state selection happens before the limit.
+For a manual backfill batch, use `pdw ingest apple-photos --mode incremental --limit N`; `full`
+is only for intentionally re-exporting already-complete resources.
 
 Serverside, `photos_drive_inbox_sensor` + `photos_drive_ingest` consume the inbox into
 `apple_photos.files`; the `photo_identity` asset dedups renditions into logical photos

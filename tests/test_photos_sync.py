@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from personal_data_warehouse_photos.exporter import ExportedPhotoFile, PhotoExportError
 from personal_data_warehouse_photos.state import PhotosUploadState
 from personal_data_warehouse_photos.sync import PhotosUploadRunner
 
@@ -58,6 +59,40 @@ class _FakeIngestClient:
         return {"storage_backend": "google_drive", "storage_key": "photos/inbox/meta", "storage_file_id": "fid-m"}
 
 
+class _FakeExporter:
+    _CONTENT = {
+        ("UUID-LIVE", "original"): b"still-bytes",
+        ("UUID-LIVE", "live_video"): b"live-video-bytes",
+        ("UUID-MISSING", "original"): b"cloud",
+        ("UUID-VIDEO", "original"): b"video-bytes",
+    }
+
+    def __init__(self, *, fail_ids: frozenset[tuple[str, str]] = frozenset()) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._fail_ids = fail_ids
+        self.max_staged_files = 0
+
+    def export(self, candidate, destination_dir):
+        key = (candidate.native_id, candidate.role)
+        self.calls.append(key)
+        if key in self._fail_ids:
+            raise PhotoExportError(f"iCloud failed for {candidate.filename}")
+        content = self._CONTENT[key]
+        path = Path(destination_dir) / f"{candidate.native_id}-{candidate.role}{candidate.extension}"
+        path.write_bytes(content)
+        self.max_staged_files = max(
+            self.max_staged_files,
+            sum(1 for item in Path(destination_dir).iterdir() if item.is_file()),
+        )
+        return ExportedPhotoFile(
+            path=path,
+            filename=candidate.filename,
+            extension=candidate.extension,
+            mime_type=candidate.mime_type,
+            size_bytes=len(content),
+        )
+
+
 def _runner(tmp_path: Path, client, **kwargs) -> tuple[PhotosUploadRunner, PhotosUploadState, Path]:
     library = kwargs.pop("library", None) or _build_fixture_library(tmp_path)
     state = PhotosUploadState.open(
@@ -70,24 +105,42 @@ def _runner(tmp_path: Path, client, **kwargs) -> tuple[PhotosUploadRunner, Photo
         logger=_Logger(),
         now=lambda: datetime(2026, 6, 2, 12, 0, tzinfo=UTC),
         upload_state=state,
+        resource_exporter=kwargs.pop("resource_exporter", _FakeExporter()),
         **kwargs,
     )
     return runner, state, library
 
 
-def test_sync_uploads_present_files_and_reports_coverage(tmp_path):
+def test_sync_downloads_and_uploads_every_original_including_icloud_only(tmp_path):
     client = _FakeIngestClient()
     runner, state, _ = _runner(tmp_path, client)
     summary = runner.sync()
-    # 3 assets scanned; live still + live video + plain video are present,
-    # the cloud-only original is missing and deferred (not an error).
+    # 3 assets scanned; PhotoKit exports all four original resources, including
+    # the photo with no bytes in the local Photos-library cache.
     assert summary.assets_seen == 3
     assert summary.files_seen == 4
-    assert summary.files_present == 3
-    assert summary.files_missing == 1
-    assert summary.files_uploaded == 3
-    assert summary.metadata_uploaded == 3
-    assert len(client.files) == 3 and len(client.metadata) == 3
+    assert summary.files_exported == 4
+    assert summary.files_uploaded == 4
+    assert summary.metadata_uploaded == 4
+    assert len(client.files) == 4 and len(client.metadata) == 4
+    uploaded_ids = {
+        (item["payload"]["file"]["native_id"], item["payload"]["file"]["role"])
+        for item in client.metadata
+    }
+    assert ("UUID-MISSING", "original") in uploaded_ids
+    state.close()
+
+
+def test_sync_removes_each_temporary_full_export_after_upload(tmp_path):
+    client = _FakeIngestClient()
+    exporter = _FakeExporter()
+    runner, state, _ = _runner(tmp_path, client, resource_exporter=exporter)
+
+    runner.sync()
+
+    # A large backfill must not retain every hydrated original until the end
+    # of the run and consume the size of the whole library in temporary space.
+    assert exporter.max_staged_files == 1
     state.close()
 
 
@@ -111,7 +164,7 @@ def test_sync_skips_state_complete_files_and_reuploads_on_fingerprint_change(tmp
     client = _FakeIngestClient()
     runner, state, library = _runner(tmp_path, client)
     runner.sync()
-    assert len(client.files) == 3
+    assert len(client.files) == 4
 
     # Second run: everything complete, nothing re-uploads.
     client2 = _FakeIngestClient()
@@ -122,15 +175,18 @@ def test_sync_skips_state_complete_files_and_reuploads_on_fingerprint_change(tmp
         logger=_Logger(),
         now=lambda: datetime(2026, 6, 2, 13, 0, tzinfo=UTC),
         upload_state=state,
+        resource_exporter=_FakeExporter(),
     )
     summary = runner2.sync()
     assert summary.files_uploaded == 0
-    assert summary.files_skipped == 3
+    assert summary.files_skipped == 4
     assert client2.files == []
 
-    # Touch one file (fingerprint changes) -> exactly that file re-uploads.
-    still = library / "originals" / "A" / "UUID-LIVE.heic"
-    still.write_bytes(b"still-bytes-v2")
+    # Change one Photos metadata record (fingerprint changes) -> exactly that
+    # original resource re-exports and re-uploads.
+    with sqlite3.connect(library / "database" / "Photos.sqlite") as connection:
+        connection.execute("UPDATE ZASSET SET ZFAVORITE = 1 WHERE ZUUID = 'UUID-VIDEO'")
+        connection.commit()
     client3 = _FakeIngestClient()
     runner3 = PhotosUploadRunner(
         account="z@x.test",
@@ -139,10 +195,11 @@ def test_sync_skips_state_complete_files_and_reuploads_on_fingerprint_change(tmp
         logger=_Logger(),
         now=lambda: datetime(2026, 6, 2, 14, 0, tzinfo=UTC),
         upload_state=state,
+        resource_exporter=_FakeExporter(),
     )
     summary = runner3.sync()
     assert summary.files_uploaded == 1
-    assert client3.files[0]["extension"] == ".heic"
+    assert client3.files[0]["extension"] == ".mov"
     state.close()
 
 
@@ -150,9 +207,11 @@ def test_sync_defers_oversize_files_with_visible_count(tmp_path):
     client = _FakeIngestClient()
     runner, state, _ = _runner(tmp_path, client, max_upload_bytes=12)
     summary = runner.sync()
-    # live-video-bytes (16) exceeds the 12-byte ceiling; the rest upload.
+    # live-video-bytes (16) exceeds the 12-byte ceiling after PhotoKit exports
+    # it; the other full resources upload.
     assert summary.files_deferred_oversize == 1
-    assert summary.files_uploaded == 2
+    assert summary.files_exported == 4
+    assert summary.files_uploaded == 3
     state.close()
 
 
@@ -162,7 +221,7 @@ def test_sync_collects_failures_and_reraises_after_the_batch(tmp_path):
     with pytest.raises(RuntimeError, match="boom on IMG_0001.HEIC"):
         runner.sync()
     # The other files still uploaded and are recorded complete...
-    assert len(client.metadata) == 2
+    assert len(client.metadata) == 3
     entry = state.entry_for(source_type="asset_file", source_id="UUID-VIDEO|original")
     assert entry is not None and entry.complete
     # ...while the failed one is recorded as failing, not complete.
@@ -187,6 +246,7 @@ def test_sync_limit_applies_after_state_selection(tmp_path):
         logger=_Logger(),
         now=lambda: datetime(2026, 6, 2, 13, 0, tzinfo=UTC),
         upload_state=state,
+        resource_exporter=_FakeExporter(),
         limit=1,
     )
     summary2 = runner2.sync()
@@ -197,10 +257,33 @@ def test_sync_limit_applies_after_state_selection(tmp_path):
 
 def test_before_upload_check_blocks_the_batch(tmp_path):
     client = _FakeIngestClient()
-    runner, state, _ = _runner(tmp_path, client, before_upload_check=lambda: "metered network")
+    exporter = _FakeExporter()
+    runner, state, _ = _runner(
+        tmp_path,
+        client,
+        before_upload_check=lambda: "metered network",
+        resource_exporter=exporter,
+    )
     summary = runner.sync()
     assert summary.files_uploaded == 0
     assert client.files == []
+    assert exporter.calls == []
+    state.close()
+
+
+def test_sync_fails_loudly_when_an_icloud_original_cannot_be_downloaded(tmp_path):
+    client = _FakeIngestClient()
+    exporter = _FakeExporter(fail_ids=frozenset({("UUID-MISSING", "original")}))
+    runner, state, _ = _runner(tmp_path, client, resource_exporter=exporter)
+
+    with pytest.raises(PhotoExportError, match="iCloud failed for IMG_0002.HEIC"):
+        runner.sync()
+
+    # Other originals still upload, but the missing full file makes the run
+    # non-zero and records a retryable failure instead of false coverage.
+    assert len(client.metadata) == 3
+    failed = state.entry_for(source_type="asset_file", source_id="UUID-MISSING|original")
+    assert failed is not None and not failed.complete
     state.close()
 
 

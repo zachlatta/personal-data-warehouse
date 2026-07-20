@@ -102,6 +102,7 @@ def test_photos_runner_uploads_via_ingest_client(tmp_path: Path) -> None:
     from personal_data_warehouse_photos.envelope import provenance_dedup_sha256
     from personal_data_warehouse_photos.sync import PhotosUploadRunner
     from tests.test_photos_scanner import _build_fixture_library
+    from tests.test_photos_sync import _FakeExporter
 
     library = _build_fixture_library(tmp_path)
     client = _FakePhotoIngestClient()
@@ -112,10 +113,11 @@ def test_photos_runner_uploads_via_ingest_client(tmp_path: Path) -> None:
         ingest_client=client,
         logger=_CaptureLogger(),
         now=lambda: datetime(2026, 6, 2, 12, tzinfo=UTC),
+        resource_exporter=_FakeExporter(),
     ).sync()
 
-    assert summary.files_uploaded == 3
-    assert len(client.files) == 3 and len(client.metadata) == 3
+    assert summary.files_uploaded == 4
+    assert len(client.files) == 4 and len(client.metadata) == 4
     still = next(m for m in client.metadata if m["payload"]["file"]["role"] == "original" and m["payload"]["file"]["mime_type"] == "image/heic")
     # The envelope carries the source slug the Dagster reader routes on, and
     # the metadata dedup key is the provenance sha (not the file sha).

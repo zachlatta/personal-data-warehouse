@@ -4,13 +4,11 @@ set -u
 REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
 UV="/opt/homebrew/bin/uv"
 # Run the Python uploader module DIRECTLY (not through `pdw ingest`): pdw
-# self-updates on every release, and each binary replacement invalidates the
-# TCC grants attributed to it — first Full Disk Access, then the
-# kTCCServicePhotos grant this uploader relies on. With pdw out of the exec
-# chain, macOS attributes the Photos-library permission to the stable
-# binaries (zsh / uv / the venv python), so one approval survives releases.
+# self-updates on every release, and each binary replacement can invalidate
+# Full Disk Access attributed to it. PhotoKit access belongs separately to the
+# uploader's stable native helper, which carries the required privacy plist.
 # Credentials still come from pdw's own config file, so `pdw login` remains
-# the single setup step.
+# the single credential setup step.
 PDW_CONFIG="$HOME/.config/pdw/config.json"
 if [ -r "$PDW_CONFIG" ]; then
   export PDW_API_URL="${PDW_API_URL:-$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["base_url"])' "$PDW_CONFIG" 2>/dev/null)}"
@@ -31,7 +29,8 @@ if ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
-  "$UV" run python -m personal_data_warehouse_photos.cli --mode incremental >> "$LOG_FILE" 2>&1
+  "$UV" run python -m personal_data_warehouse_photos.cli \
+    --mode incremental --limit "${PHOTOS_UPLOAD_LIMIT:-100}" >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi
 

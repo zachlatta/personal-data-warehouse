@@ -2,15 +2,16 @@
 
 Reads a snapshot of the library's ``Photos.sqlite`` (never the live file: WAL
 churn from Photos.app would tear reads) and resolves each non-trashed asset to
-the file(s) to upload: the original, plus a Live Photo's ``<uuid>_3.mov``
-motion sibling. Originals in an "Optimize Mac Storage" library are routinely
-cloud-only placeholders (~60% of Zach's library at design time), so a missing
-file is a first-class ``present=False`` classification the sync layer defers
-and re-checks every run — never an error.
+the original PhotoKit resource(s) to export: the primary photo/video, plus a
+Live Photo's original paired-video component. The scanner intentionally does
+not inspect ``originals/``: Optimize Mac Storage makes that directory an
+incomplete cache, not an authoritative view of the library.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -103,18 +104,15 @@ def _probe_openable(path: Path, timeout_seconds: float = PROBE_TIMEOUT_SECONDS) 
 
 @dataclass(frozen=True)
 class PhotoFileCandidate:
-    """One uploadable file claim: an asset's original or its live-video sibling."""
+    """One original PhotoKit resource claim."""
 
     native_id: str  # the still asset's ZUUID for BOTH roles (this attaches the .mov)
     role: str  # original | live_video
     asset_kind: str  # image | video (of the parent asset)
-    path: Path
     filename: str
     extension: str
     mime_type: str
-    present: bool
-    size_bytes: int
-    file_modified_ns: int
+    expected_size_bytes: int
     width: int
     height: int
     captured_at: str  # local wall-clock ISO, "" when unknown
@@ -125,7 +123,12 @@ class PhotoFileCandidate:
 
     @property
     def fingerprint(self) -> str:
-        return f"{self.size_bytes}|{self.file_modified_ns}"
+        payload = json.dumps(
+            {"version": 2, "role": self.role, "apple_record": self.apple_record},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"photokit-v2|{hashlib.sha256(payload).hexdigest()}"
 
     @property
     def state_id(self) -> str:
@@ -158,11 +161,8 @@ def snapshot_photos_store(library_path: Path | str, destination_dir: Path | str)
 
 def scan_photo_file_candidates(
     snapshot_path: Path | str,
-    *,
-    originals_root: Path | str,
 ) -> list[PhotoFileCandidate]:
-    """Newest-first file candidates for every non-trashed asset."""
-    originals = Path(originals_root).expanduser()
+    """Newest-first original-resource candidates for every non-trashed asset."""
     connection = sqlite3.connect(Path(snapshot_path))
     connection.row_factory = sqlite3.Row
     try:
@@ -216,17 +216,15 @@ def scan_photo_file_candidates(
 
     candidates: list[PhotoFileCandidate] = []
     for row in rows:
-        candidates.extend(_candidates_for_asset(row, originals))
+        candidates.extend(_candidates_for_asset(row))
     return candidates
 
 
-def _candidates_for_asset(row: sqlite3.Row, originals: Path) -> list[PhotoFileCandidate]:
+def _candidates_for_asset(row: sqlite3.Row) -> list[PhotoFileCandidate]:
     uuid = str(row["uuid"] or "")
     filename = str(row["filename"] or "")
     if not uuid or not filename:
         return []
-    directory = str(row["directory"] or "")
-    original_path = originals / directory / filename
     kind = int(row["kind"] or 0)
     asset_kind = "video" if kind == 1 else "image"
 
@@ -234,14 +232,14 @@ def _candidates_for_asset(row: sqlite3.Row, originals: Path) -> list[PhotoFileCa
     captured_at, tz_offset = _wall_clock(row["date_created"], tz_seconds)
     record = _apple_record(row)
 
-    extension = _suffix(filename)
+    original_filename = str(row["original_filename"] or "") or filename
+    extension = _suffix(original_filename)
     original = _file_candidate(
         row,
         native_id=uuid,
         role="original",
         asset_kind=asset_kind,
-        path=original_path,
-        filename=str(row["original_filename"] or "") or filename,
+        filename=original_filename,
         extension=extension,
         mime_type=_mime_type(str(row["uti"] or ""), extension),
         captured_at=captured_at,
@@ -251,17 +249,16 @@ def _candidates_for_asset(row: sqlite3.Row, originals: Path) -> list[PhotoFileCa
     candidates = [original]
 
     if asset_kind == "image" and int(row["kind_subtype"] or 0) == KIND_SUBTYPE_LIVE_PHOTO:
-        # The motion component sits next to the still as <uuid>_3.mov and is
-        # uploaded under the SAME native id with role live_video, which is what
-        # lets the identity layer attach it to the still's asset.
-        live_name = f"{Path(filename).stem}_3.mov"
+        # PhotoKit exposes the original motion component as a paired-video
+        # resource. It is uploaded under the SAME native id, which lets the
+        # identity layer attach it to the still's asset.
+        live_name = f"{Path(original_filename).stem}.MOV"
         candidates.append(
             _file_candidate(
                 row,
                 native_id=uuid,
                 role="live_video",
                 asset_kind=asset_kind,
-                path=original_path.with_name(live_name),
                 filename=live_name,
                 extension=".mov",
                 mime_type="video/quicktime",
@@ -279,7 +276,6 @@ def _file_candidate(
     native_id: str,
     role: str,
     asset_kind: str,
-    path: Path,
     filename: str,
     extension: str,
     mime_type: str,
@@ -287,29 +283,16 @@ def _file_candidate(
     tz_offset: str,
     record: dict[str, Any],
 ) -> PhotoFileCandidate:
-    size_bytes = 0
-    modified_ns = 0
-    present = False
-    try:
-        stat = path.stat()
-        size_bytes = int(stat.st_size)
-        modified_ns = int(stat.st_mtime_ns)
-        present = size_bytes > 0
-    except OSError:
-        present = False
     width = int(row["width"] or 0) if role == "original" else 0
     height = int(row["height"] or 0) if role == "original" else 0
     return PhotoFileCandidate(
         native_id=native_id,
         role=role,
         asset_kind=asset_kind,
-        path=path,
         filename=filename,
         extension=extension,
         mime_type=mime_type,
-        present=present,
-        size_bytes=size_bytes,
-        file_modified_ns=modified_ns,
+        expected_size_bytes=int(row["original_file_size"] or 0) if role == "original" else 0,
         width=width,
         height=height,
         captured_at=captured_at,
@@ -403,7 +386,3 @@ def _mime_type(uti: str, extension: str) -> str:
     if extension in _EXTENSION_MIME_TYPES:
         return _EXTENSION_MIME_TYPES[extension]
     return "application/octet-stream"
-
-
-def default_originals_root(library_path: Path | str) -> Path:
-    return Path(library_path).expanduser() / "originals"
