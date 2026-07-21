@@ -136,6 +136,44 @@ SEARCH_TEXT_SOURCE_FLOOR = 3
 # output. A scoped search (sources => ARRAY[...]) bypasses the cap and uses the
 # full max_results so a single-source deep search still returns everything.
 SEARCH_TEXT_BROAD_PER_BRANCH_CAP = 12
+# Hard ceiling on max_results for both search functions. Production logs showed
+# broad overfetch (max_results 500-1000, then client-side filtering) as a
+# dominant slow-query family; no legitimate agent flow reads deeper than this,
+# and callers needing exhaustive results should scope by sources/since instead.
+SEARCH_TEXT_MAX_RESULTS_CAP = 200
+# The declarative source map both search functions are generated from: one
+# entry per coarse source token as (token, timeline adapters, subsource
+# expression). Keeping this the single source of truth guarantees ranked and
+# exact search accept the same `sources` vocabulary.
+SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("agent_session", ("agent_session",), "t.source"),
+    ("alice_voice_recording", ("alice_voice_recording",), "t.kind"),
+    ("calendar", ("calendar_event",), "t.kind"),
+    ("contact", ("contact_update",), "t.kind"),
+    ("gmail", ("gmail_email",), "t.kind"),
+    ("google_drive", ("drive_file",), "t.kind"),
+    ("imessage", ("apple_message",), "t.kind"),
+    (
+        "finance",
+        ("finance_transaction", "finance_observation", "manual_finance_document"),
+        "t.kind",
+    ),
+    ("mutation", ("mutation",), "COALESCE(t.metadata->>'status', t.kind)"),
+    ("mutation_request", ("mutation_request",), "COALESCE(t.metadata->>'status', t.kind)"),
+    ("note", ("apple_note_revision",), "t.kind"),
+    ("photo", ("photo",), "t.kind"),
+    ("slack", ("slack_message",), "t.kind"),
+    ("slack_file", ("slack_file",), "t.kind"),
+    ("transcript", ("voice_memo",), "t.kind"),
+    ("warehouse", ("enrichment_run",), "t.kind"),
+    ("whatsapp", ("whatsapp_message",), "t.kind"),
+)
+# Timeline rows every search must exclude, beyond the per-row deleted flag.
+SEARCH_DRIVE_EXCLUSION_SQL = (
+    "NOT (t.adapter = 'drive_file' "
+    "AND (COALESCE((t.metadata->>'trashed')::boolean, false) "
+    "OR COALESCE((t.metadata->>'excluded')::boolean, false)))"
+)
 SLACK_CONVERSATION_STATS_COLUMNS = (
     "account",
     "team_id",
@@ -448,6 +486,67 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "timeline_sync_state": TableSpec(TIMELINE_SYNC_STATE_COLUMNS, ("adapter",), "updated_at"),
 }
 
+# The source-owned AI conversation event tables (claude_code.events,
+# codex.events, ...). They share AGENT_SESSION_EVENT_COLUMNS and are read
+# together through the marts.ai_conversation_events union view, so they all
+# need the same read-path indexes.
+_AI_CONVERSATION_EVENT_TABLES = (
+    "chatgpt_events",
+    "claude_desktop_events",
+    "claude_code_events",
+    "codex_events",
+    "openclaw_events",
+    "pi_events",
+)
+
+
+def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
+    """Read-path indexes for every source-owned AI conversation event table.
+
+    The marts.ai_conversation_events union view has no storage of its own, so
+    every probe through it (the timeline agent_session adapter's per-session
+    LATERAL lookups, session roll-ups, recency scans, changed-session
+    detection) is only as good as the per-source indexes underneath.
+    """
+    specs: list[IndexSpec] = []
+    for table in _AI_CONVERSATION_EVENT_TABLES:
+        specs.append(
+            IndexSpec(
+                f"{table}_session_seq_idx",
+                table,
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_session_seq_idx "
+                f"ON {table} (session_id, seq)",
+            )
+        )
+        specs.append(
+            IndexSpec(
+                f"{table}_occurred_at_idx",
+                table,
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_occurred_at_idx "
+                f"ON {table} (occurred_at DESC)",
+            )
+        )
+        # First-prompt template lookups for the timeline's scheduled-session
+        # detection; expression must match the adapter's probe.
+        specs.append(
+            IndexSpec(
+                f"{table}_first_prompt_idx",
+                table,
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_first_prompt_idx "
+                f"ON {table} ((left(text, 64))) WHERE role = 'user' AND seq <= 5",
+            )
+        )
+        specs.append(
+            IndexSpec(
+                f"{table}_ingested_at_idx",
+                table,
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_ingested_at_idx "
+                f"ON {table} (ingested_at)",
+            )
+        )
+    return tuple(specs)
+
+
 POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "finance_transactions_account_time_idx",
@@ -460,6 +559,17 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "gmail_messages",
         "CREATE INDEX IF NOT EXISTS gmail_messages_thread_idx ON gmail_messages (account, thread_id, internal_date DESC)",
     ),
+    # Recipient-membership lookups ('a@b' = ANY(to_addresses || cc_addresses
+    # || bcc_addresses)) are structured raw-table predicates. Codified from
+    # the out-of-band production index created on the unmerged
+    # pdw-slow-query-diagnosis branch (commit 5300f75); the definition must
+    # stay byte-compatible with that deployed index.
+    IndexSpec(
+        "gmail_messages_recipients_array_idx",
+        "gmail_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_recipients_array_idx ON gmail_messages "
+        "USING gin ((to_addresses || cc_addresses || bcc_addresses)) WHERE is_deleted = 0",
+    ),
     # Normalized-subject-prefix lookups for the timeline's mail-merge
     # detection (timeline.py _GMAIL_MERGE_CLUSTER); the expression must match
     # that probe's expression exactly.
@@ -469,14 +579,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS gmail_messages_merge_prefix_idx ON gmail_messages "
         "(account, (left(regexp_replace(lower(subject), '^((re|fwd|fw)(\\[\\d+\\])?:\\s*)+', ''), 24)), "
         "internal_date)",
-    ),
-    # First-prompt template lookups for the timeline's scheduled-session
-    # detection (the agent_session adapter); expression must match the probe.
-    IndexSpec(
-        "agent_session_events_first_prompt_idx",
-        "agent_session_events",
-        "CREATE INDEX IF NOT EXISTS agent_session_events_first_prompt_idx ON agent_session_events "
-        "((left(text, 64))) WHERE role = 'user' AND seq <= 5",
     ),
     IndexSpec(
         "gmail_messages_internal_date_idx",
@@ -498,30 +600,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "gmail_messages_subject_trgm_idx",
         "gmail_messages",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_subject_trgm_idx ON gmail_messages USING gin (subject public.gin_trgm_ops)",
-        requires_pg_trgm=True,
-    ),
-    IndexSpec(
-        "gmail_messages_snippet_trgm_idx",
-        "gmail_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_snippet_trgm_idx ON gmail_messages USING gin (snippet public.gin_trgm_ops)",
-        requires_pg_trgm=True,
-    ),
-    IndexSpec(
-        "gmail_messages_body_text_trgm_idx",
-        "gmail_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_body_text_trgm_idx ON gmail_messages USING gin (body_text public.gin_trgm_ops)",
-        requires_pg_trgm=True,
-    ),
-    IndexSpec(
-        "gmail_messages_body_markdown_trgm_idx",
-        "gmail_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_body_markdown_trgm_idx ON gmail_messages USING gin (body_markdown_clean public.gin_trgm_ops)",
-        requires_pg_trgm=True,
-    ),
-    IndexSpec(
-        "gmail_messages_body_html_trgm_idx",
-        "gmail_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_body_html_trgm_idx ON gmail_messages USING gin (body_html public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
@@ -638,11 +716,13 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "apple_messages",
         "CREATE INDEX IF NOT EXISTS apple_messages_time_idx ON apple_messages (message_at DESC) WHERE is_deleted = 0",
     ),
+    # Per-correspondent history ("latest/prior messages with this handle") is a
+    # structured raw-table access pattern; without this index it planned as a
+    # 115M-cost scan per handle in production.
     IndexSpec(
-        "apple_messages_body_trgm_idx",
+        "apple_messages_handle_time_idx",
         "apple_messages",
-        "CREATE INDEX IF NOT EXISTS apple_messages_body_trgm_idx ON apple_messages USING gin (body_text public.gin_trgm_ops) WHERE is_deleted = 0",
-        requires_pg_trgm=True,
+        "CREATE INDEX IF NOT EXISTS apple_messages_handle_time_idx ON apple_messages (account, handle_id, message_at DESC) WHERE is_deleted = 0",
     ),
     IndexSpec(
         "apple_message_chat_messages_chat_time_idx",
@@ -658,6 +738,14 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "apple_message_attachments_hash_idx",
         "apple_message_attachments",
         "CREATE INDEX IF NOT EXISTS apple_message_attachments_hash_idx ON apple_message_attachments (content_sha256)",
+    ),
+    # The timeline apple_message adapter probes attachments by (account,
+    # message_id) per candidate message; the PK is (account, attachment_id,
+    # message_id), so those probes need their own index.
+    IndexSpec(
+        "apple_message_attachments_message_idx",
+        "apple_message_attachments",
+        "CREATE INDEX IF NOT EXISTS apple_message_attachments_message_idx ON apple_message_attachments (account, message_id)",
     ),
     IndexSpec(
         "whatsapp_messages_time_idx",
@@ -684,22 +772,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "agent_runs_task_status_subject_idx",
         "agent_runs",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_runs_task_status_subject_idx ON agent_runs (task_type, status, subject_id)",
-    ),
-    IndexSpec(
-        "agent_session_events_session_seq_idx",
-        "agent_session_events",
-        "CREATE INDEX IF NOT EXISTS agent_session_events_session_seq_idx ON agent_session_events (source, session_id, seq)",
-    ),
-    IndexSpec(
-        "agent_session_events_time_idx",
-        "agent_session_events",
-        "CREATE INDEX IF NOT EXISTS agent_session_events_time_idx ON agent_session_events (occurred_at DESC)",
-    ),
-    IndexSpec(
-        "agent_session_events_text_trgm_idx",
-        "agent_session_events",
-        "CREATE INDEX IF NOT EXISTS agent_session_events_text_trgm_idx ON agent_session_events USING gin (text public.gin_trgm_ops) WHERE text != ''",
-        requires_pg_trgm=True,
     ),
     IndexSpec(
         "agent_run_events_created_idx",
@@ -745,15 +817,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS slack_messages_thread_idx ON slack_messages (account, team_id, conversation_id, thread_ts)",
     ),
     IndexSpec(
-        # Full-coverage trgm index on slack_messages.text. Replaces the
-        # earlier partial (WHERE is_deleted=0) index so queries that omit
-        # the is_deleted filter still get index acceleration.
-        "slack_messages_text_trgm_idx",
-        "slack_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_text_trgm_idx ON slack_messages USING gin (text public.gin_trgm_ops)",
-        requires_pg_trgm=True,
-    ),
-    IndexSpec(
         "slack_conversations_scope_idx",
         "slack_conversations",
         "CREATE INDEX IF NOT EXISTS slack_conversations_scope_idx ON slack_conversations (account, team_id, conversation_type)",
@@ -794,12 +857,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS google_drive_files_modified_idx ON google_drive_files (account, modified_time DESC) WHERE trashed = 0 AND is_excluded = 0",
     ),
     IndexSpec(
-        "google_drive_files_name_trgm_idx",
-        "google_drive_files",
-        "CREATE INDEX IF NOT EXISTS google_drive_files_name_trgm_idx ON google_drive_files USING gin (name public.gin_trgm_ops)",
-        requires_pg_trgm=True,
-    ),
-    IndexSpec(
         "google_drive_file_texts_text_trgm_idx",
         "google_drive_file_texts",
         "CREATE INDEX IF NOT EXISTS google_drive_file_texts_text_trgm_idx ON google_drive_file_texts USING gin (text public.gin_trgm_ops)",
@@ -826,8 +883,8 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS whoop_recoveries_updated_idx ON whoop_recoveries (account, updated_at DESC)",
     ),
     # Unified timeline read paths: keyset pagination by event time (with seq as
-    # the tiebreak), per-source/kind filtered scans, and arrival-order scans for
-    # "what's new since seq N" consumers.
+    # the tiebreak) and per-source filtered scans. The kind filter rides on the
+    # time/priority indexes as a residual predicate.
     IndexSpec(
         "timeline_events_time_idx",
         "timeline_events",
@@ -837,16 +894,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "timeline_events_source_time_idx",
         "timeline_events",
         "CREATE INDEX IF NOT EXISTS timeline_events_source_time_idx ON timeline_events (source, event_ts DESC, seq DESC)",
-    ),
-    IndexSpec(
-        "timeline_events_kind_time_idx",
-        "timeline_events",
-        "CREATE INDEX IF NOT EXISTS timeline_events_kind_time_idx ON timeline_events (kind, event_ts DESC, seq DESC)",
-    ),
-    IndexSpec(
-        "timeline_events_seq_idx",
-        "timeline_events",
-        "CREATE INDEX IF NOT EXISTS timeline_events_seq_idx ON timeline_events (seq)",
     ),
     IndexSpec(
         "timeline_events_priority_time_idx",
@@ -874,11 +921,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "gmail_messages_synced_at_idx",
         "gmail_messages",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_synced_at_idx ON gmail_messages (synced_at)",
-    ),
-    IndexSpec(
-        "agent_session_events_ingested_at_idx",
-        "agent_session_events",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_session_events_ingested_at_idx ON agent_session_events (ingested_at)",
     ),
     IndexSpec(
         "slack_files_synced_at_idx",
@@ -930,6 +972,7 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "whatsapp_messages",
         "CREATE INDEX IF NOT EXISTS whatsapp_messages_ingested_at_idx ON whatsapp_messages (ingested_at)",
     ),
+    *_ai_conversation_event_index_specs(),
 )
 
 # Indexes that used to exist but have been superseded. Dropped idempotently
@@ -979,6 +1022,27 @@ POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
     ("upstream_mutation_requests_reason_bm25_idx", "upstream_mutation_requests"),
     ("google_drive_files_name_bm25_idx", "google_drive_files"),
     ("google_drive_file_texts_text_bm25_idx", "google_drive_file_texts"),
+    # Raw-table text-scan trigram indexes retired 2026-07: production usage
+    # counters showed them essentially never scanned (~13 GB of dead weight)
+    # while the timeline search document covers the same text through
+    # search.search_text() / search.search_text_exact(). Raw tables serve
+    # structured predicates; text search belongs to the timeline layer.
+    ("gmail_messages_snippet_trgm_idx", "gmail_messages"),
+    ("gmail_messages_body_text_trgm_idx", "gmail_messages"),
+    ("gmail_messages_body_markdown_trgm_idx", "gmail_messages"),
+    ("gmail_messages_body_html_trgm_idx", "gmail_messages"),
+    ("slack_messages_text_trgm_idx", "slack_messages"),
+    ("apple_messages_body_trgm_idx", "apple_messages"),
+    ("google_drive_files_name_trgm_idx", "google_drive_files"),
+    # Out-of-band production index from the unmerged pdw-slow-query-diagnosis
+    # branch (commit 5300f75); never scanned in production (the recipient
+    # index from that branch was codified instead — see
+    # gmail_messages_recipients_array_idx in POSTGRES_INDEXES).
+    ("slack_messages_live_human_thread_scan_idx", "slack_messages"),
+    # Timeline btrees with zero lifetime scans; the kind filter rides the
+    # time/priority indexes and nothing pages by bare seq.
+    ("timeline_events_kind_time_idx", "timeline_events"),
+    ("timeline_events_seq_idx", "timeline_events"),
 )
 
 
@@ -1354,15 +1418,6 @@ _PHOTO_TABLES = tuple(PHOTO_SOURCE_RELATIONS.values()) + (
     "agent_runs",
     "agent_run_events",
     "agent_run_tool_calls",
-)
-
-_AI_CONVERSATION_EVENT_TABLES = (
-    "chatgpt_events",
-    "claude_desktop_events",
-    "claude_code_events",
-    "codex_events",
-    "openclaw_events",
-    "pi_events",
 )
 
 _AI_EVENT_TABLE_BY_SOURCE = {
@@ -6702,8 +6757,11 @@ class PostgresWarehouse:
         payload = "\n".join(
             [
                 source,
+                repr(SEARCH_SOURCE_DEFS),
+                SEARCH_DRIVE_EXCLUSION_SQL,
                 ",".join(sorted(self._SEARCHABLE_TEXT_TABLES)),
                 str(SEARCH_TEXT_SOURCE_FLOOR),
+                str(SEARCH_TEXT_MAX_RESULTS_CAP),
             ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -6732,48 +6790,53 @@ class PostgresWarehouse:
     def _search_text_function_exists(self) -> bool:
         rows = self._query(
             """
-            SELECT 1
+            SELECT count(DISTINCT p.proname)
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE p.proname = 'search_text'
+            WHERE p.proname IN ('search_text', 'search_text_exact')
               AND n.nspname = %s
-            LIMIT 1
             """,
             (self.physical_schema_name("search"),),
         )
-        return bool(rows)
+        return bool(rows) and int(rows[0][0]) == 2
 
     def _ensure_search_text_function(self) -> None:
-        # search_text() is the single, default cross-source search path. It now
-        # searches the unified timeline's `search_text` BM25 document, rather
-        # than fanning out over source-specific tables. Timeline adapters own
-        # the hard normalization work: they pick the event timestamp, actor,
-        # context, priority, stable ref, and full text document (including
-        # detail text like Drive extracts, transcripts, and media enrichments).
+        # search_text() is the default RANKED cross-source search path and
+        # search_text_exact() is its literal-substring sibling; both read the
+        # unified timeline's `search_text` document, rather than fanning out
+        # over source-specific tables. Timeline adapters own the hard
+        # normalization work: they pick the event timestamp, actor, context,
+        # priority, stable ref, and full text document (including detail text
+        # like Drive extracts, transcripts, and media enrichments).
         #
-        # Output remains (source, subsource, context, who, occurred_at, account,
-        # ref, text, score) so existing agents can keep calling
-        # search.search_text(...). `ref` is now a timeline ref of the form
+        # Output is (source, subsource, context, who, occurred_at, account,
+        # ref, text, score) for both. `ref` is a timeline ref of the form
         # `<adapter>:<event_id>`; drill into timeline.events by adapter/event_id
         # (or use source_table/source_pk from that row) for source-specific rows.
         #
-        # The function still executes one BM25 top-k branch per coarse source so
+        # search_text() executes one BM25 top-k branch per coarse source so
         # broad searches cannot starve low-volume sources. All branches read the
         # same timeline_events_search_text_bm25_idx index and differ only in the
-        # adapter filter and source label they return.
+        # adapter filter and source label they return. search_text_exact() is a
+        # single ILIKE scan over the same document served by
+        # timeline_events_search_text_trgm_idx, ordered by recency.
 
-        def branch(source: str, where: str, subsource: str = "t.kind") -> tuple[str, str]:
+        def adapter_filter(adapters: tuple[str, ...]) -> str:
+            if len(adapters) == 1:
+                return f"t.adapter = '{adapters[0]}'"
+            adapter_list = ", ".join(f"'{adapter}'" for adapter in adapters)
+            return f"t.adapter IN ({adapter_list})"
+
+        def branch(source: str, adapters: tuple[str, ...], subsource: str) -> tuple[str, str]:
             rank = "t.search_text <@> to_bm25query(%1$L, 'timeline_events_search_text_bm25_idx')"
             where_sql = (
-                f"({where}) "
+                f"({adapter_filter(adapters)}) "
                 "AND t.search_text != '' "
-                "AND NOT COALESCE((t.metadata->>'deleted')::boolean, false)"
+                "AND NOT COALESCE((t.metadata->>'deleted')::boolean, false) "
+                "AND (%3$L::timestamptz IS NULL OR t.event_ts >= %3$L::timestamptz)"
             )
             if source == "google_drive":
-                where_sql += (
-                    " AND NOT COALESCE((t.metadata->>'trashed')::boolean, false)"
-                    " AND NOT COALESCE((t.metadata->>'excluded')::boolean, false)"
-                )
+                where_sql += f" AND {SEARCH_DRIVE_EXCLUSION_SQL}"
             return (
                 source,
                 f"( SELECT '{source}'::text AS source, {subsource} AS subsource, "
@@ -6784,28 +6847,7 @@ class PostgresWarehouse:
                 f"WHERE {where_sql} ORDER BY {rank} LIMIT %2$s )"
             )
 
-        branches = [
-            branch("agent_session", "t.adapter = 'agent_session'", "t.source"),
-            branch("alice_voice_recording", "t.adapter = 'alice_voice_recording'"),
-            branch("calendar", "t.adapter = 'calendar_event'"),
-            branch("contact", "t.adapter = 'contact_update'"),
-            branch("gmail", "t.adapter = 'gmail_email'"),
-            branch("google_drive", "t.adapter = 'drive_file'"),
-            branch("imessage", "t.adapter = 'apple_message'"),
-            branch(
-                "finance",
-                "t.adapter IN ('finance_transaction', 'finance_observation', 'manual_finance_document')",
-            ),
-            branch("mutation", "t.adapter = 'mutation'", "COALESCE(t.metadata->>'status', t.kind)"),
-            branch("mutation_request", "t.adapter = 'mutation_request'", "COALESCE(t.metadata->>'status', t.kind)"),
-            branch("note", "t.adapter = 'apple_note_revision'"),
-            branch("photo", "t.adapter = 'photo'"),
-            branch("slack", "t.adapter = 'slack_message'"),
-            branch("slack_file", "t.adapter = 'slack_file'"),
-            branch("transcript", "t.adapter = 'voice_memo'"),
-            branch("warehouse", "t.adapter = 'enrichment_run'"),
-            branch("whatsapp", "t.adapter = 'whatsapp_message'"),
-        ]
+        branches = [branch(*definition) for definition in SEARCH_SOURCE_DEFS]
 
         # Run each source branch independently so a missing/unusable BM25 index
         # (for example during a deploy before the timeline index finishes) drops
@@ -6814,6 +6856,24 @@ class PostgresWarehouse:
         branch_sql_array = ",\n                        ".join(f"$b${sql}$b$" for _, sql in branches)
         distinct_sources = sorted({source for source, _ in branches})
         search_text_sources_values = ", ".join(f"('{source}')" for source in distinct_sources)
+        # search_text_exact() runs as ONE scan over the timeline document, so
+        # its source filter is an adapter -> token map and its subsource is a
+        # CASE over the same defs the ranked branches are generated from.
+        adapter_source_values = ", ".join(
+            f"('{adapter}', '{source}')"
+            for source, adapters, _ in SEARCH_SOURCE_DEFS
+            for adapter in adapters
+        )
+        subsource_whens = "\n                    ".join(
+            f"WHEN {adapter_filter(adapters)} THEN {subsource}"
+            for source, adapters, subsource in SEARCH_SOURCE_DEFS
+            if subsource != "t.kind"
+        )
+        exact_subsource_case = (
+            "CASE\n                    "
+            + subsource_whens
+            + "\n                    ELSE t.kind\n                END"
+        )
         search_schema_name = self.physical_schema_name("search") if hasattr(self, "physical_schema_name") else "search"
         self._command(
             r"""
@@ -6841,7 +6901,9 @@ class PostgresWarehouse:
             STABLE
             AS $fn$
             DECLARE
-                per_source integer := greatest(coalesce(max_results, 50), 1);
+                per_source integer := least(greatest(coalesce(max_results, 50), 1), """
+            + str(SEARCH_TEXT_MAX_RESULTS_CAP)
+            + r""");
                 per_branch_limit integer := CASE
                     WHEN sources IS NULL THEN least(per_source, """
             + str(SEARCH_TEXT_BROAD_PER_BRANCH_CAP)
@@ -6884,7 +6946,7 @@ class PostgresWarehouse:
                             'x.who, x.occurred_at, x.account, x.ref, left(x.text, """
             + str(SEARCH_TEXT_PREVIEW_CHARS)
             + r"""), x.score)::search_text_hit) FROM (' || branch || ') x',
-                            query, per_branch_limit
+                            query, per_branch_limit, since
                         ) INTO branch_hits;
                         IF branch_hits IS NOT NULL THEN
                             hits := hits || branch_hits;
@@ -6912,6 +6974,90 @@ class PostgresWarehouse:
             + str(SEARCH_TEXT_SOURCE_FLOOR)
             + r""") ASC, r.score ASC NULLS LAST
                     LIMIT per_source;
+            END;
+            $fn$;
+            CREATE OR REPLACE FUNCTION search_text_exact(
+                query text,
+                max_results integer DEFAULT 50,
+                sources text[] DEFAULT NULL,
+                since timestamptz DEFAULT NULL
+            )
+            RETURNS SETOF search_text_hit
+            LANGUAGE plpgsql
+            STABLE
+            AS $fn$
+            DECLARE
+                per_source integer := least(greatest(coalesce(max_results, 50), 1), """
+            + str(SEARCH_TEXT_MAX_RESULTS_CAP)
+            + r""");
+                needle text := trim(coalesce(query, ''));
+                pattern text;
+                requested_source text;
+            BEGIN
+                IF length(needle) < 3 THEN
+                    RAISE EXCEPTION 'search_text_exact: query must be at least 3 characters'
+                        USING HINT = 'substring search needs >= 3 characters for the trigram index; use search_text() for ranked keyword search';
+                END IF;
+                IF sources IS NOT NULL THEN
+                    FOREACH requested_source IN ARRAY sources LOOP
+                        IF NOT requested_source = ANY (ARRAY[
+                        """
+            + branch_sources_array
+            + r"""
+                        ]) THEN
+                            RAISE EXCEPTION 'search_text_exact: unknown source %', requested_source
+                                USING HINT = 'call search_text_sources() to list the valid source tokens';
+                        END IF;
+                    END LOOP;
+                END IF;
+                pattern := '%' || replace(replace(replace(needle, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+                RETURN QUERY
+                    SELECT hit.source, hit.subsource, hit.context, hit.who,
+                           hit.occurred_at, hit.account, hit.ref,
+                           -- Window the preview around the first match: a
+                           -- head-of-document cut routinely misses the matched
+                           -- text in large documents (transcripts, Drive docs).
+                           CASE
+                               WHEN length(hit.text) <= """
+            + str(SEARCH_TEXT_PREVIEW_CHARS)
+            + r""" THEN hit.text
+                               ELSE substring(
+                                   hit.text
+                                   FROM greatest(position(lower(needle) IN lower(hit.text)) - """
+            + str(SEARCH_TEXT_PREVIEW_CHARS // 2)
+            + r""", 1)
+                                   FOR """
+            + str(SEARCH_TEXT_PREVIEW_CHARS)
+            + r""")
+                           END AS text,
+                           hit.score
+                    FROM (
+                        SELECT map.source AS source,
+                               """
+            + exact_subsource_case
+            + r""" AS subsource,
+                               t.context AS context, t.actor AS who,
+                               t.event_ts AS occurred_at,
+                               COALESCE(t.source_pk->>'account', t.metadata->>'account', '') AS account,
+                               t.adapter || ':' || t.event_id AS ref,
+                               t.search_text AS text,
+                               NULL::real AS score
+                        FROM timeline_events t
+                        JOIN (VALUES """
+            + adapter_source_values
+            + r""") AS map(adapter, source) ON map.adapter = t.adapter
+                        WHERE t.search_text ILIKE pattern
+                          AND t.search_text != ''
+                          AND NOT COALESCE((t.metadata->>'deleted')::boolean, false)
+                          AND """
+            + SEARCH_DRIVE_EXCLUSION_SQL
+            + r"""
+                          AND (sources IS NULL OR map.source = ANY (sources))
+                          AND (since IS NULL OR t.event_ts >= since)
+                        ORDER BY t.event_ts DESC
+                        LIMIT per_source
+                    ) hit
+                    ORDER BY hit.occurred_at DESC;
             END;
             $fn$;
             CREATE OR REPLACE FUNCTION search_text_sources()
@@ -6948,9 +7094,10 @@ class PostgresWarehouse:
     def _search_text_alter_sql(self) -> str:
         function_path = self._search_path_sql().removeprefix("SET search_path TO ")
         search_schema = _identifier(self.physical_schema_name("search"))
-        return (
-            f'ALTER FUNCTION {search_schema}."search_text"(text, integer, text[], timestamptz) '
+        return "; ".join(
+            f'ALTER FUNCTION {search_schema}."{function_name}"(text, integer, text[], timestamptz) '
             f"SET search_path TO {function_path}"
+            for function_name in ("search_text", "search_text_exact")
         )
 
     def _ensure_view(self, view: str, create_sql: str) -> None:

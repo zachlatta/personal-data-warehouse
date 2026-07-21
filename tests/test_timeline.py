@@ -181,10 +181,14 @@ def test_timeline_indexes_are_registered_for_timeline_tables():
     assert {
         "timeline_events_time_idx",
         "timeline_events_source_time_idx",
-        "timeline_events_kind_time_idx",
-        "timeline_events_seq_idx",
+        "timeline_events_priority_time_idx",
         "timeline_events_search_text_bm25_idx",
+        "timeline_events_search_text_trgm_idx",
     } <= names
+    # Retired after production usage counters showed zero lifetime scans: the
+    # kind filter rides the time/priority indexes and nothing pages by bare seq.
+    assert "timeline_events_kind_time_idx" not in names
+    assert "timeline_events_seq_idx" not in names
 
 
 # --- live schema coverage (Postgres) -------------------------------------------
@@ -236,7 +240,7 @@ def test_ensure_timeline_tables_is_idempotent_and_indexed(warehouse):
     )
     names = {row[0] for row in rows}
     assert "timeline_events_time_idx" in names
-    assert "timeline_events_seq_idx" in names
+    assert "timeline_events_source_time_idx" in names
     # seq must be sequence-backed so upserts can bump it.
     warehouse._command(
         "INSERT INTO timeline_events (adapter, event_id, source, kind, event_ts, source_table) "

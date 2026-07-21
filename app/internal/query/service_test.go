@@ -154,7 +154,9 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 	}
 	for _, want := range []string{
 		`-- Reference these tables by their schema-qualified name`,
-		`SELECT * FROM search.search_text('offer letter', 50)`,
+		`search.search_text('offer letter', 50)`,
+		`search.search_text_exact('offer letter', 50)`,
+		`raw source tables serve STRUCTURED predicates`,
 		`# gmail.messages (~1,234,567 rows, estimated)`,
 		`# slack.messages (~42 rows, estimated)`,
 		`# marts.gmail_inbox`,

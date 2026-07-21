@@ -122,6 +122,7 @@ var Relations = map[string]Relation{
 	"whoop_oauth_tokens":                    {"private", "whoop_oauth_tokens"},
 	"plaid_item_tokens":                     {"private", "plaid_item_tokens"},
 	"search_text":                           {"search", "search_text"},
+	"search_text_exact":                     {"search", "search_text_exact"},
 	"search_text_sources":                   {"search", "search_text_sources"},
 	"search_schema_state":                   {"search", "schema_state"},
 }

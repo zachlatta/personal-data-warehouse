@@ -243,27 +243,31 @@ SQL starting points:
   `apple_voice_memos_transcript_segments`, `clean_calendar_with_transcripts`,
   `clean_transcripts_no_calendar_match`
 
-General search flow for pdw clients:
+General search flow for pdw clients — raw source tables serve structured predicates (keys,
+senders, time ranges, joins); **all text search goes through the `search.*` functions** over the
+unified timeline document. Raw message/body columns are deliberately not text-indexed:
 
-- Cross-source search (the default): `SELECT * FROM search_text('offer letter', 50)`
+- Ranked keyword search (the default): `SELECT * FROM search_text('offer letter', 50)`
   searches the unified timeline BM25 document and returns
   `(source, subsource, context, who, occurred_at, account, ref, text, score)` ranked across
-  **every** timeline source (`score` lower / more negative = better). `ref` is now a
+  **every** timeline source (`score` lower / more negative = better). `ref` is a
   timeline ref (`<adapter>:<event_id>`); join to `timeline.events` and then use
-  `source_table`/`source_pk` for full source rows. Optional args:
-  `search_text(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')`.
-  Call `SELECT * FROM search_text_sources()` to discover valid source tokens. Attachment/media
-  enrichments, Drive extracts, transcripts, and other detail text are folded into the parent
-  timeline event's `search_text` document. Ranking is OR'd, stemmed whole-word BM25, so a noisy
-  top-N never proves absence — for "find every mention of X" raise `max_results` and fall back to
-  single-table trigram `%>` / `ILIKE` for variants once you know the table. New cross-source text
-  is picked up by adding it to the relevant timeline adapter's search document.
+  `source_table`/`source_pk` for full source rows.
+- Literal substring/phrase/id search: `SELECT * FROM search_text_exact('offer letter', 50)` —
+  the same document and hit shape, matched exactly (trigram-indexed, case-insensitive, LIKE
+  wildcards treated literally), ordered by recency, with the returned text windowed around the
+  first match. Use this instead of post-filtering `search_text()` output with an outer `ILIKE`
+  or scanning raw body columns; needles must be at least 3 characters.
+- Both take the same optional args:
+  `(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')`, with
+  `max_results` capped server-side. Call `SELECT * FROM search_text_sources()` to discover
+  valid source tokens. Attachment/media enrichments, Drive extracts, transcripts, and other
+  detail text are folded into the parent timeline event's `search_text` document. BM25 ranking
+  is OR'd, stemmed whole-word matching, so a noisy top-N never proves absence — for "find every
+  mention of X" use `search_text_exact()` and vary the needle. New cross-source text is picked
+  up by adding it to the relevant timeline adapter's search document.
 - Detailed follow-up: use the timeline hit's `source_table`/`source_pk` to query the canonical
-  source tables directly for complete rows, joins, attachments, thread context, etc. Do not use
-  source-table BM25 for general search; those legacy indexes were removed.
-- Fuzzy / typo-tolerant table search (trigram): once you know the table, `WHERE text %> 'kubernets'
-  ORDER BY word_similarity('kubernets', text) DESC LIMIT 20` matches misspelled terms
-  via the same `gin_trgm_ops` indexes that accelerate `ILIKE '%substring%'`.
+  source tables directly for complete rows, joins, attachments, thread context, etc.
 
 ### `query`
 

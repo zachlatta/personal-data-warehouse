@@ -1212,15 +1212,13 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     assert "slack_messages_recent_thread_time_idx" in index_names
     assert "slack_messages_user_time_idx" in index_names
     assert "slack_messages_time_idx" in index_names
-    assert "slack_messages_text_trgm_idx" in index_names
-    # The earlier partial trgm index has been superseded by the full-coverage one.
+    # Raw-table text search is retired: message text is searched through the
+    # timeline document (search.search_text / search.search_text_exact).
+    assert "slack_messages_text_trgm_idx" not in index_names
     assert "slack_messages_text_trgm_live_idx" not in index_names
 
     slack_user_index_names = _index_names(warehouse, "slack_users")
     assert "slack_users_email_lower_idx" in slack_user_index_names
-
-    extension_rows = warehouse._query("SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'")
-    assert extension_rows == [("pg_trgm",)]
 
 
 def test_postgres_slack_messages_set_autovacuum_storage_parameters(warehouse: PostgresWarehouse) -> None:
@@ -1275,12 +1273,15 @@ def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehous
 
     index_names = _index_names(warehouse, "gmail_messages")
     assert "gmail_messages_internal_date_idx" in index_names
+    # Structured predicates (sender/subject lookups) keep their indexes; the
+    # body/snippet trigram family is retired — body text is searched through
+    # the timeline document (search.search_text / search.search_text_exact).
     assert "gmail_messages_from_trgm_idx" in index_names
     assert "gmail_messages_subject_trgm_idx" in index_names
-    assert "gmail_messages_snippet_trgm_idx" in index_names
-    assert "gmail_messages_body_text_trgm_idx" in index_names
-    assert "gmail_messages_body_markdown_trgm_idx" in index_names
-    assert "gmail_messages_body_html_trgm_idx" in index_names
+    assert "gmail_messages_snippet_trgm_idx" not in index_names
+    assert "gmail_messages_body_text_trgm_idx" not in index_names
+    assert "gmail_messages_body_markdown_trgm_idx" not in index_names
+    assert "gmail_messages_body_html_trgm_idx" not in index_names
 
 
 @pytest.mark.parametrize(
@@ -1312,6 +1313,45 @@ def test_postgres_agent_tables_create_run_lookup_index(warehouse: PostgresWareho
 
     index_names = _index_names(warehouse, "agent_runs")
     assert "agent_runs_task_status_subject_idx" in index_names
+
+
+def test_postgres_apple_messages_create_handle_history_index(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_apple_messages_tables()
+
+    index_names = _index_names(warehouse, "apple_messages")
+    assert "apple_messages_handle_time_idx" in index_names
+    assert "apple_messages_body_trgm_idx" not in index_names
+
+    attachment_index_names = _index_names(warehouse, "apple_message_attachments")
+    assert "apple_message_attachments_message_idx" in attachment_index_names
+
+
+def test_postgres_ai_conversation_event_tables_create_read_path_indexes(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # The marts.ai_conversation_events union view has no storage of its own, so
+    # session probes, recency scans, first-prompt template detection, and
+    # changed-session watermark scans all depend on per-source indexes.
+    warehouse.ensure_agent_sessions_tables()
+
+    import personal_data_warehouse.postgres as postgres_module
+
+    for table in postgres_module._AI_CONVERSATION_EVENT_TABLES:
+        index_names = _index_names(warehouse, table)
+        assert f"{table}_session_seq_idx" in index_names, table
+        assert f"{table}_occurred_at_idx" in index_names, table
+        assert f"{table}_first_prompt_idx" in index_names, table
+        assert f"{table}_ingested_at_idx" in index_names, table
+
+
+def test_postgres_indexes_define_no_legacy_agent_session_events_specs() -> None:
+    # The legacy mixed agent_session_events table is gone; index definitions
+    # against it could never be created (the logical name now resolves to the
+    # marts union view) and must not linger in the registry.
+    import personal_data_warehouse.postgres as postgres_module
+
+    legacy = [ix.name for ix in postgres_module.POSTGRES_INDEXES if ix.table == "agent_session_events"]
+    assert legacy == []
 
 
 def _pg_textsearch_usable(warehouse: PostgresWarehouse) -> bool:
@@ -1558,6 +1598,105 @@ def test_search_text_merge_guarantees_per_source_floor() -> None:
         "search_text() merge must order a per-source floor (src_rank > N) ahead "
         "of the global score fill"
     )
+
+
+def test_search_text_pushes_since_into_branches() -> None:
+    # `since` used to be applied only after every branch had already collected
+    # (and scored) its top-k over all time, so a tightly time-scoped search paid
+    # full-corpus cost and could return zero rows despite in-window matches
+    # existing below the all-time top-k. Each branch must filter before ranking.
+    sql = _search_text_function_sql()
+    assert "%3$L::timestamptz IS NULL OR t.event_ts >= %3$L::timestamptz" in sql, (
+        "search_text() branches must push the `since` bound into the branch WHERE"
+    )
+    assert "query, per_branch_limit, since" in sql, (
+        "each branch's EXECUTE must pass `since` as the third format argument"
+    )
+
+
+def test_search_functions_clamp_max_results() -> None:
+    # Broad overfetch (max_results 500-1000) followed by client-side filtering
+    # was one of the dominant slow-query families; both search functions clamp
+    # to a hard ceiling instead of silently accepting any depth.
+    import personal_data_warehouse.postgres as postgres_module
+
+    sql = _search_text_function_sql()
+    clamp = (
+        "least(greatest(coalesce(max_results, 50), 1), "
+        f"{postgres_module.SEARCH_TEXT_MAX_RESULTS_CAP})"
+    )
+    assert sql.count(clamp) >= 2, (
+        "both search_text() and search_text_exact() must clamp max_results to "
+        "SEARCH_TEXT_MAX_RESULTS_CAP"
+    )
+
+
+def _search_text_exact_sql() -> str:
+    sql = _search_text_function_sql()
+    marker = "CREATE OR REPLACE FUNCTION search_text_exact("
+    assert marker in sql, "expected search_text_exact() to be generated alongside search_text()"
+    return sql.split(marker, 1)[1]
+
+
+def test_search_text_exact_uses_trigram_ilike_not_bm25() -> None:
+    # Exact/substring search is the trigram index's job: one indexed scan over
+    # the same timeline document ranked search uses, ordered by recency. Going
+    # through BM25 here would re-introduce the overfetch-and-post-filter
+    # pattern this function exists to remove.
+    sql = _search_text_exact_sql()
+    assert "ILIKE pattern" in sql
+    assert "to_bm25query" not in sql
+    assert "ORDER BY t.event_ts DESC" in sql
+
+
+def test_search_text_exact_escapes_like_wildcards() -> None:
+    sql = _search_text_exact_sql()
+    assert (
+        "replace(replace(replace(needle, '\\', '\\\\'), '%', '\\%'), '_', '\\_')" in sql
+    ), "search_text_exact() must escape LIKE wildcards so needles are literal"
+
+
+def test_search_text_exact_rejects_short_needles_and_unknown_sources() -> None:
+    sql = _search_text_exact_sql()
+    assert "at least 3 characters" in sql
+    assert "unknown source" in sql
+
+
+def test_search_text_exact_windows_preview_around_the_match() -> None:
+    # A preview cut from the head of a large document (full transcripts, Drive
+    # extracts) routinely misses the matched text, which is exactly what pushed
+    # agents back to raw-table scans. The preview must be windowed around the
+    # first match position instead.
+    sql = _search_text_exact_sql()
+    assert "position(lower(needle)" in sql
+
+
+def test_search_text_exact_source_tokens_match_ranked_search() -> None:
+    # Both functions must accept the same `sources` vocabulary, discoverable
+    # via search_text_sources(); drift between them would make the documented
+    # "ranked -> exact" escalation path error on valid tokens.
+    import re
+
+    sql = _search_text_exact_sql()
+    match = re.search(r"AS map\(adapter, source\)", sql)
+    assert match, "expected search_text_exact() to map adapters to source tokens"
+    tokens = set(re.findall(r"\('[a-z0-9_]+', '([a-z0-9_]+)'\)", sql))
+    assert tokens == set(_search_text_branch_source_labels())
+
+
+def test_search_text_alter_pins_search_path_for_both_functions() -> None:
+    import personal_data_warehouse.postgres as postgres_module
+
+    class _Stub:
+        def _search_path_sql(self) -> str:
+            return "SET search_path TO pdw_x, public"
+
+        def physical_schema_name(self, schema: str) -> str:
+            return schema
+
+    sql = postgres_module.PostgresWarehouse._search_text_alter_sql(_Stub())  # type: ignore[arg-type]
+    assert '"search_text"(text, integer, text[], timestamptz)' in sql
+    assert '"search_text_exact"(text, integer, text[], timestamptz)' in sql
 
 
 def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse) -> None:
@@ -1830,6 +1969,75 @@ def test_search_text_rejects_unknown_source_tokens(warehouse: PostgresWarehouse)
 
     # A valid token is unaffected.
     warehouse._query("SELECT count(*) FROM search_text('zzqqxx', 5, ARRAY['imessage'])")
+
+
+def test_search_text_exact_finds_literal_phrases(warehouse: PostgresWarehouse) -> None:
+    # The exact-search half of the timeline layer: a literal substring over the
+    # same search document ranked search uses, served by the trigram index.
+    # This is the supported replacement for raw-table ILIKE scans and for the
+    # "overfetch search_text() then outer-ILIKE the preview" pattern.
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=message_datetime,
+                text="deploy pin: rollout-cadence-7g4 approved for friday",
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.2",
+                message_datetime=message_datetime,
+                text="lunch plans for friday",
+            ),
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    rows = warehouse._query(
+        "SELECT source, ref, text, score FROM search_text_exact(%s, 10)",
+        ("rollout-cadence-7g4",),
+    )
+    assert [row[0] for row in rows] == ["slack"]
+    assert "rollout-cadence-7g4" in rows[0][2]
+
+    # A needle that only matches as a BM25 stem, not a literal substring, must
+    # not match: this function is exact.
+    assert warehouse._query("SELECT * FROM search_text_exact('rollout-cadence-9z9', 10)") == []
+
+    # The sources filter uses the same tokens as ranked search.
+    assert (
+        warehouse._query(
+            "SELECT * FROM search_text_exact(%s, 10, sources => ARRAY['gmail'])",
+            ("rollout-cadence-7g4",),
+        )
+        == []
+    )
+    with pytest.raises(psycopg2.Error, match="unknown source"):
+        warehouse._query("SELECT * FROM search_text_exact('zzqqxx', 5, ARRAY['apple_messages'])")
+
+    # LIKE wildcards in the needle are literal characters, not patterns.
+    assert warehouse._query("SELECT * FROM search_text_exact('roll%cadence', 10)") == []
+
+    # Needles below trigram length raise loudly instead of degrading to a scan.
+    with pytest.raises(psycopg2.Error, match="at least 3 characters"):
+        warehouse._query("SELECT * FROM search_text_exact('ab', 5)")
+
+    # `since` bounds results.
+    assert (
+        warehouse._query(
+            "SELECT * FROM search_text_exact(%s, 10, since => %s)",
+            ("rollout-cadence-7g4", datetime(2026, 6, 1, tzinfo=UTC)),
+        )
+        == []
+    )
 
 
 def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWarehouse) -> None:

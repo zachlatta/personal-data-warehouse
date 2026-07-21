@@ -191,6 +191,7 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("timeline_events_seq", "timeline", "events_seq"),
     ("search_text_hit", "search", "text_hit"),
     ("search_text", "search", "search_text"),
+    ("search_text_exact", "search", "search_text_exact"),
     ("search_text_sources", "search", "search_text_sources"),
     ("search_schema_state", "search", "schema_state"),
     # Private/control-plane secrets and session snapshots
