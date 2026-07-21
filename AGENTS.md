@@ -345,13 +345,17 @@ the requester. Grant **Full Access** (Selected Photos is insufficient), then kic
 LaunchAgent. The helper is rebuilt only when its checked-in Swift source or privacy plist changes;
 because it is ad-hoc signed, such a change requires authorization again. If a run reports that
 Photos access was denied or limited, repair PDW Photos Exporter in System Settings → Privacy &
-Security → Photos.
+Security → Photos. LaunchServices invocation is asynchronous and the uploader waits on the app's
+redirected result files; do not use `open -W`, which races short-lived helper instances and can
+fail with `initial call to kevent() failed: No such process` even when the app launched.
 
 The uploader snapshots `Photos.sqlite` (never reads the live DB) for metadata and candidate
 selection, but deliberately never reads `Photos Library.photoslibrary/originals` for media:
 under Optimize Mac Storage that tree is only an incomplete cache. Every selected resource is
 exported through PhotoKit with iCloud network access enabled, so Photos downloads the complete
-original before upload. Photo and video assets request PhotoKit's original resource type; Live
+original before upload. Scanner selection is limited to `ZBUNDLESCOPE = 0`: nonzero bundle scopes
+are transient syndicated/shared records that Photos stores in `ZASSET` but does not expose as
+user-library `PHAsset`s. Photo and video assets request PhotoKit's original resource type; Live
 Photos also request the original paired-video resource under the still's ZUUID with
 `role=live_video`. A missing asset, failed iCloud download, empty export, or size mismatch is a
 loud run failure that retries later—never a successful local-only coverage count. Complete bytes

@@ -1,11 +1,11 @@
 """Apple Photos library scanner.
 
 Reads a snapshot of the library's ``Photos.sqlite`` (never the live file: WAL
-churn from Photos.app would tear reads) and resolves each non-trashed asset to
-the original PhotoKit resource(s) to export: the primary photo/video, plus a
-Live Photo's original paired-video component. The scanner intentionally does
-not inspect ``originals/``: Optimize Mac Storage makes that directory an
-incomplete cache, not an authoritative view of the library.
+churn from Photos.app would tear reads) and resolves each non-trashed,
+user-library asset to the original PhotoKit resource(s) to export: the primary
+photo/video, plus a Live Photo's original paired-video component. The scanner
+intentionally does not inspect ``originals/``: Optimize Mac Storage makes that
+directory an incomplete cache, not an authoritative view of the library.
 """
 
 from __future__ import annotations
@@ -208,6 +208,10 @@ def scan_photo_file_candidates(
             LEFT JOIN ZADDITIONALASSETATTRIBUTES aa ON aa.ZASSET = a.Z_PK
             LEFT JOIN ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
             WHERE a.ZTRASHEDSTATE = 0
+              -- Bundle-scoped rows are transient syndicated/shared records
+              -- stored in Photos.sqlite but are not user-library PHAssets.
+              -- PhotoKit cannot fetch or export them.
+              AND COALESCE(a.ZBUNDLESCOPE, 0) = 0
             ORDER BY a.ZDATECREATED DESC
             """
         ).fetchall()

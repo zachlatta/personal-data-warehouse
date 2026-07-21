@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -38,10 +39,12 @@ class _HelperRunner:
         content: bytes = b"full-icloud-original",
         error: str = "",
         status: int = 3,
+        delay_seconds: float = 0,
     ) -> None:
         self.content = content
         self.error = error
         self.status = status
+        self.delay_seconds = delay_seconds
         self.calls: list[list[str]] = []
 
     def __call__(self, command, **_kwargs):
@@ -50,22 +53,27 @@ class _HelperRunner:
         stdout_path = Path(command[command.index("--stdout") + 1])
         stderr_path = Path(command[command.index("--stderr") + 1])
         helper_arguments = command[command.index("--args") + 1 :]
-        if self.error:
-            stderr_path.write_text(self.error, encoding="utf-8")
-            # `open -W` does not reliably propagate the app's exit status.
-            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-        if helper_arguments[0] == "export":
-            destination = Path(
-                helper_arguments[helper_arguments.index("--destination") + 1]
-            )
-            destination.write_bytes(self.content)
-            role = helper_arguments[helper_arguments.index("--role") + 1]
-            filename = "IMG_0357.MOV" if role == "live_video" else "IMG_0357.HEIC"
-            uti = "com.apple.quicktime-movie" if role == "live_video" else "public.heic"
-            payload = {"filename": filename, "uti": uti, "size_bytes": len(self.content)}
+        def complete() -> None:
+            if self.error:
+                stderr_path.write_text(self.error, encoding="utf-8")
+                return
+            if helper_arguments[0] == "export":
+                destination = Path(
+                    helper_arguments[helper_arguments.index("--destination") + 1]
+                )
+                destination.write_bytes(self.content)
+                role = helper_arguments[helper_arguments.index("--role") + 1]
+                filename = "IMG_0357.MOV" if role == "live_video" else "IMG_0357.HEIC"
+                uti = "com.apple.quicktime-movie" if role == "live_video" else "public.heic"
+                payload = {"filename": filename, "uti": uti, "size_bytes": len(self.content)}
+            else:
+                payload = {"status": self.status}
+            stdout_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        if self.delay_seconds:
+            threading.Timer(self.delay_seconds, complete).start()
         else:
-            payload = {"status": self.status}
-        stdout_path.write_text(json.dumps(payload), encoding="utf-8")
+            complete()
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
 
@@ -84,7 +92,8 @@ def test_export_downloads_full_original_from_icloud(tmp_path):
 
     command = runner.calls[0]
     assert Path(command[0]).name == "open"
-    assert command[1:4] == ["-n", "-j", "-W"]
+    assert command[1:3] == ["-n", "-j"]
+    assert "-W" not in command
     assert command[command.index("--args") + 1] == "export"
     assert command[command.index("--uuid") + 1] == "UUID-ICLOUD"
     assert command[command.index("--role") + 1] == "original"
@@ -129,6 +138,13 @@ def test_request_authorization_uses_native_helper(tmp_path):
     command = runner.calls[0]
     assert command[command.index("--args") + 1 :] == ["authorize"]
     assert str(tmp_path / "PDW Photos Exporter.app") in command
+
+
+def test_launchservices_waits_for_the_apps_result_without_open_wait_mode(tmp_path):
+    runner = _HelperRunner(status=3, delay_seconds=0.05)
+
+    assert _exporter(runner, tmp_path).authorization_status() == 3
+    assert "-W" not in runner.calls[0]
 
 
 def test_native_helper_pins_full_original_and_icloud_contract():

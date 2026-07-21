@@ -32,7 +32,7 @@ def _build_fixture_library(root: Path) -> Path:
             ZWIDTH INTEGER, ZHEIGHT INTEGER,
             ZLATITUDE REAL, ZLONGITUDE REAL,
             ZFAVORITE INTEGER, ZHIDDEN INTEGER, ZADJUSTMENTSSTATE INTEGER,
-            ZTRASHEDSTATE INTEGER
+            ZTRASHEDSTATE INTEGER, ZBUNDLESCOPE INTEGER
         );
         CREATE TABLE ZADDITIONALASSETATTRIBUTES (
             Z_PK INTEGER PRIMARY KEY, ZASSET INTEGER,
@@ -50,21 +50,26 @@ def _build_fixture_library(root: Path) -> Path:
         # Live photo still (kind 0, subtype 2) with GPS + camera.
         (1, "UUID-LIVE", "A", "UUID-LIVE.heic", 0, 2, "public.heic",
          _CAPTURE_COCOA, _CAPTURE_COCOA + 10, _CAPTURE_COCOA + 10,
-         4284, 5712, 45.5, -122.6, 0, 0, 0, 0),
+         4284, 5712, 45.5, -122.6, 0, 0, 0, 0, 0),
         # Plain photo whose original is cloud-only.
         (2, "UUID-MISSING", "A", "UUID-MISSING.heic", 0, 0, "public.heic",
          _CAPTURE_COCOA - 100, _CAPTURE_COCOA, _CAPTURE_COCOA,
-         4032, 3024, -180.0, -180.0, 0, 0, 0, 0),
+         4032, 3024, -180.0, -180.0, 0, 0, 0, 0, 0),
         # Video asset.
         (3, "UUID-VIDEO", "A", "UUID-VIDEO.mov", 1, 0, "com.apple.quicktime-movie",
          _CAPTURE_COCOA - 200, _CAPTURE_COCOA, _CAPTURE_COCOA,
-         1920, 1080, -180.0, -180.0, 0, 0, 0, 0),
+         1920, 1080, -180.0, -180.0, 0, 0, 0, 0, 0),
         # Trashed asset: must never appear.
         (4, "UUID-TRASHED", "A", "UUID-TRASHED.heic", 0, 0, "public.heic",
          _CAPTURE_COCOA - 300, _CAPTURE_COCOA, _CAPTURE_COCOA,
-         100, 100, -180.0, -180.0, 0, 0, 0, 1),
+         100, 100, -180.0, -180.0, 0, 0, 0, 1, 0),
+        # Photos keeps transient syndicated/bundled records in ZASSET, but
+        # they are not user-library PHAssets and cannot be exported.
+        (5, "UUID-BUNDLED", "A", "UUID-BUNDLED.heic", 0, 0, "public.heic",
+         _CAPTURE_COCOA + 100, _CAPTURE_COCOA + 100, _CAPTURE_COCOA + 100,
+         100, 100, -180.0, -180.0, 0, 0, 0, 0, 3),
     ]
-    connection.executemany("INSERT INTO ZASSET VALUES (" + ",".join("?" * 18) + ")", rows)
+    connection.executemany("INSERT INTO ZASSET VALUES (" + ",".join("?" * 19) + ")", rows)
     connection.executemany(
         "INSERT INTO ZADDITIONALASSETATTRIBUTES VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
@@ -94,6 +99,7 @@ def test_scanner_excludes_trashed_and_includes_icloud_only_assets(tmp_path):
     candidates = _scan(tmp_path)
     by_id = {(c.native_id, c.role): c for c in candidates}
     assert ("UUID-TRASHED", "original") not in by_id
+    assert ("UUID-BUNDLED", "original") not in by_id
     cloud_only = by_id[("UUID-MISSING", "original")]
     assert cloud_only.filename == "IMG_0002.HEIC"
     assert cloud_only.expected_size_bytes == 2_000_000

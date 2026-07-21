@@ -16,6 +16,7 @@ import platform
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -133,7 +134,6 @@ class PhotoKitAssetExporter:
                 open_command,
                 "-n",
                 "-j",
-                "-W",
                 "--stdout",
                 str(stdout_path),
                 "--stderr",
@@ -154,12 +154,28 @@ class PhotoKitAssetExporter:
                 raise PhotoExportError(
                     f"Timed out after {self._timeout_seconds:g}s waiting for Apple Photos/iCloud"
                 ) from exc
-            helper_stdout = (
-                stdout_path.read_text(encoding="utf-8") if stdout_path.is_file() else ""
-            )
-            helper_stderr = (
-                stderr_path.read_text(encoding="utf-8") if stderr_path.is_file() else ""
-            )
+            # `open -W` has a race when a short-lived app exits before `open`
+            # installs its process watcher ("initial call to kevent() failed:
+            # No such process"). Launch the app asynchronously, then wait on
+            # the redirected result channel that the app itself owns.
+            deadline = time.monotonic() + self._timeout_seconds
+            helper_stdout = ""
+            helper_stderr = ""
+            while result.returncode == 0:
+                helper_stdout = (
+                    stdout_path.read_text(encoding="utf-8") if stdout_path.is_file() else ""
+                )
+                helper_stderr = (
+                    stderr_path.read_text(encoding="utf-8") if stderr_path.is_file() else ""
+                )
+                if helper_stdout.strip() or helper_stderr.strip():
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PhotoExportError(
+                        f"Timed out after {self._timeout_seconds:g}s waiting for Apple Photos/iCloud"
+                    )
+                time.sleep(min(0.05, remaining))
         if result.returncode != 0 or not helper_stdout.strip():
             detail = (
                 helper_stderr.strip()
