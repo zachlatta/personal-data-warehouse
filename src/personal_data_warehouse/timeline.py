@@ -151,6 +151,7 @@ def _simple_adapter(
     search_text: str | None = None,
     priority: str = str(TIMELINE_PRIORITY_CC),
     where: str = "TRUE",
+    changed_join_sql: str = "",
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE,
     refresh_hours: float = 0.0,
 ) -> TimelineAdapter:
@@ -163,7 +164,8 @@ def _simple_adapter(
     # (measured at ~90s/batch on the 30M-row slack_messages in production).
     # Source columns are NOT NULL throughout the warehouse schema; adapters
     # that need fallback chains state them explicitly.
-    select = f"""
+    def build_select(from_clause: str) -> str:
+        return f"""
         SELECT
             COALESCE(({event_id}), '') AS event_id,
             '{source}' AS source,
@@ -179,9 +181,11 @@ def _simple_adapter(
             COALESCE(({search_text}), '') AS search_text,
             ({ingest_ts}) AS ingest_ts,
             COALESCE(({priority}), {TIMELINE_PRIORITY_CC}) AS priority
-        FROM {from_sql}
+        FROM {from_clause}
         WHERE ({where})
     """
+
+    select = build_select(from_sql)
     backfill_sql = f"""
         {select}
           AND ({event_ts}) <= %(cursor_ts)s
@@ -190,8 +194,15 @@ def _simple_adapter(
         ORDER BY 4 DESC, 1 DESC
         LIMIT %(limit)s
     """
+    # When ingest_ts is a computed expression (GREATEST over attachment /
+    # enrichment LATERALs) no index can serve the watermark predicate, so the
+    # bare incremental query re-evaluates the full join for every source row
+    # on every tick. Adapters with that shape pass changed_join_sql — an
+    # incremental-only inner join to a watermark-driven candidate set covering
+    # every input of ingest_ts — so per-tick cost scales with what changed.
+    incremental_from = from_sql if not changed_join_sql else f"{from_sql}\n    {changed_join_sql}"
     incremental_sql = f"""
-        {select}
+        {build_select(incremental_from)}
           AND ({ingest_ts}) >= %(watermark_ts)s
           AND (({ingest_ts}), COALESCE(({event_id}), ''))
               > (%(watermark_ts)s, %(watermark_id)s)
@@ -392,6 +403,17 @@ _GMAIL_EMAIL = _simple_adapter(
         LEFT JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
         WHERE a.account = t.account AND a.message_id = t.message_id AND a.is_deleted = 0
     ) att ON TRUE""",
+    changed_join_sql="""JOIN (
+        SELECT account, message_id FROM gmail_messages
+        WHERE synced_at >= %(watermark_ts)s
+        UNION
+        SELECT a.account, a.message_id FROM gmail_attachments a
+        WHERE a.synced_at >= %(watermark_ts)s
+        UNION
+        SELECT a.account, a.message_id FROM gmail_attachments a
+        JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
+        WHERE e.updated_at >= %(watermark_ts)s
+    ) pdw_changed ON pdw_changed.account = t.account AND pdw_changed.message_id = t.message_id""",
     event_id="concat_ws('|', t.account, t.message_id)",
     # Bare column, not a COALESCE chain: event_ts is the backfill's ORDER BY
     # and keyset key, and only a plain column keeps the scan on
@@ -728,27 +750,27 @@ _APPLE_MESSAGE = _simple_adapter(
     source_table="apple_messages",
     source="apple_messages",
     kind="message",
-    # apple_message_chat_messages' PK leads with chat_id, so a per-row lateral
-    # lookup by (account, message_id) has no index; the aggregated hash join
-    # costs one small scan per batch instead.
+    # cm/roster are LATERAL probes, not whole-table GROUP BY subqueries: the
+    # grouped form materialized every chat's aggregate on every incremental
+    # tick regardless of how few messages changed. The probes ride
+    # apple_message_chat_messages_message_idx and the chat_handles PK.
     from_sql="""apple_messages t
     LEFT JOIN apple_message_handles h ON h.account = t.account AND h.handle_id = t.handle_id
-    LEFT JOIN (
-        SELECT account, message_id, min(chat_id) AS chat_id
+    LEFT JOIN LATERAL (
+        SELECT min(chat_id) AS chat_id
         FROM apple_message_chat_messages
-        GROUP BY account, message_id
-    ) cm ON cm.account = t.account AND cm.message_id = t.message_id
+        WHERE account = t.account AND message_id = t.message_id
+    ) cm ON TRUE
     LEFT JOIN apple_message_chats c ON c.account = t.account AND c.chat_id = cm.chat_id
-    LEFT JOIN (
+    LEFT JOIN LATERAL (
         -- Distinct people, not handle rows: device re-syncs leave duplicate
         -- handle records for the same address in chat rosters.
-        SELECT ch.account, ch.chat_id,
-               count(DISTINCT COALESCE(NULLIF(rh.address, ''), ch.handle_id)) AS n
+        SELECT count(DISTINCT COALESCE(NULLIF(rh.address, ''), ch.handle_id)) AS n
         FROM apple_message_chat_handles ch
         LEFT JOIN apple_message_handles rh
             ON rh.account = ch.account AND rh.handle_id = ch.handle_id
-        GROUP BY ch.account, ch.chat_id
-    ) roster ON roster.account = t.account AND roster.chat_id = cm.chat_id
+        WHERE ch.account = t.account AND ch.chat_id = cm.chat_id
+    ) roster ON TRUE
     LEFT JOIN LATERAL (
         SELECT
             string_agg(
@@ -772,6 +794,17 @@ _APPLE_MESSAGE = _simple_adapter(
             WHERE a.account = t.account AND a.message_id = t.message_id AND a.is_missing = 0
         ) labels
     ) att_labels ON TRUE""",
+    changed_join_sql="""JOIN (
+        SELECT account, message_id FROM apple_messages
+        WHERE ingested_at >= %(watermark_ts)s
+        UNION
+        SELECT a.account, a.message_id FROM apple_message_attachments a
+        WHERE a.ingested_at >= %(watermark_ts)s
+        UNION
+        SELECT a.account, a.message_id FROM apple_message_attachments a
+        JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
+        WHERE e.updated_at >= %(watermark_ts)s
+    ) pdw_changed ON pdw_changed.account = t.account AND pdw_changed.message_id = t.message_id""",
     event_id="concat_ws('|', t.account, t.message_id)",
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
     ingest_ts="GREATEST(t.ingested_at, COALESCE(att.attachment_ingest_ts, t.ingested_at))",
@@ -878,11 +911,13 @@ _WHATSAPP_MESSAGE = _simple_adapter(
     LEFT JOIN whatsapp_chats c ON c.account = t.account AND c.chat_id = t.chat_id
     LEFT JOIN whatsapp_contacts ct ON ct.account = t.account AND ct.jid = t.sender_jid
     LEFT JOIN whatsapp_contacts chat_ct ON chat_ct.account = t.account AND chat_ct.jid = t.chat_id
-    LEFT JOIN (
-        SELECT account, chat_id, count(*) AS n
-        FROM whatsapp_chat_participants
-        GROUP BY account, chat_id
-    ) roster ON roster.account = t.account AND roster.chat_id = t.chat_id
+    LEFT JOIN LATERAL (
+        -- NULLIF keeps the no-roster case NULL (the priority CASE reads an
+        -- unknown roster as "not a known-small group", not as size zero).
+        SELECT NULLIF(count(*), 0) AS n
+        FROM whatsapp_chat_participants p
+        WHERE p.account = t.account AND p.chat_id = t.chat_id
+    ) roster ON TRUE
     LEFT JOIN LATERAL (
         SELECT
             string_agg(
@@ -894,6 +929,18 @@ _WHATSAPP_MESSAGE = _simple_adapter(
         LEFT JOIN file_attachment_enrichments e ON e.content_sha256 = m.content_sha256
         WHERE m.account = t.account AND m.chat_id = t.chat_id AND m.message_id = t.message_id
     ) media ON TRUE""",
+    changed_join_sql="""JOIN (
+        SELECT account, chat_id, message_id FROM whatsapp_messages
+        WHERE ingested_at >= %(watermark_ts)s
+        UNION
+        SELECT m.account, m.chat_id, m.message_id FROM whatsapp_media_items m
+        WHERE m.ingested_at >= %(watermark_ts)s
+        UNION
+        SELECT m.account, m.chat_id, m.message_id FROM whatsapp_media_items m
+        JOIN file_attachment_enrichments e ON e.content_sha256 = m.content_sha256
+        WHERE e.updated_at >= %(watermark_ts)s
+    ) pdw_changed ON pdw_changed.account = t.account
+        AND pdw_changed.chat_id = t.chat_id AND pdw_changed.message_id = t.message_id""",
     event_id="concat_ws('|', t.account, t.chat_id, t.message_id)",
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
     ingest_ts="GREATEST(t.ingested_at, COALESCE(media.media_ingest_ts, t.ingested_at))",
@@ -1564,8 +1611,8 @@ def _agent_session_adapter() -> TimelineAdapter:
 
     The GROUP BY aggregates only cheap scalars; first/last text-ish fields
     (title, first prompt, model, cwd, ...) and the BM25 search document come
-    from per-session LATERAL probes on the (source, session_id, seq) index so
-    the normalized timeline row can be the primary search hit.
+    from per-session LATERAL probes on each source table's (session_id, seq)
+    index so the normalized timeline row can be the primary search hit.
     """
     rollup = f"""
         SELECT

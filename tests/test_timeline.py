@@ -164,6 +164,27 @@ def test_adapter_sql_carries_the_pagination_contract():
         assert adapter.max_ingest_sql.lstrip().upper().startswith("SELECT")
 
 
+def test_heavy_adapters_bound_incremental_scans_to_changed_candidates():
+    # The incremental predicate is a computed ingest_ts (GREATEST over the
+    # attachment/enrichment LATERAL), which no index can serve: without a
+    # candidate pre-filter every tick re-evaluates the full multi-join for
+    # every source row (measured at ~3 minutes per 5-minute tick for
+    # apple_message in production — the single largest recurring load on the
+    # database). The attachment-carrying adapters must instead join a
+    # watermark-driven candidate set covering every input of ingest_ts:
+    # message ingestion, attachment ingestion, and enrichment updates.
+    for name in ("apple_message", "gmail_email", "whatsapp_message"):
+        adapter = adapter_by_name(name)
+        assert "pdw_changed" in adapter.incremental_sql, name
+        assert "e.updated_at >= %(watermark_ts)s" in adapter.incremental_sql, (
+            f"{name}: enrichment updates must re-emit their parent message"
+        )
+        # The candidate join is an incremental-only optimization; backfill and
+        # first-contact max-ingest stay full-range.
+        assert "pdw_changed" not in adapter.backfill_sql, name
+        assert "pdw_changed" not in adapter.max_ingest_sql, name
+
+
 def test_upsert_sql_bumps_seq_only_on_content_change():
     sql = timeline_upsert_sql()
     assert "ON CONFLICT (adapter, event_id) DO UPDATE" in sql
@@ -1665,6 +1686,43 @@ def test_incremental_picks_up_new_and_changed_rows(warehouse):
         "SELECT seq FROM timeline_events WHERE event_id = %s", (gmail_id,)
     )[0][0]
     assert gmail_seq == old_seqs[gmail_id]
+
+
+def test_apple_message_incremental_picks_up_late_attachment_enrichment(warehouse):
+    # The candidate-join incremental must re-emit a message when only its
+    # attachment's enrichment changed (message row untouched) — the case that
+    # forced the old unindexable GREATEST-over-LATERAL watermark predicate.
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+
+        later = _NOW + timedelta(minutes=10)
+        warehouse._command(
+            """
+            INSERT INTO apple_message_attachments (account, attachment_id, message_id,
+                                                   filename, content_sha256, ingested_at)
+            VALUES ('z@x.test', 'att1', 'am1', 'marina.heic', 'sha-att1', %s)
+            """,
+            (later,),
+        )
+        warehouse._command(
+            """
+            INSERT INTO file_attachment_enrichments (content_sha256, ai_provider, ai_model,
+                                                     ai_prompt_version, text, updated_at)
+            VALUES ('sha-att1', 'p', 'm', 'v1', 'a photo of the marina at sunset', %s)
+            """,
+            (later,),
+        )
+        engine.run()
+    finally:
+        engine.close()
+
+    rows = warehouse._query(
+        "SELECT search_text FROM timeline_events WHERE event_id = 'z@x.test|am1'"
+    )
+    assert rows and "marina at sunset" in rows[0][0]
 
 
 def test_backfill_pages_newest_first(warehouse):
