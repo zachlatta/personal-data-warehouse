@@ -4,10 +4,18 @@
 <dict>
     <key>CFBundleIdentifier</key>
     <string>com.zachlatta.pdw.photos-exporter</string>
+    <key>CFBundleExecutable</key>
+    <string>pdw-photos-exporter</string>
     <key>CFBundleName</key>
     <string>PDW Photos Exporter</string>
+    <key>CFBundleDisplayName</key>
+    <string>PDW Photos Exporter</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSPhotoLibraryUsageDescription</key>
     <string>PDW syncs complete original photos and videos into the personal data warehouse.</string>
 </dict>

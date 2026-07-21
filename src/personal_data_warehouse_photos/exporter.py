@@ -22,6 +22,8 @@ from pathlib import Path
 from personal_data_warehouse_photos.scanner import PhotoFileCandidate, _mime_type, _suffix
 
 HELPER_IDENTIFIER = "com.zachlatta.pdw.photos-exporter"
+HELPER_APP_NAME = "PDW Photos Exporter.app"
+HELPER_EXECUTABLE_NAME = "pdw-photos-exporter"
 HELPER_BUILD_TIMEOUT_SECONDS = 120
 PHOTOS_AUTHORIZED_STATUS = 3
 
@@ -117,24 +119,57 @@ class PhotoKitAssetExporter:
 
     def _run_helper(self, *arguments: str) -> dict:
         helper = self._helper_path or build_photokit_helper()
-        command = [str(helper), *arguments]
-        try:
-            result = self._command_runner(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
-                check=False,
+        open_command = shutil.which("open")
+        if not open_command:
+            raise PhotoExportError("Could not find the macOS LaunchServices `open` command")
+        # Always launch the app bundle through LaunchServices. Directly execing
+        # a command-line Mach-O makes TCC attribute Photos access to its
+        # responsible parent (Ghostty interactively, launchd when scheduled),
+        # so the two contexts observe different grants.
+        with tempfile.TemporaryDirectory(prefix="pdw-photos-invoke-") as invocation_dir:
+            stdout_path = Path(invocation_dir) / "stdout.json"
+            stderr_path = Path(invocation_dir) / "stderr.txt"
+            command = [
+                open_command,
+                "-n",
+                "-j",
+                "-W",
+                "--stdout",
+                str(stdout_path),
+                "--stderr",
+                str(stderr_path),
+                str(helper),
+                "--args",
+                *arguments,
+            ]
+            try:
+                result = self._command_runner(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise PhotoExportError(
+                    f"Timed out after {self._timeout_seconds:g}s waiting for Apple Photos/iCloud"
+                ) from exc
+            helper_stdout = (
+                stdout_path.read_text(encoding="utf-8") if stdout_path.is_file() else ""
             )
-        except subprocess.TimeoutExpired as exc:
-            raise PhotoExportError(
-                f"Timed out after {self._timeout_seconds:g}s waiting for Apple Photos/iCloud"
-            ) from exc
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "unknown PhotoKit error"
+            helper_stderr = (
+                stderr_path.read_text(encoding="utf-8") if stderr_path.is_file() else ""
+            )
+        if result.returncode != 0 or not helper_stdout.strip():
+            detail = (
+                helper_stderr.strip()
+                or result.stderr.strip()
+                or result.stdout.strip()
+                or "unknown PhotoKit error"
+            )
             raise PhotoExportError(detail)
         try:
-            payload = json.loads(result.stdout)
+            payload = json.loads(helper_stdout)
         except (TypeError, json.JSONDecodeError) as exc:
             raise PhotoExportError("The native PhotoKit helper returned invalid output") from exc
         if not isinstance(payload, dict):
@@ -143,7 +178,7 @@ class PhotoKitAssetExporter:
 
 
 def build_photokit_helper(*, destination_dir: Path | None = None) -> Path:
-    """Build and cache the native helper with its privacy plist embedded."""
+    """Build and cache a hidden app bundle with a stable PhotoKit identity."""
     if platform.system() != "Darwin":
         raise PhotoExportError("Apple Photos export is only available on macOS")
     source_dir = Path(__file__).with_name("macos")
@@ -153,15 +188,20 @@ def build_photokit_helper(*, destination_dir: Path | None = None) -> Path:
     root = destination_dir or (
         Path.home() / "Library" / "Application Support" / "personal-data-warehouse" / "photos-helper"
     )
-    binary = root / "pdw-photos-exporter"
+    app_bundle = root / HELPER_APP_NAME
+    binary = app_bundle / "Contents" / "MacOS" / HELPER_EXECUTABLE_NAME
     stamp = root / "source.sha256"
     lock_path = root / "build.lock"
     root.mkdir(parents=True, exist_ok=True)
 
     with lock_path.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        if binary.is_file() and stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == digest:
-            return binary
+        if (
+            binary.is_file()
+            and stamp.is_file()
+            and stamp.read_text(encoding="utf-8").strip() == digest
+        ):
+            return app_bundle
         xcrun = shutil.which("xcrun")
         codesign = shutil.which("codesign")
         if not xcrun or not codesign:
@@ -169,7 +209,12 @@ def build_photokit_helper(*, destination_dir: Path | None = None) -> Path:
                 "Building the Apple Photos helper requires the macOS Command Line Tools"
             )
         with tempfile.TemporaryDirectory(prefix="pdw-photos-helper-", dir=root) as temporary:
-            temporary_binary = Path(temporary) / binary.name
+            temporary_app = Path(temporary) / HELPER_APP_NAME
+            temporary_contents = temporary_app / "Contents"
+            temporary_macos = temporary_contents / "MacOS"
+            temporary_macos.mkdir(parents=True)
+            temporary_binary = temporary_macos / HELPER_EXECUTABLE_NAME
+            shutil.copy2(info_plist, temporary_contents / "Info.plist")
             compile_result = subprocess.run(
                 [
                     xcrun,
@@ -178,14 +223,6 @@ def build_photokit_helper(*, destination_dir: Path | None = None) -> Path:
                     str(source),
                     "-o",
                     str(temporary_binary),
-                    "-Xlinker",
-                    "-sectcreate",
-                    "-Xlinker",
-                    "__TEXT",
-                    "-Xlinker",
-                    "__info_plist",
-                    "-Xlinker",
-                    str(info_plist),
                 ],
                 capture_output=True,
                 text=True,
@@ -205,7 +242,7 @@ def build_photokit_helper(*, destination_dir: Path | None = None) -> Path:
                     "-",
                     "--identifier",
                     HELPER_IDENTIFIER,
-                    str(temporary_binary),
+                    str(temporary_app),
                 ],
                 capture_output=True,
                 text=True,
@@ -217,8 +254,13 @@ def build_photokit_helper(*, destination_dir: Path | None = None) -> Path:
                     "Could not sign the native Apple Photos helper: "
                     + (sign_result.stderr.strip() or sign_result.stdout.strip())
                 )
-            os.replace(temporary_binary, binary)
+            if app_bundle.exists():
+                shutil.rmtree(app_bundle)
+            os.replace(temporary_app, app_bundle)
             temporary_stamp = Path(temporary) / stamp.name
             temporary_stamp.write_text(digest + "\n", encoding="utf-8")
             os.replace(temporary_stamp, stamp)
-    return binary
+            # Completely replace the original loose-binary flow so TCC can no
+            # longer fall back to terminal/launchd attribution.
+            (root / HELPER_EXECUTABLE_NAME).unlink(missing_ok=True)
+    return app_bundle

@@ -73,21 +73,29 @@ private func fetchAsset(uuid: String) -> PHAsset? {
     return found
 }
 
-private func authorize() -> Never {
+private func requestAuthorization() -> PHAuthorizationStatus {
     let current = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     if current != .notDetermined {
-        emit(["status": current.rawValue])
+        return current
     }
     let completion = Completion()
     PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
         completion.finish(status: status)
     }
     let (_, status) = waitForCompletion(completion)
-    emit(["status": status?.rawValue ?? -1])
+    return status ?? .denied
+}
+
+private func authorize() -> Never {
+    emit(["status": requestAuthorization().rawValue])
 }
 
 private func exportResource() -> Never {
-    guard PHPhotoLibrary.authorizationStatus(for: .readWrite).rawValue == authorizedStatus else {
+    // The first scheduled run is allowed to raise the consent prompt itself.
+    // This process is an LSUIElement app launched in the user's Aqua session,
+    // so the prompt and resulting grant belong to PDW Photos Exporter rather
+    // than to Ghostty or launchd.
+    guard requestAuthorization().rawValue == authorizedStatus else {
         fail("The uploader does not have Full Photos library access. Run `uv run python -m personal_data_warehouse_photos.cli --authorize` interactively, then allow Full Access in System Settings → Privacy & Security → Photos.")
     }
     let values = arguments()

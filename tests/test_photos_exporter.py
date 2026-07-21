@@ -47,23 +47,31 @@ class _HelperRunner:
     def __call__(self, command, **_kwargs):
         command = [str(value) for value in command]
         self.calls.append(command)
+        stdout_path = Path(command[command.index("--stdout") + 1])
+        stderr_path = Path(command[command.index("--stderr") + 1])
+        helper_arguments = command[command.index("--args") + 1 :]
         if self.error:
-            return subprocess.CompletedProcess(command, 1, stdout="", stderr=self.error)
-        if command[1] == "export":
-            destination = Path(command[command.index("--destination") + 1])
+            stderr_path.write_text(self.error, encoding="utf-8")
+            # `open -W` does not reliably propagate the app's exit status.
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        if helper_arguments[0] == "export":
+            destination = Path(
+                helper_arguments[helper_arguments.index("--destination") + 1]
+            )
             destination.write_bytes(self.content)
-            role = command[command.index("--role") + 1]
+            role = helper_arguments[helper_arguments.index("--role") + 1]
             filename = "IMG_0357.MOV" if role == "live_video" else "IMG_0357.HEIC"
             uti = "com.apple.quicktime-movie" if role == "live_video" else "public.heic"
             payload = {"filename": filename, "uti": uti, "size_bytes": len(self.content)}
         else:
             payload = {"status": self.status}
-        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+        stdout_path.write_text(json.dumps(payload), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
 
 def _exporter(runner: _HelperRunner, tmp_path: Path) -> PhotoKitAssetExporter:
     return PhotoKitAssetExporter(
-        helper_path=tmp_path / "pdw-photos-exporter",
+        helper_path=tmp_path / "PDW Photos Exporter.app",
         command_runner=runner,
         timeout_seconds=1,
     )
@@ -75,9 +83,12 @@ def test_export_downloads_full_original_from_icloud(tmp_path):
     exported = _exporter(runner, tmp_path).export(_candidate(), tmp_path)
 
     command = runner.calls[0]
-    assert command[1] == "export"
+    assert Path(command[0]).name == "open"
+    assert command[1:4] == ["-n", "-j", "-W"]
+    assert command[command.index("--args") + 1] == "export"
     assert command[command.index("--uuid") + 1] == "UUID-ICLOUD"
     assert command[command.index("--role") + 1] == "original"
+    assert command[command.index("--args") - 1].endswith("PDW Photos Exporter.app")
     assert exported.path.read_bytes() == b"full-icloud-original"
     assert exported.filename == "IMG_0357.HEIC"
     assert exported.size_bytes == 20
@@ -115,7 +126,9 @@ def test_request_authorization_uses_native_helper(tmp_path):
     runner = _HelperRunner(status=3)
 
     assert _exporter(runner, tmp_path).request_authorization() == 3
-    assert runner.calls == [[str(tmp_path / "pdw-photos-exporter"), "authorize"]]
+    command = runner.calls[0]
+    assert command[command.index("--args") + 1 :] == ["authorize"]
+    assert str(tmp_path / "PDW Photos Exporter.app") in command
 
 
 def test_native_helper_pins_full_original_and_icloud_contract():
@@ -133,5 +146,11 @@ def test_native_helper_pins_full_original_and_icloud_contract():
     assert "wantedType = .video" in source
     assert "wantedType = .pairedVideo" in source
     assert "PHAsset.fetchAssets(with: nil)" in source  # non-default library-scope fallback
+    assert "guard requestAuthorization().rawValue == authorizedStatus" in source
     assert "NSPhotoLibraryUsageDescription" in info_plist
     assert "com.zachlatta.pdw.photos-exporter" in info_plist
+    assert "<key>CFBundlePackageType</key>" in info_plist
+    assert "<string>APPL</string>" in info_plist
+    assert "<key>CFBundleExecutable</key>" in info_plist
+    assert "<key>LSUIElement</key>" in info_plist
+    assert "<true/>" in info_plist

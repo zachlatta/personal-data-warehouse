@@ -333,15 +333,19 @@ If the run log shows `PermissionError` for `~/Pictures/Photos Library.photoslibr
 LaunchAgent is loaded correctly but macOS Full Disk Access is blocking the background process —
 the same FDA/uv-python-path-drift story as the other uploaders above.
 
-The uploader also needs the macOS Photos privacy grant used by PhotoKit. PhotoKit runs in a tiny
-native helper cached at `~/Library/Application Support/personal-data-warehouse/photos-helper/`;
-the helper has a stable identifier and an embedded `NSPhotoLibraryUsageDescription` (an
-unbundled Python process cannot reliably request this permission). Request access once from an
-interactive terminal with `uv run python -m personal_data_warehouse_photos.cli --authorize`,
-grant **Full Access** (Selected Photos is insufficient), and then kickstart the LaunchAgent. The
-helper is rebuilt only when its checked-in Swift source or privacy plist changes; because it is
-ad-hoc signed, such a change requires running `--authorize` again. If a run reports that Photos
-access was denied or limited, repair it in System Settings → Privacy & Security → Photos.
+The uploader also needs the macOS Photos privacy grant used by PhotoKit. PhotoKit runs in the
+hidden native app `~/Library/Application Support/personal-data-warehouse/photos-helper/PDW Photos
+Exporter.app`; every helper call goes through LaunchServices so TCC consistently attributes the
+grant to `com.zachlatta.pdw.photos-exporter`. Do not replace this with a loose executable: macOS
+attributes a command-line PhotoKit request to its responsible parent (Ghostty interactively,
+launchd when scheduled), producing a grant that works in only one context. The first scheduled
+export requests access automatically, or request it ahead of time with `uv run python -m
+personal_data_warehouse_photos.cli --authorize`; either path must show **PDW Photos Exporter** as
+the requester. Grant **Full Access** (Selected Photos is insufficient), then kickstart the
+LaunchAgent. The helper is rebuilt only when its checked-in Swift source or privacy plist changes;
+because it is ad-hoc signed, such a change requires authorization again. If a run reports that
+Photos access was denied or limited, repair PDW Photos Exporter in System Settings → Privacy &
+Security → Photos.
 
 The uploader snapshots `Photos.sqlite` (never reads the live DB) for metadata and candidate
 selection, but deliberately never reads `Photos Library.photoslibrary/originals` for media:
