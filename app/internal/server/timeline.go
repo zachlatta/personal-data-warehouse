@@ -27,9 +27,14 @@ type timelineQuerier interface {
 }
 
 const (
-	timelineDefaultPageSize   = 60
-	timelineMaxPageSize       = 200
-	timelineSourcesCacheTTL   = 5 * time.Minute
+	timelineDefaultPageSize = 60
+	timelineMaxPageSize     = 200
+	// The sidebar count aggregates scan all of timeline.events (~85s of
+	// database time per refresh in production); counts of a 42M-row table do
+	// not need minute-level freshness, and the handler already serves the
+	// stale payload while a background refresh runs. `?refresh=` still forces
+	// an immediate rebuild.
+	timelineSourcesCacheTTL   = 24 * time.Hour
 	timelineDetailFieldChars  = 50000
 	timelineChildRowFieldChar = 4000
 )

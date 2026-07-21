@@ -77,6 +77,25 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvDefaultQueryTimeoutMatchesCallerBudget(t *testing.T) {
+	// The server-side statement budget must not exceed what callers can
+	// actually wait for (the public edge cuts requests off around 100s, the
+	// CLI default is aligned to this value): a larger ceiling only produced
+	// orphaned statements that kept burning the database after every client
+	// had given up.
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL": "postgres://d:s@example.com/d",
+		"MCP_SECRET_TOKEN":      "0123456789abcdef0123456789abcdef",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv: %v", err)
+	}
+	if cfg.QueryTimeout != 60*time.Second {
+		t.Fatalf("QueryTimeout = %s, want 60s", cfg.QueryTimeout)
+	}
+}
+
 func TestLoadFromEnvDefaultsQueryPostgresRole(t *testing.T) {
 	env := map[string]string{
 		"POSTGRES_DATABASE_URL": "postgres://d:s@example.com/d",

@@ -59,7 +59,7 @@ COMMANDS
                                --output FMT  csv, json, or nd-json. If omitted,
                                              defaults to csv and prints a note.
                                --file PATH   Read the SQL statement from a file.
-                               --no-timeout  Wait indefinitely for a long query.
+                               --no-timeout  Wait indefinitely for the response (the server still bounds statement execution).
   columns <schema.table>     List a relation's column names and types. Use this (or
                              schema) before writing SQL so you don't guess column
                              names.
@@ -281,7 +281,11 @@ func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer
 
 const sqlOutputHint = "note: use --output [csv|json|nd-json] to specify output format"
 
-const defaultSQLTimeout = 10 * time.Second
+// Slightly above the server's 60s statement budget (config.QueryTimeout), so a
+// slow query surfaces the server's SQL timeout error — which carries a rewrite
+// hint — instead of a client-side abort that leaves the statement burning
+// server-side and invites a blind retry.
+const defaultSQLTimeout = 75 * time.Second
 
 type sqlCommandInput struct {
 	Question string `json:"question"`
@@ -335,7 +339,7 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 	out, err := client.CallTool(ctx, "sql", input)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			fmt.Fprintf(stderr, "pdw sql: query timed out after %s; rerun with --no-timeout to wait indefinitely\n", defaultSQLTimeout)
+			fmt.Fprintf(stderr, "pdw sql: no response after %s (the server itself stops statements after its own budget); narrow the query, or rerun with --no-timeout if you are waiting on a large result download\n", defaultSQLTimeout)
 			return 1
 		}
 		var apiErr *cliclient.APIError

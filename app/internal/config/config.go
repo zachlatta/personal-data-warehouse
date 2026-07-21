@@ -145,7 +145,14 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		GetFieldMaxChars:        200000,
 		QueryCacheTTL:           30 * time.Minute,
 		DebugCacheTool:          false,
-		QueryTimeout:            300 * time.Second,
+		// One end-to-end query budget. No caller can wait longer than the
+		// public edge allows (~100s at the CDN; the CLI default is aligned to
+		// this value), so a larger server-side ceiling only produced orphaned
+		// queries that burned the database for minutes after every client had
+		// given up — and invited retry storms on top. Deployments that need
+		// longer diagnostics can raise MCP_QUERY_TIMEOUT; ad-hoc admin work
+		// should use a direct Postgres connection instead.
+		QueryTimeout:            60 * time.Second,
 		MutationUIPassword:      getenv("PDW_MUTATION_UI_PASSWORD"),
 		MutationUISessionSecret: getenv("PDW_MUTATION_UI_SESSION_SECRET"),
 		MutationUISessionTTL:    12 * time.Hour,

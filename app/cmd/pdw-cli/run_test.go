@@ -99,7 +99,11 @@ func successfulSQLResponse(req *http.Request) *http.Response {
 	}
 }
 
-func TestSQLCommandUsesTenSecondDeadlineByDefault(t *testing.T) {
+func TestSQLCommandDefaultDeadlineOutlivesServerStatementBudget(t *testing.T) {
+	// The client deadline must sit ABOVE the server's 60s statement timeout
+	// (config.QueryTimeout) so a slow query surfaces the server's SQL error —
+	// which carries a rewrite hint — instead of a client-side abort that
+	// leaves the statement burning server-side.
 	var remaining time.Duration
 	client := newTransportClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		deadline, ok := req.Context().Deadline()
@@ -115,8 +119,8 @@ func TestSQLCommandUsesTenSecondDeadlineByDefault(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if remaining < 9*time.Second || remaining > 10*time.Second {
-		t.Fatalf("SQL deadline remaining = %s, want approximately 10s", remaining)
+	if remaining <= 60*time.Second || remaining > defaultSQLTimeout {
+		t.Fatalf("SQL deadline remaining = %s, want above the server's 60s budget (approximately %s)", remaining, defaultSQLTimeout)
 	}
 }
 
@@ -145,7 +149,7 @@ func TestSQLCommandTimeoutErrorPointsToNoTimeoutFlag(t *testing.T) {
 	if code == 0 {
 		t.Fatal("expected timeout to return a non-zero exit code")
 	}
-	if !strings.Contains(stderr.String(), "timed out after 10s") || !strings.Contains(stderr.String(), "--no-timeout") {
+	if !strings.Contains(stderr.String(), "no response after 1m15s") || !strings.Contains(stderr.String(), "--no-timeout") {
 		t.Fatalf("timeout error is not actionable: %s", stderr.String())
 	}
 }
