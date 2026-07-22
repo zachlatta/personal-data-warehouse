@@ -513,3 +513,144 @@ def test_upload_timeout_applied_to_post() -> None:
     big = b"x" * (200 * 1024 * 1024)
     client.upload_agent_sessions_batch(big, exported_at="2026-06-19T12:34:56+00:00")
     assert session.calls[0]["timeout"] == 200.0
+
+
+# --- transient upload retries ----------------------------------------------
+
+
+class _HTTPStatusResponse:
+    """Response whose raise_for_status raises like requests does for a status."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:
+        import requests
+
+        raise requests.HTTPError(f"{self.status_code} Server Error", response=self)
+
+    def json(self) -> dict:
+        return {}
+
+
+class _ScriptedSession:
+    """Session that replays a scripted sequence of outcomes."""
+
+    def __init__(self, outcomes: list) -> None:
+        self._outcomes = list(outcomes)
+        self.calls: list[dict] = []
+
+    def post(self, url, *, data, headers, timeout):
+        self.calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _retry_client(session) -> IngestClient:
+    return IngestClient(
+        base_url="https://pdw.example.com",
+        signing_key=b"k" * 32,
+        session=session,
+        now=lambda: 1700000000.0,
+    )
+
+
+def test_upload_retries_proxy_499_and_succeeds(monkeypatch) -> None:
+    # A large photo/video upload that stalls gets a 499 from the proxy. One
+    # blip used to fail the whole scheduled run, so a single flaky video
+    # wedged an entire photos batch.
+    monkeypatch.setattr("personal_data_warehouse.ingest_client.time.sleep", lambda _s: None)
+    ok = _FakeResponse(
+        {
+            "storage_backend": "google_drive",
+            "storage_key": "apple-photos/inbox/files/x.mov",
+            "storage_file_id": "fid-1",
+            "storage_url": "https://drive/x",
+        }
+    )
+    session = _ScriptedSession([_HTTPStatusResponse(499), ok])
+    stored = _retry_client(session).upload_photo_file(
+        b"movie-bytes",
+        captured_at="2026-06-02T20:54:45",
+        extension=".mov",
+        content_type="video/quicktime",
+    )
+
+    assert stored["storage_file_id"] == "fid-1"
+    assert len(session.calls) == 2
+
+
+def test_upload_retries_dropped_connection(monkeypatch) -> None:
+    import requests
+
+    monkeypatch.setattr("personal_data_warehouse.ingest_client.time.sleep", lambda _s: None)
+    ok = _FakeResponse(
+        {"storage_backend": "google_drive", "storage_key": "k", "storage_file_id": "f", "storage_url": "u"}
+    )
+    session = _ScriptedSession([requests.ConnectionError("tailnet reset"), ok])
+
+    stored = _retry_client(session).upload_agent_sessions_batch(
+        b"batch", exported_at="2026-07-22T12:00:00+00:00"
+    )
+
+    assert stored["storage_file_id"] == "f"
+    assert len(session.calls) == 2
+
+
+def test_upload_does_not_retry_client_rejections(monkeypatch) -> None:
+    import requests
+
+    monkeypatch.setattr("personal_data_warehouse.ingest_client.time.sleep", lambda _s: None)
+    # 413 means the body is over the route's cap: retrying cannot help and the
+    # caller (e.g. voice memos) needs the error to defer the file instead.
+    session = _ScriptedSession([_HTTPStatusResponse(413)])
+
+    with pytest.raises(requests.HTTPError):
+        _retry_client(session).upload_agent_sessions_batch(
+            b"batch", exported_at="2026-07-22T12:00:00+00:00"
+        )
+
+    assert len(session.calls) == 1
+
+
+def test_upload_gives_up_after_the_attempt_budget(monkeypatch) -> None:
+    import requests
+
+    from personal_data_warehouse.ingest_client import UPLOAD_RETRY_ATTEMPTS
+
+    monkeypatch.setattr("personal_data_warehouse.ingest_client.time.sleep", lambda _s: None)
+    session = _ScriptedSession([_HTTPStatusResponse(502)] * UPLOAD_RETRY_ATTEMPTS)
+
+    with pytest.raises(requests.HTTPError):
+        _retry_client(session).upload_agent_sessions_batch(
+            b"batch", exported_at="2026-07-22T12:00:00+00:00"
+        )
+
+    assert len(session.calls) == UPLOAD_RETRY_ATTEMPTS
+
+
+def test_upload_retry_resigns_each_attempt(monkeypatch) -> None:
+    """Each attempt must carry a fresh expiry, or a slow retry ships a dead signature."""
+    monkeypatch.setattr("personal_data_warehouse.ingest_client.time.sleep", lambda _s: None)
+    clock = iter([1700000000.0, 1700000900.0])
+    ok = _FakeResponse(
+        {"storage_backend": "google_drive", "storage_key": "k", "storage_file_id": "f", "storage_url": "u"}
+    )
+    session = _ScriptedSession([_HTTPStatusResponse(503), ok])
+    client = IngestClient(
+        base_url="https://pdw.example.com",
+        signing_key=b"k" * 32,
+        session=session,
+        now=lambda: next(clock),
+        link_ttl_seconds=900,
+    )
+
+    client.upload_agent_sessions_batch(b"batch", exported_at="2026-07-22T12:00:00+00:00")
+
+    exps = [
+        {k: v[0] for k, v in parse_qs(urlsplit(call["url"]).query).items()}["exp"]
+        for call in session.calls
+    ]
+    assert exps == [str(1700000000 + 900), str(1700000900 + 900)]

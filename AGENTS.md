@@ -821,8 +821,16 @@ localhost Plaid Link flow and persists the exchanged token; repeat it once per i
 `pdw ingest plaid sync` performs an immediate pull. Production uses the `plaid_finance_sync` asset
 and `plaid_finance_sync_every_thirty_minutes` schedule. Account, holding, and liability responses
 are authoritative snapshots: reconcile missing accounts/holdings/liabilities rather than leaving
-stale current rows. Product errors must persist a redacted failed `plaid.sync_state` row before the
-run fails. Optional products default to read-only `transactions,investments,liabilities`; no
+stale current rows. Product errors must persist a redacted `plaid.sync_state` row before the run
+fails. The exception is a permanent Item error — `NO_ACCOUNTS`, `ITEM_LOGIN_REQUIRED`, and the rest
+of `PLAID_ACTION_REQUIRED_ERROR_CODES` — which no retry can clear: those record status
+`action_required` (keeping the prior cursor and last-success time so re-linking resumes instead of
+replaying), warn in the run log, count in the asset's `action_required` metadata, and leave the run
+green. Otherwise one dead institution keeps the every-30-minutes schedule permanently red and
+buries the transient failures that are worth paging on. Repair by re-running
+`pdw ingest plaid link` for that institution; find them with
+`SELECT * FROM plaid.sync_state WHERE status = 'action_required'`.
+Optional products default to read-only `transactions,investments,liabilities`; no
 payment/money-movement Plaid products are requested.
 New Links request `PLAID_TRANSACTIONS_LOOKBACK_DAYS` of Transactions history, defaulting to Plaid's
 730-day maximum; the same setting controls the Investments transaction query window. Transactions

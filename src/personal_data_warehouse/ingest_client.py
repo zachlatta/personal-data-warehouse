@@ -41,6 +41,16 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 # (a 512 MiB body → ~512 s) to tolerate slow Drive writes.
 _MIN_UPLOAD_BYTES_PER_SEC = 1024 * 1024
 
+# Every ingest endpoint keys on the body's content sha and the app dedups, so
+# repeating an upload is free and safe. Without a retry a single transport blip
+# failed the entire uploader run: one large video that stalled long enough for
+# the proxy to log a 499 took a whole scheduled photos batch down with it.
+# Rejections that a retry cannot change (413 over the route's cap, 401, 400)
+# still propagate immediately so size-aware callers can defer the item.
+UPLOAD_RETRY_ATTEMPTS = 3
+UPLOAD_RETRY_BASE_SECONDS = 2.0
+RETRYABLE_UPLOAD_STATUS_CODES = frozenset({429, 499, 500, 502, 503, 504})
+
 # The app accepts bodies up to PDW_INGEST_MAX_OBJECT_BYTES (Go default 512 MiB).
 # Mirror that default so size-aware clients (e.g. voice memos) can defer a file
 # that the app would only 413 anyway instead of wedging the whole run on it.
@@ -54,6 +64,15 @@ CLOUDFLARE_MAX_BODY_BYTES = 100 * 1024 * 1024
 _logger = logging.getLogger(__name__)
 
 StoredObjectDict = dict[str, str]
+
+
+def _is_retryable_upload_error(exc: requests.RequestException) -> bool:
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        return response is not None and response.status_code in RETRYABLE_UPLOAD_STATUS_CODES
+    # A dropped connection or a read timeout never got a verdict from the app,
+    # and the endpoints are content-sha idempotent, so repeating is safe.
+    return isinstance(exc, requests.ConnectionError | requests.Timeout)
 
 
 def sign_object_upload(secret: bytes, endpoint: str, content_sha256: str, exp_unix: int) -> str:
@@ -146,6 +165,34 @@ class IngestClient:
         content_type: str,
         params: Mapping[str, str | None],
     ) -> Any:
+        for attempt in range(UPLOAD_RETRY_ATTEMPTS):
+            try:
+                return self._signed_post_once(
+                    endpoint, body=body, content_type=content_type, params=params
+                )
+            except requests.RequestException as exc:
+                if attempt == UPLOAD_RETRY_ATTEMPTS - 1 or not _is_retryable_upload_error(exc):
+                    raise
+                delay = UPLOAD_RETRY_BASE_SECONDS * (2**attempt)
+                _logger.warning(
+                    "retrying %s upload in %.0fs after transient failure: %s",
+                    endpoint,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable: upload retry loop must return or raise")
+
+    def _signed_post_once(
+        self,
+        endpoint: str,
+        *,
+        body: bytes,
+        content_type: str,
+        params: Mapping[str, str | None],
+    ) -> Any:
+        # Re-signed per attempt: the signature carries an expiry, so a retry
+        # after a long stalled upload must not replay a stale one.
         content_sha256 = hashlib.sha256(body).hexdigest()
         exp_unix = int(self._now()) + self._link_ttl_seconds
         signature = sign_object_upload(self._signing_key, endpoint, content_sha256, exp_unix)

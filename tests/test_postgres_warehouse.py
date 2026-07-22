@@ -1373,6 +1373,18 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_google_drive_source_tables()
     warehouse.ensure_whoop_tables()
     warehouse.ensure_plaid_tables()
+    warehouse.ensure_manual_finance_tables()
+    warehouse.ensure_finance_tables()
+    warehouse.ensure_alice_voice_recordings_tables()
+    warehouse.ensure_chatgpt_tables()
+    warehouse.ensure_claude_desktop_tables()
+    warehouse.ensure_agent_tables()
+    warehouse.ensure_file_attachment_enrichment_tables()
+    # Every source above has a timeline adapter, and timeline sync reads all of
+    # them. Sources added since this helper was last updated were missing, so
+    # each timeline-backed search_text test died on an UndefinedTable for
+    # whichever unprovisioned source the engine reached first. Keep this list
+    # exhaustive: it is the whole point of the helper.
     warehouse.ensure_timeline_tables()
 
 
@@ -1403,7 +1415,24 @@ def _search_text_function_sql() -> str:
     captured: list[str] = []
 
     class _Capture:
+        # _ensure_search_text_function is called unbound with this double as
+        # `self`, so it must answer every attribute that function touches. It
+        # grew a _raw_command/_search_text_alter_sql call (the search_path pin
+        # that fixed the silent app-search outage) and the double was never
+        # updated, so all eleven search_text tests errored on AttributeError —
+        # leaving the default cross-source search path with no coverage at all.
+        # Borrow the real SQL builders so what is captured is exactly what a
+        # live warehouse would issue; only execution is faked.
+        _schema = "public"
+        _search_path_sql = postgres_module.PostgresWarehouse._search_path_sql
+        _search_text_alter_sql = postgres_module.PostgresWarehouse._search_text_alter_sql
+        physical_schema_name = postgres_module.PostgresWarehouse.physical_schema_name
+        physical_schema_names = postgres_module.PostgresWarehouse.physical_schema_names
+
         def _command(self, sql: str) -> None:
+            captured.append(sql)
+
+        def _raw_command(self, sql: str) -> None:
             captured.append(sql)
 
     postgres_module.PostgresWarehouse._ensure_search_text_function(_Capture())
@@ -3333,3 +3362,114 @@ def test_postgres_sync_state_round_trips_latest_update(warehouse: PostgresWareho
     state = warehouse.load_sync_state()["zach@example.test"]
     assert state.last_history_id == 1
     assert state.status == "ok"
+
+
+# --- query role privilege sweep --------------------------------------------
+
+
+def test_query_role_setup_is_skipped_once_privileges_are_correct(warehouse: PostgresWarehouse) -> None:
+    # The sweep rewrites the ACL of every table in every managed schema, so
+    # re-running it on each of the ~30k warehouse constructions a day churned
+    # pg_class by millions of row updates and raced concurrent DDL ("tuple
+    # concurrently updated"). A freshly constructed warehouse must report no
+    # drift, i.e. the next construction does zero catalog writes.
+    assert warehouse._query_role_setup_needed() is False
+
+
+def test_query_role_setup_detects_and_repairs_revoked_table_privileges(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_plaid_tables()
+    # ensure_* created new tables; default privileges keep them readable.
+    assert warehouse._query_role_setup_needed() is False
+
+    accounts = warehouse.sql_relation("plaid_accounts")
+    warehouse._raw_command(f'REVOKE SELECT ON {accounts} FROM "{warehouse.query_role}"')
+    assert warehouse._query_role_setup_needed() is True
+
+    # A new construction notices the drift and repairs it.
+    repaired = PostgresWarehouse(_postgres_url(), schema=warehouse.schema_namespace)
+    try:
+        assert repaired._query_role_setup_needed() is False
+        connection = psycopg2.connect(_postgres_url())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(f'SET LOCAL ROLE "{repaired.query_role}"')
+                cursor.execute(f"SELECT count(*) FROM {accounts}")
+                assert cursor.fetchone() == (0,)
+        finally:
+            connection.rollback()
+            connection.close()
+    finally:
+        repaired.close()
+
+
+def test_query_role_setup_detects_private_schema_leak(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_plaid_tables()
+    tokens = warehouse.sql_relation("plaid_item_tokens")
+    private_schema = warehouse.physical_schema_name("private")
+
+    # Anything that hands the query role access to private token storage is
+    # drift, no matter how it got granted.
+    warehouse._raw_command(f'GRANT USAGE ON SCHEMA "{private_schema}" TO "{warehouse.query_role}"')
+    warehouse._raw_command(f'GRANT SELECT ON {tokens} TO "{warehouse.query_role}"')
+    assert warehouse._query_role_setup_needed() is True
+
+    repaired = PostgresWarehouse(_postgres_url(), schema=warehouse.schema_namespace)
+    try:
+        assert repaired._query_role_setup_needed() is False
+        connection = psycopg2.connect(_postgres_url())
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(f'SET LOCAL ROLE "{repaired.query_role}"')
+                with pytest.raises(psycopg2.errors.InsufficientPrivilege):
+                    cursor.execute(f"SELECT access_token FROM {tokens}")
+        finally:
+            connection.rollback()
+            connection.close()
+    finally:
+        repaired.close()
+
+
+def test_query_role_setup_retries_tuple_concurrently_updated(warehouse: PostgresWarehouse, monkeypatch) -> None:
+    # The advisory lock serializes competing sweeps but not unrelated DDL
+    # touching the same pg_class rows, so the collision has to be survivable.
+    attempts: list[int] = []
+
+    def flaky() -> None:
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise psycopg2.errors.InternalError_("tuple concurrently updated")
+
+    monkeypatch.setattr(warehouse, "_query_role_setup_needed", lambda: True)
+    monkeypatch.setattr(warehouse, "_ensure_query_role_locked", flaky)
+    monkeypatch.setattr("personal_data_warehouse.postgres.time.sleep", lambda _seconds: None)
+
+    warehouse._ensure_query_role()
+
+    assert len(attempts) == 3
+
+
+def test_query_role_setup_reraises_unrelated_errors(warehouse: PostgresWarehouse, monkeypatch) -> None:
+    def boom() -> None:
+        raise psycopg2.errors.InsufficientPrivilege("permission denied")
+
+    monkeypatch.setattr(warehouse, "_query_role_setup_needed", lambda: True)
+    monkeypatch.setattr(warehouse, "_ensure_query_role_locked", boom)
+
+    with pytest.raises(psycopg2.errors.InsufficientPrivilege):
+        warehouse._ensure_query_role()
+
+
+def test_query_role_setup_detects_non_select_private_grants(warehouse: PostgresWarehouse) -> None:
+    # The sweep issues REVOKE ALL on private, so the probe must not certify a
+    # boundary narrower than that: a stray INSERT grant is still drift.
+    warehouse.ensure_plaid_tables()
+    tokens = warehouse.sql_relation("plaid_item_tokens")
+
+    warehouse._raw_command(f'GRANT INSERT ON {tokens} TO "{warehouse.query_role}"')
+    assert warehouse._query_role_setup_needed() is True
+
+    repaired = PostgresWarehouse(_postgres_url(), schema=warehouse.schema_namespace)
+    try:
+        assert repaired._query_role_setup_needed() is False
+    finally:
+        repaired.close()

@@ -6,15 +6,23 @@ from datetime import UTC, date, datetime
 import pytest
 
 from personal_data_warehouse.config import PlaidConfig
-from personal_data_warehouse.plaid_sync import PlaidSyncRunner, PlaidLinkedItem
+from personal_data_warehouse.plaid_sync import (
+    PLAID_STATUS_ACTION_REQUIRED,
+    PlaidAPIError,
+    PlaidSyncRunner,
+    PlaidLinkedItem,
+)
 
 
 class FakeLogger:
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
     def info(self, *args, **kwargs) -> None:
         pass
 
-    def warning(self, *args, **kwargs) -> None:
-        pass
+    def warning(self, message, *args, **kwargs) -> None:
+        self.warnings.append(str(message) % args if args else str(message))
 
 
 class FakePlaidClient:
@@ -360,4 +368,121 @@ def test_plaid_sync_records_product_failure_without_token_leak_and_continues_oth
     assert states["liabilities"]["status"] == "ok"
     # The failed product retains its prior successful timestamp instead of
     # pretending the failed attempt completed successfully.
+    assert states["transactions"]["last_synced_at"] == datetime.fromtimestamp(0, tz=UTC)
+
+
+def _plaid_config() -> PlaidConfig:
+    return PlaidConfig(
+        account="zach@example.com",
+        client_id="client-id",
+        secret="secret",
+        environment="sandbox",
+        products=("transactions", "investments", "liabilities"),
+        country_codes=("US",),
+        client_name="Personal Data Warehouse",
+    )
+
+
+def test_plaid_sync_marks_permanently_broken_product_action_required_without_failing_run() -> None:
+    # A linked Item can stop exposing accounts entirely. NO_ACCOUNTS never
+    # clears on retry, so failing the run turned one dead institution into 262
+    # consecutive red Dagster runs that buried every other signal.
+    class NoAccountsClient(FakePlaidClient):
+        def accounts_get(self, access_token: str):
+            raise PlaidAPIError("NO_ACCOUNTS: no valid accounts were found for this item")
+
+        def transactions_sync(self, access_token: str, *, cursor: str | None, count: int):
+            raise PlaidAPIError(f"NO_ACCOUNTS: no valid accounts for token {access_token}")
+
+    warehouse = FakePlaidWarehouse()
+    logger = FakeLogger()
+
+    summary = PlaidSyncRunner(
+        config=_plaid_config(),
+        warehouse=warehouse,
+        plaid_client=NoAccountsClient(),
+        logger=logger,
+        now=lambda: datetime(2026, 7, 22, 12, tzinfo=UTC),
+    ).sync_all()
+
+    states = {row["product"]: row for row in warehouse.sync_state_rows or []}
+    assert states["accounts"]["status"] == PLAID_STATUS_ACTION_REQUIRED
+    assert states["transactions"]["status"] == PLAID_STATUS_ACTION_REQUIRED
+    assert "NO_ACCOUNTS" in states["accounts"]["error"]
+    # The access token must not leak into the persisted state on this path either.
+    assert "access-token" not in states["transactions"]["error"]
+    # Products that still work on the same Item are untouched.
+    assert states["investments"]["status"] == "ok"
+    assert states["liabilities"]["status"] == "ok"
+    assert summary.investment_holdings == 1
+    # Needing a re-link is loud in the run log even though it is not a failure.
+    assert any("NO_ACCOUNTS" in warning for warning in logger.warnings)
+    assert summary.action_required == 2
+
+
+def test_plaid_sync_marks_whole_item_action_required_when_item_get_needs_relink() -> None:
+    class LoggedOutClient(FakePlaidClient):
+        def item_get(self, access_token: str):
+            raise PlaidAPIError("ITEM_LOGIN_REQUIRED: the login details of this item have changed")
+
+    warehouse = FakePlaidWarehouse()
+
+    summary = PlaidSyncRunner(
+        config=_plaid_config(),
+        warehouse=warehouse,
+        plaid_client=LoggedOutClient(),
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 7, 22, 12, tzinfo=UTC),
+    ).sync_all()
+
+    states = {row["product"]: row["status"] for row in warehouse.sync_state_rows or []}
+    assert states == {
+        "accounts": PLAID_STATUS_ACTION_REQUIRED,
+        "transactions": PLAID_STATUS_ACTION_REQUIRED,
+        "investments": PLAID_STATUS_ACTION_REQUIRED,
+        "liabilities": PLAID_STATUS_ACTION_REQUIRED,
+    }
+    assert summary.action_required == 4
+
+
+def test_plaid_sync_still_fails_loudly_for_retryable_plaid_errors() -> None:
+    # Transient/server-side codes stay fatal: those are worth a red run.
+    class FlakyClient(FakePlaidClient):
+        def transactions_sync(self, access_token: str, *, cursor: str | None, count: int):
+            raise PlaidAPIError("INTERNAL_SERVER_ERROR: Plaid had an internal error")
+
+    warehouse = FakePlaidWarehouse()
+
+    with pytest.raises(RuntimeError, match="transactions"):
+        PlaidSyncRunner(
+            config=_plaid_config(),
+            warehouse=warehouse,
+            plaid_client=FlakyClient(),
+            logger=FakeLogger(),
+            now=lambda: datetime(2026, 7, 22, 12, tzinfo=UTC),
+        ).sync_all()
+
+    states = {row["product"]: row["status"] for row in warehouse.sync_state_rows or []}
+    assert states["transactions"] == "failed"
+
+
+def test_plaid_sync_action_required_product_keeps_prior_cursor_and_success_time() -> None:
+    class NoAccountsTransactions(FakePlaidClient):
+        def transactions_sync(self, access_token: str, *, cursor: str | None, count: int):
+            raise PlaidAPIError("NO_ACCOUNTS: no valid accounts were found for this item")
+
+    warehouse = FakePlaidWarehouse()
+
+    PlaidSyncRunner(
+        config=_plaid_config(),
+        warehouse=warehouse,
+        plaid_client=NoAccountsTransactions(),
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 7, 22, 12, tzinfo=UTC),
+    ).sync_all()
+
+    states = {row["product"]: row for row in warehouse.sync_state_rows or []}
+    # An Item that needs re-linking must not lose its transactions cursor, or
+    # re-linking would replay the entire history.
+    assert states["transactions"]["cursor"] == "cursor-1"
     assert states["transactions"]["last_synced_at"] == datetime.fromtimestamp(0, tz=UTC)

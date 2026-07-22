@@ -523,6 +523,22 @@ snapshots: accounts absent from a later snapshot are tombstoned, while absent ho
 liabilities are removed. Product failures are written to `plaid.sync_state` with a redacted error
 before the overall run fails, so an old `ok` cannot mask a broken credential/product.
 
+Permanent Item errors are the one exception to failing the run. When Plaid answers with a code that
+only a fresh Link run can clear (`NO_ACCOUNTS`, `ITEM_LOGIN_REQUIRED`, `USER_PERMISSION_REVOKED`,
+… — see `PLAID_ACTION_REQUIRED_ERROR_CODES`), the product is recorded as `action_required` instead
+of `failed` and the run stays green: retrying every 30 minutes cannot fix it, and a permanently red
+schedule hides the transient failures that genuinely need attention. The condition is still loud —
+a warning per run, an `action_required` count in the asset metadata, and a queryable row:
+
+```sql
+SELECT item_id, product, status, error, last_synced_at
+FROM plaid.sync_state
+WHERE status = 'action_required';
+```
+
+Re-link that institution with `pdw ingest plaid link` to clear it. The prior cursor and last
+successful sync time are preserved, so re-linking resumes rather than replaying all history.
+
 Warehouse initialization provisions the NOLOGIN role named by `PDW_QUERY_POSTGRES_ROLE` (default
 `pdw_query`), grants it read access only to queryable schemas, and revokes `private` from both that
 role and `PUBLIC`. The Go MCP/HTTP SQL runner and Python `PostgresReadOnlyRunner` assume this role

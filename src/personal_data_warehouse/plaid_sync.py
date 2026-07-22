@@ -20,6 +20,40 @@ PLAID_ENV_BASE_URLS = {
 }
 PLAID_PAGE_SIZE = 500
 
+# Terminal sync_state status for an Item that only a fresh Link run can repair.
+PLAID_STATUS_ACTION_REQUIRED = "action_required"
+
+# Plaid error codes that retrying can never clear: the Item's credentials,
+# consent, or account selection have to be re-established through Link.
+# Treating them as run failures turns one dead institution into a permanently
+# red sync job: a single linked Item answering NO_ACCOUNTS produced 262
+# consecutive failed runs over five days, burying every other schedule signal.
+# They get their own terminal state instead: recorded in plaid.sync_state,
+# warned about on every run, and surfaced in the asset's Dagster metadata,
+# without pretending the pull succeeded and without failing the run.
+PLAID_ACTION_REQUIRED_ERROR_CODES = frozenset(
+    {
+        "ACCESS_NOT_GRANTED",
+        "INSUFFICIENT_CREDENTIALS",
+        "INVALID_CREDENTIALS",
+        "INVALID_MFA",
+        "INVALID_SEND_METHOD",
+        "INVALID_UPDATED_USERNAME",
+        "ITEM_LOCKED",
+        "ITEM_LOGIN_REQUIRED",
+        "ITEM_NOT_SUPPORTED",
+        "MFA_NOT_SUPPORTED",
+        "NO_ACCOUNTS",
+        "NO_AUTH_ACCOUNTS",
+        "NO_INVESTMENT_ACCOUNTS",
+        "NO_LIABILITY_ACCOUNTS",
+        "PENDING_DISCONNECT",
+        "PENDING_EXPIRATION",
+        "USER_INPUT_TIMEOUT",
+        "USER_PERMISSION_REVOKED",
+    }
+)
+
 
 @dataclass(frozen=True)
 class PlaidSyncSummary:
@@ -31,6 +65,7 @@ class PlaidSyncSummary:
     investment_holdings: int = 0
     investment_transactions: int = 0
     liabilities: int = 0
+    action_required: int = 0
 
 
 class PlaidAPIError(RuntimeError):
@@ -188,9 +223,13 @@ class PlaidSyncRunner:
             item_response = self._client.item_get(item.access_token)
         except Exception as exc:
             error = self._safe_error(exc, item)
-            for product in ("accounts", *self._config.products):
-                self._record_failure(state, item.account, item_id, product, error, synced_at)
-            return PlaidSyncSummary(), [f"{institution} item: {error}"]
+            products = ("accounts", *self._config.products)
+            fatal = False
+            for product in products:
+                if self._record_failure(state, item.account, item_id, product, error, synced_at, institution):
+                    fatal = True
+            summary = PlaidSyncSummary(action_required=0 if fatal else len(products))
+            return summary, [f"{institution} item: {error}"] if fatal else []
 
         plaid_item = dict(item_response.get("item") or {})
         item_id = str(plaid_item.get("item_id") or item.item_id)
@@ -236,8 +275,10 @@ class PlaidSyncRunner:
             )
         except Exception as exc:
             error = self._safe_error(exc, item)
-            self._record_failure(state, item.account, item_id, "accounts", error, synced_at)
-            failures.append(f"{institution} accounts: {error}")
+            if self._record_failure(state, item.account, item_id, "accounts", error, synced_at, institution):
+                failures.append(f"{institution} accounts: {error}")
+            else:
+                summary = _merge_summary(summary, PlaidSyncSummary(action_required=1))
         else:
             summary = _merge_summary(summary, PlaidSyncSummary(accounts=account_count))
             self._record_state(item.account, item_id, "accounts", "", "ok", "", synced_at)
@@ -256,8 +297,10 @@ class PlaidSyncRunner:
                 )
             except Exception as exc:
                 error = self._safe_error(exc, item)
-                self._record_failure(state, item.account, item_id, "transactions", error, synced_at)
-                failures.append(f"{institution} transactions: {error}")
+                if self._record_failure(state, item.account, item_id, "transactions", error, synced_at, institution):
+                    failures.append(f"{institution} transactions: {error}")
+                else:
+                    summary = _merge_summary(summary, PlaidSyncSummary(action_required=1))
             else:
                 self._record_state(item.account, item_id, "transactions", next_cursor, "ok", "", synced_at)
                 summary = _merge_summary(
@@ -277,8 +320,10 @@ class PlaidSyncRunner:
                 )
             except Exception as exc:
                 error = self._safe_error(exc, item)
-                self._record_failure(state, item.account, item_id, "investments", error, synced_at)
-                failures.append(f"{institution} investments: {error}")
+                if self._record_failure(state, item.account, item_id, "investments", error, synced_at, institution):
+                    failures.append(f"{institution} investments: {error}")
+                else:
+                    summary = _merge_summary(summary, PlaidSyncSummary(action_required=1))
             else:
                 self._record_state(item.account, item_id, "investments", "", "ok", "", synced_at)
                 summary = _merge_summary(summary, investments_summary)
@@ -295,8 +340,10 @@ class PlaidSyncRunner:
                 )
             except Exception as exc:
                 error = self._safe_error(exc, item)
-                self._record_failure(state, item.account, item_id, "liabilities", error, synced_at)
-                failures.append(f"{institution} liabilities: {error}")
+                if self._record_failure(state, item.account, item_id, "liabilities", error, synced_at, institution):
+                    failures.append(f"{institution} liabilities: {error}")
+                else:
+                    summary = _merge_summary(summary, PlaidSyncSummary(action_required=1))
             else:
                 self._record_state(item.account, item_id, "liabilities", "", "ok", "", synced_at)
                 summary = _merge_summary(summary, PlaidSyncSummary(liabilities=liability_count))
@@ -495,7 +542,18 @@ class PlaidSyncRunner:
         product: str,
         error: str,
         attempted_at: datetime,
-    ) -> None:
+        institution: str,
+    ) -> bool:
+        """Persist a failed product pull; return True when it should fail the run.
+
+        Permanent Item errors (see ``PLAID_ACTION_REQUIRED_ERROR_CODES``) are
+        recorded under their own status and reported as non-fatal: only a fresh
+        Link run repairs them, so retrying every 30 minutes forever just keeps
+        the schedule red. The prior cursor and last successful timestamp are
+        preserved either way, so re-linking resumes instead of replaying.
+        """
+
+        action_required = _plaid_error_code(error) in PLAID_ACTION_REQUIRED_ERROR_CODES
         previous = state.get((account, item_id, product), {})
         previous_success = previous.get("last_synced_at")
         if not isinstance(previous_success, datetime):
@@ -505,11 +563,19 @@ class PlaidSyncRunner:
             item_id=item_id,
             product=product,
             cursor=str(previous.get("cursor") or ""),
-            status="failed",
+            status=PLAID_STATUS_ACTION_REQUIRED if action_required else "failed",
             error=error,
             last_synced_at=_ensure_utc(previous_success),
             updated_at=attempted_at,
         )
+        if action_required:
+            self._logger.warning(
+                "Plaid %s %s needs re-linking (run `pdw ingest plaid link`): %s",
+                institution,
+                product,
+                error,
+            )
+        return not action_required
 
     def _safe_error(self, exc: Exception, item: PlaidLinkedItem) -> str:
         message = str(exc) or type(exc).__name__
@@ -561,7 +627,23 @@ def _merge_summary(left: PlaidSyncSummary, right: PlaidSyncSummary) -> PlaidSync
         investment_holdings=left.investment_holdings + right.investment_holdings,
         investment_transactions=left.investment_transactions + right.investment_transactions,
         liabilities=left.liabilities + right.liabilities,
+        action_required=left.action_required + right.action_required,
     )
+
+
+def _plaid_error_code(message: str) -> str:
+    """Extract the leading Plaid error code from a `"<CODE>: <message>"` string.
+
+    Only messages Plaid itself produced (via ``_plaid_error_from_json``) carry a
+    code, so anything else — a transport error, a bug in our own row mapping —
+    stays fatal by default.
+    """
+
+    code, separator, _ = message.partition(":")
+    if not separator:
+        return ""
+    code = code.strip()
+    return code if code and code.isupper() else ""
 
 
 def _account_row(*, account: str, item_id: str, row: dict[str, Any], synced_at: datetime, sync_version: int) -> dict[str, Any]:

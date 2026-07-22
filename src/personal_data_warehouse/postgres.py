@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import re
+import time
 from typing import Any
 import uuid
 
@@ -159,7 +160,19 @@ CALENDAR_EVENT_OPERATIONS = (
 )
 SEARCH_SCHEMA_REFRESH_LOCK_ID = 8_407_112_465
 # Serializes _ensure_query_role's shared GRANT/REVOKEs across processes.
-QUERY_ROLE_SETUP_LOCK_ID = 8_407_112_466
+# Distinct from TIMELINE_SYNC_POSTGRES_LOCK_ID, which held the same id: the two
+# happen to live in different databases today (this one on the warehouse, that
+# one on Dagster's), so they never actually contended, but advisory-lock ids
+# have to stay globally unique or moving either lock silently deadlocks it
+# against the other. test_advisory_lock_ids_are_unique enforces that.
+QUERY_ROLE_SETUP_LOCK_ID = 8_407_112_469
+# The advisory lock above only excludes other privilege sweeps. Ordinary DDL
+# (CREATE TABLE, CREATE OR REPLACE VIEW) from unrelated processes touches the
+# same pg_class rows, and Postgres reports the collision as "tuple concurrently
+# updated". Retry rather than failing a whole sensor tick or asset run.
+QUERY_ROLE_SETUP_ATTEMPTS = 4
+QUERY_ROLE_SETUP_RETRY_SECONDS = 0.25
+QUERY_ROLE_CONCURRENT_UPDATE_MESSAGE = "tuple concurrently updated"
 
 
 @dataclass(frozen=True)
@@ -1528,20 +1541,123 @@ class PostgresWarehouse:
         self._ensure_plaid_finance_mart_views()
 
     def _ensure_query_role(self) -> None:
-        # Concurrent warehouse constructions (parallel extraction workers,
-        # simultaneous sensor ticks) race on these shared GRANT/REVOKEs and
-        # Postgres surfaces the collision as "tuple concurrently updated".
-        # Serialize the whole role setup across every process with a
-        # transaction-scoped advisory lock.
+        # The sweep in _ensure_query_role_locked rewrites the ACL of every
+        # table in every managed schema, every schema's nspacl, and two
+        # pg_default_acl rows per schema. Every PostgresWarehouse construction
+        # ran it — roughly 30k sensor ticks plus 4k asset runs a day — which
+        # churned pg_class by 8M row updates against 907 live rows, kept
+        # autovacuum permanently busy on the catalog, and collided with
+        # concurrent DDL often enough to fail ~20 sensor ticks a day with
+        # "tuple concurrently updated".
+        #
+        # Probe first and write only when the privileges have actually
+        # drifted, so the steady state is one cheap catalog read and zero
+        # catalog writes. Drift is self-correcting: a table created without
+        # SELECT for the query role is detected on the next construction, and
+        # repairing it also re-applies the default privileges that keep later
+        # tables readable without another sweep.
+        if not self._query_role_setup_needed():
+            return
+        for attempt in range(QUERY_ROLE_SETUP_ATTEMPTS):
+            try:
+                self._run_query_role_setup()
+                return
+            except psycopg2.Error as exc:
+                last_attempt = attempt == QUERY_ROLE_SETUP_ATTEMPTS - 1
+                if last_attempt or QUERY_ROLE_CONCURRENT_UPDATE_MESSAGE not in str(exc):
+                    raise
+                time.sleep(QUERY_ROLE_SETUP_RETRY_SECONDS * (attempt + 1))
+
+    def _run_query_role_setup(self) -> None:
+        # Serialize competing sweeps across processes with a transaction-scoped
+        # advisory lock, then re-check under it: another process may have
+        # repaired the same drift while we waited.
         with self._connection.cursor() as cursor:
             cursor.execute("BEGIN")
             try:
                 cursor.execute("SELECT pg_advisory_xact_lock(%s)", (QUERY_ROLE_SETUP_LOCK_ID,))
-                self._ensure_query_role_locked()
+                if self._query_role_setup_needed():
+                    self._ensure_query_role_locked()
                 cursor.execute("COMMIT")
             except Exception:
                 cursor.execute("ROLLBACK")
                 raise
+
+    def _query_role_setup_needed(self) -> bool:
+        """Report whether the query role's privileges have drifted.
+
+        Read-only: it never touches the catalog, so the common "everything is
+        already granted" case costs one indexless scan of pg_class/pg_proc
+        instead of a few hundred GRANT statements.
+        """
+
+        schemas = self.physical_schema_names()
+        private_schema = self.physical_schema_name("private")
+        with self._connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (self._query_role,))
+            if cursor.fetchone() is None:
+                return True
+            cursor.execute(
+                """
+                SELECT
+                    -- the connecting user must be able to hand out the role's grants
+                    NOT pg_has_role(current_user, %(role)s, 'MEMBER')
+                    -- every managed schema must exist and be usable by the role
+                 OR EXISTS (
+                        SELECT 1
+                        FROM unnest(%(schemas)s::text[]) AS s(name)
+                        LEFT JOIN pg_namespace n ON n.nspname = s.name
+                        WHERE n.oid IS NULL
+                           OR NOT has_schema_privilege(%(role)s, n.oid, 'USAGE')
+                    )
+                    -- ...and every relation and function in them readable
+                 OR EXISTS (
+                        SELECT 1
+                        FROM pg_class c
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = ANY(%(schemas)s::text[])
+                          AND c.relkind = ANY (ARRAY['r', 'v', 'm', 'p', 'f']::"char"[])
+                          AND NOT has_table_privilege(%(role)s, c.oid, 'SELECT')
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                        FROM pg_proc p
+                        JOIN pg_namespace n ON n.oid = p.pronamespace
+                        WHERE n.nspname = ANY(%(schemas)s::text[])
+                          AND NOT has_function_privilege(%(role)s, p.oid, 'EXECUTE')
+                    )
+                    -- Private token storage must stay unreachable, for the
+                    -- query role and for PUBLIC. Checked against *any*
+                    -- privilege, mirroring the REVOKE ALL the sweep issues, so
+                    -- this can never certify a narrower boundary than it sets.
+                 OR EXISTS (
+                        SELECT 1
+                        FROM pg_namespace n
+                        WHERE n.nspname = %(private)s
+                          AND (
+                                has_schema_privilege(%(role)s, n.oid, 'USAGE, CREATE')
+                             OR has_schema_privilege('public', n.oid, 'USAGE, CREATE')
+                             OR EXISTS (
+                                    SELECT 1
+                                    FROM pg_class c
+                                    WHERE c.relnamespace = n.oid
+                                      AND c.relkind = ANY (ARRAY['r', 'v', 'm', 'p', 'f']::"char"[])
+                                      AND (
+                                            has_table_privilege(%(role)s, c.oid, %(any_privilege)s)
+                                         OR has_table_privilege('public', c.oid, %(any_privilege)s)
+                                      )
+                                )
+                          )
+                    )
+                """,
+                {
+                    "role": self._query_role,
+                    "schemas": schemas,
+                    "private": private_schema,
+                    "any_privilege": "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER",
+                },
+            )
+            return bool(cursor.fetchone()[0])
 
     def _ensure_query_role_locked(self) -> None:
         role = _identifier(self._query_role)

@@ -53,6 +53,10 @@ def plaid_finance_sync(context) -> MaterializeResult:
         "investment_holdings": summary.investment_holdings,
         "investment_transactions": summary.investment_transactions,
         "liabilities": summary.liabilities,
+        # Non-zero means an Item needs `pdw ingest plaid link` re-run; the run
+        # stays green because no retry can clear it. plaid.sync_state carries
+        # which institution/product and why.
+        "action_required": summary.action_required,
     }
     return MaterializeResult(
         metadata={
