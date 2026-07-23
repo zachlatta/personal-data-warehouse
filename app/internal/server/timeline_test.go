@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -363,6 +364,46 @@ func TestTimelineItemNotFound(t *testing.T) {
 	resp, _ := timelineGET(t, srv, "/api/timeline/item?adapter=gmail_email&event_id=missing", true)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("got %d, want 404", resp.StatusCode)
+	}
+}
+
+// slowCapableTimelineRunner adds the timelineSlowQuerier capability so tests
+// can observe which statements ride the long background budget.
+type slowCapableTimelineRunner struct {
+	fakeTimelineRunner
+	slowMu       sync.Mutex
+	slowSQL      []string
+	slowTimeouts []time.Duration
+}
+
+func (f *slowCapableTimelineRunner) QueryArgsWithTimeout(ctx context.Context, sql string, args []any, maxRows int, timeout time.Duration) (query.RawResult, error) {
+	f.slowMu.Lock()
+	f.slowSQL = append(f.slowSQL, sql)
+	f.slowTimeouts = append(f.slowTimeouts, timeout)
+	f.slowMu.Unlock()
+	return f.fakeTimelineRunner.QueryArgs(ctx, sql, args, maxRows)
+}
+
+func TestTimelineSourcesAggregatesUseTheBackgroundStatementBudget(t *testing.T) {
+	// The sidebar count aggregates scan all of timeline.events and
+	// legitimately outlive the agent-facing statement timeout; they must run
+	// with their own budget or the cache would never warm. The fast sync-state
+	// read stays on the normal budget.
+	runner := &slowCapableTimelineRunner{}
+	svc := newTimelineService(runner, runner, nil, slog.Default())
+	if _, err := svc.buildSourcesPayload(context.Background()); err != nil {
+		t.Fatalf("buildSourcesPayload: %v", err)
+	}
+	if len(runner.slowSQL) != 2 {
+		t.Fatalf("slow-budget statements = %d (%q), want the two count aggregates", len(runner.slowSQL), runner.slowSQL)
+	}
+	for i, sql := range runner.slowSQL {
+		if !strings.Contains(sql, "GROUP BY") {
+			t.Fatalf("slow-budget statement %d is not an aggregate: %q", i, sql)
+		}
+		if runner.slowTimeouts[i] != timelineSourcesRefreshBudget {
+			t.Fatalf("slow-budget timeout = %s, want %s", runner.slowTimeouts[i], timelineSourcesRefreshBudget)
+		}
 	}
 }
 

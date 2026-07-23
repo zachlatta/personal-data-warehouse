@@ -70,6 +70,14 @@ func (r *PostgresRunner) Query(ctx context.Context, statement string, maxRows in
 // SQL (like the timeline endpoints) uses this so caller-supplied values ride
 // as bind parameters instead of being spliced into SQL text.
 func (r *PostgresRunner) QueryArgs(ctx context.Context, statement string, args []any, maxRows int) (RawResult, error) {
+	return r.QueryArgsWithTimeout(ctx, statement, args, maxRows, r.queryTimeout)
+}
+
+// QueryArgsWithTimeout runs like QueryArgs but with an explicit statement
+// budget. The default budget is sized for the agent-facing query surface;
+// app-internal background work with a legitimately longer runtime (the
+// timeline sidebar's full-table count aggregates) passes its own.
+func (r *PostgresRunner) QueryArgsWithTimeout(ctx context.Context, statement string, args []any, maxRows int, timeout time.Duration) (RawResult, error) {
 	logger := slog.Default().With("component", "postgres")
 	started := time.Now()
 	logger.DebugContext(ctx, "Postgres query dispatch", "sql", statement, "max_rows", maxRows)
@@ -81,7 +89,7 @@ func (r *PostgresRunner) QueryArgs(ctx context.Context, statement string, args [
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	timeoutMs := r.queryTimeout.Milliseconds()
+	timeoutMs := timeout.Milliseconds()
 	if timeoutMs <= 0 {
 		timeoutMs = 30000
 	}

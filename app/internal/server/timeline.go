@@ -18,6 +18,14 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
+// timelineSlowQuerier is the optional capability for app-internal background
+// aggregates whose legitimate runtime exceeds the agent-facing statement
+// budget (the sidebar's full-table counts take minutes cold). Fakes without it
+// fall back to the plain QueryArgs budget.
+type timelineSlowQuerier interface {
+	QueryArgsWithTimeout(ctx context.Context, statement string, args []any, maxRows int, timeout time.Duration) (query.RawResult, error)
+}
+
 // timelineQuerier is the parameterized-query capability the timeline endpoints
 // need. *query.PostgresRunner implements it; the plain fake runner used by
 // unrelated tests does not, in which case the timeline endpoints simply are
@@ -37,6 +45,10 @@ const (
 	timelineSourcesCacheTTL   = 24 * time.Hour
 	timelineDetailFieldChars  = 50000
 	timelineChildRowFieldChar = 4000
+	// Statement budget for the background sidebar-count aggregates; they scan
+	// all of timeline.events and legitimately outlive the agent-facing query
+	// timeout.
+	timelineSourcesRefreshBudget = 10 * time.Minute
 )
 
 // timelineMediaSigner mints signed /objects/ download links for inline media
@@ -345,8 +357,15 @@ func (s *timelineService) refreshSourcesAsync() {
 	}()
 }
 
+func (s *timelineService) slowQueryArgs(ctx context.Context, statement string, maxRows int) (query.RawResult, error) {
+	if slow, ok := s.timeline.(timelineSlowQuerier); ok {
+		return slow.QueryArgsWithTimeout(ctx, statement, nil, maxRows, timelineSourcesRefreshBudget)
+	}
+	return s.timeline.QueryArgs(ctx, statement, nil, maxRows)
+}
+
 func (s *timelineService) buildSourcesPayload(ctx context.Context) ([]byte, error) {
-	sources, err := s.timeline.QueryArgs(ctx, timelineSourcesSQL, nil, 10000)
+	sources, err := s.slowQueryArgs(ctx, timelineSourcesSQL, 10000)
 	if err != nil {
 		return nil, fmt.Errorf("sources aggregate: %w", err)
 	}
@@ -354,7 +373,7 @@ func (s *timelineService) buildSourcesPayload(ctx context.Context) ([]byte, erro
 	if err != nil {
 		return nil, fmt.Errorf("sync state: %w", err)
 	}
-	priorities, err := s.timeline.QueryArgs(ctx, timelinePrioritiesSQL, nil, 100)
+	priorities, err := s.slowQueryArgs(ctx, timelinePrioritiesSQL, 100)
 	if err != nil {
 		return nil, fmt.Errorf("priorities aggregate: %w", err)
 	}

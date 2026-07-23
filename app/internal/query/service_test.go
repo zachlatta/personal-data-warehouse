@@ -421,6 +421,12 @@ func TestSchemaErrorHint(t *testing.T) {
 			want:    []string{"cursor_ts", "NULLIF"},
 		},
 		{
+			name:    "statement timeout steers to the search layer",
+			message: `ERROR: canceling statement due to statement timeout (SQLSTATE 57014)`,
+			sql:     "SELECT * FROM gmail.messages WHERE body_text ILIKE '%offer%'",
+			want:    []string{"search.search_text(", "search.search_text_exact("},
+		},
+		{
 			name:     "unrelated syntax error gets no hint",
 			message:  "ERROR: syntax error at or near \"FROM\" (SQLSTATE 42601)",
 			sql:      "SELECT FROM gmail.messages",

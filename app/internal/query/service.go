@@ -1103,6 +1103,9 @@ var tableRemaps = map[string]string{
 var quotedIdentifierRe = regexp.MustCompile(`"([^"]+)"`)
 
 func schemaErrorHint(message, sql string) string {
+	if hint := statementTimeoutHint(message); hint != "" {
+		return hint
+	}
 	if hint := datetimeOperatorHint(message); hint != "" {
 		return hint
 	}
@@ -1114,6 +1117,16 @@ func schemaErrorHint(message, sql string) string {
 	}
 	if hint := numericCastHint(message, sql); hint != "" {
 		return hint
+	}
+	return ""
+}
+
+// statementTimeoutHint fires when a query exhausts the server's statement
+// budget (SQLSTATE 57014). The common cause is text-scanning raw tables, so
+// the recovery path names the search layer rather than suggesting a retry.
+func statementTimeoutHint(message string) string {
+	if strings.Contains(message, "canceling statement due to statement timeout") {
+		return "(hint: the query exceeded the server's statement budget and a retry will too. Narrow it with selective indexed predicates and LIMIT; for text search use search.search_text('needle', 50) for ranked keyword search or search.search_text_exact('needle', 50) for literal substrings instead of ILIKE/regex over raw text columns.)"
 	}
 	return ""
 }
