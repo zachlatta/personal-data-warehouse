@@ -117,8 +117,7 @@ def main() -> None:
         f"selected={summary.files_selected} "
         f"exported={summary.files_exported} "
         f"uploaded={summary.files_uploaded} "
-        f"skipped={summary.files_skipped} "
-        f"oversize_deferred={summary.files_deferred_oversize}"
+        f"skipped={summary.files_skipped}"
     )
 
 

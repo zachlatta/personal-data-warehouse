@@ -39,8 +39,16 @@ def test_known_answer_signature_matches_go() -> None:
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict) -> None:
+    def __init__(
+        self,
+        payload: dict,
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self._payload = payload
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
         pass
@@ -100,8 +108,49 @@ def test_post_signs_body_and_sends_expected_query() -> None:
     assert q["sig"] == expected_sig
 
 
-def test_upload_photo_file_and_metadata_send_expected_queries() -> None:
-    session = _FakeSession()
+class _PhotoResumableSession(_FakeSession):
+    def __init__(self, *, content_sha256: str) -> None:
+        super().__init__()
+        self.content_sha256 = content_sha256
+        self.put_calls: list[dict] = []
+
+    def post(self, url, *, data, headers, timeout):
+        parts = urlsplit(url)
+        if parts.path == "/ingest/photos/file/resumable":
+            self.calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
+            return _FakeResponse(
+                {
+                    "complete": False,
+                    "upload_url": "https://uploads.example.test/session-secret",
+                    "storage_backend": "google_drive",
+                    "storage_key": "photos/inbox/2026/06/photo.heic",
+                    "chunk_size_bytes": 4,
+                }
+            )
+        return super().post(url, data=data, headers=headers, timeout=timeout)
+
+    def put(self, url, *, data, headers, timeout):
+        self.put_calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
+        end = int(headers["Content-Range"].split(" ")[1].split("-")[1].split("/")[0])
+        if end < 9:
+            return _FakeResponse({}, status_code=308, headers={"Range": f"bytes=0-{end}"})
+        return _FakeResponse(
+            {
+                "id": "fid-photo",
+                "webViewLink": "https://drive/photo",
+                "sha256Checksum": self.content_sha256,
+                "size": "10",
+            },
+            status_code=200,
+        )
+
+
+def test_upload_photo_file_uses_resumable_chunks_and_metadata_stays_signed(tmp_path: Path) -> None:
+    body = b"heic-byte!"
+    content_sha256 = hashlib.sha256(body).hexdigest()
+    path = tmp_path / "photo.heic"
+    path.write_bytes(body)
+    session = _PhotoResumableSession(content_sha256=content_sha256)
     client = IngestClient(
         base_url="https://app.example.test/",
         signing_key=b"0123456789abcdef0123456789abcdef",
@@ -109,17 +158,34 @@ def test_upload_photo_file_and_metadata_send_expected_queries() -> None:
         now=lambda: 1700000000.0,
         link_ttl_seconds=900,
     )
-    body = b"heic-bytes"
-    client.upload_photo_file(body, captured_at="2026-06-01T14:30:00", extension=".heic", content_type="image/heic")
+    stored = client.upload_photo_file_path(
+        path,
+        captured_at="2026-06-01T14:30:00",
+        extension=".heic",
+        content_type="image/heic",
+        content_sha256=content_sha256,
+    )
+    assert stored["storage_file_id"] == "fid-photo"
+
     call = session.calls[0]
     parts = urlsplit(call["url"])
-    assert parts.path == "/ingest/photos/file"
+    assert parts.path == "/ingest/photos/file/resumable"
     q = {k: v[0] for k, v in parse_qs(parts.query).items()}
-    assert q["captured_at"] == "2026-06-01T14:30:00"
-    assert q["extension"] == ".heic"
-    assert q["content_type"] == "image/heic"
-    assert q["content_sha256"] == hashlib.sha256(body).hexdigest()
-    assert call["headers"]["Content-Type"] == "image/heic"
+    assert q["content_sha256"] == hashlib.sha256(call["data"]).hexdigest()
+    assert call["headers"]["Content-Type"] == "application/json"
+    assert json.loads(call["data"]) == {
+        "captured_at": "2026-06-01T14:30:00",
+        "content_sha256": content_sha256,
+        "content_type": "image/heic",
+        "extension": ".heic",
+        "size_bytes": len(body),
+    }
+    assert [put["data"] for put in session.put_calls] == [body[:4], body[4:8], body[8:]]
+    assert [put["headers"]["Content-Range"] for put in session.put_calls] == [
+        "bytes 0-3/10",
+        "bytes 4-7/10",
+        "bytes 8-9/10",
+    ]
 
     client.upload_photo_metadata(
         {"schema_version": 1, "source": "apple_photos"},
@@ -134,6 +200,118 @@ def test_upload_photo_file_and_metadata_send_expected_queries() -> None:
     assert q["file_content_sha256"] == "filesha"
     assert q["metadata_dedup_sha256"] == "dedupsha"
     assert call["headers"]["Content-Type"] == "application/json"
+
+
+def test_resumable_photo_upload_queries_drive_after_a_dropped_chunk(tmp_path: Path) -> None:
+    import requests
+
+    body = b"abcdefgh"
+    content_sha256 = hashlib.sha256(body).hexdigest()
+    path = tmp_path / "movie.mov"
+    path.write_bytes(body)
+
+    class InterruptedSession(_PhotoResumableSession):
+        def __init__(self) -> None:
+            super().__init__(content_sha256=content_sha256)
+            self.outcomes = [
+                requests.Timeout("response lost"),
+                _FakeResponse({}, status_code=308, headers={"Range": "bytes=0-3"}),
+                _FakeResponse(
+                    {
+                        "id": "fid-movie",
+                        "webViewLink": "https://drive/movie",
+                        "sha256Checksum": content_sha256,
+                        "size": "8",
+                    }
+                ),
+            ]
+
+        def put(self, url, *, data, headers, timeout):
+            self.put_calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    session = InterruptedSession()
+    stored = IngestClient(
+        base_url="https://app.example.test",
+        signing_key=b"k" * 32,
+        session=session,
+    ).upload_photo_file_path(
+        path,
+        captured_at="2026-06-01T14:30:00",
+        extension=".mov",
+        content_type="video/quicktime",
+        content_sha256=content_sha256,
+    )
+
+    assert stored["storage_file_id"] == "fid-movie"
+    assert session.put_calls[0]["headers"]["Content-Range"] == "bytes 0-3/8"
+    assert session.put_calls[1]["data"] == b""
+    assert session.put_calls[1]["headers"]["Content-Range"] == "bytes */8"
+    assert session.put_calls[2]["headers"]["Content-Range"] == "bytes 4-7/8"
+
+
+def test_resumable_photo_upload_rejects_drive_checksum_mismatch(tmp_path: Path) -> None:
+    body = b"full-original"
+    content_sha256 = hashlib.sha256(body).hexdigest()
+    path = tmp_path / "photo.heic"
+    path.write_bytes(body)
+
+    class WrongChecksumSession(_PhotoResumableSession):
+        def put(self, url, *, data, headers, timeout):
+            self.put_calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
+            return _FakeResponse(
+                {
+                    "id": "fid-corrupt",
+                    "webViewLink": "https://drive/corrupt",
+                    "sha256Checksum": "0" * 64,
+                    "size": str(len(body)),
+                }
+            )
+
+    with pytest.raises(ValueError, match="checksum"):
+        IngestClient(
+            base_url="https://app.example.test",
+            signing_key=b"k" * 32,
+            session=WrongChecksumSession(content_sha256=content_sha256),
+        ).upload_photo_file_path(
+            path,
+            captured_at="2026-06-01T14:30:00",
+            extension=".heic",
+            content_type="image/heic",
+            content_sha256=content_sha256,
+        )
+
+
+def test_resumable_photo_upload_never_exposes_the_session_capability_in_errors(
+    tmp_path: Path,
+) -> None:
+    import requests
+
+    body = b"full-original"
+    content_sha256 = hashlib.sha256(body).hexdigest()
+    path = tmp_path / "photo.heic"
+    path.write_bytes(body)
+
+    class FailingSession(_PhotoResumableSession):
+        def put(self, url, *, data, headers, timeout):
+            raise requests.RequestException(f"failed while using {url}")
+
+    with pytest.raises(RuntimeError) as raised:
+        IngestClient(
+            base_url="https://app.example.test",
+            signing_key=b"k" * 32,
+            session=FailingSession(content_sha256=content_sha256),
+        ).upload_photo_file_path(
+            path,
+            captured_at="2026-06-01T14:30:00",
+            extension=".heic",
+            content_type="image/heic",
+            content_sha256=content_sha256,
+        )
+    assert "session-secret" not in str(raised.value)
 
 
 def test_upload_manual_finance_document_and_metadata_send_expected_queries() -> None:
@@ -558,9 +736,6 @@ def _retry_client(session) -> IngestClient:
 
 
 def test_upload_retries_proxy_499_and_succeeds(monkeypatch) -> None:
-    # A large photo/video upload that stalls gets a 499 from the proxy. One
-    # blip used to fail the whole scheduled run, so a single flaky video
-    # wedged an entire photos batch.
     monkeypatch.setattr("personal_data_warehouse.ingest_client.time.sleep", lambda _s: None)
     ok = _FakeResponse(
         {
@@ -571,11 +746,9 @@ def test_upload_retries_proxy_499_and_succeeds(monkeypatch) -> None:
         }
     )
     session = _ScriptedSession([_HTTPStatusResponse(499), ok])
-    stored = _retry_client(session).upload_photo_file(
-        b"movie-bytes",
-        captured_at="2026-06-02T20:54:45",
-        extension=".mov",
-        content_type="video/quicktime",
+    stored = _retry_client(session).upload_agent_sessions_batch(
+        b"batch",
+        exported_at="2026-07-22T12:00:00+00:00",
     )
 
     assert stored["storage_file_id"] == "fid-1"

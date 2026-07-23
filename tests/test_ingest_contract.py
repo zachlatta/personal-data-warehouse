@@ -80,9 +80,17 @@ class _FakePhotoIngestClient:
         self.files: list[dict] = []
         self.metadata: list[dict] = []
 
-    def upload_photo_file(self, content, *, captured_at, extension, content_type):
+    def upload_photo_file_path(
+        self, path, *, captured_at, extension, content_type, content_sha256
+    ):
         self.files.append(
-            {"content": content, "captured_at": captured_at, "extension": extension, "content_type": content_type}
+            {
+                "content": Path(path).read_bytes(),
+                "content_sha256": content_sha256,
+                "captured_at": captured_at,
+                "extension": extension,
+                "content_type": content_type,
+            }
         )
         return {"storage_backend": "google_drive", "storage_key": "k", "storage_file_id": "fid", "storage_url": ""}
 

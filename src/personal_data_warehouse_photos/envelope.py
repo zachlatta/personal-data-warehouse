@@ -4,7 +4,8 @@ This is THE contract between every photo uploader (Apple Photos now,
 Google Photos / manual imports later) and the warehouse. A photo upload is
 always two posts:
 
-1. the file blob -> ``POST /ingest/photos/file`` (deduped by content sha), and
+1. a resumable file upload initiated through
+   ``POST /ingest/photos/file/resumable`` (deduped by content sha), and
 2. this JSON envelope -> ``POST /ingest/photos/metadata`` (deduped by the
    PROVENANCE sha, so the same bytes arriving from two sources keep both
    envelopes).
@@ -20,7 +21,7 @@ forever.
 
 Adding a photo source clientside is: call :func:`build_photo_metadata` with
 your ``source`` slug + ``record_key``/``record``, upload via
-``IngestClient.upload_photo_file`` / ``upload_photo_metadata``, and pass
+``IngestClient.upload_photo_file_path`` / ``upload_photo_metadata``, and pass
 :func:`provenance_dedup_sha256` as the metadata dedup key. Nothing else.
 """
 

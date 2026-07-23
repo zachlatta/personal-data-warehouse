@@ -81,6 +81,32 @@ type PutFileInput struct {
 	Kind              string
 }
 
+// ResumableFileUploadInput asks a capable backend to create a scoped upload
+// session without proxying the file bytes through the app.
+type ResumableFileUploadInput struct {
+	ObjectKey     string
+	ContentSHA256 string
+	ContentType   string
+	SizeBytes     int64
+	AppProperties map[string]string
+	Kind          string
+}
+
+// ResumableFileUpload is either a content-addressed dedup hit or a fresh,
+// backend-scoped upload URL. UploadURL is a write capability and must never be
+// logged or persisted.
+type ResumableFileUpload struct {
+	UploadURL string
+	Existing  *StoredObject
+}
+
+// ResumableFileStore is an optional capability implemented by backends that
+// can let an authenticated client stream large files directly into a narrowly
+// scoped upload session.
+type ResumableFileStore interface {
+	BeginResumableFileUpload(ctx context.Context, in ResumableFileUploadInput) (ResumableFileUpload, error)
+}
+
 // PutJSONInput uploads a JSON sidecar object.
 type PutJSONInput struct {
 	ObjectKey           string

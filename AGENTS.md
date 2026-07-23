@@ -359,12 +359,16 @@ user-library `PHAsset`s. Photo and video assets request PhotoKit's original reso
 Photos also request the original paired-video resource under the still's ZUUID with
 `role=live_video`. A missing asset, failed iCloud download, empty export, or size mismatch is a
 loud run failure that retries later—never a successful local-only coverage count. Complete bytes
-then go through `POST /ingest/photos/file` + `/ingest/photos/metadata`. Files above the route's
-upload ceiling defer after export; edited renditions are not uploaded yet (originals only; the
-run log counts assets with adjustments). The scheduled 100-resource limit bounds disk/network
-work and still walks the backlog because incremental state selection happens before the limit.
-For a manual backfill batch, use `pdw ingest apple-photos --mode incremental --limit N`; `full`
-is only for intentionally re-exporting already-complete resources.
+then go through `POST /ingest/photos/file/resumable` + `/ingest/photos/metadata`. The app creates a
+scoped Google Drive resumable session after its normal content-sha dedup check; the uploader
+streams the export to Drive in 16 MiB chunks, resumes from Drive's acknowledged byte after
+timeouts, and verifies Drive's final sha256 + size before uploading the envelope. Photo files
+therefore have no app/Cloudflare body ceiling and never permanently defer for size. Edited
+renditions are not uploaded yet (originals only; the run log counts assets with adjustments).
+The scheduled 100-resource limit bounds disk/network work and still walks the backlog because
+incremental state selection happens before the limit. For a manual backfill batch, use
+`pdw ingest apple-photos --mode incremental --limit N`; `full` is only for intentionally
+re-exporting already-complete resources.
 
 Serverside, `photos_drive_inbox_sensor` + `photos_drive_ingest` consume the inbox into
 `apple_photos.files`; the `photo_identity` asset dedups renditions into logical photos
@@ -394,8 +398,8 @@ To add a source:
    sources fail loud at ingest — register before uploading.
 3. **Uploader**: post the shared envelope (`personal_data_warehouse_photos/envelope.py`,
    `source="<source>"`, native id + role per file, raw record under a source-named key like
-   `takeout_sidecar`) to the existing `/ingest/photos/file` + `/ingest/photos/metadata`
-   endpoints via `IngestClient.upload_photo_file`/`upload_photo_metadata`. Live/motion
+   `takeout_sidecar`) to `/ingest/photos/file/resumable` + `/ingest/photos/metadata` via
+   `IngestClient.upload_photo_file_path`/`upload_photo_metadata`. Live/motion
    components upload under the same native id with `role=live_video`; edited outputs use
    `role=edited`.
 4. **Precedence**: slot the source into `PHOTO_SOURCE_PRECEDENCE`
@@ -516,6 +520,10 @@ The upload client (`ingest_client.py`, shared by every uploader) handles this tw
   real ceiling for the chosen route (512 MiB direct, else min(app cap, 100 MiB)). The voice-memos
   runner defers any recording above it (like its partial/age deferrals) instead of 413-ing and
   wedging — so e.g. a lone 588 MiB memo is skipped while every other memo uploads.
+- **Photos do not use the capped body route.** Their signed start request is tiny, and their full
+  bytes go straight into an app-created Drive resumable session in 16 MiB chunks. This works
+  through the public app URL and has no 100/512/640 MiB per-file ceiling; Drive's acknowledged
+  range handles lost responses and its final sha256 + size gate the metadata upload.
 
 Agent-session SQL starting points are the source-owned raw event tables
 `claude_code.events`, `codex.events`, `openclaw.events`, `pi.events`, `claude_desktop.events`, and

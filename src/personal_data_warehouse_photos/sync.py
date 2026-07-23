@@ -3,7 +3,9 @@
 Snapshot the library DB, resolve original-resource candidates, export each
 selected resource through PhotoKit with iCloud network access enabled, and
 upload its complete bytes through the app's shared photo endpoints (blob +
-envelope). The local ``originals/`` cache is never used as a source of truth.
+envelope). File blobs use resumable Drive sessions, so full originals are not
+bounded by the app/proxy request ceiling. The local ``originals/`` cache is
+never used as a source of truth.
 """
 
 from __future__ import annotations
@@ -35,7 +37,6 @@ class PhotosUploadSummary:
     files_exported: int
     files_uploaded: int
     metadata_uploaded: int
-    files_deferred_oversize: int
     bytes_exported: int = 0
     bytes_uploaded: int = 0
 
@@ -53,19 +54,12 @@ class PhotosUploadRunner:
         mode: str = "incremental",
         upload_state: PhotosUploadState | None = None,
         before_upload_check=None,
-        max_upload_bytes: int | None = None,
         resource_exporter=None,
     ) -> None:
         if ingest_client is None:
             raise ValueError("ingest_client is required")
         if mode not in {"full", "incremental"}:
             raise ValueError("mode must be 'full' or 'incremental'")
-        # Files larger than the chosen route's ceiling (the app cap, or
-        # Cloudflare's 100 MiB edge limit on the public host) defer instead of
-        # 413-ing forever — the voice-memos lesson. Mostly bites large videos.
-        if max_upload_bytes is None:
-            max_upload_bytes = getattr(ingest_client, "effective_max_upload_bytes", None)
-        self._max_upload_bytes = max_upload_bytes if (max_upload_bytes and max_upload_bytes > 0) else None
         self._account = account
         self._library_path = Path(library_path).expanduser()
         self._ingest_client = ingest_client
@@ -115,7 +109,6 @@ class PhotosUploadRunner:
 
         selected: list[PhotoFileCandidate] = []
         state_skipped = 0
-        oversize_deferred = 0
         for candidate in candidates:
             if self._mode == "incremental" and self._is_state_complete(candidate):
                 state_skipped += 1
@@ -128,10 +121,9 @@ class PhotosUploadRunner:
             selected = selected[: self._limit]
 
         self._logger.info(
-            "Incremental selection: selected=%s skipped=%s oversize_deferred=%s",
+            "Incremental selection: selected=%s skipped=%s",
             len(selected),
             state_skipped,
-            oversize_deferred,
         )
         if selected and self._before_upload_check is not None:
             skip_reason = self._before_upload_check()
@@ -145,7 +137,6 @@ class PhotosUploadRunner:
                     files_exported=0,
                     files_uploaded=0,
                     metadata_uploaded=0,
-                    files_deferred_oversize=oversize_deferred,
                 )
 
         # Per-file failures are collected, not raised mid-batch (voice-memos
@@ -171,18 +162,6 @@ class PhotosUploadRunner:
                 exported = self._resource_exporter.export(candidate, export_dir)
                 exported_count += 1
                 bytes_exported += exported.size_bytes
-                if (
-                    self._max_upload_bytes is not None
-                    and exported.size_bytes > self._max_upload_bytes
-                ):
-                    oversize_deferred += 1
-                    self._logger.warning(
-                        "Deferring %s (%s): exceeds the %s upload ceiling for the current route",
-                        exported.filename,
-                        format_bytes(exported.size_bytes),
-                        format_bytes(self._max_upload_bytes),
-                    )
-                    continue
                 self._upload_candidate(
                     index=index,
                     total=len(selected),
@@ -223,13 +202,12 @@ class PhotosUploadRunner:
             files_exported=exported_count,
             files_uploaded=uploaded,
             metadata_uploaded=metadata_uploaded,
-            files_deferred_oversize=oversize_deferred,
             bytes_exported=bytes_exported,
             bytes_uploaded=bytes_uploaded,
         )
         self._logger.info(
             "Photo upload summary: assets=%s original_resources=%s selected=%s exported=%s (%s) "
-            "uploaded=%s (%s) skipped=%s oversize_deferred=%s",
+            "uploaded=%s (%s) skipped=%s",
             summary.assets_seen,
             summary.files_seen,
             summary.files_selected,
@@ -238,7 +216,6 @@ class PhotosUploadRunner:
             summary.files_uploaded,
             format_bytes(summary.bytes_uploaded),
             summary.files_skipped,
-            summary.files_deferred_oversize,
         )
         if failures:
             self._logger.warning(
@@ -268,8 +245,7 @@ class PhotosUploadRunner:
         candidate: PhotoFileCandidate,
         exported: ExportedPhotoFile,
     ) -> None:
-        content = exported.path.read_bytes()
-        content_sha256 = hashlib.sha256(content).hexdigest()
+        content_sha256 = sha256_file(exported.path)
         captured_at = candidate.captured_at or self._now().strftime("%Y-%m-%dT%H:%M:%S")
         self._logger.info(
             "[%s/%s] Uploading %s (%s, %s)",
@@ -277,13 +253,14 @@ class PhotosUploadRunner:
             total,
             exported.filename,
             candidate.role,
-            format_bytes(len(content)),
+            format_bytes(exported.size_bytes),
         )
-        stored = self._ingest_client.upload_photo_file(
-            content,
+        stored = self._ingest_client.upload_photo_file_path(
+            exported.path,
             captured_at=captured_at,
             extension=exported.extension,
             content_type=exported.mime_type,
+            content_sha256=content_sha256,
         )
         envelope = build_photo_metadata(
             source=PHOTO_SOURCE,
@@ -292,7 +269,7 @@ class PhotosUploadRunner:
             role=candidate.role,
             filename=exported.filename,
             mime_type=exported.mime_type,
-            size_bytes=len(content),
+            size_bytes=exported.size_bytes,
             content_sha256=content_sha256,
             uploaded_at=self._now().isoformat(),
             width=candidate.width,
@@ -334,3 +311,11 @@ def format_bytes(count: float) -> str:
             return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
         size /= 1024
     return f"{size:.1f} TiB"
+
+
+def sha256_file(path: Path, *, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

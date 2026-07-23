@@ -27,17 +27,22 @@ class _Logger:
 
 
 class _FakeIngestClient:
-    effective_max_upload_bytes = 100 * 1024 * 1024
+    # Photo files must ignore the one-shot route ceiling: they use resumable
+    # Drive sessions now, including when the public app route is capped.
+    effective_max_upload_bytes = 12
 
     def __init__(self, *, fail_filenames: frozenset[str] = frozenset()) -> None:
         self.files: list[dict] = []
         self.metadata: list[dict] = []
         self._fail_filenames = fail_filenames
 
-    def upload_photo_file(self, content, *, captured_at, extension, content_type):
+    def upload_photo_file_path(
+        self, path, *, captured_at, extension, content_type, content_sha256
+    ):
         self.files.append(
             {
-                "size": len(content),
+                "size": Path(path).stat().st_size,
+                "content_sha256": content_sha256,
                 "captured_at": captured_at,
                 "extension": extension,
                 "content_type": content_type,
@@ -203,15 +208,15 @@ def test_sync_skips_state_complete_files_and_reuploads_on_fingerprint_change(tmp
     state.close()
 
 
-def test_sync_defers_oversize_files_with_visible_count(tmp_path):
+def test_sync_uploads_files_above_the_legacy_one_shot_ceiling(tmp_path):
     client = _FakeIngestClient()
-    runner, state, _ = _runner(tmp_path, client, max_upload_bytes=12)
+    runner, state, _ = _runner(tmp_path, client)
     summary = runner.sync()
-    # live-video-bytes (16) exceeds the 12-byte ceiling after PhotoKit exports
-    # it; the other full resources upload.
-    assert summary.files_deferred_oversize == 1
+    # live-video-bytes exceeds the fake client's 12-byte one-shot ceiling, but
+    # resumable photo uploads have no route-size deferral.
     assert summary.files_exported == 4
-    assert summary.files_uploaded == 3
+    assert summary.files_uploaded == 4
+    assert not hasattr(summary, "files_deferred_oversize")
     state.close()
 
 

@@ -25,10 +25,14 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 import requests
+
+HTTP_STATUS_OK = 200
+HTTP_STATUS_CREATED = 201
 
 # Domain separator; must match objectUploadKind in the Go auth package.
 OBJECT_UPLOAD_KIND = "object-upload"
@@ -51,6 +55,11 @@ UPLOAD_RETRY_ATTEMPTS = 3
 UPLOAD_RETRY_BASE_SECONDS = 2.0
 RETRYABLE_UPLOAD_STATUS_CODES = frozenset({429, 499, 500, 502, 503, 504})
 
+PHOTO_RESUMABLE_ENDPOINT = "/ingest/photos/file/resumable"
+PHOTO_RESUMABLE_STATUS_CODE = 308
+PHOTO_RESUMABLE_RETRY_ATTEMPTS = 5
+PHOTO_RESUMABLE_SESSION_RESTARTS = 3
+
 # The app accepts bodies up to PDW_INGEST_MAX_OBJECT_BYTES (Go default 512 MiB).
 # Mirror that default so size-aware clients (e.g. voice memos) can defer a file
 # that the app would only 413 anyway instead of wedging the whole run on it.
@@ -66,6 +75,10 @@ _logger = logging.getLogger(__name__)
 StoredObjectDict = dict[str, str]
 
 
+class _ResumableSessionExpired(Exception):
+    """Internal signal to ask the app for a fresh Drive upload session."""
+
+
 def _is_retryable_upload_error(exc: requests.RequestException) -> bool:
     if isinstance(exc, requests.HTTPError):
         response = exc.response
@@ -73,6 +86,14 @@ def _is_retryable_upload_error(exc: requests.RequestException) -> bool:
     # A dropped connection or a read timeout never got a verdict from the app,
     # and the endpoints are content-sha idempotent, so repeating is safe.
     return isinstance(exc, requests.ConnectionError | requests.Timeout)
+
+
+def _upload_error_summary(exc: requests.RequestException) -> str:
+    """Describe a failure without logging signed URLs or upload capabilities."""
+
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return f"HTTP {exc.response.status_code}"
+    return type(exc).__name__
 
 
 def sign_object_upload(secret: bytes, endpoint: str, content_sha256: str, exp_unix: int) -> str:
@@ -178,7 +199,7 @@ class IngestClient:
                     "retrying %s upload in %.0fs after transient failure: %s",
                     endpoint,
                     delay,
-                    exc,
+                    _upload_error_summary(exc),
                 )
                 time.sleep(delay)
         raise AssertionError("unreachable: upload retry loop must return or raise")
@@ -343,20 +364,243 @@ class IngestClient:
         )
 
     # --- photos (all photo sources share these two endpoints) ---------------
-    def upload_photo_file(
+    def upload_photo_file_path(
         self,
-        content: bytes,
+        path: Path | str,
         *,
         captured_at: str,
         extension: str,
         content_type: str,
+        content_sha256: str,
     ) -> StoredObjectDict:
-        return self._post(
-            "/ingest/photos/file",
-            body=content,
-            content_type=content_type or "application/octet-stream",
-            params={"captured_at": captured_at, "extension": extension, "content_type": content_type},
-        )
+        """Upload a complete photo resource through a resumable Drive session.
+
+        Only the small, signed initiation request traverses the app/proxy. The
+        file itself is streamed in bounded chunks to the scoped Drive upload
+        URL the app creates with its credential, so neither Cloudflare's body
+        cap nor a long app request can truncate or permanently defer a large
+        original. Drive's final sha256 and size are checked before metadata is
+        allowed to reference the object.
+        """
+
+        file_path = Path(path)
+        size_bytes = file_path.stat().st_size
+        if size_bytes <= 0:
+            raise ValueError("photo file must not be empty")
+        if len(content_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in content_sha256.lower()
+        ):
+            raise ValueError("content_sha256 must be a 64-character hexadecimal digest")
+
+        start_body = json.dumps(
+            {
+                "captured_at": captured_at,
+                "content_sha256": content_sha256.lower(),
+                "content_type": content_type or "application/octet-stream",
+                "extension": extension,
+                "size_bytes": size_bytes,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        for restart in range(PHOTO_RESUMABLE_SESSION_RESTARTS):
+            try:
+                started = self._signed_post(
+                    PHOTO_RESUMABLE_ENDPOINT,
+                    body=start_body,
+                    content_type="application/json",
+                    params={},
+                )
+            except requests.RequestException:
+                raise RuntimeError("could not start resumable photo upload") from None
+            if bool(started.get("complete")):
+                return self._stored_object_from_payload(started)
+
+            upload_url = str(started.get("upload_url", ""))
+            storage_key = str(started.get("storage_key", ""))
+            chunk_size = int(started.get("chunk_size_bytes", 0))
+            if not upload_url or not storage_key or chunk_size <= 0:
+                raise RuntimeError("app returned an invalid resumable photo upload session")
+            upload_parts = urlsplit(upload_url)
+            is_loopback_http = upload_parts.scheme == "http" and upload_parts.hostname in {
+                "127.0.0.1",
+                "::1",
+                "localhost",
+            }
+            if upload_parts.scheme != "https" and not is_loopback_http:
+                raise RuntimeError("app returned a non-HTTPS resumable photo upload session")
+
+            try:
+                completed = self._upload_photo_chunks(
+                    file_path,
+                    upload_url=upload_url,
+                    content_type=content_type or "application/octet-stream",
+                    size_bytes=size_bytes,
+                    chunk_size=chunk_size,
+                )
+            except _ResumableSessionExpired:
+                if restart == PHOTO_RESUMABLE_SESSION_RESTARTS - 1:
+                    raise RuntimeError(
+                        "resumable photo upload session expired repeatedly"
+                    ) from None
+                continue
+
+            actual_sha = str(completed.get("sha256Checksum", "")).lower()
+            if actual_sha != content_sha256.lower():
+                raise ValueError("Drive checksum does not match the complete photo file")
+            actual_size = int(completed.get("size", -1))
+            if actual_size != size_bytes:
+                raise ValueError("Drive size does not match the complete photo file")
+            file_id = str(completed.get("id", ""))
+            if not file_id:
+                raise RuntimeError("Drive did not return a file id for the complete photo file")
+            return {
+                "storage_backend": str(started.get("storage_backend", "google_drive")),
+                "storage_key": storage_key,
+                "storage_file_id": file_id,
+                "storage_url": str(completed.get("webViewLink", "")),
+            }
+        raise AssertionError("unreachable: resumable session loop must return or raise")
+
+    def _upload_photo_chunks(
+        self,
+        path: Path,
+        *,
+        upload_url: str,
+        content_type: str,
+        size_bytes: int,
+        chunk_size: int,
+    ) -> Mapping[str, Any]:
+        offset = 0
+        session = self._session_for_thread()
+        with path.open("rb") as handle:
+            while offset < size_bytes:
+                handle.seek(offset)
+                chunk = handle.read(min(chunk_size, size_bytes - offset))
+                if not chunk:
+                    raise RuntimeError("photo file ended before its declared size")
+                end = offset + len(chunk) - 1
+                headers = {
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {offset}-{end}/{size_bytes}",
+                    "Content-Type": content_type,
+                }
+                try:
+                    response = session.put(
+                        upload_url,
+                        data=chunk,
+                        headers=headers,
+                        timeout=self._upload_timeout(len(chunk)),
+                    )
+                except (requests.ConnectionError, requests.Timeout):
+                    offset, completed = self._query_resumable_photo_status(
+                        upload_url, size_bytes=size_bytes
+                    )
+                    if completed is not None:
+                        return completed
+                    continue
+                except requests.RequestException:
+                    raise RuntimeError("resumable photo upload transport failed") from None
+
+                if response.status_code in {HTTP_STATUS_OK, HTTP_STATUS_CREATED}:
+                    return response.json()
+                if response.status_code == PHOTO_RESUMABLE_STATUS_CODE:
+                    offset = self._resumable_next_offset(response, size_bytes=size_bytes)
+                    continue
+                if response.status_code == 404:
+                    raise _ResumableSessionExpired
+                if response.status_code in RETRYABLE_UPLOAD_STATUS_CODES:
+                    offset, completed = self._query_resumable_photo_status(
+                        upload_url, size_bytes=size_bytes
+                    )
+                    if completed is not None:
+                        return completed
+                    continue
+                self._raise_resumable_status(response)
+        raise RuntimeError("Drive did not confirm the complete photo upload")
+
+    def _query_resumable_photo_status(
+        self, upload_url: str, *, size_bytes: int
+    ) -> tuple[int, Mapping[str, Any] | None]:
+        headers = {
+            "Content-Length": "0",
+            "Content-Range": f"bytes */{size_bytes}",
+        }
+        session = self._session_for_thread()
+        for attempt in range(PHOTO_RESUMABLE_RETRY_ATTEMPTS):
+            try:
+                response = session.put(
+                    upload_url,
+                    data=b"",
+                    headers=headers,
+                    timeout=self._timeout,
+                )
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt == PHOTO_RESUMABLE_RETRY_ATTEMPTS - 1:
+                    raise RuntimeError(
+                        "could not determine resumable photo upload status"
+                    ) from None
+                time.sleep(UPLOAD_RETRY_BASE_SECONDS * (2**attempt))
+                continue
+            except requests.RequestException:
+                raise RuntimeError(
+                    "could not determine resumable photo upload status"
+                ) from None
+
+            if response.status_code in {HTTP_STATUS_OK, HTTP_STATUS_CREATED}:
+                return size_bytes, response.json()
+            if response.status_code == PHOTO_RESUMABLE_STATUS_CODE:
+                return self._resumable_next_offset(response, size_bytes=size_bytes), None
+            if response.status_code == 404:
+                raise _ResumableSessionExpired
+            if (
+                response.status_code in RETRYABLE_UPLOAD_STATUS_CODES
+                and attempt < PHOTO_RESUMABLE_RETRY_ATTEMPTS - 1
+            ):
+                time.sleep(UPLOAD_RETRY_BASE_SECONDS * (2**attempt))
+                continue
+            self._raise_resumable_status(response)
+        raise AssertionError("unreachable: resumable status loop must return or raise")
+
+    @staticmethod
+    def _resumable_next_offset(response: Any, *, size_bytes: int) -> int:
+        range_header = str(response.headers.get("Range", ""))
+        if not range_header:
+            return 0
+        prefix = "bytes=0-"
+        if not range_header.startswith(prefix):
+            raise RuntimeError("Drive returned an invalid resumable upload range")
+        try:
+            offset = int(range_header[len(prefix) :]) + 1
+        except ValueError as exc:
+            raise RuntimeError("Drive returned an invalid resumable upload range") from exc
+        if offset < 0 or offset > size_bytes:
+            raise RuntimeError("Drive returned a resumable upload range outside the file")
+        return offset
+
+    @staticmethod
+    def _raise_resumable_status(response: Any) -> None:
+        status = int(getattr(response, "status_code", 0))
+        try:
+            response.raise_for_status()
+        except requests.RequestException:
+            raise RuntimeError(
+                f"resumable photo upload failed with HTTP status {status}"
+            ) from None
+        raise RuntimeError(f"resumable photo upload failed with HTTP status {status}")
+
+    @staticmethod
+    def _stored_object_from_payload(payload: Mapping[str, Any]) -> StoredObjectDict:
+        stored = {
+            "storage_backend": str(payload.get("storage_backend", "")),
+            "storage_key": str(payload.get("storage_key", "")),
+            "storage_file_id": str(payload.get("storage_file_id", "")),
+            "storage_url": str(payload.get("storage_url", "")),
+        }
+        if not stored["storage_key"] or not stored["storage_file_id"]:
+            raise RuntimeError("app returned an invalid existing photo object")
+        return stored
 
     def upload_photo_metadata(
         self,

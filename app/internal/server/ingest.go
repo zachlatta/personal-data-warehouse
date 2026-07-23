@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,6 +25,11 @@ import (
 // layout (folder ids, object keys, kinds, and pdw_* tags) so no storage
 // internals leak to client devices.
 const ingestPathPrefix = "/ingest/"
+
+const (
+	photoResumableEndpoint = "/ingest/photos/file/resumable"
+	photoChunkSizeBytes    = 16 * 1024 * 1024
+)
 
 // ingestSourceDef describes the object-store identity for one ingestion source.
 // Source and LegacySources must match the values the Dagster *_drive_ingest
@@ -132,6 +138,24 @@ type ingestResponse struct {
 	StorageURL     string `json:"storage_url,omitempty"`
 }
 
+type photoResumableRequest struct {
+	CapturedAt    string `json:"captured_at"`
+	Extension     string `json:"extension"`
+	ContentType   string `json:"content_type"`
+	ContentSHA256 string `json:"content_sha256"`
+	SizeBytes     int64  `json:"size_bytes"`
+}
+
+type photoResumableResponse struct {
+	Complete       bool   `json:"complete"`
+	UploadURL      string `json:"upload_url,omitempty"`
+	ChunkSizeBytes int64  `json:"chunk_size_bytes,omitempty"`
+	StorageBackend string `json:"storage_backend"`
+	StorageKey     string `json:"storage_key"`
+	StorageFileID  string `json:"storage_file_id,omitempty"`
+	StorageURL     string `json:"storage_url,omitempty"`
+}
+
 func (svc *ingestService) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -139,38 +163,20 @@ func (svc *ingestService) handler() http.Handler {
 			return
 		}
 		endpoint := path.Clean(r.URL.Path)
+		if endpoint == photoResumableEndpoint {
+			svc.handlePhotoResumable(w, r)
+			return
+		}
 		artifact, ok := svc.artifacts[endpoint]
 		if !ok {
 			http.NotFound(w, r)
 			return
 		}
+		body, actualSHA, ok := svc.readSignedBody(w, r, endpoint)
+		if !ok {
+			return
+		}
 		q := r.URL.Query()
-		declaredSHA := q.Get("content_sha256")
-		// The signature covers endpoint + content sha + exp, so it authorizes
-		// this exact body for this exact endpoint until exp. A failure gets one
-		// generic message and the sig never reaches logs.
-		if err := svc.signer.VerifyObjectUpload(endpoint, declaredSHA, q.Get("exp"), q.Get("sig")); err != nil {
-			svc.logger.WarnContext(r.Context(), "ingest upload link rejected", "endpoint", endpoint, "error", err)
-			http.Error(w, "invalid or expired upload link", http.StatusForbidden)
-			return
-		}
-		body, err := readLimited(r.Body, svc.maxBytes)
-		if err == errTooLarge {
-			http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-		if err != nil {
-			http.Error(w, "could not read body", http.StatusBadRequest)
-			return
-		}
-		// Recompute the sha over the received bytes: the signature only covers
-		// the declared sha, so this is what binds the signature to the body.
-		actualSHA := hex.EncodeToString(sha256Sum(body))
-		if actualSHA != declaredSHA {
-			svc.logger.WarnContext(r.Context(), "ingest body sha mismatch", "endpoint", endpoint, "declared", declaredSHA, "actual", actualSHA)
-			http.Error(w, "content_sha256 does not match body", http.StatusBadRequest)
-			return
-		}
 		built, err := artifact.build(q, actualSHA, svc.now().UTC())
 		if err != nil {
 			svc.logger.WarnContext(r.Context(), "ingest request rejected", "endpoint", endpoint, "error", err)
@@ -214,6 +220,131 @@ func (svc *ingestService) handler() http.Handler {
 			StorageURL:     stored.StorageURL,
 		})
 	})
+}
+
+func (svc *ingestService) readSignedBody(w http.ResponseWriter, r *http.Request, endpoint string) ([]byte, string, bool) {
+	q := r.URL.Query()
+	declaredSHA := q.Get("content_sha256")
+	// The signature covers endpoint + content sha + exp, so it authorizes this
+	// exact body for this exact endpoint until exp. A failure gets one generic
+	// message and the sig never reaches logs.
+	if err := svc.signer.VerifyObjectUpload(endpoint, declaredSHA, q.Get("exp"), q.Get("sig")); err != nil {
+		svc.logger.WarnContext(r.Context(), "ingest upload link rejected", "endpoint", endpoint, "error", err)
+		http.Error(w, "invalid or expired upload link", http.StatusForbidden)
+		return nil, "", false
+	}
+	body, err := readLimited(r.Body, svc.maxBytes)
+	if err == errTooLarge {
+		http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
+		return nil, "", false
+	}
+	if err != nil {
+		http.Error(w, "could not read body", http.StatusBadRequest)
+		return nil, "", false
+	}
+	actualSHA := hex.EncodeToString(sha256Sum(body))
+	if actualSHA != declaredSHA {
+		svc.logger.WarnContext(r.Context(), "ingest body sha mismatch", "endpoint", endpoint, "declared", declaredSHA, "actual", actualSHA)
+		http.Error(w, "content_sha256 does not match body", http.StatusBadRequest)
+		return nil, "", false
+	}
+	return body, actualSHA, true
+}
+
+var (
+	sha256HexPattern      = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	photoExtensionPattern = regexp.MustCompile(`^\.[A-Za-z0-9]{1,16}$`)
+)
+
+func (svc *ingestService) handlePhotoResumable(w http.ResponseWriter, r *http.Request) {
+	store, ok := svc.stores["photos"]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	resumableStore, ok := store.(objectstore.ResumableFileStore)
+	if !ok {
+		http.Error(w, "photo resumable uploads are unavailable", http.StatusNotImplemented)
+		return
+	}
+	body, _, ok := svc.readSignedBody(w, r, photoResumableEndpoint)
+	if !ok {
+		return
+	}
+	var request photoResumableRequest
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		http.Error(w, "invalid resumable upload request", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		http.Error(w, "invalid resumable upload request", http.StatusBadRequest)
+		return
+	}
+	if !sha256HexPattern.MatchString(request.ContentSHA256) {
+		http.Error(w, "invalid content_sha256", http.StatusBadRequest)
+		return
+	}
+	request.ContentSHA256 = strings.ToLower(request.ContentSHA256)
+	if request.SizeBytes <= 0 {
+		http.Error(w, "size_bytes must be positive", http.StatusBadRequest)
+		return
+	}
+	if !photoExtensionPattern.MatchString(request.Extension) {
+		http.Error(w, "invalid extension", http.StatusBadRequest)
+		return
+	}
+	capturedAt, err := parseTimestamp(request.CapturedAt)
+	if err != nil {
+		http.Error(w, "invalid captured_at", http.StatusBadRequest)
+		return
+	}
+	contentType := request.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	objectKey := fmt.Sprintf(
+		"photos/inbox/%04d/%02d/%s-%s%s",
+		capturedAt.Year(),
+		int(capturedAt.Month()),
+		capturedAt.Format("2006-01-02"),
+		request.ContentSHA256,
+		request.Extension,
+	)
+	started, err := resumableStore.BeginResumableFileUpload(
+		r.Context(),
+		objectstore.ResumableFileUploadInput{
+			ObjectKey:     objectKey,
+			ContentSHA256: request.ContentSHA256,
+			ContentType:   contentType,
+			SizeBytes:     request.SizeBytes,
+			Kind:          "photo_file",
+		},
+	)
+	if err != nil {
+		svc.logger.ErrorContext(r.Context(), "photo resumable upload initiation failed", "storage_key", objectKey, "error", err)
+		http.Error(w, "object store error", http.StatusBadGateway)
+		return
+	}
+	response := photoResumableResponse{
+		StorageBackend: store.Backend(),
+		StorageKey:     objectKey,
+	}
+	if started.Existing != nil {
+		response.Complete = true
+		response.StorageBackend = started.Existing.StorageBackend
+		response.StorageKey = started.Existing.StorageKey
+		response.StorageFileID = started.Existing.StorageFileID
+		response.StorageURL = started.Existing.StorageURL
+		svc.logger.InfoContext(r.Context(), "photo resumable upload dedup hit", "storage_key", response.StorageKey, "bytes", request.SizeBytes)
+	} else {
+		response.UploadURL = started.UploadURL
+		response.ChunkSizeBytes = photoChunkSizeBytes
+		svc.logger.InfoContext(r.Context(), "photo resumable upload session created", "storage_key", objectKey, "bytes", request.SizeBytes)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 func sha256Sum(b []byte) []byte {
@@ -403,26 +534,7 @@ func ingestArtifacts() []ingestArtifact {
 				return ingestBuildResult{objectKey: key, sourceContentSHA: audioSHA, appProperties: map[string]string{}}, nil
 			},
 		},
-		// --- photos: original/rendition blob + JSON metadata envelope --------
-		{
-			endpoint:   "/ingest/photos/file",
-			sourceSlug: "photos",
-			kind:       "photo_file",
-			// Deduped by content sha (stable): the same original arriving again
-			// (re-run, or a second photo source holding identical bytes) is a
-			// no-op; the per-source provenance lives in the metadata envelopes.
-			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
-				// captured_at is used as wall-clock (like voice-memos
-				// recorded_at) so the key's date matches the shot.
-				capturedAt, err := parseTimestamp(q.Get("captured_at"))
-				if err != nil {
-					return ingestBuildResult{}, fmt.Errorf("invalid captured_at: %w", err)
-				}
-				key := fmt.Sprintf("photos/inbox/%04d/%02d/%s-%s%s",
-					capturedAt.Year(), int(capturedAt.Month()), capturedAt.Format("2006-01-02"), sha, q.Get("extension"))
-				return ingestBuildResult{objectKey: key, contentType: q.Get("content_type"), appProperties: map[string]string{}}, nil
-			},
-		},
+		// --- photos: resumable file session + JSON metadata envelope ----------
 		{
 			endpoint:   "/ingest/photos/metadata",
 			sourceSlug: "photos",

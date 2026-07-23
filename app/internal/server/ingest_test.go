@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,8 +23,10 @@ import (
 // the object store (object key, kind, app properties, body) without exercising
 // Drive itself, which is covered in the objectstore package.
 type capturingStore struct {
-	lastFile *objectstore.PutFileInput
-	lastJSON *objectstore.PutJSONInput
+	lastFile      *objectstore.PutFileInput
+	lastJSON      *objectstore.PutJSONInput
+	lastResumable *objectstore.ResumableFileUploadInput
+	resumableHit  *objectstore.StoredObject
 }
 
 func (c *capturingStore) Backend() string { return "google_drive" }
@@ -46,6 +49,13 @@ func (c *capturingStore) PutFile(_ context.Context, in objectstore.PutFileInput)
 func (c *capturingStore) PutJSON(_ context.Context, in objectstore.PutJSONInput) (objectstore.StoredObject, error) {
 	c.lastJSON = &in
 	return objectstore.StoredObject{StorageBackend: "google_drive", StorageKey: in.ObjectKey, StorageFileID: "fid-json"}, nil
+}
+func (c *capturingStore) BeginResumableFileUpload(_ context.Context, in objectstore.ResumableFileUploadInput) (objectstore.ResumableFileUpload, error) {
+	c.lastResumable = &in
+	return objectstore.ResumableFileUpload{
+		UploadURL: "https://www.googleapis.com/upload/drive/v3/files?upload_id=session-secret",
+		Existing:  c.resumableHit,
+	}, nil
 }
 func (c *capturingStore) GetObject(context.Context, objectstore.StoredObject) ([]byte, error) {
 	return nil, objectstore.ErrNotImplemented
@@ -397,26 +407,38 @@ func TestIngestVoiceMemosAudioAndMetadataKeys(t *testing.T) {
 	}
 }
 
-func TestIngestPhotosFileAndMetadataKeys(t *testing.T) {
+func TestIngestPhotosResumableFileAndMetadataKeys(t *testing.T) {
 	svc, stores := ingestTestService()
 	photo := []byte("heic-bytes")
 	photoSHA := sha256Hex(photo)
-	// File blob: captured_at is wall-clock (no UTC shift), extension verbatim.
-	target := signedIngestTarget("/ingest/photos/file", photo, url.Values{
-		"captured_at":  {"2026-06-01T14:30:00"},
-		"extension":    {".heic"},
-		"content_type": {"image/heic"},
+	startBody, _ := json.Marshal(map[string]any{
+		"captured_at":    "2026-06-01T14:30:00",
+		"extension":      ".heic",
+		"content_type":   "image/heic",
+		"content_sha256": photoSHA,
+		"size_bytes":     len(photo),
 	})
-	if rec := postIngest(t, svc, target, photo); rec.Code != http.StatusOK {
-		t.Fatalf("file status = %d, body %q", rec.Code, rec.Body.String())
+	target := signedIngestTarget("/ingest/photos/file/resumable", startBody, nil)
+	rec := postIngest(t, svc, target, startBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("file start status = %d, body %q", rec.Code, rec.Body.String())
 	}
-	put := stores["photos"].lastFile
+	put := stores["photos"].lastResumable
 	wantFileKey := "photos/inbox/2026/06/2026-06-01-" + photoSHA + ".heic"
 	if put.ObjectKey != wantFileKey {
 		t.Fatalf("file key = %q, want %q", put.ObjectKey, wantFileKey)
 	}
-	if put.Kind != "photo_file" || put.SkipExistingCheck || put.ContentType != "image/heic" {
+	if put.Kind != "photo_file" || put.ContentType != "image/heic" ||
+		put.ContentSHA256 != photoSHA || put.SizeBytes != int64(len(photo)) {
 		t.Fatalf("file put = %+v", put)
+	}
+	var started photoResumableResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &started); err != nil {
+		t.Fatalf("decode start response: %v", err)
+	}
+	if started.Complete || started.UploadURL == "" || started.StorageKey != wantFileKey ||
+		started.ChunkSizeBytes < 256*1024 {
+		t.Fatalf("start response = %+v", started)
 	}
 
 	// Metadata envelope: deduped by the PROVENANCE sha, not the file sha, so
@@ -444,6 +466,43 @@ func TestIngestPhotosFileAndMetadataKeys(t *testing.T) {
 	}
 	if string(pj.Payload) != string(meta) {
 		t.Fatalf("metadata payload = %q", pj.Payload)
+	}
+}
+
+func TestIngestPhotosResumableReturnsExistingAndRemovesLegacyRoute(t *testing.T) {
+	svc, stores := ingestTestService()
+	stores["photos"].resumableHit = &objectstore.StoredObject{
+		StorageBackend: "google_drive",
+		StorageKey:     "photos/inbox/existing.heic",
+		StorageFileID:  "existing-id",
+		StorageURL:     "https://drive/existing",
+	}
+	body, _ := json.Marshal(map[string]any{
+		"captured_at":    "2026-06-01T14:30:00",
+		"extension":      ".heic",
+		"content_type":   "image/heic",
+		"content_sha256": strings.Repeat("a", 64),
+		"size_bytes":     123,
+	})
+	target := signedIngestTarget("/ingest/photos/file/resumable", body, nil)
+	rec := postIngest(t, svc, target, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	var response photoResumableResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.Complete || response.StorageFileID != "existing-id" || response.UploadURL != "" {
+		t.Fatalf("response = %+v", response)
+	}
+
+	legacy := []byte("legacy-photo-body")
+	legacyTarget := signedIngestTarget("/ingest/photos/file", legacy, url.Values{
+		"captured_at": {"2026-06-01T14:30:00"},
+	})
+	if old := postIngest(t, svc, legacyTarget, legacy); old.Code != http.StatusNotFound {
+		t.Fatalf("legacy route status = %d, want 404", old.Code)
 	}
 }
 

@@ -142,16 +142,17 @@ func NewGoogleDriveStore(opts GoogleDriveOptions) *GoogleDriveStore {
 func (s *GoogleDriveStore) Backend() string { return "google_drive" }
 
 type driveFile struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	MimeType      string            `json:"mimeType"`
-	Size          string            `json:"size"`
-	CreatedTime   string            `json:"createdTime"`
-	ModifiedTime  string            `json:"modifiedTime"`
-	WebViewLink   string            `json:"webViewLink"`
-	AppProperties map[string]string `json:"appProperties"`
-	Parents       []string          `json:"parents"`
-	Trashed       bool              `json:"trashed"`
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	MimeType       string            `json:"mimeType"`
+	Size           string            `json:"size"`
+	SHA256Checksum string            `json:"sha256Checksum"`
+	CreatedTime    string            `json:"createdTime"`
+	ModifiedTime   string            `json:"modifiedTime"`
+	WebViewLink    string            `json:"webViewLink"`
+	AppProperties  map[string]string `json:"appProperties"`
+	Parents        []string          `json:"parents"`
+	Trashed        bool              `json:"trashed"`
 }
 
 type driveFileList struct {
@@ -206,6 +207,13 @@ func isTransientStatus(status int) bool {
 // doRequest performs an HTTP request, retrying transient failures, and returns
 // the response body. Non-2xx responses become *driveError.
 func (s *GoogleDriveStore) doRequest(ctx context.Context, method, rawURL string, headers map[string]string, body []byte) ([]byte, error) {
+	data, _, err := s.doRequestWithHeaders(ctx, method, rawURL, headers, body)
+	return data, err
+}
+
+// doRequestWithHeaders is doRequest plus response headers. Resumable Drive
+// initiation returns its scoped session capability in Location.
+func (s *GoogleDriveStore) doRequestWithHeaders(ctx context.Context, method, rawURL string, headers map[string]string, body []byte) ([]byte, http.Header, error) {
 	var lastErr error
 	for attempt := 1; attempt <= s.maxAttempts; attempt++ {
 		var reader io.Reader
@@ -214,7 +222,7 @@ func (s *GoogleDriveStore) doRequest(ctx context.Context, method, rawURL string,
 		}
 		req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for key, value := range headers {
 			req.Header.Set(key, value)
@@ -239,7 +247,7 @@ func (s *GoogleDriveStore) doRequest(ctx context.Context, method, rawURL string,
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return data, nil
+			return data, resp.Header.Clone(), nil
 		}
 		de := &driveError{Status: resp.StatusCode, Body: string(data)}
 		if isTransientStatus(resp.StatusCode) && attempt < s.maxAttempts {
@@ -247,9 +255,9 @@ func (s *GoogleDriveStore) doRequest(ctx context.Context, method, rawURL string,
 			time.Sleep(backoff(attempt))
 			continue
 		}
-		return nil, de
+		return nil, nil, de
 	}
-	return nil, lastErr
+	return nil, nil, lastErr
 }
 
 func backoff(attempt int) time.Duration {
@@ -274,7 +282,7 @@ func (s *GoogleDriveStore) listFiles(ctx context.Context, query string, pageSize
 	values := url.Values{}
 	values.Set("q", query)
 	values.Set("pageSize", strconv.Itoa(pageSize))
-	values.Set("fields", "nextPageToken,files(id,name,webViewLink,appProperties)")
+	values.Set("fields", "nextPageToken,files(id,name,size,sha256Checksum,webViewLink,appProperties)")
 	values.Set("supportsAllDrives", "true")
 	values.Set("includeItemsFromAllDrives", "true")
 	if pageToken != "" {
@@ -402,6 +410,94 @@ func (s *GoogleDriveStore) PutFile(ctx context.Context, in PutFileInput) (Stored
 		return StoredObject{}, err
 	}
 	return s.storedObject(file, in.ObjectKey), nil
+}
+
+// BeginResumableFileUpload creates a Drive resumable session after applying
+// the same dedup, object-key, folder, and pdw_* metadata contract as PutFile.
+// The session URL authorizes only the one initiated upload; no Drive credential
+// leaves the app.
+func (s *GoogleDriveStore) BeginResumableFileUpload(ctx context.Context, in ResumableFileUploadInput) (ResumableFileUpload, error) {
+	if err := s.requireFolderID("BeginResumableFileUpload"); err != nil {
+		return ResumableFileUpload{}, err
+	}
+	if in.SizeBytes <= 0 {
+		return ResumableFileUpload{}, fmt.Errorf("resumable upload size must be positive")
+	}
+	kind := in.Kind
+	if kind == "" {
+		kind = s.audioKind
+	}
+	existing, err := s.findByAppProperty(ctx, "content_sha256", in.ContentSHA256, kind)
+	if err != nil {
+		return ResumableFileUpload{}, err
+	}
+	if existing != nil {
+		existingSize, _ := strconv.ParseInt(existing.Size, 10, 64)
+		if existing.SHA256Checksum == in.ContentSHA256 && existingSize == in.SizeBytes {
+			stored := s.storedObject(*existing, in.ObjectKey)
+			return ResumableFileUpload{Existing: &stored}, nil
+		}
+		// A direct upload that was interrupted after Drive committed it but
+		// before the client verified the response can be found on retry. Never
+		// trust its claimed app property alone: remove the exact malformed
+		// object and create a fresh session so a corrupt partial cannot become
+		// a permanent dedup hit.
+		if err := s.DeleteObject(ctx, s.storedObject(*existing, in.ObjectKey)); err != nil {
+			return ResumableFileUpload{}, fmt.Errorf("remove invalid resumable dedup object: %w", err)
+		}
+	}
+
+	contentType := in.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	appProps := map[string]string{
+		"pdw_source":         s.source,
+		"pdw_kind":           kind,
+		"pdw_root_folder_id": s.folderID,
+		"pdw_stage":          objectStage(in.ObjectKey),
+		"content_sha256":     in.ContentSHA256,
+	}
+	for key, value := range in.AppProperties {
+		appProps[key] = value
+	}
+	parentID, err := s.ensureParentFolder(ctx, in.ObjectKey)
+	if err != nil {
+		return ResumableFileUpload{}, err
+	}
+	metadata, err := json.Marshal(map[string]any{
+		"name":          driveNameFromObjectKey(in.ObjectKey),
+		"parents":       []string{parentID},
+		"mimeType":      contentType,
+		"appProperties": appProps,
+	})
+	if err != nil {
+		return ResumableFileUpload{}, err
+	}
+	values := url.Values{}
+	values.Set("uploadType", "resumable")
+	values.Set("fields", "id,webViewLink,sha256Checksum,size")
+	values.Set("supportsAllDrives", "true")
+	headers := map[string]string{
+		"Content-Type":            "application/json; charset=UTF-8",
+		"X-Upload-Content-Type":   contentType,
+		"X-Upload-Content-Length": strconv.FormatInt(in.SizeBytes, 10),
+	}
+	_, responseHeaders, err := s.doRequestWithHeaders(
+		ctx,
+		http.MethodPost,
+		s.uploadBaseURL+"/files?"+values.Encode(),
+		headers,
+		metadata,
+	)
+	if err != nil {
+		return ResumableFileUpload{}, err
+	}
+	uploadURL := responseHeaders.Get("Location")
+	if uploadURL == "" {
+		return ResumableFileUpload{}, fmt.Errorf("drive resumable initiation returned no Location")
+	}
+	return ResumableFileUpload{UploadURL: uploadURL}, nil
 }
 
 func (s *GoogleDriveStore) PutJSON(ctx context.Context, in PutJSONInput) (StoredObject, error) {

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,9 +26,10 @@ import (
 // API the write path uses: list queries (always empty -> no dedup hit, folders
 // always created) and multipart uploads, which it records for assertion.
 type fakeDrive struct {
-	mu      sync.Mutex
-	uploads []capturedUpload
-	nextID  int
+	mu        sync.Mutex
+	uploads   []capturedUpload
+	resumable map[string]*capturedUpload
+	nextID    int
 }
 
 type capturedUpload struct {
@@ -42,6 +45,10 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/files"):
 		writeFakeJSON(w, `{"files":[]}`)
+	case r.Method == http.MethodPost && r.URL.Query().Get("uploadType") == "resumable":
+		d.startResumable(w, r)
+	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/resumable/"):
+		d.putResumable(w, r)
 	case r.Method == http.MethodPost && r.URL.Query().Get("uploadType") == "multipart":
 		d.recordUpload(r)
 		d.mu.Lock()
@@ -54,6 +61,91 @@ func (d *fakeDrive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unexpected", http.StatusBadRequest)
 	}
+}
+
+func (d *fakeDrive) startResumable(w http.ResponseWriter, r *http.Request) {
+	var metadata struct {
+		Name          string            `json:"name"`
+		Parents       []string          `json:"parents"`
+		MimeType      string            `json:"mimeType"`
+		AppProperties map[string]string `json:"appProperties"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&metadata); err != nil {
+		http.Error(w, "bad metadata", http.StatusBadRequest)
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.nextID++
+	sessionID := fmt.Sprintf("session-%d", d.nextID)
+	if d.resumable == nil {
+		d.resumable = map[string]*capturedUpload{}
+	}
+	d.resumable[sessionID] = &capturedUpload{
+		Name:      metadata.Name,
+		Parents:   metadata.Parents,
+		MimeType:  metadata.MimeType,
+		AppProps:  metadata.AppProperties,
+		MediaType: r.Header.Get("X-Upload-Content-Type"),
+	}
+	w.Header().Set("Location", "http://"+r.Host+"/resumable/"+sessionID)
+	writeFakeJSON(w, `{}`)
+}
+
+func (d *fakeDrive) putResumable(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimPrefix(r.URL.Path, "/resumable/")
+	d.mu.Lock()
+	upload := d.resumable[sessionID]
+	d.mu.Unlock()
+	if upload == nil {
+		http.NotFound(w, r)
+		return
+	}
+	contentRange := r.Header.Get("Content-Range")
+	if strings.HasPrefix(contentRange, "bytes */") {
+		if len(upload.Media) > 0 {
+			w.Header().Set("Range", fmt.Sprintf("bytes=0-%d", len(upload.Media)-1))
+		}
+		w.WriteHeader(308)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	d.mu.Lock()
+	upload.Media = append(upload.Media, body...)
+	parts := strings.Split(contentRange, "/")
+	if len(parts) != 2 {
+		d.mu.Unlock()
+		http.Error(w, "bad content range", http.StatusBadRequest)
+		return
+	}
+	total, err := strconv.Atoi(parts[1])
+	if err != nil {
+		d.mu.Unlock()
+		http.Error(w, "bad content range", http.StatusBadRequest)
+		return
+	}
+	if len(upload.Media) < total {
+		w.Header().Set("Range", fmt.Sprintf("bytes=0-%d", len(upload.Media)-1))
+		d.mu.Unlock()
+		w.WriteHeader(308)
+		return
+	}
+	d.uploads = append(d.uploads, *upload)
+	delete(d.resumable, sessionID)
+	fileID := fmt.Sprintf("file-%d", d.nextID)
+	content := append([]byte(nil), upload.Media...)
+	d.mu.Unlock()
+	checksum := sha256.Sum256(content)
+	writeFakeJSON(
+		w,
+		fmt.Sprintf(
+			`{"id":%q,"webViewLink":%q,"sha256Checksum":%q,"size":%q}`,
+			fileID,
+			"https://drive/"+fileID,
+			fmt.Sprintf("%x", checksum),
+			fmt.Sprintf("%d", len(content)),
+		),
+	)
 }
 
 func (d *fakeDrive) recordUpload(r *http.Request) {
@@ -150,9 +242,8 @@ func e2eCases() []e2eCase {
 	noteAtt := []byte("note-attachment")
 	revision := []byte(`{"schema_version":1,"source":"apple_notes"}`)
 	audioSHA := sha(audio)
-	photo := []byte("heic-bytes")
-	photoSHA := sha(photo)
 	photoMeta := []byte(`{"schema_version":1,"source":"apple_photos"}`)
+	photoSHA := sha([]byte("heic-bytes"))
 	photoDedupSHA := sha([]byte("apple_photos|z@x.test|UUID-1|original|" + photoSHA))
 	statement := []byte("%PDF-statement-bytes")
 	statementSHA := sha(statement)
@@ -188,12 +279,6 @@ func e2eCases() []e2eCase {
 			extra:    url.Values{"recorded_at": {"2025-07-15T09:00:00"}, "audio_content_sha256": {audioSHA}},
 			wantName: "2025-07-15-" + audioSHA + ".json", wantMime: "application/json",
 			wantProps: map[string]string{"pdw_kind": "voice_memo_metadata", "audio_content_sha256": audioSHA},
-		},
-		{
-			name: "photos/file", endpoint: "/ingest/photos/file", body: photo,
-			extra:    url.Values{"captured_at": {"2026-06-01T14:30:00"}, "extension": {".heic"}, "content_type": {"image/heic"}},
-			wantName: "2026-06-01-" + photoSHA + ".heic", wantMime: "image/heic",
-			wantProps: map[string]string{"pdw_kind": "photo_file", "pdw_stage": "inbox", "pdw_source": "photos"},
 		},
 		{
 			name: "photos/metadata", endpoint: "/ingest/photos/metadata", body: photoMeta,
@@ -245,6 +330,53 @@ func e2eCases() []e2eCase {
 			wantName: "R1.json", wantMime: "application/json",
 			wantProps: map[string]string{"pdw_kind": "apple_note_revision_metadata", "note_content_sha256": "FP1"},
 		},
+	}
+}
+
+func TestIngestEndToEndPhotoResumableUpload(t *testing.T) {
+	drive := &fakeDrive{}
+	driveServer := httptest.NewServer(drive)
+	defer driveServer.Close()
+	service := e2eService(t, driveServer.URL)
+	photo := []byte("heic-bytes")
+	photoSHA := sha256Hex(photo)
+	startBody, _ := json.Marshal(photoResumableRequest{
+		CapturedAt:    "2026-06-01T14:30:00",
+		Extension:     ".heic",
+		ContentType:   "image/heic",
+		ContentSHA256: photoSHA,
+		SizeBytes:     int64(len(photo)),
+	})
+	startTarget := signedIngestTarget(photoResumableEndpoint, startBody, nil)
+	startRecorder := postIngest(t, service, startTarget, startBody)
+	if startRecorder.Code != http.StatusOK {
+		t.Fatalf("start status = %d, body %q", startRecorder.Code, startRecorder.Body.String())
+	}
+	var started photoResumableResponse
+	if err := json.Unmarshal(startRecorder.Body.Bytes(), &started); err != nil {
+		t.Fatalf("decode start: %v", err)
+	}
+	request, _ := http.NewRequest(http.MethodPut, started.UploadURL, strings.NewReader(string(photo)))
+	request.Header.Set("Content-Length", fmt.Sprintf("%d", len(photo)))
+	request.Header.Set("Content-Type", "image/heic")
+	request.Header.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(photo)-1, len(photo)))
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("upload chunk: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("upload status = %d", response.StatusCode)
+	}
+	if len(drive.uploads) != 1 {
+		t.Fatalf("Drive uploads = %d, want 1", len(drive.uploads))
+	}
+	uploaded := drive.lastUpload()
+	if uploaded.Name != "2026-06-01-"+photoSHA+".heic" ||
+		string(uploaded.Media) != string(photo) ||
+		uploaded.AppProps["pdw_kind"] != "photo_file" ||
+		uploaded.AppProps["pdw_source"] != "photos" {
+		t.Fatalf("uploaded = %+v", uploaded)
 	}
 }
 
@@ -319,8 +451,8 @@ func TestIngestEndToEndPythonClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("python driver failed: %v", err)
 	}
-	if got := len(drive.uploads); got != len(ingestArtifacts()) {
-		t.Fatalf("expected %d uploads from python client, got %d", len(ingestArtifacts()), got)
+	if got := len(drive.uploads); got != len(ingestArtifacts())+1 {
+		t.Fatalf("expected %d uploads from python client, got %d", len(ingestArtifacts())+1, got)
 	}
 }
 

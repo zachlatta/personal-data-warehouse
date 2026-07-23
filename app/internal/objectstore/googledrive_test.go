@@ -15,6 +15,7 @@ type recordedCall struct {
 	Method string
 	Path   string
 	Query  map[string][]string
+	Header http.Header
 	Body   string
 }
 
@@ -40,6 +41,7 @@ func (f *driveFake) Do(req *http.Request) (*http.Response, error) {
 		Method: req.Method,
 		Path:   req.URL.Path,
 		Query:  req.URL.Query(),
+		Header: req.Header.Clone(),
 		Body:   string(bodyBytes),
 	})
 	q := req.URL.Query()
@@ -54,6 +56,10 @@ func (f *driveFake) Do(req *http.Request) (*http.Response, error) {
 			return jsonResp(404, map[string]string{"error": "not found"})
 		}
 		return rawResp(200, data)
+	case req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/upload/") && q.Get("uploadType") == "resumable":
+		resp, _ := jsonResp(http.StatusOK, map[string]string{})
+		resp.Header.Set("Location", "https://www.googleapis.com/upload/drive/v3/files?upload_id=session-secret")
+		return resp, nil
 	case req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/upload/"):
 		return jsonResp(200, driveFile{ID: "uploaded-file", WebViewLink: "https://drive/uploaded"})
 	case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/files"):
@@ -455,6 +461,93 @@ func TestPutFileDedupesAndUploads(t *testing.T) {
 	}
 	if !uploaded {
 		t.Fatal("expected an upload request")
+	}
+}
+
+func TestBeginResumableFileUploadDedupesOrCreatesDriveSession(t *testing.T) {
+	input := ResumableFileUploadInput{
+		ObjectKey:     "photos/inbox/2026/07/2026-07-01-abc.mov",
+		ContentSHA256: "abc",
+		ContentType:   "video/quicktime",
+		SizeBytes:     5 * 1024 * 1024 * 1024,
+		Kind:          "photo_file",
+	}
+
+	existing := &driveFake{objects: []driveFile{{
+		ID: "existing", WebViewLink: "https://drive/existing",
+		SHA256Checksum: "abc", Size: "5368709120",
+	}}}
+	hit, err := voiceMemosStore(existing).BeginResumableFileUpload(context.Background(), input)
+	if err != nil {
+		t.Fatalf("dedup begin: %v", err)
+	}
+	if hit.Existing == nil || hit.Existing.StorageFileID != "existing" || hit.UploadURL != "" {
+		t.Fatalf("unexpected dedup result: %+v", hit)
+	}
+
+	fresh := &driveFake{}
+	started, err := voiceMemosStore(fresh).BeginResumableFileUpload(context.Background(), input)
+	if err != nil {
+		t.Fatalf("fresh begin: %v", err)
+	}
+	if started.Existing != nil {
+		t.Fatalf("fresh begin returned existing: %+v", started.Existing)
+	}
+	if started.UploadURL != "https://www.googleapis.com/upload/drive/v3/files?upload_id=session-secret" {
+		t.Fatalf("upload URL = %q", started.UploadURL)
+	}
+
+	var init *recordedCall
+	for i := range fresh.calls {
+		call := &fresh.calls[i]
+		if call.Query["uploadType"] != nil && call.Query["uploadType"][0] == "resumable" {
+			init = call
+		}
+	}
+	if init == nil {
+		t.Fatal("expected resumable initiation request")
+	}
+	if init.Header.Get("X-Upload-Content-Type") != "video/quicktime" {
+		t.Fatalf("X-Upload-Content-Type = %q", init.Header.Get("X-Upload-Content-Type"))
+	}
+	if init.Header.Get("X-Upload-Content-Length") != "5368709120" {
+		t.Fatalf("X-Upload-Content-Length = %q", init.Header.Get("X-Upload-Content-Length"))
+	}
+	var metadata struct {
+		Name          string            `json:"name"`
+		MimeType      string            `json:"mimeType"`
+		AppProperties map[string]string `json:"appProperties"`
+	}
+	if err := json.Unmarshal([]byte(init.Body), &metadata); err != nil {
+		t.Fatalf("decode metadata: %v", err)
+	}
+	if metadata.Name != "2026-07-01-abc.mov" || metadata.MimeType != "video/quicktime" {
+		t.Fatalf("metadata = %+v", metadata)
+	}
+	if metadata.AppProperties["pdw_kind"] != "photo_file" ||
+		metadata.AppProperties["content_sha256"] != "abc" ||
+		metadata.AppProperties["pdw_stage"] != "inbox" {
+		t.Fatalf("app properties = %+v", metadata.AppProperties)
+	}
+
+	corrupt := &driveFake{objects: []driveFile{{
+		ID: "corrupt", SHA256Checksum: "wrong", Size: "123",
+	}}}
+	restarted, err := voiceMemosStore(corrupt).BeginResumableFileUpload(context.Background(), input)
+	if err != nil {
+		t.Fatalf("replace corrupt dedup object: %v", err)
+	}
+	if restarted.Existing != nil || restarted.UploadURL == "" {
+		t.Fatalf("corrupt object should be replaced with a fresh session: %+v", restarted)
+	}
+	deleted := false
+	for _, call := range corrupt.calls {
+		if call.Method == http.MethodDelete && strings.HasSuffix(call.Path, "/files/corrupt") {
+			deleted = true
+		}
+	}
+	if !deleted {
+		t.Fatal("expected corrupt content-sha dedup object to be deleted")
 	}
 }
 
