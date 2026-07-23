@@ -30,6 +30,7 @@ var ingestModules = map[string]string{
 	"voice-memos":    "personal_data_warehouse_voice_memos.cli",
 	"apple-notes":    "personal_data_warehouse_apple_notes.cli",
 	"apple-messages": "personal_data_warehouse_apple_messages.cli",
+	"apple-contacts": "personal_data_warehouse_apple_contacts.cli",
 	"agent-sessions": "personal_data_warehouse_agent_sessions.cli",
 	"plaid":          "personal_data_warehouse_plaid.cli",
 	"apple-photos":   "personal_data_warehouse_photos.cli",
@@ -98,6 +99,7 @@ SOURCES
   voice-memos      Upload local macOS Voice Memos recordings
   apple-notes      Upload local Apple Notes
   apple-messages   Upload local Apple Messages (iMessage/SMS/RCS)
+  apple-contacts   Upload local Apple/iCloud Contacts
   agent-sessions   Upload AI agent CLI session transcripts
   apple-photos     Upload local Apple Photos originals + metadata
   claude-desktop   Push the Claude Desktop (claude.ai) session credential

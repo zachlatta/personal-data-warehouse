@@ -1,6 +1,8 @@
 # personal_data_warehouse
 
-This project syncs Gmail mailbox data, Google Calendar events, Slack data, WHOOP health data, Apple Notes, Apple Messages, Voice Memos, and Plaid-backed personal finance data into Postgres through Dagster.
+This project syncs Gmail mailbox data, Google Calendar events, Google and Apple Contacts, Slack
+data, WHOOP health data, Apple Notes, Apple Messages, Voice Memos, and Plaid-backed personal
+finance data into Postgres through Dagster.
 
 Current ingestion path:
 
@@ -23,6 +25,9 @@ Current ingestion path:
 - Apple Messages use the same local Mac app-ingest path: a LaunchAgent snapshots `chat.db`,
   posts compressed message batches plus bounded attachment backfill objects to the app, and
   Dagster ingests them into normalized Postgres tables.
+- Apple Contacts use that app-ingest path too: a LaunchAgent snapshots every local and account
+  Address Book store, posts changed contacts and tombstones, and Dagster merges them with Google
+  Contacts in the canonical `marts.contacts` view.
 - WHOOP syncs read-only health data through the WHOOP v2 OAuth API: profile, body measurements,
   cycles, recovery, sleep, and workouts land in source-owned `whoop.*` Postgres tables.
 - Plaid uses an interactive local Link flow to authorize personal institutions. Access tokens stay
@@ -224,8 +229,9 @@ uv run personal-data-warehouse-contacts-sync
 ```
 
 Dagster exposes `google_contacts_sync` in the `contacts` group, scheduled hourly by
-`contacts_sync_hourly`. The sync writes `contact_cards` and `contact_sync_state`, with
-`clean_contacts` as the current non-deleted view.
+`contacts_sync_hourly`. The sync writes `google_contacts.cards` and
+`google_contacts.sync_state`. The canonical `marts.contacts` view unions active Google and Apple
+cards; `marts.contact_points` normalizes every email address and phone number for identity joins.
 
 ## WHOOP Sync
 
@@ -968,6 +974,59 @@ its current real path
 `/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`, then
 kickstart the LaunchAgent again.
 
+## Apple Contacts Sync
+
+Apple Contacts mirrors the Contacts.app data that Messages uses for names, including iCloud and
+local "On My Mac" cards. The uploader snapshots
+`~/Library/Application Support/AddressBook`, extracts all contact cards and contact points, and
+posts changed rows plus deletion tombstones through `/ingest/apple-contacts/batch`. It never writes
+to the live Address Book database.
+
+Configure the local uploader with the same app credentials as the other Mac uploaders:
+
+```bash
+APPLE_CONTACTS_ACCOUNT=you@example.com
+PDW_API_URL=https://your-public-pdw-app
+PDW_SECRET_TOKEN=<same-secret-as-pdw-app>
+APPLE_CONTACTS_STORE_PATH=~/Library/Application Support/AddressBook
+```
+
+Run it manually:
+
+```bash
+pdw ingest apple-contacts --mode incremental
+```
+
+Incremental state lives in
+`~/Library/Application Support/personal-data-warehouse/apple-contacts-upload-state.sqlite`.
+Dagster's `apple_contacts_drive_inbox_sensor` consumes uploaded batches into
+`apple_contacts.cards` and promotes them from `apple-contacts/inbox/...` to
+`apple-contacts/library/...`.
+
+The canonical identity views are:
+
+- `marts.contacts`: active Google and Apple cards.
+- `marts.contact_points`: normalized phone and email identifiers.
+- `marts.apple_messages`: Messages rows with `sender_name`, `sender_address`, and resolved contact
+  provenance.
+
+WhatsApp sender resolution also follows `whatsapp.chat_participants` LID-to-phone aliases before
+joining `whatsapp.contacts`, so linked-device-only senders no longer appear missing.
+
+Install or refresh the five-minute LaunchAgent:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.apple-contacts-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-contacts-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-contacts-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-contacts-upload
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-contacts-upload
+```
+
+Monitor it with `bin/apple-contacts-upload-status`. If the run cannot read an
+`AddressBook-v22.abcddb` store, grant Full Disk Access to `/bin/zsh`, `/opt/homebrew/bin/uv`, the
+repo venv Python, and that Python executable's current resolved uv-managed path.
+
 ### Alice App Voice Recordings
 
 Alice App voice recordings are archived into the same Google Drive object-storage root using the
@@ -1250,6 +1309,9 @@ The sync creates and maintains:
 - `apple_message_chats`, `apple_message_handles`, `apple_message_chat_handles`,
   `apple_message_chat_messages`: normalized conversation, participant, and membership tables
 - `apple_message_attachments`: attachment metadata and staged Drive storage pointers
+- `apple_contacts.cards`: latest known state for each local or iCloud Apple contact
+- `marts.contacts`, `marts.contact_points`: canonical active contacts and normalized identifiers
+- `marts.apple_messages`: Apple Messages enriched with contact-backed sender identity
 - `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
 - `plaid.items`, `plaid.accounts`, `plaid.transactions`, `plaid.investment_securities`,

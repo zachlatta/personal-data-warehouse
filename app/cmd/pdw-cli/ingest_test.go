@@ -52,6 +52,7 @@ func TestIngestResolvesKnownSources(t *testing.T) {
 		"voice-memos":    "personal_data_warehouse_voice_memos.cli",
 		"apple-notes":    "personal_data_warehouse_apple_notes.cli",
 		"apple-messages": "personal_data_warehouse_apple_messages.cli",
+		"apple-contacts": "personal_data_warehouse_apple_contacts.cli",
 		"agent-sessions": "personal_data_warehouse_agent_sessions.cli",
 		"plaid":          "personal_data_warehouse_plaid.cli",
 		"apple-photos":   "personal_data_warehouse_photos.cli",

@@ -114,6 +114,7 @@ func (c Config) ObjectStoreEnabled() bool {
 // per-source folder override env var (PDW_INGEST_<INFIX>_FOLDER_ID).
 var ingestSourceEnvInfix = map[string]string{
 	"agent_sessions":    "AGENT_SESSIONS",
+	"apple_contacts":    "APPLE_CONTACTS",
 	"apple_messages":    "APPLE_MESSAGES",
 	"apple_voice_memos": "VOICE_MEMOS",
 	"apple_notes":       "APPLE_NOTES",

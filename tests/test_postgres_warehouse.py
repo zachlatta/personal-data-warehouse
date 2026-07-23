@@ -16,6 +16,7 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.slack_sync import SlackApiCallError, SlackSyncRunner
 
 from personal_data_warehouse.schema import (
+    APPLE_MESSAGE_COLUMNS,
     APPLE_NOTE_ATTACHMENT_COLUMNS,
     APPLE_NOTE_COLUMNS,
     APPLE_NOTE_REVISION_COLUMNS,
@@ -43,6 +44,7 @@ from personal_data_warehouse.postgres import (
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
     _dedupe_conflict_rows,
+    _identifier,
     _normalize_insert_value,
     _upsert_clause,
 )
@@ -1064,9 +1066,10 @@ def test_postgres_whatsapp_chat_participants_roundtrip(warehouse: PostgresWareho
 
 
 def _wa_message_row(*, chat_id: str, message_id: str, sender_jid: str = "", is_from_me: int = 0,
-                    push_name: str = "", body_text: str = "", sync_version: int = 1) -> dict:
+                    push_name: str = "", body_text: str = "", sync_version: int = 1,
+                    **overrides) -> dict:
     base = datetime(2026, 6, 1, 12, tzinfo=UTC)
-    return {
+    row = {
         "account": "zach@example.test",
         "chat_id": chat_id,
         "message_id": message_id,
@@ -1084,6 +1087,8 @@ def _wa_message_row(*, chat_id: str, message_id: str, sender_jid: str = "", is_f
         "ingested_at": base,
         "sync_version": sync_version,
     }
+    row.update(overrides)
+    return row
 
 
 def test_backfill_whatsapp_chats_fills_gaps_without_clobbering(warehouse: PostgresWarehouse) -> None:
@@ -1150,6 +1155,121 @@ def test_clean_whatsapp_messages_view_classifies_and_resolves(warehouse: Postgre
         "SELECT sender_name FROM clean_whatsapp_messages WHERE message_id='d1'"
     )[0][0]
     assert sender == "Alice Example"
+
+
+def test_clean_whatsapp_messages_resolves_lid_sender_through_phone_jid(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_whatsapp_tables()
+    base = datetime(2026, 7, 1, 12, tzinfo=UTC)
+    account = "owner@example.test"
+    phone_jid = "15551234567@s.whatsapp.net"
+    lid_jid = "123456789012345@lid"
+    warehouse.insert_whatsapp_contacts([
+        {
+            "account": account,
+            "jid": phone_jid,
+            "push_name": "",
+            "first_name": "",
+            "full_name": "Example Person",
+            "business_name": "",
+            "raw_metadata_json": "{}",
+            "ingested_at": base,
+            "sync_version": 1,
+        }
+    ])
+    warehouse.insert_whatsapp_chat_participants([
+        {
+            "account": account,
+            "chat_id": "123@g.us",
+            "participant_jid": lid_jid,
+            "phone_jid": phone_jid,
+            "lid_jid": lid_jid,
+            "display_name": "",
+            "is_admin": 0,
+            "is_super_admin": 0,
+            "raw_metadata_json": "{}",
+            "ingested_at": base,
+            "sync_version": 1,
+        }
+    ])
+    warehouse.insert_whatsapp_messages([
+        _wa_message_row(
+            account=account,
+            chat_id="123@g.us",
+            message_id="lid-message",
+            sender_jid=lid_jid,
+        )
+    ])
+
+    sender = warehouse._query(
+        "SELECT sender_name FROM clean_whatsapp_messages WHERE message_id='lid-message'"
+    )[0][0]
+
+    assert sender == "Example Person"
+
+
+def test_canonical_contacts_and_apple_messages_resolve_apple_contact(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_contacts_tables()
+    warehouse.ensure_apple_contacts_tables()
+    warehouse.ensure_apple_messages_tables()
+    base = datetime(2026, 7, 1, 12, tzinfo=UTC)
+    apple_row = _contact_card_row(
+        card_id="apple-contact-1",
+        display_name="Example Person",
+        primary_phone="+1 (555) 123-4567",
+        phones=[{"value": "+1 (555) 123-4567", "metadata": {"primary": True}}],
+        sync_version=1,
+    )
+    apple_row.update(
+        source="apple_contacts",
+        source_kind="apple_contacts",
+        account="owner@example.test",
+        address_book_id="icloud-source",
+        source_uid="apple-contact-1",
+        synced_at=base,
+        source_updated_at=base,
+    )
+    warehouse.insert_apple_contact_cards([apple_row])
+    warehouse.insert_apple_message_handles([
+        {
+            "account": "owner@example.test",
+            "handle_id": "handle-1",
+            "handle_rowid": 1,
+            "address": "+15551234567",
+            "country": "US",
+            "service": "iMessage",
+            "uncanonicalized_id": "",
+            "person_centric_id": "",
+            "raw_metadata_json": "{}",
+            "ingested_at": base,
+            "sync_version": 1,
+        }
+    ])
+    message = _default_row(
+        APPLE_MESSAGE_COLUMNS,
+        account="owner@example.test",
+        message_id="message-1",
+        message_rowid=1,
+        handle_id="handle-1",
+        body_text="hello",
+        message_at=base,
+        ingested_at=base,
+        sync_version=1,
+    )
+    warehouse.insert_apple_messages([message])
+
+    contacts = warehouse._query(
+        "SELECT source, display_name FROM clean_contacts WHERE card_id='apple-contact-1'"
+    )
+    resolved = warehouse._query(
+        "SELECT sender_name, sender_address FROM clean_apple_messages WHERE message_id='message-1'"
+    )
+
+    assert contacts == [("apple_contacts", "Example Person")]
+    assert resolved == [("Example Person", "+15551234567")]
 
 
 def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: PostgresWarehouse) -> None:
@@ -2498,6 +2618,7 @@ def test_postgres_ensure_contacts_recovers_when_existing_view_has_extra_columns(
         "SELECT pg_get_viewdef(to_regclass(%s))",
         (warehouse.sql_relation("clean_contacts"),),
     )[0][0]
+    warehouse._command("DROP VIEW clean_contact_points")
     warehouse._command("DROP VIEW clean_contacts")
     warehouse._command(
         "CREATE VIEW clean_contacts AS "
@@ -2520,6 +2641,28 @@ def test_postgres_ensure_contacts_recovers_when_existing_view_has_extra_columns(
     ]
     assert "drift_extra" not in columns
     assert columns[-2:] == ["raw_json", "nicknames"]
+
+
+def test_postgres_ensure_contacts_removes_google_only_legacy_mart(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_contacts_tables()
+    marts_schema = warehouse.physical_schema_name("marts")
+    warehouse._raw_command(
+        f"CREATE VIEW {_identifier(marts_schema)}.{_identifier('google_contacts')} "
+        "AS SELECT 1 AS legacy"
+    )
+
+    warehouse.ensure_contacts_tables()
+
+    assert warehouse._query(
+        "SELECT to_regclass(%s)",
+        (f"{marts_schema}.google_contacts",),
+    ) == [(None,)]
+    assert warehouse._query(
+        "SELECT to_regclass(%s)",
+        (warehouse.sql_relation("clean_contacts"),),
+    )[0][0] is not None
 
 
 def test_postgres_mark_missing_contact_cards_deleted_tombstones_only_scope(warehouse: PostgresWarehouse) -> None:

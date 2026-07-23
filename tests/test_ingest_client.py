@@ -108,6 +108,28 @@ def test_post_signs_body_and_sends_expected_query() -> None:
     assert q["sig"] == expected_sig
 
 
+def test_apple_contacts_batch_uses_semantic_ingest_endpoint() -> None:
+    session = _FakeSession()
+    client = IngestClient(
+        base_url="https://app.example.test/",
+        signing_key=b"0123456789abcdef0123456789abcdef",
+        session=session,
+        now=lambda: 1700000000.0,
+    )
+
+    client.upload_apple_contacts_batch(
+        b"contacts-gzip",
+        exported_at="2026-07-23T12:00:00+00:00",
+    )
+
+    call = session.calls[0]
+    parts = urlsplit(call["url"])
+    assert parts.path == "/ingest/apple-contacts/batch"
+    query = {key: value[0] for key, value in parse_qs(parts.query).items()}
+    assert query["exported_at"] == "2026-07-23T12:00:00+00:00"
+    assert call["headers"]["Content-Type"] == "application/gzip"
+
+
 class _PhotoResumableSession(_FakeSession):
     def __init__(self, *, content_sha256: str) -> None:
         super().__init__()

@@ -46,6 +46,7 @@ type ingestSourceDef struct {
 // handler passes an explicit kind, so the per-artifact kind is authoritative.
 var ingestSourceDefs = map[string]ingestSourceDef{
 	"agent_sessions":    {source: "agent_sessions", blobKind: "agent_sessions_blob", metadataKind: "agent_sessions_export_batch"},
+	"apple_contacts":    {source: "apple_contacts", blobKind: "apple_contact_blob", metadataKind: "apple_contact_export_batch"},
 	"apple_messages":    {source: "apple_messages", blobKind: "apple_message_attachment", metadataKind: "apple_message_export_batch"},
 	"apple_voice_memos": {source: "apple_voice_memos", blobKind: "voice_memo_audio", metadataKind: "voice_memo_metadata", legacySources: []string{"voice_memos"}},
 	"apple_notes":       {source: "apple_notes", blobKind: "apple_note_body_html", metadataKind: "apple_note_revision_metadata"},
@@ -463,6 +464,7 @@ func ingestArtifacts() []ingestArtifact {
 	}
 	return []ingestArtifact{
 		batch("/ingest/agent-sessions/batch", "agent_sessions", "agent-sessions/inbox", "agent_sessions_export_batch"),
+		batch("/ingest/apple-contacts/batch", "apple_contacts", "apple-contacts/inbox", "apple_contact_export_batch"),
 		batch("/ingest/apple-messages/batch", "apple_messages", "apple-messages/inbox", "apple_message_export_batch"),
 		{
 			endpoint:   "/ingest/apple-messages/attachment",

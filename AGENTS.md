@@ -296,6 +296,50 @@ Apple Messages SQL starting points are `apple_messages`, `apple_message_chats`,
 `apple_message_handles`, `apple_message_chat_handles`, `apple_message_chat_messages`, and
 `apple_message_attachments`.
 
+## Local Apple Contacts Upload Scheduler
+
+This Mac is intended to run the local Apple Contacts uploader through a user LaunchAgent:
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.apple-contacts-upload`
+- Installed plist: `~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-contacts-upload.plist`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.apple-contacts-upload.plist`
+- Wrapper script: `bin/apple-contacts-upload-launchd`
+- Run cadence: every 300 seconds with `RunAtLoad`
+- Command: `uv run python -m personal_data_warehouse_apple_contacts.cli --mode incremental`
+- Main run log: `~/Library/Logs/personal-data-warehouse/apple-contacts-upload.run.log`
+- Heartbeat file: `~/Library/Logs/personal-data-warehouse/apple-contacts-upload.heartbeat`
+- Status helper: `bin/apple-contacts-upload-status`
+
+Use these commands when inspecting or repairing it:
+
+```bash
+bin/apple-contacts-upload-status
+launchctl print gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-contacts-upload
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-contacts-upload
+tail -80 ~/Library/Logs/personal-data-warehouse/apple-contacts-upload.run.log
+cat ~/Library/Logs/personal-data-warehouse/apple-contacts-upload.heartbeat
+```
+
+If the plist changes, reinstall it with:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.apple-contacts-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-contacts-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-contacts-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-contacts-upload
+```
+
+The uploader snapshots every `AddressBook-v22.abcddb` under
+`~/Library/Application Support/AddressBook`, including local and account/iCloud stores. It sends
+changed cards and tombstones through the app's `/ingest/apple-contacts/batch` endpoint. Dagster's
+`apple_contacts_drive_inbox_sensor` consumes them into `apple_contacts.cards`; `marts.contacts`
+unions active Apple and Google cards and `marts.contact_points` provides normalized phones/emails
+for identity joins. `marts.apple_messages` uses those points to resolve Messages senders.
+
+If the run log shows `PermissionError` or SQLite `authorization denied` for an Address Book
+store, grant Full Disk Access to `/bin/zsh`, `/opt/homebrew/bin/uv`, the repo venv Python, and the
+current real uv Python path, then kickstart the LaunchAgent.
+
 ## Local Apple Photos Upload Scheduler
 
 This Mac is intended to run the local Apple Photos uploader through a user LaunchAgent:

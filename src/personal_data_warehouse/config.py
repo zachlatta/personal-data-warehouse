@@ -45,6 +45,8 @@ DEFAULT_APPLE_NOTES_STORE_PATH = "~/Library/Group Containers/group.com.apple.not
 DEFAULT_APPLE_NOTES_STORAGE_BACKEND = "google_drive"
 DEFAULT_APPLE_MESSAGES_STORE_PATH = "~/Library/Messages/chat.db"
 DEFAULT_APPLE_MESSAGES_STORAGE_BACKEND = "google_drive"
+DEFAULT_APPLE_CONTACTS_STORE_PATH = "~/Library/Application Support/AddressBook"
+DEFAULT_APPLE_CONTACTS_STORAGE_BACKEND = "google_drive"
 DEFAULT_APPLE_PHOTOS_LIBRARY_PATH = "~/Pictures/Photos Library.photoslibrary"
 DEFAULT_PHOTOS_STORAGE_BACKEND = "google_drive"
 DEFAULT_APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN = 512 * 1024 * 1024
@@ -227,6 +229,15 @@ class AppleMessagesConfig:
     attachment_bytes_per_run: int = DEFAULT_APPLE_MESSAGES_ATTACHMENT_BYTES_PER_RUN
     attachment_count_per_run: int = DEFAULT_APPLE_MESSAGES_ATTACHMENT_COUNT_PER_RUN
     upload_workers: int = DEFAULT_APPLE_MESSAGES_UPLOAD_WORKERS
+
+
+@dataclass(frozen=True)
+class AppleContactsConfig:
+    account: str
+    store_path: str
+    storage_backend: str
+    google_drive_account: str
+    google_drive_folder_id: str
 
 
 @dataclass(frozen=True)
@@ -448,6 +459,7 @@ class Settings:
     voice_memos: VoiceMemosConfig | None = None
     apple_notes: AppleNotesConfig | None = None
     apple_messages: AppleMessagesConfig | None = None
+    apple_contacts: AppleContactsConfig | None = None
     photos: PhotosConfig | None = None
     manual_finance: ManualFinanceConfig | None = None
     whatsapp: WhatsAppConfig | None = None
@@ -514,6 +526,8 @@ class Settings:
             configured_domains.add(email_domain(self.apple_notes.google_drive_account))
         if self.apple_messages is not None:
             configured_domains.add(email_domain(self.apple_messages.google_drive_account))
+        if self.apple_contacts is not None:
+            configured_domains.add(email_domain(self.apple_contacts.google_drive_account))
         if self.whatsapp is not None:
             configured_domains.add(email_domain(self.whatsapp.google_drive_account))
         if self.agent_sessions is not None:
@@ -554,6 +568,7 @@ def load_settings(
     require_voice_memos: bool = False,
     require_apple_notes: bool = False,
     require_apple_messages: bool = False,
+    require_apple_contacts: bool = False,
     require_photos: bool = False,
     require_manual_finance: bool = False,
     require_whatsapp: bool = False,
@@ -928,6 +943,64 @@ def load_settings(
             attachment_bytes_per_run=apple_messages_attachment_bytes_per_run,
             attachment_count_per_run=apple_messages_attachment_count_per_run,
             upload_workers=apple_messages_upload_workers,
+        )
+
+    apple_contacts_account = (
+        os.getenv("APPLE_CONTACTS_ACCOUNT")
+        or apple_messages_account
+        or apple_notes_account
+        or voice_memos_account
+        or default_voice_memos_account
+    ).strip()
+    apple_contacts_store_path = os.path.expanduser(
+        os.getenv("APPLE_CONTACTS_STORE_PATH", DEFAULT_APPLE_CONTACTS_STORE_PATH)
+    )
+    apple_contacts_google_drive_account = (
+        os.getenv("APPLE_CONTACTS_GOOGLE_DRIVE_ACCOUNT")
+        or apple_contacts_account
+        or apple_messages_google_drive_account
+        or voice_memos_account
+    ).strip()
+    apple_contacts_google_drive_folder_id = (
+        os.getenv("APPLE_CONTACTS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("VOICE_MEMOS_DRIVE_FOLDER_ID")
+        or ""
+    ).strip()
+    apple_contacts_storage_backend = os.getenv(
+        "APPLE_CONTACTS_STORAGE_BACKEND",
+        _default_upload_backend(
+            DEFAULT_APPLE_CONTACTS_STORAGE_BACKEND,
+            google_drive_folder_id=apple_contacts_google_drive_folder_id,
+        ),
+    ).strip()
+    apple_contacts: AppleContactsConfig | None = None
+    if (
+        require_apple_contacts
+        or os.getenv("APPLE_CONTACTS_ACCOUNT")
+        or os.getenv("APPLE_CONTACTS_GOOGLE_DRIVE_FOLDER_ID")
+        or os.getenv("APPLE_CONTACTS_STORE_PATH")
+    ):
+        if not apple_contacts_account:
+            raise ValueError("APPLE_CONTACTS_ACCOUNT or GMAIL_ACCOUNTS must be set for Apple Contacts sync")
+        if apple_contacts_storage_backend not in {"google_drive", "http_app"}:
+            raise ValueError("APPLE_CONTACTS_STORAGE_BACKEND currently supports: google_drive, http_app")
+        if apple_contacts_storage_backend == "google_drive":
+            if not apple_contacts_google_drive_account:
+                raise ValueError("APPLE_CONTACTS_GOOGLE_DRIVE_ACCOUNT or APPLE_CONTACTS_ACCOUNT must be set")
+            if not apple_contacts_google_drive_folder_id:
+                raise ValueError(
+                    "APPLE_CONTACTS_GOOGLE_DRIVE_FOLDER_ID, APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, "
+                    "APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+                )
+        apple_contacts = AppleContactsConfig(
+            account=apple_contacts_account,
+            store_path=apple_contacts_store_path,
+            storage_backend=apple_contacts_storage_backend,
+            google_drive_account=apple_contacts_google_drive_account,
+            google_drive_folder_id=apple_contacts_google_drive_folder_id,
         )
 
     photos_account = (
@@ -1610,6 +1683,8 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if apple_messages and apple_messages.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if apple_contacts and apple_contacts.storage_backend == "google_drive":
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if whatsapp and whatsapp.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if alice_voice_recordings and alice_voice_recordings.storage_backend == "google_drive":
@@ -1662,6 +1737,7 @@ def load_settings(
         voice_memos=voice_memos,
         apple_notes=apple_notes,
         apple_messages=apple_messages,
+        apple_contacts=apple_contacts,
         photos=photos,
         manual_finance=manual_finance,
         whatsapp=whatsapp,

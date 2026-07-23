@@ -149,7 +149,7 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("agent_session", ("agent_session",), "t.source"),
     ("alice_voice_recording", ("alice_voice_recording",), "t.kind"),
     ("calendar", ("calendar_event",), "t.kind"),
-    ("contact", ("contact_update",), "t.kind"),
+    ("contact", ("contact_update", "apple_contact_update"), "t.kind"),
     ("gmail", ("gmail_email",), "t.kind"),
     ("google_drive", ("drive_file",), "t.kind"),
     ("imessage", ("apple_message",), "t.kind"),
@@ -256,6 +256,10 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "calendar_events": TableSpec(CALENDAR_EVENT_COLUMNS, ("account", "calendar_id", "event_id")),
     "calendar_sync_state": TableSpec(CALENDAR_SYNC_STATE_COLUMNS, ("account", "calendar_id")),
     "contact_cards": TableSpec(
+        CONTACT_CARD_COLUMNS,
+        ("source", "account", "source_kind", "address_book_id", "card_id"),
+    ),
+    "apple_contact_cards": TableSpec(
         CONTACT_CARD_COLUMNS,
         ("source", "account", "source_kind", "address_book_id", "card_id"),
     ),
@@ -1106,6 +1110,18 @@ JSONB_COLUMNS_BY_TABLE = {
         "photos",
         "raw_json",
     },
+    "apple_contact_cards": {
+        "emails",
+        "phones",
+        "addresses",
+        "organizations",
+        "urls",
+        "nicknames",
+        "groups",
+        "dates",
+        "photos",
+        "raw_json",
+    },
     "google_drive_files": {
         "parents_json",
         "owners_json",
@@ -1143,6 +1159,16 @@ JSONB_COLUMNS_BY_TABLE = {
 
 JSONB_ARRAY_COLUMNS_BY_TABLE = {
     "contact_cards": {
+        "emails",
+        "phones",
+        "addresses",
+        "organizations",
+        "urls",
+        "nicknames",
+        "groups",
+        "photos",
+    },
+    "apple_contact_cards": {
         "emails",
         "phones",
         "addresses",
@@ -1586,10 +1612,21 @@ class PostgresWarehouse:
         self._ensure_search_views_if_possible()
 
     def ensure_contacts_tables(self) -> None:
-        self._ensure_table_group(["contact_cards", "contact_sync_state"])
+        self._ensure_table_group(["contact_cards", "contact_sync_state", "apple_contact_cards"])
         self._command("ALTER TABLE contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
+        self._command("ALTER TABLE apple_contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
+        self._drop_google_only_contacts_mart()
+        rebuild_apple_messages_view = self._prepare_contacts_view_replacement()
         self._ensure_clean_contacts_view()
+        self._ensure_clean_contact_points_view()
+        if rebuild_apple_messages_view:
+            messages = query_relation("apple_messages").with_namespace(self._schema)
+            if self._physical_table_exists(schema=messages.schema, table=messages.name):
+                self._ensure_clean_apple_messages_view()
         self._ensure_search_views_if_possible()
+
+    def ensure_apple_contacts_tables(self) -> None:
+        self.ensure_contacts_tables()
 
     def ensure_plaid_tables(self) -> None:
         self._ensure_table_group(
@@ -2034,6 +2071,7 @@ class PostgresWarehouse:
         self._ensure_search_views_if_possible()
 
     def ensure_apple_messages_tables(self) -> None:
+        self.ensure_contacts_tables()
         self._ensure_table_group(
             [
                 "apple_message_handles",
@@ -2044,6 +2082,7 @@ class PostgresWarehouse:
                 "apple_message_attachments",
             ]
         )
+        self._ensure_clean_apple_messages_view()
         self._ensure_search_views_if_possible()
 
     def ensure_whatsapp_tables(self) -> None:
@@ -5160,6 +5199,9 @@ class PostgresWarehouse:
     def insert_contact_cards(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("contact_cards", rows, CONTACT_CARD_COLUMNS)
 
+    def insert_apple_contact_cards(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("apple_contact_cards", rows, CONTACT_CARD_COLUMNS)
+
     def load_contact_sync_state(self) -> dict[tuple[str, str, str, str], dict[str, Any]]:
         columns = CONTACT_SYNC_STATE_COLUMNS
         rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM contact_sync_state")
@@ -7290,7 +7332,185 @@ class PostgresWarehouse:
                 nicknames
             FROM contact_cards
             WHERE is_deleted = 0
+            UNION ALL
+            SELECT
+                source,
+                account,
+                source_kind,
+                address_book_id,
+                card_id,
+                etag,
+                source_uid,
+                display_name,
+                given_name,
+                family_name,
+                organization,
+                job_title,
+                primary_email,
+                primary_phone,
+                emails,
+                phones,
+                addresses,
+                organizations,
+                urls,
+                groups,
+                dates,
+                photos,
+                notes,
+                source_updated_at,
+                synced_at,
+                raw_json,
+                nicknames
+            FROM apple_contact_cards
+            WHERE is_deleted = 0
             """
+        )
+
+    def _drop_google_only_contacts_mart(self) -> None:
+        legacy_schema = self.physical_schema_name("marts")
+        self._raw_command(
+            f"DROP VIEW IF EXISTS {_identifier(legacy_schema)}.{_identifier('google_contacts')}"
+        )
+
+    def _prepare_contacts_view_replacement(self) -> bool:
+        expected_columns = (
+            "source",
+            "account",
+            "source_kind",
+            "address_book_id",
+            "card_id",
+            "etag",
+            "source_uid",
+            "display_name",
+            "given_name",
+            "family_name",
+            "organization",
+            "job_title",
+            "primary_email",
+            "primary_phone",
+            "emails",
+            "phones",
+            "addresses",
+            "organizations",
+            "urls",
+            "groups",
+            "dates",
+            "photos",
+            "notes",
+            "source_updated_at",
+            "synced_at",
+            "raw_json",
+            "nicknames",
+        )
+        contacts = query_relation("clean_contacts").with_namespace(self._schema)
+        actual_columns = tuple(
+            row[0]
+            for row in self._query(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (contacts.schema, contacts.name),
+            )
+        )
+        if not actual_columns or actual_columns == expected_columns:
+            return False
+
+        # contact_points depends on contacts, and apple_messages depends on
+        # contact_points. Remove only these derived views before replacing a
+        # drifted contacts view; both are recreated in this ensure path.
+        for logical_name in ("clean_apple_messages", "clean_contact_points"):
+            relation = query_relation(logical_name).with_namespace(self._schema)
+            self._raw_command(
+                f"DROP VIEW IF EXISTS {_identifier(relation.schema)}.{_identifier(relation.name)}"
+            )
+        return True
+
+    def _ensure_clean_contact_points_view(self) -> None:
+        self._ensure_view(
+            "clean_contact_points",
+            """
+            CREATE OR REPLACE VIEW clean_contact_points AS
+            SELECT DISTINCT
+                c.source,
+                c.account,
+                c.source_kind,
+                c.address_book_id,
+                c.card_id,
+                c.display_name,
+                c.organization,
+                c.source_updated_at,
+                points.point_type,
+                points.point_value,
+                points.point_label,
+                CASE
+                    WHEN points.point_type = 'email' THEN lower(trim(points.point_value))
+                    ELSE CASE
+                        WHEN length(regexp_replace(points.point_value, '[^0-9]', '', 'g')) = 10
+                            THEN '1' || regexp_replace(points.point_value, '[^0-9]', '', 'g')
+                        ELSE regexp_replace(points.point_value, '[^0-9]', '', 'g')
+                    END
+                END AS normalized_value
+            FROM clean_contacts c
+            CROSS JOIN LATERAL (
+                SELECT 'email'::text AS point_type,
+                       value->>'value' AS point_value,
+                       COALESCE(value->>'type', value->>'label', '') AS point_label
+                FROM jsonb_array_elements(COALESCE(c.emails, '[]'::jsonb)) value
+                WHERE COALESCE(value->>'value', '') <> ''
+                UNION
+                SELECT 'email', c.primary_email, 'primary'
+                WHERE c.primary_email <> ''
+                UNION
+                SELECT 'phone',
+                       COALESCE(NULLIF(value->>'canonicalForm', ''), value->>'value'),
+                       COALESCE(value->>'type', value->>'label', '')
+                FROM jsonb_array_elements(COALESCE(c.phones, '[]'::jsonb)) value
+                WHERE COALESCE(NULLIF(value->>'canonicalForm', ''), value->>'value', '') <> ''
+                UNION
+                SELECT 'phone', c.primary_phone, 'primary'
+                WHERE c.primary_phone <> ''
+            ) points
+            WHERE points.point_value <> ''
+            """,
+        )
+
+    def _ensure_clean_apple_messages_view(self) -> None:
+        self._ensure_view(
+            "clean_apple_messages",
+            """
+            CREATE OR REPLACE VIEW clean_apple_messages AS
+            SELECT
+                m.*,
+                COALESCE(h.address, '') AS sender_address,
+                CASE
+                    WHEN m.is_from_me = 1 THEN 'me'
+                    ELSE COALESCE(NULLIF(resolved.display_name, ''), NULLIF(h.address, ''), m.handle_id)
+                END AS sender_name,
+                COALESCE(resolved.source, '') AS contact_source,
+                COALESCE(resolved.card_id, '') AS contact_card_id
+            FROM apple_messages m
+            LEFT JOIN apple_message_handles h
+              ON h.account = m.account AND h.handle_id = m.handle_id
+            LEFT JOIN LATERAL (
+                SELECT cp.source, cp.card_id, cp.display_name
+                FROM clean_contact_points cp
+                WHERE cp.point_type = CASE WHEN h.address LIKE '%@%' THEN 'email' ELSE 'phone' END
+                  AND cp.normalized_value = CASE
+                      WHEN h.address LIKE '%@%' THEN lower(trim(h.address))
+                      WHEN length(regexp_replace(h.address, '[^0-9]', '', 'g')) = 10
+                          THEN '1' || regexp_replace(h.address, '[^0-9]', '', 'g')
+                      ELSE regexp_replace(h.address, '[^0-9]', '', 'g')
+                  END
+                ORDER BY
+                    (cp.source = 'apple_contacts') DESC,
+                    cp.source_updated_at DESC,
+                    cp.card_id
+                LIMIT 1
+            ) resolved ON TRUE
+            """,
         )
 
     def _ensure_clean_whatsapp_messages_view(self) -> None:
@@ -7345,7 +7565,18 @@ class PostgresWarehouse:
             FROM whatsapp_messages m
             LEFT JOIN whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id
             LEFT JOIN whatsapp_contacts cc ON cc.account = m.account AND cc.jid = m.chat_id
-            LEFT JOIN whatsapp_contacts ct ON ct.account = m.account AND ct.jid = m.sender_jid
+            LEFT JOIN LATERAL (
+                SELECT p.phone_jid
+                FROM whatsapp_chat_participants p
+                WHERE p.account = m.account
+                  AND p.phone_jid <> ''
+                  AND (p.participant_jid = m.sender_jid OR p.lid_jid = m.sender_jid)
+                ORDER BY p.ingested_at DESC, p.chat_id
+                LIMIT 1
+            ) sender_alias ON TRUE
+            LEFT JOIN whatsapp_contacts ct
+              ON ct.account = m.account
+             AND ct.jid = COALESCE(NULLIF(sender_alias.phone_jid, ''), m.sender_jid)
             """
         )
 

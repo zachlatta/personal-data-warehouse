@@ -311,6 +311,15 @@ class IngestClient:
             params={"exported_at": exported_at},
         )
 
+    # --- apple contacts -----------------------------------------------------
+    def upload_apple_contacts_batch(self, gzip_bytes: bytes, *, exported_at: str) -> StoredObjectDict:
+        return self._post(
+            "/ingest/apple-contacts/batch",
+            body=gzip_bytes,
+            content_type="application/gzip",
+            params={"exported_at": exported_at},
+        )
+
     def upload_apple_messages_attachment(
         self,
         content: bytes,

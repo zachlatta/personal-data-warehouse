@@ -61,6 +61,7 @@ packages = [
     "src/personal_data_warehouse_claude_desktop",
     "src/personal_data_warehouse_alice_voice_recordings",
     "src/personal_data_warehouse_apple_messages",
+    "src/personal_data_warehouse_apple_contacts",
     "src/personal_data_warehouse_apple_notes",
     "src/personal_data_warehouse_photos",
     "src/personal_data_warehouse_voice_memos",

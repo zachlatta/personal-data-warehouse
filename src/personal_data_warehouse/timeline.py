@@ -754,7 +754,7 @@ _APPLE_MESSAGE = _simple_adapter(
     # grouped form materialized every chat's aggregate on every incremental
     # tick regardless of how few messages changed. The probes ride
     # apple_message_chat_messages_message_idx and the chat_handles PK.
-    from_sql="""apple_messages t
+    from_sql="""clean_apple_messages t
     LEFT JOIN apple_message_handles h ON h.account = t.account AND h.handle_id = t.handle_id
     LEFT JOIN LATERAL (
         SELECT min(chat_id) AS chat_id
@@ -809,8 +809,9 @@ _APPLE_MESSAGE = _simple_adapter(
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
     ingest_ts="GREATEST(t.ingested_at, COALESCE(att.attachment_ingest_ts, t.ingested_at))",
     actor=(
+        "COALESCE(NULLIF(t.sender_name, ''), "
         "CASE WHEN t.is_from_me = 1 THEN 'me' "
-        "ELSE COALESCE(NULLIF(h.address, ''), NULLIF(t.handle_id, ''), '') END"
+        "ELSE COALESCE(NULLIF(h.address, ''), NULLIF(t.handle_id, ''), '') END)"
     ),
     title="t.subject",
     snippet=_snippet(
@@ -826,7 +827,7 @@ _APPLE_MESSAGE = _simple_adapter(
     ),
     context=(
         "COALESCE(NULLIF(c.display_name, ''), NULLIF(c.chat_identifier, ''), "
-        "NULLIF(h.address, ''), t.service)"
+        "NULLIF(t.sender_name, ''), NULLIF(h.address, ''), t.service)"
     ),
     source_pk="jsonb_build_object('account', t.account, 'message_id', t.message_id)",
     metadata=(
@@ -842,8 +843,8 @@ _APPLE_MESSAGE = _simple_adapter(
     search_text=_search_concat(
         "t.subject",
         "t.body_text",
-        "COALESCE(NULLIF(c.display_name, ''), NULLIF(c.chat_identifier, ''), NULLIF(h.address, ''), t.service)",
-        "CASE WHEN t.is_from_me = 1 THEN 'me' ELSE COALESCE(NULLIF(h.address, ''), NULLIF(t.handle_id, ''), '') END",
+        "COALESCE(NULLIF(c.display_name, ''), NULLIF(c.chat_identifier, ''), NULLIF(t.sender_name, ''), NULLIF(h.address, ''), t.service)",
+        "COALESCE(NULLIF(t.sender_name, ''), CASE WHEN t.is_from_me = 1 THEN 'me' ELSE COALESCE(NULLIF(h.address, ''), NULLIF(t.handle_id, ''), '') END)",
         "att.attachment_search_text",
     ),
     # chat.db style: 45 = 1:1 conversation, 43 = group. The roster counts
@@ -909,7 +910,18 @@ _WHATSAPP_MESSAGE = _simple_adapter(
     kind="message",
     from_sql="""whatsapp_messages t
     LEFT JOIN whatsapp_chats c ON c.account = t.account AND c.chat_id = t.chat_id
-    LEFT JOIN whatsapp_contacts ct ON ct.account = t.account AND ct.jid = t.sender_jid
+    LEFT JOIN LATERAL (
+        SELECT p.phone_jid
+        FROM whatsapp_chat_participants p
+        WHERE p.account = t.account
+          AND p.phone_jid <> ''
+          AND (p.participant_jid = t.sender_jid OR p.lid_jid = t.sender_jid)
+        ORDER BY p.ingested_at DESC, p.chat_id
+        LIMIT 1
+    ) sender_alias ON TRUE
+    LEFT JOIN whatsapp_contacts ct
+      ON ct.account = t.account
+     AND ct.jid = COALESCE(NULLIF(sender_alias.phone_jid, ''), t.sender_jid)
     LEFT JOIN whatsapp_contacts chat_ct ON chat_ct.account = t.account AND chat_ct.jid = t.chat_id
     LEFT JOIN LATERAL (
         -- NULLIF keeps the no-roster case NULL (the priority CASE reads an
@@ -1238,38 +1250,46 @@ _PHOTO = _simple_adapter(
     refresh_hours=48,
 )
 
-_CONTACT_UPDATE = _simple_adapter(
-    name="contact_update",
-    source_table="contact_cards",
-    source="contacts",
-    kind="contact_update",
-    from_sql="contact_cards t",
-    event_id="concat_ws('|', t.source, t.account, t.source_kind, t.address_book_id, t.card_id)",
-    event_ts=_real_ts("t.source_updated_at", "t.synced_at"),
-    ingest_ts="t.synced_at",
-    title=(
-        "COALESCE(NULLIF(t.display_name, ''), NULLIF(t.organization, ''), "
-        "NULLIF(t.primary_email, ''), t.card_id)"
-    ),
-    context="t.account",
-    source_pk=(
-        "jsonb_build_object('source', t.source, 'account', t.account, 'source_kind', t.source_kind, "
-        "'address_book_id', t.address_book_id, 'card_id', t.card_id)"
-    ),
-    metadata=(
-        "jsonb_build_object("
-        "'organization', t.organization, "
-        "'job_title', t.job_title, "
-        "'primary_email', t.primary_email, "
-        "'primary_phone', t.primary_phone, "
-        "'deleted', t.is_deleted <> 0)"
-    ),
-    search_text=_search_concat(
-        "t.display_name", "t.organization", "t.job_title", "t.primary_email", "t.primary_phone",
-        "t.notes", "t.emails", "t.phones", "t.addresses", "t.urls", "t.nicknames"
-    ),
-    # Contact-card churn is sync machinery, not traffic aimed at Zach.
-    priority=str(TIMELINE_PRIORITY_BACKGROUND),
+def _contact_update_adapter(*, name: str, source_table: str) -> TimelineAdapter:
+    return _simple_adapter(
+        name=name,
+        source_table=source_table,
+        source="contacts",
+        kind=name,
+        from_sql=f"{source_table} t",
+        event_id="concat_ws('|', t.source, t.account, t.source_kind, t.address_book_id, t.card_id)",
+        event_ts=_real_ts("t.source_updated_at", "t.synced_at"),
+        ingest_ts="t.synced_at",
+        title=(
+            "COALESCE(NULLIF(t.display_name, ''), NULLIF(t.organization, ''), "
+            "NULLIF(t.primary_email, ''), t.card_id)"
+        ),
+        context="t.account",
+        source_pk=(
+            "jsonb_build_object('source', t.source, 'account', t.account, 'source_kind', t.source_kind, "
+            "'address_book_id', t.address_book_id, 'card_id', t.card_id)"
+        ),
+        metadata=(
+            "jsonb_build_object("
+            "'organization', t.organization, "
+            "'job_title', t.job_title, "
+            "'primary_email', t.primary_email, "
+            "'primary_phone', t.primary_phone, "
+            "'deleted', t.is_deleted <> 0)"
+        ),
+        search_text=_search_concat(
+            "t.display_name", "t.organization", "t.job_title", "t.primary_email", "t.primary_phone",
+            "t.notes", "t.emails", "t.phones", "t.addresses", "t.urls", "t.nicknames"
+        ),
+        # Contact-card churn is sync machinery, not traffic aimed at Zach.
+        priority=str(TIMELINE_PRIORITY_BACKGROUND),
+    )
+
+
+_CONTACT_UPDATE = _contact_update_adapter(name="contact_update", source_table="contact_cards")
+_APPLE_CONTACT_UPDATE = _contact_update_adapter(
+    name="apple_contact_update",
+    source_table="apple_contact_cards",
 )
 
 _WHOOP_CYCLE = _simple_adapter(
@@ -1776,6 +1796,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _DRIVE_FILE,
     _PHOTO,
     _CONTACT_UPDATE,
+    _APPLE_CONTACT_UPDATE,
     _WHOOP_CYCLE,
     _WHOOP_RECOVERY,
     _WHOOP_SLEEP,
@@ -1847,6 +1868,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "calendar_sync_state": _state("calendar sync cursor"),
     # Contacts
     "contact_cards": _events(),
+    "apple_contact_cards": _events(),
     "contact_sync_state": _state("contacts sync cursor"),
     # Voice memos
     "apple_voice_memos_files": _events(),

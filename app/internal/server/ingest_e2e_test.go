@@ -257,6 +257,12 @@ func e2eCases() []e2eCase {
 			wantProps: map[string]string{"pdw_kind": "agent_sessions_export_batch", "pdw_stage": "inbox", "pdw_source": "agent_sessions", "batch_sha256": sha(batchBody)},
 		},
 		{
+			name: "apple-contacts/batch", endpoint: "/ingest/apple-contacts/batch", body: batchBody,
+			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
+			wantName: "20260619T123456Z-" + sha(batchBody) + ".jsonl.gz", wantMime: "application/gzip",
+			wantProps: map[string]string{"pdw_kind": "apple_contact_export_batch", "pdw_stage": "inbox", "pdw_source": "apple_contacts", "batch_sha256": sha(batchBody)},
+		},
+		{
 			name: "apple-messages/batch", endpoint: "/ingest/apple-messages/batch", body: batchBody,
 			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
 			wantName: "20260619T123456Z-" + sha(batchBody) + ".jsonl.gz", wantMime: "application/gzip",

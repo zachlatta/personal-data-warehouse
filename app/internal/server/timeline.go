@@ -255,6 +255,7 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "google_drive", kind: "file_change"},
 	{source: "photos", kind: "photo"},
 	{source: "contacts", kind: "contact_update"},
+	{source: "contacts", kind: "apple_contact_update"},
 	{source: "whoop", kind: "health_cycle"},
 	{source: "whoop", kind: "recovery"},
 	{source: "whoop", kind: "sleep"},
