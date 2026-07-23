@@ -117,6 +117,10 @@ class TimelineAdapter:
     incremental_sql: str
     max_ingest_sql: str
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE
+    # Zero means drain the incremental watermark until caught up. A bounded
+    # value lets unusually broad dimension invalidations make steady progress
+    # without starving later adapters and their refresh windows.
+    max_incremental_batches_per_run: int = 0
     # When > 0, every sync pass re-walks rows whose event_ts falls in the last
     # N hours and re-upserts them. Classification signals that look forward or
     # arrive late (Zach replying in a chat promotes the surrounding window;
@@ -152,7 +156,9 @@ def _simple_adapter(
     priority: str = str(TIMELINE_PRIORITY_CC),
     where: str = "TRUE",
     changed_join_sql: str = "",
+    changed_join_anchor: str = "",
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE,
+    max_incremental_batches_per_run: int = 0,
     refresh_hours: float = 0.0,
 ) -> TimelineAdapter:
     if search_text is None:
@@ -200,7 +206,20 @@ def _simple_adapter(
     # on every tick. Adapters with that shape pass changed_join_sql — an
     # incremental-only inner join to a watermark-driven candidate set covering
     # every input of ingest_ts — so per-tick cost scales with what changed.
-    incremental_from = from_sql if not changed_join_sql else f"{from_sql}\n    {changed_join_sql}"
+    incremental_from = from_sql
+    if changed_join_sql:
+        if changed_join_anchor:
+            if from_sql.count(changed_join_anchor) != 1:
+                raise ValueError(
+                    f"changed join anchor must occur exactly once: {changed_join_anchor!r}"
+                )
+            incremental_from = from_sql.replace(
+                changed_join_anchor,
+                f"{changed_join_anchor}\n    {changed_join_sql}",
+                1,
+            )
+        else:
+            incremental_from = f"{from_sql}\n    {changed_join_sql}"
     incremental_sql = f"""
         {build_select(incremental_from)}
           AND ({ingest_ts}) >= %(watermark_ts)s
@@ -219,6 +238,7 @@ def _simple_adapter(
         incremental_sql=incremental_sql,
         max_ingest_sql=max_ingest_sql,
         batch_size=batch_size,
+        max_incremental_batches_per_run=max_incremental_batches_per_run,
         refresh_hours=refresh_hours,
     )
 
@@ -817,24 +837,38 @@ _APPLE_MESSAGE = _simple_adapter(
         JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
         WHERE e.updated_at >= %(watermark_ts)s
         UNION
+        (
         -- Contact edits can add, remove, or replace an address, so the old
         -- affected point is not necessarily present after the upsert. Re-emit
         -- all incoming messages when either contact source changes because
         -- contact batches are sparse and this is the only deletion-safe
-        -- invalidation.
-        SELECT m.account, m.message_id FROM apple_messages m
+        -- invalidation. Page this branch before the expensive message joins:
+        -- without the inner keyset LIMIT, every 2,000-row page normalized all
+        -- ~100,000 incoming messages before the outer LIMIT.
+        SELECT m.account, m.message_id
+        FROM apple_messages m
+        CROSS JOIN (
+            SELECT GREATEST(
+                COALESCE(
+                    (SELECT max(synced_at) FROM contact_cards),
+                    TIMESTAMPTZ '1970-01-01'
+                ),
+                COALESCE(
+                    (SELECT max(synced_at) FROM apple_contact_cards),
+                    TIMESTAMPTZ '1970-01-01'
+                )
+            ) AS latest_synced_at
+        ) identity_sync
         WHERE m.is_from_me = 0
           AND (
-              EXISTS (
-                  SELECT 1 FROM contact_cards
-                  WHERE synced_at >= %(watermark_ts)s
-              )
-              OR EXISTS (
-                  SELECT 1 FROM apple_contact_cards
-                  WHERE synced_at >= %(watermark_ts)s
-              )
-          )
+              identity_sync.latest_synced_at,
+              concat_ws('|', m.account, m.message_id)
+          ) > (%(watermark_ts)s, %(watermark_id)s)
+        ORDER BY identity_sync.latest_synced_at, concat_ws('|', m.account, m.message_id)
+        LIMIT %(limit)s
+        )
     ) pdw_changed ON pdw_changed.account = t.account AND pdw_changed.message_id = t.message_id""",
+    changed_join_anchor="clean_apple_messages t",
     event_id="concat_ws('|', t.account, t.message_id)",
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
     ingest_ts=(
@@ -929,7 +963,8 @@ _APPLE_MESSAGE = _simple_adapter(
         "               AND z.is_from_me = 1) THEN 2 "
         "ELSE 3 END"
     ),
-    refresh_hours=48,
+    max_incremental_batches_per_run=2,
+    refresh_hours=168,
 )
 
 _WHATSAPP_MESSAGE_SNIPPET = (
@@ -2308,6 +2343,7 @@ class TimelineSyncEngine:
 
     def _run_incremental(self, adapter: TimelineAdapter, state: _AdapterState, deadline: float | None) -> int:
         total = 0
+        batches = 0
         limit = self._batch_limit(adapter)
         while True:
             rows = self._fetch(
@@ -2327,7 +2363,15 @@ class TimelineSyncEngine:
             self._save_state(adapter, state)
             self._bump_counter(adapter, "incremental_rows", len(rows))
             total += len(rows)
-            if len(rows) < limit or _past(deadline):
+            batches += 1
+            if (
+                len(rows) < limit
+                or _past(deadline)
+                or (
+                    adapter.max_incremental_batches_per_run > 0
+                    and batches >= adapter.max_incremental_batches_per_run
+                )
+            ):
                 break
         return total
 

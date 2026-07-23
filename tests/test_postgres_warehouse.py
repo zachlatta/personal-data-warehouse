@@ -1305,14 +1305,15 @@ def test_timeline_reemits_old_apple_message_when_contact_identity_changes(
             _default_row(
                 APPLE_MESSAGE_COLUMNS,
                 account=account,
-                message_id="message-1",
-                message_rowid=1,
+                message_id=f"message-{index}",
+                message_rowid=index,
                 handle_id="handle-1",
                 body_text="hello",
-                message_at=base,
-                ingested_at=base,
-                sync_version=1,
+                message_at=base + timedelta(minutes=index),
+                ingested_at=base + timedelta(minutes=index),
+                sync_version=index,
             )
+            for index in range(1, 6)
         ]
     )
 
@@ -1321,12 +1322,12 @@ def test_timeline_reemits_old_apple_message_when_contact_identity_changes(
         source_schema=warehouse._schema,
         dest_schema=warehouse._schema,
         adapters=[adapter_by_name("apple_message")],
+        batch_size=2,
     )
     try:
         engine.run()
         assert warehouse._query(
-            "SELECT actor FROM timeline_events WHERE adapter='apple_message' AND event_id=%s",
-            (f"{account}|message-1",),
+            "SELECT DISTINCT actor FROM timeline_events WHERE adapter='apple_message'"
         ) == [(phone,)]
 
         apple_row = _contact_card_row(
@@ -1348,13 +1349,19 @@ def test_timeline_reemits_old_apple_message_when_contact_identity_changes(
         warehouse.insert_apple_contact_cards([apple_row])
 
         engine.run()
+        assert warehouse._query(
+            "SELECT actor, count(*) FROM timeline_events "
+            "WHERE adapter='apple_message' GROUP BY actor ORDER BY actor"
+        ) == [(phone, 1), ("Example Person", 4)]
+
+        engine.run()
     finally:
         engine.close()
 
     assert warehouse._query(
-        "SELECT actor FROM timeline_events WHERE adapter='apple_message' AND event_id=%s",
-        (f"{account}|message-1",),
-    ) == [("Example Person",)]
+        "SELECT actor, count(*) FROM timeline_events "
+        "WHERE adapter='apple_message' GROUP BY actor"
+    ) == [("Example Person", 5)]
 
 
 def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: PostgresWarehouse) -> None:

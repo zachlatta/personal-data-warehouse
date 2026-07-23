@@ -191,7 +191,15 @@ def test_apple_message_contact_changes_invalidate_message_history():
     assert "contact_cards" in adapter.incremental_sql
     assert "apple_contact_cards" in adapter.incremental_sql
     assert "contact_sync.latest_synced_at" in adapter.incremental_sql
+    assert "identity_sync.latest_synced_at" in adapter.incremental_sql
     assert "m.is_from_me = 0" in adapter.incremental_sql
+    assert adapter.incremental_sql.count("LIMIT %(limit)s") == 2
+    assert adapter.incremental_sql.index("pdw_changed") < adapter.incremental_sql.index(
+        "apple_message_handles h"
+    )
+    assert adapter.batch_size == 2_000
+    assert adapter.max_incremental_batches_per_run == 2
+    assert adapter.refresh_hours == 168
 
 
 def test_upsert_sql_bumps_seq_only_on_content_change():
