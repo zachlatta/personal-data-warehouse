@@ -31,7 +31,7 @@ from personal_data_warehouse.schema import (
     VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
 )
 from personal_data_warehouse.relations import query_relation
-from personal_data_warehouse.timeline import TimelineSyncEngine
+from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
     ATTACHMENT_BACKFILL_STATE_COLUMNS,
@@ -1270,6 +1270,91 @@ def test_canonical_contacts_and_apple_messages_resolve_apple_contact(
 
     assert contacts == [("apple_contacts", "Example Person")]
     assert resolved == [("Example Person", "+15551234567")]
+
+
+def test_timeline_reemits_old_apple_message_when_contact_identity_changes(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_contacts_tables()
+    warehouse.ensure_apple_contacts_tables()
+    warehouse.ensure_apple_messages_tables()
+    warehouse.ensure_file_attachment_enrichment_tables()
+    warehouse.ensure_timeline_tables()
+    base = datetime(2025, 1, 1, 12, tzinfo=UTC)
+    account = "owner@example.test"
+    phone = "+15551234567"
+    warehouse.insert_apple_message_handles(
+        [
+            {
+                "account": account,
+                "handle_id": "handle-1",
+                "handle_rowid": 1,
+                "address": phone,
+                "country": "US",
+                "service": "iMessage",
+                "uncanonicalized_id": "",
+                "person_centric_id": "",
+                "raw_metadata_json": "{}",
+                "ingested_at": base,
+                "sync_version": 1,
+            }
+        ]
+    )
+    warehouse.insert_apple_messages(
+        [
+            _default_row(
+                APPLE_MESSAGE_COLUMNS,
+                account=account,
+                message_id="message-1",
+                message_rowid=1,
+                handle_id="handle-1",
+                body_text="hello",
+                message_at=base,
+                ingested_at=base,
+                sync_version=1,
+            )
+        ]
+    )
+
+    engine = TimelineSyncEngine(
+        source_url=_postgres_url(),
+        source_schema=warehouse._schema,
+        dest_schema=warehouse._schema,
+        adapters=[adapter_by_name("apple_message")],
+    )
+    try:
+        engine.run()
+        assert warehouse._query(
+            "SELECT actor FROM timeline_events WHERE adapter='apple_message' AND event_id=%s",
+            (f"{account}|message-1",),
+        ) == [(phone,)]
+
+        apple_row = _contact_card_row(
+            card_id="apple-contact-1",
+            display_name="Example Person",
+            primary_phone=phone,
+            phones=[{"value": phone, "metadata": {"primary": True}}],
+            sync_version=2,
+        )
+        apple_row.update(
+            source="apple_contacts",
+            source_kind="apple_contacts",
+            account=account,
+            address_book_id="icloud-source",
+            source_uid="apple-contact-1",
+            synced_at=base + timedelta(days=1),
+            source_updated_at=base + timedelta(days=1),
+        )
+        warehouse.insert_apple_contact_cards([apple_row])
+
+        engine.run()
+    finally:
+        engine.close()
+
+    assert warehouse._query(
+        "SELECT actor FROM timeline_events WHERE adapter='apple_message' AND event_id=%s",
+        (f"{account}|message-1",),
+    ) == [("Example Person",)]
 
 
 def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: PostgresWarehouse) -> None:

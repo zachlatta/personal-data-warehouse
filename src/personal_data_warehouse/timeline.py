@@ -793,7 +793,19 @@ _APPLE_MESSAGE = _simple_adapter(
             FROM apple_message_attachments a
             WHERE a.account = t.account AND a.message_id = t.message_id AND a.is_missing = 0
         ) labels
-    ) att_labels ON TRUE""",
+    ) att_labels ON TRUE
+    CROSS JOIN (
+        SELECT GREATEST(
+            COALESCE(
+                (SELECT max(synced_at) FROM contact_cards),
+                TIMESTAMPTZ '1970-01-01'
+            ),
+            COALESCE(
+                (SELECT max(synced_at) FROM apple_contact_cards),
+                TIMESTAMPTZ '1970-01-01'
+            )
+        ) AS latest_synced_at
+    ) contact_sync""",
     changed_join_sql="""JOIN (
         SELECT account, message_id FROM apple_messages
         WHERE ingested_at >= %(watermark_ts)s
@@ -804,10 +816,34 @@ _APPLE_MESSAGE = _simple_adapter(
         SELECT a.account, a.message_id FROM apple_message_attachments a
         JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
         WHERE e.updated_at >= %(watermark_ts)s
+        UNION
+        -- Contact edits can add, remove, or replace an address, so the old
+        -- affected point is not necessarily present after the upsert. Re-emit
+        -- all incoming messages when either contact source changes because
+        -- contact batches are sparse and this is the only deletion-safe
+        -- invalidation.
+        SELECT m.account, m.message_id FROM apple_messages m
+        WHERE m.is_from_me = 0
+          AND (
+              EXISTS (
+                  SELECT 1 FROM contact_cards
+                  WHERE synced_at >= %(watermark_ts)s
+              )
+              OR EXISTS (
+                  SELECT 1 FROM apple_contact_cards
+                  WHERE synced_at >= %(watermark_ts)s
+              )
+          )
     ) pdw_changed ON pdw_changed.account = t.account AND pdw_changed.message_id = t.message_id""",
     event_id="concat_ws('|', t.account, t.message_id)",
     event_ts=_real_ts("t.message_at", "t.ingested_at"),
-    ingest_ts="GREATEST(t.ingested_at, COALESCE(att.attachment_ingest_ts, t.ingested_at))",
+    ingest_ts=(
+        "GREATEST("
+        "t.ingested_at, "
+        "COALESCE(att.attachment_ingest_ts, t.ingested_at), "
+        "CASE WHEN t.is_from_me = 0 THEN contact_sync.latest_synced_at ELSE t.ingested_at END"
+        ")"
+    ),
     actor=(
         "COALESCE(NULLIF(t.sender_name, ''), "
         "CASE WHEN t.is_from_me = 1 THEN 'me' "

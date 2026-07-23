@@ -185,6 +185,15 @@ def test_heavy_adapters_bound_incremental_scans_to_changed_candidates():
         assert "pdw_changed" not in adapter.max_ingest_sql, name
 
 
+def test_apple_message_contact_changes_invalidate_message_history():
+    adapter = adapter_by_name("apple_message")
+
+    assert "contact_cards" in adapter.incremental_sql
+    assert "apple_contact_cards" in adapter.incremental_sql
+    assert "contact_sync.latest_synced_at" in adapter.incremental_sql
+    assert "m.is_from_me = 0" in adapter.incremental_sql
+
+
 def test_upsert_sql_bumps_seq_only_on_content_change():
     sql = timeline_upsert_sql()
     assert "ON CONFLICT (adapter, event_id) DO UPDATE" in sql
