@@ -1273,12 +1273,14 @@ def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehous
 
     index_names = _index_names(warehouse, "gmail_messages")
     assert "gmail_messages_internal_date_idx" in index_names
-    # Structured predicates (sender/subject lookups) keep their indexes; the
-    # body/snippet trigram family is retired — body text is searched through
-    # the timeline document (search.search_text / search.search_text_exact).
+    # Structured predicates keep their indexes: sender/subject lookups, and
+    # snippet because the voice-memo identity hints OR it with from/subject (a
+    # bitmap-OR plan needs every arm indexed). The body trigram family is
+    # retired — body text is searched through the timeline document
+    # (search.search_text / search.search_text_exact).
     assert "gmail_messages_from_trgm_idx" in index_names
     assert "gmail_messages_subject_trgm_idx" in index_names
-    assert "gmail_messages_snippet_trgm_idx" not in index_names
+    assert "gmail_messages_snippet_trgm_idx" in index_names
     assert "gmail_messages_body_text_trgm_idx" not in index_names
     assert "gmail_messages_body_markdown_trgm_idx" not in index_names
     assert "gmail_messages_body_html_trgm_idx" not in index_names

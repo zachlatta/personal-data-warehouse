@@ -602,6 +602,17 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_subject_trgm_idx ON gmail_messages USING gin (subject public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
+    # Kept alongside from/subject: the voice-memo speaker-identity hints scan
+    # gmail with (from_address ILIKE .. OR subject ILIKE .. OR snippet ILIKE
+    # ..), and a bitmap-OR plan needs every arm indexed — one unindexed arm
+    # degrades the whole query to a full 23 GB scan inside the enrichment
+    # pipeline (apple_voice_memos_enrichment.py).
+    IndexSpec(
+        "gmail_messages_snippet_trgm_idx",
+        "gmail_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_snippet_trgm_idx ON gmail_messages USING gin (snippet public.gin_trgm_ops)",
+        requires_pg_trgm=True,
+    ),
     IndexSpec(
         "gmail_attachments_message_idx",
         "gmail_attachments",
@@ -1027,7 +1038,8 @@ POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
     # while the timeline search document covers the same text through
     # search.search_text() / search.search_text_exact(). Raw tables serve
     # structured predicates; text search belongs to the timeline layer.
-    ("gmail_messages_snippet_trgm_idx", "gmail_messages"),
+    # (from/subject/snippet trgm stay: the voice-memo identity hints and other
+    # structured sender/subject lookups ride them.)
     ("gmail_messages_body_text_trgm_idx", "gmail_messages"),
     ("gmail_messages_body_markdown_trgm_idx", "gmail_messages"),
     ("gmail_messages_body_html_trgm_idx", "gmail_messages"),
