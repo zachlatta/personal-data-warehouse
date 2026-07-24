@@ -92,10 +92,10 @@ jobs:
     runs-on: >-
       ${{ github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.full_name != github.repository &&
-          'ubuntu-latest' || 'rotom-builder' }}
+          'ubuntu-latest' ||
+          format('rotom-builder-pdw-cli-{0}-{1}', matrix.goos, matrix.goarch) }}
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - goos: linux
