@@ -2269,7 +2269,7 @@ class PostgresWarehouse:
             """
         )
 
-    def _migrate_timeline_priority_to_enum(self, timeline_rel: Any) -> None:
+    def _migrate_timeline_priority_to_enum(self, timeline_rel: Any, *, batch_size: int = 50000) -> None:
         """One-time, resumable ``bigint`` -> ``timeline_priority`` migration.
 
         Batched and non-locking so it never rewrites the whole (multi-GB) table
@@ -2304,31 +2304,38 @@ class PostgresWarehouse:
                 "ADD COLUMN priority_enum timeline_priority NOT NULL DEFAULT 'unclassified'"
             )
 
-        # Backfill legacy tiers in bounded batches. IS DISTINCT FROM is
-        # self-terminating (legacy 0 -> 'unclassified' already matches the
-        # default) and doubles as the resume cursor across restarts.
+        # Backfill legacy tiers by walking the primary key once (keyset
+        # pagination). A `WHERE priority_enum IS DISTINCT FROM ... LIMIT` batch
+        # re-seq-scans the whole table every iteration (there is no index on the
+        # new column), which is O(rows^2) on the 40M+ row production table.
+        # Walking (adapter, event_id) ranges rides the primary-key index, so the
+        # total cost is O(rows); each range UPDATE stays idempotent
+        # (IS DISTINCT FROM) so already-migrated rows (a resumed or partly
+        # migrated table) are cheap no-ops and the walk is safe to restart.
         map_case = (
             "(CASE priority WHEN 1 THEN 'self' WHEN 2 THEN 'direct' "
             "WHEN 3 THEN 'cc' WHEN 4 THEN 'noise' WHEN 5 THEN 'background' "
             "ELSE 'unclassified' END)::timeline_priority"
         )
-        while (
-            self._command_rowcount(
-                f"""
-                WITH batch AS (
-                    SELECT ctid FROM timeline_events
-                    WHERE priority_enum IS DISTINCT FROM {map_case}
-                    LIMIT 50000
-                )
-                UPDATE timeline_events e
-                SET priority_enum = {map_case}
-                FROM batch
-                WHERE e.ctid = batch.ctid
-                """
+        cursor_adapter, cursor_event_id = "", ""
+        while True:
+            batch = self._query(
+                "SELECT adapter, event_id FROM timeline_events "
+                "WHERE (adapter, event_id) > (%s, %s) "
+                f"ORDER BY adapter, event_id LIMIT {int(batch_size)}",
+                (cursor_adapter, cursor_event_id),
             )
-            > 0
-        ):
-            pass
+            if not batch:
+                break
+            last_adapter, last_event_id = batch[-1][0], batch[-1][1]
+            self._command(
+                f"UPDATE timeline_events SET priority_enum = {map_case} "
+                "WHERE (adapter, event_id) > (%s, %s) "
+                "AND (adapter, event_id) <= (%s, %s) "
+                f"AND priority_enum IS DISTINCT FROM {map_case}",
+                (cursor_adapter, cursor_event_id, last_adapter, last_event_id),
+            )
+            cursor_adapter, cursor_event_id = last_adapter, last_event_id
 
         # Build the replacement index without a write lock (autocommit conn),
         # then swap column + index names atomically so readers never see a
@@ -8287,13 +8294,6 @@ class PostgresWarehouse:
     def _command(self, sql: str, params: Sequence[Any] | None = None) -> None:
         with self._connection.cursor() as cursor:
             cursor.execute(self._qualify_sql(sql), params)
-
-    def _command_rowcount(self, sql: str, params: Sequence[Any] | None = None) -> int:
-        """Like ``_command`` but returns the affected row count (for batched
-        migrations that loop until a statement stops touching rows)."""
-        with self._connection.cursor() as cursor:
-            cursor.execute(self._qualify_sql(sql), params)
-            return cursor.rowcount
 
     def _query(self, sql: str, params: Sequence[Any] | None = None) -> list[tuple[Any, ...]]:
         with self._connection.cursor() as cursor:

@@ -386,6 +386,41 @@ def test_priority_bigint_column_migrates_to_enum_in_batches(warehouse):
     assert mapped_again == mapped
 
 
+def test_priority_enum_backfill_walks_every_row_across_batches(warehouse):
+    """The keyset backfill must cover every row (no gaps/overlap) when the table
+    spans multiple batches — the O(rows) walk the production 40M-row table needs."""
+    rel = query_relation("timeline_events").with_namespace(warehouse._schema)
+    warehouse._ensure_timeline_priority_type()
+    warehouse._command(
+        "CREATE TABLE timeline_events ("
+        " adapter text NOT NULL, event_id text NOT NULL,"
+        " priority bigint NOT NULL DEFAULT 0,"
+        " priority_enum timeline_priority NOT NULL DEFAULT 'unclassified',"
+        " event_ts timestamptz NOT NULL DEFAULT now(),"
+        " seq bigint NOT NULL DEFAULT 0,"
+        " PRIMARY KEY (adapter, event_id))"
+    )
+    # Two adapters so the composite-key cursor is exercised, five rows total.
+    rows = [("a", "e1", 1), ("a", "e2", 2), ("a", "e3", 3), ("b", "e1", 4), ("b", "e2", 5)]
+    for adapter, event_id, pri in rows:
+        warehouse._command(
+            "INSERT INTO timeline_events (adapter, event_id, priority) VALUES (%s, %s, %s)",
+            (adapter, event_id, pri),
+        )
+
+    # batch_size=2 forces three batches (2 + 2 + 1) across the composite key.
+    warehouse._migrate_timeline_priority_to_enum(rel, batch_size=2)
+
+    mapped = {
+        (row[0], row[1]): row[2]
+        for row in warehouse._query("SELECT adapter, event_id, priority::text FROM timeline_events")
+    }
+    assert mapped == {
+        ("a", "e1"): "self", ("a", "e2"): "direct", ("a", "e3"): "cc",
+        ("b", "e1"): "noise", ("b", "e2"): "background",
+    }
+
+
 def test_adapter_queries_run_against_the_real_schema(warehouse):
     """Every adapter's generated SQL must execute against the ensured schema.
 
