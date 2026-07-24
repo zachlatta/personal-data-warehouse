@@ -57,22 +57,15 @@ TIMELINE_SNIPPET_CHARS = 500
 TIMELINE_TITLE_CHARS = 300
 TIMELINE_DEFAULT_BATCH_SIZE = 2000
 
-# Priority tiers, classified per row at sync time. Stored in the
-# ``timeline_priority`` Postgres enum so the value is self-describing (the
-# column reads 'self'/'direct'/... rather than an opaque number) and the tier
-# set is discoverable straight from the schema. Declaration order in the enum
-# is the sort order, highest attention first: self > direct > cc > noise >
-# background (> unclassified, the not-yet-synced bucket). The lines between
-# tiers are heuristics and expected to be tuned; changing an adapter's
-# classification and re-running the backfill reclassifies rows (priority
-# participates in the content guard, so seq bumps on change). Each constant is
-# a quoted SQL label literal so interpolating it into an adapter's SELECT emits
-# the enum label directly.
-TIMELINE_PRIORITY_SELF = "'self'"  # actions Zach initiated (his messages, sessions, memos, notes)
-TIMELINE_PRIORITY_DIRECT = "'direct'"  # real people reaching him directly (DMs, direct email, small groups)
-TIMELINE_PRIORITY_CC = "'cc'"  # real-people activity he is peripheral to (cc'd, channels, big groups)
-TIMELINE_PRIORITY_NOISE = "'noise'"  # bulk/automated traffic (newsletters, bots, non-member channels)
-TIMELINE_PRIORITY_BACKGROUND = "'background'"  # the warehouse's own machinery (enrichment, mutation workers)
+# Priority tiers, classified per row at sync time (1 = highest). The lines
+# between tiers are heuristics and expected to be tuned; changing an
+# adapter's classification and re-running the backfill reclassifies rows
+# (priority participates in the content guard, so seq bumps on change).
+TIMELINE_PRIORITY_SELF = 1  # actions Zach initiated (his messages, sessions, memos, notes)
+TIMELINE_PRIORITY_DIRECT = 2  # real people reaching him directly (DMs, direct email, small groups)
+TIMELINE_PRIORITY_CC = 3  # real-people activity he is peripheral to (cc'd, channels, big groups)
+TIMELINE_PRIORITY_NOISE = 4  # bulk/automated traffic (newsletters, bots, non-member channels)
+TIMELINE_PRIORITY_BACKGROUND = 5  # the warehouse's own machinery (enrichment, mutation workers)
 
 _EPOCH = "'1970-01-01 00:00:00+00'::timestamptz"
 # Sentinel guard: house style stores "no timestamp" as the epoch, so anything
@@ -160,7 +153,7 @@ def _simple_adapter(
     context: str = "''",
     metadata: str = "'{}'::jsonb",
     search_text: str | None = None,
-    priority: str = TIMELINE_PRIORITY_CC,
+    priority: str = str(TIMELINE_PRIORITY_CC),
     where: str = "TRUE",
     changed_join_sql: str = "",
     changed_join_anchor: str = "",
@@ -193,7 +186,7 @@ def _simple_adapter(
             COALESCE(({metadata}), '{{}}'::jsonb)::text AS metadata,
             COALESCE(({search_text}), '') AS search_text,
             ({ingest_ts}) AS ingest_ts,
-            COALESCE(({priority}), 'cc') AS priority
+            COALESCE(({priority}), {TIMELINE_PRIORITY_CC}) AS priority
         FROM {from_clause}
         WHERE ({where})
     """
@@ -479,34 +472,34 @@ _GMAIL_EMAIL = _simple_adapter(
         # copy that lands in a different account (cross-account forwards) —
         # unless it is one send of a mail-merge blast nobody had replied to.
         f"WHEN {_GMAIL_FROM_SELF} THEN "
-        f"  CASE WHEN {_GMAIL_MERGE_CLUSTER} AND NOT {_GMAIL_THREAD_INBOUND_BEFORE} THEN 'noise' ELSE 'self' END "
-        "WHEN 'SPAM' = ANY(t.label_ids) OR 'TRASH' = ANY(t.label_ids) THEN 'noise' "
+        f"  CASE WHEN {_GMAIL_MERGE_CLUSTER} AND NOT {_GMAIL_THREAD_INBOUND_BEFORE} THEN 4 ELSE 1 END "
+        "WHEN 'SPAM' = ANY(t.label_ids) OR 'TRASH' = ANY(t.label_ids) THEN 4 "
         # Relay services carrying a human's activity: mention/author copies are
         # directed at me; bot-authored payloads (CI, deploy status) are noise;
         # the rest is skim-worthy cc.
         f"WHEN t.from_address ~* {_GMAIL_RELAY_SENDER_PATTERN} THEN "
         "  CASE WHEN EXISTS (SELECT 1 FROM unnest(t.to_addresses || t.cc_addresses) a "
         "                    WHERE a ILIKE '%%mention@noreply.github.com%%' "
-        "                       OR a ILIKE '%%author@noreply.github.com%%') THEN 'direct' "
+        "                       OR a ILIKE '%%author@noreply.github.com%%') THEN 2 "
         f"       WHEN t.from_address ~* '\\[bot\\]' OR t.subject ~* {_GMAIL_CI_SUBJECT_PATTERN} "
         f"         OR t.snippet ~* {_GMAIL_RELAYED_BOT_BODY_PATTERN} "
-        "         OR t.subject ~* '^(re: )?\\[[^\\]]+\\] bump ' THEN 'noise' "
-        "       ELSE 'cc' END "
-        f"WHEN t.subject ~* {_GMAIL_RSVP_SUBJECT_PATTERN} THEN 'cc' "
-        f"WHEN t.subject ~* {_GMAIL_OTP_SUBJECT_PATTERN} THEN 'noise' "
-        f"WHEN {_GMAIL_AUTOMATED_FROM} AND t.subject ~* '^(re: )?new comment' THEN 'cc' "
-        f"WHEN {_GMAIL_HUMAN_ACTION_RELAY} THEN 'cc' "
-        f"WHEN 'CATEGORY_FORUMS' = ANY(t.label_ids) AND ({_GMAIL_AUTOMATED_FROM} OR {_GMAIL_FORUMS_NOISE}) THEN 'noise' "
-        f"WHEN 'CATEGORY_FORUMS' = ANY(t.label_ids) AND t.from_address !~* {_GMAIL_BULK_SENDER_PATTERN} THEN 'cc' "
-        f"WHEN NOT {_GMAIL_AUTOMATED_FROM} AND {_GMAIL_MY_REPLY_AFTER} THEN 'direct' "
+        "         OR t.subject ~* '^(re: )?\\[[^\\]]+\\] bump ' THEN 4 "
+        "       ELSE 3 END "
+        f"WHEN t.subject ~* {_GMAIL_RSVP_SUBJECT_PATTERN} THEN 3 "
+        f"WHEN t.subject ~* {_GMAIL_OTP_SUBJECT_PATTERN} THEN 4 "
+        f"WHEN {_GMAIL_AUTOMATED_FROM} AND t.subject ~* '^(re: )?new comment' THEN 3 "
+        f"WHEN {_GMAIL_HUMAN_ACTION_RELAY} THEN 3 "
+        f"WHEN 'CATEGORY_FORUMS' = ANY(t.label_ids) AND ({_GMAIL_AUTOMATED_FROM} OR {_GMAIL_FORUMS_NOISE}) THEN 4 "
+        f"WHEN 'CATEGORY_FORUMS' = ANY(t.label_ids) AND t.from_address !~* {_GMAIL_BULK_SENDER_PATTERN} THEN 3 "
+        f"WHEN NOT {_GMAIL_AUTOMATED_FROM} AND {_GMAIL_MY_REPLY_AFTER} THEN 2 "
         f"WHEN NOT {_GMAIL_AUTOMATED_FROM} AND {_GMAIL_I_POSTED_IN_THREAD} THEN "
-        f"  CASE WHEN {_GMAIL_ADDRESSED} THEN 'direct' ELSE 'cc' END "
-        f"WHEN NOT {_GMAIL_AUTOMATED_FROM} AND {_GMAIL_KNOWN_CORRESPONDENT} AND {_GMAIL_ADDRESSED} THEN 'direct' "
+        f"  CASE WHEN {_GMAIL_ADDRESSED} THEN 2 ELSE 3 END "
+        f"WHEN NOT {_GMAIL_AUTOMATED_FROM} AND {_GMAIL_KNOWN_CORRESPONDENT} AND {_GMAIL_ADDRESSED} THEN 2 "
         f"WHEN 'STARRED' = ANY(t.label_ids) AND NOT {_GMAIL_AUTOMATED_FROM} "
-        f"  AND NOT {_GMAIL_BULK_CATEGORY} THEN 'direct' "
-        f"WHEN {_GMAIL_BULK_CATEGORY} OR {_GMAIL_AUTOMATED_FROM} THEN 'noise' "
-        f"WHEN {_GMAIL_ADDRESSED} THEN 'direct' "
-        "ELSE 'cc' END"
+        f"  AND NOT {_GMAIL_BULK_CATEGORY} THEN 2 "
+        f"WHEN {_GMAIL_BULK_CATEGORY} OR {_GMAIL_AUTOMATED_FROM} THEN 4 "
+        f"WHEN {_GMAIL_ADDRESSED} THEN 2 "
+        "ELSE 3 END"
     ),
     refresh_hours=72,
 )
@@ -640,36 +633,36 @@ _SLACK_DM_CONTEXT = (
 _SLACK_MESSAGE_PRIORITY = (
     "CASE "
     f"WHEN {_SLACK_ATTACHMENT_ONLY_MESSAGE} THEN {TIMELINE_PRIORITY_BACKGROUND} "
-    "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 'self' "
+    "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 1 "
     f"WHEN {_SLACK_IS_BOT} THEN "
     "  CASE WHEN c.is_im = 1 AND t.text ~* '(commented on|shared an item|replied to|"
-    "mentioned you|upgrade request|invited you|assigned you)' THEN 'cc' ELSE 'noise' END "
-    f"WHEN t.subtype IN {_SLACK_SYSTEM_SUBTYPES} THEN 'noise' "
-    "WHEN c.is_im = 1 THEN 'direct' "
-    "WHEN ident.user_id <> '' AND t.text LIKE '%%<@' || ident.user_id || '>%%' THEN 'direct' "
-    "WHEN t.text ~* '\\m(zrl|latta|zach latta|zachlatta)\\M' THEN 'direct' "
+    "mentioned you|upgrade request|invited you|assigned you)' THEN 3 ELSE 4 END "
+    f"WHEN t.subtype IN {_SLACK_SYSTEM_SUBTYPES} THEN 4 "
+    "WHEN c.is_im = 1 THEN 2 "
+    "WHEN ident.user_id <> '' AND t.text LIKE '%%<@' || ident.user_id || '>%%' THEN 2 "
+    "WHEN t.text ~* '\\m(zrl|latta|zach latta|zachlatta)\\M' THEN 2 "
     "WHEN t.text ~* '\\mzach\\M' AND (c.is_private = 1 "
-    f"  OR c.num_members <= 1000 OR {_SLACK_W6H} >= 1) THEN 'direct' "
-    f"WHEN {_SLACK_THREAD_ROOT_MINE} THEN 'direct' "
-    f"WHEN {_SLACK_MY_THREAD_RECENT} THEN 'direct' "
+    f"  OR c.num_members <= 1000 OR {_SLACK_W6H} >= 1) THEN 2 "
+    f"WHEN {_SLACK_THREAD_ROOT_MINE} THEN 2 "
+    f"WHEN {_SLACK_MY_THREAD_RECENT} THEN 2 "
     f"WHEN c.is_mpim = 1 THEN "
     f"  CASE WHEN {_SLACK_W6H} >= 1 OR {_SLACK_MPIM_ROSTER} BETWEEN 1 AND 5 "
-    f"        OR {_SLACK_P3D} >= 3 THEN 'direct' ELSE 'cc' END "
+    f"        OR {_SLACK_P3D} >= 3 THEN 2 ELSE 3 END "
     "WHEN c.is_member = 1 THEN "
     f"  CASE WHEN {_SLACK_W6H} >= 2 AND ({_SLACK_CONV_VELOCITY_24H} <= 150 "
-    f"         OR ({_SLACK_W6H} >= 3 AND {_SLACK_P3D} >= 2)) THEN 'direct' "
+    f"         OR ({_SLACK_W6H} >= 3 AND {_SLACK_P3D} >= 2)) THEN 2 "
     f"       WHEN c.is_private = 1 AND {_SLACK_MPIM_ROSTER} <= 20 "
-    f"         AND {_SLACK_P24H} >= 1 THEN 'direct' "
-    "       ELSE 'cc' END "
-    "ELSE 'noise' END"
+    f"         AND {_SLACK_P24H} >= 1 THEN 2 "
+    "       ELSE 3 END "
+    "ELSE 4 END"
 )
 
 _SLACK_FILE_PRIORITY = (
     "CASE "
     f"WHEN {_SLACK_INACCESSIBLE_FILE_STUB} THEN {TIMELINE_PRIORITY_BACKGROUND} "
-    "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 'self' "
-    "WHEN u.is_bot = 1 THEN 'noise' "
-    "WHEN c.is_im = 1 THEN 'direct' "
+    "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 1 "
+    "WHEN u.is_bot = 1 THEN 4 "
+    "WHEN c.is_im = 1 THEN 2 "
     f"WHEN c.is_mpim = 1 THEN "
     "  CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM slack_messages z "
     "       WHERE z.user_id = ident.user_id "
@@ -677,7 +670,7 @@ _SLACK_FILE_PRIORITY = (
     "                                    AND t.created_at + interval '6 hours' "
     "         AND z.account = t.account AND z.team_id = t.team_id "
     "         AND z.conversation_id = t.conversation_id AND z.is_deleted = 0 "
-    f"       LIMIT 1) fw) >= 1 OR {_SLACK_MPIM_ROSTER} BETWEEN 1 AND 5 THEN 'direct' ELSE 'cc' END "
+    f"       LIMIT 1) fw) >= 1 OR {_SLACK_MPIM_ROSTER} BETWEEN 1 AND 5 THEN 2 ELSE 3 END "
     "WHEN c.is_member = 1 THEN "
     "  CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM slack_messages z "
     "       WHERE z.user_id = ident.user_id "
@@ -685,8 +678,8 @@ _SLACK_FILE_PRIORITY = (
     "                                    AND t.created_at + interval '6 hours' "
     "         AND z.account = t.account AND z.team_id = t.team_id "
     "         AND z.conversation_id = t.conversation_id AND z.is_deleted = 0 "
-    "       LIMIT 2) fw) >= 2 THEN 'direct' ELSE 'cc' END "
-    "ELSE 'noise' END"
+    "       LIMIT 2) fw) >= 2 THEN 2 ELSE 3 END "
+    "ELSE 4 END"
 )
 # IM/MPIM checks come first: slack stores a user-id-ish "name" on DM
 # conversations, which otherwise renders as a channel called #U0xxxx.
@@ -936,12 +929,12 @@ _APPLE_MESSAGE = _simple_adapter(
     # one-way broadcast, not a conversation.
     priority=(
         "CASE "
-        "WHEN t.is_from_me = 1 THEN 'self' "
-        "WHEN t.is_system_message = 1 OR t.is_service_message = 1 OR t.is_spam = 1 THEN 'noise' "
+        "WHEN t.is_from_me = 1 THEN 1 "
+        "WHEN t.is_system_message = 1 OR t.is_service_message = 1 OR t.is_spam = 1 THEN 4 "
         "WHEN h.address ~ '^[0-9]{3,6}$' "
-        "  OR (h.address <> '' AND h.address NOT LIKE '+%%' AND h.address NOT LIKE '%%@%%') THEN 'noise' "
-        "WHEN c.display_name ~ '^[0-9]{3,6}$' OR c.chat_identifier ~ '^[0-9]{3,6}$' THEN 'noise' "
-        "WHEN h.address ~ '^\\+1(800|833|844|855|866|877|888)' THEN 'noise' "
+        "  OR (h.address <> '' AND h.address NOT LIKE '+%%' AND h.address NOT LIKE '%%@%%') THEN 4 "
+        "WHEN c.display_name ~ '^[0-9]{3,6}$' OR c.chat_identifier ~ '^[0-9]{3,6}$' THEN 4 "
+        "WHEN h.address ~ '^\\+1(800|833|844|855|866|877|888)' THEN 4 "
         "WHEN c.style = 45 OR COALESCE(roster.n, 0) <= 1 THEN "
         # A conversation needs his participation: two replies ever, or one
         # reply that is not drowned by a 20+ message broadcast stream.
@@ -949,7 +942,7 @@ _APPLE_MESSAGE = _simple_adapter(
         "         SELECT 1 FROM apple_message_chat_messages zc "
         "         JOIN apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
         "         WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
-        "           AND z.is_from_me = 1 LIMIT 2) ow) >= 2 THEN 'direct' "
+        "           AND z.is_from_me = 1 LIMIT 2) ow) >= 2 THEN 2 "
         "       WHEN (SELECT count(*) FROM ("
         "         SELECT 1 FROM apple_message_chat_messages zc "
         "         JOIN apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
@@ -959,16 +952,16 @@ _APPLE_MESSAGE = _simple_adapter(
         "         SELECT 1 FROM apple_message_chat_messages zc "
         "         JOIN apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
         "         WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
-        "           AND z.is_from_me = 0 LIMIT 20) iw) < 20 THEN 'direct' "
-        "       ELSE 'noise' END "
-        "WHEN COALESCE(roster.n, 0) <= 9 THEN 'direct' "
+        "           AND z.is_from_me = 0 LIMIT 20) iw) < 20 THEN 2 "
+        "       ELSE 4 END "
+        "WHEN COALESCE(roster.n, 0) <= 9 THEN 2 "
         "WHEN EXISTS (SELECT 1 FROM apple_message_chat_messages zc "
         "             JOIN apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
         "             WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
         "               AND zc.message_date BETWEEN t.message_at - interval '6 hours' "
         "                                       AND t.message_at + interval '6 hours' "
-        "               AND z.is_from_me = 1) THEN 'direct' "
-        "ELSE 'cc' END"
+        "               AND z.is_from_me = 1) THEN 2 "
+        "ELSE 3 END"
     ),
     max_incremental_batches_per_run=1,
     refresh_hours=168,
@@ -1068,25 +1061,25 @@ _WHATSAPP_MESSAGE = _simple_adapter(
     # conversation (his own message within +/-6 hours).
     priority=(
         "CASE "
-        "WHEN t.is_from_me = 1 THEN 'self' "
-        "WHEN c.chat_type = 'status' THEN 'noise' "
+        "WHEN t.is_from_me = 1 THEN 1 "
+        "WHEN c.chat_type = 'status' THEN 4 "
         "WHEN EXISTS (SELECT 1 FROM whatsapp_contacts b "
         "             WHERE b.account = t.account AND b.jid = t.sender_jid "
-        "               AND b.business_name <> '') THEN 'noise' "
+        "               AND b.business_name <> '') THEN 4 "
         "WHEN t.body_text = '' AND COALESCE(t.media_type, '') IN ('', 'none', 'unknown') "
         "  AND (t.sender_jid = t.chat_id OR t.sender_jid = '' "
         "       OR COALESCE(c.chat_type, '') <> 'group' "
         "       OR COALESCE(NULLIF(ct.full_name, ''), NULLIF(ct.push_name, ''), "
-        "                   NULLIF(t.push_name, '')) IS NULL) THEN 'noise' "
+        "                   NULLIF(t.push_name, '')) IS NULL) THEN 4 "
         "WHEN c.chat_type = 'group' OR t.chat_id LIKE '%%@g.us' THEN "
-        "  CASE WHEN COALESCE(roster.n, 99) <= 5 THEN 'direct' "
+        "  CASE WHEN COALESCE(roster.n, 99) <= 5 THEN 2 "
         "       WHEN EXISTS (SELECT 1 FROM whatsapp_messages z "
         "                    WHERE z.account = t.account AND z.chat_id = t.chat_id "
         "                      AND z.is_from_me = 1 "
         "                      AND z.message_at BETWEEN t.message_at - interval '6 hours' "
-        "                                           AND t.message_at + interval '6 hours') THEN 'direct' "
-        "       ELSE 'cc' END "
-        "ELSE 'direct' END"
+        "                                           AND t.message_at + interval '6 hours') THEN 2 "
+        "       ELSE 3 END "
+        "ELSE 2 END"
     ),
     refresh_hours=48,
 )
@@ -1109,7 +1102,7 @@ _APPLE_NOTE_REVISION = _simple_adapter(
     ),
     metadata="jsonb_build_object('note_id', t.note_id, 'deleted', t.is_deleted <> 0)",
     search_text=_search_concat("t.title", "t.folder_path", "t.body_text"),
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _VOICE_MEMO = _simple_adapter(
@@ -1153,7 +1146,7 @@ _VOICE_MEMO = _simple_adapter(
         "'deleted', t.is_deleted <> 0)"
     ),
     search_text=_search_concat("t.title", "t.filename", "ens.enrichment_search_text"),
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _DATE_ONLY = r"'^\d{4}-\d{2}-\d{2}$'"
@@ -1201,16 +1194,16 @@ _CALENDAR_EVENT = _simple_adapter(
     # flight events; real invites from humans are attention.
     priority=(
         "CASE "
-        "WHEN t.is_deleted <> 0 OR t.status = 'cancelled' THEN 'noise' "
-        f"WHEN ({_CALENDAR_START_TS}) > t.synced_at THEN 'cc' "
+        "WHEN t.is_deleted <> 0 OR t.status = 'cancelled' THEN 4 "
+        f"WHEN ({_CALENDAR_START_TS}) > t.synced_at THEN 3 "
         "WHEN t.organizer_email ILIKE '%%group.calendar.google.com%%' "
-        "  OR t.organizer_email ILIKE '%%holiday%%' THEN 'noise' "
-        "WHEN t.description LIKE '%%͏%%' OR t.description LIKE '%%­%%' THEN 'noise' "
+        "  OR t.organizer_email ILIKE '%%holiday%%' THEN 4 "
+        "WHEN t.description LIKE '%%͏%%' OR t.description LIKE '%%­%%' THEN 4 "
         "WHEN t.organizer_email ILIKE '%%' || t.account || '%%' "
         "  OR EXISTS (SELECT 1 FROM gmail_sync_state self "
         "             WHERE self.account <> '' AND t.organizer_email ILIKE '%%' || self.account || '%%') THEN "
-        "  CASE WHEN t.summary LIKE '✈%%' THEN 'noise' ELSE 'self' END "
-        "ELSE 'direct' END"
+        "  CASE WHEN t.summary LIKE '✈%%' THEN 4 ELSE 1 END "
+        "ELSE 2 END"
     ),
 )
 
@@ -1257,21 +1250,21 @@ _DRIVE_FILE = _simple_adapter(
         # blobs and export shards it writes to Drive) — machinery, not
         # activity. Sampling showed thousands of them per window at the noise
         # tier drowning real events.
-        "WHEN t.is_excluded <> 0 THEN 'background' "
-        "WHEN t.trashed <> 0 THEN 'noise' "
+        "WHEN t.is_excluded <> 0 THEN 5 "
+        "WHEN t.trashed <> 0 THEN 4 "
         # Google-Forms response uploads and shared-with-organizers intake
         # folders are pipeline traffic, not someone reaching Zach; shortcut
         # churn likewise reads as ambient.
         "WHEN t.folder_path LIKE '%%(File responses)%%' "
-        "  OR t.folder_path ~* 'shared with|shared w/' THEN 'cc' "
-        "WHEN t.mime_type = 'application/vnd.google-apps.shortcut' THEN 'cc' "
+        "  OR t.folder_path ~* 'shared with|shared w/' THEN 3 "
+        "WHEN t.mime_type = 'application/vnd.google-apps.shortcut' THEN 3 "
         "WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(t.owners_json) o "
         "             WHERE o->>'emailAddress' ILIKE t.account "
-        "               AND (t.last_modifying_user = '' OR t.last_modifying_user = o->>'displayName')) THEN 'self' "
+        "               AND (t.last_modifying_user = '' OR t.last_modifying_user = o->>'displayName')) THEN 1 "
         "WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(t.owners_json) o "
-        "             WHERE o->>'emailAddress' ILIKE t.account) THEN 'direct' "
-        "WHEN t.starred <> 0 THEN 'direct' "
-        "ELSE 'cc' END"
+        "             WHERE o->>'emailAddress' ILIKE t.account) THEN 2 "
+        "WHEN t.starred <> 0 THEN 2 "
+        "ELSE 3 END"
     ),
 )
 
@@ -1324,7 +1317,7 @@ _PHOTO = _simple_adapter(
         "enr.enrichment_search_text",
     ),
     # Photos Zach took are his own actions.
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
     refresh_hours=48,
 )
 
@@ -1360,7 +1353,7 @@ def _contact_update_adapter(*, name: str, source_table: str) -> TimelineAdapter:
             "t.notes", "t.emails", "t.phones", "t.addresses", "t.urls", "t.nicknames"
         ),
         # Contact-card churn is sync machinery, not traffic aimed at Zach.
-        priority=TIMELINE_PRIORITY_BACKGROUND,
+        priority=str(TIMELINE_PRIORITY_BACKGROUND),
     )
 
 
@@ -1394,7 +1387,7 @@ _WHOOP_CYCLE = _simple_adapter(
         "'max_heart_rate', t.max_heart_rate)"
     ),
     search_text=_search_concat("t.score_state", "t.strain", "t.average_heart_rate", "t.max_heart_rate"),
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _WHOOP_RECOVERY = _simple_adapter(
@@ -1429,7 +1422,7 @@ _WHOOP_RECOVERY = _simple_adapter(
         "'skin_temp_celsius', t.skin_temp_celsius)"
     ),
     search_text=_search_concat("t.score_state", "t.recovery_score", "t.resting_heart_rate", "t.hrv_rmssd_milli"),
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _WHOOP_SLEEP = _simple_adapter(
@@ -1460,7 +1453,7 @@ _WHOOP_SLEEP = _simple_adapter(
         "'respiratory_rate', t.respiratory_rate)"
     ),
     search_text=_search_concat("t.score_state", "t.sleep_performance_percentage", "t.respiratory_rate"),
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _WHOOP_WORKOUT = _simple_adapter(
@@ -1492,7 +1485,7 @@ _WHOOP_WORKOUT = _simple_adapter(
         "'distance_meter', t.distance_meter)"
     ),
     search_text=_search_concat("t.sport_name", "t.score_state", "t.strain", "t.average_heart_rate"),
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _MUTATION = _simple_adapter(
@@ -1518,7 +1511,7 @@ _MUTATION = _simple_adapter(
         "'request_id', t.request_id, "
         "'has_error', t.error <> '')"
     ),
-    priority=TIMELINE_PRIORITY_BACKGROUND,
+    priority=str(TIMELINE_PRIORITY_BACKGROUND),
 )
 
 _MUTATION_REQUEST = _simple_adapter(
@@ -1535,7 +1528,7 @@ _MUTATION_REQUEST = _simple_adapter(
     snippet=_snippet("t.reason"),
     source_pk="jsonb_build_object('id', t.id)",
     metadata=("jsonb_build_object('status', t.status, 'has_error', t.error <> '')"),
-    priority=TIMELINE_PRIORITY_BACKGROUND,
+    priority=str(TIMELINE_PRIORITY_BACKGROUND),
 )
 
 _ENRICHMENT_RUN = _simple_adapter(
@@ -1560,7 +1553,7 @@ _ENRICHMENT_RUN = _simple_adapter(
         "'prompt_version', t.prompt_version, "
         "'exit_code', t.exit_code)"
     ),
-    priority=TIMELINE_PRIORITY_BACKGROUND,
+    priority=str(TIMELINE_PRIORITY_BACKGROUND),
 )
 
 _ALICE_VOICE_RECORDING = _simple_adapter(
@@ -1584,7 +1577,7 @@ _ALICE_VOICE_RECORDING = _simple_adapter(
         "'recovery_source', t.recovery_source)"
     ),
     search_text=_search_concat("t.title", "t.filename", "t.raw_metadata_json"),
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _FINANCE_TRANSACTION = _simple_adapter(
@@ -1616,7 +1609,7 @@ _FINANCE_TRANSACTION = _simple_adapter(
     search_text=_search_concat(
         "t.description", "t.merchant", "t.amount", "t.currency", "a.name", "a.institution"
     ),
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _FINANCE_OBSERVATION = _simple_adapter(
@@ -1648,7 +1641,7 @@ _FINANCE_OBSERVATION = _simple_adapter(
         "'side', a.side)"
     ),
     search_text=_search_concat("a.name", "a.institution", "t.kind", "t.value", "t.currency"),
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
@@ -1694,7 +1687,7 @@ _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
     search_text=_search_concat(
         "t.filename", "t.original_path", "ex.institution", "ex.account_name_hint", "ex.summary"
     ),
-    priority=TIMELINE_PRIORITY_SELF,
+    priority=str(TIMELINE_PRIORITY_SELF),
 )
 
 

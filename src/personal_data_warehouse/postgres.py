@@ -1372,6 +1372,7 @@ INTEGER_COLUMNS = {
     "backfill_done",
     "backfill_rows",
     "incremental_rows",
+    "priority",
     "whoop_user_id",
     "average_heart_rate",
     "max_heart_rate",
@@ -2181,15 +2182,8 @@ class PostgresWarehouse:
         provide (late backfills land in the past by event_ts but in the
         present by seq).
         """
-        # The priority enum must exist before the table is created: on a fresh
-        # install _postgres_type builds the priority column as this type.
-        self._ensure_timeline_priority_type()
         self._ensure_table_group(["timeline_events", "timeline_sync_state"])
         timeline_rel = query_relation("timeline_events").with_namespace(self._schema)
-        # Migrate any pre-enum (legacy bigint) priority column in place. Runs to
-        # completion (through the column swap) before this method returns, so the
-        # sync engine never writes an enum label into a still-bigint column.
-        self._migrate_timeline_priority_to_enum(timeline_rel)
         had_search_text = bool(
             self._query(
                 """
@@ -2210,7 +2204,7 @@ class PostgresWarehouse:
         # Additive migrations for timelines created before later normalized
         # fields existed. `search_text` is the full BM25 document backing the
         # general search function; re-syncing fills it in for old rows.
-        # (priority's own migration ran above, before this method's own work.)
+        self._command("ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS priority bigint NOT NULL DEFAULT 0")
         self._command("ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS search_text text NOT NULL DEFAULT ''")
         if not had_search_text:
             # Existing timelines need a full re-walk so every historical row gets
@@ -2241,121 +2235,6 @@ class PostgresWarehouse:
             """
         )
         self._ensure_search_views_if_possible()
-
-    def _ensure_timeline_priority_type(self) -> None:
-        """Create the ``timeline_priority`` enum if it does not exist.
-
-        Mirrors the ``search_text_hit`` composite-type bootstrap: the existence
-        probe is schema-qualified (``to_regtype`` takes a string literal that
-        ``qualify_sql_relations`` does not rewrite), while the ``CREATE TYPE``
-        uses the logical name so it lands in the timeline schema. Declaration
-        order is the sort order (highest attention first).
-        """
-        timeline_schema = (
-            self.physical_schema_name("timeline") if hasattr(self, "physical_schema_name") else "timeline"
-        )
-        self._command(
-            r"""
-            DO $do$
-            BEGIN
-                IF to_regtype('"""
-            + timeline_schema
-            + r""".timeline_priority') IS NULL THEN
-                    CREATE TYPE timeline_priority AS ENUM
-                        ('self', 'direct', 'cc', 'noise', 'background', 'unclassified');
-                END IF;
-            END
-            $do$;
-            """
-        )
-
-    def _migrate_timeline_priority_to_enum(self, timeline_rel: Any, *, block_batch: int = 10000) -> None:
-        """One-time, resumable ``bigint`` -> ``timeline_priority`` migration.
-
-        Batched and non-locking so it never rewrites the whole (multi-GB) table
-        under an exclusive lock, and a raw UPDATE (not the timeline upsert) so it
-        never bumps ``seq``. Idempotent: a fresh install already has the enum
-        column (built by CREATE TABLE) and returns immediately, and a crash
-        mid-run resumes cleanly on the next call.
-        """
-
-        def _col_type(column: str) -> str | None:
-            rows = self._query(
-                """
-                SELECT data_type FROM information_schema.columns
-                WHERE table_schema = %s AND table_name = %s AND column_name = %s
-                LIMIT 1
-                """,
-                (timeline_rel.schema, timeline_rel.name, column),
-            )
-            return rows[0][0] if rows else None
-
-        priority_type = _col_type("priority")
-        work_type = _col_type("priority_enum")
-        # Fresh install / already migrated: priority is the enum and there is no
-        # leftover work column.
-        if priority_type != "bigint" and work_type is None:
-            return
-
-        # Stage the enum column (metadata-only on PG11+: constant default).
-        if work_type is None:
-            self._command(
-                "ALTER TABLE timeline_events "
-                "ADD COLUMN priority_enum timeline_priority NOT NULL DEFAULT 'unclassified'"
-            )
-
-        # Backfill legacy tiers by walking the heap in physical (ctid block)
-        # order. A primary-key keyset walk reads each batch's rows in index
-        # order but they are physically scattered across the multi-GB heap, so
-        # every batch does thousands of random page reads (minutes per batch on
-        # a table that does not fit in cache). A `ctid >= '(a,0)' AND ctid <
-        # '(b,0)'` range is a sequential Tid Range Scan of contiguous blocks
-        # instead: O(rows) with sequential I/O. Each range UPDATE is idempotent
-        # (IS DISTINCT FROM) so a restart re-scans already-done blocks cheaply
-        # (sequential read, no writes) and a partly migrated table converges.
-        map_case = (
-            "(CASE priority WHEN 1 THEN 'self' WHEN 2 THEN 'direct' "
-            "WHEN 3 THEN 'cc' WHEN 4 THEN 'noise' WHEN 5 THEN 'background' "
-            "ELSE 'unclassified' END)::timeline_priority"
-        )
-        total_blocks = self._query(
-            "SELECT (pg_relation_size((quote_ident(%s) || '.' || quote_ident(%s))::regclass) "
-            "/ current_setting('block_size')::bigint)::bigint",
-            (timeline_rel.schema, timeline_rel.name),
-        )[0][0]
-        block = 0
-        step = max(1, int(block_batch))
-        while block <= total_blocks:
-            high = block + step
-            self._command(
-                f"UPDATE timeline_events SET priority_enum = {map_case} "
-                f"WHERE ctid >= '({block},0)'::tid AND ctid < '({high},0)'::tid "
-                f"AND priority_enum IS DISTINCT FROM {map_case}"
-            )
-            block = high
-
-        # Build the replacement index without a write lock (autocommit conn),
-        # then swap column + index names atomically so readers never see a
-        # window without a `priority` column. CONCURRENTLY waits for every older
-        # transaction in the shared database, so throwaway test schemas use a
-        # plain build (same reasoning as _ensure_indexes).
-        tmp_index_sql = (
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS timeline_events_priority_time_tmp_idx "
-            "ON timeline_events (priority_enum, event_ts DESC, seq DESC)"
-        )
-        if self._schema.startswith("pdw_test_"):
-            tmp_index_sql = tmp_index_sql.replace("CREATE INDEX CONCURRENTLY", "CREATE INDEX", 1)
-        self._command(tmp_index_sql)
-        self._command(
-            """
-            BEGIN;
-            ALTER TABLE timeline_events DROP COLUMN priority;
-            ALTER TABLE timeline_events RENAME COLUMN priority_enum TO priority;
-            ALTER INDEX timeline_events_priority_time_tmp_idx
-                RENAME TO timeline_events_priority_time_idx;
-            COMMIT;
-            """
-        )
 
     def ensure_claude_desktop_tables(self) -> None:
         """Tables for the serverside Claude Desktop poller.
@@ -8330,11 +8209,6 @@ class PostgresWarehouse:
 
 
 def _postgres_type(column: str, *, table: str | None = None) -> str:
-    # The timeline's priority tier is a self-describing native enum (see
-    # timeline.py). The logical type name resolves to the timeline schema via
-    # qualify_sql_relations when the CREATE TABLE runs.
-    if table == "timeline_events" and column == "priority":
-        return "timeline_priority"
     if _is_jsonb_column(table, column):
         return "jsonb"
     if column in ARRAY_COLUMNS:
@@ -8355,10 +8229,6 @@ def _postgres_type(column: str, *, table: str | None = None) -> str:
 
 
 def _default_sql(column: str, *, table: str | None = None) -> str:
-    if table == "timeline_events" and column == "priority":
-        # Not-yet-(re)synced rows sit at the "unknown" tier; every adapter emits
-        # a real tier, so this should only ever be transient.
-        return "'unclassified'"
     if _is_jsonb_column(table, column):
         if column in JSONB_ARRAY_COLUMNS_BY_TABLE.get(table or "", set()):
             return "'[]'::jsonb"

@@ -193,9 +193,6 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("timeline_sync_state", "timeline", "sync_state"),
     ("timeline_gmail_correspondents", "timeline", "gmail_correspondents"),
     ("timeline_events_seq", "timeline", "events_seq"),
-    # Postgres enum type backing timeline_events.priority (colocated in the
-    # timeline schema so the value is self-describing and discoverable).
-    ("timeline_priority", "timeline", "timeline_priority"),
     ("search_text_hit", "search", "text_hit"),
     ("search_text", "search", "search_text"),
     ("search_text_exact", "search", "search_text_exact"),

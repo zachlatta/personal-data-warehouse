@@ -11,12 +11,7 @@ from dotenv import load_dotenv
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.postgres import POSTGRES_INDEXES, POSTGRES_TABLES, PostgresWarehouse
-from personal_data_warehouse.relations import (
-    AI_EVENT_SOURCE_RELATIONS,
-    CANONICAL_RELATIONS,
-    physical_schema_names,
-    query_relation,
-)
+from personal_data_warehouse.relations import AI_EVENT_SOURCE_RELATIONS, CANONICAL_RELATIONS, physical_schema_names
 from personal_data_warehouse.timeline import (
     RAW_DDL_TABLES,
     TIMELINE_ADAPTERS,
@@ -284,29 +279,6 @@ def test_ensure_timeline_tables_is_idempotent_and_indexed(warehouse):
     names = {row[0] for row in rows}
     assert "timeline_events_time_idx" in names
     assert "timeline_events_source_time_idx" in names
-    assert "timeline_events_priority_time_idx" in names
-    # A fresh install builds priority as the self-describing enum, defaulting to
-    # 'unclassified'; the value IS the label and only valid labels are accepted.
-    col = warehouse._query(
-        """
-        SELECT data_type, udt_name FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = 'events' AND column_name = 'priority'
-        """,
-        (warehouse.physical_schema_name("timeline"),),
-    )[0]
-    assert col == ("USER-DEFINED", "timeline_priority")
-    warehouse._command(
-        "INSERT INTO timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
-        "VALUES ('t', 'ep', 's', 'k', now(), 'x', 'self')"
-    )
-    assert warehouse._query(
-        "SELECT priority FROM timeline_events WHERE event_id = 'ep'"
-    )[0][0] == "self"
-    with pytest.raises(Exception):
-        warehouse._command(
-            "INSERT INTO timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
-            "VALUES ('t', 'ebad', 's', 'k', now(), 'x', 'not-a-tier')"
-        )
     # seq must be sequence-backed so upserts can bump it.
     warehouse._command(
         "INSERT INTO timeline_events (adapter, event_id, source, kind, event_ts, source_table) "
@@ -314,119 +286,6 @@ def test_ensure_timeline_tables_is_idempotent_and_indexed(warehouse):
     )
     seqs = [row[0] for row in warehouse._query("SELECT seq FROM timeline_events ORDER BY event_id")]
     assert seqs[0] != seqs[1]
-
-
-def test_priority_bigint_column_migrates_to_enum_in_batches(warehouse):
-    """A legacy (pre-enum) bigint priority column is migrated in place to the
-    timeline_priority enum: every tier maps to its label, the canonical index is
-    rebuilt under its original name, no work column is left behind, and a second
-    call is a no-op."""
-    rel = query_relation("timeline_events").with_namespace(warehouse._schema)
-
-    # Simulate a pre-enum install: the enum type does not exist yet and priority
-    # is a bare bigint (0 = unclassified, 1..5 = tiers), with the old index.
-    warehouse._ensure_timeline_priority_type()
-    warehouse._command(
-        "CREATE TABLE timeline_events ("
-        " adapter text NOT NULL, event_id text NOT NULL,"
-        " priority bigint NOT NULL DEFAULT 0,"
-        " event_ts timestamptz NOT NULL DEFAULT now(),"
-        " seq bigint NOT NULL DEFAULT 0,"
-        " PRIMARY KEY (adapter, event_id))"
-    )
-    warehouse._command(
-        "CREATE INDEX timeline_events_priority_time_idx "
-        "ON timeline_events (priority, event_ts DESC, seq DESC)"
-    )
-    seeded = {"e0": 0, "e1": 1, "e2": 2, "e3": 3, "e4": 4, "e5": 5}
-    for event_id, pri in seeded.items():
-        warehouse._command(
-            "INSERT INTO timeline_events (adapter, event_id, priority) VALUES ('a', %s, %s)",
-            (event_id, pri),
-        )
-
-    warehouse._migrate_timeline_priority_to_enum(rel)
-
-    col = warehouse._query(
-        """
-        SELECT data_type, udt_name FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = %s AND column_name = 'priority'
-        """,
-        (rel.schema, rel.name),
-    )[0]
-    assert col == ("USER-DEFINED", "timeline_priority")
-    # No leftover work column.
-    assert not warehouse._query(
-        """
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = %s AND column_name = 'priority_enum'
-        """,
-        (rel.schema, rel.name),
-    )
-    # Every legacy tier mapped to its label (0 -> unclassified).
-    mapped = {
-        row[0]: row[1]
-        for row in warehouse._query("SELECT event_id, priority::text FROM timeline_events")
-    }
-    assert mapped == {
-        "e0": "unclassified", "e1": "self", "e2": "direct",
-        "e3": "cc", "e4": "noise", "e5": "background",
-    }
-    # The canonical index survives the swap under its original name.
-    assert warehouse._query(
-        "SELECT 1 FROM pg_indexes WHERE schemaname = %s AND indexname = 'timeline_events_priority_time_idx'",
-        (rel.schema,),
-    )
-    # Idempotent: the already-migrated path returns immediately and changes nothing.
-    warehouse._migrate_timeline_priority_to_enum(rel)
-    mapped_again = {
-        row[0]: row[1]
-        for row in warehouse._query("SELECT event_id, priority::text FROM timeline_events")
-    }
-    assert mapped_again == mapped
-
-
-def test_priority_enum_backfill_walks_every_heap_block(warehouse):
-    """The ctid block walk must cover every row (no gaps/overlap between block
-    ranges) when the table spans multiple heap blocks — the O(rows) sequential
-    walk the production 40M-row table needs. block_batch=1 forces a fresh block
-    range per iteration."""
-    rel = query_relation("timeline_events").with_namespace(warehouse._schema)
-    warehouse._ensure_timeline_priority_type()
-    warehouse._command(
-        "CREATE TABLE timeline_events ("
-        " adapter text NOT NULL, event_id text NOT NULL,"
-        " priority bigint NOT NULL DEFAULT 0,"
-        " priority_enum timeline_priority NOT NULL DEFAULT 'unclassified',"
-        " event_ts timestamptz NOT NULL DEFAULT now(),"
-        " seq bigint NOT NULL DEFAULT 0,"
-        " PRIMARY KEY (adapter, event_id))"
-    )
-    # Enough rows (with a filler column absent, rows are small) to span several
-    # 8KB heap blocks so the single-block walk iterates many times.
-    n = 600
-    warehouse._command(
-        "INSERT INTO timeline_events (adapter, event_id, priority) "
-        "SELECT 'a', 'e'||g::text, (g %% 5) + 1 FROM generate_series(1, %s) g",
-        (n,),
-    )
-    blocks = warehouse._query(
-        "SELECT (pg_relation_size((quote_ident(%s) || '.' || quote_ident(%s))::regclass) "
-        "/ current_setting('block_size')::bigint)::bigint",
-        (rel.schema, rel.name),
-    )[0][0]
-    assert blocks >= 2, "test needs a multi-block heap to be meaningful"
-
-    warehouse._migrate_timeline_priority_to_enum(rel, block_batch=1)
-
-    labels = {"1": "self", "2": "direct", "3": "cc", "4": "noise", "5": "background"}
-    got = {
-        row[0]: row[1]
-        for row in warehouse._query("SELECT event_id, priority::text FROM timeline_events")
-    }
-    assert len(got) == n
-    for g in range(1, n + 1):
-        assert got[f"e{g}"] == labels[str((g % 5) + 1)]
 
 
 def test_adapter_queries_run_against_the_real_schema(warehouse):
@@ -763,25 +622,25 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
 # an unstarred drive file (3), contact churn (5: sync machinery), and the
 # warehouse's own machinery (5).
 EXPECTED_SEEDED_PRIORITIES = {
-    "gmail_email": "direct",
-    "slack_message": "cc",
-    "slack_file": "cc",
-    "apple_message": "direct",
-    "whatsapp_message": "cc",
-    "agent_session": "self",
-    "apple_note_revision": "self",
-    "voice_memo": "self",
-    "alice_voice_recording": "self",
-    "calendar_event": "self",
-    "drive_file": "cc",
-    "photo": "self",
-    "contact_update": "background",
-    "finance_transaction": "self",
-    "finance_observation": "self",
-    "manual_finance_document": "self",
-    "mutation": "background",
-    "mutation_request": "background",
-    "enrichment_run": "background",
+    "gmail_email": 2,
+    "slack_message": 3,
+    "slack_file": 3,
+    "apple_message": 2,
+    "whatsapp_message": 3,
+    "agent_session": 1,
+    "apple_note_revision": 1,
+    "voice_memo": 1,
+    "alice_voice_recording": 1,
+    "calendar_event": 1,
+    "drive_file": 3,
+    "photo": 1,
+    "contact_update": 5,
+    "finance_transaction": 1,
+    "finance_observation": 1,
+    "manual_finance_document": 1,
+    "mutation": 5,
+    "mutation_request": 5,
+    "enrichment_run": 5,
 }
 
 EXPECTED_SEEDED_EVENTS = {
@@ -1052,25 +911,25 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     finally:
         engine.close()
 
-    def priority_of(event_id: str) -> str:
+    def priority_of(event_id: str) -> int:
         return warehouse._query(
             "SELECT priority FROM timeline_events WHERE event_id = %s", (event_id,)
         )[0][0]
 
-    assert priority_of("z|T1|C1|3000.1") == "self", "my own message is self-priority"
-    assert priority_of("z|T1|C1|3000.2") == "direct", "a mention of me is direct"
-    assert priority_of("z|T1|D1|3000.3") == "direct", "a DM is direct"
-    assert priority_of("z|T1|C1|3000.4") == "noise", "bot posts are noise"
-    assert priority_of("z|T1|C1|4000.2") == "direct", "a reply in my thread is direct"
-    assert priority_of("z@x.test|f-mine") == "self", "my own drive edits are self"
-    assert priority_of("z@x.test|f-shared") == "direct", "someone editing my file is direct"
-    assert priority_of("z@x.test|am-biz") == "noise", "business/RCS senders are noise"
-    assert priority_of("z@x.test|f-excluded") == "background", "warehouse-excluded drive blobs are background"
-    assert priority_of("z@x.test|m-promo") == "noise", "promos are noise even when addressed to me"
-    assert priority_of("z@x.test|m-noreply") == "noise", "broadcast senders are noise"
-    assert priority_of("z@x.test|m-notify") == "noise", "pure machine mail is noise"
-    assert priority_of("z@x.test|m-starred") == "direct", "starred email is direct"
-    assert priority_of("openclaw|cron-sess") == "background", "cron heartbeat sessions are background"
+    assert priority_of("z|T1|C1|3000.1") == 1, "my own message is self-priority"
+    assert priority_of("z|T1|C1|3000.2") == 2, "a mention of me is direct"
+    assert priority_of("z|T1|D1|3000.3") == 2, "a DM is direct"
+    assert priority_of("z|T1|C1|3000.4") == 4, "bot posts are noise"
+    assert priority_of("z|T1|C1|4000.2") == 2, "a reply in my thread is direct"
+    assert priority_of("z@x.test|f-mine") == 1, "my own drive edits are self"
+    assert priority_of("z@x.test|f-shared") == 2, "someone editing my file is direct"
+    assert priority_of("z@x.test|am-biz") == 4, "business/RCS senders are noise"
+    assert priority_of("z@x.test|f-excluded") == 5, "warehouse-excluded drive blobs are background"
+    assert priority_of("z@x.test|m-promo") == 4, "promos are noise even when addressed to me"
+    assert priority_of("z@x.test|m-noreply") == 4, "broadcast senders are noise"
+    assert priority_of("z@x.test|m-notify") == 4, "pure machine mail is noise"
+    assert priority_of("z@x.test|m-starred") == 2, "starred email is direct"
+    assert priority_of("openclaw|cron-sess") == 5, "cron heartbeat sessions are background"
 
 
 def test_priority_separates_conversations_automation_and_machinery(warehouse):
@@ -1450,62 +1309,62 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     finally:
         engine.close()
 
-    def priority_of(event_id: str) -> str:
+    def priority_of(event_id: str) -> int:
         return warehouse._query(
             "SELECT priority FROM timeline_events WHERE event_id = %s", (event_id,)
         )[0][0]
 
     # slack
-    assert priority_of("z|T1|C1|5000.3") == "direct", "channel msg inside his two-post window is a conversation"
-    assert priority_of("z|T1|CBIG|5000.5") == "cc", "one drive-by post does not promote a 40k channel"
-    assert priority_of("z|T1|CBIG|5000.6") == "direct", "naming him promotes anywhere"
-    assert priority_of("z|T1|G1|5000.7") == "cc", "a big group DM he is not engaged in is peripheral"
-    assert priority_of("z|T1|G2|5000.8") == "direct", "small group DMs are attention"
-    assert priority_of("z|T1|C1|5000.9") == "noise", "username-only legacy integrations are bots"
+    assert priority_of("z|T1|C1|5000.3") == 2, "channel msg inside his two-post window is a conversation"
+    assert priority_of("z|T1|CBIG|5000.5") == 3, "one drive-by post does not promote a 40k channel"
+    assert priority_of("z|T1|CBIG|5000.6") == 2, "naming him promotes anywhere"
+    assert priority_of("z|T1|G1|5000.7") == 3, "a big group DM he is not engaged in is peripheral"
+    assert priority_of("z|T1|G2|5000.8") == 2, "small group DMs are attention"
+    assert priority_of("z|T1|C1|5000.9") == 4, "username-only legacy integrations are bots"
     # gmail
-    assert priority_of("z@x.test|merge-20") == "noise", "mail-merge blast sends are not his actions"
-    assert priority_of("z@x.test|my-reply") == "self", "a personal reply after inbound mail stays his"
-    assert priority_of("z@x.test|m-replied") == "direct", "mail he answered within 48h has his attention"
-    assert priority_of("z@x.test|gh-mention") == "direct", "github mention copies are direct"
-    assert priority_of("z@x.test|gh-bot") == "noise", "relayed bot payloads are noise"
-    assert priority_of("z@x.test|gh-plain") == "cc", "relayed human comments are cc"
-    assert priority_of("z@x.test|m-otp") == "noise", "login codes are noise"
-    assert priority_of("z@x.test|m-confirm-code") == "noise", "confirmation codes are noise"
-    assert priority_of("z@x.test|m-rsvp") == "cc", "auto-RSVP notices are cc"
-    assert priority_of("z@x.test|m-shipment-confirmation") == "noise", "shipment automations are noise"
-    assert priority_of("z@x.test|m-corr") == "direct", "known correspondents beat gmail's bulk category"
-    assert priority_of("z@x.test|m-forum-human") == "cc", "human work-list posts are cc"
-    assert priority_of("z@x.test|m-forum-digest") == "noise", "forum digests are noise"
-    assert priority_of("z@x.test|m-forum-newsletter") == "noise", "forum newsletters are noise"
-    assert priority_of("z@x.test|m-forum-announcement") == "noise", "public-list announcements are noise"
-    assert priority_of("z@x.test|m-forum-new-comment") == "cc", "automated human comment relays remain cc"
-    assert priority_of("z@x.test|m-figma-upgrade") == "cc", "seat requests are human-action relays"
-    assert priority_of("z@x.test|m-airtable-access") == "cc", "access requests are human-action relays"
-    assert priority_of("z@x.test|m-sign-request") == "cc", "signature requests are human-action relays"
-    assert priority_of("z@x.test|m-drive-share") == "cc", "drive shares are human-action relays"
-    assert priority_of("z@x.test|m-vercel-access") == "cc", "app access requests are human-action relays"
+    assert priority_of("z@x.test|merge-20") == 4, "mail-merge blast sends are not his actions"
+    assert priority_of("z@x.test|my-reply") == 1, "a personal reply after inbound mail stays his"
+    assert priority_of("z@x.test|m-replied") == 2, "mail he answered within 48h has his attention"
+    assert priority_of("z@x.test|gh-mention") == 2, "github mention copies are direct"
+    assert priority_of("z@x.test|gh-bot") == 4, "relayed bot payloads are noise"
+    assert priority_of("z@x.test|gh-plain") == 3, "relayed human comments are cc"
+    assert priority_of("z@x.test|m-otp") == 4, "login codes are noise"
+    assert priority_of("z@x.test|m-confirm-code") == 4, "confirmation codes are noise"
+    assert priority_of("z@x.test|m-rsvp") == 3, "auto-RSVP notices are cc"
+    assert priority_of("z@x.test|m-shipment-confirmation") == 4, "shipment automations are noise"
+    assert priority_of("z@x.test|m-corr") == 2, "known correspondents beat gmail's bulk category"
+    assert priority_of("z@x.test|m-forum-human") == 3, "human work-list posts are cc"
+    assert priority_of("z@x.test|m-forum-digest") == 4, "forum digests are noise"
+    assert priority_of("z@x.test|m-forum-newsletter") == 4, "forum newsletters are noise"
+    assert priority_of("z@x.test|m-forum-announcement") == 4, "public-list announcements are noise"
+    assert priority_of("z@x.test|m-forum-new-comment") == 3, "automated human comment relays remain cc"
+    assert priority_of("z@x.test|m-figma-upgrade") == 3, "seat requests are human-action relays"
+    assert priority_of("z@x.test|m-airtable-access") == 3, "access requests are human-action relays"
+    assert priority_of("z@x.test|m-sign-request") == 3, "signature requests are human-action relays"
+    assert priority_of("z@x.test|m-drive-share") == 3, "drive shares are human-action relays"
+    assert priority_of("z@x.test|m-vercel-access") == 3, "app access requests are human-action relays"
     # apple
-    assert priority_of("z@x.test|am-oneway") == "noise", "a 1:1 chat he never answers is a broadcast"
-    assert priority_of("z@x.test|am-shortcode") == "noise", "shortcode-named group blasts are noise"
-    assert priority_of("z@x.test|am-group-active") == "direct", "big group during his active window"
-    assert priority_of("z@x.test|am-group-idle") == "cc", "big group outside his window is peripheral"
+    assert priority_of("z@x.test|am-oneway") == 4, "a 1:1 chat he never answers is a broadcast"
+    assert priority_of("z@x.test|am-shortcode") == 4, "shortcode-named group blasts are noise"
+    assert priority_of("z@x.test|am-group-active") == 2, "big group during his active window"
+    assert priority_of("z@x.test|am-group-idle") == 3, "big group outside his window is peripheral"
     # whatsapp
-    assert priority_of("z@x.test|agent@lid|wm-agent") == "noise", "business/bot accounts are automated"
-    assert priority_of("z@x.test|chat@g.us|wm-stub") == "noise", "contentless E2E stubs are noise"
+    assert priority_of("z@x.test|agent@lid|wm-agent") == 4, "business/bot accounts are automated"
+    assert priority_of("z@x.test|chat@g.us|wm-stub") == 4, "contentless E2E stubs are noise"
     # agent sessions
-    assert priority_of("claude_code|sdk-sess") == "background", "sdk-cli runs are machinery"
-    assert priority_of("claude_code|empty-sess") == "background", "zero-user-turn transcripts are machinery"
-    assert priority_of("claude_desktop|desktop-conv") == "self", "desktop conversations are his even header-only"
-    assert priority_of("claude_code|side-sess") == "background", "sidechain-only subagent transcripts are machinery"
-    assert priority_of("claude_code|routine-0") == "background", "recurring template prompts are scheduled routines"
+    assert priority_of("claude_code|sdk-sess") == 5, "sdk-cli runs are machinery"
+    assert priority_of("claude_code|empty-sess") == 5, "zero-user-turn transcripts are machinery"
+    assert priority_of("claude_desktop|desktop-conv") == 1, "desktop conversations are his even header-only"
+    assert priority_of("claude_code|side-sess") == 5, "sidechain-only subagent transcripts are machinery"
+    assert priority_of("claude_code|routine-0") == 5, "recurring template prompts are scheduled routines"
     # calendar
-    assert priority_of("z@x.test|cal1|ev-feed") == "noise", "subscribed calendar feeds are noise"
-    assert priority_of("z@x.test|cal1|ev-promo") == "noise", "promo-invite blasts are noise"
-    assert priority_of("z@x.test|cal1|ev-flight") == "noise", "flighty auto-events are not his actions"
-    assert priority_of("z@x.test|cal1|ev-invite") == "direct", "human invites are attention"
+    assert priority_of("z@x.test|cal1|ev-feed") == 4, "subscribed calendar feeds are noise"
+    assert priority_of("z@x.test|cal1|ev-promo") == 4, "promo-invite blasts are noise"
+    assert priority_of("z@x.test|cal1|ev-flight") == 4, "flighty auto-events are not his actions"
+    assert priority_of("z@x.test|cal1|ev-invite") == 2, "human invites are attention"
     # drive
-    assert priority_of("z@x.test|f-form") == "cc", "form-response uploads are pipeline traffic"
-    assert priority_of("z@x.test|f-shortcut") == "cc", "shortcut churn is ambient"
+    assert priority_of("z@x.test|f-form") == 3, "form-response uploads are pipeline traffic"
+    assert priority_of("z@x.test|f-shortcut") == 3, "shortcut churn is ambient"
 
 
 def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
@@ -1674,9 +1533,9 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
 
     assert by_event_id["z|T1|D1|dm-1"]["context"] == "DM with Teammate One"
     assert by_event_id["z|T1|D2|dm-name-fallback"]["context"] == "DM with Teammate Two"
-    assert by_event_id["z|T1|D1|dm-file-shell"]["priority"] == "background"
+    assert by_event_id["z|T1|D1|dm-file-shell"]["priority"] == 5
     stale_file = by_event_id[f"z|T1|FSTUB|D1|{stale_message_ts}"]
-    assert stale_file["priority"] == "background"
+    assert stale_file["priority"] == 5
     assert stale_file["event_ts"] < now - timedelta(minutes=30)
 
     whatsapp = by_event_id["z@x.test|friend@lid|voice-1"]
@@ -1690,9 +1549,9 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     imessage = by_event_id["z@x.test|im-attach"]
     assert imessage["snippet"] == "[attachment: photo.jpg]"
 
-    assert by_event_id["z@x.test|primary|cancelled"]["priority"] != "self"
-    assert by_event_id["z@x.test|primary|future"]["priority"] != "self"
-    assert by_event_id["openclaw|subagent-cron"]["priority"] == "background"
+    assert by_event_id["z@x.test|primary|cancelled"]["priority"] != 1
+    assert by_event_id["z@x.test|primary|future"]["priority"] != 1
+    assert by_event_id["openclaw|subagent-cron"]["priority"] == 5
 
 
 def test_voice_memo_timeline_refreshes_when_enrichment_arrives_later(warehouse):
@@ -1772,7 +1631,7 @@ def test_refresh_window_converges_late_signals(warehouse):
     row = warehouse._query(
         "SELECT priority FROM timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
     )
-    assert row[0][0] == "cc", "no engagement yet: ambient member channel"
+    assert row[0][0] == 3, "no engagement yet: ambient member channel"
 
     # Zach replies twice; the original message predates the watermark so only
     # the refresh re-walk can reclassify it.
@@ -1794,7 +1653,7 @@ def test_refresh_window_converges_late_signals(warehouse):
     row = warehouse._query(
         "SELECT priority FROM timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
     )
-    assert row[0][0] == "direct", "his replies retroactively promote the conversation window"
+    assert row[0][0] == 2, "his replies retroactively promote the conversation window"
 
 
 def test_incremental_picks_up_new_and_changed_rows(warehouse):
