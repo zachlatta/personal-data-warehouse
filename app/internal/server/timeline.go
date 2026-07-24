@@ -99,7 +99,7 @@ SELECT adapter, event_id, source, kind, priority, event_ts, end_ts, actor, title
 FROM ` + warehouse.SQLRelation("timeline_events") + `
 WHERE ($1 = '' OR source = ANY(string_to_array($1, ',')))
   AND ($2 = '' OR kind = ANY(string_to_array($2, ',')))
-  AND ($3 = '' OR priority = ANY(string_to_array($3, ',')::bigint[]))
+  AND ($3 = '' OR priority::text = ANY(string_to_array($3, ',')))
   AND (event_ts, seq) < ($4::timestamptz, $5::bigint)
 ORDER BY event_ts DESC, seq DESC
 LIMIT $6`
@@ -125,7 +125,7 @@ func parseTimelineCursor(raw string) (string, int64, error) {
 
 var (
 	timelineTokenListPattern    = regexp.MustCompile(`^[a-z0-9_,-]*$`)
-	timelinePriorityListPattern = regexp.MustCompile(`^[0-9,]*$`)
+	timelinePriorityListPattern = regexp.MustCompile(`^[a-z,]*$`)
 )
 
 func (s *timelineService) handleList(w http.ResponseWriter, r *http.Request) {
@@ -275,7 +275,11 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "pi", kind: "agent_session"},
 }
 
-var timelinePriorityCatalog = []int64{1, 2, 3, 4, 5}
+// Timeline priority tiers (the timeline_priority enum labels), highest
+// attention first. 'unclassified' is intentionally omitted: every adapter emits
+// a real tier, so it only appears transiently on not-yet-synced rows and never
+// needs a sidebar filter chip.
+var timelinePriorityCatalog = []string{"self", "direct", "cc", "noise", "background"}
 
 // handleSources serves the sidebar's counts. The aggregates behind them scan
 // the whole timeline (minutes on a cold multi-GB table), so the handler never
