@@ -2269,7 +2269,7 @@ class PostgresWarehouse:
             """
         )
 
-    def _migrate_timeline_priority_to_enum(self, timeline_rel: Any, *, batch_size: int = 50000) -> None:
+    def _migrate_timeline_priority_to_enum(self, timeline_rel: Any, *, block_batch: int = 10000) -> None:
         """One-time, resumable ``bigint`` -> ``timeline_priority`` migration.
 
         Batched and non-locking so it never rewrites the whole (multi-GB) table
@@ -2304,38 +2304,35 @@ class PostgresWarehouse:
                 "ADD COLUMN priority_enum timeline_priority NOT NULL DEFAULT 'unclassified'"
             )
 
-        # Backfill legacy tiers by walking the primary key once (keyset
-        # pagination). A `WHERE priority_enum IS DISTINCT FROM ... LIMIT` batch
-        # re-seq-scans the whole table every iteration (there is no index on the
-        # new column), which is O(rows^2) on the 40M+ row production table.
-        # Walking (adapter, event_id) ranges rides the primary-key index, so the
-        # total cost is O(rows); each range UPDATE stays idempotent
-        # (IS DISTINCT FROM) so already-migrated rows (a resumed or partly
-        # migrated table) are cheap no-ops and the walk is safe to restart.
+        # Backfill legacy tiers by walking the heap in physical (ctid block)
+        # order. A primary-key keyset walk reads each batch's rows in index
+        # order but they are physically scattered across the multi-GB heap, so
+        # every batch does thousands of random page reads (minutes per batch on
+        # a table that does not fit in cache). A `ctid >= '(a,0)' AND ctid <
+        # '(b,0)'` range is a sequential Tid Range Scan of contiguous blocks
+        # instead: O(rows) with sequential I/O. Each range UPDATE is idempotent
+        # (IS DISTINCT FROM) so a restart re-scans already-done blocks cheaply
+        # (sequential read, no writes) and a partly migrated table converges.
         map_case = (
             "(CASE priority WHEN 1 THEN 'self' WHEN 2 THEN 'direct' "
             "WHEN 3 THEN 'cc' WHEN 4 THEN 'noise' WHEN 5 THEN 'background' "
             "ELSE 'unclassified' END)::timeline_priority"
         )
-        cursor_adapter, cursor_event_id = "", ""
-        while True:
-            batch = self._query(
-                "SELECT adapter, event_id FROM timeline_events "
-                "WHERE (adapter, event_id) > (%s, %s) "
-                f"ORDER BY adapter, event_id LIMIT {int(batch_size)}",
-                (cursor_adapter, cursor_event_id),
-            )
-            if not batch:
-                break
-            last_adapter, last_event_id = batch[-1][0], batch[-1][1]
+        total_blocks = self._query(
+            "SELECT (pg_relation_size((quote_ident(%s) || '.' || quote_ident(%s))::regclass) "
+            "/ current_setting('block_size')::bigint)::bigint",
+            (timeline_rel.schema, timeline_rel.name),
+        )[0][0]
+        block = 0
+        step = max(1, int(block_batch))
+        while block <= total_blocks:
+            high = block + step
             self._command(
                 f"UPDATE timeline_events SET priority_enum = {map_case} "
-                "WHERE (adapter, event_id) > (%s, %s) "
-                "AND (adapter, event_id) <= (%s, %s) "
-                f"AND priority_enum IS DISTINCT FROM {map_case}",
-                (cursor_adapter, cursor_event_id, last_adapter, last_event_id),
+                f"WHERE ctid >= '({block},0)'::tid AND ctid < '({high},0)'::tid "
+                f"AND priority_enum IS DISTINCT FROM {map_case}"
             )
-            cursor_adapter, cursor_event_id = last_adapter, last_event_id
+            block = high
 
         # Build the replacement index without a write lock (autocommit conn),
         # then swap column + index names atomically so readers never see a
