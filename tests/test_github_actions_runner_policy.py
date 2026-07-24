@@ -31,3 +31,9 @@ def test_fork_pull_request_builds_remain_github_hosted() -> None:
 
         assert "\n  pull_request:\n" in workflow
         assert "'ubuntu-latest' || 'rotom-builder'" in workflow
+
+
+def test_cli_build_matrix_queues_only_one_rotom_job_at_a_time() -> None:
+    workflow = CLI_WORKFLOW.read_text()
+
+    assert "strategy:\n      fail-fast: false\n      max-parallel: 1\n" in workflow
