@@ -963,7 +963,7 @@ _APPLE_MESSAGE = _simple_adapter(
         "               AND z.is_from_me = 1) THEN 2 "
         "ELSE 3 END"
     ),
-    max_incremental_batches_per_run=2,
+    max_incremental_batches_per_run=1,
     refresh_hours=168,
 )
 

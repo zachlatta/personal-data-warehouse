@@ -1352,6 +1352,12 @@ def test_timeline_reemits_old_apple_message_when_contact_identity_changes(
         assert warehouse._query(
             "SELECT actor, count(*) FROM timeline_events "
             "WHERE adapter='apple_message' GROUP BY actor ORDER BY actor"
+        ) == [(phone, 3), ("Example Person", 2)]
+
+        engine.run()
+        assert warehouse._query(
+            "SELECT actor, count(*) FROM timeline_events "
+            "WHERE adapter='apple_message' GROUP BY actor ORDER BY actor"
         ) == [(phone, 1), ("Example Person", 4)]
 
         engine.run()

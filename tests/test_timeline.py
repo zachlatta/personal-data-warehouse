@@ -198,7 +198,7 @@ def test_apple_message_contact_changes_invalidate_message_history():
         "apple_message_handles h"
     )
     assert adapter.batch_size == 2_000
-    assert adapter.max_incremental_batches_per_run == 2
+    assert adapter.max_incremental_batches_per_run == 1
     assert adapter.refresh_hours == 168
 
 
