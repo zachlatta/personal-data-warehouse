@@ -1012,6 +1012,9 @@ func schemaErrorHint(message, sql string) string {
 	if hint := datetimeOperatorHint(message); hint != "" {
 		return hint
 	}
+	if hint := undefinedFunctionHint(message); hint != "" {
+		return hint
+	}
 	if hint := undefinedTableHint(message); hint != "" {
 		return hint
 	}
@@ -1080,6 +1083,42 @@ func datetimeOperatorHint(message string) string {
 		return "(hint: that column is timestamp with time zone — compare it to a timestamp, not an epoch integer, e.g. message_at >= '2026-01-01' instead of message_at > 1700000000.)"
 	}
 	return ""
+}
+
+// functionRemaps point a bare function name at its schema-qualified form. The
+// search entry points are the ones agents reach for unqualified, because that
+// is how they were callable before the schema reorganization moved them.
+var functionRemaps = map[string]string{
+	"search_text":         "search.search_text",
+	"search_text_exact":   "search.search_text_exact",
+	"search_text_sources": "search.search_text_sources",
+}
+
+var undefinedFunctionRe = regexp.MustCompile(`function ([a-zA-Z0-9_."]+)\s*\(`)
+
+// undefinedFunctionHint fires on a missing function (SQLSTATE 42883). Query
+// sessions run with Postgres' default '"$user", public' search_path — the same
+// reason relations must be schema-qualified — so a bare search_text('needle')
+// resolves to nothing. This error is the GOOD outcome: until the pre-schema-
+// reorganization public.search_text copy was dropped, that call resolved to a
+// stale function whose per-branch exception guard silently returned zero rows,
+// so search looked empty instead of misqualified.
+func undefinedFunctionHint(message string) string {
+	if !strings.Contains(message, "42883") || !strings.Contains(message, "does not exist") {
+		return ""
+	}
+	match := undefinedFunctionRe.FindStringSubmatch(message)
+	if match == nil {
+		return ""
+	}
+	name := strings.ToLower(strings.ReplaceAll(match[1], `"`, ""))
+	if idx := strings.LastIndex(name, "."); idx >= 0 {
+		name = name[idx+1:]
+	}
+	if remap, ok := functionRemaps[name]; ok {
+		return fmt.Sprintf("(hint: call %s(...) — queries carry no warehouse search_path, so its functions must be schema-qualified just like its tables.)", remap)
+	}
+	return "(hint: no such function — queries carry no warehouse search_path, so schema-qualify warehouse functions: search.search_text('needle', 50) for ranked search, search.search_text_exact('needle', 50) for literal substrings. Run schema_overview for the rest.)"
 }
 
 // undefinedTableHint fires on a missing relation (SQLSTATE 42P01). A known

@@ -465,6 +465,91 @@ def test_old_layout_raw_control_tables_migrate_without_public_leftovers(warehous
     assert legacy_rows == []
 
 
+def _search_routine_names(warehouse: PostgresWarehouse, schema: str) -> list[str]:
+    return [
+        row[0]
+        for row in warehouse._query(
+            """
+            SELECT p.proname
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = %s
+              AND p.proname IN ('search_text', 'search_text_exact', 'search_text_sources')
+            ORDER BY p.proname
+            """,
+            (schema,),
+        )
+    ]
+
+
+def _search_hit_type_names(warehouse: PostgresWarehouse, schema: str) -> list[str]:
+    return [
+        row[0]
+        for row in warehouse._query(
+            """
+            SELECT t.typname
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE n.nspname = %s AND t.typname = 'search_text_hit'
+            """,
+            (schema,),
+        )
+    ]
+
+
+def test_old_layout_search_functions_are_dropped_not_left_shadowing() -> None:
+    """The pre-reorg search_text copies must not survive in the base namespace.
+
+    They do not just sit there unused: they SHADOW the real functions for every
+    caller that does not set a search_path. The app's read-only query runner
+    resolves through Postgres' default '"$user", public', so an unqualified
+    search_text() call found the pre-reorg public copy first. That copy predates
+    the function-level search_path pin, so its per-branch dynamic SQL could not
+    resolve the timeline BM25 index from a bare public path — and search_text()'s
+    per-branch exception guard turned every lookup failure into an empty result
+    instead of an error. Unqualified search returned zero rows for 16 days while
+    search.search_text() worked fine.
+    """
+    # Deliberately NOT the module fixture: its labelled namespace is longer than
+    # Postgres' 63-byte identifier limit, so the schema is created under a
+    # truncated name and every catalog lookup keyed on the full name misses. The
+    # legacy sweep this test covers is exactly such a lookup, so the namespace
+    # has to round-trip; the pre-condition assertions below fail loudly if it
+    # ever stops doing so.
+    namespace = make_test_schema()
+    warehouse = PostgresWarehouse(_postgres_url(), schema=namespace)
+    try:
+        warehouse._raw_command(
+            f'CREATE TYPE "{namespace}".search_text_hit AS (source text, ref text, text text, score real)'
+        )
+        warehouse._raw_command(
+            f'CREATE FUNCTION "{namespace}".search_text('
+            "query text, max_results integer DEFAULT 50, "
+            "sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL) "
+            f'RETURNS SETOF "{namespace}".search_text_hit LANGUAGE sql STABLE AS '
+            "$$ SELECT NULL::text, NULL::text, NULL::text, NULL::real WHERE false $$"
+        )
+        warehouse._raw_command(
+            f'CREATE FUNCTION "{namespace}".search_text_sources() RETURNS TABLE (source text) '
+            "LANGUAGE sql IMMUTABLE AS $$ SELECT NULL::text WHERE false $$"
+        )
+        assert _search_routine_names(warehouse, namespace) == ["search_text", "search_text_sources"]
+        assert _search_hit_type_names(warehouse, namespace) == ["search_text_hit"]
+
+        warehouse.ensure_timeline_tables()
+
+        assert _search_routine_names(warehouse, namespace) == []
+        assert _search_hit_type_names(warehouse, namespace) == []
+        search_schema = physical_schema_name("search", namespace=namespace)
+        assert _search_routine_names(warehouse, search_schema) == [
+            "search_text",
+            "search_text_exact",
+            "search_text_sources",
+        ]
+    finally:
+        cleanup_test_warehouse(warehouse)
+
+
 def test_old_layout_sync_state_migrates_without_legacy_public_view(warehouse: PostgresWarehouse) -> None:
     warehouse._raw_command(
         f"""

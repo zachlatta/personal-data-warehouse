@@ -6756,6 +6756,11 @@ class PostgresWarehouse:
 
     _SEARCH_SCHEMA_MARKER_TABLE = "search_schema_state"
 
+    # Search routines/types the pre-reorganization layout created directly in
+    # the base namespace, before they moved into the `search` schema.
+    _LEGACY_SEARCH_ROUTINES = ("search_text", "search_text_exact", "search_text_sources")
+    _LEGACY_SEARCH_HIT_TYPE = "search_text_hit"
+
     def _ensure_search_views_if_possible(self) -> None:
         # Several Dagster assets can call ensure_* concurrently on deploy. The
         # shared search_text() function/index refresh mutates global Postgres
@@ -6777,6 +6782,7 @@ class PostgresWarehouse:
         # BM25 search_text() function. Drop any copy older deployments left
         # behind so it cannot be used as a slow fallback.
         self._command("DROP VIEW IF EXISTS searchable_text")
+        self._drop_legacy_search_routines_if_present()
         if not all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
             return
         # Build the timeline BM25 index search_text() references BEFORE
@@ -6794,6 +6800,62 @@ class PostgresWarehouse:
             return
         self._ensure_search_text_function()
         self._write_search_schema_signature(signature)
+
+    def _drop_legacy_search_routines_if_present(self) -> None:
+        """Drop pre-reorganization search_text copies from the base namespace.
+
+        The schema reorganization moved these functions (and their row type)
+        into the `search` schema but left the base-namespace copies behind, and
+        a stale copy does not sit there harmlessly: it SHADOWS the real one.
+        Callers that do not set a search_path — the app's read-only query
+        runner resolves through Postgres' default '"$user", public' — found
+        `public.search_text` first. That copy predates the function-level
+        search_path pin below, so its per-branch dynamic SQL could not resolve
+        the timeline BM25 index, and search_text()'s per-branch exception guard
+        (which exists so one unusable branch degrades instead of failing the
+        whole search) turned that into an empty result set. Unqualified search
+        silently returned zero rows for 16 days while search.search_text()
+        worked fine.
+
+        Sweeping on every refresh, rather than once behind the DDL signature
+        cache, keeps a copy resurrected by an older deployment from shadowing
+        the current functions again.
+        """
+        legacy_schema = self._schema
+        if legacy_schema == self.physical_schema_name("search"):
+            return
+        routines = self._query(
+            """
+            SELECT p.proname, pg_get_function_identity_arguments(p.oid)
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = %s AND p.proname = ANY(%s)
+            """,
+            (legacy_schema, list(self._LEGACY_SEARCH_ROUTINES)),
+        )
+        for name, arguments in routines:
+            self._raw_command(
+                f"DROP FUNCTION IF EXISTS {_identifier(legacy_schema)}.{_identifier(name)}({arguments})"
+            )
+        legacy_type_present = bool(
+            self._query(
+                """
+                SELECT 1
+                FROM pg_type t
+                JOIN pg_namespace n ON n.oid = t.typnamespace
+                WHERE n.nspname = %s AND t.typname = %s
+                LIMIT 1
+                """,
+                (legacy_schema, self._LEGACY_SEARCH_HIT_TYPE),
+            )
+        )
+        if legacy_type_present:
+            # Plain DROP (no CASCADE): the functions above were the only thing
+            # that should reference this row type, so anything still depending
+            # on it is a surprise worth failing on rather than deleting.
+            self._raw_command(
+                f"DROP TYPE IF EXISTS {_identifier(legacy_schema)}.{_identifier(self._LEGACY_SEARCH_HIT_TYPE)}"
+            )
 
     def _search_schema_signature(self) -> str:
         """Signature of everything that determines the generated search DDL.

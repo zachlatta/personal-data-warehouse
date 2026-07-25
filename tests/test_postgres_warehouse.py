@@ -116,16 +116,29 @@ def _message_row(*, message_id: str, subject: str, labels: list[str], sync_versi
 
 def test_search_view_refresh_takes_advisory_lock(monkeypatch) -> None:
     warehouse = object.__new__(PostgresWarehouse)
+    warehouse._schema = "public"
     commands: list[tuple[str, tuple | None]] = []
 
     monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: commands.append((sql, params)))
     monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: False)
+    # Report one pre-reorganization copy so the DROP the legacy sweep issues for
+    # it has to land inside the advisory lock like the rest of the refresh.
+    monkeypatch.setattr(
+        warehouse,
+        "_query",
+        lambda sql, params=None: [("search_text", "query text, max_results integer")] if "pg_proc" in sql else [],
+    )
+    monkeypatch.setattr(warehouse, "_raw_command", lambda sql, params=None: commands.append((sql, params)))
 
     warehouse._ensure_search_views_if_possible()
 
     assert commands[0] == ("SELECT pg_advisory_lock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
     assert commands[-1] == ("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
     assert ("DROP VIEW IF EXISTS searchable_text", None) in commands
+    assert (
+        'DROP FUNCTION IF EXISTS "public"."search_text"(query text, max_results integer)',
+        None,
+    ) in commands
 
 
 def test_search_view_refresh_releases_advisory_lock_on_error(monkeypatch) -> None:

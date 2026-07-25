@@ -522,6 +522,30 @@ func TestSchemaErrorHint(t *testing.T) {
 			want:    []string{"schema_overview"},
 		},
 		{
+			name:    "unqualified search_text names the search-schema function",
+			message: "ERROR: function search_text(unknown, integer) does not exist (SQLSTATE 42883)",
+			sql:     "SELECT * FROM search_text('invoice', 50)",
+			want:    []string{"search.search_text("},
+		},
+		{
+			name:    "unqualified search_text_exact names the search-schema function",
+			message: "ERROR: function search_text_exact(unknown, integer) does not exist (SQLSTATE 42883)",
+			sql:     "SELECT * FROM search_text_exact('invoice', 50)",
+			want:    []string{"search.search_text_exact("},
+		},
+		{
+			name:    "public-qualified search_text still points at the search schema",
+			message: "ERROR: function public.search_text(unknown, integer) does not exist (SQLSTATE 42883)",
+			sql:     "SELECT * FROM public.search_text('invoice', 50)",
+			want:    []string{"search.search_text("},
+		},
+		{
+			name:    "unknown function is told to schema-qualify",
+			message: "ERROR: function frobnicate(integer) does not exist (SQLSTATE 42883)",
+			sql:     "SELECT frobnicate(1)",
+			want:    []string{"schema-qualif"},
+		},
+		{
 			name:    "numeric cast of empty cursor_ts",
 			message: `ERROR: invalid input syntax for type numeric: "" (SQLSTATE 22P02)`,
 			sql:     "SELECT cursor_ts::numeric FROM slack.sync_state WHERE cursor_ts = ''",
