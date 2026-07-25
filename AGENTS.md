@@ -402,8 +402,15 @@ are transient syndicated/shared records that Photos stores in `ZASSET` but does 
 user-library `PHAsset`s. Photo and video assets request PhotoKit's original resource type; Live
 Photos also request the original paired-video resource under the still's ZUUID with
 `role=live_video`. A missing asset, failed iCloud download, empty export, or size mismatch is a
-loud run failure that retries later—never a successful local-only coverage count. Complete bytes
-then go through `POST /ingest/photos/file/resumable` + `/ingest/photos/metadata`. The app creates a
+loud run failure that retries later—never a successful local-only coverage count. Repeated
+failures on one file back off exponentially (30 min doubling to 7 days) and are dropped from
+selection while backed off, so a file PhotoKit will never export cannot consume the run's
+`--limit` slots; after 5 attempts it also stops failing the run and is reported as
+`deferred=`/`failed=` in the summary instead. That demotion requires an upload to have succeeded
+since the streak began, so a real outage (revoked Photos access, dead network) stays loudly red
+rather than going quietly green. `--retry-failed` clears every backoff for an immediate retry.
+Complete bytes then go through
+`POST /ingest/photos/file/resumable` + `/ingest/photos/metadata`. The app creates a
 scoped Google Drive resumable session after its normal content-sha dedup check; the uploader
 streams the export to Drive in 16 MiB chunks, resumes from Drive's acknowledged byte after
 timeouts, and verifies Drive's final sha256 + size before uploading the envelope. Photo files

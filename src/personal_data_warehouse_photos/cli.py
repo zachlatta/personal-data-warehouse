@@ -48,6 +48,11 @@ def main() -> None:
         help="Request one-time macOS Photos library access and exit",
     )
     parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Clear the retry backoff on previously failed files so they are attempted this run",
+    )
+    parser.add_argument(
         "--network-diagnostics",
         action="store_true",
         help="Print network guard diagnostics and exit",
@@ -89,6 +94,9 @@ def main() -> None:
             if not acquired:
                 print("Photo upload skipped: another uploader run is active")
                 return
+            if args.retry_failed:
+                cleared = state.clear_failures()
+                print(f"Cleared the retry backoff on {cleared} previously failed file(s)")
             try:
                 summary = PhotosUploadRunner(
                     account=settings.photos.account,
@@ -117,7 +125,9 @@ def main() -> None:
         f"selected={summary.files_selected} "
         f"exported={summary.files_exported} "
         f"uploaded={summary.files_uploaded} "
-        f"skipped={summary.files_skipped}"
+        f"skipped={summary.files_skipped} "
+        f"deferred={summary.files_deferred} "
+        f"failed={summary.files_failed}"
     )
 
 

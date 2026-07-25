@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import tempfile
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from personal_data_warehouse_photos.envelope import build_photo_metadata, provenance_dedup_sha256
@@ -27,6 +27,28 @@ from personal_data_warehouse_photos.state import SOURCE_TYPE_ASSET_FILE, PhotosU
 
 PHOTO_SOURCE = "apple_photos"
 
+# Some rows in Photos.sqlite can never be exported through PhotoKit (burst
+# stack members, records whose iCloud original is gone, ...). Retrying them
+# every 30 minutes forever burned the run's export budget and, because the
+# first failure was re-raised, kept every scheduled run red — so a handful of
+# dead assets hid the health of the ~12k that upload fine. Failing files are
+# therefore backed off exponentially, and after MAX_FATAL_ATTEMPTS they stop
+# failing the run: they are reported loudly in the summary instead.
+MAX_FATAL_ATTEMPTS = 5
+RETRY_BACKOFF_BASE = timedelta(minutes=30)
+MAX_RETRY_BACKOFF = timedelta(days=7)
+# 2 ** 12 * 30min is far past the cap; bound the shift so the delay math cannot
+# overflow for a file that has been failing for years.
+MAX_BACKOFF_DOUBLINGS = 12
+
+
+def retry_delay(failure_count: int) -> timedelta:
+    """Exponential backoff for a file that has failed ``failure_count`` times."""
+    if failure_count <= 0:
+        return timedelta(0)
+    doublings = min(failure_count, MAX_BACKOFF_DOUBLINGS) - 1
+    return min(RETRY_BACKOFF_BASE * (2**doublings), MAX_RETRY_BACKOFF)
+
 
 @dataclass(frozen=True)
 class PhotosUploadSummary:
@@ -39,6 +61,8 @@ class PhotosUploadSummary:
     metadata_uploaded: int
     bytes_exported: int = 0
     bytes_uploaded: int = 0
+    files_deferred: int = 0
+    files_failed: int = 0
 
 
 class PhotosUploadRunner:
@@ -109,22 +133,32 @@ class PhotosUploadRunner:
 
         selected: list[PhotoFileCandidate] = []
         state_skipped = 0
+        deferred: list[tuple[PhotoFileCandidate, datetime]] = []
         for candidate in candidates:
             if self._mode == "incremental" and self._is_state_complete(candidate):
                 state_skipped += 1
+                continue
+            retry_at = self._retry_not_before(candidate)
+            if retry_at is not None:
+                deferred.append((candidate, retry_at))
                 continue
             selected.append(candidate)
         # The limit applies AFTER state selection (unlike voice memos) so a
         # capped run always makes forward progress through the backlog instead
         # of re-considering the same already-complete head of the list.
+        # Backed-off failures are dropped before the limit too, so broken files
+        # never consume slots that working ones need.
         if self._limit is not None:
             selected = selected[: self._limit]
 
         self._logger.info(
-            "Incremental selection: selected=%s skipped=%s",
+            "Incremental selection: selected=%s skipped=%s deferred=%s",
             len(selected),
             state_skipped,
+            len(deferred),
         )
+        if deferred:
+            self._log_deferred(deferred)
         if selected and self._before_upload_check is not None:
             skip_reason = self._before_upload_check()
             if skip_reason:
@@ -137,13 +171,14 @@ class PhotosUploadRunner:
                     files_exported=0,
                     files_uploaded=0,
                     metadata_uploaded=0,
+                    files_deferred=len(deferred),
                 )
 
         # Per-file failures are collected, not raised mid-batch (voice-memos
         # pattern): successes are recorded in upload_state so the next run
-        # resumes past them, and the first failure re-raises at the end so the
-        # run still exits non-zero for the status helper.
-        failures: list[tuple[str, Exception]] = []
+        # resumes past them, and a still-retryable failure re-raises at the end
+        # so the run exits non-zero for the status helper.
+        failures: list[tuple[PhotoFileCandidate, Exception]] = []
         uploaded = 0
         metadata_uploaded = 0
         exported_count = 0
@@ -170,15 +205,7 @@ class PhotosUploadRunner:
                 )
             except Exception as exc:  # noqa: BLE001 - surfaced after the batch
                 self._logger.warning("Failed to upload %s: %s", candidate.filename, exc)
-                failures.append((candidate.filename, exc))
-                if self._upload_state is not None:
-                    self._upload_state.mark_failure(
-                        source_type=SOURCE_TYPE_ASSET_FILE,
-                        source_id=candidate.state_id,
-                        fingerprint=candidate.fingerprint,
-                        error=str(exc),
-                        now=self._now(),
-                    )
+                failures.append((candidate, exc))
                 continue
             finally:
                 if exported is not None:
@@ -194,6 +221,8 @@ class PhotosUploadRunner:
             metadata_uploaded += 1
             bytes_uploaded += exported.size_bytes
 
+        retryable = self._record_failures(failures)
+
         summary = PhotosUploadSummary(
             assets_seen=assets_seen,
             files_seen=len(candidates),
@@ -204,10 +233,12 @@ class PhotosUploadRunner:
             metadata_uploaded=metadata_uploaded,
             bytes_exported=bytes_exported,
             bytes_uploaded=bytes_uploaded,
+            files_deferred=len(deferred),
+            files_failed=len(failures),
         )
         self._logger.info(
             "Photo upload summary: assets=%s original_resources=%s selected=%s exported=%s (%s) "
-            "uploaded=%s (%s) skipped=%s",
+            "uploaded=%s (%s) skipped=%s deferred=%s failed=%s",
             summary.assets_seen,
             summary.files_seen,
             summary.files_selected,
@@ -216,8 +247,10 @@ class PhotosUploadRunner:
             summary.files_uploaded,
             format_bytes(summary.bytes_uploaded),
             summary.files_skipped,
+            summary.files_deferred,
+            summary.files_failed,
         )
-        if failures:
+        if retryable:
             self._logger.warning(
                 "Photo upload finished with %s failed file(s) after uploading %s; re-raising the "
                 "first so the run is marked failed (successful uploads are recorded, so the next "
@@ -225,8 +258,52 @@ class PhotosUploadRunner:
                 len(failures),
                 summary.files_uploaded,
             )
-            raise failures[0][1]
+            raise retryable[0]
+        if failures:
+            self._logger.warning(
+                "%s file(s) have now failed %s+ times and no longer fail the run; they retry on "
+                "backoff (up to %s days) and stay visible as failed= in this summary: %s",
+                len(failures),
+                MAX_FATAL_ATTEMPTS,
+                MAX_RETRY_BACKOFF.days,
+                ", ".join(f"{candidate.filename} ({exc})" for candidate, exc in failures[:5]),
+            )
         return summary
+
+    def _record_failures(
+        self, failures: list[tuple[PhotoFileCandidate, Exception]]
+    ) -> list[Exception]:
+        """Persist each failed attempt; return the ones that must fail the run.
+
+        A failure keeps failing the run until the same file has been attempted
+        MAX_FATAL_ATTEMPTS times AND an upload has succeeded since that streak
+        began. The second condition is what keeps a real outage (revoked Photos
+        access, dead network) loudly red instead of quietly "green with
+        failures": if nothing has succeeded since the failures started, every
+        failure is still treated as fatal no matter how many attempts it has.
+        """
+        if self._upload_state is None:
+            return [exc for _, exc in failures]
+        now = self._now()
+        latest_success = self._upload_state.latest_success_at()
+        retryable: list[Exception] = []
+        for candidate, exc in failures:
+            entry = self._upload_state.mark_failure(
+                source_type=SOURCE_TYPE_ASSET_FILE,
+                source_id=candidate.state_id,
+                fingerprint=candidate.fingerprint,
+                error=str(exc),
+                now=now,
+            )
+            first_failure = _parse_timestamp(entry.first_failure_at)
+            proven = (
+                latest_success is not None
+                and first_failure is not None
+                and latest_success >= first_failure
+            )
+            if entry.failure_count < MAX_FATAL_ATTEMPTS or not proven:
+                retryable.append(exc)
+        return retryable
 
     def _is_state_complete(self, candidate: PhotoFileCandidate) -> bool:
         if self._upload_state is None:
@@ -235,6 +312,34 @@ class PhotosUploadRunner:
             source_type=SOURCE_TYPE_ASSET_FILE,
             source_id=candidate.state_id,
             fingerprint=candidate.fingerprint,
+        )
+
+    def _retry_not_before(self, candidate: PhotoFileCandidate) -> datetime | None:
+        """The moment a previously failed candidate may be attempted again."""
+        if self._upload_state is None:
+            return None
+        entry = self._upload_state.entry_for(
+            source_type=SOURCE_TYPE_ASSET_FILE, source_id=candidate.state_id
+        )
+        if entry is None or entry.failure_count <= 0:
+            return None
+        if entry.fingerprint != candidate.fingerprint:
+            # The asset changed in Photos: a different file to upload, so the
+            # old streak says nothing about it.
+            return None
+        last_failure = _parse_timestamp(entry.last_failure_at)
+        if last_failure is None:
+            return None
+        retry_at = last_failure + retry_delay(entry.failure_count)
+        return retry_at if self._now() < retry_at else None
+
+    def _log_deferred(self, deferred: list[tuple[PhotoFileCandidate, datetime]]) -> None:
+        earliest = min(retry_at for _, retry_at in deferred)
+        self._logger.warning(
+            "Deferred %s previously failed file(s) still in retry backoff (earliest retry %s): %s",
+            len(deferred),
+            earliest.isoformat(),
+            ", ".join(candidate.filename for candidate, _ in deferred[:5]),
         )
 
     def _upload_candidate(
@@ -302,6 +407,15 @@ class PhotosUploadRunner:
                 content_sha256=content_sha256,
                 storage_key=str(stored.get("storage_key", "")) if isinstance(stored, dict) else "",
             )
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def format_bytes(count: float) -> str:

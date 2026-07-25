@@ -30,6 +30,11 @@ class PhotosUploadStateEntry:
     last_failure_at: str = ""
     last_error: str = ""
     last_checked_at: str = ""
+    # Consecutive failed attempts for this fingerprint, and when the current
+    # failing streak started. They drive the runner's retry backoff, so a file
+    # PhotoKit will never export cannot hold the whole schedule hostage.
+    failure_count: int = 0
+    first_failure_at: str = ""
 
 
 class PhotosUploadState:
@@ -54,7 +59,8 @@ class PhotosUploadState:
         row = self._connection.execute(
             """
             SELECT source_type, source_id, fingerprint, complete, content_sha256, storage_key,
-                   last_success_at, last_failure_at, last_error, last_checked_at
+                   last_success_at, last_failure_at, last_error, last_checked_at,
+                   failure_count, first_failure_at
             FROM upload_state
             WHERE source_type = ? AND source_id = ?
             """,
@@ -73,7 +79,30 @@ class PhotosUploadState:
             last_failure_at=str(row["last_failure_at"]),
             last_error=str(row["last_error"]),
             last_checked_at=str(row["last_checked_at"]),
+            failure_count=int(row["failure_count"] or 0),
+            first_failure_at=str(row["first_failure_at"]),
         )
+
+    def latest_success_at(self) -> datetime | None:
+        """When this uploader last proved the whole export path works."""
+        row = self._connection.execute(
+            "SELECT MAX(last_success_at) AS moment FROM upload_state WHERE last_success_at != ''"
+        ).fetchone()
+        moment = str(row["moment"] or "") if row is not None else ""
+        if not moment:
+            return None
+        try:
+            return datetime.fromisoformat(moment)
+        except ValueError:
+            return None
+
+    def clear_failures(self) -> int:
+        """Forget every failing streak so backed-off files retry immediately."""
+        cursor = self._connection.execute(
+            "UPDATE upload_state SET failure_count = 0, first_failure_at = '' WHERE failure_count != 0"
+        )
+        self._connection.commit()
+        return int(cursor.rowcount or 0)
 
     def is_complete(self, *, source_type: str, source_id: str, fingerprint: str) -> bool:
         entry = self.entry_for(source_type=source_type, source_id=source_id)
@@ -94,9 +123,10 @@ class PhotosUploadState:
             """
             INSERT INTO upload_state (
                 source_type, source_id, fingerprint, complete, content_sha256, storage_key,
-                last_success_at, last_failure_at, last_error, last_checked_at
+                last_success_at, last_failure_at, last_error, last_checked_at,
+                failure_count, first_failure_at
             )
-            VALUES (?, ?, ?, 1, ?, ?, ?, '', '', ?)
+            VALUES (?, ?, ?, 1, ?, ?, ?, '', '', ?, 0, '')
             ON CONFLICT(source_type, source_id) DO UPDATE SET
                 fingerprint = excluded.fingerprint,
                 complete = excluded.complete,
@@ -105,7 +135,9 @@ class PhotosUploadState:
                 last_success_at = excluded.last_success_at,
                 last_failure_at = '',
                 last_error = '',
-                last_checked_at = excluded.last_checked_at
+                last_checked_at = excluded.last_checked_at,
+                failure_count = 0,
+                first_failure_at = ''
             """,
             (source_type, source_id, fingerprint, content_sha256, storage_key, timestamp, timestamp),
         )
@@ -119,22 +151,35 @@ class PhotosUploadState:
         fingerprint: str,
         error: str,
         now: datetime,
-    ) -> None:
+    ) -> PhotosUploadStateEntry:
+        """Record one failed attempt and return the updated entry.
+
+        Attempts accumulate only while the fingerprint is unchanged: a re-edited
+        asset is a different file to upload and starts a fresh streak.
+        """
         timestamp = now.astimezone(UTC).isoformat()
         existing = self.entry_for(source_type=source_type, source_id=source_id)
+        same_file = existing is not None and existing.fingerprint == fingerprint
+        failure_count = (existing.failure_count if same_file and existing else 0) + 1
+        first_failure_at = (
+            existing.first_failure_at if same_file and existing and existing.first_failure_at else timestamp
+        )
         self._connection.execute(
             """
             INSERT INTO upload_state (
                 source_type, source_id, fingerprint, complete, content_sha256, storage_key,
-                last_success_at, last_failure_at, last_error, last_checked_at
+                last_success_at, last_failure_at, last_error, last_checked_at,
+                failure_count, first_failure_at
             )
-            VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_type, source_id) DO UPDATE SET
                 fingerprint = excluded.fingerprint,
                 complete = 0,
                 last_failure_at = excluded.last_failure_at,
                 last_error = excluded.last_error,
-                last_checked_at = excluded.last_checked_at
+                last_checked_at = excluded.last_checked_at,
+                failure_count = excluded.failure_count,
+                first_failure_at = excluded.first_failure_at
             """,
             (
                 source_type,
@@ -146,9 +191,14 @@ class PhotosUploadState:
                 timestamp,
                 error,
                 timestamp,
+                failure_count,
+                first_failure_at,
             ),
         )
         self._connection.commit()
+        entry = self.entry_for(source_type=source_type, source_id=source_id)
+        assert entry is not None  # just written
+        return entry
 
     def _ensure_schema(self) -> None:
         self._connection.execute(
@@ -172,10 +222,27 @@ class PhotosUploadState:
                 last_failure_at TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',
                 last_checked_at TEXT NOT NULL DEFAULT '',
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                first_failure_at TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (source_type, source_id)
             )
             """
         )
+        # Add retry-tracking columns to state files written before they existed.
+        # Bumping STATE_SCHEMA_VERSION instead would wipe every completed row
+        # and re-upload the whole library.
+        present = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(upload_state)").fetchall()
+        }
+        for column, definition in (
+            ("failure_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("first_failure_at", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in present:
+                self._connection.execute(
+                    f"ALTER TABLE upload_state ADD COLUMN {column} {definition}"  # noqa: S608 - fixed names
+                )
         self._connection.commit()
 
     def _ensure_metadata(self) -> None:
