@@ -4,11 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -110,6 +113,7 @@ func (r *PostgresRunner) QueryArgsWithTimeout(ctx context.Context, statement str
 
 	rows, err := tx.QueryContext(ctx, statement, args...)
 	if err != nil {
+		err = withPostgresDiagnostics(err)
 		logger.ErrorContext(ctx, "Postgres query dispatch failed", "sql", statement, "error", err, "duration", time.Since(started))
 		return RawResult{}, err
 	}
@@ -146,6 +150,42 @@ func (r *PostgresRunner) QueryArgsWithTimeout(ctx context.Context, statement str
 	}
 	logger.DebugContext(ctx, "Postgres query returned", "sql", statement, "rows", len(result.Rows), "columns", len(result.Columns), "duration", time.Since(started))
 	return result, nil
+}
+
+// postgresError carries a Postgres error whose text has been widened to
+// include the server's own DETAIL and HINT.
+type postgresError struct {
+	err  error
+	text string
+}
+
+func (e *postgresError) Error() string { return e.text }
+func (e *postgresError) Unwrap() error { return e.err }
+
+// withPostgresDiagnostics restores the diagnostics pgx drops on the floor.
+// pgconn.PgError.Error() renders only "severity: message (SQLSTATE code)", so
+// the server's DETAIL and — far more usefully — its HINT never reached callers.
+// Postgres computes a Levenshtein-based suggestion for undefined columns and
+// tables ("Perhaps you meant to reference the column messages.message_at"),
+// which is exactly the answer for the long tail of one-off wrong column names
+// that no hand-maintained remap table can cover. It was there all along and we
+// were discarding it.
+func withPostgresDiagnostics(err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return err
+	}
+	var extra []string
+	if pgErr.Detail != "" {
+		extra = append(extra, "DETAIL: "+pgErr.Detail)
+	}
+	if pgErr.Hint != "" {
+		extra = append(extra, "HINT: "+pgErr.Hint)
+	}
+	if len(extra) == 0 {
+		return err
+	}
+	return &postgresError{err: err, text: pgErr.Error() + " " + strings.Join(extra, " ")}
 }
 
 var postgresRoleIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)

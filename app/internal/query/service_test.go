@@ -64,87 +64,99 @@ func describeColumnsSQL(schema, table string) string {
 		"ORDER BY a.attnum"
 }
 
-func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
+// overviewColumnCatalogSQL and overviewPrimaryKeySQL replaced 108 per-relation
+// describe queries: the overview no longer prints columns, so it no longer pays
+// to fetch them one relation at a time.
+func overviewColumnCatalogSQL() string {
+	return "SELECT n.nspname AS schema, c.relname AS name, " +
+		"count(*)::bigint AS column_count, " +
+		"array_to_string(array_agg(a.attname ORDER BY a.attnum) " +
+		"FILTER (WHERE format_type(a.atttypid, a.atttypmod) = 'timestamp with time zone'), ',') AS time_columns " +
+		"FROM pg_attribute a " +
+		"JOIN pg_class c ON c.oid = a.attrelid " +
+		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
+		"WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") " +
+		"AND c.relkind IN ('r', 'p', 'm', 'v') AND a.attnum > 0 AND NOT a.attisdropped " +
+		"GROUP BY 1, 2"
+}
+
+func overviewPrimaryKeySQL() string {
+	return "SELECT n.nspname AS schema, c.relname AS name, " +
+		"array_to_string(array_agg(a.attname ORDER BY k.ord), ',') AS pk_columns " +
+		"FROM pg_class c " +
+		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
+		"JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary " +
+		"CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) " +
+		"JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum " +
+		"WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") " +
+		"GROUP BY 1, 2"
+}
+
+func overviewRunner() *recordingRunner {
 	showTablesSQL := "SELECT table_schema AS schema, table_name AS name FROM information_schema.tables WHERE table_schema = ANY(" + queryableSchemaArraySQL() + ") AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_schema, table_name"
-	describeCleanGmailSQL := describeColumnsSQL("marts", "gmail_inbox")
-	describeGmailSQL := describeColumnsSQL("gmail", "messages")
-	describeSlackSQL := describeColumnsSQL("slack", "messages")
-	indexSQL := "SELECT n.nspname AS schema, t.relname AS name, regexp_replace(pg_get_indexdef(ix.indexrelid), '^.* USING ', '') AS def, CASE WHEN ix.indisprimary THEN ' [primary key]' WHEN ix.indisunique THEN ' [unique]' ELSE '' END AS flag FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_class t ON t.oid = ix.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") AND t.relkind IN ('r', 'p', 'm') ORDER BY n.nspname, t.relname, ix.indisprimary DESC, def"
-	runner := &recordingRunner{results: map[string]RawResult{
+	rowEstimateSQL := "SELECT n.nspname AS schema, c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0"
+	return &recordingRunner{results: map[string]RawResult{
 		"SELECT current_database() AS database": {
 			Columns: []string{"database"},
-			Rows:    []map[string]any{{"database": "default"}},
+			Rows:    []map[string]any{{"database": "warehouse"}},
 		},
 		showTablesSQL: {
 			Columns: []string{"schema", "name"},
 			Rows: []map[string]any{
-				{"schema": "marts", "name": "gmail_inbox"},
 				{"schema": "gmail", "name": "messages"},
+				{"schema": "marts", "name": "gmail_inbox"},
 				{"schema": "slack", "name": "messages"},
+				{"schema": "timeline", "name": "events"},
+				{"schema": "whoop", "name": "workouts"},
 			},
 		},
-		"SELECT n.nspname AS schema, c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0": {
+		rowEstimateSQL: {
 			Columns: []string{"schema", "name", "row_estimate"},
 			Rows: []map[string]any{
 				{"schema": "gmail", "name": "messages", "row_estimate": int64(1234567)},
-				{"schema": "slack", "name": "messages", "row_estimate": int64(42)},
+				{"schema": "slack", "name": "messages", "row_estimate": int64(42000000)},
+				{"schema": "timeline", "name": "events", "row_estimate": int64(44000000)},
+				{"schema": "whoop", "name": "workouts", "row_estimate": int64(321)},
 			},
 		},
-		indexSQL: {
-			Columns: []string{"schema", "name", "def", "flag"},
+		overviewColumnCatalogSQL(): {
+			Columns: []string{"schema", "name", "column_count", "time_columns"},
 			Rows: []map[string]any{
-				{"schema": "gmail", "name": "messages", "def": "btree (account, message_id)", "flag": " [primary key]"},
-				{"schema": "gmail", "name": "messages", "def": "gin (body_text gin_trgm_ops)", "flag": ""},
-				{"schema": "slack", "name": "messages", "def": "btree (account, team_id, conversation_id, message_ts)", "flag": " [primary key]"},
-				{"schema": "slack", "name": "messages", "def": "bm25 (text) WITH (text_config='english')", "flag": ""},
-				{"schema": "slack", "name": "messages", "def": "gin (text gin_trgm_ops)", "flag": ""},
+				{"schema": "gmail", "name": "messages", "column_count": int64(31), "time_columns": "internal_date,ingested_at"},
+				{"schema": "marts", "name": "gmail_inbox", "column_count": int64(12), "time_columns": ""},
+				{"schema": "slack", "name": "messages", "column_count": int64(26), "time_columns": "message_datetime,ingested_at"},
+				{"schema": "timeline", "name": "events", "column_count": int64(19), "time_columns": "event_ts,end_ts,ingest_ts"},
+				// Two plausible event times and no curated entry: the overview must
+				// say so rather than pick one.
+				{"schema": "whoop", "name": "workouts", "column_count": int64(25), "time_columns": "start_at,end_at,synced_at"},
 			},
 		},
-		describeCleanGmailSQL: {
-			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
+		overviewPrimaryKeySQL(): {
+			Columns: []string{"schema", "name", "pk_columns"},
 			Rows: []map[string]any{
-				{"name": "thread_id", "type": "String"},
-				{"name": "latest_subject", "type": "String"},
+				{"schema": "gmail", "name": "messages", "pk_columns": "account,message_id"},
+				{"schema": "slack", "name": "messages", "pk_columns": "account,team_id,conversation_id,message_ts"},
+				{"schema": "timeline", "name": "events", "pk_columns": "adapter,event_id"},
+				{"schema": "whoop", "name": "workouts", "pk_columns": "account,workout_id"},
 			},
 		},
-		describeGmailSQL: {
-			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
+		describeColumnsSQL("timeline", "events"): {
+			Columns: []string{"name", "type"},
 			Rows: []map[string]any{
-				{"name": "id", "type": "String"},
-				{"name": "body", "type": "String"},
-			},
-		},
-		describeSlackSQL: {
-			Columns: []string{"name", "type", "default_type", "default_expression", "comment"},
-			Rows: []map[string]any{
-				{"name": "channel_id", "type": "String"},
+				{"name": "adapter", "type": "text"},
+				{"name": "event_ts", "type": "timestamp with time zone"},
+				{"name": "source_pk", "type": "jsonb"},
 			},
 		},
 	}}
+}
+
+func TestSchemaOverviewListsRelationsWithKeysAndTimeColumns(t *testing.T) {
+	runner := overviewRunner()
 	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
 
 	resp := svc.SchemaOverview(context.Background())
 
-	rowEstimateSQL := "SELECT n.nspname AS schema, c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0"
-	wantQueries := []string{
-		"SELECT current_database() AS database",
-		showTablesSQL,
-		rowEstimateSQL,
-		indexSQL,
-	}
-	if strings.Join(runner.queries[:4], "\n") != strings.Join(wantQueries, "\n") {
-		t.Fatalf("first queries = %#v, want %#v", runner.queries[:4], wantQueries)
-	}
-	// The overview describes each table's columns (concurrently, so the order is
-	// nondeterministic) and runs NO per-row sample queries — dropping those is
-	// what roughly halved the response size.
-	wantDescribeQueries := []string{describeCleanGmailSQL, describeGmailSQL, describeSlackSQL}
-	gotDescribeQueries := append([]string(nil), runner.queries[4:]...)
-	slices.Sort(gotDescribeQueries)
-	slices.Sort(wantDescribeQueries)
-	if strings.Join(gotDescribeQueries, "\n") != strings.Join(wantDescribeQueries, "\n") {
-		t.Fatalf("describe queries = %#v, want %#v", gotDescribeQueries, wantDescribeQueries)
-	}
 	if len(resp.Results) != 1 {
 		t.Fatalf("results length = %d, want 1", len(resp.Results))
 	}
@@ -153,25 +165,86 @@ func TestServiceSchemaOverviewUsesInformationSchemaAndSamples(t *testing.T) {
 		t.Fatalf("SchemaOverview returned error: %s", result.Error)
 	}
 	for _, want := range []string{
-		`-- Reference these tables by their schema-qualified name`,
-		`search.search_text('offer letter', 50)`,
-		`search.search_text_exact('offer letter', 50)`,
-		`raw source tables serve STRUCTURED predicates`,
-		`# gmail.messages (~1,234,567 rows, estimated)`,
-		`# slack.messages (~42 rows, estimated)`,
-		`# marts.gmail_inbox`,
-		`#   btree (account, message_id) [primary key]`,
-		`id (String),body (String)`,
-		`channel_id (String)`,
+		// The three type rules no column name implies.
+		"Booleans are bigint 0/1, not boolean",
+		"JSON columns are text on the older sources and real jsonb on the newer ones",
+		"Never prefix the database name",
+		`describe_table('gmail.messages')`,
+		"70% of failed warehouse queries are 42703 undefined-column",
+		// Search + layer contract survive from the old preamble.
+		"search.search_text('offer letter', 50)",
+		"search.search_text_exact('offer letter', 50)",
+		"raw tables serve STRUCTURED predicates",
+		// One line per relation: size, width, key, time column.
+		"# gmail (1 relation)",
+		"gmail.messages",
+		"~1.2M",
+		" 31 cols",
+		"pk(account,message_id)",
+		"time: internal_date",
+		"pk(account,team_id,conversation_id,message_ts)",
+		"time: message_datetime",
+		// Views have no planner estimate and must not claim zero rows.
+		"marts.gmail_inbox",
+		"view",
+		// timeline.events keeps its columns inline; nothing else does.
+		"timeline.events — full column catalog",
+		"adapter (text),event_ts (timestamp with time zone),source_pk (jsonb)",
 	} {
 		if !strings.Contains(result.CSV, want) {
 			t.Fatalf("schema overview missing %q in:\n%s", want, result.CSV)
 		}
 	}
-	// The overview emits only the column catalog (one header row per table, no
-	// sampled values), so there is nothing to truncate.
-	if !result.Truncated.Empty() {
-		t.Fatalf("schema overview should not emit a truncation table, got %#v", result.Truncated)
+	// The database name is interpolated, not left as a format verb.
+	if strings.Contains(result.CSV, "%s") || strings.Contains(result.CSV, "%%") {
+		t.Fatalf("schema overview leaked a format verb:\n%s", result.CSV)
+	}
+	if !strings.Contains(result.CSV, `("warehouse.")`) {
+		t.Fatalf("schema overview should name the current database, got:\n%s", result.CSV)
+	}
+	// Columns for ordinary relations are describe_table's job now; emitting them
+	// here is what made the overview too big to keep in context.
+	if strings.Contains(result.CSV, "is_deleted (bigint)") || strings.Contains(result.CSV, "# indexes:") {
+		t.Fatalf("overview should not carry per-relation columns or indexes:\n%s", result.CSV)
+	}
+	// Exactly one describe query, for timeline.events — not one per relation.
+	describes := 0
+	for _, q := range runner.queries {
+		if strings.HasPrefix(q, "SELECT a.attname AS name, format_type(") {
+			describes++
+		}
+	}
+	if describes != 1 {
+		t.Fatalf("expected exactly 1 per-relation describe query, got %d: %#v", describes, runner.queries)
+	}
+}
+
+// Naming the wrong time column produces a query that runs, returns rows, and
+// answers a different question than the caller asked — worse than an error.
+func TestSchemaOverviewFlagsAmbiguousTimeColumnsInsteadOfGuessing(t *testing.T) {
+	svc := NewService(overviewRunner(), Options{MaxRows: 5, MaxFieldChars: 100})
+
+	csv := svc.SchemaOverview(context.Background()).Results[0].CSV
+
+	if !strings.Contains(csv, "time: start_at|end_at  (ambiguous — confirm with describe_table)") {
+		t.Fatalf("ambiguous time column should be flagged, got:\n%s", csv)
+	}
+	// synced_at is bookkeeping, not an event time, so it must not be offered.
+	if strings.Contains(csv, "time: synced_at") {
+		t.Fatalf("bookkeeping timestamp offered as the event time:\n%s", csv)
+	}
+}
+
+// The overview is the required first call, so its size is part of the contract.
+func TestSchemaOverviewStaysCompact(t *testing.T) {
+	svc := NewService(overviewRunner(), Options{MaxRows: 5, MaxFieldChars: 100})
+
+	csv := svc.SchemaOverview(context.Background()).Results[0].CSV
+
+	// Preamble plus five relations. The real warehouse has ~108, and the budget
+	// that matters is ~200 bytes per relation on top of a fixed ~5KB preamble.
+	if len(csv) > 8000 {
+		t.Fatalf("overview grew to %d bytes for 5 relations; the per-relation budget is what keeps it usable", len(csv))
 	}
 }
 
@@ -199,21 +272,8 @@ func TestFormatRowCount(t *testing.T) {
 
 func TestServiceSchemaOverviewSkipsRowCountWhenLookupFails(t *testing.T) {
 	rowEstimateSQL := "SELECT n.nspname AS schema, c.relname AS name, c.reltuples::bigint AS row_estimate FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY(" + queryableSchemaArraySQL() + ") AND c.relkind IN ('r', 'p', 'm') AND c.reltuples >= 0"
-	showTablesSQL := "SELECT table_schema AS schema, table_name AS name FROM information_schema.tables WHERE table_schema = ANY(" + queryableSchemaArraySQL() + ") AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_schema, table_name"
-	describeSQL := describeColumnsSQL("gmail", "messages")
-	runner := &recordingRunner{
-		results: map[string]RawResult{
-			"SELECT current_database() AS database": {
-				Columns: []string{"database"}, Rows: []map[string]any{{"database": "default"}},
-			},
-			showTablesSQL: {Columns: []string{"schema", "name"}, Rows: []map[string]any{{"schema": "gmail", "name": "messages"}}},
-			describeSQL: {
-				Columns: []string{"name"},
-				Rows:    []map[string]any{{"name": "id"}},
-			},
-		},
-		errs: map[string]error{rowEstimateSQL: errors.New("pg_class lookup denied")},
-	}
+	runner := overviewRunner()
+	runner.errs = map[string]error{rowEstimateSQL: errors.New("pg_class lookup denied")}
 	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
 
 	resp := svc.SchemaOverview(context.Background())
@@ -223,8 +283,12 @@ func TestServiceSchemaOverviewSkipsRowCountWhenLookupFails(t *testing.T) {
 	if resp.Results[0].Error != "" {
 		t.Fatalf("SchemaOverview surfaced row-estimate failure as error: %q", resp.Results[0].Error)
 	}
-	if !strings.Contains(resp.Results[0].CSV, "# gmail.messages\n") {
-		t.Fatalf("expected unannotated heading when row estimate lookup fails, got %q", resp.Results[0].CSV)
+	// A denied estimate must degrade to "view", never to a fabricated ~0 rows.
+	if strings.Contains(resp.Results[0].CSV, "~0") {
+		t.Fatalf("missing row estimate rendered as zero rows:\n%s", resp.Results[0].CSV)
+	}
+	if !strings.Contains(resp.Results[0].CSV, "gmail.messages") {
+		t.Fatalf("expected the relation to still be listed, got:\n%s", resp.Results[0].CSV)
 	}
 }
 
@@ -367,7 +431,7 @@ func TestSchemaErrorHint(t *testing.T) {
 			name:    "time guess on a known single table names that table's column",
 			message: `ERROR: column "ts" does not exist (SQLSTATE 42703)`,
 			sql:     "SELECT ts FROM slack.messages LIMIT 1",
-			want:    []string{"slack.messages", "message_datetime", "schema_overview"},
+			want:    []string{"slack.messages", "message_datetime", "describe_table"},
 		},
 		{
 			name:    "time guess on AI conversation events names occurred_at",
@@ -390,6 +454,49 @@ func TestSchemaErrorHint(t *testing.T) {
 			wantNone: []string{"primary time column", "message_datetime"},
 		},
 		{
+			// Postgres computes its own Levenshtein suggestion, which names the
+			// real column; our vaguer "columns differ per source" line would only
+			// dilute it, so it must not be appended after one.
+			name:     "postgres suggestion suppresses the generic fallback",
+			message:  `ERROR: column "message_ate" does not exist (SQLSTATE 42703) HINT: Perhaps you meant to reference the column "messages.message_at".`,
+			sql:      "SELECT message_ate FROM whatsapp.messages LIMIT 1",
+			wantNone: []string{"column names differ per source"},
+		},
+		{
+			// 87 boolean-named columns in the warehouse are bigint 0/1, so this is
+			// what `NOT is_from_me` / `= true` / `FILTER (WHERE is_read)` produce.
+			// It used to come back as a bare Postgres error with no hint at all.
+			name:    "boolean predicate on a bigint flag",
+			message: "ERROR: argument of NOT must be type boolean, not type bigint (SQLSTATE 42804)",
+			sql:     "SELECT count(*) FROM whatsapp.messages WHERE NOT is_from_me",
+			want:    []string{"bigint 0/1", "is_from_me = 1"},
+		},
+		{
+			name:    "FILTER on a bigint flag",
+			message: "ERROR: argument of FILTER must be type boolean, not type bigint (SQLSTATE 42804)",
+			sql:     "SELECT count(*) FILTER (WHERE is_read) FROM apple_messages.messages",
+			want:    []string{"bigint 0/1"},
+		},
+		{
+			name:    "bigint flag compared to a boolean literal",
+			message: "ERROR: operator does not exist: bigint = boolean (SQLSTATE 42883)",
+			sql:     "SELECT 1 FROM slack.messages WHERE is_deleted = true",
+			want:    []string{"bigint 0/1"},
+		},
+		{
+			// json-in-text columns: 71 of them, against 44 that really are jsonb.
+			name:    "json operator on a text column",
+			message: "ERROR: operator does not exist: text ->> unknown (SQLSTATE 42883)",
+			sql:     "SELECT raw_metadata_json->>'x' FROM whatsapp.messages",
+			want:    []string{"::jsonb"},
+		},
+		{
+			name:    "subscripting a text json column",
+			message: "ERROR: cannot subscript type text because it does not support subscripting (SQLSTATE 42804)",
+			sql:     "SELECT raw_json['a'] FROM slack.messages",
+			want:    []string{"::jsonb"},
+		},
+		{
 			name:    "chat_jid remap",
 			message: `ERROR: column "chat_jid" does not exist (SQLSTATE 42703)`,
 			sql:     "SELECT chat_jid FROM whatsapp.messages LIMIT 1",
@@ -399,7 +506,7 @@ func TestSchemaErrorHint(t *testing.T) {
 			name:     "non-time unknown column gets generic schema_overview hint only",
 			message:  `ERROR: column "frobnicate" does not exist (SQLSTATE 42703)`,
 			sql:      "SELECT frobnicate FROM gmail.messages LIMIT 1",
-			want:     []string{"schema_overview"},
+			want:     []string{"describe_table"},
 			wantNone: []string{"primary time column", "conversation_id"},
 		},
 		{
@@ -499,7 +606,7 @@ func TestServiceExecuteFullAppendsMissingColumnHintToError(t *testing.T) {
 	}, Options{MaxRows: 5, MaxFieldChars: 100})
 
 	resp := svc.ExecuteFull(context.Background(), "How many recent iMessages?", sql, "csv")
-	if !strings.Contains(resp.Error, "schema_overview") {
+	if !strings.Contains(resp.Error, "describe_table") {
 		t.Fatalf("error = %q, want it to contain the missing-column hint", resp.Error)
 	}
 }

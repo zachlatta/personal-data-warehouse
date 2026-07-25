@@ -60,9 +60,13 @@ COMMANDS
                                              defaults to csv and prints a note.
                                --file PATH   Read the SQL statement from a file.
                                --no-timeout  Wait indefinitely for the response (the server still bounds statement execution).
-  columns <schema.table>     List a relation's column names and types. Use this (or
-                             schema) before writing SQL so you don't guess column
-                             names.
+  columns <table>            Describe one relation: every column with its exact
+                             Postgres type, plus indexes and row estimate. Takes
+                             gmail.messages or a bare table name. Run this for each
+                             relation before writing SQL — schema_overview lists
+                             relations and keys but NOT columns, so this is the only
+                             authoritative column list. Guessing column names is the
+                             single largest source of failed queries.
   schema                     Run schema_overview and print the warehouse schema
                              (same as running pdw with no command).
   ingest <source> [flags]    Run a local data-warehouse uploader through pdw.
@@ -104,7 +108,7 @@ EXAMPLES
   pdw list
   pdw describe sql
   pdw call schema_overview
-  pdw columns gmail.messages
+  pdw columns gmail.messages         # every column + type, before writing SQL
   pdw sql 'SELECT 1'
   pdw sql -q 'How many rows?' 'SELECT count(*) FROM gmail.messages'
   pdw sql --output json -q 'What time is it?' 'SELECT now()'
@@ -421,8 +425,13 @@ func resolveSQLInput(positional []string, questionFlag, file string, stdin io.Re
 	return question, sql, 0
 }
 
-// runColumns lists a table's columns via the sql tool so callers can confirm
-// exact column names before writing SQL instead of guessing them.
+// runColumns describes one relation so callers can confirm exact column names
+// before writing SQL instead of guessing them. It calls the server's
+// describe_table tool rather than hand-rolling an information_schema query, so
+// the CLI and MCP surfaces return the identical catalog — same exact
+// format_type() types (text[] and bigint, not information_schema's "ARRAY"),
+// same indexes, same row estimate, and the same actionable error naming real
+// candidates when the relation does not exist.
 func runColumns(client *cliclient.Client, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "pdw columns: table name is required (usage: pdw columns <table>)")
@@ -433,19 +442,16 @@ func runColumns(client *cliclient.Client, args []string, stdout, stderr io.Write
 		return 2
 	}
 	relation := strings.TrimSpace(args[0])
-	schema, table, ok := parseSchemaQualifiedIdentifier(relation)
-	if !ok {
-		fmt.Fprintln(stderr, "pdw columns: table name must be a schema-qualified identifier like gmail.messages")
+	if !isRelationIdentifier(relation) {
+		fmt.Fprintln(stderr, "pdw columns: table name must be an identifier like gmail.messages (or a bare table name)")
 		return 2
 	}
-	sql := "SELECT column_name, data_type, is_nullable FROM information_schema.columns " +
-		"WHERE table_schema = '" + schema + "' AND table_name = '" + table + "' ORDER BY ordinal_position"
-	input, err := json.Marshal(sqlCommandInput{Question: "What columns does the " + relation + " table have?", SQL: sql, Format: "csv"})
+	input, err := json.Marshal(map[string]string{"relation": relation})
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw columns:", err)
 		return 1
 	}
-	out, err := client.CallTool(context.Background(), "sql", input)
+	out, err := client.CallTool(context.Background(), "describe_table", input)
 	if err != nil {
 		var apiErr *cliclient.APIError
 		if errors.As(err, &apiErr) {
@@ -455,24 +461,47 @@ func runColumns(client *cliclient.Client, args []string, stdout, stderr io.Write
 		fmt.Fprintln(stderr, "pdw columns:", err)
 		return 1
 	}
-	var payload sqlCommandResponse
+	return printCatalogResults(out, "pdw columns", stdout, stderr)
+}
+
+// isRelationIdentifier accepts `table` and `schema.table`. The server validates
+// too; this keeps an obviously malformed name from making a round trip.
+func isRelationIdentifier(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) > 2 {
+		return false
+	}
+	for _, part := range parts {
+		if !validIdentifier(part) {
+			return false
+		}
+	}
+	return true
+}
+
+// printCatalogResults renders the {results:[{csv,error}]} payload shared by the
+// schema_overview and describe_table tools.
+func printCatalogResults(out []byte, prefix string, stdout, stderr io.Writer) int {
+	var payload struct {
+		Results []struct {
+			CSV   string `json:"csv"`
+			Error string `json:"error"`
+		} `json:"results"`
+	}
 	if err := json.Unmarshal(out, &payload); err != nil {
 		fmt.Fprintln(stdout, string(out))
 		return 0
 	}
-	if payload.Error != "" {
-		fmt.Fprintln(stderr, "pdw columns:", payload.Error)
-		return 1
+	for _, r := range payload.Results {
+		if r.Error != "" {
+			fmt.Fprintln(stderr, prefix+":", r.Error)
+			return 1
+		}
+		if r.CSV != "" {
+			fmt.Fprintln(stdout, r.CSV)
+		}
 	}
-	return printSQLRows(payload.Rows, "csv", stdout)
-}
-
-func parseSchemaQualifiedIdentifier(s string) (schema string, table string, ok bool) {
-	parts := strings.Split(s, ".")
-	if len(parts) != 2 || !validIdentifier(parts[0]) || !validIdentifier(parts[1]) {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
+	return 0
 }
 
 func validIdentifier(s string) bool {

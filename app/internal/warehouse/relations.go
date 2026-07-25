@@ -14,6 +14,7 @@ var QueryableSchemas = []string{
 	"google_drive",
 	"plaid",
 	"slack",
+	"apple_contacts",
 	"apple_notes",
 	"apple_messages",
 	"apple_voice_memos",

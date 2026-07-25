@@ -484,16 +484,18 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	found := map[string]bool{}
 	for _, tool := range tools.Tools {
 		found[tool.Name] = true
-		// Tool descriptions are intentionally short and must point callers at
-		// schema_overview as the required first call. schema_overview's own
-		// description doesn't need that reminder.
+		// Tool descriptions are intentionally short and must point callers at the
+		// two-step discovery path: schema_overview for the relations, then
+		// describe_table for a relation's columns. Those two tools' own
+		// descriptions don't need the reminder.
 		if tool.Name == "query" || tool.Name == "get_rows" || tool.Name == "get_field" || tool.Name == "grep_rows" {
-			if !strings.Contains(tool.Description, "Call schema_overview first.") {
-				t.Fatalf("%s description should remind callers to call schema_overview first: %q", tool.Name, tool.Description)
+			if !strings.Contains(tool.Description, "Call schema_overview first") ||
+				!strings.Contains(tool.Description, "describe_table") {
+				t.Fatalf("%s description should point callers at schema_overview then describe_table: %q", tool.Name, tool.Description)
 			}
 		}
 	}
-	for _, name := range []string{"query", "get_rows", "get_field", "grep_rows", "schema_overview"} {
+	for _, name := range []string{"query", "get_rows", "get_field", "grep_rows", "schema_overview", "describe_table"} {
 		if !found[name] {
 			t.Fatalf("%s tool not listed: %#v", name, tools.Tools)
 		}
@@ -513,21 +515,35 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	if !ok {
 		t.Fatalf("content type = %T", result.Content[0])
 	}
-	if !strings.Contains(text.Text, "# marts.gmail_inbox") || !strings.Contains(text.Text, "thread_id (text),latest_subject (text)") {
-		t.Fatalf("schema overview did not include clean view: %q", text.Text)
+	// The overview lists relations grouped by schema; per-relation columns moved
+	// to describe_table, so the view appears as a line under its schema heading
+	// rather than as its own column catalog.
+	if !strings.Contains(text.Text, "# marts (1 relation)") || !strings.Contains(text.Text, "marts.gmail_inbox") {
+		t.Fatalf("schema overview did not list the marts view: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# gmail.messages") || !strings.Contains(text.Text, "subject (text)") {
-		t.Fatalf("unexpected schema overview text: %q", text.Text)
+	if strings.Contains(text.Text, "thread_id (text),latest_subject (text)") {
+		t.Fatalf("schema overview should not carry per-relation columns: %q", text.Text)
 	}
-	// The overview is a column catalog only — no sampled data rows.
+	// The overview must still name every relation, with its curated event-time
+	// column, so a caller knows what exists and what to filter on before it
+	// reaches for describe_table.
+	for _, want := range []string{
+		"gmail.messages",
+		"apple_notes.notes",
+		"time: modified_at",
+		"apple_messages.messages",
+		"time: message_at",
+	} {
+		if !strings.Contains(text.Text, want) {
+			t.Fatalf("schema overview missing %q: %q", want, text.Text)
+		}
+	}
+	// No sampled data rows, and no per-relation column catalogs.
 	if strings.Contains(text.Text, "thread-1,hello inbox") || strings.Contains(text.Text, "hello message") {
 		t.Fatalf("schema overview should not include sampled row values: %q", text.Text)
 	}
-	if !strings.Contains(text.Text, "# apple_notes.notes") || !strings.Contains(text.Text, "note_id (text),title (text),modified_at (timestamp with time zone),body_text (text),body_html (text),is_deleted (bigint)") {
-		t.Fatalf("schema overview did not include Apple Notes table: %q", text.Text)
-	}
-	if !strings.Contains(text.Text, "# apple_messages") || !strings.Contains(text.Text, "message_id (text),message_at (timestamp with time zone),service (text),handle_id (text),body_text (text),is_from_me (bigint),is_deleted (bigint)") {
-		t.Fatalf("schema overview did not include Apple Messages table: %q", text.Text)
+	if strings.Contains(text.Text, "is_from_me (bigint)") {
+		t.Fatalf("schema overview should not carry per-relation columns: %q", text.Text)
 	}
 
 	queryResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query", Arguments: map[string]any{

@@ -1,0 +1,13 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "relation": {
+      "description": "schema-qualified relation to describe, e.g. gmail.messages; a bare table name resolves when only one schema has it",
+      "type": "string"
+    }
+  },
+  "required": [
+    "relation"
+  ],
+  "type": "object"
+}

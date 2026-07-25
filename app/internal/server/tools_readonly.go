@@ -18,6 +18,7 @@ func readOnlyTools(svc *query.Service) []tool.Tool {
 		getFieldTool(svc),
 		grepRowsTool(svc),
 		schemaOverviewTool(svc),
+		describeTableTool(svc),
 		sqlTool(svc),
 	}
 }
@@ -128,8 +129,24 @@ func schemaOverviewTool(svc *query.Service) tool.Tool {
 	}
 }
 
+// describeTableTool is registered on every surface, not MCP-only: the CLI is
+// where most warehouse SQL is written, and per-table discovery existing only as
+// a client-side subcommand is why it went almost unused.
+func describeTableTool(svc *query.Service) tool.Tool {
+	return &tool.Typed[describeTableInput, schemaOverviewOutput]{
+		NameStr:        "describe_table",
+		TitleStr:       "Describe Table",
+		DescriptionStr: describeTableDescription,
+		Handle: func(ctx context.Context, in describeTableInput) (schemaOverviewOutput, error) {
+			return schemaOverviewOutput{Response: svc.DescribeTable(ctx, in.Relation)}, nil
+		},
+		IsError: func(o schemaOverviewOutput) bool { return o.hasError() },
+	}
+}
+
 // schemaOverviewOutput wraps query.Response so it can implement
-// tool.MultiContentMarshaler without query depending on the MCP SDK.
+// tool.MultiContentMarshaler without query depending on the MCP SDK. Both
+// catalog tools return the same shape, so both use it.
 type schemaOverviewOutput struct {
 	query.Response
 }

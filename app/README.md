@@ -12,7 +12,7 @@ Each tool declares which surfaces it appears on:
   tools designed for an LLM stepping through results.
 - **CLI-only**: `sql` — psql-style "give me the whole result"
   for terminal/script use; no caching, no field truncation.
-- **Both**: `schema_overview`, the `propose_*` mutation tools.
+- **Both**: `schema_overview`, `describe_table`, the `propose_*` mutation tools.
 
 ## Environment
 
@@ -406,26 +406,69 @@ It also exposes a schema overview MCP tool:
 }
 ```
 
-`schema_overview` returns one text block: a leading note on how to reference
-the tables, then a section per table or view headed by its bare name (the name
-you use directly in `FROM`/`JOIN`):
+`schema_overview` returns one text block: a preamble covering the conventions a
+caller cannot infer from any column name, then one line per relation grouped by
+schema.
 
 ```text
--- Reference these tables by their bare name in FROM/JOIN (e.g. FROM gmail_messages). Do not prefix them with the database name ("postgres.").
-
-# table_name
-
-column1,column2,column3
-sample row 1
-sample row 2
+-- HOW TO USE THIS: relation names + keys + row counts only. For any other column, call
+--   describe_table('gmail.messages')  →  every column with its exact Postgres type.
+...
+# gmail (4 relations)
+  gmail.messages    ~1.2M   31 cols  pk(account,message_id)  time: internal_date
 ```
 
-The heading is the bare table name on purpose: it is what `FROM` expects.
-Earlier versions printed `# database.table_name`, which led callers to write
-`FROM postgres.table_name` — invalid in Postgres, where qualification is
-`schema.table`, not `database.table`. It uses `current_database()` and
-`information_schema` against the current Postgres schema, then samples up to
-three rows per table. Sample cell values are capped at 15 characters to keep the preview compact; truncation metadata is included when a preview value is shortened.
+Each line carries the relation's planner row estimate, column count, primary
+key, and primary event-time column. It deliberately does **not** list columns:
+at 108 relations the full catalog was ~61KB, big enough that some clients
+spilled it to a file rather than rendering it, and far too big to survive in an
+agent's context until the SQL was written. What actually happened was that
+callers read it once, lost it, and guessed — 70% of failed warehouse queries in
+30 days of transcripts were SQLSTATE 42703 (undefined column). Columns moved to
+`describe_table`, which is cheap enough to call per relation, and the overview
+now costs ~18KB.
+
+`timeline.events` keeps its columns inline, because every `search.*` result
+hands back a ref into it and a second round trip on every search is not worth
+the bytes saved.
+
+The `time:` field is curated, not inferred. Where a relation has several
+plausible event-time columns and no curated entry, it lists the candidates and
+says `(ambiguous — confirm with describe_table)` rather than picking one:
+naming the wrong timestamp yields a query that runs, returns rows, and answers
+a different question than the caller asked.
+
+### `describe_table`
+
+```json
+{
+  "name": "describe_table",
+  "input": {"relation": "gmail.messages"}
+}
+```
+
+The authoritative column list for one relation — every column with its exact
+`format_type` (`text[]`, `bigint`, `timestamp with time zone`, not
+`information_schema`'s "ARRAY"), plus indexes and row estimate:
+
+```text
+# whatsapp.messages (~123,456 rows, estimated)
+# indexes:
+#   btree (account, chat_id, message_id) [primary key]
+#   gin (body_text gin_trgm_ops) WHERE (is_deleted = 0)
+
+account (text),chat_id (text),is_from_me (bigint),message_at (timestamp with time zone),...
+```
+
+It takes a schema-qualified name, a bare table name (resolved when only one
+schema has it), or a database-qualified one (the leading segment is dropped).
+Every failure names concrete candidates instead of sending the caller back to
+the catalog empty-handed: an ambiguous bare name lists every schema that has
+it, an unknown name lists the closest matches, and a known-wrong name
+(`slack_channels`) is answered with the right one.
+
+It is registered on both surfaces. `pdw columns <table>` is the CLI spelling
+and calls this tool, so both surfaces return byte-identical output.
 
 ### `_debug_cache_status`
 
@@ -457,7 +500,7 @@ go build -o /tmp/pdw ./cmd/pdw-cli
 /tmp/pdw list --json              # raw JSON tool list
 /tmp/pdw describe sql             # title + description + input JSON Schema
 /tmp/pdw call schema_overview     # zero-input NON-SQL tool
-/tmp/pdw columns gmail_messages   # column names + types for one table
+/tmp/pdw columns gmail.messages   # describe_table: columns + types + indexes for one relation
 /tmp/pdw sql 'SELECT 1'                  # SQL is the only positional; defaults to CSV + an output-format note
 /tmp/pdw sql -q 'What is one?' 'SELECT 1'  # -q records the caller's intent in server logs
 /tmp/pdw sql --output json -q 'What time is it?' 'SELECT now()'

@@ -70,6 +70,10 @@ type queryStatementInput struct {
 
 type schemaOverviewInput struct{}
 
+type describeTableInput struct {
+	Relation string `json:"relation" jsonschema:"schema-qualified relation to describe, e.g. gmail.messages; a bare table name resolves when only one schema has it"`
+}
+
 type getRowsInput struct {
 	QueryID string `json:"query_id" jsonschema:"query_id returned by query"`
 	Offset  int    `json:"offset,omitempty" jsonschema:"zero-based row offset, default 0"`
@@ -105,9 +109,9 @@ type sqlInput struct {
 // happen: clients searching for "Slack" or "Gmail" hit this paragraph. The
 // per-tool descriptions stay deliberately short; the rich content lives in
 // the schema_overview response.
-const serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, and Plaid-backed finance data. Always call schema_overview first to learn the tables and columns; then write read-only Postgres SQL with query."
+const serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, and Plaid-backed finance data. Call schema_overview first to learn the relations, then describe_table on each relation you are about to reference to get its exact columns and types, then write read-only Postgres SQL with query. Do not guess column names: schema_overview lists relations and keys, describe_table is the only authoritative column list."
 
-const schemaFirstReminder = "Call schema_overview first."
+const schemaFirstReminder = "Call schema_overview first, then describe_table for the columns of each relation you reference."
 
 const queryDescription = "Run read-only Postgres SQL against the personal data warehouse and cache the result under a query_id. " + schemaFirstReminder + " Each SQL statement must be paired with question, a concise plain-English question this SQL statement is trying to answer."
 
@@ -117,7 +121,9 @@ const getFieldDescription = "Return a character chunk from a single cell in a ca
 
 const grepRowsDescription = "Regex-search a cached query result and return match context. " + schemaFirstReminder
 
-const schemaOverviewDescription = "Required first call. Lists the warehouse's tables, views, columns, and compact samples so the caller can pick the right tables before writing SQL. Each base table heading includes an approximate row count from planner statistics, formatted as `(~N rows, estimated)`; use that estimate for sizing decisions instead of running SELECT COUNT(*) over large tables."
+const schemaOverviewDescription = "Required first call. Lists every relation in the warehouse with its row estimate, primary key, and primary time column, plus the search and layer conventions needed to write correct SQL. It deliberately does NOT list every column — call describe_table for that. Row estimates come from planner statistics, formatted as `(~N rows, estimated)`; use them for sizing decisions instead of running SELECT COUNT(*) over large tables."
+
+const describeTableDescription = "Return one relation's exact columns with their Postgres types, plus its indexes and row estimate. This is the authoritative column list: schema_overview intentionally omits columns, so call this for each relation you are about to reference instead of guessing column names. Accepts a schema-qualified name (gmail.messages) or a bare table name when only one schema has it, and names concrete candidates when the relation does not exist."
 
 const sqlDescription = "Run a read-only Postgres SQL statement and return its full result, like a psql session. Skips the query cache, pagination, and field truncation that the MCP query tool applies. Refuses write SQL and caps the response at 1,000,000 rows. Each call must include question, a concise plain-English question this SQL statement is trying to answer, so server logs capture the caller's intent."
 

@@ -614,31 +614,60 @@ func TestCallRedirectsSQLToolsToSQLCommand(t *testing.T) {
 	}
 }
 
-func TestColumnsCommandUsesSQLToolWithSchemaQualifiedRelation(t *testing.T) {
+// The CLI and MCP surfaces must return the identical catalog, so columns calls
+// the describe_table tool instead of hand-rolling an information_schema query.
+func TestColumnsCommandCallsDescribeTableTool(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{"rows":"column_name,data_type,is_nullable\nid,text,NO"}}`)
+		_, _ = io.WriteString(w, `{"data":{"results":[{"csv":"# gmail.messages (~1,234,567 rows, estimated)\n\naccount (text),is_deleted (bigint)\n"}]}}`)
 	})
 	out, errOut, code := runCLI(t, srv.URL, "", "columns", "gmail.messages")
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
 	}
-	if srv.lastPath != "/api/tools/sql" || srv.lastMethod != http.MethodPost {
+	if srv.lastPath != "/api/tools/describe_table" || srv.lastMethod != http.MethodPost {
 		t.Fatalf("server got %s %s", srv.lastMethod, srv.lastPath)
 	}
 	var input map[string]string
 	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
 		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
 	}
-	if !strings.Contains(input["sql"], "information_schema.columns") ||
-		!strings.Contains(input["sql"], "table_schema = 'gmail'") ||
-		!strings.Contains(input["sql"], "table_name = 'messages'") {
-		t.Fatalf("columns SQL = %q", input["sql"])
+	if input["relation"] != "gmail.messages" {
+		t.Fatalf("relation = %q", input["relation"])
 	}
-	if !strings.Contains(input["question"], "gmail.messages") {
-		t.Fatalf("columns question = %q", input["question"])
-	}
-	if !strings.Contains(out, "column_name,data_type,is_nullable") || !strings.Contains(out, "id,text,NO") {
+	if !strings.Contains(out, "# gmail.messages") || !strings.Contains(out, "is_deleted (bigint)") {
 		t.Fatalf("columns output:\n%s", out)
+	}
+}
+
+// A bare table name is resolved server-side, so the CLI must forward it rather
+// than insisting on a schema prefix the caller may not know yet.
+func TestColumnsCommandForwardsBareTableName(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"results":[{"csv":"# gmail.messages\n"}]}}`)
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "columns", "messages")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if input["relation"] != "messages" {
+		t.Fatalf("relation = %q", input["relation"])
+	}
+}
+
+func TestColumnsCommandSurfacesServerRelationError(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"results":[{"error":"no relation named message. Closest matches: gmail.messages."}]}}`)
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "columns", "message")
+	if code == 0 {
+		t.Fatalf("expected non-zero exit when the relation does not exist")
+	}
+	if !strings.Contains(errOut, "gmail.messages") {
+		t.Fatalf("stderr should carry the server's candidate list: %s", errOut)
 	}
 }
 
@@ -650,7 +679,7 @@ func TestColumnsCommandRejectsBadIdentifier(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("expected non-zero exit for an injection-y table name")
 	}
-	if !strings.Contains(errOut, "schema-qualified identifier") {
+	if !strings.Contains(errOut, "identifier") {
 		t.Fatalf("stderr = %s", errOut)
 	}
 }

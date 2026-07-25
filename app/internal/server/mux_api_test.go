@@ -26,6 +26,7 @@ const muxAPITestSecret = "test-secret-token-at-least-32-chars-x"
 // for the core read/query and mutation proposal schemas snapshotted here.
 var apiSnapshotTools = []string{
 	"schema_overview",
+	"describe_table",
 	"sql",
 	"propose_mutation",
 	"propose_mutation_help",
