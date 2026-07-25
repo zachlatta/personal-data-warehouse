@@ -56,13 +56,28 @@ private func arguments() -> [String: String] {
     return parsed
 }
 
+private func libraryFetchOptions() -> PHFetchOptions {
+    let options = PHFetchOptions()
+    // Photos.sqlite lists rows that PhotoKit hides from a default fetch: burst
+    // stack members other than the representative pick, and hidden assets.
+    // Without these two flags such an asset is simply "not available", so the
+    // uploader could never export it and failed forever on rows it can see in
+    // the library database.
+    options.includeAllBurstAssets = true
+    options.includeHiddenAssets = true
+    return options
+}
+
 private func fetchAsset(uuid: String) -> PHAsset? {
     let normalIdentifier = "\(uuid)/L0/001"
-    let direct = PHAsset.fetchAssets(withLocalIdentifiers: [normalIdentifier], options: nil)
+    let direct = PHAsset.fetchAssets(
+        withLocalIdentifiers: [normalIdentifier],
+        options: libraryFetchOptions()
+    )
     if direct.count == 1 {
         return direct.object(at: 0)
     }
-    let allAssets = PHAsset.fetchAssets(with: nil)
+    let allAssets = PHAsset.fetchAssets(with: libraryFetchOptions())
     var found: PHAsset?
     allAssets.enumerateObjects { asset, _, stop in
         if asset.localIdentifier.split(separator: "/", maxSplits: 1).first.map(String.init) == uuid {

@@ -399,10 +399,14 @@ under Optimize Mac Storage that tree is only an incomplete cache. Every selected
 exported through PhotoKit with iCloud network access enabled, so Photos downloads the complete
 original before upload. Scanner selection is limited to `ZBUNDLESCOPE = 0`: nonzero bundle scopes
 are transient syndicated/shared records that Photos stores in `ZASSET` but does not expose as
-user-library `PHAsset`s. Photo and video assets request PhotoKit's original resource type; Live
-Photos also request the original paired-video resource under the still's ZUUID with
-`role=live_video`. A missing asset, failed iCloud download, empty export, or size mismatch is a
-loud run failure that retries later—never a successful local-only coverage count. Repeated
+user-library `PHAsset`s. The native helper fetches with `includeAllBurstAssets` +
+`includeHiddenAssets`: burst-stack members (`ZVISIBILITYSTATE = 2`) and hidden assets are ordinary
+rows in `Photos.sqlite` but are invisible to a default PhotoKit fetch, so without those flags they
+are permanently "not available through PhotoKit". Photo and video assets request PhotoKit's
+original resource type; Live Photos also request the original paired-video resource under the
+still's ZUUID with `role=live_video`. A missing asset, failed iCloud download, empty export, or
+size mismatch is a loud run failure that retries later—never a successful local-only coverage
+count. Repeated
 failures on one file back off exponentially (30 min doubling to 7 days) and are dropped from
 selection while backed off, so a file PhotoKit will never export cannot consume the run's
 `--limit` slots; after 5 attempts it also stops failing the run and is reported as

@@ -161,7 +161,12 @@ def test_native_helper_pins_full_original_and_icloud_contract():
     assert "wantedType = .photo" in source
     assert "wantedType = .video" in source
     assert "wantedType = .pairedVideo" in source
-    assert "PHAsset.fetchAssets(with: nil)" in source  # non-default library-scope fallback
+    assert "PHAsset.fetchAssets(with: libraryFetchOptions())" in source  # library-scope fallback
+    # Burst-stack members and hidden assets are in Photos.sqlite (so the
+    # scanner offers them) but are invisible to a default PhotoKit fetch.
+    assert "options.includeAllBurstAssets = true" in source
+    assert "options.includeHiddenAssets = true" in source
+    assert "withLocalIdentifiers: [normalIdentifier],\n        options: libraryFetchOptions()" in source
     assert "guard requestAuthorization().rawValue == authorizedStatus" in source
     assert "NSPhotoLibraryUsageDescription" in info_plist
     assert "com.zachlatta.pdw.photos-exporter" in info_plist
