@@ -1699,6 +1699,7 @@ def _search_text_function_sql() -> str:
         _schema = "public"
         _search_path_sql = postgres_module.PostgresWarehouse._search_path_sql
         _search_text_alter_sql = postgres_module.PostgresWarehouse._search_text_alter_sql
+        sql_relation = postgres_module.PostgresWarehouse.sql_relation
         physical_schema_name = postgres_module.PostgresWarehouse.physical_schema_name
         physical_schema_names = postgres_module.PostgresWarehouse.physical_schema_names
 
@@ -1762,6 +1763,25 @@ def test_search_text_sources_filter_skips_unrequested_branches() -> None:
     assert "branch_sqls text[]" in sql
     assert "IF sources IS NOT NULL AND NOT branch_source = ANY (sources) THEN" in sql
     assert "CONTINUE;" in sql
+
+
+def test_search_text_casts_branch_rows_to_the_physical_hit_type() -> None:
+    # The per-branch row cast is built inside a SQL string literal, which the
+    # relation qualifier deliberately does not rewrite, so it must already be
+    # schema-qualified. An unqualified `::search_text_hit` there resolved —
+    # through the function's own pinned search_path, whose last entry is public
+    # — to the pre-reorganization public.search_text_hit type. Every branch then
+    # silently depended on a legacy leftover, and sweeping that leftover emptied
+    # all of them at once, because the per-branch guard swallows the type lookup
+    # error exactly like it swallowed the missing BM25 index before it.
+    sql = _search_text_function_sql()
+
+    assert '::"search"."text_hit"' in sql, (
+        "search_text()'s EXECUTE'd branch cast must name the physical hit type"
+    )
+    assert "::search_text_hit" not in sql, (
+        "an unqualified hit-type cast resolves to the legacy public copy, not the search schema"
+    )
 
 
 def test_only_timeline_bm25_index_is_registered() -> None:

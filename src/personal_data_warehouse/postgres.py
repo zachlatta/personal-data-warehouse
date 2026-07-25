@@ -6991,6 +6991,15 @@ class PostgresWarehouse:
             + "\n                    ELSE t.kind\n                END"
         )
         search_schema_name = self.physical_schema_name("search") if hasattr(self, "physical_schema_name") else "search"
+        # The per-branch row cast below lives inside a SQL string literal, which
+        # the relation qualifier deliberately leaves alone, so it has to be
+        # written schema-qualified here. An unqualified `::search_text_hit`
+        # resolved — through the function's own pinned search_path, whose last
+        # entry is public — to the pre-reorganization public.search_text_hit
+        # type. Every branch then depended on a legacy leftover, and dropping it
+        # silently emptied all of them (the per-branch guard swallows the type
+        # lookup error).
+        hit_type_sql = self.sql_relation("search_text_hit") if hasattr(self, "sql_relation") else '"search"."text_hit"'
         self._command(
             r"""
             DO $do$
@@ -7061,7 +7070,9 @@ class PostgresWarehouse:
                             'SELECT array_agg(ROW(x.source, x.subsource, x.context, '
                             'x.who, x.occurred_at, x.account, x.ref, left(x.text, """
             + str(SEARCH_TEXT_PREVIEW_CHARS)
-            + r"""), x.score)::search_text_hit) FROM (' || branch || ') x',
+            + r"""), x.score)::"""
+            + hit_type_sql
+            + r""") FROM (' || branch || ') x',
                             query, per_branch_limit, since
                         ) INTO branch_hits;
                         IF branch_hits IS NOT NULL THEN
