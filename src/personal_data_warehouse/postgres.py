@@ -214,6 +214,10 @@ QUERY_ROLE_SETUP_LOCK_ID = 8_407_112_469
 QUERY_ROLE_SETUP_ATTEMPTS = 4
 QUERY_ROLE_SETUP_RETRY_SECONDS = 0.25
 QUERY_ROLE_CONCURRENT_UPDATE_MESSAGE = "tuple concurrently updated"
+# Serializes the one-time timeline priority bigint -> enum rewrite. Without it
+# two processes booting together both see a bigint column, both issue the ALTER,
+# and the second one rewrites the whole table again behind the first.
+TIMELINE_PRIORITY_MIGRATION_LOCK_ID = 8_407_112_471
 
 
 @dataclass(frozen=True)
@@ -1393,7 +1397,6 @@ INTEGER_COLUMNS = {
     "backfill_done",
     "backfill_rows",
     "incremental_rows",
-    "priority",
     "whoop_user_id",
     "average_heart_rate",
     "max_heart_rate",
@@ -2292,8 +2295,16 @@ class PostgresWarehouse:
         provide (late backfills land in the past by event_ts but in the
         present by seq).
         """
+        # The priority enum must exist before the table is created: on a fresh
+        # install _postgres_type builds the priority column as this type.
+        self._ensure_timeline_priority_type()
         self._ensure_table_group(["timeline_events", "timeline_sync_state"])
         timeline_rel = query_relation("timeline_events").with_namespace(self._schema)
+        # Rewrite any pre-enum (legacy bigint) priority column, before this
+        # method returns and therefore before the sync engine can write an enum
+        # label into a still-bigint column. On a large timeline the rewrite is a
+        # maintenance-window operation; see _migrate_timeline_priority_to_enum.
+        self._migrate_timeline_priority_to_enum(timeline_rel)
         had_search_text = bool(
             self._query(
                 """
@@ -2314,7 +2325,7 @@ class PostgresWarehouse:
         # Additive migrations for timelines created before later normalized
         # fields existed. `search_text` is the full BM25 document backing the
         # general search function; re-syncing fills it in for old rows.
-        self._command("ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS priority bigint NOT NULL DEFAULT 0")
+        # (priority's own migration ran above, before this method's own work.)
         self._command("ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS search_text text NOT NULL DEFAULT ''")
         if not had_search_text:
             # Existing timelines need a full re-walk so every historical row gets
@@ -2345,6 +2356,86 @@ class PostgresWarehouse:
             """
         )
         self._ensure_search_views_if_possible()
+
+    def _ensure_timeline_priority_type(self) -> None:
+        """Create the ``timeline_priority`` enum if it does not exist.
+
+        Mirrors the ``search_text_hit`` composite-type bootstrap: the existence
+        probe is schema-qualified (``to_regtype`` takes a string literal that
+        ``qualify_sql_relations`` does not rewrite), while the ``CREATE TYPE``
+        uses the logical name so it lands in the timeline schema. Declaration
+        order is the sort order (highest attention first).
+        """
+        timeline_schema = (
+            self.physical_schema_name("timeline") if hasattr(self, "physical_schema_name") else "timeline"
+        )
+        self._command(
+            r"""
+            DO $do$
+            BEGIN
+                IF to_regtype('"""
+            + timeline_schema
+            + r""".timeline_priority') IS NULL THEN
+                    CREATE TYPE timeline_priority AS ENUM
+                        ('self', 'direct', 'cc', 'noise', 'background', 'unclassified');
+                END IF;
+            END
+            $do$;
+            """
+        )
+
+    def _migrate_timeline_priority_to_enum(self, timeline_rel: Any) -> None:
+        """One-time ``bigint`` -> ``timeline_priority`` migration of an existing table.
+
+        A single ``ALTER COLUMN ... TYPE ... USING``. That is the cheapest form
+        this change can take: one sequential heap rewrite plus a bulk rebuild of
+        the table's indexes (which also compacts accumulated bloat), where a
+        staged column and batched UPDATE instead writes a *second* row version
+        for every row and churns every index on every batch — several times the
+        I/O, and it leaves the same number of dead tuples behind for autovacuum.
+
+        The rewrite holds ACCESS EXCLUSIVE for its duration, so on a large
+        timeline this is a maintenance-window operation, not a background one:
+        readers and the sync engine both block until it finishes. Dropping the
+        table's large secondary indexes first (and rebuilding them after) cuts
+        the locked work to the heap rewrite plus the primary key.
+
+        Idempotent and safe to call from every process on every boot: a fresh
+        install already has the enum column from CREATE TABLE and returns on the
+        first probe, and the advisory lock keeps two concurrent Dagster runs
+        from both starting the rewrite (they would otherwise queue on the table
+        lock and rewrite it twice).
+        """
+        if self._timeline_priority_column_type(timeline_rel) != "bigint":
+            return
+        self._command("SELECT pg_advisory_lock(%s)", (TIMELINE_PRIORITY_MIGRATION_LOCK_ID,))
+        try:
+            # Re-probe under the lock: the process we queued behind may have
+            # been the one that migrated it.
+            if self._timeline_priority_column_type(timeline_rel) != "bigint":
+                return
+            self._command(
+                "ALTER TABLE timeline_events "
+                "ALTER COLUMN priority DROP DEFAULT, "
+                "ALTER COLUMN priority TYPE timeline_priority USING (CASE priority "
+                "WHEN 1 THEN 'self' WHEN 2 THEN 'direct' WHEN 3 THEN 'cc' "
+                "WHEN 4 THEN 'noise' WHEN 5 THEN 'background' "
+                "ELSE 'unclassified' END)::timeline_priority, "
+                "ALTER COLUMN priority SET DEFAULT 'unclassified'"
+            )
+        finally:
+            self._command("SELECT pg_advisory_unlock(%s)", (TIMELINE_PRIORITY_MIGRATION_LOCK_ID,))
+
+    def _timeline_priority_column_type(self, timeline_rel: Any) -> str | None:
+        rows = self._query(
+            """
+            SELECT data_type FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s AND column_name = 'priority'
+            LIMIT 1
+            """,
+            (timeline_rel.schema, timeline_rel.name),
+        )
+        return rows[0][0] if rows else None
 
     def ensure_claude_desktop_tables(self) -> None:
         """Tables for the serverside Claude Desktop poller.
@@ -8401,6 +8492,11 @@ class PostgresWarehouse:
 
 
 def _postgres_type(column: str, *, table: str | None = None) -> str:
+    # The timeline's priority tier is a self-describing native enum (see
+    # timeline.py). The logical type name resolves to the timeline schema via
+    # qualify_sql_relations when the CREATE TABLE runs.
+    if table == "timeline_events" and column == "priority":
+        return "timeline_priority"
     if _is_jsonb_column(table, column):
         return "jsonb"
     if column in ARRAY_COLUMNS:
@@ -8421,6 +8517,10 @@ def _postgres_type(column: str, *, table: str | None = None) -> str:
 
 
 def _default_sql(column: str, *, table: str | None = None) -> str:
+    if table == "timeline_events" and column == "priority":
+        # Not-yet-(re)synced rows sit at the "unknown" tier; every adapter emits
+        # a real tier, so this should only ever be transient.
+        return "'unclassified'"
     if _is_jsonb_column(table, column):
         if column in JSONB_ARRAY_COLUMNS_BY_TABLE.get(table or "", set()):
             return "'[]'::jsonb"

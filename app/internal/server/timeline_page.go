@@ -113,19 +113,20 @@ button.primary { color: #10131a; background: var(--amber); border-color: var(--a
 @keyframes rowin { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 .row:hover { background: var(--surface); }
 .row.sel { background: var(--surface2); outline: 1px solid var(--line2); }
-/* Priority weighting: tier 1/2 read at full strength, peripheral and noise
-   tiers recede, background machinery almost disappears until hovered. */
-.row.p3 { opacity: .82; }
-.row.p4 { opacity: .55; }
-.row.p5 { opacity: .38; }
-.row.p4:hover, .row.p5:hover, .row.p3:hover { opacity: 1; }
-.row.p1 .title, .row.p2 .title { font-weight: 600; }
+/* Priority weighting: self/direct read at full strength, peripheral and noise
+   tiers recede, background machinery almost disappears until hovered. Keyed on
+   the timeline_priority enum label (row class is "p-" + priority). */
+.row.p-cc { opacity: .82; }
+.row.p-noise { opacity: .55; }
+.row.p-background { opacity: .38; }
+.row.p-noise:hover, .row.p-background:hover, .row.p-cc:hover { opacity: 1; }
+.row.p-self .title, .row.p-direct .title { font-weight: 600; }
 .pbadge {
   display: inline-block; font-size: 8.5px; letter-spacing: .1em; border-radius: 2px;
   padding: 1px 4px; border: 1px solid var(--line2); color: var(--faint); text-transform: uppercase;
 }
-.row.p1 .pbadge { color: var(--amber); border-color: var(--amber-dim); }
-.row.p2 .pbadge { color: var(--text); }
+.row.p-self .pbadge { color: var(--amber); border-color: var(--amber-dim); }
+.row.p-direct .pbadge { color: var(--text); }
 .row .t { color: var(--faint); font-size: 11px; text-align: right; }
 .row .tick { align-self: stretch; border-radius: 1px; opacity: .85; min-height: 30px; }
 .row .who { overflow: hidden; }
@@ -297,10 +298,9 @@ a.filelink:hover { text-decoration: underline; }
     lastDay: "", selected: null, count: 0
   };
 
-  var PRIORITY_LABELS = {
-    "1": "self", "2": "direct", "3": "cc'd", "4": "noise", "5": "background", "0": "unclassified"
-  };
-  function priorityLabel(p) { return PRIORITY_LABELS[String(p)] || ("p" + p); }
+  // Priority is the timeline_priority enum: the value IS the label
+  // ('self'/'direct'/'cc'/'noise'/'background'/'unclassified'), so there is no
+  // number->name map to keep in sync — the schema is the source of truth.
 
   function el(id) { return document.getElementById(id); }
   function h(tag, cls, text) {
@@ -411,8 +411,8 @@ a.filelink:hover { text-decoration: underline; }
       renderChips(el("kindlist"), toCatalog(byKind), state.kinds, false);
       var priorityCatalog = (body.priorities || []).map(function (row) {
         return {
-          name: String(row.priority),
-          label: priorityLabel(row.priority),
+          name: row.priority,
+          label: row.priority,
           count: row.count
         };
       });
@@ -481,7 +481,7 @@ a.filelink:hover { text-decoration: underline; }
         head.appendChild(h("span", "rule"));
         rowsNode.appendChild(head);
       }
-      var row = h("div", "row p" + (item.priority || 0));
+      var row = h("div", "row p-" + (item.priority || "unclassified"));
       row.style.animationDelay = Math.min(index, 12) * 12 + "ms";
       row.appendChild(h("div", "t", fmtTime(item.event_ts)));
       var tick = h("div", "tick");
@@ -510,7 +510,7 @@ a.filelink:hover { text-decoration: underline; }
       var right = h("div");
       right.appendChild(h("div", "ctx", item.context || ""));
       var badges = h("div", "flags");
-      badges.appendChild(h("span", "pbadge", priorityLabel(item.priority)));
+      badges.appendChild(h("span", "pbadge", item.priority));
       if (flags.length) badges.appendChild(document.createTextNode(" " + flags.join(" · ")));
       right.appendChild(badges);
       row.appendChild(right);
@@ -730,7 +730,7 @@ a.filelink:hover { text-decoration: underline; }
     head.appendChild(kvTable([
       ["when", fmtFull(item.event_ts)], ["until", isReal(item.end_ts) ? fmtFull(item.end_ts) : ""],
       ["actor", item.actor], ["context", item.context],
-      ["priority", priorityLabel(item.priority) + " (" + item.priority + ")"],
+      ["priority", item.priority],
       ["adapter", item.adapter], ["event id", item.event_id],
       ["seq", item.seq], ["source table", item.source_table]
     ]));

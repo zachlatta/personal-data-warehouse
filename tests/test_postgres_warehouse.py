@@ -2397,7 +2397,7 @@ def test_search_text_returns_hits_under_default_search_path(warehouse: PostgresW
         INSERT INTO timeline_events (adapter, event_id, source, kind, event_ts, source_table,
                                      search_text, priority, actor, title, snippet, context)
         VALUES ('slack_message', 'dp1', 'slack', 'message', now(), 'slack_messages',
-                'zanzibar default path probe', 3, 'a', 't', 's', 'c')
+                'zanzibar default path probe', 'cc', 'a', 't', 's', 'c')
         """
     )
     warehouse._command('SET search_path TO "$user", public')
