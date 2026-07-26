@@ -36,6 +36,10 @@ UPSTREAM_TIMEOUT_SECONDS = 300
 OBJECT_STREAM_CHUNK_BYTES = 1 << 20
 # Mirrors auth.MaxClientNameLen in the Go app.
 MAX_CLIENT_NAME_CHARS = 64
+# The app sits behind Cloudflare, which bans urllib's default User-Agent
+# outright (error 1010, browser_signature_banned) — every upstream call 403s
+# without this. Identify honestly; a descriptive agent string passes.
+UPSTREAM_USER_AGENT = "pdw-agent-tool-proxy/1.0 (+personal-data-warehouse)"
 
 
 @dataclass(frozen=True)
@@ -181,7 +185,11 @@ def run_agent_tool_proxy(
             return data
 
         def _forward_json(self, method: str, path: str, *, body: bytes | None = None) -> tuple[int, Any]:
-            headers = {"authorization": upstream.authorization, "accept": "application/json"}
+            headers = {
+                "authorization": upstream.authorization,
+                "accept": "application/json",
+                "user-agent": UPSTREAM_USER_AGENT,
+            }
             if body:
                 headers["content-type"] = "application/json"
             req = request.Request(upstream.base_url + path, data=body or None, headers=headers, method=method)
@@ -201,7 +209,11 @@ def run_agent_tool_proxy(
         def _stream_object(self) -> None:
             # Copied through in chunks, not buffered: stored objects run to
             # 100 MB and this proxy lives inside the Dagster process.
-            req = request.Request(upstream.base_url + self.path, method="GET")
+            req = request.Request(
+                upstream.base_url + self.path,
+                headers={"user-agent": UPSTREAM_USER_AGENT},
+                method="GET",
+            )
             try:
                 with request.urlopen(req, timeout=UPSTREAM_TIMEOUT_SECONDS) as response:
                     self.send_response(200)

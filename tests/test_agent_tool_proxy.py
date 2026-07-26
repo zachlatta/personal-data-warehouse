@@ -106,6 +106,39 @@ def test_agent_client_name_stays_within_the_apps_limit() -> None:
     assert ":" not in agent_client_name("pdw:agent", "run:1")
 
 
+def test_agent_tool_proxy_identifies_itself_to_cloudflare(fake_app) -> None:
+    """Upstream requests must not go out as `Python-urllib`.
+
+    The app sits behind Cloudflare, which bans that signature outright (error
+    1010, `browser_signature_banned`) — so without an explicit User-Agent every
+    upstream call 403s in production while passing every local test.
+    """
+
+    app = fake_app(
+        responses={
+            "sql": {"rows": "n\n1"},
+            "get_object": {
+                "storage_file_id": "fid-1",
+                "exists": True,
+                "download_url": "https://public.example.com/objects/fid-1?exp=9&sig=s",
+            },
+        }
+    )
+    app.object_bytes = b"bytes"
+
+    with proxy_for(app) as env:
+        call_proxy(env, "/api/tools", None)
+        call_proxy(env, "/api/tools/sql", {"sql": "SELECT 1"})
+        _status, payload = call_proxy(env, "/api/tools/get_object", {"storage_file_id": "fid-1"})
+        with request.urlopen(payload["data"]["download_url"], timeout=10) as response:
+            response.read()
+
+    assert app.user_agents, "no upstream requests were recorded"
+    for agent in app.user_agents:
+        assert agent.startswith("pdw-agent-tool-proxy/"), agent
+        assert "urllib" not in agent.lower()
+
+
 def test_agent_tool_proxy_rejects_a_wrong_bearer(fake_app) -> None:
     app = fake_app(responses={"sql": {"rows": ""}})
 

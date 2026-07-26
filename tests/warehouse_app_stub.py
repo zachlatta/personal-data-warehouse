@@ -34,6 +34,7 @@ class StubWarehouseApp:
         )
         self.responses = responses or {}
         self.calls: list[tuple[str, str, str, bytes]] = []
+        self.user_agents: list[str] = []
         self.object_bytes = b""
 
         app = self
@@ -41,6 +42,7 @@ class StubWarehouseApp:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
                 app.calls.append(("GET", self.path, self.headers.get("authorization", ""), b""))
+                app.user_agents.append(self.headers.get("user-agent", ""))
                 if self.path == "/api/tools":
                     app.write_json(self, {"data": app.tools})
                     return
@@ -56,6 +58,7 @@ class StubWarehouseApp:
             def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
                 body = self.rfile.read(int(self.headers.get("content-length", "0") or "0"))
                 app.calls.append(("POST", self.path, self.headers.get("authorization", ""), body))
+                app.user_agents.append(self.headers.get("user-agent", ""))
                 name = self.path.removeprefix("/api/tools/")
                 if name in app.responses:
                     app.write_json(self, {"data": app.responses[name]})
