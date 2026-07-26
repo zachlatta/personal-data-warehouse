@@ -24,6 +24,10 @@ RUN uv sync --frozen --group dev --no-install-project
 COPY README.md ./
 COPY workspace.yaml ./
 COPY src ./src
+# The agent image is built from inside this container (docker build against the
+# host daemon, context = this repo root), and it compiles the pdw CLI that agent
+# runs use to reach the warehouse — so the Go sources have to be here too.
+COPY app ./app
 COPY docker/agent.Dockerfile docker/agent.Dockerfile
 COPY docker/agent-entrypoint.sh docker/agent-entrypoint.sh
 COPY docker/dagster.yaml "$DAGSTER_HOME/dagster.yaml"

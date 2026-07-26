@@ -11,9 +11,8 @@ becomes one agent session equipped to figure it out:
 - The prompt carries the uploader's folder hint (``original_path`` — his
   folder-per-account organization), the currently known ledger accounts, and
   a flexible structured output contract (everything optional-by-emptiness).
-- The agent runs with read-only warehouse query access
-  (``run_with_warehouse``) so it can look things up when a document is
-  ambiguous.
+- The agent runs with an authenticated, read-only ``pdw`` CLI
+  (``run_with_pdw``) so it can look things up when a document is ambiguous.
 
 Results land in ``manual_finance.extractions`` (typed columns + the full
 payload in ``raw_result_json``), keyed by content sha + model/prompt version:
@@ -506,9 +505,9 @@ class ManualFinanceExtractionRunner:
             model=self._model,
             input_files=inputs.input_files,
         )
-        # Read-only warehouse access: the agent can look up known accounts or
-        # prior extractions while it works.
-        result = self._agent.run_with_warehouse(request, warehouse=warehouse)
+        # Read-only warehouse access through the authenticated pdw CLI: the
+        # agent can look up known accounts or prior extractions while it works.
+        result = self._agent.run_with_pdw(request)
         self._record_agent_result(warehouse, result)
         if result.status != "completed":
             raise RuntimeError(result.error or f"agent run {result.run_id} failed")

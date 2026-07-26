@@ -16,8 +16,8 @@ from personal_data_warehouse.agent_runner import (
     ensure_agent_image,
     write_builtin_cli_tools,
 )
-from personal_data_warehouse.agent_tool_proxy import run_agent_tool_proxy
-from personal_data_warehouse.postgres_readonly import PostgresReadOnlyService, RawResult
+from personal_data_warehouse.agent_tool_proxy import WarehouseAppConfig, run_agent_tool_proxy
+from tests.warehouse_app_stub import StubWarehouseApp
 
 
 pytestmark = pytest.mark.skipif(
@@ -120,47 +120,95 @@ def test_live_agent_builtin_cli_tools_are_available_on_path(tmp_path) -> None:
     assert "ok" in completed.stdout
 
 
-def test_live_agent_builtin_cli_can_query_host_proxy(tmp_path) -> None:
+def test_live_agent_pdw_cli_reaches_the_warehouse_through_the_host_proxy(tmp_path) -> None:
+    """The image's real `pdw` must work against the per-run proxy end to end.
+
+    Everything here is exercised for real except the app itself, which is a
+    local stub: the container's binary, its env-only auth, the proxy hop, and
+    the container->host network path that Docker networking gets wrong most
+    often.
+    """
+
     require_docker()
     config = live_agent_config(tmp_path)
-    write_builtin_cli_tools(tmp_path)
 
-    class FakeRunner:
-        def query(self, sql, *, max_rows):
-            return RawResult(columns=["answer"], rows=[{"answer": 42}])
-
-    service = PostgresReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
-    with run_agent_tool_proxy(query_service=service) as env:
-        completed = subprocess.run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--add-host",
-                "host.docker.internal:host-gateway",
-                "--mount",
-                f"type=bind,src={tmp_path.resolve()},dst=/run",
-                "--env",
-                "AGENT_TOOL_MANIFEST_PATH=/run/TOOLS.md",
-                "--env",
-                f"PDW_AGENT_TOOL_PROXY_URL={env['PDW_AGENT_TOOL_PROXY_URL']}",
-                "--env",
-                f"PDW_AGENT_TOOL_PROXY_TOKEN={env['PDW_AGENT_TOOL_PROXY_TOKEN']}",
-                config.image,
-                "sh",
-                "-lc",
-                "export PATH=/run/tools:$PATH && pdw-postgres-query 'SELECT 42 AS answer'",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=120,
-        )
+    app = StubWarehouseApp(
+        responses={"sql": {"rows": "answer\n42", "total_rows": 1, "format": "csv"}},
+        tools=[{"name": "sql", "title": "Run SQL", "description": "", "input_schema": {}}],
+    )
+    try:
+        with run_agent_tool_proxy(app=WarehouseAppConfig(base_url=app.base_url, token="live-test-token")) as env:
+            completed = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--add-host",
+                    "host.docker.internal:host-gateway",
+                    "--env",
+                    f"PDW_API_URL={env['PDW_API_URL']}",
+                    "--env",
+                    f"PDW_SECRET_TOKEN={env['PDW_SECRET_TOKEN']}",
+                    "--env",
+                    f"PDW_CLIENT_NAME={env['PDW_CLIENT_NAME']}",
+                    "--env",
+                    f"PDW_NO_AUTO_UPDATE={env['PDW_NO_AUTO_UPDATE']}",
+                    config.image,
+                    "sh",
+                    "-lc",
+                    "command -v pdw && pdw sql -q 'live smoke' --output csv 'SELECT 42 AS answer'",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+            )
+    finally:
+        app.close()
 
     assert completed.returncode == 0, completed.stderr
-    payload = json.loads(completed.stdout)
-    assert payload["csv"] == "answer\n42"
-    assert payload["error"] == ""
+    assert "/usr/local/bin/pdw" in completed.stdout
+    assert "answer\n42" in completed.stdout
+
+
+def test_live_agent_pdw_cli_cannot_reach_blocked_tools(tmp_path) -> None:
+    require_docker()
+    config = live_agent_config(tmp_path)
+
+    app = StubWarehouseApp(responses={"propose_mutation": {"proposal_id": "should-never-be-reached"}})
+    try:
+        with run_agent_tool_proxy(app=WarehouseAppConfig(base_url=app.base_url, token="live-test-token")) as env:
+            completed = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--add-host",
+                    "host.docker.internal:host-gateway",
+                    "--env",
+                    f"PDW_API_URL={env['PDW_API_URL']}",
+                    "--env",
+                    f"PDW_SECRET_TOKEN={env['PDW_SECRET_TOKEN']}",
+                    "--env",
+                    f"PDW_CLIENT_NAME={env['PDW_CLIENT_NAME']}",
+                    "--env",
+                    f"PDW_NO_AUTO_UPDATE={env['PDW_NO_AUTO_UPDATE']}",
+                    config.image,
+                    "sh",
+                    "-lc",
+                    "pdw call propose_mutation --data '{}'",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+            )
+    finally:
+        app.close()
+
+    assert completed.returncode != 0
+    assert "tool_not_found" in completed.stderr
+    assert app.tool_call_paths() == []
 
 
 def test_live_agent_subscription_smoke_returns_schema_json(tmp_path) -> None:

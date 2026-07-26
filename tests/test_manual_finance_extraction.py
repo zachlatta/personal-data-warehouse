@@ -136,11 +136,9 @@ class FakeAgent:
     def __init__(self, output: dict[str, Any]):
         self._output = output
         self.requests: list[Any] = []
-        self.warehouses: list[Any] = []
 
-    def run_with_warehouse(self, request, *, warehouse, **kwargs):
+    def run_with_pdw(self, request, **kwargs):
         self.requests.append(request)
-        self.warehouses.append(warehouse)
         return FakeAgentResult(
             subject_id=request.subject_id,
             final_output_json=dict(self._output),
@@ -342,8 +340,9 @@ def test_runner_extracts_and_writes_typed_row(warehouse):
     ).sync(limit=None)
     assert summary.documents_extracted == 1
     assert summary.documents_failed == 0
-    # The agent ran with warehouse access and a structured request.
-    assert agent.warehouses == [warehouse]
+    # The agent ran with warehouse access (the authenticated pdw CLI) and a
+    # structured request.
+    assert len(agent.requests) == 1
     assert agent.requests[0].task_type == "manual_finance_extraction"
     rows = warehouse._query(
         """
@@ -398,8 +397,8 @@ def test_runner_parallel_workers_extract_all_candidates(warehouse):
     assert summary.documents_extracted == 5
     assert summary.documents_failed == 0
     assert warehouse._query("SELECT count(*) FROM manual_finance_extractions WHERE status = 'ok'") == [(5,)]
-    # Every agent run got a warehouse handle (its read-only tool proxy).
-    assert len(agent.warehouses) == 5
+    # Every document went through its own agent run.
+    assert len(agent.requests) == 5
 
 
 def test_runner_parallel_requires_warehouse_factory():

@@ -15,6 +15,7 @@ from personal_data_warehouse.agent_runner import (
     agent_run_event_rows,
     agent_run_row,
     agent_run_tool_call_rows,
+    extract_tool_name,
 )
 
 
@@ -58,14 +59,7 @@ class VoiceMemosEnrichmentSummary:
 
 
 class AgentRunClient(Protocol):
-    def run_with_warehouse(
-        self,
-        request: AgentRunRequest,
-        *,
-        warehouse,
-        max_rows: int = 50,
-        max_field_chars: int = 3000,
-    ) -> AgentRunResult:
+    def run_with_pdw(self, request: AgentRunRequest, **kwargs) -> AgentRunResult:
         ...
 
 
@@ -128,7 +122,7 @@ class ContainerAgentStructuredClient:
             input_files=dict(input_files or {}),
         )
         if self._warehouse is not None:
-            result = self._agent.run_with_warehouse(request, warehouse=self._warehouse)
+            result = self._agent.run_with_pdw(request)
         else:
             result = self._agent.run(request)
         self._record_agent_result(result)
@@ -1943,7 +1937,7 @@ def container_agent_prompt(
             "Use Bash freely for local scratch scripts and deterministic CLI helpers in the run workspace.",
             "Run \"$PDW_TOOL_HELP\" to see the local CLI tools available in this run.",
             "Use \"$AGENT_INPUT_DIR\" to read large task input files that were intentionally not embedded in this prompt.",
-            "Use \"$PDW_POSTGRES_SCHEMA\" and \"$PDW_POSTGRES_QUERY\" for read-only warehouse research. These call a short-lived proxy; the raw Postgres URL is not available in the container.",
+            "Use the authenticated `pdw` CLI for read-only warehouse research: `pdw schema` to find relations, `pdw columns <relation>` for exact columns, `pdw sql -q '<intent>' '<SQL>'` to query, and `pdw call get_object` to locate stored blobs. It reaches a short-lived per-run proxy; no database URL or app credential exists in this container.",
             "Before final output, you may write candidate JSON to a file and run \"$PDW_VALIDATE_JSON\" candidate.json \"$AGENT_SCHEMA_PATH\".",
             "These local CLI tools are the only supported tool interface inside the agent container.",
         ],
@@ -1965,13 +1959,26 @@ def container_agent_prompt(
     return json.dumps(payload, sort_keys=True, default=str)
 
 
+WAREHOUSE_CLI_COMMANDS = frozenset({"pdw sql", "pdw schema", "pdw columns"})
+
+
 def count_warehouse_cli_calls(events: Sequence[Any]) -> int:
+    """How many times the run actually reached the warehouse through `pdw`.
+
+    This gates the "did the agent do its research?" check, so it counts executed
+    commands only: it reads each event's structured payload rather than its
+    text, because the prompt itself contains literal `pdw sql` examples that a
+    substring match would happily count as research that never happened.
+    `pdw help` and `pdw version` are not warehouse reads and do not count.
+    """
+
     count = 0
     for event in events:
-        text = str(getattr(event, "text", ""))
-        if "PDW_POSTGRES_QUERY" in text or "pdw-postgres-query" in text:
-            count += 1
-        if "PDW_POSTGRES_SCHEMA" in text or "pdw-postgres-schema" in text:
+        payload = getattr(event, "event_json", None)
+        if not isinstance(payload, Mapping):
+            continue
+        invocation = extract_tool_name(payload)
+        if invocation in WAREHOUSE_CLI_COMMANDS or invocation.startswith("pdw call "):
             count += 1
     return count
 
@@ -2003,7 +2010,7 @@ def enrichment_user_prompt(*, input_file: str = AGENT_USER_PROMPT_INPUT_FILE) ->
             "warehouse_context": {
                 "result_format": "Tool results are CSV with truncation metadata.",
                 "query_notes": [
-                    "Use \"$PDW_POSTGRES_SCHEMA\" output to identify table names, column names, and whether fields are scalar or arrays before writing SQL.",
+                    "Use `pdw schema` to identify relations, then `pdw columns <relation>` for each relation you reference: it gives exact column names, types, and whether fields are scalar or arrays. Do not guess column names.",
                     "For array columns, use Postgres array operators such as value = ANY(column).",
                     "Compare timestamptz columns with typed timestamp literals or ranges; do not compare timestamp columns to untyped ISO strings with timezone suffixes.",
                     "Do not add FORMAT clauses; the tool already returns CSV.",
@@ -2060,12 +2067,12 @@ def enrichment_task_input(
 
 def enrichment_instructions() -> list[str]:
     return [
-        "Before final output, read input_data.path, then run \"$PDW_POSTGRES_SCHEMA\" and multiple focused \"$PDW_POSTGRES_QUERY\" calls to search calendar, email, Slack, and related warehouse context.",
+        "Before final output, read input_data.path, then run `pdw schema` and multiple focused `pdw sql -q '<intent>' '<SQL>'` calls to search calendar, email, Slack, and related warehouse context.",
         "Make separate warehouse checks for: the selected calendar event including attendee data, participant/person identity evidence, and suspicious domain terms or organizations that need spelling verification.",
         "Hard requirements: accurate date/time, accurate participant/name spellings, and accurate domain terms in transcript.",
         "participants means actual people who speak or are strongly evidenced as present. Do not include calendar invitees merely because they were invited, especially if responseStatus is needsAction and there is no transcript evidence they attended.",
         "If you select a calendar event, start_at and end_at must come from that calendar event or verified warehouse context.",
-        "Do not leave participants as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, use \"$PDW_POSTGRES_SCHEMA\" results to query Slack/email identity data before finalizing participants or speaker_map.",
+        "Do not leave participants as raw email addresses when a full name can be resolved. If a calendar attendee has only an email address, use `pdw schema` results to query Slack/email identity data before finalizing participants or speaker_map.",
         "Do not stop at a one-token name like a Slack display_name or calendar first name. Search Gmail/calendar/Slack context around the event title, email local part, usernames, candidate briefs, and prior messages until you find a full preferred/legal name or have clear evidence none is available.",
         "When a speaker is identified only by a first name, use calendar attendee emails plus Slack/email identity evidence to resolve the full name.",
         "Calendar candidates may include identity_hints for attendee emails. Use possible_names from identity_hints for attendee and speaker names when supported by transcript evidence.",

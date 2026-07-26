@@ -27,9 +27,8 @@ from personal_data_warehouse.agent_runner import (
     volume_copy_command,
     write_builtin_cli_tools,
 )
-from personal_data_warehouse.agent_tool_proxy import run_agent_tool_proxy
+from personal_data_warehouse.agent_tool_proxy import WarehouseAppConfig
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.postgres_readonly import PostgresReadOnlyService, RawResult
 
 
 def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> None:
@@ -62,7 +61,9 @@ def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> N
     assert "type=volume,src=pdw-agent-runs,dst=/agent-runs" in command
     assert "--add-host" in command
     assert "host.docker.internal:host-gateway" in command
-    assert any(item.endswith("/tools/pdw-postgres-query") for item in command if item.startswith("PDW_POSTGRES_QUERY="))
+    # The warehouse is reached with the real `pdw` CLI, not a bespoke shim.
+    assert "PDW_POSTGRES_QUERY" not in " ".join(command)
+    assert "PDW_POSTGRES_SCHEMA" not in " ".join(command)
 
 
 def test_container_agent_runner_writes_prompt_schema_and_parses_final_json(tmp_path) -> None:
@@ -90,9 +91,9 @@ def test_container_agent_runner_writes_prompt_schema_and_parses_final_json(tmp_p
     assert result.final_output_json == {"meeting_title": "Done"}
     assert result.events[0].event_type == "agent_message"
     assert (tmp_path / "run-1" / "tools" / "pdw-validate-json").exists()
-    assert (tmp_path / "run-1" / "tools" / "pdw-postgres-query").exists()
-    assert (tmp_path / "run-1" / "tools" / "pdw-postgres-schema").exists()
-    assert (tmp_path / "run-1" / "TOOLS.md").exists()
+    assert not (tmp_path / "run-1" / "tools" / "pdw-postgres-query").exists()
+    assert not (tmp_path / "run-1" / "tools" / "pdw-postgres-schema").exists()
+    assert "pdw sql" in (tmp_path / "run-1" / "TOOLS.md").read_text(encoding="utf-8")
 
 
 def test_container_agent_runner_builds_missing_managed_image_before_run(tmp_path) -> None:
@@ -128,22 +129,7 @@ def test_container_agent_runner_builds_missing_managed_image_before_run(tmp_path
     assert build_index < agent_run_index
 
 
-def test_container_agent_runner_can_inject_postgres_proxy_without_raw_url(tmp_path) -> None:
-    class FakeReadOnlyConnection:
-        def __init__(self) -> None:
-            self.closed = False
-
-        def close(self) -> None:
-            self.closed = True
-
-    class FakeWarehouse:
-        def __init__(self, connection: FakeReadOnlyConnection) -> None:
-            self.connection = connection
-
-        def read_only_connection(self) -> FakeReadOnlyConnection:
-            return self.connection
-
-    fake_connection = FakeReadOnlyConnection()
+def test_container_agent_runner_points_pdw_cli_at_a_per_run_proxy(tmp_path) -> None:
     volume_copy_calls = 0
     agent_command = []
 
@@ -163,18 +149,21 @@ def test_container_agent_runner_can_inject_postgres_proxy_without_raw_url(tmp_pa
         tool_proxy_bind_host="127.0.0.1",
         tool_proxy_public_host="127.0.0.1",
     )
-    result = ContainerAgentRunner(config, runner=fake_run).run_with_warehouse(
+    result = ContainerAgentRunner(config, runner=fake_run).run_with_pdw(
         AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1"),
-        warehouse=FakeWarehouse(fake_connection),
+        app=WarehouseAppConfig(base_url="https://warehouse.example.com", token="real-app-token-32-chars-minimum!!"),
     )
 
     joined = " ".join(agent_command)
     assert result.status == "completed"
-    assert fake_connection.closed is True
-    assert "PDW_AGENT_TOOL_PROXY_URL=http://127.0.0.1:" in joined
-    assert "PDW_AGENT_TOOL_PROXY_TOKEN=" in joined
-    assert "PDW_POSTGRES_QUERY=" in joined
+    assert "PDW_API_URL=http://127.0.0.1:" in joined
+    assert "PDW_SECRET_TOKEN=" in joined
+    assert "PDW_CLIENT_NAME=pdw-agent-run-1" in joined
+    assert "PDW_NO_AUTO_UPDATE=1" in joined
+    # Neither the raw database nor the real app credential ever reaches the container.
     assert "POSTGRES_DATABASE_URL" not in joined
+    assert "real-app-token-32-chars-minimum!!" not in joined
+    assert "warehouse.example.com" not in joined
 
 
 def test_container_agent_runner_writes_input_files_and_exports_input_dir(tmp_path) -> None:
@@ -307,7 +296,7 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
                     "type": "item.completed",
                     "item": {
                         "type": "command_execution",
-                        "command": '/bin/bash -lc "$PDW_POSTGRES_QUERY SELECT 1"',
+                        "command": "/bin/bash -lc \"pdw sql -q 'row count' 'SELECT 1'\"",
                         "aggregated_output": '{"csv":"1\\n1"}',
                         "exit_code": 0,
                         "status": "completed",
@@ -323,9 +312,53 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
     assert agent_run_row(result)["prompt_version"] == "prompt-v1"
     assert agent_run_event_rows(result)[0]["event_type"] == "mcp_tool_call"
     tool_rows = agent_run_tool_call_rows(result)
-    assert [row["tool_name"] for row in tool_rows] == ["query", "pdw-postgres-query"]
+    assert [row["tool_name"] for row in tool_rows] == ["query", "pdw sql"]
     assert tool_rows[0]["arguments_json"] == '{"sql":"SELECT 1"}'
-    assert "PDW_POSTGRES_QUERY" in tool_rows[1]["arguments_json"]
+    assert "pdw sql" in tool_rows[1]["arguments_json"]
+
+
+def test_agent_run_tool_call_rows_names_each_pdw_subcommand() -> None:
+    now = datetime.now(tz=UTC)
+    commands = [
+        ("pdw schema", "pdw schema"),
+        ("pdw columns gmail.messages", "pdw columns"),
+        ("bash -lc \"pdw call get_object --data '{}'\"", "pdw call get_object"),
+        # Flags may precede the tool name; the --data blob must not be mistaken for it.
+        ("pdw call --data '{\"storage_file_id\":\"fid\"}' get_object", "pdw call get_object"),
+        ("pdw call something_unregistered --data '{}'", "pdw call"),
+        ("pdw sql --file query.sql", "pdw sql"),
+        ("/usr/local/bin/pdw help", "pdw"),
+        ("rg -n TODO .", "bash"),
+    ]
+    events = [
+        AgentRunEvent(
+            event_index=index,
+            stream="stdout",
+            event_type="item.completed",
+            event_json={"type": "item.completed", "item": {"type": "command_execution", "command": command}},
+            text="{}",
+            created_at=now,
+        )
+        for index, (command, _expected) in enumerate(commands)
+    ]
+    result = AgentRunResult(
+        run_id="run-1",
+        provider="codex",
+        model="gpt-test",
+        task_type="voice_memo_enrichment",
+        subject_id="rec-1",
+        prompt_version="prompt-v1",
+        input_sha256="sha",
+        status="completed",
+        final_output_json={},
+        error="",
+        exit_code=0,
+        started_at=now,
+        completed_at=now,
+        events=events,
+    )
+
+    assert [row["tool_name"] for row in agent_run_tool_call_rows(result)] == [expected for _command, expected in commands]
 
 
 def test_container_agent_runner_rejects_oversized_prompt_before_docker(tmp_path) -> None:
@@ -430,6 +463,75 @@ def test_default_agent_docker_image_uses_agent_image_inputs_hash(tmp_path) -> No
     assert image.startswith("pdw-agent:")
     assert len(first) == 6
     assert changed != image
+
+
+def test_default_agent_docker_image_tracks_the_pdw_cli_source(tmp_path) -> None:
+    """The image bakes in a compiled `pdw`, so CLI edits must rebuild it.
+
+    Hashing only the Dockerfile would leave every agent run on a stale binary
+    after a CLI change, with no signal that it happened.
+    """
+
+    dockerfile = tmp_path / "agent.Dockerfile"
+    entrypoint = tmp_path / "agent-entrypoint.sh"
+    cli_dir = tmp_path / "app" / "cmd" / "pdw-cli"
+    cli_dir.mkdir(parents=True)
+    dockerfile.write_text("FROM alpine\n", encoding="utf-8")
+    entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
+    (tmp_path / "app" / "go.mod").write_text("module example\n", encoding="utf-8")
+    (cli_dir / "run.go").write_text("package main\n", encoding="utf-8")
+
+    def image_now() -> str:
+        return default_agent_docker_image(
+            repository="pdw-agent",
+            dockerfile_path=dockerfile,
+            entrypoint_path=entrypoint,
+            cli_source_dir=tmp_path / "app",
+        )
+
+    before = image_now()
+    (cli_dir / "run.go").write_text("package main\n// changed\n", encoding="utf-8")
+    after = image_now()
+
+    # A test-only .go file is not shipped in the binary and must not churn the tag.
+    (cli_dir / "run_test.go").write_text("package main\n", encoding="utf-8")
+    with_test_file = image_now()
+
+    assert after != before
+    assert with_test_file == after
+
+
+def test_dagster_image_ships_every_input_the_agent_image_build_needs() -> None:
+    """Agent images are built from inside the Dagster container.
+
+    `ensure_agent_image` runs `docker build` with this repo root as the context,
+    so anything agent.Dockerfile COPYs must also have been COPYed into the
+    Dagster image — otherwise the build only fails in production, on the first
+    agent run after deploy.
+    """
+
+    repo_root = Path(__file__).resolve().parents[1]
+    dagster_dockerfile = (repo_root / "Dockerfile").read_text(encoding="utf-8")
+    agent_dockerfile = (repo_root / "docker" / "agent.Dockerfile").read_text(encoding="utf-8")
+
+    copied_into_dagster = {
+        line.split()[1].lstrip("./")
+        for line in dagster_dockerfile.splitlines()
+        if line.startswith("COPY ") and len(line.split()) >= 3
+    }
+    build_context_paths = {
+        source.lstrip("./").split("/")[0]
+        for line in agent_dockerfile.splitlines()
+        if line.startswith("COPY ") and "--from=" not in line
+        for source in line.split()[1:-1]
+    }
+
+    missing = {
+        path
+        for path in build_context_paths
+        if not any(copied == path or copied.startswith(path + "/") for copied in copied_into_dagster)
+    }
+    assert not missing, f"agent.Dockerfile needs {sorted(missing)} but the Dagster image does not COPY it"
 
 
 def test_agent_config_uses_container_hostname_for_non_bridge_proxy(monkeypatch) -> None:
@@ -542,96 +644,6 @@ def test_builtin_cli_tools_validate_json(tmp_path) -> None:
 
     assert completed.returncode == 0
     assert completed.stdout.strip() == "ok"
-
-
-def test_builtin_cli_tools_query_postgres_proxy(tmp_path) -> None:
-    class FakeRunner:
-        def query(self, sql, *, max_rows):
-            assert max_rows == 3
-            return RawResult(columns=["answer"], rows=[{"answer": 42}])
-
-    write_builtin_cli_tools(tmp_path)
-    service = PostgresReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
-    with run_agent_tool_proxy(query_service=service, bind_host="127.0.0.1", public_host="127.0.0.1") as env:
-        completed = subprocess.run(
-            [str(tmp_path / "tools" / "pdw-postgres-query"), "SELECT 42 AS answer"],
-            env={**env, "PATH": os.environ.get("PATH", "")},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-    assert completed.returncode == 0, completed.stderr
-    payload = json.loads(completed.stdout)
-    assert payload["csv"] == "answer\n42"
-    assert payload["error"] == ""
-
-
-def test_builtin_cli_tools_reject_write_queries_through_proxy(tmp_path) -> None:
-    class FakeRunner:
-        def query(self, sql, *, max_rows):
-            raise AssertionError("write query should be rejected before runner")
-
-    write_builtin_cli_tools(tmp_path)
-    service = PostgresReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
-    with run_agent_tool_proxy(query_service=service, bind_host="127.0.0.1", public_host="127.0.0.1") as env:
-        completed = subprocess.run(
-            [str(tmp_path / "tools" / "pdw-postgres-query"), "DROP TABLE apple_voice_memos_enrichments"],
-            env={**env, "PATH": os.environ.get("PATH", "")},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-    assert completed.returncode == 0
-    payload = json.loads(completed.stdout)
-    assert "read-only" in payload["error"]
-
-
-def test_agent_tool_proxy_serializes_postgres_queries() -> None:
-    active = 0
-    max_active = 0
-    guard = threading.Lock()
-
-    class FakeRunner:
-        def query(self, sql, *, max_rows):
-            nonlocal active, max_active
-            with guard:
-                active += 1
-                max_active = max(max_active, active)
-            try:
-                time.sleep(0.05)
-                return RawResult(columns=["sql"], rows=[{"sql": sql}])
-            finally:
-                with guard:
-                    active -= 1
-
-    service = PostgresReadOnlyService(FakeRunner(), max_rows=2, max_field_chars=100)
-    with run_agent_tool_proxy(query_service=service, bind_host="127.0.0.1", public_host="127.0.0.1") as env:
-        results = []
-
-        def post(sql: str) -> None:
-            req = request.Request(
-                f"{env['PDW_AGENT_TOOL_PROXY_URL']}/query",
-                data=json.dumps({"sql": sql}).encode("utf-8"),
-                headers={
-                    "authorization": f"Bearer {env['PDW_AGENT_TOOL_PROXY_TOKEN']}",
-                    "content-type": "application/json",
-                },
-                method="POST",
-            )
-            with request.urlopen(req, timeout=5) as response:
-                results.append(json.loads(response.read().decode("utf-8")))
-
-        threads = [threading.Thread(target=post, args=(f"SELECT {index}",)) for index in range(3)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-    assert len(results) == 3
-    assert all(result["error"] == "" for result in results)
-    assert max_active == 1
 
 
 def test_builtin_cli_tools_reject_invalid_json_shape(tmp_path) -> None:

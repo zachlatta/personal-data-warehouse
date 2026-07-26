@@ -965,7 +965,7 @@ statements are the mortgage's only source.
   the agent. Input prep only chooses what the agent sees (pypdf text layer when rich; pdftoppm
   page renders — `MANUAL_FINANCE_RENDER_MAX_PAGES`, default 10 — when scanned; raw text for
   CSV/OFX/RTF; normalized JPEG for screenshots). The agent runs with read-only warehouse access
-  (`run_with_warehouse`), gets known `finance.accounts` + `original_path` as context, and returns
+  (`run_with_pdw`), gets known `finance.accounts` + `original_path` as context, and returns
   a strict-schema payload (transactions[]/balances[]/valuations[] with decimal-string money)
   mapped into typed columns; bumping `PROMPT_VERSION` re-extracts without clobbering. Retry cap:
   agent failures count per run in `agent_runs`; permanent input-prep failures record status

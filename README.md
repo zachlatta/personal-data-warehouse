@@ -1203,11 +1203,18 @@ AGENT_RUNS_DIR=/agent-runs
 AGENT_DOCKER_NETWORK=coolify
 ```
 
-The read-only Postgres tool is exposed through a short-lived proxy owned by the Dagster process.
-The agent container receives only a proxy URL and per-run bearer token, not `POSTGRES_DATABASE_URL`. Defaults
-work on Docker Desktop/OrbStack via `host.docker.internal`. In Coolify, set `AGENT_DOCKER_NETWORK`
-to the app network, usually `coolify`; when the network is not `bridge`, the proxy host defaults to
-the Dagster container hostname. Override the host only if Docker DNS cannot resolve that hostname:
+Warehouse access is the real `pdw` CLI, compiled into the agent image from this repo and
+authenticated through a short-lived proxy owned by the Dagster process. The container receives
+`PDW_API_URL` pointing at that proxy plus a random per-run `PDW_SECRET_TOKEN` — never
+`POSTGRES_DATABASE_URL` and never the app's real token. The proxy forwards only read-only tools
+(`sql`, `schema_overview`, `describe_table`, `get_object`), caps rows per query, and dies with the
+run. Because the Dagster process is the authenticated client, it needs `PDW_API_URL` and
+`PDW_SECRET_TOKEN` for the warehouse app; agent runs fail loud if they are unset.
+
+Defaults work on Docker Desktop/OrbStack via `host.docker.internal`. In Coolify, set
+`AGENT_DOCKER_NETWORK` to the app network, usually `coolify`; when the network is not `bridge`, the
+proxy host defaults to the Dagster container hostname. Override the host only if Docker DNS cannot
+resolve that hostname:
 
 ```bash
 AGENT_DOCKER_NETWORK=coolify
@@ -1244,21 +1251,34 @@ plain Python for testing, while assets receive the resource and use it to start 
 The Voice Memos enrichment asset consumes this resource by default; other assets can reuse the same
 resource later.
 
-Each run also gets a per-run `tools/` directory mounted into the agent container. The runner exports
-absolute helper paths because Codex/Claude shell environments may not preserve `PATH` changes.
-Current built-ins:
+Inside the container the agent uses the same `pdw` commands a human would, already authenticated:
+
+```bash
+pdw schema                                        # relations + keys
+pdw columns gmail.messages                        # exact columns and types
+pdw sql -q 'why you are asking' "SELECT summary, attendees_json FROM google_calendar.events LIMIT 5"
+pdw call get_object --data '{"storage_file_id":"..."}'   # then curl the signed download_url
+```
+
+Each run also gets a per-run `tools/` directory mounted into the container for the helpers that are
+not part of the CLI. The runner exports absolute paths for those because Codex/Claude shell
+environments may not preserve `PATH` changes (`pdw` itself lives at `/usr/local/bin/pdw`, so it
+needs no such handling):
 
 ```bash
 "$PDW_TOOL_HELP"
 "$PDW_VALIDATE_JSON" candidate.json "$AGENT_SCHEMA_PATH"
-"$PDW_POSTGRES_SCHEMA"
-"$PDW_POSTGRES_QUERY" "SELECT summary, attendees_json FROM calendar_events LIMIT 5"
 ```
 
-`$PDW_POSTGRES_SCHEMA` and `$PDW_POSTGRES_QUERY` route through the per-run read-only proxy. SQL
-is locally restricted to read-only statement types.
-Secret-backed tools should only be added deliberately, with the understanding that any credential or
-capability available to a CLI is also available to arbitrary Bash inside the agent container.
+Two properties make this safe to hand an LLM that reads untrusted content: the container's token is
+random per run and worthless once the run ends, and the proxy's allowlist means a `propose_mutation`
+or `/ingest/*` call is unreachable no matter what the model is talked into attempting. That is the
+whole reason the container does not simply get `PDW_SECRET_TOKEN`. Secret-backed tools should only
+be added deliberately, with the understanding that any credential or capability available to a CLI
+is also available to arbitrary Bash inside the agent container.
+
+Because the image compiles `pdw` from `app/`, the image tag hashes those sources too: editing the
+CLI changes the tag and the next run rebuilds, rather than silently keeping a stale binary.
 
 Written tests that do not call live agents run with the normal suite:
 
@@ -1279,9 +1299,9 @@ AGENT_REASONING_EFFORT=medium \
 uv run pytest tests/test_agent_runner_live.py -q
 ```
 
-The live tests verify the image has both CLIs and no Docker socket, start real one-off agent
-containers through the subscription login, and check that the built-in Postgres CLI can reach a
-host-owned read-only proxy without receiving the raw Postgres URL.
+The live tests verify the image has both agent CLIs and no Docker socket, start real one-off agent
+containers through the subscription login, and check that the image's `pdw` can query through the
+host-owned per-run proxy — and that a blocked tool such as `propose_mutation` never reaches the app.
 
 ## Warehouse Tables
 

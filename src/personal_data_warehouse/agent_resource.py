@@ -19,6 +19,10 @@ from personal_data_warehouse.agent_runner import (
     AgentRunResult,
     ContainerAgentRunner,
 )
+from personal_data_warehouse.agent_tool_proxy import (
+    DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS,
+    WarehouseAppConfig,
+)
 
 if TYPE_CHECKING:
     from personal_data_warehouse.config import AgentConfig
@@ -93,21 +97,15 @@ class AgentResource(ConfigurableResource):
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         return self.runner().run(self._effective_request(request))
 
-    def run_with_warehouse(
+    def run_with_pdw(
         self,
         request: AgentRunRequest,
         *,
-        warehouse,
-        max_rows: int = 50,
-        max_field_chars: int = 3000,
+        app: WarehouseAppConfig | None = None,
+        max_rows: int = DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS,
     ) -> AgentRunResult:
         effective_request = self._effective_request(request)
-        return self.runner().run_with_warehouse(
-            effective_request,
-            warehouse=warehouse,
-            max_rows=max_rows,
-            max_field_chars=max_field_chars,
-        )
+        return self.runner().run_with_pdw(effective_request, app=app, max_rows=max_rows)
 
     def _effective_request(self, request: AgentRunRequest) -> AgentRunRequest:
         self._raise_if_unconfigured()

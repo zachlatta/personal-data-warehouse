@@ -18,6 +18,7 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
     event_identity_terms,
     load_calendar_candidates,
     canonicalize_text_verified_name_mentions,
+    count_warehouse_cli_calls,
     load_attendee_identity_hints,
     load_contact_alias_hints,
     load_enrichment_candidates,
@@ -29,7 +30,7 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
     validate_enrichment_result,
     withhold_low_confidence_resolved_speaker_names,
 )
-from personal_data_warehouse.agent_runner import AgentRunResult
+from personal_data_warehouse.agent_runner import AgentRunEvent, AgentRunResult
 
 
 class FakeIdentityWarehouse:
@@ -1157,6 +1158,56 @@ def test_enrichment_row_canonicalizes_close_name_variants_to_verified_attendees(
 
     assert "Hey Taylor" in row["transcript"]
     assert "Tayler" not in row["raw_result_json"]
+
+
+def _command_event(index: int, command: str) -> AgentRunEvent:
+    return AgentRunEvent(
+        event_index=index,
+        stream="stdout",
+        event_type="item.completed",
+        event_json={"type": "item.completed", "item": {"type": "command_execution", "command": command}},
+        text="{}",
+        created_at=datetime(2026, 4, 27, tzinfo=UTC),
+    )
+
+
+def test_count_warehouse_cli_calls_counts_executed_pdw_reads() -> None:
+    events = [
+        _command_event(0, "pdw schema"),
+        _command_event(1, "pdw sql -q 'attendees' 'SELECT 1'"),
+        _command_event(2, "pdw columns google_calendar.events"),
+        _command_event(3, "pdw call get_object --data '{}'"),
+    ]
+
+    assert count_warehouse_cli_calls(events) == 4
+
+
+def test_count_warehouse_cli_calls_ignores_non_research_commands() -> None:
+    events = [
+        _command_event(0, "pdw help"),
+        _command_event(1, "pdw version"),
+        _command_event(2, "rg -n TODO ."),
+    ]
+
+    assert count_warehouse_cli_calls(events) == 0
+
+
+def test_count_warehouse_cli_calls_ignores_prompt_text_that_only_mentions_pdw() -> None:
+    """The prompt itself shows `pdw sql` examples; quoting them is not research."""
+
+    echoed_prompt = AgentRunEvent(
+        event_index=0,
+        stream="stdout",
+        event_type="user_message",
+        event_json={
+            "type": "user_message",
+            "text": "Before final output, run `pdw schema` and multiple focused `pdw sql -q ...` calls.",
+        },
+        text="Before final output, run `pdw schema` and multiple `pdw sql` calls.",
+        created_at=datetime(2026, 4, 27, tzinfo=UTC),
+    )
+
+    assert count_warehouse_cli_calls([echoed_prompt]) == 0
 
 
 def test_canonicalize_text_verified_name_mentions_only_rewrites_close_name_variants() -> None:

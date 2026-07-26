@@ -18,8 +18,13 @@ import time
 import uuid
 from typing import Any
 
-from personal_data_warehouse.agent_tool_proxy import run_agent_tool_proxy
-from personal_data_warehouse.postgres_readonly import PostgresReadOnlyRunner, PostgresReadOnlyService
+from personal_data_warehouse.agent_tool_proxy import (
+    DEFAULT_AGENT_TOOL_ALLOWLIST,
+    DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS,
+    WarehouseAppConfig,
+    run_agent_tool_proxy,
+    warehouse_app_config_from_env,
+)
 
 
 DEFAULT_AGENT_AUTH_VOLUME = "pdw-agent-auth"
@@ -52,6 +57,8 @@ DEFAULT_AGENT_IMAGE_REPOSITORY = "personal-data-warehouse-agent"
 DEFAULT_AGENT_DOCKERFILE_PATH = Path(__file__).resolve().parents[2] / "docker" / "agent.Dockerfile"
 DEFAULT_AGENT_ENTRYPOINT_PATH = Path(__file__).resolve().parents[2] / "docker" / "agent-entrypoint.sh"
 DEFAULT_AGENT_BUILD_CONTEXT_DIR = Path(__file__).resolve().parents[2]
+# The image compiles the pdw CLI from this tree, so its sources are image inputs.
+DEFAULT_AGENT_CLI_SOURCE_DIR = Path(__file__).resolve().parents[2] / "app"
 DEFAULT_AGENT_TOOL_PROXY_BIND_HOST = "0.0.0.0"
 DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST = "host.docker.internal"
 DEFAULT_AGENT_MAX_PROMPT_CHARS = 900_000
@@ -319,29 +326,29 @@ class ContainerAgentRunner:
         except Exception:  # noqa: BLE001 - unknown expiry falls back to exclusive
             return None
 
-    def run_with_warehouse(
+    def run_with_pdw(
         self,
         request: AgentRunRequest,
         *,
-        warehouse,
-        max_rows: int = 50,
-        max_field_chars: int = 3000,
+        app: WarehouseAppConfig | None = None,
+        max_rows: int = DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS,
     ) -> AgentRunResult:
-        runner = PostgresReadOnlyRunner(warehouse)
-        query_service = PostgresReadOnlyService(
-            runner,
+        """Run the agent with an authenticated `pdw` CLI pointed at a per-run proxy.
+
+        The container gets a throwaway token for a proxy that only forwards
+        read-only warehouse tools and stored-object reads; the app's real
+        credential stays in this process.
+        """
+
+        app = app or warehouse_app_config_from_env()
+        with run_agent_tool_proxy(
+            app=app,
+            run_id=request.run_id,
             max_rows=max_rows,
-            max_field_chars=max_field_chars,
-        )
-        try:
-            with run_agent_tool_proxy(
-                query_service=query_service,
-                bind_host=self._config.tool_proxy_bind_host,
-                public_host=self._config.tool_proxy_public_host,
-            ) as tool_env:
-                return self.run(request.with_extra_env(tool_env))
-        finally:
-            runner.close()
+            bind_host=self._config.tool_proxy_bind_host,
+            public_host=self._config.tool_proxy_public_host,
+        ) as tool_env:
+            return self.run(request.with_extra_env(tool_env))
 
     def _ensure_managed_image(self) -> None:
         if self._config.image != default_agent_docker_image():
@@ -438,10 +445,6 @@ class ContainerAgentRunner:
             f"PDW_TOOL_HELP={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-tool-help",
             "--env",
             f"PDW_VALIDATE_JSON={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-validate-json",
-            "--env",
-            f"PDW_POSTGRES_SCHEMA={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-postgres-schema",
-            "--env",
-            f"PDW_POSTGRES_QUERY={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-postgres-query",
             "--env",
             f"CODEX_HOME={DEFAULT_AGENT_CONTAINER_AUTH_DIR}/codex",
             "--env",
@@ -582,12 +585,11 @@ def extract_tool_name(payload: Mapping[str, Any]) -> str:
     item = payload.get("item")
     if isinstance(item, Mapping) and item.get("type") == "command_execution":
         command = str(item.get("command") or "")
-        if "pdw-postgres-query" in command or "PDW_POSTGRES_QUERY" in command:
-            return "pdw-postgres-query"
-        if "pdw-postgres-schema" in command or "PDW_POSTGRES_SCHEMA" in command:
-            return "pdw-postgres-schema"
         if "pdw-validate-json" in command or "PDW_VALIDATE_JSON" in command:
             return "pdw-validate-json"
+        pdw_command = pdw_cli_invocation(command)
+        if pdw_command:
+            return pdw_command
         return "bash"
     for key in ("tool_name", "tool", "name"):
         value = payload.get(key)
@@ -600,6 +602,40 @@ def extract_tool_name(payload: Mapping[str, Any]) -> str:
         value = mcp.get("tool") or mcp.get("name")
         if isinstance(value, str):
             return value
+    return ""
+
+
+PDW_CLI_SUBCOMMANDS = frozenset({"sql", "schema", "columns", "call", "list", "describe"})
+
+
+def pdw_cli_invocation(command: str) -> str:
+    """Name the `pdw` invocation inside a shell command, or "" if there is none.
+
+    Agent tool use shows up as opaque `command_execution` events, so this is how
+    warehouse access gets attributed in `agent_run_tool_calls`. `pdw call <tool>`
+    keeps the tool name because that is the interesting part.
+    """
+
+    tokens = command.replace("'", " ").replace('"', " ").split()
+    for index, token in enumerate(tokens):
+        if token != "pdw" and not token.endswith("/pdw"):
+            continue
+        rest = [item for item in tokens[index + 1 :] if not item.startswith("-")]
+        if not rest:
+            return "pdw"
+        subcommand = rest[0]
+        if subcommand not in PDW_CLI_SUBCOMMANDS:
+            return "pdw"
+        if subcommand == "call":
+            # The tool name may follow the flags rather than precede them, and
+            # the --data JSON has been flattened into tokens by now — so match
+            # known tool names rather than guessing from token shape, or
+            # `--data '{"storage_file_id":...}' get_object` reads as a call to
+            # "storage_file_id".
+            for candidate in rest[1:]:
+                if candidate in DEFAULT_AGENT_TOOL_ALLOWLIST:
+                    return f"pdw call {candidate}"
+        return f"pdw {subcommand}"
     return ""
 
 
@@ -752,14 +788,6 @@ def write_builtin_cli_tools(run_dir: Path) -> None:
     validate_tool.write_text(PDW_VALIDATE_JSON_SCRIPT, encoding="utf-8")
     validate_tool.chmod(0o755)
 
-    postgres_query_tool = tools_dir / "pdw-postgres-query"
-    postgres_query_tool.write_text(PDW_POSTGRES_QUERY_SCRIPT, encoding="utf-8")
-    postgres_query_tool.chmod(0o755)
-
-    postgres_schema_tool = tools_dir / "pdw-postgres-schema"
-    postgres_schema_tool.write_text(PDW_POSTGRES_SCHEMA_SCRIPT, encoding="utf-8")
-    postgres_schema_tool.chmod(0o755)
-
     help_tool = tools_dir / "pdw-tool-help"
     help_tool.write_text(PDW_TOOL_HELP_SCRIPT, encoding="utf-8")
     help_tool.chmod(0o755)
@@ -770,7 +798,43 @@ def write_builtin_cli_tools(run_dir: Path) -> None:
 def cli_tool_manifest() -> str:
     return """# Agent CLI Tools
 
-These commands live in `$AGENT_TOOLS_DIR` inside the agent container. The runner also exports absolute path helpers: `$PDW_TOOL_HELP`, `$PDW_VALIDATE_JSON`, `$PDW_POSTGRES_SCHEMA`, and `$PDW_POSTGRES_QUERY`.
+## pdw
+
+`pdw` is the personal data warehouse CLI, already authenticated for this run and
+on `PATH`. It is the way to reach warehouse data. Run `pdw help` for the full
+usage; the commands available to an agent run are:
+
+```bash
+pdw schema                                  # every relation, with keys — start here
+pdw columns gmail.messages                  # exact columns + types for ONE relation
+pdw sql -q 'why you are asking' 'SELECT ...'   # read-only SQL
+pdw sql -q 'why you are asking' --file query.sql   # SQL from a file (no shell quoting)
+pdw call get_object --data '{"storage_file_id":"..."}'   # locate a stored blob
+```
+
+Notes that save a round trip:
+
+- `schema` lists relations but NOT columns. Run `columns` on every relation you
+  are about to reference; guessing column names is the top cause of failed SQL.
+- Always pass `-q` with a short plain-English intent. It is logged server-side.
+- `--output csv|json|nd-json` selects the result format; CSV is the default.
+- Results are capped per query, so use focused `SELECT` lists and `LIMIT`. A
+  `truncated` flag with `proxy_row_limit` in the response means you are seeing a
+  slice of a larger result; narrow the query rather than paging blindly.
+- Writes are impossible: the CLI reaches a read-only surface through a per-run
+  proxy, and no database URL or app credential exists in this container.
+
+`pdw call get_object` returns metadata plus a signed, time-limited
+`download_url`. Fetch the bytes with that URL — it needs no extra
+authentication:
+
+```bash
+url=$(pdw call get_object --data '{"storage_file_id":"FILE_ID"}' | jq -r .download_url)
+curl -fsS "$url" -o attachment.pdf
+```
+
+Task input files that were too large for the prompt are already on disk in
+`$AGENT_INPUT_DIR`; read those directly instead of re-fetching them.
 
 ## pdw-tool-help
 
@@ -793,21 +857,6 @@ Usage:
 ```
 
 Supported schema checks: object root, required keys, additionalProperties=false, and primitive `string`, `number`, `integer`, `boolean`, `array`, and `object` property types.
-
-## pdw-postgres-schema
-
-Print a compact read-only Postgres schema overview through the per-run tool proxy.
-
-## pdw-postgres-query
-
-Run one read-only Postgres query through the per-run tool proxy. The raw Postgres URL is not available in the agent container.
-
-Usage:
-
-```bash
-"$PDW_POSTGRES_QUERY" "SELECT * FROM google_calendar.events LIMIT 5"
-cat query.sql | "$PDW_POSTGRES_QUERY"
-```
 """
 
 
@@ -903,79 +952,6 @@ if __name__ == "__main__":
 """
 
 
-PDW_POSTGRES_CLIENT_PY = r'''
-from __future__ import annotations
-
-import json
-import os
-import sys
-from urllib import error, request
-
-
-def proxy_request(path: str, payload: dict[str, object]) -> int:
-    base_url = os.getenv("PDW_AGENT_TOOL_PROXY_URL", "").rstrip("/")
-    token = os.getenv("PDW_AGENT_TOOL_PROXY_TOKEN", "")
-    if not base_url or not token:
-        print("Postgres proxy is not configured for this agent run", file=sys.stderr)
-        return 2
-    body = json.dumps(payload).encode("utf-8")
-    req = request.Request(
-        f"{base_url}{path}",
-        data=body,
-        headers={
-            "authorization": f"Bearer {token}",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with request.urlopen(req, timeout=30) as response:
-            text = response.read().decode("utf-8")
-    except error.HTTPError as exc:
-        text = exc.read().decode("utf-8", errors="replace")
-        print(text or str(exc), file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"Postgres proxy request failed: {exc}", file=sys.stderr)
-        return 1
-    print(text)
-    return 0
-'''
-
-
-PDW_POSTGRES_QUERY_SCRIPT = f"""#!/usr/bin/env python3
-{PDW_POSTGRES_CLIENT_PY}
-
-
-def main(argv: list[str]) -> int:
-    if len(argv) > 2:
-        print("usage: pdw-postgres-query [SQL]", file=sys.stderr)
-        return 2
-    sql = argv[1] if len(argv) == 2 else sys.stdin.read()
-    return proxy_request("/query", {{"sql": sql}})
-
-
-if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
-"""
-
-
-PDW_POSTGRES_SCHEMA_SCRIPT = f"""#!/usr/bin/env python3
-{PDW_POSTGRES_CLIENT_PY}
-
-
-def main(argv: list[str]) -> int:
-    if len(argv) != 1:
-        print("usage: pdw-postgres-schema", file=sys.stderr)
-        return 2
-    return proxy_request("/schema", {{}})
-
-
-if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
-"""
-
-
 def jwt_expiry_epoch(token: str) -> float | None:
     """The `exp` claim of a JWT, without signature verification."""
     parts = token.split(".")
@@ -1052,9 +1028,10 @@ def default_agent_docker_image(
     repository: str = DEFAULT_AGENT_IMAGE_REPOSITORY,
     dockerfile_path: Path = DEFAULT_AGENT_DOCKERFILE_PATH,
     entrypoint_path: Path = DEFAULT_AGENT_ENTRYPOINT_PATH,
+    cli_source_dir: Path = DEFAULT_AGENT_CLI_SOURCE_DIR,
 ) -> str:
     digest = hashlib.sha256()
-    for path in (dockerfile_path, entrypoint_path):
+    for path in (dockerfile_path, entrypoint_path, *pdw_cli_source_files(cli_source_dir)):
         digest.update(str(path.name).encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
@@ -1062,14 +1039,40 @@ def default_agent_docker_image(
     return f"{repository}:{digest.hexdigest()[:6]}"
 
 
+def pdw_cli_source_files(cli_source_dir: Path) -> list[Path]:
+    """The Go sources compiled into the image's `pdw`, in a stable order.
+
+    Test files are excluded: they never reach the binary, so letting them move
+    the image tag would rebuild the image on every test edit.
+    """
+
+    if not cli_source_dir.is_dir():
+        return []
+    sources = [
+        path
+        for path in cli_source_dir.rglob("*.go")
+        if path.is_file() and not path.name.endswith("_test.go")
+    ]
+    for name in ("go.mod", "go.sum"):
+        manifest = cli_source_dir / name
+        if manifest.is_file():
+            sources.append(manifest)
+    return sorted(sources)
+
+
 def ensure_agent_image(
     *,
     dockerfile_path: Path = DEFAULT_AGENT_DOCKERFILE_PATH,
     entrypoint_path: Path = DEFAULT_AGENT_ENTRYPOINT_PATH,
     context_dir: Path = DEFAULT_AGENT_BUILD_CONTEXT_DIR,
+    cli_source_dir: Path = DEFAULT_AGENT_CLI_SOURCE_DIR,
     runner=subprocess.run,
 ) -> str:
-    resolved_image = default_agent_docker_image(dockerfile_path=dockerfile_path, entrypoint_path=entrypoint_path)
+    resolved_image = default_agent_docker_image(
+        dockerfile_path=dockerfile_path,
+        entrypoint_path=entrypoint_path,
+        cli_source_dir=cli_source_dir,
+    )
     inspect = runner(
         ["docker", "image", "inspect", resolved_image],
         capture_output=True,
