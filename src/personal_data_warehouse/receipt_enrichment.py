@@ -343,13 +343,16 @@ WHERE t.posted_at >= %(since)s
   AND t.pending = 0
   AND (
         r.transaction_id IS NULL
+     OR r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s
      OR (
             r.settled = 0
         AND r.attempt_count < %(max_attempts)s
         AND r.last_attempt_at <= %(retry_before)s
      )
   )
-ORDER BY (r.transaction_id IS NULL) DESC,
+ORDER BY (r.transaction_id IS NOT NULL
+              AND r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s) DESC,
+         (r.transaction_id IS NULL) DESC,
          (t.amount < 0) DESC,
          t.posted_at DESC,
          t.transaction_id
@@ -637,6 +640,7 @@ class ReceiptEnrichmentRunner:
                 "since": now - timedelta(days=self._lookback_days),
                 "retry_before": now - timedelta(days=self._retry_after_days),
                 "max_attempts": self._max_attempts,
+                "prompt_version": PROMPT_VERSION,
                 "limit": self._transaction_limit,
             },
         )

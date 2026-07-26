@@ -9,6 +9,7 @@ from personal_data_warehouse.receipt_enrichment import (
     DECISION_FOUND,
     DECISION_INSUFFICIENT,
     DECISION_NOT_FOUND,
+    PROMPT_VERSION,
     SOURCE_GMAIL_MESSAGE,
     SOURCE_PHOTO,
     ReceiptEnrichmentRunner,
@@ -220,6 +221,28 @@ def test_retry_window_and_budget_are_applied_to_the_transaction_row():
     _runner(warehouse, FakeAgent(), retry_after_days=7, max_attempts=2).sync()
     assert captured["retry_before"] == NOW - timedelta(days=7)
     assert captured["max_attempts"] == 2
+
+
+def test_prompt_change_requeues_recent_rows_before_unresearched_transactions():
+    captured = {}
+
+    def capture(params):
+        captured.update(params)
+        return []
+
+    warehouse = FakeWarehouse({"FROM finance_transactions AS t": capture})
+    _runner(warehouse, FakeAgent()).sync()
+    candidate_sql = next(
+        sql for sql, _ in warehouse.queries if "FROM finance_transactions AS t" in sql
+    )
+
+    assert captured["prompt_version"] == PROMPT_VERSION
+    assert "r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s" in candidate_sql
+    assert (
+        "r.transaction_id IS NOT NULL\n"
+        "              AND r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s"
+        in candidate_sql
+    )
 
 
 def test_agent_failure_leaves_transaction_unwritten_for_next_run():
