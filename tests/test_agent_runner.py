@@ -16,6 +16,8 @@ from personal_data_warehouse.agent_runner import (
     AgentRunResult,
     AgentRunEvent,
     ContainerAgentRunner,
+    agent_credentials_copy_command,
+    agent_credentials_volume_name,
     agent_run_event_rows,
     agent_run_row,
     agent_run_tool_call_rows,
@@ -31,6 +33,18 @@ from personal_data_warehouse.agent_tool_proxy import WarehouseAppConfig
 from personal_data_warehouse.config import load_settings
 
 
+def is_run_volume_copy(command: list[str]) -> bool:
+    return (
+        command[:2] == ["docker", "run"]
+        and "alpine:3.20" in command
+        and any(item.endswith("dst=/volume") for item in command)
+    )
+
+
+def is_agent_container_run(command: list[str], image: str = "pdw-agent:latest") -> bool:
+    return command[:2] == ["docker", "run"] and "--name" in command and image in command
+
+
 def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> None:
     config = AgentContainerConfig(
         image="pdw-agent:latest",
@@ -40,7 +54,13 @@ def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> N
     )
     request = AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1")
 
-    command = ContainerAgentRunner(config).docker_command(request=request, provider="codex", model="gpt-test")
+    credentials_volume = agent_credentials_volume_name(request.run_id)
+    command = ContainerAgentRunner(config).docker_command(
+        request=request,
+        provider="codex",
+        model="gpt-test",
+        credentials_volume=credentials_volume,
+    )
 
     assert command[:3] == ["docker", "run", "--rm"]
     assert "/var/run/docker.sock" not in command
@@ -52,12 +72,19 @@ def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> N
     assert "--security-opt" in command
     assert "no-new-privileges" in command
     assert "--read-only" in command
+    assert command[command.index("--memory-swap") + 1] == config.memory
     assert "OPENAI_API_KEY" not in " ".join(command)
     assert "ANTHROPIC_API_KEY" not in " ".join(command)
     assert "POSTGRES_DATABASE_URL" not in " ".join(command)
     assert "AGENT_MODEL=gpt-test" in command
     assert "AGENT_REASONING_EFFORT=medium" in command
-    assert "type=volume,src=pdw-agent-auth,dst=/agent-auth" in command
+    assert "type=volume,src=pdw-agent-auth,dst=/agent-auth" not in command
+    assert f"type=volume,src={credentials_volume},dst=/agent-credentials" in command
+    assert "CODEX_HOME=/tmp/agent-codex-home" in command
+    assert "CODEX_SQLITE_HOME=/tmp/agent-codex-sqlite" in command
+    assert "CLAUDE_CONFIG_DIR=/tmp/agent-claude-config" in command
+    assert "AGENT_AUTH_SOURCE=/agent-credentials/codex/auth.json" in command
+    assert "AGENT_AUTH_OUTPUT=/agent-credentials/codex/auth.json" in command
     assert "type=volume,src=pdw-agent-runs,dst=/agent-runs" in command
     assert "--add-host" in command
     assert "host.docker.internal:host-gateway" in command
@@ -66,12 +93,39 @@ def test_container_agent_runner_builds_locked_down_docker_command(tmp_path) -> N
     assert "PDW_POSTGRES_SCHEMA" not in " ".join(command)
 
 
+def test_agent_credentials_copy_commands_stage_and_persist_only_codex_auth_file() -> None:
+    stage = agent_credentials_copy_command(
+        auth_volume="pdw-agent-auth",
+        credentials_volume="pdw-agent-credentials-run-1",
+        provider="codex",
+        direction="stage",
+    )
+    persist = agent_credentials_copy_command(
+        auth_volume="pdw-agent-auth",
+        credentials_volume="pdw-agent-credentials-run-1",
+        provider="codex",
+        direction="persist",
+    )
+
+    assert "type=volume,src=pdw-agent-auth,dst=/persistent-auth,readonly" in stage
+    assert "type=volume,src=pdw-agent-credentials-run-1,dst=/run-credentials" in stage
+    assert "/persistent-auth/codex/auth.json" in stage[-1]
+    assert "/run-credentials/codex/auth.json" in stage[-1]
+    assert "/persistent-auth/." not in stage[-1]
+
+    assert "type=volume,src=pdw-agent-auth,dst=/persistent-auth" in persist
+    assert "type=volume,src=pdw-agent-credentials-run-1,dst=/run-credentials,readonly" in persist
+    assert "/run-credentials/codex/auth.json" in persist[-1]
+    assert "/persistent-auth/codex/auth.json" in persist[-1]
+    assert "/run-credentials/." not in persist[-1]
+
+
 def test_container_agent_runner_writes_prompt_schema_and_parses_final_json(tmp_path) -> None:
     volume_copy_calls = 0
 
     def fake_run(command, **kwargs):
         nonlocal volume_copy_calls
-        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+        if is_run_volume_copy(command):
             volume_copy_calls += 1
             run_dir = tmp_path / "run-1"
             if volume_copy_calls == 1:
@@ -96,6 +150,109 @@ def test_container_agent_runner_writes_prompt_schema_and_parses_final_json(tmp_p
     assert "pdw sql" in (tmp_path / "run-1" / "TOOLS.md").read_text(encoding="utf-8")
 
 
+def test_container_agent_runner_stages_refreshes_and_removes_per_run_credentials(tmp_path) -> None:
+    calls = []
+    volume_copy_calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal volume_copy_calls
+        calls.append(command)
+        if is_run_volume_copy(command):
+            volume_copy_calls += 1
+            if volume_copy_calls == 2:
+                (tmp_path / "run-1" / "final.json").write_text('{"ok":true}', encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    result = ContainerAgentRunner(
+        AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path),
+        runner=fake_run,
+    ).run(AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1"))
+
+    assert result.status == "completed"
+    create_index = next(index for index, call in enumerate(calls) if call[:3] == ["docker", "volume", "create"])
+    stage_index = next(
+        index
+        for index, call in enumerate(calls)
+        if "type=volume,src=pdw-agent-auth,dst=/persistent-auth,readonly" in call
+    )
+    agent_index = next(index for index, call in enumerate(calls) if is_agent_container_run(call))
+    persist_index = next(
+        index
+        for index, call in enumerate(calls)
+        if "type=volume,src=pdw-agent-auth,dst=/persistent-auth" in call
+        and "type=volume,src=pdw-agent-auth,dst=/persistent-auth,readonly" not in call
+    )
+    remove_index = next(index for index, call in enumerate(calls) if call[:4] == ["docker", "volume", "rm", "-f"])
+
+    assert create_index < stage_index < agent_index < persist_index < remove_index
+    assert "pdw-agent-auth" not in calls[agent_index]
+
+
+def test_shared_auth_run_does_not_replace_persistent_credential(tmp_path, monkeypatch) -> None:
+    calls = []
+    volume_copy_calls = 0
+    monkeypatch.setattr(
+        ContainerAgentRunner,
+        "_auth_lock_must_be_exclusive",
+        lambda self, provider: False,
+    )
+
+    def fake_run(command, **kwargs):
+        nonlocal volume_copy_calls
+        calls.append(command)
+        if is_run_volume_copy(command):
+            volume_copy_calls += 1
+            if volume_copy_calls == 2:
+                (tmp_path / "run-1" / "final.json").write_text('{"ok":true}', encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    result = ContainerAgentRunner(
+        AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path),
+        runner=fake_run,
+    ).run(AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1"))
+
+    assert result.status == "completed"
+    assert any(
+        "type=volume,src=pdw-agent-auth,dst=/persistent-auth,readonly" in call
+        for call in calls
+    )
+    assert not any(
+        "type=volume,src=pdw-agent-auth,dst=/persistent-auth" in call
+        and "type=volume,src=pdw-agent-auth,dst=/persistent-auth,readonly" not in call
+        for call in calls
+    )
+    assert any(call[:4] == ["docker", "volume", "rm", "-f"] for call in calls)
+
+
+def test_timed_out_agent_is_stopped_before_refreshed_auth_is_persisted(tmp_path) -> None:
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if is_agent_container_run(command):
+            raise subprocess.TimeoutExpired(command, timeout=1)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    result = ContainerAgentRunner(
+        AgentContainerConfig(
+            image="pdw-agent:latest",
+            runs_dir=tmp_path,
+            timeout_seconds=1,
+        ),
+        runner=fake_run,
+    ).run(AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1"))
+
+    stop_index = next(index for index, call in enumerate(calls) if call[:2] == ["docker", "stop"])
+    persist_index = next(
+        index
+        for index, call in enumerate(calls)
+        if "type=volume,src=pdw-agent-auth,dst=/persistent-auth" in call
+        and "type=volume,src=pdw-agent-auth,dst=/persistent-auth,readonly" not in call
+    )
+    assert result.status == "error"
+    assert stop_index < persist_index
+
+
 def test_container_agent_runner_builds_missing_managed_image_before_run(tmp_path) -> None:
     calls = []
     volume_copy_calls = 0
@@ -108,7 +265,7 @@ def test_container_agent_runner_builds_missing_managed_image_before_run(tmp_path
             return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
         if command[:2] == ["docker", "build"]:
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+        if is_run_volume_copy(command):
             volume_copy_calls += 1
             if volume_copy_calls == 2:
                 (tmp_path / "run-1" / "final.json").write_text('{"ok":true}', encoding="utf-8")
@@ -135,12 +292,13 @@ def test_container_agent_runner_points_pdw_cli_at_a_per_run_proxy(tmp_path) -> N
 
     def fake_run(command, **kwargs):
         nonlocal volume_copy_calls, agent_command
-        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+        if is_run_volume_copy(command):
             volume_copy_calls += 1
             if volume_copy_calls == 2:
                 (tmp_path / "run-1" / "final.json").write_text('{"ok":true}', encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-        agent_command = command
+        if is_agent_container_run(command):
+            agent_command = command
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     config = AgentContainerConfig(
@@ -172,12 +330,13 @@ def test_container_agent_runner_writes_input_files_and_exports_input_dir(tmp_pat
 
     def fake_run(command, **kwargs):
         nonlocal agent_command, volume_copy_calls
-        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+        if is_run_volume_copy(command):
             volume_copy_calls += 1
             if volume_copy_calls == 2:
                 (tmp_path / "run-1" / "final.json").write_text('{"ok":true}', encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-        agent_command = command
+        if is_agent_container_run(command):
+            agent_command = command
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     config = AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path)
@@ -203,7 +362,7 @@ def test_container_agent_runner_writes_binary_input_files(tmp_path) -> None:
 
     def fake_run(command, **kwargs):
         nonlocal volume_copy_calls
-        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+        if is_run_volume_copy(command):
             volume_copy_calls += 1
             if volume_copy_calls == 2:
                 (tmp_path / "run-1" / "final.json").write_text('{"ok":true}', encoding="utf-8")
@@ -389,15 +548,17 @@ def test_container_agent_runner_reports_nonzero_exit_stderr_before_json_parse_er
 
     def fake_run(command, **kwargs):
         nonlocal volume_copy_calls
-        if command[:2] == ["docker", "run"] and "alpine:3.20" in command:
+        if is_run_volume_copy(command):
             volume_copy_calls += 1
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-        return subprocess.CompletedProcess(
-            command,
-            1,
-            stdout='{"type":"thread.started"}\n',
-            stderr="Error: turn/start failed: Input exceeds the maximum length of 1048576 characters.\n",
-        )
+        if is_agent_container_run(command):
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout='{"type":"thread.started"}\n',
+                stderr="Error: turn/start failed: Input exceeds the maximum length of 1048576 characters.\n",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     config = AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path)
     request = AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1")
@@ -419,6 +580,8 @@ def test_auth_command_uses_subscription_volume_without_api_keys() -> None:
 
     assert command[:4] == ["docker", "run", "--rm", "-it"]
     assert "type=volume,src=pdw-agent-auth,dst=/agent-auth" in command
+    assert "CODEX_SQLITE_HOME=/tmp/agent-codex-sqlite" in command
+    assert "/tmp/agent-codex-sqlite:rw,nosuid,size=512m" in command
     assert "OPENAI_API_KEY" not in " ".join(command)
     assert command[-3:-1] == ["sh", "-lc"]
     assert "mkdir -p" in command[-1]
@@ -613,6 +776,71 @@ def test_agent_entrypoint_skips_codex_git_repo_check() -> None:
     assert 'model="${model:-gpt-5.6-sol}"' in entrypoint
     assert 'export PATH="$tools_dir:$PATH"' in entrypoint
     assert '< "$prompt_path"' in entrypoint
+
+
+def test_agent_entrypoint_keeps_codex_state_ephemeral_and_returns_only_refreshed_auth(tmp_path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_codex = bin_dir / "codex"
+    fake_codex.write_text(
+        """#!/bin/sh
+set -eu
+test "$(cat "$CODEX_HOME/auth.json")" = "original-auth"
+printf 'sqlite-state' > "$CODEX_SQLITE_HOME/state_5.sqlite"
+printf 'refreshed-auth' > "$CODEX_HOME/auth.json"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    printf '{"ok":true}' > "$1"
+    exit 0
+  fi
+  shift
+done
+exit 2
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+
+    prompt = tmp_path / "prompt.txt"
+    schema = tmp_path / "schema.json"
+    final_message = tmp_path / "final.md"
+    final_json = tmp_path / "final.json"
+    credential_source = tmp_path / "credential-source.json"
+    credential_output = tmp_path / "credential-output.json"
+    codex_home = tmp_path / "codex-home"
+    sqlite_home = tmp_path / "codex-sqlite"
+    prompt.write_text("Return JSON", encoding="utf-8")
+    schema.write_text('{"type":"object"}', encoding="utf-8")
+    credential_source.write_text("original-auth", encoding="utf-8")
+
+    completed = subprocess.run(
+        ["sh", "docker/agent-entrypoint.sh"],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "AGENT_PROVIDER": "codex",
+            "AGENT_PROMPT_PATH": str(prompt),
+            "AGENT_SCHEMA_PATH": str(schema),
+            "AGENT_FINAL_MESSAGE_PATH": str(final_message),
+            "AGENT_FINAL_JSON_PATH": str(final_json),
+            "AGENT_AUTH_SOURCE": str(credential_source),
+            "AGENT_AUTH_OUTPUT": str(credential_output),
+            "CODEX_HOME": str(codex_home),
+            "CODEX_SQLITE_HOME": str(sqlite_home),
+            "HOME": str(tmp_path / "home"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert credential_source.read_text(encoding="utf-8") == "original-auth"
+    assert credential_output.read_text(encoding="utf-8") == "refreshed-auth"
+    assert (sqlite_home / "state_5.sqlite").read_text(encoding="utf-8") == "sqlite-state"
+    assert not (credential_output.parent / "state_5.sqlite").exists()
+    assert json.loads(final_json.read_text(encoding="utf-8")) == {"ok": True}
 
 
 def test_builtin_cli_tools_validate_json(tmp_path) -> None:

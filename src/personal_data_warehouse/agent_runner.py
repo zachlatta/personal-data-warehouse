@@ -31,17 +31,21 @@ DEFAULT_AGENT_AUTH_VOLUME = "pdw-agent-auth"
 DEFAULT_AGENT_RUNS_VOLUME = "pdw-agent-runs"
 DEFAULT_AGENT_RUNS_DIR = ".agent-runs"
 DEFAULT_AGENT_CONTAINER_AUTH_DIR = "/agent-auth"
+DEFAULT_AGENT_CONTAINER_CREDENTIALS_DIR = "/agent-credentials"
 DEFAULT_AGENT_CONTAINER_RUNS_DIR = "/agent-runs"
+DEFAULT_AGENT_CONTAINER_CODEX_HOME = "/tmp/agent-codex-home"
+DEFAULT_AGENT_CONTAINER_CODEX_SQLITE_HOME = "/tmp/agent-codex-sqlite"
+DEFAULT_AGENT_CONTAINER_CLAUDE_CONFIG_DIR = "/tmp/agent-claude-config"
 DEFAULT_AGENT_TOOLS_DIR_NAME = "tools"
 DEFAULT_AGENT_INPUTS_DIR_NAME = "inputs"
 DEFAULT_AGENT_TOOL_MANIFEST_NAME = "TOOLS.md"
 DEFAULT_AGENT_MEMORY = "4g"
 
-# AGENT_AUTH_LOCK_MODE governs how agent runs share the provider credential:
+# AGENT_AUTH_LOCK_MODE governs how agent runs stage and refresh the provider credential:
 # "exclusive" (default) keeps the historical one-run-at-a-time behavior;
-# "auto" lets runs overlap (shared flock) while the codex access token is
-# comfortably far from expiry, going exclusive within the refresh margin so
-# a token refresh (which rotates the refresh token) never races.
+# "auto" lets runs overlap using disposable credential snapshots while the
+# codex access token is comfortably far from expiry, going exclusive within
+# the refresh margin so one run can rotate and persist the refresh token.
 AGENT_AUTH_LOCK_MODE_ENV = "AGENT_AUTH_LOCK_MODE"
 AGENT_AUTH_REFRESH_MARGIN_SECONDS_ENV = "AGENT_AUTH_REFRESH_MARGIN_SECONDS"
 DEFAULT_AGENT_AUTH_REFRESH_MARGIN_SECONDS = 90 * 60
@@ -216,36 +220,64 @@ class ContainerAgentRunner:
         self._ensure_managed_image()
         run_dir = self._prepare_run_dir(request)
         self._sync_run_dir_to_volume(request.run_id, run_dir)
-        command = self.docker_command(request=request, provider=provider, model=model)
+        credentials_volume = agent_credentials_volume_name(request.run_id)
+        command = self.docker_command(
+            request=request,
+            provider=provider,
+            model=model,
+            credentials_volume=credentials_volume,
+        )
         started_at = datetime.now(tz=UTC)
         events: list[AgentRunEvent] = []
         error = ""
         exit_code = 0
-        with provider_auth_lock(provider, exclusive=self._auth_lock_must_be_exclusive(provider)):
+        auth_lock_exclusive = self._auth_lock_must_be_exclusive(provider)
+        with provider_auth_lock(provider, exclusive=auth_lock_exclusive):
             try:
-                completed = self._runner(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=self._config.timeout_seconds,
-                    check=False,
+                self._prepare_credentials_volume(
+                    provider=provider,
+                    credentials_volume=credentials_volume,
                 )
-                exit_code = int(getattr(completed, "returncode", 1))
-                completed_at = datetime.now(tz=UTC)
-                events.extend(
-                    agent_events_from_streams(
-                        stdout=completed.stdout or "",
-                        stderr=completed.stderr or "",
-                        created_at=completed_at,
+                try:
+                    completed = self._runner(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=self._config.timeout_seconds,
+                        check=False,
                     )
-                )
-            except subprocess.TimeoutExpired as exc:
-                completed_at = datetime.now(tz=UTC)
-                exit_code = 124
-                error = f"agent container timed out after {self._config.timeout_seconds}s"
-                stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-                stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-                events.extend(agent_events_from_streams(stdout=stdout, stderr=stderr, created_at=completed_at))
+                    exit_code = int(getattr(completed, "returncode", 1))
+                    completed_at = datetime.now(tz=UTC)
+                    events.extend(
+                        agent_events_from_streams(
+                            stdout=completed.stdout or "",
+                            stderr=completed.stderr or "",
+                            created_at=completed_at,
+                        )
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    self._stop_agent_container(request.run_id)
+                    completed_at = datetime.now(tz=UTC)
+                    exit_code = 124
+                    error = f"agent container timed out after {self._config.timeout_seconds}s"
+                    stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+                    stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+                    events.extend(
+                        agent_events_from_streams(
+                            stdout=stdout,
+                            stderr=stderr,
+                            created_at=completed_at,
+                        )
+                    )
+                if auth_lock_exclusive:
+                    self._persist_credentials_volume(
+                        provider=provider,
+                        credentials_volume=credentials_volume,
+                    )
+                    with _AUTH_EXP_CACHE_LOCK:
+                        _AUTH_EXP_CACHE.pop((self._config.auth_volume, provider), None)
+            finally:
+                self._remove_credentials_volume(credentials_volume)
 
         self._sync_run_dir_from_volume(request.run_id, run_dir)
         final_output, final_error = load_agent_final_output(run_dir=run_dir, provider=provider, events=events)
@@ -325,6 +357,72 @@ class ContainerAgentRunner:
             return jwt_expiry_epoch(str(tokens.get("access_token") or ""))
         except Exception:  # noqa: BLE001 - unknown expiry falls back to exclusive
             return None
+
+    def _prepare_credentials_volume(self, *, provider: str, credentials_volume: str) -> None:
+        created = self._runner(
+            [
+                "docker",
+                "volume",
+                "create",
+                "--label",
+                "personal-data-warehouse.agent-credentials=ephemeral",
+                credentials_volume,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        if int(getattr(created, "returncode", 1)) != 0:
+            raise RuntimeError(f"failed to create ephemeral agent credentials volume {credentials_volume}")
+        staged = self._runner(
+            agent_credentials_copy_command(
+                auth_volume=self._config.auth_volume,
+                credentials_volume=credentials_volume,
+                provider=provider,
+                direction="stage",
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        if int(getattr(staged, "returncode", 1)) != 0:
+            raise RuntimeError(f"failed to stage {provider} credential for agent run")
+
+    def _persist_credentials_volume(self, *, provider: str, credentials_volume: str) -> None:
+        persisted = self._runner(
+            agent_credentials_copy_command(
+                auth_volume=self._config.auth_volume,
+                credentials_volume=credentials_volume,
+                provider=provider,
+                direction="persist",
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        if int(getattr(persisted, "returncode", 1)) != 0:
+            raise RuntimeError(f"failed to persist refreshed {provider} credential after agent run")
+
+    def _remove_credentials_volume(self, credentials_volume: str) -> None:
+        self._runner(
+            ["docker", "volume", "rm", "-f", credentials_volume],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+    def _stop_agent_container(self, run_id: str) -> None:
+        self._runner(
+            ["docker", "stop", "--time", "10", agent_container_name(run_id)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
 
     def run_with_pdw(
         self,
@@ -415,9 +513,18 @@ class ContainerAgentRunner:
         write_builtin_cli_tools(run_dir)
         return run_dir
 
-    def docker_command(self, *, request: AgentRunRequest, provider: str, model: str) -> list[str]:
-        name = docker_safe_name(f"pdw-agent-{request.run_id}")
+    def docker_command(
+        self,
+        *,
+        request: AgentRunRequest,
+        provider: str,
+        model: str,
+        credentials_volume: str,
+    ) -> list[str]:
+        name = agent_container_name(request.run_id)
         container_run_dir = f"{DEFAULT_AGENT_CONTAINER_RUNS_DIR}/{request.run_id}"
+        credential_path = provider_credential_relative_path(provider)
+        container_credential_path = f"{DEFAULT_AGENT_CONTAINER_CREDENTIALS_DIR}/{credential_path}"
         env = [
             "--env",
             f"AGENT_PROVIDER={provider}",
@@ -446,9 +553,15 @@ class ContainerAgentRunner:
             "--env",
             f"PDW_VALIDATE_JSON={container_run_dir}/{DEFAULT_AGENT_TOOLS_DIR_NAME}/pdw-validate-json",
             "--env",
-            f"CODEX_HOME={DEFAULT_AGENT_CONTAINER_AUTH_DIR}/codex",
+            f"AGENT_AUTH_SOURCE={container_credential_path}",
             "--env",
-            f"CLAUDE_CONFIG_DIR={DEFAULT_AGENT_CONTAINER_AUTH_DIR}/claude",
+            f"AGENT_AUTH_OUTPUT={container_credential_path}",
+            "--env",
+            f"CODEX_HOME={DEFAULT_AGENT_CONTAINER_CODEX_HOME}",
+            "--env",
+            f"CODEX_SQLITE_HOME={DEFAULT_AGENT_CONTAINER_CODEX_SQLITE_HOME}",
+            "--env",
+            f"CLAUDE_CONFIG_DIR={DEFAULT_AGENT_CONTAINER_CLAUDE_CONFIG_DIR}",
             "--env",
             "HOME=/tmp/agent-home",
         ]
@@ -468,6 +581,8 @@ class ContainerAgentRunner:
             "host.docker.internal:host-gateway",
             "--memory",
             self._config.memory,
+            "--memory-swap",
+            self._config.memory,
             "--cpus",
             self._config.cpus,
             "--pids-limit",
@@ -482,7 +597,10 @@ class ContainerAgentRunner:
             "--tmpfs",
             "/tmp/agent-home:rw,nosuid,size=512m",
             "--mount",
-            f"type=volume,src={self._config.auth_volume},dst={DEFAULT_AGENT_CONTAINER_AUTH_DIR}",
+            (
+                f"type=volume,src={credentials_volume},"
+                f"dst={DEFAULT_AGENT_CONTAINER_CREDENTIALS_DIR}"
+            ),
             "--mount",
             f"type=volume,src={self._config.runs_volume},dst={DEFAULT_AGENT_CONTAINER_RUNS_DIR}",
             *env,
@@ -753,6 +871,78 @@ def docker_safe_name(value: str) -> str:
     return cleaned[:120].strip("-_.") or "pdw-agent"
 
 
+def agent_container_name(run_id: str) -> str:
+    return docker_safe_name(f"pdw-agent-{run_id}")
+
+
+def agent_credentials_volume_name(run_id: str) -> str:
+    run_name = docker_safe_name(run_id)[:60]
+    return f"pdw-agent-credentials-{run_name}-{uuid.uuid4().hex}"
+
+
+def provider_credential_relative_path(provider: str) -> str:
+    provider = provider.strip().lower()
+    if provider == "codex":
+        return "codex/auth.json"
+    if provider == "claude":
+        return "claude/.credentials.json"
+    raise ValueError("provider must be codex or claude")
+
+
+def agent_credentials_copy_command(
+    *,
+    auth_volume: str,
+    credentials_volume: str,
+    provider: str,
+    direction: str,
+) -> list[str]:
+    credential_path = provider_credential_relative_path(provider)
+    persistent_path = f"/persistent-auth/{credential_path}"
+    run_path = f"/run-credentials/{credential_path}"
+    if direction == "stage":
+        source_path = persistent_path
+        destination_path = run_path
+        auth_mount = f"type=volume,src={auth_volume},dst=/persistent-auth,readonly"
+        credentials_mount = f"type=volume,src={credentials_volume},dst=/run-credentials"
+    elif direction == "persist":
+        source_path = run_path
+        destination_path = persistent_path
+        auth_mount = f"type=volume,src={auth_volume},dst=/persistent-auth"
+        credentials_mount = (
+            f"type=volume,src={credentials_volume},dst=/run-credentials,readonly"
+        )
+    else:
+        raise ValueError("direction must be stage or persist")
+    destination_dir = destination_path.rsplit("/", 1)[0]
+    temporary_path = f"{destination_path}.tmp"
+    shell_command = (
+        f'test -s "{source_path}"'
+        f' || {{ echo "missing {provider} agent credential" >&2; exit 1; }}'
+        f' && mkdir -p "{destination_dir}"'
+        f' && cp "{source_path}" "{temporary_path}"'
+        f' && chmod 600 "{temporary_path}"'
+        f' && mv "{temporary_path}" "{destination_path}"'
+    )
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,nosuid,size=16m",
+        "--mount",
+        auth_mount,
+        "--mount",
+        credentials_mount,
+        "alpine:3.20",
+        "sh",
+        "-lc",
+        shell_command,
+    ]
+
+
 def volume_copy_command(*, volume: str, run_id: str, direction: str, host_dir: Path) -> list[str]:
     run_name = docker_safe_name(run_id)
     host_mount = str(host_dir.resolve())
@@ -970,11 +1160,11 @@ def jwt_expiry_epoch(token: str) -> float | None:
 def provider_auth_lock(provider: str, *, exclusive: bool = True):
     """Serialize provider auth across agent containers.
 
-    Runs normally hold the lock SHARED (they only read the provider's
-    credential, so they may overlap); a run that might trigger a token
-    refresh takes it EXCLUSIVE and executes alone — ChatGPT-mode codex
-    rotates refresh tokens, so two containers refreshing concurrently can
-    invalidate the shared credential and force a manual re-login.
+    Shared holders run from disposable credential snapshots and discard any
+    changes. A run that might trigger a token refresh takes the lock EXCLUSIVE,
+    executes alone, and persists only its refreshed credential. ChatGPT-mode
+    codex rotates refresh tokens, so two containers refreshing concurrently
+    can invalidate the login and force a manual re-authentication.
     """
     lock_path = Path(os.getenv("AGENT_AUTH_LOCK_DIR", "/tmp")) / f"pdw-agent-{docker_safe_name(provider)}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1109,7 +1299,7 @@ def auth_docker_command(*, provider: str, action: str, config: AgentContainerCon
         ("claude", "status"): "claude auth status",
     }[(provider, action)]
     shell_command = (
-        "mkdir -p \"$CODEX_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$HOME\""
+        "mkdir -p \"$CODEX_HOME\" \"$CODEX_SQLITE_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$HOME\""
         f" && {command}"
     )
     return [
@@ -1122,11 +1312,15 @@ def auth_docker_command(*, provider: str, action: str, config: AgentContainerCon
         "--env",
         f"CODEX_HOME={DEFAULT_AGENT_CONTAINER_AUTH_DIR}/codex",
         "--env",
+        f"CODEX_SQLITE_HOME={DEFAULT_AGENT_CONTAINER_CODEX_SQLITE_HOME}",
+        "--env",
         f"CLAUDE_CONFIG_DIR={DEFAULT_AGENT_CONTAINER_AUTH_DIR}/claude",
         "--env",
         "HOME=/tmp/agent-home",
         "--tmpfs",
         "/tmp/agent-home:rw,nosuid,size=512m",
+        "--tmpfs",
+        f"{DEFAULT_AGENT_CONTAINER_CODEX_SQLITE_HOME}:rw,nosuid,size=512m",
         config.image,
         "sh",
         "-lc",

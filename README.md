@@ -1204,9 +1204,19 @@ pdw-agent-auth -> /agent-auth
 pdw-agent-runs -> /agent-runs
 ```
 
-`pdw-agent-auth` stores persistent Codex/Claude CLI login state. `pdw-agent-runs` is the shared
-handoff volume for per-run prompts, schemas, local helper tools, final JSON/message files, and other
-agent run artifacts. The run volume is not used for subscription auth.
+`pdw-agent-auth` stores the persistent Codex/Claude CLI credential. Normal agent containers never
+mount that volume. Before each run, the trusted runner stages only `codex/auth.json` (or
+`claude/.credentials.json`) into a small per-run Docker volume. The agent copies that credential
+into a tmpfs-backed provider home; both `CODEX_HOME` and `CODEX_SQLITE_HOME` are ephemeral, so
+Codex's SQLite state, WAL, sessions, caches, and plugins disappear with the container instead of
+churning the shared auth volume. Agent containers cannot use swap, so tmpfs pages cannot spill
+back onto the host SSD. Runs that hold the exclusive provider-auth lock copy only the possibly
+refreshed credential back afterward, preserving refresh-token rotation. Per-run credential
+volumes are removed after use.
+
+`pdw-agent-runs` is the shared handoff volume for per-run prompts, schemas, local helper tools,
+final JSON/message files, and other agent run artifacts. The run volume is never used for
+subscription auth.
 
 Also mount the host Docker socket into the Dagster app only:
 
