@@ -1,50 +1,63 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 import json
 
 from personal_data_warehouse.receipt_enrichment import (
+    DECISION_FOUND,
     DECISION_INSUFFICIENT,
-    DECISION_MATCHED,
-    DECISION_NO_MATCH,
-    DECISION_NOT_A_PURCHASE,
-    ENRICHMENT_PROMPT_VERSION,
-    TRIAGE_PROMPT_VERSION,
-    VERDICT_NOT_PURCHASE,
-    VERDICT_PURCHASE,
-    TriageCandidate,
-    attachment_descriptor,
-    enrichment_prompt,
-    enrichment_schema,
-    gmail_descriptor,
-    link_rows,
+    DECISION_NOT_RECEIPTABLE,
+    DECISION_NOT_FOUND,
+    PROMPT_VERSION,
+    SOURCE_GMAIL_ATTACHMENT,
+    SOURCE_GMAIL_MESSAGE,
+    SOURCE_PHOTO,
     merge_usage,
-    photo_descriptor,
     record_id_for,
-    record_row,
-    triage_prompt,
-    triage_rows,
-    triage_schema,
+    transaction_prompt,
+    transaction_receipt_row,
+    transaction_schema,
     usage_from_events,
 )
 
-NOW = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
-
-
-def _candidate(source: str = "photo", native_id: str = "ph_1") -> TriageCandidate:
-    return TriageCandidate(
-        source=source,
-        native_id=native_id,
-        occurred_at=NOW - timedelta(days=3),
-        descriptor="Document type: photo: receipt",
-        kind="photo",
-    )
+NOW = datetime(2026, 7, 26, 12, 0, tzinfo=UTC)
+TRANSACTION = {
+    "transaction_id": "ft_1",
+    "account_id": "fa_1",
+    "account_name": "Everyday Card",
+    "account_kind": "credit",
+    "institution": "Example Bank",
+    "mask": "1234",
+    "posted_at": datetime(2026, 7, 25, 12, 0, tzinfo=UTC),
+    "amount": "-30.79",
+    "currency": "USD",
+    "merchant": "Example Cafe",
+    "description": "EXAMPLE CAFE",
+    "source": "plaid",
+}
 
 
 def _result(**overrides):
     result = {
-        "is_purchase_record": True,
+        "decision": DECISION_FOUND,
+        "sources_searched": [SOURCE_PHOTO, SOURCE_GMAIL_MESSAGE, SOURCE_GMAIL_ATTACHMENT],
         "receipt": {
+            "primary_source": SOURCE_PHOTO,
+            "primary_native_id": "ph_1",
+            "evidence": [
+                {
+                    "source": SOURCE_PHOTO,
+                    "native_id": "ph_1",
+                    "role": "primary",
+                    "why": "The photographed receipt shows the exact settled total.",
+                },
+                {
+                    "source": SOURCE_GMAIL_MESSAGE,
+                    "native_id": "gm_1",
+                    "role": "corroborating",
+                    "why": "The order confirmation names the same items.",
+                },
+            ],
             "merchant_name": "Example Cafe",
             "merchant_location": "Springfield, XX",
             "purchased_at": "2026-07-23",
@@ -56,311 +69,167 @@ def _result(**overrides):
             "amount_charged_to_card": "",
             "card_last4": "1234",
             "order_id": "",
-            "line_items": [{"description": "Mortadella", "quantity": "1", "amount": "12.00"}],
-            "summary": "Lunch at Example Cafe",
-            "confidence": "high",
+            "line_items": [
+                {"description": "Mortadella", "quantity": "1", "amount": "12.00"}
+            ],
+            "summary": "Lunch at Example Cafe.",
+            "record_confidence": "high",
+            "match_confidence": "high",
+            "match_reason": "The date, merchant, currency, and exact settled total agree.",
         },
-        "decision": DECISION_MATCHED,
-        "matches": [
-            {
-                "transaction_id": "ft_1",
-                "confidence": "high",
-                "relationship": "exact",
-                "why": "exact cents",
-            }
-        ],
-        "reasoning": "one exact match",
+        "reasoning": "The photo is legible and the email independently corroborates it.",
     }
     result.update(overrides)
     return result
 
 
-# --- identity -------------------------------------------------------------
-
-
-def test_record_id_is_stable_and_source_scoped():
-    assert record_id_for("photo", "ph_1") == record_id_for("photo", "ph_1")
-    assert record_id_for("photo", "ph_1") != record_id_for("gmail_message", "ph_1")
-    assert record_id_for("photo", "ph_1").startswith("rr_")
-
-
-# --- triage ---------------------------------------------------------------
-
-
-def test_triage_rows_ignore_unknown_ids_and_keep_first_verdict():
-    candidate = _candidate()
-    candidates = {candidate.artifact_id: candidate}
-    rows = triage_rows(
-        [
-            {"artifact_id": candidate.artifact_id, "verdict": VERDICT_PURCHASE, "reason": "receipt"},
-            # a batched response echoing the same id must not flip the verdict
-            {"artifact_id": candidate.artifact_id, "verdict": VERDICT_NOT_PURCHASE, "reason": "oops"},
-            {"artifact_id": "photo:never-asked", "verdict": VERDICT_PURCHASE, "reason": "hallucinated"},
-        ],
-        candidates=candidates,
-        provider="codex",
-        model="gpt-5.6-terra",
-        agent_run_id="run-1",
-        decided_at=NOW,
-    )
-    assert len(rows) == 1
-    assert rows[0]["native_id"] == "ph_1"
-    assert rows[0]["verdict"] == VERDICT_PURCHASE
-    assert rows[0]["ai_prompt_version"] == TRIAGE_PROMPT_VERSION
-    assert rows[0]["occurred_at"] == candidate.occurred_at
-
-
-def test_triage_prompt_lists_every_artifact_id():
-    candidates = [_candidate(native_id=f"ph_{i}") for i in range(3)]
-    prompt = triage_prompt(
-        [
-            {
-                "artifact_id": c.artifact_id,
-                "kind": c.kind,
-                "occurred_at": c.occurred_at,
-                "descriptor": c.descriptor,
-            }
-            for c in candidates
-        ]
-    )
-    for candidate in candidates:
-        assert candidate.artifact_id in prompt
-    assert "purchase_record" in prompt
-
-
-def test_triage_schema_requires_one_verdict_shape():
-    schema = triage_schema()
-    item = schema["properties"]["verdicts"]["items"]
-    assert item["required"] == ["artifact_id", "verdict", "reason"]
-    assert item["additionalProperties"] is False
-
-
-# --- record rows ----------------------------------------------------------
-
-
-def test_record_row_normalizes_money_and_dates():
-    row = record_row(
-        _result(),
-        source="photo",
-        native_id="ph_1",
-        occurred_at=NOW,
-        attempt_count=0,
+def _row(result=None, *, attempt_count=0, known_evidence=None):
+    return transaction_receipt_row(
+        result or _result(),
+        transaction=TRANSACTION,
+        attempt_count=attempt_count,
         max_attempts=2,
+        known_evidence=known_evidence
+        if known_evidence is not None
+        else {(SOURCE_PHOTO, "ph_1"), (SOURCE_GMAIL_MESSAGE, "gm_1")},
         provider="codex",
         model="gpt-5.6-terra",
         agent_run_id="run-1",
         elapsed_ms=1234,
         now=NOW,
     )
+
+
+def test_record_id_is_stable_and_transaction_scoped():
+    assert record_id_for("ft_1") == record_id_for("ft_1")
+    assert record_id_for("ft_1") != record_id_for("ft_2")
+    assert record_id_for("ft_1").startswith("rr_")
+
+
+def test_transaction_schema_is_closed_and_supports_source_evidence():
+    schema = transaction_schema()
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["decision", "sources_searched", "receipt", "reasoning"]
+    assert schema["properties"]["decision"]["enum"] == [
+        DECISION_FOUND,
+        DECISION_NOT_FOUND,
+        DECISION_NOT_RECEIPTABLE,
+        DECISION_INSUFFICIENT,
+    ]
+    evidence = schema["properties"]["receipt"]["properties"]["evidence"]["items"]
+    assert evidence["properties"]["source"]["enum"] == [
+        SOURCE_PHOTO,
+        SOURCE_GMAIL_MESSAGE,
+        SOURCE_GMAIL_ATTACHMENT,
+    ]
+    assert evidence["additionalProperties"] is False
+
+
+def test_prompt_is_transaction_first_and_requires_real_photo_inspection():
+    prompt = transaction_prompt(TRANSACTION)
+    assert "ft_1" in prompt
+    assert "Example Cafe" in prompt
+    assert "pdw sql" in prompt
+    assert "search.search_text" in prompt
+    assert "gmail.messages" in prompt
+    assert "marts.photos" in prompt
+    assert "pdw call get_object" in prompt
+    assert "inspect the actual image" in prompt
+    assert "caption" in prompt
+    assert "artifact triage" not in prompt.lower()
+
+
+def test_found_receipt_is_normalized_and_settles_immediately():
+    row = _row()
+    assert row["transaction_id"] == "ft_1"
+    assert row["record_id"] == record_id_for("ft_1")
+    assert row["decision"] == DECISION_FOUND
+    assert row["primary_source"] == SOURCE_PHOTO
+    assert row["primary_native_id"] == "ph_1"
+    assert row["currency"] == "USD"
     assert row["total"] == "30.79"
     assert row["purchased_at"] == "2026-07-23"
-    assert row["currency"] == "USD"
-    assert row["is_purchase_record"] == 1
     assert row["attempt_count"] == 1
-    assert row["ai_prompt_version"] == ENRICHMENT_PROMPT_VERSION
+    assert row["settled"] == 1
+    assert row["ai_prompt_version"] == PROMPT_VERSION
     assert json.loads(row["line_items_json"])[0]["description"] == "Mortadella"
+    evidence = json.loads(row["evidence_json"])
+    assert {(item["source"], item["native_id"]) for item in evidence} == {
+        (SOURCE_PHOTO, "ph_1"),
+        (SOURCE_GMAIL_MESSAGE, "gm_1"),
+    }
 
 
-def test_record_row_drops_unparseable_money_and_dates():
-    row = record_row(
-        _result(
-            receipt={
-                **_result()["receipt"],
-                "total": "see attached",
-                "purchased_at": "last Tuesday",
-                "tip": "",
-            }
-        ),
-        source="photo",
-        native_id="ph_1",
-        occurred_at=NOW,
-        attempt_count=0,
-        max_attempts=2,
-        provider="codex",
-        model="gpt-5.6-terra",
-        agent_run_id="run-1",
-        elapsed_ms=1,
-        now=NOW,
+def test_unverified_evidence_cannot_publish_a_receipt():
+    row = _row(known_evidence=set())
+    assert row["decision"] == DECISION_INSUFFICIENT
+    assert row["record_id"] == ""
+    assert row["primary_source"] == ""
+    assert row["summary"] == ""
+    assert row["settled"] == 0
+    assert json.loads(row["raw_result_json"])["decision"] == DECISION_FOUND
+
+
+def test_only_high_confidence_matches_publish_receipts():
+    result = _result(
+        receipt={**_result()["receipt"], "match_confidence": "medium"}
     )
-    # storage holds sentinels, never NULL (warehouse convention); the marts
-    # views map these back to NULL so "absent" stays distinguishable from zero
+    row = _row(result)
+    assert row["decision"] == DECISION_INSUFFICIENT
+    assert row["record_id"] == ""
+    assert row["settled"] == 0
+
+
+def test_invalid_money_and_dates_are_stored_as_absent_sentinels():
+    result = _result(
+        receipt={
+            **_result()["receipt"],
+            "total": "see attached",
+            "purchased_at": "last Tuesday",
+            "tip": "",
+        }
+    )
+    row = _row(result)
     assert row["total"] == "0"
     assert row["purchased_at"] == "1970-01-01"
     assert row["tip"] == "0"
 
 
-def test_matched_record_settles_immediately():
-    row = record_row(
-        _result(),
-        source="photo", native_id="ph_1", occurred_at=NOW,
-        attempt_count=0, max_attempts=2, provider="codex",
-        model="m", agent_run_id="r", elapsed_ms=1, now=NOW,
+def test_no_receipt_gets_one_retry_then_settles():
+    result = _result(
+        decision=DECISION_NOT_FOUND,
+        receipt={},
+        reasoning="Searched the relevant photo and email windows without finding evidence.",
     )
-    assert row["settled"] == 1
+    first = _row(result, attempt_count=0)
+    assert first["decision"] == DECISION_NOT_FOUND
+    assert first["settled"] == 0
+    assert first["record_id"] == ""
 
-
-def test_no_match_stays_open_for_its_single_retry_then_settles():
-    first = record_row(
-        _result(decision=DECISION_NO_MATCH, matches=[]),
-        source="photo", native_id="ph_1", occurred_at=NOW,
-        attempt_count=0, max_attempts=2, provider="codex",
-        model="m", agent_run_id="r", elapsed_ms=1, now=NOW,
-    )
-    assert first["attempt_count"] == 1
-    assert first["settled"] == 0, "a charge may still post; it gets one retry"
-
-    second = record_row(
-        _result(decision=DECISION_NO_MATCH, matches=[]),
-        source="photo", native_id="ph_1", occurred_at=NOW,
-        attempt_count=1, max_attempts=2, provider="codex",
-        model="m", agent_run_id="r", elapsed_ms=1, now=NOW,
-    )
+    second = _row(result, attempt_count=1)
     assert second["attempt_count"] == 2
-    assert second["settled"] == 1, "retry budget spent"
+    assert second["settled"] == 1
 
 
-def test_not_a_purchase_settles_without_burning_the_retry():
-    row = record_row(
-        _result(is_purchase_record=False, decision=DECISION_NOT_A_PURCHASE, matches=[]),
-        source="gmail_message", native_id="m1", occurred_at=NOW,
-        attempt_count=0, max_attempts=2, provider="codex",
-        model="m", agent_run_id="r", elapsed_ms=1, now=NOW,
+def test_non_purchase_transaction_settles_without_receipt_fields():
+    row = _row(
+        _result(
+            decision=DECISION_NOT_RECEIPTABLE,
+            sources_searched=[],
+            receipt={},
+            reasoning="This is an account transfer, not a purchase.",
+        )
     )
+    assert row["decision"] == DECISION_NOT_RECEIPTABLE
     assert row["settled"] == 1
-    assert row["is_purchase_record"] == 0
+    assert row["record_id"] == ""
+    assert row["summary"] == ""
 
 
-def test_insufficient_evidence_is_retried():
-    row = record_row(
-        _result(decision=DECISION_INSUFFICIENT, matches=[]),
-        source="photo", native_id="ph_1", occurred_at=NOW,
-        attempt_count=0, max_attempts=2, provider="codex",
-        model="m", agent_run_id="r", elapsed_ms=1, now=NOW,
-    )
+def test_unknown_decision_is_retried_as_insufficient_evidence():
+    row = _row(_result(decision="invented", receipt={}))
+    assert row["decision"] == DECISION_INSUFFICIENT
     assert row["settled"] == 0
-
-
-# --- link rows ------------------------------------------------------------
-
-
-def test_only_high_confidence_links_are_persisted():
-    rows = link_rows(
-        _result(
-            matches=[
-                {"transaction_id": "ft_high", "confidence": "high", "relationship": "exact", "why": "a"},
-                {"transaction_id": "ft_med", "confidence": "medium", "relationship": "fx", "why": "b"},
-                {"transaction_id": "ft_low", "confidence": "low", "relationship": "guess", "why": "c"},
-            ]
-        ),
-        record_id="rr_1",
-        agent_run_id="run-1",
-        now=NOW,
-    )
-    assert [row["transaction_id"] for row in rows] == ["ft_high"]
-
-
-def test_links_require_a_matched_decision():
-    assert link_rows(
-        _result(decision=DECISION_NO_MATCH),
-        record_id="rr_1", agent_run_id="run-1", now=NOW,
-    ) == []
-
-
-def test_links_drop_hallucinated_transaction_ids():
-    rows = link_rows(
-        _result(
-            matches=[
-                {"transaction_id": "ft_real", "confidence": "high", "relationship": "exact", "why": "a"},
-                {"transaction_id": "ft_invented", "confidence": "high", "relationship": "exact", "why": "b"},
-            ]
-        ),
-        record_id="rr_1",
-        agent_run_id="run-1",
-        known_transaction_ids={"ft_real"},
-        now=NOW,
-    )
-    assert [row["transaction_id"] for row in rows] == ["ft_real"]
-
-
-def test_links_dedupe_repeated_transaction_ids():
-    rows = link_rows(
-        _result(
-            matches=[
-                {"transaction_id": "ft_1", "confidence": "high", "relationship": "exact", "why": "a"},
-                {"transaction_id": "ft_1", "confidence": "high", "relationship": "exact", "why": "a"},
-            ]
-        ),
-        record_id="rr_1", agent_run_id="run-1", now=NOW,
-    )
-    assert len(rows) == 1
-
-
-def test_split_shipments_keep_every_high_confidence_leg():
-    rows = link_rows(
-        _result(
-            matches=[
-                {"transaction_id": "ft_a", "confidence": "high", "relationship": "shipment 1", "why": "a"},
-                {"transaction_id": "ft_b", "confidence": "high", "relationship": "shipment 2", "why": "b"},
-            ]
-        ),
-        record_id="rr_1", agent_run_id="run-1", now=NOW,
-    )
-    assert {row["transaction_id"] for row in rows} == {"ft_a", "ft_b"}
-
-
-# --- descriptors ----------------------------------------------------------
-
-
-def test_photo_descriptor_keeps_headers_not_the_whole_ocr():
-    caption = (
-        "AI attachment extraction\n\n"
-        "Document type: photo: receipt\n\n"
-        "Summary: A hand holds a takeout receipt.\n\n"
-        "Visible text:\nEXAMPLE CAFE\n" + "line\n" * 200
-    )
-    descriptor = photo_descriptor({"body": caption})
-    assert "Document type: photo: receipt" in descriptor
-    assert "Summary:" in descriptor
-    assert "EXAMPLE CAFE" not in descriptor
-    assert len(descriptor) <= 400
-
-
-def test_gmail_and_attachment_descriptors_are_compact():
-    gmail = gmail_descriptor(
-        {"from_address": "auto-confirm@amazon.com", "subject": "Ordered: 1 item", "snippet": "x" * 500}
-    )
-    assert "auto-confirm@amazon.com" in gmail
-    assert len(gmail) < 400
-    attachment = attachment_descriptor(
-        {"filename": "invoice.pdf", "subject": "Invoice", "from_address": "billing@x.com", "head": "y" * 500}
-    )
-    assert "invoice.pdf" in attachment
-    assert len(attachment) < 400
-
-
-# --- prompt / schema contracts -------------------------------------------
-
-
-def test_enrichment_prompt_names_the_real_query_tool():
-    prompt = enrichment_prompt(source="photo", title="t", observed_at="2026-07-25", text="body")
-    # the container carries the authenticated pdw CLI; naming a tool that is not
-    # there once made a model conclude the database was unavailable and give up
-    assert "pdw sql" in prompt
-    assert "PDW_POSTGRES_QUERY" not in prompt
-    assert "body" in prompt
-
-
-def test_enrichment_schema_is_closed_and_covers_the_ledger_fields():
-    schema = enrichment_schema()
-    assert schema["additionalProperties"] is False
-    receipt = schema["properties"]["receipt"]["properties"]
-    for field in ("total", "currency", "card_last4", "line_items", "summary"):
-        assert field in receipt
-    match = schema["properties"]["matches"]["items"]["properties"]
-    assert match["confidence"]["enum"] == ["high", "medium", "low"]
-
-
-# --- usage ----------------------------------------------------------------
 
 
 def test_usage_only_counts_turn_completed_events():
@@ -387,40 +256,7 @@ def test_merge_usage_accumulates():
     assert totals == {"input_tokens": 8, "output_tokens": 1}
 
 
-# --- column coverage ------------------------------------------------------
-# Every row builder must emit every column its table declares; a missing key
-# only surfaces as a KeyError at insert time, i.e. in production.
+def test_row_builder_covers_the_transaction_receipt_table():
+    from personal_data_warehouse.schema import RECEIPT_TRANSACTION_RECEIPT_COLUMNS
 
-
-def test_row_builders_cover_their_table_columns():
-    from personal_data_warehouse.schema import (
-        RECEIPT_RECORD_COLUMNS,
-        RECEIPT_TRANSACTION_LINK_COLUMNS,
-        RECEIPT_TRIAGE_COLUMNS,
-    )
-
-    candidate = _candidate()
-    triage = triage_rows(
-        [{"artifact_id": candidate.artifact_id, "verdict": VERDICT_PURCHASE, "reason": "r"}],
-        candidates={candidate.artifact_id: candidate},
-        provider="codex", model="m", agent_run_id="run", decided_at=NOW,
-    )[0]
-    assert set(RECEIPT_TRIAGE_COLUMNS) <= set(triage)
-
-    record = record_row(
-        _result(),
-        source="photo", native_id="ph_1", occurred_at=NOW,
-        attempt_count=0, max_attempts=2, provider="codex",
-        model="m", agent_run_id="run", elapsed_ms=1, now=NOW,
-    )
-    assert set(RECEIPT_RECORD_COLUMNS) <= set(record)
-
-    link = link_rows(_result(), record_id="rr_1", agent_run_id="run", now=NOW)[0]
-    assert set(RECEIPT_TRANSACTION_LINK_COLUMNS) <= set(link)
-
-
-def test_sync_version_is_monotonic_with_time():
-    from personal_data_warehouse.receipt_enrichment import sync_version_for
-    from datetime import timedelta
-
-    assert sync_version_for(NOW + timedelta(seconds=1)) > sync_version_for(NOW)
+    assert set(RECEIPT_TRANSACTION_RECEIPT_COLUMNS) <= set(_row())

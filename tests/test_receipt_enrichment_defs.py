@@ -6,15 +6,15 @@ import logging
 import pytest
 
 from personal_data_warehouse.receipt_enrichment import (
-    DECISION_MATCHED,
-    DECISION_NO_MATCH,
+    DECISION_FOUND,
+    DECISION_INSUFFICIENT,
+    DECISION_NOT_FOUND,
     SOURCE_GMAIL_MESSAGE,
     SOURCE_PHOTO,
-    VERDICT_PURCHASE,
     ReceiptEnrichmentRunner,
 )
 
-NOW = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+NOW = datetime(2026, 7, 26, 12, 0, tzinfo=UTC)
 
 
 class FakeResult:
@@ -28,31 +28,23 @@ class FakeResult:
 
 
 class FakeAgent:
-    """Records every request and replays canned responses by task_type."""
-
-    def __init__(self, triage=None, enrichment=None):
-        self._triage = triage or {"verdicts": []}
-        self._enrichment = enrichment or {}
+    def __init__(self, result=None):
+        self._result = result or {}
         self.requests = []
 
     def run(self, request):
-        self.requests.append(request)
-        return FakeResult(self._triage)
+        raise AssertionError("receipt matching must never run a separate non-PDW extraction step")
 
     def run_with_pdw(self, request, **kwargs):
         self.requests.append(request)
-        payload = self._enrichment
-        if callable(payload):
-            payload = payload(request)
+        payload = self._result(request) if callable(self._result) else self._result
         return FakeResult(payload)
 
 
 class FakeWarehouse:
     def __init__(self, rows_by_marker):
         self.rows_by_marker = rows_by_marker
-        self.triage_rows = []
-        self.records = []
-        self.links = []
+        self.rows = []
         self.queries = []
         self.ensured = False
 
@@ -66,14 +58,65 @@ class FakeWarehouse:
                 return rows(params) if callable(rows) else rows
         return []
 
-    def insert_receipt_triage(self, rows):
-        self.triage_rows.extend(rows)
+    def insert_receipt_transaction_receipts(self, rows):
+        self.rows.extend(rows)
 
-    def insert_receipt_records(self, rows):
-        self.records.extend(rows)
 
-    def insert_receipt_transaction_links(self, rows):
-        self.links.extend(rows)
+def _transaction(transaction_id="ft_1", **overrides):
+    row = {
+        "transaction_id": transaction_id,
+        "account_id": "fa_1",
+        "account_name": "Everyday Card",
+        "account_kind": "credit",
+        "institution": "Example Bank",
+        "mask": "1234",
+        "posted_at": NOW - timedelta(days=1),
+        "amount": "-30.79",
+        "currency": "USD",
+        "merchant": "Example Cafe",
+        "description": "EXAMPLE CAFE",
+        "source": "plaid",
+        "attempt_count": 0,
+        "last_attempt_at": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def _found_result():
+    return {
+        "decision": DECISION_FOUND,
+        "sources_searched": [SOURCE_PHOTO, SOURCE_GMAIL_MESSAGE],
+        "receipt": {
+            "primary_source": SOURCE_PHOTO,
+            "primary_native_id": "ph_1",
+            "evidence": [
+                {
+                    "source": SOURCE_PHOTO,
+                    "native_id": "ph_1",
+                    "role": "primary",
+                    "why": "exact total",
+                }
+            ],
+            "merchant_name": "Example Cafe",
+            "merchant_location": "",
+            "purchased_at": "2026-07-25",
+            "currency": "USD",
+            "total": "30.79",
+            "subtotal": "",
+            "tax": "",
+            "tip": "",
+            "amount_charged_to_card": "",
+            "card_last4": "1234",
+            "order_id": "",
+            "line_items": [],
+            "summary": "Lunch.",
+            "record_confidence": "high",
+            "match_confidence": "high",
+            "match_reason": "Exact merchant, date, and settled amount.",
+        },
+        "reasoning": "The image and transaction agree.",
+    }
 
 
 def _runner(warehouse, agent, **kwargs):
@@ -88,185 +131,116 @@ def _runner(warehouse, agent, **kwargs):
     )
 
 
-def test_triage_only_considers_the_lookback_window():
-    warehouse = FakeWarehouse({"FROM clean_photos": [], "FROM gmail_messages": [], "FROM gmail_attachments": []})
-    agent = FakeAgent()
-    _runner(warehouse, agent, lookback_days=30).sync()
-    since_values = {params["since"] for sql, params in warehouse.queries if params and "since" in params}
-    assert since_values, "candidate queries must be time-bounded"
-    for since in since_values:
-        assert since == NOW - timedelta(days=30)
-
-
-def test_triage_writes_a_row_per_artifact_and_counts_purchases():
-    photo_rows = [
-        {"native_id": "ph_1", "occurred_at": NOW - timedelta(days=5),
-         "body": "Document type: photo: receipt\n\nSummary: a slip"},
-        {"native_id": "ph_2", "occurred_at": NOW - timedelta(days=6),
-         "body": "Document type: photo: landscape\n\nSummary: a hill"},
-    ]
-    warehouse = FakeWarehouse({
-        "FROM clean_photos AS p\nLEFT JOIN": photo_rows,
-        "FROM gmail_messages AS m\nLEFT JOIN": [],
-        "FROM gmail_attachments AS a": [],
-        "FROM receipt_triage AS t": [],
-    })
-    agent = FakeAgent(triage={"verdicts": [
-        {"artifact_id": "photo:ph_1", "verdict": "purchase_record", "reason": "receipt"},
-        {"artifact_id": "photo:ph_2", "verdict": "not_a_purchase", "reason": "landscape"},
-    ]})
-    summary = _runner(warehouse, agent).sync()
-
-    assert warehouse.ensured
-    assert summary.triaged == 2
-    assert summary.purchase_records == 1
-    assert {row["native_id"] for row in warehouse.triage_rows} == {"ph_1", "ph_2"}
-    assert summary.usage["input_tokens"] > 0
-
-
-def test_triage_prompt_excludes_the_full_ocr():
-    body = "Document type: photo: receipt\n\nSummary: a slip\n\nVisible text:\nSECRET-TOTAL-LINE\n"
-    warehouse = FakeWarehouse({
-        "FROM clean_photos AS p\nLEFT JOIN": [
-            {"native_id": "ph_1", "occurred_at": NOW - timedelta(days=5), "body": body}
-        ],
-        "FROM gmail_messages AS m\nLEFT JOIN": [],
-        "FROM gmail_attachments AS a": [],
-        "FROM receipt_triage AS t": [],
-    })
-    agent = FakeAgent(triage={"verdicts": []})
-    _runner(warehouse, agent).sync()
-    triage_prompts = [r.prompt for r in agent.requests if r.task_type == "receipt_triage"]
-    assert triage_prompts
-    assert "SECRET-TOTAL-LINE" not in triage_prompts[0]
-
-
-def test_enrichment_writes_record_and_high_confidence_link():
-    candidate = {
-        "source": SOURCE_PHOTO, "native_id": "ph_1",
-        "occurred_at": NOW - timedelta(days=5),
-        "record_id": None, "attempt_count": 0, "last_attempt_at": None,
-    }
-    warehouse = FakeWarehouse({
-        "FROM clean_photos AS p\nLEFT JOIN": [],
-        "FROM gmail_messages AS m\nLEFT JOIN": [],
-        "FROM gmail_attachments AS a": [],
-        "FROM receipt_triage AS t": [candidate],
-        "FROM clean_photos AS p WHERE": [
-            {"text": "EXAMPLE CAFE\nTOTAL 30.79", "title": "", "occurred_at": NOW - timedelta(days=5)}
-        ],
-        "FROM finance_transactions WHERE": [{"transaction_id": "ft_1"}],
-    })
-    agent = FakeAgent(enrichment={
-        "is_purchase_record": True,
-        "receipt": {
-            "merchant_name": "Example Cafe", "merchant_location": "Springfield, XX",
-            "purchased_at": "2026-07-20", "currency": "USD", "total": "30.79",
-            "subtotal": "29.00", "tax": "0.79", "tip": "1.00",
-            "amount_charged_to_card": "", "card_last4": "1234", "order_id": "",
-            "line_items": [], "summary": "Lunch", "confidence": "high",
-        },
-        "decision": DECISION_MATCHED,
-        "matches": [{"transaction_id": "ft_1", "confidence": "high",
-                     "relationship": "exact", "why": "exact cents"}],
-        "reasoning": "exact",
-    })
-    summary = _runner(warehouse, agent).sync()
-
-    assert summary.enriched == 1
-    assert summary.matched == 1
-    assert summary.trusted_links == 1
-    assert warehouse.records[0]["merchant_name"] == "Example Cafe"
-    assert warehouse.records[0]["settled"] == 1
-    assert warehouse.links[0]["transaction_id"] == "ft_1"
-
-
-def test_enrichment_drops_a_link_to_a_nonexistent_transaction():
-    candidate = {
-        "source": SOURCE_PHOTO, "native_id": "ph_1",
-        "occurred_at": NOW - timedelta(days=5),
-        "record_id": None, "attempt_count": 0, "last_attempt_at": None,
-    }
-    warehouse = FakeWarehouse({
-        "FROM clean_photos AS p\nLEFT JOIN": [],
-        "FROM gmail_messages AS m\nLEFT JOIN": [],
-        "FROM gmail_attachments AS a": [],
-        "FROM receipt_triage AS t": [candidate],
-        "FROM clean_photos AS p WHERE": [
-            {"text": "slip", "title": "", "occurred_at": NOW}
-        ],
-        # the ledger does not contain the claimed id
-        "FROM finance_transactions WHERE": [],
-    })
-    agent = FakeAgent(enrichment={
-        "is_purchase_record": True,
-        "receipt": {
-            "merchant_name": "X", "merchant_location": "", "purchased_at": "",
-            "currency": "USD", "total": "1.00", "subtotal": "", "tax": "", "tip": "",
-            "amount_charged_to_card": "", "card_last4": "", "order_id": "",
-            "line_items": [], "summary": "s", "confidence": "high",
-        },
-        "decision": DECISION_MATCHED,
-        "matches": [{"transaction_id": "ft_invented", "confidence": "high",
-                     "relationship": "exact", "why": "made up"}],
-        "reasoning": "r",
-    })
-    summary = _runner(warehouse, agent).sync()
-    assert summary.enriched == 1
-    assert warehouse.links == [], "a hallucinated transaction id must not create a link"
-    assert summary.trusted_links == 0
-
-
-def test_enrichment_candidate_query_applies_settle_and_retry_windows():
+def test_worklist_is_recent_posted_transactions_not_artifacts():
     captured = {}
 
     def capture(params):
         captured.update(params)
         return []
 
-    warehouse = FakeWarehouse({
-        "FROM clean_photos AS p\nLEFT JOIN": [],
-        "FROM gmail_messages AS m\nLEFT JOIN": [],
-        "FROM gmail_attachments AS a": [],
-        "FROM receipt_triage AS t": capture,
-    })
-    _runner(warehouse, FakeAgent(), settle_days=2, retry_after_days=7, max_attempts=2).sync()
-    assert captured["settle_before"] == NOW - timedelta(days=2)
+    warehouse = FakeWarehouse({"FROM finance_transactions AS t": capture})
+    _runner(warehouse, FakeAgent()).sync()
+
+    assert warehouse.ensured
+    assert captured["since"] == NOW - timedelta(days=30)
+    candidate_sql = next(sql for sql, _ in warehouse.queries if "FROM finance_transactions AS t" in sql)
+    assert "t.posted_at >= %(since)s" in candidate_sql
+    assert "t.pending = 0" in candidate_sql
+    assert "clean_photos" not in candidate_sql
+    assert "gmail_messages" not in candidate_sql
+    assert "receipt_triage" not in candidate_sql
+
+
+def test_one_pdw_agent_operation_per_transaction():
+    transactions = [_transaction("ft_1"), _transaction("ft_2", amount="-12.00")]
+    warehouse = FakeWarehouse(
+        {
+            "FROM finance_transactions AS t": transactions,
+            "FROM clean_photos WHERE": lambda params: [
+                {"native_id": native_id} for native_id in params[0] if native_id == "ph_1"
+            ],
+            "FROM gmail_messages WHERE": [],
+            "FROM gmail_attachments WHERE": [],
+        }
+    )
+    agent = FakeAgent(_found_result())
+
+    summary = _runner(warehouse, agent).sync()
+
+    assert len(agent.requests) == 2
+    assert {request.subject_id for request in agent.requests} == {"ft_1", "ft_2"}
+    assert {request.task_type for request in agent.requests} == {"receipt_transaction_match"}
+    assert all("pdw sql" in request.prompt for request in agent.requests)
+    assert summary.researched == 2
+    assert summary.receipts_found == 2
+    assert len(warehouse.rows) == 2
+    assert {row["transaction_id"] for row in warehouse.rows} == {"ft_1", "ft_2"}
+
+
+def test_receipt_is_not_published_when_agent_invents_evidence():
+    warehouse = FakeWarehouse(
+        {
+            "FROM finance_transactions AS t": [_transaction()],
+            "FROM clean_photos WHERE": [],
+            "FROM gmail_messages WHERE": [],
+            "FROM gmail_attachments WHERE": [],
+        }
+    )
+    summary = _runner(warehouse, FakeAgent(_found_result())).sync()
+
+    assert warehouse.rows[0]["decision"] == DECISION_INSUFFICIENT
+    assert warehouse.rows[0]["record_id"] == ""
+    assert summary.receipts_found == 0
+    assert summary.insufficient == 1
+
+
+def test_no_receipt_result_is_durable_and_retryable():
+    result = {
+        "decision": DECISION_NOT_FOUND,
+        "sources_searched": [SOURCE_PHOTO, SOURCE_GMAIL_MESSAGE],
+        "receipt": {},
+        "reasoning": "No relevant source evidence found.",
+    }
+    warehouse = FakeWarehouse({"FROM finance_transactions AS t": [_transaction()]})
+    summary = _runner(warehouse, FakeAgent(result)).sync()
+
+    assert summary.not_found == 1
+    assert warehouse.rows[0]["decision"] == DECISION_NOT_FOUND
+    assert warehouse.rows[0]["settled"] == 0
+
+
+def test_retry_window_and_budget_are_applied_to_the_transaction_row():
+    captured = {}
+
+    def capture(params):
+        captured.update(params)
+        return []
+
+    warehouse = FakeWarehouse({"FROM finance_transactions AS t": capture})
+    _runner(warehouse, FakeAgent(), retry_after_days=7, max_attempts=2).sync()
     assert captured["retry_before"] == NOW - timedelta(days=7)
     assert captured["max_attempts"] == 2
-    assert captured["purchase"] == VERDICT_PURCHASE
 
 
-def test_container_failure_leaves_the_record_untouched_for_a_later_run():
+def test_agent_failure_leaves_transaction_unwritten_for_next_run():
     class FailingAgent(FakeAgent):
         def run_with_pdw(self, request, **kwargs):
             self.requests.append(request)
             return FakeResult({}, exit_code=1, error="container exited 1")
 
-    candidate = {
-        "source": SOURCE_GMAIL_MESSAGE, "native_id": "m1",
-        "occurred_at": NOW - timedelta(days=5),
-        "record_id": None, "attempt_count": 0, "last_attempt_at": None,
-    }
-    warehouse = FakeWarehouse({
-        "FROM clean_photos AS p\nLEFT JOIN": [],
-        "FROM gmail_messages AS m\nLEFT JOIN": [],
-        "FROM gmail_attachments AS a": [],
-        "FROM receipt_triage AS t": [candidate],
-        "FROM gmail_messages AS m WHERE": [{"text": "body", "title": "t", "occurred_at": NOW}],
-    })
+    warehouse = FakeWarehouse({"FROM finance_transactions AS t": [_transaction()]})
     summary = _runner(warehouse, FailingAgent()).sync()
     assert summary.failed == 1
-    assert warehouse.records == [], "an infra failure is not evidence about the receipt"
+    assert warehouse.rows == []
 
 
-def test_defaults_match_the_agreed_cadence():
+def test_defaults_are_a_hard_30_day_window(monkeypatch):
     from personal_data_warehouse.defs import receipt_enrichment as defs_module
 
+    monkeypatch.setenv("RECEIPT_LOOKBACK_DAYS", "730")
     assert defs_module.receipt_lookback_days() == 30
-    assert defs_module.receipt_settle_days() == 2
     assert defs_module.receipt_retry_after_days() == 7
-    assert defs_module.receipt_max_attempts() == 2, "one attempt plus one retry"
+    assert defs_module.receipt_max_attempts() == 2
     assert defs_module.receipt_model() == "gpt-5.6-terra"
 
 

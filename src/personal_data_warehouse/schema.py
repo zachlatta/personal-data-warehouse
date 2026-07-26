@@ -1575,33 +1575,21 @@ class GoogleDriveSyncState:
     files_seen: int
 
 
-# receipts: agent-derived purchase records linked to ledger transactions.
+# receipts: one agent research result per recent ledger transaction.
 #
-# One triage row per artifact ever considered, so nothing is re-examined and
-# the "we looked and it wasn't a receipt" answer is durable. Keyed by the
-# artifact's own identity in its source schema.
-RECEIPT_TRIAGE_COLUMNS = (
-    "source",
-    "native_id",
-    "occurred_at",
-    "verdict",
-    "reason",
-    "ai_provider",
-    "ai_model",
-    "ai_prompt_version",
-    "agent_run_id",
-    "decided_at",
-    "sync_version",
-)
-
-# One row per purchase the agent read out of an artifact. Facts only: what the
-# document says. The link decision lives in receipt_transaction_links so a
-# re-link never rewrites the facts, and `settled` records that the retry
-# budget is spent (attempt at +2 days, one retry 7 days later).
-RECEIPT_RECORD_COLUMNS = (
+# Search, source validation, extraction, and matching happen in one operation.
+# Negative results are durable and retryable; trusted positive results carry
+# the consolidated receipt facts in the same row. There is deliberately no
+# archive-wide artifact triage or separate receipt-to-transaction link table.
+RECEIPT_TRANSACTION_RECEIPT_COLUMNS = (
+    "transaction_id",
     "record_id",
-    "source",
-    "native_id",
+    "decision",
+    "reasoning",
+    "sources_searched_json",
+    "primary_source",
+    "primary_native_id",
+    "evidence_json",
     "occurred_at",
     "purchased_at",
     "merchant_name",
@@ -1617,9 +1605,8 @@ RECEIPT_RECORD_COLUMNS = (
     "line_items_json",
     "summary",
     "record_confidence",
-    "is_purchase_record",
-    "decision",
-    "reasoning",
+    "match_confidence",
+    "match_reason",
     "attempt_count",
     "last_attempt_at",
     "settled",
@@ -1632,21 +1619,5 @@ RECEIPT_RECORD_COLUMNS = (
     "agent_run_id",
     "created_at",
     "updated_at",
-    "sync_version",
-)
-
-# The agent's opinion about which charge a record paid for. `relationship` is
-# free text in the agent's own words ("exact", "tip added after slip", "one of
-# several shipments") rather than an enum, because the interesting cases keep
-# turning out to be ones no enum anticipated.
-RECEIPT_TRANSACTION_LINK_COLUMNS = (
-    "record_id",
-    "transaction_id",
-    "confidence",
-    "relationship",
-    "why",
-    "ai_prompt_version",
-    "agent_run_id",
-    "created_at",
     "sync_version",
 )

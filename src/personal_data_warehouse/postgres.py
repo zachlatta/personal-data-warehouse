@@ -46,9 +46,7 @@ from personal_data_warehouse.schema import (
     FINANCE_TRANSACTION_LINK_COLUMNS,
     MANUAL_FINANCE_DOCUMENT_COLUMNS,
     MANUAL_FINANCE_EXTRACTION_COLUMNS,
-    RECEIPT_RECORD_COLUMNS,
-    RECEIPT_TRANSACTION_LINK_COLUMNS,
-    RECEIPT_TRIAGE_COLUMNS,
+    RECEIPT_TRANSACTION_RECEIPT_COLUMNS,
     PLAID_ACCOUNT_COLUMNS,
     PLAID_INVESTMENT_HOLDING_COLUMNS,
     PLAID_INVESTMENT_SECURITY_COLUMNS,
@@ -303,11 +301,9 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("account_id", "as_of", "kind", "source"),
     ),
     "finance_transactions": TableSpec(FINANCE_TRANSACTION_COLUMNS, ("transaction_id",)),
-    "receipt_triage": TableSpec(RECEIPT_TRIAGE_COLUMNS, ("source", "native_id")),
-    "receipt_records": TableSpec(RECEIPT_RECORD_COLUMNS, ("record_id",)),
-    "receipt_transaction_links": TableSpec(
-        RECEIPT_TRANSACTION_LINK_COLUMNS,
-        ("record_id", "transaction_id"),
+    "receipt_transaction_receipts": TableSpec(
+        RECEIPT_TRANSACTION_RECEIPT_COLUMNS,
+        ("transaction_id",),
     ),
     "finance_transaction_links": TableSpec(
         FINANCE_TRANSACTION_LINK_COLUMNS,
@@ -1227,7 +1223,13 @@ NUMERIC_COLUMNS_BY_TABLE = {
     "finance_observations": {"value"},
     "finance_transactions": {"amount"},
     "manual_finance_extractions": {"closing_balance"},
-    "receipt_records": {"total", "subtotal", "tax", "tip", "amount_charged"},
+    "receipt_transaction_receipts": {
+        "total",
+        "subtotal",
+        "tax",
+        "tip",
+        "amount_charged",
+    },
 }
 
 # Day-granularity columns (DATE, not timestamptz): an observation is "the
@@ -1245,9 +1247,7 @@ def _is_numeric_column(table: str | None, column: str) -> bool:
     return column in NUMERIC_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
-    # receipts: when the triage verdict was made, and when the last
-    # enrichment attempt ran (drives the settle/retry windows)
-    "decided_at",
+    # receipts: the last transaction research attempt drives its retry window
     "last_attempt_at",
     "internal_date",
     "synced_at",
@@ -2052,25 +2052,39 @@ class PostgresWarehouse:
         )
 
     def ensure_receipt_tables(self) -> None:
-        self._ensure_table_group(
-            [
-                "receipt_triage",
-                "receipt_records",
-                "receipt_transaction_links",
-            ]
-        )
+        self._ensure_table_group(["receipt_transaction_receipts"])
+        self._drop_legacy_receipt_pipeline()
         self._ensure_receipt_mart_views()
+
+    def _drop_legacy_receipt_pipeline(self) -> None:
+        """Remove the artifact-first v1 tables after the v2 table exists.
+
+        The production trial produced no trusted transaction links, and its
+        extracted rows include known OCR errors. Leaving them queryable would
+        preserve a second, contradictory receipt architecture.
+        """
+        receipts_schema = self.physical_schema_name("receipts")
+        legacy_tables = ("artifact_triage", "records", "transaction_links")
+        if not any(
+            self._physical_table_exists(schema=receipts_schema, table=table)
+            for table in legacy_tables
+        ):
+            return
+
+        receipts = _identifier(receipts_schema)
+        marts = _identifier(self.physical_schema_name("marts"))
+        self._raw_command(f"DROP VIEW IF EXISTS {marts}.{_identifier('unmatched_receipts')}")
+        self._raw_command(f"DROP VIEW IF EXISTS {marts}.{_identifier('transaction_receipts')}")
+        for table in legacy_tables:
+            self._raw_command(f"DROP TABLE IF EXISTS {receipts}.{_identifier(table)}")
 
     def _ensure_receipt_mart_views(self) -> None:
         receipts = _identifier(self.physical_schema_name("receipts"))
         finance = _identifier(self.physical_schema_name("finance"))
         marts = _identifier(self.physical_schema_name("marts"))
-        # The read surface: every ledger transaction, with whatever the agent
-        # found for it. LEFT JOIN so this stays a superset of the ledger --
-        # `receipt_summary IS NULL` is the honest "no receipt found" answer,
-        # and `link_confidence` is exposed rather than filtered so a low-
-        # confidence guess is visible without being indistinguishable from a
-        # confident one.
+        # Every ledger transaction stays visible. The joined row contains the
+        # durable search decision and, only for a verified high-confidence
+        # match, receipt facts produced by that same agent operation.
         self._ensure_physical_view(
             f"{marts}.transaction_receipts",
             f"""
@@ -2083,60 +2097,34 @@ class PostgresWarehouse:
                 t.currency AS transaction_currency,
                 t.merchant,
                 t.description,
-                r.record_id,
-                r.summary AS receipt_summary,
-                r.line_items_json,
-                r.merchant_name AS receipt_merchant,
-                r.merchant_location,
+                NULLIF(r.record_id, '') AS record_id,
+                NULLIF(r.summary, '') AS receipt_summary,
+                CASE WHEN r.decision = 'receipt_found' THEN r.line_items_json END AS line_items_json,
+                NULLIF(r.merchant_name, '') AS receipt_merchant,
+                NULLIF(r.merchant_location, '') AS merchant_location,
                 NULLIF(r.purchased_at, '1970-01-01'::date) AS purchased_at,
-                r.currency AS receipt_currency,
+                NULLIF(r.currency, '') AS receipt_currency,
                 NULLIF(r.total, 0) AS receipt_total,
                 NULLIF(r.tax, 0) AS receipt_tax,
                 NULLIF(r.tip, 0) AS receipt_tip,
-                r.order_id,
-                r.card_last4,
-                r.source AS receipt_source,
-                r.native_id AS receipt_native_id,
-                l.confidence AS link_confidence,
-                l.relationship AS link_relationship,
-                l.why AS link_reason
-            FROM {finance}.transactions AS t
-            LEFT JOIN {receipts}.transaction_links AS l
-                ON l.transaction_id = t.transaction_id
-            LEFT JOIN {receipts}.records AS r
-                ON r.record_id = l.record_id
-            """,
-        )
-        # The other direction: receipts we read but could not place. This is
-        # where unsynced-card spend and coverage gaps surface, so it is a
-        # first-class view rather than a query someone has to remember.
-        self._ensure_physical_view(
-            f"{marts}.unmatched_receipts",
-            f"""
-            CREATE OR REPLACE VIEW {marts}.unmatched_receipts AS
-            SELECT
-                r.record_id,
-                r.source,
-                r.native_id,
-                r.occurred_at,
-                NULLIF(r.purchased_at, '1970-01-01'::date) AS purchased_at,
-                r.merchant_name,
-                r.merchant_location,
-                r.currency,
-                NULLIF(r.total, 0) AS total,
-                r.card_last4,
-                r.summary,
-                r.decision,
-                r.reasoning,
+                NULLIF(r.order_id, '') AS order_id,
+                NULLIF(r.card_last4, '') AS card_last4,
+                NULLIF(r.primary_source, '') AS receipt_source,
+                NULLIF(r.primary_native_id, '') AS receipt_native_id,
+                NULLIF(r.match_confidence, '') AS link_confidence,
+                NULLIF(r.match_reason, '') AS link_reason,
+                r.decision AS receipt_decision,
+                r.reasoning AS receipt_reasoning,
+                r.sources_searched_json,
+                r.evidence_json,
                 r.attempt_count,
                 r.last_attempt_at,
-                r.settled
-            FROM {receipts}.records AS r
-            WHERE r.is_purchase_record = 1
-              AND NOT EXISTS (
-                  SELECT 1 FROM {receipts}.transaction_links AS l
-                  WHERE l.record_id = r.record_id
-              )
+                r.settled,
+                r.ai_model,
+                r.ai_processed_at
+            FROM {finance}.transactions AS t
+            LEFT JOIN {receipts}.transaction_receipts AS r
+                ON r.transaction_id = t.transaction_id
             """,
         )
 
@@ -5766,14 +5754,12 @@ class PostgresWarehouse:
     def insert_finance_transaction_links(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("finance_transaction_links", rows, FINANCE_TRANSACTION_LINK_COLUMNS)
 
-    def insert_receipt_triage(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("receipt_triage", rows, RECEIPT_TRIAGE_COLUMNS)
-
-    def insert_receipt_records(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("receipt_records", rows, RECEIPT_RECORD_COLUMNS)
-
-    def insert_receipt_transaction_links(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows("receipt_transaction_links", rows, RECEIPT_TRANSACTION_LINK_COLUMNS)
+    def insert_receipt_transaction_receipts(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows(
+            "receipt_transaction_receipts",
+            rows,
+            RECEIPT_TRANSACTION_RECEIPT_COLUMNS,
+        )
 
     def reconcile_finance_transactions(self, *, transaction_ids: list[str], link_keys: list[str]) -> int:
         """Hard-delete ledger transactions/links absent from the desired set.

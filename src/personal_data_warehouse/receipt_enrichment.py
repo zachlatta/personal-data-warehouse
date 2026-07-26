@@ -1,66 +1,58 @@
-"""Receipt → transaction enrichment: what was actually purchased.
+"""Transaction-first receipt research.
 
-A statement line reading ``AMAZON *************** -34.97`` says nothing about
-what arrived in the box. The documents that do say — order emails, photographed
-paper slips, PDF invoices — are already in the warehouse; this module reads them
-with an agent and links them to the charge they paid for.
+The ledger is the worklist. For each posted transaction in the most recent
+30 days, one PDW-enabled agent searches source emails, attachments, and photos,
+reads the best evidence, and returns the receipt facts and match decision
+together. There is no archive-wide receipt scan, no artifact triage, and no
+separate extraction or linking pass.
 
-Every judgment belongs to the agent. There are no format parsers, no amount
-bands, no posting-lag windows and no scoring weights here, because receipt and
-email formats drift constantly (Amazon's own order email stopped naming items
-mid-2026) and rules written against today's formats rot silently. Code selects
-candidates by time, moves text, and records outcomes; the agent decides what a
-document says and which charge it paid for, using read-only SQL to check itself.
-
-Two stages, both agent-driven:
-
-  triage      one cheap batched pass over compact artifact metadata, deciding
-              what is even a purchase record. A 30-day window holds ~10,600
-              artifacts but only ~135 real receipts, so this is what keeps the
-              expensive stage from running 78x more often than it needs to.
-  enrichment  one agent call per purchase record: read the document, then find
-              the transaction. Extraction and linking share a call because the
-              linking half already needs warehouse access, so folding them
-              together halves the number of container runs — and the container's
-              fixed prompt, not the receipt text, is what actually costs money.
-
-Timing. Receipts almost always arrive *before* the charge: an Amazon order email
-precedes its posting by a median of 2 days and a 95th percentile of 17, because
-Amazon bills at shipment. Photos need a median 18 hours to upload and be
-captioned. So a record is left to settle before the first attempt, and a failure
-gets exactly one retry a week later, by which point all but the longest
-backorders have posted.
+One durable row per transaction records both positive and negative findings.
+Only high-confidence matches backed by a real source identifier publish receipt
+facts to the mart. A negative finding gets one delayed retry so late-arriving
+mail, photo uploads, and attachment extraction can still fill the transaction.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import time
 from typing import Any
 
-TRIAGE_PROMPT_VERSION = "receipt-triage-v1"
-ENRICHMENT_PROMPT_VERSION = "receipt-enrich-v1"
+PROMPT_VERSION = "receipt-transaction-research-v1"
 
-VERDICT_PURCHASE = "purchase_record"
-VERDICT_NOT_PURCHASE = "not_a_purchase"
-VERDICT_UNCERTAIN = "uncertain"
-
-DECISION_MATCHED = "matched"
-DECISION_NO_MATCH = "no_matching_transaction"
-DECISION_NOT_A_PURCHASE = "not_a_purchase"
+DECISION_FOUND = "receipt_found"
+DECISION_NOT_FOUND = "no_receipt_found"
+DECISION_NOT_RECEIPTABLE = "not_receiptable"
 DECISION_INSUFFICIENT = "insufficient_evidence"
-
-# Only these reach marts.transaction_receipts as trustworthy links. Measured on
-# a 40-receipt sample: every high-confidence link was exact to the cent, and
-# every error the agent made was one it had already rated below high.
-TRUSTED_LINK_CONFIDENCE = "high"
+DECISIONS = (
+    DECISION_FOUND,
+    DECISION_NOT_FOUND,
+    DECISION_NOT_RECEIPTABLE,
+    DECISION_INSUFFICIENT,
+)
 
 SOURCE_PHOTO = "photo"
 SOURCE_GMAIL_MESSAGE = "gmail_message"
 SOURCE_GMAIL_ATTACHMENT = "gmail_attachment"
+EVIDENCE_SOURCES = (
+    SOURCE_PHOTO,
+    SOURCE_GMAIL_MESSAGE,
+    SOURCE_GMAIL_ATTACHMENT,
+)
+
+TRUSTED_CONFIDENCE = "high"
+ABSENT_MONEY = "0"
+ABSENT_DATE = "1970-01-01"
+
+DEFAULT_LOOKBACK_DAYS = 30
+DEFAULT_RETRY_AFTER_DAYS = 7
+DEFAULT_MAX_ATTEMPTS = 2
+DEFAULT_TRANSACTION_LIMIT = 10
 
 
 def sync_version_for(moment: datetime) -> int:
@@ -68,139 +60,114 @@ def sync_version_for(moment: datetime) -> int:
     return int(moment.timestamp() * 1_000_000)
 
 
-def record_id_for(source: str, native_id: str) -> str:
-    digest = hashlib.sha256(f"{source}\x00{native_id}".encode("utf-8")).hexdigest()
+def record_id_for(transaction_id: str) -> str:
+    digest = hashlib.sha256(f"transaction-receipt\x00{transaction_id}".encode()).hexdigest()
     return f"rr_{digest[:24]}"
 
 
-# ---------------------------------------------------------------------------
-# Triage: which artifacts are purchase records at all?
-# ---------------------------------------------------------------------------
-
-
-def triage_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["verdicts"],
-        "properties": {
-            "verdicts": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["artifact_id", "verdict", "reason"],
-                    "properties": {
-                        "artifact_id": {
-                            "type": "string",
-                            "description": "Echo the artifact_id verbatim.",
-                        },
-                        "verdict": {
-                            "type": "string",
-                            "enum": [VERDICT_PURCHASE, VERDICT_NOT_PURCHASE, VERDICT_UNCERTAIN],
-                        },
-                        "reason": {"type": "string", "description": "A few words."},
-                    },
-                },
-            }
-        },
-    }
-
-
-TRIAGE_INSTRUCTIONS = """\
-You are sorting artifacts from a personal data warehouse into "records a purchase" and
-"does not", so that a more expensive step only runs on the first kind.
-
-You get a compact description of each artifact — for an email its sender, subject and
-snippet; for a photo the document type and one-line summary a vision model already wrote;
-for an attachment its filename and opening lines. You do NOT get the full document, and
-you do not need it: you are deciding what deserves a closer look, not extracting anything.
-
-Answer `purchase_record` when the artifact looks like evidence of a specific purchase,
-refund, or payment Zach made — an order confirmation, a shipping notice with prices, an
-emailed or photographed receipt, an invoice he paid, a card slip.
-
-Answer `not_a_purchase` for marketing and promotional mail (including "your cart is
-waiting" and sale announcements), newsletters, account and security notices, delivery
-notices with no purchase detail, calendar and social notifications, bank statements
-summarizing many transactions, tax and legal documents, and anything belonging to someone
-else's purchase.
-
-Answer `uncertain` only when the description is too thin to tell. Prefer a real answer:
-`uncertain` is treated as "look closer" and costs real money downstream, so use it when
-you genuinely cannot tell, not as a hedge.
-
-Being wrong in the `purchase_record` direction wastes a little money. Being wrong in the
-`not_a_purchase` direction loses the receipt permanently, because artifacts are triaged
-once. When it is close, lean toward `purchase_record`.
-
-Return exactly one verdict per artifact_id, echoing each id verbatim.
-"""
-
-
-def triage_prompt(artifacts: Sequence[Mapping[str, Any]]) -> str:
-    lines = [TRIAGE_INSTRUCTIONS, "\n--- artifacts ---"]
-    for artifact in artifacts:
-        lines.append(
-            f"\nartifact_id: {artifact['artifact_id']}\n"
-            f"kind: {artifact['kind']}\n"
-            f"when: {str(artifact.get('occurred_at') or '')[:10]}\n"
-            f"{artifact['descriptor']}"
-        )
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Enrichment: read the document, then find the charge.
-# ---------------------------------------------------------------------------
-
-
-def _money(description: str = "Decimal string like \"12.34\", or \"\" if absent.") -> dict[str, Any]:
+def _money(description: str = 'Decimal string like "12.34", or "" if absent.') -> dict[str, Any]:
     return {"type": "string", "description": description}
 
 
-def enrichment_schema() -> dict[str, Any]:
+def transaction_schema() -> dict[str, Any]:
+    evidence_item = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["source", "native_id", "role", "why"],
+        "properties": {
+            "source": {"type": "string", "enum": list(EVIDENCE_SOURCES)},
+            "native_id": {
+                "type": "string",
+                "description": "Exact source primary key returned by PDW.",
+            },
+            "role": {
+                "type": "string",
+                "description": "For example primary, corroborating, or duplicate view.",
+            },
+            "why": {
+                "type": "string",
+                "description": "What this source proves about the receipt or match.",
+            },
+        },
+    }
+    receipt_required = [
+        "primary_source",
+        "primary_native_id",
+        "evidence",
+        "merchant_name",
+        "merchant_location",
+        "purchased_at",
+        "currency",
+        "total",
+        "subtotal",
+        "tax",
+        "tip",
+        "amount_charged_to_card",
+        "card_last4",
+        "order_id",
+        "line_items",
+        "summary",
+        "record_confidence",
+        "match_confidence",
+        "match_reason",
+    ]
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["is_purchase_record", "receipt", "decision", "matches", "reasoning"],
+        "required": ["decision", "sources_searched", "receipt", "reasoning"],
         "properties": {
-            "is_purchase_record": {
-                "type": "boolean",
-                "description": "False for marketing, statements, tax forms, contracts, and anything that is not a specific purchase by Zach.",
+            "decision": {"type": "string", "enum": list(DECISIONS)},
+            "sources_searched": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(EVIDENCE_SOURCES)},
+                "description": (
+                    "Source families actually queried. Usually photo and gmail_message; "
+                    "gmail_attachment when relevant. Empty is valid only for an obviously "
+                    "non-purchase transaction."
+                ),
             },
             "receipt": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": [
-                    "merchant_name", "merchant_location", "purchased_at", "currency",
-                    "total", "subtotal", "tax", "tip", "amount_charged_to_card",
-                    "card_last4", "order_id", "line_items", "summary", "confidence",
-                ],
+                "required": receipt_required,
                 "properties": {
+                    "primary_source": {
+                        "type": "string",
+                        "enum": ["", *EVIDENCE_SOURCES],
+                        "description": "Best evidence source, or empty when no receipt was found.",
+                    },
+                    "primary_native_id": {
+                        "type": "string",
+                        "description": "Exact best-evidence primary key, or empty.",
+                    },
+                    "evidence": {"type": "array", "items": evidence_item},
                     "merchant_name": {"type": "string"},
-                    "merchant_location": {"type": "string", "description": "City/state or printed address, else \"\"."},
+                    "merchant_location": {
+                        "type": "string",
+                        "description": 'Printed address or city/state, else "".',
+                    },
                     "purchased_at": {
                         "type": "string",
-                        "description": "YYYY-MM-DD as printed ON the document, else \"\". Never guess it from the artifact timestamp.",
+                        "description": (
+                            'YYYY-MM-DD printed on source evidence, else "". Never infer '
+                            "it from the photo, email, or transaction timestamp."
+                        ),
                     },
                     "currency": {
                         "type": "string",
-                        "description": (
-                            "ISO code inferred from the document. Canadian slips show TPS/TVQ, "
-                            "Gulf ones AED and VAT, European ones VAT or EUR. Getting this wrong "
-                            "is worse than leaving it \"\", because a foreign receipt settles in "
-                            "USD at a rate you do not know."
-                        ),
+                        "description": 'ISO code supported by source evidence, else "".',
                     },
-                    "total": _money("Grand total printed on the document, INCLUDING any gratuity line."),
+                    "total": _money("Grand total printed on the receipt, including gratuity."),
                     "subtotal": _money(),
                     "tax": _money(),
                     "tip": _money(),
                     "amount_charged_to_card": _money(
-                        "Only when the document states a settled amount different from total; else \"\"."
+                        "Only when the source states a settled card amount distinct from total."
                     ),
-                    "card_last4": {"type": "string", "description": "Exactly 4 digits as printed, or \"\"."},
+                    "card_last4": {
+                        "type": "string",
+                        "description": 'Exactly four digits printed by the source, else "".',
+                    },
                     "order_id": {"type": "string"},
                     "line_items": {
                         "type": "array",
@@ -217,288 +184,169 @@ def enrichment_schema() -> dict[str, Any]:
                     },
                     "summary": {
                         "type": "string",
-                        "description": "One sentence: what was actually bought, as you would want it to read on a bank statement.",
+                        "description": "One factual sentence describing what was bought.",
                     },
-                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "record_confidence": {
+                        "type": "string",
+                        "enum": ["", "high", "medium", "low"],
+                    },
+                    "match_confidence": {
+                        "type": "string",
+                        "enum": ["", "high", "medium", "low"],
+                    },
+                    "match_reason": {
+                        "type": "string",
+                        "description": "Specific evidence connecting this receipt to the transaction.",
+                    },
                 },
             },
-            "decision": {
+            "reasoning": {
                 "type": "string",
-                "enum": [DECISION_MATCHED, DECISION_NO_MATCH, DECISION_NOT_A_PURCHASE, DECISION_INSUFFICIENT],
+                "description": "Concise research summary, at most three sentences.",
             },
-            "matches": {
-                "type": "array",
-                "description": "Empty unless decision is \"matched\". Several entries only when the purchase genuinely settled as several charges.",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["transaction_id", "confidence", "relationship", "why"],
-                    "properties": {
-                        "transaction_id": {"type": "string"},
-                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-                        "relationship": {
-                            "type": "string",
-                            "description": "In your own words, e.g. \"exact\", \"tip added after slip\", \"one of several shipments\".",
-                        },
-                        "why": {"type": "string", "description": "The specific evidence, one sentence."},
-                    },
-                },
-            },
-            "reasoning": {"type": "string", "description": "Three sentences max."},
         },
     }
 
 
-ENRICHMENT_INSTRUCTIONS = """\
-You are enriching Zach's personal finance ledger. Given ONE artifact — a photographed
-receipt, an email, or a document attachment — describe what was purchased and find the
-bank or card transaction that paid for it.
+TRANSACTION_RESEARCH_INSTRUCTIONS = """\
+You are researching ONE ledger transaction. Find its receipt, if one exists in the
+personal data warehouse, and read the receipt in this same operation. The transaction is
+the work item: do not scan the archive to extract unrelated receipts, and do not hand work
+off to a separate extraction step.
 
-You have the `pdw` CLI on PATH, already authenticated for this run, reaching a
-read-only surface. Query with:
+The `pdw` CLI is on PATH and already authenticated to a read-only warehouse surface.
+Use it actively. Start with `pdw schema` and `pdw columns <schema.table>` rather than
+guessing columns. Run SQL with:
 
-    pdw sql -q 'why you are asking' 'SELECT ...'
+    pdw sql --output json -q 'why you are asking' 'SELECT ...'
 
-Add `--output json` if you prefer JSON to CSV. `pdw columns finance.transactions`
-prints exact columns for a relation when you want to confirm one. The tables you need:
+Search both photos and Gmail unless the ledger row is plainly not a purchase/refund:
 
-    finance.transactions  transaction_id, account_id, posted_at, amount, currency,
-                          description, merchant, pending, source
-    finance.accounts      account_id, name, kind, side, institution, mask
+- `search.search_text(query, max_results, sources, since)` searches source text. Its
+  source names include `photo` and `gmail`.
+- `marts.photos` has `photo_id`, `capture_ts`, `caption`, and
+  `thumbnail_storage_file_id`.
+- `gmail.messages` has message metadata and bodies. `gmail.attachments` joins
+  `enrichment.file_attachment_enrichments` by `content_sha256` for extracted attachment
+  text.
+- `receipts.transaction_receipts` shows decisions already made for other transactions.
+  Do not reuse one source receipt for two transactions unless the source itself clearly
+  proves that it covers both (for example, a split settlement).
 
-Reading the document:
-- Copy amounts exactly as printed. Never compute, round, or reconcile them.
-- `total` is the grand total INCLUDING any gratuity line. A slip reading
-  "Purchase 115.00 / Gratuity 11.50 / TOTAL 126.50" has a total of 126.50.
-- Detect the currency from the document itself.
-- Leave `purchased_at` empty rather than inferring it from when the photo was taken or
-  the email arrived.
-- Itemize what the document lists. Never invent an item that is not written down; an
-  empty list is a fine answer, a fabricated one poisons the warehouse.
+Search with several clues, not just one: statement merchant/description tokens, exact
+amount strings, likely order wording, and a date window that allows ordering, shipping,
+posting, and upload lag. A redacted statement merchant is a reason to search harder, not
+to give up. Query focused rows and widen only when evidence warrants it.
 
-Finding the charge — treat these as things to verify, not rules to apply:
-- `amount` is signed; money leaving an account is negative.
-- `posted_at` is a POSTING date, not the purchase date, and the lag varies by account.
-  Some merchants bill at shipment, so an order can post more than a week after it.
-- The last-4 printed on a receipt is the physical card or phone-wallet number, and is
-  frequently NOT `finance.accounts.mask`. Equal values are strong evidence; unequal
-  values are weak evidence, not disproof.
-- A merchant's statement string often differs from how it names itself on a receipt, and
-  some charges arrive with the descriptor redacted entirely.
-- A purchase sometimes settles as several charges, and a restaurant may authorize one
-  amount and settle another.
+For every plausible photo, query its `thumbnail_storage_file_id`, locate it with:
 
-Not every purchase is in this ledger. Zach photographs receipts paid on a work card that
-is not synced here, so if the slip names a card you cannot tie to any account and nothing
-fits, `no_matching_transaction` is the correct and useful answer. Use
-`insufficient_evidence` only when the DOCUMENT is too degraded to read — never because a
-tool call was awkward; the query tool is available, so retry it instead.
+    pdw call get_object --data '{"storage_file_id":"..."}'
 
-Reserve `high` confidence for links you would defend. Everything below `high` is held back
-from the ledger view, so an honest `medium` costs nothing while a confident wrong link is
-expensive.
+Download the returned signed URL and inspect the actual image. Never trust the existing
+photo caption or OCR as authoritative: nearby photos can be duplicate views of one
+receipt, and captions can confidently mistranscribe merchant names, addresses, totals,
+and line items. Reconcile duplicate views into ONE receipt and use the clearest original
+evidence. Likewise, read the full relevant email or extracted attachment rather than
+deciding from a subject/snippet alone.
 
-Choose your own tolerances for THIS purchase: a $4 coffee and a $1,900 flight do not
-deserve the same slack. Query as much as you need, then stop.
+Decision meanings:
 
-Return ONLY a JSON object matching the schema.
+- `receipt_found`: source evidence identifies the purchase and connects it to this exact
+  transaction. Return one consolidated logical receipt, with every supporting source in
+  `evidence`. Reserve `match_confidence=high` for a link you would defend.
+- `no_receipt_found`: this could be a purchase, but a diligent photo and Gmail search
+  found no receipt.
+- `not_receiptable`: the ledger row is plainly a transfer, cash movement, fee, interest,
+  income, or other non-purchase for which a receipt is not expected.
+- `insufficient_evidence`: relevant evidence exists but is degraded or conflicting.
+  Tool awkwardness is not evidence; retry the query instead.
+
+Read amounts exactly from source evidence. Do not compute or reconcile receipt fields.
+The transaction amount is signed (negative is money leaving an account), its timestamp is
+a posting date, and an account mask may differ from the physical or wallet card last four.
+Merchant statement text can differ from the receipt name. Never fabricate a line item,
+source identifier, date, merchant, or total.
+
+When no receipt is found, return every receipt field as an empty string/list. Return ONLY
+a JSON object matching the provided schema.
 """
 
 
-def enrichment_prompt(*, source: str, title: str, observed_at: str, text: str) -> str:
+def transaction_prompt(transaction: Mapping[str, Any]) -> str:
+    transaction_payload = {
+        key: str(transaction.get(key) or "")
+        for key in (
+            "transaction_id",
+            "account_id",
+            "account_name",
+            "account_kind",
+            "institution",
+            "mask",
+            "posted_at",
+            "amount",
+            "currency",
+            "merchant",
+            "description",
+            "source",
+        )
+    }
     return (
-        f"{ENRICHMENT_INSTRUCTIONS}\n"
-        f"---\n"
-        f"Artifact source: {source}\n"
-        f"Artifact title: {title or '(none)'}\n"
-        f"Captured/received at (context only — the purchase may predate this): {observed_at}\n"
-        f"---\n"
-        f"{text}\n"
+        f"{TRANSACTION_RESEARCH_INSTRUCTIONS}\n"
+        "--- transaction to research ---\n"
+        f"{json.dumps(transaction_payload, indent=2, sort_keys=True)}\n"
     )
 
 
-# ---------------------------------------------------------------------------
-# Candidate selection. Time windows only: no opinion about what a receipt is.
-# ---------------------------------------------------------------------------
-
-# Artifacts inside the lookback window with no triage row yet. Photos are only
-# visible once the vision pass has written a caption, which is also what makes
-# their text readable, so an uncaptioned photo is simply not a candidate yet.
-UNTRIAGED_PHOTOS_SQL = """
-SELECT p.photo_id AS native_id,
-       p.capture_ts AS occurred_at,
-       p.caption AS body
-FROM clean_photos AS p
-LEFT JOIN receipt_triage AS t
-    ON t.source = %(source)s AND t.native_id = p.photo_id
-WHERE p.caption <> ''
-  AND p.capture_ts >= %(since)s
-  AND t.native_id IS NULL
-ORDER BY p.capture_ts DESC
-LIMIT %(limit)s
-"""
-
-UNTRIAGED_GMAIL_SQL = """
-SELECT m.message_id AS native_id,
-       m.internal_date AS occurred_at,
-       m.from_address,
-       m.subject,
-       m.snippet
-FROM gmail_messages AS m
-LEFT JOIN receipt_triage AS t
-    ON t.source = %(source)s AND t.native_id = m.message_id
-WHERE m.is_deleted = 0
-  AND m.internal_date >= %(since)s
-  AND t.native_id IS NULL
-ORDER BY m.internal_date DESC
-LIMIT %(limit)s
-"""
-
-UNTRIAGED_GMAIL_ATTACHMENTS_SQL = """
-SELECT a.content_sha256 AS native_id,
-       a.internal_date AS occurred_at,
-       a.filename,
-       m.subject,
-       m.from_address,
-       LEFT(e.text, 400) AS head
-FROM gmail_attachments AS a
-JOIN file_attachment_enrichments AS e
-    ON e.content_sha256 = a.content_sha256
-LEFT JOIN gmail_messages AS m
-    ON m.message_id = a.message_id AND m.account = a.account
-LEFT JOIN receipt_triage AS t
-    ON t.source = %(source)s AND t.native_id = a.content_sha256
-WHERE a.is_deleted = 0
-  AND a.internal_date >= %(since)s
-  AND e.text IS NOT NULL AND e.text <> ''
-  AND t.native_id IS NULL
-ORDER BY a.internal_date DESC
-LIMIT %(limit)s
-"""
-
-# Triaged as a purchase, old enough to have settled, and either never attempted
-# or eligible for its single retry. `settled = 1` means the retry budget is
-# spent and the record is final.
-ENRICHMENT_CANDIDATES_SQL = """
-SELECT t.source,
-       t.native_id,
-       t.occurred_at,
-       r.record_id,
+TRANSACTION_CANDIDATES_SQL = """
+SELECT t.transaction_id,
+       t.account_id,
+       a.name AS account_name,
+       a.kind AS account_kind,
+       a.institution,
+       a.mask,
+       t.posted_at,
+       t.amount,
+       t.currency,
+       t.description,
+       t.merchant,
+       t.source,
        COALESCE(r.attempt_count, 0) AS attempt_count,
        r.last_attempt_at
-FROM receipt_triage AS t
-LEFT JOIN receipt_records AS r
-    ON r.source = t.source AND r.native_id = t.native_id
-WHERE t.verdict IN (%(purchase)s, %(uncertain)s)
-  AND t.occurred_at >= %(since)s
-  AND t.occurred_at <= %(settle_before)s
-  AND COALESCE(r.settled, 0) = 0
+FROM finance_transactions AS t
+JOIN finance_accounts AS a ON a.account_id = t.account_id
+LEFT JOIN receipt_transaction_receipts AS r
+    ON r.transaction_id = t.transaction_id
+WHERE t.posted_at >= %(since)s
+  AND t.pending = 0
   AND (
-        r.record_id IS NULL
-     OR (COALESCE(r.attempt_count, 0) < %(max_attempts)s
-         AND r.last_attempt_at <= %(retry_before)s)
+        r.transaction_id IS NULL
+     OR (
+            r.settled = 0
+        AND r.attempt_count < %(max_attempts)s
+        AND r.last_attempt_at <= %(retry_before)s
+     )
   )
-ORDER BY t.occurred_at DESC
+ORDER BY (r.transaction_id IS NULL) DESC,
+         (t.amount < 0) DESC,
+         t.posted_at DESC,
+         t.transaction_id
 LIMIT %(limit)s
 """
 
-# Full text for one artifact, fetched only once it is worth enriching.
-PHOTO_TEXT_SQL = """
-SELECT p.caption AS text, '' AS title, p.capture_ts AS occurred_at
-FROM clean_photos AS p WHERE p.photo_id = %(native_id)s
-"""
-
-GMAIL_TEXT_SQL = """
-SELECT COALESCE(NULLIF(m.body_markdown_clean, ''), NULLIF(m.body_text, ''), m.snippet) AS text,
-       m.subject AS title,
-       m.internal_date AS occurred_at
-FROM gmail_messages AS m WHERE m.message_id = %(native_id)s LIMIT 1
-"""
-
-GMAIL_ATTACHMENT_TEXT_SQL = """
-SELECT e.text AS text,
-       COALESCE(a.filename, '') AS title,
-       a.internal_date AS occurred_at
-FROM gmail_attachments AS a
-JOIN file_attachment_enrichments AS e ON e.content_sha256 = a.content_sha256
-WHERE a.content_sha256 = %(native_id)s
-ORDER BY a.internal_date DESC
-LIMIT 1
-"""
-
-
-@dataclass(frozen=True)
-class TriageCandidate:
-    source: str
-    native_id: str
-    occurred_at: datetime
-    descriptor: str
-    kind: str
-
-    @property
-    def artifact_id(self) -> str:
-        return f"{self.source}:{self.native_id}"
-
-
-@dataclass(frozen=True)
-class EnrichmentSummary:
-    triaged: int = 0
-    purchase_records: int = 0
-    enriched: int = 0
-    matched: int = 0
-    trusted_links: int = 0
-    settled: int = 0
-    failed: int = 0
-    triage_batches: int = 0
-    usage: dict[str, int] = field(default_factory=dict)
-
-    def as_metadata(self) -> dict[str, Any]:
-        return {
-            "triaged": self.triaged,
-            "purchase_records": self.purchase_records,
-            "enriched": self.enriched,
-            "matched": self.matched,
-            "trusted_links": self.trusted_links,
-            "settled": self.settled,
-            "failed": self.failed,
-            "triage_batches": self.triage_batches,
-            **{f"tokens_{key}": value for key, value in sorted(self.usage.items())},
-        }
-
-
-def photo_descriptor(row: Mapping[str, Any]) -> str:
-    """The caption's own header lines — enough to judge, far short of the whole OCR."""
-    caption = str(row.get("body") or "")
-    keep: list[str] = []
-    for line in caption.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        lowered = stripped.lower()
-        if lowered.startswith(("document type:", "summary:")):
-            keep.append(stripped)
-        if len(keep) >= 2:
-            break
-    if not keep:
-        keep.append(caption[:200])
-    return "\n".join(keep)[:400]
-
-
-def gmail_descriptor(row: Mapping[str, Any]) -> str:
-    return (
-        f"from: {row.get('from_address') or ''}\n"
-        f"subject: {row.get('subject') or ''}\n"
-        f"snippet: {str(row.get('snippet') or '')[:240]}"
-    )
-
-
-def attachment_descriptor(row: Mapping[str, Any]) -> str:
-    return (
-        f"filename: {row.get('filename') or ''}\n"
-        f"email subject: {row.get('subject') or ''}\n"
-        f"from: {row.get('from_address') or ''}\n"
-        f"opening text: {str(row.get('head') or '')[:240]}"
-    )
+_EVIDENCE_SQL_BY_SOURCE = {
+    SOURCE_PHOTO: (
+        "SELECT photo_id AS native_id FROM clean_photos "
+        "WHERE photo_id = ANY(%s)"
+    ),
+    SOURCE_GMAIL_MESSAGE: (
+        "SELECT message_id AS native_id FROM gmail_messages "
+        "WHERE message_id = ANY(%s) AND is_deleted = 0"
+    ),
+    SOURCE_GMAIL_ATTACHMENT: (
+        "SELECT content_sha256 AS native_id FROM gmail_attachments "
+        "WHERE content_sha256 = ANY(%s) AND is_deleted = 0"
+    ),
+}
 
 
 def usage_from_events(events: Sequence[Any]) -> dict[str, int]:
@@ -524,62 +372,15 @@ def merge_usage(into: dict[str, int], extra: Mapping[str, int]) -> dict[str, int
     return into
 
 
-def triage_rows(
-    verdicts: Sequence[Mapping[str, Any]],
-    *,
-    candidates: Mapping[str, TriageCandidate],
-    provider: str,
-    model: str,
-    agent_run_id: str,
-    decided_at: datetime | None = None,
-) -> list[dict[str, Any]]:
-    """Turn one triage response into rows, ignoring ids we did not ask about.
-
-    Batched responses occasionally echo an id more than once; the first verdict
-    wins so a repeat cannot flip an artifact's fate.
-    """
-    decided = decided_at or datetime.now(UTC)
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for verdict in verdicts:
-        artifact_id = str(verdict.get("artifact_id") or "")
-        candidate = candidates.get(artifact_id)
-        if candidate is None or artifact_id in seen:
-            continue
-        seen.add(artifact_id)
-        rows.append(
-            {
-                "source": candidate.source,
-                "native_id": candidate.native_id,
-                "occurred_at": candidate.occurred_at,
-                "verdict": str(verdict.get("verdict") or VERDICT_UNCERTAIN),
-                "reason": str(verdict.get("reason") or "")[:500],
-                "ai_provider": provider,
-                "ai_model": model,
-                "ai_prompt_version": TRIAGE_PROMPT_VERSION,
-                "agent_run_id": agent_run_id,
-                "decided_at": decided,
-                "sync_version": sync_version_for(decided),
-            }
-        )
-    return rows
-
-
-# The warehouse stores no NULLs: every column is NOT NULL with a sentinel
-# default. So "the document did not print a subtotal" is stored as 0 and "no
-# date printed" as the epoch, and the marts views map those sentinels back to
-# NULL so the read surface can still tell absent from zero.
-ABSENT_MONEY = "0"
-ABSENT_DATE = "1970-01-01"
-
-
 def _decimal_or_absent(value: Any) -> str:
     text = str(value or "").replace("$", "").replace(",", "").strip()
     if not text:
         return ABSENT_MONEY
     try:
-        float(text)
-    except ValueError:
+        parsed = Decimal(text)
+    except InvalidOperation:
+        return ABSENT_MONEY
+    if not parsed.is_finite():
         return ABSENT_MONEY
     return text
 
@@ -595,14 +396,56 @@ def _date_or_absent(value: Any) -> str:
     return text
 
 
-def record_row(
+def _validated_evidence(
+    receipt: Mapping[str, Any],
+    known_evidence: set[tuple[str, str]],
+) -> tuple[list[dict[str, str]], tuple[str, str]]:
+    validated: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    raw_evidence = receipt.get("evidence")
+    if isinstance(raw_evidence, Sequence) and not isinstance(raw_evidence, (str, bytes)):
+        for item in raw_evidence:
+            if not isinstance(item, Mapping):
+                continue
+            pair = (
+                str(item.get("source") or "").strip(),
+                str(item.get("native_id") or "").strip(),
+            )
+            if pair not in known_evidence or pair in seen:
+                continue
+            seen.add(pair)
+            validated.append(
+                {
+                    "source": pair[0],
+                    "native_id": pair[1],
+                    "role": str(item.get("role") or "")[:100],
+                    "why": str(item.get("why") or "")[:1000],
+                }
+            )
+    primary = (
+        str(receipt.get("primary_source") or "").strip(),
+        str(receipt.get("primary_native_id") or "").strip(),
+    )
+    if primary in known_evidence and primary not in seen:
+        validated.insert(
+            0,
+            {
+                "source": primary[0],
+                "native_id": primary[1],
+                "role": "primary",
+                "why": "Primary source evidence.",
+            },
+        )
+    return validated, primary
+
+
+def transaction_receipt_row(
     result: Mapping[str, Any],
     *,
-    source: str,
-    native_id: str,
-    occurred_at: datetime,
+    transaction: Mapping[str, Any],
     attempt_count: int,
     max_attempts: int,
+    known_evidence: set[tuple[str, str]],
     provider: str,
     model: str,
     agent_run_id: str,
@@ -610,48 +453,78 @@ def record_row(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     stamp = now or datetime.now(UTC)
-    receipt = result.get("receipt") if isinstance(result.get("receipt"), Mapping) else {}
+    raw_receipt = result.get("receipt")
+    receipt = raw_receipt if isinstance(raw_receipt, Mapping) else {}
+    evidence, primary = _validated_evidence(receipt, known_evidence)
     decision = str(result.get("decision") or DECISION_INSUFFICIENT)
-    is_purchase = bool(result.get("is_purchase_record"))
+    if decision not in DECISIONS:
+        decision = DECISION_INSUFFICIENT
+
+    sources_searched = []
+    raw_sources = result.get("sources_searched")
+    if isinstance(raw_sources, Sequence) and not isinstance(raw_sources, (str, bytes)):
+        sources_searched = list(
+            dict.fromkeys(
+                str(source)
+                for source in raw_sources
+                if str(source) in EVIDENCE_SOURCES
+            )
+        )
+
+    trusted_receipt = (
+        decision == DECISION_FOUND
+        and primary in known_evidence
+        and str(receipt.get("record_confidence") or "").lower() == TRUSTED_CONFIDENCE
+        and str(receipt.get("match_confidence") or "").lower() == TRUSTED_CONFIDENCE
+    )
+    if decision == DECISION_FOUND and not trusted_receipt:
+        decision = DECISION_INSUFFICIENT
+    if decision == DECISION_NOT_FOUND and not {
+        SOURCE_PHOTO,
+        SOURCE_GMAIL_MESSAGE,
+    }.issubset(sources_searched):
+        decision = DECISION_INSUFFICIENT
+
+    publish = receipt if trusted_receipt else {}
     attempts = attempt_count + 1
-    # A record stops being retried when it matched, when the agent said it is
-    # not a purchase at all, or when its one retry is spent. Everything else
-    # gets exactly one more look a week later.
     settled = (
-        decision == DECISION_MATCHED
-        or decision == DECISION_NOT_A_PURCHASE
-        or not is_purchase
+        decision in {DECISION_FOUND, DECISION_NOT_RECEIPTABLE}
         or attempts >= max_attempts
     )
+    transaction_id = str(transaction.get("transaction_id") or "")
     return {
-        "record_id": record_id_for(source, native_id),
-        "source": source,
-        "native_id": native_id,
-        "occurred_at": occurred_at,
-        "purchased_at": _date_or_absent(receipt.get("purchased_at")),
-        "merchant_name": str(receipt.get("merchant_name") or ""),
-        "merchant_location": str(receipt.get("merchant_location") or ""),
-        "currency": str(receipt.get("currency") or "").upper(),
-        "total": _decimal_or_absent(receipt.get("total")),
-        "subtotal": _decimal_or_absent(receipt.get("subtotal")),
-        "tax": _decimal_or_absent(receipt.get("tax")),
-        "tip": _decimal_or_absent(receipt.get("tip")),
-        "amount_charged": _decimal_or_absent(receipt.get("amount_charged_to_card")),
-        "card_last4": str(receipt.get("card_last4") or ""),
-        "order_id": str(receipt.get("order_id") or ""),
-        "line_items_json": json.dumps(receipt.get("line_items") or [], sort_keys=True, default=str),
-        "summary": str(receipt.get("summary") or ""),
-        "record_confidence": str(receipt.get("confidence") or ""),
-        "is_purchase_record": 1 if is_purchase else 0,
+        "transaction_id": transaction_id,
+        "record_id": record_id_for(transaction_id) if trusted_receipt else "",
         "decision": decision,
         "reasoning": str(result.get("reasoning") or "")[:2000],
+        "sources_searched_json": json.dumps(sources_searched, sort_keys=True),
+        "primary_source": primary[0] if trusted_receipt else "",
+        "primary_native_id": primary[1] if trusted_receipt else "",
+        "evidence_json": json.dumps(evidence if trusted_receipt else [], sort_keys=True),
+        "occurred_at": transaction.get("posted_at") or stamp,
+        "purchased_at": _date_or_absent(publish.get("purchased_at")),
+        "merchant_name": str(publish.get("merchant_name") or ""),
+        "merchant_location": str(publish.get("merchant_location") or ""),
+        "currency": str(publish.get("currency") or "").upper(),
+        "total": _decimal_or_absent(publish.get("total")),
+        "subtotal": _decimal_or_absent(publish.get("subtotal")),
+        "tax": _decimal_or_absent(publish.get("tax")),
+        "tip": _decimal_or_absent(publish.get("tip")),
+        "amount_charged": _decimal_or_absent(publish.get("amount_charged_to_card")),
+        "card_last4": str(publish.get("card_last4") or ""),
+        "order_id": str(publish.get("order_id") or ""),
+        "line_items_json": json.dumps(publish.get("line_items") or [], sort_keys=True),
+        "summary": str(publish.get("summary") or ""),
+        "record_confidence": str(publish.get("record_confidence") or ""),
+        "match_confidence": str(publish.get("match_confidence") or ""),
+        "match_reason": str(publish.get("match_reason") or "")[:1000],
         "attempt_count": attempts,
         "last_attempt_at": stamp,
         "settled": 1 if settled else 0,
         "raw_result_json": json.dumps(result, sort_keys=True, default=str),
         "ai_provider": provider,
         "ai_model": model,
-        "ai_prompt_version": ENRICHMENT_PROMPT_VERSION,
+        "ai_prompt_version": PROMPT_VERSION,
         "ai_elapsed_ms": elapsed_ms,
         "ai_processed_at": stamp,
         "agent_run_id": agent_run_id,
@@ -661,84 +534,32 @@ def record_row(
     }
 
 
-def link_rows(
-    result: Mapping[str, Any],
-    *,
-    record_id: str,
-    agent_run_id: str,
-    known_transaction_ids: set[str] | None = None,
-    now: datetime | None = None,
-) -> list[dict[str, Any]]:
-    """Link rows for one enrichment result.
+@dataclass(frozen=True)
+class EnrichmentSummary:
+    candidates: int = 0
+    researched: int = 0
+    receipts_found: int = 0
+    not_found: int = 0
+    not_receiptable: int = 0
+    insufficient: int = 0
+    failed: int = 0
+    usage: dict[str, int] = field(default_factory=dict)
 
-    Only `high` confidence is persisted: on the benchmark sample every
-    high-confidence link was exact to the cent, and every mistake the agent made
-    was one it had already flagged as `medium`. Lower-confidence guesses stay
-    visible in `records.raw_result_json` without entering the ledger view.
-
-    `known_transaction_ids`, when supplied, drops ids that are not real rows —
-    an agent that hallucinates an id should not create a dangling link.
-    """
-    stamp = now or datetime.now(UTC)
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    if str(result.get("decision") or "") != DECISION_MATCHED:
-        return rows
-    for match in result.get("matches") or []:
-        if not isinstance(match, Mapping):
-            continue
-        transaction_id = str(match.get("transaction_id") or "").strip()
-        confidence = str(match.get("confidence") or "").lower()
-        if not transaction_id or transaction_id in seen:
-            continue
-        if confidence != TRUSTED_LINK_CONFIDENCE:
-            continue
-        if known_transaction_ids is not None and transaction_id not in known_transaction_ids:
-            continue
-        seen.add(transaction_id)
-        rows.append(
-            {
-                "record_id": record_id,
-                "transaction_id": transaction_id,
-                "confidence": confidence,
-                "relationship": str(match.get("relationship") or "")[:200],
-                "why": str(match.get("why") or "")[:1000],
-                "ai_prompt_version": ENRICHMENT_PROMPT_VERSION,
-                "agent_run_id": agent_run_id,
-                "created_at": stamp,
-                "sync_version": sync_version_for(stamp),
-            }
-        )
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-
-DEFAULT_LOOKBACK_DAYS = 30
-DEFAULT_SETTLE_DAYS = 2
-DEFAULT_RETRY_AFTER_DAYS = 7
-DEFAULT_MAX_ATTEMPTS = 2
-DEFAULT_TRIAGE_BATCH_SIZE = 100
-DEFAULT_TRIAGE_ARTIFACT_LIMIT = 1_000
-DEFAULT_ENRICHMENT_LIMIT = 40
-DEFAULT_ENRICHMENT_TEXT_CHARS = 14_000
-
-_TEXT_SQL_BY_SOURCE = {
-    SOURCE_PHOTO: PHOTO_TEXT_SQL,
-    SOURCE_GMAIL_MESSAGE: GMAIL_TEXT_SQL,
-    SOURCE_GMAIL_ATTACHMENT: GMAIL_ATTACHMENT_TEXT_SQL,
-}
+    def as_metadata(self) -> dict[str, Any]:
+        return {
+            "candidates": self.candidates,
+            "researched": self.researched,
+            "receipts_found": self.receipts_found,
+            "not_found": self.not_found,
+            "not_receiptable": self.not_receiptable,
+            "insufficient": self.insufficient,
+            "failed": self.failed,
+            **{f"tokens_{key}": value for key, value in sorted(self.usage.items())},
+        }
 
 
 class ReceiptEnrichmentRunner:
-    """Triage artifacts, then enrich the ones that are purchases.
-
-    Both stages are bounded by a lookback window so a first run in production
-    cannot walk the entire archive, and every artifact is triaged exactly once
-    so cost is proportional to what is new.
-    """
+    """Research recent ledger transactions with one PDW-enabled agent each."""
 
     def __init__(
         self,
@@ -749,13 +570,9 @@ class ReceiptEnrichmentRunner:
         provider: str,
         model: str,
         lookback_days: int = DEFAULT_LOOKBACK_DAYS,
-        settle_days: int = DEFAULT_SETTLE_DAYS,
         retry_after_days: int = DEFAULT_RETRY_AFTER_DAYS,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-        triage_batch_size: int = DEFAULT_TRIAGE_BATCH_SIZE,
-        triage_artifact_limit: int = DEFAULT_TRIAGE_ARTIFACT_LIMIT,
-        enrichment_limit: int = DEFAULT_ENRICHMENT_LIMIT,
-        text_chars: int = DEFAULT_ENRICHMENT_TEXT_CHARS,
+        transaction_limit: int = DEFAULT_TRANSACTION_LIMIT,
         now: datetime | None = None,
     ) -> None:
         self._warehouse = warehouse
@@ -763,235 +580,130 @@ class ReceiptEnrichmentRunner:
         self._log = logger
         self._provider = provider
         self._model = model
-        self._lookback_days = lookback_days
-        self._settle_days = settle_days
+        # This pipeline is intentionally hard-capped at 30 days. A caller may
+        # choose a smaller diagnostic window, but configuration cannot turn it
+        # into an archive scan.
+        self._lookback_days = min(max(1, lookback_days), DEFAULT_LOOKBACK_DAYS)
         self._retry_after_days = retry_after_days
         self._max_attempts = max_attempts
-        self._triage_batch_size = max(1, triage_batch_size)
-        self._triage_artifact_limit = triage_artifact_limit
-        self._enrichment_limit = enrichment_limit
-        self._text_chars = text_chars
+        self._transaction_limit = max(1, transaction_limit)
         self._now = now
-
-    # -- helpers ----------------------------------------------------------
 
     def _clock(self) -> datetime:
         return self._now or datetime.now(UTC)
 
-    def _since(self) -> datetime:
-        from datetime import timedelta
-
-        return self._clock() - timedelta(days=self._lookback_days)
-
-    def sync(self) -> EnrichmentSummary:
-        from personal_data_warehouse.agent_runner import AgentRunRequest  # local: keeps import graph light
-
-        self._warehouse.ensure_receipt_tables()
-        usage: dict[str, int] = {}
-        triaged, purchases, batches = self._triage(AgentRunRequest, usage)
-        enriched, matched, trusted, settled, failed = self._enrich(AgentRunRequest, usage)
-        return EnrichmentSummary(
-            triaged=triaged,
-            purchase_records=purchases,
-            enriched=enriched,
-            matched=matched,
-            trusted_links=trusted,
-            settled=settled,
-            failed=failed,
-            triage_batches=batches,
-            usage=usage,
-        )
-
-    # -- stage 1 ----------------------------------------------------------
-
-    def _triage_candidates(self) -> list[TriageCandidate]:
-        since = self._since()
-        limit = self._triage_artifact_limit
-        out: list[TriageCandidate] = []
-        for source, sql, descriptor, kind in (
-            (SOURCE_PHOTO, UNTRIAGED_PHOTOS_SQL, photo_descriptor, "photo"),
-            (SOURCE_GMAIL_MESSAGE, UNTRIAGED_GMAIL_SQL, gmail_descriptor, "email"),
-            (SOURCE_GMAIL_ATTACHMENT, UNTRIAGED_GMAIL_ATTACHMENTS_SQL, attachment_descriptor, "attachment"),
-        ):
-            rows = self._warehouse._query_dicts(
-                sql, {"source": source, "since": since, "limit": limit}
-            )
-            for row in rows:
-                out.append(
-                    TriageCandidate(
-                        source=source,
-                        native_id=str(row["native_id"]),
-                        occurred_at=row["occurred_at"],
-                        descriptor=descriptor(row),
-                        kind=kind,
-                    )
-                )
-        return out
-
-    def _triage(self, request_cls, usage: dict[str, int]) -> tuple[int, int, int]:
-        candidates = self._triage_candidates()
-        if not candidates:
-            return 0, 0, 0
-        self._log.info(f"receipt triage: {len(candidates)} untriaged artifacts in the window")
-
-        triaged = purchases = batches = 0
-        for start in range(0, len(candidates), self._triage_batch_size):
-            batch = candidates[start : start + self._triage_batch_size]
-            by_id = {candidate.artifact_id: candidate for candidate in batch}
-            prompt = triage_prompt(
-                [
-                    {
-                        "artifact_id": candidate.artifact_id,
-                        "kind": candidate.kind,
-                        "occurred_at": candidate.occurred_at,
-                        "descriptor": candidate.descriptor,
-                    }
-                    for candidate in batch
-                ]
-            )
-            request = request_cls(
-                prompt=prompt,
-                schema=triage_schema(),
-                task_type="receipt_triage",
-                subject_id=f"batch-{start // self._triage_batch_size}",
-                prompt_version=TRIAGE_PROMPT_VERSION,
-            )
-            result = self._agent.run(request)
-            batches += 1
-            merge_usage(usage, usage_from_events(result.events))
-            if result.exit_code != 0:
-                self._log.warning(f"receipt triage batch failed: {result.error}")
-                continue
-            rows = triage_rows(
-                (result.final_output_json or {}).get("verdicts") or [],
-                candidates=by_id,
-                provider=self._provider,
-                model=self._model,
-                agent_run_id=request.run_id,
-                decided_at=self._clock(),
-            )
-            # An artifact the model silently dropped stays untriaged and is
-            # simply picked up next run; never guess a verdict for it.
-            self._warehouse.insert_receipt_triage(rows)
-            triaged += len(rows)
-            purchases += sum(1 for row in rows if row["verdict"] == VERDICT_PURCHASE)
-        return triaged, purchases, batches
-
-    # -- stage 2 ----------------------------------------------------------
-
-    def _enrichment_candidates(self) -> list[dict[str, Any]]:
-        from datetime import timedelta
-
+    def _candidates(self) -> list[dict[str, Any]]:
         now = self._clock()
         return self._warehouse._query_dicts(
-            ENRICHMENT_CANDIDATES_SQL,
+            TRANSACTION_CANDIDATES_SQL,
             {
-                "purchase": VERDICT_PURCHASE,
-                "uncertain": VERDICT_UNCERTAIN,
-                "since": self._since(),
-                # settle before the first look: the charge may not have posted
-                "settle_before": now - timedelta(days=self._settle_days),
+                "since": now - timedelta(days=self._lookback_days),
                 "retry_before": now - timedelta(days=self._retry_after_days),
                 "max_attempts": self._max_attempts,
-                "limit": self._enrichment_limit,
+                "limit": self._transaction_limit,
             },
         )
 
-    def _artifact_text(self, source: str, native_id: str) -> dict[str, Any] | None:
-        sql = _TEXT_SQL_BY_SOURCE.get(source)
-        if sql is None:
-            return None
-        rows = self._warehouse._query_dicts(sql, {"native_id": native_id})
-        return rows[0] if rows else None
+    @staticmethod
+    def _claimed_evidence(result: Mapping[str, Any]) -> dict[str, set[str]]:
+        claimed = {source: set() for source in EVIDENCE_SOURCES}
+        receipt = result.get("receipt")
+        if not isinstance(receipt, Mapping):
+            return claimed
+        primary_source = str(receipt.get("primary_source") or "")
+        primary_id = str(receipt.get("primary_native_id") or "")
+        if primary_source in claimed and primary_id:
+            claimed[primary_source].add(primary_id)
+        evidence = receipt.get("evidence")
+        if isinstance(evidence, Sequence) and not isinstance(evidence, (str, bytes)):
+            for item in evidence:
+                if not isinstance(item, Mapping):
+                    continue
+                source = str(item.get("source") or "")
+                native_id = str(item.get("native_id") or "")
+                if source in claimed and native_id:
+                    claimed[source].add(native_id)
+        return claimed
 
-    def _enrich(self, request_cls, usage: dict[str, int]) -> tuple[int, int, int, int, int]:
-        candidates = self._enrichment_candidates()
-        if not candidates:
-            return 0, 0, 0, 0, 0
-        self._log.info(f"receipt enrichment: {len(candidates)} records due")
-
-        enriched = matched = trusted = settled = failed = 0
-        for candidate in candidates:
-            source = str(candidate["source"])
-            native_id = str(candidate["native_id"])
-            artifact = self._artifact_text(source, native_id)
-            if artifact is None or not str(artifact.get("text") or "").strip():
-                self._log.warning(f"receipt enrichment: no text for {source}:{native_id}")
-                failed += 1
+    def _known_evidence(self, result: Mapping[str, Any]) -> set[tuple[str, str]]:
+        known: set[tuple[str, str]] = set()
+        for source, native_ids in self._claimed_evidence(result).items():
+            if not native_ids:
                 continue
+            rows = self._warehouse._query_dicts(
+                _EVIDENCE_SQL_BY_SOURCE[source],
+                (sorted(native_ids),),
+            )
+            known.update(
+                (source, str(row["native_id"]))
+                for row in rows
+                if str(row.get("native_id") or "")
+            )
+        return known
 
-            occurred_at = candidate["occurred_at"] or artifact.get("occurred_at")
-            prompt = enrichment_prompt(
-                source=source,
-                title=str(artifact.get("title") or ""),
-                observed_at=str(occurred_at),
-                text=str(artifact["text"])[: self._text_chars],
+    def sync(self) -> EnrichmentSummary:
+        from personal_data_warehouse.agent_runner import AgentRunRequest
+
+        self._warehouse.ensure_receipt_tables()
+        candidates = self._candidates()
+        if not candidates:
+            return EnrichmentSummary()
+        self._log.info(
+            f"receipt transaction research: {len(candidates)} recent posted transactions due"
+        )
+
+        researched = receipts_found = not_found = not_receiptable = insufficient = failed = 0
+        usage: dict[str, int] = {}
+        for transaction in candidates:
+            transaction_id = str(transaction["transaction_id"])
+            request = AgentRunRequest(
+                prompt=transaction_prompt(transaction),
+                schema=transaction_schema(),
+                task_type="receipt_transaction_match",
+                subject_id=transaction_id,
+                prompt_version=PROMPT_VERSION,
             )
-            request = request_cls(
-                prompt=prompt,
-                schema=enrichment_schema(),
-                task_type="receipt_enrichment",
-                subject_id=f"{source}:{native_id}",
-                prompt_version=ENRICHMENT_PROMPT_VERSION,
-            )
-            started = self._clock()
+            started = time.monotonic()
             result = self._agent.run_with_pdw(request)
             merge_usage(usage, usage_from_events(result.events))
             if result.exit_code != 0:
-                # Leave the record untouched so the next run retries it; a
-                # container failure is not evidence about the receipt.
-                self._log.warning(f"receipt enrichment failed for {source}:{native_id}: {result.error}")
+                self._log.warning(
+                    f"receipt transaction research failed for {transaction_id}: {result.error}"
+                )
                 failed += 1
                 continue
 
             payload = result.final_output_json or {}
-            elapsed_ms = int((self._clock() - started).total_seconds() * 1000)
-            row = record_row(
+            row = transaction_receipt_row(
                 payload,
-                source=source,
-                native_id=native_id,
-                occurred_at=occurred_at,
-                attempt_count=int(candidate.get("attempt_count") or 0),
+                transaction=transaction,
+                attempt_count=int(transaction.get("attempt_count") or 0),
                 max_attempts=self._max_attempts,
+                known_evidence=self._known_evidence(payload),
                 provider=self._provider,
                 model=self._model,
                 agent_run_id=request.run_id,
-                elapsed_ms=elapsed_ms,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
                 now=self._clock(),
             )
-            self._warehouse.insert_receipt_records([row])
-            enriched += 1
-            settled += row["settled"]
-            if row["decision"] == DECISION_MATCHED:
-                matched += 1
+            self._warehouse.insert_receipt_transaction_receipts([row])
+            researched += 1
+            if row["decision"] == DECISION_FOUND:
+                receipts_found += 1
+            elif row["decision"] == DECISION_NOT_FOUND:
+                not_found += 1
+            elif row["decision"] == DECISION_NOT_RECEIPTABLE:
+                not_receiptable += 1
+            else:
+                insufficient += 1
 
-            links = link_rows(
-                payload,
-                record_id=row["record_id"],
-                agent_run_id=request.run_id,
-                known_transaction_ids=self._known_transaction_ids(payload),
-                now=self._clock(),
-            )
-            if links:
-                self._warehouse.insert_receipt_transaction_links(links)
-                trusted += len(links)
-        return enriched, matched, trusted, settled, failed
-
-    def _known_transaction_ids(self, payload: Mapping[str, Any]) -> set[str]:
-        """Which of the claimed transaction ids actually exist.
-
-        An agent that invents an id would otherwise create a link pointing at
-        nothing, which reads as a real match in the mart view.
-        """
-        claimed = [
-            str(match.get("transaction_id") or "").strip()
-            for match in (payload.get("matches") or [])
-            if isinstance(match, Mapping) and str(match.get("transaction_id") or "").strip()
-        ]
-        if not claimed:
-            return set()
-        rows = self._warehouse._query_dicts(
-            "SELECT transaction_id FROM finance_transactions WHERE transaction_id = ANY(%s)",
-            (claimed,),
+        return EnrichmentSummary(
+            candidates=len(candidates),
+            researched=researched,
+            receipts_found=receipts_found,
+            not_found=not_found,
+            not_receiptable=not_receiptable,
+            insufficient=insufficient,
+            failed=failed,
+            usage=usage,
         )
-        return {str(row["transaction_id"]) for row in rows}
