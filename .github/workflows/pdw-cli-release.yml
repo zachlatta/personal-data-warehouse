@@ -14,6 +14,7 @@ on:
       - "app/internal/tool/**"
       - "app/internal/api/**"
       - "app/internal/auth/**"
+      - "app/internal/warehouse/**"
       - "app/go.mod"
       - "app/go.sum"
   pull_request:
@@ -22,6 +23,7 @@ on:
       - "app/cmd/pdw-cli/**"
       - "app/internal/cliclient/**"
       - "app/internal/selfupdate/**"
+      - "app/internal/warehouse/**"
       - "app/go.mod"
       - "app/go.sum"
   workflow_dispatch:

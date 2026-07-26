@@ -121,6 +121,17 @@ func TestWorkflowReleasesOnEveryMainCommit(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunsWhenWarehouseSchemasChange(t *testing.T) {
+	body := readWorkflow(t)
+	const warehousePath = `"app/internal/warehouse/**"`
+	if strings.Count(body, warehousePath) != 2 {
+		t.Fatalf(
+			"workflow must include %s in both push and pull_request path filters",
+			warehousePath,
+		)
+	}
+}
+
 func TestWorkflowAlsoReleasesOnPDWCLITags(t *testing.T) {
 	body := readWorkflow(t)
 	// Manually-cut tagged releases keep working alongside per-commit ones.
