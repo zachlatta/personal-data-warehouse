@@ -237,12 +237,39 @@ def test_prompt_change_requeues_recent_rows_before_unresearched_transactions():
     )
 
     assert captured["prompt_version"] == PROMPT_VERSION
-    assert "r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s" in candidate_sql
+    assert captured["found_decision"] == DECISION_FOUND
+    assert "brokerage" in captured["non_retail_account_kinds"]
+    assert "r.decision IS DISTINCT FROM %(found_decision)s" in candidate_sql
+    assert "a.kind = ANY(%(non_retail_account_kinds)s)" in candidate_sql
     assert (
         "r.transaction_id IS NOT NULL\n"
-        "              AND r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s"
+        "              AND r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s\n"
+        "              AND"
         in candidate_sql
     )
+
+
+def test_prompt_change_starts_a_fresh_negative_retry_budget():
+    result = {
+        "decision": DECISION_NOT_FOUND,
+        "sources_searched": [SOURCE_PHOTO, SOURCE_GMAIL_MESSAGE],
+        "receipt": {},
+        "reasoning": "No relevant source evidence found.",
+    }
+    warehouse = FakeWarehouse(
+        {
+            "FROM finance_transactions AS t": [
+                _transaction(
+                    attempt_count=2,
+                    prior_prompt_version="receipt-transaction-research-old",
+                )
+            ]
+        }
+    )
+    _runner(warehouse, FakeAgent(result)).sync()
+
+    assert warehouse.rows[0]["attempt_count"] == 1
+    assert warehouse.rows[0]["settled"] == 0
 
 
 def test_agent_failure_leaves_transaction_unwritten_for_next_run():

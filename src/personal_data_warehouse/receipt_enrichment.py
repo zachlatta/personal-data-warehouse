@@ -23,7 +23,7 @@ import json
 import time
 from typing import Any
 
-PROMPT_VERSION = "receipt-transaction-research-v3"
+PROMPT_VERSION = "receipt-transaction-research-v4"
 
 DECISION_FOUND = "receipt_found"
 DECISION_NOT_FOUND = "no_receipt_found"
@@ -334,7 +334,8 @@ SELECT t.transaction_id,
        t.merchant,
        t.source,
        COALESCE(r.attempt_count, 0) AS attempt_count,
-       r.last_attempt_at
+       r.last_attempt_at,
+       r.ai_prompt_version AS prior_prompt_version
 FROM finance_transactions AS t
 JOIN finance_accounts AS a ON a.account_id = t.account_id
 LEFT JOIN receipt_transaction_receipts AS r
@@ -343,7 +344,16 @@ WHERE t.posted_at >= %(since)s
   AND t.pending = 0
   AND (
         r.transaction_id IS NULL
-     OR r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s
+     OR (
+            r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s
+        AND (
+               r.decision IS DISTINCT FROM %(found_decision)s
+            OR (
+                   a.kind = ANY(%(non_retail_account_kinds)s)
+               AND BTRIM(COALESCE(t.merchant, '')) = ''
+            )
+        )
+     )
      OR (
             r.settled = 0
         AND r.attempt_count < %(max_attempts)s
@@ -351,7 +361,14 @@ WHERE t.posted_at >= %(since)s
      )
   )
 ORDER BY (r.transaction_id IS NOT NULL
-              AND r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s) DESC,
+              AND r.ai_prompt_version IS DISTINCT FROM %(prompt_version)s
+              AND (
+                     r.decision IS DISTINCT FROM %(found_decision)s
+                  OR (
+                         a.kind = ANY(%(non_retail_account_kinds)s)
+                     AND BTRIM(COALESCE(t.merchant, '')) = ''
+                  )
+              )) DESC,
          (r.transaction_id IS NULL) DESC,
          (t.amount < 0) DESC,
          t.posted_at DESC,
@@ -641,6 +658,8 @@ class ReceiptEnrichmentRunner:
                 "retry_before": now - timedelta(days=self._retry_after_days),
                 "max_attempts": self._max_attempts,
                 "prompt_version": PROMPT_VERSION,
+                "found_decision": DECISION_FOUND,
+                "non_retail_account_kinds": sorted(NON_RETAIL_ACCOUNT_KINDS),
                 "limit": self._transaction_limit,
             },
         )
@@ -718,7 +737,11 @@ class ReceiptEnrichmentRunner:
             row = transaction_receipt_row(
                 payload,
                 transaction=transaction,
-                attempt_count=int(transaction.get("attempt_count") or 0),
+                attempt_count=(
+                    int(transaction.get("attempt_count") or 0)
+                    if str(transaction.get("prior_prompt_version") or "") == PROMPT_VERSION
+                    else 0
+                ),
                 max_attempts=self._max_attempts,
                 known_evidence=self._known_evidence(payload),
                 provider=self._provider,
