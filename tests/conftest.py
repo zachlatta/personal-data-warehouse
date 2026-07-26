@@ -32,7 +32,7 @@ def cleanup_test_warehouse(warehouse: PostgresWarehouse) -> None:
     """Drop every schema owned by a test warehouse, then close it."""
     try:
         schema_names = [
-            *warehouse.physical_schema_names(include_private=True),
+            *warehouse.physical_schema_names(include_hidden=True),
             warehouse.schema_namespace,
         ]
         for schema_name in schema_names:

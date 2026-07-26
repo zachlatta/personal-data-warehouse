@@ -31,7 +31,7 @@ def photo_enrichment_context(warehouse, candidate: Mapping[str, Any]) -> dict[st
     rows = warehouse._query_dicts(
         """
         SELECT capture_ts, capture_tz_offset, latitude, longitude, camera_make, camera_model
-        FROM photo_assets
+        FROM @photo_assets
         WHERE photo_id = %s
         """,
         (photo_id,),
@@ -96,7 +96,7 @@ def _calendar_events_near(warehouse, capture_ts: datetime) -> list[dict[str, Any
     rows = warehouse._query(
         f"""
         SELECT event_id, summary, start_at, end_at, location
-        FROM calendar_events
+        FROM @calendar_events
         WHERE start_at <= %s::timestamptz + INTERVAL '{CALENDAR_WINDOW_HOURS} hours'
           AND end_at >= %s::timestamptz - INTERVAL '{CALENDAR_WINDOW_HOURS} hours'
           AND is_deleted = 0

@@ -996,7 +996,7 @@ usage; the commands available to an agent run are:
 
 ```bash
 pdw schema                                  # every relation, with keys — start here
-pdw columns gmail.messages                  # exact columns + types for ONE relation
+pdw columns base_gmail.messages                  # exact columns + types for ONE relation
 pdw sql -q 'why you are asking' 'SELECT ...'   # read-only SQL
 pdw sql -q 'why you are asking' --file query.sql   # SQL from a file (no shell quoting)
 pdw call get_object --data '{"storage_file_id":"..."}'   # locate a stored blob

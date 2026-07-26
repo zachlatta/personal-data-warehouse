@@ -32,7 +32,7 @@ def warehouse():
     try:
         yield wh
     finally:
-        for schema_name in wh.physical_schema_names(include_private=True) + [schema]:
+        for schema_name in wh.physical_schema_names(include_hidden=True) + [schema]:
             wh._raw_command(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
         wh.close()
 
@@ -40,7 +40,7 @@ def warehouse():
 def _calendar_event(warehouse, *, event_id, summary, start, end, location="", status="confirmed"):
     warehouse._command(
         """
-        INSERT INTO calendar_events (account, calendar_id, event_id, summary, location, status,
+        INSERT INTO @calendar_events (account, calendar_id, event_id, summary, location, status,
                                      start_at, end_at, updated_at, synced_at)
         VALUES ('z@x.test', 'cal1', %s, %s, %s, %s, %s, %s, %s, %s)
         """,

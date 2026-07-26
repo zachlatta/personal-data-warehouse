@@ -62,7 +62,7 @@ COMMANDS
                                --no-timeout  Wait indefinitely for the response (the server still bounds statement execution).
   columns <table>            Describe one relation: every column with its exact
                              Postgres type, plus indexes and row estimate. Takes
-                             gmail.messages or a bare table name. Run this for each
+                             base_gmail.messages or a bare table name. Run this for each
                              relation before writing SQL — schema_overview lists
                              relations and keys but NOT columns, so this is the only
                              authoritative column list. Guessing column names is the
@@ -108,9 +108,9 @@ EXAMPLES
   pdw list
   pdw describe sql
   pdw call schema_overview
-  pdw columns gmail.messages         # every column + type, before writing SQL
+  pdw columns base_gmail.messages         # every column + type, before writing SQL
   pdw sql 'SELECT 1'
-  pdw sql -q 'How many rows?' 'SELECT count(*) FROM gmail.messages'
+  pdw sql -q 'How many rows?' 'SELECT count(*) FROM base_gmail.messages'
   pdw sql --output json -q 'What time is it?' 'SELECT now()'
   pdw sql --no-timeout -q 'Run a long query' 'SELECT ...'
   pdw sql -q 'Find calendar transcripts mentioning Vercel' --file query.sql
@@ -443,7 +443,7 @@ func runColumns(client *cliclient.Client, args []string, stdout, stderr io.Write
 	}
 	relation := strings.TrimSpace(args[0])
 	if !isRelationIdentifier(relation) {
-		fmt.Fprintln(stderr, "pdw columns: table name must be an identifier like gmail.messages (or a bare table name)")
+		fmt.Fprintln(stderr, "pdw columns: table name must be an identifier like base_gmail.messages (or a bare table name)")
 		return 2
 	}
 	input, err := json.Marshal(map[string]string{"relation": relation})

@@ -11,14 +11,14 @@ from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.postgres import POSTGRES_TABLES, PostgresWarehouse
 from personal_data_warehouse.postgres_readonly import PostgresReadOnlyRunner
-from personal_data_warehouse.relations import query_relation
+from personal_data_warehouse.relations import relation
 
 
 def test_plaid_relations_use_plaid_source_schema_and_private_tokens() -> None:
-    assert query_relation("plaid_accounts").schema == "plaid"
-    assert query_relation("plaid_accounts").name == "accounts"
-    assert query_relation("plaid_transactions").schema == "plaid"
-    assert query_relation("plaid_item_tokens").schema == "private"
+    assert relation("plaid_accounts").schema == "base_plaid"
+    assert relation("plaid_accounts").name == "accounts"
+    assert relation("plaid_transactions").schema == "base_plaid"
+    assert relation("plaid_item_tokens").schema == "private"
 
 
 def test_plaid_table_specs_define_idempotent_upsert_keys() -> None:
@@ -48,7 +48,7 @@ def warehouse():
 
 
 def _relation_exists(warehouse: PostgresWarehouse, logical_name: str) -> bool:
-    rel = query_relation(logical_name).with_namespace(warehouse.schema_namespace)
+    rel = relation(logical_name).with_namespace(warehouse.schema_namespace)
     rows = warehouse._query(
         """
         SELECT 1
@@ -90,18 +90,14 @@ def test_ensure_plaid_tables_creates_raw_private_and_finance_mart_views(warehous
     ):
         assert _relation_exists(warehouse, logical_name), logical_name
 
-    for view_name in (
-        "finance_investment_holdings",
-        "finance_investment_transactions",
-        "finance_liabilities",
-    ):
-        assert _view_exists(warehouse, "marts", view_name), view_name
+    for view_name in ("investment_holdings", "investment_transactions", "liabilities"):
+        assert _view_exists(warehouse, "marts_finance", view_name), view_name
 
-    # marts.finance_accounts / marts.finance_transactions are ledger views
-    # owned by ensure_finance_tables now (they read finance.*, not plaid.*).
+    # marts_finance.accounts / marts_finance.transactions are ledger views owned
+    # by ensure_finance_tables now (they read derived_finance.*, not base_plaid.*).
     warehouse.ensure_finance_tables()
-    for view_name in ("finance_accounts", "finance_transactions"):
-        assert _view_exists(warehouse, "marts", view_name), view_name
+    for view_name in ("accounts", "transactions"):
+        assert _view_exists(warehouse, "marts_finance", view_name), view_name
 
 
 def test_plaid_query_role_can_read_source_tables_but_not_private_tokens(warehouse: PostgresWarehouse) -> None:

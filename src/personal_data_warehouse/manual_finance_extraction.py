@@ -592,7 +592,7 @@ class ManualFinanceExtractionRunner:
             return self._warehouse._query_dicts(
                 """
                 SELECT name, kind, side, institution, mask
-                FROM finance_accounts
+                FROM @finance_accounts
                 ORDER BY institution, name
                 LIMIT 200
                 """
@@ -626,21 +626,21 @@ def _extraction_candidate_query(*, error_window_sql: str, unreadable_window_sql:
     return f"""
         WITH failed_runs AS (
             SELECT subject_id, count(*) AS error_attempts
-            FROM agent_runs
+            FROM @agent_runs
             WHERE task_type = %s
               AND status = 'error'
               {error_window_sql}
             GROUP BY subject_id
         )
         {projection}
-        FROM manual_finance_documents d
+        FROM @manual_finance_documents d
         LEFT JOIN failed_runs runs ON runs.subject_id = d.content_sha256
         WHERE d.is_deleted = 0
           AND d.storage_file_id <> ''
           AND COALESCE(runs.error_attempts, 0) < %s
           AND NOT EXISTS (
               SELECT 1
-              FROM manual_finance_extractions done
+              FROM @manual_finance_extractions done
               WHERE done.content_sha256 = d.content_sha256
                 AND done.ai_provider = %s
                 AND done.ai_prompt_version = %s
@@ -648,7 +648,7 @@ def _extraction_candidate_query(*, error_window_sql: str, unreadable_window_sql:
           )
           AND NOT EXISTS (
               SELECT 1
-              FROM manual_finance_extractions unreadable
+              FROM @manual_finance_extractions unreadable
               WHERE unreadable.content_sha256 = d.content_sha256
                 AND unreadable.ai_provider = %s
                 AND unreadable.ai_prompt_version = %s

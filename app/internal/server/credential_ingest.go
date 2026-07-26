@@ -61,7 +61,10 @@ func (s *claudeDesktopCredentialStore) Close() error {
 	return s.db.Close()
 }
 
-const privateSchemaDDL = `CREATE SCHEMA IF NOT EXISTS "private"`
+// Take the schema from the catalog rather than restating it, so a catalog
+// move cannot leave the app provisioning an orphan schema.
+var privateSchemaDDL = "CREATE SCHEMA IF NOT EXISTS " +
+	warehouse.QuoteIdent(warehouse.SchemaOf("claude_desktop_credentials"))
 
 var claudeDesktopCredentialDDL = `CREATE TABLE IF NOT EXISTS ` + warehouse.SQLRelation("claude_desktop_credentials") + ` (
 	account text PRIMARY KEY,

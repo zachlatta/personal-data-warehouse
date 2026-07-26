@@ -3,7 +3,7 @@
 Raw photo files land per-source (apple_photos.files now; future sources add
 their own <source>.files via PHOTO_SOURCE_RELATIONS), identity lives in the
 derived photos.* tables, and cross-source querying goes through the
-marts.photo_files / marts.photos / marts.photo_canonical_renditions views.
+marts_photos.files / marts_photos.photos / marts_photos.canonical_renditions views.
 The timeline adapter contract for photos is covered by tests/test_timeline.py.
 """
 
@@ -19,9 +19,9 @@ from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.postgres import POSTGRES_TABLES, PostgresWarehouse
 from personal_data_warehouse.relations import (
+    BASE_SCHEMAS,
     DERIVED_SCHEMAS,
     PHOTO_SOURCE_RELATIONS,
-    SOURCE_RAW_SCHEMAS,
     relation,
 )
 from personal_data_warehouse.schema import PHOTO_SOURCE_FILE_COLUMNS
@@ -142,24 +142,24 @@ def test_photo_source_registry_shape():
         spec = POSTGRES_TABLES[table]
         assert spec.columns == PHOTO_SOURCE_FILE_COLUMNS, table
         assert spec.primary_key == ("source", "account", "source_native_id", "content_sha256"), table
-        assert relation(table).schema == source
+        assert relation(table).schema == f"base_{source}"
 
 
 def test_photo_relations_are_registered():
-    assert "apple_photos" in SOURCE_RAW_SCHEMAS
-    assert "photos" in DERIVED_SCHEMAS
-    assert (relation("apple_photos_files").schema, relation("apple_photos_files").name) == ("apple_photos", "files")
-    assert (relation("photo_assets").schema, relation("photo_assets").name) == ("photos", "assets")
-    assert (relation("photo_asset_files").schema, relation("photo_asset_files").name) == ("photos", "asset_files")
+    assert "base_apple_photos" in BASE_SCHEMAS
+    assert "derived_photos" in DERIVED_SCHEMAS
+    assert (relation("apple_photos_files").schema, relation("apple_photos_files").name) == ("base_apple_photos", "files")
+    assert (relation("photo_assets").schema, relation("photo_assets").name) == ("derived_photos", "assets")
+    assert (relation("photo_asset_files").schema, relation("photo_asset_files").name) == ("derived_photos", "asset_files")
     assert (relation("media_fingerprints").schema, relation("media_fingerprints").name) == (
-        "enrichment",
+        "derived_enrichment",
         "media_fingerprints",
     )
-    assert (relation("photo_files").schema, relation("photo_files").name) == ("marts", "photo_files")
-    assert (relation("clean_photos").schema, relation("clean_photos").name) == ("marts", "photos")
+    assert (relation("photo_files").schema, relation("photo_files").name) == ("marts_photos", "files")
+    assert (relation("clean_photos").schema, relation("clean_photos").name) == ("marts_photos", "photos")
     assert (relation("photo_canonical_renditions").schema, relation("photo_canonical_renditions").name) == (
-        "marts",
-        "photo_canonical_renditions",
+        "marts_photos",
+        "canonical_renditions",
     )
 
 
@@ -181,20 +181,20 @@ def test_ensure_photos_tables_is_idempotent_and_creates_marts_views(warehouse):
         FROM information_schema.tables
         WHERE table_schema = ANY(%s)
         """,
-        (warehouse.physical_schema_names(include_private=True),),
+        (warehouse.physical_schema_names(include_hidden=True),),
     )
     relations = {(schema, table): type_ for schema, table, type_ in rows}
 
     def phys(schema: str) -> str:
         return warehouse.physical_schema_name(schema)
 
-    assert relations[(phys("apple_photos"), "files")] == "BASE TABLE"
-    assert relations[(phys("photos"), "assets")] == "BASE TABLE"
-    assert relations[(phys("photos"), "asset_files")] == "BASE TABLE"
-    assert relations[(phys("enrichment"), "media_fingerprints")] == "BASE TABLE"
-    assert relations[(phys("marts"), "photo_files")] == "VIEW"
-    assert relations[(phys("marts"), "photos")] == "VIEW"
-    assert relations[(phys("marts"), "photo_canonical_renditions")] == "VIEW"
+    assert relations[(phys("base_apple_photos"), "files")] == "BASE TABLE"
+    assert relations[(phys("derived_photos"), "assets")] == "BASE TABLE"
+    assert relations[(phys("derived_photos"), "asset_files")] == "BASE TABLE"
+    assert relations[(phys("derived_enrichment"), "media_fingerprints")] == "BASE TABLE"
+    assert relations[(phys("marts_photos"), "files")] == "VIEW"
+    assert relations[(phys("marts_photos"), "photos")] == "VIEW"
+    assert relations[(phys("marts_photos"), "canonical_renditions")] == "VIEW"
 
 
 def test_insert_photo_source_files_upserts_by_provenance_key(warehouse):
@@ -205,14 +205,14 @@ def test_insert_photo_source_files_upserts_by_provenance_key(warehouse):
         "apple_photos_files",
         [_photo_file_row(filename="IMG_0001 (edited).HEIC", sync_version=2)],
     )
-    rows = warehouse._query("SELECT filename, sync_version FROM apple_photos_files")
+    rows = warehouse._query("SELECT filename, sync_version FROM @apple_photos_files")
     assert rows == [("IMG_0001 (edited).HEIC", 2)]
     # Lower sync_version: stale write is ignored.
     warehouse.insert_photo_source_files(
         "apple_photos_files",
         [_photo_file_row(filename="stale.HEIC", sync_version=1)],
     )
-    rows = warehouse._query("SELECT filename, sync_version FROM apple_photos_files")
+    rows = warehouse._query("SELECT filename, sync_version FROM @apple_photos_files")
     assert rows == [("IMG_0001 (edited).HEIC", 2)]
 
 
@@ -227,7 +227,7 @@ def test_photo_files_mart_unions_sources_and_joins_identity(warehouse):
     )
     warehouse.insert_photo_asset_files([_link_row()])
     rows = warehouse._query(
-        "SELECT source, source_native_id, photo_id, match_method FROM photo_files ORDER BY source_native_id"
+        "SELECT source, source_native_id, photo_id, match_method FROM @photo_files ORDER BY source_native_id"
     )
     # Linked row carries its identity; unresolved row shows empty photo_id.
     assert rows == [
@@ -249,7 +249,7 @@ def test_canonical_renditions_are_stills_with_thumbnails_only(warehouse):
         ]
     )
     rows = warehouse._query(
-        "SELECT photo_id, content_sha256, mime_type, filename, storage_file_id FROM photo_canonical_renditions"
+        "SELECT photo_id, content_sha256, mime_type, filename, storage_file_id FROM @photo_canonical_renditions"
     )
     assert rows == [("ph1", "sha-thumb", "image/jpeg", "IMG_0001.HEIC", "drive-th1")]
 
@@ -284,7 +284,7 @@ def test_photo_canonical_renditions_feed_the_enrichment_candidate_query(warehous
     # vision pass per logical photo.
     warehouse._command(
         """
-        INSERT INTO file_attachment_enrichments (content_sha256, ai_provider, ai_model,
+        INSERT INTO @file_attachment_enrichments (content_sha256, ai_provider, ai_model,
                                                  ai_prompt_version, text, text_extraction_status, updated_at)
         VALUES ('sha-thumb', 'agent_codex', 'm', %s, 'caption', 'agent_ok', %s)
         """,
@@ -304,13 +304,13 @@ def test_clean_photos_carries_caption_and_counts(warehouse):
     )
     warehouse._command(
         """
-        INSERT INTO file_attachment_enrichments (content_sha256, ai_provider, ai_model,
+        INSERT INTO @file_attachment_enrichments (content_sha256, ai_provider, ai_model,
                                                  ai_prompt_version, text, updated_at)
         VALUES ('sha-thumb', 'agent_codex', 'm', 'photo-agent-v1', 'A red bicycle against a wall', %s)
         """,
         (_TS,),
     )
     rows = warehouse._query(
-        "SELECT photo_id, kind, camera_model, rendition_count, caption FROM clean_photos"
+        "SELECT photo_id, kind, camera_model, rendition_count, caption FROM @clean_photos"
     )
     assert rows == [("ph1", "image", "iPhone 16 Pro", 2, "A red bicycle against a wall")]

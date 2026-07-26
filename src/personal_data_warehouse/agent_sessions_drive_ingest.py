@@ -18,9 +18,9 @@ Three transports feed the same row schema:
   linearizes that tree into ``chatgpt.events`` rows; see
   ``defs/chatgpt_backend_ingest.py``.
 
-The unified raw event surface is ``marts.ai_conversation_events``. The
+The unified raw event surface is ``marts_ai_conversations.events``. The
 session-level roll-up (counts, token sums, header) is
-``marts.ai_conversation_sessions``, so it stays correct no matter how a
+``marts_ai_conversations.sessions``, so it stays correct no matter how a
 session's lines are split across batches over time, and treats every ``source``
 uniformly.
 """

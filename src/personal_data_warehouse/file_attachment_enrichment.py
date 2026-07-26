@@ -119,7 +119,8 @@ AGENT_ATTACHMENT_INPUT_BASENAME = "attachment"
 class FileEnrichmentSource:
     """Describes one attachment source the shared enrichment runner can scan.
 
-    ``table`` is the source's attachment table; the column names map the generic
+    ``table`` is the source's attachment table as a catalog id (expanded through
+    the ``@`` marker when the query runs); the column names map the generic
     candidate query onto it. ``stored_predicate`` is a SQL fragment (using table
     alias ``a``) that selects only rows whose blob is in the object store. Every
     source's storage columns are assumed to be the standard
@@ -214,7 +215,7 @@ When the prompt includes capture_context, use it to GROUND the description, neve
 
 
 # One enrichable still per LOGICAL photo (the identity layer's 1280px JPEG
-# thumbnail, via marts.photo_canonical_renditions) — never per rendition, so a
+# thumbnail, via marts_photos.canonical_renditions) — never per rendition, so a
 # photo arriving from three sources is enriched once.
 PHOTOS_SOURCE = FileEnrichmentSource(
     name="photos",
@@ -525,14 +526,14 @@ def _candidate_query(source: FileEnrichmentSource, *, projection: str, tail: str
     return f"""
         WITH failed_runs AS (
             SELECT subject_id, count(*) AS error_attempts
-            FROM agent_runs
+            FROM @agent_runs
             WHERE task_type = %s
               AND status = 'error'
               {{error_window_sql}}
             GROUP BY subject_id
         )
         {projection}
-        FROM {source.table} a
+        FROM @{source.table} a
         LEFT JOIN {ENRICHMENT_TABLE} det
             ON det.content_sha256 = a.{sha}
               AND det.ai_provider = '' AND det.ai_model = '' AND det.ai_prompt_version = ''

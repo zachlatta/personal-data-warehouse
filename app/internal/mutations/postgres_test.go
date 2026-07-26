@@ -9,20 +9,33 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
-func TestUpstreamMutationSchemaDDLIsNotRelationQualified(t *testing.T) {
-	if !strings.Contains(upstreamMutationSchemaCreateStatement, `CREATE SCHEMA IF NOT EXISTS "upstream_mutations"`) {
+func TestUpstreamMutationDDLTargetsTheOpsSchema(t *testing.T) {
+	if !strings.Contains(upstreamMutationSchemaCreateStatement, `CREATE SCHEMA IF NOT EXISTS "ops"`) {
 		t.Fatalf("unexpected schema DDL: %s", upstreamMutationSchemaCreateStatement)
-	}
-	if got := warehouse.QualifySQL(upstreamMutationSchemaCreateStatement); got != upstreamMutationSchemaCreateStatement {
-		t.Fatalf("schema DDL should not be relation-qualified: %s", got)
 	}
 	for _, statement := range upstreamMutationSchemaStatements {
 		if strings.Contains(statement, "CREATE SCHEMA") {
-			t.Fatalf("schema DDL must stay outside the QualifySQL statement loop: %s", statement)
+			t.Fatalf("schema DDL must stay outside the statement loop: %s", statement)
 		}
-		qualified := warehouse.QualifySQL(statement)
-		if strings.Contains(qualified, `CREATE SCHEMA IF NOT EXISTS "upstream_mutations"."operations"`) {
-			t.Fatalf("schema DDL was relation-qualified: %s", qualified)
+		expanded := warehouse.ExpandRelations(statement)
+		if strings.Contains(expanded, "@") {
+			t.Fatalf("statement still carries an unexpanded relation marker: %s", expanded)
+		}
+	}
+}
+
+// Every mutation statement must name its relations through the catalog. A bare
+// name would resolve through whatever search_path the connection happens to
+// carry, which is how the pre-reorg rewriter silently shadowed relations.
+func TestUpstreamMutationStatementsNameRelationsThroughTheCatalog(t *testing.T) {
+	for _, statement := range upstreamMutationSchemaStatements {
+		expanded := warehouse.ExpandRelations(statement)
+		for _, bare := range []string{
+			" upstream_mutations ", " upstream_mutation_requests ", " upstream_mutation_events ",
+		} {
+			if strings.Contains(expanded, bare) {
+				t.Fatalf("bare relation name %q survived expansion: %s", bare, expanded)
+			}
 		}
 	}
 }

@@ -235,18 +235,18 @@ guessing columns. Run SQL with:
 
 Search both photos and Gmail unless the ledger row is plainly not a purchase/refund:
 
-- `search.search_text(query, max_results, sources, since)` searches source text. Its
+- `timeline.search_text(query, max_results, sources, since)` searches source text. Its
   source names include `photo` and `gmail`.
-- `marts.photos` has `photo_id`, `capture_ts`, `caption`, and
+- `marts_photos.photos` has `photo_id`, `capture_ts`, `caption`, and
   `thumbnail_storage_file_id`.
-- `gmail.messages` has message metadata and bodies. `gmail.attachments` joins
-  `enrichment.file_attachment_enrichments` by `content_sha256` for extracted attachment
+- `base_gmail.messages` has message metadata and bodies. `base_gmail.attachments` joins
+  `derived_enrichment.file_attachment_enrichments` by `content_sha256` for extracted attachment
   text. Evidence IDs must be the primary key for the source you name:
-  `gmail_message` uses `gmail.messages.message_id`, while `gmail_attachment` uses
-  `gmail.attachments.attachment_id`. A message_id is not an attachment_id. Query and
+  `gmail_message` uses `base_gmail.messages.message_id`, while `gmail_attachment` uses
+  `base_gmail.attachments.attachment_id`. A message_id is not an attachment_id. Query and
   return the actual attachment row when an attachment is the receipt; do not reuse its
   parent message ID.
-- `receipts.transaction_receipts` shows decisions already made for other transactions.
+- `derived_receipts.transaction_receipts` shows decisions already made for other transactions.
   Do not reuse one source receipt for two transactions unless the source itself clearly
   proves that it covers both (for example, a split settlement).
 
@@ -336,9 +336,9 @@ SELECT t.transaction_id,
        COALESCE(r.attempt_count, 0) AS attempt_count,
        r.last_attempt_at,
        r.ai_prompt_version AS prior_prompt_version
-FROM finance_transactions AS t
-JOIN finance_accounts AS a ON a.account_id = t.account_id
-LEFT JOIN receipt_transaction_receipts AS r
+FROM @finance_transactions AS t
+JOIN @finance_accounts AS a ON a.account_id = t.account_id
+LEFT JOIN @receipt_transaction_receipts AS r
     ON r.transaction_id = t.transaction_id
 WHERE t.posted_at >= %(since)s
   AND t.pending = 0
@@ -378,15 +378,15 @@ LIMIT %(limit)s
 
 _EVIDENCE_SQL_BY_SOURCE = {
     SOURCE_PHOTO: (
-        "SELECT photo_id AS native_id FROM clean_photos "
+        "SELECT photo_id AS native_id FROM @clean_photos "
         "WHERE photo_id = ANY(%s)"
     ),
     SOURCE_GMAIL_MESSAGE: (
-        "SELECT message_id AS native_id FROM gmail_messages "
+        "SELECT message_id AS native_id FROM @gmail_messages "
         "WHERE message_id = ANY(%s) AND is_deleted = 0"
     ),
     SOURCE_GMAIL_ATTACHMENT: (
-        "SELECT attachment_id AS native_id FROM gmail_attachments "
+        "SELECT attachment_id AS native_id FROM @gmail_attachments "
         "WHERE attachment_id = ANY(%s) AND is_deleted = 0"
     ),
 }

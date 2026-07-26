@@ -140,12 +140,12 @@ def test_worklist_is_recent_posted_transactions_not_artifacts():
         captured.update(params)
         return []
 
-    warehouse = FakeWarehouse({"FROM finance_transactions AS t": capture})
+    warehouse = FakeWarehouse({"FROM @finance_transactions AS t": capture})
     _runner(warehouse, FakeAgent()).sync()
 
     assert warehouse.ensured
     assert captured["since"] == NOW - timedelta(days=30)
-    candidate_sql = next(sql for sql, _ in warehouse.queries if "FROM finance_transactions AS t" in sql)
+    candidate_sql = next(sql for sql, _ in warehouse.queries if "FROM @finance_transactions AS t" in sql)
     assert "t.posted_at >= %(since)s" in candidate_sql
     assert "t.pending = 0" in candidate_sql
     assert "clean_photos" not in candidate_sql
@@ -157,12 +157,12 @@ def test_one_pdw_agent_operation_per_transaction():
     transactions = [_transaction("ft_1"), _transaction("ft_2", amount="-12.00")]
     warehouse = FakeWarehouse(
         {
-            "FROM finance_transactions AS t": transactions,
-            "FROM clean_photos WHERE": lambda params: [
+            "FROM @finance_transactions AS t": transactions,
+            "FROM @clean_photos WHERE": lambda params: [
                 {"native_id": native_id} for native_id in params[0] if native_id == "ph_1"
             ],
-            "FROM gmail_messages WHERE": [],
-            "FROM gmail_attachments WHERE": [],
+            "FROM @gmail_messages WHERE": [],
+            "FROM @gmail_attachments WHERE": [],
         }
     )
     agent = FakeAgent(_found_result())
@@ -182,10 +182,10 @@ def test_one_pdw_agent_operation_per_transaction():
 def test_receipt_is_not_published_when_agent_invents_evidence():
     warehouse = FakeWarehouse(
         {
-            "FROM finance_transactions AS t": [_transaction()],
-            "FROM clean_photos WHERE": [],
-            "FROM gmail_messages WHERE": [],
-            "FROM gmail_attachments WHERE": [],
+            "FROM @finance_transactions AS t": [_transaction()],
+            "FROM @clean_photos WHERE": [],
+            "FROM @gmail_messages WHERE": [],
+            "FROM @gmail_attachments WHERE": [],
         }
     )
     summary = _runner(warehouse, FakeAgent(_found_result())).sync()
@@ -213,8 +213,8 @@ def test_gmail_attachment_evidence_is_validated_by_attachment_id():
     }
     warehouse = FakeWarehouse(
         {
-            "FROM finance_transactions AS t": [_transaction()],
-            "FROM gmail_attachments WHERE": [{"native_id": "att_1"}],
+            "FROM @finance_transactions AS t": [_transaction()],
+            "FROM @gmail_attachments WHERE": [{"native_id": "att_1"}],
         }
     )
 
@@ -223,7 +223,7 @@ def test_gmail_attachment_evidence_is_validated_by_attachment_id():
     assert summary.receipts_found == 1
     assert warehouse.rows[0]["primary_native_id"] == "att_1"
     attachment_sql = next(
-        sql for sql, _ in warehouse.queries if "FROM gmail_attachments WHERE" in sql
+        sql for sql, _ in warehouse.queries if "FROM @gmail_attachments WHERE" in sql
     )
     assert "SELECT attachment_id AS native_id" in attachment_sql
     assert "WHERE attachment_id = ANY(%s)" in attachment_sql
@@ -236,7 +236,7 @@ def test_no_receipt_result_is_durable_and_retryable():
         "receipt": {},
         "reasoning": "No relevant source evidence found.",
     }
-    warehouse = FakeWarehouse({"FROM finance_transactions AS t": [_transaction()]})
+    warehouse = FakeWarehouse({"FROM @finance_transactions AS t": [_transaction()]})
     summary = _runner(warehouse, FakeAgent(result)).sync()
 
     assert summary.not_found == 1
@@ -251,7 +251,7 @@ def test_retry_window_and_budget_are_applied_to_the_transaction_row():
         captured.update(params)
         return []
 
-    warehouse = FakeWarehouse({"FROM finance_transactions AS t": capture})
+    warehouse = FakeWarehouse({"FROM @finance_transactions AS t": capture})
     _runner(warehouse, FakeAgent(), retry_after_days=7, max_attempts=2).sync()
     assert captured["retry_before"] == NOW - timedelta(days=7)
     assert captured["max_attempts"] == 2
@@ -264,10 +264,10 @@ def test_prompt_change_requeues_recent_rows_before_unresearched_transactions():
         captured.update(params)
         return []
 
-    warehouse = FakeWarehouse({"FROM finance_transactions AS t": capture})
+    warehouse = FakeWarehouse({"FROM @finance_transactions AS t": capture})
     _runner(warehouse, FakeAgent()).sync()
     candidate_sql = next(
-        sql for sql, _ in warehouse.queries if "FROM finance_transactions AS t" in sql
+        sql for sql, _ in warehouse.queries if "FROM @finance_transactions AS t" in sql
     )
 
     assert captured["prompt_version"] == PROMPT_VERSION
@@ -292,7 +292,7 @@ def test_prompt_change_starts_a_fresh_negative_retry_budget():
     }
     warehouse = FakeWarehouse(
         {
-            "FROM finance_transactions AS t": [
+            "FROM @finance_transactions AS t": [
                 _transaction(
                     attempt_count=2,
                     prior_prompt_version="receipt-transaction-research-old",
@@ -312,7 +312,7 @@ def test_agent_failure_leaves_transaction_unwritten_for_next_run():
             self.requests.append(request)
             return FakeResult({}, exit_code=1, error="container exited 1")
 
-    warehouse = FakeWarehouse({"FROM finance_transactions AS t": [_transaction()]})
+    warehouse = FakeWarehouse({"FROM @finance_transactions AS t": [_transaction()]})
     summary = _runner(warehouse, FailingAgent()).sync()
     assert summary.failed == 1
     assert warehouse.rows == []

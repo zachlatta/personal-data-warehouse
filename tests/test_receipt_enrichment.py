@@ -130,12 +130,12 @@ def test_prompt_is_transaction_first_and_requires_real_photo_inspection():
     assert "ft_1" in prompt
     assert "Example Cafe" in prompt
     assert "pdw sql" in prompt
-    assert "search.search_text" in prompt
-    assert "gmail.messages" in prompt
-    assert "gmail.attachments.attachment_id" in prompt
+    assert "timeline.search_text" in prompt
+    assert "base_gmail.messages" in prompt
+    assert "base_gmail.attachments.attachment_id" in prompt
     assert "message_id is not an attachment_id" in prompt
     assert "Brokerage, security, and cryptocurrency trades" in prompt
-    assert "marts.photos" in prompt
+    assert "marts_photos.photos" in prompt
     assert "pdw call get_object" in prompt
     assert "inspect the actual image" in prompt
     assert "caption" in prompt

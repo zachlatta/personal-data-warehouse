@@ -7,9 +7,9 @@ logical `finance.accounts` (via `finance.account_links`, the photos-identity
 pattern: raw rows never learn about identity), appends per-day
 `finance.observations`, and builds the unified deduped `finance.transactions`
 ledger (via `finance.transaction_links`). Net worth is the latest observation
-per account summed by side — read through `marts.finance_net_worth` /
-`marts.finance_net_worth_history`; transactions through
-`marts.finance_transactions`.
+per account summed by side — read through `marts_finance.net_worth` /
+`marts_finance.net_worth_history`; transactions through
+`marts_finance.transactions`.
 
 Sign convention: ledger amounts are signed NUMERIC, **positive = inflow to
 the account**. Plaid reports positive-out (in both the transactions and the
@@ -863,8 +863,8 @@ class FinanceLedgerRunner:
             SELECT a.account, a.account_id, a.name, a.official_name, a.mask,
                    a.type, a.subtype, a.current_balance, a.iso_currency_code,
                    COALESCE(i.institution_name, '') AS institution_name
-            FROM plaid_accounts a
-            LEFT JOIN plaid_items i
+            FROM @plaid_accounts a
+            LEFT JOIN @plaid_items i
               ON i.account = a.account AND i.item_id = a.item_id
             WHERE a.is_removed = 0
             ORDER BY a.account, a.account_id
@@ -877,7 +877,7 @@ class FinanceLedgerRunner:
             SELECT account, account_id, transaction_id, posted_at, name,
                    merchant_name, amount, iso_currency_code, pending,
                    pending_transaction_id
-            FROM plaid_transactions
+            FROM @plaid_transactions
             WHERE is_removed = 0
             ORDER BY posted_at, transaction_id
             """
@@ -888,7 +888,7 @@ class FinanceLedgerRunner:
             """
             SELECT account, account_id, investment_transaction_id,
                    transaction_at, name, amount, iso_currency_code
-            FROM plaid_investment_transactions
+            FROM @plaid_investment_transactions
             ORDER BY transaction_at, investment_transaction_id
             """
         )
@@ -903,8 +903,8 @@ class FinanceLedgerRunner:
                    e.account_name_hint, e.account_mask, e.currency,
                    e.transactions_json, e.balances_json, e.valuations_json,
                    d.account, d.original_path, d.filename
-            FROM manual_finance_extractions e
-            JOIN manual_finance_documents d
+            FROM @manual_finance_extractions e
+            JOIN @manual_finance_documents d
               ON d.content_sha256 = e.content_sha256 AND d.is_deleted = 0
             WHERE e.status = 'ok'
             ORDER BY e.content_sha256, e.created_at DESC
@@ -915,7 +915,7 @@ class FinanceLedgerRunner:
         rows = self._warehouse._query(
             """
             SELECT account, source_account_key, account_id
-            FROM finance_account_links
+            FROM @finance_account_links
             WHERE source = %s
             """,
             (source,),
@@ -923,12 +923,12 @@ class FinanceLedgerRunner:
         return {(str(account), str(key)): str(account_id) for account, key, account_id in rows}
 
     def _load_account_created_at(self) -> dict[str, datetime]:
-        rows = self._warehouse._query("SELECT account_id, created_at FROM finance_accounts")
+        rows = self._warehouse._query("SELECT account_id, created_at FROM @finance_accounts")
         return {str(account_id): created_at for account_id, created_at in rows}
 
     def _load_account_index(self) -> list[dict[str, Any]]:
         return self._warehouse._query_dicts(
-            "SELECT account_id, account, mask, institution, kind, side, created_at FROM finance_accounts"
+            "SELECT account_id, account, mask, institution, kind, side, created_at FROM @finance_accounts"
         )
 
     def _link_row(
@@ -1024,10 +1024,10 @@ def has_pending_finance_observations(warehouse: PostgresWarehouse) -> bool:
     rows = warehouse._query(
         """
         SELECT 1
-        FROM plaid_accounts a
-        LEFT JOIN finance_account_links l
+        FROM @plaid_accounts a
+        LEFT JOIN @finance_account_links l
           ON l.source = %s AND l.account = a.account AND l.source_account_key = a.account_id
-        LEFT JOIN finance_observations o
+        LEFT JOIN @finance_observations o
           ON o.account_id = l.account_id
          AND o.source = %s
          AND o.kind = %s

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 // The schema overview is the required first call, so its size is a hard
@@ -25,12 +27,12 @@ import (
 // curated, never inferred: the names diverge per source and picking the wrong
 // timestamptz silently answers a different question than the caller asked.
 var overviewTimeColumns = map[string]string{
-	"timeline.events":            "event_ts",
-	"apple_photos.files":         "captured_at",
-	"photos.assets":              "capture_ts",
-	"plaid.transactions":         "posted_at",
-	"whatsapp.media_items":       "message_at",
-	"apple_messages.attachments": "message_at",
+	"timeline.events":                 "event_ts",
+	"base_apple_photos.files":         "captured_at",
+	"derived_photos.assets":           "capture_ts",
+	"base_plaid.transactions":         "posted_at",
+	"base_whatsapp.media_items":       "message_at",
+	"base_apple_messages.attachments": "message_at",
 }
 
 func init() {
@@ -51,46 +53,95 @@ var bookkeepingTimeColumns = map[string]bool{
 	"sync_started_at": true, "ingest_ts": true,
 }
 
+// startHereBlock renders the catalog's own start-here guidance. It lives in
+// warehouse_catalog.json so the schema overview, the Postgres schema comments,
+// and any other surface all say the same thing without restating it.
+func startHereBlock() string {
+	var out strings.Builder
+	for _, line := range warehouse.StartHere.Lines {
+		for i, wrapped := range wrapComment(line, 92) {
+			if i == 0 {
+				out.WriteString("-- " + wrapped + "\n")
+			} else {
+				out.WriteString("--   " + wrapped + "\n")
+			}
+		}
+	}
+	return out.String()
+}
+
+// wrapComment soft-wraps a guidance line so the overview stays readable in a
+// terminal without the catalog having to carry pre-wrapped text.
+func wrapComment(line string, width int) []string {
+	words := strings.Fields(line)
+	if len(words) == 0 {
+		return []string{""}
+	}
+	lines := []string{}
+	current := words[0]
+	for _, word := range words[1:] {
+		if len(current)+1+len(word) > width {
+			lines = append(lines, current)
+			current = word
+			continue
+		}
+		current += " " + word
+	}
+	return append(lines, current)
+}
+
 // overviewPreamble is everything a caller needs before writing SQL that no
 // per-relation lookup can tell them. Each paragraph earned its place from a
 // recurring failure in real transcripts.
-const overviewPreamble = `-- HOW TO USE THIS: relation names + keys + row counts only. For any other column, call
---   describe_table('gmail.messages')  →  every column with its exact Postgres type.
+const overviewPreamble = `--
+-- SCHEMA LAYERS (they sort in this order, which is also the order to reach for them):
+--   base_<source>    faithful provider data — every field the source gave us
+--   derived_<domain> modelled facts: identity resolution, enrichment, transcripts, ledger history
+--   marts_<domain>   stable domain read interfaces (finance, contacts, messages, photos, inbox, ...)
+--   timeline         the cross-source event stream + search_text()/search_text_exact()
+--   (sync cursors, credentials and helper functions are deliberately not queryable)
+--
+-- HOW TO USE THIS: relation names + keys + row counts only. For any other column, call
+--   describe_table('base_gmail.messages')  →  every column with its exact Postgres type.
 --   Do NOT guess column names: 70%% of failed warehouse queries are 42703 undefined-column.
--- Reference relations schema-qualified (FROM gmail.messages). Never prefix the database name ("%s.").
+-- Reference relations schema-qualified (FROM base_gmail.messages).
+--   Never prefix the database name ("%s.").
 --
 -- THREE TYPE RULES YOU CANNOT INFER FROM A COLUMN NAME:
 --  1. Booleans are bigint 0/1, not boolean. Every is_*/has_* column (is_from_me, is_deleted,
 --     is_read, is_archived, ...) is bigint. Write ` + "`is_from_me = 1`" + `, never ` + "`NOT is_from_me`" + `,
 --     ` + "`= true`" + `, or ` + "`FILTER (WHERE is_read)`" + ` — those raise 42804.
 --  2. JSON columns are text on the older sources and real jsonb on the newer ones, so there is
---     no single rule. text on: slack, gmail, google_calendar, apple_*, whatsapp, ai_processing,
---     and the agent-session event tables (claude_code, claude_desktop, codex, chatgpt, openclaw,
---     pi). jsonb on: plaid, whoop, google_drive, google_contacts, apple_contacts, apple_photos,
---     manual_finance, upstream_mutations, alice_voice_recordings. On a text one, cast before
+--     no single rule. text on: base_slack, base_gmail, base_google_calendar, base_apple_*,
+--     base_whatsapp, and the agent-session event tables (base_claude_code, base_claude_desktop,
+--     base_codex, base_chatgpt, base_openclaw, base_pi). jsonb on: base_plaid, base_whoop,
+--     base_google_drive, base_google_contacts, base_apple_contacts, base_apple_photos,
+--     base_manual_finance, base_alice_voice_recordings. On a text one, cast before
 --     -> / ->> / subscripting, else 42883. describe_table is authoritative — check, don't assume.
 --  3. Time columns are per-source names, all timestamptz, given as ` + "`time:`" + ` on each line below.
 --     Compare them to timestamps, never epoch ints (>= '2026-01-01', not > 1700000000).
---     Neighbouring lookalikes are NOT timestamps: slack.messages.message_ts/edited_ts and
---     gmail.messages.date_header are text; apple_messages.messages.date_ns is bigint NANOseconds;
---     slack.sync_state.cursor_ts is text and often '' (guard NULLIF(cursor_ts,'')::numeric).
+--     Neighbouring lookalikes are NOT timestamps: base_slack.messages.message_ts/edited_ts and
+--     base_gmail.messages.date_header are text; base_apple_messages.messages.date_ns is bigint
+--     NANOseconds.
 --
--- LAYER CONTRACT: raw tables serve STRUCTURED predicates (keys, senders, time ranges, joins).
--- ALL text search goes through search.* over the timeline document. Raw body columns are
+-- SEARCH CONTRACT: base_* tables serve STRUCTURED predicates (keys, senders, time ranges, joins).
+-- ALL text search goes through timeline.* over the timeline document. Raw body columns are
 -- deliberately not text-indexed — ILIKE/regex/hand-rolled cross-source UNIONs force full table
 -- scans and will hit the statement timeout on the big tables.
---   search.search_text('offer letter', 50)        RANKED keyword search (BM25; scores are
---                                                 negative, more negative = better; terms are
---                                                 OR'd + stemmed whole words, no phrases/typos)
---   search.search_text_exact('offer letter', 50)  LITERAL substring/phrase/id match, recency-
---                                                 ordered. Use this for 'every mention of X';
---                                                 never post-filter search_text() with ILIKE.
+--   timeline.search_text('offer letter', 50)        RANKED keyword search (BM25; scores are
+--                                                   negative, more negative = better; terms are
+--                                                   OR'd + stemmed whole words, no phrases/typos)
+--   timeline.search_text_exact('offer letter', 50)  LITERAL substring/phrase/id match, recency-
+--                                                   ordered. Use this for 'every mention of X';
+--                                                   never post-filter search_text() with ILIKE.
 --   both take (query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')
 --   and return (source, subsource, context, who, occurred_at, account, ref, text, score).
 --   ref is '<adapter>:<event_id>' into timeline.events — drill via that row's source_table/
---   source_pk back to the source table for full rows, joins, attachments, thread context.
---   valid ` + "`sources`" + ` tokens: SELECT * FROM search.search_text_sources() (an unknown token raises
---   an error listing the valid set). Detail text (attachments, media enrichments, Drive
+--   source_pk back to the source relation for full rows, joins, attachments, thread context.
+--   source_table holds the catalog id (e.g. gmail_messages), not a SQL name; this listing shows
+--   which schema each one lives in.
+--   valid ` + "`sources`" + ` tokens: SELECT * FROM timeline.search_text_sources() (an unknown token
+--   raises an error listing the valid set). Detail text (attachments, media enrichments, Drive
 --   extracts, session transcripts) is folded into the parent event's search document.
 --   For meetings: sources => ARRAY['transcript'] covers transcript, action_items, participants,
 --   and summary. Summaries are lossy — before calling a request unanswered, search transcript
@@ -203,6 +254,7 @@ func timeColumnFor(display string, facts *relationFacts) string {
 
 func (s *Service) renderOverview(database string, tables []tableRef, facts map[string]*relationFacts, timelineColumns string) string {
 	var out strings.Builder
+	out.WriteString(startHereBlock())
 	out.WriteString(fmt.Sprintf(overviewPreamble, database))
 	out.WriteString("\n")
 

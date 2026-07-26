@@ -29,8 +29,9 @@ func (f fakeRunner) Query(_ context.Context, sql string, maxRows int) (query.Raw
 }
 
 func queryableSchemaArraySQL() string {
-	quoted := make([]string, 0, len(warehouse.QueryableSchemas))
-	for _, schema := range warehouse.QueryableSchemas {
+	schemas := warehouse.QueryableSchemas()
+	quoted := make([]string, 0, len(schemas))
+	for _, schema := range schemas {
 		quoted = append(quoted, warehouse.SQLString(schema))
 	}
 	return "ARRAY[" + strings.Join(quoted, ",") + "]"
@@ -413,14 +414,14 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 		"SELECT table_schema AS schema, table_name AS name FROM information_schema.tables WHERE table_schema = ANY(" + queryableSchemaArraySQL() + ") AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_schema, table_name": {
 			Columns: []string{"schema", "name"},
 			Rows: []map[string]any{
-				{"schema": "apple_messages", "name": "messages"},
-				{"schema": "apple_notes", "name": "notes"},
-				{"schema": "apple_voice_memos", "name": "enrichments"},
-				{"schema": "marts", "name": "gmail_inbox"},
-				{"schema": "gmail", "name": "messages"},
+				{"schema": "base_apple_messages", "name": "messages"},
+				{"schema": "base_apple_notes", "name": "notes"},
+				{"schema": "derived_voice_memos", "name": "enrichments"},
+				{"schema": "marts_inbox", "name": "gmail_threads"},
+				{"schema": "base_gmail", "name": "messages"},
 			},
 		},
-		describeColumnsSQL("apple_messages", "messages"): {
+		describeColumnsSQL("base_apple_messages", "messages"): {
 			Columns: []string{"name", "type"},
 			Rows: []map[string]any{
 				{"name": "message_id", "type": "text"},
@@ -432,7 +433,7 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 				{"name": "is_deleted", "type": "bigint"},
 			},
 		},
-		describeColumnsSQL("apple_notes", "notes"): {
+		describeColumnsSQL("base_apple_notes", "notes"): {
 			Columns: []string{"name", "type"},
 			Rows: []map[string]any{
 				{"name": "note_id", "type": "text"},
@@ -443,15 +444,15 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 				{"name": "is_deleted", "type": "bigint"},
 			},
 		},
-		describeColumnsSQL("marts", "gmail_inbox"): {
+		describeColumnsSQL("marts_inbox", "gmail_threads"): {
 			Columns: []string{"name", "type"},
 			Rows:    []map[string]any{{"name": "thread_id", "type": "text"}, {"name": "latest_subject", "type": "text"}},
 		},
-		describeColumnsSQL("gmail", "messages"): {
+		describeColumnsSQL("base_gmail", "messages"): {
 			Columns: []string{"name", "type"},
 			Rows:    []map[string]any{{"name": "subject", "type": "text"}},
 		},
-		describeColumnsSQL("apple_voice_memos", "enrichments"): {
+		describeColumnsSQL("derived_voice_memos", "enrichments"): {
 			Columns: []string{"name", "type"},
 			Rows:    []map[string]any{{"name": "transcript", "type": "text"}, {"name": "summary", "type": "text"}},
 		},
@@ -518,7 +519,7 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	// The overview lists relations grouped by schema; per-relation columns moved
 	// to describe_table, so the view appears as a line under its schema heading
 	// rather than as its own column catalog.
-	if !strings.Contains(text.Text, "# marts (1 relation)") || !strings.Contains(text.Text, "marts.gmail_inbox") {
+	if !strings.Contains(text.Text, "# marts_inbox (1 relation)") || !strings.Contains(text.Text, "marts_inbox.gmail_threads") {
 		t.Fatalf("schema overview did not list the marts view: %q", text.Text)
 	}
 	if strings.Contains(text.Text, "thread_id (text),latest_subject (text)") {
@@ -528,10 +529,10 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	// column, so a caller knows what exists and what to filter on before it
 	// reaches for describe_table.
 	for _, want := range []string{
-		"gmail.messages",
-		"apple_notes.notes",
+		"base_gmail.messages",
+		"base_apple_notes.notes",
 		"time: modified_at",
-		"apple_messages.messages",
+		"base_apple_messages.messages",
 		"time: message_at",
 	} {
 		if !strings.Contains(text.Text, want) {

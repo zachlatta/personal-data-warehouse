@@ -280,7 +280,7 @@ def test_candidates_and_retry_cap(warehouse):
     def record_failed_run(index: int) -> None:
         warehouse._command(
             """
-            INSERT INTO agent_runs (run_id, task_type, subject_id, status, started_at)
+            INSERT INTO @agent_runs (run_id, task_type, subject_id, status, started_at)
             VALUES (%s, %s, %s, 'error', now())
             """,
             (f"agent-fail-{index}", "manual_finance_extraction", "sha-doc-1"),
@@ -294,7 +294,7 @@ def test_candidates_and_retry_cap(warehouse):
     record_failed_run(3)
     assert candidates() == []
     assert not has_extraction_candidate(warehouse, provider=provider, prompt_version=PROMPT_VERSION)
-    warehouse._command("DELETE FROM agent_runs")
+    warehouse._command("DELETE FROM @agent_runs")
 
     runner = ManualFinanceExtractionRunner(
         warehouse=warehouse,
@@ -307,13 +307,13 @@ def test_candidates_and_retry_cap(warehouse):
     # A permanent input-prep failure (UNREADABLE) excludes without any agent run.
     runner._record_failure(warehouse, _document_row(), error="corrupt pdf", status=STATUS_UNREADABLE)
     assert candidates() == []
-    warehouse._command("DELETE FROM manual_finance_extractions")
+    warehouse._command("DELETE FROM @manual_finance_extractions")
 
     # A plain ERROR row does NOT exclude on its own (transient pre-agent
     # failures retry; only agent_runs counting and UNREADABLE bind).
     runner._record_failure(warehouse, _document_row(), error="drive hiccup", status=STATUS_ERROR)
     assert [c["content_sha256"] for c in candidates()] == ["sha-doc-1"]
-    warehouse._command("DELETE FROM manual_finance_extractions")
+    warehouse._command("DELETE FROM @manual_finance_extractions")
 
     # A completed extraction (any status in COMPLETED_STATUSES) removes it.
     ok_row = runner._extraction_row(
@@ -348,7 +348,7 @@ def test_runner_extracts_and_writes_typed_row(warehouse):
         """
         SELECT status, document_type, institution, account_mask, period_end,
                closing_balance, transactions_json -> 0 ->> 'description'
-        FROM manual_finance_extractions
+        FROM @manual_finance_extractions
         """
     )
     assert rows == [
@@ -396,7 +396,7 @@ def test_runner_parallel_workers_extract_all_candidates(warehouse):
     assert summary.documents_seen == 5
     assert summary.documents_extracted == 5
     assert summary.documents_failed == 0
-    assert warehouse._query("SELECT count(*) FROM manual_finance_extractions WHERE status = 'ok'") == [(5,)]
+    assert warehouse._query("SELECT count(*) FROM @manual_finance_extractions WHERE status = 'ok'") == [(5,)]
     # Every document went through its own agent run.
     assert len(agent.requests) == 5
 
@@ -435,11 +435,11 @@ def test_runner_records_unreadable_and_not_useful(warehouse):
         now=lambda: _TS,
     ).sync(limit=None)
     assert summary.documents_unreadable == 1
-    rows = warehouse._query("SELECT status FROM manual_finance_extractions")
+    rows = warehouse._query("SELECT status FROM @manual_finance_extractions")
     assert rows == [(STATUS_UNREADABLE,)]
 
     # Non-financial documents record not_useful (terminal).
-    warehouse._command("DELETE FROM manual_finance_extractions")
+    warehouse._command("DELETE FROM @manual_finance_extractions")
     warehouse.insert_manual_finance_documents(
         [
             _document_row(

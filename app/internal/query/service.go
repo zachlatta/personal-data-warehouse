@@ -81,8 +81,9 @@ func (t tableRef) DisplayName() string {
 }
 
 func queryableSchemaArraySQL() string {
-	quoted := make([]string, 0, len(warehouse.QueryableSchemas))
-	for _, schema := range warehouse.QueryableSchemas {
+	schemas := warehouse.QueryableSchemas()
+	quoted := make([]string, 0, len(schemas))
+	for _, schema := range schemas {
 		quoted = append(quoted, warehouse.SQLString(schema))
 	}
 	return "ARRAY[" + strings.Join(quoted, ",") + "]"
@@ -941,18 +942,18 @@ func queryErrorWithHint(message, sql string) string {
 // column differently, which is the single most common wrong guess, so the order
 // is preserved to render a stable per-source list in the fallback hint.
 var timeColumns = []struct{ table, column string }{
-	{"gmail.messages", "internal_date"},
-	{"slack.messages", "message_datetime"},
-	{"apple_messages.messages", "message_at"},
-	{"apple_messages.chat_messages", "message_date"},
-	{"whatsapp.messages", "message_at"},
-	{"marts.ai_conversation_events", "occurred_at"},
-	{"google_calendar.events", "start_at"},
-	{"apple_notes.notes", "modified_at"},
-	{"apple_notes.revisions", "modified_at"},
-	{"apple_voice_memos.files", "recorded_at"},
-	{"google_contacts.cards", "source_updated_at"},
-	{"google_drive.files", "modified_time"},
+	{"base_gmail.messages", "internal_date"},
+	{"base_slack.messages", "message_datetime"},
+	{"base_apple_messages.messages", "message_at"},
+	{"base_apple_messages.chat_messages", "message_date"},
+	{"base_whatsapp.messages", "message_at"},
+	{"marts_ai_conversations.events", "occurred_at"},
+	{"base_google_calendar.events", "start_at"},
+	{"base_apple_notes.notes", "modified_at"},
+	{"base_apple_notes.revisions", "modified_at"},
+	{"base_apple_voice_memos.files", "recorded_at"},
+	{"base_google_contacts.cards", "source_updated_at"},
+	{"base_google_drive.files", "modified_time"},
 }
 
 // timeGuessColumns are the generic names agents reach for when they want a
@@ -977,30 +978,52 @@ var timeGuessColumns = map[string]bool{
 // columnRemaps point a specific wrong column name at the right one. These are
 // structural renames (not time columns) that recur across sessions.
 var columnRemaps = map[string]string{
-	"channel_id": "Slack tables use conversation_id, and the channels table is named slack.conversations (not slack_channels)",
-	"channel":    "Slack tables use conversation_id, and the channels table is named slack.conversations (not slack_channels)",
-	"chat_jid":   "use chat_id — apple_messages.messages/whatsapp.messages and their chat tables key on chat_id, not chat_jid",
+	"channel_id": "Slack tables use conversation_id, and the channels table is named base_slack.conversations (not slack_channels)",
+	"channel":    "Slack tables use conversation_id, and the channels table is named base_slack.conversations (not slack_channels)",
+	"chat_jid":   "use chat_id — base_apple_messages.messages/base_whatsapp.messages and their chat tables key on chat_id, not chat_jid",
 }
 
-// tableRemaps point a wrong table name at the right one.
+// tableRemaps point a wrong table name at the right one. The catalog supplies
+// one entry per stable logical id (those ids read like table names — they are
+// what timeline rows and older docs use — but they are catalog identifiers, not
+// SQL), plus the historical timeline source_table tokens. The literals below
+// are the recurring human synonyms no catalog can derive.
 var tableRemaps = map[string]string{
-	"slack_channels":          "slack.conversations",
-	"slack_channel":           "slack.conversations",
-	"slack_conversation":      "slack.conversations",
-	"slack_conversations":     "slack.conversations",
-	"slack_message":           "slack.messages",
-	"slack_messages":          "slack.messages",
-	"gmail_message":           "gmail.messages",
-	"gmail_messages":          "gmail.messages",
-	"apple_message":           "apple_messages.messages",
-	"apple_messages":          "apple_messages.messages",
-	"agent_session_events":    "marts.ai_conversation_events",
-	"clean_agent_sessions":    "marts.ai_conversation_sessions",
-	"calendar_events":         "google_calendar.events",
-	"contact_cards":           "google_contacts.cards",
-	"apple_voice_memos_files": "apple_voice_memos.files",
-	"google_drive_files":      "google_drive.files",
-	"whatsapp_messages":       "whatsapp.messages",
+	"slack_channels":     "base_slack.conversations",
+	"slack_channel":      "base_slack.conversations",
+	"slack_conversation": "base_slack.conversations",
+	"slack_message":      "base_slack.messages",
+	"gmail_message":      "base_gmail.messages",
+	"apple_message":      "base_apple_messages.messages",
+	"marts":              "the marts split by domain: marts_inbox, marts_contacts, marts_messages, marts_ai_conversations, marts_photos, marts_calendar, marts_finance, marts_receipts",
+	"search":             "the search functions moved into timeline: timeline.search_text(...) / timeline.search_text_exact(...)",
+	"searchable_text":    "timeline.search_text('needle', 50) for ranked search, or timeline.search_text_exact('needle', 50) for literal substrings",
+}
+
+func init() {
+	for _, obj := range warehouse.Objects {
+		if !obj.Discoverable {
+			continue
+		}
+		if _, manual := tableRemaps[obj.ID]; manual {
+			continue
+		}
+		tableRemaps[obj.ID] = obj.Schema + "." + obj.Name
+	}
+	for legacy, current := range warehouse.RenamedTimelineSourceTables {
+		if _, manual := tableRemaps[legacy]; manual {
+			continue
+		}
+		tableRemaps[legacy] = warehouse.DisplayRelation(current)
+	}
+	// Pre-reorganization physical names, so a query written against the old
+	// layout is answered with the new location instead of a bare "no such
+	// relation". This is an error hint only — nothing resolves SQL through it.
+	for old, current := range warehouse.PreviousLocations {
+		if _, manual := tableRemaps[old]; !manual {
+			tableRemaps[old] = current
+		}
+	}
 }
 
 var quotedIdentifierRe = regexp.MustCompile(`"([^"]+)"`)
@@ -1068,7 +1091,7 @@ func textJSONHint(message string) string {
 // the recovery path names the search layer rather than suggesting a retry.
 func statementTimeoutHint(message string) string {
 	if strings.Contains(message, "canceling statement due to statement timeout") {
-		return "(hint: the query exceeded the server's statement budget and a retry will too. Narrow it with selective indexed predicates and LIMIT; for text search use search.search_text('needle', 50) for ranked keyword search or search.search_text_exact('needle', 50) for literal substrings instead of ILIKE/regex over raw text columns.)"
+		return "(hint: the query exceeded the server's statement budget and a retry will too. Narrow it with selective indexed predicates and LIMIT; for text search use timeline.search_text('needle', 50) for ranked keyword search or timeline.search_text_exact('needle', 50) for literal substrings instead of ILIKE/regex over raw text columns.)"
 	}
 	return ""
 }
@@ -1089,9 +1112,9 @@ func datetimeOperatorHint(message string) string {
 // search entry points are the ones agents reach for unqualified, because that
 // is how they were callable before the schema reorganization moved them.
 var functionRemaps = map[string]string{
-	"search_text":         "search.search_text",
-	"search_text_exact":   "search.search_text_exact",
-	"search_text_sources": "search.search_text_sources",
+	"search_text":         "timeline.search_text",
+	"search_text_exact":   "timeline.search_text_exact",
+	"search_text_sources": "timeline.search_text_sources",
 }
 
 var undefinedFunctionRe = regexp.MustCompile(`function ([a-zA-Z0-9_."]+)\s*\(`)
@@ -1118,7 +1141,7 @@ func undefinedFunctionHint(message string) string {
 	if remap, ok := functionRemaps[name]; ok {
 		return fmt.Sprintf("(hint: call %s(...) — queries carry no warehouse search_path, so its functions must be schema-qualified just like its tables.)", remap)
 	}
-	return "(hint: no such function — queries carry no warehouse search_path, so schema-qualify warehouse functions: search.search_text('needle', 50) for ranked search, search.search_text_exact('needle', 50) for literal substrings. Run schema_overview for the rest.)"
+	return "(hint: no such function — queries carry no warehouse search_path, so schema-qualify warehouse functions: timeline.search_text('needle', 50) for ranked search, timeline.search_text_exact('needle', 50) for literal substrings. Run schema_overview for the rest.)"
 }
 
 // undefinedTableHint fires on a missing relation (SQLSTATE 42P01). A known

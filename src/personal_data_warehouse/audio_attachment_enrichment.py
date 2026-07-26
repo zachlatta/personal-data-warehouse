@@ -388,7 +388,7 @@ def _audio_candidate_query(source: AudioEnrichmentSource, *, projection: str, ta
             GROUP BY content_sha256
         )
         {projection}
-        FROM {source.table} a
+        FROM @{source.table} a
         LEFT JOIN failed_runs runs
             ON runs.subject_id = a.{sha}
         WHERE {source.stored_predicate}

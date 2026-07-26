@@ -1,7 +1,7 @@
 """Real-Postgres integration test for the ChatGPT server-side ingest path.
 
 Skips unless POSTGRES_DATABASE_URL is set. Exercises the actual schema:
-agent_session_events + the clean_agent_sessions view, chatgpt_conversation_sync
+the source-owned event tables + the ai-conversation session view, chatgpt_conversation_sync
 (incremental watermark), and the chatgpt_sessions credential store, proving the
 runner, normalizer, DDL, and view agree end-to-end and that re-syncs are
 idempotent.
@@ -122,7 +122,7 @@ def test_full_ingest_view_and_idempotency(warehouse):
     # clean_agent_sessions roll-up over the real view.
     sessions = warehouse._query_dicts(
         "SELECT session_id, title, model, first_prompt, event_count, user_event_count, "
-        "assistant_event_count, started_at, ended_at FROM clean_agent_sessions "
+        "assistant_event_count, started_at, ended_at FROM @clean_agent_sessions "
         "WHERE source='chatgpt' ORDER BY session_id"
     )
     assert [s["session_id"] for s in sessions] == ["conv-aaa", "conv-bbb"]
@@ -137,7 +137,7 @@ def test_full_ingest_view_and_idempotency(warehouse):
 
     # Transcript order + role/subtype mapping.
     events = warehouse._query_dicts(
-        "SELECT seq, role, subtype, tool_name FROM agent_session_events "
+        "SELECT seq, role, subtype, tool_name FROM @ai_conversation_events "
         "WHERE source='chatgpt' AND session_id='conv-aaa' ORDER BY seq"
     )
     assert [(e["role"], e["subtype"]) for e in events] == [
@@ -187,7 +187,7 @@ def test_credential_store_roundtrip(warehouse):
     warehouse.upsert_chatgpt_session(
         account=ACCOUNT, session_key="default", session_token="rotated", source_browser="Brave"
     )
-    rows = warehouse._query_dicts("SELECT count(*) c FROM chatgpt_sessions WHERE account=%s", (ACCOUNT,))
+    rows = warehouse._query_dicts("SELECT count(*) c FROM @chatgpt_sessions WHERE account=%s", (ACCOUNT,))
     assert rows[0]["c"] == 1
     refreshed = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
     assert refreshed["session_token"] == "rotated"
@@ -244,4 +244,4 @@ def test_expiry_mark_roundtrip_and_clears_on_republish(warehouse):
 
 
 def _chatgpt_row_count(warehouse) -> int:
-    return warehouse._query_dicts("SELECT count(*) c FROM agent_session_events WHERE source='chatgpt'")[0]["c"]
+    return warehouse._query_dicts("SELECT count(*) c FROM @ai_conversation_events WHERE source='chatgpt'")[0]["c"]

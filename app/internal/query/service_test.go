@@ -104,7 +104,7 @@ func overviewRunner() *recordingRunner {
 			Columns: []string{"schema", "name"},
 			Rows: []map[string]any{
 				{"schema": "gmail", "name": "messages"},
-				{"schema": "marts", "name": "gmail_inbox"},
+				{"schema": "marts_inbox", "name": "gmail_threads"},
 				{"schema": "slack", "name": "messages"},
 				{"schema": "timeline", "name": "events"},
 				{"schema": "whoop", "name": "workouts"},
@@ -123,7 +123,7 @@ func overviewRunner() *recordingRunner {
 			Columns: []string{"schema", "name", "column_count", "time_columns"},
 			Rows: []map[string]any{
 				{"schema": "gmail", "name": "messages", "column_count": int64(31), "time_columns": "internal_date,ingested_at"},
-				{"schema": "marts", "name": "gmail_inbox", "column_count": int64(12), "time_columns": ""},
+				{"schema": "marts_inbox", "name": "gmail_threads", "column_count": int64(12), "time_columns": ""},
 				{"schema": "slack", "name": "messages", "column_count": int64(26), "time_columns": "message_datetime,ingested_at"},
 				{"schema": "timeline", "name": "events", "column_count": int64(19), "time_columns": "event_ts,end_ts,ingest_ts"},
 				// Two plausible event times and no curated entry: the overview must
@@ -169,12 +169,16 @@ func TestSchemaOverviewListsRelationsWithKeysAndTimeColumns(t *testing.T) {
 		"Booleans are bigint 0/1, not boolean",
 		"JSON columns are text on the older sources and real jsonb on the newer ones",
 		"Never prefix the database name",
-		`describe_table('gmail.messages')`,
+		`describe_table('base_gmail.messages')`,
 		"70% of failed warehouse queries are 42703 undefined-column",
-		// Search + layer contract survive from the old preamble.
-		"search.search_text('offer letter', 50)",
-		"search.search_text_exact('offer letter', 50)",
-		"raw tables serve STRUCTURED predicates",
+		// The layer contract and the catalog's own start-here recommendation.
+		"START HERE: timeline.events is the cross-source entry point",
+		"base_<source>",
+		"derived_<domain>",
+		"marts_<domain>",
+		"timeline.search_text('offer letter', 50)",
+		"timeline.search_text_exact('offer letter', 50)",
+		"base_* tables serve STRUCTURED predicates",
 		// One line per relation: size, width, key, time column.
 		"# gmail (1 relation)",
 		"gmail.messages",
@@ -185,7 +189,7 @@ func TestSchemaOverviewListsRelationsWithKeysAndTimeColumns(t *testing.T) {
 		"pk(account,team_id,conversation_id,message_ts)",
 		"time: message_datetime",
 		// Views have no planner estimate and must not claim zero rows.
-		"marts.gmail_inbox",
+		"marts_inbox.gmail_threads",
 		"view",
 		// timeline.events keeps its columns inline; nothing else does.
 		"timeline.events — full column catalog",
@@ -431,19 +435,19 @@ func TestSchemaErrorHint(t *testing.T) {
 			name:    "time guess on a known single table names that table's column",
 			message: `ERROR: column "ts" does not exist (SQLSTATE 42703)`,
 			sql:     "SELECT ts FROM slack.messages LIMIT 1",
-			want:    []string{"slack.messages", "message_datetime", "describe_table"},
+			want:    []string{"base_slack.messages", "message_datetime", "describe_table"},
 		},
 		{
 			name:    "time guess on AI conversation events names occurred_at",
 			message: `ERROR: column "created_at" does not exist (SQLSTATE 42703)`,
-			sql:     "SELECT created_at FROM marts.ai_conversation_events LIMIT 1",
-			want:    []string{"marts.ai_conversation_events", "occurred_at"},
+			sql:     "SELECT created_at FROM marts_ai_conversations.events LIMIT 1",
+			want:    []string{"marts_ai_conversations.events", "occurred_at"},
 		},
 		{
 			name:     "time guess with ambiguous join falls back to full list",
 			message:  `ERROR: column "ts" does not exist (SQLSTATE 42703)`,
 			sql:      "SELECT ts FROM slack.messages JOIN gmail.messages ON true",
-			want:     []string{"slack.messages.message_datetime", "gmail.messages.internal_date"},
+			want:     []string{"base_slack.messages.message_datetime", "base_gmail.messages.internal_date"},
 			wantNone: []string{"the primary time column on"},
 		},
 		{
@@ -525,19 +529,19 @@ func TestSchemaErrorHint(t *testing.T) {
 			name:    "unqualified search_text names the search-schema function",
 			message: "ERROR: function search_text(unknown, integer) does not exist (SQLSTATE 42883)",
 			sql:     "SELECT * FROM search_text('invoice', 50)",
-			want:    []string{"search.search_text("},
+			want:    []string{"timeline.search_text("},
 		},
 		{
 			name:    "unqualified search_text_exact names the search-schema function",
 			message: "ERROR: function search_text_exact(unknown, integer) does not exist (SQLSTATE 42883)",
 			sql:     "SELECT * FROM search_text_exact('invoice', 50)",
-			want:    []string{"search.search_text_exact("},
+			want:    []string{"timeline.search_text_exact("},
 		},
 		{
 			name:    "public-qualified search_text still points at the search schema",
 			message: "ERROR: function public.search_text(unknown, integer) does not exist (SQLSTATE 42883)",
 			sql:     "SELECT * FROM public.search_text('invoice', 50)",
-			want:    []string{"search.search_text("},
+			want:    []string{"timeline.search_text("},
 		},
 		{
 			name:    "unknown function is told to schema-qualify",
@@ -555,7 +559,7 @@ func TestSchemaErrorHint(t *testing.T) {
 			name:    "statement timeout steers to the search layer",
 			message: `ERROR: canceling statement due to statement timeout (SQLSTATE 57014)`,
 			sql:     "SELECT * FROM gmail.messages WHERE body_text ILIKE '%offer%'",
-			want:    []string{"search.search_text(", "search.search_text_exact("},
+			want:    []string{"timeline.search_text(", "timeline.search_text_exact("},
 		},
 		{
 			name:     "unrelated syntax error gets no hint",

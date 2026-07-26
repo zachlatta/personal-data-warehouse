@@ -112,7 +112,7 @@ def test_whoop_tables_upsert_rows_and_state(warehouse: PostgresWarehouse) -> Non
         updated_at=synced_at,
     )
 
-    rows = warehouse._query("SELECT cycle_id, strain FROM whoop_cycles WHERE account = %s", ("zach@example.com",))
+    rows = warehouse._query("SELECT cycle_id, strain FROM @whoop_cycles WHERE account = %s", ("zach@example.com",))
     assert rows == [("cycle-1", 6.0)]
     state = warehouse.load_whoop_sync_state()
     assert state[("zach@example.com", "cycles")]["status"] == "ok"

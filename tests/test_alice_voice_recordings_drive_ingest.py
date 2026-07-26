@@ -66,7 +66,7 @@ def listing(file_id: str, filename: str, **properties: str) -> ObjectListing:
 
 def test_alice_archive_tables_are_source_owned_and_registered() -> None:
     recordings = relation("alice_voice_recordings")
-    assert (recordings.schema, recordings.name) == ("alice_voice_recordings", "recordings")
+    assert (recordings.schema, recordings.name) == ("base_alice_voice_recordings", "recordings")
     assert POSTGRES_TABLES["alice_voice_recordings"].columns == ALICE_VOICE_RECORDING_COLUMNS
     assert POSTGRES_TABLES["alice_voice_recordings"].primary_key == ("account", "recording_id")
     assert (

@@ -27,7 +27,7 @@ Current ingestion path:
   Dagster ingests them into normalized Postgres tables.
 - Apple Contacts use that app-ingest path too: a LaunchAgent snapshots every local and account
   Address Book store, posts changed contacts and tombstones, and Dagster merges them with Google
-  Contacts in the canonical `marts.contacts` view.
+  Contacts in the canonical `marts_contacts.contacts` view.
 - WHOOP syncs read-only health data through the WHOOP v2 OAuth API: profile, body measurements,
   cycles, recovery, sleep, and workouts land in source-owned `whoop.*` Postgres tables.
 - Plaid uses an interactive local Link flow to authorize personal institutions. Access tokens stay
@@ -229,22 +229,22 @@ uv run personal-data-warehouse-contacts-sync
 ```
 
 Dagster exposes `google_contacts_sync` in the `contacts` group, scheduled hourly by
-`contacts_sync_hourly`. The sync writes `google_contacts.cards` and
-`google_contacts.sync_state`. The canonical `marts.contacts` view unions active Google and Apple
-cards; `marts.contact_points` normalizes every email address and phone number for identity joins.
+`contacts_sync_hourly`. The sync writes `base_google_contacts.cards` and
+`ops.google_contacts_sync_state`. The canonical `marts_contacts.contacts` view unions active Google and Apple
+cards; `marts_contacts.contact_points` normalizes every email address and phone number for identity joins.
 
 ## WHOOP Sync
 
 WHOOP sync is a read-only OAuth integration against the WHOOP v2 API. It writes the main
 health data collections into source-owned tables:
 
-- `whoop.profiles` (`whoop_profiles` logical name): basic profile (`read:profile`)
-- `whoop.body_measurements` (`whoop_body_measurements`): height/weight/max HR (`read:body_measurement`)
-- `whoop.cycles` (`whoop_cycles`): physiological cycles and strain (`read:cycles`)
-- `whoop.recoveries` (`whoop_recoveries`): recovery scores and HRV/RHR/SpO2/skin temp (`read:recovery`)
-- `whoop.sleeps` (`whoop_sleeps`): sleeps/naps, stages, sleep need, respiratory rate (`read:sleep`)
-- `whoop.workouts` (`whoop_workouts`): workouts, sport, strain, HR, distance, zones (`read:workout`)
-- `whoop.sync_state` (`whoop_sync_state`): per-collection sync status and watermarks
+- `base_whoop.profiles` (`whoop_profiles` logical name): basic profile (`read:profile`)
+- `base_whoop.body_measurements` (`whoop_body_measurements`): height/weight/max HR (`read:body_measurement`)
+- `base_whoop.cycles` (`whoop_cycles`): physiological cycles and strain (`read:cycles`)
+- `base_whoop.recoveries` (`whoop_recoveries`): recovery scores and HRV/RHR/SpO2/skin temp (`read:recovery`)
+- `base_whoop.sleeps` (`whoop_sleeps`): sleeps/naps, stages, sleep need, respiratory rate (`read:sleep`)
+- `base_whoop.workouts` (`whoop_workouts`): workouts, sport, strain, HR, distance, zones (`read:workout`)
+- `ops.whoop_sync_state` (`whoop_sync_state`): per-collection sync status and watermarks
 
 Cycles, recovery scores, sleeps, and workouts are also projected into the warehouse's unified
 `timeline.events` surface through dedicated WHOOP timeline adapters; profile/body snapshots remain
@@ -311,16 +311,16 @@ SQL starting points:
 
 ```sql
 SELECT start_at, strain, average_heart_rate, max_heart_rate
-FROM whoop.cycles ORDER BY start_at DESC LIMIT 30;
+FROM base_whoop.cycles ORDER BY start_at DESC LIMIT 30;
 
 SELECT start_at, end_at, sleep_performance_percentage, respiratory_rate
-FROM whoop.sleeps WHERE nap = 0 ORDER BY start_at DESC LIMIT 30;
+FROM base_whoop.sleeps WHERE nap = 0 ORDER BY start_at DESC LIMIT 30;
 
 SELECT start_at, sport_name, strain, distance_meter
-FROM whoop.workouts ORDER BY start_at DESC LIMIT 30;
+FROM base_whoop.workouts ORDER BY start_at DESC LIMIT 30;
 
 SELECT updated_at, recovery_score, resting_heart_rate, hrv_rmssd_milli
-FROM whoop.recoveries ORDER BY updated_at DESC LIMIT 30;
+FROM base_whoop.recoveries ORDER BY updated_at DESC LIMIT 30;
 ```
 
 WHOOP API notes followed by the implementation: base URL `https://api.prod.whoop.com/developer`,
@@ -460,14 +460,14 @@ Calendar sync runs through `calendar_event_sync_every_five_minutes` with its own
 ## Plaid Finance Sync
 
 Plaid raw data is source-owned: physical relations live under `plaid.*`, not a generic
-`finance` source schema. Stable finance-domain read views live under `marts.finance_*`.
+`derived_finance` schema. Stable finance-domain read views live under `marts_finance.*`.
 Access tokens are isolated in `private.plaid_item_tokens`; normal read-only schema discovery and
 query surfaces do not expose the private schema. Plaid's legacy public key is not used by the
 modern Link-token API.
 
 The activity timeline reads the deduplicated ledger rather than the raw Plaid tables: it emits
-`finance.transaction` events from `finance.transactions`, `finance.balance_observation` events
-from `finance.observations`, and `finance.document` events from `manual_finance.documents`. This
+`finance.transaction` events from `derived_finance.transactions`, `finance.balance_observation` events
+from `derived_finance.observations`, and `finance.document` events from `base_manual_finance.documents`. This
 keeps finance visible without showing the same transaction once per source witness.
 
 Configure the `PLAID_*` variables below and ensure `POSTGRES_DATABASE_URL` points at the target
@@ -526,7 +526,7 @@ redirect URI. Optional tuning: `PLAID_CLIENT_NAME`, `PLAID_PRODUCTS`, `PLAID_COU
 `PLAID_LANGUAGE`, `PLAID_WEBHOOK`, `PLAID_REQUEST_TIMEOUT_SECONDS`, and
 `PLAID_TRANSACTIONS_LOOKBACK_DAYS`. Account, holding, and liability endpoints are authoritative
 snapshots: accounts absent from a later snapshot are tombstoned, while absent holdings and
-liabilities are removed. Product failures are written to `plaid.sync_state` with a redacted error
+liabilities are removed. Product failures are written to `ops.plaid_sync_state` with a redacted error
 before the overall run fails, so an old `ok` cannot mask a broken credential/product.
 
 Permanent Item errors are the one exception to failing the run. When Plaid answers with a code that
@@ -538,7 +538,7 @@ a warning per run, an `action_required` count in the asset metadata, and a query
 
 ```sql
 SELECT item_id, product, status, error, last_synced_at
-FROM plaid.sync_state
+FROM ops.plaid_sync_state
 WHERE status = 'action_required';
 ```
 
@@ -546,12 +546,12 @@ Re-link that institution with `pdw ingest plaid link` to clear it. The prior cur
 successful sync time are preserved, so re-linking resumes rather than replaying all history — but
 only when Link repairs the existing Item. Plaid may instead mint a **new** `item_id` with new
 account ids for the same real accounts, leaving the dead Item linked alongside it. Both then sync,
-so every balance is counted twice in `marts.finance_net_worth` and every transaction in the
-overlap window appears twice in `marts.finance_transactions`. A cleared `action_required` is
+so every balance is counted twice in `marts_finance.net_worth` and every transaction in the
+overlap window appears twice in `marts_derived_finance.transactions`. A cleared `action_required` is
 therefore not the finish line; check the item count too:
 
 ```sql
-SELECT institution_name, count(*) FROM plaid.items GROUP BY 1 HAVING count(*) > 1;
+SELECT institution_name, count(*) FROM base_plaid.items GROUP BY 1 HAVING count(*) > 1;
 ```
 
 Retire the leftover Item — this revokes it at Plaid (`/item/remove`) and deletes exactly that
@@ -568,7 +568,7 @@ revocation (an Item Plaid has already forgotten is the one exception), so a fail
 retry. On its next run the finance ledger merges the re-linked accounts back into the logical
 accounts they duplicated (Plaid account ids are item-scoped, so ledger identity resolves a plaid
 account by owner + institution + mask + side, exactly like a statement document) and drops the
-duplicated transactions. Merge residue — a `finance.accounts` row no source links to any more —
+duplicated transactions. Merge residue — a `derived_finance.accounts` row no source links to any more —
 is pruned with its observations in the same run.
 
 Warehouse initialization provisions the NOLOGIN role named by `PDW_QUERY_POSTGRES_ROLE` (default
@@ -591,12 +591,12 @@ Safe ad-hoc verification queries should avoid selecting masks, balances, transac
 holdings, raw JSON, or private tokens. Useful aggregate/status surfaces are:
 
 ```sql
-SELECT product, status, last_synced_at FROM plaid.sync_state ORDER BY product;
-SELECT count(*) FROM marts.finance_accounts;
-SELECT count(*) FROM marts.finance_transactions;
-SELECT count(*) FROM marts.finance_investment_holdings;
-SELECT count(*) FROM marts.finance_investment_transactions;
-SELECT count(*) FROM marts.finance_liabilities;
+SELECT product, status, last_synced_at FROM ops.plaid_sync_state ORDER BY product;
+SELECT count(*) FROM marts_derived_finance.accounts;
+SELECT count(*) FROM marts_derived_finance.transactions;
+SELECT count(*) FROM marts_finance.investment_holdings;
+SELECT count(*) FROM marts_finance.investment_transactions;
+SELECT count(*) FROM marts_finance.liabilities;
 ```
 
 ## Deployment Metadata
@@ -725,7 +725,7 @@ devices through iCloud exactly like a rename typed in the app.
   loudly instead of being mutated.
 - Enriched titles come from the app's authenticated HTTP tool API (the same
   static-bearer `sql` tool the pdw CLI uses): the newest completed
-  `apple_voice_memos.enrichments` title per recording, joined to local recordings by
+  `derived_voice_memos.enrichments` title per recording, joined to local recordings by
   filename stem.
 
 The write-back runs by default after every upload. Control it with
@@ -1026,18 +1026,18 @@ pdw ingest apple-contacts --mode incremental
 Incremental state lives in
 `~/Library/Application Support/personal-data-warehouse/apple-contacts-upload-state.sqlite`.
 Dagster's `apple_contacts_drive_inbox_sensor` consumes uploaded batches into
-`apple_contacts.cards` and promotes them from `apple-contacts/inbox/...` to
+`base_apple_contacts.cards` and promotes them from `apple-contacts/inbox/...` to
 `apple-contacts/library/...`.
 
 The canonical identity views are:
 
-- `marts.contacts`: active Google and Apple cards.
-- `marts.contact_points`: normalized phone and email identifiers.
-- `marts.apple_messages`: Messages rows with `sender_name`, `sender_address`, and resolved contact
+- `marts_contacts.contacts`: active Google and Apple cards.
+- `marts_contacts.contact_points`: normalized phone and email identifiers.
+- `marts_messages.apple_messages`: Messages rows with `sender_name`, `sender_address`, and resolved contact
   provenance.
 
-WhatsApp sender resolution also follows `whatsapp.chat_participants` LID-to-phone aliases before
-joining `whatsapp.contacts`, so linked-device-only senders no longer appear missing.
+WhatsApp sender resolution also follows `base_whatsapp.chat_participants` LID-to-phone aliases before
+joining `base_whatsapp.contacts`, so linked-device-only senders no longer appear missing.
 
 Install or refresh the five-minute LaunchAgent:
 
@@ -1113,8 +1113,8 @@ uv run personal-data-warehouse-google-auth --email you@example.com --write-env
 
 Dagster exposes `alice_voice_recordings_import`, `alice_voice_recordings_gmail_recovery`, and
 `alice_voice_recordings_drive_ingest` in the `alice_voice_recordings` group. The final asset
-materializes the merged API/recovery archive into `alice_voice_recordings.recordings` and
-`alice_voice_recordings.artifacts`, which makes recordings searchable and adds one recording event
+materializes the merged API/recovery archive into `base_alice_voice_recordings.recordings` and
+`base_alice_voice_recordings.artifacts`, which makes recordings searchable and adds one recording event
 to the timeline. `alice_voice_recordings_import_job` runs all three assets daily at 04:17 UTC. This
 is the scheduler of record for regular Alice archival. To run the API import manually:
 
@@ -1291,8 +1291,8 @@ Inside the container the agent uses the same `pdw` commands a human would, alrea
 
 ```bash
 pdw schema                                        # relations + keys
-pdw columns gmail.messages                        # exact columns and types
-pdw sql -q 'why you are asking' "SELECT summary, attendees_json FROM google_calendar.events LIMIT 5"
+pdw columns base_gmail.messages                        # exact columns and types
+pdw sql -q 'why you are asking' "SELECT summary, attendees_json FROM base_google_calendar.events LIMIT 5"
 pdw call get_object --data '{"storage_file_id":"..."}'   # then curl the signed download_url
 ```
 
@@ -1365,18 +1365,18 @@ The sync creates and maintains:
 - `apple_message_chats`, `apple_message_handles`, `apple_message_chat_handles`,
   `apple_message_chat_messages`: normalized conversation, participant, and membership tables
 - `apple_message_attachments`: attachment metadata and staged Drive storage pointers
-- `apple_contacts.cards`: latest known state for each local or iCloud Apple contact
-- `marts.contacts`, `marts.contact_points`: canonical active contacts and normalized identifiers
-- `marts.apple_messages`: Apple Messages enriched with contact-backed sender identity
+- `base_apple_contacts.cards`: latest known state for each local or iCloud Apple contact
+- `marts_contacts.contacts`, `marts_contacts.contact_points`: canonical active contacts and normalized identifiers
+- `marts_messages.apple_messages`: Apple Messages enriched with contact-backed sender identity
 - `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
 - `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
-- `plaid.items`, `plaid.accounts`, `plaid.transactions`, `plaid.investment_securities`,
-  `plaid.investment_holdings`, `plaid.investment_transactions`, and `plaid.liabilities`: raw,
+- `base_plaid.items`, `base_plaid.accounts`, `base_plaid.transactions`, `base_plaid.investment_securities`,
+  `base_plaid.investment_holdings`, `base_plaid.investment_transactions`, and `base_plaid.liabilities`: raw,
   source-owned Plaid metadata and financial records
-- `plaid.sync_state`: per-item/product cursor, status, and last successful sync timestamp
+- `ops.plaid_sync_state`: per-item/product cursor, status, and last successful sync timestamp
 - `private.plaid_item_tokens`: private Plaid access-token storage; excluded from normal read surfaces
-- `marts.finance_accounts`, `marts.finance_transactions`, `marts.finance_investment_holdings`,
-  `marts.finance_investment_transactions`, and `marts.finance_liabilities`: stable finance-domain
+- `marts_derived_finance.accounts`, `marts_derived_finance.transactions`, `marts_finance.investment_holdings`,
+  `marts_finance.investment_transactions`, and `marts_finance.liabilities`: stable finance-domain
   views over the Plaid source tables
 
 The warehouse also creates clean views for current inbox and transcript state:

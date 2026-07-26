@@ -362,9 +362,9 @@ class PhotoIdentityRunner:
                        f.captured_at, f.capture_tz_offset, f.camera_make, f.camera_model,
                        f.raw_metadata_json, f.storage_backend, f.storage_key,
                        f.storage_file_id, f.storage_url
-                FROM {table} f
+                FROM @{table} f
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM photo_asset_files l
+                    SELECT 1 FROM @photo_asset_files l
                     WHERE l.source = f.source AND l.account = f.account
                       AND l.source_native_id = f.source_native_id
                       AND l.content_sha256 = f.content_sha256
@@ -383,8 +383,8 @@ class PhotoIdentityRunner:
             SELECT l.source, l.account, l.source_native_id, l.role, l.content_sha256,
                    l.photo_id, a.capture_ts AS captured_at, a.camera_make, a.camera_model,
                    a.best_file_mime_type AS mime_type
-            FROM photo_asset_files l
-            JOIN photo_assets a ON a.photo_id = l.photo_id
+            FROM @photo_asset_files l
+            JOIN @photo_assets a ON a.photo_id = l.photo_id
             """
         )
         return [
@@ -405,7 +405,7 @@ class PhotoIdentityRunner:
 
     def _load_fingerprints(self) -> dict[str, str]:
         rows = self._warehouse._query(
-            "SELECT content_sha256, dhash FROM media_fingerprints WHERE hash_version = %s",
+            "SELECT content_sha256, dhash FROM @media_fingerprints WHERE hash_version = %s",
             (self._hash_version,),
         )
         return {str(sha): str(dhash) for sha, dhash in rows}
@@ -536,8 +536,8 @@ class PhotoIdentityRunner:
                        f.captured_at, f.capture_tz_offset, f.camera_make, f.camera_model,
                        f.raw_metadata_json, f.storage_backend, f.storage_key,
                        f.storage_file_id, f.storage_url
-                FROM photo_asset_files l
-                JOIN {table} f
+                FROM @photo_asset_files l
+                JOIN @{table} f
                   ON f.source = l.source AND f.account = l.account
                  AND f.source_native_id = l.source_native_id
                  AND f.content_sha256 = l.content_sha256
@@ -550,7 +550,7 @@ class PhotoIdentityRunner:
 
     def _load_asset(self, photo_id: str) -> dict[str, Any] | None:
         rows = self._warehouse._query_dicts(
-            "SELECT * FROM photo_assets WHERE photo_id = %s", (photo_id,)
+            "SELECT * FROM @photo_assets WHERE photo_id = %s", (photo_id,)
         )
         return rows[0] if rows else None
 
@@ -592,9 +592,9 @@ def has_unresolved_photo_files(warehouse) -> bool:
     for table in PHOTO_SOURCE_RELATIONS.values():
         rows = warehouse._query(
             f"""
-            SELECT 1 FROM {table} f
+            SELECT 1 FROM @{table} f
             WHERE NOT EXISTS (
-                SELECT 1 FROM photo_asset_files l
+                SELECT 1 FROM @photo_asset_files l
                 WHERE l.source = f.source AND l.account = f.account
                   AND l.source_native_id = f.source_native_id
                   AND l.content_sha256 = f.content_sha256

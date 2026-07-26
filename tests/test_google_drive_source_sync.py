@@ -231,13 +231,13 @@ def test_full_crawl_mirrors_metadata_and_text(warehouse):
     assert summary.files_seen == 2 and summary.texts_written == 2
 
     rows = warehouse._query(
-        "SELECT folder_path, is_excluded, storage_backend, storage_file_id FROM google_drive_files "
+        "SELECT folder_path, is_excluded, storage_backend, storage_file_id FROM @google_drive_files "
         "WHERE file_id = 'f_doc'"
     )
     assert rows == [("/My Drive/Docs", 0, "google_drive_source", "f_doc")]
 
     texts = warehouse._query(
-        "SELECT extractor, text_extraction_status FROM google_drive_file_texts WHERE file_id = 'f_doc'"
+        "SELECT extractor, text_extraction_status FROM @google_drive_file_texts WHERE file_id = 'f_doc'"
     )
     assert texts == [("drive_export", "ok")]
 
@@ -268,12 +268,12 @@ def test_full_crawl_excludes_transport_folders(warehouse):
     _runner(warehouse, client, settings).sync_all()
 
     excluded = warehouse._query(
-        "SELECT file_id, is_excluded, exclude_reason FROM google_drive_files ORDER BY file_id"
+        "SELECT file_id, is_excluded, exclude_reason FROM @google_drive_files ORDER BY file_id"
     )
     assert excluded == [("drop", 1, "excluded_folder"), ("keep", 0, "")]
     # The excluded file's bytes were never downloaded and it has no text row.
     assert "drop" not in client.download_calls
-    assert warehouse._query("SELECT count(*) FROM google_drive_file_texts WHERE file_id = 'drop'") == [(0,)]
+    assert warehouse._query("SELECT count(*) FROM @google_drive_file_texts WHERE file_id = 'drop'") == [(0,)]
 
 
 def test_full_crawl_records_skip_status_for_unsupported_files(warehouse):
@@ -294,7 +294,7 @@ def test_full_crawl_records_skip_status_for_unsupported_files(warehouse):
     _runner(warehouse, client).sync_all()
 
     assert warehouse._query(
-        "SELECT extractor, text_extraction_status, text FROM google_drive_file_texts WHERE file_id = 'pdf'"
+        "SELECT extractor, text_extraction_status, text FROM @google_drive_file_texts WHERE file_id = 'pdf'"
     ) == [("none", "unsupported", "")]
 
 
@@ -369,13 +369,13 @@ def test_incremental_upserts_and_soft_deletes(warehouse):
     summary = _runner(warehouse, client).sync_all()[0]
     assert summary.sync_type == "incremental"
 
-    assert warehouse._query("SELECT trashed FROM google_drive_files WHERE file_id = 'f1'") == [(1,)]
-    assert warehouse._query("SELECT name FROM google_drive_files WHERE file_id = 'f2'") == [("b.txt",)]
+    assert warehouse._query("SELECT trashed FROM @google_drive_files WHERE file_id = 'f1'") == [(1,)]
+    assert warehouse._query("SELECT name FROM @google_drive_files WHERE file_id = 'f2'") == [("b.txt",)]
     hits = warehouse._query(
         """
         SELECT f.account || ':' || f.file_id
-        FROM google_drive_files f
-        JOIN google_drive_file_texts t USING (account, file_id)
+        FROM @google_drive_files f
+        JOIN @google_drive_file_texts t USING (account, file_id)
         WHERE f.trashed = 0 AND f.is_excluded = 0 AND t.text ILIKE '%mango%'
         """
     )
@@ -384,8 +384,8 @@ def test_incremental_upserts_and_soft_deletes(warehouse):
     assert warehouse._query(
         """
         SELECT count(*)
-        FROM google_drive_files f
-        JOIN google_drive_file_texts t USING (account, file_id)
+        FROM @google_drive_files f
+        JOIN @google_drive_file_texts t USING (account, file_id)
         WHERE f.trashed = 0 AND f.is_excluded = 0 AND f.account = 'zach@hackclub.com' AND f.file_id = 'f1'
         """
     ) == [(0,)]
@@ -419,9 +419,9 @@ def test_incremental_skips_reextraction_when_unchanged(warehouse):
     # No re-download since modifiedTime is unchanged and an ok text row exists.
     assert client.download_calls == []
     # Metadata still updated (starred flag).
-    assert warehouse._query("SELECT starred FROM google_drive_files WHERE file_id = 'f1'") == [(1,)]
+    assert warehouse._query("SELECT starred FROM @google_drive_files WHERE file_id = 'f1'") == [(1,)]
     # The file row keeps pointing at the previously extracted content.
-    assert warehouse._query("SELECT content_sha256 != '' FROM google_drive_files WHERE file_id = 'f1'") == [(True,)]
+    assert warehouse._query("SELECT content_sha256 != '' FROM @google_drive_files WHERE file_id = 'f1'") == [(True,)]
 
 
 def test_incremental_preserves_full_crawl_timestamp(warehouse):
@@ -471,6 +471,6 @@ def test_incremental_stores_page_token_when_capped(warehouse):
     summary = _runner(warehouse, client, settings).sync_all()[0]
 
     assert summary.files_seen == 1
-    assert warehouse._query("SELECT file_id FROM google_drive_files WHERE file_id IN ('f2', 'f3')") == [("f2",)]
+    assert warehouse._query("SELECT file_id FROM @google_drive_files WHERE file_id IN ('f2', 'f3')") == [("f2",)]
     state = warehouse.load_google_drive_sync_state()["zach@hackclub.com"]
     assert state.start_page_token == "token-page-2"

@@ -30,7 +30,7 @@ from personal_data_warehouse.schema import (
     VOICE_MEMO_FILE_COLUMNS,
     VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
 )
-from personal_data_warehouse.relations import query_relation
+from personal_data_warehouse.relations import relation
 from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
@@ -69,7 +69,7 @@ def warehouse():
 
 
 def _physical_relation(warehouse: PostgresWarehouse, logical_name: str):
-    return query_relation(logical_name).with_namespace(warehouse.schema_namespace)
+    return relation(logical_name).with_namespace(warehouse.schema_namespace)
 
 
 def _index_names(warehouse: PostgresWarehouse, logical_name: str) -> set[str]:
@@ -121,24 +121,13 @@ def test_search_view_refresh_takes_advisory_lock(monkeypatch) -> None:
 
     monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: commands.append((sql, params)))
     monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: False)
-    # Report one pre-reorganization copy so the DROP the legacy sweep issues for
-    # it has to land inside the advisory lock like the rest of the refresh.
-    monkeypatch.setattr(
-        warehouse,
-        "_query",
-        lambda sql, params=None: [("search_text", "query text, max_results integer")] if "pg_proc" in sql else [],
-    )
+    monkeypatch.setattr(warehouse, "_query", lambda sql, params=None: [])
     monkeypatch.setattr(warehouse, "_raw_command", lambda sql, params=None: commands.append((sql, params)))
 
     warehouse._ensure_search_views_if_possible()
 
     assert commands[0] == ("SELECT pg_advisory_lock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
     assert commands[-1] == ("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
-    assert ("DROP VIEW IF EXISTS searchable_text", None) in commands
-    assert (
-        'DROP FUNCTION IF EXISTS "public"."search_text"(query text, max_results integer)',
-        None,
-    ) in commands
 
 
 def test_search_view_refresh_releases_advisory_lock_on_error(monkeypatch) -> None:
@@ -147,11 +136,13 @@ def test_search_view_refresh_releases_advisory_lock_on_error(monkeypatch) -> Non
 
     def command(sql, params=None):
         commands.append((sql, params))
-        if sql == "DROP VIEW IF EXISTS searchable_text":
-            raise RuntimeError("ddl failed")
+        if "pg_advisory_lock" in sql:
+            return
+        raise RuntimeError("ddl failed")
 
     monkeypatch.setattr(warehouse, "_command", command)
-    monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: False)
+    monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: True)
+    monkeypatch.setattr(warehouse, "_ensure_indexes", lambda tables: None)
 
     with pytest.raises(RuntimeError, match="ddl failed"):
         warehouse._ensure_search_views_if_possible()
@@ -176,7 +167,7 @@ def test_search_schema_rebuild_is_skipped_when_unchanged(warehouse: PostgresWare
     finally:
         warehouse._command = original_command
 
-    assert not any("CREATE OR REPLACE FUNCTION search_text(" in sql for sql in issued), (
+    assert not any("CREATE OR REPLACE FUNCTION @search_text(" in sql for sql in issued), (
         "search_text() was recompiled even though its DDL was unchanged"
     )
 
@@ -188,7 +179,7 @@ def test_search_schema_rebuild_is_skipped_when_unchanged(warehouse: PostgresWare
     finally:
         warehouse._command = original_command
 
-    assert any("CREATE OR REPLACE FUNCTION search_text(" in sql for sql in issued), (
+    assert any("CREATE OR REPLACE FUNCTION @search_text(" in sql for sql in issued), (
         "search_text() was not rebuilt after the signature marker was cleared"
     )
 
@@ -316,7 +307,7 @@ def test_postgres_message_upsert_keeps_highest_sync_version(warehouse: PostgresW
     warehouse.insert_messages([_message_row(message_id="m1", subject="new", labels=["INBOX"], sync_version=20)])
     warehouse.insert_messages([_message_row(message_id="m1", subject="old", labels=["INBOX"], sync_version=10)])
 
-    rows = warehouse._query("SELECT subject, sync_version FROM gmail_messages WHERE message_id = %s", ("m1",))
+    rows = warehouse._query("SELECT subject, sync_version FROM @gmail_messages WHERE message_id = %s", ("m1",))
 
     assert rows == [("new", 20)]
 
@@ -415,7 +406,7 @@ def test_postgres_insert_slack_messages_dedupes_duplicate_keys_in_one_batch(ware
     )
 
     rows = warehouse._query(
-        "SELECT text, sync_version FROM slack_messages WHERE conversation_id = %s AND message_ts = %s",
+        "SELECT text, sync_version FROM @slack_messages WHERE conversation_id = %s AND message_ts = %s",
         ("C1", "100.1"),
     )
     assert rows == [("new", 2)]
@@ -904,61 +895,6 @@ def test_postgres_whatsapp_media_enrichment_candidates_select_downloaded_blobs(
     )
 
 
-def test_postgres_renames_legacy_gmail_attachment_enrichments_table(warehouse: PostgresWarehouse) -> None:
-    """The shared file_attachment_enrichments table is the renamed
-    gmail_attachment_enrichments. The migration must preserve existing rows and
-    leave only the new-named relation + indexes behind."""
-    from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS
-
-    now = datetime(2026, 6, 1, tzinfo=UTC)
-    warehouse.ensure_file_attachment_enrichment_tables()
-    warehouse.insert_attachment_enrichments(
-        [
-            _default_row(
-                ATTACHMENT_ENRICHMENT_COLUMNS,
-                content_sha256="legacy-sha",
-                ai_provider="agent_codex",
-                ai_model="",
-                ai_prompt_version="gmail-attachment-agent-v1",
-                text="legacy enrichment text",
-                text_extraction_status="agent_ok",
-                updated_at=now,
-                sync_version=1,
-            )
-        ]
-    )
-
-    # Simulate a pre-generalization deployment: the table and its indexes still
-    # carry the old gmail_attachment_enrichments names.
-    warehouse._command("ALTER TABLE file_attachment_enrichments RENAME TO gmail_attachment_enrichments")
-    warehouse._command(
-        "ALTER INDEX IF EXISTS file_attachment_enrichments_text_bm25_idx "
-        "RENAME TO gmail_attachment_enrichments_text_bm25_idx"
-    )
-    warehouse._command(
-        "ALTER INDEX IF EXISTS file_attachment_enrichments_text_trgm_idx "
-        "RENAME TO gmail_attachment_enrichments_text_trgm_idx"
-    )
-    warehouse._command(
-        "ALTER INDEX IF EXISTS file_attachment_enrichments_pkey "
-        "RENAME TO gmail_attachment_enrichments_pkey"
-    )
-    assert warehouse._relation_exists("gmail_attachment_enrichments")
-    assert not warehouse._relation_exists("file_attachment_enrichments")
-
-    warehouse.ensure_file_attachment_enrichment_tables()
-
-    assert warehouse._relation_exists("file_attachment_enrichments")
-    assert not warehouse._relation_exists("gmail_attachment_enrichments")
-    preserved = warehouse._query(
-        "SELECT text FROM file_attachment_enrichments WHERE content_sha256 = %s",
-        ("legacy-sha",),
-    )
-    assert preserved == [("legacy enrichment text",)]
-    index_names = _index_names(warehouse, "file_attachment_enrichments")
-    assert not any(name.startswith("gmail_attachment_enrichments") for name in index_names)
-
-
 def test_postgres_insert_normalizes_nul_text_values() -> None:
     assert _normalize_insert_value("before\x00after") == "before\\u0000after"
     assert _normalize_insert_value(["ok", "before\x00after", ("nested\x00value",)]) == [
@@ -1045,7 +981,7 @@ def test_postgres_whatsapp_chat_name_survives_later_blank_history_row(warehouse:
     warehouse.insert_whatsapp_chats([chat_row(name="", sync_version=2)])
 
     rows = warehouse._query(
-        "SELECT name FROM whatsapp_chats WHERE chat_id = '120363274447440808@g.us'"
+        "SELECT name FROM @whatsapp_chats WHERE chat_id = '120363274447440808@g.us'"
     )
     assert [row[0] for row in rows] == ["Founders Group"]
 
@@ -1072,7 +1008,7 @@ def test_postgres_whatsapp_chat_participants_roundtrip(warehouse: PostgresWareho
     )
 
     rows = warehouse._query(
-        "SELECT display_name, is_admin FROM whatsapp_chat_participants "
+        "SELECT display_name, is_admin FROM @whatsapp_chat_participants "
         "WHERE chat_id = '120363274447440808@g.us'"
     )
     assert rows == [("Alice", 1)]
@@ -1127,14 +1063,14 @@ def test_backfill_whatsapp_chats_fills_gaps_without_clobbering(warehouse: Postgr
 
     assert inserted == 4  # everything except the already-present 111@g.us
     kinds = dict(warehouse._query(
-        "SELECT chat_id, chat_type FROM whatsapp_chats WHERE account='zach@example.test'"
+        "SELECT chat_id, chat_type FROM @whatsapp_chats WHERE account='zach@example.test'"
     ))
     assert kinds["status@broadcast"] == "status"
     assert kinds["222@g.us"] == "group"
     assert kinds["15550001@s.whatsapp.net"] == "user"
     assert kinds["98765@lid"] == "user"
     # Existing named group untouched.
-    name = warehouse._query("SELECT name FROM whatsapp_chats WHERE chat_id='111@g.us'")[0][0]
+    name = warehouse._query("SELECT name FROM @whatsapp_chats WHERE chat_id='111@g.us'")[0][0]
     assert name == "Real Group"
     # Idempotent: a second pass inserts nothing.
     assert warehouse.backfill_whatsapp_chats_from_messages() == 0
@@ -1158,14 +1094,14 @@ def test_clean_whatsapp_messages_view_classifies_and_resolves(warehouse: Postgre
     warehouse.backfill_whatsapp_chats_from_messages()
 
     rows = dict(warehouse._query(
-        "SELECT message_id, chat_kind FROM clean_whatsapp_messages WHERE account='zach@example.test'"
+        "SELECT message_id, chat_kind FROM @clean_whatsapp_messages WHERE account='zach@example.test'"
     ))
     assert rows["s1"] == "status"
     assert rows["g1"] == "group"
     assert rows["d1"] == "user"
     # sender_name resolves via whatsapp_contacts (full_name wins over push_name).
     sender = warehouse._query(
-        "SELECT sender_name FROM clean_whatsapp_messages WHERE message_id='d1'"
+        "SELECT sender_name FROM @clean_whatsapp_messages WHERE message_id='d1'"
     )[0][0]
     assert sender == "Alice Example"
 
@@ -1216,7 +1152,7 @@ def test_clean_whatsapp_messages_resolves_lid_sender_through_phone_jid(
     ])
 
     sender = warehouse._query(
-        "SELECT sender_name FROM clean_whatsapp_messages WHERE message_id='lid-message'"
+        "SELECT sender_name FROM @clean_whatsapp_messages WHERE message_id='lid-message'"
     )[0][0]
 
     assert sender == "Example Person"
@@ -1275,10 +1211,10 @@ def test_canonical_contacts_and_apple_messages_resolve_apple_contact(
     warehouse.insert_apple_messages([message])
 
     contacts = warehouse._query(
-        "SELECT source, display_name FROM clean_contacts WHERE card_id='apple-contact-1'"
+        "SELECT source, display_name FROM @clean_contacts WHERE card_id='apple-contact-1'"
     )
     resolved = warehouse._query(
-        "SELECT sender_name, sender_address FROM clean_apple_messages WHERE message_id='message-1'"
+        "SELECT sender_name, sender_address FROM @clean_apple_messages WHERE message_id='message-1'"
     )
 
     assert contacts == [("apple_contacts", "Example Person")]
@@ -1340,7 +1276,7 @@ def test_timeline_reemits_old_apple_message_when_contact_identity_changes(
     try:
         engine.run()
         assert warehouse._query(
-            "SELECT DISTINCT actor FROM timeline_events WHERE adapter='apple_message'"
+            "SELECT DISTINCT actor FROM @timeline_events WHERE adapter='apple_message'"
         ) == [(phone,)]
 
         apple_row = _contact_card_row(
@@ -1363,13 +1299,13 @@ def test_timeline_reemits_old_apple_message_when_contact_identity_changes(
 
         engine.run()
         assert warehouse._query(
-            "SELECT actor, count(*) FROM timeline_events "
+            "SELECT actor, count(*) FROM @timeline_events "
             "WHERE adapter='apple_message' GROUP BY actor ORDER BY actor"
         ) == [(phone, 3), ("Example Person", 2)]
 
         engine.run()
         assert warehouse._query(
-            "SELECT actor, count(*) FROM timeline_events "
+            "SELECT actor, count(*) FROM @timeline_events "
             "WHERE adapter='apple_message' GROUP BY actor ORDER BY actor"
         ) == [(phone, 1), ("Example Person", 4)]
 
@@ -1378,7 +1314,7 @@ def test_timeline_reemits_old_apple_message_when_contact_identity_changes(
         engine.close()
 
     assert warehouse._query(
-        "SELECT actor, count(*) FROM timeline_events "
+        "SELECT actor, count(*) FROM @timeline_events "
         "WHERE adapter='apple_message' GROUP BY actor"
     ) == [("Example Person", 5)]
 
@@ -1416,25 +1352,6 @@ def test_postgres_warehouse_can_create_all_runtime_tables_and_views(warehouse: P
     assert {(rel.schema, rel.name) for rel in physical} <= found
 
 
-def test_postgres_warehouse_does_not_mutate_unrelated_legacy_relations(warehouse: PostgresWarehouse) -> None:
-    warehouse._command("CREATE TABLE finance_accounts (id text PRIMARY KEY)")
-    warehouse._command("CREATE VIEW finance_liabilities AS SELECT id FROM finance_accounts")
-
-    warehouse.ensure_tables()
-
-    rows = warehouse._query(
-        """
-        SELECT table_name, table_type
-        FROM information_schema.tables
-        WHERE table_schema = current_schema()
-          AND table_name IN ('finance_accounts', 'finance_liabilities')
-        ORDER BY table_name, table_type
-        """
-    )
-
-    assert rows == [("finance_accounts", "BASE TABLE"), ("finance_liabilities", "VIEW")]
-
-
 def test_postgres_slack_tables_create_recent_message_indexes(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_slack_tables()
 
@@ -1444,7 +1361,7 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     assert "slack_messages_user_time_idx" in index_names
     assert "slack_messages_time_idx" in index_names
     # Raw-table text search is retired: message text is searched through the
-    # timeline document (search.search_text / search.search_text_exact).
+    # timeline document (timeline.search_text / timeline.search_text_exact).
     assert "slack_messages_text_trgm_idx" not in index_names
     assert "slack_messages_text_trgm_live_idx" not in index_names
 
@@ -1479,7 +1396,7 @@ def test_postgres_ensure_indexes_drops_obsolete_indexes(warehouse: PostgresWareh
     # that ran on an older revision before the full-coverage index was introduced.
     warehouse._command(
         "CREATE INDEX IF NOT EXISTS slack_messages_text_trgm_live_idx "
-        "ON slack_messages USING gin (text public.gin_trgm_ops) WHERE is_deleted = 0"
+        "ON @slack_messages USING gin (text public.gin_trgm_ops) WHERE is_deleted = 0"
     )
     rel = _physical_relation(warehouse, "slack_messages")
     pre_rows = warehouse._query(
@@ -1508,7 +1425,7 @@ def test_postgres_gmail_tables_create_search_indexes(warehouse: PostgresWarehous
     # snippet because the voice-memo identity hints OR it with from/subject (a
     # bitmap-OR plan needs every arm indexed). The body trigram family is
     # retired — body text is searched through the timeline document
-    # (search.search_text / search.search_text_exact).
+    # (timeline.search_text / timeline.search_text_exact).
     assert "gmail_messages_from_trgm_idx" in index_names
     assert "gmail_messages_subject_trgm_idx" in index_names
     assert "gmail_messages_snippet_trgm_idx" in index_names
@@ -1533,6 +1450,7 @@ def test_postgres_concurrent_indexes_are_disabled_only_in_test_namespaces(
     warehouse._pg_textsearch_ensured = False
     commands: list[str] = []
     monkeypatch.setattr(warehouse, "_index_exists", lambda _name: False)
+    monkeypatch.setattr(warehouse, "_drop_invalid_index", lambda _name: None)
     monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: commands.append(sql))
 
     warehouse._ensure_indexes(["gmail_messages"])
@@ -1545,7 +1463,7 @@ def test_postgres_agent_tables_create_run_lookup_index(warehouse: PostgresWareho
     warehouse.ensure_agent_tables()
 
     index_names = _index_names(warehouse, "agent_runs")
-    assert "agent_runs_task_status_subject_idx" in index_names
+    assert "ai_processing_agent_runs_task_status_subject_idx" in index_names
 
 
 def test_postgres_apple_messages_create_handle_history_index(warehouse: PostgresWarehouse) -> None:
@@ -1562,7 +1480,7 @@ def test_postgres_apple_messages_create_handle_history_index(warehouse: Postgres
 def test_postgres_ai_conversation_event_tables_create_read_path_indexes(
     warehouse: PostgresWarehouse,
 ) -> None:
-    # The marts.ai_conversation_events union view has no storage of its own, so
+    # The marts_ai_conversations.events union view has no storage of its own, so
     # session probes, recency scans, first-prompt template detection, and
     # changed-session watermark scans all depend on per-source indexes.
     warehouse.ensure_agent_sessions_tables()
@@ -1607,7 +1525,7 @@ def test_postgres_timeline_tables_create_only_timeline_bm25_index(warehouse: Pos
     assert "timeline_events_search_text_bm25_idx" in timeline_indexes
 
     # The legacy source-table BM25 fan-out indexes should not be recreated; the
-    # flow is search.search_text() on timeline -> detailed SQL on source tables.
+    # flow is timeline.search_text() on timeline -> detailed SQL on source tables.
     assert "slack_messages_text_bm25_idx" not in _index_names(warehouse, "slack_messages")
     assert "gmail_messages_subject_bm25_idx" not in _index_names(warehouse, "gmail_messages")
 
@@ -1700,6 +1618,7 @@ def _search_text_function_sql() -> str:
         _search_path_sql = postgres_module.PostgresWarehouse._search_path_sql
         _search_text_alter_sql = postgres_module.PostgresWarehouse._search_text_alter_sql
         sql_relation = postgres_module.PostgresWarehouse.sql_relation
+        _object_schema = postgres_module.PostgresWarehouse._object_schema
         physical_schema_name = postgres_module.PostgresWarehouse.physical_schema_name
         physical_schema_names = postgres_module.PostgresWarehouse.physical_schema_names
 
@@ -1725,13 +1644,13 @@ def _search_text_branch_source_labels() -> list[str]:
 
 
 def _search_text_sources_helper_labels() -> list[str]:
-    """The labels enumerated by the search_text_sources() helper, parsed from its
+    """The labels enumerated by the @search_text_sources() helper, parsed from its
     VALUES list in the generated SQL (no DB needed)."""
     import re
 
     sql = _search_text_function_sql()
     match = re.search(
-        r"CREATE OR REPLACE FUNCTION search_text_sources\(\).*?\$sources\$(.*?)\$sources\$",
+        r"CREATE OR REPLACE FUNCTION @search_text_sources\(\).*?\$sources\$(.*?)\$sources\$",
         sql,
         re.DOTALL,
     )
@@ -1776,7 +1695,7 @@ def test_search_text_casts_branch_rows_to_the_physical_hit_type() -> None:
     # error exactly like it swallowed the missing BM25 index before it.
     sql = _search_text_function_sql()
 
-    assert '::"search"."text_hit"' in sql, (
+    assert '::"timeline"."text_hit"' in sql, (
         "search_text()'s EXECUTE'd branch cast must name the physical hit type"
     )
     assert "::search_text_hit" not in sql, (
@@ -1832,7 +1751,7 @@ def test_search_text_caps_per_branch_topk_for_broad_search() -> None:
     # bm25 index scan (small/new tables or any join above the scan), which leaks
     # wrong scores silently — the failure class this function exists to avoid.
     assert "bm25_get_current_score" not in sql, (
-        "search_text() must not use bm25_get_current_score() (unreliable off the "
+        "@search_text() must not use bm25_get_current_score() (unreliable off the "
         "index-scan path); recompute the bm25 operator in the SELECT list instead"
     )
 
@@ -1860,7 +1779,7 @@ def test_search_text_pushes_since_into_branches() -> None:
     # existing below the all-time top-k. Each branch must filter before ranking.
     sql = _search_text_function_sql()
     assert "%3$L::timestamptz IS NULL OR t.event_ts >= %3$L::timestamptz" in sql, (
-        "search_text() branches must push the `since` bound into the branch WHERE"
+        "@search_text() branches must push the `since` bound into the branch WHERE"
     )
     assert "query, per_branch_limit, since" in sql, (
         "each branch's EXECUTE must pass `since` as the third format argument"
@@ -1886,7 +1805,7 @@ def test_search_functions_clamp_max_results() -> None:
 
 def _search_text_exact_sql() -> str:
     sql = _search_text_function_sql()
-    marker = "CREATE OR REPLACE FUNCTION search_text_exact("
+    marker = "CREATE OR REPLACE FUNCTION @search_text_exact("
     assert marker in sql, "expected search_text_exact() to be generated alongside search_text()"
     return sql.split(marker, 1)[1]
 
@@ -1947,6 +1866,8 @@ def test_search_text_alter_pins_search_path_for_both_functions() -> None:
         def physical_schema_name(self, schema: str) -> str:
             return schema
 
+        _object_schema = postgres_module.PostgresWarehouse._object_schema
+
     sql = postgres_module.PostgresWarehouse._search_text_alter_sql(_Stub())  # type: ignore[arg-type]
     assert '"search_text"(text, integer, text[], timestamptz)' in sql
     assert '"search_text_exact"(text, integer, text[], timestamptz)' in sql
@@ -1970,7 +1891,7 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
         row[0]
         for row in warehouse._query(
             "SELECT indexname FROM pg_indexes WHERE schemaname = ANY(%s)",
-            (warehouse.physical_schema_names(include_private=True),),
+            (warehouse.physical_schema_names(include_hidden=True),),
         )
     }
     missing = sorted(name for name in referenced if name not in built)
@@ -2113,7 +2034,7 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     # BM25 non-matches score 0; matches score negative. Isolate matches with score < 0
     # so the assertions hold regardless of how few total rows the fixture has.
     matched = warehouse._query(
-        "SELECT source, subsource, ref FROM search_text('zanzibar rollout', 20) WHERE score < 0"
+        "SELECT source, subsource, ref FROM @search_text('zanzibar rollout', 20) WHERE score < 0"
     )
     matched_sources = {(row[0], row[1]) for row in matched}
     matched_refs = {row[2] for row in matched}
@@ -2128,13 +2049,13 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
 
     # sources filter restricts the fan-out.
     gmail_only = warehouse._query(
-        "SELECT DISTINCT source FROM search_text('zanzibar', 20, ARRAY['gmail']) WHERE score < 0"
+        "SELECT DISTINCT source FROM @search_text('zanzibar', 20, ARRAY['gmail']) WHERE score < 0"
     )
     assert gmail_only == [("gmail",)]
 
     # since filter excludes rows dated before the cutoff (fixtures are 2026-05-19).
     after_cutoff = warehouse._query(
-        "SELECT count(*) FROM search_text('zanzibar', 20, NULL, '2027-01-01'::timestamptz) WHERE score < 0"
+        "SELECT count(*) FROM @search_text('zanzibar', 20, NULL, '2027-01-01'::timestamptz) WHERE score < 0"
     )
     assert after_cutoff == [(0,)]
 
@@ -2144,7 +2065,7 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     warehouse._command("SET default_transaction_read_only = on")
     try:
         read_only = warehouse._query(
-            "SELECT source, subsource FROM search_text('zanzibar rollout', 20) WHERE score < 0"
+            "SELECT source, subsource FROM @search_text('zanzibar rollout', 20) WHERE score < 0"
         )
     finally:
         warehouse._command("SET default_transaction_read_only = off")
@@ -2157,7 +2078,7 @@ def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse)
     warehouse._command("DROP INDEX IF EXISTS apple_voice_memos_title_bm25_idx")
     warehouse._command("DROP INDEX IF EXISTS contact_cards_name_bm25_idx")
     survived = warehouse._query(
-        "SELECT source, subsource FROM search_text('zanzibar rollout', 20) WHERE score < 0"
+        "SELECT source, subsource FROM @search_text('zanzibar rollout', 20) WHERE score < 0"
     )
     survived_sources = {(row[0], row[1]) for row in survived}
     assert ("slack", "message") in survived_sources
@@ -2181,7 +2102,7 @@ def test_search_text_sources_lists_accepted_filter_tokens(warehouse: PostgresWar
     # genuine read-only transaction (no DDL/DML at call time).
     warehouse._command("SET default_transaction_read_only = on")
     try:
-        rows = warehouse._query("SELECT source FROM search_text_sources() ORDER BY source")
+        rows = warehouse._query("SELECT source FROM @search_text_sources() ORDER BY source")
     finally:
         warehouse._command("SET default_transaction_read_only = off")
     assert [row[0] for row in rows] == expected
@@ -2193,7 +2114,7 @@ def test_search_text_sources_lists_accepted_filter_tokens(warehouse: PostgresWar
     # the function compiling/accepting the token, not about hit counts.
     for label in expected:
         warehouse._query(
-            "SELECT count(*) FROM search_text('zzqqxx', 5, ARRAY[%s])",
+            "SELECT count(*) FROM @search_text('zzqqxx', 5, ARRAY[%s])",
             (label,),
         )
 
@@ -2213,15 +2134,15 @@ def test_search_text_rejects_unknown_source_tokens(warehouse: PostgresWarehouse)
     warehouse._set_search_path()
 
     with pytest.raises(psycopg2.Error, match="unknown source"):
-        warehouse._query("SELECT * FROM search_text('zzqqxx', 5, ARRAY['apple_messages'])")
+        warehouse._query("SELECT * FROM @search_text('zzqqxx', 5, ARRAY['apple_messages'])")
 
     # A mix of one valid and one invalid token still raises (no partial silent
     # drop of the unknown one).
     with pytest.raises(psycopg2.Error, match="unknown source"):
-        warehouse._query("SELECT * FROM search_text('zzqqxx', 5, ARRAY['imessage', 'bogus'])")
+        warehouse._query("SELECT * FROM @search_text('zzqqxx', 5, ARRAY['imessage', 'bogus'])")
 
     # A valid token is unaffected.
-    warehouse._query("SELECT count(*) FROM search_text('zzqqxx', 5, ARRAY['imessage'])")
+    warehouse._query("SELECT count(*) FROM @search_text('zzqqxx', 5, ARRAY['imessage'])")
 
 
 def test_search_text_exact_finds_literal_phrases(warehouse: PostgresWarehouse) -> None:
@@ -2255,7 +2176,7 @@ def test_search_text_exact_finds_literal_phrases(warehouse: PostgresWarehouse) -
     _sync_timeline(warehouse)
 
     rows = warehouse._query(
-        "SELECT source, ref, text, score FROM search_text_exact(%s, 10)",
+        "SELECT source, ref, text, score FROM @search_text_exact(%s, 10)",
         ("rollout-cadence-7g4",),
     )
     assert [row[0] for row in rows] == ["slack"]
@@ -2263,30 +2184,30 @@ def test_search_text_exact_finds_literal_phrases(warehouse: PostgresWarehouse) -
 
     # A needle that only matches as a BM25 stem, not a literal substring, must
     # not match: this function is exact.
-    assert warehouse._query("SELECT * FROM search_text_exact('rollout-cadence-9z9', 10)") == []
+    assert warehouse._query("SELECT * FROM @search_text_exact('rollout-cadence-9z9', 10)") == []
 
     # The sources filter uses the same tokens as ranked search.
     assert (
         warehouse._query(
-            "SELECT * FROM search_text_exact(%s, 10, sources => ARRAY['gmail'])",
+            "SELECT * FROM @search_text_exact(%s, 10, sources => ARRAY['gmail'])",
             ("rollout-cadence-7g4",),
         )
         == []
     )
     with pytest.raises(psycopg2.Error, match="unknown source"):
-        warehouse._query("SELECT * FROM search_text_exact('zzqqxx', 5, ARRAY['apple_messages'])")
+        warehouse._query("SELECT * FROM @search_text_exact('zzqqxx', 5, ARRAY['apple_messages'])")
 
     # LIKE wildcards in the needle are literal characters, not patterns.
-    assert warehouse._query("SELECT * FROM search_text_exact('roll%cadence', 10)") == []
+    assert warehouse._query("SELECT * FROM @search_text_exact('roll%cadence', 10)") == []
 
     # Needles below trigram length raise loudly instead of degrading to a scan.
     with pytest.raises(psycopg2.Error, match="at least 3 characters"):
-        warehouse._query("SELECT * FROM search_text_exact('ab', 5)")
+        warehouse._query("SELECT * FROM @search_text_exact('ab', 5)")
 
     # `since` bounds results.
     assert (
         warehouse._query(
-            "SELECT * FROM search_text_exact(%s, 10, since => %s)",
+            "SELECT * FROM @search_text_exact(%s, 10, since => %s)",
             ("rollout-cadence-7g4", datetime(2026, 6, 1, tzinfo=UTC)),
         )
         == []
@@ -2340,7 +2261,7 @@ def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWareh
     _sync_timeline(warehouse)
 
     matched = warehouse._query(
-        "SELECT DISTINCT source FROM search_text('zanzibar rollout', 50) WHERE score < 0"
+        "SELECT DISTINCT source FROM @search_text('zanzibar rollout', 50) WHERE score < 0"
     )
     sources = {row[0] for row in matched}
     assert "slack" in sources
@@ -2351,30 +2272,24 @@ def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWareh
     # requesting it now raises (unknown-source guard) rather than silently
     # returning nothing.
     with pytest.raises(psycopg2.Error, match="unknown source"):
-        warehouse._query("SELECT count(*) FROM search_text('zanzibar', 50, ARRAY['agent'])")
+        warehouse._query("SELECT count(*) FROM @search_text('zanzibar', 50, ARRAY['agent'])")
 
 
 def test_search_text_alter_sql_is_prequalified_and_executed_raw() -> None:
-    # The ALTER that pins search_text()'s search_path quotes schema names, and
-    # in the PUBLIC namespace several of them ("apple_notes", "apple_messages")
-    # are also canonical logical relation names. Feeding the statement through
-    # _command's SQL qualifier rewrote them into schema.table references
-    # mid-list — a syntax error that crashed every ensure in production (test
-    # namespaces prefix their schema names, so namespaced runs could not catch
-    # it). The statement must be fully physical up front and executed through
-    # _raw_command, never _command.
+    # The ALTER that pins search_text()'s search_path is a list of physical
+    # schema names, not relation references. It carries no @markers, so it must
+    # already be complete when it is issued — and it goes through _raw_command
+    # so nothing can reinterpret it on the way out.
     import inspect
 
-    from personal_data_warehouse.relations import qualify_sql_relations
+    from personal_data_warehouse.relations import expand_relations
 
     wh = PostgresWarehouse.__new__(PostgresWarehouse)
     wh._schema = "public"
     statement = wh._search_text_alter_sql()
-    assert statement.startswith('ALTER FUNCTION "search"."search_text"(')
+    assert statement.startswith('ALTER FUNCTION "timeline"."search_text"(')
     assert "SET search_path TO" in statement
-    # Under the public namespace the qualifier WOULD corrupt this statement —
-    # that is exactly why it must go through _raw_command.
-    assert qualify_sql_relations(statement, namespace="public") != statement
+    assert expand_relations(statement, namespace="public") == statement
     assert "_raw_command(self._search_text_alter_sql())" in inspect.getsource(
         PostgresWarehouse._ensure_search_text_function
     )
@@ -2394,7 +2309,7 @@ def test_search_text_returns_hits_under_default_search_path(warehouse: PostgresW
     _ensure_all_table_groups(warehouse)
     warehouse._command(
         """
-        INSERT INTO timeline_events (adapter, event_id, source, kind, event_ts, source_table,
+        INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table,
                                      search_text, priority, actor, title, snippet, context)
         VALUES ('slack_message', 'dp1', 'slack', 'message', now(), 'slack_messages',
                 'zanzibar default path probe', 'cc', 'a', 't', 's', 'c')
@@ -2403,7 +2318,7 @@ def test_search_text_returns_hits_under_default_search_path(warehouse: PostgresW
     warehouse._command('SET search_path TO "$user", public')
     try:
         rows = warehouse._query(
-            "SELECT ref FROM search_text('zanzibar', 10, ARRAY['slack']) WHERE score < 0"
+            "SELECT ref FROM @search_text('zanzibar', 10, ARRAY['slack']) WHERE score < 0"
         )
     finally:
         warehouse._set_search_path()
@@ -2449,7 +2364,7 @@ def test_search_text_caps_hit_text_to_preview(warehouse: PostgresWarehouse) -> N
     _sync_timeline(warehouse)
 
     rows = warehouse._query(
-        "SELECT ref, text FROM search_text('zanzibar', 50, ARRAY['slack']) WHERE score < 0"
+        "SELECT ref, text FROM @search_text('zanzibar', 50, ARRAY['slack']) WHERE score < 0"
     )
     by_ref = {row[0]: row[1] for row in rows}
     long_ref = next(ref for ref in by_ref if ref.endswith("300.1"))
@@ -2505,7 +2420,7 @@ def test_search_text_low_volume_source_survives_high_volume_source(warehouse: Po
     sources = {
         row[0]
         for row in warehouse._query(
-            "SELECT source FROM search_text('zanzibar', 4) WHERE score < 0"
+            "SELECT source FROM @search_text('zanzibar', 4) WHERE score < 0"
         )
     }
     assert "contact" in sources, (
@@ -2580,10 +2495,10 @@ def test_postgres_contacts_view_appends_new_nicknames_column_on_existing_view(
     warehouse: PostgresWarehouse,
 ) -> None:
     warehouse._ensure_table_group(["contact_cards", "contact_sync_state"])
-    warehouse._command("ALTER TABLE contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
+    warehouse._command("ALTER TABLE @contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
     warehouse._command(
         """
-        CREATE OR REPLACE VIEW clean_contacts AS
+        CREATE OR REPLACE VIEW @clean_contacts AS
         SELECT
             source,
             account,
@@ -2611,7 +2526,7 @@ def test_postgres_contacts_view_appends_new_nicknames_column_on_existing_view(
             source_updated_at,
             synced_at,
             raw_json
-        FROM contact_cards
+        FROM @contact_cards
         WHERE is_deleted = 0
         """
     )
@@ -2655,7 +2570,7 @@ def test_postgres_contact_cards_upsert_jsonb_and_clean_view(warehouse: PostgresW
     rows = warehouse._query(
         """
         SELECT display_name, emails #>> '{0,value}', nicknames #>> '{0,value}', raw_json ->> 'resourceName'
-        FROM clean_contacts
+        FROM @clean_contacts
         ORDER BY card_id
         """
     )
@@ -2683,7 +2598,7 @@ def test_postgres_contact_card_edit_replaces_existing_active_card(warehouse: Pos
     rows = warehouse._query(
         """
         SELECT display_name, primary_email, emails #>> '{0,value}', raw_json ->> 'etag'
-        FROM clean_contacts
+        FROM @clean_contacts
         WHERE card_id = 'people/c1'
         """
     )
@@ -2714,25 +2629,28 @@ def test_postgres_contact_card_incremental_delete_removes_card_from_clean_contac
     rows = warehouse._query(
         """
         SELECT is_deleted, raw_json #>> '{metadata,deleted}'
-        FROM contact_cards
+        FROM @contact_cards
         WHERE card_id = 'people/c1'
         """
     )
-    clean_rows = warehouse._query("SELECT count(*) FROM clean_contacts WHERE card_id = 'people/c1'")
+    clean_rows = warehouse._query("SELECT count(*) FROM @clean_contacts WHERE card_id = 'people/c1'")
 
     assert rows == [(1, "true")]
     assert clean_rows == [(0,)]
 
 
 def test_ensure_view_replaces_view_whose_columns_cannot_be_dropped(warehouse: PostgresWarehouse) -> None:
-    warehouse._command("CREATE VIEW ensure_view_fixture AS SELECT 1 AS a, 2 AS b")
+    # CREATE OR REPLACE VIEW cannot drop a column, and this database is shared:
+    # another checkout running a different revision leaves views whose shape does
+    # not match this code's. _ensure_view must recreate rather than wedge.
+    warehouse._command("CREATE VIEW @clean_photos AS SELECT 1 AS a, 2 AS b")
 
     warehouse._ensure_view(
-        "ensure_view_fixture",
-        "CREATE OR REPLACE VIEW ensure_view_fixture AS SELECT 1 AS a",
+        "clean_photos",
+        "CREATE OR REPLACE VIEW @clean_photos AS SELECT 1 AS a",
     )
 
-    assert warehouse._query("SELECT * FROM ensure_view_fixture") == [(1,)]
+    assert warehouse._query("SELECT * FROM @clean_photos") == [(1,)]
 
 
 def test_postgres_ensure_contacts_recovers_when_existing_view_has_extra_columns(
@@ -2749,10 +2667,10 @@ def test_postgres_ensure_contacts_recovers_when_existing_view_has_extra_columns(
         "SELECT pg_get_viewdef(to_regclass(%s))",
         (warehouse.sql_relation("clean_contacts"),),
     )[0][0]
-    warehouse._command("DROP VIEW clean_contact_points")
-    warehouse._command("DROP VIEW clean_contacts")
+    warehouse._command("DROP VIEW @clean_contact_points")
+    warehouse._command("DROP VIEW @clean_contacts")
     warehouse._command(
-        "CREATE VIEW clean_contacts AS "
+        "CREATE VIEW @clean_contacts AS "
         f"SELECT base.*, 'drift'::text AS drift_extra FROM ({viewdef.strip().rstrip(';')}) AS base"
     )
 
@@ -2772,28 +2690,6 @@ def test_postgres_ensure_contacts_recovers_when_existing_view_has_extra_columns(
     ]
     assert "drift_extra" not in columns
     assert columns[-2:] == ["raw_json", "nicknames"]
-
-
-def test_postgres_ensure_contacts_removes_google_only_legacy_mart(
-    warehouse: PostgresWarehouse,
-) -> None:
-    warehouse.ensure_contacts_tables()
-    marts_schema = warehouse.physical_schema_name("marts")
-    warehouse._raw_command(
-        f"CREATE VIEW {_identifier(marts_schema)}.{_identifier('google_contacts')} "
-        "AS SELECT 1 AS legacy"
-    )
-
-    warehouse.ensure_contacts_tables()
-
-    assert warehouse._query(
-        "SELECT to_regclass(%s)",
-        (f"{marts_schema}.google_contacts",),
-    ) == [(None,)]
-    assert warehouse._query(
-        "SELECT to_regclass(%s)",
-        (warehouse.sql_relation("clean_contacts"),),
-    )[0][0] is not None
 
 
 def test_postgres_mark_missing_contact_cards_deleted_tombstones_only_scope(warehouse: PostgresWarehouse) -> None:
@@ -2824,7 +2720,7 @@ def test_postgres_mark_missing_contact_cards_deleted_tombstones_only_scope(wareh
     rows = warehouse._query(
         """
         SELECT account, card_id, is_deleted, synced_at
-        FROM contact_cards
+        FROM @contact_cards
         ORDER BY account, card_id
         """
     )
@@ -2889,7 +2785,7 @@ def test_postgres_replace_slack_conversation_members_tombstones_missing_members(
     rows = warehouse._query(
         """
         SELECT conversation_id, user_id, is_deleted, synced_at, sync_version
-        FROM slack_conversation_members
+        FROM @slack_conversation_members
         ORDER BY conversation_id, user_id
         """
     )
@@ -3026,14 +2922,14 @@ def test_postgres_rebuild_slack_conversation_stats_backfills_live_messages(
             ),
         ]
     )
-    warehouse._command("TRUNCATE slack_conversation_stats")
+    warehouse._command("TRUNCATE @slack_conversation_stats")
 
     warehouse.rebuild_slack_conversation_stats()
 
     rows = warehouse._query(
         """
         SELECT conversation_id, message_count, latest_message_at
-        FROM slack_conversation_stats
+        FROM @slack_conversation_stats
         ORDER BY conversation_id
         """
     )
@@ -3054,12 +2950,12 @@ def test_postgres_ensure_slack_tables_backfills_empty_conversation_stats(
             )
         ]
     )
-    warehouse._command("TRUNCATE slack_conversation_stats")
+    warehouse._command("TRUNCATE @slack_conversation_stats")
 
     warehouse.ensure_slack_tables()
 
     rows = warehouse._query(
-        "SELECT conversation_id, message_count, latest_message_at FROM slack_conversation_stats",
+        "SELECT conversation_id, message_count, latest_message_at FROM @slack_conversation_stats",
     )
     assert rows == [("C1", 1, now)]
 
@@ -3079,7 +2975,7 @@ def test_postgres_insert_slack_messages_refreshes_conversation_stats(
     )
 
     rows = warehouse._query(
-        "SELECT message_count, latest_message_at FROM slack_conversation_stats WHERE conversation_id = %s",
+        "SELECT message_count, latest_message_at FROM @slack_conversation_stats WHERE conversation_id = %s",
         ("C1",),
     )
     assert rows == [(2, newer)]
@@ -3108,7 +3004,7 @@ def test_postgres_insert_slack_messages_updates_stats_without_full_conversation_
     )
 
     rows = warehouse._query(
-        "SELECT message_count, latest_message_at FROM slack_conversation_stats WHERE conversation_id = %s",
+        "SELECT message_count, latest_message_at FROM @slack_conversation_stats WHERE conversation_id = %s",
         ("C1",),
     )
     assert rows == [(1, now)]
@@ -3142,7 +3038,7 @@ def test_postgres_slack_conversation_stats_follow_tombstones_and_ignore_stale_ro
     warehouse.insert_slack_messages([{**live, "is_deleted": 0, "sync_version": 5}])
 
     rows = warehouse._query(
-        "SELECT message_count, latest_message_at FROM slack_conversation_stats WHERE conversation_id = %s",
+        "SELECT message_count, latest_message_at FROM @slack_conversation_stats WHERE conversation_id = %s",
         ("C1",),
     )
     assert rows == [(1, newer)]
@@ -3279,7 +3175,7 @@ def test_freshness_sync_end_to_end_archives_gone_channel_in_real_warehouse(
 
     # The dead channel is archived in the real DB; the healthy channel stays active.
     archived = warehouse._query(
-        "SELECT conversation_id, is_archived FROM slack_conversations ORDER BY conversation_id"
+        "SELECT conversation_id, is_archived FROM @slack_conversations ORDER BY conversation_id"
     )
     assert dict(archived) == {"C_GONE": 1, "C_OK": 0}
 
@@ -3289,7 +3185,7 @@ def test_freshness_sync_end_to_end_archives_gone_channel_in_real_warehouse(
 
     # The healthy channel's message was persisted.
     persisted = warehouse._query(
-        "SELECT conversation_id FROM slack_messages WHERE is_deleted = 0 ORDER BY conversation_id"
+        "SELECT conversation_id FROM @slack_messages WHERE is_deleted = 0 ORDER BY conversation_id"
     )
     assert [row[0] for row in persisted] == ["C_OK"]
 
@@ -3309,7 +3205,7 @@ def test_postgres_slack_conversation_loader_query_uses_stats_not_message_groupin
     warehouse.load_slack_conversation_payloads(account="zrl", team_id="T1")
 
     assert "slack_conversation_stats AS m" in captured["sql"]
-    assert "FROM slack_messages" not in captured["sql"]
+    assert "FROM @slack_messages" not in captured["sql"]
     assert "GROUP BY account, team_id, conversation_id" not in captured["sql"]
 
 
@@ -3428,7 +3324,7 @@ def test_postgres_slack_read_state_candidate_query_uses_stats_not_message_groupi
     warehouse.load_slack_read_state_candidate_payloads(account="zrl", team_id="T1")
 
     assert "slack_conversation_stats AS m" in captured["sql"]
-    assert "FROM slack_messages" not in captured["sql"]
+    assert "FROM @slack_messages" not in captured["sql"]
     assert "GROUP BY account, team_id, conversation_id" not in captured["sql"]
 
 
@@ -3473,7 +3369,7 @@ def test_postgres_message_upsert_preserves_latest_tombstone(warehouse: PostgresW
     warehouse.insert_messages([_message_row(message_id="m1", subject="deleted", labels=[], sync_version=20, is_deleted=1)])
 
     assert warehouse.existing_message_ids(account="zach@example.test", message_ids=["m1"]) == set()
-    rows = warehouse._query("SELECT subject, is_deleted, sync_version FROM gmail_messages WHERE message_id = %s", ("m1",))
+    rows = warehouse._query("SELECT subject, is_deleted, sync_version FROM @gmail_messages WHERE message_id = %s", ("m1",))
     assert rows == [("deleted", 1, 20)]
 
 
@@ -3493,7 +3389,7 @@ def test_postgres_gmail_clean_inbox_view_matches_current_state(warehouse: Postgr
     rows = warehouse._query(
         """
         SELECT thread_id, subject, state, unread_count, important_count, thread_messages_json
-        FROM clean_gmail_inbox
+        FROM @clean_gmail_inbox
         """
     )
 
@@ -3511,7 +3407,7 @@ def test_postgres_gmail_clean_inbox_preview_uses_byte_prefix(warehouse: Postgres
 
     warehouse.insert_messages([row])
 
-    rows = warehouse._query("SELECT latest_preview FROM clean_gmail_inbox")
+    rows = warehouse._query("SELECT latest_preview FROM @clean_gmail_inbox")
 
     assert rows == [(expected,)]
 
@@ -3523,7 +3419,7 @@ def test_postgres_gmail_clean_inbox_ties_latest_message_by_lowest_message_id(war
 
     warehouse.insert_messages([higher, lower])
 
-    rows = warehouse._query("SELECT subject FROM clean_gmail_inbox")
+    rows = warehouse._query("SELECT subject FROM @clean_gmail_inbox")
 
     assert rows == [("lower",)]
 
@@ -3609,7 +3505,7 @@ def test_postgres_calendar_transcript_views_use_latest_grouping(warehouse: Postg
     rows = warehouse._query(
         """
         SELECT calendar_account, calendar_title, recording_id, title, created_at
-        FROM clean_calendar_with_transcripts
+        FROM @clean_calendar_with_transcripts
         """
     )
 
@@ -3646,10 +3542,10 @@ def test_postgres_voice_memo_ensure_can_skip_runtime_content_hash_backfill(wareh
     )
 
     warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
-    assert warehouse._query("SELECT content_sha256 FROM apple_voice_memos_transcription_runs") == [("",)]
+    assert warehouse._query("SELECT content_sha256 FROM @apple_voice_memos_transcription_runs") == [("",)]
 
     warehouse.ensure_apple_voice_memos_tables()
-    assert warehouse._query("SELECT content_sha256 FROM apple_voice_memos_transcription_runs") == [("audio-hash",)]
+    assert warehouse._query("SELECT content_sha256 FROM @apple_voice_memos_transcription_runs") == [("audio-hash",)]
 
 
 def test_postgres_apple_notes_revision_history_keeps_latest_state(warehouse: PostgresWarehouse) -> None:
@@ -3727,9 +3623,9 @@ def test_postgres_apple_notes_revision_history_keeps_latest_state(warehouse: Pos
         ]
     )
 
-    latest = warehouse._query("SELECT latest_revision_id, title FROM apple_notes WHERE note_id = %s", ("note-1",))
-    revisions = warehouse._query("SELECT revision_id FROM apple_note_revisions WHERE note_id = %s ORDER BY revision_id", ("note-1",))
-    attachments = warehouse._query("SELECT attachment_id FROM apple_note_attachments WHERE note_id = %s", ("note-1",))
+    latest = warehouse._query("SELECT latest_revision_id, title FROM @apple_notes WHERE note_id = %s", ("note-1",))
+    revisions = warehouse._query("SELECT revision_id FROM @apple_note_revisions WHERE note_id = %s ORDER BY revision_id", ("note-1",))
+    attachments = warehouse._query("SELECT attachment_id FROM @apple_note_attachments WHERE note_id = %s", ("note-1",))
 
     assert latest == [("rev-new", "new")]
     assert revisions == [("rev-new",), ("rev-old",)]
@@ -3791,7 +3687,7 @@ def test_postgres_slack_account_state_uses_empty_actor_for_missing_user(warehous
 
     warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
 
-    assert warehouse._query("SELECT actor_name FROM slack_account_state_item_rows WHERE is_deleted = 0") == [("",)]
+    assert warehouse._query("SELECT actor_name FROM @slack_account_state_item_rows WHERE is_deleted = 0") == [("",)]
 
 
 def test_postgres_load_untranscribed_voice_memos_uses_valid_retryable_error_sql(

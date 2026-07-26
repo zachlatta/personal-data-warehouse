@@ -95,14 +95,14 @@ WITH scored AS (
            r.size_bytes, r.storage_backend, r.storage_key, r.storage_file_id,
            r.storage_url, r.capture_ts,
            EXISTS (
-               SELECT 1 FROM calendar_events c
+               SELECT 1 FROM @calendar_events c
                WHERE c.start_at <= r.capture_ts + INTERVAL '3 hours'
                  AND c.end_at >= r.capture_ts - INTERVAL '3 hours'
                  AND c.is_deleted = 0 AND c.status <> 'cancelled'
            ) AS has_calendar,
            (a.latitude <> 0 OR a.longitude <> 0) AS has_gps
-    FROM photo_canonical_renditions r
-    JOIN photo_assets a ON a.photo_id = r.photo_id
+    FROM @photo_canonical_renditions r
+    JOIN @photo_assets a ON a.photo_id = r.photo_id
 )
 SELECT *,
        CASE WHEN has_calendar THEN 'calendar'

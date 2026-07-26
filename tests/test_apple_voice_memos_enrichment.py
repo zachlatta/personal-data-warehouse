@@ -39,9 +39,9 @@ class FakeIdentityWarehouse:
 
     def _query(self, sql):
         self.queries.append(sql)
-        if "FROM slack_users" in sql:
+        if "FROM @slack_users" in sql:
             return [("guest@example.com", "guest", "guest", "", "U1")]
-        if "FROM gmail_messages" in sql:
+        if "FROM @gmail_messages" in sql:
             return [("system@example.com", "Guest Person accepted their invite", "Guest Person joined")]
         return []
 
@@ -550,7 +550,7 @@ def test_load_attendee_identity_hints_extracts_possible_full_names_without_hardc
 
     assert hints["guest@example.com"]["possible_names"] == ["Guest Person"]
     assert hints["guest@example.com"]["gmail_mentions"][0]["subject"] == "Guest Person accepted their invite"
-    gmail_query = next(query for query in warehouse.queries if "FROM gmail_messages" in query)
+    gmail_query = next(query for query in warehouse.queries if "FROM @gmail_messages" in query)
     assert "ILIKE" in gmail_query
     assert "is_deleted = 0" in gmail_query
     assert "position(lower" not in gmail_query
@@ -766,7 +766,7 @@ def test_load_event_identity_hints_queries_event_specific_context() -> None:
     class Warehouse:
         def _query(self, sql):
             queries.append(sql)
-            if "FROM google_drive_file_texts" in sql:
+            if "FROM @google_drive_file_texts" in sql:
                 return [
                     (
                         datetime(2026, 4, 20, tzinfo=UTC),
@@ -774,7 +774,7 @@ def test_load_event_identity_hints_queries_event_specific_context() -> None:
                         "Nova and Quill are listed on the Launch Week organizing team.",
                     )
                 ]
-            if "FROM gmail_messages" in sql:
+            if "FROM @gmail_messages" in sql:
                 return [
                     (
                         datetime(2026, 4, 21, tzinfo=UTC),
@@ -783,7 +783,7 @@ def test_load_event_identity_hints_queries_event_specific_context() -> None:
                         "Nova is coordinating Launch Week.",
                     )
                 ]
-            if "FROM slack_messages" in sql:
+            if "FROM @slack_messages" in sql:
                 return [
                     (
                         datetime(2026, 4, 22, tzinfo=UTC),
@@ -912,9 +912,9 @@ def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit
 
     assert "f.recorded_at >= '2026-03-03T00:00:00+00:00'::timestamptz" in queries[0]
     assert "LIMIT" not in queries[0]
-    assert "FROM apple_voice_memos_files AS f" in queries[0]
-    assert "INNER JOIN apple_voice_memos_transcription_runs AS r" in queries[0]
-    assert "FROM apple_voice_memos_enrichments" in queries[0]
+    assert "FROM @apple_voice_memos_files AS f" in queries[0]
+    assert "INNER JOIN @apple_voice_memos_transcription_runs AS r" in queries[0]
+    assert "FROM @apple_voice_memos_enrichments" in queries[0]
     assert "r.content_sha256" in queries[0]
     assert "f.content_sha256 = r.content_sha256" in queries[0]
     assert "e.content_sha256 = r.content_sha256" in queries[0]
@@ -994,8 +994,8 @@ def test_load_enrichment_candidates_uses_agent_error_budget() -> None:
         max_error_attempts=7,
     )
 
-    assert "FROM agent_runs" in queries[0]
-    assert "FROM apple_voice_memos_enrichments" in queries[0]
+    assert "FROM @agent_runs" in queries[0]
+    assert "FROM @apple_voice_memos_enrichments" in queries[0]
     assert "provider = 'codex'" in queries[0]
     assert "provider = 'agent_codex'" in queries[0]
     assert "prompt_version = 'test-prompt'" not in queries[0].split("SELECT subject_id, count(*) AS error_attempts", 1)[1]
@@ -1018,7 +1018,7 @@ def test_load_enrichment_candidates_can_disable_agent_error_budget() -> None:
         max_error_attempts=0,
     )
 
-    assert "FROM agent_runs" not in queries[0]
+    assert "FROM @agent_runs" not in queries[0]
     assert "error_attempts" not in queries[0]
 
 

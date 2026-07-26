@@ -3,7 +3,7 @@
 The ledger is the derived stocks-and-flows layer: logical accounts
 (finance.accounts + finance.account_links, photos-identity pattern) and
 append-only point-in-time observations (finance.observations). Net worth is
-read through marts.finance_net_worth / marts.finance_net_worth_history.
+read through marts_finance.net_worth / marts_finance.net_worth_history.
 Money columns are NUMERIC and observation days are DATE — never floats or
 timestamps.
 """
@@ -101,14 +101,14 @@ def _observation_row(**overrides) -> dict:
 
 
 def test_finance_relations_are_registered():
-    assert "finance" in DERIVED_SCHEMAS
-    assert (relation("finance_accounts").schema, relation("finance_accounts").name) == ("finance", "accounts")
+    assert "derived_finance" in DERIVED_SCHEMAS
+    assert (relation("finance_accounts").schema, relation("finance_accounts").name) == ("derived_finance", "accounts")
     assert (relation("finance_account_links").schema, relation("finance_account_links").name) == (
-        "finance",
+        "derived_finance",
         "account_links",
     )
     assert (relation("finance_observations").schema, relation("finance_observations").name) == (
-        "finance",
+        "derived_finance",
         "observations",
     )
 
@@ -144,18 +144,18 @@ def test_ensure_finance_tables_is_idempotent_and_creates_marts_views(warehouse):
         FROM information_schema.tables
         WHERE table_schema = ANY(%s)
         """,
-        (warehouse.physical_schema_names(include_private=True),),
+        (warehouse.physical_schema_names(include_hidden=True),),
     )
     relations = {(schema, table): type_ for schema, table, type_ in rows}
 
     def phys(schema: str) -> str:
         return warehouse.physical_schema_name(schema)
 
-    assert relations[(phys("finance"), "accounts")] == "BASE TABLE"
-    assert relations[(phys("finance"), "account_links")] == "BASE TABLE"
-    assert relations[(phys("finance"), "observations")] == "BASE TABLE"
-    assert relations[(phys("marts"), "finance_net_worth")] == "VIEW"
-    assert relations[(phys("marts"), "finance_net_worth_history")] == "VIEW"
+    assert relations[(phys("derived_finance"), "accounts")] == "BASE TABLE"
+    assert relations[(phys("derived_finance"), "account_links")] == "BASE TABLE"
+    assert relations[(phys("derived_finance"), "observations")] == "BASE TABLE"
+    assert relations[(phys("marts_finance"), "net_worth")] == "VIEW"
+    assert relations[(phys("marts_finance"), "net_worth_history")] == "VIEW"
 
 
 def test_finance_money_is_numeric_and_days_are_dates(warehouse):
@@ -166,7 +166,7 @@ def test_finance_money_is_numeric_and_days_are_dates(warehouse):
         FROM information_schema.columns
         WHERE table_schema = %s AND table_name = 'observations'
         """,
-        (warehouse.physical_schema_name("finance"),),
+        (warehouse.physical_schema_name("derived_finance"),),
     )
     types = dict(rows)
     assert types["value"] == "numeric"
@@ -178,7 +178,7 @@ def test_finance_money_is_numeric_and_days_are_dates(warehouse):
         FROM information_schema.columns
         WHERE table_schema = %s AND table_name = 'transactions'
         """,
-        (warehouse.physical_schema_name("finance"),),
+        (warehouse.physical_schema_name("derived_finance"),),
     )
     assert dict(rows)["amount"] == "numeric"
 
@@ -205,9 +205,8 @@ def test_finance_transactions_mart_reads_the_ledger(warehouse):
             }
         ]
     )
-    marts = warehouse.physical_schema_name("marts")
     rows = warehouse._query(
-        f'SELECT transaction_id, account_name, institution, amount, source FROM "{marts}".finance_transactions'
+        "SELECT transaction_id, account_name, institution, amount, source FROM @marts_finance_transactions"
     )
     assert rows == [("ft_1", "Checking ...0001", "Acme Bank", Decimal("-4.50"), "plaid")]
 
@@ -215,9 +214,8 @@ def test_finance_transactions_mart_reads_the_ledger(warehouse):
 def test_finance_accounts_mart_carries_latest_observation(warehouse):
     warehouse.ensure_finance_tables()
     warehouse.insert_finance_accounts([_account_row()])
-    marts = warehouse.physical_schema_name("marts")
     # Accounts without observations still appear (latest_value NULL).
-    rows = warehouse._query(f'SELECT account_id, latest_value FROM "{marts}".finance_accounts')
+    rows = warehouse._query("SELECT account_id, latest_value FROM @marts_finance_accounts")
     assert rows == [("fa_1", None)]
     warehouse.insert_finance_observations(
         [
@@ -225,7 +223,7 @@ def test_finance_accounts_mart_carries_latest_observation(warehouse):
             _observation_row(as_of=date(2026, 6, 1), value=Decimal("999.99")),
         ]
     )
-    rows = warehouse._query(f'SELECT latest_value, latest_as_of FROM "{marts}".finance_accounts')
+    rows = warehouse._query("SELECT latest_value, latest_as_of FROM @marts_finance_accounts")
     assert rows == [(Decimal("100.00"), date(2026, 7, 1))]
 
 
@@ -236,19 +234,19 @@ def test_observation_upsert_is_idempotent_per_account_day(warehouse):
     warehouse.insert_finance_observations(
         [_observation_row(value=Decimal("150.00"), sync_version=2)]
     )
-    rows = warehouse._query("SELECT value, sync_version FROM finance_observations")
+    rows = warehouse._query("SELECT value, sync_version FROM @finance_observations")
     assert rows == [(Decimal("150.00"), 2)]
     # Stale writes are ignored.
     warehouse.insert_finance_observations(
         [_observation_row(value=Decimal("1.00"), sync_version=1)]
     )
-    rows = warehouse._query("SELECT value, sync_version FROM finance_observations")
+    rows = warehouse._query("SELECT value, sync_version FROM @finance_observations")
     assert rows == [(Decimal("150.00"), 2)]
     # A different day appends instead of updating: history is preserved.
     warehouse.insert_finance_observations(
         [_observation_row(as_of=date(2026, 7, 2), value=Decimal("160.00"), sync_version=3)]
     )
-    rows = warehouse._query("SELECT count(*) FROM finance_observations")
+    rows = warehouse._query("SELECT count(*) FROM @finance_observations")
     assert rows == [(2,)]
 
 
@@ -269,13 +267,13 @@ def test_net_worth_signs_liabilities_and_uses_latest_observation(warehouse):
         ]
     )
     rows = warehouse._query(
-        "SELECT account_id, value, signed_value FROM finance_net_worth ORDER BY account_id"
+        "SELECT account_id, value, signed_value FROM @marts_finance_net_worth ORDER BY account_id"
     )
     assert rows == [
         ("fa_1", Decimal("100.00"), Decimal("100.00")),
         ("fa_2", Decimal("40.00"), Decimal("-40.00")),
     ]
-    total = warehouse._query("SELECT SUM(signed_value) FROM finance_net_worth")
+    total = warehouse._query("SELECT SUM(signed_value) FROM @marts_finance_net_worth")
     assert total == [(Decimal("60.00"),)]
 
 
@@ -288,7 +286,7 @@ def test_net_worth_prefers_balance_over_valuation_on_the_same_day(warehouse):
             _observation_row(kind="valuation", value=Decimal("500.00")),
         ]
     )
-    rows = warehouse._query("SELECT observation_kind, value FROM finance_net_worth")
+    rows = warehouse._query("SELECT observation_kind, value FROM @marts_finance_net_worth")
     assert rows == [("balance", Decimal("100.00"))]
 
 
@@ -310,7 +308,7 @@ def test_net_worth_history_forward_fills_gap_days(warehouse):
     rows = warehouse._query(
         """
         SELECT day, assets, liabilities, net_worth
-        FROM finance_net_worth_history
+        FROM @marts_finance_net_worth_history
         WHERE day BETWEEN %s AND %s
         ORDER BY day
         """,
@@ -340,7 +338,7 @@ def test_net_worth_history_excludes_accounts_before_first_observation(warehouse)
     )
     rows = warehouse._query(
         """
-        SELECT day, assets FROM finance_net_worth_history
+        SELECT day, assets FROM @marts_finance_net_worth_history
         WHERE day BETWEEN %s AND %s ORDER BY day
         """,
         (date(2026, 7, 1), date(2026, 7, 3)),

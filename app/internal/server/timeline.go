@@ -514,13 +514,13 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			      ORDER BY e.updated_at DESC`,
 		},
 	},
-	"agent_session_events": {
+	"ai_conversation_events": {
 		{
 			name:     "events",
 			params:   []string{"source", "session_id"},
 			pageSize: 100,
 			sql: `SELECT seq, occurred_at, role, event_type, tool_name, left(text, 700) AS text
-			      FROM ` + warehouse.SQLRelation("agent_session_events") + ` WHERE source = $1 AND session_id = $2
+			      FROM ` + warehouse.SQLRelation("ai_conversation_events") + ` WHERE source = $1 AND session_id = $2
 			      ORDER BY seq`,
 		},
 	},
@@ -765,6 +765,8 @@ func (s *timelineService) handleItem(w http.ResponseWriter, r *http.Request) {
 	row := result.Rows[0]
 	item := timelineItemJSON(row)
 	sourceTable, pk := timelineSourcePointer(row)
+	// Rows written before a catalog rename still carry the historical token.
+	sourceTable = warehouse.CurrentSourceTable(sourceTable)
 
 	response := map[string]any{"item": item}
 	children, known := timelineChildQueries[sourceTable]
@@ -774,7 +776,9 @@ func (s *timelineService) handleItem(w http.ResponseWriter, r *http.Request) {
 		s.logger.WarnContext(r.Context(), "timeline item for unmapped source table", "source_table", sourceTable)
 	}
 
-	if timelineIdentifierPattern.MatchString(sourceTable) && sourceTable != "agent_session_events" {
+	// The AI-conversation entry point is a cross-source union view, so it has
+	// no single source row to fetch — only the child event page below.
+	if timelineIdentifierPattern.MatchString(sourceTable) && sourceTable != "ai_conversation_events" {
 		if sourceRow, srcErr := s.fetchSourceRow(r.Context(), sourceTable, pk); srcErr != nil {
 			response["source_row_error"] = srcErr.Error()
 		} else {
@@ -951,15 +955,16 @@ func (s *timelineService) fetchSourceRow(ctx context.Context, table string, pk m
 	sortStrings(keys)
 	clauses := make([]string, 0, len(keys))
 	args := make([]any, 0, len(keys))
-	if _, ok := warehouse.Relations[table]; !ok {
+	rel, ok := warehouse.DrillDownRelation(table)
+	if !ok {
 		return nil, fmt.Errorf("unknown source table %q", table)
 	}
 	for i, key := range keys {
 		clauses = append(clauses, fmt.Sprintf("%s = $%d", warehouse.QuoteIdent(key), i+1))
 		args = append(args, pk[key])
 	}
-	sql := fmt.Sprintf("SELECT row_to_json(t)::text AS row FROM %s t WHERE %s LIMIT 1",
-		warehouse.SQLRelation(table), strings.Join(clauses, " AND "))
+	sql := fmt.Sprintf("SELECT row_to_json(t)::text AS row FROM %s.%s t WHERE %s LIMIT 1",
+		warehouse.QuoteIdent(rel.Schema), warehouse.QuoteIdent(rel.Name), strings.Join(clauses, " AND "))
 	result, err := s.source.QueryArgs(ctx, sql, args, 1)
 	if err != nil {
 		return nil, err

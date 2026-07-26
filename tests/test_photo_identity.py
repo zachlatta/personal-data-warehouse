@@ -302,12 +302,12 @@ def test_runner_links_live_photo_and_generates_thumbnail(warehouse):
     assert summary.assets_created == 1
     assert summary.thumbnails_generated == 1
     links = warehouse._query(
-        "SELECT role, photo_id, match_method FROM photo_asset_files ORDER BY role DESC"
+        "SELECT role, photo_id, match_method FROM @photo_asset_files ORDER BY role DESC"
     )
     assert [(r, m) for r, _p, m in links] == [("original", "new"), ("live_video", "source_id")]
     assert links[0][1] == links[1][1]  # one asset
 
-    assets = warehouse._query_dicts("SELECT * FROM photo_assets")
+    assets = warehouse._query_dicts("SELECT * FROM @photo_assets")
     assert len(assets) == 1
     asset = assets[0]
     assert asset["kind"] == "image"
@@ -317,11 +317,11 @@ def test_runner_links_live_photo_and_generates_thumbnail(warehouse):
     assert asset["thumbnail_content_type"] == "image/jpeg"
     assert asset["thumbnail_storage_file_id"] == "thumb-1"
     # The thumbnail also satisfies the enrichment candidate view.
-    renditions = warehouse._query("SELECT photo_id, content_sha256 FROM photo_canonical_renditions")
+    renditions = warehouse._query("SELECT photo_id, content_sha256 FROM @photo_canonical_renditions")
     assert len(renditions) == 1
     # And the fingerprint landed in the shared cache.
     fingerprints = warehouse._query(
-        "SELECT content_sha256, hash_version FROM media_fingerprints"
+        "SELECT content_sha256, hash_version FROM @media_fingerprints"
     )
     assert fingerprints == [(_sha(still), HASH_VERSION)]
 
@@ -353,7 +353,7 @@ def test_runner_burst_frames_stay_distinct_but_cross_source_rendition_merges(war
     ).sync()
 
     rows = warehouse._query_dicts(
-        "SELECT source, source_native_id, photo_id, match_method FROM photo_asset_files"
+        "SELECT source, source_native_id, photo_id, match_method FROM @photo_asset_files"
     )
     by_native = {row["source_native_id"]: row for row in rows}
     # Burst guard: near-identical same-source frames are separate assets.
@@ -365,11 +365,11 @@ def test_runner_burst_frames_stay_distinct_but_cross_source_rendition_merges(war
     # Canonical precedence: the merged asset keeps Apple's fields and the
     # full-res original as best file.
     asset = warehouse._query_dicts(
-        "SELECT * FROM photo_assets WHERE photo_id = %s", (by_native["UUID-A"]["photo_id"],)
+        "SELECT * FROM @photo_assets WHERE photo_id = %s", (by_native["UUID-A"]["photo_id"],)
     )[0]
     assert asset["best_file_sha256"] == _sha(original)
     assert asset["camera_model"] == "iPhone 16 Pro"
-    assert warehouse._query("SELECT count(*) FROM photo_assets")[0][0] == 2
+    assert warehouse._query("SELECT count(*) FROM @photo_assets")[0][0] == 2
 
 
 def test_runner_rerun_is_idempotent(warehouse):
@@ -386,13 +386,13 @@ def test_runner_rerun_is_idempotent(warehouse):
 
     first = run(0)
     assert (first.files_linked, first.assets_created) == (1, 1)
-    ids = warehouse._query("SELECT photo_id FROM photo_assets")
+    ids = warehouse._query("SELECT photo_id FROM @photo_assets")
 
     second = run(5)
     assert second.files_seen == 0
     assert second.files_linked == 0
     assert second.assets_created == 0
-    assert warehouse._query("SELECT photo_id FROM photo_assets") == ids
+    assert warehouse._query("SELECT photo_id FROM @photo_assets") == ids
     assert not has_unresolved_photo_files(warehouse)
     # The thumbnail was generated exactly once.
     assert len(store.put_files) == 1
@@ -411,10 +411,10 @@ def test_runner_undecodable_blob_is_classified_not_fatal(warehouse):
     assert summary.files_linked == 1
     assert summary.undecodable_files == 1
     assert summary.thumbnails_generated == 0
-    asset = warehouse._query_dicts("SELECT * FROM photo_assets")[0]
+    asset = warehouse._query_dicts("SELECT * FROM @photo_assets")[0]
     assert asset["thumbnail_content_sha256"] == ""
     # No canonical rendition -> not an enrichment candidate.
-    assert warehouse._query("SELECT count(*) FROM photo_canonical_renditions")[0][0] == 0
+    assert warehouse._query("SELECT count(*) FROM @photo_canonical_renditions")[0][0] == 0
 
 
 def test_runner_video_asset_gets_no_thumbnail_or_fingerprint(warehouse):
@@ -430,6 +430,6 @@ def test_runner_video_asset_gets_no_thumbnail_or_fingerprint(warehouse):
     ).sync()
     assert summary.fingerprints_computed == 0
     assert summary.thumbnails_generated == 0
-    asset = warehouse._query_dicts("SELECT * FROM photo_assets")[0]
+    asset = warehouse._query_dicts("SELECT * FROM @photo_assets")[0]
     assert asset["kind"] == "video"
-    assert warehouse._query("SELECT count(*) FROM photo_canonical_renditions")[0][0] == 0
+    assert warehouse._query("SELECT count(*) FROM @photo_canonical_renditions")[0][0] == 0

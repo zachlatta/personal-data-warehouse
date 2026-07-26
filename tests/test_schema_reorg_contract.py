@@ -1,7 +1,27 @@
+"""The warehouse schema contract: base_* → derived_* → marts_* → timeline.
+
+These tests describe the target layout itself rather than any one source's
+tables, so they are the place a schema change has to be argued:
+
+* the catalog is internally consistent and is the only editable authority
+  (Python reads it, the Go file is generated from it);
+* a fresh real-Postgres warehouse contains exactly the cataloged objects;
+* the read-only query role can read every public relation, cannot reach
+  ``private``, and reaches ``ops``/``internal`` only through the explicit
+  application allowlist;
+* discovery sorts base → derived → marts → timeline, hides the implementation
+  schemas, and prominently recommends timeline as the starting point;
+* no pre-reorg schema, relation, function, type, or rewriter survives.
+"""
+
 from __future__ import annotations
 
+import ast
+import json
 import os
-from datetime import UTC, datetime
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,17 +29,25 @@ from dotenv import load_dotenv
 
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
-from personal_data_warehouse.postgres import POSTGRES_TABLES, PostgresWarehouse, _default_sql, _identifier, _postgres_type
-from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
-from personal_data_warehouse_alice_voice_recordings.sync import SOURCE as ALICE_VOICE_RECORDINGS_SOURCE
+from personal_data_warehouse.postgres import POSTGRES_TABLES, PostgresWarehouse
 from personal_data_warehouse.relations import (
+    ALL_CANONICAL_SCHEMAS,
+    BASE_SCHEMAS,
     CANONICAL_RELATIONS,
-    QUERYABLE_SCHEMAS,
-    SOURCE_RAW_SCHEMAS,
+    CATALOG,
+    DERIVED_SCHEMAS,
+    DISCOVERABLE_SCHEMAS,
+    HIDDEN_SCHEMAS,
+    MARTS_SCHEMAS,
+    expand_relations,
     physical_schema_name,
-    qualify_sql_relations,
     relation,
 )
+from personal_data_warehouse.schema_upgrade import UPGRADE_PLAN
+from personal_data_warehouse.timeline import TIMELINE_ADAPTERS, TIMELINE_TABLE_COVERAGE
+from personal_data_warehouse_alice_voice_recordings.sync import SOURCE as ALICE_VOICE_RECORDINGS_SOURCE
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _postgres_url() -> str:
@@ -32,7 +60,7 @@ def _postgres_url() -> str:
 
 @pytest.fixture()
 def warehouse():
-    namespace = make_test_schema("schema_reorg")
+    namespace = make_test_schema("reorg")
     wh = PostgresWarehouse(_postgres_url(), schema=namespace)
     try:
         yield wh
@@ -40,559 +68,571 @@ def warehouse():
         cleanup_test_warehouse(wh)
 
 
+def _provision_everything(wh: PostgresWarehouse) -> None:
+    wh.ensure_tables()
+    wh.ensure_calendar_tables()
+    wh.ensure_contacts_tables()
+    wh.ensure_google_drive_source_tables()
+    wh.ensure_slack_tables()
+    wh.ensure_apple_notes_tables()
+    wh.ensure_apple_messages_tables()
+    wh.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    wh.ensure_alice_voice_recordings_tables()
+    wh.ensure_whatsapp_tables()
+    wh.ensure_photos_tables()
+    wh.ensure_whoop_tables()
+    wh.ensure_agent_sessions_tables()
+    wh.ensure_plaid_tables()
+    wh.ensure_finance_tables()
+    wh.ensure_manual_finance_tables()
+    wh.ensure_receipt_tables()
+    wh.ensure_agent_tables()
+    wh.ensure_whatsapp_client_session_table()
+    wh.ensure_timeline_tables()
+    wh.ensure_upstream_mutation_tables()
+
+
+# ---------------------------------------------------------------------------
+# catalog contract
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_layers_and_schema_names_are_consistent() -> None:
+    for schema in BASE_SCHEMAS:
+        assert schema.startswith("base_")
+    for schema in DERIVED_SCHEMAS:
+        assert schema.startswith("derived_")
+    for schema in MARTS_SCHEMAS:
+        assert schema.startswith("marts_")
+    assert "timeline" in DISCOVERABLE_SCHEMAS
+    assert set(HIDDEN_SCHEMAS) == {"ops", "private", "internal"}
+    assert set(DISCOVERABLE_SCHEMAS).isdisjoint(HIDDEN_SCHEMAS)
+    assert set(ALL_CANONICAL_SCHEMAS) == set(DISCOVERABLE_SCHEMAS) | set(HIDDEN_SCHEMAS)
+
+
+def test_public_schemas_sort_base_then_derived_then_marts_then_timeline() -> None:
+    """Plain alphabetical order is the intended reading order.
+
+    A bare ``\\dn`` in psql, an ORDER BY table_schema, and the schema overview
+    all agree without anyone hand-sorting them.
+    """
+    ordered = list(DISCOVERABLE_SCHEMAS)
+    assert ordered == sorted(ordered)
+    layers = [CATALOG.schema(name).layer for name in ordered]
+    assert layers == sorted(layers, key=["base", "derived", "marts", "timeline"].index)
+
+
+def test_catalog_ids_and_physical_locations_are_unique() -> None:
+    ids = [obj.id for obj in CATALOG.objects]
+    assert len(ids) == len(set(ids))
+    physical = [(obj.schema, obj.name, obj.kind) for obj in CATALOG.objects]
+    assert len(physical) == len(set(physical))
+
+
+def test_catalog_object_counts_match_the_target_map() -> None:
+    by_layer: dict[str, int] = {}
+    for obj in CATALOG.objects:
+        by_layer[obj.layer] = by_layer.get(obj.layer, 0) + 1
+    assert by_layer == {
+        "base": 52,
+        "derived": 17,
+        "marts": 21,
+        "timeline": 7,
+        "ops": 20,
+        "private": 5,
+        "internal": 1,
+    }
+
+
+def test_catalog_records_the_target_physical_locations() -> None:
+    expected = {
+        # base: faithful source data
+        "gmail_messages": ("base_gmail", "messages"),
+        "gmail_attachments": ("base_gmail", "attachments"),
+        "calendar_events": ("base_google_calendar", "events"),
+        "contact_cards": ("base_google_contacts", "cards"),
+        "google_drive_files": ("base_google_drive", "files"),
+        "plaid_transactions": ("base_plaid", "transactions"),
+        "slack_messages": ("base_slack", "messages"),
+        "apple_contact_cards": ("base_apple_contacts", "cards"),
+        "apple_notes": ("base_apple_notes", "notes"),
+        "apple_messages": ("base_apple_messages", "messages"),
+        "apple_voice_memos_files": ("base_apple_voice_memos", "files"),
+        "apple_photos_files": ("base_apple_photos", "files"),
+        "alice_voice_recordings": ("base_alice_voice_recordings", "recordings"),
+        "whoop_sleeps": ("base_whoop", "sleeps"),
+        "whatsapp_messages": ("base_whatsapp", "messages"),
+        "chatgpt_events": ("base_chatgpt", "events"),
+        "claude_code_events": ("base_claude_code", "events"),
+        "manual_finance_documents": ("base_manual_finance", "documents"),
+        # derived: modelled facts
+        "apple_voice_memos_enrichments": ("derived_voice_memos", "enrichments"),
+        "google_drive_file_texts": ("derived_documents", "google_drive_file_texts"),
+        "slack_conversation_stats": ("derived_slack", "conversation_stats"),
+        "slack_account_state_item_rows": ("derived_slack", "inbox_items"),
+        "file_attachment_enrichments": ("derived_enrichment", "file_attachment_enrichments"),
+        "media_fingerprints": ("derived_enrichment", "media_fingerprints"),
+        "photo_assets": ("derived_photos", "assets"),
+        "photo_asset_files": ("derived_photos", "asset_files"),
+        "finance_observations": ("derived_finance", "observations"),
+        "manual_finance_extractions": ("derived_finance", "document_extractions"),
+        "receipt_transaction_receipts": ("derived_receipts", "transaction_receipts"),
+        # marts: domain read interfaces
+        "clean_gmail_inbox": ("marts_inbox", "gmail_threads"),
+        "clean_slack_inbox": ("marts_inbox", "slack_items"),
+        "clean_contacts": ("marts_contacts", "contacts"),
+        "clean_contact_points": ("marts_contacts", "contact_points"),
+        "clean_apple_messages": ("marts_messages", "apple_messages"),
+        "clean_whatsapp_messages": ("marts_messages", "whatsapp_messages"),
+        "ai_conversation_events": ("marts_ai_conversations", "events"),
+        "clean_agent_sessions": ("marts_ai_conversations", "sessions"),
+        "photo_files": ("marts_photos", "files"),
+        "clean_photos": ("marts_photos", "photos"),
+        "photo_canonical_renditions": ("marts_photos", "canonical_renditions"),
+        "clean_calendar_with_transcripts": ("marts_calendar", "events_with_voice_memos"),
+        "clean_transcripts_no_calendar_match": ("marts_calendar", "unmatched_voice_memos"),
+        "marts_finance_net_worth": ("marts_finance", "net_worth"),
+        "marts_finance_net_worth_history": ("marts_finance", "net_worth_history"),
+        "marts_transaction_receipts": ("marts_receipts", "transaction_receipts"),
+        # timeline: the entry point plus the search interface
+        "timeline_events": ("timeline", "events"),
+        "timeline_events_seq": ("timeline", "events_seq"),
+        "timeline_priority": ("timeline", "timeline_priority"),
+        "search_text_hit": ("timeline", "text_hit"),
+        "search_text": ("timeline", "search_text"),
+        "search_text_exact": ("timeline", "search_text_exact"),
+        "search_text_sources": ("timeline", "search_text_sources"),
+        # ops: source-prefixed so one flat schema cannot collide
+        "gmail_sync_state": ("ops", "gmail_sync_state"),
+        "calendar_sync_state": ("ops", "google_calendar_sync_state"),
+        "contact_sync_state": ("ops", "google_contacts_sync_state"),
+        "slack_sync_state": ("ops", "slack_sync_state"),
+        "timeline_sync_state": ("ops", "timeline_sync_state"),
+        "search_schema_state": ("ops", "search_schema_state"),
+        "agent_runs": ("ops", "ai_processing_agent_runs"),
+        "upstream_mutations": ("ops", "upstream_mutation_operations"),
+        "upstream_mutation_requests": ("ops", "upstream_mutation_requests"),
+        # private + internal
+        "plaid_item_tokens": ("private", "plaid_item_tokens"),
+        "chatgpt_sessions": ("private", "chatgpt_sessions"),
+        "utf8_byte_prefix": ("internal", "utf8_byte_prefix"),
+    }
+    for logical, location in expected.items():
+        rel = relation(logical)
+        assert (rel.schema, rel.name) == location, logical
+
+
 def test_alice_archive_source_uses_source_owned_name() -> None:
     assert ALICE_VOICE_RECORDINGS_SOURCE == "alice_voice_recordings"
 
 
-def test_agent_documentation_uses_new_ai_query_surfaces() -> None:
-    docs = Path("AGENTS.md").read_text()
-    assert "agent_session_events" not in docs
-    assert "clean_agent_sessions" not in docs
-    assert "searchable_text" not in docs
-    assert "marts.ai_conversation_events" in docs
-    assert "marts.ai_conversation_sessions" in docs
-    assert "search.search_text()" in docs
+def test_every_postgres_table_spec_is_a_cataloged_table() -> None:
+    for name in POSTGRES_TABLES:
+        obj = CATALOG.object(name)
+        assert obj.kind == "table", name
 
 
-def test_relation_qualification_distinguishes_search_function_from_column() -> None:
-    sql = """
-        CREATE TABLE timeline_events ("search_text" text NOT NULL);
-        CREATE INDEX idx ON timeline_events (search_text);
-        SELECT * FROM search_text('needle', 10);
+def test_query_access_policy_matches_the_layer_contract() -> None:
+    for obj in CATALOG.objects:
+        if obj.layer in {"base", "derived", "marts", "timeline"}:
+            assert obj.query_access == "public", obj.id
+            assert obj.discoverable, obj.id
+        elif obj.layer == "private":
+            assert obj.query_access == "denied", obj.id
+            assert obj.secret, obj.id
+        else:
+            assert obj.query_access in {"denied", "app_only", "execute_only"}, obj.id
+            assert not obj.discoverable, obj.id
+
+    # ops is reachable only for the operational surfaces the app itself renders.
+    app_read = {obj.id for obj in CATALOG.objects if obj.query_access == "app_only"}
+    assert app_read == {
+        "timeline_sync_state",
+        "upstream_mutations",
+        "upstream_mutation_requests",
+        "upstream_mutation_events",
+        "upstream_mutation_request_events",
+        "agent_runs",
+        "agent_run_events",
+        "agent_run_tool_calls",
+    }
+    assert {obj.id for obj in CATALOG.objects if obj.query_access == "execute_only"} == {
+        "utf8_byte_prefix"
+    }
+    assert set(CATALOG.denied_schemas()) == {"private"}
+
+
+def test_namespaced_schema_identifiers_stay_within_postgres_limit() -> None:
+    namespace = make_test_schema("a_deliberately_long_integration_label")
+    physicals = [physical_schema_name(schema, namespace=namespace) for schema in ALL_CANONICAL_SCHEMAS]
+    for physical in physicals:
+        assert len(physical.encode("utf-8")) <= 63, physical
+        # The leak reaper keys on the pdw_test_<timestamp>_ prefix.
+        assert physical.startswith("pdw_test_")
+    assert len(set(physicals)) == len(physicals)
+
+
+# ---------------------------------------------------------------------------
+# catalog is the only authority
+# ---------------------------------------------------------------------------
+
+
+def test_go_catalog_is_generated_from_the_json_catalog() -> None:
+    result = subprocess.run(
+        [sys.executable, "scripts/generate_go_warehouse_catalog.py", "--check"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_go_catalog_has_no_second_editable_relation_table() -> None:
+    relations_go = (REPO_ROOT / "app/internal/warehouse/relations.go").read_text()
+    assert "var Relations = map[string]Relation{" not in relations_go
+    assert "var QueryableSchemas = []string{" not in relations_go
+    generated = (REPO_ROOT / "app/internal/warehouse/catalog_gen.go").read_text()
+    assert "DO NOT EDIT" in generated
+    for logical in ("gmail_messages", "timeline_events", "search_text"):
+        assert f'ID: "{logical}"' in generated
+
+
+def test_catalog_json_round_trips_through_the_generator() -> None:
+    payload = json.loads((REPO_ROOT / "src/personal_data_warehouse/warehouse_catalog.json").read_text())
+    assert payload["version"] == CATALOG.version
+    assert len(payload["objects"]) == len(CATALOG.objects)
+    assert payload["start_here"]["schema"] == "timeline"
+
+
+# ---------------------------------------------------------------------------
+# no legacy naming layer
+# ---------------------------------------------------------------------------
+
+
+def test_relation_rewriters_and_legacy_aliases_are_gone() -> None:
+    relations_py = (REPO_ROOT / "src/personal_data_warehouse/relations.py").read_text()
+    assert "def qualify_sql_relations" not in relations_py
+    assert "LEGACY_QUERY_ALIASES" not in relations_py
+    assert "def query_relation" not in relations_py
+
+    relations_go = (REPO_ROOT / "app/internal/warehouse/relations.go").read_text()
+    assert "func QualifySQL" not in relations_go
+
+    assert "agent_session_events" not in CANONICAL_RELATIONS
+    assert "agent_session_events" not in POSTGRES_TABLES
+
+
+def test_unknown_relation_markers_fail_instead_of_passing_through() -> None:
+    with pytest.raises(KeyError):
+        expand_relations("SELECT * FROM @not_a_relation")
+    # A bare legacy name is left exactly as written, so Postgres rejects it
+    # rather than the code silently resolving it somewhere.
+    assert expand_relations("SELECT * FROM gmail_messages") == "SELECT * FROM gmail_messages"
+
+
+def test_relation_markers_are_not_expanded_inside_literals_or_comments() -> None:
+    sql = (
+        "SELECT '@gmail_messages' AS literal, \"@gmail_messages\" AS ident\n"
+        "-- @gmail_messages in a comment\n"
+        "FROM @gmail_messages WHERE addr LIKE '%@example.com'"
+    )
+    expanded = expand_relations(sql)
+    assert "'@gmail_messages'" in expanded
+    assert '"@gmail_messages"' in expanded
+    assert "-- @gmail_messages in a comment" in expanded
+    assert "'%@example.com'" in expanded
+    assert 'FROM "base_gmail"."messages"' in expanded
+
+
+def test_no_runtime_legacy_migration_paths_remain() -> None:
+    postgres_py = (REPO_ROOT / "src/personal_data_warehouse/postgres.py").read_text()
+    for banned in (
+        "_migrate_legacy_table_if_present",
+        "_migrate_legacy_named_table_if_present",
+        "_migrate_legacy_agent_session_events_if_present",
+        "_migrate_file_attachment_enrichments_rename",
+        "_migrate_timeline_priority_to_enum",
+        "_drop_legacy_search_routines_if_present",
+        "_drop_legacy_view_if_present",
+        "_ensure_ai_conversation_events_insert_trigger",
+    ):
+        assert banned not in postgres_py, banned
+
+
+def test_warehouse_sql_never_names_a_relation_bare() -> None:
+    """A logical id in SQL must be written as an explicit @marker.
+
+    This is the enforcement test for the rewriter's removal: bare tokens used to
+    be rewritten for you, so re-introducing one would look like it worked
+    locally and then resolve through the search_path in production.
     """
+    names = set(CANONICAL_RELATIONS)
 
-    qualified = qualify_sql_relations(sql, namespace="pdw_test")
+    def code_only(text: str) -> str:
+        """Blank out SQL string literals and comments, like expand_relations does."""
+        out: list[str] = []
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "'":
+                start = i
+                i += 1
+                while i < n:
+                    if text[i] == "'":
+                        i += 1
+                        if i < n and text[i] == "'":
+                            i += 1
+                            continue
+                        break
+                    i += 1
+                out.append(" " * (i - start))
+                continue
+            if ch == "-" and i + 1 < n and text[i + 1] == "-":
+                start = i
+                while i < n and text[i] != "\n":
+                    i += 1
+                out.append(" " * (i - start))
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
 
-    assert '"search_text" text NOT NULL' in qualified
-    assert "(search_text)" in qualified
-    assert 'FROM "pdw_test_search"."search_text"(' in qualified
-    assert qualified.count('"pdw_test_timeline"."events"') == 2
-
-
-def test_relation_registry_encodes_source_owned_raw_schemas() -> None:
-    assert SOURCE_RAW_SCHEMAS == (
-        "gmail",
-        "google_calendar",
-        "google_contacts",
-        "google_drive",
-        "plaid",
-        "slack",
-        "apple_contacts",
-        "apple_notes",
-        "apple_messages",
-        "apple_voice_memos",
-        "apple_photos",
-        "alice_voice_recordings",
-        "whoop",
-        "whatsapp",
-        "chatgpt",
-        "claude_desktop",
-        "claude_code",
-        "codex",
-        "openclaw",
-        "pi",
-        "manual_finance",
+    sql_keyword = re.compile(
+        r"\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|FROM|JOIN|CREATE|ALTER|DROP|TRUNCATE)\b"
+    )
+    offenders: list[str] = []
+    for path in (
+        REPO_ROOT / "src/personal_data_warehouse/postgres.py",
+        REPO_ROOT / "src/personal_data_warehouse/timeline.py",
+    ):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                parts = [node.value]
+            elif isinstance(node, ast.JoinedStr):
+                parts = [
+                    v.value
+                    for v in node.values
+                    if isinstance(v, ast.Constant) and isinstance(v.value, str)
+                ]
+            else:
+                continue
+            text = " ".join(parts)
+            if not sql_keyword.search(text):
+                continue
+            text = code_only(text)
+            for match in re.finditer(r"(?<![@.\w])([A-Za-z_][A-Za-z0-9_]*)(?![\w.])", text):
+                token = match.group(1)
+                if token in names and token != "search_text":
+                    offenders.append(f"{path.name}:{node.lineno}: {token}")
+    assert not offenders, "bare warehouse relation tokens in SQL: " + "; ".join(
+        sorted(set(offenders))[:20]
     )
 
-    expected = {
-        "gmail_messages": ("gmail", "messages"),
-        "gmail_attachments": ("gmail", "attachments"),
-        "calendar_events": ("google_calendar", "events"),
-        "contact_cards": ("google_contacts", "cards"),
-        "apple_contact_cards": ("apple_contacts", "cards"),
-        "google_drive_files": ("google_drive", "files"),
-        "plaid_items": ("plaid", "items"),
-        "plaid_accounts": ("plaid", "accounts"),
-        "plaid_transactions": ("plaid", "transactions"),
-        "plaid_item_tokens": ("private", "plaid_item_tokens"),
-        "slack_messages": ("slack", "messages"),
-        "apple_notes": ("apple_notes", "notes"),
-        "apple_messages": ("apple_messages", "messages"),
-        "clean_contacts": ("marts", "contacts"),
-        "clean_contact_points": ("marts", "contact_points"),
-        "clean_apple_messages": ("marts", "apple_messages"),
-        "apple_voice_memos_files": ("apple_voice_memos", "files"),
-        "apple_photos_files": ("apple_photos", "files"),
-        "photo_assets": ("photos", "assets"),
-        "photo_asset_files": ("photos", "asset_files"),
-        "media_fingerprints": ("enrichment", "media_fingerprints"),
-        "photo_files": ("marts", "photo_files"),
-        "clean_photos": ("marts", "photos"),
-        "photo_canonical_renditions": ("marts", "photo_canonical_renditions"),
-        "whatsapp_messages": ("whatsapp", "messages"),
-        "chatgpt_events": ("chatgpt", "events"),
-        "claude_desktop_events": ("claude_desktop", "events"),
-        "claude_code_events": ("claude_code", "events"),
-        "codex_events": ("codex", "events"),
-        "openclaw_events": ("openclaw", "events"),
-        "pi_events": ("pi", "events"),
-        "file_attachment_enrichments": ("enrichment", "file_attachment_enrichments"),
-        "agent_runs": ("ai_processing", "agent_runs"),
-        "upstream_mutations": ("upstream_mutations", "operations"),
-        "timeline_events": ("timeline", "events"),
-        "search_schema_state": ("search", "schema_state"),
-        "chatgpt_sessions": ("private", "chatgpt_sessions"),
-        "claude_desktop_credentials": ("private", "claude_desktop_credentials"),
-        "whatsapp_client_sessions": ("private", "whatsapp_client_sessions"),
+
+# ---------------------------------------------------------------------------
+# timeline routing
+# ---------------------------------------------------------------------------
+
+
+def test_timeline_source_tables_are_catalog_ids() -> None:
+    for adapter in TIMELINE_ADAPTERS:
+        assert adapter.source_table in CANONICAL_RELATIONS, adapter.name
+    for name in TIMELINE_TABLE_COVERAGE:
+        assert name in CANONICAL_RELATIONS, name
+
+
+def test_renamed_timeline_source_tables_are_recorded_for_stored_rows() -> None:
+    assert CATALOG.renamed_timeline_source_tables == {
+        "agent_session_events": "ai_conversation_events"
     }
-    for logical_name, (schema, table) in expected.items():
-        rel = relation(logical_name)
-        assert (rel.schema, rel.name) == (schema, table)
-
-    assert "agent_session_events" not in CANONICAL_RELATIONS, (
-        "mixed AI events must be split into source-owned raw event tables and re-unified in marts"
-    )
-    assert "private" not in QUERYABLE_SCHEMAS
+    assert UPGRADE_PLAN.timeline_source_table_renames == {
+        "agent_session_events": "ai_conversation_events"
+    }
 
 
-def test_fresh_warehouse_creates_source_owned_and_derived_schemas(warehouse: PostgresWarehouse) -> None:
-    warehouse.ensure_tables()
-    warehouse.ensure_calendar_tables()
-    warehouse.ensure_contacts_tables()
-    warehouse.ensure_google_drive_source_tables()
-    warehouse.ensure_slack_tables()
-    warehouse.ensure_apple_notes_tables()
-    warehouse.ensure_apple_messages_tables()
-    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
-    warehouse.ensure_whatsapp_tables()
-    warehouse.ensure_photos_tables()
-    warehouse.ensure_agent_sessions_tables()
-    warehouse.ensure_timeline_tables()
-    warehouse.ensure_upstream_mutation_tables()
+# ---------------------------------------------------------------------------
+# real Postgres: fresh provisioning matches the catalog exactly
+# ---------------------------------------------------------------------------
 
-    rows = warehouse._query(
+
+def _inventory(wh: PostgresWarehouse, sql: str) -> set[tuple[str, str]]:
+    return {
+        (schema, name)
+        for schema, name in wh._query(sql, (wh.physical_schema_names(include_hidden=True),))
+    }
+
+
+def test_fresh_database_object_inventory_matches_the_catalog(warehouse: PostgresWarehouse) -> None:
+    _provision_everything(warehouse)
+    namespace = warehouse.schema_namespace
+
+    def expected(kinds: set[str]) -> set[tuple[str, str]]:
+        return {
+            (physical_schema_name(obj.schema, namespace=namespace), obj.name)
+            for obj in CATALOG.objects
+            if obj.kind in kinds
+        }
+
+    assert _inventory(
+        warehouse,
         """
-        SELECT table_schema, table_name, table_type
-        FROM information_schema.tables
-        WHERE table_schema = ANY(%s)
-        ORDER BY table_schema, table_name
+        SELECT n.nspname, c.relname
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = ANY(%s) AND c.relkind IN ('r', 'v', 'm', 'p')
         """,
-        (warehouse.physical_schema_names(include_private=True),),
-    )
-    relations = {(schema, table) for schema, table, _type in rows}
+    ) == expected({"table", "view"})
 
-    expected_relations = {
-        (physical_schema_name("gmail", namespace=warehouse.schema_namespace), "messages"),
-        (physical_schema_name("gmail", namespace=warehouse.schema_namespace), "attachments"),
-        (physical_schema_name("google_calendar", namespace=warehouse.schema_namespace), "events"),
-        (physical_schema_name("google_contacts", namespace=warehouse.schema_namespace), "cards"),
-        (physical_schema_name("apple_contacts", namespace=warehouse.schema_namespace), "cards"),
-        (physical_schema_name("google_drive", namespace=warehouse.schema_namespace), "files"),
-        (physical_schema_name("slack", namespace=warehouse.schema_namespace), "messages"),
-        (physical_schema_name("apple_notes", namespace=warehouse.schema_namespace), "notes"),
-        (physical_schema_name("apple_messages", namespace=warehouse.schema_namespace), "messages"),
-        (physical_schema_name("apple_voice_memos", namespace=warehouse.schema_namespace), "files"),
-        (physical_schema_name("apple_photos", namespace=warehouse.schema_namespace), "files"),
-        (physical_schema_name("photos", namespace=warehouse.schema_namespace), "assets"),
-        (physical_schema_name("photos", namespace=warehouse.schema_namespace), "asset_files"),
-        (physical_schema_name("enrichment", namespace=warehouse.schema_namespace), "media_fingerprints"),
-        (physical_schema_name("marts", namespace=warehouse.schema_namespace), "photo_files"),
-        (physical_schema_name("marts", namespace=warehouse.schema_namespace), "photos"),
-        (physical_schema_name("marts", namespace=warehouse.schema_namespace), "photo_canonical_renditions"),
-        (physical_schema_name("whatsapp", namespace=warehouse.schema_namespace), "messages"),
-        (physical_schema_name("chatgpt", namespace=warehouse.schema_namespace), "events"),
-        (physical_schema_name("claude_desktop", namespace=warehouse.schema_namespace), "events"),
-        (physical_schema_name("claude_code", namespace=warehouse.schema_namespace), "events"),
-        (physical_schema_name("codex", namespace=warehouse.schema_namespace), "events"),
-        (physical_schema_name("openclaw", namespace=warehouse.schema_namespace), "events"),
-        (physical_schema_name("pi", namespace=warehouse.schema_namespace), "events"),
-        (physical_schema_name("marts", namespace=warehouse.schema_namespace), "ai_conversation_events"),
-        (physical_schema_name("marts", namespace=warehouse.schema_namespace), "ai_conversation_sessions"),
-        (physical_schema_name("timeline", namespace=warehouse.schema_namespace), "events"),
-        (physical_schema_name("search", namespace=warehouse.schema_namespace), "schema_state"),
-        (physical_schema_name("enrichment", namespace=warehouse.schema_namespace), "file_attachment_enrichments"),
-        (physical_schema_name("ai_processing", namespace=warehouse.schema_namespace), "agent_runs"),
-        (physical_schema_name("upstream_mutations", namespace=warehouse.schema_namespace), "operations"),
-        (physical_schema_name("private", namespace=warehouse.schema_namespace), "chatgpt_sessions"),
-        (physical_schema_name("private", namespace=warehouse.schema_namespace), "claude_desktop_credentials"),
-        (physical_schema_name("private", namespace=warehouse.schema_namespace), "whatsapp_client_sessions"),
-    }
-    assert expected_relations <= relations
+    assert _inventory(
+        warehouse,
+        """
+        SELECT n.nspname, c.relname
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = ANY(%s) AND c.relkind = 'S'
+        """,
+    ) == expected({"sequence"})
 
-    search_schema = physical_schema_name("search", namespace=warehouse.schema_namespace)
-    search_type_rows = warehouse._query(
+    assert _inventory(
+        warehouse,
+        """
+        SELECT n.nspname, p.proname
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = ANY(%s)
+        """,
+    ) == expected({"function"})
+
+    assert _inventory(
+        warehouse,
         """
         SELECT n.nspname, t.typname
-        FROM pg_type t
-        JOIN pg_namespace n ON n.oid = t.typnamespace
-        WHERE n.nspname = %s AND t.typname = 'text_hit'
+        FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = ANY(%s)
+          AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class c WHERE c.oid = t.typrelid) = 'c')
+          AND NOT EXISTS (SELECT 1 FROM pg_type el WHERE el.oid = t.typelem AND el.typarray = t.oid)
         """,
-        (search_schema,),
-    )
-    assert search_type_rows == [(search_schema, "text_hit")]
-    search_function_rows = warehouse._query(
-        """
-        SELECT n.nspname, p.proname
-        FROM pg_proc p
-        JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = %s AND p.proname IN ('search_text', 'search_text_sources')
-        ORDER BY p.proname
-        """,
-        (search_schema,),
-    )
-    assert search_function_rows == [(search_schema, "search_text"), (search_schema, "search_text_sources")]
-    util_schema = physical_schema_name("util", namespace=warehouse.schema_namespace)
-    util_function_rows = warehouse._query(
-        """
-        SELECT n.nspname, p.proname
-        FROM pg_proc p
-        JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = %s AND p.proname = 'utf8_byte_prefix'
-        """,
-        (util_schema,),
-    )
-    assert util_function_rows == [(util_schema, "utf8_byte_prefix")]
+    ) == expected({"type"})
 
-    legacy_names = sorted(set(CANONICAL_RELATIONS) | {"agent_session_events"})
-    old_public_rows = warehouse._query(
+
+def test_fresh_database_has_no_pre_reorg_schemas_or_shadowing_routines(
+    warehouse: PostgresWarehouse,
+) -> None:
+    _provision_everything(warehouse)
+    namespace = warehouse.schema_namespace
+    legacy_schemas = [
+        physical_schema_name(schema, namespace=namespace)
+        for schema in (
+            "gmail",
+            "google_calendar",
+            "google_contacts",
+            "google_drive",
+            "slack",
+            "whatsapp",
+            "apple_notes",
+            "apple_messages",
+            "apple_voice_memos",
+            "apple_photos",
+            "apple_contacts",
+            "alice_voice_recordings",
+            "whoop",
+            "plaid",
+            "chatgpt",
+            "claude_code",
+            "claude_desktop",
+            "codex",
+            "openclaw",
+            "pi",
+            "manual_finance",
+            "marts",
+            "search",
+            "enrichment",
+            "photos",
+            "finance",
+            "receipts",
+            "ai_processing",
+            "upstream_mutations",
+            "util",
+        )
+    ]
+    present = warehouse._query(
+        "SELECT nspname FROM pg_namespace WHERE nspname = ANY(%s)", (legacy_schemas,)
+    )
+    assert present == []
+
+    # The base namespace must hold nothing at all: a stale search_text() left
+    # there silently shadowed the real one for 16 days, because unqualified
+    # callers resolve through Postgres' default '"$user", public' search_path.
+    leftovers = warehouse._query(
         """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = %s AND table_name = ANY(%s)
+        SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = %s AND c.relkind IN ('r', 'v', 'm', 'S')
         UNION ALL
-        SELECT table_name
-        FROM information_schema.views
-        WHERE table_schema = %s AND table_name = ANY(%s)
+        SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = %s
+        UNION ALL
+        SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = %s
         """,
-        (warehouse.schema_namespace, legacy_names, warehouse.schema_namespace, legacy_names),
+        (namespace, namespace, namespace),
     )
-    assert old_public_rows == []
+    assert leftovers == []
 
 
-def _agent_event_row(*, source: str, session_id: str, event_uuid: str, seq: int) -> dict[str, object]:
-    now = datetime(2026, 7, 9, 7, tzinfo=UTC)
-    row = {column: "" for column in AGENT_SESSION_EVENT_COLUMNS}
-    row.update(
-        {
-            "source": source,
-            "session_id": session_id,
-            "event_uuid": event_uuid,
-            "account": "zach@example.test",
-            "device": "test-device",
-            "seq": seq,
-            "occurred_at": now,
-            "role": "user",
-            "event_type": "message",
-            "session_title": f"{source} session",
-            "text": f"hello from {source}",
-            "raw_json": "{}",
-            "ingested_at": now,
-            "sync_version": 1,
-        }
-    )
-    for column in (
-        "input_tokens",
-        "output_tokens",
-        "cache_read_tokens",
-        "cache_creation_tokens",
-        "is_sidechain",
+def test_schema_comments_publish_the_start_here_guidance(warehouse: PostgresWarehouse) -> None:
+    timeline_schema = warehouse.physical_schema_name("timeline")
+    comment = warehouse._query(
+        "SELECT obj_description(n.oid, 'pg_namespace') FROM pg_namespace n WHERE n.nspname = %s",
+        (timeline_schema,),
+    )[0][0]
+    assert "Start with timeline" in comment
+    base_comment = warehouse._query(
+        "SELECT obj_description(n.oid, 'pg_namespace') FROM pg_namespace n WHERE n.nspname = %s",
+        (warehouse.physical_schema_name("base_gmail"),),
+    )[0][0]
+    assert "source data" in base_comment
+
+
+def test_query_role_reads_public_relations_and_is_denied_private(
+    warehouse: PostgresWarehouse,
+) -> None:
+    _provision_everything(warehouse)
+    namespace = warehouse.schema_namespace
+    role = warehouse.query_role
+
+    for obj in CATALOG.objects:
+        if not obj.is_relation:
+            continue
+        qualified = f'"{physical_schema_name(obj.schema, namespace=namespace)}"."{obj.name}"'
+        readable = warehouse._query(
+            "SELECT has_table_privilege(%s, %s, 'SELECT')", (role, qualified)
+        )[0][0]
+        if obj.query_access in {"public", "app_only"}:
+            assert readable, f"{obj.id} should be readable by {role}"
+        else:
+            assert not readable, f"{obj.id} must not be readable by {role}"
+            public_readable = warehouse._query(
+                "SELECT has_table_privilege('public', %s, 'SELECT')", (qualified,)
+            )[0][0]
+            assert not public_readable, f"{obj.id} must not be readable by PUBLIC"
+
+    private_schema = warehouse.physical_schema_name("private")
+    usable = warehouse._query(
+        "SELECT has_schema_privilege(%s, %s, 'USAGE')", (role, private_schema)
+    )[0][0]
+    assert not usable
+
+
+def test_query_role_can_execute_the_search_interface(warehouse: PostgresWarehouse) -> None:
+    _provision_everything(warehouse)
+    role = warehouse.query_role
+    for logical, signature in (
+        ("search_text", "(text, integer, text[], timestamptz)"),
+        ("search_text_exact", "(text, integer, text[], timestamptz)"),
+        ("search_text_sources", "()"),
+        ("utf8_byte_prefix", "(text, integer)"),
     ):
-        row[column] = 0
-    return row
-
-
-def test_ai_events_split_by_source_and_reunified_in_marts(warehouse: PostgresWarehouse) -> None:
-    warehouse.ensure_agent_sessions_tables()
-    rows = [
-        _agent_event_row(source="chatgpt", session_id="chatgpt-1", event_uuid="event-chatgpt", seq=1),
-        _agent_event_row(source="claude_desktop", session_id="desktop-1", event_uuid="event-desktop", seq=1),
-        _agent_event_row(source="claude_code", session_id="claude-code-1", event_uuid="event-claude-code", seq=1),
-        _agent_event_row(source="codex", session_id="codex-1", event_uuid="event-codex", seq=1),
-        _agent_event_row(source="openclaw", session_id="openclaw-1", event_uuid="event-openclaw", seq=1),
-        _agent_event_row(source="pi", session_id="pi-1", event_uuid="event-pi", seq=1),
-    ]
-    warehouse.insert_agent_session_events(rows)
-    warehouse.insert_agent_session_events(rows)  # idempotent upsert into per-source tables.
-
-    for source in ("chatgpt", "claude_desktop", "claude_code", "codex", "openclaw", "pi"):
-        source_rows = warehouse._query(
-            f"SELECT source, session_id, text FROM {warehouse.sql_relation(source + '_events')}"
-        )
-        assert source_rows == [(source, rows[[row["source"] for row in rows].index(source)]["session_id"], f"hello from {source}")]
-
-    unified = warehouse._query(
-        f"""
-        SELECT source, session_id, event_uuid
-        FROM {warehouse.sql_relation('ai_conversation_events')}
-        ORDER BY source
-        """
-    )
-    assert len(unified) == 6
-    assert {row[0] for row in unified} == {"chatgpt", "claude_desktop", "claude_code", "codex", "openclaw", "pi"}
-
-    sessions = warehouse._query(
-        f"""
-        SELECT source, session_id, title, first_prompt, event_count
-        FROM {warehouse.sql_relation('clean_agent_sessions')}
-        ORDER BY source
-        """
-    )
-    assert len(sessions) == 6
-    assert {row[4] for row in sessions} == {1}
-
-    old_mixed_rows = warehouse._query(
-        """
-        SELECT table_schema, table_name
-        FROM information_schema.tables
-        WHERE table_schema = %s AND table_name = 'agent_session_events'
-        """,
-        (warehouse.schema_namespace,),
-    )
-    assert old_mixed_rows == []
-
-
-def _create_legacy_agent_session_events_table(warehouse: PostgresWarehouse) -> None:
-    spec = POSTGRES_TABLES["agent_session_events"]
-    columns = ", ".join(
-        f"{_identifier(column)} {_postgres_type(column, table='agent_session_events')} NOT NULL DEFAULT {_default_sql(column, table='agent_session_events')}"
-        for column in spec.columns
-    )
-    primary_key = ", ".join(_identifier(column) for column in spec.primary_key)
-    warehouse._raw_command(
-        f"""
-        CREATE TABLE "{warehouse.schema_namespace}".agent_session_events (
-            {columns},
-            PRIMARY KEY ({primary_key})
-        )
-        """
-    )
-
-
-def test_old_layout_mixed_ai_events_migrate_to_source_tables_without_legacy_view(warehouse: PostgresWarehouse) -> None:
-    _create_legacy_agent_session_events_table(warehouse)
-    warehouse._raw_command(
-        f"""
-        CREATE VIEW "{warehouse.schema_namespace}".clean_agent_sessions AS
-        SELECT source, session_id, count(*) AS event_count
-        FROM "{warehouse.schema_namespace}".agent_session_events
-        GROUP BY source, session_id
-        """
-    )
-    legacy_row = _agent_event_row(source="claude_code", session_id="legacy-session", event_uuid="legacy-event", seq=1)
-    columns = AGENT_SESSION_EVENT_COLUMNS
-    placeholders = ", ".join(["%s"] * len(columns))
-    column_sql = ", ".join(_identifier(column) for column in columns)
-    warehouse._raw_command(
-        f"""
-        INSERT INTO "{warehouse.schema_namespace}".agent_session_events ({column_sql})
-        VALUES ({placeholders})
-        """,
-        tuple(legacy_row[column] for column in columns),
-    )
-
-    warehouse.ensure_agent_sessions_tables()
-
-    migrated = warehouse._query(
-        f"""
-        SELECT source, session_id, event_uuid, text
-        FROM {warehouse.sql_relation('claude_code_events')}
-        """
-    )
-    assert migrated == [("claude_code", "legacy-session", "legacy-event", "hello from claude_code")]
-    unified = warehouse._query(
-        f"""
-        SELECT source, session_id, event_uuid
-        FROM {warehouse.sql_relation('ai_conversation_events')}
-        """
-    )
-    assert unified == [("claude_code", "legacy-session", "legacy-event")]
-    legacy_rows = warehouse._query(
-        """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = %s AND table_name IN ('agent_session_events', 'clean_agent_sessions')
-        UNION ALL
-        SELECT table_name
-        FROM information_schema.views
-        WHERE table_schema = %s AND table_name IN ('agent_session_events', 'clean_agent_sessions')
-        """,
-        (warehouse.schema_namespace, warehouse.schema_namespace),
-    )
-    assert legacy_rows == []
-
-
-def test_old_layout_raw_control_tables_migrate_without_public_leftovers(warehouse: PostgresWarehouse) -> None:
-    warehouse._raw_command(
-        f"""
-        CREATE TABLE "{warehouse.schema_namespace}".chatgpt_sessions (
-            account text NOT NULL,
-            session_key text NOT NULL DEFAULT 'default',
-            session_token text NOT NULL DEFAULT '',
-            source_browser text NOT NULL DEFAULT '',
-            token_sha256 text NOT NULL DEFAULT '',
-            published_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
-            updated_at timestamptz NOT NULL DEFAULT now(),
-            sync_version bigint NOT NULL DEFAULT 1,
-            PRIMARY KEY (account, session_key)
-        )
-        """
-    )
-    warehouse._raw_command(
-        f"""
-        INSERT INTO "{warehouse.schema_namespace}".chatgpt_sessions (account, session_key, session_token, token_sha256)
-        VALUES ('zach@example.test', 'default', 'token-redacted', 'sha')
-        """
-    )
-    warehouse._raw_command(
-        f"""
-        CREATE TABLE "{warehouse.schema_namespace}".pdw_search_schema_state (
-            id smallint PRIMARY KEY DEFAULT 1,
-            signature text NOT NULL,
-            CONSTRAINT pdw_search_schema_state_single_row CHECK (id = 1)
-        )
-        """
-    )
-    warehouse._raw_command(
-        f"INSERT INTO \"{warehouse.schema_namespace}\".pdw_search_schema_state (id, signature) VALUES (1, 'legacy-signature')"
-    )
-
-    warehouse.ensure_chatgpt_session_table()
-    assert warehouse._stored_search_schema_signature() == "legacy-signature"
-
-    chatgpt_rows = warehouse._query(
-        f"SELECT account, session_key, session_token FROM {warehouse.sql_relation('chatgpt_sessions')}"
-    )
-    assert chatgpt_rows == [("zach@example.test", "default", "token-redacted")]
-    legacy_rows = warehouse._query(
-        """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = %s AND table_name IN ('chatgpt_sessions', 'pdw_search_schema_state')
-        ORDER BY table_name
-        """,
-        (warehouse.schema_namespace,),
-    )
-    assert legacy_rows == []
-
-
-def _search_routine_names(warehouse: PostgresWarehouse, schema: str) -> list[str]:
-    return [
-        row[0]
-        for row in warehouse._query(
-            """
-            SELECT p.proname
-            FROM pg_proc p
-            JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE n.nspname = %s
-              AND p.proname IN ('search_text', 'search_text_exact', 'search_text_sources')
-            ORDER BY p.proname
-            """,
-            (schema,),
-        )
-    ]
-
-
-def _search_hit_type_names(warehouse: PostgresWarehouse, schema: str) -> list[str]:
-    return [
-        row[0]
-        for row in warehouse._query(
-            """
-            SELECT t.typname
-            FROM pg_type t
-            JOIN pg_namespace n ON n.oid = t.typnamespace
-            WHERE n.nspname = %s AND t.typname = 'search_text_hit'
-            """,
-            (schema,),
-        )
-    ]
-
-
-def test_old_layout_search_functions_are_dropped_not_left_shadowing() -> None:
-    """The pre-reorg search_text copies must not survive in the base namespace.
-
-    They do not just sit there unused: they SHADOW the real functions for every
-    caller that does not set a search_path. The app's read-only query runner
-    resolves through Postgres' default '"$user", public', so an unqualified
-    search_text() call found the pre-reorg public copy first. That copy predates
-    the function-level search_path pin, so its per-branch dynamic SQL could not
-    resolve the timeline BM25 index from a bare public path — and search_text()'s
-    per-branch exception guard turned every lookup failure into an empty result
-    instead of an error. Unqualified search returned zero rows for 16 days while
-    search.search_text() worked fine.
-    """
-    # Deliberately NOT the module fixture: its labelled namespace is longer than
-    # Postgres' 63-byte identifier limit, so the schema is created under a
-    # truncated name and every catalog lookup keyed on the full name misses. The
-    # legacy sweep this test covers is exactly such a lookup, so the namespace
-    # has to round-trip; the pre-condition assertions below fail loudly if it
-    # ever stops doing so.
-    namespace = make_test_schema()
-    warehouse = PostgresWarehouse(_postgres_url(), schema=namespace)
-    try:
-        warehouse._raw_command(
-            f'CREATE TYPE "{namespace}".search_text_hit AS (source text, ref text, text text, score real)'
-        )
-        warehouse._raw_command(
-            f'CREATE FUNCTION "{namespace}".search_text('
-            "query text, max_results integer DEFAULT 50, "
-            "sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL) "
-            f'RETURNS SETOF "{namespace}".search_text_hit LANGUAGE sql STABLE AS '
-            "$$ SELECT NULL::text, NULL::text, NULL::text, NULL::real WHERE false $$"
-        )
-        warehouse._raw_command(
-            f'CREATE FUNCTION "{namespace}".search_text_sources() RETURNS TABLE (source text) '
-            "LANGUAGE sql IMMUTABLE AS $$ SELECT NULL::text WHERE false $$"
-        )
-        assert _search_routine_names(warehouse, namespace) == ["search_text", "search_text_sources"]
-        assert _search_hit_type_names(warehouse, namespace) == ["search_text_hit"]
-
-        warehouse.ensure_timeline_tables()
-
-        assert _search_routine_names(warehouse, namespace) == []
-        assert _search_hit_type_names(warehouse, namespace) == []
-        search_schema = physical_schema_name("search", namespace=namespace)
-        assert _search_routine_names(warehouse, search_schema) == [
-            "search_text",
-            "search_text_exact",
-            "search_text_sources",
-        ]
-    finally:
-        cleanup_test_warehouse(warehouse)
-
-
-def test_old_layout_sync_state_migrates_without_legacy_public_view(warehouse: PostgresWarehouse) -> None:
-    warehouse._raw_command(
-        f"""
-        CREATE TABLE "{warehouse.schema_namespace}".gmail_sync_state (
-            account text PRIMARY KEY,
-            last_history_id bigint NOT NULL DEFAULT 0,
-            last_sync_type text NOT NULL DEFAULT '',
-            status text NOT NULL DEFAULT '',
-            error text NOT NULL DEFAULT '',
-            updated_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz
-        )
-        """
-    )
-    updated_at = datetime(2026, 7, 9, 6, tzinfo=UTC)
-    warehouse._raw_command(
-        f"""
-        INSERT INTO "{warehouse.schema_namespace}".gmail_sync_state
-            (account, last_history_id, last_sync_type, status, error, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-        ("zach@example.test", 123, "partial", "ok", "", updated_at),
-    )
-
-    warehouse.ensure_tables()
-
-    migrated = warehouse._query(
-        f"""
-        SELECT account, last_history_id, last_sync_type, status, updated_at
-        FROM {warehouse.sql_relation('gmail_sync_state')}
-        """
-    )
-    assert migrated == [("zach@example.test", 123, "partial", "ok", updated_at)]
-
-    legacy_rows = warehouse._query(
-        """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = %s AND table_name = 'gmail_sync_state'
-        UNION ALL
-        SELECT table_name
-        FROM information_schema.views
-        WHERE table_schema = %s AND table_name = 'gmail_sync_state'
-        """,
-        (warehouse.schema_namespace, warehouse.schema_namespace),
-    )
-    assert legacy_rows == []
+        rel = relation(logical).with_namespace(warehouse.schema_namespace)
+        executable = warehouse._query(
+            "SELECT has_function_privilege(%s, %s, 'EXECUTE')",
+            (role, f'"{rel.schema}"."{rel.name}"{signature}'),
+        )[0][0]
+        assert executable, logical

@@ -367,7 +367,7 @@ def test_reclaim_stale_executing_mutations_resets_orphaned_gmail_rows(warehouse:
     just_now = datetime.now(tz=UTC) - timedelta(minutes=1)
     warehouse._command(
         """
-        UPDATE upstream_mutations
+        UPDATE @upstream_mutations
            SET status = 'executing',
                claimed_by = 'dead-worker',
                claimed_at = %s,
@@ -379,7 +379,7 @@ def test_reclaim_stale_executing_mutations_resets_orphaned_gmail_rows(warehouse:
     )
     warehouse._command(
         """
-        UPDATE upstream_mutations
+        UPDATE @upstream_mutations
            SET status = 'executing',
                claimed_by = 'live-worker',
                claimed_at = %s,
@@ -460,7 +460,7 @@ def test_reclaim_stale_executing_mutations_leaves_non_idempotent_ops(warehouse: 
     long_ago = datetime.now(tz=UTC) - timedelta(hours=2)
     warehouse._command(
         """
-        UPDATE upstream_mutations
+        UPDATE @upstream_mutations
            SET status = 'executing',
                claimed_by = 'dead-worker',
                claimed_at = %s,

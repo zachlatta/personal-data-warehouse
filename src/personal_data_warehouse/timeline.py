@@ -49,7 +49,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 
 from personal_data_warehouse.config import normalize_postgres_url
-from personal_data_warehouse.relations import physical_schema_names, qualify_sql_relations
+from personal_data_warehouse.relations import expand_relations, physical_schema_names
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +339,7 @@ _GMAIL_MERGE_PREFIX = (
 _GMAIL_FROM_SELF = (
     "(t.from_address ILIKE '%%' || t.account || '%%' "
     " OR 'SENT' = ANY(t.label_ids) "
-    " OR EXISTS (SELECT 1 FROM gmail_sync_state self "
+    " OR EXISTS (SELECT 1 FROM @gmail_sync_state self "
     "            WHERE self.account <> '' AND t.from_address ILIKE '%%' || self.account || '%%'))"
 )
 # Addressed to Zach himself: a synced account or his personal domain in To.
@@ -347,14 +347,14 @@ _GMAIL_ADDRESSED = (
     "EXISTS (SELECT 1 FROM unnest(t.to_addresses) rcpt "
     "        WHERE rcpt ILIKE '%%' || t.account || '%%' "
     "           OR lower(rcpt) LIKE '%%@zachlatta.com%%' "
-    "           OR EXISTS (SELECT 1 FROM gmail_sync_state self "
+    "           OR EXISTS (SELECT 1 FROM @gmail_sync_state self "
     "                      WHERE self.account <> '' AND rcpt ILIKE '%%' || self.account || '%%'))"
 )
 # >=30 self-sent messages sharing a normalized subject prefix within +/-3 days
 # = a mail-merge blast (quote-shopping batches stay under the threshold).
 _GMAIL_MERGE_CLUSTER = (
     "(SELECT count(*) FROM ("
-    " SELECT 1 FROM gmail_messages g2"
+    " SELECT 1 FROM @gmail_messages g2"
     f" WHERE {_GMAIL_MERGE_PREFIX.format(col='g2.subject')} = {_GMAIL_MERGE_PREFIX.format(col='t.subject')}"
     "  AND g2.internal_date BETWEEN t.internal_date - interval '3 days'"
     "                           AND t.internal_date + interval '3 days'"
@@ -362,31 +362,31 @@ _GMAIL_MERGE_CLUSTER = (
     " LIMIT 30) merge_probe) >= 30"
 )
 _GMAIL_THREAD_INBOUND_BEFORE = (
-    "EXISTS (SELECT 1 FROM gmail_messages g3 "
+    "EXISTS (SELECT 1 FROM @gmail_messages g3 "
     "        WHERE g3.thread_id = t.thread_id "
     "          AND g3.internal_date < t.internal_date "
     "          AND g3.from_address NOT ILIKE '%%' || g3.account || '%%' "
-    "          AND NOT EXISTS (SELECT 1 FROM gmail_sync_state s3 "
+    "          AND NOT EXISTS (SELECT 1 FROM @gmail_sync_state s3 "
     "                          WHERE s3.account <> '' AND g3.from_address ILIKE '%%' || s3.account || '%%'))"
 )
 # Zach answered this thread after the message arrived (within 48h): the
 # strongest "this conversation has his attention" signal.
 _GMAIL_MY_REPLY_AFTER = (
-    "EXISTS (SELECT 1 FROM gmail_messages g4 "
+    "EXISTS (SELECT 1 FROM @gmail_messages g4 "
     "        WHERE g4.thread_id = t.thread_id "
     "          AND g4.internal_date > t.internal_date "
     "          AND g4.internal_date < t.internal_date + interval '48 hours' "
     "          AND g4.from_address ILIKE '%%' || g4.account || '%%')"
 )
 _GMAIL_I_POSTED_IN_THREAD = (
-    "EXISTS (SELECT 1 FROM gmail_messages g5 "
+    "EXISTS (SELECT 1 FROM @gmail_messages g5 "
     "        WHERE g5.thread_id = t.thread_id "
     "          AND g5.from_address ILIKE '%%' || g5.account || '%%')"
 )
 # Sender is someone Zach has written to at least twice (relationship signal;
 # the table is timeline-owned state refreshed by the sync engine).
 _GMAIL_KNOWN_CORRESPONDENT = (
-    "EXISTS (SELECT 1 FROM timeline_gmail_correspondents gc "
+    "EXISTS (SELECT 1 FROM @timeline_gmail_correspondents gc "
     "        WHERE gc.addr = lower(COALESCE(NULLIF(substring(t.from_address FROM '<([^>]+)>'), ''), "
     "                                       t.from_address)) "
     "          AND gc.n_sent_to >= 2)"
@@ -418,7 +418,7 @@ _GMAIL_EMAIL = _simple_adapter(
     source_table="gmail_messages",
     source="gmail",
     kind="email",
-    from_sql="""gmail_messages t
+    from_sql="""@gmail_messages t
     LEFT JOIN LATERAL (
         SELECT
             string_agg(
@@ -426,19 +426,19 @@ _GMAIL_EMAIL = _simple_adapter(
                 E'\n' ORDER BY a.part_id, e.updated_at DESC
             ) AS attachment_search_text,
             max(GREATEST(a.synced_at, COALESCE(e.updated_at, a.synced_at))) AS attachment_ingest_ts
-        FROM gmail_attachments a
-        LEFT JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
+        FROM @gmail_attachments a
+        LEFT JOIN @file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
         WHERE a.account = t.account AND a.message_id = t.message_id AND a.is_deleted = 0
     ) att ON TRUE""",
     changed_join_sql="""JOIN (
-        SELECT account, message_id FROM gmail_messages
+        SELECT account, message_id FROM @gmail_messages
         WHERE synced_at >= %(watermark_ts)s
         UNION
-        SELECT a.account, a.message_id FROM gmail_attachments a
+        SELECT a.account, a.message_id FROM @gmail_attachments a
         WHERE a.synced_at >= %(watermark_ts)s
         UNION
-        SELECT a.account, a.message_id FROM gmail_attachments a
-        JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
+        SELECT a.account, a.message_id FROM @gmail_attachments a
+        JOIN @file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
         WHERE e.updated_at >= %(watermark_ts)s
     ) pdw_changed ON pdw_changed.account = t.account AND pdw_changed.message_id = t.message_id""",
     event_id="concat_ws('|', t.account, t.message_id)",
@@ -512,11 +512,11 @@ _GMAIL_EMAIL = _simple_adapter(
 )
 
 _SLACK_JOINS = """
-    LEFT JOIN slack_users u
+    LEFT JOIN @slack_users u
         ON u.account = t.account AND u.team_id = t.team_id AND u.user_id = t.user_id
-    LEFT JOIN slack_conversations c
+    LEFT JOIN @slack_conversations c
         ON c.account = t.account AND c.team_id = t.team_id AND c.conversation_id = t.conversation_id
-    LEFT JOIN slack_account_identities ident
+    LEFT JOIN @slack_account_identities ident
         ON ident.account = t.account AND ident.team_id = t.team_id
 """
 
@@ -524,7 +524,7 @@ _SLACK_JOINS = """
 # A single primary-key probe per threaded row.
 _SLACK_THREAD_ROOT_MINE = (
     "(t.thread_ts <> '' AND ident.user_id <> '' AND EXISTS ("
-    "SELECT 1 FROM slack_messages z "
+    "SELECT 1 FROM @slack_messages z "
     "WHERE z.account = t.account AND z.team_id = t.team_id "
     "  AND z.conversation_id = t.conversation_id AND z.message_ts = t.thread_ts "
     "  AND z.user_id = ident.user_id AND z.is_deleted = 0))"
@@ -535,7 +535,7 @@ _SLACK_THREAD_ROOT_MINE = (
 # read as ambient, per the labeled benchmark.)
 _SLACK_MY_THREAD_RECENT = (
     "(t.thread_ts <> '' AND ident.user_id <> '' AND EXISTS ("
-    "SELECT 1 FROM slack_messages z "
+    "SELECT 1 FROM @slack_messages z "
     "WHERE z.user_id = ident.user_id "
     "  AND z.message_datetime BETWEEN t.message_datetime - interval '12 hours' "
     "                             AND t.message_datetime "
@@ -552,7 +552,7 @@ def _slack_my_msgs_in_window(*, before: str, after: str, limit: int) -> str:
     firehose rows that resolve earlier never pay for it."""
     return (
         "(SELECT count(*) FROM ("
-        " SELECT 1 FROM slack_messages z"
+        " SELECT 1 FROM @slack_messages z"
         " WHERE z.user_id = ident.user_id"
         f"  AND z.message_datetime BETWEEN t.message_datetime - interval '{before}'"
         f"                             AND t.message_datetime + interval '{after}'"
@@ -571,7 +571,7 @@ _SLACK_P24H = _slack_my_msgs_in_window(before="24 hours", after="0 hours", limit
 # to 0 in production syncs, so size cannot be trusted; behavior can.
 _SLACK_CONV_VELOCITY_24H = (
     "(SELECT count(*) FROM ("
-    " SELECT 1 FROM slack_messages v"
+    " SELECT 1 FROM @slack_messages v"
     " WHERE v.account = t.account AND v.team_id = t.team_id"
     "  AND v.conversation_id = t.conversation_id AND v.is_deleted = 0"
     "  AND v.message_datetime BETWEEN t.message_datetime - interval '24 hours'"
@@ -593,7 +593,7 @@ _SLACK_SYSTEM_SUBTYPES = (
     "'channel_purpose', 'channel_topic', 'group_join', 'group_leave')"
 )
 _SLACK_MPIM_ROSTER = (
-    "GREATEST(c.num_members, (SELECT count(*) FROM slack_conversation_members m "
+    "GREATEST(c.num_members, (SELECT count(*) FROM @slack_conversation_members m "
     "WHERE m.account = t.account AND m.team_id = t.team_id "
     "  AND m.conversation_id = t.conversation_id AND m.is_deleted = 0))"
 )
@@ -616,14 +616,14 @@ _SLACK_DM_CONTEXT = (
     "                               NULLIF(peer.name, ''), NULLIF(peer.email, ''), dm_peer.user_id) "
     " FROM ("
     "   SELECT m.user_id, 0 AS source_order "
-    "   FROM slack_conversation_members m "
+    "   FROM @slack_conversation_members m "
     "   WHERE m.account = t.account AND m.team_id = t.team_id "
     "     AND m.conversation_id = t.conversation_id AND m.is_deleted = 0 "
     "     AND (ident.user_id = '' OR m.user_id <> ident.user_id) "
     "   UNION ALL "
     "   SELECT c.name AS user_id, 1 AS source_order WHERE c.name <> ''"
     " ) dm_peer "
-    " LEFT JOIN slack_users peer "
+    " LEFT JOIN @slack_users peer "
     "   ON peer.account = t.account AND peer.team_id = t.team_id AND peer.user_id = dm_peer.user_id "
     " WHERE dm_peer.user_id <> '' "
     " ORDER BY dm_peer.source_order, dm_peer.user_id LIMIT 1)"
@@ -671,7 +671,7 @@ _SLACK_FILE_PRIORITY = (
     "WHEN u.is_bot = 1 THEN 'noise' "
     "WHEN c.is_im = 1 THEN 'direct' "
     f"WHEN c.is_mpim = 1 THEN "
-    "  CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM slack_messages z "
+    "  CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM @slack_messages z "
     "       WHERE z.user_id = ident.user_id "
     "         AND z.message_datetime BETWEEN t.created_at - interval '6 hours' "
     "                                    AND t.created_at + interval '6 hours' "
@@ -679,7 +679,7 @@ _SLACK_FILE_PRIORITY = (
     "         AND z.conversation_id = t.conversation_id AND z.is_deleted = 0 "
     f"       LIMIT 1) fw) >= 1 OR {_SLACK_MPIM_ROSTER} BETWEEN 1 AND 5 THEN 'direct' ELSE 'cc' END "
     "WHEN c.is_member = 1 THEN "
-    "  CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM slack_messages z "
+    "  CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM @slack_messages z "
     "       WHERE z.user_id = ident.user_id "
     "         AND z.message_datetime BETWEEN t.created_at - interval '6 hours' "
     "                                    AND t.created_at + interval '6 hours' "
@@ -702,7 +702,7 @@ _SLACK_MESSAGE = _simple_adapter(
     source_table="slack_messages",
     source="slack",
     kind="message",
-    from_sql="slack_messages t" + _SLACK_JOINS,
+    from_sql="@slack_messages t" + _SLACK_JOINS,
     event_id="concat_ws('|', t.account, t.team_id, t.conversation_id, t.message_ts)",
     # Bare column so the 30M+-row backfill pages via slack_messages_time_idx;
     # an expression here forces a full sort per batch (see gmail_email).
@@ -740,7 +740,7 @@ _SLACK_FILE = _simple_adapter(
     source_table="slack_files",
     source="slack",
     kind="file_share",
-    from_sql="slack_files t" + _SLACK_JOINS,
+    from_sql="@slack_files t" + _SLACK_JOINS,
     event_id="concat_ws('|', t.account, t.team_id, t.file_id, t.conversation_id, t.message_ts)",
     event_ts=_real_ts("t.created_at", _SLACK_MESSAGE_TS_AS_TIMESTAMPTZ, "t.synced_at"),
     ingest_ts="t.synced_at",
@@ -781,20 +781,20 @@ _APPLE_MESSAGE = _simple_adapter(
     # grouped form materialized every chat's aggregate on every incremental
     # tick regardless of how few messages changed. The probes ride
     # apple_message_chat_messages_message_idx and the chat_handles PK.
-    from_sql="""clean_apple_messages t
-    LEFT JOIN apple_message_handles h ON h.account = t.account AND h.handle_id = t.handle_id
+    from_sql="""@clean_apple_messages t
+    LEFT JOIN @apple_message_handles h ON h.account = t.account AND h.handle_id = t.handle_id
     LEFT JOIN LATERAL (
         SELECT min(chat_id) AS chat_id
-        FROM apple_message_chat_messages
+        FROM @apple_message_chat_messages
         WHERE account = t.account AND message_id = t.message_id
     ) cm ON TRUE
-    LEFT JOIN apple_message_chats c ON c.account = t.account AND c.chat_id = cm.chat_id
+    LEFT JOIN @apple_message_chats c ON c.account = t.account AND c.chat_id = cm.chat_id
     LEFT JOIN LATERAL (
         -- Distinct people, not handle rows: device re-syncs leave duplicate
         -- handle records for the same address in chat rosters.
         SELECT count(DISTINCT COALESCE(NULLIF(rh.address, ''), ch.handle_id)) AS n
-        FROM apple_message_chat_handles ch
-        LEFT JOIN apple_message_handles rh
+        FROM @apple_message_chat_handles ch
+        LEFT JOIN @apple_message_handles rh
             ON rh.account = ch.account AND rh.handle_id = ch.handle_id
         WHERE ch.account = t.account AND ch.chat_id = cm.chat_id
     ) roster ON TRUE
@@ -805,8 +805,8 @@ _APPLE_MESSAGE = _simple_adapter(
                 E'\n' ORDER BY a.attachment_id, e.updated_at DESC
             ) AS attachment_search_text,
             max(GREATEST(a.ingested_at, COALESCE(e.updated_at, a.ingested_at))) AS attachment_ingest_ts
-        FROM apple_message_attachments a
-        LEFT JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
+        FROM @apple_message_attachments a
+        LEFT JOIN @file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
         WHERE a.account = t.account AND a.message_id = t.message_id
     ) att ON TRUE
     LEFT JOIN LATERAL (
@@ -817,31 +817,31 @@ _APPLE_MESSAGE = _simple_adapter(
                 NULLIF(a.transfer_name, ''), NULLIF(regexp_replace(a.filename, '^.*/', ''), ''),
                 NULLIF(a.mime_type, ''), NULLIF(a.content_type, ''), 'attachment'
             ) AS label
-            FROM apple_message_attachments a
+            FROM @apple_message_attachments a
             WHERE a.account = t.account AND a.message_id = t.message_id AND a.is_missing = 0
         ) labels
     ) att_labels ON TRUE
     CROSS JOIN (
         SELECT GREATEST(
             COALESCE(
-                (SELECT max(synced_at) FROM contact_cards),
+                (SELECT max(synced_at) FROM @contact_cards),
                 TIMESTAMPTZ '1970-01-01'
             ),
             COALESCE(
-                (SELECT max(synced_at) FROM apple_contact_cards),
+                (SELECT max(synced_at) FROM @apple_contact_cards),
                 TIMESTAMPTZ '1970-01-01'
             )
         ) AS latest_synced_at
     ) contact_sync""",
     changed_join_sql="""JOIN (
-        SELECT account, message_id FROM apple_messages
+        SELECT account, message_id FROM @apple_messages
         WHERE ingested_at >= %(watermark_ts)s
         UNION
-        SELECT a.account, a.message_id FROM apple_message_attachments a
+        SELECT a.account, a.message_id FROM @apple_message_attachments a
         WHERE a.ingested_at >= %(watermark_ts)s
         UNION
-        SELECT a.account, a.message_id FROM apple_message_attachments a
-        JOIN file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
+        SELECT a.account, a.message_id FROM @apple_message_attachments a
+        JOIN @file_attachment_enrichments e ON e.content_sha256 = a.content_sha256
         WHERE e.updated_at >= %(watermark_ts)s
         UNION
         (
@@ -853,15 +853,15 @@ _APPLE_MESSAGE = _simple_adapter(
         -- without the inner keyset LIMIT, every 2,000-row page normalized all
         -- ~100,000 incoming messages before the outer LIMIT.
         SELECT m.account, m.message_id
-        FROM apple_messages m
+        FROM @apple_messages m
         CROSS JOIN (
             SELECT GREATEST(
                 COALESCE(
-                    (SELECT max(synced_at) FROM contact_cards),
+                    (SELECT max(synced_at) FROM @contact_cards),
                     TIMESTAMPTZ '1970-01-01'
                 ),
                 COALESCE(
-                    (SELECT max(synced_at) FROM apple_contact_cards),
+                    (SELECT max(synced_at) FROM @apple_contact_cards),
                     TIMESTAMPTZ '1970-01-01'
                 )
             ) AS latest_synced_at
@@ -946,24 +946,24 @@ _APPLE_MESSAGE = _simple_adapter(
         # A conversation needs his participation: two replies ever, or one
         # reply that is not drowned by a 20+ message broadcast stream.
         "  CASE WHEN (SELECT count(*) FROM ("
-        "         SELECT 1 FROM apple_message_chat_messages zc "
-        "         JOIN apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
+        "         SELECT 1 FROM @apple_message_chat_messages zc "
+        "         JOIN @apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
         "         WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
         "           AND z.is_from_me = 1 LIMIT 2) ow) >= 2 THEN 'direct' "
         "       WHEN (SELECT count(*) FROM ("
-        "         SELECT 1 FROM apple_message_chat_messages zc "
-        "         JOIN apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
+        "         SELECT 1 FROM @apple_message_chat_messages zc "
+        "         JOIN @apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
         "         WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
         "           AND z.is_from_me = 1 LIMIT 2) ow) = 1 "
         "        AND (SELECT count(*) FROM ("
-        "         SELECT 1 FROM apple_message_chat_messages zc "
-        "         JOIN apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
+        "         SELECT 1 FROM @apple_message_chat_messages zc "
+        "         JOIN @apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
         "         WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
         "           AND z.is_from_me = 0 LIMIT 20) iw) < 20 THEN 'direct' "
         "       ELSE 'noise' END "
         "WHEN COALESCE(roster.n, 0) <= 9 THEN 'direct' "
-        "WHEN EXISTS (SELECT 1 FROM apple_message_chat_messages zc "
-        "             JOIN apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
+        "WHEN EXISTS (SELECT 1 FROM @apple_message_chat_messages zc "
+        "             JOIN @apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
         "             WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
         "               AND zc.message_date BETWEEN t.message_at - interval '6 hours' "
         "                                       AND t.message_at + interval '6 hours' "
@@ -986,26 +986,26 @@ _WHATSAPP_MESSAGE = _simple_adapter(
     source_table="whatsapp_messages",
     source="whatsapp",
     kind="message",
-    from_sql="""whatsapp_messages t
-    LEFT JOIN whatsapp_chats c ON c.account = t.account AND c.chat_id = t.chat_id
+    from_sql="""@whatsapp_messages t
+    LEFT JOIN @whatsapp_chats c ON c.account = t.account AND c.chat_id = t.chat_id
     LEFT JOIN LATERAL (
         SELECT p.phone_jid
-        FROM whatsapp_chat_participants p
+        FROM @whatsapp_chat_participants p
         WHERE p.account = t.account
           AND p.phone_jid <> ''
           AND (p.participant_jid = t.sender_jid OR p.lid_jid = t.sender_jid)
         ORDER BY p.ingested_at DESC, p.chat_id
         LIMIT 1
     ) sender_alias ON TRUE
-    LEFT JOIN whatsapp_contacts ct
+    LEFT JOIN @whatsapp_contacts ct
       ON ct.account = t.account
      AND ct.jid = COALESCE(NULLIF(sender_alias.phone_jid, ''), t.sender_jid)
-    LEFT JOIN whatsapp_contacts chat_ct ON chat_ct.account = t.account AND chat_ct.jid = t.chat_id
+    LEFT JOIN @whatsapp_contacts chat_ct ON chat_ct.account = t.account AND chat_ct.jid = t.chat_id
     LEFT JOIN LATERAL (
         -- NULLIF keeps the no-roster case NULL (the priority CASE reads an
         -- unknown roster as "not a known-small group", not as size zero).
         SELECT NULLIF(count(*), 0) AS n
-        FROM whatsapp_chat_participants p
+        FROM @whatsapp_chat_participants p
         WHERE p.account = t.account AND p.chat_id = t.chat_id
     ) roster ON TRUE
     LEFT JOIN LATERAL (
@@ -1015,19 +1015,19 @@ _WHATSAPP_MESSAGE = _simple_adapter(
                 E'\n' ORDER BY m.media_type, e.updated_at DESC
             ) AS media_search_text,
             max(GREATEST(m.ingested_at, COALESCE(e.updated_at, m.ingested_at))) AS media_ingest_ts
-        FROM whatsapp_media_items m
-        LEFT JOIN file_attachment_enrichments e ON e.content_sha256 = m.content_sha256
+        FROM @whatsapp_media_items m
+        LEFT JOIN @file_attachment_enrichments e ON e.content_sha256 = m.content_sha256
         WHERE m.account = t.account AND m.chat_id = t.chat_id AND m.message_id = t.message_id
     ) media ON TRUE""",
     changed_join_sql="""JOIN (
-        SELECT account, chat_id, message_id FROM whatsapp_messages
+        SELECT account, chat_id, message_id FROM @whatsapp_messages
         WHERE ingested_at >= %(watermark_ts)s
         UNION
-        SELECT m.account, m.chat_id, m.message_id FROM whatsapp_media_items m
+        SELECT m.account, m.chat_id, m.message_id FROM @whatsapp_media_items m
         WHERE m.ingested_at >= %(watermark_ts)s
         UNION
-        SELECT m.account, m.chat_id, m.message_id FROM whatsapp_media_items m
-        JOIN file_attachment_enrichments e ON e.content_sha256 = m.content_sha256
+        SELECT m.account, m.chat_id, m.message_id FROM @whatsapp_media_items m
+        JOIN @file_attachment_enrichments e ON e.content_sha256 = m.content_sha256
         WHERE e.updated_at >= %(watermark_ts)s
     ) pdw_changed ON pdw_changed.account = t.account
         AND pdw_changed.chat_id = t.chat_id AND pdw_changed.message_id = t.message_id""",
@@ -1070,7 +1070,7 @@ _WHATSAPP_MESSAGE = _simple_adapter(
         "CASE "
         "WHEN t.is_from_me = 1 THEN 'self' "
         "WHEN c.chat_type = 'status' THEN 'noise' "
-        "WHEN EXISTS (SELECT 1 FROM whatsapp_contacts b "
+        "WHEN EXISTS (SELECT 1 FROM @whatsapp_contacts b "
         "             WHERE b.account = t.account AND b.jid = t.sender_jid "
         "               AND b.business_name <> '') THEN 'noise' "
         "WHEN t.body_text = '' AND COALESCE(t.media_type, '') IN ('', 'none', 'unknown') "
@@ -1080,7 +1080,7 @@ _WHATSAPP_MESSAGE = _simple_adapter(
         "                   NULLIF(t.push_name, '')) IS NULL) THEN 'noise' "
         "WHEN c.chat_type = 'group' OR t.chat_id LIKE '%%@g.us' THEN "
         "  CASE WHEN COALESCE(roster.n, 99) <= 5 THEN 'direct' "
-        "       WHEN EXISTS (SELECT 1 FROM whatsapp_messages z "
+        "       WHEN EXISTS (SELECT 1 FROM @whatsapp_messages z "
         "                    WHERE z.account = t.account AND z.chat_id = t.chat_id "
         "                      AND z.is_from_me = 1 "
         "                      AND z.message_at BETWEEN t.message_at - interval '6 hours' "
@@ -1096,7 +1096,7 @@ _APPLE_NOTE_REVISION = _simple_adapter(
     source_table="apple_note_revisions",
     source="apple_notes",
     kind="note_edit",
-    from_sql="apple_note_revisions t",
+    from_sql="@apple_note_revisions t",
     event_id="concat_ws('|', t.account, t.note_id, t.revision_id)",
     event_ts=_real_ts("t.modified_at", "t.created_at", "t.exported_at", "t.ingested_at"),
     ingest_ts="t.ingested_at",
@@ -1117,10 +1117,10 @@ _VOICE_MEMO = _simple_adapter(
     source_table="apple_voice_memos_files",
     source="voice_memos",
     kind="voice_memo",
-    from_sql=f"""apple_voice_memos_files t
+    from_sql=f"""@apple_voice_memos_files t
     LEFT JOIN LATERAL (
         SELECT en.title AS en_title, en.summary AS en_summary
-        FROM apple_voice_memos_enrichments en
+        FROM @apple_voice_memos_enrichments en
         WHERE en.account = t.account AND en.recording_id = t.recording_id
           AND (NULLIF(en.title, '') IS NOT NULL OR NULLIF(en.summary, '') IS NOT NULL)
         ORDER BY en.created_at DESC
@@ -1135,7 +1135,7 @@ _VOICE_MEMO = _simple_adapter(
                 E'\n' ORDER BY en2.created_at DESC
             ) AS enrichment_search_text,
             max(en2.created_at) AS enrichment_ingest_ts
-        FROM apple_voice_memos_enrichments en2
+        FROM @apple_voice_memos_enrichments en2
         WHERE en2.account = t.account AND en2.recording_id = t.recording_id
     ) ens ON TRUE""",
     event_id="concat_ws('|', t.account, t.recording_id)",
@@ -1168,7 +1168,7 @@ _CALENDAR_EVENT = _simple_adapter(
     source_table="calendar_events",
     source="calendar",
     kind="event",
-    from_sql="calendar_events t",
+    from_sql="@calendar_events t",
     event_id="concat_ws('|', t.account, t.calendar_id, t.event_id)",
     event_ts=_CALENDAR_START_TS,
     end_ts=(
@@ -1207,7 +1207,7 @@ _CALENDAR_EVENT = _simple_adapter(
         "  OR t.organizer_email ILIKE '%%holiday%%' THEN 'noise' "
         "WHEN t.description LIKE '%%͏%%' OR t.description LIKE '%%­%%' THEN 'noise' "
         "WHEN t.organizer_email ILIKE '%%' || t.account || '%%' "
-        "  OR EXISTS (SELECT 1 FROM gmail_sync_state self "
+        "  OR EXISTS (SELECT 1 FROM @gmail_sync_state self "
         "             WHERE self.account <> '' AND t.organizer_email ILIKE '%%' || self.account || '%%') THEN "
         "  CASE WHEN t.summary LIKE '✈%%' THEN 'noise' ELSE 'self' END "
         "ELSE 'direct' END"
@@ -1219,12 +1219,12 @@ _DRIVE_FILE = _simple_adapter(
     source_table="google_drive_files",
     source="google_drive",
     kind="file_change",
-    from_sql="""google_drive_files t
+    from_sql="""@google_drive_files t
     LEFT JOIN LATERAL (
         SELECT
             string_agg(ft.text, E'\n' ORDER BY ft.extracted_at DESC) AS extracted_search_text,
             max(ft.extracted_at) AS extracted_ingest_ts
-        FROM google_drive_file_texts ft
+        FROM @google_drive_file_texts ft
         WHERE ft.account = t.account AND ft.file_id = t.file_id
           AND ft.text_extraction_status = 'ok' AND ft.text != ''
     ) txt ON TRUE""",
@@ -1286,12 +1286,12 @@ _PHOTO = _simple_adapter(
     # shared file_attachment_enrichments table and arrives after the asset
     # row, so ingest_ts folds the enrichment timestamp in and refresh_hours
     # re-walks recent events until the caption lands.
-    from_sql="""photo_assets t
+    from_sql="""@photo_assets t
     LEFT JOIN LATERAL (
         SELECT
             string_agg(e.text, E'\n' ORDER BY e.updated_at DESC) AS enrichment_search_text,
             max(GREATEST(e.updated_at, e.ai_processed_at)) AS enrichment_ingest_ts
-        FROM file_attachment_enrichments e
+        FROM @file_attachment_enrichments e
         WHERE e.content_sha256 != ''
           AND e.content_sha256 IN (t.thumbnail_content_sha256, t.best_file_sha256)
           AND e.text != ''
@@ -1334,7 +1334,7 @@ def _contact_update_adapter(*, name: str, source_table: str) -> TimelineAdapter:
         source_table=source_table,
         source="contacts",
         kind=name,
-        from_sql=f"{source_table} t",
+        from_sql=f"@{source_table} t",
         event_id="concat_ws('|', t.source, t.account, t.source_kind, t.address_book_id, t.card_id)",
         event_ts=_real_ts("t.source_updated_at", "t.synced_at"),
         ingest_ts="t.synced_at",
@@ -1375,7 +1375,7 @@ _WHOOP_CYCLE = _simple_adapter(
     source_table="whoop_cycles",
     source="whoop",
     kind="health_cycle",
-    from_sql="whoop_cycles t",
+    from_sql="@whoop_cycles t",
     event_id="concat_ws('|', t.account, t.cycle_id)",
     event_ts=_real_ts("t.start_at", "t.created_at", "t.synced_at"),
     end_ts="t.end_at",
@@ -1403,7 +1403,7 @@ _WHOOP_RECOVERY = _simple_adapter(
     source="whoop",
     kind="recovery",
     from_sql=(
-        "whoop_recoveries t LEFT JOIN whoop_cycles c "
+        "@whoop_recoveries t LEFT JOIN @whoop_cycles c "
         "ON c.account = t.account AND c.cycle_id = t.cycle_id"
     ),
     event_id="concat_ws('|', t.account, t.cycle_id)",
@@ -1437,7 +1437,7 @@ _WHOOP_SLEEP = _simple_adapter(
     source_table="whoop_sleeps",
     source="whoop",
     kind="sleep",
-    from_sql="whoop_sleeps t",
+    from_sql="@whoop_sleeps t",
     event_id="concat_ws('|', t.account, t.sleep_id)",
     event_ts=_real_ts("t.start_at", "t.created_at", "t.synced_at"),
     end_ts="t.end_at",
@@ -1468,7 +1468,7 @@ _WHOOP_WORKOUT = _simple_adapter(
     source_table="whoop_workouts",
     source="whoop",
     kind="workout",
-    from_sql="whoop_workouts t",
+    from_sql="@whoop_workouts t",
     event_id="concat_ws('|', t.account, t.workout_id)",
     event_ts=_real_ts("t.start_at", "t.created_at", "t.synced_at"),
     end_ts="t.end_at",
@@ -1500,7 +1500,7 @@ _MUTATION = _simple_adapter(
     source_table="upstream_mutations",
     source="mutations",
     kind="mutation",
-    from_sql="upstream_mutations t",
+    from_sql="@upstream_mutations t",
     event_id="t.id",
     event_ts=f"COALESCE(NULLIF(t.executed_at, {_EPOCH}), t.created_at)",
     ingest_ts="t.updated_at",
@@ -1526,7 +1526,7 @@ _MUTATION_REQUEST = _simple_adapter(
     source_table="upstream_mutation_requests",
     source="mutations",
     kind="mutation_request",
-    from_sql="upstream_mutation_requests t",
+    from_sql="@upstream_mutation_requests t",
     event_id="t.id",
     event_ts="t.created_at",
     ingest_ts="t.updated_at",
@@ -1543,7 +1543,7 @@ _ENRICHMENT_RUN = _simple_adapter(
     source_table="agent_runs",
     source="warehouse",
     kind="enrichment_run",
-    from_sql="agent_runs t",
+    from_sql="@agent_runs t",
     event_id="t.run_id",
     event_ts=_real_ts("t.started_at", "t.completed_at"),
     end_ts="t.completed_at",
@@ -1568,7 +1568,7 @@ _ALICE_VOICE_RECORDING = _simple_adapter(
     source_table="alice_voice_recordings",
     source="alice_voice_recordings",
     kind="voice_recording",
-    from_sql="alice_voice_recordings t",
+    from_sql="@alice_voice_recordings t",
     event_id="concat_ws('|', t.account, t.recording_id)",
     event_ts="t.recorded_at",
     ingest_ts="t.ingested_at",
@@ -1593,8 +1593,8 @@ _FINANCE_TRANSACTION = _simple_adapter(
     source="finance",
     kind="transaction",
     from_sql=(
-        "finance_transactions t "
-        "LEFT JOIN finance_accounts a ON a.account_id = t.account_id"
+        "@finance_transactions t "
+        "LEFT JOIN @finance_accounts a ON a.account_id = t.account_id"
     ),
     event_id="t.transaction_id",
     event_ts="t.posted_at",
@@ -1625,8 +1625,8 @@ _FINANCE_OBSERVATION = _simple_adapter(
     source="finance",
     kind="balance_observation",
     from_sql=(
-        "finance_observations t "
-        "LEFT JOIN finance_accounts a ON a.account_id = t.account_id"
+        "@finance_observations t "
+        "LEFT JOIN @finance_accounts a ON a.account_id = t.account_id"
     ),
     event_id="concat_ws('|', t.account_id, t.as_of::text, t.kind, t.source)",
     event_ts="t.as_of::timestamp AT TIME ZONE 'UTC'",
@@ -1656,11 +1656,11 @@ _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
     source_table="manual_finance_documents",
     source="finance",
     kind="document",
-    from_sql="""manual_finance_documents t
+    from_sql="""@manual_finance_documents t
     LEFT JOIN LATERAL (
         SELECT e.document_type, e.institution, e.account_name_hint, e.period_start,
                e.period_end, e.currency, e.closing_balance, e.summary, e.created_at
-        FROM manual_finance_extractions e
+        FROM @manual_finance_extractions e
         WHERE e.content_sha256 = t.content_sha256
         ORDER BY e.created_at DESC LIMIT 1
     ) ex ON TRUE""",
@@ -1699,11 +1699,11 @@ _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
 
 
 def _agent_session_adapter() -> TimelineAdapter:
-    """Session-level roll-up over marts.ai_conversation_events.
+    """Session-level roll-up over marts_ai_conversations.events.
 
     One timeline row per session/conversation (Claude Code, Codex, OpenClaw,
     Claude Desktop, ChatGPT — the row's ``source`` is the per-session source
-    value), matching the marts.ai_conversation_sessions roll-up. Individual transcript
+    value), matching the marts_ai_conversations.sessions roll-up. Individual transcript
     lines are surfaced through the session's detail view, not as separate
     timeline entries.
 
@@ -1761,7 +1761,7 @@ def _agent_session_adapter() -> TimelineAdapter:
                  -- scheduled routine (daily monitor runs), not a human typing.
                  WHEN length(COALESCE(fp.text, '')) > 40 AND (
                       SELECT count(*) FROM (
-                          SELECT 1 FROM agent_session_events rep
+                          SELECT 1 FROM @ai_conversation_events rep
                           WHERE rep.role = 'user' AND rep.seq <= 5
                             AND left(rep.text, 64) = left(fp.text, 64)
                           LIMIT 4) reps) >= 4
@@ -1784,44 +1784,44 @@ def _agent_session_adapter() -> TimelineAdapter:
                 count(*) FILTER (WHERE e.is_sidechain = 0) AS non_sidechain_count,
                 sum(e.output_tokens) AS output_tokens,
                 max(e.ingested_at) AS ingest_ts
-            FROM agent_session_events e
+            FROM @ai_conversation_events e
             {{changed_join}}
             GROUP BY e.source, e.session_id
         ) s
         LEFT JOIN LATERAL (
-            SELECT e2.session_title FROM agent_session_events e2
+            SELECT e2.session_title FROM @ai_conversation_events e2
             WHERE e2.source = s.source AND e2.session_id = s.session_id AND e2.session_title != ''
             ORDER BY e2.seq LIMIT 1
         ) st ON TRUE
         LEFT JOIN LATERAL (
-            SELECT e2.text FROM agent_session_events e2
+            SELECT e2.text FROM @ai_conversation_events e2
             WHERE e2.source = s.source AND e2.session_id = s.session_id
               AND e2.role = 'user' AND e2.text != ''
             ORDER BY e2.seq LIMIT 1
         ) fp ON TRUE
         LEFT JOIN LATERAL (
-            SELECT e2.model FROM agent_session_events e2
+            SELECT e2.model FROM @ai_conversation_events e2
             WHERE e2.source = s.source AND e2.session_id = s.session_id AND e2.model != ''
             ORDER BY e2.seq DESC LIMIT 1
         ) md ON TRUE
         LEFT JOIN LATERAL (
-            SELECT e2.cwd FROM agent_session_events e2
+            SELECT e2.cwd FROM @ai_conversation_events e2
             WHERE e2.source = s.source AND e2.session_id = s.session_id AND e2.cwd != ''
             ORDER BY e2.seq LIMIT 1
         ) cw ON TRUE
         LEFT JOIN LATERAL (
-            SELECT e2.git_branch FROM agent_session_events e2
+            SELECT e2.git_branch FROM @ai_conversation_events e2
             WHERE e2.source = s.source AND e2.session_id = s.session_id AND e2.git_branch != ''
             ORDER BY e2.seq DESC LIMIT 1
         ) gb ON TRUE
         LEFT JOIN LATERAL (
-            SELECT e2.repo_url FROM agent_session_events e2
+            SELECT e2.repo_url FROM @ai_conversation_events e2
             WHERE e2.source = s.source AND e2.session_id = s.session_id AND e2.repo_url != ''
             ORDER BY e2.seq LIMIT 1
         ) ru ON TRUE
         LEFT JOIN LATERAL (
             SELECT string_agg(e2.text, E'\n' ORDER BY e2.seq) AS transcript_text
-            FROM agent_session_events e2
+            FROM @ai_conversation_events e2
             WHERE e2.source = s.source AND e2.session_id = s.session_id
               AND e2.text != '' AND e2.role IN ('user', 'assistant')
         ) tx ON TRUE
@@ -1836,7 +1836,7 @@ def _agent_session_adapter() -> TimelineAdapter:
     changed_join = """
         JOIN (
             SELECT DISTINCT source, session_id
-            FROM agent_session_events
+            FROM @ai_conversation_events
             WHERE ingested_at >= %(watermark_ts)s
         ) changed ON changed.source = e.source AND changed.session_id = e.session_id
     """
@@ -1848,12 +1848,12 @@ def _agent_session_adapter() -> TimelineAdapter:
     """
     return TimelineAdapter(
         name="agent_session",
-        source_table="agent_session_events",
+        source_table="ai_conversation_events",
         source="agent_sessions",
         kind="agent_session",
         backfill_sql=backfill_sql,
         incremental_sql=incremental_sql,
-        max_ingest_sql="SELECT max(ingested_at) FROM agent_session_events",
+        max_ingest_sql="SELECT max(ingested_at) FROM @ai_conversation_events",
         batch_size=10000,
     )
 
@@ -1981,8 +1981,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "whatsapp_contacts": _entity("sender dimension joined into message events"),
     "whatsapp_media_items": _detail("whatsapp_messages"),
     "whatsapp_client_sessions": _state("linked-device session snapshot"),
-    # AI conversations (source-owned raw tables, unified through marts.ai_conversation_events)
-    "agent_session_events": _state("legacy mixed table name; migrated into source-owned AI event tables"),
+    # AI conversations. The adapter reads the marts_ai_conversations.events
+    # union view and emits one row per session, so each source-owned raw table
+    # is what actually feeds the timeline.
     "chatgpt_events": _events("rolled up to one timeline row per conversation"),
     "claude_desktop_events": _events("rolled up to one timeline row per conversation"),
     "claude_code_events": _events("rolled up to one timeline row per session"),
@@ -2022,7 +2023,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "whoop_workouts": _events(),
     "whoop_sync_state": _state("per-collection WHOOP scan watermark"),
     "whoop_oauth_tokens": _state("rotating WHOOP OAuth credential"),
-    # Plaid finance data is queryable through plaid.* and marts.finance_* but
+    # Plaid finance data is queryable through base_plaid.* and marts_finance.* but
     # deliberately excluded from the general communications/activity timeline.
     "plaid_items": _entity("institution dimension for Plaid finance queries"),
     "plaid_accounts": _entity("account and current balance state"),
@@ -2121,7 +2122,8 @@ _TIMELINE_CONTENT_COLUMNS = (
 )
 
 
-def timeline_upsert_sql(*, table_ref: str = "timeline_events", sequence_ref: str = "timeline_events_seq") -> str:
+def timeline_upsert_sql(*, table_ref: str, sequence_ref: str) -> str:
+    """Build the timeline upsert. Both refs must already be schema-qualified."""
     assignments = ", ".join(f"{col} = EXCLUDED.{col}" for col in _TIMELINE_UPSERT_COLUMNS[2:])
     current = ", ".join(f"target.{col}" for col in _TIMELINE_CONTENT_COLUMNS)
     incoming = ", ".join(f"EXCLUDED.{col}" for col in _TIMELINE_CONTENT_COLUMNS)
@@ -2195,18 +2197,18 @@ class TimelineSyncEngine:
     # -- connections ---------------------------------------------------------
 
     def _search_path_sql(self, namespace: str) -> str:
-        parts = ['"' + schema.replace('"', '""') + '"' for schema in physical_schema_names(namespace=namespace)]
+        parts = ['"' + schema.replace('"', '""') + '"' for schema in physical_schema_names(namespace=namespace, include_hidden=True)]
         parts.append("public")
         return "SET search_path TO " + ", ".join(parts)
 
     def _source_sql(self, sql: str) -> str:
-        return qualify_sql_relations(sql, namespace=self._source_schema)
+        return expand_relations(sql, namespace=self._source_schema)
 
     def _dest_sql(self, sql: str) -> str:
-        return qualify_sql_relations(sql, namespace=self._dest_schema)
+        return expand_relations(sql, namespace=self._dest_schema)
 
     def _qualified_regclass(self, logical_name: str, *, namespace: str) -> str:
-        return qualify_sql_relations(logical_name, namespace=namespace)
+        return expand_relations('@' + logical_name, namespace=namespace)
 
     def _connect(self) -> None:
         if self._source_conn is None:
@@ -2243,7 +2245,7 @@ class TimelineSyncEngine:
                     """
                     SELECT backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
                            watermark_ingest_ts, watermark_event_id
-                    FROM timeline_sync_state
+                    FROM @timeline_sync_state
                     WHERE adapter = %s
                     """
                 ),
@@ -2279,7 +2281,7 @@ class TimelineSyncEngine:
             cursor.execute(
                 self._dest_sql(
                     """
-                    INSERT INTO timeline_sync_state (
+                    INSERT INTO @timeline_sync_state (
                         adapter, backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
                         watermark_ingest_ts, watermark_event_id, last_run_at, last_error, updated_at
                     )
@@ -2313,7 +2315,7 @@ class TimelineSyncEngine:
         with self._dest_conn.cursor() as cursor:
             cursor.execute(
                 self._dest_sql(
-                    f"UPDATE timeline_sync_state SET {column} = {column} + %s, updated_at = now() "
+                    f"UPDATE @timeline_sync_state SET {column} = {column} + %s, updated_at = now() "
                     "WHERE adapter = %s"
                 ),
                 (amount, adapter.name),
@@ -2343,8 +2345,10 @@ class TimelineSyncEngine:
             execute_values(
                 cursor,
                 timeline_upsert_sql(
-                    table_ref=self._dest_sql("timeline_events"),
-                    sequence_ref=self._dest_sql("timeline_events_seq"),
+                    table_ref=self._qualified_regclass("timeline_events", namespace=self._dest_schema),
+                    sequence_ref=self._qualified_regclass(
+                        "timeline_events_seq", namespace=self._dest_schema
+                    ),
                 ),
                 values,
                 template=_TIMELINE_INSERT_TEMPLATE,
@@ -2428,7 +2432,7 @@ class TimelineSyncEngine:
             cursor.execute("SELECT to_regclass(%s) IS NOT NULL", (timeline_correspondents,))
             if not cursor.fetchone()[0]:
                 return
-            cursor.execute(self._dest_sql("SELECT max(refreshed_at) FROM timeline_gmail_correspondents"))
+            cursor.execute(self._dest_sql("SELECT max(refreshed_at) FROM @timeline_gmail_correspondents"))
             last = cursor.fetchone()[0]
         if last is not None and datetime.now(tz=UTC) - last < timedelta(hours=24):
             return
@@ -2443,10 +2447,10 @@ class TimelineSyncEngine:
                     SELECT lower(COALESCE(NULLIF(substring(rcpt FROM '<([^>]+)>'), ''), rcpt)) AS addr,
                            count(*) AS n_sent_to,
                            max(m.internal_date) AS last_sent_at
-                    FROM gmail_messages m
+                    FROM @gmail_messages m
                     CROSS JOIN LATERAL unnest(m.to_addresses) AS rcpt
                     WHERE m.from_address ILIKE '%%' || m.account || '%%'
-                       OR EXISTS (SELECT 1 FROM gmail_sync_state s
+                       OR EXISTS (SELECT 1 FROM @gmail_sync_state s
                                   WHERE s.account <> '' AND m.from_address ILIKE '%%' || s.account || '%%')
                     GROUP BY 1
                     """
@@ -2454,11 +2458,11 @@ class TimelineSyncEngine:
             )
             rows = cursor.fetchall()
         with self._dest_conn.cursor() as cursor:
-            cursor.execute(self._dest_sql("DELETE FROM timeline_gmail_correspondents"))
+            cursor.execute(self._dest_sql("DELETE FROM @timeline_gmail_correspondents"))
             execute_values(
                 cursor,
                 self._dest_sql(
-                    "INSERT INTO timeline_gmail_correspondents (addr, n_sent_to, last_sent_at) "
+                    "INSERT INTO @timeline_gmail_correspondents (addr, n_sent_to, last_sent_at) "
                     "VALUES %s ON CONFLICT (addr) DO NOTHING"
                 ),
                 rows,

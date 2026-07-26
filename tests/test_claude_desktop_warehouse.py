@@ -152,7 +152,7 @@ def test_read_credential_after_manual_insert(warehouse) -> None:
     assert warehouse.read_claude_desktop_credential(account="account@example.com") is None
     warehouse._command(
         """
-        INSERT INTO claude_desktop_credentials (account, session_key, org_id, captured_at)
+        INSERT INTO @claude_desktop_credentials (account, session_key, org_id, captured_at)
         VALUES (%s, %s, %s, %s)
         """,
         ("account@example.com", "sk-ant-sid-xyz", "org-1", INGESTED),
@@ -171,14 +171,14 @@ def test_read_latest_credential_ignores_account_and_picks_newest(warehouse) -> N
     # most recently pushed credential regardless of label.
     warehouse._command(
         """
-        INSERT INTO claude_desktop_credentials (account, session_key, org_id, captured_at, updated_at)
+        INSERT INTO @claude_desktop_credentials (account, session_key, org_id, captured_at, updated_at)
         VALUES (%s, %s, %s, %s, %s)
         """,
         ("stale@example.com", "sk-old", "org-old", INGESTED, datetime(2026, 6, 22, 18, tzinfo=UTC)),
     )
     warehouse._command(
         """
-        INSERT INTO claude_desktop_credentials (account, session_key, org_id, captured_at, updated_at)
+        INSERT INTO @claude_desktop_credentials (account, session_key, org_id, captured_at, updated_at)
         VALUES (%s, %s, %s, %s, %s)
         """,
         ("fresh@example.com", "sk-new", "org-new", INGESTED, datetime(2026, 6, 24, 20, tzinfo=UTC)),
@@ -239,7 +239,7 @@ def test_claude_desktop_persists_end_to_end(warehouse) -> None:
     assert summary.events_written == 3
 
     rows = warehouse._query(
-        "SELECT role, text, model FROM agent_session_events "
+        "SELECT role, text, model FROM @ai_conversation_events "
         "WHERE source = 'claude_desktop' AND session_id = 'conv-xyz' ORDER BY seq"
     )
     assert rows[0][0] == "meta"
@@ -249,6 +249,6 @@ def test_claude_desktop_persists_end_to_end(warehouse) -> None:
 
     view = warehouse._query(
         "SELECT title, model, first_prompt, event_count, user_event_count, assistant_event_count "
-        "FROM clean_agent_sessions WHERE source = 'claude_desktop' AND session_id = 'conv-xyz'"
+        "FROM @clean_agent_sessions WHERE source = 'claude_desktop' AND session_id = 'conv-xyz'"
     )
     assert view == [("Science fair display", "claude-sonnet-4-6", "what display for a science fair", 3, 1, 1)]

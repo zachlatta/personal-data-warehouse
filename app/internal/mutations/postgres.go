@@ -96,15 +96,15 @@ type sqlQueryRower interface {
 }
 
 func execContext(ctx context.Context, execer sqlExecer, statement string, args ...any) (sql.Result, error) {
-	return execer.ExecContext(ctx, warehouse.QualifySQL(statement), args...)
+	return execer.ExecContext(ctx, warehouse.ExpandRelations(statement), args...)
 }
 
 func queryContext(ctx context.Context, queryer sqlQueryer, statement string, args ...any) (*sql.Rows, error) {
-	return queryer.QueryContext(ctx, warehouse.QualifySQL(statement), args...)
+	return queryer.QueryContext(ctx, warehouse.ExpandRelations(statement), args...)
 }
 
 func queryRowContext(ctx context.Context, queryer sqlQueryRower, statement string, args ...any) *sql.Row {
-	return queryer.QueryRowContext(ctx, warehouse.QualifySQL(statement), args...)
+	return queryer.QueryRowContext(ctx, warehouse.ExpandRelations(statement), args...)
 }
 
 func (s *PostgresStore) EnsureTables(ctx context.Context) error {
@@ -123,10 +123,8 @@ func (s *PostgresStore) EnsureTables(ctx context.Context) error {
 func (s *PostgresStore) ensureTablesNow(ctx context.Context) error {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
-	// This is schema DDL, not relation DDL: do not pass it through
-	// warehouse.QualifySQL, because the schema name intentionally matches the
-	// legacy logical relation key "upstream_mutations" (now
-	// upstream_mutations.operations).
+	// Schema DDL, not relation DDL: it names the schema directly (from the
+	// catalog) and carries no @relation markers to expand.
 	if _, err := s.db.ExecContext(ctx, upstreamMutationSchemaCreateStatement); err != nil {
 		return err
 	}
@@ -178,7 +176,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 		return Request{}, err
 	}
 	if _, err := execContext(ctx, tx, `
-		INSERT INTO upstream_mutation_requests (
+		INSERT INTO @upstream_mutation_requests (
 			id, status, title, reason, context_json, result_json, idempotency_key,
 			requested_by, created_at, updated_at
 		)
@@ -200,7 +198,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 			return Request{}, err
 		}
 		if _, err := execContext(ctx, tx, `
-			INSERT INTO upstream_mutations (
+			INSERT INTO @upstream_mutations (
 				id, request_id, request_index, provider, operation, account, status, title, reason,
 				payload_json, preview_json, result_json, idempotency_key,
 				requested_by, created_at, updated_at
@@ -254,8 +252,8 @@ func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) 
 		       request.requested_by, request.approved_by, request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at,
 		       count(mutation.id)::bigint AS mutation_count
-		FROM upstream_mutation_requests AS request
-		LEFT JOIN upstream_mutations AS mutation ON mutation.request_id = request.id
+		FROM @upstream_mutation_requests AS request
+		LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
 		%s
 		GROUP BY request.id
 		ORDER BY request.created_at DESC, request.id DESC
@@ -365,7 +363,7 @@ func (s *PostgresStore) UpdateGmailEmailMutation(ctx context.Context, requestID 
 	}
 	now := time.Now().UTC()
 	if _, err := execContext(ctx, tx, `
-		UPDATE upstream_mutations
+		UPDATE @upstream_mutations
 		   SET title = $1,
 		       payload_json = $2::jsonb,
 		       preview_json = $3::jsonb,
@@ -376,7 +374,7 @@ func (s *PostgresStore) UpdateGmailEmailMutation(ctx context.Context, requestID 
 		return Mutation{}, err
 	}
 	if _, err := execContext(ctx, tx, `
-		UPDATE upstream_mutation_requests
+		UPDATE @upstream_mutation_requests
 		   SET revision = revision + 1,
 		       updated_at = $1
 		 WHERE id = $2
@@ -458,7 +456,7 @@ func (s *PostgresStore) RemoveMutation(ctx context.Context, requestID string, mu
 	const removalError = "removed during review"
 	now := time.Now().UTC()
 	if _, err := execContext(ctx, tx, `
-		UPDATE upstream_mutations
+		UPDATE @upstream_mutations
 		   SET status = 'rejected',
 		       error = $1,
 		       updated_at = $2
@@ -467,7 +465,7 @@ func (s *PostgresStore) RemoveMutation(ctx context.Context, requestID string, mu
 		return Mutation{}, err
 	}
 	if _, err := execContext(ctx, tx, `
-		UPDATE upstream_mutation_requests
+		UPDATE @upstream_mutation_requests
 		   SET revision = revision + 1,
 		       updated_at = $1
 		 WHERE id = $2
@@ -525,14 +523,14 @@ func (s *PostgresStore) ApproveRequest(ctx context.Context, id string, actor str
 	}
 	now := time.Now().UTC()
 	if _, err := execContext(ctx, tx, `
-		UPDATE upstream_mutation_requests
+		UPDATE @upstream_mutation_requests
 		   SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $3
 		 WHERE id = $4
 	`, actor, now, now, id); err != nil {
 		return Request{}, err
 	}
 	if _, err := execContext(ctx, tx, `
-		UPDATE upstream_mutations
+		UPDATE @upstream_mutations
 		   SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $3
 		 WHERE request_id = $4 AND status = 'pending_review'
 	`, actor, now, now, id); err != nil {
@@ -585,14 +583,14 @@ func (s *PostgresStore) RejectRequest(ctx context.Context, id string, actor stri
 	}
 	now := time.Now().UTC()
 	if _, err := execContext(ctx, tx, `
-		UPDATE upstream_mutation_requests
+		UPDATE @upstream_mutation_requests
 		   SET status = 'rejected', error = $1, updated_at = $2
 		 WHERE id = $3
 	`, reason, now, id); err != nil {
 		return Request{}, err
 	}
 	if _, err := execContext(ctx, tx, `
-		UPDATE upstream_mutations
+		UPDATE @upstream_mutations
 		   SET status = 'rejected', error = $1, updated_at = $2
 		 WHERE request_id = $3 AND status = 'pending_review'
 	`, reason, now, id); err != nil {
@@ -615,7 +613,7 @@ func (s *PostgresStore) RejectRequest(ctx context.Context, id string, actor stri
 
 func (s *PostgresStore) getRequestByIdempotencyKey(ctx context.Context, key string) (Request, error) {
 	var id string
-	err := queryRowContext(ctx, s.db, `SELECT id FROM upstream_mutation_requests WHERE idempotency_key = $1`, key).Scan(&id)
+	err := queryRowContext(ctx, s.db, `SELECT id FROM @upstream_mutation_requests WHERE idempotency_key = $1`, key).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Request{}, nil
 	}
@@ -632,8 +630,8 @@ func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, err
 		       request.requested_by, request.approved_by, request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at,
 		       count(mutation.id)::bigint AS mutation_count
-		FROM upstream_mutation_requests AS request
-		LEFT JOIN upstream_mutations AS mutation ON mutation.request_id = request.id
+		FROM @upstream_mutation_requests AS request
+		LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
 		WHERE request.id = $1
 		GROUP BY request.id
 	`, id)
@@ -650,7 +648,7 @@ func (s *PostgresStore) listMutationsForRequest(ctx context.Context, requestID s
 		       payload_json, preview_json, result_json, error, idempotency_key, revision, attempt_count,
 		       requested_by, approved_by, claimed_by, claimed_at, created_at, updated_at, approved_at,
 		       executed_at, observed_at
-		FROM upstream_mutations
+		FROM @upstream_mutations
 		WHERE request_id = $1
 		ORDER BY request_index ASC, created_at ASC, id ASC
 	`, requestID)
@@ -712,7 +710,7 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 			substring(COALESCE(message.body_html, '') from 1 for 200000) AS body_html,
 			count(*) OVER (PARTITION BY message.account, message.thread_id)::bigint AS message_count,
 			count(*) FILTER (WHERE 'INBOX' = ANY(message.label_ids)) OVER (PARTITION BY message.account, message.thread_id)::bigint AS inbox_message_count
-		FROM gmail_messages AS message
+		FROM @gmail_messages AS message
 		JOIN wanted ON wanted.account = message.account AND wanted.thread_id = message.thread_id
 		WHERE message.is_deleted = 0
 		  AND NOT ('TRASH' = ANY(message.label_ids))
@@ -800,7 +798,7 @@ func (s *PostgresStore) enrichGmailEmailReplyHeaders(ctx context.Context, mutati
 					PARTITION BY message.account, message.thread_id
 					ORDER BY message.internal_date DESC, message.message_id DESC
 				) AS row_number
-			FROM gmail_messages AS message
+			FROM @gmail_messages AS message
 			JOIN wanted ON wanted.account = message.account AND wanted.thread_id = message.thread_id
 			WHERE message.is_deleted = 0
 			  AND COALESCE(message.rfc822_message_id, '') != ''
@@ -1006,7 +1004,7 @@ func (s *PostgresStore) enrichGmailEmailReplyQuotes(ctx context.Context, mutatio
 					PARTITION BY message.account, message.thread_id
 					ORDER BY message.internal_date DESC, message.message_id DESC
 				) AS row_number
-			FROM gmail_messages AS message
+			FROM @gmail_messages AS message
 			JOIN wanted ON wanted.account = message.account AND wanted.thread_id = message.thread_id
 			WHERE message.is_deleted = 0
 			  AND NOT ('TRASH' = ANY(message.label_ids))
@@ -1225,7 +1223,7 @@ func (s *PostgresStore) latestGmailSignature(ctx context.Context, account string
 	var bodyHTML, bodyText string
 	err := queryRowContext(ctx, s.db, `
 		SELECT COALESCE(body_html, ''), COALESCE(body_text, '')
-		FROM gmail_messages
+		FROM @gmail_messages
 		WHERE account = $1
 		  AND is_deleted = 0
 		  AND 'SENT' = ANY(label_ids)
@@ -2051,7 +2049,7 @@ func randomID(prefix string) (string, error) {
 
 func requestStatusForUpdate(ctx context.Context, tx *sql.Tx, id string) (string, error) {
 	var status string
-	err := queryRowContext(ctx, tx, `SELECT status FROM upstream_mutation_requests WHERE id = $1 FOR UPDATE`, id).Scan(&status)
+	err := queryRowContext(ctx, tx, `SELECT status FROM @upstream_mutation_requests WHERE id = $1 FOR UPDATE`, id).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -2061,7 +2059,7 @@ func requestStatusForUpdate(ctx context.Context, tx *sql.Tx, id string) (string,
 func pendingMutationIDsForUpdate(ctx context.Context, tx *sql.Tx, requestID string) ([]string, error) {
 	rows, err := queryContext(ctx, tx, `
 		SELECT id
-		FROM upstream_mutations
+		FROM @upstream_mutations
 		WHERE request_id = $1 AND status = 'pending_review'
 		ORDER BY request_index ASC, created_at ASC, id ASC
 		FOR UPDATE
@@ -2090,7 +2088,7 @@ func mutationForUpdate(ctx context.Context, tx *sql.Tx, requestID string, mutati
 		       payload_json, preview_json, result_json, error, idempotency_key, revision, attempt_count,
 		       requested_by, approved_by, claimed_by, claimed_at, created_at, updated_at, approved_at,
 		       executed_at, observed_at
-		FROM upstream_mutations
+		FROM @upstream_mutations
 		WHERE request_id = $1 AND id = $2
 		FOR UPDATE
 	`, requestID, mutationID)
@@ -2103,11 +2101,11 @@ func mutationForUpdate(ctx context.Context, tx *sql.Tx, requestID string, mutati
 
 func appendRequestEvent(ctx context.Context, tx *sql.Tx, requestID string, eventType string, actorType string, actorID string, event map[string]any) error {
 	var index int64
-	if err := queryRowContext(ctx, tx, `SELECT COALESCE(MAX(event_index), -1) + 1 FROM upstream_mutation_request_events WHERE request_id = $1`, requestID).Scan(&index); err != nil {
+	if err := queryRowContext(ctx, tx, `SELECT COALESCE(MAX(event_index), -1) + 1 FROM @upstream_mutation_request_events WHERE request_id = $1`, requestID).Scan(&index); err != nil {
 		return err
 	}
 	_, err := execContext(ctx, tx, `
-		INSERT INTO upstream_mutation_request_events (request_id, event_index, event_type, actor_type, actor_id, event_json)
+		INSERT INTO @upstream_mutation_request_events (request_id, event_index, event_type, actor_type, actor_id, event_json)
 		VALUES ($1, $2, $3, $4, $5, $6::jsonb)
 	`, requestID, index, eventType, actorType, actorID, jsonString(event))
 	return err
@@ -2115,11 +2113,11 @@ func appendRequestEvent(ctx context.Context, tx *sql.Tx, requestID string, event
 
 func appendMutationEvent(ctx context.Context, tx *sql.Tx, mutationID string, eventType string, actorType string, actorID string, event map[string]any) error {
 	var index int64
-	if err := queryRowContext(ctx, tx, `SELECT COALESCE(MAX(event_index), -1) + 1 FROM upstream_mutation_events WHERE mutation_id = $1`, mutationID).Scan(&index); err != nil {
+	if err := queryRowContext(ctx, tx, `SELECT COALESCE(MAX(event_index), -1) + 1 FROM @upstream_mutation_events WHERE mutation_id = $1`, mutationID).Scan(&index); err != nil {
 		return err
 	}
 	_, err := execContext(ctx, tx, `
-		INSERT INTO upstream_mutation_events (mutation_id, event_index, event_type, actor_type, actor_id, event_json)
+		INSERT INTO @upstream_mutation_events (mutation_id, event_index, event_type, actor_type, actor_id, event_json)
 		VALUES ($1, $2, $3, $4, $5, $6::jsonb)
 	`, mutationID, index, eventType, actorType, actorID, jsonString(event))
 	return err
@@ -2160,10 +2158,14 @@ func decodeJSONStringArray(value string) []string {
 	return stringSliceFromAny(anyValues)
 }
 
-const upstreamMutationSchemaCreateStatement = `CREATE SCHEMA IF NOT EXISTS "upstream_mutations"`
+// The operational tables live in the catalog's ops schema; take the name from
+// the catalog rather than restating it, so a catalog move cannot leave the app
+// creating an orphan schema.
+var upstreamMutationSchemaCreateStatement = "CREATE SCHEMA IF NOT EXISTS " +
+	warehouse.QuoteIdent(warehouse.SchemaOf("upstream_mutations"))
 
 var upstreamMutationSchemaStatements = []string{
-	`CREATE TABLE IF NOT EXISTS upstream_mutation_requests (
+	`CREATE TABLE IF NOT EXISTS @upstream_mutation_requests (
 		id text PRIMARY KEY,
 		status text NOT NULL DEFAULT 'pending_review',
 		title text NOT NULL DEFAULT '',
@@ -2181,7 +2183,7 @@ var upstreamMutationSchemaStatements = []string{
 		executed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
 		observed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz
 	)`,
-	`CREATE TABLE IF NOT EXISTS upstream_mutations (
+	`CREATE TABLE IF NOT EXISTS @upstream_mutations (
 		id text PRIMARY KEY,
 		request_id text NOT NULL DEFAULT '',
 		request_index bigint NOT NULL DEFAULT 0,
@@ -2208,9 +2210,9 @@ var upstreamMutationSchemaStatements = []string{
 		executed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
 		observed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz
 	)`,
-	`ALTER TABLE upstream_mutations ADD COLUMN IF NOT EXISTS request_id text NOT NULL DEFAULT ''`,
-	`ALTER TABLE upstream_mutations ADD COLUMN IF NOT EXISTS request_index bigint NOT NULL DEFAULT 0`,
-	`CREATE TABLE IF NOT EXISTS upstream_mutation_events (
+	`ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS request_id text NOT NULL DEFAULT ''`,
+	`ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS request_index bigint NOT NULL DEFAULT 0`,
+	`CREATE TABLE IF NOT EXISTS @upstream_mutation_events (
 		mutation_id text NOT NULL,
 		event_index bigint NOT NULL,
 		event_type text NOT NULL DEFAULT '',
@@ -2220,7 +2222,7 @@ var upstreamMutationSchemaStatements = []string{
 		created_at timestamptz NOT NULL DEFAULT now(),
 		PRIMARY KEY (mutation_id, event_index)
 	)`,
-	`CREATE TABLE IF NOT EXISTS upstream_mutation_request_events (
+	`CREATE TABLE IF NOT EXISTS @upstream_mutation_request_events (
 		request_id text NOT NULL,
 		event_index bigint NOT NULL,
 		event_type text NOT NULL DEFAULT '',
@@ -2230,11 +2232,11 @@ var upstreamMutationSchemaStatements = []string{
 		created_at timestamptz NOT NULL DEFAULT now(),
 		PRIMARY KEY (request_id, event_index)
 	)`,
-	`CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutation_requests_idempotency_idx ON upstream_mutation_requests (idempotency_key) WHERE idempotency_key != ''`,
-	`CREATE INDEX IF NOT EXISTS upstream_mutation_requests_status_updated_idx ON upstream_mutation_requests (status, updated_at)`,
-	`CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutations_idempotency_idx ON upstream_mutations (idempotency_key) WHERE idempotency_key != ''`,
-	`CREATE INDEX IF NOT EXISTS upstream_mutations_request_idx ON upstream_mutations (request_id, request_index, created_at, id)`,
-	`CREATE INDEX IF NOT EXISTS upstream_mutations_status_updated_idx ON upstream_mutations (status, updated_at)`,
-	`CREATE INDEX IF NOT EXISTS upstream_mutation_request_events_request_idx ON upstream_mutation_request_events (request_id, event_index)`,
-	`CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON upstream_mutation_events (mutation_id, event_index)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutation_requests_idempotency_idx ON @upstream_mutation_requests (idempotency_key) WHERE idempotency_key != ''`,
+	`CREATE INDEX IF NOT EXISTS upstream_mutation_requests_status_updated_idx ON @upstream_mutation_requests (status, updated_at)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutations_idempotency_idx ON @upstream_mutations (idempotency_key) WHERE idempotency_key != ''`,
+	`CREATE INDEX IF NOT EXISTS upstream_mutations_request_idx ON @upstream_mutations (request_id, request_index, created_at, id)`,
+	`CREATE INDEX IF NOT EXISTS upstream_mutations_status_updated_idx ON @upstream_mutations (status, updated_at)`,
+	`CREATE INDEX IF NOT EXISTS upstream_mutation_request_events_request_idx ON @upstream_mutation_request_events (request_id, event_index)`,
+	`CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON @upstream_mutation_events (mutation_id, event_index)`,
 }

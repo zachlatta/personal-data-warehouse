@@ -289,7 +289,7 @@ def test_sync_registers_accounts_links_and_observations(warehouse):
     assert summary.observations_upserted == 2
 
     accounts = warehouse._query(
-        "SELECT account_id, kind, side, institution, mask FROM finance_accounts ORDER BY mask"
+        "SELECT account_id, kind, side, institution, mask FROM @finance_accounts ORDER BY mask"
     )
     fa_checking = stable_finance_account_id("plaid", "z@x.test", "acc-1")
     fa_credit = stable_finance_account_id("plaid", "z@x.test", "acc-2")
@@ -299,7 +299,7 @@ def test_sync_registers_accounts_links_and_observations(warehouse):
     ]
 
     links = warehouse._query(
-        "SELECT source, source_account_key, account_id, match_method FROM finance_account_links ORDER BY source_account_key"
+        "SELECT source, source_account_key, account_id, match_method FROM @finance_account_links ORDER BY source_account_key"
     )
     assert links == [
         ("plaid", "acc-1", fa_checking, "source_id"),
@@ -307,7 +307,7 @@ def test_sync_registers_accounts_links_and_observations(warehouse):
     ]
 
     observations = warehouse._query(
-        "SELECT account_id, as_of, kind, value, currency, source FROM finance_observations ORDER BY account_id"
+        "SELECT account_id, as_of, kind, value, currency, source FROM @finance_observations ORDER BY account_id"
     )
     assert sorted(observations) == sorted(
         [
@@ -324,24 +324,24 @@ def test_sync_is_idempotent_and_appends_across_days(warehouse):
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(hour=18)).sync()
     assert summary.accounts_created == 0
     assert summary.links_created == 0
-    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(1,)]
-    assert warehouse._query("SELECT count(*) FROM finance_account_links") == [(1,)]
-    assert warehouse._query("SELECT count(*) FROM finance_observations") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_account_links") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_observations") == [(1,)]
     # The next day appends a new observation: history accrues.
     FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=14)).sync()
-    assert warehouse._query("SELECT count(*) FROM finance_observations") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_observations") == [(2,)]
 
 
 def test_sync_refreshes_account_fields_but_preserves_identity(warehouse):
     _seed_plaid(warehouse, [_plaid_account_row()])
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
-    created = warehouse._query("SELECT account_id, created_at FROM finance_accounts")
+    created = warehouse._query("SELECT account_id, created_at FROM @finance_accounts")
     # The institution renames the account; identity and created_at are stable.
     warehouse.insert_plaid_accounts(
         [_plaid_account_row(name="Premium Checking", sync_version=2)]
     )
     FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=14)).sync()
-    rows = warehouse._query("SELECT account_id, name, created_at FROM finance_accounts")
+    rows = warehouse._query("SELECT account_id, name, created_at FROM @finance_accounts")
     assert rows == [(created[0][0], "Premium Checking", created[0][1])]
 
 
@@ -355,7 +355,7 @@ def test_sync_skips_removed_plaid_accounts(warehouse):
     )
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     assert summary.accounts_seen == 1
-    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(1,)]
 
 
 def test_has_pending_finance_observations(warehouse):
@@ -380,9 +380,9 @@ def test_replay_rebuilds_identically(warehouse):
     )
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     snapshot_sql = (
-        "SELECT account_id, kind, side FROM finance_accounts ORDER BY account_id",
-        "SELECT transaction_id, account_id, amount, source FROM finance_transactions ORDER BY transaction_id",
-        "SELECT source, source_row_key, transaction_id, match_method FROM finance_transaction_links ORDER BY source, source_row_key",
+        "SELECT account_id, kind, side FROM @finance_accounts ORDER BY account_id",
+        "SELECT transaction_id, account_id, amount, source FROM @finance_transactions ORDER BY transaction_id",
+        "SELECT source, source_row_key, transaction_id, match_method FROM @finance_transaction_links ORDER BY source, source_row_key",
     )
     before = [warehouse._query(sql) for sql in snapshot_sql]
     for table in (
@@ -392,7 +392,7 @@ def test_replay_rebuilds_identically(warehouse):
         "finance_account_links",
         "finance_accounts",
     ):
-        warehouse._command(f"DELETE FROM {table}")
+        warehouse._command(f"DELETE FROM @{table}")
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     after = [warehouse._query(sql) for sql in snapshot_sql]
     assert before == after
@@ -463,7 +463,7 @@ def test_plaid_transactions_become_signed_ledger_rows(warehouse):
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     assert summary.transactions_upserted == 2
     rows = warehouse._query(
-        "SELECT description, amount, source, pending FROM finance_transactions ORDER BY amount"
+        "SELECT description, amount, source, pending FROM @finance_transactions ORDER BY amount"
     )
     # Plaid positive-out flips to ledger negative (outflow); inflow is positive.
     assert rows == [
@@ -477,7 +477,7 @@ def test_pending_row_merges_into_posted_successor_and_reconciles(warehouse):
     warehouse.insert_plaid_transactions([_plaid_transaction_row(transaction_id="tx-p", pending=1)])
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     pending_ledger_id = stable_finance_transaction_id("plaid", "z@x.test|tx-p")
-    assert warehouse._query("SELECT transaction_id FROM finance_transactions") == [(pending_ledger_id,)]
+    assert warehouse._query("SELECT transaction_id FROM @finance_transactions") == [(pending_ledger_id,)]
 
     # The posted row arrives and the pending row tombstones (plaid behavior).
     warehouse.insert_plaid_transactions(
@@ -488,7 +488,7 @@ def test_pending_row_merges_into_posted_successor_and_reconciles(warehouse):
     )
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(hour=13)).sync()
     posted_ledger_id = stable_finance_transaction_id("plaid", "z@x.test|tx-post")
-    rows = warehouse._query("SELECT transaction_id, pending FROM finance_transactions")
+    rows = warehouse._query("SELECT transaction_id, pending FROM @finance_transactions")
     # The pending row's ledger transaction is gone; only the posted row remains.
     assert rows == [(posted_ledger_id, 0)]
     assert summary.transactions_removed > 0
@@ -504,7 +504,7 @@ def test_pending_row_merges_into_posted_successor_and_reconciles(warehouse):
     FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(hour=14)).sync()
     links = dict(
         warehouse._query(
-            "SELECT source_row_key, match_method FROM finance_transaction_links WHERE source_row_key LIKE '%%tx-p2'"
+            "SELECT source_row_key, match_method FROM @finance_transaction_links WHERE source_row_key LIKE '%%tx-p2'"
         )
     )
     assert links == {"z@x.test|tx-p2": "pending_id"}
@@ -538,7 +538,7 @@ def test_plaid_investment_transactions_become_signed_ledger_rows(warehouse):
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     assert summary.transactions_upserted == 3
     rows = warehouse._query(
-        "SELECT description, amount, source, pending FROM finance_transactions ORDER BY amount"
+        "SELECT description, amount, source, pending FROM @finance_transactions ORDER BY amount"
     )
     # Plaid positive-out flips to ledger negative (outflow); inflow is positive.
     assert rows == [
@@ -548,7 +548,7 @@ def test_plaid_investment_transactions_become_signed_ledger_rows(warehouse):
     ]
     links = dict(
         warehouse._query(
-            "SELECT source_row_key, match_method FROM finance_transaction_links ORDER BY source_row_key"
+            "SELECT source_row_key, match_method FROM @finance_transaction_links ORDER BY source_row_key"
         )
     )
     # Investment rows live in their own source_row_key namespace.
@@ -569,7 +569,7 @@ def test_investment_and_transaction_feed_ids_never_collide(warehouse):
     )
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     assert summary.transactions_upserted == 2
-    assert warehouse._query("SELECT count(*) FROM finance_transactions") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_transactions") == [(2,)]
 
 
 def test_document_transactions_dedup_against_investment_overlap(warehouse):
@@ -601,16 +601,16 @@ def test_document_transactions_dedup_against_investment_overlap(warehouse):
     )
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     assert summary.transactions_merged == 1
-    rows = warehouse._query("SELECT description, amount, source FROM finance_transactions ORDER BY posted_at")
+    rows = warehouse._query("SELECT description, amount, source FROM @finance_transactions ORDER BY posted_at")
     assert rows == [
         ("OLD TRANSFER", Decimal("50.00"), "manual_finance"),
         ("TRANSFERRED FROM VS (Cash)", Decimal("100"), "plaid"),
     ]
     # The doc's account resolved to the EXISTING plaid account by mask: no new account.
-    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(1,)]
     links = dict(
         warehouse._query(
-            "SELECT source_row_key, match_method FROM finance_transaction_links WHERE source = 'manual_finance'"
+            "SELECT source_row_key, match_method FROM @finance_transaction_links WHERE source = 'manual_finance'"
         )
     )
     assert links == {"sha-brokerage|0": "fuzzy_amount_date", "sha-brokerage|1": "source_id"}
@@ -632,16 +632,16 @@ def test_document_transactions_dedup_against_plaid_overlap(warehouse):
     )
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     assert summary.transactions_merged == 1
-    rows = warehouse._query("SELECT description, amount, source FROM finance_transactions ORDER BY posted_at")
+    rows = warehouse._query("SELECT description, amount, source FROM @finance_transactions ORDER BY posted_at")
     assert rows == [
         ("OLD RENT", Decimal("-900.00"), "manual_finance"),
         ("COFFEE SHOP", Decimal("-4.5"), "plaid"),
     ]
     # The doc's account resolved to the EXISTING plaid account by mask: no new account.
-    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(1,)]
     links = dict(
         warehouse._query(
-            "SELECT source_row_key, match_method FROM finance_transaction_links WHERE source = 'manual_finance'"
+            "SELECT source_row_key, match_method FROM @finance_transaction_links WHERE source = 'manual_finance'"
         )
     )
     assert links == {"sha-doc-1|0": "fuzzy_amount_date", "sha-doc-1|1": "source_id"}
@@ -667,16 +667,16 @@ def test_mortgage_statement_founds_account_and_principal_observations(warehouse)
     )
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     accounts = warehouse._query(
-        "SELECT kind, side, institution FROM finance_accounts WHERE mask = '0009'"
+        "SELECT kind, side, institution FROM @finance_accounts WHERE mask = '0009'"
     )
     assert accounts == [("mortgage", "liability", "Acme Mortgage Servicing")]
     observations = warehouse._query(
-        "SELECT kind, value, source FROM finance_observations WHERE as_of = %s",
+        "SELECT kind, value, source FROM @finance_observations WHERE as_of = %s",
         (date(2026, 6, 30),),
     )
     assert observations == [("principal", Decimal("412345.67"), "manual_finance")]
     # Net worth now subtracts the mortgage principal.
-    total = warehouse._query("SELECT SUM(signed_value) FROM finance_net_worth")
+    total = warehouse._query("SELECT SUM(signed_value) FROM @marts_finance_net_worth")
     assert total == [(Decimal("123.45") - Decimal("412345.67"),)]
 
 
@@ -718,7 +718,7 @@ def test_multi_entity_valuation_doc_prefers_total_else_first(warehouse):
     )
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     rows = warehouse._query(
-        "SELECT as_of, value FROM finance_observations WHERE kind = 'valuation' ORDER BY as_of"
+        "SELECT as_of, value FROM @finance_observations WHERE kind = 'valuation' ORDER BY as_of"
     )
     assert rows == [
         (date(2026, 4, 11), Decimal("16797.38")),
@@ -765,15 +765,15 @@ def test_folder_spanning_account_number_change_resolves_by_any_mask(warehouse):
     )
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     # No duplicate account: the folder resolved to the existing plaid account.
-    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(1,)]
     links = dict(
         warehouse._query(
-            "SELECT source_account_key, match_method FROM finance_account_links WHERE source = 'manual_finance'"
+            "SELECT source_account_key, match_method FROM @finance_account_links WHERE source = 'manual_finance'"
         )
     )
     assert links == {"broker-individual-5270": "mask"}
     # Both eras' balances land on the one account.
-    assert warehouse._query("SELECT count(*) FROM finance_observations WHERE source='manual_finance'") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_observations WHERE source='manual_finance'") == [(2,)]
 
 
 def test_valuation_documents_found_asset_accounts(warehouse):
@@ -797,9 +797,9 @@ def test_valuation_documents_found_asset_accounts(warehouse):
         ),
     )
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
-    accounts = warehouse._query("SELECT kind, side, name FROM finance_accounts")
+    accounts = warehouse._query("SELECT kind, side, name FROM @finance_accounts")
     assert accounts == [("property", "asset", "Main St house")]
-    observations = warehouse._query("SELECT kind, value FROM finance_observations")
+    observations = warehouse._query("SELECT kind, value FROM @finance_observations")
     assert observations == [("valuation", Decimal("650000"))]
 
 
@@ -834,7 +834,7 @@ def test_relinked_plaid_account_adopts_the_existing_ledger_account(warehouse):
 
     # The dead item is retired (`pdw ingest plaid unlink`) and the institution
     # comes back under a new item with new plaid account ids.
-    warehouse._command("DELETE FROM plaid_accounts WHERE item_id = 'item-1'")
+    warehouse._command("DELETE FROM @plaid_accounts WHERE item_id = 'item-1'")
     warehouse.insert_plaid_items([_plaid_item_row(item_id="item-2")])
     warehouse.insert_plaid_accounts(
         [_credit_card_row(item_id="item-2", account_id="acc-card-2", current_balance=250.0)]
@@ -842,16 +842,16 @@ def test_relinked_plaid_account_adopts_the_existing_ledger_account(warehouse):
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=14)).sync()
 
     assert summary.accounts_created == 0
-    assert warehouse._query("SELECT account_id FROM finance_accounts") == [(original,)]
+    assert warehouse._query("SELECT account_id FROM @finance_accounts") == [(original,)]
     assert warehouse._query(
-        "SELECT source_account_key, account_id, match_method FROM finance_account_links ORDER BY source_account_key"
+        "SELECT source_account_key, account_id, match_method FROM @finance_account_links ORDER BY source_account_key"
     ) == [
         ("acc-card", original, "source_id"),
         ("acc-card-2", original, "institution_mask"),
     ]
     # One continuous balance history across the re-link.
     assert warehouse._query(
-        "SELECT as_of, value FROM finance_observations ORDER BY as_of"
+        "SELECT as_of, value FROM @finance_observations ORDER BY as_of"
     ) == [
         (date(2026, 7, 13), Decimal("100.00")),
         (date(2026, 7, 14), Decimal("250.00")),
@@ -871,15 +871,15 @@ def test_concurrent_duplicate_plaid_items_keep_separate_ledger_accounts(warehous
     )
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
 
-    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(2,)]
-    assert warehouse._query("SELECT count(*) FROM finance_observations") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_observations") == [(2,)]
 
 
 def test_retiring_a_forked_plaid_item_merges_and_prunes_the_duplicate(warehouse):
     """The production incident, end to end.
 
     A re-link forked a card before the dead item was retired:
-    marts.finance_net_worth carried two live rows per card and the transaction
+    marts_finance.net_worth carried two live rows per card and the transaction
     overlap was double-counted. Unlinking the old item must leave exactly one
     logical account per card, carrying the whole history (including the
     statement documents linked to it), and no residue.
@@ -913,26 +913,26 @@ def test_retiring_a_forked_plaid_item_merges_and_prunes_the_duplicate(warehouse)
     )
     FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=14)).sync()
     forked = stable_finance_account_id("plaid", "z@x.test", "acc-card-2")
-    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(2,)]
-    assert warehouse._query("SELECT count(*) FROM finance_transactions") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_transactions") == [(2,)]
 
     # `pdw ingest plaid unlink item-1` deletes the dead item's raw rows.
-    warehouse._command("DELETE FROM plaid_accounts WHERE item_id = 'item-1'")
-    warehouse._command("DELETE FROM plaid_transactions WHERE item_id = 'item-1'")
+    warehouse._command("DELETE FROM @plaid_accounts WHERE item_id = 'item-1'")
+    warehouse._command("DELETE FROM @plaid_transactions WHERE item_id = 'item-1'")
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=15)).sync()
 
     assert summary.accounts_merged == 1
     assert summary.accounts_pruned == 1
-    assert warehouse._query("SELECT account_id FROM finance_accounts") == [(original,)]
+    assert warehouse._query("SELECT account_id FROM @finance_accounts") == [(original,)]
     assert warehouse._query(
-        "SELECT count(*) FROM finance_observations WHERE account_id = %s", (forked,)
+        "SELECT count(*) FROM @finance_observations WHERE account_id = %s", (forked,)
     ) == [(0,)]
     # The statement document keeps pointing at the surviving account, and the
     # overlap collapses back to one transaction.
     assert warehouse._query(
-        "SELECT account_id FROM finance_account_links WHERE source = 'manual_finance'"
+        "SELECT account_id FROM @finance_account_links WHERE source = 'manual_finance'"
     ) == [(original,)]
-    assert warehouse._query("SELECT account_id, count(*) FROM finance_transactions GROUP BY 1") == [
+    assert warehouse._query("SELECT account_id, count(*) FROM @finance_transactions GROUP BY 1") == [
         (original, 1)
     ]
 
@@ -947,7 +947,7 @@ def test_plaid_accounts_without_a_mask_never_adopt_another_account(warehouse):
     )
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
 
-    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(2,)]
 
 
 def test_ledger_never_prunes_an_account_a_source_still_links_to(warehouse):
@@ -955,9 +955,9 @@ def test_ledger_never_prunes_an_account_a_source_still_links_to(warehouse):
     account and its history until something else claims it."""
     _seed_plaid(warehouse, [_plaid_account_row()])
     FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
-    warehouse._command("DELETE FROM plaid_accounts")
+    warehouse._command("DELETE FROM @plaid_accounts")
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=14)).sync()
 
     assert summary.accounts_pruned == 0
-    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(1,)]
-    assert warehouse._query("SELECT count(*) FROM finance_observations") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_observations") == [(1,)]

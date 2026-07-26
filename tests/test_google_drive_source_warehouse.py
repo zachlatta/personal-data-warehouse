@@ -147,13 +147,13 @@ def test_files_and_text_surface_in_search_text(warehouse):
     _sync_timeline(warehouse)
 
     name_hits = warehouse._query(
-        "SELECT context, who, ref FROM search_text('quarterly', 20, ARRAY['google_drive']) "
+        "SELECT context, who, ref FROM @search_text('quarterly', 20, ARRAY['google_drive']) "
         "WHERE score < 0 AND subsource = 'file_change'"
     )
     assert name_hits == [("/My Drive/Docs", "Zach", "drive_file:zach@hackclub.com|f1")]
 
     content_hits = warehouse._query(
-        "SELECT ref FROM search_text('pineapple', 20, ARRAY['google_drive']) "
+        "SELECT ref FROM @search_text('pineapple', 20, ARRAY['google_drive']) "
         "WHERE score < 0 AND subsource = 'file_change'"
     )
     assert content_hits == [("drive_file:zach@hackclub.com|f1",)]
@@ -176,7 +176,7 @@ def test_excluded_and_trashed_files_hidden_from_search(warehouse):
     )
     _sync_timeline(warehouse)
     hits = warehouse._query(
-        "SELECT text FROM search_text('hidden', 20, ARRAY['google_drive']) WHERE score < 0"
+        "SELECT text FROM @search_text('hidden', 20, ARRAY['google_drive']) WHERE score < 0"
     )
     assert hits == []
 

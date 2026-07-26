@@ -79,7 +79,7 @@ func (s *Service) resolveRelation(ctx context.Context, relation string) (tableRe
 	trimmed := strings.TrimSpace(relation)
 	trimmed = strings.TrimSuffix(trimmed, ";")
 	if trimmed == "" {
-		return tableRef{}, "relation is required, e.g. describe_table('gmail.messages'). Run schema_overview for the relation list."
+		return tableRef{}, "relation is required, e.g. describe_table('base_gmail.messages'). Run schema_overview for the relation list."
 	}
 
 	parts := strings.Split(trimmed, ".")
@@ -87,7 +87,7 @@ func (s *Service) resolveRelation(ctx context.Context, relation string) (tableRe
 		parts[i] = strings.Trim(strings.TrimSpace(part), `"`)
 	}
 	if len(parts) > 2 {
-		// A database-qualified name ("postgres.gmail.messages"): drop the leading
+		// A database-qualified name ("postgres.base_gmail.messages"): drop the leading
 		// database segment rather than failing, since that prefix is the exact
 		// mistake the overview's first line warns about.
 		parts = parts[len(parts)-2:]
@@ -99,10 +99,10 @@ func (s *Service) resolveRelation(ctx context.Context, relation string) (tableRe
 		schema = parts[0]
 	}
 	if name == "" {
-		return tableRef{}, "relation is required, e.g. describe_table('gmail.messages'). Run schema_overview for the relation list."
+		return tableRef{}, "relation is required, e.g. describe_table('base_gmail.messages'). Run schema_overview for the relation list."
 	}
 	if !validIdentifier(name) || (schema != "" && !validIdentifier(schema)) {
-		return tableRef{}, fmt.Sprintf("%q is not a relation name — pass a schema-qualified relation like gmail.messages.", relation)
+		return tableRef{}, fmt.Sprintf("%q is not a relation name — pass a schema-qualified relation like base_gmail.messages.", relation)
 	}
 
 	matches := s.relationsNamed(ctx, name)

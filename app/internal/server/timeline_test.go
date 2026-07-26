@@ -526,7 +526,7 @@ func TestTimelineChildQueriesCoverEveryEventTable(t *testing.T) {
 	// every adapter source_table must have an entry (possibly empty).
 	expected := []string{
 		"gmail_messages", "slack_messages", "slack_files", "apple_messages",
-		"whatsapp_messages", "agent_session_events", "apple_note_revisions",
+		"whatsapp_messages", "ai_conversation_events", "apple_note_revisions",
 		"apple_voice_memos_files", "calendar_events", "google_drive_files",
 		"photo_assets", "contact_cards", "whoop_cycles", "whoop_recoveries",
 		"whoop_sleeps", "whoop_workouts", "upstream_mutations",
@@ -562,7 +562,7 @@ func TestTimelineDetailQueriesExposeEveryKnownRelationship(t *testing.T) {
 	if !strings.Contains(joined(whatsapp), "attachment_enrichments") {
 		t.Fatalf("WhatsApp detail queries must expose attachment enrichment text")
 	}
-	if queries := timelineChildQueries["agent_session_events"]; len(queries) != 1 || queries[0].name != "events" {
+	if queries := timelineChildQueries["ai_conversation_events"]; len(queries) != 1 || queries[0].name != "events" {
 		t.Fatalf("agent session detail must use one pageable event stream: %#v", queries)
 	}
 	for table, queries := range timelineChildQueries {

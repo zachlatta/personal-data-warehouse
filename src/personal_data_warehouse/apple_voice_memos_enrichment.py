@@ -325,13 +325,13 @@ def load_enrichment_candidates(
             FROM
             (
                 SELECT subject_id
-                FROM agent_runs
+                FROM @agent_runs
                 WHERE task_type = 'apple_voice_memo_enrichment'
                   AND provider = {_sql_string(agent_run_provider)}
                   AND status = 'error'
                 UNION ALL
                 SELECT recording_id AS subject_id
-                FROM apple_voice_memos_enrichments
+                FROM @apple_voice_memos_enrichments
                 WHERE provider = {_sql_string(provider)}
                   AND status = 'error'
             )
@@ -348,15 +348,15 @@ def load_enrichment_candidates(
             f.recorded_at,
             f.title,
             r.transcript_text
-        FROM apple_voice_memos_files AS f
-        INNER JOIN apple_voice_memos_transcription_runs AS r
+        FROM @apple_voice_memos_files AS f
+        INNER JOIN @apple_voice_memos_transcription_runs AS r
             ON f.account = r.account
               AND f.recording_id = r.recording_id
               AND f.content_sha256 = r.content_sha256
         LEFT JOIN
         (
             SELECT account, recording_id, content_sha256, created_at
-            FROM apple_voice_memos_enrichments
+            FROM @apple_voice_memos_enrichments
             WHERE provider = {_sql_string(provider)}
               {completed_prompt_filter}
               AND status = 'completed'
@@ -387,7 +387,7 @@ def load_calendar_candidates(warehouse, recording: Mapping[str, Any]) -> list[di
     rows = warehouse._query(
         f"""
         SELECT event_id, summary, start_at, end_at, location, attendees_json
-        FROM calendar_events
+        FROM @calendar_events
         WHERE start_at <= {_sql_string(latest)}::timestamptz + INTERVAL '3 hours'
           AND end_at >= {_sql_string(earliest)}::timestamptz - INTERVAL '3 hours'
           AND is_deleted = 0
@@ -445,7 +445,7 @@ def load_transcript_segments(warehouse, recording: Mapping[str, Any]) -> list[di
     rows = warehouse._query(
         f"""
         SELECT segment_index, speaker_label, start_ms, end_ms, confidence, text
-        FROM apple_voice_memos_transcript_segments
+        FROM @apple_voice_memos_transcript_segments
         WHERE account = {_sql_string(str(recording.get("account", "")))}
           AND recording_id = {_sql_string(str(recording.get("recording_id", "")))}
           AND provider = 'assemblyai'
@@ -498,7 +498,7 @@ def load_contact_alias_hints(
                     c.nicknames,
                     c.source_updated_at
                 FROM mention_terms mt
-                INNER JOIN clean_contacts c
+                INNER JOIN @clean_contacts c
                   ON EXISTS (
                     SELECT 1
                     FROM jsonb_array_elements(c.nicknames) AS nickname
@@ -947,8 +947,8 @@ def load_drive_event_identity_snippets(
                 COALESCE(f.modified_time, t.source_modified_time) AS occurred_at,
                 f.name,
                 left(COALESCE(t.text, ''), {PROMPT_EVENT_IDENTITY_CONTEXT_CHARS}) AS text
-            FROM google_drive_file_texts AS t
-            INNER JOIN google_drive_files AS f
+            FROM @google_drive_file_texts AS t
+            INNER JOIN @google_drive_files AS f
               ON f.account = t.account
              AND f.file_id = t.file_id
             WHERE t.text_extraction_status = 'ok'
@@ -991,7 +991,7 @@ def load_gmail_event_identity_snippets(
                 from_address,
                 subject,
                 COALESCE(snippet, '') || ' ' || left(COALESCE(body_text, ''), {PROMPT_EVENT_IDENTITY_CONTEXT_CHARS}) AS text
-            FROM gmail_messages
+            FROM @gmail_messages
             WHERE is_deleted = 0
               AND {event_identity_time_window_sql(recording, "internal_date")}
               AND {event_identity_match_sql("COALESCE(from_address, '') || ' ' || COALESCE(subject, '') || ' ' || COALESCE(snippet, '') || ' ' || COALESCE(body_text, '')", event_terms)}
@@ -1030,8 +1030,8 @@ def load_slack_event_identity_snippets(
                 m.message_datetime,
                 COALESCE(NULLIF(u.real_name, ''), NULLIF(u.display_name, ''), NULLIF(u.name, ''), m.username, '') AS speaker,
                 m.text
-            FROM slack_messages AS m
-            LEFT JOIN slack_users AS u
+            FROM @slack_messages AS m
+            LEFT JOIN @slack_users AS u
               ON u.account = m.account
              AND u.team_id = m.team_id
              AND u.user_id = m.user_id
@@ -1395,7 +1395,7 @@ def load_attendee_identity_hints(
         slack_rows = warehouse._query(
             f"""
             SELECT lower(email), name, real_name, display_name, user_id
-            FROM slack_users
+            FROM @slack_users
             WHERE lower(email) IN {email_list_sql}
             LIMIT 50
             """
@@ -1424,7 +1424,7 @@ def load_attendee_identity_hints(
             gmail_rows = warehouse._query(
                 f"""
                 SELECT from_address, subject, snippet
-                FROM gmail_messages
+                FROM @gmail_messages
                 WHERE is_deleted = 0
                   AND (
                     from_address ILIKE {_sql_like_contains(email)} ESCAPE E'\\\\'

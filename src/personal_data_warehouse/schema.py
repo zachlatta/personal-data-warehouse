@@ -1089,7 +1089,7 @@ AGENT_RUN_TOOL_CALL_COLUMNS = (
 
 # AI conversation logs (Claude Code, Codex, OpenClaw, Claude Desktop, ChatGPT).
 # One row per raw transcript/conversation event; source-owned physical tables
-# share this row shape, and marts.ai_conversation_sessions provides the
+# share this row shape, and marts_ai_conversations.sessions provides the
 # session-level roll-up so cross-batch counts and token sums stay correct.
 AGENT_SESSION_EVENT_COLUMNS = (
     "source",

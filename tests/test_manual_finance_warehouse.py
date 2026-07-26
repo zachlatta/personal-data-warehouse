@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.postgres import POSTGRES_TABLES, PostgresWarehouse
-from personal_data_warehouse.relations import SOURCE_RAW_SCHEMAS, relation
+from personal_data_warehouse.relations import BASE_SCHEMAS, relation
 from personal_data_warehouse.schema import (
     MANUAL_FINANCE_DOCUMENT_COLUMNS,
     MANUAL_FINANCE_EXTRACTION_COLUMNS,
@@ -113,14 +113,14 @@ def _extraction_row(**overrides) -> dict:
 
 
 def test_manual_finance_relations_are_registered():
-    assert "manual_finance" in SOURCE_RAW_SCHEMAS
+    assert "base_manual_finance" in BASE_SCHEMAS
     assert (relation("manual_finance_documents").schema, relation("manual_finance_documents").name) == (
-        "manual_finance",
+        "base_manual_finance",
         "documents",
     )
     assert (relation("manual_finance_extractions").schema, relation("manual_finance_extractions").name) == (
-        "manual_finance",
-        "extractions",
+        "derived_finance",
+        "document_extractions",
     )
 
 
@@ -151,15 +151,13 @@ def test_ensure_manual_finance_tables_is_idempotent(warehouse):
         FROM information_schema.tables
         WHERE table_schema = ANY(%s) AND table_type = 'BASE TABLE'
         """,
-        (warehouse.physical_schema_names(include_private=True),),
+        (warehouse.physical_schema_names(include_hidden=True),),
     )
     tables = {(schema, table) for schema, table in rows}
-    manual_finance = warehouse.physical_schema_name("manual_finance")
-    assert (manual_finance, "documents") in tables
-    assert (manual_finance, "extractions") in tables
+    assert (warehouse.physical_schema_name("base_manual_finance"), "documents") in tables
+    assert (warehouse.physical_schema_name("derived_finance"), "document_extractions") in tables
     # The extraction candidate/retry queries must work on a fresh schema.
-    ai_processing = warehouse.physical_schema_name("ai_processing")
-    assert (ai_processing, "agent_runs") in tables
+    assert (warehouse.physical_schema_name("ops"), "ai_processing_agent_runs") in tables
 
 
 def test_extraction_money_is_numeric_and_periods_are_dates(warehouse):
@@ -168,9 +166,9 @@ def test_extraction_money_is_numeric_and_periods_are_dates(warehouse):
         """
         SELECT column_name, data_type
         FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = 'extractions'
+        WHERE table_schema = %s AND table_name = 'document_extractions'
         """,
-        (warehouse.physical_schema_name("manual_finance"),),
+        (warehouse.physical_schema_name("derived_finance"),),
     )
     types = dict(rows)
     assert types["closing_balance"] == "numeric"
@@ -187,7 +185,7 @@ def test_document_upsert_is_idempotent_by_provenance(warehouse):
     warehouse.insert_manual_finance_documents(
         [_document_row(original_path="statements/acme-checking-2026-06.pdf", sync_version=2)]
     )
-    rows = warehouse._query("SELECT original_path, sync_version FROM manual_finance_documents")
+    rows = warehouse._query("SELECT original_path, sync_version FROM @manual_finance_documents")
     assert rows == [("statements/acme-checking-2026-06.pdf", 2)]
 
 
@@ -198,7 +196,7 @@ def test_extraction_rows_round_trip(warehouse):
         """
         SELECT document_type, closing_balance, period_end,
                transactions_json -> 0 ->> 'description'
-        FROM manual_finance_extractions
+        FROM @manual_finance_extractions
         """
     )
     assert rows == [("bank_statement", Decimal("1234.56"), date(2026, 6, 30), "COFFEE")]
@@ -206,4 +204,4 @@ def test_extraction_rows_round_trip(warehouse):
     warehouse.insert_manual_finance_extractions(
         [_extraction_row(ai_prompt_version="manual-finance-agent-v2")]
     )
-    assert warehouse._query("SELECT count(*) FROM manual_finance_extractions") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM @manual_finance_extractions") == [(2,)]

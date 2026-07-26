@@ -242,7 +242,7 @@ def load_alice_gmail_transcript_emails(
             body_markdown_clean,
             body_text,
             body_html
-        FROM gmail_messages
+        FROM @gmail_messages
         WHERE is_deleted = 0
           AND account IN ({account_values})
           AND from_address = 'alice@aliceapp.ai'
@@ -312,7 +312,7 @@ def load_alice_gmail_attachments(
             size,
             content_sha256,
             part_json
-        FROM gmail_attachments
+        FROM @gmail_attachments
         WHERE is_deleted = 0
           AND ({' OR '.join(clauses)})
         ORDER BY internal_date, part_id, filename

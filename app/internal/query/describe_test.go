@@ -175,21 +175,39 @@ func TestDescribeTableKnownWrongNameIsRemapped(t *testing.T) {
 
 func TestDescribeTableWrongSchemaNamesTheRightOne(t *testing.T) {
 	runner := fakeRunner{results: map[string]RawResult{
-		relationsNamedSQL("messages"): {
+		relationsNamedSQL("widgets"): {
 			Columns: []string{"schema", "name"},
-			Rows:    []map[string]any{{"schema": "gmail", "name": "messages"}},
+			Rows:    []map[string]any{{"schema": "base_gmail", "name": "widgets"}},
 		},
-		relationsLikeSQL("%messages%"): {
+		relationsLikeSQL("%widgets%"): {
 			Columns: []string{"schema", "name"},
-			Rows:    []map[string]any{{"schema": "gmail", "name": "messages"}},
+			Rows:    []map[string]any{{"schema": "base_gmail", "name": "widgets"}},
 		},
 	}}
 	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
 
-	resp := svc.DescribeTable(context.Background(), "slack.messages")
+	resp := svc.DescribeTable(context.Background(), "base_slack.widgets")
 
-	if err := resp.Results[0].Error; !strings.Contains(err, "gmail.messages") {
+	if err := resp.Results[0].Error; !strings.Contains(err, "base_gmail.widgets") {
 		t.Fatalf("wrong schema should name where the table actually lives, got: %s", err)
+	}
+}
+
+// A pre-reorganization physical name is answered with its current location
+// rather than a guess, so a query written against the old layout self-corrects
+// in one step.
+func TestDescribeTablePreReorgNameNamesItsNewLocation(t *testing.T) {
+	svc := NewService(fakeRunner{results: map[string]RawResult{}}, Options{MaxRows: 5, MaxFieldChars: 100})
+	for old, want := range map[string]string{
+		"gmail.messages":          "base_gmail.messages",
+		"marts.finance_net_worth": "marts_finance.net_worth",
+		"photos.assets":           "derived_photos.assets",
+		"slack.sync_state":        "ops.slack_sync_state",
+	} {
+		resp := svc.DescribeTable(context.Background(), old)
+		if err := resp.Results[0].Error; !strings.Contains(err, want) {
+			t.Fatalf("describe_table(%q) should point at %s, got: %s", old, want, err)
+		}
 	}
 }
 
@@ -208,23 +226,23 @@ func TestDescribeTableRejectsBlankAndMalformedInput(t *testing.T) {
 // than claim zero rows.
 func TestDescribeTableOmitsRowCountForViews(t *testing.T) {
 	runner := fakeRunner{results: map[string]RawResult{
-		relationsNamedSQL("gmail_inbox"): {
+		relationsNamedSQL("gmail_threads"): {
 			Columns: []string{"schema", "name"},
-			Rows:    []map[string]any{{"schema": "marts", "name": "gmail_inbox"}},
+			Rows:    []map[string]any{{"schema": "marts_inbox", "name": "gmail_threads"}},
 		},
-		rowEstimateSQLFor("marts", "gmail_inbox"): {Columns: []string{"row_estimate"}},
-		indexSQLFor("marts", "gmail_inbox"):       {Columns: []string{"def", "flag"}},
-		describeColumnsSQL("marts", "gmail_inbox"): {
+		rowEstimateSQLFor("marts_inbox", "gmail_threads"): {Columns: []string{"row_estimate"}},
+		indexSQLFor("marts_inbox", "gmail_threads"):       {Columns: []string{"def", "flag"}},
+		describeColumnsSQL("marts_inbox", "gmail_threads"): {
 			Columns: []string{"name", "type"},
 			Rows:    []map[string]any{{"name": "thread_id", "type": "text"}},
 		},
 	}}
 	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
 
-	resp := svc.DescribeTable(context.Background(), "marts.gmail_inbox")
+	resp := svc.DescribeTable(context.Background(), "marts_inbox.gmail_threads")
 
 	csv := resp.Results[0].CSV
-	if !strings.Contains(csv, "# marts.gmail_inbox\n") {
+	if !strings.Contains(csv, "# marts_inbox.gmail_threads\n") {
 		t.Fatalf("view heading should carry no row estimate, got:\n%s", csv)
 	}
 	if strings.Contains(csv, "rows, estimated") {

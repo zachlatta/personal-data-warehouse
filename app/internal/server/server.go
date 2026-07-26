@@ -71,7 +71,7 @@ type queryStatementInput struct {
 type schemaOverviewInput struct{}
 
 type describeTableInput struct {
-	Relation string `json:"relation" jsonschema:"schema-qualified relation to describe, e.g. gmail.messages; a bare table name resolves when only one schema has it"`
+	Relation string `json:"relation" jsonschema:"schema-qualified relation to describe, e.g. base_gmail.messages; a bare table name resolves when only one schema has it"`
 }
 
 type getRowsInput struct {
@@ -123,7 +123,7 @@ const grepRowsDescription = "Regex-search a cached query result and return match
 
 const schemaOverviewDescription = "Required first call. Lists every relation in the warehouse with its row estimate, primary key, and primary time column, plus the search and layer conventions needed to write correct SQL. It deliberately does NOT list every column — call describe_table for that. Row estimates come from planner statistics, formatted as `(~N rows, estimated)`; use them for sizing decisions instead of running SELECT COUNT(*) over large tables."
 
-const describeTableDescription = "Return one relation's exact columns with their Postgres types, plus its indexes and row estimate. This is the authoritative column list: schema_overview intentionally omits columns, so call this for each relation you are about to reference instead of guessing column names. Accepts a schema-qualified name (gmail.messages) or a bare table name when only one schema has it, and names concrete candidates when the relation does not exist."
+const describeTableDescription = "Return one relation's exact columns with their Postgres types, plus its indexes and row estimate. This is the authoritative column list: schema_overview intentionally omits columns, so call this for each relation you are about to reference instead of guessing column names. Accepts a schema-qualified name (base_gmail.messages) or a bare table name when only one schema has it, and names concrete candidates when the relation does not exist."
 
 const sqlDescription = "Run a read-only Postgres SQL statement and return its full result, like a psql session. Skips the query cache, pagination, and field truncation that the MCP query tool applies. Refuses write SQL and caps the response at 1,000,000 rows. Each call must include question, a concise plain-English question this SQL statement is trying to answer, so server logs capture the caller's intent."
 

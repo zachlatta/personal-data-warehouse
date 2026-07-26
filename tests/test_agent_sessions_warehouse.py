@@ -90,7 +90,7 @@ def test_ensure_creates_table_and_view(warehouse) -> None:
     warehouse.ensure_agent_sessions_tables()
     # idempotent
     warehouse.ensure_agent_sessions_tables()
-    assert warehouse._relation_exists("agent_session_events")
+    assert warehouse._relation_exists("ai_conversation_events")
     assert warehouse._relation_exists("clean_agent_sessions")
 
 
@@ -98,7 +98,7 @@ def test_insert_upserts_by_primary_key(warehouse) -> None:
     warehouse.ensure_agent_sessions_tables()
     warehouse.insert_agent_session_events([_event_row(text="first", sync_version=1)])
     warehouse.insert_agent_session_events([_event_row(text="second", sync_version=2)])
-    rows = warehouse._query("SELECT text FROM agent_session_events WHERE event_uuid = 'evt-1'")
+    rows = warehouse._query("SELECT text FROM @ai_conversation_events WHERE event_uuid = 'evt-1'")
     assert rows == [("second",)]
 
 
@@ -143,7 +143,7 @@ def test_clean_agent_sessions_view_rolls_up_session(warehouse) -> None:
         SELECT title, cwd, git_branch, model, first_prompt, event_count,
                user_event_count, assistant_event_count, input_tokens, output_tokens,
                cache_read_tokens, cache_creation_tokens, started_at, ended_at
-        FROM clean_agent_sessions WHERE session_id = 'sess-1'
+        FROM @clean_agent_sessions WHERE session_id = 'sess-1'
         """
     )
     assert len(rows) == 1
@@ -219,7 +219,7 @@ def test_search_text_includes_agent_session_branches(warehouse) -> None:
     # no hits.
     warehouse._set_search_path()
     rows = warehouse._query(
-        "SELECT DISTINCT subsource FROM search_text('zanzibar', 50, ARRAY['agent_session']) "
+        "SELECT DISTINCT subsource FROM @search_text('zanzibar', 50, ARRAY['agent_session']) "
         "WHERE score < 0 ORDER BY subsource"
     )
     subsources = [r[0] for r in rows]
@@ -266,10 +266,10 @@ def test_runner_persists_into_warehouse_end_to_end(warehouse) -> None:
     ).sync()
     assert summary.events_written == 1
     rows = warehouse._query(
-        "SELECT text, role, cwd FROM agent_session_events WHERE session_id = 'sess-xyz'"
+        "SELECT text, role, cwd FROM @ai_conversation_events WHERE session_id = 'sess-xyz'"
     )
     assert rows == [("hello warehouse", "user", "/work")]
     view = warehouse._query(
-        "SELECT first_prompt, event_count FROM clean_agent_sessions WHERE session_id = 'sess-xyz'"
+        "SELECT first_prompt, event_count FROM @clean_agent_sessions WHERE session_id = 'sess-xyz'"
     )
     assert view == [("hello warehouse", 1)]

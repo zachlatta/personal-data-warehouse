@@ -15,7 +15,7 @@ from personal_data_warehouse.relations import (
     AI_EVENT_SOURCE_RELATIONS,
     CANONICAL_RELATIONS,
     physical_schema_names,
-    query_relation,
+    relation,
 )
 from personal_data_warehouse.timeline import (
     RAW_DDL_TABLES,
@@ -69,6 +69,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_plaid_tables()
     wh.ensure_finance_tables()
     wh.ensure_manual_finance_tables()
+    wh.ensure_receipt_tables()
     wh.ensure_timeline_tables()
 
 
@@ -85,7 +86,7 @@ def test_every_registered_table_is_classified():
 def test_adapter_source_tables_are_classified_as_events():
     adapter_tables: set[str] = set()
     for adapter in TIMELINE_ADAPTERS:
-        if adapter.source_table == "agent_session_events":
+        if adapter.source_table == "ai_conversation_events":
             adapter_tables.update(AI_EVENT_SOURCE_RELATIONS.values())
         else:
             adapter_tables.add(adapter.source_table)
@@ -208,15 +209,15 @@ def test_apple_message_contact_changes_invalidate_message_history():
 
 
 def test_upsert_sql_bumps_seq_only_on_content_change():
-    sql = timeline_upsert_sql()
+    sql = timeline_upsert_sql(table_ref='"timeline"."events"', sequence_ref='"timeline"."events_seq"')
     assert "ON CONFLICT (adapter, event_id) DO UPDATE" in sql
-    assert "seq = nextval('timeline_events_seq')" in sql
+    assert "seq = nextval('\"timeline\".\"events_seq\"')" in sql
     assert "IS DISTINCT FROM" in sql
     # A re-sync that only refreshes the source's ingestion timestamp must not
     # count as a content change, or every re-synced row looks new to
     # arrival-order consumers.
     guard = sql.split("WHERE", 1)[1]
-    assert "timeline_events.ingest_ts" not in guard
+    assert "ingest_ts = EXCLUDED.ingest_ts" not in guard
 
 
 def test_timeline_indexes_are_registered_for_timeline_tables():
@@ -245,7 +246,7 @@ def test_live_schema_has_no_unclassified_tables(warehouse):
         FROM information_schema.tables
         WHERE table_schema = ANY(%s) AND table_type = 'BASE TABLE'
         """,
-        (warehouse.physical_schema_names(include_private=True),),
+        (warehouse.physical_schema_names(include_hidden=True),),
     )
     physical_to_logical = {
         (rel.with_namespace(warehouse.schema_namespace).schema, rel.name): logical
@@ -269,7 +270,7 @@ def test_live_schema_has_no_unclassified_tables(warehouse):
     stale = {
         logical
         for physical, logical in expected_physical.items()
-        if physical not in live_physical and logical != "agent_session_events"
+        if physical not in live_physical
     }
     assert stale == set(), f"classified tables missing from the live schema: {sorted(stale)}"
 
@@ -296,142 +297,24 @@ def test_ensure_timeline_tables_is_idempotent_and_indexed(warehouse):
     )[0]
     assert col == ("USER-DEFINED", "timeline_priority")
     warehouse._command(
-        "INSERT INTO timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
+        "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
         "VALUES ('t', 'ep', 's', 'k', now(), 'x', 'self')"
     )
     assert warehouse._query(
-        "SELECT priority FROM timeline_events WHERE event_id = 'ep'"
+        "SELECT priority FROM @timeline_events WHERE event_id = 'ep'"
     )[0][0] == "self"
     with pytest.raises(Exception):
         warehouse._command(
-            "INSERT INTO timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
+            "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
             "VALUES ('t', 'ebad', 's', 'k', now(), 'x', 'not-a-tier')"
         )
     # seq must be sequence-backed so upserts can bump it.
     warehouse._command(
-        "INSERT INTO timeline_events (adapter, event_id, source, kind, event_ts, source_table) "
+        "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table) "
         "VALUES ('t', 'e1', 's', 'k', now(), 'x'), ('t', 'e2', 's', 'k', now(), 'x')"
     )
-    seqs = [row[0] for row in warehouse._query("SELECT seq FROM timeline_events ORDER BY event_id")]
+    seqs = [row[0] for row in warehouse._query("SELECT seq FROM @timeline_events ORDER BY event_id")]
     assert seqs[0] != seqs[1]
-
-
-def _seed_legacy_bigint_timeline(warehouse) -> dict[str, int]:
-    """Build a pre-enum timeline_events: bare bigint priority (0 = unclassified,
-    1..5 = tiers), its default, and the index that rides it."""
-    warehouse._ensure_timeline_priority_type()
-    warehouse._command(
-        "CREATE TABLE timeline_events ("
-        " adapter text NOT NULL, event_id text NOT NULL,"
-        " priority bigint NOT NULL DEFAULT 0,"
-        " event_ts timestamptz NOT NULL DEFAULT now(),"
-        " seq bigint NOT NULL DEFAULT 0,"
-        " PRIMARY KEY (adapter, event_id))"
-    )
-    warehouse._command(
-        "CREATE INDEX timeline_events_priority_time_idx "
-        "ON timeline_events (priority, event_ts DESC, seq DESC)"
-    )
-    seeded = {"e0": 0, "e1": 1, "e2": 2, "e3": 3, "e4": 4, "e5": 5}
-    for event_id, pri in seeded.items():
-        warehouse._command(
-            "INSERT INTO timeline_events (adapter, event_id, priority) VALUES ('a', %s, %s)",
-            (event_id, pri),
-        )
-    return seeded
-
-
-def test_priority_bigint_column_migrates_to_enum(warehouse):
-    """A legacy (pre-enum) bigint priority column is rewritten in place to the
-    timeline_priority enum: every tier maps to its label, the column default
-    becomes the enum's, the index that rides priority survives typed as the
-    enum, and a second call is a no-op."""
-    rel = query_relation("timeline_events").with_namespace(warehouse._schema)
-    _seed_legacy_bigint_timeline(warehouse)
-
-    warehouse._migrate_timeline_priority_to_enum(rel)
-
-    col = warehouse._query(
-        """
-        SELECT data_type, udt_name, column_default FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = %s AND column_name = 'priority'
-        """,
-        (rel.schema, rel.name),
-    )[0]
-    assert col[:2] == ("USER-DEFINED", "timeline_priority")
-    # The bigint default (0) cannot be cast to the enum, so the rewrite has to
-    # drop it and set the enum's own default in the same statement.
-    assert col[2].startswith("'unclassified'")
-    # Every legacy tier mapped to its label (0 -> unclassified).
-    mapped = {
-        row[0]: row[1]
-        for row in warehouse._query("SELECT event_id, priority::text FROM timeline_events")
-    }
-    assert mapped == {
-        "e0": "unclassified", "e1": "self", "e2": "direct",
-        "e3": "cc", "e4": "noise", "e5": "background",
-    }
-    # The rewrite rebuilds every index on the table; the one that leads with
-    # priority keeps its name and is now typed as the enum.
-    assert warehouse._query(
-        """
-        SELECT 1 FROM pg_index i
-        JOIN pg_class c ON c.oid = i.indexrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
-        JOIN pg_type t ON t.oid = a.atttypid
-        WHERE n.nspname = %s AND c.relname = 'timeline_events_priority_time_idx'
-          AND t.typname = 'timeline_priority' AND t.typtype = 'e'
-        """,
-        (rel.schema,),
-    )
-    # Idempotent: the already-migrated path returns immediately and changes nothing.
-    warehouse._migrate_timeline_priority_to_enum(rel)
-    mapped_again = {
-        row[0]: row[1]
-        for row in warehouse._query("SELECT event_id, priority::text FROM timeline_events")
-    }
-    assert mapped_again == mapped
-
-
-def test_priority_migration_rewrites_once_under_an_advisory_lock(warehouse):
-    """The rewrite is one ALTER holding one advisory lock, and a migrated table
-    never even takes the lock.
-
-    Both properties are load-bearing on a large timeline: the rewrite takes
-    ACCESS EXCLUSIVE for its whole duration, so two Dagster processes booting
-    together must not each queue up and rewrite the table in turn (they did,
-    the first time this migration was attempted in production), and the
-    steady-state boot path must not serialize on a lock it has no work for.
-    """
-    rel = query_relation("timeline_events").with_namespace(warehouse._schema)
-    _seed_legacy_bigint_timeline(warehouse)
-
-    issued: list[str] = []
-    real_command = warehouse._command
-
-    def recording_command(sql, params=None):
-        issued.append(" ".join(sql.split()))
-        return real_command(sql, params)
-
-    warehouse._command = recording_command  # type: ignore[method-assign]
-    try:
-        warehouse._migrate_timeline_priority_to_enum(rel)
-        first_pass = list(issued)
-        issued.clear()
-        warehouse._migrate_timeline_priority_to_enum(rel)
-        second_pass = list(issued)
-    finally:
-        del warehouse._command
-
-    locks = [sql for sql in first_pass if "advisory" in sql]
-    alters = [sql for sql in first_pass if sql.startswith("ALTER TABLE")]
-    assert len(locks) == 2 and "pg_advisory_lock" in locks[0] and "pg_advisory_unlock" in locks[1]
-    # One statement, not a staged column plus a batched UPDATE walk: the single
-    # rewrite is the least I/O the type change can cost.
-    assert len(alters) == 1, alters
-    assert first_pass.index(locks[0]) < first_pass.index(alters[0]) < first_pass.index(locks[1])
-    assert second_pass == []
 
 
 def test_adapter_queries_run_against_the_real_schema(warehouse):
@@ -489,7 +372,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     """A little bit of everything, with distinct event times."""
     wh._command(
         """
-        INSERT INTO gmail_messages (account, message_id, thread_id, internal_date, subject,
+        INSERT INTO @gmail_messages (account, message_id, thread_id, internal_date, subject,
                                     from_address, to_addresses, snippet, synced_at)
         VALUES ('z@x.test', 'm1', 'th1', %s, 'Hello world', 'alice@example.test',
                 %s, 'hi there', %s)
@@ -498,25 +381,25 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO slack_users (account, team_id, user_id, display_name)
+        INSERT INTO @slack_users (account, team_id, user_id, display_name)
         VALUES ('z', 'T1', 'U1', 'alice')
         """
     )
     wh._command(
         """
-        INSERT INTO slack_account_identities (account, team_id, user_id)
+        INSERT INTO @slack_account_identities (account, team_id, user_id)
         VALUES ('z', 'T1', 'UME')
         """
     )
     wh._command(
         """
-        INSERT INTO slack_conversations (account, team_id, conversation_id, name, is_member)
+        INSERT INTO @slack_conversations (account, team_id, conversation_id, name, is_member)
         VALUES ('z', 'T1', 'C1', 'general', 1)
         """
     )
     wh._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                     message_datetime, user_id, text, synced_at)
         VALUES ('z', 'T1', 'C1', '1000.1', %s, 'U1', 'slack says hi', %s)
         """,
@@ -524,7 +407,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO slack_files (account, team_id, file_id, conversation_id, message_ts,
+        INSERT INTO @slack_files (account, team_id, file_id, conversation_id, message_ts,
                                  user_id, created_at, name, title, mimetype, synced_at)
         VALUES ('z', 'T1', 'F1', 'C1', '1000.1', 'U1', %s, 'notes.pdf', '', 'application/pdf', %s)
         """,
@@ -532,26 +415,26 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO apple_message_handles (account, handle_id, address)
+        INSERT INTO @apple_message_handles (account, handle_id, address)
         VALUES ('z@x.test', 'h1', '+15551234567')
         """
     )
     wh._command(
         """
-        INSERT INTO apple_message_chats (account, chat_id, display_name)
+        INSERT INTO @apple_message_chats (account, chat_id, display_name)
         VALUES ('z@x.test', 'c1', 'Family')
         """
     )
     wh._command(
         """
-        INSERT INTO apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
+        INSERT INTO @apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
         VALUES ('z@x.test', 'c1', 'am1', %s, %s)
         """,
         (_NOW - timedelta(hours=4), _NOW),
     )
     wh._command(
         """
-        INSERT INTO apple_messages (account, message_id, handle_id, body_text, message_at,
+        INSERT INTO @apple_messages (account, message_id, handle_id, body_text, message_at,
                                     is_from_me, ingested_at)
         VALUES ('z@x.test', 'am1', 'h1', 'imessage body', %s, 0, %s)
         """,
@@ -561,14 +444,14 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     # than a one-way broadcast.
     wh._command(
         """
-        INSERT INTO apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
+        INSERT INTO @apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
         VALUES ('z@x.test', 'c1', 'am0', %s, %s)
         """,
         (_NOW - timedelta(hours=3), _NOW),
     )
     wh._command(
         """
-        INSERT INTO apple_messages (account, message_id, handle_id, body_text, message_at,
+        INSERT INTO @apple_messages (account, message_id, handle_id, body_text, message_at,
                                     is_from_me, ingested_at)
         VALUES ('z@x.test', 'am0', '', 'sounds good!', %s, 1, %s)
         """,
@@ -576,13 +459,13 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO whatsapp_chats (account, chat_id, name)
+        INSERT INTO @whatsapp_chats (account, chat_id, name)
         VALUES ('z@x.test', 'chat@g.us', 'The Group')
         """
     )
     wh._command(
         """
-        INSERT INTO whatsapp_messages (account, chat_id, message_id, sender_jid, push_name,
+        INSERT INTO @whatsapp_messages (account, chat_id, message_id, sender_jid, push_name,
                                        body_text, message_at, is_from_me, ingested_at)
         VALUES ('z@x.test', 'chat@g.us', 'wm1', 'p@s.whatsapp.net', 'bob',
                 'whatsapp body', %s, 0, %s)
@@ -592,7 +475,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     for seq, (role, text) in enumerate([("user", "fix the bug"), ("assistant", "done")]):
         wh._command(
             """
-            INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+            INSERT INTO @claude_code_events (source, session_id, event_uuid, seq, occurred_at,
                                               role, text, session_title, cwd, device, ingested_at)
             VALUES ('claude_code', 'sess1', %s, %s, %s, %s, %s, 'Fix the bug', '/repo', 'porygon', %s)
             """,
@@ -600,7 +483,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
         )
     wh._command(
         """
-        INSERT INTO apple_note_revisions (account, note_id, revision_id, title, body_text,
+        INSERT INTO @apple_note_revisions (account, note_id, revision_id, title, body_text,
                                           folder_path, modified_at, ingested_at)
         VALUES ('z@x.test', 'n1', 'r1', 'Groceries', 'milk, eggs', 'Notes', %s, %s)
         """,
@@ -608,14 +491,14 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO apple_voice_memos_files (account, recording_id, title, filename, recorded_at, ingested_at)
+        INSERT INTO @apple_voice_memos_files (account, recording_id, title, filename, recorded_at, ingested_at)
         VALUES ('z@x.test', 'rec1', 'Standup', 'standup.m4a', %s, %s)
         """,
         (_NOW - timedelta(hours=8), _NOW),
     )
     wh._command(
         """
-        INSERT INTO apple_voice_memos_enrichments (account, recording_id, provider, model,
+        INSERT INTO @apple_voice_memos_enrichments (account, recording_id, provider, model,
                                                    prompt_version, title, summary, created_at)
         VALUES ('z@x.test', 'rec1', 'p', 'm', 'v1', 'Standup notes', 'we discussed things', %s)
         """,
@@ -623,7 +506,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO alice_voice_recordings (account, recording_id, title, filename,
+        INSERT INTO @alice_voice_recordings (account, recording_id, title, filename,
                                             content_type, recorded_at, duration_seconds, ingested_at)
         VALUES ('z@x.test', 'alice-rec1', 'Alice walk', 'alice-walk.m4a',
                 'audio/mp4', %s, 321, %s)
@@ -632,7 +515,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO calendar_events (account, calendar_id, event_id, summary, description,
+        INSERT INTO @calendar_events (account, calendar_id, event_id, summary, description,
                                      organizer_email, start_at, end_at, updated_at, synced_at)
         VALUES ('z@x.test', 'cal1', 'ev1', 'Team sync', 'weekly', 'z@x.test', %s, %s, %s, %s)
         """,
@@ -640,7 +523,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO google_drive_files (account, file_id, name, mime_type, folder_path,
+        INSERT INTO @google_drive_files (account, file_id, name, mime_type, folder_path,
                                         last_modifying_user, modified_time, ingested_at)
         VALUES ('z@x.test', 'f1', 'Design doc', 'application/vnd.google-apps.document',
                 'My Drive', 'zach', %s, %s)
@@ -649,7 +532,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO contact_cards (source, account, source_kind, address_book_id, card_id,
+        INSERT INTO @contact_cards (source, account, source_kind, address_book_id, card_id,
                                    display_name, organization, source_updated_at, synced_at)
         VALUES ('google', 'z@x.test', 'personal', 'ab1', 'card1', 'Ada Example', 'Example Engines',
                 %s, %s)
@@ -658,7 +541,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO photo_assets (photo_id, account, kind, capture_ts, camera_make, camera_model,
+        INSERT INTO @photo_assets (photo_id, account, kind, capture_ts, camera_make, camera_model,
                                   width, height, best_file_sha256, best_file_mime_type,
                                   best_file_filename, thumbnail_content_sha256,
                                   thumbnail_content_type, thumbnail_storage_file_id,
@@ -671,7 +554,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO photo_asset_files (source, account, source_native_id, role, content_sha256,
+        INSERT INTO @photo_asset_files (source, account, source_native_id, role, content_sha256,
                                        photo_id, match_method, created_at)
         VALUES ('apple_photos', 'z@x.test', 'UUID-1', 'original', 'stillsha', 'ph1', 'new', %s)
         """,
@@ -679,7 +562,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO file_attachment_enrichments (content_sha256, ai_provider, ai_model,
+        INSERT INTO @file_attachment_enrichments (content_sha256, ai_provider, ai_model,
                                                  ai_prompt_version, text, updated_at)
         VALUES ('thumbsha', 'agent_codex', 'm', 'photo-agent-v1',
                 'A golden retriever on a beach at sunset', %s)
@@ -688,7 +571,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO upstream_mutations (id, provider, operation, status, title, reason,
+        INSERT INTO @upstream_mutations (id, provider, operation, status, title, reason,
                                         requested_by, executed_at, created_at, updated_at)
         VALUES ('mut1', 'slack', 'chat.postMessage', 'executed', 'Send standup reminder',
                 'weekly reminder', 'assistant', %s, %s, %s)
@@ -697,7 +580,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO upstream_mutation_requests (id, status, title, reason, requested_by,
+        INSERT INTO @upstream_mutation_requests (id, status, title, reason, requested_by,
                                                 created_at, updated_at)
         VALUES ('req1', 'approved', 'Standup reminders', 'requested by zach', 'assistant', %s, %s)
         """,
@@ -705,7 +588,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO agent_runs (run_id, provider, model, task_type, subject_id, status,
+        INSERT INTO @agent_runs (run_id, provider, model, task_type, subject_id, status,
                                 started_at, completed_at)
         VALUES ('run1', 'codex', 'gpt-5', 'attachment_enrichment', 'sha1', 'ok', %s, %s)
         """,
@@ -714,7 +597,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     sync_version = int(_NOW.timestamp() * 1_000_000)
     wh._command(
         """
-        INSERT INTO finance_accounts (account_id, account, name, kind, side, currency,
+        INSERT INTO @finance_accounts (account_id, account, name, kind, side, currency,
                                       institution, created_at, updated_at, sync_version)
         VALUES ('fa1', 'z@x.test', 'Checking', 'checking', 'asset', 'USD',
                 'Example Bank', %s, %s, %s)
@@ -723,7 +606,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO finance_transactions (transaction_id, account_id, posted_at, amount,
+        INSERT INTO @finance_transactions (transaction_id, account_id, posted_at, amount,
                                           currency, description, merchant, pending, source,
                                           created_at, sync_version)
         VALUES ('ft1', 'fa1', %s, -12.34, 'USD', 'Lunch', 'Cafe', 0, 'plaid', %s, %s)
@@ -732,7 +615,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO finance_observations (account_id, as_of, kind, value, currency,
+        INSERT INTO @finance_observations (account_id, as_of, kind, value, currency,
                                           source, observed_at, sync_version)
         VALUES ('fa1', '2026-05-31', 'balance', 1234.56, 'USD', 'plaid', %s, %s)
         """,
@@ -740,7 +623,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO manual_finance_documents (source, account, source_native_id, filename,
+        INSERT INTO @manual_finance_documents (source, account, source_native_id, filename,
                                               original_path, mime_type, content_sha256,
                                               file_modified_at, ingested_at, sync_version)
         VALUES ('manual', 'z@x.test', 'docsha', 'statement.pdf', 'Bank/Checking',
@@ -750,7 +633,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO manual_finance_extractions (content_sha256, ai_provider, ai_model,
+        INSERT INTO @manual_finance_extractions (content_sha256, ai_provider, ai_model,
                                                 ai_prompt_version, status, institution,
                                                 period_end, summary, created_at, sync_version)
         VALUES ('docsha', 'agent_codex', 'm', 'v1', 'completed', 'Example Bank',
@@ -826,7 +709,7 @@ def test_backfill_normalizes_every_source(warehouse):
         assert by_adapter[adapter].backfill_done, adapter
 
     rows = warehouse._query_dicts(
-        "SELECT * FROM timeline_events ORDER BY event_ts DESC"
+        "SELECT * FROM @timeline_events ORDER BY event_ts DESC"
     )
     assert len(rows) == sum(EXPECTED_SEEDED_EVENTS.values())
     # Newest first: gmail (NOW-1h); finance observations include older days.
@@ -914,7 +797,7 @@ def test_backfill_normalizes_every_source(warehouse):
     finally:
         engine2.close()
     assert all(s.backfill_rows == 0 and s.incremental_rows == 0 for s in stats2)
-    rows_after = warehouse._query_dicts("SELECT event_id, seq FROM timeline_events")
+    rows_after = warehouse._query_dicts("SELECT event_id, seq FROM @timeline_events")
     assert {r["event_id"]: r["seq"] for r in rows_after} == seqs_before
 
 
@@ -924,7 +807,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     # My own slack message -> self.
     warehouse._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                     message_datetime, user_id, text, synced_at)
         VALUES ('z', 'T1', 'C1', '3000.1', %s, 'UME', 'shipping it', %s)
         """,
@@ -933,7 +816,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     # A mention of me in a member channel -> direct.
     warehouse._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                     message_datetime, user_id, text, synced_at)
         VALUES ('z', 'T1', 'C1', '3000.2', %s, 'U1', 'hey <@UME> take a look', %s)
         """,
@@ -942,13 +825,13 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     # A DM from a real person -> direct.
     warehouse._command(
         """
-        INSERT INTO slack_conversations (account, team_id, conversation_id, is_im)
+        INSERT INTO @slack_conversations (account, team_id, conversation_id, is_im)
         VALUES ('z', 'T1', 'D1', 1)
         """
     )
     warehouse._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                     message_datetime, user_id, text, synced_at)
         VALUES ('z', 'T1', 'D1', '3000.3', %s, 'U1', 'lunch?', %s)
         """,
@@ -957,7 +840,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     # A bot post in the member channel -> noise.
     warehouse._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                     message_datetime, user_id, bot_id, text, synced_at)
         VALUES ('z', 'T1', 'C1', '3000.4', %s, '', 'B1', 'deploy finished', %s)
         """,
@@ -966,7 +849,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     # A promo email addressed directly to me is still bulk -> noise.
     warehouse._command(
         """
-        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+        INSERT INTO @gmail_messages (account, message_id, internal_date, subject, from_address,
                                     to_addresses, label_ids, synced_at)
         VALUES ('z@x.test', 'm-promo', %s, 'SALE', 'deals@shop.example',
                 %s, %s, %s)
@@ -976,7 +859,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     # A reply by someone else in a thread I participated in -> direct.
     warehouse._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts, thread_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts, thread_ts,
                                     message_datetime, user_id, text, synced_at)
         VALUES ('z', 'T1', 'C1', '4000.1', '4000.1', %s, 'UME', 'starting a thread', %s),
                ('z', 'T1', 'C1', '4000.2', '4000.1', %s, 'U1', 'replying to zach', %s)
@@ -987,7 +870,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     # someone else -> direct.
     warehouse._command(
         """
-        INSERT INTO google_drive_files (account, file_id, name, owners_json,
+        INSERT INTO @google_drive_files (account, file_id, name, owners_json,
                                         last_modifying_user, modified_time, ingested_at)
         VALUES ('z@x.test', 'f-mine', 'journal.txt',
                 '[{"displayName": "Zach Latta", "emailAddress": "z@x.test"}]'::jsonb,
@@ -1002,7 +885,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     # senders -> cc tier; both even when addressed straight to me.
     warehouse._command(
         """
-        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+        INSERT INTO @gmail_messages (account, message_id, internal_date, subject, from_address,
                                     to_addresses, synced_at)
         VALUES ('z@x.test', 'm-noreply', %s, 'Weekly digest', 'noreply@service.example', %s, %s),
                ('z@x.test', 'm-notify', %s, 'Receipt attached', 'receipts@service.example', %s, %s)
@@ -1011,7 +894,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     )
     warehouse._command(
         """
-        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+        INSERT INTO @gmail_messages (account, message_id, internal_date, subject, from_address,
                                     to_addresses, label_ids, synced_at)
         VALUES ('z@x.test', 'm-starred', %s, 'Contract', 'lawyer@firm.example', %s, %s, %s)
         """,
@@ -1020,13 +903,13 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     # A business/RCS sender (not a phone number, not an email) -> noise.
     warehouse._command(
         """
-        INSERT INTO apple_message_handles (account, handle_id, address)
+        INSERT INTO @apple_message_handles (account, handle_id, address)
         VALUES ('z@x.test', 'h-biz', 'some_airline_dsqx1')
         """
     )
     warehouse._command(
         """
-        INSERT INTO apple_messages (account, message_id, handle_id, body_text, message_at,
+        INSERT INTO @apple_messages (account, message_id, handle_id, body_text, message_at,
                                     is_from_me, ingested_at)
         VALUES ('z@x.test', 'am-biz', 'h-biz', 'Your flight changed', %s, 0, %s)
         """,
@@ -1035,7 +918,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     # The warehouse's own excluded Drive storage blobs -> background.
     warehouse._command(
         """
-        INSERT INTO google_drive_files (account, file_id, name, is_excluded, modified_time, ingested_at)
+        INSERT INTO @google_drive_files (account, file_id, name, is_excluded, modified_time, ingested_at)
         VALUES ('z@x.test', 'f-excluded', 'blob-shard.bin', 1, %s, %s)
         """,
         (_NOW, _NOW),
@@ -1044,7 +927,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     for seq, (role, text) in enumerate([("user", "[cron:abc123 Monitor things] Run checks"), ("assistant", "ok")]):
         warehouse._command(
             """
-            INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+            INSERT INTO @openclaw_events (source, session_id, event_uuid, seq, occurred_at,
                                               role, text, ingested_at)
             VALUES ('openclaw', 'cron-sess', %s, %s, %s, %s, %s, %s)
             """,
@@ -1059,7 +942,7 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
 
     def priority_of(event_id: str) -> str:
         return warehouse._query(
-            "SELECT priority FROM timeline_events WHERE event_id = %s", (event_id,)
+            "SELECT priority FROM @timeline_events WHERE event_id = %s", (event_id,)
         )[0][0]
 
     assert priority_of("z|T1|C1|3000.1") == "self", "my own message is self-priority"
@@ -1089,7 +972,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # --- slack: engagement windows, name mentions, group DMs ----------------
     warehouse._command(
         """
-        INSERT INTO slack_conversations (account, team_id, conversation_id, name, is_member,
+        INSERT INTO @slack_conversations (account, team_id, conversation_id, name, is_member,
                                          num_members, is_mpim, is_private)
         VALUES ('z', 'T1', 'CBIG', 'lounge', 1, 40000, 0, 0),
                ('z', 'T1', 'G1', 'mpdm-group', 1, 7, 1, 0),
@@ -1100,7 +983,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # conversation he is in; a single drive-by post in #lounge is not.
     warehouse._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                     message_datetime, user_id, text, synced_at)
         VALUES ('z', 'T1', 'C1', '5000.1', %s, 'UME', 'working on it', %s),
                ('z', 'T1', 'C1', '5000.2', %s, 'UME', 'done', %s),
@@ -1125,7 +1008,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # A legacy integration posting with a username and no user account.
     warehouse._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                     message_datetime, user_id, username, text, synced_at)
         VALUES ('z', 'T1', 'C1', '5000.9', %s, '', 'streambot', 'streaming activity', %s)
         """,
@@ -1145,7 +1028,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     for row in merge_rows:
         warehouse._command(
             """
-            INSERT INTO gmail_messages (account, message_id, thread_id, internal_date,
+            INSERT INTO @gmail_messages (account, message_id, thread_id, internal_date,
                                         subject, from_address, to_addresses, synced_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
@@ -1154,7 +1037,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # A personal reply in a thread someone else wrote in first stays his.
     warehouse._command(
         """
-        INSERT INTO gmail_messages (account, message_id, thread_id, internal_date,
+        INSERT INTO @gmail_messages (account, message_id, thread_id, internal_date,
                                     subject, from_address, to_addresses, synced_at)
         VALUES ('z@x.test', 'inbound-1', 'mth-5', %s, 'Re: join the program?',
                 'school5@example.test', %s, %s),
@@ -1169,7 +1052,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # Human mail he answered within 48h -> attention, even unaddressed.
     warehouse._command(
         """
-        INSERT INTO gmail_messages (account, message_id, thread_id, internal_date,
+        INSERT INTO @gmail_messages (account, message_id, thread_id, internal_date,
                                     subject, from_address, to_addresses, synced_at)
         VALUES ('z@x.test', 'm-replied', 'th-conv', %s, 'quick question',
                 'friend@example.test', %s, %s),
@@ -1185,7 +1068,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # a plain relayed comment is cc.
     warehouse._command(
         """
-        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+        INSERT INTO @gmail_messages (account, message_id, internal_date, subject, from_address,
                                     to_addresses, cc_addresses, snippet, synced_at)
         VALUES ('z@x.test', 'gh-mention', %s, 'Re: [org/repo] fix (PR #1)',
                 'notifications@github.com', %s, %s, 'someone: @zach take a look', %s),
@@ -1203,7 +1086,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     )
     warehouse._command(
         """
-        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+        INSERT INTO @gmail_messages (account, message_id, internal_date, subject, from_address,
                                     to_addresses, synced_at)
         VALUES ('z@x.test', 'm-otp', %s, 'Your login code: 123-456', 'human.sounding@bank.example', %s, %s),
                ('z@x.test', 'm-confirm-code', %s, '123456 is your confirmation code', 'human.sounding@example.test', %s, %s),
@@ -1220,7 +1103,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # A known correspondent whose mail Gmail mis-categorized as bulk.
     warehouse._command(
         """
-        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+        INSERT INTO @gmail_messages (account, message_id, internal_date, subject, from_address,
                                     to_addresses, label_ids, synced_at)
         VALUES ('z@x.test', 'm-corr', %s, 'travel receipts', 'friend@example.test', %s,
                 %s, %s)
@@ -1229,7 +1112,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     )
     warehouse._command(
         """
-        INSERT INTO timeline_gmail_correspondents (addr, n_sent_to, last_sent_at, refreshed_at)
+        INSERT INTO @timeline_gmail_correspondents (addr, n_sent_to, last_sent_at, refreshed_at)
         VALUES ('friend@example.test', 12, %s, now())
         """,
         (_NOW,),
@@ -1239,7 +1122,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # digest/newsletter/list-announcement shapes are noise.
     warehouse._command(
         """
-        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+        INSERT INTO @gmail_messages (account, message_id, internal_date, subject, from_address,
                                     to_addresses, label_ids, snippet, synced_at)
         VALUES ('z@x.test', 'm-forum-human', %s, 'WFH today', 'teammate@example.test', %s,
                 %s, 'Hi, I will be working from home today. -- You received this message because you are subscribed.', %s),
@@ -1288,7 +1171,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # --- apple: one-way broadcasts, toll-free, shortcode groups, windows ----
     warehouse._command(
         """
-        INSERT INTO apple_message_handles (account, handle_id, address)
+        INSERT INTO @apple_message_handles (account, handle_id, address)
         VALUES ('z@x.test', 'h-oneway', '+15559990000'),
                ('z@x.test', 'h-tollfree', '+18335551234'),
                ('z@x.test', 'h-group', '+15558887777')
@@ -1296,7 +1179,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     )
     warehouse._command(
         """
-        INSERT INTO apple_message_chats (account, chat_id, display_name, style)
+        INSERT INTO @apple_message_chats (account, chat_id, display_name, style)
         VALUES ('z@x.test', 'c-oneway', '', 45),
                ('z@x.test', 'c-shortcode', '56789', 43),
                ('z@x.test', 'c-biggroup', 'Trip Crew', 43)
@@ -1310,14 +1193,14 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     ):
         warehouse._command(
             """
-            INSERT INTO apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
+            INSERT INTO @apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
             VALUES ('z@x.test', %s, %s, %s, %s)
             """,
             (chat_id, mid, _NOW - timedelta(days=offset), _NOW),
         )
         warehouse._command(
             """
-            INSERT INTO apple_messages (account, message_id, handle_id, body_text, message_at,
+            INSERT INTO @apple_messages (account, message_id, handle_id, body_text, message_at,
                                         is_from_me, ingested_at)
             VALUES ('z@x.test', %s, %s, 'hello', %s, 0, %s)
             """,
@@ -1329,21 +1212,21 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     for i in range(11):
         warehouse._command(
             """
-            INSERT INTO apple_message_chat_handles (account, chat_id, handle_id)
+            INSERT INTO @apple_message_chat_handles (account, chat_id, handle_id)
             VALUES ('z@x.test', 'c-biggroup', %s)
             """,
             (f"h-g{i}",),
         )
     warehouse._command(
         """
-        INSERT INTO apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
+        INSERT INTO @apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
         VALUES ('z@x.test', 'c-biggroup', 'am-group-mine', %s, %s)
         """,
         (_NOW - timedelta(hours=2), _NOW),
     )
     warehouse._command(
         """
-        INSERT INTO apple_messages (account, message_id, handle_id, body_text, message_at,
+        INSERT INTO @apple_messages (account, message_id, handle_id, body_text, message_at,
                                     is_from_me, ingested_at)
         VALUES ('z@x.test', 'am-group-mine', '', 'on my way', %s, 1, %s)
         """,
@@ -1353,13 +1236,13 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # --- whatsapp: business senders and E2E stubs ----------------------------
     warehouse._command(
         """
-        INSERT INTO whatsapp_contacts (account, jid, push_name, business_name)
+        INSERT INTO @whatsapp_contacts (account, jid, push_name, business_name)
         VALUES ('z@x.test', 'agent@lid', 'Agent', 'Agent Service')
         """
     )
     warehouse._command(
         """
-        INSERT INTO whatsapp_messages (account, chat_id, message_id, sender_jid, push_name,
+        INSERT INTO @whatsapp_messages (account, chat_id, message_id, sender_jid, push_name,
                                        body_text, message_at, is_from_me, ingested_at)
         VALUES ('z@x.test', 'agent@lid', 'wm-agent', 'agent@lid', 'Agent',
                 'task finished', %s, 0, %s),
@@ -1375,10 +1258,12 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
         ("desktop-conv", "", []),
     ):
         source = "claude_desktop" if sess == "desktop-conv" else "claude_code"
+        # Writes go to the source-owned raw table; the unified view is read-only.
+        events_table = f"@{source}_events"
         if not rows:
             warehouse._command(
-                """
-                INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+                f"""
+                INSERT INTO {events_table} (source, session_id, event_uuid, seq, occurred_at,
                                                   role, event_type, session_title, entrypoint, ingested_at)
                 VALUES (%s, %s, 'meta0', 0, %s, 'meta', 'conversation', 'A titled conversation', %s, %s)
                 """,
@@ -1386,8 +1271,8 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
             )
         for seq, (role, text) in enumerate(rows):
             warehouse._command(
-                """
-                INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+                f"""
+                INSERT INTO {events_table} (source, session_id, event_uuid, seq, occurred_at,
                                                   role, text, entrypoint, ingested_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
@@ -1399,7 +1284,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     ):
         warehouse._command(
             """
-            INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+            INSERT INTO @claude_code_events (source, session_id, event_uuid, seq, occurred_at,
                                               role, text, is_sidechain, ingested_at)
             VALUES ('claude_code', 'side-sess', %s, %s, %s, %s, %s, 1, %s)
             """,
@@ -1411,7 +1296,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     for day in range(4):
         warehouse._command(
             """
-            INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+            INSERT INTO @claude_code_events (source, session_id, event_uuid, seq, occurred_at,
                                               role, text, entrypoint, ingested_at)
             VALUES ('claude_code', %s, 'r0', 0, %s, 'user', %s, 'cli', %s)
             """,
@@ -1421,7 +1306,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # --- calendar: feeds, promo invites, flighty ------------------------------
     warehouse._command(
         """
-        INSERT INTO calendar_events (account, calendar_id, event_id, summary, description,
+        INSERT INTO @calendar_events (account, calendar_id, event_id, summary, description,
                                      organizer_email, start_at, updated_at, synced_at)
         VALUES ('z@x.test', 'cal1', 'ev-feed', 'Vinyasa Flow', '',
                 'studio_x1@group.calendar.google.com', %s, %s, %s),
@@ -1438,7 +1323,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # --- drive: form pipelines and shortcuts ---------------------------------
     warehouse._command(
         """
-        INSERT INTO google_drive_files (account, file_id, name, mime_type, folder_path,
+        INSERT INTO @google_drive_files (account, file_id, name, mime_type, folder_path,
                                         last_modifying_user, modified_time, ingested_at)
         VALUES ('z@x.test', 'f-form', 'logo - applicant.png', 'image/png',
                 '/apps form/Application (File responses)/Upload Logo (File responses)',
@@ -1457,7 +1342,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
 
     def priority_of(event_id: str) -> str:
         return warehouse._query(
-            "SELECT priority FROM timeline_events WHERE event_id = %s", (event_id,)
+            "SELECT priority FROM @timeline_events WHERE event_id = %s", (event_id,)
         )[0][0]
 
     # slack
@@ -1523,7 +1408,7 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     # rather than the sync timestamp.
     warehouse._command(
         """
-        INSERT INTO slack_users (account, team_id, user_id, display_name)
+        INSERT INTO @slack_users (account, team_id, user_id, display_name)
         VALUES ('z', 'T1', 'UME', 'self'),
                ('z', 'T1', 'U1', 'Teammate One'),
                ('z', 'T1', 'U2', 'Teammate Two')
@@ -1531,20 +1416,20 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     )
     warehouse._command(
         """
-        INSERT INTO slack_account_identities (account, team_id, user_id)
+        INSERT INTO @slack_account_identities (account, team_id, user_id)
         VALUES ('z', 'T1', 'UME')
         """
     )
     warehouse._command(
         """
-        INSERT INTO slack_conversations (account, team_id, conversation_id, name, is_im)
+        INSERT INTO @slack_conversations (account, team_id, conversation_id, name, is_im)
         VALUES ('z', 'T1', 'D1', '', 1),
                ('z', 'T1', 'D2', 'U2', 1)
         """
     )
     warehouse._command(
         """
-        INSERT INTO slack_conversation_members (account, team_id, conversation_id, user_id)
+        INSERT INTO @slack_conversation_members (account, team_id, conversation_id, user_id)
         VALUES ('z', 'T1', 'D1', 'UME'),
                ('z', 'T1', 'D1', 'U1')
         """
@@ -1552,7 +1437,7 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     stale_message_ts = f"{(now - timedelta(hours=1)).timestamp():.6f}"
     warehouse._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                     message_datetime, user_id, text, raw_json, synced_at)
         VALUES ('z', 'T1', 'D1', 'dm-1', %s, 'UME', 'hello there', '{}', %s),
                ('z', 'T1', 'D1', 'dm-file-shell', %s, 'UME', '',
@@ -1563,7 +1448,7 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     )
     warehouse._command(
         """
-        INSERT INTO slack_files (account, team_id, file_id, conversation_id, message_ts,
+        INSERT INTO @slack_files (account, team_id, file_id, conversation_id, message_ts,
                                  user_id, created_at, name, title, filetype, size, raw_json, synced_at)
         VALUES ('z', 'T1', 'FSTUB', 'D1', %s, 'UME', '1970-01-01', '', '',
                 'jpg', 0, '{"file_access":"file_not_found"}', %s)
@@ -1576,13 +1461,13 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     # snippet.
     warehouse._command(
         """
-        INSERT INTO whatsapp_contacts (account, jid, push_name)
+        INSERT INTO @whatsapp_contacts (account, jid, push_name)
         VALUES ('z@x.test', 'friend@lid', 'Saved Contact')
         """
     )
     warehouse._command(
         """
-        INSERT INTO whatsapp_messages (account, chat_id, message_id, sender_jid, body_text,
+        INSERT INTO @whatsapp_messages (account, chat_id, message_id, sender_jid, body_text,
                                        message_kind, media_type, message_at, is_from_me, ingested_at)
         VALUES ('z@x.test', 'friend@lid', 'voice-1', '', '', 'voice', 'voice', %s, 1, %s)
         """,
@@ -1592,7 +1477,7 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     # Gmail should decode common HTML entities in timeline display fields.
     warehouse._command(
         """
-        INSERT INTO gmail_messages (account, message_id, internal_date, subject, from_address,
+        INSERT INTO @gmail_messages (account, message_id, internal_date, subject, from_address,
                                     snippet, synced_at)
         VALUES ('z@x.test', 'html-1', %s, 'Re: &lt;Plan&gt;', 'Zach <z@x.test>',
                 'I&#39;m ready &amp; excited &lt;3', %s)
@@ -1604,14 +1489,14 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     # the object-replacement placeholder character.
     warehouse._command(
         """
-        INSERT INTO apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
+        INSERT INTO @apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
         VALUES ('z@x.test', 'chat-attach', 'im-attach', %s, %s)
         """,
         (now, now),
     )
     warehouse._command(
         """
-        INSERT INTO apple_messages (account, message_id, body_text, message_at,
+        INSERT INTO @apple_messages (account, message_id, body_text, message_at,
                                     is_from_me, cache_has_attachments, ingested_at)
         VALUES ('z@x.test', 'im-attach', '￼', %s, 1, 1, %s)
         """,
@@ -1619,7 +1504,7 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     )
     warehouse._command(
         """
-        INSERT INTO apple_message_attachments (account, attachment_id, message_id, filename,
+        INSERT INTO @apple_message_attachments (account, attachment_id, message_id, filename,
                                                mime_type, is_missing, ingested_at)
         VALUES ('z@x.test', 'att-1', 'im-attach', '~/Library/Messages/Attachments/x/photo.jpg',
                 'image/jpeg', 0, %s)
@@ -1631,7 +1516,7 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     # not classify as self activity in a recent-self review.
     warehouse._command(
         """
-        INSERT INTO calendar_events (account, calendar_id, event_id, summary, organizer_email,
+        INSERT INTO @calendar_events (account, calendar_id, event_id, summary, organizer_email,
                                      start_at, status, is_deleted, updated_at, synced_at)
         VALUES ('z@x.test', 'primary', 'cancelled', 'Cancelled haircut', 'z@x.test',
                 %s, 'cancelled', 1, %s, %s),
@@ -1645,7 +1530,7 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     # when they contain a user row.
     warehouse._command(
         """
-        INSERT INTO agent_session_events (source, session_id, event_uuid, seq, occurred_at,
+        INSERT INTO @openclaw_events (source, session_id, event_uuid, seq, occurred_at,
                                           role, text, device, ingested_at)
         VALUES ('openclaw', 'subagent-cron', 'u0', 0, %s, 'user',
                 '[Subagent Context] You are running as a subagent.\n\n[Subagent Task]\nCron monitor subtask.',
@@ -1674,7 +1559,7 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
 
     by_event_id = {
         row["event_id"]: row
-        for row in warehouse._query_dicts("SELECT * FROM timeline_events")
+        for row in warehouse._query_dicts("SELECT * FROM @timeline_events")
     }
 
     assert by_event_id["z|T1|D1|dm-1"]["context"] == "DM with Teammate One"
@@ -1705,7 +1590,7 @@ def test_voice_memo_timeline_refreshes_when_enrichment_arrives_later(warehouse):
     adapter = adapter_by_name("voice_memo")
     warehouse._command(
         """
-        INSERT INTO apple_voice_memos_files (account, recording_id, title, filename,
+        INSERT INTO @apple_voice_memos_files (account, recording_id, title, filename,
                                              recorded_at, ingested_at)
         VALUES ('z@x.test', 'rec-late', '20260709 raw title', 'raw.m4a', %s, %s)
         """,
@@ -1718,14 +1603,14 @@ def test_voice_memo_timeline_refreshes_when_enrichment_arrives_later(warehouse):
     finally:
         engine.close()
     before = warehouse._query_dicts(
-        "SELECT title, snippet FROM timeline_events WHERE event_id = 'z@x.test|rec-late'"
+        "SELECT title, snippet FROM @timeline_events WHERE event_id = 'z@x.test|rec-late'"
     )[0]
     assert before["title"] == "20260709 raw title"
     assert before["snippet"] == ""
 
     warehouse._command(
         """
-        INSERT INTO apple_voice_memos_enrichments (account, recording_id, provider, model,
+        INSERT INTO @apple_voice_memos_enrichments (account, recording_id, provider, model,
                                                    prompt_version, status, title, summary, created_at)
         VALUES ('z@x.test', 'rec-late', 'p', 'm', 'v1', 'completed',
                 'Readable memo title', 'Readable memo summary', %s)
@@ -1740,7 +1625,7 @@ def test_voice_memo_timeline_refreshes_when_enrichment_arrives_later(warehouse):
         engine.close()
     assert stats[0].incremental_rows == 1
     after = warehouse._query_dicts(
-        "SELECT title, snippet FROM timeline_events WHERE event_id = 'z@x.test|rec-late'"
+        "SELECT title, snippet FROM @timeline_events WHERE event_id = 'z@x.test|rec-late'"
     )[0]
     assert after["title"] == "Readable memo title"
     assert after["snippet"] == "Readable memo summary"
@@ -1752,17 +1637,17 @@ def test_refresh_window_converges_late_signals(warehouse):
     _ensure_all_source_tables(warehouse)
     now = datetime.now(tz=UTC)
     warehouse._command(
-        "INSERT INTO slack_account_identities (account, team_id, user_id) VALUES ('z', 'T1', 'UME')"
+        "INSERT INTO @slack_account_identities (account, team_id, user_id) VALUES ('z', 'T1', 'UME')"
     )
     warehouse._command(
         """
-        INSERT INTO slack_conversations (account, team_id, conversation_id, name, is_member, num_members)
+        INSERT INTO @slack_conversations (account, team_id, conversation_id, name, is_member, num_members)
         VALUES ('z', 'T1', 'C9', 'work', 1, 30)
         """
     )
     warehouse._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                     message_datetime, user_id, text, synced_at)
         VALUES ('z', 'T1', 'C9', '9000.1', %s, 'U1', 'question for the room', %s)
         """,
@@ -1775,7 +1660,7 @@ def test_refresh_window_converges_late_signals(warehouse):
     finally:
         engine.close()
     row = warehouse._query(
-        "SELECT priority FROM timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
+        "SELECT priority FROM @timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
     )
     assert row[0][0] == "cc", "no engagement yet: ambient member channel"
 
@@ -1783,7 +1668,7 @@ def test_refresh_window_converges_late_signals(warehouse):
     # the refresh re-walk can reclassify it.
     warehouse._command(
         """
-        INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                     message_datetime, user_id, text, synced_at)
         VALUES ('z', 'T1', 'C9', '9000.2', %s, 'UME', 'on it', %s),
                ('z', 'T1', 'C9', '9000.3', %s, 'UME', 'fixed', %s)
@@ -1797,7 +1682,7 @@ def test_refresh_window_converges_late_signals(warehouse):
         engine.close()
     assert stats[0].refreshed_rows > 0
     row = warehouse._query(
-        "SELECT priority FROM timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
+        "SELECT priority FROM @timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
     )
     assert row[0][0] == "direct", "his replies retroactively promote the conversation window"
 
@@ -1814,20 +1699,20 @@ def test_incremental_picks_up_new_and_changed_rows(warehouse):
         # fresher ingestion timestamp than the stored watermark.
         warehouse._command(
             """
-            INSERT INTO slack_messages (account, team_id, conversation_id, message_ts,
+            INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
                                         message_datetime, user_id, text, synced_at)
             VALUES ('z', 'T1', 'C1', '2000.1', %s, 'U1', 'newer message', %s)
             """,
             (later, later),
         )
         warehouse._command(
-            "UPDATE slack_messages SET text = 'slack says hi (edited)', synced_at = %s "
+            "UPDATE @slack_messages SET text = 'slack says hi (edited)', synced_at = %s "
             "WHERE message_ts = '1000.1'",
             (later,),
         )
         old_seqs = {
             row["event_id"]: row["seq"]
-            for row in warehouse._query_dicts("SELECT event_id, seq FROM timeline_events")
+            for row in warehouse._query_dicts("SELECT event_id, seq FROM @timeline_events")
         }
         stats = engine.run()
     finally:
@@ -1836,7 +1721,7 @@ def test_incremental_picks_up_new_and_changed_rows(warehouse):
     by_adapter = {s.adapter: s for s in stats}
     assert by_adapter["slack_message"].incremental_rows == 2
     rows = warehouse._query_dicts(
-        "SELECT event_id, snippet, seq FROM timeline_events WHERE adapter = 'slack_message'"
+        "SELECT event_id, snippet, seq FROM @timeline_events WHERE adapter = 'slack_message'"
     )
     by_id = {row["event_id"]: row for row in rows}
     assert len(by_id) == 2
@@ -1846,7 +1731,7 @@ def test_incremental_picks_up_new_and_changed_rows(warehouse):
     # Untouched rows keep their seq.
     gmail_id = "z@x.test|m1"
     gmail_seq = warehouse._query(
-        "SELECT seq FROM timeline_events WHERE event_id = %s", (gmail_id,)
+        "SELECT seq FROM @timeline_events WHERE event_id = %s", (gmail_id,)
     )[0][0]
     assert gmail_seq == old_seqs[gmail_id]
 
@@ -1864,7 +1749,7 @@ def test_apple_message_incremental_picks_up_late_attachment_enrichment(warehouse
         later = _NOW + timedelta(minutes=10)
         warehouse._command(
             """
-            INSERT INTO apple_message_attachments (account, attachment_id, message_id,
+            INSERT INTO @apple_message_attachments (account, attachment_id, message_id,
                                                    filename, content_sha256, ingested_at)
             VALUES ('z@x.test', 'att1', 'am1', 'marina.heic', 'sha-att1', %s)
             """,
@@ -1872,7 +1757,7 @@ def test_apple_message_incremental_picks_up_late_attachment_enrichment(warehouse
         )
         warehouse._command(
             """
-            INSERT INTO file_attachment_enrichments (content_sha256, ai_provider, ai_model,
+            INSERT INTO @file_attachment_enrichments (content_sha256, ai_provider, ai_model,
                                                      ai_prompt_version, text, updated_at)
             VALUES ('sha-att1', 'p', 'm', 'v1', 'a photo of the marina at sunset', %s)
             """,
@@ -1883,7 +1768,7 @@ def test_apple_message_incremental_picks_up_late_attachment_enrichment(warehouse
         engine.close()
 
     rows = warehouse._query(
-        "SELECT search_text FROM timeline_events WHERE event_id = 'z@x.test|am1'"
+        "SELECT search_text FROM @timeline_events WHERE event_id = 'z@x.test|am1'"
     )
     assert rows and "marina at sunset" in rows[0][0]
 
@@ -1893,7 +1778,7 @@ def test_backfill_pages_newest_first(warehouse):
     for i in range(7):
         warehouse._command(
             """
-            INSERT INTO gmail_messages (account, message_id, internal_date, subject, synced_at)
+            INSERT INTO @gmail_messages (account, message_id, internal_date, subject, synced_at)
             VALUES ('z@x.test', %s, %s, %s, %s)
             """,
             (f"m{i}", _NOW - timedelta(hours=i), f"mail {i}", _NOW),
@@ -1904,18 +1789,18 @@ def test_backfill_pages_newest_first(warehouse):
         engine.run(max_seconds=0.000001)
         titles = [
             row[0]
-            for row in warehouse._query("SELECT title FROM timeline_events ORDER BY event_ts DESC")
+            for row in warehouse._query("SELECT title FROM @timeline_events ORDER BY event_ts DESC")
         ]
         assert titles == ["mail 0", "mail 1", "mail 2"]
-        state = warehouse._query_dicts("SELECT * FROM timeline_sync_state")[0]
+        state = warehouse._query_dicts("SELECT * FROM @timeline_sync_state")[0]
         assert state["backfill_done"] == 0
         # Finish the job with no budget cap.
         engine.run()
     finally:
         engine.close()
-    count = warehouse._query("SELECT count(*) FROM timeline_events")[0][0]
+    count = warehouse._query("SELECT count(*) FROM @timeline_events")[0][0]
     assert count == 7
-    state = warehouse._query_dicts("SELECT * FROM timeline_sync_state")[0]
+    state = warehouse._query_dicts("SELECT * FROM @timeline_sync_state")[0]
     assert state["backfill_done"] == 1
     assert state["backfill_rows"] == 7
 
@@ -1929,17 +1814,17 @@ def test_engine_pumps_into_a_separate_destination_schema(warehouse):
     try:
         engine.run()
         with engine._dest_conn.cursor() as cursor:
-            cursor.execute(engine._dest_sql("SELECT count(*) FROM timeline_events"))
+            cursor.execute(engine._dest_sql("SELECT count(*) FROM @timeline_events"))
             count = cursor.fetchone()[0]
         assert count == sum(EXPECTED_SEEDED_EVENTS.values())
         # Nothing was written into the source schema.
         assert not warehouse._query(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = 'events' LIMIT 1",
             (warehouse.physical_schema_name("timeline"),),
-        ) or warehouse._query("SELECT count(*) FROM timeline_events")[0][0] == 0
+        ) or warehouse._query("SELECT count(*) FROM @timeline_events")[0][0] == 0
     finally:
         with engine._dest_conn.cursor() as cursor:
-            for schema_name in physical_schema_names(namespace=dest_schema, include_private=True) + [dest_schema]:
+            for schema_name in physical_schema_names(namespace=dest_schema, include_hidden=True) + [dest_schema]:
                 cursor.execute(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
         engine.close()
 
@@ -1954,7 +1839,7 @@ def test_engine_reports_failures_loudly_but_keeps_going(warehouse):
         kind="email",
         backfill_sql="SELECT nonsense FROM missing_table WHERE x < %(cursor_ts)s AND y = %(cursor_id)s LIMIT %(limit)s",
         incremental_sql="SELECT nonsense FROM missing_table WHERE x > %(watermark_ts)s AND y = %(watermark_id)s LIMIT %(limit)s",
-        max_ingest_sql="SELECT max(synced_at) FROM gmail_messages",
+        max_ingest_sql="SELECT max(synced_at) FROM @gmail_messages",
     )
     engine = _engine(warehouse, adapters=[broken, adapter_by_name("gmail_email")])
     try:

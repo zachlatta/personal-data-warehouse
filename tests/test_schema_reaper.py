@@ -45,8 +45,8 @@ def test_cleanup_test_warehouse_drops_every_physical_schema_and_base_namespace()
             self.commands: list[str] = []
             self.closed = False
 
-        def physical_schema_names(self, *, include_private: bool = False) -> list[str]:
-            assert include_private is True
+        def physical_schema_names(self, *, include_hidden: bool = False) -> list[str]:
+            assert include_hidden is True
             return [f"{self.schema_namespace}_gmail", f"{self.schema_namespace}_private"]
 
         def _raw_command(self, command: str) -> None:

@@ -55,7 +55,10 @@ func NewPostgresStore(databaseURL string, timeout time.Duration) (*PostgresStore
 
 func (s *PostgresStore) Close() error { return s.db.Close() }
 
-const createSchemaSQL = `CREATE SCHEMA IF NOT EXISTS "private"`
+// Take the schema from the catalog rather than restating it, so a catalog
+// move cannot leave the app provisioning an orphan schema.
+var createSchemaSQL = "CREATE SCHEMA IF NOT EXISTS " +
+	warehouse.QuoteIdent(warehouse.SchemaOf("chatgpt_sessions"))
 
 var createTableSQL = `
 CREATE TABLE IF NOT EXISTS ` + warehouse.SQLRelation("chatgpt_sessions") + ` (

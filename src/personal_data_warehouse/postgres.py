@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import time
@@ -102,14 +103,17 @@ from personal_data_warehouse.schema import (
 )
 from personal_data_warehouse.config import normalize_postgres_url
 from personal_data_warehouse.relations import (
+    ALL_CANONICAL_SCHEMAS,
     CANONICAL_RELATIONS,
+    CATALOG,
     PHOTO_SOURCE_RELATIONS,
-    QUERYABLE_SCHEMAS,
+    expand_relations,
     physical_schema_name,
     physical_schema_names,
-    qualify_sql_relations,
-    query_relation,
+    relation as canonical_relation,
 )
+
+logger = logging.getLogger(__name__)
 
 POSTGRES_TEXT_NUL_REPLACEMENT = "\\u0000"
 # A search_text() hit's `text` is a relevance PREVIEW, not the full document.
@@ -215,7 +219,6 @@ QUERY_ROLE_CONCURRENT_UPDATE_MESSAGE = "tuple concurrently updated"
 # Serializes the one-time timeline priority bigint -> enum rewrite. Without it
 # two processes booting together both see a bigint column, both issue the ALTER,
 # and the second one rewrites the whole table again behind the first.
-TIMELINE_PRIORITY_MIGRATION_LOCK_ID = 8_407_112_471
 
 
 @dataclass(frozen=True)
@@ -373,7 +376,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     # Photos: one raw file table per source (all sharing
     # PHOTO_SOURCE_FILE_COLUMNS — see PHOTO_SOURCE_RELATIONS in relations.py),
     # unified by the derived photos.assets/asset_files identity tables and the
-    # marts.photo_files / marts.photos / marts.photo_canonical_renditions views.
+    # marts_photos.files / marts_photos.photos / marts_photos.canonical_renditions views.
     "apple_photos_files": TableSpec(
         PHOTO_SOURCE_FILE_COLUMNS,
         ("source", "account", "source_native_id", "content_sha256"),
@@ -384,19 +387,6 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("source", "account", "source_native_id", "content_sha256"),
     ),
     "media_fingerprints": TableSpec(MEDIA_FINGERPRINT_COLUMNS, ("content_sha256", "hash_version")),
-    # Legacy logical name retained only so old-layout migrations can understand
-    # the historical mixed table. Runtime writes split into the source-owned
-    # *_events tables below and read through marts.ai_conversation_events.
-    "agent_session_events": TableSpec(
-        AGENT_SESSION_EVENT_COLUMNS,
-        ("source", "session_id", "event_uuid"),
-        storage_parameters=(
-            ("autovacuum_analyze_scale_factor", "0"),
-            ("autovacuum_analyze_threshold", "50000"),
-            ("autovacuum_vacuum_scale_factor", "0"),
-            ("autovacuum_vacuum_threshold", "100000"),
-        ),
-    ),
     "chatgpt_events": TableSpec(
         AGENT_SESSION_EVENT_COLUMNS,
         ("source", "session_id", "event_uuid"),
@@ -515,7 +505,7 @@ PLAID_ITEM_SCOPED_TABLES = (
 
 # The source-owned AI conversation event tables (claude_code.events,
 # codex.events, ...). They share AGENT_SESSION_EVENT_COLUMNS and are read
-# together through the marts.ai_conversation_events union view, so they all
+# together through the marts_ai_conversations.events union view, so they all
 # need the same read-path indexes.
 _AI_CONVERSATION_EVENT_TABLES = (
     "chatgpt_events",
@@ -530,7 +520,7 @@ _AI_CONVERSATION_EVENT_TABLES = (
 def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
     """Read-path indexes for every source-owned AI conversation event table.
 
-    The marts.ai_conversation_events union view has no storage of its own, so
+    The marts_ai_conversations.events union view has no storage of its own, so
     every probe through it (the timeline agent_session adapter's per-session
     LATERAL lookups, session roll-ups, recency scans, changed-session
     detection) is only as good as the per-source indexes underneath.
@@ -542,7 +532,7 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
                 f"{table}_session_seq_idx",
                 table,
                 f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_session_seq_idx "
-                f"ON {table} (session_id, seq)",
+                f"ON @{table} (session_id, seq)",
             )
         )
         specs.append(
@@ -550,7 +540,7 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
                 f"{table}_occurred_at_idx",
                 table,
                 f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_occurred_at_idx "
-                f"ON {table} (occurred_at DESC)",
+                f"ON @{table} (occurred_at DESC)",
             )
         )
         # First-prompt template lookups for the timeline's scheduled-session
@@ -560,7 +550,7 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
                 f"{table}_first_prompt_idx",
                 table,
                 f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_first_prompt_idx "
-                f"ON {table} ((left(text, 64))) WHERE role = 'user' AND seq <= 5",
+                f"ON @{table} ((left(text, 64))) WHERE role = 'user' AND seq <= 5",
             )
         )
         specs.append(
@@ -568,7 +558,7 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
                 f"{table}_ingested_at_idx",
                 table,
                 f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_ingested_at_idx "
-                f"ON {table} (ingested_at)",
+                f"ON @{table} (ingested_at)",
             )
         )
     return tuple(specs)
@@ -579,12 +569,12 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "finance_transactions_account_time_idx",
         "finance_transactions",
         "CREATE INDEX IF NOT EXISTS finance_transactions_account_time_idx "
-        "ON finance_transactions (account_id, posted_at DESC)",
+        "ON @finance_transactions (account_id, posted_at DESC)",
     ),
     IndexSpec(
         "gmail_messages_thread_idx",
         "gmail_messages",
-        "CREATE INDEX IF NOT EXISTS gmail_messages_thread_idx ON gmail_messages (account, thread_id, internal_date DESC)",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_thread_idx ON @gmail_messages (account, thread_id, internal_date DESC)",
     ),
     # Recipient-membership lookups ('a@b' = ANY(to_addresses || cc_addresses
     # || bcc_addresses)) are structured raw-table predicates. Codified from
@@ -594,7 +584,7 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "gmail_messages_recipients_array_idx",
         "gmail_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_recipients_array_idx ON gmail_messages "
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_recipients_array_idx ON @gmail_messages "
         "USING gin ((to_addresses || cc_addresses || bcc_addresses)) WHERE is_deleted = 0",
     ),
     # Normalized-subject-prefix lookups for the timeline's mail-merge
@@ -603,30 +593,30 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "gmail_messages_merge_prefix_idx",
         "gmail_messages",
-        "CREATE INDEX IF NOT EXISTS gmail_messages_merge_prefix_idx ON gmail_messages "
+        "CREATE INDEX IF NOT EXISTS gmail_messages_merge_prefix_idx ON @gmail_messages "
         "(account, (left(regexp_replace(lower(subject), '^((re|fwd|fw)(\\[\\d+\\])?:\\s*)+', ''), 24)), "
         "internal_date)",
     ),
     IndexSpec(
         "gmail_messages_internal_date_idx",
         "gmail_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_internal_date_idx ON gmail_messages (internal_date DESC)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_internal_date_idx ON @gmail_messages (internal_date DESC)",
     ),
     IndexSpec(
         "gmail_messages_label_ids_idx",
         "gmail_messages",
-        "CREATE INDEX IF NOT EXISTS gmail_messages_label_ids_idx ON gmail_messages USING gin (label_ids)",
+        "CREATE INDEX IF NOT EXISTS gmail_messages_label_ids_idx ON @gmail_messages USING gin (label_ids)",
     ),
     IndexSpec(
         "gmail_messages_from_trgm_idx",
         "gmail_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_from_trgm_idx ON gmail_messages USING gin (from_address public.gin_trgm_ops)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_from_trgm_idx ON @gmail_messages USING gin (from_address public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
         "gmail_messages_subject_trgm_idx",
         "gmail_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_subject_trgm_idx ON gmail_messages USING gin (subject public.gin_trgm_ops)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_subject_trgm_idx ON @gmail_messages USING gin (subject public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     # Kept alongside from/subject: the voice-memo speaker-identity hints scan
@@ -637,122 +627,122 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "gmail_messages_snippet_trgm_idx",
         "gmail_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_snippet_trgm_idx ON gmail_messages USING gin (snippet public.gin_trgm_ops)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_snippet_trgm_idx ON @gmail_messages USING gin (snippet public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
         "gmail_attachments_message_idx",
         "gmail_attachments",
-        "CREATE INDEX IF NOT EXISTS gmail_attachments_message_idx ON gmail_attachments (account, message_id)",
+        "CREATE INDEX IF NOT EXISTS gmail_attachments_message_idx ON @gmail_attachments (account, message_id)",
     ),
     IndexSpec(
         "file_attachment_enrichments_text_trgm_idx",
         "file_attachment_enrichments",
-        "CREATE INDEX IF NOT EXISTS file_attachment_enrichments_text_trgm_idx ON file_attachment_enrichments USING gin (text public.gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS file_attachment_enrichments_text_trgm_idx ON @file_attachment_enrichments USING gin (text public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
         "calendar_events_time_idx",
         "calendar_events",
-        "CREATE INDEX IF NOT EXISTS calendar_events_time_idx ON calendar_events (start_at, end_at)",
+        "CREATE INDEX IF NOT EXISTS calendar_events_time_idx ON @calendar_events (start_at, end_at)",
     ),
     IndexSpec(
         "contact_cards_display_idx",
         "contact_cards",
-        "CREATE INDEX IF NOT EXISTS contact_cards_display_idx ON contact_cards (account, source_kind, display_name) WHERE is_deleted = 0",
+        "CREATE INDEX IF NOT EXISTS contact_cards_display_idx ON @contact_cards (account, source_kind, display_name) WHERE is_deleted = 0",
     ),
     IndexSpec(
         "contact_cards_primary_email_idx",
         "contact_cards",
-        "CREATE INDEX IF NOT EXISTS contact_cards_primary_email_idx ON contact_cards (lower(primary_email)) WHERE is_deleted = 0 AND primary_email != ''",
+        "CREATE INDEX IF NOT EXISTS contact_cards_primary_email_idx ON @contact_cards (lower(primary_email)) WHERE is_deleted = 0 AND primary_email != ''",
     ),
     IndexSpec(
         "contact_cards_primary_phone_idx",
         "contact_cards",
-        "CREATE INDEX IF NOT EXISTS contact_cards_primary_phone_idx ON contact_cards (lower(primary_phone)) WHERE is_deleted = 0 AND primary_phone != ''",
+        "CREATE INDEX IF NOT EXISTS contact_cards_primary_phone_idx ON @contact_cards (lower(primary_phone)) WHERE is_deleted = 0 AND primary_phone != ''",
     ),
     IndexSpec(
         "contact_cards_source_updated_idx",
         "contact_cards",
-        "CREATE INDEX IF NOT EXISTS contact_cards_source_updated_idx ON contact_cards (source_updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS contact_cards_source_updated_idx ON @contact_cards (source_updated_at DESC)",
     ),
     IndexSpec(
         "contact_cards_raw_json_idx",
         "contact_cards",
-        "CREATE INDEX IF NOT EXISTS contact_cards_raw_json_idx ON contact_cards USING gin (raw_json)",
+        "CREATE INDEX IF NOT EXISTS contact_cards_raw_json_idx ON @contact_cards USING gin (raw_json)",
     ),
     IndexSpec(
         "voice_memo_files_recorded_idx",
         "apple_voice_memos_files",
-        "CREATE INDEX IF NOT EXISTS voice_memo_files_recorded_idx ON apple_voice_memos_files (recorded_at DESC)",
+        "CREATE INDEX IF NOT EXISTS voice_memo_files_recorded_idx ON @apple_voice_memos_files (recorded_at DESC)",
     ),
     IndexSpec(
         "alice_voice_recordings_recorded_idx",
         "alice_voice_recordings",
-        "CREATE INDEX IF NOT EXISTS alice_voice_recordings_recorded_idx ON alice_voice_recordings (recorded_at DESC)",
+        "CREATE INDEX IF NOT EXISTS alice_voice_recordings_recorded_idx ON @alice_voice_recordings (recorded_at DESC)",
     ),
     IndexSpec(
         "alice_voice_recording_artifacts_recording_idx",
         "alice_voice_recording_artifacts",
-        "CREATE INDEX IF NOT EXISTS alice_voice_recording_artifacts_recording_idx ON alice_voice_recording_artifacts (account, recording_id, kind)",
+        "CREATE INDEX IF NOT EXISTS alice_voice_recording_artifacts_recording_idx ON @alice_voice_recording_artifacts (account, recording_id, kind)",
     ),
     IndexSpec(
         "apple_photos_files_ingested_at_idx",
         "apple_photos_files",
-        "CREATE INDEX IF NOT EXISTS apple_photos_files_ingested_at_idx ON apple_photos_files (ingested_at)",
+        "CREATE INDEX IF NOT EXISTS apple_photos_files_ingested_at_idx ON @apple_photos_files (ingested_at)",
     ),
     IndexSpec(
         "apple_photos_files_content_sha256_idx",
         "apple_photos_files",
-        "CREATE INDEX IF NOT EXISTS apple_photos_files_content_sha256_idx ON apple_photos_files (content_sha256)",
+        "CREATE INDEX IF NOT EXISTS apple_photos_files_content_sha256_idx ON @apple_photos_files (content_sha256)",
     ),
     IndexSpec(
         "photo_assets_capture_ts_idx",
         "photo_assets",
-        "CREATE INDEX IF NOT EXISTS photo_assets_capture_ts_idx ON photo_assets (capture_ts DESC)",
+        "CREATE INDEX IF NOT EXISTS photo_assets_capture_ts_idx ON @photo_assets (capture_ts DESC)",
     ),
     IndexSpec(
         "photo_asset_files_photo_id_idx",
         "photo_asset_files",
-        "CREATE INDEX IF NOT EXISTS photo_asset_files_photo_id_idx ON photo_asset_files (photo_id)",
+        "CREATE INDEX IF NOT EXISTS photo_asset_files_photo_id_idx ON @photo_asset_files (photo_id)",
     ),
     IndexSpec(
         "apple_voice_memos_transcript_trgm_idx",
         "apple_voice_memos_enrichments",
-        "CREATE INDEX IF NOT EXISTS apple_voice_memos_transcript_trgm_idx ON apple_voice_memos_enrichments USING gin (transcript public.gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS apple_voice_memos_transcript_trgm_idx ON @apple_voice_memos_enrichments USING gin (transcript public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
         "apple_notes_modified_idx",
         "apple_notes",
-        "CREATE INDEX IF NOT EXISTS apple_notes_modified_idx ON apple_notes (modified_at DESC) WHERE is_deleted = 0",
+        "CREATE INDEX IF NOT EXISTS apple_notes_modified_idx ON @apple_notes (modified_at DESC) WHERE is_deleted = 0",
     ),
     IndexSpec(
         "apple_notes_title_trgm_idx",
         "apple_notes",
-        "CREATE INDEX IF NOT EXISTS apple_notes_title_trgm_idx ON apple_notes USING gin (title public.gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS apple_notes_title_trgm_idx ON @apple_notes USING gin (title public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
         "apple_notes_body_trgm_idx",
         "apple_notes",
-        "CREATE INDEX IF NOT EXISTS apple_notes_body_trgm_idx ON apple_notes USING gin (body_text public.gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS apple_notes_body_trgm_idx ON @apple_notes USING gin (body_text public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
         "apple_note_revisions_note_idx",
         "apple_note_revisions",
-        "CREATE INDEX IF NOT EXISTS apple_note_revisions_note_idx ON apple_note_revisions (account, note_id, modified_at DESC)",
+        "CREATE INDEX IF NOT EXISTS apple_note_revisions_note_idx ON @apple_note_revisions (account, note_id, modified_at DESC)",
     ),
     IndexSpec(
         "apple_note_attachments_hash_idx",
         "apple_note_attachments",
-        "CREATE INDEX IF NOT EXISTS apple_note_attachments_hash_idx ON apple_note_attachments (content_sha256)",
+        "CREATE INDEX IF NOT EXISTS apple_note_attachments_hash_idx ON @apple_note_attachments (content_sha256)",
     ),
     IndexSpec(
         "apple_messages_time_idx",
         "apple_messages",
-        "CREATE INDEX IF NOT EXISTS apple_messages_time_idx ON apple_messages (message_at DESC) WHERE is_deleted = 0",
+        "CREATE INDEX IF NOT EXISTS apple_messages_time_idx ON @apple_messages (message_at DESC) WHERE is_deleted = 0",
     ),
     # Per-correspondent history ("latest/prior messages with this handle") is a
     # structured raw-table access pattern; without this index it planned as a
@@ -760,22 +750,22 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "apple_messages_handle_time_idx",
         "apple_messages",
-        "CREATE INDEX IF NOT EXISTS apple_messages_handle_time_idx ON apple_messages (account, handle_id, message_at DESC) WHERE is_deleted = 0",
+        "CREATE INDEX IF NOT EXISTS apple_messages_handle_time_idx ON @apple_messages (account, handle_id, message_at DESC) WHERE is_deleted = 0",
     ),
     IndexSpec(
         "apple_message_chat_messages_chat_time_idx",
         "apple_message_chat_messages",
-        "CREATE INDEX IF NOT EXISTS apple_message_chat_messages_chat_time_idx ON apple_message_chat_messages (account, chat_id, message_date DESC)",
+        "CREATE INDEX IF NOT EXISTS apple_message_chat_messages_chat_time_idx ON @apple_message_chat_messages (account, chat_id, message_date DESC)",
     ),
     IndexSpec(
         "apple_message_chat_messages_message_idx",
         "apple_message_chat_messages",
-        "CREATE INDEX IF NOT EXISTS apple_message_chat_messages_message_idx ON apple_message_chat_messages (account, message_id, chat_id)",
+        "CREATE INDEX IF NOT EXISTS apple_message_chat_messages_message_idx ON @apple_message_chat_messages (account, message_id, chat_id)",
     ),
     IndexSpec(
         "apple_message_attachments_hash_idx",
         "apple_message_attachments",
-        "CREATE INDEX IF NOT EXISTS apple_message_attachments_hash_idx ON apple_message_attachments (content_sha256)",
+        "CREATE INDEX IF NOT EXISTS apple_message_attachments_hash_idx ON @apple_message_attachments (content_sha256)",
     ),
     # The timeline apple_message adapter probes attachments by (account,
     # message_id) per candidate message; the PK is (account, attachment_id,
@@ -783,43 +773,44 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "apple_message_attachments_message_idx",
         "apple_message_attachments",
-        "CREATE INDEX IF NOT EXISTS apple_message_attachments_message_idx ON apple_message_attachments (account, message_id)",
+        "CREATE INDEX IF NOT EXISTS apple_message_attachments_message_idx ON @apple_message_attachments (account, message_id)",
     ),
     IndexSpec(
         "whatsapp_messages_time_idx",
         "whatsapp_messages",
-        "CREATE INDEX IF NOT EXISTS whatsapp_messages_time_idx ON whatsapp_messages (message_at DESC) WHERE is_deleted = 0",
+        "CREATE INDEX IF NOT EXISTS whatsapp_messages_time_idx ON @whatsapp_messages (message_at DESC) WHERE is_deleted = 0",
     ),
     IndexSpec(
         "whatsapp_messages_chat_time_idx",
         "whatsapp_messages",
-        "CREATE INDEX IF NOT EXISTS whatsapp_messages_chat_time_idx ON whatsapp_messages (account, chat_id, message_at DESC)",
+        "CREATE INDEX IF NOT EXISTS whatsapp_messages_chat_time_idx ON @whatsapp_messages (account, chat_id, message_at DESC)",
     ),
     IndexSpec(
         "whatsapp_messages_body_trgm_idx",
         "whatsapp_messages",
-        "CREATE INDEX IF NOT EXISTS whatsapp_messages_body_trgm_idx ON whatsapp_messages USING gin (body_text public.gin_trgm_ops) WHERE is_deleted = 0",
+        "CREATE INDEX IF NOT EXISTS whatsapp_messages_body_trgm_idx ON @whatsapp_messages USING gin (body_text public.gin_trgm_ops) WHERE is_deleted = 0",
         requires_pg_trgm=True,
     ),
     IndexSpec(
         "whatsapp_media_items_hash_idx",
         "whatsapp_media_items",
-        "CREATE INDEX IF NOT EXISTS whatsapp_media_items_hash_idx ON whatsapp_media_items (content_sha256)",
+        "CREATE INDEX IF NOT EXISTS whatsapp_media_items_hash_idx ON @whatsapp_media_items (content_sha256)",
     ),
     IndexSpec(
-        "agent_runs_task_status_subject_idx",
+        "ai_processing_agent_runs_task_status_subject_idx",
         "agent_runs",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_runs_task_status_subject_idx ON agent_runs (task_type, status, subject_id)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS ai_processing_agent_runs_task_status_subject_idx "
+        "ON @agent_runs (task_type, status, subject_id)",
     ),
     IndexSpec(
-        "agent_run_events_created_idx",
+        "ai_processing_agent_run_events_created_idx",
         "agent_run_events",
-        "CREATE INDEX IF NOT EXISTS agent_run_events_created_idx ON agent_run_events (created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ai_processing_agent_run_events_created_idx ON @agent_run_events (created_at DESC)",
     ),
     IndexSpec(
         "slack_messages_conversation_time_idx",
         "slack_messages",
-        "CREATE INDEX IF NOT EXISTS slack_messages_conversation_time_idx ON slack_messages (account, team_id, conversation_id, message_datetime DESC)",
+        "CREATE INDEX IF NOT EXISTS slack_messages_conversation_time_idx ON @slack_messages (account, team_id, conversation_id, message_datetime DESC)",
     ),
     IndexSpec(
         # Single-column index on message_datetime so global MIN/MAX/COUNT
@@ -827,98 +818,98 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         # full table scan across all 30M+ messages.
         "slack_messages_time_idx",
         "slack_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_time_idx ON slack_messages (message_datetime DESC)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_time_idx ON @slack_messages (message_datetime DESC)",
     ),
     IndexSpec(
         "slack_messages_user_time_idx",
         "slack_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_user_time_idx ON slack_messages (user_id, message_datetime DESC)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_user_time_idx ON @slack_messages (user_id, message_datetime DESC)",
     ),
     IndexSpec(
         "slack_messages_synced_at_idx",
         "slack_messages",
-        "CREATE INDEX IF NOT EXISTS slack_messages_synced_at_idx ON slack_messages (synced_at)",
+        "CREATE INDEX IF NOT EXISTS slack_messages_synced_at_idx ON @slack_messages (synced_at)",
     ),
     IndexSpec(
         "slack_messages_recent_scope_time_idx",
         "slack_messages",
-        "CREATE INDEX IF NOT EXISTS slack_messages_recent_scope_time_idx ON slack_messages (account, team_id, message_datetime DESC) WHERE is_deleted = 0",
+        "CREATE INDEX IF NOT EXISTS slack_messages_recent_scope_time_idx ON @slack_messages (account, team_id, message_datetime DESC) WHERE is_deleted = 0",
     ),
     IndexSpec(
         "slack_messages_recent_thread_time_idx",
         "slack_messages",
-        "CREATE INDEX IF NOT EXISTS slack_messages_recent_thread_time_idx ON slack_messages (account, team_id, thread_ts, message_datetime DESC) WHERE is_deleted = 0",
+        "CREATE INDEX IF NOT EXISTS slack_messages_recent_thread_time_idx ON @slack_messages (account, team_id, thread_ts, message_datetime DESC) WHERE is_deleted = 0",
     ),
     IndexSpec(
         "slack_messages_thread_idx",
         "slack_messages",
-        "CREATE INDEX IF NOT EXISTS slack_messages_thread_idx ON slack_messages (account, team_id, conversation_id, thread_ts)",
+        "CREATE INDEX IF NOT EXISTS slack_messages_thread_idx ON @slack_messages (account, team_id, conversation_id, thread_ts)",
     ),
     IndexSpec(
         "slack_conversations_scope_idx",
         "slack_conversations",
-        "CREATE INDEX IF NOT EXISTS slack_conversations_scope_idx ON slack_conversations (account, team_id, conversation_type)",
+        "CREATE INDEX IF NOT EXISTS slack_conversations_scope_idx ON @slack_conversations (account, team_id, conversation_type)",
     ),
     IndexSpec(
         "slack_conversations_synced_at_idx",
         "slack_conversations",
-        "CREATE INDEX IF NOT EXISTS slack_conversations_synced_at_idx ON slack_conversations (synced_at)",
+        "CREATE INDEX IF NOT EXISTS slack_conversations_synced_at_idx ON @slack_conversations (synced_at)",
     ),
     IndexSpec(
         "slack_users_email_lower_idx",
         "slack_users",
-        "CREATE INDEX IF NOT EXISTS slack_users_email_lower_idx ON slack_users (lower(email)) WHERE email != ''",
+        "CREATE INDEX IF NOT EXISTS slack_users_email_lower_idx ON @slack_users (lower(email)) WHERE email != ''",
     ),
     IndexSpec(
         "slack_users_synced_at_idx",
         "slack_users",
-        "CREATE INDEX IF NOT EXISTS slack_users_synced_at_idx ON slack_users (synced_at)",
+        "CREATE INDEX IF NOT EXISTS slack_users_synced_at_idx ON @slack_users (synced_at)",
     ),
     IndexSpec(
         "slack_conversation_members_synced_at_idx",
         "slack_conversation_members",
-        "CREATE INDEX IF NOT EXISTS slack_conversation_members_synced_at_idx ON slack_conversation_members (synced_at)",
+        "CREATE INDEX IF NOT EXISTS slack_conversation_members_synced_at_idx ON @slack_conversation_members (synced_at)",
     ),
     IndexSpec(
         "slack_state_scope_idx",
         "slack_sync_state",
-        "CREATE INDEX IF NOT EXISTS slack_state_scope_idx ON slack_sync_state (account, team_id, object_type, object_id)",
+        "CREATE INDEX IF NOT EXISTS slack_state_scope_idx ON @slack_sync_state (account, team_id, object_type, object_id)",
     ),
     IndexSpec(
         "slack_account_state_live_scope_idx",
         "slack_account_state_item_rows",
-        "CREATE INDEX IF NOT EXISTS slack_account_state_live_scope_idx ON slack_account_state_item_rows (account, scope_id, priority_rank, latest_activity_at DESC) WHERE is_deleted = 0",
+        "CREATE INDEX IF NOT EXISTS slack_account_state_live_scope_idx ON @slack_account_state_item_rows (account, scope_id, priority_rank, latest_activity_at DESC) WHERE is_deleted = 0",
     ),
     IndexSpec(
         "google_drive_files_modified_idx",
         "google_drive_files",
-        "CREATE INDEX IF NOT EXISTS google_drive_files_modified_idx ON google_drive_files (account, modified_time DESC) WHERE trashed = 0 AND is_excluded = 0",
+        "CREATE INDEX IF NOT EXISTS google_drive_files_modified_idx ON @google_drive_files (account, modified_time DESC) WHERE trashed = 0 AND is_excluded = 0",
     ),
     IndexSpec(
         "google_drive_file_texts_text_trgm_idx",
         "google_drive_file_texts",
-        "CREATE INDEX IF NOT EXISTS google_drive_file_texts_text_trgm_idx ON google_drive_file_texts USING gin (text public.gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS google_drive_file_texts_text_trgm_idx ON @google_drive_file_texts USING gin (text public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     IndexSpec(
         "whoop_cycles_start_idx",
         "whoop_cycles",
-        "CREATE INDEX IF NOT EXISTS whoop_cycles_start_idx ON whoop_cycles (account, start_at DESC)",
+        "CREATE INDEX IF NOT EXISTS whoop_cycles_start_idx ON @whoop_cycles (account, start_at DESC)",
     ),
     IndexSpec(
         "whoop_sleeps_start_idx",
         "whoop_sleeps",
-        "CREATE INDEX IF NOT EXISTS whoop_sleeps_start_idx ON whoop_sleeps (account, start_at DESC)",
+        "CREATE INDEX IF NOT EXISTS whoop_sleeps_start_idx ON @whoop_sleeps (account, start_at DESC)",
     ),
     IndexSpec(
         "whoop_workouts_start_idx",
         "whoop_workouts",
-        "CREATE INDEX IF NOT EXISTS whoop_workouts_start_idx ON whoop_workouts (account, start_at DESC)",
+        "CREATE INDEX IF NOT EXISTS whoop_workouts_start_idx ON @whoop_workouts (account, start_at DESC)",
     ),
     IndexSpec(
         "whoop_recoveries_updated_idx",
         "whoop_recoveries",
-        "CREATE INDEX IF NOT EXISTS whoop_recoveries_updated_idx ON whoop_recoveries (account, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS whoop_recoveries_updated_idx ON @whoop_recoveries (account, updated_at DESC)",
     ),
     # Unified timeline read paths: keyset pagination by event time (with seq as
     # the tiebreak) and per-source filtered scans. The kind filter rides on the
@@ -926,28 +917,28 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "timeline_events_time_idx",
         "timeline_events",
-        "CREATE INDEX IF NOT EXISTS timeline_events_time_idx ON timeline_events (event_ts DESC, seq DESC)",
+        "CREATE INDEX IF NOT EXISTS timeline_events_time_idx ON @timeline_events (event_ts DESC, seq DESC)",
     ),
     IndexSpec(
         "timeline_events_source_time_idx",
         "timeline_events",
-        "CREATE INDEX IF NOT EXISTS timeline_events_source_time_idx ON timeline_events (source, event_ts DESC, seq DESC)",
+        "CREATE INDEX IF NOT EXISTS timeline_events_source_time_idx ON @timeline_events (source, event_ts DESC, seq DESC)",
     ),
     IndexSpec(
         "timeline_events_priority_time_idx",
         "timeline_events",
-        "CREATE INDEX IF NOT EXISTS timeline_events_priority_time_idx ON timeline_events (priority, event_ts DESC, seq DESC)",
+        "CREATE INDEX IF NOT EXISTS timeline_events_priority_time_idx ON @timeline_events (priority, event_ts DESC, seq DESC)",
     ),
     IndexSpec(
         "timeline_events_search_text_bm25_idx",
         "timeline_events",
-        "CREATE INDEX IF NOT EXISTS timeline_events_search_text_bm25_idx ON timeline_events USING bm25 (search_text) WITH (text_config='english')",
+        "CREATE INDEX IF NOT EXISTS timeline_events_search_text_bm25_idx ON @timeline_events USING bm25 (search_text) WITH (text_config='english')",
         requires_pg_textsearch=True,
     ),
     IndexSpec(
         "timeline_events_search_text_trgm_idx",
         "timeline_events",
-        "CREATE INDEX IF NOT EXISTS timeline_events_search_text_trgm_idx ON timeline_events USING gin (search_text public.gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS timeline_events_search_text_trgm_idx ON @timeline_events USING gin (search_text public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
     # Ingestion-timestamp indexes on the larger event sources so the timeline's
@@ -958,57 +949,57 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "gmail_messages_synced_at_idx",
         "gmail_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_synced_at_idx ON gmail_messages (synced_at)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS gmail_messages_synced_at_idx ON @gmail_messages (synced_at)",
     ),
     IndexSpec(
         "slack_files_synced_at_idx",
         "slack_files",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_files_synced_at_idx ON slack_files (synced_at)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_files_synced_at_idx ON @slack_files (synced_at)",
     ),
     IndexSpec(
         "slack_files_created_at_idx",
         "slack_files",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_files_created_at_idx ON slack_files (created_at DESC)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_files_created_at_idx ON @slack_files (created_at DESC)",
     ),
     IndexSpec(
         "apple_messages_ingested_at_idx",
         "apple_messages",
-        "CREATE INDEX IF NOT EXISTS apple_messages_ingested_at_idx ON apple_messages (ingested_at)",
+        "CREATE INDEX IF NOT EXISTS apple_messages_ingested_at_idx ON @apple_messages (ingested_at)",
     ),
     IndexSpec(
         "google_drive_files_ingested_at_idx",
         "google_drive_files",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS google_drive_files_ingested_at_idx ON google_drive_files (ingested_at)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS google_drive_files_ingested_at_idx ON @google_drive_files (ingested_at)",
     ),
     IndexSpec(
         "calendar_events_synced_at_idx",
         "calendar_events",
-        "CREATE INDEX IF NOT EXISTS calendar_events_synced_at_idx ON calendar_events (synced_at)",
+        "CREATE INDEX IF NOT EXISTS calendar_events_synced_at_idx ON @calendar_events (synced_at)",
     ),
     IndexSpec(
         "contact_cards_synced_at_idx",
         "contact_cards",
-        "CREATE INDEX IF NOT EXISTS contact_cards_synced_at_idx ON contact_cards (synced_at)",
+        "CREATE INDEX IF NOT EXISTS contact_cards_synced_at_idx ON @contact_cards (synced_at)",
     ),
     IndexSpec(
         "apple_note_revisions_ingested_at_idx",
         "apple_note_revisions",
-        "CREATE INDEX IF NOT EXISTS apple_note_revisions_ingested_at_idx ON apple_note_revisions (ingested_at)",
+        "CREATE INDEX IF NOT EXISTS apple_note_revisions_ingested_at_idx ON @apple_note_revisions (ingested_at)",
     ),
     IndexSpec(
         "apple_voice_memos_files_ingested_at_idx",
         "apple_voice_memos_files",
-        "CREATE INDEX IF NOT EXISTS apple_voice_memos_files_ingested_at_idx ON apple_voice_memos_files (ingested_at)",
+        "CREATE INDEX IF NOT EXISTS apple_voice_memos_files_ingested_at_idx ON @apple_voice_memos_files (ingested_at)",
     ),
     IndexSpec(
         "alice_voice_recordings_ingested_at_idx",
         "alice_voice_recordings",
-        "CREATE INDEX IF NOT EXISTS alice_voice_recordings_ingested_at_idx ON alice_voice_recordings (ingested_at)",
+        "CREATE INDEX IF NOT EXISTS alice_voice_recordings_ingested_at_idx ON @alice_voice_recordings (ingested_at)",
     ),
     IndexSpec(
         "whatsapp_messages_ingested_at_idx",
         "whatsapp_messages",
-        "CREATE INDEX IF NOT EXISTS whatsapp_messages_ingested_at_idx ON whatsapp_messages (ingested_at)",
+        "CREATE INDEX IF NOT EXISTS whatsapp_messages_ingested_at_idx ON @whatsapp_messages (ingested_at)",
     ),
     *_ai_conversation_event_index_specs(),
 )
@@ -1052,8 +1043,6 @@ POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
     ("contact_cards_organization_bm25_idx", "contact_cards"),
     ("contact_cards_job_title_bm25_idx", "contact_cards"),
     ("contact_cards_notes_bm25_idx", "contact_cards"),
-    ("agent_session_events_text_bm25_idx", "agent_session_events"),
-    ("agent_session_events_title_bm25_idx", "agent_session_events"),
     ("agent_run_events_text_bm25_idx", "agent_run_events"),
     ("upstream_mutations_title_bm25_idx", "upstream_mutations"),
     ("upstream_mutation_requests_title_bm25_idx", "upstream_mutation_requests"),
@@ -1063,7 +1052,7 @@ POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
     # Raw-table text-scan trigram indexes retired 2026-07: production usage
     # counters showed them essentially never scanned (~13 GB of dead weight)
     # while the timeline search document covers the same text through
-    # search.search_text() / search.search_text_exact(). Raw tables serve
+    # timeline.search_text() / timeline.search_text_exact(). Raw tables serve
     # structured predicates; text search belongs to the timeline layer.
     # (from/subject/snippet trgm stay: the voice-memo identity hints and other
     # structured sender/subject lookups ride them.)
@@ -1094,7 +1083,6 @@ POSTGRES_INSERT_PAGE_SIZES = {
     "apple_message_attachments": 500,
     "whatsapp_messages": 500,
     "whatsapp_media_items": 500,
-    "agent_session_events": 500,
     "chatgpt_events": 500,
     "claude_desktop_events": 500,
     "claude_code_events": 500,
@@ -1486,7 +1474,7 @@ _PHOTO_TABLES = tuple(PHOTO_SOURCE_RELATIONS.values()) + (
     "photo_assets",
     "photo_asset_files",
     "media_fingerprints",
-    # The marts.photos caption join reads the shared enrichment table and the
+    # The marts_photos.photos caption join reads the shared enrichment table and the
     # enrichment candidate query counts agent_runs failures, so the photos
     # ensure must be able to run first on a fresh schema (voice-memos
     # precedent).
@@ -1527,6 +1515,7 @@ class PostgresWarehouse:
         self._ensure_canonical_schemas()
         self._set_search_path()
         self._ensure_query_role()
+        self._ensure_schema_comments()
 
     @property
     def schema_namespace(self) -> str:
@@ -1536,33 +1525,80 @@ class PostgresWarehouse:
     def query_role(self) -> str:
         return self._query_role
 
-    def physical_schema_names(self, *, include_private: bool = False) -> list[str]:
-        return physical_schema_names(namespace=self._schema, include_private=include_private)
+    def physical_schema_names(self, *, include_hidden: bool = False) -> list[str]:
+        return physical_schema_names(namespace=self._schema, include_hidden=include_hidden)
 
     def physical_schema_name(self, schema: str) -> str:
         return physical_schema_name(schema, namespace=self._schema)
 
+    def _object_schema(self, logical_name: str) -> str:
+        """Physical schema holding one catalog object (types/functions included)."""
+        return self.physical_schema_name(canonical_relation(logical_name).schema)
+
     def sql_relation(self, logical_name: str) -> str:
-        return query_relation(logical_name).sql(namespace=self._schema)
+        return canonical_relation(logical_name).sql(namespace=self._schema)
 
     def close(self) -> None:
         self._connection.close()
 
     def _ensure_canonical_schemas(self) -> None:
+        # One round trip, not one per schema: every PostgresWarehouse
+        # construction runs this (~30k/day in production across sensor ticks and
+        # asset runs) and the reorg took the managed schema count from 31 to 40.
+        statements = [
+            f"CREATE SCHEMA IF NOT EXISTS {_identifier(schema)}"
+            for schema in self.physical_schema_names(include_hidden=True)
+        ]
+        if self._schema != "public":
+            statements.insert(0, f"CREATE SCHEMA IF NOT EXISTS {_identifier(self._schema)}")
         with self._connection.cursor() as cursor:
-            if self._schema != "public":
-                cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_identifier(self._schema)}")
-            for schema in self.physical_schema_names(include_private=True):
-                cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_identifier(schema)}")
+            cursor.execute("; ".join(statements))
+
+    def _schema_comments(self) -> dict[str, str]:
+        comments: dict[str, str] = {}
+        for schema in CATALOG.schemas:
+            comment = schema.comment
+            if schema.name == CATALOG.start_here.schema:
+                comment = f"{CATALOG.start_here.headline} {comment}"
+            comments[self.physical_schema_name(schema.name)] = comment
+        return comments
+
+    def _ensure_schema_comments(self) -> None:
+        """Publish the catalog's layer guidance as Postgres COMMENTs.
+
+        An agent inspecting the database directly (psql's \\dn+, a generic SQL
+        client) never calls schema_overview, so the same "start with timeline,
+        then marts_*, then base_*" contract has to live in what Postgres itself
+        hands out. Probe first and write only on drift: like the query-role
+        sweep, an unconditional COMMENT ON per construction would churn
+        pg_description on every sensor tick.
+        """
+        expected = self._schema_comments()
+        current = {
+            schema: comment
+            for schema, comment in self._query(
+                """
+                SELECT n.nspname, obj_description(n.oid, 'pg_namespace')
+                FROM pg_namespace n
+                WHERE n.nspname = ANY(%s)
+                """,
+                (list(expected),),
+            )
+        }
+        for schema, comment in expected.items():
+            if current.get(schema) == comment:
+                continue
+            self._raw_command(f"COMMENT ON SCHEMA {_identifier(schema)} IS %s", (comment,))
 
     def _search_path_sql(self) -> str:
-        # Include every queryable schema so unqualified function/operator helper
-        # references continue to resolve internally, but callers should use
-        # schema-qualified relation names because many schemas now have tables
-        # named `messages`, `sync_state`, etc.
+        # Every managed schema except `private`, so unqualified helper/index
+        # references still resolve. Relation references never rely on this:
+        # warehouse SQL names relations through the catalog (`@logical_id`),
+        # because dozens of schemas now hold a `messages` or a `sync_state`.
         parts = [
             _identifier(self.physical_schema_name(schema))
-            for schema in QUERYABLE_SCHEMAS
+            for schema in ALL_CANONICAL_SCHEMAS
+            if schema != "private"
         ]
         parts.append("public")  # extensions such as pg_trgm / pg_textsearch live here.
         return "SET search_path TO " + ", ".join(parts)
@@ -1584,7 +1620,6 @@ class PostgresWarehouse:
         return connection
 
     def ensure_tables(self) -> None:
-        self._migrate_file_attachment_enrichments_rename()
         self._ensure_table_group(
             [
                 "gmail_messages",
@@ -1596,7 +1631,7 @@ class PostgresWarehouse:
         )
         for column in ("storage_backend", "storage_key", "storage_file_id", "storage_url", "storage_status"):
             self._command(
-                f"ALTER TABLE gmail_attachments ADD COLUMN IF NOT EXISTS {_identifier(column)} text NOT NULL DEFAULT ''"
+                f"ALTER TABLE @gmail_attachments ADD COLUMN IF NOT EXISTS {_identifier(column)} text NOT NULL DEFAULT ''"
             )
         self._ensure_clean_gmail_inbox_view()
         self._ensure_search_views_if_possible()
@@ -1607,42 +1642,8 @@ class PostgresWarehouse:
         Used by the source-agnostic attachment enrichment runner so it can write
         results without depending on any one source's ensure_* path.
         """
-        self._migrate_file_attachment_enrichments_rename()
         self._ensure_table_group(["file_attachment_enrichments"])
         self._ensure_search_views_if_possible()
-
-    def _migrate_file_attachment_enrichments_rename(self) -> None:
-        # gmail_attachment_enrichments became the shared file_attachment_enrichments
-        # table (Gmail + WhatsApp + any future source). Rename in place to preserve
-        # existing enrichments, and drop the old-named bm25/trgm indexes so the
-        # ensure step rebuilds them under the new names. Idempotent: once renamed,
-        # the IF EXISTS / IF NOT EXISTS clauses no-op on every later deploy.
-        target = query_relation("file_attachment_enrichments").with_namespace(self._schema)
-        legacy_locations = (self._schema, target.schema)
-        for legacy_schema in legacy_locations:
-            if not self._physical_table_exists(schema=legacy_schema, table="gmail_attachment_enrichments"):
-                continue
-            if self._physical_table_exists(schema=target.schema, table=target.name):
-                raise RuntimeError(
-                    f"cannot migrate legacy table {legacy_schema}.gmail_attachment_enrichments: "
-                    f"target {target.schema}.{target.name} already exists"
-                )
-            if legacy_schema != target.schema:
-                self._raw_command(
-                    f"ALTER TABLE {_identifier(legacy_schema)}.{_identifier('gmail_attachment_enrichments')} SET SCHEMA {_identifier(target.schema)}"
-                )
-            self._raw_command(
-                f"ALTER TABLE {_identifier(target.schema)}.{_identifier('gmail_attachment_enrichments')} RENAME TO {_identifier(target.name)}"
-            )
-            break
-        self._raw_command(f"DROP INDEX IF EXISTS {_identifier(target.schema)}.{_identifier('gmail_attachment_enrichments_text_bm25_idx')}")
-        self._raw_command(f"DROP INDEX IF EXISTS {_identifier(target.schema)}.{_identifier('gmail_attachment_enrichments_text_trgm_idx')}")
-        # ALTER TABLE ... RENAME does not rename the table's indexes, so a
-        # renamed deployment keeps serving its primary key under the old name.
-        self._raw_command(
-            f"ALTER INDEX IF EXISTS {_identifier(target.schema)}.{_identifier('gmail_attachment_enrichments_pkey')} "
-            f"RENAME TO {_identifier('file_attachment_enrichments_pkey')}"
-        )
 
     def ensure_calendar_tables(self) -> None:
         self._ensure_table_group(["calendar_events", "calendar_sync_state"])
@@ -1651,14 +1652,13 @@ class PostgresWarehouse:
 
     def ensure_contacts_tables(self) -> None:
         self._ensure_table_group(["contact_cards", "contact_sync_state", "apple_contact_cards"])
-        self._command("ALTER TABLE contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
-        self._command("ALTER TABLE apple_contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
-        self._drop_google_only_contacts_mart()
+        self._command("ALTER TABLE @contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
+        self._command("ALTER TABLE @apple_contact_cards ADD COLUMN IF NOT EXISTS nicknames jsonb NOT NULL DEFAULT '[]'::jsonb")
         rebuild_apple_messages_view = self._prepare_contacts_view_replacement()
         self._ensure_clean_contacts_view()
         self._ensure_clean_contact_points_view()
         if rebuild_apple_messages_view:
-            messages = query_relation("apple_messages").with_namespace(self._schema)
+            messages = canonical_relation("apple_messages").with_namespace(self._schema)
             if self._physical_table_exists(schema=messages.schema, table=messages.name):
                 self._ensure_clean_apple_messages_view()
         self._ensure_search_views_if_possible()
@@ -1731,10 +1731,23 @@ class PostgresWarehouse:
         Read-only: it never touches the catalog, so the common "everything is
         already granted" case costs one indexless scan of pg_class/pg_proc
         instead of a few hundred GRANT statements.
+
+        The contract it checks is the catalog's: every relation and function in
+        a discoverable schema readable, every allowlisted object outside them
+        readable, and everything else — ``ops`` beyond the allowlist,
+        ``private`` in full — unreachable for the role AND for PUBLIC.
         """
 
         schemas = self.physical_schema_names()
-        private_schema = self.physical_schema_name("private")
+        allowed_schemas, allowed_relations, allowed_functions = self._query_role_allowlist()
+        denied_schemas = [
+            self.physical_schema_name(schema) for schema in CATALOG.denied_schemas()
+        ]
+        denied_relations = [
+            f"{self.physical_schema_name(obj.schema)}.{obj.name}"
+            for obj in CATALOG.objects
+            if obj.query_access == "denied" and obj.is_relation
+        ]
         with self._connection.cursor() as cursor:
             cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (self._query_role,))
             if cursor.fetchone() is None:
@@ -1744,15 +1757,15 @@ class PostgresWarehouse:
                 SELECT
                     -- the connecting user must be able to hand out the role's grants
                     NOT pg_has_role(current_user, %(role)s, 'MEMBER')
-                    -- every managed schema must exist and be usable by the role
+                    -- every schema the role reaches must exist and be usable
                  OR EXISTS (
                         SELECT 1
-                        FROM unnest(%(schemas)s::text[]) AS s(name)
+                        FROM unnest(%(schemas)s::text[] || %(allowed_schemas)s::text[]) AS s(name)
                         LEFT JOIN pg_namespace n ON n.nspname = s.name
                         WHERE n.oid IS NULL
                            OR NOT has_schema_privilege(%(role)s, n.oid, 'USAGE')
                     )
-                    -- ...and every relation and function in them readable
+                    -- ...every relation and function in the public ones readable
                  OR EXISTS (
                         SELECT 1
                         FROM pg_class c
@@ -1768,38 +1781,77 @@ class PostgresWarehouse:
                         WHERE n.nspname = ANY(%(schemas)s::text[])
                           AND NOT has_function_privilege(%(role)s, p.oid, 'EXECUTE')
                     )
-                    -- Private token storage must stay unreachable, for the
-                    -- query role and for PUBLIC. Checked against *any*
-                    -- privilege, mirroring the REVOKE ALL the sweep issues, so
-                    -- this can never certify a narrower boundary than it sets.
+                    -- ...and each individually allowlisted object outside them
+                 OR EXISTS (
+                        SELECT 1
+                        FROM unnest(%(allowed_relations)s::text[]) AS r(name)
+                        WHERE to_regclass(r.name) IS NOT NULL
+                          AND NOT has_table_privilege(%(role)s, to_regclass(r.name), 'SELECT')
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                        FROM unnest(%(allowed_functions)s::text[]) AS f(name)
+                        WHERE to_regprocedure(f.name) IS NOT NULL
+                          AND NOT has_function_privilege(%(role)s, to_regprocedure(f.name), 'EXECUTE')
+                    )
+                    -- Credentials and un-allowlisted operational state must stay
+                    -- unreachable, for the query role and for PUBLIC. Checked
+                    -- against *any* privilege, mirroring the REVOKE ALL the
+                    -- sweep issues, so this can never certify a narrower
+                    -- boundary than it sets.
                  OR EXISTS (
                         SELECT 1
                         FROM pg_namespace n
-                        WHERE n.nspname = %(private)s
+                        WHERE n.nspname = ANY(%(denied_schemas)s::text[])
                           AND (
                                 has_schema_privilege(%(role)s, n.oid, 'USAGE, CREATE')
                              OR has_schema_privilege('public', n.oid, 'USAGE, CREATE')
-                             OR EXISTS (
-                                    SELECT 1
-                                    FROM pg_class c
-                                    WHERE c.relnamespace = n.oid
-                                      AND c.relkind = ANY (ARRAY['r', 'v', 'm', 'p', 'f']::"char"[])
-                                      AND (
-                                            has_table_privilege(%(role)s, c.oid, %(any_privilege)s)
-                                         OR has_table_privilege('public', c.oid, %(any_privilege)s)
-                                      )
-                                )
+                          )
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                        FROM unnest(%(denied_relations)s::text[]) AS r(name)
+                        WHERE to_regclass(r.name) IS NOT NULL
+                          AND (
+                                has_table_privilege(%(role)s, to_regclass(r.name), %(any_privilege)s)
+                             OR has_table_privilege('public', to_regclass(r.name), %(any_privilege)s)
                           )
                     )
                 """,
                 {
                     "role": self._query_role,
                     "schemas": schemas,
-                    "private": private_schema,
+                    "allowed_schemas": allowed_schemas,
+                    "allowed_relations": allowed_relations,
+                    "allowed_functions": allowed_functions,
+                    "denied_schemas": denied_schemas,
+                    "denied_relations": denied_relations,
                     "any_privilege": "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER",
                 },
             )
             return bool(cursor.fetchone()[0])
+
+    def _query_role_allowlist(self) -> tuple[list[str], list[str], list[str]]:
+        """Objects granted individually outside the blanket-granted schemas.
+
+        ``ops`` relations the app's own timeline/mutation surfaces read, and the
+        ``internal`` helper the inbox mart depends on. Everything else in those
+        schemas stays unreadable, so ``ops`` is not made publicly queryable just
+        to keep the operational UI working.
+        """
+        schemas: list[str] = []
+        relations: list[str] = []
+        functions: list[str] = []
+        for obj in CATALOG.query_role_extra_objects():
+            schema = self.physical_schema_name(obj.schema)
+            if schema not in schemas:
+                schemas.append(schema)
+            qualified = f"{_identifier(schema)}.{_identifier(obj.name)}"
+            if obj.is_relation:
+                relations.append(qualified)
+            elif obj.kind == "function":
+                functions.append(f"{qualified}(text, integer)")
+        return schemas, relations, functions
 
     def _ensure_query_role_locked(self) -> None:
         role = _identifier(self._query_role)
@@ -1818,29 +1870,79 @@ class PostgresWarehouse:
         current_user = str(self._query("SELECT current_user")[0][0])
         self._raw_command(f"GRANT {role} TO {_identifier(current_user)}")
 
-        private_schema = _identifier(self.physical_schema_name("private"))
-        self._raw_command(f"REVOKE ALL ON SCHEMA {private_schema} FROM PUBLIC")
-        self._raw_command(f"REVOKE ALL ON ALL TABLES IN SCHEMA {private_schema} FROM PUBLIC")
-        self._raw_command(f"REVOKE ALL ON SCHEMA {private_schema} FROM {role}")
-        self._raw_command(f"REVOKE ALL ON ALL TABLES IN SCHEMA {private_schema} FROM {role}")
+        revokes: list[str] = []
+        for schema_name in CATALOG.denied_schemas():
+            schema = _identifier(self.physical_schema_name(schema_name))
+            revokes += [
+                f"REVOKE ALL ON SCHEMA {schema} FROM PUBLIC",
+                f"REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM PUBLIC",
+                f"REVOKE ALL ON SCHEMA {schema} FROM {role}",
+                f"REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM {role}",
+            ]
 
+        # ops holds both allowlisted and denied relations. Revoke the whole
+        # schema, then re-grant exactly the allowlist below; ops carries no
+        # default privileges, so a table created later stays unreadable until
+        # the catalog says otherwise.
+        for schema_name in CATALOG.hidden_schemas():
+            if schema_name in CATALOG.denied_schemas():
+                continue
+            schema = _identifier(self.physical_schema_name(schema_name))
+            revokes += [
+                f"REVOKE ALL ON SCHEMA {schema} FROM PUBLIC",
+                f"REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM PUBLIC, {role}",
+            ]
+        self._raw_command("; ".join(revokes))
+
+        grants: list[str] = []
         for schema_name in self.physical_schema_names():
             schema = _identifier(schema_name)
-            self._raw_command(f"GRANT USAGE ON SCHEMA {schema} TO {role}")
-            self._raw_command(f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role}")
-            self._raw_command(f"GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {schema} TO {role}")
-            self._raw_command(f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT ON TABLES TO {role}")
-            self._raw_command(f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT EXECUTE ON FUNCTIONS TO {role}")
+            grants += [
+                f"GRANT USAGE ON SCHEMA {schema} TO {role}",
+                f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role}",
+                f"GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {schema} TO {role}",
+                f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT ON TABLES TO {role}",
+                f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT EXECUTE ON FUNCTIONS TO {role}",
+            ]
+        self._raw_command("; ".join(grants))
+
+        # The individually allowlisted objects outside those schemas. Grant only
+        # what exists: ensure_* creates them after this sweep, and each one is
+        # granted at creation (_apply_catalog_grant) plus by the next sweep the
+        # drift probe triggers.
+        allowed_schemas, allowed_relations, allowed_functions = self._query_role_allowlist()
+        allowlist = [
+            f"GRANT USAGE ON SCHEMA {_identifier(schema_name)} TO {role}"
+            for schema_name in allowed_schemas
+        ]
+        existing_relations = {
+            row[0]
+            for row in self._query(
+                "SELECT name FROM unnest(%s::text[]) AS r(name) WHERE to_regclass(r.name) IS NOT NULL",
+                (allowed_relations,),
+            )
+        }
+        allowlist += [f"GRANT SELECT ON {qualified} TO {role}" for qualified in existing_relations]
+        existing_functions = {
+            row[0]
+            for row in self._query(
+                "SELECT name FROM unnest(%s::text[]) AS f(name) WHERE to_regprocedure(f.name) IS NOT NULL",
+                (allowed_functions,),
+            )
+        }
+        allowlist += [
+            f"GRANT EXECUTE ON FUNCTION {qualified} TO {role}" for qualified in existing_functions
+        ]
+        if allowlist:
+            self._raw_command("; ".join(allowlist))
 
     def _ensure_plaid_finance_mart_views(self) -> None:
-        # marts.finance_accounts / marts.finance_transactions are ledger views
+        # marts_finance.accounts / marts_finance.transactions are ledger views
         # now (see _ensure_finance_ledger_mart_views); only the plaid-specific
         # investment/liability passthroughs remain here.
-        plaid = _identifier(self.physical_schema_name("plaid"))
-        marts = _identifier(self.physical_schema_name("marts"))
         view_sql = [
-            f"""
-            CREATE OR REPLACE VIEW {marts}.finance_investment_holdings AS
+            ("marts_finance_investment_holdings", """
+            CREATE OR REPLACE VIEW @marts_finance_investment_holdings AS
             SELECT
                 h.account,
                 h.item_id,
@@ -1857,13 +1959,13 @@ class PostgresWarehouse:
                 h.iso_currency_code,
                 h.unofficial_currency_code,
                 h.synced_at
-            FROM {plaid}.investment_holdings AS h
-            LEFT JOIN {plaid}.investment_securities AS s
+            FROM @plaid_investment_holdings AS h
+            LEFT JOIN @plaid_investment_securities AS s
               ON s.account = h.account
              AND s.security_id = h.security_id
-            """,
-            f"""
-            CREATE OR REPLACE VIEW {marts}.finance_investment_transactions AS
+            """),
+            ("marts_finance_investment_transactions", """
+            CREATE OR REPLACE VIEW @marts_finance_investment_transactions AS
             SELECT
                 t.account,
                 t.item_id,
@@ -1883,13 +1985,13 @@ class PostgresWarehouse:
                 t.iso_currency_code,
                 t.unofficial_currency_code,
                 t.synced_at
-            FROM {plaid}.investment_transactions AS t
-            LEFT JOIN {plaid}.investment_securities AS s
+            FROM @plaid_investment_transactions AS t
+            LEFT JOIN @plaid_investment_securities AS s
               ON s.account = t.account
              AND s.security_id = t.security_id
-            """,
-            f"""
-            CREATE OR REPLACE VIEW {marts}.finance_liabilities AS
+            """),
+            ("marts_finance_liabilities", """
+            CREATE OR REPLACE VIEW @marts_finance_liabilities AS
             SELECT
                 account,
                 item_id,
@@ -1905,11 +2007,11 @@ class PostgresWarehouse:
                 iso_currency_code,
                 unofficial_currency_code,
                 synced_at
-            FROM {plaid}.liabilities
-            """,
+            FROM @plaid_liabilities
+            """),
         ]
-        for sql in view_sql:
-            self._raw_command(sql)
+        for logical, sql in view_sql:
+            self._ensure_view(logical, sql)
 
     def ensure_finance_tables(self) -> None:
         self._ensure_table_group(
@@ -1924,16 +2026,14 @@ class PostgresWarehouse:
         self._ensure_finance_ledger_mart_views()
 
     def _ensure_finance_ledger_mart_views(self) -> None:
-        finance = _identifier(self.physical_schema_name("finance"))
-        marts = _identifier(self.physical_schema_name("marts"))
         # Each account contributes its single latest observation. Same-day
         # ties resolve by kind: balance (institution-authoritative) beats
         # principal beats valuation.
         kind_rank = "CASE o.kind WHEN 'balance' THEN 0 WHEN 'principal' THEN 1 ELSE 2 END"
-        self._ensure_physical_view(
-            f"{marts}.finance_net_worth",
+        self._ensure_view(
+            "marts_finance_net_worth",
             f"""
-            CREATE OR REPLACE VIEW {marts}.finance_net_worth AS
+            CREATE OR REPLACE VIEW @marts_finance_net_worth AS
             SELECT
                 a.account_id,
                 a.account,
@@ -1949,23 +2049,23 @@ class PostgresWarehouse:
                 o.source,
                 o.observed_at,
                 CASE WHEN a.side = 'liability' THEN -o.value ELSE o.value END AS signed_value
-            FROM {finance}.accounts AS a
+            FROM @finance_accounts AS a
             JOIN LATERAL (
                 SELECT o.kind, o.as_of, o.value, o.source, o.observed_at
-                FROM {finance}.observations AS o
+                FROM @finance_observations AS o
                 WHERE o.account_id = a.account_id
                 ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
                 LIMIT 1
             ) AS o ON TRUE
             """,
         )
-        self._ensure_physical_view(
-            f"{marts}.finance_net_worth_history",
+        self._ensure_view(
+            "marts_finance_net_worth_history",
             f"""
-            CREATE OR REPLACE VIEW {marts}.finance_net_worth_history AS
+            CREATE OR REPLACE VIEW @marts_finance_net_worth_history AS
             WITH days AS (
                 SELECT generate_series(
-                    (SELECT min(as_of) FROM {finance}.observations),
+                    (SELECT min(as_of) FROM @finance_observations),
                     CURRENT_DATE,
                     interval '1 day'
                 )::date AS day
@@ -1973,10 +2073,10 @@ class PostgresWarehouse:
             account_days AS (
                 SELECT d.day, a.side, o.value
                 FROM days AS d
-                CROSS JOIN {finance}.accounts AS a
+                CROSS JOIN @finance_accounts AS a
                 LEFT JOIN LATERAL (
                     SELECT o.value
-                    FROM {finance}.observations AS o
+                    FROM @finance_observations AS o
                     WHERE o.account_id = a.account_id AND o.as_of <= d.day
                     ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
                     LIMIT 1
@@ -1993,12 +2093,12 @@ class PostgresWarehouse:
             """,
         )
         # The ledger read surface REPLACES the old plaid passthrough views of
-        # the same names (different columns — _ensure_physical_view drops and
-        # recreates when CREATE OR REPLACE refuses).
-        self._ensure_physical_view(
-            f"{marts}.finance_accounts",
+        # the same names (different columns — _ensure_view drops and recreates
+        # when CREATE OR REPLACE refuses).
+        self._ensure_view(
+            "marts_finance_accounts",
             f"""
-            CREATE OR REPLACE VIEW {marts}.finance_accounts AS
+            CREATE OR REPLACE VIEW @marts_finance_accounts AS
             SELECT
                 a.account_id,
                 a.account,
@@ -2014,20 +2114,20 @@ class PostgresWarehouse:
                 o.source AS latest_observation_source,
                 a.created_at,
                 a.updated_at
-            FROM {finance}.accounts AS a
+            FROM @finance_accounts AS a
             LEFT JOIN LATERAL (
                 SELECT o.kind, o.as_of, o.value, o.source
-                FROM {finance}.observations AS o
+                FROM @finance_observations AS o
                 WHERE o.account_id = a.account_id
                 ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
                 LIMIT 1
             ) AS o ON TRUE
             """,
         )
-        self._ensure_physical_view(
-            f"{marts}.finance_transactions",
+        self._ensure_view(
+            "marts_finance_transactions",
             f"""
-            CREATE OR REPLACE VIEW {marts}.finance_transactions AS
+            CREATE OR REPLACE VIEW @marts_finance_transactions AS
             SELECT
                 t.transaction_id,
                 t.account_id,
@@ -2046,49 +2146,23 @@ class PostgresWarehouse:
                 t.merchant,
                 t.pending,
                 t.source
-            FROM {finance}.transactions AS t
-            JOIN {finance}.accounts AS a ON a.account_id = t.account_id
+            FROM @finance_transactions AS t
+            JOIN @finance_accounts AS a ON a.account_id = t.account_id
             """,
         )
 
     def ensure_receipt_tables(self) -> None:
         self._ensure_table_group(["receipt_transaction_receipts"])
-        self._drop_legacy_receipt_pipeline()
         self._ensure_receipt_mart_views()
 
-    def _drop_legacy_receipt_pipeline(self) -> None:
-        """Remove the artifact-first v1 tables after the v2 table exists.
-
-        The production trial produced no trusted transaction links, and its
-        extracted rows include known OCR errors. Leaving them queryable would
-        preserve a second, contradictory receipt architecture.
-        """
-        receipts_schema = self.physical_schema_name("receipts")
-        legacy_tables = ("artifact_triage", "records", "transaction_links")
-        if not any(
-            self._physical_table_exists(schema=receipts_schema, table=table)
-            for table in legacy_tables
-        ):
-            return
-
-        receipts = _identifier(receipts_schema)
-        marts = _identifier(self.physical_schema_name("marts"))
-        self._raw_command(f"DROP VIEW IF EXISTS {marts}.{_identifier('unmatched_receipts')}")
-        self._raw_command(f"DROP VIEW IF EXISTS {marts}.{_identifier('transaction_receipts')}")
-        for table in legacy_tables:
-            self._raw_command(f"DROP TABLE IF EXISTS {receipts}.{_identifier(table)}")
-
     def _ensure_receipt_mart_views(self) -> None:
-        receipts = _identifier(self.physical_schema_name("receipts"))
-        finance = _identifier(self.physical_schema_name("finance"))
-        marts = _identifier(self.physical_schema_name("marts"))
         # Every ledger transaction stays visible. The joined row contains the
         # durable search decision and, only for a verified high-confidence
         # match, receipt facts produced by that same agent operation.
-        self._ensure_physical_view(
-            f"{marts}.transaction_receipts",
-            f"""
-            CREATE OR REPLACE VIEW {marts}.transaction_receipts AS
+        self._ensure_view(
+            "marts_transaction_receipts",
+            """
+            CREATE OR REPLACE VIEW @marts_transaction_receipts AS
             SELECT
                 t.transaction_id,
                 t.account_id,
@@ -2122,8 +2196,8 @@ class PostgresWarehouse:
                 r.settled,
                 r.ai_model,
                 r.ai_processed_at
-            FROM {finance}.transactions AS t
-            LEFT JOIN {receipts}.transaction_receipts AS r
+            FROM @finance_transactions AS t
+            LEFT JOIN @receipt_transaction_receipts AS r
                 ON r.transaction_id = t.transaction_id
             """,
         )
@@ -2140,16 +2214,6 @@ class PostgresWarehouse:
                 "agent_run_tool_calls",
             ]
         )
-
-    def _ensure_physical_view(self, qualified_view: str, create_sql: str) -> None:
-        # Same shared-database drift rationale as _ensure_view, for marts views
-        # addressed by physical name (they are not registered logical
-        # relations). Plain DROP, no CASCADE: dependents fail loudly.
-        try:
-            self._raw_command(create_sql)
-        except psycopg2.errors.InvalidTableDefinition:
-            self._raw_command(f"DROP VIEW IF EXISTS {qualified_view}")
-            self._raw_command(create_sql)
 
     def ensure_apple_voice_memos_tables(self, *, backfill_content_hashes: bool = True) -> None:
         self._ensure_table_group(
@@ -2227,65 +2291,11 @@ class PostgresWarehouse:
 
     def ensure_agent_sessions_tables(self) -> None:
         self._ensure_table_group(_AI_CONVERSATION_EVENT_TABLES)
-        self._migrate_legacy_agent_session_events_if_present()
         self.ensure_chatgpt_tables()
         self.ensure_claude_desktop_tables()
         self._ensure_ai_conversation_events_view()
         self._ensure_clean_agent_sessions_view()
         self._ensure_search_views_if_possible()
-
-    def _migrate_legacy_agent_session_events_if_present(self) -> None:
-        legacy_schema = self._schema
-        legacy_table = "agent_session_events"
-        if not self._physical_table_exists(schema=legacy_schema, table=legacy_table):
-            return
-        column_sql = ", ".join(_identifier(column) for column in AGENT_SESSION_EVENT_COLUMNS)
-        for source, table in _AI_EVENT_TABLE_BY_SOURCE.items():
-            self._command(
-                f"""
-                INSERT INTO {self.sql_relation(table)} ({column_sql})
-                SELECT {column_sql}
-                FROM {_identifier(legacy_schema)}.{_identifier(legacy_table)}
-                WHERE source = %s
-                ON CONFLICT (source, session_id, event_uuid) DO UPDATE SET
-                    account = EXCLUDED.account,
-                    device = EXCLUDED.device,
-                    seq = EXCLUDED.seq,
-                    occurred_at = EXCLUDED.occurred_at,
-                    role = EXCLUDED.role,
-                    event_type = EXCLUDED.event_type,
-                    subtype = EXCLUDED.subtype,
-                    parent_uuid = EXCLUDED.parent_uuid,
-                    turn_id = EXCLUDED.turn_id,
-                    model = EXCLUDED.model,
-                    cwd = EXCLUDED.cwd,
-                    git_branch = EXCLUDED.git_branch,
-                    git_commit = EXCLUDED.git_commit,
-                    repo_url = EXCLUDED.repo_url,
-                    cli_version = EXCLUDED.cli_version,
-                    entrypoint = EXCLUDED.entrypoint,
-                    session_title = EXCLUDED.session_title,
-                    text = EXCLUDED.text,
-                    tool_name = EXCLUDED.tool_name,
-                    tool_input_json = EXCLUDED.tool_input_json,
-                    tool_result_json = EXCLUDED.tool_result_json,
-                    input_tokens = EXCLUDED.input_tokens,
-                    output_tokens = EXCLUDED.output_tokens,
-                    cache_read_tokens = EXCLUDED.cache_read_tokens,
-                    cache_creation_tokens = EXCLUDED.cache_creation_tokens,
-                    is_sidechain = EXCLUDED.is_sidechain,
-                    raw_json = EXCLUDED.raw_json,
-                    ingested_at = EXCLUDED.ingested_at,
-                    sync_version = EXCLUDED.sync_version
-                """,
-                (source,),
-            )
-        # Old deployments may have left public.clean_agent_sessions depending on
-        # the legacy public.agent_session_events table. Drop the legacy view before
-        # dropping the copied table; the canonical marts.ai_conversation_sessions
-        # view is recreated below by _ensure_clean_agent_sessions_view().
-        self._drop_legacy_view_if_present("clean_agent_sessions")
-        self._raw_command(f"DROP TABLE {_identifier(legacy_schema)}.{_identifier(legacy_table)}")
 
     def ensure_timeline_tables(self) -> None:
         """Tables for the unified timeline (personal_data_warehouse/timeline.py).
@@ -2301,55 +2311,17 @@ class PostgresWarehouse:
         # install _postgres_type builds the priority column as this type.
         self._ensure_timeline_priority_type()
         self._ensure_table_group(["timeline_events", "timeline_sync_state"])
-        timeline_rel = query_relation("timeline_events").with_namespace(self._schema)
-        # Rewrite any pre-enum (legacy bigint) priority column, before this
-        # method returns and therefore before the sync engine can write an enum
-        # label into a still-bigint column. On a large timeline the rewrite is a
-        # maintenance-window operation; see _migrate_timeline_priority_to_enum.
-        self._migrate_timeline_priority_to_enum(timeline_rel)
-        had_search_text = bool(
-            self._query(
-                """
-                SELECT 1
-                FROM information_schema.columns
-                WHERE table_schema = %s AND table_name = %s AND column_name = 'search_text'
-                LIMIT 1
-                """,
-                (timeline_rel.schema, timeline_rel.name),
-            )
-        )
-        self._migrate_legacy_named_table_if_present("timeline_gmail_correspondents", "timeline_gmail_correspondents")
         sequence_ref = self.sql_relation("timeline_events_seq")
-        self._command("CREATE SEQUENCE IF NOT EXISTS timeline_events_seq")
-        self._command(f"ALTER TABLE timeline_events ALTER COLUMN seq SET DEFAULT nextval('{sequence_ref}')")
-        self._command("ALTER TABLE timeline_events ALTER COLUMN first_seen_at SET DEFAULT now()")
-        self._command("ALTER TABLE timeline_events ALTER COLUMN updated_at SET DEFAULT now()")
-        # Additive migrations for timelines created before later normalized
-        # fields existed. `search_text` is the full BM25 document backing the
-        # general search function; re-syncing fills it in for old rows.
-        # (priority's own migration ran above, before this method's own work.)
-        self._command("ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS search_text text NOT NULL DEFAULT ''")
-        if not had_search_text:
-            # Existing timelines need a full re-walk so every historical row gets
-            # the full adapter-owned search document. New installs already start
-            # their backfill from scratch; this only resets pre-search timelines.
-            self._command(
-                """
-                UPDATE timeline_sync_state
-                SET backfill_cursor_event_ts = '9999-01-01 00:00:00+00'::timestamptz,
-                    backfill_cursor_event_id = '',
-                    backfill_done = 0,
-                    last_error = '',
-                    updated_at = now()
-                WHERE EXISTS (SELECT 1 FROM timeline_events LIMIT 1)
-                """
-            )
+        self._command("CREATE SEQUENCE IF NOT EXISTS @timeline_events_seq")
+        self._command(f"ALTER TABLE @timeline_events ALTER COLUMN seq SET DEFAULT nextval('{sequence_ref}')")
+        self._command("ALTER TABLE @timeline_events ALTER COLUMN first_seen_at SET DEFAULT now()")
+        self._command("ALTER TABLE @timeline_events ALTER COLUMN updated_at SET DEFAULT now()")
         # Addresses Zach has ever written to, with counts — the relationship
         # signal the gmail adapter's known-correspondent rule reads. Refreshed
         # by TimelineSyncEngine at most once per day.
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS timeline_gmail_correspondents (
+            CREATE TABLE IF NOT EXISTS @timeline_gmail_correspondents (
                 addr text PRIMARY KEY,
                 n_sent_to bigint NOT NULL DEFAULT 0,
                 last_sent_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
@@ -2360,84 +2332,31 @@ class PostgresWarehouse:
         self._ensure_search_views_if_possible()
 
     def _ensure_timeline_priority_type(self) -> None:
-        """Create the ``timeline_priority`` enum if it does not exist.
+        """Create the ``@timeline_priority`` enum if it does not exist.
 
-        Mirrors the ``search_text_hit`` composite-type bootstrap: the existence
-        probe is schema-qualified (``to_regtype`` takes a string literal that
-        ``qualify_sql_relations`` does not rewrite), while the ``CREATE TYPE``
-        uses the logical name so it lands in the timeline schema. Declaration
-        order is the sort order (highest attention first).
+        Mirrors the ``@search_text_hit`` composite-type bootstrap. Both the
+        probe and the CREATE name the type through the catalog: an unqualified
+        CREATE TYPE would land in whichever schema the search_path happens to
+        list first, which is a base_* source schema.
         """
-        timeline_schema = (
-            self.physical_schema_name("timeline") if hasattr(self, "physical_schema_name") else "timeline"
-        )
+        type_ref = self.sql_relation("timeline_priority")
+        type_literal = type_ref.replace("\'", "\'\'")
         self._command(
             r"""
             DO $do$
             BEGIN
                 IF to_regtype('"""
-            + timeline_schema
-            + r""".timeline_priority') IS NULL THEN
-                    CREATE TYPE timeline_priority AS ENUM
+            + type_literal
+            + r"""') IS NULL THEN
+                    CREATE TYPE """
+            + type_ref
+            + r""" AS ENUM
                         ('self', 'direct', 'cc', 'noise', 'background', 'unclassified');
                 END IF;
             END
             $do$;
             """
         )
-
-    def _migrate_timeline_priority_to_enum(self, timeline_rel: Any) -> None:
-        """One-time ``bigint`` -> ``timeline_priority`` migration of an existing table.
-
-        A single ``ALTER COLUMN ... TYPE ... USING``. That is the cheapest form
-        this change can take: one sequential heap rewrite plus a bulk rebuild of
-        the table's indexes (which also compacts accumulated bloat), where a
-        staged column and batched UPDATE instead writes a *second* row version
-        for every row and churns every index on every batch — several times the
-        I/O, and it leaves the same number of dead tuples behind for autovacuum.
-
-        The rewrite holds ACCESS EXCLUSIVE for its duration, so on a large
-        timeline this is a maintenance-window operation, not a background one:
-        readers and the sync engine both block until it finishes. Dropping the
-        table's large secondary indexes first (and rebuilding them after) cuts
-        the locked work to the heap rewrite plus the primary key.
-
-        Idempotent and safe to call from every process on every boot: a fresh
-        install already has the enum column from CREATE TABLE and returns on the
-        first probe, and the advisory lock keeps two concurrent Dagster runs
-        from both starting the rewrite (they would otherwise queue on the table
-        lock and rewrite it twice).
-        """
-        if self._timeline_priority_column_type(timeline_rel) != "bigint":
-            return
-        self._command("SELECT pg_advisory_lock(%s)", (TIMELINE_PRIORITY_MIGRATION_LOCK_ID,))
-        try:
-            # Re-probe under the lock: the process we queued behind may have
-            # been the one that migrated it.
-            if self._timeline_priority_column_type(timeline_rel) != "bigint":
-                return
-            self._command(
-                "ALTER TABLE timeline_events "
-                "ALTER COLUMN priority DROP DEFAULT, "
-                "ALTER COLUMN priority TYPE timeline_priority USING (CASE priority "
-                "WHEN 1 THEN 'self' WHEN 2 THEN 'direct' WHEN 3 THEN 'cc' "
-                "WHEN 4 THEN 'noise' WHEN 5 THEN 'background' "
-                "ELSE 'unclassified' END)::timeline_priority, "
-                "ALTER COLUMN priority SET DEFAULT 'unclassified'"
-            )
-        finally:
-            self._command("SELECT pg_advisory_unlock(%s)", (TIMELINE_PRIORITY_MIGRATION_LOCK_ID,))
-
-    def _timeline_priority_column_type(self, timeline_rel: Any) -> str | None:
-        rows = self._query(
-            """
-            SELECT data_type FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s AND column_name = 'priority'
-            LIMIT 1
-            """,
-            (timeline_rel.schema, timeline_rel.name),
-        )
-        return rows[0][0] if rows else None
 
     def ensure_claude_desktop_tables(self) -> None:
         """Tables for the serverside Claude Desktop poller.
@@ -2449,11 +2368,9 @@ class PostgresWarehouse:
         Postgres-durable per-conversation ``updated_at`` cursor so the poller does
         not re-fetch every conversation after a deploy.
         """
-        self._migrate_legacy_named_table_if_present("claude_desktop_credentials", "claude_desktop_credentials")
-        self._migrate_legacy_named_table_if_present("claude_desktop_conversation_state", "claude_desktop_conversation_state")
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS claude_desktop_credentials (
+            CREATE TABLE IF NOT EXISTS @claude_desktop_credentials (
                 account text PRIMARY KEY,
                 session_key text NOT NULL,
                 org_id text NOT NULL DEFAULT '',
@@ -2465,7 +2382,7 @@ class PostgresWarehouse:
         )
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS claude_desktop_conversation_state (
+            CREATE TABLE IF NOT EXISTS @claude_desktop_conversation_state (
                 account text NOT NULL,
                 conversation_id text NOT NULL,
                 updated_at text NOT NULL DEFAULT '',
@@ -2480,7 +2397,7 @@ class PostgresWarehouse:
         rows = self._query_dicts(
             """
             SELECT account, session_key, org_id, expires_at, captured_at, updated_at
-            FROM claude_desktop_credentials
+            FROM @claude_desktop_credentials
             WHERE account = %s
             """,
             (account,),
@@ -2501,7 +2418,7 @@ class PostgresWarehouse:
         rows = self._query_dicts(
             """
             SELECT account, session_key, org_id, expires_at, captured_at, updated_at
-            FROM claude_desktop_credentials
+            FROM @claude_desktop_credentials
             ORDER BY updated_at DESC
             LIMIT 1
             """
@@ -2511,7 +2428,7 @@ class PostgresWarehouse:
     def claude_desktop_cursor(self, *, account: str, conversation_id: str) -> str:
         rows = self._query(
             """
-            SELECT updated_at FROM claude_desktop_conversation_state
+            SELECT updated_at FROM @claude_desktop_conversation_state
             WHERE account = %s AND conversation_id = %s
             """,
             (account, conversation_id),
@@ -2524,7 +2441,7 @@ class PostgresWarehouse:
         synced = now or datetime.now(tz=UTC)
         self._command(
             """
-            INSERT INTO claude_desktop_conversation_state (account, conversation_id, updated_at, last_synced_at)
+            INSERT INTO @claude_desktop_conversation_state (account, conversation_id, updated_at, last_synced_at)
             VALUES (%s, %s, %s, %s)
             ON CONFLICT (account, conversation_id) DO UPDATE SET
                 updated_at = EXCLUDED.updated_at,
@@ -2534,10 +2451,9 @@ class PostgresWarehouse:
         )
 
     def ensure_whatsapp_client_session_table(self) -> None:
-        self._migrate_legacy_named_table_if_present("whatsapp_client_sessions", "whatsapp_client_sessions")
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS whatsapp_client_sessions (
+            CREATE TABLE IF NOT EXISTS @whatsapp_client_sessions (
                 account text NOT NULL,
                 session_key text NOT NULL DEFAULT 'default',
                 client_id text NOT NULL DEFAULT '',
@@ -2551,15 +2467,15 @@ class PostgresWarehouse:
             )
             """
         )
-        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS client_id text NOT NULL DEFAULT ''")
-        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS database_bytes bytea NOT NULL DEFAULT ''::bytea")
-        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS database_sha256 text NOT NULL DEFAULT ''")
-        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS database_bytes_size bigint NOT NULL DEFAULT 0")
+        self._command("ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS client_id text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS database_bytes bytea NOT NULL DEFAULT ''::bytea")
+        self._command("ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS database_sha256 text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS database_bytes_size bigint NOT NULL DEFAULT 0")
         self._command(
-            "ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS restored_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
+            "ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS restored_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
         )
-        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()")
-        self._command("ALTER TABLE whatsapp_client_sessions ADD COLUMN IF NOT EXISTS sync_version bigint NOT NULL DEFAULT 1")
+        self._command("ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()")
+        self._command("ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS sync_version bigint NOT NULL DEFAULT 1")
 
     def get_whatsapp_client_session(self, *, account: str, session_key: str) -> dict[str, Any] | None:
         self.ensure_whatsapp_client_session_table()
@@ -2567,7 +2483,7 @@ class PostgresWarehouse:
             """
             SELECT account, session_key, client_id, database_bytes, database_sha256,
                    database_bytes_size, restored_at, updated_at, sync_version
-            FROM whatsapp_client_sessions
+            FROM @whatsapp_client_sessions
             WHERE account = %s AND session_key = %s
             """,
             (account, session_key),
@@ -2595,7 +2511,7 @@ class PostgresWarehouse:
         sync_version = int(now.astimezone(UTC).timestamp() * 1_000_000)
         self._command(
             """
-            INSERT INTO whatsapp_client_sessions (
+            INSERT INTO @whatsapp_client_sessions (
                 account, session_key, client_id, database_bytes, database_sha256,
                 database_bytes_size, restored_at, updated_at, sync_version
             )
@@ -2645,10 +2561,9 @@ class PostgresWarehouse:
         ``whatsapp_client_sessions`` but holds an opaque token string rather than
         a SQLite snapshot.
         """
-        self._migrate_legacy_named_table_if_present("chatgpt_sessions", "chatgpt_sessions")
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS chatgpt_sessions (
+            CREATE TABLE IF NOT EXISTS @chatgpt_sessions (
                 account text NOT NULL,
                 session_key text NOT NULL DEFAULT 'default',
                 session_token text NOT NULL DEFAULT '',
@@ -2661,25 +2576,24 @@ class PostgresWarehouse:
             )
             """
         )
-        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS source_browser text NOT NULL DEFAULT ''")
-        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS token_sha256 text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS source_browser text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS token_sha256 text NOT NULL DEFAULT ''")
         self._command(
-            "ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS published_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
+            "ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS published_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
         )
-        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()")
-        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS sync_version bigint NOT NULL DEFAULT 1")
+        self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()")
+        self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS sync_version bigint NOT NULL DEFAULT 1")
         # A poll that gets a 401 marks the current token expired here so the sensor can
         # skip instead of relaunching doomed runs; keyed to the token's sha so a fresh
         # publish (which rotates the sha) clears it automatically.
-        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_at timestamptz")
-        self._command("ALTER TABLE chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_token_sha256 text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_at timestamptz")
+        self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_token_sha256 text NOT NULL DEFAULT ''")
 
     def ensure_chatgpt_conversation_sync_table(self) -> None:
         """Per-conversation incremental sync watermark for the ChatGPT poller."""
-        self._migrate_legacy_named_table_if_present("chatgpt_conversation_sync", "chatgpt_conversation_sync")
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS chatgpt_conversation_sync (
+            CREATE TABLE IF NOT EXISTS @chatgpt_conversation_sync (
                 account text NOT NULL,
                 session_id text NOT NULL,
                 update_time double precision NOT NULL DEFAULT 0,
@@ -2696,7 +2610,7 @@ class PostgresWarehouse:
             """
             SELECT account, session_key, session_token, source_browser, token_sha256,
                    published_at, updated_at, sync_version, expired_at, expired_token_sha256
-            FROM chatgpt_sessions
+            FROM @chatgpt_sessions
             WHERE account = %s AND session_key = %s
             """,
             (account, session_key),
@@ -2724,7 +2638,7 @@ class PostgresWarehouse:
         when = when or datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE chatgpt_sessions
+            UPDATE @chatgpt_sessions
             SET expired_at = %s, expired_token_sha256 = %s
             WHERE account = %s AND session_key = %s AND token_sha256 = %s
             """,
@@ -2736,7 +2650,7 @@ class PostgresWarehouse:
         self.ensure_chatgpt_session_table()
         self._command(
             """
-            UPDATE chatgpt_sessions
+            UPDATE @chatgpt_sessions
             SET expired_at = NULL, expired_token_sha256 = ''
             WHERE account = %s AND session_key = %s AND expired_at IS NOT NULL
             """,
@@ -2760,7 +2674,7 @@ class PostgresWarehouse:
         sync_version = int(now.astimezone(UTC).timestamp() * 1_000_000)
         self._command(
             """
-            INSERT INTO chatgpt_sessions (
+            INSERT INTO @chatgpt_sessions (
                 account, session_key, session_token, source_browser, token_sha256,
                 published_at, updated_at, sync_version
             )
@@ -2822,16 +2736,19 @@ class PostgresWarehouse:
         self._ensure_search_views_if_possible()
 
     def ensure_upstream_mutation_tables(self) -> None:
-        for legacy_table in (
+        self._ensure_upstream_mutation_tables_ddl()
+        for logical in (
             "upstream_mutation_requests",
             "upstream_mutations",
             "upstream_mutation_events",
             "upstream_mutation_request_events",
         ):
-            self._migrate_legacy_named_table_if_present(legacy_table, legacy_table)
+            self._apply_catalog_grant(logical)
+
+    def _ensure_upstream_mutation_tables_ddl(self) -> None:
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS upstream_mutation_requests (
+            CREATE TABLE IF NOT EXISTS @upstream_mutation_requests (
                 id text PRIMARY KEY,
                 status text NOT NULL DEFAULT 'pending_review',
                 title text NOT NULL DEFAULT '',
@@ -2853,7 +2770,7 @@ class PostgresWarehouse:
         )
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS upstream_mutations (
+            CREATE TABLE IF NOT EXISTS @upstream_mutations (
                 id text PRIMARY KEY,
                 request_id text NOT NULL DEFAULT '',
                 request_index bigint NOT NULL DEFAULT 0,
@@ -2882,11 +2799,11 @@ class PostgresWarehouse:
             )
             """
         )
-        self._command("ALTER TABLE upstream_mutations ADD COLUMN IF NOT EXISTS request_id text NOT NULL DEFAULT ''")
-        self._command("ALTER TABLE upstream_mutations ADD COLUMN IF NOT EXISTS request_index bigint NOT NULL DEFAULT 0")
+        self._command("ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS request_id text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS request_index bigint NOT NULL DEFAULT 0")
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS upstream_mutation_events (
+            CREATE TABLE IF NOT EXISTS @upstream_mutation_events (
                 mutation_id text NOT NULL,
                 event_index bigint NOT NULL,
                 event_type text NOT NULL DEFAULT '',
@@ -2900,7 +2817,7 @@ class PostgresWarehouse:
         )
         self._command(
             """
-            CREATE TABLE IF NOT EXISTS upstream_mutation_request_events (
+            CREATE TABLE IF NOT EXISTS @upstream_mutation_request_events (
                 request_id text NOT NULL,
                 event_index bigint NOT NULL,
                 event_type text NOT NULL DEFAULT '',
@@ -2913,13 +2830,13 @@ class PostgresWarehouse:
             """
         )
         for sql in (
-            "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutation_requests_idempotency_idx ON upstream_mutation_requests (idempotency_key) WHERE idempotency_key != ''",
-            "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_status_updated_idx ON upstream_mutation_requests (status, updated_at)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutations_idempotency_idx ON upstream_mutations (idempotency_key) WHERE idempotency_key != ''",
-            "CREATE INDEX IF NOT EXISTS upstream_mutations_request_idx ON upstream_mutations (request_id, request_index, created_at, id)",
-            "CREATE INDEX IF NOT EXISTS upstream_mutations_status_updated_idx ON upstream_mutations (status, updated_at)",
-            "CREATE INDEX IF NOT EXISTS upstream_mutation_request_events_request_idx ON upstream_mutation_request_events (request_id, event_index)",
-            "CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON upstream_mutation_events (mutation_id, event_index)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutation_requests_idempotency_idx ON @upstream_mutation_requests (idempotency_key) WHERE idempotency_key != ''",
+            "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_status_updated_idx ON @upstream_mutation_requests (status, updated_at)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutations_idempotency_idx ON @upstream_mutations (idempotency_key) WHERE idempotency_key != ''",
+            "CREATE INDEX IF NOT EXISTS upstream_mutations_request_idx ON @upstream_mutations (request_id, request_index, created_at, id)",
+            "CREATE INDEX IF NOT EXISTS upstream_mutations_status_updated_idx ON @upstream_mutations (status, updated_at)",
+            "CREATE INDEX IF NOT EXISTS upstream_mutation_request_events_request_idx ON @upstream_mutation_request_events (request_id, event_index)",
+            "CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON @upstream_mutation_events (mutation_id, event_index)",
         ):
             self._command(sql)
         # Recreate search_text() if needed; general search now reads the
@@ -2939,7 +2856,7 @@ class PostgresWarehouse:
                 (array_agg(from_address ORDER BY internal_date DESC, message_id ASC))[1] AS latest_from_address,
                 max(internal_date) AS latest_at,
                 count(*)::bigint AS inbox_message_count
-            FROM gmail_messages
+            FROM @gmail_messages
             WHERE account = %s
               AND thread_id = ANY(%s)
               AND is_deleted = 0
@@ -2974,7 +2891,7 @@ class PostgresWarehouse:
                 (array_agg(from_address ORDER BY internal_date DESC, message_id ASC))[1] AS latest_from_address,
                 max(internal_date) AS latest_at,
                 count(*)::bigint AS message_count
-            FROM gmail_messages
+            FROM @gmail_messages
             WHERE account = %s
               AND thread_id = ANY(%s)
               AND is_deleted = 0
@@ -3034,7 +2951,7 @@ class PostgresWarehouse:
         request_id = f"req_{uuid.uuid4().hex}"
         self._command(
             """
-            INSERT INTO upstream_mutation_requests (
+            INSERT INTO @upstream_mutation_requests (
                 id, status, title, reason, context_json, result_json, idempotency_key,
                 requested_by, created_at, updated_at
             )
@@ -3062,7 +2979,7 @@ class PostgresWarehouse:
             mutation_id = f"mut_{uuid.uuid4().hex}"
             self._command(
                 """
-                INSERT INTO upstream_mutations (
+                INSERT INTO @upstream_mutations (
                     id, request_id, request_index, provider, operation, account, status, title, reason,
                     payload_json, preview_json, result_json, idempotency_key,
                     requested_by, created_at, updated_at
@@ -3105,12 +3022,12 @@ class PostgresWarehouse:
         return created
 
     def get_upstream_mutation(self, mutation_id: str) -> dict[str, Any] | None:
-        rows = self._query_dicts("SELECT * FROM upstream_mutations WHERE id = %s", (mutation_id,))
+        rows = self._query_dicts("SELECT * FROM @upstream_mutations WHERE id = %s", (mutation_id,))
         return rows[0] if rows else None
 
     def get_upstream_mutation_request(self, request_id: str) -> dict[str, Any] | None:
         self.ensure_upstream_mutation_tables()
-        rows = self._query_dicts("SELECT * FROM upstream_mutation_requests WHERE id = %s", (request_id,))
+        rows = self._query_dicts("SELECT * FROM @upstream_mutation_requests WHERE id = %s", (request_id,))
         if not rows:
             return None
         request = rows[0]
@@ -3119,7 +3036,7 @@ class PostgresWarehouse:
 
     def get_upstream_mutation_request_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
         rows = self._query_dicts(
-            "SELECT id FROM upstream_mutation_requests WHERE idempotency_key = %s",
+            "SELECT id FROM @upstream_mutation_requests WHERE idempotency_key = %s",
             (idempotency_key,),
         )
         return self.get_upstream_mutation_request(str(rows[0]["id"])) if rows else None
@@ -3136,8 +3053,8 @@ class PostgresWarehouse:
                 """
                 SELECT request.*,
                        count(mutation.id)::bigint AS mutation_count
-                FROM upstream_mutation_requests AS request
-                LEFT JOIN upstream_mutations AS mutation ON mutation.request_id = request.id
+                FROM @upstream_mutation_requests AS request
+                LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
                 WHERE request.status = ANY(%s)
                 GROUP BY request.id
                 ORDER BY request.created_at DESC, request.id DESC
@@ -3149,8 +3066,8 @@ class PostgresWarehouse:
             """
             SELECT request.*,
                    count(mutation.id)::bigint AS mutation_count
-            FROM upstream_mutation_requests AS request
-            LEFT JOIN upstream_mutations AS mutation ON mutation.request_id = request.id
+            FROM @upstream_mutation_requests AS request
+            LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
             GROUP BY request.id
             ORDER BY request.created_at DESC, request.id DESC
             LIMIT %s
@@ -3163,7 +3080,7 @@ class PostgresWarehouse:
         return self._query_dicts(
             """
             SELECT *
-            FROM upstream_mutations
+            FROM @upstream_mutations
             WHERE request_id = %s
             ORDER BY request_index ASC, created_at ASC, id ASC
             """,
@@ -3174,7 +3091,7 @@ class PostgresWarehouse:
         return self._query_dicts(
             """
             SELECT *
-            FROM upstream_mutation_request_events
+            FROM @upstream_mutation_request_events
             WHERE request_id = %s
             ORDER BY event_index ASC
             """,
@@ -3192,7 +3109,7 @@ class PostgresWarehouse:
             return self._query_dicts(
                 """
                 SELECT *
-                FROM upstream_mutations
+                FROM @upstream_mutations
                 WHERE status = ANY(%s)
                 ORDER BY created_at DESC, id DESC
                 LIMIT %s
@@ -3202,7 +3119,7 @@ class PostgresWarehouse:
         return self._query_dicts(
             """
             SELECT *
-            FROM upstream_mutations
+            FROM @upstream_mutations
             ORDER BY created_at DESC, id DESC
             LIMIT %s
             """,
@@ -3213,7 +3130,7 @@ class PostgresWarehouse:
         return self._query_dicts(
             """
             SELECT *
-            FROM upstream_mutation_events
+            FROM @upstream_mutation_events
             WHERE mutation_id = %s
             ORDER BY event_index ASC
             """,
@@ -3248,7 +3165,7 @@ class PostgresWarehouse:
         now = datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE upstream_mutations
+            UPDATE @upstream_mutations
                SET status = 'rejected',
                    error = 'removed during review',
                    updated_at = %s
@@ -3258,7 +3175,7 @@ class PostgresWarehouse:
         )
         self._command(
             """
-            UPDATE upstream_mutation_requests
+            UPDATE @upstream_mutation_requests
                SET revision = revision + 1,
                    updated_at = %s
              WHERE id = %s
@@ -3299,7 +3216,7 @@ class PostgresWarehouse:
         now = datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE upstream_mutation_requests
+            UPDATE @upstream_mutation_requests
                SET status = 'approved',
                    approved_by = %s,
                    approved_at = %s,
@@ -3310,7 +3227,7 @@ class PostgresWarehouse:
         )
         self._command(
             """
-            UPDATE upstream_mutations
+            UPDATE @upstream_mutations
                SET status = 'approved',
                    approved_by = %s,
                    approved_at = %s,
@@ -3355,7 +3272,7 @@ class PostgresWarehouse:
         now = datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE upstream_mutation_requests
+            UPDATE @upstream_mutation_requests
                SET status = 'rejected',
                    error = %s,
                    updated_at = %s
@@ -3365,7 +3282,7 @@ class PostgresWarehouse:
         )
         self._command(
             """
-            UPDATE upstream_mutations
+            UPDATE @upstream_mutations
                SET status = 'rejected',
                    error = %s,
                    updated_at = %s
@@ -3451,7 +3368,7 @@ class PostgresWarehouse:
         now = datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE upstream_mutations
+            UPDATE @upstream_mutations
                SET payload_json = %s,
                    preview_json = %s,
                    revision = revision + 1,
@@ -3516,7 +3433,7 @@ class PostgresWarehouse:
         now = datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE upstream_mutations
+            UPDATE @upstream_mutations
                SET payload_json = %s,
                    preview_json = %s,
                    revision = revision + 1,
@@ -3569,7 +3486,7 @@ class PostgresWarehouse:
         now = datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE upstream_mutations
+            UPDATE @upstream_mutations
                SET payload_json = %s,
                    preview_json = %s,
                    revision = revision + 1,
@@ -3603,7 +3520,7 @@ class PostgresWarehouse:
         now = datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE upstream_mutations
+            UPDATE @upstream_mutations
                SET status = 'approved',
                    approved_by = %s,
                    approved_at = %s,
@@ -3641,7 +3558,7 @@ class PostgresWarehouse:
         now = datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE upstream_mutations
+            UPDATE @upstream_mutations
                SET status = 'rejected',
                    error = %s,
                    updated_at = %s
@@ -3672,13 +3589,13 @@ class PostgresWarehouse:
             """
             WITH candidates AS (
                 SELECT id
-                FROM upstream_mutations
+                FROM @upstream_mutations
                 WHERE status = ANY(%s)
                 ORDER BY approved_at ASC, created_at ASC, id ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
             )
-            UPDATE upstream_mutations AS mutation
+            UPDATE @upstream_mutations AS mutation
                SET status = 'executing',
                    claimed_by = %s,
                    claimed_at = %s,
@@ -3723,7 +3640,7 @@ class PostgresWarehouse:
             """
             WITH candidates AS (
                 SELECT id, request_id, claimed_by, attempt_count
-                FROM upstream_mutations
+                FROM @upstream_mutations
                 WHERE status = 'executing'
                   AND claimed_at < %s
                   AND (provider, operation) IN (
@@ -3731,7 +3648,7 @@ class PostgresWarehouse:
                   )
                 FOR UPDATE SKIP LOCKED
             )
-            UPDATE upstream_mutations AS mutation
+            UPDATE @upstream_mutations AS mutation
                SET status = 'approved',
                    claimed_by = '',
                    claimed_at = '1970-01-01 00:00:00+00'::timestamptz,
@@ -3779,7 +3696,7 @@ class PostgresWarehouse:
         rows = self._query(
             """
             SELECT count(*)::bigint
-            FROM upstream_mutations
+            FROM @upstream_mutations
             WHERE status = 'executing'
               AND claimed_at < %s
               AND (provider, operation) IN (
@@ -3794,7 +3711,7 @@ class PostgresWarehouse:
         now = datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE upstream_mutations
+            UPDATE @upstream_mutations
                SET status = 'succeeded',
                    result_json = %s,
                    error = '',
@@ -3836,7 +3753,7 @@ class PostgresWarehouse:
                 FROM jsonb_to_recordset(%s::jsonb) AS row(id text, result_json jsonb)
             ),
             updated AS (
-                UPDATE upstream_mutations AS mutation
+                UPDATE @upstream_mutations AS mutation
                    SET status = 'succeeded',
                        result_json = completion_data.result_json,
                        error = '',
@@ -3868,11 +3785,11 @@ class PostgresWarehouse:
                     event_data.mutation_id,
                     COALESCE(max(event.event_index) + 1, 0) AS event_index
                 FROM event_data
-                LEFT JOIN upstream_mutation_events AS event
+                LEFT JOIN @upstream_mutation_events AS event
                   ON event.mutation_id = event_data.mutation_id
                 GROUP BY event_data.mutation_id
             )
-            INSERT INTO upstream_mutation_events (
+            INSERT INTO @upstream_mutation_events (
                 mutation_id, event_index, event_type, actor_type, actor_id, event_json, created_at
             )
             SELECT
@@ -3906,7 +3823,7 @@ class PostgresWarehouse:
         now = datetime.now(tz=UTC)
         self._command(
             """
-            UPDATE upstream_mutations
+            UPDATE @upstream_mutations
                SET status = %s,
                    error = %s,
                    result_json = %s,
@@ -3932,7 +3849,7 @@ class PostgresWarehouse:
         rows = self._query(
             """
             SELECT count(*)::bigint
-            FROM upstream_mutations
+            FROM @upstream_mutations
             WHERE status = ANY(%s)
             """,
             (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES),),
@@ -3953,7 +3870,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT thread_id, message_id
-            FROM gmail_messages
+            FROM @gmail_messages
             WHERE account = %s
               AND thread_id = ANY(%s)
               AND is_deleted = 0
@@ -3976,7 +3893,7 @@ class PostgresWarehouse:
         mutations = self._query_dicts(
             """
             SELECT *
-            FROM upstream_mutations
+            FROM @upstream_mutations
             WHERE provider = 'gmail'
               AND operation = 'gmail.archive_threads'
               AND status = 'succeeded'
@@ -3994,7 +3911,7 @@ class PostgresWarehouse:
             live_rows = self._query(
                 """
                 SELECT thread_id
-                FROM gmail_messages
+                FROM @gmail_messages
                 WHERE account = %s
                   AND thread_id = ANY(%s)
                   AND is_deleted = 0
@@ -4010,7 +3927,7 @@ class PostgresWarehouse:
             now = datetime.now(tz=UTC)
             self._command(
                 """
-                UPDATE upstream_mutations
+                UPDATE @upstream_mutations
                    SET status = 'observed',
                        observed_at = %s,
                        updated_at = %s
@@ -4036,7 +3953,7 @@ class PostgresWarehouse:
         mutations = self._query_dicts(
             """
             SELECT *
-            FROM upstream_mutations
+            FROM @upstream_mutations
             WHERE provider = 'gmail'
               AND operation = 'gmail.unarchive_threads'
               AND status = 'succeeded'
@@ -4054,7 +3971,7 @@ class PostgresWarehouse:
             inbox_rows = self._query(
                 """
                 SELECT DISTINCT thread_id
-                FROM gmail_messages
+                FROM @gmail_messages
                 WHERE account = %s
                   AND thread_id = ANY(%s)
                   AND is_deleted = 0
@@ -4070,7 +3987,7 @@ class PostgresWarehouse:
             now = datetime.now(tz=UTC)
             self._command(
                 """
-                UPDATE upstream_mutations
+                UPDATE @upstream_mutations
                    SET status = 'observed',
                        observed_at = %s,
                        updated_at = %s
@@ -4096,7 +4013,7 @@ class PostgresWarehouse:
         mutations = self._query_dicts(
             """
             SELECT *
-            FROM upstream_mutations
+            FROM @upstream_mutations
             WHERE provider = 'gmail'
               AND operation = %s
               AND status = 'succeeded'
@@ -4121,7 +4038,7 @@ class PostgresWarehouse:
             rows = self._query(
                 """
                 SELECT message_id
-                FROM gmail_messages
+                FROM @gmail_messages
                 WHERE account = %s
                   AND message_id = ANY(%s)
                   AND is_deleted = 0
@@ -4134,7 +4051,7 @@ class PostgresWarehouse:
             now = datetime.now(tz=UTC)
             self._command(
                 """
-                UPDATE upstream_mutations
+                UPDATE @upstream_mutations
                    SET status = 'observed',
                        observed_at = %s,
                        updated_at = %s
@@ -4161,7 +4078,7 @@ class PostgresWarehouse:
         mutations = self._query_dicts(
             """
             SELECT *
-            FROM upstream_mutations
+            FROM @upstream_mutations
             WHERE provider = 'google_people'
               AND operation = %s
               AND status = 'succeeded'
@@ -4182,7 +4099,7 @@ class PostgresWarehouse:
             now = datetime.now(tz=UTC)
             self._command(
                 """
-                UPDATE upstream_mutations
+                UPDATE @upstream_mutations
                    SET status = 'observed',
                        observed_at = %s,
                        updated_at = %s
@@ -4209,7 +4126,7 @@ class PostgresWarehouse:
         mutations = self._query_dicts(
             """
             SELECT *
-            FROM upstream_mutations
+            FROM @upstream_mutations
             WHERE provider = %s
               AND operation = ANY(%s)
               AND status = 'succeeded'
@@ -4242,7 +4159,7 @@ class PostgresWarehouse:
             now = datetime.now(tz=UTC)
             self._command(
                 """
-                UPDATE upstream_mutations
+                UPDATE @upstream_mutations
                    SET status = 'observed',
                        observed_at = %s,
                        updated_at = %s
@@ -4275,7 +4192,7 @@ class PostgresWarehouse:
         rows = self._query_dicts(
             """
             SELECT is_deleted, raw_json
-            FROM calendar_events
+            FROM @calendar_events
             WHERE account = %s
               AND calendar_id = %s
               AND event_id = %s
@@ -4298,7 +4215,7 @@ class PostgresWarehouse:
         return str(live_event.get("etag") or "").strip() == expected_etag
 
     def _refresh_upstream_mutation_request_status(self, request_id: str) -> None:
-        request = self._query_dicts("SELECT * FROM upstream_mutation_requests WHERE id = %s", (request_id,))
+        request = self._query_dicts("SELECT * FROM @upstream_mutation_requests WHERE id = %s", (request_id,))
         if not request:
             return
         mutations = self.list_upstream_mutations_for_request(request_id)
@@ -4335,7 +4252,7 @@ class PostgresWarehouse:
         }
         self._command(
             """
-            UPDATE upstream_mutation_requests
+            UPDATE @upstream_mutation_requests
                SET status = %s,
                    result_json = %s,
                    executed_at = CASE WHEN %s > executed_at THEN %s ELSE executed_at END,
@@ -4621,7 +4538,7 @@ class PostgresWarehouse:
                 from_address AS latest_from_address,
                 rfc822_message_id,
                 internal_date AS latest_at
-            FROM gmail_messages
+            FROM @gmail_messages
             WHERE account = %s
               AND thread_id = %s
               AND is_deleted = 0
@@ -4746,7 +4663,7 @@ class PostgresWarehouse:
         rows = self._query_dicts(
             """
             SELECT *
-            FROM contact_cards
+            FROM @contact_cards
             WHERE source = 'google_people'
               AND account = %s
               AND source_kind = 'google_contacts'
@@ -4805,7 +4722,7 @@ class PostgresWarehouse:
     ) -> None:
         self._command(
             """
-            INSERT INTO upstream_mutation_events (
+            INSERT INTO @upstream_mutation_events (
                 mutation_id, event_index, event_type, actor_type, actor_id, event_json, created_at
             )
             SELECT
@@ -4816,7 +4733,7 @@ class PostgresWarehouse:
                 %s,
                 %s,
                 %s
-            FROM upstream_mutation_events
+            FROM @upstream_mutation_events
             WHERE mutation_id = %s
             """,
             (
@@ -4841,7 +4758,7 @@ class PostgresWarehouse:
     ) -> None:
         self._command(
             """
-            INSERT INTO upstream_mutation_request_events (
+            INSERT INTO @upstream_mutation_request_events (
                 request_id, event_index, event_type, actor_type, actor_id, event_json, created_at
             )
             SELECT
@@ -4852,7 +4769,7 @@ class PostgresWarehouse:
                 %s,
                 %s,
                 %s
-            FROM upstream_mutation_request_events
+            FROM @upstream_mutation_request_events
             WHERE request_id = %s
             """,
             (
@@ -4872,7 +4789,6 @@ class PostgresWarehouse:
         self._ensure_indexes(tables)
 
     def _ensure_table(self, table: str) -> None:
-        self._migrate_legacy_table_if_present(table)
         spec = POSTGRES_TABLES[table]
         column_sql = [
             f"{_identifier(column)} {_postgres_type(column, table=table)} NOT NULL DEFAULT {_default_sql(column, table=table)}"
@@ -4890,42 +4806,27 @@ class PostgresWarehouse:
         if spec.storage_parameters:
             settings = ", ".join(f"{key} = {value}" for key, value in spec.storage_parameters)
             self._command(f"ALTER TABLE {self.sql_relation(table)} SET ({settings})")
+        self._apply_catalog_grant(table)
 
-    def _migrate_legacy_table_if_present(self, table: str) -> None:
-        self._migrate_legacy_named_table_if_present(table, table)
+    def _apply_catalog_grant(self, logical_name: str) -> None:
+        """Grant a hidden-schema object the exact access the catalog allows.
 
-    def _migrate_legacy_named_table_if_present(self, legacy_table: str, logical_name: str) -> None:
-        if logical_name not in CANONICAL_RELATIONS:
+        Schemas outside the discoverable set carry no default privileges, so an
+        allowlisted ops relation or the internal helper has to be granted when it
+        is created — the role sweep runs at connection time, before ensure_*
+        creates anything.
+        """
+        obj = CATALOG.object(logical_name)
+        if obj.query_access not in {"app_only", "execute_only"}:
             return
-        rel = query_relation(logical_name).with_namespace(self._schema)
-        if rel.schema == self._schema and rel.name == legacy_table:
-            return
-        if not self._physical_table_exists(schema=self._schema, table=legacy_table):
-            return
-        if not self._physical_table_exists(schema=rel.schema, table=rel.name):
-            self._raw_command(
-                f"ALTER TABLE {_identifier(self._schema)}.{_identifier(legacy_table)} SET SCHEMA {_identifier(rel.schema)}"
-            )
-            if rel.name != legacy_table:
-                self._raw_command(f"ALTER TABLE {_identifier(rel.schema)}.{_identifier(legacy_table)} RENAME TO {_identifier(rel.name)}")
-            return
-        common_columns = self._common_table_columns(
-            source_schema=self._schema,
-            source_table=legacy_table,
-            target_schema=rel.schema,
-            target_table=rel.name,
-        )
-        if common_columns:
-            column_sql = ", ".join(_identifier(column) for column in common_columns)
-            self._raw_command(
-                f"""
-                INSERT INTO {_identifier(rel.schema)}.{_identifier(rel.name)} ({column_sql})
-                SELECT {column_sql}
-                FROM {_identifier(self._schema)}.{_identifier(legacy_table)}
-                ON CONFLICT DO NOTHING
-                """
-            )
-        self._raw_command(f"DROP TABLE IF EXISTS {_identifier(self._schema)}.{_identifier(legacy_table)}")
+        role = _identifier(self._query_role)
+        rel = canonical_relation(logical_name).with_namespace(self._schema)
+        qualified = f"{_identifier(rel.schema)}.{_identifier(rel.name)}"
+        self._raw_command(f"GRANT USAGE ON SCHEMA {_identifier(rel.schema)} TO {role}")
+        if obj.kind == "function":
+            self._raw_command(f"GRANT EXECUTE ON FUNCTION {qualified}(text, integer) TO {role}")
+        else:
+            self._raw_command(f"GRANT SELECT ON {qualified} TO {role}")
 
     def _common_table_columns(
         self,
@@ -4951,9 +4852,6 @@ class PostgresWarehouse:
         )
         return [row[0] for row in rows]
 
-    def _legacy_table_exists(self, table: str) -> bool:
-        return self._physical_table_exists(schema=self._schema, table=table)
-
     def _physical_table_exists(self, *, schema: str, table: str) -> bool:
         rows = self._query(
             """
@@ -4975,6 +4873,7 @@ class PostgresWarehouse:
                 if self._index_exists(index.name):
                     self._ensured_index_names.add(index.name)
                     continue
+                self._drop_invalid_index(index.name)
                 if index.requires_pg_trgm and not self._pg_trgm_ensured:
                     self._command("CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public")
                     self._pg_trgm_ensured = True
@@ -5006,6 +4905,36 @@ class PostgresWarehouse:
             except Exception:
                 pass
 
+    def _drop_invalid_index(self, index_name: str) -> None:
+        """Clear a failed CREATE INDEX CONCURRENTLY leftover so it can be rebuilt.
+
+        An interrupted concurrent build leaves an index that is neither valid
+        nor usable, and it occupies the name: every later ensure_* sees "not
+        valid" from _index_exists, tries to create it, and gets "already
+        exists" — which the caller swallows. The index is dead weight forever
+        and its table silently loses that access path. Production carried five
+        of these across the agent-session event tables.
+        """
+        invalid = self._query(
+            """
+            SELECT n.nspname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_index i ON i.indexrelid = c.oid
+            WHERE n.nspname = ANY(%s)
+              AND c.relname = %s
+              AND c.relkind = 'i'
+              AND NOT (i.indisvalid AND i.indisready)
+            LIMIT 1
+            """,
+            (self.physical_schema_names(include_hidden=True), index_name),
+        )
+        if not invalid:
+            return
+        schema = _identifier(str(invalid[0][0]))
+        logger.warning("dropping invalid index %s.%s so it can be rebuilt", schema, index_name)
+        self._raw_command(f"DROP INDEX CONCURRENTLY IF EXISTS {schema}.{_identifier(index_name)}")
+
     def _index_exists(self, index_name: str) -> bool:
         rows = self._query(
             """
@@ -5020,7 +4949,7 @@ class PostgresWarehouse:
               AND i.indisready
             LIMIT 1
             """,
-            (self.physical_schema_names(include_private=True), index_name),
+            (self.physical_schema_names(include_hidden=True), index_name),
         )
         return bool(rows)
 
@@ -5028,7 +4957,7 @@ class PostgresWarehouse:
         rows = self._query(
             """
             SELECT account, last_history_id, last_sync_type, status, error, updated_at
-            FROM gmail_sync_state
+            FROM @gmail_sync_state
             """
         )
         return {
@@ -5065,7 +4994,7 @@ class PostgresWarehouse:
         ai_pending_clause = """
               NOT EXISTS (
                   SELECT 1
-                  FROM gmail_attachment_backfill_state state
+                  FROM @gmail_attachment_backfill_state state
                   WHERE state.account = gm.account
                     AND state.message_id = gm.message_id
                     AND state.status = 'ok'
@@ -5076,7 +5005,7 @@ class PostgresWarehouse:
             pending_clause = f"""({ai_pending_clause}
               OR EXISTS (
                   SELECT 1
-                  FROM gmail_attachments pending
+                  FROM @gmail_attachments pending
                   WHERE pending.account = gm.account
                     AND pending.message_id = gm.message_id
                     AND pending.is_deleted = 0
@@ -5089,7 +5018,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT payload_json
-            FROM gmail_messages AS gm
+            FROM @gmail_messages AS gm
             WHERE account = %s
               AND is_deleted = 0
               AND {_postgres_gmail_attachment_candidate_clause()}
@@ -5141,7 +5070,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT {", ".join(_identifier(column) for column in columns)}
-            FROM file_attachment_enrichments
+            FROM @file_attachment_enrichments
             WHERE content_sha256 = ANY(%s)
               AND ai_provider = %s
               AND ai_model = %s
@@ -5177,7 +5106,7 @@ class PostgresWarehouse:
         rows = self._query(
             """
             SELECT file_id, source_modified_time, content_sha256
-            FROM google_drive_file_texts
+            FROM @google_drive_file_texts
             WHERE account = %s AND text_extraction_status = 'ok'
             """,
             (account,),
@@ -5194,7 +5123,7 @@ class PostgresWarehouse:
             return
         self._command(
             """
-            UPDATE google_drive_files
+            UPDATE @google_drive_files
             SET trashed = 1,
                 sync_version = GREATEST(sync_version + 1, %s)
             WHERE account = %s AND file_id = ANY(%s)
@@ -5207,7 +5136,7 @@ class PostgresWarehouse:
             """
             SELECT account, start_page_token, last_page_token, drive_id,
                    last_sync_type, status, error, full_crawled_at, files_seen
-            FROM google_drive_sync_state
+            FROM @google_drive_sync_state
             """
         )
         return {
@@ -5245,11 +5174,11 @@ class PostgresWarehouse:
 
     def load_whoop_sync_state(self) -> dict[tuple[str, str], dict[str, Any]]:
         columns = WHOOP_SYNC_STATE_COLUMNS
-        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM whoop_sync_state")
+        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM @whoop_sync_state")
         return {(str(row[0]), str(row[1])): dict(zip(columns, row, strict=True)) for row in rows}
 
     def load_whoop_oauth_token(self, *, account: str) -> str:
-        rows = self._query("SELECT token_json FROM whoop_oauth_tokens WHERE account = %s", (account,))
+        rows = self._query("SELECT token_json FROM @whoop_oauth_tokens WHERE account = %s", (account,))
         return str(rows[0][0]) if rows else ""
 
     def upsert_whoop_oauth_token(self, *, account: str, token_json: str, updated_at: datetime) -> None:
@@ -5301,7 +5230,7 @@ class PostgresWarehouse:
         rows = self._query(
             """
             SELECT event_id
-            FROM calendar_events
+            FROM @calendar_events
             WHERE account = %s
               AND calendar_id = %s
               AND recurring_event_id != ''
@@ -5326,7 +5255,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT {", ".join(_identifier(column) for column in CALENDAR_EVENT_COLUMNS)}
-            FROM calendar_events
+            FROM @calendar_events
             WHERE account = %s
               AND calendar_id = %s
               AND event_id = ANY(%s)
@@ -5359,7 +5288,7 @@ class PostgresWarehouse:
             "expanded_window_end",
             "updated_at",
         )
-        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM calendar_sync_state")
+        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM @calendar_sync_state")
         return {
             (str(row[0]), str(row[1])): dict(zip(columns, row, strict=True))
             for row in rows
@@ -5407,7 +5336,7 @@ class PostgresWarehouse:
 
     def load_contact_sync_state(self) -> dict[tuple[str, str, str, str], dict[str, Any]]:
         columns = CONTACT_SYNC_STATE_COLUMNS
-        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM contact_sync_state")
+        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM @contact_sync_state")
         return {
             (str(row[0]), str(row[1]), str(row[2]), str(row[3])): dict(zip(columns, row, strict=True))
             for row in rows
@@ -5478,7 +5407,7 @@ class PostgresWarehouse:
         rows = self._query(
             """
             SELECT account, item_id, access_token, institution_id, institution_name
-            FROM plaid_item_tokens
+            FROM @plaid_item_tokens
             ORDER BY account, institution_name, item_id
             """
         )
@@ -5495,7 +5424,7 @@ class PostgresWarehouse:
 
     def load_plaid_sync_state(self) -> dict[tuple[str, str, str], dict[str, Any]]:
         columns = PLAID_SYNC_STATE_COLUMNS
-        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM plaid_sync_state")
+        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM @plaid_sync_state")
         return {
             (str(row[0]), str(row[1]), str(row[2])): dict(zip(columns, row, strict=True))
             for row in rows
@@ -5523,7 +5452,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT {", ".join(_identifier(column) for column in PLAID_ACCOUNT_COLUMNS)}
-            FROM plaid_accounts
+            FROM @plaid_accounts
             WHERE account = %s
               AND item_id = %s
               AND is_removed = 0
@@ -5558,7 +5487,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT {", ".join(_identifier(column) for column in PLAID_TRANSACTION_COLUMNS)}
-            FROM plaid_transactions
+            FROM @plaid_transactions
             WHERE account = %s
               AND item_id = %s
               AND transaction_id = ANY(%s)
@@ -5664,7 +5593,7 @@ class PostgresWarehouse:
         return self._query_dicts(
             """
             SELECT account_id, name, mask, type, subtype, current_balance, is_removed
-            FROM plaid_accounts
+            FROM @plaid_accounts
             WHERE account = %s AND item_id = %s
             ORDER BY mask, account_id
             """,
@@ -5690,7 +5619,7 @@ class PostgresWarehouse:
         unlink`), not a sync outcome: re-linking an institution can mint a NEW
         item_id instead of repairing the old one, and both Items then keep
         reporting the same real accounts — double-counting balances in
-        marts.finance_net_worth and duplicating every transaction in the
+        marts_finance.net_worth and duplicating every transaction in the
         overlap window. Tombstones would not help; those rows have to stop
         existing. plaid_investment_securities is deliberately absent: it is
         keyed by account, not item, and is shared across Items.
@@ -5772,12 +5701,12 @@ class PostgresWarehouse:
         removed = self._query(
             """
             WITH removed_links AS (
-                DELETE FROM finance_transaction_links
+                DELETE FROM @finance_transaction_links
                 WHERE (source || '|' || source_row_key) <> ALL(%s)
                 RETURNING 1
             ),
             removed_transactions AS (
-                DELETE FROM finance_transactions
+                DELETE FROM @finance_transactions
                 WHERE transaction_id <> ALL(%s)
                 RETURNING 1
             )
@@ -5794,27 +5723,27 @@ class PostgresWarehouse:
         re-pointed, so an account reaches zero links exactly once: when the
         source that founded it merged into an older account for the same real
         account (a Plaid re-link forks one). What is left is derived residue —
-        keeping it double-counts the account in marts.finance_net_worth.
+        keeping it double-counts the account in marts_finance.net_worth.
         Transactions are reconciled separately by the same run.
         """
         removed = self._query(
             """
             WITH unlinked AS (
                 SELECT a.account_id
-                FROM finance_accounts AS a
+                FROM @finance_accounts AS a
                 WHERE NOT EXISTS (
                     SELECT 1
-                    FROM finance_account_links AS l
+                    FROM @finance_account_links AS l
                     WHERE l.account_id = a.account_id
                 )
             ),
             removed_observations AS (
-                DELETE FROM finance_observations
+                DELETE FROM @finance_observations
                 WHERE account_id IN (SELECT account_id FROM unlinked)
                 RETURNING 1
             ),
             removed_accounts AS (
-                DELETE FROM finance_accounts
+                DELETE FROM @finance_accounts
                 WHERE account_id IN (SELECT account_id FROM unlinked)
                 RETURNING 1
             )
@@ -5847,7 +5776,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT {", ".join(_identifier(column) for column in CONTACT_CARD_COLUMNS)}
-            FROM contact_cards
+            FROM @contact_cards
             WHERE source = %s
               AND account = %s
               AND source_kind = %s
@@ -5967,7 +5896,7 @@ class PostgresWarehouse:
         """
         rows = self._query(
             """
-            INSERT INTO whatsapp_chats (
+            INSERT INTO @whatsapp_chats (
                 account, chat_id, name, chat_type, is_archived,
                 last_message_at, raw_metadata_json, ingested_at, sync_version
             )
@@ -5987,8 +5916,8 @@ class PostgresWarehouse:
                 '{"source":"synthesized_from_message"}',
                 now(),
                 1
-            FROM (SELECT DISTINCT account, chat_id FROM whatsapp_messages) m
-            LEFT JOIN whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id
+            FROM (SELECT DISTINCT account, chat_id FROM @whatsapp_messages) m
+            LEFT JOIN @whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id
             WHERE c.chat_id IS NULL AND m.chat_id <> ''
             ON CONFLICT (account, chat_id) DO NOTHING
             RETURNING 1
@@ -6027,7 +5956,7 @@ class PostgresWarehouse:
         rows = self._query_dicts(
             """
             SELECT session_id, update_time
-            FROM chatgpt_conversation_sync
+            FROM @chatgpt_conversation_sync
             WHERE account = %s
             """,
             (account,),
@@ -6047,7 +5976,7 @@ class PostgresWarehouse:
         synced = synced_at or datetime.now(tz=UTC)
         self._command(
             """
-            INSERT INTO chatgpt_conversation_sync (account, session_id, update_time, event_count, synced_at)
+            INSERT INTO @chatgpt_conversation_sync (account, session_id, update_time, event_count, synced_at)
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (account, session_id) DO UPDATE SET
                 update_time = EXCLUDED.update_time,
@@ -6083,10 +6012,10 @@ class PostgresWarehouse:
                 f.storage_key,
                 f.storage_file_id,
                 f.storage_url
-            FROM apple_voice_memos_files AS f
+            FROM @apple_voice_memos_files AS f
             LEFT JOIN (
                 SELECT account, recording_id, content_sha256, completed_at
-                FROM apple_voice_memos_transcription_runs
+                FROM @apple_voice_memos_transcription_runs
                 WHERE provider = %s
                   AND (
                     status = 'completed'
@@ -6129,7 +6058,7 @@ class PostgresWarehouse:
         rows = self._query(
             """
             SELECT message_id
-            FROM gmail_messages
+            FROM @gmail_messages
             WHERE account = %s
               AND is_deleted = 0
               AND message_id = ANY(%s)
@@ -6149,7 +6078,7 @@ class PostgresWarehouse:
         rows = self._query(
             """
             SELECT message_id, part_id, filename
-            FROM gmail_attachments
+            FROM @gmail_attachments
             WHERE account = %s
               AND is_deleted = 0
               AND message_id = ANY(%s)
@@ -6169,7 +6098,7 @@ class PostgresWarehouse:
         rows = self._query(
             """
             SELECT message_id, payload_json
-            FROM gmail_messages
+            FROM @gmail_messages
             WHERE account = %s
               AND is_deleted = 0
               AND message_id = ANY(%s)
@@ -6214,7 +6143,7 @@ class PostgresWarehouse:
             "error",
             "updated_at",
         )
-        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM slack_sync_state")
+        rows = self._query(f"SELECT {', '.join(_identifier(column) for column in columns)} FROM @slack_sync_state")
         return {
             (str(row[0]), str(row[1]), str(row[2]), str(row[3])): dict(zip(columns, row, strict=True))
             for row in rows
@@ -6253,7 +6182,7 @@ class PostgresWarehouse:
             existing_rows = self._query(
                 """
                 SELECT conversation_id, raw_json
-                FROM slack_conversations
+                FROM @slack_conversations
                 WHERE account = %s
                   AND team_id = %s
                   AND conversation_id = ANY(%s)
@@ -6312,7 +6241,7 @@ class PostgresWarehouse:
         """
         self._command(
             """
-            UPDATE slack_conversations
+            UPDATE @slack_conversations
                SET is_archived = 1
              WHERE account = %s
                AND team_id = %s
@@ -6355,13 +6284,13 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT c.raw_json
-            FROM slack_conversations AS c
-            LEFT JOIN slack_sync_state AS s
+            FROM @slack_conversations AS c
+            LEFT JOIN @slack_sync_state AS s
               ON c.account = s.account
              AND c.team_id = s.team_id
              AND c.conversation_id = s.object_id
              AND s.object_type = 'conversation'
-            LEFT JOIN slack_conversation_stats AS m
+            LEFT JOIN @slack_conversation_stats AS m
               ON c.account = m.account
              AND c.team_id = m.team_id
              AND c.conversation_id = m.conversation_id
@@ -6429,7 +6358,7 @@ class PostgresWarehouse:
         if missing_replies_only:
             where.append(
                 "NOT EXISTS ("
-                "SELECT 1 FROM slack_messages AS r "
+                "SELECT 1 FROM @slack_messages AS r "
                 "WHERE r.account = m.account "
                 "AND r.team_id = m.team_id "
                 "AND r.conversation_id = m.conversation_id "
@@ -6449,13 +6378,13 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT m.conversation_id, m.message_ts, m.reply_count, m.latest_reply_ts, m.message_datetime
-            FROM slack_messages AS m
-            LEFT JOIN slack_sync_state AS s
+            FROM @slack_messages AS m
+            LEFT JOIN @slack_sync_state AS s
               ON m.account = s.account
              AND m.team_id = s.team_id
              AND s.object_type = 'thread'
              AND m.conversation_id || ':' || m.message_ts = s.object_id
-            LEFT JOIN slack_conversations AS c
+            LEFT JOIN @slack_conversations AS c
               ON m.account = c.account
              AND m.team_id = c.team_id
              AND m.conversation_id = c.conversation_id
@@ -6501,8 +6430,8 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT c.raw_json
-            FROM slack_conversations AS c
-            LEFT JOIN slack_conversation_stats AS m
+            FROM @slack_conversations AS c
+            LEFT JOIN @slack_conversation_stats AS m
               ON c.account = m.account
              AND c.team_id = m.team_id
              AND c.conversation_id = m.conversation_id
@@ -6550,8 +6479,8 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT c.raw_json
-            FROM slack_conversations AS c
-            LEFT JOIN slack_sync_state AS s
+            FROM @slack_conversations AS c
+            LEFT JOIN @slack_sync_state AS s
               ON c.account = s.account
              AND c.team_id = s.team_id
              AND c.conversation_id = s.object_id
@@ -6590,7 +6519,7 @@ class PostgresWarehouse:
             params.append(active_user_ids)
         self._command(
             f"""
-            UPDATE slack_conversation_members
+            UPDATE @slack_conversation_members
                SET is_deleted = 1,
                    synced_at = %s,
                    sync_version = %s
@@ -6632,7 +6561,7 @@ class PostgresWarehouse:
             delete_where.append("team_id = %s")
             delete_params.append(team_id)
 
-        delete_sql = "DELETE FROM slack_conversation_stats"
+        delete_sql = "DELETE FROM @slack_conversation_stats"
         if delete_where:
             delete_sql += " WHERE " + " AND ".join(delete_where)
         try:
@@ -6640,7 +6569,7 @@ class PostgresWarehouse:
             self._command(delete_sql, tuple(delete_params))
             self._command(
                 f"""
-                INSERT INTO slack_conversation_stats (
+                INSERT INTO @slack_conversation_stats (
                     account,
                     team_id,
                     conversation_id,
@@ -6655,7 +6584,7 @@ class PostgresWarehouse:
                     count(*)::bigint AS message_count,
                     max(message_datetime) AS latest_message_at,
                     clock_timestamp() AS updated_at
-                FROM slack_messages
+                FROM @slack_messages
                 WHERE {" AND ".join(where)}
                 GROUP BY account, team_id, conversation_id
                 """,
@@ -6670,8 +6599,8 @@ class PostgresWarehouse:
         rows = self._query(
             """
             SELECT
-                EXISTS (SELECT 1 FROM slack_conversation_stats LIMIT 1),
-                EXISTS (SELECT 1 FROM slack_messages LIMIT 1)
+                EXISTS (SELECT 1 FROM @slack_conversation_stats LIMIT 1),
+                EXISTS (SELECT 1 FROM @slack_messages LIMIT 1)
             """
         )
         if rows and not bool(rows[0][0]) and bool(rows[0][1]):
@@ -6737,7 +6666,7 @@ class PostgresWarehouse:
         with self._connection.cursor() as cursor:
             execute_values(
                 cursor,
-                self._qualify_sql(
+                self._expand_relations(
                     """
                     WITH incoming(account, team_id, conversation_id, message_ts) AS (VALUES %s)
                     SELECT
@@ -6748,7 +6677,7 @@ class PostgresWarehouse:
                         m.is_deleted,
                         m.message_datetime,
                         m.sync_version
-                    FROM slack_messages AS m
+                    FROM @slack_messages AS m
                     INNER JOIN incoming AS i
                       ON m.account = i.account
                      AND m.team_id = i.team_id
@@ -6801,9 +6730,9 @@ class PostgresWarehouse:
         with self._connection.cursor() as cursor:
             execute_values(
                 cursor,
-                self._qualify_sql(
+                self._expand_relations(
                     """
-                    INSERT INTO slack_conversation_stats AS target (
+                    INSERT INTO @slack_conversation_stats AS target (
                         account,
                         team_id,
                         conversation_id,
@@ -6842,10 +6771,10 @@ class PostgresWarehouse:
             with self._connection.cursor() as cursor:
                 execute_values(
                     cursor,
-                    self._qualify_sql(
+                    self._expand_relations(
                         """
                         WITH affected(account, team_id, conversation_id) AS (VALUES %s)
-                        DELETE FROM slack_conversation_stats AS s
+                        DELETE FROM @slack_conversation_stats AS s
                         USING affected AS a
                         WHERE s.account = a.account
                           AND s.team_id = a.team_id
@@ -6858,10 +6787,10 @@ class PostgresWarehouse:
                 )
                 execute_values(
                     cursor,
-                    self._qualify_sql(
+                    self._expand_relations(
                         """
                         WITH affected(account, team_id, conversation_id) AS (VALUES %s)
-                        INSERT INTO slack_conversation_stats (
+                        INSERT INTO @slack_conversation_stats (
                             account,
                             team_id,
                             conversation_id,
@@ -6876,7 +6805,7 @@ class PostgresWarehouse:
                             count(*)::bigint AS message_count,
                             max(m.message_datetime) AS latest_message_at,
                             clock_timestamp() AS updated_at
-                        FROM slack_messages AS m
+                        FROM @slack_messages AS m
                         INNER JOIN affected AS a
                           ON m.account = a.account
                          AND m.team_id = a.team_id
@@ -6920,7 +6849,7 @@ class PostgresWarehouse:
         active_rows = self._query(
             f"""
             SELECT {columns}
-            FROM slack_account_state_item_rows
+            FROM @slack_account_state_item_rows
             WHERE account = %s
               AND scope_id = %s
               AND is_deleted = 0
@@ -6929,7 +6858,7 @@ class PostgresWarehouse:
         )
         self._command(
             f"""
-            INSERT INTO slack_account_state_item_rows AS target ({columns})
+            INSERT INTO @slack_account_state_item_rows AS target ({columns})
             {self._slack_account_state_items_select_sql()}
             {_upsert_clause("slack_account_state_item_rows", POSTGRES_TABLES["slack_account_state_item_rows"], target_alias="target")}
             """,
@@ -6965,7 +6894,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT message_ts
-            FROM slack_messages
+            FROM @slack_messages
             WHERE account = %s
               AND team_id = %s
               AND conversation_id = %s
@@ -6996,7 +6925,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"""
             SELECT conversation_id, MAX({_numeric_ts("message_ts")}) AS high_water
-            FROM slack_messages
+            FROM @slack_messages
             WHERE account = %s
               AND team_id = %s
               AND conversation_id = ANY(%s)
@@ -7020,10 +6949,10 @@ class PostgresWarehouse:
     def _backfill_voice_memo_transcription_run_content_hashes(self) -> None:
         self._command(
             """
-            UPDATE apple_voice_memos_transcription_runs AS r
+            UPDATE @apple_voice_memos_transcription_runs AS r
             SET content_sha256 = f.content_sha256,
                 sync_version = GREATEST(r.sync_version + 1, (extract(epoch from clock_timestamp()) * 1000000)::bigint)
-            FROM apple_voice_memos_files AS f
+            FROM @apple_voice_memos_files AS f
             WHERE r.account = f.account
               AND r.recording_id = f.recording_id
               AND r.content_sha256 = ''
@@ -7034,10 +6963,10 @@ class PostgresWarehouse:
     def _backfill_voice_memo_enrichment_content_hashes(self) -> None:
         self._command(
             """
-            UPDATE apple_voice_memos_enrichments AS e
+            UPDATE @apple_voice_memos_enrichments AS e
             SET content_sha256 = f.content_sha256,
                 sync_version = GREATEST(e.sync_version + 1, (extract(epoch from clock_timestamp()) * 1000000)::bigint)
-            FROM apple_voice_memos_files AS f
+            FROM @apple_voice_memos_files AS f
             WHERE e.account = f.account
               AND e.recording_id = f.recording_id
               AND e.content_sha256 = ''
@@ -7052,11 +6981,6 @@ class PostgresWarehouse:
 
     _SEARCH_SCHEMA_MARKER_TABLE = "search_schema_state"
 
-    # Search routines/types the pre-reorganization layout created directly in
-    # the base namespace, before they moved into the `search` schema.
-    _LEGACY_SEARCH_ROUTINES = ("search_text", "search_text_exact", "search_text_sources")
-    _LEGACY_SEARCH_HIT_TYPE = "search_text_hit"
-
     def _ensure_search_views_if_possible(self) -> None:
         # Several Dagster assets can call ensure_* concurrently on deploy. The
         # shared search_text() function/index refresh mutates global Postgres
@@ -7069,16 +6993,6 @@ class PostgresWarehouse:
             self._command("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
 
     def _ensure_search_views_if_possible_locked(self) -> None:
-        # The person_identities view was removed; drop any copy left behind by
-        # deployments that created it.
-        self._command("DROP VIEW IF EXISTS person_identities")
-        # The legacy cross-source searchable_text view (a ~30-branch UNION that
-        # callers scanned with ILIKE/~*, often OR-ing the un-indexable computed
-        # `who` column, and which therefore timed out) has been replaced by the
-        # BM25 search_text() function. Drop any copy older deployments left
-        # behind so it cannot be used as a slow fallback.
-        self._command("DROP VIEW IF EXISTS searchable_text")
-        self._drop_legacy_search_routines_if_present()
         if not all(self._relation_exists(table) for table in self._SEARCHABLE_TEXT_TABLES):
             return
         # Build the timeline BM25 index search_text() references BEFORE
@@ -7096,62 +7010,6 @@ class PostgresWarehouse:
             return
         self._ensure_search_text_function()
         self._write_search_schema_signature(signature)
-
-    def _drop_legacy_search_routines_if_present(self) -> None:
-        """Drop pre-reorganization search_text copies from the base namespace.
-
-        The schema reorganization moved these functions (and their row type)
-        into the `search` schema but left the base-namespace copies behind, and
-        a stale copy does not sit there harmlessly: it SHADOWS the real one.
-        Callers that do not set a search_path — the app's read-only query
-        runner resolves through Postgres' default '"$user", public' — found
-        `public.search_text` first. That copy predates the function-level
-        search_path pin below, so its per-branch dynamic SQL could not resolve
-        the timeline BM25 index, and search_text()'s per-branch exception guard
-        (which exists so one unusable branch degrades instead of failing the
-        whole search) turned that into an empty result set. Unqualified search
-        silently returned zero rows for 16 days while search.search_text()
-        worked fine.
-
-        Sweeping on every refresh, rather than once behind the DDL signature
-        cache, keeps a copy resurrected by an older deployment from shadowing
-        the current functions again.
-        """
-        legacy_schema = self._schema
-        if legacy_schema == self.physical_schema_name("search"):
-            return
-        routines = self._query(
-            """
-            SELECT p.proname, pg_get_function_identity_arguments(p.oid)
-            FROM pg_proc p
-            JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE n.nspname = %s AND p.proname = ANY(%s)
-            """,
-            (legacy_schema, list(self._LEGACY_SEARCH_ROUTINES)),
-        )
-        for name, arguments in routines:
-            self._raw_command(
-                f"DROP FUNCTION IF EXISTS {_identifier(legacy_schema)}.{_identifier(name)}({arguments})"
-            )
-        legacy_type_present = bool(
-            self._query(
-                """
-                SELECT 1
-                FROM pg_type t
-                JOIN pg_namespace n ON n.oid = t.typnamespace
-                WHERE n.nspname = %s AND t.typname = %s
-                LIMIT 1
-                """,
-                (legacy_schema, self._LEGACY_SEARCH_HIT_TYPE),
-            )
-        )
-        if legacy_type_present:
-            # Plain DROP (no CASCADE): the functions above were the only thing
-            # that should reference this row type, so anything still depending
-            # on it is a surprise worth failing on rather than deleting.
-            self._raw_command(
-                f"DROP TYPE IF EXISTS {_identifier(legacy_schema)}.{_identifier(self._LEGACY_SEARCH_HIT_TYPE)}"
-            )
 
     def _search_schema_signature(self) -> str:
         """Signature of everything that determines the generated search DDL.
@@ -7179,14 +7037,13 @@ class PostgresWarehouse:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _stored_search_schema_signature(self) -> str | None:
-        self._migrate_legacy_named_table_if_present("pdw_search_schema_state", self._SEARCH_SCHEMA_MARKER_TABLE)
         self._command(
-            f"CREATE TABLE IF NOT EXISTS {_identifier(self._SEARCH_SCHEMA_MARKER_TABLE)} "
+            f"CREATE TABLE IF NOT EXISTS {self.sql_relation(self._SEARCH_SCHEMA_MARKER_TABLE)} "
             "(id smallint PRIMARY KEY DEFAULT 1, signature text NOT NULL, "
             "CONSTRAINT search_schema_state_single_row CHECK (id = 1))"
         )
         rows = self._query(
-            f"SELECT signature FROM {_identifier(self._SEARCH_SCHEMA_MARKER_TABLE)} WHERE id = 1"
+            f"SELECT signature FROM {self.sql_relation(self._SEARCH_SCHEMA_MARKER_TABLE)} WHERE id = 1"
         )
         if not rows:
             return None
@@ -7194,7 +7051,7 @@ class PostgresWarehouse:
 
     def _write_search_schema_signature(self, signature: str) -> None:
         self._command(
-            f"INSERT INTO {_identifier(self._SEARCH_SCHEMA_MARKER_TABLE)} (id, signature) "
+            f"INSERT INTO {self.sql_relation(self._SEARCH_SCHEMA_MARKER_TABLE)} (id, signature) "
             "VALUES (1, %s) ON CONFLICT (id) DO UPDATE SET signature = EXCLUDED.signature",
             (signature,),
         )
@@ -7208,7 +7065,7 @@ class PostgresWarehouse:
             WHERE p.proname IN ('search_text', 'search_text_exact')
               AND n.nspname = %s
             """,
-            (self.physical_schema_name("search"),),
+            (self._object_schema("search_text"),),
         )
         return bool(rows) and int(rows[0][0]) == 2
 
@@ -7255,7 +7112,7 @@ class PostgresWarehouse:
                 "t.context AS context, t.actor AS who, t.event_ts AS occurred_at, "
                 "COALESCE(t.source_pk->>'account', t.metadata->>'account', '') AS account, "
                 "t.adapter || ':' || t.event_id AS ref, t.search_text AS text, "
-                f"({rank})::real AS score FROM timeline_events t "
+                f"({rank})::real AS score FROM @timeline_events t "
                 f"WHERE {where_sql} ORDER BY {rank} LIMIT %2$s )"
             )
 
@@ -7286,24 +7143,25 @@ class PostgresWarehouse:
             + subsource_whens
             + "\n                    ELSE t.kind\n                END"
         )
-        search_schema_name = self.physical_schema_name("search") if hasattr(self, "physical_schema_name") else "search"
         # The per-branch row cast below lives inside a SQL string literal, which
-        # the relation qualifier deliberately leaves alone, so it has to be
-        # written schema-qualified here. An unqualified `::search_text_hit`
-        # resolved — through the function's own pinned search_path, whose last
-        # entry is public — to the pre-reorganization public.search_text_hit
-        # type. Every branch then depended on a legacy leftover, and dropping it
-        # silently emptied all of them (the per-branch guard swallows the type
-        # lookup error).
-        hit_type_sql = self.sql_relation("search_text_hit") if hasattr(self, "sql_relation") else '"search"."text_hit"'
+        # relation expansion deliberately leaves alone, so it has to be written
+        # schema-qualified here. An unqualified `::text_hit` resolved — through
+        # the function's own pinned search_path, whose last entry is public — to
+        # the pre-reorganization public.search_text_hit type. Every branch then
+        # depended on a legacy leftover, and dropping it silently emptied all of
+        # them (the per-branch guard swallows the type lookup error).
+        hit_type_sql = self.sql_relation("search_text_hit")
+        hit_type_literal = hit_type_sql.replace("'", "''")
         self._command(
             r"""
             DO $do$
             BEGIN
                 IF to_regtype('"""
-            + search_schema_name
-            + r""".text_hit') IS NULL THEN
-                    CREATE TYPE search_text_hit AS (
+            + hit_type_literal
+            + r"""') IS NULL THEN
+                    CREATE TYPE """
+            + hit_type_sql
+            + r""" AS (
                         source text, subsource text, context text, who text,
                         occurred_at timestamptz, account text, ref text,
                         text text, score real
@@ -7311,13 +7169,13 @@ class PostgresWarehouse:
                 END IF;
             END
             $do$;
-            CREATE OR REPLACE FUNCTION search_text(
+            CREATE OR REPLACE FUNCTION @search_text(
                 query text,
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
                 since timestamptz DEFAULT NULL
             )
-            RETURNS SETOF search_text_hit
+            RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
             STABLE
             AS $fn$
@@ -7344,8 +7202,8 @@ class PostgresWarehouse:
                 branch_source text;
                 branch text;
                 branch_idx integer;
-                hits search_text_hit[] := '{}';
-                branch_hits search_text_hit[];
+                hits @search_text_hit[] := '{}';
+                branch_hits @search_text_hit[];
             BEGIN
                 IF sources IS NOT NULL THEN
                     FOREACH branch_source IN ARRAY sources LOOP
@@ -7399,13 +7257,13 @@ class PostgresWarehouse:
                     LIMIT per_source;
             END;
             $fn$;
-            CREATE OR REPLACE FUNCTION search_text_exact(
+            CREATE OR REPLACE FUNCTION @search_text_exact(
                 query text,
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
                 since timestamptz DEFAULT NULL
             )
-            RETURNS SETOF search_text_hit
+            RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
             STABLE
             AS $fn$
@@ -7465,7 +7323,7 @@ class PostgresWarehouse:
                                t.adapter || ':' || t.event_id AS ref,
                                t.search_text AS text,
                                NULL::real AS score
-                        FROM timeline_events t
+                        FROM @timeline_events t
                         JOIN (VALUES """
             + adapter_source_values
             + r""") AS map(adapter, source) ON map.adapter = t.adapter
@@ -7483,7 +7341,7 @@ class PostgresWarehouse:
                     ORDER BY hit.occurred_at DESC;
             END;
             $fn$;
-            CREATE OR REPLACE FUNCTION search_text_sources()
+            CREATE OR REPLACE FUNCTION @search_text_sources()
             RETURNS TABLE (source text)
             LANGUAGE sql
             IMMUTABLE
@@ -7516,7 +7374,7 @@ class PostgresWarehouse:
 
     def _search_text_alter_sql(self) -> str:
         function_path = self._search_path_sql().removeprefix("SET search_path TO ")
-        search_schema = _identifier(self.physical_schema_name("search"))
+        search_schema = _identifier(self._object_schema("search_text"))
         return "; ".join(
             f'ALTER FUNCTION {search_schema}."{function_name}"(text, integer, text[], timestamptz) '
             f"SET search_path TO {function_path}"
@@ -7524,7 +7382,6 @@ class PostgresWarehouse:
         )
 
     def _ensure_view(self, view: str, create_sql: str) -> None:
-        self._drop_legacy_view_if_present(view)
         # CREATE OR REPLACE VIEW refuses to drop, rename, or retype an existing
         # view's columns, and this database is shared: another checkout running
         # a different revision can leave a view whose columns no longer match
@@ -7536,46 +7393,22 @@ class PostgresWarehouse:
         try:
             self._command(create_sql)
         except psycopg2.errors.InvalidTableDefinition:
-            try:
-                view_ref = self.sql_relation(view)
-            except KeyError:
-                view_ref = _identifier(view)
-            self._command(f"DROP VIEW IF EXISTS {view_ref}")
+            self._command(f"DROP VIEW IF EXISTS {self.sql_relation(view)}")
             self._command(create_sql)
-
-    def _drop_legacy_view_if_present(self, view: str) -> None:
-        try:
-            rel = query_relation(view).with_namespace(self._schema)
-        except KeyError:
-            return
-        if rel.schema == self._schema and rel.name == view:
-            return
-        rows = self._query(
-            """
-            SELECT 1
-            FROM information_schema.views
-            WHERE table_schema = %s AND table_name = %s
-            LIMIT 1
-            """,
-            (self._schema, view),
-        )
-        if rows:
-            self._raw_command(f"DROP VIEW IF EXISTS {_identifier(self._schema)}.{_identifier(view)}")
 
     def _ensure_clean_gmail_inbox_view(self) -> None:
         self._ensure_utf8_byte_prefix_function()
-        util_prefix_fn = f"{_identifier(self.physical_schema_name('util'))}.utf8_byte_prefix"
         self._ensure_view(
             "clean_gmail_inbox",
             """
-            CREATE OR REPLACE VIEW clean_gmail_inbox AS
+            CREATE OR REPLACE VIEW @clean_gmail_inbox AS
             SELECT
                 account,
                 thread_id,
                 max(internal_date) AS latest_at,
                 (array_agg(from_address ORDER BY internal_date DESC, message_id ASC))[1] AS latest_from_address,
                 (array_agg(subject ORDER BY internal_date DESC, message_id ASC))[1] AS subject,
-                __UTF8_PREFIX_FN__(
+                @utf8_byte_prefix(
                     (array_agg(
                         COALESCE(NULLIF(body_markdown_clean, ''), NULLIF(body_markdown, ''), NULLIF(body_text, ''), snippet)
                         ORDER BY internal_date DESC, message_id ASC
@@ -7599,20 +7432,19 @@ class PostgresWarehouse:
                     '}',
                     ',' ORDER BY internal_date ASC, message_id ASC
                 ) || ']' AS thread_messages_json
-            FROM gmail_messages
+            FROM @gmail_messages
             WHERE is_deleted = 0
               AND 'INBOX' = ANY(label_ids)
               AND NOT ('TRASH' = ANY(label_ids))
               AND NOT ('SPAM' = ANY(label_ids))
             GROUP BY account, thread_id
-            """.replace("__UTF8_PREFIX_FN__", util_prefix_fn)
+            """,
         )
 
     def _ensure_utf8_byte_prefix_function(self) -> None:
-        util_prefix_fn = f"{_identifier(self.physical_schema_name('util'))}.utf8_byte_prefix"
         self._command(
-            f"""
-            CREATE OR REPLACE FUNCTION {util_prefix_fn}(value text, max_bytes integer)
+            """
+            CREATE OR REPLACE FUNCTION @utf8_byte_prefix(value text, max_bytes integer)
             RETURNS text
             LANGUAGE plpgsql
             IMMUTABLE
@@ -7638,12 +7470,13 @@ class PostgresWarehouse:
             $$;
             """
         )
+        self._apply_catalog_grant("utf8_byte_prefix")
 
     def _ensure_clean_slack_inbox_view(self) -> None:
         self._ensure_view(
             "clean_slack_inbox",
             """
-            CREATE OR REPLACE VIEW clean_slack_inbox AS
+            CREATE OR REPLACE VIEW @clean_slack_inbox AS
             SELECT
                 account,
                 scope_id AS team_id,
@@ -7661,7 +7494,7 @@ class PostgresWarehouse:
                 preview,
                 unread_count,
                 reason
-            FROM slack_account_state_item_rows
+            FROM @slack_account_state_item_rows
             WHERE is_deleted = 0
             """
         )
@@ -7670,7 +7503,7 @@ class PostgresWarehouse:
         self._ensure_view(
             "clean_contacts",
             """
-            CREATE OR REPLACE VIEW clean_contacts AS
+            CREATE OR REPLACE VIEW @clean_contacts AS
             SELECT
                 source,
                 account,
@@ -7699,7 +7532,7 @@ class PostgresWarehouse:
                 synced_at,
                 raw_json,
                 nicknames
-            FROM contact_cards
+            FROM @contact_cards
             WHERE is_deleted = 0
             UNION ALL
             SELECT
@@ -7730,15 +7563,9 @@ class PostgresWarehouse:
                 synced_at,
                 raw_json,
                 nicknames
-            FROM apple_contact_cards
+            FROM @apple_contact_cards
             WHERE is_deleted = 0
             """
-        )
-
-    def _drop_google_only_contacts_mart(self) -> None:
-        legacy_schema = self.physical_schema_name("marts")
-        self._raw_command(
-            f"DROP VIEW IF EXISTS {_identifier(legacy_schema)}.{_identifier('google_contacts')}"
         )
 
     def _prepare_contacts_view_replacement(self) -> bool:
@@ -7771,7 +7598,7 @@ class PostgresWarehouse:
             "raw_json",
             "nicknames",
         )
-        contacts = query_relation("clean_contacts").with_namespace(self._schema)
+        contacts = canonical_relation("clean_contacts").with_namespace(self._schema)
         actual_columns = tuple(
             row[0]
             for row in self._query(
@@ -7791,7 +7618,7 @@ class PostgresWarehouse:
         # contact_points. Remove only these derived views before replacing a
         # drifted contacts view; both are recreated in this ensure path.
         for logical_name in ("clean_apple_messages", "clean_contact_points"):
-            relation = query_relation(logical_name).with_namespace(self._schema)
+            relation = canonical_relation(logical_name).with_namespace(self._schema)
             self._raw_command(
                 f"DROP VIEW IF EXISTS {_identifier(relation.schema)}.{_identifier(relation.name)}"
             )
@@ -7801,7 +7628,7 @@ class PostgresWarehouse:
         self._ensure_view(
             "clean_contact_points",
             """
-            CREATE OR REPLACE VIEW clean_contact_points AS
+            CREATE OR REPLACE VIEW @clean_contact_points AS
             SELECT DISTINCT
                 c.source,
                 c.account,
@@ -7822,7 +7649,7 @@ class PostgresWarehouse:
                         ELSE regexp_replace(points.point_value, '[^0-9]', '', 'g')
                     END
                 END AS normalized_value
-            FROM clean_contacts c
+            FROM @clean_contacts c
             CROSS JOIN LATERAL (
                 SELECT 'email'::text AS point_type,
                        value->>'value' AS point_value,
@@ -7850,7 +7677,7 @@ class PostgresWarehouse:
         self._ensure_view(
             "clean_apple_messages",
             """
-            CREATE OR REPLACE VIEW clean_apple_messages AS
+            CREATE OR REPLACE VIEW @clean_apple_messages AS
             SELECT
                 m.*,
                 COALESCE(h.address, '') AS sender_address,
@@ -7860,12 +7687,12 @@ class PostgresWarehouse:
                 END AS sender_name,
                 COALESCE(resolved.source, '') AS contact_source,
                 COALESCE(resolved.card_id, '') AS contact_card_id
-            FROM apple_messages m
-            LEFT JOIN apple_message_handles h
+            FROM @apple_messages m
+            LEFT JOIN @apple_message_handles h
               ON h.account = m.account AND h.handle_id = m.handle_id
             LEFT JOIN LATERAL (
                 SELECT cp.source, cp.card_id, cp.display_name
-                FROM clean_contact_points cp
+                FROM @clean_contact_points cp
                 WHERE cp.point_type = CASE WHEN h.address LIKE '%@%' THEN 'email' ELSE 'phone' END
                   AND cp.normalized_value = CASE
                       WHEN h.address LIKE '%@%' THEN lower(trim(h.address))
@@ -7892,7 +7719,7 @@ class PostgresWarehouse:
         self._ensure_view(
             "clean_whatsapp_messages",
             """
-            CREATE OR REPLACE VIEW clean_whatsapp_messages AS
+            CREATE OR REPLACE VIEW @clean_whatsapp_messages AS
             SELECT
                 m.account,
                 m.chat_id,
@@ -7931,26 +7758,26 @@ class PostgresWarehouse:
                 m.message_at,
                 m.edited_at,
                 m.is_deleted
-            FROM whatsapp_messages m
-            LEFT JOIN whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id
-            LEFT JOIN whatsapp_contacts cc ON cc.account = m.account AND cc.jid = m.chat_id
+            FROM @whatsapp_messages m
+            LEFT JOIN @whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id
+            LEFT JOIN @whatsapp_contacts cc ON cc.account = m.account AND cc.jid = m.chat_id
             LEFT JOIN LATERAL (
                 SELECT p.phone_jid
-                FROM whatsapp_chat_participants p
+                FROM @whatsapp_chat_participants p
                 WHERE p.account = m.account
                   AND p.phone_jid <> ''
                   AND (p.participant_jid = m.sender_jid OR p.lid_jid = m.sender_jid)
                 ORDER BY p.ingested_at DESC, p.chat_id
                 LIMIT 1
             ) sender_alias ON TRUE
-            LEFT JOIN whatsapp_contacts ct
+            LEFT JOIN @whatsapp_contacts ct
               ON ct.account = m.account
              AND ct.jid = COALESCE(NULLIF(sender_alias.phone_jid, ''), m.sender_jid)
             """
         )
 
     def _ensure_photo_marts_views(self) -> None:
-        # marts.photo_files: every rendition from every photo source, one
+        # marts_photos.files: every rendition from every photo source, one
         # relation. Generated from PHOTO_SOURCE_RELATIONS so registering a new
         # photo source automatically adds its raw table to the union.
         per_source_selects = []
@@ -7966,8 +7793,8 @@ class PostgresWarehouse:
                 COALESCE(l.photo_id, '') AS photo_id,
                 COALESCE(l.match_method, '') AS match_method,
                 COALESCE(l.match_score, 0) AS match_score
-            FROM {table} f
-            LEFT JOIN photo_asset_files l
+            FROM @{table} f
+            LEFT JOIN @photo_asset_files l
               ON l.source = f.source AND l.account = f.account
              AND l.source_native_id = f.source_native_id
              AND l.content_sha256 = f.content_sha256
@@ -7977,17 +7804,17 @@ class PostgresWarehouse:
         self._ensure_view(
             "photo_files",
             f"""
-            CREATE OR REPLACE VIEW photo_files AS
+            CREATE OR REPLACE VIEW @photo_files AS
             {union_sql}
             """,
         )
-        # marts.photos: one row per logical photo, with rendition/source counts
+        # marts_photos.photos: one row per logical photo, with rendition/source counts
         # and the newest AI caption (enrichment keyed by the thumbnail or best
         # file sha).
         self._ensure_view(
             "clean_photos",
             """
-            CREATE OR REPLACE VIEW clean_photos AS
+            CREATE OR REPLACE VIEW @clean_photos AS
             SELECT
                 a.photo_id,
                 a.account,
@@ -8011,15 +7838,15 @@ class PostgresWarehouse:
                 COALESCE(e.caption, '') AS caption,
                 a.created_at,
                 a.updated_at
-            FROM photo_assets a
+            FROM @photo_assets a
             LEFT JOIN (
                 SELECT photo_id, count(*) AS rendition_count, count(DISTINCT source) AS source_count
-                FROM photo_asset_files
+                FROM @photo_asset_files
                 GROUP BY photo_id
             ) l ON l.photo_id = a.photo_id
             LEFT JOIN LATERAL (
                 SELECT e.text AS caption
-                FROM file_attachment_enrichments e
+                FROM @file_attachment_enrichments e
                 WHERE e.content_sha256 != ''
                   AND e.content_sha256 IN (a.thumbnail_content_sha256, a.best_file_sha256)
                   AND e.text != ''
@@ -8028,14 +7855,14 @@ class PostgresWarehouse:
             ) e ON TRUE
             """,
         )
-        # marts.photo_canonical_renditions: exactly one enrichable still per
+        # marts_photos.canonical_renditions: exactly one enrichable still per
         # logical photo — the identity runner's 1280px JPEG thumbnail — shaped
         # for FileEnrichmentSource's default column names. Video-only assets
         # and assets whose thumbnail has not been generated yet are excluded.
         self._ensure_view(
             "photo_canonical_renditions",
             """
-            CREATE OR REPLACE VIEW photo_canonical_renditions AS
+            CREATE OR REPLACE VIEW @photo_canonical_renditions AS
             SELECT
                 a.photo_id,
                 a.account,
@@ -8048,7 +7875,7 @@ class PostgresWarehouse:
                 a.thumbnail_storage_file_id AS storage_file_id,
                 a.thumbnail_storage_url AS storage_url,
                 a.capture_ts
-            FROM photo_assets a
+            FROM @photo_assets a
             WHERE a.kind = 'image' AND a.thumbnail_content_sha256 != ''
             """,
         )
@@ -8060,50 +7887,9 @@ class PostgresWarehouse:
         self._ensure_view(
             "ai_conversation_events",
             f"""
-            CREATE OR REPLACE VIEW ai_conversation_events AS
+            CREATE OR REPLACE VIEW @ai_conversation_events AS
             {union_sql}
             """,
-        )
-        self._ensure_ai_conversation_events_insert_trigger()
-
-    def _ensure_ai_conversation_events_insert_trigger(self) -> None:
-        columns = AGENT_SESSION_EVENT_COLUMNS
-        column_sql = ", ".join(_identifier(column) for column in columns)
-        branches = []
-        for source, table in _AI_EVENT_TABLE_BY_SOURCE.items():
-            values_sql = ", ".join(
-                f"COALESCE(NEW.{_identifier(column)}, {_default_sql(column, table=table)})"
-                for column in columns
-            )
-            branches.append(
-                f"""
-                IF NEW.source = '{source}' THEN
-                    INSERT INTO {self.sql_relation(table)} AS target ({column_sql})
-                    VALUES ({values_sql})
-                    {_upsert_clause(table, POSTGRES_TABLES[table], columns, target_alias="target")};
-                    RETURN NULL;
-                END IF;
-                """
-            )
-        trigger_schema = _identifier(self.physical_schema_name("marts"))
-        trigger_function = f"{trigger_schema}.{_identifier('ai_conversation_events_insert')}"
-        view_ref = self.sql_relation("ai_conversation_events")
-        self._command(
-            f"""
-            CREATE OR REPLACE FUNCTION {trigger_function}()
-            RETURNS trigger
-            LANGUAGE plpgsql
-            AS $$
-            BEGIN
-                {''.join(branches)}
-                RAISE EXCEPTION 'unknown AI conversation event source: %', NEW.source;
-            END;
-            $$;
-            DROP TRIGGER IF EXISTS ai_conversation_events_insert ON {view_ref};
-            CREATE TRIGGER ai_conversation_events_insert
-            INSTEAD OF INSERT ON {view_ref}
-            FOR EACH ROW EXECUTE FUNCTION {trigger_function}();
-            """
         )
 
     def _ensure_clean_agent_sessions_view(self) -> None:
@@ -8114,7 +7900,7 @@ class PostgresWarehouse:
         self._ensure_view(
             "clean_agent_sessions",
             """
-            CREATE OR REPLACE VIEW clean_agent_sessions AS
+            CREATE OR REPLACE VIEW @clean_agent_sessions AS
             SELECT
                 source,
                 session_id,
@@ -8138,7 +7924,7 @@ class PostgresWarehouse:
                 sum(output_tokens)::bigint AS output_tokens,
                 sum(cache_read_tokens)::bigint AS cache_read_tokens,
                 sum(cache_creation_tokens)::bigint AS cache_creation_tokens
-            FROM agent_session_events
+            FROM @ai_conversation_events
             GROUP BY source, session_id
             """
         )
@@ -8152,7 +7938,7 @@ class PostgresWarehouse:
         self._ensure_view(
             "clean_calendar_with_transcripts",
             """
-            CREATE OR REPLACE VIEW clean_calendar_with_transcripts AS
+            CREATE OR REPLACE VIEW @clean_calendar_with_transcripts AS
             WITH latest_calendar_events AS (
                 SELECT DISTINCT ON (event_id)
                     account AS calendar_account,
@@ -8167,7 +7953,7 @@ class PostgresWarehouse:
                     is_all_day,
                     attendees_json,
                     html_link
-                FROM calendar_events
+                FROM @calendar_events
                 WHERE is_deleted = 0
                 ORDER BY event_id, synced_at DESC, account DESC, calendar_id DESC
             ),
@@ -8186,7 +7972,7 @@ class PostgresWarehouse:
                     action_items_json,
                     evidence_json,
                     created_at AS enriched_at
-                FROM apple_voice_memos_enrichments
+                FROM @apple_voice_memos_enrichments
                 WHERE status = 'completed'
                 ORDER BY account, recording_id, created_at DESC, provider DESC, model DESC, prompt_version DESC
             )
@@ -8224,10 +8010,10 @@ class PostgresWarehouse:
         self._ensure_view(
             "clean_transcripts_no_calendar_match",
             """
-            CREATE OR REPLACE VIEW clean_transcripts_no_calendar_match AS
+            CREATE OR REPLACE VIEW @clean_transcripts_no_calendar_match AS
             WITH latest_calendar_events AS (
                 SELECT event_id
-                FROM calendar_events
+                FROM @calendar_events
                 WHERE is_deleted = 0
                 GROUP BY event_id
             ),
@@ -8246,7 +8032,7 @@ class PostgresWarehouse:
                     action_items_json,
                     evidence_json,
                     created_at AS enriched_at
-                FROM apple_voice_memos_enrichments
+                FROM @apple_voice_memos_enrichments
                 WHERE status = 'completed'
                 ORDER BY account, recording_id, created_at DESC, provider DESC, model DESC, prompt_version DESC
             )
@@ -8272,7 +8058,7 @@ class PostgresWarehouse:
                 e.evidence_json,
                 e.enriched_at AS created_at
             FROM latest_enrichments AS e
-            LEFT JOIN apple_voice_memos_files AS f
+            LEFT JOIN @apple_voice_memos_files AS f
               ON e.account = f.account
              AND e.recording_id = f.recording_id
              AND f.is_deleted = 0
@@ -8286,9 +8072,9 @@ class PostgresWarehouse:
 
     def _relation_exists(self, relation_name: str) -> bool:
         try:
-            rel = query_relation(relation_name).with_namespace(self._schema)
+            rel = canonical_relation(relation_name).with_namespace(self._schema)
         except KeyError:
-            schemas = self.physical_schema_names(include_private=True) + [self._schema]
+            schemas = self.physical_schema_names(include_hidden=True) + [self._schema]
             name = relation_name
         else:
             schemas = [rel.schema]
@@ -8322,7 +8108,7 @@ class PostgresWarehouse:
                 ),
                 recent_messages AS NOT MATERIALIZED (
                     SELECT m.*
-                    FROM slack_messages AS m, vars
+                    FROM @slack_messages AS m, vars
                     WHERE m.account = vars.account
                       AND m.team_id = vars.team_id
                       AND m.is_deleted = 0
@@ -8330,7 +8116,7 @@ class PostgresWarehouse:
                 ),
                 current_conversations AS NOT MATERIALIZED (
                     SELECT c.*, {last_read} AS last_read_ts
-                    FROM slack_conversations AS c, vars
+                    FROM @slack_conversations AS c, vars
                     WHERE c.account = vars.account
                       AND c.team_id = vars.team_id
                       AND c.is_archived = 0
@@ -8376,13 +8162,13 @@ class PostgresWarehouse:
                 vars.synced_at,
                 vars.sync_version
             FROM vars
-            INNER JOIN slack_account_identities AS i
+            INNER JOIN @slack_account_identities AS i
               ON i.account = vars.account AND i.team_id = vars.team_id
             INNER JOIN current_conversations AS c
               ON i.account = c.account AND i.team_id = c.team_id
             INNER JOIN recent_messages AS m
               ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id
-            LEFT JOIN slack_users AS u
+            LEFT JOIN @slack_users AS u
               ON m.account = u.account AND m.team_id = u.team_id AND m.user_id = u.user_id
             WHERE c.is_im = 1 OR c.is_mpim = 1
             GROUP BY vars.synced_at, vars.sync_version, c.account, c.team_id, c.conversation_id, c.name, c.is_im, c.is_mpim, c.last_read_ts, i.user_id
@@ -8415,13 +8201,13 @@ class PostgresWarehouse:
                 vars.synced_at,
                 vars.sync_version
             FROM vars
-            INNER JOIN slack_account_identities AS i
+            INNER JOIN @slack_account_identities AS i
               ON i.account = vars.account AND i.team_id = vars.team_id
             INNER JOIN current_conversations AS c
               ON i.account = c.account AND i.team_id = c.team_id
             INNER JOIN recent_messages AS m
               ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id
-            LEFT JOIN slack_users AS u
+            LEFT JOIN @slack_users AS u
               ON m.account = u.account AND m.team_id = u.team_id AND m.user_id = u.user_id
             WHERE m.user_id != i.user_id
               AND position('<@' || i.user_id || '>' in m.text) > 0
@@ -8463,7 +8249,7 @@ class PostgresWarehouse:
                 vars.synced_at,
                 vars.sync_version
             FROM vars
-            INNER JOIN slack_account_identities AS i
+            INNER JOIN @slack_account_identities AS i
               ON i.account = vars.account AND i.team_id = vars.team_id
             INNER JOIN recent_messages AS p
               ON p.account = i.account
@@ -8478,7 +8264,7 @@ class PostgresWarehouse:
              AND p.team_id = r.team_id
              AND p.conversation_id = r.conversation_id
              AND p.message_ts = r.thread_ts
-            LEFT JOIN slack_users AS ru
+            LEFT JOIN @slack_users AS ru
               ON r.account = ru.account AND r.team_id = ru.team_id AND r.user_id = ru.user_id
             GROUP BY vars.synced_at, vars.sync_version, p.account, p.team_id, p.conversation_id, p.message_ts, p.user_id, p.text, p.raw_json, c.name, c.last_read_ts, i.user_id
             HAVING (count(*) FILTER (WHERE r.user_id = i.user_id OR p.user_id = i.user_id) > 0 OR {parent_is_subscribed})
@@ -8511,13 +8297,13 @@ class PostgresWarehouse:
                 vars.synced_at,
                 vars.sync_version
             FROM vars
-            INNER JOIN slack_account_identities AS i
+            INNER JOIN @slack_account_identities AS i
               ON i.account = vars.account AND i.team_id = vars.team_id
             INNER JOIN current_conversations AS c
               ON i.account = c.account AND i.team_id = c.team_id
             INNER JOIN recent_messages AS m
               ON c.account = m.account AND c.team_id = m.team_id AND c.conversation_id = m.conversation_id
-            LEFT JOIN slack_users AS u
+            LEFT JOIN @slack_users AS u
               ON m.account = u.account AND m.team_id = u.team_id AND m.user_id = u.user_id
             WHERE c.is_im = 0
               AND c.is_mpim = 0
@@ -8529,8 +8315,8 @@ class PostgresWarehouse:
             GROUP BY vars.synced_at, vars.sync_version, c.account, c.team_id, c.conversation_id, c.name
         """
 
-    def _qualify_sql(self, sql: str) -> str:
-        return qualify_sql_relations(sql, namespace=self._schema)
+    def _expand_relations(self, sql: str) -> str:
+        return expand_relations(sql, namespace=self._schema)
 
     def _raw_command(self, sql: str, params: Sequence[Any] | None = None) -> None:
         with self._connection.cursor() as cursor:
@@ -8538,16 +8324,16 @@ class PostgresWarehouse:
 
     def _command(self, sql: str, params: Sequence[Any] | None = None) -> None:
         with self._connection.cursor() as cursor:
-            cursor.execute(self._qualify_sql(sql), params)
+            cursor.execute(self._expand_relations(sql), params)
 
     def _query(self, sql: str, params: Sequence[Any] | None = None) -> list[tuple[Any, ...]]:
         with self._connection.cursor() as cursor:
-            cursor.execute(self._qualify_sql(sql), params)
+            cursor.execute(self._expand_relations(sql), params)
             return cursor.fetchall()
 
     def _query_dicts(self, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
         with self._connection.cursor() as cursor:
-            cursor.execute(self._qualify_sql(sql), params)
+            cursor.execute(self._expand_relations(sql), params)
             columns = [description[0] for description in cursor.description]
             return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
@@ -8564,7 +8350,7 @@ class PostgresWarehouse:
             {_upsert_clause(table, spec, columns, target_alias="target")}
         """
         with self._connection.cursor() as cursor:
-            execute_values(cursor, self._qualify_sql(sql), rows, template=template, page_size=POSTGRES_INSERT_PAGE_SIZES.get(table, 1000))
+            execute_values(cursor, self._expand_relations(sql), rows, template=template, page_size=POSTGRES_INSERT_PAGE_SIZES.get(table, 1000))
 
     def _insert_rows(self, table: str, rows: list[dict[str, Any]], columns: tuple[str, ...]) -> None:
         self._insert(
@@ -8579,10 +8365,10 @@ class PostgresWarehouse:
 
 def _postgres_type(column: str, *, table: str | None = None) -> str:
     # The timeline's priority tier is a self-describing native enum (see
-    # timeline.py). The logical type name resolves to the timeline schema via
-    # qualify_sql_relations when the CREATE TABLE runs.
+    # timeline.py). The marker resolves to the timeline schema when the CREATE
+    # TABLE runs through relation expansion.
     if table == "timeline_events" and column == "priority":
-        return "timeline_priority"
+        return "@timeline_priority"
     if _is_jsonb_column(table, column):
         return "jsonb"
     if column in ARRAY_COLUMNS:
