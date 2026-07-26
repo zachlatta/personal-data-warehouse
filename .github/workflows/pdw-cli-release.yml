@@ -34,7 +34,10 @@ permissions:
 jobs:
   test:
     name: Go tests
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name != github.repository &&
+          'ubuntu-latest' || 'rotom-builder-pdw-cli-test' }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -48,7 +51,10 @@ jobs:
   version:
     name: Resolve version
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: >-
+      ${{ github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name != github.repository &&
+          'ubuntu-latest' || 'rotom-builder-pdw-cli-version' }}
     outputs:
       version: ${{ steps.compute.outputs.version }}
       tag: ${{ steps.compute.outputs.tag }}
@@ -204,7 +210,7 @@ jobs:
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/pdw-cli/v'))
-    runs-on: ubuntu-latest
+    runs-on: rotom-builder-pdw-cli-release
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4

@@ -23,11 +23,27 @@ TRUSTED_CLI_BUILD_RUNNER = """runs-on: >-
           github.event.pull_request.head.repo.full_name != github.repository &&
           'ubuntu-latest' ||
           format('rotom-builder-pdw-cli-{0}-{1}', matrix.goos, matrix.goarch) }}"""
+TRUSTED_CLI_TEST_RUNNER = """runs-on: >-
+      ${{ github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name != github.repository &&
+          'ubuntu-latest' || 'rotom-builder-pdw-cli-test' }}"""
+TRUSTED_CLI_VERSION_RUNNER = """runs-on: >-
+      ${{ github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name != github.repository &&
+          'ubuntu-latest' || 'rotom-builder-pdw-cli-version' }}"""
 
 
 def test_every_trusted_artifact_build_uses_rotom() -> None:
     assert TRUSTED_IMAGE_BUILD_RUNNER in PG_BACKREST_WORKFLOW.read_text()
     assert TRUSTED_CLI_BUILD_RUNNER in CLI_WORKFLOW.read_text()
+
+
+def test_every_trusted_cli_job_uses_rotom() -> None:
+    workflow = CLI_WORKFLOW.read_text()
+
+    assert TRUSTED_CLI_TEST_RUNNER in workflow
+    assert TRUSTED_CLI_VERSION_RUNNER in workflow
+    assert "runs-on: rotom-builder-pdw-cli-release" in workflow
 
 
 def test_fork_pull_request_builds_remain_github_hosted() -> None:

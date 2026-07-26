@@ -132,6 +132,26 @@ func TestWorkflowRunsWhenWarehouseSchemasChange(t *testing.T) {
 	}
 }
 
+func TestWorkflowRoutesEveryTrustedJobToRotom(t *testing.T) {
+	body := readWorkflow(t)
+	for _, label := range []string{
+		"rotom-builder-pdw-cli-test",
+		"rotom-builder-pdw-cli-version",
+	} {
+		want := "'ubuntu-latest' || '" + label + "'"
+		if strings.Count(body, want) != 1 {
+			t.Fatalf(
+				"workflow must route trusted work to %s and reserve ubuntu-latest for fork pull requests",
+				label,
+			)
+		}
+	}
+	const releaseRunner = "runs-on: rotom-builder-pdw-cli-release"
+	if strings.Count(body, releaseRunner) != 1 {
+		t.Fatalf("workflow release job must use %s", releaseRunner)
+	}
+}
+
 func TestWorkflowAlsoReleasesOnPDWCLITags(t *testing.T) {
 	body := readWorkflow(t)
 	// Manually-cut tagged releases keep working alongside per-commit ones.
