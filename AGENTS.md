@@ -881,6 +881,8 @@ boundary or expose the token table through normal query surfaces.
 Configure `PLAID_ACCOUNT`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, and `PLAID_ENV` on the machine doing
 interactive linking and in the production Dagster deployment. `pdw ingest plaid link` opens the
 localhost Plaid Link flow and persists the exchanged token; repeat it once per institution.
+`pdw ingest plaid items` lists what is linked; `pdw ingest plaid unlink <item-id>` retires one
+(revokes it at Plaid, then deletes exactly that Item's rows — see the re-link trap below).
 `pdw ingest plaid sync` performs an immediate pull. Production uses the `plaid_finance_sync` asset
 and `plaid_finance_sync_every_thirty_minutes` schedule. Account, holding, and liability responses
 are authoritative snapshots: reconcile missing accounts/holdings/liabilities rather than leaving
@@ -893,6 +895,16 @@ green. Otherwise one dead institution keeps the every-30-minutes schedule perman
 buries the transient failures that are worth paging on. Repair by re-running
 `pdw ingest plaid link` for that institution; find them with
 `SELECT * FROM plaid.sync_state WHERE status = 'action_required'`.
+**A cleared `action_required` is not the finish line.** Link only sometimes repairs the existing
+Item; it can just as well mint a NEW `item_id` with NEW account ids for the same real accounts and
+leave the dead Item linked beside it (this happened on 2026-07-25). Both Items then sync: every
+balance is counted twice in `marts.finance_net_worth` and the transaction overlap is duplicated.
+After any re-link, assert the item count too —
+`SELECT institution_name, count(*) FROM plaid.items GROUP BY 1 HAVING count(*) > 1` — and retire
+the leftover with `pdw ingest plaid unlink <item-id>` (`--dry-run` first; the id may be an
+unambiguous prefix). The ledger side self-heals from there: plaid account identity resolves by
+owner + institution + mask + side, so the surviving Item's accounts merge back into the logical
+accounts they duplicated, and the residue is pruned.
 Optional products default to read-only `transactions,investments,liabilities`; no
 payment/money-movement Plaid products are requested.
 New Links request `PLAID_TRANSACTIONS_LOOKBACK_DAYS` of Transactions history, defaulting to Plaid's
@@ -919,7 +931,12 @@ enrichment layer.
 - `finance.accounts` — one row per logical account/asset/liability (kinds incl.
   checking/credit/brokerage/ira/mortgage/property/vehicle/private_fund/receivable), resolved across sources
   via `finance.account_links` (photos-identity pattern: raw rows never learn about identity;
-  deterministic `fa_<sha>` ids; delete links + rerun replays every decision).
+  deterministic `fa_<sha>` ids; delete links + rerun replays every decision). Identity evidence is
+  owner + institution + mask + side for **both** sources: plaid account ids are item-scoped, so a
+  re-link that mints a new Item would otherwise fork every account and double-count net worth.
+  Two simultaneously-live plaid accounts never merge (nothing says which is authoritative) —
+  retire the dead Item and the survivor adopts the older account on the next run, leaving residue
+  with no links, which is pruned with its observations.
 - `finance.observations` — append-only per-day values (PK account_id/as_of/kind/source; NUMERIC
   money, DATE days). The `finance_ledger` asset (schedule `7,37 * * * *`, after each `*/30` Plaid
   sync) snapshots every live Plaid account's balance daily — Plaid itself only keeps

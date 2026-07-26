@@ -543,7 +543,33 @@ WHERE status = 'action_required';
 ```
 
 Re-link that institution with `pdw ingest plaid link` to clear it. The prior cursor and last
-successful sync time are preserved, so re-linking resumes rather than replaying all history.
+successful sync time are preserved, so re-linking resumes rather than replaying all history — but
+only when Link repairs the existing Item. Plaid may instead mint a **new** `item_id` with new
+account ids for the same real accounts, leaving the dead Item linked alongside it. Both then sync,
+so every balance is counted twice in `marts.finance_net_worth` and every transaction in the
+overlap window appears twice in `marts.finance_transactions`. A cleared `action_required` is
+therefore not the finish line; check the item count too:
+
+```sql
+SELECT institution_name, count(*) FROM plaid.items GROUP BY 1 HAVING count(*) > 1;
+```
+
+Retire the leftover Item — this revokes it at Plaid (`/item/remove`) and deletes exactly that
+Item's rows (accounts, transactions, holdings, liabilities, sync state, and its access token):
+
+```bash
+pdw ingest plaid items                       # list linked items + their row counts
+pdw ingest plaid unlink <item-id> --dry-run  # exactly what would be revoked and deleted
+pdw ingest plaid unlink <item-id>            # confirm at the prompt (--yes to skip)
+```
+
+The item id may be given as an unambiguous prefix. Nothing is deleted unless Plaid accepts the
+revocation (an Item Plaid has already forgotten is the one exception), so a failed run is safe to
+retry. On its next run the finance ledger merges the re-linked accounts back into the logical
+accounts they duplicated (Plaid account ids are item-scoped, so ledger identity resolves a plaid
+account by owner + institution + mask + side, exactly like a statement document) and drops the
+duplicated transactions. Merge residue — a `finance.accounts` row no source links to any more —
+is pruned with its observations in the same run.
 
 Warehouse initialization provisions the NOLOGIN role named by `PDW_QUERY_POSTGRES_ROLE` (default
 `pdw_query`), grants it read access only to queryable schemas, and revokes `private` from both that

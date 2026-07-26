@@ -119,6 +119,16 @@ class PlaidClient:
     def item_get(self, access_token: str) -> dict[str, Any]:
         return self._post("/item/get", {"access_token": access_token})
 
+    def item_remove(self, access_token: str) -> dict[str, Any]:
+        """Revoke an Item at Plaid so it stops billing and syncing.
+
+        The undo for Link, and the only write this integration makes: it
+        invalidates our own access token and moves no money. Plaid forgetting
+        the Item says nothing about the rows it produced, so the warehouse
+        still deletes those itself (see PostgresWarehouse.delete_plaid_item).
+        """
+        return self._post("/item/remove", {"access_token": access_token})
+
     def accounts_get(self, access_token: str) -> dict[str, Any]:
         return self._post("/accounts/get", {"access_token": access_token})
 
@@ -553,7 +563,7 @@ class PlaidSyncRunner:
         preserved either way, so re-linking resumes instead of replaying.
         """
 
-        action_required = _plaid_error_code(error) in PLAID_ACTION_REQUIRED_ERROR_CODES
+        action_required = plaid_error_code(error) in PLAID_ACTION_REQUIRED_ERROR_CODES
         previous = state.get((account, item_id, product), {})
         previous_success = previous.get("last_synced_at")
         if not isinstance(previous_success, datetime):
@@ -631,7 +641,7 @@ def _merge_summary(left: PlaidSyncSummary, right: PlaidSyncSummary) -> PlaidSync
     )
 
 
-def _plaid_error_code(message: str) -> str:
+def plaid_error_code(message: str) -> str:
     """Extract the leading Plaid error code from a `"<CODE>: <message>"` string.
 
     Only messages Plaid itself produced (via ``_plaid_error_from_json``) carry a

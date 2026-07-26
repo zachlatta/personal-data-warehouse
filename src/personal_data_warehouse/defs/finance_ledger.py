@@ -59,6 +59,10 @@ def finance_ledger(context) -> MaterializeResult:
             "observations_upserted": MetadataValue.int(
                 summary.observations_upserted if summary else 0
             ),
+            # Nonzero means a re-linked institution's accounts merged back into
+            # the logical accounts they duplicated, and the residue was pruned.
+            "accounts_merged": MetadataValue.int(summary.accounts_merged if summary else 0),
+            "accounts_pruned": MetadataValue.int(summary.accounts_pruned if summary else 0),
         }
     )
 

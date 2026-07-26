@@ -122,6 +122,7 @@ EXAMPLES
   pdw ingest agent-sessions --limit 1000
   pdw ingest plaid link
   pdw ingest plaid sync
+  pdw ingest plaid unlink <item-id>   # retire an item a re-link left behind
   pdw ingest manual-finance ~/Desktop/accounts
 `
 

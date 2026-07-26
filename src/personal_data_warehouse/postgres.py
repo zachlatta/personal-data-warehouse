@@ -503,6 +503,20 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "timeline_sync_state": TableSpec(TIMELINE_SYNC_STATE_COLUMNS, ("adapter",), "updated_at"),
 }
 
+# Every table whose rows belong to exactly one linked Plaid Item, data first
+# and the credential last. plaid_investment_securities is absent on purpose:
+# securities are keyed by account and shared across Items.
+PLAID_ITEM_SCOPED_TABLES = (
+    "plaid_items",
+    "plaid_accounts",
+    "plaid_transactions",
+    "plaid_investment_holdings",
+    "plaid_investment_transactions",
+    "plaid_liabilities",
+    "plaid_sync_state",
+    "plaid_item_tokens",
+)
+
 # The source-owned AI conversation event tables (claude_code.events,
 # codex.events, ...). They share AGENT_SESSION_EVENT_COLUMNS and are read
 # together through the marts.ai_conversation_events union view, so they all
@@ -5657,6 +5671,56 @@ class PostgresWarehouse:
         )
         return len(stale_keys)
 
+    def load_plaid_item_accounts(self, *, account: str, item_id: str) -> list[dict[str, Any]]:
+        """The accounts one linked Item reports, for operator-facing output."""
+        return self._query_dicts(
+            """
+            SELECT account_id, name, mask, type, subtype, current_balance, is_removed
+            FROM plaid_accounts
+            WHERE account = %s AND item_id = %s
+            ORDER BY mask, account_id
+            """,
+            (account, item_id),
+        )
+
+    def count_plaid_item_rows(self, *, account: str, item_id: str) -> dict[str, int]:
+        """Row counts per table for one linked Item — what unlink would delete."""
+        return {
+            table: int(
+                self._query(
+                    f"SELECT count(*) FROM {self.sql_relation(table)} WHERE account = %s AND item_id = %s",
+                    (account, item_id),
+                )[0][0]
+            )
+            for table in PLAID_ITEM_SCOPED_TABLES
+        }
+
+    def delete_plaid_item(self, *, account: str, item_id: str) -> dict[str, int]:
+        """Delete every row belonging to one linked Plaid Item, atomically.
+
+        Retiring an Item is a deliberate operator action (`pdw ingest plaid
+        unlink`), not a sync outcome: re-linking an institution can mint a NEW
+        item_id instead of repairing the old one, and both Items then keep
+        reporting the same real accounts — double-counting balances in
+        marts.finance_net_worth and duplicating every transaction in the
+        overlap window. Tombstones would not help; those rows have to stop
+        existing. plaid_investment_securities is deliberately absent: it is
+        keyed by account, not item, and is shared across Items.
+        """
+        deletes = ", ".join(
+            f"{_identifier('d_' + table)} AS ("
+            f"DELETE FROM {self.sql_relation(table)} WHERE account = %s AND item_id = %s RETURNING 1)"
+            for table in PLAID_ITEM_SCOPED_TABLES
+        )
+        selects = ", ".join(
+            f"(SELECT count(*) FROM {_identifier('d_' + table)})" for table in PLAID_ITEM_SCOPED_TABLES
+        )
+        params: list[Any] = []
+        for _ in PLAID_ITEM_SCOPED_TABLES:
+            params.extend((account, item_id))
+        row = self._query(f"WITH {deletes} SELECT {selects}", tuple(params))[0]
+        return dict(zip(PLAID_ITEM_SCOPED_TABLES, (int(value) for value in row), strict=True))
+
     def insert_plaid_sync_state(
         self,
         *,
@@ -5734,6 +5798,42 @@ class PostgresWarehouse:
             SELECT (SELECT count(*) FROM removed_links) + (SELECT count(*) FROM removed_transactions)
             """,
             (link_keys, transaction_ids),
+        )
+        return int(removed[0][0]) if removed else 0
+
+    def prune_unlinked_finance_accounts(self) -> int:
+        """Delete ledger accounts no source links to, with their observations.
+
+        Every account is founded by a link, and links are only ever added or
+        re-pointed, so an account reaches zero links exactly once: when the
+        source that founded it merged into an older account for the same real
+        account (a Plaid re-link forks one). What is left is derived residue —
+        keeping it double-counts the account in marts.finance_net_worth.
+        Transactions are reconciled separately by the same run.
+        """
+        removed = self._query(
+            """
+            WITH unlinked AS (
+                SELECT a.account_id
+                FROM finance_accounts AS a
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM finance_account_links AS l
+                    WHERE l.account_id = a.account_id
+                )
+            ),
+            removed_observations AS (
+                DELETE FROM finance_observations
+                WHERE account_id IN (SELECT account_id FROM unlinked)
+                RETURNING 1
+            ),
+            removed_accounts AS (
+                DELETE FROM finance_accounts
+                WHERE account_id IN (SELECT account_id FROM unlinked)
+                RETURNING 1
+            )
+            SELECT (SELECT count(*) FROM removed_accounts)
+            """
         )
         return int(removed[0][0]) if removed else 0
 

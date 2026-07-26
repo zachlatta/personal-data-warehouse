@@ -291,3 +291,138 @@ def test_plaid_snapshot_reconciliation_tombstones_accounts_and_deletes_absent_ro
     assert warehouse._query(
         f"SELECT account_id, liability_type FROM {warehouse.sql_relation('plaid_liabilities')}"
     ) == [("active", "credit")]
+
+
+def _seed_item(warehouse: PostgresWarehouse, item_id: str, *, account_id: str, transaction_id: str) -> None:
+    now = datetime(2026, 7, 25, 12, tzinfo=UTC)
+    warehouse.upsert_plaid_item_token(
+        account="zach@example.com",
+        item_id=item_id,
+        access_token=f"access-{item_id}",
+        institution_id="ins_1",
+        institution_name="Example Bank",
+        linked_at=now,
+    )
+    warehouse.insert_plaid_items(
+        [
+            {
+                "account": "zach@example.com",
+                "item_id": item_id,
+                "institution_id": "ins_1",
+                "institution_name": "Example Bank",
+                "available_products": [],
+                "billed_products": [],
+                "webhook": "",
+                "consent_expiration_time": now,
+                "error_json": {},
+                "raw_json": {},
+                "linked_at": now,
+                "synced_at": now,
+                "sync_version": 1,
+            }
+        ]
+    )
+    warehouse.insert_plaid_accounts(
+        [
+            {
+                "account": "zach@example.com",
+                "item_id": item_id,
+                "account_id": account_id,
+                "name": "Rewards Card",
+                "official_name": "Rewards Card",
+                "mask": "4242",
+                "type": "credit",
+                "subtype": "credit card",
+                "available_balance": 0.0,
+                "current_balance": 10.0,
+                "limit_balance": 0.0,
+                "iso_currency_code": "USD",
+                "unofficial_currency_code": "",
+                "is_removed": 0,
+                "raw_json": {},
+                "synced_at": now,
+                "sync_version": 1,
+            }
+        ]
+    )
+    warehouse.insert_plaid_transactions(
+        [
+            {
+                "account": "zach@example.com",
+                "item_id": item_id,
+                "account_id": account_id,
+                "transaction_id": transaction_id,
+                "posted_at": now,
+                "authorized_at": now,
+                "name": "COFFEE",
+                "merchant_name": "Coffee",
+                "amount": 4.5,
+                "iso_currency_code": "USD",
+                "unofficial_currency_code": "",
+                "category_json": [],
+                "payment_channel": "in store",
+                "pending": 0,
+                "pending_transaction_id": "",
+                "is_removed": 0,
+                "raw_json": {},
+                "synced_at": now,
+                "sync_version": 1,
+            }
+        ]
+    )
+    warehouse.insert_plaid_sync_state(
+        account="zach@example.com",
+        item_id=item_id,
+        product="transactions",
+        cursor="cursor-1",
+        status="ok",
+        last_synced_at=now,
+        updated_at=now,
+    )
+
+
+def test_delete_plaid_item_removes_every_item_scoped_row_and_spares_other_items(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Retiring a duplicate Item must take its rows and nothing else.
+
+    A re-link that mints a new item_id leaves the old Item's accounts and
+    transactions behind, double-counting both net worth and the transaction
+    overlap; `pdw ingest plaid unlink` deletes exactly that Item's rows.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_item(warehouse, "item-old", account_id="acc-old", transaction_id="tx-old")
+    _seed_item(warehouse, "item-new", account_id="acc-new", transaction_id="tx-new")
+
+    counts = warehouse.count_plaid_item_rows(account="zach@example.com", item_id="item-old")
+    assert counts == {
+        "plaid_item_tokens": 1,
+        "plaid_items": 1,
+        "plaid_accounts": 1,
+        "plaid_transactions": 1,
+        "plaid_investment_holdings": 0,
+        "plaid_investment_transactions": 0,
+        "plaid_liabilities": 0,
+        "plaid_sync_state": 1,
+    }
+    assert warehouse.delete_plaid_item(account="zach@example.com", item_id="item-old") == counts
+
+    assert [item.item_id for item in warehouse.load_plaid_item_tokens()] == ["item-new"]
+    for logical_name, column in (
+        ("plaid_items", "item_id"),
+        ("plaid_accounts", "account_id"),
+        ("plaid_transactions", "transaction_id"),
+    ):
+        rows = warehouse._query(f"SELECT {column} FROM {warehouse.sql_relation(logical_name)}")
+        assert [row[0] for row in rows] == [
+            {"plaid_items": "item-new", "plaid_accounts": "acc-new", "plaid_transactions": "tx-new"}[
+                logical_name
+            ]
+        ], logical_name
+    assert warehouse._query(
+        f"SELECT item_id FROM {warehouse.sql_relation('plaid_sync_state')}"
+    ) == [("item-new",)]
+    # Deleting an already-retired item is a no-op, not an error.
+    assert warehouse.delete_plaid_item(account="zach@example.com", item_id="item-old") == {
+        table: 0 for table in counts
+    }

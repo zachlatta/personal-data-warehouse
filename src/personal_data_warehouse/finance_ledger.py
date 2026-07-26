@@ -181,6 +181,8 @@ class FinanceLedgerSummary:
     transactions_merged: int = 0
     transactions_skipped: int = 0
     transactions_removed: int = 0
+    accounts_merged: int = 0
+    accounts_pruned: int = 0
 
 
 class FinanceLedgerRunner:
@@ -214,27 +216,33 @@ class FinanceLedgerRunner:
         plaid_links = self._load_links(LEDGER_SOURCE_PLAID)
         account_rows: list[dict[str, Any]] = []
         link_rows: list[dict[str, Any]] = []
+        resolutions = self._resolve_plaid_accounts(
+            plaid_accounts, links=plaid_links, index=self._load_account_index()
+        )
+        accounts_merged = 0
         plaid_account_map: dict[tuple[str, str], str] = {}
         for row in plaid_accounts:
             link_key = (row["account"], row["account_id"])
-            account_id = plaid_links.get(link_key)
-            if account_id is None:
-                account_id = stable_finance_account_id(
-                    LEDGER_SOURCE_PLAID, row["account"], row["account_id"]
-                )
+            account_id, match_method = resolutions[link_key]
+            if match_method:
+                # A new source account, or one whose link now points at the
+                # account it merged into: (re)write the audit row.
                 link_rows.append(
                     self._link_row(
                         source=LEDGER_SOURCE_PLAID,
                         account=row["account"],
                         source_account_key=row["account_id"],
                         account_id=account_id,
-                        match_method="source_id",
+                        match_method=match_method,
                         match_score=1.0,
                         now=now,
                         sync_version=sync_version,
                     )
                 )
-                links_created += 1
+                if link_key in plaid_links:
+                    accounts_merged += 1
+                else:
+                    links_created += 1
             plaid_account_map[link_key] = account_id
 
             kind, side = plaid_account_kind_side(row["type"], row["subtype"])
@@ -386,6 +394,12 @@ class FinanceLedgerRunner:
             sync_version=sync_version,
         )
 
+        # Merge residue: an account every source has stopped linking to is not
+        # a fact, it is the leftover half of a merge. Nothing else empties an
+        # account's links (they are only ever added or re-pointed), so this
+        # cannot reach an account a live source still claims.
+        accounts_pruned = self._warehouse.prune_unlinked_finance_accounts()
+
         summary = FinanceLedgerSummary(
             accounts_seen=len(plaid_accounts) + len(extractions),
             accounts_created=accounts_created,
@@ -395,10 +409,12 @@ class FinanceLedgerRunner:
             transactions_merged=transactions["merged"],
             transactions_skipped=transactions["skipped"],
             transactions_removed=transactions["removed"],
+            accounts_merged=accounts_merged,
+            accounts_pruned=accounts_pruned,
         )
         self._logger.info(
             "Finance ledger: accounts_seen=%s accounts_created=%s links_created=%s observations=%s "
-            "transactions=%s merged=%s skipped=%s removed=%s",
+            "transactions=%s merged=%s skipped=%s removed=%s accounts_merged=%s accounts_pruned=%s",
             summary.accounts_seen,
             summary.accounts_created,
             summary.links_created,
@@ -407,8 +423,79 @@ class FinanceLedgerRunner:
             summary.transactions_merged,
             summary.transactions_skipped,
             summary.transactions_removed,
+            summary.accounts_merged,
+            summary.accounts_pruned,
         )
         return summary
+
+    # --- plaid account identity -------------------------------------------------
+
+    def _resolve_plaid_accounts(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        links: dict[tuple[str, str], str],
+        index: list[dict[str, Any]],
+    ) -> dict[tuple[str, str], tuple[str, str]]:
+        """Resolve each live plaid account to a logical account.
+
+        Plaid account ids are **item-scoped**: re-linking an institution mints
+        a new item_id AND new account_ids for the same real accounts. Keying
+        ledger identity on the plaid id alone therefore forks every account on
+        every re-link and double-counts net worth, which is exactly what a
+        re-linked card issuer did in production. So a plaid account resolves the
+        way a statement document already does — by institution+mask — and only
+        founds a new logical account when nothing matches.
+
+        Returns ``{(owner, plaid_account_id): (account_id, match_method)}``;
+        an empty match_method means the existing link already said this and
+        needs no new audit row.
+        """
+
+        by_id = {str(entry["account_id"]): entry for entry in index}
+        ordered = sorted(rows, key=lambda row: (str(row["account"]), str(row["account_id"])))
+        resolved: dict[tuple[str, str], tuple[str, str]] = {}
+        # One logical account per live source account: claiming keeps two live
+        # plaid accounts (a re-link the operator has not retired yet) from
+        # racing each other's daily balance observation.
+        claimed: set[str] = set()
+
+        # An existing link is a decision already made; it wins.
+        for row in ordered:
+            key = (str(row["account"]), str(row["account_id"]))
+            linked = links.get(key)
+            if linked is not None:
+                resolved[key] = (linked, "")
+                claimed.add(linked)
+
+        for row in ordered:
+            key = (str(row["account"]), str(row["account_id"]))
+            _, side = plaid_account_kind_side(str(row["type"]), str(row["subtype"]))
+            candidate = _best_identity_match(
+                index,
+                owner=str(row["account"]),
+                institution=str(row["institution_name"]),
+                mask=str(row["mask"]),
+                side=side,
+                exclude=claimed,
+            )
+            current = resolved.get(key, (None, ""))[0]
+            if current is None:
+                account_id = candidate or stable_finance_account_id(
+                    LEDGER_SOURCE_PLAID, str(row["account"]), str(row["account_id"])
+                )
+                resolved[key] = (account_id, "institution_mask" if candidate else "source_id")
+                claimed.add(account_id)
+                continue
+            # A fork left over from a re-link: this account's link points at a
+            # duplicate of an older account nothing live claims. Re-point it.
+            # Strictly older only — on a tie there is no evidence which one is
+            # the established account, so keep both rather than guess.
+            if candidate is not None and _created_before(by_id.get(candidate), by_id.get(current)):
+                resolved[key] = (candidate, "institution_mask")
+                claimed.discard(current)
+                claimed.add(candidate)
+        return resolved
 
     # --- transactions ---------------------------------------------------------
 
@@ -841,7 +928,7 @@ class FinanceLedgerRunner:
 
     def _load_account_index(self) -> list[dict[str, Any]]:
         return self._warehouse._query_dicts(
-            "SELECT account_id, mask, institution, kind, side FROM finance_accounts"
+            "SELECT account_id, account, mask, institution, kind, side, created_at FROM finance_accounts"
         )
 
     def _link_row(
@@ -879,6 +966,57 @@ class FinanceLedgerRunner:
             "created_at": now,
             "sync_version": sync_version,
         }
+
+
+def _institution_matches(left: str, right: str) -> bool:
+    """Loose institution equality: agent-extracted and Plaid-reported names for
+    one institution differ in decoration ("Example Bank" / "Example Bank NA")."""
+    left = left.strip().lower()
+    right = right.strip().lower()
+    if not left or not right:
+        return False
+    return left == right or left in right or right in left
+
+
+def _best_identity_match(
+    index: list[dict[str, Any]],
+    *,
+    owner: str,
+    institution: str,
+    mask: str,
+    side: str,
+    exclude: set[str],
+) -> str | None:
+    """The oldest existing logical account that is the same real account.
+
+    Identity evidence is owner + institution + account mask + side. Without a
+    mask or an institution there is no evidence at all (Venmo and the
+    valuation-founded accounts report neither), so those never merge.
+    """
+
+    if not mask.strip() or not institution.strip():
+        return None
+    matches = [
+        entry
+        for entry in index
+        if str(entry.get("account_id", "")) not in exclude
+        and str(entry.get("account", "")) == owner
+        and str(entry.get("mask", "")).strip() == mask.strip()
+        and str(entry.get("side", "")) == side
+        and _institution_matches(institution, str(entry.get("institution", "")))
+    ]
+    if not matches:
+        return None
+    matches.sort(key=lambda entry: (entry["created_at"], str(entry["account_id"])))
+    return str(matches[0]["account_id"])
+
+
+def _created_before(candidate: dict[str, Any] | None, current: dict[str, Any] | None) -> bool:
+    if candidate is None:
+        return False
+    if current is None:
+        return True
+    return candidate["created_at"] < current["created_at"]
 
 
 def has_pending_finance_observations(warehouse: PostgresWarehouse) -> bool:

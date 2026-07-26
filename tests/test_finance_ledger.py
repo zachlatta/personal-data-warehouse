@@ -801,3 +801,163 @@ def test_valuation_documents_found_asset_accounts(warehouse):
     assert accounts == [("property", "asset", "Main St house")]
     observations = warehouse._query("SELECT kind, value FROM finance_observations")
     assert observations == [("valuation", Decimal("650000"))]
+
+
+# --- re-linked institutions (Plaid mints a new item id, not a repaired one) --------
+
+
+def _credit_card_row(**overrides) -> dict:
+    """A credit card as Plaid reports it — the shape a re-link duplicates."""
+    defaults = {
+        "account_id": "acc-card",
+        "name": "Rewards Card",
+        "official_name": "Rewards Card",
+        "mask": "4242",
+        "type": "credit",
+        "subtype": "credit card",
+        "current_balance": 100.0,
+    }
+    return _plaid_account_row(**{**defaults, **overrides})
+
+
+def test_relinked_plaid_account_adopts_the_existing_ledger_account(warehouse):
+    """Re-linking an institution is the same card under a new plaid id.
+
+    Plaid mints a fresh item_id AND fresh account_ids when Link runs again, so
+    keying ledger identity on the plaid account id alone forks every account
+    and double-counts net worth. The new account resolves onto the existing
+    logical account by institution+mask instead.
+    """
+    _seed_plaid(warehouse, [_credit_card_row()])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    original = stable_finance_account_id("plaid", "z@x.test", "acc-card")
+
+    # The dead item is retired (`pdw ingest plaid unlink`) and the institution
+    # comes back under a new item with new plaid account ids.
+    warehouse._command("DELETE FROM plaid_accounts WHERE item_id = 'item-1'")
+    warehouse.insert_plaid_items([_plaid_item_row(item_id="item-2")])
+    warehouse.insert_plaid_accounts(
+        [_credit_card_row(item_id="item-2", account_id="acc-card-2", current_balance=250.0)]
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=14)).sync()
+
+    assert summary.accounts_created == 0
+    assert warehouse._query("SELECT account_id FROM finance_accounts") == [(original,)]
+    assert warehouse._query(
+        "SELECT source_account_key, account_id, match_method FROM finance_account_links ORDER BY source_account_key"
+    ) == [
+        ("acc-card", original, "source_id"),
+        ("acc-card-2", original, "institution_mask"),
+    ]
+    # One continuous balance history across the re-link.
+    assert warehouse._query(
+        "SELECT as_of, value FROM finance_observations ORDER BY as_of"
+    ) == [
+        (date(2026, 7, 13), Decimal("100.00")),
+        (date(2026, 7, 14), Decimal("250.00")),
+    ]
+
+
+def test_concurrent_duplicate_plaid_items_keep_separate_ledger_accounts(warehouse):
+    """While both items are live we cannot tell which one is authoritative.
+
+    Merging them would make the day's balance observation a race between two
+    live sources, so each keeps its own account until the operator retires one.
+    """
+    _seed_plaid(warehouse, [_credit_card_row()])
+    warehouse.insert_plaid_items([_plaid_item_row(item_id="item-2")])
+    warehouse.insert_plaid_accounts(
+        [_credit_card_row(item_id="item-2", account_id="acc-card-2", current_balance=250.0)]
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM finance_observations") == [(2,)]
+
+
+def test_retiring_a_forked_plaid_item_merges_and_prunes_the_duplicate(warehouse):
+    """The production incident, end to end.
+
+    A re-link forked a card before the dead item was retired:
+    marts.finance_net_worth carried two live rows per card and the transaction
+    overlap was double-counted. Unlinking the old item must leave exactly one
+    logical account per card, carrying the whole history (including the
+    statement documents linked to it), and no residue.
+    """
+    _seed_plaid(warehouse, [_credit_card_row()])
+    warehouse.insert_plaid_transactions(
+        [_plaid_transaction_row(account_id="acc-card", transaction_id="tx-old", amount=12.34)]
+    )
+    _seed_document(
+        warehouse,
+        extraction=_extraction_row(
+            document_type="credit_card_statement",
+            account_mask="4242",
+            balances_json=[{"date": "2026-06-30", "balance": "500.00"}],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    original = stable_finance_account_id("plaid", "z@x.test", "acc-card")
+
+    # A later re-link forks the card: a second item, a second ledger account.
+    warehouse.insert_plaid_items([_plaid_item_row(item_id="item-2")])
+    warehouse.insert_plaid_accounts(
+        [_credit_card_row(item_id="item-2", account_id="acc-card-2", current_balance=250.0)]
+    )
+    warehouse.insert_plaid_transactions(
+        [
+            _plaid_transaction_row(
+                item_id="item-2", account_id="acc-card-2", transaction_id="tx-new", amount=12.34
+            )
+        ]
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=14)).sync()
+    forked = stable_finance_account_id("plaid", "z@x.test", "acc-card-2")
+    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(2,)]
+    assert warehouse._query("SELECT count(*) FROM finance_transactions") == [(2,)]
+
+    # `pdw ingest plaid unlink item-1` deletes the dead item's raw rows.
+    warehouse._command("DELETE FROM plaid_accounts WHERE item_id = 'item-1'")
+    warehouse._command("DELETE FROM plaid_transactions WHERE item_id = 'item-1'")
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=15)).sync()
+
+    assert summary.accounts_merged == 1
+    assert summary.accounts_pruned == 1
+    assert warehouse._query("SELECT account_id FROM finance_accounts") == [(original,)]
+    assert warehouse._query(
+        "SELECT count(*) FROM finance_observations WHERE account_id = %s", (forked,)
+    ) == [(0,)]
+    # The statement document keeps pointing at the surviving account, and the
+    # overlap collapses back to one transaction.
+    assert warehouse._query(
+        "SELECT account_id FROM finance_account_links WHERE source = 'manual_finance'"
+    ) == [(original,)]
+    assert warehouse._query("SELECT account_id, count(*) FROM finance_transactions GROUP BY 1") == [
+        (original, 1)
+    ]
+
+
+def test_plaid_accounts_without_a_mask_never_adopt_another_account(warehouse):
+    """Mask+institution is the identity evidence; without it, never merge."""
+    _seed_plaid(warehouse, [_plaid_account_row(mask="")])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    warehouse.insert_plaid_items([_plaid_item_row(item_id="item-2")])
+    warehouse.insert_plaid_accounts(
+        [_plaid_account_row(item_id="item-2", account_id="acc-2", mask="")]
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(2,)]
+
+
+def test_ledger_never_prunes_an_account_a_source_still_links_to(warehouse):
+    """Pruning is only for merge residue — an unlinked institution keeps its
+    account and its history until something else claims it."""
+    _seed_plaid(warehouse, [_plaid_account_row()])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    warehouse._command("DELETE FROM plaid_accounts")
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=14)).sync()
+
+    assert summary.accounts_pruned == 0
+    assert warehouse._query("SELECT count(*) FROM finance_accounts") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM finance_observations") == [(1,)]

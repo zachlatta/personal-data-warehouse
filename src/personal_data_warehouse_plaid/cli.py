@@ -7,16 +7,28 @@ import html
 import json
 import logging
 import secrets
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 import webbrowser
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.plaid_sync import PlaidClient, PlaidSyncRunner
+from personal_data_warehouse.plaid_sync import (
+    PlaidAPIError,
+    PlaidClient,
+    PlaidSyncRunner,
+    plaid_error_code,
+)
+from personal_data_warehouse.schema import PlaidLinkedItem
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 LOGGER = logging.getLogger(__name__)
+
+# Plaid errors that mean "this Item is already gone on Plaid's side": the
+# local rows are then the only thing left to clean up, so /item/remove failing
+# with one of these must not block the delete.
+PLAID_ALREADY_REMOVED_ERROR_CODES = frozenset({"ITEM_NOT_FOUND", "INVALID_ACCESS_TOKEN"})
 
 
 @dataclass(frozen=True)
@@ -239,6 +251,166 @@ def run_sync(_args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_plaid_item(items: list[PlaidLinkedItem], needle: str) -> PlaidLinkedItem:
+    """Find one linked Item by exact id or unambiguous id prefix.
+
+    Plaid item ids are long opaque strings that are usually read off a table
+    that truncated them, so a prefix is what an operator actually has in hand.
+    Ambiguity is an error, never a guess — this selects rows to delete.
+    """
+    needle = needle.strip()
+    if not needle:
+        raise ValueError("an item id is required")
+    exact = [item for item in items if item.item_id == needle]
+    if exact:
+        return exact[0]
+    matches = [item for item in items if item.item_id.startswith(needle)]
+    if not matches:
+        raise ValueError(f"no linked Plaid item matches {needle!r}")
+    if len(matches) > 1:
+        ids = ", ".join(sorted(item.item_id for item in matches))
+        raise ValueError(f"{needle!r} matches {len(matches)} linked Plaid items: {ids}")
+    return matches[0]
+
+
+def _describe_item(item: PlaidLinkedItem) -> str:
+    return f"{item.item_id} ({item.institution_name or item.institution_id or 'unknown institution'})"
+
+
+def unlink_plaid_item(
+    *,
+    warehouse,
+    client,
+    item: PlaidLinkedItem,
+    confirm,
+    out,
+    dry_run: bool = False,
+    skip_remote: bool = False,
+) -> int:
+    """Retire one linked Plaid Item: revoke it at Plaid, then delete its rows.
+
+    Re-linking an institution does not always repair the existing Item —
+    Plaid can mint a brand new item_id with brand new account ids for the same
+    real accounts. Both Items then keep syncing: net worth counts every
+    balance twice and the transaction overlap is duplicated. There is no way
+    back from Link, so retiring the dead Item is its own operation.
+
+    Plaid is revoked first: if that fails for any reason other than the Item
+    already being gone, nothing is deleted, so a retry is safe.
+    """
+
+    accounts = warehouse.load_plaid_item_accounts(account=item.account, item_id=item.item_id)
+    counts = warehouse.count_plaid_item_rows(account=item.account, item_id=item.item_id)
+    print(f"Plaid item {_describe_item(item)}", file=out)
+    for account in accounts:
+        removed = " [removed]" if int(account.get("is_removed") or 0) else ""
+        print(
+            f"  account {account['mask'] or '----'} {account['name']} "
+            f"({account['type']}/{account['subtype']}) balance {account['current_balance']}{removed}",
+            file=out,
+        )
+    print(
+        "  rows to delete: " + " ".join(f"{table}={count}" for table, count in sorted(counts.items())),
+        file=out,
+    )
+    if dry_run:
+        print("Dry run: nothing was revoked or deleted.", file=out)
+        return 0
+    if not confirm(f"Revoke {_describe_item(item)} at Plaid and delete its warehouse rows?"):
+        print("Aborted; nothing was revoked or deleted.", file=out)
+        return 1
+
+    if skip_remote:
+        print("Skipping Plaid /item/remove (--skip-remote).", file=out)
+    else:
+        try:
+            client.item_remove(item.access_token)
+        except PlaidAPIError as exc:
+            message = _redact(str(exc), item.access_token)
+            if plaid_error_code(message) not in PLAID_ALREADY_REMOVED_ERROR_CODES:
+                print(f"Plaid refused to remove the item: {message}", file=out)
+                print("Nothing was deleted; fix the error and re-run.", file=out)
+                return 1
+            print(f"Plaid has already forgotten this item ({message}); deleting local rows.", file=out)
+        else:
+            print("Revoked at Plaid.", file=out)
+
+    deleted = warehouse.delete_plaid_item(account=item.account, item_id=item.item_id)
+    print(
+        "Deleted: " + " ".join(f"{table}={count}" for table, count in sorted(deleted.items())),
+        file=out,
+    )
+    print(
+        "The finance ledger reconciles on its next run: a re-linked account merges back into the "
+        "logical account it duplicated, and the duplicated transactions disappear.",
+        file=out,
+    )
+    return 0
+
+
+def _redact(message: str, *credentials: str) -> str:
+    for credential in credentials:
+        if credential:
+            message = message.replace(credential, "[redacted]")
+    return message
+
+
+def _confirm_on_stdin(prompt: str) -> bool:
+    try:
+        answer = input(f"{prompt} [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def run_items(_args: argparse.Namespace) -> int:
+    settings = load_settings(require_gmail=False, require_plaid=True)
+    if settings.plaid is None:
+        raise ValueError("Plaid is not configured")
+    warehouse = warehouse_from_settings(settings)
+    try:
+        warehouse.ensure_plaid_tables()
+        items = warehouse.load_plaid_item_tokens()
+        if not items:
+            print("No linked Plaid items. Run `pdw ingest plaid link` to add one.")
+            return 0
+        for item in items:
+            counts = warehouse.count_plaid_item_rows(account=item.account, item_id=item.item_id)
+            print(
+                f"{item.item_id}  {item.institution_name or item.institution_id or 'unknown institution'}  "
+                f"accounts={counts['plaid_accounts']} transactions={counts['plaid_transactions']}"
+            )
+    finally:
+        warehouse.close()
+    return 0
+
+
+def run_unlink(args: argparse.Namespace) -> int:
+    settings = load_settings(require_gmail=False, require_plaid=True)
+    if settings.plaid is None:
+        raise ValueError("Plaid is not configured")
+    warehouse = warehouse_from_settings(settings)
+    try:
+        warehouse.ensure_plaid_tables()
+        try:
+            item = resolve_plaid_item(warehouse.load_plaid_item_tokens(), args.item_id)
+        except ValueError as exc:
+            print(f"pdw ingest plaid unlink: {exc}", file=sys.stderr)
+            print("Run `pdw ingest plaid items` to list linked items.", file=sys.stderr)
+            return 2
+        return unlink_plaid_item(
+            warehouse=warehouse,
+            client=PlaidClient(settings.plaid),
+            item=item,
+            confirm=(lambda _prompt: True) if args.yes else _confirm_on_stdin,
+            out=sys.stdout,
+            dry_run=args.dry_run,
+            skip_remote=args.skip_remote,
+        )
+    finally:
+        warehouse.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Link Plaid items and sync Plaid-backed personal finance data.")
     subparsers = parser.add_subparsers(dest="command")
@@ -247,8 +419,23 @@ def build_parser() -> argparse.ArgumentParser:
     link.add_argument("--port", type=int, default=0, help="local port for the Plaid Link callback server (0 picks an open port)")
     link.add_argument("--no-browser", action="store_true", help="print the local Link URL without opening a browser")
     sync = subparsers.add_parser("sync", help="sync all linked Plaid items")
+    items = subparsers.add_parser("items", help="list linked Plaid items with their row counts")
+    unlink = subparsers.add_parser(
+        "unlink",
+        help="retire a linked Plaid item: revoke it at Plaid and delete its warehouse rows",
+    )
+    unlink.add_argument("item_id", help="item id, or an unambiguous prefix of one (see `plaid items`)")
+    unlink.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    unlink.add_argument("--dry-run", action="store_true", help="print what would be revoked and deleted")
+    unlink.add_argument(
+        "--skip-remote",
+        action="store_true",
+        help="do not call Plaid /item/remove (for an item already revoked in the Plaid dashboard)",
+    )
     sync.set_defaults(func=run_sync)
     link.set_defaults(func=run_link)
+    items.set_defaults(func=run_items)
+    unlink.set_defaults(func=run_unlink)
     parser.set_defaults(func=run_sync)
     return parser
 

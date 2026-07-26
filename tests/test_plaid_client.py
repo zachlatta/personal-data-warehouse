@@ -95,3 +95,13 @@ def test_plaid_client_surfaces_plaid_error_without_token_values() -> None:
         assert "secret" not in message
     else:
         raise AssertionError("Plaid API errors should raise PlaidAPIError")
+
+
+def test_plaid_client_removes_item_to_revoke_its_access_token() -> None:
+    session = FakeSession([FakeResponse({"request_id": "req-1"})])
+
+    response = PlaidClient(_config(), session=session).item_remove("access-token")
+
+    assert response == {"request_id": "req-1"}
+    assert session.posts[0]["url"] == "https://sandbox.plaid.com/item/remove"
+    assert session.posts[0]["json"]["access_token"] == "access-token"
