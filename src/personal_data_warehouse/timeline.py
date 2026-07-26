@@ -2035,6 +2035,18 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "finance_transaction_links": _detail("finance_transactions", "source-row resolution audit"),
     "manual_finance_documents": _events("uploaded statements and financial records"),
     "manual_finance_extractions": _detail("manual_finance_documents", "structured extraction history"),
+    # Receipts. A receipt is not its own timeline event: it explains a
+    # transaction that is already one, so records hang off the finance event
+    # and the triage log is internal bookkeeping about what we have examined.
+    "receipt_triage": _state("per-artifact record of what has already been examined"),
+    "receipt_records": _detail(
+        "finance_transactions",
+        "what was actually purchased, read out of a receipt/order email/attachment",
+    ),
+    "receipt_transaction_links": _detail(
+        "finance_transactions",
+        "receipt → transaction link with the agent's confidence and rationale",
+    ),
     # Upstream mutations (the warehouse acting on the world)
     "upstream_mutations": _events(),
     "upstream_mutation_requests": _events(),

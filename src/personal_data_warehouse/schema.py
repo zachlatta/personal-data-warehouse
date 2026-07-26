@@ -1573,3 +1573,80 @@ class GoogleDriveSyncState:
     error: str
     full_crawled_at: datetime
     files_seen: int
+
+
+# receipts: agent-derived purchase records linked to ledger transactions.
+#
+# One triage row per artifact ever considered, so nothing is re-examined and
+# the "we looked and it wasn't a receipt" answer is durable. Keyed by the
+# artifact's own identity in its source schema.
+RECEIPT_TRIAGE_COLUMNS = (
+    "source",
+    "native_id",
+    "occurred_at",
+    "verdict",
+    "reason",
+    "ai_provider",
+    "ai_model",
+    "ai_prompt_version",
+    "agent_run_id",
+    "decided_at",
+    "sync_version",
+)
+
+# One row per purchase the agent read out of an artifact. Facts only: what the
+# document says. The link decision lives in receipt_transaction_links so a
+# re-link never rewrites the facts, and `settled` records that the retry
+# budget is spent (attempt at +2 days, one retry 7 days later).
+RECEIPT_RECORD_COLUMNS = (
+    "record_id",
+    "source",
+    "native_id",
+    "occurred_at",
+    "purchased_at",
+    "merchant_name",
+    "merchant_location",
+    "currency",
+    "total",
+    "subtotal",
+    "tax",
+    "tip",
+    "amount_charged",
+    "card_last4",
+    "order_id",
+    "line_items_json",
+    "summary",
+    "record_confidence",
+    "is_purchase_record",
+    "decision",
+    "reasoning",
+    "attempt_count",
+    "last_attempt_at",
+    "settled",
+    "raw_result_json",
+    "ai_provider",
+    "ai_model",
+    "ai_prompt_version",
+    "ai_elapsed_ms",
+    "ai_processed_at",
+    "agent_run_id",
+    "created_at",
+    "updated_at",
+    "sync_version",
+)
+
+# The agent's opinion about which charge a record paid for. `relationship` is
+# free text in the agent's own words ("exact", "tip added after slip", "one of
+# several shipments") rather than an enum, because the interesting cases keep
+# turning out to be ones no enum anticipated.
+RECEIPT_TRANSACTION_LINK_COLUMNS = (
+    "record_id",
+    "transaction_id",
+    "confidence",
+    "relationship",
+    "why",
+    "ai_prompt_version",
+    "agent_run_id",
+    "created_at",
+    "sync_version",
+)

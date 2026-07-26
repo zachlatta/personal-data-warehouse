@@ -46,6 +46,9 @@ from personal_data_warehouse.schema import (
     FINANCE_TRANSACTION_LINK_COLUMNS,
     MANUAL_FINANCE_DOCUMENT_COLUMNS,
     MANUAL_FINANCE_EXTRACTION_COLUMNS,
+    RECEIPT_RECORD_COLUMNS,
+    RECEIPT_TRANSACTION_LINK_COLUMNS,
+    RECEIPT_TRIAGE_COLUMNS,
     PLAID_ACCOUNT_COLUMNS,
     PLAID_INVESTMENT_HOLDING_COLUMNS,
     PLAID_INVESTMENT_SECURITY_COLUMNS,
@@ -296,6 +299,12 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("account_id", "as_of", "kind", "source"),
     ),
     "finance_transactions": TableSpec(FINANCE_TRANSACTION_COLUMNS, ("transaction_id",)),
+    "receipt_triage": TableSpec(RECEIPT_TRIAGE_COLUMNS, ("source", "native_id")),
+    "receipt_records": TableSpec(RECEIPT_RECORD_COLUMNS, ("record_id",)),
+    "receipt_transaction_links": TableSpec(
+        RECEIPT_TRANSACTION_LINK_COLUMNS,
+        ("record_id", "transaction_id"),
+    ),
     "finance_transaction_links": TableSpec(
         FINANCE_TRANSACTION_LINK_COLUMNS,
         ("source", "source_row_key"),
@@ -1200,6 +1209,7 @@ NUMERIC_COLUMNS_BY_TABLE = {
     "finance_observations": {"value"},
     "finance_transactions": {"amount"},
     "manual_finance_extractions": {"closing_balance"},
+    "receipt_records": {"total", "subtotal", "tax", "tip", "amount_charged"},
 }
 
 # Day-granularity columns (DATE, not timestamptz): an observation is "the
@@ -1208,6 +1218,8 @@ DATE_COLUMNS = {
     "as_of",
     "period_start",
     "period_end",
+    # the date printed on a receipt is a day, not an instant
+    "purchased_at",
 }
 
 
@@ -1215,6 +1227,10 @@ def _is_numeric_column(table: str | None, column: str) -> bool:
     return column in NUMERIC_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # receipts: when the triage verdict was made, and when the last
+    # enrichment attempt ran (drives the settle/retry windows)
+    "decided_at",
+    "last_attempt_at",
     "internal_date",
     "synced_at",
     "updated_at",
@@ -1281,6 +1297,11 @@ TIMESTAMP_COLUMNS = {
 
 INTEGER_COLUMNS = {
     "seq",
+    # receipts: boolean-ish flags and counters stored as bigint like the
+    # rest of the warehouse's is_* columns
+    "is_purchase_record",
+    "settled",
+    "attempt_count",
     "input_tokens",
     "output_tokens",
     "cache_read_tokens",
@@ -2010,6 +2031,95 @@ class PostgresWarehouse:
                 t.source
             FROM {finance}.transactions AS t
             JOIN {finance}.accounts AS a ON a.account_id = t.account_id
+            """,
+        )
+
+    def ensure_receipt_tables(self) -> None:
+        self._ensure_table_group(
+            [
+                "receipt_triage",
+                "receipt_records",
+                "receipt_transaction_links",
+            ]
+        )
+        self._ensure_receipt_mart_views()
+
+    def _ensure_receipt_mart_views(self) -> None:
+        receipts = _identifier(self.physical_schema_name("receipts"))
+        finance = _identifier(self.physical_schema_name("finance"))
+        marts = _identifier(self.physical_schema_name("marts"))
+        # The read surface: every ledger transaction, with whatever the agent
+        # found for it. LEFT JOIN so this stays a superset of the ledger --
+        # `receipt_summary IS NULL` is the honest "no receipt found" answer,
+        # and `link_confidence` is exposed rather than filtered so a low-
+        # confidence guess is visible without being indistinguishable from a
+        # confident one.
+        self._ensure_physical_view(
+            f"{marts}.transaction_receipts",
+            f"""
+            CREATE OR REPLACE VIEW {marts}.transaction_receipts AS
+            SELECT
+                t.transaction_id,
+                t.account_id,
+                t.posted_at,
+                t.amount,
+                t.currency AS transaction_currency,
+                t.merchant,
+                t.description,
+                r.record_id,
+                r.summary AS receipt_summary,
+                r.line_items_json,
+                r.merchant_name AS receipt_merchant,
+                r.merchant_location,
+                NULLIF(r.purchased_at, '1970-01-01'::date) AS purchased_at,
+                r.currency AS receipt_currency,
+                NULLIF(r.total, 0) AS receipt_total,
+                NULLIF(r.tax, 0) AS receipt_tax,
+                NULLIF(r.tip, 0) AS receipt_tip,
+                r.order_id,
+                r.card_last4,
+                r.source AS receipt_source,
+                r.native_id AS receipt_native_id,
+                l.confidence AS link_confidence,
+                l.relationship AS link_relationship,
+                l.why AS link_reason
+            FROM {finance}.transactions AS t
+            LEFT JOIN {receipts}.transaction_links AS l
+                ON l.transaction_id = t.transaction_id
+            LEFT JOIN {receipts}.records AS r
+                ON r.record_id = l.record_id
+            """,
+        )
+        # The other direction: receipts we read but could not place. This is
+        # where unsynced-card spend and coverage gaps surface, so it is a
+        # first-class view rather than a query someone has to remember.
+        self._ensure_physical_view(
+            f"{marts}.unmatched_receipts",
+            f"""
+            CREATE OR REPLACE VIEW {marts}.unmatched_receipts AS
+            SELECT
+                r.record_id,
+                r.source,
+                r.native_id,
+                r.occurred_at,
+                NULLIF(r.purchased_at, '1970-01-01'::date) AS purchased_at,
+                r.merchant_name,
+                r.merchant_location,
+                r.currency,
+                NULLIF(r.total, 0) AS total,
+                r.card_last4,
+                r.summary,
+                r.decision,
+                r.reasoning,
+                r.attempt_count,
+                r.last_attempt_at,
+                r.settled
+            FROM {receipts}.records AS r
+            WHERE r.is_purchase_record = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM {receipts}.transaction_links AS l
+                  WHERE l.record_id = r.record_id
+              )
             """,
         )
 
@@ -5500,6 +5610,15 @@ class PostgresWarehouse:
 
     def insert_finance_transaction_links(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("finance_transaction_links", rows, FINANCE_TRANSACTION_LINK_COLUMNS)
+
+    def insert_receipt_triage(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("receipt_triage", rows, RECEIPT_TRIAGE_COLUMNS)
+
+    def insert_receipt_records(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("receipt_records", rows, RECEIPT_RECORD_COLUMNS)
+
+    def insert_receipt_transaction_links(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("receipt_transaction_links", rows, RECEIPT_TRANSACTION_LINK_COLUMNS)
 
     def reconcile_finance_transactions(self, *, transaction_ids: list[str], link_keys: list[str]) -> int:
         """Hard-delete ledger transactions/links absent from the desired set.

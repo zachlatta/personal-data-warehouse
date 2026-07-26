@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local agent-container run directories: prompts, inputs and raw agent output.
+# These contain whatever the agent was asked to read (receipt text, email
+# bodies, transcripts), so they must never be committed to this public repo.
+.agent-runs/

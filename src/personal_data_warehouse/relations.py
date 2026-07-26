@@ -36,6 +36,7 @@ DERIVED_SCHEMAS: tuple[str, ...] = (
     "enrichment",
     "photos",
     "finance",
+    "receipts",
     "ai_processing",
     "upstream_mutations",
     "util",
@@ -181,6 +182,12 @@ _CANONICAL_RELATION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("finance_observations", "finance", "observations"),
     ("finance_transactions", "finance", "transactions"),
     ("finance_transaction_links", "finance", "transaction_links"),
+    # Receipts: agent-derived purchase records (what was actually bought) and
+    # their links to ledger transactions. Every artifact source stays raw;
+    # this schema owns only the derived reading of it.
+    ("receipt_triage", "receipts", "artifact_triage"),
+    ("receipt_records", "receipts", "records"),
+    ("receipt_transaction_links", "receipts", "transaction_links"),
     ("file_attachment_enrichments", "enrichment", "file_attachment_enrichments"),
     ("agent_runs", "ai_processing", "agent_runs"),
     ("agent_run_events", "ai_processing", "agent_run_events"),
