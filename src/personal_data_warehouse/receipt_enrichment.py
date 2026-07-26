@@ -23,7 +23,7 @@ import json
 import time
 from typing import Any
 
-PROMPT_VERSION = "receipt-transaction-research-v4"
+PROMPT_VERSION = "receipt-transaction-research-v5"
 
 DECISION_FOUND = "receipt_found"
 DECISION_NOT_FOUND = "no_receipt_found"
@@ -386,8 +386,8 @@ _EVIDENCE_SQL_BY_SOURCE = {
         "WHERE message_id = ANY(%s) AND is_deleted = 0"
     ),
     SOURCE_GMAIL_ATTACHMENT: (
-        "SELECT content_sha256 AS native_id FROM gmail_attachments "
-        "WHERE content_sha256 = ANY(%s) AND is_deleted = 0"
+        "SELECT attachment_id AS native_id FROM gmail_attachments "
+        "WHERE attachment_id = ANY(%s) AND is_deleted = 0"
     ),
 }
 

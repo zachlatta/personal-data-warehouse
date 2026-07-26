@@ -10,6 +10,7 @@ from personal_data_warehouse.receipt_enrichment import (
     DECISION_INSUFFICIENT,
     DECISION_NOT_FOUND,
     PROMPT_VERSION,
+    SOURCE_GMAIL_ATTACHMENT,
     SOURCE_GMAIL_MESSAGE,
     SOURCE_PHOTO,
     ReceiptEnrichmentRunner,
@@ -193,6 +194,39 @@ def test_receipt_is_not_published_when_agent_invents_evidence():
     assert warehouse.rows[0]["record_id"] == ""
     assert summary.receipts_found == 0
     assert summary.insufficient == 1
+
+
+def test_gmail_attachment_evidence_is_validated_by_attachment_id():
+    result = _found_result()
+    result["receipt"] = {
+        **result["receipt"],
+        "primary_source": SOURCE_GMAIL_ATTACHMENT,
+        "primary_native_id": "att_1",
+        "evidence": [
+            {
+                "source": SOURCE_GMAIL_ATTACHMENT,
+                "native_id": "att_1",
+                "role": "primary",
+                "why": "The attached invoice shows the exact total.",
+            }
+        ],
+    }
+    warehouse = FakeWarehouse(
+        {
+            "FROM finance_transactions AS t": [_transaction()],
+            "FROM gmail_attachments WHERE": [{"native_id": "att_1"}],
+        }
+    )
+
+    summary = _runner(warehouse, FakeAgent(result)).sync()
+
+    assert summary.receipts_found == 1
+    assert warehouse.rows[0]["primary_native_id"] == "att_1"
+    attachment_sql = next(
+        sql for sql, _ in warehouse.queries if "FROM gmail_attachments WHERE" in sql
+    )
+    assert "SELECT attachment_id AS native_id" in attachment_sql
+    assert "WHERE attachment_id = ANY(%s)" in attachment_sql
 
 
 def test_no_receipt_result_is_durable_and_retryable():
