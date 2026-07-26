@@ -3,10 +3,10 @@
 Every finance source is a witness to one of two fact types: a **flow** (money
 moved: a transaction) or a **stock** (something was worth X at time T: a
 balance, valuation, or principal). This runner resolves raw source rows into
-logical `finance.accounts` (via `finance.account_links`, the photos-identity
+logical `derived_finance.accounts` (via `derived_finance.account_links`, the photos-identity
 pattern: raw rows never learn about identity), appends per-day
-`finance.observations`, and builds the unified deduped `finance.transactions`
-ledger (via `finance.transaction_links`). Net worth is the latest observation
+`derived_finance.observations`, and builds the unified deduped `derived_finance.transactions`
+ledger (via `derived_finance.transaction_links`). Net worth is the latest observation
 per account summed by side — read through `marts_finance.net_worth` /
 `marts_finance.net_worth_history`; transactions through
 `marts_finance.transactions`.

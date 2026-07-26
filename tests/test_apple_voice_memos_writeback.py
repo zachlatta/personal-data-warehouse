@@ -316,7 +316,7 @@ def test_fetch_enriched_titles_queries_the_app_sql_tool() -> None:
     request = session.requests[0]
     assert request["url"] == "https://warehouse.example.com/api/tools/sql"
     assert request["headers"]["Authorization"] == "Bearer pdw:secret"
-    assert "apple_voice_memos.enrichments" in request["json"]["sql"]
+    assert "derived_voice_memos.enrichments" in request["json"]["sql"]
     assert "content_sha256" in request["json"]["sql"]
     assert "'zach@example.com'" in request["json"]["sql"]
     assert request["json"]["format"] == "ndjson"

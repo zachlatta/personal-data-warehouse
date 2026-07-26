@@ -430,6 +430,50 @@ def test_warehouse_sql_never_names_a_relation_bare() -> None:
     )
 
 
+def test_no_module_names_a_pre_reorg_physical_relation() -> None:
+    """No string anywhere may still spell an old ``schema.name``.
+
+    The @marker sweep only reaches SQL the warehouse expands. SQL that crosses a
+    boundary first — the voice-memo write-back queries the app's HTTP tool API,
+    a report script builds its own statement — carries the physical name as a
+    plain string, so it is exactly where a rename rots silently. It did: the
+    write-back shipped ``apple_voice_memos.enrichments`` and broke on the first
+    run after the cutover.
+    """
+    old_names = {
+        f"{obj.previous_schema}.{obj.previous_name}"
+        for obj in CATALOG.objects
+        if obj.previous_schema
+    }
+    current = {f"{obj.schema}.{obj.name}" for obj in CATALOG.objects}
+    stale = old_names - current
+    # schema_upgrade.py is the one module whose whole job is the old layout.
+    skip = {REPO_ROOT / "src/personal_data_warehouse/schema_upgrade.py"}
+    offenders: list[str] = []
+    for path in list((REPO_ROOT / "src").rglob("*.py")) + list((REPO_ROOT / "scripts").rglob("*.py")):
+        if path in skip:
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                parts = [node.value]
+            elif isinstance(node, ast.JoinedStr):
+                parts = [
+                    v.value
+                    for v in node.values
+                    if isinstance(v, ast.Constant) and isinstance(v.value, str)
+                ]
+            else:
+                continue
+            for text in parts:
+                for name in stale:
+                    if re.search(rf"(?<![\w.@]){re.escape(name)}(?![\w])", text):
+                        offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}: {name}")
+    assert not offenders, "pre-reorg physical names still in source: " + "; ".join(
+        sorted(set(offenders))[:20]
+    )
+
+
 # ---------------------------------------------------------------------------
 # timeline routing
 # ---------------------------------------------------------------------------

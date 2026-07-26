@@ -10,7 +10,7 @@ Those lines ride the exact same envelope/batch/ingest path as the agent-sessions
 sources - ``record_type="claude_desktop_event"``, ``tool="claude_desktop"`` -
 posted to ``/ingest/agent-sessions/batch``. The app writes them into the
 ``agent-sessions/inbox`` Drive folder and the existing
-``agent_sessions_drive_ingest`` asset normalizes them into ``claude_desktop.events``
+``agent_sessions_drive_ingest`` asset normalizes them into ``base_claude_desktop.events``
 plus the unified ``marts_ai_conversations.events`` surface. The warehouse dedupes by
 ``(source, session_id, event_uuid)``, so re-shipping a whole conversation when it
 gains one new turn is cheap and idempotent.

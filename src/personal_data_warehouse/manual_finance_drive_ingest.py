@@ -1,7 +1,7 @@
 """Drive-inbox ingest for manually uploaded finance documents.
 
 Clone of the photos transport with one fixed destination table
-(``manual_finance.documents``): the inbox (``manual-finance/inbox/``) receives
+(``base_manual_finance.documents``): the inbox (``manual-finance/inbox/``) receives
 document blobs + metadata envelopes, rows upsert by provenance, and objects
 promote inbox -> library keeping their account-keyed folder segment. Like
 photos, the blob lookup falls back inbox -> library so a re-sent envelope

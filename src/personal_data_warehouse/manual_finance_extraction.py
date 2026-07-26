@@ -14,7 +14,7 @@ becomes one agent session equipped to figure it out:
 - The agent runs with an authenticated, read-only ``pdw`` CLI
   (``run_with_pdw``) so it can look things up when a document is ambiguous.
 
-Results land in ``manual_finance.extractions`` (typed columns + the full
+Results land in ``derived_finance.document_extractions`` (typed columns + the full
 payload in ``raw_result_json``), keyed by content sha + model/prompt version:
 bumping ``PROMPT_VERSION`` re-extracts the corpus without clobbering history.
 

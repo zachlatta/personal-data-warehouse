@@ -8,7 +8,7 @@ polls the claude.ai API - the ``sessionKey`` alone authenticates, so it works
 from prod's IP. It fetches conversations changed since the per-conversation
 Postgres cursor and ships them through the SAME ingest path as the agent-sessions
 sources (``/ingest/agent-sessions/batch`` -> ``agent_sessions_drive_ingest`` ->
-``claude_desktop.events`` plus the unified ``marts_ai_conversations.events`` surface).
+``base_claude_desktop.events`` plus the unified ``marts_ai_conversations.events`` surface).
 
 Polling is plain request/response (no persistent connection), so this runs as a
 short job on a keepalive cadence - mirroring the uploader cadence - rather than

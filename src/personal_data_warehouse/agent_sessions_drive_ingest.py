@@ -6,16 +6,16 @@ Three transports feed the same row schema:
   transcripts that a per-device uploader tails and batches into
   ``agent-sessions/inbox/batches/`` as gzipped JSONL envelopes. This module
   consumes those batches and normalizes each raw line into source-owned rows
-  (``claude_code.events``, ``codex.events``, ``openclaw.events``, or ``pi.events``; lossless
+  (``base_claude_code.events``, ``base_codex.events``, ``base_openclaw.events``, or ``base_pi.events``; lossless
   ``raw_json`` plus queryable columns), then promotes processed batch files into
   ``agent-sessions/library/``.
 * Claude Desktop is polled server-side from claude.ai using a credential pushed
   from the local desktop app. It ships ``claude_desktop_event`` envelopes through
   the same Drive inbox, and ``claude_desktop_event_row`` normalizes them into
-  ``claude_desktop.events`` rows.
+  ``base_claude_desktop.events`` rows.
 * ChatGPT (the consumer product) is polled server-side from its backend API,
   which returns each conversation as a node-tree. ``chatgpt_conversation_to_event_rows``
-  linearizes that tree into ``chatgpt.events`` rows; see
+  linearizes that tree into ``base_chatgpt.events`` rows; see
   ``defs/chatgpt_backend_ingest.py``.
 
 The unified raw event surface is ``marts_ai_conversations.events``. The
@@ -820,7 +820,7 @@ def chatgpt_conversation_to_event_rows(
     device: str,
     ingested_at: datetime,
 ) -> list[dict[str, Any]]:
-    """Normalize one ChatGPT conversation tree into ``chatgpt.events`` rows."""
+    """Normalize one ChatGPT conversation tree into ``base_chatgpt.events`` rows."""
     mapping = conversation.get("mapping")
     mapping = mapping if isinstance(mapping, Mapping) else {}
     session_id = str(conversation.get("conversation_id") or conversation.get("id") or "")

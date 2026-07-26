@@ -22,6 +22,8 @@ from typing import Callable, Mapping, Sequence
 
 import requests
 
+from personal_data_warehouse.relations import relation
+
 # Voice Memos keeps this bit set in ZFLAGS while a recording still carries the
 # name the app assigned ("New Recording N", or a geocoded location name) and
 # clears it when the user types a title. Verified empirically: every
@@ -190,9 +192,13 @@ def fetch_enriched_titles(
     recording_id and by audio content sha (the drift-proof identity).
     """
     escaped_account = account.replace("'", "''")
+    # Named through the catalog: this SQL crosses the HTTP tool API, so it is
+    # not expanded by the warehouse's own relation markers and would otherwise
+    # be the one place a schema move could silently rot.
+    enrichments = relation("apple_voice_memos_enrichments")
     sql = (
         "SELECT DISTINCT ON (recording_id) recording_id, content_sha256, title "
-        "FROM apple_voice_memos.enrichments "
+        f"FROM {enrichments.schema}.{enrichments.name} "
         "WHERE status = 'completed' AND title IS NOT NULL "
         f"AND account = '{escaped_account}' "
         "ORDER BY recording_id, created_at DESC"

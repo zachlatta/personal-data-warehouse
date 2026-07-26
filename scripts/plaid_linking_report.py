@@ -19,16 +19,16 @@ def load_safe_status_rows() -> tuple[list[tuple], list[tuple]]:
             """
             WITH tx AS (
                 SELECT account, item_id, account_id, count(*) FILTER (WHERE is_removed = 0) AS n
-                FROM plaid.transactions GROUP BY account, item_id, account_id
+                FROM base_plaid.transactions GROUP BY account, item_id, account_id
             ), holdings AS (
                 SELECT account, item_id, account_id, count(*) AS n
-                FROM plaid.investment_holdings GROUP BY account, item_id, account_id
+                FROM base_plaid.investment_holdings GROUP BY account, item_id, account_id
             ), inv_tx AS (
                 SELECT account, item_id, account_id, count(*) AS n
-                FROM plaid.investment_transactions GROUP BY account, item_id, account_id
+                FROM base_plaid.investment_transactions GROUP BY account, item_id, account_id
             ), liabilities AS (
                 SELECT account, item_id, account_id, count(*) AS n
-                FROM plaid.liabilities GROUP BY account, item_id, account_id
+                FROM base_plaid.liabilities GROUP BY account, item_id, account_id
             ), status AS (
                 SELECT
                     i.institution_name,
@@ -40,8 +40,8 @@ def load_safe_status_rows() -> tuple[list[tuple], list[tuple]]:
                     (COALESCE(holdings.n, 0) > 0 OR COALESCE(inv_tx.n, 0) > 0) AS investments_present,
                     COALESCE(liabilities.n, 0) > 0 AS liabilities_present,
                     a.synced_at
-                FROM plaid.accounts AS a
-                JOIN plaid.items AS i USING (account, item_id)
+                FROM base_plaid.accounts AS a
+                JOIN base_plaid.items AS i USING (account, item_id)
                 LEFT JOIN tx USING (account, item_id, account_id)
                 LEFT JOIN holdings USING (account, item_id, account_id)
                 LEFT JOIN inv_tx USING (account, item_id, account_id)
@@ -65,8 +65,8 @@ def load_safe_status_rows() -> tuple[list[tuple], list[tuple]]:
         products = warehouse._query(
             """
             SELECT i.institution_name, s.product, s.status, s.last_synced_at
-            FROM plaid.sync_state AS s
-            JOIN plaid.items AS i USING (account, item_id)
+            FROM @plaid_sync_state AS s
+            JOIN @plaid_items AS i USING (account, item_id)
             ORDER BY i.institution_name, s.product
             """
         )

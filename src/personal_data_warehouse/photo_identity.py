@@ -1,8 +1,8 @@
 """Photo identity resolution: raw per-source file rows -> deduplicated assets.
 
 The runner scans every registered photo source table (``PHOTO_SOURCE_RELATIONS``)
-for rows without a ``photos.asset_files`` link, fingerprints stills, applies the
-merge policy, and maintains ``photos.assets`` (canonical fields + thumbnail).
+for rows without a ``derived_photos.asset_files`` link, fingerprints stills, applies the
+merge policy, and maintains ``derived_photos.assets`` (canonical fields + thumbnail).
 Raw rows are NEVER mutated; deleting the link rows and re-running replays every
 decision.
 
