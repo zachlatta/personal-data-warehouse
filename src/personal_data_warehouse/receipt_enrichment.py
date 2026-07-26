@@ -23,7 +23,7 @@ import json
 import time
 from typing import Any
 
-PROMPT_VERSION = "receipt-transaction-research-v1"
+PROMPT_VERSION = "receipt-transaction-research-v3"
 
 DECISION_FOUND = "receipt_found"
 DECISION_NOT_FOUND = "no_receipt_found"
@@ -46,6 +46,19 @@ EVIDENCE_SOURCES = (
 )
 
 TRUSTED_CONFIDENCE = "high"
+NON_RETAIL_ACCOUNT_KINDS = frozenset(
+    {
+        "brokerage",
+        "crypto",
+        "investment",
+        "ira",
+        "mortgage",
+        "private_fund",
+        "property",
+        "receivable",
+        "vehicle",
+    }
+)
 ABSENT_MONEY = "0"
 ABSENT_DATE = "1970-01-01"
 
@@ -228,7 +241,11 @@ Search both photos and Gmail unless the ledger row is plainly not a purchase/ref
   `thumbnail_storage_file_id`.
 - `gmail.messages` has message metadata and bodies. `gmail.attachments` joins
   `enrichment.file_attachment_enrichments` by `content_sha256` for extracted attachment
-  text.
+  text. Evidence IDs must be the primary key for the source you name:
+  `gmail_message` uses `gmail.messages.message_id`, while `gmail_attachment` uses
+  `gmail.attachments.attachment_id`. A message_id is not an attachment_id. Query and
+  return the actual attachment row when an attachment is the receipt; do not reuse its
+  parent message ID.
 - `receipts.transaction_receipts` shows decisions already made for other transactions.
   Do not reuse one source receipt for two transactions unless the source itself clearly
   proves that it covers both (for example, a split settlement).
@@ -266,6 +283,12 @@ The transaction amount is signed (negative is money leaving an account), its tim
 a posting date, and an account mask may differ from the physical or wallet card last four.
 Merchant statement text can differ from the receipt name. Never fabricate a line item,
 source identifier, date, merchant, or total.
+
+Brokerage, security, and cryptocurrency trades are not retail purchases. Dividends,
+interest, reinvestments, asset valuations, and internal investment cash movements are
+also `not_receiptable`; an order confirmation, trade fill, or account statement does not
+turn them into receipts. A brokerage cash-management transaction with a real retail
+merchant may still have a receipt.
 
 When no receipt is found, return every receipt field as an empty string/list. Return ONLY
 a JSON object matching the provided schema.
@@ -396,6 +419,13 @@ def _date_or_absent(value: Any) -> str:
     return text
 
 
+def _is_plainly_non_retail_financial_activity(transaction: Mapping[str, Any]) -> bool:
+    """Identify account activity that cannot become a retail receipt."""
+    account_kind = str(transaction.get("account_kind") or "").strip().lower()
+    merchant = str(transaction.get("merchant") or "").strip()
+    return account_kind in NON_RETAIL_ACCOUNT_KINDS and not merchant
+
+
 def _validated_evidence(
     receipt: Mapping[str, Any],
     known_evidence: set[tuple[str, str]],
@@ -459,6 +489,13 @@ def transaction_receipt_row(
     decision = str(result.get("decision") or DECISION_INSUFFICIENT)
     if decision not in DECISIONS:
         decision = DECISION_INSUFFICIENT
+    reasoning = str(result.get("reasoning") or "")[:2000]
+    if _is_plainly_non_retail_financial_activity(transaction):
+        decision = DECISION_NOT_RECEIPTABLE
+        reasoning = (
+            "This is non-retail brokerage or asset-account activity without a merchant; "
+            "a trade or account confirmation is not a receipt."
+        )
 
     sources_searched = []
     raw_sources = result.get("sources_searched")
@@ -496,7 +533,7 @@ def transaction_receipt_row(
         "transaction_id": transaction_id,
         "record_id": record_id_for(transaction_id) if trusted_receipt else "",
         "decision": decision,
-        "reasoning": str(result.get("reasoning") or "")[:2000],
+        "reasoning": reasoning,
         "sources_searched_json": json.dumps(sources_searched, sort_keys=True),
         "primary_source": primary[0] if trusted_receipt else "",
         "primary_native_id": primary[1] if trusted_receipt else "",

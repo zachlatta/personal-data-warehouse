@@ -83,10 +83,10 @@ def _result(**overrides):
     return result
 
 
-def _row(result=None, *, attempt_count=0, known_evidence=None):
+def _row(result=None, *, attempt_count=0, known_evidence=None, transaction=None):
     return transaction_receipt_row(
         result or _result(),
-        transaction=TRANSACTION,
+        transaction=transaction or TRANSACTION,
         attempt_count=attempt_count,
         max_attempts=2,
         known_evidence=known_evidence
@@ -132,6 +132,9 @@ def test_prompt_is_transaction_first_and_requires_real_photo_inspection():
     assert "pdw sql" in prompt
     assert "search.search_text" in prompt
     assert "gmail.messages" in prompt
+    assert "gmail.attachments.attachment_id" in prompt
+    assert "message_id is not an attachment_id" in prompt
+    assert "Brokerage, security, and cryptocurrency trades" in prompt
     assert "marts.photos" in prompt
     assert "pdw call get_object" in prompt
     assert "inspect the actual image" in prompt
@@ -224,6 +227,31 @@ def test_non_purchase_transaction_settles_without_receipt_fields():
     assert row["settled"] == 1
     assert row["record_id"] == ""
     assert row["summary"] == ""
+
+
+def test_non_retail_brokerage_activity_cannot_publish_a_receipt():
+    transaction = {
+        **TRANSACTION,
+        "account_kind": "brokerage",
+        "merchant": "",
+        "description": "buy shares of an index fund - PURCHASED",
+    }
+    row = _row(_result(), transaction=transaction)
+    assert row["decision"] == DECISION_NOT_RECEIPTABLE
+    assert row["record_id"] == ""
+    assert row["merchant_name"] == ""
+    assert row["settled"] == 1
+    assert "brokerage" in row["reasoning"].lower()
+    assert json.loads(row["raw_result_json"])["decision"] == DECISION_FOUND
+
+
+def test_brokerage_cash_account_with_a_merchant_can_still_publish_a_receipt():
+    transaction = {
+        **TRANSACTION,
+        "account_kind": "brokerage",
+        "merchant": "Example Cafe",
+    }
+    assert _row(_result(), transaction=transaction)["decision"] == DECISION_FOUND
 
 
 def test_unknown_decision_is_retried_as_insufficient_evidence():
