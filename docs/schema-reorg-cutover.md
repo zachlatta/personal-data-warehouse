@@ -117,18 +117,22 @@ Then, through the app:
 ```bash
 pdw schema | head -20                     # starts with "START WITH timeline"
 pdw schema | grep -c '^# ops '            # 0
-pdw sql -q check "SELECT count(*) FROM timeline.events"
+pdw sql -q check "SELECT EXISTS (SELECT 1 FROM timeline.events LIMIT 1) AS has_events"
 pdw sql -q search "SELECT source, ref FROM timeline.search_text('invoice', 5)"
 pdw sql -q denied "SELECT 1 FROM private.chatgpt_sessions"   # must be denied
 curl -fsS "$PDW_API_URL/healthz"
 ```
 
-Timeline freshness (the sync engine must resume, not restart):
+Timeline freshness (the sync engine must resume, not restart) comes from its
+per-adapter cursors:
 
 ```sql
 SELECT adapter, backfill_done, last_error, updated_at FROM ops.timeline_sync_state ORDER BY adapter;
-SELECT max(event_ts) FROM timeline.events;
 ```
+
+Do not use `max(timeline.events.event_ts)` as a freshness check. `event_ts` is
+the event's real-world time, so future calendar events legitimately put the
+global maximum years ahead of the current ingestion time.
 
 Production logs, pinned to the resolved UUID:
 
