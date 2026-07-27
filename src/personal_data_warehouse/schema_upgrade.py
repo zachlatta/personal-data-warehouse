@@ -122,7 +122,11 @@ def _build_plan() -> UpgradePlan:
     moves: list[ObjectMove] = []
     for obj in CATALOG.objects:
         if not obj.previous_schema:
-            raise ValueError(f"catalog object {obj.id!r} has no recorded previous location")
+            # An object added after the reorganization never existed in the old
+            # layout, so there is nothing to relocate: normal provisioning
+            # creates it. Only objects that predate the reorg carry a previous
+            # location, and only those are part of this migration.
+            continue
         moves.append(
             ObjectMove(
                 id=obj.id,
@@ -556,6 +560,7 @@ def provision_everything(warehouse) -> None:
     warehouse.ensure_agent_tables()
     warehouse.ensure_timeline_tables()
     warehouse.ensure_upstream_mutation_tables()
+    warehouse.ensure_pipeline_health_tables()
 
 
 if __name__ == "__main__":

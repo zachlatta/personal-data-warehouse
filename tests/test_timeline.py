@@ -71,6 +71,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_manual_finance_tables()
     wh.ensure_receipt_tables()
     wh.ensure_timeline_tables()
+    wh.ensure_pipeline_health_tables()
 
 
 # --- coverage registry (pure) -------------------------------------------------

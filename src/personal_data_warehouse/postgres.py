@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
 import inspect
@@ -66,6 +66,8 @@ from personal_data_warehouse.schema import (
     PHOTO_ASSET_COLUMNS,
     PHOTO_ASSET_FILE_COLUMNS,
     PHOTO_SOURCE_FILE_COLUMNS,
+    PIPELINE_HEALTH_COLUMNS,
+    PIPELINE_TABLE_FRESHNESS_COLUMNS,
     RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS,
     SLACK_ACCOUNT_IDENTITY_COLUMNS,
     SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS,
@@ -102,6 +104,12 @@ from personal_data_warehouse.schema import (
     SyncState,
 )
 from personal_data_warehouse.config import normalize_postgres_url
+from personal_data_warehouse.pipeline_health import (
+    COLLECTOR_STALE_SECONDS,
+    EPOCH as PIPELINE_HEALTH_EPOCH,
+    LATE_MULTIPLIER,
+    STALE_MULTIPLIER,
+)
 from personal_data_warehouse.relations import (
     ALL_CANONICAL_SCHEMAS,
     CANONICAL_RELATIONS,
@@ -487,6 +495,16 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ),
     ),
     "timeline_sync_state": TableSpec(TIMELINE_SYNC_STATE_COLUMNS, ("adapter",), "updated_at"),
+    # Pipeline freshness snapshot (personal_data_warehouse/pipeline_health.py).
+    # One row per pipeline and one per warehouse table, replaced in place by each
+    # collection; collected_at is the version column so a stale collector can
+    # never overwrite a newer snapshot.
+    "pipeline_health": TableSpec(PIPELINE_HEALTH_COLUMNS, ("pipeline",), "collected_at"),
+    "pipeline_table_freshness": TableSpec(
+        PIPELINE_TABLE_FRESHNESS_COLUMNS,
+        ("table_id",),
+        "collected_at",
+    ),
 }
 
 # Every table whose rows belong to exactly one linked Plaid Item, data first
@@ -1002,6 +1020,17 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS whatsapp_messages_ingested_at_idx ON @whatsapp_messages (ingested_at)",
     ),
     *_ai_conversation_event_index_specs(),
+    # The shared enrichment table is only ~100k rows but ~0.5 GB of extracted
+    # text, so the freshness collector's cost guard would skip an unindexed
+    # max(updated_at) and leave every attachment/media/caption enrichment
+    # pipeline unmeasurable. A ~2 MB timestamp index buys the whole enrichment
+    # layer a real "last produced a result at".
+    IndexSpec(
+        "file_attachment_enrichments_updated_at_idx",
+        "file_attachment_enrichments",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS file_attachment_enrichments_updated_at_idx "
+        "ON @file_attachment_enrichments (updated_at)",
+    ),
 )
 
 # Indexes that used to exist but have been superseded. Dropped idempotently
@@ -1299,6 +1328,11 @@ TIMESTAMP_COLUMNS = {
     "captured_at",
     "capture_ts",
     "observed_at",
+    # pipeline freshness snapshot
+    "last_write_at",
+    "newest_event_at",
+    "last_error_at",
+    "collected_at",
 }
 
 INTEGER_COLUMNS = {
@@ -1421,6 +1455,18 @@ INTEGER_COLUMNS = {
     "best_file_size_bytes",
     "thumbnail_size_bytes",
     "duration_seconds",
+    # pipeline freshness snapshot
+    "expected_data_interval_seconds",
+    "expected_run_interval_seconds",
+    "row_estimate",
+    "byte_size",
+    "table_count",
+    "tables_probed",
+    "tables_skipped",
+    "state_rows",
+    "state_error_rows",
+    "state_attention_rows",
+    "probe_ms",
 }
 
 FLOAT_COLUMNS = {
@@ -2296,6 +2342,180 @@ class PostgresWarehouse:
         self._ensure_ai_conversation_events_view()
         self._ensure_clean_agent_sessions_view()
         self._ensure_search_views_if_possible()
+
+    def ensure_pipeline_health_tables(self) -> None:
+        """Snapshot tables plus the marts_ops read interface over them.
+
+        See personal_data_warehouse/pipeline_health.py: the tables hold measured
+        facts, the views turn them into a live status.
+        """
+        self._ensure_table_group(["pipeline_health", "pipeline_table_freshness"])
+        self._ensure_pipeline_health_mart_views()
+
+    def _ensure_pipeline_health_mart_views(self) -> None:
+        """Publish pipeline freshness with a status computed at read time.
+
+        Status has to be derived here rather than stored by the collector: a row
+        that said 'ok' when it was written still says 'ok' three days after the
+        collector stopped running, which is precisely the failure this dashboard
+        exists to catch. So the snapshot stores facts (measured timestamps and
+        the declared SLA) and these views compare them against ``now()``,
+        including how old the snapshot itself is.
+        """
+        epoch = "'1970-01-01 00:00:00+00'::timestamptz"
+        # A pipeline's own SLA drives the thresholds, so a 5-minute poller and a
+        # monthly upload are judged on their own terms.
+        def freshness_status(at: str, expected: str, *, unmonitored: str) -> str:
+            return f"""
+            CASE
+                WHEN {expected} = 0 THEN
+                    CASE WHEN {at} IS NULL THEN '{unmonitored}' ELSE 'manual' END
+                WHEN {at} IS NULL THEN 'no_data'
+                WHEN now() - {at} > make_interval(
+                    secs => {expected} * {STALE_MULTIPLIER}) THEN 'stale'
+                WHEN now() - {at} > make_interval(
+                    secs => {expected} * {LATE_MULTIPLIER}) THEN 'late'
+                ELSE 'ok'
+            END
+            """
+
+        self._ensure_view(
+            "marts_pipeline_health",
+            f"""
+            CREATE OR REPLACE VIEW @marts_pipeline_health AS
+            WITH measured AS (
+                SELECT
+                    pipeline, label, kind, cadence, transport, note,
+                    expected_data_interval_seconds,
+                    expected_run_interval_seconds,
+                    NULLIF(last_write_at, {epoch}) AS last_write_at,
+                    NULLIF(newest_event_at, {epoch}) AS newest_event_at,
+                    NULLIF(last_run_at, {epoch}) AS last_run_at,
+                    row_estimate, byte_size,
+                    table_count, tables_probed, tables_skipped,
+                    state_table, state_rows, state_error_rows, state_attention_rows,
+                    NULLIF(last_error, '') AS last_error,
+                    NULLIF(last_error_at, {epoch}) AS last_error_at,
+                    NULLIF(collected_at, {epoch}) AS collected_at
+                FROM @pipeline_health
+            ),
+            classified AS (
+                SELECT
+                    measured.*,
+                    {freshness_status(
+                        "last_write_at", "expected_data_interval_seconds", unmonitored="no_data"
+                    )} AS data_status,
+                    {freshness_status(
+                        "last_run_at", "expected_run_interval_seconds", unmonitored="unmonitored"
+                    )} AS run_status
+                FROM measured
+            )
+            SELECT
+                pipeline,
+                label,
+                kind,
+                cadence,
+                transport,
+                CASE
+                    -- A snapshot this old is evidence about the collector, not
+                    -- about the pipelines it describes.
+                    WHEN collected_at IS NULL
+                      OR now() - collected_at > make_interval(
+                            secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
+                    WHEN state_error_rows > 0 THEN 'failing'
+                    WHEN state_attention_rows > 0 THEN 'attention'
+                    WHEN 'stale' IN (data_status, run_status) THEN 'stale'
+                    WHEN 'late' IN (data_status, run_status) THEN 'late'
+                    WHEN data_status = 'no_data'
+                     AND run_status IN ('no_data', 'unmonitored') THEN 'no_data'
+                    WHEN data_status = 'manual' THEN 'manual'
+                    ELSE 'ok'
+                END AS status,
+                data_status,
+                run_status,
+                last_write_at,
+                newest_event_at,
+                last_run_at,
+                (EXTRACT(EPOCH FROM now() - last_write_at))::bigint AS data_age_seconds,
+                (EXTRACT(EPOCH FROM now() - last_run_at))::bigint AS run_age_seconds,
+                expected_data_interval_seconds,
+                expected_run_interval_seconds,
+                row_estimate,
+                byte_size,
+                table_count,
+                tables_probed,
+                tables_skipped,
+                state_table,
+                state_rows,
+                state_error_rows,
+                state_attention_rows,
+                last_error,
+                last_error_at,
+                collected_at,
+                (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds,
+                note
+            FROM classified
+            """,
+        )
+        self._ensure_view(
+            "marts_pipeline_table_freshness",
+            f"""
+            CREATE OR REPLACE VIEW @marts_pipeline_table_freshness AS
+            SELECT
+                table_id,
+                pipeline,
+                role,
+                layer,
+                table_schema,
+                table_name,
+                written_at_column,
+                event_at_column,
+                NULLIF(last_write_at, {epoch}) AS last_write_at,
+                NULLIF(newest_event_at, {epoch}) AS newest_event_at,
+                (EXTRACT(EPOCH FROM now() - NULLIF(last_write_at, {epoch})))::bigint
+                    AS data_age_seconds,
+                row_estimate,
+                byte_size,
+                probe_status,
+                NULLIF(probe_detail, '') AS probe_detail,
+                probe_ms,
+                NULLIF(collected_at, {epoch}) AS collected_at,
+                note
+            FROM @pipeline_table_freshness
+            """,
+        )
+
+    def write_pipeline_health(
+        self,
+        pipelines: Sequence[Any],
+        tables: Sequence[Any],
+        *,
+        collected_at: datetime,
+    ) -> None:
+        """Replace the freshness snapshot with one collection's measurements.
+
+        Rows for pipelines or tables that no longer exist in the registry are
+        deleted, so a retired source disappears from the dashboard instead of
+        lingering as permanently stale.
+        """
+        self._insert_rows(
+            "pipeline_health",
+            [_pipeline_health_row(snapshot, collected_at=collected_at) for snapshot in pipelines],
+            PIPELINE_HEALTH_COLUMNS,
+        )
+        self._insert_rows(
+            "pipeline_table_freshness",
+            [_pipeline_health_row(snapshot, collected_at=collected_at) for snapshot in tables],
+            PIPELINE_TABLE_FRESHNESS_COLUMNS,
+        )
+        self._command(
+            "DELETE FROM @pipeline_health WHERE pipeline <> ALL(%s)",
+            ([snapshot.pipeline for snapshot in pipelines],),
+        )
+        self._command(
+            "DELETE FROM @pipeline_table_freshness WHERE table_id <> ALL(%s)",
+            ([snapshot.table_id for snapshot in tables],),
+        )
 
     def ensure_timeline_tables(self) -> None:
         """Tables for the unified timeline (personal_data_warehouse/timeline.py).
@@ -8595,6 +8815,20 @@ def _validate_identifier(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
         raise ValueError(f"invalid SQL identifier: {value!r}")
     return value
+
+
+def _pipeline_health_row(snapshot: Any, *, collected_at: datetime) -> dict[str, Any]:
+    """Flatten one freshness snapshot for insert.
+
+    Warehouse timestamp columns are NOT NULL with the epoch as "absent", so an
+    unmeasured probe becomes the epoch here and the marts_ops views turn it back
+    into NULL on the way out.
+    """
+    row = {**asdict(snapshot), "collected_at": collected_at}
+    return {
+        column: (PIPELINE_HEALTH_EPOCH if value is None and column in TIMESTAMP_COLUMNS else value)
+        for column, value in row.items()
+    }
 
 
 def _normalize_insert_value(value: Any, *, table: str | None = None, column: str | None = None) -> Any:

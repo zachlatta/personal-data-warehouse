@@ -1,0 +1,598 @@
+package server
+
+// pipelinesPagePath is the browser route for the freshness dashboard. The
+// timeline page links to it, so the constant is shared rather than spelled twice.
+const pipelinesPagePath = "/pipelines"
+
+// pipelinesPageHTML is the self-contained freshness dashboard: one row per
+// pipeline, worst first, with the per-table detail behind a click. It follows
+// the timeline shell's contract — static HTML, no external assets, the shared
+// secret asked for once and kept in localStorage, all data from the
+// bearer-protected /api/pipelines endpoint. NOTE: the file is a Go raw string
+// literal, so the embedded JS deliberately avoids backticks.
+const pipelinesPageHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdw — pipeline freshness</title>
+<style>
+:root {
+  --bg: #0e1116; --bg2: #12161d; --surface: #161b23; --surface2: #1b212b;
+  --line: #252c37; --line2: #2f3844;
+  --text: #d8dde5; --dim: #8b94a1; --faint: #5d6673;
+  --amber: #e8b45a; --amber-dim: #a97f35;
+  --ok: #62c98d; --late: #e8b45a; --stale: #e06c5f; --failing: #ff5f52;
+  --attention: #e8975a; --manual: #7fa8d0; --nodata: #5d6673; --unknown: #b78ae8;
+  --mono: "Berkeley Mono", "JetBrains Mono", "IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { height: 100%; }
+body {
+  min-height: 100%; background: var(--bg); color: var(--text);
+  font: 13px/1.45 var(--mono);
+  background-image: repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 3px);
+}
+::selection { background: rgba(232,180,90,.25); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 5px; border: 2px solid var(--bg); }
+a { color: var(--amber); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+#topbar {
+  position: sticky; top: 0; z-index: 30; height: 46px; display: flex; align-items: center; gap: 14px;
+  border-bottom: 1px solid var(--line); background: var(--bg2); padding: 0 14px;
+}
+#wordmark { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
+#wordmark .glyph { color: var(--amber); font-weight: 700; }
+#wordmark .name { letter-spacing: .18em; font-weight: 700; font-size: 12px; }
+#wordmark .sub { color: var(--faint); font-size: 11px; letter-spacing: .08em; }
+#spacer { flex: 1; }
+#snapshot { color: var(--dim); font-size: 11px; letter-spacing: .04em; white-space: nowrap; }
+#snapshot b { color: var(--amber); font-weight: 600; }
+button {
+  background: var(--surface); color: var(--dim); border: 1px solid var(--line2);
+  border-radius: 3px; padding: 4px 10px; font: 11px var(--mono); letter-spacing: .06em; cursor: pointer;
+}
+button:hover { color: var(--text); border-color: var(--amber-dim); }
+button.primary { color: #10131a; background: var(--amber); border-color: var(--amber); font-weight: 700; }
+button.on { color: var(--text); border-color: var(--amber); }
+input[type="password"] {
+  background: var(--surface); color: var(--text); border: 1px solid var(--line2);
+  border-radius: 3px; padding: 4px 7px; font: 12px var(--mono);
+}
+
+#page { max-width: 1180px; margin: 0 auto; padding: 16px 16px 90px; }
+
+/* ---- status tiles ---- */
+#tiles { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.tile {
+  flex: 1 1 116px; background: var(--surface); border: 1px solid var(--line);
+  border-left: 3px solid var(--line2); border-radius: 4px; padding: 9px 11px; cursor: pointer;
+}
+.tile:hover { background: var(--surface2); }
+.tile.on { border-color: var(--line2); background: var(--surface2); box-shadow: inset 0 0 0 1px var(--line2); }
+.tile .n { font-size: 21px; font-weight: 700; letter-spacing: .02em; }
+.tile .k { color: var(--faint); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; margin-top: 2px; }
+
+/* ---- pipeline groups ---- */
+.group { margin-bottom: 22px; }
+.group > h2 {
+  color: var(--faint); font-size: 10px; letter-spacing: .18em; text-transform: uppercase;
+  display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px;
+}
+.group > h2 .rule { flex: 1; border-top: 1px dashed var(--line2); transform: translateY(-3px); }
+.group > h2 .n { color: var(--faint); letter-spacing: .04em; }
+
+.pl {
+  border: 1px solid var(--line); border-left: 3px solid var(--line2); border-radius: 4px;
+  background: var(--surface); margin-bottom: 5px; cursor: pointer;
+}
+.pl:hover { background: var(--surface2); }
+.pl.open { background: var(--surface2); }
+.plhead {
+  display: grid; grid-template-columns: 10px 1fr 132px 132px 116px 92px 74px;
+  gap: 0 12px; align-items: baseline; padding: 8px 11px;
+}
+.pl .dot { width: 9px; height: 9px; border-radius: 50%; align-self: center; }
+.pl .nm { overflow: hidden; }
+.pl .nm .lb { font-size: 13px; font-weight: 600; }
+.pl .nm .id { color: var(--faint); font-size: 10.5px; margin-left: 7px; }
+.pl .nm .cad { color: var(--dim); font-size: 10.5px; margin-top: 1px; }
+.pl .col .l { color: var(--faint); font-size: 9px; letter-spacing: .13em; text-transform: uppercase; }
+.pl .col .v { font-size: 12px; white-space: nowrap; }
+.pl .col .v.dimv { color: var(--dim); }
+.pl .st { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; text-align: right; font-weight: 700; }
+.pl .num { text-align: right; }
+.bar { grid-column: 2 / -1; height: 3px; background: rgba(255,255,255,.05); border-radius: 2px; margin-top: 2px; overflow: hidden; }
+.bar i { display: block; height: 100%; }
+.plerr {
+  color: var(--failing); font-size: 11px; padding: 0 11px 8px 33px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.plnote { color: var(--faint); font-size: 10.5px; padding: 0 11px 8px 33px; }
+
+/* ---- expanded detail ---- */
+.detail { border-top: 1px solid var(--line); padding: 9px 11px 11px 33px; cursor: default; }
+.detail .meta { color: var(--dim); font-size: 11px; margin-bottom: 8px; }
+.detail .meta b { color: var(--faint); font-weight: 400; letter-spacing: .1em; text-transform: uppercase; font-size: 9px; }
+table.tbl { width: 100%; border-collapse: collapse; }
+table.tbl th {
+  color: var(--faint); font-size: 9px; letter-spacing: .13em; text-transform: uppercase;
+  text-align: left; font-weight: 400; padding: 3px 8px 3px 0; border-bottom: 1px solid var(--line);
+}
+table.tbl td { padding: 3px 8px 3px 0; font-size: 11.5px; border-bottom: 1px dotted var(--line); vertical-align: top; }
+table.tbl td.n { text-align: right; }
+table.tbl td.rel { color: var(--dim); }
+table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
+.rolechip {
+  font-size: 8.5px; letter-spacing: .1em; text-transform: uppercase; border: 1px solid var(--line2);
+  border-radius: 2px; padding: 0 4px; color: var(--faint);
+}
+.probe { font-size: 10px; color: var(--faint); }
+.probe.warn { color: var(--late); }
+.probe.bad { color: var(--stale); }
+
+#status { color: var(--faint); font-size: 11px; padding: 20px 2px; letter-spacing: .06em; }
+#legend { color: var(--faint); font-size: 10.5px; line-height: 1.7; border-top: 1px dashed var(--line2); padding-top: 12px; }
+#legend b { color: var(--dim); font-weight: 600; }
+
+/* ---- token overlay ---- */
+#gate {
+  position: fixed; inset: 0; z-index: 100; display: none; align-items: center; justify-content: center;
+  background: rgba(10,12,16,.92); backdrop-filter: blur(3px);
+}
+#gate.open { display: flex; }
+#gate .card {
+  width: 420px; background: var(--surface); border: 1px solid var(--line2); border-radius: 6px;
+  padding: 26px; box-shadow: 0 30px 80px rgba(0,0,0,.6);
+}
+#gate h2 { font-size: 13px; letter-spacing: .16em; margin-bottom: 6px; color: var(--amber); }
+#gate p { color: var(--dim); font-size: 11.5px; margin-bottom: 14px; }
+#gate form { display: flex; gap: 8px; }
+#gate input { flex: 1; }
+#gate .bad { color: var(--stale); font-size: 11px; margin-top: 10px; display: none; }
+
+@media (max-width: 900px) {
+  .plhead { grid-template-columns: 10px 1fr 110px 74px; }
+  .pl .col.hide, .pl .num.hide { display: none; }
+}
+</style>
+</head>
+<body>
+<div id="topbar">
+  <div id="wordmark"><span class="glyph">◍</span><span class="name">PDW/PIPELINES</span><span class="sub">what is still arriving</span></div>
+  <div id="spacer"></div>
+  <div id="snapshot">—</div>
+  <button id="attention">needs attention</button>
+  <button id="reload">reload</button>
+  <a href="/timeline"><button>▤ timeline</button></a>
+  <button id="lock" title="change access token">⌁ token</button>
+</div>
+
+<div id="page">
+  <div id="tiles"></div>
+  <div id="groups"></div>
+  <div id="status"></div>
+  <div id="legend"></div>
+</div>
+
+<div id="gate">
+  <div class="card">
+    <h2>◍ PDW/PIPELINES</h2>
+    <p>This dashboard reads the warehouse through the app's bearer-protected API. Paste the app secret token (PDW_SECRET_TOKEN); it stays in this browser's localStorage.</p>
+    <form id="gateform">
+      <input type="password" id="gatetoken" placeholder="secret token" autocomplete="off">
+      <button class="primary" type="submit">unlock</button>
+    </form>
+    <div class="bad" id="gatebad">rejected — check the token and try again.</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // Worst first: the point of the page is the exceptions, so this order drives
+  // both the tiles and the sort inside every group.
+  var SEVERITY = ["failing", "stale", "attention", "late", "unknown", "no_data", "manual", "ok"];
+  var COLORS = {
+    ok: "var(--ok)", late: "var(--late)", stale: "var(--stale)", failing: "var(--failing)",
+    attention: "var(--attention)", manual: "var(--manual)", no_data: "var(--nodata)",
+    unknown: "var(--unknown)"
+  };
+  var KINDS = [
+    ["source", "sources — data coming in from the outside world"],
+    ["enrichment", "enrichment — AI and extraction passes over what arrived"],
+    ["derived", "derived — models built from the sources"],
+    ["internal", "internal — the warehouse acting on itself"]
+  ];
+  var STATUS_HELP = {
+    ok: "delivering within its expected interval",
+    late: "quiet for longer than expected, not yet alarming",
+    stale: "quiet for much longer than expected — probably broken",
+    failing: "its own sync state records an error",
+    attention: "needs a manual step (a re-link, a re-login)",
+    manual: "no cadence expected (manual uploads)",
+    no_data: "nothing has ever arrived",
+    unknown: "the freshness snapshot itself is stale — check the pipeline_health asset"
+  };
+
+  var state = {
+    token: localStorage.getItem("pdw_timeline_token") || "",
+    pipelines: [], tables: [], skew: 0, filter: "", attentionOnly: false, open: {}
+  };
+
+  // Share the timeline page's token handoff (#token= / ?token=) so one link
+  // unlocks either page.
+  if (location.hash.indexOf("#token=") === 0) {
+    localStorage.setItem("pdw_timeline_token", decodeURIComponent(location.hash.slice(7)));
+    history.replaceState(null, "", location.pathname);
+  } else if (location.search.indexOf("token=") !== -1) {
+    var qtoken = new URLSearchParams(location.search).get("token");
+    if (qtoken) {
+      localStorage.setItem("pdw_timeline_token", qtoken);
+      history.replaceState(null, "", location.pathname);
+    }
+  }
+
+  function el(id) { return document.getElementById(id); }
+  function h(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function api(path) {
+    return fetch(path, { headers: { "Authorization": "Bearer pipelines-ui:" + state.token } })
+      .then(function (resp) {
+        if (resp.status === 401 || resp.status === 403) { openGate(true); throw new Error("unauthorized"); }
+        if (!resp.ok) return resp.json().then(function (body) { throw new Error(body.error || resp.statusText); });
+        return resp.json();
+      });
+  }
+
+  /* ---- token gate ---- */
+  function openGate(rejected) {
+    el("gate").classList.add("open");
+    el("gatebad").style.display = rejected && state.token ? "block" : "none";
+    el("gatetoken").focus();
+  }
+  el("gateform").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    state.token = el("gatetoken").value.trim();
+    localStorage.setItem("pdw_timeline_token", state.token);
+    el("gate").classList.remove("open");
+    boot();
+  });
+  el("lock").addEventListener("click", function () { openGate(false); });
+
+  /* ---- formatting ---- */
+  function ago(seconds) {
+    if (seconds === null || seconds === undefined) return "—";
+    var s = Math.max(0, Math.round(seconds));
+    if (s < 60) return s + "s";
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + "m";
+    var hrs = Math.floor(m / 60);
+    if (hrs < 48) return hrs + "h " + (m % 60) + "m";
+    var d = Math.floor(hrs / 24);
+    if (d < 60) return d + "d " + (hrs % 24) + "h";
+    return Math.floor(d / 30) + "mo " + (d % 30) + "d";
+  }
+  // Ages are recomputed against the server's clock (offset measured at load),
+  // so a skewed laptop clock cannot invent staleness.
+  function ageOf(ts) {
+    if (!ts) return null;
+    return (Date.now() + state.skew - new Date(ts).getTime()) / 1000;
+  }
+  function stamp(ts) { return ts ? new Date(ts).toLocaleString() : "never"; }
+  function rows(n) {
+    if (n === null || n === undefined) return "—";
+    if (n >= 1000000) return (n / 1000000).toFixed(n >= 10000000 ? 0 : 1) + "M";
+    if (n >= 1000) return Math.round(n / 1000) + "k";
+    return String(n);
+  }
+  function bytes(n) {
+    if (!n) return "—";
+    var units = ["B", "KiB", "MiB", "GiB", "TiB"], i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)) + " " + units[i];
+  }
+  function interval(seconds) {
+    if (!seconds) return "no expectation";
+    if (seconds < 3600) return "every " + Math.round(seconds / 60) + "m expected";
+    if (seconds < 172800) return "every " + Math.round(seconds / 3600) + "h expected";
+    return "every " + Math.round(seconds / 86400) + "d expected";
+  }
+
+  /* ---- render ---- */
+  function visible() {
+    return state.pipelines.filter(function (p) {
+      if (state.attentionOnly && ["ok", "manual"].indexOf(p.status) !== -1) return false;
+      if (state.filter && p.status !== state.filter) return false;
+      return true;
+    });
+  }
+
+  function renderTiles() {
+    var counts = {};
+    state.pipelines.forEach(function (p) { counts[p.status] = (counts[p.status] || 0) + 1; });
+    var node = el("tiles");
+    node.textContent = "";
+    SEVERITY.forEach(function (status) {
+      if (!counts[status]) return;
+      var tile = h("div", "tile" + (state.filter === status ? " on" : ""));
+      tile.style.borderLeftColor = COLORS[status];
+      var n = h("div", "n", String(counts[status]));
+      n.style.color = COLORS[status];
+      tile.appendChild(n);
+      tile.appendChild(h("div", "k", status.replace("_", " ")));
+      tile.title = STATUS_HELP[status] || "";
+      tile.addEventListener("click", function () {
+        state.filter = state.filter === status ? "" : status;
+        render();
+      });
+      node.appendChild(tile);
+    });
+  }
+
+  function column(label, value, dim, title) {
+    var col = h("div", "col" + (dim ? " hide" : ""));
+    col.appendChild(h("div", "l", label));
+    var v = h("div", "v" + (dim ? " dimv" : ""), value);
+    if (title) v.title = title;
+    col.appendChild(v);
+    return col;
+  }
+
+  function pipelineNode(p) {
+    var wrap = h("div", "pl" + (state.open[p.pipeline] ? " open" : ""));
+    wrap.style.borderLeftColor = COLORS[p.status] || "var(--line2)";
+
+    var head = h("div", "plhead");
+    var dot = h("div", "dot");
+    dot.style.background = COLORS[p.status] || "var(--nodata)";
+    head.appendChild(dot);
+
+    var nm = h("div", "nm");
+    var line = h("div");
+    line.appendChild(h("span", "lb", p.label));
+    line.appendChild(h("span", "id", p.pipeline));
+    nm.appendChild(line);
+    nm.appendChild(h("div", "cad", p.cadence + " · " + interval(p.expected_data_interval_seconds)));
+    head.appendChild(nm);
+
+    var dataAge = ageOf(p.last_write_at);
+    head.appendChild(column("last data", p.last_write_at ? ago(dataAge) + " ago" : "never",
+      false, stamp(p.last_write_at)));
+    head.appendChild(column("newest event", p.newest_event_at ? stamp(p.newest_event_at).split(",")[0] : "—",
+      true, p.newest_event_at ? stamp(p.newest_event_at) : ""));
+    var runAge = ageOf(p.last_run_at);
+    head.appendChild(column("last run", p.last_run_at ? ago(runAge) + " ago" : "no heartbeat",
+      true, p.last_run_at ? stamp(p.last_run_at) : "this pipeline keeps no run state in the warehouse"));
+
+    var num = h("div", "col num hide");
+    num.appendChild(h("div", "l", "rows"));
+    num.appendChild(h("div", "v", rows(p.row_estimate)));
+    head.appendChild(num);
+
+    var st = h("div", "st", p.status.replace("_", " "));
+    st.style.color = COLORS[p.status];
+    st.title = STATUS_HELP[p.status] || "";
+    head.appendChild(st);
+    wrap.appendChild(head);
+
+    // Freshness bar: how far through its own tolerance this pipeline has run.
+    var expected = p.expected_data_interval_seconds;
+    if (expected && dataAge !== null) {
+      var bar = h("div", "bar");
+      var fill = h("i");
+      fill.style.width = Math.min(100, Math.max(2, (dataAge / (expected * 6)) * 100)) + "%";
+      fill.style.background = COLORS[p.status];
+      bar.appendChild(fill);
+      var barWrap = h("div", "plhead");
+      barWrap.style.padding = "0 11px 7px";
+      barWrap.appendChild(h("div"));
+      barWrap.appendChild(bar);
+      wrap.appendChild(barWrap);
+    }
+
+    // A recorded error and a failing count are not the same thing: Plaid stamps
+    // ITEM_LOGIN_REQUIRED on a scope whose status is action_required, which is a
+    // manual step rather than a failure, and an error can outlive the status
+    // that produced it.
+    var alert = "";
+    if (p.state_error_rows) {
+      alert = "⚠ " + p.state_error_rows + " failing in " + p.state_table;
+    } else if (p.state_attention_rows) {
+      alert = "⚠ " + p.state_attention_rows + " scope(s) in " + p.state_table + " need a manual step";
+    } else if (p.last_error) {
+      alert = "⚠ last error recorded in " + p.state_table;
+    }
+    if (alert) {
+      var err = h("div", "plerr", alert + (p.last_error ? ": " + p.last_error : ""));
+      if (p.last_error) err.title = p.last_error;
+      wrap.appendChild(err);
+    }
+
+    if (state.open[p.pipeline]) wrap.appendChild(detailNode(p));
+
+    head.addEventListener("click", function () {
+      state.open[p.pipeline] = !state.open[p.pipeline];
+      render();
+    });
+    return wrap;
+  }
+
+  function detailNode(p) {
+    var box = h("div", "detail");
+    box.addEventListener("click", function (ev) { ev.stopPropagation(); });
+
+    var meta = h("div", "meta");
+    meta.appendChild(h("b", "", "transport "));
+    meta.appendChild(document.createTextNode(p.transport));
+    if (p.note) {
+      meta.appendChild(h("br"));
+      meta.appendChild(h("b", "", "note "));
+      meta.appendChild(document.createTextNode(p.note));
+    }
+    if (p.state_table) {
+      meta.appendChild(h("br"));
+      meta.appendChild(h("b", "", "run state "));
+      meta.appendChild(document.createTextNode(
+        p.state_table + " · " + p.state_rows + " scope(s) · " +
+        (p.expected_run_interval_seconds ? interval(p.expected_run_interval_seconds) : "no cadence expected")
+      ));
+    }
+    box.appendChild(meta);
+
+    var table = h("table", "tbl");
+    var head = h("tr");
+    ["table", "", "last write", "newest event", "rows", "size", "probe"].forEach(function (label) {
+      head.appendChild(h("th", "", label));
+    });
+    table.appendChild(head);
+    state.tables.filter(function (t) { return t.pipeline === p.pipeline; }).forEach(function (t) {
+      var tr = h("tr", t.role);
+      var name = h("td", "", t.table_schema + "." + t.table_name);
+      name.title = t.table_id + (t.note ? " — " + t.note : "");
+      tr.appendChild(name);
+      var role = h("td");
+      role.appendChild(h("span", "rolechip", t.role));
+      tr.appendChild(role);
+      var write = h("td", "rel", t.last_write_at ? ago(ageOf(t.last_write_at)) + " ago" : "—");
+      write.title = (t.written_at_column || "no column") + " · " + stamp(t.last_write_at);
+      tr.appendChild(write);
+      var event = h("td", "rel", t.newest_event_at ? stamp(t.newest_event_at).split(",")[0] : "—");
+      event.title = (t.event_at_column || "no column") + " · " + stamp(t.newest_event_at);
+      tr.appendChild(event);
+      tr.appendChild(h("td", "n", rows(t.row_estimate)));
+      tr.appendChild(h("td", "n", bytes(t.byte_size)));
+      var probeClass = "probe";
+      if (t.probe_status === "skipped_unindexed") probeClass += " warn";
+      if (["timeout", "error", "missing"].indexOf(t.probe_status) !== -1) probeClass += " bad";
+      var probe = h("td");
+      var chip = h("span", probeClass, t.probe_status.replace(/_/g, " "));
+      if (t.probe_detail) chip.title = t.probe_detail;
+      probe.appendChild(chip);
+      tr.appendChild(probe);
+      table.appendChild(tr);
+    });
+    box.appendChild(table);
+    return box;
+  }
+
+  function renderGroups() {
+    var node = el("groups");
+    node.textContent = "";
+    var shown = visible();
+    KINDS.forEach(function (entry) {
+      var kind = entry[0];
+      var members = shown.filter(function (p) { return p.kind === kind; });
+      if (!members.length) return;
+      members.sort(function (a, b) {
+        var d = SEVERITY.indexOf(a.status) - SEVERITY.indexOf(b.status);
+        if (d !== 0) return d;
+        return (ageOf(b.last_write_at) || 0) - (ageOf(a.last_write_at) || 0);
+      });
+      var group = h("div", "group");
+      var head = h("h2");
+      head.appendChild(h("span", "", entry[1]));
+      head.appendChild(h("span", "rule"));
+      head.appendChild(h("span", "n", members.length + ""));
+      group.appendChild(head);
+      members.forEach(function (p) { group.appendChild(pipelineNode(p)); });
+      node.appendChild(group);
+    });
+    if (!shown.length) {
+      node.appendChild(h("div", "", state.pipelines.length
+        ? "nothing matches that filter."
+        : "no snapshot yet — the pipeline_health asset has not run."));
+    }
+  }
+
+  function renderSnapshot() {
+    var newest = null;
+    state.pipelines.forEach(function (p) {
+      if (p.collected_at && (!newest || p.collected_at > newest)) newest = p.collected_at;
+    });
+    var node = el("snapshot");
+    node.textContent = "";
+    if (!newest) {
+      node.textContent = "no snapshot";
+      return;
+    }
+    var age = ageOf(newest);
+    node.appendChild(document.createTextNode("measured "));
+    var b = h("b", "", ago(age) + " ago");
+    if (age > 3600) b.style.color = "var(--unknown)";
+    node.appendChild(b);
+    node.appendChild(document.createTextNode(" · " + state.pipelines.length + " pipelines · " +
+      state.tables.length + " tables"));
+    node.title = stamp(newest);
+  }
+
+  function renderLegend() {
+    var node = el("legend");
+    node.textContent = "";
+    node.appendChild(h("b", "", "last data"));
+    node.appendChild(document.createTextNode(
+      " is the newest payload row the pipeline wrote — dimension and cursor tables are excluded so a daily" +
+      " directory refresh cannot make a frozen source look healthy. "));
+    node.appendChild(h("b", "", "last run"));
+    node.appendChild(document.createTextNode(
+      " is its heartbeat, read from its sync-state table; uploaders that push from a laptop keep no state here," +
+      " so they show no heartbeat and only data freshness applies. Status is computed at read time against each" +
+      " pipeline's own expected interval (late past 2x, stale past 6x), so it stays honest even if the collector stops. "));
+    node.appendChild(h("b", "", "probe"));
+    node.appendChild(document.createTextNode(
+      " says how a table's timestamp was measured; skipped means an unindexed max() over a large heap would have" +
+      " cost more than the answer is worth. Queryable as marts_ops.pipeline_health and marts_ops.table_freshness."));
+  }
+
+  function render() {
+    renderTiles();
+    renderGroups();
+    renderSnapshot();
+    renderLegend();
+  }
+
+  el("attention").addEventListener("click", function () {
+    state.attentionOnly = !state.attentionOnly;
+    el("attention").classList.toggle("on", state.attentionOnly);
+    state.filter = "";
+    render();
+  });
+  el("reload").addEventListener("click", function () { load(); });
+
+  function load() {
+    el("status").textContent = "reading the freshness snapshot…";
+    return api("/api/pipelines").then(function (body) {
+      state.pipelines = body.pipelines || [];
+      state.tables = body.tables || [];
+      state.skew = body.server_now ? new Date(body.server_now).getTime() - Date.now() : 0;
+      el("status").textContent = "";
+      render();
+    }).catch(function (err) {
+      if (err.message !== "unauthorized") el("status").textContent = "error: " + err.message;
+    });
+  }
+
+  function boot() {
+    if (!state.token) { openGate(false); return; }
+    load();
+    // The snapshot refreshes every ten minutes; re-poll on the same order of
+    // magnitude and let the rendered ages tick over in between.
+    if (!boot.timer) {
+      boot.timer = setInterval(function () { load(); }, 120000);
+      setInterval(function () { if (state.pipelines.length) render(); }, 30000);
+    }
+  }
+  boot();
+})();
+</script>
+</body>
+</html>
+`

@@ -1414,6 +1414,44 @@ Attachments that cannot be extracted still get metadata rows with `text_extracti
 WhatsApp image/PDF media (the `whatsapp_media_enrichment` asset), keyed by `content_sha256`
 under each source's own `task_type`/`prompt_version`. See `file_attachment_enrichment.py`.
 
+## Pipeline Freshness and Health
+
+Every table in the warehouse belongs to a declared pipeline, and the warehouse measures its own
+freshness: what is still arriving, what stopped, and when each source last delivered a row.
+
+- **Registry** (`src/personal_data_warehouse/pipeline_health.py`): `PIPELINES` declares each
+  pipeline's cadence, transport, expected data/run intervals, and sync-state table;
+  `TABLE_PIPELINES` maps every table to its pipeline with a role (`data` payload, `support`
+  dimension, `state` cursor) and the columns that mean "the pipeline wrote this row" and "this
+  is when the row's content happened". `tests/test_pipeline_health.py` fails if a warehouse
+  table is missing, so new sources cannot ship unmonitored.
+- **Collector**: the `pipeline_health` Dagster asset runs every 10 minutes, probes
+  `max(<column>)` per table, and writes `ops.pipeline_health` (one row per pipeline) and
+  `ops.pipeline_table_freshness` (one row per table). Probes are cost-bounded: a column an
+  index leads with, or a table small enough to scan, otherwise the row records
+  `probe_status = 'skipped_unindexed'` with the reason. Nothing else in the warehouse is
+  mutated.
+- **Read interface**: `marts_ops.pipeline_health` and `marts_ops.table_freshness` add the
+  derived status — `ok`, `late` (past 2x its expected interval), `stale` (past 6x), `failing`
+  (its sync state records an error), `attention` (needs a manual step, e.g. a Plaid re-link),
+  `manual` (no cadence expected), `no_data`, or `unknown` (the snapshot itself is stale).
+  Status is computed at read time, so it stays honest if the collector stops.
+- **Dashboard**: the app serves `/pipelines`, linked from the `/timeline` topbar. Status tiles
+  summarize the fleet, pipelines are grouped by kind with the worst first, and each row expands
+  to per-table freshness, row counts, sizes, and probe status.
+
+```sql
+-- what is not healthy right now
+SELECT pipeline, status, last_write_at, last_run_at, last_error
+FROM marts_ops.pipeline_health
+WHERE status NOT IN ('ok', 'manual')
+ORDER BY status, last_write_at;
+
+-- when was Gmail last updated?
+SELECT last_write_at, newest_event_at, data_age_seconds, row_estimate
+FROM marts_ops.pipeline_health WHERE pipeline = 'gmail';
+```
+
 ## Verification
 
 Run tests:

@@ -284,6 +284,14 @@
       "comment": "Stable messages read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."
     },
     {
+      "name": "marts_ops",
+      "layer": "marts",
+      "domain": "ops",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Stable warehouse-operations read interface: which pipeline feeds each table, when it last delivered data, and whether it is healthy. Start with marts_ops.pipeline_health."
+    },
+    {
       "name": "marts_photos",
       "layer": "marts",
       "domain": "photos",
@@ -1669,6 +1677,28 @@
       }
     },
     {
+      "id": "marts_pipeline_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "pipeline_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "marts_pipeline_table_freshness",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "table_freshness",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "marts_transaction_receipts",
       "kind": "view",
       "layer": "marts",
@@ -1952,6 +1982,28 @@
         "schema": "search",
         "name": "schema_state"
       }
+    },
+    {
+      "id": "pipeline_health",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "pipeline_health",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
+      "id": "pipeline_table_freshness",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "pipeline_table_freshness",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
     },
     {
       "id": "timeline_sync_state",

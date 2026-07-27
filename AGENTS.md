@@ -61,6 +61,48 @@ keep their filenode, rebuilds the marts/search layer from code, and validates th
 is deliberately not part of any `ensure_*` path: fresh provisioning only ever creates the
 target layout.
 
+## Pipeline Freshness and Health
+
+Every warehouse table also has to declare **which pipeline feeds it and how freshness is
+measured**, in `src/personal_data_warehouse/pipeline_health.py`:
+
+- `PIPELINES` — one entry per pipeline (source poller, uploader, enrichment pass, derived
+  builder) with its cadence, transport, expected data/run intervals, and the sync-state table
+  that carries its heartbeat and errors.
+- `TABLE_PIPELINES` — one entry per table: its pipeline, its `role`
+  (`data` payload / `support` dimension / `state` cursor), the column the pipeline stamps on
+  write, and the column holding the row's real-world event time.
+
+`tests/test_pipeline_health.py` enforces this against `POSTGRES_TABLES`, the raw-DDL tables,
+and the live schema — the same contract `TIMELINE_TABLE_COVERAGE` has, and the tests also
+assert the two registries cover exactly the same tables. **Adding a warehouse table means
+adding it to both.**
+
+Data freshness is measured only from `data` tables, deliberately: Slack refreshing its user
+directory daily must not make Slack look healthy while message ingestion is frozen. Run
+freshness comes from the `state` tables (an uploader pushing from a Mac has no in-warehouse
+heartbeat, so it only has data freshness — which is why a quiet uploader is worth alarming on).
+
+- Collector: the `pipeline_health` Dagster asset (`*/10 * * * *`) probes `max(<column>)` per
+  table and writes `ops.pipeline_health` + `ops.pipeline_table_freshness`. It only probes a
+  column an index leads with or a table under `PROBE_MAX_UNINDEXED_BYTES`, and records
+  `probe_status = 'skipped_unindexed'` otherwise — `timeline.events` (43M rows, 50 GB) is
+  monitored through `ops.timeline_sync_state` instead of a full-heap `max(updated_at)`.
+- Read surfaces: `marts_ops.pipeline_health` and `marts_ops.table_freshness` compute
+  `status` at **read** time (`ok`/`late`/`stale`/`failing`/`attention`/`manual`/`no_data`/
+  `unknown`) against each pipeline's own expected interval, so a snapshot older than
+  `COLLECTOR_STALE_SECONDS` reports `unknown` rather than presenting stale facts as current.
+  Store facts, derive status — the same rule the finance ledger follows.
+- UI: the app serves `/pipelines` (linked from the `/timeline` topbar) over
+  `GET /api/pipelines`; worst status first, per-table detail behind a click.
+
+Quick check without the UI:
+
+```bash
+pdw sql -q "which pipelines are unhealthy" "SELECT pipeline, status, last_write_at, last_error
+  FROM marts_ops.pipeline_health WHERE status NOT IN ('ok','manual') ORDER BY status"
+```
+
 ## Commit and Push Safety
 
 Before committing or pushing, review the complete staged diff line by line for secrets,

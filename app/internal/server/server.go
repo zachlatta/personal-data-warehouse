@@ -195,7 +195,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		body := "Personal Data Warehouse app\nMCP endpoint: /mcp\nHTTP API: /api/tools\nGit SHA: " + buildinfo.GitSHA() + "\n"
+		body := "Personal Data Warehouse app\nMCP endpoint: /mcp\nHTTP API: /api/tools\nTimeline UI: /timeline\nPipeline freshness: " + pipelinesPagePath + "\nGit SHA: " + buildinfo.GitSHA() + "\n"
 		if mutationSvc != nil {
 			body += "Mutation review UI: " + mutations.ReviewPath + "\n"
 		}
@@ -328,6 +328,12 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		logger.Info("timeline endpoints enabled",
 			"dedicated_database", cfg.TimelineDatabaseURL != "",
 			"media_base_url", mediaBase)
+
+		// Pipeline freshness reads the marts_ops views in the warehouse itself
+		// (not the timeline copy), so it follows the source runner.
+		pipelineSvc := newPipelineService(sourceRunner, logger)
+		pipelineSvc.registerRoutes(mux, authSvc.RequireStaticBearer())
+		logger.Info("pipeline freshness endpoints enabled", "page", pipelinesPagePath)
 	}
 
 	return logRequests(logger, mux)

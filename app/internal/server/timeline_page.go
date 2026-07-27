@@ -45,6 +45,7 @@ body {
 #wordmark .glyph { color: var(--amber); font-weight: 700; }
 #wordmark .name { letter-spacing: .18em; font-weight: 700; font-size: 12px; }
 #wordmark .sub { color: var(--faint); font-size: 11px; letter-spacing: .08em; }
+#topbar a { text-decoration: none; color: inherit; }
 #stats { color: var(--dim); font-size: 11px; letter-spacing: .05em; white-space: nowrap; }
 #stats b { color: var(--amber); font-weight: 600; }
 #spacer { flex: 1; }
@@ -219,6 +220,7 @@ a.filelink:hover { text-decoration: underline; }
     <div id="spacer"></div>
     <div class="ctl"><label>jump</label><input type="date" id="jump"></div>
     <button id="latest">latest</button>
+    <a href="/pipelines"><button id="pipelines" title="pipeline freshness and health">◍ pipelines</button></a>
     <button id="lock" title="change access token">⌁ token</button>
   </div>
   <div id="rail">

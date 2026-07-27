@@ -2056,6 +2056,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "upstream_mutation_request_events": _detail("upstream_mutation_requests"),
     # Search surfaces
     "search_schema_state": _state("search_text DDL signature cache"),
+    # Pipeline freshness (personal_data_warehouse/pipeline_health.py): a
+    # measurement of the warehouse's own pipelines, not activity in it.
+    "pipeline_health": _state("per-pipeline freshness and health snapshot"),
+    "pipeline_table_freshness": _state("per-table freshness snapshot"),
     # The timeline itself
     "timeline_events": _state("the unified timeline"),
     "timeline_sync_state": _state("per-adapter sync cursors"),

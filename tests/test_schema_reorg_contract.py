@@ -90,6 +90,7 @@ def _provision_everything(wh: PostgresWarehouse) -> None:
     wh.ensure_whatsapp_client_session_table()
     wh.ensure_timeline_tables()
     wh.ensure_upstream_mutation_tables()
+    wh.ensure_pipeline_health_tables()
 
 
 # ---------------------------------------------------------------------------
@@ -136,9 +137,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
     assert by_layer == {
         "base": 52,
         "derived": 17,
-        "marts": 21,
+        "marts": 23,
         "timeline": 7,
-        "ops": 20,
+        "ops": 22,
         "private": 5,
         "internal": 1,
     }
@@ -194,6 +195,10 @@ def test_catalog_records_the_target_physical_locations() -> None:
         "marts_finance_net_worth": ("marts_finance", "net_worth"),
         "marts_finance_net_worth_history": ("marts_finance", "net_worth_history"),
         "marts_transaction_receipts": ("marts_receipts", "transaction_receipts"),
+        # The warehouse's own operational read interface: freshness and health
+        # per pipeline, with the ops snapshot behind it.
+        "marts_pipeline_health": ("marts_ops", "pipeline_health"),
+        "marts_pipeline_table_freshness": ("marts_ops", "table_freshness"),
         # timeline: the entry point plus the search interface
         "timeline_events": ("timeline", "events"),
         "timeline_events_seq": ("timeline", "events_seq"),
@@ -204,6 +209,8 @@ def test_catalog_records_the_target_physical_locations() -> None:
         "search_text_sources": ("timeline", "search_text_sources"),
         # ops: source-prefixed so one flat schema cannot collide
         "gmail_sync_state": ("ops", "gmail_sync_state"),
+        "pipeline_health": ("ops", "pipeline_health"),
+        "pipeline_table_freshness": ("ops", "pipeline_table_freshness"),
         "calendar_sync_state": ("ops", "google_calendar_sync_state"),
         "contact_sync_state": ("ops", "google_contacts_sync_state"),
         "slack_sync_state": ("ops", "slack_sync_state"),
@@ -248,6 +255,10 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
     app_read = {obj.id for obj in CATALOG.objects if obj.query_access == "app_only"}
     assert app_read == {
         "timeline_sync_state",
+        # Read through the marts_ops views by the /pipelines dashboard; granted
+        # directly too so "when did gmail last update?" is answerable in SQL.
+        "pipeline_health",
+        "pipeline_table_freshness",
         "upstream_mutations",
         "upstream_mutation_requests",
         "upstream_mutation_events",

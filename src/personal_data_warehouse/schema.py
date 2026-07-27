@@ -1537,6 +1537,60 @@ TIMELINE_SYNC_STATE_COLUMNS = (
     "updated_at",
 )
 
+# Pipeline freshness snapshot (see personal_data_warehouse/pipeline_health.py).
+# Facts only: measured timestamps plus the registry metadata that gives them
+# meaning. Status is derived live in the marts_ops views, because "ok" computed
+# at collection time would still read "ok" days after the collector died.
+PIPELINE_HEALTH_COLUMNS = (
+    "pipeline",
+    "label",
+    "kind",
+    "cadence",
+    "transport",
+    "note",
+    "expected_data_interval_seconds",
+    "expected_run_interval_seconds",
+    # Newest payload write, newest real-world event, and newest run heartbeat.
+    "last_write_at",
+    "newest_event_at",
+    "last_run_at",
+    "row_estimate",
+    "byte_size",
+    "table_count",
+    "tables_probed",
+    "tables_skipped",
+    # Rolled up from the pipeline's declared sync-state table, when it has one.
+    "state_table",
+    "state_rows",
+    "state_error_rows",
+    "state_attention_rows",
+    "last_error",
+    "last_error_at",
+    "collected_at",
+)
+
+PIPELINE_TABLE_FRESHNESS_COLUMNS = (
+    "table_id",
+    "pipeline",
+    "role",
+    "layer",
+    "table_schema",
+    "table_name",
+    "written_at_column",
+    "event_at_column",
+    "last_write_at",
+    "newest_event_at",
+    "row_estimate",
+    "byte_size",
+    # Why a timestamp is missing is as important as the timestamp: an unprobed
+    # 50 GB heap and a genuinely empty table look identical otherwise.
+    "probe_status",
+    "probe_detail",
+    "probe_ms",
+    "note",
+    "collected_at",
+)
+
 GOOGLE_DRIVE_SYNC_STATE_COLUMNS = (
     "account",
     "start_page_token",
