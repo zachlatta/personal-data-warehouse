@@ -148,7 +148,7 @@ class FakeWarehouse:
             payloads = [
                 payload
                 for payload in payloads
-                if self.states.get((account, team_id, "conversation", str(payload["id"])), {}).get("status") != "error"
+                if self.states.get((account, team_id, "conversation", str(payload["id"])), {}).get("status") != "gone"
             ]
         if limit is not None:
             payloads = payloads[:limit]
@@ -184,7 +184,7 @@ class FakeWarehouse:
                 ref
                 for ref in refs
                 if self.states.get((account, team_id, "thread", f"{ref['conversation_id']}:{ref['thread_ts']}"), {}).get("status")
-                != "error"
+                != "gone"
             ]
         if skip_completed:
             refs = [
@@ -611,8 +611,46 @@ def test_runner_members_only_records_errors_without_replacing_members(monkeypatc
     assert warehouse.members == []
     assert warehouse.state_updates[-1]["object_type"] == "conversation_members"
     assert warehouse.state_updates[-1]["object_id"] == "G1"
+    # Constructed without a Slack error code, so we cannot tell it is
+    # permanently gone; it stays a retryable error.
     assert warehouse.state_updates[-1]["status"] == "error"
     assert "not_in_channel" in warehouse.state_updates[-1]["error"]
+
+
+def test_runner_members_only_marks_gone_channel_terminal(monkeypatch):
+    # A coded gone failure from conversations.members is terminal: record the
+    # 'gone' status so the members stage stops re-offering the channel and the
+    # dashboard does not count it as failing forever.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+            "conversations.members": [
+                SlackApiCallError("conversations.members failed: channel_not_found", code="channel_not_found")
+            ],
+        }
+    )
+    warehouse = FakeWarehouse()
+    warehouse.member_candidate_payloads = [{"id": "G1", "name": "private", "is_private": True, "is_member": True}]
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_members_only=True,
+        use_existing_conversations=True,
+        conversation_types=("private_channel",),
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.state_updates[-1]["object_type"] == "conversation_members"
+    assert warehouse.state_updates[-1]["object_id"] == "G1"
+    assert warehouse.state_updates[-1]["status"] == "gone"
+    assert "channel_not_found" in warehouse.state_updates[-1]["error"]
 
 
 def test_runner_can_refresh_conversations_without_fetching_messages(monkeypatch):
@@ -1040,11 +1078,13 @@ def test_runner_can_load_only_not_full_cached_conversations(monkeypatch):
 
 
 def test_runner_can_skip_known_conversation_errors(monkeypatch):
+    # skip_known_errors excludes conversations recorded as terminally 'gone';
+    # transiently-errored conversations stay in the candidate set for retry.
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
     settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
     warehouse = FakeWarehouse(
-        states={("zrl", "T1", "conversation", "C_ERROR"): {"status": "error", "last_sync_type": "full"}}
+        states={("zrl", "T1", "conversation", "C_ERROR"): {"status": "gone", "last_sync_type": "full"}}
     )
     warehouse.conversation_payloads = [
         {"id": "C_ERROR", "name": "error", "is_channel": True},
@@ -1154,8 +1194,11 @@ def test_runner_full_sync_marks_gone_channel_inactive(monkeypatch):
         sleep=lambda seconds: None,
     ).sync_all()
 
+    # Gone-for-good channels record the terminal 'gone' status, not 'error':
+    # nothing will ever retry them, so an error row would sit in the failing
+    # count on the pipeline health dashboard forever.
     assert any(
-        update["object_id"] == "C_GONE" and update["status"] == "error"
+        update["object_id"] == "C_GONE" and update["status"] == "gone"
         for update in warehouse.state_updates
     )
     assert warehouse.inactivated_conversations == [
@@ -1255,7 +1298,7 @@ def test_runner_freshness_priority_skips_and_deactivates_gone_channel(monkeypatc
         {"account": "zrl", "team_id": "T1", "conversation_id": "C_GONE"}
     ]
     assert any(
-        update["object_id"] == "C_GONE" and update["status"] == "error"
+        update["object_id"] == "C_GONE" and update["status"] == "gone"
         for update in warehouse.state_updates
     )
 
@@ -1794,6 +1837,8 @@ def test_runner_reprocesses_completed_thread_when_latest_reply_advances(monkeypa
 
 
 def test_runner_thread_replies_only_can_skip_known_errors(monkeypatch):
+    # skip_known_errors skips threads recorded as terminally 'gone'; plain
+    # 'error' rows are transient and stay retryable (see the retry test below).
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
     settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
@@ -1804,7 +1849,7 @@ def test_runner_thread_replies_only_can_skip_known_errors(monkeypatch):
     ]
     warehouse.states = {
         ("zrl", "T1", "thread", "C_ERROR:1713974400.000100"): {
-            "status": "error",
+            "status": "gone",
             "last_sync_type": "thread_replies",
             "cursor_ts": "1713974400.000100",
         }
@@ -1838,6 +1883,58 @@ def test_runner_thread_replies_only_can_skip_known_errors(monkeypatch):
 
     assert warehouse.thread_ref_calls[0]["skip_known_errors"] is True
     assert [params["channel"] for method, params in client.calls if method == "conversations.replies"] == ["C_OK"]
+
+
+def test_runner_thread_replies_only_retries_previously_errored_thread(monkeypatch):
+    # A thread whose last attempt recorded a transient 'error' must be offered
+    # again under skip_known_errors, so it can self-heal to 'ok' instead of
+    # sitting in the dashboard's failing count forever.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.thread_refs = [
+        {"conversation_id": "C_RETRY", "thread_ts": "1713974400.000100", "reply_count": 1, "latest_reply_ts": "1713974500.000100"},
+    ]
+    warehouse.states = {
+        ("zrl", "T1", "thread", "C_RETRY:1713974400.000100"): {
+            "status": "error",
+            "last_sync_type": "thread_replies",
+            "cursor_ts": "1713974400.000100",
+        }
+    }
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.replies": [
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1713974400.000100", "user": "U1", "text": "root", "reply_count": 1},
+                        {"ts": "1713974500.000100", "thread_ts": "1713974400.000100", "user": "U2", "text": "reply"},
+                    ],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_thread_replies_only=True,
+        skip_known_errors=True,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert [params["channel"] for method, params in client.calls if method == "conversations.replies"] == ["C_RETRY"]
+    assert any(
+        update["object_type"] == "thread" and update["status"] == "ok" and update["object_id"] == "C_RETRY:1713974400.000100"
+        for update in warehouse.state_updates
+    )
 
 
 def test_runner_thread_replies_marks_gone_channel_inactive(monkeypatch):
@@ -1884,12 +1981,98 @@ def test_runner_thread_replies_marks_gone_channel_inactive(monkeypatch):
     assert warehouse.inactivated_conversations == [
         {"account": "zrl", "team_id": "T1", "conversation_id": "C_GONE"}
     ]
+    # Terminal status, not 'error': the thread will never be retried, so an
+    # error row would count as an active failure on the dashboard forever.
     assert any(
-        update["object_type"] == "thread" and update["status"] == "error" and update["object_id"] == "C_GONE:1713974400.000100"
+        update["object_type"] == "thread" and update["status"] == "gone" and update["object_id"] == "C_GONE:1713974400.000100"
         for update in warehouse.state_updates
     )
     # The run keeps going and still syncs the healthy thread.
     assert [params["channel"] for method, params in client.calls if method == "conversations.replies"] == ["C_GONE", "C_OK"]
+
+
+def test_runner_thread_replies_marks_deleted_thread_gone_without_deactivating_channel(monkeypatch):
+    # thread_not_found means the parent message was deleted: terminal for that
+    # one thread, but the channel itself is fine and must stay active.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.thread_refs = [
+        {"conversation_id": "C1", "thread_ts": "1713974400.000100", "reply_count": 1, "latest_reply_ts": "1713974500.000100"},
+        {"conversation_id": "C1", "thread_ts": "1713974600.000100", "reply_count": 1, "latest_reply_ts": "1713974700.000100"},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.replies": [
+                SlackApiCallError("conversations.replies failed: thread_not_found", code="thread_not_found"),
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1713974600.000100", "user": "U1", "text": "root", "reply_count": 1},
+                        {"ts": "1713974700.000100", "thread_ts": "1713974600.000100", "user": "U2", "text": "reply"},
+                    ],
+                    "response_metadata": {},
+                },
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_thread_replies_only=True,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.inactivated_conversations == []
+    assert any(
+        update["object_type"] == "thread" and update["status"] == "gone" and update["object_id"] == "C1:1713974400.000100"
+        for update in warehouse.state_updates
+    )
+    # The channel's other threads still sync.
+    assert [params["channel"] for method, params in client.calls if method == "conversations.replies"] == ["C1", "C1"]
+
+
+def test_runner_thread_replies_keeps_transient_error_retryable(monkeypatch):
+    # A transient failure (5xx HTML page, internal_error, ...) records status
+    # 'error' — NOT the terminal 'gone' — so later passes retry it and either
+    # heal it to 'ok' or keep an honest, recent failing signal on the dashboard.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.thread_refs = [
+        {"conversation_id": "C1", "thread_ts": "1713974400.000100", "reply_count": 1, "latest_reply_ts": "1713974500.000100"},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.replies": [
+                SlackApiCallError("conversations.replies failed: internal_error", code="internal_error"),
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_thread_replies_only=True,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.inactivated_conversations == []
+    assert any(
+        update["object_type"] == "thread" and update["status"] == "error" and update["object_id"] == "C1:1713974400.000100"
+        for update in warehouse.state_updates
+    )
 
 
 def test_runner_thread_replies_only_can_select_missing_replies(monkeypatch):

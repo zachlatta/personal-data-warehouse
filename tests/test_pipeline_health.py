@@ -469,6 +469,38 @@ def test_status_ladder_reports_lateness_staleness_and_failure(warehouse):
     assert failing["state_error_rows"] == 1
 
 
+def test_terminal_gone_state_rows_do_not_surface_as_failures(warehouse):
+    # Slack records deleted/archived channels and deleted thread parents with
+    # the terminal status 'gone', keeping the failure text as the reason. Those
+    # rows are expected, closed-out facts: they must not count as failing and
+    # their error text must not surface as the pipeline's current last_error.
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @slack_sync_state
+            (account, team_id, object_type, object_id, cursor_ts, last_sync_type,
+             status, error, updated_at, sync_version)
+        VALUES
+            ('zrl', 'T1', 'thread', 'C1:1770000000.000001', '', 'thread_replies',
+             'gone', 'conversations.replies failed: channel_not_found', %s, 1),
+            ('zrl', 'T1', 'conversation', 'C2', '', 'partial',
+             'ok', '', %s, 1)
+        """,
+        (now, now - timedelta(minutes=5)),
+    )
+    PipelineHealthCollector(warehouse).run()
+
+    row = warehouse._query_dicts(
+        "SELECT state_rows, state_error_rows, last_error, last_error_at"
+        " FROM @marts_pipeline_health WHERE pipeline = 'slack'"
+    )[0]
+    assert row["state_rows"] == 2
+    assert row["state_error_rows"] == 0
+    assert row["last_error"] is None
+    assert row["last_error_at"] is None
+
+
 def test_a_stale_snapshot_reports_unknown_instead_of_stale_facts(warehouse):
     """The dashboard must distrust itself when the collector stops running."""
     _provision_every_table(warehouse)

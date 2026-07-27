@@ -2952,6 +2952,7 @@ class PostgresWarehouse:
             ]
         )
         self._ensure_slack_conversation_stats_backfilled()
+        self._ensure_slack_sync_state_gone_reclassified()
         self._ensure_clean_slack_inbox_view()
         self._ensure_search_views_if_possible()
 
@@ -6497,7 +6498,10 @@ class PostgresWarehouse:
         if zero_messages_only:
             where.append("COALESCE(m.message_count, 0) = 0")
         if skip_known_errors:
-            where.append("COALESCE(s.status, '') != 'error'")
+            # 'gone' is terminal (deleted/archived/left channel) so retrying is a
+            # guaranteed identical failure; a transient 'error' stays in the
+            # candidate set so it can heal to 'ok' on the next attempt.
+            where.append("COALESCE(s.status, '') != 'gone'")
         limit_clause = "LIMIT %s" if limit is not None else ""
         if limit is not None:
             params.append(int(limit))
@@ -6562,7 +6566,9 @@ class PostgresWarehouse:
             where.append(_numeric_ts("m.message_ts") + " >= %s")
             params.append(since_ts)
         if skip_known_errors:
-            where.append("(s.object_id IS NULL OR s.status != 'error')")
+            # Terminally-gone threads (deleted parent, dead channel) are never
+            # retried; transient 'error' threads are, so they self-heal.
+            where.append("(s.object_id IS NULL OR s.status != 'gone')")
         if skip_completed:
             where.append(
                 "("
@@ -6692,7 +6698,7 @@ class PostgresWarehouse:
             where.append("c.conversation_type = ANY(%s)")
             params.append(list(conversation_types))
         if skip_known_errors:
-            where.append("COALESCE(s.status, '') != 'error'")
+            where.append("COALESCE(s.status, '') != 'gone'")
         limit_clause = "LIMIT %s" if limit is not None else ""
         if limit is not None:
             params.append(int(limit))
@@ -6825,6 +6831,35 @@ class PostgresWarehouse:
         )
         if rows and not bool(rows[0][0]) and bool(rows[0][1]):
             self.rebuild_slack_conversation_stats()
+
+    def _ensure_slack_sync_state_gone_reclassified(self) -> None:
+        """Reclassify legacy terminal gone-code failures from 'error' to 'gone'.
+
+        Rows written before the 'gone' status existed recorded channel_not_found
+        (and the other gone codes) as status 'error'. Nothing ever retries a
+        gone object, so those rows could never resolve and sat in the pipeline
+        health dashboard's failing count forever. The recorded error text is
+        exactly '<method> failed: <code>' (SlackApiCallError), so a suffix
+        match per gone code identifies them precisely; the error text itself is
+        kept as the reason the object is gone.
+        """
+        # Imported here: these are Slack API semantics owned by the sync module,
+        # and the storage layer must not drift from the codes it records.
+        from personal_data_warehouse.slack_sync import (
+            SLACK_CONVERSATION_GONE_CODES,
+            SLACK_THREAD_GONE_CODES,
+        )
+
+        codes = sorted(SLACK_CONVERSATION_GONE_CODES | SLACK_THREAD_GONE_CODES)
+        self._command(
+            """
+            UPDATE @slack_sync_state
+            SET status = 'gone'
+            WHERE status = 'error'
+              AND error LIKE ANY(%s)
+            """,
+            ([f"% failed: {code}" for code in codes],),
+        )
 
     def _slack_conversation_stat_changes_for_message_rows(
         self,

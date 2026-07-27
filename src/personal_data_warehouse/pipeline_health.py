@@ -1046,12 +1046,19 @@ class PipelineHealthCollector:
         if source.error_column:
             error = _ident(source.error_column)
             # The newest non-empty error, with the timestamp that recorded it.
+            # When the table carries a status, only alarm-worthy rows qualify:
+            # a terminal expected state (slack's 'gone' channels) keeps its
+            # failure text as the reason it was closed out, and that text must
+            # not resurface as the pipeline's current failure banner.
+            error_filter = f"COALESCE({error}, '') != ''"
+            if source.status_column:
+                error_filter += f" AND {_ident(source.status_column)} = ANY(%(alarm)s)"
             selects.append(
                 f"(array_agg({error} ORDER BY {updated} DESC) "
-                f"FILTER (WHERE COALESCE({error}, '') != ''))[1] AS last_error"
+                f"FILTER (WHERE {error_filter}))[1] AS last_error"
             )
             selects.append(
-                f"max({updated}) FILTER (WHERE COALESCE({error}, '') != '')::timestamptz "
+                f"max({updated}) FILTER (WHERE {error_filter})::timestamptz "
                 "AS last_error_at"
             )
         else:
@@ -1060,7 +1067,11 @@ class PipelineHealthCollector:
         sql = (
             f"SELECT {', '.join(selects)} FROM {_ident(relation.schema)}.{_ident(relation.name)}"
         )
-        params = {"errors": list(source.error_statuses), "attention": list(source.attention_statuses)}
+        params = {
+            "errors": list(source.error_statuses),
+            "attention": list(source.attention_statuses),
+            "alarm": list(source.error_statuses) + list(source.attention_statuses),
+        }
         try:
             rows = self._warehouse._query_dicts(sql, params)
         except psycopg2.Error as error:

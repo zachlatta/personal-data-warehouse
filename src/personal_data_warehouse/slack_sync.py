@@ -29,6 +29,17 @@ SLACK_CONVERSATION_GONE_CODES = frozenset(
     {"channel_not_found", "is_archived", "channel_is_archived", "not_in_channel"}
 )
 
+# conversations.replies error codes that are terminal for one thread without
+# implying anything about its channel: the parent message was deleted.
+SLACK_THREAD_GONE_CODES = frozenset({"thread_not_found"})
+
+# Gone-code failures are recorded in slack_sync_state with this terminal status
+# instead of 'error'. Nothing ever retries a gone object, so an 'error' row for
+# one would sit in the pipeline health dashboard's failing count forever;
+# 'error' is reserved for transient failures, which stay in the candidate set
+# and either heal to 'ok' on retry or keep an honest, recent failing signal.
+SLACK_SYNC_STATE_GONE = "gone"
+
 
 class SlackRateLimitedError(Exception):
     def __init__(self, *, retry_after: int) -> None:
@@ -427,6 +438,7 @@ class SlackSyncRunner:
         team_id: str,
         conversation_id: str,
         sync_type: str,
+        status: str,
         error: str,
         synced_at: datetime,
         sync_version: int,
@@ -438,7 +450,7 @@ class SlackSyncRunner:
             object_id=conversation_id,
             cursor_ts="",
             last_sync_type=sync_type,
-            status="error",
+            status=status,
             error=error,
             updated_at=synced_at,
             sync_version=sync_version,
@@ -459,19 +471,22 @@ class SlackSyncRunner:
 
         A single bad conversation (e.g. a deleted/archived channel returning
         channel_not_found) must never abort the whole sync window. We persist the
-        error to slack_sync_state and, when the error means the channel is gone
-        for good, mark it inactive so later passes stop polling it.
+        failure to slack_sync_state and, when it means the channel is gone for
+        good, record the terminal 'gone' status and mark the channel inactive so
+        later passes stop polling it.
         """
+        gone = exc.code in SLACK_CONVERSATION_GONE_CODES
         self._record_conversation_error(
             account=account,
             team_id=team_id,
             conversation_id=conversation_id,
             sync_type=sync_type,
+            status=SLACK_SYNC_STATE_GONE if gone else "error",
             error=str(exc),
             synced_at=synced_at,
             sync_version=sync_version,
         )
-        if exc.code in SLACK_CONVERSATION_GONE_CODES:
+        if gone:
             self._warehouse.mark_slack_conversation_inactive(
                 account=account,
                 team_id=team_id,
@@ -757,7 +772,9 @@ class SlackSyncRunner:
             latest_reply_ts = str(thread_ref.get("latest_reply_ts") or "")
             object_id = thread_state_object_id(conversation_id=conversation_id, thread_ts=thread_ts)
             state = state_by_key.get((account.account, team_id, "thread", object_id))
-            if self._skip_known_errors and self._state_has_status(state, "error"):
+            # Only terminally-gone threads are dropped; a transient 'error' is
+            # retried so it can heal instead of freezing as failing forever.
+            if self._skip_known_errors and self._state_has_status(state, SLACK_SYNC_STATE_GONE):
                 continue
             if self._skip_completed_threads and self._thread_state_covers_latest_reply(
                 state,
@@ -787,6 +804,8 @@ class SlackSyncRunner:
                 raise
             except SlackApiCallError as exc:
                 self._logger.warning("Could not sync Slack thread %s in %s: %s", thread_ts, conversation_id, exc)
+                channel_gone = exc.code in SLACK_CONVERSATION_GONE_CODES
+                thread_gone = channel_gone or exc.code in SLACK_THREAD_GONE_CODES
                 self._warehouse.insert_slack_sync_state(
                     account=account.account,
                     team_id=team_id,
@@ -794,12 +813,12 @@ class SlackSyncRunner:
                     object_id=object_id,
                     cursor_ts=thread_ts,
                     last_sync_type="thread_replies",
-                    status="error",
+                    status=SLACK_SYNC_STATE_GONE if thread_gone else "error",
                     error=str(exc),
                     updated_at=synced_at,
                     sync_version=sync_version,
                 )
-                if exc.code in SLACK_CONVERSATION_GONE_CODES:
+                if channel_gone:
                     self._warehouse.mark_slack_conversation_inactive(
                         account=account.account,
                         team_id=team_id,
@@ -1010,7 +1029,7 @@ class SlackSyncRunner:
                     object_id=conversation_id,
                     cursor_ts="",
                     last_sync_type="members",
-                    status="error",
+                    status=SLACK_SYNC_STATE_GONE if exc.code in SLACK_CONVERSATION_GONE_CODES else "error",
                     error=str(exc),
                     updated_at=synced_at,
                     sync_version=sync_version,
@@ -1840,7 +1859,7 @@ def main() -> None:
     parser.add_argument(
         "--skip-known-errors",
         action="store_true",
-        help="When using cached conversations, skip conversations already marked error in slack_sync_state",
+        help="When using cached conversations, skip objects marked terminally gone in slack_sync_state (transient errors are still retried)",
     )
     parser.add_argument("--conversation-limit", type=int, help="Maximum cached conversations to process in this run")
     parser.add_argument("--conversation-page-limit", type=int, help="Maximum conversations.list pages to fetch in this run")

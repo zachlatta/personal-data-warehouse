@@ -3276,6 +3276,183 @@ def test_postgres_slack_thread_parent_refs_exclude_gone_conversations(
     assert [ref["conversation_id"] for ref in refs] == ["C-live"]
 
 
+def _insert_sync_state(
+    warehouse: PostgresWarehouse,
+    *,
+    object_type: str,
+    object_id: str,
+    status: str,
+    error: str = "",
+) -> None:
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type=object_type,
+        object_id=object_id,
+        cursor_ts="",
+        last_sync_type="thread_replies" if object_type == "thread" else "partial",
+        status=status,
+        error=error,
+        updated_at=datetime(2026, 5, 19, 12, tzinfo=UTC),
+        sync_version=1,
+    )
+
+
+def test_postgres_slack_thread_parent_refs_skip_gone_but_retry_errors(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # skip_known_errors permanently drops threads recorded as 'gone' (deleted
+    # parent / dead channel — retrying is a guaranteed identical failure) but
+    # keeps offering threads whose last attempt was a transient 'error', so
+    # they self-heal instead of freezing in the failing count forever.
+    warehouse.ensure_slack_tables()
+    now = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(conversation_id=cid, raw_json=f'{{"id":"{cid}"}}')
+            for cid in ("C-gone", "C-error", "C-fresh")
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id=cid,
+                message_ts=ts,
+                message_datetime=now,
+                reply_count=1,
+            )
+            for cid, ts in (
+                ("C-gone", "1770000000.000001"),
+                ("C-error", "1770000000.000002"),
+                ("C-fresh", "1770000000.000003"),
+            )
+        ]
+    )
+    _insert_sync_state(
+        warehouse,
+        object_type="thread",
+        object_id="C-gone:1770000000.000001",
+        status="gone",
+        error="conversations.replies failed: thread_not_found",
+    )
+    _insert_sync_state(
+        warehouse,
+        object_type="thread",
+        object_id="C-error:1770000000.000002",
+        status="error",
+        error="conversations.replies failed: internal_error",
+    )
+
+    refs = warehouse.load_slack_thread_parent_refs(account="zrl", team_id="T1", skip_known_errors=True)
+
+    assert sorted(ref["conversation_id"] for ref in refs) == ["C-error", "C-fresh"]
+
+
+def test_postgres_slack_conversation_payloads_skip_gone_but_retry_errors(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(conversation_id=cid, raw_json=f'{{"id":"{cid}"}}')
+            for cid in ("C-gone", "C-error", "C-fresh")
+        ]
+    )
+    _insert_sync_state(
+        warehouse,
+        object_type="conversation",
+        object_id="C-gone",
+        status="gone",
+        error="conversations.history failed: channel_not_found",
+    )
+    _insert_sync_state(
+        warehouse,
+        object_type="conversation",
+        object_id="C-error",
+        status="error",
+        error="conversations.history failed: fatal_error",
+    )
+
+    payloads = warehouse.load_slack_conversation_payloads(account="zrl", team_id="T1", skip_known_errors=True)
+
+    assert sorted(p["id"] for p in payloads) == ["C-error", "C-fresh"]
+
+
+def test_postgres_slack_member_candidates_skip_gone_but_retry_errors(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(
+                conversation_id=cid,
+                conversation_type="private_channel",
+                raw_json=f'{{"id":"{cid}"}}',
+            )
+            for cid in ("G-gone", "G-error", "G-fresh")
+        ]
+    )
+    _insert_sync_state(
+        warehouse,
+        object_type="conversation_members",
+        object_id="G-gone",
+        status="gone",
+        error="conversations.members failed: channel_not_found",
+    )
+    _insert_sync_state(
+        warehouse,
+        object_type="conversation_members",
+        object_id="G-error",
+        status="error",
+        error="conversations.members failed: internal_error",
+    )
+
+    payloads = warehouse.load_slack_member_sync_candidate_payloads(account="zrl", team_id="T1", skip_known_errors=True)
+
+    assert sorted(p["id"] for p in payloads) == ["G-error", "G-fresh"]
+
+
+def test_postgres_ensure_slack_tables_reclassifies_legacy_gone_errors(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # Rows written before the 'gone' status existed recorded terminal
+    # channel/thread-gone failures as status 'error', which the pipeline health
+    # dashboard counts as actively failing forever (they are never retried, so
+    # nothing ever resolves them). ensure_slack_tables reclassifies them in
+    # place; transient errors are left alone for retry.
+    warehouse.ensure_slack_tables()
+    legacy = {
+        "C-dead:1770000000.000001": ("thread", "conversations.replies failed: channel_not_found"),
+        "C-dead-thread:1770000000.000002": ("thread", "conversations.replies failed: thread_not_found"),
+        "C-left": ("conversation", "conversations.history failed: not_in_channel"),
+        "C-archived": ("conversation", "conversations.history failed: is_archived"),
+        "G-dead": ("conversation_members", "conversations.members failed: channel_not_found"),
+        "C-flaky": ("conversation", "conversations.history failed: fatal_error"),
+    }
+    for object_id, (object_type, error) in legacy.items():
+        _insert_sync_state(
+            warehouse,
+            object_type=object_type,
+            object_id=object_id,
+            status="error",
+            error=error,
+        )
+
+    warehouse.ensure_slack_tables()
+
+    states = warehouse.load_slack_sync_state()
+    by_id = {key[3]: state for key, state in states.items() if key[3] in legacy}
+    assert by_id["C-dead:1770000000.000001"]["status"] == "gone"
+    assert by_id["C-dead-thread:1770000000.000002"]["status"] == "gone"
+    assert by_id["C-left"]["status"] == "gone"
+    assert by_id["C-archived"]["status"] == "gone"
+    assert by_id["G-dead"]["status"] == "gone"
+    # The recorded failure itself is preserved as the reason the object is gone.
+    assert by_id["C-left"]["error"] == "conversations.history failed: not_in_channel"
+    # A transient failure stays a retryable error.
+    assert by_id["C-flaky"]["status"] == "error"
+
+
 def test_postgres_slack_read_state_candidates_use_stats_latest_message_at(
     warehouse: PostgresWarehouse,
 ) -> None:
