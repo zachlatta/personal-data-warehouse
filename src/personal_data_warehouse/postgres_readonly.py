@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
+import json
 from typing import Any
 
 
@@ -48,3 +50,21 @@ def rows_to_raw_result(columns: Sequence[str], rows: Sequence[Sequence[Any]]) ->
         columns=column_names,
         rows=[{column: row[index] for index, column in enumerate(column_names)} for row in rows],
     )
+
+
+def tsv_value(value: Any) -> str:
+    """Render a Postgres value for the local tab-separated admin helper."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    elif isinstance(value, datetime):
+        value = value.astimezone(UTC).isoformat() if value.tzinfo else value.isoformat()
+    elif isinstance(value, date):
+        value = value.isoformat()
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        return str(value)

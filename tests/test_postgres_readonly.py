@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, date, datetime
 import os
 
 import psycopg2
@@ -9,7 +10,16 @@ from dotenv import load_dotenv
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.postgres import PostgresWarehouse
-from personal_data_warehouse.postgres_readonly import PostgresReadOnlyRunner
+from personal_data_warehouse.postgres_readonly import PostgresReadOnlyRunner, tsv_value
+
+
+def test_tsv_value_formats_postgres_values_stably() -> None:
+    assert tsv_value(None) == ""
+    assert tsv_value("plain") == "plain"
+    assert tsv_value(b"hello\xff") == "hello\ufffd"
+    assert tsv_value(date(2026, 7, 27)) == "2026-07-27"
+    assert tsv_value(datetime(2026, 7, 27, 13, 30, tzinfo=UTC)) == "2026-07-27T13:30:00+00:00"
+    assert tsv_value({"b": 2, "a": 1}) == '{"a":1,"b":2}'
 
 
 def _postgres_url() -> str:

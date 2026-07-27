@@ -35,7 +35,7 @@ import sys
 from dotenv import load_dotenv
 
 from personal_data_warehouse.postgres import PostgresWarehouse
-from personal_data_warehouse.postgres_readonly import PostgresReadOnlyRunner, csv_value
+from personal_data_warehouse.postgres_readonly import PostgresReadOnlyRunner, tsv_value
 
 
 load_dotenv(".env")
@@ -51,5 +51,5 @@ writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
 if result.columns:
     writer.writerow(result.columns)
 for row in result.rows:
-    writer.writerow([csv_value(row.get(column)) for column in result.columns])
+    writer.writerow([tsv_value(row.get(column)) for column in result.columns])
 PY
