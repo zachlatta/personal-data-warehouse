@@ -22,7 +22,6 @@ from personal_data_warehouse.agent_runner import (
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
 AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v6"
 DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
-DEFAULT_ENRICHMENT_RECORDED_AFTER = datetime(2024, 12, 1, tzinfo=UTC)
 DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 5
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
 LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS = 12_000
@@ -182,14 +181,13 @@ class VoiceMemosEnrichmentRunner:
         self._force_prompt_version = force_prompt_version
         self._max_error_attempts = max_error_attempts
 
-    def sync(self, *, limit: int | None, recorded_after: datetime | None = None) -> VoiceMemosEnrichmentSummary:
+    def sync(self, *, limit: int | None) -> VoiceMemosEnrichmentSummary:
         self._warehouse.ensure_apple_voice_memos_tables()
         recordings = load_enrichment_candidates(
             self._warehouse,
             provider=self._provider,
             prompt_version=self._prompt_version,
             limit=limit,
-            recorded_after=recorded_after,
             force_prompt_version=self._force_prompt_version,
             max_error_attempts=self._max_error_attempts,
         )
@@ -298,7 +296,6 @@ def load_enrichment_candidates(
     provider: str,
     prompt_version: str,
     limit: int | None,
-    recorded_after: datetime | None = None,
     force_prompt_version: bool = False,
     max_error_attempts: int = DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
 ) -> list[dict[str, Any]]:
@@ -309,10 +306,6 @@ def load_enrichment_candidates(
     ]
     if max_error_attempts > 0:
         filters.append(f"COALESCE(a.error_attempts, 0) < {int(max_error_attempts)}")
-    if recorded_after is not None:
-        if recorded_after.tzinfo is None:
-            recorded_after = recorded_after.replace(tzinfo=UTC)
-        filters.append(f"f.recorded_at >= {_sql_string(recorded_after.astimezone(UTC).isoformat())}::timestamptz")
     limit_sql = f"LIMIT {int(limit)}" if limit and limit > 0 else ""
     completed_prompt_filter = f"AND prompt_version = {_sql_string(prompt_version)}" if force_prompt_version else ""
     agent_run_provider = provider.removeprefix("agent_")

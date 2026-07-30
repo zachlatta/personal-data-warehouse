@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
 
 from dagster import (
     DefaultScheduleStatus,
@@ -27,7 +26,6 @@ from personal_data_warehouse.schedule_guards import skip_if_job_active, skip_if_
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.apple_voice_memos_enrichment import (
     AGENT_ENRICHMENT_PROMPT_VERSION,
-    DEFAULT_ENRICHMENT_RECORDED_AFTER,
     DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     ContainerAgentStructuredClient,
     VoiceMemosEnrichmentRunner,
@@ -36,9 +34,8 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 VOICE_MEMOS_ENRICHMENT_POSTGRES_LOCK_ID = 7_403_111_841
-DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE = 0
+DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE = 10
 VOICE_MEMOS_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 60
-VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER_ENV = "VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER"
 VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_ENV = "VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION"
 VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV = "VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS"
 UNCONFIGURED_AGENT_RESOURCE = AgentResource.disabled()
@@ -61,7 +58,6 @@ def apple_voice_memos_enrichment(context, agent: AgentResource) -> MaterializeRe
             str(DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE),
         )
     )
-    recorded_after = apple_voice_memos_enrichment_recorded_after()
     warehouse = warehouse_from_settings(settings)
     with exclusive_sync_lock(
         name="apple_voice_memos_enrichment",
@@ -84,14 +80,13 @@ def apple_voice_memos_enrichment(context, agent: AgentResource) -> MaterializeRe
                 prompt_version=apple_voice_memos_enrichment_prompt_version(),
                 force_prompt_version=apple_voice_memos_enrichment_force_prompt_version(),
                 max_error_attempts=apple_voice_memos_enrichment_max_error_attempts(),
-            ).sync(limit=batch_size if batch_size > 0 else None, recorded_after=recorded_after)
+            ).sync(limit=batch_size if batch_size > 0 else None)
 
     return MaterializeResult(
         metadata={
             "recordings_seen": MetadataValue.int(summary.recordings_seen if summary else 0),
             "recordings_enriched": MetadataValue.int(summary.recordings_enriched if summary else 0),
             "recordings_failed": MetadataValue.int(summary.recordings_failed if summary else 0),
-            "recorded_after": MetadataValue.text(recorded_after.isoformat()),
         }
     )
 
@@ -126,7 +121,6 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
         require_agent=True,
     )
 
-    recorded_after = apple_voice_memos_enrichment_recorded_after()
     warehouse = warehouse_from_settings(settings)
     try:
         candidates = load_enrichment_candidates(
@@ -134,7 +128,6 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
             provider=apple_voice_memos_enrichment_provider(settings),
             prompt_version=apple_voice_memos_enrichment_prompt_version(),
             limit=1,
-            recorded_after=recorded_after,
             force_prompt_version=apple_voice_memos_enrichment_force_prompt_version(),
             max_error_attempts=apple_voice_memos_enrichment_max_error_attempts(),
         )
@@ -144,23 +137,6 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
         warehouse.close()
 
     return RunRequest(tags={"apple_voice_memos_trigger": "enrichment_backlog"})
-
-
-def apple_voice_memos_enrichment_recorded_after() -> datetime:
-    value = os.getenv(VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER_ENV)
-    if value is None or not value.strip():
-        return DEFAULT_ENRICHMENT_RECORDED_AFTER
-
-    raw_value = value.strip()
-    try:
-        recorded_after = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError(
-            f"{VOICE_MEMOS_ENRICHMENT_RECORDED_AFTER_ENV} must be an ISO date or datetime, got {raw_value!r}"
-        ) from exc
-    if recorded_after.tzinfo is None:
-        recorded_after = recorded_after.replace(tzinfo=UTC)
-    return recorded_after.astimezone(UTC)
 
 
 def apple_voice_memos_enrichment_provider(settings) -> str:

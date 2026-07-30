@@ -894,7 +894,7 @@ def test_apply_contact_alias_corrections_rewrites_final_output_aliases() -> None
     assert corrected["speaker_map"][0]["evidence"] == "Taylor appears in ASR."
 
 
-def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit() -> None:
+def test_load_enrichment_candidates_scans_all_recording_history_without_limit() -> None:
     queries = []
 
     class Warehouse:
@@ -907,10 +907,9 @@ def test_load_enrichment_candidates_can_scope_to_recent_recordings_without_limit
         provider="agent_codex",
         prompt_version="test-prompt",
         limit=None,
-        recorded_after=datetime(2026, 3, 3, tzinfo=UTC),
     )
 
-    assert "f.recorded_at >= '2026-03-03T00:00:00+00:00'::timestamptz" in queries[0]
+    assert "f.recorded_at >=" not in queries[0]
     assert "LIMIT" not in queries[0]
     assert "FROM @apple_voice_memos_files AS f" in queries[0]
     assert "INNER JOIN @apple_voice_memos_transcription_runs AS r" in queries[0]
@@ -935,7 +934,6 @@ def test_load_enrichment_candidates_keeps_limit_when_configured() -> None:
         provider="agent_codex",
         prompt_version="test-prompt",
         limit=12,
-        recorded_after=None,
     )
 
     assert "LIMIT 12" in queries[0]
