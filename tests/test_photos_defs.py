@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 from dagster import DagsterInstance, RunRequest, SkipReason, build_sensor_context
 
 from personal_data_warehouse.defs import photos_drive_ingest as photos_defs
@@ -74,6 +77,29 @@ def test_photos_drive_inbox_sensor_runs_every_minute() -> None:
     sensor = photos_defs.photos_drive_inbox_sensor
     assert sensor.minimum_interval_seconds == 60
     assert sensor.default_status.value == "RUNNING"
+
+
+def test_photos_drive_ingest_asset_bounds_each_run(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def sync(self):
+            return SimpleNamespace(metadata_seen=1, rows_written=1, objects_promoted=2)
+
+    monkeypatch.setattr(photos_defs, "load_settings", lambda **_kwargs: FakeSettings())
+    monkeypatch.setattr(photos_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(photos_defs, "photos_object_store", lambda _settings: object())
+    monkeypatch.setattr(photos_defs, "exclusive_sync_lock", lambda **_kwargs: nullcontext(True))
+    monkeypatch.setattr(photos_defs, "PhotosDriveIngestRunner", FakeRunner)
+
+    photos_defs.photos_drive_ingest.node_def.compute_fn.decorated_fn(
+        SimpleNamespace(log=object())
+    )
+
+    assert captured["max_payloads"] == 500
 
 
 def test_photos_drive_inbox_sensor_skips_when_inbox_is_empty(monkeypatch) -> None:

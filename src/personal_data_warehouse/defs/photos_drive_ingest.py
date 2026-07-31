@@ -17,6 +17,7 @@ from dagster import (
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.photos_drive_ingest import (
+    PHOTOS_DRIVE_INGEST_MAX_PAYLOADS_PER_RUN,
     PhotosDriveIngestRunner,
     has_metadata_payloads,
     iter_metadata_payloads,
@@ -67,6 +68,7 @@ def photos_drive_ingest(context) -> MaterializeResult:
                 metadata_source=lambda: iter_metadata_payloads(object_store=object_store),
                 object_store=object_store,
                 logger=context.log,
+                max_payloads=PHOTOS_DRIVE_INGEST_MAX_PAYLOADS_PER_RUN,
             ).sync()
 
     return MaterializeResult(
@@ -74,6 +76,9 @@ def photos_drive_ingest(context) -> MaterializeResult:
             "metadata_seen": MetadataValue.int(summary.metadata_seen if summary else 0),
             "rows_written": MetadataValue.int(summary.rows_written if summary else 0),
             "objects_promoted": MetadataValue.int(summary.objects_promoted if summary else 0),
+            "max_payloads_per_run": MetadataValue.int(
+                PHOTOS_DRIVE_INGEST_MAX_PAYLOADS_PER_RUN
+            ),
         }
     )
 

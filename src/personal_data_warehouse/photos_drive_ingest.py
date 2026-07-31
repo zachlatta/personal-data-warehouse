@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import islice
 from typing import Any
 
 from personal_data_warehouse.objectstore import ObjectListing, ObjectStore
@@ -31,6 +32,11 @@ INBOX_PREFIX = "photos/inbox/"
 LIBRARY_PREFIX = "photos/library/"
 METADATA_KIND = "photo_metadata"
 FILE_KIND = "photo_file"
+# A full historical inbox walk can exceed Dagster's four-hour run cap. Keep
+# each pass comfortably bounded, and persist/move smaller groups throughout
+# the pass so a canceled run still shrinks the inbox instead of starting over.
+PHOTOS_DRIVE_INGEST_MAX_PAYLOADS_PER_RUN = 500
+PHOTOS_DRIVE_INGEST_WRITE_BATCH_SIZE = 25
 
 
 @dataclass(frozen=True)
@@ -49,17 +55,74 @@ class PhotosDriveIngestRunner:
         object_store: ObjectStore | None = None,
         logger,
         now: Callable[[], datetime] | None = None,
+        max_payloads: int | None = None,
+        write_batch_size: int = PHOTOS_DRIVE_INGEST_WRITE_BATCH_SIZE,
     ) -> None:
+        if max_payloads is not None and max_payloads < 1:
+            raise ValueError("max_payloads must be at least 1")
+        if write_batch_size < 1:
+            raise ValueError("write_batch_size must be at least 1")
         self._warehouse = warehouse
         self._metadata_source = metadata_source
         self._object_store = object_store
         self._logger = logger
         self._now = now or (lambda: datetime.now(tz=UTC))
+        self._max_payloads = max_payloads
+        self._write_batch_size = write_batch_size
 
     def sync(self) -> PhotosDriveIngestSummary:
         self._warehouse.ensure_photos_tables()
         ingested_at = self._now()
-        payloads = list(self._metadata_source())
+        payloads = iter(self._metadata_source())
+        if self._max_payloads is not None:
+            payloads = islice(payloads, self._max_payloads)
+
+        metadata_seen = 0
+        rows_written = 0
+        promoted = 0
+        tables_seen: set[str] = set()
+        batch: list[Mapping[str, Any]] = []
+        for payload in payloads:
+            batch.append(payload)
+            if len(batch) < self._write_batch_size:
+                continue
+            batch_rows, batch_promoted, batch_tables = self._sync_batch(
+                batch,
+                ingested_at=ingested_at,
+            )
+            metadata_seen += len(batch)
+            rows_written += batch_rows
+            promoted += batch_promoted
+            tables_seen.update(batch_tables)
+            batch = []
+        if batch:
+            batch_rows, batch_promoted, batch_tables = self._sync_batch(
+                batch,
+                ingested_at=ingested_at,
+            )
+            metadata_seen += len(batch)
+            rows_written += batch_rows
+            promoted += batch_promoted
+            tables_seen.update(batch_tables)
+
+        self._logger.info(
+            "Ingested %s photo metadata envelope(s) into %s table(s); promoted %s object(s)",
+            rows_written,
+            len(tables_seen),
+            promoted,
+        )
+        return PhotosDriveIngestSummary(
+            metadata_seen=metadata_seen,
+            rows_written=rows_written,
+            objects_promoted=promoted,
+        )
+
+    def _sync_batch(
+        self,
+        payloads: list[Mapping[str, Any]],
+        *,
+        ingested_at: datetime,
+    ) -> tuple[int, int, set[str]]:
         rows_by_table: dict[str, list[dict[str, Any]]] = {}
         for payload in payloads:
             table = photo_source_table(payload)
@@ -73,16 +136,7 @@ class PhotosDriveIngestRunner:
             for payload in payloads:
                 promoted += promote_payload(self._object_store, payload)
         rows_written = sum(len(rows) for rows in rows_by_table.values())
-        self._logger.info(
-            "Ingested %s photo metadata envelope(s) into %s table(s)",
-            rows_written,
-            len(rows_by_table),
-        )
-        return PhotosDriveIngestSummary(
-            metadata_seen=len(payloads),
-            rows_written=rows_written,
-            objects_promoted=promoted,
-        )
+        return rows_written, promoted, set(rows_by_table)
 
 
 def photo_source_table(payload: Mapping[str, Any]) -> str:

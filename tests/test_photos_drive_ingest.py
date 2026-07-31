@@ -35,11 +35,13 @@ class FakeWarehouse:
     def __init__(self) -> None:
         self.ensured = False
         self.rows_by_table: dict[str, list[dict[str, object]]] = {}
+        self.insert_batches: list[tuple[str, int]] = []
 
     def ensure_photos_tables(self) -> None:
         self.ensured = True
 
     def insert_photo_source_files(self, table, rows) -> None:
+        self.insert_batches.append((table, len(rows)))
         self.rows_by_table.setdefault(table, []).extend(rows)
 
 
@@ -210,6 +212,114 @@ def test_runner_writes_rows_and_promotes_inbox_objects() -> None:
         ("file-1", "photos/library/2026/06/2026-06-01-filesha.heic"),
         ("meta-1", "photos/library/2026/06/2026-06-01-dedupsha.json"),
     ]
+
+
+def test_runner_bounds_each_run_without_reading_past_the_limit() -> None:
+    store = FakeObjectStore()
+    warehouse = FakeWarehouse()
+    payloads_read: list[int] = []
+
+    def payload_source():
+        for index in range(4):
+            payloads_read.append(index)
+            yield attach_storage_context(
+                {
+                    **envelope(),
+                    "file": {
+                        **envelope()["file"],
+                        "native_id": f"UUID-{index}",
+                        "content_sha256": f"filesha-{index}",
+                    },
+                },
+                metadata_listing=_listing(
+                    f"photos/inbox/2026/06/meta-{index}.json",
+                    f"meta-{index}",
+                ),
+                file_listing=_listing(
+                    f"photos/inbox/2026/06/file-{index}.heic",
+                    f"file-{index}",
+                ),
+            )
+
+    summary = PhotosDriveIngestRunner(
+        warehouse=warehouse,
+        metadata_source=payload_source,
+        object_store=store,
+        logger=FakeLogger(),
+        max_payloads=2,
+    ).sync()
+
+    assert payloads_read == [0, 1]
+    assert summary.metadata_seen == 2
+    assert summary.rows_written == 2
+    assert summary.objects_promoted == 4
+    assert [file_id for file_id, _key in store.moved] == [
+        "file-0",
+        "meta-0",
+        "file-1",
+        "meta-1",
+    ]
+
+
+def test_runner_commits_and_promotes_batches_before_reading_the_whole_pass() -> None:
+    store = FakeObjectStore()
+    warehouse = FakeWarehouse()
+
+    def payload_source():
+        for index in range(3):
+            if index == 2:
+                assert warehouse.insert_batches == [("apple_photos_files", 2)]
+                assert [file_id for file_id, _key in store.moved] == [
+                    "file-0",
+                    "meta-0",
+                    "file-1",
+                    "meta-1",
+                ]
+            yield attach_storage_context(
+                {
+                    **envelope(),
+                    "file": {
+                        **envelope()["file"],
+                        "native_id": f"UUID-{index}",
+                        "content_sha256": f"filesha-{index}",
+                    },
+                },
+                metadata_listing=_listing(
+                    f"photos/inbox/2026/06/meta-{index}.json",
+                    f"meta-{index}",
+                ),
+                file_listing=_listing(
+                    f"photos/inbox/2026/06/file-{index}.heic",
+                    f"file-{index}",
+                ),
+            )
+
+    summary = PhotosDriveIngestRunner(
+        warehouse=warehouse,
+        metadata_source=payload_source,
+        object_store=store,
+        logger=FakeLogger(),
+        write_batch_size=2,
+    ).sync()
+
+    assert summary.metadata_seen == 3
+    assert warehouse.insert_batches == [
+        ("apple_photos_files", 2),
+        ("apple_photos_files", 1),
+    ]
+
+
+def test_runner_rejects_non_positive_progress_bounds() -> None:
+    kwargs = {
+        "warehouse": FakeWarehouse(),
+        "metadata_source": lambda: [],
+        "object_store": FakeObjectStore(),
+        "logger": FakeLogger(),
+    }
+    with pytest.raises(ValueError, match="max_payloads must be at least 1"):
+        PhotosDriveIngestRunner(**kwargs, max_payloads=0)
+    with pytest.raises(ValueError, match="write_batch_size must be at least 1"):
+        PhotosDriveIngestRunner(**kwargs, write_batch_size=0)
 
 
 def test_promote_payload_fails_loud_when_storage_key_missing() -> None:
