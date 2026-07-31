@@ -214,6 +214,49 @@ _LARGE_TABLES = {
 }
 
 
+def test_state_status_vocabulary_covers_both_failure_dialects():
+    """Every sync writer records a hard failure as 'error' or 'failed'.
+
+    The writers never agreed on one word — slack_sync writes ``error`` while
+    whoop_sync, calendar_sync, contacts_sync, and google_drive_source_sync
+    write ``failed`` — so every StateSource with a status column must classify
+    *both*. A dialect the collector does not classify is a pipeline that can
+    die invisibly: on 2026-07-30 WHOOP reported 'ok' on the dashboard through
+    26 hours of hard failure because its ``failed`` rows matched nothing.
+    """
+    for entry in PIPELINES:
+        state = entry.state
+        if state is None or not state.status_column:
+            continue
+        assert "error" in state.error_statuses, (
+            f"{entry.id}: 'error' missing from error_statuses"
+        )
+        assert "failed" in state.error_statuses, (
+            f"{entry.id}: 'failed' missing from error_statuses"
+        )
+
+
+def test_benign_statuses_are_never_classified_as_failures():
+    """'ok', slack's 'gone' tombstones, and plaid's 'unsupported' products are
+    working-as-designed states, not failures, and must never count toward the
+    dashboard's error or attention totals."""
+    for entry in PIPELINES:
+        state = entry.state
+        if state is None:
+            continue
+        for benign in ("ok", "gone", "unsupported"):
+            assert benign not in state.error_statuses, (entry.id, benign)
+            assert benign not in state.attention_statuses, (entry.id, benign)
+
+
+def test_plaid_action_required_is_surfaced_as_attention():
+    """An expired Plaid Item login stays green at the run level by design; the
+    dashboard's attention state is the only place it becomes visible."""
+    state = pipeline("plaid").state
+    assert state is not None
+    assert "action_required" in state.attention_statuses
+
+
 def test_thresholds_are_ordered_and_bounded():
     assert 1 < LATE_MULTIPLIER < STALE_MULTIPLIER
     # A missed collection must not turn the whole dashboard 'unknown': the asset

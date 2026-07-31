@@ -131,10 +131,17 @@ class StateSource:
     status_column: str = ""
     error_column: str = ""
     #: Status values that mean "this scope is broken and no retry will fix it
-    #: on its own". Plaid records ``action_required`` for an Item whose login
-    #: expired; the run stays green by design, and the dashboard is where that
-    #: has to become visible.
-    error_statuses: tuple[str, ...] = ("error",)
+    #: on its own". The sync writers never agreed on one failure word —
+    #: slack_sync writes ``error`` while whoop_sync, calendar_sync,
+    #: contacts_sync, and google_drive_source_sync write ``failed`` — so the
+    #: default classifies both dialects. (WHOOP spent 26 hours hard-down on
+    #: 2026-07-30 reading 'ok' on the dashboard because only ``error`` was
+    #: counted; tests/test_pipeline_health.py pins both now.) Plaid records
+    #: ``action_required`` for an Item whose login expired; the run stays
+    #: green by design, and the dashboard is where that has to become visible.
+    #: Benign non-ok states ('gone' tombstones, 'unsupported' products) are
+    #: deliberately unclassified.
+    error_statuses: tuple[str, ...] = ("error", "failed")
     attention_statuses: tuple[str, ...] = ("action_required",)
 
 
@@ -392,7 +399,14 @@ PIPELINES: tuple[Pipeline, ...] = (
         cadence="poller every 5 min",
         transport="Dagster chatgpt_backend_ingest → chatgpt.com backend API with a published session",
         data=7 * DAY,
-        note="needs a manual `pdw chatgpt publish-session` roughly weekly",
+        run=3 * DAY,
+        state=StateSource(table="chatgpt_conversation_sync", updated_column="synced_at"),
+        note=(
+            "needs a manual `pdw chatgpt publish-session` roughly weekly; the run"
+            " signal advances only on days ChatGPT is actually used, so the run"
+            " interval is deliberately loose — it exists to catch an expired"
+            " session in days rather than the two weeks the data threshold takes"
+        ),
     ),
     _source(
         "whoop",
