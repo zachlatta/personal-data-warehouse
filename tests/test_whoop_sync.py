@@ -8,7 +8,11 @@ import pytest
 import requests
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.whoop_auth import encode_whoop_token_env, whoop_token_json_from_env
+from personal_data_warehouse.whoop_auth import (
+    WhoopOAuthError,
+    encode_whoop_token_env,
+    whoop_token_json_from_env,
+)
 from personal_data_warehouse.whoop_sync import (
     WhoopApiClient,
     WhoopApiError,
@@ -32,6 +36,14 @@ class NullLogger:
 
     def warning(self, *args, **kwargs):
         pass
+
+
+class RecordingLogger(NullLogger):
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
+    def warning(self, message, *args, **kwargs):
+        self.warnings.append(str(message) % args if args else str(message))
 
 
 class FakeWhoopWarehouse:
@@ -84,15 +96,18 @@ class FakeWhoopWarehouse:
 
 
 class FakeWhoopClient:
-    def __init__(self, *, profile=None, body=None, pages=None, fail_path=None) -> None:
+    def __init__(self, *, profile=None, body=None, pages=None, fail_path=None, fail_error=None) -> None:
         self.profile = profile or {"user_id": 101, "email": "z@example.com", "first_name": "Z", "last_name": "L"}
         self.body = body or {"height_meter": 1.8, "weight_kilogram": 80.0, "max_heart_rate": 190}
         self.pages = {path: list(path_pages) for path, path_pages in (pages or {}).items()}
         self.calls = []
         self.fail_path = fail_path
+        self.fail_error = fail_error
 
     def get_json(self, path, *, params=None):
         self.calls.append((path, dict(params or {})))
+        if self.fail_error is not None:
+            raise self.fail_error
         if path == self.fail_path:
             raise RuntimeError("boom")
         if path == "/v2/user/profile/basic":
@@ -586,6 +601,59 @@ def test_sync_runner_uses_incremental_lookback_from_prior_success(monkeypatch) -
 
     cycle_call = next(call for call in client.calls if call[0] == "/v2/cycle")
     assert cycle_call[1]["start"] == "2026-07-02T12:00:00Z"
+
+
+def test_sync_runner_records_action_required_for_dead_refresh_token(monkeypatch) -> None:
+    # A revoked/expired refresh token is answered with HTTP 400 by WHOOP's
+    # token endpoint and no retry can clear it. Before this classification the
+    # */5 schedule turned one dead token into ~288 red runs/day (2026-07-30).
+    monkeypatch.setenv("WHOOP_ACCOUNT", "zach@example.com")
+    monkeypatch.setenv("WHOOP_TOKEN_JSON_B64", encode_whoop_token_env(_token_json(access_token="secret-token")))
+    settings = load_settings(require_postgres=False, require_gmail=False, require_whoop=True)
+    warehouse = FakeWhoopWarehouse()
+    logger = RecordingLogger()
+    client = FakeWhoopClient(
+        fail_error=WhoopOAuthError("WHOOP token refresh failed with HTTP 400", status_code=400),
+    )
+
+    summaries = WhoopSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=logger,
+        client_factory=lambda _config: client,
+        now=lambda: datetime(2026, 7, 30, 12, tzinfo=UTC),
+    ).sync_all()
+
+    # The run stays green; every collection records the manual step instead.
+    assert len(warehouse.state_rows) == 6
+    assert {row["status"] for row in warehouse.state_rows} == {"action_required"}
+    assert summaries[0].action_required == 6
+    assert summaries[0].records_written == 0
+    assert any("personal-data-warehouse-whoop-auth" in warning for warning in logger.warnings)
+    assert any("WHOOP_TOKEN_JSON_B64" in warning for warning in logger.warnings)
+
+
+def test_sync_runner_still_fails_loud_for_transient_refresh_errors(monkeypatch) -> None:
+    # A 5xx from the token endpoint is retryable: it must keep failing the run
+    # so real outages page instead of silently recording action_required.
+    monkeypatch.setenv("WHOOP_ACCOUNT", "zach@example.com")
+    monkeypatch.setenv("WHOOP_TOKEN_JSON_B64", encode_whoop_token_env(_token_json(access_token="secret-token")))
+    settings = load_settings(require_postgres=False, require_gmail=False, require_whoop=True)
+    warehouse = FakeWhoopWarehouse()
+    client = FakeWhoopClient(
+        fail_error=WhoopOAuthError("WHOOP token refresh failed with HTTP 503", status_code=503),
+    )
+
+    with pytest.raises(RuntimeError, match="WHOOP sync failed"):
+        WhoopSyncRunner(
+            settings=settings,
+            warehouse=warehouse,
+            logger=NullLogger(),
+            client_factory=lambda _config: client,
+            now=lambda: datetime(2026, 7, 30, 12, tzinfo=UTC),
+        ).sync_all()
+
+    assert {row["status"] for row in warehouse.state_rows} == {"failed"}
 
 
 def test_sync_runner_records_failure_state_without_token_leak(monkeypatch) -> None:

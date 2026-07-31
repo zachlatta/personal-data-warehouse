@@ -307,6 +307,15 @@ without a `start` filter unless `WHOOP_FULL_SYNC_START` is set (for example
 runs idempotent while still overlapping recent WHOOP score updates. Use `WHOOP_FORCE_FULL_SYNC=1`
 for an explicit backfill.
 
+A dead refresh token — WHOOP's token endpoint answering `400`/`401`/`403`, which no retry can
+clear — records `status = 'action_required'` in `ops.whoop_sync_state` for every collection and
+leaves the run **green** (mirroring Plaid's `action_required` handling: one dead credential must
+not turn the every-five-minutes schedule into hundreds of red runs a day). The `/pipelines`
+dashboard surfaces the rows as needing a manual step. Repair by re-running the OAuth flow
+(`uv run personal-data-warehouse-whoop-auth --write-env`) and updating `WHOOP_TOKEN_JSON_B64` on
+the production Dagster deployment; the next sync persists the fresh token and self-heals.
+Transient token-endpoint failures (5xx, network) still fail the run loudly.
+
 SQL starting points:
 
 ```sql

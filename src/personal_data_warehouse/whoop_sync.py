@@ -13,7 +13,7 @@ import requests
 
 from personal_data_warehouse.config import Settings, WhoopConfig, load_settings
 from personal_data_warehouse.warehouse import warehouse_from_settings
-from personal_data_warehouse.whoop_auth import refresh_whoop_token
+from personal_data_warehouse.whoop_auth import WhoopOAuthError, refresh_whoop_token
 
 EPOCH_UTC = datetime.fromtimestamp(0, tz=UTC)
 WHOOP_COLLECTIONS = (
@@ -22,6 +22,23 @@ WHOOP_COLLECTIONS = (
     ("sleep", "/v2/activity/sleep", "insert_whoop_sleeps", "sleep"),
     ("workout", "/v2/activity/workout", "insert_whoop_workouts", "workout"),
 )
+
+
+WHOOP_STATUS_ACTION_REQUIRED = "action_required"
+# Token-endpoint statuses that mean the stored refresh token itself was
+# rejected (revoked, expired, or rotated away underneath us). No retry can
+# clear these — only a manual re-auth — so they must not fail the run: the
+# */5 schedule otherwise turns one dead token into ~288 red runs/day (which
+# is exactly what happened on 2026-07-30) while burying transient failures
+# that ARE worth alarming on. Mirrors PLAID_ACTION_REQUIRED_ERROR_CODES.
+WHOOP_ACTION_REQUIRED_HTTP_STATUSES = frozenset({400, 401, 403})
+
+
+def whoop_action_required_error(error: BaseException) -> bool:
+    return (
+        isinstance(error, WhoopOAuthError)
+        and error.status_code in WHOOP_ACTION_REQUIRED_HTTP_STATUSES
+    )
 
 
 class WhoopApiError(RuntimeError):
@@ -44,6 +61,8 @@ class WhoopSyncSummary:
     sync_type: str
     records_written: int
     collections: dict[str, int]
+    #: Collections skipped because the credential needs a manual re-auth.
+    action_required: int = 0
 
 
 def public_whoop_sync_summary(summary: WhoopSyncSummary) -> dict[str, Any]:
@@ -52,6 +71,7 @@ def public_whoop_sync_summary(summary: WhoopSyncSummary) -> dict[str, Any]:
         "sync_type": summary.sync_type,
         "records_written": summary.records_written,
         "collections": dict(summary.collections),
+        "action_required": summary.action_required,
         # Explicitly document that public summaries never carry OAuth material.
         "has_token": False,
     }
@@ -240,6 +260,7 @@ class WhoopSyncRunner:
         client = self._build_client(runtime_config, persist_rotated_token=True)
         collections_written: dict[str, int] = {}
         failures: list[str] = []
+        action_required_count = 0
 
         for collection, sync_fn in (
             ("profile", self._sync_profile),
@@ -261,15 +282,17 @@ class WhoopSyncRunner:
                     updated_at=synced_at,
                 )
             except Exception as exc:
-                self._record_failure(
+                if self._record_failure(
                     account=account,
                     collection=collection,
                     state=state_by_key.get((account, collection)),
                     error=exc,
                     updated_at=synced_at,
                     config=config,
-                )
-                failures.append(f"{collection}: {exc}")
+                ):
+                    failures.append(f"{collection}: {exc}")
+                else:
+                    action_required_count += 1
 
         for collection, path, insert_method, row_kind in WHOOP_COLLECTIONS:
             state = state_by_key.get((account, collection))
@@ -296,15 +319,17 @@ class WhoopSyncRunner:
                     updated_at=synced_at,
                 )
             except Exception as exc:
-                self._record_failure(
+                if self._record_failure(
                     account=account,
                     collection=collection,
                     state=state,
                     error=exc,
                     updated_at=synced_at,
                     config=config,
-                )
-                failures.append(f"{collection}: {exc}")
+                ):
+                    failures.append(f"{collection}: {exc}")
+                else:
+                    action_required_count += 1
 
         if failures:
             raise RuntimeError("WHOOP sync failed for: " + "; ".join(failures))
@@ -314,6 +339,7 @@ class WhoopSyncRunner:
                 sync_type="mixed",
                 records_written=sum(collections_written.values()),
                 collections=collections_written,
+                action_required=action_required_count,
             )
         ]
 
@@ -429,16 +455,33 @@ class WhoopSyncRunner:
         error: Exception,
         updated_at: datetime,
         config: WhoopConfig,
-    ) -> None:
+    ) -> bool:
+        """Record the failure; return True when it should fail the run.
+
+        A dead refresh token (4xx from the token endpoint) records
+        ``action_required`` and returns False: only a manual re-auth fixes it,
+        so re-failing the run every 5 minutes is pure noise. The dashboard
+        surfaces the ``action_required`` rows instead.
+        """
+        action_required = whoop_action_required_error(error)
         self._insert_state(
             account=account,
             collection=collection,
             watermark_updated_at=state_datetime(state, "watermark_updated_at"),
             last_sync_type=str((state or {}).get("last_sync_type", "unknown")),
-            status="failed",
+            status=WHOOP_STATUS_ACTION_REQUIRED if action_required else "failed",
             error=truncate_error(_redact_config_secrets(str(error), config)),
             updated_at=updated_at,
         )
+        if action_required:
+            self._logger.warning(
+                "WHOOP %s needs re-authorization (%s): run "
+                "`uv run personal-data-warehouse-whoop-auth --write-env` locally, then update "
+                "WHOOP_TOKEN_JSON_B64 on the production Dagster deployment",
+                collection,
+                error,
+            )
+        return not action_required
 
 
 def iter_collection_pages(

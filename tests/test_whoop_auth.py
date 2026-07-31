@@ -72,6 +72,29 @@ def test_refresh_whoop_token_requests_offline_scope_and_returns_rotated_token(mo
     assert token["expires_at"] > 0
 
 
+def test_refresh_whoop_token_carries_status_code_on_http_error(monkeypatch) -> None:
+    # The status code is how callers distinguish a dead refresh token (4xx,
+    # needs a manual re-auth) from a transient token-endpoint outage (5xx).
+    class Response:
+        status_code = 400
+
+        def json(self):
+            return {"error": "invalid_grant"}
+
+    monkeypatch.setattr("personal_data_warehouse.whoop_auth.requests.post", lambda *a, **k: Response())
+
+    with pytest.raises(WhoopOAuthError, match="HTTP 400") as excinfo:
+        refresh_whoop_token(
+            {"access_token": "old-access", "refresh_token": "old-refresh"},
+            client_id="client-id",
+            client_secret="client-secret",
+            token_url="https://whoop.example/token",
+            timeout=12,
+        )
+
+    assert excinfo.value.status_code == 400
+
+
 def test_refresh_whoop_token_requires_rotated_refresh_token(monkeypatch) -> None:
     class Response:
         status_code = 200

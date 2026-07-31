@@ -56,6 +56,7 @@ def whoop_sync(context) -> MaterializeResult:
             "whoop": MetadataValue.json(public_summaries),
             "account_count": len(public_summaries),
             "records_written": sum(summary.records_written for summary in summaries),
+            "action_required": sum(summary.action_required for summary in summaries),
         }
     )
 

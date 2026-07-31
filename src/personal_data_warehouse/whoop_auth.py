@@ -19,7 +19,12 @@ from personal_data_warehouse.gmail_auth import update_env_file
 
 
 class WhoopOAuthError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        #: HTTP status from the token endpoint, when the error came from one.
+        #: 4xx means the credential itself was rejected (dead refresh token —
+        #: a manual re-auth is the only fix); 5xx/None is transient.
+        self.status_code = status_code
 
 
 def encode_whoop_token_env(token_json: str | dict[str, Any]) -> str:
@@ -75,7 +80,10 @@ def refresh_whoop_token(
         timeout=timeout,
     )
     if response.status_code >= 400:
-        raise WhoopOAuthError(f"WHOOP token refresh failed with HTTP {response.status_code}")
+        raise WhoopOAuthError(
+            f"WHOOP token refresh failed with HTTP {response.status_code}",
+            status_code=response.status_code,
+        )
     refreshed = _oauth_token_response(response, operation="refresh")
     if not refreshed.get("refresh_token"):
         raise WhoopOAuthError("WHOOP token refresh response did not include rotated refresh_token")
