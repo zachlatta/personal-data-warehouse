@@ -891,8 +891,15 @@ For local pairing/debugging there is a CLI: `uv run personal-data-warehouse-what
 Postgres is the session source of truth. `--session-file` only selects the runtime cache file.
 
 Caveats: unofficial clients violate WhatsApp ToS and carry a small account-ban risk. neonize is
-pinned to 0.3.17.post0 because newer releases need protobuf>=7, which dagster pins below; its
-Go shared library is pre-fetched in the Dockerfile (`import neonize.client` at build).
+pinned exactly (0.4.3.post0) and **must be bumped when WhatsApp rejects the bundled whatsmeow
+version** — the failure looks like `Client outdated (405) connect failure` in the run logs. In
+2026-07 the stale pin crash-looped the client for ~2.5 days (~3k red runs) because goneonize also
+panics (SIGABRT) marshaling the empty ClientOutdated event. Two rules keep that from recurring:
+subscribe only to events the warehouse consumes (`_register_event_handlers` — goneonize marshals
+KeepAliveRestored/StreamReplaced/ClientOutdated as empty protos and panics on zero-byte marshal,
+and Go only marshals subscribed events), and keep the pin fresh enough for WhatsApp's version
+gate. neonize's Go shared library is pre-fetched in the Dockerfile (`import neonize.client` at
+build).
 
 WhatsApp SQL starting points are `base_whatsapp.messages`, `base_whatsapp.chats`,
 `base_whatsapp.chat_participants` (group rosters: one row per member with admin flags),

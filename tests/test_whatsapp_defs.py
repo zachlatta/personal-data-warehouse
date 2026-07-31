@@ -82,6 +82,70 @@ def test_whatsapp_client_keepalive_sensor_launches_when_enabled(monkeypatch) -> 
     assert result.tags == {"whatsapp_trigger": "keepalive"}
 
 
+def test_whatsapp_crash_backoff_skips_during_cooldown_after_failure_streak() -> None:
+    # 3k red runs in 2.5 days: the keepalive relaunched a crash-looping client
+    # every 60s for days. After a failure streak the sensor waits out a
+    # cooldown instead.
+    skip = whatsapp_client_defs.whatsapp_crash_backoff_skip(
+        [("FAILURE", 1000.0), ("FAILURE", 900.0), ("FAILURE", 800.0)],
+        now=1300.0,
+    )
+    assert isinstance(skip, SkipReason)
+    assert "consecutive" in skip.skip_message
+    assert "cooldown" in skip.skip_message
+
+
+def test_whatsapp_crash_backoff_relaunches_once_cooldown_elapses() -> None:
+    skip = whatsapp_client_defs.whatsapp_crash_backoff_skip(
+        [("FAILURE", 1000.0), ("FAILURE", 900.0), ("FAILURE", 800.0)],
+        now=1000.0 + whatsapp_client_defs.WHATSAPP_CLIENT_CRASH_COOLDOWN_SECONDS + 1,
+    )
+    assert skip is None
+
+
+def test_whatsapp_crash_backoff_ignores_broken_streaks_and_short_history() -> None:
+    # A success inside the window breaks the streak.
+    assert (
+        whatsapp_client_defs.whatsapp_crash_backoff_skip(
+            [("FAILURE", 1000.0), ("SUCCESS", 900.0), ("FAILURE", 800.0)],
+            now=1010.0,
+        )
+        is None
+    )
+    # Fewer finished runs than the streak threshold never skips.
+    assert (
+        whatsapp_client_defs.whatsapp_crash_backoff_skip(
+            [("FAILURE", 1000.0), ("FAILURE", 900.0)],
+            now=1010.0,
+        )
+        is None
+    )
+    # No usable end times -> do not wedge the sensor.
+    assert (
+        whatsapp_client_defs.whatsapp_crash_backoff_skip(
+            [("FAILURE", None), ("FAILURE", None), ("FAILURE", None)],
+            now=1010.0,
+        )
+        is None
+    )
+
+
+def test_whatsapp_client_keepalive_sensor_skips_while_crash_looping(monkeypatch) -> None:
+    monkeypatch.setattr(whatsapp_client_defs, "load_settings", lambda **_kwargs: FakeSettings(client_enabled=True))
+    monkeypatch.setattr(
+        whatsapp_client_defs,
+        "_finished_client_runs",
+        lambda _instance: [("FAILURE", 1000.0), ("FAILURE", 900.0), ("FAILURE", 800.0)],
+    )
+    monkeypatch.setattr(whatsapp_client_defs.time, "time", lambda: 1060.0)
+
+    with DagsterInstance.ephemeral() as instance:
+        result = whatsapp_client_defs.whatsapp_client_keepalive_sensor(build_sensor_context(instance=instance))
+
+    assert isinstance(result, SkipReason)
+    assert "cooldown" in result.skip_message
+
+
 def test_whatsapp_client_keepalive_sensor_launches_without_ingest_env(monkeypatch) -> None:
     # The client writes batches + media straight to Drive now, so the keepalive
     # sensor no longer depends on any http_app ingest env (PDW_API_URL/token).

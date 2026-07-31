@@ -16,7 +16,7 @@ dependencies = [
     "python-dotenv>=1.1.0",
     "requests>=2.32.0",
     "slack-sdk>=3.41.0",
-    "neonize==0.3.17.post0",
+    "neonize==0.4.3.post0",
     "qrcode>=8.2",
     "pillow-heif>=1.4.0",
     "curl-cffi>=0.13",

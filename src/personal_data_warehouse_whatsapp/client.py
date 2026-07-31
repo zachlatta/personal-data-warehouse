@@ -93,15 +93,6 @@ class WhatsAppClientRunner:
         # neonize loads native libraries (goneonize, libmagic) at import time;
         # import lazily so merely loading this module never requires them.
         from neonize.client import NewClient
-        from neonize.events import (
-            ConnectedEv,
-            EVENT_TO_INT,
-            HistorySyncEv,
-            LoggedOutEv,
-            MessageEv,
-            OfflineSyncCompletedEv,
-            PairStatusEv,
-        )
 
         self._session_path.parent.mkdir(parents=True, exist_ok=True)
         self._logger.info(
@@ -111,15 +102,7 @@ class WhatsAppClientRunner:
             self._run_seconds,
         )
         client = NewClient(str(self._session_path), uuid=self._client_id or None)
-
-        client.event.qr(self._on_qr)
-        client.event(ConnectedEv)(self._on_connected)
-        client.event(PairStatusEv)(self._on_pair_status)
-        client.event(LoggedOutEv)(self._on_logged_out)
-        client.event(OfflineSyncCompletedEv)(self._on_offline_sync_completed)
-        client.event(MessageEv)(self._on_message)
-        client.event(HistorySyncEv)(self._on_history_sync)
-        self._register_ignored_events(client, EVENT_TO_INT)
+        self._register_event_handlers(client)
 
         connector = threading.Thread(target=self._connect_client, args=(client,), name="whatsapp-connector", daemon=True)
         flusher = threading.Thread(target=self._flush_loop, args=(client,), name="whatsapp-flusher", daemon=True)
@@ -145,6 +128,17 @@ class WhatsAppClientRunner:
             connector.join(timeout=30)
             self._flush_once()
             self._snapshot_session("shutdown")
+        if not self._connected_event.is_set():
+            # Without this, a client that can never connect (rejected client
+            # version, removed linked device) completes every window as a
+            # hollow SUCCESS with zero activity — a silent freeze. Fail the
+            # run so monitoring sees it; the keepalive's crash cooldown keeps
+            # the retries sparse.
+            raise RuntimeError(
+                "WhatsApp client never connected during its run window. Check the logs above: "
+                "'Client outdated (405)' means the pinned neonize/whatsmeow version needs a bump; "
+                "a removed linked device needs a QR re-pair."
+            )
         self._logger.info("WhatsApp client summary: %s", self._totals)
         return dict(self._totals)
 
@@ -226,15 +220,34 @@ class WhatsAppClientRunner:
             len(records.contacts),
         )
 
-    def _register_ignored_events(self, client, event_to_int: dict[type[Any], int]) -> None:
-        # neonize dispatches with self.list_func[code], so every possible event
-        # needs a handler even if the warehouse does not care about it.
-        for event_type, code in event_to_int.items():
-            if code not in client.event.list_func:
-                client.event(event_type)(self._on_ignored_event)
+    def _register_event_handlers(self, client) -> None:
+        """Subscribe ONLY the events the warehouse consumes.
 
-    def _on_ignored_event(self, _client, _event) -> None:
-        return None
+        Never subscribe to everything: goneonize marshals KeepAliveRestored,
+        StreamReplaced, and ClientOutdated as empty protos, and its
+        getBytesAndSize panics on a zero-byte marshal, SIGABRT-ing the whole
+        process. Go only marshals events that have a subscriber, so leaving
+        those unsubscribed is what keeps a "client outdated" rejection or a
+        keep-alive blip from killing the client. (neonize 0.4 dispatches with
+        ``list_func.get`` and skips missing handlers, so unsubscribed events
+        are simply dropped.)
+        """
+        from neonize.events import (
+            ConnectedEv,
+            HistorySyncEv,
+            LoggedOutEv,
+            MessageEv,
+            OfflineSyncCompletedEv,
+            PairStatusEv,
+        )
+
+        client.event.qr(self._on_qr)
+        client.event(ConnectedEv)(self._on_connected)
+        client.event(PairStatusEv)(self._on_pair_status)
+        client.event(LoggedOutEv)(self._on_logged_out)
+        client.event(OfflineSyncCompletedEv)(self._on_offline_sync_completed)
+        client.event(MessageEv)(self._on_message)
+        client.event(HistorySyncEv)(self._on_history_sync)
 
     def _downloader(self, client) -> Callable[[Any], bytes | None]:
         def download(e2e_message) -> bytes | None:

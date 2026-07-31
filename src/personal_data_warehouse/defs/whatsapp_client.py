@@ -15,6 +15,8 @@ WHATSAPP_CLIENT_ENABLED=0 when the client needs to be paused.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from dagster import (
@@ -23,6 +25,7 @@ from dagster import (
     MaterializeResult,
     MetadataValue,
     RunRequest,
+    RunsFilter,
     SkipReason,
     asset,
     define_asset_job,
@@ -38,6 +41,52 @@ from personal_data_warehouse.warehouse import warehouse_from_settings
 
 WHATSAPP_CLIENT_POSTGRES_LOCK_ID = 8_407_112_442
 WHATSAPP_CLIENT_SENSOR_INTERVAL_SECONDS = 60
+# After this many consecutive failed runs the keepalive waits out a cooldown
+# before relaunching. A crash-looping client (native panic, bad session, an
+# outdated pinned client version) otherwise produces a red run every ~60s —
+# ~3k failed runs over 2.5 days in 2026-07 — while burying real signal.
+WHATSAPP_CLIENT_CRASH_STREAK = 3
+WHATSAPP_CLIENT_CRASH_COOLDOWN_SECONDS = 900
+
+
+def whatsapp_crash_backoff_skip(
+    finished_runs: Sequence[tuple[str, float | None]],
+    *,
+    now: float,
+    streak: int = WHATSAPP_CLIENT_CRASH_STREAK,
+    cooldown_seconds: float = WHATSAPP_CLIENT_CRASH_COOLDOWN_SECONDS,
+) -> SkipReason | None:
+    """Skip while the newest ``streak`` finished runs are all failures.
+
+    ``finished_runs`` is newest-first ``(status, end_time_epoch)``. Returns
+    ``None`` (launch) once the newest failure is older than the cooldown, so a
+    persistent crash still retries a few times an hour and self-heals the
+    moment a run succeeds.
+    """
+    if len(finished_runs) < streak:
+        return None
+    window = list(finished_runs[:streak])
+    if any(status != "FAILURE" for status, _end in window):
+        return None
+    newest_end = max((end for _status, end in window if end is not None), default=None)
+    if newest_end is None:
+        return None
+    remaining = cooldown_seconds - (now - newest_end)
+    if remaining <= 0:
+        return None
+    return SkipReason(
+        f"whatsapp_client_job failed {streak} consecutive runs; in crash cooldown for another "
+        f"{int(remaining)}s before relaunching. Check the newest whatsapp_client run logs — "
+        "'Client outdated (405)' means the pinned neonize/whatsmeow version needs a bump."
+    )
+
+
+def _finished_client_runs(instance) -> list[tuple[str, float | None]]:
+    records = instance.get_run_records(
+        filters=RunsFilter(job_name="whatsapp_client_job"),
+        limit=WHATSAPP_CLIENT_CRASH_STREAK,
+    )
+    return [(record.dagster_run.status.value, record.end_time) for record in records]
 
 
 def _whatsapp_object_store(settings):
@@ -155,6 +204,10 @@ def whatsapp_client_keepalive_sensor(context):
             "WhatsApp client is disabled by WHATSAPP_CLIENT_ENABLED=0; unset it or set "
             "WHATSAPP_CLIENT_ENABLED=1 to start it."
         )
+
+    crash_skip = whatsapp_crash_backoff_skip(_finished_client_runs(context.instance), now=time.time())
+    if crash_skip is not None:
+        return crash_skip
 
     # The client writes directly to object storage (Drive). load_settings above
     # already raises (-> SkipReason) when the Drive folder/account is missing, so

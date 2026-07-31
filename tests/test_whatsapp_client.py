@@ -7,6 +7,8 @@ import json
 import sqlite3
 import warnings
 
+import pytest
+
 from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
 from personal_data_warehouse.ingest_client import CLOUDFLARE_MAX_BODY_BYTES
 from personal_data_warehouse.objectstore import ObjectListing
@@ -148,22 +150,22 @@ class FakeClient:
 
 
 class FakeEventRegistry:
+    """Mirrors neonize's Event registry: __call__ registers by EVENT_TO_INT code."""
+
     def __init__(self) -> None:
-        self.list_func = {1: lambda _client, _event: None}
+        self.list_func: dict[int, object] = {}
+        self.qr_callbacks: list[object] = []
 
     def __call__(self, event_type):
+        from neonize.events import EVENT_TO_INT
+
         def register(callback):
-            self.list_func[event_type.code] = callback
+            self.list_func[EVENT_TO_INT[event_type]] = callback
 
         return register
 
-
-class AlreadyRegisteredEvent:
-    code = 1
-
-
-class MissingEvent:
-    code = 2
+    def qr(self, callback) -> None:
+        self.qr_callbacks.append(callback)
 
 
 def message_event(
@@ -259,7 +261,23 @@ def test_postgres_session_store_imports_and_restores_sqlite_snapshot(tmp_path) -
         restored.close()
 
 
-def test_client_registers_noop_handlers_for_unhandled_neonize_events(tmp_path) -> None:
+def test_client_never_subscribes_empty_marshal_neonize_events(tmp_path) -> None:
+    # goneonize marshals KeepAliveRestored (5), StreamReplaced (7), and
+    # ClientOutdated (10) as EMPTY protos, and its getBytesAndSize panics on a
+    # zero-byte marshal (&data[0] on an empty slice) — killing the whole
+    # process with SIGABRT. Go only marshals events with a subscriber, so the
+    # fix is to never subscribe to them: the register-everything workaround for
+    # neonize 0.3's KeyError dispatcher (removed with the 0.4 upgrade; 0.4
+    # dispatches with list_func.get and skips missing handlers) subscribed all
+    # events and crash-looped production for days when WhatsApp outdated the
+    # pinned client version.
+    from neonize.events import (
+        EVENT_TO_INT,
+        ClientOutdatedEv,
+        KeepAliveRestoredEv,
+        StreamReplacedEv,
+    )
+
     client = FakeClient()
     runner = WhatsAppClientRunner(
         account="zach@example.com",
@@ -269,16 +287,55 @@ def test_client_registers_noop_handlers_for_unhandled_neonize_events(tmp_path) -
         logger=FakeLogger(),
     )
 
-    runner._register_ignored_events(  # noqa: SLF001 - guards neonize dispatcher behavior.
-        client,
-        {
-            AlreadyRegisteredEvent: AlreadyRegisteredEvent.code,
-            MissingEvent: MissingEvent.code,
-        },
+    runner._register_event_handlers(client)  # noqa: SLF001 - guards the subscription set.
+
+    subscribed = set(client.event.list_func)
+    for empty_marshal_event in (KeepAliveRestoredEv, StreamReplacedEv, ClientOutdatedEv):
+        assert EVENT_TO_INT[empty_marshal_event] not in subscribed
+    # The handlers the warehouse actually consumes stay subscribed.
+    from neonize.events import (
+        ConnectedEv,
+        HistorySyncEv,
+        LoggedOutEv,
+        MessageEv,
+        OfflineSyncCompletedEv,
+        PairStatusEv,
     )
 
-    assert sorted(client.event.list_func) == [1, 2]
-    assert client.event.list_func[2](client, object()) is None
+    for handled_event in (
+        ConnectedEv,
+        PairStatusEv,
+        LoggedOutEv,
+        OfflineSyncCompletedEv,
+        MessageEv,
+        HistorySyncEv,
+    ):
+        assert EVENT_TO_INT[handled_event] in subscribed
+    assert client.event.qr_callbacks, "QR callback must stay registered for pairing"
+
+
+def test_run_fails_loud_when_client_never_connects(tmp_path, monkeypatch) -> None:
+    # A client that cannot connect (rejected client version, dead pairing)
+    # otherwise completes its run window as a hollow SUCCESS with zero
+    # activity — a silent freeze the keepalive would relaunch forever. The
+    # window must end red so monitoring sees it.
+    import neonize.client as neonize_client
+
+    fake = FakeClient()
+    fake.connect = lambda *args, **kwargs: None  # returns without ConnectedEv
+    monkeypatch.setattr(neonize_client, "NewClient", lambda *args, **kwargs: fake)
+
+    runner = WhatsAppClientRunner(
+        account="zach@example.com",
+        session_path=tmp_path / "session.sqlite",
+        object_store=FakeObjectStore(),
+        upload_state=None,
+        logger=FakeLogger(),
+        flush_interval_seconds=1,
+    )
+
+    with pytest.raises(RuntimeError, match="never connected"):
+        runner.run()
 
 
 def test_write_qr_artifacts_creates_refreshing_pairing_page(tmp_path) -> None:
