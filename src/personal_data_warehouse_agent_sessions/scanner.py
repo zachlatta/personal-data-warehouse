@@ -64,6 +64,12 @@ def _discover_claude_code(root: Path | str | None) -> list[SessionFile]:
     for path in base.rglob("*.jsonl"):
         if not path.is_file():
             continue
+        # journal.jsonl is Claude Code's journal feature, not a session
+        # transcript; shipping it created a fake session_id='journal' session
+        # in the rollups. Real transcripts are "<uuid>.jsonl" or
+        # "agent-<hex>.jsonl" (subagent sidechains).
+        if path.name == "journal.jsonl":
+            continue
         files.append(SessionFile(tool=CLAUDE_CODE_TOOL, session_id=claude_session_id(path), path=path))
     return files
 

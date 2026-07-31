@@ -64,6 +64,9 @@ def test_discover_finds_both_tools_and_ignores_wakatime(tmp_path: Path) -> None:
     proj.mkdir(parents=True)
     (proj / "sess-a.jsonl").write_text("{}\n")
     (proj / "sess-a.jsonl.wakatime").write_text("ignore me")
+    # journal.jsonl is Claude Code's journal feature, not a session transcript;
+    # it shipped as a fake session_id='journal' session until excluded here.
+    (proj / "journal.jsonl").write_text("{}\n")
     codex_dir = tmp_path / "codex" / "2026" / "06" / "14"
     codex_dir.mkdir(parents=True)
     (codex_dir / "rollout-2026-06-14T13-16-17-019ec722-5a03-7980-bd45-f34ba5bd9502.jsonl").write_text("{}\n")
