@@ -1358,6 +1358,7 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     index_names = _index_names(warehouse, "slack_messages")
     assert "slack_messages_recent_scope_time_idx" in index_names
     assert "slack_messages_recent_thread_time_idx" in index_names
+    assert "slack_messages_thread_parents_idx" in index_names
     assert "slack_messages_user_time_idx" in index_names
     assert "slack_messages_time_idx" in index_names
     # Raw-table text search is retired: message text is searched through the
@@ -3283,6 +3284,65 @@ def test_postgres_slack_thread_missing_replies_filter_ignores_tombstones(
     assert "AND r.is_thread_reply = 1" in str(captured["sql"])
     assert "ORDER BY m.message_datetime ASC, m.message_ts ASC" in str(captured["sql"])
     assert captured["params"] == ("zrl", "T1", 5)
+
+
+def test_postgres_slack_thread_parent_refs_bound_since_on_indexed_datetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The numeric message_ts cutoff cannot use an index (it is an expression on
+    # a text column), so the candidate query seq-scanned all 42M messages —
+    # ~46 GB of buffer reads every ~5 minutes in production. The equivalent
+    # message_datetime bound lets the thread-parents partial index range-scan
+    # and stop at the cutoff.
+    warehouse = object.__new__(PostgresWarehouse)
+    captured: dict[str, object] = {}
+
+    def fake_query(sql, params=None):
+        captured["sql"] = sql
+        captured["params"] = params
+        return []
+
+    monkeypatch.setattr(warehouse, "_query", fake_query)
+
+    warehouse.load_slack_thread_parent_refs(
+        account="zrl",
+        team_id="T1",
+        since_ts=1777000000.5,
+        limit=5,
+    )
+
+    sql = str(captured["sql"])
+    assert "m.message_datetime >= to_timestamp(%s)" in sql
+    assert captured["params"] == ("zrl", "T1", 1777000000.5, 1777000000.5, 5)
+
+
+def test_postgres_slack_thread_parent_refs_since_filters_rows(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", raw_json='{"id":"C1"}')]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="1770000000.000001",
+                message_datetime=datetime(2026, 2, 1, 12, tzinfo=UTC),
+                reply_count=1,
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="1780000000.000001",
+                message_datetime=datetime(2026, 5, 28, 12, tzinfo=UTC),
+                reply_count=1,
+            ),
+        ]
+    )
+
+    refs = warehouse.load_slack_thread_parent_refs(
+        account="zrl", team_id="T1", since_ts=1775000000.0
+    )
+
+    assert [ref["thread_ts"] for ref in refs] == ["1780000000.000001"]
 
 
 def test_postgres_slack_thread_parent_refs_exclude_gone_conversations(

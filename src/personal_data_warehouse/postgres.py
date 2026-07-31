@@ -864,6 +864,19 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS slack_messages_thread_idx ON @slack_messages (account, team_id, conversation_id, thread_ts)",
     ),
     IndexSpec(
+        # Thread-backfill candidate selection: only ~1.3M of 42M messages are
+        # live thread parents, and without this partial index the candidate
+        # query seq-scanned the whole 46 GB heap every ~5 minutes (the single
+        # largest query cost in production, and a page-cache thrasher for
+        # everything else). Ordered to serve the recent-first ORDER BY with an
+        # early-stopping range scan.
+        "slack_messages_thread_parents_idx",
+        "slack_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_thread_parents_idx "
+        "ON @slack_messages (account, team_id, message_datetime DESC, message_ts DESC) "
+        "WHERE is_deleted = 0 AND is_thread_reply = 0 AND reply_count > 0",
+    ),
+    IndexSpec(
         "slack_conversations_scope_idx",
         "slack_conversations",
         "CREATE INDEX IF NOT EXISTS slack_conversations_scope_idx ON @slack_conversations (account, team_id, conversation_type)",
@@ -6620,6 +6633,13 @@ class PostgresWarehouse:
         params: list[Any] = [account, team_id]
         if since_ts is not None:
             where.append(_numeric_ts("m.message_ts") + " >= %s")
+            params.append(since_ts)
+            # Same cutoff on the indexed timestamp column: the numeric
+            # message_ts expression cannot use an index, and without this bound
+            # the query seq-scanned the whole messages heap (~46 GB of buffer
+            # reads every ~5 minutes in production). message_datetime is
+            # derived from message_ts, so the two predicates agree.
+            where.append("m.message_datetime >= to_timestamp(%s)")
             params.append(since_ts)
         if skip_known_errors:
             # Terminally-gone threads (deleted parent, dead channel) are never
