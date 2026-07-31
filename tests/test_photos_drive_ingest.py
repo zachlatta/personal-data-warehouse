@@ -19,6 +19,7 @@ from personal_data_warehouse.photos_drive_ingest import (
     metadata_to_row,
     parse_captured_at,
     photo_source_table,
+    promote_payload,
 )
 
 
@@ -209,6 +210,19 @@ def test_runner_writes_rows_and_promotes_inbox_objects() -> None:
         ("file-1", "photos/library/2026/06/2026-06-01-filesha.heic"),
         ("meta-1", "photos/library/2026/06/2026-06-01-dedupsha.json"),
     ]
+
+
+def test_promote_payload_fails_loud_when_storage_key_missing() -> None:
+    # A listing without a storage key (e.g. a backend that cannot resolve the
+    # object's path) must not silently skip promotion: that exact silence made
+    # every photos ingest run re-process the full inbox forever in production.
+    payload = attach_storage_context(
+        envelope(),
+        metadata_listing=_listing("", "meta-1"),
+        file_listing=_listing("", "file-1"),
+    )
+    with pytest.raises(ValueError, match="no storage key"):
+        promote_payload(FakeObjectStore(), payload)
 
 
 def test_runner_promotes_only_metadata_when_blob_already_in_library() -> None:

@@ -114,6 +114,10 @@ class GoogleDriveObjectStore:
         self._service = service
         self._max_attempts = max_attempts
         self._folder_cache: dict[tuple[str, str], str] = {}
+        # folder id -> (name, parent id), for reconstructing object keys from a
+        # listing's parent chain. Folders never move in this layout, so a
+        # per-store cache is safe.
+        self._folder_meta_cache: dict[str, tuple[str, str]] = {}
         self._source = source
         self._legacy_sources = legacy_sources
         self._audio_kind = audio_kind
@@ -355,7 +359,7 @@ class GoogleDriveObjectStore:
                     q=query,
                     pageSize=1000,
                     pageToken=token,
-                    fields="nextPageToken,files(id,name,webViewLink,appProperties)",
+                    fields="nextPageToken,files(id,name,webViewLink,appProperties,parents)",
                     supportsAllDrives=True,
                     includeItemsFromAllDrives=True,
                 )
@@ -382,7 +386,7 @@ class GoogleDriveObjectStore:
             .list(
                 q=query,
                 pageSize=1,
-                fields="files(id,name,webViewLink,appProperties)",
+                fields="files(id,name,webViewLink,appProperties,parents)",
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
             )
@@ -472,13 +476,67 @@ class GoogleDriveObjectStore:
         return ObjectListing(
             ref={
                 "storage_backend": self.backend,
-                "storage_key": "",
+                "storage_key": self._object_key_for_file(file),
                 "storage_file_id": str(file.get("id", "")),
                 "storage_url": str(file.get("webViewLink", "")),
             },
             app_properties=normalized,
             filename=str(file.get("name", "")),
         )
+
+    def _object_key_for_file(self, file: dict[str, Any]) -> str:
+        """Reconstruct the object key from the file's Drive parent chain.
+
+        Object keys map 1:1 to folder paths under the root folder (see
+        ``_ensure_parent_folder``), so ``<folder path>/<name>`` recovers the key
+        the object was written with. The Drive list API does not return paths,
+        and listings used to carry ``storage_key: ""`` — which made every
+        inbox->library promotion silently skip (the empty key never matched the
+        inbox prefix), so photos/manual-finance inboxes never drained and every
+        ingest run re-processed the full backlog forever.
+
+        Returns ``""`` when the chain cannot be resolved (orphaned file, broken
+        parent metadata) — consumers that require the key fail loudly on the
+        empty value instead of skipping.
+        """
+        name = str(file.get("name", ""))
+        parents = file.get("parents")
+        parent_id = str(parents[0]) if isinstance(parents, list) and parents else ""
+        if not name or not parent_id:
+            return ""
+        segments: list[str] = []
+        seen: set[str] = set()
+        while parent_id != self._folder_id:
+            if not parent_id or parent_id in seen or len(segments) > 32:
+                return ""
+            seen.add(parent_id)
+            folder_name, parent_id = self._folder_meta(parent_id)
+            if not folder_name:
+                return ""
+            segments.append(folder_name)
+        segments.reverse()
+        return "/".join([*segments, name])
+
+    def _folder_meta(self, folder_id: str) -> tuple[str, str]:
+        cached = self._folder_meta_cache.get(folder_id)
+        if cached is not None:
+            return cached
+        try:
+            response = self._request(
+                lambda: self._service.files()
+                .get(fileId=folder_id, fields="id,name,parents", supportsAllDrives=True)
+                .execute()
+            )
+        except HttpError as exc:
+            if _http_status(exc) == 404:
+                return "", ""
+            raise
+        response = response if isinstance(response, dict) else {}
+        parents = response.get("parents")
+        parent_id = str(parents[0]) if isinstance(parents, list) and parents else ""
+        meta = (str(response.get("name", "")), parent_id)
+        self._folder_meta_cache[folder_id] = meta
+        return meta
 
     def _download(self, file_id: str, output) -> None:
         try:

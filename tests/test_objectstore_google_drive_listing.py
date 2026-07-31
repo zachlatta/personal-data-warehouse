@@ -12,12 +12,13 @@ class FakeRequest:
 
 
 class FakeFiles:
-    def __init__(self, *, list_responses=None) -> None:
+    def __init__(self, *, list_responses=None, get_responses=None) -> None:
         self.list_calls: list[dict] = []
         self.create_calls: list[dict] = []
         self.get_calls: list[dict] = []
         self.update_calls: list[dict] = []
         self._list_responses = list(list_responses or [{"files": []}])
+        self._get_responses = dict(get_responses or {})
 
     def list(self, **kwargs):
         self.list_calls.append(kwargs)
@@ -30,7 +31,8 @@ class FakeFiles:
 
     def get(self, **kwargs):
         self.get_calls.append(kwargs)
-        return FakeRequest({"parents": ["old-parent"]})
+        response = self._get_responses.get(kwargs.get("fileId"), {"parents": ["old-parent"]})
+        return FakeRequest(response)
 
     def update(self, **kwargs):
         self.update_calls.append(kwargs)
@@ -83,6 +85,126 @@ def test_list_objects_query_uses_app_properties_not_parents() -> None:
     assert listing.ref["storage_url"] == "https://drive/f1"
     assert listing.filename == "rec.json"
     assert listing.app_properties["content_sha256"] == "abc"
+
+
+def test_list_objects_requests_parents_for_key_reconstruction() -> None:
+    files = FakeFiles(list_responses=[{"files": []}])
+    store = voice_memos_store(files)
+
+    store.list_objects(kind="voice_memo_metadata", stage="inbox")
+
+    assert "parents" in files.list_calls[0]["fields"]
+
+
+def test_find_object_requests_parents_for_key_reconstruction() -> None:
+    files = FakeFiles(list_responses=[{"files": []}])
+    store = voice_memos_store(files)
+
+    store.find_object(kind="voice_memo_audio", stage="inbox")
+
+    assert "parents" in files.list_calls[0]["fields"]
+
+
+def test_list_objects_reconstructs_storage_key_from_parent_chain() -> None:
+    files = FakeFiles(
+        list_responses=[
+            {
+                "files": [
+                    {
+                        "id": "f1",
+                        "name": "2026-07-15-abc123.pdf",
+                        "parents": ["fld-account"],
+                        "appProperties": {"pdw_kind": "manual_finance_document"},
+                    }
+                ]
+            }
+        ],
+        get_responses={
+            "fld-account": {"id": "fld-account", "name": "chase-checking-1234", "parents": ["fld-inbox"]},
+            "fld-inbox": {"id": "fld-inbox", "name": "inbox", "parents": ["fld-mf"]},
+            "fld-mf": {"id": "fld-mf", "name": "manual-finance", "parents": ["root-folder"]},
+        },
+    )
+    store = voice_memos_store(files)
+
+    listings = store.list_objects(kind="manual_finance_document", stage="inbox")
+
+    assert listings[0].ref["storage_key"] == (
+        "manual-finance/inbox/chase-checking-1234/2026-07-15-abc123.pdf"
+    )
+
+
+def test_list_objects_storage_key_for_file_directly_under_root() -> None:
+    files = FakeFiles(
+        list_responses=[
+            {"files": [{"id": "f1", "name": "top-level.json", "parents": ["root-folder"]}]}
+        ]
+    )
+    store = voice_memos_store(files)
+
+    listings = store.list_objects(kind="voice_memo_metadata", stage="")
+
+    assert listings[0].ref["storage_key"] == "top-level.json"
+    assert files.get_calls == []
+
+
+def test_list_objects_caches_folder_lookups_across_files() -> None:
+    files = FakeFiles(
+        list_responses=[
+            {
+                "files": [
+                    {"id": "f1", "name": "a.json", "parents": ["fld-batches"]},
+                    {"id": "f2", "name": "b.json", "parents": ["fld-batches"]},
+                ]
+            }
+        ],
+        get_responses={
+            "fld-batches": {"id": "fld-batches", "name": "batches", "parents": ["fld-inbox"]},
+            "fld-inbox": {"id": "fld-inbox", "name": "inbox", "parents": ["root-folder"]},
+        },
+    )
+    store = voice_memos_store(files)
+
+    listings = store.list_objects(kind="voice_memo_metadata", stage="inbox")
+
+    assert [listing.ref["storage_key"] for listing in listings] == [
+        "inbox/batches/a.json",
+        "inbox/batches/b.json",
+    ]
+    # Two distinct folders in the chain -> exactly two metadata lookups, cached
+    # for the second file.
+    assert len(files.get_calls) == 2
+
+
+def test_list_objects_leaves_storage_key_empty_when_chain_unresolvable() -> None:
+    files = FakeFiles(
+        list_responses=[
+            {"files": [{"id": "f1", "name": "orphan.json", "parents": ["fld-unknown"]}]}
+        ],
+        get_responses={"fld-unknown": {}},
+    )
+    store = voice_memos_store(files)
+
+    listings = store.list_objects(kind="voice_memo_metadata", stage="inbox")
+
+    assert listings[0].ref["storage_key"] == ""
+
+
+def test_list_objects_storage_key_survives_folder_cycles() -> None:
+    files = FakeFiles(
+        list_responses=[
+            {"files": [{"id": "f1", "name": "loop.json", "parents": ["fld-a"]}]}
+        ],
+        get_responses={
+            "fld-a": {"id": "fld-a", "name": "a", "parents": ["fld-b"]},
+            "fld-b": {"id": "fld-b", "name": "b", "parents": ["fld-a"]},
+        },
+    )
+    store = voice_memos_store(files)
+
+    listings = store.list_objects(kind="voice_memo_metadata", stage="inbox")
+
+    assert listings[0].ref["storage_key"] == ""
 
 
 def test_list_objects_paginates() -> None:

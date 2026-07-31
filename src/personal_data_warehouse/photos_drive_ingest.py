@@ -179,6 +179,14 @@ def promote_payload(object_store: ObjectStore, payload: Mapping[str, Any]) -> in
         if not stored:
             continue
         storage_key = str(stored.get("storage_key", ""))
+        if not storage_key:
+            # An empty key silently skipping the inbox-prefix check is exactly
+            # how promotion broke in production (listings without a resolvable
+            # object key), leaving the inbox to be re-ingested forever.
+            raise ValueError(
+                f"Photo {key} (file id {str(stored.get('storage_file_id', ''))!r}) has "
+                "no storage key; cannot decide inbox promotion"
+            )
         if not storage_key.startswith(INBOX_PREFIX):
             continue
         file_id = str(stored.get("storage_file_id", ""))

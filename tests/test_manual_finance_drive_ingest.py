@@ -15,6 +15,7 @@ from personal_data_warehouse.manual_finance_drive_ingest import (
     iter_metadata_payloads,
     library_storage_key,
     metadata_to_row,
+    promote_payload,
 )
 from personal_data_warehouse.objectstore import ObjectListing
 
@@ -139,6 +140,19 @@ def test_metadata_to_row_maps_envelope_and_storage_context():
     # The envelope survives losslessly minus the transient storage context.
     assert row["raw_metadata_json"]["file"]["original_path"] == "acme-checking-0001/acme-checking-2026-06.pdf"
     assert "file_object" not in row["raw_metadata_json"]
+
+
+def test_promote_payload_fails_loud_when_storage_key_missing():
+    # A listing without a storage key must not silently skip promotion: that
+    # exact silence left the manual-finance inbox re-ingested every five
+    # minutes forever in production.
+    payload = attach_storage_context(
+        envelope(),
+        metadata_listing=_listing("", "meta-1"),
+        file_listing=_listing("", "file-1"),
+    )
+    with pytest.raises(ValueError, match="no storage key"):
+        promote_payload(FakeObjectStore(), payload)
 
 
 def test_runner_ingests_and_promotes():
