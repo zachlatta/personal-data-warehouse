@@ -546,7 +546,7 @@ def test_slack_thread_sync_backfills_known_threads_conservatively(monkeypatch) -
     assert calls[0]["thread_since_days"] == 30
 
 
-def test_slack_thread_backfill_drains_missing_replies_oldest_first(monkeypatch) -> None:
+def test_slack_thread_backfill_drains_missing_replies_newest_first(monkeypatch) -> None:
     calls = []
 
     class FakeRunner:
@@ -594,9 +594,12 @@ def test_slack_thread_backfill_drains_missing_replies_oldest_first(monkeypatch) 
     assert len(summaries) == 1
     assert calls[0]["sync_thread_replies_only"] is True
     assert calls[0]["thread_missing_replies_only"] is True
-    # Oldest-first so the historical backlog actually drains instead of churning
-    # the same recent threads, and large enough to use the full rate-limit budget.
-    assert calls[0]["thread_order"] == "oldest"
+    # Newest-first: missing_replies_only makes each processed thread leave the
+    # candidate set, so there is no churn either way — but ordering matters for
+    # which gap closes first. Oldest-first left 35k+ threads from the last 90
+    # days (450k+ replies) unfetched in production while the walker ground
+    # through years-old history; recent threads are what queries actually hit.
+    assert calls[0]["thread_order"] == "recent"
     assert calls[0]["thread_limit"] == 100
     assert calls[0]["skip_completed_threads"] is True
     assert calls[0]["skip_known_errors"] is True

@@ -200,8 +200,14 @@ def run_slack_thread_backfill_sync(*, settings, warehouse, logger) -> list[Slack
         sync_thread_replies_only=True,
         skip_completed_threads=True,
         skip_known_errors=True,
-        thread_order=os.getenv("SLACK_ASSET_THREAD_BACKFILL_ORDER", "oldest"),
-        # Drain the historical backlog of parents whose replies were never fetched.
+        # Newest-first. missing_replies_only means every processed thread drops
+        # out of the candidate set, so ordering only decides which gap closes
+        # first — and oldest-first left 35k+ threads from the last 90 days
+        # (450k+ replies) unfetched in production while the walker ground
+        # through years-old history. Recent threads are what timeline queries
+        # actually hit; the historical tail still drains after them.
+        thread_order=os.getenv("SLACK_ASSET_THREAD_BACKFILL_ORDER", "recent"),
+        # Drain the backlog of parents whose replies were never fetched.
         # At 5/run this would take years; 100/run lets each pass use its full
         # rate-limit budget (it aborts gracefully when the budget is hit, so this is
         # an upper bound, not a guarantee of 100 replies per run).
