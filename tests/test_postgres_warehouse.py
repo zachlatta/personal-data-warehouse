@@ -1390,6 +1390,53 @@ def test_postgres_slack_messages_set_autovacuum_storage_parameters(warehouse: Po
     assert "autovacuum_vacuum_threshold=100000" in reloptions
 
 
+def test_postgres_ensure_skips_repeat_ddl_when_already_applied(warehouse: PostgresWarehouse, monkeypatch) -> None:
+    # ensure_* runs on every Dagster run; unconditional ALTERs take an ACCESS
+    # EXCLUSIVE lock on hot tables each time (~2.3k repeats of the timeline
+    # ALTERs in one prod stats window, ~2s of DDL per sync run on a 45 GB
+    # table). Once the defaults/options are in place, re-ensuring must not
+    # re-run them.
+    warehouse.ensure_timeline_tables()
+    warehouse.ensure_slack_tables()
+
+    executed: list[str] = []
+    original_command = PostgresWarehouse._command
+
+    def recording_command(self, sql, params=None):
+        executed.append(" ".join(str(sql).split()))
+        return original_command(self, sql, params)
+
+    monkeypatch.setattr(PostgresWarehouse, "_command", recording_command)
+
+    warehouse.ensure_timeline_tables()
+    warehouse.ensure_slack_tables()
+
+    repeat_ddl = [
+        sql
+        for sql in executed
+        if "ALTER COLUMN" in sql
+        or "CREATE SEQUENCE" in sql
+        or (sql.startswith("ALTER TABLE") and " SET (" in sql)
+    ]
+    assert repeat_ddl == []
+
+    # The defaults the skipped DDL maintains really are in place.
+    rel = _physical_relation(warehouse, "timeline_events")
+    rows = warehouse._query(
+        """
+        SELECT column_name, column_default
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+          AND column_name IN ('seq', 'first_seen_at', 'updated_at')
+        """,
+        (rel.schema, rel.name),
+    )
+    defaults = {row[0]: str(row[1] or "") for row in rows}
+    assert "nextval" in defaults["seq"]
+    assert defaults["first_seen_at"].startswith("now()")
+    assert defaults["updated_at"].startswith("now()")
+
+
 def test_postgres_ensure_indexes_drops_obsolete_indexes(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_slack_tables()
     # Recreate the legacy partial index out-of-band, simulating an existing deployment

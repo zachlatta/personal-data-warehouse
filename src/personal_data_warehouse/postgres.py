@@ -2531,11 +2531,18 @@ class PostgresWarehouse:
         # install _postgres_type builds the priority column as this type.
         self._ensure_timeline_priority_type()
         self._ensure_table_group(["timeline_events", "timeline_sync_state"])
+        # These ALTERs run under an ACCESS EXCLUSIVE lock on a 45+ GB table and
+        # ensure_timeline_tables runs on every timeline sync (~288/day in
+        # prod), so each is gated on the current catalog state instead of
+        # re-issued unconditionally.
         sequence_ref = self.sql_relation("timeline_events_seq")
-        self._command("CREATE SEQUENCE IF NOT EXISTS @timeline_events_seq")
-        self._command(f"ALTER TABLE @timeline_events ALTER COLUMN seq SET DEFAULT nextval('{sequence_ref}')")
-        self._command("ALTER TABLE @timeline_events ALTER COLUMN first_seen_at SET DEFAULT now()")
-        self._command("ALTER TABLE @timeline_events ALTER COLUMN updated_at SET DEFAULT now()")
+        defaults = self._column_defaults("timeline_events")
+        if not self._default_uses_sequence(defaults.get("seq", ""), sequence_ref):
+            self._command("CREATE SEQUENCE IF NOT EXISTS @timeline_events_seq")
+            self._command(f"ALTER TABLE @timeline_events ALTER COLUMN seq SET DEFAULT nextval('{sequence_ref}')")
+        for column in ("first_seen_at", "updated_at"):
+            if not defaults.get(column, "").startswith("now()"):
+                self._command(f"ALTER TABLE @timeline_events ALTER COLUMN {column} SET DEFAULT now()")
         # Addresses Zach has ever written to, with counts — the relationship
         # signal the gmail adapter's known-correspondent rule reads. Refreshed
         # by TimelineSyncEngine at most once per day.
@@ -5025,9 +5032,58 @@ class PostgresWarehouse:
             """
         )
         if spec.storage_parameters:
-            settings = ", ".join(f"{key} = {value}" for key, value in spec.storage_parameters)
-            self._command(f"ALTER TABLE {self.sql_relation(table)} SET ({settings})")
+            # ensure_* runs on every Dagster run, and ALTER TABLE ... SET takes
+            # an ACCESS EXCLUSIVE lock even when it changes nothing — ~2.3k
+            # no-op repeats on timeline.events in one prod stats window. Only
+            # run it when an option is actually missing or different.
+            desired = {f"{key}={value}" for key, value in spec.storage_parameters}
+            if not desired <= self._table_reloptions(table):
+                settings = ", ".join(f"{key} = {value}" for key, value in spec.storage_parameters)
+                self._command(f"ALTER TABLE {self.sql_relation(table)} SET ({settings})")
         self._apply_catalog_grant(table)
+
+    def _table_reloptions(self, table: str) -> set[str]:
+        rel = canonical_relation(table).with_namespace(self._schema)
+        rows = self._query(
+            """
+            SELECT unnest(c.reloptions)
+            FROM pg_class AS c
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = %s
+            """,
+            (rel.schema, rel.name),
+        )
+        return {str(row[0]) for row in rows}
+
+    def _column_defaults(self, table: str) -> dict[str, str]:
+        rel = canonical_relation(table).with_namespace(self._schema)
+        rows = self._query(
+            """
+            SELECT column_name, column_default
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            """,
+            (rel.schema, rel.name),
+        )
+        return {str(row[0]): str(row[1] or "") for row in rows}
+
+    def _default_uses_sequence(self, column_default: str, sequence_ref: str) -> bool:
+        """Does this column default draw from exactly this sequence?
+
+        Postgres renders a stored ``nextval`` default with or without the
+        schema qualifier depending on the connection's search_path, so a text
+        comparison is unreliable (the unqualified-name trap behind the 07-25
+        search_text outage). Resolve both names through ``to_regclass`` on the
+        same connection and compare identities instead.
+        """
+        match = re.match(r"nextval\('(.+)'::regclass\)$", column_default)
+        if match is None:
+            return False
+        rows = self._query(
+            "SELECT to_regclass(%s) IS NOT NULL AND to_regclass(%s) = to_regclass(%s)",
+            (match.group(1), match.group(1), sequence_ref),
+        )
+        return bool(rows and rows[0][0])
 
     def _apply_catalog_grant(self, logical_name: str) -> None:
         """Grant a hidden-schema object the exact access the catalog allows.
