@@ -302,7 +302,11 @@ def test_candidates_and_retry_cap(warehouse):
         object_store_factory=lambda: FakeObjectStore(b""),
         logger=Logger(),
         provider="codex",
-        now=lambda: _TS,
+        # The unreadable-exclusion window compares against the DATABASE's
+        # now(), so this failure must be recorded at wall-clock time — a fixed
+        # historical _TS ages out of the window and the test becomes a time
+        # bomb (it detonated 14 days after _TS, on 2026-07-27).
+        now=lambda: datetime.now(tz=UTC),
     )
     # A permanent input-prep failure (UNREADABLE) excludes without any agent run.
     runner._record_failure(warehouse, _document_row(), error="corrupt pdf", status=STATUS_UNREADABLE)
