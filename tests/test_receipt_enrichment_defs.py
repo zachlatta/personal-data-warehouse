@@ -27,6 +27,17 @@ class FakeResult:
         self.events = [
             {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 10}}
         ]
+        # Fields agent_run_row() persists into ops.ai_processing_agent_runs.
+        self.run_id = "agent-test"
+        self.provider = "codex"
+        self.model = "gpt-5.6-terra"
+        self.task_type = "receipt_transaction_match"
+        self.subject_id = "ft_1"
+        self.prompt_version = PROMPT_VERSION
+        self.status = "completed" if exit_code == 0 else "error"
+        self.input_sha256 = ""
+        self.started_at = NOW
+        self.completed_at = NOW
 
 
 class FakeAgent:
@@ -49,9 +60,13 @@ class FakeWarehouse:
         self.rows = []
         self.queries = []
         self.ensured = False
+        self.agent_runs = []
 
     def ensure_receipt_tables(self):
         self.ensured = True
+
+    def ensure_agent_tables(self):
+        pass
 
     def _query_dicts(self, sql, params=None):
         self.queries.append((sql, params))
@@ -62,6 +77,9 @@ class FakeWarehouse:
 
     def insert_receipt_transaction_receipts(self, rows):
         self.rows.extend(rows)
+
+    def insert_agent_runs(self, rows):
+        self.agent_runs.extend(rows)
 
 
 def _transaction(transaction_id="ft_1", **overrides):
@@ -151,6 +169,21 @@ def test_worklist_is_recent_posted_transactions_not_artifacts():
     assert "clean_photos" not in candidate_sql
     assert "gmail_messages" not in candidate_sql
     assert "receipt_triage" not in candidate_sql
+
+
+def test_agent_runs_are_recorded_for_monitoring():
+    # Every other agent-backed enrichment persists its runs into
+    # ops.ai_processing_agent_runs; receipts silently didn't, so 197 decisions
+    # over weeks were invisible to the shared agent-run failure monitoring.
+    warehouse = FakeWarehouse({"FROM @finance_transactions AS t": [_transaction()]})
+
+    _runner(warehouse, FakeAgent(_found_result())).sync()
+
+    assert len(warehouse.agent_runs) == 1
+    run = warehouse.agent_runs[0]
+    assert run["task_type"] == "receipt_transaction_match"
+    assert run["subject_id"] == "ft_1"
+    assert run["status"] == "completed"
 
 
 def test_one_pdw_agent_operation_per_transaction():

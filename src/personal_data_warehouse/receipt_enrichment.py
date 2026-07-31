@@ -685,6 +685,19 @@ class ReceiptEnrichmentRunner:
                     claimed[source].add(native_id)
         return claimed
 
+    def _record_agent_result(self, result) -> None:
+        """Persist the agent run into ops.ai_processing_agent_runs.
+
+        Every other agent-backed enrichment records its runs there; receipts
+        silently didn't, leaving weeks of decisions invisible to the shared
+        agent-run failure monitoring. Run row only — receipt decisions carry
+        their own audit trail in derived_finance.transaction_receipts.
+        """
+        from personal_data_warehouse.agent_runner import agent_run_row
+
+        self._warehouse.ensure_agent_tables()
+        self._warehouse.insert_agent_runs([agent_run_row(result)])
+
     def _known_evidence(self, result: Mapping[str, Any]) -> set[tuple[str, str]]:
         known: set[tuple[str, str]] = set()
         for source, native_ids in self._claimed_evidence(result).items():
@@ -725,6 +738,7 @@ class ReceiptEnrichmentRunner:
             )
             started = time.monotonic()
             result = self._agent.run_with_pdw(request)
+            self._record_agent_result(result)
             merge_usage(usage, usage_from_events(result.events))
             if result.exit_code != 0:
                 self._log.warning(
