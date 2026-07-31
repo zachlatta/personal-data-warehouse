@@ -345,6 +345,55 @@ def test_sync_refreshes_account_fields_but_preserves_identity(warehouse):
     assert rows == [(created[0][0], "Premium Checking", created[0][1])]
 
 
+def test_sync_skips_daily_balances_for_action_required_items(warehouse):
+    # Plaid keeps serving the LAST-KNOWN balance for an Item whose login died
+    # (Capital One returned NO_ACCOUNTS for 13 days while base_plaid.accounts
+    # still carried its final pre-death balances). Re-stamping those frozen
+    # numbers as fresh daily observations made net worth look current when it
+    # was not — a dead item's accounts must simply stop accruing observations
+    # until the re-link, so the last honest as_of shows through.
+    warehouse.ensure_plaid_tables()
+    warehouse.insert_plaid_items(
+        [
+            _plaid_item_row(),
+            _plaid_item_row(item_id="item-dead", institution_id="ins_2", institution_name="Dead Bank"),
+        ]
+    )
+    warehouse.insert_plaid_accounts(
+        [
+            _plaid_account_row(),
+            _plaid_account_row(
+                item_id="item-dead",
+                account_id="acc-dead",
+                name="Dead Card",
+                mask="9999",
+                type="credit",
+                subtype="credit card",
+            ),
+        ]
+    )
+    warehouse.insert_plaid_sync_state(
+        account="z@x.test",
+        item_id="item-dead",
+        product="accounts",
+        status="action_required",
+        error="NO_ACCOUNTS: no valid accounts were found for this item",
+        last_synced_at=_TS,
+        updated_at=_TS,
+    )
+
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    # Both ledger accounts exist (identity keeps working for the re-link)...
+    assert summary.accounts_seen == 2
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(2,)]
+    # ...but only the healthy item's account got today's balance observation.
+    assert summary.observations_upserted == 1
+    healthy = stable_finance_account_id("plaid", "z@x.test", "acc-1")
+    observations = warehouse._query("SELECT DISTINCT account_id FROM @finance_observations")
+    assert observations == [(healthy,)]
+
+
 def test_sync_skips_removed_plaid_accounts(warehouse):
     _seed_plaid(
         warehouse,

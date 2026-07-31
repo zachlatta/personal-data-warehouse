@@ -213,6 +213,13 @@ class FinanceLedgerRunner:
 
         # --- plaid accounts + daily balance observations -----------------------
         plaid_accounts = self._load_plaid_accounts()
+        # A dead Item (action_required: login expired, NO_ACCOUNTS, ...) stops
+        # updating base_plaid.accounts, but the last-known balances stay in
+        # place. Re-stamping them as fresh daily observations would present
+        # week-old numbers as current in net worth — so a dead item's accounts
+        # stop accruing observations until the re-link, leaving the last honest
+        # as_of visible.
+        frozen_items = self._load_action_required_item_ids()
         plaid_links = self._load_links(LEDGER_SOURCE_PLAID)
         account_rows: list[dict[str, Any]] = []
         link_rows: list[dict[str, Any]] = []
@@ -264,6 +271,16 @@ class FinanceLedgerRunner:
                     "sync_version": sync_version,
                 }
             )
+            if (row["account"], row["item_id"]) in frozen_items:
+                self._logger.warning(
+                    "Skipping daily balance for %s (%s ****%s): its Plaid item is "
+                    "action_required, so the source balance is frozen at its last "
+                    "pre-failure value",
+                    account_id,
+                    row["institution_name"],
+                    row["mask"],
+                )
+                continue
             observation_rows.append(
                 {
                     "account_id": account_id,
@@ -860,8 +877,8 @@ class FinanceLedgerRunner:
     def _load_plaid_accounts(self) -> list[dict[str, Any]]:
         return self._warehouse._query_dicts(
             """
-            SELECT a.account, a.account_id, a.name, a.official_name, a.mask,
-                   a.type, a.subtype, a.current_balance, a.iso_currency_code,
+            SELECT a.account, a.item_id, a.account_id, a.name, a.official_name,
+                   a.mask, a.type, a.subtype, a.current_balance, a.iso_currency_code,
                    COALESCE(i.institution_name, '') AS institution_name
             FROM @plaid_accounts a
             LEFT JOIN @plaid_items i
@@ -870,6 +887,16 @@ class FinanceLedgerRunner:
             ORDER BY a.account, a.account_id
             """
         )
+
+    def _load_action_required_item_ids(self) -> set[tuple[str, str]]:
+        rows = self._warehouse._query(
+            """
+            SELECT DISTINCT account, item_id
+            FROM @plaid_sync_state
+            WHERE status = 'action_required'
+            """
+        )
+        return {(str(row[0]), str(row[1])) for row in rows}
 
     def _load_plaid_transactions(self) -> list[dict[str, Any]]:
         return self._warehouse._query_dicts(
