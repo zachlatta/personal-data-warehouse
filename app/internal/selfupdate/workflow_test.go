@@ -121,13 +121,13 @@ func TestWorkflowReleasesOnEveryMainCommit(t *testing.T) {
 	}
 }
 
-func TestWorkflowRunsWhenWarehouseSchemasChange(t *testing.T) {
+func TestWorkflowRunsWhenAnyAppCodeChanges(t *testing.T) {
 	body := readWorkflow(t)
-	const warehousePath = `"app/internal/warehouse/**"`
-	if strings.Count(body, warehousePath) != 2 {
+	const appPath = `"app/**"`
+	if strings.Count(body, appPath) != 2 {
 		t.Fatalf(
 			"workflow must include %s in both push and pull_request path filters",
-			warehousePath,
+			appPath,
 		)
 	}
 }

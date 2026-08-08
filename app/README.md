@@ -538,8 +538,7 @@ and tags are `pdw-cli/v*`) so that binaries installed before the `pdw-cli` →
 whatever path the running binary occupies, so it keeps the `pdw` name on disk.
 Releases are produced automatically by `.github/workflows/pdw-cli-release.yml`:
 
-- **Every push to `main`** that touches `app/**` (CLI, client, selfupdate,
-  shared `tool`/`api`/`auth` packages, or `go.mod`/`go.sum`) builds binaries
+- **Every push to `main`** that touches any file under `app/**` builds binaries
   for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64` and
   publishes a release tagged `pdw-cli/v0.0.<commit-count>-sha.<short-sha>`.
   The commit count is monotonic, so `pdw update` always sees newer

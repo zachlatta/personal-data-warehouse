@@ -8,24 +8,11 @@ on:
       - "pdw-cli/v*"
     paths:
       - ".github/workflows/pdw-cli-release.yml"
-      - "app/cmd/pdw-cli/**"
-      - "app/internal/cliclient/**"
-      - "app/internal/selfupdate/**"
-      - "app/internal/tool/**"
-      - "app/internal/api/**"
-      - "app/internal/auth/**"
-      - "app/internal/warehouse/**"
-      - "app/go.mod"
-      - "app/go.sum"
+      - "app/**"
   pull_request:
     paths:
       - ".github/workflows/pdw-cli-release.yml"
-      - "app/cmd/pdw-cli/**"
-      - "app/internal/cliclient/**"
-      - "app/internal/selfupdate/**"
-      - "app/internal/warehouse/**"
-      - "app/go.mod"
-      - "app/go.sum"
+      - "app/**"
   workflow_dispatch:
 
 permissions:
