@@ -244,23 +244,23 @@ SQL starting points:
   `clean_transcripts_no_calendar_match`
 
 General search flow for pdw clients — raw source tables serve structured predicates (keys,
-senders, time ranges, joins); **all text search goes through the `search.*` functions** over the
+senders, time ranges, joins); **all text search goes through the `timeline.*` functions in SQL** over the
 unified timeline document. Raw message/body columns are deliberately not text-indexed:
 
-- Ranked keyword search (the default): `SELECT * FROM search_text('offer letter', 50)`
+- Ranked keyword search (the default): `SELECT * FROM timeline.search_text('offer letter', 50)`
   searches the unified timeline BM25 document and returns
   `(source, subsource, context, who, occurred_at, account, ref, text, score)` ranked across
   **every** timeline source (`score` lower / more negative = better). `ref` is a
   timeline ref (`<adapter>:<event_id>`); join to `timeline.events` and then use
   `source_table`/`source_pk` for full source rows.
-- Literal substring/phrase/id search: `SELECT * FROM search_text_exact('offer letter', 50)` —
+- Literal substring/phrase/id search: `SELECT * FROM timeline.search_text_exact('offer letter', 50)` —
   the same document and hit shape, matched exactly (trigram-indexed, case-insensitive, LIKE
   wildcards treated literally), ordered by recency, with the returned text windowed around the
   first match. Use this instead of post-filtering `search_text()` output with an outer `ILIKE`
   or scanning raw body columns; needles must be at least 3 characters.
 - Both take the same optional args:
   `(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')`, with
-  `max_results` capped server-side. Call `SELECT * FROM search_text_sources()` to discover
+  `max_results` capped server-side. Call `SELECT * FROM timeline.search_text_sources()` to discover
   valid source tokens. Attachment/media enrichments, Drive extracts, transcripts, and other
   detail text are folded into the parent timeline event's `search_text` document. BM25 ranking
   is OR'd, stemmed whole-word matching, so a noisy top-N never proves absence — for "find every
@@ -428,7 +428,7 @@ callers read it once, lost it, and guessed — 70% of failed warehouse queries i
 `describe_table`, which is cheap enough to call per relation, and the overview
 now costs ~18KB.
 
-`timeline.events` keeps its columns inline, because every `search.*` result
+`timeline.events` keeps its columns inline, because every `timeline.search_text*()` result
 hands back a ref into it and a second round trip on every search is not worth
 the bytes saved.
 
@@ -501,6 +501,7 @@ go build -o /tmp/pdw ./cmd/pdw-cli
 /tmp/pdw describe sql             # title + description + input JSON Schema
 /tmp/pdw call schema_overview     # zero-input NON-SQL tool
 /tmp/pdw columns gmail.messages   # describe_table: columns + types + indexes for one relation
+/tmp/pdw sql -q 'Find offer letters' "SELECT * FROM timeline.search_text('offer letter', 50)"
 /tmp/pdw sql 'SELECT 1'                  # SQL is the only positional; defaults to CSV + an output-format note
 /tmp/pdw sql -q 'What is one?' 'SELECT 1'  # -q records the caller's intent in server logs
 /tmp/pdw sql --output json -q 'What time is it?' 'SELECT now()'

@@ -514,6 +514,27 @@ func TestSchemaErrorHint(t *testing.T) {
 			wantNone: []string{"primary time column", "conversation_id"},
 		},
 		{
+			name:     "ranked search wrong column returns the SQL function contract",
+			message:  `ERROR: column "title" does not exist (SQLSTATE 42703)`,
+			sql:      "SELECT title FROM timeline.search_text('invoice', 20)",
+			want:     []string{"source, subsource, context, who, occurred_at, account, ref, text, score", "matched preview", "timeline.events"},
+			wantNone: []string{"describe_table"},
+		},
+		{
+			name:     "exact search time guess points to occurred_at",
+			message:  `ERROR: column "event_time" does not exist (SQLSTATE 42703)`,
+			sql:      "SELECT event_time FROM timeline.search_text_exact('invoice', 20)",
+			want:     []string{"occurred_at", "timeline.search_text_exact"},
+			wantNone: []string{"each source names its primary time column"},
+		},
+		{
+			name:     "search joined to a relation does not assume which source missed",
+			message:  `ERROR: column "thread_name" does not exist (SQLSTATE 42703)`,
+			sql:      "SELECT thread_name FROM timeline.search_text('invoice', 20) hit JOIN base_slack.messages message ON true",
+			want:     []string{"describe_table"},
+			wantNone: []string{"returns exactly"},
+		},
+		{
 			name:    "wrong table name remaps slack_channels",
 			message: `ERROR: relation "slack_channels" does not exist (SQLSTATE 42P01)`,
 			sql:     "SELECT * FROM slack_channels LIMIT 1",
@@ -636,6 +657,20 @@ func TestServiceExecuteFullAppendsMissingColumnHintToError(t *testing.T) {
 	resp := svc.ExecuteFull(context.Background(), "How many recent iMessages?", sql, "csv")
 	if !strings.Contains(resp.Error, "describe_table") {
 		t.Fatalf("error = %q, want it to contain the missing-column hint", resp.Error)
+	}
+}
+
+func TestServiceExecuteFullAppendsSearchResultContractToError(t *testing.T) {
+	const sql = "SELECT title, body FROM timeline.search_text('invoice', 20)"
+	svc := NewService(fakeRunner{
+		errs: map[string]error{sql: errors.New(`ERROR: column "title" does not exist (SQLSTATE 42703)`)},
+	}, Options{MaxRows: 5, MaxFieldChars: 100})
+
+	resp := svc.ExecuteFull(context.Background(), "Which timeline events mention an invoice?", sql, "csv")
+	for _, want := range []string{"occurred_at", "ref", "text", "score"} {
+		if !strings.Contains(resp.Error, want) {
+			t.Fatalf("error = %q, want search result contract to contain %q", resp.Error, want)
+		}
 	}
 }
 

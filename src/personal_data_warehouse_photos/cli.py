@@ -13,7 +13,6 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.ingest_client import ingest_client_from_env
 from personal_data_warehouse_voice_memos.network import (
     NetworkPolicy,
-    is_transient_upload_error,
     preflight_app_ingest,
 )
 from personal_data_warehouse_photos.exporter import PHOTOS_AUTHORIZED_STATUS, PhotoKitAssetExporter
@@ -97,26 +96,20 @@ def main() -> None:
             if args.retry_failed:
                 cleared = state.clear_failures()
                 print(f"Cleared the retry backoff on {cleared} previously failed file(s)")
-            try:
-                summary = PhotosUploadRunner(
-                    account=settings.photos.account,
-                    library_path=settings.photos.library_path,
-                    ingest_client=ingest_client_from_env(),
-                    logger=logger,
-                    limit=args.limit or None,
-                    mode=args.mode,
-                    upload_state=state,
-                    before_upload_check=build_before_upload_check(
-                        preflight_timeout_seconds=preflight_timeout_seconds
-                    ),
-                ).sync()
-            finally:
-                state.close()
-    except Exception as exc:
-        if is_transient_exception(exc):
-            print(f"Photo upload skipped after transient network failure: {exc}")
-            return
-        raise
+            summary = PhotosUploadRunner(
+                account=settings.photos.account,
+                library_path=settings.photos.library_path,
+                ingest_client=ingest_client_from_env(),
+                logger=logger,
+                limit=args.limit or None,
+                mode=args.mode,
+                upload_state=state,
+                before_upload_check=build_before_upload_check(
+                    preflight_timeout_seconds=preflight_timeout_seconds
+                ),
+            ).sync()
+    finally:
+        state.close()
 
     print(
         "Photo upload complete: "
@@ -178,15 +171,6 @@ def exclusive_lock(path: Path):
             yield True
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def is_transient_exception(exc: BaseException) -> bool:
-    current: BaseException | None = exc
-    while current is not None:
-        if isinstance(current, Exception) and is_transient_upload_error(current):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 if __name__ == "__main__":

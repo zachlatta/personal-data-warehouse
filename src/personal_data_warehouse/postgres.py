@@ -2812,6 +2812,10 @@ class PostgresWarehouse:
                 published_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
                 updated_at timestamptz NOT NULL DEFAULT now(),
                 sync_version bigint NOT NULL DEFAULT 1,
+                expired_at timestamptz,
+                expired_token_sha256 text NOT NULL DEFAULT '',
+                status text NOT NULL DEFAULT 'ok',
+                error text NOT NULL DEFAULT '',
                 PRIMARY KEY (account, session_key)
             )
             """
@@ -2828,6 +2832,8 @@ class PostgresWarehouse:
         # publish (which rotates the sha) clears it automatically.
         self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_at timestamptz")
         self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_token_sha256 text NOT NULL DEFAULT ''")
+        self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'ok'")
+        self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS error text NOT NULL DEFAULT ''")
 
     def ensure_chatgpt_conversation_sync_table(self) -> None:
         """Per-conversation incremental sync watermark for the ChatGPT poller."""
@@ -2849,7 +2855,8 @@ class PostgresWarehouse:
         rows = self._query_dicts(
             """
             SELECT account, session_key, session_token, source_browser, token_sha256,
-                   published_at, updated_at, sync_version, expired_at, expired_token_sha256
+                   published_at, updated_at, sync_version, expired_at, expired_token_sha256,
+                   status, error
             FROM @chatgpt_sessions
             WHERE account = %s AND session_key = %s
             """,
@@ -2879,22 +2886,42 @@ class PostgresWarehouse:
         self._command(
             """
             UPDATE @chatgpt_sessions
-            SET expired_at = %s, expired_token_sha256 = %s
+            SET expired_at = %s,
+                expired_token_sha256 = %s,
+                status = 'action_required',
+                error = %s,
+                updated_at = %s
             WHERE account = %s AND session_key = %s AND token_sha256 = %s
             """,
-            (when, token_sha256, account, session_key, token_sha256),
+            (
+                when,
+                token_sha256,
+                "ChatGPT session expired; run `pdw chatgpt publish-session` to refresh it.",
+                when,
+                account,
+                session_key,
+                token_sha256,
+            ),
         )
 
-    def clear_chatgpt_session_expired(self, *, account: str, session_key: str) -> None:
-        """Clear a prior expiry mark after a poll succeeds (a transient 401 recovered)."""
+    def record_chatgpt_session_success(
+        self, *, account: str, session_key: str, token_sha256: str
+    ) -> None:
+        """Record a successful poll and clear health errors for that exact token."""
+        if not token_sha256:
+            return
         self.ensure_chatgpt_session_table()
         self._command(
             """
             UPDATE @chatgpt_sessions
-            SET expired_at = NULL, expired_token_sha256 = ''
-            WHERE account = %s AND session_key = %s AND expired_at IS NOT NULL
+            SET expired_at = NULL,
+                expired_token_sha256 = '',
+                status = 'ok',
+                error = '',
+                updated_at = now()
+            WHERE account = %s AND session_key = %s AND token_sha256 = %s
             """,
-            (account, session_key),
+            (account, session_key, token_sha256),
         )
 
     def upsert_chatgpt_session(

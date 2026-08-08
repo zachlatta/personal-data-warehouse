@@ -11,7 +11,6 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.ingest_client import ingest_client_from_env
 from personal_data_warehouse_voice_memos.network import (
     NetworkPolicy,
-    is_transient_upload_error,
     preflight_app_ingest,
 )
 from personal_data_warehouse_apple_notes.notes_app import ensure_notes_app_running
@@ -83,31 +82,25 @@ def main() -> None:
     workers = args.workers or int(os.getenv("APPLE_NOTES_UPLOAD_WORKERS", "4"))
     workers = max(1, workers)
 
-    try:
-        with exclusive_lock(args.lock_file) as acquired:
-            if not acquired:
-                print("Apple Notes upload skipped: another uploader run is active")
-                return
-            try:
-                summary = AppleNotesUploadRunner(
-                    account=settings.apple_notes.account,
-                    store_path=settings.apple_notes.store_path,
-                    ingest_client=ingest_client_from_env(),
-                    logger=logger,
-                    upload_state=state,
-                    mode=args.mode,
-                    limit=args.limit or None,
-                    workers=workers,
-                    state_save_callback=lambda: state.save(args.state_file),
-                    before_upload_check=build_before_upload_check(preflight_timeout_seconds=preflight_timeout_seconds),
-                ).sync()
-            finally:
-                state.save(args.state_file)
-    except Exception as exc:
-        if is_transient_exception(exc):
-            print(f"Apple Notes upload skipped after transient network failure: {exc}")
+    with exclusive_lock(args.lock_file) as acquired:
+        if not acquired:
+            print("Apple Notes upload skipped: another uploader run is active")
             return
-        raise
+        try:
+            summary = AppleNotesUploadRunner(
+                account=settings.apple_notes.account,
+                store_path=settings.apple_notes.store_path,
+                ingest_client=ingest_client_from_env(),
+                logger=logger,
+                upload_state=state,
+                mode=args.mode,
+                limit=args.limit or None,
+                workers=workers,
+                state_save_callback=lambda: state.save(args.state_file),
+                before_upload_check=build_before_upload_check(preflight_timeout_seconds=preflight_timeout_seconds),
+            ).sync()
+        finally:
+            state.save(args.state_file)
 
     print(
         "Apple Notes upload complete: "
@@ -172,15 +165,6 @@ def exclusive_lock(path: Path):
             yield True
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def is_transient_exception(exc: BaseException) -> bool:
-    current: BaseException | None = exc
-    while current is not None:
-        if isinstance(current, Exception) and is_transient_upload_error(current):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 if __name__ == "__main__":

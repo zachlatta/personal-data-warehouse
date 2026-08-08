@@ -194,7 +194,7 @@ def test_credential_store_roundtrip(warehouse):
     assert refreshed["source_browser"] == "Brave"
 
 
-def test_expiry_mark_roundtrip_and_clears_on_republish(warehouse):
+def test_expiry_mark_roundtrip_and_clears_after_republished_token_succeeds(warehouse):
     from personal_data_warehouse.chatgpt_backend_ingest import chatgpt_session_is_marked_expired
 
     warehouse.upsert_chatgpt_session(
@@ -203,6 +203,8 @@ def test_expiry_mark_roundtrip_and_clears_on_republish(warehouse):
     row = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
     assert row["expired_at"] is None
     assert row["expired_token_sha256"] == ""
+    assert row["status"] == "ok"
+    assert row["error"] == ""
     assert chatgpt_session_is_marked_expired(row) is False
 
     # A poll rejected this token: mark it expired (keyed to its sha).
@@ -212,6 +214,8 @@ def test_expiry_mark_roundtrip_and_clears_on_republish(warehouse):
     marked = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
     assert marked["expired_at"] is not None
     assert marked["expired_token_sha256"] == row["token_sha256"]
+    assert marked["status"] == "action_required"
+    assert "publish-session" in marked["error"]
     assert chatgpt_session_is_marked_expired(marked) is True
 
     # A stale mark against a *different* token is a no-op (guards a concurrent publish).
@@ -228,18 +232,37 @@ def test_expiry_mark_roundtrip_and_clears_on_republish(warehouse):
     )
     republished = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
     assert chatgpt_session_is_marked_expired(republished) is False
+    # Publishing makes the new hash eligible to poll immediately, but health stays
+    # action_required until that new credential is actually validated. A successful
+    # old in-flight poll cannot clear the replacement row.
+    assert republished["status"] == "action_required"
+    warehouse.record_chatgpt_session_success(
+        account=ACCOUNT,
+        session_key="default",
+        token_sha256=row["token_sha256"],
+    )
+    after_stale_success = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    assert after_stale_success["status"] == "action_required"
+    assert after_stale_success["expired_token_sha256"] == row["token_sha256"]
 
-    # Explicit clear (e.g. a transient 401 that recovered on the re-probe) also resets.
+    # Once a poll with the republished token succeeds, its heartbeat clears the
+    # action-required state and the stale rejected-token marker.
     warehouse.mark_chatgpt_session_expired(
         account=ACCOUNT, session_key="default", token_sha256=republished["token_sha256"]
     )
     assert chatgpt_session_is_marked_expired(
         warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
     ) is True
-    warehouse.clear_chatgpt_session_expired(account=ACCOUNT, session_key="default")
+    warehouse.record_chatgpt_session_success(
+        account=ACCOUNT,
+        session_key="default",
+        token_sha256=republished["token_sha256"],
+    )
     cleared = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
     assert cleared["expired_at"] is None
     assert cleared["expired_token_sha256"] == ""
+    assert cleared["status"] == "ok"
+    assert cleared["error"] == ""
     assert chatgpt_session_is_marked_expired(cleared) is False
 
 

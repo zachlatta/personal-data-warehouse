@@ -41,7 +41,7 @@ class FakeWarehouse:
         self._session_row = session_row
         self.closed = False
         self.marked_expired: list[dict] = []
-        self.cleared_expired: list[dict] = []
+        self.recorded_success: list[dict] = []
 
     def get_chatgpt_session(self, *, account, session_key):
         return self._session_row
@@ -51,8 +51,10 @@ class FakeWarehouse:
             {"account": account, "session_key": session_key, "token_sha256": token_sha256}
         )
 
-    def clear_chatgpt_session_expired(self, *, account, session_key):
-        self.cleared_expired.append({"account": account, "session_key": session_key})
+    def record_chatgpt_session_success(self, *, account, session_key, token_sha256):
+        self.recorded_success.append(
+            {"account": account, "session_key": session_key, "token_sha256": token_sha256}
+        )
 
     def close(self):
         self.closed = True
@@ -135,18 +137,20 @@ def test_sensor_skips_when_session_marked_expired(monkeypatch) -> None:
     assert "publish-session" in result.skip_message
 
 
-def test_sensor_reprobes_once_expiry_window_elapses(monkeypatch) -> None:
-    # After the re-probe interval, fire a single run to detect recovery / re-publish.
+def test_sensor_does_not_reprobe_a_token_already_rejected(monkeypatch) -> None:
+    # Only publishing a different token can change a permanent credential failure.
+    # Time passing must not produce an hourly flood of identical red runs.
     _patch(
         monkeypatch,
         config=FakeConfig(poll_interval_seconds=0),
-        session_row=_expired_row(seconds_ago=chatgpt_defs.CHATGPT_EXPIRED_REPROBE_SECONDS + 120),
+        session_row=_expired_row(seconds_ago=30 * 24 * 60 * 60),
     )
     with DagsterInstance.ephemeral() as instance:
         result = chatgpt_defs.chatgpt_backend_ingest_sensor(
             build_sensor_context(instance=instance, cursor=None)
         )
-    assert isinstance(result, RunRequest)
+    assert isinstance(result, SkipReason)
+    assert "publish-session" in result.skip_message
 
 
 def test_sensor_fires_after_republish_despite_stale_mark(monkeypatch) -> None:
@@ -222,11 +226,11 @@ def test_asset_marks_session_expired_on_auth_error(monkeypatch) -> None:
     assert warehouse.marked_expired == [
         {"account": "user@example.com", "session_key": "default", "token_sha256": "abc"}
     ]
-    assert warehouse.cleared_expired == []
+    assert warehouse.recorded_success == []
     assert warehouse.closed is True
 
 
-def test_asset_clears_expiry_mark_after_successful_poll(monkeypatch) -> None:
+def test_asset_records_credential_health_after_successful_poll(monkeypatch) -> None:
     warehouse = _patch_asset(
         monkeypatch,
         session_row={
@@ -240,12 +244,13 @@ def test_asset_clears_expiry_mark_after_successful_poll(monkeypatch) -> None:
     result = chatgpt_defs.chatgpt_backend_ingest(build_asset_context())
 
     assert isinstance(result, MaterializeResult)
-    assert warehouse.cleared_expired == [{"account": "user@example.com", "session_key": "default"}]
+    assert warehouse.recorded_success == [
+        {"account": "user@example.com", "session_key": "default", "token_sha256": "abc"}
+    ]
     assert warehouse.marked_expired == []
 
 
-def test_asset_does_not_clear_when_not_previously_expired(monkeypatch) -> None:
-    # Steady-state healthy poll: no expiry mark, so no needless clear write.
+def test_asset_records_every_healthy_poll_as_the_pipeline_heartbeat(monkeypatch) -> None:
     warehouse = _patch_asset(
         monkeypatch,
         session_row={"session_token": "cookie", "token_sha256": "abc", "expired_token_sha256": ""},
@@ -254,5 +259,7 @@ def test_asset_does_not_clear_when_not_previously_expired(monkeypatch) -> None:
     result = chatgpt_defs.chatgpt_backend_ingest(build_asset_context())
 
     assert isinstance(result, MaterializeResult)
-    assert warehouse.cleared_expired == []
+    assert warehouse.recorded_success == [
+        {"account": "user@example.com", "session_key": "default", "token_sha256": "abc"}
+    ]
     assert warehouse.marked_expired == []

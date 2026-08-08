@@ -70,8 +70,19 @@ CREATE TABLE IF NOT EXISTS ` + warehouse.SQLRelation("chatgpt_sessions") + ` (
     published_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
     updated_at timestamptz NOT NULL DEFAULT now(),
     sync_version bigint NOT NULL DEFAULT 1,
+    expired_at timestamptz,
+    expired_token_sha256 text NOT NULL DEFAULT '',
+    status text NOT NULL DEFAULT 'ok',
+    error text NOT NULL DEFAULT '',
     PRIMARY KEY (account, session_key)
 )`
+
+var ensureColumnSQL = []string{
+	`ALTER TABLE ` + warehouse.SQLRelation("chatgpt_sessions") + ` ADD COLUMN IF NOT EXISTS expired_at timestamptz`,
+	`ALTER TABLE ` + warehouse.SQLRelation("chatgpt_sessions") + ` ADD COLUMN IF NOT EXISTS expired_token_sha256 text NOT NULL DEFAULT ''`,
+	`ALTER TABLE ` + warehouse.SQLRelation("chatgpt_sessions") + ` ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'ok'`,
+	`ALTER TABLE ` + warehouse.SQLRelation("chatgpt_sessions") + ` ADD COLUMN IF NOT EXISTS error text NOT NULL DEFAULT ''`,
+}
 
 var upsertSQL = `
 INSERT INTO ` + warehouse.SQLRelation("chatgpt_sessions") + ` (
@@ -94,6 +105,11 @@ func (s *PostgresStore) Upsert(ctx context.Context, account, sessionKey, session
 	}
 	if _, err := s.db.ExecContext(ctx, createTableSQL); err != nil {
 		return Ack{}, fmt.Errorf("ensure chatgpt_sessions: %w", err)
+	}
+	for _, statement := range ensureColumnSQL {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return Ack{}, fmt.Errorf("migrate chatgpt_sessions health state: %w", err)
+		}
 	}
 	sum := sha256.Sum256([]byte(sessionToken))
 	tokenSHA := hex.EncodeToString(sum[:])

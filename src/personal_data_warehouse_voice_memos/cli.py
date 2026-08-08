@@ -11,7 +11,6 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.ingest_client import ingest_client_from_env
 from personal_data_warehouse_voice_memos.network import (
     NetworkPolicy,
-    is_transient_upload_error,
     preflight_app_ingest,
 )
 from personal_data_warehouse_voice_memos.state import VoiceMemosUploadState, default_state_file
@@ -99,42 +98,35 @@ def main() -> None:
 
     summary = None
     writeback_summary = None
-    try:
-        with exclusive_lock(args.lock_file) as acquired:
-            if not acquired:
-                print("Voice Memos upload skipped: another uploader run is active")
-                return
-            if run_upload:
-                try:
-                    summary = VoiceMemosUploadRunner(
-                        account=settings.voice_memos.account,
-                        recordings_path=settings.voice_memos.recordings_path,
-                        extensions=settings.voice_memos.extensions,
-                        ingest_client=ingest_client_from_env(),
-                        logger=logger,
-                        limit=args.limit or None,
-                        workers=workers,
-                        mode=args.mode,
-                        upload_state=state,
-                        min_file_age_seconds=args.min_file_age_seconds if args.mode == "incremental" else 0,
-                        before_upload_check=build_before_upload_check(preflight_timeout_seconds=preflight_timeout_seconds),
-                    ).sync()
-                finally:
-                    state.save(args.state_file)
-            if run_title_writeback:
-                writeback_summary = run_writeback(
-                    settings=settings,
-                    logger=logger,
-                    dry_run=args.writeback_dry_run,
-                    limit=args.writeback_limit or None,
-                    upload_state=state,
-                )
-    except Exception as exc:
-        if is_transient_exception(exc):
-            print(f"Voice Memos run skipped after transient network failure: {exc}")
+    with exclusive_lock(args.lock_file) as acquired:
+        if not acquired:
+            print("Voice Memos upload skipped: another uploader run is active")
             return
-        raise
-
+        if run_upload:
+            try:
+                summary = VoiceMemosUploadRunner(
+                    account=settings.voice_memos.account,
+                    recordings_path=settings.voice_memos.recordings_path,
+                    extensions=settings.voice_memos.extensions,
+                    ingest_client=ingest_client_from_env(),
+                    logger=logger,
+                    limit=args.limit or None,
+                    workers=workers,
+                    mode=args.mode,
+                    upload_state=state,
+                    min_file_age_seconds=args.min_file_age_seconds if args.mode == "incremental" else 0,
+                    before_upload_check=build_before_upload_check(preflight_timeout_seconds=preflight_timeout_seconds),
+                ).sync()
+            finally:
+                state.save(args.state_file)
+        if run_title_writeback:
+            writeback_summary = run_writeback(
+                settings=settings,
+                logger=logger,
+                dry_run=args.writeback_dry_run,
+                limit=args.writeback_limit or None,
+                upload_state=state,
+            )
     if summary is not None:
         print(
             "Voice Memos upload complete: "
@@ -240,15 +232,6 @@ def exclusive_lock(path: Path):
             yield True
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def is_transient_exception(exc: BaseException) -> bool:
-    current: BaseException | None = exc
-    while current is not None:
-        if isinstance(current, Exception) and is_transient_upload_error(current):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 if __name__ == "__main__":

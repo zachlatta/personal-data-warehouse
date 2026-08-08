@@ -297,26 +297,6 @@ def preflight_app_ingest(
     return NetworkDecision(True, "app ingest preflight succeeded")
 
 
-def is_transient_upload_error(exc: Exception) -> bool:
-    status = getattr(getattr(exc, "response", None), "status_code", None)
-    if status in {408, 429, 500, 502, 503, 504}:
-        return True
-    message = str(exc).lower()
-    return any(
-        token in message
-        for token in (
-            "timed out",
-            "timeout",
-            "temporary failure",
-            "connection reset",
-            "connection aborted",
-            "connection refused",
-            "network is unreachable",
-            "name or service not known",
-        )
-    )
-
-
 def patterns_from_env(name: str, default: tuple[str, ...], *, fallback_name: str | None = None) -> tuple[str, ...]:
     value = os.getenv(name, "").strip()
     if not value and fallback_name:

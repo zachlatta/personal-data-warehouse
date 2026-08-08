@@ -322,64 +322,36 @@ def test_is_marked_expired_only_when_current_token_matches():
     assert chatgpt_session_is_marked_expired(_session_row(token_sha="", expired_sha="")) is False
 
 
-def test_expiry_skip_returns_reason_within_reprobe_window():
-    now = 10_000.0
-    row = _session_row(token_sha="abc", expired_sha="abc", expired_at=now - 100)  # 100s ago
-    reason = chatgpt_session_expiry_skip(
-        row, now=now, reprobe_after_seconds=3600, republish_hint=_HINT
-    )
+def test_expiry_skip_stays_quiet_until_the_rejected_token_rotates():
+    row = _session_row(token_sha="abc", expired_sha="abc", expired_at=1.0)
+    reason = chatgpt_session_expiry_skip(row, republish_hint=_HINT)
     assert reason is not None
     assert "expired" in reason
     assert "publish-session" in reason
-    assert "Re-probing in ~3500s" in reason
-
-
-def test_expiry_skip_allows_reprobe_after_window_elapses():
-    now = 10_000.0
-    row = _session_row(token_sha="abc", expired_sha="abc", expired_at=now - 4000)  # > 3600s ago
-    assert (
-        chatgpt_session_expiry_skip(row, now=now, reprobe_after_seconds=3600, republish_hint=_HINT)
-        is None
-    )
+    assert "Re-probing" not in reason
 
 
 def test_expiry_skip_none_when_not_marked_or_republished():
-    now = 10_000.0
     # Never marked.
     assert (
         chatgpt_session_expiry_skip(
-            _session_row(token_sha="abc", expired_sha=""), now=now,
-            reprobe_after_seconds=3600, republish_hint=_HINT,
+            _session_row(token_sha="abc", expired_sha=""), republish_hint=_HINT,
         )
         is None
     )
     # Re-published (token rotated) clears it immediately regardless of the timer.
     assert (
         chatgpt_session_expiry_skip(
-            _session_row(token_sha="new", expired_sha="abc", expired_at=now - 10), now=now,
-            reprobe_after_seconds=3600, republish_hint=_HINT,
+            _session_row(token_sha="new", expired_sha="abc", expired_at=10),
+            republish_hint=_HINT,
         )
         is None
     )
 
 
-def test_expiry_skip_none_when_mark_has_no_timestamp():
-    # A malformed mark (matching sha but no expired_at) must not skip forever; let a
-    # run re-establish a proper mark instead.
-    now = 10_000.0
+def test_expiry_skip_does_not_depend_on_timestamp():
+    # The rejected token hash is the durable state. A missing timestamp must not
+    # re-enable a credential that the backend already rejected.
     row = _session_row(token_sha="abc", expired_sha="abc", expired_at=None)
-    assert (
-        chatgpt_session_expiry_skip(row, now=now, reprobe_after_seconds=3600, republish_hint=_HINT)
-        is None
-    )
-
-
-def test_expiry_skip_accepts_datetime_expired_at():
-    from datetime import UTC, datetime, timedelta
-
-    recent = datetime.now(tz=UTC) - timedelta(seconds=60)
-    row = _session_row(token_sha="abc", expired_sha="abc", expired_at=recent)
-    reason = chatgpt_session_expiry_skip(
-        row, now=datetime.now(tz=UTC).timestamp(), reprobe_after_seconds=3600, republish_hint=_HINT
-    )
+    reason = chatgpt_session_expiry_skip(row, republish_hint=_HINT)
     assert reason is not None and "publish-session" in reason

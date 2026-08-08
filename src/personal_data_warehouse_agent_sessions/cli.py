@@ -12,7 +12,6 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.ingest_client import ingest_client_from_env
 from personal_data_warehouse_voice_memos.network import (
     NetworkPolicy,
-    is_transient_upload_error,
     preflight_app_ingest,
 )
 from personal_data_warehouse_agent_sessions.state import AgentSessionsUploadState, default_state_file
@@ -91,11 +90,6 @@ def main() -> None:
     except UploadBlockedError as exc:
         print(f"Agent sessions upload skipped: {exc}")
         return
-    except Exception as exc:
-        if is_transient_exception(exc):
-            print(f"Agent sessions upload skipped after transient network failure: {exc}")
-            return
-        raise
     finally:
         state.close()
 
@@ -137,15 +131,6 @@ def exclusive_lock(path: Path):
             yield True
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def is_transient_exception(exc: BaseException) -> bool:
-    current: BaseException | None = exc
-    while current is not None:
-        if isinstance(current, Exception) and is_transient_upload_error(current):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 if __name__ == "__main__":

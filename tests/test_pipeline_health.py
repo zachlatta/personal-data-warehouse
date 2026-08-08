@@ -157,6 +157,16 @@ def test_state_sources_name_cataloged_tables_with_their_columns():
                 assert column in spec.columns, f"{entry.id}: {source.table}.{column}"
 
 
+def test_chatgpt_pipeline_surfaces_expired_credentials_as_action_required():
+    chatgpt = next(entry for entry in PIPELINES if entry.id == "chatgpt")
+    assert chatgpt.state is not None
+    assert chatgpt.state.table == "chatgpt_sessions"
+    assert chatgpt.state.updated_column == "updated_at"
+    assert chatgpt.state.status_column == "status"
+    assert chatgpt.state.error_column == "error"
+    assert "action_required" in chatgpt.state.attention_statuses
+
+
 def test_pipeline_tables_are_catalog_ids():
     for table in TABLE_PIPELINES:
         assert table in CANONICAL_RELATIONS, table

@@ -60,6 +60,7 @@ After installing:
 ```bash
 pdw login    # interactive: stores API URL + token in ~/.config/pdw/config.json
 pdw list     # confirms the connection works
+pdw sql -q 'Find offer letters' "SELECT * FROM timeline.search_text('offer letter', 50)"
 pdw update   # later: self-updates to the newest release
 ```
 
@@ -1301,6 +1302,7 @@ Inside the container the agent uses the same `pdw` commands a human would, alrea
 ```bash
 pdw schema                                        # relations + keys
 pdw columns base_gmail.messages                        # exact columns and types
+pdw sql -q 'Find exact invoice references' "SELECT * FROM timeline.search_text_exact('invoice 4831', 50)"
 pdw sql -q 'why you are asking' "SELECT summary, attendees_json FROM base_google_calendar.events LIMIT 5"
 pdw call get_object --data '{"storage_file_id":"..."}'   # then curl the signed download_url
 ```

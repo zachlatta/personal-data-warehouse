@@ -399,13 +399,17 @@ PIPELINES: tuple[Pipeline, ...] = (
         cadence="poller every 5 min",
         transport="Dagster chatgpt_backend_ingest → chatgpt.com backend API with a published session",
         data=7 * DAY,
-        run=3 * DAY,
-        state=StateSource(table="chatgpt_conversation_sync", updated_column="synced_at"),
+        run=3 * HOUR,
+        state=StateSource(
+            table="chatgpt_sessions",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+        ),
         note=(
-            "needs a manual `pdw chatgpt publish-session` roughly weekly; the run"
-            " signal advances only on days ChatGPT is actually used, so the run"
-            " interval is deliberately loose — it exists to catch an expired"
-            " session in days rather than the two weeks the data threshold takes"
+            "needs a manual `pdw chatgpt publish-session` roughly weekly; every"
+            " successful poll updates the credential heartbeat, and a rejected"
+            " token remains action_required until a different token is published"
         ),
     ),
     _source(

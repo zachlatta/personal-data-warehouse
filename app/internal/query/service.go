@@ -1166,6 +1166,9 @@ func undefinedColumnHint(message, sql string) string {
 	if !strings.Contains(message, "42703") || !strings.Contains(message, "does not exist") {
 		return ""
 	}
+	if hint := searchResultColumnHint(sql); hint != "" {
+		return hint
+	}
 	col := strings.ToLower(quotedIdentifier(message))
 	if remap, ok := columnRemaps[col]; ok {
 		return "(hint: " + remap + ". Run describe_table('<schema.table>') for the full column list.)"
@@ -1183,6 +1186,31 @@ func undefinedColumnHint(message, sql string) string {
 		return ""
 	}
 	return "(hint: column names differ per source — run describe_table('<schema.table>') for the exact columns and their (type) annotations.)"
+}
+
+var searchFunctionCallRe = regexp.MustCompile(`(?i)(?:"?timeline"?\s*\.\s*)?"?(search_text(?:_exact)?)"?\s*\(`)
+
+// searchResultColumnHint keeps cross-source search inside SQL while making its
+// table-valued function contract recoverable at the exact point callers guess
+// a relation-style column (title/body/event_time are the recurring examples).
+// describe_table cannot help here because search_text* are functions, not
+// relations, so the generic undefined-column advice sends callers in circles.
+func searchResultColumnHint(sql string) string {
+	// Once a search hit is joined to another relation, the missing column may
+	// belong to either side. Fall back to the generic relation guidance rather
+	// than confidently attributing it to the function result.
+	if containsWord(strings.ToLower(sql), "join") {
+		return ""
+	}
+	match := searchFunctionCallRe.FindStringSubmatch(sql)
+	if match == nil {
+		return ""
+	}
+	function := "timeline." + strings.ToLower(match[1])
+	return fmt.Sprintf(
+		"(hint: %s() returns exactly (source, subsource, context, who, occurred_at, account, ref, text, score) — use occurred_at for time and text for the matched preview; ref joins to timeline.events for source_table/source_pk drill-down.)",
+		function,
+	)
 }
 
 // numericCastHint catches the classic Slack sync-state trap: cursor_ts is text
