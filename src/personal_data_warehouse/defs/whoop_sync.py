@@ -8,6 +8,7 @@ from dagster import (
     MaterializeResult,
     MetadataValue,
     RetryPolicy,
+    SkipReason,
     asset,
     define_asset_job,
     definitions,
@@ -18,7 +19,12 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
-from personal_data_warehouse.whoop_sync import WhoopSyncRunner, public_whoop_sync_summary
+from personal_data_warehouse.whoop_sync import (
+    WhoopSyncRunner,
+    newer_whoop_token_json,
+    public_whoop_sync_summary,
+    whoop_reauthorization_skip_reason,
+)
 
 WHOOP_SYNC_POSTGRES_LOCK_ID = 8_407_112_468
 
@@ -73,7 +79,42 @@ whoop_sync_job = define_asset_job(
     default_status=whoop_schedule_default_status(),
 )
 def whoop_sync_every_five_minutes(context):
-    return skip_if_job_active(context, job_name="whoop_sync_job")
+    active = skip_if_job_active(context, job_name="whoop_sync_job")
+    if isinstance(active, SkipReason):
+        return active
+
+    # All WHOOP endpoints share one token. Once the current token has been
+    # rejected permanently, do not launch another green no-op run every five
+    # minutes. The stored fingerprint means a replacement token immediately
+    # clears this guard without a manual state reset.
+    try:
+        settings = load_settings(require_gmail=False, require_whoop=True)
+        if settings.whoop is None:
+            return active
+        warehouse = warehouse_from_settings(settings)
+        try:
+            state = warehouse.load_whoop_sync_state()
+            stored_token_json = warehouse.load_whoop_oauth_token(
+                account=settings.whoop.account
+            )
+        finally:
+            warehouse.close()
+        runtime_token_json = newer_whoop_token_json(
+            bootstrap_token_json=settings.whoop.token_json,
+            stored_token_json=stored_token_json,
+        )
+        reason = whoop_reauthorization_skip_reason(
+            state,
+            account=settings.whoop.account,
+            token_json=runtime_token_json,
+        )
+    except Exception as exc:
+        # A fresh schema may not have the fingerprint column until the first
+        # asset run ensures it. Let that run proceed; the asset remains the
+        # fail-loud authority for unexpected configuration/database errors.
+        context.log.warning("WHOOP credential guard unavailable: %s", exc)
+        return active
+    return active if reason is None else SkipReason(reason)
 
 
 @definitions

@@ -415,6 +415,94 @@ def test_has_pending_finance_observations(warehouse):
     assert has_pending_finance_observations(warehouse) is False
 
 
+def test_action_required_item_does_not_keep_backlog_sensor_running(warehouse):
+    """A frozen Item is deliberately ineligible for a new daily observation.
+
+    The backlog predicate must use the same eligibility rule as the builder;
+    otherwise it launches a successful full-ledger rebuild every five minutes
+    forever, while that rebuild correctly refuses to write the stale balance.
+    """
+    _seed_plaid(warehouse, [_plaid_account_row()])
+    warehouse.ensure_finance_tables()
+    warehouse.insert_plaid_sync_state(
+        account="z@x.test",
+        item_id="item-1",
+        product="accounts",
+        status="action_required",
+        error="NO_ACCOUNTS",
+        last_synced_at=_TS,
+        updated_at=_TS,
+    )
+
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert warehouse._query("SELECT count(*) FROM @finance_observations") == [(0,)]
+    assert has_pending_finance_observations(warehouse) is False
+
+
+def test_rebuild_does_not_retimestamp_unchanged_manual_facts(warehouse):
+    """A replay must not turn old document facts into fresh pipeline writes."""
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        extraction=_extraction_row(
+            balances_json=[{"date": "2026-06-30", "balance": "1234.56"}],
+            transactions_json=[
+                {
+                    "date": "2026-06-20",
+                    "description": "MONTHLY PAYMENT",
+                    "amount": "25.00",
+                    "direction": "out",
+                }
+            ],
+        ),
+    )
+    first = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    first_observed_at = warehouse._query(
+        "SELECT observed_at FROM @finance_observations"
+    )[0][0]
+    first_transaction_at = warehouse._query(
+        "SELECT created_at FROM @finance_transactions"
+    )[0][0]
+    first_link_at = warehouse._query(
+        "SELECT created_at FROM @finance_transaction_links"
+    )[0][0]
+    assert first.observations_upserted == 1
+    assert first.transactions_upserted == 1
+
+    replay = FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(hour=18)).sync()
+
+    assert replay.observations_upserted == 0
+    assert replay.transactions_upserted == 0
+    assert warehouse._query("SELECT observed_at FROM @finance_observations") == [
+        (first_observed_at,)
+    ]
+    assert warehouse._query("SELECT created_at FROM @finance_transactions") == [
+        (first_transaction_at,)
+    ]
+    assert warehouse._query("SELECT created_at FROM @finance_transaction_links") == [
+        (first_link_at,)
+    ]
+
+
+def test_changed_transaction_advances_its_write_timestamp(warehouse):
+    """Suppress identical rebuilds without hiding a real source-row change."""
+    _seed_plaid(warehouse, [_plaid_account_row()])
+    warehouse.insert_plaid_transactions([_plaid_transaction_row()])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    changed_at = _TS.replace(hour=18)
+    warehouse.insert_plaid_transactions(
+        [_plaid_transaction_row(name="RENAMED COFFEE SHOP", sync_version=2)]
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=changed_at).sync()
+
+    assert summary.transactions_upserted == 1
+    assert warehouse._query(
+        "SELECT description, created_at FROM @finance_transactions"
+    ) == [("RENAMED COFFEE SHOP", changed_at)]
+
+
 def test_replay_rebuilds_identically(warehouse):
     _seed_plaid(warehouse, [_plaid_account_row(), _plaid_brokerage_account_row()])
     warehouse.insert_plaid_transactions([_plaid_transaction_row()])

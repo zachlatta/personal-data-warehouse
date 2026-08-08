@@ -6,7 +6,10 @@ from dagster import build_asset_context, build_schedule_context
 
 from personal_data_warehouse.definitions import defs
 from personal_data_warehouse.defs import whoop_sync as whoop_defs
-from personal_data_warehouse.whoop_sync import WhoopSyncSummary
+from personal_data_warehouse.whoop_sync import (
+    WhoopSyncSummary,
+    whoop_credential_sha256,
+)
 
 
 def test_whoop_defs_are_registered() -> None:
@@ -47,9 +50,113 @@ def test_whoop_schedule_uses_active_run_guard(monkeypatch) -> None:
         return {}
 
     monkeypatch.setattr(whoop_defs, "skip_if_job_active", fake_skip_if_job_active)
+    monkeypatch.setattr(whoop_defs, "load_settings", lambda **_kwargs: type(
+        "Settings", (), {"whoop": type("Whoop", (), {"account": "a", "token_json": ""})()}
+    )())
+
+    class Warehouse:
+        def load_whoop_sync_state(self):
+            return {}
+
+        def load_whoop_oauth_token(self, *, account):
+            return ""
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(whoop_defs, "warehouse_from_settings", lambda _settings: Warehouse())
 
     assert whoop_defs.whoop_sync_every_five_minutes(build_schedule_context()) == {}
     assert calls == ["whoop_sync_job"]
+
+
+def test_whoop_schedule_skips_rejected_credential_until_it_changes(monkeypatch) -> None:
+    token = '{"access_token":"expired","refresh_token":"revoked","expires_at":1}'
+    fingerprint = whoop_credential_sha256(token)
+
+    class WhoopConfig:
+        account = "configured-account"
+        token_json = token
+
+    class Settings:
+        whoop = WhoopConfig()
+
+    class Warehouse:
+        closed = False
+
+        def load_whoop_sync_state(self):
+            return {
+                ("configured-account", collection): {
+                    "status": "action_required",
+                    "credential_sha256": fingerprint,
+                }
+                for collection in (
+                    "profile",
+                    "body_measurement",
+                    "cycles",
+                    "recovery",
+                    "sleep",
+                    "workout",
+                )
+            }
+
+        def load_whoop_oauth_token(self, *, account):
+            return token
+
+        def close(self):
+            self.closed = True
+
+    warehouse = Warehouse()
+    monkeypatch.setattr(whoop_defs, "skip_if_job_active", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(whoop_defs, "load_settings", lambda **_kwargs: Settings())
+    monkeypatch.setattr(whoop_defs, "warehouse_from_settings", lambda _settings: warehouse)
+
+    result = whoop_defs.whoop_sync_every_five_minutes(build_schedule_context())
+
+    assert result.skip_message is not None
+    assert "re-authorization" in result.skip_message
+    assert warehouse.closed is True
+
+
+def test_whoop_schedule_resumes_immediately_for_a_new_credential(monkeypatch) -> None:
+    old_token = '{"access_token":"expired","refresh_token":"revoked","expires_at":1}'
+    new_token = '{"access_token":"new","refresh_token":"new-refresh","expires_at":2}'
+
+    class WhoopConfig:
+        account = "configured-account"
+        token_json = new_token
+
+    class Settings:
+        whoop = WhoopConfig()
+
+    class Warehouse:
+        def load_whoop_sync_state(self):
+            return {
+                ("configured-account", collection): {
+                    "status": "action_required",
+                    "credential_sha256": whoop_credential_sha256(old_token),
+                }
+                for collection in (
+                    "profile",
+                    "body_measurement",
+                    "cycles",
+                    "recovery",
+                    "sleep",
+                    "workout",
+                )
+            }
+
+        def load_whoop_oauth_token(self, *, account):
+            return old_token
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(whoop_defs, "skip_if_job_active", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(whoop_defs, "load_settings", lambda **_kwargs: Settings())
+    monkeypatch.setattr(whoop_defs, "warehouse_from_settings", lambda _settings: Warehouse())
+
+    assert whoop_defs.whoop_sync_every_five_minutes(build_schedule_context()) == {}
 
 
 def test_whoop_asset_emits_redacted_summary_metadata(monkeypatch) -> None:

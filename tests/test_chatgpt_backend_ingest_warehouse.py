@@ -266,5 +266,49 @@ def test_expiry_mark_roundtrip_and_clears_after_republished_token_succeeds(wareh
     assert chatgpt_session_is_marked_expired(cleared) is False
 
 
+def test_schema_upgrade_backfills_health_for_a_token_already_marked_expired(warehouse):
+    """The status/error columns shipped after expired-token tracking.
+
+    An existing production row could therefore have a current-token expiry mark
+    while the newly added health columns took their defaults (``ok``/empty). The
+    sensor then skipped that token forever, so no later asset run could repair the
+    dashboard. Ensuring the table must migrate that exact legacy state.
+    """
+    token_sha = hashlib.sha256(b"legacy-expired-cookie").hexdigest()
+    warehouse._command(
+        """
+        CREATE TABLE @chatgpt_sessions (
+            account text NOT NULL,
+            session_key text NOT NULL DEFAULT 'default',
+            session_token text NOT NULL DEFAULT '',
+            source_browser text NOT NULL DEFAULT '',
+            token_sha256 text NOT NULL DEFAULT '',
+            published_at timestamptz NOT NULL,
+            updated_at timestamptz NOT NULL,
+            sync_version bigint NOT NULL DEFAULT 1,
+            expired_at timestamptz,
+            expired_token_sha256 text NOT NULL DEFAULT '',
+            PRIMARY KEY (account, session_key)
+        )
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO @chatgpt_sessions (
+            account, session_key, session_token, token_sha256,
+            published_at, updated_at, expired_at, expired_token_sha256
+        ) VALUES (%s, 'default', 'legacy-expired-cookie', %s, %s, %s, %s, %s)
+        """,
+        (ACCOUNT, token_sha, INGESTED_AT, INGESTED_AT, INGESTED_AT, token_sha),
+    )
+
+    warehouse.ensure_chatgpt_session_table()
+
+    migrated = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    assert migrated["status"] == "action_required"
+    assert "publish-session" in migrated["error"]
+    assert migrated["updated_at"] == INGESTED_AT
+
+
 def _chatgpt_row_count(warehouse) -> int:
     return warehouse._query_dicts("SELECT count(*) c FROM @ai_conversation_events WHERE source='chatgpt'")[0]["c"]

@@ -1438,6 +1438,10 @@ WHOOP_SYNC_STATE_COLUMNS = (
     "error",
     "updated_at",
     "sync_version",
+    # Hash of the exact OAuth token rejected with a permanent auth error.
+    # Schedules skip only while this still matches the configured/private
+    # credential, then resume immediately after re-authorization rotates it.
+    "credential_sha256",
 )
 
 WHOOP_OAUTH_TOKEN_COLUMNS = (

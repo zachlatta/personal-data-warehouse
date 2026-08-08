@@ -2347,6 +2347,10 @@ class PostgresWarehouse:
                 "whoop_oauth_tokens",
             ]
         )
+        self._command(
+            "ALTER TABLE @whoop_sync_state "
+            "ADD COLUMN IF NOT EXISTS credential_sha256 text NOT NULL DEFAULT ''"
+        )
 
     def ensure_agent_sessions_tables(self) -> None:
         self._ensure_table_group(_AI_CONVERSATION_EVENT_TABLES)
@@ -2834,6 +2838,29 @@ class PostgresWarehouse:
         self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_token_sha256 text NOT NULL DEFAULT ''")
         self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'ok'")
         self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS error text NOT NULL DEFAULT ''")
+        # ``expired_*`` predates the health status columns. On upgrade, an
+        # already-rejected current token receives the new columns' defaults
+        # (ok/empty), while the sensor immediately starts skipping that token.
+        # Without this data migration no later asset run can correct the false
+        # green state. The predicate makes this a one-time repair, and tying it
+        # to the current token preserves the concurrency guarantee used by the
+        # poller and publisher.
+        self._command(
+            """
+            UPDATE @chatgpt_sessions
+            SET status = 'action_required',
+                error = CASE
+                    WHEN error = '' THEN %s
+                    ELSE error
+                END,
+                updated_at = GREATEST(updated_at, expired_at)
+            WHERE expired_at IS NOT NULL
+              AND expired_token_sha256 <> ''
+              AND token_sha256 = expired_token_sha256
+              AND (status <> 'action_required' OR error = '')
+            """,
+            ("ChatGPT session expired; run `pdw chatgpt publish-session` to refresh it.",),
+        )
 
     def ensure_chatgpt_conversation_sync_table(self) -> None:
         """Per-conversation incremental sync watermark for the ChatGPT poller."""
@@ -5515,6 +5542,7 @@ class PostgresWarehouse:
         status: str,
         error: str,
         updated_at: datetime,
+        credential_sha256: str = "",
     ) -> None:
         self._insert(
             "whoop_sync_state",
@@ -5528,6 +5556,7 @@ class PostgresWarehouse:
                     error,
                     updated_at,
                     int(_ensure_utc(updated_at).timestamp() * 1_000_000),
+                    credential_sha256,
                 )
             ],
             WHOOP_SYNC_STATE_COLUMNS,

@@ -401,6 +401,13 @@ class FinanceLedgerRunner:
                 sync_version=sync_version,
             )
         )
+        # Manual documents are immutable source facts. Rebuilding the ledger
+        # used to re-upsert every historical observation with ``observed_at =
+        # now()``, making old statements look freshly written and sending all
+        # of them through timeline incremental sync again. Plaid's same-day
+        # balance is a real live re-observation and still advances each run;
+        # unchanged manual facts do not.
+        observation_rows = self._changed_observation_rows(observation_rows)
         self._warehouse.insert_finance_observations(observation_rows)
 
         transactions = self._build_transactions(
@@ -742,14 +749,41 @@ class FinanceLedgerRunner:
                     )
                 )
 
-        self._warehouse.insert_finance_transactions(list(transaction_rows.values()))
-        self._warehouse.insert_finance_transaction_links(link_rows)
+        # The ledger is replayed from all source rows, but a replay is not a
+        # new write. Filter against the current derived facts before the
+        # upsert so 17k unchanged transactions and 18k resolution links do not
+        # acquire a new timestamp/version every run. A semantic source change
+        # still writes the row with ``created_at = now`` so timeline's
+        # watermark sees it.
+        existing_transactions = self._load_existing_transactions()
+        changed_transactions = [
+            row
+            for row in transaction_rows.values()
+            if not _row_matches(
+                existing_transactions.get(str(row["transaction_id"])),
+                row,
+                _TRANSACTION_SEMANTIC_COLUMNS,
+            )
+        ]
+        desired_links = {
+            (str(row["source"]), str(row["source_row_key"])): row for row in link_rows
+        }
+        existing_links = self._load_existing_transaction_links()
+        changed_links = [
+            row
+            for key, row in desired_links.items()
+            if not _row_matches(
+                existing_links.get(key), row, _TRANSACTION_LINK_SEMANTIC_COLUMNS
+            )
+        ]
+        self._warehouse.insert_finance_transactions(changed_transactions)
+        self._warehouse.insert_finance_transaction_links(changed_links)
         removed = self._warehouse.reconcile_finance_transactions(
             transaction_ids=list(transaction_rows.keys()),
-            link_keys=[f"{row['source']}|{row['source_row_key']}" for row in link_rows],
+            link_keys=[f"{source}|{source_row_key}" for source, source_row_key in desired_links],
         )
         return {
-            "upserted": len(transaction_rows),
+            "upserted": len(changed_transactions),
             "merged": merged,
             "skipped": skipped,
             "removed": removed,
@@ -938,6 +972,56 @@ class FinanceLedgerRunner:
             """
         )
 
+    def _changed_observation_rows(
+        self, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        existing = {
+            (str(row["account_id"]), row["as_of"], str(row["kind"]), str(row["source"])): row
+            for row in self._warehouse._query_dicts(
+                """
+                SELECT account_id, as_of, kind, value, currency, source
+                FROM @finance_observations
+                WHERE source = %s
+                """,
+                (LEDGER_SOURCE_MANUAL,),
+            )
+        }
+        changed: list[dict[str, Any]] = []
+        for row in rows:
+            if str(row["source"]) != LEDGER_SOURCE_MANUAL:
+                changed.append(row)
+                continue
+            key = (
+                str(row["account_id"]),
+                row["as_of"],
+                str(row["kind"]),
+                str(row["source"]),
+            )
+            if not _row_matches(existing.get(key), row, _OBSERVATION_SEMANTIC_COLUMNS):
+                changed.append(row)
+        return changed
+
+    def _load_existing_transactions(self) -> dict[str, dict[str, Any]]:
+        rows = self._warehouse._query_dicts(
+            """
+            SELECT transaction_id, account_id, posted_at, amount, currency,
+                   description, merchant, pending, source
+            FROM @finance_transactions
+            """
+        )
+        return {str(row["transaction_id"]): row for row in rows}
+
+    def _load_existing_transaction_links(
+        self,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        rows = self._warehouse._query_dicts(
+            """
+            SELECT source, source_row_key, transaction_id, match_method, match_score
+            FROM @finance_transaction_links
+            """
+        )
+        return {(str(row["source"]), str(row["source_row_key"])): row for row in rows}
+
     def _load_links(self, source: str) -> dict[tuple[str, str], str]:
         rows = self._warehouse._query(
             """
@@ -1060,12 +1144,45 @@ def has_pending_finance_observations(warehouse: PostgresWarehouse) -> bool:
          AND o.kind = %s
          AND o.as_of = CURRENT_DATE
         WHERE a.is_removed = 0
+          AND NOT EXISTS (
+              SELECT 1
+              FROM @plaid_sync_state s
+              WHERE s.account = a.account
+                AND s.item_id = a.item_id
+                AND s.status = 'action_required'
+          )
           AND (l.account_id IS NULL OR o.account_id IS NULL)
         LIMIT 1
         """,
         (LEDGER_SOURCE_PLAID, LEDGER_SOURCE_PLAID, OBSERVATION_KIND_BALANCE),
     )
     return bool(rows)
+
+
+_OBSERVATION_SEMANTIC_COLUMNS = ("value", "currency")
+_TRANSACTION_SEMANTIC_COLUMNS = (
+    "account_id",
+    "posted_at",
+    "amount",
+    "currency",
+    "description",
+    "merchant",
+    "pending",
+    "source",
+)
+_TRANSACTION_LINK_SEMANTIC_COLUMNS = (
+    "transaction_id",
+    "match_method",
+    "match_score",
+)
+
+
+def _row_matches(
+    existing: dict[str, Any] | None,
+    desired: dict[str, Any],
+    columns: tuple[str, ...],
+) -> bool:
+    return existing is not None and all(existing.get(column) == desired.get(column) for column in columns)
 
 
 def _group_masks_by_frequency(group: list[dict[str, Any]]) -> list[str]:

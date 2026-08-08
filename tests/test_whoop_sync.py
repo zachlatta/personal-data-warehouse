@@ -27,6 +27,8 @@ from personal_data_warehouse.whoop_sync import (
     recovery_to_row,
     sleep_to_row,
     workout_to_row,
+    whoop_credential_sha256,
+    whoop_reauthorization_skip_reason,
 )
 
 
@@ -631,6 +633,37 @@ def test_sync_runner_records_action_required_for_dead_refresh_token(monkeypatch)
     assert summaries[0].records_written == 0
     assert any("personal-data-warehouse-whoop-auth" in warning for warning in logger.warnings)
     assert any("WHOOP_TOKEN_JSON_B64" in warning for warning in logger.warnings)
+    expected_fingerprint = whoop_credential_sha256(settings.whoop.token_json)
+    assert {row["credential_sha256"] for row in warehouse.state_rows} == {
+        expected_fingerprint
+    }
+
+
+def test_matching_action_required_state_blocks_only_the_same_credential() -> None:
+    old_token = _token_json(access_token="expired", expires_at=100)
+    new_token = _token_json(access_token="new", expires_at=200)
+    account = "user@example.com"
+    state = {
+        (account, collection): {
+            "status": "action_required",
+            "credential_sha256": whoop_credential_sha256(old_token),
+        }
+        for collection in (
+            "profile",
+            "body_measurement",
+            "cycles",
+            "recovery",
+            "sleep",
+            "workout",
+        )
+    }
+
+    assert whoop_reauthorization_skip_reason(
+        state, account=account, token_json=old_token
+    ) is not None
+    assert whoop_reauthorization_skip_reason(
+        state, account=account, token_json=new_token
+    ) is None
 
 
 def test_sync_runner_still_fails_loud_for_transient_refresh_errors(monkeypatch) -> None:

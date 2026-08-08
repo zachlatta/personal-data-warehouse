@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import argparse
+import hashlib
 import json
 import logging
 import time
@@ -22,6 +23,11 @@ WHOOP_COLLECTIONS = (
     ("sleep", "/v2/activity/sleep", "insert_whoop_sleeps", "sleep"),
     ("workout", "/v2/activity/workout", "insert_whoop_workouts", "workout"),
 )
+WHOOP_STATE_COLLECTIONS = (
+    "profile",
+    "body_measurement",
+    *(collection for collection, _path, _insert_method, _row_kind in WHOOP_COLLECTIONS),
+)
 
 
 WHOOP_STATUS_ACTION_REQUIRED = "action_required"
@@ -38,6 +44,49 @@ def whoop_action_required_error(error: BaseException) -> bool:
     return (
         isinstance(error, WhoopOAuthError)
         and error.status_code in WHOOP_ACTION_REQUIRED_HTTP_STATUSES
+    )
+
+
+def whoop_credential_sha256(token_json: str) -> str:
+    """Stable non-secret identity for one configured OAuth credential."""
+    if not token_json:
+        return ""
+    canonical = json.dumps(
+        _parse_token_json(token_json), sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def whoop_reauthorization_skip_reason(
+    state_by_key: Mapping[tuple[str, str], Mapping[str, Any]],
+    *,
+    account: str,
+    token_json: str,
+) -> str | None:
+    """Skip a permanently rejected token, but never a replacement token.
+
+    Every WHOOP endpoint shares one OAuth credential. Once all collections
+    recorded ``action_required`` for the same credential, another */5 run can
+    only repeat six doomed refresh attempts. The hash makes the quiet period
+    self-clearing: a newly authorized bootstrap/private token differs and is
+    tried on the very next schedule tick.
+    """
+    fingerprint = whoop_credential_sha256(token_json)
+    if not fingerprint:
+        return None
+    states = [state_by_key.get((account, collection)) for collection in WHOOP_STATE_COLLECTIONS]
+    if not all(
+        state
+        and str(state.get("status") or "") == WHOOP_STATUS_ACTION_REQUIRED
+        and str(state.get("credential_sha256") or "") == fingerprint
+        for state in states
+    ):
+        return None
+    return (
+        "WHOOP credential needs re-authorization; skipping repeated API calls for "
+        "the same rejected token. Run `uv run personal-data-warehouse-whoop-auth "
+        "--write-env` locally, then update WHOOP_TOKEN_JSON_B64 in production. "
+        "Sync resumes automatically when the token changes."
     )
 
 
@@ -236,6 +285,7 @@ class WhoopSyncRunner:
         self._logger = logger
         self._client_factory = client_factory
         self._now = now or (lambda: datetime.now(tz=UTC))
+        self._credential_sha256 = ""
 
     def sync_all(self) -> list[WhoopSyncSummary]:
         config = self._settings.whoop
@@ -256,6 +306,23 @@ class WhoopSyncRunner:
                 token_json=runtime_token_json,
                 updated_at=synced_at,
             )
+        self._credential_sha256 = whoop_credential_sha256(runtime_token_json)
+        skip_reason = whoop_reauthorization_skip_reason(
+            state_by_key,
+            account=account,
+            token_json=runtime_token_json,
+        )
+        if skip_reason is not None:
+            self._logger.warning(skip_reason)
+            return [
+                WhoopSyncSummary(
+                    account=account,
+                    sync_type="blocked_credential",
+                    records_written=0,
+                    collections={},
+                    action_required=len(WHOOP_STATE_COLLECTIONS),
+                )
+            ]
         runtime_config = replace(config, token_json=runtime_token_json)
         client = self._build_client(runtime_config, persist_rotated_token=True)
         collections_written: dict[str, int] = {}
@@ -444,6 +511,7 @@ class WhoopSyncRunner:
         return "incremental", rfc3339_utc(start)
 
     def _insert_state(self, **row) -> None:
+        row.setdefault("credential_sha256", self._credential_sha256)
         self._warehouse.insert_whoop_sync_state(**row)
 
     def _record_failure(

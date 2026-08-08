@@ -51,6 +51,49 @@ def test_whoop_timeline_adapter_queries_execute_against_real_schema(warehouse: P
         ) == []
 
 
+def test_whoop_schema_upgrade_adds_credential_fingerprint_to_existing_state_table(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse._command(
+        """
+        CREATE TABLE @whoop_sync_state (
+            account text NOT NULL,
+            collection text NOT NULL,
+            watermark_updated_at timestamptz NOT NULL,
+            last_sync_type text NOT NULL DEFAULT '',
+            status text NOT NULL DEFAULT 'ok',
+            error text NOT NULL DEFAULT '',
+            updated_at timestamptz NOT NULL,
+            sync_version bigint NOT NULL DEFAULT 1,
+            PRIMARY KEY (account, collection)
+        )
+        """
+    )
+
+    warehouse.ensure_whoop_tables()
+
+    columns = warehouse._query_dicts(
+        """
+        SELECT column_name, column_default, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = %s
+          AND table_name = %s
+          AND column_name = 'credential_sha256'
+        """,
+        (
+            warehouse.physical_schema_name("ops"),
+            "whoop_sync_state",
+        ),
+    )
+    assert columns == [
+        {
+            "column_name": "credential_sha256",
+            "column_default": "''::text",
+            "is_nullable": "NO",
+        }
+    ]
+
+
 def test_whoop_tables_upsert_rows_and_state(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_whoop_tables()
     synced_at = datetime(2026, 7, 9, 12, tzinfo=UTC)
