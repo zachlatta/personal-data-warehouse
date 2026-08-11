@@ -1,3 +1,6 @@
+
+
+```markdown
 # personal_data_warehouse
 
 This project syncs Gmail mailbox data, Google Calendar events, Google and Apple Contacts, Slack
@@ -998,6 +1001,12 @@ cp ops/launchd/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist
 launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messages-upload 2>/dev/null || true
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist
 launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messages-upload
+```
+
+Run it immediately:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messages-upload
 ```
 
 Monitor it:
