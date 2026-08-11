@@ -21,8 +21,8 @@ from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 from personal_data_warehouse.whoop_sync import (
     WhoopSyncRunner,
-    newer_whoop_token_json,
     public_whoop_sync_summary,
+    select_whoop_token_json,
     whoop_reauthorization_skip_reason,
 )
 
@@ -99,9 +99,11 @@ def whoop_sync_every_five_minutes(context):
             )
         finally:
             warehouse.close()
-        runtime_token_json = newer_whoop_token_json(
+        runtime_token_json = select_whoop_token_json(
             bootstrap_token_json=settings.whoop.token_json,
             stored_token_json=stored_token_json,
+            state_by_key=state,
+            account=settings.whoop.account,
         )
         reason = whoop_reauthorization_skip_reason(
             state,

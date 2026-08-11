@@ -86,7 +86,8 @@ def whoop_reauthorization_skip_reason(
         "WHOOP credential needs re-authorization; skipping repeated API calls for "
         "the same rejected token. Run `uv run personal-data-warehouse-whoop-auth "
         "--write-env` locally, then update WHOOP_TOKEN_JSON_B64 in production. "
-        "Sync resumes automatically when the token changes."
+        "Sync resumes automatically when the token changes; /pipelines remains "
+        "in attention until a successful sync clears this state."
     )
 
 
@@ -156,6 +157,7 @@ class WhoopApiClient:
         self._session = session or requests.Session()
         self._token_refresher = token_refresher
         self._token_updated = token_updated
+        self._terminal_refresh_error: WhoopOAuthError | None = None
         self._refresh_enabled = refresh_enabled
         self._sleep = sleep or time.sleep
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -165,6 +167,7 @@ class WhoopApiClient:
         cls,
         config: WhoopConfig,
         *,
+        token_refresher: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         token_updated: Callable[[dict[str, Any]], None] | None = None,
         refresh_enabled: bool = True,
     ) -> "WhoopApiClient":
@@ -176,6 +179,7 @@ class WhoopApiClient:
             token_url=config.token_url,
             timeout_seconds=config.request_timeout_seconds,
             max_rate_limit_sleep_seconds=config.max_rate_limit_sleep_seconds,
+            token_refresher=token_refresher,
             token_updated=token_updated,
             refresh_enabled=refresh_enabled,
         )
@@ -236,6 +240,8 @@ class WhoopApiClient:
         return str(self._token.get("refresh_token") or "")
 
     def _ensure_fresh_token(self, *, force: bool = False) -> None:
+        if self._terminal_refresh_error is not None:
+            raise self._terminal_refresh_error
         if not force and not self._token_expires_soon():
             return
         if not self._refresh_enabled:
@@ -246,16 +252,21 @@ class WhoopApiClient:
             if force:
                 raise WhoopAuthError("WHOOP token has no refresh_token; re-run personal-data-warehouse-whoop-auth")
             return
-        if self._token_refresher is not None:
-            self._token = self._token_refresher(dict(self._token))
-        else:
-            self._token = refresh_whoop_token(
-                dict(self._token),
-                client_id=self._client_id,
-                client_secret=self._client_secret,
-                token_url=self._token_url,
-                timeout=self._timeout_seconds,
-            )
+        try:
+            if self._token_refresher is not None:
+                self._token = self._token_refresher(dict(self._token))
+            else:
+                self._token = refresh_whoop_token(
+                    dict(self._token),
+                    client_id=self._client_id,
+                    client_secret=self._client_secret,
+                    token_url=self._token_url,
+                    timeout=self._timeout_seconds,
+                )
+        except WhoopOAuthError as exc:
+            if whoop_action_required_error(exc):
+                self._terminal_refresh_error = exc
+            raise
         if self._token_updated is not None:
             self._token_updated(dict(self._token))
 
@@ -296,9 +307,11 @@ class WhoopSyncRunner:
         account = config.account
         synced_at = self._now()
         stored_token_json = self._warehouse.load_whoop_oauth_token(account=account)
-        runtime_token_json = newer_whoop_token_json(
+        runtime_token_json = select_whoop_token_json(
             bootstrap_token_json=config.token_json,
             stored_token_json=stored_token_json,
+            state_by_key=state_by_key,
+            account=account,
         )
         if runtime_token_json != stored_token_json:
             self._warehouse.upsert_whoop_oauth_token(
@@ -441,16 +454,39 @@ class WhoopSyncRunner:
     def _build_client(self, config: WhoopConfig, *, persist_rotated_token: bool):
         if self._client_factory is not None:
             return self._client_factory(config)
-        token_updated = None
+        token_refresher = None
         if persist_rotated_token:
-            token_updated = lambda token: self._warehouse.upsert_whoop_oauth_token(
-                account=config.account,
-                token_json=json.dumps(token, sort_keys=True, separators=(",", ":")),
-                updated_at=self._now(),
-            )
+            def refresh_and_persist(token: dict[str, Any]) -> dict[str, Any]:
+                expected_token_json = json.dumps(
+                    token,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+
+                def rotate(current_token_json: str) -> str:
+                    rotated = refresh_whoop_token(
+                        _parse_token_json(current_token_json),
+                        client_id=config.client_id,
+                        client_secret=config.client_secret,
+                        token_url=config.token_url,
+                        timeout=config.request_timeout_seconds,
+                    )
+                    return json.dumps(rotated, sort_keys=True, separators=(",", ":"))
+
+                current_token_json = self._warehouse.rotate_whoop_oauth_token(
+                    account=config.account,
+                    expected_token_json=expected_token_json,
+                    rotate=rotate,
+                    updated_at=self._now(),
+                )
+                self._credential_sha256 = whoop_credential_sha256(current_token_json)
+                return _parse_token_json(current_token_json)
+
+            token_refresher = refresh_and_persist
+
         return WhoopApiClient.from_config(
             config,
-            token_updated=token_updated,
+            token_refresher=token_refresher,
             refresh_enabled=persist_rotated_token,
         )
 
@@ -769,28 +805,36 @@ def truncate_error(value: str, *, max_chars: int = 4000) -> str:
     return value if len(value) <= max_chars else value[: max_chars - 3] + "..."
 
 
-def newer_whoop_token_json(*, bootstrap_token_json: str, stored_token_json: str) -> str:
-    """Choose the newest OAuth token without letting a stale private row block re-auth.
+def select_whoop_token_json(
+    *,
+    bootstrap_token_json: str,
+    stored_token_json: str,
+    state_by_key: Mapping[tuple[str, str], Mapping[str, Any]],
+    account: str,
+) -> str:
+    """Use the private row as authority, except for an explicit re-authorization.
 
-    WHOOP rotates refresh tokens. Normally the private token has the later expiry
-    and wins; after the user re-authorizes, the newly generated env bootstrap has
-    the later expiry and replaces the stale private row on the next sync.
+    ``WHOOP_TOKEN_JSON_B64`` is a one-time bootstrap, not a second mutable token
+    store. Comparing expiries is unsafe for rotating refresh tokens: a copied env
+    value can have a later-looking expiry while its refresh token was already
+    consumed. A changed bootstrap is adopted only after every collection records
+    that the current private credential was rejected.
     """
     if not stored_token_json:
         return bootstrap_token_json
     if not bootstrap_token_json:
         return stored_token_json
-    bootstrap = _parse_token_json(bootstrap_token_json)
-    stored = _parse_token_json(stored_token_json)
-    try:
-        bootstrap_expires_at = int(bootstrap.get("expires_at") or 0)
-    except (TypeError, ValueError):
-        bootstrap_expires_at = 0
-    try:
-        stored_expires_at = int(stored.get("expires_at") or 0)
-    except (TypeError, ValueError):
-        stored_expires_at = 0
-    return bootstrap_token_json if bootstrap_expires_at > stored_expires_at else stored_token_json
+    if whoop_credential_sha256(bootstrap_token_json) == whoop_credential_sha256(
+        stored_token_json
+    ):
+        return stored_token_json
+    if whoop_reauthorization_skip_reason(
+        state_by_key,
+        account=account,
+        token_json=stored_token_json,
+    ) is not None:
+        return bootstrap_token_json
+    return stored_token_json
 
 
 def _parse_token_json(token_json: str) -> dict[str, Any]:

@@ -425,6 +425,10 @@ PIPELINES: tuple[Pipeline, ...] = (
             status_column="status",
             error_column="error",
         ),
+        note=(
+            "action_required remains visible on /pipelines while repeated calls"
+            " are skipped; re-authorize WHOOP and publish a changed bootstrap token"
+        ),
     ),
     _source(
         "plaid",
