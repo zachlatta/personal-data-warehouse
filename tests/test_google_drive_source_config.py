@@ -57,12 +57,10 @@ def test_default_text_max_chars(monkeypatch):
 def test_explicit_accounts_and_flags(monkeypatch):
     monkeypatch.setenv("GOOGLE_DRIVE_SOURCE_ACCOUNTS", "zach@hackclub.com")
     monkeypatch.setenv("GOOGLE_DRIVE_SOURCE_INCLUDE_SHARED_WITH_ME", "true")
-    monkeypatch.setenv("GOOGLE_DRIVE_SOURCE_BINARY_EXTRACTION", "1")
     monkeypatch.setenv("GOOGLE_DRIVE_SOURCE_TEXT_MAX_CHARS", "5000")
     settings = load_settings(require_postgres=False)
     source = settings.google_drive_source
     assert source.accounts == ("zach@hackclub.com",)
     assert source.include_shared_with_me is True
     assert source.include_shared_drives is False
-    assert source.binary_extraction_enabled is True
     assert source.text_max_chars == 5000

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import zipfile
 from datetime import UTC, datetime
+from io import BytesIO
+from types import SimpleNamespace
 
 import pytest
 from dotenv import load_dotenv
@@ -72,28 +75,38 @@ class FakeDriveClient:
 
 
 class RecordingWarehouse:
-    def __init__(self):
+    def __init__(self, *, initial_states=None, docx_backfill_files=None):
         self.file_batches: list[int] = []
         self.text_batches: list[int] = []
+        self.text_rows: list[dict] = []
         self.sync_states: list[dict] = []
+        self.initial_states = initial_states or {}
+        self.docx_backfill_files = docx_backfill_files or []
 
     def ensure_google_drive_source_tables(self):
         pass
 
     def load_google_drive_sync_state(self):
-        return {}
+        return self.initial_states
 
     def load_google_drive_text_state(self, account):
         return {}
+
+    def load_google_drive_docx_backfill_files(self, account, *, limit):
+        return list(self.docx_backfill_files[:limit])
 
     def insert_google_drive_files(self, rows):
         self.file_batches.append(len(rows))
 
     def insert_google_drive_file_texts(self, rows):
         self.text_batches.append(len(rows))
+        self.text_rows.extend(rows)
 
     def upsert_google_drive_sync_state(self, row):
         self.sync_states.append(row)
+
+    def mark_google_drive_files_trashed(self, *, account, file_ids, sync_version):
+        pass
 
 
 def _settings(**overrides) -> Settings:
@@ -153,6 +166,22 @@ def _runner(warehouse, client, settings=None):
     )
 
 
+def _docx_bytes(*paragraphs: str) -> bytes:
+    body = "".join(
+        f"<w:p><w:r><w:t>{paragraph}</w:t></w:r></w:p>" for paragraph in paragraphs
+    )
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{body}</w:body>"
+        "</w:document>"
+    )
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+    return buffer.getvalue()
+
+
 # --- decide_extraction (pure) ---------------------------------------------
 
 
@@ -166,6 +195,14 @@ def test_decide_extraction_native_and_plain_and_unsupported():
 
     md = decide_extraction(mime_type="text/markdown", name="notes.md", size_bytes=10, config=cfg)
     assert md.mode == "download" and md.extractor == "plain"
+
+    docx = decide_extraction(
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        name="agreement.docx",
+        size_bytes=100,
+        config=cfg,
+    )
+    assert docx.mode == "download" and docx.extractor == "docx"
 
     pdf = decide_extraction(mime_type="application/pdf", name="x.pdf", size_bytes=10, config=cfg)
     assert pdf.mode == "skip" and pdf.skip_status == "unsupported"
@@ -298,6 +335,68 @@ def test_full_crawl_records_skip_status_for_unsupported_files(warehouse):
     ) == [("none", "unsupported", "")]
 
 
+def test_full_crawl_extracts_text_from_docx_files():
+    client = FakeDriveClient(
+        folders=[{"id": "root", "name": "My Drive", "parents": []}],
+        files=[
+            {
+                "id": "agreement",
+                "name": "Independent Contractor Agreement.docx",
+                "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "parents": ["root"],
+                "size": "1024",
+                "modifiedTime": "2026-06-01T00:00:00Z",
+            },
+        ],
+        downloads={
+            "agreement": _docx_bytes(
+                "Hack Club Independent Contractor Agreement",
+                "1. Scope of Work",
+            )
+        },
+    )
+    warehouse = RecordingWarehouse()
+
+    summary = _runner(warehouse, client).sync_all()[0]
+
+    assert summary.status == "ok"
+    assert client.download_calls == ["agreement"]
+    assert len(warehouse.text_rows) == 1
+    row = warehouse.text_rows[0]
+    assert row["extractor"] == "docx"
+    assert row["text_extraction_status"] == "ok"
+    assert row["text"] == "Hack Club Independent Contractor Agreement\n1. Scope of Work"
+    assert row["char_count"] == len(row["text"])
+
+
+def test_full_crawl_records_invalid_docx_as_an_extraction_error():
+    client = FakeDriveClient(
+        folders=[{"id": "root", "name": "My Drive", "parents": []}],
+        files=[
+            {
+                "id": "broken",
+                "name": "broken.docx",
+                "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "parents": ["root"],
+                "size": "12",
+                "modifiedTime": "2026-06-01T00:00:00Z",
+            },
+        ],
+        downloads={"broken": b"not a docx"},
+    )
+    warehouse = RecordingWarehouse()
+
+    summary = _runner(warehouse, client).sync_all()[0]
+
+    assert summary.status == "ok"
+    assert len(warehouse.text_rows) == 1
+    row = warehouse.text_rows[0]
+    assert row["extractor"] == "docx"
+    assert row["text_extraction_status"] == "error"
+    assert row["text"] == ""
+    assert row["text_extraction_error"]
+
+
 def test_full_crawl_flushes_batches_to_bound_memory():
     files = [
         {
@@ -327,6 +426,41 @@ def test_full_crawl_flushes_batches_to_bound_memory():
 
 
 # --- incremental -----------------------------------------------------------
+
+
+def test_incremental_backfills_docx_files_previously_recorded_as_unsupported():
+    file = {
+        "id": "agreement",
+        "name": "Independent Contractor Agreement.docx",
+        "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "parents": ["root"],
+        "size": "1024",
+        "modifiedTime": "2026-06-01T00:00:00Z",
+    }
+    warehouse = RecordingWarehouse(
+        initial_states={
+            "zach@hackclub.com": SimpleNamespace(
+                start_page_token="token-1",
+                full_crawled_at=datetime(2026, 6, 1, tzinfo=UTC),
+            )
+        },
+        docx_backfill_files=[file],
+    )
+    client = FakeDriveClient(
+        folders=[{"id": "root", "name": "My Drive", "parents": []}],
+        files=[],
+        changes=[],
+        downloads={"agreement": _docx_bytes("Backfilled contract text")},
+    )
+
+    summary = _runner(warehouse, client).sync_all()[0]
+
+    assert summary.status == "ok"
+    assert summary.sync_type == "incremental"
+    assert summary.texts_written == 1
+    assert client.download_calls == ["agreement"]
+    assert warehouse.text_rows[0]["extractor"] == "docx"
+    assert warehouse.text_rows[0]["text"] == "Backfilled contract text"
 
 
 def _seed_full(warehouse):

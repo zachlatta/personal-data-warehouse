@@ -367,7 +367,6 @@ class GoogleDriveSourceConfig:
     include_shared_drives: bool = False
     text_max_chars: int = DEFAULT_GOOGLE_DRIVE_SOURCE_TEXT_MAX_CHARS
     extract_max_bytes: int = DEFAULT_GOOGLE_DRIVE_SOURCE_EXTRACT_MAX_BYTES
-    binary_extraction_enabled: bool = False
     files_per_run: int = DEFAULT_GOOGLE_DRIVE_SOURCE_FILES_PER_RUN
     request_timeout_seconds: int = DEFAULT_GOOGLE_DRIVE_SOURCE_REQUEST_TIMEOUT_SECONDS
 
@@ -1515,7 +1514,6 @@ def load_settings(
             include_shared_drives=_parse_bool_env(os.getenv("GOOGLE_DRIVE_SOURCE_INCLUDE_SHARED_DRIVES"), False),
             text_max_chars=google_drive_source_text_max_chars,
             extract_max_bytes=google_drive_source_extract_max_bytes,
-            binary_extraction_enabled=_parse_bool_env(os.getenv("GOOGLE_DRIVE_SOURCE_BINARY_EXTRACTION"), False),
             files_per_run=google_drive_source_files_per_run,
             request_timeout_seconds=google_drive_source_request_timeout_seconds,
         )

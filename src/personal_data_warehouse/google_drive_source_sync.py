@@ -18,11 +18,13 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import logging
+import zipfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any, Callable, Protocol
+from xml.etree import ElementTree as ET
 
 from googleapiclient.http import MediaIoBaseDownload
 
@@ -31,7 +33,13 @@ from personal_data_warehouse.config import GoogleDriveSourceConfig, Settings
 logger = logging.getLogger(__name__)
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+_WORD_NAMESPACE = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_DOCX_MAIN_PART = "word/document.xml"
+_DOCX_MAX_MEMBERS = 10_000
+_DOCX_MAX_XML_BYTES = 100 * 1024 * 1024
 
 # Native Google formats we can export to text. Everything else under the
 # vnd.google-apps.* namespace (drawings, forms, sites, ...) has no useful text
@@ -71,6 +79,7 @@ FILE_FIELDS = (
 MAX_BUFFERED_FILE_ROWS = 200
 MAX_BUFFERED_TEXT_ROWS = 25
 MAX_BUFFERED_TEXT_CHARS = 10_000_000
+MAX_DOCX_BACKFILL_FILES_PER_RUN = 25
 
 
 def _is_plain_text(mime_type: str, name: str) -> bool:
@@ -82,10 +91,98 @@ def _is_plain_text(mime_type: str, name: str) -> bool:
     return any(lowered.endswith(ext) for ext in _PLAIN_TEXT_EXTENSIONS)
 
 
+def _is_docx(mime_type: str, name: str) -> bool:
+    return mime_type == DOCX_MIME or name.lower().endswith(".docx")
+
+
+def _docx_text_part_names(names: Iterable[str]) -> list[str]:
+    supplementary = sorted(
+        name
+        for name in names
+        if name in {
+            "word/comments.xml",
+            "word/endnotes.xml",
+            "word/footnotes.xml",
+        }
+        or (
+            name.startswith(("word/header", "word/footer"))
+            and name.endswith(".xml")
+        )
+    )
+    return [_DOCX_MAIN_PART, *supplementary]
+
+
+def _word_xml_text(xml: bytes, *, part_name: str) -> str:
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError as exc:
+        raise ValueError(f"DOCX part {part_name!r} contains invalid XML: {exc}") from exc
+
+    paragraphs: list[str] = []
+    for paragraph in root.iter(f"{_WORD_NAMESPACE}p"):
+        fragments: list[str] = []
+        for element in paragraph.iter():
+            if element.tag == f"{_WORD_NAMESPACE}t":
+                fragments.append(element.text or "")
+            elif element.tag == f"{_WORD_NAMESPACE}tab":
+                fragments.append("\t")
+            elif element.tag in {
+                f"{_WORD_NAMESPACE}br",
+                f"{_WORD_NAMESPACE}cr",
+            }:
+                fragments.append("\n")
+            elif element.tag == f"{_WORD_NAMESPACE}noBreakHyphen":
+                fragments.append("-")
+            elif element.tag == f"{_WORD_NAMESPACE}softHyphen":
+                fragments.append("\u00ad")
+        paragraphs.append("".join(fragments).rstrip())
+
+    while paragraphs and not paragraphs[0]:
+        paragraphs.pop(0)
+    while paragraphs and not paragraphs[-1]:
+        paragraphs.pop()
+    return "\n".join(paragraphs)
+
+
+def extract_docx_text(data: bytes) -> str:
+    """Extract visible text from the searchable XML parts of a DOCX package."""
+    stream = BytesIO(data)
+    if not zipfile.is_zipfile(stream):
+        raise ValueError("DOCX is not a valid zip container")
+    stream.seek(0)
+    try:
+        archive = zipfile.ZipFile(stream)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"DOCX is not a valid zip container: {exc}") from exc
+
+    with archive:
+        infos = archive.infolist()
+        if len(infos) > _DOCX_MAX_MEMBERS:
+            raise ValueError("DOCX contains too many package members")
+        names = {info.filename for info in infos}
+        if _DOCX_MAIN_PART not in names:
+            raise ValueError(f"DOCX is missing required part {_DOCX_MAIN_PART!r}")
+
+        parts: list[str] = []
+        total_xml_bytes = 0
+        for part_name in _docx_text_part_names(names):
+            info = archive.getinfo(part_name)
+            total_xml_bytes += info.file_size
+            if total_xml_bytes > _DOCX_MAX_XML_BYTES:
+                raise ValueError("DOCX text XML exceeds the extraction size limit")
+            try:
+                part_text = _word_xml_text(archive.read(info), part_name=part_name)
+            except (EOFError, RuntimeError, zipfile.BadZipFile) as exc:
+                raise ValueError(f"DOCX part {part_name!r} could not be read: {exc}") from exc
+            if part_text:
+                parts.append(part_text)
+        return "\n\n".join(parts)
+
+
 @dataclass(frozen=True)
 class ExtractionPlan:
     mode: str  # "export" | "download" | "skip"
-    extractor: str  # drive_export | plain | "" (skip)
+    extractor: str  # drive_export | plain | docx | "" (skip)
     export_mime: str
     skip_status: str  # only meaningful when mode == "skip"
 
@@ -100,9 +197,11 @@ def decide_extraction(*, mime_type: str, name: str, size_bytes: int, config: Goo
         return ExtractionPlan("skip", "", "", "unsupported")
     if size_bytes and size_bytes > config.extract_max_bytes:
         return ExtractionPlan("skip", "", "", "too_large")
+    if _is_docx(mime_type, name):
+        return ExtractionPlan("download", "docx", "", "")
     if _is_plain_text(mime_type, name):
         return ExtractionPlan("download", "plain", "", "")
-    # PDF/Office/images are Phase 3 (binary extraction); recorded unsupported now.
+    # PDF, other Office formats, and images do not yet have extractors.
     return ExtractionPlan("skip", "", "", "unsupported")
 
 
@@ -282,12 +381,38 @@ class GoogleDriveSourceSyncRunner:
         )
         tree = self._build_tree(client)
         known_text_state = self._warehouse.load_google_drive_text_state(account)
+        docx_backfill_files = self._warehouse.load_google_drive_docx_backfill_files(
+            account,
+            limit=MAX_DOCX_BACKFILL_FILES_PER_RUN,
+        )
         file_rows: list[dict[str, Any]] = []
         text_rows: list[dict[str, Any]] = []
         trashed_ids: list[str] = []
         seen = 0
         files_written = 0
         texts_written = 0
+        changed_file_ids = {
+            str(change.get("fileId", "") or (change.get("file") or {}).get("id", ""))
+            for change in changes
+        }
+        for file in docx_backfill_files:
+            if str(file.get("id", "")) in changed_file_ids:
+                continue
+            seen += 1
+            self._process_file(
+                account,
+                client,
+                file,
+                tree,
+                known_text_state,
+                synced_at,
+                file_rows,
+                text_rows,
+            )
+            if self._should_flush(file_rows, text_rows):
+                files, texts = self._flush_buffer(file_rows, text_rows)
+                files_written += files
+                texts_written += texts
         for change in changes:
             seen += 1
             file = change.get("file")
@@ -406,7 +531,14 @@ class GoogleDriveSourceSyncRunner:
         except Exception as exc:  # noqa: BLE001 - extraction is best-effort
             return "", "error", str(exc)[:500], "", 0
         content_sha256 = hashlib.sha256(data).hexdigest()
-        text = data.decode("utf-8", errors="replace")
+        try:
+            text = (
+                extract_docx_text(data)
+                if plan.extractor == "docx"
+                else data.decode("utf-8", errors="replace")
+            )
+        except Exception as exc:  # noqa: BLE001 - malformed documents must not fail the sync
+            return "", "error", str(exc)[:500], content_sha256, 0
         truncated = 0
         if len(text) > self._config.text_max_chars:
             text = text[: self._config.text_max_chars]

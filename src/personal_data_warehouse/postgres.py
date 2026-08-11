@@ -5460,6 +5460,52 @@ class PostgresWarehouse:
     def load_google_drive_text_modified_times(self, account: str) -> dict[str, datetime]:
         return {file_id: state[0] for file_id, state in self.load_google_drive_text_state(account).items()}
 
+    def load_google_drive_docx_backfill_files(
+        self, account: str, *, limit: int
+    ) -> list[dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT f.raw_metadata_json
+            FROM @google_drive_files AS f
+            JOIN @google_drive_file_texts AS legacy
+              ON legacy.account = f.account AND legacy.file_id = f.file_id
+            WHERE f.account = %s
+              AND f.trashed = 0
+              AND f.is_excluded = 0
+              AND legacy.extractor = 'none'
+              AND legacy.text_extraction_status = 'unsupported'
+              AND (
+                f.mime_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                OR right(lower(f.name), 5) = '.docx'
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM @google_drive_file_texts AS attempt
+                WHERE attempt.account = f.account
+                  AND attempt.file_id = f.file_id
+                  AND attempt.extractor = 'docx'
+                  AND (
+                    attempt.text_extraction_status IN ('ok', 'empty')
+                    OR attempt.content_sha256 != ''
+                  )
+              )
+            ORDER BY f.modified_time DESC, f.file_id
+            LIMIT %s
+            """,
+            (account, limit),
+        )
+        files: list[dict[str, Any]] = []
+        for (raw_metadata,) in rows:
+            parsed: object = raw_metadata
+            if isinstance(parsed, str):
+                try:
+                    parsed = json.loads(parsed)
+                except json.JSONDecodeError:
+                    continue
+            if isinstance(parsed, Mapping):
+                files.append(dict(parsed))
+        return files
+
     def mark_google_drive_files_trashed(
         self, *, account: str, file_ids: Sequence[str], sync_version: int
     ) -> None:

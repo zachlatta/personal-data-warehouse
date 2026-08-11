@@ -374,7 +374,6 @@ folders are excluded automatically so the warehouse never re-ingests its own sta
 # Tuning.
 # GOOGLE_DRIVE_SOURCE_TEXT_MAX_CHARS=5000000
 # GOOGLE_DRIVE_SOURCE_EXTRACT_MAX_BYTES=26214400
-# GOOGLE_DRIVE_SOURCE_BINARY_EXTRACTION=0   # PDF/Office (Phase 3, not yet implemented)
 # GOOGLE_DRIVE_SOURCE_FILES_PER_RUN=5000
 ```
 
@@ -389,7 +388,8 @@ Dagster exposes `google_drive_source_sync` in the `google_drive` group, schedule
 minutes by `google_drive_source_sync_every_thirty_minutes`. The first run does a full
 `files.list` crawl and records a Drive Changes `startPageToken`; later runs read
 `changes.list` incrementally. Text comes from Google-native exports (Docs→text, Sheets→CSV,
-Slides→text) and already-text files (`.md`, `.txt`, `.json`, source code, ...). The sync writes
+Slides→text), DOCX documents, and already-text files (`.md`, `.txt`, `.json`, source code, ...).
+The sync writes
 `google_drive_files`, `google_drive_file_texts`, and `google_drive_sync_state`.
 
 File bytes are **not** copied into the warehouse: rows carry `storage_backend='google_drive_source'`
