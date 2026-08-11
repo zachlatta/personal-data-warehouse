@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -5531,6 +5531,62 @@ class PostgresWarehouse:
             [(account, token_json, updated_at)],
             WHOOP_OAUTH_TOKEN_COLUMNS,
         )
+
+    def rotate_whoop_oauth_token(
+        self,
+        *,
+        account: str,
+        expected_token_json: str,
+        rotate: Callable[[str], str],
+        updated_at: datetime,
+    ) -> str:
+        """Serialize a single-use OAuth refresh against the authoritative row.
+
+        WHOOP invalidates a refresh token as soon as it returns its replacement.
+        The provider call therefore runs while a row lock is held. A racer that
+        arrived with the old token waits, observes the winner, and returns that
+        token without calling WHOOP again. A failed or incomplete refresh rolls
+        the transaction back and leaves the last known token untouched.
+        """
+
+        def canonical(token_json: str) -> str:
+            parsed = json.loads(token_json)
+            if not isinstance(parsed, dict):
+                raise ValueError("WHOOP token JSON must be an object")
+            return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+
+        expected_canonical = canonical(expected_token_json)
+        relation = self.sql_relation("whoop_oauth_tokens")
+        connection = psycopg2.connect(self._database_url)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT token_json FROM {relation} WHERE account = %s FOR UPDATE",
+                    (account,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise RuntimeError("WHOOP OAuth token row disappeared before refresh")
+                current_token_json = str(row[0])
+                if canonical(current_token_json) != expected_canonical:
+                    connection.commit()
+                    return current_token_json
+
+                rotated_token_json = rotate(current_token_json)
+                canonical(rotated_token_json)
+                cursor.execute(
+                    f"UPDATE {relation} SET token_json = %s, updated_at = %s WHERE account = %s",
+                    (rotated_token_json, updated_at, account),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("WHOOP OAuth token row disappeared during refresh")
+            connection.commit()
+            return rotated_token_json
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def insert_whoop_sync_state(
         self,

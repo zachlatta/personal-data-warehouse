@@ -279,8 +279,13 @@ The auth command writes `WHOOP_TOKEN_JSON_B64` to `.env`. That value contains OA
 must stay out of git, logs, and screenshots. The env token bootstraps the first warehouse run.
 WHOOP rotates and invalidates both access and refresh tokens on refresh, so the sync persists each
 rotated token under `private.whoop_oauth_tokens`; subsequent runs load that private row instead of
-reusing the stale bootstrap token. Dagster's WHOOP advisory lock prevents concurrent scheduled
-refreshes from racing the single-use refresh token. To verify credentials without syncing, run:
+reusing the stale bootstrap token. The private row is the sole mutable runtime authority: a
+different env token replaces it only when all collections marked the stored credential
+`action_required`, which is the explicit re-authorization handoff. Every refresh consumer,
+including the direct CLI, takes a database row lock around the provider refresh and atomic token
+update. A stale racer waits and adopts the stored winner rather than reusing the now-consumed
+refresh token. Dagster's advisory lock remains an outer guard for whole scheduled syncs. To verify
+credentials without syncing, run:
 
 ```bash
 uv run personal-data-warehouse-whoop-sync --validate
@@ -315,7 +320,9 @@ not turn the every-five-minutes schedule into hundreds of red runs a day). The `
 dashboard surfaces the rows as needing a manual step. Repair by re-running the OAuth flow
 (`uv run personal-data-warehouse-whoop-auth --write-env`) and updating `WHOOP_TOKEN_JSON_B64` on
 the production Dagster deployment; the next sync persists the fresh token and self-heals.
-Transient token-endpoint failures (5xx, network) still fail the run loudly.
+Transient token-endpoint failures (5xx, network) still fail the run loudly. Although retry ticks
+for an unchanged rejected credential are skipped, `/pipelines` continues to report
+`action_required`; see the [WHOOP OAuth operations runbook](docs/whoop-oauth-operations.md).
 
 SQL starting points:
 

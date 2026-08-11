@@ -267,6 +267,14 @@ def test_plaid_action_required_is_surfaced_as_attention():
     assert "action_required" in state.attention_statuses
 
 
+def test_whoop_action_required_remains_an_operator_visible_attention_state():
+    """Skipped retry ticks must not make a rejected WHOOP credential look healthy."""
+    state = pipeline("whoop").state
+    assert state is not None
+    assert "action_required" in state.attention_statuses
+    assert "re-author" in pipeline("whoop").note
+
+
 def test_thresholds_are_ordered_and_bounded():
     assert 1 < LATE_MULTIPLIER < STALE_MULTIPLIER
     # A missed collection must not turn the whole dashboard 'unknown': the asset

@@ -21,10 +21,10 @@ from personal_data_warehouse.whoop_sync import (
     WhoopSyncRunner,
     cycle_to_row,
     iter_collection_pages,
-    newer_whoop_token_json,
     parse_rfc3339,
     public_whoop_sync_summary,
     recovery_to_row,
+    select_whoop_token_json,
     sleep_to_row,
     workout_to_row,
     whoop_credential_sha256,
@@ -61,6 +61,7 @@ class FakeWhoopWarehouse:
         self.state_rows = []
         self.oauth_token = ""
         self.oauth_token_updates = []
+        self.oauth_token_rotations = []
 
     def ensure_whoop_tables(self) -> None:
         self.ensure_called = True
@@ -74,6 +75,24 @@ class FakeWhoopWarehouse:
     def upsert_whoop_oauth_token(self, *, account, token_json, updated_at):
         self.oauth_token = token_json
         self.oauth_token_updates.append({"account": account, "token_json": token_json, "updated_at": updated_at})
+
+    def rotate_whoop_oauth_token(self, *, account, expected_token_json, rotate, updated_at):
+        self.oauth_token_rotations.append(
+            {
+                "account": account,
+                "expected_token_json": expected_token_json,
+                "updated_at": updated_at,
+            }
+        )
+        if json.loads(self.oauth_token) != json.loads(expected_token_json):
+            return self.oauth_token
+        rotated_token_json = rotate(self.oauth_token)
+        self.upsert_whoop_oauth_token(
+            account=account,
+            token_json=rotated_token_json,
+            updated_at=updated_at,
+        )
+        return rotated_token_json
 
     def insert_whoop_profiles(self, rows):
         self.profiles.extend(rows)
@@ -272,6 +291,106 @@ def test_api_client_persists_rotated_token_after_refresh() -> None:
 
     assert persisted[0]["access_token"] == "fresh-token"
     assert persisted[0]["refresh_token"] == "refresh-token"
+
+
+def test_sync_runner_refreshes_through_the_serialized_token_store(monkeypatch) -> None:
+    expired = _token_json(
+        access_token="expired-access",
+        refresh_token="single-use-refresh",
+        expires_at=int((datetime.now(tz=UTC) - timedelta(minutes=5)).timestamp()),
+    )
+    rotated = json.loads(
+        _token_json(
+            access_token="rotated-access",
+            refresh_token="rotated-refresh",
+        )
+    )
+    monkeypatch.setenv("WHOOP_ACCOUNT", "zach@example.com")
+    monkeypatch.setenv("WHOOP_TOKEN_JSON_B64", encode_whoop_token_env(expired))
+    settings = load_settings(
+        require_postgres=False,
+        require_gmail=False,
+        require_whoop=True,
+    )
+    warehouse = FakeWhoopWarehouse()
+    warehouse.oauth_token = expired
+    refresh_calls = []
+
+    def fake_refresh(token, **_kwargs):
+        refresh_calls.append(token)
+        return rotated
+
+    monkeypatch.setattr(
+        "personal_data_warehouse.whoop_sync.refresh_whoop_token",
+        fake_refresh,
+    )
+    runner = WhoopSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+    )
+
+    client = runner._build_client(settings.whoop, persist_rotated_token=True)
+    client._ensure_fresh_token()
+
+    assert refresh_calls[0]["refresh_token"] == "single-use-refresh"
+    assert len(warehouse.oauth_token_rotations) == 1
+    assert json.loads(warehouse.oauth_token)["refresh_token"] == "rotated-refresh"
+    assert runner._credential_sha256 == whoop_credential_sha256(warehouse.oauth_token)
+
+
+def test_serialized_refresh_uses_the_store_winner_instead_of_reusing_a_stale_token() -> None:
+    expired = _token_json(
+        access_token="stale-access",
+        refresh_token="already-consumed-refresh",
+        expires_at=1,
+    )
+    winner = json.loads(
+        _token_json(
+            access_token="winner-access",
+            refresh_token="winner-refresh",
+        )
+    )
+    session = FakeSession([FakeResponse(payload={"ok": True})])
+    refresh_calls = []
+
+    def serialized_refresh(_stale_token):
+        refresh_calls.append(_stale_token)
+        return winner
+
+    client = WhoopApiClient(
+        token_json=expired,
+        session=session,
+        token_refresher=serialized_refresh,
+    )
+
+    assert client.get_json("/v2/user/profile/basic") == {"ok": True}
+    assert len(refresh_calls) == 1
+    assert session.requests[0][2]["headers"]["Authorization"] == "Bearer winner-access"
+
+
+def test_api_client_does_not_repeat_a_permanently_rejected_refresh() -> None:
+    expired = _token_json(expires_at=1)
+    refresh_calls = []
+
+    def rejected_refresh(token):
+        refresh_calls.append(token)
+        raise WhoopOAuthError(
+            "WHOOP token refresh failed with HTTP 400",
+            status_code=400,
+        )
+
+    client = WhoopApiClient(
+        token_json=expired,
+        session=FakeSession([]),
+        token_refresher=rejected_refresh,
+    )
+
+    for _ in range(2):
+        with pytest.raises(WhoopOAuthError, match="HTTP 400"):
+            client.get_json("/v2/user/profile/basic")
+
+    assert len(refresh_calls) == 1
 
 
 def test_api_client_waits_and_retries_short_rate_limit() -> None:
@@ -479,13 +598,42 @@ def test_validate_all_makes_live_shape_checks_without_returning_personal_data(mo
     assert "101" not in json.dumps(result)
 
 
-def test_newer_token_selection_allows_reauth_to_replace_stale_private_token() -> None:
-    bootstrap = _token_json(access_token="reauthorized", expires_at=300)
-    stored = _token_json(access_token="stale-private", expires_at=200)
+def test_token_selection_never_replaces_healthy_private_token_with_bootstrap() -> None:
+    bootstrap = _token_json(access_token="env-copy", expires_at=300)
+    stored = _token_json(access_token="rotated-private", expires_at=200)
 
-    assert newer_whoop_token_json(
+    assert select_whoop_token_json(
         bootstrap_token_json=bootstrap,
         stored_token_json=stored,
+        state_by_key={},
+        account="user@example.com",
+    ) == stored
+
+
+def test_token_selection_adopts_changed_bootstrap_after_stored_token_is_rejected() -> None:
+    bootstrap = _token_json(access_token="reauthorized", expires_at=300)
+    stored = _token_json(access_token="rejected-private", expires_at=400)
+    account = "user@example.com"
+    state = {
+        (account, collection): {
+            "status": "action_required",
+            "credential_sha256": whoop_credential_sha256(stored),
+        }
+        for collection in (
+            "profile",
+            "body_measurement",
+            "cycles",
+            "recovery",
+            "sleep",
+            "workout",
+        )
+    }
+
+    assert select_whoop_token_json(
+        bootstrap_token_json=bootstrap,
+        stored_token_json=stored,
+        state_by_key=state,
+        account=account,
     ) == bootstrap
 
 
@@ -493,7 +641,7 @@ def test_sync_runner_uses_private_stored_token_over_bootstrap_env_token(monkeypa
     monkeypatch.setenv("WHOOP_ACCOUNT", "zach@example.com")
     monkeypatch.setenv(
         "WHOOP_TOKEN_JSON_B64",
-        encode_whoop_token_env(_token_json(access_token="bootstrap-token", expires_at=100)),
+        encode_whoop_token_env(_token_json(access_token="bootstrap-token", expires_at=300)),
     )
     settings = load_settings(require_postgres=False, require_gmail=False, require_whoop=True)
     warehouse = FakeWhoopWarehouse()
@@ -520,6 +668,63 @@ def test_sync_runner_uses_private_stored_token_over_bootstrap_env_token(monkeypa
     ).sync_all()
 
     assert captured["token"] == "rotated-stored-token"
+    assert warehouse.oauth_token_updates == []
+
+
+def test_sync_runner_persists_reauthorized_bootstrap_after_rejection(monkeypatch) -> None:
+    account = "zach@example.com"
+    rejected = _token_json(access_token="rejected-private", expires_at=400)
+    reauthorized = _token_json(access_token="reauthorized-bootstrap", expires_at=300)
+    state = {
+        (account, collection): {
+            "status": "action_required",
+            "credential_sha256": whoop_credential_sha256(rejected),
+        }
+        for collection in (
+            "profile",
+            "body_measurement",
+            "cycles",
+            "recovery",
+            "sleep",
+            "workout",
+        )
+    }
+    monkeypatch.setenv("WHOOP_ACCOUNT", account)
+    monkeypatch.setenv(
+        "WHOOP_TOKEN_JSON_B64",
+        encode_whoop_token_env(reauthorized),
+    )
+    settings = load_settings(
+        require_postgres=False,
+        require_gmail=False,
+        require_whoop=True,
+    )
+    warehouse = FakeWhoopWarehouse(state=state)
+    warehouse.oauth_token = rejected
+    captured = {}
+    client = FakeWhoopClient(
+        pages={
+            "/v2/cycle": [{"records": [], "next_token": ""}],
+            "/v2/recovery": [{"records": [], "next_token": ""}],
+            "/v2/activity/sleep": [{"records": [], "next_token": ""}],
+            "/v2/activity/workout": [{"records": [], "next_token": ""}],
+        }
+    )
+
+    def client_factory(config):
+        captured["token"] = json.loads(config.token_json)["access_token"]
+        return client
+
+    WhoopSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=client_factory,
+    ).sync_all()
+
+    assert captured["token"] == "reauthorized-bootstrap"
+    assert len(warehouse.oauth_token_updates) == 1
+    assert json.loads(warehouse.oauth_token)["access_token"] == "reauthorized-bootstrap"
 
 
 def test_sync_runner_fetches_profile_body_and_collections_with_state(monkeypatch) -> None:

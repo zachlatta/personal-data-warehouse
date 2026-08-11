@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from threading import Event
 
 import pytest
 from dotenv import load_dotenv
@@ -161,3 +163,86 @@ def test_whoop_tables_upsert_rows_and_state(warehouse: PostgresWarehouse) -> Non
     assert state[("zach@example.com", "cycles")]["status"] == "ok"
     assert warehouse.load_whoop_oauth_token(account="zach@example.com") == '{"access_token":"private-token"}'
     assert state[("zach@example.com", "cycles")]["watermark_updated_at"] == synced_at
+
+
+def test_whoop_token_rotation_preserves_the_current_token_when_refresh_fails(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_whoop_tables()
+    account = "zach@example.com"
+    stored = '{"access_token":"current","refresh_token":"single-use"}'
+    warehouse.upsert_whoop_oauth_token(
+        account=account,
+        token_json=stored,
+        updated_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
+    )
+
+    def fail_refresh(_token_json: str) -> str:
+        raise RuntimeError("provider response was incomplete")
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        warehouse.rotate_whoop_oauth_token(
+            account=account,
+            expected_token_json=stored,
+            rotate=fail_refresh,
+            updated_at=datetime(2026, 8, 11, 12, 1, tzinfo=UTC),
+        )
+
+    assert warehouse.load_whoop_oauth_token(account=account) == stored
+
+
+def test_whoop_token_rotation_serializes_racers_and_refreshes_only_once(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_whoop_tables()
+    account = "zach@example.com"
+    original = '{"access_token":"old","refresh_token":"single-use"}'
+    winner = '{"access_token":"winner","refresh_token":"rotated"}'
+    warehouse.upsert_whoop_oauth_token(
+        account=account,
+        token_json=original,
+        updated_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
+    )
+    first_has_lock = Event()
+    allow_first_to_finish = Event()
+    losing_refresh_calls: list[str] = []
+    second = PostgresWarehouse(
+        warehouse._database_url,
+        schema=warehouse.schema_namespace,
+    )
+
+    def first_refresh(_token_json: str) -> str:
+        first_has_lock.set()
+        assert allow_first_to_finish.wait(timeout=5)
+        return winner
+
+    def losing_refresh(token_json: str) -> str:
+        losing_refresh_calls.append(token_json)
+        return '{"access_token":"loser","refresh_token":"invalid"}'
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                warehouse.rotate_whoop_oauth_token,
+                account=account,
+                expected_token_json=original,
+                rotate=first_refresh,
+                updated_at=datetime(2026, 8, 11, 12, 1, tzinfo=UTC),
+            )
+            assert first_has_lock.wait(timeout=5)
+            racer = pool.submit(
+                second.rotate_whoop_oauth_token,
+                account=account,
+                expected_token_json=original,
+                rotate=losing_refresh,
+                updated_at=datetime(2026, 8, 11, 12, 1, tzinfo=UTC),
+            )
+            allow_first_to_finish.set()
+
+            assert first.result(timeout=5) == winner
+            assert racer.result(timeout=5) == winner
+    finally:
+        second.close()
+
+    assert losing_refresh_calls == []
+    assert warehouse.load_whoop_oauth_token(account=account) == winner
