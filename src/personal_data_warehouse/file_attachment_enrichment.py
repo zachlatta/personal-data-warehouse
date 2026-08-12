@@ -126,6 +126,18 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", "
 # mark a PDF as worth a vision pass. Only consulted for sources that run a
 # deterministic extraction first (see FileEnrichmentSource.pdf_requires_prior_extraction).
 PDF_VISION_SOURCE_STATUSES = ("empty", "invalid_pdf")
+# MIME values that assert nothing. Paired with a filename that carries no
+# extension either, they describe an attachment whose format is simply unknown
+# from metadata — e.g. iMessage's extension-less "GroupPhotoImage" and
+# "BrandLogoImage" blobs, which are real images that the exact-MIME and
+# extension gates both miss. Such rows are admitted and identified from their
+# bytes (see sniff_content_type): genuine images enrich, and anything else is
+# retired as agent_unsupported on first sight rather than looping.
+#
+# The extension requirement is what keeps this narrow. It admits ~12 iMessage
+# blobs while excluding the 4,722 ".pluginPayloadAttachment" link-preview
+# payloads (1.1 GB) that the deterministic pass classifies without any download.
+AMBIGUOUS_MIME_TYPES = ("", "application/octet-stream", "application/unknown")
 MIN_IMAGE_BYTES = 256
 MODEL_IMAGE_MAX_EDGE = 1280
 MODEL_IMAGE_JPEG_QUALITY = 85
@@ -637,6 +649,10 @@ def _candidate_query(source: FileEnrichmentSource, *, projection: str, tail: str
               lower(a.{mime}) = ANY(%s)
               OR lower(a.{filename}) LIKE ANY(%s)
               OR {pdf_clause}
+              OR (
+                  lower(COALESCE(a.{mime}, '')) = ANY(%s)
+                  AND regexp_replace(a.{filename}, '^.*/', '') NOT LIKE '%%.%%'
+              )
           )
           AND NOT EXISTS (
               SELECT 1
@@ -701,6 +717,7 @@ def _candidate_params(
     ]
     if source.pdf_requires_prior_extraction:
         params.append(list(PDF_VISION_SOURCE_STATUSES))
+    params.append(list(AMBIGUOUS_MIME_TYPES))
     params.extend([provider, prompt_version, list(COMPLETED_STATUSES)])
     params.extend(terminal_params)
     return params

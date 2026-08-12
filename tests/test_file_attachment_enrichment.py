@@ -13,6 +13,7 @@ from personal_data_warehouse.agent_runner import AgentRunRequest, AgentRunResult
 from personal_data_warehouse.file_attachment_enrichment import (
     AGENT_ATTACHMENT_PROMPT_VERSION,
     AGENT_ATTACHMENT_TASK_TYPE,
+    AMBIGUOUS_MIME_TYPES,
     APPLE_MESSAGES_SOURCE,
     GMAIL_SOURCE,
     IMAGE_EXTENSIONS,
@@ -393,6 +394,30 @@ def test_candidate_query_excludes_terminal_attachments_permanently() -> None:
     assert "terminal.text_extraction_status = ANY(%s)" in sql
     assert "terminal.updated_at > now()" not in sql
     assert list(TERMINAL_STATUSES) in params
+
+
+def test_candidate_query_admits_metadata_free_blobs() -> None:
+    # iMessage stores real images as extension-less "GroupPhotoImage" /
+    # "BrandLogoImage" blobs with an application/octet-stream MIME. Neither the
+    # exact-MIME list nor the extension patterns match them, so without this
+    # clause they are permanently invisible to the vision pass. Their format is
+    # settled from their bytes once admitted.
+    warehouse = FakeWarehouse([])
+    load_file_enrichment_candidates(
+        warehouse,
+        source=APPLE_MESSAGES_SOURCE,
+        provider="agent_codex",
+        prompt_version=APPLE_MESSAGES_SOURCE.prompt_version,
+        limit=5,
+    )
+    sql, params = warehouse.queries[0]
+    # '%%' is psycopg's escape for a literal percent, matching the existing
+    # '%%.pdf' clause; it reaches Postgres as NOT LIKE '%.%'.
+    assert "NOT LIKE '%%.%%'" in sql
+    assert list(AMBIGUOUS_MIME_TYPES) in params
+    # Anchored to the basename, so a dotted DIRECTORY in the stored path cannot
+    # masquerade as a file extension.
+    assert "regexp_replace" in sql
 
 
 def test_candidate_query_can_deliberately_retry_terminal_attachments() -> None:
