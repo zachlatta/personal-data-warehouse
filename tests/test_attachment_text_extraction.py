@@ -386,6 +386,60 @@ def test_candidate_query_skips_attachments_that_already_have_a_row() -> None:
     assert sql.count("%s") == len(params)
 
 
+def test_skipped_vision_rows_do_not_consume_the_work_budget() -> None:
+    # THE starvation bug: vision-owned attachments share the "no deterministic
+    # row" condition, and in production they outnumber actionable rows ~2:1
+    # (15,575 scanned vs 5,708 actionable). If a skip counted toward the batch
+    # bound, a run could fill entirely with skips and make zero progress forever.
+    rows = [
+        candidate_row(b"", filename=f"img{i}.png", mime_type="image/png", sha=f"img-{i}")
+        for i in range(50)
+    ]
+    rows.append(candidate_row(VCARD, filename="contact.vcf", mime_type="text/vcard", sha="vcf-1"))
+    warehouse = FakeWarehouse(rows)
+
+    summary = make_runner(warehouse, FakeObjectStore(VCARD)).sync(limit=5)
+
+    # The lone actionable row is reached despite 50 skips ahead of it.
+    assert summary.extracted == 1
+    assert [r["content_sha256"] for r in warehouse.enrichment_rows] == ["vcf-1"]
+
+
+def test_work_budget_still_bounds_actionable_rows() -> None:
+    rows = [
+        candidate_row(b"", filename=f"a{i}.pluginPayloadAttachment", mime_type="application/octet-stream", sha=f"p-{i}")
+        for i in range(20)
+    ]
+    warehouse = FakeWarehouse(rows)
+
+    summary = make_runner(warehouse, FakeObjectStore(b"")).sync(limit=5)
+
+    assert summary.classified == 5
+    assert len(warehouse.enrichment_rows) == 5
+
+
+def test_full_scan_window_is_reported_not_silently_truncated() -> None:
+    # "No silent caps": if the scan window fills, actionable rows may be
+    # invisible this run, and that must be visible in the logs.
+    rows = [
+        candidate_row(b"", filename=f"img{i}.png", mime_type="image/png", sha=f"img-{i}")
+        for i in range(4)
+    ]
+    warehouse = FakeWarehouse(rows)
+    logger = FakeLogger()
+    runner = AttachmentTextExtractionRunner(
+        source=APPLE_MESSAGES_TEXT_SOURCE,
+        warehouse=warehouse,
+        object_store_factory=lambda account: FakeObjectStore(b""),
+        logger=logger,
+        scan_limit=4,
+    )
+
+    runner.sync(limit=10)
+
+    assert any("scanned the full" in w for w in logger.warnings)
+
+
 def test_candidate_query_is_bounded_by_limit() -> None:
     warehouse = FakeWarehouse([])
     load_text_extraction_candidates(warehouse, source=APPLE_MESSAGES_TEXT_SOURCE, limit=25)

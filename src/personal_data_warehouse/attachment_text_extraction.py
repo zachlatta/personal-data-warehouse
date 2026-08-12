@@ -56,7 +56,12 @@ STATUS_EMPTY = "empty"
 STATUS_UNSUPPORTED = "unsupported"
 
 DEFAULT_TEXT_MAX_CHARS = 20_000
+# Rows ACTED ON per run (extracted or classified).
 DEFAULT_TEXT_EXTRACTION_BATCH_SIZE = 500
+# Rows examined per run. Must comfortably exceed the count of vision-owned
+# attachments, which share the "no deterministic row" condition and are skipped:
+# in production 15,575 rows qualify for the scan while only 5,708 are actionable.
+DEFAULT_TEXT_EXTRACTION_SCAN_LIMIT = 50_000
 
 VCARD_MIME_TYPES = ("text/vcard", "text/x-vcard", "text/directory", "text/x-vlocation")
 VCARD_EXTENSIONS = (".vcf", ".vcard")
@@ -364,10 +369,17 @@ def load_text_extraction_candidates(
 ) -> list[dict[str, Any]]:
     """Stored attachments with no deterministic extraction row yet.
 
-    Deliberately unfiltered by format: the plan decides per row, in Python, where
-    the format tables live. Encoding that ruleset twice (once in SQL, once in
-    Python) is exactly how the vision pass's gates drifted out of sync with
-    reality in the first place.
+    Deliberately unfiltered by format: :func:`attachment_text_plan` decides per
+    row, in Python, where the format tables live. Encoding that ruleset twice
+    (once in SQL, once in Python) is exactly how the vision pass's gates drifted
+    out of sync with reality in the first place.
+
+    ``limit`` therefore bounds the METADATA scan, not the work — most rows here
+    belong to the vision pass and are skipped. The runner applies its own bound
+    to the rows it actually acts on. Sizing matters: in production 15,575 rows
+    lack a deterministic row while only 5,708 need one, so a scan bound below
+    ~10k would return nothing but vision-owned rows and the pass would spin
+    without ever reaching its work.
     """
     columns = (
         "account",
@@ -425,6 +437,7 @@ class AttachmentTextExtractionRunner:
         object_store_factory: Callable[[str], Any],
         logger,
         text_max_chars: int = DEFAULT_TEXT_MAX_CHARS,
+        scan_limit: int = DEFAULT_TEXT_EXTRACTION_SCAN_LIMIT,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._source = source
@@ -432,22 +445,40 @@ class AttachmentTextExtractionRunner:
         self._object_store_factory = object_store_factory
         self._logger = logger
         self._text_max_chars = text_max_chars
+        self._scan_limit = scan_limit
         self._now = now or (lambda: datetime.now(tz=UTC))
         self._object_stores: dict[str, Any] = {}
 
     def sync(self, *, limit: int | None) -> AttachmentTextExtractionSummary:
         self._warehouse.ensure_file_attachment_enrichment_tables()
         candidates = load_text_extraction_candidates(
-            self._warehouse, source=self._source, limit=limit
+            self._warehouse, source=self._source, limit=self._scan_limit
         )
+        if self._scan_limit and len(candidates) >= self._scan_limit:
+            # Never let a bound truncate silently: a full scan window means there
+            # may be actionable rows this run cannot see.
+            self._logger.warning(
+                "%s text extraction scanned the full %s-row window; "
+                "raise the scan limit if the backlog stops draining",
+                self._source.label,
+                self._scan_limit,
+            )
         extracted = classified = empty = failed = 0
+        acted = 0
         for candidate in candidates:
+            if limit is not None and limit > 0 and acted >= limit:
+                break
             plan = attachment_text_plan(
                 mime_type=str(candidate.get("mime_type", "")),
                 filename=str(candidate.get("filename", "")),
             )
             if plan is None:
+                # Belongs to the vision pass. Skipped WITHOUT counting toward the
+                # work bound: in production these outnumber the actionable rows
+                # roughly 2:1, so counting them would let a batch fill entirely
+                # with skips and make no progress, run after run.
                 continue
+            acted += 1
             if not plan.needs_bytes:
                 self._write(candidate, status=plan.status, text="", error=plan.reason)
                 classified += 1
