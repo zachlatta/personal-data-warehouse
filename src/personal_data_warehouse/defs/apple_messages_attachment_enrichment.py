@@ -41,6 +41,7 @@ APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 120
 APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_BATCH_SIZE_ENV = "APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_BATCH_SIZE"
 APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV = "APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS"
 APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS_ENV = "APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS"
+APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_RETRY_TERMINAL_ENV = "APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_RETRY_TERMINAL"
 APPLE_MESSAGES_ATTACHMENT_TEXT_MAX_CHARS = 20_000
 
 
@@ -127,6 +128,9 @@ def apple_messages_attachment_enrichment_backlog_sensor(context):
                 prompt_version=APPLE_MESSAGES_SOURCE.prompt_version,
                 max_error_attempts=apple_messages_attachment_enrichment_max_error_attempts(),
                 error_window_days=apple_messages_attachment_enrichment_error_window_days(),
+                # Must match the runner's view, or a retry_terminal run would
+                # never be triggered by the sensor once only terminal blobs remain.
+                retry_terminal=apple_messages_attachment_enrichment_retry_terminal(),
             )
         except Exception as exc:
             # The attachment/enrichment tables may not exist yet on a brand-new
@@ -163,6 +167,7 @@ def apple_messages_attachment_enrichment_runner(
         text_max_chars=APPLE_MESSAGES_ATTACHMENT_TEXT_MAX_CHARS,
         max_error_attempts=apple_messages_attachment_enrichment_max_error_attempts(),
         error_window_days=apple_messages_attachment_enrichment_error_window_days(),
+        retry_terminal=apple_messages_attachment_enrichment_retry_terminal(),
     )
 
 
@@ -195,6 +200,19 @@ def apple_messages_attachment_enrichment_max_error_attempts() -> int:
     if attempts < 0:
         raise ValueError(f"{APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV} must be non-negative")
     return attempts
+
+
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def apple_messages_attachment_enrichment_retry_terminal() -> bool:
+    """Whether this run re-drives attachments retired as unreadable/unsupported.
+
+    Off by default: a terminal classification describes immutable bytes, so an
+    ordinary run must never revisit it. Turn it on for one deliberate run after
+    the preparation pipeline learns a new format, then turn it back off.
+    """
+    return os.getenv(APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_RETRY_TERMINAL_ENV, "").strip().lower() in _TRUTHY_ENV_VALUES
 
 
 def apple_messages_attachment_enrichment_error_window_days() -> int:

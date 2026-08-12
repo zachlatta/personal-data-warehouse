@@ -76,7 +76,17 @@ STATUS_ERROR = "agent_error"
 # for a content-addressed blob — the same bytes always fail the same way — so it
 # must not be retried on every run the way the recycling agent_error rows were.
 STATUS_UNREADABLE = "agent_unreadable"
+# The bytes decoded fine and were positively identified, but the format is
+# deliberately outside the vision pass (video, archives, plist payloads).
+# Distinct from STATUS_UNREADABLE so coverage reporting can say "unsupported by
+# design" rather than "corrupt", which are different follow-ups.
+STATUS_UNSUPPORTED = "agent_unsupported"
 COMPLETED_STATUSES = (STATUS_OK, STATUS_NOT_USEFUL)
+# Statuses that permanently retire an attachment from the candidate pool. Both
+# are properties of the bytes, and attachments are content-addressed by sha256,
+# so re-running can only reproduce the identical failure. The escape hatch after
+# a preparation-pipeline fix is an explicit retry_terminal run, never elapsed time.
+TERMINAL_STATUSES = (STATUS_UNREADABLE, STATUS_UNSUPPORTED)
 
 
 class AttachmentPreparationError(RuntimeError):
@@ -86,8 +96,18 @@ class AttachmentPreparationError(RuntimeError):
     themselves (as opposed to a transient agent/container failure). Because
     attachments are content-addressed by sha256 the bytes never change, so this
     failure is permanent for the current preparation pipeline. The runner records
-    it as STATUS_UNREADABLE and the candidate query excludes such attachments for
-    a rolling window instead of re-downloading and re-failing them every run.
+    it as STATUS_UNREADABLE and the candidate query excludes such attachments
+    permanently.
+    """
+
+
+class AttachmentUnsupportedError(AttachmentPreparationError):
+    """The bytes were identified, but the format is not enrichable by design.
+
+    A subclass of AttachmentPreparationError because it is equally permanent, so
+    call sites that only care about "this blob will never produce text" keep
+    working unchanged. ``sync`` catches it first purely to record the more
+    precise STATUS_UNSUPPORTED.
     """
 
 IMAGE_MIME_TYPES = (
@@ -113,6 +133,59 @@ PDF_RENDER_MAX_PAGES = 1
 PDF_RENDER_TIMEOUT_SECONDS = 60
 
 AGENT_ATTACHMENT_INPUT_BASENAME = "attachment"
+
+# Minimum bytes needed before any signature below can match.
+_SNIFF_MIN_BYTES = 12
+# ISO base-media (`....ftyp<brand>`) covers HEIC stills and MP4/QuickTime video
+# with the same box header, so the brand decides which it is.
+_HEIF_BRANDS = frozenset({b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1"})
+_QUICKTIME_BRANDS = frozenset({b"qt  "})
+
+
+def sniff_content_type(content: bytes) -> str:
+    """Identify attachment bytes by magic number, or "" when unrecognized.
+
+    The declared MIME on iMessage/WhatsApp attachments is frequently absent,
+    ``application/octet-stream``, or simply wrong, and the filename extension is
+    no better. Trusting either one meant a perfectly good PNG delivered as
+    octet-stream was recorded as "not a decodable image" and written off, while a
+    video named ``.png`` burned retries. The bytes are the only honest authority.
+
+    Returns "" rather than guessing when nothing matches, so the caller can fall
+    back to the declared metadata instead of acting on a wrong identification.
+    """
+    if len(content) < _SNIFF_MIN_BYTES:
+        return ""
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return "image/webp"
+    if content.startswith((b"II*\x00", b"MM\x00*")):
+        return "image/tiff"
+    if content.startswith(b"%PDF-"):
+        return "application/pdf"
+    if content[4:8] == b"ftyp":
+        brand = content[8:12]
+        if brand in _HEIF_BRANDS:
+            return "image/heic"
+        if brand in _QUICKTIME_BRANDS:
+            return "video/quicktime"
+        return "video/mp4"
+    if content.startswith(b"bplist00"):
+        return "application/x-plist"
+    if content.startswith(b"PK\x03\x04"):
+        return "application/zip"
+    if content.startswith(b"BM"):
+        return "image/bmp"
+    return ""
+
+
+def _is_enrichable_image_type(content_type: str) -> bool:
+    return content_type.startswith("image/")
 
 
 @dataclass(frozen=True)
@@ -265,6 +338,7 @@ class FileAttachmentEnrichmentRunner:
         error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
         now: Callable[[], datetime] | None = None,
         context_builder: Callable[[Any, Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
+        retry_terminal: bool = False,
     ) -> None:
         self._source = source
         self._warehouse = warehouse
@@ -277,6 +351,10 @@ class FileAttachmentEnrichmentRunner:
         self._text_max_chars = text_max_chars
         self._max_error_attempts = max_error_attempts
         self._error_window_days = error_window_days
+        # One-run escape hatch: re-drive blobs previously retired as
+        # unreadable/unsupported, for use right after the preparation pipeline
+        # learns a new format. Off by default so terminal really means terminal.
+        self._retry_terminal = retry_terminal
         self._now = now or (lambda: datetime.now(tz=UTC))
         # Optional (warehouse, candidate) -> mapping hook: sources that know
         # more than the blob (photos: capture time, GPS, nearby calendar
@@ -301,6 +379,7 @@ class FileAttachmentEnrichmentRunner:
             limit=limit,
             max_error_attempts=self._max_error_attempts,
             error_window_days=self._error_window_days,
+            retry_terminal=self._retry_terminal,
         )
         enriched = 0
         not_useful = 0
@@ -313,10 +392,22 @@ class FileAttachmentEnrichmentRunner:
                     "[%s/%s] enriching %s %s", index, len(candidates), self._source.label, label
                 )
                 status = self._enrich_candidate(candidate)
+            except AttachmentUnsupportedError as exc:
+                # Positively identified as a format the vision pass does not
+                # handle. Terminal and distinct from "corrupt", so coverage
+                # reporting can separate "unsupported by design" from "broken".
+                # Checked before AttachmentPreparationError because it subclasses it.
+                failed += 1
+                self._record_failure(candidate, error=str(exc), status=STATUS_UNSUPPORTED)
+                self._logger.info(
+                    "[%s/%s] unsupported %s: %s", index, len(candidates), label, exc
+                )
+                continue
             except AttachmentPreparationError as exc:
-                # Permanent: the bytes can't be decoded/rendered. Record it as
-                # unreadable so the candidate query stops re-selecting it every
-                # run (it re-enters only after the rolling error window).
+                # Permanent: the bytes can't be decoded/rendered at all. Recorded
+                # as unreadable so the candidate query retires it for good; a
+                # later preparation fix re-drives it via an explicit
+                # retry_terminal run.
                 failed += 1
                 self._record_failure(candidate, error=str(exc), status=STATUS_UNREADABLE)
                 self._logger.warning(
@@ -555,17 +646,40 @@ def _candidate_query(source: FileEnrichmentSource, *, projection: str, tail: str
                 AND done.ai_prompt_version = %s
                 AND done.text_extraction_status = ANY(%s)
           )
-          AND NOT EXISTS (
-              SELECT 1
-              FROM {ENRICHMENT_TABLE} unreadable
-              WHERE unreadable.content_sha256 = a.{sha}
-                AND unreadable.ai_provider = %s
-                AND unreadable.ai_prompt_version = %s
-                AND unreadable.text_extraction_status = %s
-                {{unreadable_window_sql}}
-          )
+          {{terminal_exclusion_sql}}
         {tail}
         """
+
+
+def _terminal_exclusion_clause(
+    sha_column: str, *, provider: str, prompt_version: str, retry_terminal: bool
+) -> tuple[str, list[Any]]:
+    """SQL + params retiring attachments with a terminal classification.
+
+    Permanent by design (no rolling window): a terminal status describes the
+    bytes, and the bytes are immutable for a content-addressed blob, so a retry
+    can only reproduce the identical failure. The earlier windowed version let
+    every unreadable attachment back in after 14 days to fail the same way — how
+    7 unreadable iMessage images became 14 in two weeks, each one costing a Drive
+    download and a preparation attempt.
+
+    ``retry_terminal`` drops the guard for one deliberate run, which is the
+    supported way to re-drive blobs after the preparation pipeline learns a new
+    format (mirroring the photos uploader's ``--retry-failed``).
+    """
+    if retry_terminal:
+        return "", []
+    return (
+        f"""AND NOT EXISTS (
+              SELECT 1
+              FROM {ENRICHMENT_TABLE} terminal
+              WHERE terminal.content_sha256 = a.{sha_column}
+                AND terminal.ai_provider = %s
+                AND terminal.ai_prompt_version = %s
+                AND terminal.text_extraction_status = ANY(%s)
+          )""",
+        [provider, prompt_version, list(TERMINAL_STATUSES)],
+    )
 
 
 def _candidate_params(
@@ -575,7 +689,7 @@ def _candidate_params(
     prompt_version: str,
     max_error_attempts: int,
     error_window_params: list[Any],
-    unreadable_window_params: list[Any],
+    terminal_params: list[Any],
 ) -> list[Any]:
     params: list[Any] = [
         source.task_type,
@@ -588,7 +702,7 @@ def _candidate_params(
     if source.pdf_requires_prior_extraction:
         params.append(list(PDF_VISION_SOURCE_STATUSES))
     params.extend([provider, prompt_version, list(COMPLETED_STATUSES)])
-    params.extend([provider, prompt_version, STATUS_UNREADABLE, *unreadable_window_params])
+    params.extend(terminal_params)
     return params
 
 
@@ -601,12 +715,16 @@ def load_file_enrichment_candidates(
     limit: int | None,
     max_error_attempts: int = DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
+    retry_terminal: bool = False,
 ) -> list[dict[str, Any]]:
     """Image (or scanned-PDF) attachments stored in the object store that have
     no completed agent enrichment for this provider/prompt identity."""
     error_window_sql, error_window_params = _error_window_clause(error_window_days)
-    unreadable_window_sql, unreadable_window_params = _error_window_clause(
-        error_window_days, column="unreadable.updated_at"
+    terminal_exclusion_sql, terminal_params = _terminal_exclusion_clause(
+        source.sha_column,
+        provider=provider,
+        prompt_version=prompt_version,
+        retry_terminal=retry_terminal,
     )
     columns = (
         "account",
@@ -638,14 +756,14 @@ def load_file_enrichment_candidates(
         source,
         projection=projection,
         tail=f"ORDER BY a.{source.sha_column}, a.{source.order_column} DESC",
-    ).format(error_window_sql=error_window_sql, unreadable_window_sql=unreadable_window_sql)
+    ).format(error_window_sql=error_window_sql, terminal_exclusion_sql=terminal_exclusion_sql)
     params = _candidate_params(
         source,
         provider=provider,
         prompt_version=prompt_version,
         max_error_attempts=max_error_attempts,
         error_window_params=error_window_params,
-        unreadable_window_params=unreadable_window_params,
+        terminal_params=terminal_params,
     )
     if limit_sql:
         params.append(int(limit))
@@ -671,24 +789,28 @@ def has_file_enrichment_candidate(
     prompt_version: str,
     max_error_attempts: int = DEFAULT_ATTACHMENT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     error_window_days: int = DEFAULT_ATTACHMENT_ENRICHMENT_ERROR_WINDOW_DAYS,
+    retry_terminal: bool = False,
 ) -> bool:
     """Return whether at least one stored attachment needs agent enrichment."""
     error_window_sql, error_window_params = _error_window_clause(error_window_days)
-    unreadable_window_sql, unreadable_window_params = _error_window_clause(
-        error_window_days, column="unreadable.updated_at"
+    terminal_exclusion_sql, terminal_params = _terminal_exclusion_clause(
+        source.sha_column,
+        provider=provider,
+        prompt_version=prompt_version,
+        retry_terminal=retry_terminal,
     )
     query = _candidate_query(
         source,
         projection="SELECT 1",
         tail="LIMIT 1",
-    ).format(error_window_sql=error_window_sql, unreadable_window_sql=unreadable_window_sql)
+    ).format(error_window_sql=error_window_sql, terminal_exclusion_sql=terminal_exclusion_sql)
     params = _candidate_params(
         source,
         provider=provider,
         prompt_version=prompt_version,
         max_error_attempts=max_error_attempts,
         error_window_params=error_window_params,
-        unreadable_window_params=unreadable_window_params,
+        terminal_params=terminal_params,
     )
     rows = warehouse._query(query, tuple(params))
     return bool(rows)
@@ -706,16 +828,33 @@ def attachment_storage_ref(candidate: Mapping[str, Any]) -> dict[str, str]:
 def prepare_attachment_image(*, content: bytes, mime_type: str, filename: str) -> tuple[bytes, str]:
     """Normalize attachment bytes into one image file the agent can view.
 
-    PDFs are rendered to a PNG of the first page; everything else goes through
-    PIL for EXIF transposition, downscaling, and JPEG re-encoding so the agent
-    never sees oversized or exotic formats.
+    Routing is decided by the BYTES first (see :func:`sniff_content_type`) and
+    only falls back to the declared MIME/extension when the bytes are
+    unrecognized. That ordering is what lets a real image arrive as
+    ``application/octet-stream`` and still be enriched, and what lets a video
+    named ``.png`` be retired as unsupported instead of failing as a decode
+    error on every retry.
+
+    PDFs are rendered to a PNG of the first page; images go through PIL for EXIF
+    transposition, downscaling, and JPEG re-encoding so the agent never sees
+    oversized or exotic formats. A positively-identified non-image, non-PDF
+    format raises :class:`AttachmentUnsupportedError`.
     """
+    sniffed = sniff_content_type(content)
     extension = Path(filename.lower()).suffix
-    if mime_type.lower() == "application/pdf" or extension == ".pdf" or content.startswith(b"%PDF-"):
+    declared_pdf = mime_type.lower() == "application/pdf" or extension == ".pdf"
+
+    if sniffed == "application/pdf" or (declared_pdf and not sniffed):
         pages = render_pdf_pages(content=content, max_pages=PDF_RENDER_MAX_PAGES)
         if not pages:
             raise AttachmentPreparationError("PDF rendered no pages")
         return pages[0], f"{AGENT_ATTACHMENT_INPUT_BASENAME}.png"
+
+    if sniffed and not _is_enrichable_image_type(sniffed):
+        raise AttachmentUnsupportedError(
+            f"unsupported attachment format: {sniffed} (declared {mime_type or 'nothing'})"
+        )
+
     return normalized_model_image(content), f"{AGENT_ATTACHMENT_INPUT_BASENAME}.jpg"
 
 

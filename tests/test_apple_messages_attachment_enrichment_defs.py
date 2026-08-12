@@ -12,8 +12,25 @@ from personal_data_warehouse.defs.apple_messages_attachment_enrichment import (
     apple_messages_attachment_enrichment_hourly,
     apple_messages_attachment_enrichment_job,
     apple_messages_attachment_enrichment_max_error_attempts,
+    apple_messages_attachment_enrichment_retry_terminal,
 )
 from personal_data_warehouse.file_attachment_enrichment import APPLE_MESSAGES_SOURCE
+
+
+def test_retry_terminal_defaults_to_off(monkeypatch) -> None:
+    # Terminal must mean terminal on every ordinary run; re-driving retired blobs
+    # is an explicit operator action, never the default.
+    monkeypatch.delenv("APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_RETRY_TERMINAL", raising=False)
+    assert apple_messages_attachment_enrichment_retry_terminal() is False
+
+
+def test_retry_terminal_accepts_truthy_spellings(monkeypatch) -> None:
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_RETRY_TERMINAL", value)
+        assert apple_messages_attachment_enrichment_retry_terminal() is True
+    for value in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("APPLE_MESSAGES_ATTACHMENT_ENRICHMENT_RETRY_TERMINAL", value)
+        assert apple_messages_attachment_enrichment_retry_terminal() is False
 
 
 def test_apple_messages_attachment_enrichment_job_selects_asset() -> None:

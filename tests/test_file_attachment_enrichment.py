@@ -24,13 +24,18 @@ from personal_data_warehouse.file_attachment_enrichment import (
     STATUS_NOT_USEFUL,
     STATUS_OK,
     STATUS_UNREADABLE,
+    STATUS_UNSUPPORTED,
+    TERMINAL_STATUSES,
+    AttachmentUnsupportedError,
     attachment_enrichment_text,
     attachment_storage_ref,
     attachment_vision_prompt,
     attachment_vision_schema,
+    has_file_enrichment_candidate,
     load_file_enrichment_candidates,
     normalized_model_image,
     prepare_attachment_image,
+    sniff_content_type,
     validate_attachment_vision_result,
 )
 
@@ -368,7 +373,7 @@ def test_normalized_model_image_salvages_truncated_image() -> None:
         assert rendered.size == (256, 256)
 
 
-def test_candidate_query_excludes_recent_unreadable_attachments() -> None:
+def test_candidate_query_excludes_terminal_attachments_permanently() -> None:
     warehouse = FakeWarehouse([])
     load_file_enrichment_candidates(
         warehouse,
@@ -379,12 +384,106 @@ def test_candidate_query_excludes_recent_unreadable_attachments() -> None:
         error_window_days=14,
     )
     sql, params = warehouse.queries[0]
-    # The query must carry a dedicated unreadable-exclusion guard, scoped to the
-    # rolling window so a since-fixed preparation pipeline lets the attachment
-    # back in once its stale failure ages out.
-    assert "unreadable.text_extraction_status = %s" in sql
-    assert "unreadable.updated_at > now()" in sql
-    assert STATUS_UNREADABLE in params
+    # A terminal classification must be PERMANENT. The previous rolling-window
+    # exclusion let every agent_unreadable blob re-enter the candidate pool 14
+    # days later and re-fail identically forever — a slow loop that doubled the
+    # unreadable count between 2026-07-28 and 2026-08-12. Because attachments are
+    # content-addressed, the same bytes always fail the same way; the deliberate
+    # escape hatch is retry_terminal, not the passage of time.
+    assert "terminal.text_extraction_status = ANY(%s)" in sql
+    assert "terminal.updated_at > now()" not in sql
+    assert list(TERMINAL_STATUSES) in params
+
+
+def test_candidate_query_can_deliberately_retry_terminal_attachments() -> None:
+    # After a preparation-pipeline fix (e.g. new format support) the operator
+    # re-drives previously terminal blobs explicitly, the same way the photos
+    # uploader's --retry-failed clears its backoff.
+    warehouse = FakeWarehouse([])
+    load_file_enrichment_candidates(
+        warehouse,
+        source=GMAIL_SOURCE,
+        provider="agent_codex",
+        prompt_version=GMAIL_SOURCE.prompt_version,
+        limit=5,
+        retry_terminal=True,
+    )
+    sql, params = warehouse.queries[0]
+    assert "terminal.text_extraction_status" not in sql
+    assert list(TERMINAL_STATUSES) not in params
+
+
+def test_sniff_content_type_identifies_formats_from_bytes() -> None:
+    # Declared MIME on iMessage attachments is frequently wrong or absent, so the
+    # bytes are the authority.
+    assert sniff_content_type(png_bytes()) == "image/png"
+    assert sniff_content_type(heic_bytes()) == "image/heic"
+    assert sniff_content_type(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n") == "application/pdf"
+    assert sniff_content_type(b"GIF89a" + b"\x00" * 16) == "image/gif"
+    assert sniff_content_type(b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00") == "video/mp4"
+    assert sniff_content_type(b"\x00\x00\x00\x14ftypqt  \x00\x00\x02\x00") == "video/quicktime"
+    assert sniff_content_type(b"bplist00" + b"\x00" * 16) == "application/x-plist"
+    # Too short / unrecognized must be "unknown", never a wrong guess.
+    assert sniff_content_type(b"tiny") == ""
+    assert sniff_content_type(b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c") == ""
+
+
+def test_prepare_attachment_image_trusts_bytes_over_wrong_declared_mime() -> None:
+    # A real PNG delivered with application/octet-stream and a meaningless
+    # filename must still be enriched rather than failing as "not a decodable
+    # image" and being written off as unreadable.
+    image, name = prepare_attachment_image(
+        content=png_bytes(),
+        mime_type="application/octet-stream",
+        filename="6F2A-payload.pluginPayloadAttachment",
+    )
+    assert name == "attachment.jpg"
+    with Image.open(BytesIO(image)) as rendered:
+        assert rendered.format == "JPEG"
+
+
+def test_prepare_attachment_image_renders_pdf_bytes_mislabeled_as_image() -> None:
+    pdf = b"%PDF-1.4\n" + b"\x00" * 64
+    # Sniffed as PDF despite the .png name, so it takes the PDF render path and
+    # any failure there is a PDF failure, not a bogus "not a decodable image".
+    with pytest.raises(AttachmentPreparationError, match="pdftoppm|PDF"):
+        prepare_attachment_image(content=pdf, mime_type="image/png", filename="scan.png")
+
+
+def test_prepare_attachment_image_classifies_video_as_unsupported() -> None:
+    # Video is deliberately out of scope for the vision pass. It must get a
+    # STABLE terminal classification rather than being retried as a decode error,
+    # so the coverage report can say "unsupported by design" instead of "missing".
+    with pytest.raises(AttachmentUnsupportedError, match="video/mp4"):
+        prepare_attachment_image(
+            content=b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00" + b"\x00" * 32,
+            mime_type="video/mp4",
+            filename="IMG_2231.MOV",
+        )
+
+
+def test_unsupported_error_is_a_preparation_error_subtype() -> None:
+    # Both are permanent for a content-addressed blob, so existing call sites that
+    # catch AttachmentPreparationError keep working; sync() distinguishes them
+    # only to record the more precise status.
+    assert issubclass(AttachmentUnsupportedError, AttachmentPreparationError)
+
+
+def test_runner_records_unsupported_status_without_agent_run() -> None:
+    content = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00" + b"\x00" * 32
+    warehouse = FakeWarehouse(
+        [candidate_row(content, filename="IMG_2231.MOV", mime_type="video/quicktime")]
+    )
+    agent = FakeAgent(useful_output())
+
+    summary = make_runner(warehouse, agent, FakeObjectStore(content)).sync(limit=None)
+
+    assert summary.attachments_failed == 1
+    assert agent.requests == []  # never burns an agent run on a known-unsupported format
+    assert warehouse.agent_runs == []
+    row = warehouse.enrichment_rows[0]
+    assert row["text_extraction_status"] == STATUS_UNSUPPORTED
+    assert "video/mp4" in row["text_extraction_error"]
 
 
 def test_candidate_completion_identity_ignores_model() -> None:
@@ -405,9 +504,12 @@ def test_candidate_completion_identity_ignores_model() -> None:
 
 @pytest.mark.parametrize("source", [GMAIL_SOURCE, WHATSAPP_SOURCE, APPLE_MESSAGES_SOURCE])
 @pytest.mark.parametrize("error_window_days", [14, 0])
-def test_candidate_query_placeholder_count_matches_params(source, error_window_days) -> None:
+@pytest.mark.parametrize("retry_terminal", [False, True])
+def test_candidate_query_placeholder_count_matches_params(
+    source, error_window_days, retry_terminal
+) -> None:
     # Guards against parameter/placeholder drift across the several %s groups
-    # (cap CTE, eligibility, completed-exclusion, unreadable-exclusion, windows,
+    # (cap CTE, eligibility, completed-exclusion, terminal-exclusion, window,
     # limit), which would otherwise raise at execution time in production.
     warehouse = FakeWarehouse([])
     load_file_enrichment_candidates(
@@ -417,9 +519,27 @@ def test_candidate_query_placeholder_count_matches_params(source, error_window_d
         prompt_version=source.prompt_version,
         limit=5,
         error_window_days=error_window_days,
+        retry_terminal=retry_terminal,
     )
     sql, params = warehouse.queries[0]
     assert sql.count("%s") == len(params)
+
+
+@pytest.mark.parametrize("source", [GMAIL_SOURCE, WHATSAPP_SOURCE, APPLE_MESSAGES_SOURCE])
+def test_existence_probe_matches_candidate_query_terminal_rules(source) -> None:
+    # The sensor's probe and the runner's loader must agree on what counts as a
+    # candidate; otherwise the sensor launches runs that find nothing to do.
+    probe_warehouse = FakeWarehouse([])
+    has_file_enrichment_candidate(
+        probe_warehouse,
+        source=source,
+        provider="agent_codex",
+        prompt_version=source.prompt_version,
+    )
+    probe_sql, probe_params = probe_warehouse.queries[0]
+    assert "terminal.text_extraction_status = ANY(%s)" in probe_sql
+    assert "terminal.updated_at > now()" not in probe_sql
+    assert probe_sql.count("%s") == len(probe_params)
 
 
 def test_runner_rejects_output_missing_required_fields() -> None:
