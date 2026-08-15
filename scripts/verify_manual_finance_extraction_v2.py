@@ -115,7 +115,7 @@ def grounding_summary(output: dict, *, source_text: str) -> dict:
         # may either be itemized beside or folded into the cash total. A price
         # printed to cents can contribute up to half a cent of rounding error
         # per share; options use their exact 100-share multiplier.
-        quote_rounding = Decimal("0") if is_option else quantity * Decimal("0.005")
+        quote_rounding = Decimal("0") if is_option else abs(quantity) * Decimal("0.005")
         if difference > fees + quote_rounding + Decimal("0.02"):
             arithmetic_outliers.append(
                 {

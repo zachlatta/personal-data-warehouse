@@ -312,6 +312,32 @@ def test_transaction_schema_carries_per_trade_security_detail():
     }
 
 
+def test_grounding_arithmetic_allows_source_signed_sale_quantities():
+    from scripts.verify_manual_finance_extraction_v2 import grounding_summary
+
+    output = {
+        "transactions": [
+            {
+                "date": "2026-01-02",
+                "description": "Security sale",
+                "amount": "450.00",
+                "direction": "in",
+                "security_name": "Acme Fund",
+                "ticker": "ACME",
+                "cusip": "",
+                "quantity": "-450.000",
+                "price_per_share": "1.0000",
+                "trade_side": "sell",
+                "fees": "",
+            }
+        ]
+    }
+
+    summary = grounding_summary(output, source_text="-450.000 1.0000 450.00")
+
+    assert summary["arithmetic_outlier_count"] == 0
+
+
 def test_schema_captures_the_statement_position_snapshot():
     """Portfolio Summary gives per-security qty held at period end — the
     independent check that a reconstructed lot history is actually right."""
