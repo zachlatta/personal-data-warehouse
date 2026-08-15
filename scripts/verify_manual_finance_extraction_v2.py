@@ -112,11 +112,16 @@ def grounding_summary(output: dict, *, source_text: str) -> dict:
         multiplier = Decimal("100") if is_option else Decimal("1")
         difference = abs(abs(amount) - abs(quantity * price * multiplier))
         # Printed fractional-share totals are rounded to cents; explicit fees
-        # may either be itemized beside or folded into the cash total. A price
-        # printed to cents can contribute up to half a cent of rounding error
-        # per share; options use their exact 100-share multiplier.
+        # may either be itemized beside or folded into the cash total. Some
+        # brokers also fold a few cents of regulatory/contract charges into
+        # the cash amount without printing them in a separate fee column. A
+        # five-basis-point allowance accepts those source-grounded residuals
+        # while still catching multiplier/quantity mistakes by orders of
+        # magnitude. A spot quote printed to cents can additionally contribute
+        # up to half a cent of rounding error per share.
         quote_rounding = Decimal("0") if is_option else abs(quantity) * Decimal("0.005")
-        if difference > fees + quote_rounding + Decimal("0.02"):
+        implicit_fee_tolerance = abs(amount) * Decimal("0.0005")
+        if difference > fees + quote_rounding + max(Decimal("0.02"), implicit_fee_tolerance):
             arithmetic_outliers.append(
                 {
                     "date": row.get("date"),

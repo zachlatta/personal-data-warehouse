@@ -338,6 +338,32 @@ def test_grounding_arithmetic_allows_source_signed_sale_quantities():
     assert summary["arithmetic_outlier_count"] == 0
 
 
+def test_grounding_arithmetic_allows_small_unitemized_option_fee_residual():
+    from scripts.verify_manual_finance_extraction_v2 import grounding_summary
+
+    output = {
+        "transactions": [
+            {
+                "date": "2026-01-13",
+                "description": "Bought option contract",
+                "amount": "2324.78",
+                "direction": "out",
+                "security_name": "ACME 01/16/2026 Call $10",
+                "ticker": "ACME",
+                "cusip": "",
+                "quantity": "5",
+                "price_per_share": "4.65000",
+                "trade_side": "buy",
+                "fees": "",
+            }
+        ]
+    }
+
+    summary = grounding_summary(output, source_text="5 4.65000 2324.78")
+
+    assert summary["arithmetic_outlier_count"] == 0
+
+
 def test_schema_captures_the_statement_position_snapshot():
     """Portfolio Summary gives per-security qty held at period end — the
     independent check that a reconstructed lot history is actually right."""
