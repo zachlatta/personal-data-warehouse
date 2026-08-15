@@ -691,6 +691,9 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "finance_accounts": _support("finance_ledger", "updated_at"),
     "finance_account_links": _support("finance_ledger", "created_at", note="identity resolution audit"),
     "finance_transaction_links": _support("finance_ledger", "created_at"),
+    "finance_security_transactions": _data("finance_ledger", "created_at", "trade_date"),
+    "finance_security_transaction_links": _support("finance_ledger", "created_at"),
+    "finance_tax_lots": _support("finance_ledger", "created_at", note="FIFO reduction of the trade ledger"),
     "receipt_transaction_receipts": _data("receipt_enrichment", "updated_at", "purchased_at"),
     # Shared attachment/media enrichment
     "file_attachment_enrichments": _data("attachment_enrichment", "updated_at", "ai_processed_at"),

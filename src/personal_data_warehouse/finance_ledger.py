@@ -43,6 +43,18 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from personal_data_warehouse.postgres import PostgresWarehouse
+from personal_data_warehouse.securities_ledger import (
+    SecurityIdentity,
+    SecurityResolver,
+    build_tax_lots,
+    dedupe_security_trades,
+    ASSET_CLASS_OPTION,
+    classify_asset_class,
+    document_trade_entry,
+    option_identity,
+    plaid_trade_side,
+)
+
 
 LEDGER_SOURCE_PLAID = "plaid"
 LEDGER_SOURCE_MANUAL = "manual_finance"
@@ -74,6 +86,10 @@ ACCOUNT_KINDS = (
 # ledger row when the account and amount match exactly and the dates are
 # within this many days (posted-vs-statement date drift).
 FUZZY_MATCH_MAX_DAYS = 3
+
+# Absence sentinel for NOT NULL day columns (the receipts precedent).
+# The marts views NULLIF it back out, so no reader sees 1970 as a date.
+_SENTINEL_DATE = date(1970, 1, 1)
 
 _SAVINGS_SUBTYPES = {"savings", "hsa", "cd", "money market"}
 _IRA_SUBTYPES = {"ira", "roth", "roth ira", "401k", "403b", "457b", "sep ira", "simple ira", "pension"}
@@ -183,6 +199,10 @@ class FinanceLedgerSummary:
     transactions_removed: int = 0
     accounts_merged: int = 0
     accounts_pruned: int = 0
+    security_trades_upserted: int = 0
+    security_trades_merged: int = 0
+    security_trades_removed: int = 0
+    tax_lots_built: int = 0
 
 
 class FinanceLedgerRunner:
@@ -418,6 +438,17 @@ class FinanceLedgerRunner:
             sync_version=sync_version,
         )
 
+        # Security-level trades and the lots they imply. Runs off the same
+        # loaded sources as the cash pass, but is an independent fact table:
+        # a brokerage buy is one cash flow AND one share movement.
+        securities = self._build_security_trades(
+            plaid_account_map=plaid_account_map,
+            extractions=extractions,
+            doc_accounts=doc_accounts,
+            now=now,
+            sync_version=sync_version,
+        )
+
         # Merge residue: an account every source has stopped linking to is not
         # a fact, it is the leftover half of a merge. Nothing else empties an
         # account's links (they are only ever added or re-pointed), so this
@@ -435,10 +466,15 @@ class FinanceLedgerRunner:
             transactions_removed=transactions["removed"],
             accounts_merged=accounts_merged,
             accounts_pruned=accounts_pruned,
+            security_trades_upserted=securities["upserted"],
+            security_trades_merged=securities["merged"],
+            security_trades_removed=securities["removed"],
+            tax_lots_built=securities["lots"],
         )
         self._logger.info(
             "Finance ledger: accounts_seen=%s accounts_created=%s links_created=%s observations=%s "
-            "transactions=%s merged=%s skipped=%s removed=%s accounts_merged=%s accounts_pruned=%s",
+            "transactions=%s merged=%s skipped=%s removed=%s accounts_merged=%s accounts_pruned=%s "
+            "security_trades=%s security_merged=%s security_removed=%s tax_lots=%s",
             summary.accounts_seen,
             summary.accounts_created,
             summary.links_created,
@@ -449,8 +485,153 @@ class FinanceLedgerRunner:
             summary.transactions_removed,
             summary.accounts_merged,
             summary.accounts_pruned,
+            summary.security_trades_upserted,
+            summary.security_trades_merged,
+            summary.security_trades_removed,
+            summary.tax_lots_built,
         )
         return summary
+
+    # --- security trades + tax lots ---------------------------------------------
+
+    def _build_security_trades(
+        self,
+        *,
+        plaid_account_map: dict[tuple[str, str], str],
+        extractions: list[dict[str, Any]],
+        doc_accounts: dict[str, str],
+        now: datetime,
+        sync_version: int,
+    ) -> dict[str, int]:
+        """Unify Plaid and statement share movements, then reduce them to lots.
+
+        Plaid only reaches back 730 days; the statement corpus reaches 2018.
+        Their ~20-month overlap is deduped so a trade described by both sources
+        is one fact, not two — a doubled trade yields a confidently wrong lot.
+        """
+        resolver = SecurityResolver()
+        plaid_trades: list[dict[str, Any]] = []
+        for row in self._load_plaid_investment_transactions():
+            owner = str(row["account"])
+            account_id = plaid_account_map.get((owner, str(row["account_id"])))
+            if account_id is None:
+                continue
+            quantity = _as_decimal(row["quantity"])
+            side = plaid_trade_side(row["type"], row["subtype"], quantity)
+            if side is None:
+                continue
+            asset_class = classify_asset_class(
+                name=str(row["security_name"] or ""),
+                description=str(row["name"] or ""),
+                plaid_type=str(row["security_type"] or ""),
+            )
+            if asset_class == ASSET_CLASS_OPTION:
+                # Plaid names the security after the UNDERLYING ("IonQ Inc")
+                # and puts the strike only in the transaction text, so the
+                # contract identity has to be read out of that text.
+                identity = option_identity(
+                    ticker=str(row["ticker_symbol"]), text=str(row["name"] or "")
+                )
+            else:
+                identity = SecurityIdentity(
+                    ticker=str(row["ticker_symbol"]),
+                    cusip="",
+                    name=str(row["security_name"] or row["name"]),
+                )
+            if identity.is_empty or quantity == 0:
+                continue
+            plaid_trades.append(
+                {
+                    "account_id": account_id,
+                    "identity": identity,
+                    "trade_date": _as_date(row["transaction_at"]),
+                    "side": side,
+                    "quantity": abs(quantity),
+                    "price": _as_decimal(row["price"]) or None,
+                    "amount": abs(_as_decimal(row["amount"])),
+                    "fees": _as_decimal(row["fees"]),
+                    "currency": str(row["iso_currency_code"] or ""),
+                    "source": LEDGER_SOURCE_PLAID,
+                    "source_row_key": f"{owner}|investment|{row['investment_transaction_id']}",
+                }
+            )
+
+        document_trades: list[dict[str, Any]] = []
+        for extraction in sorted(extractions, key=lambda e: str(e["content_sha256"])):
+            sha = str(extraction["content_sha256"])
+            account_id = doc_accounts.get(sha)
+            if account_id is None:
+                continue
+            currency = str(extraction["currency"])
+            for index, entry in enumerate(extraction["transactions_json"] or []):
+                trade = document_trade_entry(entry)
+                if trade is None:
+                    continue
+                trade_date = _parse_iso_date(str(entry.get("date", "")))
+                if trade_date is None:
+                    continue
+                document_trades.append(
+                    {
+                        "account_id": account_id,
+                        "identity": trade["identity"],
+                        "trade_date": trade_date,
+                        "side": trade["side"],
+                        "quantity": trade["quantity"],
+                        "price": trade["price"],
+                        "price_is_derived": trade["price_is_derived"],
+                        "amount": trade["amount"],
+                        "fees": trade["fees"],
+                        "currency": currency,
+                        "source": LEDGER_SOURCE_MANUAL,
+                        "source_row_key": f"{sha}|{index}",
+                    }
+                )
+
+        trade_rows, link_rows, merged = dedupe_security_trades(
+            plaid_trades, document_trades, resolver=resolver
+        )
+        # Warehouse columns are NOT NULL with defaults (the house convention),
+        # so absence is written as a sentinel and restored to NULL by the marts
+        # views — never as a bare 0 a reader could mistake for a real price.
+        for row in trade_rows:
+            row["price"] = row["price"] if row["price"] is not None else Decimal("0")
+            row["amount"] = row["amount"] if row["amount"] is not None else Decimal("0")
+            row["created_at"] = now
+            row["sync_version"] = sync_version
+        for row in link_rows:
+            row["created_at"] = now
+            row["sync_version"] = sync_version
+
+        self._warehouse.insert_finance_security_transactions(trade_rows)
+        self._warehouse.insert_finance_security_transaction_links(link_rows)
+        removed = self._warehouse.delete_missing_finance_security_transactions(
+            [str(row["transaction_id"]) for row in trade_rows]
+        )
+
+        lots = build_tax_lots(
+            [
+                {**row, "source_row_key": row["transaction_id"]}
+                for row in trade_rows
+            ],
+            as_of=_as_date(now),
+        )
+        for lot in lots:
+            lot["basis_known"] = 1 if lot["basis_known"] else 0
+            lot["acquired_on"] = lot["acquired_on"] or _SENTINEL_DATE
+            lot["disposed_on"] = lot["disposed_on"] or _SENTINEL_DATE
+            for money in ("cost_per_unit", "cost_basis", "cost_basis_remaining", "realized_gain"):
+                if lot[money] is None:
+                    lot[money] = Decimal("0")
+            lot["created_at"] = now
+            lot["sync_version"] = sync_version
+        self._warehouse.replace_finance_tax_lots(lots)
+
+        return {
+            "upserted": len(trade_rows),
+            "merged": merged,
+            "removed": removed,
+            "lots": len(lots),
+        }
 
     # --- plaid account identity -------------------------------------------------
 
@@ -945,12 +1126,21 @@ class FinanceLedgerRunner:
         )
 
     def _load_plaid_investment_transactions(self) -> list[dict[str, Any]]:
+        # security_id/quantity/price/type/subtype feed the SECURITY ledger; the
+        # cash ledger only needs the amount. Joined to the security so a trade
+        # carries the ticker Plaid knows it by (Plaid reports no CUSIP).
         return self._warehouse._query_dicts(
             """
-            SELECT account, account_id, investment_transaction_id,
-                   transaction_at, name, amount, iso_currency_code
-            FROM @plaid_investment_transactions
-            ORDER BY transaction_at, investment_transaction_id
+            SELECT t.account, t.account_id, t.investment_transaction_id,
+                   t.transaction_at, t.name, t.amount, t.iso_currency_code,
+                   t.security_id, t.quantity, t.price, t.fees, t.type, t.subtype,
+                   COALESCE(s.ticker_symbol, '') AS ticker_symbol,
+                   COALESCE(s.name, '') AS security_name,
+                   COALESCE(s.type, '') AS security_type
+            FROM @plaid_investment_transactions AS t
+            LEFT JOIN @plaid_investment_securities AS s
+              ON s.account = t.account AND s.security_id = t.security_id
+            ORDER BY t.transaction_at, t.investment_transaction_id
             """
         )
 
@@ -963,6 +1153,7 @@ class FinanceLedgerRunner:
                    e.content_sha256, e.document_type, e.institution,
                    e.account_name_hint, e.account_mask, e.currency,
                    e.transactions_json, e.balances_json, e.valuations_json,
+                   e.positions_json, e.period_end,
                    d.account, d.original_path, d.filename
             FROM @manual_finance_extractions e
             JOIN @manual_finance_documents d

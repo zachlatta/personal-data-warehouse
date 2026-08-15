@@ -887,6 +887,87 @@ FINANCE_TRANSACTION_LINK_COLUMNS = (
     "sync_version",
 )
 
+# Unified deduped SECURITY trade ledger (finance.security_transactions): one
+# row per real-world share movement, resolved across sources. The cash ledger
+# above records that money left the account; this records which security, how
+# many shares, and at what price — the facts a purchase lot is made of, and
+# the ones a v1 statement extraction threw away. Plaid only reaches back 730
+# days, so the manual statement corpus is the sole source before that; the
+# ~20-month overlap is deduped (same account/security/side/quantity within a
+# few days, Plaid winning precedence) via finance.security_transaction_links.
+# `price_is_derived` marks a price computed from amount/quantity because the
+# document did not print one.
+FINANCE_SECURITY_TRANSACTION_COLUMNS = (
+    "transaction_id",
+    "account_id",
+    "security_key",
+    "ticker",
+    "cusip",
+    "security_name",
+    # spot | option. An option contract prints under the underlying's
+    # ticker but is 100 shares, so it gets its own security_key and must stay
+    # distinguishable from the stock in every read surface.
+    "asset_class",
+    "trade_date",
+    "side",
+    "quantity",
+    # Price per quantity unit: per share for equities, per contract for options.
+    "price",
+    "amount",
+    "fees",
+    "currency",
+    "price_is_derived",
+    "source",
+    "created_at",
+    "sync_version",
+)
+
+# Source-row → security-trade resolution audit
+# (finance.security_transaction_links): one row per source trade row recording
+# which unified trade it resolved into and why (source_id when it founded the
+# row, security_quantity_date when it merged into a Plaid twin).
+FINANCE_SECURITY_TRANSACTION_LINK_COLUMNS = (
+    "source",
+    "source_row_key",
+    "transaction_id",
+    "match_method",
+    "match_score",
+    "created_at",
+    "sync_version",
+)
+
+# Holding lots (finance.tax_lots): the FIFO reduction of the security trade
+# ledger, one row per acquisition lot plus one per sale that had no
+# acquisition to draw from. Derived and fully replayable — never hand-edited.
+# `basis_known` is false when a lot was opened by a share transfer (its real
+# basis lives at the origin account) or when no price was recorded, so a
+# reader can tell a known cost from an absent one instead of seeing a
+# confident zero. `method` records the lot-matching election used, because
+# FIFO is a choice and the broker's own election governs at tax time.
+FINANCE_TAX_LOT_COLUMNS = (
+    "lot_id",
+    "account_id",
+    "security_key",
+    "acquired_on",
+    "acquired_source",
+    "opening_transaction_id",
+    "method",
+    "quantity",
+    "quantity_remaining",
+    # Per share for equities, per contract for options.
+    "cost_per_unit",
+    "cost_basis",
+    "cost_basis_remaining",
+    "basis_known",
+    "proceeds",
+    "realized_gain",
+    "disposed_on",
+    "status",
+    "term",
+    "created_at",
+    "sync_version",
+)
+
 # manual_finance: manually uploaded finance documents (bank/mortgage
 # statements, Zillow screenshots, fund position docs, CSV/OFX exports). One
 # row per uploaded document; `source` is 'manual', the native id is the
@@ -942,6 +1023,7 @@ MANUAL_FINANCE_EXTRACTION_COLUMNS = (
     "transactions_json",
     "balances_json",
     "valuations_json",
+    "positions_json",
     "summary",
     "uncertainties_json",
     "raw_result_json",

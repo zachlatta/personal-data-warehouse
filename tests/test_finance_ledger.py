@@ -185,6 +185,7 @@ def _extraction_row(**overrides) -> dict:
         "transactions_json": [],
         "balances_json": [],
         "valuations_json": [],
+        "positions_json": [],
         "summary": "",
         "uncertainties_json": [],
         "raw_result_json": {},
@@ -1098,3 +1099,355 @@ def test_ledger_never_prunes_an_account_a_source_still_links_to(warehouse):
     assert summary.accounts_pruned == 0
     assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(1,)]
     assert warehouse._query("SELECT count(*) FROM @finance_observations") == [(1,)]
+
+
+# --- security trades + tax lots ------------------------------------------------
+
+
+def _security_row(**overrides) -> dict:
+    row = {
+        "account": "z@x.test",
+        "security_id": "sec-net",
+        "name": "Acme Networks Inc - Ordinary Shares - Class A",
+        "ticker_symbol": "ACME",
+        "type": "equity",
+        "close_price": 80.0,
+        "close_price_as_of": _TS,
+        "iso_currency_code": "USD",
+        "unofficial_currency_code": "",
+        "raw_json": {},
+        "synced_at": _TS,
+        "sync_version": 1,
+    }
+    row.update(overrides)
+    return row
+
+
+def _holding_row(**overrides) -> dict:
+    row = {
+        "account": "z@x.test",
+        "item_id": "item-1",
+        "account_id": "acc-b",
+        "security_id": "sec-net",
+        "quantity": 10.0,
+        "institution_value": 800.0,
+        "institution_price": 80.0,
+        "institution_price_as_of": _TS,
+        "cost_basis": 400.0,
+        "iso_currency_code": "USD",
+        "unofficial_currency_code": "",
+        "raw_json": {},
+        "synced_at": _TS,
+        "sync_version": 1,
+    }
+    row.update(overrides)
+    return row
+
+
+def _doc_trade(**overrides) -> dict:
+    entry = {
+        "date": "2020-08-10",
+        "description": "Acme Networks",
+        "amount": "400.00",
+        "direction": "out",
+        "security_name": "Acme Networks",
+        "ticker": "ACME",
+        "cusip": "111111AA1",
+        "quantity": "10",
+        "price_per_share": "40.00",
+        "trade_side": "buy",
+        "fees": "",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_statement_trades_build_lots_plaid_cannot_reach(warehouse):
+    """The whole point: a 2020 buy is outside Plaid's 730-day window, so the
+    statement is the only witness to that lot's date and cost."""
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-b",
+            source_native_id="sha-b",
+            original_path="acme-wheel-fund-0002/2020-08.csv",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-b",
+            document_type="brokerage_statement",
+            account_mask="0002",
+            transactions_json=[
+                _doc_trade(),
+                # A plain cash row must NOT become a trade.
+                {
+                    "date": "2020-08-03",
+                    "description": "ACH Deposit",
+                    "amount": "1000.00",
+                    "direction": "in",
+                    "security_name": "",
+                    "ticker": "",
+                    "cusip": "",
+                    "quantity": "",
+                    "price_per_share": "",
+                    "trade_side": "",
+                    "fees": "",
+                },
+            ],
+        ),
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert summary.security_trades_upserted == 1
+    assert summary.tax_lots_built == 1
+    rows = warehouse._query(
+        "SELECT ticker, side, quantity, price, asset_class, source FROM @finance_security_transactions"
+    )
+    assert rows == [("ACME", "buy", Decimal("10"), Decimal("40.00"), "spot", "manual_finance")]
+    lots = warehouse._query(
+        """
+        SELECT ticker, acquired_on, quantity, quantity_remaining, cost_basis, term, status
+        FROM @marts_finance_tax_lots
+        """
+    )
+    assert lots == [("ACME", date(2020, 8, 10), Decimal("10"), Decimal("10"), Decimal("400.00"), "long", "open")]
+
+
+def test_security_trades_dedup_against_the_plaid_overlap(warehouse):
+    """153 real statements overlap Plaid's window. A trade both sources
+    describe must be ONE fact — a doubled trade makes a confidently wrong lot."""
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    warehouse.insert_plaid_investment_securities([_security_row()])
+    warehouse.insert_plaid_investment_transactions(
+        [
+            _plaid_investment_transaction_row(
+                investment_transaction_id="itx-buy",
+                security_id="sec-net",
+                name="ACME buy",
+                type="buy",
+                subtype="buy",
+                quantity=10.0,
+                price=40.0,
+                amount=400.0,
+                transaction_at=_TS,
+            )
+        ]
+    )
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-b",
+            source_native_id="sha-b",
+            original_path="acme-wheel-fund-0002/statement.csv",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-b",
+            document_type="brokerage_statement",
+            account_mask="0002",
+            transactions_json=[
+                # Same security, side, quantity, one day off: merges into Plaid.
+                _doc_trade(date=_TS.date().replace(day=_TS.day - 1).isoformat()),
+                # A genuinely older buy: founds its own trade.
+                _doc_trade(date="2020-08-10", quantity="3", amount="120.00"),
+            ],
+        ),
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert summary.security_trades_merged == 1
+    assert summary.security_trades_upserted == 2
+    sources = warehouse._query(
+        "SELECT source, count(*) FROM @finance_security_transactions GROUP BY 1 ORDER BY 1"
+    )
+    assert sources == [("manual_finance", 1), ("plaid", 1)]
+    # Both source rows resolve to a trade, and the merged one records why.
+    methods = dict(
+        warehouse._query(
+            "SELECT source_row_key, match_method FROM @finance_security_transaction_links "
+            "WHERE source = 'manual_finance' ORDER BY source_row_key"
+        )
+    )
+    assert methods == {"sha-b|0": "security_quantity_date", "sha-b|1": "source_id"}
+
+
+def test_option_contracts_do_not_pollute_the_underlying_position(warehouse):
+    """Real row: 'ACME 09/18/2020 Call $60.00' qty 1 @ $0.30. One contract is
+    100 shares — counting it as a share of ACME corrupts the position."""
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-b",
+            source_native_id="sha-b",
+            original_path="acme-wheel-fund-0002/statement.csv",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-b",
+            document_type="brokerage_statement",
+            account_mask="0002",
+            transactions_json=[
+                _doc_trade(),
+                _doc_trade(
+                    description="ACME 09/18/2020 Call $60.00",
+                    security_name="ACME 09/18/2020 Call $60.00",
+                    cusip="",
+                    quantity="1",
+                    price_per_share="0.30",
+                    amount="30.00",
+                ),
+            ],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    keys = warehouse._query(
+        "SELECT asset_class, security_key, quantity FROM @finance_security_transactions ORDER BY asset_class"
+    )
+    assert [row[0] for row in keys] == ["option", "spot"]
+    assert keys[0][1] != keys[1][1]
+    # The spot lot holds 10 shares, not 11.
+    assert warehouse._query(
+        "SELECT sum(quantity_remaining) FROM @finance_tax_lots WHERE security_key = %s", (keys[1][1],)
+    ) == [(Decimal("10"),)]
+    # The option statement quotes a $0.30 per-share premium, but one contract
+    # represents 100 shares and the printed transaction total is $30. The lot
+    # basis must follow that grounded total, not price * contract count.
+    assert warehouse._query(
+        "SELECT cost_basis FROM @finance_tax_lots WHERE security_key = %s", (keys[0][1],)
+    ) == [(Decimal("30.00"),)]
+    assert warehouse._query(
+        "SELECT price FROM @finance_security_transactions WHERE security_key = %s", (keys[0][1],)
+    ) == [(Decimal("30.00"),)]
+
+
+def test_transferred_in_shares_never_invent_a_cost_basis(warehouse):
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    warehouse.insert_plaid_investment_securities([_security_row()])
+    warehouse.insert_plaid_investment_transactions(
+        [
+            _plaid_investment_transaction_row(
+                investment_transaction_id="itx-xfer",
+                security_id="sec-net",
+                name="ACME transfer",
+                type="transfer",
+                subtype="transfer",
+                quantity=25.0,
+                price=0.0,
+                amount=0.0,
+            )
+        ]
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    rows = warehouse._query(
+        "SELECT basis_known, quantity_remaining, cost_basis FROM @finance_tax_lots"
+    )
+    assert rows == [(0, Decimal("25"), Decimal("0"))]
+    # The read surface shows an ABSENT basis, never a free acquisition.
+    assert warehouse._query(
+        "SELECT cost_basis, cost_per_unit, realized_gain FROM @marts_finance_tax_lots"
+    ) == [(None, None, None)]
+
+
+def test_position_coverage_surfaces_independent_basis_disagreement(warehouse):
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    warehouse.insert_plaid_investment_securities([_security_row()])
+    warehouse.insert_plaid_investment_holdings([_holding_row(cost_basis=450.0)])
+    warehouse.insert_plaid_investment_transactions(
+        [
+            _plaid_investment_transaction_row(
+                investment_transaction_id="itx-buy",
+                security_id="sec-net",
+                name="ACME buy",
+                type="buy",
+                subtype="buy",
+                quantity=10.0,
+                price=40.0,
+                amount=400.0,
+            )
+        ]
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert warehouse._query(
+        "SELECT quantity_held, quantity_with_known_basis, basis_difference, coverage_status "
+        "FROM @marts_finance_position_coverage"
+    ) == [(Decimal("10"), Decimal("10"), Decimal("-50"), "basis_mismatch")]
+
+
+def test_security_ledger_replays_identically(warehouse):
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    warehouse.insert_plaid_investment_securities([_security_row()])
+    warehouse.insert_plaid_investment_transactions(
+        [
+            _plaid_investment_transaction_row(
+                investment_transaction_id="itx-buy",
+                security_id="sec-net",
+                name="ACME buy",
+                type="buy",
+                subtype="buy",
+                quantity=10.0,
+                price=40.0,
+                amount=400.0,
+            )
+        ]
+    )
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-b",
+            source_native_id="sha-b",
+            original_path="acme-wheel-fund-0002/statement.csv",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-b",
+            document_type="brokerage_statement",
+            account_mask="0002",
+            transactions_json=[_doc_trade()],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    sql = (
+        "SELECT transaction_id, security_key, ticker, side, quantity FROM @finance_security_transactions ORDER BY transaction_id",
+        "SELECT source, source_row_key, transaction_id, match_method FROM @finance_security_transaction_links ORDER BY source, source_row_key",
+        "SELECT lot_id, account_id, security_key, acquired_on, quantity_remaining, status FROM @finance_tax_lots ORDER BY lot_id",
+    )
+    before = [warehouse._query(q) for q in sql]
+    warehouse._command("DELETE FROM @finance_security_transaction_links")
+    warehouse._command("DELETE FROM @finance_security_transactions")
+    warehouse._command("DELETE FROM @finance_tax_lots")
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=14)).sync()
+    assert [warehouse._query(q) for q in sql] == before
+
+
+def test_lots_shrink_when_a_source_trade_disappears(warehouse):
+    """Lots are a reduction, not accumulated state: a corrected extraction that
+    removes a trade must not leave its lot behind as a confident fiction."""
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-b",
+            source_native_id="sha-b",
+            original_path="acme-wheel-fund-0002/statement.csv",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-b",
+            document_type="brokerage_statement",
+            account_mask="0002",
+            transactions_json=[_doc_trade(), _doc_trade(date="2020-09-10", quantity="5", amount="200.00")],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert warehouse._query("SELECT count(*) FROM @finance_tax_lots") == [(2,)]
+
+    warehouse._command("DELETE FROM @manual_finance_extractions")
+    warehouse.insert_manual_finance_extractions(
+        [
+            _extraction_row(
+                content_sha256="sha-b",
+                document_type="brokerage_statement",
+                account_mask="0002",
+                transactions_json=[_doc_trade()],
+            )
+        ]
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS.replace(day=14)).sync()
+    assert summary.security_trades_removed == 1
+    assert warehouse._query("SELECT count(*) FROM @finance_tax_lots") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_security_transaction_links") == [(1,)]

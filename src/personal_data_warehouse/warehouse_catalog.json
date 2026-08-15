@@ -1347,6 +1347,39 @@
       }
     },
     {
+      "id": "finance_security_transactions",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "finance",
+      "schema": "derived_finance",
+      "name": "security_transactions",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "finance_security_transaction_links",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "finance",
+      "schema": "derived_finance",
+      "name": "security_transaction_links",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "finance_tax_lots",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "finance",
+      "schema": "derived_finance",
+      "name": "tax_lots",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "manual_finance_extractions",
       "kind": "table",
       "layer": "derived",
@@ -1600,6 +1633,39 @@
         "schema": "marts",
         "name": "finance_transactions"
       }
+    },
+    {
+      "id": "marts_finance_security_transactions",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "finance",
+      "schema": "marts_finance",
+      "name": "security_transactions",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "marts_finance_tax_lots",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "finance",
+      "schema": "marts_finance",
+      "name": "tax_lots",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "marts_finance_position_coverage",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "finance",
+      "schema": "marts_finance",
+      "name": "position_coverage",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
     },
     {
       "id": "marts_finance_investment_holdings",

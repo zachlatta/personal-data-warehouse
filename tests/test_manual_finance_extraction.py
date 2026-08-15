@@ -90,6 +90,40 @@ def _document_row(**overrides) -> dict:
     return row
 
 
+def _trade_entry(**overrides) -> dict[str, Any]:
+    """A cash-flow row: every security field present but empty (the
+    optional-by-emptiness convention strict outputs force on us)."""
+    entry = {
+        "date": "2026-06-05",
+        "description": "COFFEE SHOP",
+        "amount": "4.50",
+        "direction": "out",
+        "security_name": "",
+        "ticker": "",
+        "cusip": "",
+        "quantity": "",
+        "price_per_share": "",
+        "trade_side": "",
+        "fees": "",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _position_entry(**overrides) -> dict[str, Any]:
+    entry = {
+        "date": "2026-06-30",
+        "security_name": "Acme Networks",
+        "ticker": "ACME",
+        "cusip": "111111AA1",
+        "quantity": "10.5",
+        "price": "80.00",
+        "market_value": "840.00",
+    }
+    entry.update(overrides)
+    return entry
+
+
 def _agent_output(**overrides) -> dict[str, Any]:
     output = {
         "is_financial": True,
@@ -101,11 +135,10 @@ def _agent_output(**overrides) -> dict[str, Any]:
         "period_end": "2026-06-30",
         "currency": "USD",
         "closing_balance": "1234.56",
-        "transactions": [
-            {"date": "2026-06-05", "description": "COFFEE SHOP", "amount": "4.50", "direction": "out"}
-        ],
+        "transactions": [_trade_entry()],
         "balances": [{"date": "2026-06-30", "balance": "1234.56"}],
         "valuations": [],
+        "positions": [],
         "summary": "June checking statement",
         "uncertainties": [],
     }
@@ -261,6 +294,59 @@ def test_validate_finance_extraction_result():
     assert any("closing_balance" in issue for issue in issues)
 
 
+def test_transaction_schema_carries_per_trade_security_detail():
+    """A brokerage statement prints security/qty/price per trade — v1 dropped
+    all of it, so lots before Plaid's 730-day window were unreconstructable."""
+    schema = finance_document_extraction_schema()
+    trade = schema["properties"]["transactions"]["items"]
+    for field in ("security_name", "ticker", "cusip", "quantity", "price_per_share", "trade_side", "fees"):
+        assert field in trade["properties"], field
+    # Strict structured outputs: every property must also be required.
+    assert set(trade["required"]) == set(trade["properties"])
+    assert set(trade["properties"]["trade_side"]["enum"]) == {
+        "buy",
+        "sell",
+        "transfer_in",
+        "transfer_out",
+        "",
+    }
+
+
+def test_schema_captures_the_statement_position_snapshot():
+    """Portfolio Summary gives per-security qty held at period end — the
+    independent check that a reconstructed lot history is actually right."""
+    schema = finance_document_extraction_schema()
+    assert "positions" in schema["properties"]
+    position = schema["properties"]["positions"]["items"]
+    for field in ("date", "security_name", "ticker", "cusip", "quantity", "price", "market_value"):
+        assert field in position["properties"], field
+    assert set(position["required"]) == set(position["properties"])
+    assert set(schema["required"]) == set(schema["properties"])
+
+
+def test_validation_enforces_trade_and_position_fields():
+    # A security trade missing its required keys is a validation failure.
+    issues = validate_finance_extraction_result(
+        _agent_output(transactions=[{"date": "2026-06-05", "description": "x", "amount": "1.00", "direction": "out"}])
+    )
+    assert any("transactions[0]" in issue for issue in issues)
+    # Positions are validated the same way.
+    issues = validate_finance_extraction_result(_agent_output(positions=[{"date": "2026-06-30"}]))
+    assert any("positions[0]" in issue for issue in issues)
+    assert validate_finance_extraction_result(_agent_output()) == []
+
+
+def test_prompt_tells_the_agent_to_copy_trade_detail():
+    prompt = finance_extraction_prompt(
+        candidate=_document_row(),
+        inputs=DocumentInputs(text="", input_files={}),
+        known_accounts=[],
+    )
+    instructions = json.loads(prompt)["instructions"].lower()
+    for phrase in ("quantity", "price", "ticker", "cusip", "positions"):
+        assert phrase in instructions, phrase
+
+
 # --- candidates + retry cap (live Postgres) ----------------------------------------
 
 
@@ -370,6 +456,60 @@ def test_runner_extracts_and_writes_typed_row(warehouse):
     assert not has_extraction_candidate(
         warehouse, provider="agent_codex", prompt_version=PROMPT_VERSION
     )
+
+
+def test_runner_stores_trade_detail_and_positions(warehouse):
+    warehouse.ensure_manual_finance_tables()
+    warehouse.ensure_finance_tables()
+    warehouse.insert_manual_finance_documents(
+        [
+            _document_row(
+                mime_type="text/csv",
+                filename="2020-08.csv",
+                original_path="broker-individual-0002/2020-08.csv",
+            )
+        ]
+    )
+    output = _agent_output(
+        document_type="brokerage_statement",
+        transactions=[
+            _trade_entry(
+                date="2020-08-07",
+                description="Bluebox Unsolicited, CUSIP: 333333CC3",
+                amount="1.64",
+                direction="out",
+                security_name="Bluebox",
+                ticker="BLUE",
+                cusip="333333CC3",
+                quantity="0.079322",
+                price_per_share="20.68",
+                trade_side="buy",
+            )
+        ],
+        positions=[_position_entry(date="2020-08-31", security_name="Bluebox", ticker="BLUE", quantity="1.208766")],
+    )
+    ManualFinanceExtractionRunner(
+        warehouse=warehouse,
+        agent=FakeAgent(output),
+        object_store_factory=lambda: FakeObjectStore(b"Date,Description,Qty,Price\n2020-08-07,Bluebox,0.079322,20.68\n"),
+        logger=Logger(),
+        provider="codex",
+        now=lambda: _TS,
+    ).sync(limit=None)
+    status, error = warehouse._query("SELECT status, error FROM @manual_finance_extractions")[0]
+    assert (status, error) == (STATUS_OK, "")
+    rows = warehouse._query(
+        """
+        SELECT transactions_json -> 0 ->> 'ticker',
+               transactions_json -> 0 ->> 'quantity',
+               transactions_json -> 0 ->> 'price_per_share',
+               transactions_json -> 0 ->> 'trade_side',
+               positions_json -> 0 ->> 'ticker',
+               positions_json -> 0 ->> 'quantity'
+        FROM @manual_finance_extractions
+        """
+    )
+    assert rows == [("BLUE", "0.079322", "20.68", "buy", "BLUE", "1.208766")]
 
 
 def test_runner_parallel_workers_extract_all_candidates(warehouse):

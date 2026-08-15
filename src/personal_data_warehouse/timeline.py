@@ -2041,6 +2041,13 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "finance_observations": _events("append-only balance and valuation history"),
     "finance_transactions": _events("one event per deduplicated real-world transaction"),
     "finance_transaction_links": _detail("finance_transactions", "source-row resolution audit"),
+    "finance_security_transactions": _detail(
+        "finance_transactions", "per-security trade detail behind a brokerage flow"
+    ),
+    "finance_security_transaction_links": _detail(
+        "finance_security_transactions", "source-row resolution audit"
+    ),
+    "finance_tax_lots": _detail("finance_security_transactions", "FIFO holding lots"),
     "manual_finance_documents": _events("uploaded statements and financial records"),
     "manual_finance_extractions": _detail("manual_finance_documents", "structured extraction history"),
     # Receipts. One transaction-first research result explains an existing

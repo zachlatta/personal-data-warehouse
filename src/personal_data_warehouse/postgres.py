@@ -43,6 +43,9 @@ from personal_data_warehouse.schema import (
     FINANCE_ACCOUNT_COLUMNS,
     FINANCE_ACCOUNT_LINK_COLUMNS,
     FINANCE_OBSERVATION_COLUMNS,
+    FINANCE_SECURITY_TRANSACTION_COLUMNS,
+    FINANCE_SECURITY_TRANSACTION_LINK_COLUMNS,
+    FINANCE_TAX_LOT_COLUMNS,
     FINANCE_TRANSACTION_COLUMNS,
     FINANCE_TRANSACTION_LINK_COLUMNS,
     MANUAL_FINANCE_DOCUMENT_COLUMNS,
@@ -331,6 +334,15 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         FINANCE_TRANSACTION_LINK_COLUMNS,
         ("source", "source_row_key"),
     ),
+    "finance_security_transactions": TableSpec(
+        FINANCE_SECURITY_TRANSACTION_COLUMNS,
+        ("transaction_id",),
+    ),
+    "finance_security_transaction_links": TableSpec(
+        FINANCE_SECURITY_TRANSACTION_LINK_COLUMNS,
+        ("source", "source_row_key"),
+    ),
+    "finance_tax_lots": TableSpec(FINANCE_TAX_LOT_COLUMNS, ("lot_id",)),
     # Manually uploaded finance documents + their structured extractions.
     "manual_finance_documents": TableSpec(
         MANUAL_FINANCE_DOCUMENT_COLUMNS,
@@ -599,6 +611,32 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "finance_transactions",
         "CREATE INDEX IF NOT EXISTS finance_transactions_account_time_idx "
         "ON @finance_transactions (account_id, posted_at DESC)",
+    ),
+    IndexSpec(
+        "finance_security_transactions_account_time_idx",
+        "finance_security_transactions",
+        "CREATE INDEX IF NOT EXISTS finance_security_transactions_account_time_idx "
+        "ON @finance_security_transactions (account_id, trade_date DESC)",
+    ),
+    # Freshness probing reads max(created_at); leading with it keeps the probe
+    # an index scan rather than a heap sweep.
+    IndexSpec(
+        "finance_security_transactions_created_idx",
+        "finance_security_transactions",
+        "CREATE INDEX IF NOT EXISTS finance_security_transactions_created_idx "
+        "ON @finance_security_transactions (created_at DESC)",
+    ),
+    IndexSpec(
+        "finance_tax_lots_account_security_idx",
+        "finance_tax_lots",
+        "CREATE INDEX IF NOT EXISTS finance_tax_lots_account_security_idx "
+        "ON @finance_tax_lots (account_id, security_key, acquired_on)",
+    ),
+    IndexSpec(
+        "finance_tax_lots_created_idx",
+        "finance_tax_lots",
+        "CREATE INDEX IF NOT EXISTS finance_tax_lots_created_idx "
+        "ON @finance_tax_lots (created_at DESC)",
     ),
     IndexSpec(
         "gmail_messages_thread_idx",
@@ -1214,6 +1252,7 @@ JSONB_COLUMNS_BY_TABLE = {
         "transactions_json",
         "balances_json",
         "valuations_json",
+        "positions_json",
         "uncertainties_json",
         "raw_result_json",
     },
@@ -1251,6 +1290,7 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
         "transactions_json",
         "balances_json",
         "valuations_json",
+        "positions_json",
         "uncertainties_json",
     },
 }
@@ -1263,6 +1303,19 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
 NUMERIC_COLUMNS_BY_TABLE = {
     "finance_observations": {"value"},
     "finance_transactions": {"amount"},
+    # Share counts and prices are exact NUMERIC for the same reason money is:
+    # a fractional-share position accumulated over hundreds of buys must not
+    # drift through binary floating point.
+    "finance_security_transactions": {"quantity", "price", "amount", "fees"},
+    "finance_tax_lots": {
+        "quantity",
+        "quantity_remaining",
+        "cost_per_unit",
+        "cost_basis",
+        "cost_basis_remaining",
+        "proceeds",
+        "realized_gain",
+    },
     "manual_finance_extractions": {"closing_balance"},
     "receipt_transaction_receipts": {
         "total",
@@ -1279,6 +1332,10 @@ DATE_COLUMNS = {
     "as_of",
     "period_start",
     "period_end",
+    # a trade settles on a day, and a lot's holding period is counted in days
+    "trade_date",
+    "acquired_on",
+    "disposed_on",
     # the date printed on a receipt is a day, not an instant
     "purchased_at",
 }
@@ -1445,6 +1502,11 @@ INTEGER_COLUMNS = {
     "is_super_admin",
     "is_removed",
     "pending",
+    # 0/1 flags on the securities ledger: whether a lot's cost basis is known
+    # (a transferred-in lot's basis lives at the origin account), and whether a
+    # trade's price was computed rather than printed on the document.
+    "basis_known",
+    "price_is_derived",
     "is_overdue",
     "is_google_native",
     "starred",
@@ -2091,6 +2153,21 @@ class PostgresWarehouse:
                 "finance_observations",
                 "finance_transactions",
                 "finance_transaction_links",
+                "finance_security_transactions",
+                "finance_security_transaction_links",
+                "finance_tax_lots",
+            ]
+        )
+        # The lot/coverage views price positions from Plaid's current holdings,
+        # so those tables must exist before the views are created. The ledger
+        # runner already reads them; declaring the dependency here keeps a
+        # finance-only ensure (a fresh schema, or the extraction runner) from
+        # failing on a missing relation.
+        self._ensure_table_group(
+            [
+                "plaid_accounts",
+                "plaid_investment_securities",
+                "plaid_investment_holdings",
             ]
         )
         self._ensure_finance_ledger_mart_views()
@@ -2218,6 +2295,208 @@ class PostgresWarehouse:
                 t.source
             FROM @finance_transactions AS t
             JOIN @finance_accounts AS a ON a.account_id = t.account_id
+            """,
+        )
+        # Cross-source security trades. The plaid-only passthrough at
+        # marts_finance.investment_transactions stays for Plaid drill-down;
+        # this is the one that reaches back past Plaid's 730-day window.
+        self._ensure_view(
+            "marts_finance_security_transactions",
+            """
+            CREATE OR REPLACE VIEW @marts_finance_security_transactions AS
+            SELECT
+                t.transaction_id,
+                t.account_id,
+                a.account,
+                a.name AS account_name,
+                a.kind AS account_kind,
+                a.institution,
+                a.mask,
+                t.security_key,
+                t.ticker,
+                t.cusip,
+                t.security_name,
+                t.asset_class,
+                t.trade_date,
+                t.side,
+                t.quantity,
+                -- Per quantity unit: per share for equities, per contract for
+                -- options (statement option premiums are normalized by 100).
+                -- 0 is the NOT NULL sentinel for "the document printed none";
+                -- no real trade has a zero price or a zero amount.
+                NULLIF(t.price, 0) AS price,
+                NULLIF(t.amount, 0) AS amount,
+                t.fees,
+                t.currency,
+                -- 1 when the price was computed from amount/quantity because
+                -- the document did not print one.
+                t.price_is_derived,
+                t.source
+            FROM @finance_security_transactions AS t
+            JOIN @finance_accounts AS a ON a.account_id = t.account_id
+            """,
+        )
+        # Lots joined to the latest price we have, so an open lot carries an
+        # unrealized gain. Price comes from Plaid's current holding for the
+        # same ticker; a lot in a security Plaid does not report keeps a NULL
+        # market value rather than borrowing a stale one.
+        self._ensure_view(
+            "marts_finance_tax_lots",
+            """
+            CREATE OR REPLACE VIEW @marts_finance_tax_lots AS
+            WITH latest_price AS (
+                SELECT DISTINCT ON (upper(s.ticker_symbol))
+                       upper(s.ticker_symbol) AS ticker,
+                       h.institution_price AS price,
+                       h.institution_price_as_of AS price_as_of
+                FROM @plaid_investment_holdings AS h
+                JOIN @plaid_investment_securities AS s
+                  ON s.account = h.account AND s.security_id = h.security_id
+                WHERE s.ticker_symbol <> '' AND s.ticker_symbol IS NOT NULL
+                ORDER BY upper(s.ticker_symbol),
+                         h.institution_price_as_of DESC,
+                         h.synced_at DESC,
+                         h.account,
+                         h.security_id
+            )
+            SELECT
+                l.lot_id,
+                l.account_id,
+                a.account,
+                a.name AS account_name,
+                a.kind AS account_kind,
+                a.institution,
+                a.mask,
+                l.security_key,
+                t.ticker,
+                t.security_name,
+                t.asset_class,
+                -- Absence is written as a sentinel in the NOT NULL fact table
+                -- and restored to NULL here, so no reader sees 1970 as a date
+                -- or a 0 basis it could mistake for a free acquisition.
+                NULLIF(l.acquired_on, '1970-01-01'::date) AS acquired_on,
+                NULLIF(l.disposed_on, '1970-01-01'::date) AS disposed_on,
+                l.status,
+                l.term,
+                l.method,
+                l.basis_known,
+                l.quantity,
+                l.quantity_remaining,
+                CASE WHEN l.basis_known = 1 THEN l.cost_per_unit END AS cost_per_unit,
+                CASE WHEN l.basis_known = 1 THEN l.cost_basis END AS cost_basis,
+                CASE WHEN l.basis_known = 1 THEN l.cost_basis_remaining END AS cost_basis_remaining,
+                l.proceeds,
+                CASE WHEN l.basis_known = 1 THEN l.realized_gain END AS realized_gain,
+                p.price AS latest_price,
+                p.price_as_of AS latest_price_as_of,
+                CASE WHEN p.price IS NOT NULL
+                     THEN round((l.quantity_remaining * p.price)::numeric, 2) END AS market_value,
+                CASE WHEN p.price IS NOT NULL AND l.basis_known = 1
+                     THEN round((l.quantity_remaining * p.price - l.cost_basis_remaining)::numeric, 2)
+                     END AS unrealized_gain,
+                l.acquired_source,
+                l.opening_transaction_id
+            FROM @finance_tax_lots AS l
+            JOIN @finance_accounts AS a ON a.account_id = l.account_id
+            LEFT JOIN LATERAL (
+                SELECT st.ticker, st.security_name, st.asset_class
+                FROM @finance_security_transactions AS st
+                WHERE st.security_key = l.security_key
+                ORDER BY st.ticker DESC, st.trade_date DESC
+                LIMIT 1
+            ) AS t ON TRUE
+            -- Only equities are priced from Plaid holdings: an option contract
+            -- shares the underlying's ticker and would otherwise be valued as
+            -- though it were 100x-cheaper stock.
+            LEFT JOIN latest_price AS p
+              ON p.ticker = upper(t.ticker) AND t.asset_class = 'spot'
+            """,
+        )
+        # How much of each position actually has a reconstructed lot history.
+        # An agent asking "what are my returns since I bought in" must be able
+        # to see that a position is 0% reconstructed instead of silently
+        # trusting an aggregate cost basis with no acquisition date behind it.
+        self._ensure_view(
+            "marts_finance_position_coverage",
+            """
+            CREATE OR REPLACE VIEW @marts_finance_position_coverage AS
+            WITH held AS (
+                SELECT a.account_id,
+                       upper(s.ticker_symbol) AS ticker,
+                       sum(h.quantity::numeric) AS quantity_held,
+                       sum(h.cost_basis::numeric) AS reported_cost_basis
+                FROM @plaid_investment_holdings AS h
+                JOIN @plaid_investment_securities AS s
+                  ON s.account = h.account AND s.security_id = h.security_id
+                JOIN @finance_account_links AS fl
+                  ON fl.source = 'plaid' AND fl.account = h.account
+                 AND fl.source_account_key = h.account_id
+                JOIN @finance_accounts AS a ON a.account_id = fl.account_id
+                WHERE h.quantity > 0
+                  AND s.ticker_symbol <> '' AND s.ticker_symbol IS NOT NULL
+                  AND upper(s.ticker_symbol) NOT LIKE 'CUR:%'
+                GROUP BY 1, 2
+            ), reconstructed AS (
+                SELECT l.account_id,
+                       upper(t.ticker) AS ticker,
+                       sum(l.quantity_remaining) AS quantity_with_lots,
+                       sum(CASE WHEN l.basis_known = 1 THEN l.quantity_remaining ELSE 0 END)
+                           AS quantity_with_known_basis,
+                       sum(CASE WHEN l.basis_known = 1 THEN l.cost_basis_remaining ELSE 0 END)
+                           AS reconstructed_cost_basis,
+                       min(NULLIF(l.acquired_on, '1970-01-01'::date)) AS earliest_acquisition
+                FROM @finance_tax_lots AS l
+                LEFT JOIN LATERAL (
+                    SELECT st.ticker, st.asset_class
+                    FROM @finance_security_transactions AS st
+                    WHERE st.security_key = l.security_key
+                    ORDER BY st.ticker DESC, st.trade_date DESC
+                    LIMIT 1
+                ) AS t ON TRUE
+                WHERE l.status = 'open' AND t.asset_class = 'spot'
+                GROUP BY 1, 2
+            )
+            SELECT
+                held.account_id,
+                a.name AS account_name,
+                a.institution,
+                a.mask,
+                held.ticker,
+                held.quantity_held,
+                COALESCE(r.quantity_with_lots, 0) AS quantity_with_lots,
+                COALESCE(r.quantity_with_known_basis, 0) AS quantity_with_known_basis,
+                held.reported_cost_basis,
+                r.reconstructed_cost_basis,
+                CASE WHEN r.reconstructed_cost_basis IS NOT NULL
+                     THEN r.reconstructed_cost_basis - held.reported_cost_basis
+                     END AS basis_difference,
+                r.earliest_acquisition,
+                CASE WHEN held.quantity_held > 0
+                     THEN round(
+                         least(COALESCE(r.quantity_with_known_basis, 0), held.quantity_held)
+                         / held.quantity_held * 100, 1)
+                     END AS pct_quantity_with_basis,
+                -- The percentage alone can only understate a problem: it is
+                -- capped at 100, so a position holding MORE open lots than
+                -- shares (a disposal we have no record of, e.g. shares sold in
+                -- a month whose statement was never uploaded) would read as a
+                -- clean 100%. That case gets its own status instead.
+                CASE
+                    WHEN COALESCE(r.quantity_with_lots, 0) = 0 THEN 'none'
+                    WHEN r.quantity_with_lots > held.quantity_held * 1.001
+                        THEN 'lots_exceed_holding'
+                    WHEN COALESCE(r.quantity_with_known_basis, 0) >= held.quantity_held * 0.999
+                         AND abs(r.reconstructed_cost_basis - held.reported_cost_basis)
+                             > greatest(0.02::numeric, abs(held.reported_cost_basis) * 0.001)
+                        THEN 'basis_mismatch'
+                    WHEN COALESCE(r.quantity_with_known_basis, 0) >= held.quantity_held * 0.999
+                        THEN 'complete'
+                    ELSE 'partial'
+                END AS coverage_status
+            FROM held
+            JOIN @finance_accounts AS a ON a.account_id = held.account_id
+            LEFT JOIN reconstructed AS r
+              ON r.account_id = held.account_id AND r.ticker = held.ticker
             """,
         )
 
@@ -6211,6 +6490,65 @@ class PostgresWarehouse:
 
     def insert_finance_transaction_links(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("finance_transaction_links", rows, FINANCE_TRANSACTION_LINK_COLUMNS)
+
+    def insert_finance_security_transactions(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows(
+            "finance_security_transactions", rows, FINANCE_SECURITY_TRANSACTION_COLUMNS
+        )
+
+    def insert_finance_security_transaction_links(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows(
+            "finance_security_transaction_links", rows, FINANCE_SECURITY_TRANSACTION_LINK_COLUMNS
+        )
+
+    def insert_finance_tax_lots(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("finance_tax_lots", rows, FINANCE_TAX_LOT_COLUMNS)
+
+    def replace_finance_tax_lots(self, rows: list[dict[str, Any]]) -> int:
+        """Lots are a pure reduction of the trade ledger, not accumulated state.
+
+        A rebuild must therefore be able to *shrink* the table — a corrected
+        extraction can delete a trade, and a stale lot left behind would be a
+        confident fiction. Replaced wholesale inside one transaction.
+        """
+        with self._connection:
+            self._command("DELETE FROM @finance_tax_lots")
+            if rows:
+                self._insert_rows("finance_tax_lots", rows, FINANCE_TAX_LOT_COLUMNS)
+        return len(rows)
+
+    def delete_missing_finance_security_transactions(self, keep_ids: list[str]) -> int:
+        """Drop unified trades whose source rows no longer exist (same
+        reconciliation the cash ledger does — derived state follows its
+        sources, and raw rows are never touched)."""
+        if keep_ids:
+            removed = self._query(
+                """
+                WITH removed_links AS (
+                    DELETE FROM @finance_security_transaction_links
+                    WHERE transaction_id <> ALL(%s)
+                    RETURNING 1
+                ), removed_trades AS (
+                    DELETE FROM @finance_security_transactions
+                    WHERE transaction_id <> ALL(%s)
+                    RETURNING 1
+                )
+                SELECT (SELECT count(*) FROM removed_trades)
+                """,
+                (keep_ids, keep_ids),
+            )
+        else:
+            removed = self._query(
+                """
+                WITH removed_links AS (
+                    DELETE FROM @finance_security_transaction_links RETURNING 1
+                ), removed_trades AS (
+                    DELETE FROM @finance_security_transactions RETURNING 1
+                )
+                SELECT (SELECT count(*) FROM removed_trades)
+                """
+            )
+        return int(removed[0][0]) if removed else 0
 
     def insert_receipt_transaction_receipts(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows(

@@ -51,7 +51,11 @@ from personal_data_warehouse.file_attachment_enrichment import (
 from personal_data_warehouse.gmail_sync import raw_attachment_text
 
 TASK_TYPE = "manual_finance_extraction"
-PROMPT_VERSION = "manual-finance-agent-v1"
+# v2 captures per-trade security detail (ticker/cusip/qty/price/side) and the
+# statement's position snapshot. v1 stored a brokerage buy as an anonymous cash
+# debit, which left every purchase lot older than Plaid's 730-day window
+# unreconstructable. Bumping re-extracts the corpus without clobbering v1.
+PROMPT_VERSION = "manual-finance-agent-v2"
 
 STATUS_OK = "ok"
 STATUS_NOT_USEFUL = "not_useful"
@@ -100,12 +104,52 @@ def finance_document_extraction_schema() -> dict[str, Any]:
     transaction_schema = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["date", "description", "amount", "direction"],
+        "required": [
+            "date",
+            "description",
+            "amount",
+            "direction",
+            "security_name",
+            "ticker",
+            "cusip",
+            "quantity",
+            "price_per_share",
+            "trade_side",
+            "fees",
+        ],
         "properties": {
             "date": {"type": "string", "description": "ISO date YYYY-MM-DD"},
             "description": {"type": "string"},
             "amount": {"type": "string", "description": "unsigned decimal string, e.g. '4.50'"},
             "direction": {"type": "string", "enum": ["in", "out"]},
+            # Security detail: present on brokerage trade rows, empty on plain
+            # cash flows. A statement prints all of it per trade, and without it
+            # a buy is indistinguishable from any other debit — which is how the
+            # pre-2024 lot history went missing.
+            "security_name": {"type": "string", "description": "security name as printed, or empty"},
+            "ticker": {"type": "string", "description": "ticker/symbol as printed, or empty"},
+            "cusip": {"type": "string", "description": "CUSIP as printed, or empty"},
+            "quantity": {"type": "string", "description": "unsigned decimal share count, or empty"},
+            "price_per_share": {"type": "string", "description": "unsigned decimal price per share, or empty"},
+            "trade_side": {
+                "type": "string",
+                "enum": ["buy", "sell", "transfer_in", "transfer_out", ""],
+            },
+            "fees": {"type": "string", "description": "unsigned decimal fees, or empty"},
+        },
+    }
+    position_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["date", "security_name", "ticker", "cusip", "quantity", "price", "market_value"],
+        "properties": {
+            "date": {"type": "string", "description": "ISO as-of date YYYY-MM-DD"},
+            "security_name": {"type": "string"},
+            "ticker": {"type": "string", "description": "ticker/symbol as printed, or empty"},
+            "cusip": {"type": "string", "description": "CUSIP as printed, or empty"},
+            "quantity": {"type": "string", "description": "decimal share count held"},
+            "price": {"type": "string", "description": "decimal price per share, or empty"},
+            "market_value": {"type": "string", "description": "decimal market value, or empty"},
         },
     }
     balance_schema = {
@@ -143,6 +187,7 @@ def finance_document_extraction_schema() -> dict[str, Any]:
             "transactions",
             "balances",
             "valuations",
+            "positions",
             "summary",
             "uncertainties",
         ],
@@ -166,6 +211,7 @@ def finance_document_extraction_schema() -> dict[str, Any]:
             "transactions": {"type": "array", "items": transaction_schema},
             "balances": {"type": "array", "items": balance_schema},
             "valuations": {"type": "array", "items": valuation_schema},
+            "positions": {"type": "array", "items": position_schema},
             "summary": {"type": "string"},
             "uncertainties": {"type": "array", "items": {"type": "string"}},
         },
@@ -176,6 +222,10 @@ def finance_extraction_instructions() -> str:
     return """Extract structured financial facts from this real finance document. It may be a bank/credit-card/brokerage/mortgage statement, a property or vehicle valuation screenshot, a private fund positions report, or a CSV/OFX transaction export — figure out what it is from its content; the format may be messy or unusual.
 
 Extract EVERY transaction the document itself reports (date, description exactly as printed, unsigned decimal amount, direction relative to this account: money arriving is "in", money leaving is "out"). Do not summarize, sample, or skip small transactions. For statements also extract the stated opening/closing balances with their dates into balances (the closing balance also goes in closing_balance). For valuation-style documents (home value screenshots, vehicle values, fund position reports) put each stated value into valuations with its as-of date and a short description.
+
+When a transaction is a SECURITY MOVEMENT (a brokerage buy, sell, incoming/outgoing transfer, reinvestment, or fractional recurring purchase of a stock, ETF, option, mutual fund, or crypto), also copy its per-transaction detail onto that same entry: security_name, ticker, cusip, quantity (share or contract count), price_per_share, trade_side ("buy", "sell", "transfer_in", or "transfer_out"), and fees. Brokerage activity tables print these in their own columns — copy each exactly as printed, never computed or rounded, and never divide the amount by the quantity to invent a price. A partial row is still worth having: fill in whatever the document prints and leave the rest empty. Leave ALL of these empty for ordinary cash movements (deposits, withdrawals, interest, fees, card purchases). This detail is what makes a purchase lot reconstructable years later, so it is the highest-value part of a brokerage statement.
+
+For a brokerage/investment statement, also fill positions from the holdings or portfolio-summary table: one entry per security held, with the as-of date (normally the statement period end), security_name, ticker, cusip, quantity held, price, and market_value, each exactly as printed. Leave positions empty for documents that report no holdings.
 
 Identify the account: the institution name, the account's own name/type as printed, and the mask (last digits). The document's original_path folder name usually encodes institution-name-mask — use it as a hint, but prefer what the document itself says. Match against known_accounts when one clearly corresponds. period_start/period_end are the statement period when stated.
 
@@ -247,9 +297,25 @@ def validate_finance_extraction_result(result: Mapping[str, Any]) -> list[str]:
         if not isinstance(result.get(key), str):
             issues.append(f"{key} must be a string")
     for key, required_fields in (
-        ("transactions", ("date", "description", "amount", "direction")),
+        (
+            "transactions",
+            (
+                "date",
+                "description",
+                "amount",
+                "direction",
+                "security_name",
+                "ticker",
+                "cusip",
+                "quantity",
+                "price_per_share",
+                "trade_side",
+                "fees",
+            ),
+        ),
         ("balances", ("date", "balance")),
         ("valuations", ("date", "value", "description")),
+        ("positions", ("date", "security_name", "ticker", "cusip", "quantity", "price", "market_value")),
     ):
         value = result.get(key)
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
@@ -569,6 +635,7 @@ class ManualFinanceExtractionRunner:
             "transactions_json": list(output.get("transactions", []) or []),
             "balances_json": list(output.get("balances", []) or []),
             "valuations_json": list(output.get("valuations", []) or []),
+            "positions_json": list(output.get("positions", []) or []),
             "summary": str(output.get("summary", "")),
             "uncertainties_json": list(output.get("uncertainties", []) or []),
             "raw_result_json": dict(output),

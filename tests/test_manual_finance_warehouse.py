@@ -97,6 +97,7 @@ def _extraction_row(**overrides) -> dict:
         ],
         "balances_json": [{"date": "2026-06-30", "balance": "1234.56"}],
         "valuations_json": [],
+        "positions_json": [],
         "summary": "June checking statement",
         "uncertainties_json": [],
         "raw_result_json": {"document_type": "bank_statement"},

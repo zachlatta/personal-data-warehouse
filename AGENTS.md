@@ -1101,6 +1101,69 @@ Finance SQL starting points: `marts_finance.net_worth`, `marts_finance.net_worth
 `derived_finance.accounts`, `derived_finance.observations`, `base_manual_finance.documents`,
 `derived_finance.document_extractions`, plus the existing `base_plaid.*` / `marts_finance.*` views.
 
+## Securities: trades, tax lots, and coverage
+
+The cash ledger records that money left a brokerage account; it cannot say which security, how
+many shares, or at what price. Those are the facts a purchase **lot** is made of, and they live
+in their own layer.
+
+**Do not answer a holdings/returns/cost-basis question from
+`marts_finance.investment_transactions`** — that view is a Plaid passthrough, and Plaid's
+lookback is a hard **730 days** (trade history starts 2024-07-16). Reading it alone is how an
+agent concluded in 2026-08 that pre-2024 lots were "not reconstructable from Plaid" and told
+the user to ask the broker, while the buys sat in the statement corpus back to 2018.
+
+Use instead:
+
+| relation | what it answers |
+| --- | --- |
+| `marts_finance.security_transactions` | every share movement, both sources, deduped |
+| `marts_finance.tax_lots` | FIFO lots: acquired_on, basis, term, unrealized gain |
+| `marts_finance.position_coverage` | **how much of a position actually has a lot history** |
+
+- `derived_finance.security_transactions` is one row per real share movement across Plaid and
+  manual statements, with `derived_finance.security_transaction_links` recording how each source
+  row resolved (`source_id` founded it, `security_quantity_date` merged it into a Plaid twin).
+  The ~20-month statement/Plaid overlap **must** dedup — a doubled trade yields a confidently
+  wrong lot. Sides are `buy` / `sell` / `transfer_in` / `transfer_out`.
+- `derived_finance.tax_lots` is the FIFO reduction, rebuilt wholesale each run (it is a
+  reduction, not accumulated state, so it must be able to shrink). It never invents a basis:
+  `basis_known = 0` for a transferred-in lot (the real basis is at the origin account), and a
+  sale with no acquisition becomes an `unmatched_sale` row rather than a negative position.
+  `method` records the lot election used — FIFO is a *choice*, and the broker's own election
+  governs at tax time.
+- **`asset_class` is not cosmetic.** An option prints under the underlying's ticker but one
+  contract is 100 shares. Plaid compounds this by labelling option trades `type = 'equity'` on
+  the security while the transaction name reads *"buy 2.000 QBIT call with strike of $12.00"*.
+  Options therefore get their own `security_key` and are excluded from spot pricing/coverage.
+- **Check `position_coverage` before quoting a return.** `coverage_status` is `complete` /
+  `partial` / `none` / `lots_exceed_holding` / `basis_mismatch`. The last two mean either more
+  open lots than shares held (a missing disposal) or reconstructed basis disagrees materially
+  with the provider's independent position basis. A percentage alone can only understate these
+  problems because it is capped at 100.
+
+Extraction contract: `PROMPT_VERSION = manual-finance-agent-v2` captures per-trade
+`ticker`/`cusip`/`quantity`/`price_per_share`/`trade_side`/`fees` plus a `positions[]` snapshot
+of the statement's portfolio summary. v1 stored a brokerage buy as an anonymous cash debit.
+Bumping the version re-extracts the corpus without clobbering v1 (the extractions PK includes
+the prompt version). `price_is_derived = 1` marks a price computed from amount/quantity because
+the document did not print one.
+
+**Known limits — state them when the answer depends on them.** Neither is modelled, and both
+show up as a `partial` / `lots_exceed_holding` coverage status rather than a wrong-looking
+number:
+
+- **Stock splits.** A split changes the share count with no trade, so a lot opened from a
+  pre-split statement carries pre-split quantities against a post-split holding.
+- **Wash sales.** Lots are raw FIFO facts. A harvested loss inside the ±30-day wash window is
+  still shown as realized, because disallowance is a tax *opinion*, not a fact the sources
+  witness. Say so before anyone trades on a harvesting number.
+
+Verification scripts (they hit the real agent and the real corpus, so run them deliberately):
+`scripts/verify_manual_finance_extraction_v2.py <pdf>...` checks the agent against a statement's
+printed detail; `scripts/verify_securities_ledger_e2e.py <extraction json>...` replays real Plaid
+data plus real extractions through the production runner into a throwaway schema.
+
 ## Shared file-attachment enrichment
 
 `gmail_attachment_enrichments` was renamed to `file_attachment_enrichments` and generalized into

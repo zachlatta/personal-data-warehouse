@@ -136,8 +136,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         by_layer[obj.layer] = by_layer.get(obj.layer, 0) + 1
     assert by_layer == {
         "base": 52,
-        "derived": 17,
-        "marts": 23,
+        "derived": 20,
+        "marts": 26,
         "timeline": 7,
         "ops": 22,
         "private": 5,
@@ -176,6 +176,8 @@ def test_catalog_records_the_target_physical_locations() -> None:
         "photo_assets": ("derived_photos", "assets"),
         "photo_asset_files": ("derived_photos", "asset_files"),
         "finance_observations": ("derived_finance", "observations"),
+        "finance_security_transactions": ("derived_finance", "security_transactions"),
+        "finance_tax_lots": ("derived_finance", "tax_lots"),
         "manual_finance_extractions": ("derived_finance", "document_extractions"),
         "receipt_transaction_receipts": ("derived_receipts", "transaction_receipts"),
         # marts: domain read interfaces

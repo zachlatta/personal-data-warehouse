@@ -63,6 +63,19 @@ def finance_ledger(context) -> MaterializeResult:
             # the logical accounts they duplicated, and the residue was pruned.
             "accounts_merged": MetadataValue.int(summary.accounts_merged if summary else 0),
             "accounts_pruned": MetadataValue.int(summary.accounts_pruned if summary else 0),
+            # Security trades and the lots they reduce to. `security_trades_merged`
+            # is the statement/Plaid overlap seam: a drop toward zero while both
+            # sources are live would mean the overlap is double-counting.
+            "security_trades_upserted": MetadataValue.int(
+                summary.security_trades_upserted if summary else 0
+            ),
+            "security_trades_merged": MetadataValue.int(
+                summary.security_trades_merged if summary else 0
+            ),
+            "security_trades_removed": MetadataValue.int(
+                summary.security_trades_removed if summary else 0
+            ),
+            "tax_lots_built": MetadataValue.int(summary.tax_lots_built if summary else 0),
         }
     )
 
