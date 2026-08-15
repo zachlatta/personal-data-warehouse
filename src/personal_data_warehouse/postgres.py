@@ -2563,6 +2563,14 @@ class PostgresWarehouse:
                 "agent_run_tool_calls",
             ]
         )
+        # ``CREATE TABLE IF NOT EXISTS`` does not evolve an existing production
+        # table when the extraction contract gains a field. Keep this explicit
+        # migration beside the owning ensure path so both the extraction asset
+        # and the finance ledger can safely deploy v2 before any v2 row exists.
+        self._command(
+            "ALTER TABLE @manual_finance_extractions "
+            "ADD COLUMN IF NOT EXISTS positions_json jsonb NOT NULL DEFAULT '[]'::jsonb"
+        )
 
     def ensure_apple_voice_memos_tables(self, *, backfill_content_hashes: bool = True) -> None:
         self._ensure_table_group(

@@ -161,6 +161,27 @@ def test_ensure_manual_finance_tables_is_idempotent(warehouse):
     assert (warehouse.physical_schema_name("ops"), "ai_processing_agent_runs") in tables
 
 
+def test_ensure_manual_finance_tables_adds_positions_to_legacy_table(warehouse):
+    warehouse.ensure_manual_finance_tables()
+    warehouse._command("ALTER TABLE @manual_finance_extractions DROP COLUMN positions_json")
+
+    warehouse.ensure_manual_finance_tables()
+
+    rows = warehouse._query(
+        """
+        SELECT data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = %s
+          AND table_name = 'document_extractions'
+          AND column_name = 'positions_json'
+        """,
+        (warehouse.physical_schema_name("derived_finance"),),
+    )
+    assert len(rows) == 1
+    assert rows[0][0:2] == ("jsonb", "NO")
+    assert "'[]'::jsonb" in rows[0][2]
+
+
 def test_extraction_money_is_numeric_and_periods_are_dates(warehouse):
     warehouse.ensure_manual_finance_tables()
     rows = warehouse._query(
