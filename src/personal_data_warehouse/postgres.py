@@ -224,9 +224,20 @@ QUERY_ROLE_SETUP_LOCK_ID = 8_407_112_469
 QUERY_ROLE_SETUP_ATTEMPTS = 4
 QUERY_ROLE_SETUP_RETRY_SECONDS = 0.25
 QUERY_ROLE_CONCURRENT_UPDATE_MESSAGE = "tuple concurrently updated"
+# Serializes every mutation of WHOOP's single-use rotating credential,
+# including first bootstrap, scheduled refresh, direct CLI refresh, and
+# explicit reauthorization. A row lock alone cannot serialize the first insert.
+WHOOP_TOKEN_AUTHORITY_LOCK_ID = 8_407_112_472
 # Serializes the one-time timeline priority bigint -> enum rewrite. Without it
 # two processes booting together both see a bigint column, both issue the ALTER,
 # and the second one rewrites the whole table again behind the first.
+
+
+def _canonical_whoop_token_json(value: str) -> str:
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("WHOOP token JSON must be an object")
+    return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
 
 
 @dataclass(frozen=True)
@@ -5571,12 +5582,85 @@ class PostgresWarehouse:
         rows = self._query("SELECT token_json FROM @whoop_oauth_tokens WHERE account = %s", (account,))
         return str(rows[0][0]) if rows else ""
 
-    def upsert_whoop_oauth_token(self, *, account: str, token_json: str, updated_at: datetime) -> None:
-        self._insert(
-            "whoop_oauth_tokens",
-            [(account, token_json, updated_at)],
-            WHOOP_OAUTH_TOKEN_COLUMNS,
-        )
+    def load_or_bootstrap_whoop_oauth_token(
+        self,
+        *,
+        account: str,
+        bootstrap_token_json: str,
+        updated_at: datetime,
+    ) -> str:
+        """Return the database authority, installing the env bootstrap once.
+
+        The bootstrap is considered only when the account has no private row.
+        It can never replace an existing row, even after a refresh failure.
+        """
+
+        relation = self.sql_relation("whoop_oauth_tokens")
+        connection = psycopg2.connect(self._database_url)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (WHOOP_TOKEN_AUTHORITY_LOCK_ID,),
+                )
+                cursor.execute(
+                    f"SELECT token_json FROM {relation} WHERE account = %s FOR UPDATE",
+                    (account,),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    connection.commit()
+                    return str(row[0])
+                if not bootstrap_token_json:
+                    raise RuntimeError(
+                        "WHOOP has no installed OAuth credential; run "
+                        "`uv run personal-data-warehouse-whoop-auth --install`"
+                    )
+                installed = _canonical_whoop_token_json(bootstrap_token_json)
+                cursor.execute(
+                    f"INSERT INTO {relation} (account, token_json, updated_at) "
+                    "VALUES (%s, %s, %s)",
+                    (account, installed, updated_at),
+                )
+            connection.commit()
+            return installed
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def replace_whoop_oauth_token(
+        self,
+        *,
+        account: str,
+        token_json: str,
+        updated_at: datetime,
+    ) -> None:
+        """Explicitly install a reauthorized token under the authority lock."""
+
+        installed = _canonical_whoop_token_json(token_json)
+        relation = self.sql_relation("whoop_oauth_tokens")
+        connection = psycopg2.connect(self._database_url)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (WHOOP_TOKEN_AUTHORITY_LOCK_ID,),
+                )
+                cursor.execute(
+                    f"INSERT INTO {relation} (account, token_json, updated_at) "
+                    "VALUES (%s, %s, %s) "
+                    "ON CONFLICT (account) DO UPDATE SET "
+                    "token_json = EXCLUDED.token_json, updated_at = EXCLUDED.updated_at",
+                    (account, installed, updated_at),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def rotate_whoop_oauth_token(
         self,
@@ -5595,17 +5679,15 @@ class PostgresWarehouse:
         the transaction back and leaves the last known token untouched.
         """
 
-        def canonical(token_json: str) -> str:
-            parsed = json.loads(token_json)
-            if not isinstance(parsed, dict):
-                raise ValueError("WHOOP token JSON must be an object")
-            return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
-
-        expected_canonical = canonical(expected_token_json)
+        expected_canonical = _canonical_whoop_token_json(expected_token_json)
         relation = self.sql_relation("whoop_oauth_tokens")
         connection = psycopg2.connect(self._database_url)
         try:
             with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (WHOOP_TOKEN_AUTHORITY_LOCK_ID,),
+                )
                 cursor.execute(
                     f"SELECT token_json FROM {relation} WHERE account = %s FOR UPDATE",
                     (account,),
@@ -5614,12 +5696,11 @@ class PostgresWarehouse:
                 if row is None:
                     raise RuntimeError("WHOOP OAuth token row disappeared before refresh")
                 current_token_json = str(row[0])
-                if canonical(current_token_json) != expected_canonical:
+                if _canonical_whoop_token_json(current_token_json) != expected_canonical:
                     connection.commit()
                     return current_token_json
 
-                rotated_token_json = rotate(current_token_json)
-                canonical(rotated_token_json)
+                rotated_token_json = _canonical_whoop_token_json(rotate(current_token_json))
                 cursor.execute(
                     f"UPDATE {relation} SET token_json = %s, updated_at = %s WHERE account = %s",
                     (rotated_token_json, updated_at, account),

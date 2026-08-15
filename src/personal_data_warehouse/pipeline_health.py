@@ -427,7 +427,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
         note=(
             "action_required remains visible on /pipelines while repeated calls"
-            " are skipped; re-authorize WHOOP and publish a changed bootstrap token"
+            " are skipped; re-authorize WHOOP with `personal-data-warehouse-whoop-auth --install`"
         ),
     ),
     _source(

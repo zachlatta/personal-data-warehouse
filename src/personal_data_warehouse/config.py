@@ -1422,8 +1422,6 @@ def load_settings(
     ):
         if not whoop_account:
             raise ValueError("WHOOP_ACCOUNT or GMAIL_ACCOUNTS must be set for WHOOP sync")
-        if require_whoop and not whoop_token_json:
-            raise ValueError("WHOOP_TOKEN_JSON or WHOOP_TOKEN_JSON_B64 must be set for WHOOP sync")
         if (require_whoop or require_whoop_client_secrets) and (not whoop_client_id or not whoop_client_secret):
             raise ValueError("WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET must be set for WHOOP OAuth and token refresh")
         if whoop_page_size < 1 or whoop_page_size > 25:

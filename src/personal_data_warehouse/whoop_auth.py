@@ -7,6 +7,8 @@ import os
 import secrets
 import threading
 import webbrowser
+from collections.abc import Callable
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -14,7 +16,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
-from personal_data_warehouse.config import DEFAULT_WHOOP_SCOPES, WhoopConfig, load_settings
+from personal_data_warehouse.config import (
+    DEFAULT_WHOOP_SCOPES,
+    Settings,
+    WhoopConfig,
+    load_settings,
+)
 from personal_data_warehouse.gmail_auth import update_env_file
 
 
@@ -31,6 +38,35 @@ def encode_whoop_token_env(token_json: str | dict[str, Any]) -> str:
     if isinstance(token_json, dict):
         token_json = json.dumps(token_json, sort_keys=True, separators=(",", ":"))
     return base64.b64encode(token_json.encode("utf-8")).decode("ascii")
+
+
+def install_whoop_token(
+    *,
+    settings: Settings,
+    token: dict[str, Any],
+    warehouse_factory: Callable[[Settings], Any] | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> None:
+    """Install a reauthorized token into the serialized private authority."""
+
+    if settings.whoop is None:
+        raise RuntimeError("WHOOP settings were not loaded")
+    if not settings.postgres_database_url:
+        raise RuntimeError("POSTGRES_DATABASE_URL must be set to install a WHOOP token")
+    if warehouse_factory is None:
+        from personal_data_warehouse.warehouse import warehouse_from_settings
+
+        warehouse_factory = warehouse_from_settings
+    warehouse = warehouse_factory(settings)
+    try:
+        warehouse.ensure_whoop_tables()
+        warehouse.replace_whoop_oauth_token(
+            account=settings.whoop.account,
+            token_json=json.dumps(token, sort_keys=True, separators=(",", ":")),
+            updated_at=(now or (lambda: datetime.now(tz=UTC)))(),
+        )
+    finally:
+        warehouse.close()
 
 
 def whoop_token_json_from_env() -> str:
@@ -157,12 +193,13 @@ def authorization_code_from_callback_url(
 def run_oauth_flow(
     *,
     write_env: bool = False,
+    install: bool = False,
     open_browser: bool = True,
     manual: bool = False,
     input_fn=input,
 ) -> dict[str, str]:
     settings = load_settings(
-        require_postgres=False,
+        require_postgres=install,
         require_gmail=False,
         require_whoop_client_secrets=True,
     )
@@ -209,6 +246,11 @@ def run_oauth_flow(
         code = callback.code
 
     token = exchange_authorization_code(code=code, config=config)
+    if install:
+        install_whoop_token(settings=settings, token=token)
+        print("Installed WHOOP OAuth token in the private warehouse authority")
+        return {}
+
     env_values = {"WHOOP_TOKEN_JSON_B64": encode_whoop_token_env(token)}
     if write_env:
         update_env_file(Path(".env"), env_values)
@@ -286,10 +328,19 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Authorize WHOOP for the personal data warehouse.")
-    parser.add_argument(
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument(
         "--write-env",
         action="store_true",
         help="Update the local .env file with WHOOP_TOKEN_JSON_B64 instead of only printing it.",
+    )
+    destination.add_argument(
+        "--install",
+        action="store_true",
+        help=(
+            "Install the token directly into private.whoop_oauth_tokens under "
+            "the serialized authority lock (requires POSTGRES_DATABASE_URL)."
+        ),
     )
     parser.add_argument(
         "--no-browser",
@@ -302,7 +353,12 @@ def main() -> None:
         help="Paste the final callback URL instead of listening on localhost (useful when authorizing in a browser on another computer).",
     )
     args = parser.parse_args()
-    run_oauth_flow(write_env=args.write_env, open_browser=not args.no_browser, manual=args.manual)
+    run_oauth_flow(
+        write_env=args.write_env,
+        install=args.install,
+        open_browser=not args.no_browser,
+        manual=args.manual,
+    )
 
 
 if __name__ == "__main__":

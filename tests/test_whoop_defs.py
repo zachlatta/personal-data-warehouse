@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from dagster import build_asset_context, build_schedule_context
+import pytest
+from dagster import Failure, build_asset_context, build_schedule_context
 
 from personal_data_warehouse.definitions import defs
 from personal_data_warehouse.defs import whoop_sync as whoop_defs
 from personal_data_warehouse.whoop_sync import (
+    WhoopActionRequiredError,
     WhoopSyncSummary,
     whoop_credential_sha256,
 )
@@ -24,8 +26,16 @@ def test_whoop_sync_schedule_runs_every_five_minutes() -> None:
     assert whoop_defs.whoop_sync_every_five_minutes.default_status == whoop_defs.whoop_schedule_default_status()
 
 
-def test_whoop_schedule_default_status_requires_credentials(monkeypatch) -> None:
-    for name in ("WHOOP_ACCOUNT", "GMAIL_ACCOUNTS", "WHOOP_CLIENT_ID", "WHOOP_CLIENT_SECRET", "WHOOP_TOKEN_JSON", "WHOOP_TOKEN_JSON_B64"):
+def test_whoop_schedule_default_status_requires_database_and_client_credentials(monkeypatch) -> None:
+    for name in (
+        "WHOOP_ACCOUNT",
+        "GMAIL_ACCOUNTS",
+        "WHOOP_CLIENT_ID",
+        "WHOOP_CLIENT_SECRET",
+        "WHOOP_TOKEN_JSON",
+        "WHOOP_TOKEN_JSON_B64",
+        "POSTGRES_DATABASE_URL",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("WHOOP_ENABLED", raising=False)
     assert whoop_defs.whoop_schedule_default_status().value == "STOPPED"
@@ -34,7 +44,7 @@ def test_whoop_schedule_default_status_requires_credentials(monkeypatch) -> None
     monkeypatch.setenv("WHOOP_ACCOUNT", "configured-account")
     monkeypatch.setenv("WHOOP_CLIENT_ID", "client-id")
     monkeypatch.setenv("WHOOP_CLIENT_SECRET", "client-secret")
-    monkeypatch.setenv("WHOOP_TOKEN_JSON_B64", "encoded-token")
+    monkeypatch.setenv("POSTGRES_DATABASE_URL", "postgresql://warehouse")
 
     assert whoop_defs.whoop_schedule_default_status().value == "RUNNING"
 
@@ -118,13 +128,13 @@ def test_whoop_schedule_skips_rejected_credential_until_it_changes(monkeypatch) 
     assert warehouse.closed is True
 
 
-def test_whoop_schedule_resumes_immediately_for_a_new_credential(monkeypatch) -> None:
+def test_whoop_schedule_resumes_immediately_for_an_installed_credential(monkeypatch) -> None:
     old_token = '{"access_token":"expired","refresh_token":"revoked","expires_at":1}'
     new_token = '{"access_token":"new","refresh_token":"new-refresh","expires_at":2}'
 
     class WhoopConfig:
         account = "configured-account"
-        token_json = new_token
+        token_json = old_token
 
     class Settings:
         whoop = WhoopConfig()
@@ -147,7 +157,7 @@ def test_whoop_schedule_resumes_immediately_for_a_new_credential(monkeypatch) ->
             }
 
         def load_whoop_oauth_token(self, *, account):
-            return old_token
+            return new_token
 
         def close(self):
             pass
@@ -195,3 +205,33 @@ def test_whoop_asset_emits_redacted_summary_metadata(monkeypatch) -> None:
     summary = result.metadata["whoop"].value[0]
     assert summary["has_token"] is False
     assert "token" not in str(summary).lower().replace("has_token", "")
+
+
+def test_whoop_asset_does_not_materialize_no_progress_as_success(monkeypatch) -> None:
+    class WhoopConfig:
+        enabled = True
+
+    class Settings:
+        whoop = WhoopConfig()
+
+    class Runner:
+        def __init__(self, **_kwargs):
+            pass
+
+        def sync_all(self):
+            raise WhoopActionRequiredError("WHOOP needs re-authorization")
+
+    @contextmanager
+    def lock(**_kwargs):
+        yield True
+
+    monkeypatch.setattr(whoop_defs, "load_settings", lambda **_kwargs: Settings())
+    monkeypatch.setattr(whoop_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(whoop_defs, "exclusive_sync_lock", lock)
+    monkeypatch.setattr(whoop_defs, "WhoopSyncRunner", Runner)
+
+    with pytest.raises(Failure) as excinfo:
+        whoop_defs.whoop_sync(build_asset_context())
+
+    assert excinfo.value.allow_retries is False
+    assert excinfo.value.metadata["action_required"].value is True

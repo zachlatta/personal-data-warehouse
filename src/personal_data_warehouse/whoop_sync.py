@@ -33,10 +33,9 @@ WHOOP_STATE_COLLECTIONS = (
 WHOOP_STATUS_ACTION_REQUIRED = "action_required"
 # Token-endpoint statuses that mean the stored refresh token itself was
 # rejected (revoked, expired, or rotated away underneath us). No retry can
-# clear these — only a manual re-auth — so they must not fail the run: the
-# */5 schedule otherwise turns one dead token into ~288 red runs/day (which
-# is exactly what happened on 2026-07-30) while burying transient failures
-# that ARE worth alarming on. Mirrors PLAID_ACTION_REQUIRED_ERROR_CODES.
+# clear these — only a manual re-auth. The first detection fails loudly after
+# recording action_required; the schedule guard then prevents ~288 duplicate
+# red runs/day while pipeline health remains in attention.
 WHOOP_ACTION_REQUIRED_HTTP_STATUSES = frozenset({400, 401, 403})
 
 
@@ -68,8 +67,8 @@ def whoop_reauthorization_skip_reason(
     Every WHOOP endpoint shares one OAuth credential. Once all collections
     recorded ``action_required`` for the same credential, another */5 run can
     only repeat six doomed refresh attempts. The hash makes the quiet period
-    self-clearing: a newly authorized bootstrap/private token differs and is
-    tried on the very next schedule tick.
+    self-clearing: a newly installed private token differs and is tried on the
+    very next schedule tick.
     """
     fingerprint = whoop_credential_sha256(token_json)
     if not fingerprint:
@@ -85,14 +84,18 @@ def whoop_reauthorization_skip_reason(
     return (
         "WHOOP credential needs re-authorization; skipping repeated API calls for "
         "the same rejected token. Run `uv run personal-data-warehouse-whoop-auth "
-        "--write-env` locally, then update WHOOP_TOKEN_JSON_B64 in production. "
-        "Sync resumes automatically when the token changes; /pipelines remains "
-        "in attention until a successful sync clears this state."
+        "--install` from a trusted terminal with production database access. "
+        "Sync resumes automatically when the private token changes; /pipelines "
+        "remains in attention until a successful sync clears this state."
     )
 
 
 class WhoopApiError(RuntimeError):
     pass
+
+
+class WhoopActionRequiredError(WhoopApiError):
+    """The current credential needs an explicit OAuth reauthorization."""
 
 
 class WhoopAuthError(WhoopApiError):
@@ -111,8 +114,6 @@ class WhoopSyncSummary:
     sync_type: str
     records_written: int
     collections: dict[str, int]
-    #: Collections skipped because the credential needs a manual re-auth.
-    action_required: int = 0
 
 
 def public_whoop_sync_summary(summary: WhoopSyncSummary) -> dict[str, Any]:
@@ -121,7 +122,6 @@ def public_whoop_sync_summary(summary: WhoopSyncSummary) -> dict[str, Any]:
         "sync_type": summary.sync_type,
         "records_written": summary.records_written,
         "collections": dict(summary.collections),
-        "action_required": summary.action_required,
         # Explicitly document that public summaries never carry OAuth material.
         "has_token": False,
     }
@@ -264,8 +264,13 @@ class WhoopApiClient:
                     timeout=self._timeout_seconds,
                 )
         except WhoopOAuthError as exc:
-            if whoop_action_required_error(exc):
-                self._terminal_refresh_error = exc
+            # A refresh-token request has an ambiguous provider boundary: a
+            # 5xx or disconnected response may arrive after WHOOP consumed the
+            # single-use token. Never submit that same token again from this
+            # process. Dagster may retry the step in a fresh process; it will
+            # either rotate successfully or surface the resulting 4xx as an
+            # explicit reauthorization incident.
+            self._terminal_refresh_error = exc
             raise
         if self._token_updated is not None:
             self._token_updated(dict(self._token))
@@ -306,19 +311,11 @@ class WhoopSyncRunner:
         state_by_key = self._warehouse.load_whoop_sync_state()
         account = config.account
         synced_at = self._now()
-        stored_token_json = self._warehouse.load_whoop_oauth_token(account=account)
-        runtime_token_json = select_whoop_token_json(
-            bootstrap_token_json=config.token_json,
-            stored_token_json=stored_token_json,
-            state_by_key=state_by_key,
+        runtime_token_json = self._warehouse.load_or_bootstrap_whoop_oauth_token(
             account=account,
+            bootstrap_token_json=config.token_json,
+            updated_at=synced_at,
         )
-        if runtime_token_json != stored_token_json:
-            self._warehouse.upsert_whoop_oauth_token(
-                account=account,
-                token_json=runtime_token_json,
-                updated_at=synced_at,
-            )
         self._credential_sha256 = whoop_credential_sha256(runtime_token_json)
         skip_reason = whoop_reauthorization_skip_reason(
             state_by_key,
@@ -327,15 +324,7 @@ class WhoopSyncRunner:
         )
         if skip_reason is not None:
             self._logger.warning(skip_reason)
-            return [
-                WhoopSyncSummary(
-                    account=account,
-                    sync_type="blocked_credential",
-                    records_written=0,
-                    collections={},
-                    action_required=len(WHOOP_STATE_COLLECTIONS),
-                )
-            ]
+            raise WhoopActionRequiredError(skip_reason)
         runtime_config = replace(config, token_json=runtime_token_json)
         client = self._build_client(runtime_config, persist_rotated_token=True)
         collections_written: dict[str, int] = {}
@@ -413,13 +402,18 @@ class WhoopSyncRunner:
 
         if failures:
             raise RuntimeError("WHOOP sync failed for: " + "; ".join(failures))
+        if action_required_count:
+            raise WhoopActionRequiredError(
+                "WHOOP credential needs re-authorization; no complete sync was "
+                "materialized. Run `uv run personal-data-warehouse-whoop-auth "
+                "--install` from a trusted terminal with production database access."
+            )
         return [
             WhoopSyncSummary(
                 account=account,
                 sync_type="mixed",
                 records_written=sum(collections_written.values()),
                 collections=collections_written,
-                action_required=action_required_count,
             )
         ]
 
@@ -563,9 +557,10 @@ class WhoopSyncRunner:
         """Record the failure; return True when it should fail the run.
 
         A dead refresh token (4xx from the token endpoint) records
-        ``action_required`` and returns False: only a manual re-auth fixes it,
-        so re-failing the run every 5 minutes is pure noise. The dashboard
-        surfaces the ``action_required`` rows instead.
+        ``action_required`` and returns False so the caller can raise one
+        explicit action-required error after recording every collection. The
+        schedule guard suppresses later no-op launches while the dashboard
+        keeps the incident visible.
         """
         action_required = whoop_action_required_error(error)
         self._insert_state(
@@ -580,8 +575,8 @@ class WhoopSyncRunner:
         if action_required:
             self._logger.warning(
                 "WHOOP %s needs re-authorization (%s): run "
-                "`uv run personal-data-warehouse-whoop-auth --write-env` locally, then update "
-                "WHOOP_TOKEN_JSON_B64 on the production Dagster deployment",
+                "`uv run personal-data-warehouse-whoop-auth --install` from a trusted "
+                "terminal with production database access",
                 collection,
                 error,
             )
@@ -803,38 +798,6 @@ def sync_version_from_datetime(value: datetime) -> int:
 
 def truncate_error(value: str, *, max_chars: int = 4000) -> str:
     return value if len(value) <= max_chars else value[: max_chars - 3] + "..."
-
-
-def select_whoop_token_json(
-    *,
-    bootstrap_token_json: str,
-    stored_token_json: str,
-    state_by_key: Mapping[tuple[str, str], Mapping[str, Any]],
-    account: str,
-) -> str:
-    """Use the private row as authority, except for an explicit re-authorization.
-
-    ``WHOOP_TOKEN_JSON_B64`` is a one-time bootstrap, not a second mutable token
-    store. Comparing expiries is unsafe for rotating refresh tokens: a copied env
-    value can have a later-looking expiry while its refresh token was already
-    consumed. A changed bootstrap is adopted only after every collection records
-    that the current private credential was rejected.
-    """
-    if not stored_token_json:
-        return bootstrap_token_json
-    if not bootstrap_token_json:
-        return stored_token_json
-    if whoop_credential_sha256(bootstrap_token_json) == whoop_credential_sha256(
-        stored_token_json
-    ):
-        return stored_token_json
-    if whoop_reauthorization_skip_reason(
-        state_by_key,
-        account=account,
-        token_json=stored_token_json,
-    ) is not None:
-        return bootstrap_token_json
-    return stored_token_json
 
 
 def _parse_token_json(token_json: str) -> dict[str, Any]:

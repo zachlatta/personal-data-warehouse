@@ -14,6 +14,7 @@ from personal_data_warehouse.whoop_auth import (
     whoop_token_json_from_env,
 )
 from personal_data_warehouse.whoop_sync import (
+    WhoopActionRequiredError,
     WhoopApiClient,
     WhoopApiError,
     WhoopAuthError,
@@ -24,7 +25,6 @@ from personal_data_warehouse.whoop_sync import (
     parse_rfc3339,
     public_whoop_sync_summary,
     recovery_to_row,
-    select_whoop_token_json,
     sleep_to_row,
     workout_to_row,
     whoop_credential_sha256,
@@ -61,6 +61,7 @@ class FakeWhoopWarehouse:
         self.state_rows = []
         self.oauth_token = ""
         self.oauth_token_updates = []
+        self.oauth_token_bootstraps = []
         self.oauth_token_rotations = []
 
     def ensure_whoop_tables(self) -> None:
@@ -72,7 +73,24 @@ class FakeWhoopWarehouse:
     def load_whoop_oauth_token(self, *, account):
         return self.oauth_token
 
-    def upsert_whoop_oauth_token(self, *, account, token_json, updated_at):
+    def load_or_bootstrap_whoop_oauth_token(
+        self, *, account, bootstrap_token_json, updated_at
+    ):
+        self.oauth_token_bootstraps.append(
+            {
+                "account": account,
+                "bootstrap_token_json": bootstrap_token_json,
+                "updated_at": updated_at,
+            }
+        )
+        if self.oauth_token:
+            return self.oauth_token
+        if not bootstrap_token_json:
+            raise RuntimeError("WHOOP has no installed OAuth credential")
+        self.oauth_token = bootstrap_token_json
+        return self.oauth_token
+
+    def replace_whoop_oauth_token(self, *, account, token_json, updated_at):
         self.oauth_token = token_json
         self.oauth_token_updates.append({"account": account, "token_json": token_json, "updated_at": updated_at})
 
@@ -87,7 +105,7 @@ class FakeWhoopWarehouse:
         if json.loads(self.oauth_token) != json.loads(expected_token_json):
             return self.oauth_token
         rotated_token_json = rotate(self.oauth_token)
-        self.upsert_whoop_oauth_token(
+        self.replace_whoop_oauth_token(
             account=account,
             token_json=rotated_token_json,
             updated_at=updated_at,
@@ -219,13 +237,21 @@ def test_load_settings_accepts_whoop_config(monkeypatch) -> None:
     assert "offline" in settings.whoop.scopes
 
 
-def test_load_settings_requires_whoop_token_for_sync(monkeypatch) -> None:
+def test_load_settings_allows_the_database_to_be_the_whoop_token_authority(monkeypatch) -> None:
     monkeypatch.setenv("WHOOP_ACCOUNT", "zach@example.com")
+    monkeypatch.setenv("WHOOP_CLIENT_ID", "client-id")
+    monkeypatch.setenv("WHOOP_CLIENT_SECRET", "client-secret")
     monkeypatch.delenv("WHOOP_TOKEN_JSON", raising=False)
     monkeypatch.delenv("WHOOP_TOKEN_JSON_B64", raising=False)
 
-    with pytest.raises(ValueError, match="WHOOP_TOKEN_JSON_B64"):
-        load_settings(require_postgres=False, require_gmail=False, require_whoop=True)
+    settings = load_settings(
+        require_postgres=False,
+        require_gmail=False,
+        require_whoop=True,
+    )
+
+    assert settings.whoop is not None
+    assert settings.whoop.token_json == ""
 
 
 def test_load_settings_requires_whoop_client_credentials_for_refresh(monkeypatch) -> None:
@@ -388,6 +414,38 @@ def test_api_client_does_not_repeat_a_permanently_rejected_refresh() -> None:
 
     for _ in range(2):
         with pytest.raises(WhoopOAuthError, match="HTTP 400"):
+            client.get_json("/v2/user/profile/basic")
+
+    assert len(refresh_calls) == 1
+
+
+def test_api_client_does_not_repeat_an_ambiguous_refresh_failure_in_one_process() -> None:
+    """Reproduce the 2026-08-12 06:00 UTC refresh boundary.
+
+    Production received HTTP 502 for the first refresh and HTTP 400 when the
+    same process immediately reused that single-use token for the next WHOOP
+    collection. The first response may have consumed the token, so retrying it
+    inside the same process is unsafe and obscures the original failure.
+    """
+
+    expired = _token_json(expires_at=1)
+    refresh_calls = []
+
+    def ambiguous_refresh(token):
+        refresh_calls.append(token)
+        raise WhoopOAuthError(
+            "WHOOP token refresh failed with HTTP 502",
+            status_code=502,
+        )
+
+    client = WhoopApiClient(
+        token_json=expired,
+        session=FakeSession([]),
+        token_refresher=ambiguous_refresh,
+    )
+
+    for _ in range(2):
+        with pytest.raises(WhoopOAuthError, match="HTTP 502"):
             client.get_json("/v2/user/profile/basic")
 
     assert len(refresh_calls) == 1
@@ -598,45 +656,6 @@ def test_validate_all_makes_live_shape_checks_without_returning_personal_data(mo
     assert "101" not in json.dumps(result)
 
 
-def test_token_selection_never_replaces_healthy_private_token_with_bootstrap() -> None:
-    bootstrap = _token_json(access_token="env-copy", expires_at=300)
-    stored = _token_json(access_token="rotated-private", expires_at=200)
-
-    assert select_whoop_token_json(
-        bootstrap_token_json=bootstrap,
-        stored_token_json=stored,
-        state_by_key={},
-        account="user@example.com",
-    ) == stored
-
-
-def test_token_selection_adopts_changed_bootstrap_after_stored_token_is_rejected() -> None:
-    bootstrap = _token_json(access_token="reauthorized", expires_at=300)
-    stored = _token_json(access_token="rejected-private", expires_at=400)
-    account = "user@example.com"
-    state = {
-        (account, collection): {
-            "status": "action_required",
-            "credential_sha256": whoop_credential_sha256(stored),
-        }
-        for collection in (
-            "profile",
-            "body_measurement",
-            "cycles",
-            "recovery",
-            "sleep",
-            "workout",
-        )
-    }
-
-    assert select_whoop_token_json(
-        bootstrap_token_json=bootstrap,
-        stored_token_json=stored,
-        state_by_key=state,
-        account=account,
-    ) == bootstrap
-
-
 def test_sync_runner_uses_private_stored_token_over_bootstrap_env_token(monkeypatch) -> None:
     monkeypatch.setenv("WHOOP_ACCOUNT", "zach@example.com")
     monkeypatch.setenv(
@@ -669,16 +688,33 @@ def test_sync_runner_uses_private_stored_token_over_bootstrap_env_token(monkeypa
 
     assert captured["token"] == "rotated-stored-token"
     assert warehouse.oauth_token_updates == []
+    assert len(warehouse.oauth_token_bootstraps) == 1
 
 
-def test_sync_runner_persists_reauthorized_bootstrap_after_rejection(monkeypatch) -> None:
+def test_nine_hour_recurrence_cannot_resurrect_the_stale_bootstrap(monkeypatch) -> None:
+    """The original env bootstrap must not replace a rejected rotated row.
+
+    After the August 11 repair, the private token rotated for nine hours. At
+    06:00 UTC an ambiguous 502 left that rotated credential unusable. At 06:05
+    the old implementation treated the original, long-consumed env bootstrap
+    as a reauthorization and wrote it back over the private row.
+    """
+
     account = "zach@example.com"
-    rejected = _token_json(access_token="rejected-private", expires_at=400)
-    reauthorized = _token_json(access_token="reauthorized-bootstrap", expires_at=300)
+    rotated_then_rejected = _token_json(
+        access_token="rotated-private",
+        refresh_token="rotated-nine-hours",
+        expires_at=400,
+    )
+    stale_bootstrap = _token_json(
+        access_token="original-bootstrap",
+        refresh_token="consumed-nine-hours-ago",
+        expires_at=300,
+    )
     state = {
         (account, collection): {
             "status": "action_required",
-            "credential_sha256": whoop_credential_sha256(rejected),
+            "credential_sha256": whoop_credential_sha256(rotated_then_rejected),
         }
         for collection in (
             "profile",
@@ -692,7 +728,7 @@ def test_sync_runner_persists_reauthorized_bootstrap_after_rejection(monkeypatch
     monkeypatch.setenv("WHOOP_ACCOUNT", account)
     monkeypatch.setenv(
         "WHOOP_TOKEN_JSON_B64",
-        encode_whoop_token_env(reauthorized),
+        encode_whoop_token_env(stale_bootstrap),
     )
     settings = load_settings(
         require_postgres=False,
@@ -700,31 +736,24 @@ def test_sync_runner_persists_reauthorized_bootstrap_after_rejection(monkeypatch
         require_whoop=True,
     )
     warehouse = FakeWhoopWarehouse(state=state)
-    warehouse.oauth_token = rejected
-    captured = {}
-    client = FakeWhoopClient(
-        pages={
-            "/v2/cycle": [{"records": [], "next_token": ""}],
-            "/v2/recovery": [{"records": [], "next_token": ""}],
-            "/v2/activity/sleep": [{"records": [], "next_token": ""}],
-            "/v2/activity/workout": [{"records": [], "next_token": ""}],
-        }
-    )
+    warehouse.oauth_token = rotated_then_rejected
+    clients_built = []
 
     def client_factory(config):
-        captured["token"] = json.loads(config.token_json)["access_token"]
-        return client
+        clients_built.append(config)
+        raise AssertionError("blocked credentials must not build an API client")
 
-    WhoopSyncRunner(
-        settings=settings,
-        warehouse=warehouse,
-        logger=NullLogger(),
-        client_factory=client_factory,
-    ).sync_all()
+    with pytest.raises(WhoopActionRequiredError, match="re-authorization"):
+        WhoopSyncRunner(
+            settings=settings,
+            warehouse=warehouse,
+            logger=NullLogger(),
+            client_factory=client_factory,
+        ).sync_all()
 
-    assert captured["token"] == "reauthorized-bootstrap"
-    assert len(warehouse.oauth_token_updates) == 1
-    assert json.loads(warehouse.oauth_token)["access_token"] == "reauthorized-bootstrap"
+    assert clients_built == []
+    assert warehouse.oauth_token == rotated_then_rejected
+    assert warehouse.oauth_token_updates == []
 
 
 def test_sync_runner_fetches_profile_body_and_collections_with_state(monkeypatch) -> None:
@@ -823,21 +852,21 @@ def test_sync_runner_records_action_required_for_dead_refresh_token(monkeypatch)
         fail_error=WhoopOAuthError("WHOOP token refresh failed with HTTP 400", status_code=400),
     )
 
-    summaries = WhoopSyncRunner(
-        settings=settings,
-        warehouse=warehouse,
-        logger=logger,
-        client_factory=lambda _config: client,
-        now=lambda: datetime(2026, 7, 30, 12, tzinfo=UTC),
-    ).sync_all()
+    with pytest.raises(WhoopActionRequiredError, match="re-authorization"):
+        WhoopSyncRunner(
+            settings=settings,
+            warehouse=warehouse,
+            logger=logger,
+            client_factory=lambda _config: client,
+            now=lambda: datetime(2026, 7, 30, 12, tzinfo=UTC),
+        ).sync_all()
 
-    # The run stays green; every collection records the manual step instead.
+    # The first detection is a red run; the schedule guard suppresses later
+    # no-op launches while pipeline health stays in attention.
     assert len(warehouse.state_rows) == 6
     assert {row["status"] for row in warehouse.state_rows} == {"action_required"}
-    assert summaries[0].action_required == 6
-    assert summaries[0].records_written == 0
     assert any("personal-data-warehouse-whoop-auth" in warning for warning in logger.warnings)
-    assert any("WHOOP_TOKEN_JSON_B64" in warning for warning in logger.warnings)
+    assert any("--install" in warning for warning in logger.warnings)
     expected_fingerprint = whoop_credential_sha256(settings.whoop.token_json)
     assert {row["credential_sha256"] for row in warehouse.state_rows} == {
         expected_fingerprint

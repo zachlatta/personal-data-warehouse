@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
+
 import pytest
 
 from personal_data_warehouse.config import WhoopConfig
@@ -7,6 +10,7 @@ from personal_data_warehouse.whoop_auth import (
     WhoopOAuthError,
     authorization_code_from_callback_url,
     authorization_url,
+    install_whoop_token,
     refresh_whoop_token,
 )
 
@@ -111,6 +115,48 @@ def test_refresh_whoop_token_requires_rotated_refresh_token(monkeypatch) -> None
             client_secret="client-secret",
             token_url="https://whoop.example/token",
         )
+
+
+def test_install_whoop_token_replaces_the_serialized_database_authority() -> None:
+    calls = []
+
+    class Settings:
+        postgres_database_url = "postgresql://warehouse"
+        whoop = type("Whoop", (), {"account": "test@example.com"})()
+
+    class Warehouse:
+        def ensure_whoop_tables(self):
+            calls.append(("ensure",))
+
+        def replace_whoop_oauth_token(self, **kwargs):
+            calls.append(("replace", kwargs))
+
+        def close(self):
+            calls.append(("close",))
+
+    installed_at = datetime(
+        2026,
+        8,
+        14,
+        12,
+        tzinfo=UTC,
+    )
+    token = {"access_token": "new", "refresh_token": "new-refresh"}
+
+    install_whoop_token(
+        settings=Settings(),
+        token=token,
+        warehouse_factory=lambda _settings: Warehouse(),
+        now=lambda: installed_at,
+    )
+
+    assert calls[0] == ("ensure",)
+    operation, kwargs = calls[1]
+    assert operation == "replace"
+    assert kwargs["account"] == "test@example.com"
+    assert json.loads(kwargs["token_json"]) == token
+    assert kwargs["updated_at"] == installed_at
+    assert calls[2] == ("close",)
 
 
 def test_authorization_code_from_callback_url_validates_state_and_redirect() -> None:

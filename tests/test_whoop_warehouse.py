@@ -142,7 +142,7 @@ def test_whoop_tables_upsert_rows_and_state(warehouse: PostgresWarehouse) -> Non
             },
         ]
     )
-    warehouse.upsert_whoop_oauth_token(
+    warehouse.replace_whoop_oauth_token(
         account="zach@example.com",
         token_json='{"access_token":"private-token"}',
         updated_at=synced_at,
@@ -171,7 +171,7 @@ def test_whoop_token_rotation_preserves_the_current_token_when_refresh_fails(
     warehouse.ensure_whoop_tables()
     account = "zach@example.com"
     stored = '{"access_token":"current","refresh_token":"single-use"}'
-    warehouse.upsert_whoop_oauth_token(
+    warehouse.replace_whoop_oauth_token(
         account=account,
         token_json=stored,
         updated_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
@@ -198,7 +198,7 @@ def test_whoop_token_rotation_serializes_racers_and_refreshes_only_once(
     account = "zach@example.com"
     original = '{"access_token":"old","refresh_token":"single-use"}'
     winner = '{"access_token":"winner","refresh_token":"rotated"}'
-    warehouse.upsert_whoop_oauth_token(
+    warehouse.replace_whoop_oauth_token(
         account=account,
         token_json=original,
         updated_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
@@ -246,3 +246,95 @@ def test_whoop_token_rotation_serializes_racers_and_refreshes_only_once(
 
     assert losing_refresh_calls == []
     assert warehouse.load_whoop_oauth_token(account=account) == winner
+
+
+def test_whoop_reauthorization_and_rotation_share_one_critical_section(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """An explicit reauthorization cannot race a scheduled refresh."""
+
+    warehouse.ensure_whoop_tables()
+    account = "zach@example.com"
+    original = '{"access_token":"old","refresh_token":"single-use"}'
+    rotated = '{"access_token":"rotated","refresh_token":"next"}'
+    reauthorized = '{"access_token":"reauthorized","refresh_token":"fresh"}'
+    warehouse.replace_whoop_oauth_token(
+        account=account,
+        token_json=original,
+        updated_at=datetime(2026, 8, 12, 5, tzinfo=UTC),
+    )
+    refresh_has_lock = Event()
+    allow_refresh_to_finish = Event()
+    install_started = Event()
+    second = PostgresWarehouse(
+        warehouse._database_url,
+        schema=warehouse.schema_namespace,
+    )
+
+    def provider_refresh(_token_json: str) -> str:
+        refresh_has_lock.set()
+        assert allow_refresh_to_finish.wait(timeout=5)
+        return rotated
+
+    def install_reauthorization() -> None:
+        install_started.set()
+        second.replace_whoop_oauth_token(
+            account=account,
+            token_json=reauthorized,
+            updated_at=datetime(2026, 8, 12, 6, 1, tzinfo=UTC),
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            refresh = pool.submit(
+                warehouse.rotate_whoop_oauth_token,
+                account=account,
+                expected_token_json=original,
+                rotate=provider_refresh,
+                updated_at=datetime(2026, 8, 12, 6, tzinfo=UTC),
+            )
+            assert refresh_has_lock.wait(timeout=5)
+            install = pool.submit(
+                install_reauthorization,
+            )
+            assert install_started.wait(timeout=5)
+            assert not install.done()
+            allow_refresh_to_finish.set()
+
+            assert refresh.result(timeout=5) == rotated
+            install.result(timeout=5)
+    finally:
+        second.close()
+
+    assert warehouse.load_whoop_oauth_token(account=account) == reauthorized
+
+
+def test_competing_first_bootstraps_install_exactly_one_authority(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_whoop_tables()
+    account = "zach@example.com"
+    first = '{"access_token":"first","refresh_token":"first-refresh"}'
+    second_token = '{"access_token":"second","refresh_token":"second-refresh"}'
+    second = PostgresWarehouse(
+        warehouse._database_url,
+        schema=warehouse.schema_namespace,
+    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [
+                pool.submit(
+                    wh.load_or_bootstrap_whoop_oauth_token,
+                    account=account,
+                    bootstrap_token_json=token,
+                    updated_at=datetime(2026, 8, 12, 6, tzinfo=UTC),
+                )
+                for wh, token in ((warehouse, first), (second, second_token))
+            ]
+            installed = [result.result(timeout=5) for result in results]
+    finally:
+        second.close()
+
+    assert installed[0] == installed[1]
+    assert warehouse.load_whoop_oauth_token(account=account) == installed[0]
