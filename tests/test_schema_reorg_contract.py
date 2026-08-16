@@ -137,7 +137,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
     assert by_layer == {
         "base": 52,
         "derived": 20,
-        "marts": 26,
+        "marts": 28,
         "timeline": 7,
         "ops": 22,
         "private": 5,
@@ -196,11 +196,13 @@ def test_catalog_records_the_target_physical_locations() -> None:
         "clean_transcripts_no_calendar_match": ("marts_calendar", "unmatched_voice_memos"),
         "marts_finance_net_worth": ("marts_finance", "net_worth"),
         "marts_finance_net_worth_history": ("marts_finance", "net_worth_history"),
+        "marts_finance_account_freshness": ("marts_finance", "account_freshness"),
         "marts_transaction_receipts": ("marts_receipts", "transaction_receipts"),
         # The warehouse's own operational read interface: freshness and health
         # per pipeline, with the ops snapshot behind it.
         "marts_pipeline_health": ("marts_ops", "pipeline_health"),
         "marts_pipeline_table_freshness": ("marts_ops", "table_freshness"),
+        "marts_ops_plaid_item_health": ("marts_ops", "plaid_item_health"),
         # timeline: the entry point plus the search interface
         "timeline_events": ("timeline", "events"),
         "timeline_events_seq": ("timeline", "events_seq"),

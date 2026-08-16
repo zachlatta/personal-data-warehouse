@@ -11,7 +11,7 @@ timestamps.
 from __future__ import annotations
 
 import os
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -348,3 +348,127 @@ def test_net_worth_history_excludes_accounts_before_first_observation(warehouse)
         (date(2026, 7, 2), Decimal("100.00")),
         (date(2026, 7, 3), Decimal("150.00")),
     ]
+
+
+# --- per-account freshness (marts_finance.account_freshness) -------------------
+#
+# Regression cover for the Venture X outage: one credit card stopped producing
+# transactions on 2026-03-21 and nothing noticed until 2026-08-16, because
+# table-level freshness on base_plaid.transactions stayed green the whole time
+# (three other institutions kept writing to it) and the statement pipeline that
+# had been covering the card is declared manual, hence never stale.
+
+
+def _txn_row(**overrides) -> dict:
+    row = {
+        "transaction_id": "ft_1",
+        "account_id": "fa_1",
+        "posted_at": _TS,
+        "amount": Decimal("-12.34"),
+        "currency": "USD",
+        "description": "Coffee",
+        "merchant": "Cafe",
+        "pending": 0,
+        "source": "plaid",
+        "created_at": _TS,
+        "sync_version": 1,
+    }
+    row.update(overrides)
+    return row
+
+
+def _cadence_rows(account_id: str, *, count: int, every_days: float, quiet_days: float) -> list[dict]:
+    """``count`` transactions spaced ``every_days`` apart, ending ``quiet_days`` ago."""
+    now = datetime.now(tz=UTC)
+    last = now - timedelta(days=quiet_days)
+    return [
+        _txn_row(
+            transaction_id=f"ft_{account_id}_{index}",
+            account_id=account_id,
+            posted_at=last - timedelta(days=every_days * index),
+        )
+        for index in range(count)
+    ]
+
+
+def _freshness(warehouse) -> dict[str, tuple]:
+    rows = warehouse._query(
+        """
+        SELECT account_id, status, baseline_gaps, quiet_ratio
+        FROM @marts_finance_account_freshness
+        """
+    )
+    return {row[0]: (row[1], row[2], row[3]) for row in rows}
+
+
+def test_account_freshness_flags_a_dense_account_that_went_quiet(warehouse):
+    """A daily-cadence account silent for two months is stale, not ok.
+
+    This is the shape of the missed outage: heavy, regular use and then
+    nothing.
+    """
+    warehouse.ensure_finance_tables()
+    warehouse.insert_finance_accounts([_account_row(account_id="fa_card", kind="credit")])
+    warehouse.insert_finance_transactions(
+        _cadence_rows("fa_card", count=40, every_days=1, quiet_days=60)
+    )
+    status, gaps, ratio = _freshness(warehouse)["fa_card"]
+    assert status == "stale"
+    assert gaps == 20, "cadence uses the most recent N intervals"
+    # Silent for 60x its own typical one-day gap.
+    assert ratio == pytest.approx(Decimal("60"), abs=Decimal("1"))
+
+
+def test_account_freshness_leaves_a_naturally_slow_account_alone(warehouse):
+    """The same 60 days of silence is unremarkable at a monthly cadence.
+
+    A single global threshold cannot express this, which is why the expectation
+    is measured per account instead of declared.
+    """
+    warehouse.ensure_finance_tables()
+    warehouse.insert_finance_accounts([_account_row(account_id="fa_ira", kind="ira")])
+    warehouse.insert_finance_transactions(
+        _cadence_rows("fa_ira", count=12, every_days=30, quiet_days=60)
+    )
+    status, _, ratio = _freshness(warehouse)["fa_ira"]
+    assert status == "ok"
+    assert ratio == pytest.approx(Decimal("2"), abs=Decimal("0.2"))
+
+
+def test_account_freshness_baseline_ignores_the_silence_it_is_measuring(warehouse):
+    """The cadence window ends at the last transaction, not at now().
+
+    Measured over a trailing window from now(), an account quiet for longer
+    than the window contributes zero intervals and disappears into 'sparse' —
+    the longer it stays broken, the more normal broken looks. Anchoring to the
+    last transaction is what keeps a long outage loud.
+    """
+    warehouse.ensure_finance_tables()
+    warehouse.insert_finance_accounts([_account_row(account_id="fa_old", kind="credit")])
+    warehouse.insert_finance_transactions(
+        _cadence_rows("fa_old", count=30, every_days=1, quiet_days=200)
+    )
+    status, gaps, _ = _freshness(warehouse)["fa_old"]
+    assert gaps == 20, "gaps must come from before the outage, not after it"
+    assert status == "stale"
+
+
+def test_account_freshness_reports_rather_than_judges_thin_history(warehouse):
+    """Too few intervals for a percentile, and no transactions at all.
+
+    A verdict built on three data points is how a monitor teaches you to ignore
+    it; valuation-only accounts (a house, a car) are silent by nature.
+    """
+    warehouse.ensure_finance_tables()
+    warehouse.insert_finance_accounts(
+        [
+            _account_row(account_id="fa_thin", kind="credit"),
+            _account_row(account_id="fa_house", kind="property"),
+        ]
+    )
+    warehouse.insert_finance_transactions(
+        _cadence_rows("fa_thin", count=3, every_days=1, quiet_days=400)
+    )
+    freshness = _freshness(warehouse)
+    assert freshness["fa_thin"][0] == "sparse"
+    assert freshness["fa_house"] == ("no_transactions", 0, None)

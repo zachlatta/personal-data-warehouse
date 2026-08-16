@@ -1743,6 +1743,17 @@
       }
     },
     {
+      "id": "marts_finance_account_freshness",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "finance",
+      "schema": "marts_finance",
+      "name": "account_freshness",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "marts_pipeline_health",
       "kind": "view",
       "layer": "marts",
@@ -1760,6 +1771,17 @@
       "domain": "ops",
       "schema": "marts_ops",
       "name": "table_freshness",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "marts_ops_plaid_item_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "plaid_item_health",
       "discoverable": true,
       "query_access": "public",
       "secret": false

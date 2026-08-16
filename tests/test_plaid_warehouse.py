@@ -422,3 +422,162 @@ def test_delete_plaid_item_removes_every_item_scoped_row_and_spares_other_items(
     assert warehouse.delete_plaid_item(account="zach@example.com", item_id="item-old") == {
         table: 0 for table in counts
     }
+
+
+# --- marts_ops.plaid_item_health ----------------------------------------------
+
+
+def _item_row(item_id: str, *, now: datetime, error: dict | None = None) -> dict:
+    return {
+        "account": "zach@example.com",
+        "item_id": item_id,
+        "institution_id": "ins_1",
+        "institution_name": "Example Bank",
+        "available_products": [],
+        "billed_products": [],
+        "webhook": "",
+        "consent_expiration_time": now,
+        "error_json": error or {},
+        "raw_json": {},
+        "linked_at": now,
+        "synced_at": now,
+        "sync_version": 1,
+    }
+
+
+def _plaid_account_row(item_id: str, account_id: str, name: str, *, now: datetime) -> dict:
+    return {
+        "account": "zach@example.com",
+        "item_id": item_id,
+        "account_id": account_id,
+        "name": name,
+        "official_name": name,
+        "mask": "4242",
+        "type": "credit",
+        "subtype": "credit card",
+        "available_balance": 0.0,
+        "current_balance": 10.0,
+        "limit_balance": 0.0,
+        "iso_currency_code": "USD",
+        "unofficial_currency_code": "",
+        "is_removed": 0,
+        "raw_json": {},
+        "synced_at": now,
+        "sync_version": 1,
+    }
+
+
+def test_plaid_item_health_names_the_broken_item(warehouse: PostgresWarehouse) -> None:
+    """A broken Item must be identifiable, not just counted.
+
+    ``base_plaid.items.error_json`` was written by every sync and read by
+    nothing. The only visible trace of a dead Item was the 'action_required'
+    tally on marts_ops.pipeline_health, which says how many need attention but
+    never which — so a Capital One Item sat in ITEM_ERROR / NO_ACCOUNTS with
+    its card frozen and no way to see it short of querying the raw column by
+    hand. The run stays green on purpose (failing it once produced 262
+    consecutive failed runs), so this row is the compensating signal.
+    """
+    warehouse.ensure_plaid_tables()
+    now = datetime(2026, 8, 16, 5, 0, tzinfo=UTC)
+    warehouse.insert_plaid_items(
+        [
+            _item_row("item-ok", now=now),
+            _item_row(
+                "item-broken",
+                now=now,
+                error={
+                    "error_code": "NO_ACCOUNTS",
+                    "error_type": "ITEM_ERROR",
+                    "error_message": "no valid accounts were found for this item",
+                },
+            ),
+        ]
+    )
+    warehouse.insert_plaid_accounts(
+        [
+            _plaid_account_row("item-ok", "acc-ok", "Checking", now=now),
+            _plaid_account_row("item-broken", "acc-broken", "Venture X", now=now),
+        ]
+    )
+    rows = warehouse._query(
+        """
+        SELECT item_id, status, error_code, error_type, account_names, account_count
+        FROM @marts_ops_plaid_item_health
+        ORDER BY item_id
+        """
+    )
+    assert rows == [
+        ("item-broken", "action_required", "NO_ACCOUNTS", "ITEM_ERROR", "Venture X", 1),
+        ("item-ok", "ok", "", "", "Checking", 1),
+    ]
+
+
+def test_plaid_item_health_reports_the_frozen_accounts_last_transaction(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The Item's error and its data going quiet belong on the same row.
+
+    Knowing an Item is broken is only half the answer; the operational question
+    is how much data has been missed since, which is the age of the newest
+    transaction across the accounts that Item feeds.
+    """
+    warehouse.ensure_plaid_tables()
+    now = datetime(2026, 8, 16, 5, 0, tzinfo=UTC)
+    frozen_at = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    warehouse.insert_plaid_items([_item_row("item-1", now=now)])
+    warehouse.insert_plaid_accounts(
+        [_plaid_account_row("item-1", "acc-1", "Venture X", now=now)]
+    )
+    warehouse.insert_plaid_transactions(
+        [
+            {
+                "account": "zach@example.com",
+                "item_id": "item-1",
+                "account_id": "acc-1",
+                "transaction_id": "txn-1",
+                "posted_at": frozen_at,
+                "authorized_at": frozen_at,
+                "name": "COFFEE",
+                "merchant_name": "Coffee",
+                "amount": 4.5,
+                "iso_currency_code": "USD",
+                "unofficial_currency_code": "",
+                "category_json": [],
+                "payment_channel": "in store",
+                "pending": 0,
+                "pending_transaction_id": "",
+                "is_removed": 0,
+                "raw_json": {},
+                "synced_at": now,
+                "sync_version": 1,
+            }
+        ]
+    )
+    rows = warehouse._query(
+        "SELECT newest_transaction_at FROM @marts_ops_plaid_item_health WHERE item_id = %s",
+        ("item-1",),
+    )
+    assert rows == [(frozen_at,)]
+
+
+def test_plaid_item_health_covers_an_item_with_no_accounts(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """NO_ACCOUNTS means exactly that, so the join must not drop the row.
+
+    An inner join here would hide the single most important case: the Item
+    whose accounts Plaid can no longer see.
+    """
+    warehouse.ensure_plaid_tables()
+    now = datetime(2026, 8, 16, 5, 0, tzinfo=UTC)
+    warehouse.insert_plaid_items(
+        [_item_row("item-empty", now=now, error={"error_code": "NO_ACCOUNTS"})]
+    )
+    rows = warehouse._query(
+        """
+        SELECT item_id, status, account_count, account_names, newest_transaction_at
+        FROM @marts_ops_plaid_item_health
+        """
+    )
+    assert rows == [("item-empty", "action_required", 0, "", None)]

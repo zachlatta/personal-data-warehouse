@@ -62,6 +62,13 @@ from personal_data_warehouse.relations import CATALOG, relation as canonical_rel
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ACCOUNT_BASELINE_GAPS",
+    "ACCOUNT_BASELINE_MAX_DAYS",
+    "ACCOUNT_BASELINE_PERCENTILE",
+    "ACCOUNT_LATE_MULTIPLIER",
+    "ACCOUNT_MIN_BASELINE_GAPS",
+    "ACCOUNT_MIN_EXPECTED_GAP_SECONDS",
+    "ACCOUNT_STALE_MULTIPLIER",
     "COLLECTOR_STALE_SECONDS",
     "LATE_MULTIPLIER",
     "PIPELINES",
@@ -94,6 +101,65 @@ STALE_MULTIPLIER = 6
 #: collector runs every ten minutes; past this the dashboard reports 'unknown'
 #: instead of quietly presenting hour-old timestamps as current.
 COLLECTOR_STALE_SECONDS = 3600
+
+# --- per-account freshness (marts_finance.account_freshness) ------------------
+#
+# Table-level freshness cannot see one account going quiet. ``base_plaid.
+# transactions`` stayed current for four months while the Capital One Venture X
+# card contributed nothing to it, because Fidelity, Robinhood, and Venmo kept
+# writing to the same table; ``max(posted_at)`` over the whole table is a
+# max, so the loudest source hides every silent one. The statement side was
+# worse than invisible — ``manual_finance`` declares ``data=None`` (a manual
+# upload never goes stale), so the PDF pipeline stopping in March 2026 was by
+# construction not a detectable event. Between them the card had no transaction
+# from 2026-03-21 to 2026-05-12 and nothing noticed.
+#
+# The fix has to be per-account, and it cannot use one global threshold: a card
+# used daily and a Roth IRA touched twice a year are both healthy. Nor can the
+# interval be declared per account — that is 20+ hand-maintained numbers that
+# rot the moment spending habits change.
+#
+# So each account is judged against *its own* measured cadence. The estimator
+# is the 90th percentile of the intervals between consecutive transactions,
+# which absorbs the burstiness a mean cannot: brokerages trade in clusters and
+# then sit idle, and a mean gap flags them constantly. Two properties matter:
+#
+#   * The baseline window ends at the account's LAST transaction, not at now().
+#     Measuring cadence over a trailing window that includes the silence lets a
+#     long outage depress its own baseline and hide itself — the longer an
+#     account is broken, the more normal being broken looks.
+#   * The window is counted in INTERVALS, not days. A fixed span of days cannot
+#     serve both ends of the range: 180 days holds hundreds of intervals for a
+#     daily-use card but at most six for a monthly one, so every slow account
+#     would fall below the minimum and sit permanently unjudged — silently
+#     exempt, which is the failure this exists to prevent. Taking the most
+#     recent N intervals instead lets each account reach back exactly as far as
+#     its own cadence requires.
+#   * Accounts with too few observed intervals are reported 'sparse' rather
+#     than judged. A p90 over three gaps is not a cadence, and forcing a
+#     verdict there is how a monitor earns the ignore-it reflex.
+#
+# Backtested against the Venture X outage: the card reaches 16x its typical gap
+# by 2026-04-05 and 51x by 2026-05-10, so this reports 'stale' roughly two
+# weeks in instead of four months. At these thresholds the current warehouse
+# has two accounts above 'late' (the broken card, and a receivable that was
+# settled by check), and every actively-used account sits below 1.0x.
+ACCOUNT_BASELINE_PERCENTILE = 0.9
+#: How many recent intervals define an account's cadence.
+ACCOUNT_BASELINE_GAPS = 20
+#: Outer sanity bound on how far back those intervals may reach, so a dormant
+#: account is not judged against how it behaved years ago.
+ACCOUNT_BASELINE_MAX_DAYS = 1095
+#: Fewer measured intervals than this and the account is 'sparse', not judged.
+ACCOUNT_MIN_BASELINE_GAPS = 10
+#: Cadence floor. Without it an account posting several times a day is 'late'
+#: after a quiet weekend, which is noise, not signal.
+ACCOUNT_MIN_EXPECTED_GAP_SECONDS = 12 * 3600
+#: Multiples of the account's own typical gap. Wider than the pipeline
+#: multipliers above because a p90 is exceeded by 10% of normal gaps by
+#: definition, so the margin has to clear routine variance.
+ACCOUNT_LATE_MULTIPLIER = 6
+ACCOUNT_STALE_MULTIPLIER = 15
 
 #: ``max(col)`` on an unindexed column is a full heap scan. Tables under this
 #: size are cheap enough to scan on every collection; larger ones are skipped

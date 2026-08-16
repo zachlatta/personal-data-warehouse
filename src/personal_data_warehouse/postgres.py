@@ -108,6 +108,13 @@ from personal_data_warehouse.schema import (
 )
 from personal_data_warehouse.config import normalize_postgres_url
 from personal_data_warehouse.pipeline_health import (
+    ACCOUNT_BASELINE_GAPS,
+    ACCOUNT_BASELINE_MAX_DAYS,
+    ACCOUNT_BASELINE_PERCENTILE,
+    ACCOUNT_LATE_MULTIPLIER,
+    ACCOUNT_MIN_BASELINE_GAPS,
+    ACCOUNT_MIN_EXPECTED_GAP_SECONDS,
+    ACCOUNT_STALE_MULTIPLIER,
     COLLECTOR_STALE_SECONDS,
     EPOCH as PIPELINE_HEALTH_EPOCH,
     LATE_MULTIPLIER,
@@ -2141,6 +2148,56 @@ class PostgresWarehouse:
                 synced_at
             FROM @plaid_liabilities
             """),
+            # Plaid records a broken Item by writing the API's error payload to
+            # base_plaid.items.error_json — and until this view, nothing in the
+            # warehouse ever read that column back. The Capital One Item sat in
+            # ITEM_ERROR / NO_ACCOUNTS with its transactions frozen while the
+            # only visible trace was a count of 'action_required' rows rolled
+            # up in marts_ops.pipeline_health, which says how many Items need
+            # attention but never which ones. Naming the Item, its institution,
+            # and the accounts that stop updating with it is the whole point.
+            #
+            # The run deliberately stays green when this fires (see the note in
+            # plaid_sync.py: failing the asset on a broken Item once produced
+            # 262 consecutive failed runs over five days and buried every other
+            # signal), so a readable row here is the compensating control.
+            ("marts_ops_plaid_item_health", """
+            CREATE OR REPLACE VIEW @marts_ops_plaid_item_health AS
+            SELECT
+                i.account,
+                i.item_id,
+                i.institution_name,
+                i.linked_at,
+                i.synced_at,
+                COALESCE(i.error_json->>'error_code', '') AS error_code,
+                COALESCE(i.error_json->>'error_type', '') AS error_type,
+                COALESCE(i.error_json->>'error_message', '') AS error_message,
+                CASE
+                    WHEN COALESCE(i.error_json->>'error_code', '') = '' THEN 'ok'
+                    ELSE 'action_required'
+                END AS status,
+                linked.account_count,
+                COALESCE(linked.account_names, '') AS account_names,
+                linked.newest_transaction_at,
+                (EXTRACT(EPOCH FROM now() - linked.newest_transaction_at))::bigint
+                    AS transaction_age_seconds
+            FROM @plaid_items AS i
+            LEFT JOIN LATERAL (
+                SELECT
+                    count(*)::bigint AS account_count,
+                    string_agg(a.name, ', ' ORDER BY a.name) AS account_names,
+                    max(t.newest_transaction_at) AS newest_transaction_at
+                FROM @plaid_accounts AS a
+                LEFT JOIN LATERAL (
+                    SELECT max(posted_at) AS newest_transaction_at
+                    FROM @plaid_transactions AS p
+                    WHERE p.account = a.account
+                      AND p.account_id = a.account_id
+                ) AS t ON TRUE
+                WHERE a.account = i.account
+                  AND a.item_id = i.item_id
+            ) AS linked ON TRUE
+            """),
         ]
         for logical, sql in view_sql:
             self._ensure_view(logical, sql)
@@ -2497,6 +2554,130 @@ class PostgresWarehouse:
             JOIN @finance_accounts AS a ON a.account_id = held.account_id
             LEFT JOIN reconstructed AS r
               ON r.account_id = held.account_id AND r.ticker = held.ticker
+            """,
+        )
+        self._ensure_account_freshness_mart_view()
+
+    def _ensure_account_freshness_mart_view(self) -> None:
+        """Per-account transaction recency, judged against the account's own cadence.
+
+        ``marts_ops.table_freshness`` answers "is this table still being
+        written to"; nothing answered "is this *account* still being written
+        to", and the difference hid a four-month gap on one credit card inside
+        a table that never stopped looking current. See the rationale block in
+        ``pipeline_health.py`` for the incident and how the thresholds were
+        chosen.
+
+        Status is derived here rather than stored, for the same reason the
+        pipeline health views derive theirs: a stored verdict keeps asserting
+        itself long after whatever produced it stopped running. Every input is
+        measured live off the ledger, which is small (~15k transactions) and
+        indexed on ``(account_id, posted_at DESC)``, so the whole view is an
+        index-only pass rather than something needing a collector.
+        """
+        baseline = f"make_interval(days => {ACCOUNT_BASELINE_MAX_DAYS})"
+        self._ensure_view(
+            "marts_finance_account_freshness",
+            f"""
+            CREATE OR REPLACE VIEW @marts_finance_account_freshness AS
+            WITH last_txn AS (
+                SELECT
+                    account_id,
+                    max(posted_at) AS last_transaction_at,
+                    count(*)::bigint AS transaction_count
+                FROM @finance_transactions
+                GROUP BY account_id
+            ),
+            -- Intervals between consecutive transactions, ending at the
+            -- account's last one. Anchoring to the last transaction rather than
+            -- now() is what stops a long silence from diluting the very
+            -- baseline it should be measured against.
+            all_gaps AS (
+                SELECT
+                    t.account_id,
+                    t.posted_at,
+                    EXTRACT(EPOCH FROM t.posted_at - lag(t.posted_at) OVER (
+                        PARTITION BY t.account_id ORDER BY t.posted_at
+                    )) AS gap_seconds
+                FROM @finance_transactions AS t
+                JOIN last_txn AS l ON l.account_id = t.account_id
+                WHERE t.posted_at > l.last_transaction_at - {baseline}
+                  AND t.posted_at <= l.last_transaction_at
+            ),
+            -- Most recent N intervals, counted in intervals rather than days:
+            -- a fixed span of days holds hundreds for a daily-use card and a
+            -- handful for a monthly one, which would leave every slow account
+            -- below the minimum and permanently unjudged.
+            recent_gaps AS (
+                SELECT
+                    account_id,
+                    gap_seconds,
+                    row_number() OVER (
+                        PARTITION BY account_id ORDER BY posted_at DESC
+                    ) AS recency
+                FROM all_gaps
+                WHERE gap_seconds IS NOT NULL
+            ),
+            cadence AS (
+                SELECT
+                    account_id,
+                    count(*)::bigint AS baseline_gaps,
+                    percentile_cont({ACCOUNT_BASELINE_PERCENTILE})
+                        WITHIN GROUP (ORDER BY gap_seconds) AS typical_gap_seconds
+                FROM recent_gaps
+                WHERE recency <= {ACCOUNT_BASELINE_GAPS}
+                GROUP BY account_id
+            ),
+            measured AS (
+                SELECT
+                    a.account_id,
+                    a.account,
+                    a.name,
+                    a.kind,
+                    a.side,
+                    a.institution,
+                    a.mask,
+                    l.last_transaction_at,
+                    COALESCE(l.transaction_count, 0)::bigint AS transaction_count,
+                    COALESCE(c.baseline_gaps, 0)::bigint AS baseline_gaps,
+                    GREATEST(
+                        c.typical_gap_seconds,
+                        {ACCOUNT_MIN_EXPECTED_GAP_SECONDS}
+                    ) AS expected_gap_seconds,
+                    EXTRACT(EPOCH FROM now() - l.last_transaction_at) AS quiet_seconds
+                FROM @finance_accounts AS a
+                LEFT JOIN last_txn AS l ON l.account_id = a.account_id
+                LEFT JOIN cadence AS c ON c.account_id = a.account_id
+            )
+            SELECT
+                account_id,
+                account,
+                name,
+                kind,
+                side,
+                institution,
+                mask,
+                last_transaction_at,
+                transaction_count,
+                baseline_gaps,
+                expected_gap_seconds::bigint AS expected_gap_seconds,
+                quiet_seconds::bigint AS quiet_seconds,
+                round((quiet_seconds / expected_gap_seconds)::numeric, 2) AS quiet_ratio,
+                CASE
+                    -- Valuation-only accounts (a house, a car, a private fund)
+                    -- have observations but never transactions. Silence is
+                    -- their normal state, not a fault.
+                    WHEN last_transaction_at IS NULL THEN 'no_transactions'
+                    -- Too few measured intervals for a percentile to mean
+                    -- anything. Reported, not judged.
+                    WHEN baseline_gaps < {ACCOUNT_MIN_BASELINE_GAPS} THEN 'sparse'
+                    WHEN quiet_seconds
+                        > expected_gap_seconds * {ACCOUNT_STALE_MULTIPLIER} THEN 'stale'
+                    WHEN quiet_seconds
+                        > expected_gap_seconds * {ACCOUNT_LATE_MULTIPLIER} THEN 'late'
+                    ELSE 'ok'
+                END AS status
+            FROM measured
             """,
         )
 
