@@ -151,6 +151,12 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		if len(mutation.Operations) == 0 {
 			return fmt.Errorf("mutation %d must include operations", index)
 		}
+		// Normalize here as well as at storage so a malformed contact operation
+		// is rejected in the propose_mutation tool response, where the agent can
+		// still fix it, rather than after a human has approved it.
+		if _, err := normalizeContactOperations(mutation.Operations); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 	case CalendarCreateEventOperation:
 		if err := validateConfiguredAccount(account, s.cfg.CalendarAccounts, "CALENDAR_ACCOUNTS"); err != nil {
 			return err

@@ -149,6 +149,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	normalized = s.enrichGmailEmailReplyHeaders(ctx, normalized)
 	normalized = s.enrichGmailEmailSignatures(ctx, normalized)
 	normalized = s.enrichGmailEmailReplyQuotes(ctx, normalized)
+	s.enrichContactPreviews(ctx, normalized)
 	idempotencyKey, err := requestIdempotencyKey(input, normalized)
 	if err != nil {
 		return Request{}, err
@@ -1408,8 +1409,11 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				},
 			})
 		case GooglePeopleContactsOperation, ContactsBatchMutationOperation:
-			for operationIndex, operation := range mutation.Operations {
-				op := cloneMap(operation)
+			operations, err := normalizeContactOperations(mutation.Operations)
+			if err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			for operationIndex, op := range operations {
 				out = append(out, storedMutation{
 					Provider:  "google_people",
 					Operation: ContactsBatchMutationOperation,
@@ -2020,12 +2024,6 @@ func contactMutationTitle(operation map[string]any, index int) string {
 	}
 }
 
-func contactOperationPreview(operation map[string]any, index int) map[string]any {
-	preview := cloneMap(operation)
-	preview["op_index"] = index
-	return preview
-}
-
 func requestIdempotencyKey(input CreateRequestInput, mutations []storedMutation) (string, error) {
 	data, err := json.Marshal(map[string]any{
 		"title":     input.Title,
@@ -2239,4 +2237,58 @@ var upstreamMutationSchemaStatements = []string{
 	`CREATE INDEX IF NOT EXISTS upstream_mutations_status_updated_idx ON @upstream_mutations (status, updated_at)`,
 	`CREATE INDEX IF NOT EXISTS upstream_mutation_request_events_request_idx ON @upstream_mutation_request_events (request_id, event_index)`,
 	`CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON @upstream_mutation_events (mutation_id, event_index)`,
+}
+
+// enrichContactPreviews loads the synced Google Contacts row behind every
+// update/delete so the review UI renders a real before/after diff instead of an
+// empty one. Failures are non-fatal: a proposal that cannot show `before` is
+// still reviewable, and the executor re-checks the live contact anyway.
+func (s *PostgresStore) enrichContactPreviews(ctx context.Context, mutations []storedMutation) {
+	if s == nil || s.db == nil {
+		return
+	}
+	keys := contactCardKeysForMutations(mutations)
+	if len(keys) == 0 {
+		return
+	}
+	args := make([]any, 0, len(keys)*2)
+	values := make([]string, 0, len(keys))
+	for _, key := range keys {
+		args = append(args, key.Account, key.ResourceName)
+		values = append(values, fmt.Sprintf("($%d, $%d)", len(args)-1, len(args)))
+	}
+	rows, err := queryContext(ctx, s.db, fmt.Sprintf(`
+		WITH wanted(account, card_id) AS (
+			VALUES %s
+		)
+		SELECT card.account, card.card_id, card.etag, COALESCE(card.raw_json, '{}'::jsonb)
+		FROM @contact_cards AS card
+		JOIN wanted ON wanted.account = card.account AND wanted.card_id = card.card_id
+		WHERE card.source = 'google_people'
+		  AND card.source_kind = 'google_contacts'
+		  AND card.address_book_id = 'people/me'
+		  AND card.is_deleted = 0
+	`, strings.Join(values, ", ")), args...)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	cards := map[contactCardKey]map[string]any{}
+	for rows.Next() {
+		var account, cardID, etag string
+		var rawJSON []byte
+		if err := rows.Scan(&account, &cardID, &etag, &rawJSON); err != nil {
+			return
+		}
+		card := decodeJSONMap(rawJSON)
+		// The dedicated etag column is what the sync treats as authoritative,
+		// so it wins over whatever the archived person body happens to carry.
+		card["etag"] = etag
+		cards[contactCardKey{Account: account, ResourceName: cardID}] = card
+	}
+	if err := rows.Err(); err != nil {
+		return
+	}
+	applyContactCardRows(mutations, cards)
 }

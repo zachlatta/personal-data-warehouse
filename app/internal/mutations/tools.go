@@ -133,7 +133,7 @@ func MutationHelp() MutationHelpDocument {
 				Fields: []MutationHelpArg{
 					{Name: "type", JSONType: "string", Required: true, Description: "literal " + GooglePeopleContactsOperation},
 					{Name: "account", JSONType: "string", Required: true, Description: "configured Google Contacts account email address"},
-					{Name: "operations", JSONType: "array<object>", Required: true, Description: `each operation has op = "create_contact", "update_contact", or "delete_contact" and the relevant person/resource_name payload`},
+					{Name: "operations", JSONType: "array<object>", Required: true, Description: `each operation has op = "create_contact", "update_contact", or "delete_contact"; see notes for the required fields of each`},
 				},
 				Example: map[string]any{
 					"type":    GooglePeopleContactsOperation,
@@ -146,8 +146,29 @@ func MutationHelp() MutationHelpDocument {
 								"emailAddresses": []map[string]any{{"value": "ada@example.com"}},
 							},
 						},
+						{
+							"op":            "update_contact",
+							"resource_name": "people/c1234567890123456789",
+							"etag":          "%EhQBAgMFBgcJCgsMEBUWLjU3PT4/QBoBAiIMdGhpc2lzYW5ldGFn",
+							"person": map[string]any{
+								"organizations": []map[string]any{{"name": "Hack Club", "title": "Gap Year Fellow"}},
+							},
+						},
+						{
+							"op":            "delete_contact",
+							"resource_name": "people/c9876543210987654321",
+							"etag":          "%EhQBAgMFBgcJCgsMEBUWLjU3PT4/QBoBAiIMYW5vdGhlcmV0YWc=",
+						},
 					},
 				},
+				ExtraNotes: "create_contact needs `person` (a Google People `Person`) and must NOT set person.resourceName. " +
+					"update_contact and delete_contact both need `resource_name` plus the contact's current `etag` — read both from " +
+					"base_google_contacts.cards (columns card_id and etag). The etag is what lets the executor prove the contact still " +
+					"looks the way the reviewer saw it; an update without one is rejected by the People API. " +
+					"For update_contact, `update_person_fields` is optional: when omitted it is derived from the keys of `person`, which " +
+					"updates exactly what you sent and cannot delete anything. Set it explicitly only to CLEAR a field — naming a field " +
+					"that `person` omits deletes that field's current value, and the review UI flags that in red. " +
+					"Only these fields are updatable: " + contactUpdatablePersonFieldList() + ".",
 			},
 			{
 				Type:        CalendarCreateEventOperation,

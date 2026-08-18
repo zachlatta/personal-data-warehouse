@@ -1190,19 +1190,28 @@ func renderContactSummaryMeta(w http.ResponseWriter, summary contactSummary) {
 func renderContactOperationEffect(w http.ResponseWriter, operation map[string]any, op string) {
 	switch op {
 	case "update_contact":
-		fields := contactUpdateFields(operation)
-		fmt.Fprint(w, `<p class="contact-effect">Replaces `)
-		if len(fields) == 0 {
-			fmt.Fprint(w, `selected fields`)
-		} else {
-			for index, field := range fields {
-				if index > 0 {
-					fmt.Fprint(w, `, `)
-				}
-				fmt.Fprintf(w, `<code>%s</code>`, html.EscapeString(field))
+		cleared := contactClearedFields(operation)
+		replaced := []string{}
+		for _, field := range contactUpdateFields(operation) {
+			if !contains(cleared, field) {
+				replaced = append(replaced, field)
 			}
 		}
+		fmt.Fprint(w, `<p class="contact-effect">Replaces `)
+		if len(replaced) == 0 {
+			fmt.Fprint(w, `selected fields`)
+		} else {
+			renderContactFieldCodes(w, replaced)
+		}
 		fmt.Fprint(w, `</p>`)
+		// A masked field with no incoming value is a wipe, not an edit. Naming
+		// it separately is the only thing standing between an approval click
+		// and silently emptying a field in Google Contacts.
+		if len(cleared) > 0 {
+			fmt.Fprint(w, `<p class="contact-effect contact-clears">Clears `)
+			renderContactFieldCodes(w, cleared)
+			fmt.Fprint(w, ` — the current value is deleted.</p>`)
+		}
 	case "delete_contact":
 		fmt.Fprint(w, `<p class="contact-effect">Deletes this contact from Google Contacts.</p>`)
 	case "create_contact":
@@ -1211,6 +1220,47 @@ func renderContactOperationEffect(w http.ResponseWriter, operation map[string]an
 	if resource := strings.TrimSpace(stringFromAny(operation["resource_name"])); resource != "" {
 		fmt.Fprintf(w, `<p class="contact-resource"><code>%s</code></p>`, html.EscapeString(resource))
 	}
+	renderContactEtagWarning(w, operation, op)
+}
+
+func renderContactFieldCodes(w http.ResponseWriter, fields []string) {
+	for index, field := range fields {
+		if index > 0 {
+			fmt.Fprint(w, `, `)
+		}
+		fmt.Fprintf(w, `<code>%s</code>`, html.EscapeString(field))
+	}
+}
+
+func contactClearedFields(operation map[string]any) []string {
+	return stringSliceFromAny(operation["clear_person_fields"])
+}
+
+// renderContactEtagWarning tells the reviewer when the contact has already moved
+// past the state this proposal was built on. The executor refuses such an
+// operation, so approving it can only produce a failed run.
+func renderContactEtagWarning(w http.ResponseWriter, operation map[string]any, op string) {
+	if op != "update_contact" && op != "delete_contact" {
+		return
+	}
+	if found, ok := operation["contact_found"].(bool); ok && !found {
+		fmt.Fprint(w, `<p class="contact-effect contact-clears">This contact is not in the synced Google Contacts copy, so the change cannot be previewed.</p>`)
+		return
+	}
+	current, ok := operation["etag_is_current"].(bool)
+	if !ok || current {
+		return
+	}
+	fmt.Fprint(w, `<p class="contact-effect contact-clears">This contact changed since this was proposed, so the change will be refused. Re-propose it against the current contact.</p>`)
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func renderContactOperationBody(w http.ResponseWriter, operation map[string]any, op string) {
@@ -2088,7 +2138,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f2ee;padding:10px;
 .calendar-tech dl{margin:10px 0 0;display:grid;grid-template-columns:140px minmax(0,1fr);gap:6px 12px}
 .calendar-tech dt{color:#5f6368;font-size:12px}
 .calendar-tech dd{margin:0;color:#202124;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow-wrap:anywhere}
-.contact-mutation{padding:0;overflow:hidden}.contact-mutation>.mutation-head,.contact-mutation>.mutation-meta{margin-left:16px;margin-right:16px}.contact-mutation>.mutation-head{margin-top:16px}.contact-operations{border-top:1px solid #dfe1e5;margin-top:16px}.contact-operation{border-top:1px solid #f1f3f4;padding:18px 16px}.contact-operation:first-child{border-top:0}.contact-operation.destructive{box-shadow:inset 3px 0 #c5221f}.contact-operation.creating{box-shadow:inset 3px 0 #137333}.contact-operation.updating{box-shadow:inset 3px 0 #1967d2}.contact-operation.creating .contact-avatar{background:#137333}.contact-operation.updating .contact-avatar{background:#1967d2}.contact-operation-main{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:flex-start}.contact-avatar{width:40px;height:40px;border-radius:50%%;background:#137333;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.contact-operation.destructive .contact-avatar{background:#c5221f}.contact-operation-copy{min-width:0}.contact-operation-copy h4{margin:2px 0 4px;font-size:18px}.contact-op{margin:0;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.contact-meta{display:flex;flex-wrap:wrap;gap:8px;color:#5f6368;font-size:13px}.contact-effect,.contact-resource{margin:8px 0 0;color:#3c4043}.contact-effect code,.contact-resource code{background:#f1f3f4;border-radius:4px;padding:2px 5px}.contact-diff{margin-top:12px;border:1px solid #e8eaed;border-radius:6px;background:white}.contact-inline-row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;border-top:1px solid #eef0f2;padding:10px 12px}.contact-inline-row:first-child{border-top:0}.contact-inline-row>code{background:#f8fafd;border-radius:4px;padding:4px 6px;justify-self:start}.contact-inline-change{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.contact-inline-old,.contact-inline-new,.contact-inline-unchanged{border-radius:4px;padding:3px 6px;overflow-wrap:anywhere}.contact-inline-old{background:#fce8e6;color:#8c1d18;text-decoration:line-through;text-decoration-thickness:2px}.contact-inline-new{background:#e6f4ea;color:#137333;text-decoration:none}.contact-inline-arrow{color:#5f6368}.contact-diff-empty{margin:0;padding:12px;color:#5f6368}.contact-person-block{margin-top:12px;border-top:1px solid #e8eaed;padding-top:12px}.contact-block-title{margin:0 0 8px;font-weight:700}.contact-person-block dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;margin:0}.contact-person-block dt{color:#5f6368}.contact-person-block dd{margin:0}.contact-operation .raw-json{margin-bottom:0}
+.contact-mutation{padding:0;overflow:hidden}.contact-mutation>.mutation-head,.contact-mutation>.mutation-meta{margin-left:16px;margin-right:16px}.contact-mutation>.mutation-head{margin-top:16px}.contact-operations{border-top:1px solid #dfe1e5;margin-top:16px}.contact-operation{border-top:1px solid #f1f3f4;padding:18px 16px}.contact-operation:first-child{border-top:0}.contact-operation.destructive{box-shadow:inset 3px 0 #c5221f}.contact-operation.creating{box-shadow:inset 3px 0 #137333}.contact-operation.updating{box-shadow:inset 3px 0 #1967d2}.contact-operation.creating .contact-avatar{background:#137333}.contact-operation.updating .contact-avatar{background:#1967d2}.contact-operation-main{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:flex-start}.contact-avatar{width:40px;height:40px;border-radius:50%%;background:#137333;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.contact-operation.destructive .contact-avatar{background:#c5221f}.contact-operation-copy{min-width:0}.contact-operation-copy h4{margin:2px 0 4px;font-size:18px}.contact-op{margin:0;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.contact-meta{display:flex;flex-wrap:wrap;gap:8px;color:#5f6368;font-size:13px}.contact-effect,.contact-resource{margin:8px 0 0;color:#3c4043}.contact-clears{color:#8c1d18;font-weight:600}.contact-clears code{background:#fce8e6}.contact-effect code,.contact-resource code{background:#f1f3f4;border-radius:4px;padding:2px 5px}.contact-diff{margin-top:12px;border:1px solid #e8eaed;border-radius:6px;background:white}.contact-inline-row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;border-top:1px solid #eef0f2;padding:10px 12px}.contact-inline-row:first-child{border-top:0}.contact-inline-row>code{background:#f8fafd;border-radius:4px;padding:4px 6px;justify-self:start}.contact-inline-change{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.contact-inline-old,.contact-inline-new,.contact-inline-unchanged{border-radius:4px;padding:3px 6px;overflow-wrap:anywhere}.contact-inline-old{background:#fce8e6;color:#8c1d18;text-decoration:line-through;text-decoration-thickness:2px}.contact-inline-new{background:#e6f4ea;color:#137333;text-decoration:none}.contact-inline-arrow{color:#5f6368}.contact-diff-empty{margin:0;padding:12px;color:#5f6368}.contact-person-block{margin-top:12px;border-top:1px solid #e8eaed;padding-top:12px}.contact-block-title{margin:0 0 8px;font-weight:700}.contact-person-block dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;margin:0}.contact-person-block dt{color:#5f6368}.contact-person-block dd{margin:0}.contact-operation .raw-json{margin-bottom:0}
 .request-context{padding:18px 20px;background:#fff;border:1px solid #dadce0;border-radius:8px;margin:14px 0}.request-context h2{margin:0 0 12px;font-size:18px}.request-context .context-heading{font-size:13px;font-weight:700;color:#5f6368;text-transform:uppercase;letter-spacing:.04em;margin:18px 0 10px}.context-source{margin:0 0 10px;color:#3c4043}.context-label{display:inline-block;color:#5f6368;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-right:6px}.context-note{margin:0 0 6px;color:#3c4043;white-space:pre-wrap}.identifications{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}.identification{border:1px solid #e8eaed;border-radius:6px;padding:12px 14px;background:#fafbfc}.identification-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px}.identification-head strong{font-size:14px;color:#202124}.identification-chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.confidence-chip{display:inline-block;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:600;background:#e8eaed;color:#3c4043}.confidence-chip.confidence-high{background:#e6f4ea;color:#137333}.confidence-chip.confidence-medium-high,.confidence-chip.confidence-medium{background:#fef7e0;color:#92660e}.confidence-chip.confidence-medium-low{background:#fce8e6;color:#a50e0e}.confidence-chip.confidence-low{background:#fce8e6;color:#a50e0e}.identification-action{display:inline-block;background:#fef7e0;color:#92660e;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:600}.identification-phone{background:#f1f3f4;color:#3c4043;border-radius:4px;padding:2px 6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.identification-evidence{margin:8px 0 0;padding-left:20px;color:#3c4043}.identification-evidence li{margin:3px 0}
 @media (max-width:760px){main{padding:16px}.gmail-row{grid-template-columns:20px 20px minmax(0,1fr) 56px;gap:8px}.gmail-important,.gmail-list-labels{display:none}.gmail-sender{grid-column:3}.gmail-subject{grid-column:3 / 5;white-space:normal}.gmail-date{grid-column:4;grid-row:1}.gmail-expanded-subject{padding-left:18px;display:block}.gmail-message-summary{grid-template-columns:36px minmax(0,1fr);padding:18px}.gmail-message-body{padding-left:18px;padding-right:18px}.gmail-message-header{display:block}.gmail-message-header time{display:block;margin-top:4px}.gmail-body-frame{height:620px}.gmail-email-fields label,.gmail-email-readonly dl{grid-template-columns:1fr}.gmail-email-toolbar{flex-wrap:wrap}.contact-operation-main{grid-template-columns:40px minmax(0,1fr)}.contact-operation-main>.pill{grid-column:2}.contact-person-block dl{grid-template-columns:1fr}.contact-inline-row{grid-template-columns:1fr;gap:8px}.contact-inline-change{align-items:flex-start}}
 </style></head><body>`, html.EscapeString(title))

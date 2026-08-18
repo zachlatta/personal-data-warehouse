@@ -71,9 +71,12 @@ class GoogleContactMutationExecutor:
         op = str(operation.get("op") or "")
         client_op_id = str(operation.get("client_op_id") or "")
         if op == "create_contact":
+            person = _mapping(operation.get("person"))
+            if not person:
+                raise ValueError("create_contact must include person")
             response = execute_contacts_request(
                 lambda: service.people()
-                .createContact(body=_mapping(operation.get("person")), personFields=CONTACT_PERSON_FIELDS)
+                .createContact(body=person, personFields=CONTACT_PERSON_FIELDS)
                 .execute()
             )
             return {
@@ -85,17 +88,38 @@ class GoogleContactMutationExecutor:
             }
         if op == "update_contact":
             resource_name = str(operation.get("resource_name") or "")
-            expected_etag = str(operation.get("expected_etag") or "")
+            if not resource_name:
+                raise ValueError("update_contact must include resource_name")
+            expected_etag = _expected_etag(operation)
+            if not expected_etag:
+                # Without an etag the People API rejects the request outright,
+                # and nothing proves the contact still matches what the reviewer
+                # approved. Say which field is missing instead of forwarding a
+                # request that can only come back as an opaque 400.
+                raise ValueError(f"update_contact {resource_name} must include expected_etag")
+            person = _mapping(operation.get("person"))
+            if not person:
+                raise ValueError(f"update_contact {resource_name} must include person")
+            fields = [str(field).strip() for field in (operation.get("update_person_fields") or []) if str(field).strip()]
+            if not fields:
+                # An empty mask sends `updatePersonFields=`, which updates
+                # nothing and reads as a Google-side failure. The proposer is
+                # responsible for the mask, so a missing one is contract drift.
+                raise ValueError(f"update_contact {resource_name} must include update_person_fields")
             live_person = self._live_contact(service=service, resource_name=resource_name)
             _raise_if_stale(resource_name=resource_name, expected_etag=expected_etag, live_person=live_person)
-            fields = operation.get("update_person_fields") or []
+            # Send the etag we just read back rather than the stored copy, so
+            # the body is always consistent with the person the check passed on.
+            body = dict(person)
+            body["resourceName"] = resource_name
+            body["etag"] = str(live_person.get("etag") or expected_etag)
             response = execute_contacts_request(
                 lambda: service.people()
                 .updateContact(
                     resourceName=resource_name,
-                    updatePersonFields=",".join(str(field) for field in fields),
+                    updatePersonFields=",".join(fields),
                     personFields=CONTACT_PERSON_FIELDS,
-                    body=_mapping(operation.get("person")),
+                    body=body,
                 )
                 .execute()
             )
@@ -108,7 +132,13 @@ class GoogleContactMutationExecutor:
             }
         if op == "delete_contact":
             resource_name = str(operation.get("resource_name") or "")
-            expected_etag = str(operation.get("expected_etag") or "")
+            if not resource_name:
+                raise ValueError("delete_contact must include resource_name")
+            expected_etag = _expected_etag(operation)
+            if not expected_etag:
+                # A delete is irreversible, so it only runs against the contact
+                # the reviewer actually saw.
+                raise ValueError(f"delete_contact {resource_name} must include expected_etag")
             live_person = self._live_contact(service=service, resource_name=resource_name)
             _raise_if_stale(resource_name=resource_name, expected_etag=expected_etag, live_person=live_person)
             response = execute_contacts_request(
@@ -161,6 +191,21 @@ def contact_mutation_failure_status(exc: Exception) -> str:
     if isinstance(exc, RuntimeError) and ("OAuth token" in str(exc) or "cannot be refreshed" in str(exc)):
         return "blocked_missing_credentials"
     return "failed_terminal"
+
+
+def _expected_etag(operation: Mapping[str, Any]) -> str:
+    """Read the etag the proposal was built on.
+
+    The Go proposer writes ``expected_etag``, but agent-authored payloads carry a
+    bare ``etag`` and some nest it under ``person``. Reading only the first name
+    is how the etag was silently dropped on the way to Google.
+    """
+    person = _mapping(operation.get("person"))
+    for value in (operation.get("expected_etag"), operation.get("etag"), person.get("etag")):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _mapping(value: Any) -> dict[str, Any]:

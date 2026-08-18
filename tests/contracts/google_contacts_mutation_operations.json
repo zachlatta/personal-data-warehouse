@@ -1,0 +1,90 @@
+{
+  "comment": [
+    "The Google Contacts mutation contract, pinned in one place because it spans two languages.",
+    "The Go proposer (app/internal/mutations/contacts.go) turns `proposed` into `normalized`.",
+    "The Python executor (src/personal_data_warehouse/contact_mutations.py) reads `normalized`.",
+    "Both test suites assert against this file, so neither side can drift alone. It drifted once:",
+    "Go stored agent operations verbatim while Python read a shape nobody produced, and every",
+    "update_contact mutation failed with a People API 400 until the 2026-08-15 gap-year cohort",
+    "request made it visible."
+  ],
+  "cases": [
+    {
+      "name": "update derives the field mask from the person body",
+      "proposed": {
+        "op": "update_contact",
+        "resource_name": "people/c1",
+        "etag": "etag-1",
+        "person": {
+          "names": [{"givenName": "Ada", "familyName": "Lovelace"}],
+          "organizations": [{"name": "Analytical Engines", "title": "Computer Scientist"}]
+        }
+      },
+      "normalized": {
+        "op": "update_contact",
+        "client_op_id": "op-0",
+        "resource_name": "people/c1",
+        "expected_etag": "etag-1",
+        "update_person_fields": ["names", "organizations"],
+        "person": {
+          "names": [{"givenName": "Ada", "familyName": "Lovelace"}],
+          "organizations": [{"name": "Analytical Engines", "title": "Computer Scientist"}],
+          "resourceName": "people/c1",
+          "etag": "etag-1"
+        }
+      }
+    },
+    {
+      "name": "update keeps an explicit mask and reports the fields it clears",
+      "proposed": {
+        "op": "update_contact",
+        "client_op_id": "explicit-id",
+        "resource_name": "people/c2",
+        "expected_etag": "etag-2",
+        "update_person_fields": ["biographies", "birthdays"],
+        "person": {"biographies": [{"value": "note", "contentType": "TEXT_PLAIN"}]}
+      },
+      "normalized": {
+        "op": "update_contact",
+        "client_op_id": "explicit-id",
+        "resource_name": "people/c2",
+        "expected_etag": "etag-2",
+        "update_person_fields": ["biographies", "birthdays"],
+        "clear_person_fields": ["birthdays"],
+        "person": {
+          "biographies": [{"value": "note", "contentType": "TEXT_PLAIN"}],
+          "resourceName": "people/c2",
+          "etag": "etag-2"
+        }
+      }
+    },
+    {
+      "name": "create passes the person through untouched",
+      "proposed": {
+        "op": "create_contact",
+        "person": {
+          "names": [{"givenName": "Grace", "familyName": "Hopper"}],
+          "emailAddresses": [{"value": "grace@example.test"}]
+        }
+      },
+      "normalized": {
+        "op": "create_contact",
+        "client_op_id": "op-0",
+        "person": {
+          "names": [{"givenName": "Grace", "familyName": "Hopper"}],
+          "emailAddresses": [{"value": "grace@example.test"}]
+        }
+      }
+    },
+    {
+      "name": "delete carries the reviewed etag",
+      "proposed": {"op": "delete_contact", "resource_name": "people/c3", "etag": "etag-3"},
+      "normalized": {
+        "op": "delete_contact",
+        "client_op_id": "op-0",
+        "resource_name": "people/c3",
+        "expected_etag": "etag-3"
+      }
+    }
+  ]
+}

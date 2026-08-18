@@ -69,7 +69,7 @@ func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
 					"reply_to_thread_id": "thread-4",
 				},
 			},
-			{Type: GooglePeopleContactsOperation, Account: "zach@example.test", Operations: []map[string]any{{"op": "delete_contact", "resource_name": "people/1"}}},
+			{Type: GooglePeopleContactsOperation, Account: "zach@example.test", Operations: []map[string]any{{"op": "delete_contact", "resource_name": "people/1", "etag": "etag-1"}}},
 		},
 	})
 	if err != nil {
@@ -110,6 +110,9 @@ func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
 	}
 	if contactOps[0]["op"] != "delete_contact" || mutations[4].Operation != ContactsBatchMutationOperation {
 		t.Fatalf("contact mutation = %#v", mutations[4])
+	}
+	if contactOps[0]["expected_etag"] != "etag-1" || contactOps[0]["client_op_id"] != "op-0" {
+		t.Fatalf("normalized contact operation = %#v", contactOps[0])
 	}
 }
 

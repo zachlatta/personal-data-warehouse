@@ -1406,3 +1406,70 @@ func hiddenFieldValue(t *testing.T, body string, name string) string {
 	}
 	return match[1]
 }
+
+func renderContactOperationHTML(t *testing.T, operation map[string]any) string {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	renderContactOperation(recorder, contactOperationView{
+		Mutation:  Mutation{Status: "pending_review"},
+		Operation: operation,
+	})
+	return recorder.Body.String()
+}
+
+// An explicit field mask that names a field the person body omits WIPES that
+// field in Google Contacts. The reviewer has to see that as a deletion, not as
+// part of an otherwise ordinary "Replaces …" line.
+func TestReviewUIRendersContactFieldClearsAsDestructive(t *testing.T) {
+	body := renderContactOperationHTML(t, map[string]any{
+		"op":                   "update_contact",
+		"op_index":             0,
+		"resource_name":        "people/ada",
+		"update_person_fields": []any{"names", "biographies"},
+		"clear_person_fields":  []any{"biographies"},
+		"before":               map[string]any{"names": []any{map[string]any{"displayName": "Ada Old"}}},
+		"after":                map[string]any{"names": []any{map[string]any{"displayName": "Ada Lovelace"}}},
+	})
+	if !strings.Contains(body, "Clears") || !strings.Contains(body, "biographies") {
+		t.Fatalf("body does not warn about cleared fields: %q", body)
+	}
+	if !strings.Contains(body, "contact-clears") {
+		t.Fatalf("cleared fields are not marked destructive: %q", body)
+	}
+}
+
+// A proposal whose etag has already moved cannot execute — the executor refuses
+// it. Surfacing that at review time beats approving a doomed change.
+func TestReviewUIWarnsWhenContactEtagIsStale(t *testing.T) {
+	body := renderContactOperationHTML(t, map[string]any{
+		"op":              "update_contact",
+		"op_index":        0,
+		"resource_name":   "people/ada",
+		"expected_etag":   "etag-old",
+		"current_etag":    "etag-new",
+		"etag_is_current": false,
+		"contact_found":   true,
+		"before":          map[string]any{"names": []any{map[string]any{"displayName": "Ada Old"}}},
+		"after":           map[string]any{"names": []any{map[string]any{"displayName": "Ada Lovelace"}}},
+	})
+	if !strings.Contains(body, "changed since this was proposed") {
+		t.Fatalf("body does not warn about the stale etag: %q", body)
+	}
+}
+
+func TestReviewUIDoesNotWarnWhenContactEtagIsCurrent(t *testing.T) {
+	body := renderContactOperationHTML(t, map[string]any{
+		"op":              "update_contact",
+		"op_index":        0,
+		"resource_name":   "people/ada",
+		"expected_etag":   "etag-new",
+		"current_etag":    "etag-new",
+		"etag_is_current": true,
+		"contact_found":   true,
+		"before":          map[string]any{"names": []any{map[string]any{"displayName": "Ada Old"}}},
+		"after":           map[string]any{"names": []any{map[string]any{"displayName": "Ada Lovelace"}}},
+	})
+	if strings.Contains(body, "changed since this was proposed") {
+		t.Fatalf("body warns about a current etag: %q", body)
+	}
+}
