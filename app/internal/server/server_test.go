@@ -79,6 +79,10 @@ func (s fakeMutationStore) RejectRequest(context.Context, string, string, string
 	return mutations.Request{}, mutations.ErrNotFound
 }
 
+func (s fakeMutationStore) SupersedeRequest(context.Context, string, string, string) (mutations.Request, error) {
+	return mutations.Request{}, mutations.ErrNotFound
+}
+
 type recordingMutationStore struct {
 	request mutations.Request
 	input   mutations.CreateRequestInput
@@ -110,6 +114,10 @@ func (s *recordingMutationStore) ApproveRequest(context.Context, string, string)
 }
 
 func (s *recordingMutationStore) RejectRequest(context.Context, string, string, string) (mutations.Request, error) {
+	return mutations.Request{}, mutations.ErrNotFound
+}
+
+func (s *recordingMutationStore) SupersedeRequest(context.Context, string, string, string) (mutations.Request, error) {
 	return mutations.Request{}, mutations.ErrNotFound
 }
 

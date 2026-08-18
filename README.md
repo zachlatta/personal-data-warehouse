@@ -165,6 +165,14 @@ to `/mutation-review/login` until you sign in. The UI uses an HttpOnly session c
 CSRF tokens for approve and deny actions. The old per-action `PDW_MUTATION_REVIEW_PIN` flow is no
 longer used.
 
+A request that failed terminally can never run again, so it would otherwise sit in the review list
+forever looking unresolved. Such a request carries a **Mark superseded** control: give it the id of
+the request that replaced it, and both the list and the detail page link the two. The failed status
+is deliberately left alone — the request really did fail, and that stays the record; what is added
+is the link showing it was dealt with. Only `failed_terminal`, `failed_retryable`, and
+`blocked_missing_credentials` requests can be superseded, so live work cannot be closed out by
+mistake, and the replacement must already exist.
+
 Optional UI settings:
 
 ```bash

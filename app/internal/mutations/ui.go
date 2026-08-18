@@ -164,6 +164,18 @@ func (s *Service) handleRequestRoute(w http.ResponseWriter, r *http.Request, ses
 			}
 			http.Redirect(w, r, ReviewPath+"/requests/"+url.PathEscape(requestID), http.StatusSeeOther)
 			return
+		case "supersede":
+			supersededBy := strings.TrimSpace(r.FormValue("superseded_by"))
+			if err := validateSupersedeInput(requestID, supersededBy); err != nil {
+				s.renderRequestDetail(w, r, session, requestID, err.Error())
+				return
+			}
+			if _, err := s.store.SupersedeRequest(r.Context(), requestID, supersededBy, reviewerActorID); err != nil {
+				s.renderRequestDetail(w, r, session, requestID, err.Error())
+				return
+			}
+			http.Redirect(w, r, ReviewPath+"/requests/"+url.PathEscape(requestID), http.StatusSeeOther)
+			return
 		}
 	}
 	http.NotFound(w, r)
@@ -258,7 +270,7 @@ func renderRequestTable(w http.ResponseWriter, title string, requests []Request,
 			count = len(request.Mutations)
 		}
 		fmt.Fprintf(w, `<tr><td>%s</td><td><a href="%s/requests/%s">%s</a><div class="reason">%s</div></td><td>%d</td><td>%s</td></tr>`,
-			html.EscapeString(displayRequestStatus(request.Status)),
+			html.EscapeString(requestListStatus(request)),
 			ReviewPath,
 			url.PathEscape(request.ID),
 			html.EscapeString(request.Title),
@@ -300,6 +312,7 @@ func (s *Service) renderRequestDetail(w http.ResponseWriter, r *http.Request, se
 		fmt.Fprintf(w, `<form class="actions" method="post" action="%s/requests/%s/approve"><input type="hidden" name="csrf_token" value="%s"><button type="submit">Approve</button></form>`, ReviewPath, url.PathEscape(request.ID), html.EscapeString(session.CSRF))
 		fmt.Fprintf(w, `<form class="actions" method="post" action="%s/requests/%s/reject"><input type="hidden" name="csrf_token" value="%s"><input name="reason" placeholder="Reason"><button type="submit">Deny</button></form>`, ReviewPath, url.PathEscape(request.ID), html.EscapeString(session.CSRF))
 	}
+	renderSupersedeSection(w, request, session.CSRF)
 	fmt.Fprint(w, `</section>`)
 	renderRequestContext(w, request.Context)
 	fmt.Fprint(w, `<section><h2>Mutations</h2>`)
@@ -2138,7 +2151,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f2ee;padding:10px;
 .calendar-tech dl{margin:10px 0 0;display:grid;grid-template-columns:140px minmax(0,1fr);gap:6px 12px}
 .calendar-tech dt{color:#5f6368;font-size:12px}
 .calendar-tech dd{margin:0;color:#202124;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow-wrap:anywhere}
-.contact-mutation{padding:0;overflow:hidden}.contact-mutation>.mutation-head,.contact-mutation>.mutation-meta{margin-left:16px;margin-right:16px}.contact-mutation>.mutation-head{margin-top:16px}.contact-operations{border-top:1px solid #dfe1e5;margin-top:16px}.contact-operation{border-top:1px solid #f1f3f4;padding:18px 16px}.contact-operation:first-child{border-top:0}.contact-operation.destructive{box-shadow:inset 3px 0 #c5221f}.contact-operation.creating{box-shadow:inset 3px 0 #137333}.contact-operation.updating{box-shadow:inset 3px 0 #1967d2}.contact-operation.creating .contact-avatar{background:#137333}.contact-operation.updating .contact-avatar{background:#1967d2}.contact-operation-main{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:flex-start}.contact-avatar{width:40px;height:40px;border-radius:50%%;background:#137333;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.contact-operation.destructive .contact-avatar{background:#c5221f}.contact-operation-copy{min-width:0}.contact-operation-copy h4{margin:2px 0 4px;font-size:18px}.contact-op{margin:0;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.contact-meta{display:flex;flex-wrap:wrap;gap:8px;color:#5f6368;font-size:13px}.contact-effect,.contact-resource{margin:8px 0 0;color:#3c4043}.contact-clears{color:#8c1d18;font-weight:600}.contact-clears code{background:#fce8e6}.contact-effect code,.contact-resource code{background:#f1f3f4;border-radius:4px;padding:2px 5px}.contact-diff{margin-top:12px;border:1px solid #e8eaed;border-radius:6px;background:white}.contact-inline-row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;border-top:1px solid #eef0f2;padding:10px 12px}.contact-inline-row:first-child{border-top:0}.contact-inline-row>code{background:#f8fafd;border-radius:4px;padding:4px 6px;justify-self:start}.contact-inline-change{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.contact-inline-old,.contact-inline-new,.contact-inline-unchanged{border-radius:4px;padding:3px 6px;overflow-wrap:anywhere}.contact-inline-old{background:#fce8e6;color:#8c1d18;text-decoration:line-through;text-decoration-thickness:2px}.contact-inline-new{background:#e6f4ea;color:#137333;text-decoration:none}.contact-inline-arrow{color:#5f6368}.contact-diff-empty{margin:0;padding:12px;color:#5f6368}.contact-person-block{margin-top:12px;border-top:1px solid #e8eaed;padding-top:12px}.contact-block-title{margin:0 0 8px;font-weight:700}.contact-person-block dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;margin:0}.contact-person-block dt{color:#5f6368}.contact-person-block dd{margin:0}.contact-operation .raw-json{margin-bottom:0}
+.contact-mutation{padding:0;overflow:hidden}.contact-mutation>.mutation-head,.contact-mutation>.mutation-meta{margin-left:16px;margin-right:16px}.contact-mutation>.mutation-head{margin-top:16px}.contact-operations{border-top:1px solid #dfe1e5;margin-top:16px}.contact-operation{border-top:1px solid #f1f3f4;padding:18px 16px}.contact-operation:first-child{border-top:0}.contact-operation.destructive{box-shadow:inset 3px 0 #c5221f}.contact-operation.creating{box-shadow:inset 3px 0 #137333}.contact-operation.updating{box-shadow:inset 3px 0 #1967d2}.contact-operation.creating .contact-avatar{background:#137333}.contact-operation.updating .contact-avatar{background:#1967d2}.contact-operation-main{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:14px;align-items:flex-start}.contact-avatar{width:40px;height:40px;border-radius:50%%;background:#137333;color:white;display:grid;place-items:center;font-weight:700;font-size:18px}.contact-operation.destructive .contact-avatar{background:#c5221f}.contact-operation-copy{min-width:0}.contact-operation-copy h4{margin:2px 0 4px;font-size:18px}.contact-op{margin:0;color:#1a73e8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}.contact-meta{display:flex;flex-wrap:wrap;gap:8px;color:#5f6368;font-size:13px}.superseded{margin:8px 0 0;padding:10px 12px;border-radius:6px;background:#e8f0fe;color:#174ea6}.superseded code{background:#d2e3fc;border-radius:4px;padding:2px 5px}.contact-effect,.contact-resource{margin:8px 0 0;color:#3c4043}.contact-clears{color:#8c1d18;font-weight:600}.contact-clears code{background:#fce8e6}.contact-effect code,.contact-resource code{background:#f1f3f4;border-radius:4px;padding:2px 5px}.contact-diff{margin-top:12px;border:1px solid #e8eaed;border-radius:6px;background:white}.contact-inline-row{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;border-top:1px solid #eef0f2;padding:10px 12px}.contact-inline-row:first-child{border-top:0}.contact-inline-row>code{background:#f8fafd;border-radius:4px;padding:4px 6px;justify-self:start}.contact-inline-change{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0}.contact-inline-old,.contact-inline-new,.contact-inline-unchanged{border-radius:4px;padding:3px 6px;overflow-wrap:anywhere}.contact-inline-old{background:#fce8e6;color:#8c1d18;text-decoration:line-through;text-decoration-thickness:2px}.contact-inline-new{background:#e6f4ea;color:#137333;text-decoration:none}.contact-inline-arrow{color:#5f6368}.contact-diff-empty{margin:0;padding:12px;color:#5f6368}.contact-person-block{margin-top:12px;border-top:1px solid #e8eaed;padding-top:12px}.contact-block-title{margin:0 0 8px;font-weight:700}.contact-person-block dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 12px;margin:0}.contact-person-block dt{color:#5f6368}.contact-person-block dd{margin:0}.contact-operation .raw-json{margin-bottom:0}
 .request-context{padding:18px 20px;background:#fff;border:1px solid #dadce0;border-radius:8px;margin:14px 0}.request-context h2{margin:0 0 12px;font-size:18px}.request-context .context-heading{font-size:13px;font-weight:700;color:#5f6368;text-transform:uppercase;letter-spacing:.04em;margin:18px 0 10px}.context-source{margin:0 0 10px;color:#3c4043}.context-label{display:inline-block;color:#5f6368;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin-right:6px}.context-note{margin:0 0 6px;color:#3c4043;white-space:pre-wrap}.identifications{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}.identification{border:1px solid #e8eaed;border-radius:6px;padding:12px 14px;background:#fafbfc}.identification-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px}.identification-head strong{font-size:14px;color:#202124}.identification-chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.confidence-chip{display:inline-block;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:600;background:#e8eaed;color:#3c4043}.confidence-chip.confidence-high{background:#e6f4ea;color:#137333}.confidence-chip.confidence-medium-high,.confidence-chip.confidence-medium{background:#fef7e0;color:#92660e}.confidence-chip.confidence-medium-low{background:#fce8e6;color:#a50e0e}.confidence-chip.confidence-low{background:#fce8e6;color:#a50e0e}.identification-action{display:inline-block;background:#fef7e0;color:#92660e;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:600}.identification-phone{background:#f1f3f4;color:#3c4043;border-radius:4px;padding:2px 6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.identification-evidence{margin:8px 0 0;padding-left:20px;color:#3c4043}.identification-evidence li{margin:3px 0}
 @media (max-width:760px){main{padding:16px}.gmail-row{grid-template-columns:20px 20px minmax(0,1fr) 56px;gap:8px}.gmail-important,.gmail-list-labels{display:none}.gmail-sender{grid-column:3}.gmail-subject{grid-column:3 / 5;white-space:normal}.gmail-date{grid-column:4;grid-row:1}.gmail-expanded-subject{padding-left:18px;display:block}.gmail-message-summary{grid-template-columns:36px minmax(0,1fr);padding:18px}.gmail-message-body{padding-left:18px;padding-right:18px}.gmail-message-header{display:block}.gmail-message-header time{display:block;margin-top:4px}.gmail-body-frame{height:620px}.gmail-email-fields label,.gmail-email-readonly dl{grid-template-columns:1fr}.gmail-email-toolbar{flex-wrap:wrap}.contact-operation-main{grid-template-columns:40px minmax(0,1fr)}.contact-operation-main>.pill{grid-column:2}.contact-person-block dl{grid-template-columns:1fr}.contact-inline-row{grid-template-columns:1fr;gap:8px}.contact-inline-change{align-items:flex-start}}
 </style></head><body>`, html.EscapeString(title))
@@ -2146,4 +2159,37 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f2ee;padding:10px;
 
 func writeHTMLFooter(w http.ResponseWriter) {
 	fmt.Fprint(w, `</body></html>`)
+}
+
+// renderSupersedeSection closes the loop on a dead request. A terminal failure
+// otherwise sits in the review list forever looking unresolved, even after the
+// underlying bug is fixed and a replacement has run.
+func renderSupersedeSection(w http.ResponseWriter, request Request, csrfToken string) {
+	if superseded := strings.TrimSpace(request.SupersededBy); superseded != "" {
+		fmt.Fprintf(
+			w,
+			`<p class="superseded">Superseded by <a href="%s/requests/%s"><code>%s</code></a>. This request is kept as the record of what failed.</p>`,
+			ReviewPath, url.PathEscape(superseded), html.EscapeString(superseded),
+		)
+		return
+	}
+	if !requestIsSupersedable(request.Status) {
+		return
+	}
+	fmt.Fprintf(
+		w,
+		`<form class="actions" method="post" action="%s/requests/%s/supersede"><input type="hidden" name="csrf_token" value="%s"><input name="superseded_by" placeholder="Replacement request id"><button type="submit">Mark superseded</button></form>`,
+		ReviewPath, url.PathEscape(request.ID), html.EscapeString(csrfToken),
+	)
+}
+
+// requestListStatus keeps a resolved failure from reading as an open one. The
+// list is where a stale red row is actually noticed, so the resolution has to
+// show there and not only on the detail page.
+func requestListStatus(request Request) string {
+	status := displayRequestStatus(request.Status)
+	if strings.TrimSpace(request.SupersededBy) != "" {
+		return status + " (superseded)"
+	}
+	return status
 }

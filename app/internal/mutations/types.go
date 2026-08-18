@@ -44,6 +44,7 @@ type Store interface {
 	RemoveMutation(ctx context.Context, requestID string, mutationID string, actor string) (Mutation, error)
 	ApproveRequest(ctx context.Context, id string, actor string) (Request, error)
 	RejectRequest(ctx context.Context, id string, actor string, reason string) (Request, error)
+	SupersedeRequest(ctx context.Context, id string, supersededBy string, actor string) (Request, error)
 }
 
 type RequestFilter struct {
@@ -106,6 +107,7 @@ type Request struct {
 	Result         map[string]any
 	Error          string
 	IdempotencyKey string
+	SupersededBy   string
 	Revision       int64
 	RequestedBy    string
 	ApprovedBy     string

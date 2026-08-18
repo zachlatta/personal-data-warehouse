@@ -249,7 +249,8 @@ func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) 
 	args = append(args, limit)
 	rows, err := queryContext(ctx, s.db, fmt.Sprintf(`
 		SELECT request.id, request.status, request.title, request.reason, request.context_json,
-		       request.result_json, request.error, request.idempotency_key, request.revision,
+		       request.result_json, request.error, request.idempotency_key,
+		       request.superseded_by_request_id, request.revision,
 		       request.requested_by, request.approved_by, request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at,
 		       count(mutation.id)::bigint AS mutation_count
@@ -627,7 +628,8 @@ func (s *PostgresStore) getRequestByIdempotencyKey(ctx context.Context, key stri
 func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, error) {
 	row := queryRowContext(ctx, s.db, `
 		SELECT request.id, request.status, request.title, request.reason, request.context_json,
-		       request.result_json, request.error, request.idempotency_key, request.revision,
+		       request.result_json, request.error, request.idempotency_key,
+		       request.superseded_by_request_id, request.revision,
 		       request.requested_by, request.approved_by, request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at,
 		       count(mutation.id)::bigint AS mutation_count
@@ -1272,6 +1274,7 @@ func scanRequest(row scanner) (Request, error) {
 		&resultJSON,
 		&request.Error,
 		&request.IdempotencyKey,
+		&request.SupersededBy,
 		&request.Revision,
 		&request.RequestedBy,
 		&request.ApprovedBy,
@@ -2179,7 +2182,8 @@ var upstreamMutationSchemaStatements = []string{
 		updated_at timestamptz NOT NULL DEFAULT now(),
 		approved_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
 		executed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
-		observed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz
+		observed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+		superseded_by_request_id text NOT NULL DEFAULT ''
 	)`,
 	`CREATE TABLE IF NOT EXISTS @upstream_mutations (
 		id text PRIMARY KEY,
@@ -2210,6 +2214,7 @@ var upstreamMutationSchemaStatements = []string{
 	)`,
 	`ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS request_id text NOT NULL DEFAULT ''`,
 	`ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS request_index bigint NOT NULL DEFAULT 0`,
+	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS superseded_by_request_id text NOT NULL DEFAULT ''`,
 	`CREATE TABLE IF NOT EXISTS @upstream_mutation_events (
 		mutation_id text NOT NULL,
 		event_index bigint NOT NULL,

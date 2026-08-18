@@ -18,6 +18,27 @@ type reviewStore struct {
 	rejected     []string
 	emailUpdates []emailUpdateCall
 	removed      []removeMutationCall
+	superseded   []supersedeCall
+}
+
+type supersedeCall struct {
+	RequestID    string
+	SupersededBy string
+	Actor        string
+}
+
+func (s *reviewStore) SupersedeRequest(_ context.Context, id string, supersededBy string, actor string) (Request, error) {
+	if err := validateSupersedeInput(id, supersededBy); err != nil {
+		return Request{}, err
+	}
+	s.superseded = append(s.superseded, supersedeCall{RequestID: id, SupersededBy: supersededBy, Actor: actor})
+	for index := range s.requests {
+		if s.requests[index].ID == id {
+			s.requests[index].SupersededBy = supersededBy
+			return s.requests[index], nil
+		}
+	}
+	return Request{}, ErrNotFound
 }
 
 type removeMutationCall struct {

@@ -45,6 +45,10 @@ func (s *recordingStore) RejectRequest(context.Context, string, string, string) 
 	return Request{}, nil
 }
 
+func (s *recordingStore) SupersedeRequest(context.Context, string, string, string) (Request, error) {
+	return Request{}, nil
+}
+
 func TestProposeMutationGmailArchiveThreads(t *testing.T) {
 	store := &recordingStore{request: Request{
 		ID:     "req-123",
