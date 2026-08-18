@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+import copy
 from datetime import UTC, datetime, timedelta
 import json
 import os
+from pathlib import Path
+from typing import Any
 
 import pytest
 from dotenv import load_dotenv
@@ -10,13 +14,26 @@ from dotenv import load_dotenv
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.schema import CALENDAR_EVENT_COLUMNS, CONTACT_CARD_COLUMNS, MESSAGE_COLUMNS
+from personal_data_warehouse.warehouse_catalog import CATALOG
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
+    CALENDAR_CREATE_EVENT_OPERATION,
+    CALENDAR_PROVIDER,
     FLOAT_COLUMNS,
+    GMAIL_ARCHIVE_OPERATION,
+    GMAIL_SEND_EMAIL_OPERATION,
+    GMAIL_UNARCHIVE_OPERATION,
+    GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
     INTEGER_COLUMNS,
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
+    _jsonb_param,
 )
+
+
+ACCOUNT = "zach@example.test"
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+CONTACT_MUTATION_CONTRACT_PATH = Path(__file__).parent / "contracts" / "google_contacts_mutation_operations.json"
 
 
 def _postgres_url() -> str:
@@ -37,175 +54,172 @@ def warehouse():
         cleanup_test_warehouse(wh)
 
 
-def test_upstream_mutation_request_validation_idempotency_and_review(warehouse: PostgresWarehouse) -> None:
+def _seed_mutation_request(
+    warehouse: PostgresWarehouse,
+    *,
+    request_id: str,
+    title: str,
+    mutations: Sequence[Mapping[str, Any]],
+    reason: str = "seeded by test",
+    status: str = "approved",
+    account: str = ACCOUNT,
+    requested_by: str = "test",
+) -> dict[str, Any]:
+    """Insert an upstream mutation request plus its mutation rows.
+
+    Proposal and review are served by the Go app (``app/internal/mutations``); these tests
+    cover the Dagster worker's claim/execute/observe path, so they seed the rows the Go
+    proposer would have written rather than going through a second Python proposer.
+    """
+    warehouse.ensure_upstream_mutation_tables()
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @upstream_mutation_requests (
+            id, status, title, reason, context_json, idempotency_key, revision,
+            requested_by, approved_by, created_at, updated_at, approved_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, 1, %s, %s, %s, %s, %s)
+        """,
+        (
+            request_id,
+            status,
+            title,
+            reason,
+            _jsonb_param({"source": "unit-test"}),
+            request_id,
+            requested_by,
+            "zach" if status == "approved" else "",
+            now,
+            now,
+            now if status == "approved" else EPOCH,
+        ),
+    )
+
+    children: list[dict[str, Any]] = []
+    for index, spec in enumerate(mutations):
+        child_status = str(spec.get("status") or status)
+        child = {
+            "id": f"{request_id}_m{index}",
+            "request_id": request_id,
+            "request_index": index,
+            "provider": str(spec["provider"]),
+            "operation": str(spec["operation"]),
+            "account": str(spec.get("account") or account),
+            "status": child_status,
+            "title": str(spec.get("title") or title),
+            "reason": str(spec.get("reason") or reason),
+            "payload_json": dict(spec.get("payload") or {}),
+            "preview_json": dict(spec.get("preview") or {}),
+        }
+        warehouse._command(
+            """
+            INSERT INTO @upstream_mutations (
+                id, request_id, request_index, provider, operation, account, status,
+                title, reason, payload_json, preview_json, idempotency_key, revision,
+                requested_by, approved_by, created_at, updated_at, approved_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, %s, %s, %s)
+            """,
+            (
+                child["id"],
+                child["request_id"],
+                child["request_index"],
+                child["provider"],
+                child["operation"],
+                child["account"],
+                child["status"],
+                child["title"],
+                child["reason"],
+                _jsonb_param(child["payload_json"]),
+                _jsonb_param(child["preview_json"]),
+                child["id"],
+                requested_by,
+                "zach" if child_status == "approved" else "",
+                now,
+                now,
+                now if child_status == "approved" else EPOCH,
+            ),
+        )
+        warehouse._append_upstream_mutation_event(
+            child["id"],
+            event_type="created",
+            actor_type="human",
+            actor_id=requested_by,
+            event_json={"request_id": request_id},
+        )
+        children.append(child)
+
+    return {"id": request_id, "status": status, "title": title, "mutations": children}
+
+
+def _request_status(warehouse: PostgresWarehouse, request_id: str) -> str:
+    rows = warehouse._query_dicts(
+        "SELECT status FROM @upstream_mutation_requests WHERE id = %s",
+        (request_id,),
+    )
+    assert rows, f"unknown request {request_id}"
+    return str(rows[0]["status"])
+
+
+def _mutation_events(warehouse: PostgresWarehouse, mutation_id: str) -> list[dict[str, Any]]:
+    return warehouse._query_dicts(
+        """
+        SELECT *
+        FROM @upstream_mutation_events
+        WHERE mutation_id = %s
+        ORDER BY event_index ASC
+        """,
+        (mutation_id,),
+    )
+
+
+def _contract_operation(case_name: str, **overrides: Any) -> dict[str, Any]:
+    """Return the Go proposer's normalized contacts operation for one contract case."""
+    contract = json.loads(CONTACT_MUTATION_CONTRACT_PATH.read_text(encoding="utf-8"))
+    for case in contract["cases"]:
+        if case["name"] == case_name:
+            operation = copy.deepcopy(case["normalized"])
+            operation.update(copy.deepcopy(overrides))
+            return operation
+    raise AssertionError(f"unknown contacts mutation contract case: {case_name}")
+
+
+def _gmail_thread_label_mutation(*, thread_id: str, archive: bool) -> dict[str, Any]:
+    return {
+        "provider": "gmail",
+        "operation": GMAIL_ARCHIVE_OPERATION if archive else GMAIL_UNARCHIVE_OPERATION,
+        "payload": (
+            {"thread_ids": [thread_id], "remove_label_ids": ["INBOX"]}
+            if archive
+            else {"thread_ids": [thread_id], "add_label_ids": ["INBOX"]}
+        ),
+        "preview": {"thread_count": 1, "threads": [{"thread_id": thread_id}]},
+    }
+
+
+def test_gmail_message_ids_for_thread_label_mutation_selects_matching_threads(
+    warehouse: PostgresWarehouse,
+) -> None:
     warehouse.ensure_tables()
     warehouse.insert_messages(
         [
             _message_row(message_id="m1", thread_id="thread-1", subject="One", labels=["INBOX"], sync_version=1),
             _message_row(message_id="m2", thread_id="thread-2", subject="Two", labels=["INBOX"], sync_version=1),
+            _message_row(message_id="m3", thread_id="thread-3", subject="Three", labels=[], sync_version=1),
         ]
     )
 
-    with pytest.raises(ValueError, match="thread_ids"):
-        warehouse.propose_mutation(
-            title="Archive bad",
-            reason="clear mail",
-            mutations=[{"type": "gmail.archive_threads", "account": "zach@example.test", "thread_ids": []}],
-        )
-    with pytest.raises(ValueError, match="unknown or non-inbox"):
-        warehouse.propose_mutation(
-            title="Archive missing",
-            reason="clear mail",
-            mutations=[{"type": "gmail.archive_threads", "account": "zach@example.test", "thread_ids": ["missing"]}],
-        )
     assert warehouse.gmail_message_ids_for_thread_label_mutation(
-        account="zach@example.test",
+        account=ACCOUNT,
         thread_ids=["thread-1", "thread-2"],
         archive=True,
     ) == {"thread-1": ["m1"], "thread-2": ["m2"]}
-
-    mutation = warehouse.propose_mutation(
-        title="Archive old threads",
-        reason="clear mail",
-        context={"source": "unit-test"},
-        mutations=[{
-            "type": "gmail.archive_threads",
-            "account": "zach@example.test",
-            "thread_ids": ["thread-1", "thread-2", "thread-1"],
-        }],
-    )
-    duplicate = warehouse.propose_mutation(
-        title="Archive 2 Gmail threads",
-        reason="duplicate proposal",
-        mutations=[{
-            "type": "gmail.archive_threads",
-            "account": "zach@example.test",
-            "thread_ids": ["thread-2", "thread-1"],
-        }],
-    )
-
-    assert duplicate["id"] == mutation["id"]
-    assert mutation["id"].startswith("req_")
-    assert mutation["status"] == "pending_review"
-    assert len(mutation["mutations"]) == 2
-    assert [child["payload_json"]["thread_ids"] for child in mutation["mutations"]] == [["thread-1"], ["thread-2"]]
-    assert [child["preview_json"]["thread_count"] for child in mutation["mutations"]] == [1, 1]
-
-    edited = warehouse.remove_upstream_mutation_from_request(
-        request_id=mutation["id"],
-        mutation_id=mutation["mutations"][0]["id"],
-        actor_id="zach",
-    )
-    assert [child["status"] for child in edited["mutations"]] == ["rejected", "pending_review"]
-    assert edited["revision"] == 2
-
-    approved = warehouse.approve_upstream_mutation_request(mutation["id"], actor_id="zach")
-    assert approved["status"] == "approved"
-    assert [child["status"] for child in approved["mutations"]] == ["rejected", "approved"]
-
-    with pytest.raises(ValueError, match="cannot edit"):
-        warehouse.remove_upstream_mutation_from_request(
-            request_id=mutation["id"],
-            mutation_id=mutation["mutations"][1]["id"],
-            actor_id="zach",
-        )
-
-    events = warehouse.list_upstream_mutation_request_events(mutation["id"])
-    assert [event["event_index"] for event in events] == [0, 1, 2]
-    assert [event["event_type"] for event in events] == ["created", "mutation_removed", "approved"]
-
-
-def test_request_rejection_logs_child_mutation_events(warehouse: PostgresWarehouse) -> None:
-    warehouse.ensure_tables()
-    warehouse.insert_messages(
-        [
-            _message_row(message_id="m1", thread_id="thread-1", subject="One", labels=["INBOX"], sync_version=1),
-            _message_row(message_id="m2", thread_id="thread-2", subject="Two", labels=["INBOX"], sync_version=1),
-        ]
-    )
-    request = warehouse.propose_mutation(
-        title="Archive 2 Gmail threads",
-        reason="clear mail",
-        mutations=[{
-            "type": "gmail.archive_threads",
-            "account": "zach@example.test",
-            "thread_ids": ["thread-1", "thread-2"],
-        }],
-    )
-
-    warehouse.reject_upstream_mutation_request(request["id"], actor_id="zach", reason="not today")
-
-    for mutation in request["mutations"]:
-        events = warehouse.list_upstream_mutation_events(mutation["id"])
-        assert [event["event_type"] for event in events] == ["created", "rejected"]
-        assert events[-1]["event_json"] == {"request_id": request["id"], "reason": "not today"}
-
-
-def test_upstream_mutation_request_can_span_gmail_and_contacts(warehouse: PostgresWarehouse) -> None:
-    warehouse.ensure_tables()
-    warehouse.ensure_contacts_tables()
-    warehouse.insert_messages(
-        [
-            _message_row(message_id="m1", thread_id="thread-1", subject="One", labels=["INBOX"], sync_version=1),
-        ]
-    )
-    warehouse.insert_contact_cards(
-        [
-            _contact_card_row(card_id="people/update", etag="etag-update", display_name="Update Me"),
-            _contact_card_row(card_id="people/delete", etag="etag-delete", display_name="Delete Me"),
-        ]
-    )
-
-    request = warehouse.propose_mutation(
-        title="Morning cleanup",
-        reason="clear inbox and clean contacts",
-        requested_by="agent-test",
-        mutations=[
-            {
-                "type": "gmail.archive_threads",
-                "account": "zach@example.test",
-                "thread_ids": ["thread-1"],
-            },
-            {
-                "type": "google_people.contacts",
-                "account": "zach@example.test",
-                "operations": [
-                    {
-                        "op": "update_contact",
-                        "client_op_id": "update-1",
-                        "resource_name": "people/update",
-                        "etag": "etag-update",
-                        "update_person_fields": ["names"],
-                        "person": {"names": [{"displayName": "Updated Person", "givenName": "Updated"}]},
-                    },
-                    {
-                        "op": "delete_contact",
-                        "client_op_id": "delete-1",
-                        "resource_name": "people/delete",
-                        "etag": "etag-delete",
-                        "reason": "duplicate",
-                    },
-                ],
-            },
-        ],
-    )
-
-    assert request["title"] == "Morning cleanup"
-    assert request["status"] == "pending_review"
-    assert [child["provider"] for child in request["mutations"]] == ["gmail", "google_people", "google_people"]
-    assert [child["operation"] for child in request["mutations"]] == [
-        "gmail.archive_threads",
-        "contacts.batch_mutation",
-        "contacts.batch_mutation",
-    ]
-    assert request["mutations"][1]["payload_json"]["operations"][0]["op"] == "update_contact"
-    assert request["mutations"][2]["payload_json"]["operations"][0]["op"] == "delete_contact"
-
-    listed = warehouse.list_upstream_mutation_requests(limit=10)
-    assert [row["id"] for row in listed] == [request["id"]]
-    assert [row["id"] for row in warehouse.list_upstream_mutations_for_request(request["id"])] == [
-        child["id"] for child in request["mutations"]
-    ]
+    assert warehouse.gmail_message_ids_for_thread_label_mutation(
+        account=ACCOUNT,
+        thread_ids=["thread-3"],
+        archive=True,
+    ) == {"thread-3": []}
 
 
 def test_upstream_mutation_claim_fail_and_observe_transitions(warehouse: PostgresWarehouse) -> None:
@@ -217,26 +231,18 @@ def test_upstream_mutation_claim_fail_and_observe_transitions(warehouse: Postgre
         ]
     )
 
-    succeeded_mutation = warehouse.propose_mutation(
+    succeeded_mutation = _seed_mutation_request(
+        warehouse,
+        request_id="req_succeeded",
         title="Archive 1 Gmail thread",
-        reason="clear mail",
-        mutations=[{
-            "type": "gmail.archive_threads",
-            "account": "zach@example.test",
-            "thread_ids": ["thread-1"],
-        }],
+        mutations=[_gmail_thread_label_mutation(thread_id="thread-1", archive=True)],
     )
-    retryable_mutation = warehouse.propose_mutation(
+    retryable_mutation = _seed_mutation_request(
+        warehouse,
+        request_id="req_retryable",
         title="Archive 1 Gmail thread",
-        reason="clear mail too",
-        mutations=[{
-            "type": "gmail.archive_threads",
-            "account": "zach@example.test",
-            "thread_ids": ["thread-2"],
-        }],
+        mutations=[_gmail_thread_label_mutation(thread_id="thread-2", archive=True)],
     )
-    warehouse.approve_upstream_mutation_request(succeeded_mutation["id"], actor_id="zach")
-    warehouse.approve_upstream_mutation_request(retryable_mutation["id"], actor_id="zach")
 
     claimed = warehouse.claim_approved_upstream_mutations(limit=10, claimed_by="worker-1")
     assert [row["status"] for row in claimed] == ["executing", "executing"]
@@ -268,8 +274,8 @@ def test_upstream_mutation_claim_fail_and_observe_transitions(warehouse: Postgre
     observed_after_sync = warehouse.observe_succeeded_gmail_archive_mutations()
 
     assert observed_after_sync == 1
-    assert warehouse.get_upstream_mutation_request(succeeded_mutation["id"])["status"] == "observed"
-    assert warehouse.get_upstream_mutation_request(retryable_mutation["id"])["status"] == "failed_retryable"
+    assert _request_status(warehouse, succeeded_mutation["id"]) == "observed"
+    assert _request_status(warehouse, retryable_mutation["id"]) == "failed_retryable"
 
 
 def test_complete_upstream_mutations_bulk_updates_rows_and_events(warehouse: PostgresWarehouse) -> None:
@@ -280,23 +286,15 @@ def test_complete_upstream_mutations_bulk_updates_rows_and_events(warehouse: Pos
             _message_row(message_id="m2", thread_id="thread-2", subject="Two", labels=["INBOX"], sync_version=1),
         ]
     )
-    request = warehouse.propose_mutation(
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_bulk",
         title="Archive 2 Gmail threads",
-        reason="clear mail",
         mutations=[
-            {
-                "type": "gmail.archive_threads",
-                "account": "zach@example.test",
-                "thread_ids": ["thread-1"],
-            },
-            {
-                "type": "gmail.archive_threads",
-                "account": "zach@example.test",
-                "thread_ids": ["thread-2"],
-            },
+            _gmail_thread_label_mutation(thread_id="thread-1", archive=True),
+            _gmail_thread_label_mutation(thread_id="thread-2", archive=True),
         ],
     )
-    warehouse.approve_upstream_mutation_request(request["id"], actor_id="zach")
     claimed = warehouse.claim_approved_upstream_mutations(limit=10, claimed_by="worker-1")
 
     completed = warehouse.complete_upstream_mutations(
@@ -308,10 +306,10 @@ def test_complete_upstream_mutations_bulk_updates_rows_and_events(warehouse: Pos
     )
 
     assert completed == 2
-    assert warehouse.get_upstream_mutation_request(request["id"])["status"] == "succeeded"
+    assert _request_status(warehouse, request["id"]) == "succeeded"
     for mutation in warehouse.list_upstream_mutations_for_request(request["id"]):
         assert mutation["status"] == "succeeded"
-        events = warehouse.list_upstream_mutation_events(mutation["id"])
+        events = _mutation_events(warehouse, mutation["id"])
         assert events[-1]["event_type"] == "executed"
         assert events[-1]["actor_id"] == "worker-1"
         assert events[-1]["event_json"]["archived_thread_ids"]
@@ -327,36 +325,27 @@ def test_reclaim_stale_executing_mutations_resets_orphaned_gmail_rows(warehouse:
         ]
     )
 
-    stale_request = warehouse.propose_mutation(
+    stale_request = _seed_mutation_request(
+        warehouse,
+        request_id="req_stale",
         title="Stale archive",
         reason="worker crashed",
-        mutations=[{
-            "type": "gmail.archive_threads",
-            "account": "zach@example.test",
-            "thread_ids": ["thread-1"],
-        }],
+        mutations=[_gmail_thread_label_mutation(thread_id="thread-1", archive=True)],
     )
-    fresh_request = warehouse.propose_mutation(
+    fresh_request = _seed_mutation_request(
+        warehouse,
+        request_id="req_fresh",
         title="Fresh archive",
         reason="just claimed",
-        mutations=[{
-            "type": "gmail.archive_threads",
-            "account": "zach@example.test",
-            "thread_ids": ["thread-2"],
-        }],
+        mutations=[_gmail_thread_label_mutation(thread_id="thread-2", archive=True)],
     )
-    untouched_request = warehouse.propose_mutation(
+    untouched_request = _seed_mutation_request(
+        warehouse,
+        request_id="req_untouched",
         title="Already approved",
         reason="not claimed",
-        mutations=[{
-            "type": "gmail.archive_threads",
-            "account": "zach@example.test",
-            "thread_ids": ["thread-3"],
-        }],
+        mutations=[_gmail_thread_label_mutation(thread_id="thread-3", archive=True)],
     )
-    warehouse.approve_upstream_mutation_request(stale_request["id"], actor_id="zach")
-    warehouse.approve_upstream_mutation_request(fresh_request["id"], actor_id="zach")
-    warehouse.approve_upstream_mutation_request(untouched_request["id"], actor_id="zach")
 
     stale_mutation_id = stale_request["mutations"][0]["id"]
     fresh_mutation_id = fresh_request["mutations"][0]["id"]
@@ -407,7 +396,7 @@ def test_reclaim_stale_executing_mutations_resets_orphaned_gmail_rows(warehouse:
     assert stale_after_reclaim["claimed_by"] == ""
     reclaim_events = [
         event
-        for event in warehouse.list_upstream_mutation_events(stale_mutation_id)
+        for event in _mutation_events(warehouse, stale_mutation_id)
         if event["event_type"] == "reclaimed"
     ]
     assert len(reclaim_events) == 1
@@ -439,23 +428,29 @@ def test_reclaim_stale_executing_mutations_leaves_non_idempotent_ops(warehouse: 
         ]
     )
 
-    request = warehouse.propose_mutation(
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_send",
         title="Send email",
         reason="stuck non-idempotent",
         mutations=[
             {
-                "type": "gmail.send_email",
-                "account": "zach@example.test",
-                "delivery_mode": "send",
-                "message": {
-                    "to": ["one@example.test"],
-                    "subject": "Hi",
-                    "body_text": "Body",
+                "provider": "gmail",
+                "operation": GMAIL_SEND_EMAIL_OPERATION,
+                "payload": {
+                    "delivery_mode": "send",
+                    "message": {
+                        "to": ["one@example.test"],
+                        "cc": [],
+                        "bcc": [],
+                        "subject": "Hi",
+                        "body_text": "Body",
+                        "body_html": "",
+                    },
                 },
             }
         ],
     )
-    warehouse.approve_upstream_mutation_request(request["id"], actor_id="zach")
     mutation_id = request["mutations"][0]["id"]
     long_ago = datetime.now(tz=UTC) - timedelta(hours=2)
     warehouse._command(
@@ -484,7 +479,7 @@ def test_reclaim_stale_executing_mutations_leaves_non_idempotent_ops(warehouse: 
     assert warehouse.get_upstream_mutation(mutation_id)["status"] == "executing"
 
 
-def test_gmail_unarchive_mutation_validation_and_observe(warehouse: PostgresWarehouse) -> None:
+def test_gmail_unarchive_mutation_claim_and_observe(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     warehouse.insert_messages(
         [
@@ -493,44 +488,23 @@ def test_gmail_unarchive_mutation_validation_and_observe(warehouse: PostgresWare
         ]
     )
     assert warehouse.gmail_message_ids_for_thread_label_mutation(
-        account="zach@example.test",
+        account=ACCOUNT,
         thread_ids=["archived-thread"],
         archive=False,
     ) == {"archived-thread": ["m1"]}
 
-    with pytest.raises(ValueError, match="unknown or non-archived"):
-        warehouse.propose_mutation(
-            title="Bad unarchive",
-            reason="not archived",
-            mutations=[
-                {
-                    "type": "gmail.unarchive_threads",
-                    "account": "zach@example.test",
-                    "thread_ids": ["inbox-thread"],
-                }
-            ],
-        )
-
-    request = warehouse.propose_mutation(
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_unarchive",
         title="Unarchive one",
         reason="bring it back",
-        mutations=[
-            {
-                "type": "gmail.unarchive_threads",
-                "account": "zach@example.test",
-                "thread_ids": ["archived-thread"],
-            }
-        ],
+        mutations=[_gmail_thread_label_mutation(thread_id="archived-thread", archive=False)],
     )
-
     mutation = request["mutations"][0]
-    assert mutation["operation"] == "gmail.unarchive_threads"
-    assert mutation["payload_json"] == {"thread_ids": ["archived-thread"], "add_label_ids": ["INBOX"]}
-    assert mutation["preview_json"]["thread_count"] == 1
 
-    warehouse.approve_upstream_mutation_request(request["id"], actor_id="zach")
     claimed = warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker")
-    assert claimed[0]["operation"] == "gmail.unarchive_threads"
+    assert claimed[0]["operation"] == GMAIL_UNARCHIVE_OPERATION
+    assert claimed[0]["payload_json"] == {"thread_ids": ["archived-thread"], "add_label_ids": ["INBOX"]}
     warehouse.complete_upstream_mutation(
         mutation["id"],
         result_json={"unarchived_thread_ids": ["archived-thread"]},
@@ -550,10 +524,10 @@ def test_gmail_unarchive_mutation_validation_and_observe(warehouse: PostgresWare
         ]
     )
     assert warehouse.observe_succeeded_gmail_unarchive_mutations() == 1
-    assert warehouse.get_upstream_mutation_request(request["id"])["status"] == "observed"
+    assert _request_status(warehouse, request["id"]) == "observed"
 
 
-def test_gmail_send_email_mutation_proposal_edit_reply_and_observe(warehouse: PostgresWarehouse) -> None:
+def test_gmail_send_email_mutation_claim_and_observe(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     warehouse.insert_messages(
         [
@@ -561,64 +535,35 @@ def test_gmail_send_email_mutation_proposal_edit_reply_and_observe(warehouse: Po
         ]
     )
 
-    request = warehouse.propose_mutation(
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_email",
         title="Send follow-ups",
         reason="agent drafted useful replies",
         mutations=[
             {
-                "type": "gmail.send_email",
-                "account": "zach@example.test",
-                "delivery_mode": "send",
-                "message": {
-                    "to": ["one@example.test"],
-                    "cc": ["two@example.test"],
-                    "bcc": ["secret@example.test"],
-                    "subject": "New thread",
-                    "body_text": "Hello from a new thread",
+                "provider": "gmail",
+                "operation": GMAIL_SEND_EMAIL_OPERATION,
+                "payload": {
+                    "delivery_mode": "draft",
+                    "message": {
+                        "to": ["one@example.test"],
+                        "cc": ["edited-cc@example.test"],
+                        "bcc": ["secret@example.test"],
+                        "subject": "New thread",
+                        "body_text": "Edited body",
+                        "body_html": "",
+                    },
                 },
-            },
-            {
-                "type": "gmail.send_email",
-                "account": "zach@example.test",
-                "delivery_mode": "draft",
-                "message": {
-                    "to": ["sender@example.test"],
-                    "body_text": "Reply body",
-                    "reply_to_thread_id": "thread-1",
-                },
-            },
+            }
         ],
     )
+    mutation_id = request["mutations"][0]["id"]
 
-    assert [child["operation"] for child in request["mutations"]] == ["gmail.send_email", "gmail.send_email"]
-    new_message = request["mutations"][0]["payload_json"]["message"]
-    reply_message = request["mutations"][1]["payload_json"]["message"]
-    assert new_message["bcc"] == ["secret@example.test"]
-    assert reply_message["subject"] == "Re: Existing thread"
-    assert reply_message["reply_to_thread_id"] == "thread-1"
-    assert reply_message["in_reply_to"] == "<m1@example.test>"
-    assert request["mutations"][1]["preview_json"]["email"]["mode"] == "reply"
-
-    edited = warehouse.update_gmail_email_mutation(
-        mutation_id=request["mutations"][0]["id"],
-        delivery_mode="draft",
-        message={
-            **new_message,
-            "body_text": "Edited body",
-            "cc": ["edited-cc@example.test"],
-        },
-        actor_id="zach",
-    )
-    assert edited["payload_json"]["delivery_mode"] == "draft"
-    assert edited["payload_json"]["message"]["body_text"] == "Edited body"
-    assert edited["preview_json"]["email"]["cc"] == ["edited-cc@example.test"]
-    assert edited["revision"] == 2
-
-    warehouse.approve_upstream_mutation(request["mutations"][0]["id"], actor_id="zach")
     claimed = warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker")
-    assert claimed[0]["operation"] == "gmail.send_email"
+    assert claimed[0]["operation"] == GMAIL_SEND_EMAIL_OPERATION
     warehouse.complete_upstream_mutation(
-        request["mutations"][0]["id"],
+        mutation_id,
         result_json={"delivery_mode": "draft", "draft_id": "draft-1", "draft_message_id": "draft-message-1"},
         actor_id="worker",
     )
@@ -636,72 +581,52 @@ def test_gmail_send_email_mutation_proposal_edit_reply_and_observe(warehouse: Po
         ]
     )
     assert warehouse.observe_succeeded_gmail_email_mutations() == 1
-    assert warehouse.get_upstream_mutation(request["mutations"][0]["id"])["status"] == "observed"
+    assert warehouse.get_upstream_mutation(mutation_id)["status"] == "observed"
 
 
-def test_contact_mutation_proposal_edit_and_observe(warehouse: PostgresWarehouse) -> None:
+def test_contact_mutation_claim_and_observe(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_contacts_tables()
     warehouse.insert_contact_cards(
         [
-            _contact_card_row(card_id="people/update", etag="etag-update", display_name="Update Me"),
-            _contact_card_row(card_id="people/delete", etag="etag-delete", display_name="Delete Me"),
+            _contact_card_row(card_id="people/c1", etag="etag-1", display_name="Update Me"),
+            _contact_card_row(card_id="people/c3", etag="etag-3", display_name="Delete Me"),
         ]
     )
 
-    mutation = warehouse.propose_mutation(
+    update_operation = _contract_operation("update derives the field mask from the person body")
+    delete_operation = _contract_operation("delete carries the reviewed etag")
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_contacts",
         title="Clean contacts",
         reason="test contact batch",
-        mutations=[{
-            "type": "google_people.contacts",
-            "account": "zach@example.test",
-            "operations": [
-                {
-                    "op": "update_contact",
-                    "client_op_id": "update-1",
-                    "resource_name": "people/update",
-                    "etag": "etag-update",
-                    "update_person_fields": ["names"],
-                    "person": {
-                        "names": [{"displayName": "Updated Person", "givenName": "Updated"}],
-                    },
-                },
-                {
-                    "op": "delete_contact",
-                    "client_op_id": "delete-1",
-                    "resource_name": "people/delete",
-                    "etag": "etag-delete",
-                    "reason": "duplicate",
-                },
-            ],
-        }],
+        mutations=[
+            {
+                "provider": "google_people",
+                "operation": GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
+                "payload": {"operations": [update_operation]},
+                "preview": {"operation_count": 1},
+            },
+            {
+                # The reviewer removed this one before approving the request.
+                "provider": "google_people",
+                "operation": GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
+                "status": "rejected",
+                "payload": {"operations": [delete_operation]},
+                "preview": {"operation_count": 1},
+            },
+        ],
     )
 
-    assert mutation["status"] == "pending_review"
-    assert [child["provider"] for child in mutation["mutations"]] == ["google_people", "google_people"]
-    assert mutation["mutations"][0]["preview_json"]["operation_count"] == 1
-    assert mutation["mutations"][0]["payload_json"]["operations"][0]["person"]["resourceName"] == "people/update"
-    assert mutation["mutations"][0]["payload_json"]["operations"][0]["person"]["etag"] == "etag-update"
-
-    edited = warehouse.remove_upstream_mutation_from_request(
-        request_id=mutation["id"],
-        mutation_id=mutation["mutations"][1]["id"],
-        actor_id="zach",
-    )
-    assert [child["status"] for child in edited["mutations"]] == ["pending_review", "rejected"]
-    assert edited["revision"] == 2
-    assert [event["event_type"] for event in warehouse.list_upstream_mutation_request_events(mutation["id"])] == [
-        "created",
-        "mutation_removed",
-    ]
-
-    warehouse.approve_upstream_mutation_request(mutation["id"], actor_id="zach")
     claimed = warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker")
-    assert claimed[0]["id"] == mutation["mutations"][0]["id"]
+    assert [row["id"] for row in claimed] == [request["mutations"][0]["id"]]
+    assert claimed[0]["payload_json"]["operations"][0]["person"]["resourceName"] == "people/c1"
+    assert claimed[0]["payload_json"]["operations"][0]["person"]["etag"] == "etag-1"
     warehouse.complete_upstream_mutation(
-        mutation["mutations"][0]["id"],
+        request["mutations"][0]["id"],
         result_json={
             "operation_results": [
-                {"op": "update_contact", "resource_name": "people/update", "etag": "etag-updated"}
+                {"op": "update_contact", "resource_name": "people/c1", "etag": "etag-updated"}
             ]
         },
         actor_id="worker",
@@ -710,11 +635,11 @@ def test_contact_mutation_proposal_edit_and_observe(warehouse: PostgresWarehouse
 
     warehouse.insert_contact_cards(
         [
-            _contact_card_row(card_id="people/update", etag="etag-updated", display_name="Updated Person", sync_version=2),
+            _contact_card_row(card_id="people/c1", etag="etag-updated", display_name="Ada Lovelace", sync_version=2),
         ]
     )
     assert warehouse.observe_succeeded_contact_mutations() == 1
-    assert warehouse.get_upstream_mutation_request(mutation["id"])["status"] == "observed"
+    assert _request_status(warehouse, request["id"]) == "observed"
 
 
 def test_contact_nickname_update_observes_synced_value_when_response_etag_differs(
@@ -723,39 +648,42 @@ def test_contact_nickname_update_observes_synced_value_when_response_etag_differ
     warehouse.ensure_contacts_tables()
     warehouse.insert_contact_cards(
         [
-            _contact_card_row(card_id="people/update", etag="etag-before", display_name="Update Me"),
+            _contact_card_row(card_id="people/c1", etag="etag-before", display_name="Update Me"),
         ]
     )
 
-    mutation = warehouse.propose_mutation(
+    nickname_operation = _contract_operation(
+        "update derives the field mask from the person body",
+        expected_etag="etag-before",
+        update_person_fields=["nicknames"],
+        person={
+            "nicknames": [{"value": "Ace", "type": "DEFAULT"}],
+            "resourceName": "people/c1",
+            "etag": "etag-before",
+        },
+    )
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_nickname",
         title="Add nickname",
         reason="test nickname update",
         mutations=[
             {
-                "type": "google_people.contacts",
-                "account": "zach@example.test",
-                "operations": [
-                    {
-                        "op": "update_contact",
-                        "client_op_id": "update-1",
-                        "resource_name": "people/update",
-                        "etag": "etag-before",
-                        "update_person_fields": ["nicknames"],
-                        "person": {"nicknames": [{"value": "Ace", "type": "DEFAULT"}]},
-                    }
-                ],
+                "provider": "google_people",
+                "operation": GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
+                "payload": {"operations": [nickname_operation]},
             }
         ],
     )
-    child = mutation["mutations"][0]
-    warehouse.approve_upstream_mutation_request(mutation["id"], actor_id="zach")
+    child = request["mutations"][0]
+
     claimed = warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker")
     assert claimed[0]["id"] == child["id"]
     warehouse.complete_upstream_mutation(
         child["id"],
         result_json={
             "operation_results": [
-                {"op": "update_contact", "resource_name": "people/update", "etag": "etag-response"}
+                {"op": "update_contact", "resource_name": "people/c1", "etag": "etag-response"}
             ]
         },
         actor_id="worker",
@@ -764,12 +692,12 @@ def test_contact_nickname_update_observes_synced_value_when_response_etag_differ
     warehouse.insert_contact_cards(
         [
             _contact_card_row(
-                card_id="people/update",
+                card_id="people/c1",
                 etag="etag-from-sync",
                 display_name="Update Me",
                 nicknames=[{"value": "Ace", "metadata": {"primary": True}}],
                 raw_json={
-                    "resourceName": "people/update",
+                    "resourceName": "people/c1",
                     "etag": "etag-from-sync",
                     "nicknames": [{"value": "Ace", "metadata": {"primary": True}}],
                 },
@@ -779,36 +707,39 @@ def test_contact_nickname_update_observes_synced_value_when_response_etag_differ
     )
 
     assert warehouse.observe_succeeded_contact_mutations() == 1
-    assert warehouse.get_upstream_mutation_request(mutation["id"])["status"] == "observed"
+    assert _request_status(warehouse, request["id"]) == "observed"
 
 
-def test_calendar_event_mutation_proposal_and_observe(warehouse: PostgresWarehouse) -> None:
-    mutation = warehouse.propose_mutation(
+def test_calendar_event_mutation_claim_and_observe(warehouse: PostgresWarehouse) -> None:
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_calendar",
         title="Schedule planning",
         reason="test calendar create",
-        mutations=[{
-            "type": "calendar.create_event",
-            "account": "zach@example.test",
-            "event": {
-                "summary": "Planning",
-                "start": {"dateTime": "2030-01-01T10:00:00", "timeZone": "UTC"},
-                "end": {"dateTime": "2030-01-01T10:30:00", "timeZone": "UTC"},
-            },
-            "send_updates": "none",
-        }],
+        mutations=[
+            {
+                "provider": CALENDAR_PROVIDER,
+                "operation": CALENDAR_CREATE_EVENT_OPERATION,
+                "payload": {
+                    "calendar_id": "primary",
+                    "send_updates": "none",
+                    "event": {
+                        "summary": "Planning",
+                        "start": {"dateTime": "2030-01-01T10:00:00", "timeZone": "UTC"},
+                        "end": {"dateTime": "2030-01-01T10:30:00", "timeZone": "UTC"},
+                    },
+                },
+            }
+        ],
     )
+    child = request["mutations"][0]
 
-    assert mutation["status"] == "pending_review"
-    child = mutation["mutations"][0]
-    assert child["provider"] == "google_calendar"
-    assert child["operation"] == "calendar.create_event"
-    assert child["payload_json"]["calendar_id"] == "primary"
-    assert child["payload_json"]["send_updates"] == "none"
-    assert child["preview_json"]["event"]["summary"] == "Planning"
-
-    warehouse.approve_upstream_mutation_request(mutation["id"], actor_id="zach")
     claimed = warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker")
     assert claimed[0]["id"] == child["id"]
+    assert claimed[0]["provider"] == CALENDAR_PROVIDER
+    assert claimed[0]["operation"] == CALENDAR_CREATE_EVENT_OPERATION
+    assert claimed[0]["payload_json"]["calendar_id"] == "primary"
+    assert claimed[0]["payload_json"]["send_updates"] == "none"
     warehouse.complete_upstream_mutation(
         child["id"],
         result_json={"calendar_id": "primary", "event_id": "event-1", "etag": '"created-etag"'},
@@ -827,7 +758,7 @@ def test_calendar_event_mutation_proposal_and_observe(warehouse: PostgresWarehou
         ]
     )
     assert warehouse.observe_succeeded_calendar_event_mutations() == 1
-    assert warehouse.get_upstream_mutation_request(mutation["id"])["status"] == "observed"
+    assert _request_status(warehouse, request["id"]) == "observed"
 
 
 def _message_row(
@@ -841,7 +772,7 @@ def _message_row(
     now = datetime(2026, 5, 22, 12, tzinfo=UTC)
     row = _default_row(
         MESSAGE_COLUMNS,
-        account="zach@example.test",
+        account=ACCOUNT,
         message_id=message_id,
         thread_id=thread_id,
         history_id=sync_version,
@@ -850,8 +781,8 @@ def _message_row(
         snippet="snippet",
         subject=subject,
         from_address="sender@example.test",
-        to_addresses=["zach@example.test"],
-        delivered_to="zach@example.test",
+        to_addresses=[ACCOUNT],
+        delivered_to=ACCOUNT,
         rfc822_message_id=f"<{message_id}@example.test>",
         date_header="Fri, 22 May 2026 12:00:00 +0000",
         size_estimate=123,
@@ -879,7 +810,7 @@ def _contact_card_row(
     row = _default_row(
         CONTACT_CARD_COLUMNS,
         source="google_people",
-        account="zach@example.test",
+        account=ACCOUNT,
         source_kind="google_contacts",
         address_book_id="people/me",
         card_id=card_id,
@@ -929,7 +860,7 @@ def _calendar_event_row(
     }
     return _default_row(
         CALENDAR_EVENT_COLUMNS,
-        account="zach@example.test",
+        account=ACCOUNT,
         calendar_id="primary",
         event_id=event_id,
         status=raw_event["status"],
@@ -960,3 +891,20 @@ def _default_row(columns: tuple[str, ...], **overrides):
             row[column] = ""
     row.update(overrides)
     return row
+
+
+# The Go app owns this table's write path but Python's ensure path can bootstrap
+# it first. Two definitions of one table that disagree is the same class of
+# drift that broke Google Contacts updates, so pin them to agree here.
+def test_ensure_upstream_mutation_tables_declares_the_supersede_column(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_upstream_mutation_tables()
+    target = CATALOG.object("upstream_mutation_requests")
+    rows = warehouse._query_dicts(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        """,
+        (target.schema, target.name),
+    )
+    assert "superseded_by_request_id" in {str(row["column_name"]) for row in rows}
