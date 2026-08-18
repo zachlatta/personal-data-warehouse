@@ -2001,6 +2001,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # Slack
     "slack_messages": _events(),
     "slack_files": _events("file shares; may exist without a synced message"),
+    "slack_file_fingerprints": _detail(
+        "slack_files",
+        "perceptual-hash link (file -> content sha) behind 'who sent this image?'",
+    ),
     "slack_message_reactions": _detail("slack_messages"),
     "slack_teams": _entity(),
     "slack_account_identities": _entity("which user_id is Zach per team"),

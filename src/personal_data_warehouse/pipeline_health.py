@@ -584,6 +584,19 @@ PIPELINES: tuple[Pipeline, ...] = (
         expected_run_interval=None,
     ),
     Pipeline(
+        id="slack_file_fingerprints",
+        label="Slack image fingerprints",
+        kind="derived",
+        cadence="hourly :19",
+        transport="Dagster slack_file_fingerprints -> files.slack.com, bounded slices",
+        expected_data_interval=7 * DAY,
+        expected_run_interval=None,
+        note=(
+            "walks a ~905k-image backlog newest-first in bounded slices; the link "
+            "table is the cursor, so a slow backfill is normal rather than late"
+        ),
+    ),
+    Pipeline(
         id="finance_ledger",
         label="Finance ledger",
         kind="derived",
@@ -687,6 +700,11 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "slack_conversation_stats": _support("slack", "updated_at", "latest_message_at"),
     "slack_account_state_item_rows": _support("slack", "synced_at", "latest_activity_at"),
     "slack_sync_state": _state("slack", "updated_at", "per-object cursors and errors"),
+    "slack_file_fingerprints": _data(
+        "slack_file_fingerprints",
+        "updated_at",
+        note="file -> content sha link; the hash itself lives in media_fingerprints",
+    ),
     # Apple Messages
     "apple_messages": _data("apple_messages", "ingested_at", "message_at"),
     "apple_message_attachments": _support("apple_messages", "ingested_at"),

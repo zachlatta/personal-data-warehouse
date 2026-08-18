@@ -236,6 +236,14 @@
       "comment": "Modelled voice memos facts: normalization, identity resolution, enrichment, and history that the raw source cannot express."
     },
     {
+      "name": "internal",
+      "layer": "internal",
+      "domain": "internal",
+      "discoverable": false,
+      "query_access": "hidden",
+      "comment": "Implementation-only helper functions and types. Not a query surface."
+    },
+    {
       "name": "marts_ai_conversations",
       "layer": "marts",
       "domain": "ai_conversations",
@@ -308,20 +316,12 @@
       "comment": "Stable receipts read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."
     },
     {
-      "name": "timeline",
-      "layer": "timeline",
-      "domain": "timeline",
+      "name": "marts_slack",
+      "layer": "marts",
+      "domain": "slack",
       "discoverable": true,
       "query_access": "public",
-      "comment": "One row per real-world event across every source, plus the search_text()/search_text_exact() interface. Drill through source_table/source_pk for full detail; it is the recommended entry point, not the only truth."
-    },
-    {
-      "name": "internal",
-      "layer": "internal",
-      "domain": "internal",
-      "discoverable": false,
-      "query_access": "hidden",
-      "comment": "Implementation-only helper functions and types. Not a query surface."
+      "comment": "Stable read interfaces for the slack domain."
     },
     {
       "name": "ops",
@@ -338,6 +338,14 @@
       "discoverable": false,
       "query_access": "hidden",
       "comment": "Credentials and session snapshots. Never granted to the read-only query role."
+    },
+    {
+      "name": "timeline",
+      "layer": "timeline",
+      "domain": "timeline",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "One row per real-world event across every source, plus the search_text()/search_text_exact() interface. Drill through source_table/source_pk for full detail; it is the recommended entry point, not the only truth."
     }
   ],
   "objects": [
@@ -1210,6 +1218,28 @@
         "schema": "slack",
         "name": "account_state_item_rows"
       }
+    },
+    {
+      "id": "slack_file_fingerprints",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "slack",
+      "schema": "derived_slack",
+      "name": "file_fingerprints",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "slack_image_fingerprints",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "slack",
+      "schema": "marts_slack",
+      "name": "image_fingerprints",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
     },
     {
       "id": "file_attachment_enrichments",

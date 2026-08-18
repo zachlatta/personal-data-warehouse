@@ -136,8 +136,10 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         by_layer[obj.layer] = by_layer.get(obj.layer, 0) + 1
     assert by_layer == {
         "base": 52,
-        "derived": 20,
-        "marts": 28,
+        # +1 derived / +1 marts: derived_slack.file_fingerprints and its
+        # marts_slack.image_fingerprints read view (Slack image identification).
+        "derived": 21,
+        "marts": 29,
         "timeline": 7,
         "ops": 22,
         "private": 5,

@@ -1173,3 +1173,84 @@ columns, a `stored_predicate`, and whether PDFs need a prior deterministic-extra
 wire a Dagster asset/sensor that runs `FileAttachmentEnrichmentRunner` with that source — see
 `defs/gmail_attachment_enrichment.py` and `defs/whatsapp_media_enrichment.py`. The table rename
 migrates in place via `ensure_*` (`ALTER TABLE IF EXISTS … RENAME`), preserving existing rows.
+
+## Slack file bytes and "who sent this image?"
+
+### Getting a Slack file's bytes: `get_object` already does this
+
+`get_object` takes a `base_slack.files.file_id` (`F...`) directly and returns metadata plus a
+signed `download_url` that needs no further auth. The app resolves the file live through
+`files.info` across every configured workspace token and downloads `url_private`
+(`app/internal/objectstore/slack.go`, wired in `server.go`); it already holds the tokens.
+
+```bash
+pdw call get_object --data '{"storage_file_id":"F0EXAMPLE123"}'
+curl -L -o poster.png "<download_url from the response>"
+```
+
+**Do not build a second Slack fetch path.** A 2026-08-16 session concluded pdw could not fetch
+Slack file bytes and guessed an answer; it had tried the *public* `slack-files.com` permalink,
+which 404s unless the file was explicitly shared publicly. `url_private` needs the bearer token
+and `get_object` supplies it. Sampled 2026-08-18 across recent, 2016-era and mid-era files,
+images and non-images: 19/19 returned bytes, including a 20 MB PNG.
+
+Slack's sharpest trap is already handled there: an unauthorized `files.slack.com` GET returns
+**200 with an HTML login page**, not a 4xx, and the store rejects that rather than returning it
+as content.
+
+### Identifying an image: fingerprints, then plain SQL
+
+Slack image files are fingerprinted with the same 256-bit dhash the photos pipeline uses, into
+the same `derived_enrichment.media_fingerprints` table. `derived_slack.file_fingerprints` links
+a Slack file to the content sha its bytes hash to (PK `account, team_id, file_id` — one download
+per file, not per share) and carries the status/attempts/backoff that make the backfill
+resumable. **The bytes are never stored**: ~905k live Slack images total ~552 GB versus ~200
+bytes per fingerprint, and a named file's bytes are one `get_object` call away.
+
+There is **no new command**. Hash the picture, then run ordinary SQL:
+
+```bash
+uv run python -c "from personal_data_warehouse.slack_image_lookup import lookup_sql_for_image; \
+  print(lookup_sql_for_image('/path/to/poster.png'))"     # prints ready-to-run SQL
+```
+
+Paste that into `pdw sql` (or the `query` tool). It ranks `marts_slack.image_fingerprints` by
+`bit_count` XOR distance and **resolves the uploader** by joining `base_slack.users` — the join
+the 2026-08-16 session never made. It reports **real_name, @handle and display_name separately**
+because Slack keeps all three and they differ (a real row: `Real Name` / `@realname110` /
+`realname`); that session was asked for the *handle* specifically.
+
+The hash must come from that Pillow code path — a fingerprint computed by a different resampler
+does not error, it silently stops matching.
+
+Read distances as: **0–6 the same image**, 7–16 very likely, 17–28 possibly related, beyond that
+check by eye. Verified on the real corpus: every re-encode/rescale of the motivating poster
+hashes to distance **0**, while two *different* 11x17 posters sit at **124–125**. Byte size is
+useless here — one re-encode was *larger* than the original, and the two copies in the incident
+differed by 1.3 MB.
+
+Backfill: the `slack_file_fingerprints` Dagster asset (hourly `:19`) takes a bounded
+newest-first slice (`SLACK_FILE_FINGERPRINT_LIMIT`, default 300; `..._RUN_SECONDS`, default
+900). Newest-first because recency is what people ask about. It fetches bytes **through the
+app's `get_object`**, so it holds no Slack credential of its own and there is one Slack-file
+implementation to fix. A 429 ends the slice cleanly without burning the file's retry budget.
+**The table is the cursor**, so it resumes by itself; there is no watermark to repair.
+
+Two gotchas worth knowing:
+
+- **Print artwork breaks photo defaults.** The motivating poster is 420,750,000 pixels (11x17
+  inches at 1500 DPI), far past Pillow's ~89 MP decompression-bomb guard. `compute_dhash` takes
+  an opt-in `max_pixels` (Slack uses 512 MP) that is scoped and restored, so the photos pipeline
+  keeps its own posture. Without it that exact file is `undecodable` forever.
+- **A DM's `name` is the other user's id**, and a group DM's is `mpdm-a--b--c-1`. Render by
+  `conversation_kind`, never by name, or a DM prints as a channel that does not exist.
+
+Coverage is not proof of absence — only fingerprinted files are searchable:
+
+```bash
+pdw sql --output json -q "slack fingerprint coverage" \
+  "SELECT status, count(*) FROM derived_slack.file_fingerprints GROUP BY 1 ORDER BY 2 DESC"
+```
+
+End-to-end check against real Slack bytes in a throwaway schema (writes nothing to prod):
+`uv run python scripts/verify_slack_image_lookup.py --file-id <F...> [--probe copy.png]`.

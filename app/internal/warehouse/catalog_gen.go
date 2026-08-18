@@ -53,6 +53,7 @@ var Schemas = []CatalogSchema{
 	{Name: "derived_receipts", Layer: "derived", Domain: "receipts", Discoverable: true, Comment: "Modelled receipts facts: normalization, identity resolution, enrichment, and history that the raw source cannot express."},
 	{Name: "derived_slack", Layer: "derived", Domain: "slack", Discoverable: true, Comment: "Modelled slack facts: normalization, identity resolution, enrichment, and history that the raw source cannot express."},
 	{Name: "derived_voice_memos", Layer: "derived", Domain: "voice_memos", Discoverable: true, Comment: "Modelled voice memos facts: normalization, identity resolution, enrichment, and history that the raw source cannot express."},
+	{Name: "internal", Layer: "internal", Domain: "internal", Discoverable: false, Comment: "Implementation-only helper functions and types. Not a query surface."},
 	{Name: "marts_ai_conversations", Layer: "marts", Domain: "ai_conversations", Discoverable: true, Comment: "Stable ai conversations read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."},
 	{Name: "marts_calendar", Layer: "marts", Domain: "calendar", Discoverable: true, Comment: "Stable calendar read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."},
 	{Name: "marts_contacts", Layer: "marts", Domain: "contacts", Discoverable: true, Comment: "Stable contacts read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."},
@@ -62,10 +63,10 @@ var Schemas = []CatalogSchema{
 	{Name: "marts_ops", Layer: "marts", Domain: "ops", Discoverable: true, Comment: "Stable warehouse-operations read interface: which pipeline feeds each table, when it last delivered data, and whether it is healthy. Start with marts_ops.pipeline_health."},
 	{Name: "marts_photos", Layer: "marts", Domain: "photos", Discoverable: true, Comment: "Stable photos read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."},
 	{Name: "marts_receipts", Layer: "marts", Domain: "receipts", Discoverable: true, Comment: "Stable receipts read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."},
-	{Name: "timeline", Layer: "timeline", Domain: "timeline", Discoverable: true, Comment: "One row per real-world event across every source, plus the search_text()/search_text_exact() interface. Drill through source_table/source_pk for full detail; it is the recommended entry point, not the only truth."},
-	{Name: "internal", Layer: "internal", Domain: "internal", Discoverable: false, Comment: "Implementation-only helper functions and types. Not a query surface."},
+	{Name: "marts_slack", Layer: "marts", Domain: "slack", Discoverable: true, Comment: "Stable read interfaces for the slack domain."},
 	{Name: "ops", Layer: "ops", Domain: "ops", Discoverable: false, Comment: "Implementation detail: sync cursors, watermarks and runtime state. Not a query surface."},
 	{Name: "private", Layer: "private", Domain: "private", Discoverable: false, Comment: "Credentials and session snapshots. Never granted to the read-only query role."},
+	{Name: "timeline", Layer: "timeline", Domain: "timeline", Discoverable: true, Comment: "One row per real-world event across every source, plus the search_text()/search_text_exact() interface. Drill through source_table/source_pk for full detail; it is the recommended entry point, not the only truth."},
 }
 
 // Objects is every managed warehouse object keyed by its stable logical id.
@@ -130,6 +131,8 @@ var Objects = []CatalogObject{
 	{ID: "google_drive_file_texts", Kind: "table", Layer: "derived", Domain: "documents", Schema: "derived_documents", Name: "google_drive_file_texts", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "slack_conversation_stats", Kind: "table", Layer: "derived", Domain: "slack", Schema: "derived_slack", Name: "conversation_stats", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "slack_account_state_item_rows", Kind: "table", Layer: "derived", Domain: "slack", Schema: "derived_slack", Name: "inbox_items", Discoverable: true, QueryAccess: "public", Secret: false},
+	{ID: "slack_file_fingerprints", Kind: "table", Layer: "derived", Domain: "slack", Schema: "derived_slack", Name: "file_fingerprints", Discoverable: true, QueryAccess: "public", Secret: false},
+	{ID: "slack_image_fingerprints", Kind: "view", Layer: "marts", Domain: "slack", Schema: "marts_slack", Name: "image_fingerprints", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "file_attachment_enrichments", Kind: "table", Layer: "derived", Domain: "enrichment", Schema: "derived_enrichment", Name: "file_attachment_enrichments", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "media_fingerprints", Kind: "table", Layer: "derived", Domain: "enrichment", Schema: "derived_enrichment", Name: "media_fingerprints", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "photo_assets", Kind: "table", Layer: "derived", Domain: "photos", Schema: "derived_photos", Name: "assets", Discoverable: true, QueryAccess: "public", Secret: false},

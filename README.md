@@ -1484,6 +1484,62 @@ SELECT last_write_at, newest_event_at, data_age_seconds, row_estimate
 FROM marts_ops.pipeline_health WHERE pipeline = 'gmail';
 ```
 
+## Slack Image Identification
+
+Answers "who sent this image?" from a picture alone.
+
+**Getting a Slack file's bytes is not part of this** — `get_object` already does it. Pass a
+`base_slack.files.file_id` (`F...`) and it returns metadata plus a signed `download_url`; the app
+resolves the file live via `files.info` across every configured workspace token and downloads
+`url_private` (`app/internal/objectstore/slack.go`). The public `slack-files.com` permalink is
+not a substitute: it 404s unless the file was explicitly shared publicly.
+
+```bash
+pdw call get_object --data '{"storage_file_id":"F0EXAMPLE123"}'
+```
+
+**Fingerprints.** The `slack_file_fingerprints` Dagster asset (hourly `:19`) walks `image/*` rows
+newest-first in bounded slices, fetching each file's bytes **through `get_object`** so it needs no
+Slack credential of its own, hashing them with the photos pipeline's 256-bit dhash into
+`derived_enrichment.media_fingerprints`, and recording the file -> sha link plus status/backoff in
+`derived_slack.file_fingerprints`. **Fetched bytes are discarded**: ~905k live Slack images total
+~552 GB versus ~200 bytes per fingerprint, and a named file's bytes are one `get_object` call
+away. The link table is the cursor, so runs are resumable and a 429 ends a slice without consuming
+the file's retry budget.
+
+| setting | default | meaning |
+| --- | --- | --- |
+| `SLACK_FILE_FINGERPRINT_LIMIT` | 300 | files per run |
+| `SLACK_FILE_FINGERPRINT_RUN_SECONDS` | 900 | wall-clock budget per run |
+| `SLACK_FILE_FETCH_MAX_BYTES` | 64 MiB | per-file download ceiling |
+| `SLACK_FILE_FETCH_TIMEOUT_SECONDS` | 180 | per-request timeout |
+
+**Looking an image up** is plain SQL through the existing query tools; there is no new command.
+Hash the local picture, then run the SQL it prints:
+
+```bash
+uv run python -c "from personal_data_warehouse.slack_image_lookup import lookup_sql_for_image; \
+  print(lookup_sql_for_image('poster.png'))"
+```
+
+It ranks `marts_slack.image_fingerprints` by `bit_count` XOR distance, resolving the uploader
+through `base_slack.users` and reporting real name, `@handle`, and display name separately.
+Distances: 0-6 the same image, 7-16 very likely, 17-28 possibly related, beyond that check by eye.
+The hash must come from that Pillow code path; a different resampler silently stops matching.
+
+Coverage query (absence of a match is not proof the image was never sent):
+
+```bash
+pdw sql --output json -q "slack fingerprint coverage" \
+  "SELECT status, count(*) FROM derived_slack.file_fingerprints GROUP BY 1 ORDER BY 2 DESC"
+```
+
+End-to-end check against real Slack bytes, in a throwaway schema, writing nothing to production:
+
+```bash
+uv run python scripts/verify_slack_image_lookup.py --file-id F0... [--probe copy.png]
+```
+
 ## Verification
 
 Run tests:

@@ -77,6 +77,7 @@ from personal_data_warehouse.schema import (
     SLACK_CONVERSATION_MEMBER_COLUMNS,
     SLACK_CONVERSATION_READ_STATE_FIELDS,
     SLACK_FILE_COLUMNS,
+    SLACK_FILE_FINGERPRINT_COLUMNS,
     SLACK_MESSAGE_COLUMNS,
     SLACK_REACTION_COLUMNS,
     SLACK_SYNC_STATE_COLUMNS,
@@ -424,6 +425,14 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("source", "account", "source_native_id", "content_sha256"),
     ),
     "media_fingerprints": TableSpec(MEDIA_FINGERPRINT_COLUMNS, ("content_sha256", "hash_version")),
+    # One row per Slack file, NOT per (file, conversation) share: the same
+    # upload cross-posted into five channels is one set of bytes and one
+    # download. The perceptual hash lives in media_fingerprints, keyed by
+    # the content sha this table resolves.
+    "slack_file_fingerprints": TableSpec(
+        SLACK_FILE_FINGERPRINT_COLUMNS,
+        ("account", "team_id", "file_id"),
+    ),
     "chatgpt_events": TableSpec(
         AGENT_SESSION_EVENT_COLUMNS,
         ("source", "session_id", "event_uuid"),
@@ -1353,6 +1362,10 @@ def _is_numeric_column(table: str | None, column: str) -> bool:
 TIMESTAMP_COLUMNS = {
     # receipts: the last transaction research attempt drives its retry window
     "last_attempt_at",
+    # slack file fingerprints: when the backoff lets this file be retried.
+    # Every warehouse column is NOT NULL, so a terminal row carries the epoch
+    # sentinel rather than NULL ("no retry scheduled").
+    "next_attempt_at",
     "internal_date",
     "synced_at",
     "updated_at",
@@ -1424,6 +1437,9 @@ TIMESTAMP_COLUMNS = {
 
 INTEGER_COLUMNS = {
     "seq",
+    # slack file fingerprints: retry counter and downloaded size
+    "attempts",
+    "fetched_bytes",
     # receipts: boolean-ish flags and counters stored as bigint like the
     # rest of the warehouse's is_* columns
     "is_purchase_record",
@@ -3499,6 +3515,11 @@ class PostgresWarehouse:
                 "slack_conversation_stats",
                 "slack_message_reactions",
                 "slack_files",
+                # The fingerprint link table provisions with the rest of Slack
+                # so a fresh warehouse has it; the asset's narrower
+                # ensure_slack_file_fingerprint_tables() is a subset of this.
+                "slack_file_fingerprints",
+                "media_fingerprints",
                 "slack_sync_state",
                 "slack_account_state_item_rows",
             ]
@@ -3506,6 +3527,7 @@ class PostgresWarehouse:
         self._ensure_slack_conversation_stats_backfilled()
         self._ensure_slack_sync_state_gone_reclassified()
         self._ensure_clean_slack_inbox_view()
+        self._ensure_slack_image_fingerprint_view()
         self._ensure_search_views_if_possible()
 
     def ensure_upstream_mutation_tables(self) -> None:
@@ -6471,6 +6493,132 @@ class PostgresWarehouse:
 
     def insert_slack_files(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("slack_files", rows, SLACK_FILE_COLUMNS)
+
+    # --- Slack image fingerprints ------------------------------------------
+    #
+    # "Who sent this image?" needs three things joined: the perceptual hash
+    # (shared with photos), the Slack file row, and the uploader's identity.
+    # The last one is what the 2026-08-16 agent never joined, so the marts view
+    # resolves it rather than leaving it to the caller.
+
+    def ensure_slack_file_fingerprint_tables(self) -> None:
+        self._ensure_table_group(
+            ["slack_files", "slack_users", "slack_conversations", "slack_file_fingerprints", "media_fingerprints"]
+        )
+        self._ensure_slack_image_fingerprint_view()
+
+    def _ensure_slack_image_fingerprint_view(self) -> None:
+        self._ensure_view(
+            "slack_image_fingerprints",
+            """
+            CREATE OR REPLACE VIEW @slack_image_fingerprints AS
+            SELECT
+                f.account,
+                f.team_id,
+                f.file_id,
+                f.conversation_id,
+                f.message_ts,
+                f.name,
+                f.title,
+                f.mimetype,
+                f.filetype,
+                f.size,
+                f.created_at,
+                f.is_deleted,
+                f.url_private,
+                f.user_id AS uploader_user_id,
+                COALESCE(u.display_name, '') AS uploader_display_name,
+                COALESCE(u.real_name, '') AS uploader_real_name,
+                COALESCE(u.name, '') AS uploader_name,
+                COALESCE(u.email, '') AS uploader_email,
+                COALESCE(u.is_bot, 0) AS uploader_is_bot,
+                COALESCE(c.name, '') AS conversation_name,
+                COALESCE(
+                    NULLIF(c.conversation_type, ''),
+                    CASE
+                        WHEN c.is_im = 1 THEN 'im'
+                        WHEN c.is_mpim = 1 THEN 'mpim'
+                        WHEN c.is_group = 1 THEN 'group'
+                        WHEN c.is_channel = 1 THEN 'channel'
+                        ELSE ''
+                    END
+                ) AS conversation_kind,
+                COALESCE(c.is_private, 0) AS conversation_is_private,
+                l.content_sha256,
+                l.fetched_bytes,
+                m.hash_version,
+                m.dhash,
+                m.width,
+                m.height
+            FROM @slack_files f
+            JOIN @slack_file_fingerprints l
+                ON l.account = f.account AND l.team_id = f.team_id AND l.file_id = f.file_id
+            JOIN @media_fingerprints m
+                ON m.content_sha256 = l.content_sha256 AND m.hash_version = l.hash_version
+            LEFT JOIN @slack_users u
+                ON u.account = f.account AND u.team_id = f.team_id AND u.user_id = f.user_id
+            LEFT JOIN @slack_conversations c
+                ON c.account = f.account AND c.team_id = f.team_id
+                AND c.conversation_id = f.conversation_id
+            WHERE l.status = 'ok' AND l.content_sha256 <> ''
+            """,
+        )
+
+    def slack_file_fingerprint_candidates(
+        self, *, limit: int, now: datetime, max_attempts: int = 5
+    ) -> list[dict[str, Any]]:
+        """Slack image files still needing a fingerprint, newest first.
+
+        Newest-first because recency is what people actually ask about, and it
+        makes a bounded slice immediately useful instead of useful only once the
+        whole 552 GB backlog is done.
+
+        The GROUP BY collapses a file shared into several conversations to one
+        candidate: same bytes, one download.
+
+        Scaling note: this walks the ``created_at DESC`` index and skips rows
+        already recorded, so the cost of finding new work grows with the size of
+        the finished set. That is fine at this corpus size (index scan plus
+        primary-key probes); if it ever stops being fine, the fix is a
+        high-water mark for the incremental half plus a separate descending
+        backfill cursor, not a bigger limit.
+        """
+        rows = self._query_dicts(
+            """
+            SELECT
+                f.account,
+                f.team_id,
+                f.file_id,
+                max(f.url_private) AS url_private,
+                max(f.mimetype) AS mimetype,
+                max(f.name) AS name,
+                max(f.size) AS size,
+                max(f.created_at) AS created_at,
+                COALESCE(max(l.attempts), 0) AS attempts
+            FROM @slack_files f
+            LEFT JOIN @slack_file_fingerprints l
+                ON l.account = f.account AND l.team_id = f.team_id AND l.file_id = f.file_id
+            WHERE f.mimetype LIKE %s
+              AND f.is_deleted = 0
+              AND f.url_private <> ''
+              AND (
+                    l.file_id IS NULL
+                    OR (
+                        l.status NOT IN ('ok', 'undecodable', 'too_large')
+                        AND l.attempts < %s
+                        AND (l.next_attempt_at IS NULL OR l.next_attempt_at <= %s)
+                    )
+              )
+            GROUP BY f.account, f.team_id, f.file_id
+            ORDER BY max(f.created_at) DESC
+            LIMIT %s
+            """,
+            ("image/%", int(max_attempts), now, int(limit)),
+        )
+        return rows
+
+    def upsert_slack_file_fingerprints(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("slack_file_fingerprints", rows, SLACK_FILE_FINGERPRINT_COLUMNS)
 
     def rebuild_slack_conversation_stats(self, *, account: str | None = None, team_id: str | None = None) -> None:
         if team_id is not None and account is None:

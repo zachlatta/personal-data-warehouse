@@ -1129,6 +1129,35 @@ MEDIA_FINGERPRINT_COLUMNS = (
     "sync_version",
 )
 
+# Slack file -> content sha link (derived_slack.file_fingerprints).
+#
+# base_slack.files cannot carry a content sha: a sha is only knowable after
+# downloading the bytes, and the bytes live behind an authenticated
+# files.slack.com URL. This table records the download's outcome so the
+# ~905k-image / ~552 GB corpus can be walked in bounded, resumable slices --
+# it IS the backfill cursor. The perceptual hash itself goes in the shared
+# derived_enrichment.media_fingerprints table, keyed by that sha.
+#
+# The bytes are deliberately never stored: caching them would cost ~3000x what
+# the "who sent this image?" answer needs, and the bytes stay one on-demand
+# fetch away via url_private.
+SLACK_FILE_FINGERPRINT_COLUMNS = (
+    "account",
+    "team_id",
+    "file_id",
+    "content_sha256",
+    "hash_version",
+    "status",
+    "attempts",
+    "fetched_bytes",
+    "last_error",
+    "last_attempt_at",
+    "next_attempt_at",
+    "created_at",
+    "updated_at",
+    "sync_version",
+)
+
 AGENT_RUN_COLUMNS = (
     "run_id",
     "provider",
