@@ -1937,6 +1937,28 @@
       }
     },
     {
+      "id": "search_text_preview",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "search_text_preview",
+      "discoverable": false,
+      "query_access": "execute_only",
+      "secret": false
+    },
+    {
+      "id": "timeline_context",
+      "kind": "function",
+      "layer": "timeline",
+      "domain": "timeline",
+      "schema": "timeline",
+      "name": "context",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "gmail_sync_state",
       "kind": "table",
       "layer": "ops",

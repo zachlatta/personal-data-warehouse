@@ -182,6 +182,8 @@ var Objects = []CatalogObject{
 	{ID: "search_text", Kind: "function", Layer: "timeline", Domain: "timeline", Schema: "timeline", Name: "search_text", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "search_text_exact", Kind: "function", Layer: "timeline", Domain: "timeline", Schema: "timeline", Name: "search_text_exact", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "search_text_sources", Kind: "function", Layer: "timeline", Domain: "timeline", Schema: "timeline", Name: "search_text_sources", Discoverable: true, QueryAccess: "public", Secret: false},
+	{ID: "search_text_preview", Kind: "function", Layer: "internal", Domain: "internal", Schema: "internal", Name: "search_text_preview", Discoverable: false, QueryAccess: "execute_only", Secret: false},
+	{ID: "timeline_context", Kind: "function", Layer: "timeline", Domain: "timeline", Schema: "timeline", Name: "context", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "gmail_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "gmail_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false},
 	{ID: "gmail_attachment_backfill_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "gmail_attachment_backfill_state", Discoverable: false, QueryAccess: "denied", Secret: false},
 	{ID: "calendar_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "google_calendar_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false},

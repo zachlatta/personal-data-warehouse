@@ -190,7 +190,43 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("transcript", ("voice_memo",), "t.kind"),
     ("warehouse", ("enrichment_run",), "t.kind"),
     ("whatsapp", ("whatsapp_message",), "t.kind"),
+    ("whoop", ("whoop_cycle", "whoop_recovery", "whoop_sleep", "whoop_workout"), "t.kind"),
 )
+# Familiar-name aliases the search functions accept for `sources` tokens. The
+# canonical tokens are terse and diverge from every other name in the warehouse
+# ('imessage' not 'apple_messages', 'note' not 'apple_notes', 'transcript' not
+# 'voice_memos'), and production agent sessions show the same wrong guesses
+# recurring for months. An alias resolves to its canonical token before
+# validation; anything not in this map and not a canonical token still raises.
+# Every key must stay disjoint from the canonical token set (test-enforced).
+SEARCH_SOURCE_ALIASES: dict[str, str] = {
+    "agent_sessions": "agent_session",
+    "apple_message": "imessage",
+    "apple_messages": "imessage",
+    "apple_note": "note",
+    "apple_notes": "note",
+    "calendar_event": "calendar",
+    "calendar_events": "calendar",
+    "contacts": "contact",
+    "drive": "google_drive",
+    "email": "gmail",
+    "emails": "gmail",
+    "gdrive": "google_drive",
+    "imessages": "imessage",
+    "mutation_requests": "mutation_request",
+    "mutations": "mutation",
+    "notes": "note",
+    "photos": "photo",
+    "slack_files": "slack_file",
+    "transcripts": "transcript",
+    "voice_memo": "transcript",
+    "voice_memos": "transcript",
+    "whatsapp_media": "whatsapp",
+    "whoop_cycle": "whoop",
+    "whoop_recovery": "whoop",
+    "whoop_sleep": "whoop",
+    "whoop_workout": "whoop",
+}
 # Timeline rows every search must exclude, beyond the per-row deleted flag.
 SEARCH_DRIVE_EXCLUSION_SQL = (
     "NOT (t.adapter = 'drive_file' "
@@ -1023,6 +1059,16 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "timeline_events_priority_time_idx",
         "timeline_events",
         "CREATE INDEX IF NOT EXISTS timeline_events_priority_time_idx ON @timeline_events (priority, event_ts DESC, seq DESC)",
+    ),
+    # timeline.context(ref, before, after) walks a hit's neighbors within the
+    # same (source, context) stream — the surrounding chat/channel/thread
+    # messages a search hit needs to be readable without a raw-table drill.
+    # CONCURRENTLY: timeline_events is ~47M rows in production.
+    IndexSpec(
+        "timeline_events_context_time_idx",
+        "timeline_events",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS timeline_events_context_time_idx "
+        "ON @timeline_events (source, context, event_ts DESC, seq DESC)",
     ),
     IndexSpec(
         "timeline_events_search_text_bm25_idx",
@@ -7134,10 +7180,13 @@ class PostgresWarehouse:
             [
                 source,
                 repr(SEARCH_SOURCE_DEFS),
+                repr(sorted(SEARCH_SOURCE_ALIASES.items())),
                 SEARCH_DRIVE_EXCLUSION_SQL,
                 ",".join(sorted(self._SEARCHABLE_TEXT_TABLES)),
                 str(SEARCH_TEXT_SOURCE_FLOOR),
                 str(SEARCH_TEXT_MAX_RESULTS_CAP),
+                str(SEARCH_TEXT_PREVIEW_CHARS),
+                str(SEARCH_TEXT_BROAD_PER_BRANCH_CAP),
             ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -7163,17 +7212,22 @@ class PostgresWarehouse:
         )
 
     def _search_text_function_exists(self) -> bool:
+        expected = (
+            (self._object_schema("search_text"), "search_text"),
+            (self._object_schema("search_text_exact"), "search_text_exact"),
+            (self._object_schema("search_text_preview"), "search_text_preview"),
+            (self._object_schema("timeline_context"), "context"),
+        )
         rows = self._query(
             """
-            SELECT count(DISTINCT p.proname)
+            SELECT count(DISTINCT (n.nspname, p.proname))
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE p.proname IN ('search_text', 'search_text_exact')
-              AND n.nspname = %s
+            WHERE (n.nspname, p.proname) IN %s
             """,
-            (self._object_schema("search_text"),),
+            (expected,),
         )
-        return bool(rows) and int(rows[0][0]) == 2
+        return bool(rows) and int(rows[0][0]) == len(expected)
 
     def _ensure_search_text_function(self) -> None:
         # search_text() is the default RANKED cross-source search path and
@@ -7218,7 +7272,9 @@ class PostgresWarehouse:
                 "t.context AS context, t.actor AS who, t.event_ts AS occurred_at, "
                 "COALESCE(t.source_pk->>'account', t.metadata->>'account', '') AS account, "
                 "t.adapter || ':' || t.event_id AS ref, t.search_text AS text, "
-                f"({rank})::real AS score FROM @timeline_events t "
+                f"({rank})::real AS score, t.title AS title, "
+                "t.source_table AS source_table, t.source_pk AS source_pk "
+                "FROM @timeline_events t "
                 f"WHERE {where_sql} ORDER BY {rank} LIMIT %2$s )"
             )
 
@@ -7249,6 +7305,26 @@ class PostgresWarehouse:
             + subsource_whens
             + "\n                    ELSE t.kind\n                END"
         )
+        # Familiar-name aliases resolve to canonical tokens before validation,
+        # in both functions, so 'apple_messages' works instead of round-tripping
+        # a RAISE at the caller. Generated as a CASE from SEARCH_SOURCE_ALIASES.
+        alias_whens = "\n                            ".join(
+            f"WHEN '{alias}' THEN '{token}'"
+            for alias, token in sorted(SEARCH_SOURCE_ALIASES.items())
+        )
+        alias_case = (
+            "CASE s.token\n                            "
+            + alias_whens
+            + "\n                            ELSE s.token\n                        END"
+        )
+        sources_alias_sql = (
+            "IF sources IS NOT NULL THEN\n"
+            "                    sources := ARRAY(\n"
+            "                        SELECT " + alias_case + "\n"
+            "                        FROM unnest(sources) AS s(token)\n"
+            "                    );\n"
+            "                END IF;"
+        )
         # The per-branch row cast below lives inside a SQL string literal, which
         # relation expansion deliberately leaves alone, so it has to be written
         # schema-qualified here. An unqualified `::text_hit` resolved — through
@@ -7258,9 +7334,25 @@ class PostgresWarehouse:
         # them (the per-branch guard swallows the type lookup error).
         hit_type_sql = self.sql_relation("search_text_hit")
         hit_type_literal = hit_type_sql.replace("'", "''")
+        preview_fn_sql = self.sql_relation("search_text_preview")
+        # The hit type carries drill-down columns (event_ts mirrors occurred_at
+        # because agents copy timeline.events column lists into search calls;
+        # title/source_table/source_pk make a hit one hop from its source row).
+        # Reshaping a composite type in place is impossible, so a shape change
+        # drops it WITH CASCADE (the only dependents are the search functions,
+        # recreated immediately below) and recreates.
+        hit_type_columns_sql = (
+            "source text, subsource text, context text, who text, "
+            "occurred_at timestamptz, account text, ref text, "
+            "text text, score real, event_ts timestamptz, title text, "
+            "source_table text, source_pk jsonb"
+        )
+        hit_type_attr_count = len(hit_type_columns_sql.split(","))
         self._command(
             r"""
             DO $do$
+            DECLARE
+                hit_attr_count integer;
             BEGIN
                 IF to_regtype('"""
             + hit_type_literal
@@ -7268,13 +7360,77 @@ class PostgresWarehouse:
                     CREATE TYPE """
             + hit_type_sql
             + r""" AS (
-                        source text, subsource text, context text, who text,
-                        occurred_at timestamptz, account text, ref text,
-                        text text, score real
+                        """
+            + hit_type_columns_sql
+            + r"""
                     );
+                ELSE
+                    SELECT count(*) INTO hit_attr_count
+                    FROM pg_attribute
+                    WHERE attrelid = to_regclass('"""
+            + hit_type_literal
+            + r"""')
+                      AND attnum > 0 AND NOT attisdropped;
+                    IF hit_attr_count IS DISTINCT FROM """
+            + str(hit_type_attr_count)
+            + r""" THEN
+                        DROP TYPE """
+            + hit_type_sql
+            + r""" CASCADE;
+                        CREATE TYPE """
+            + hit_type_sql
+            + r""" AS (
+                            """
+            + hit_type_columns_sql
+            + r"""
+                        );
+                    END IF;
                 END IF;
             END
             $do$;
+            -- Relevance preview: window the returned text around the first
+            -- occurrence of any query term instead of cutting the head of the
+            -- document. A head cut routinely misses the matched span in large
+            -- documents (Drive extracts, transcripts), which made true hits
+            -- read as false positives and pushed agents back to raw-table
+            -- scans. Terms the tokenizer stemmed away simply fall back to the
+            -- head cut. IMMUTABLE PARALLEL SAFE so the planner can pre-evaluate
+            -- and parallelize freely.
+            CREATE OR REPLACE FUNCTION @search_text_preview(doc text, query text)
+            RETURNS text
+            LANGUAGE sql
+            IMMUTABLE
+            PARALLEL SAFE
+            AS $preview$
+                SELECT CASE
+                    WHEN doc IS NULL OR length(doc) <= """
+            + str(SEARCH_TEXT_PREVIEW_CHARS)
+            + r""" THEN doc
+                    ELSE COALESCE(
+                        (
+                            SELECT substring(
+                                doc
+                                FROM greatest(min(strpos(lowdoc.d, term.t)) - """
+            + str(SEARCH_TEXT_PREVIEW_CHARS // 2)
+            + r""", 1)
+                                FOR """
+            + str(SEARCH_TEXT_PREVIEW_CHARS)
+            + r""")
+                            FROM (SELECT lower(doc) AS d) lowdoc
+                            CROSS JOIN (
+                                SELECT DISTINCT lower(m[1]) AS t
+                                FROM regexp_matches(coalesce(query, ''), '[[:alnum:]][[:alnum:]@._+-]*', 'g') AS m
+                                WHERE length(m[1]) >= 3
+                                LIMIT 8
+                            ) term
+                            WHERE strpos(lowdoc.d, term.t) > 0
+                        ),
+                        left(doc, """
+            + str(SEARCH_TEXT_PREVIEW_CHARS)
+            + r""")
+                    )
+                END
+            $preview$;
             CREATE OR REPLACE FUNCTION @search_text(
                 query text,
                 max_results integer DEFAULT 50,
@@ -7310,7 +7466,13 @@ class PostgresWarehouse:
                 branch_idx integer;
                 hits @search_text_hit[] := '{}';
                 branch_hits @search_text_hit[];
+                executed_branches integer := 0;
+                failed_sources text[] := '{}';
+                first_branch_error text;
             BEGIN
+                """
+            + sources_alias_sql
+            + r"""
                 IF sources IS NOT NULL THEN
                     FOREACH branch_source IN ARRAY sources LOOP
                         IF NOT branch_source = ANY (branch_sources) THEN
@@ -7325,12 +7487,14 @@ class PostgresWarehouse:
                         CONTINUE;
                     END IF;
                     branch := branch_sqls[branch_idx];
+                    executed_branches := executed_branches + 1;
                     BEGIN
                         EXECUTE format(
                             'SELECT array_agg(ROW(x.source, x.subsource, x.context, '
-                            'x.who, x.occurred_at, x.account, x.ref, left(x.text, """
-            + str(SEARCH_TEXT_PREVIEW_CHARS)
-            + r"""), x.score)::"""
+                            'x.who, x.occurred_at, x.account, x.ref, """
+            + preview_fn_sql
+            + r"""(x.text, %1$L), x.score, x.occurred_at, x.title, '
+                            'x.source_table, x.source_pk)::"""
             + hit_type_sql
             + r""") FROM (' || branch || ') x',
                             query, per_branch_limit, since
@@ -7339,13 +7503,33 @@ class PostgresWarehouse:
                             hits := hits || branch_hits;
                         END IF;
                     EXCEPTION WHEN OTHERS THEN
-                        NULL;
+                        -- A branch failure must never be silent: an empty
+                        -- result that is really a broken branch reads as "no
+                        -- matches" and has caused multi-day silent outages.
+                        -- Degrade with a WARNING while other branches still
+                        -- work (mid-deploy index builds), but if every branch
+                        -- failed the search layer itself is broken — raise.
+                        failed_sources := failed_sources || branch_source;
+                        IF first_branch_error IS NULL THEN
+                            first_branch_error := SQLERRM;
+                        END IF;
                     END;
                 END LOOP;
+                IF coalesce(array_length(failed_sources, 1), 0) > 0 THEN
+                    IF array_length(failed_sources, 1) = executed_branches THEN
+                        RAISE EXCEPTION 'search_text: every source branch failed; first error: %', first_branch_error
+                            USING HINT = 'the timeline search layer is broken or mid-deploy — this is NOT an empty result';
+                    END IF;
+                    RAISE WARNING 'search_text: % source branch(es) failed (%) and are missing from results; first error: %',
+                        array_length(failed_sources, 1),
+                        array_to_string(failed_sources, ', '),
+                        first_branch_error;
+                END IF;
                 RETURN QUERY
                     WITH ranked AS (
                         SELECT h.source, h.subsource, h.context, h.who, h.occurred_at,
                                h.account, h.ref, h.text, h.score,
+                               h.event_ts, h.title, h.source_table, h.source_pk,
                                row_number() OVER (
                                    PARTITION BY h.source ORDER BY h.score ASC NULLS LAST
                                ) AS src_rank
@@ -7355,7 +7539,8 @@ class PostgresWarehouse:
                           AND h.score < 0
                     )
                     SELECT r.source, r.subsource, r.context, r.who, r.occurred_at,
-                           r.account, r.ref, r.text, r.score
+                           r.account, r.ref, r.text, r.score,
+                           r.event_ts, r.title, r.source_table, r.source_pk
                     FROM ranked r
                     ORDER BY (r.src_rank > """
             + str(SEARCH_TEXT_SOURCE_FLOOR)
@@ -7378,13 +7563,27 @@ class PostgresWarehouse:
             + str(SEARCH_TEXT_MAX_RESULTS_CAP)
             + r""");
                 needle text := trim(coalesce(query, ''));
+                -- Machine-token variants. Agents paste amounts/phone numbers in
+                -- whatever formatting the copy source used, then probe format
+                -- variants by hand ('1,441.52' vs '1441.52'). Match a small set
+                -- of deterministic variants of the needle in one call instead:
+                -- needle_b strips thousands separators; needle_c inserts them
+                -- (plain >=4-digit numbers) or strips phone punctuation.
+                needle_b text;
+                needle_c text;
+                grouped text;
                 pattern text;
+                pattern_b text;
+                pattern_c text;
                 requested_source text;
             BEGIN
                 IF length(needle) < 3 THEN
                     RAISE EXCEPTION 'search_text_exact: query must be at least 3 characters'
                         USING HINT = 'substring search needs >= 3 characters for the trigram index; use search_text() for ranked keyword search';
                 END IF;
+                """
+            + sources_alias_sql
+            + r"""
                 IF sources IS NOT NULL THEN
                     FOREACH requested_source IN ARRAY sources LOOP
                         IF NOT requested_source = ANY (ARRAY[
@@ -7397,7 +7596,26 @@ class PostgresWarehouse:
                         END IF;
                     END LOOP;
                 END IF;
+                needle_b := regexp_replace(needle, '([0-9]),([0-9])', '\1\2', 'g');
+                IF length(needle_b) < 3 THEN
+                    needle_b := needle;
+                END IF;
+                needle_c := needle;
+                IF needle ~ '^[0-9]{4,}([.][0-9]+)?$' THEN
+                    LOOP
+                        grouped := regexp_replace(needle_c, '([0-9])([0-9]{3})([.,]|$)', '\1,\2\3');
+                        EXIT WHEN grouped = needle_c;
+                        needle_c := grouped;
+                    END LOOP;
+                ELSIF needle ~ '^\+?[0-9() .-]{7,}$' THEN
+                    needle_c := regexp_replace(needle, '[^0-9]', '', 'g');
+                    IF length(needle_c) < 3 THEN
+                        needle_c := needle;
+                    END IF;
+                END IF;
                 pattern := '%' || replace(replace(replace(needle, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+                pattern_b := '%' || replace(replace(replace(needle_b, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+                pattern_c := '%' || replace(replace(replace(needle_c, '\', '\\'), '%', '\%'), '_', '\_') || '%';
                 RETURN QUERY
                     SELECT hit.source, hit.subsource, hit.context, hit.who,
                            hit.occurred_at, hit.account, hit.ref,
@@ -7410,14 +7628,20 @@ class PostgresWarehouse:
             + r""" THEN hit.text
                                ELSE substring(
                                    hit.text
-                                   FROM greatest(position(lower(needle) IN lower(hit.text)) - """
+                                   FROM greatest(COALESCE(
+                                       NULLIF(position(lower(needle) IN ld.lowdoc), 0),
+                                       NULLIF(position(lower(needle_b) IN ld.lowdoc), 0),
+                                       NULLIF(position(lower(needle_c) IN ld.lowdoc), 0),
+                                       1) - """
             + str(SEARCH_TEXT_PREVIEW_CHARS // 2)
             + r""", 1)
                                    FOR """
             + str(SEARCH_TEXT_PREVIEW_CHARS)
             + r""")
                            END AS text,
-                           hit.score
+                           hit.score,
+                           hit.occurred_at AS event_ts, hit.title,
+                           hit.source_table, hit.source_pk
                     FROM (
                         SELECT map.source AS source,
                                """
@@ -7428,12 +7652,16 @@ class PostgresWarehouse:
                                COALESCE(t.source_pk->>'account', t.metadata->>'account', '') AS account,
                                t.adapter || ':' || t.event_id AS ref,
                                t.search_text AS text,
-                               NULL::real AS score
+                               NULL::real AS score,
+                               t.title AS title, t.source_table AS source_table,
+                               t.source_pk AS source_pk
                         FROM @timeline_events t
                         JOIN (VALUES """
             + adapter_source_values
             + r""") AS map(adapter, source) ON map.adapter = t.adapter
-                        WHERE t.search_text ILIKE pattern
+                        WHERE (t.search_text ILIKE pattern
+                               OR t.search_text ILIKE pattern_b
+                               OR t.search_text ILIKE pattern_c)
                           AND t.search_text != ''
                           AND NOT COALESCE((t.metadata->>'deleted')::boolean, false)
                           AND """
@@ -7444,6 +7672,14 @@ class PostgresWarehouse:
                         ORDER BY t.event_ts DESC
                         LIMIT per_source
                     ) hit
+                    CROSS JOIN LATERAL (
+                        SELECT CASE
+                            WHEN length(hit.text) <= """
+            + str(SEARCH_TEXT_PREVIEW_CHARS)
+            + r""" THEN ''
+                            ELSE lower(hit.text)
+                        END AS lowdoc
+                    ) ld
                     ORDER BY hit.occurred_at DESC;
             END;
             $fn$;
@@ -7458,6 +7694,63 @@ class PostgresWarehouse:
             + r""") AS s(source)
                 ORDER BY s.source
             $sources$;
+            -- timeline.context(ref, before, after): the surrounding events of
+            -- one timeline row, within the same (source, context) stream — the
+            -- neighboring chat/channel/thread messages a search hit needs to
+            -- be readable. `ref` is exactly what search_text()/search_text_exact()
+            -- return ('<adapter>:<event_id>'), so a hit terminates in one hop
+            -- instead of a raw-table drill. Served by
+            -- timeline_events_context_time_idx.
+            CREATE OR REPLACE FUNCTION @timeline_context(
+                ref text,
+                before integer DEFAULT 5,
+                after integer DEFAULT 5
+            )
+            RETURNS SETOF @timeline_events
+            LANGUAGE plpgsql
+            STABLE
+            AS $ctx$
+            DECLARE
+                anchor @timeline_events%ROWTYPE;
+                ref_adapter text := split_part(coalesce(ref, ''), ':', 1);
+                ref_event_id text;
+                n_before integer := least(greatest(coalesce(before, 5), 0), 50);
+                n_after integer := least(greatest(coalesce(after, 5), 0), 50);
+            BEGIN
+                IF position(':' IN coalesce(ref, '')) = 0 THEN
+                    RAISE EXCEPTION 'context: ref must look like <adapter>:<event_id>, got %', ref
+                        USING HINT = 'pass the ref column returned by search_text()/search_text_exact()';
+                END IF;
+                ref_event_id := substring(ref FROM length(ref_adapter) + 2);
+                SELECT * INTO anchor FROM @timeline_events t
+                WHERE t.adapter = ref_adapter AND t.event_id = ref_event_id;
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'context: no timeline event for ref %', ref
+                        USING HINT = 'refs come from search_text()/search_text_exact() as <adapter>:<event_id>';
+                END IF;
+                RETURN QUERY
+                    SELECT w.* FROM (
+                        (
+                            SELECT t.* FROM @timeline_events t
+                            WHERE t.source = anchor.source
+                              AND t.context = anchor.context
+                              AND (t.event_ts, t.seq) < (anchor.event_ts, anchor.seq)
+                            ORDER BY t.event_ts DESC, t.seq DESC
+                            LIMIT n_before
+                        )
+                        UNION ALL
+                        (
+                            SELECT t.* FROM @timeline_events t
+                            WHERE t.source = anchor.source
+                              AND t.context = anchor.context
+                              AND (t.event_ts, t.seq) >= (anchor.event_ts, anchor.seq)
+                            ORDER BY t.event_ts ASC, t.seq ASC
+                            LIMIT n_after + 1
+                        )
+                    ) w
+                    ORDER BY w.event_ts ASC, w.seq ASC;
+            END;
+            $ctx$;
             """
         )
         # to_bm25query() resolves the timeline BM25 index by NAME, and the

@@ -2170,11 +2170,11 @@ def test_search_text_sources_lists_accepted_filter_tokens(warehouse: PostgresWar
 def test_search_text_rejects_unknown_source_tokens(warehouse: PostgresWarehouse) -> None:
     # An unknown `sources` token must RAISE (pointing the caller at
     # search_text_sources()), NOT silently return nothing. The accepted tokens
-    # are terse and differ from some table/source names, so callers reliably guess
-    # wrong ('apple_messages'/'file_attachment'/'whatsapp_media' instead of the
-    # real timeline search tokens like 'imessage'/'gmail'/'whatsapp'). A silent empty result reads
-    # as "nothing matched" and yields confident wrong answers; the failure must
-    # be loud and self-correcting.
+    # are terse and differ from some table/source names; the recurring wrong
+    # guesses ('apple_messages', 'voice_memos', ...) resolve through
+    # SEARCH_SOURCE_ALIASES instead of erroring, but anything outside the alias
+    # map and the canonical tokens must stay loud: a silent empty result reads
+    # as "nothing matched" and yields confident wrong answers.
     if not _pg_textsearch_usable(warehouse):
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
 
@@ -2182,7 +2182,7 @@ def test_search_text_rejects_unknown_source_tokens(warehouse: PostgresWarehouse)
     warehouse._set_search_path()
 
     with pytest.raises(psycopg2.Error, match="unknown source"):
-        warehouse._query("SELECT * FROM @search_text('zzqqxx', 5, ARRAY['apple_messages'])")
+        warehouse._query("SELECT * FROM @search_text('zzqqxx', 5, ARRAY['file_attachment'])")
 
     # A mix of one valid and one invalid token still raises (no partial silent
     # drop of the unknown one).
@@ -2191,6 +2191,57 @@ def test_search_text_rejects_unknown_source_tokens(warehouse: PostgresWarehouse)
 
     # A valid token is unaffected.
     warehouse._query("SELECT count(*) FROM @search_text('zzqqxx', 5, ARRAY['imessage'])")
+
+
+def test_search_source_aliases_are_disjoint_from_canonical_tokens() -> None:
+    # Every alias must map onto a canonical token and never shadow one:
+    # a key that equals a canonical token would silently rewrite a valid
+    # request, and a value outside the token set would raise at call time.
+    import personal_data_warehouse.postgres as postgres_module
+
+    tokens = {source for source, _, _ in postgres_module.SEARCH_SOURCE_DEFS}
+    aliases = postgres_module.SEARCH_SOURCE_ALIASES
+    assert not set(aliases) & tokens, "aliases must not shadow canonical tokens"
+    assert set(aliases.values()) <= tokens, "every alias must resolve to a canonical token"
+
+
+def test_search_text_accepts_source_aliases(warehouse: PostgresWarehouse) -> None:
+    # Production sessions guess warehouse-familiar names ('apple_messages',
+    # 'voice_memos', 'contacts') for the terse source tokens over and over.
+    # Both search functions resolve those aliases instead of round-tripping a
+    # RAISE at the caller.
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    for alias in ("apple_messages", "voice_memos", "contacts", "drive", "whoop_sleep"):
+        warehouse._query("SELECT count(*) FROM @search_text('zzqqxx', 5, ARRAY[%s])", (alias,))
+        warehouse._query(
+            "SELECT count(*) FROM @search_text_exact('zzqqxx', 5, ARRAY[%s])", (alias,)
+        )
+
+    # Aliased and canonical requests hit the same branch.
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=message_datetime,
+                text="quokka sighting on the wallaby trail",
+            )
+        ]
+    )
+    _sync_timeline(warehouse)
+    canonical = warehouse._query(
+        "SELECT ref FROM @search_text('quokka', 5, ARRAY['slack']) WHERE score < 0"
+    )
+    assert canonical, "expected the canonical token to match the fixture"
 
 
 def test_search_text_exact_finds_literal_phrases(warehouse: PostgresWarehouse) -> None:
@@ -2243,7 +2294,7 @@ def test_search_text_exact_finds_literal_phrases(warehouse: PostgresWarehouse) -
         == []
     )
     with pytest.raises(psycopg2.Error, match="unknown source"):
-        warehouse._query("SELECT * FROM @search_text_exact('zzqqxx', 5, ARRAY['apple_messages'])")
+        warehouse._query("SELECT * FROM @search_text_exact('zzqqxx', 5, ARRAY['file_attachment'])")
 
     # LIKE wildcards in the needle are literal characters, not patterns.
     assert warehouse._query("SELECT * FROM @search_text_exact('roll%cadence', 10)") == []
@@ -2260,6 +2311,221 @@ def test_search_text_exact_finds_literal_phrases(warehouse: PostgresWarehouse) -
         )
         == []
     )
+
+
+def test_search_text_exact_matches_number_format_variants(warehouse: PostgresWarehouse) -> None:
+    # Agents paste machine tokens in whatever format the copy source used and
+    # then probe variants by hand ('1,441.52' AND '1441.52'; full phone AND
+    # fragments — both observed in production sessions). Exact search matches
+    # deterministic formatting variants of the needle in one call: thousands
+    # separators both ways, and phone punctuation stripped.
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=message_datetime,
+                text="invoice total came to 1,441.52 for the venue",
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.2",
+                message_datetime=message_datetime,
+                text="wire exactly 2716.09 by friday",
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.3",
+                message_datetime=message_datetime,
+                text="text me at +14155163303 when you land",
+            ),
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    # Needle without separators finds the comma-formatted document.
+    rows = warehouse._query("SELECT text FROM @search_text_exact('1441.52', 10)")
+    assert len(rows) == 1 and "1,441.52" in rows[0][0]
+    # Needle with separators finds the plain document.
+    rows = warehouse._query("SELECT text FROM @search_text_exact('2,716.09', 10)")
+    assert len(rows) == 1 and "2716.09" in rows[0][0]
+    # Phone punctuation in the needle is stripped to a digits-only variant.
+    rows = warehouse._query("SELECT text FROM @search_text_exact('(415) 516-3303', 10)")
+    assert len(rows) == 1 and "+14155163303" in rows[0][0]
+    # The verbatim needle still matches exactly.
+    rows = warehouse._query("SELECT text FROM @search_text_exact('1,441.52', 10)")
+    assert len(rows) == 1 and "1,441.52" in rows[0][0]
+
+
+def test_search_text_hits_carry_drilldown_columns(warehouse: PostgresWarehouse) -> None:
+    # A hit must terminate in one hop: event_ts mirrors occurred_at (agents
+    # copy timeline.events column lists into search calls — the #1 recurring
+    # 42703), and title/source_table/source_pk point straight at the source
+    # row without the intermediate timeline.events lookup.
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=message_datetime,
+                text="planning the zanzibar rollout schedule",
+            )
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    rows = warehouse._query(
+        "SELECT occurred_at, event_ts, title, source_table, source_pk"
+        " FROM @search_text('zanzibar', 10) WHERE score < 0"
+    )
+    assert rows, "expected a ranked hit"
+    occurred_at, event_ts, title, source_table, source_pk = rows[0]
+    assert event_ts == occurred_at
+    assert source_table == "slack_messages"
+    assert source_pk and "conversation_id" in source_pk
+    assert title is not None
+
+    exact_rows = warehouse._query(
+        "SELECT occurred_at, event_ts, source_table, source_pk"
+        " FROM @search_text_exact('zanzibar rollout', 10)"
+    )
+    assert exact_rows and exact_rows[0][1] == exact_rows[0][0]
+    assert exact_rows[0][2] == "slack_messages"
+
+
+def test_search_text_windows_ranked_preview_around_match(warehouse: PostgresWarehouse) -> None:
+    # The ranked preview must be windowed around the first query-term match,
+    # not cut from the head of the document: a head cut routinely misses the
+    # matched span in large documents, which made true hits read as false
+    # positives (and was already fixed for search_text_exact).
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    filler = " ".join(f"filler{i}" for i in range(2500))  # far past the preview cap
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=message_datetime,
+                text=f"{filler} the xylocarp shipment arrives tuesday",
+            )
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    rows = warehouse._query("SELECT text FROM @search_text('xylocarp', 10) WHERE score < 0")
+    assert rows, "expected a ranked hit on the long document"
+    assert "xylocarp" in rows[0][0], (
+        "ranked preview must include the matched span, not the head of the document"
+    )
+
+
+def test_search_text_raises_when_every_branch_fails(warehouse: PostgresWarehouse) -> None:
+    # A broken search layer must be loud. The per-branch guard may degrade a
+    # PARTIAL failure (mid-deploy index build) to a WARNING, but when every
+    # branch fails there are no results to degrade to — returning an empty set
+    # here is exactly the silent-outage mode that went unnoticed for 16 days.
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    warehouse._command("DROP INDEX IF EXISTS timeline_events_search_text_bm25_idx")
+    with pytest.raises(psycopg2.Error, match="every source branch failed"):
+        warehouse._query("SELECT * FROM @search_text('zanzibar', 5)")
+
+
+def test_timeline_context_returns_neighboring_events(warehouse: PostgresWarehouse) -> None:
+    # timeline.context(ref, before, after) turns a search hit into a readable
+    # conversation: the surrounding events of the same (source, context)
+    # stream, ordered by time, anchored on the ref the search functions return.
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    base = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1),
+            _slack_conversation_row(conversation_id="C2", conversation_type="private_channel", sync_version=1),
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=base,
+                text="first: agenda for the offsite",
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.2",
+                message_datetime=base + timedelta(minutes=1),
+                text="second: the vexillology budget is approved",
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.3",
+                message_datetime=base + timedelta(minutes=2),
+                text="third: lunch afterwards",
+            ),
+            _slack_message_row(
+                conversation_id="C2",
+                message_ts="200.1",
+                message_datetime=base + timedelta(minutes=1),
+                text="unrelated channel chatter",
+            ),
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    ref_rows = warehouse._query("SELECT ref FROM @search_text_exact('vexillology', 5)")
+    assert ref_rows, "expected the anchor hit"
+    ref = ref_rows[0][0]
+
+    rows = warehouse._query(
+        "SELECT snippet FROM @timeline_context(%s, 5, 5) ORDER BY event_ts, seq", (ref,)
+    )
+    snippets = [row[0] for row in rows]
+    assert len(snippets) == 3, f"expected exactly the three C1 messages, got {snippets}"
+    assert "first" in snippets[0] and "vexillology" in snippets[1] and "third" in snippets[2]
+    assert not any("unrelated" in s for s in snippets)
+
+    # before/after bounds are honored.
+    rows = warehouse._query("SELECT snippet FROM @timeline_context(%s, 0, 1)", (ref,))
+    assert len(rows) == 2
+
+    # A ref that resolves to nothing is loud, not empty.
+    with pytest.raises(psycopg2.Error, match="no timeline event"):
+        warehouse._query("SELECT * FROM @timeline_context('slack_message:nope', 1, 1)")
+    with pytest.raises(psycopg2.Error, match="ref must look like"):
+        warehouse._query("SELECT * FROM @timeline_context('not-a-ref', 1, 1)")
 
 
 def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWarehouse) -> None:
