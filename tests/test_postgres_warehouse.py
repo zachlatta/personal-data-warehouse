@@ -1898,9 +1898,9 @@ def test_search_text_exact_source_tokens_match_ranked_search() -> None:
     import re
 
     sql = _search_text_exact_sql()
-    match = re.search(r"AS map\(adapter, source\)", sql)
+    match = re.search(r"JOIN \(VALUES (.*?)\) AS map\(adapter, source\)", sql, re.DOTALL)
     assert match, "expected search_text_exact() to map adapters to source tokens"
-    tokens = set(re.findall(r"\('[a-z0-9_]+', '([a-z0-9_]+)'\)", sql))
+    tokens = set(re.findall(r"\('[a-z0-9_]+', '([a-z0-9_]+)'\)", match.group(1)))
     assert tokens == set(_search_text_branch_source_labels())
 
 
