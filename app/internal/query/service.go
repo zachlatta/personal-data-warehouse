@@ -1091,7 +1091,7 @@ func textJSONHint(message string) string {
 // the recovery path names the search layer rather than suggesting a retry.
 func statementTimeoutHint(message string) string {
 	if strings.Contains(message, "canceling statement due to statement timeout") {
-		return "(hint: the query exceeded the server's statement budget and a retry will too. Narrow it with selective indexed predicates and LIMIT; for text search use timeline.search_text('needle', 50) for ranked keyword search or timeline.search_text_exact('needle', 50) for literal substrings instead of ILIKE/regex over raw text columns.)"
+		return "(hint: the query exceeded the server's statement budget and a retry will too. Narrow it with selective indexed predicates and LIMIT; for text search use timeline.search_text('needle', 50) for ranked keyword search or timeline.search_text_exact('needle', 50) for literal substrings instead of ILIKE/regex over raw text columns. If the timed-out query WAS a search call, scope it down instead of retrying: pass sources => ARRAY['slack'] and/or since => '2026-01-01', and lower max_results.)"
 	}
 	return ""
 }

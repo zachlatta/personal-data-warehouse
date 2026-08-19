@@ -40,6 +40,7 @@ import argparse
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import logging
 import time
@@ -1357,7 +1358,15 @@ def _contact_update_adapter(*, name: str, source_table: str) -> TimelineAdapter:
         ),
         search_text=_search_concat(
             "t.display_name", "t.organization", "t.job_title", "t.primary_email", "t.primary_phone",
-            "t.notes", "t.emails", "t.phones", "t.addresses", "t.urls", "t.nicknames"
+            "t.notes", "t.emails", "t.phones", "t.addresses", "t.urls", "t.nicknames",
+            # Digits-only phone variants: contacts store phones in display
+            # formatting ('+1 (415) 516-3303'), while searches arrive as
+            # whatever format the copy source used. Appending each number with
+            # its punctuation stripped makes any formatting of the same number
+            # a literal substring hit (search_text_exact strips the needle the
+            # same way).
+            "regexp_replace(t.primary_phone, '[^0-9]', '', 'g')",
+            "regexp_replace(regexp_replace(t.phones::text, '[^0-9\",]', '', 'g'), '[\",]+', ' ', 'g')",
         ),
         # Contact-card churn is sync machinery, not traffic aimed at Zach.
         priority=TIMELINE_PRIORITY_BACKGROUND,
@@ -1708,9 +1717,10 @@ def _agent_session_adapter() -> TimelineAdapter:
     timeline entries.
 
     The GROUP BY aggregates only cheap scalars; first/last text-ish fields
-    (title, first prompt, model, cwd, ...) and the BM25 search document come
-    from per-session LATERAL probes on each source table's (session_id, seq)
-    index so the normalized timeline row can be the primary search hit.
+    (title, first prompt, model, cwd, ...) come from per-session LATERAL
+    probes on each source table's (session_id, seq) index. The session row's
+    search document carries only those headline fields — transcript content
+    is indexed per turn by the agent_session_turn adapter below.
     """
     rollup = f"""
         SELECT
@@ -1737,9 +1747,12 @@ def _agent_session_adapter() -> TimelineAdapter:
                 'repo_url', ru.repo_url,
                 'output_tokens', s.output_tokens
             ))::text AS metadata,
+            -- Headline fields only: the transcript itself is indexed at turn
+            -- granularity by the agent_session_turn adapter, where BM25
+            -- relevance is not diluted across a whole session and the search
+            -- preview lands on the matched turn instead of the transcript head.
             concat_ws(E'\n', NULLIF(st.session_title, ''), NULLIF(fp.text, ''),
-                      NULLIF(cw.cwd, ''), NULLIF(gb.git_branch, ''), NULLIF(ru.repo_url, ''),
-                      NULLIF(tx.transcript_text, '')) AS search_text,
+                      NULLIF(cw.cwd, ''), NULLIF(gb.git_branch, ''), NULLIF(ru.repo_url, '')) AS search_text,
             s.ingest_ts AS ingest_ts,
             -- Interactive vs background (benchmark-tuned, sampling/ 2026-07).
             -- chatgpt/claude_desktop are always human conversations, and some
@@ -1819,12 +1832,6 @@ def _agent_session_adapter() -> TimelineAdapter:
             WHERE e2.source = s.source AND e2.session_id = s.session_id AND e2.repo_url != ''
             ORDER BY e2.seq LIMIT 1
         ) ru ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT string_agg(e2.text, E'\n' ORDER BY e2.seq) AS transcript_text
-            FROM @ai_conversation_events e2
-            WHERE e2.source = s.source AND e2.session_id = s.session_id
-              AND e2.text != '' AND e2.role IN ('user', 'assistant')
-        ) tx ON TRUE
     """
     backfill_sql = f"""
         SELECT * FROM ({rollup.format(changed_join="")}) roll
@@ -1860,6 +1867,73 @@ def _agent_session_adapter() -> TimelineAdapter:
 
 _AGENT_SESSION = _agent_session_adapter()
 
+
+def _agent_session_turn_adapter() -> TimelineAdapter:
+    """One timeline row per user/assistant turn of every agent session.
+
+    The session roll-up above is the browse/priority surface; these rows are
+    the SEARCH surface for transcript content. One row per whole session
+    diluted BM25 relevance across arbitrarily long transcripts and the hit
+    preview routinely missed the matched turn — measured as a primary reason
+    agents fell back to raw-table scans. Turn rows are priority 'background'
+    so they never crowd the browse/priority views; their `context` is
+    '<source>|<session_id>', so timeline.context(ref) pages the surrounding
+    turns of the same session.
+    """
+    select = f"""
+        SELECT
+            concat_ws('|', e.source, e.session_id, e.seq::text) AS event_id,
+            e.source AS source,
+            'agent_turn' AS kind,
+            e.occurred_at AS event_ts,
+            {_EPOCH} AS end_ts,
+            COALESCE(e.role, '') AS actor,
+            COALESCE(left(e.text, {TIMELINE_TITLE_CHARS}), '') AS title,
+            COALESCE(left(e.text, {TIMELINE_SNIPPET_CHARS}), '') AS snippet,
+            concat_ws('|', e.source, e.session_id) AS context,
+            (jsonb_build_object('source', e.source, 'session_id', e.session_id,
+                                'event_uuid', e.event_uuid))::text AS source_pk,
+            (jsonb_build_object('seq', e.seq, 'role', e.role, 'device', e.device,
+                                'session_title', e.session_title))::text AS metadata,
+            concat_ws(E'\n', NULLIF(e.session_title, ''), NULLIF(e.text, '')) AS search_text,
+            e.ingested_at AS ingest_ts,
+            {TIMELINE_PRIORITY_BACKGROUND} AS priority
+        FROM @ai_conversation_events e
+        WHERE e.role IN ('user', 'assistant') AND e.text != ''
+    """
+    backfill_sql = f"""
+        {select}
+          AND e.occurred_at <= %(cursor_ts)s
+          AND (e.occurred_at, concat_ws('|', e.source, e.session_id, e.seq::text))
+              < (%(cursor_ts)s, %(cursor_id)s)
+        ORDER BY 4 DESC, 1 DESC
+        LIMIT %(limit)s
+    """
+    incremental_sql = f"""
+        {select}
+          AND e.ingested_at >= %(watermark_ts)s
+          AND (e.ingested_at, concat_ws('|', e.source, e.session_id, e.seq::text))
+              > (%(watermark_ts)s, %(watermark_id)s)
+        ORDER BY 13 ASC, 1 ASC
+        LIMIT %(limit)s
+    """
+    return TimelineAdapter(
+        name="agent_session_turn",
+        source_table="ai_conversation_events",
+        source="agent_sessions",
+        kind="agent_turn",
+        backfill_sql=backfill_sql,
+        incremental_sql=incremental_sql,
+        max_ingest_sql=(
+            "SELECT max(ingested_at) FROM @ai_conversation_events "
+            "WHERE role IN ('user', 'assistant') AND text != ''"
+        ),
+        batch_size=5000,
+    )
+
+
+_AGENT_SESSION_TURN = _agent_session_turn_adapter()
+
 TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _GMAIL_EMAIL,
     _SLACK_MESSAGE,
@@ -1867,6 +1941,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _APPLE_MESSAGE,
     _WHATSAPP_MESSAGE,
     _AGENT_SESSION,
+    _AGENT_SESSION_TURN,
     _APPLE_NOTE_REVISION,
     _VOICE_MEMO,
     _ALICE_VOICE_RECORDING,
@@ -1893,6 +1968,29 @@ def adapter_by_name(name: str) -> TimelineAdapter:
         if adapter.name == name:
             return adapter
     raise KeyError(name)
+
+
+def adapter_definition_signature(adapter: TimelineAdapter) -> str:
+    """Fingerprint of everything that shapes an adapter's normalized rows.
+
+    Stored per adapter in timeline_sync_state; when the definition changes
+    (new search-document fields, reclassified priority, renamed context) the
+    engine resets that adapter's backfill cursor so already-synced history
+    re-walks and converges to the new shape. The content-guarded upsert makes
+    an unchanged row a no-op, so a reset costs reads, not rewrites.
+    """
+    payload = "\n".join(
+        [
+            adapter.name,
+            adapter.source_table,
+            adapter.source,
+            adapter.kind,
+            adapter.backfill_sql,
+            adapter.incremental_sql,
+            adapter.max_ingest_sql,
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -1984,12 +2082,12 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # AI conversations. The adapter reads the marts_ai_conversations.events
     # union view and emits one row per session, so each source-owned raw table
     # is what actually feeds the timeline.
-    "chatgpt_events": _events("rolled up to one timeline row per conversation"),
-    "claude_desktop_events": _events("rolled up to one timeline row per conversation"),
-    "claude_code_events": _events("rolled up to one timeline row per session"),
-    "codex_events": _events("rolled up to one timeline row per session"),
-    "openclaw_events": _events("rolled up to one timeline row per session"),
-    "pi_events": _events("rolled up to one timeline row per session"),
+    "chatgpt_events": _events("one session roll-up row plus one row per user/assistant turn"),
+    "claude_desktop_events": _events("one session roll-up row plus one row per user/assistant turn"),
+    "claude_code_events": _events("one session roll-up row plus one row per user/assistant turn"),
+    "codex_events": _events("one session roll-up row plus one row per user/assistant turn"),
+    "openclaw_events": _events("one session roll-up row plus one row per user/assistant turn"),
+    "pi_events": _events("one session roll-up row plus one row per user/assistant turn"),
     "chatgpt_sessions": _state("chatgpt.com web-session credential"),
     "chatgpt_conversation_sync": _state("per-conversation poll watermark"),
     "claude_desktop_credentials": _state("claude.ai session credential"),
@@ -2259,7 +2357,7 @@ class TimelineSyncEngine:
                 self._dest_sql(
                     """
                     SELECT backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
-                           watermark_ingest_ts, watermark_event_id
+                           watermark_ingest_ts, watermark_event_id, adapter_signature
                     FROM @timeline_sync_state
                     WHERE adapter = %s
                     """
@@ -2268,13 +2366,31 @@ class TimelineSyncEngine:
             )
             row = cursor.fetchone()
         if row is not None:
-            return _AdapterState(
+            state = _AdapterState(
                 backfill_cursor_ts=row[0],
                 backfill_cursor_id=row[1],
                 backfill_done=bool(row[2]),
                 watermark_ts=row[3],
                 watermark_id=row[4],
             )
+            stored_signature = row[5]
+            if stored_signature != adapter_definition_signature(adapter):
+                # The adapter's normalization SQL changed since this cursor was
+                # written: already-synced history is stale (old search document,
+                # old priority rules, ...). Restart the newest-first backfill so
+                # every row re-walks; the incremental watermark stays put (new
+                # source rows keep flowing while the re-walk converges), and the
+                # content-guarded upsert keeps unchanged rows free.
+                logger.info(
+                    "timeline adapter %s definition changed (or signature unknown); "
+                    "resetting backfill cursor",
+                    adapter.name,
+                )
+                state.backfill_cursor_ts = BACKFILL_CURSOR_START
+                state.backfill_cursor_id = ""
+                state.backfill_done = False
+                self._save_state(adapter, state)
+            return state
         # First contact: start the incremental watermark at the source's
         # current ingestion high-water so incremental only tails NEW rows,
         # and let the backfill (newest-first) load everything already there.
@@ -2298,9 +2414,10 @@ class TimelineSyncEngine:
                     """
                     INSERT INTO @timeline_sync_state (
                         adapter, backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
-                        watermark_ingest_ts, watermark_event_id, last_run_at, last_error, updated_at
+                        watermark_ingest_ts, watermark_event_id, last_run_at, last_error, updated_at,
+                        adapter_signature
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, now(), %s, now())
+                    VALUES (%s, %s, %s, %s, %s, %s, now(), %s, now(), %s)
                     ON CONFLICT (adapter) DO UPDATE SET
                         backfill_cursor_event_ts = EXCLUDED.backfill_cursor_event_ts,
                         backfill_cursor_event_id = EXCLUDED.backfill_cursor_event_id,
@@ -2309,7 +2426,8 @@ class TimelineSyncEngine:
                         watermark_event_id = EXCLUDED.watermark_event_id,
                         last_run_at = now(),
                         last_error = EXCLUDED.last_error,
-                        updated_at = now()
+                        updated_at = now(),
+                        adapter_signature = EXCLUDED.adapter_signature
                     """
                 ),
                 (
@@ -2320,6 +2438,7 @@ class TimelineSyncEngine:
                     state.watermark_ts,
                     state.watermark_id,
                     error,
+                    adapter_definition_signature(adapter),
                 ),
             )
 

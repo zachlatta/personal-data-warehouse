@@ -1650,6 +1650,10 @@ TIMELINE_SYNC_STATE_COLUMNS = (
     "last_run_at",
     "last_error",
     "updated_at",
+    # sha256 of the adapter's normalization SQL at the last sync. A changed
+    # definition resets the backfill cursor so historical rows converge to the
+    # new shape (the content-guarded upsert makes an unchanged row a no-op).
+    "adapter_signature",
 )
 
 # Pipeline freshness snapshot (see personal_data_warehouse/pipeline_health.py).

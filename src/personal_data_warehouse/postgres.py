@@ -169,7 +169,7 @@ SEARCH_TEXT_MAX_RESULTS_CAP = 200
 # expression). Keeping this the single source of truth guarantees ranked and
 # exact search accept the same `sources` vocabulary.
 SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
-    ("agent_session", ("agent_session",), "t.source"),
+    ("agent_session", ("agent_session", "agent_session_turn"), "t.source"),
     ("alice_voice_recording", ("alice_voice_recording",), "t.kind"),
     ("calendar", ("calendar_event",), "t.kind"),
     ("contact", ("contact_update", "apple_contact_update"), "t.kind"),
@@ -3088,6 +3088,12 @@ class PostgresWarehouse:
         # install _postgres_type builds the priority column as this type.
         self._ensure_timeline_priority_type()
         self._ensure_table_group(["timeline_events", "timeline_sync_state"])
+        # Migration for pre-existing sync-state tables (the table is ~24 rows,
+        # so the unconditional ACCESS EXCLUSIVE lock here is harmless).
+        self._command(
+            "ALTER TABLE @timeline_sync_state "
+            "ADD COLUMN IF NOT EXISTS adapter_signature text NOT NULL DEFAULT ''"
+        )
         # These ALTERs run under an ACCESS EXCLUSIVE lock on a 45+ GB table and
         # ensure_timeline_tables runs on every timeline sync (~288/day in
         # prod), so each is gated on the current catalog state instead of

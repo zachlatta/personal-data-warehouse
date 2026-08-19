@@ -135,14 +135,22 @@ const overviewPreamble = `--
 --                                                   ordered. Use this for 'every mention of X';
 --                                                   never post-filter search_text() with ILIKE.
 --   both take (query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')
---   and return (source, subsource, context, who, occurred_at, account, ref, text, score).
---   ref is '<adapter>:<event_id>' into timeline.events — drill via that row's source_table/
---   source_pk back to the source relation for full rows, joins, attachments, thread context.
---   source_table holds the catalog id (e.g. gmail_messages), not a SQL name; this listing shows
---   which schema each one lives in.
---   valid ` + "`sources`" + ` tokens: SELECT * FROM timeline.search_text_sources() (an unknown token
---   raises an error listing the valid set). Detail text (attachments, media enrichments, Drive
---   extracts, session transcripts) is folded into the parent event's search document.
+--   and return (source, subsource, context, who, occurred_at, account, ref, text, score,
+--   event_ts, title, source_table, source_pk). The ` + "`text`" + ` preview is windowed around the
+--   first matched term. event_ts = occurred_at (same value, both names accepted downstream).
+--   A hit carries its own drill-down: source_table + source_pk point at the source relation
+--   (source_table is the catalog id, e.g. gmail_messages, not a SQL name; this listing shows
+--   which schema each one lives in). For a chat/channel hit, read the surrounding conversation
+--   with timeline.context(ref, 5, 5) — it returns the neighboring timeline.events rows of the
+--   same (source, context) stream, so you rarely need the raw tables just for context.
+--   valid ` + "`sources`" + ` tokens: SELECT * FROM timeline.search_text_sources(); familiar aliases
+--   (apple_messages, apple_notes, voice_memos, drive, contacts, photos, ...) resolve to the
+--   right token, and an unknown token raises an error listing the valid set. Detail text
+--   (attachments, media enrichments, Drive extracts) is folded into the parent event's search
+--   document; agent-session transcripts are indexed per TURN (kind agent_turn), so a hit lands
+--   on the matching turn — use timeline.context(ref) to page the rest of that session.
+--   search_text_exact additionally matches number-format variants of the needle (thousands
+--   separators both ways, phone punctuation stripped), so '1441.52' finds '1,441.52'.
 --   For meetings: sources => ARRAY['transcript'] covers transcript, action_items, participants,
 --   and summary. Summaries are lossy — before calling a request unanswered, search transcript
 --   text and Slack DMs dated AFTER it; decisions are often made on calls only.

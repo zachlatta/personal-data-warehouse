@@ -149,9 +149,11 @@ def test_go_warming_filter_catalog_matches_runtime_event_sources():
     expected = {
         (adapter.source, adapter.kind)
         for adapter in TIMELINE_ADAPTERS
-        if adapter.name != "agent_session"
+        if adapter.name not in ("agent_session", "agent_session_turn")
     }
+    # The agent-session adapters emit per-provider `source` values at runtime.
     expected.update((source, "agent_session") for source in AI_EVENT_SOURCE_RELATIONS)
+    expected.update((source, "agent_turn") for source in AI_EVENT_SOURCE_RELATIONS)
     assert actual == expected
 
 
@@ -658,6 +660,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "apple_message": "direct",
     "whatsapp_message": "cc",
     "agent_session": "self",
+    "agent_session_turn": "background",
     "apple_note_revision": "self",
     "voice_memo": "self",
     "alice_voice_recording": "self",
@@ -680,6 +683,7 @@ EXPECTED_SEEDED_EVENTS = {
     "apple_message": 2,
     "whatsapp_message": 1,
     "agent_session": 1,
+    "agent_session_turn": 2,
     "apple_note_revision": 1,
     "voice_memo": 1,
     "alice_voice_recording": 1,
@@ -748,7 +752,22 @@ def test_backfill_normalizes_every_source(warehouse):
     assert session["metadata"]["events"] == 2
     assert session["end_ts"] > session["event_ts"]
     assert "fix the bug" in session["search_text"]
-    assert "done" in session["search_text"]
+    # Transcript content is indexed per turn, not on the session row: one
+    # session-sized document diluted BM25 relevance and hid the matched turn
+    # outside the search preview.
+    assert "done" not in session["search_text"]
+
+    turns = [r for r in rows if r["adapter"] == "agent_session_turn"]
+    assert len(turns) == 2
+    assert {t["kind"] for t in turns} == {"agent_turn"}
+    assert {t["source"] for t in turns} == {"claude_code"}
+    assert {t["context"] for t in turns} == {"claude_code|sess1"}
+    assert all(t["priority"] == "background" for t in turns)
+    reply = next(t for t in turns if t["metadata"]["role"] == "assistant")
+    assert reply["actor"] == "assistant"
+    assert "done" in reply["search_text"]
+    assert reply["source_pk"]["session_id"] == "sess1"
+    assert reply["metadata"]["seq"] == 1
 
     memo = next(r for r in rows if r["adapter"] == "voice_memo")
     assert memo["title"] == "Standup notes"

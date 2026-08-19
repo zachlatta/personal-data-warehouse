@@ -2363,6 +2363,25 @@ def test_search_text_exact_matches_number_format_variants(warehouse: PostgresWar
     rows = warehouse._query("SELECT text FROM @search_text_exact('1,441.52', 10)")
     assert len(rows) == 1 and "1,441.52" in rows[0][0]
 
+    # Contact cards additionally index digits-only phone variants, so ANY
+    # formatting of a stored number matches — not just the app's display form.
+    warehouse.insert_contact_cards(
+        [
+            _contact_card_row(
+                card_id="card-ph",
+                display_name="Phone Fixture",
+                sync_version=1,
+                primary_phone="+1 (415) 516-9999",
+                phones=[{"value": "+1 (415) 516-9999"}],
+            )
+        ]
+    )
+    _sync_timeline(warehouse)
+    rows = warehouse._query(
+        "SELECT text FROM @search_text_exact('415-516-9999', 10, ARRAY['contact'])"
+    )
+    assert len(rows) == 1 and "Phone Fixture" in rows[0][0]
+
 
 def test_search_text_hits_carry_drilldown_columns(warehouse: PostgresWarehouse) -> None:
     # A hit must terminate in one hop: event_ts mirrors occurred_at (agents
@@ -2459,6 +2478,66 @@ def test_search_text_raises_when_every_branch_fails(warehouse: PostgresWarehouse
     warehouse._command("DROP INDEX IF EXISTS timeline_events_search_text_bm25_idx")
     with pytest.raises(psycopg2.Error, match="every source branch failed"):
         warehouse._query("SELECT * FROM @search_text('zanzibar', 5)")
+
+
+def test_timeline_backfill_resets_when_adapter_definition_changes(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # Changing an adapter's normalization SQL (new search-document fields,
+    # reclassified priority, ...) used to apply only to rows the sync touched
+    # afterwards: historical rows kept the old shape forever because the
+    # backfill cursor was spent. The engine now fingerprints each adapter's
+    # definition in timeline_sync_state and restarts the backfill when it
+    # changes, so history converges; the content-guarded upsert keeps
+    # unchanged rows free.
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=message_datetime,
+                text="signature reset fixture",
+            )
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    rows = warehouse._query(
+        "SELECT adapter_signature, backfill_done, backfill_rows"
+        " FROM @timeline_sync_state WHERE adapter = 'slack_message'"
+    )
+    assert rows, "expected a slack_message sync-state row"
+    signature, backfill_done, backfill_rows = rows[0]
+    assert signature != "", "the engine must record the adapter definition signature"
+    assert backfill_done == 1
+
+    # An unchanged definition must NOT re-walk (the whole point of the guard).
+    _sync_timeline(warehouse)
+    unchanged = warehouse._query(
+        "SELECT backfill_rows FROM @timeline_sync_state WHERE adapter = 'slack_message'"
+    )
+    assert unchanged[0][0] == backfill_rows, "unchanged definition re-walked the backfill"
+
+    # Simulate a definition change (as a deploy with edited adapter SQL would
+    # look to the stored state): the next run restarts and re-walks history.
+    warehouse._command(
+        "UPDATE @timeline_sync_state SET adapter_signature = 'stale' WHERE adapter = 'slack_message'"
+    )
+    _sync_timeline(warehouse)
+    after = warehouse._query(
+        "SELECT adapter_signature, backfill_done, backfill_rows"
+        " FROM @timeline_sync_state WHERE adapter = 'slack_message'"
+    )
+    assert after[0][0] == signature, "the current signature must be re-recorded"
+    assert after[0][1] == 1, "the re-walk must run to completion"
+    assert after[0][2] > backfill_rows, "history must actually re-walk after a definition change"
 
 
 def test_timeline_context_returns_neighboring_events(warehouse: PostgresWarehouse) -> None:

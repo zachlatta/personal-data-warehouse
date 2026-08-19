@@ -140,10 +140,13 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 21,
         "marts": 29,
-        "timeline": 7,
+        # +1 timeline: timeline.context(ref, before, after), the search-hit
+        # neighborhood reader. +1 internal: internal.search_text_preview, the
+        # match-windowed preview helper both search functions use.
+        "timeline": 8,
         "ops": 22,
         "private": 5,
-        "internal": 1,
+        "internal": 2,
     }
 
 
@@ -274,7 +277,8 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
         "agent_run_tool_calls",
     }
     assert {obj.id for obj in CATALOG.objects if obj.query_access == "execute_only"} == {
-        "utf8_byte_prefix"
+        "utf8_byte_prefix",
+        "search_text_preview",
     }
     assert set(CATALOG.denied_schemas()) == {"private"}
 

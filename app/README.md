@@ -249,23 +249,39 @@ unified timeline document. Raw message/body columns are deliberately not text-in
 
 - Ranked keyword search (the default): `SELECT * FROM timeline.search_text('offer letter', 50)`
   searches the unified timeline BM25 document and returns
-  `(source, subsource, context, who, occurred_at, account, ref, text, score)` ranked across
-  **every** timeline source (`score` lower / more negative = better). `ref` is a
-  timeline ref (`<adapter>:<event_id>`); join to `timeline.events` and then use
-  `source_table`/`source_pk` for full source rows.
+  `(source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title,
+  source_table, source_pk)` ranked across **every** timeline source (`score` lower / more
+  negative = better; `event_ts` duplicates `occurred_at` so `timeline.events` column lists
+  work unchanged). The `text` preview is windowed around the first matched term. A hit
+  carries its own drill-down: `source_table`/`source_pk` point straight at the source
+  relation; `ref` (`<adapter>:<event_id>`) still joins to `timeline.events` when the
+  normalized row is wanted.
+- Surrounding conversation: `SELECT * FROM timeline.context(ref, 5, 5)` returns the
+  neighboring `timeline.events` rows of the hit's `(source, context)` stream — the messages
+  around a chat/channel hit, or the turns around an agent-session hit — so a hit reads as a
+  conversation without a raw-table excursion.
 - Literal substring/phrase/id search: `SELECT * FROM timeline.search_text_exact('offer letter', 50)` —
   the same document and hit shape, matched exactly (trigram-indexed, case-insensitive, LIKE
   wildcards treated literally), ordered by recency, with the returned text windowed around the
-  first match. Use this instead of post-filtering `search_text()` output with an outer `ILIKE`
-  or scanning raw body columns; needles must be at least 3 characters.
+  first match. Number-format variants of the needle also match (thousands separators both
+  ways, phone punctuation stripped), so `1441.52` finds `1,441.52` and `(415) 516-3303`
+  finds `+14155163303`. Use this instead of post-filtering `search_text()` output with an
+  outer `ILIKE` or scanning raw body columns; needles must be at least 3 characters.
 - Both take the same optional args:
   `(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')`, with
   `max_results` capped server-side. Call `SELECT * FROM timeline.search_text_sources()` to discover
-  valid source tokens. Attachment/media enrichments, Drive extracts, transcripts, and other
-  detail text are folded into the parent timeline event's `search_text` document. BM25 ranking
+  valid source tokens; familiar aliases (`apple_messages`, `apple_notes`, `voice_memos`,
+  `drive`, `contacts`, ...) resolve to the right token, and an unknown token raises listing
+  the valid set. Attachment/media enrichments, Drive extracts, transcripts, and other
+  detail text are folded into the parent timeline event's `search_text` document;
+  agent-session transcripts are indexed per turn (`kind = 'agent_turn'`) so a hit lands on
+  the matching turn rather than a whole-session blob. BM25 ranking
   is OR'd, stemmed whole-word matching, so a noisy top-N never proves absence — for "find every
   mention of X" use `search_text_exact()` and vary the needle. New cross-source text is picked
   up by adding it to the relevant timeline adapter's search document.
+- A broken search layer is loud: a partially failed fan-out raises a SQL WARNING naming the
+  failed sources, and if every source branch fails the call errors instead of returning an
+  empty (silently wrong) result set.
 - Detailed follow-up: use the timeline hit's `source_table`/`source_pk` to query the canonical
   source tables directly for complete rows, joins, attachments, thread context, etc.
 
