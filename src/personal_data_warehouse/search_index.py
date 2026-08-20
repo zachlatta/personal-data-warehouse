@@ -361,6 +361,29 @@ class EmbeddingClient:
             ),
         )
 
+    def _fit_dimensions(self, vector: list[float]) -> list[float]:
+        """Coerce a returned vector to the configured dimensionality.
+
+        Servers that ignore the ``dimensions`` request parameter (several
+        self-hosted backends) return the model's native width. For
+        Matryoshka-trained models (text-embedding-3-*, Qwen3-Embedding,
+        nomic-embed v1.5) prefix truncation + L2 renormalization is the
+        *defined* way to shorten, so a larger vector is truncated rather than
+        rejected — pick an MRL model when self-hosting. A smaller vector can
+        never be widened and errors.
+        """
+        if len(vector) == self.dimensions:
+            return vector
+        if len(vector) < self.dimensions:
+            raise EmbeddingConfigError(
+                f"embeddings endpoint returned {len(vector)}-dim vectors; "
+                f"expected {self.dimensions} (set SEARCH_EMBEDDINGS_DIMENSIONS "
+                "or serve a wider model)"
+            )
+        prefix = vector[: self.dimensions]
+        norm = sum(value * value for value in prefix) ** 0.5 or 1.0
+        return [value / norm for value in prefix]
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         import requests
 
@@ -395,13 +418,7 @@ class EmbeddingClient:
                     raise EmbeddingConfigError(
                         f"embeddings endpoint returned {len(vectors)} vectors for {len(texts)} inputs"
                     )
-                for vector in vectors:
-                    if len(vector) != self.dimensions:
-                        raise EmbeddingConfigError(
-                            f"embeddings endpoint returned {len(vector)}-dim vectors; "
-                            f"expected {self.dimensions} (set SEARCH_EMBEDDINGS_DIMENSIONS)"
-                        )
-                return vectors
+                return [self._fit_dimensions(vector) for vector in vectors]
             except Exception as error:  # noqa: BLE001 - retried, re-raised below
                 last_error = error
                 time.sleep(min(2**attempt, 15))

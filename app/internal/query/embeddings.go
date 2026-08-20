@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -146,8 +147,30 @@ func (c *EmbeddingsClient) embedOnce(ctx context.Context, body []byte) (vector [
 		return nil, false, fmt.Errorf("embeddings response carried no data entries")
 	}
 	embedding := decoded.Data[0].Embedding
-	if len(embedding) != c.dimensions {
+	if len(embedding) < c.dimensions {
 		return nil, false, fmt.Errorf("embeddings endpoint returned a %d-dimension vector, want %d; SEARCH_EMBEDDINGS_DIMENSIONS must match the model's output (and the pgvector column timeline.search_hybrid indexes)", len(embedding), c.dimensions)
+	}
+	if len(embedding) > c.dimensions {
+		// Servers that ignore the `dimensions` request parameter (several
+		// self-hosted backends) return the model's native width. For
+		// Matryoshka-trained models prefix truncation + L2 renormalization is
+		// the defined way to shorten, and the Python indexing runner does the
+		// same, so query and document vectors stay in the same space.
+		embedding = embedding[:c.dimensions]
+		var norm float64
+		for _, value := range embedding {
+			norm += value * value
+		}
+		if norm == 0 {
+			norm = 1
+		} else {
+			norm = math.Sqrt(norm)
+		}
+		normalized := make([]float64, len(embedding))
+		for i, value := range embedding {
+			normalized[i] = value / norm
+		}
+		embedding = normalized
 	}
 	return embedding, false, nil
 }
