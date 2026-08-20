@@ -154,6 +154,10 @@ const overviewPreamble = `--
 --   For meetings: sources => ARRAY['transcript'] covers transcript, action_items, participants,
 --   and summary. Summaries are lossy — before calling a request unanswered, search transcript
 --   text and Slack DMs dated AFTER it; decisions are often made on calls only.
+--   The ` + "`search`" + ` tool wraps this contract: hybrid semantic+keyword retrieval through
+--   timeline.search_hybrid when embeddings are configured, falling back to search_text keyword
+--   search (reporting a fallback_reason) when they are not; modes keyword/exact force the
+--   corresponding SQL function.
 --
 -- Row counts are planner estimates; use them for sizing instead of SELECT COUNT(*).
 `

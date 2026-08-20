@@ -30,6 +30,7 @@ var mcpSnapshotTools = []string{
 	"get_rows",
 	"get_field",
 	"grep_rows",
+	"search",
 	"schema_overview",
 	"describe_table",
 	"propose_mutation",

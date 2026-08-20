@@ -28,6 +28,9 @@ type Options struct {
 	QueryCacheTTL      time.Duration
 	DebugCacheTool     bool
 	Logger             *slog.Logger
+	// SearchEmbedder powers the search tool's hybrid mode. Nil means
+	// embeddings are unconfigured and hybrid searches fall back to keyword.
+	SearchEmbedder Embedder
 }
 
 type Runner interface {
@@ -61,10 +64,11 @@ func (e statementValidationError) logFields() []any {
 }
 
 type Service struct {
-	runner Runner
-	opts   Options
-	logger *slog.Logger
-	cache  *queryCache
+	runner   Runner
+	opts     Options
+	logger   *slog.Logger
+	cache    *queryCache
+	embedder Embedder
 }
 
 type tableRef struct {
@@ -255,7 +259,7 @@ func NewService(runner Runner, opts Options) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{runner: runner, opts: opts, logger: logger.With("component", "query"), cache: newQueryCache(opts.QueryCacheMaxBytes, opts.QueryCacheTTL)}
+	return &Service{runner: runner, opts: opts, logger: logger.With("component", "query"), cache: newQueryCache(opts.QueryCacheMaxBytes, opts.QueryCacheTTL), embedder: opts.SearchEmbedder}
 }
 
 func normalizeStatements(statements []Statement) ([]Statement, statementValidationError) {

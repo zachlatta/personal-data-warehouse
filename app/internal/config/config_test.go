@@ -35,6 +35,10 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 		"PDW_MUTATION_UI_SESSION_TTL_SECONDS": "7200",
 		"GMAIL_ACCOUNTS":                      "zach@example.test, work@example.test",
 		"CONTACT_GOOGLE_ACCOUNTS":             "contacts@example.test",
+		"SEARCH_EMBEDDINGS_BASE_URL":          "https://embeddings.example.test/v1/",
+		"SEARCH_EMBEDDINGS_API_KEY":           "sk-embed-test",
+		"SEARCH_EMBEDDINGS_MODEL":             "custom-embedding-model",
+		"SEARCH_EMBEDDINGS_DIMENSIONS":        "256",
 	}
 
 	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
@@ -74,6 +78,31 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.PostgresDatabaseURL != "postgresql://default:secret@example.com/default" {
 		t.Fatalf("PostgresDatabaseURL = %q", cfg.PostgresDatabaseURL)
+	}
+	if cfg.SearchEmbeddingsBaseURL != "https://embeddings.example.test/v1" {
+		t.Fatalf("SearchEmbeddingsBaseURL = %q", cfg.SearchEmbeddingsBaseURL)
+	}
+	if cfg.SearchEmbeddingsAPIKey != "sk-embed-test" || cfg.SearchEmbeddingsModel != "custom-embedding-model" || cfg.SearchEmbeddingsDimensions != 256 {
+		t.Fatalf("search embeddings config = key %q model %q dims %d", cfg.SearchEmbeddingsAPIKey, cfg.SearchEmbeddingsModel, cfg.SearchEmbeddingsDimensions)
+	}
+}
+
+func TestLoadFromEnvSearchEmbeddingsDefaults(t *testing.T) {
+	env := map[string]string{
+		"POSTGRES_DATABASE_URL": "postgres://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":      "0123456789abcdef0123456789abcdef",
+	}
+	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
+	if err != nil {
+		t.Fatalf("LoadFromEnv returned error: %v", err)
+	}
+	// BaseURL and APIKey stay empty when unset — that pair is what marks
+	// embeddings unconfigured — while model and dimensions carry defaults.
+	if cfg.SearchEmbeddingsBaseURL != "" || cfg.SearchEmbeddingsAPIKey != "" {
+		t.Fatalf("embeddings should be unconfigured by default: base %q key %q", cfg.SearchEmbeddingsBaseURL, cfg.SearchEmbeddingsAPIKey)
+	}
+	if cfg.SearchEmbeddingsModel != "text-embedding-3-small" || cfg.SearchEmbeddingsDimensions != 512 {
+		t.Fatalf("embeddings defaults = model %q dims %d", cfg.SearchEmbeddingsModel, cfg.SearchEmbeddingsDimensions)
 	}
 }
 

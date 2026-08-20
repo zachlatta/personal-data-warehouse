@@ -78,6 +78,16 @@ type Config struct {
 	// sync; accounts without a token are skipped.
 	SlackAccounts []SlackAccount
 
+	// Search embeddings (optional). The search tool's hybrid mode embeds the
+	// query through an OpenAI-compatible /embeddings endpoint; when neither the
+	// API key nor an explicit base URL is set, hybrid searches fall back to
+	// keyword search. An explicit base URL alone counts as configured because
+	// self-hosted embedding servers need no key.
+	SearchEmbeddingsBaseURL    string
+	SearchEmbeddingsAPIKey     string
+	SearchEmbeddingsModel      string
+	SearchEmbeddingsDimensions int
+
 	// DriveSourceTokensByAccount maps a Google Drive *source* account email to
 	// its OAuth token JSON, so the account-aware download proxy can stream a
 	// google_drive_source file live from the account that owns it. Populated
@@ -246,6 +256,13 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		if token := googleTokenJSONForAccount(getenv, account); token != "" {
 			cfg.DriveSourceTokensByAccount[account] = token
 		}
+	}
+
+	cfg.SearchEmbeddingsBaseURL = strings.TrimRight(strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_BASE_URL")), "/")
+	cfg.SearchEmbeddingsAPIKey = strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_API_KEY"))
+	cfg.SearchEmbeddingsModel = valueOrDefault(strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_MODEL")), "text-embedding-3-small")
+	if cfg.SearchEmbeddingsDimensions, err = parsePositiveInt(getenv("SEARCH_EMBEDDINGS_DIMENSIONS"), 512, "SEARCH_EMBEDDINGS_DIMENSIONS"); err != nil {
+		return Config{}, err
 	}
 
 	cfg.DebugCacheTool = parseBool(getenv("MCP_DEBUG_CACHE_TOOL"))

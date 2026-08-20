@@ -17,6 +17,7 @@ func readOnlyTools(svc *query.Service) []tool.Tool {
 		getRowsTool(svc),
 		getFieldTool(svc),
 		grepRowsTool(svc),
+		searchTool(svc),
 		schemaOverviewTool(svc),
 		describeTableTool(svc),
 		sqlTool(svc),
@@ -101,6 +102,27 @@ func grepRowsTool(svc *query.Service) tool.Tool {
 			return svc.GrepRows(ctx, in.QueryID, in.Pattern, in.Columns, in.Limit, in.ContextChars), nil
 		},
 		IsError: func(r query.GrepResponse) bool { return r.Error != "" },
+	}
+}
+
+// searchTool is registered on every surface, like describe_table: retrieval is
+// the entry point for both MCP agents and CLI sessions, so hiding it from
+// either side would push callers back to hand-written search SQL.
+func searchTool(svc *query.Service) tool.Tool {
+	return &tool.Typed[searchInput, query.SearchResponse]{
+		NameStr:        "search",
+		TitleStr:       "Search Timeline",
+		DescriptionStr: searchDescription,
+		Handle: func(ctx context.Context, in searchInput) (query.SearchResponse, error) {
+			return svc.Search(ctx, query.SearchRequest{
+				Query:      in.Query,
+				MaxResults: in.MaxResults,
+				Sources:    in.Sources,
+				Since:      in.Since,
+				Mode:       in.Mode,
+			}), nil
+		},
+		IsError: func(r query.SearchResponse) bool { return r.Error != "" },
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ const muxAPITestSecret = "test-secret-token-at-least-32-chars-x"
 // mcpSnapshotTools but swaps in the CLI-only tools (and drops MCP-only ones)
 // for the core read/query and mutation proposal schemas snapshotted here.
 var apiSnapshotTools = []string{
+	"search",
 	"schema_overview",
 	"describe_table",
 	"sql",
@@ -133,7 +135,7 @@ func TestAPIListsTools(t *testing.T) {
 	for _, e := range payload.Data {
 		names[e.Name] = true
 	}
-	for _, required := range []string{"schema_overview", "sql"} {
+	for _, required := range []string{"schema_overview", "search", "sql"} {
 		if !names[required] {
 			t.Fatalf("API tool list missing %q: %#v", required, names)
 		}
@@ -185,6 +187,111 @@ func TestAPIRunsSQL(t *testing.T) {
 	}
 	if envelope.Data.Rows != "n\n1\n2\n3" {
 		t.Fatalf("rows body = %q", envelope.Data.Rows)
+	}
+}
+
+// searchCapableRunner extends fakeRunner with the parameterized-query
+// capability the search tool needs, recording each statement and its bind
+// args. Every parameterized statement returns the same canned hit so tests
+// can assert on the response shape without restating the search SQL here.
+type searchCapableRunner struct {
+	fakeRunner
+	mu         sync.Mutex
+	statements []string
+	args       [][]any
+}
+
+func (r *searchCapableRunner) QueryArgs(_ context.Context, statement string, args []any, _ int) (query.RawResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.statements = append(r.statements, statement)
+	r.args = append(r.args, args)
+	return query.RawResult{
+		Columns: []string{"source", "who", "text"},
+		Rows:    []map[string]any{{"source": "slack", "who": "zach", "text": "offer letter attached"}},
+	}, nil
+}
+
+func TestAPIRunsSearchAndReportsKeywordFallback(t *testing.T) {
+	// Without SEARCH_EMBEDDINGS_* config the default hybrid mode must still
+	// answer: keyword retrieval runs and the response says why.
+	runner := &searchCapableRunner{}
+	authSvc := pdwauth.NewService([]byte(muxAPITestSecret), func() time.Time { return time.Unix(0, 0) })
+	cfg := config.Config{
+		Addr:          ":0",
+		BaseURL:       "http://example.test",
+		SecretToken:   muxAPITestSecret,
+		MaxRows:       100,
+		MaxFieldChars: 1000,
+	}
+	mux := NewMux(cfg, authSvc, runner)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	body := `{"query":"offer letter","sources":["slack"],"since":"2026-03-01"}`
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/search", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST search: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body = %s", resp.StatusCode, body)
+	}
+	var envelope struct {
+		Data struct {
+			Query          string           `json:"query"`
+			Mode           string           `json:"mode"`
+			FallbackReason string           `json:"fallback_reason"`
+			TotalRows      int              `json:"total_rows"`
+			Rows           []map[string]any `json:"rows"`
+			Error          string           `json:"error"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if envelope.Data.Error != "" {
+		t.Fatalf("search error: %s", envelope.Data.Error)
+	}
+	if envelope.Data.Mode != "keyword" || !strings.Contains(envelope.Data.FallbackReason, "embeddings unconfigured") {
+		t.Fatalf("mode = %q fallback_reason = %q", envelope.Data.Mode, envelope.Data.FallbackReason)
+	}
+	if envelope.Data.TotalRows != 1 || len(envelope.Data.Rows) != 1 || envelope.Data.Rows[0]["text"] != "offer letter attached" {
+		t.Fatalf("unexpected rows: %#v", envelope.Data)
+	}
+	if len(runner.statements) != 1 || !strings.Contains(runner.statements[0], "timeline.search_text(") {
+		t.Fatalf("statements = %#v", runner.statements)
+	}
+	args := runner.args[0]
+	if len(args) != 4 || args[0] != "offer letter" || args[3] != "2026-03-01" {
+		t.Fatalf("args = %#v", args)
+	}
+}
+
+func TestAPISearchRequiresQuery(t *testing.T) {
+	srv := newMuxAPITestServer(t)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/search", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST search: %v", err)
+	}
+	defer resp.Body.Close()
+	var envelope struct {
+		Data struct {
+			Error string `json:"error"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(envelope.Data.Error, "query must be") {
+		t.Fatalf("error = %q", envelope.Data.Error)
 	}
 }
 

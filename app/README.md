@@ -284,6 +284,14 @@ unified timeline document. Raw message/body columns are deliberately not text-in
   empty (silently wrong) result set.
 - Detailed follow-up: use the timeline hit's `source_table`/`source_pk` to query the canonical
   source tables directly for complete rows, joins, attachments, thread context, etc.
+- Tool-level entry point: the `search` tool wraps this contract for callers that don't want to
+  write SQL. Its default `hybrid` mode embeds the query through an OpenAI-compatible embeddings
+  API (`SEARCH_EMBEDDINGS_BASE_URL`, `SEARCH_EMBEDDINGS_API_KEY`, `SEARCH_EMBEDDINGS_MODEL`,
+  `SEARCH_EMBEDDINGS_DIMENSIONS`) and calls `timeline.search_hybrid`; when embeddings are not
+  configured or `search_hybrid` is not installed (no pgvector), it automatically falls back to
+  keyword search and reports a `fallback_reason`. Modes `keyword` and `exact` force
+  `timeline.search_text` / `timeline.search_text_exact` directly. Takes
+  `query`, `max_results` (default 50), `sources`, `since`, and `mode`.
 
 ### `query`
 

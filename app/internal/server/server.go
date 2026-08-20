@@ -97,6 +97,14 @@ type grepRowsInput struct {
 	ContextChars int      `json:"context_chars,omitempty" jsonschema:"characters of context around each match, default 200"`
 }
 
+type searchInput struct {
+	Query      string   `json:"query" jsonschema:"search text to run against the cross-source timeline corpus"`
+	MaxResults int      `json:"max_results,omitempty" jsonschema:"maximum hits to return, default 50"`
+	Sources    []string `json:"sources,omitempty" jsonschema:"optional source tokens or aliases (slack, gmail, apple_messages, drive, ...); an unknown token errors listing the valid set"`
+	Since      string   `json:"since,omitempty" jsonschema:"optional timestamptz lower bound on event time, e.g. 2026-03-01"`
+	Mode       string   `json:"mode,omitempty" jsonschema:"hybrid (default: semantic+keyword; falls back to keyword when embeddings are unavailable), keyword (BM25 ranked), or exact (literal substring/phrase/id match)"`
+}
+
 type debugCacheInput struct{}
 
 type sqlInput struct {
@@ -120,6 +128,8 @@ const getRowsDescription = "Return a row slice from a cached query result by que
 const getFieldDescription = "Return a character chunk from a single cell in a cached query result. Use this to read long fields (transcripts, message bodies, email bodies, note bodies) end-to-end without putting substring offsets in SQL. " + schemaFirstReminder
 
 const grepRowsDescription = "Regex-search a cached query result and return match context. " + schemaFirstReminder
+
+const searchDescription = "Search the cross-source timeline corpus. Default mode hybrid embeds the query and runs semantic+keyword retrieval (timeline.search_hybrid), falling back to ranked keyword search with a fallback_reason when embeddings are not configured; mode keyword forces BM25 keyword search (timeline.search_text) and mode exact literal substring matching (timeline.search_text_exact). Each hit carries source_table/source_pk for drill-down to the authoritative row."
 
 const schemaOverviewDescription = "Required first call. Lists every relation in the warehouse with its row estimate, primary key, and primary time column, plus the search and layer conventions needed to write correct SQL. It deliberately does NOT list every column — call describe_table for that. Row estimates come from planner statistics, formatted as `(~N rows, estimated)`; use them for sizing decisions instead of running SELECT COUNT(*) over large tables."
 
@@ -206,6 +216,17 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	})
 
 	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}
+	if embedder := query.NewEmbeddingsClient(query.EmbeddingsOptions{
+		BaseURL:    cfg.SearchEmbeddingsBaseURL,
+		APIKey:     cfg.SearchEmbeddingsAPIKey,
+		Model:      cfg.SearchEmbeddingsModel,
+		Dimensions: cfg.SearchEmbeddingsDimensions,
+	}); embedder != nil {
+		queryOpts.SearchEmbedder = embedder
+		logger.Info("search embeddings enabled", "model", embedder.Model())
+	} else {
+		logger.Info("search embeddings not configured; search tool falls back to keyword mode")
+	}
 	var extra []tool.Tool
 	store, storeEnabled, err := objectStoreFromConfig(cfg)
 	if err != nil {

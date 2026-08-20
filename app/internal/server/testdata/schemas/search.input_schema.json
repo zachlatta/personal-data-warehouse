@@ -1,0 +1,35 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "max_results": {
+      "description": "maximum hits to return, default 50",
+      "type": "integer"
+    },
+    "mode": {
+      "description": "hybrid (default: semantic+keyword; falls back to keyword when embeddings are unavailable), keyword (BM25 ranked), or exact (literal substring/phrase/id match)",
+      "type": "string"
+    },
+    "query": {
+      "description": "search text to run against the cross-source timeline corpus",
+      "type": "string"
+    },
+    "since": {
+      "description": "optional timestamptz lower bound on event time, e.g. 2026-03-01",
+      "type": "string"
+    },
+    "sources": {
+      "description": "optional source tokens or aliases (slack, gmail, apple_messages, drive, ...); an unknown token errors listing the valid set",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    }
+  },
+  "required": [
+    "query"
+  ],
+  "type": "object"
+}
