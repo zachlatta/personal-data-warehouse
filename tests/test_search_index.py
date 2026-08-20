@@ -1,0 +1,315 @@
+from __future__ import annotations
+
+import os
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from dotenv import load_dotenv
+
+from tests.conftest import cleanup_test_warehouse, make_test_schema
+
+from personal_data_warehouse.postgres import (
+    SEARCH_EMBEDDING_DIMENSIONS,
+    PostgresWarehouse,
+)
+from personal_data_warehouse.search_index import (
+    CHUNK_MAX_CHARS,
+    EmbeddingClient,
+    SearchChunkBuilder,
+    SearchEmbeddingRunner,
+    split_text,
+    vector_literal,
+    window_start,
+)
+from personal_data_warehouse.timeline import TimelineSyncEngine
+
+
+def _postgres_url() -> str:
+    load_dotenv()
+    url = os.environ.get("POSTGRES_DATABASE_URL")
+    if not url:
+        pytest.skip("POSTGRES_DATABASE_URL is not set")
+    return url
+
+
+@pytest.fixture()
+def warehouse():
+    schema = make_test_schema()
+    wh = PostgresWarehouse(_postgres_url(), schema=schema)
+    try:
+        yield wh
+    finally:
+        cleanup_test_warehouse(wh)
+
+
+def _pgvector_usable(wh: PostgresWarehouse) -> bool:
+    return wh.pgvector_available()
+
+
+def _provision(wh: PostgresWarehouse) -> None:
+    # The timeline engine runs every adapter, so every source table must
+    # exist; borrow the exhaustive helper the search_text tests use.
+    from tests.test_postgres_warehouse import _ensure_all_table_groups
+
+    _ensure_all_table_groups(wh)
+    wh.ensure_search_index_tables()
+
+
+def _sync_timeline(wh: PostgresWarehouse) -> None:
+    engine = TimelineSyncEngine(
+        source_url=_postgres_url(),
+        source_schema=wh._schema,
+        dest_schema=wh._schema,
+    )
+    try:
+        engine.run()
+    finally:
+        engine.close()
+
+
+# --- pure chunking ------------------------------------------------------------
+
+
+def test_split_text_small_document_is_one_chunk() -> None:
+    assert split_text("hello world") == ["hello world"]
+    assert split_text("  ") == []
+    assert split_text("ab") == []  # below the minimum
+
+
+def test_split_text_large_document_splits_on_line_boundaries() -> None:
+    lines = [f"line {i} " + "x" * 80 for i in range(100)]
+    doc = "\n".join(lines)
+    chunks = split_text(doc)
+    assert len(chunks) > 1
+    assert all(len(chunk) <= CHUNK_MAX_CHARS for chunk in chunks)
+    # Nothing is lost: every line's marker appears in some chunk.
+    joined = "\n".join(chunks)
+    for i in range(100):
+        assert f"line {i} " in joined
+    # Deterministic: identical input yields identical chunks (stable shas so
+    # rebuilds never re-embed unchanged text).
+    assert chunks == split_text(doc)
+
+
+def test_window_start_floors_to_the_hour() -> None:
+    ts = datetime(2026, 5, 19, 12, 42, 31, tzinfo=UTC)
+    assert window_start(ts) == datetime(2026, 5, 19, 12, tzinfo=UTC)
+
+
+def test_vector_literal_shape() -> None:
+    literal = vector_literal([0.5, -1.0, 0.25])
+    assert literal == "[0.500000,-1.000000,0.250000]"
+
+
+# --- chunk builder (live) -----------------------------------------------------
+
+from tests.test_postgres_warehouse import (  # noqa: E402 - shared fixtures
+    _message_row,
+    _slack_conversation_row,
+    _slack_message_row,
+)
+
+
+def _seed_slack(wh: PostgresWarehouse, texts: list[str], *, start_minute: int = 0) -> None:
+    base = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    wh.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    wh.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts=f"{100 + start_minute}.{i}",
+                message_datetime=base + timedelta(minutes=start_minute + i),
+                text=text,
+            )
+            for i, text in enumerate(texts)
+        ]
+    )
+
+
+def test_chunk_builder_windows_chat_and_chunks_documents(warehouse: PostgresWarehouse) -> None:
+    _provision(warehouse)
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["morning standup notes", "the quokka budget is approved", "lunch plans"])
+    warehouse.insert_messages(
+        [_message_row(message_id="m1", subject="quarterly xylophone report", labels=["INBOX"], sync_version=1)]
+    )
+    _sync_timeline(warehouse)
+
+    stats = SearchChunkBuilder(warehouse).run()
+    assert stats.caught_up
+    assert stats.chunks_written > 0
+
+    rows = warehouse._query_dicts(
+        "SELECT chunk_id, anchor, adapter, source, context, text FROM @search_chunks ORDER BY chunk_id"
+    )
+    by_adapter: dict[str, list[dict]] = {}
+    for row in rows:
+        by_adapter.setdefault(row["adapter"], []).append(row)
+
+    # Chat messages collapse into one conversation-window chunk, not three
+    # tiny per-message chunks.
+    slack_chunks = by_adapter.get("slack_message", [])
+    assert len(slack_chunks) == 1
+    assert "quokka budget" in slack_chunks[0]["text"]
+    assert "standup" in slack_chunks[0]["text"]
+    assert slack_chunks[0]["anchor"].startswith("slack_message|w|")
+
+    # Gmail is chunked per event.
+    gmail_chunks = by_adapter.get("gmail_email", [])
+    assert len(gmail_chunks) == 1
+    assert "xylophone" in gmail_chunks[0]["text"]
+
+    # Incremental: a new message in the same window rebuilds that window's
+    # chunk in place (same anchor, no duplicate windows).
+    _seed_slack(warehouse, ["one more thing: ship the zeppelin"], start_minute=10)
+    _sync_timeline(warehouse)
+    stats2 = SearchChunkBuilder(warehouse).run()
+    assert stats2.caught_up
+    slack_rows = warehouse._query_dicts(
+        "SELECT anchor, text FROM @search_chunks WHERE adapter = 'slack_message'"
+    )
+    assert len(slack_rows) == 1
+    assert "zeppelin" in slack_rows[0]["text"]
+    assert "quokka budget" in slack_rows[0]["text"]
+
+    # A caught-up second run is a no-op.
+    stats3 = SearchChunkBuilder(warehouse).run()
+    assert stats3.processed_events == 0 and stats3.caught_up
+
+
+def test_chunk_builder_skips_machinery_adapters(warehouse: PostgresWarehouse) -> None:
+    _provision(warehouse)
+    warehouse.ensure_agent_tables()
+    warehouse._set_search_path()
+    from personal_data_warehouse.schema import AGENT_RUN_COLUMNS
+
+    created_at = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    run_row = {column: "" for column in AGENT_RUN_COLUMNS}
+    run_row.update(
+        run_id="agent-zzz",
+        task_type="test",
+        status="succeeded",
+        exit_code=0,
+        started_at=created_at,
+        completed_at=created_at,
+        sync_version=1,
+    )
+    warehouse.insert_agent_runs([run_row])
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    rows = warehouse._query("SELECT count(*) FROM @search_chunks WHERE adapter = 'enrichment_run'")
+    assert rows[0][0] == 0
+
+
+# --- embeddings (live, requires pgvector) ------------------------------------
+
+
+class _FakeEmbeddingClient(EmbeddingClient):
+    """Deterministic offline embedder: hash-bucket one-hot-ish vectors."""
+
+    def __init__(self) -> None:
+        super().__init__(base_url="http://fake", api_key="fake", model="fake-model",
+                         dimensions=SEARCH_EMBEDDING_DIMENSIONS)
+        self.calls = 0
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        vectors = []
+        for text in texts:
+            vector = [0.0] * self.dimensions
+            for token in text.lower().split():
+                vector[hash(token) % self.dimensions] += 1.0
+            norm = sum(v * v for v in vector) ** 0.5 or 1.0
+            vectors.append([v / norm for v in vector])
+        return vectors
+
+
+def test_embedding_runner_reports_unconfigured(warehouse: PostgresWarehouse) -> None:
+    _provision(warehouse)
+    for var in ("SEARCH_EMBEDDINGS_API_KEY", "SEARCH_EMBEDDINGS_BASE_URL"):
+        assert not os.environ.get(var), f"{var} set in test env; unset to run this test"
+    stats = SearchEmbeddingRunner(warehouse).run()
+    assert "unconfigured" in stats.skipped_reason
+
+
+def test_embedding_runner_embeds_each_distinct_text_once(warehouse: PostgresWarehouse) -> None:
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["alpha bravo charlie", "delta echo foxtrot"])
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+
+    client = _FakeEmbeddingClient()
+    stats = SearchEmbeddingRunner(warehouse, client).run()
+    assert stats.embedded > 0 and stats.caught_up
+
+    rows = warehouse._query(
+        "SELECT count(*), count(embedding) FROM @search_chunk_embeddings WHERE model = 'fake-model'"
+    )
+    total, with_vectors = rows[0]
+    assert total == with_vectors == stats.embedded
+
+    # Re-run: nothing new to embed, and the client is not called again.
+    calls_before = client.calls
+    stats2 = SearchEmbeddingRunner(warehouse, client).run()
+    assert stats2.embedded == 0 and stats2.caught_up
+    assert client.calls == calls_before
+
+
+def test_search_hybrid_fuses_semantic_and_keyword_ranks(warehouse: PostgresWarehouse) -> None:
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    rows = warehouse._query(
+        "SELECT 1 FROM pg_available_extensions WHERE name = 'pg_textsearch'"
+        " AND current_setting('shared_preload_libraries') LIKE '%pg_textsearch%'"
+    )
+    if not rows:
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _provision(warehouse)
+    warehouse._set_search_path()
+    _seed_slack(
+        warehouse,
+        [
+            "the marmoset enclosure needs cleaning",
+            "totally unrelated coffee chatter",
+        ],
+    )
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    client = _FakeEmbeddingClient()
+    SearchEmbeddingRunner(warehouse, client).run()
+    # ensure again so the signature guard sees chunks+vector and creates
+    # search_hybrid (provisioning order in this test built tables first).
+    warehouse._command("DELETE FROM @search_schema_state")
+    warehouse._ensure_search_views_if_possible()
+
+    # Query vector: embed the query text with the same fake embedder, so the
+    # window chunk containing the marmoset line is the nearest neighbor.
+    [query_vector] = client.embed(["marmoset enclosure"])
+    hits = warehouse._query_dicts(
+        "SELECT source, ref, text, score, event_ts, source_table FROM @search_hybrid("
+        "%s, %s, 'fake-model', 10)",
+        ("marmoset enclosure", vector_literal(query_vector)),
+    )
+    assert hits, "expected hybrid hits"
+    assert all(h["score"] < 0 for h in hits), "hybrid scores are negative RRF (lower = better)"
+    top = hits[0]
+    assert "marmoset" in top["text"]
+    assert top["source"] == "slack"
+    assert top["ref"].startswith("slack_message:")
+    assert top["event_ts"] is not None
+
+    # sources filter + aliases work on the semantic branch too.
+    scoped = warehouse._query_dicts(
+        "SELECT ref FROM @search_hybrid(%s, %s, 'fake-model', 10, ARRAY['gmail'])",
+        ("marmoset enclosure", vector_literal(query_vector)),
+    )
+    assert scoped == []
+
+    with pytest.raises(Exception, match="query_embedding is required"):
+        warehouse._query("SELECT * FROM @search_hybrid('x', '')")

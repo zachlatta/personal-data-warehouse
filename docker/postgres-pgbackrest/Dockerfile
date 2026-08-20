@@ -10,6 +10,11 @@ RUN apt-get update \
         pgbackrest \
         tini \
         zstd \
+        # pgvector: ANN vector search for the hybrid (semantic + BM25)
+        # timeline retrieval layer. Ships from the same pgdg apt repo the
+        # base image installs Postgres from; needs only CREATE EXTENSION
+        # vector per database (no shared_preload_libraries entry).
+        postgresql-18-pgvector \
     && rm -rf /var/lib/apt/lists/*
 
 # pg_textsearch: BM25 full-text search (https://github.com/timescale/pg_textsearch).

@@ -70,6 +70,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_finance_tables()
     wh.ensure_manual_finance_tables()
     wh.ensure_receipt_tables()
+    wh.ensure_search_index_tables()
     wh.ensure_timeline_tables()
     wh.ensure_pipeline_health_tables()
 
@@ -233,9 +234,11 @@ def test_timeline_indexes_are_registered_for_timeline_tables():
         "timeline_events_search_text_trgm_idx",
     } <= names
     # Retired after production usage counters showed zero lifetime scans: the
-    # kind filter rides the time/priority indexes and nothing pages by bare seq.
+    # kind filter rides the time/priority indexes. (timeline_events_seq_idx was
+    # retired for the same reason, then revived: the search-chunk builder pages
+    # timeline changes by bare seq as its incremental cursor.)
     assert "timeline_events_kind_time_idx" not in names
-    assert "timeline_events_seq_idx" not in names
+    assert "timeline_events_seq_idx" in names
 
 
 # --- live schema coverage (Postgres) -------------------------------------------

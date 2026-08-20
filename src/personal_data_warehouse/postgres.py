@@ -82,6 +82,9 @@ from personal_data_warehouse.schema import (
     SLACK_REACTION_COLUMNS,
     SLACK_SYNC_STATE_COLUMNS,
     SLACK_TEAM_COLUMNS,
+    SEARCH_CHUNK_COLUMNS,
+    SEARCH_CHUNK_EMBEDDING_COLUMNS,
+    SEARCH_CHUNK_SYNC_STATE_COLUMNS,
     SLACK_USER_COLUMNS,
     SYNC_STATE_COLUMNS,
     TIMELINE_EVENT_COLUMNS,
@@ -227,6 +230,18 @@ SEARCH_SOURCE_ALIASES: dict[str, str] = {
     "whoop_sleep": "whoop",
     "whoop_workout": "whoop",
 }
+# Hybrid retrieval (search_hybrid): reciprocal-rank-fusion constant. Rank-based
+# fusion sidesteps the cross-corpus score-comparability problem entirely — BM25
+# scores and cosine distances never meet, only ranks do. 60 is the standard
+# RRF k from the literature; it dampens the head so one branch's #1 cannot
+# drown the other branch's top few.
+SEARCH_HYBRID_RRF_K = 60
+# Embedding space for the semantic branch. 512-dim halfvec keeps ~10M chunks
+# around 10 GB of vectors; models are OpenAI-compatible `/v1/embeddings`
+# (cloud OpenAI, Gemini's compat endpoint, or a self-hosted server), requested
+# with dimensions=512 (Matryoshka truncation).
+SEARCH_EMBEDDING_DIMENSIONS = 512
+SEARCH_EMBEDDING_DEFAULT_MODEL = "text-embedding-3-small"
 # Timeline rows every search must exclude, beyond the per-row deleted flag.
 SEARCH_DRIVE_EXCLUSION_SQL = (
     "NOT (t.adapter = 'drive_file' "
@@ -305,6 +320,7 @@ class IndexSpec:
     sql: str
     requires_pg_trgm: bool = False
     requires_pg_textsearch: bool = False
+    requires_pgvector: bool = False
 
 
 POSTGRES_TABLES: dict[str, TableSpec] = {
@@ -569,6 +585,23 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ),
     ),
     "timeline_sync_state": TableSpec(TIMELINE_SYNC_STATE_COLUMNS, ("adapter",), "updated_at"),
+    # Derived search-retrieval layer (search_index.py). Chunks churn with the
+    # timeline, so give autovacuum the same append-heavy posture.
+    "search_chunks": TableSpec(
+        SEARCH_CHUNK_COLUMNS,
+        ("chunk_id",),
+        "built_at",
+        storage_parameters=(
+            ("autovacuum_vacuum_scale_factor", "0.02"),
+            ("autovacuum_analyze_scale_factor", "0.02"),
+        ),
+    ),
+    "search_chunk_embeddings": TableSpec(
+        SEARCH_CHUNK_EMBEDDING_COLUMNS,
+        ("text_sha256", "model"),
+        "embedded_at",
+    ),
+    "search_chunk_sync_state": TableSpec(SEARCH_CHUNK_SYNC_STATE_COLUMNS, ("id",), "updated_at"),
     # Pipeline freshness snapshot (personal_data_warehouse/pipeline_health.py).
     # One row per pipeline and one per warehouse table, replaced in place by each
     # collection; collected_at is the version column so a stale collector can
@@ -1070,6 +1103,44 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS timeline_events_context_time_idx "
         "ON @timeline_events (source, context, event_ts DESC, seq DESC)",
     ),
+    # The search-chunk builder pages timeline changes by seq (its watermark is
+    # a timeline.events.seq cursor), which nothing else does — the bare-seq
+    # index retired in POSTGRES_OBSOLETE_INDEXES is revived for exactly this.
+    IndexSpec(
+        "timeline_events_seq_idx",
+        "timeline_events",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS timeline_events_seq_idx "
+        "ON @timeline_events (seq)",
+    ),
+    # Search-chunk maintenance paths: replace-by-anchor on rebuild, embedding
+    # join by content sha, and the semantic branch's time/adapter filters.
+    IndexSpec(
+        "search_chunks_anchor_idx",
+        "search_chunks",
+        "CREATE INDEX IF NOT EXISTS search_chunks_anchor_idx ON @search_chunks (anchor)",
+    ),
+    IndexSpec(
+        "search_chunks_sha_idx",
+        "search_chunks",
+        "CREATE INDEX IF NOT EXISTS search_chunks_sha_idx ON @search_chunks (text_sha256)",
+    ),
+    IndexSpec(
+        "search_chunks_adapter_ts_idx",
+        "search_chunks",
+        "CREATE INDEX IF NOT EXISTS search_chunks_adapter_ts_idx "
+        "ON @search_chunks (adapter, event_ts DESC)",
+    ),
+    # ANN index for the hybrid semantic branch. Only buildable once the
+    # pgvector extension and the conditional halfvec column exist; on hosts
+    # without them the creation fails and is harmlessly skipped like every
+    # other missing-prerequisite index.
+    IndexSpec(
+        "search_chunk_embeddings_hnsw_idx",
+        "search_chunk_embeddings",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS search_chunk_embeddings_hnsw_idx "
+        "ON @search_chunk_embeddings USING hnsw (embedding public.halfvec_cosine_ops)",
+        requires_pgvector=True,
+    ),
     IndexSpec(
         "timeline_events_search_text_bm25_idx",
         "timeline_events",
@@ -1220,9 +1291,9 @@ POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
     # gmail_messages_recipients_array_idx in POSTGRES_INDEXES).
     ("slack_messages_live_human_thread_scan_idx", "slack_messages"),
     # Timeline btrees with zero lifetime scans; the kind filter rides the
-    # time/priority indexes and nothing pages by bare seq.
+    # time/priority indexes. (timeline_events_seq_idx was retired here too,
+    # then revived in POSTGRES_INDEXES: the search-chunk builder pages by seq.)
     ("timeline_events_kind_time_idx", "timeline_events"),
-    ("timeline_events_seq_idx", "timeline_events"),
 )
 
 
@@ -1406,6 +1477,9 @@ def _is_numeric_column(table: str | None, column: str) -> bool:
     return column in NUMERIC_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # search index: when a chunk was (re)built / a text embedded
+    "built_at",
+    "embedded_at",
     # receipts: the last transaction research attempt drives its retry window
     "last_attempt_at",
     # slack file fingerprints: when the backoff lets this file be retried.
@@ -1483,6 +1557,11 @@ TIMESTAMP_COLUMNS = {
 
 INTEGER_COLUMNS = {
     "seq",
+    # search index: chunk ordinal within an anchor, embedding token count,
+    # and the chunk builder's timeline-seq watermark
+    "chunk_index",
+    "token_count",
+    "last_seq",
     # slack file fingerprints: retry counter and downloaded size
     "attempts",
     "fetched_bytes",
@@ -1712,6 +1791,7 @@ class PostgresWarehouse:
         self._ensured_index_names: set[str] = set()
         self._pg_trgm_ensured = False
         self._pg_textsearch_ensured = False
+        self._pgvector_ensured = False
         self._ensure_canonical_schemas()
         self._set_search_path()
         self._ensure_query_role()
@@ -3119,6 +3199,44 @@ class PostgresWarehouse:
             )
             """
         )
+        self._ensure_search_views_if_possible()
+
+    def pgvector_available(self) -> bool:
+        """Whether this Postgres can CREATE EXTENSION vector.
+
+        The extension ships in the warehouse's postgres image; a host running
+        an older image simply lacks it, and every vector-dependent surface
+        (embedding column, HNSW index, search_hybrid) degrades until the image
+        is rolled — code never assumes it.
+        """
+        rows = self._query(
+            "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'"
+        )
+        return bool(rows)
+
+    def ensure_search_index_tables(self) -> None:
+        """Tables for the derived search-retrieval layer (search_index.py).
+
+        The chunk tables are plain and always creatable; the embedding vector
+        column and its HNSW index exist only where the pgvector extension is
+        installable, so the same code runs against pre-pgvector hosts (the
+        chunk backlog builds up and embeds later).
+        """
+        self._ensure_table_group(
+            ["search_chunks", "search_chunk_embeddings", "search_chunk_sync_state"]
+        )
+        if self.pgvector_available():
+            if not self._pgvector_ensured:
+                self._command("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
+                self._pgvector_ensured = True
+            self._command(
+                "ALTER TABLE @search_chunk_embeddings "
+                "ADD COLUMN IF NOT EXISTS embedding public.halfvec(512)"
+            )
+            # Re-walk the index specs now that the vector column exists (the
+            # first pass above ran before it and skipped the HNSW build).
+            self._ensured_index_names.discard("search_chunk_embeddings_hnsw_idx")
+            self._ensure_indexes(["search_chunk_embeddings"])
         self._ensure_search_views_if_possible()
 
     def _ensure_timeline_priority_type(self) -> None:
@@ -4640,6 +4758,11 @@ class PostgresWarehouse:
                     # on hosts whose Postgres lacks the pg_textsearch preload.
                     self._command("CREATE EXTENSION IF NOT EXISTS pg_textsearch WITH SCHEMA public")
                     self._pg_textsearch_ensured = True
+                if index.requires_pgvector and not self._pgvector_ensured:
+                    # Fails (and is harmlessly skipped) on hosts whose Postgres
+                    # image predates the pgvector install.
+                    self._command("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
+                    self._pgvector_ensured = True
                 index_sql = index.sql
                 if self._schema.startswith("pdw_test_"):
                     # CONCURRENTLY waits for every older transaction in the
@@ -7182,6 +7305,14 @@ class PostgresWarehouse:
             source = inspect.getsource(type(self)._ensure_search_text_function)
         except (OSError, TypeError):
             return ""
+        try:
+            # Flipping pgvector availability (or the chunk tables appearing)
+            # changes what the generator emits (search_hybrid), so it is part
+            # of the signature: rolling the postgres image to one with pgvector
+            # triggers exactly one rebuild that creates the hybrid function.
+            hybrid_state = f"{self.pgvector_available()}:{self._relation_exists('search_chunks')}"
+        except Exception:  # noqa: BLE001 - degrade to always-rebuild
+            hybrid_state = "unknown"
         payload = "\n".join(
             [
                 source,
@@ -7193,6 +7324,9 @@ class PostgresWarehouse:
                 str(SEARCH_TEXT_MAX_RESULTS_CAP),
                 str(SEARCH_TEXT_PREVIEW_CHARS),
                 str(SEARCH_TEXT_BROAD_PER_BRANCH_CAP),
+                str(SEARCH_HYBRID_RRF_K),
+                str(SEARCH_EMBEDDING_DIMENSIONS),
+                hybrid_state,
             ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -7759,6 +7893,123 @@ class PostgresWarehouse:
             $ctx$;
             """
         )
+        if self.pgvector_available() and self._relation_exists("search_chunks"):
+            # Hybrid retrieval: BM25 (search_text) + ANN over chunk embeddings,
+            # merged by reciprocal rank fusion. Only created where pgvector and
+            # the chunk tables exist; the app's `search` tool falls back to
+            # search_text() when this function is absent. Every vector type and
+            # operator is schema-qualified (public.halfvec / OPERATOR(public.<=>))
+            # so resolution never depends on the caller's search_path — the
+            # exact failure class behind the 16-day silent-zero outage.
+            self._command(
+                r"""
+            CREATE OR REPLACE FUNCTION @search_hybrid(
+                query text,
+                query_embedding text,
+                embedding_model text DEFAULT '"""
+                + SEARCH_EMBEDDING_DEFAULT_MODEL
+                + r"""',
+                max_results integer DEFAULT 50,
+                sources text[] DEFAULT NULL,
+                since timestamptz DEFAULT NULL
+            )
+            RETURNS SETOF @search_text_hit
+            LANGUAGE plpgsql
+            STABLE
+            AS $fn$
+            DECLARE
+                per_source integer := least(greatest(coalesce(max_results, 50), 1), """
+                + str(SEARCH_TEXT_MAX_RESULTS_CAP)
+                + r""");
+                qvec public.halfvec("""
+                + str(SEARCH_EMBEDDING_DIMENSIONS)
+                + r""");
+            BEGIN
+                IF query_embedding IS NULL OR trim(query_embedding) = '' THEN
+                    RAISE EXCEPTION 'search_hybrid: query_embedding is required'
+                        USING HINT = 'pass the query embedding as a vector literal; use search_text() for keyword-only search';
+                END IF;
+                qvec := query_embedding::public.halfvec("""
+                + str(SEARCH_EMBEDDING_DIMENSIONS)
+                + r""");
+                """
+                + sources_alias_sql
+                + r"""
+                RETURN QUERY
+                WITH lex AS (
+                    SELECT h.ref, h.source, h.subsource, h.context, h.who, h.occurred_at,
+                           h.account, h.text, h.title, h.source_table, h.source_pk,
+                           row_number() OVER () AS rnk
+                    FROM @search_text(query, per_source, sources, since) AS h
+                ),
+                sem_hits AS (
+                    SELECT c.adapter || ':' || c.event_id AS ref,
+                           c.context, c.event_ts, c.text,
+                           (e.embedding OPERATOR(public.<=>) qvec) AS dist
+                    FROM @search_chunk_embeddings e
+                    JOIN @search_chunks c ON c.text_sha256 = e.text_sha256
+                    JOIN (VALUES """
+                + adapter_source_values
+                + r""") AS map(adapter, source) ON map.adapter = c.adapter
+                    WHERE e.model = embedding_model
+                      AND e.embedding IS NOT NULL
+                      AND (sources IS NULL OR map.source = ANY (sources))
+                      AND (since IS NULL OR c.event_ts >= since)
+                    ORDER BY e.embedding OPERATOR(public.<=>) qvec
+                    LIMIT per_source * 4
+                ),
+                sem_ranked AS (
+                    SELECT d.ref, d.context, d.event_ts, d.text,
+                           row_number() OVER (ORDER BY d.dist ASC) AS rnk
+                    FROM (
+                        SELECT DISTINCT ON (sh.ref) sh.ref, sh.context, sh.event_ts,
+                               sh.text, sh.dist
+                        FROM sem_hits sh
+                        ORDER BY sh.ref, sh.dist ASC
+                    ) d
+                ),
+                merged AS (
+                    SELECT COALESCE(l.ref, s.ref) AS ref,
+                           l.source, l.subsource, l.context AS lex_context, l.who,
+                           l.occurred_at, l.account, l.text AS lex_text, l.title,
+                           l.source_table, l.source_pk,
+                           s.context AS sem_context, s.event_ts AS sem_ts, s.text AS sem_text,
+                           (COALESCE(1.0 / ("""
+                + str(SEARCH_HYBRID_RRF_K)
+                + r""" + l.rnk), 0) + COALESCE(1.0 / ("""
+                + str(SEARCH_HYBRID_RRF_K)
+                + r""" + s.rnk), 0)) AS rrf
+                    FROM lex l
+                    FULL OUTER JOIN sem_ranked s ON s.ref = l.ref
+                )
+                SELECT COALESCE(m.source, tmap.source, t.source) AS source,
+                       COALESCE(m.subsource, """
+                + exact_subsource_case
+                + r""") AS subsource,
+                       COALESCE(m.lex_context, m.sem_context, t.context) AS context,
+                       COALESCE(m.who, t.actor, '') AS who,
+                       COALESCE(m.occurred_at, m.sem_ts, t.event_ts) AS occurred_at,
+                       COALESCE(m.account, t.source_pk->>'account', t.metadata->>'account', '') AS account,
+                       m.ref,
+                       COALESCE(m.sem_text, m.lex_text) AS text,
+                       (-m.rrf)::real AS score,
+                       COALESCE(m.occurred_at, m.sem_ts, t.event_ts) AS event_ts,
+                       COALESCE(m.title, t.title, '') AS title,
+                       COALESCE(m.source_table, t.source_table, '') AS source_table,
+                       COALESCE(m.source_pk, t.source_pk) AS source_pk
+                FROM merged m
+                LEFT JOIN @timeline_events t
+                  ON t.adapter = split_part(m.ref, ':', 1)
+                 AND t.event_id = substring(m.ref FROM length(split_part(m.ref, ':', 1)) + 2)
+                LEFT JOIN (VALUES """
+                + adapter_source_values
+                + r""") AS tmap(adapter, source) ON tmap.adapter = t.adapter
+                ORDER BY m.rrf DESC, COALESCE(m.occurred_at, m.sem_ts, t.event_ts) DESC
+                LIMIT per_source;
+            END;
+            $fn$;
+            """
+            )
         # to_bm25query() resolves the timeline BM25 index by NAME, and the
         # EXECUTE'd branch SQL resolves the search_text_hit row type, both
         # through the CALLER's search_path. App/API query sessions run with

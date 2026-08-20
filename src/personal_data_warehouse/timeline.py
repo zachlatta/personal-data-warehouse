@@ -2165,6 +2165,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "upstream_mutation_request_events": _detail("upstream_mutation_requests"),
     # Search surfaces
     "search_schema_state": _state("search_text DDL signature cache"),
+    "search_chunks": _state("derived retrieval chunks behind timeline.search_hybrid()"),
+    "search_chunk_embeddings": _state("per-content-sha chunk embeddings (semantic search)"),
+    "search_chunk_sync_state": _state("chunk builder's timeline seq watermark"),
     # Pipeline freshness (personal_data_warehouse/pipeline_health.py): a
     # measurement of the warehouse's own pipelines, not activity in it.
     "pipeline_health": _state("per-pipeline freshness and health snapshot"),

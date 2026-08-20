@@ -1638,6 +1638,43 @@ TIMELINE_EVENT_COLUMNS = (
     "updated_at",
 )
 
+# Derived search-retrieval layer (personal_data_warehouse/search_index.py):
+# chunked documents behind timeline.search_hybrid(). One row per chunk; the
+# anchor ties a chunk back to the timeline rows it was built from so a changed
+# event replaces exactly its own chunks.
+SEARCH_CHUNK_COLUMNS = (
+    "chunk_id",
+    "anchor",
+    "adapter",
+    "event_id",
+    "source",
+    "context",
+    "event_ts",
+    "chunk_index",
+    "text",
+    "text_sha256",
+    "char_count",
+    "built_at",
+)
+
+# One embedding per distinct chunk text per model — identical text (repeated
+# messages, re-chunked docs) is embedded and paid for once. The vector column
+# itself (halfvec) is added conditionally when the pgvector extension is
+# available, so this spec stays creatable on hosts that predate the install.
+SEARCH_CHUNK_EMBEDDING_COLUMNS = (
+    "text_sha256",
+    "model",
+    "token_count",
+    "embedded_at",
+)
+
+# Single-row cursor over timeline.events.seq for the chunk builder.
+SEARCH_CHUNK_SYNC_STATE_COLUMNS = (
+    "id",
+    "last_seq",
+    "updated_at",
+)
+
 TIMELINE_SYNC_STATE_COLUMNS = (
     "adapter",
     "backfill_cursor_event_ts",

@@ -89,6 +89,7 @@ def _provision_everything(wh: PostgresWarehouse) -> None:
     wh.ensure_agent_tables()
     wh.ensure_whatsapp_client_session_table()
     wh.ensure_timeline_tables()
+    wh.ensure_search_index_tables()
     wh.ensure_upstream_mutation_tables()
     wh.ensure_pipeline_health_tables()
 
@@ -138,13 +139,13 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         "base": 52,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
-        "derived": 21,
+        "derived": 23,
         "marts": 29,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +1 internal: internal.search_text_preview, the
         # match-windowed preview helper both search functions use.
-        "timeline": 8,
-        "ops": 22,
+        "timeline": 9,
+        "ops": 23,
         "private": 5,
         "internal": 2,
     }
@@ -264,6 +265,7 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
     app_read = {obj.id for obj in CATALOG.objects if obj.query_access == "app_only"}
     assert app_read == {
         "timeline_sync_state",
+        "search_chunk_sync_state",
         # Read through the marts_ops views by the /pipelines dashboard; granted
         # directly too so "when did gmail last update?" is answerable in SQL.
         "pipeline_health",

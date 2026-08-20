@@ -1619,6 +1619,7 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_claude_desktop_tables()
     warehouse.ensure_agent_tables()
     warehouse.ensure_file_attachment_enrichment_tables()
+    warehouse.ensure_search_index_tables()
     # Every source above has a timeline adapter, and timeline sync reads all of
     # them. Sources added since this helper was last updated were missing, so
     # each timeline-backed search_text test died on an UndefinedTable for
@@ -1676,8 +1677,19 @@ def _search_text_function_sql() -> str:
         def _raw_command(self, sql: str) -> None:
             captured.append(sql)
 
+        # Report the vector prerequisites as present so the hybrid function's
+        # DDL is generated and captured for the structural tests below.
+        def pgvector_available(self) -> bool:
+            return True
+
+        def _relation_exists(self, table: str) -> bool:
+            return True
+
     postgres_module.PostgresWarehouse._ensure_search_text_function(_Capture())
-    return captured[0]
+    # The generator issues the core DDL first, then (prerequisites permitting)
+    # the search_hybrid DDL as a second command; concatenate so structural
+    # tests see everything a fully-equipped warehouse would run.
+    return "\n".join(sql for sql in captured if "CREATE OR REPLACE FUNCTION" in sql or "DO $do$" in sql)
 
 
 def _search_text_branch_source_labels() -> list[str]:

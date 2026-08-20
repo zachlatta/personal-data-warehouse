@@ -220,6 +220,14 @@
       "comment": "Modelled receipts facts: normalization, identity resolution, enrichment, and history that the raw source cannot express."
     },
     {
+      "name": "derived_search",
+      "layer": "derived",
+      "domain": "search",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Derived search-retrieval layer: chunked documents and their vector embeddings behind timeline.search_hybrid(). Chunks reference timeline.events anchors (adapter/event_id)."
+    },
+    {
       "name": "derived_slack",
       "layer": "derived",
       "domain": "slack",
@@ -1959,6 +1967,39 @@
       "secret": false
     },
     {
+      "id": "search_chunks",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "search",
+      "schema": "derived_search",
+      "name": "chunks",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "search_chunk_embeddings",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "search",
+      "schema": "derived_search",
+      "name": "chunk_embeddings",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "search_hybrid",
+      "kind": "function",
+      "layer": "timeline",
+      "domain": "timeline",
+      "schema": "timeline",
+      "name": "search_hybrid",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "gmail_sync_state",
       "kind": "table",
       "layer": "ops",
@@ -2159,6 +2200,17 @@
         "schema": "timeline",
         "name": "sync_state"
       }
+    },
+    {
+      "id": "search_chunk_sync_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "search_chunk_sync_state",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
     },
     {
       "id": "timeline_gmail_correspondents",

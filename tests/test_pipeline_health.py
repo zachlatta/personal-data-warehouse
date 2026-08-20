@@ -341,6 +341,7 @@ def _provision_every_table(wh: PostgresWarehouse) -> None:
     wh.ensure_finance_tables()
     wh.ensure_manual_finance_tables()
     wh.ensure_receipt_tables()
+    wh.ensure_search_index_tables()
     wh.ensure_timeline_tables()
     wh.ensure_pipeline_health_tables()
 

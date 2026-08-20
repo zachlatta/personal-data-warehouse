@@ -622,6 +622,20 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="timeline.events is too large to probe for writes; per-adapter sync state is the signal",
     ),
     Pipeline(
+        id="search_index",
+        label="Search index (chunks + embeddings)",
+        kind="derived",
+        cadence="chunks every 5 min; embeddings every 10 min",
+        transport="Dagster search_chunks / search_chunk_embeddings over timeline.events",
+        expected_data_interval=2 * HOUR,
+        expected_run_interval=None,
+        note=(
+            "chunks follow the timeline seq cursor; embeddings drain through the "
+            "configured OpenAI-compatible endpoint and skip (not fail) while "
+            "unconfigured or pre-pgvector"
+        ),
+    ),
+    Pipeline(
         id="upstream_mutations",
         label="Upstream mutations",
         kind="internal",
@@ -795,6 +809,14 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     # lives beside timeline.events), so its DDL-signature marker is timeline
     # state rather than a pipeline of its own.
     "search_schema_state": _state("timeline", None, "search DDL signature marker; carries no timestamp"),
+    # Derived search-retrieval layer (search_index.py)
+    "search_chunks": _data("search_index", "built_at", "event_ts"),
+    "search_chunk_embeddings": _support(
+        "search_index",
+        "embedded_at",
+        note="embedding coverage lags chunks by design; staleness here must not page while unconfigured",
+    ),
+    "search_chunk_sync_state": _state("search_index", "updated_at", "timeline seq watermark"),
     # Upstream mutations
     "upstream_mutations": _data("upstream_mutations", "updated_at", "created_at"),
     "upstream_mutation_requests": _data("upstream_mutations", "updated_at", "created_at"),
