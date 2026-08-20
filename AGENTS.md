@@ -105,7 +105,9 @@ Queries (the app's Go client only, never the Python document indexer) are wrappe
 instruction prefix from `SEARCH_EMBEDDINGS_QUERY_PREFIX`, per Qwen3-Embedding's
 instruction-asymmetric training. Inspect with `ssh mew docker logs pdw-embeddings`;
 relaunch with the same `docker run` flags plus `--auto-truncate` (required: the model's
-32k context exceeds TEI's default batch limit).
+32k context exceeds TEI's default batch limit) **and `--max-client-batch-size 256`**
+(the indexer posts 128-text batches; TEI's default cap of 32 makes them 413 —
+this exact omission broke a relaunch once already).
 Wider-than-512 vectors are MRL-truncated + renormalized client-side on both the Python
 and Go sides, so the server honoring the `dimensions` parameter is optional. pgvector
 ships in the warehouse postgres image; a host that predates it degrades (no embedding
