@@ -61,6 +61,52 @@ keep their filenode, rebuilds the marts/search layer from code, and validates th
 is deliberately not part of any `ensure_*` path: fresh provisioning only ever creates the
 target layout.
 
+## Timeline search and hybrid retrieval
+
+Text search runs through three timeline functions plus one app tool:
+
+- `timeline.search_text(query, max_results, sources, since)` — ranked BM25. Hits carry
+  `event_ts` (mirror of `occurred_at`), `title`, `source_table`, `source_pk` for one-hop
+  drill-down; the `text` preview is windowed around the first matched term; `sources`
+  accepts familiar aliases (`apple_messages`, `voice_memos`, `drive`, ...); a partially
+  failed fan-out WARNs and a fully failed one raises — an empty result is never a broken
+  search layer in disguise.
+- `timeline.search_text_exact(...)` — literal substring, recency-ordered, and it also
+  matches number-format variants of the needle (thousands separators both ways, phone
+  punctuation stripped).
+- `timeline.context(ref, before, after)` — the neighboring events of a hit's
+  (source, context) stream: the surrounding chat/channel messages, or the surrounding
+  turns of an agent session (context `<source>|<session_id>`).
+- The app's `search` tool — hybrid semantic+keyword retrieval: it embeds the query and
+  calls `timeline.search_hybrid` (BM25 + pgvector ANN fused by reciprocal rank), falling
+  back to keyword with an explicit `fallback_reason` when embeddings or pgvector are
+  unavailable. Agent sessions are indexed per turn (`kind = 'agent_turn'`); the session
+  roll-up row carries headline fields only.
+
+The semantic layer (`src/personal_data_warehouse/search_index.py`): `derived_search.chunks`
+is derived from `timeline.events` by the `search_chunks` asset (cursor =
+`timeline.events.seq`, so it converges whenever the timeline does — timeline sync also
+resets a source adapter's backfill whenever that adapter's SQL changes, via
+`adapter_signature` in `ops.timeline_sync_state`). Chat sources chunk as per-(context,
+hour) conversation windows; other sources chunk per event with big documents split.
+`derived_search.chunk_embeddings` holds one 512-dim halfvec per distinct chunk text per
+model (content-sha keyed), filled by the `search_chunk_embeddings` asset through any
+OpenAI-compatible `/v1/embeddings` endpoint (`SEARCH_EMBEDDINGS_BASE_URL` / `_API_KEY` /
+`_MODEL` / `_DIMENSIONS` on the Dagster AND app deployments). Unconfigured or
+pre-pgvector hosts skip loudly, never red.
+
+**The production embedding server runs on `mew` (the GPU box, `ssh mew`)**: a
+`text-embeddings-inference` container named `pdw-embeddings` (`--restart unless-stopped`,
+HF cache volume at `/opt/pdw-embeddings/hf-cache`) serving `Qwen/Qwen3-Embedding-0.6B` on
+the RTX 3080 Ti, bound to the tailnet at `http://100.104.110.27:8485/v1`. Inspect with
+`ssh mew docker logs pdw-embeddings`; relaunch with the same `docker run` flags plus
+`--auto-truncate` (required: the model's 32k context exceeds TEI's default batch limit).
+Wider-than-512 vectors are MRL-truncated + renormalized client-side on both the Python
+and Go sides, so the server honoring the `dimensions` parameter is optional. pgvector
+ships in the warehouse postgres image; a host that predates it degrades (no embedding
+column, no HNSW, no `search_hybrid`) until the DB container is rolled onto the current
+image.
+
 ## Pipeline Freshness and Health
 
 Every warehouse table also has to declare **which pipeline feeds it and how freshness is
