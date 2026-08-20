@@ -45,17 +45,23 @@ type EmbeddingsOptions struct {
 	// Dimensions defaults to DefaultEmbeddingsDimensions. The response vector
 	// must come back with exactly this many dimensions.
 	Dimensions int
+	// QueryPrefix is prepended to every text before embedding. Instruction-
+	// tuned retrieval models (Qwen3-Embedding) embed documents raw but expect
+	// queries wrapped in a task instruction; this client only ever embeds
+	// queries, so the prefix applies to everything it sends.
+	QueryPrefix string
 	// HTTPClient overrides the default 30s-timeout client (tests).
 	HTTPClient *http.Client
 }
 
 // EmbeddingsClient calls an OpenAI-compatible POST /embeddings endpoint.
 type EmbeddingsClient struct {
-	baseURL    string
-	apiKey     string
-	model      string
-	dimensions int
-	httpClient *http.Client
+	baseURL     string
+	apiKey      string
+	model       string
+	dimensions  int
+	queryPrefix string
+	httpClient  *http.Client
 }
 
 // NewEmbeddingsClient returns a client, or nil when embeddings are not
@@ -83,11 +89,12 @@ func NewEmbeddingsClient(opts EmbeddingsOptions) *EmbeddingsClient {
 		httpClient = &http.Client{Timeout: embeddingsRequestTimeout}
 	}
 	return &EmbeddingsClient{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		apiKey:     apiKey,
-		model:      model,
-		dimensions: dimensions,
-		httpClient: httpClient,
+		baseURL:     strings.TrimRight(baseURL, "/"),
+		apiKey:      apiKey,
+		model:       model,
+		dimensions:  dimensions,
+		queryPrefix: opts.QueryPrefix,
+		httpClient:  httpClient,
 	}
 }
 
@@ -98,7 +105,7 @@ func (c *EmbeddingsClient) Model() string { return c.model }
 func (c *EmbeddingsClient) Embed(ctx context.Context, text string) ([]float64, error) {
 	body, err := json.Marshal(map[string]any{
 		"model":      c.model,
-		"input":      []string{text},
+		"input":      []string{c.queryPrefix + text},
 		"dimensions": c.dimensions,
 	})
 	if err != nil {

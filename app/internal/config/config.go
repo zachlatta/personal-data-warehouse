@@ -87,6 +87,11 @@ type Config struct {
 	SearchEmbeddingsAPIKey     string
 	SearchEmbeddingsModel      string
 	SearchEmbeddingsDimensions int
+	// SearchEmbeddingsQueryPrefix is prepended to query text before embedding.
+	// Instruction-tuned retrieval models (Qwen3-Embedding) embed documents raw
+	// but expect queries wrapped in a task instruction; the Python indexing
+	// runner deliberately never applies it.
+	SearchEmbeddingsQueryPrefix string
 
 	// DriveSourceTokensByAccount maps a Google Drive *source* account email to
 	// its OAuth token JSON, so the account-aware download proxy can stream a
@@ -261,6 +266,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	cfg.SearchEmbeddingsBaseURL = strings.TrimRight(strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_BASE_URL")), "/")
 	cfg.SearchEmbeddingsAPIKey = strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_API_KEY"))
 	cfg.SearchEmbeddingsModel = valueOrDefault(strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_MODEL")), "text-embedding-3-small")
+	cfg.SearchEmbeddingsQueryPrefix = getenv("SEARCH_EMBEDDINGS_QUERY_PREFIX")
 	if cfg.SearchEmbeddingsDimensions, err = parsePositiveInt(getenv("SEARCH_EMBEDDINGS_DIMENSIONS"), 512, "SEARCH_EMBEDDINGS_DIMENSIONS"); err != nil {
 		return Config{}, err
 	}

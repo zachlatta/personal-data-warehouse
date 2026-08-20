@@ -97,10 +97,15 @@ pre-pgvector hosts skip loudly, never red.
 
 **The production embedding server runs on `mew` (the GPU box, `ssh mew`)**: a
 `text-embeddings-inference` container named `pdw-embeddings` (`--restart unless-stopped`,
-HF cache volume at `/opt/pdw-embeddings/hf-cache`) serving `Qwen/Qwen3-Embedding-0.6B` on
-the RTX 3080 Ti, bound to the tailnet at `http://100.104.110.27:8485/v1`. Inspect with
-`ssh mew docker logs pdw-embeddings`; relaunch with the same `docker run` flags plus
-`--auto-truncate` (required: the model's 32k context exceeds TEI's default batch limit).
+HF cache volume at `/opt/pdw-embeddings/hf-cache`) serving `Qwen/Qwen3-Embedding-4B` on
+the RTX 3080 Ti, bound to the tailnet at `http://100.104.110.27:8485/v1`. 4B was chosen
+over 0.6B off the 2026 MTEB standings (multilingual 69.45 vs 64.33; the 8B leader does
+not fit 12 GB) — the family tops open self-hosted models and the GPU is otherwise idle.
+Queries (the app's Go client only, never the Python document indexer) are wrapped in the
+instruction prefix from `SEARCH_EMBEDDINGS_QUERY_PREFIX`, per Qwen3-Embedding's
+instruction-asymmetric training. Inspect with `ssh mew docker logs pdw-embeddings`;
+relaunch with the same `docker run` flags plus `--auto-truncate` (required: the model's
+32k context exceeds TEI's default batch limit).
 Wider-than-512 vectors are MRL-truncated + renormalized client-side on both the Python
 and Go sides, so the server honoring the `dimensions` parameter is optional. pgvector
 ships in the warehouse postgres image; a host that predates it degrades (no embedding

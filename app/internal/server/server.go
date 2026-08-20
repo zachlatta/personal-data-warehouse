@@ -217,10 +217,11 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 
 	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}
 	if embedder := query.NewEmbeddingsClient(query.EmbeddingsOptions{
-		BaseURL:    cfg.SearchEmbeddingsBaseURL,
-		APIKey:     cfg.SearchEmbeddingsAPIKey,
-		Model:      cfg.SearchEmbeddingsModel,
-		Dimensions: cfg.SearchEmbeddingsDimensions,
+		BaseURL:     cfg.SearchEmbeddingsBaseURL,
+		APIKey:      cfg.SearchEmbeddingsAPIKey,
+		Model:       cfg.SearchEmbeddingsModel,
+		Dimensions:  cfg.SearchEmbeddingsDimensions,
+		QueryPrefix: cfg.SearchEmbeddingsQueryPrefix,
 	}); embedder != nil {
 		queryOpts.SearchEmbedder = embedder
 		logger.Info("search embeddings enabled", "model", embedder.Model())
