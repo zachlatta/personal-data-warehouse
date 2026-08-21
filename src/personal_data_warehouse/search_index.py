@@ -60,6 +60,9 @@ DOCUMENT_MAX_CHARS = 200_000
 CHUNK_MIN_CHARS = 3
 
 EMBED_BATCH_SIZE = 128
+# Candidate rows fetched per keyset page (pre-dedupe); bounds memory while
+# amortizing the anti-join probe cost over many embed batches.
+EMBED_SLAB_SIZE = 5_000
 # Embedding-model input cap safety: ~8k tokens for the OpenAI small models.
 EMBED_MAX_CHARS = 20_000
 
@@ -468,46 +471,95 @@ class SearchEmbeddingRunner:
         stats = EmbedStats()
         remaining = limit
         table = self._wh.sql_relation("search_chunk_embeddings")
+        # Newest-first keyset cursor over chunks. Recency-first means the
+        # searchable period grows backwards from today — the year Zach
+        # actually queries completes long before 2014's Slack does. The
+        # keyset (event_ts, chunk_id) pages the anti-join WITHOUT re-scanning
+        # the whole chunk table per batch: the previous per-batch
+        # GROUP-BY-over-everything candidate query collapsed throughput to
+        # ~40k/h once the corpus hit millions of chunks.
+        cursor_ts: datetime | None = None
+        cursor_id = ""
         while remaining > 0:
-            batch = self._wh._query(
-                """
-                SELECT c.text_sha256, max(c.text) AS text
-                FROM @search_chunks c
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM @search_chunk_embeddings e
-                    WHERE e.text_sha256 = c.text_sha256 AND e.model = %s
+            if cursor_ts is None:
+                slab = self._wh._query(
+                    """
+                    SELECT c.text_sha256, c.text, c.event_ts, c.chunk_id
+                    FROM @search_chunks c
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM @search_chunk_embeddings e
+                        WHERE e.text_sha256 = c.text_sha256 AND e.model = %s
+                    )
+                    ORDER BY c.event_ts DESC, c.chunk_id DESC
+                    LIMIT %s
+                    """,
+                    (client.model, EMBED_SLAB_SIZE),
                 )
-                GROUP BY c.text_sha256
-                LIMIT %s
-                """,
-                (client.model, min(EMBED_BATCH_SIZE, remaining)),
-            )
-            if not batch:
+            else:
+                slab = self._wh._query(
+                    """
+                    SELECT c.text_sha256, c.text, c.event_ts, c.chunk_id
+                    FROM @search_chunks c
+                    WHERE (c.event_ts, c.chunk_id) < (%s, %s)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM @search_chunk_embeddings e
+                        WHERE e.text_sha256 = c.text_sha256 AND e.model = %s
+                    )
+                    ORDER BY c.event_ts DESC, c.chunk_id DESC
+                    LIMIT %s
+                    """,
+                    (cursor_ts, cursor_id, client.model, EMBED_SLAB_SIZE),
+                )
+            if not slab:
                 stats.caught_up = True
                 break
-            shas = [row[0] for row in batch]
-            texts = [row[1] for row in batch]
-            vectors = client.embed(texts)
-            with self._wh._connection.cursor() as cursor:
-                execute_values(
-                    cursor,
-                    f"INSERT INTO {table} (text_sha256, model, token_count, embedded_at, embedding)"
-                    " VALUES %s ON CONFLICT (text_sha256, model) DO UPDATE SET"
-                    " token_count = EXCLUDED.token_count, embedded_at = now(),"
-                    " embedding = EXCLUDED.embedding",
-                    [
-                        (sha, client.model, max(1, len(text) // 4), vector_literal(vector))
-                        for sha, text, vector in zip(shas, texts, vectors, strict=True)
-                    ],
-                    template=(
-                        "(%s, %s, %s, now(), %s::public.halfvec("
-                        + str(SEARCH_EMBEDDING_DIMENSIONS)
-                        + "))"
-                    ),
-                    page_size=200,
-                )
-            stats.embedded += len(batch)
-            remaining -= len(batch)
-            if deadline is not None and time.monotonic() >= deadline:
-                break
+            cursor_ts, cursor_id = slab[-1][2], slab[-1][3]
+            # Dedupe by content sha within the slab (identical text repeats
+            # across windows); the anti-join handles cross-slab repeats.
+            seen: dict[str, str] = {}
+            for sha, text, _ts, _cid in slab:
+                if sha not in seen:
+                    seen[sha] = text
+            pending = list(seen.items())[: max(remaining, 0)]
+            if not pending:
+                continue
+            batches = [
+                pending[i : i + EMBED_BATCH_SIZE]
+                for i in range(0, len(pending), EMBED_BATCH_SIZE)
+            ]
+            # Two requests in flight keeps the GPU busy while the previous
+            # batch's rows insert; more would only queue inside TEI.
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(client.embed, [text for _, text in batch])
+                    for batch in batches
+                ]
+                for batch, future in zip(batches, futures, strict=True):
+                    vectors = future.result()
+                    with self._wh._connection.cursor() as db_cursor:
+                        execute_values(
+                            db_cursor,
+                            f"INSERT INTO {table} (text_sha256, model, token_count, embedded_at, embedding)"
+                            " VALUES %s ON CONFLICT (text_sha256, model) DO UPDATE SET"
+                            " token_count = EXCLUDED.token_count, embedded_at = now(),"
+                            " embedding = EXCLUDED.embedding",
+                            [
+                                (sha, client.model, max(1, len(text) // 4), vector_literal(vector))
+                                for (sha, text), vector in zip(batch, vectors, strict=True)
+                            ],
+                            template=(
+                                "(%s, %s, %s, now(), %s::public.halfvec("
+                                + str(SEARCH_EMBEDDING_DIMENSIONS)
+                                + "))"
+                            ),
+                            page_size=200,
+                        )
+                    stats.embedded += len(batch)
+                    remaining -= len(batch)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        for pending_future in futures:
+                            pending_future.cancel()
+                        return stats
         return stats

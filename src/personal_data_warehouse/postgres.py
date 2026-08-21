@@ -1130,6 +1130,13 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS search_chunks_adapter_ts_idx "
         "ON @search_chunks (adapter, event_ts DESC)",
     ),
+    # Newest-first keyset cursor for the embedding drain (event_ts, chunk_id).
+    IndexSpec(
+        "search_chunks_ts_chunk_idx",
+        "search_chunks",
+        "CREATE INDEX IF NOT EXISTS search_chunks_ts_chunk_idx "
+        "ON @search_chunks (event_ts DESC, chunk_id DESC)",
+    ),
     # ANN index for the hybrid semantic branch. Only buildable once the
     # pgvector extension and the conditional halfvec column exist; on hosts
     # without them the creation fails and is harmlessly skipped like every
