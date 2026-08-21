@@ -242,16 +242,17 @@ SEARCH_SOURCE_ALIASES: dict[str, str] = {
 # RRF k from the literature; it dampens the head so one branch's #1 cannot
 # drown the other branch's top few.
 SEARCH_HYBRID_RRF_K = 60
-# Give paraphrase retrieval a small advantage without letting it drown exact
-# lexical matches. Once the semantic corpus grew from 30 to 90 days, the former
-# 1.5x boost let a semantic-only hit at rank 30 beat the best lexical hit. A
-# human-judged replay over the expanded corpus keeps the useful semantic
-# promotion at 1.25x while preserving strong keyword answers.
-SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.25
+# Keep semantic and lexical ranks balanced. Once the semantic corpus grew from
+# 30 to 90 days, even a small semantic boost let merely related passages drown
+# exact high-confidence keyword answers. Overlaps already receive both RRF
+# contributions and need no extra multiplier.
+SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.0
 # Filtered ANN recall depends on asking the iterative scan for a deep enough
 # qualifying pool. A 4x pool was adequate at 30 days but became unstable at 90
 # days because the global HNSW index had three times as many filtered-out rows.
 SEARCH_HYBRID_CANDIDATE_MULTIPLIER = 20
+SEARCH_HYBRID_MIN_CANDIDATES = 1000
+SEARCH_HYBRID_MAX_CANDIDATES = 2000
 # Embedding space for the semantic branch. 512-dim halfvec keeps ~10M chunks
 # around 10 GB of vectors; models are OpenAI-compatible `/v1/embeddings`
 # (cloud OpenAI, Gemini's compat endpoint, or a self-hosted server), requested
@@ -7355,6 +7356,8 @@ class PostgresWarehouse:
                 str(SEARCH_HYBRID_RRF_K),
                 str(SEARCH_HYBRID_SEMANTIC_WEIGHT),
                 str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER),
+                str(SEARCH_HYBRID_MIN_CANDIDATES),
+                str(SEARCH_HYBRID_MAX_CANDIDATES),
                 str(SEARCH_EMBEDDING_DIMENSIONS),
                 hybrid_state,
             ]
@@ -8006,9 +8009,13 @@ class PostgresWarehouse:
                       AND (sources IS NULL OR map.source = ANY (sources))
                       AND (since IS NULL OR c.event_ts >= since)
                     ORDER BY e.embedding OPERATOR(public.<=>) qvec
-                    LIMIT per_source * """
+                    LIMIT least(greatest(per_source * """
                 + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
-                + r"""
+                + ", "
+                + str(SEARCH_HYBRID_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_MAX_CANDIDATES)
+                + r""")
                 ),
                 sem_ranked AS (
                     SELECT d.ref, d.context, d.event_ts, d.text,

@@ -1692,16 +1692,16 @@ def _search_text_function_sql() -> str:
     return "\n".join(sql for sql in captured if "CREATE OR REPLACE FUNCTION" in sql or "DO $do$" in sql)
 
 
-def test_search_hybrid_gives_semantic_rank_a_bounded_boost() -> None:
+def test_search_hybrid_balances_semantic_and_lexical_ranks() -> None:
     sql = _search_text_function_sql()
 
-    assert "1.25 * COALESCE(1.0 / (60 + s.rnk), 0)" in sql
+    assert "1.0 * COALESCE(1.0 / (60 + s.rnk), 0)" in sql
 
 
 def test_search_hybrid_uses_a_deep_filtered_semantic_candidate_pool() -> None:
     sql = _search_text_function_sql()
 
-    assert "LIMIT per_source * 20" in sql
+    assert "LIMIT least(greatest(per_source * 20, 1000), 2000)" in sql
 
 
 def test_search_schema_signature_covers_hybrid_tuning(monkeypatch) -> None:
@@ -1712,6 +1712,7 @@ def test_search_schema_signature_covers_hybrid_tuning(monkeypatch) -> None:
     monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: True)
     baseline = warehouse._search_schema_signature()
     baseline_weight = postgres_module.SEARCH_HYBRID_SEMANTIC_WEIGHT
+    baseline_multiplier = postgres_module.SEARCH_HYBRID_CANDIDATE_MULTIPLIER
 
     monkeypatch.setattr(
         postgres_module,
@@ -1726,7 +1727,19 @@ def test_search_schema_signature_covers_hybrid_tuning(monkeypatch) -> None:
     monkeypatch.setattr(
         postgres_module,
         "SEARCH_HYBRID_CANDIDATE_MULTIPLIER",
-        postgres_module.SEARCH_HYBRID_CANDIDATE_MULTIPLIER + 1,
+        baseline_multiplier + 1,
+    )
+    assert warehouse._search_schema_signature() != baseline
+
+    monkeypatch.setattr(
+        postgres_module,
+        "SEARCH_HYBRID_CANDIDATE_MULTIPLIER",
+        baseline_multiplier,
+    )
+    monkeypatch.setattr(
+        postgres_module,
+        "SEARCH_HYBRID_MIN_CANDIDATES",
+        postgres_module.SEARCH_HYBRID_MIN_CANDIDATES + 1,
     )
     assert warehouse._search_schema_signature() != baseline
 
