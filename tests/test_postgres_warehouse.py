@@ -1701,7 +1701,7 @@ def test_search_hybrid_gives_semantic_rank_a_modest_weight_boost() -> None:
 def test_search_hybrid_uses_iterative_hnsw_for_filtered_recent_searches() -> None:
     sql = _search_text_function_sql()
 
-    assert "set_config('hnsw.iterative_scan', 'strict_order', true)" in sql
+    assert "set_config('hnsw.iterative_scan', 'relaxed_order', true)" in sql
     assert "greatest(400, per_source * 8)" in sql
     assert "set_config('hnsw.max_scan_tuples', '100000', true)" in sql
     assert "set_config('hnsw.scan_mem_multiplier', '4', true)" in sql

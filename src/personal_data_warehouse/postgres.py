@@ -7964,15 +7964,17 @@ class PostgresWarehouse:
                 -- Recent/source filters are applied during the ANN scan. With
                 -- iterative scan disabled, ef_search candidates from the full
                 -- corpus can contain too few qualifying rows and silently
-                -- omit excellent recent matches. Strict iterative scan keeps
-                -- expanding until the filtered LIMIT is satisfied, while the
-                -- larger exploration floor improves approximate recall. The
+                -- omit excellent recent matches. Relaxed iterative scan keeps
+                -- expanding until the filtered LIMIT is satisfied and gives
+                -- better filtered recall than strict ordering; the outer
+                -- semantic ranking restores distance order. The larger
+                -- exploration floor improves approximate recall. The
                 -- default 20k tuple/memory budgets became too small once the
                 -- embedding corpus covered 90 days: selective 30-day queries
                 -- could exhaust the global ANN scan before reaching their
                 -- best recent neighbors.
                 PERFORM set_config('hnsw.ef_search', greatest(400, per_source * 8)::text, true);
-                PERFORM set_config('hnsw.iterative_scan', 'strict_order', true);
+                PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);
                 PERFORM set_config('hnsw.max_scan_tuples', '100000', true);
                 PERFORM set_config('hnsw.scan_mem_multiplier', '4', true);
                 """
