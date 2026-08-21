@@ -242,12 +242,12 @@ SEARCH_SOURCE_ALIASES: dict[str, str] = {
 # RRF k from the literature; it dampens the head so one branch's #1 cannot
 # drown the other branch's top few.
 SEARCH_HYBRID_RRF_K = 60
-# Keep the two branches balanced. Once the semantic corpus grew from 30 to 90
-# days, a semantic-only hit at rank 30 still beat the best lexical hit under
-# the former 1.5x boost, drowning exact high-confidence keyword matches with
-# merely related passages. Overlaps already receive both RRF contributions and
-# need no extra semantic multiplier.
-SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.0
+# Give paraphrase retrieval a small advantage without letting it drown exact
+# lexical matches. Once the semantic corpus grew from 30 to 90 days, the former
+# 1.5x boost let a semantic-only hit at rank 30 beat the best lexical hit. A
+# human-judged replay over the expanded corpus keeps the useful semantic
+# promotion at 1.25x while preserving strong keyword answers.
+SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.25
 # Filtered ANN recall depends on asking the iterative scan for a deep enough
 # qualifying pool. A 4x pool was adequate at 30 days but became unstable at 90
 # days because the global HNSW index had three times as many filtered-out rows.
