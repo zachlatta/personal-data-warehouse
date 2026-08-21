@@ -1703,6 +1703,8 @@ def test_search_hybrid_uses_iterative_hnsw_for_filtered_recent_searches() -> Non
 
     assert "set_config('hnsw.iterative_scan', 'strict_order', true)" in sql
     assert "greatest(100, per_source * 8)" in sql
+    assert "set_config('hnsw.max_scan_tuples', '100000', true)" in sql
+    assert "set_config('hnsw.scan_mem_multiplier', '4', true)" in sql
 
 
 def _search_text_branch_source_labels() -> list[str]:
