@@ -242,13 +242,16 @@ SEARCH_SOURCE_ALIASES: dict[str, str] = {
 # RRF k from the literature; it dampens the head so one branch's #1 cannot
 # drown the other branch's top few.
 SEARCH_HYBRID_RRF_K = 60
-# Semantic-only matches otherwise tie lexical-only matches at the same rank,
-# even though the semantic branch is the one that recovers paraphrases and
-# natural-language questions.  A private, human-judged recent-corpus replay
-# found that a modest boost promoted those answers without displacing strong
-# lexical+semantic overlaps.  Keep this deliberately small: exact identifiers
-# and quoted phrases still belong on the lexical/exact paths.
-SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.5
+# Keep the two branches balanced. Once the semantic corpus grew from 30 to 90
+# days, a semantic-only hit at rank 30 still beat the best lexical hit under
+# the former 1.5x boost, drowning exact high-confidence keyword matches with
+# merely related passages. Overlaps already receive both RRF contributions and
+# need no extra semantic multiplier.
+SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.0
+# Filtered ANN recall depends on asking the iterative scan for a deep enough
+# qualifying pool. A 4x pool was adequate at 30 days but became unstable at 90
+# days because the global HNSW index had three times as many filtered-out rows.
+SEARCH_HYBRID_CANDIDATE_MULTIPLIER = 20
 # Embedding space for the semantic branch. 512-dim halfvec keeps ~10M chunks
 # around 10 GB of vectors; models are OpenAI-compatible `/v1/embeddings`
 # (cloud OpenAI, Gemini's compat endpoint, or a self-hosted server), requested
@@ -8001,7 +8004,9 @@ class PostgresWarehouse:
                       AND (sources IS NULL OR map.source = ANY (sources))
                       AND (since IS NULL OR c.event_ts >= since)
                     ORDER BY e.embedding OPERATOR(public.<=>) qvec
-                    LIMIT per_source * 4
+                    LIMIT per_source * """
+                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
+                + r"""
                 ),
                 sem_ranked AS (
                     SELECT d.ref, d.context, d.event_ts, d.text,

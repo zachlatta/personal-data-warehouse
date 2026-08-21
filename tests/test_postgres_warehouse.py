@@ -1692,10 +1692,16 @@ def _search_text_function_sql() -> str:
     return "\n".join(sql for sql in captured if "CREATE OR REPLACE FUNCTION" in sql or "DO $do$" in sql)
 
 
-def test_search_hybrid_gives_semantic_rank_a_modest_weight_boost() -> None:
+def test_search_hybrid_balances_semantic_and_lexical_ranks() -> None:
     sql = _search_text_function_sql()
 
-    assert "1.5 * COALESCE(1.0 / (60 + s.rnk), 0)" in sql
+    assert "1.0 * COALESCE(1.0 / (60 + s.rnk), 0)" in sql
+
+
+def test_search_hybrid_uses_a_deep_filtered_semantic_candidate_pool() -> None:
+    sql = _search_text_function_sql()
+
+    assert "LIMIT per_source * 20" in sql
 
 
 def test_search_hybrid_uses_iterative_hnsw_for_filtered_recent_searches() -> None:
