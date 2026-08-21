@@ -221,3 +221,8 @@ __marimo__/
 # These contain whatever the agent was asked to read (receipt text, email
 # bodies, transcripts), so they must never be committed to this public repo.
 .agent-runs/
+
+# Local search-evaluation corpora and reports contain private timeline queries
+# and result references mined from agent transcripts.  Keep the reproducible
+# harness in git, never its generated inputs or outputs.
+.search-eval/
