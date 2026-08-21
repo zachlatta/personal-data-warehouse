@@ -7973,7 +7973,7 @@ class PostgresWarehouse:
                 -- embedding corpus covered 90 days: selective 30-day queries
                 -- could exhaust the global ANN scan before reaching their
                 -- best recent neighbors.
-                PERFORM set_config('hnsw.ef_search', greatest(400, per_source * 8)::text, true);
+                PERFORM set_config('hnsw.ef_search', greatest(2000, per_source * 8)::text, true);
                 PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);
                 PERFORM set_config('hnsw.max_scan_tuples', '100000', true);
                 PERFORM set_config('hnsw.scan_mem_multiplier', '4', true);
