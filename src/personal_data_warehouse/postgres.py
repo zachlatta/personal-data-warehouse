@@ -7954,6 +7954,9 @@ class PostgresWarehouse:
                 qvec := query_embedding::public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
                 + r""");
+                -- HNSW returns at most ef_search candidates regardless of
+                -- LIMIT; the default (40) silently starves per_source * 4.
+                PERFORM set_config('hnsw.ef_search', (per_source * 4)::text, true);
                 """
                 + sources_alias_sql
                 + r"""
@@ -8020,9 +8023,16 @@ class PostgresWarehouse:
                        COALESCE(m.source_table, t.source_table, '') AS source_table,
                        COALESCE(m.source_pk, t.source_pk) AS source_pk
                 FROM merged m
-                LEFT JOIN @timeline_events t
-                  ON t.adapter = split_part(m.ref, ':', 1)
-                 AND t.event_id = substring(m.ref FROM length(split_part(m.ref, ':', 1)) + 2)
+                -- LATERAL forces a per-row primary-key probe. A plain join on
+                -- these computed expressions let the planner pick a hash join,
+                -- which seq-scanned the ~47M-row timeline table (~29s of a
+                -- 36s call) for a <=200-row merge.
+                LEFT JOIN LATERAL (
+                    SELECT te.* FROM @timeline_events te
+                    WHERE te.adapter = split_part(m.ref, ':', 1)
+                      AND te.event_id = substring(m.ref FROM length(split_part(m.ref, ':', 1)) + 2)
+                    LIMIT 1
+                ) t ON TRUE
                 LEFT JOIN (VALUES """
                 + adapter_source_values
                 + r""") AS tmap(adapter, source) ON tmap.adapter = t.adapter
