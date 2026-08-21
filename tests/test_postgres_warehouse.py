@@ -1692,6 +1692,19 @@ def _search_text_function_sql() -> str:
     return "\n".join(sql for sql in captured if "CREATE OR REPLACE FUNCTION" in sql or "DO $do$" in sql)
 
 
+def test_search_hybrid_gives_semantic_rank_a_modest_weight_boost() -> None:
+    sql = _search_text_function_sql()
+
+    assert "1.5 * COALESCE(1.0 / (60 + s.rnk), 0)" in sql
+
+
+def test_search_hybrid_uses_iterative_hnsw_for_filtered_recent_searches() -> None:
+    sql = _search_text_function_sql()
+
+    assert "set_config('hnsw.iterative_scan', 'strict_order', true)" in sql
+    assert "greatest(100, per_source * 8)" in sql
+
+
 def _search_text_branch_source_labels() -> list[str]:
     """The per-branch source labels search_text() filters on, parsed from the
     generated `branch_sources` array in the function SQL (no DB needed)."""

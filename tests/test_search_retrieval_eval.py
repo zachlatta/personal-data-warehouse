@@ -163,6 +163,10 @@ def test_evaluate_case_reports_recall_mrr_and_novelty() -> None:
     assert result["hybrid_recall_at_k"] == pytest.approx(0.5)
     assert result["keyword_mrr"] == pytest.approx(1.0)
     assert result["hybrid_mrr"] == pytest.approx(0.5)
+    assert result["keyword_hit_at_1"] == pytest.approx(1.0)
+    assert result["hybrid_hit_at_1"] == pytest.approx(0.0)
+    assert result["keyword_hit_at_5"] == pytest.approx(1.0)
+    assert result["hybrid_hit_at_5"] == pytest.approx(1.0)
     assert result["hybrid_novel_refs"] == ["new"]
 
 
@@ -189,6 +193,8 @@ def test_evaluate_case_does_not_claim_recall_without_judgments() -> None:
     )
     assert result["keyword_recall_at_k"] is None
     assert result["hybrid_recall_at_k"] is None
+    assert result["keyword_hit_at_1"] is None
+    assert result["hybrid_hit_at_5"] is None
 
 
 def test_extract_cases_uses_source_and_time_when_historical_rows_omit_ref() -> None:

@@ -34,7 +34,10 @@ exploratory count of roughly 465 included those ambiguous transcript matches.
 
 Exact identifier/phrase searches replay only in `exact` mode. Ranked keyword
 queries run in both `keyword` and `hybrid` modes and report recall@k, MRR,
-fallbacks, errors, and hybrid candidates that were not in the keyword top-k.
+hit@1, hit@5, fallbacks, errors, and hybrid candidates that were not in the
+keyword top-k. Hit rates answer the practical question "did the user get at
+least one useful result near the top?" without penalizing a retriever for not
+returning every duplicate passage that contains the same answer.
 Do not interpret hybrid numbers while `derived_search.chunks` or
 `derived_search.chunk_embeddings` is still backfilling: the lexical half sees
 the full timeline while the semantic half does not.

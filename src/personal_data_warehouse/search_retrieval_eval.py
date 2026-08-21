@@ -258,6 +258,15 @@ def _mrr(relevant: Sequence[str], returned: Sequence[str], k: int) -> float | No
     return 0.0
 
 
+def _hit(relevant: Sequence[str], returned: Sequence[str], k: int) -> float | None:
+    """Return whether at least one relevant result appears in the first k."""
+
+    if not relevant:
+        return None
+    relevant_set = {canonical_ref(ref) for ref in relevant}
+    return float(any(canonical_ref(ref) in relevant_set for ref in returned[:k]))
+
+
 def evaluate_case(
     case: EvalCase,
     *,
@@ -283,6 +292,12 @@ def evaluate_case(
         ),
         "keyword_mrr": _mrr(relevant, keyword.keys, k),
         "hybrid_mrr": _mrr(relevant, hybrid.keys, k) if hybrid else None,
+        "keyword_hit_at_1": _hit(relevant, keyword.keys, 1),
+        "hybrid_hit_at_1": _hit(relevant, hybrid.keys, 1) if hybrid else None,
+        "keyword_hit_at_5": _hit(relevant, keyword.keys, min(5, k)),
+        "hybrid_hit_at_5": (
+            _hit(relevant, hybrid.keys, min(5, k)) if hybrid else None
+        ),
         "hybrid_novel_refs": [
             ref
             for index, ref in enumerate(hybrid_refs[:k])
@@ -408,6 +423,10 @@ def summarize(rows: Sequence[dict[str, Any]], *, k: int) -> dict[str, Any]:
         "hybrid_recall_at_k": _mean(judged, "hybrid_recall_at_k"),
         "keyword_mrr": _mean(judged, "keyword_mrr"),
         "hybrid_mrr": _mean(judged, "hybrid_mrr"),
+        "keyword_hit_at_1": _mean(judged, "keyword_hit_at_1"),
+        "hybrid_hit_at_1": _mean(judged, "hybrid_hit_at_1"),
+        "keyword_hit_at_5": _mean(judged, "keyword_hit_at_5"),
+        "hybrid_hit_at_5": _mean(judged, "hybrid_hit_at_5"),
         "hybrid_fallbacks": sum(bool(row.get("hybrid_fallback_reason")) for row in rows),
         "keyword_errors": sum(bool(row.get("keyword_error")) for row in rows),
         "hybrid_errors": sum(bool(row.get("hybrid_error")) for row in rows),

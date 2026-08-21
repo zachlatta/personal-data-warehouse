@@ -242,6 +242,13 @@ SEARCH_SOURCE_ALIASES: dict[str, str] = {
 # RRF k from the literature; it dampens the head so one branch's #1 cannot
 # drown the other branch's top few.
 SEARCH_HYBRID_RRF_K = 60
+# Semantic-only matches otherwise tie lexical-only matches at the same rank,
+# even though the semantic branch is the one that recovers paraphrases and
+# natural-language questions.  A private, human-judged recent-corpus replay
+# found that a modest boost promoted those answers without displacing strong
+# lexical+semantic overlaps.  Keep this deliberately small: exact identifiers
+# and quoted phrases still belong on the lexical/exact paths.
+SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.5
 # Embedding space for the semantic branch. 512-dim halfvec keeps ~10M chunks
 # around 10 GB of vectors; models are OpenAI-compatible `/v1/embeddings`
 # (cloud OpenAI, Gemini's compat endpoint, or a self-hosted server), requested
@@ -7954,9 +7961,14 @@ class PostgresWarehouse:
                 qvec := query_embedding::public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
                 + r""");
-                -- HNSW returns at most ef_search candidates regardless of
-                -- LIMIT; the default (40) silently starves per_source * 4.
-                PERFORM set_config('hnsw.ef_search', (per_source * 4)::text, true);
+                -- Recent/source filters are applied during the ANN scan. With
+                -- iterative scan disabled, ef_search candidates from the full
+                -- corpus can contain too few qualifying rows and silently
+                -- omit excellent recent matches. Strict iterative scan keeps
+                -- expanding until the filtered LIMIT is satisfied, while the
+                -- larger exploration floor improves approximate recall.
+                PERFORM set_config('hnsw.ef_search', greatest(100, per_source * 8)::text, true);
+                PERFORM set_config('hnsw.iterative_scan', 'strict_order', true);
                 """
                 + sources_alias_sql
                 + r"""
@@ -8001,7 +8013,9 @@ class PostgresWarehouse:
                            s.context AS sem_context, s.event_ts AS sem_ts, s.text AS sem_text,
                            (COALESCE(1.0 / ("""
                 + str(SEARCH_HYBRID_RRF_K)
-                + r""" + l.rnk), 0) + COALESCE(1.0 / ("""
+                + r""" + l.rnk), 0) + """
+                + str(SEARCH_HYBRID_SEMANTIC_WEIGHT)
+                + r""" * COALESCE(1.0 / ("""
                 + str(SEARCH_HYBRID_RRF_K)
                 + r""" + s.rnk), 0)) AS rrf
                     FROM lex l
