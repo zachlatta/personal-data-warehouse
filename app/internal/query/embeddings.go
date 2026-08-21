@@ -113,6 +113,7 @@ func (c *EmbeddingsClient) Embed(ctx context.Context, text string) ([]float64, e
 	}
 	vector, retryable, err := c.embedOnce(ctx, body)
 	if err != nil && retryable {
+		time.Sleep(500 * time.Millisecond)
 		vector, _, err = c.embedOnce(ctx, body)
 	}
 	return vector, err
@@ -131,7 +132,10 @@ func (c *EmbeddingsClient) embedOnce(ctx context.Context, body []byte) (vector [
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, false, fmt.Errorf("embeddings request failed: %w", err)
+		// Transport failures (refused/reset dials, transient tailnet blips)
+		// are exactly as retryable as a 503 — returning them as terminal made
+		// half an eval run fall back to keyword over momentary dial errors.
+		return nil, true, fmt.Errorf("embeddings request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
