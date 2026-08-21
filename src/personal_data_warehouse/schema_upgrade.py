@@ -559,6 +559,7 @@ def provision_everything(warehouse) -> None:
     warehouse.ensure_receipt_tables()
     warehouse.ensure_agent_tables()
     warehouse.ensure_timeline_tables()
+    warehouse.ensure_search_index_tables()
     warehouse.ensure_upstream_mutation_tables()
     warehouse.ensure_pipeline_health_tables()
 

@@ -412,6 +412,245 @@ def test_same_quantity_and_date_with_materially_different_amounts_do_not_merge()
     assert len(rows) == 2
 
 
+def test_split_fill_statement_rows_merge_into_the_single_plaid_trade():
+    """A statement prints one order as partial fills (11 + 0.650089 shares) while
+    Plaid posts the whole 11.650089-share trade as one row a day later. Found in
+    the real corpus 2026-08-21: ten such trades were double-counted, inflating
+    the VTI position's lots to exactly 2x the held quantity."""
+    plaid = [
+        _trade(
+            source="plaid",
+            source_row_key="z|investment|p1",
+            trade_date=date(2026, 1, 14),
+            quantity=D("11.650089"),
+            price=D("343.345"),
+            amount=D("4000.0"),
+        )
+    ]
+    document = [
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|4",
+            trade_date=date(2026, 1, 13),
+            quantity=D("11"),
+            price=D("343.345"),
+            amount=D("3776.80"),
+        ),
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|5",
+            trade_date=date(2026, 1, 13),
+            quantity=D("0.650089"),
+            price=D("343.345"),
+            amount=D("223.20"),
+        ),
+    ]
+    rows, links, merged = dedupe_security_trades(plaid, document)
+    assert merged == 2
+    assert len(rows) == 1
+    assert rows[0]["source"] == "plaid"
+    assert {link["transaction_id"] for link in links} == {rows[0]["transaction_id"]}
+    assert sorted(
+        link["match_method"] for link in links if link["source"] == "manual_finance"
+    ) == ["security_split_fill", "security_split_fill"]
+
+
+def test_split_fill_merges_many_fills_when_the_totals_agree():
+    """The largest real case was one sale printed as 13 partial fills."""
+    plaid = [
+        _trade(
+            source="plaid",
+            source_row_key="z|investment|p1",
+            side="sell",
+            trade_date=date(2025, 6, 9),
+            quantity=D("112.0"),
+            amount=D("19540.22"),
+        )
+    ]
+    document = [
+        _trade(
+            source="manual_finance",
+            source_row_key=f"sha-a|{i}",
+            side="sell",
+            trade_date=date(2025, 6, 6),
+            quantity=D("28"),
+            amount=D("4885.05"),
+        )
+        for i in range(4)
+    ]
+    rows, _links, merged = dedupe_security_trades(plaid, document)
+    assert merged == 4
+    assert len(rows) == 1
+
+
+def test_split_fills_do_not_merge_when_the_summed_quantity_disagrees():
+    plaid = [
+        _trade(
+            source="plaid",
+            source_row_key="z|investment|p1",
+            trade_date=date(2026, 1, 14),
+            quantity=D("12.650089"),
+            amount=D("4343.35"),
+        )
+    ]
+    document = [
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|4",
+            trade_date=date(2026, 1, 13),
+            quantity=D("11"),
+            amount=D("3776.80"),
+        ),
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|5",
+            trade_date=date(2026, 1, 13),
+            quantity=D("0.650089"),
+            amount=D("223.20"),
+        ),
+    ]
+    rows, _links, merged = dedupe_security_trades(plaid, document)
+    assert merged == 0
+    assert len(rows) == 3
+
+
+def test_split_fills_do_not_merge_when_the_summed_amounts_disagree():
+    """Same share count, materially different cash total: two different orders."""
+    plaid = [
+        _trade(
+            source="plaid",
+            source_row_key="z|investment|p1",
+            trade_date=date(2026, 1, 14),
+            quantity=D("11.650089"),
+            amount=D("4500.00"),
+        )
+    ]
+    document = [
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|4",
+            trade_date=date(2026, 1, 13),
+            quantity=D("11"),
+            amount=D("3776.80"),
+        ),
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|5",
+            trade_date=date(2026, 1, 13),
+            quantity=D("0.650089"),
+            amount=D("223.20"),
+        ),
+    ]
+    rows, _links, merged = dedupe_security_trades(plaid, document)
+    assert merged == 0
+    assert len(rows) == 3
+
+
+def test_split_fills_on_different_statement_dates_stay_separate():
+    """Grouping is per statement date: fills of one order print on one date, so
+    same-size buys a week apart must not be summed into a phantom match."""
+    plaid = [
+        _trade(
+            source="plaid",
+            source_row_key="z|investment|p1",
+            trade_date=date(2026, 1, 14),
+            quantity=D("20"),
+            amount=D("8000.00"),
+        )
+    ]
+    document = [
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|4",
+            trade_date=date(2026, 1, 13),
+            quantity=D("10"),
+            amount=D("4000.00"),
+        ),
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|5",
+            trade_date=date(2026, 1, 6),
+            quantity=D("10"),
+            amount=D("4000.00"),
+        ),
+    ]
+    rows, _links, merged = dedupe_security_trades(plaid, document)
+    assert merged == 0
+    assert len(rows) == 3
+
+
+def test_split_fill_group_skips_plaid_rows_already_absorbed_individually():
+    """A Plaid row that matched a statement row one-to-one is spoken for; a
+    later split-fill group must not pile onto it."""
+    plaid = [
+        _trade(
+            source="plaid",
+            source_row_key="z|investment|p1",
+            trade_date=date(2026, 1, 14),
+            quantity=D("11.650089"),
+            amount=D("4000.0"),
+        )
+    ]
+    document = [
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|1",
+            trade_date=date(2026, 1, 14),
+            quantity=D("11.650089"),
+            amount=D("4000.0"),
+        ),
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|4",
+            trade_date=date(2026, 1, 13),
+            quantity=D("11"),
+            amount=D("3776.80"),
+        ),
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|5",
+            trade_date=date(2026, 1, 13),
+            quantity=D("0.650089"),
+            amount=D("223.20"),
+        ),
+    ]
+    rows, _links, merged = dedupe_security_trades(plaid, document)
+    assert merged == 1
+    assert len(rows) == 3
+
+
+def test_split_fill_dedupe_is_deterministic_under_input_reordering():
+    plaid = [
+        _trade(
+            source="plaid",
+            source_row_key="z|investment|p1",
+            trade_date=date(2026, 1, 14),
+            quantity=D("11.650089"),
+            amount=D("4000.0"),
+        )
+    ]
+    document = [
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|4",
+            trade_date=date(2026, 1, 13),
+            quantity=D("11"),
+            amount=D("3776.80"),
+        ),
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|5",
+            trade_date=date(2026, 1, 13),
+            quantity=D("0.650089"),
+            amount=D("223.20"),
+        ),
+    ]
+    first = dedupe_security_trades(plaid, document)
+    second = dedupe_security_trades(list(reversed(plaid)), list(reversed(document)))
+    assert [r["transaction_id"] for r in first[0]] == [r["transaction_id"] for r in second[0]]
+    assert first[2] == second[2] == 2
+
+
 def test_dedupe_is_deterministic_under_input_reordering():
     plaid = [
         _trade(source="plaid", source_row_key="z|investment|p1", trade_date=date(2025, 3, 3)),

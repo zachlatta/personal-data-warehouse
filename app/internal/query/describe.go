@@ -29,6 +29,12 @@ func (s *Service) DescribeTable(ctx context.Context, relation string) Response {
 	result := Result{SQL: "SELECT pg_attribute + pg_index + pg_class FOR " + relation}
 	s.logger.InfoContext(ctx, "describe table started", "relation", relation)
 
+	if description := describeFunction(relation); description != "" {
+		result.CSV = description
+		s.logger.InfoContext(ctx, "describe function completed", "relation", relation, "duration", time.Since(started))
+		return Response{Results: []Result{result}}
+	}
+
 	ref, failure := s.resolveRelation(ctx, relation)
 	if failure != "" {
 		result.Error = failure
@@ -98,6 +104,7 @@ func (s *Service) resolveRelation(ctx context.Context, relation string) (tableRe
 	if len(parts) == 2 {
 		schema = parts[0]
 	}
+
 	if name == "" {
 		return tableRef{}, "relation is required, e.g. describe_table('base_gmail.messages'). Run schema_overview for the relation list."
 	}
@@ -135,6 +142,50 @@ func (s *Service) resolveRelation(ctx context.Context, relation string) (tableRe
 		return tableRef{}, fmt.Sprintf("no relation named %s — %s exists as %s.", trimmed, name, displayNames(matches))
 	}
 	return tableRef{}, fmt.Sprintf("no relation named %s. Run schema_overview for the full relation list.", trimmed)
+}
+
+// describeFunction answers a describe of one of the timeline search functions
+// with its signature and output shape. This is a successful catalog response,
+// not an error hint: `pdw columns timeline.search_text` and the MCP
+// describe_table tool should both be usable discovery paths for functions.
+// A bare name is accepted for the unambiguous ones (search_text,
+// search_hybrid, ...); "context" alone is far too generic to assume the
+// timeline function, so it requires the schema.
+func describeFunction(relation string) string {
+	trimmed := strings.TrimSuffix(strings.TrimSpace(relation), ";")
+	parts := strings.Split(trimmed, ".")
+	for i, part := range parts {
+		parts[i] = strings.ToLower(strings.Trim(strings.TrimSpace(part), `"`))
+	}
+	if len(parts) > 2 {
+		parts = parts[len(parts)-2:]
+	}
+	name := parts[len(parts)-1]
+	schema := ""
+	if len(parts) == 2 {
+		schema = parts[0]
+	}
+	if schema != "" && schema != "timeline" {
+		return ""
+	}
+	header := "# timeline." + name + "\n\n"
+	searchReturns := "returns SETOF (" + searchHitColumns + ") — use occurred_at (or its mirror event_ts) for time, text for the matched preview; source_table + source_pk drill to the source row"
+	switch name {
+	case "search_text":
+		return header + "timeline.search_text is a function, not a relation: timeline.search_text(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL) " + searchReturns + ". Ranked BM25 keyword search; call timeline.search_text_sources() for the valid source tokens."
+	case "search_text_exact":
+		return header + "timeline.search_text_exact is a function, not a relation: timeline.search_text_exact(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL) " + searchReturns + ". Literal substring search, recency-ordered; it also matches number-format variants of the needle."
+	case "search_hybrid":
+		return header + "timeline.search_hybrid is a function, not a relation: timeline.search_hybrid(query text, query_embedding text, embedding_model text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL) " + searchReturns + ". It needs a query embedding — use the app's search tool instead of calling it directly, or timeline.search_text for keyword-only."
+	case "search_text_sources":
+		return header + "timeline.search_text_sources is a function, not a relation: timeline.search_text_sources() returns SETOF (source text) — the valid tokens for the sources parameter of the search functions."
+	case "context":
+		if schema != "timeline" {
+			return ""
+		}
+		return header + "timeline.context is a function, not a relation: timeline.context(ref text, before integer DEFAULT 5, after integer DEFAULT 5) returns SETOF timeline.events rows — the neighboring events of a search hit's (source, context) stream. Pass the ref column a search function returned."
+	}
+	return ""
 }
 
 // relationsNamed returns every queryable relation with the given table name.

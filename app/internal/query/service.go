@@ -1057,7 +1057,25 @@ func schemaErrorHint(message, sql string) string {
 	if hint := numericCastHint(message, sql); hint != "" {
 		return hint
 	}
+	if hint := opsPermissionHint(message, sql); hint != "" {
+		return hint
+	}
 	return ""
+}
+
+// opsPermissionHint fires when the query role is denied on an ops.* sync-state
+// table (SQLSTATE 42501). Pipeline-debugging sessions get pointed at ops.* by
+// the operational docs, but most of that schema is deliberately unreadable by
+// the query role — 10 sessions in 30 days hit this wall with no recovery path.
+// The supported health surfaces answer the same questions.
+func opsPermissionHint(message, sql string) string {
+	if !strings.Contains(message, "42501") && !strings.Contains(message, "permission denied") {
+		return ""
+	}
+	if !strings.Contains(strings.ToLower(sql), "ops.") {
+		return ""
+	}
+	return "(hint: most ops.* sync-state tables are internal and not readable by the query role. For pipeline and freshness debugging read marts_ops.pipeline_health (per-pipeline status + last error), marts_ops.table_freshness (per-table last write + age), and marts_ops.plaid_item_health — those are the supported surfaces.)"
 }
 
 // bigintBooleanHint fires when a caller writes an honest boolean predicate
@@ -1118,7 +1136,25 @@ func datetimeOperatorHint(message string) string {
 var functionRemaps = map[string]string{
 	"search_text":         "timeline.search_text",
 	"search_text_exact":   "timeline.search_text_exact",
+	"search_hybrid":       "timeline.search_hybrid",
 	"search_text_sources": "timeline.search_text_sources",
+}
+
+// searchHitColumns is the exact output shape of timeline.search_text,
+// timeline.search_text_exact, and timeline.search_hybrid — mirror of the
+// composite type built in postgres.py (hit_type_columns_sql). It drifted once
+// already: the 2026-08-19 overhaul added event_ts/title/source_table/source_pk
+// and the hint here kept describing the nine-column shape for a day.
+const searchHitColumns = "source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk"
+
+// searchFunctionSignatures are printed when a caller misses a search
+// function's signature — a wrong named parameter (limit_rows =>) or wrong
+// argument shape on an already-qualified call. Telling that caller to
+// schema-qualify what they already qualified sends them in circles.
+var searchFunctionSignatures = map[string]string{
+	"search_text":       "timeline.search_text(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL)",
+	"search_text_exact": "timeline.search_text_exact(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL)",
+	"search_hybrid":     "timeline.search_hybrid(query text, query_embedding text, embedding_model text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL)",
 }
 
 var undefinedFunctionRe = regexp.MustCompile(`function ([a-zA-Z0-9_."]+)\s*\(`)
@@ -1138,11 +1174,18 @@ func undefinedFunctionHint(message string) string {
 	if match == nil {
 		return ""
 	}
-	name := strings.ToLower(strings.ReplaceAll(match[1], `"`, ""))
+	qualified := strings.ToLower(strings.ReplaceAll(match[1], `"`, ""))
+	name := qualified
 	if idx := strings.LastIndex(name, "."); idx >= 0 {
 		name = name[idx+1:]
 	}
 	if remap, ok := functionRemaps[name]; ok {
+		signature, hasSignature := searchFunctionSignatures[name]
+		if hasSignature && (strings.HasPrefix(qualified, "timeline.") || strings.Contains(message, "=>")) {
+			// The caller already qualified the function (or used a named
+			// argument): the miss is the signature, not the schema path.
+			return fmt.Sprintf("(hint: the signature is %s — the named parameters are max_results, sources, since — returning (%s).)", signature, searchHitColumns)
+		}
 		return fmt.Sprintf("(hint: call %s(...) — queries carry no warehouse search_path, so its functions must be schema-qualified just like its tables.)", remap)
 	}
 	return "(hint: no such function — queries carry no warehouse search_path, so schema-qualify warehouse functions: timeline.search_text('needle', 50) for ranked search, timeline.search_text_exact('needle', 50) for literal substrings. Run schema_overview for the rest.)"
@@ -1192,7 +1235,7 @@ func undefinedColumnHint(message, sql string) string {
 	return "(hint: column names differ per source — run describe_table('<schema.table>') for the exact columns and their (type) annotations.)"
 }
 
-var searchFunctionCallRe = regexp.MustCompile(`(?i)(?:"?timeline"?\s*\.\s*)?"?(search_text(?:_exact)?)"?\s*\(`)
+var searchFunctionCallRe = regexp.MustCompile(`(?i)(?:"?timeline"?\s*\.\s*)?"?(search_text(?:_exact)?|search_hybrid)"?\s*\(`)
 
 // searchResultColumnHint keeps cross-source search inside SQL while making its
 // table-valued function contract recoverable at the exact point callers guess
@@ -1212,8 +1255,9 @@ func searchResultColumnHint(sql string) string {
 	}
 	function := "timeline." + strings.ToLower(match[1])
 	return fmt.Sprintf(
-		"(hint: %s() returns exactly (source, subsource, context, who, occurred_at, account, ref, text, score) — use occurred_at for time and text for the matched preview; ref joins to timeline.events for source_table/source_pk drill-down.)",
+		"(hint: %s() returns exactly (%s) — use occurred_at (or its mirror event_ts) for time, text for the matched preview, and title for the headline; source_table + source_pk drill straight to the source row, and timeline.context(ref) fetches the surrounding events.)",
 		function,
+		searchHitColumns,
 	)
 }
 

@@ -31,8 +31,11 @@ from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.search_index import SearchChunkBuilder, SearchEmbeddingRunner
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 
-SEARCH_CHUNKS_POSTGRES_LOCK_ID = 8_407_112_467
-SEARCH_EMBEDDINGS_POSTGRES_LOCK_ID = 8_407_112_468
+# Keep these globally unique across every Dagster asset. Reusing the WhatsApp
+# enrichment and WHOOP lock ids serialized unrelated pipelines and let a long
+# embedding run delay health-data ingestion.
+SEARCH_CHUNKS_POSTGRES_LOCK_ID = 8_407_112_474
+SEARCH_EMBEDDINGS_POSTGRES_LOCK_ID = 8_407_112_475
 
 SEARCH_CHUNKS_RUN_BUDGET_SECONDS = 240
 SEARCH_EMBEDDINGS_RUN_BUDGET_SECONDS = 480

@@ -416,6 +416,7 @@ def dedupe_security_trades(
             }
         )
 
+    unmatched_documents: list[tuple[str, dict[str, Any]]] = []
     for trade in sorted(document_trades, key=lambda t: (str(t["source_row_key"]),)):
         security_key = resolver.key_for(trade["identity"])
         match = _best_trade_match(
@@ -439,6 +440,62 @@ def dedupe_security_trades(
                     match_score=_match_score(match["trade_date"], trade["trade_date"], max_day_gap),
                 )
             )
+            continue
+        unmatched_documents.append((security_key, dict(trade)))
+
+    # Second pass: split fills. A statement prints one order as several
+    # partial-fill rows (2 to 13 in the real corpus) while Plaid posts the
+    # whole trade as one row a settlement-day later. No fill matches the Plaid
+    # row one-to-one, so without this pass every such trade double-counts and
+    # the FIFO lots inflate — the motivating VTI position carried exactly 2x
+    # its held quantity. Fills of one order print under one statement date, so
+    # grouping is by (account, security, side, trade_date) and the group's
+    # summed quantity/amount must match the Plaid row under the same
+    # tolerances a single row would.
+    groups: dict[tuple[str, str, str, Any], list[dict[str, Any]]] = {}
+    for security_key, trade in unmatched_documents:
+        group_key = (str(trade["account_id"]), security_key, str(trade["side"]), trade["trade_date"])
+        groups.setdefault(group_key, []).append(trade)
+
+    absorbed_row_keys: set[str] = set()
+    for group_key in sorted(groups, key=lambda key: (key[0], key[1], key[2], str(key[3]))):
+        group = groups[group_key]
+        if len(group) < 2:
+            continue
+        account_id, security_key, side, trade_date = group_key
+        total_quantity = sum(
+            (abs(_decimal(trade.get("quantity")) or Decimal("0")) for trade in group),
+            Decimal("0"),
+        )
+        amounts = [_decimal(trade.get("amount")) for trade in group]
+        total_amount = sum((abs(a) for a in amounts), Decimal("0")) if all(amounts) else None
+        match = _best_trade_match(
+            pool,
+            account_id=account_id,
+            security_key=security_key,
+            side=side,
+            quantity=total_quantity,
+            amount=total_amount,
+            trade_date=trade_date,
+            max_day_gap=max_day_gap,
+        )
+        if match is None:
+            continue
+        match["used"] = True
+        for trade in group:
+            merged += 1
+            absorbed_row_keys.add(str(trade["source_row_key"]))
+            link_rows.append(
+                _link_row(
+                    trade,
+                    transaction_id=match["transaction_id"],
+                    match_method="security_split_fill",
+                    match_score=_match_score(match["trade_date"], trade_date, max_day_gap),
+                )
+            )
+
+    for security_key, trade in unmatched_documents:
+        if str(trade["source_row_key"]) in absorbed_row_keys:
             continue
         row = _trade_row(trade, security_key=security_key, resolver=resolver)
         trade_rows[row["transaction_id"]] = row

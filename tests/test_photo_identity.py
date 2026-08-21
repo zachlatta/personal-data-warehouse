@@ -398,6 +398,68 @@ def test_runner_rerun_is_idempotent(warehouse):
     assert len(store.put_files) == 1
 
 
+def test_runner_repairs_links_whose_asset_was_never_canonicalized(warehouse):
+    """A crash between link-insert and asset canonicalization strands the file:
+    it has a link (so it is never 'unresolved' again) but no asset, thumbnail,
+    caption, or timeline event. The 2026-07-14 prod backfill left 1,642 photos
+    (~14.7% of the corpus) invisible this way. The runner must treat a link
+    whose photo_id has no asset row as pending work."""
+    warehouse.ensure_photos_tables()
+    still = image_bytes(synthetic_photo(29))
+    _seed_file(warehouse, native_id="UUID-1", sha=_sha(still), blob_id="b-1")
+    store = FakeObjectStore({"b-1": still})
+
+    def run(minute: int):
+        return PhotoIdentityRunner(
+            warehouse=warehouse, object_store=store, logger=_Logger(),
+            now=lambda: datetime(2026, 6, 2, 12, minute, tzinfo=UTC),
+        ).sync()
+
+    run(0)
+    # Simulate the crash window: the link survived, the asset write never ran.
+    warehouse._command("DELETE FROM @photo_assets")
+    assert has_unresolved_photo_files(warehouse)
+
+    summary = run(5)
+    assert summary.assets_created == 1
+    assets = warehouse._query_dicts("SELECT * FROM @photo_assets")
+    assert len(assets) == 1
+    assert assets[0]["thumbnail_content_type"] == "image/jpeg"
+    # And the repair converges: nothing left to do on the next pass.
+    assert not has_unresolved_photo_files(warehouse)
+    third = run(10)
+    assert (third.files_seen, third.assets_created, third.assets_updated) == (0, 0, 0)
+
+
+def test_runner_bounds_the_dangling_asset_repair_to_the_batch_size(warehouse):
+    """The historic repair is 1,642 assets; one run must not try to thumbnail
+    them all. The same batch limit that bounds unresolved files bounds the
+    repair, and successive runs drain it."""
+    warehouse.ensure_photos_tables()
+    blobs = {}
+    for i in range(3):
+        content = image_bytes(synthetic_photo(40 + i))
+        blobs[f"b-{i}"] = content
+        _seed_file(warehouse, native_id=f"UUID-{i}", sha=_sha(content), blob_id=f"b-{i}")
+    store = FakeObjectStore(blobs)
+
+    def run(minute: int, batch_size: int | None = None):
+        return PhotoIdentityRunner(
+            warehouse=warehouse, object_store=store, logger=_Logger(),
+            batch_size=batch_size,
+            now=lambda: datetime(2026, 6, 2, 12, minute, tzinfo=UTC),
+        ).sync()
+
+    run(0)
+    warehouse._command("DELETE FROM @photo_assets")
+
+    first = run(5, batch_size=2)
+    assert first.assets_created == 2
+    second = run(10, batch_size=2)
+    assert second.assets_created == 1
+    assert warehouse._query("SELECT count(*) FROM @photo_assets")[0][0] == 3
+
+
 def test_runner_undecodable_blob_is_classified_not_fatal(warehouse):
     warehouse.ensure_photos_tables()
     _seed_file(warehouse, native_id="UUID-BAD", sha="sha-bad", blob_id="b-bad")

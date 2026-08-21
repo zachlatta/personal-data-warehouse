@@ -2633,6 +2633,11 @@ class PostgresWarehouse:
                 WHERE h.quantity > 0
                   AND s.ticker_symbol <> '' AND s.ticker_symbol IS NOT NULL
                   AND upper(s.ticker_symbol) NOT LIKE 'CUR:%'
+                  -- Money-market sweep vehicles (SPAXX and friends) are cash:
+                  -- their basis IS their value and their "trades" are sweeps
+                  -- no statement prints, so coverage against them is pure
+                  -- basis_mismatch noise.
+                  AND lower(coalesce(s.type, '')) <> 'cash'
                 GROUP BY 1, 2
             ), reconstructed AS (
                 SELECT l.account_id,

@@ -313,6 +313,22 @@ class PhotoIdentityRunner:
             if photo_id not in touched_ids:
                 touched_ids.append(photo_id)
 
+        # Links whose asset row was never written are stranded, not resolved: a
+        # crash between link-insert and canonicalization (the 2026-07-14 prod
+        # backfill) left files that _load_unresolved would never revisit — no
+        # asset, thumbnail, caption, or timeline event. Re-canonicalize them.
+        dangling = [
+            photo_id
+            for photo_id in self._load_dangling_asset_ids()
+            if photo_id not in touched_ids
+        ]
+        if dangling:
+            self._logger.warning(
+                "Photo identity: repairing %s linked photos whose asset row was never written",
+                len(dangling),
+            )
+            touched_ids.extend(dangling)
+
         assets_created = 0
         assets_updated = 0
         thumbnails_generated = 0
@@ -376,6 +392,23 @@ class PhotoIdentityRunner:
             )
             records.extend(self._record_from_row(row) for row in rows)
         return records
+
+    def _load_dangling_asset_ids(self) -> list[str]:
+        limit_sql = "LIMIT %s" if self._batch_size else ""
+        params: tuple[Any, ...] = (self._batch_size,) if self._batch_size else ()
+        rows = self._warehouse._query(
+            f"""
+            SELECT DISTINCT l.photo_id
+            FROM @photo_asset_files l
+            WHERE NOT EXISTS (
+                SELECT 1 FROM @photo_assets a WHERE a.photo_id = l.photo_id
+            )
+            ORDER BY l.photo_id
+            {limit_sql}
+            """,
+            params,
+        )
+        return [str(photo_id) for (photo_id,) in rows]
 
     def _load_existing(self) -> list[PhotoFileRecord]:
         rows = self._warehouse._query_dicts(
@@ -604,7 +637,19 @@ def has_unresolved_photo_files(warehouse) -> bool:
         )
         if rows:
             return True
-    return False
+    # A link with no asset row is stranded work too (crash between link-insert
+    # and canonicalization), so the backlog sensor must keep the job running
+    # until the repair converges.
+    rows = warehouse._query(
+        """
+        SELECT 1 FROM @photo_asset_files l
+        WHERE NOT EXISTS (
+            SELECT 1 FROM @photo_assets a WHERE a.photo_id = l.photo_id
+        )
+        LIMIT 1
+        """
+    )
+    return bool(rows)
 
 
 def _canonical_rank(record: PhotoFileRecord) -> tuple[int, int, int]:

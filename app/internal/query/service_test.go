@@ -514,10 +514,14 @@ func TestSchemaErrorHint(t *testing.T) {
 			wantNone: []string{"primary time column", "conversation_id"},
 		},
 		{
-			name:     "ranked search wrong column returns the SQL function contract",
-			message:  `ERROR: column "title" does not exist (SQLSTATE 42703)`,
-			sql:      "SELECT title FROM timeline.search_text('invoice', 20)",
-			want:     []string{"source, subsource, context, who, occurred_at, account, ref, text, score", "matched preview", "timeline.events"},
+			name:    "ranked search wrong column returns the SQL function contract",
+			message: `ERROR: column "snippet" does not exist (SQLSTATE 42703)`,
+			sql:     "SELECT snippet FROM timeline.search_text('invoice', 20)",
+			want: []string{
+				"source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk",
+				"matched preview",
+				"timeline.context",
+			},
 			wantNone: []string{"describe_table"},
 		},
 		{
@@ -551,6 +555,54 @@ func TestSchemaErrorHint(t *testing.T) {
 			message: "ERROR: function search_text(unknown, integer) does not exist (SQLSTATE 42883)",
 			sql:     "SELECT * FROM search_text('invoice', 50)",
 			want:    []string{"timeline.search_text("},
+		},
+		{
+			// A wrong NAMED parameter (limit_rows => 20) on an already-qualified
+			// call is a signature miss, not a qualification miss: telling the
+			// caller to schema-qualify what they already qualified sends them in
+			// circles. Print the real signature instead.
+			name:    "wrong named parameter on a qualified search call prints the signature",
+			message: "ERROR: function timeline.search_text(unknown, limit_rows => integer) does not exist (SQLSTATE 42883)",
+			sql:     "SELECT * FROM timeline.search_text('invoice', limit_rows => 20)",
+			want: []string{
+				"max_results integer DEFAULT 50",
+				"sources text[] DEFAULT NULL",
+				"since timestamptz DEFAULT NULL",
+			},
+			wantNone: []string{"schema-qualified just like its tables"},
+		},
+		{
+			name:    "wrong argument shape on a qualified exact search prints the signature",
+			message: "ERROR: function timeline.search_text_exact(unknown, unknown) does not exist (SQLSTATE 42883)",
+			sql:     "SELECT * FROM timeline.search_text_exact('invoice', 'gmail')",
+			want:    []string{"timeline.search_text_exact(query text", "max_results integer DEFAULT 50"},
+		},
+		{
+			name:    "wrong argument shape on a qualified hybrid search prints the signature",
+			message: "ERROR: function timeline.search_hybrid(unknown, unknown) does not exist (SQLSTATE 42883)",
+			sql:     "SELECT * FROM timeline.search_hybrid('invoice', '[0.1]')",
+			want:    []string{"timeline.search_hybrid(query text", "query_embedding text", "embedding_model text"},
+		},
+		{
+			name:    "hybrid search wrong column returns the shared result contract",
+			message: `ERROR: column "snippet" does not exist (SQLSTATE 42703)`,
+			sql:     "SELECT snippet FROM timeline.search_hybrid('invoice', '[0.1]', 'model')",
+			want:    []string{"timeline.search_hybrid() returns exactly", "event_ts", "source_pk"},
+		},
+		{
+			// Pipeline-debugging sessions get pointed at ops.* sync state by the
+			// docs, but the query role deliberately cannot read most of it. The
+			// denial must name the supported health surfaces.
+			name:    "ops sync state permission denial names the marts_ops surfaces",
+			message: "ERROR: permission denied for table whoop_sync_state (SQLSTATE 42501)",
+			sql:     "SELECT * FROM ops.whoop_sync_state",
+			want:    []string{"marts_ops.pipeline_health", "marts_ops.table_freshness", "marts_ops.plaid_item_health"},
+		},
+		{
+			name:     "permission denial outside ops gets no ops hint",
+			message:  "ERROR: permission denied for schema private (SQLSTATE 42501)",
+			sql:      "SELECT * FROM private.plaid_item_tokens",
+			wantNone: []string{"marts_ops.pipeline_health"},
 		},
 		{
 			name:    "unqualified search_text_exact names the search-schema function",

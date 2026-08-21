@@ -1370,6 +1370,57 @@ def test_position_coverage_surfaces_independent_basis_disagreement(warehouse):
     ) == [(Decimal("10"), Decimal("10"), Decimal("-50"), "basis_mismatch")]
 
 
+def test_position_coverage_excludes_plaid_cash_securities(warehouse):
+    """A money-market sweep vehicle (Plaid type='cash', e.g. SPAXX) has no trade
+    history to reconstruct — its basis IS its value — so it must not sit in
+    position_coverage as a permanent basis_mismatch. Found on the real corpus
+    2026-08-21: two SPAXX rows whose basis_difference exactly equalled the
+    position value, pure structural noise."""
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    warehouse.insert_plaid_investment_securities(
+        [
+            _security_row(),
+            _security_row(
+                security_id="sec-mm",
+                name="Fidelity Government Money Market Fund",
+                ticker_symbol="SPAXX",
+                type="cash",
+                close_price=1.0,
+            ),
+        ]
+    )
+    warehouse.insert_plaid_investment_holdings(
+        [
+            _holding_row(cost_basis=400.0),
+            _holding_row(
+                security_id="sec-mm",
+                quantity=4868.02,
+                institution_value=4868.02,
+                institution_price=1.0,
+                cost_basis=0.0,
+            ),
+        ]
+    )
+    warehouse.insert_plaid_investment_transactions(
+        [
+            _plaid_investment_transaction_row(
+                investment_transaction_id="itx-buy",
+                security_id="sec-net",
+                name="ACME buy",
+                type="buy",
+                subtype="buy",
+                quantity=10.0,
+                price=40.0,
+                amount=400.0,
+            )
+        ]
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert warehouse._query(
+        "SELECT ticker FROM @marts_finance_position_coverage ORDER BY ticker"
+    ) == [("ACME",)]
+
+
 def test_security_ledger_replays_identically(warehouse):
     _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
     warehouse.insert_plaid_investment_securities([_security_row()])

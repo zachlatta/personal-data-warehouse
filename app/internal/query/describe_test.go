@@ -159,6 +159,57 @@ func TestDescribeTableUnknownRelationSuggestsNearMatches(t *testing.T) {
 	}
 }
 
+func TestDescribeTableAnswersTimelineSearchFunctions(t *testing.T) {
+	// describe_table('timeline.search_text') used to dead-end with "no relation
+	// named timeline.search_text" — the search entry points are functions, so
+	// information_schema misses them, and there was no way to discover their
+	// signature or output shape. Real sessions then guessed both and failed.
+	runner := fakeRunner{results: map[string]RawResult{}}
+	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
+
+	for _, name := range []string{
+		"timeline.search_text",
+		"search_text",
+		"timeline.search_text_exact",
+		"timeline.search_hybrid",
+		"timeline.context",
+	} {
+		resp := svc.DescribeTable(context.Background(), name)
+		if resp.Results[0].Error != "" {
+			t.Fatalf("%s should be a successful catalog response, got error: %s", name, resp.Results[0].Error)
+		}
+		msg := resp.Results[0].CSV
+		if !strings.Contains(msg, "function, not a relation") {
+			t.Fatalf("%s should describe the function, got: %s", name, msg)
+		}
+		if !strings.Contains(msg, "(") || !strings.Contains(msg, "returns") {
+			t.Fatalf("%s should carry a signature and return shape, got: %s", name, msg)
+		}
+	}
+
+	resp := svc.DescribeTable(context.Background(), "timeline.search_text")
+	msg := resp.Results[0].CSV
+	for _, want := range []string{
+		"query text",
+		"max_results integer DEFAULT 50",
+		"sources text[] DEFAULT NULL",
+		"since timestamptz DEFAULT NULL",
+		"event_ts",
+		"source_table",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("search_text description missing %q, got: %s", want, msg)
+		}
+	}
+
+	// A bare "context" stays a relation lookup — the name is far too generic to
+	// assume the timeline function.
+	respContext := svc.DescribeTable(context.Background(), "context")
+	if strings.Contains(respContext.Results[0].CSV, "function, not a relation") {
+		t.Fatalf("bare 'context' must not resolve to the timeline function, got: %s", respContext.Results[0].CSV)
+	}
+}
+
 func TestDescribeTableKnownWrongNameIsRemapped(t *testing.T) {
 	runner := fakeRunner{results: map[string]RawResult{
 		relationsNamedSQL("slack_channels"):    {Columns: []string{"schema", "name"}},
