@@ -36,7 +36,11 @@ SEARCH_EMBEDDINGS_POSTGRES_LOCK_ID = 8_407_112_468
 
 SEARCH_CHUNKS_RUN_BUDGET_SECONDS = 240
 SEARCH_EMBEDDINGS_RUN_BUDGET_SECONDS = 480
-SEARCH_EMBEDDINGS_RUN_LIMIT = 20_000
+# Sized so the time budget, not the count, is the binding constraint: the mew
+# TEI server does ~85 texts/s on Qwen3-Embedding-4B, so 480s ≈ 40k texts. The
+# chunk builder was measured outpacing the previous 20k cap during the dense
+# Slack backfill region while the GPU idled between runs.
+SEARCH_EMBEDDINGS_RUN_LIMIT = 40_000
 
 
 def _warehouse() -> PostgresWarehouse:
