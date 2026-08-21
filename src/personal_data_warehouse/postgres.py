@@ -146,6 +146,12 @@ POSTGRES_TEXT_NUL_REPLACEMENT = "\\u0000"
 # text keeps the array small while preserving a generous preview; the caller
 # fetches full content via the returned timeline `ref`.
 SEARCH_TEXT_PREVIEW_CHARS = 8000
+# How much of a document the preview windowing scans for the first match.
+# Unbounded scanning meant lower()+strpos over ENTIRE multi-MB TOASTed
+# documents per returned hit — measured at ~7s and 4M buffer reads for one
+# broad search_text() call. Beyond this prefix the preview falls back to the
+# head cut, which is what it would have shown anyway before windowing.
+SEARCH_TEXT_PREVIEW_SCAN_CHARS = 200_000
 # search_text() still runs one timeline branch per coarse source. Even though
 # those branches share one BM25 corpus, a single flat `ORDER BY score LIMIT n`
 # would let high-volume sources (gmail/slack) crowd out one matching contact card
@@ -7568,7 +7574,9 @@ class PostgresWarehouse:
                                 FOR """
             + str(SEARCH_TEXT_PREVIEW_CHARS)
             + r""")
-                            FROM (SELECT lower(doc) AS d) lowdoc
+                            FROM (SELECT lower(left(doc, """
+            + str(SEARCH_TEXT_PREVIEW_SCAN_CHARS)
+            + r""")) AS d) lowdoc
                             CROSS JOIN (
                                 SELECT DISTINCT lower(m[1]) AS t
                                 FROM regexp_matches(coalesce(query, ''), '[[:alnum:]][[:alnum:]@._+-]*', 'g') AS m
@@ -7829,7 +7837,9 @@ class PostgresWarehouse:
                             WHEN length(hit.text) <= """
             + str(SEARCH_TEXT_PREVIEW_CHARS)
             + r""" THEN ''
-                            ELSE lower(hit.text)
+                            ELSE lower(left(hit.text, """
+            + str(SEARCH_TEXT_PREVIEW_SCAN_CHARS)
+            + r"""))
                         END AS lowdoc
                     ) ld
                     ORDER BY hit.occurred_at DESC;
