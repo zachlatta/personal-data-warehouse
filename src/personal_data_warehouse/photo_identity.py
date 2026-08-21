@@ -335,7 +335,6 @@ class PhotoIdentityRunner:
         for photo_id in touched_ids:
             created, thumbnail = self._canonicalize_asset(
                 photo_id,
-                now=now,
                 sync_version=sync_version,
                 is_new=photo_id not in existing_asset_ids,
             )
@@ -509,7 +508,6 @@ class PhotoIdentityRunner:
         self,
         photo_id: str,
         *,
-        now: datetime,
         sync_version: int,
         is_new: bool,
     ) -> tuple[bool, bool]:
@@ -530,7 +528,12 @@ class PhotoIdentityRunner:
                 thumbnail = thumbnail_new
                 generated = True
 
-        created_at = existing_asset["created_at"] if existing_asset else now
+        # Canonicalization can spend minutes fetching and thumbnailing a large
+        # batch. Stamp the asset at the actual write, not at sync start: a
+        # backdated late write can otherwise land behind timeline's ingestion
+        # watermark and remain invisible forever.
+        write_now = self._now()
+        created_at = existing_asset["created_at"] if existing_asset else write_now
 
         self._warehouse.insert_photo_assets(
             [
@@ -552,7 +555,7 @@ class PhotoIdentityRunner:
                     "best_file_size_bytes": primary.size_bytes,
                     **thumbnail,
                     "created_at": created_at,
-                    "updated_at": now,
+                    "updated_at": write_now,
                     "sync_version": sync_version,
                 }
             ]

@@ -431,6 +431,29 @@ def test_runner_repairs_links_whose_asset_was_never_canonicalized(warehouse):
     assert (third.files_seen, third.assets_created, third.assets_updated) == (0, 0, 0)
 
 
+def test_runner_stamps_asset_when_canonicalization_finishes_not_when_batch_starts(warehouse):
+    """Long photo batches must not backdate late asset writes behind timeline's
+    ingestion watermark.  The production repair spent ~25 minutes per batch;
+    using the batch-start timestamp made assets written near the end invisible
+    to incremental timeline sync once another row advanced the watermark."""
+    warehouse.ensure_photos_tables()
+    still = image_bytes(synthetic_photo(39))
+    _seed_file(warehouse, native_id="UUID-1", sha=_sha(still), blob_id="b-1")
+    store = FakeObjectStore({"b-1": still})
+    started_at = datetime(2026, 6, 2, 12, 0, tzinfo=UTC)
+    canonicalized_at = started_at + timedelta(minutes=25)
+    times = iter((started_at, canonicalized_at))
+
+    PhotoIdentityRunner(
+        warehouse=warehouse,
+        object_store=store,
+        logger=_Logger(),
+        now=lambda: next(times),
+    ).sync()
+
+    assert warehouse._query("SELECT updated_at FROM @photo_assets") == [(canonicalized_at,)]
+
+
 def test_runner_bounds_the_dangling_asset_repair_to_the_batch_size(warehouse):
     """The historic repair is 1,642 assets; one run must not try to thumbnail
     them all. The same batch limit that bounds unresolved files bounds the
