@@ -1704,6 +1704,33 @@ def test_search_hybrid_uses_a_deep_filtered_semantic_candidate_pool() -> None:
     assert "LIMIT per_source * 20" in sql
 
 
+def test_search_schema_signature_covers_hybrid_tuning(monkeypatch) -> None:
+    import personal_data_warehouse.postgres as postgres_module
+
+    warehouse = object.__new__(postgres_module.PostgresWarehouse)
+    monkeypatch.setattr(warehouse, "pgvector_available", lambda: True)
+    monkeypatch.setattr(warehouse, "_relation_exists", lambda _table: True)
+    baseline = warehouse._search_schema_signature()
+    baseline_weight = postgres_module.SEARCH_HYBRID_SEMANTIC_WEIGHT
+
+    monkeypatch.setattr(
+        postgres_module,
+        "SEARCH_HYBRID_SEMANTIC_WEIGHT",
+        baseline_weight + 0.01,
+    )
+    assert warehouse._search_schema_signature() != baseline
+
+    monkeypatch.setattr(
+        postgres_module, "SEARCH_HYBRID_SEMANTIC_WEIGHT", baseline_weight
+    )
+    monkeypatch.setattr(
+        postgres_module,
+        "SEARCH_HYBRID_CANDIDATE_MULTIPLIER",
+        postgres_module.SEARCH_HYBRID_CANDIDATE_MULTIPLIER + 1,
+    )
+    assert warehouse._search_schema_signature() != baseline
+
+
 def test_search_hybrid_uses_iterative_hnsw_for_filtered_recent_searches() -> None:
     sql = _search_text_function_sql()
 

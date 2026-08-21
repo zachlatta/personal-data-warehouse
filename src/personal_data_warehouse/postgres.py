@@ -7353,6 +7353,8 @@ class PostgresWarehouse:
                 str(SEARCH_TEXT_PREVIEW_CHARS),
                 str(SEARCH_TEXT_BROAD_PER_BRANCH_CAP),
                 str(SEARCH_HYBRID_RRF_K),
+                str(SEARCH_HYBRID_SEMANTIC_WEIGHT),
+                str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER),
                 str(SEARCH_EMBEDDING_DIMENSIONS),
                 hybrid_state,
             ]
