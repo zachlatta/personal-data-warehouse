@@ -189,8 +189,9 @@ Query the warehouse directly as superuser, which is the only way to read `privat
 credential metadata and the `ops.*` tables the read-only `pdw` role cannot see:
 
 ```bash
-PG=$(ssh mew-coolify 'sudo -n docker ps --format "{{.Names}}" | grep pgbackrest')
-ssh mew-coolify "sudo -n docker exec $PG psql -U postgres -c 'SELECT ...'"
+# Match on the IMAGE: the container name is a bare uuid and says nothing.
+ssh mew-coolify 'PG=$(sudo -n docker ps --format "{{.Names}} {{.Image}}" | awk "/pgbackrest/ {print \$1}");
+  sudo -n docker exec "$PG" psql -U postgres -c "SELECT ..."'
 ```
 
 Two traps that cost a session each: `docker` on both hosts needs `sudo -n` (the login user is
