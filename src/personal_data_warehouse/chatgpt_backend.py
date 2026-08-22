@@ -10,6 +10,14 @@ This is an unofficial API, so the client is deliberately small and fails loudly:
 any 401/403 (or a session response without an ``accessToken``) raises
 ``ChatGPTAuthError`` so the caller can surface "re-publish the session" rather
 than silently degrade.
+
+Cloudflare fronts chatgpt.com and bot-challenges non-browser TLS fingerprints,
+so the default transport is a ``curl_cffi`` session impersonating Chrome (the
+same treatment ``personal_data_warehouse_claude_desktop.api`` needed after the
+2026-07-12 claude.ai block). Measured 2026-08-22 from the production host with
+one identical cookie: plain ``requests``/``urllib`` got ``403`` with
+``cf-mitigated: challenge``, ``curl_cffi`` got ``200``. The User-Agent below
+must stay in step with the impersonation target.
 """
 
 from __future__ import annotations
@@ -21,14 +29,60 @@ import json
 import time
 from typing import Any
 
+from curl_cffi import requests as cffi_requests
+
 DEFAULT_BASE_URL = "https://chatgpt.com"
-# A real desktop browser UA; the backend rejects obviously-automated clients.
+# The Chrome build curl_cffi impersonates at the TLS layer; the UA header
+# matches so the two fingerprints tell Cloudflare the same story.
+DEFAULT_IMPERSONATE = "chrome131"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 DEFAULT_PAGE_SIZE = 28
 DEFAULT_TIMEOUT_SECONDS = 30.0
+
+
+#: How long before the hard expiry a human should be told to sign in again.
+#: The token lives exactly 10 days, so two days is ~one weekend of slack.
+TOKEN_WARN_WITHIN_SECONDS = 2 * 86400
+
+
+def token_expiry_warning(
+    expiry: float,
+    *,
+    now: float,
+    warn_within_seconds: float = TOKEN_WARN_WITHIN_SECONDS,
+) -> str | None:
+    """Warn that the published session is about to lapse, or already has.
+
+    ChatGPT mints the ``accessToken`` only during a browser sign-in and stamps it
+    with a hard 10-day ``exp``; replaying the captured cookie returns that same
+    cached token forever, so no amount of polling renews it. That makes the
+    lapse perfectly predictable, and therefore worth announcing *before* the
+    ingest stops rather than after. Returns ``None`` when there is plenty of
+    life left, or when ``expiry`` is 0.0 (an opaque token whose expiry we cannot
+    read - never invent an alarm from a missing fact).
+    """
+    if expiry <= 0:
+        return None
+    remaining = expiry - now
+    if remaining > warn_within_seconds:
+        return None
+    action = (
+        "Sign out and back into chatgpt.com in the capture browser, then run "
+        "`pdw chatgpt publish-session` - a token is only minted at sign-in and lives 10 days."
+    )
+    if remaining <= 0:
+        return f"ChatGPT session expired {_days(-remaining)} ago. {action}"
+    return f"ChatGPT session expires in {_days(remaining)}. {action}"
+
+
+def _days(seconds: float) -> str:
+    days = seconds / 86400.0
+    if days >= 1:
+        return f"{days:.1f} days"
+    return f"{seconds / 3600.0:.1f} hours"
 
 
 class ChatGPTAuthError(RuntimeError):
@@ -60,7 +114,7 @@ class ChatGPTBackendClient:
         self,
         *,
         session_credential: str,
-        session,
+        session: Any | None = None,
         base_url: str = DEFAULT_BASE_URL,
         user_agent: str = DEFAULT_USER_AGENT,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
@@ -68,16 +122,26 @@ class ChatGPTBackendClient:
     ) -> None:
         if not session_credential:
             raise ChatGPTAuthError("no ChatGPT session credential configured")
-        if session is None:
-            raise ValueError("session is required")
         self._cookie_header = _cookie_header(session_credential)
-        self._session = session
+        self._session = (
+            session if session is not None else cffi_requests.Session(impersonate=DEFAULT_IMPERSONATE)
+        )
         self._base = base_url.rstrip("/")
         self._user_agent = user_agent
         self._timeout = timeout
         self._now = now
         self._access_token: str = ""
         self._access_expiry: float = 0.0
+
+    @property
+    def access_token_expiry(self) -> float:
+        """Epoch seconds the current access token dies, or 0.0 before a fetch.
+
+        The bearer is minted only by a browser sign-in and carries a hard 10-day
+        ``exp`` that no server-side call can extend, so callers surface this to
+        warn a human *before* the credential lapses.
+        """
+        return self._access_expiry
 
     # --- auth ---------------------------------------------------------------
 

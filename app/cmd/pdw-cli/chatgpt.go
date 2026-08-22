@@ -20,13 +20,20 @@ the warehouse syncs ChatGPT server-side via its backend API. That needs a
 chatgpt.com web session, which only exists in a browser. publish-session reads
 your login from a local Chrome-family browser (Chrome/Brave/Edge/Arc), decrypts
 the session cookie (you'll be asked once to allow keychain access), validates it
-against ChatGPT, and publishes it to the warehouse. Re-run it whenever the
-server reports the session expired.
+against ChatGPT, and publishes it to the warehouse.
+
+The captured access token is minted only by a browser sign-in and carries a hard
+10-day expiry that nothing server-side can renew, so the chatgpt-auth LaunchAgent
+re-publishes hourly to keep the server's copy as fresh as the browser's. When the
+browser's own session is what has lapsed, publish-session says so and you sign
+into chatgpt.com again.
 
 FLAGS (forwarded to the uploader; see "pdw chatgpt publish-session --help")
   --browser NAME     Force a browser (chrome|brave|edge|arc|chromium|vivaldi).
   --account EMAIL    Account label/key for the session (default $CHATGPT_ACCOUNT/fallback).
   --session-key KEY  Session key for multiple accounts (default "default").
+  --non-interactive  Never install a browser or prompt to sign in (used by the
+                     hourly chatgpt-auth LaunchAgent).
   --dry-run          Validate and report without publishing.
 
 The session is posted to the warehouse over the same URL + token pdw uses for

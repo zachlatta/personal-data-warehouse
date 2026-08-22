@@ -170,13 +170,41 @@ explicitly instructs otherwise.
 
 ## Deployment / Production
 
-This app runs in production as a Coolify app on `rotom`, Zach's personal Coolify server (Linux,
-on the Tailscale tailnet). You can `ssh rotom` to inspect its running config directly.
+**PDW runs on `mew-coolify`, not on `rotom`.** The Coolify *control plane* (UI, API, the
+`coolify` container) still lives on `rotom`, but as of 2026-08-19/21 the app, Dagster, the
+warehouse Postgres, and the Dagster Postgres were all migrated to the Coolify server named
+`mew-coolify` (a KVM guest on `mew`). `ssh mew-coolify` to inspect the running containers;
+`ssh rotom` only gets you the control plane plus Loki, Grafana, and the other apps it still
+hosts. The two hosts share one public egress IP, so an outbound-IP symptom does not tell you
+which of them made a request.
+
+Find the running containers (names are `<resource-uuid>-<deploy-timestamp>` for apps, bare
+uuid for databases) — do not hardcode uuids, they change when a resource is recreated:
+
+```bash
+ssh mew-coolify 'sudo -n docker ps --format "{{.Names}}\t{{.Image}}"'
+```
+
+Query the warehouse directly as superuser, which is the only way to read `private.*`
+credential metadata and the `ops.*` tables the read-only `pdw` role cannot see:
+
+```bash
+PG=$(ssh mew-coolify 'sudo -n docker ps --format "{{.Names}}" | grep pgbackrest')
+ssh mew-coolify "sudo -n docker exec $PG psql -U postgres -c 'SELECT ...'"
+```
+
+Two traps that cost a session each: `docker` on both hosts needs `sudo -n` (the login user is
+not in the `docker` group), and the Python env inside the app/Dagster containers is
+`/app/.venv/bin/python`, **not** the `python3` on `PATH` — `/usr/local/bin/python3` is missing
+every project dependency, so a `ModuleNotFoundError` there means you used the wrong
+interpreter, not a broken image.
 
 Coolify management tooling lives in the `sysadmin` repo at `~/dev/zachlatta/sysadmin`:
 
 - On `crobat` you can obtain a Coolify API key from that repo to drive the Coolify API. See its
-  `README.md` and the `rotom/` notes folder for details.
+  `README.md` and the `rotom/` notes folder for details. `GET $COOLIFY_URL/api/v1/applications`
+  reports each app's `destination.server.name`, which is the authoritative answer to "which
+  host is this on?"
 - The same repo holds the Loki log wrapper used to read production logs — see the
   [Production Logs](#production-logs) section below.
 
@@ -188,7 +216,8 @@ the same connection string from `DAGSTER_POSTGRES_URL` (see `docker/dagster.yaml
 
 ## Production Logs
 
-Production runs as a Coolify app on the `rotom` server. The best way to read
+Production runs as a Coolify app on the `mew-coolify` server (managed by the
+Coolify instance on `rotom`). The best way to read
 its logs is the Loki wrapper in the `sysadmin` repo:
 `~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs`.
 
@@ -202,23 +231,26 @@ ask Zach instead of guessing.
 Once you have confirmed you are on `crobat` or `porygon`, useful starting points:
 
 ```bash
-# Recent app/container logs for the Coolify deployment.
+# Recent app/container logs for the PDW deployments (they live on mew-coolify).
 ~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs \
-  --format-logs --since 1h '{job="coolify",server="rotom"}'
+  --format-logs --since 1h '{job="coolify",server="mew-coolify"}'
 
 # Filter to a specific container by resource UUID (see warning below).
 ~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs \
   --format-logs --since 1h \
-  '{job="coolify",server="rotom"} | json | container_name =~ "(?i).*<resource-uuid>.*"'
+  '{job="coolify",server="mew-coolify"} | json | container_name =~ "(?i).*<resource-uuid>.*"'
 
-# Host-level system logs for rotom itself.
+# Host-level system logs. Match both hosts when you are not sure which one served a request.
 ~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs \
-  --format-logs --since 1h '{job="machine",server="rotom"}'
+  --format-logs --since 1h '{job="machine",server=~"rotom|mew-coolify"}'
 ```
+
+Logs predating the 2026-08-19/21 migration are under `server="rotom"`, so widen the
+selector to `server=~"rotom|mew-coolify"` for any window that spans it.
 
 ### Pin to the right deployment before reading logs
 
-The `rotom` Coolify server hosts many apps, several with confusingly similar
+The Coolify fleet hosts many apps, several with confusingly similar
 names. A loose name filter like `container_name =~ ".*dagster.*"` can silently
 match more than one and return logs for the wrong app. Don't filter by guessed
 names — first ask the Coolify API for the deployment's exact resource UUID, then
@@ -678,7 +710,7 @@ e.g. `/ingest/agent-sessions/batch`, `/ingest/apple-messages/batch` + `/attachme
 Dagster `*_drive_ingest` readers are unchanged.
 
 **Exception — the in-process WhatsApp client writes directly to Drive.** It runs *inside* the
-trusted prod Dagster deployment (co-located with the app on rotom) and already holds the full
+trusted prod Dagster deployment (co-located with the app on mew-coolify) and already holds the full
 Drive read+write credential the readers use, so the app indirection buys nothing and only re-adds
 a Cloudflare 100 MiB body cap on its large media (WhatsApp videos). It builds the same Drive
 `ObjectStore` the `whatsapp_drive_ingest` reader builds and writes `whatsapp/inbox/batches/` +
@@ -714,7 +746,7 @@ and because a per-file failure used to re-raise, a single oversized memo wedged 
 The upload client (`ingest_client.py`, shared by every uploader) handles this two ways:
 
 - **Prefer a Tailscale-direct origin.** When `PDW_INGEST_TAILSCALE_HOST` names a tailnet node
-  (e.g. `rotom`, the Coolify host) — or `PDW_INGEST_DIRECT_URL` gives an explicit base — the client
+  (e.g. `mew-coolify`, the host the app runs on) — or `PDW_INGEST_DIRECT_URL` gives an explicit base — the client
   resolves that node's current tailnet IPv4 via the `tailscale` CLI and, if it answers `/healthz`
   as the app, sends uploads straight there over plain HTTP (Tailscale/WireGuard is the transport
   encryption) with the public `Host:` header so Traefik still routes to the app. That bypasses
@@ -880,6 +912,84 @@ pdw's grant survives self-updates only because release binaries are signed with 
 identity — see
 [pdw CLI Full Disk Access vs self-updates](#pdw-cli-full-disk-access-vs-self-updates-macos);
 if it breaks, make sure a signed release build is installed (`pdw update --force`).
+
+### Why the ChatGPT session expires, and the hourly auth LaunchAgent
+
+**The ChatGPT credential dies exactly 10 days after capture, by construction.** The
+`accessToken` is an RS256 JWT with `exp - iat = 864000s`, and ChatGPT mints it **only during
+a browser sign-in**. Replaying the captured cookie at `/api/auth/session` returns *that same
+cached token forever* - measured 2026-08-22, twelve days after capture and two days after the
+token's own expiry, chatgpt.com still returned the token issued at capture time, even when the
+rotated `Set-Cookie` was honored and replayed across consecutive calls. Nothing server-side
+renews it. The 2026-08 cycle is the shape to recognize: published 08-10 11:17:30, 286 green
+polls/day for ten days, first failure 08-20 12:20 - one sensor tick after the JWT expired.
+Do not go looking for rate limits, IP binding, or a flaky cookie; check `token_expires_at`
+in `private.chatgpt_sessions` first.
+
+Two mechanisms follow from that:
+
+- **`chatgpt-auth`, an hourly LaunchAgent** (below) re-publishes the browser's session, so the
+  server's copy is never staler than the browser's. **Chrome renews the token by itself** as
+  long as it stays running and signed in - porygon's Chrome re-minted at 2026-08-20 11:36:10,
+  nineteen minutes after the previous token expired at 11:16:47, with nobody at the keyboard.
+  Hourly re-publishing plus a permanently-running Chrome is therefore hands-off. What it cannot
+  survive is Chrome being quit or signed out for ten days: the agent will then faithfully
+  republish a token that is already dead.
+- **An early warning instead of a silent stop.** Every successful poll writes the token's real
+  expiry to `private.chatgpt_sessions.token_expires_at`; within two days of it the credential
+  reads `action_required` on `/pipelines` **while polling continues** (it never sets
+  `expired_at`, which is the separate "rejected, stop polling" mark). `publish-session` prints
+  the same warning to stderr, so it lands in the agent's run log and in
+  `bin/chatgpt-auth-status`.
+
+**chatgpt.com is behind a Cloudflare managed challenge.** Plain `requests`/`urllib` gets a 403
+with `cf-mitigated: challenge`; the identical cookie under `curl_cffi` Chrome impersonation gets
+a 200 (measured from the prod host, 2026-08-22). `ChatGPTBackendClient` therefore defaults to a
+`curl_cffi` session, exactly like `personal_data_warehouse_claude_desktop.api`. Never "simplify"
+it back to `requests` - the symptom is an opaque `ChatGPTAuthError: session expired`, because a
+403 is classified as an auth failure.
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.chatgpt-auth`
+- Installed plist: `~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.chatgpt-auth.plist`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.chatgpt-auth.plist`
+- Wrapper script: `bin/chatgpt-auth-launchd` (sources the repo `.env`, then runs
+  `pdw chatgpt publish-session --non-interactive`)
+- Run cadence: every 3600 seconds with `RunAtLoad`
+- Main run log: `~/Library/Logs/personal-data-warehouse/chatgpt-auth.run.log`
+- Heartbeat file: `~/Library/Logs/personal-data-warehouse/chatgpt-auth.heartbeat`
+- Status helper: `bin/chatgpt-auth-status`
+
+**It runs on porygon**, whose Chrome holds the chatgpt.com login and stays running around the
+clock - which is exactly what keeps the token renewing. A laptop that sleeps or quits Chrome is
+a worse host, even though `publish-session` works there too (crobat's Chrome `Profile 1` also
+has the login). Whichever Mac hosts it, that Mac's Chrome must stay running and signed in.
+
+```bash
+bin/chatgpt-auth-status
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.chatgpt-auth
+tail -80 ~/Library/Logs/personal-data-warehouse/chatgpt-auth.run.log
+pdw chatgpt publish-session --dry-run   # verify cookie decryption without publishing
+```
+
+Install / reinstall the plist after editing the template:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.chatgpt-auth.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.chatgpt-auth 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.chatgpt-auth.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.chatgpt-auth
+```
+
+The agent reads the browser's "Chrome Safe Storage" keychain item through `/usr/bin/security`,
+so it needs the login keychain auto-unlocked by loginwindow **and** an ACL that says **Always
+Allow** (plain "Allow" is one-shot and the next tick fails). Grant it once by running
+`pdw chatgpt publish-session` from a GUI-attached terminal on that Mac and clicking Always
+Allow; on porygon this grant is already in place, and the sibling `claude-desktop-auth` agent
+proves the launchd session can read the keychain there. When it later fails, decode
+`security`'s exit status before theorising - 36 is
+"cannot prompt" and says nothing, 51 on *every* item means the login keychain password
+diverged from the account password. This is a keychain problem, not TCC: TCC fails on a file
+path with `Operation not permitted`.
 
 Claude Desktop SQL starting points are `base_claude_desktop.events` for raw rows and
 `marts_ai_conversations.events` / `marts_ai_conversations.sessions` filtered to

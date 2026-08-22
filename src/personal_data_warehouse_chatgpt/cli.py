@@ -13,10 +13,15 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from collections.abc import Sequence
 
-from personal_data_warehouse.chatgpt_backend import ChatGPTAuthError, ChatGPTBackendClient
-from personal_data_warehouse.chatgpt_cookies import ChatGPTCookieError
+from personal_data_warehouse.chatgpt_backend import (
+    ChatGPTAuthError,
+    ChatGPTBackendClient,
+    token_expiry_warning,
+)
+from personal_data_warehouse.chatgpt_cookies import ChatGPTCookieError, discover_chatgpt_session
 from personal_data_warehouse.chatgpt_setup import ensure_browser, ensure_logged_in
 from personal_data_warehouse.ingest_client import ingest_client_from_env
 
@@ -49,20 +54,25 @@ def _resolve_account(explicit: str | None) -> str:
 
 
 def _publish_session(args: argparse.Namespace) -> int:
-    import requests
-
     account = _resolve_account(args.account)
 
+    # Under launchd nobody can answer a prompt or watch a browser install, so
+    # the scheduled path must only ever read what is already there.
+    non_interactive = args.non_interactive
     try:
-        profile = ensure_browser(prefer=args.browser, auto_install=not args.no_install)
-        captured = ensure_logged_in(profile)
+        profile = ensure_browser(
+            prefer=args.browser, auto_install=not (args.no_install or non_interactive)
+        )
+        captured = (
+            discover_chatgpt_session(browser=profile.key)
+            if non_interactive
+            else ensure_logged_in(profile)
+        )
     except ChatGPTCookieError as exc:
         print(f"pdw chatgpt: {exc}", file=sys.stderr)
         return 1
 
-    client = ChatGPTBackendClient(
-        session_credential=captured.cookie_header, session=requests.Session()
-    )
+    client = ChatGPTBackendClient(session_credential=captured.cookie_header)
     try:
         session_payload = client.fetch_auth_session()
     except ChatGPTAuthError as exc:
@@ -79,6 +89,13 @@ def _publish_session(args: argparse.Namespace) -> int:
         f"Found ChatGPT session in {captured.browser} "
         f"({captured.cookie_count} chatgpt.com cookies). Signed in as {signed_in}."
     )
+    # Publish a near-dead session anyway - some ingest beats none - but say so
+    # on stderr, which is what the LaunchAgent's run log captures.
+    warning = token_expiry_warning(
+        getattr(client, "access_token_expiry", 0.0) or 0.0, now=time.time()
+    )
+    if warning:
+        print(f"pdw chatgpt: WARNING: {warning}", file=sys.stderr)
 
     if args.dry_run:
         print("--dry-run: not publishing the session.")
@@ -136,6 +153,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--session-key",
         default="default",
         help="Session key, for multiple ChatGPT accounts (default: 'default').",
+    )
+    publish.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Never install a browser or prompt to sign in (for the scheduled LaunchAgent).",
     )
     publish.add_argument(
         "--dry-run",

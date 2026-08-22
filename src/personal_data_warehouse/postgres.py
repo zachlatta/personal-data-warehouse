@@ -109,6 +109,7 @@ from personal_data_warehouse.schema import (
     GoogleDriveSyncState,
     SyncState,
 )
+from personal_data_warehouse.chatgpt_backend import token_expiry_warning
 from personal_data_warehouse.config import normalize_postgres_url
 from personal_data_warehouse.pipeline_health import (
     ACCOUNT_BASELINE_GAPS,
@@ -3511,6 +3512,7 @@ class PostgresWarehouse:
                 sync_version bigint NOT NULL DEFAULT 1,
                 expired_at timestamptz,
                 expired_token_sha256 text NOT NULL DEFAULT '',
+                token_expires_at timestamptz,
                 status text NOT NULL DEFAULT 'ok',
                 error text NOT NULL DEFAULT '',
                 PRIMARY KEY (account, session_key)
@@ -3529,6 +3531,11 @@ class PostgresWarehouse:
         # publish (which rotates the sha) clears it automatically.
         self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_at timestamptz")
         self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS expired_token_sha256 text NOT NULL DEFAULT ''")
+        # The access token's own hard expiry, learned on each successful poll. It
+        # is the only reliable warning that the credential is about to lapse: the
+        # token is minted at browser sign-in and lives exactly 10 days, and no
+        # server-side call renews it.
+        self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS token_expires_at timestamptz")
         self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'ok'")
         self._command("ALTER TABLE @chatgpt_sessions ADD COLUMN IF NOT EXISTS error text NOT NULL DEFAULT ''")
         # ``expired_*`` predates the health status columns. On upgrade, an
@@ -3576,7 +3583,7 @@ class PostgresWarehouse:
             """
             SELECT account, session_key, session_token, source_browser, token_sha256,
                    published_at, updated_at, sync_version, expired_at, expired_token_sha256,
-                   status, error
+                   token_expires_at, status, error
             FROM @chatgpt_sessions
             WHERE account = %s AND session_key = %s
             """,
@@ -3625,23 +3632,52 @@ class PostgresWarehouse:
         )
 
     def record_chatgpt_session_success(
-        self, *, account: str, session_key: str, token_sha256: str
+        self,
+        *,
+        account: str,
+        session_key: str,
+        token_sha256: str,
+        token_expires_at: datetime | None = None,
+        now: datetime | None = None,
     ) -> None:
-        """Record a successful poll and clear health errors for that exact token."""
+        """Record a successful poll and clear health errors for that exact token.
+
+        ``token_expires_at`` is the access token's hard expiry as read from its
+        JWT. Because that expiry is fixed at browser sign-in and unreachable from
+        here, an imminent lapse is announced as ``action_required`` *while the
+        poller keeps working* - the credential still authenticates, a human just
+        needs to sign in again soon. Deliberately distinct from
+        ``mark_chatgpt_session_expired``: this never sets ``expired_at``, so the
+        sensor does not stop polling a session that is still perfectly good.
+        """
         if not token_sha256:
             return
         self.ensure_chatgpt_session_table()
+        now = now or datetime.now(tz=UTC)
+        warning = (
+            token_expiry_warning(token_expires_at.timestamp(), now=now.timestamp())
+            if token_expires_at is not None
+            else None
+        )
         self._command(
             """
             UPDATE @chatgpt_sessions
             SET expired_at = NULL,
                 expired_token_sha256 = '',
-                status = 'ok',
-                error = '',
+                token_expires_at = COALESCE(%s, token_expires_at),
+                status = %s,
+                error = %s,
                 updated_at = now()
             WHERE account = %s AND session_key = %s AND token_sha256 = %s
             """,
-            (account, session_key, token_sha256),
+            (
+                token_expires_at,
+                "action_required" if warning else "ok",
+                warning or "",
+                account,
+                session_key,
+                token_sha256,
+            ),
         )
 
     def upsert_chatgpt_session(

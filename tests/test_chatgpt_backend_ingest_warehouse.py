@@ -312,3 +312,62 @@ def test_schema_upgrade_backfills_health_for_a_token_already_marked_expired(ware
 
 def _chatgpt_row_count(warehouse) -> int:
     return warehouse._query_dicts("SELECT count(*) c FROM @ai_conversation_events WHERE source='chatgpt'")[0]["c"]
+
+
+def test_successful_poll_records_the_token_expiry_and_warns_before_it_lapses(warehouse):
+    """A ChatGPT session dies on a schedule, so warn while it can still be fixed.
+
+    The access token is minted only by a browser sign-in and carries a hard
+    10-day ``exp``; replaying the captured cookie returns that same cached token
+    forever. The lapse is therefore perfectly predictable, and the dashboard
+    should ask for a re-publish *before* ingest stops rather than after. The
+    poller keeps running throughout - this is ``action_required``, not a failure.
+    """
+    from personal_data_warehouse.chatgpt_backend_ingest import chatgpt_session_is_marked_expired
+
+    warehouse.upsert_chatgpt_session(
+        account=ACCOUNT, session_key="default", session_token="cookie", source_browser="Chrome"
+    )
+    row = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    now = datetime(2026, 8, 22, 12, tzinfo=UTC)
+
+    # Plenty of life left: healthy, and the expiry is recorded for the dashboard.
+    healthy_expiry = datetime(2026, 8, 30, 12, tzinfo=UTC)
+    warehouse.record_chatgpt_session_success(
+        account=ACCOUNT,
+        session_key="default",
+        token_sha256=row["token_sha256"],
+        token_expires_at=healthy_expiry,
+        now=now,
+    )
+    healthy = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    assert healthy["status"] == "ok"
+    assert healthy["error"] == ""
+    assert healthy["token_expires_at"] == healthy_expiry
+
+    # Inside the warning window: visible on the dashboard, still polling, and the
+    # message names the command that fixes it.
+    warehouse.record_chatgpt_session_success(
+        account=ACCOUNT,
+        session_key="default",
+        token_sha256=row["token_sha256"],
+        token_expires_at=datetime(2026, 8, 23, 12, tzinfo=UTC),
+        now=now,
+    )
+    warned = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    assert warned["status"] == "action_required"
+    assert "publish-session" in warned["error"]
+    assert warned["expired_at"] is None  # not dead yet: the sensor must keep polling
+    assert chatgpt_session_is_marked_expired(warned) is False
+
+    # And it recovers on its own once a fresh sign-in extends the expiry.
+    warehouse.record_chatgpt_session_success(
+        account=ACCOUNT,
+        session_key="default",
+        token_sha256=row["token_sha256"],
+        token_expires_at=healthy_expiry,
+        now=now,
+    )
+    recovered = warehouse.get_chatgpt_session(account=ACCOUNT, session_key="default")
+    assert recovered["status"] == "ok"
+    assert recovered["error"] == ""

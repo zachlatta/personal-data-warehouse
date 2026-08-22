@@ -473,9 +473,11 @@ PIPELINES: tuple[Pipeline, ...] = (
             error_column="error",
         ),
         note=(
-            "needs a manual `pdw chatgpt publish-session` roughly weekly; every"
-            " successful poll updates the credential heartbeat, and a rejected"
-            " token remains action_required until a different token is published"
+            "the hourly chatgpt-auth LaunchAgent re-publishes the browser session;"
+            " the access token is minted only at chatgpt.com sign-in and lives 10"
+            " days, so action_required means either an imminent expiry (still"
+            " polling - sign in again) or a rejected token (polling stopped until"
+            " a different token is published)"
         ),
     ),
     _source(

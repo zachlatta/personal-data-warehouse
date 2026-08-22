@@ -1,0 +1,45 @@
+#!/bin/zsh
+set -u
+
+REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
+# `pdw chatgpt publish-session` captures the chatgpt.com cookie from the local
+# Chrome-family browser and publishes it to the warehouse for the server-side
+# poller. It runs hourly because the captured access token is minted only at
+# browser sign-in and dies exactly 10 days later; re-publishing keeps the
+# server's copy as fresh as the browser's, which is the most this side can do.
+# It reads the browser's "Safe Storage" keychain item, so the login keychain
+# must be auto-unlocked by loginwindow and the item's ACL must say Always Allow
+# (see the macos-keychain-launchd-vs-session runbook when it starts failing).
+PDW="${PDW_BIN:-$HOME/.local/bin/pdw}"
+[ -x "$PDW" ] || PDW="$(command -v pdw 2>/dev/null || echo "$PDW")"
+LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
+LOG_FILE="$LOG_DIR/chatgpt-auth.run.log"
+HEARTBEAT_FILE="$LOG_DIR/chatgpt-auth.heartbeat"
+
+mkdir -p "$LOG_DIR"
+
+if [ -f "$REPO_DIR/.env" ]; then
+  set -a
+  source "$REPO_DIR/.env"
+  set +a
+fi
+
+started_at_iso="$(date -Iseconds)"
+echo "[$started_at_iso] starting chatgpt session publish" >> "$LOG_FILE"
+
+if ! cd "$REPO_DIR"; then
+  exit_code=1
+  echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
+else
+  # --non-interactive: never install a browser, never prompt for a sign-in that
+  # nobody is present to complete.
+  "$PDW" chatgpt publish-session --non-interactive >> "$LOG_FILE" 2>&1
+  exit_code=$?
+fi
+
+finished_at_iso="$(date -Iseconds)"
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+echo "[$finished_at_iso] finished chatgpt session publish exit_code=$exit_code" >> "$LOG_FILE"
+
+exit "$exit_code"

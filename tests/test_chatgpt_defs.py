@@ -51,9 +51,16 @@ class FakeWarehouse:
             {"account": account, "session_key": session_key, "token_sha256": token_sha256}
         )
 
-    def record_chatgpt_session_success(self, *, account, session_key, token_sha256):
+    def record_chatgpt_session_success(
+        self, *, account, session_key, token_sha256, token_expires_at=None
+    ):
         self.recorded_success.append(
-            {"account": account, "session_key": session_key, "token_sha256": token_sha256}
+            {
+                "account": account,
+                "session_key": session_key,
+                "token_sha256": token_sha256,
+                "token_expires_at": token_expires_at,
+            }
         )
 
     def close(self):
@@ -177,6 +184,9 @@ def _fake_lock(*args, **kwargs):
 
 
 class _DummyClient:
+    #: No parseable JWT expiry, the opaque-token case: the heartbeat records None.
+    access_token_expiry = 0.0
+
     def __init__(self, **kwargs):
         pass
 
@@ -245,7 +255,12 @@ def test_asset_records_credential_health_after_successful_poll(monkeypatch) -> N
 
     assert isinstance(result, MaterializeResult)
     assert warehouse.recorded_success == [
-        {"account": "user@example.com", "session_key": "default", "token_sha256": "abc"}
+        {
+            "account": "user@example.com",
+            "session_key": "default",
+            "token_sha256": "abc",
+            "token_expires_at": None,
+        }
     ]
     assert warehouse.marked_expired == []
 
@@ -260,6 +275,45 @@ def test_asset_records_every_healthy_poll_as_the_pipeline_heartbeat(monkeypatch)
 
     assert isinstance(result, MaterializeResult)
     assert warehouse.recorded_success == [
-        {"account": "user@example.com", "session_key": "default", "token_sha256": "abc"}
+        {
+            "account": "user@example.com",
+            "session_key": "default",
+            "token_sha256": "abc",
+            "token_expires_at": None,
+        }
     ]
     assert warehouse.marked_expired == []
+
+
+def test_successful_poll_hands_the_token_expiry_to_the_credential_heartbeat(monkeypatch) -> None:
+    """The asset is the only place that learns the token's real expiry.
+
+    It authenticates every poll, so it holds the JWT ``exp`` that says when the
+    published session dies. Passing it through is what lets the dashboard ask for
+    a re-publish before ingest stops instead of after.
+    """
+    expiry = datetime(2026, 8, 24, 20, 52, 47, tzinfo=UTC)
+
+    class _ExpiringClient:
+        access_token_expiry = expiry.timestamp()
+
+        def __init__(self, **kwargs):
+            pass
+
+    warehouse = _patch_asset(
+        monkeypatch,
+        session_row={"session_token": "cookie", "token_sha256": "abc", "expired_token_sha256": ""},
+        sync=_healthy_summary,
+    )
+    monkeypatch.setattr(chatgpt_defs, "ChatGPTBackendClient", _ExpiringClient)
+
+    chatgpt_defs.chatgpt_backend_ingest(build_asset_context())
+
+    assert warehouse.recorded_success == [
+        {
+            "account": "user@example.com",
+            "session_key": "default",
+            "token_sha256": "abc",
+            "token_expires_at": expiry,
+        }
+    ]

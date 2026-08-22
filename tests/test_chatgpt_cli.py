@@ -10,12 +10,17 @@ _BRAVE = BrowserProfile("brave", "Brave", "BraveSoftware/Brave-Browser", "Brave 
 
 
 class FakeClient:
-    def __init__(self, *, session_credential, session, **kwargs):
+    #: Epoch the fake's token dies; tests override to exercise the warning.
+    expiry = 0.0
+
+    def __init__(self, *, session_credential, session=None, **kwargs):
         self.credential = session_credential
+        self.access_token_expiry = 0.0
 
     def fetch_auth_session(self):
         if self.credential == "bad":
             raise ChatGPTAuthError("session expired")
+        self.access_token_expiry = type(self).expiry
         return {"user": {"email": "user@example.com"}, "accessToken": "tok"}
 
 
@@ -119,4 +124,48 @@ def test_cookie_discovery_failure_exits_nonzero(monkeypatch, capsys):
     monkeypatch.setattr(cli, "ensure_logged_in", _raise)
     code = cli.main(["publish-session", "--account", "a@b.com"])
     assert code == 1
+    assert "no session found" in capsys.readouterr().err
+
+
+def test_publish_session_reports_a_near_expiry_session(monkeypatch, capsys):
+    # The hourly LaunchAgent republishes the same browser session all week, so
+    # the only useful early warning is the token's own exp: say it out loud
+    # while there is still time to sign in again.
+    import time
+
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(cli, "ingest_client_from_env", lambda: FakeIngest())
+    monkeypatch.setattr(FakeClient, "expiry", time.time() + 6 * 3600)
+
+    code = cli.main(["publish-session", "--account", "a@b.com"])
+
+    assert code == 0  # publishing a short-lived session still beats no session
+    captured = capsys.readouterr()
+    assert "expires in" in captured.err
+    assert "Published ChatGPT session" in captured.out
+
+
+def test_non_interactive_never_installs_or_prompts(monkeypatch, capsys):
+    # Under launchd there is no one to answer a prompt and no reason to install
+    # a browser; a missing session must fail fast instead of hanging the agent.
+    seen = {}
+
+    def _ensure_browser(prefer=None, auto_install=True):
+        seen["auto_install"] = auto_install
+        return _BRAVE
+
+    def _discover(*, browser=None):
+        seen["browser"] = browser
+        raise ChatGPTCookieError("no session found")
+
+    monkeypatch.setattr(cli, "ensure_browser", _ensure_browser)
+    monkeypatch.setattr(cli, "discover_chatgpt_session", _discover)
+    monkeypatch.setattr(
+        cli, "ensure_logged_in", lambda profile: pytest.fail("must not prompt in non-interactive mode")
+    )
+
+    code = cli.main(["publish-session", "--account", "a@b.com", "--non-interactive"])
+
+    assert code == 1
+    assert seen == {"auto_install": False, "browser": "brave"}
     assert "no session found" in capsys.readouterr().err

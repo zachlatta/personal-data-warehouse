@@ -193,3 +193,68 @@ def test_opaque_access_token_falls_back_to_session_expiry():
     c.fetch_auth_session()
     assert c._access_token == "opaque-tok"
     assert c._access_expiry > 1_000.0
+
+
+def test_default_session_impersonates_a_browser_tls_fingerprint() -> None:
+    # chatgpt.com sits behind the same Cloudflare managed challenge claude.ai
+    # does: verified 2026-08-22 from the prod host, a plain-requests/urllib GET
+    # of /api/auth/session returns 403 with `cf-mitigated: challenge` while the
+    # very same cookie under curl_cffi Chrome impersonation returns 200. So the
+    # default transport must impersonate Chrome; an injected session (as in the
+    # tests above) still bypasses this entirely.
+    from curl_cffi import requests as cffi_requests
+
+    client = ChatGPTBackendClient(session_credential="token")
+
+    assert isinstance(client._session, cffi_requests.Session)
+    assert str(client._session.impersonate).startswith("chrome")
+
+
+def test_access_token_expiry_is_exposed_after_fetch() -> None:
+    # The publisher and the poller both need to report how much life the
+    # captured token has left: it is minted only by a browser sign-in and dies
+    # exactly 10 days later, and nothing server-side can renew it.
+    session = FakeSession({"/api/auth/session": [FakeResponse(payload={"accessToken": _jwt(5000)})]})
+    client = ChatGPTBackendClient(session_credential="token", session=session, now=lambda: 1000.0)
+
+    assert client.access_token_expiry == 0.0
+    client.fetch_auth_session()
+    assert client.access_token_expiry == 5000.0
+
+
+#: A realistic epoch: the helper treats 0.0 as "expiry unknown", so tests must
+#: not stand in a toy clock small enough to collide with that sentinel.
+_NOW = 1_700_000_000.0
+
+
+def test_token_expiry_warning_is_quiet_with_plenty_of_life() -> None:
+    from personal_data_warehouse.chatgpt_backend import token_expiry_warning
+
+    # 9 of the token's 10 days remain: nothing for a human to do yet.
+    assert token_expiry_warning(_NOW + 9 * 86400, now=_NOW) is None
+
+
+def test_token_expiry_warning_is_quiet_when_the_expiry_is_unknown() -> None:
+    from personal_data_warehouse.chatgpt_backend import token_expiry_warning
+
+    # An opaque (non-JWT) token has no parseable exp; do not invent an alarm.
+    assert token_expiry_warning(0.0, now=_NOW) is None
+
+
+def test_token_expiry_warning_fires_inside_the_window() -> None:
+    from personal_data_warehouse.chatgpt_backend import token_expiry_warning
+
+    message = token_expiry_warning(_NOW + 36 * 3600, now=_NOW)
+
+    assert message is not None
+    assert "1.5 days" in message
+    assert "publish-session" in message
+
+
+def test_token_expiry_warning_reports_an_already_dead_token() -> None:
+    from personal_data_warehouse.chatgpt_backend import token_expiry_warning
+
+    message = token_expiry_warning(_NOW - 3600, now=_NOW)
+
+    assert message is not None
+    assert "expired" in message

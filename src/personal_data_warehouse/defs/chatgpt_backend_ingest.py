@@ -19,6 +19,7 @@ can change. Before a session is ever published the sensor likewise just skips
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import time
 
 from dagster import (
@@ -85,11 +86,11 @@ def chatgpt_backend_ingest(context) -> MaterializeResult:
                     f"No ChatGPT session published for {config.account!r}. {_REPUBLISH_HINT}"
                 )
 
-            import requests
-
+            # No explicit session: the client defaults to a Chrome-impersonating
+            # curl_cffi transport, which is what gets past Cloudflare's managed
+            # challenge on chatgpt.com (plain requests earns a 403 here).
             client = ChatGPTBackendClient(
                 session_credential=credential,
-                session=requests.Session(),
                 base_url=config.base_url,
                 timeout=config.request_timeout_seconds,
             )
@@ -117,10 +118,17 @@ def chatgpt_backend_ingest(context) -> MaterializeResult:
                 # Persist the successful poll as the pipeline heartbeat. Guarding the
                 # write by token hash prevents an old in-flight poll from clearing an
                 # expiry recorded for a concurrently published replacement token.
+                # The token's own hard expiry rides along: this poll authenticated,
+                # so it is the freshest reading of when the credential will lapse,
+                # and the dashboard turns that into a warning ahead of the outage.
+                expiry_epoch = float(getattr(client, "access_token_expiry", 0.0) or 0.0)
                 warehouse.record_chatgpt_session_success(
                     account=config.account,
                     session_key=config.session_key,
                     token_sha256=str((session_row or {}).get("token_sha256") or ""),
+                    token_expires_at=(
+                        datetime.fromtimestamp(expiry_epoch, UTC) if expiry_epoch > 0 else None
+                    ),
                 )
         finally:
             warehouse.close()
