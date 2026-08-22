@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -50,18 +51,24 @@ type EmbeddingsOptions struct {
 	// queries wrapped in a task instruction; this client only ever embeds
 	// queries, so the prefix applies to everything it sends.
 	QueryPrefix string
+	// QueryRawWeight blends the raw-query embedding with the prefixed-query
+	// embedding when QueryPrefix is set. Zero uses only the instructed vector;
+	// 0.5 gives each representation equal weight. Values outside [0,1] are
+	// clamped defensively; application config rejects them before this layer.
+	QueryRawWeight float64
 	// HTTPClient overrides the default 30s-timeout client (tests).
 	HTTPClient *http.Client
 }
 
 // EmbeddingsClient calls an OpenAI-compatible POST /embeddings endpoint.
 type EmbeddingsClient struct {
-	baseURL     string
-	apiKey      string
-	model       string
-	dimensions  int
-	queryPrefix string
-	httpClient  *http.Client
+	baseURL        string
+	apiKey         string
+	model          string
+	dimensions     int
+	queryPrefix    string
+	queryRawWeight float64
+	httpClient     *http.Client
 }
 
 // NewEmbeddingsClient returns a client, or nil when embeddings are not
@@ -88,13 +95,20 @@ func NewEmbeddingsClient(opts EmbeddingsOptions) *EmbeddingsClient {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: embeddingsRequestTimeout}
 	}
+	queryRawWeight := opts.QueryRawWeight
+	if math.IsNaN(queryRawWeight) || queryRawWeight < 0 {
+		queryRawWeight = 0
+	} else if queryRawWeight > 1 {
+		queryRawWeight = 1
+	}
 	return &EmbeddingsClient{
-		baseURL:     strings.TrimRight(baseURL, "/"),
-		apiKey:      apiKey,
-		model:       model,
-		dimensions:  dimensions,
-		queryPrefix: opts.QueryPrefix,
-		httpClient:  httpClient,
+		baseURL:        strings.TrimRight(baseURL, "/"),
+		apiKey:         apiKey,
+		model:          model,
+		dimensions:     dimensions,
+		queryPrefix:    opts.QueryPrefix,
+		queryRawWeight: queryRawWeight,
+		httpClient:     httpClient,
 	}
 }
 
@@ -103,25 +117,47 @@ func (c *EmbeddingsClient) Model() string { return c.model }
 // Embed returns the embedding vector for text. It retries once on a 429 or
 // 5xx response; every other failure is returned immediately.
 func (c *EmbeddingsClient) Embed(ctx context.Context, text string) ([]float64, error) {
+	inputs := []string{c.queryPrefix + text}
+	blend := c.queryPrefix != "" && c.queryRawWeight > 0 && c.queryRawWeight < 1
+	if blend {
+		inputs = append(inputs, text)
+	} else if c.queryPrefix != "" && c.queryRawWeight >= 1 {
+		inputs[0] = text
+	}
 	body, err := json.Marshal(map[string]any{
 		"model":      c.model,
-		"input":      []string{c.queryPrefix + text},
+		"input":      inputs,
 		"dimensions": c.dimensions,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode embeddings request: %w", err)
 	}
-	vector, retryable, err := c.embedOnce(ctx, body)
+	vectors, retryable, err := c.embedOnce(ctx, body)
 	if err != nil && retryable {
 		time.Sleep(500 * time.Millisecond)
-		vector, _, err = c.embedOnce(ctx, body)
+		vectors, _, err = c.embedOnce(ctx, body)
 	}
-	return vector, err
+	if err != nil {
+		return nil, err
+	}
+	if len(vectors) != len(inputs) {
+		return nil, fmt.Errorf("embeddings response carried %d data entries for %d inputs", len(vectors), len(inputs))
+	}
+	for index := range vectors {
+		vectors[index], err = c.fitDimensions(vectors[index])
+		if err != nil {
+			return nil, err
+		}
+	}
+	if blend {
+		return blendNormalized(vectors[0], vectors[1], c.queryRawWeight), nil
+	}
+	return vectors[0], nil
 }
 
 // embedOnce performs a single POST /embeddings round trip. retryable reports
 // whether the failure is worth one more attempt (rate limit or server error).
-func (c *EmbeddingsClient) embedOnce(ctx context.Context, body []byte) (vector []float64, retryable bool, err error) {
+func (c *EmbeddingsClient) embedOnce(ctx context.Context, body []byte) (vectors [][]float64, retryable bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/embeddings", bytes.NewReader(body))
 	if err != nil {
 		return nil, false, fmt.Errorf("build embeddings request: %w", err)
@@ -149,6 +185,7 @@ func (c *EmbeddingsClient) embedOnce(ctx context.Context, body []byte) (vector [
 	var decoded struct {
 		Data []struct {
 			Embedding []float64 `json:"embedding"`
+			Index     int       `json:"index"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(respBody, &decoded); err != nil {
@@ -157,9 +194,17 @@ func (c *EmbeddingsClient) embedOnce(ctx context.Context, body []byte) (vector [
 	if len(decoded.Data) == 0 {
 		return nil, false, fmt.Errorf("embeddings response carried no data entries")
 	}
-	embedding := decoded.Data[0].Embedding
+	sort.SliceStable(decoded.Data, func(i, j int) bool { return decoded.Data[i].Index < decoded.Data[j].Index })
+	vectors = make([][]float64, 0, len(decoded.Data))
+	for _, item := range decoded.Data {
+		vectors = append(vectors, item.Embedding)
+	}
+	return vectors, false, nil
+}
+
+func (c *EmbeddingsClient) fitDimensions(embedding []float64) ([]float64, error) {
 	if len(embedding) < c.dimensions {
-		return nil, false, fmt.Errorf("embeddings endpoint returned a %d-dimension vector, want %d; SEARCH_EMBEDDINGS_DIMENSIONS must match the model's output (and the pgvector column timeline.search_hybrid indexes)", len(embedding), c.dimensions)
+		return nil, fmt.Errorf("embeddings endpoint returned a %d-dimension vector, want %d; SEARCH_EMBEDDINGS_DIMENSIONS must match the model's output (and the pgvector column timeline.search_hybrid indexes)", len(embedding), c.dimensions)
 	}
 	if len(embedding) > c.dimensions {
 		// Servers that ignore the `dimensions` request parameter (several
@@ -168,22 +213,36 @@ func (c *EmbeddingsClient) embedOnce(ctx context.Context, body []byte) (vector [
 		// the defined way to shorten, and the Python indexing runner does the
 		// same, so query and document vectors stay in the same space.
 		embedding = embedding[:c.dimensions]
-		var norm float64
-		for _, value := range embedding {
-			norm += value * value
-		}
-		if norm == 0 {
-			norm = 1
-		} else {
-			norm = math.Sqrt(norm)
-		}
-		normalized := make([]float64, len(embedding))
-		for i, value := range embedding {
-			normalized[i] = value / norm
-		}
-		embedding = normalized
+		embedding = normalize(embedding)
 	}
-	return embedding, false, nil
+	return embedding, nil
+}
+
+func blendNormalized(instructed, raw []float64, rawWeight float64) []float64 {
+	instructed = normalize(instructed)
+	raw = normalize(raw)
+	result := make([]float64, len(instructed))
+	for index := range instructed {
+		result[index] = (1-rawWeight)*instructed[index] + rawWeight*raw[index]
+	}
+	return normalize(result)
+}
+
+func normalize(vector []float64) []float64 {
+	var norm float64
+	for _, value := range vector {
+		norm += value * value
+	}
+	if norm == 0 {
+		norm = 1
+	} else {
+		norm = math.Sqrt(norm)
+	}
+	normalized := make([]float64, len(vector))
+	for index, value := range vector {
+		normalized[index] = value / norm
+	}
+	return normalized
 }
 
 func truncateForError(body string) string {

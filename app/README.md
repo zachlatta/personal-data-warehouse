@@ -287,7 +287,11 @@ unified timeline document. Raw message/body columns are deliberately not text-in
 - Tool-level entry point: the `search` tool wraps this contract for callers that don't want to
   write SQL. Its default `hybrid` mode embeds the query through an OpenAI-compatible embeddings
   API (`SEARCH_EMBEDDINGS_BASE_URL`, `SEARCH_EMBEDDINGS_API_KEY`, `SEARCH_EMBEDDINGS_MODEL`,
-  `SEARCH_EMBEDDINGS_DIMENSIONS`) and calls `timeline.search_hybrid`; when embeddings are not
+  `SEARCH_EMBEDDINGS_DIMENSIONS`) and calls `timeline.search_hybrid`. Instruction-tuned models can
+  prepend `SEARCH_EMBEDDINGS_QUERY_PREFIX` on queries only. When a corpus benefits from both the
+  raw and instructed representations, `SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT` may blend them in one
+  batched embedding request (`0` = instructed only, `1` = raw only, `0.5` = equal blend); the
+  result is L2-normalized before retrieval. When embeddings are not
   configured or `search_hybrid` is not installed (no pgvector), it automatically falls back to
   keyword search and reports a `fallback_reason`. Modes `keyword` and `exact` force
   `timeline.search_text` / `timeline.search_text_exact` directly. Takes

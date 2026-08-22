@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -92,6 +93,10 @@ type Config struct {
 	// but expect queries wrapped in a task instruction; the Python indexing
 	// runner deliberately never applies it.
 	SearchEmbeddingsQueryPrefix string
+	// SearchEmbeddingsQueryRawWeight optionally blends the raw-query vector
+	// with the instruction-prefixed vector. It must be in [0,1]; zero keeps
+	// the model-standard instruction-only behavior.
+	SearchEmbeddingsQueryRawWeight float64
 
 	// DriveSourceTokensByAccount maps a Google Drive *source* account email to
 	// its OAuth token JSON, so the account-aware download proxy can stream a
@@ -267,6 +272,9 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	cfg.SearchEmbeddingsAPIKey = strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_API_KEY"))
 	cfg.SearchEmbeddingsModel = valueOrDefault(strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_MODEL")), "text-embedding-3-small")
 	cfg.SearchEmbeddingsQueryPrefix = getenv("SEARCH_EMBEDDINGS_QUERY_PREFIX")
+	if cfg.SearchEmbeddingsQueryRawWeight, err = parseUnitFloat(getenv("SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT"), 0, "SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT"); err != nil {
+		return Config{}, err
+	}
 	if cfg.SearchEmbeddingsDimensions, err = parsePositiveInt(getenv("SEARCH_EMBEDDINGS_DIMENSIONS"), 512, "SEARCH_EMBEDDINGS_DIMENSIONS"); err != nil {
 		return Config{}, err
 	}
@@ -339,6 +347,18 @@ func parsePositiveInt64(raw string, fallback int64, name string) (int64, error) 
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value <= 0 {
 		return 0, errors.New(name + " must be a positive integer")
+	}
+	return value, nil
+}
+
+func parseUnitFloat(raw string, fallback float64, name string) (float64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || value < 0 || value > 1 {
+		return 0, errors.New(name + " must be a number between 0 and 1")
 	}
 	return value, nil
 }

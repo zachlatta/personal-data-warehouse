@@ -39,6 +39,8 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 		"SEARCH_EMBEDDINGS_API_KEY":           "sk-embed-test",
 		"SEARCH_EMBEDDINGS_MODEL":             "custom-embedding-model",
 		"SEARCH_EMBEDDINGS_DIMENSIONS":        "256",
+		"SEARCH_EMBEDDINGS_QUERY_PREFIX":      "Instruct: retrieve personal data\nQuery:",
+		"SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT":  "0.5",
 	}
 
 	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
@@ -82,8 +84,8 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	if cfg.SearchEmbeddingsBaseURL != "https://embeddings.example.test/v1" {
 		t.Fatalf("SearchEmbeddingsBaseURL = %q", cfg.SearchEmbeddingsBaseURL)
 	}
-	if cfg.SearchEmbeddingsAPIKey != "sk-embed-test" || cfg.SearchEmbeddingsModel != "custom-embedding-model" || cfg.SearchEmbeddingsDimensions != 256 {
-		t.Fatalf("search embeddings config = key %q model %q dims %d", cfg.SearchEmbeddingsAPIKey, cfg.SearchEmbeddingsModel, cfg.SearchEmbeddingsDimensions)
+	if cfg.SearchEmbeddingsAPIKey != "sk-embed-test" || cfg.SearchEmbeddingsModel != "custom-embedding-model" || cfg.SearchEmbeddingsDimensions != 256 || cfg.SearchEmbeddingsQueryPrefix != "Instruct: retrieve personal data\nQuery:" || cfg.SearchEmbeddingsQueryRawWeight != 0.5 {
+		t.Fatalf("search embeddings config = key %q model %q dims %d prefix %q raw_weight %v", cfg.SearchEmbeddingsAPIKey, cfg.SearchEmbeddingsModel, cfg.SearchEmbeddingsDimensions, cfg.SearchEmbeddingsQueryPrefix, cfg.SearchEmbeddingsQueryRawWeight)
 	}
 }
 
@@ -101,8 +103,22 @@ func TestLoadFromEnvSearchEmbeddingsDefaults(t *testing.T) {
 	if cfg.SearchEmbeddingsBaseURL != "" || cfg.SearchEmbeddingsAPIKey != "" {
 		t.Fatalf("embeddings should be unconfigured by default: base %q key %q", cfg.SearchEmbeddingsBaseURL, cfg.SearchEmbeddingsAPIKey)
 	}
-	if cfg.SearchEmbeddingsModel != "text-embedding-3-small" || cfg.SearchEmbeddingsDimensions != 512 {
-		t.Fatalf("embeddings defaults = model %q dims %d", cfg.SearchEmbeddingsModel, cfg.SearchEmbeddingsDimensions)
+	if cfg.SearchEmbeddingsModel != "text-embedding-3-small" || cfg.SearchEmbeddingsDimensions != 512 || cfg.SearchEmbeddingsQueryRawWeight != 0 {
+		t.Fatalf("embeddings defaults = model %q dims %d raw_weight %v", cfg.SearchEmbeddingsModel, cfg.SearchEmbeddingsDimensions, cfg.SearchEmbeddingsQueryRawWeight)
+	}
+}
+
+func TestLoadFromEnvRejectsEmbeddingQueryRawWeightOutsideUnitInterval(t *testing.T) {
+	for _, raw := range []string{"1.1", "-0.1", "NaN", "not-a-number"} {
+		env := map[string]string{
+			"POSTGRES_DATABASE_URL":              "postgres://default:secret@example.com/default",
+			"MCP_SECRET_TOKEN":                   "0123456789abcdef0123456789abcdef",
+			"SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT": raw,
+		}
+		_, err := LoadFromEnv(func(key string) string { return env[key] })
+		if err == nil || !strings.Contains(err.Error(), "SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT") {
+			t.Fatalf("raw weight %q: expected validation error, got %v", raw, err)
+		}
 	}
 }
 

@@ -103,7 +103,12 @@ over 0.6B off the 2026 MTEB standings (multilingual 69.45 vs 64.33; the 8B leade
 not fit 12 GB) — the family tops open self-hosted models and the GPU is otherwise idle.
 Queries (the app's Go client only, never the Python document indexer) are wrapped in the
 instruction prefix from `SEARCH_EMBEDDINGS_QUERY_PREFIX`, per Qwen3-Embedding's
-instruction-asymmetric training. Inspect with `ssh mew docker logs pdw-embeddings`;
+instruction-asymmetric training. Production also sets
+`SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT=0.5`: the app embeds the instructed and raw query in
+one two-item request, blends their unit vectors equally, and renormalizes. This retained
+the instruction's retrieval gains without losing strong raw-query neighbors in the
+full-corpus eval; it does not change document embeddings. Inspect with
+`ssh mew docker logs pdw-embeddings`;
 relaunch with the same `docker run` flags plus `--auto-truncate` (required: the model's
 32k context exceeds TEI's default batch limit) **and `--max-client-batch-size 256`**
 (the indexer posts 128-text batches; TEI's default cap of 32 makes them 413 —

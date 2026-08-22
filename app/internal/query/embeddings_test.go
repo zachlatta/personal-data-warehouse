@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -70,6 +71,41 @@ func TestEmbeddingsClientEmbedSendsOpenAICompatibleRequest(t *testing.T) {
 	}
 	if gotBody["dimensions"] != float64(3) {
 		t.Fatalf("dimensions = %v", gotBody["dimensions"])
+	}
+}
+
+func TestEmbeddingsClientBlendsRawAndInstructionQueryVectors(t *testing.T) {
+	var gotInputs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		gotInputs = body.Input
+		// Return out of order to ensure the OpenAI `index` field, rather than
+		// response order, decides which vector is instructed versus raw.
+		_, _ = w.Write([]byte(`{"data":[{"index":1,"embedding":[0,3]},{"index":0,"embedding":[2,0]}]}`))
+	}))
+	defer srv.Close()
+
+	client := NewEmbeddingsClient(EmbeddingsOptions{
+		BaseURL:        srv.URL,
+		Dimensions:     2,
+		QueryPrefix:    "Instruct: retrieve personal data\nQuery:",
+		QueryRawWeight: 0.5,
+	})
+	vector, err := client.Embed(context.Background(), "lunch plans")
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	want := 1 / math.Sqrt(2)
+	if len(vector) != 2 || math.Abs(vector[0]-want) > 1e-12 || math.Abs(vector[1]-want) > 1e-12 {
+		t.Fatalf("blended vector = %v, want [%v %v]", vector, want, want)
+	}
+	if len(gotInputs) != 2 || gotInputs[0] != "Instruct: retrieve personal data\nQuery:lunch plans" || gotInputs[1] != "lunch plans" {
+		t.Fatalf("inputs = %#v", gotInputs)
 	}
 }
 
