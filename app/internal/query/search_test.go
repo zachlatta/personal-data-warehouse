@@ -336,3 +336,70 @@ func TestSearchTruncatesLongFieldsLikeQueryResults(t *testing.T) {
 		t.Fatalf("truncations = %#v", resp.Truncations)
 	}
 }
+
+func TestSearchHintsWhenTheQueryIsPhrasedAsASentence(t *testing.T) {
+	// The caller is itself an LLM, so query rewriting belongs in guidance, not
+	// in an extra model in the search path. It is worth guiding: on the labeled
+	// benchmark, sentence-shaped queries score MRR 0.27 against 0.53 for
+	// term-bag queries, and rewording the nine unanswerable questions as the
+	// words their answering record would contain recovered five of them, from
+	// nothing-in-the-top-50 to ranks 10, 10, 12, 15 and 48.
+	runner := &fakeSearchRunner{
+		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{searchHybridSQL: searchHit()},
+	}
+	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5}}}
+	svc := NewService(runner, Options{SearchEmbedder: embedder})
+
+	resp := svc.Search(context.Background(), SearchRequest{
+		Query: "how long our money lasts at the current pace of expenses",
+	})
+	if resp.Hint == "" {
+		t.Fatal("a sentence-shaped query should carry a reformulation hint")
+	}
+	if !strings.Contains(resp.Hint, "record") {
+		t.Fatalf("the hint must say what to rewrite TOWARD; got %q", resp.Hint)
+	}
+}
+
+func TestSearchDoesNotHintOnATermBagQuery(t *testing.T) {
+	// A hint on every response is noise nobody reads. Term-bag queries are
+	// already the strong case, so they get nothing.
+	runner := &fakeSearchRunner{
+		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{searchHybridSQL: searchHit()},
+	}
+	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5}}}
+	svc := NewService(runner, Options{SearchEmbedder: embedder})
+
+	for _, query := range []string{
+		"vision insurance VSP EyeMed glasses member ID",
+		"Honda Ridgeline rear differential fluid",
+		"admin/api-keys",
+	} {
+		resp := svc.Search(context.Background(), SearchRequest{Query: query})
+		if resp.Hint != "" {
+			t.Fatalf("%q should not be hinted; got %q", query, resp.Hint)
+		}
+	}
+}
+
+func TestSearchHintSurvivesTheKeywordFallback(t *testing.T) {
+	// The advice is about phrasing, not about which retriever ran, so a
+	// deployment without embeddings needs it just as much.
+	runner := &fakeSearchRunner{
+		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{searchTextSQL: searchHit()},
+	}
+	svc := NewService(runner, Options{})
+
+	resp := svc.Search(context.Background(), SearchRequest{
+		Query: "notice that someone will be unreachable for a while",
+	})
+	if resp.Mode != SearchModeKeyword || resp.FallbackReason == "" {
+		t.Fatalf("expected the keyword fallback; mode=%q reason=%q", resp.Mode, resp.FallbackReason)
+	}
+	if resp.Hint == "" {
+		t.Fatal("the phrasing hint must not depend on the retriever that ran")
+	}
+}

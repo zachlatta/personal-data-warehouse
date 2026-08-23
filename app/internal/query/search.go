@@ -18,6 +18,57 @@ const (
 
 const searchDefaultMaxResults = 50
 
+// searchPhrasingHint is advice for the caller's NEXT search, not an error. The
+// caller here is itself a language model, which is why query rewriting lives in
+// guidance rather than in another model inside the search path: it costs
+// nothing and needs no new dependency.
+//
+// It is worth saying. On the labeled benchmark, sentence-shaped queries score
+// MRR 0.27 where term-bag queries score 0.53, and rewording the nine questions
+// that returned nothing useful -- as the words their ANSWERING RECORD would
+// contain rather than the words of the question -- recovered five of them, from
+// nothing in the top 50 to ranks 10, 10, 12, 15 and 48.
+const searchPhrasingHint = "This query reads like a sentence. Retrieval here is measurably better " +
+	"when a query is phrased as the words the ANSWERING RECORD would contain rather than the " +
+	"words of the question: \"how long our money lasts\" finds nothing, \"runway burn rate months " +
+	"of cash remaining\" finds it. If the results below miss, re-issue with the vocabulary the " +
+	"record itself would use (an email's subject line, a statement's column heading, the phrase a " +
+	"person would actually have typed)."
+
+// searchSentenceWords are the function words that separate a question from a
+// bag of search terms. Counting them is crude, and deliberately so: the
+// alternative is another model call to classify a string. Two or more means the
+// query is carrying grammar rather than search terms, which is exactly the
+// shape the benchmark says retrieves worst.
+var searchSentenceWords = map[string]bool{
+	"a": true, "an": true, "the": true, "my": true, "our": true, "your": true, "their": true,
+	"is": true, "are": true, "was": true, "were": true, "will": true, "would": true, "can": true,
+	"of": true, "for": true, "with": true, "that": true, "this": true, "at": true, "on": true,
+	"in": true, "to": true, "from": true, "and": true, "or": true, "by": true, "about": true,
+	"how": true, "what": true, "when": true, "where": true, "why": true, "who": true, "which": true,
+	"did": true, "does": true, "do": true, "should": true, "could": true, "me": true, "i": true,
+}
+
+// searchHintFor returns advice for the caller, or "" when the query is already
+// in the shape that retrieves well. Hinting every response is noise nobody
+// reads, so the strong case gets nothing.
+func searchHintFor(query string) string {
+	fields := strings.Fields(strings.ToLower(query))
+	if len(fields) < 5 {
+		return ""
+	}
+	sentenceWords := 0
+	for _, field := range fields {
+		if searchSentenceWords[strings.Trim(field, ".,!?;:'\"")] {
+			sentenceWords++
+		}
+	}
+	if sentenceWords < 2 {
+		return ""
+	}
+	return searchPhrasingHint
+}
+
 // ArgsRunner is the parameterized-query capability search needs: caller
 // values (the query text, source tokens, since bound) ride as bind parameters
 // instead of being spliced into SQL. *PostgresRunner implements it with the
@@ -66,11 +117,12 @@ type SearchRequest struct {
 // SearchResponse mirrors the query tool's result shape: JSON row maps with the
 // same per-field truncation, plus search metadata. Mode is the mode that
 // actually executed; FallbackReason is set when hybrid was requested but the
-// keyword path ran instead.
+// keyword path ran instead; Hint carries retrieval advice for the NEXT call.
 type SearchResponse struct {
 	Query          string            `json:"query"`
 	Mode           string            `json:"mode"`
 	FallbackReason string            `json:"fallback_reason,omitempty"`
+	Hint           string            `json:"hint,omitempty"`
 	TotalRows      int               `json:"total_rows"`
 	ColumnNames    []string          `json:"column_names,omitempty"`
 	Rows           any               `json:"rows,omitempty"`
@@ -109,6 +161,9 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	if maxResults <= 0 {
 		maxResults = searchDefaultMaxResults
 	}
+	// Phrasing advice is about the query, not about which retriever ran, so it
+	// is set before the mode is decided and survives the keyword fallback.
+	resp.Hint = searchHintFor(resp.Query)
 
 	var sources any
 	if len(req.Sources) > 0 {

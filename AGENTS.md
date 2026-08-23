@@ -95,6 +95,15 @@ index walks past millions of gmail/slack documents and took 15-16s on an unlucky
 And the pool depth is a measured trade (`SEARCH_TEXT_BROAD_POOL`): deeper gives the
 per-source floor more to promote, up to a point where latency grows and scores do not.
 
+**Phrase a search as the words the answering record would contain, not as the question.**
+Sentence-shaped queries score MRR 0.27 on the labeled benchmark where term-bag queries score
+0.53, and rewording the nine questions that returned nothing useful — "how long our money
+lasts at the current pace of expenses" → "runway burn rate months of cash remaining" —
+recovered five of them, from nothing in the top 50 to ranks 10, 10, 12, 15 and 48. The
+`search` tool says this in its description and attaches a `hint` to any sentence-shaped
+query, because the caller is itself a model and can act on it; that is why query rewriting
+is guidance here rather than another model in the search path.
+
 - The app's `search` tool — hybrid retrieval over **three** legs fused by reciprocal rank:
   BM25, pgvector ANN (one leg per query representation, see below), and — for a query of
   at most `SEARCH_HYBRID_EXACT_MAX_WORDS` words — literal substring. The literal leg is
