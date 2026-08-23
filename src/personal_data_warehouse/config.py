@@ -91,6 +91,40 @@ DEFAULT_WHOOP_INCREMENTAL_LOOKBACK_DAYS = 14
 DEFAULT_WHOOP_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_WHOOP_MAX_RATE_LIMIT_SLEEP_SECONDS = 120
 DEFAULT_WHOOP_ENABLED = True
+# The private (app) API. Its base URL is deliberately NOT the public API's
+# /developer prefix: these are app.whoop.com's own endpoints.
+DEFAULT_WHOOP_PRIVATE_BASE_URL = "https://api.prod.whoop.com"
+DEFAULT_WHOOP_PRIVATE_ENABLED = True
+DEFAULT_WHOOP_PRIVATE_SESSION_KEY = "default"
+DEFAULT_WHOOP_PRIVATE_REQUEST_TIMEOUT_SECONDS = 30
+DEFAULT_WHOOP_PRIVATE_INCREMENTAL_LOOKBACK_DAYS = 2
+DEFAULT_WHOOP_PRIVATE_BACKFILL_WINDOW_DAYS = 14
+# The floor a backfill walks back to. WHOOP's own history starts well after
+# this, so an early floor costs one empty window, not a wrong answer.
+DEFAULT_WHOOP_PRIVATE_FULL_SYNC_START = "2015-01-01T00:00:00Z"
+DEFAULT_WHOOP_PRIVATE_CYCLES_PAGE_LIMIT = 25
+# Heart rate is the expensive collection: minute grain is 1,440 points a day.
+# One run covers `chunk_hours * chunks_per_run` of backfill plus the recent
+# window, which is what keeps a */15 schedule inside the rate limit.
+DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNK_HOURS = 6
+DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNKS_PER_RUN = 8
+DEFAULT_WHOOP_PRIVATE_HEART_RATE_RECENT_HOURS = 6
+DEFAULT_WHOOP_PRIVATE_JOURNAL_DAYS_PER_RUN = 7
+DEFAULT_WHOOP_PRIVATE_DOCUMENTS_LOOKBACK_DAYS = 3
+DEFAULT_WHOOP_PRIVATE_MAX_SLEEP_EVENT_REQUESTS = 25
+DEFAULT_WHOOP_PRIVATE_MAX_WORKOUT_REQUESTS = 25
+DEFAULT_WHOOP_PRIVATE_SPORTS_COUNTRY_CODE = "US"
+#: progression-service trend names that answer 200. RESTING_HEART_RATE is not
+#: one of them (HTTP 400), so do not add it back without re-probing.
+DEFAULT_WHOOP_PRIVATE_TREND_METRICS = (
+    "VO2_MAX",
+    "WEIGHT",
+    "BODY_COMPOSITION",
+    "STEPS",
+    "CALORIES",
+    "HRV",
+    "STRESS_DURING_SLEEP",
+)
 DEFAULT_CLAUDE_DESKTOP_BASE_URL = "https://claude.ai"
 DEFAULT_CLAUDE_DESKTOP_ENABLED = True
 DEFAULT_ALICE_BASE_URL = "https://aliceapp.ai"
@@ -359,6 +393,36 @@ class WhoopConfig:
 
 
 @dataclass(frozen=True)
+class WhoopPrivateConfig:
+    """The WHOOP private (app) API sync.
+
+    It holds no client id or secret: the credential is a browser session
+    published by `pdw whoop publish-session` and stored in
+    ``private.whoop_private_sessions``, which the sync rotates for itself.
+    """
+
+    account: str
+    session_key: str = DEFAULT_WHOOP_PRIVATE_SESSION_KEY
+    base_url: str = DEFAULT_WHOOP_PRIVATE_BASE_URL
+    request_timeout_seconds: int = DEFAULT_WHOOP_PRIVATE_REQUEST_TIMEOUT_SECONDS
+    incremental_lookback_days: int = DEFAULT_WHOOP_PRIVATE_INCREMENTAL_LOOKBACK_DAYS
+    backfill_window_days: int = DEFAULT_WHOOP_PRIVATE_BACKFILL_WINDOW_DAYS
+    full_sync_start: str = DEFAULT_WHOOP_PRIVATE_FULL_SYNC_START
+    force_full_sync: bool = False
+    cycles_page_limit: int = DEFAULT_WHOOP_PRIVATE_CYCLES_PAGE_LIMIT
+    heart_rate_chunk_hours: int = DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNK_HOURS
+    heart_rate_chunks_per_run: int = DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNKS_PER_RUN
+    heart_rate_recent_hours: int = DEFAULT_WHOOP_PRIVATE_HEART_RATE_RECENT_HOURS
+    journal_days_per_run: int = DEFAULT_WHOOP_PRIVATE_JOURNAL_DAYS_PER_RUN
+    documents_lookback_days: int = DEFAULT_WHOOP_PRIVATE_DOCUMENTS_LOOKBACK_DAYS
+    max_sleep_event_requests: int = DEFAULT_WHOOP_PRIVATE_MAX_SLEEP_EVENT_REQUESTS
+    max_workout_requests: int = DEFAULT_WHOOP_PRIVATE_MAX_WORKOUT_REQUESTS
+    sports_country_code: str = DEFAULT_WHOOP_PRIVATE_SPORTS_COUNTRY_CODE
+    trend_metrics: tuple[str, ...] = DEFAULT_WHOOP_PRIVATE_TREND_METRICS
+    enabled: bool = DEFAULT_WHOOP_PRIVATE_ENABLED
+
+
+@dataclass(frozen=True)
 class GoogleDriveSourceConfig:
     accounts: tuple[str, ...]
     exclude_folder_ids: tuple[str, ...] = ()
@@ -467,6 +531,7 @@ class Settings:
     claude_desktop: ClaudeDesktopConfig | None = None
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
     whoop: WhoopConfig | None = None
+    whoop_private: WhoopPrivateConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
     plaid: PlaidConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
@@ -577,6 +642,7 @@ def load_settings(
     require_alice_voice_recordings: bool = False,
     require_whoop: bool = False,
     require_whoop_client_secrets: bool = False,
+    require_whoop_private: bool = False,
     require_google_drive_source: bool = False,
     require_plaid: bool = False,
     require_assemblyai: bool = False,
@@ -1453,6 +1519,113 @@ def load_settings(
             enabled=_parse_bool_env(os.getenv("WHOOP_ENABLED"), DEFAULT_WHOOP_ENABLED),
         )
 
+    # The private (app) API rides on the same account label as the public one
+    # and needs no client credentials at all: its credential is the published
+    # browser session. It is therefore configured whenever WHOOP is.
+    whoop_private_account = (
+        os.getenv("WHOOP_PRIVATE_ACCOUNT") or whoop_account or default_voice_memos_account
+    ).strip()
+    whoop_private: WhoopPrivateConfig | None = None
+    if (
+        require_whoop_private
+        or whoop is not None
+        or any(name.startswith("WHOOP_PRIVATE_") for name in os.environ)
+    ):
+        if not whoop_private_account:
+            raise ValueError(
+                "WHOOP_PRIVATE_ACCOUNT, WHOOP_ACCOUNT or GMAIL_ACCOUNTS must be set for the WHOOP private API sync"
+            )
+        whoop_private_ints = {
+            "request_timeout_seconds": (
+                "WHOOP_PRIVATE_REQUEST_TIMEOUT_SECONDS",
+                DEFAULT_WHOOP_PRIVATE_REQUEST_TIMEOUT_SECONDS,
+                1,
+            ),
+            "incremental_lookback_days": (
+                "WHOOP_PRIVATE_INCREMENTAL_LOOKBACK_DAYS",
+                DEFAULT_WHOOP_PRIVATE_INCREMENTAL_LOOKBACK_DAYS,
+                0,
+            ),
+            "backfill_window_days": (
+                "WHOOP_PRIVATE_BACKFILL_WINDOW_DAYS",
+                DEFAULT_WHOOP_PRIVATE_BACKFILL_WINDOW_DAYS,
+                1,
+            ),
+            "cycles_page_limit": (
+                "WHOOP_PRIVATE_CYCLES_PAGE_LIMIT",
+                DEFAULT_WHOOP_PRIVATE_CYCLES_PAGE_LIMIT,
+                1,
+            ),
+            "heart_rate_chunk_hours": (
+                "WHOOP_PRIVATE_HEART_RATE_CHUNK_HOURS",
+                DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNK_HOURS,
+                1,
+            ),
+            "heart_rate_chunks_per_run": (
+                "WHOOP_PRIVATE_HEART_RATE_CHUNKS_PER_RUN",
+                DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNKS_PER_RUN,
+                1,
+            ),
+            "heart_rate_recent_hours": (
+                "WHOOP_PRIVATE_HEART_RATE_RECENT_HOURS",
+                DEFAULT_WHOOP_PRIVATE_HEART_RATE_RECENT_HOURS,
+                1,
+            ),
+            "journal_days_per_run": (
+                "WHOOP_PRIVATE_JOURNAL_DAYS_PER_RUN",
+                DEFAULT_WHOOP_PRIVATE_JOURNAL_DAYS_PER_RUN,
+                1,
+            ),
+            "documents_lookback_days": (
+                "WHOOP_PRIVATE_DOCUMENTS_LOOKBACK_DAYS",
+                DEFAULT_WHOOP_PRIVATE_DOCUMENTS_LOOKBACK_DAYS,
+                1,
+            ),
+            "max_sleep_event_requests": (
+                "WHOOP_PRIVATE_MAX_SLEEP_EVENT_REQUESTS",
+                DEFAULT_WHOOP_PRIVATE_MAX_SLEEP_EVENT_REQUESTS,
+                0,
+            ),
+            "max_workout_requests": (
+                "WHOOP_PRIVATE_MAX_WORKOUT_REQUESTS",
+                DEFAULT_WHOOP_PRIVATE_MAX_WORKOUT_REQUESTS,
+                0,
+            ),
+        }
+        whoop_private_values: dict[str, int] = {}
+        for field_name, (env_name, default, minimum) in whoop_private_ints.items():
+            try:
+                value = int(os.getenv(env_name, str(default)))
+            except ValueError as exc:
+                raise ValueError(f"{env_name} must be an integer") from exc
+            if value < minimum:
+                raise ValueError(f"{env_name} must be greater than or equal to {minimum}")
+            whoop_private_values[field_name] = value
+        whoop_private_trends = tuple(
+            dict.fromkeys(_parse_csv_env(os.getenv("WHOOP_PRIVATE_TREND_METRICS")))
+        ) or DEFAULT_WHOOP_PRIVATE_TREND_METRICS
+        whoop_private = WhoopPrivateConfig(
+            account=whoop_private_account,
+            session_key=os.getenv("WHOOP_PRIVATE_SESSION_KEY", DEFAULT_WHOOP_PRIVATE_SESSION_KEY).strip()
+            or DEFAULT_WHOOP_PRIVATE_SESSION_KEY,
+            base_url=os.getenv("WHOOP_PRIVATE_BASE_URL", DEFAULT_WHOOP_PRIVATE_BASE_URL).strip().rstrip("/")
+            or DEFAULT_WHOOP_PRIVATE_BASE_URL,
+            full_sync_start=os.getenv(
+                "WHOOP_PRIVATE_FULL_SYNC_START", DEFAULT_WHOOP_PRIVATE_FULL_SYNC_START
+            ).strip()
+            or DEFAULT_WHOOP_PRIVATE_FULL_SYNC_START,
+            force_full_sync=_parse_bool_env(os.getenv("WHOOP_PRIVATE_FORCE_FULL_SYNC"), False),
+            sports_country_code=os.getenv(
+                "WHOOP_PRIVATE_SPORTS_COUNTRY_CODE", DEFAULT_WHOOP_PRIVATE_SPORTS_COUNTRY_CODE
+            ).strip()
+            or DEFAULT_WHOOP_PRIVATE_SPORTS_COUNTRY_CODE,
+            trend_metrics=whoop_private_trends,
+            enabled=_parse_bool_env(
+                os.getenv("WHOOP_PRIVATE_ENABLED"), DEFAULT_WHOOP_PRIVATE_ENABLED
+            ),
+            **whoop_private_values,
+        )
+
     # Google Drive as an ingested data source (distinct from Drive-as-transport,
     # which the storage backends above use). Files in the warehouse's own
     # transport folders are excluded by default so we never re-ingest our own
@@ -1742,6 +1915,7 @@ def load_settings(
         claude_desktop=claude_desktop,
         alice_voice_recordings=alice_voice_recordings,
         whoop=whoop,
+        whoop_private=whoop_private,
         google_drive_source=google_drive_source,
         plaid=plaid,
         assemblyai=assemblyai,

@@ -1630,6 +1630,53 @@ _WHOOP_WORKOUT = _simple_adapter(
     priority=TIMELINE_PRIORITY_SELF,
 )
 
+# The private WHOOP API (source `whoop_private`) re-fetches the same cycles,
+# sleeps, recoveries and workouts the public API already publishes, at a much
+# higher resolution. Exactly ONE of its tables becomes timeline events: the
+# journal. Everything else it syncs is classified `detail` of the public
+# base_whoop row it duplicates, because those events are already on the
+# timeline via the four adapters above — a second adapter over the private
+# copies would emit a duplicate of every health event Zach has ever recorded
+# onto a 43M-row table.
+_WHOOP_PRIVATE_JOURNAL = _simple_adapter(
+    name="whoop_private_journal",
+    source_table="whoop_private_journal_entries",
+    source="whoop_private",
+    kind="journal_entry",
+    from_sql="@whoop_private_journal_entries t",
+    event_id="concat_ws('|', t.account, t.day::text, t.question_id::text)",
+    # `day` is the user-local calendar day the entry answers for, stored as a
+    # DATE; there is no clock time on a journal answer. Anchor it at UTC
+    # midnight the way finance_observation anchors `as_of`.
+    event_ts="t.day::timestamp AT TIME ZONE 'UTC'",
+    ingest_ts="t.synced_at",
+    actor="'me'",
+    title=(
+        "concat('WHOOP journal: ', "
+        "COALESCE(NULLIF(t.question_text, ''), t.question_id::text))"
+    ),
+    snippet=_snippet("t.answer"),
+    context="t.account",
+    source_pk=(
+        "jsonb_build_object('account', t.account, 'day', t.day, "
+        "'question_id', t.question_id)"
+    ),
+    metadata=(
+        "jsonb_build_object("
+        "'day', t.day, "
+        "'question_id', t.question_id, "
+        "'behavior_id', t.behavior_id, "
+        "'answer', t.answer)"
+    ),
+    search_text=_search_concat("t.question_text", "t.answer"),
+    # The one WHOOP table that is not sensor telemetry. Cycles, recoveries and
+    # sleeps above are `noise` precisely because the strap computes them about
+    # Zach with no action of his; a journal entry is the opposite — he opened
+    # the app and answered the question himself, which is the definition of the
+    # self tier (the same reasoning that keeps whoop_workout at `self`).
+    priority=TIMELINE_PRIORITY_SELF,
+)
+
 _MUTATION = _simple_adapter(
     name="mutation",
     source_table="upstream_mutations",
@@ -2141,6 +2188,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _WHOOP_RECOVERY,
     _WHOOP_SLEEP,
     _WHOOP_WORKOUT,
+    _WHOOP_PRIVATE_JOURNAL,
     _FINANCE_TRANSACTION,
     _FINANCE_OBSERVATION,
     _MANUAL_FINANCE_DOCUMENT,
@@ -2312,6 +2360,44 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "whoop_workouts": _events(),
     "whoop_sync_state": _state("per-collection WHOOP scan watermark"),
     "whoop_oauth_tokens": _state("rotating WHOOP OAuth credential"),
+    # WHOOP private API (app.whoop.com's own endpoints). It syncs the SAME
+    # cycles/sleeps/recoveries/workouts the public API does, at a far higher
+    # resolution, so every one of those tables is `detail` of the public row it
+    # duplicates: those events already reach the timeline through the four
+    # base_whoop adapters, and emitting them a second time would double every
+    # health event Zach has. Only the journal — which the public API does not
+    # expose at all — is an events table here.
+    "whoop_private_cycles": _detail(
+        "whoop_cycles", "high-resolution copy of the public cycle (strain components, sleep need)"
+    ),
+    "whoop_private_sleeps": _detail(
+        "whoop_sleeps", "high-resolution copy of the public sleep (stage durations, debt, projections)"
+    ),
+    "whoop_private_recoveries": _detail(
+        "whoop_recoveries", "high-resolution copy of the public recovery (HRV/RHR components)"
+    ),
+    "whoop_private_workouts": _detail(
+        "whoop_workouts", "high-resolution copy of the public workout (zone durations, GPS)"
+    ),
+    "whoop_private_sleep_events": _detail(
+        "whoop_private_sleeps", "the hypnogram: one row per LIGHT/REM/SWS/DISTURBANCE stage"
+    ),
+    "whoop_private_heart_rate_samples": _detail(
+        "whoop_cycles", "per-6-second heart rate time series under the day's cycle"
+    ),
+    "whoop_private_workout_heart_rate_samples": _detail(
+        "whoop_private_workouts", "per-sample heart rate inside one workout"
+    ),
+    "whoop_private_documents": _detail(
+        "whoop_cycles",
+        "Tier-2 raw UI payloads (trends, stress, cardio details, sleep deep-dive) kept as raw_json",
+    ),
+    "whoop_private_journal_entries": _events(
+        "one event per journal question Zach answered; no public-API equivalent"
+    ),
+    "whoop_private_sports": _entity("sport catalog resolving a workout's sport_id"),
+    "whoop_private_sync_state": _state("per-collection private-API scan watermark"),
+    "whoop_private_sessions": _state("rotating private-API browser session credential"),
     # Plaid finance data is queryable through base_plaid.* and marts_finance.* but
     # deliberately excluded from the general communications/activity timeline.
     "plaid_items": _entity("institution dimension for Plaid finance queries"),

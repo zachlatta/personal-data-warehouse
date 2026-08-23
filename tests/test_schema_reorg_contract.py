@@ -81,6 +81,7 @@ def _provision_everything(wh: PostgresWarehouse) -> None:
     wh.ensure_whatsapp_tables()
     wh.ensure_photos_tables()
     wh.ensure_whoop_tables()
+    wh.ensure_whoop_private_tables()
     wh.ensure_agent_sessions_tables()
     wh.ensure_plaid_tables()
     wh.ensure_finance_tables()
@@ -136,7 +137,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
     for obj in CATALOG.objects:
         by_layer[obj.layer] = by_layer.get(obj.layer, 0) + 1
     assert by_layer == {
-        "base": 52,
+        # +10 base: the whoop_private source (base_whoop_private), which adds
+        # the time series the public WHOOP API has no endpoint for.
+        "base": 62,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 23,
@@ -152,8 +155,10 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # neighborhood reader. +1 internal: internal.search_text_preview, the
         # match-windowed preview helper both search functions use.
         "timeline": 9,
-        "ops": 25,
-        "private": 5,
+        # +1 ops / +1 private: whoop_private's sync state and its rotating
+        # browser-session credential.
+        "ops": 26,
+        "private": 6,
         "internal": 2,
     }
 

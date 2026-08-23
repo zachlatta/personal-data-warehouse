@@ -293,6 +293,39 @@ class IngestClient:
             params={},
         )
 
+    def publish_whoop_private_session(
+        self,
+        *,
+        account: str,
+        access_token: str,
+        refresh_token: str,
+        access_expires_at: str,
+        refresh_expires_at: str,
+        session_key: str = "default",
+        source_browser: str = "",
+    ) -> Mapping[str, Any]:
+        """Publish a captured app.whoop.com browser session to the app.
+
+        Returns the app's acknowledgement, which carries fingerprints and
+        expiries but never the tokens themselves.
+        """
+        payload = {
+            "account": account,
+            "session_key": session_key,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "access_expires_at": access_expires_at,
+            "refresh_expires_at": refresh_expires_at,
+            "source_browser": source_browser,
+        }
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return self._signed_post(
+            "/ingest/whoop-private/session",
+            body=body,
+            content_type="application/json",
+            params={},
+        )
+
     # --- agent sessions -----------------------------------------------------
     def upload_agent_sessions_batch(self, gzip_bytes: bytes, *, exported_at: str) -> StoredObjectDict:
         return self._post(

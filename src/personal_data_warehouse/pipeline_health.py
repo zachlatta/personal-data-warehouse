@@ -690,6 +690,29 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     _source(
+        "whoop_private",
+        "WHOOP private API",
+        cadence="every 15 min",
+        transport=(
+            "Dagster whoop_private_sync → WHOOP private API"
+            " (browser session, rotating refresh token)"
+        ),
+        data=2 * DAY,
+        run=90 * MINUTE,
+        state=StateSource(
+            table="whoop_private_sync_state",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+        ),
+        note=(
+            "the access token lives 24h and the refresh token 30 days, rotating on"
+            " every refresh, so the source is hands-off until the refresh window"
+            " lapses; action_required means the captured browser session is dead —"
+            " re-publish it with `pdw whoop publish-session`"
+        ),
+    ),
+    _source(
         "plaid",
         "Plaid finance",
         cadence="every 30 min",
@@ -1009,6 +1032,42 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "whoop_body_measurements": _support("whoop", "synced_at"),
     "whoop_sync_state": _state("whoop", "updated_at"),
     "whoop_oauth_tokens": _state("whoop", "updated_at", "rotating OAuth credential"),
+    # WHOOP private API. A separate pipeline from `whoop`, deliberately: it has
+    # its own credential (a captured browser session, not the OAuth app) and
+    # its own cadence, so one of them dying must not be hidden by the other
+    # still writing. The cycle/sleep/recovery/workout tables here duplicate the
+    # public ones at higher resolution, so they are still `data` — this
+    # pipeline going quiet is a real outage even though base_whoop keeps
+    # filling.
+    "whoop_private_cycles": _data("whoop_private", "synced_at", "start_at"),
+    "whoop_private_sleeps": _data("whoop_private", "synced_at", "start_at"),
+    "whoop_private_recoveries": _data(
+        "whoop_private",
+        "synced_at",
+        "created_at",
+        note="a recovery has no span of its own; it is scored against the cycle that precedes it",
+    ),
+    "whoop_private_workouts": _data("whoop_private", "synced_at", "start_at"),
+    "whoop_private_sleep_events": _data("whoop_private", "synced_at", "started_at"),
+    "whoop_private_heart_rate_samples": _data(
+        "whoop_private",
+        "synced_at",
+        "sample_at",
+        note="the per-6-second series; only synced_at leads an index, so event time may read as skipped",
+    ),
+    "whoop_private_workout_heart_rate_samples": _data("whoop_private", "synced_at", "sample_at"),
+    "whoop_private_journal_entries": _data("whoop_private", "synced_at", "day"),
+    "whoop_private_documents": _data(
+        "whoop_private",
+        "synced_at",
+        "collected_at",
+        note="Tier-2 UI payloads kept as raw_json; collected_at is when the page was fetched",
+    ),
+    "whoop_private_sports": _support("whoop_private", "synced_at", note="sport catalog"),
+    "whoop_private_sync_state": _state("whoop_private", "updated_at"),
+    "whoop_private_sessions": _state(
+        "whoop_private", "updated_at", "rotating browser-session credential (24h access, 30d refresh)"
+    ),
     # Plaid
     "plaid_transactions": _data("plaid", "synced_at", "posted_at"),
     "plaid_investment_transactions": _data("plaid", "synced_at", "transaction_at"),

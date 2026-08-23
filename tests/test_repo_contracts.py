@@ -301,11 +301,107 @@ def test_agents_md_covers_whoop() -> None:
     assert "docs/whoop-oauth-operations.md" in section
 
 
+def test_agents_md_covers_whoop_private() -> None:
+    """The private API is a second WHOOP source with its own credential.
+
+    It is the only source whose auth is a captured browser session, and the
+    only one whose units disagree with a sibling source (seconds vs
+    milliseconds of the same measurement), so both have to be written down
+    where an agent reading AGENTS.md will hit them.
+    """
+    text = AGENTS_MD.read_text()
+    assert "## WHOOP private API" in text, "AGENTS.md does not mention the WHOOP private API"
+    section = text.split("## WHOOP private API", 1)[1].split("\n## ", 1)[0]
+    assert "base_whoop_private.journal_entries" in section
+    assert "private.whoop_private_sessions" in section
+    assert "docs/whoop-private-api.md" in section
+    assert "pdw whoop publish-session" in section, (
+        "the section must name the command that repairs a dead session"
+    )
+    assert "hrv_rmssd" in section and "second" in section, (
+        "the seconds-vs-milliseconds trap against the public API is a 1000x error"
+    )
+
+
+def _registered_names(prefix: str, *, excluding: tuple[str, ...] = ()) -> tuple[set[str], set[str]]:
+    """The coverage tables and timeline adapters belonging to one source.
+
+    ``whoop_private_*`` shares the ``whoop_`` prefix with the public WHOOP
+    source, so a bare ``startswith`` glob folds two sources into one set: the
+    public assertion then passes on the private source's rows and the private
+    assertion can never fail on its own. Longer prefixes living under a shorter
+    one are subtracted explicitly rather than tolerated.
+    """
+
+    def matches(name: str) -> bool:
+        return name.startswith(prefix) and not any(name.startswith(x) for x in excluding)
+
+    return (
+        {name for name in TIMELINE_TABLE_COVERAGE if matches(name)},
+        {adapter.name for adapter in TIMELINE_ADAPTERS if matches(adapter.name)},
+    )
+
+
+def _assert_source_is_registered(
+    prefix: str,
+    *,
+    excluding: tuple[str, ...] = (),
+    pipeline_id: str,
+    expected_adapters: set[str],
+) -> None:
+    tables, adapters = _registered_names(prefix, excluding=excluding)
+    assert tables, f"no {prefix}* tables registered — update this test"
+    assert tables <= set(TABLE_PIPELINES), (
+        f"{prefix}* tables missing from TABLE_PIPELINES: {sorted(tables - set(TABLE_PIPELINES))}"
+    )
+    assert pipeline_id in {entry.id for entry in PIPELINES}
+    assert {name for name in TABLE_PIPELINES if TABLE_PIPELINES[name].pipeline == pipeline_id} <= tables
+    # Pinning the exact adapter set is the point: a source that grows an event
+    # table and forgets TIMELINE_ADAPTERS fails silently everywhere else.
+    assert adapters == expected_adapters
+    for name in adapters:
+        source_table = next(a.source_table for a in TIMELINE_ADAPTERS if a.name == name)
+        assert source_table in tables, f"{name} reads {source_table}, which this source does not own"
+        assert TIMELINE_TABLE_COVERAGE[source_table].role == "events", source_table
+
+
 def test_whoop_is_registered_in_both_registries() -> None:
     """The claim the WHOOP section makes about coverage is checked, not asserted."""
-    whoop_tables = {name for name in TIMELINE_TABLE_COVERAGE if name.startswith("whoop_")}
-    assert whoop_tables, "no whoop tables registered — update this test"
-    assert whoop_tables <= set(TABLE_PIPELINES)
-    assert "whoop" in {pipeline.id for pipeline in PIPELINES}
-    whoop_adapters = {a.name for a in TIMELINE_ADAPTERS if a.name.startswith("whoop_")}
-    assert whoop_adapters == {"whoop_cycle", "whoop_recovery", "whoop_sleep", "whoop_workout"}
+    _assert_source_is_registered(
+        "whoop_",
+        excluding=("whoop_private_",),
+        pipeline_id="whoop",
+        expected_adapters={"whoop_cycle", "whoop_recovery", "whoop_sleep", "whoop_workout"},
+    )
+
+
+def test_whoop_private_is_registered_in_both_registries() -> None:
+    """The private API is a separate source and needs its own registrations.
+
+    It syncs the same cycles/sleeps/recoveries/workouts the public API does, so
+    exactly one of its tables may be an events table: the journal, which has no
+    public equivalent. A second adapter over the private copies would emit a
+    duplicate of every health event onto a 43M-row timeline.
+    """
+    _assert_source_is_registered(
+        "whoop_private_",
+        pipeline_id="whoop_private",
+        expected_adapters={"whoop_private_journal"},
+    )
+    tables, _ = _registered_names("whoop_private_")
+    duplicated = {
+        "whoop_private_cycles",
+        "whoop_private_sleeps",
+        "whoop_private_recoveries",
+        "whoop_private_workouts",
+        "whoop_private_heart_rate_samples",
+        "whoop_private_workout_heart_rate_samples",
+        "whoop_private_sleep_events",
+        "whoop_private_documents",
+    }
+    assert duplicated <= tables
+    for table in duplicated:
+        assert TIMELINE_TABLE_COVERAGE[table].role == "detail", (
+            f"{table} is classified {TIMELINE_TABLE_COVERAGE[table].role!r}; the public "
+            "base_whoop adapters already put these events on the timeline"
+        )

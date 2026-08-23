@@ -19,6 +19,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/whoopsession"
 )
 
 const debugCacheStatusDescription = "Return live cached query_ids, ages, and total cache size for debugging."
@@ -291,6 +292,16 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		} else {
 			mux.Handle(chatgptsession.Endpoint, chatgptsession.NewService(sessionStore, authSvc, time.Now, logger).Handler())
 			logger.Info("chatgpt session publishing enabled", "endpoint", chatgptsession.Endpoint)
+		}
+
+		// WHOOP's private API enforces MFA, so the credential is a captured
+		// browser session rather than an OAuth grant. Same signed-publish shape.
+		whoopStore, werr := whoopsession.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+		if werr != nil {
+			logger.Error("whoop session store failed to initialize; session publishing disabled", "error", werr.Error())
+		} else {
+			mux.Handle(whoopsession.Endpoint, whoopsession.NewService(whoopStore, authSvc, time.Now, logger).Handler())
+			logger.Info("whoop private session publishing enabled", "endpoint", whoopsession.Endpoint)
 		}
 
 		// The Claude Desktop credential endpoint persists a secret in Postgres

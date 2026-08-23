@@ -202,6 +202,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	if cmd == "chatgpt" {
 		return runChatGPT(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
 	}
+	// whoop publish-session is the same shape: a local browser-cookie capture
+	// posted to the app's signed endpoint, with no /api/tools client needed.
+	if cmd == "whoop" {
+		return runWhoop(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
+	}
 	if hasHelpArg(rest) {
 		fmt.Fprint(stdout, usage)
 		return 0

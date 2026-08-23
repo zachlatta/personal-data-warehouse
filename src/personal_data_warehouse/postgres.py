@@ -103,6 +103,18 @@ from personal_data_warehouse.schema import (
     WHOOP_BODY_MEASUREMENT_COLUMNS,
     WHOOP_CYCLE_COLUMNS,
     WHOOP_OAUTH_TOKEN_COLUMNS,
+    WHOOP_PRIVATE_CYCLE_COLUMNS,
+    WHOOP_PRIVATE_DOCUMENT_COLUMNS,
+    WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS,
+    WHOOP_PRIVATE_JOURNAL_ENTRY_COLUMNS,
+    WHOOP_PRIVATE_RECOVERY_COLUMNS,
+    WHOOP_PRIVATE_SESSION_COLUMNS,
+    WHOOP_PRIVATE_SLEEP_COLUMNS,
+    WHOOP_PRIVATE_SLEEP_EVENT_COLUMNS,
+    WHOOP_PRIVATE_SPORT_COLUMNS,
+    WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
+    WHOOP_PRIVATE_WORKOUT_COLUMNS,
+    WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS,
     WHOOP_PROFILE_COLUMNS,
     WHOOP_RECOVERY_COLUMNS,
     WHOOP_SLEEP_COLUMNS,
@@ -237,6 +249,11 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("warehouse", ("enrichment_run",), "t.kind"),
     ("whatsapp", ("whatsapp_message",), "t.kind"),
     ("whoop", ("whoop_cycle", "whoop_recovery", "whoop_sleep", "whoop_workout"), "t.kind"),
+    # The private (app) API contributes exactly one adapter: the journal. Its
+    # cycles/sleeps/recoveries/workouts are the same real-world events the
+    # public API already puts on the timeline, so re-emitting them would double
+    # every health event.
+    ("whoop_private", ("whoop_private_journal",), "t.kind"),
 )
 # The adapters the broad-search pool scans through the low-volume partial BM25
 # index, derived from the source map so a new source cannot be forgotten.
@@ -285,6 +302,8 @@ SEARCH_SOURCE_ALIASES: dict[str, str] = {
     "whoop_recovery": "whoop",
     "whoop_sleep": "whoop",
     "whoop_workout": "whoop",
+    "whoop_journal": "whoop_private",
+    "whoop_private_journal": "whoop_private",
 }
 # Hybrid retrieval (search_hybrid): reciprocal-rank-fusion constant. Rank-based
 # fusion sidesteps the cross-corpus score-comparability problem entirely — BM25
@@ -386,9 +405,21 @@ QUERY_ROLE_CONCURRENT_UPDATE_MESSAGE = "tuple concurrently updated"
 # including first bootstrap, scheduled refresh, direct CLI refresh, and
 # explicit reauthorization. A row lock alone cannot serialize the first insert.
 WHOOP_TOKEN_AUTHORITY_LOCK_ID = 8_407_112_472
+# The same discipline for the WHOOP *private* (app API) browser session. Its
+# refresh token rotates on every single refresh -- see
+# docs/whoop-private-api.md -- so two unsynchronized refreshes leave one winner
+# and one caller holding a credential the next refresh will reject. Distinct id
+# from the public credential's: the two rotate independently and must not
+# serialize against each other.
+WHOOP_PRIVATE_SESSION_AUTHORITY_LOCK_ID = 8_407_112_476
 # Serializes the one-time timeline priority bigint -> enum rewrite. Without it
 # two processes booting together both see a bigint column, both issue the ALTER,
 # and the second one rewrites the whole table again behind the first.
+
+
+def _sha256_hex(value: str) -> str:
+    """Fingerprint a credential so state can name it without storing it twice."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _canonical_whoop_token_json(value: str) -> str:
@@ -667,6 +698,55 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "whoop_workouts": TableSpec(WHOOP_WORKOUT_COLUMNS, ("account", "workout_id")),
     "whoop_sync_state": TableSpec(WHOOP_SYNC_STATE_COLUMNS, ("account", "collection")),
     "whoop_oauth_tokens": TableSpec(WHOOP_OAUTH_TOKEN_COLUMNS, ("account",), "updated_at"),
+    # WHOOP private (app) API. Summary grain mirrors the public tables; the
+    # sample tables are the reason this source exists.
+    "whoop_private_cycles": TableSpec(WHOOP_PRIVATE_CYCLE_COLUMNS, ("account", "cycle_id")),
+    "whoop_private_sleeps": TableSpec(WHOOP_PRIVATE_SLEEP_COLUMNS, ("account", "activity_id")),
+    "whoop_private_recoveries": TableSpec(WHOOP_PRIVATE_RECOVERY_COLUMNS, ("account", "activity_id")),
+    "whoop_private_workouts": TableSpec(WHOOP_PRIVATE_WORKOUT_COLUMNS, ("account", "activity_id")),
+    "whoop_private_sleep_events": TableSpec(
+        WHOOP_PRIVATE_SLEEP_EVENT_COLUMNS,
+        ("account", "activity_id", "event_index"),
+    ),
+    # ~525k rows/year at the 6-second grain, and append-heavy: the default
+    # size-proportional autovacuum triggers would leave planner statistics
+    # stale for months at a time (the gmail_messages precedent).
+    "whoop_private_heart_rate_samples": TableSpec(
+        WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS,
+        ("account", "sample_at"),
+        storage_parameters=(
+            ("autovacuum_analyze_scale_factor", "0.02"),
+            ("autovacuum_vacuum_scale_factor", "0.05"),
+        ),
+    ),
+    "whoop_private_workout_heart_rate_samples": TableSpec(
+        WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS,
+        ("account", "activity_id", "sample_at"),
+        storage_parameters=(
+            ("autovacuum_analyze_scale_factor", "0.02"),
+            ("autovacuum_vacuum_scale_factor", "0.05"),
+        ),
+    ),
+    "whoop_private_journal_entries": TableSpec(
+        WHOOP_PRIVATE_JOURNAL_ENTRY_COLUMNS,
+        ("account", "day", "question_id"),
+    ),
+    "whoop_private_sports": TableSpec(WHOOP_PRIVATE_SPORT_COLUMNS, ("account", "sport_id")),
+    "whoop_private_documents": TableSpec(
+        WHOOP_PRIVATE_DOCUMENT_COLUMNS,
+        ("account", "kind", "doc_key"),
+    ),
+    "whoop_private_sync_state": TableSpec(
+        WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
+        ("account", "collection"),
+    ),
+    # PK (account, session_key) is load-bearing: the app's publish endpoint
+    # upserts this same table with ON CONFLICT (account, session_key). See
+    # app/internal/whoopsession/store.go.
+    "whoop_private_sessions": TableSpec(
+        WHOOP_PRIVATE_SESSION_COLUMNS,
+        ("account", "session_key"),
+    ),
     # Unified timeline (personal_data_warehouse/timeline.py). Row volume tracks
     # the sum of every event source (slack_messages dominates), so it gets the
     # same append-heavy autovacuum thresholds.
@@ -1176,6 +1256,126 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "whoop_recoveries",
         "CREATE INDEX IF NOT EXISTS whoop_recoveries_updated_idx ON @whoop_recoveries (account, updated_at DESC)",
     ),
+    # WHOOP private (app API). Every data table carries an index LEADING with
+    # synced_at, which is the column the freshness collector probes with
+    # max(): it refuses to run that over a large unindexed heap, so a table
+    # without this index reports no freshness at all rather than reporting it
+    # late (pipeline_health.PROBE_SKIPPED_UNINDEXED).
+    IndexSpec(
+        "whoop_private_cycles_synced_idx",
+        "whoop_private_cycles",
+        "CREATE INDEX IF NOT EXISTS whoop_private_cycles_synced_idx ON @whoop_private_cycles (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_cycles_start_idx",
+        "whoop_private_cycles",
+        "CREATE INDEX IF NOT EXISTS whoop_private_cycles_start_idx ON @whoop_private_cycles (account, start_at DESC)",
+    ),
+    IndexSpec(
+        "whoop_private_sleeps_synced_idx",
+        "whoop_private_sleeps",
+        "CREATE INDEX IF NOT EXISTS whoop_private_sleeps_synced_idx ON @whoop_private_sleeps (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_sleeps_start_idx",
+        "whoop_private_sleeps",
+        "CREATE INDEX IF NOT EXISTS whoop_private_sleeps_start_idx ON @whoop_private_sleeps (account, start_at DESC)",
+    ),
+    IndexSpec(
+        "whoop_private_recoveries_synced_idx",
+        "whoop_private_recoveries",
+        "CREATE INDEX IF NOT EXISTS whoop_private_recoveries_synced_idx ON @whoop_private_recoveries (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_recoveries_updated_idx",
+        "whoop_private_recoveries",
+        "CREATE INDEX IF NOT EXISTS whoop_private_recoveries_updated_idx ON @whoop_private_recoveries (account, updated_at DESC)",
+    ),
+    IndexSpec(
+        "whoop_private_workouts_synced_idx",
+        "whoop_private_workouts",
+        "CREATE INDEX IF NOT EXISTS whoop_private_workouts_synced_idx ON @whoop_private_workouts (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_workouts_start_idx",
+        "whoop_private_workouts",
+        "CREATE INDEX IF NOT EXISTS whoop_private_workouts_start_idx ON @whoop_private_workouts (account, start_at DESC)",
+    ),
+    IndexSpec(
+        "whoop_private_sleep_events_synced_idx",
+        "whoop_private_sleep_events",
+        "CREATE INDEX IF NOT EXISTS whoop_private_sleep_events_synced_idx ON @whoop_private_sleep_events (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_sleep_events_time_idx",
+        "whoop_private_sleep_events",
+        "CREATE INDEX IF NOT EXISTS whoop_private_sleep_events_time_idx ON @whoop_private_sleep_events (account, started_at DESC)",
+    ),
+    # The time-range scan for the 6-second heart-rate series is served by the
+    # primary key (account, sample_at) -- it is already a btree ordered exactly
+    # that way, in both directions -- so only the freshness index is added here.
+    IndexSpec(
+        "whoop_private_heart_rate_samples_synced_idx",
+        "whoop_private_heart_rate_samples",
+        "CREATE INDEX IF NOT EXISTS whoop_private_heart_rate_samples_synced_idx "
+        "ON @whoop_private_heart_rate_samples (synced_at)",
+    ),
+    # The freshness collector probes max(sample_at) for this table's event time
+    # and refuses a max() over a large heap unless an index LEADS with that
+    # column. The primary key leads with account, so without this the event-time
+    # probe would report skipped_unindexed once the table grows past the probe
+    # threshold -- roughly half a million rows a year.
+    IndexSpec(
+        "whoop_private_heart_rate_samples_time_idx",
+        "whoop_private_heart_rate_samples",
+        "CREATE INDEX IF NOT EXISTS whoop_private_heart_rate_samples_time_idx "
+        "ON @whoop_private_heart_rate_samples (sample_at DESC)",
+    ),
+    IndexSpec(
+        "whoop_private_workout_hr_samples_synced_idx",
+        "whoop_private_workout_heart_rate_samples",
+        "CREATE INDEX IF NOT EXISTS whoop_private_workout_hr_samples_synced_idx "
+        "ON @whoop_private_workout_heart_rate_samples (synced_at)",
+    ),
+    # The workout samples' primary key leads with activity_id, so "what was my
+    # heart rate between 09:00 and 10:00" cannot use it. This is the index that
+    # makes a cross-workout time range a range scan instead of a seq scan.
+    IndexSpec(
+        "whoop_private_workout_hr_samples_time_idx",
+        "whoop_private_workout_heart_rate_samples",
+        "CREATE INDEX IF NOT EXISTS whoop_private_workout_hr_samples_time_idx "
+        "ON @whoop_private_workout_heart_rate_samples (account, sample_at)",
+    ),
+    IndexSpec(
+        "whoop_private_journal_entries_synced_idx",
+        "whoop_private_journal_entries",
+        "CREATE INDEX IF NOT EXISTS whoop_private_journal_entries_synced_idx "
+        "ON @whoop_private_journal_entries (synced_at)",
+    ),
+    # The journal is the one private-API table with a timeline adapter; its
+    # backfill pages newest-first by the entry's day.
+    IndexSpec(
+        "whoop_private_journal_entries_day_idx",
+        "whoop_private_journal_entries",
+        "CREATE INDEX IF NOT EXISTS whoop_private_journal_entries_day_idx "
+        "ON @whoop_private_journal_entries (account, day DESC)",
+    ),
+    IndexSpec(
+        "whoop_private_sports_synced_idx",
+        "whoop_private_sports",
+        "CREATE INDEX IF NOT EXISTS whoop_private_sports_synced_idx ON @whoop_private_sports (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_documents_synced_idx",
+        "whoop_private_documents",
+        "CREATE INDEX IF NOT EXISTS whoop_private_documents_synced_idx ON @whoop_private_documents (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_documents_kind_idx",
+        "whoop_private_documents",
+        "CREATE INDEX IF NOT EXISTS whoop_private_documents_kind_idx "
+        "ON @whoop_private_documents (account, kind, collected_at DESC)",
+    ),
     # Unified timeline read paths: keyset pagination by event time (with seq as
     # the tiebreak) and per-source filtered scans. The kind filter rides on the
     # time/priority indexes as a residual predicate.
@@ -1514,6 +1714,23 @@ JSONB_COLUMNS_BY_TABLE = {
     "whoop_recoveries": {"score_json", "raw_json"},
     "whoop_sleeps": {"stage_summary_json", "sleep_needed_json", "score_json", "raw_json"},
     "whoop_workouts": {"zone_durations_json", "score_json", "raw_json"},
+    "whoop_private_cycles": {"raw_json"},
+    "whoop_private_sleeps": {"raw_json"},
+    "whoop_private_recoveries": {"raw_json"},
+    "whoop_private_workouts": {
+        "zone_durations_json",
+        "zone_durations_v2_json",
+        "gps_data_json",
+        "raw_json",
+    },
+    "whoop_private_sleep_events": {"raw_json"},
+    "whoop_private_heart_rate_samples": {"raw_json"},
+    "whoop_private_workout_heart_rate_samples": {"raw_json"},
+    "whoop_private_journal_entries": {"raw_json"},
+    "whoop_private_sports": {"raw_json"},
+    # Tier-2 BFF payloads: faithful raw only. See docs/whoop-private-api.md --
+    # a typed column over a UI payload goes quietly null when WHOOP restyles.
+    "whoop_private_documents": {"raw_json"},
     "plaid_items": {"error_json", "raw_json"},
     "plaid_accounts": {"raw_json"},
     "plaid_transactions": {"category_json", "raw_json"},
@@ -1612,11 +1829,34 @@ DATE_COLUMNS = {
     "disposed_on",
     # the date printed on a receipt is a day, not an instant
     "purchased_at",
+    # WHOOP private: a journal entry is logged for a user-local calendar day,
+    # and a cycle reports the day(s) it is awake for -- neither is an instant.
+    "day",
+    "day_start",
+    "day_end",
 }
 
 
 def _is_numeric_column(table: str | None, column: str) -> bool:
     return column in NUMERIC_COLUMNS_BY_TABLE.get(table or "", set())
+
+
+# Columns whose name is claimed by a global type set but which are plain text
+# in this particular table. Checked before every global set, exactly like
+# NUMERIC_COLUMNS_BY_TABLE, so one source's label column cannot be forced into
+# another source's numeric column of the same name.
+#
+# `state` is the live example: apple_message_chats stores a numeric chat state,
+# while WHOOP's private API stores a label ("COMPLETE"). Without this override
+# the label lands in a bigint column and every insert fails.
+TEXT_COLUMNS_BY_TABLE = {
+    "whoop_private_sleeps": {"state"},
+    "whoop_private_recoveries": {"state"},
+}
+
+
+def _is_text_column(table: str | None, column: str) -> bool:
+    return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
     # mart health: the stalest input pipeline's last write. (When the view's
@@ -1698,6 +1938,15 @@ TIMESTAMP_COLUMNS = {
     "newest_event_at",
     "last_error_at",
     "collected_at",
+    # WHOOP private (app API)
+    "published_at",
+    "sample_at",
+    "ended_at",
+    "predicted_end",
+    "optimal_sleep_start",
+    "optimal_sleep_end",
+    "access_expires_at",
+    "refresh_expires_at",
 }
 
 INTEGER_COLUMNS = {
@@ -1860,6 +2109,22 @@ INTEGER_COLUMNS = {
     "state_error_rows",
     "state_attention_rows",
     "probe_ms",
+    # WHOOP private (app API). Counts, beats-per-minute samples, and the 0/1
+    # flags the warehouse stores as bigint rather than boolean.
+    "day_avg_heart_rate",
+    "day_max_heart_rate",
+    "heart_rate",
+    "step_seconds",
+    "total_wake_events",
+    "disturbances",
+    "cycles_count",
+    "total_steps",
+    "history_size",
+    "is_nap",
+    "calibrating",
+    "has_gps",
+    "has_survey",
+    "is_current",
 }
 
 FLOAT_COLUMNS = {
@@ -1899,7 +2164,64 @@ FLOAT_COLUMNS = {
     "latitude",
     "longitude",
     "match_score",
+    # WHOOP private (app API). Scores, strains and durations arrive as the
+    # provider's own reals; nothing here is money, so double precision is the
+    # right storage and NUMERIC would be false precision.
+    "score",
+    "day_strain",
+    "scaled_strain",
+    "day_kilojoules",
+    "intensity_score",
+    "raw_intensity_score",
+    "cumulative_workout_intensity",
+    "kilojoules",
+    "msk_score",
+    "sleep_need",
+    "latency",
+    "arousal_time",
+    "in_sleep_efficiency",
+    "debt_pre",
+    "debt_post",
+    "habitual_sleep_need",
+    "credit_from_naps",
+    "need_from_strain",
+    "quality_duration",
+    "light_sleep_duration",
+    "slow_wave_sleep_duration",
+    "rem_sleep_duration",
+    "wake_duration",
+    "no_data_duration",
+    "time_in_bed",
+    "sleep_consistency",
+    "projected_score",
+    "projected_sleep",
+    # The private API's HRV is SECONDS; hrv_rmssd_milli beside it is the same
+    # measurement in the unit every other WHOOP relation uses.
+    "hrv_rmssd_seconds",
+    "spo2",
+    "prob_covid",
+    "hr_baseline",
+    "hrv_component",
+    "rhr_component",
+    "recovery_rate",
 }
+
+# Order matters only for readability; _ensure_table_group creates each with
+# CREATE TABLE IF NOT EXISTS and then applies the group's indexes.
+_WHOOP_PRIVATE_TABLES = (
+    "whoop_private_cycles",
+    "whoop_private_sleeps",
+    "whoop_private_recoveries",
+    "whoop_private_workouts",
+    "whoop_private_sleep_events",
+    "whoop_private_heart_rate_samples",
+    "whoop_private_workout_heart_rate_samples",
+    "whoop_private_journal_entries",
+    "whoop_private_sports",
+    "whoop_private_documents",
+    "whoop_private_sync_state",
+    "whoop_private_sessions",
+)
 
 _WHATSAPP_TABLES = (
     "whatsapp_chats",
@@ -3140,6 +3462,25 @@ class PostgresWarehouse:
             "ALTER TABLE @whoop_sync_state "
             "ADD COLUMN IF NOT EXISTS credential_sha256 text NOT NULL DEFAULT ''"
         )
+
+    def ensure_whoop_private_tables(self) -> None:
+        """Provision the WHOOP private (app) API source.
+
+        Separate from ensure_whoop_tables: the two sources share a provider but
+        not a credential, a cadence, or a failure mode, and the private source
+        can be paused without touching the public one.
+        """
+        self._ensure_table_group(list(_WHOOP_PRIVATE_TABLES))
+        # The session table is written by the app too
+        # (app/internal/whoopsession/store.go), whose CREATE gives these two
+        # columns semantic defaults. Restate them here so it makes no difference
+        # which side created the table first: a publish that omits session_key
+        # must land on the same row the poller reads, and a row that has never
+        # failed must read 'ok' rather than the empty string.
+        self._command(
+            "ALTER TABLE @whoop_private_sessions ALTER COLUMN session_key SET DEFAULT 'default'"
+        )
+        self._command("ALTER TABLE @whoop_private_sessions ALTER COLUMN status SET DEFAULT 'ok'")
 
     def ensure_agent_sessions_tables(self) -> None:
         self._ensure_table_group(_AI_CONVERSATION_EVENT_TABLES)
@@ -5906,6 +6247,298 @@ class PostgresWarehouse:
             ],
             WHOOP_SYNC_STATE_COLUMNS,
         )
+
+    # -- WHOOP private (app) API ------------------------------------------
+
+    def insert_whoop_private_cycles(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_private_cycles", rows, WHOOP_PRIVATE_CYCLE_COLUMNS)
+
+    def insert_whoop_private_sleeps(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_private_sleeps", rows, WHOOP_PRIVATE_SLEEP_COLUMNS)
+
+    def insert_whoop_private_recoveries(self, rows: list[dict[str, Any]]) -> None:
+        """Upsert recoveries.
+
+        Callers must populate BOTH ``hrv_rmssd_seconds`` (the private API's own
+        unit) and ``hrv_rmssd_milli`` (the unit base_whoop.recoveries and every
+        derived HRV number use). ``schema.whoop_private_hrv_rmssd_milli`` is the
+        one sanctioned conversion.
+        """
+        self._insert_rows("whoop_private_recoveries", rows, WHOOP_PRIVATE_RECOVERY_COLUMNS)
+
+    def insert_whoop_private_workouts(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_private_workouts", rows, WHOOP_PRIVATE_WORKOUT_COLUMNS)
+
+    def insert_whoop_private_sleep_events(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_private_sleep_events", rows, WHOOP_PRIVATE_SLEEP_EVENT_COLUMNS)
+
+    def insert_whoop_private_heart_rate_samples(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows(
+            "whoop_private_heart_rate_samples",
+            rows,
+            WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS,
+        )
+
+    def insert_whoop_private_workout_heart_rate_samples(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows(
+            "whoop_private_workout_heart_rate_samples",
+            rows,
+            WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS,
+        )
+
+    def insert_whoop_private_journal_entries(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_private_journal_entries", rows, WHOOP_PRIVATE_JOURNAL_ENTRY_COLUMNS)
+
+    def insert_whoop_private_sports(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_private_sports", rows, WHOOP_PRIVATE_SPORT_COLUMNS)
+
+    def insert_whoop_private_documents(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_private_documents", rows, WHOOP_PRIVATE_DOCUMENT_COLUMNS)
+
+    def load_whoop_private_sync_state(self) -> dict[tuple[str, str], dict[str, Any]]:
+        columns = WHOOP_PRIVATE_SYNC_STATE_COLUMNS
+        rows = self._query(
+            f"SELECT {', '.join(_identifier(column) for column in columns)} FROM @whoop_private_sync_state"
+        )
+        return {(str(row[0]), str(row[1])): dict(zip(columns, row, strict=True)) for row in rows}
+
+    def insert_whoop_private_sync_state(
+        self,
+        *,
+        account: str,
+        collection: str,
+        watermark_updated_at: datetime,
+        last_sync_type: str,
+        status: str,
+        error: str,
+        updated_at: datetime,
+        credential_sha256: str = "",
+    ) -> None:
+        self._insert(
+            "whoop_private_sync_state",
+            [
+                (
+                    account,
+                    collection,
+                    watermark_updated_at,
+                    last_sync_type,
+                    status,
+                    error,
+                    updated_at,
+                    int(_ensure_utc(updated_at).timestamp() * 1_000_000),
+                    credential_sha256,
+                )
+            ],
+            WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
+        )
+
+    def load_whoop_private_session(self, *, account: str, session_key: str = "default") -> dict[str, Any]:
+        """The stored browser session, or an empty dict when none is published.
+
+        Empty rather than None so a caller cannot accidentally treat "no
+        credential yet" as a row with falsy fields; the sync path checks for a
+        refresh_token and reports action_required.
+        """
+
+        columns = WHOOP_PRIVATE_SESSION_COLUMNS
+        rows = self._query(
+            f"SELECT {', '.join(_identifier(column) for column in columns)} "
+            "FROM @whoop_private_sessions WHERE account = %s AND session_key = %s",
+            (account, session_key),
+        )
+        if not rows:
+            return {}
+        return dict(zip(columns, rows[0], strict=True))
+
+    def replace_whoop_private_session(
+        self,
+        *,
+        account: str,
+        access_token: str,
+        refresh_token: str,
+        access_expires_at: datetime,
+        refresh_expires_at: datetime,
+        published_at: datetime,
+        updated_at: datetime,
+        session_key: str = "default",
+        source_browser: str = "",
+        status: str = "ok",
+        error: str = "",
+    ) -> None:
+        """Install a freshly captured browser session under the authority lock.
+
+        This is the "a human logged in again" path, and it always wins: it
+        clears any action_required state, because the point of publishing is to
+        repair a rejected credential. It takes the same lock a rotation takes,
+        so a publish cannot interleave with a rotation that is mid-flight and
+        silently lose whichever committed second.
+
+        The app writes this same row over its own HMAC-signed endpoint
+        (app/internal/whoopsession); this method is the Python-side twin used by
+        tests and by any in-process publisher.
+        """
+
+        if not refresh_token:
+            raise ValueError("WHOOP private session needs a refresh token")
+        relation = self.sql_relation("whoop_private_sessions")
+        connection = psycopg2.connect(self._database_url)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (WHOOP_PRIVATE_SESSION_AUTHORITY_LOCK_ID,),
+                )
+                cursor.execute(
+                    f"INSERT INTO {relation} (account, session_key, access_token, refresh_token, "
+                    "access_expires_at, refresh_expires_at, refresh_token_sha256, source_browser, "
+                    "published_at, updated_at, sync_version, status, error) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (account, session_key) DO UPDATE SET "
+                    "access_token = EXCLUDED.access_token, "
+                    "refresh_token = EXCLUDED.refresh_token, "
+                    "access_expires_at = EXCLUDED.access_expires_at, "
+                    "refresh_expires_at = EXCLUDED.refresh_expires_at, "
+                    "refresh_token_sha256 = EXCLUDED.refresh_token_sha256, "
+                    "source_browser = EXCLUDED.source_browser, "
+                    "published_at = EXCLUDED.published_at, "
+                    "updated_at = EXCLUDED.updated_at, "
+                    "sync_version = EXCLUDED.sync_version, "
+                    "status = EXCLUDED.status, "
+                    "error = EXCLUDED.error",
+                    (
+                        account,
+                        session_key,
+                        access_token,
+                        refresh_token,
+                        access_expires_at,
+                        refresh_expires_at,
+                        _sha256_hex(refresh_token),
+                        source_browser,
+                        published_at,
+                        updated_at,
+                        int(_ensure_utc(updated_at).timestamp() * 1_000_000),
+                        status,
+                        error,
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def rotate_whoop_private_session(
+        self,
+        *,
+        account: str,
+        expected_refresh_token: str,
+        access_token: str,
+        refresh_token: str,
+        access_expires_at: datetime,
+        refresh_expires_at: datetime,
+        updated_at: datetime,
+        session_key: str = "default",
+    ) -> dict[str, Any]:
+        """Persist a rotation as a compare-and-swap under the authority lock.
+
+        WHOOP's private auth-service returns a NEW refresh token on every
+        refresh, so the stored credential is a moving target: two callers that
+        both refreshed from the same starting token produce two different live
+        sessions, and a last-writer-wins UPDATE installs whichever committed
+        second -- which may be the one whose token the other caller has already
+        superseded. The public WHOOP credential produced three production
+        incidents from exactly this shape (docs/whoop-oauth-operations.md), and
+        rotate_whoop_oauth_token is the discipline being mirrored: advisory
+        lock, row lock, compare, then write.
+
+        The comparison is on the refresh token the caller *started from*. If it
+        no longer matches, someone else already rotated; this call makes no
+        change and returns the winning row, so the loser adopts the live
+        credential instead of overwriting it with a superseded one.
+
+        Unlike the public credential, the provider call happens before this
+        method rather than inside the lock. That is deliberate and safe here:
+        the private API's old refresh token keeps working immediately after a
+        refresh (verified 2026-08-23), so the danger is a lost update, not a
+        consumed token -- and a lost update is exactly what the compare
+        prevents. Returns the row that is live after the call.
+        """
+
+        if not expected_refresh_token:
+            raise ValueError("WHOOP private session rotation needs the expected refresh token")
+        if not refresh_token:
+            raise ValueError("WHOOP private refresh returned no refresh token")
+        columns = WHOOP_PRIVATE_SESSION_COLUMNS
+        select_list = ", ".join(_identifier(column) for column in columns)
+        relation = self.sql_relation("whoop_private_sessions")
+        connection = psycopg2.connect(self._database_url)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (WHOOP_PRIVATE_SESSION_AUTHORITY_LOCK_ID,),
+                )
+                cursor.execute(
+                    f"SELECT {select_list} FROM {relation} "
+                    "WHERE account = %s AND session_key = %s FOR UPDATE",
+                    (account, session_key),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "WHOOP private session row disappeared before rotation; "
+                        "re-publish it with `pdw whoop publish-session`"
+                    )
+                current = dict(zip(columns, row, strict=True))
+                if str(current["refresh_token"]) != expected_refresh_token:
+                    # Someone else already rotated. Their token is the live one.
+                    connection.commit()
+                    return current
+
+                rotated = dict(current)
+                rotated.update(
+                    {
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "access_expires_at": access_expires_at,
+                        "refresh_expires_at": refresh_expires_at,
+                        "refresh_token_sha256": _sha256_hex(refresh_token),
+                        "updated_at": updated_at,
+                        "sync_version": int(_ensure_utc(updated_at).timestamp() * 1_000_000),
+                        # A successful rotation is proof the credential works.
+                        "status": "ok",
+                        "error": "",
+                    }
+                )
+                cursor.execute(
+                    f"UPDATE {relation} SET access_token = %s, refresh_token = %s, "
+                    "access_expires_at = %s, refresh_expires_at = %s, refresh_token_sha256 = %s, "
+                    "updated_at = %s, sync_version = %s, status = %s, error = %s "
+                    "WHERE account = %s AND session_key = %s",
+                    (
+                        rotated["access_token"],
+                        rotated["refresh_token"],
+                        rotated["access_expires_at"],
+                        rotated["refresh_expires_at"],
+                        rotated["refresh_token_sha256"],
+                        rotated["updated_at"],
+                        rotated["sync_version"],
+                        rotated["status"],
+                        rotated["error"],
+                        account,
+                        session_key,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("WHOOP private session row disappeared during rotation")
+            connection.commit()
+            return rotated
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def insert_calendar_events(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("calendar_events", rows, CALENDAR_EVENT_COLUMNS)
@@ -10797,8 +11430,11 @@ def _postgres_type(column: str, *, table: str | None = None) -> str:
         return "jsonb"
     if column in ARRAY_COLUMNS:
         return "text[]"
-    # Per-table NUMERIC/DATE run before the global name sets: ledger column
-    # names collide with raw-source float columns.
+    # Per-table TEXT/NUMERIC run before the global name sets: ledger column
+    # names collide with raw-source float columns, and one source's label
+    # column collides with another source's numeric column of the same name.
+    if _is_text_column(table, column):
+        return "text"
     if _is_numeric_column(table, column):
         return "numeric"
     if column in DATE_COLUMNS:
@@ -10827,6 +11463,8 @@ def _default_sql(column: str, *, table: str | None = None) -> str:
         return "'{}'::jsonb"
     if column in ARRAY_COLUMNS:
         return "'{}'::text[]"
+    if _is_text_column(table, column):
+        return "''"
     if _is_numeric_column(table, column):
         return "0"
     if column in DATE_COLUMNS:

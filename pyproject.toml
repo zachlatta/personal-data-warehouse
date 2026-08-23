@@ -33,6 +33,7 @@ personal-data-warehouse-google-drive-source-sync = "personal_data_warehouse.goog
 personal-data-warehouse-slack-sync = "personal_data_warehouse.slack_sync:main"
 personal-data-warehouse-whoop-auth = "personal_data_warehouse.whoop_auth:main"
 personal-data-warehouse-whoop-sync = "personal_data_warehouse.whoop_sync:main"
+personal-data-warehouse-whoop-private-sync = "personal_data_warehouse.whoop_private_sync:main"
 # The four scheduled client uploaders are no longer standalone console scripts:
 # they run through the pdw CLI as `pdw ingest <source>` (voice-memos,
 # apple-notes, apple-messages, agent-sessions), which execs `uv run python -m

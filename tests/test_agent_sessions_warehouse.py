@@ -187,6 +187,7 @@ def test_search_text_includes_agent_session_branches(warehouse) -> None:
     warehouse.ensure_agent_sessions_tables()
     warehouse.ensure_google_drive_source_tables()
     warehouse.ensure_whoop_tables()
+    warehouse.ensure_whoop_private_tables()
     warehouse.ensure_finance_tables()
     warehouse.ensure_manual_finance_tables()
     warehouse.ensure_alice_voice_recordings_tables()

@@ -1633,6 +1633,91 @@ deployment restart. Never paste the callback URL, authorization code, or token i
 logs, or a commit. Full runbook, including the cross-host reverse-tunnel procedure:
 [`docs/whoop-oauth-operations.md`](docs/whoop-oauth-operations.md).
 
+## WHOOP private API (health, high resolution)
+
+`base_whoop` is the *public* developer API, and it is summary-grain: one row per cycle,
+sleep, recovery and workout, with **no time series at all**. Per-6-second heart rate, the
+sleep hypnogram, the journal, and the trend metrics (VO2 max, weight, body composition,
+steps) have no public endpoint whatsoever. Source `whoop_private` is the second WHOOP
+source that fills that in by calling the endpoints `app.whoop.com` itself calls. Full
+reconnaissance, including the dead ends nobody should re-walk:
+[`docs/whoop-private-api.md`](docs/whoop-private-api.md).
+
+**It is a separate pipeline from `whoop`, on purpose.** It has its own credential and its
+own cadence, so `marts_ops.pipeline_health` reports `whoop` and `whoop_private`
+independently and one of them dying is never hidden by the other still writing.
+
+### SQL starting points
+
+```sql
+-- the day's minute-by-minute heart rate
+SELECT sample_at, heart_rate FROM base_whoop_private.heart_rate_samples
+WHERE sample_at >= now() - interval '1 day' ORDER BY sample_at;
+
+-- last night's hypnogram
+SELECT stage, started_at, ended_at FROM base_whoop_private.sleep_events
+ORDER BY started_at DESC LIMIT 50;
+```
+
+| relation | what it holds |
+| --- | --- |
+| `base_whoop_private.heart_rate_samples` | continuous heart rate (step 6s / 60s / 600s — the API accepts no other step) |
+| `base_whoop_private.workout_heart_rate_samples` | the same series scoped to one workout |
+| `base_whoop_private.sleep_events` | the hypnogram: one row per LIGHT / REM / SWS / DISTURBANCES stage |
+| `base_whoop_private.journal_entries` | the journal answers Zach typed; **the only table here with a timeline adapter** |
+| `base_whoop_private.cycles`, `.sleeps`, `.recoveries`, `.workouts` | high-resolution copies of the public rows (strain components, sleep debt, HRV/RHR components, zone durations, GPS) |
+| `base_whoop_private.sports` | the 204-sport catalog resolving a workout's `sport_id` |
+| `base_whoop_private.documents` | Tier-2 raw UI payloads (trends, stress, cardio details, sleep deep-dive) kept as `raw_json` |
+| `ops.whoop_private_sync_state` | per-collection watermark, status and error |
+| `private.whoop_private_sessions` | the credential |
+
+**Only `journal_entries` reaches `timeline.events`** (adapter `whoop_private_journal`,
+source `whoop_private`, priority `self` — Zach opened the app and answered the question
+himself). The private cycles/sleeps/recoveries/workouts are classified `detail` of the
+`base_whoop` row they duplicate: those events are already on the timeline through the four
+public adapters, and a second adapter over the private copies would emit a duplicate of
+every health event onto a 43M-row table. Read a health *event* from `timeline.events`, then
+drill into `base_whoop_private.*` for the resolution the public row does not carry.
+
+### Auth: a captured browser session, not OAuth
+
+MFA is mandatory on this account, so there is no unattended password grant and no login to
+implement. The web app's session is captured from ordinary Chrome cookies on `.whoop.com`
+(the same Safe Storage keychain machinery `chatgpt_cookies.py` uses) and published to the
+warehouse, exactly like the ChatGPT session:
+
+- `whoop-auth-token` — the bearer, an AWS Cognito JWT, **24 hours**.
+- `whoop-auth-refresh-token` — opaque, **30 days**, and **every refresh returns a new one**.
+
+Persisting the rotation slides the 30-day window forward, so this source is hands-off
+indefinitely: unlike ChatGPT's 10-day token, nothing here expires on a fixed clock while
+the sync keeps running. The refresh goes to
+`POST /auth-service/v2/whoop/refresh` with the **refresh** token in the `Authorization`
+header and an **empty body** — sending it as `{"refresh_token": ...}` returns 401, which is
+what makes every published recipe fail. Rotations are persisted under the same advisory
+lock the public WHOOP credential uses; three production incidents came from treating a
+rotating credential casually.
+
+When the refresh window does lapse, `ops.whoop_private_sync_state` goes `action_required`
+and `/pipelines` shows it. Repair it from the Mac whose Chrome holds the whoop.com login:
+
+```bash
+pdw whoop publish-session          # add --dry-run to verify cookie decryption first
+```
+
+### Unit traps
+
+- **`hrv_rmssd` is in SECONDS here.** The public API's `base_whoop.recoveries.hrv_rmssd_milli`
+  is milliseconds. Mixing the two is a 1000x error, so the private table stores
+  `hrv_rmssd_seconds` *and* a derived milliseconds column rather than one ambiguous name.
+- **`during`, `days` and `optimal_sleep_times` are PostgreSQL range notation**
+  (`['start','end')`). Parse the bounds; do not cast the string to a timestamp.
+- Day boundaries are user-local — take `timezone_offset` from the bootstrap response first.
+- The cycle carries `predicted_end` + `data_state`, which is a cleaner in-progress signal
+  than the warehouse's epoch sentinel.
+- Rate limits are 2,000 per 5 minutes and 144,000 per day (~20x the public API), so a
+  backfill is not limit-constrained.
+
 ## Plaid Finance
 
 Personal financial data is linked through Plaid and stored in the source-owned `plaid` schema.

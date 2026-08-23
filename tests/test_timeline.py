@@ -69,6 +69,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_upstream_mutation_tables()
     wh.ensure_google_drive_source_tables()
     wh.ensure_whoop_tables()
+    wh.ensure_whoop_private_tables()
     wh.ensure_plaid_tables()
     wh.ensure_finance_tables()
     wh.ensure_manual_finance_tables()
@@ -771,6 +772,20 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
         """,
         (_NOW - timedelta(hours=20), _NOW - timedelta(hours=19), _NOW, _NOW),
     )
+    # The one whoop_private table with an adapter. Everything else that source
+    # syncs is `detail` of the public base_whoop row it duplicates, so seeding
+    # it would be seeding rows no adapter reads.
+    wh._command(
+        """
+        INSERT INTO @whoop_private_journal_entries (account, day, question_id, question_text,
+                                                   answer, behavior_id, synced_at, sync_version)
+        VALUES ('z@x.test', %s, '62', 'Did you drink any alcohol?', 'false', '7', %s, %s)
+        """,
+        # `day` is a DATE, so this lands at midnight UTC of the seeded day —
+        # deliberately not older than the finance observation the ordering
+        # assertions treat as the oldest seeded row.
+        (_NOW.date(), _NOW, sync_version),
+    )
 
 
 # The seeded fixture rows exercise one classification branch per adapter:
@@ -779,7 +794,8 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
 # his own reply at 1), an unknown-roster whatsapp group (3), a session Zach
 # prompted (1), his own notes/memos (1), a calendar event he organizes (1),
 # an unstarred drive file (3), contact churn (5: sync machinery), device
-# telemetry vs a workout he did (4), and the warehouse's own machinery (5).
+# telemetry vs a workout he did and a journal answer he typed (4 vs 1), and
+# the warehouse's own machinery (5).
 # Every adapter appears: test_expected_fixtures_cover_every_adapter pins the
 # keys to the registry, so a new adapter cannot ship without a tier assertion.
 EXPECTED_SEEDED_PRIORITIES = {
@@ -802,6 +818,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "whoop_recovery": "noise",
     "whoop_sleep": "noise",
     "whoop_workout": "self",
+    "whoop_private_journal": "self",
     "finance_transaction": "self",
     "finance_observation": "background",
     "manual_finance_document": "self",
@@ -830,6 +847,7 @@ EXPECTED_SEEDED_EVENTS = {
     "whoop_recovery": 1,
     "whoop_sleep": 1,
     "whoop_workout": 1,
+    "whoop_private_journal": 1,
     "finance_transaction": 1,
     "finance_observation": 1,
     "manual_finance_document": 1,

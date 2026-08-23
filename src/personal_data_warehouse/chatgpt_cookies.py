@@ -159,6 +159,43 @@ def _strip_pkcs7(data: bytes) -> bytes:
     return data
 
 
+def read_cookies_for_host(db_path: Path, key: bytes, host_suffix: str) -> dict[str, str]:
+    """Decrypt every cookie whose host_key ends with ``host_suffix``.
+
+    The AES-CBC + Safe Storage keychain machinery here is browser-specific, not
+    site-specific, so other sources (see ``whoop_private_session``) reuse it
+    rather than re-implementing the crypto. Returns name -> value.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        local = Path(tmp) / "Cookies"
+        shutil.copy(db_path, local)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(db_path) + suffix)
+            if sidecar.exists():
+                shutil.copy(sidecar, Path(str(local) + suffix))
+        connection = sqlite3.connect(str(local))
+        try:
+            rows = connection.execute(
+                "SELECT host_key, name, encrypted_value, value FROM cookies "
+                "WHERE host_key LIKE ? ORDER BY name",
+                (f"%{host_suffix}",),
+            ).fetchall()
+        finally:
+            connection.close()
+
+    found: dict[str, str] = {}
+    for host_key, name, encrypted_value, value in rows:
+        decoded = _decrypt_value(
+            bytes(encrypted_value) if encrypted_value is not None else b"",
+            key=key,
+            host_key=str(host_key),
+            plain=str(value or ""),
+        )
+        if decoded:
+            found[str(name)] = decoded
+    return found
+
+
 def _read_chatgpt_cookies(db_path: Path, key: bytes) -> list[tuple[str, str]]:
     with tempfile.TemporaryDirectory() as tmp:
         # Copy DB (+ WAL/SHM) so a running browser's lock doesn't block us and

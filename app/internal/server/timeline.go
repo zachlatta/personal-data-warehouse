@@ -260,6 +260,7 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "whoop", kind: "recovery"},
 	{source: "whoop", kind: "sleep"},
 	{source: "whoop", kind: "workout"},
+	{source: "whoop_private", kind: "journal_entry"},
 	{source: "mutations", kind: "mutation"},
 	{source: "mutations", kind: "mutation_request"},
 	{source: "warehouse", kind: "enrichment_run"},

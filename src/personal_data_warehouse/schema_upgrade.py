@@ -552,6 +552,7 @@ def provision_everything(warehouse) -> None:
     warehouse.ensure_whatsapp_client_session_table()
     warehouse.ensure_photos_tables()
     warehouse.ensure_whoop_tables()
+    warehouse.ensure_whoop_private_tables()
     warehouse.ensure_agent_sessions_tables()
     warehouse.ensure_plaid_tables()
     warehouse.ensure_finance_tables()

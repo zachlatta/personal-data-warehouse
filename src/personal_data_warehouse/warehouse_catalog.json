@@ -180,6 +180,14 @@
       "comment": "Faithful whoop source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
     },
     {
+      "name": "base_whoop_private",
+      "layer": "base",
+      "domain": "whoop_private",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Faithful whoop private source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
+    },
+    {
       "name": "derived_documents",
       "layer": "derived",
       "domain": "documents",
@@ -964,6 +972,124 @@
         "schema": "whoop",
         "name": "workouts"
       }
+    },
+    {
+      "id": "whoop_private_cycles",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "cycles",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "START HERE for the private WHOOP source. One row per cycle (sleep-onset to next sleep-onset, so start_at is not midnight). The same cycles as base_whoop.cycles, at the app API's richer grain; the public table remains the timeline's source."
+    },
+    {
+      "id": "whoop_private_sleeps",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "sleeps",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "whoop_private_recoveries",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "recoveries",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "hrv_rmssd_seconds is the private API's own unit (SECONDS); hrv_rmssd_milli is the same measurement in the milliseconds base_whoop.recoveries uses. Joining the two sources on the wrong one is a 1000x error."
+    },
+    {
+      "id": "whoop_private_workouts",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "workouts",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "whoop_private_sleep_events",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "sleep_events",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "The hypnogram: one row per sleep stage span (LIGHT/REM/SWS/DISTURBANCES), ordered by event_index within a sleep's activity_id."
+    },
+    {
+      "id": "whoop_private_heart_rate_samples",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "heart_rate_samples",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Continuous heart rate at the metrics-service grain (step_seconds is 6, 60 or 600). ~525k rows/year; range-scan it by (account, sample_at), the primary key."
+    },
+    {
+      "id": "whoop_private_workout_heart_rate_samples",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "workout_heart_rate_samples",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "6-second heart rate scoped to one workout. Cross-workout time ranges use the (account, sample_at) index, not the activity-leading primary key."
+    },
+    {
+      "id": "whoop_private_journal_entries",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "journal_entries",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "What Zach logged himself, one row per (day, question). The only private-API table with a timeline adapter."
+    },
+    {
+      "id": "whoop_private_sports",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "sports",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "WHOOP's sport catalog: resolves base_whoop_private.workouts.sport_id to a name."
+    },
+    {
+      "id": "whoop_private_documents",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "documents",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Tier-2 BFF payloads (trends, stress, cardio details, sleep deep dive) kept as faithful raw_json only, keyed by (kind, doc_key). These are UI documents: WHOOP restyles them without notice, so a typed column over them goes quietly null."
     },
     {
       "id": "whatsapp_chats",
@@ -2223,6 +2349,17 @@
       }
     },
     {
+      "id": "whoop_private_sync_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "whoop_private_sync_state",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "plaid_sync_state",
       "kind": "table",
       "layer": "ops",
@@ -2524,6 +2661,17 @@
         "schema": "private",
         "name": "whoop_oauth_tokens"
       }
+    },
+    {
+      "id": "whoop_private_sessions",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "whoop_private_sessions",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true
     },
     {
       "id": "plaid_item_tokens",

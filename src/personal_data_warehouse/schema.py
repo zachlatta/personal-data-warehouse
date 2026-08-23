@@ -1561,6 +1561,293 @@ WHOOP_OAUTH_TOKEN_COLUMNS = (
     "updated_at",
 )
 
+# --------------------------------------------------------------------------
+# WHOOP private (app) API -- source `whoop_private`.
+#
+# The public developer API (WHOOP_* above) is summary grain. This source adds
+# the time series app.whoop.com itself renders: per-6-second heart rate, the
+# sleep hypnogram, journal entries, and the BFF "documents" that have no public
+# endpoint at all. See docs/whoop-private-api.md.
+#
+# Two unit traps are baked into these names on purpose:
+#   * the private API's HRV is in SECONDS, the public API's is milliseconds --
+#     hence hrv_rmssd_seconds AND hrv_rmssd_milli side by side, never one bare
+#     `hrv_rmssd` that a cross-source join can be wrong about by 1000x;
+#   * `during`, `days` and `optimal_sleep_times` arrive as PostgreSQL range
+#     literals and are split into explicit start/end columns here, because a
+#     range stored as text is not orderable and not indexable.
+# --------------------------------------------------------------------------
+
+#: The private API reports ``hrv_rmssd`` in seconds; every other HRV number in
+#: the warehouse (base_whoop.recoveries.hrv_rmssd_milli, and anything derived
+#: from it) is milliseconds. Both are stored, and this is the only conversion.
+WHOOP_PRIVATE_HRV_MILLI_PER_SECOND = 1000.0
+
+
+def whoop_private_hrv_rmssd_milli(hrv_rmssd_seconds: float) -> float:
+    """Convert the private API's seconds-grain HRV to the warehouse's millis.
+
+    Kept as a named function rather than an inline ``* 1000`` so that the one
+    place the two units meet is greppable and test-covered: a recovery whose
+    ``hrv_rmssd_seconds`` is 0.0821 is 82.1 ms, and reading the seconds column
+    as if it were the public API's milliseconds understates HRV by 1000x.
+    """
+    return float(hrv_rmssd_seconds) * WHOOP_PRIVATE_HRV_MILLI_PER_SECOND
+
+
+WHOOP_PRIVATE_CYCLE_COLUMNS = (
+    "account",
+    "cycle_id",
+    "whoop_user_id",
+    # `during` split: the cycle runs sleep-onset to next sleep-onset, so
+    # start_at is NOT midnight and end_at carries the epoch sentinel while the
+    # cycle is still running (data_state/predicted_end are the cleaner signal).
+    "start_at",
+    "end_at",
+    # `days` split: the user-local calendar day(s) the cycle is awake for.
+    "day_start",
+    "day_end",
+    "day_strain",
+    "scaled_strain",
+    "day_kilojoules",
+    "day_avg_heart_rate",
+    "day_max_heart_rate",
+    "intensity_score",
+    "sleep_need",
+    "predicted_end",
+    "data_state",
+    "timezone_offset",
+    "created_at",
+    "updated_at",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_SLEEP_COLUMNS = (
+    "account",
+    "activity_id",
+    "cycle_id",
+    "whoop_user_id",
+    "start_at",
+    "end_at",
+    "is_nap",
+    "score",
+    "state",
+    "latency",
+    "arousal_time",
+    "total_wake_events",
+    "in_sleep_efficiency",
+    "debt_pre",
+    "debt_post",
+    "habitual_sleep_need",
+    "credit_from_naps",
+    "need_from_strain",
+    "quality_duration",
+    "light_sleep_duration",
+    "slow_wave_sleep_duration",
+    "rem_sleep_duration",
+    "wake_duration",
+    "no_data_duration",
+    "time_in_bed",
+    "disturbances",
+    "cycles_count",
+    "respiratory_rate",
+    "sleep_consistency",
+    "projected_score",
+    "projected_sleep",
+    # `optimal_sleep_times` split, same reason as `during` above.
+    "optimal_sleep_start",
+    "optimal_sleep_end",
+    "algo_version",
+    "survey_response_id",
+    "timezone_offset",
+    "created_at",
+    "updated_at",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_RECOVERY_COLUMNS = (
+    "account",
+    "activity_id",
+    "recovery_score",
+    "resting_heart_rate",
+    # The private API's own unit. See whoop_private_hrv_rmssd_milli.
+    "hrv_rmssd_seconds",
+    # The same measurement in the unit every other WHOOP relation uses, so a
+    # cross-source query cannot silently be off by 1000x.
+    "hrv_rmssd_milli",
+    "skin_temp_celsius",
+    "spo2",
+    "calibrating",
+    "prob_covid",
+    "hr_baseline",
+    "hrv_component",
+    "rhr_component",
+    "recovery_rate",
+    "state",
+    "algo_version",
+    "history_size",
+    "survey_response_id",
+    "created_at",
+    "updated_at",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_WORKOUT_COLUMNS = (
+    "account",
+    "activity_id",
+    "sport_id",
+    "start_at",
+    "end_at",
+    "score",
+    "intensity_score",
+    "raw_intensity_score",
+    "cumulative_workout_intensity",
+    "kilojoules",
+    "average_heart_rate",
+    "max_heart_rate",
+    "percent_recorded",
+    "total_steps",
+    "msk_score",
+    "zone_durations_json",
+    "zone_durations_v2_json",
+    "gps_data_json",
+    "source",
+    "survey_response_id",
+    "timezone_offset",
+    "created_at",
+    "updated_at",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_SLEEP_EVENT_COLUMNS = (
+    "account",
+    "activity_id",
+    # Position in the hypnogram, so the stages stay ordered without depending
+    # on a float timestamp comparison.
+    "event_index",
+    # LIGHT / REM / SWS / DISTURBANCES, WHOOP's `type`.
+    "stage",
+    "started_at",
+    "ended_at",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS = (
+    "account",
+    "sample_at",
+    "heart_rate",
+    # 6, 60 or 600 -- the metrics-service `step` the sample was fetched at.
+    # Kept per row because a backfill may coarsen old windows.
+    "step_seconds",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS = (
+    "account",
+    "activity_id",
+    "sample_at",
+    "heart_rate",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_JOURNAL_ENTRY_COLUMNS = (
+    "account",
+    # User-local calendar day the entry was logged for, not an instant.
+    "day",
+    "question_id",
+    "question_text",
+    "answer",
+    "behavior_id",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_SPORT_COLUMNS = (
+    "account",
+    "sport_id",
+    "name",
+    "category",
+    "has_gps",
+    "has_survey",
+    "activity_type_internal_name",
+    "is_current",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_DOCUMENT_COLUMNS = (
+    "account",
+    # trend / stress / cardio_details / sleep_deep_dive / health_tab ...
+    "kind",
+    # metric name, date, or activity id -- whatever identifies this document
+    # within its kind.
+    "doc_key",
+    "collected_at",
+    # Tier-2 BFF payloads are UI documents: faithful raw only, never typed
+    # columns, because WHOOP restyles them without notice.
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_SYNC_STATE_COLUMNS = (
+    "account",
+    "collection",
+    "watermark_updated_at",
+    "last_sync_type",
+    "status",
+    "error",
+    "updated_at",
+    "sync_version",
+    # Hash of the exact session rejected with a permanent auth error, so the
+    # schedule skips only while that same dead credential is still installed.
+    "credential_sha256",
+)
+
+#: The captured browser session. This tuple is the Python half of a table the
+#: app also writes: ``app/internal/whoopsession/store.go`` creates the
+#: idempotent twin so the very first ``pdw whoop publish-session`` succeeds
+#: before any poll has run. The two definitions must agree column for column --
+#: the app's upsert names ``ON CONFLICT (account, session_key)``, so even the
+#: primary key is part of the contract.
+WHOOP_PRIVATE_SESSION_COLUMNS = (
+    "account",
+    "session_key",
+    "access_token",
+    # Rotates on EVERY refresh. Mutating this row outside
+    # PostgresWarehouse.rotate_whoop_private_session / .replace_... is how a
+    # rotating credential gets lost; see docs/whoop-oauth-operations.md.
+    "refresh_token",
+    "access_expires_at",
+    "refresh_expires_at",
+    # Fingerprint of the live refresh token: lets sync state record *which*
+    # credential was rejected without ever storing the secret twice.
+    "refresh_token_sha256",
+    "source_browser",
+    # When a browser capture last published this session (a human logged in).
+    "published_at",
+    "updated_at",
+    "sync_version",
+    "status",
+    "error",
+)
+
 GOOGLE_DRIVE_FILE_COLUMNS = (
     "account",
     "file_id",
