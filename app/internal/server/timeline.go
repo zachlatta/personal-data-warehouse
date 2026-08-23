@@ -436,13 +436,60 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 	},
 	"slack_messages": {
 		{
-			name:   "reactions",
+			// The per-emoji roll-up, which the reactor list below cannot show:
+			// one production message carries 1,043 reaction rows, so a page of
+			// 50 reactors is 50 rows of the single most-used emoji and says
+			// nothing about the other twenty. This is ~one row per emoji.
+			//
+			// reaction_count is Slack's own total and is authoritative;
+			// reactors_known is how many of those reactors we actually have a
+			// row for, because Slack truncates a reaction's users[] list at
+			// ~50. Measured across the 2,172,849 (message, emoji) groups in
+			// production the two agree 816 times short of it — rare, but it is
+			// always the popular message someone asks about, so the two
+			// numbers are reported separately instead of implying we know all
+			// 452 people who hit :upvote:.
+			name:   "reaction_summary",
 			params: []string{"account", "team_id", "conversation_id", "message_ts"},
-			sql: `SELECT reaction_name, user_id, reaction_count
+			sql: `SELECT reaction_name, max(reaction_count) AS reaction_count,
+			             count(*) AS reactors_known
 			      FROM ` + warehouse.SQLRelation("slack_message_reactions") + `
 			      WHERE account = $1 AND team_id = $2 AND conversation_id = $3 AND message_ts = $4
 			        AND is_deleted = 0
-			      ORDER BY reaction_name`,
+			      GROUP BY reaction_name
+			      ORDER BY max(reaction_count) DESC, reaction_name`,
+		},
+		{
+			// One row per (emoji, reactor). Slack keeps three different names
+			// per user and in this corpus they genuinely disagree: real_name
+			// is a legal-ish full name, name is an unrelated login handle, and
+			// display_name is a self-chosen nickname. Rows exist where all
+			// three differ and where real_name is the least recognisable of
+			// them, so all three are reported rather than silently collapsing
+			// into whichever one happens to be set.
+			//
+			// There is no "when": Slack's message payload gives reactions as
+			// {name, count, users[]} with no per-user timestamp, so the column
+			// does not exist to surface. The parent message's time is the only
+			// real-world time available; synced_at is a pipeline stamp and
+			// would be a lie if presented as one.
+			//
+			// Ordered by reaction_count so the first page is the emoji people
+			// actually used; alphabetical order made the 50-row page an
+			// arbitrary slice.
+			name:   "reactions",
+			params: []string{"account", "team_id", "conversation_id", "message_ts"},
+			sql: `SELECT r.reaction_name, r.reaction_count,
+			             COALESCE(NULLIF(u.real_name, ''), r.user_id) AS reacted_by,
+			             NULLIF(u.name, '') AS handle,
+			             NULLIF(u.display_name, '') AS display_name,
+			             u.is_bot, r.user_id
+			      FROM ` + warehouse.SQLRelation("slack_message_reactions") + ` r
+			      LEFT JOIN ` + warehouse.SQLRelation("slack_users") + ` u
+			        ON u.account = r.account AND u.team_id = r.team_id AND u.user_id = r.user_id
+			      WHERE r.account = $1 AND r.team_id = $2 AND r.conversation_id = $3 AND r.message_ts = $4
+			        AND r.is_deleted = 0
+			      ORDER BY r.reaction_count DESC, r.reaction_name, r.user_id`,
 		},
 		{
 			name:   "thread_replies",
@@ -845,6 +892,11 @@ func (s *timelineService) handleItemChildren(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	sourceTable, pk := timelineSourcePointer(result.Rows[0])
+	// Same normalization handleItem does. Without it a row still carrying a
+	// pre-rename source_table returns its children on the first page and then
+	// 404s on "load more", which is the confusing half-failure rather than a
+	// clean one.
+	sourceTable = warehouse.CurrentSourceTable(sourceTable)
 	child, ok := timelineChildByName(timelineChildQueries[sourceTable], childName)
 	if !ok {
 		httpError(w, http.StatusNotFound, "timeline child collection not found")

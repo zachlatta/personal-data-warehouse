@@ -784,3 +784,139 @@ func TestCapJSONStringsTruncates(t *testing.T) {
 		t.Fatalf("long = %v", out["long"])
 	}
 }
+
+// TestSlackReactionDetailResolvesReactorsAndRollsUpEmoji pins the promise the
+// timeline coverage registry makes for slack_message_reactions. The table is
+// registered `_detail("slack_messages")` — "surfaced through the detail view of
+// their parent table's timeline events" — and its 4.4M rows of real signal
+// about what Zach reacted to were reachable only as raw Slack user ids.
+func TestSlackReactionDetailResolvesReactorsAndRollsUpEmoji(t *testing.T) {
+	reactions, ok := timelineChildByName(timelineChildQueries["slack_messages"], "reactions")
+	if !ok {
+		t.Fatal("slack_messages must expose a reactions detail collection")
+	}
+	// The join key is the reactions PK minus (reaction_name, user_id), which
+	// is exactly what a slack timeline row's source_pk carries.
+	if got := strings.Join(reactions.params, ","); got != "account,team_id,conversation_id,message_ts" {
+		t.Fatalf("reactions params = %q", got)
+	}
+	if !strings.Contains(reactions.sql, warehouse.SQLRelation("slack_users")) {
+		t.Fatal("reactions must resolve the reactor through slack_users, not report a raw Uxxxxxxx id")
+	}
+	// Slack keeps three names per user and in this corpus they genuinely
+	// differ — a full name, an unrelated login handle, and a self-chosen
+	// nickname — so all three are reported rather than one silently chosen.
+	for _, column := range []string{"reacted_by", "handle", "display_name"} {
+		if !strings.Contains(reactions.sql, column) {
+			t.Fatalf("reactions must report %q distinctly: %s", column, reactions.sql)
+		}
+	}
+	// Most-used emoji first: one production message carries 1,043 reaction
+	// rows, so alphabetical order made the bounded first page an arbitrary
+	// slice of whatever happened to sort first.
+	if !strings.Contains(reactions.sql, "ORDER BY r.reaction_count DESC") {
+		t.Fatalf("reactions must lead with the most-used emoji: %s", reactions.sql)
+	}
+
+	summary, ok := timelineChildByName(timelineChildQueries["slack_messages"], "reaction_summary")
+	if !ok {
+		t.Fatal("slack_messages must expose the per-emoji roll-up; a 50-row page of reactors cannot show it")
+	}
+	if !strings.Contains(summary.sql, "GROUP BY reaction_name") {
+		t.Fatalf("reaction_summary must roll up per emoji: %s", summary.sql)
+	}
+	// Slack truncates a reaction's users[] at ~50, so the count it reports and
+	// the number of reactors we hold are different facts and are named as such.
+	if !strings.Contains(summary.sql, "reactors_known") {
+		t.Fatalf("reaction_summary must not imply we know every reactor: %s", summary.sql)
+	}
+}
+
+// TestSlackReactionDetailIsBounded guards the one property that makes this
+// cheap enough to run on every Slack detail view.
+func TestSlackReactionDetailIsBounded(t *testing.T) {
+	item := timelineEventRow("slack-1", 30, "2026-06-01T12:00:00Z")
+	item["adapter"] = "slack_message"
+	item["source"] = "slack"
+	item["source_table"] = "slack_messages"
+	item["source_pk"] = `{"account":"zrl","team_id":"T1","conversation_id":"C1","message_ts":"1.1"}`
+
+	// More reactors than a page, as the real corpus has.
+	rows := make([]map[string]any, 0, 60)
+	for i := 0; i < 60; i++ {
+		rows = append(rows, map[string]any{
+			"reaction_name": "upvote", "reaction_count": int64(452),
+			"reacted_by": fmt.Sprintf("Reactor %d", i), "handle": fmt.Sprintf("reactor%d", i),
+			"display_name": "r", "user_id": fmt.Sprintf("U%03d", i),
+		})
+	}
+	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
+		"FROM " + warehouse.SQLRelation("timeline_events"):         {Rows: []map[string]any{item}},
+		"FROM " + warehouse.SQLRelation("slack_message_reactions"): {Rows: rows},
+		"row_to_json": {Rows: []map[string]any{{"row": `{"text":"hi"}`}}},
+	}}
+	srv := newTimelineTestServer(t, runner)
+	resp, body := timelineGET(t, srv, "/api/timeline/item?adapter=slack_message&event_id=slack-1", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d: %s", resp.StatusCode, body)
+	}
+	var payload struct {
+		Children     map[string][]map[string]any `json:"children"`
+		ChildrenMeta map[string]struct {
+			HasMore    bool `json:"has_more"`
+			NextOffset int  `json:"next_offset"`
+		} `json:"children_meta"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(payload.Children["reactions"]); got != 50 {
+		t.Fatalf("reactions page = %d rows, want the 50-row cap", got)
+	}
+	if !payload.ChildrenMeta["reactions"].HasMore {
+		t.Fatal("a message with more reactors than a page must report has_more")
+	}
+	if payload.Children["reactions"][0]["reacted_by"] != "Reactor 0" {
+		t.Fatalf("reactor name did not survive to the payload: %#v", payload.Children["reactions"][0])
+	}
+	for i := 0; i < runner.callCount(); i++ {
+		call := runner.call(i)
+		if strings.Contains(call.SQL, warehouse.SQLRelation("slack_message_reactions")) &&
+			!strings.Contains(call.SQL, "LIMIT $") {
+			t.Fatalf("reaction query ran unbounded: %s", call.SQL)
+		}
+	}
+}
+
+// TestTimelineChildPagingNormalizesRenamedSourceTables covers the half-failure
+// the reactions work surfaced: handleItem resolved a pre-rename source_table
+// but handleItemChildren did not, so "load more" 404'd on a detail view whose
+// first page had just rendered fine.
+func TestTimelineChildPagingNormalizesRenamedSourceTables(t *testing.T) {
+	legacy, current := "", ""
+	for from, to := range warehouse.RenamedTimelineSourceTables {
+		legacy, current = from, to
+		break
+	}
+	if legacy == "" {
+		t.Skip("no renamed source tables in the catalog")
+	}
+	children := timelineChildQueries[current]
+	if len(children) == 0 {
+		t.Skipf("%s has no child collections to page", current)
+	}
+
+	item := timelineEventRow("renamed-1", 31, "2026-06-01T12:00:00Z")
+	item["source_table"] = legacy
+	item["source_pk"] = `{"source":"claude_code","session_id":"s1"}`
+
+	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
+		"FROM " + warehouse.SQLRelation("timeline_events"): {Rows: []map[string]any{item}},
+	}}
+	srv := newTimelineTestServer(t, runner)
+	resp, body := timelineGET(t, srv,
+		"/api/timeline/item/children?adapter=gmail_email&event_id=renamed-1&child="+children[0].name+"&offset=0", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("paging a renamed source table got %d: %s", resp.StatusCode, body)
+	}
+}
