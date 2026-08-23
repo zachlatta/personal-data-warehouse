@@ -62,6 +62,17 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      # poppler-utils supplies pdftoppm, which the attachment/manual-finance
+      # extraction path shells out to for image-only PDFs. Without it
+      # render_pdf_pages raises a bare RuntimeError instead of the domain
+      # AttachmentPreparationError and the enrichment tests fail. Install the
+      # binary rather than softening the exception: in production a missing
+      # pdftoppm is a broken deployment, and it must stay loud rather than be
+      # mistaken for a permanently unreadable document and dropped by the
+      # retry cap.
+      - name: Install PDF rendering tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils
+
       - name: Start the warehouse Postgres
         run: |
           set -euo pipefail
