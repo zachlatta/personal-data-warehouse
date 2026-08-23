@@ -353,7 +353,9 @@ def run_search(
         args.extend(("--source", ",".join(sources)))
     if since:
         args.extend(("--since", since))
-    args.append(query)
+    # A literal identifier can itself begin with "-". Terminate option parsing
+    # so the first-class CLI cannot mistake the benchmark query for a flag.
+    args.extend(("--", query))
     started = time.time()
     try:
         payload = _pdw_json(args, timeout=timeout)

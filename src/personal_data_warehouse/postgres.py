@@ -285,11 +285,11 @@ SEARCH_SOURCE_ALIASES: dict[str, str] = {
 # RRF k from the literature; it dampens the head so one branch's #1 cannot
 # drown the other branch's top few.
 SEARCH_HYBRID_RRF_K = 60
-# Give semantic ranks only the small nudge the expanded-corpus replay supports.
-# The old 1.5x weight drowned exact lexical answers; 1.0x left a judged
-# paraphrase just outside the top five. The deeper candidate pool below makes
-# lexical/semantic overlaps robust enough for this bounded 1.1x boost.
-SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.1
+# The literal leg now protects exact lexical answers that an earlier 1.5x
+# experiment drowned. Re-measured against the independent 26-label benchmark,
+# 1.5 improved three ranks across all three query strata with zero regressions
+# (MRR 0.429 -> 0.446); 1.7 crossed the safe boundary and regressed two labels.
+SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.5
 # Filtered ANN recall depends on asking the iterative scan for a deep enough
 # qualifying pool. A 4x pool was adequate at 30 days but became unstable at 90
 # days because the global HNSW index had three times as many filtered-out rows.
@@ -8204,6 +8204,9 @@ class PostgresWarehouse:
             # operator is schema-qualified (public.halfvec / OPERATOR(public.<=>))
             # so resolution never depends on the caller's search_path — the
             # exact failure class behind the 16-day silent-zero outage.
+            chunk_index_regclass = (
+                f"{self._object_schema('search_chunks')}.search_chunks_text_trgm_idx"
+            ).replace("'", "''")
             self._command(
                 r"""
             -- CREATE OR REPLACE with a new parameter OVERLOADS rather than
@@ -8231,6 +8234,7 @@ class PostgresWarehouse:
                 + str(SEARCH_TEXT_MAX_RESULTS_CAP)
                 + r""");
                 exact_refs text[];
+                chat_exact_refs text[];
                 exact_needle text := btrim(coalesce(query, ''));
                 exact_needle_b text;
                 exact_needle_c text;
@@ -8299,10 +8303,11 @@ class PostgresWarehouse:
                 END IF;
                 -- The literal-substring leg. Gated on a short query: it is where
                 -- BM25 tokenization and embeddings both fail (identifiers,
-                -- names, paths) and literal matching wins. Machine tokens use
-                -- the bounded chunk index below; ordinary names keep the full
-                -- exact path for quality. A natural-language question gains
-                -- nothing from either one.
+                -- names, paths) and literal matching wins. Plain-document
+                -- machine tokens use the bounded chunk index below. Ordinary
+                -- names and matching conversation windows keep the full exact
+                -- path for quality and correct event identity. A natural-
+                -- language question gains nothing from either one.
                 -- The length floor matters: search_text_exact RAISES below it,
                 -- which would take the whole hybrid search down.
                 IF length(btrim(query)) >= """ + str(SEARCH_HYBRID_EXACT_MIN_CHARS) + r""" AND coalesce(
@@ -8323,7 +8328,16 @@ class PostgresWarehouse:
                         -- name from rank 1 to rank 2; machine tokens (digits or
                         -- identifier punctuation) were quality-identical and
                         -- are the calls whose old recheck has the worst tail.
-                        IF exact_needle ~ '[0-9_./@-]' THEN
+                        IF exact_needle ~ '[0-9_./@-]'
+                           AND EXISTS (
+                               SELECT 1
+                               FROM pg_catalog.pg_index i
+                               WHERE i.indexrelid = pg_catalog.to_regclass('"""
+                + chunk_index_regclass
+                + r"""')
+                                 AND i.indisvalid
+                                 AND i.indisready
+                           ) THEN
                             exact_needle_b := regexp_replace(
                                 exact_needle, '([0-9]),([0-9])', '\1\2', 'g'
                             );
@@ -8357,33 +8371,99 @@ class PostgresWarehouse:
                                 exact_needle_c, '\', '\\'), '%', '\%'), '_', '\_') || '%';
                             SELECT array_agg(
                                        x.ref
-                                       ORDER BY x.match_pos ASC NULLS LAST,
+                                       ORDER BY x.match_chunk ASC NULLS LAST,
+                                                x.match_pos ASC NULLS LAST,
                                                 x.event_ts DESC
                                    )
                               INTO exact_refs
                               FROM (
-                                SELECT c.adapter || ':' || c.event_id AS ref,
-                                       max(c.event_ts) AS event_ts,
-                                       min(CASE
-                                           -- For symbolic identifiers, an early
-                                           -- occurrence is stronger evidence than
-                                           -- a late mention: this moved one label
-                                           -- from rank 7 to rank 2. Position in an
-                                           -- opaque numeric id is arbitrary, so
-                                           -- those preserve recency ordering.
+                                -- Plain document chunks retain the source event
+                                -- id. Join back to timeline both to validate that
+                                -- ref and to apply exact's deleted/Drive filters.
+                                SELECT t.adapter || ':' || t.event_id AS ref,
+                                       max(t.event_ts) AS event_ts,
+                                       CASE
                                            WHEN exact_needle ~ '[0-9]' THEN NULL
-                                           ELSE strpos(lower(c.text), lower(exact_needle))
-                                       END) AS match_pos
+                                           ELSE min(c.chunk_index)
+                                       END AS match_chunk,
+                                       CASE
+                                           -- Symbolic identifiers prefer their
+                                           -- earliest chunk and position. Opaque
+                                           -- numeric ids preserve recency.
+                                           WHEN exact_needle ~ '[0-9]' THEN NULL
+                                           ELSE (array_agg(
+                                               strpos(lower(c.text), lower(exact_needle))
+                                               ORDER BY c.chunk_index,
+                                                        strpos(
+                                                            lower(c.text),
+                                                            lower(exact_needle)
+                                                        )
+                                           ))[1]
+                                       END AS match_pos
                                 FROM @search_chunks c
-                                WHERE (c.text ILIKE exact_pattern ESCAPE '\'
+                                JOIN @timeline_events t
+                                  ON t.adapter = c.adapter
+                                 AND t.event_id = c.event_id
+                                WHERE c.anchor NOT LIKE c.adapter || '|w|%'
+                                  AND (c.text ILIKE exact_pattern ESCAPE '\'
                                        OR c.text ILIKE exact_pattern_b ESCAPE '\'
                                        OR c.text ILIKE exact_pattern_c ESCAPE '\')
-                                  AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
-                                  AND (since IS NULL OR c.event_ts >= since)
-                                GROUP BY c.adapter, c.event_id
-                                ORDER BY match_pos ASC NULLS LAST, event_ts DESC
+                                  AND t.search_text != ''
+                                  AND NOT COALESCE(
+                                      (t.metadata->>'deleted')::boolean, false
+                                  )
+                                  AND """
+            + SEARCH_DRIVE_EXCLUSION_SQL
+            + r"""
+                                  AND (
+                                      sem_adapters IS NULL
+                                      OR t.adapter = ANY (sem_adapters)
+                                  )
+                                  AND (since IS NULL OR t.event_ts >= since)
+                                GROUP BY t.adapter, t.event_id
+                                ORDER BY match_chunk ASC NULLS LAST,
+                                         match_pos ASC NULLS LAST,
+                                         event_ts DESC
                                 LIMIT per_source
                               ) x;
+
+                            -- A conversation-window chunk represents the last
+                            -- event in its hour, not necessarily the member that
+                            -- contains the literal. Only if the bounded index
+                            -- finds a matching chat window, use exact's full-
+                            -- document path to recover the actual member ref.
+                            IF EXISTS (
+                                SELECT 1
+                                FROM @search_chunks c
+                                WHERE c.anchor LIKE c.adapter || '|w|%'
+                                  AND (c.text ILIKE exact_pattern ESCAPE '\'
+                                       OR c.text ILIKE exact_pattern_b ESCAPE '\'
+                                       OR c.text ILIKE exact_pattern_c ESCAPE '\')
+                                  AND (
+                                      sem_adapters IS NULL
+                                      OR c.adapter = ANY (sem_adapters)
+                                  )
+                                  AND (
+                                      since IS NULL
+                                      OR c.event_ts + interval '1 hour' > since
+                                  )
+                                LIMIT 1
+                            ) THEN
+                                SELECT array_agg(h.ref ORDER BY h.event_ts DESC)
+                                  INTO chat_exact_refs
+                                  FROM @search_text_exact(
+                                      query,
+                                      per_source,
+                                      ARRAY['imessage', 'slack', 'whatsapp'],
+                                      since
+                                  ) AS h
+                                  WHERE sem_adapters IS NULL
+                                     OR split_part(h.ref, ':', 1) = ANY (sem_adapters);
+                                exact_refs := (
+                                    coalesce(exact_refs, ARRAY[]::text[])
+                                    || coalesce(chat_exact_refs, ARRAY[]::text[])
+                                )[1:per_source];
+                            END IF;
                         ELSE
                             SELECT array_agg(x.ref)
                               INTO exact_refs

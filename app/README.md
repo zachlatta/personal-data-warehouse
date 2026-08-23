@@ -289,10 +289,11 @@ unified timeline document. Raw message/body columns are deliberately not text-in
   API (`SEARCH_EMBEDDINGS_BASE_URL`, `SEARCH_EMBEDDINGS_API_KEY`, `SEARCH_EMBEDDINGS_MODEL`,
   `SEARCH_EMBEDDINGS_DIMENSIONS`) and calls `timeline.search_hybrid`, which fuses BM25, one
   semantic leg per query representation, and — for a short, identifier-shaped query — a
-  literal-substring leg. Machine tokens (ids, paths, emails and version-like strings) run
-  that leg over the bounded `derived_search.chunks.text` trigram index instead of rechecking
-  multi-megabyte timeline documents; ordinary alphabetic names retain the full-document
-  exact leg because chat-chunk anchoring can otherwise move the answering event. It also
+  literal-substring leg. Machine tokens (ids, paths, emails and version-like strings) search
+  bounded plain-document chunks through the `derived_search.chunks.text` trigram index instead
+  of rechecking multi-megabyte timeline documents. Matching conversation windows and ordinary
+  alphabetic names retain full-document exact matching: a window's representative ref is its
+  last event, which may not be the event containing the literal. It also
   returns a `hint` on a sentence-shaped query, advising the
   caller to re-issue with the vocabulary the answering record would use — measured to
   recover five of nine otherwise-unanswerable benchmark questions. Instruction-tuned models can

@@ -111,11 +111,13 @@ is guidance here rather than another model in the search path.
   person's name), where BM25 tokenization and embeddings both fail: adding it took the
   labeled benchmark from MRR 0.292 to 0.403 and answered three queries that previously
   had nothing in the top 50. It stays gated because ungated it scored *worse*. Machine
-  tokens (digits or identifier punctuation) search the bounded 2-6k retrieval chunks through
-  `search_chunks_text_trgm_idx`, not the multi-megabyte timeline documents; symbolic tokens
-  rank an earlier chunk occurrence ahead of a late mention, while opaque ids containing
-  digits preserve recency. Ordinary alphabetic names retain the full-document exact path:
-  chat-window anchoring moved one labeled answer from rank 1 to rank 2. Hybrid falls
+  tokens (digits or identifier punctuation) search bounded plain-document retrieval chunks
+  through `search_chunks_text_trgm_idx`, not multi-megabyte timeline documents; symbolic
+  tokens rank an earlier chunk occurrence ahead of a late mention, while opaque ids containing
+  digits preserve recency. Conversation windows retain full-document exact matching because a
+  window's `event_id` is its last member, not necessarily the member containing the literal;
+  the full path runs only when the chunk index first confirms a matching chat window. Ordinary
+  alphabetic names also retain full-document exact matching. Hybrid falls
   back to keyword with an explicit `fallback_reason` when embeddings or pgvector are
   unavailable. Agent sessions are indexed per turn (`kind = 'agent_turn'`); the session
   roll-up row carries headline fields only.

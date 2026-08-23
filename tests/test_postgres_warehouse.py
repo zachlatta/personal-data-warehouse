@@ -1692,10 +1692,10 @@ def _search_text_function_sql() -> str:
     return "\n".join(sql for sql in captured if "CREATE OR REPLACE FUNCTION" in sql or "DO $do$" in sql)
 
 
-def test_search_hybrid_gives_semantic_rank_a_small_bounded_boost() -> None:
+def test_search_hybrid_gives_semantic_rank_a_measured_bounded_boost() -> None:
     sql = _search_text_function_sql()
 
-    assert "1.1 * COALESCE(1.0 / (60 + s.rnk), 0)" in sql
+    assert "1.5 * COALESCE(1.0 / (60 + s.rnk), 0)" in sql
 
 
 def test_search_hybrid_uses_a_deep_filtered_semantic_candidate_pool() -> None:
@@ -4779,16 +4779,26 @@ def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -
     hybrid = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid("):]
     literal = hybrid[hybrid.index("exact_refs"):hybrid.index("RETURN QUERY")]
     assert "exact_needle ~ '[0-9_./@-]'" in literal
+    assert "pg_catalog.to_regclass" in literal
+    assert "i.indisvalid" in literal and "i.indisready" in literal
     assert "FROM @search_chunks" in literal
+    assert "JOIN @timeline_events t" in literal
+    assert "c.anchor NOT LIKE c.adapter || '|w|%'" in literal
+    assert "t.metadata->>'deleted'" in literal
+    assert "t.adapter = 'drive_file'" in literal
+    assert "t.metadata->>'excluded'" in literal
+    assert "ARRAY['imessage', 'slack', 'whatsapp']" in literal
+    assert "split_part(h.ref, ':', 1) = ANY (sem_adapters)" in literal
     assert "@search_text_exact(" in literal, (
-        "ordinary names must keep the full-document leg: the chunk leg moved "
-        "one labeled proper-name answer from rank 1 to rank 2"
+        "ordinary names and chat-window identifiers must keep full-document "
+        "matching so hybrid returns the event that actually contains the literal"
     )
     assert "GROUP BY" in literal, (
         "several chunks from one event must produce one literal rank"
     )
-    assert "c.adapter = ANY (sem_adapters)" in literal
-    assert "c.event_ts >= since" in literal
+    assert "t.adapter = ANY (sem_adapters)" in literal
+    assert "t.event_ts >= since" in literal
+    assert "c.event_ts + interval '1 hour' > since" in literal
 
 
 def test_search_hybrid_ranks_symbolic_chunk_matches_by_prominence() -> None:
@@ -4801,8 +4811,9 @@ def test_search_hybrid_ranks_symbolic_chunk_matches_by_prominence() -> None:
     hybrid = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid("):]
     literal = hybrid[hybrid.index("exact_refs"):hybrid.index("RETURN QUERY")]
     assert "WHEN exact_needle ~ '[0-9]' THEN NULL" in literal
+    assert "c.chunk_index" in literal
     assert "strpos(lower(c.text), lower(exact_needle))" in literal
-    assert "ORDER BY match_pos ASC NULLS LAST, event_ts DESC" in literal
+    assert "match_chunk ASC NULLS LAST" in literal
 
 
 def test_search_hybrid_literal_leg_is_gated_on_query_length() -> None:

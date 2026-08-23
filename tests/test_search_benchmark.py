@@ -406,6 +406,7 @@ def test_run_search_uses_first_class_cli_with_structured_flags(monkeypatch) -> N
         "slack,gmail",
         "--since",
         "2026-08-01",
+        "--",
         "budget approval",
     ]
     assert seen["kwargs"]["timeout"] == 420.0
