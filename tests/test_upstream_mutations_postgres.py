@@ -899,12 +899,16 @@ def _default_row(columns: tuple[str, ...], **overrides):
 def test_ensure_upstream_mutation_tables_declares_the_supersede_column(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_upstream_mutation_tables()
     target = CATALOG.object("upstream_mutation_requests")
+    # Resolve through the warehouse's own namespace mapping, not the catalog's
+    # production schema: under a test namespace ensure_* creates the table in
+    # that namespace, so asking information_schema about `ops` only ever passed
+    # against a database that already carried production's schema.
     rows = warehouse._query_dicts(
         """
         SELECT column_name
         FROM information_schema.columns
         WHERE table_schema = %s AND table_name = %s
         """,
-        (target.schema, target.name),
+        (warehouse._object_schema("upstream_mutation_requests"), target.name),
     )
     assert "superseded_by_request_id" in {str(row["column_name"]) for row in rows}
