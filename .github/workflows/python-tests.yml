@@ -103,33 +103,23 @@ jobs:
       - name: Sync dependencies
         run: uv sync --frozen
 
-      # The four contract suites, not the whole tree — but NOT because of time.
-      # Measured 2026-08-23 against this exact image in a clean environment: the
-      # whole suite is 1836 passed / 2 failed / 6 skipped in 3m53s, and the four
-      # suites below are 81 tests in ~57s. Runtime is not the obstacle; two
-      # pre-existing failures are, and neither is caused by CI:
+      # The WHOLE tree, against a real Postgres with the real search
+      # extensions. Measured 2026-08-23 against this exact image in a clean
+      # environment: 1838 passed / 6 skipped in 3m45s. Runtime was never the
+      # obstacle; two pre-existing failures were, and both are now fixed —
+      # one test pinned the pre-pooling "every source branch failed" wording
+      # that a pooled broad scan no longer emits, and one asked
+      # information_schema about the un-namespaced `ops` schema instead of the
+      # throwaway test namespace, so it could only pass against a database that
+      # already carried production's schema.
       #
-      #   * tests/test_postgres_warehouse.py::test_search_text_raises_when_every_branch_fails
-      #     still expects the pre-pooling "every source branch failed" message.
-      #     Broad search no longer fans out per source, so a missing BM25 index
-      #     now surfaces as the raw undefined-object error instead.
-      #   * tests/test_upstream_mutations_postgres.py::test_ensure_upstream_mutation_tables_declares_the_supersede_column
-      #     asks information_schema about the *un-namespaced* `ops` schema rather
-      #     than the throwaway test namespace, so it can only pass against a
-      #     database that already carries production's schema.
-      #
-      # Fix those two and this step becomes `uv run pytest -q` over everything.
-      # Until then the gate is the set that describes the warehouse's contracts
-      # — catalog and layer layout, timeline coverage and adapter shape, the
-      # pipeline freshness registries, and the repo-level guardrails — all four
-      # running against a real Postgres rather than a fake.
-      - name: Contract suites
-        run: |
-          uv run pytest -q -rs \
-            tests/test_schema_reorg_contract.py \
-            tests/test_timeline.py \
-            tests/test_pipeline_health.py \
-            tests/test_repo_contracts.py
+      # Run everything rather than a curated list: a contract nobody thought to
+      # put on the list is exactly the one that rots. The suite that describes
+      # the warehouse's contracts — catalog and layer layout, timeline coverage
+      # and adapter shape, the freshness registries, the repo guardrails — is
+      # included by construction.
+      - name: Test suite
+        run: uv run pytest -q -rs
 
       - name: Postgres logs on failure
         if: failure()

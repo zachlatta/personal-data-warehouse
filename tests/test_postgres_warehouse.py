@@ -2557,9 +2557,16 @@ def test_search_text_windows_ranked_preview_around_match(warehouse: PostgresWare
 
 def test_search_text_raises_when_every_branch_fails(warehouse: PostgresWarehouse) -> None:
     # A broken search layer must be loud. The per-branch guard may degrade a
-    # PARTIAL failure (mid-deploy index build) to a WARNING, but when every
-    # branch fails there are no results to degrade to — returning an empty set
-    # here is exactly the silent-outage mode that went unnoticed for 16 days.
+    # PARTIAL failure (mid-deploy index build) to a WARNING, but when the scan
+    # cannot run at all there are no results to degrade to — returning an empty
+    # set here is exactly the silent-outage mode that went unnoticed for 16
+    # days.
+    #
+    # The assertion deliberately does NOT pin the old "every source branch
+    # failed" wording. A broad search no longer fans out per source; it pools
+    # two index-ordered scans, so a missing index now surfaces as the raw
+    # undefined-object error instead of the fan-out summary. What must stay
+    # true is that it RAISES and names the index, not the exact prose.
     if not _pg_textsearch_usable(warehouse):
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
 
@@ -2567,7 +2574,7 @@ def test_search_text_raises_when_every_branch_fails(warehouse: PostgresWarehouse
     warehouse._set_search_path()
 
     warehouse._command("DROP INDEX IF EXISTS timeline_events_search_text_bm25_idx")
-    with pytest.raises(psycopg2.Error, match="every source branch failed"):
+    with pytest.raises(psycopg2.Error, match="timeline_events_search_text_bm25_idx"):
         warehouse._query("SELECT * FROM @search_text('zanzibar', 5)")
 
 

@@ -126,8 +126,23 @@ def test_python_ci_workflow_exists_and_has_no_path_filter() -> None:
 
 
 def test_ci_runs_the_database_backed_contract_suites() -> None:
-    """The workflow must name each contract suite, so dropping one is visible."""
+    """CI must run the whole suite, or explicitly name every contract suite.
+
+    Naming a curated list was the earlier gate, back when two pre-existing
+    failures kept the tree from running green on a fresh database. Both are
+    fixed, so the workflow now runs everything — which is strictly stronger,
+    because a contract suite nobody remembered to add to the list is exactly
+    the one that rots. Accept either shape so the guardrail keeps meaning
+    something if the tree ever has to be narrowed again.
+    """
     text = PYTHON_TESTS_WORKFLOW.read_text()
+    runs_everything = any(
+        line.strip() in {"run: uv run pytest -q -rs", "run: uv run pytest -q"}
+        or line.strip().startswith("run: uv run pytest -q -rs\n")
+        for line in text.splitlines()
+    )
+    if runs_everything:
+        return
     for suite in (
         "tests/test_timeline.py",
         "tests/test_pipeline_health.py",
