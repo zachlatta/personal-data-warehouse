@@ -32,17 +32,17 @@ func (r *fakeSearchRunner) QueryArgs(_ context.Context, statement string, args [
 }
 
 type fakeEmbedder struct {
-	model  string
-	vector []float64
-	err    error
-	calls  int
+	model   string
+	vectors [][]float64
+	err     error
+	calls   int
 }
 
 func (f *fakeEmbedder) Model() string { return f.model }
 
-func (f *fakeEmbedder) Embed(context.Context, string) ([]float64, error) {
+func (f *fakeEmbedder) Embed(context.Context, string) ([][]float64, error) {
 	f.calls++
-	return f.vector, f.err
+	return f.vectors, f.err
 }
 
 func searchHit() RawResult {
@@ -138,7 +138,7 @@ func TestSearchHybridModeEmbedsAndRunsSearchHybrid(t *testing.T) {
 		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
 		argsResults: map[string]RawResult{searchHybridSQL: searchHit()},
 	}
-	embedder := &fakeEmbedder{model: "test-model", vector: []float64{0.5, -1.25}}
+	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5, -1.25}}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
 
 	resp := svc.Search(context.Background(), SearchRequest{Query: "offer letter"})
@@ -155,11 +155,46 @@ func TestSearchHybridModeEmbedsAndRunsSearchHybrid(t *testing.T) {
 		t.Fatalf("statements = %#v", runner.statements)
 	}
 	args := runner.args[0]
-	if len(args) != 6 {
+	if len(args) != 7 {
 		t.Fatalf("args = %#v", args)
 	}
 	if args[0] != "offer letter" || args[1] != "[0.5,-1.25]" || args[2] != "test-model" || args[3] != searchDefaultMaxResults {
 		t.Fatalf("args = %#v", args)
+	}
+	// One query representation means no alternate vector, and search_hybrid
+	// skips its second ANN leg on a NULL rather than scanning twice.
+	if args[6] != nil {
+		t.Fatalf("alternate embedding = %#v, want nil", args[6])
+	}
+}
+
+func TestSearchHybridPassesBothQueryRepresentations(t *testing.T) {
+	// An instruction-tuned deployment returns the instructed and the raw
+	// vector; both must reach search_hybrid, because each neighbourhood holds
+	// answers the other misses.
+	runner := &fakeSearchRunner{
+		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{searchHybridSQL: searchHit()},
+	}
+	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5, -1.25}, {1, 0}}}
+	svc := NewService(runner, Options{SearchEmbedder: embedder})
+
+	resp := svc.Search(context.Background(), SearchRequest{Query: "offer letter"})
+	if resp.Error != "" {
+		t.Fatalf("error: %s", resp.Error)
+	}
+	args := runner.args[0]
+	if len(args) != 7 {
+		t.Fatalf("args = %#v", args)
+	}
+	if args[1] != "[0.5,-1.25]" {
+		t.Fatalf("primary embedding = %#v", args[1])
+	}
+	if args[6] != "[1,0]" {
+		t.Fatalf("alternate embedding = %#v", args[6])
+	}
+	if embedder.calls != 1 {
+		t.Fatalf("both representations must ride in one request; calls = %d", embedder.calls)
 	}
 }
 
@@ -187,7 +222,7 @@ func TestSearchHybridFallsBackWhenHybridFunctionMissing(t *testing.T) {
 		fakeRunner:  fakeRunner{results: hybridProbeResult(false)},
 		argsResults: map[string]RawResult{searchTextSQL: searchHit()},
 	}
-	embedder := &fakeEmbedder{model: "test-model", vector: []float64{1}}
+	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{1}}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
 
 	resp := svc.Search(context.Background(), SearchRequest{Query: "offer letter"})

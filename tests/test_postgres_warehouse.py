@@ -1824,15 +1824,33 @@ def test_search_text_casts_branch_rows_to_the_physical_hit_type() -> None:
     )
 
 
-def test_only_timeline_bm25_index_is_registered() -> None:
+def test_only_timeline_bm25_indexes_are_registered() -> None:
+    # BM25 indexes are expensive enough that per-source sprawl once left ~25GB
+    # of dead text indexes behind. Exactly two are justified: the global
+    # timeline index, and the PARTIAL index over the low-volume adapters that
+    # the broad-search pool's second partition scans. The partial one indexes a
+    # disjoint 2.6% of the rows, so it adds a fraction of the corpus rather
+    # than a second copy of it -- any further bm25 index needs the same
+    # argument made explicitly.
     import personal_data_warehouse.postgres as postgres_module
 
     bm25_indexes = {
-        ix.name
+        ix.name: ix
         for ix in postgres_module.POSTGRES_INDEXES
         if getattr(ix, "requires_pg_textsearch", False)
     }
-    assert bm25_indexes == {"timeline_events_search_text_bm25_idx"}
+    assert set(bm25_indexes) == {
+        "timeline_events_search_text_bm25_idx",
+        "timeline_events_search_text_bm25_lowvol_idx",
+    }
+    lowvol = bm25_indexes["timeline_events_search_text_bm25_lowvol_idx"].sql
+    assert "WHERE adapter IN (" in lowvol, (
+        "the low-volume bm25 index must be PARTIAL; a second full-corpus index "
+        "doubles the most expensive index in the warehouse"
+    )
+    assert "'gmail_email'" not in lowvol and "'slack_message'" not in lowvol, (
+        "high-volume adapters belong to the global index partition only"
+    )
 
 
 def test_search_text_only_references_defined_bm25_indexes() -> None:
@@ -4555,3 +4573,145 @@ def test_query_role_setup_detects_non_select_private_grants(warehouse: PostgresW
         assert repaired._query_role_setup_needed() is False
     finally:
         repaired.close()
+
+
+def test_search_text_broad_search_runs_one_pooled_bm25_scan_not_a_branch_loop() -> None:
+    # A broad (unscoped) search used to execute one BM25 branch per coarse
+    # source -- eighteen EXECUTEs in a plpgsql loop, strictly serial on one
+    # backend, so wall clock was the SUM of every branch. Measured on the
+    # production corpus that was 6.9s warm / 21.7s cold, while a single
+    # index-ordered scan of the same BM25 index returns the global top 200 in
+    # 36ms: the fan-out cost ~200x what the index costs. Worse, the planner
+    # refuses the index for a selective adapter filter and re-scores every row
+    # instead (~5.6ms per document), which is why the small `transcript` branch
+    # alone took 3.4s.
+    #
+    # The broad path must therefore be ONE pooled scan, and the branch loop
+    # must remain only for scoped (sources => ARRAY[...]) searches.
+    sql = _search_text_function_sql()
+    assert "IF sources IS NULL THEN" in sql, (
+        "search_text() must take a pooled fast path for broad searches instead "
+        "of looping every source branch"
+    )
+    assert "broad_pool" in sql, "the broad fast path must build a single candidate pool"
+
+
+def test_search_text_broad_pool_scans_low_volume_adapters_separately() -> None:
+    # One flat global scan buries low-volume sources: a matching contact card
+    # or voice-memo scores below hundreds of gmail/slack hits, and the
+    # per-source floor cannot promote a row the pool never contained. The pool
+    # is therefore scanned in two partitions -- high-volume adapters and
+    # everything else -- so the floor still has candidates to promote. The
+    # second partition costs ~143ms, versus ~4.8s for the per-source branches
+    # it replaces.
+    sql = _search_text_function_sql()
+    for adapter in ("'gmail_email'", "'slack_message'", "'apple_message'"):
+        assert adapter in sql
+    assert "UNION ALL" in sql
+    assert "t.adapter NOT IN (" in sql and "t.adapter IN (" in sql, (
+        "the broad pool must scan high-volume adapters and the low-volume "
+        "remainder as two separate index-ordered scans"
+    )
+
+
+def test_search_text_broad_pool_forces_the_index_ordered_plan() -> None:
+    # With the default cost model the planner reads every row of a selective
+    # adapter filter and recomputes the bm25 operator per row, which is ~100x
+    # slower than scanning the score-ordered index and filtering. The operator
+    # has no cost declaration the planner could use, so the fast path pins the
+    # plan for the duration of the scan and restores it immediately.
+    sql = _search_text_function_sql()
+    assert "set_config('enable_sort', 'off', true)" in sql
+    assert "set_config('enable_sort', 'on', true)" in sql, (
+        "enable_sort must be restored right after the pooled scan so the hint "
+        "cannot leak into the caller's query"
+    )
+
+
+def test_search_text_broad_pool_keeps_the_per_source_floor() -> None:
+    # Same guarantee the branch merge gave: every source's top-N hits survive
+    # ahead of the global score fill.
+    sql = _search_text_function_sql()
+    pool = sql[sql.index("broad_pool"):]
+    assert "PARTITION BY" in pool and "src_rank >" in pool, (
+        "the pooled broad path must rank within each source and put each "
+        "source's top-floor hits ahead of the global fill"
+    )
+
+
+def test_search_text_broad_pool_previews_only_the_returned_rows() -> None:
+    # The branch loop previewed 12 rows x 18 branches (216 documents) to return
+    # 50. Windowing a preview scans up to SEARCH_TEXT_PREVIEW_SCAN_CHARS of a
+    # possibly multi-MB document, so previewing candidates that never survive
+    # the merge is pure waste.
+    sql = _search_text_function_sql()
+    pool = sql[sql.index("broad_pool"):]
+    preview_at = pool.index("search_text_preview")
+    floor_at = pool.index("src_rank >")
+    assert preview_at > floor_at, (
+        "the broad path must window previews after the per-source floor merge, "
+        "not for every pooled candidate"
+    )
+
+
+def test_search_hybrid_accepts_a_second_query_embedding() -> None:
+    # Qwen3-Embedding is instruction-asymmetric: the instructed and the raw
+    # form of the same question land in different neighbourhoods, and each
+    # finds answers the other misses. Blending them into one vector averages
+    # those neighbourhoods away (measured MRR 0.234); searching BOTH and fusing
+    # by rank keeps them (0.300 on the same corpus and labels). The second
+    # embedding is optional so a deployment without an instruction prefix, and
+    # any direct SQL caller, keeps the single-vector behaviour.
+    sql = _search_text_function_sql()
+    assert "query_embedding_alt text DEFAULT NULL" in sql
+    assert "qvec_alt" in sql
+
+
+def test_search_hybrid_second_leg_is_skipped_when_no_alt_embedding() -> None:
+    # A NULL alt embedding must not cost a second ANN scan: the leg is gated on
+    # the parameter so the planner can drop it with a one-time filter.
+    sql = _search_text_function_sql()
+    assert "query_embedding_alt IS NOT NULL" in sql or "qvec_alt IS NOT NULL" in sql
+
+
+def test_search_hybrid_fuses_semantic_legs_by_rank_not_distance() -> None:
+    # Distances from two different query vectors are not comparable (each is
+    # calibrated to its own neighbourhood), so the legs merge by reciprocal
+    # rank, the same argument that keeps BM25 scores and cosine distances
+    # apart in the outer fusion.
+    sql = _search_text_function_sql()
+    assert "sem_legs" in sql and "sum(1.0 / (" in sql
+
+
+def test_search_hybrid_clamps_ef_search_to_pgvectors_maximum() -> None:
+    # pgvector rejects hnsw.ef_search above 1000. The exploration floor was
+    # written as greatest(1000, max_results * 8), which exceeds that ceiling
+    # for any max_results above 125 -- and search_text caps max_results at 200,
+    # so `search(..., max_results => 150)` raised
+    # `1600 is outside the valid range for parameter "hnsw.ef_search"` instead
+    # of searching. The floor must be clamped, not just floored.
+    sql = _search_text_function_sql()
+    assert "set_config('hnsw.ef_search', greatest(" not in sql, (
+        "an unclamped ef_search errors for max_results > 125"
+    )
+    assert "least(1000, greatest(1000, per_source * 8))" in sql
+
+
+def test_search_schema_signature_covers_the_broad_pool_constants() -> None:
+    # The signature guard skips recompiling the search DDL when nothing
+    # changed. It is derived from the generator's SOURCE plus an explicit list
+    # of constants, because the source only mentions a constant by NAME --
+    # retuning the pool sizes or moving a source between the high- and
+    # low-volume partitions would otherwise leave production running the old
+    # functions forever.
+    import inspect
+
+    import personal_data_warehouse.postgres as postgres_module
+
+    signature_source = inspect.getsource(postgres_module.PostgresWarehouse._search_schema_signature)
+    for constant in (
+        "SEARCH_TEXT_BROAD_POOL",
+        "SEARCH_TEXT_BROAD_SMALL_POOL",
+        "SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL",
+    ):
+        assert constant in signature_source, f"{constant} is missing from the search DDL signature"

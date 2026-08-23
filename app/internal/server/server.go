@@ -215,6 +215,9 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		w.WriteHeader(http.StatusNoContent)
 	})
 
+	for _, deprecated := range cfg.DeprecatedEnvVars {
+		logger.Warn("ignoring deprecated environment variable", "variable", deprecated)
+	}
 	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}
 	if embedder := query.NewEmbeddingsClient(query.EmbeddingsOptions{
 		BaseURL:        cfg.SearchEmbeddingsBaseURL,
@@ -222,7 +225,6 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		Model:          cfg.SearchEmbeddingsModel,
 		Dimensions:     cfg.SearchEmbeddingsDimensions,
 		QueryPrefix:    cfg.SearchEmbeddingsQueryPrefix,
-		QueryRawWeight: cfg.SearchEmbeddingsQueryRawWeight,
 	}); embedder != nil {
 		queryOpts.SearchEmbedder = embedder
 		logger.Info("search embeddings enabled", "model", embedder.Model())

@@ -169,6 +169,28 @@ SEARCH_TEXT_SOURCE_FLOOR = 3
 # output. A scoped search (sources => ARRAY[...]) bypasses the cap and uses the
 # full max_results so a single-source deep search still returns everything.
 SEARCH_TEXT_BROAD_PER_BRANCH_CAP = 12
+# A BROAD (unscoped) search_text() call does not fan out over per-source
+# branches at all: it pools candidates from index-ordered scans of the same
+# BM25 index and applies the per-source floor to that pool. The fan-out was
+# eighteen EXECUTEs in a strictly serial plpgsql loop, so its wall clock was
+# the SUM of every branch -- 6.9s warm and 21.7s cold on the production corpus,
+# while one index-ordered scan returns the global top 200 in 36ms. Two
+# partitions, not one: a single flat scan is dominated by the high-volume
+# sources, and the floor cannot promote a low-volume hit the pool never
+# contained. The low-volume partition costs ~143ms and replaces ~4.8s of
+# branch scans.
+SEARCH_TEXT_BROAD_POOL = 2000
+SEARCH_TEXT_BROAD_SMALL_POOL = 300
+# Sources whose documents dominate the corpus, and therefore the global BM25
+# ordering. Everything else is scanned as the second pool partition.
+SEARCH_TEXT_HIGH_VOLUME_SOURCES: tuple[str, ...] = (
+    "agent_session",
+    "gmail",
+    "google_drive",
+    "imessage",
+    "slack",
+    "whatsapp",
+)
 # Hard ceiling on max_results for both search functions. Production logs showed
 # broad overfetch (max_results 500-1000, then client-side filtering) as a
 # dominant slow-query family; no legitimate agent flow reads deeper than this,
@@ -201,6 +223,19 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("warehouse", ("enrichment_run",), "t.kind"),
     ("whatsapp", ("whatsapp_message",), "t.kind"),
     ("whoop", ("whoop_cycle", "whoop_recovery", "whoop_sleep", "whoop_workout"), "t.kind"),
+)
+# The adapters the broad-search pool scans through the low-volume partial BM25
+# index, derived from the source map so a new source cannot be forgotten.
+SEARCH_TEXT_LOW_VOLUME_ADAPTERS: tuple[str, ...] = tuple(
+    sorted(
+        adapter
+        for source, adapters, _ in SEARCH_SOURCE_DEFS
+        if source not in SEARCH_TEXT_HIGH_VOLUME_SOURCES
+        for adapter in adapters
+    )
+)
+SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL = ", ".join(
+    f"'{adapter}'" for adapter in SEARCH_TEXT_LOW_VOLUME_ADAPTERS
 )
 # Familiar-name aliases the search functions accept for `sources` tokens. The
 # canonical tokens are terse and diverge from every other name in the warehouse
@@ -1170,6 +1205,22 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "timeline_events_search_text_bm25_idx",
         "timeline_events",
         "CREATE INDEX IF NOT EXISTS timeline_events_search_text_bm25_idx ON @timeline_events USING bm25 (search_text) WITH (text_config='english')",
+        requires_pg_textsearch=True,
+    ),
+    # A broad search_text() call scans the corpus in two partitions so the
+    # per-source floor still has low-volume candidates to promote. Scanning
+    # low-volume adapters through the GLOBAL bm25 index means walking the
+    # score-ordered index past millions of gmail/slack documents to find them
+    # (15-16s on the production corpus for an unlucky query). Their own partial
+    # index answers the same scan in ~26ms and costs 61s to build over 1.2M
+    # documents / 147MB of text -- the whole low-volume tail is 2.6% of the
+    # corpus by rows and 1.6% by bytes.
+    IndexSpec(
+        "timeline_events_search_text_bm25_lowvol_idx",
+        "timeline_events",
+        "CREATE INDEX IF NOT EXISTS timeline_events_search_text_bm25_lowvol_idx "
+        "ON @timeline_events USING bm25 (search_text) WITH (text_config='english') "
+        f"WHERE adapter IN ({SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL})",
         requires_pg_textsearch=True,
     ),
     IndexSpec(
@@ -7389,6 +7440,9 @@ class PostgresWarehouse:
                 str(SEARCH_TEXT_MAX_RESULTS_CAP),
                 str(SEARCH_TEXT_PREVIEW_CHARS),
                 str(SEARCH_TEXT_BROAD_PER_BRANCH_CAP),
+                str(SEARCH_TEXT_BROAD_POOL),
+                str(SEARCH_TEXT_BROAD_SMALL_POOL),
+                SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL,
                 str(SEARCH_HYBRID_RRF_K),
                 str(SEARCH_HYBRID_SEMANTIC_WEIGHT),
                 str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER),
@@ -7488,6 +7542,59 @@ class PostgresWarehouse:
             )
 
         branches = [branch(*definition) for definition in SEARCH_SOURCE_DEFS]
+
+        # The BROAD (unscoped) path. It does not touch the branch array at all:
+        # both partitions are index-ordered scans of a BM25 index, the pool
+        # carries only ranking keys (never the multi-MB document), and the
+        # surviving rows are hydrated by primary key afterwards.
+        low_volume_list = SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL
+        pool_source_case = (
+            "CASE t.adapter "
+            + " ".join(
+                f"WHEN '{adapter}' THEN '{source}'"
+                for source, adapters, _ in SEARCH_SOURCE_DEFS
+                for adapter in adapters
+            )
+            + " END"
+        )
+        pool_subsource_case = (
+            "CASE "
+            + " ".join(
+                f"WHEN {adapter_filter(adapters)} THEN {subsource}"
+                for source, adapters, subsource in SEARCH_SOURCE_DEFS
+            )
+            + " ELSE t.kind END"
+        )
+        pool_where = (
+            "t.search_text != '' "
+            "AND NOT COALESCE((t.metadata->>'deleted')::boolean, false) "
+            "AND (since IS NULL OR t.event_ts >= since) "
+            f"AND {SEARCH_DRIVE_EXCLUSION_SQL}"
+        )
+
+        def pool_partition(adapter_sql: str, index_name: str, limit: int) -> str:
+            rank = f"t.search_text <@> to_bm25query(query, '{index_name}')"
+            return (
+                "( SELECT t.adapter, t.event_id, "
+                f"{pool_source_case} AS source, ({rank})::real AS score "
+                "FROM @timeline_events t "
+                f"WHERE {pool_where} AND {adapter_sql} "
+                f"ORDER BY {rank} LIMIT {limit} )"
+            )
+
+        broad_pool_sql = (
+            pool_partition(
+                f"t.adapter NOT IN ({low_volume_list})",
+                "timeline_events_search_text_bm25_idx",
+                SEARCH_TEXT_BROAD_POOL,
+            )
+            + "\n                        UNION ALL\n                        "
+            + pool_partition(
+                f"t.adapter IN ({low_volume_list})",
+                "timeline_events_search_text_bm25_lowvol_idx",
+                SEARCH_TEXT_BROAD_SMALL_POOL,
+            )
+        )
 
         # Run each source branch independently so a missing/unusable BM25 index
         # (for example during a deploy before the timeline index finishes) drops
@@ -7692,6 +7799,57 @@ class PostgresWarehouse:
                         END IF;
                     END LOOP;
                 END IF;
+"""
+            + r"""
+                -- BROAD SEARCH: one pooled scan, not eighteen branches.
+                -- Both partitions are index-ordered scans of a BM25 index, so
+                -- the pool costs tens of milliseconds where the serial branch
+                -- loop cost seconds.  enable_sort is pinned off for the scans
+                -- because the planner has no cost model for the bm25 operator
+                -- and otherwise reads every row of a selective adapter filter
+                -- and re-scores it (~5.6ms per document); it is restored
+                -- immediately so the hint cannot leak into the caller's query.
+                IF sources IS NULL THEN
+                    PERFORM set_config('enable_sort', 'off', true);
+                    RETURN QUERY
+                        WITH broad_pool AS (
+                        """ + broad_pool_sql + r"""
+                        ),
+                        broad_ranked AS (
+                            SELECT p.adapter, p.event_id, p.source, p.score,
+                                   row_number() OVER (
+                                       PARTITION BY p.source ORDER BY p.score ASC
+                                   ) AS src_rank
+                            FROM broad_pool p
+                            WHERE p.score < 0
+                        ),
+                        -- The floor merge runs on ranking keys alone; only the
+                        -- survivors are hydrated and previewed, because
+                        -- windowing a preview scans a large prefix of a
+                        -- possibly multi-megabyte document.
+                        broad_top AS (
+                            SELECT r.adapter, r.event_id, r.source, r.score, r.src_rank
+                            FROM broad_ranked r
+                            ORDER BY (r.src_rank > """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r""") ASC,
+                                     r.score ASC
+                            LIMIT per_source
+                        )
+                        SELECT b.source, """ + pool_subsource_case + r""", t.context, t.actor,
+                               t.event_ts,
+                               COALESCE(t.source_pk->>'account', t.metadata->>'account', ''),
+                               t.adapter || ':' || t.event_id,
+                               "internal"."search_text_preview"(t.search_text, query),
+                               b.score, t.event_ts, t.title, t.source_table, t.source_pk
+                        FROM broad_top b
+                        JOIN @timeline_events t
+                          ON t.adapter = b.adapter AND t.event_id = b.event_id
+                        ORDER BY (b.src_rank > """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r""") ASC,
+                                 b.score ASC;
+                    PERFORM set_config('enable_sort', 'on', true);
+                    RETURN;
+                END IF;
+"""
+            + r"""
                 FOR branch_idx IN 1..coalesce(array_length(branch_sqls, 1), 0) LOOP
                     branch_source := branch_sources[branch_idx];
                     IF sources IS NOT NULL AND NOT branch_source = ANY (sources) THEN
@@ -7984,7 +8142,8 @@ class PostgresWarehouse:
                 + r"""',
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
-                since timestamptz DEFAULT NULL
+                since timestamptz DEFAULT NULL,
+                query_embedding_alt text DEFAULT NULL
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
@@ -7993,6 +8152,9 @@ class PostgresWarehouse:
             DECLARE
                 per_source integer := least(greatest(coalesce(max_results, 50), 1), """
                 + str(SEARCH_TEXT_MAX_RESULTS_CAP)
+                + r""");
+                qvec_alt public.halfvec("""
+                + str(SEARCH_EMBEDDING_DIMENSIONS)
                 + r""");
                 qvec public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
@@ -8005,6 +8167,15 @@ class PostgresWarehouse:
                 qvec := query_embedding::public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
                 + r""");
+                -- The optional second vector is the same question in its other
+                -- form (instructed vs raw). Qwen3-Embedding is
+                -- instruction-asymmetric, so the two land in different
+                -- neighbourhoods and each retrieves answers the other misses.
+                IF query_embedding_alt IS NOT NULL AND trim(query_embedding_alt) <> '' THEN
+                    qvec_alt := query_embedding_alt::public.halfvec("""
+                + str(SEARCH_EMBEDDING_DIMENSIONS)
+                + r""");
+                END IF;
                 -- Recent/source filters are applied during the ANN scan. With
                 -- iterative scan disabled, ef_search candidates from the full
                 -- corpus can contain too few qualifying rows and silently
@@ -8017,7 +8188,10 @@ class PostgresWarehouse:
                 -- embedding corpus covered 90 days: selective 30-day queries
                 -- could exhaust the global ANN scan before reaching their
                 -- best recent neighbors.
-                PERFORM set_config('hnsw.ef_search', greatest(1000, per_source * 8)::text, true);
+                -- pgvector's hard ceiling for this GUC is 1000: an unclamped
+                -- floor raised "1600 is outside the valid range" for any
+                -- max_results above 125, which search_text's cap allows.
+                PERFORM set_config('hnsw.ef_search', least(1000, greatest(1000, per_source * 8))::text, true);
                 PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);
                 PERFORM set_config('hnsw.max_scan_tuples', '100000', true);
                 PERFORM set_config('hnsw.scan_mem_multiplier', '4', true);
@@ -8031,10 +8205,16 @@ class PostgresWarehouse:
                            row_number() OVER () AS rnk
                     FROM @search_text(query, per_source, sources, since) AS h
                 ),
-                sem_hits AS (
+                -- One leg per query vector. The second leg is gated on the
+                -- parameter, so a single-vector call pays a one-time filter,
+                -- not a second ANN scan.
+                sem_legs AS (
+                    (
                     SELECT c.adapter || ':' || c.event_id AS ref,
                            c.context, c.event_ts, c.text,
-                           (e.embedding OPERATOR(public.<=>) qvec) AS dist
+                           row_number() OVER (
+                               ORDER BY (e.embedding OPERATOR(public.<=>) qvec)
+                           ) AS rnk
                     FROM @search_chunk_embeddings e
                     JOIN @search_chunks c ON c.text_sha256 = e.text_sha256
                     JOIN (VALUES """
@@ -8042,7 +8222,7 @@ class PostgresWarehouse:
                 + r""") AS map(adapter, source) ON map.adapter = c.adapter
                     WHERE e.model = embedding_model
                       AND e.embedding IS NOT NULL
-                      AND (sources IS NULL OR map.source = ANY (sources))
+                                            AND (sources IS NULL OR map.source = ANY (sources))
                       AND (since IS NULL OR c.event_ts >= since)
                     ORDER BY e.embedding OPERATOR(public.<=>) qvec
                     LIMIT least(greatest(per_source * """
@@ -8052,16 +8232,56 @@ class PostgresWarehouse:
                 + "), "
                 + str(SEARCH_HYBRID_MAX_CANDIDATES)
                 + r""")
+                    )
+                    UNION ALL
+                    (
+                    SELECT c.adapter || ':' || c.event_id AS ref,
+                           c.context, c.event_ts, c.text,
+                           row_number() OVER (
+                               ORDER BY (e.embedding OPERATOR(public.<=>) qvec_alt)
+                           ) AS rnk
+                    FROM @search_chunk_embeddings e
+                    JOIN @search_chunks c ON c.text_sha256 = e.text_sha256
+                    JOIN (VALUES """
+                + adapter_source_values
+                + r""") AS map(adapter, source) ON map.adapter = c.adapter
+                    WHERE e.model = embedding_model
+                      AND e.embedding IS NOT NULL
+                      AND qvec_alt IS NOT NULL
+                      AND (sources IS NULL OR map.source = ANY (sources))
+                      AND (since IS NULL OR c.event_ts >= since)
+                    ORDER BY e.embedding OPERATOR(public.<=>) qvec_alt
+                    LIMIT least(greatest(per_source * """
+                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
+                + ", "
+                + str(SEARCH_HYBRID_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_MAX_CANDIDATES)
+                + r""")
+                    )
                 ),
                 sem_ranked AS (
-                    SELECT d.ref, d.context, d.event_ts, d.text,
-                           row_number() OVER (ORDER BY d.dist ASC) AS rnk
+                    -- Ranks, not distances: two query vectors are calibrated to
+                    -- their own neighbourhoods, so their distances are not
+                    -- comparable -- the same reason BM25 and cosine meet only
+                    -- as ranks in the outer fusion. Summing each event's
+                    -- chunk reciprocal ranks also rewards a document matching
+                    -- in several places, which scoring only its single best
+                    -- chunk throws away (measured MRR 0.212 -> 0.300).
+                    SELECT g.ref, g.context, g.event_ts, g.text,
+                           row_number() OVER (ORDER BY g.fuse DESC, g.best ASC) AS rnk
                     FROM (
-                        SELECT DISTINCT ON (sh.ref) sh.ref, sh.context, sh.event_ts,
-                               sh.text, sh.dist
-                        FROM sem_hits sh
-                        ORDER BY sh.ref, sh.dist ASC
-                    ) d
+                        SELECT sl.ref,
+                               min(sl.rnk) AS best,
+                               sum(1.0 / ("""
+                + str(SEARCH_HYBRID_RRF_K)
+                + r""" + sl.rnk)) AS fuse,
+                               (array_agg(sl.context ORDER BY sl.rnk))[1] AS context,
+                               (array_agg(sl.event_ts ORDER BY sl.rnk))[1] AS event_ts,
+                               (array_agg(sl.text ORDER BY sl.rnk))[1] AS text
+                        FROM sem_legs sl
+                        GROUP BY sl.ref
+                    ) g
                 ),
                 merged AS (
                     SELECT COALESCE(l.ref, s.ref) AS ref,

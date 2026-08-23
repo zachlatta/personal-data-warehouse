@@ -38,13 +38,13 @@ const searchResultColumns = "source, subsource, context, who, occurred_at, accou
 const (
 	searchTextSQL   = "SELECT " + searchResultColumns + " FROM timeline.search_text($1, $2::integer, $3::text[], $4::timestamptz)"
 	searchExactSQL  = "SELECT " + searchResultColumns + " FROM timeline.search_text_exact($1, $2::integer, $3::text[], $4::timestamptz)"
-	searchHybridSQL = "SELECT " + searchResultColumns + " FROM timeline.search_hybrid($1, $2, $3, $4::integer, $5::text[], $6::timestamptz)"
+	searchHybridSQL = "SELECT " + searchResultColumns + " FROM timeline.search_hybrid($1, $2, $3, $4::integer, $5::text[], $6::timestamptz, $7)"
 
 	// searchHybridProbeSQL reports whether timeline.search_hybrid exists with
 	// the exact signature the hybrid path calls. Deployments whose Postgres
 	// image lacks pgvector never install it, and the probe is what keeps the
 	// tool answering (via keyword fallback) instead of erroring there.
-	searchHybridProbeSQL = "SELECT to_regprocedure('timeline.search_hybrid(text,text,text,integer,text[],timestamptz)') IS NOT NULL AS installed"
+	searchHybridProbeSQL = "SELECT to_regprocedure('timeline.search_hybrid(text,text,text,integer,text[],timestamptz,text)') IS NOT NULL AS installed"
 )
 
 // Fallback reasons the response carries when hybrid mode ran the keyword path
@@ -129,7 +129,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 		statement = searchTextSQL
 		args = []any{resp.Query, maxResults, sources, since}
 	case SearchModeHybrid:
-		vector, reason := s.hybridQueryVector(ctx, resp.Query)
+		vectors, reason := s.hybridQueryVectors(ctx, resp.Query)
 		if reason != "" {
 			resp.Mode = SearchModeKeyword
 			resp.FallbackReason = reason
@@ -137,8 +137,14 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 			args = []any{resp.Query, maxResults, sources, since}
 			break
 		}
+		// The second vector is optional: search_hybrid scans one ANN leg per
+		// vector and skips the second with a one-time filter when it is NULL.
+		var alternate any
+		if len(vectors) > 1 {
+			alternate = vectors[1]
+		}
 		statement = searchHybridSQL
-		args = []any{resp.Query, vector, s.embedder.Model(), maxResults, sources, since}
+		args = []any{resp.Query, vectors[0], s.embedder.Model(), maxResults, sources, since, alternate}
 	}
 
 	started := time.Now()
@@ -161,26 +167,34 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	return resp
 }
 
-// hybridQueryVector embeds the query for the hybrid path. A non-empty reason
-// means hybrid is unavailable and the caller should run keyword search,
-// reporting the reason so a misconfigured deployment is visible instead of
-// silently degraded.
-func (s *Service) hybridQueryVector(ctx context.Context, queryText string) (string, string) {
+// hybridQueryVectors embeds the query for the hybrid path, returning one
+// literal per query representation (instructed and raw, when the deployment
+// configures an instruction prefix). A non-empty reason means hybrid is
+// unavailable and the caller should run keyword search, reporting the reason
+// so a misconfigured deployment is visible instead of silently degraded.
+func (s *Service) hybridQueryVectors(ctx context.Context, queryText string) ([]string, string) {
 	if s.embedder == nil {
-		return "", searchFallbackEmbeddingsUnconfigured
+		return nil, searchFallbackEmbeddingsUnconfigured
 	}
 	installed, err := s.searchHybridInstalled(ctx)
 	if err != nil {
-		return "", "search_hybrid probe failed: " + err.Error()
+		return nil, "search_hybrid probe failed: " + err.Error()
 	}
 	if !installed {
-		return "", searchFallbackHybridNotInstalled
+		return nil, searchFallbackHybridNotInstalled
 	}
-	vector, err := s.embedder.Embed(ctx, queryText)
+	vectors, err := s.embedder.Embed(ctx, queryText)
 	if err != nil {
-		return "", "embedding request failed: " + err.Error()
+		return nil, "embedding request failed: " + err.Error()
 	}
-	return VectorLiteral(vector), ""
+	if len(vectors) == 0 {
+		return nil, "embedding request returned no vectors"
+	}
+	literals := make([]string, 0, len(vectors))
+	for _, vector := range vectors {
+		literals = append(literals, VectorLiteral(vector))
+	}
+	return literals, ""
 }
 
 // searchHybridInstalled probes for timeline.search_hybrid. Probed per request

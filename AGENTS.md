@@ -77,6 +77,19 @@ Text search runs through three timeline functions plus one app tool:
 - `timeline.context(ref, before, after)` — the neighboring events of a hit's
   (source, context) stream: the surrounding chat/channel messages, or the surrounding
   turns of an agent session (context `<source>|<session_id>`).
+A **broad** (unscoped) `search_text` call does not fan out per source: it pools candidates
+from two index-ordered BM25 scans — the global index for the high-volume adapters, a partial
+index (`timeline_events_search_text_bm25_lowvol_idx`) for the low-volume tail — and applies
+the per-source floor to that pool. The old per-source fan-out ran eighteen branches serially
+in one plpgsql loop, so its wall clock was the SUM of every branch (6.9s warm, 21.7s cold on
+the production corpus) while one index-ordered scan of the same index returns the global
+top 200 in 36ms. A **scoped** call (`sources => ARRAY[...]`) still runs the per-source
+branches. Two things there are load-bearing and easy to undo by accident: the pool pins
+`enable_sort = off` for the scans (the planner has no cost model for the bm25 operator and
+otherwise re-scores every row of a selective adapter filter, ~5.6ms per document), and the
+low-volume partition needs its OWN index — scanning those adapters through the global index
+walks past millions of gmail/slack documents and took 15-16s on an unlucky query.
+
 - The app's `search` tool — hybrid semantic+keyword retrieval: it embeds the query and
   calls `timeline.search_hybrid` (BM25 + pgvector ANN fused by reciprocal rank), falling
   back to keyword with an explicit `fallback_reason` when embeddings or pgvector are
@@ -103,11 +116,18 @@ over 0.6B off the 2026 MTEB standings (multilingual 69.45 vs 64.33; the 8B leade
 not fit 12 GB) — the family tops open self-hosted models and the GPU is otherwise idle.
 Queries (the app's Go client only, never the Python document indexer) are wrapped in the
 instruction prefix from `SEARCH_EMBEDDINGS_QUERY_PREFIX`, per Qwen3-Embedding's
-instruction-asymmetric training. Production also sets
-`SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT=0.5`: the app embeds the instructed and raw query in
-one two-item request, blends their unit vectors equally, and renormalizes. This retained
-the instruction's retrieval gains without losing strong raw-query neighbors in the
-full-corpus eval; it does not change document embeddings. Inspect with
+instruction-asymmetric training. The app embeds the instructed **and** the raw query in one
+two-item request and passes **both** vectors to `timeline.search_hybrid`, which scans one
+ANN leg per vector and fuses them by rank. Two legs, not a blend: the instructed and raw
+forms of a question land in different neighbourhoods and each retrieves answers the other
+misses, so averaging them into one vector averages the difference away — measured on the
+labeled benchmark, blending scored MRR 0.234 where two legs scored 0.300. The instruction
+*text* matters as much as its presence (0.240 vs 0.300 for two wordings of the same task),
+so re-measure with `search_benchmark` before changing it. Write the instruction's newline as
+the two characters `\n`, which the app decodes: Coolify truncates an environment value at a
+real newline, and production silently ran with the instruction's second half missing. `SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT`
+is removed; the app logs a warning if it is still set. None of this changes document
+embeddings. Inspect with
 `ssh mew docker logs pdw-embeddings`;
 relaunch with the same `docker run` flags plus `--auto-truncate` (required: the model's
 32k context exceeds TEI's default batch limit) **and `--max-client-batch-size 256`**

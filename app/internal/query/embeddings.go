@@ -29,7 +29,11 @@ const embeddingsRequestTimeout = 30 * time.Second
 // compares against. *EmbeddingsClient implements it; tests substitute fakes.
 type Embedder interface {
 	Model() string
-	Embed(ctx context.Context, text string) ([]float64, error)
+	// Embed returns one or more query vectors for text, most specific first.
+	// An instruction-tuned client returns the instructed and the raw vector so
+	// retrieval can search both neighbourhoods; a plain one returns a single
+	// vector. Retrieval fuses whatever it is given by rank.
+	Embed(ctx context.Context, text string) ([][]float64, error)
 }
 
 // EmbeddingsOptions configures an OpenAI-compatible embeddings endpoint.
@@ -50,12 +54,9 @@ type EmbeddingsOptions struct {
 	// tuned retrieval models (Qwen3-Embedding) embed documents raw but expect
 	// queries wrapped in a task instruction; this client only ever embeds
 	// queries, so the prefix applies to everything it sends.
+	// When it is set the client embeds BOTH forms and returns both vectors,
+	// because retrieval searches each neighbourhood separately -- see Embed.
 	QueryPrefix string
-	// QueryRawWeight blends the raw-query embedding with the prefixed-query
-	// embedding when QueryPrefix is set. Zero uses only the instructed vector;
-	// 0.5 gives each representation equal weight. Values outside [0,1] are
-	// clamped defensively; application config rejects them before this layer.
-	QueryRawWeight float64
 	// HTTPClient overrides the default 30s-timeout client (tests).
 	HTTPClient *http.Client
 }
@@ -66,9 +67,8 @@ type EmbeddingsClient struct {
 	apiKey         string
 	model          string
 	dimensions     int
-	queryPrefix    string
-	queryRawWeight float64
-	httpClient     *http.Client
+	queryPrefix string
+	httpClient  *http.Client
 }
 
 // NewEmbeddingsClient returns a client, or nil when embeddings are not
@@ -95,34 +95,32 @@ func NewEmbeddingsClient(opts EmbeddingsOptions) *EmbeddingsClient {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: embeddingsRequestTimeout}
 	}
-	queryRawWeight := opts.QueryRawWeight
-	if math.IsNaN(queryRawWeight) || queryRawWeight < 0 {
-		queryRawWeight = 0
-	} else if queryRawWeight > 1 {
-		queryRawWeight = 1
-	}
 	return &EmbeddingsClient{
-		baseURL:        strings.TrimRight(baseURL, "/"),
-		apiKey:         apiKey,
-		model:          model,
-		dimensions:     dimensions,
-		queryPrefix:    opts.QueryPrefix,
-		queryRawWeight: queryRawWeight,
-		httpClient:     httpClient,
+		baseURL:     strings.TrimRight(baseURL, "/"),
+		apiKey:      apiKey,
+		model:       model,
+		dimensions:  dimensions,
+		queryPrefix: opts.QueryPrefix,
+		httpClient:  httpClient,
 	}
 }
 
 func (c *EmbeddingsClient) Model() string { return c.model }
 
-// Embed returns the embedding vector for text. It retries once on a 429 or
-// 5xx response; every other failure is returned immediately.
-func (c *EmbeddingsClient) Embed(ctx context.Context, text string) ([]float64, error) {
-	inputs := []string{c.queryPrefix + text}
-	blend := c.queryPrefix != "" && c.queryRawWeight > 0 && c.queryRawWeight < 1
-	if blend {
-		inputs = append(inputs, text)
-	} else if c.queryPrefix != "" && c.queryRawWeight >= 1 {
-		inputs[0] = text
+// Embed returns one or two query vectors in a single round trip. It retries
+// once on a 429 or 5xx response; every other failure is returned immediately.
+//
+// Two vectors, not a blend. Qwen3-Embedding is instruction-asymmetric: the
+// instructed and the raw form of the same question land in different regions
+// of the space, and each one retrieves answers the other misses. Averaging
+// them into one vector averages that away — measured on the labeled benchmark,
+// blending scored MRR 0.234 while searching both neighbourhoods and fusing by
+// rank scored 0.300. The instructed vector is always first, so a caller that
+// can only use one still gets the better single vector.
+func (c *EmbeddingsClient) Embed(ctx context.Context, text string) ([][]float64, error) {
+	inputs := []string{text}
+	if c.queryPrefix != "" {
+		inputs = []string{c.queryPrefix + text, text}
 	}
 	body, err := json.Marshal(map[string]any{
 		"model":      c.model,
@@ -149,10 +147,7 @@ func (c *EmbeddingsClient) Embed(ctx context.Context, text string) ([]float64, e
 			return nil, err
 		}
 	}
-	if blend {
-		return blendNormalized(vectors[0], vectors[1], c.queryRawWeight), nil
-	}
-	return vectors[0], nil
+	return vectors, nil
 }
 
 // embedOnce performs a single POST /embeddings round trip. retryable reports
@@ -216,16 +211,6 @@ func (c *EmbeddingsClient) fitDimensions(embedding []float64) ([]float64, error)
 		embedding = normalize(embedding)
 	}
 	return embedding, nil
-}
-
-func blendNormalized(instructed, raw []float64, rawWeight float64) []float64 {
-	instructed = normalize(instructed)
-	raw = normalize(raw)
-	result := make([]float64, len(instructed))
-	for index := range instructed {
-		result[index] = (1-rawWeight)*instructed[index] + rawWeight*raw[index]
-	}
-	return normalize(result)
 }
 
 func normalize(vector []float64) []float64 {

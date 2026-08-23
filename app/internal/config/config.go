@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -93,10 +92,9 @@ type Config struct {
 	// but expect queries wrapped in a task instruction; the Python indexing
 	// runner deliberately never applies it.
 	SearchEmbeddingsQueryPrefix string
-	// SearchEmbeddingsQueryRawWeight optionally blends the raw-query vector
-	// with the instruction-prefixed vector. It must be in [0,1]; zero keeps
-	// the model-standard instruction-only behavior.
-	SearchEmbeddingsQueryRawWeight float64
+	// DeprecatedEnvVars names environment variables that are set but no longer
+	// do anything, each with the reason. The server logs them at startup.
+	DeprecatedEnvVars []string
 
 	// DriveSourceTokensByAccount maps a Google Drive *source* account email to
 	// its OAuth token JSON, so the account-aware download proxy can stream a
@@ -271,9 +269,22 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	cfg.SearchEmbeddingsBaseURL = strings.TrimRight(strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_BASE_URL")), "/")
 	cfg.SearchEmbeddingsAPIKey = strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_API_KEY"))
 	cfg.SearchEmbeddingsModel = valueOrDefault(strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_MODEL")), "text-embedding-3-small")
-	cfg.SearchEmbeddingsQueryPrefix = getenv("SEARCH_EMBEDDINGS_QUERY_PREFIX")
-	if cfg.SearchEmbeddingsQueryRawWeight, err = parseUnitFloat(getenv("SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT"), 0, "SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT"); err != nil {
-		return Config{}, err
+	// Decoded, not raw: the instruction wants a real newline before "Query:"
+	// (worth ~0.02 MRR on the labeled benchmark against a space), but a
+	// newline inside an environment value does not survive every deploy
+	// pipeline -- Coolify silently truncated production's prefix at the
+	// newline, so the app ran for weeks with the instruction's second half
+	// missing and nothing reported it. Writing the escape as the two
+	// characters \n keeps the value single-line all the way through.
+	cfg.SearchEmbeddingsQueryPrefix = decodeEnvEscapes(getenv("SEARCH_EMBEDDINGS_QUERY_PREFIX"))
+	// SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT blended the instructed and raw query
+	// vectors into one. Retrieval now searches both neighbourhoods and fuses
+	// them by rank, which measured materially better, so the knob is gone.
+	// A still-set value is reported rather than ignored: silently inert config
+	// is how a deployment ends up believing it is tuned when it is not.
+	if strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT")) != "" {
+		cfg.DeprecatedEnvVars = append(cfg.DeprecatedEnvVars,
+			"SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT (removed: the instructed and raw query vectors are now searched as separate ANN legs and fused by rank; unset it)")
 	}
 	if cfg.SearchEmbeddingsDimensions, err = parsePositiveInt(getenv("SEARCH_EMBEDDINGS_DIMENSIONS"), 512, "SEARCH_EMBEDDINGS_DIMENSIONS"); err != nil {
 		return Config{}, err
@@ -320,6 +331,29 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// decodeEnvEscapes turns the escape sequences \n and \t in an environment
+// value into the characters they name, accepting the doubled forms \\n and
+// \\t as well. Nothing else is decoded: this is a transport fix for values
+// that must stay on one line, not a general unescaper.
+//
+// Both forms are accepted because control planes re-escape on the way through.
+// Coolify stores a submitted \n as \\n, and it truncates a real newline
+// outright -- production ran for weeks with an instruction prefix cut in half
+// at the newline and nothing reported it. Decoding both means the value works
+// however the control plane chose to store it.
+func decodeEnvEscapes(raw string) string {
+	if !strings.Contains(raw, "\\") {
+		return raw
+	}
+	replacer := strings.NewReplacer(
+		"\\\\n", "\n",
+		"\\\\t", "\t",
+		"\\n", "\n",
+		"\\t", "\t",
+	)
+	return replacer.Replace(raw)
+}
+
 func valueOrDefault(value, fallback string) string {
 	if strings.TrimSpace(value) == "" {
 		return fallback
@@ -347,18 +381,6 @@ func parsePositiveInt64(raw string, fallback int64, name string) (int64, error) 
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value <= 0 {
 		return 0, errors.New(name + " must be a positive integer")
-	}
-	return value, nil
-}
-
-func parseUnitFloat(raw string, fallback float64, name string) (float64, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return fallback, nil
-	}
-	value, err := strconv.ParseFloat(raw, 64)
-	if err != nil || math.IsNaN(value) || value < 0 || value > 1 {
-		return 0, errors.New(name + " must be a number between 0 and 1")
 	}
 	return value, nil
 }

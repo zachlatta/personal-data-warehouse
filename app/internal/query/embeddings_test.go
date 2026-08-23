@@ -3,7 +3,6 @@ package query
 import (
 	"context"
 	"encoding/json"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,10 +49,14 @@ func TestEmbeddingsClientEmbedSendsOpenAICompatibleRequest(t *testing.T) {
 	defer srv.Close()
 
 	client := NewEmbeddingsClient(EmbeddingsOptions{BaseURL: srv.URL, APIKey: "sk-test", Model: "test-model", Dimensions: 3})
-	vector, err := client.Embed(context.Background(), "offer letter")
+	vectors, err := client.Embed(context.Background(), "offer letter")
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
+	if len(vectors) != 1 {
+		t.Fatalf("want one vector without a query prefix, got %d", len(vectors))
+	}
+	vector := vectors[0]
 	if len(vector) != 3 || vector[0] != 0.5 || vector[1] != -1.25 || vector[2] != 0 {
 		t.Fatalf("vector = %v", vector)
 	}
@@ -74,7 +77,12 @@ func TestEmbeddingsClientEmbedSendsOpenAICompatibleRequest(t *testing.T) {
 	}
 }
 
-func TestEmbeddingsClientBlendsRawAndInstructionQueryVectors(t *testing.T) {
+func TestEmbeddingsClientReturnsInstructedAndRawQueryVectors(t *testing.T) {
+	// Instruction-asymmetric models put the instructed and the raw form of one
+	// question in different neighbourhoods, each holding answers the other
+	// misses. The client returns BOTH so retrieval can scan both and fuse by
+	// rank; blending them into one vector averaged the difference away and
+	// measured materially worse (MRR 0.234 vs 0.300 on the labeled benchmark).
 	var gotInputs []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -91,22 +99,28 @@ func TestEmbeddingsClientBlendsRawAndInstructionQueryVectors(t *testing.T) {
 	defer srv.Close()
 
 	client := NewEmbeddingsClient(EmbeddingsOptions{
-		BaseURL:        srv.URL,
-		Dimensions:     2,
-		QueryPrefix:    "Instruct: retrieve personal data\nQuery:",
-		QueryRawWeight: 0.5,
+		BaseURL:     srv.URL,
+		Dimensions:  2,
+		QueryPrefix: "Instruct: retrieve personal data\nQuery:",
 	})
-	vector, err := client.Embed(context.Background(), "lunch plans")
+	vectors, err := client.Embed(context.Background(), "lunch plans")
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
-	want := 1 / math.Sqrt(2)
-	if len(vector) != 2 || math.Abs(vector[0]-want) > 1e-12 || math.Abs(vector[1]-want) > 1e-12 {
-		t.Fatalf("blended vector = %v, want [%v %v]", vector, want, want)
+	if len(vectors) != 2 {
+		t.Fatalf("want the instructed and the raw vector, got %d", len(vectors))
+	}
+	// Instructed first: a caller that can only use one vector gets the better one.
+	if vectors[0][0] != 2 || vectors[0][1] != 0 {
+		t.Fatalf("instructed vector = %v", vectors[0])
+	}
+	if vectors[1][0] != 0 || vectors[1][1] != 3 {
+		t.Fatalf("raw vector = %v", vectors[1])
 	}
 	if len(gotInputs) != 2 || gotInputs[0] != "Instruct: retrieve personal data\nQuery:lunch plans" || gotInputs[1] != "lunch plans" {
 		t.Fatalf("inputs = %#v", gotInputs)
 	}
+	// One round trip, not two: both forms ride in the same batched request.
 }
 
 func TestEmbeddingsClientOmitsAuthorizationWithoutKey(t *testing.T) {
@@ -154,12 +168,12 @@ func TestEmbeddingsClientRetriesOnceOnServerError(t *testing.T) {
 	defer srv.Close()
 
 	client := NewEmbeddingsClient(EmbeddingsOptions{BaseURL: srv.URL, Dimensions: 2})
-	vector, err := client.Embed(context.Background(), "q")
+	vectors, err := client.Embed(context.Background(), "q")
 	if err != nil {
 		t.Fatalf("Embed after retry: %v", err)
 	}
-	if len(vector) != 2 {
-		t.Fatalf("vector = %v", vector)
+	if len(vectors) != 1 || len(vectors[0]) != 2 {
+		t.Fatalf("vectors = %v", vectors)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("calls = %d, want 2", calls.Load())
