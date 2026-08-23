@@ -1196,7 +1196,7 @@ Personal financial data is linked through Plaid and stored in the source-owned `
 Raw/query tables are `base_plaid.items`, `base_plaid.accounts`, `base_plaid.transactions`,
 `base_plaid.investment_securities`, `base_plaid.investment_holdings`, `base_plaid.investment_transactions`,
 `base_plaid.liabilities`, and `ops.plaid_sync_state`. Finance-domain read views are
-`marts_derived_finance.accounts`, `marts_derived_finance.transactions`, `marts_finance.investment_holdings`,
+`marts_finance.accounts`, `marts_finance.transactions`, `marts_finance.investment_holdings`,
 `marts_finance.investment_transactions`, and `marts_finance.liabilities`. Access tokens are
 isolated in `private.plaid_item_tokens`. Warehouse initialization provisions the NOLOGIN
 `PDW_QUERY_POSTGRES_ROLE` (default `pdw_query`), revokes `private` from it/`PUBLIC`, and both Go and
@@ -1279,8 +1279,8 @@ enrichment layer.
   and found property/vehicle/private_fund accounts.
 - Net worth: `marts_finance.net_worth` (latest observation per account, signed by side; net worth
   = `SUM(signed_value)`) and `marts_finance.net_worth_history` (forward-filled daily
-  assets/liabilities/net series). `marts_derived_finance.accounts` (accounts + latest observation) and
-  `marts_derived_finance.transactions` (the ledger joined to accounts) REPLACED the old Plaid passthrough
+  assets/liabilities/net series). `marts_finance.accounts` (accounts + latest observation) and
+  `marts_finance.transactions` (the ledger joined to accounts) REPLACED the old Plaid passthrough
   views of the same names; the plaid-specific `marts_finance.investment_*` / `marts_finance.liabilities`
   passthroughs remain.
 

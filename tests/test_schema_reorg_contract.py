@@ -453,6 +453,59 @@ def test_warehouse_sql_never_names_a_relation_bare() -> None:
     )
 
 
+def _stale_physical_names() -> set[str]:
+    old_names = {
+        f"{obj.previous_schema}.{obj.previous_name}"
+        for obj in CATALOG.objects
+        if obj.previous_schema
+    }
+    current = {f"{obj.schema}.{obj.name}" for obj in CATALOG.objects}
+    return old_names - current
+
+
+def _python_string_literals(path: Path) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            parts = [node.value]
+        elif isinstance(node, ast.JoinedStr):
+            parts = [
+                v.value for v in node.values if isinstance(v, ast.Constant) and isinstance(v.value, str)
+            ]
+        else:
+            continue
+        out.extend((node.lineno, text) for text in parts)
+    return out
+
+
+# Interpreted ("...") and raw (`...`) Go string literals. Comments are excluded
+# deliberately: a stale name in a comment misleads a reader, a stale name in a
+# literal is shipped behaviour — the query service's error hints are literals
+# and are read by an agent as instructions.
+_GO_STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"|`[^`]*`', re.MULTILINE)
+
+
+def _go_string_literals(path: Path) -> list[tuple[int, str]]:
+    text = path.read_text()
+    return [
+        (text.count("\n", 0, m.start()) + 1, m.group(0)) for m in _GO_STRING.finditer(text)
+    ]
+
+
+def _markdown_documents() -> list[Path]:
+    """Every prose document, with ``CLAUDE.md``'s symlink to ``AGENTS.md`` collapsed."""
+    seen: set[Path] = set()
+    docs: list[Path] = []
+    for path in sorted(REPO_ROOT.glob("*.md")) + sorted((REPO_ROOT / "docs").rglob("*.md")):
+        real = path.resolve()
+        if real in seen:
+            continue
+        seen.add(real)
+        docs.append(path)
+    return docs
+
+
 def test_no_module_names_a_pre_reorg_physical_relation() -> None:
     """No string anywhere may still spell an old ``schema.name``.
 
@@ -462,37 +515,73 @@ def test_no_module_names_a_pre_reorg_physical_relation() -> None:
     plain string, so it is exactly where a rename rots silently. It did: the
     write-back shipped ``apple_voice_memos.enrichments`` and broke on the first
     run after the cutover.
+
+    The sweep covers Python, the Go app, **and the Markdown**, because the docs
+    are executable for an agent: an agent that reads ``README.md`` and types the
+    name it found there gets an undefined-relation error, and the docs went 28
+    days after the reorg still telling it to query ``clean_gmail_inbox``.
     """
-    old_names = {
-        f"{obj.previous_schema}.{obj.previous_name}"
-        for obj in CATALOG.objects
-        if obj.previous_schema
-    }
-    current = {f"{obj.schema}.{obj.name}" for obj in CATALOG.objects}
-    stale = old_names - current
+    stale = _stale_physical_names()
     # schema_upgrade.py is the one module whose whole job is the old layout.
-    skip = {REPO_ROOT / "src/personal_data_warehouse/schema_upgrade.py"}
-    offenders: list[str] = []
-    for path in list((REPO_ROOT / "src").rglob("*.py")) + list((REPO_ROOT / "scripts").rglob("*.py")):
-        if path in skip:
+    skip = {
+        REPO_ROOT / "src/personal_data_warehouse/schema_upgrade.py",
+        # Generated from the catalog's own `previous` blocks: mapping the old
+        # location onto the new one is the entire point of the file.
+        REPO_ROOT / "app/internal/warehouse/catalog_gen.go",
+    }
+    sources: list[tuple[Path, list[tuple[int, str]]]] = []
+    for path in sorted((REPO_ROOT / "src").rglob("*.py")) + sorted((REPO_ROOT / "scripts").rglob("*.py")):
+        if path not in skip:
+            sources.append((path, _python_string_literals(path)))
+    for path in sorted((REPO_ROOT / "app").rglob("*.go")):
+        # Go tests feed old names in on purpose: they assert the undefined-relation
+        # error still points at the new location.
+        if path in skip or path.name.endswith("_test.go"):
             continue
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                parts = [node.value]
-            elif isinstance(node, ast.JoinedStr):
-                parts = [
-                    v.value
-                    for v in node.values
-                    if isinstance(v, ast.Constant) and isinstance(v.value, str)
-                ]
-            else:
-                continue
-            for text in parts:
-                for name in stale:
-                    if re.search(rf"(?<![\w.@]){re.escape(name)}(?![\w])", text):
-                        offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}: {name}")
+        sources.append((path, _go_string_literals(path)))
+    for path in _markdown_documents():
+        sources.append((path, list(enumerate(path.read_text().splitlines(), 1))))
+
+    offenders: list[str] = []
+    for path, chunks in sources:
+        for lineno, text in chunks:
+            for name in stale:
+                if re.search(rf"(?<![\w.@]){re.escape(name)}(?![\w])", text):
+                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {name}")
     assert not offenders, "pre-reorg physical names still in source: " + "; ".join(
+        sorted(set(offenders))[:20]
+    )
+
+
+# A qualified relation reference, by shape rather than by a known-schema list, so
+# a schema that never existed (``marts_derived_finance``) is caught too — that
+# exact invention sat in four places in the docs, one of them presented as
+# runnable verification SQL, for a month after the reorg.
+_QUALIFIED_RELATION = re.compile(
+    r"(?<![\w.])((?:base|derived|marts)_[a-z0-9_]+|timeline|ops|private|internal)"
+    r"\.([a-z_][a-z0-9_]*)(\*?)"
+)
+
+
+def test_docs_only_name_relations_that_exist() -> None:
+    """Every ``schema.relation`` in the prose must be in the catalog.
+
+    Agents read these documents and type what they find. The stale-name sweep
+    above only catches names the catalog remembers moving; this catches the
+    other half — a name that was never right, or a relation that was deleted
+    outright — by requiring every qualified reference to resolve.
+    """
+    live = {f"{obj.schema}.{obj.name}" for obj in CATALOG.objects}
+    offenders: list[str] = []
+    for path in _markdown_documents():
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            for match in _QUALIFIED_RELATION.finditer(line):
+                if match.group(3) == "*":  # a `marts_finance.investment_*` glob in prose
+                    continue
+                token = f"{match.group(1)}.{match.group(2)}"
+                if token not in live:
+                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {token}")
+    assert not offenders, "docs name relations that do not exist: " + "; ".join(
         sorted(set(offenders))[:20]
     )
 

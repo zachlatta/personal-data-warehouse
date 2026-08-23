@@ -578,7 +578,7 @@ successful sync time are preserved, so re-linking resumes rather than replaying 
 only when Link repairs the existing Item. Plaid may instead mint a **new** `item_id` with new
 account ids for the same real accounts, leaving the dead Item linked alongside it. Both then sync,
 so every balance is counted twice in `marts_finance.net_worth` and every transaction in the
-overlap window appears twice in `marts_derived_finance.transactions`. A cleared `action_required` is
+overlap window appears twice in `marts_finance.transactions`. A cleared `action_required` is
 therefore not the finish line; check the item count too:
 
 ```sql
@@ -623,8 +623,8 @@ holdings, raw JSON, or private tokens. Useful aggregate/status surfaces are:
 
 ```sql
 SELECT product, status, last_synced_at FROM ops.plaid_sync_state ORDER BY product;
-SELECT count(*) FROM marts_derived_finance.accounts;
-SELECT count(*) FROM marts_derived_finance.transactions;
+SELECT count(*) FROM marts_finance.accounts;
+SELECT count(*) FROM marts_finance.transactions;
 SELECT count(*) FROM marts_finance.investment_holdings;
 SELECT count(*) FROM marts_finance.investment_transactions;
 SELECT count(*) FROM marts_finance.liabilities;
@@ -1377,54 +1377,68 @@ host-owned per-run proxy — and that a blocked tool such as `propose_mutation` 
 
 ## Warehouse Tables
 
+Every name below is the **physical** `schema.relation` you type into SQL, in the
+`base_* → derived_* → marts_* → timeline` layout described under
+[Warehouse Schema Layout](AGENTS.md#warehouse-schema-layout). The short ids some of these
+relations still carry internally (`gmail_messages`, `clean_gmail_inbox`, ...) are *catalog
+logical ids*, not SQL: warehouse SQL names them through an `@logical_id` marker, and typing
+one bare into `pdw sql` is an undefined-relation error. `src/personal_data_warehouse/warehouse_catalog.json`
+is the authority for both, and `tests/test_schema_reorg_contract.py` fails if this document
+names a relation that does not exist.
+
 The sync creates and maintains:
 
-- `gmail_messages`: latest known state for each Gmail message, keyed by `(account, message_id)`
-- `gmail_attachments`: latest known state and extracted text for each Gmail attachment
-- `gmail_attachment_backfill_state`: per-message marker for attachment backfill progress
-- `gmail_sync_state`: per-mailbox sync cursor and last run status
-- `calendar_events`: latest known state for each calendar event
-- `calendar_sync_state`: per-account/calendar sync token and last run status
-- `whoop_profiles`, `whoop_body_measurements`, `whoop_cycles`, `whoop_recoveries`,
-  `whoop_sleeps`, `whoop_workouts`: read-only WHOOP v2 profile/health/activity data
-- `whoop_sync_state`: per-WHOOP-collection sync window and last run status
+- `base_gmail.messages`: latest known state for each Gmail message, keyed by `(account, message_id)`
+- `base_gmail.attachments`: latest known state and extracted text for each Gmail attachment
+- `ops.gmail_attachment_backfill_state`: per-message marker for attachment backfill progress
+- `ops.gmail_sync_state`: per-mailbox sync cursor and last run status
+- `base_google_calendar.events`: latest known state for each calendar event
+- `ops.google_calendar_sync_state`: per-account/calendar sync token and last run status
+- `base_whoop.profiles`, `base_whoop.body_measurements`, `base_whoop.cycles`,
+  `base_whoop.recoveries`, `base_whoop.sleeps`, `base_whoop.workouts`: read-only WHOOP v2
+  profile/health/activity data
+- `ops.whoop_sync_state`: per-WHOOP-collection sync window and last run status
 - `private.whoop_oauth_tokens`: private runtime copy of the current rotated WHOOP OAuth token
-- `apple_voice_memos_files`: latest known metadata for Voice Memos audio files uploaded through Drive
-- `apple_voice_memos_transcription_runs`: raw transcription provider results and run state
-- `apple_voice_memos_transcript_segments`: normalized diarized transcript segments
-- `apple_voice_memos_enrichments`: canonical transcript, calendar match, participants, summary, action items, and evidence
-- `apple_notes`: latest known state for each Apple Note
-- `apple_note_revisions`: every observed Apple Note revision and tombstone
-- `apple_note_attachments`: attachment metadata and storage pointers per note revision
-- `apple_messages`: latest known state for each Apple Messages row, including decoded body text,
-  service, tapback/reply/edit metadata, and tombstones
-- `apple_message_chats`, `apple_message_handles`, `apple_message_chat_handles`,
-  `apple_message_chat_messages`: normalized conversation, participant, and membership tables
-- `apple_message_attachments`: attachment metadata and staged Drive storage pointers
+- `base_apple_voice_memos.files`: latest known metadata for Voice Memos audio files uploaded through Drive
+- `derived_voice_memos.transcription_runs`: raw transcription provider results and run state
+- `derived_voice_memos.transcript_segments`: normalized diarized transcript segments
+- `derived_voice_memos.enrichments`: canonical transcript, calendar match, participants, summary, action items, and evidence
+- `base_apple_notes.notes`: latest known state for each Apple Note
+- `base_apple_notes.revisions`: every observed Apple Note revision and tombstone
+- `base_apple_notes.attachments`: attachment metadata and storage pointers per note revision
+- `base_apple_messages.messages`: latest known state for each Apple Messages row, including decoded
+  body text, service, tapback/reply/edit metadata, and tombstones
+- `base_apple_messages.chats`, `base_apple_messages.handles`, `base_apple_messages.chat_handles`,
+  `base_apple_messages.chat_messages`: normalized conversation, participant, and membership tables
+- `base_apple_messages.attachments`: attachment metadata and staged Drive storage pointers
 - `base_apple_contacts.cards`: latest known state for each local or iCloud Apple contact
 - `marts_contacts.contacts`, `marts_contacts.contact_points`: canonical active contacts and normalized identifiers
 - `marts_messages.apple_messages`: Apple Messages enriched with contact-backed sender identity
-- `agent_runs`, `agent_run_events`, `agent_run_tool_calls`: containerized Codex/Claude run audit logs
-- `slack_account_identities`: authenticated Slack user identity for each synced Slack account/team
+- `ops.ai_processing_agent_runs`, `ops.ai_processing_agent_run_events`,
+  `ops.ai_processing_agent_run_tool_calls`: containerized Codex/Claude run audit logs
+- `base_slack.account_identities`: authenticated Slack user identity for each synced Slack account/team
 - `base_plaid.items`, `base_plaid.accounts`, `base_plaid.transactions`, `base_plaid.investment_securities`,
   `base_plaid.investment_holdings`, `base_plaid.investment_transactions`, and `base_plaid.liabilities`: raw,
   source-owned Plaid metadata and financial records
 - `ops.plaid_sync_state`: per-item/product cursor, status, and last successful sync timestamp
 - `private.plaid_item_tokens`: private Plaid access-token storage; excluded from normal read surfaces
-- `marts_derived_finance.accounts`, `marts_derived_finance.transactions`, `marts_finance.investment_holdings`,
+- `marts_finance.accounts`, `marts_finance.transactions`, `marts_finance.investment_holdings`,
   `marts_finance.investment_transactions`, and `marts_finance.liabilities`: stable finance-domain
   views over the Plaid source tables
 
-The warehouse also creates clean views for current inbox and transcript state:
+The warehouse also creates read views for current inbox and transcript state:
 
-- `clean_gmail_inbox`: Gmail inbox threads with latest-message summary fields and
+- `marts_inbox.gmail_threads`: Gmail inbox threads with latest-message summary fields and
   `thread_messages_json` carrying full thread context oldest-to-newest
-- `clean_slack_inbox`: Slack DMs, mentions, participating threads, and channel unread items for
+- `marts_inbox.slack_items`: Slack DMs, mentions, participating threads, and channel unread items for
   the authenticated Slack user when read state is known
-- `clean_calendar_with_transcripts`: calendar events joined to matched Voice Memo transcript enrichments
-- `clean_transcripts_no_calendar_match`: completed Voice Memo transcript enrichments without a calendar match
+- `marts_calendar.events_with_voice_memos`: calendar events joined to matched Voice Memo transcript enrichments
+- `marts_calendar.unmatched_voice_memos`: completed Voice Memo transcript enrichments without a calendar match
 
-`gmail_messages` stores:
+And every one of those sources also lands on `timeline.events`, the cross-source event stream
+that is the recommended starting point — see [The seven contracts](AGENTS.md#the-seven-contracts).
+
+`base_gmail.messages` stores:
 
 - mailbox/account
 - Gmail message and thread IDs
@@ -1436,10 +1450,10 @@ The warehouse also creates clean views for current inbox and transcript state:
 - extracted `text/plain` and `text/html` bodies
 - the raw Gmail message payload as JSON
 
-Attachments are stored in `gmail_attachments`, keyed by `(account, message_id, part_id, filename)`.
+Attachments are stored in `base_gmail.attachments`, keyed by `(account, message_id, part_id, filename)`.
 The sync stores attachment metadata, content hashes, text extraction status, and extracted text for searchable formats.
 Supported text extraction includes plain text-like files, HTML, PDF, ZIP contents, and Office Open XML files such as `.docx`, `.pptx`, and `.xlsx`.
-Agent vision enrichment stores successful output in the shared `file_attachment_enrichments`
+Agent vision enrichment stores successful output in the shared `derived_enrichment.file_attachment_enrichments`
 table with `text_extraction_status = 'agent_ok'` (or `agent_not_useful` for blank/decorative
 images), alongside the provider, model, exact prompt, prompt hash, prompt version, source
 extraction status, elapsed time, and processing timestamp. Rows produced by the removed inline
