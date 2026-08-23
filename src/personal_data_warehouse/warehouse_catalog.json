@@ -1886,6 +1886,18 @@
       "comment": "Per-table freshness: when the pipeline last wrote, how old the newest real-world event is, and whether the probe could run at all (probe_status)."
     },
     {
+      "id": "marts_timeline_adapter_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "timeline_adapter_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Per-adapter timeline currency: is this kind of data actually reaching timeline.events? The single `timeline` row in marts_ops.pipeline_health is a max() over every adapter and hides a frozen one. Note last_run_at is only stamped when a batch returned rows, so an idle adapter looks stalled; compare watermark_ingest_ts against the source relation instead."
+    },
+    {
       "id": "marts_ops_plaid_item_health",
       "kind": "view",
       "layer": "marts",

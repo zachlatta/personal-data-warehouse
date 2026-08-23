@@ -3261,6 +3261,52 @@ class PostgresWarehouse:
             """,
         )
 
+        # Level 3 of the health contract: "is THIS kind of data current on the
+        # timeline?" The pipeline row cannot answer it. `timeline` is a single
+        # pipeline whose run heartbeat is a max() over every adapter, so one
+        # frozen adapter is arithmetically invisible behind twenty-four healthy
+        # ones -- measured 2026-08-23, six adapters had not run in ~60 hours
+        # against a 30-minute cadence while the pipeline reported
+        # `run_age = 0.00d, ok`.
+        #
+        # Facts, not just a verdict: `last_run_at` is NOT "when the adapter last
+        # ran". `_save_state` only stamps it when a batch returned rows, so an
+        # adapter with nothing to do looks identical to a wedged one. Anyone
+        # alarming on `run_age_seconds` alone will page falsely. The honest
+        # signal is `watermark_ingest_ts` compared against the newest row in the
+        # adapter's own source relation, which is why both are exposed side by
+        # side and the status stays deliberately conservative.
+        # Guarded: ensure_pipeline_health_tables can run before
+        # ensure_timeline_tables has created the state table it reads.
+        if not self._relation_exists("timeline_sync_state"):
+            return
+        self._ensure_view(
+            "marts_timeline_adapter_health",
+            f"""
+            CREATE OR REPLACE VIEW @marts_timeline_adapter_health AS
+            SELECT
+                adapter,
+                backfill_done,
+                backfill_rows,
+                incremental_rows,
+                NULLIF(watermark_ingest_ts, {epoch}) AS watermark_ingest_ts,
+                NULLIF(last_run_at, {epoch}) AS last_run_at,
+                (EXTRACT(EPOCH FROM now() - NULLIF(watermark_ingest_ts, {epoch})))::bigint
+                    AS watermark_age_seconds,
+                (EXTRACT(EPOCH FROM now() - NULLIF(last_run_at, {epoch})))::bigint
+                    AS run_age_seconds,
+                CASE
+                    WHEN NULLIF(last_error, '') IS NOT NULL THEN 'failing'
+                    WHEN backfill_done = 0 THEN 'backfilling'
+                    ELSE 'ok'
+                END AS status,
+                NULLIF(last_error, '') AS last_error,
+                NULLIF(updated_at, {epoch}) AS updated_at,
+                adapter_signature
+            FROM @timeline_sync_state
+            """,
+        )
+
     def write_pipeline_health(
         self,
         pipelines: Sequence[Any],

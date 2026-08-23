@@ -648,3 +648,45 @@ def test_read_only_query_role_can_read_the_marts_views(warehouse):
             assert cursor.fetchone()[0] == len(TABLE_PIPELINES)
     finally:
         connection.close()
+
+
+def test_timeline_adapter_health_exposes_every_adapter_to_the_query_role(warehouse):
+    """Level 3 of the health contract: is THIS kind of data current on the timeline?
+
+    The single ``timeline`` row in ``marts_ops.pipeline_health`` cannot answer
+    it. Its run heartbeat is a ``max()`` over every adapter, so one wedged
+    adapter is arithmetically invisible behind the healthy ones -- measured in
+    production on 2026-08-23, six adapters had not run in roughly sixty hours
+    against a thirty-minute cadence while the pipeline reported ``ok``.
+    """
+    from personal_data_warehouse.timeline import TIMELINE_ADAPTERS, TimelineSyncEngine
+
+    _provision_every_table(warehouse)
+    PipelineHealthCollector(warehouse).run()
+    TimelineSyncEngine(
+        source_url=_postgres_url(),
+        source_schema=warehouse._schema,
+        dest_schema=warehouse._schema,
+    ).run()
+
+    connection = warehouse.read_only_connection()
+    try:
+        with connection.cursor() as cursor:
+            rel = relation("marts_timeline_adapter_health").with_namespace(
+                warehouse.schema_namespace
+            )
+            cursor.execute(f'SELECT adapter, status FROM "{rel.schema}"."{rel.name}"')
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+
+    seen = {adapter for adapter, _ in rows}
+    expected = {adapter.name for adapter in TIMELINE_ADAPTERS}
+    assert seen == expected, (
+        "every timeline adapter must be visible in the health surface; missing "
+        f"{sorted(expected - seen)}, unexpected {sorted(seen - expected)}"
+    )
+    # A freshly synced warehouse has no errors and no unfinished backfill, so
+    # anything other than 'ok' here means the status expression is wrong rather
+    # than that the fixture is unhealthy.
+    assert {status for _, status in rows} == {"ok"}

@@ -143,7 +143,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +3 marts: the cross-source entry points marts_messages.messages and
         # marts_voice_memos.recordings/.transcript_segments, which gave the two
         # domains that had per-source views but no unified read interface one.
-        "marts": 32,
+        "marts": 33,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +1 internal: internal.search_text_preview, the
         # match-windowed preview helper both search functions use.

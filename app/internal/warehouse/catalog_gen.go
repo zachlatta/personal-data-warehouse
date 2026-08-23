@@ -178,6 +178,7 @@ var Objects = []CatalogObject{
 	{ID: "marts_finance_account_freshness", Kind: "view", Layer: "marts", Domain: "finance", Schema: "marts_finance", Name: "account_freshness", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "marts_pipeline_health", Kind: "view", Layer: "marts", Domain: "ops", Schema: "marts_ops", Name: "pipeline_health", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "marts_pipeline_table_freshness", Kind: "view", Layer: "marts", Domain: "ops", Schema: "marts_ops", Name: "table_freshness", Discoverable: true, QueryAccess: "public", Secret: false},
+	{ID: "marts_timeline_adapter_health", Kind: "view", Layer: "marts", Domain: "ops", Schema: "marts_ops", Name: "timeline_adapter_health", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "marts_ops_plaid_item_health", Kind: "view", Layer: "marts", Domain: "ops", Schema: "marts_ops", Name: "plaid_item_health", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "marts_transaction_receipts", Kind: "view", Layer: "marts", Domain: "receipts", Schema: "marts_receipts", Name: "transaction_receipts", Discoverable: true, QueryAccess: "public", Secret: false},
 	{ID: "timeline_events", Kind: "table", Layer: "timeline", Domain: "timeline", Schema: "timeline", Name: "events", Discoverable: true, QueryAccess: "public", Secret: false},
