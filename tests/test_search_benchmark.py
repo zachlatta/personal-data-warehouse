@@ -255,3 +255,89 @@ class TestBenchmarkCase:
                              truth_refs=(), truth_predicate={"sources": ["gmail"]},
                              ambiguous=True, note="")
         assert case.relevance_basis == "predicate"
+
+
+def test_smoke_report_names_every_source_that_failed() -> None:
+    # Every labeled query in the benchmark is UNSCOPED, so `sources => [...]`
+    # has no coverage at all -- and two production regressions hid in exactly
+    # that gap for hours: a plan flip made seven source tokens raise
+    # "query specifies index X but planner chose index Y", and a scoped hybrid
+    # search blew the app's statement budget at 73s. Both are one call per
+    # token away from being obvious, so the harness makes that call.
+    from personal_data_warehouse.search_benchmark import summarize_smoke
+
+    results = [
+        {"source": "gmail", "mode": "hybrid", "error": "", "elapsed_seconds": 3.1, "rows": 5},
+        {"source": "photo", "mode": "hybrid", "error": "planner chose index", "elapsed_seconds": 0.2, "rows": 0},
+        {"source": "whoop", "mode": "hybrid", "error": "", "elapsed_seconds": 44.0, "rows": 5},
+    ]
+    report = summarize_smoke(results, slow_seconds=30.0)
+    assert report["failed"] == ["photo/hybrid"]
+    assert report["slow"] == ["whoop/hybrid"]
+    assert report["ok"] == 2
+
+
+def test_smoke_report_is_clean_when_every_source_answers() -> None:
+    from personal_data_warehouse.search_benchmark import summarize_smoke
+
+    results = [
+        {"source": s, "mode": "hybrid", "error": "", "elapsed_seconds": 1.0, "rows": 3}
+        for s in ("gmail", "photo", "whoop")
+    ]
+    report = summarize_smoke(results, slow_seconds=30.0)
+    assert report["failed"] == [] and report["slow"] == [] and report["ok"] == 3
+
+
+def test_smoke_subcommand_needs_no_labels(monkeypatch, tmp_path) -> None:
+    # The label file is the expensive, private artifact. Asking "does every
+    # source still answer?" must not require it -- that check should be
+    # runnable on any deployment, including one with no labels at all.
+    import personal_data_warehouse.search_benchmark as module
+
+    called = {}
+
+    def fake_run_smoke(query, *, modes, depth, workers, progress=True):
+        called["query"] = query
+        return {"checked": 2, "ok": 2, "failed": [], "slow": [], "slow_seconds": 25.0,
+                "results": [], "environment": {}, "config": {}}
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("smoke must not load labels")
+
+    monkeypatch.setattr(module, "run_smoke", fake_run_smoke)
+    monkeypatch.setattr(module, "load_cases", explode)
+    out = tmp_path / ".search-eval" / "smoke.json"
+    assert module.main(["smoke", "--output", str(out)]) == 0
+    assert called["query"]
+
+
+def test_smoke_subcommand_exits_nonzero_when_a_source_fails(monkeypatch, tmp_path) -> None:
+    import personal_data_warehouse.search_benchmark as module
+
+    monkeypatch.setattr(module, "run_smoke", lambda *a, **k: {
+        "checked": 2, "ok": 1, "failed": ["photo/hybrid"], "slow": [], "slow_seconds": 25.0,
+        "results": [], "environment": {}, "config": {}})
+    monkeypatch.setattr(module, "load_cases", lambda *a, **k: [])
+    out = tmp_path / ".search-eval" / "smoke.json"
+    assert module.main(["smoke", "--output", str(out)]) == 1
+
+
+def test_smoke_does_not_pay_for_the_corpus_stamp(monkeypatch, tmp_path) -> None:
+    # Counting 7M chunks and 6M embeddings takes minutes. A scored report needs
+    # it, because two scores over different corpora are not comparable; a
+    # post-deploy health check does not, and a check nobody wants to wait ten
+    # minutes for is a check nobody runs.
+    import personal_data_warehouse.search_benchmark as module
+
+    seen = {}
+
+    def fake_capture(*, include_corpus: bool = True):
+        seen["include_corpus"] = include_corpus
+        return {}
+
+    monkeypatch.setattr(module, "capture_environment", fake_capture)
+    monkeypatch.setattr(module, "_pdw_json", lambda *a, **k: [{"source": "gmail"}])
+    monkeypatch.setattr(module, "run_search",
+                        lambda *a, **k: module.SearchResult(mode="hybrid", rows=(), elapsed_seconds=0.1))
+    module.run_smoke("probe", modes=("hybrid",), depth=5, workers=1, progress=False)
+    assert seen["include_corpus"] is False

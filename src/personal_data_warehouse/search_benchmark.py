@@ -43,6 +43,10 @@ DEFAULT_WORKERS = 8
 SOFT_MATCH_SECONDS = 3600
 
 HIT_THRESHOLDS = (1, 5, 10)
+# A scoped search slower than this is reported by the smoke check even though
+# it returned rows: the app cancels a query at its statement budget, so a
+# 44-second scoped search is a failure for every caller but this harness.
+SMOKE_SLOW_SECONDS = 25.0
 
 
 class PrivateOutputError(RuntimeError):
@@ -381,8 +385,14 @@ def resolve_truth_metadata(refs: Sequence[str]) -> dict[str, tuple[str, str, dat
     return out
 
 
-def capture_environment() -> dict[str, Any]:
-    """Stamp what was under test, so two reports can be compared honestly."""
+def capture_environment(*, include_corpus: bool = True) -> dict[str, Any]:
+    """Stamp what was under test, so two reports can be compared honestly.
+
+    ``include_corpus`` counts 7M chunks and 6M embeddings, which takes minutes.
+    A scored report needs it -- two scores over different corpora are not
+    comparable. A health check does not, and a post-deploy check nobody wants
+    to wait ten minutes for is a check nobody runs.
+    """
 
     env: dict[str, Any] = {}
     try:
@@ -402,15 +412,16 @@ def capture_environment() -> dict[str, Any]:
         "(SELECT count(*) FROM derived_search.chunk_embeddings) AS embeddings, "
         "(SELECT max(seq) FROM timeline.events) AS timeline_max_seq"
     )
-    try:
-        rows = _pdw_json(
-            ["sql", "--no-timeout", "--output", "json", "-q",
-             "stamp corpus frontiers for the retrieval benchmark", corpus_sql],
-            timeout=180,
-        )
-        env["corpus"] = rows[0] if isinstance(rows, list) and rows else {}
-    except (subprocess.SubprocessError, OSError, ValueError, KeyError, IndexError) as error:
-        env["corpus"] = {"error": str(error)[:160]}
+    if include_corpus:
+        try:
+            rows = _pdw_json(
+                ["sql", "--no-timeout", "--output", "json", "-q",
+                 "stamp corpus frontiers for the retrieval benchmark", corpus_sql],
+                timeout=600,
+            )
+            env["corpus"] = rows[0] if isinstance(rows, list) and rows else {}
+        except (subprocess.SubprocessError, OSError, ValueError, KeyError, IndexError) as error:
+            env["corpus"] = {"error": str(error)[:160]}
     env["captured_at"] = datetime.now(timezone.utc).isoformat()
     return env
 
@@ -540,6 +551,71 @@ def measure_serial_latency(
     return out
 
 
+def summarize_smoke(
+    results: Sequence[dict[str, Any]], *, slow_seconds: float = SMOKE_SLOW_SECONDS
+) -> dict[str, Any]:
+    """Which (source, mode) pairs failed outright, and which merely crawled.
+
+    Slow is reported separately from failed because the two have different
+    causes and different fixes, and because a scoped search that takes longer
+    than the app's statement budget fails for the CALLER while looking healthy
+    here.
+    """
+
+    failed = [f"{r['source']}/{r['mode']}" for r in results if r.get("error")]
+    slow = [
+        f"{r['source']}/{r['mode']}"
+        for r in results
+        if not r.get("error") and float(r.get("elapsed_seconds") or 0) >= slow_seconds
+    ]
+    return {
+        "checked": len(results),
+        "ok": len(results) - len(failed),
+        "failed": failed,
+        "slow": slow,
+        "slow_seconds": slow_seconds,
+        "results": list(results),
+    }
+
+
+def run_smoke(
+    query: str, *, modes: Sequence[str], depth: int, workers: int, progress: bool = True
+) -> dict[str, Any]:
+    """Call search once per (source token, mode). No labels, no scoring.
+
+    This exists because every labeled query is unscoped: the scored benchmark
+    cannot see a scoped-search failure at all, and two of them shipped to
+    production unnoticed.
+    """
+
+    sources = _pdw_json(
+        ["sql", "--output", "json", "-q", "list the search source tokens for the smoke check",
+         "SELECT source FROM timeline.search_text_sources() ORDER BY source"],
+        timeout=120,
+    )
+    tokens = [str(row["source"]) for row in sources if isinstance(row, dict)]
+    tasks = [(token, mode) for token in tokens for mode in modes]
+
+    def execute(task: tuple[str, str]) -> dict[str, Any]:
+        token, mode = task
+        result = run_search(query, mode, depth, sources=[token])
+        row = {
+            "source": token, "mode": mode, "error": result.error,
+            "rows": len(result.rows), "elapsed_seconds": round(result.elapsed_seconds, 2),
+        }
+        if progress:
+            status = "FAIL" if result.error else f"{len(result.rows):3d} rows"
+            print(f"  {token:24} {mode:8} {result.elapsed_seconds:6.1f}s  {status}", flush=True)
+        return row
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        results = list(pool.map(execute, tasks))
+    report = summarize_smoke(results)
+    report["environment"] = capture_environment(include_corpus=False)
+    report["config"] = {"query": query, "modes": list(modes), "depth": depth}
+    return report
+
+
 def _print_report(report: dict[str, Any]) -> None:
     modes = report["config"]["modes"]
     width = 52
@@ -610,10 +686,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     latency.add_argument("--sample", type=int, default=6)
     latency.add_argument("--repeats", type=int, default=1)
 
+    smoke = subparsers.add_parser(
+        "smoke", help="call search once per source token; catches scoped-search breakage"
+    )
+    smoke.add_argument("--query", default="kernel magazine",
+                       help="any query; the check is that every source ANSWERS, not what it returns")
+    smoke.add_argument("--modes", default="hybrid,keyword")
+    smoke.add_argument("--depth", type=int, default=10)
+    smoke.add_argument("--workers", type=int, default=4)
+    smoke.add_argument("--output", type=Path, default=Path(".search-eval/smoke_report.json"))
+
     args = parser.parse_args(argv)
     assert_private_path(args.output)
     modes = tuple(m.strip() for m in args.modes.split(",") if m.strip())
-    cases = load_cases(args.labels)
+    # smoke takes no labels: it asks whether every source ANSWERS, which is a
+    # different question from whether the answer is right.
+    cases = load_cases(args.labels) if hasattr(args, "labels") else []
+
+    if args.command == "smoke":
+        report = run_smoke(
+            args.query, modes=modes, depth=args.depth, workers=args.workers
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"\n  {report['ok']}/{report['checked']} source/mode pairs answered")
+        if report["failed"]:
+            print(f"  FAILED: {', '.join(report['failed'])}")
+        if report["slow"]:
+            print(f"  SLOW (>= {report['slow_seconds']}s): {', '.join(report['slow'])}")
+            print("    ...measured under concurrency and often on a cold ANN neighbourhood, "
+                  "so re-time a flagged source serially before chasing it: the high-volume "
+                  "sources flagged this way have measured 5-8s warm.")
+        print(f"\nwrote {args.output}")
+        return 1 if report["failed"] else 0
 
     if args.command == "latency":
         queries = [c.query for c in cases][: args.sample]

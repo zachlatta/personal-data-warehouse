@@ -37,7 +37,23 @@ uv run python scripts/search_benchmark.py run \
 
 # Serial latency sample (the only comparable latency number).
 uv run python scripts/search_benchmark.py latency --sample 8
+
+# One call per source token: does every SCOPED search still answer?
+uv run python scripts/search_benchmark.py smoke
 ```
+
+**Run `smoke` after touching the search indexes or the search SQL.** Every
+labeled query is unscoped, so the scored benchmark cannot see a scoped-search
+failure at all -- and two of them reached production unnoticed on 2026-08-23. A
+plan flip made seven source tokens raise *"query specifies index X but planner
+chose index Y"*, and a scoped hybrid search took 73s, past the app's statement
+budget, so callers got a timeout instead of results. Both were one call per
+token away from obvious. `smoke` needs no labels, exits non-zero when a source
+fails, and separately reports any source slower than the app will wait for --
+a scoped search that answers in 44s is still broken for every caller. Those
+timings are taken under concurrency and often on a cold ANN neighbourhood, so
+re-time a flagged source serially before chasing it — the high-volume sources
+flag this way at 25-30s and measure 5-8s warm.
 
 **Run it in parallel.** A single hybrid call takes tens of seconds against the production
 corpus, so a serial pass over a few dozen queries takes half an hour. `--workers` fans the
