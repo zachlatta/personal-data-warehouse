@@ -2227,3 +2227,64 @@ def test_prune_refuses_rather_than_empty_an_adapter(warehouse):
     assert after == before, (
         "an empty authoritative set must refuse the prune, not delete every row"
     )
+
+
+def test_prune_clamps_a_large_backlog_instead_of_declining_it(warehouse):
+    """A real backlog is legitimately large; refusing it outright never converges.
+
+    Production carried 4,944 orphans against 19,316 finance_transaction rows
+    (25.6%) when the prune shipped. A hard cap would have declined that exact
+    cleanup forever. Deleting at most a tenth per run converges it in a few
+    passes while keeping any single mistake bounded.
+    """
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    for i in range(200):
+        warehouse._command(
+            """
+            INSERT INTO @finance_transactions (transaction_id, account_id, posted_at, amount,
+                                              currency, description, merchant, pending, source,
+                                              created_at, sync_version)
+            VALUES (%s, 'fa1', %s, -1.00, 'USD', 'Bulk', 'Bulk', 0, 'plaid', %s, %s)
+            """,
+            (f"ft-mass-{i}", _NOW - timedelta(hours=20), _NOW, 1),
+        )
+    _engine(warehouse).run()
+
+    def _count() -> int:
+        return warehouse._query(
+            "SELECT count(*) FROM @timeline_events WHERE adapter = 'finance_transaction'"
+        )[0][0]
+
+    total = _count()
+    # Orphan a third of them: far past the per-run cap, but a legitimate backlog.
+    warehouse._command(
+        "UPDATE @finance_transactions SET transaction_id = 'gone-' || transaction_id "
+        "WHERE transaction_id LIKE 'ft-mass-%' "
+        "AND replace(transaction_id, 'ft-mass-', '')::int < 60"
+    )
+
+    first = _count()
+    _engine(warehouse).run()
+    after_one = _count()
+    assert after_one < first, "a clamped prune must still make progress"
+
+    for _ in range(30):
+        _engine(warehouse).run()
+    settled = _count()
+
+    # The contract is that no timeline row outlives its source row. Comparing
+    # raw counts would be wrong here: the re-keyed rows are still live under
+    # new ids and the incremental watermark has not seen them yet (the rename
+    # did not bump sync_version), so the timeline legitimately lags them.
+    orphans = warehouse._query(
+        """
+        SELECT count(*) FROM @timeline_events e
+        WHERE e.adapter = 'finance_transaction'
+          AND NOT EXISTS (
+              SELECT 1 FROM @finance_transactions t WHERE t.transaction_id = e.event_id
+          )
+        """
+    )[0][0]
+    assert orphans == 0, f"repeated runs must drain the backlog; {orphans} orphans remain"
+    assert settled < total, "the orphans were never removed"

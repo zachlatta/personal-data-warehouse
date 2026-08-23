@@ -2854,19 +2854,41 @@ class TimelineSyncEngine:
             doomed = int(cursor.fetchone()[0])
             if doomed == 0:
                 return 0
-            if total - doomed < self.PRUNE_MIN_KEEP or doomed > total * self.PRUNE_MAX_FRACTION:
+            # Clamp rather than refuse. A real backlog is legitimately large
+            # -- production carried 4,944 orphans against 19,316 rows (25.6%)
+            # when this shipped -- so a hard refusal would decline the exact
+            # cleanup it exists for, forever. Deleting at most a tenth per run
+            # converges that in a few passes while keeping any single mistake
+            # small, visible, and recoverable from the run before it.
+            budget = max(1, int(total * self.PRUNE_MAX_FRACTION))
+            if total - doomed < self.PRUNE_MIN_KEEP:
                 logger.error(
-                    "timeline prune refused for %s: %s of %s rows would be deleted "
-                    "(cap %.0f%%); the authoritative query is probably incomplete",
+                    "timeline prune refused for %s: only %s of %s rows would survive; "
+                    "the authoritative query is probably incomplete",
+                    adapter.name,
+                    total - doomed,
+                    total,
+                )
+                return 0
+            if doomed > budget:
+                logger.warning(
+                    "timeline prune clamped for %s: %s of %s rows are orphaned, "
+                    "deleting %s this run and the rest on later runs",
                     adapter.name,
                     doomed,
                     total,
-                    self.PRUNE_MAX_FRACTION * 100,
+                    budget,
                 )
-                return 0
             cursor.execute(
-                f"DELETE FROM {events} WHERE adapter = %s AND NOT (event_id = ANY(%s))",
-                (adapter.name, live_ids),
+                f"""
+                DELETE FROM {events}
+                WHERE ctid IN (
+                    SELECT ctid FROM {events}
+                    WHERE adapter = %s AND NOT (event_id = ANY(%s))
+                    LIMIT %s
+                )
+                """,
+                (adapter.name, live_ids, budget),
             )
             deleted = cursor.rowcount
         logger.info("timeline prune removed %s orphaned rows for %s", deleted, adapter.name)
