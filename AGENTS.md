@@ -6,6 +6,54 @@ Development practices:
 * When asked to refactor or change existing code flows, please plan to completely replace the old legacy flow with the new requested flow - including ripping out any and all legacy code
 * When querying the database, you can use the pdw CLI
 
+## The seven contracts
+
+Everything after this section is detail. These seven are what the warehouse *is*, and
+future work — human or agent — is expected to honor them rather than route around them.
+Each one names what holds it up, because an unenforced contract is one refactor away from
+quietly becoming untrue, and several of these have been.
+
+- **C1 — everything synced eventually lands on `timeline.events`.** One row per real-world
+  event, from every source, with `source_table` + `source_pk` drilling back to the
+  authoritative row. *Held up by* `TIMELINE_TABLE_COVERAGE`: every warehouse table must
+  declare itself as `events`, `detail`, `entity`, or `state`, and `tests/test_timeline.py`
+  checks that against the **live** schema, so a new table that skips the registry fails the
+  suite. *Gap:* nothing forces a source's event table to actually have an adapter — the
+  classification is a human's word.
+- **C2 — the timeline has five priority tiers and everything is properly categorized.**
+  `self`, `direct`, `cc`, `noise`, `background`, in that attention order, stored in the
+  `timeline.timeline_priority` enum. *Held up by* the enum itself (an invalid label is a
+  Postgres error) and the classification tests. *Gap:* which tier an adapter assigns is a
+  judgement no test can make for you, and a forgotten classification silently defaults to
+  `cc`. See [Timeline priority tiers](#timeline-priority-tiers).
+- **C3 — agents start at the timeline and can filter by priority.** The `search` tool or
+  `timeline.events`/`timeline.search_text()` in SQL, then one hop out to the source row.
+  *Held up by* the catalog's `START HERE` guidance being published as real schema comments
+  (`test_schema_comments_publish_the_start_here_guidance`) so discovery cannot disagree with
+  the docs.
+- **C4 — raw source data for every source is queryable via SQL.** `base_<source>` is a
+  faithful copy, discoverable, and readable by the read-only `pdw_query` role. The timeline
+  is the recommended entry point, never the only truth. *Held up by*
+  `test_query_role_reads_public_relations_and_is_denied_private` and the catalog's
+  query-access policy per layer.
+- **C5 — multi-source concepts layer `base_* → derived_*/marts_* → timeline`; consumers read
+  the other way, `timeline → marts_* → base_*`.** Raw rows never learn about identity;
+  identity and enrichment live in `derived_*`; `marts_*` is the stable read interface.
+  *Held up by* `tests/test_schema_reorg_contract.py` (layer/schema-name consistency, the
+  catalog as the only editable authority, no pre-reorg name anywhere in the source **or the
+  docs**).
+- **C6 — PDW responds fast, and saturates the host before anyone optimizes further.**
+  *Held up by* nothing automatic. It is the contract that has cost the most: see
+  [Performance contract](#performance-contract).
+- **C7 — pipeline health for every source, mart, and timeline data type is inspectable via
+  SQL and web.** *Held up by* `PIPELINES` + `TABLE_PIPELINES` and
+  `tests/test_pipeline_health.py`, which asserts the freshness registry and the timeline
+  registry cover *exactly* the same tables. Read it at `marts_ops.pipeline_health` /
+  `marts_ops.table_freshness` or at `/pipelines`.
+
+Adding a source touches all seven. The step-by-step list, marked by which steps a test
+catches and which fail silently, is [Adding a warehouse source](#adding-a-warehouse-source).
+
 ## Warehouse Schema Layout
 
 The warehouse is organized into four public layers that also sort alphabetically in that
@@ -60,6 +108,45 @@ function, and a stale unqualified copy silently returned zero rows for 16 days.
 keep their filenode, rebuilds the marts/search layer from code, and validates the result. It
 is deliberately not part of any `ensure_*` path: fresh provisioning only ever creates the
 target layout.
+
+## Timeline priority tiers
+
+Every `timeline.events` row carries a `priority`, classified per row at sync time by the
+adapter's own SQL and stored in the `timeline.timeline_priority` enum. It is the column an
+agent filters a timeline read by, and it is the reason "what happened today" does not open
+with a newsletter. The enum's declaration order **is** the sort order, most attention first:
+
+| tier | what it means | typical rows |
+| --- | --- | --- |
+| `self` | Zach initiated it | his sent mail and messages, his notes and voice memos, his agent sessions, his own calendar events |
+| `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, a mention |
+| `cc` | real-people activity he is peripheral to | cc'd mail, channel traffic, big group threads |
+| `noise` | bulk or automated traffic | newsletters, notifications, bots, channels he is not a member of |
+| `background` | the warehouse's own machinery | enrichment runs, mutation workers, per-turn agent-session rows |
+
+```sql
+SELECT event_ts, priority, source, actor, title, snippet
+FROM timeline.events
+WHERE priority IN ('self', 'direct', 'cc')
+  AND event_ts >= now() - interval '1 day'
+ORDER BY event_ts DESC LIMIT 100;
+```
+
+`unclassified` is the sixth label and is **not a tier** — it is a fail-loud sentinel for rows
+the sync has not classified yet. It must never appear in steady state; if a query returns
+`unclassified` rows, an adapter's classification did not run, and the answer to whatever was
+asked is wrong rather than merely incomplete. The tiers themselves are heuristics and are
+expected to be tuned; the sentinel is not.
+
+**Changing a high-volume adapter's classification SQL is not a cheap edit.** `priority` is
+part of the normalized content, so it participates in the content guard (`seq` bumps when it
+changes) and it is part of `adapter_signature` in `ops.timeline_sync_state`. Changing the SQL
+changes the signature, which resets that adapter's backfill and re-walks **every row it
+owns** — slack alone is 46.8M rows, and a past re-walk grew `timeline.events` to 93 GB before
+it settled. Batch the change with any other adapter edit you were going to make, expect the
+table to bloat while it runs, and plan the vacuum. A forgotten classification is the quieter
+failure: the engine wraps every adapter's expression in `COALESCE(..., 'cc')`, so a new
+adapter that never assigns a tier produces plausible-looking `cc` rows instead of an error.
 
 ## Timeline search and hybrid retrieval
 
@@ -169,6 +256,46 @@ ships in the warehouse postgres image; a host that predates it degrades (no embe
 column, no HNSW, no `search_hybrid`) until the DB container is rolled onto the current
 image.
 
+## Performance contract
+
+PDW is supposed to answer fast, and **before anyone optimizes further, confirm we are
+actually using the host.** This is C6, it is enforced by nothing, and it has already cost
+three incidents.
+
+**The budget hierarchy, innermost first.** Each layer's budget must sit *below* the next one
+out, so the innermost timer fires first and the failure carries a useful message:
+
+| budget | value | where |
+| --- | --- | --- |
+| Postgres statement timeout, per user query | 60s | `config.QueryTimeout` (`PDW_QUERY_TIMEOUT`), applied as `SET LOCAL statement_timeout` |
+| Python read-only runner | 30s | `postgres.py`, `-c statement_timeout=30000` on the read-only connection |
+| `pdw sql` client wait | 75s | `defaultSQLTimeout` — deliberately *above* the server budget |
+| Public edge cutoff | ~100s | Cloudflare in front of the app; not configurable from here |
+
+The ordering is the whole point. The CLI waits longer than the server so a slow query comes
+back as the server's SQL timeout error — which carries a rewrite hint — instead of a
+client-side abort that leaves the statement burning server-side and invites a blind retry.
+The incident that produced this table was the opposite arrangement: a 10s client wait, a
+~100s edge cutoff and a 300s server budget, so every slow query was abandoned by its caller
+while the database kept working on it. If you change one of these numbers, change it knowing
+which of the others it must stay under.
+
+**Saturate the host before optimizing.** Measured 2026-08-23: a warm identifier search burned
+3.9s on **one** core while the 28-vCPU box sat 90-96% idle and `parallel_workers_launched`
+came back **0**. An unparallelized plan on an idle 28-vCPU host is not a query that needs a
+cleverer algorithm; it is a query that has not been allowed to use the machine. Check
+`EXPLAIN (ANALYZE, BUFFERS)` for `Workers Launched`, and check the box's actual utilization,
+*before* reaching for a new index, a narrower scan, or a rewrite. The measured wins in the
+search layer came from exactly this discipline in reverse — the pooled two-partition BM25
+scan replaced eighteen serial per-source branches whose wall clock was the SUM of every
+branch (6.9s warm, 21.7s cold) with one index-ordered scan at 36ms.
+
+**Large rewrites are their own budget.** The `timeline.events` priority column change from
+`bigint` to the enum failed twice before it worked: the table is 43M rows and the rewrite
+drags every index with it. Dropping the indexes first and rebuilding them after brought it
+down to ~50 minutes and shrank the table from 63 GB to 45 GB. Assume any `ALTER TYPE` on a
+table that size is an outage-shaped operation and plan it as one.
+
 ## Pipeline Freshness and Health
 
 Every warehouse table also has to declare **which pipeline feeds it and how freshness is
@@ -210,6 +337,82 @@ Quick check without the UI:
 pdw sql -q "which pipelines are unhealthy" "SELECT pipeline, status, last_write_at, last_error
   FROM marts_ops.pipeline_health WHERE status NOT IN ('ok','manual') ORDER BY status"
 ```
+
+## Adding a warehouse source
+
+The only checklist that existed for years was the *photo-source* one further down, which is
+the specialized case. This is the general one: fifteen edits, in dependency order, each
+marked **ENFORCED** (a test fails if you skip it — the test is named so you can run it) or
+**SILENT** (nothing catches it; the source ships subtly wrong and stays that way until
+someone notices a gap in an answer).
+
+**Getting the data in**
+
+1. **The collector** — a client uploader under `src/personal_data_warehouse_<source>/`, or a
+   Dagster poller under `defs/`. **SILENT.**
+2. **The transport** — remote devices POST to the app's `/ingest/<source>/...` endpoints
+   (they must not hold the Drive credential); in-process Dagster clients may write Drive
+   directly. **SILENT.** See
+   [Client uploads via the app](#client-uploads-via-the-app-the-write-path-for-remote-devices).
+3. **The Dagster reader** — the `<source>_drive_inbox_sensor` + `<source>_drive_ingest` asset
+   that promotes inbox objects into the raw table, and its schedule/sensor wiring.
+   **SILENT.**
+
+**Making it a warehouse object**
+
+4. **Catalog entry** in `src/personal_data_warehouse/warehouse_catalog.json` — logical id,
+   layer, domain, physical schema/name, discoverability, query access. This is the *only*
+   place a new relation is declared. **ENFORCED**
+   (`test_fresh_database_object_inventory_matches_the_catalog`: a fresh database must contain
+   exactly the cataloged objects, and an unknown `@marker` raises instead of passing through).
+5. **Regenerate the Go mirror**: `uv run python scripts/generate_go_warehouse_catalog.py`.
+   **ENFORCED** (`test_go_catalog_is_generated_from_the_json_catalog`).
+6. **`TableSpec`** in `postgres.py` plus the `ensure_<source>_tables()` path that creates it.
+   **ENFORCED** (`test_every_postgres_table_spec_is_a_cataloged_table`, plus the fresh-database
+   inventory above).
+7. **Indexes** in `POSTGRES_INDEXES`, including one leading with the column the freshness
+   probe reads. **ENFORCED** for the freshness column
+   (`test_the_pipelines_data_tables_are_cheaply_probeable`: the collector refuses `max()` over
+   a large unindexed heap, so an unindexed new table reports no freshness at all).
+
+**Making it visible**
+
+8. **`TIMELINE_TABLE_COVERAGE`** — one entry per new table: `events`, `detail`, `entity`, or
+   `state`. **ENFORCED** (`test_every_registered_table_is_classified` and
+   `test_live_schema_has_no_unclassified_tables`, which checks the **live** schema).
+9. **`TABLE_PIPELINES` + a `Pipeline` in `PIPELINES`** — which pipeline feeds the table, its
+   role, its write column and its event-time column. **ENFORCED**
+   (`test_every_registered_table_has_a_pipeline` and
+   `test_pipeline_and_timeline_registries_cover_the_same_tables` — the two registries must
+   cover *exactly* the same tables).
+10. **Register a timeline adapter** in `TIMELINE_ADAPTERS`. **SILENT** — and this is the
+    biggest hole in C1. A table classified `detail`/`entity`/`state` legitimately has no
+    adapter, so nothing can tell "correctly not on the timeline" from "forgotten". If your
+    source has events, it needs an adapter, and only you will know.
+11. **The adapter's pagination contract** — `backfill_sql` pages newest-first by
+    `(event_ts, event_id)`, `incremental_sql` oldest-first by `(ingest_ts, event_id)`, both
+    returning exactly `TIMELINE_NORMALIZED_COLUMNS`, plus `max_ingest_sql`. **ENFORCED**
+    (`test_adapter_sql_carries_the_pagination_contract`).
+12. **Assign a priority tier** in the adapter's SELECT. **SILENT** — a missing classification
+    becomes `cc` via `COALESCE`, which looks like a decision. See
+    [Timeline priority tiers](#timeline-priority-tiers).
+13. **Seed the adapter in the end-to-end timeline tests** (`_seed_sources` +
+    `EXPECTED_SEEDED_EVENTS` in `tests/test_timeline.py`). **SILENT** — that test iterates the
+    *seed dictionary*, not the adapter registry, so an unseeded adapter is simply never
+    exercised and its SQL is never run against a real schema.
+14. **Add the `SEARCH_SOURCE_DEFS` token** in `postgres.py`. **ENFORCED** since 2026-08-23
+    (`tests/test_repo_contracts.py::test_every_timeline_adapter_has_a_search_source_token`).
+    It was silent before, and silent here means two things at once: the source cannot be
+    scoped with `sources => ARRAY[...]`, and it falls outside the low-volume BM25 partition,
+    so a broad search reaches its rows only by walking past millions of gmail/slack documents.
+15. **Document it** — a section in `AGENTS.md` and/or `README.md` with the SQL starting
+    points. **SILENT in substance, ENFORCED in accuracy**: nothing requires you to write the
+    section, but if you do, every `schema.relation` you name must exist
+    (`test_docs_only_name_relations_that_exist`) and may not be a pre-reorg name
+    (`test_no_module_names_a_pre_reorg_physical_relation`).
+
+Photo sources have five *additional* registry edits on top of this list — see
+[Adding a photo source](#adding-a-photo-source-google_photos-takeout-import-manual-imports-).
 
 ## Commit and Push Safety
 
@@ -1189,6 +1392,58 @@ first backfill), `CHATGPT_SESSION_KEY`, `CHATGPT_BASE_URL`. The **app** auto-exp
 starting points: `base_chatgpt.events` plus `marts_ai_conversations.events` /
 `marts_ai_conversations.sessions` filtered to `source = 'chatgpt'`, and `private.chatgpt_sessions`
 (credential) / `ops.chatgpt_conversation_sync` (per-conversation watermark).
+
+## WHOOP (health)
+
+Read-only OAuth sync against the WHOOP v2 API, running as the `whoop_sync` Dagster asset on
+`whoop_sync_every_five_minutes`. Six source-owned tables — `base_whoop.profiles`,
+`base_whoop.body_measurements`, `base_whoop.cycles`, `base_whoop.recoveries`,
+`base_whoop.sleeps`, `base_whoop.workouts` — plus `ops.whoop_sync_state` (per-collection
+watermark and status) and `private.whoop_oauth_tokens` (the credential). Cycles, recoveries,
+sleeps and workouts each get a timeline adapter; profile and body measurements stay source
+entities rather than repeated events.
+
+```sql
+SELECT start_at, strain, average_heart_rate FROM base_whoop.cycles ORDER BY start_at DESC LIMIT 30;
+SELECT start_at, sleep_performance_percentage FROM base_whoop.sleeps WHERE nap = 0 ORDER BY start_at DESC LIMIT 30;
+```
+
+**A cycle is not its start date.** It runs sleep-onset to next sleep-onset, so the day it
+reports is the day it is *awake* for: an onset at 11:12 PM Friday ending 12:07 AM Sunday is
+the **Saturday** cycle. The in-progress cycle stores `end_at = 1970-01-01T00:00Z` — the
+warehouse-wide "absent" sentinel, not NULL — so `ORDER BY end_at DESC` ranks the running
+cycle *oldest*; bound on `start_at` instead.
+
+**The credential rotates on every refresh, and that is the whole operational story.** WHOOP
+refresh tokens are single-use: a successful refresh invalidates the pair that produced it, so
+two concurrent refreshes have one winner and one permanently dead loser. Three production
+incidents in 2026-07/08 came from exactly that. The repaired design has one authority —
+`private.whoop_oauth_tokens` — and a `WHOOP_TOKEN_JSON_B64` env value may populate an *absent*
+row once and can never replace an existing one. Every credential mutation (bootstrap,
+scheduled refresh, direct CLI refresh, explicit reauthorization) takes the same Postgres
+advisory lock, and refresh additionally holds the account row lock from the provider call
+through the commit; a racer with the pre-rotation token waits and adopts the winner rather
+than spending a consumed token.
+
+A dead refresh token — the token endpoint answering 400/401/403, which no retry can clear —
+records `status = 'action_required'` for every collection, fails the first no-progress run,
+and then *skips* later ticks for that same rejected fingerprint so one dead credential cannot
+generate hundreds of identical red runs. It stays `attention` on `/pipelines` until a real
+success clears it, so an unchanged `action_required` row is an active incident, not a quiet
+pipeline:
+
+```bash
+pdw sql -q "is WHOOP authentication healthy" \
+  "SELECT pipeline, status, last_write_at, last_run_at, last_error
+   FROM marts_ops.pipeline_health WHERE pipeline = 'whoop'"
+```
+
+Repair it by re-running the OAuth flow from a terminal with production database access:
+`uv run personal-data-warehouse-whoop-auth --install` (add `--manual --no-browser` when the
+browser is on another machine). The next tick sees the new fingerprint and self-heals with no
+deployment restart. Never paste the callback URL, authorization code, or token into chat,
+logs, or a commit. Full runbook, including the cross-host reverse-tunnel procedure:
+[`docs/whoop-oauth-operations.md`](docs/whoop-oauth-operations.md).
 
 ## Plaid Finance
 
