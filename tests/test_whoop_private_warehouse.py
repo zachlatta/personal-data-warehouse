@@ -13,6 +13,7 @@ Two halves, deliberately:
 
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -769,3 +770,41 @@ def _publish(warehouse: PostgresWarehouse, refresh_token: str, access_token: str
         published_at=datetime(2026, 8, 23, 12, tzinfo=UTC),
         updated_at=datetime(2026, 8, 23, 12, tzinfo=UTC),
     )
+
+
+def test_a_changed_partial_index_definition_is_rebuilt_not_left_stale(warehouse):
+    """A stale bm25 predicate takes down broad search, so it must self-heal.
+
+    `CREATE INDEX IF NOT EXISTS` cannot express "the WHERE clause moved". When
+    the whoop_private adapter joined the low-volume list, production kept the
+    18-adapter index it was born with; the search layer pins that index by name
+    and vchord-bm25 raised as soon as the query mentioned the 19th adapter,
+    which broke EVERY broad search until the index was rebuilt by hand.
+    """
+    from personal_data_warehouse.postgres import IndexSpec, PostgresWarehouse
+
+    spec = IndexSpec(
+        name="pdw_drift_probe_idx",
+        table="whoop_private_journal_entries",
+        sql="CREATE INDEX IF NOT EXISTS pdw_drift_probe_idx ON @whoop_private_journal_entries (day)",
+        rebuild_on_definition_change=True,
+    )
+    changed = replace(spec, sql=spec.sql + " WHERE question_id <> ''")
+
+    first = PostgresWarehouse.index_definition_fingerprint(spec)
+    second = PostgresWarehouse.index_definition_fingerprint(changed)
+
+    assert first != second, "a changed predicate must change the fingerprint"
+    # Whitespace alone is not a definition change; it must not trigger rebuilds.
+    assert PostgresWarehouse.index_definition_fingerprint(
+        replace(spec, sql=spec.sql.replace(" ", "  "))
+    ) == first
+
+
+def test_indexes_not_opted_in_are_never_rebuilt(warehouse):
+    """Rebuilds are expensive; only indexes that ask for it are checked."""
+    from personal_data_warehouse.postgres import IndexSpec
+
+    plain = IndexSpec(name="x_idx", table="whoop_private_sports", sql="CREATE INDEX x_idx ON @whoop_private_sports (name)")
+
+    assert warehouse._index_definition_drifted(plain) is False

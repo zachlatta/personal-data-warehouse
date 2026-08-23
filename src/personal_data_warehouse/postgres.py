@@ -449,6 +449,17 @@ class IndexSpec:
     requires_pg_trgm: bool = False
     requires_pg_textsearch: bool = False
     requires_pgvector: bool = False
+    #: Rebuild this index when its DEFINITION changes, not merely when it is
+    #: absent. `CREATE INDEX IF NOT EXISTS` cannot express "the predicate moved",
+    #: so a partial index whose WHERE clause is derived from code silently keeps
+    #: the predicate it was born with. That is not cosmetic for the bm25 search
+    #: indexes: the search layer pins an index BY NAME and vchord-bm25 raises if
+    #: the planner picks a different one, so a partial index that no longer
+    #: covers its adapter list takes DOWN broad search. That is exactly what
+    #: happened in production on 2026-08-23 when a new timeline adapter joined
+    #: the low-volume list. Opting in stamps the definition's fingerprint on the
+    #: index as a comment and rebuilds when it drifts.
+    rebuild_on_definition_change: bool = False
 
 
 POSTGRES_TABLES: dict[str, TableSpec] = {
@@ -1482,6 +1493,9 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "ON @timeline_events USING bm25 (search_text) WITH (text_config='english') "
         f"WHERE adapter IN ({SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL})",
         requires_pg_textsearch=True,
+        # The adapter list above grows whenever a low-volume timeline adapter is
+        # added, and a stale predicate breaks broad search outright.
+        rebuild_on_definition_change=True,
     ),
     IndexSpec(
         "timeline_events_search_text_trgm_idx",
@@ -5724,6 +5738,21 @@ class PostgresWarehouse:
                 continue
             try:
                 if self._index_exists(index.name):
+                    if not self._index_definition_drifted(index):
+                        self._ensured_index_names.add(index.name)
+                        continue
+                    # Rebuild atomically: DROP and CREATE go to the server as one
+                    # command string, so concurrent readers block on the lock
+                    # instead of meeting a window where the pinned index name
+                    # does not exist.
+                    self._command(
+                        "DROP INDEX "
+                        + _identifier(index.name)
+                        + "; "
+                        + self._expanded_index_sql(index)
+                        + "; "
+                        + self._index_fingerprint_comment_sql(index)
+                    )
                     self._ensured_index_names.add(index.name)
                     continue
                 self._drop_invalid_index(index.name)
@@ -5749,6 +5778,8 @@ class PostgresWarehouse:
                     # integration tests isolated from those global snapshots.
                     index_sql = index_sql.replace("CREATE INDEX CONCURRENTLY", "CREATE INDEX", 1)
                 self._command(index_sql)
+                if index.rebuild_on_definition_change:
+                    self._command(self._index_fingerprint_comment_sql(index))
                 self._ensured_index_names.add(index.name)
             except Exception:
                 # Tests often create only a subset of tables. Missing-table index failures
@@ -5762,6 +5793,38 @@ class PostgresWarehouse:
                     self._command(f"DROP INDEX CONCURRENTLY IF EXISTS {_identifier(obsolete_name)}")
             except Exception:
                 pass
+
+    @staticmethod
+    def index_definition_fingerprint(index: IndexSpec) -> str:
+        """A stable short hash of the index's declared SQL."""
+        return hashlib.sha256(" ".join(index.sql.split()).encode("utf-8")).hexdigest()[:16]
+
+    def _index_fingerprint_comment_sql(self, index: IndexSpec) -> str:
+        marker = f"pdw-index-def:{self.index_definition_fingerprint(index)}"
+        return f"COMMENT ON INDEX {_identifier(index.name)} IS '{marker}'"
+
+    def _expanded_index_sql(self, index: IndexSpec) -> str:
+        sql = index.sql.replace("CREATE INDEX CONCURRENTLY", "CREATE INDEX", 1)
+        return sql.replace("IF NOT EXISTS ", "", 1)
+
+    def _index_definition_drifted(self, index: IndexSpec) -> bool:
+        """True when the live index was built from a different definition.
+
+        Only indexes that opt in are checked; for everything else an existing
+        index is accepted as-is, which is the historical behaviour.
+        """
+        if not index.rebuild_on_definition_change:
+            return False
+        expected = f"pdw-index-def:{self.index_definition_fingerprint(index)}"
+        rows = self._query(
+            "SELECT obj_description(c.oid, 'pg_class') FROM pg_class c "
+            "INNER JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname = %s AND n.nspname = ANY(%s) AND c.relkind = 'i' LIMIT 1",
+            (index.name, self.physical_schema_names(include_hidden=True)),
+        )
+        if not rows:
+            return False
+        return (rows[0][0] or "") != expected
 
     def _drop_invalid_index(self, index_name: str) -> None:
         """Clear a failed CREATE INDEX CONCURRENTLY leftover so it can be rebuilt.
