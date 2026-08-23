@@ -161,6 +161,19 @@ class TimelineAdapter:
     # his answer to an email promotes the thread) converge through this window
     # instead of freezing at first-ingest values.
     refresh_hours: float = 0.0
+    # Opt-in orphan prune. A SELECT returning the adapter's authoritative
+    # CURRENT set of event_ids (one text column). Timeline rows for this
+    # adapter whose event_id is absent from that set are deleted.
+    #
+    # Opt-in, never global: an adapter over an append-only source must NEVER
+    # prune, because a bounded incremental query legitimately does not return
+    # rows it already synced -- pruning on that basis would delete history.
+    # Only a RECONCILED derived source, one that is rebuilt each run and can
+    # state its full current key set cheaply, may set this. Measured
+    # 2026-08-23, derived_finance.transactions had been re-deduplicated and
+    # re-keyed repeatedly, leaving 4,944 orphaned timeline rows (25.6%) that
+    # search still returned alongside their live replacements.
+    prune_sql: str = ""
 
 
 def _real_ts(*exprs: str) -> str:
@@ -194,6 +207,7 @@ def _simple_adapter(
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE,
     max_incremental_batches_per_run: int = 0,
     refresh_hours: float = 0.0,
+    prune_sql: str = "",
 ) -> TimelineAdapter:
     if search_text is None:
         search_text = _search_concat(title, snippet, context, actor)
@@ -274,6 +288,7 @@ def _simple_adapter(
         batch_size=batch_size,
         max_incremental_batches_per_run=max_incremental_batches_per_run,
         refresh_hours=refresh_hours,
+        prune_sql=prune_sql,
     )
 
 
@@ -1720,6 +1735,13 @@ _FINANCE_TRANSACTION = _simple_adapter(
     event_id="t.transaction_id",
     event_ts="t.posted_at",
     ingest_ts="to_timestamp(t.sync_version / 1000000.0)",
+    # derived_finance.transactions is reconciled against its sources every run
+    # and re-keys transaction_id when the cross-source dedup changes its mind,
+    # so superseded timeline rows accumulate with no upstream row left to
+    # correct them. Measured 2026-08-23: 19,316 timeline rows against 14,372
+    # live transactions -- 4,944 orphans (25.6%) that search still returned
+    # next to their live replacements.
+    prune_sql="SELECT t.transaction_id FROM @finance_transactions t",
     actor="COALESCE(NULLIF(t.merchant, ''), t.description)",
     title="COALESCE(NULLIF(t.merchant, ''), NULLIF(t.description, ''), 'Transaction')",
     snippet="concat(t.amount::text, ' ', t.currency)",
@@ -2430,6 +2452,7 @@ class AdapterSyncStats:
     backfill_rows: int = 0
     incremental_rows: int = 0
     refreshed_rows: int = 0
+    pruned_rows: int = 0
     backfill_done: bool = False
     error: str = ""
 
@@ -2791,6 +2814,64 @@ class TimelineSyncEngine:
         self._bump_counter(adapter, "backfill_rows", len(rows))
         return len(rows)
 
+    # A prune that runs away is far worse than the orphans it removes: the
+    # sync engine has no undo and timeline.events is the read surface for every
+    # agent. Refuse rather than delete when the proposed deletion is a large
+    # share of the adapter's rows -- that shape means the authoritative query
+    # returned a partial answer (a mid-rebuild derived table, a failed join),
+    # not that history genuinely disappeared.
+    PRUNE_MAX_FRACTION = 0.10
+    PRUNE_MIN_KEEP = 50
+
+    def _run_prune(self, adapter: TimelineAdapter) -> int:
+        """Delete timeline rows whose source row no longer exists.
+
+        The authoritative key set comes from the SOURCE database and the rows
+        live in the DEST, which may be a different connection, so the live set
+        is materialized rather than joined. That is affordable only because
+        this is opt-in for reconciled derived sources, which are small.
+        """
+        live_ids = [row[0] for row in self._fetch(adapter.prune_sql, {})]
+        events = self._qualified_regclass("timeline_events", namespace=self._dest_schema)
+        with self._dest_conn.cursor() as cursor:
+            cursor.execute(f"SELECT count(*) FROM {events} WHERE adapter = %s", (adapter.name,))
+            total = int(cursor.fetchone()[0])
+            if total == 0:
+                return 0
+            if not live_ids:
+                # An empty authoritative set is indistinguishable from a broken
+                # query, and deleting every row of an adapter is exactly the
+                # runaway this guard exists for.
+                logger.error(
+                    "timeline prune refused for %s: the authoritative query returned no rows",
+                    adapter.name,
+                )
+                return 0
+            cursor.execute(
+                f"SELECT count(*) FROM {events} WHERE adapter = %s AND NOT (event_id = ANY(%s))",
+                (adapter.name, live_ids),
+            )
+            doomed = int(cursor.fetchone()[0])
+            if doomed == 0:
+                return 0
+            if total - doomed < self.PRUNE_MIN_KEEP or doomed > total * self.PRUNE_MAX_FRACTION:
+                logger.error(
+                    "timeline prune refused for %s: %s of %s rows would be deleted "
+                    "(cap %.0f%%); the authoritative query is probably incomplete",
+                    adapter.name,
+                    doomed,
+                    total,
+                    self.PRUNE_MAX_FRACTION * 100,
+                )
+                return 0
+            cursor.execute(
+                f"DELETE FROM {events} WHERE adapter = %s AND NOT (event_id = ANY(%s))",
+                (adapter.name, live_ids),
+            )
+            deleted = cursor.rowcount
+        logger.info("timeline prune removed %s orphaned rows for %s", deleted, adapter.name)
+        return deleted
+
     def run(self, *, max_seconds: float | None = None) -> list[AdapterSyncStats]:
         self._connect()
         deadline = time.monotonic() + max_seconds if max_seconds else None
@@ -2812,6 +2893,8 @@ class TimelineSyncEngine:
                 stats[adapter.name].incremental_rows = self._run_incremental(adapter, state, deadline)
                 if adapter.refresh_hours > 0 and state.backfill_done:
                     stats[adapter.name].refreshed_rows = self._run_refresh(adapter, deadline)
+                if adapter.prune_sql and state.backfill_done:
+                    stats[adapter.name].pruned_rows = self._run_prune(adapter)
                 stats[adapter.name].backfill_done = state.backfill_done
             except Exception as exc:  # noqa: BLE001 - keep other adapters running
                 logger.exception("timeline incremental sync failed for %s", adapter.name)

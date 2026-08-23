@@ -2145,3 +2145,85 @@ def test_engine_reports_failures_loudly_but_keeps_going(warehouse):
     assert stats["broken"].error
     assert stats["gmail_email"].backfill_rows == 1
     assert not stats["gmail_email"].error
+
+
+def test_prune_removes_orphans_but_never_touches_an_append_only_adapter(warehouse):
+    """A reconciled source re-keys its rows; the timeline must follow it down.
+
+    derived_finance.transactions is rebuilt and re-deduplicated every run, so a
+    transaction_id it stops issuing leaves a timeline row nothing upstream can
+    correct. Measured in production 2026-08-23: 19,316 finance_transaction rows
+    against 14,372 live transactions, 4,944 orphans (25.6%) that search
+    returned alongside their live replacements.
+
+    The same pass must be inert for append-only adapters, whose bounded
+    incremental queries legitimately do not re-return rows they already synced.
+    """
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    # The prune refuses to delete a large share of an adapter, so a two-row
+    # fixture can only ever exercise the guard. Seed a realistic population so
+    # a single orphan is the small minority the cap is designed to allow.
+    for i in range(200):
+        warehouse._command(
+            """
+            INSERT INTO @finance_transactions (transaction_id, account_id, posted_at, amount,
+                                              currency, description, merchant, pending, source,
+                                              created_at, sync_version)
+            VALUES (%s, 'fa1', %s, -1.00, 'USD', 'Bulk', 'Bulk', 0, 'plaid', %s, %s)
+            """,
+            (f"ft-bulk-{i}", _NOW - timedelta(hours=20), _NOW, 1),
+        )
+    engine = _engine(warehouse)
+    engine.run()
+
+    def _timeline_ids(adapter: str) -> set[str]:
+        rows = warehouse._query(
+            "SELECT event_id FROM @timeline_events WHERE adapter = %s", (adapter,)
+        )
+        return {row[0] for row in rows}
+
+    assert "ft1" in _timeline_ids("finance_transaction")
+    slack_before = _timeline_ids("slack_message")
+    assert slack_before, "fixture must produce slack rows for the append-only half"
+
+    # Re-key the transaction the way a re-dedup does: the old id is simply
+    # gone, and nothing upstream will ever mention it again.
+    warehouse._command(
+        "UPDATE @finance_transactions SET transaction_id = 'ft1-rekeyed' "
+        "WHERE transaction_id = 'ft1'"
+    )
+    _engine(warehouse).run()
+
+    finance_after = _timeline_ids("finance_transaction")
+    assert "ft1" not in finance_after, "the orphaned row survived the prune"
+    assert "ft1-rekeyed" in finance_after, "the live replacement was not synced"
+    assert _timeline_ids("slack_message") == slack_before, (
+        "an append-only adapter must never lose rows to the prune pass"
+    )
+
+
+def test_prune_refuses_rather_than_empty_an_adapter(warehouse):
+    """A runaway prune is worse than the orphans it removes; there is no undo.
+
+    An authoritative query that returns nothing looks identical to one that is
+    broken, mid-rebuild, or joined wrong. Refuse loudly instead of deleting.
+    """
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    engine = _engine(warehouse)
+    engine.run()
+    before = warehouse._query(
+        "SELECT count(*) FROM @timeline_events WHERE adapter = 'finance_transaction'"
+    )[0][0]
+    assert before > 0
+
+    warehouse._command("DELETE FROM @finance_transactions")
+    _engine(warehouse).run()
+
+    after = warehouse._query(
+        "SELECT count(*) FROM @timeline_events WHERE adapter = 'finance_transaction'"
+    )[0][0]
+    assert after == before, (
+        "an empty authoritative set must refuse the prune, not delete every row"
+    )
