@@ -100,7 +100,7 @@ per-source floor more to promote, up to a point where latency grows and scores d
   at most `SEARCH_HYBRID_EXACT_MAX_WORDS` words — literal substring. The literal leg is
   what makes identifier-shaped questions work ("admin/api-keys", a Drive file id, a
   person's name), where BM25 tokenization and embeddings both fail: adding it took the
-  labeled benchmark from MRR 0.292 to 0.383 and answered three queries that previously
+  labeled benchmark from MRR 0.292 to 0.403 and answered three queries that previously
   had nothing in the top 50. It stays gated because it costs seconds (its trigram recheck
   detoasts multi-megabyte documents) and ungated it scored *worse*. Hybrid falls
   back to keyword with an explicit `fallback_reason` when embeddings or pgvector are

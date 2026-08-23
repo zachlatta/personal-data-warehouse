@@ -298,7 +298,7 @@ SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.1
 # person's name) are exactly where BM25 tokenization and embeddings both fail
 # and literal matching wins: on the labeled benchmark the exact MODE scores MRR
 # 0.518 on that stratum against hybrid's 0.245. Folding it in as a third fused
-# leg took hybrid from MRR 0.292 to 0.383, hit@5 12 -> 15, and answered three
+# leg took hybrid from MRR 0.292 to 0.403, hit@5 12 -> 15, and answered three
 # queries that previously had nothing in the top 50.
 #
 # It is gated on query length because it is not free: the leg costs seconds
