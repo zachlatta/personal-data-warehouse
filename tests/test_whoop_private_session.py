@@ -110,3 +110,16 @@ def test_the_fingerprint_tracks_the_refresh_token(monkeypatch) -> None:
     second = capture_whoop_session(now=NOW).fingerprint()
 
     assert first != second
+
+
+def test_publish_uses_the_real_ingest_client_factory() -> None:
+    """`--dry-run` never constructs the client, so nothing caught a bad factory.
+
+    The first real publish failed with AttributeError because the CLI called
+    `IngestClient.from_env()`, which does not exist -- the module-level factory
+    is `ingest_client_from_env`. This asserts the name the CLI actually binds.
+    """
+    from personal_data_warehouse import whoop_private_setup
+
+    assert hasattr(whoop_private_setup, "ingest_client_from_env")
+    assert callable(whoop_private_setup.ingest_client_from_env)

@@ -19,7 +19,7 @@ import json
 import sys
 
 from personal_data_warehouse.config import load_settings
-from personal_data_warehouse.ingest_client import IngestClient
+from personal_data_warehouse.ingest_client import ingest_client_from_env
 from personal_data_warehouse.whoop_private_session import (
     WhoopSessionCaptureError,
     capture_whoop_session,
@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     account = _resolve_account(args.account)
-    client = IngestClient.from_env()
+    client = ingest_client_from_env()
     ack = client.publish_whoop_private_session(
         account=account,
         access_token=captured.access_token,
