@@ -143,6 +143,21 @@ func TestServerInstructionsCarryDiscoveryKeywords(t *testing.T) {
 	}
 }
 
+func TestServerInstructionsTellAgentsToSearchBeforeSchemaDiscovery(t *testing.T) {
+	for _, want := range []string{"text, topic, person", "search first", "no schema discovery", "timeline.context"} {
+		if !strings.Contains(strings.ToLower(serverInstructions), strings.ToLower(want)) {
+			t.Fatalf("serverInstructions missing %q: %s", want, serverInstructions)
+		}
+	}
+}
+
+func TestSearchToolIsAvailableToMCPAndCLI(t *testing.T) {
+	tool := searchTool(query.NewService(fakeRunner{}, query.Options{}))
+	if !tool.Surfaces().ShowsOnMCP() || !tool.Surfaces().ShowsOnCLI() {
+		t.Fatalf("search surfaces = %v; want MCP and CLI", tool.Surfaces())
+	}
+}
+
 func TestMCPServerRegistersMutationProposalToolsWhenConfigured(t *testing.T) {
 	runner := fakeRunner{results: map[string]query.RawResult{}}
 	mutationSvc := mutations.NewService(fakeMutationStore{request: mutations.Request{

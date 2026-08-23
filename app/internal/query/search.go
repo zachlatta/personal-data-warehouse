@@ -16,7 +16,23 @@ const (
 	SearchModeExact   = "exact"
 )
 
-const searchDefaultMaxResults = 50
+// Twenty keeps the default MCP response small enough for an agent to inspect
+// in full. Callers doing recall work can still request up to the SQL-side cap.
+// The earlier default of 50 routinely produced tens of thousands of output
+// tokens, so agents piped the response through ad-hoc Python or `head` and lost
+// the metadata and lower-ranked hits anyway.
+const searchDefaultMaxResults = 20
+
+const (
+	searchHitGuidance = "For a chat/channel or agent-turn hit, read neighboring events with " +
+		"timeline.context(ref, 5, 5). If the hit is still insufficient, use source_table and " +
+		"source_pk for a one-hop drill-down to the authoritative row; raise max_results explicitly " +
+		"only when you need more recall."
+	searchEmptyGuidance = "No hits is not proof of absence. Retry once with fewer terms or the " +
+		"vocabulary the answering record would contain; use mode exact for an identifier or literal " +
+		"phrase, widen sources/since if scoped, or raise max_results for more recall. Do not fall " +
+		"back to ILIKE over raw body columns."
+)
 
 // searchPhrasingHint is advice for the caller's NEXT search, not an error. The
 // caller here is itself a language model, which is why query rewriting lives in
@@ -123,6 +139,7 @@ type SearchResponse struct {
 	Mode           string            `json:"mode"`
 	FallbackReason string            `json:"fallback_reason,omitempty"`
 	Hint           string            `json:"hint,omitempty"`
+	Guidance       string            `json:"guidance,omitempty"`
 	TotalRows      int               `json:"total_rows"`
 	ColumnNames    []string          `json:"column_names,omitempty"`
 	Rows           any               `json:"rows,omitempty"`
@@ -212,6 +229,11 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	}
 	resp.ColumnNames = append([]string(nil), raw.Columns...)
 	resp.TotalRows = len(raw.Rows)
+	if resp.TotalRows == 0 {
+		resp.Guidance = searchEmptyGuidance
+	} else {
+		resp.Guidance = searchHitGuidance
+	}
 	resp.Rows, resp.Truncations, err = s.formatRows(raw.Columns, raw.Rows, 0, len(raw.Rows), "json")
 	if err != nil {
 		resp.Error = err.Error()

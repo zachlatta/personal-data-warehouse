@@ -90,6 +90,12 @@ func TestSearchKeywordModeRunsSearchText(t *testing.T) {
 	}
 }
 
+func TestSearchDefaultResultCountBoundsLLMOutput(t *testing.T) {
+	if searchDefaultMaxResults != 20 {
+		t.Fatalf("default max_results = %d, want 20", searchDefaultMaxResults)
+	}
+}
+
 func TestSearchExactModeRunsSearchTextExact(t *testing.T) {
 	runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchExactSQL: searchHit()}}
 	svc := NewService(runner, Options{})
@@ -334,6 +340,22 @@ func TestSearchTruncatesLongFieldsLikeQueryResults(t *testing.T) {
 	}
 	if len(resp.Truncations) != 1 || resp.Truncations[0].Total != 50 || resp.Truncations[0].Returned != 10 {
 		t.Fatalf("truncations = %#v", resp.Truncations)
+	}
+}
+
+func TestSearchResponseGuidesTheNextStep(t *testing.T) {
+	withHit := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: searchHit()}}
+	resp := NewService(withHit, Options{}).Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword"})
+	if !strings.Contains(resp.Guidance, "timeline.context") || !strings.Contains(resp.Guidance, "source_table") {
+		t.Fatalf("hit guidance is not actionable: %q", resp.Guidance)
+	}
+
+	withoutHit := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: {}}}
+	resp = NewService(withoutHit, Options{}).Search(context.Background(), SearchRequest{Query: "missing", Mode: "keyword"})
+	for _, want := range []string{"not proof of absence", "exact", "ILIKE"} {
+		if !strings.Contains(resp.Guidance, want) {
+			t.Fatalf("zero-result guidance missing %q: %q", want, resp.Guidance)
+		}
 	}
 }
 

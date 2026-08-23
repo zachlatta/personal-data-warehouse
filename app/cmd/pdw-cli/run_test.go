@@ -599,6 +599,24 @@ func TestCallServerErrorReturnsNonZeroAndStructuredMessage(t *testing.T) {
 	}
 }
 
+func TestCallTopLevelSoftErrorReturnsNonZero(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		// The HTTP tool surface deliberately returns domain errors as 200 so it
+		// matches MCP. The CLI must still provide truthful process semantics.
+		_, _ = io.WriteString(w, `{"data":{"query":"kernel magazine","mode":"hybrid","total_rows":0,"error":"ERROR: canceling statement due to statement timeout (SQLSTATE 57014)"}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "call", "get_rows", "--data", `{"query_id":"q"}`)
+	if code == 0 {
+		t.Fatalf("soft tool error must fail; stdout=%s", out)
+	}
+	if out != "" {
+		t.Fatalf("error-shaped data must not be printed as successful JSON: %s", out)
+	}
+	if !strings.Contains(errOut, "statement timeout") {
+		t.Fatalf("stderr missing domain error: %s", errOut)
+	}
+}
+
 func TestCallRedirectsSQLToolsToSQLCommand(t *testing.T) {
 	for _, name := range []string{"sql", "query"} {
 		srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
@@ -611,6 +629,96 @@ func TestCallRedirectsSQLToolsToSQLCommand(t *testing.T) {
 		if !strings.Contains(errOut, "pdw sql") {
 			t.Fatalf("call %s should redirect to the sql command, got: %s", name, errOut)
 		}
+	}
+}
+
+func TestCallRedirectsSearchToSearchCommand(t *testing.T) {
+	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be hit through the legacy call syntax")
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "call", "search", "--data", `{"query":"offer letter"}`)
+	if code == 0 {
+		t.Fatal("legacy call search syntax should redirect")
+	}
+	for _, want := range []string{"pdw search", "--source", "--mode exact"} {
+		if !strings.Contains(errOut, want) {
+			t.Fatalf("search redirect missing %q:\n%s", want, errOut)
+		}
+	}
+}
+
+func TestSearchCommandBuildsToolInputWithoutJSONQuoting(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"query":"budget approval","mode":"hybrid","total_rows":1,"rows":[{"source":"slack","occurred_at":"2026-08-20T12:00:00Z","who":"sender","title":"Budget","text":"The budget was approved.","ref":"slack_message:abc"}]}}`)
+	})
+	// Flags may appear after the query, matching common shell/agent usage.
+	out, errOut, code := runCLI(t, srv.URL, "", "search", "budget", "approval", "--mode", "hybrid", "--max-results", "7", "--source", "slack,gmail", "--since", "2026-08-01")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	if srv.lastPath != "/api/tools/search" || srv.lastMethod != http.MethodPost {
+		t.Fatalf("server got %s %s", srv.lastMethod, srv.lastPath)
+	}
+	var input struct {
+		Query      string   `json:"query"`
+		Mode       string   `json:"mode"`
+		MaxResults int      `json:"max_results"`
+		Sources    []string `json:"sources"`
+		Since      string   `json:"since"`
+	}
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if input.Query != "budget approval" || input.Mode != "hybrid" || input.MaxResults != 7 || input.Since != "2026-08-01" {
+		t.Fatalf("input = %#v", input)
+	}
+	if fmt.Sprint(input.Sources) != "[slack gmail]" {
+		t.Fatalf("sources = %#v", input.Sources)
+	}
+	for _, want := range []string{"1 result", "slack", "sender", "The budget was approved.", "slack_message:abc"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("text output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestSearchCommandJSONOutputIsClean(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"query":"admin/api-keys","mode":"exact","total_rows":0,"guidance":"Try widening the scope."}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "search", "--output", "json", "--mode", "exact", "admin/api-keys")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not clean JSON: %v\n%s", err, out)
+	}
+	if got["query"] != "admin/api-keys" || got["mode"] != "exact" {
+		t.Fatalf("output = %#v", got)
+	}
+}
+
+func TestSearchCommandReturnsNonZeroOnToolError(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"query":"kernel magazine","mode":"hybrid","total_rows":0,"error":"ERROR: canceling statement due to statement timeout (SQLSTATE 57014)"}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "search", "kernel", "magazine")
+	if code == 0 {
+		t.Fatalf("search error must fail; stdout=%s", out)
+	}
+	if !strings.Contains(errOut, "statement timeout") {
+		t.Fatalf("stderr missing search error: %s", errOut)
+	}
+}
+
+func TestSearchCommandRejectsMissingQuery(t *testing.T) {
+	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be hit")
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "search", "--mode", "hybrid")
+	if code == 0 || !strings.Contains(errOut, "query") {
+		t.Fatalf("code=%d stderr=%s", code, errOut)
 	}
 }
 

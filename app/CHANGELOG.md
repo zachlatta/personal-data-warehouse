@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New: `pdw search [flags] QUERY...` provides first-class hybrid CLI search using the same implementation as the MCP `search` tool, with compact text output and clean `--output json`. MCP now directs text lookups to search before schema discovery, the default response is bounded to 20 hits, and responses include explicit zero-result/drill-down guidance. Generic CLI `call` also exits non-zero when a tool returns a top-level soft error instead of printing an error-shaped success.
 - Breaking: `get_object` now returns a signed, time-limited `download_url` (plus `expires_at`) instead of inline `content_base64`/`content_omitted`. The link is served by a new unauthenticated-but-HMAC-verified `GET /objects/{storage_file_id}?exp=...&sig=...` endpoint, so it can be opened straight from a chat or browser. Link lifetime is `PDW_OBJECT_URL_TTL` (default 1h); `PDW_OBJECT_STORE_MAX_OBJECT_BYTES` now caps what the endpoint will serve (default raised 5MB → 100MB).
 - Breaking: every client must now identify itself with a name that gets logged on every request, so it's possible to tell connectors apart (claude vs. codex vs. hermes, etc.).
   - HTTP API: `Authorization: Bearer <client_name>:<PDW_SECRET_TOKEN>`. A bare `Bearer <token>` is rejected with 401.

@@ -2,7 +2,7 @@
   "additionalProperties": false,
   "properties": {
     "max_results": {
-      "description": "maximum hits to return, default 50",
+      "description": "maximum hits to return, default 20; request more only for recall work",
       "type": "integer"
     },
     "mode": {

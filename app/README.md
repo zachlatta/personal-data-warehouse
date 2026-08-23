@@ -302,7 +302,11 @@ unified timeline document. Raw message/body columns are deliberately not text-in
   configured or `search_hybrid` is not installed (no pgvector), it automatically falls back to
   keyword search and reports a `fallback_reason`. Modes `keyword` and `exact` force
   `timeline.search_text` / `timeline.search_text_exact` directly. Takes
-  `query`, `max_results` (default 50), `sources`, `since`, and `mode`.
+  `query`, `max_results` (default 20; raise it explicitly for recall work), `sources`, `since`, and `mode`.
+  The first-class CLI uses this same tool without JSON quoting: `pdw search --source
+  gmail,slack 'offer letter'`. It prints a compact hit list by default; `--output json` returns
+  the full machine-readable response. SQL-native workflows can still call
+  `timeline.search_text`, `timeline.search_text_exact`, and `timeline.context` through `pdw sql`.
 
 ### `query`
 

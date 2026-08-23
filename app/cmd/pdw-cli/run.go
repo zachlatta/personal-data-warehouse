@@ -44,6 +44,13 @@ COMMANDS
                              "call sql" / "call query".
                                --data JSON   Inline JSON input
                                              (aliases: --args, --input, --json).
+  search [flags] QUERY...     Hybrid search across every synced source. This is
+                             the normal CLI search path; no JSON or SQL required.
+                               --mode MODE       hybrid (default), keyword, or exact
+                               -n, --max-results N  Maximum hits (default 20)
+                               --source NAMES    Source aliases, comma-separated; repeatable
+                               --since TIME      Lower event-time bound (e.g. 2026-08-01)
+                               --output FMT      text (default) or json
   sql [--output FMT] [-q QUESTION] [--file PATH] [--no-timeout] [SQL]
                              The one way to run read-only SQL. The SQL is the
                              single positional argument; it may instead be read
@@ -107,8 +114,15 @@ EXAMPLES
   pdw login                          # one-time setup; persists URL + token
   pdw list
   pdw describe sql
+  pdw search 'runway burn rate months cash remaining'
+  pdw search --source gmail,slack --since 2026-08-01 'budget approval'
+  pdw search --mode exact --output json 'admin/api-keys'
   pdw call schema_overview
   pdw columns base_gmail.messages         # every column + type, before writing SQL
+  pdw sql -q 'Search for an offer letter' \
+    "SELECT * FROM timeline.search_text('offer letter', 20)"
+  pdw sql -q 'Find every literal API-key path' \
+    "SELECT * FROM timeline.search_text_exact('admin/api-keys', 20)"
   pdw sql 'SELECT 1'
   pdw sql -q 'How many rows?' 'SELECT count(*) FROM base_gmail.messages'
   pdw sql --output json -q 'What time is it?' 'SELECT now()'
@@ -228,6 +242,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		return runDescribe(client, rest, stdout, stderr)
 	case "call":
 		return runCall(client, rest, stdin, stdout, stderr)
+	case "search":
+		return runSearch(client, rest, stdout, stderr)
 	case "sql":
 		return runSQL(client, rest, stdin, stdout, stderr)
 	case "columns":
@@ -689,6 +705,13 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		fmt.Fprintln(stderr, "This avoids JSON/shell quoting; `call` is only for non-SQL tools.")
 		return 2
 	}
+	if name == "search" {
+		fmt.Fprintln(stderr, "pdw call: use the first-class search command instead of JSON:")
+		fmt.Fprintln(stderr, "  pdw search '<terms>'")
+		fmt.Fprintln(stderr, "  pdw search --source gmail,slack --since 2026-08-01 '<terms>'")
+		fmt.Fprintln(stderr, "  pdw search --mode exact --output json '<literal>'")
+		return 2
+	}
 	fs := flag.NewFlagSet("call", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	data := fs.String("data", "", "inline JSON request body")
@@ -735,6 +758,15 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		fmt.Fprintln(stderr, "pdw call:", err)
 		return 1
 	}
+	// The HTTP tool API returns domain-level errors as 200 with data so it can
+	// preserve partial-result semantics and match MCP. A top-level error string,
+	// however, means this individual call failed. Reflect that in the process
+	// exit status instead of making shell agents treat an error-shaped response
+	// as success (notably search statement timeouts).
+	if message := topLevelToolError(out); message != "" {
+		fmt.Fprintln(stderr, "pdw call:", message)
+		return 1
+	}
 	pretty, perr := prettyJSON(out)
 	if perr != nil {
 		fmt.Fprintln(stdout, string(out))
@@ -742,6 +774,20 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 	}
 	fmt.Fprintln(stdout, pretty)
 	return 0
+}
+
+func topLevelToolError(raw json.RawMessage) string {
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &envelope) != nil || len(envelope.Error) == 0 {
+		return ""
+	}
+	var message string
+	if json.Unmarshal(envelope.Error, &message) == nil {
+		return strings.TrimSpace(message)
+	}
+	return ""
 }
 
 func loadCallInput(data string, stdin io.Reader) (json.RawMessage, error) {

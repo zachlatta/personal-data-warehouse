@@ -105,9 +105,9 @@ func grepRowsTool(svc *query.Service) tool.Tool {
 	}
 }
 
-// searchTool is registered on every surface, like describe_table: retrieval is
-// the entry point for both MCP agents and CLI sessions, so hiding it from
-// either side would push callers back to hand-written search SQL.
+// searchTool is registered on both MCP and the HTTP API. MCP agents call it
+// directly; the first-class `pdw search` command uses the same HTTP tool, so
+// both surfaces share one retrieval implementation and response contract.
 func searchTool(svc *query.Service) tool.Tool {
 	return &tool.Typed[searchInput, query.SearchResponse]{
 		NameStr:        "search",
