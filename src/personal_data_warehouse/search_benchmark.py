@@ -312,9 +312,9 @@ def summarize(rows: Sequence[dict[str, Any]], *, depth: int) -> dict[str, Any]:
 def trim_to_json(stdout: str) -> str:
     """Drop any human-readable preamble the CLI printed before the payload.
 
-    ``pdw call`` returns an object and ``pdw sql --output json`` returns an
-    array, so anchoring on ``{`` alone lands *inside* an array and decodes only
-    its first element before failing on the rest.
+    ``pdw search --output json`` returns an object and ``pdw sql --output
+    json`` returns an array, so anchoring on ``{`` alone lands *inside* an
+    array and decodes only its first element before failing on the rest.
     """
 
     candidates = [pos for pos in (stdout.find("{"), stdout.find("[")) if pos != -1]
@@ -331,9 +331,8 @@ def _pdw_json(args: list[str], *, timeout: float) -> Any:
         # harness that hides why a call failed sends you to reproduce it by
         # hand every single time.
         detail = (completed.stderr or completed.stdout or "").strip()
-        raise RuntimeError(
-            f"pdw {' '.join(args[:2])} failed ({completed.returncode}): {detail[:400]}"
-        )
+        command = " ".join(args[:2]) if args[:1] == ["call"] else args[0]
+        raise RuntimeError(f"pdw {command} failed ({completed.returncode}): {detail[:400]}")
     return json.loads(trim_to_json(completed.stdout))
 
 
@@ -341,14 +340,23 @@ def run_search(
     query: str, mode: str, depth: int, *, sources: Sequence[str] = (), since: str = "",
     timeout: float = 420.0,
 ) -> SearchResult:
-    request: dict[str, Any] = {"query": query, "mode": mode, "max_results": depth}
+    args = [
+        "search",
+        "--output",
+        "json",
+        "--mode",
+        mode,
+        "--max-results",
+        str(depth),
+    ]
     if sources:
-        request["sources"] = list(sources)
+        args.extend(("--source", ",".join(sources)))
     if since:
-        request["since"] = since
+        args.extend(("--since", since))
+    args.append(query)
     started = time.time()
     try:
-        payload = _pdw_json(["call", "search", "--data", json.dumps(request)], timeout=timeout)
+        payload = _pdw_json(args, timeout=timeout)
         result = parse_search_payload(json.dumps(payload))
     except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as error:
         result = SearchResult(mode=mode, error=str(error)[:400])

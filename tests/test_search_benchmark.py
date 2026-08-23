@@ -359,3 +359,54 @@ def test_search_failure_carries_the_cli_stderr(monkeypatch) -> None:
     monkeypatch.setattr(module.subprocess, "run", fake_run)
     result = module.run_search("anything", "hybrid", 10)
     assert "statement timeout: budget exceeded" in result.error
+
+
+def test_run_search_uses_first_class_cli_with_structured_flags(monkeypatch) -> None:
+    import subprocess as subprocess_module
+
+    import personal_data_warehouse.search_benchmark as module
+
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return subprocess_module.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "query": "budget approval",
+                    "mode": "hybrid",
+                    "rows": [{"ref": "slack_message:abc", "source": "slack"}],
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    result = module.run_search(
+        "budget approval",
+        "hybrid",
+        7,
+        sources=("slack", "gmail"),
+        since="2026-08-01",
+    )
+
+    assert seen["args"] == [
+        "pdw",
+        "search",
+        "--output",
+        "json",
+        "--mode",
+        "hybrid",
+        "--max-results",
+        "7",
+        "--source",
+        "slack,gmail",
+        "--since",
+        "2026-08-01",
+        "budget approval",
+    ]
+    assert seen["kwargs"]["timeout"] == 420.0
+    assert result.rows[0].ref == "slack_message:abc"
