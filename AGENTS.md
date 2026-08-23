@@ -333,6 +333,13 @@ drags every index with it. Dropping the indexes first and rebuilding them after 
 down to ~50 minutes and shrank the table from 63 GB to 45 GB. Assume any `ALTER TYPE` on a
 table that size is an outage-shaped operation and plan it as one.
 
+A source-scoped agent-session ANN search uses a deliberately smaller candidate pool
+(`4 * max_results`, bounded to 40-200 per vector). Agent-session chunks are only 3.05% of
+the global HNSW: asking for 1,000 qualifying rows made one vector leg scan 97,245 embeddings
+and take 31.2s, so two legs exceeded the app's 60s statement budget. A 40-row leg took 2.25s;
+agent sessions have p95 three chunks per event, so the 4x pool still covers the requested
+event depth. Broad and every other scoped search retain the deeper 20x / 1,000-2,000 pool.
+
 ## Pipeline Freshness and Health
 
 Every warehouse table also has to declare **which pipeline feeds it and how freshness is

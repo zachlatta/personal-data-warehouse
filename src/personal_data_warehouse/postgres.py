@@ -316,6 +316,15 @@ SEARCH_HYBRID_EXACT_MIN_CHARS = 3
 SEARCH_HYBRID_CANDIDATE_MULTIPLIER = 20
 SEARCH_HYBRID_MIN_CANDIDATES = 1000
 SEARCH_HYBRID_MAX_CANDIDATES = 2000
+# Agent-session chunks are only 3.05% of the global HNSW. Asking that index for
+# 1000 qualifying rows made each query-vector leg scan ~97k embeddings and take
+# 31.2s; two legs time out before fusion. LIMIT 40 took 2.25s. Agent sessions
+# have p95 three chunks/event, so a 4x pool with a 40-row floor still gives a
+# depth-10 search enough distinct event candidates. Keep every other scope on
+# the measured deeper pool until it gets its own evidence.
+SEARCH_HYBRID_AGENT_CANDIDATE_MULTIPLIER = 4
+SEARCH_HYBRID_AGENT_MIN_CANDIDATES = 40
+SEARCH_HYBRID_AGENT_MAX_CANDIDATES = 200
 # Embedding space for the semantic branch. 512-dim halfvec keeps ~10M chunks
 # around 10 GB of vectors; models are OpenAI-compatible `/v1/embeddings`
 # (cloud OpenAI, Gemini's compat endpoint, or a self-hosted server), requested
@@ -7489,6 +7498,9 @@ class PostgresWarehouse:
                 str(SEARCH_HYBRID_EXACT_MAX_WORDS),
                 str(SEARCH_HYBRID_MIN_CANDIDATES),
                 str(SEARCH_HYBRID_MAX_CANDIDATES),
+                str(SEARCH_HYBRID_AGENT_CANDIDATE_MULTIPLIER),
+                str(SEARCH_HYBRID_AGENT_MIN_CANDIDATES),
+                str(SEARCH_HYBRID_AGENT_MAX_CANDIDATES),
                 str(SEARCH_EMBEDDING_DIMENSIONS),
                 hybrid_state,
             ]
@@ -8509,13 +8521,21 @@ class PostgresWarehouse:
                       AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
                       AND (since IS NULL OR c.event_ts >= since)
                     ORDER BY e.embedding OPERATOR(public.<=>) qvec
-                    LIMIT least(greatest(per_source * """
+                    LIMIT CASE WHEN sem_adapters <@ ARRAY[
+                        'agent_session', 'agent_session_turn'
+                    ]::text[] THEN least(greatest(per_source * """
+                + str(SEARCH_HYBRID_AGENT_CANDIDATE_MULTIPLIER)
+                + ", "
+                + str(SEARCH_HYBRID_AGENT_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_AGENT_MAX_CANDIDATES)
+                + r""") ELSE least(greatest(per_source * """
                 + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
                 + ", "
                 + str(SEARCH_HYBRID_MIN_CANDIDATES)
                 + "), "
                 + str(SEARCH_HYBRID_MAX_CANDIDATES)
-                + r""")
+                + r""") END
                     )
                     UNION ALL
                     (
@@ -8532,13 +8552,21 @@ class PostgresWarehouse:
                       AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
                       AND (since IS NULL OR c.event_ts >= since)
                     ORDER BY e.embedding OPERATOR(public.<=>) qvec_alt
-                    LIMIT least(greatest(per_source * """
+                    LIMIT CASE WHEN sem_adapters <@ ARRAY[
+                        'agent_session', 'agent_session_turn'
+                    ]::text[] THEN least(greatest(per_source * """
+                + str(SEARCH_HYBRID_AGENT_CANDIDATE_MULTIPLIER)
+                + ", "
+                + str(SEARCH_HYBRID_AGENT_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_AGENT_MAX_CANDIDATES)
+                + r""") ELSE least(greatest(per_source * """
                 + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
                 + ", "
                 + str(SEARCH_HYBRID_MIN_CANDIDATES)
                 + "), "
                 + str(SEARCH_HYBRID_MAX_CANDIDATES)
-                + r""")
+                + r""") END
                     )
                 ),
                 sem_ranked AS (

@@ -1701,7 +1701,15 @@ def test_search_hybrid_gives_semantic_rank_a_measured_bounded_boost() -> None:
 def test_search_hybrid_uses_a_deep_filtered_semantic_candidate_pool() -> None:
     sql = _search_text_function_sql()
 
-    assert "LIMIT least(greatest(per_source * 20, 1000), 2000)" in sql
+    assert sql.count("least(greatest(per_source * 20, 1000), 2000)") >= 2
+
+
+def test_search_hybrid_bounds_agent_session_semantic_candidate_work() -> None:
+    sql = _search_text_function_sql()
+
+    assert sql.count("sem_adapters <@ ARRAY[") >= 2
+    assert sql.count("'agent_session', 'agent_session_turn'") >= 2
+    assert sql.count("least(greatest(per_source * 4, 40), 200)") >= 2
 
 
 def test_search_schema_signature_covers_hybrid_tuning(monkeypatch) -> None:

@@ -305,7 +305,10 @@ unified timeline document. Raw message/body columns are deliberately not text-in
   forms land in different neighbourhoods and each retrieves answers the other misses (blending
   them into a single vector measured MRR 0.234 against 0.300 for two legs). When embeddings are not
   configured or `search_hybrid` is not installed (no pgvector), it automatically falls back to
-  keyword search and reports a `fallback_reason`. Modes `keyword` and `exact` force
+  keyword search and reports a `fallback_reason`. Agent-session-only searches bound each ANN
+  leg to 4x the requested depth (40-200 rows): those chunks are 3.05% of the global HNSW, and
+  the general 1,000-row floor made each filtered vector leg take about 31 seconds. Other scopes
+  retain the deeper pool. Modes `keyword` and `exact` force
   `timeline.search_text` / `timeline.search_text_exact` directly. Takes
   `query`, `max_results` (default 20; raise it explicitly for recall work), `sources`, `since`, and `mode`.
   The first-class CLI uses this same tool without JSON quoting: `pdw search --source
