@@ -646,6 +646,10 @@ build arguments. Coolify excludes it by default to preserve build cache reuse.
 This repo includes a `Dockerfile` that runs Dagster on port `3000` with `uv`.
 The Docker image uses Postgres-backed Dagster storage via `docker/dagster.yaml`.
 
+The GPU embeddings service has its own Coolify Docker Compose application in
+[`embeddings/`](embeddings/README.md). Deploy it separately from the main
+Dagster application so Coolify can target the GPU-equipped host directly.
+
 For Coolify:
 
 1. Create a new Dockerfile-based application from this repo.

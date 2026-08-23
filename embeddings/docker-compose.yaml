@@ -1,0 +1,40 @@
+services:
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:86-1.8@sha256:65f792e790f976713a5d2ab2586d93d074203d1f0ec2045e87e60113fbd0e256
+    restart: unless-stopped
+    command:
+      - --model-id
+      - Qwen/Qwen3-Embedding-4B
+      - --auto-truncate
+      - --max-client-batch-size
+      - "256"
+      - --max-batch-tokens
+      - "16384"
+    environment:
+      HUGGINGFACE_HUB_CACHE: /data
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      NVIDIA_VISIBLE_DEVICES: all
+    volumes:
+      - "${EMBEDDINGS_CACHE_PATH:-/opt/pdw-embeddings/hf-cache}:/data"
+    ports:
+      - "${EMBEDDINGS_BIND_ADDRESS:?set EMBEDDINGS_BIND_ADDRESS to mew's tailnet IP}:${EMBEDDINGS_PORT:-8485}:80"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1/health
+      start_period: 10m
+      interval: 30s
+      timeout: 5s
+      retries: 5
