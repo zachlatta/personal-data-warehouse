@@ -1,0 +1,40 @@
+# Ruff configuration for the Python tree.
+#
+# Run it exactly the way CI does:
+#
+#     uvx ruff@0.14.1 check .
+#
+# Ruff lives here rather than in `pyproject.toml`'s dev group on purpose: the
+# lint gate should not be able to change under a dependency resolution, and
+# nothing in the package imports it.
+#
+# WHY THE RULESET IS NARROW. This gate was added to a 70k-line tree that had
+# never had a linter, and reformatting it was explicitly not the job. The
+# selected rules are the ones where a finding is a *bug* rather than a
+# preference: a syntax or runtime error (E9), an undefined or unbound name
+# (F82x) — the failure mode that shipped a NameError to production — a
+# comparison against a literal with `is` (F632), and the pyflakes checks for
+# broken f-strings, assert tuples and duplicate arguments (F7xx).
+#
+# Rules deliberately NOT enabled yet, with the count they would fire on the tree
+# as of 2026-08-23: F401 unused-import (28), F811 redefined-while-unused (8),
+# E741 ambiguous-variable-name (3), F402 (2), F541 (2), F841 (2), E731 (1).
+# None is a correctness problem; all of them are a cleanup PR someone can do in
+# one pass, at which point add the rule here and the gate holds it clean. Do not
+# widen the ruleset and add an `ignore = [...]` line instead — a rule that is
+# selected and then ignored everywhere never gets turned back on.
+line-length = 120
+target-version = "py310"
+
+exclude = [
+    ".venv",
+    "app",  # Go
+]
+
+[lint]
+select = [
+    "E9",   # syntax / IO errors ruff cannot recover from
+    "F63",  # invalid comparisons and assert on a tuple
+    "F7",   # broken f-strings, `break` outside a loop, duplicate arguments
+    "F82",  # undefined name, undefined local, unbound local
+]

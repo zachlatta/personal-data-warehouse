@@ -1,0 +1,136 @@
+name: Python tests
+
+# DELIBERATELY UNFILTERED. The two older workflows are scoped to their own
+# subtree (`app/**`, `docker/postgres-pgbackrest/**`), which is right for an
+# image build and wrong for a correctness gate: before this workflow existed, a
+# pull request touching only `src/`, `tests/`, `scripts/` or the docs triggered
+# no CI at all, and every Python contract test was a local honor system.
+# `tests/test_repo_contracts.py` fails if a `paths:` filter is ever added here.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Ruff is pinned and run through `uvx` rather than added to the project's
+      # dev dependencies: the lint gate should not be able to change under a
+      # dependency resolution, and nothing in the package imports it. The
+      # ruleset in `ruff.toml` is deliberately narrow (correctness lints the
+      # existing 70k-line tree already passes) — this is a gate against new
+      # breakage, not a reformat.
+      - name: Ruff
+        run: uvx ruff@0.14.1 check .
+
+  contracts:
+    name: Contract suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The warehouse's own Postgres image, published by
+      # .github/workflows/postgres-pgbackrest-image.yml. Using it rather than
+      # stock `postgres:18` is what makes the suite runnable: the tests build a
+      # real BM25 index (pg_textsearch, which needs shared_preload_libraries and
+      # therefore a `docker run` rather than a `services:` block — Actions
+      # service containers cannot override the command), a real HNSW vector
+      # index (pgvector), and real trigram indexes (pg_trgm). The package is
+      # public, so no registry login is needed and fork PRs work too.
+      PDW_POSTGRES_IMAGE: ghcr.io/zachlatta/personal-data-warehouse-postgres-pgbackrest:latest
+      POSTGRES_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/pdw
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Start the warehouse Postgres
+        run: |
+          set -euo pipefail
+          docker run -d --name pdw-postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=pdw \
+            -e PDW_PGBACKREST_ENABLED=false \
+            -p 5432:5432 \
+            "$PDW_POSTGRES_IMAGE" \
+            postgres -c shared_preload_libraries=pg_textsearch
+
+          for _ in $(seq 1 60); do
+            if docker exec pdw-postgres pg_isready -U postgres -d pdw >/dev/null 2>&1; then
+              echo "postgres is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "postgres did not become ready" >&2
+          docker logs pdw-postgres
+          exit 1
+
+      # Fail here, with the extension name in the log, rather than 40 tests
+      # later with an opaque "type vector does not exist".
+      - name: Verify the search extensions are installable
+        run: |
+          docker exec pdw-postgres psql -U postgres -d pdw -v ON_ERROR_STOP=1 -c "
+            CREATE EXTENSION IF NOT EXISTS vector;
+            CREATE EXTENSION IF NOT EXISTS pg_trgm;
+            CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+          "
+          docker exec pdw-postgres psql -U postgres -d pdw -c "\dx"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      # The four contract suites, not the whole tree — but NOT because of time.
+      # Measured 2026-08-23 against this exact image in a clean environment: the
+      # whole suite is 1836 passed / 2 failed / 6 skipped in 3m53s, and the four
+      # suites below are 81 tests in ~57s. Runtime is not the obstacle; two
+      # pre-existing failures are, and neither is caused by CI:
+      #
+      #   * tests/test_postgres_warehouse.py::test_search_text_raises_when_every_branch_fails
+      #     still expects the pre-pooling "every source branch failed" message.
+      #     Broad search no longer fans out per source, so a missing BM25 index
+      #     now surfaces as the raw undefined-object error instead.
+      #   * tests/test_upstream_mutations_postgres.py::test_ensure_upstream_mutation_tables_declares_the_supersede_column
+      #     asks information_schema about the *un-namespaced* `ops` schema rather
+      #     than the throwaway test namespace, so it can only pass against a
+      #     database that already carries production's schema.
+      #
+      # Fix those two and this step becomes `uv run pytest -q` over everything.
+      # Until then the gate is the set that describes the warehouse's contracts
+      # — catalog and layer layout, timeline coverage and adapter shape, the
+      # pipeline freshness registries, and the repo-level guardrails — all four
+      # running against a real Postgres rather than a fake.
+      - name: Contract suites
+        run: |
+          uv run pytest -q -rs \
+            tests/test_schema_reorg_contract.py \
+            tests/test_timeline.py \
+            tests/test_pipeline_health.py \
+            tests/test_repo_contracts.py
+
+      - name: Postgres logs on failure
+        if: failure()
+        run: docker logs pdw-postgres
