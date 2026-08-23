@@ -301,12 +301,13 @@ SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.1
 # leg took hybrid from MRR 0.292 to 0.403, hit@5 12 -> 15, and answered three
 # queries that previously had nothing in the top 50.
 #
-# It is gated on query length because it is not free: the leg costs seconds
-# (the trigram recheck detoasts multi-megabyte documents), and a natural-
-# language question gains nothing from it -- ungated it scored *worse* (0.374)
-# while making every long query pay. Weight 2 because a literal match on a
-# short query is strong evidence, where a rank-1 BM25 hit on two common words
-# is not.
+# It is gated on query length because literal matching is not free, and a
+# natural-language question gains nothing from it -- ungated it scored *worse*
+# (0.374) while making every long query pay. Machine tokens search the bounded
+# retrieval chunks; ordinary names retain the full-document exact path because
+# chunk anchoring regressed one proper-name label. Weight 2 because a literal
+# match on a short query is strong evidence, where a rank-1 BM25 hit on two
+# common words is not.
 SEARCH_HYBRID_EXACT_WEIGHT = 2.0
 SEARCH_HYBRID_EXACT_MAX_WORDS = 3
 # search_text_exact() raises below this needle length, so the leg must not be
@@ -1215,6 +1216,18 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "search_chunks",
         "CREATE INDEX IF NOT EXISTS search_chunks_ts_chunk_idx "
         "ON @search_chunks (event_ts DESC, chunk_id DESC)",
+    ),
+    # Hybrid's short-query literal leg needs identifier recall, not the full
+    # multi-megabyte timeline document returned by search_text_exact(). Search
+    # the retrieval chunks instead: every row is bounded to 2-6k characters
+    # (and oversized documents cover their first 200k), so the trigram recheck
+    # never has to detoast and decompress a multi-megabyte source document.
+    IndexSpec(
+        "search_chunks_text_trgm_idx",
+        "search_chunks",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS search_chunks_text_trgm_idx "
+        "ON @search_chunks USING gin (text public.gin_trgm_ops)",
+        requires_pg_trgm=True,
     ),
     # ANN index for the hybrid semantic branch. Only buildable once the
     # pgvector extension and the conditional halfvec column exist; on hosts
@@ -8218,6 +8231,13 @@ class PostgresWarehouse:
                 + str(SEARCH_TEXT_MAX_RESULTS_CAP)
                 + r""");
                 exact_refs text[];
+                exact_needle text := btrim(coalesce(query, ''));
+                exact_needle_b text;
+                exact_needle_c text;
+                exact_grouped text;
+                exact_pattern text;
+                exact_pattern_b text;
+                exact_pattern_c text;
                 sem_adapters text[];
                 qvec_alt public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
@@ -8279,20 +8299,101 @@ class PostgresWarehouse:
                 END IF;
                 -- The literal-substring leg. Gated on a short query: it is where
                 -- BM25 tokenization and embeddings both fail (identifiers,
-                -- names, paths) and literal matching wins, and it costs seconds
-                -- because the trigram recheck detoasts multi-megabyte
-                -- documents. A natural-language question gains nothing from it.
+                -- names, paths) and literal matching wins. Machine tokens use
+                -- the bounded chunk index below; ordinary names keep the full
+                -- exact path for quality. A natural-language question gains
+                -- nothing from either one.
                 -- The length floor matters: search_text_exact RAISES below it,
                 -- which would take the whole hybrid search down.
                 IF length(btrim(query)) >= """ + str(SEARCH_HYBRID_EXACT_MIN_CHARS) + r""" AND coalesce(
                        array_length(regexp_split_to_array(btrim(query), '\s+'), 1), 0
                    ) <= """ + str(SEARCH_HYBRID_EXACT_MAX_WORDS) + r""" THEN
                     BEGIN
-                        SELECT array_agg(x.ref)
-                          INTO exact_refs
-                          FROM (
-                            SELECT h.ref FROM @search_text_exact(query, per_source, sources, since) AS h
-                          ) x;
+                        -- search_text_exact() has to search the full timeline
+                        -- document because exact mode promises whole-corpus
+                        -- literal lookup. Hybrid only needs a cheap recall leg
+                        -- for short identifiers. Retrieval chunks cover the
+                        -- first 200k characters in bounded 2-6k rows, avoiding
+                        -- the multi-megabyte TOAST recheck that dominated every
+                        -- short hybrid query. Keep exact mode itself unchanged.
+                        -- Match the exact function's deterministic amount and
+                        -- phone variants so moving the leg does not narrow it.
+                        -- Keep ordinary alphabetic names on the full-document
+                        -- path. Chunk-window anchoring moved one labeled proper
+                        -- name from rank 1 to rank 2; machine tokens (digits or
+                        -- identifier punctuation) were quality-identical and
+                        -- are the calls whose old recheck has the worst tail.
+                        IF exact_needle ~ '[0-9_./@-]' THEN
+                            exact_needle_b := regexp_replace(
+                                exact_needle, '([0-9]),([0-9])', '\1\2', 'g'
+                            );
+                            IF length(exact_needle_b) < 3 THEN
+                                exact_needle_b := exact_needle;
+                            END IF;
+                            exact_needle_c := exact_needle;
+                            IF exact_needle ~ '^[0-9]{4,}([.][0-9]+)?$' THEN
+                                LOOP
+                                    exact_grouped := regexp_replace(
+                                        exact_needle_c,
+                                        '([0-9])([0-9]{3})([.,]|$)',
+                                        '\1,\2\3'
+                                    );
+                                    EXIT WHEN exact_grouped = exact_needle_c;
+                                    exact_needle_c := exact_grouped;
+                                END LOOP;
+                            ELSIF exact_needle ~ '^\+?[0-9() .-]{7,}$' THEN
+                                exact_needle_c := regexp_replace(
+                                    exact_needle, '[^0-9]', '', 'g'
+                                );
+                                IF length(exact_needle_c) < 3 THEN
+                                    exact_needle_c := exact_needle;
+                                END IF;
+                            END IF;
+                            exact_pattern := '%' || replace(replace(replace(
+                                exact_needle, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+                            exact_pattern_b := '%' || replace(replace(replace(
+                                exact_needle_b, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+                            exact_pattern_c := '%' || replace(replace(replace(
+                                exact_needle_c, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+                            SELECT array_agg(
+                                       x.ref
+                                       ORDER BY x.match_pos ASC NULLS LAST,
+                                                x.event_ts DESC
+                                   )
+                              INTO exact_refs
+                              FROM (
+                                SELECT c.adapter || ':' || c.event_id AS ref,
+                                       max(c.event_ts) AS event_ts,
+                                       min(CASE
+                                           -- For symbolic identifiers, an early
+                                           -- occurrence is stronger evidence than
+                                           -- a late mention: this moved one label
+                                           -- from rank 7 to rank 2. Position in an
+                                           -- opaque numeric id is arbitrary, so
+                                           -- those preserve recency ordering.
+                                           WHEN exact_needle ~ '[0-9]' THEN NULL
+                                           ELSE strpos(lower(c.text), lower(exact_needle))
+                                       END) AS match_pos
+                                FROM @search_chunks c
+                                WHERE (c.text ILIKE exact_pattern ESCAPE '\'
+                                       OR c.text ILIKE exact_pattern_b ESCAPE '\'
+                                       OR c.text ILIKE exact_pattern_c ESCAPE '\')
+                                  AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
+                                  AND (since IS NULL OR c.event_ts >= since)
+                                GROUP BY c.adapter, c.event_id
+                                ORDER BY match_pos ASC NULLS LAST, event_ts DESC
+                                LIMIT per_source
+                              ) x;
+                        ELSE
+                            SELECT array_agg(x.ref)
+                              INTO exact_refs
+                              FROM (
+                                SELECT h.ref
+                                FROM @search_text_exact(
+                                    query, per_source, sources, since
+                                ) AS h
+                              ) x;
+                        END IF;
                     EXCEPTION WHEN OTHERS THEN
                         -- The literal leg is an enhancement; losing the whole
                         -- search because it failed would be worse than

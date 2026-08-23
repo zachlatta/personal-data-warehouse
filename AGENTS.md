@@ -110,8 +110,12 @@ is guidance here rather than another model in the search path.
   what makes identifier-shaped questions work ("admin/api-keys", a Drive file id, a
   person's name), where BM25 tokenization and embeddings both fail: adding it took the
   labeled benchmark from MRR 0.292 to 0.403 and answered three queries that previously
-  had nothing in the top 50. It stays gated because it costs seconds (its trigram recheck
-  detoasts multi-megabyte documents) and ungated it scored *worse*. Hybrid falls
+  had nothing in the top 50. It stays gated because ungated it scored *worse*. Machine
+  tokens (digits or identifier punctuation) search the bounded 2-6k retrieval chunks through
+  `search_chunks_text_trgm_idx`, not the multi-megabyte timeline documents; symbolic tokens
+  rank an earlier chunk occurrence ahead of a late mention, while opaque ids containing
+  digits preserve recency. Ordinary alphabetic names retain the full-document exact path:
+  chat-window anchoring moved one labeled answer from rank 1 to rank 2. Hybrid falls
   back to keyword with an explicit `fallback_reason` when embeddings or pgvector are
   unavailable. Agent sessions are indexed per turn (`kind = 'agent_turn'`); the session
   roll-up row carries headline fields only.

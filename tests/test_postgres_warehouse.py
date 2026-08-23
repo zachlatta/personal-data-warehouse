@@ -4755,12 +4755,61 @@ def test_search_hybrid_fuses_a_literal_leg_for_short_queries() -> None:
     assert "exact_refs" in sql and "@search_text_exact(" in sql
 
 
+def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -> None:
+    # search_text_exact() has to preserve literal lookup across the full
+    # timeline document, but hybrid only needs a cheap identifier-recall leg.
+    # Calling the full function here makes every short hybrid query recheck
+    # multi-megabyte TOASTed documents through the timeline trigram index.
+    # The retrieval chunks cover the first 200k characters in bounded 2-6k
+    # rows, so their own trigram index can confirm the same short identifiers
+    # without decompressing the source document.
+    import personal_data_warehouse.postgres as postgres_module
+
+    index = next(
+        spec
+        for spec in postgres_module.POSTGRES_INDEXES
+        if spec.name == "search_chunks_text_trgm_idx"
+    )
+    assert index.table == "search_chunks"
+    assert index.requires_pg_trgm
+    assert "CONCURRENTLY" in index.sql
+    assert "text public.gin_trgm_ops" in index.sql
+
+    sql = _search_text_function_sql()
+    hybrid = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid("):]
+    literal = hybrid[hybrid.index("exact_refs"):hybrid.index("RETURN QUERY")]
+    assert "exact_needle ~ '[0-9_./@-]'" in literal
+    assert "FROM @search_chunks" in literal
+    assert "@search_text_exact(" in literal, (
+        "ordinary names must keep the full-document leg: the chunk leg moved "
+        "one labeled proper-name answer from rank 1 to rank 2"
+    )
+    assert "GROUP BY" in literal, (
+        "several chunks from one event must produce one literal rank"
+    )
+    assert "c.adapter = ANY (sem_adapters)" in literal
+    assert "c.event_ts >= since" in literal
+
+
+def test_search_hybrid_ranks_symbolic_chunk_matches_by_prominence() -> None:
+    # Recency-only literal ranking put the labeled definition of one symbolic
+    # identifier at rank 7. Preferring an earlier occurrence within a bounded
+    # chunk moved it to rank 2 without moving any other labeled answer. Opaque
+    # ids containing digits are different: position is arbitrary there and
+    # hurt one label, so they deliberately keep the old recency order.
+    sql = _search_text_function_sql()
+    hybrid = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid("):]
+    literal = hybrid[hybrid.index("exact_refs"):hybrid.index("RETURN QUERY")]
+    assert "WHEN exact_needle ~ '[0-9]' THEN NULL" in literal
+    assert "strpos(lower(c.text), lower(exact_needle))" in literal
+    assert "ORDER BY match_pos ASC NULLS LAST, event_ts DESC" in literal
+
+
 def test_search_hybrid_literal_leg_is_gated_on_query_length() -> None:
-    # The literal leg costs seconds (the trigram recheck detoasts multi-MB
-    # documents) and a natural-language question gains nothing from it --
-    # ungated it scored WORSE (0.374 against 0.383) while making every long
-    # query pay. It must also never run below search_text_exact's minimum
-    # needle length, which raises.
+    # Literal matching is not free and a natural-language question gains
+    # nothing from it -- ungated it scored WORSE (0.374 against 0.383) while
+    # making every long query pay. It must also never run below
+    # search_text_exact's minimum needle length, which raises.
     sql = _search_text_function_sql()
     assert "regexp_split_to_array" in sql, "the leg must be gated on the query's word count"
     assert f"<= {postgres_module_exact_max_words()}" in sql
