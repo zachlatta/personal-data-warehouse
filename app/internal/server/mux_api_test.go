@@ -267,7 +267,7 @@ func TestAPIRunsSearchAndReportsKeywordFallback(t *testing.T) {
 		t.Fatalf("statements = %#v", runner.statements)
 	}
 	args := runner.args[0]
-	if len(args) != 4 || args[0] != "offer letter" || args[3] != "2026-03-01" {
+	if len(args) != 5 || args[0] != "offer letter" || args[3] != "2026-03-01" {
 		t.Fatalf("args = %#v", args)
 	}
 }
@@ -376,5 +376,96 @@ func TestAPIUnknownToolReturns404(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
+// postAPITool is the shared "call a tool over the HTTP API" helper the
+// unknown-field tests use; it returns the status and the raw body so a test can
+// assert on the error envelope rather than only on decoded data.
+func postAPITool(t *testing.T, runner query.Runner, name, body string) (int, string) {
+	t.Helper()
+	authSvc := pdwauth.NewService([]byte(muxAPITestSecret), func() time.Time { return time.Unix(0, 0) })
+	cfg := config.Config{
+		Addr:          ":0",
+		BaseURL:       "http://example.test",
+		SecretToken:   muxAPITestSecret,
+		MaxRows:       100,
+		MaxFieldChars: 1000,
+	}
+	srv := httptest.NewServer(NewMux(cfg, authSvc, runner))
+	t.Cleanup(srv.Close)
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/"+name, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", name, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(raw)
+}
+
+func TestAPIRejectsUnknownToolFields(t *testing.T) {
+	// The worst failure mode in the system: the HTTP path used to json.Unmarshal
+	// and drop anything it did not recognize, so {"query":"x","priority":"self"}
+	// returned 200 with UNFILTERED results. An agent that guessed the singular
+	// field name got a confident, authoritative-looking answer to a question it
+	// had never asked, and nothing downstream could tell. The MCP path already
+	// validated against the same schema (additionalProperties:false); this is
+	// the HTTP surface reaching parity.
+	runner := &searchCapableRunner{}
+	status, body := postAPITool(t, runner, "search", `{"query":"offer letter","priority":"self"}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s, want 400", status, body)
+	}
+	if !strings.Contains(body, `unknown field \"priority\"`) {
+		t.Fatalf("error must name the unknown field; body = %s", body)
+	}
+	// Naming the alternatives is the point: the caller is a model that guessed,
+	// and the correct key is one character away from the one it tried.
+	if !strings.Contains(body, "priorities") || !strings.Contains(body, "max_results") {
+		t.Fatalf("error must list the valid fields; body = %s", body)
+	}
+	if len(runner.statements) != 0 {
+		t.Fatalf("rejected input must not reach the database; statements = %#v", runner.statements)
+	}
+}
+
+func TestAPIAcceptsKnownToolFields(t *testing.T) {
+	// The guard must not become a wall: the documented fields still work, and
+	// omitted optional fields are still omitted rather than rejected.
+	runner := &searchCapableRunner{}
+	status, body := postAPITool(t, runner, "search",
+		`{"query":"offer letter","priorities":["self","direct"],"mode":"keyword"}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body = %s, want 200", status, body)
+	}
+	if len(runner.args) != 1 {
+		t.Fatalf("args = %#v", runner.args)
+	}
+	tiers, ok := runner.args[0][4].([]string)
+	if !ok || len(tiers) != 2 || tiers[0] != "self" || tiers[1] != "direct" {
+		t.Fatalf("priorities must reach the SQL call; args = %#v", runner.args[0])
+	}
+}
+
+func TestAPIRejectsUnknownPriorityTier(t *testing.T) {
+	// Mirrors the `sources` contract: an unknown token errors and names the
+	// valid set, rather than being dropped into a search of everything.
+	runner := &searchCapableRunner{}
+	status, body := postAPITool(t, runner, "search", `{"query":"offer letter","priorities":["urgent"]}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body = %s", status, body)
+	}
+	if !strings.Contains(body, `unknown priority \"urgent\"`) {
+		t.Fatalf("body = %s", body)
+	}
+	if !strings.Contains(body, "self, direct, cc, noise, background, unclassified") {
+		t.Fatalf("error must list the valid tiers; body = %s", body)
+	}
+	if len(runner.statements) != 0 {
+		t.Fatalf("invalid tier must not reach the database; statements = %#v", runner.statements)
 	}
 }

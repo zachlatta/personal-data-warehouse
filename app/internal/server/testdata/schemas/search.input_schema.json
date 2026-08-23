@@ -9,6 +9,16 @@
       "description": "hybrid (default: semantic+keyword; falls back to keyword when embeddings are unavailable), keyword (BM25 ranked), or exact (literal substring/phrase/id match)",
       "type": "string"
     },
+    "priorities": {
+      "description": "optional attention tiers: self (Zach initiated it), direct (a real person reaching him directly), cc (real-people activity he is peripheral to), noise (bulk/automated), background (warehouse machinery); default is every tier and an unknown token errors listing the valid set",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "null",
+        "array"
+      ]
+    },
     "query": {
       "description": "search text to run against the cross-source timeline corpus",
       "type": "string"

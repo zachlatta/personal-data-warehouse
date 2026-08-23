@@ -518,7 +518,7 @@ func TestSchemaErrorHint(t *testing.T) {
 			message: `ERROR: column "snippet" does not exist (SQLSTATE 42703)`,
 			sql:     "SELECT snippet FROM timeline.search_text('invoice', 20)",
 			want: []string{
-				"source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk",
+				"source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk, priority",
 				"matched preview",
 				"timeline.context",
 			},

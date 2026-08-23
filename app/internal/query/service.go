@@ -1145,16 +1145,16 @@ var functionRemaps = map[string]string{
 // composite type built in postgres.py (hit_type_columns_sql). It drifted once
 // already: the 2026-08-19 overhaul added event_ts/title/source_table/source_pk
 // and the hint here kept describing the nine-column shape for a day.
-const searchHitColumns = "source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk"
+const searchHitColumns = "source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk, priority"
 
 // searchFunctionSignatures are printed when a caller misses a search
 // function's signature — a wrong named parameter (limit_rows =>) or wrong
 // argument shape on an already-qualified call. Telling that caller to
 // schema-qualify what they already qualified sends them in circles.
 var searchFunctionSignatures = map[string]string{
-	"search_text":       "timeline.search_text(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL)",
-	"search_text_exact": "timeline.search_text_exact(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL)",
-	"search_hybrid":     "timeline.search_hybrid(query text, query_embedding text, embedding_model text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL)",
+	"search_text":       "timeline.search_text(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL, priorities text[] DEFAULT NULL)",
+	"search_text_exact": "timeline.search_text_exact(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL, priorities text[] DEFAULT NULL)",
+	"search_hybrid":     "timeline.search_hybrid(query text, query_embedding text, embedding_model text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL, priorities text[] DEFAULT NULL)",
 }
 
 var undefinedFunctionRe = regexp.MustCompile(`function ([a-zA-Z0-9_."]+)\s*\(`)
@@ -1184,7 +1184,7 @@ func undefinedFunctionHint(message string) string {
 		if hasSignature && (strings.HasPrefix(qualified, "timeline.") || strings.Contains(message, "=>")) {
 			// The caller already qualified the function (or used a named
 			// argument): the miss is the signature, not the schema path.
-			return fmt.Sprintf("(hint: the signature is %s — the named parameters are max_results, sources, since — returning (%s).)", signature, searchHitColumns)
+			return fmt.Sprintf("(hint: the signature is %s — the named parameters are max_results, sources, since, priorities — returning (%s).)", signature, searchHitColumns)
 		}
 		return fmt.Sprintf("(hint: call %s(...) — queries carry no warehouse search_path, so its functions must be schema-qualified just like its tables.)", remap)
 	}

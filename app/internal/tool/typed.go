@@ -1,10 +1,13 @@
 package tool
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"regexp"
+	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -52,10 +55,62 @@ func (t *Typed[I, O]) InputSchema() (*jsonschema.Schema, error) {
 	return jsonschema.ForType(reflect.TypeOf(zero), &jsonschema.ForOptions{})
 }
 
+// InvalidInputError is a caller mistake in the request body, not a tool
+// failure: the transport should answer 400, not 502.
+type InvalidInputError struct{ Message string }
+
+func (e *InvalidInputError) Error() string { return e.Message }
+
+// unknownFieldRe pulls the offending key out of encoding/json's message, which
+// reads: json: unknown field "priority".
+var unknownFieldRe = regexp.MustCompile(`unknown field "([^"]*)"`)
+
+// jsonFieldNames lists the JSON keys a tool input actually accepts, so a
+// rejection can name the alternatives instead of just saying no.
+func jsonFieldNames(t reflect.Type) []string {
+	if t == nil || t.Kind() != reflect.Struct {
+		return nil
+	}
+	names := make([]string, 0, t.NumField())
+	for i := range t.NumField() {
+		field := t.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
 func (t *Typed[I, O]) Invoke(ctx context.Context, raw json.RawMessage) (any, bool, error) {
 	var input I
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &input); err != nil {
+		// Reject unknown fields, exactly like the MCP path's schema
+		// validation (every tool input schema carries
+		// additionalProperties:false). Without this the HTTP surface answered
+		// an unrecognized field with 200 and UNFILTERED results: an agent that
+		// guessed `priority` instead of `priorities` got a confident,
+		// authoritative-looking answer to a question it had not asked. A
+		// silently ignored filter is the worst failure mode this system has,
+		// because nothing downstream can detect it.
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			if match := unknownFieldRe.FindStringSubmatch(err.Error()); match != nil {
+				valid := jsonFieldNames(reflect.TypeOf(input))
+				message := fmt.Sprintf("unknown field %q for tool %s", match[1], t.NameStr)
+				if len(valid) > 0 {
+					message += "; valid fields are " + strings.Join(valid, ", ")
+				}
+				return nil, true, &InvalidInputError{Message: message}
+			}
 			return nil, true, err
 		}
 	}

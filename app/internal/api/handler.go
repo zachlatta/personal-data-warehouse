@@ -97,6 +97,11 @@ func (h *handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	if callErr != nil {
 		h.logger.InfoContext(r.Context(), "API tool result", "tool", name, "client", pdwauth.ClientNameFromContext(r.Context()), "is_error", true, "error", callErr.Error())
 		// Decode failures bubble up as callErr too; tell them apart by type.
+		var invalidInput *tool.InvalidInputError
+		if errors.As(callErr, &invalidInput) {
+			writeError(w, http.StatusBadRequest, "invalid_input", invalidInput.Message)
+			return
+		}
 		var syntaxErr *json.SyntaxError
 		var typeErr *json.UnmarshalTypeError
 		if errors.As(callErr, &syntaxErr) || errors.As(callErr, &typeErr) {

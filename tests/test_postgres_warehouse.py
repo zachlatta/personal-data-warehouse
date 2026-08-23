@@ -1664,6 +1664,7 @@ def _search_text_function_sql() -> str:
         # Borrow the real SQL builders so what is captured is exactly what a
         # live warehouse would issue; only execution is faked.
         _schema = "public"
+        _SEARCH_PRIORITY_TOKENS = postgres_module.PostgresWarehouse._SEARCH_PRIORITY_TOKENS
         _search_path_sql = postgres_module.PostgresWarehouse._search_path_sql
         _search_text_alter_sql = postgres_module.PostgresWarehouse._search_text_alter_sql
         sql_relation = postgres_module.PostgresWarehouse.sql_relation
@@ -2015,9 +2016,13 @@ def test_search_text_alter_pins_search_path_for_both_functions() -> None:
 
         _object_schema = postgres_module.PostgresWarehouse._object_schema
 
+    # The ALTER names the function by its FULL argument list. Adding a
+    # parameter without updating it here would leave the search_path pin on a
+    # signature that no longer exists -- the exact shape of the 16-day
+    # silent-zero outage, except the ALTER would now fail loudly instead.
     sql = postgres_module.PostgresWarehouse._search_text_alter_sql(_Stub())  # type: ignore[arg-type]
-    assert '"search_text"(text, integer, text[], timestamptz)' in sql
-    assert '"search_text_exact"(text, integer, text[], timestamptz)' in sql
+    assert '"search_text"(text, integer, text[], timestamptz, text[])' in sql
+    assert '"search_text_exact"(text, integer, text[], timestamptz, text[])' in sql
 
 
 def test_search_text_ranks_across_sources_via_bm25(warehouse: PostgresWarehouse) -> None:
@@ -2582,7 +2587,19 @@ def test_search_text_raises_when_every_branch_fails(warehouse: PostgresWarehouse
     warehouse._set_search_path()
 
     warehouse._command("DROP INDEX IF EXISTS timeline_events_search_text_bm25_idx")
-    with pytest.raises(psycopg2.Error, match="timeline_events_search_text_bm25_idx"):
+    # The per-branch guard (and therefore the aggregate "every branch failed"
+    # message) belongs to the SCOPED path. This assertion used to be written
+    # against an unscoped call, and silently stopped testing what it claims to
+    # when broad search moved off the branch loop onto the pooled scan: it has
+    # been failing on main since, with the raw index error instead of the
+    # guard's message.
+    with pytest.raises(psycopg2.Error, match="every source branch failed"):
+        warehouse._query("SELECT * FROM @search_text('zanzibar', 5, ARRAY['slack','gmail'])")
+    warehouse._connection.rollback()
+    # The BROAD path has no per-branch guard by design — one pooled scan, not
+    # eighteen branches — but it must be just as loud. An empty result here is
+    # the 16-day silent outage, so a raise (of any message) is the contract.
+    with pytest.raises(psycopg2.Error):
         warehouse._query("SELECT * FROM @search_text('zanzibar', 5)")
 
 
@@ -4940,3 +4957,272 @@ def test_search_hybrid_pushes_the_source_filter_into_the_ann_scan() -> None:
     assert "map.source = ANY (sources)" not in legs, (
         "a post-join source filter blocks pgvector's filtered iterative scan"
     )
+
+
+def test_search_functions_accept_a_priorities_filter() -> None:
+    # Every timeline event carries a priority tier, and until now an agent
+    # could not use it: the human web UI could filter, the agent surface could
+    # not, and `priority` was not even on the hit. All three entry points take
+    # the same trailing `priorities text[] DEFAULT NULL` so a scoped question
+    # ("what did a real person send me") is one parameter, not a post-filter
+    # over whatever the unscoped top-k happened to return.
+    sql = _search_text_function_sql()
+    for function_name in ("@search_text(", "@search_text_exact(", "@search_hybrid("):
+        body = sql.split(f"CREATE OR REPLACE FUNCTION {function_name}", 1)
+        assert len(body) == 2, f"expected {function_name} to be generated"
+        signature = body[1].split(")", 1)[0]
+        assert "priorities text[] DEFAULT NULL" in signature, (
+            f"{function_name} must accept a trailing priorities filter; got {signature!r}"
+        )
+
+
+def test_search_text_pushes_priorities_into_every_scan() -> None:
+    # A tier filter applied AFTER a top-k scan returns the whole corpus's top-k
+    # intersected with the tier, which for 'self' (503k of 48M rows) is almost
+    # always empty. It has to be part of the WHERE of every scan: each per-source
+    # branch AND both partitions of the broad pooled scan.
+    sql = _search_text_function_sql()
+    branch_count = sql.count("%4$L::text[] IS NULL OR t.priority::text = ANY (%4$L::text[])")
+    assert branch_count >= len(postgres_module_source_defs()), (
+        "every per-source branch must filter on priority inside its WHERE; "
+        f"found {branch_count} branches with the predicate"
+    )
+    assert "query, per_branch_limit, since, priorities" in sql, (
+        "each branch's EXECUTE must pass `priorities` as the fourth format argument"
+    )
+    # Both pooled partitions (global index + low-volume partial index).
+    assert sql.count("AND (priorities IS NULL OR t.priority::text = ANY (priorities))") >= 3, (
+        "the broad pooled scan's BOTH partitions and search_text_exact's scan "
+        "must filter on priority in the WHERE, not after the top-k"
+    )
+
+
+def postgres_module_source_defs() -> tuple:
+    import personal_data_warehouse.postgres as postgres_module
+
+    return postgres_module.SEARCH_SOURCE_DEFS
+
+
+def test_search_functions_reject_unknown_priority_tokens() -> None:
+    # Same contract `sources` has. Silently dropping an unrecognized tier is
+    # the worst outcome available: the caller asked for one tier and gets the
+    # entire corpus, which reads downstream as a correct answer.
+    import personal_data_warehouse.postgres as postgres_module
+
+    sql = _search_text_function_sql()
+    for function_name in ("search_text", "search_text_exact", "search_hybrid"):
+        assert f"RAISE EXCEPTION '{function_name}: unknown priority %'" in sql, (
+            f"{function_name}() must RAISE on an unknown priority token"
+        )
+    valid = ", ".join(postgres_module.PostgresWarehouse._SEARCH_PRIORITY_TOKENS)
+    assert f"valid priorities are {valid}" in sql, (
+        "the RAISE must name the whole valid set, so a caller can self-correct"
+    )
+    # An empty array means "every tier", exactly like omitting the parameter:
+    # callers build it from an optional tool field and [] must not mean
+    # "match nothing".
+    assert "IF priorities IS NOT NULL AND coalesce(array_length(priorities, 1), 0) = 0 THEN" in sql
+
+
+def test_search_hit_carries_its_priority_tier() -> None:
+    # A hit that does not say which tier it came from cannot be triaged, and a
+    # filtered search cannot show its work. The composite type is rebuilt
+    # (DROP ... CASCADE) whenever its attribute count changes, so this column
+    # must be counted in that guard too.
+    sql = _search_text_function_sql()
+    assert "source_pk jsonb, priority text" in sql, (
+        "the search hit composite type must carry priority"
+    )
+    assert "hit_attr_count IS DISTINCT FROM 14" in sql, (
+        "the composite-type rebuild guard must count the new attribute; a stale "
+        "count leaves the old 13-column type in place and every branch cast fails"
+    )
+
+
+def test_search_hybrid_filters_the_semantic_leg_on_priority() -> None:
+    # The two lexical legs push the tier down into their own scans. The ANN legs
+    # cannot (derived_search.chunks carries no priority, and a filter above
+    # pgvector's iterative scan is what made a source-scoped search take 44.6s),
+    # so the fusion must filter on the timeline row it already probes by primary
+    # key. Without it a hybrid search would honor the tier in two legs of three.
+    sql = _search_text_function_sql()
+    assert "@search_text(query, per_source, sources, since, priorities)" in sql, (
+        "search_hybrid's lexical leg must pass the tier filter down"
+    )
+    assert "query, per_source, sources, since, priorities" in sql, (
+        "search_hybrid's literal leg must pass the tier filter down"
+    )
+    assert "OR COALESCE(m.priority, t.priority::text) = ANY (priorities))" in sql, (
+        "search_hybrid must filter its fused output on priority, or the semantic "
+        "leg would return rows from tiers the caller excluded"
+    )
+
+
+def test_search_text_exact_scopes_parallel_hints_to_the_recheck() -> None:
+    # The trigram index answers in ~170ms; the ILIKE recheck then detoasts every
+    # candidate document, and that is where the seconds go -- single-core CPU on
+    # a 28-vCPU box (measured on prod: shared hit=50871, zero reads). The planner
+    # costs the bitmap heap scan by ROWS and has no idea a row can be a
+    # multi-megabyte TOASTed document, so it never parallelizes. Telling it setup
+    # is free took the identifier query from 4143ms to 782ms on 8 workers, same
+    # buffers, same rows.
+    #
+    # The scoping is the load-bearing part, exactly like enable_sort in
+    # search_text(): a hint left over a whole plan is how a query once ran for
+    # five MINUTES. Save, set, run the ONE statement, restore.
+    sql = _search_text_exact_sql()
+    assert "saved_parallel_setup_cost := current_setting('parallel_setup_cost')" in sql
+    assert "saved_min_parallel_scan := current_setting('min_parallel_table_scan_size')" in sql
+    set_at = sql.index("PERFORM set_config('parallel_setup_cost', '0', true)")
+    query_at = sql.index("RETURN QUERY")
+    restore_at = sql.index("PERFORM set_config('parallel_setup_cost', saved_parallel_setup_cost, true)")
+    assert set_at < query_at < restore_at, (
+        "the parallel hint must be set immediately before the recheck and restored "
+        "immediately after it, never left over the rest of the function"
+    )
+    assert "PERFORM set_config('min_parallel_table_scan_size', saved_min_parallel_scan, true)" in sql, (
+        "both hints must be restored to what the deployment actually configures, "
+        "not to the shipped defaults"
+    )
+
+
+def test_read_only_search_helpers_are_parallel_safe() -> None:
+    # Marking governs the CALLER's plan, and only the bodies that touch session
+    # state have to stay unsafe. context() and search_text_sources() read and
+    # nothing else, so a caller joining them to anything keeps its parallel plan.
+    sql = _search_text_function_sql()
+    for marker in ("@search_text_sources()", "@timeline_context("):
+        body = sql.split(f"CREATE OR REPLACE FUNCTION {marker}", 1)[1]
+        header = body.split("AS $", 1)[0]
+        assert "PARALLEL SAFE" in header, f"{marker} should be PARALLEL SAFE: {header!r}"
+    # search_text/search_text_exact call set_config(), which raises under
+    # IsInParallelMode() in the LEADER as well as in a worker -- so PARALLEL
+    # RESTRICTED would not save them either. They must stay unsafe.
+    for marker in ("@search_text(", "@search_text_exact("):
+        header = sql.split(f"CREATE OR REPLACE FUNCTION {marker}", 1)[1].split("AS $", 1)[0]
+        assert "PARALLEL SAFE" not in header and "PARALLEL RESTRICTED" not in header, (
+            f"{marker} calls set_config() and must remain PARALLEL UNSAFE: {header!r}"
+        )
+
+
+def test_search_schema_signature_covers_the_priority_tokens() -> None:
+    # The generated DDL embeds the tier list; if the list changes without the
+    # signature changing, the rebuild guard skips the recompile and the
+    # validation keeps accepting (or rejecting) the old set forever.
+    import personal_data_warehouse.postgres as postgres_module
+
+    class _Stub:
+        _SEARCHABLE_TEXT_TABLES = ("timeline_events",)
+        _SEARCH_PRIORITY_TOKENS = postgres_module.PostgresWarehouse._SEARCH_PRIORITY_TOKENS
+        _search_schema_signature = postgres_module.PostgresWarehouse._search_schema_signature
+        _ensure_search_text_function = postgres_module.PostgresWarehouse._ensure_search_text_function
+
+        def pgvector_available(self) -> bool:
+            return True
+
+        def _relation_exists(self, table: str) -> bool:
+            return True
+
+    stub = _Stub()
+    before = stub._search_schema_signature()
+    stub._SEARCH_PRIORITY_TOKENS = ("self", "direct")
+    after = stub._search_schema_signature()
+    assert before and before != after, (
+        "changing the priority token list must change the search schema signature"
+    )
+
+
+def test_search_functions_drop_their_previous_signature() -> None:
+    # CREATE OR REPLACE with a new parameter OVERLOADS rather than replaces.
+    # Leaving the four-argument form in place makes every existing positional
+    # call ambiguous and lets a caller that omits `priorities` keep reaching an
+    # implementation that cannot filter.
+    sql = _search_text_function_sql()
+    assert "DROP FUNCTION IF EXISTS @search_text(text, integer, text[], timestamptz);" in sql
+    assert "DROP FUNCTION IF EXISTS @search_text_exact(text, integer, text[], timestamptz);" in sql
+    assert (
+        "DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz, text);"
+        in sql
+    )
+
+
+def test_search_text_filters_hits_to_the_requested_priority(warehouse: PostgresWarehouse) -> None:
+    # End-to-end against a real timeline: the tier filter must actually restrict
+    # the result set (both ranked and literal search), an unknown tier must
+    # RAISE, and an unfiltered call must be unchanged.
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="700.1",
+                message_datetime=message_datetime,
+                text="zanzibar rollout schedule",
+            )
+        ]
+    )
+    warehouse.insert_contact_cards(
+        [_contact_card_row(card_id="card-zan", display_name="Zanzibar Person", sync_version=1)]
+    )
+    _sync_timeline(warehouse)
+
+    unfiltered = {
+        (row[0], row[1])
+        for row in warehouse._query(
+            "SELECT ref, priority FROM @search_text('zanzibar', 20) WHERE score < 0"
+        )
+    }
+    assert unfiltered, "expected ranked hits before filtering"
+    assert all(priority for _, priority in unfiltered), (
+        "every hit must report the tier it came from"
+    )
+    tiers = {priority for _, priority in unfiltered}
+
+    for tier in sorted(tiers):
+        rows = warehouse._query(
+            "SELECT ref, priority FROM @search_text('zanzibar', 20, NULL, NULL, %s::text[]) WHERE score < 0",
+            ([tier],),
+        )
+        assert rows, f"expected at least one hit in tier {tier}"
+        assert {priority for _, priority in rows} == {tier}
+        assert {ref for ref, _ in rows} == {ref for ref, priority in unfiltered if priority == tier}
+
+    # Every tier at once is the same answer as no filter at all.
+    all_tiers = warehouse._query(
+        "SELECT ref FROM @search_text('zanzibar', 20, NULL, NULL, %s::text[]) WHERE score < 0",
+        (sorted(tiers),),
+    )
+    assert {row[0] for row in all_tiers} == {ref for ref, _ in unfiltered}
+
+    # An EMPTY array means every tier, not "match nothing".
+    empty_filter = warehouse._query(
+        "SELECT ref FROM @search_text('zanzibar', 20, NULL, NULL, %s::text[]) WHERE score < 0",
+        ([],),
+    )
+    assert {row[0] for row in empty_filter} == {ref for ref, _ in unfiltered}
+
+    # Literal search filters on the same vocabulary.
+    exact_tier = sorted(tiers)[0]
+    exact_rows = warehouse._query(
+        "SELECT priority FROM @search_text_exact('zanzibar', 20, NULL, NULL, %s::text[])",
+        ([exact_tier],),
+    )
+    assert exact_rows and {row[0] for row in exact_rows} == {exact_tier}
+
+    for function in ("@search_text", "@search_text_exact"):
+        with pytest.raises(psycopg2.errors.RaiseException) as excinfo:
+            warehouse._query(
+                f"SELECT ref FROM {function}('zanzibar', 20, NULL, NULL, %s::text[])",
+                (["urgent"],),
+            )
+        assert "unknown priority" in str(excinfo.value)
+        warehouse._connection.rollback()

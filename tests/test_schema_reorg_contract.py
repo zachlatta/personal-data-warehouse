@@ -780,9 +780,14 @@ def test_query_role_reads_public_relations_and_is_denied_private(
 def test_query_role_can_execute_the_search_interface(warehouse: PostgresWarehouse) -> None:
     _provision_everything(warehouse)
     role = warehouse.query_role
+    # The trailing text[] is the priority-tier filter. It is part of the
+    # signature the query role must be able to execute, not an optional extra:
+    # adding the parameter OVERLOADS rather than replaces, so the old four-arg
+    # forms were dropped deliberately and naming one here would assert a
+    # privilege on a function that no longer exists.
     for logical, signature in (
-        ("search_text", "(text, integer, text[], timestamptz)"),
-        ("search_text_exact", "(text, integer, text[], timestamptz)"),
+        ("search_text", "(text, integer, text[], timestamptz, text[])"),
+        ("search_text_exact", "(text, integer, text[], timestamptz, text[])"),
         ("search_text_sources", "()"),
         ("utf8_byte_prefix", "(text, integer)"),
     ):

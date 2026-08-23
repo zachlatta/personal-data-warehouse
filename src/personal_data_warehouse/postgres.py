@@ -7545,6 +7545,16 @@ class PostgresWarehouse:
 
     _SEARCH_SCHEMA_MARKER_TABLE = "search_schema_state"
 
+    # The timeline priority tiers, in enum declaration order (highest attention
+    # first). Search takes them as a `priorities` filter so an agent can ask the
+    # corpus the question a human asks it -- "what did a real person send me" --
+    # instead of retrieving 39.7M noise rows and hoping the ranker sorts it out.
+    # Validated in SQL against this exact list: a mistyped tier must RAISE with
+    # the valid set, the same contract `sources` has, because the silent
+    # alternative is a search that quietly widens back to the whole corpus and
+    # answers a different question than the one asked.
+    _SEARCH_PRIORITY_TOKENS = ("self", "direct", "cc", "noise", "background", "unclassified")
+
     def _ensure_search_views_if_possible(self) -> None:
         # Several Dagster assets can call ensure_* concurrently on deploy. The
         # shared search_text() function/index refresh mutates global Postgres
@@ -7610,6 +7620,7 @@ class PostgresWarehouse:
                 str(SEARCH_TEXT_BROAD_POOL),
                 str(SEARCH_TEXT_BROAD_SMALL_POOL),
                 SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL,
+                ",".join(self._SEARCH_PRIORITY_TOKENS),
                 str(SEARCH_HYBRID_RRF_K),
                 str(SEARCH_HYBRID_SEMANTIC_WEIGHT),
                 str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER),
@@ -7703,11 +7714,17 @@ class PostgresWarehouse:
                 else "timeline_events_search_text_bm25_lowvol_idx"
             )
             rank = f"t.search_text <@> to_bm25query(%1$L, '{index_name}')"
+            # The priority filter is pushed into the branch WHERE, not applied
+            # to the branch's results: filtering after a top-k scan returns the
+            # top-k of the WHOLE corpus intersected with the tier, which for
+            # 'self' (503k of 48M rows) is almost always empty. Served by
+            # timeline_events_priority_time_idx.
             where_sql = (
                 f"({adapter_filter(adapters)}) "
                 "AND t.search_text != '' "
                 "AND NOT COALESCE((t.metadata->>'deleted')::boolean, false) "
-                "AND (%3$L::timestamptz IS NULL OR t.event_ts >= %3$L::timestamptz)"
+                "AND (%3$L::timestamptz IS NULL OR t.event_ts >= %3$L::timestamptz) "
+                "AND (%4$L::text[] IS NULL OR t.priority::text = ANY (%4$L::text[]))"
             )
             if source == "google_drive":
                 where_sql += f" AND {SEARCH_DRIVE_EXCLUSION_SQL}"
@@ -7718,7 +7735,8 @@ class PostgresWarehouse:
                 "COALESCE(t.source_pk->>'account', t.metadata->>'account', '') AS account, "
                 "t.adapter || ':' || t.event_id AS ref, t.search_text AS text, "
                 f"({rank})::real AS score, t.title AS title, "
-                "t.source_table AS source_table, t.source_pk AS source_pk "
+                "t.source_table AS source_table, t.source_pk AS source_pk, "
+                "t.priority::text AS priority "
                 "FROM @timeline_events t "
                 f"WHERE {where_sql} ORDER BY {rank} LIMIT %2$s )"
             )
@@ -7751,6 +7769,7 @@ class PostgresWarehouse:
             "t.search_text != '' "
             "AND NOT COALESCE((t.metadata->>'deleted')::boolean, false) "
             "AND (since IS NULL OR t.event_ts >= since) "
+            "AND (priorities IS NULL OR t.priority::text = ANY (priorities)) "
             f"AND {SEARCH_DRIVE_EXCLUSION_SQL}"
         )
 
@@ -7823,6 +7842,33 @@ class PostgresWarehouse:
             "                    );\n"
             "                END IF;"
         )
+        # `priorities` normalization + validation, shared verbatim by all three
+        # entry points so a tier token means the same thing everywhere.
+        priority_tokens_sql = ", ".join(f"'{token}'" for token in self._SEARCH_PRIORITY_TOKENS)
+        priority_tokens_hint = ", ".join(self._SEARCH_PRIORITY_TOKENS)
+
+        def priorities_guard_sql(function_name: str) -> str:
+            return (
+                # An EMPTY array must mean "every tier", exactly like omitting
+                # the parameter. Callers build this array from an optional tool
+                # field, and treating [] as "match nothing" turns a caller's
+                # unset filter into a silently empty result set.
+                "IF priorities IS NOT NULL AND coalesce(array_length(priorities, 1), 0) = 0 THEN\n"
+                "                    priorities := NULL;\n"
+                "                END IF;\n"
+                "                IF priorities IS NOT NULL THEN\n"
+                "                    FOREACH requested_priority IN ARRAY priorities LOOP\n"
+                "                        IF NOT requested_priority = ANY (ARRAY["
+                + priority_tokens_sql
+                + "]) THEN\n"
+                f"                            RAISE EXCEPTION '{function_name}: unknown priority %', requested_priority\n"
+                "                                USING HINT = 'valid priorities are "
+                + priority_tokens_hint
+                + "';\n"
+                "                        END IF;\n"
+                "                    END LOOP;\n"
+                "                END IF;"
+            )
         # The per-branch row cast below lives inside a SQL string literal, which
         # relation expansion deliberately leaves alone, so it has to be written
         # schema-qualified here. An unqualified `::text_hit` resolved — through
@@ -7839,11 +7885,15 @@ class PostgresWarehouse:
         # Reshaping a composite type in place is impossible, so a shape change
         # drops it WITH CASCADE (the only dependents are the search functions,
         # recreated immediately below) and recreates.
+        # `priority` is on the hit because a hit that does not say which tier it
+        # came from cannot be triaged: an agent filtering to 'direct' has no way
+        # to show its work, and an unfiltered search cannot tell a real person's
+        # message from bulk traffic without a second query per hit.
         hit_type_columns_sql = (
             "source text, subsource text, context text, who text, "
             "occurred_at timestamptz, account text, ref text, "
             "text text, score real, event_ts timestamptz, title text, "
-            "source_table text, source_pk jsonb"
+            "source_table text, source_pk jsonb, priority text"
         )
         hit_type_attr_count = len(hit_type_columns_sql.split(","))
         self._command(
@@ -7886,6 +7936,15 @@ class PostgresWarehouse:
                 END IF;
             END
             $do$;
+            -- CREATE OR REPLACE with a new parameter OVERLOADS rather than
+            -- replaces. Leaving the four-argument signature in place would make
+            -- every existing positional call ambiguous (both candidates match)
+            -- and, worse, would let a caller that omits `priorities` keep
+            -- reaching an implementation that cannot filter. Drop them first.
+            -- (The type rebuild above already CASCADEs them away when the hit
+            -- shape changed; these make the transition explicit either way.)
+            DROP FUNCTION IF EXISTS @search_text(text, integer, text[], timestamptz);
+            DROP FUNCTION IF EXISTS @search_text_exact(text, integer, text[], timestamptz);
             -- Relevance preview: window the returned text around the first
             -- occurrence of any query term instead of cutting the head of the
             -- document. A head cut routinely misses the matched span in large
@@ -7935,11 +7994,21 @@ class PostgresWarehouse:
                 query text,
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
-                since timestamptz DEFAULT NULL
+                since timestamptz DEFAULT NULL,
+                priorities text[] DEFAULT NULL
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
             STABLE
+            -- Deliberately NOT parallel safe/restricted: this function calls
+            -- set_config() below, and set_config raises "cannot set parameters
+            -- during a parallel operation" whenever IsInParallelMode() is true
+            -- -- which includes the LEADER of a parallel plan, so PARALLEL
+            -- RESTRICTED would not save it either. The marking costs nothing:
+            -- it only governs whether a CALLER's plan may parallelize, and
+            -- measurement shows the parallelism that matters here is inside the
+            -- body (a plpgsql RETURN QUERY plans and parallelizes on its own,
+            -- regardless of the enclosing function's label).
             AS $fn$
             DECLARE
                 per_source integer := least(greatest(coalesce(max_results, 50), 1), """
@@ -7962,6 +8031,7 @@ class PostgresWarehouse:
             + r"""
                 ];
                 branch_source text;
+                requested_priority text;
                 branch text;
                 branch_idx integer;
                 hits @search_text_hit[] := '{}';
@@ -7991,7 +8061,8 @@ class PostgresWarehouse:
                         END IF;
                     END LOOP;
                 END IF;
-"""
+                """
+            + priorities_guard_sql("search_text")
             + r"""
                 -- BROAD SEARCH: one pooled scan, not eighteen branches.
                 -- Both partitions are index-ordered scans of a BM25 index, so
@@ -8036,7 +8107,8 @@ class PostgresWarehouse:
                                COALESCE(t.source_pk->>'account', t.metadata->>'account', ''),
                                t.adapter || ':' || t.event_id,
                                """ + preview_fn_sql + r"""(t.search_text, query),
-                               b.score, t.event_ts, t.title, t.source_table, t.source_pk
+                               b.score, t.event_ts, t.title, t.source_table, t.source_pk,
+                               t.priority::text
                         FROM broad_top b
                         JOIN @timeline_events t
                           ON t.adapter = b.adapter AND t.event_id = b.event_id
@@ -8065,10 +8137,10 @@ class PostgresWarehouse:
                             'x.who, x.occurred_at, x.account, x.ref, """
             + preview_fn_sql
             + r"""(x.text, %1$L), x.score, x.occurred_at, x.title, '
-                            'x.source_table, x.source_pk)::"""
+                            'x.source_table, x.source_pk, x.priority)::"""
             + hit_type_sql
             + r""") FROM (' || branch || ') x',
-                            query, per_branch_limit, since
+                            query, per_branch_limit, since, priorities
                         ) INTO branch_hits;
                         IF branch_hits IS NOT NULL THEN
                             hits := hits || branch_hits;
@@ -8102,6 +8174,7 @@ class PostgresWarehouse:
                         SELECT h.source, h.subsource, h.context, h.who, h.occurred_at,
                                h.account, h.ref, h.text, h.score,
                                h.event_ts, h.title, h.source_table, h.source_pk,
+                               h.priority,
                                row_number() OVER (
                                    PARTITION BY h.source ORDER BY h.score ASC NULLS LAST
                                ) AS src_rank
@@ -8112,7 +8185,8 @@ class PostgresWarehouse:
                     )
                     SELECT r.source, r.subsource, r.context, r.who, r.occurred_at,
                            r.account, r.ref, r.text, r.score,
-                           r.event_ts, r.title, r.source_table, r.source_pk
+                           r.event_ts, r.title, r.source_table, r.source_pk,
+                           r.priority
                     FROM ranked r
                     ORDER BY (r.src_rank > """
             + str(SEARCH_TEXT_SOURCE_FLOOR)
@@ -8124,11 +8198,16 @@ class PostgresWarehouse:
                 query text,
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
-                since timestamptz DEFAULT NULL
+                since timestamptz DEFAULT NULL,
+                priorities text[] DEFAULT NULL
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
             STABLE
+            -- Same reason as search_text: this body calls set_config(), which
+            -- raises under IsInParallelMode() in the leader as well as in a
+            -- worker, so PARALLEL UNSAFE is the only correct label. It costs
+            -- nothing -- the parallelism this function needs is INSIDE it.
             AS $fn$
             DECLARE
                 per_source integer := least(greatest(coalesce(max_results, 50), 1), """
@@ -8148,6 +8227,13 @@ class PostgresWarehouse:
                 pattern_b text;
                 pattern_c text;
                 requested_source text;
+                requested_priority text;
+                -- Saved so the parallel hints below are RESTORED to whatever
+                -- this deployment actually configures, not to the shipped
+                -- defaults: the hint must not leak past the one statement it
+                -- exists for, exactly like search_text's enable_sort scoping.
+                saved_parallel_setup_cost text;
+                saved_min_parallel_scan text;
             BEGIN
                 IF length(needle) < 3 THEN
                     RAISE EXCEPTION 'search_text_exact: query must be at least 3 characters'
@@ -8168,6 +8254,9 @@ class PostgresWarehouse:
                         END IF;
                     END LOOP;
                 END IF;
+                """
+            + priorities_guard_sql("search_text_exact")
+            + r"""
                 needle_b := regexp_replace(needle, '([0-9]),([0-9])', '\1\2', 'g');
                 IF length(needle_b) < 3 THEN
                     needle_b := needle;
@@ -8188,6 +8277,22 @@ class PostgresWarehouse:
                 pattern := '%' || replace(replace(replace(needle, '\', '\\'), '%', '\%'), '_', '\_') || '%';
                 pattern_b := '%' || replace(replace(replace(needle_b, '\', '\\'), '%', '\%'), '_', '\_') || '%';
                 pattern_c := '%' || replace(replace(replace(needle_c, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+                -- The trigram index answers in ~170ms; the ILIKE RECHECK then
+                -- detoasts every candidate document and that is where the
+                -- seconds go -- pure single-core CPU (measured on prod:
+                -- shared hit=50871, zero reads) while a 28-vCPU box sat 90%+
+                -- idle. The planner never chooses a parallel plan for it
+                -- because it costs a bitmap heap scan by ROWS, and has no idea
+                -- a row here can be a multi-megabyte TOASTed document.
+                -- Telling it that setup is free, for this ONE statement, moved
+                -- the identifier query from 4143ms serial to 782ms on 8
+                -- workers with identical buffers and identical rows.
+                -- Scoped exactly like enable_sort in search_text(): a hint left
+                -- over the whole plan is how a query once ran for five MINUTES.
+                saved_parallel_setup_cost := current_setting('parallel_setup_cost');
+                saved_min_parallel_scan := current_setting('min_parallel_table_scan_size');
+                PERFORM set_config('parallel_setup_cost', '0', true);
+                PERFORM set_config('min_parallel_table_scan_size', '0', true);
                 RETURN QUERY
                     SELECT hit.source, hit.subsource, hit.context, hit.who,
                            hit.occurred_at, hit.account, hit.ref,
@@ -8213,7 +8318,7 @@ class PostgresWarehouse:
                            END AS text,
                            hit.score,
                            hit.occurred_at AS event_ts, hit.title,
-                           hit.source_table, hit.source_pk
+                           hit.source_table, hit.source_pk, hit.priority
                     FROM (
                         SELECT map.source AS source,
                                """
@@ -8226,7 +8331,8 @@ class PostgresWarehouse:
                                t.search_text AS text,
                                NULL::real AS score,
                                t.title AS title, t.source_table AS source_table,
-                               t.source_pk AS source_pk
+                               t.source_pk AS source_pk,
+                               t.priority::text AS priority
                         FROM @timeline_events t
                         JOIN (VALUES """
             + adapter_source_values
@@ -8241,6 +8347,7 @@ class PostgresWarehouse:
             + r"""
                           AND (sources IS NULL OR map.source = ANY (sources))
                           AND (since IS NULL OR t.event_ts >= since)
+                          AND (priorities IS NULL OR t.priority::text = ANY (priorities))
                         ORDER BY t.event_ts DESC
                         LIMIT per_source
                     ) hit
@@ -8255,12 +8362,15 @@ class PostgresWarehouse:
                         END AS lowdoc
                     ) ld
                     ORDER BY hit.occurred_at DESC;
+                PERFORM set_config('parallel_setup_cost', saved_parallel_setup_cost, true);
+                PERFORM set_config('min_parallel_table_scan_size', saved_min_parallel_scan, true);
             END;
             $fn$;
             CREATE OR REPLACE FUNCTION @search_text_sources()
             RETURNS TABLE (source text)
             LANGUAGE sql
             IMMUTABLE
+            PARALLEL SAFE
             AS $sources$
                 SELECT s.source
                 FROM (VALUES """
@@ -8283,6 +8393,11 @@ class PostgresWarehouse:
             RETURNS SETOF @timeline_events
             LANGUAGE plpgsql
             STABLE
+            -- Unlike its search siblings this body only reads: no set_config,
+            -- no SET clause, nothing that touches session state. Marking it
+            -- PARALLEL SAFE lets a caller that joins context() to anything else
+            -- keep a parallel plan instead of being forced serial by the call.
+            PARALLEL SAFE
             AS $ctx$
             DECLARE
                 anchor @timeline_events%ROWTYPE;
@@ -8345,6 +8460,7 @@ class PostgresWarehouse:
             -- caller omitting the alternate embedding keeps reaching the old
             -- implementation.
             DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz);
+            DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz, text);
             CREATE OR REPLACE FUNCTION @search_hybrid(
                 query text,
                 query_embedding text,
@@ -8354,7 +8470,8 @@ class PostgresWarehouse:
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
                 since timestamptz DEFAULT NULL,
-                query_embedding_alt text DEFAULT NULL
+                query_embedding_alt text DEFAULT NULL,
+                priorities text[] DEFAULT NULL
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
@@ -8373,6 +8490,7 @@ class PostgresWarehouse:
                 exact_pattern text;
                 exact_pattern_b text;
                 exact_pattern_c text;
+                requested_priority text;
                 sem_adapters text[];
                 qvec_alt public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
@@ -8418,6 +8536,9 @@ class PostgresWarehouse:
                 PERFORM set_config('hnsw.scan_mem_multiplier', '4', true);
                 """
                 + sources_alias_sql
+                + r"""
+                """
+                + priorities_guard_sql("search_hybrid")
                 + r"""
                 -- Resolve `sources` to ADAPTERS once. Filtering the ANN legs
                 -- through a joined adapter->source list keeps the predicate
@@ -8601,7 +8722,7 @@ class PostgresWarehouse:
                               FROM (
                                 SELECT h.ref
                                 FROM @search_text_exact(
-                                    query, per_source, sources, since
+                                    query, per_source, sources, since, priorities
                                 ) AS h
                               ) x;
                         END IF;
@@ -8620,8 +8741,9 @@ class PostgresWarehouse:
                 WITH lex AS (
                     SELECT h.ref, h.source, h.subsource, h.context, h.who, h.occurred_at,
                            h.account, h.text, h.title, h.source_table, h.source_pk,
+                           h.priority,
                            row_number() OVER () AS rnk
-                    FROM @search_text(query, per_source, sources, since) AS h
+                    FROM @search_text(query, per_source, sources, since, priorities) AS h
                 ),
                 -- One leg per query vector. The second leg is gated on the
                 -- parameter, so a single-vector call pays a one-time filter,
@@ -8720,7 +8842,7 @@ class PostgresWarehouse:
                     SELECT COALESCE(l.ref, s.ref, x.ref) AS ref,
                            l.source, l.subsource, l.context AS lex_context, l.who,
                            l.occurred_at, l.account, l.text AS lex_text, l.title,
-                           l.source_table, l.source_pk,
+                           l.source_table, l.source_pk, l.priority,
                            s.context AS sem_context, s.event_ts AS sem_ts, s.text AS sem_text,
                            (COALESCE(1.0 / ("""
                 + str(SEARCH_HYBRID_RRF_K)
@@ -8752,7 +8874,8 @@ class PostgresWarehouse:
                        COALESCE(m.occurred_at, m.sem_ts, t.event_ts) AS event_ts,
                        COALESCE(m.title, t.title, '') AS title,
                        COALESCE(m.source_table, t.source_table, '') AS source_table,
-                       COALESCE(m.source_pk, t.source_pk) AS source_pk
+                       COALESCE(m.source_pk, t.source_pk) AS source_pk,
+                       COALESCE(m.priority, t.priority::text) AS priority
                 FROM merged m
                 -- LATERAL forces a per-row primary-key probe. A plain join on
                 -- these computed expressions let the planner pick a hash join,
@@ -8767,6 +8890,18 @@ class PostgresWarehouse:
                 LEFT JOIN (VALUES """
                 + adapter_source_values
                 + r""") AS tmap(adapter, source) ON tmap.adapter = t.adapter
+                -- The two lexical legs above already filtered on `priorities`
+                -- at full depth. The ANN legs cannot: derived_search.chunks
+                -- carries no priority, and hanging a join above pgvector's
+                -- iterative scan is the exact shape that made a source-scoped
+                -- search take 44.6s. So the semantic leg is filtered HERE, on
+                -- the timeline row the fusion already probes by primary key --
+                -- correct, and cheap, at the cost of some semantic recall
+                -- inside a narrow tier. The filter is not optional: a hybrid
+                -- search that honored the tier in two legs out of three would
+                -- answer a priority-scoped question with unscoped rows.
+                WHERE (priorities IS NULL
+                       OR COALESCE(m.priority, t.priority::text) = ANY (priorities))
                 ORDER BY m.rrf DESC, COALESCE(m.occurred_at, m.sem_ts, t.event_ts) DESC
                 LIMIT per_source;
             END;
@@ -8795,7 +8930,7 @@ class PostgresWarehouse:
         function_path = self._search_path_sql().removeprefix("SET search_path TO ")
         search_schema = _identifier(self._object_schema("search_text"))
         return "; ".join(
-            f'ALTER FUNCTION {search_schema}."{function_name}"(text, integer, text[], timestamptz) '
+            f'ALTER FUNCTION {search_schema}."{function_name}"(text, integer, text[], timestamptz, text[]) '
             f"SET search_path TO {function_path}"
             for function_name in ("search_text", "search_text_exact")
         )

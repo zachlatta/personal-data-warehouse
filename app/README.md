@@ -250,7 +250,7 @@ unified timeline document. Raw message/body columns are deliberately not text-in
 - Ranked keyword search (the default): `SELECT * FROM timeline.search_text('offer letter', 50)`
   searches the unified timeline BM25 document and returns
   `(source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title,
-  source_table, source_pk)` ranked across **every** timeline source (`score` lower / more
+  source_table, source_pk, priority)` ranked across **every** timeline source (`score` lower / more
   negative = better; `event_ts` duplicates `occurred_at` so `timeline.events` column lists
   work unchanged). The `text` preview is windowed around the first matched term. A hit
   carries its own drill-down: `source_table`/`source_pk` point straight at the source
@@ -268,8 +268,15 @@ unified timeline document. Raw message/body columns are deliberately not text-in
   finds `+14155163303`. Use this instead of post-filtering `search_text()` output with an
   outer `ILIKE` or scanning raw body columns; needles must be at least 3 characters.
 - Both take the same optional args:
-  `(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')`, with
-  `max_results` capped server-side. Call `SELECT * FROM timeline.search_text_sources()` to discover
+  `(query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01',
+  priorities => ARRAY['self','direct'])`, with `max_results` capped server-side.
+  `priorities` scopes the search to timeline attention tiers — `self` (Zach initiated it),
+  `direct` (a real person reaching him directly), `cc` (real-people activity he is peripheral
+  to), `noise` (bulk/automated traffic), `background` (the warehouse's own machinery) — and is
+  pushed into every scan rather than applied afterwards, so a narrow tier still gets a full
+  top-k. Omitting it (or passing an empty array) searches every tier, and an unknown token
+  raises listing the valid set. `noise` alone is 83% of the corpus, so a question about
+  attention rather than content almost always wants `ARRAY['self','direct','cc']`. Call `SELECT * FROM timeline.search_text_sources()` to discover
   valid source tokens; familiar aliases (`apple_messages`, `apple_notes`, `voice_memos`,
   `drive`, `contacts`, ...) resolve to the right token, and an unknown token raises listing
   the valid set. Attachment/media enrichments, Drive extracts, transcripts, and other

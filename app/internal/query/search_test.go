@@ -78,7 +78,7 @@ func TestSearchKeywordModeRunsSearchText(t *testing.T) {
 		t.Fatalf("statements = %#v", runner.statements)
 	}
 	args := runner.args[0]
-	if len(args) != 4 || args[0] != "offer letter" || args[1] != searchDefaultMaxResults || args[2] != nil || args[3] != nil {
+	if len(args) != 5 || args[0] != "offer letter" || args[1] != searchDefaultMaxResults || args[2] != nil || args[3] != nil || args[4] != nil {
 		t.Fatalf("args = %#v", args)
 	}
 	if resp.TotalRows != 1 || len(resp.ColumnNames) != 4 {
@@ -161,7 +161,7 @@ func TestSearchHybridModeEmbedsAndRunsSearchHybrid(t *testing.T) {
 		t.Fatalf("statements = %#v", runner.statements)
 	}
 	args := runner.args[0]
-	if len(args) != 7 {
+	if len(args) != 8 {
 		t.Fatalf("args = %#v", args)
 	}
 	if args[0] != "offer letter" || args[1] != "[0.5,-1.25]" || args[2] != "test-model" || args[3] != searchDefaultMaxResults {
@@ -190,7 +190,7 @@ func TestSearchHybridPassesBothQueryRepresentations(t *testing.T) {
 		t.Fatalf("error: %s", resp.Error)
 	}
 	args := runner.args[0]
-	if len(args) != 7 {
+	if len(args) != 8 {
 		t.Fatalf("args = %#v", args)
 	}
 	if args[1] != "[0.5,-1.25]" {
@@ -241,9 +241,12 @@ func TestSearchHybridFallsBackWhenHybridFunctionMissing(t *testing.T) {
 	if resp.FallbackReason != "search_hybrid not installed: postgres image lacks pgvector" {
 		t.Fatalf("fallback_reason = %q", resp.FallbackReason)
 	}
-	if embedder.calls != 0 {
-		t.Fatalf("embedder should not be called when search_hybrid is missing; calls = %d", embedder.calls)
-	}
+	// The embedder MAY have been called: the probe and the embedding request
+	// are deliberately overlapped (two independent round trips, one to
+	// Postgres and one to the GPU box), so a host without pgvector pays one
+	// speculative embed per search while every properly equipped host saves
+	// the probe's latency on every search. What must not change is the
+	// verdict: the probe still decides, and it still names the fix.
 	if len(runner.statements) != 1 || runner.statements[0] != searchTextSQL {
 		t.Fatalf("statements = %#v", runner.statements)
 	}
@@ -423,5 +426,119 @@ func TestSearchHintSurvivesTheKeywordFallback(t *testing.T) {
 	}
 	if resp.Hint == "" {
 		t.Fatal("the phrasing hint must not depend on the retriever that ran")
+	}
+}
+
+func TestSearchScopesEveryModeToPriorityTiers(t *testing.T) {
+	// Priority is the difference between "what needs my attention" and 48M
+	// rows, so it has to reach the SQL call in EVERY mode -- including the
+	// hybrid path, whose extra parameters make it the easy one to forget.
+	cases := []struct {
+		mode      string
+		statement string
+		index     int
+	}{
+		{SearchModeKeyword, searchTextSQL, 4},
+		{SearchModeExact, searchExactSQL, 4},
+		{SearchModeHybrid, searchHybridSQL, 7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mode, func(t *testing.T) {
+			runner := &fakeSearchRunner{
+				fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
+				argsResults: map[string]RawResult{tc.statement: searchHit()},
+			}
+			opts := Options{}
+			if tc.mode == SearchModeHybrid {
+				opts.SearchEmbedder = &fakeEmbedder{model: "test-model", vectors: [][]float64{{1}}}
+			}
+			svc := NewService(runner, opts)
+
+			resp := svc.Search(context.Background(), SearchRequest{
+				Query:      "offer letter",
+				Mode:       tc.mode,
+				Priorities: []string{"self", "direct"},
+			})
+			if resp.Error != "" {
+				t.Fatalf("error: %s", resp.Error)
+			}
+			if len(runner.args) != 1 {
+				t.Fatalf("args = %#v", runner.args)
+			}
+			tiers, ok := runner.args[0][tc.index].([]string)
+			if !ok || len(tiers) != 2 || tiers[0] != "self" || tiers[1] != "direct" {
+				t.Fatalf("priorities missing from %s args: %#v", tc.mode, runner.args[0])
+			}
+		})
+	}
+}
+
+func TestSearchWithoutPrioritiesBindsNull(t *testing.T) {
+	// Omitting the filter must be byte-identical to the old behavior: a NULL
+	// bind, which the SQL side reads as "every tier". Binding an empty array
+	// instead would be a silent corpus-wide change of meaning.
+	runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: searchHit()}}
+	svc := NewService(runner, Options{})
+
+	svc.Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword", Priorities: []string{}})
+	if runner.args[0][4] != nil {
+		t.Fatalf("empty priorities must bind NULL; args = %#v", runner.args[0])
+	}
+}
+
+func TestSearchRejectsUnknownPriorityTier(t *testing.T) {
+	// Loud, and naming the valid set: silently dropping the token would answer
+	// a tier-scoped question with the whole corpus, which reads as a correct
+	// answer to anyone downstream.
+	runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: searchHit()}}
+	svc := NewService(runner, Options{})
+
+	resp := svc.Search(context.Background(), SearchRequest{
+		Query:      "offer letter",
+		Mode:       "keyword",
+		Priorities: []string{"self", "urgent"},
+	})
+	if resp.Error == "" {
+		t.Fatal("an unknown priority tier must be an error, not a silently wider search")
+	}
+	if !strings.Contains(resp.Error, `unknown priority "urgent"`) {
+		t.Fatalf("error = %q", resp.Error)
+	}
+	for _, tier := range SearchPriorities {
+		if !strings.Contains(resp.Error, tier) {
+			t.Fatalf("error must list every valid tier (missing %q): %q", tier, resp.Error)
+		}
+	}
+	if len(runner.statements) != 0 {
+		t.Fatalf("rejected search must not reach the database; statements = %#v", runner.statements)
+	}
+}
+
+func TestSearchHitsCarryPriority(t *testing.T) {
+	// A hit that does not say which tier it came from cannot be triaged, and
+	// an agent filtering by tier has no way to show its work. The column list
+	// is explicit precisely so this cannot drift silently.
+	if !strings.Contains(searchResultColumns, "priority") {
+		t.Fatalf("searchResultColumns must select priority: %q", searchResultColumns)
+	}
+	for _, statement := range []string{searchTextSQL, searchExactSQL, searchHybridSQL} {
+		if !strings.Contains(statement, "priority") {
+			t.Fatalf("statement must select priority: %q", statement)
+		}
+	}
+}
+
+func TestSearchSQLPassesPrioritiesToEverySQLFunction(t *testing.T) {
+	// The SQL functions gained a trailing priorities parameter; the probe has
+	// to match the new signature too or hybrid silently falls back to keyword
+	// on a perfectly healthy deployment.
+	if !strings.Contains(searchTextSQL, "$5::text[]") || !strings.Contains(searchExactSQL, "$5::text[]") {
+		t.Fatalf("search_text/search_text_exact must pass priorities: %q %q", searchTextSQL, searchExactSQL)
+	}
+	if !strings.Contains(searchHybridSQL, "$8::text[]") {
+		t.Fatalf("search_hybrid must pass priorities: %q", searchHybridSQL)
+	}
+	if !strings.Contains(searchHybridProbeSQL, "timestamptz,text,text[]") {
+		t.Fatalf("the hybrid probe must match the installed signature: %q", searchHybridProbeSQL)
 	}
 }

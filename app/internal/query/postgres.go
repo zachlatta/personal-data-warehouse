@@ -21,6 +21,25 @@ type PostgresRunner struct {
 	queryRole    string
 }
 
+// Pool limits for the warehouse connection. database/sql defaults to
+// MaxIdleConns=2 and MaxOpenConns=UNLIMITED, and both halves are wrong here.
+// Unlimited lets a burst of concurrent tool calls race the warehouse's
+// max_connections=60 -- which is shared with Dagster and every other client --
+// and be refused by the server instead of queued in this process. Idle=2 means
+// a third concurrent search opens a fresh connection across the tailnet, pays
+// the TLS handshake, and then throws the connection away.
+const (
+	postgresMaxOpenConns    = 25
+	postgresMaxIdleConns    = 10
+	postgresConnMaxLifetime = 30 * time.Minute
+)
+
+func configurePool(db *sql.DB) {
+	db.SetMaxOpenConns(postgresMaxOpenConns)
+	db.SetMaxIdleConns(postgresMaxIdleConns)
+	db.SetConnMaxLifetime(postgresConnMaxLifetime)
+}
+
 func NewPostgresRunner(databaseURL string, timeout time.Duration) (*PostgresRunner, error) {
 	return NewPostgresRunnerWithRole(databaseURL, timeout, "")
 }
@@ -37,6 +56,7 @@ func NewPostgresRunnerWithRole(databaseURL string, timeout time.Duration, queryR
 		logger.Error("Postgres open failed", "error", err)
 		return nil, err
 	}
+	configurePool(db)
 	effectiveTimeout := timeout
 	if effectiveTimeout <= 0 {
 		effectiveTimeout = 30 * time.Second

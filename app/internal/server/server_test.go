@@ -813,3 +813,50 @@ func TestMcpToolHooksOnResultLogsSoftError(t *testing.T) {
 		t.Fatalf("soft IsError must still log full payload: %s", line)
 	}
 }
+
+func TestServerInstructionsNameTheTimelineTiersAndLayerOrder(t *testing.T) {
+	// Measured over 60 days: only 7.4% of agent sessions started at search or
+	// the timeline, 43% opened with schema_overview, 18% opened by guessing a
+	// relation that does not exist, the MCP search tool was called zero times,
+	// and 7 sessions total used any priority literal. The instructions never
+	// mentioned the timeline as the entry point, never mentioned the layer
+	// order, and never mentioned the tiers -- so an agent had no way to know.
+	lowered := strings.ToLower(serverInstructions)
+	for _, want := range []string{
+		"start at the timeline",
+		"timeline.events",
+		"priority tier",
+	} {
+		if !strings.Contains(lowered, want) {
+			t.Fatalf("serverInstructions must say %q: %s", want, serverInstructions)
+		}
+	}
+	// Every tier, with what it means -- a bare list of five words is not usable.
+	for _, tier := range query.SearchPriorities {
+		if tier == "unclassified" {
+			continue // the not-yet-synced bucket; not something to scope to
+		}
+		if !strings.Contains(lowered, tier+" =") {
+			t.Fatalf("serverInstructions must define the %q tier: %s", tier, serverInstructions)
+		}
+	}
+	// The layer order, in order.
+	timeline := strings.Index(lowered, "timeline (the event stream)")
+	marts := strings.Index(lowered, "marts_*")
+	base := strings.Index(lowered, "base_*")
+	if timeline < 0 || marts < 0 || base < 0 || !(timeline < marts && marts < base) {
+		t.Fatalf("serverInstructions must give the timeline -> marts_* -> base_* order: %s", serverInstructions)
+	}
+}
+
+func TestSearchDescriptionTellsAgentsAboutPriorityScoping(t *testing.T) {
+	// The search tool is where an agent decides whether to scope, so the tiers
+	// have to be named here too -- not only in the input schema, which many
+	// clients never surface to the model.
+	lowered := strings.ToLower(searchDescription)
+	for _, want := range []string{"priorities", "self", "direct", "noise", "priority"} {
+		if !strings.Contains(lowered, want) {
+			t.Fatalf("searchDescription must mention %q: %s", want, searchDescription)
+		}
+	}
+}

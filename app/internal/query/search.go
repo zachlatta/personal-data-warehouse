@@ -3,8 +3,11 @@ package query
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // Search modes. Hybrid is the default: semantic+keyword retrieval through
@@ -96,22 +99,22 @@ type ArgsRunner interface {
 // searchResultColumns is the shared hit shape all three timeline search
 // functions return; the explicit list keeps the tool's output stable even if
 // the SQL functions grow trailing columns.
-const searchResultColumns = "source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk"
+const searchResultColumns = "source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk, priority"
 
 // The int/text[]/timestamptz casts are load-bearing: pgx binds a Go int as
 // bigint and there is no implicit bigint→integer cast during function
 // resolution, so an uncast $2 would fail to match the functions' integer
 // max_results parameter.
 const (
-	searchTextSQL   = "SELECT " + searchResultColumns + " FROM timeline.search_text($1, $2::integer, $3::text[], $4::timestamptz)"
-	searchExactSQL  = "SELECT " + searchResultColumns + " FROM timeline.search_text_exact($1, $2::integer, $3::text[], $4::timestamptz)"
-	searchHybridSQL = "SELECT " + searchResultColumns + " FROM timeline.search_hybrid($1, $2, $3, $4::integer, $5::text[], $6::timestamptz, $7)"
+	searchTextSQL   = "SELECT " + searchResultColumns + " FROM timeline.search_text($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
+	searchExactSQL  = "SELECT " + searchResultColumns + " FROM timeline.search_text_exact($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
+	searchHybridSQL = "SELECT " + searchResultColumns + " FROM timeline.search_hybrid($1, $2, $3, $4::integer, $5::text[], $6::timestamptz, $7, $8::text[])"
 
 	// searchHybridProbeSQL reports whether timeline.search_hybrid exists with
 	// the exact signature the hybrid path calls. Deployments whose Postgres
 	// image lacks pgvector never install it, and the probe is what keeps the
 	// tool answering (via keyword fallback) instead of erroring there.
-	searchHybridProbeSQL = "SELECT to_regprocedure('timeline.search_hybrid(text,text,text,integer,text[],timestamptz,text)') IS NOT NULL AS installed"
+	searchHybridProbeSQL = "SELECT to_regprocedure('timeline.search_hybrid(text,text,text,integer,text[],timestamptz,text,text[])') IS NOT NULL AS installed"
 )
 
 // Fallback reasons the response carries when hybrid mode ran the keyword path
@@ -121,6 +124,28 @@ const (
 	searchFallbackHybridNotInstalled     = "search_hybrid not installed: postgres image lacks pgvector"
 )
 
+// SearchPriorities are the timeline attention tiers a search may be scoped to,
+// in enum declaration order (highest attention first). They mirror
+// timeline.timeline_priority exactly; the SQL side validates too, but doing it
+// here means a mistyped tier costs no round trip and the error can name the
+// whole set.
+var SearchPriorities = []string{"self", "direct", "cc", "noise", "background", "unclassified"}
+
+// validateSearchPriorities returns an error naming the valid set on the first
+// unknown token. Silently dropping it would be the worst outcome: the caller
+// asked for one tier and would get the entire 48M-row corpus back, with no
+// signal that the filter it asked for never applied.
+func validateSearchPriorities(priorities []string) error {
+	for _, priority := range priorities {
+		if slices.Contains(SearchPriorities, priority) {
+			continue
+		}
+		return fmt.Errorf("unknown priority %q; valid priorities are %s",
+			priority, strings.Join(SearchPriorities, ", "))
+	}
+	return nil
+}
+
 // SearchRequest is the search tool's input.
 type SearchRequest struct {
 	Query      string
@@ -128,6 +153,9 @@ type SearchRequest struct {
 	Sources    []string
 	Since      string
 	Mode       string
+	// Priorities scopes the search to timeline attention tiers. Empty means
+	// every tier, which is what omitting it has always meant.
+	Priorities []string
 }
 
 // SearchResponse mirrors the query tool's result shape: JSON row maps with the
@@ -169,6 +197,10 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 		resp.Error = fmt.Sprintf("mode must be %q, %q, or %q; got %q", SearchModeHybrid, SearchModeKeyword, SearchModeExact, mode)
 		return resp
 	}
+	if err := validateSearchPriorities(req.Priorities); err != nil {
+		resp.Error = err.Error()
+		return resp
+	}
 	runner, ok := s.runner.(ArgsRunner)
 	if !ok {
 		resp.Error = "search requires a parameterized-query runner"
@@ -190,23 +222,27 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	if trimmed := strings.TrimSpace(req.Since); trimmed != "" {
 		since = trimmed
 	}
+	var priorities any
+	if len(req.Priorities) > 0 {
+		priorities = req.Priorities
+	}
 
 	statement := ""
 	var args []any
 	switch mode {
 	case SearchModeExact:
 		statement = searchExactSQL
-		args = []any{resp.Query, maxResults, sources, since}
+		args = []any{resp.Query, maxResults, sources, since, priorities}
 	case SearchModeKeyword:
 		statement = searchTextSQL
-		args = []any{resp.Query, maxResults, sources, since}
+		args = []any{resp.Query, maxResults, sources, since, priorities}
 	case SearchModeHybrid:
 		vectors, reason := s.hybridQueryVectors(ctx, resp.Query)
 		if reason != "" {
 			resp.Mode = SearchModeKeyword
 			resp.FallbackReason = reason
 			statement = searchTextSQL
-			args = []any{resp.Query, maxResults, sources, since}
+			args = []any{resp.Query, maxResults, sources, since, priorities}
 			break
 		}
 		// The second vector is optional: search_hybrid scans one ANN leg per
@@ -216,11 +252,11 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 			alternate = vectors[1]
 		}
 		statement = searchHybridSQL
-		args = []any{resp.Query, vectors[0], s.embedder.Model(), maxResults, sources, since, alternate}
+		args = []any{resp.Query, vectors[0], s.embedder.Model(), maxResults, sources, since, alternate, priorities}
 	}
 
 	started := time.Now()
-	s.logger.InfoContext(ctx, "search started", "query", resp.Query, "mode", resp.Mode, "fallback_reason", resp.FallbackReason, "max_results", maxResults, "sources", req.Sources, "since", req.Since)
+	s.logger.InfoContext(ctx, "search started", "query", resp.Query, "mode", resp.Mode, "fallback_reason", resp.FallbackReason, "max_results", maxResults, "sources", req.Sources, "since", req.Since, "priorities", req.Priorities)
 	raw, err := runner.QueryArgs(ctx, statement, args, maxResults)
 	if err != nil {
 		resp.Error = s.queryErrorMessage(ctx, err.Error(), statement)
@@ -253,16 +289,41 @@ func (s *Service) hybridQueryVectors(ctx context.Context, queryText string) ([]s
 	if s.embedder == nil {
 		return nil, searchFallbackEmbeddingsUnconfigured
 	}
-	installed, err := s.searchHybridInstalled(ctx)
-	if err != nil {
-		return nil, "search_hybrid probe failed: " + err.Error()
+	// The catalog probe is a Postgres round trip and the embedding call is an
+	// HTTP round trip to the GPU box; neither input depends on the other, so
+	// running them back to back spent the probe's latency for nothing on every
+	// single hybrid search. Overlap them.
+	var (
+		installed bool
+		probeErr  error
+		vectors   [][]float64
+		embedErr  error
+	)
+	// Deliberately a plain group, not WithContext: neither leg should cancel
+	// the other. A failed probe still wants the embedding's error text for the
+	// log, and cancelling the probe on a slow embedder would turn a degraded
+	// GPU box into a misleading "probe failed" fallback reason.
+	var group errgroup.Group
+	group.Go(func() error {
+		installed, probeErr = s.searchHybridInstalled(ctx)
+		return nil
+	})
+	group.Go(func() error {
+		vectors, embedErr = s.embedder.Embed(ctx, queryText)
+		return nil
+	})
+	_ = group.Wait()
+	// The probe's verdict is reported first: "postgres image lacks pgvector" is
+	// the actionable one, and on such a host the speculative embedding is
+	// simply discarded.
+	if probeErr != nil {
+		return nil, "search_hybrid probe failed: " + probeErr.Error()
 	}
 	if !installed {
 		return nil, searchFallbackHybridNotInstalled
 	}
-	vectors, err := s.embedder.Embed(ctx, queryText)
-	if err != nil {
-		return nil, "embedding request failed: " + err.Error()
+	if embedErr != nil {
+		return nil, "embedding request failed: " + embedErr.Error()
 	}
 	if len(vectors) == 0 {
 		return nil, "embedding request returned no vectors"

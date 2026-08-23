@@ -959,3 +959,34 @@ func TestFlagsOverrideEnv(t *testing.T) {
 		t.Fatalf("auth = %q", srv.lastAuth)
 	}
 }
+
+func TestSearchCommandSendsPriorityTiers(t *testing.T) {
+	// --priority has to work in both positions (before and after the query),
+	// like every other value flag this command accepts, and it has to arrive
+	// as the plural JSON key the tool actually declares.
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"query":"budget","mode":"hybrid","total_rows":1,"rows":[{"source":"gmail","priority":"direct","occurred_at":"2026-08-20T12:00:00Z","who":"sender","title":"Budget","text":"approved","ref":"gmail_email:abc"}]}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "search", "budget", "--priority", "self,direct")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	var input struct {
+		Query      string   `json:"query"`
+		Priorities []string `json:"priorities"`
+	}
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if input.Query != "budget" {
+		t.Fatalf("query = %q", input.Query)
+	}
+	if fmt.Sprint(input.Priorities) != "[self direct]" {
+		t.Fatalf("priorities = %#v", input.Priorities)
+	}
+	// The tier is printed with the hit: a filtered search that does not show
+	// what it filtered to cannot be checked by the person reading it.
+	if !strings.Contains(out, "direct") {
+		t.Fatalf("text output must show the hit's priority tier:\n%s", out)
+	}
+}

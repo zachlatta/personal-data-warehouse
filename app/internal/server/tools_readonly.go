@@ -120,6 +120,7 @@ func searchTool(svc *query.Service) tool.Tool {
 				Sources:    in.Sources,
 				Since:      in.Since,
 				Mode:       in.Mode,
+				Priorities: in.Priorities,
 			}), nil
 		},
 		IsError: func(r query.SearchResponse) bool { return r.Error != "" },

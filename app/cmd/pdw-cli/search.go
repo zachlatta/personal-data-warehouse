@@ -39,6 +39,7 @@ type cliSearchResponse struct {
 
 type cliSearchHit struct {
 	Source     string `json:"source"`
+	Priority   string `json:"priority"`
 	OccurredAt string `json:"occurred_at"`
 	Who        string `json:"who"`
 	Title      string `json:"title"`
@@ -57,6 +58,9 @@ func runSearch(client *cliclient.Client, args []string, stdout, stderr io.Writer
 	var sources searchSourcesFlag
 	fs.Var(&sources, "source", "source aliases, comma-separated; repeatable")
 	fs.Var(&sources, "sources", "alias for --source")
+	var priorities searchSourcesFlag
+	fs.Var(&priorities, "priority", "attention tiers (self, direct, cc, noise, background), comma-separated; repeatable")
+	fs.Var(&priorities, "priorities", "alias for --priority")
 	if err := fs.Parse(searchFlagsFirst(args)); err != nil {
 		fmt.Fprintln(stderr, "pdw search:", err)
 		return 2
@@ -78,6 +82,7 @@ func runSearch(client *cliclient.Client, args []string, stdout, stderr io.Writer
 	input, err := json.Marshal(map[string]any{
 		"query": queryText, "mode": *mode, "max_results": *maxResults,
 		"sources": []string(sources), "since": *since,
+		"priorities": []string(priorities),
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw search:", err)
@@ -118,6 +123,7 @@ func searchFlagsFirst(args []string) []string {
 	known := map[string]bool{
 		"--mode": true, "--max-results": true, "-n": true,
 		"--since": true, "--output": true, "--source": true, "--sources": true,
+		"--priority": true, "--priorities": true,
 	}
 	flags := make([]string, 0, len(args))
 	positionals := make([]string, 0, len(args))
@@ -150,7 +156,7 @@ func printSearchText(w io.Writer, resp cliSearchResponse) {
 		fmt.Fprintf(w, "Fallback: %s\n", resp.FallbackReason)
 	}
 	for i, hit := range resp.Rows {
-		fmt.Fprintf(w, "\n%d. %s\n", i+1, strings.Join(nonemptySearchParts(hit.Source, hit.OccurredAt, hit.Who), " · "))
+		fmt.Fprintf(w, "\n%d. %s\n", i+1, strings.Join(nonemptySearchParts(hit.Source, hit.Priority, hit.OccurredAt, hit.Who), " · "))
 		if title := strings.TrimSpace(hit.Title); title != "" && title != strings.TrimSpace(hit.Text) {
 			fmt.Fprintf(w, "   %s\n", compactSearchLine(title))
 		}

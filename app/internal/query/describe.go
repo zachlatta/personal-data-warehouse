@@ -172,11 +172,11 @@ func describeFunction(relation string) string {
 	searchReturns := "returns SETOF (" + searchHitColumns + ") — use occurred_at (or its mirror event_ts) for time, text for the matched preview; source_table + source_pk drill to the source row"
 	switch name {
 	case "search_text":
-		return header + "timeline.search_text is a function, not a relation: timeline.search_text(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL) " + searchReturns + ". Ranked BM25 keyword search; call timeline.search_text_sources() for the valid source tokens."
+		return header + "timeline.search_text is a function, not a relation: timeline.search_text(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL, priorities text[] DEFAULT NULL) " + searchReturns + ". Ranked BM25 keyword search; call timeline.search_text_sources() for the valid source tokens."
 	case "search_text_exact":
-		return header + "timeline.search_text_exact is a function, not a relation: timeline.search_text_exact(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL) " + searchReturns + ". Literal substring search, recency-ordered; it also matches number-format variants of the needle."
+		return header + "timeline.search_text_exact is a function, not a relation: timeline.search_text_exact(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL, priorities text[] DEFAULT NULL) " + searchReturns + ". Literal substring search, recency-ordered; it also matches number-format variants of the needle."
 	case "search_hybrid":
-		return header + "timeline.search_hybrid is a function, not a relation: timeline.search_hybrid(query text, query_embedding text, embedding_model text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL, query_embedding_alt text DEFAULT NULL) " + searchReturns + ". It needs a query embedding — use the app's search tool instead of calling it directly, or timeline.search_text for keyword-only."
+		return header + "timeline.search_hybrid is a function, not a relation: timeline.search_hybrid(query text, query_embedding text, embedding_model text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL, query_embedding_alt text DEFAULT NULL, priorities text[] DEFAULT NULL) " + searchReturns + ". It needs a query embedding — use the app's search tool instead of calling it directly, or timeline.search_text for keyword-only."
 	case "search_text_sources":
 		return header + "timeline.search_text_sources is a function, not a relation: timeline.search_text_sources() returns SETOF (source text) — the valid tokens for the sources parameter of the search functions."
 	case "context":

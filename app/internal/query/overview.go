@@ -134,9 +134,15 @@ const overviewPreamble = `--
 --   timeline.search_text_exact('offer letter', 50)  LITERAL substring/phrase/id match, recency-
 --                                                   ordered. Use this for 'every mention of X';
 --                                                   never post-filter search_text() with ILIKE.
---   both take (query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01')
---   and return (source, subsource, context, who, occurred_at, account, ref, text, score,
---   event_ts, title, source_table, source_pk). The ` + "`text`" + ` preview is windowed around the
+--   both take (query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01',
+--   priorities => ARRAY['self','direct']) and return (source, subsource, context, who,
+--   occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk,
+--   priority). ` + "`priorities`" + ` scopes to the attention tiers on timeline.events — self
+--   (Zach initiated it), direct (a real person reaching him directly), cc (real-people
+--   activity he is peripheral to), noise (bulk/automated, 82%% of the corpus), background
+--   (warehouse machinery) — and is pushed into every scan, so a narrow tier still gets a full
+--   top-k. Omit it (or pass an empty array) for every tier; an unknown token raises listing
+--   the valid set. The ` + "`text`" + ` preview is windowed around the
 --   first matched term. event_ts = occurred_at (same value, both names accepted downstream).
 --   A hit carries its own drill-down: source_table + source_pk point at the source relation
 --   (source_table is the catalog id, e.g. gmail_messages, not a SQL name; this listing shows
