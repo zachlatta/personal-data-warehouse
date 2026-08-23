@@ -18,7 +18,11 @@ from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.pipeline_health import (
     COLLECTOR_STALE_SECONDS,
+    DATA_BASIS_REQUIRED_ABOVE,
+    EXPENSIVE_MART_VIEWS,
+    INHERIT_DATA_INTERVAL,
     LATE_MULTIPLIER,
+    MART_PROBE_STATEMENT_TIMEOUT_MS,
     PIPELINE_KINDS,
     PIPELINES,
     PROBE_EMPTY,
@@ -26,17 +30,19 @@ from personal_data_warehouse.pipeline_health import (
     PROBE_MISSING,
     PROBE_NO_TIMESTAMP,
     PROBE_OK,
+    PROBE_SKIPPED_EXPENSIVE,
     PROBE_SKIPPED_UNINDEXED,
     PROBE_STATEMENT_TIMEOUT_MS,
     STALE_MULTIPLIER,
     TABLE_PIPELINES,
     TABLE_ROLES,
     PipelineHealthCollector,
+    mart_view_ids,
     pipeline,
     pipeline_tables,
 )
 from personal_data_warehouse.postgres import POSTGRES_INDEXES, POSTGRES_TABLES, PostgresWarehouse
-from personal_data_warehouse.relations import CANONICAL_RELATIONS, relation
+from personal_data_warehouse.relations import CANONICAL_RELATIONS, CATALOG, relation
 from personal_data_warehouse.timeline import RAW_DDL_TABLES, TIMELINE_TABLE_COVERAGE
 
 
@@ -690,3 +696,555 @@ def test_timeline_adapter_health_exposes_every_adapter_to_the_query_role(warehou
     # anything other than 'ok' here means the status expression is wrong rather
     # than that the fixture is unhealthy.
     assert {status for _, status in rows} == {"ok"}
+
+
+# --- level 2: the marts layer's own health (pure) -----------------------------
+
+
+def test_every_marts_view_is_covered_by_the_mart_health_registry():
+    """The marts layer had ZERO health coverage until 2026-08-23.
+
+    Every ``derived_*`` TABLE was covered by ``TABLE_PIPELINES``; not one
+    ``marts_*`` VIEW was, so ``SELECT layer, count(*) FROM
+    marts_ops.table_freshness GROUP BY 1`` returned base/derived/ops/private/
+    timeline and no marts row at all -- for the exact relations every agent is
+    told to start from.
+
+    The list is derived from the catalog rather than hand-maintained, so adding
+    a mart stays one catalog edit; this pins that the derivation covers it.
+    """
+    catalogued = {
+        obj.id for obj in CATALOG.objects if obj.layer == "marts" and obj.kind == "view"
+    }
+    assert set(mart_view_ids()) == catalogued
+    assert catalogued, "the warehouse always has marts views"
+
+
+def test_a_mart_view_cannot_be_measured_the_way_a_table_is():
+    """State the limitation instead of pretending the table probe generalizes.
+
+    ``TABLE_PIPELINES`` measures ``max(<written_at>)`` over a heap. A view has
+    no stamped column to take a max of and no ``relpages`` for the cheapness
+    guard to consult, so pointing the existing probe at one would mean either
+    inventing a timestamp column or running an unbounded aggregate over a union
+    of six source tables every ten minutes. No mart may appear in the table
+    registry.
+    """
+    marts = set(mart_view_ids())
+    assert marts.isdisjoint(TABLE_PIPELINES)
+    assert marts.isdisjoint(POSTGRES_TABLES)
+
+
+def test_expensive_mart_probes_are_declared_not_discovered():
+    """A view too expensive to probe says so up front, and is still measured.
+
+    Same contract as ``skipped_unindexed``: record the skip and why. Discovering
+    the cost at runtime instead means the collector's window absorbs it every
+    ten minutes until someone notices.
+    """
+    assert EXPENSIVE_MART_VIEWS <= set(mart_view_ids())
+    assert 0 < MART_PROBE_STATEMENT_TIMEOUT_MS <= 30_000
+
+
+# --- the SLA registry itself (pure) -------------------------------------------
+
+
+def test_a_long_data_sla_says_where_its_number_came_from():
+    """A week-plus SLA has to justify itself.
+
+    Seven pipelines carried ``expected_data_interval = 30 days`` -- ``pi``,
+    whose uploader runs every five minutes, could therefore not reach 'late'
+    until SIXTY days, and did sit quiet for five weeks under a green dot. The
+    blunt month was not carelessness: these sources really are bursty, and the
+    cadence is not the answer either. The fix is to require the number to be
+    traceable, so the next reader re-measures it instead of re-guessing it.
+    """
+    for entry in PIPELINES:
+        interval = entry.expected_data_interval
+        if interval is None or interval < DATA_BASIS_REQUIRED_ABOVE:
+            continue
+        assert entry.data_basis.strip(), (
+            f"{entry.id} declares a {interval.days}-day data SLA with no basis; say how "
+            "that number was derived (see the measurement query in pipeline_health.py)"
+        )
+
+
+def test_the_bursty_sources_have_an_sla_that_can_catch_a_forty_four_day_silence():
+    """The seven blunt-30-day pipelines, judged against what they must catch.
+
+    ``alice_voice_recordings`` sat 44.5 days without a write under a green dot.
+    Any pipeline whose data SLA is set from a measured gap distribution must
+    reach at least 'late' inside that window; the exceptions are the ones where
+    measurement says the source genuinely is quieter than that, and they have to
+    earn the exception by keeping a run heartbeat instead.
+    """
+    forty_four_days = timedelta(days=44)
+    previously_blunt = {
+        "alice_voice_recordings",
+        "pi",
+        "voice_memo_transcription",
+        "apple_voice_memos",
+        "voice_memo_enrichment",
+        "apple_contacts",
+        "google_contacts",
+    }
+    for entry_id in sorted(previously_blunt):
+        entry = pipeline(entry_id)
+        interval = entry.expected_data_interval
+        assert interval is not None, entry_id
+        # No pipeline may keep the old 30-day number by accident.
+        assert entry.data_basis.strip(), entry_id
+        if interval * LATE_MULTIPLIER <= forty_four_days:
+            continue
+        # The only way to be looser than that is to have a heartbeat that
+        # catches breakage instead -- run freshness, not data freshness.
+        assert entry.expected_run_interval is not None and entry.state is not None, (
+            f"{entry_id} cannot reach 'late' within 44 days and has no run heartbeat "
+            "to catch it breaking; either tighten the data SLA or explain the heartbeat"
+        )
+        assert "heartbeat" in entry.data_basis or "heartbeat" in entry.note, entry_id
+
+
+def test_run_cadence_and_data_arrival_are_separate_numbers():
+    """The distinction the blunt 30 days collapsed.
+
+    ``pi``'s uploader runs every five minutes and its data arrives in bursts;
+    those are different facts and only one of them is an SLA. A data interval
+    tighter than the run interval is incoherent -- it demands output faster than
+    the pipeline is even scheduled -- and every real-world source is looser
+    still. ``timeline`` is the deliberate equal case: it runs every five minutes
+    and, because it is fed by every other pipeline at once, genuinely must write
+    within its 30-minute run window.
+    """
+    equal_by_design = {"timeline"}
+    for entry in PIPELINES:
+        if entry.expected_run_interval is None or entry.expected_data_interval is None:
+            continue
+        assert entry.expected_data_interval >= entry.expected_run_interval, entry.id
+        if entry.id in equal_by_design:
+            continue
+        assert entry.expected_data_interval > entry.expected_run_interval, entry.id
+
+
+# --- newest_event_at is judged ------------------------------------------------
+
+
+def test_event_time_is_judged_by_default_so_a_new_source_cannot_forget():
+    """``newest_event_at`` was collected, stored, shipped and rendered -- never judged.
+
+    The status ladder branched only on ``last_write_at``/``last_run_at``, so
+    ``alice_voice_recordings`` showed a green dot beside a newest event 118 days
+    old. Inheriting the data interval by default means a new source is judged on
+    event time without doing anything; opting out is explicit and carries a
+    reason.
+    """
+    inherited = [entry for entry in PIPELINES if entry.event_interval_is_inherited]
+    assert inherited, "inheriting must be the default"
+    for entry in inherited:
+        assert entry.event_interval == entry.expected_data_interval, entry.id
+    for entry in PIPELINES:
+        if entry.event_interval_is_inherited:
+            continue
+        assert entry.note or entry.data_basis, (
+            f"{entry.id} overrides the event interval without explaining why"
+        )
+    assert INHERIT_DATA_INTERVAL not in {
+        entry.event_interval for entry in PIPELINES
+    }, "the sentinel must never leak out as a real interval"
+
+
+def test_the_finance_ledger_event_interval_prevents_a_measured_false_positive():
+    """The one override, and the reason it exists.
+
+    A naive event check at the data interval flips exactly two pipelines on the
+    production corpus: ``alice_voice_recordings``, a true positive, and
+    ``finance_ledger``, a false one. ``derived_finance.observations.as_of`` is a
+    DATE, so an observation written at 15:40 is dated 00:00 that day and event
+    time trails write time by up to a day *while working perfectly*. Measured
+    2026-08-23: newest_event_at was 15.8h old against a 6h 'late' threshold.
+    """
+    ledger = pipeline("finance_ledger")
+    assert not ledger.event_interval_is_inherited
+    assert ledger.expected_data_interval == timedelta(hours=3)
+    assert ledger.event_interval is not None
+    assert ledger.event_interval > ledger.expected_data_interval * LATE_MULTIPLIER
+    # And it must still be able to see a genuinely frozen ledger.
+    assert ledger.event_interval <= timedelta(days=3)
+
+    # alice keeps event monitoring but on its own measured event cadence, which
+    # is far looser than its ingest cadence -- a person's recording habit is
+    # bursty, a daily poller writing nothing is not.
+    alice = pipeline("alice_voice_recordings")
+    assert not alice.event_interval_is_inherited
+    assert alice.event_interval is not None
+    assert alice.event_interval > alice.expected_data_interval
+
+
+# --- level 2 live behaviour (Postgres) ----------------------------------------
+
+
+def test_collector_writes_a_row_for_every_marts_view(warehouse):
+    _provision_every_table(warehouse)
+    _, _, marts = PipelineHealthCollector(warehouse).run_all()
+    assert {view.view_id for view in marts} == set(mart_view_ids())
+
+    rows = {
+        row["view_id"]: row
+        for row in warehouse._query_dicts(
+            "SELECT view_id, domain, view_schema, view_name, status, input_status,"
+            " probe_status, input_count, input_tables, definition_sha256,"
+            " first_seen_at, collected_at FROM @marts_mart_view_health"
+        )
+    }
+    assert set(rows) == set(mart_view_ids())
+    for row in rows.values():
+        assert row["definition_sha256"], row["view_id"]
+        assert row["first_seen_at"] is not None
+        assert row["collected_at"] is not None
+
+    # The declared-expensive view is skipped with a reason rather than timing
+    # the collection window out.
+    for view_id in EXPENSIVE_MART_VIEWS:
+        assert rows[view_id]["probe_status"] == PROBE_SKIPPED_EXPENSIVE
+
+
+def test_mart_inputs_are_resolved_from_pg_depend_not_a_hardcoded_map(warehouse):
+    """A view's inputs must come from the catalog, or the map rots on redefinition.
+
+    ``marts_ai_conversations.events`` unions the six agent-source event tables;
+    the resolver has to find all of them, including through intermediate views.
+    """
+    _provision_every_table(warehouse)
+    _, _, marts = PipelineHealthCollector(warehouse).run_all()
+    by_id = {view.view_id: view for view in marts}
+
+    conversations = by_id["ai_conversation_events"]
+    assert {
+        "claude_code_events",
+        "codex_events",
+        "openclaw_events",
+        "pi_events",
+        "claude_desktop_events",
+        "chatgpt_events",
+    } <= set(conversations.input_tables)
+
+    # A view over a view resolves to base tables, never to the intermediate.
+    for view in marts:
+        assert all(table in TABLE_PIPELINES for table in view.input_tables), view.view_id
+
+
+def test_a_stale_input_makes_the_mart_that_reads_it_stale(warehouse):
+    """Input-freshness roll-up: this is what surfaces `pi` through the mart.
+
+    ``pi`` went 38 days without a write against a 3-day SLA, and every consumer
+    of ``marts_ai_conversations.events`` was reading a source that had stopped
+    -- with nothing anywhere saying so.
+    """
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    stale_by = pipeline("pi").expected_data_interval
+    assert stale_by is not None
+    warehouse._command(
+        """
+        INSERT INTO @pi_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
+        VALUES ('z@x.test', 'pi', 's1', 'e1', %s, %s)
+        """,
+        (now - stale_by * (STALE_MULTIPLIER + 1), now - stale_by * (STALE_MULTIPLIER + 1)),
+    )
+    PipelineHealthCollector(warehouse).run_all()
+
+    row = warehouse._query_dicts(
+        "SELECT status, input_status, stalest_pipeline, stalest_pipeline_expected_seconds"
+        " FROM @marts_mart_view_health WHERE view_id = 'ai_conversation_events'"
+    )[0]
+    assert row["stalest_pipeline"] == "pi"
+    assert row["input_status"] == "stale"
+    assert row["status"] == "stale"
+    assert row["stalest_pipeline_expected_seconds"] == int(stale_by.total_seconds())
+
+
+def test_each_mart_input_is_judged_against_its_own_pipelines_sla(warehouse):
+    """Not simply the oldest input.
+
+    ``marts_ai_conversations.events`` reads six sources whose expectations
+    differ by an order of magnitude (``pi`` at 3 days, ``codex`` at 7). Ranking
+    by raw age would permanently nominate whichever source is legitimately the
+    quietest and never notice the one actually misbehaving.
+    """
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    codex_interval = pipeline("codex").expected_data_interval
+    pi_interval = pipeline("pi").expected_data_interval
+    assert codex_interval is not None and pi_interval is not None
+    assert codex_interval > pi_interval, "the fixture needs two different SLAs"
+    # codex is OLDER in absolute terms but still inside its own SLA; pi is
+    # younger yet past its tighter one. Raw-age ranking picks codex; the
+    # SLA-relative ranking that matters picks pi.
+    codex_age = codex_interval * LATE_MULTIPLIER - timedelta(hours=1)
+    pi_age = pi_interval * LATE_MULTIPLIER + timedelta(hours=1)
+    assert codex_age > pi_age
+    warehouse._command(
+        """
+        INSERT INTO @codex_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
+        VALUES ('z@x.test', 'codex', 's1', 'e1', %s, %s)
+        """,
+        (now - codex_age, now - codex_age),
+    )
+    warehouse._command(
+        """
+        INSERT INTO @pi_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
+        VALUES ('z@x.test', 'pi', 's1', 'e1', %s, %s)
+        """,
+        (now - pi_age, now - pi_age),
+    )
+    PipelineHealthCollector(warehouse).run_all()
+    row = warehouse._query_dicts(
+        "SELECT stalest_pipeline, input_status FROM @marts_mart_view_health"
+        " WHERE view_id = 'ai_conversation_events'"
+    )[0]
+    assert row["stalest_pipeline"] == "pi", (
+        "the input past its own SLA must win, not the one with the older timestamp"
+    )
+    assert row["input_status"] == "late"
+
+
+def test_a_bounded_non_empty_probe_reports_empty_rather_than_hanging(warehouse):
+    _provision_every_table(warehouse)
+    _, _, marts = PipelineHealthCollector(warehouse).run_all()
+    probed = [
+        view
+        for view in marts
+        if view.probe_status not in {PROBE_SKIPPED_EXPENSIVE, PROBE_MISSING}
+    ]
+    assert probed
+    # Nothing is seeded, so every probeable view is empty -- and says so.
+    assert {view.probe_status for view in probed} <= {PROBE_EMPTY, PROBE_OK}
+    for view in probed:
+        assert view.probe_ms < MART_PROBE_STATEMENT_TIMEOUT_MS
+
+    row = warehouse._query_dicts(
+        "SELECT status, probe_status, has_rows FROM @marts_mart_view_health"
+        " WHERE view_id = %s",
+        (probed[0].view_id,),
+    )[0]
+    assert row["probe_status"] in {PROBE_EMPTY, PROBE_OK}
+    assert row["has_rows"] in (0, 1)
+
+
+def test_a_redefined_view_is_visible_as_definition_drift(warehouse):
+    """A redefinition that silently drops a source table changes no rows.
+
+    So the definition itself is what is watched: the hash changes and
+    ``first_seen_at`` resets, which is the only signal such a change produces.
+    """
+    _provision_every_table(warehouse)
+    collector = PipelineHealthCollector(warehouse)
+    _, _, first = collector.run_all()
+    before = {view.view_id: (view.definition_sha256, view.first_seen_at) for view in first}
+
+    # A stable second collection must NOT report drift.
+    _, _, second = collector.run_all()
+    for view in second:
+        assert view.definition_sha256 == before[view.view_id][0], view.view_id
+        assert view.first_seen_at == before[view.view_id][1], view.view_id
+
+    # A leaf mart, redefined to read nothing -- the shape of a redefinition that
+    # silently drops a source table.
+    view_id = "slack_image_fingerprints"
+    assert before[view_id][0]
+    target = relation(view_id).with_namespace(warehouse.schema_namespace)
+    warehouse._command(f'DROP VIEW "{target.schema}"."{target.name}"')
+    warehouse._command(
+        f'CREATE VIEW "{target.schema}"."{target.name}" AS SELECT 1::bigint AS placeholder'
+    )
+    _, _, third = collector.run_all()
+    changed = {view.view_id: view for view in third}[view_id]
+    assert changed.definition_sha256 != before[view_id][0]
+    assert changed.first_seen_at != before[view_id][1]
+    # The inputs it no longer reads are gone from the recorded list, which is
+    # the drop this check exists to make visible.
+    assert changed.input_tables == []
+    assert before[view_id][0] and view_id in before
+
+
+def test_a_stale_mart_snapshot_reports_unknown(warehouse):
+    _provision_every_table(warehouse)
+    collector = PipelineHealthCollector(warehouse)
+    pipelines, tables = collector.collect()
+    marts = collector.collect_marts(pipelines, tables)
+    old = datetime.now(tz=UTC) - timedelta(seconds=COLLECTOR_STALE_SECONDS * 2)
+    warehouse.write_mart_view_health(marts, collected_at=old)
+    statuses = {
+        row["status"]
+        for row in warehouse._query_dicts("SELECT status FROM @marts_mart_view_health")
+    }
+    assert statuses == {"unknown"}
+
+
+def test_mart_health_is_readable_by_the_query_role(warehouse):
+    _provision_every_table(warehouse)
+    PipelineHealthCollector(warehouse).run_all()
+    connection = warehouse.read_only_connection()
+    try:
+        with connection.cursor() as cursor:
+            rel = relation("marts_mart_view_health").with_namespace(
+                warehouse.schema_namespace
+            )
+            cursor.execute(f'SELECT count(*) FROM "{rel.schema}"."{rel.name}"')
+            assert cursor.fetchone()[0] == len(mart_view_ids())
+    finally:
+        connection.close()
+
+
+def test_event_lateness_escalates_but_a_measurement_gap_never_does(warehouse):
+    """Judging ``newest_event_at`` must not turn "we did not look" into red."""
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    event_interval = pipeline("gmail").event_interval
+    assert event_interval is not None
+
+    def collect(event_age: timedelta) -> dict:
+        warehouse._command("DELETE FROM @gmail_messages")
+        warehouse._command(
+            """
+            INSERT INTO @gmail_messages (account, message_id, synced_at, internal_date)
+            VALUES ('z@x.test', 'm1', %s, %s)
+            """,
+            (now, now - event_age),
+        )
+        PipelineHealthCollector(warehouse).run_all()
+        return warehouse._query_dicts(
+            "SELECT status, data_status, event_status, event_age_seconds,"
+            " expected_event_interval_seconds, event_tables_probed"
+            " FROM @marts_pipeline_health WHERE pipeline = 'gmail'"
+        )[0]
+
+    fresh = collect(timedelta(minutes=1))
+    assert fresh["event_status"] == "ok"
+    assert fresh["status"] == "ok"
+    assert fresh["expected_event_interval_seconds"] == int(event_interval.total_seconds())
+
+    late = collect(event_interval * (LATE_MULTIPLIER + 1))
+    # The write is current; only the event time is behind. Before this shipped
+    # that combination was reported 'ok'.
+    assert late["data_status"] == "ok"
+    assert late["event_status"] == "late"
+    assert late["status"] == "late"
+
+    stale = collect(event_interval * (STALE_MULTIPLIER + 1))
+    assert stale["event_status"] == "stale"
+    assert stale["status"] == "stale"
+
+    # A pipeline whose data tables declare no event column at all is
+    # 'unmonitored', never 'no_data'.
+    unmonitored = warehouse._query_dicts(
+        "SELECT event_status, expected_event_interval_seconds"
+        " FROM @marts_pipeline_health WHERE pipeline = 'pipeline_health'"
+    )[0]
+    assert unmonitored["expected_event_interval_seconds"] == 0
+    assert unmonitored["event_status"] == "unmonitored"
+
+
+def test_an_unmeasured_event_column_is_not_reported_as_no_data(warehouse):
+    """``google_drive`` and ``attachment_enrichment`` DO declare an event column.
+
+    It sits on a 376 MiB / 561 MiB heap with no index leading with it, so the
+    collector skips the ``max()`` by design. That is 'unmeasured' -- a different
+    and much quieter claim than "nothing has ever arrived", and it must never
+    colour the pipeline late or stale.
+    """
+    _provision_every_table(warehouse)
+    collector = PipelineHealthCollector(warehouse)
+    pipelines, tables = collector.collect()
+    drive = next(entry for entry in pipelines if entry.pipeline == "google_drive")
+    # Force the "declared but unmeasured" shape the production heap produces.
+    drive.newest_event_at = None
+    drive.event_tables_probed = 0
+    warehouse.write_pipeline_health(pipelines, tables, collected_at=datetime.now(tz=UTC))
+    row = warehouse._query_dicts(
+        "SELECT status, event_status FROM @marts_pipeline_health WHERE pipeline = 'google_drive'"
+    )[0]
+    assert row["event_status"] == "unmeasured"
+    assert row["status"] not in {"late", "stale"}
+
+
+def test_a_mart_is_never_more_broken_than_the_pipelines_feeding_it(warehouse):
+    """The measured false positive this rule exists to prevent.
+
+    The registry declares an SLA per PIPELINE, and a pipeline's own freshness is
+    a ``max()`` over its data tables — deliberately, because a pipeline is not
+    broken just because one of its tables is quiet. Judging an individual input
+    TABLE against its pipeline's interval breaks that symmetry: measured against
+    production 2026-08-23 it reported four marts 'stale'
+    (``marts_finance.transactions``, ``marts_finance.account_freshness``,
+    ``marts_finance.position_coverage``, ``marts_receipts.transaction_receipts``)
+    because ``derived_finance.transactions`` was 1.1 days old against
+    ``finance_ledger``'s three-hour interval — while the ledger was writing
+    balance observations every half hour exactly as designed.
+
+    So the invariant is: a mart's input_status can never be worse than the
+    worst data_status of the pipelines feeding it. The per-table detail lives in
+    marts_ops.table_freshness, which is where a quiet table inside a healthy
+    pipeline belongs.
+    """
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    ledger = pipeline("finance_ledger")
+    assert ledger.expected_data_interval is not None
+    # The ledger's transactions table is far past the pipeline's interval while
+    # its observations table -- the one the pipeline's freshness actually comes
+    # from -- was written seconds ago. That is the healthy production shape.
+    warehouse._command(
+        """
+        INSERT INTO @finance_transactions
+            (transaction_id, account_id, posted_at, created_at)
+        VALUES ('t1', 'fa_1', %s, %s)
+        """,
+        (now - timedelta(days=2), now - timedelta(days=2)),
+    )
+    warehouse._command(
+        """
+        INSERT INTO @finance_observations
+            (account_id, as_of, kind, source, observed_at)
+        VALUES ('fa_1', %s, 'balance', 'plaid', %s)
+        """,
+        (now.date(), now),
+    )
+    PipelineHealthCollector(warehouse).run_all()
+
+    ledger_status = warehouse._query_dicts(
+        "SELECT data_status FROM @marts_pipeline_health WHERE pipeline = 'finance_ledger'"
+    )[0]["data_status"]
+    assert ledger_status == "ok", "fixture must model a HEALTHY ledger with one quiet table"
+
+    rows = warehouse._query_dicts(
+        "SELECT view_id, input_status, stalest_pipeline FROM @marts_mart_view_health"
+        " WHERE 'finance_ledger' = ANY(input_pipelines)"
+    )
+    assert rows, "expected marts fed by the finance ledger"
+    for row in rows:
+        assert row["input_status"] in {"ok", "unmeasured"}, (
+            f"{row['view_id']} reported {row['input_status']} off a healthy ledger; "
+            "input freshness must be judged per pipeline, not per table"
+        )
+
+
+def test_mart_input_pipelines_are_recorded_alongside_the_tables(warehouse):
+    """Both facts are stored: the tables are the pg_depend evidence and the
+    drift signal, the pipelines are what gets judged."""
+    _provision_every_table(warehouse)
+    _, _, marts = PipelineHealthCollector(warehouse).run_all()
+    by_id = {view.view_id: view for view in marts}
+    conversations = by_id["ai_conversation_events"]
+    assert "pi" in conversations.input_pipelines
+    assert "codex" in conversations.input_pipelines
+    for view in marts:
+        assert set(view.input_pipelines) <= {entry.id for entry in PIPELINES}, view.view_id
+        # Every named pipeline must be reachable from a recorded input table --
+        # the two lists describe the same dependency, at two grains.
+        derived = {
+            TABLE_PIPELINES[table].pipeline
+            for table in view.input_tables
+            if TABLE_PIPELINES[table].role != "state"
+        }
+        assert set(view.input_pipelines) == derived, view.view_id

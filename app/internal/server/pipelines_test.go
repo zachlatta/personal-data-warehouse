@@ -228,3 +228,269 @@ func TestPipelinesPageExplainsEveryStatus(t *testing.T) {
 		}
 	}
 }
+
+// --- levels 2-4: marts, timeline adapters, collation integrity ---------------
+
+func martHealthRow(viewID, status, inputStatus string) map[string]any {
+	return map[string]any{
+		"view_id": viewID, "domain": "ai_conversations",
+		"view_schema": "marts_ai_conversations", "view_name": "events",
+		"status": status, "input_status": inputStatus, "probe_status": "ok",
+		"probe_detail": nil, "probe_ms": int64(4), "has_rows": int64(1),
+		"input_tables":                      []any{"pi_events", "codex_events"},
+		"input_count":                       int64(2),
+		"inputs_unmeasured":                 int64(0),
+		"stalest_pipeline":                  "pi",
+		"input_pipelines":                   []any{"pi", "codex"},
+		"stalest_pipeline_at":               "2026-07-20T11:15:47Z",
+		"stalest_pipeline_age_seconds":      int64(604800),
+		"stalest_pipeline_expected_seconds": int64(259200),
+		"definition_sha256":                 "abc123def456",
+		"first_seen_at":                     "2026-07-01T00:00:00Z",
+		"definition_age_seconds":            int64(2246400),
+		"collected_at":                      "2026-07-27T11:21:00Z",
+		"note":                              "",
+	}
+}
+
+func adapterHealthRow(adapter, status string) map[string]any {
+	return map[string]any{
+		"adapter": adapter, "status": status,
+		"backfill_done": int64(1), "backfill_rows": int64(1200), "incremental_rows": int64(34),
+		"watermark_ingest_ts": "2026-07-27T11:00:00Z", "last_run_at": "2026-07-27T11:20:00Z",
+		"watermark_age_seconds": int64(1260), "run_age_seconds": int64(60),
+		"last_error": nil, "updated_at": "2026-07-27T11:20:00Z",
+	}
+}
+
+func collationHealthRow(objectID, scope, status, finding string) map[string]any {
+	return map[string]any{
+		"object_id": objectID, "scope": scope, "object_name": objectID,
+		"status": status, "finding": finding,
+		"detail":   "this database cannot detect collation drift; text index ordering is unverified",
+		"provider": "database default", "recorded_version": nil, "actual_version": "2.36",
+		"dependent_indexes": int64(188), "table_name": nil,
+		"is_unique": int64(0), "is_partial": int64(0), "predicate": nil,
+		"key_columns": []any{}, "heap_rows": int64(0), "distinct_keys": int64(0),
+		"excess_rows": int64(0), "probe_ms": int64(0),
+		"collected_at": "2026-07-27T11:21:00Z",
+	}
+}
+
+func newFullPipelinesTestRunner() *fakeTimelineRunner {
+	runner := newPipelinesTestRunner()
+	runner.argResults[warehouse.SQLRelation("marts_mart_view_health")] = query.RawResult{
+		Columns: []string{"view_id"},
+		Rows: []map[string]any{
+			martHealthRow("ai_conversation_events", "stale", "stale"),
+			martHealthRow("marts_finance_net_worth", "ok", "ok"),
+		},
+	}
+	runner.argResults[warehouse.SQLRelation("marts_timeline_adapter_health")] = query.RawResult{
+		Columns: []string{"adapter"},
+		Rows: []map[string]any{
+			adapterHealthRow("gmail", "ok"),
+			adapterHealthRow("pi", "failing"),
+		},
+	}
+	runner.argResults[warehouse.SQLRelation("marts_collation_health")] = query.RawResult{
+		Columns: []string{"object_id"},
+		Rows: []map[string]any{
+			collationHealthRow("database", "database", "attention", "no_baseline"),
+			collationHealthRow("index:base_slack.messages_pkey", "index", "ok", "ok"),
+		},
+	}
+	return runner
+}
+
+// All four levels have to reach the browser, or the SQL surface and the web
+// surface disagree about what the warehouse's health is.
+func TestPipelinesAPIReturnsEveryHealthLevel(t *testing.T) {
+	srv := newTimelineTestServer(t, newFullPipelinesTestRunner())
+	resp, body := timelineGET(t, srv, "/api/pipelines", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var payload struct {
+		Pipelines []map[string]any `json:"pipelines"`
+		Tables    []map[string]any `json:"tables"`
+		Marts     []map[string]any `json:"marts"`
+		Adapters  []map[string]any `json:"adapters"`
+		Collation []map[string]any `json:"collation"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if len(payload.Marts) != 2 {
+		t.Fatalf("expected the marts layer in the payload, got %d rows", len(payload.Marts))
+	}
+	if len(payload.Adapters) != 2 {
+		t.Fatalf("expected timeline adapter health in the payload, got %d rows", len(payload.Adapters))
+	}
+	if len(payload.Collation) != 2 {
+		t.Fatalf("expected collation health in the payload, got %d rows", len(payload.Collation))
+	}
+	if payload.Marts[0]["stalest_pipeline"] != "pi" {
+		t.Fatalf("mart rows must carry the stalest pipeline: %v", payload.Marts[0])
+	}
+}
+
+// Each supplementary level is provisioned by a different ensure path and a
+// different collector, so one of them missing must not take the whole dashboard
+// down: the four levels that DO work are exactly what a health page is for.
+func TestPipelinesAPIDegradesPerLevel(t *testing.T) {
+	for _, relation := range []string{
+		warehouse.SQLRelation("marts_mart_view_health"),
+		warehouse.SQLRelation("marts_timeline_adapter_health"),
+		warehouse.SQLRelation("marts_collation_health"),
+	} {
+		runner := newFullPipelinesTestRunner()
+		runner.argErrs = map[string]error{
+			relation: errors.New(`ERROR: relation does not exist (SQLSTATE 42P01)`),
+		}
+		srv := newTimelineTestServer(t, runner)
+		resp, body := timelineGET(t, srv, "/api/pipelines", true)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s missing must not fail the request, got %d: %s", relation, resp.StatusCode, body)
+		}
+		var payload struct {
+			Pipelines []map[string]any `json:"pipelines"`
+			Marts     []map[string]any `json:"marts"`
+			Adapters  []map[string]any `json:"adapters"`
+			Collation []map[string]any `json:"collation"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("decode: %v (%s)", err, body)
+		}
+		if len(payload.Pipelines) != 2 {
+			t.Fatalf("%s missing must not hide the pipeline rows: %s", relation, body)
+		}
+		// The absent level answers with an empty slice, never null: the page
+		// iterates these without a nil check, like every other row list here.
+		if payload.Marts == nil || payload.Adapters == nil || payload.Collation == nil {
+			t.Fatalf("%s missing produced a null level: %s", relation, body)
+		}
+	}
+}
+
+// Same rule as the pipeline rows: read the published marts_ops views, never the
+// ops snapshot tables, because the app's runner assumes the read-only role.
+func TestPipelinesAPIReadsEveryHealthLevelThroughMarts(t *testing.T) {
+	runner := newFullPipelinesTestRunner()
+	srv := newTimelineTestServer(t, runner)
+	if resp, body := timelineGET(t, srv, "/api/pipelines", true); resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	seen := make([]string, 0, runner.callCount())
+	for i := 0; i < runner.callCount(); i++ {
+		seen = append(seen, runner.call(i).SQL)
+	}
+	joined := strings.Join(seen, "\n")
+	for _, relation := range []string{
+		warehouse.SQLRelation("marts_mart_view_health"),
+		warehouse.SQLRelation("marts_timeline_adapter_health"),
+		warehouse.SQLRelation("marts_collation_health"),
+	} {
+		if !strings.Contains(joined, relation) {
+			t.Fatalf("expected a query against %s, got:\n%s", relation, joined)
+		}
+	}
+	for _, forbidden := range []string{
+		warehouse.SQLRelation("mart_view_health"),
+		warehouse.SQLRelation("collation_health"),
+	} {
+		if strings.Contains(joined, forbidden+"\n") {
+			t.Fatalf("dashboard must not read the ops snapshot table %s directly:\n%s", forbidden, joined)
+		}
+	}
+}
+
+// newest_event_at was collected, stored, shipped and rendered for months and
+// never judged. The API has to carry the verdict, or the page cannot show it.
+func TestPipelinesAPICarriesTheEventVerdict(t *testing.T) {
+	runner := newFullPipelinesTestRunner()
+	srv := newTimelineTestServer(t, runner)
+	if resp, body := timelineGET(t, srv, "/api/pipelines", true); resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	joined := ""
+	for i := 0; i < runner.callCount(); i++ {
+		joined += runner.call(i).SQL + "\n"
+	}
+	for _, column := range []string{
+		"event_status", "event_age_seconds", "expected_event_interval_seconds",
+		"event_tables_probed", "data_basis",
+	} {
+		if !strings.Contains(joined, column) {
+			t.Fatalf("the pipeline query must select %s:\n%s", column, joined)
+		}
+	}
+}
+
+// A section nobody can read is a section nobody acts on.
+func TestPipelinesPageRendersEveryHealthLevel(t *testing.T) {
+	for _, needle := range []string{
+		"marts_ops.mart_view_health",
+		"marts_ops.timeline_adapter_health",
+		"marts_ops.collation_health",
+		"stalest pipeline",
+		"definition",
+		"amcheck",
+		"pg_database.datcollversion",
+	} {
+		if !strings.Contains(pipelinesPageHTML, needle) {
+			t.Fatalf("pipelines page is missing %q", needle)
+		}
+	}
+}
+
+// The statuses only these levels can emit need a color and a tooltip too, or a
+// mart with an unmeasured input renders as an unexplained gray row.
+func TestPipelinesPageExplainsTheNewStatuses(t *testing.T) {
+	for _, status := range []string{"backfilling", "unmeasured", "unmonitored"} {
+		if !strings.Contains(pipelinesPageHTML, status+": ") {
+			t.Fatalf("page does not colour status %q", status)
+		}
+		if !strings.Contains(pipelinesPageHTML, status+":") {
+			t.Fatalf("page does not explain status %q", status)
+		}
+	}
+}
+
+// "we did not look" must not read as "nothing ever arrived", and the page has
+// to say which one it means.
+func TestPipelinesPageDistinguishesUnmeasuredFromNoData(t *testing.T) {
+	if !strings.Contains(pipelinesPageHTML, "we did not look") {
+		t.Fatal("page must explain that unmeasured is not no_data")
+	}
+	if !strings.Contains(pipelinesPageHTML, "nothing has ever arrived") {
+		t.Fatal("page must still explain no_data")
+	}
+}
+
+// A Postgres text[] reaches the browser as the raw array literal "{a,b,c}",
+// not as a JSON array — so a string whose .length is truthy and whose .join is
+// undefined. Calling .join on one threw inside the marts section and, because
+// load()'s catch swallows the error into the status line, silently blanked
+// every section rendered after it: marts, adapters, integrity, the snapshot
+// counts and the legend all disappeared while the pipeline rows above them
+// looked perfectly fine.
+func TestPipelinesPageNormalizesPostgresArrayLiterals(t *testing.T) {
+	if !strings.Contains(pipelinesPageHTML, "function list(value)") {
+		t.Fatal("page must carry the text[] literal normalizer")
+	}
+	for _, field := range []string{"input_pipelines", "input_tables", "key_columns"} {
+		if strings.Contains(pipelinesPageHTML, "."+field+".join") {
+			t.Fatalf("%s is a Postgres text[] literal; run it through list() before .join", field)
+		}
+		if strings.Contains(pipelinesPageHTML, "."+field+".length") {
+			t.Fatalf("%s is a Postgres text[] literal; .length on the raw string is meaningless", field)
+		}
+	}
+	if !strings.Contains(pipelinesPageHTML, "list(m.input_pipelines)") {
+		t.Fatal("the marts row must normalize input_pipelines")
+	}
+	if !strings.Contains(pipelinesPageHTML, "list(m.input_tables)") {
+		t.Fatal("the marts row must normalize input_tables")
+	}
+}

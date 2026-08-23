@@ -17,13 +17,20 @@ import (
 const (
 	pipelinesMaxRows      = 500
 	pipelinesTableMaxRows = 1000
+	// The marts layer is ~35 views, the timeline ~25 adapters, and the
+	// collation snapshot one row per checked collation plus one per probed
+	// unique index (~110 in production). All tiny.
+	pipelinesMartMaxRows      = 500
+	pipelinesAdapterMaxRows   = 500
+	pipelinesCollationMaxRows = 2000
 )
 
 var pipelineHealthSQL = `
 SELECT pipeline, label, kind, cadence, transport, status, data_status, run_status,
-       last_write_at, newest_event_at, last_run_at,
-       data_age_seconds, run_age_seconds,
+       event_status, last_write_at, newest_event_at, last_run_at,
+       data_age_seconds, run_age_seconds, event_age_seconds,
        expected_data_interval_seconds, expected_run_interval_seconds,
+       expected_event_interval_seconds, event_tables_probed, data_basis,
        row_estimate, byte_size, table_count, tables_probed, tables_skipped,
        state_table, state_rows, state_error_rows, state_attention_rows,
        last_error, last_error_at, collected_at, snapshot_age_seconds, note
@@ -37,6 +44,38 @@ SELECT table_id, pipeline, role, layer, table_schema, table_name,
        probe_status, probe_detail, probe_ms, collected_at, note
 FROM ` + warehouse.SQLRelation("marts_pipeline_table_freshness") + `
 ORDER BY pipeline, role, table_id`
+
+// Level 2: the marts_* read interface. A view has no stamped column to measure,
+// so these rows carry input freshness, a bounded non-empty probe, and the
+// definition hash instead.
+var pipelineMartHealthSQL = `
+SELECT view_id, domain, view_schema, view_name, status, input_status, probe_status,
+       probe_detail, probe_ms, has_rows, input_tables, input_pipelines, input_count, inputs_unmeasured,
+       stalest_pipeline, stalest_pipeline_at, stalest_pipeline_age_seconds,
+       stalest_pipeline_expected_seconds, definition_sha256, first_seen_at,
+       definition_age_seconds, collected_at, note
+FROM ` + warehouse.SQLRelation("marts_mart_view_health") + `
+ORDER BY view_schema, view_name`
+
+// Level 3: per-adapter timeline currency. The single `timeline` pipeline row is
+// a max() over every adapter, so one frozen adapter hides behind the rest.
+var pipelineAdapterHealthSQL = `
+SELECT adapter, status, backfill_done, backfill_rows, incremental_rows,
+       watermark_ingest_ts, last_run_at, watermark_age_seconds, run_age_seconds,
+       last_error, updated_at
+FROM ` + warehouse.SQLRelation("marts_timeline_adapter_health") + `
+ORDER BY adapter`
+
+// Level 4: collation drift and unique-index divergence. Postgres cannot warn
+// about the former on this database (no recorded baseline, and REFRESH
+// COLLATION VERSION refuses to create one from NULL), so this is the only cover.
+var pipelineCollationHealthSQL = `
+SELECT object_id, scope, object_name, status, finding, detail, provider,
+       recorded_version, actual_version, dependent_indexes, table_name,
+       is_unique, is_partial, predicate, key_columns, heap_rows, distinct_keys,
+       excess_rows, probe_ms, collected_at
+FROM ` + warehouse.SQLRelation("marts_collation_health") + `
+ORDER BY scope, object_name`
 
 type pipelineService struct {
 	warehouse timelineQuerier
@@ -64,6 +103,9 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 			writeJSON(w, map[string]any{
 				"pipelines":  []map[string]any{},
 				"tables":     []map[string]any{},
+				"marts":      []map[string]any{},
+				"adapters":   []map[string]any{},
+				"collation":  []map[string]any{},
 				"server_now": s.now().UTC().Format(time.RFC3339Nano),
 				"pending":    true,
 			})
@@ -79,11 +121,42 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 		httpError(w, http.StatusInternalServerError, "pipeline table freshness query failed")
 		return
 	}
+	// The three levels below the pipeline roll-up degrade independently. Each
+	// one is provisioned by a different ensure path and a different collector,
+	// so a deploy can legitimately have the pipeline views before the mart or
+	// collation snapshot exists. Answering 500 for the whole dashboard because
+	// one of them is still warming would hide the four levels that DO work,
+	// which is the opposite of what a health page is for.
+	marts := s.optionalRows(r, "mart health", pipelineMartHealthSQL, pipelinesMartMaxRows)
+	adapters := s.optionalRows(r, "timeline adapter health", pipelineAdapterHealthSQL, pipelinesAdapterMaxRows)
+	collation := s.optionalRows(r, "collation health", pipelineCollationHealthSQL, pipelinesCollationMaxRows)
 	writeJSON(w, map[string]any{
 		"pipelines":  nonNilRows(pipelines.Rows),
 		"tables":     nonNilRows(tables.Rows),
+		"marts":      marts,
+		"adapters":   adapters,
+		"collation":  collation,
 		"server_now": s.now().UTC().Format(time.RFC3339Nano),
 	})
+}
+
+// optionalRows runs a supplementary health query, answering with an empty slice
+// rather than failing the request when its relation has not been provisioned or
+// its query errors. A missing relation is logged at info (a warming deploy); a
+// real error is logged at error but still does not take the page down.
+func (s *pipelineService) optionalRows(
+	r *http.Request, label, sql string, maxRows int,
+) []map[string]any {
+	result, err := s.warehouse.QueryArgs(r.Context(), sql, nil, maxRows)
+	if err != nil {
+		if isMissingRelation(err) {
+			s.logger.InfoContext(r.Context(), label+" view not provisioned yet", "error", err)
+		} else {
+			s.logger.ErrorContext(r.Context(), label+" query failed", "error", err)
+		}
+		return []map[string]any{}
+	}
+	return nonNilRows(result.Rows)
 }
 
 // isMissingRelation recognizes Postgres's undefined_table/undefined_view report.

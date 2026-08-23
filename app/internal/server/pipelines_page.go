@@ -173,6 +173,9 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
 <div id="page">
   <div id="tiles"></div>
   <div id="groups"></div>
+  <div id="marts"></div>
+  <div id="adapters"></div>
+  <div id="collation"></div>
   <div id="status"></div>
   <div id="legend"></div>
 </div>
@@ -195,11 +198,15 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
 
   // Worst first: the point of the page is the exceptions, so this order drives
   // both the tiles and the sort inside every group.
-  var SEVERITY = ["failing", "stale", "attention", "late", "unknown", "no_data", "manual", "ok"];
+  var SEVERITY = [
+    "failing", "stale", "attention", "late", "unknown",
+    "backfilling", "no_data", "unmeasured", "unmonitored", "manual", "ok"
+  ];
   var COLORS = {
     ok: "var(--ok)", late: "var(--late)", stale: "var(--stale)", failing: "var(--failing)",
     attention: "var(--attention)", manual: "var(--manual)", no_data: "var(--nodata)",
-    unknown: "var(--unknown)"
+    unknown: "var(--unknown)", backfilling: "var(--manual)",
+    unmeasured: "var(--nodata)", unmonitored: "var(--nodata)"
   };
   var KINDS = [
     ["source", "sources — data coming in from the outside world"],
@@ -215,12 +222,25 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     attention: "needs a manual step (a re-link, a re-login)",
     manual: "no cadence expected (manual uploads)",
     no_data: "nothing has ever arrived",
-    unknown: "the freshness snapshot itself is stale — check the pipeline_health asset"
+    unknown: "the freshness snapshot itself is stale — check the pipeline_health asset",
+    backfilling: "still working through its historical backlog",
+    unmeasured: "we did not look — the probe was too expensive to afford, which is not the same claim as no data",
+    unmonitored: "nothing declares an expectation here, so there is nothing to be late against"
   };
+  // The four levels this dashboard covers, worst first inside each. They are
+  // deliberately separate surfaces rather than one flat list: a pipeline, a
+  // mart, a timeline adapter and a corrupt index each fail for different
+  // reasons and are repaired in different places.
+  var LEVELS = [
+    ["marts", "marts — the read interface, judged on the freshness of what it reads"],
+    ["adapters", "timeline adapters — is THIS kind of data reaching timeline.events"],
+    ["collation", "integrity — collation drift and unique-index divergence"]
+  ];
 
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
-    pipelines: [], tables: [], skew: 0, filter: "", attentionOnly: false, open: {}
+    pipelines: [], tables: [], marts: [], adapters: [], collation: [],
+    skew: 0, filter: "", attentionOnly: false, open: {}
   };
 
   // Share the timeline page's token handoff (#token= / ?token=) so one link
@@ -300,6 +320,21 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
     return (v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)) + " " + units[i];
   }
+  // A Postgres text[] arrives from the query runner as the raw array literal
+  // "{a,b,c}", not as a JSON array, so anything that treats it as one gets a
+  // string whose .length is truthy and whose .join is undefined. That threw
+  // inside the marts section and, because load()'s catch swallows it into the
+  // status line, silently blanked every section rendered after it.
+  function list(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value !== "string") return [];
+    var body = value.replace(/^\{/, "").replace(/\}$/, "").trim();
+    if (!body) return [];
+    return body.split(",").map(function (item) {
+      return item.replace(/^"/, "").replace(/"$/, "");
+    });
+  }
+
   function interval(seconds) {
     if (!seconds) return "no expectation";
     if (seconds < 3600) return "every " + Math.round(seconds / 60) + "m expected";
@@ -309,16 +344,34 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
 
   /* ---- render ---- */
   function visible() {
-    return state.pipelines.filter(function (p) {
-      if (state.attentionOnly && ["ok", "manual"].indexOf(p.status) !== -1) return false;
-      if (state.filter && p.status !== state.filter) return false;
-      return true;
-    });
+    return state.pipelines.filter(matchesFilter);
+  }
+
+  // Everything the dashboard monitors, across all four levels. The tiles are a
+  // roll-up over this rather than over pipelines alone: a corrupt unique index
+  // and a frozen timeline adapter are exceptions too, and burying them under a
+  // pipelines-only count is how the page stops being the place you look.
+  function everything() {
+    return state.pipelines
+      .concat(state.marts)
+      .concat(state.adapters)
+      .concat(state.collation);
+  }
+
+  function matchesFilter(row) {
+    if (state.attentionOnly &&
+        ["ok", "manual", "unmonitored", "unmeasured"].indexOf(row.status) !== -1) return false;
+    if (state.filter && row.status !== state.filter) return false;
+    return true;
+  }
+
+  function bySeverity(a, b) {
+    return SEVERITY.indexOf(a.status) - SEVERITY.indexOf(b.status);
   }
 
   function renderTiles() {
     var counts = {};
-    state.pipelines.forEach(function (p) { counts[p.status] = (counts[p.status] || 0) + 1; });
+    everything().forEach(function (p) { counts[p.status] = (counts[p.status] || 0) + 1; });
     var node = el("tiles");
     node.textContent = "";
     SEVERITY.forEach(function (status) {
@@ -367,8 +420,19 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     var dataAge = ageOf(p.last_write_at);
     head.appendChild(column("last data", p.last_write_at ? ago(dataAge) + " ago" : "never",
       false, stamp(p.last_write_at)));
-    head.appendChild(column("newest event", p.newest_event_at ? stamp(p.newest_event_at).split(",")[0] : "—",
-      true, p.newest_event_at ? stamp(p.newest_event_at) : ""));
+    // The newest real-world event, and — since 2026-08-23 — its verdict. This
+    // column was rendered and never judged, which is how a green dot sat beside
+    // an event 118 days old.
+    var eventCol = column("newest event",
+      p.newest_event_at ? ago(ageOf(p.newest_event_at)) + " ago" : "—",
+      true,
+      (p.newest_event_at ? stamp(p.newest_event_at) + " · " : "") +
+        "event freshness: " + (p.event_status || "—") + " · " +
+        (STATUS_HELP[p.event_status] || ""));
+    if (p.event_status === "late" || p.event_status === "stale") {
+      eventCol.querySelector(".v").style.color = COLORS[p.event_status];
+    }
+    head.appendChild(eventCol);
     var runAge = ageOf(p.last_run_at);
     head.appendChild(column("last run", p.last_run_at ? ago(runAge) + " ago" : "no heartbeat",
       true, p.last_run_at ? stamp(p.last_run_at) : "this pipeline keeps no run state in the warehouse"));
@@ -446,6 +510,23 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
         (p.expected_run_interval_seconds ? interval(p.expected_run_interval_seconds) : "no cadence expected")
       ));
     }
+    // Where the data SLA came from. A month-long interval that nobody can
+    // re-derive is a number that rots; seven of them did, and pi could not
+    // reach 'late' inside sixty days as a result.
+    if (p.data_basis) {
+      meta.appendChild(h("br"));
+      meta.appendChild(h("b", "", "data sla "));
+      meta.appendChild(document.createTextNode(
+        interval(p.expected_data_interval_seconds) + " — " + p.data_basis
+      ));
+    }
+    if (p.expected_event_interval_seconds) {
+      meta.appendChild(h("br"));
+      meta.appendChild(h("b", "", "event sla "));
+      meta.appendChild(document.createTextNode(
+        interval(p.expected_event_interval_seconds) + " · " + (p.event_status || "—")
+      ));
+    }
     box.appendChild(meta);
 
     var table = h("table", "tbl");
@@ -513,6 +594,143 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     }
   }
 
+  /* ---- levels 2-4: marts, timeline adapters, integrity ---- */
+
+  // One row renderer for all three, in the same shape as a pipeline row: dot,
+  // name, up to three columns, status word, optional detail line. Extending the
+  // existing idiom rather than inventing a second one keeps the whole page
+  // readable at a glance and scanning worst-first the same way.
+  function healthRow(item, name, subtitle, columns, detail) {
+    var wrap = h("div", "pl");
+    wrap.style.borderLeftColor = COLORS[item.status] || "var(--line2)";
+    var head = h("div", "plhead");
+    var dot = h("div", "dot");
+    dot.style.background = COLORS[item.status] || "var(--nodata)";
+    head.appendChild(dot);
+
+    var nm = h("div", "nm");
+    nm.appendChild(h("div", "", name));
+    if (subtitle) nm.appendChild(h("div", "cad", subtitle));
+    head.appendChild(nm);
+
+    columns.forEach(function (col) {
+      head.appendChild(column(col[0], col[1], col[3] === true, col[2]));
+    });
+    while (head.children.length < 6) head.appendChild(h("div", "col hide"));
+
+    var st = h("div", "st", (item.status || "").replace(/_/g, " "));
+    st.style.color = COLORS[item.status];
+    st.title = STATUS_HELP[item.status] || "";
+    head.appendChild(st);
+    wrap.appendChild(head);
+    if (detail) {
+      var line = h("div", "plnote", detail);
+      line.title = detail;
+      if (item.status === "failing" || item.status === "stale") {
+        line.style.color = COLORS[item.status];
+      }
+      wrap.appendChild(line);
+    }
+    return wrap;
+  }
+
+  function martNode(m) {
+    var stalest = m.stalest_pipeline
+      ? m.stalest_pipeline + " " + ago(ageOf(m.stalest_pipeline_at)) + " ago"
+      : (m.inputs_unmeasured ? "unmeasured" : "—");
+    var pipes = list(m.input_pipelines);
+    var inputs = list(m.input_tables);
+    return healthRow(m,
+      m.view_schema + "." + m.view_name,
+      m.input_count + " input table(s)" + (pipes.length ? " from " + pipes.join(", ") : "") +
+        (inputs.length ? " · " + inputs.join(", ") : ""),
+      [
+        ["stalest pipeline", stalest, m.stalest_pipeline_expected_seconds
+          ? "judged against that pipeline's own " + interval(m.stalest_pipeline_expected_seconds) +
+            " — per pipeline, not per table: a pipeline's freshness is already a max() over its" +
+            " data tables, so judging one quiet table against the whole interval invents staleness." +
+            " marts_ops.table_freshness has the per-table detail."
+          : "no expectation to judge against", false],
+        ["rows?", m.has_rows ? "yes" : "no", "bounded SELECT 1 ... LIMIT 1", true],
+        ["definition", m.first_seen_at ? ago(ageOf(m.first_seen_at)) + " old" : "—",
+          "sha256 " + (m.definition_sha256 || "").slice(0, 12) +
+          " — a redefinition that drops a source table changes no rows, only this", true]
+      ],
+      m.probe_status && m.probe_status !== "ok" && m.probe_status !== "empty"
+        ? "probe " + m.probe_status.replace(/_/g, " ") + (m.probe_detail ? ": " + m.probe_detail : "")
+        : "");
+  }
+
+  function adapterNode(a) {
+    return healthRow(a,
+      a.adapter,
+      "backfill " + (a.backfill_done ? "done" : "in progress") +
+        " · " + rows(a.backfill_rows) + " backfilled · " + rows(a.incremental_rows) + " incremental",
+      [
+        ["watermark", a.watermark_ingest_ts ? ago(ageOf(a.watermark_ingest_ts)) + " ago" : "—",
+          "the honest signal: how far this adapter has consumed its source", false],
+        ["last run", a.last_run_at ? ago(ageOf(a.last_run_at)) + " ago" : "—",
+          "only stamped when a batch returned rows, so an idle adapter looks stalled — " +
+          "do not alarm on this alone", true]
+      ],
+      a.last_error || "");
+  }
+
+  function collationNode(c) {
+    var columns = [];
+    if (c.scope === "index") {
+      var keys = list(c.key_columns);
+      columns.push(["rows", rows(c.heap_rows),
+        (c.table_name || "") + (keys.length ? " (" + keys.join(", ") + ")" : ""), false]);
+      columns.push(["distinct keys", rows(c.distinct_keys), "", true]);
+      columns.push(["excess", String(c.excess_rows || 0),
+        c.is_partial ? "counted under the index predicate: " + c.predicate
+                     : "no partial predicate", true]);
+    } else {
+      columns.push(["recorded", c.recorded_version || "none",
+        "pg_database.datcollversion / pg_collation.collversion", false]);
+      columns.push(["live", c.actual_version || "unknown",
+        "what the collation library reports right now", true]);
+      columns.push(["indexes", String(c.dependent_indexes || 0),
+        "collatable indexes that depend on this collation", true]);
+    }
+    return healthRow(c, c.object_name,
+      c.scope + (c.provider ? " · " + c.provider : ""),
+      columns, c.detail || "");
+  }
+
+  function renderSection(id, heading, items, nodeFn, sortFn) {
+    var node = el(id);
+    node.textContent = "";
+    var shown = items.filter(matchesFilter).sort(sortFn || bySeverity);
+    if (!items.length) return;
+    var group = h("div", "group");
+    var head = h("h2");
+    head.appendChild(h("span", "", heading));
+    head.appendChild(h("span", "rule"));
+    head.appendChild(h("span", "n", shown.length + " / " + items.length));
+    group.appendChild(head);
+    if (!shown.length) {
+      group.appendChild(h("div", "plnote", "nothing matches that filter."));
+    }
+    shown.forEach(function (item) { group.appendChild(nodeFn(item)); });
+    node.appendChild(group);
+  }
+
+  function renderLevels() {
+    renderSection("marts", LEVELS[0][1], state.marts, martNode);
+    renderSection("adapters", LEVELS[1][1], state.adapters, adapterNode);
+    // The database's own collation row first: it is the finding the other rows
+    // corroborate, and it is the one that says this database cannot warn itself.
+    renderSection("collation", LEVELS[2][1], state.collation, collationNode,
+      function (a, b) {
+        if ((a.scope === "database") !== (b.scope === "database")) {
+          return a.scope === "database" ? -1 : 1;
+        }
+        return bySeverity(a, b);
+      });
+  }
+
   function renderSnapshot() {
     var newest = null;
     state.pipelines.forEach(function (p) {
@@ -530,7 +748,8 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     if (age > 3600) b.style.color = "var(--unknown)";
     node.appendChild(b);
     node.appendChild(document.createTextNode(" · " + state.pipelines.length + " pipelines · " +
-      state.tables.length + " tables"));
+      state.tables.length + " tables · " + state.marts.length + " marts · " +
+      state.adapters.length + " adapters · " + state.collation.length + " integrity checks"));
     node.title = stamp(newest);
   }
 
@@ -546,15 +765,45 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       " is its heartbeat, read from its sync-state table; uploaders that push from a laptop keep no state here," +
       " so they show no heartbeat and only data freshness applies. Status is computed at read time against each" +
       " pipeline's own expected interval (late past 2x, stale past 6x), so it stays honest even if the collector stops. "));
+    node.appendChild(h("b", "", "newest event"));
+    node.appendChild(document.createTextNode(
+      " is when the newest real-world event this pipeline holds actually happened, which is not the same as when a row" +
+      " was written and is now judged on its own interval — the finance ledger dates observations by day, so its event" +
+      " time trails its writes while working perfectly, and it says so. "));
     node.appendChild(h("b", "", "probe"));
     node.appendChild(document.createTextNode(
       " says how a table's timestamp was measured; skipped means an unindexed max() over a large heap would have" +
-      " cost more than the answer is worth. Queryable as marts_ops.pipeline_health and marts_ops.table_freshness."));
+      " cost more than the answer is worth — 'unmeasured' means we did not look, which is a quieter claim than 'no data'."));
+    node.appendChild(h("br"));
+    node.appendChild(h("b", "", "marts"));
+    node.appendChild(document.createTextNode(
+      " have no stamped column and no relpages, so they cannot be probed the way a table is: each view is judged on the" +
+      " freshness of the stalest relation it reads (inputs resolved from pg_depend, each against its OWN pipeline's" +
+      " interval), on a bounded SELECT 1 ... LIMIT 1, and on whether its definition hash changed — a redefinition that" +
+      " silently drops a source table changes no rows, only that. "));
+    node.appendChild(h("b", "", "adapters"));
+    node.appendChild(document.createTextNode(
+      " answer whether one KIND of data is reaching timeline.events; the single timeline pipeline row is a max() over all" +
+      " of them and hides a frozen one. Note last run is only stamped when a batch returned rows, so an idle adapter" +
+      " looks stalled — the watermark is the honest signal. "));
+    node.appendChild(h("b", "", "integrity"));
+    node.appendChild(document.createTextNode(
+      " is collation drift. This database has NO recorded baseline (pg_database.datcollversion is NULL) and REFRESH" +
+      " COLLATION VERSION refuses to create one from NULL, so Postgres can never raise its own mismatch warning and this" +
+      " is the only cover; the live library version is stored each run so a future change is visible by comparison. Only" +
+      " collations an index actually depends on are shown. The duplicate-key probe applies each index's partial predicate" +
+      " and is corroboration only: it cannot see a mis-ordered index that has no duplicates, and three of the seven" +
+      " indexes damaged on 2026-08-23 were exactly that — use amcheck's bt_index_check for that class."));
+    node.appendChild(h("br"));
+    node.appendChild(document.createTextNode(
+      "Everything here is queryable at parity: marts_ops.pipeline_health, marts_ops.table_freshness," +
+      " marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.collation_health."));
   }
 
   function render() {
     renderTiles();
     renderGroups();
+    renderLevels();
     renderSnapshot();
     renderLegend();
   }
@@ -572,6 +821,9 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     return api("/api/pipelines").then(function (body) {
       state.pipelines = body.pipelines || [];
       state.tables = body.tables || [];
+      state.marts = body.marts || [];
+      state.adapters = body.adapters || [];
+      state.collation = body.collation || [];
       state.skew = body.server_now ? new Date(body.server_now).getTime() - Date.now() : 0;
       el("status").textContent = "";
       render();

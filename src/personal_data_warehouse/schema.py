@@ -1704,12 +1704,24 @@ PIPELINE_HEALTH_COLUMNS = (
     "cadence",
     "transport",
     "note",
+    # Where expected_data_interval_seconds came from. A long SLA that nobody can
+    # re-derive is a number that rots; this is the audit trail for it.
+    "data_basis",
     "expected_data_interval_seconds",
     "expected_run_interval_seconds",
+    # How far behind the newest REAL-WORLD event may fall. Usually the same as
+    # the data interval, but the finance ledger dates observations by day, so
+    # its event time trails its writes while working perfectly. Zero means no
+    # data table declares an event column at all — unmonitored, not late.
+    "expected_event_interval_seconds",
     # Newest payload write, newest real-world event, and newest run heartbeat.
     "last_write_at",
     "newest_event_at",
     "last_run_at",
+    # Data tables that actually yielded an event timestamp. Zero alongside a
+    # nonzero expectation means the columns exist but were too expensive to
+    # probe: unmeasured, which is not the same claim as "nothing ever arrived".
+    "event_tables_probed",
     "row_estimate",
     "byte_size",
     "table_count",
@@ -1744,6 +1756,75 @@ PIPELINE_TABLE_FRESHNESS_COLUMNS = (
     "probe_detail",
     "probe_ms",
     "note",
+    "collected_at",
+)
+
+# Mart (view) health — level 2 of the health contract. A view has no stamped
+# column to take a max() of and no relpages to bound a probe with, so it is
+# measured on the three things that ARE cheap and true about it: how fresh the
+# stalest relation it reads is, whether it currently returns a row, and whether
+# its definition changed. See personal_data_warehouse/pipeline_health.py.
+MART_VIEW_HEALTH_COLUMNS = (
+    "view_id",
+    "domain",
+    "view_schema",
+    "view_name",
+    # Base tables this view reads, resolved transitively from pg_depend at
+    # collection time rather than from a hand-written map, and the pipelines
+    # they belong to — which is what actually gets judged.
+    "input_tables",
+    "input_pipelines",
+    "input_count",
+    # The input PIPELINE furthest past its own SLA, with the interval it was
+    # judged against so the verdict can be re-derived live. Per pipeline rather
+    # than per table on purpose: a pipeline's freshness is already a max() over
+    # its data tables, so judging one quiet table against the whole pipeline's
+    # interval invents staleness (measured: four marts read 'stale' off a
+    # perfectly healthy finance ledger).
+    "stalest_pipeline",
+    "stalest_pipeline_at",
+    "stalest_pipeline_expected_seconds",
+    "inputs_unmeasured",
+    "has_rows",
+    "definition_sha256",
+    # When THIS definition hash was first observed: a silent redefinition that
+    # drops a source table changes nothing measurable about the rows.
+    "first_seen_at",
+    "probe_status",
+    "probe_detail",
+    "probe_ms",
+    "note",
+    "collected_at",
+)
+
+# Collation drift and index integrity (personal_data_warehouse/collation_health.py).
+# One row per checked object across three scopes: the database's own collation,
+# the named collations an index actually depends on, and the unique indexes the
+# corroborating divergence probe could afford.
+COLLATION_HEALTH_COLUMNS = (
+    "object_id",
+    "scope",
+    "object_name",
+    "provider",
+    # '' when pg_database.datcollversion / pg_collation.collversion is NULL —
+    # which IS the finding here, not a neutral state.
+    "recorded_version",
+    "actual_version",
+    "dependent_indexes",
+    "finding",
+    "detail",
+    # Index-scope columns.
+    "table_name",
+    "is_unique",
+    "is_partial",
+    # The partial predicate. Ignoring it made a clean index report 53,035
+    # phantom excess rows, so it is stored as evidence of what was counted.
+    "predicate",
+    "key_columns",
+    "heap_rows",
+    "distinct_keys",
+    "excess_rows",
+    "probe_ms",
     "collected_at",
 )
 

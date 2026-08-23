@@ -14,6 +14,7 @@ from dagster import (
 
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.pipeline_health import (
+    PROBE_EMPTY,
     PROBE_ERROR,
     PROBE_MISSING,
     PROBE_SKIPPED_UNINDEXED,
@@ -50,6 +51,7 @@ def pipeline_health(context) -> MaterializeResult:
     warehouse = warehouse_from_settings(settings)
     pipelines: list = []
     tables: list = []
+    marts: list = []
     try:
         with exclusive_sync_lock(
             name="pipeline_health",
@@ -61,7 +63,7 @@ def pipeline_health(context) -> MaterializeResult:
                 )
             else:
                 warehouse.ensure_pipeline_health_tables()
-                pipelines, tables = PipelineHealthCollector(warehouse).run()
+                pipelines, tables, marts = PipelineHealthCollector(warehouse).run_all()
     finally:
         warehouse.close()
 
@@ -84,6 +86,19 @@ def pipeline_health(context) -> MaterializeResult:
         metadata={
             "pipelines": MetadataValue.int(len(pipelines)),
             "tables": MetadataValue.int(len(tables)),
+            "marts": MetadataValue.int(len(marts)),
+            # A mart that cannot answer "is there a row?" is a broken read
+            # interface, not a quiet one — worth surfacing on the run itself.
+            "marts_failing_probe": MetadataValue.json(
+                sorted(
+                    view.view_id
+                    for view in marts
+                    if view.probe_status in {PROBE_ERROR, PROBE_TIMEOUT, PROBE_MISSING}
+                )
+            ),
+            "marts_empty": MetadataValue.json(
+                sorted(view.view_id for view in marts if view.probe_status == PROBE_EMPTY)
+            ),
             # Cost-guard skips are expected (a 50 GB heap with no timestamp
             # index); a probe error or timeout is not.
             "probes_skipped": MetadataValue.json(sorted(skipped)),

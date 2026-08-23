@@ -143,12 +143,16 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +3 marts: the cross-source entry points marts_messages.messages and
         # marts_voice_memos.recordings/.transcript_segments, which gave the two
         # domains that had per-source views but no unified read interface one.
-        "marts": 33,
+        # +2 marts / +2 ops: marts_ops.mart_view_health (level 2 of the health
+        # contract -- the marts layer itself had no coverage at all) and
+        # marts_ops.collation_health, over ops.mart_view_health and
+        # ops.collation_health.
+        "marts": 35,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +1 internal: internal.search_text_preview, the
         # match-windowed preview helper both search functions use.
         "timeline": 9,
-        "ops": 23,
+        "ops": 25,
         "private": 5,
         "internal": 2,
     }
@@ -273,6 +277,10 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
         # directly too so "when did gmail last update?" is answerable in SQL.
         "pipeline_health",
         "pipeline_table_freshness",
+        # Levels 2 and 4 of the same dashboard: the marts layer's own health and
+        # the collation-drift findings, both rendered by /pipelines.
+        "mart_view_health",
+        "collation_health",
         "upstream_mutations",
         "upstream_mutation_requests",
         "upstream_mutation_events",

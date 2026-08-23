@@ -68,6 +68,8 @@ from personal_data_warehouse.schema import (
     PHOTO_ASSET_COLUMNS,
     PHOTO_ASSET_FILE_COLUMNS,
     PHOTO_SOURCE_FILE_COLUMNS,
+    COLLATION_HEALTH_COLUMNS,
+    MART_VIEW_HEALTH_COLUMNS,
     PIPELINE_HEALTH_COLUMNS,
     PIPELINE_TABLE_FRESHNESS_COLUMNS,
     RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS,
@@ -707,6 +709,10 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("table_id",),
         "collected_at",
     ),
+    # Mart (view) health and collation/index integrity, same snapshot contract:
+    # measured facts keyed by the object, replaced in place each collection.
+    "mart_view_health": TableSpec(MART_VIEW_HEALTH_COLUMNS, ("view_id",), "collected_at"),
+    "collation_health": TableSpec(COLLATION_HEALTH_COLUMNS, ("object_id",), "collected_at"),
 }
 
 # Every table whose rows belong to exactly one linked Plaid Item, data first
@@ -1452,6 +1458,12 @@ POSTGRES_INSERT_PAGE_SIZES = {
 
 
 ARRAY_COLUMNS = {
+    # mart health: the base tables a view reads (logical ids) and the pipelines
+    # they belong to, resolved from pg_depend. collation health: a unique
+    # index's key columns.
+    "input_tables",
+    "input_pipelines",
+    "key_columns",
     "label_ids",
     "to_addresses",
     "cc_addresses",
@@ -1607,6 +1619,9 @@ def _is_numeric_column(table: str | None, column: str) -> bool:
     return column in NUMERIC_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # mart health: the stalest input pipeline's last write. (When the view's
+    # current definition hash was first observed reuses first_seen_at.)
+    "stalest_pipeline_at",
     # search index: when a chunk was (re)built / a text embedded
     "built_at",
     "embedded_at",
@@ -1686,6 +1701,21 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    # mart health: input counts and the bounded non-empty probe's answer
+    "input_count",
+    "inputs_unmeasured",
+    "stalest_pipeline_expected_seconds",
+    "has_rows",
+    # pipeline health: the event-time SLA and how many data tables yielded one
+    "expected_event_interval_seconds",
+    "event_tables_probed",
+    # collation health: the corroborating unique-index divergence probe
+    "dependent_indexes",
+    "is_unique",
+    "is_partial",
+    "heap_rows",
+    "distinct_keys",
+    "excess_rows",
     "seq",
     # search index: chunk ordinal within an anchor, embedding token count,
     # and the chunk builder's timeline-seq watermark
@@ -3125,7 +3155,14 @@ class PostgresWarehouse:
         See personal_data_warehouse/pipeline_health.py: the tables hold measured
         facts, the views turn them into a live status.
         """
-        self._ensure_table_group(["pipeline_health", "pipeline_table_freshness"])
+        self._ensure_table_group(
+            [
+                "pipeline_health",
+                "pipeline_table_freshness",
+                "mart_view_health",
+                "collation_health",
+            ]
+        )
         self._ensure_pipeline_health_mart_views()
 
     def _ensure_pipeline_health_mart_views(self) -> None:
@@ -3162,11 +3199,14 @@ class PostgresWarehouse:
             WITH measured AS (
                 SELECT
                     pipeline, label, kind, cadence, transport, note,
+                    NULLIF(data_basis, '') AS data_basis,
                     expected_data_interval_seconds,
                     expected_run_interval_seconds,
+                    expected_event_interval_seconds,
                     NULLIF(last_write_at, {epoch}) AS last_write_at,
                     NULLIF(newest_event_at, {epoch}) AS newest_event_at,
                     NULLIF(last_run_at, {epoch}) AS last_run_at,
+                    event_tables_probed,
                     row_estimate, byte_size,
                     table_count, tables_probed, tables_skipped,
                     state_table, state_rows, state_error_rows, state_attention_rows,
@@ -3183,7 +3223,33 @@ class PostgresWarehouse:
                     )} AS data_status,
                     {freshness_status(
                         "last_run_at", "expected_run_interval_seconds", unmonitored="unmonitored"
-                    )} AS run_status
+                    )} AS run_status,
+                    -- Event freshness: how old the newest REAL-WORLD event is,
+                    -- as opposed to how recently a row was written. Collected,
+                    -- stored, shipped over the API and rendered on the page
+                    -- since this dashboard shipped, and until 2026-08-23 never
+                    -- judged -- which is why alice_voice_recordings showed a
+                    -- green dot beside an event 118 days old.
+                    --
+                    -- 'unmeasured' is a distinct answer from 'no_data' on
+                    -- purpose. google_drive and attachment_enrichment DO
+                    -- declare an event column; it sits on a 376 MiB / 561 MiB
+                    -- heap with no index leading with it, so the collector
+                    -- skips the max() by design. Reporting that as "nothing has
+                    -- ever arrived" would be a louder and different claim than
+                    -- the truth, which is "we did not look".
+                    CASE
+                        WHEN expected_event_interval_seconds = 0 THEN 'unmonitored'
+                        WHEN event_tables_probed = 0 THEN 'unmeasured'
+                        WHEN newest_event_at IS NULL THEN 'no_data'
+                        WHEN now() - newest_event_at > make_interval(
+                            secs => expected_event_interval_seconds
+                                    * {STALE_MULTIPLIER}) THEN 'stale'
+                        WHEN now() - newest_event_at > make_interval(
+                            secs => expected_event_interval_seconds
+                                    * {LATE_MULTIPLIER}) THEN 'late'
+                        ELSE 'ok'
+                    END AS event_status
                 FROM measured
             )
             SELECT
@@ -3200,8 +3266,12 @@ class PostgresWarehouse:
                             secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
                     WHEN state_error_rows > 0 THEN 'failing'
                     WHEN state_attention_rows > 0 THEN 'attention'
-                    WHEN 'stale' IN (data_status, run_status) THEN 'stale'
-                    WHEN 'late' IN (data_status, run_status) THEN 'late'
+                    -- Event lateness escalates exactly like write lateness.
+                    -- Only 'late'/'stale' escalate: 'unmonitored', 'unmeasured'
+                    -- and 'no_data' are statements about the measurement, and
+                    -- a measurement gap must never colour a pipeline red.
+                    WHEN 'stale' IN (data_status, run_status, event_status) THEN 'stale'
+                    WHEN 'late' IN (data_status, run_status, event_status) THEN 'late'
                     WHEN data_status = 'no_data'
                      AND run_status IN ('no_data', 'unmonitored') THEN 'no_data'
                     WHEN data_status = 'manual' THEN 'manual'
@@ -3209,13 +3279,18 @@ class PostgresWarehouse:
                 END AS status,
                 data_status,
                 run_status,
+                event_status,
                 last_write_at,
                 newest_event_at,
                 last_run_at,
                 (EXTRACT(EPOCH FROM now() - last_write_at))::bigint AS data_age_seconds,
                 (EXTRACT(EPOCH FROM now() - last_run_at))::bigint AS run_age_seconds,
+                (EXTRACT(EPOCH FROM now() - newest_event_at))::bigint AS event_age_seconds,
                 expected_data_interval_seconds,
                 expected_run_interval_seconds,
+                expected_event_interval_seconds,
+                event_tables_probed,
+                data_basis,
                 row_estimate,
                 byte_size,
                 table_count,
@@ -3258,6 +3333,184 @@ class PostgresWarehouse:
                 NULLIF(collected_at, {epoch}) AS collected_at,
                 note
             FROM @pipeline_table_freshness
+            """,
+        )
+
+        # Level 2 of the health contract: the marts_* read interface itself.
+        # Thirty-three views -- the relations every agent is told to start from
+        # -- had zero coverage until 2026-08-23: `SELECT layer, count(*) FROM
+        # marts_ops.table_freshness GROUP BY 1` returned base/derived/ops/
+        # private/timeline and no marts row at all.
+        #
+        # It is worth being explicit about why they were not simply added to
+        # TABLE_PIPELINES: a VIEW HAS NO STAMPED COLUMN TO TAKE A max() OF and
+        # no relpages for the cheapness guard to consult, so the existing
+        # table-probe mechanism genuinely cannot be pointed at one. What IS
+        # cheap and true about a view is measured instead -- input freshness,
+        # a bounded non-empty probe, and definition drift -- and the status
+        # below is derived from those at read time.
+        self._ensure_view(
+            "marts_mart_view_health",
+            f"""
+            CREATE OR REPLACE VIEW @marts_mart_view_health AS
+            WITH measured AS (
+                SELECT
+                    view_id, domain, view_schema, view_name,
+                    input_tables, input_pipelines, input_count,
+                    NULLIF(stalest_pipeline, '') AS stalest_pipeline,
+                    NULLIF(stalest_pipeline_at, {epoch}) AS stalest_pipeline_at,
+                    stalest_pipeline_expected_seconds,
+                    inputs_unmeasured, has_rows,
+                    definition_sha256,
+                    NULLIF(first_seen_at, {epoch}) AS first_seen_at,
+                    probe_status,
+                    NULLIF(probe_detail, '') AS probe_detail,
+                    probe_ms,
+                    NULLIF(note, '') AS note,
+                    NULLIF(collected_at, {epoch}) AS collected_at
+                FROM @mart_view_health
+            ),
+            classified AS (
+                SELECT
+                    measured.*,
+                    -- A view is only ever as fresh as the stalest PIPELINE
+                    -- feeding it, and each is judged against ITS OWN expected
+                    -- interval: marts_ai_conversations.events unions six agent
+                    -- sources whose expectations differ by an order of
+                    -- magnitude, so a single global threshold would permanently
+                    -- nominate whichever one is legitimately the quietest.
+                    -- Per pipeline rather than per table -- see
+                    -- _roll_up_inputs: a pipeline's own freshness is a max()
+                    -- over its data tables, so judging one quiet table against
+                    -- the whole pipeline's interval manufactures staleness.
+                    CASE
+                        WHEN stalest_pipeline_at IS NULL
+                          OR stalest_pipeline_expected_seconds = 0 THEN 'unmeasured'
+                        WHEN now() - stalest_pipeline_at > make_interval(
+                            secs => stalest_pipeline_expected_seconds
+                                    * {STALE_MULTIPLIER}) THEN 'stale'
+                        WHEN now() - stalest_pipeline_at > make_interval(
+                            secs => stalest_pipeline_expected_seconds
+                                    * {LATE_MULTIPLIER}) THEN 'late'
+                        ELSE 'ok'
+                    END AS input_status
+                FROM measured
+            )
+            SELECT
+                view_id,
+                domain,
+                view_schema,
+                view_name,
+                CASE
+                    -- Same self-distrust as marts_ops.pipeline_health: a
+                    -- snapshot this old is evidence about the collector, not
+                    -- about the views it describes.
+                    WHEN collected_at IS NULL
+                      OR now() - collected_at > make_interval(
+                            secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
+                    WHEN probe_status IN ('error', 'missing') THEN 'failing'
+                    WHEN probe_status = 'timeout' THEN 'attention'
+                    WHEN input_status = 'stale' THEN 'stale'
+                    WHEN input_status = 'late' THEN 'late'
+                    WHEN probe_status = 'empty' THEN 'no_data'
+                    ELSE 'ok'
+                END AS status,
+                input_status,
+                probe_status,
+                probe_detail,
+                probe_ms,
+                has_rows,
+                input_tables,
+                input_pipelines,
+                input_count,
+                inputs_unmeasured,
+                stalest_pipeline,
+                stalest_pipeline_at,
+                (EXTRACT(EPOCH FROM now() - stalest_pipeline_at))::bigint
+                    AS stalest_pipeline_age_seconds,
+                stalest_pipeline_expected_seconds,
+                definition_sha256,
+                first_seen_at,
+                -- How long the current definition has stood. A redefinition
+                -- that silently drops a source table changes nothing
+                -- measurable about the rows, so the definition is what is
+                -- watched; a recent first_seen_at next to a surprising
+                -- input_tables list is the shape to look for.
+                (EXTRACT(EPOCH FROM now() - first_seen_at))::bigint
+                    AS definition_age_seconds,
+                collected_at,
+                (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds,
+                note
+            FROM classified
+            """,
+        )
+
+        # Collation drift: the check Postgres cannot do for this database.
+        # datcollversion is NULL while the live library reports a version, and
+        # REFRESH COLLATION VERSION refuses to create a baseline from NULL, so
+        # there will never be a mismatch warning here. Note the finding is
+        # written as an explicit NULL test in collation_health.py rather than
+        # `recorded <> actual`, which evaluates to NULL and reports CLEAN.
+        self._ensure_view(
+            "marts_collation_health",
+            f"""
+            CREATE OR REPLACE VIEW @marts_collation_health AS
+            WITH measured AS (
+                SELECT
+                    object_id, scope, object_name,
+                    NULLIF(provider, '') AS provider,
+                    NULLIF(recorded_version, '') AS recorded_version,
+                    NULLIF(actual_version, '') AS actual_version,
+                    dependent_indexes, finding,
+                    NULLIF(detail, '') AS detail,
+                    NULLIF(table_name, '') AS table_name,
+                    is_unique, is_partial,
+                    NULLIF(predicate, '') AS predicate,
+                    key_columns,
+                    heap_rows, distinct_keys, excess_rows, probe_ms,
+                    NULLIF(collected_at, {epoch}) AS collected_at
+                FROM @collation_health
+            )
+            SELECT
+                object_id,
+                scope,
+                object_name,
+                CASE
+                    WHEN collected_at IS NULL
+                      OR now() - collected_at > make_interval(
+                            secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
+                    -- Duplicate rows under a UNIQUE index are the loudest
+                    -- evidence: a working ON CONFLICT cannot produce them.
+                    WHEN finding = 'duplicate_keys' THEN 'failing'
+                    -- A recorded baseline that no longer matches the library.
+                    WHEN finding = 'version_changed' THEN 'failing'
+                    -- No baseline at all IS the finding, not a neutral state:
+                    -- it means this database can never warn about the next
+                    -- drift either, and text index ordering is unverified.
+                    WHEN finding = 'no_baseline' THEN 'attention'
+                    WHEN finding = 'unknown_actual' THEN 'attention'
+                    WHEN finding IN ('timeout', 'error') THEN 'attention'
+                    WHEN finding IN ('skipped_expression', 'skipped_large') THEN 'unmeasured'
+                    ELSE 'ok'
+                END AS status,
+                finding,
+                detail,
+                provider,
+                recorded_version,
+                actual_version,
+                dependent_indexes,
+                table_name,
+                is_unique,
+                is_partial,
+                predicate,
+                key_columns,
+                heap_rows,
+                distinct_keys,
+                excess_rows,
+                probe_ms,
+                collected_at,
+                (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds
+            FROM measured
             """,
         )
 
@@ -3337,6 +3590,39 @@ class PostgresWarehouse:
         self._command(
             "DELETE FROM @pipeline_table_freshness WHERE table_id <> ALL(%s)",
             ([snapshot.table_id for snapshot in tables],),
+        )
+
+    def write_mart_view_health(
+        self, views: Sequence[Any], *, collected_at: datetime
+    ) -> None:
+        """Replace the mart-health snapshot with one collection's measurements."""
+        self._insert_rows(
+            "mart_view_health",
+            [_pipeline_health_row(snapshot, collected_at=collected_at) for snapshot in views],
+            MART_VIEW_HEALTH_COLUMNS,
+        )
+        self._command(
+            "DELETE FROM @mart_view_health WHERE view_id <> ALL(%s)",
+            ([snapshot.view_id for snapshot in views],),
+        )
+
+    def write_collation_health(
+        self, findings: Sequence[Any], *, collected_at: datetime
+    ) -> None:
+        """Replace the collation/index-integrity snapshot.
+
+        Retired objects are pruned like every other snapshot here: a dropped
+        index must disappear rather than linger as a permanently failing row
+        nobody can act on.
+        """
+        self._insert_rows(
+            "collation_health",
+            [_pipeline_health_row(finding, collected_at=collected_at) for finding in findings],
+            COLLATION_HEALTH_COLUMNS,
+        )
+        self._command(
+            "DELETE FROM @collation_health WHERE object_id <> ALL(%s)",
+            ([finding.object_id for finding in findings],),
         )
 
     def ensure_timeline_tables(self) -> None:

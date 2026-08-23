@@ -2359,6 +2359,8 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # measurement of the warehouse's own pipelines, not activity in it.
     "pipeline_health": _state("per-pipeline freshness and health snapshot"),
     "pipeline_table_freshness": _state("per-table freshness snapshot"),
+    "mart_view_health": _state("per-marts-view input freshness, non-empty probe, and definition hash"),
+    "collation_health": _state("collation drift baselines and unique-index divergence findings"),
     # The timeline itself
     "timeline_events": _state("the unified timeline"),
     "timeline_sync_state": _state("per-adapter sync cursors"),

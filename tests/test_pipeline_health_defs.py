@@ -7,9 +7,13 @@ from dagster import build_asset_context, build_schedule_context
 
 import personal_data_warehouse.defs.pipeline_health as pipeline_health_defs
 from personal_data_warehouse.pipeline_health import (
+    PROBE_EMPTY,
+    PROBE_ERROR,
     PROBE_OK,
+    PROBE_SKIPPED_EXPENSIVE,
     PROBE_SKIPPED_UNINDEXED,
     PROBE_TIMEOUT,
+    MartViewSnapshot,
     PipelineSnapshot,
     TableSnapshot,
 )
@@ -39,6 +43,10 @@ class _FakeCollector:
         self.ran = True
         return _snapshots()
 
+    def run_all(self):
+        pipelines, tables = self.run()
+        return pipelines, tables, _mart_snapshots()
+
 
 def _pipeline(name: str, **kwargs) -> PipelineSnapshot:
     defaults = dict(
@@ -48,11 +56,14 @@ def _pipeline(name: str, **kwargs) -> PipelineSnapshot:
         cadence="every 5 min",
         transport="test",
         note="",
+        data_basis="",
         expected_data_interval_seconds=3600,
         expected_run_interval_seconds=0,
+        expected_event_interval_seconds=3600,
         last_write_at=None,
         newest_event_at=None,
         last_run_at=None,
+        event_tables_probed=0,
         row_estimate=0,
         byte_size=0,
         table_count=1,
@@ -88,6 +99,38 @@ def _table(table_id: str, probe_status: str) -> TableSnapshot:
         probe_ms=1,
         note="",
     )
+
+
+def _mart(view_id: str, probe_status: str) -> MartViewSnapshot:
+    return MartViewSnapshot(
+        view_id=view_id,
+        domain="ops",
+        view_schema="marts_ops",
+        view_name=view_id,
+        input_tables=["gmail_messages"],
+        input_pipelines=["gmail"],
+        input_count=1,
+        stalest_pipeline="gmail",
+        stalest_pipeline_at=None,
+        stalest_pipeline_expected_seconds=3600,
+        inputs_unmeasured=0,
+        has_rows=1,
+        definition_sha256="sha",
+        first_seen_at=None,
+        probe_status=probe_status,
+        probe_detail="",
+        probe_ms=2,
+        note="",
+    )
+
+
+def _mart_snapshots():
+    return [
+        _mart("marts_ok", PROBE_OK),
+        _mart("marts_empty", PROBE_EMPTY),
+        _mart("marts_broken", PROBE_ERROR),
+        _mart("marts_costly", PROBE_SKIPPED_EXPENSIVE),
+    ]
 
 
 def _snapshots():
@@ -149,6 +192,11 @@ def test_asset_collects_and_reports_probe_outcomes(monkeypatch):
     assert result.metadata["probes_failed"].value == ["slack_message_reactions"]
     assert result.metadata["pipelines_with_errors"].value == ["slack"]
     assert result.metadata["pipelines_needing_attention"].value == ["plaid"]
+    # Level 2: a mart that cannot answer "is there a row?" is a broken read
+    # interface, and an empty one is a different claim worth seeing separately.
+    assert result.metadata["marts"].value == 4
+    assert result.metadata["marts_failing_probe"].value == ["marts_broken"]
+    assert result.metadata["marts_empty"].value == ["marts_empty"]
 
 
 def test_asset_skips_when_another_collection_is_active(monkeypatch):

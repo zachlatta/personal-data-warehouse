@@ -1898,6 +1898,52 @@
       "comment": "Per-adapter timeline currency: is this kind of data actually reaching timeline.events? The single `timeline` row in marts_ops.pipeline_health is a max() over every adapter and hides a frozen one. Note last_run_at is only stamped when a batch returned rows, so an idle adapter looks stalled; compare watermark_ingest_ts against the source relation instead."
     },
     {
+      "id": "mart_view_health",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "mart_view_health",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
+      "id": "collation_health",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "collation_health",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
+      "id": "marts_mart_view_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "mart_view_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Health of the marts_* read interface itself. A view has no stamped column and no relpages, so it cannot be probed the way a table is: each view is judged instead on the freshness of the stalest relation it reads (inputs resolved from pg_depend, each judged against its own pipeline's SLA), on a bounded SELECT 1 ... LIMIT 1, and on whether its definition hash changed. Companion to marts_ops.pipeline_health, which covers tables."
+    },
+    {
+      "id": "marts_collation_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "collation_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Collation drift and unique-index divergence. This database has NO recorded collation baseline (pg_database.datcollversion is NULL) while the live library does report a version, and ALTER DATABASE ... REFRESH COLLATION VERSION refuses to create one from NULL - so Postgres can never raise its own mismatch warning and this view is the only cover. Reports only collations an index actually depends on. The duplicate-key probe is corroboration and cannot see a mis-ordered index that has no duplicates; amcheck's bt_index_check is the rigorous tool for that."
+    },
+    {
       "id": "marts_ops_plaid_item_health",
       "kind": "view",
       "layer": "marts",

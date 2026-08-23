@@ -46,10 +46,13 @@ quietly becoming untrue, and several of these have been.
   *Held up by* nothing automatic. It is the contract that has cost the most: see
   [Performance contract](#performance-contract).
 - **C7 — pipeline health for every source, mart, and timeline data type is inspectable via
-  SQL and web.** *Held up by* `PIPELINES` + `TABLE_PIPELINES` and
+  SQL and web.** Four levels, at parity in SQL and on `/pipelines`: pipelines
+  (`marts_ops.pipeline_health` / `marts_ops.table_freshness`), the marts read interface
+  (`marts_ops.mart_view_health`), per-adapter timeline currency
+  (`marts_ops.timeline_adapter_health`), and index integrity
+  (`marts_ops.collation_health`). *Held up by* `PIPELINES` + `TABLE_PIPELINES` and
   `tests/test_pipeline_health.py`, which asserts the freshness registry and the timeline
-  registry cover *exactly* the same tables. Read it at `marts_ops.pipeline_health` /
-  `marts_ops.table_freshness` or at `/pipelines`.
+  registry cover *exactly* the same tables, and that every catalogued mart gets a health row.
 
 Adding a source touches all seven. The step-by-step list, marked by which steps a test
 catches and which fail silently, is [Adding a warehouse source](#adding-a-warehouse-source).
@@ -354,11 +357,25 @@ Every warehouse table also has to declare **which pipeline feeds it and how fres
 measured**, in `src/personal_data_warehouse/pipeline_health.py`:
 
 - `PIPELINES` — one entry per pipeline (source poller, uploader, enrichment pass, derived
-  builder) with its cadence, transport, expected data/run intervals, and the sync-state table
-  that carries its heartbeat and errors.
+  builder) with its cadence, transport, expected data/run/event intervals, and the sync-state
+  table that carries its heartbeat and errors.
 - `TABLE_PIPELINES` — one entry per table: its pipeline, its `role`
   (`data` payload / `support` dimension / `state` cursor), the column the pipeline stamps on
   write, and the column holding the row's real-world event time.
+
+**Three intervals, and collapsing them is how a monitor ends up unable to catch anything.**
+`expected_run_interval` is how often the pipeline *runs*; `expected_data_interval` is how
+often *data legitimately arrives*; `expected_event_interval` is how far behind *the newest
+real-world event* may fall. Until 2026-08-23 seven pipelines carried a blunt
+`expected_data_interval = 30 days`, so with the ladder's 2x/6x multipliers `pi` — an uploader
+that runs every five minutes — could not reach `late` until sixty days, and sat quiet for
+five weeks under a green dot. The cadence is not the answer either: a person does not record
+a voice memo hourly. Each of those numbers is now set from the source's **own measured gap
+distribution** over 730 days (the query is in `pipeline_health.py`), and any interval of a
+week or more must carry a `data_basis` saying where it came from
+(`test_a_long_data_sla_says_where_its_number_came_from`). `google_contacts` is the instructive
+exception: measurement says contact edits really do go 51 days quiet, so its data SLA is
+deliberately loose and its **hourly run heartbeat** is what catches it breaking.
 
 `tests/test_pipeline_health.py` enforces this against `POSTGRES_TABLES`, the raw-DDL tables,
 and the live schema — the same contract `TIMELINE_TABLE_COVERAGE` has, and the tests also
@@ -383,11 +400,62 @@ heartbeat, so it only has data freshness — which is why a quiet uploader is wo
 - UI: the app serves `/pipelines` (linked from the `/timeline` topbar) over
   `GET /api/pipelines`; worst status first, per-table detail behind a click.
 
+### The four levels, and what each one can and cannot see
+
+| level | relation | answers |
+| --- | --- | --- |
+| 1 — pipelines | `marts_ops.pipeline_health` (+ `marts_ops.table_freshness`) | is this feed still delivering |
+| 2 — marts | `marts_ops.mart_view_health` | is the read interface built on anything current |
+| 3 — timeline adapters | `marts_ops.timeline_adapter_health` | is THIS kind of data reaching `timeline.events` |
+| 4 — integrity | `marts_ops.collation_health` | did the sort order move under us, and did anything break |
+
+**Level 2 exists because a view cannot be probed like a table.** `TABLE_PIPELINES` measures
+`max(<written_at>)` over a heap; a view has no stamped column to take a max of and no
+`relpages` for the cheapness guard to consult, so the table probe genuinely cannot be pointed
+at one. What is cheap and true about a view is measured instead: the freshness of the
+**stalest pipeline feeding it**, a **bounded `SELECT 1 FROM <view> LIMIT 1`**, and the
+**sha256 of `pg_get_viewdef()`** so a redefinition that silently drops a source table is
+visible even though it changes no rows. Views too expensive to probe every ten minutes are
+*declared* in `EXPENSIVE_MART_VIEWS` and recorded as `probe_status = 'skipped_expensive'`,
+the same honest-skip contract as `skipped_unindexed`.
+
+Two details of the input roll-up are load-bearing, both settled by measuring against
+production rather than by argument:
+
+- **Inputs come from `pg_depend`/`pg_rewrite`, closed transitively to base tables** — never a
+  hand-written map, which would rot the first time a view was redefined. Both the tables and
+  the pipelines they belong to are stored: the tables are the evidence, the pipelines are what
+  gets judged.
+- **Judged per pipeline, not per table, and ranked by age relative to SLA rather than raw
+  age.** A pipeline's own freshness is already a `max()` over its data tables, deliberately;
+  applying its interval to one *individual* table breaks that symmetry. Measured 2026-08-23,
+  doing so reported four marts `stale` because `derived_finance.transactions` was 1.1 days old
+  against `finance_ledger`'s three-hour interval, while the ledger was writing balance
+  observations every half hour exactly as designed. So **a mart is never more broken than the
+  pipelines feeding it**, and `marts_ops.table_freshness` remains the place to look for a quiet
+  table inside a healthy pipeline. Ranking by SLA-relative age matters for the same reason:
+  `marts_ai_conversations.events` unions six agent sources whose expectations differ tenfold,
+  and raw age would permanently nominate whichever is legitimately the quietest.
+
+**`newest_event_at` is judged, and `unmeasured` is not `no_data`.** Event lateness escalates
+the pipeline's status exactly like write lateness. Two failure modes are deliberately kept
+apart from it: `unmonitored` (no data table declares an event column) and `unmeasured` (the
+column exists but sits on a large heap with no leading index, so the collector skipped it by
+design — `google_drive.modified_time`, `file_attachment_enrichments.ai_processed_at`).
+Neither ever colours a pipeline red: a gap in the measurement is not evidence about the data.
+
 Quick check without the UI:
 
 ```bash
 pdw sql -q "which pipelines are unhealthy" "SELECT pipeline, status, last_write_at, last_error
   FROM marts_ops.pipeline_health WHERE status NOT IN ('ok','manual') ORDER BY status"
+
+pdw sql -q "which marts read something stale" "SELECT view_schema, view_name, status,
+  stalest_pipeline, stalest_pipeline_at FROM marts_ops.mart_view_health
+  WHERE status NOT IN ('ok') ORDER BY status"
+
+pdw sql -q "collation and index integrity" "SELECT scope, object_name, status, finding, detail
+  FROM marts_ops.collation_health WHERE status NOT IN ('ok') ORDER BY status"
 ```
 
 ## Adding a warehouse source
@@ -484,7 +552,32 @@ had accumulated: `base_apple_messages.chat_messages` 30,043, `base_slack.message
 6,622, `base_google_calendar.events` 145, `base_apple_notes.notes` 15. Every duplicate group
 differed in `sync_version` and `ingested_at`, which is the upsert-became-insert signature.
 
-**How to check, and the two traps.** `amcheck` is the reliable tool
+**There is now a detector, because Postgres will never be one here.** The `collation_health`
+Dagster asset (daily 03:41) writes `ops.collation_health`, read through
+`marts_ops.collation_health` and rendered on `/pipelines`. It is detector-only — no `REINDEX`,
+no `CREATE EXTENSION`, no DDL (`test_the_detector_issues_no_ddl_and_no_repair` pins that), and
+a finding keeps the run green so the one signal that matters does not become a permanently red
+asset everyone ignores. Four things about it are load-bearing:
+
+- **`datcollversion IS NULL` beside a real actual version IS the finding**, reported as
+  `no_baseline`, worded as *"this database cannot detect collation drift; text index ordering
+  is unverified"*. Written the obvious way — `recorded <> actual` — the comparison evaluates
+  to NULL rather than true and reports CLEAN on exactly the database that has the problem.
+- **The observed library version is stored as a fact** every run. With no baseline in
+  `pg_database`, the snapshot's own history is the only baseline that will ever exist, so the
+  next glibc change is visible as `actual_version` moving.
+- **Only collations something actually uses are reported.** All 188 collatable indexes here
+  ride the database default and **zero** use ICU, yet **871** ICU collations report drift;
+  surfacing those buries the signal on day one, so the query joins through
+  `pg_index`/`pg_attribute.attcollation` and reports only collations with a dependent index.
+- **The duplicate-key probe applies each index's partial predicate** and skips expression
+  indexes (`indkey` containing 0) and heaps over `DIVERGENCE_MAX_HEAP_BYTES` (2 GiB, which
+  still covers both tables that actually accumulated duplicates). It is corroboration only:
+  it detects duplicate *keys*, and three of the seven damaged indexes had none — they were
+  merely mis-ordered. `amcheck` is the rigorous tool for that class, and the published view's
+  comment says so.
+
+**How to check by hand, and the two traps.** `amcheck` is the reliable tool
 (`SELECT bt_index_check('schema.index'::regclass)`; it raises rather than returning a
 value, so check for an exception, not a result):
 

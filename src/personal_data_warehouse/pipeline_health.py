@@ -47,6 +47,7 @@ health comes from its per-adapter sync state instead.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Iterable, Sequence
@@ -57,12 +58,24 @@ from typing import Any
 
 import psycopg2
 
-from personal_data_warehouse.relations import CATALOG, relation as canonical_relation
+from personal_data_warehouse.relations import (
+    CANONICAL_RELATIONS,
+    CATALOG,
+    relation as canonical_relation,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "ACCOUNT_BASELINE_GAPS",
+    "DATA_BASIS_REQUIRED_ABOVE",
+    "EXPENSIVE_MART_VIEWS",
+    "INHERIT_DATA_INTERVAL",
+    "MART_PROBE_STATEMENT_TIMEOUT_MS",
+    "MART_VIEW_IDS",
+    "MartViewSnapshot",
+    "PROBE_SKIPPED_EXPENSIVE",
+    "mart_view_ids",
     "ACCOUNT_BASELINE_MAX_DAYS",
     "ACCOUNT_BASELINE_PERCENTILE",
     "ACCOUNT_LATE_MULTIPLIER",
@@ -177,9 +190,77 @@ PROBE_OK = "ok"
 PROBE_EMPTY = "empty"
 PROBE_NO_TIMESTAMP = "no_timestamp"
 PROBE_SKIPPED_UNINDEXED = "skipped_unindexed"
+#: A view the registry declares too expensive to touch every ten minutes. Same
+#: contract as ``skipped_unindexed``: record why, never silently return nothing.
+PROBE_SKIPPED_EXPENSIVE = "skipped_expensive"
 PROBE_TIMEOUT = "timeout"
 PROBE_ERROR = "error"
 PROBE_MISSING = "missing"
+
+# --- mart (view) health -------------------------------------------------------
+#
+# Level 2 of the health contract. The thirty-odd ``marts_*`` views are the
+# warehouse's stable read interface — the relations an agent is told to start
+# from — and until now not one of them had any health coverage at all:
+# ``SELECT layer, count(*) FROM marts_ops.table_freshness GROUP BY 1`` returned
+# base/derived/ops/private/timeline and no ``marts`` row.
+#
+# **The table probe genuinely cannot be pointed at a view.** ``TABLE_PIPELINES``
+# measures ``max(<written_at>)`` over a heap; a view has no stamped column to
+# take a max of, no ``relpages`` to bound the cost with, and no index for the
+# collector's cheapness guard to consult. Pretending otherwise would mean
+# either inventing a timestamp column that does not exist or running an
+# unbounded aggregate over a union of six source tables every ten minutes.
+#
+# So a view is measured by the three things that are cheap AND true about it:
+#
+# 1. **Input freshness.** A view is only ever as fresh as the stalest relation
+#    it reads. The inputs are resolved from ``pg_depend``/``pg_rewrite`` at
+#    collection time rather than from a hand-written map, so a redefinition
+#    cannot leave the map behind, and each input is judged against *its own*
+#    pipeline's SLA (``marts_ai_conversations.events`` reads six agent-source
+#    tables whose expectations differ by an order of magnitude). This alone
+#    surfaces ``pi`` going quiet through every view that reads it.
+# 2. **A bounded non-empty probe** — ``SELECT 1 FROM <view> LIMIT 1``. O(1) for
+#    almost every view here: measured against production 2026-08-23, thirty-two
+#    of the thirty-three returned inside ~15 ms of server time, and the one
+#    outlier (``marts_inbox.gmail_threads``, ~2.3 s) is declared below rather
+#    than discovered at runtime.
+# 3. **Definition drift** — the sha256 of ``pg_get_viewdef()``. A redefinition
+#    that silently drops a source table changes nothing measurable about the
+#    rows; it changes the definition, so that is what is watched.
+
+#: Per-view probe budget. Deliberately the same order as the table probe: a
+#: view that cannot answer "is there a row?" inside this is recorded as a
+#: timeout rather than being allowed to stretch the collection window.
+MART_PROBE_STATEMENT_TIMEOUT_MS = 5_000
+
+#: Views whose bounded probe is known to cost real work, so the collector does
+#: not pay it every ten minutes. They are still measured on inputs and on
+#: definition drift; only the row probe is skipped, and the skip is recorded.
+#: Measured on the production corpus 2026-08-23 (wall clock includes ~320 ms of
+#: round trip): marts_inbox.gmail_threads 2,619 ms — it groups the whole Gmail
+#: thread corpus before a LIMIT can bite. Every other view came back in under
+#: 540 ms end to end.
+EXPENSIVE_MART_VIEWS: frozenset[str] = frozenset({"clean_gmail_inbox"})
+
+
+def mart_view_ids() -> tuple[str, ...]:
+    """Every ``marts_*`` view, read from the catalog rather than a second registry.
+
+    The catalog already declares each mart's logical id, layer and physical
+    location, so deriving the list from it means adding a mart is still one
+    catalog edit: the health surface picks it up with no parallel list to
+    forget. ``tests/test_pipeline_health.py`` asserts the collector emits a row
+    for every one of them.
+    """
+    return tuple(
+        sorted(obj.id for obj in CATALOG.objects if obj.layer == "marts" and obj.kind == "view")
+    )
+
+
+#: Snapshot of the above at import time, for callers that want a constant.
+MART_VIEW_IDS: tuple[str, ...] = mart_view_ids()
 
 
 @dataclass(frozen=True)
@@ -211,15 +292,42 @@ class StateSource:
     attention_statuses: tuple[str, ...] = ("action_required",)
 
 
+#: ``expected_event_interval`` sentinel meaning "judge event time on the data
+#: interval". Inheriting is the default so a new source cannot quietly opt out
+#: of event-time monitoring by forgetting a field; a pipeline whose event time
+#: legitimately lags its writes has to say so, and say why.
+INHERIT_DATA_INTERVAL = timedelta.min
+
+#: Above this, a data interval stops being self-evident from the cadence and
+#: has to justify itself in ``data_basis``. Enforced by
+#: ``test_a_long_data_sla_says_where_its_number_came_from``.
+DATA_BASIS_REQUIRED_ABOVE = timedelta(days=7)
+
+
 @dataclass(frozen=True)
 class Pipeline:
     """One thing that keeps part of the warehouse up to date.
 
-    ``expected_data_interval`` is how long the pipeline may go without writing a
-    payload row before something is probably wrong — a judgement about the real
-    world (email arrives hourly, voice memos monthly), not the poll cadence.
-    ``expected_run_interval`` is the poll cadence itself, and applies only when
-    the pipeline keeps a heartbeat in ``state`` (a laptop uploader does not).
+    Three intervals, deliberately separate, because collapsing them is how a
+    monitor ends up unable to catch anything:
+
+    * ``expected_run_interval`` — how often the pipeline **runs**. It is the
+      poll cadence, and it applies only when the pipeline keeps a heartbeat in
+      ``state``; an uploader pushing from a Mac has none.
+    * ``expected_data_interval`` — how often **data legitimately arrives**. A
+      judgement about the real world, not about the schedule: a five-minute
+      uploader whose human records a voice memo twice a month is healthy at
+      five minutes and healthy at two weeks. Setting this to the cadence turns
+      every quiet weekend into an alarm; setting it to a blunt month (as seven
+      pipelines did until 2026-08-23) means a six-week outage cannot reach
+      ``late``, because ``late`` is 2x and ``stale`` is 6x. Where measurable, it
+      is set from the source's own measured gap distribution — see
+      ``data_basis``.
+    * ``expected_event_interval`` — how far behind **the newest real-world
+      event** may fall. Usually the same as the data interval, which is the
+      default; a pipeline whose event time legitimately lags its writes (the
+      finance ledger dates observations by day) overrides it explicitly.
+
     ``None`` means "no expectation": manual uploads never go stale.
     """
 
@@ -233,8 +341,25 @@ class Pipeline:
     transport: str
     expected_data_interval: timedelta | None
     expected_run_interval: timedelta | None = None
+    #: Defaults to ``expected_data_interval``; override only with a reason.
+    expected_event_interval: timedelta | None = INHERIT_DATA_INTERVAL
+    #: Where ``expected_data_interval`` came from. Required once the interval
+    #: reaches a week, so a long SLA is a measurement someone can re-check
+    #: rather than a number someone once guessed.
+    data_basis: str = ""
     state: StateSource | None = None
     note: str = ""
+
+    @property
+    def event_interval(self) -> timedelta | None:
+        """The interval the newest event time is judged against."""
+        if self.expected_event_interval == INHERIT_DATA_INTERVAL:
+            return self.expected_data_interval
+        return self.expected_event_interval
+
+    @property
+    def event_interval_is_inherited(self) -> bool:
+        return self.expected_event_interval == INHERIT_DATA_INTERVAL
 
 
 @dataclass(frozen=True)
@@ -271,6 +396,8 @@ def _source(
     transport: str,
     data: timedelta | None,
     run: timedelta | None = None,
+    event: timedelta | None = INHERIT_DATA_INTERVAL,
+    basis: str = "",
     state: StateSource | None = None,
     note: str = "",
 ) -> Pipeline:
@@ -282,6 +409,8 @@ def _source(
         transport=transport,
         expected_data_interval=data,
         expected_run_interval=run,
+        expected_event_interval=event,
+        data_basis=basis,
         state=state,
         note=note,
     )
@@ -290,6 +419,25 @@ def _source(
 DAY = timedelta(days=1)
 HOUR = timedelta(hours=1)
 MINUTE = timedelta(minutes=1)
+
+# Every ``data_basis`` below that says "measured" was taken from the production
+# corpus on 2026-08-23 with this shape, over a 730-day window: the distinct
+# minutes in which the pipeline's payload table was written, and the
+# distribution of the gaps between consecutive ones. That is "how long has this
+# pipeline ever legitimately gone without writing anything", which is exactly
+# what the SLA has to sit above and the cadence cannot tell you.
+#
+#   WITH stamps AS (
+#     SELECT DISTINCT date_trunc('minute', <written_at>) AS t FROM <table>
+#     WHERE <written_at> > now() - interval '730 days'
+#   ), gaps AS (
+#     SELECT EXTRACT(EPOCH FROM t - lag(t) OVER (ORDER BY t))/86400.0 AS d FROM stamps
+#   )
+#   SELECT count(*), percentile_cont(0.95) WITHIN GROUP (ORDER BY d), max(d) FROM gaps;
+#
+# Re-run it before moving one of these numbers. A gap distribution changes when
+# habits change, and an SLA that no longer matches the source it describes is
+# the failure this registry exists to prevent, in either direction.
 
 
 # Every pipeline that writes to the warehouse. Adding a source means adding an
@@ -329,21 +477,36 @@ PIPELINES: tuple[Pipeline, ...] = (
         "Google Contacts",
         cadence="hourly",
         transport="Dagster contacts_sync → People API (sync tokens)",
-        data=30 * DAY,
+        data=60 * DAY,
         run=3 * HOUR,
+        basis=(
+            "measured: 4 gaps, max 51.75d — contact edits really are that rare,"
+            " so the previous 30d was BELOW the source's own longest legitimate"
+            " silence and would eventually have cried wolf. This pipeline runs"
+            " hourly with a heartbeat, and that heartbeat, not data freshness,"
+            " is what catches it breaking"
+        ),
         state=StateSource(
             table="contact_sync_state",
             updated_column="updated_at",
             status_column="status",
             error_column="error",
         ),
+        note="data goes quiet for months by nature; judge this one on last_run_at",
     ),
     _source(
         "apple_contacts",
         "Apple Contacts",
         cadence="uploader every 5 min",
         transport="Mac LaunchAgent → /ingest/apple-contacts/batch → Drive inbox → Dagster",
-        data=30 * DAY,
+        data=21 * DAY,
+        basis=(
+            "measured: only 6 gaps, p90 8.30d, max 8.43d — a sparse sample, so"
+            " the interval is set well above it rather than fitted to it. 21d"
+            " (late at 42d) is the tightest honest bound: unlike google_contacts"
+            " this uploader keeps no heartbeat, so data freshness is the ONLY"
+            " in-warehouse signal that the Mac stopped pushing"
+        ),
         note="no in-warehouse heartbeat; check bin/apple-contacts-upload-status on the Mac",
     ),
     _source(
@@ -405,14 +568,32 @@ PIPELINES: tuple[Pipeline, ...] = (
         "Apple Voice Memos",
         cadence="uploader every 5 min",
         transport="Mac LaunchAgent → /ingest/voice-memos/* → Drive inbox → Dagster",
-        data=30 * DAY,
+        data=7 * DAY,
+        basis=(
+            "measured: 145 gaps, p95 3.86d, max 6.56d — a person does not record"
+            " a voice memo hourly, but two years of history says they have never"
+            " gone a week. 7d puts late at 14d and stale at 42d"
+        ),
     ),
     _source(
         "alice_voice_recordings",
         "Alice Voice Recordings",
         cadence="daily 04:17",
         transport="Dagster alice_voice_recordings → Alice API",
-        data=30 * DAY,
+        data=7 * DAY,
+        # The event side is judged far more loosely than the ingest side, and
+        # on purpose: Zach's recording habit is bursty (51 measured event gaps,
+        # p90 16.19d, max 223.19d), but the DAILY POLLER writing nothing for
+        # weeks is not bursty, it is a poller that stopped.
+        event=30 * DAY,
+        basis=(
+            "a daily poller with no heartbeat, so data freshness is the only"
+            " signal there is. Ingest gaps carry none: every recording the"
+            " warehouse holds arrived in a single 53-row batch on 2026-07-10, so"
+            " 7d (late at 14d, stale at 42d) is set from the poll cadence with"
+            " headroom rather than from a distribution that does not exist"
+        ),
+        note="poller runs daily; a week of silence means it stopped, not that Zach went quiet",
     ),
     _source(
         "apple_photos",
@@ -434,6 +615,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         cadence="uploader every 5 min",
         transport="Mac LaunchAgent tails ~/.codex/sessions → /ingest/agent-sessions/batch",
         data=7 * DAY,
+        basis="measured: 2,479 gaps, p95 0.06d, max 3.94d — 7d leaves ample headroom",
     ),
     _source(
         "openclaw",
@@ -441,13 +623,20 @@ PIPELINES: tuple[Pipeline, ...] = (
         cadence="systemd timer every 5 min",
         transport="openclaw VM systemd timer → /ingest/agent-sessions/batch",
         data=7 * DAY,
+        basis="measured: 5,558 gaps, p95 0.02d, max 1.14d — 7d leaves ample headroom",
     ),
     _source(
         "pi",
         "pi sessions",
         cadence="uploader every 5 min",
         transport="Mac LaunchAgent tails ~/.pi/agent/sessions → /ingest/agent-sessions/batch",
-        data=30 * DAY,
+        data=3 * DAY,
+        basis=(
+            "measured: 168 gaps, p95 0.06d, max 2.86d. The previous 30d could not"
+            " reach 'late' until sixty days, which is how this source sat quiet"
+            " for five weeks under a green dot; 3d puts late at 6d — still twice"
+            " the longest silence in two years — and stale at 18d"
+        ),
     ),
     _source(
         "claude_desktop",
@@ -456,6 +645,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Dagster claude_desktop_client → claude.ai API with a pushed session key",
         data=7 * DAY,
         run=3 * HOUR,
+        basis="measured: 111 gaps, p95 1.51d, max 16.71d; the 3h run heartbeat is the sharper signal",
         state=StateSource(table="claude_desktop_credentials", updated_column="updated_at"),
         note="the Mac re-pushes the session key hourly; a stale credential expires the poller",
     ),
@@ -466,6 +656,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Dagster chatgpt_backend_ingest → chatgpt.com backend API with a published session",
         data=7 * DAY,
         run=3 * HOUR,
+        basis="measured: 65 gaps, p95 5.29d, max 19.17d; the 3h run heartbeat is the sharper signal",
         state=StateSource(
             table="chatgpt_sessions",
             updated_column="updated_at",
@@ -528,6 +719,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Dagster gmail/whatsapp/imessage/photo enrichment assets → agent container",
         expected_data_interval=7 * DAY,
         expected_run_interval=None,
+        data_basis="measured: 32,756 gaps, p95 0.01d, max 1.04d — 7d leaves ample headroom",
         note="one shared table for every source's extracted text, captions, and transcripts",
     ),
     Pipeline(
@@ -538,6 +730,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Dagster google_drive_source_sync (inline extractors)",
         expected_data_interval=7 * DAY,
         expected_run_interval=None,
+        data_basis="measured: 335 gaps, p95 0.83d, max 2.32d — 7d leaves ample headroom",
     ),
     Pipeline(
         id="voice_memo_transcription",
@@ -545,8 +738,14 @@ PIPELINES: tuple[Pipeline, ...] = (
         kind="enrichment",
         cadence="hourly",
         transport="Dagster apple_voice_memos_transcription → AssemblyAI",
-        expected_data_interval=30 * DAY,
+        expected_data_interval=7 * DAY,
         expected_run_interval=None,
+        data_basis=(
+            "measured: 463 gaps, p95 1.61d, max 6.56d. It transcribes what the"
+            " voice-memo uploader delivers, so its honest SLA is its input's, not"
+            " its hourly schedule; the previous 30d could not reach 'late' inside"
+            " two months"
+        ),
     ),
     Pipeline(
         id="voice_memo_enrichment",
@@ -554,8 +753,12 @@ PIPELINES: tuple[Pipeline, ...] = (
         kind="enrichment",
         cadence="hourly :17",
         transport="Dagster apple_voice_memos_enrichment → agent container",
-        expected_data_interval=30 * DAY,
+        expected_data_interval=7 * DAY,
         expected_run_interval=None,
+        data_basis=(
+            "measured: 794 gaps, p95 0.71d, max 6.57d — same reasoning as"
+            " voice_memo_transcription: it follows its input's cadence, not the clock"
+        ),
     ),
     Pipeline(
         id="manual_finance_extraction",
@@ -575,6 +778,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Dagster receipt_enrichment → agent container over the ledger",
         expected_data_interval=7 * DAY,
         expected_run_interval=None,
+        data_basis="measured: 528 gaps, p95 0.36d, max 1.58d — 7d leaves ample headroom",
     ),
     Pipeline(
         id="photo_identity",
@@ -584,6 +788,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Dagster photo_identity over every registered photo source",
         expected_data_interval=7 * DAY,
         expected_run_interval=None,
+        data_basis="measured: 215 gaps, p95 0.71d, max 2.47d — 7d leaves ample headroom",
     ),
     Pipeline(
         id="slack_file_fingerprints",
@@ -593,6 +798,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Dagster slack_file_fingerprints -> files.slack.com, bounded slices",
         expected_data_interval=7 * DAY,
         expected_run_interval=None,
+        data_basis="measured: 428 gaps, p95 0.04d, max 0.05d — 7d leaves ample headroom",
         note=(
             "walks a ~905k-image backlog newest-first in bounded slices; the link "
             "table is the cursor, so a slow backfill is normal rather than late"
@@ -606,6 +812,16 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Dagster finance_ledger over Plaid + manual_finance",
         expected_data_interval=3 * HOUR,
         expected_run_interval=None,
+        # The one pipeline where event time legitimately trails write time, and
+        # the reason ``expected_event_interval`` exists as a separate number at
+        # all. ``derived_finance.observations.as_of`` is a DATE: an observation
+        # written at 15:40 is dated 00:00 that day, so newest_event_at is behind
+        # last_write_at by up to a day *while working perfectly*. Judging it on
+        # the 3h data interval reported 'late' on a healthy ledger — measured
+        # against production 2026-08-23, newest_event_at was 15.8h old against a
+        # 6h 'late' threshold. That is the false positive this override exists
+        # to prevent; 2d keeps a genuinely frozen ledger detectable at 4d.
+        expected_event_interval=2 * DAY,
         note="snapshots every live account's balance, so observations advance every run",
     ),
     Pipeline(
@@ -666,6 +882,27 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Dagster pipeline_health asset over every registered table",
         expected_data_interval=30 * MINUTE,
         expected_run_interval=None,
+    ),
+    Pipeline(
+        # Separate from pipeline_health on purpose: this one costs a sequential
+        # scan of every unique index's heap under the size ceiling (~2 GB of
+        # reads on the production shape), which is a daily amount of work, not a
+        # ten-minutely one. Folding it into the freshness collector would either
+        # make that collector expensive or make this check useless.
+        id="collation_health",
+        label="Collation drift & index integrity",
+        kind="internal",
+        cadence="daily 03:41",
+        transport="Dagster collation_health asset over pg_database/pg_collation + unique indexes",
+        expected_data_interval=2 * DAY,
+        expected_run_interval=None,
+        data_basis="a daily asset; 2d puts late at 4d, so one missed run is not an alarm",
+        note=(
+            "this database has NO collation baseline (datcollversion is NULL) and"
+            " REFRESH COLLATION VERSION cannot create one, so Postgres will never"
+            " warn; the duplicate-key probe is corroboration only and cannot see a"
+            " mis-ordered index that has no duplicates — amcheck can"
+        ),
     ),
 )
 
@@ -827,6 +1064,16 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     # This snapshot itself
     "pipeline_health": _data("pipeline_health", "collected_at"),
     "pipeline_table_freshness": _support("pipeline_health", "collected_at"),
+    "mart_view_health": _support(
+        "pipeline_health",
+        "collected_at",
+        note="level 2: the marts_* read interface, measured on inputs rather than a stamped column",
+    ),
+    "collation_health": _data(
+        "collation_health",
+        "collected_at",
+        note="collation baselines and the corroborating unique-index divergence probe",
+    ),
     # The warehouse's own enrichment agent
     "agent_runs": _data("enrichment_agent", "started_at", "started_at"),
     "agent_run_events": _support("enrichment_agent", "created_at"),
@@ -884,11 +1131,18 @@ class PipelineSnapshot:
     cadence: str
     transport: str
     note: str
+    data_basis: str
     expected_data_interval_seconds: int
     expected_run_interval_seconds: int
+    expected_event_interval_seconds: int
     last_write_at: datetime | None
     newest_event_at: datetime | None
     last_run_at: datetime | None
+    #: How many ``data`` tables actually yielded an event timestamp. Zero with a
+    #: nonzero expected_event_interval means the event columns exist but were
+    #: too expensive to probe — "unmeasured", which the view must not render as
+    #: "no data has ever arrived".
+    event_tables_probed: int
     row_estimate: int
     byte_size: int
     table_count: int
@@ -900,6 +1154,44 @@ class PipelineSnapshot:
     state_attention_rows: int
     last_error: str
     last_error_at: datetime | None
+
+
+@dataclass
+class MartViewSnapshot:
+    """One probed ``marts_*`` view, as written to ``ops.mart_view_health``.
+
+    Facts only, exactly like the table snapshot: what the view reads, whether
+    it currently returns a row, how its definition hashes, and how fresh the
+    stalest thing it reads is. The verdict is derived at read time by
+    ``marts_ops.mart_view_health``, so a snapshot that stops refreshing reports
+    ``unknown`` rather than yesterday's green.
+    """
+
+    view_id: str
+    domain: str
+    view_schema: str
+    view_name: str
+    #: Logical ids of the base TABLES this view reads, transitively through any
+    #: intermediate views. Resolved from pg_depend, never hand-maintained.
+    input_tables: list[str]
+    #: The pipelines those tables belong to — what actually gets judged.
+    input_pipelines: list[str]
+    input_count: int
+    #: The input pipeline furthest past its own SLA, and the numbers needed to
+    #: re-derive that judgement live.
+    stalest_pipeline: str
+    stalest_pipeline_at: datetime | None
+    stalest_pipeline_expected_seconds: int
+    inputs_unmeasured: int
+    has_rows: int
+    definition_sha256: str
+    #: When THIS definition sha was first observed. A change resets it, which is
+    #: how a silent redefinition becomes visible.
+    first_seen_at: datetime | None
+    probe_status: str
+    probe_detail: str
+    probe_ms: int
+    note: str
 
 
 def _real(value: datetime | None) -> datetime | None:
@@ -940,7 +1232,7 @@ class PipelineHealthCollector:
         # timeout is the backstop for the unexpected one (a bloated index, a
         # concurrent rewrite holding pages hostage). A probe that trips it is
         # recorded as a timeout instead of stretching the collection window.
-        with self._probe_budget():
+        with self._probe_budget(PROBE_STATEMENT_TIMEOUT_MS):
             tables = [
                 self._probe_table(table_id, coverage, stats, indexed)
                 for table_id, coverage in sorted(TABLE_PIPELINES.items())
@@ -953,15 +1245,54 @@ class PipelineHealthCollector:
             ]
         return pipelines, tables
 
-    def run(self) -> tuple[list[PipelineSnapshot], list[TableSnapshot]]:
-        """Collect and persist, returning what was written."""
+    def collect_marts(
+        self, pipelines: Sequence[PipelineSnapshot], tables: Sequence[TableSnapshot]
+    ) -> list[MartViewSnapshot]:
+        """Measure every ``marts_*`` view against the snapshot just taken.
+
+        Takes the pipeline and table snapshots rather than re-reading them, so a
+        view's input freshness is measured at the same instant as its inputs' —
+        a roll-up assembled from two different collections could report a view
+        as staler than anything it reads.
+        """
+        by_table = {snapshot.table_id: snapshot for snapshot in tables}
+        by_pipeline = {snapshot.pipeline: snapshot for snapshot in pipelines}
+        inputs = self._view_input_tables()
+        definitions = self._view_definitions()
+        previous = self._previous_definition_shas()
+        now = self._now()
+        with self._probe_budget(MART_PROBE_STATEMENT_TIMEOUT_MS):
+            return [
+                self._probe_mart_view(
+                    view_id, by_table, by_pipeline, inputs, definitions, previous, now
+                )
+                for view_id in mart_view_ids()
+            ]
+
+    def run_all(
+        self,
+    ) -> tuple[list[PipelineSnapshot], list[TableSnapshot], list[MartViewSnapshot]]:
+        """Collect and persist everything this collector measures.
+
+        One ``collected_at`` for all three snapshots, so the views' staleness
+        guard applies to the whole dashboard at once rather than letting one
+        surface silently outlive another.
+        """
         pipelines, tables = self.collect()
-        self._warehouse.write_pipeline_health(pipelines, tables, collected_at=self._now())
+        marts = self.collect_marts(pipelines, tables)
+        collected_at = self._now()
+        self._warehouse.write_pipeline_health(pipelines, tables, collected_at=collected_at)
+        self._warehouse.write_mart_view_health(marts, collected_at=collected_at)
+        return pipelines, tables, marts
+
+    def run(self) -> tuple[list[PipelineSnapshot], list[TableSnapshot]]:
+        """Collect and persist, returning the pipeline and table snapshots."""
+        pipelines, tables, _ = self.run_all()
         return pipelines, tables
 
     @contextmanager
-    def _probe_budget(self):
-        self._warehouse._raw_command(f"SET statement_timeout = {PROBE_STATEMENT_TIMEOUT_MS}")
+    def _probe_budget(self, milliseconds: int):
+        self._warehouse._raw_command(f"SET statement_timeout = {int(milliseconds)}")
         try:
             yield
         finally:
@@ -1004,6 +1335,108 @@ class PipelineHealthCollector:
             (self._warehouse.physical_schema_names(include_hidden=True),),
         )
         return {(schema, table, column) for schema, table, column in rows}
+
+    # -- mart (view) catalog reads ----------------------------------------
+
+    def _relation_dependencies(self) -> dict[tuple[str, str], set[tuple[str, str, str]]]:
+        """Direct relation-level dependencies of every view in our schemas.
+
+        ``pg_depend`` records a view's dependencies against its ``pg_rewrite``
+        rule, not against the view relation, which is why the join goes through
+        ``pg_rewrite``. Column-level rows are collapsed to the relation and the
+        view's dependency on itself is dropped, leaving one edge per
+        (view, relation it reads).
+        """
+        rows = self._warehouse._query(
+            """
+            SELECT vn.nspname, vc.relname, dn.nspname, dc.relname, dc.relkind
+            FROM pg_rewrite AS r
+            INNER JOIN pg_class AS vc ON vc.oid = r.ev_class
+            INNER JOIN pg_namespace AS vn ON vn.oid = vc.relnamespace
+            INNER JOIN pg_depend AS d
+              ON d.objid = r.oid
+             AND d.classid = 'pg_rewrite'::regclass
+             AND d.refclassid = 'pg_class'::regclass
+            INNER JOIN pg_class AS dc ON dc.oid = d.refobjid
+            INNER JOIN pg_namespace AS dn ON dn.oid = dc.relnamespace
+            WHERE vc.relkind = 'v'
+              AND vn.nspname = ANY(%s)
+              AND d.refobjid <> r.ev_class
+            """,
+            (self._warehouse.physical_schema_names(include_hidden=True),),
+        )
+        edges: dict[tuple[str, str], set[tuple[str, str, str]]] = {}
+        for view_schema, view_name, dep_schema, dep_name, dep_kind in rows:
+            edges.setdefault((view_schema, view_name), set()).add(
+                (dep_schema, dep_name, dep_kind)
+            )
+        return edges
+
+    def _view_input_tables(self) -> dict[tuple[str, str], list[str]]:
+        """Resolve each view to the logical ids of the base tables it reads.
+
+        Views read views (``marts_finance.net_worth`` reads
+        ``marts_derived_finance.accounts``), so the edges are closed
+        transitively down to relkind 'r'. The transitive closure is done here
+        rather than in a recursive CTE because it has to terminate on a cycle —
+        Postgres permits mutually recursive views — and a visited set is the
+        clearest way to say that.
+        """
+        edges = self._relation_dependencies()
+        physical_to_logical = {
+            (rel.with_namespace(self._warehouse.schema_namespace).schema, rel.name): logical
+            for logical, rel in CANONICAL_RELATIONS.items()
+            if logical in TABLE_PIPELINES
+        }
+
+        def resolve(start: tuple[str, str]) -> list[str]:
+            seen: set[tuple[str, str]] = set()
+            queue = [start]
+            found: set[str] = set()
+            while queue:
+                node = queue.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                for dep_schema, dep_name, dep_kind in edges.get(node, ()):
+                    if dep_kind == "v":
+                        queue.append((dep_schema, dep_name))
+                        continue
+                    logical = physical_to_logical.get((dep_schema, dep_name))
+                    if logical is not None:
+                        found.add(logical)
+            return sorted(found)
+
+        return {view: resolve(view) for view in edges}
+
+    def _view_definitions(self) -> dict[tuple[str, str], str]:
+        rows = self._warehouse._query(
+            """
+            SELECT n.nspname, c.relname, pg_get_viewdef(c.oid, true)
+            FROM pg_class AS c
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE c.relkind = 'v' AND n.nspname = ANY(%s)
+            """,
+            (self._warehouse.physical_schema_names(include_hidden=True),),
+        )
+        return {(schema, name): definition or "" for schema, name, definition in rows}
+
+    def _previous_definition_shas(self) -> dict[str, tuple[str, datetime | None]]:
+        """The last collection's definition hash per view, to detect a change.
+
+        A first collection (or a database that predates the table) simply has
+        no history, which is treated as "this definition was first seen now"
+        rather than as a change — an empty table must not report the whole
+        marts layer as freshly redefined.
+        """
+        try:
+            rows = self._warehouse._query(
+                "SELECT view_id, definition_sha256, first_seen_at FROM @mart_view_health"
+            )
+        except psycopg2.Error as error:
+            logger.info("no previous mart definition hashes: %s", error)
+            return {}
+        return {view_id: (sha or "", _real(seen)) for view_id, sha, seen in rows}
 
     # -- probes ------------------------------------------------------------
 
@@ -1078,6 +1511,141 @@ class PipelineHealthCollector:
             snapshot.probe_status = PROBE_EMPTY
         return snapshot
 
+    def _probe_mart_view(
+        self,
+        view_id: str,
+        by_table: dict[str, TableSnapshot],
+        by_pipeline: dict[str, PipelineSnapshot],
+        inputs: dict[tuple[str, str], list[str]],
+        definitions: dict[tuple[str, str], str],
+        previous: dict[str, tuple[str, datetime | None]],
+        now: datetime,
+    ) -> MartViewSnapshot:
+        obj = CATALOG.object(view_id)
+        relation = canonical_relation(view_id).with_namespace(self._warehouse.schema_namespace)
+        key = (relation.schema, relation.name)
+        input_tables = inputs.get(key, [])
+        definition = definitions.get(key)
+        snapshot = MartViewSnapshot(
+            view_id=view_id,
+            domain=obj.domain,
+            view_schema=relation.schema,
+            view_name=relation.name,
+            input_tables=input_tables,
+            input_pipelines=[],
+            input_count=len(input_tables),
+            stalest_pipeline="",
+            stalest_pipeline_at=None,
+            stalest_pipeline_expected_seconds=0,
+            inputs_unmeasured=0,
+            has_rows=0,
+            definition_sha256="",
+            first_seen_at=None,
+            probe_status=PROBE_OK,
+            probe_detail="",
+            probe_ms=0,
+            note=obj.comment or "",
+        )
+        if definition is None:
+            snapshot.probe_status = PROBE_MISSING
+            snapshot.probe_detail = "view does not exist in this database"
+            return snapshot
+
+        snapshot.definition_sha256 = hashlib.sha256(definition.encode("utf-8")).hexdigest()
+        seen_before = previous.get(view_id)
+        if seen_before is not None and seen_before[0] == snapshot.definition_sha256:
+            snapshot.first_seen_at = seen_before[1] or now
+        else:
+            snapshot.first_seen_at = now
+
+        self._roll_up_inputs(snapshot, by_table, by_pipeline)
+
+        if view_id in EXPENSIVE_MART_VIEWS:
+            snapshot.probe_status = PROBE_SKIPPED_EXPENSIVE
+            snapshot.probe_detail = (
+                "declared too expensive to probe every collection; input freshness "
+                "and definition drift still apply"
+            )
+            return snapshot
+
+        started = time.monotonic()
+        sql = f"SELECT 1 FROM {_ident(relation.schema)}.{_ident(relation.name)} LIMIT 1"
+        try:
+            rows = self._warehouse._query(sql)
+        except psycopg2.errors.QueryCanceled as error:
+            snapshot.probe_status = PROBE_TIMEOUT
+            snapshot.probe_detail = _one_line(str(error))[:500]
+        except psycopg2.Error as error:
+            snapshot.probe_status = PROBE_ERROR
+            snapshot.probe_detail = _one_line(str(error))[:500]
+        else:
+            snapshot.has_rows = 1 if rows else 0
+            snapshot.probe_status = PROBE_OK if rows else PROBE_EMPTY
+        snapshot.probe_ms = int((time.monotonic() - started) * 1000)
+        return snapshot
+
+    def _roll_up_inputs(
+        self,
+        snapshot: MartViewSnapshot,
+        by_table: dict[str, TableSnapshot],
+        by_pipeline: dict[str, PipelineSnapshot],
+    ) -> None:
+        """Pick the input PIPELINE furthest past its own SLA.
+
+        Two decisions here, both of which were measured against production
+        before being made:
+
+        **Judge per pipeline, not per table.** The registry declares an SLA per
+        pipeline and the pipeline's own freshness is a ``max()`` over its data
+        tables — deliberately, because a pipeline is not broken just because one
+        of its tables is quiet. Judging an individual input table against its
+        pipeline's SLA breaks that: measured 2026-08-23, it reported four marts
+        'stale' because ``derived_finance.transactions`` was 1.1 days old
+        against ``finance_ledger``'s three-hour interval, while the ledger was
+        writing balance observations every half hour exactly as designed. Those
+        are false positives, and a monitoring change that cries wolf is worse
+        than the gap it closes. So a mart can never be more broken than the
+        pipelines feeding it; the *per-table* detail lives in
+        ``marts_ops.table_freshness``, which is where to look when a quiet table
+        inside a healthy pipeline is the question.
+
+        **Rank by age relative to SLA, not by raw age.**
+        ``marts_ai_conversations.events`` reads six agent sources whose
+        expectations differ by an order of magnitude, so "oldest" would
+        permanently nominate whichever source is legitimately the quietest
+        instead of the one actually misbehaving. The interval is stored beside
+        the timestamp so the view re-derives the verdict at read time rather
+        than trusting a stored one.
+
+        ``state`` tables are excluded: a cursor's write time is the pipeline's
+        heartbeat, not the freshness of anything the mart shows.
+        """
+        pipelines: list[str] = []
+        for table_id in snapshot.input_tables:
+            table = by_table.get(table_id)
+            if table is None or table.role == "state":
+                continue
+            if table.pipeline not in pipelines:
+                pipelines.append(table.pipeline)
+        snapshot.input_pipelines = sorted(pipelines)
+
+        worst_ratio = -1.0
+        unmeasured = 0
+        for pipeline_id in snapshot.input_pipelines:
+            entry = by_pipeline.get(pipeline_id)
+            expected = entry.expected_data_interval_seconds if entry else 0
+            written = entry.last_write_at if entry else None
+            if written is None or expected <= 0:
+                unmeasured += 1
+                continue
+            ratio = (self._now() - written).total_seconds() / expected
+            if ratio > worst_ratio:
+                worst_ratio = ratio
+                snapshot.stalest_pipeline = pipeline_id
+                snapshot.stalest_pipeline_at = written
+                snapshot.stalest_pipeline_expected_seconds = expected
+        snapshot.inputs_unmeasured = unmeasured
+
     def _probeable(
         self,
         schema: str,
@@ -1117,6 +1685,13 @@ class PipelineHealthCollector:
         data_tables = [table for table in tables if table.role == "data"]
         state_tables = [table for table in tables if table.role == "state"]
         state = self._state_aggregate(entry)
+        # Event time is only judgeable where a data table actually declares an
+        # event column. Where none does (the freshness collector's own snapshot,
+        # the Slack fingerprint link table), the expectation is recorded as
+        # zero — "not monitored" — rather than left to read as "no data has ever
+        # arrived", which is a different and much louder claim.
+        event_columns = [table for table in data_tables if table.event_at_column]
+        expected_event = _seconds(entry.event_interval) if event_columns else 0
         return PipelineSnapshot(
             pipeline=entry.id,
             label=entry.label,
@@ -1124,12 +1699,17 @@ class PipelineHealthCollector:
             cadence=entry.cadence,
             transport=entry.transport,
             note=entry.note,
+            data_basis=entry.data_basis,
             expected_data_interval_seconds=_seconds(entry.expected_data_interval),
             expected_run_interval_seconds=_seconds(entry.expected_run_interval),
+            expected_event_interval_seconds=expected_event,
             last_write_at=_newest(*(table.last_write_at for table in data_tables)),
             newest_event_at=_newest(*(table.newest_event_at for table in data_tables)),
             last_run_at=_newest(
                 state.get("last_run_at"), *(table.last_write_at for table in state_tables)
+            ),
+            event_tables_probed=sum(
+                1 for table in event_columns if table.newest_event_at is not None
             ),
             row_estimate=sum(table.row_estimate for table in data_tables),
             byte_size=sum(table.byte_size for table in tables),
@@ -1221,6 +1801,7 @@ def _worst_probe_status(statuses: Iterable[str]) -> str:
         PROBE_ERROR,
         PROBE_TIMEOUT,
         PROBE_SKIPPED_UNINDEXED,
+        PROBE_SKIPPED_EXPENSIVE,
         PROBE_NO_TIMESTAMP,
         PROBE_EMPTY,
         PROBE_OK,
