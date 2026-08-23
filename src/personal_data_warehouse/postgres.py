@@ -325,8 +325,9 @@ SEARCH_HYBRID_MAX_CANDIDATES = 2000
 # 1000 qualifying rows made each query-vector leg scan ~97k embeddings and take
 # 31.2s; two legs time out before fusion. LIMIT 40 took 2.25s. Agent sessions
 # have p95 three chunks/event, so a 4x pool with a 40-row floor still gives a
-# depth-10 search enough distinct event candidates. Keep every other scope on
-# the measured deeper pool until it gets its own evidence.
+# depth-10 search enough distinct event candidates. Drive keeps the deeper pool
+# but obtains it with the source-first exact path below; every other scope uses
+# the global HNSW until it gets its own evidence.
 SEARCH_HYBRID_AGENT_CANDIDATE_MULTIPLIER = 4
 SEARCH_HYBRID_AGENT_MIN_CANDIDATES = 40
 SEARCH_HYBRID_AGENT_MAX_CANDIDATES = 200
@@ -8676,6 +8677,10 @@ class PostgresWarehouse:
                                       OR t.adapter = ANY (sem_adapters)
                                   )
                                   AND (since IS NULL OR t.event_ts >= since)
+                                  AND (
+                                      priorities IS NULL
+                                      OR t.priority::text = ANY (priorities)
+                                  )
                                 GROUP BY t.adapter, t.event_id
                                 ORDER BY match_chunk ASC NULLS LAST,
                                          match_pos ASC NULLS LAST,
@@ -8711,7 +8716,8 @@ class PostgresWarehouse:
                                       query,
                                       per_source,
                                       ARRAY['imessage', 'slack', 'whatsapp'],
-                                      since
+                                      since,
+                                      priorities
                                   ) AS h
                                   WHERE sem_adapters IS NULL
                                      OR split_part(h.ref, ':', 1) = ANY (sem_adapters);
@@ -8751,8 +8757,12 @@ class PostgresWarehouse:
                 ),
                 -- One leg per query vector. The second leg is gated on the
                 -- parameter, so a single-vector call pays a one-time filter,
-                -- not a second ANN scan.
-                sem_legs AS (
+                -- not a second ANN scan. Most scopes use the global HNSW.
+                -- Drive is excluded here: its 223k chunks are large enough
+                -- for an adapter-first exact scan to use parallel workers,
+                -- but selective enough that filtered HNSW spends longer
+                -- walking past other adapters than doing the exact math.
+                sem_global_legs AS (
                     (
                     SELECT c.adapter || ':' || c.event_id AS ref,
                            c.context, c.event_ts, c.text,
@@ -8763,6 +8773,7 @@ class PostgresWarehouse:
                     JOIN @search_chunks c ON c.text_sha256 = e.text_sha256
                     WHERE e.model = embedding_model
                       AND e.embedding IS NOT NULL
+                      AND sem_adapters IS DISTINCT FROM ARRAY['drive_file']::text[]
                       AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
                       AND (since IS NULL OR c.event_ts >= since)
                     ORDER BY e.embedding OPERATOR(public.<=>) qvec
@@ -8794,6 +8805,7 @@ class PostgresWarehouse:
                     WHERE e.model = embedding_model
                       AND e.embedding IS NOT NULL
                       AND qvec_alt IS NOT NULL
+                      AND sem_adapters IS DISTINCT FROM ARRAY['drive_file']::text[]
                       AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
                       AND (since IS NULL OR c.event_ts >= since)
                     ORDER BY e.embedding OPERATOR(public.<=>) qvec_alt
@@ -8813,6 +8825,88 @@ class PostgresWarehouse:
                 + str(SEARCH_HYBRID_MAX_CANDIDATES)
                 + r""") END
                     )
+                ),
+                -- A source-scoped Drive HNSW leg is pathologically selective:
+                -- LIMIT 40 walked 14,737 global embeddings and took 16.0s.
+                -- Scanning all 223k Drive chunks source-first launched three
+                -- workers and took 7.0s cold / 0.66s warm even at LIMIT 1000.
+                -- OFFSET 0 is a load-bearing plan barrier: without it the
+                -- planner returns to the global HNSW. Fetch text only after
+                -- top-k, or the exact scan detoasts every Drive chunk.
+                drive_semantic_legs AS (
+                    (
+                    SELECT top.adapter || ':' || top.event_id AS ref,
+                           top.context, top.event_ts, c2.text, top.rnk
+                    FROM (
+                        SELECT s.*,
+                               row_number() OVER (ORDER BY s.distance) AS rnk
+                        FROM (
+                            SELECT c.chunk_id, c.adapter, c.event_id,
+                                   c.context, c.event_ts,
+                                   e.embedding OPERATOR(public.<=>) qvec AS distance
+                            FROM @search_chunks c
+                            JOIN @search_chunk_embeddings e
+                              ON e.text_sha256 = c.text_sha256
+                            WHERE sem_adapters = ARRAY['drive_file']::text[]
+                              AND c.adapter = ANY (sem_adapters)
+                              AND e.model = embedding_model
+                              AND e.embedding IS NOT NULL
+                              AND (since IS NULL OR c.event_ts >= since)
+                            OFFSET 0
+                        ) s
+                        ORDER BY s.distance
+                        LIMIT least(greatest(per_source * """
+                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
+                + ", "
+                + str(SEARCH_HYBRID_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_MAX_CANDIDATES)
+                + r""")
+                    ) top
+                    JOIN @search_chunks c2 ON c2.chunk_id = top.chunk_id
+                    ORDER BY top.distance
+                    )
+                    UNION ALL
+                    (
+                    SELECT top.adapter || ':' || top.event_id AS ref,
+                           top.context, top.event_ts, c2.text, top.rnk
+                    FROM (
+                        SELECT s.*,
+                               row_number() OVER (ORDER BY s.distance) AS rnk
+                        FROM (
+                            SELECT c.chunk_id, c.adapter, c.event_id,
+                                   c.context, c.event_ts,
+                                   e.embedding OPERATOR(public.<=>) qvec_alt AS distance
+                            FROM @search_chunks c
+                            JOIN @search_chunk_embeddings e
+                              ON e.text_sha256 = c.text_sha256
+                            WHERE sem_adapters = ARRAY['drive_file']::text[]
+                              AND c.adapter = ANY (sem_adapters)
+                              AND e.model = embedding_model
+                              AND e.embedding IS NOT NULL
+                              AND qvec_alt IS NOT NULL
+                              AND (since IS NULL OR c.event_ts >= since)
+                            OFFSET 0
+                        ) s
+                        ORDER BY s.distance
+                        LIMIT least(greatest(per_source * """
+                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
+                + ", "
+                + str(SEARCH_HYBRID_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_MAX_CANDIDATES)
+                + r""")
+                    ) top
+                    JOIN @search_chunks c2 ON c2.chunk_id = top.chunk_id
+                    ORDER BY top.distance
+                    )
+                ),
+                sem_legs AS (
+                    SELECT g.ref, g.context, g.event_ts, g.text, g.rnk
+                    FROM sem_global_legs g
+                    UNION ALL
+                    SELECT d.ref, d.context, d.event_ts, d.text, d.rnk
+                    FROM drive_semantic_legs d
                 ),
                 sem_ranked AS (
                     -- Ranks, not distances: two query vectors are calibrated to

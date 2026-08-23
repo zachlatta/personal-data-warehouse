@@ -1713,6 +1713,20 @@ def test_search_hybrid_bounds_agent_session_semantic_candidate_work() -> None:
     assert sql.count("least(greatest(per_source * 4, 40), 200)") >= 2
 
 
+def test_search_hybrid_scans_drive_embeddings_source_first_in_parallel() -> None:
+    sql = _search_text_function_sql()
+
+    # Drive is large enough (223k chunks) for an exact three-worker scan to
+    # beat a filtered walk through the global HNSW. OFFSET 0 is the plan
+    # barrier that keeps the adapter-first join below the distance sort; text
+    # must only be fetched after the top-k or all Drive documents are detoasted.
+    assert "sem_adapters = ARRAY['drive_file']::text[]" in sql
+    assert "drive_semantic_legs AS" in sql
+    assert sql.count("OFFSET 0") >= 2
+    assert "JOIN @search_chunks c2 ON c2.chunk_id = top.chunk_id" in sql
+    assert "sem_global_legs" in sql
+
+
 def test_search_schema_signature_covers_hybrid_tuning(monkeypatch) -> None:
     import personal_data_warehouse.postgres as postgres_module
 
@@ -4819,7 +4833,15 @@ def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -
     assert "t.metadata->>'deleted'" in literal
     assert "t.adapter = 'drive_file'" in literal
     assert "t.metadata->>'excluded'" in literal
+    assert "t.priority::text = ANY (priorities)" in literal, (
+        "bounded exact candidates must be priority-scoped before top-k"
+    )
     assert "ARRAY['imessage', 'slack', 'whatsapp']" in literal
+    assert """ARRAY['imessage', 'slack', 'whatsapp'],
+                                      since,
+                                      priorities""" in literal, (
+        "chat exact-ref recovery must preserve the hybrid priority scope"
+    )
     assert "split_part(h.ref, ':', 1) = ANY (sem_adapters)" in literal
     assert "@search_text_exact(" in literal, (
         "ordinary names and chat-window identifiers must keep full-document "
@@ -4951,7 +4973,9 @@ def test_search_hybrid_pushes_the_source_filter_into_the_ann_scan() -> None:
     # adapters once, then filter the scan on c.adapter directly.
     sql = _search_text_function_sql()
     hybrid = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid("):]
-    legs = hybrid[hybrid.index("sem_legs AS ("):hybrid.index("sem_ranked AS (")]
+    legs = hybrid[
+        hybrid.index("sem_global_legs AS (") : hybrid.index("sem_ranked AS (")
+    ]
     assert "sem_adapters" in legs, "the semantic legs must filter on resolved adapters"
     assert "c.adapter = ANY (sem_adapters)" in legs
     assert "map.source = ANY (sources)" not in legs, (

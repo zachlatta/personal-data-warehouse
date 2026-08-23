@@ -340,6 +340,14 @@ and take 31.2s, so two legs exceeded the app's 60s statement budget. A 40-row le
 agent sessions have p95 three chunks per event, so the 4x pool still covers the requested
 event depth. Broad and every other scoped search retain the deeper 20x / 1,000-2,000 pool.
 
+Google Drive is the opposite filtered-ANN case: reducing the pool did not fix it. A 40-row
+HNSW leg still walked 14,737 global embeddings and took 16.0s. For exactly the Drive scope,
+hybrid instead scans all 223k Drive chunks by exact cosine distance, source-first behind an
+`OFFSET 0` plan barrier. PostgreSQL launches three workers for that scan; it measured 7.0s
+cold and 0.66s warm while returning the full 1,000-row pool, so it is both faster and more
+exact than filtered ANN. Fetch chunk text only *after* the top-k: doing it below the sort
+detoasts every Drive document. Broad and mixed-source searches still use the global HNSW.
+
 ## Pipeline Freshness and Health
 
 Every warehouse table also has to declare **which pipeline feeds it and how freshness is
