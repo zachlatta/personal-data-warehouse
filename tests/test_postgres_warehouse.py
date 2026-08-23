@@ -4715,3 +4715,15 @@ def test_search_schema_signature_covers_the_broad_pool_constants() -> None:
         "SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL",
     ):
         assert constant in signature_source, f"{constant} is missing from the search DDL signature"
+
+
+def test_search_hybrid_drops_its_previous_signature() -> None:
+    # CREATE OR REPLACE FUNCTION with a new parameter creates an OVERLOAD, it
+    # does not replace. Without an explicit drop, an upgraded warehouse keeps
+    # the six-argument search_hybrid alongside the seven-argument one, and any
+    # caller that omits the alternate embedding -- hand-written SQL, an agent
+    # copying the old signature -- silently gets the OLD implementation with
+    # the old ranking. Drop it as part of the same DDL.
+    sql = _search_text_function_sql()
+    assert "DROP FUNCTION IF EXISTS" in sql
+    assert "@search_hybrid(text, text, text, integer, text[], timestamptz)" in sql

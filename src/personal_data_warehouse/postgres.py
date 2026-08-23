@@ -8134,6 +8134,11 @@ class PostgresWarehouse:
             # exact failure class behind the 16-day silent-zero outage.
             self._command(
                 r"""
+            -- CREATE OR REPLACE with a new parameter OVERLOADS rather than
+            -- replaces, so the previous signature has to go explicitly or a
+            -- caller omitting the alternate embedding keeps reaching the old
+            -- implementation.
+            DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz);
             CREATE OR REPLACE FUNCTION @search_hybrid(
                 query text,
                 query_embedding text,
