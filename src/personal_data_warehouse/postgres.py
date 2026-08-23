@@ -7548,7 +7548,17 @@ class PostgresWarehouse:
             return f"t.adapter IN ({adapter_list})"
 
         def branch(source: str, adapters: tuple[str, ...], subsource: str) -> tuple[str, str]:
-            rank = "t.search_text <@> to_bm25query(%1$L, 'timeline_events_search_text_bm25_idx')"
+            # Score through the index that COVERS this branch's adapters.
+            # vchord-bm25 raises when the named index is not the one the plan
+            # used, and a low-volume branch's adapter filter is fully covered by
+            # the partial index -- so naming the global index there is a branch
+            # failure waiting for a plan flip. It is also the fast plan.
+            index_name = (
+                "timeline_events_search_text_bm25_idx"
+                if source in SEARCH_TEXT_HIGH_VOLUME_SOURCES
+                else "timeline_events_search_text_bm25_lowvol_idx"
+            )
+            rank = f"t.search_text <@> to_bm25query(%1$L, '{index_name}')"
             where_sql = (
                 f"({adapter_filter(adapters)}) "
                 "AND t.search_text != '' "
@@ -7892,6 +7902,12 @@ class PostgresWarehouse:
                 END IF;
 """
             + r"""
+                -- Same argument as the broad pool: the planner has no cost
+                -- model for the bm25 operator and otherwise re-scores every row
+                -- of a selective adapter filter (~5.6ms per document, 3.5s for
+                -- one small branch). Restored right after the loop, because the
+                -- merge below needs a real sort.
+                PERFORM set_config('enable_sort', 'off', true);
                 FOR branch_idx IN 1..coalesce(array_length(branch_sqls, 1), 0) LOOP
                     branch_source := branch_sources[branch_idx];
                     IF sources IS NOT NULL AND NOT branch_source = ANY (sources) THEN
@@ -7926,6 +7942,7 @@ class PostgresWarehouse:
                         END IF;
                     END;
                 END LOOP;
+                PERFORM set_config('enable_sort', 'on', true);
                 IF coalesce(array_length(failed_sources, 1), 0) > 0 THEN
                     IF array_length(failed_sources, 1) = executed_branches THEN
                         RAISE EXCEPTION 'search_text: every source branch failed; first error: %', first_branch_error

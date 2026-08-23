@@ -4802,3 +4802,48 @@ def test_search_hybrid_literal_leg_failure_does_not_take_down_the_search() -> No
     leg = sql[sql.index("exact_refs"):]
     assert "EXCEPTION WHEN OTHERS THEN" in leg
     assert "RAISE WARNING 'search_hybrid: literal leg failed" in leg
+
+
+def test_each_search_branch_names_the_index_that_covers_its_adapters() -> None:
+    # vchord-bm25 raises "query specifies index X but planner chose index Y"
+    # when the index named in to_bm25query() is not the one the plan used. A
+    # low-volume branch's adapter filter is fully covered by the PARTIAL index,
+    # so the planner may legitimately choose it -- and then a branch that names
+    # the global index fails, taking a scoped search down with it (all-branches-
+    # failed raises). Each branch must name the index that covers its own
+    # adapters, which is also the fast plan: the transcript branch went from
+    # 3.5s to ~150ms.
+    import re
+
+    import personal_data_warehouse.postgres as postgres_module
+
+    sql = _search_text_function_sql()
+    body = sql[sql.index("branch_sqls text[]"):]
+    for source, adapters, _ in postgres_module.SEARCH_SOURCE_DEFS:
+        branch = next(
+            (line for line in body.split("$b$") if f"'{source}'::text AS source" in line),
+            None,
+        )
+        assert branch, f"no generated branch for {source}"
+        indexes = set(re.findall(r"to_bm25query\([^,]+,\s*'([a-z0-9_]+)'\)", branch))
+        low_volume = source not in postgres_module.SEARCH_TEXT_HIGH_VOLUME_SOURCES
+        want = (
+            "timeline_events_search_text_bm25_lowvol_idx"
+            if low_volume
+            else "timeline_events_search_text_bm25_idx"
+        )
+        assert indexes == {want}, f"{source} branch scores through {indexes}, want {want}"
+
+
+def test_search_text_branch_loop_pins_the_index_ordered_plan() -> None:
+    # Same argument as the broad pool: without the hint the planner re-scores
+    # every row of a selective adapter filter instead of scanning the index.
+    # The hint has to cover the branch EXECUTEs and be restored before the
+    # merge, which needs a real sort.
+    sql = _search_text_function_sql()
+    loop_at = sql.index("FOR branch_idx IN 1..")
+    assert "set_config('enable_sort', 'off', true)" in sql[:loop_at]
+    merge_at = sql.index("PARTITION BY h.source")
+    assert "set_config('enable_sort', 'on', true)" in sql[loop_at:merge_at], (
+        "enable_sort must be restored after the branch loop and before the merge"
+    )
