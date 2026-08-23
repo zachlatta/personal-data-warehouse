@@ -341,3 +341,21 @@ def test_smoke_does_not_pay_for_the_corpus_stamp(monkeypatch, tmp_path) -> None:
                         lambda *a, **k: module.SearchResult(mode="hybrid", rows=(), elapsed_seconds=0.1))
     module.run_smoke("probe", modes=("hybrid",), depth=5, workers=1, progress=False)
     assert seen["include_corpus"] is False
+
+
+def test_search_failure_carries_the_cli_stderr(monkeypatch) -> None:
+    # CalledProcessError stringifies to "returned non-zero exit status 1" and
+    # drops stderr, which is where the reason lives. A harness that hides the
+    # reason sends you to reproduce every failure by hand.
+    import subprocess as subprocess_module
+
+    import personal_data_warehouse.search_benchmark as module
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess_module.CompletedProcess(
+            args=["pdw"], returncode=1, stdout="", stderr="statement timeout: budget exceeded"
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    result = module.run_search("anything", "hybrid", 10)
+    assert "statement timeout: budget exceeded" in result.error

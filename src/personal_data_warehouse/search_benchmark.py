@@ -323,8 +323,17 @@ def trim_to_json(stdout: str) -> str:
 
 def _pdw_json(args: list[str], *, timeout: float) -> Any:
     completed = subprocess.run(
-        ["pdw", *args], check=True, capture_output=True, text=True, timeout=timeout
+        ["pdw", *args], capture_output=True, text=True, timeout=timeout
     )
+    if completed.returncode != 0:
+        # CalledProcessError stringifies to "returned non-zero exit status 1"
+        # and drops stderr, which is where the CLI puts the actual reason. A
+        # harness that hides why a call failed sends you to reproduce it by
+        # hand every single time.
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(
+            f"pdw {' '.join(args[:2])} failed ({completed.returncode}): {detail[:400]}"
+        )
     return json.loads(trim_to_json(completed.stdout))
 
 
@@ -341,8 +350,8 @@ def run_search(
     try:
         payload = _pdw_json(["call", "search", "--data", json.dumps(request)], timeout=timeout)
         result = parse_search_payload(json.dumps(payload))
-    except (subprocess.SubprocessError, OSError, ValueError) as error:
-        result = SearchResult(mode=mode, error=str(error)[:200])
+    except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as error:
+        result = SearchResult(mode=mode, error=str(error)[:400])
     return SearchResult(
         mode=result.mode or mode,
         rows=result.rows,
