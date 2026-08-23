@@ -82,7 +82,7 @@ def render() -> str:
     lines.append("var Objects = []CatalogObject{")
     for obj in CATALOG.objects:
         lines.append(
-            "\t{ID: %s, Kind: %s, Layer: %s, Domain: %s, Schema: %s, Name: %s, Discoverable: %s, QueryAccess: %s, Secret: %s},"
+            "\t{ID: %s, Kind: %s, Layer: %s, Domain: %s, Schema: %s, Name: %s, Discoverable: %s, QueryAccess: %s, Secret: %s, Comment: %s},"
             % (
                 go_string(obj.id),
                 go_string(obj.kind),
@@ -93,6 +93,7 @@ def render() -> str:
                 "true" if obj.discoverable else "false",
                 go_string(obj.query_access),
                 "true" if obj.secret else "false",
+                go_string(obj.comment),
             )
         )
     lines.append("}")

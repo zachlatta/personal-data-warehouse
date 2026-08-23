@@ -32,6 +32,11 @@ type CatalogObject struct {
 	Discoverable bool
 	QueryAccess  string
 	Secret       bool
+	// Comment is the relation's own catalog prose — what this table is for,
+	// and the trap a caller would otherwise learn from a wrong answer. It is
+	// published as the pg_class comment, and rendered by schema_overview
+	// (first sentence) and describe_table (in full).
+	Comment string
 }
 
 type StartHereGuidance struct {

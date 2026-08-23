@@ -245,9 +245,13 @@ func TestSchemaOverviewStaysCompact(t *testing.T) {
 
 	csv := svc.SchemaOverview(context.Background()).Results[0].CSV
 
-	// Preamble plus five relations. The real warehouse has ~108, and the budget
-	// that matters is ~200 bytes per relation on top of a fixed ~5KB preamble.
-	if len(csv) > 8000 {
+	// Preamble plus five relations. The real warehouse has ~147, and the budget
+	// that matters is ~200 bytes per relation on top of the fixed preamble.
+	// The preamble also carries the catalog-guidance legend, and two of the
+	// five fixture relations (marts_inbox.gmail_threads, timeline.events)
+	// carry a catalog comment of their own, which is what the extra ~750
+	// bytes over the pre-guidance 7.3KB buys.
+	if len(csv) > 9000 {
 		t.Fatalf("overview grew to %d bytes for 5 relations; the per-relation budget is what keeps it usable", len(csv))
 	}
 }

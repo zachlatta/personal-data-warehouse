@@ -58,6 +58,14 @@ func (s *Service) DescribeTable(ctx context.Context, relation string) Response {
 		out.WriteString(" rows, estimated)")
 	}
 	out.WriteString("\n")
+	// The catalog's prose for this relation, in full. schema_overview shows
+	// only its capped first sentence, and this is where the rest lives — which
+	// is what makes truncating there a pointer rather than a loss.
+	for _, line := range wrapComment(relationHeadlines[ref.DisplayName()], 88) {
+		if line != "" {
+			out.WriteString("# " + line + "\n")
+		}
+	}
 	if lines := s.tableIndexList(ctx, ref); len(lines) > 0 {
 		out.WriteString("# indexes:\n")
 		for _, line := range lines {

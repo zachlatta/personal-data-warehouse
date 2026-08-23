@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -51,6 +52,137 @@ var bookkeepingTimeColumns = map[string]bool{
 	"last_synced_at": true, "first_seen_at": true, "last_seen_at": true,
 	"completed_at": true, "last_success_at": true, "deleted_at": true,
 	"sync_started_at": true, "ingest_ts": true,
+}
+
+// --- catalog guidance ----------------------------------------------------------
+//
+// Every schema, and 35 relations, carry a `comment` in warehouse_catalog.json
+// saying which relation to reach for and what each one is actually for. Those
+// comments are published as real Postgres comments, but neither schema_overview
+// nor describe_table used to render them, so the guidance existed everywhere
+// except where an agent would see it. Measured over 60 days, 43% of sessions
+// opened with schema_overview and 18% opened by naming a relation that does not
+// exist. This block is what closes that gap.
+//
+// The overview's size is the constraint (see the file header), so the rendering
+// is selective in two ways:
+//
+//   - A schema headline prints only when the schema's comment names a specific
+//     relation, which is exactly the guidance worth paying for. The 21 base_*
+//     and 6 generic derived_* comments are one boilerplate sentence with the
+//     source name substituted; the preamble's layer table already says it, and
+//     repeating it 27 more times would spend ~3.2KB to say nothing.
+//   - A relation's own comment prints as its FIRST SENTENCE, capped. The full
+//     text is one describe_table call away, which is what makes truncating here
+//     safe rather than lossy.
+var (
+	// schemaHeadlines holds the schema comments that name a relation.
+	schemaHeadlines = map[string]string{}
+	// relationHeadlines maps "schema.name" to that relation's own comment.
+	relationHeadlines = map[string]string{}
+	// entryPointRelations holds the "schema.name" of every relation the
+	// catalog nominates as a starting point.
+	entryPointRelations = map[string]bool{}
+)
+
+// relationReference matches a schema-qualified relation named inside catalog
+// prose ("Start with marts_photos.photos, ..."). Bare words and the function
+// and column references that share the surrounding text (search_text(),
+// source_table/source_pk) deliberately do not match.
+var relationReference = regexp.MustCompile(`\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b`)
+
+// overviewRelationCommentChars caps a per-relation line. At 110 it keeps the
+// traps that cost real sessions intact ("Plaid's lookback is a hard 730 days"
+// is 101) while holding the whole addition to ~3KB.
+const overviewRelationCommentChars = 110
+
+func init() {
+	knownSchemas := map[string]bool{}
+	for _, schema := range warehouse.Schemas {
+		knownSchemas[schema.Name] = true
+	}
+	knownRelations := map[string]bool{}
+	for _, obj := range warehouse.Objects {
+		if !obj.IsRelation() {
+			continue
+		}
+		display := obj.Schema + "." + obj.Name
+		knownRelations[display] = true
+		if obj.Comment == "" {
+			continue
+		}
+		relationHeadlines[display] = obj.Comment
+		// The catalog already has a convention for this: an entry point
+		// introduces itself with "Start here" (timeline.events shouts it).
+		// Reading the convention beats adding a second place to declare the
+		// same fact and then keeping the two in agreement.
+		if strings.HasPrefix(strings.ToLower(obj.Comment), "start here") {
+			entryPointRelations[display] = true
+		}
+	}
+	for _, schema := range warehouse.Schemas {
+		if !schema.Discoverable || schema.Comment == "" {
+			continue
+		}
+		named := false
+		// Fallback nomination for a schema where no relation says "Start here"
+		// of its own accord: the FIRST relation of this schema the headline
+		// mentions. It has to be the first, because these comments go on to
+		// name the drill-downs too — "Start with marts_photos.photos ...;
+		// marts_photos.files lists every underlying rendition" nominates one
+		// relation and describes another, and marking both would erase the
+		// distinction this marker exists to draw.
+		firstOwn := ""
+		schemaDeclares := false
+		for _, match := range relationReference.FindAllStringSubmatch(schema.Comment, -1) {
+			if !knownSchemas[match[1]] {
+				continue
+			}
+			named = true
+			// Only a schema's own relations are candidates. A comment pointing
+			// at another schema (derived_voice_memos naming
+			// marts_voice_memos.recordings) is guidance, not a nomination.
+			if match[1] != schema.Name || !knownRelations[match[0]] {
+				continue
+			}
+			if firstOwn == "" {
+				firstOwn = match[0]
+			}
+			if entryPointRelations[match[0]] {
+				schemaDeclares = true
+			}
+		}
+		if named {
+			schemaHeadlines[schema.Name] = schema.Comment
+		}
+		if firstOwn != "" && !schemaDeclares {
+			entryPointRelations[firstOwn] = true
+		}
+	}
+}
+
+// firstSentence trims catalog prose to its opening claim. Relation names carry
+// their dot without a following space, so ". " is an unambiguous boundary here.
+func firstSentence(comment string) string {
+	if idx := strings.Index(comment, ". "); idx >= 0 {
+		return comment[:idx+1]
+	}
+	return comment
+}
+
+// capRunes shortens text to a rune budget on a word boundary and marks the cut,
+// so a reader knows describe_table holds the rest. It counts runes because the
+// catalog prose contains em dashes, which a byte-slice would split.
+func capRunes(text string, max int) string {
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	cut := string(runes[:max])
+	if idx := strings.LastIndexByte(cut, ' '); idx > 0 {
+		cut = cut[:idx]
+	}
+	return strings.TrimRight(cut, " ,;:.—-") + "…"
 }
 
 // startHereBlock renders the catalog's own start-here guidance. It lives in
@@ -166,6 +298,11 @@ const overviewPreamble = `--
 --   corresponding SQL function.
 --
 -- Row counts are planner estimates; use them for sizing instead of SELECT COUNT(*).
+--
+-- READING THE LISTING: a ` + "`#`" + ` line under a schema heading is that schema's own guidance,
+-- and the indented line under a relation says what it is for. ` + "`→`" + ` in the left margin marks
+-- the relation to START WITH in that schema — the others are drill-downs off it. A trailing
+-- ` + "`…`" + ` means the description was cut; describe_table prints it in full.
 `
 
 // relationFacts is the per-relation catalog the overview renders.
@@ -297,6 +434,11 @@ func (s *Service) renderOverview(database string, tables []tableRef, facts map[s
 	for _, schema := range schemas {
 		relations := bySchema[schema]
 		out.WriteString(fmt.Sprintf("# %s (%d relation%s)\n", schema, len(relations), plural(len(relations))))
+		for _, line := range wrapComment(schemaHeadlines[schema], 88) {
+			if line != "" {
+				out.WriteString("#   " + line + "\n")
+			}
+		}
 		for _, table := range relations {
 			display := table.DisplayName()
 			entry := facts[display]
@@ -310,7 +452,14 @@ func (s *Service) renderOverview(database string, tables []tableRef, facts map[s
 			if timeColumn := timeColumnFor(display, entry); timeColumn != "" {
 				fields = append(fields, "time: "+timeColumn)
 			}
-			out.WriteString("  " + strings.Join(fields, "  ") + "\n")
+			gutter := "  "
+			if entryPointRelations[display] {
+				gutter = "→ "
+			}
+			out.WriteString(gutter + strings.Join(fields, "  ") + "\n")
+			if comment := relationHeadlines[display]; comment != "" {
+				out.WriteString("      " + capRunes(firstSentence(comment), overviewRelationCommentChars) + "\n")
+			}
 		}
 		out.WriteString("\n")
 	}
