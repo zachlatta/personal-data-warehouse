@@ -109,6 +109,43 @@ keep their filenode, rebuilds the marts/search layer from code, and validates th
 is deliberately not part of any `ensure_*` path: fresh provisioning only ever creates the
 target layout.
 
+### Absence is the epoch, not NULL
+
+Warehouse columns are overwhelmingly `NOT NULL`, and the `TableSpec` layer in `postgres.py`
+gives timestamps a sentinel default. So "hasn't happened yet" and "never happened" are
+stored as **`1970-01-01 00:00:00+00`**, not as `NULL`. Because the default is applied at
+that shared layer, every source inherits the same representation — this is a warehouse-wide
+convention, not a per-source quirk.
+
+The symptom you will hit before you understand the cause: `base_whoop.cycles.end_at` holds
+the epoch for the cycle still in progress, so `ORDER BY end_at DESC` ranks the *currently
+running* cycle as the oldest row in the table. Measured 2026-08-23, the same shape is
+everywhere — in the most recent 20,000 `base_apple_messages.messages` rows, `date_read` is
+the sentinel 8,220 times and `date_delivered` 16,616 times, with **zero** NULLs in either;
+all 18,284 of `base_whatsapp.messages.edited_at`'s absent values are the sentinel too. That
+is 41% and 83% of recent messages, so `MIN(date_read)`, `ORDER BY date_read`, and any
+"unread" predicate are wrong by default, not in some edge case.
+
+**The `marts_*` read view is the sanctioned place to translate it back**, with
+`NULLIF(col, '1970-01-01 00:00:00+00'::timestamptz)`. `marts_ops.pipeline_health` already
+does exactly this for `last_write_at`, `newest_event_at`, `last_run_at`, `last_error_at`
+and `collected_at`. A view that relies on this should say so in a comment, so the next
+reader does not rediscover the convention through a mis-sorted query.
+
+Two rules follow, and the second is the one that bites:
+
+- **Translate every exposed timestamp column, or none.** Since the sources are internally
+  consistent, a view that `NULLIF`s `date_read` but forgets `date_delivered` does not
+  inherit an inconsistency — it *manufactures* one, and every downstream `ORDER BY`,
+  `MIN()`, `COALESCE` and `IS NULL` then disagrees depending on which column was asked.
+- **Test it per column.** Seed a row carrying the sentinel, read it back through the view,
+  and assert `NULL`. `test_whoop_cycles_view_reports_an_unfinished_cycle_as_null_not_the_epoch`
+  is the shape to copy; it is cheap to repeat once per exposed timestamp.
+
+Booleans are the sibling trap: they are `bigint` 0/1 here, not `boolean` (`is_from_me = 1`,
+never `= true`). A conforming view over several sources should make the conformed column's
+type explicit rather than mixing a bigint from one source with a bool from another.
+
 ## Timeline priority tiers
 
 Every `timeline.events` row carries a `priority`, classified per row at sync time by the
