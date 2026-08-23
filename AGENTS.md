@@ -84,11 +84,16 @@ the per-source floor to that pool. The old per-source fan-out ran eighteen branc
 in one plpgsql loop, so its wall clock was the SUM of every branch (6.9s warm, 21.7s cold on
 the production corpus) while one index-ordered scan of the same index returns the global
 top 200 in 36ms. A **scoped** call (`sources => ARRAY[...]`) still runs the per-source
-branches. Two things there are load-bearing and easy to undo by accident: the pool pins
+branches. Three things there are load-bearing and easy to undo by accident. The pool pins
 `enable_sort = off` for the scans (the planner has no cost model for the bm25 operator and
-otherwise re-scores every row of a selective adapter filter, ~5.6ms per document), and the
-low-volume partition needs its OWN index — scanning those adapters through the global index
-walks past millions of gmail/slack documents and took 15-16s on an unlucky query.
+otherwise re-scores every row of a selective adapter filter, ~5.6ms per document) — but
+**only** for the scans: the pool is collected into arrays in its own statement and the hint
+is restored before the ranking runs, because leaving it over the whole plan left the
+planner no sane way to feed the window function and one query then ran for five MINUTES.
+The low-volume partition needs its OWN index — scanning those adapters through the global
+index walks past millions of gmail/slack documents and took 15-16s on an unlucky query.
+And the pool depth is a measured trade (`SEARCH_TEXT_BROAD_POOL`): deeper gives the
+per-source floor more to promote, up to a point where latency grows and scores do not.
 
 - The app's `search` tool — hybrid semantic+keyword retrieval: it embeds the query and
   calls `timeline.search_hybrid` (BM25 + pgvector ANN fused by reciprocal rank), falling

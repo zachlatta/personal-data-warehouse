@@ -4593,7 +4593,9 @@ def test_search_text_broad_search_runs_one_pooled_bm25_scan_not_a_branch_loop() 
         "search_text() must take a pooled fast path for broad searches instead "
         "of looping every source branch"
     )
-    assert "broad_pool" in sql, "the broad fast path must build a single candidate pool"
+    assert "pool_adapter" in sql and "broad_ranked" in sql, (
+        "the broad fast path must build a single candidate pool"
+    )
 
 
 def test_search_text_broad_pool_scans_low_volume_adapters_separately() -> None:
@@ -4626,13 +4628,27 @@ def test_search_text_broad_pool_forces_the_index_ordered_plan() -> None:
         "enable_sort must be restored right after the pooled scan so the hint "
         "cannot leak into the caller's query"
     )
+    # ...and it must cover ONLY the scans. Leaving it on for the ranking query
+    # too left the planner no sane way to feed the window function: at a 10k
+    # pool one query ran for five MINUTES. The pool is therefore collected in
+    # its own statement, into arrays, before the hint is restored.
+    off_at = sql.index("set_config('enable_sort', 'off', true)")
+    on_at = sql.index("set_config('enable_sort', 'on', true)")
+    scoped = sql[off_at:on_at]
+    assert "array_agg" in scoped, (
+        "the pooled scan must be collected in its own statement while the "
+        "enable_sort hint is in force"
+    )
+    assert "row_number() OVER" not in scoped, (
+        "the per-source ranking must run AFTER enable_sort is restored"
+    )
 
 
 def test_search_text_broad_pool_keeps_the_per_source_floor() -> None:
     # Same guarantee the branch merge gave: every source's top-N hits survive
     # ahead of the global score fill.
     sql = _search_text_function_sql()
-    pool = sql[sql.index("broad_pool"):]
+    pool = sql[sql.index("pool_adapter"):]
     assert "PARTITION BY" in pool and "src_rank >" in pool, (
         "the pooled broad path must rank within each source and put each "
         "source's top-floor hits ahead of the global fill"
@@ -4645,7 +4661,7 @@ def test_search_text_broad_pool_previews_only_the_returned_rows() -> None:
     # possibly multi-MB document, so previewing candidates that never survive
     # the merge is pure waste.
     sql = _search_text_function_sql()
-    pool = sql[sql.index("broad_pool"):]
+    pool = sql[sql.index("pool_adapter"):]
     preview_at = pool.index("search_text_preview")
     floor_at = pool.index("src_rank >")
     assert preview_at > floor_at, (

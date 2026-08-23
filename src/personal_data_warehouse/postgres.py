@@ -179,8 +179,15 @@ SEARCH_TEXT_BROAD_PER_BRANCH_CAP = 12
 # sources, and the floor cannot promote a low-volume hit the pool never
 # contained. The low-volume partition costs ~143ms and replaces ~4.8s of
 # branch scans.
-SEARCH_TEXT_BROAD_POOL = 2000
-SEARCH_TEXT_BROAD_SMALL_POOL = 300
+# Pool depth is a measured trade, not a guess. On the labeled benchmark,
+# 2000/300 scored MRR 0.278, and 5000/800 scored 0.292 with hit@5 11 -> 12 and
+# hit@10 12 -> 13: a deeper pool gives the per-source floor more to promote.
+# 10000/1500 scored the same as 5000/800 on every hit@k (it answers one more
+# query somewhere inside the top 50) for twice the added latency -- serial p50
+# 0.46s at 2000, 0.63s at 5000, 1.15s at 10000 -- so 5000 is where the curve
+# flattens. Re-measure with search_benchmark before moving it.
+SEARCH_TEXT_BROAD_POOL = 5000
+SEARCH_TEXT_BROAD_SMALL_POOL = 800
 # Sources whose documents dominate the corpus, and therefore the global BM25
 # ordering. Everything else is scanned as the second pool partition.
 SEARCH_TEXT_HIGH_VOLUME_SOURCES: tuple[str, ...] = (
@@ -7783,6 +7790,16 @@ class PostgresWarehouse:
                 branch text;
                 branch_idx integer;
                 hits @search_text_hit[] := '{}';
+                -- Broad-path pool, carried as parallel arrays: the scans need
+                -- enable_sort off to stay on the BM25 index, but the ranking
+                -- above them needs a real sort. Collecting the pool in its own
+                -- statement scopes the hint to the scans; leaving it over the
+                -- whole plan cost a five-MINUTE query at a 10k pool, because
+                -- the planner then had no sane way to feed the window.
+                pool_adapter text[];
+                pool_event_id text[];
+                pool_source text[];
+                pool_score real[];
                 branch_hits @search_text_hit[];
                 executed_branches integer := 0;
                 failed_sources text[] := '{}';
@@ -7811,17 +7828,22 @@ class PostgresWarehouse:
                 -- immediately so the hint cannot leak into the caller's query.
                 IF sources IS NULL THEN
                     PERFORM set_config('enable_sort', 'off', true);
-                    RETURN QUERY
-                        WITH broad_pool AS (
+                    SELECT array_agg(p.adapter), array_agg(p.event_id),
+                           array_agg(p.source), array_agg(p.score)
+                      INTO pool_adapter, pool_event_id, pool_source, pool_score
+                      FROM (
                         """ + broad_pool_sql + r"""
-                        ),
-                        broad_ranked AS (
-                            SELECT p.adapter, p.event_id, p.source, p.score,
+                      ) p;
+                    PERFORM set_config('enable_sort', 'on', true);
+                    RETURN QUERY
+                        WITH broad_ranked AS (
+                            SELECT u.adapter, u.event_id, u.source, u.score,
                                    row_number() OVER (
-                                       PARTITION BY p.source ORDER BY p.score ASC
+                                       PARTITION BY u.source ORDER BY u.score ASC
                                    ) AS src_rank
-                            FROM broad_pool p
-                            WHERE p.score < 0
+                            FROM unnest(pool_adapter, pool_event_id, pool_source, pool_score)
+                                 AS u(adapter, event_id, source, score)
+                            WHERE u.score < 0
                         ),
                         -- The floor merge runs on ranking keys alone; only the
                         -- survivors are hydrated and previewed, because
@@ -7838,14 +7860,13 @@ class PostgresWarehouse:
                                t.event_ts,
                                COALESCE(t.source_pk->>'account', t.metadata->>'account', ''),
                                t.adapter || ':' || t.event_id,
-                               "internal"."search_text_preview"(t.search_text, query),
+                               """ + preview_fn_sql + r"""(t.search_text, query),
                                b.score, t.event_ts, t.title, t.source_table, t.source_pk
                         FROM broad_top b
                         JOIN @timeline_events t
                           ON t.adapter = b.adapter AND t.event_id = b.event_id
                         ORDER BY (b.src_rank > """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r""") ASC,
                                  b.score ASC;
-                    PERFORM set_config('enable_sort', 'on', true);
                     RETURN;
                 END IF;
 """
