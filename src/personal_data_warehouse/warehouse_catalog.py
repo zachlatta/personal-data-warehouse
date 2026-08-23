@@ -74,6 +74,11 @@ class CatalogObject:
     discoverable: bool
     query_access: str
     secret: bool
+    #: Guidance published as the relation's Postgres COMMENT: which relation in
+    #: this schema to read first, and — where a domain-mart name promises more
+    #: than the SQL delivers — exactly what it does not cover. Optional; the
+    #: schema comment carries the layer-level story.
+    comment: str = ""
     #: Where this object lived in the pre-reorganization layout. Read ONLY by
     #: the one-shot upgrader (``schema_upgrade.py``) so the migration is
     #: derivable from the catalog instead of hand-transcribed; runtime code must
@@ -125,6 +130,7 @@ class WarehouseCatalog:
                 discoverable=bool(row["discoverable"]),
                 query_access=row["query_access"],
                 secret=bool(row["secret"]),
+                comment=row.get("comment", ""),
                 previous_schema=row.get("previous", {}).get("schema", ""),
                 previous_name=row.get("previous", {}).get("name", ""),
             )
@@ -249,6 +255,11 @@ class WarehouseCatalog:
                 raise ValueError(f"secret catalog object {obj.id!r} must deny the query role")
             if bool(obj.previous_schema) != bool(obj.previous_name):
                 raise ValueError(f"catalog object {obj.id!r} has a half-specified previous location")
+            if obj.comment and not obj.is_relation:
+                raise ValueError(
+                    f"catalog object {obj.id!r} carries a comment but is not a relation; "
+                    "only tables and views have a pg_class comment"
+                )
 
         if self.start_here.schema not in schema_names:
             raise ValueError("start_here names a schema that is not in the catalog")

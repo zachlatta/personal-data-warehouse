@@ -241,7 +241,7 @@
       "domain": "voice_memos",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Modelled voice memos facts: normalization, identity resolution, enrichment, and history that the raw source cannot express."
+      "comment": "Modelled voice-memo facts: transcription runs, speaker-labelled transcript segments, and agent enrichments (title/summary/participants/action items/calendar match). Enrichments are keyed per provider+model+prompt_version, so read them through marts_voice_memos.recordings unless you specifically want every attempt."
     },
     {
       "name": "internal",
@@ -257,7 +257,7 @@
       "domain": "ai_conversations",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable ai conversations read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."
+      "comment": "Stable AI-conversation read interface across every provider (Claude Code, Codex, OpenClaw, pi, Claude Desktop, ChatGPT). Start with marts_ai_conversations.sessions for one row per session, then marts_ai_conversations.events for its turns."
     },
     {
       "name": "marts_calendar",
@@ -265,7 +265,7 @@
       "domain": "calendar",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable calendar read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."
+      "comment": "Stable calendar read interface. Start with marts_calendar.events_with_voice_memos for meetings that have a recorded transcript; marts_calendar.unmatched_voice_memos holds the transcripts no calendar event claimed."
     },
     {
       "name": "marts_contacts",
@@ -273,7 +273,7 @@
       "domain": "contacts",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable contacts read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."
+      "comment": "Stable contacts read interface across Apple and Google address books. Start with marts_contacts.contacts for one row per card; marts_contacts.contact_points gives the normalized emails/phones other sources join identities through."
     },
     {
       "name": "marts_finance",
@@ -281,7 +281,7 @@
       "domain": "finance",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable finance read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."
+      "comment": "Stable finance read interface over the Plaid + manual-statement ledger. Start with marts_finance.net_worth (or .net_worth_history); marts_finance.security_transactions and .tax_lots answer holdings/cost-basis questions, and check marts_finance.position_coverage before quoting a return."
     },
     {
       "name": "marts_inbox",
@@ -289,7 +289,7 @@
       "domain": "inbox",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable inbox read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."
+      "comment": "Stable inbox read interface: what is waiting for a reply. Start with marts_inbox.gmail_threads and marts_inbox.slack_items."
     },
     {
       "name": "marts_messages",
@@ -297,7 +297,7 @@
       "domain": "messages",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable messages read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."
+      "comment": "Stable chat-message read interface. Start with marts_messages.messages, which conforms iMessage/SMS and WhatsApp into one column set; the per-source views marts_messages.apple_messages and marts_messages.whatsapp_messages keep each provider's full detail."
     },
     {
       "name": "marts_ops",
@@ -313,7 +313,7 @@
       "domain": "photos",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable photos read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."
+      "comment": "Stable photos read interface. Start with marts_photos.photos, one row per deduplicated logical photo with its AI caption; marts_photos.files lists every underlying rendition across photo sources."
     },
     {
       "name": "marts_receipts",
@@ -321,7 +321,7 @@
       "domain": "receipts",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable receipts read interface. Start with timeline for cross-source browse/search; use these views for structured domain analysis."
+      "comment": "Stable receipts read interface. Start with marts_receipts.transaction_receipts, which links a receipt document to the finance transaction it settles."
     },
     {
       "name": "marts_slack",
@@ -329,7 +329,15 @@
       "domain": "slack",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable read interfaces for the slack domain."
+      "comment": "Stable Slack read interface. Start with marts_slack.image_fingerprints to identify an image by perceptual hash and resolve who uploaded it."
+    },
+    {
+      "name": "marts_voice_memos",
+      "layer": "marts",
+      "domain": "voice_memos",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Stable voice-recording read interface across every voice source. Start with marts_voice_memos.recordings, one row per recording with its resolved title, summary and transcript; marts_voice_memos.transcript_segments holds the speaker-labelled utterances."
     },
     {
       "name": "ops",
@@ -1147,6 +1155,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "One row per transcription attempt per recording, carrying the provider's full transcript text. The resolved per-recording view is marts_voice_memos.recordings.",
       "previous": {
         "schema": "apple_voice_memos",
         "name": "transcription_runs"
@@ -1162,6 +1171,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "One row per speaker-labelled utterance of a transcription run. Joined to its recording in marts_voice_memos.transcript_segments.",
       "previous": {
         "schema": "apple_voice_memos",
         "name": "transcript_segments"
@@ -1177,6 +1187,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Agent enrichment attempts, one row per (account, recording_id, provider, model, prompt_version) \u2014 so a recording has SEVERAL rows and a query that does not de-duplicate double-counts. Read marts_voice_memos.recordings for the resolved latest completed enrichment per recording.",
       "previous": {
         "schema": "apple_voice_memos",
         "name": "enrichments"
@@ -1247,7 +1258,8 @@
       "name": "image_fingerprints",
       "discoverable": true,
       "query_access": "public",
-      "secret": false
+      "secret": false,
+      "comment": "Slack image files with their 256-bit perceptual hash and the uploading user, for 'who sent this image?' lookups by XOR distance. Coverage is not proof of absence: only fingerprinted files appear (see derived_slack.file_fingerprints.status)."
     },
     {
       "id": "file_attachment_enrichments",
@@ -1457,6 +1469,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "One row per Gmail INBOX thread with its latest message preview and unread/important counts: what is still waiting for a reply.",
       "previous": {
         "schema": "marts",
         "name": "gmail_inbox"
@@ -1472,6 +1485,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Slack items that want attention \u2014 unread DMs, mentions, and participating threads \u2014 one row each with a priority rank.",
       "previous": {
         "schema": "marts",
         "name": "slack_inbox"
@@ -1487,6 +1501,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Start here for people. One row per live contact card across Apple and Google address books; marts_contacts.contact_points explodes the same cards into normalized emails/phones for identity joins.",
       "previous": {
         "schema": "marts",
         "name": "contacts"
@@ -1502,6 +1517,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "One row per (card, email/phone), with normalized_value in the shape other sources match on: lowercased emails, digits-only phones with a leading country code.",
       "previous": {
         "schema": "marts",
         "name": "contact_points"
@@ -1517,6 +1533,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Every base_apple_messages.messages column plus the resolved sender (sender_address/sender_name from base_apple_messages.handles and marts_contacts.contact_points). Apple-only; for cross-source message questions use marts_messages.messages.",
       "previous": {
         "schema": "marts",
         "name": "apple_messages"
@@ -1532,10 +1549,23 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "WhatsApp messages with the chat kind, chat name and sender name already resolved. WhatsApp-only; for cross-source message questions use marts_messages.messages.",
       "previous": {
         "schema": "marts",
         "name": "whatsapp_messages"
       }
+    },
+    {
+      "id": "marts_messages_messages",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "messages",
+      "schema": "marts_messages",
+      "name": "messages",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Start here for chat messages. One row per message across iMessage/SMS (base_apple_messages) and WhatsApp (base_whatsapp), conformed onto one column set so no caller has to hand-roll the cross-source UNION. chat_kind is the conformed vocabulary (direct/group/status/...); source_message_kind keeps the provider's own token. is_from_me and is_deleted are bigint 0/1, this warehouse's boolean. EVERY timestamp here is NULL when absent: the base tables are NOT NULL and store 'never' as 1970-01-01 (83% of recent messages have a sentinel date_delivered), so the sentinel is translated once here and ORDER BY, MIN() and IS NULL mean what they say. Tombstoned rows are included \u2014 filter is_deleted = 0 for live messages only."
     },
     {
       "id": "ai_conversation_events",
@@ -1547,6 +1577,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "One row per turn or tool call across every AI-conversation source. A tool call and its result are separate rows; JSON columns are text, so cast before ->>.",
       "previous": {
         "schema": "marts",
         "name": "ai_conversation_events"
@@ -1562,6 +1593,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Start here for past AI sessions. One row per session across all six providers, with title, first prompt, repo/branch, device, model and token totals. Drill into marts_ai_conversations.events for the turns.",
       "previous": {
         "schema": "marts",
         "name": "ai_conversation_sessions"
@@ -1577,6 +1609,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Every rendition from every photo source, with the logical photo it resolved to and the dedup audit (match_method/match_score).",
       "previous": {
         "schema": "marts",
         "name": "photo_files"
@@ -1592,6 +1625,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Start here for photos. One row per deduplicated logical photo with its AI caption and rendition counts; marts_photos.files lists every underlying rendition.",
       "previous": {
         "schema": "marts",
         "name": "photos"
@@ -1607,6 +1641,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Exactly one enrichable still per logical photo (the 1280px thumbnail), shaped for the shared file-enrichment runner. Not a general photo listing \u2014 use marts_photos.photos.",
       "previous": {
         "schema": "marts",
         "name": "photo_canonical_renditions"
@@ -1622,6 +1657,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Calendar events matched to a recorded voice memo, with the enrichment's transcript and summary. The recording side comes from marts_voice_memos.recordings.",
       "previous": {
         "schema": "marts",
         "name": "google_calendar_with_apple_voice_memos"
@@ -1637,10 +1673,35 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Voice-memo transcripts that no calendar event claimed, with calendar_match_issue saying why. The counterpart of marts_calendar.events_with_voice_memos.",
       "previous": {
         "schema": "marts",
         "name": "apple_voice_memos_without_calendar_match"
       }
+    },
+    {
+      "id": "marts_voice_memos_recordings",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "voice_memos",
+      "schema": "marts_voice_memos",
+      "name": "recordings",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Start here for voice recordings. One row per recording across BOTH voice sources \u2014 base_apple_voice_memos.files and base_alice_voice_recordings.recordings \u2014 with the latest completed derived_voice_memos.enrichments row resolved into title/summary/transcript/participants/action items/calendar match. Columns a source cannot provide are NULL rather than guessed: Alice recordings are not transcribed or enriched here. Every timestamp is NULL when absent, translating the warehouse's NOT NULL 1970-01-01 epoch sentinel. is_deleted is bigint 0/1."
+    },
+    {
+      "id": "marts_voice_memos_transcript_segments",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "voice_memos",
+      "schema": "marts_voice_memos",
+      "name": "transcript_segments",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Speaker-labelled transcript utterances with their recording's title and a spoken_at wall-clock instant derived from the segment offset. Timestamps are NULL when the recording has no known date (the warehouse's 1970-01-01 sentinel), so spoken_at is NULL rather than an offset from 1970. Only apple_voice_memos produces transcript segments today; the source column is there so another voice source can join without changing callers."
     },
     {
       "id": "marts_finance_accounts",
@@ -1681,7 +1742,8 @@
       "name": "security_transactions",
       "discoverable": true,
       "query_access": "public",
-      "secret": false
+      "secret": false,
+      "comment": "Every share movement across Plaid and manual statements, deduped. Use this rather than marts_finance.investment_transactions, whose Plaid history stops at 730 days."
     },
     {
       "id": "marts_finance_tax_lots",
@@ -1692,7 +1754,8 @@
       "name": "tax_lots",
       "discoverable": true,
       "query_access": "public",
-      "secret": false
+      "secret": false,
+      "comment": "FIFO lots with acquisition date, basis, term and unrealized gain. Splits and wash sales are not modelled; basis_known = 0 means the real basis lives at the origin account."
     },
     {
       "id": "marts_finance_position_coverage",
@@ -1703,7 +1766,8 @@
       "name": "position_coverage",
       "discoverable": true,
       "query_access": "public",
-      "secret": false
+      "secret": false,
+      "comment": "How much of each position actually has a reconstructed lot history. Read this before quoting a return: 'partial', 'lots_exceed_holding' and 'basis_mismatch' all mean the number below is not the whole story."
     },
     {
       "id": "marts_finance_investment_holdings",
@@ -1715,6 +1779,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Plaid-only passthrough of base_plaid.investment_holdings + securities: current holdings for Plaid-linked brokerages, and nothing else. Manual statements also carry positions (derived_finance.document_extractions.positions_json), but those are dated statement snapshots with no resolved account or security id, so unioning them here would mix current state with history under one name. For cross-source holdings work use marts_finance.tax_lots + marts_finance.position_coverage.",
       "previous": {
         "schema": "marts",
         "name": "finance_investment_holdings"
@@ -1730,6 +1795,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Plaid-only passthrough of base_plaid.investment_transactions, and Plaid's lookback is a hard 730 days. For the full cross-source trade history \u2014 Plaid plus every statement the corpus holds \u2014 use marts_finance.security_transactions.",
       "previous": {
         "schema": "marts",
         "name": "finance_investment_transactions"
@@ -1745,6 +1811,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Plaid-only passthrough of base_plaid.liabilities: statement balances, minimum payments and due dates for Plaid-linked credit/loan accounts. Liabilities the servicer does not expose through Plaid (the mortgage) are absent here; their balances arrive from statements as derived_finance.observations rows and are counted in marts_finance.net_worth.",
       "previous": {
         "schema": "marts",
         "name": "finance_liabilities"
@@ -1760,6 +1827,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Start here for money. One row per logical account carrying its latest observation, signed by side; net worth is SUM(signed_value). marts_finance.net_worth_history is the forward-filled daily series.",
       "previous": {
         "schema": "marts",
         "name": "finance_net_worth"
@@ -1775,6 +1843,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Forward-filled daily assets/liabilities/net series built from derived_finance.observations. Plaid keeps no balance history \u2014 this is it.",
       "previous": {
         "schema": "marts",
         "name": "finance_net_worth_history"
@@ -1789,7 +1858,8 @@
       "name": "account_freshness",
       "discoverable": true,
       "query_access": "public",
-      "secret": false
+      "secret": false,
+      "comment": "Per-account recency of the finance ledger: when each account last produced an observation or a transaction."
     },
     {
       "id": "marts_pipeline_health",
@@ -1800,7 +1870,8 @@
       "name": "pipeline_health",
       "discoverable": true,
       "query_access": "public",
-      "secret": false
+      "secret": false,
+      "comment": "Start here for warehouse health: one row per pipeline with status computed at read time against its own expected interval. marts_ops.table_freshness is the per-table detail."
     },
     {
       "id": "marts_pipeline_table_freshness",
@@ -1811,7 +1882,8 @@
       "name": "table_freshness",
       "discoverable": true,
       "query_access": "public",
-      "secret": false
+      "secret": false,
+      "comment": "Per-table freshness: when the pipeline last wrote, how old the newest real-world event is, and whether the probe could run at all (probe_status)."
     },
     {
       "id": "marts_ops_plaid_item_health",
@@ -1822,7 +1894,8 @@
       "name": "plaid_item_health",
       "discoverable": true,
       "query_access": "public",
-      "secret": false
+      "secret": false,
+      "comment": "One row per linked Plaid Item, naming the institution and accounts that stop updating when it breaks. status = 'action_required' means re-run `pdw ingest plaid link` for that institution."
     },
     {
       "id": "marts_transaction_receipts",
@@ -1834,6 +1907,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "Receipt documents linked to the finance transaction they settle, with the agent's confidence and evidence.",
       "previous": {
         "schema": "marts",
         "name": "transaction_receipts"
@@ -1849,6 +1923,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
+      "comment": "START HERE. One row per real-world event from every source, newest-first browsable and searchable through timeline.search_text()/search_text_exact(). Each row's source_table + source_pk drill straight back to the authoritative record.",
       "previous": {
         "schema": "timeline",
         "name": "events"

@@ -3043,6 +3043,9 @@ class PostgresWarehouse:
         if backfill_content_hashes:
             self._backfill_voice_memo_transcription_run_content_hashes()
             self._backfill_voice_memo_enrichment_content_hashes()
+        # marts_voice_memos.* unions both voice sources, so either source's
+        # ensure_* path builds it.
+        self._ensure_voice_memos_mart_views()
         self._ensure_clean_calendar_transcript_views_if_possible()
         self._ensure_search_views_if_possible()
 
@@ -3053,6 +3056,7 @@ class PostgresWarehouse:
                 "alice_voice_recording_artifacts",
             ]
         )
+        self._ensure_voice_memos_mart_views()
         self._ensure_search_views_if_possible()
 
     def ensure_voice_memos_tables(self) -> None:
@@ -8935,7 +8939,7 @@ class PostgresWarehouse:
             for function_name in ("search_text", "search_text_exact")
         )
 
-    def _ensure_view(self, view: str, create_sql: str) -> None:
+    def _ensure_view(self, view: str, create_sql: str, *, dependents: tuple[str, ...] = ()) -> None:
         # CREATE OR REPLACE VIEW refuses to drop, rename, or retype an existing
         # view's columns, and this database is shared: another checkout running
         # a different revision can leave a view whose columns no longer match
@@ -8944,11 +8948,73 @@ class PostgresWarehouse:
         # in-place replacement is impossible. Plain DROP (no CASCADE) so a view
         # that grew dependent objects still fails loudly instead of silently
         # dropping them.
+        #
+        # `dependents` is the exception: views this ensure path recreates itself
+        # a few statements later. Without naming them the plain DROP fails on
+        # the dependency and every ensure wedges — the failure mode the drop is
+        # meant to expose is only useful for objects nobody here rebuilds.
         try:
             self._command(create_sql)
         except psycopg2.errors.InvalidTableDefinition:
+            for dependent in dependents:
+                self._command(f"DROP VIEW IF EXISTS {self.sql_relation(dependent)}")
             self._command(f"DROP VIEW IF EXISTS {self.sql_relation(view)}")
             self._command(create_sql)
+        self._ensure_relation_comments()
+
+    #: Relations whose Postgres COMMENT this connection has already confirmed
+    #: matches the catalog. Class-level default so every instance starts empty.
+    _relation_comments_verified: frozenset[tuple[str, str]] = frozenset()
+
+    def _ensure_relation_comments(self) -> None:
+        """Publish the catalog's per-relation guidance as Postgres COMMENTs.
+
+        The schema comment says which layer you are in; this says which relation
+        in it to read first, and — for the Plaid-only marts_finance passthroughs
+        — exactly what a domain-mart name is NOT delivering. Both are written
+        once, in warehouse_catalog.json.
+
+        Probe first and write only on drift, like the schema-comment sweep: an
+        unconditional COMMENT ON per ensure would churn pg_description on every
+        sensor tick. Relations already confirmed on this connection are not
+        re-probed, so the sweep runs once per ensure path plus once more for
+        each relation created after it — never once per statement.
+        """
+        expected: dict[tuple[str, str], tuple[str, str]] = {}
+        for obj in CATALOG.objects:
+            if not obj.comment or not obj.is_relation:
+                continue
+            rel = canonical_relation(obj.id).with_namespace(self._schema)
+            key = (rel.schema, rel.name)
+            if key in self._relation_comments_verified:
+                continue
+            expected[key] = (obj.kind, obj.comment)
+        if not expected:
+            return
+        current = {
+            (schema, name): comment
+            for schema, name, comment in self._query(
+                """
+                SELECT n.nspname, c.relname, obj_description(c.oid, 'pg_class')
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = ANY(%s) AND c.relkind IN ('r', 'v', 'm', 'p')
+                """,
+                (self.physical_schema_names(include_hidden=True),),
+            )
+        }
+        verified = set(self._relation_comments_verified)
+        for (schema, name), (kind, comment) in expected.items():
+            if (schema, name) not in current:
+                continue  # not provisioned in this deployment yet
+            if current[(schema, name)] != comment:
+                keyword = "VIEW" if kind == "view" else "TABLE"
+                self._raw_command(
+                    f"COMMENT ON {keyword} {_identifier(schema)}.{_identifier(name)} IS %s",
+                    (comment,),
+                )
+            verified.add((schema, name))
+        self._relation_comments_verified = frozenset(verified)
 
     def _ensure_clean_gmail_inbox_view(self) -> None:
         self._ensure_utf8_byte_prefix_function()
@@ -9168,10 +9234,15 @@ class PostgresWarehouse:
         if not actual_columns or actual_columns == expected_columns:
             return False
 
-        # contact_points depends on contacts, and apple_messages depends on
-        # contact_points. Remove only these derived views before replacing a
-        # drifted contacts view; both are recreated in this ensure path.
-        for logical_name in ("clean_apple_messages", "clean_contact_points"):
+        # contact_points depends on contacts, apple_messages depends on
+        # contact_points, and the unified messages mart depends on
+        # apple_messages. Remove only these derived views before replacing a
+        # drifted contacts view; all three are recreated in this ensure path.
+        for logical_name in (
+            "marts_messages_messages",
+            "clean_apple_messages",
+            "clean_contact_points",
+        ):
             relation = canonical_relation(logical_name).with_namespace(self._schema)
             self._raw_command(
                 f"DROP VIEW IF EXISTS {_identifier(relation.schema)}.{_identifier(relation.name)}"
@@ -9228,40 +9299,61 @@ class PostgresWarehouse:
         )
 
     def _ensure_clean_apple_messages_view(self) -> None:
+        # Sender identity is a property of the HANDLE, not of the message: the
+        # resolution below reads only h.address. Resolving it in a per-row
+        # LATERAL therefore recomputed marts_contacts.contact_points — itself a
+        # jsonb-expanding view over every contact card — once per message, about
+        # 30 ms a row. In production a 30-day window of this view took 59
+        # seconds and a full scan never finished inside any query timeout, which
+        # is why nothing could be built on top of it. Resolving once per handle
+        # (3,975 of them against 13,116 contact points, ~190 ms) returns rows
+        # identical to the LATERAL — verified over a 21-day window, 1,480 rows,
+        # zero differences — and takes the same 30-day window to 0.4 s and a
+        # full 172k-row scan to 0.7 s.
         self._ensure_view(
             "clean_apple_messages",
             """
             CREATE OR REPLACE VIEW @clean_apple_messages AS
-            SELECT
-                m.*,
-                COALESCE(h.address, '') AS sender_address,
-                CASE
-                    WHEN m.is_from_me = 1 THEN 'me'
-                    ELSE COALESCE(NULLIF(resolved.display_name, ''), NULLIF(h.address, ''), m.handle_id)
-                END AS sender_name,
-                COALESCE(resolved.source, '') AS contact_source,
-                COALESCE(resolved.card_id, '') AS contact_card_id
-            FROM @apple_messages m
-            LEFT JOIN @apple_message_handles h
-              ON h.account = m.account AND h.handle_id = m.handle_id
-            LEFT JOIN LATERAL (
-                SELECT cp.source, cp.card_id, cp.display_name
-                FROM @clean_contact_points cp
-                WHERE cp.point_type = CASE WHEN h.address LIKE '%@%' THEN 'email' ELSE 'phone' END
-                  AND cp.normalized_value = CASE
-                      WHEN h.address LIKE '%@%' THEN lower(trim(h.address))
-                      WHEN length(regexp_replace(h.address, '[^0-9]', '', 'g')) = 10
-                          THEN '1' || regexp_replace(h.address, '[^0-9]', '', 'g')
-                      ELSE regexp_replace(h.address, '[^0-9]', '', 'g')
-                  END
+            WITH resolved_handles AS (
+                SELECT DISTINCT ON (h.account, h.handle_id)
+                    h.account,
+                    h.handle_id,
+                    h.address,
+                    COALESCE(cp.source, '') AS contact_source,
+                    COALESCE(cp.card_id, '') AS contact_card_id,
+                    COALESCE(cp.display_name, '') AS contact_display_name
+                FROM @apple_message_handles h
+                LEFT JOIN @clean_contact_points cp
+                  ON cp.point_type = CASE WHEN h.address LIKE '%@%' THEN 'email' ELSE 'phone' END
+                 AND cp.normalized_value = CASE
+                     WHEN h.address LIKE '%@%' THEN lower(trim(h.address))
+                     WHEN length(regexp_replace(h.address, '[^0-9]', '', 'g')) = 10
+                         THEN '1' || regexp_replace(h.address, '[^0-9]', '', 'g')
+                     ELSE regexp_replace(h.address, '[^0-9]', '', 'g')
+                 END
                 ORDER BY
+                    h.account,
+                    h.handle_id,
                     (cp.source = 'apple_contacts') DESC,
                     cp.source_updated_at DESC,
                     cp.card_id
-                LIMIT 1
-            ) resolved ON TRUE
+            )
+            SELECT
+                m.*,
+                COALESCE(r.address, '') AS sender_address,
+                CASE
+                    WHEN m.is_from_me = 1 THEN 'me'
+                    ELSE COALESCE(NULLIF(r.contact_display_name, ''), NULLIF(r.address, ''), m.handle_id)
+                END AS sender_name,
+                COALESCE(r.contact_source, '') AS contact_source,
+                COALESCE(r.contact_card_id, '') AS contact_card_id
+            FROM @apple_messages m
+            LEFT JOIN resolved_handles r
+              ON r.account = m.account AND r.handle_id = m.handle_id
             """,
+            dependents=("marts_messages_messages",),
         )
+        self._ensure_messages_mart_view_if_possible()
 
     def _ensure_clean_whatsapp_messages_view(self) -> None:
         # Ergonomic layer over whatsapp_messages: a single chat_kind so callers
@@ -9327,8 +9419,328 @@ class PostgresWarehouse:
             LEFT JOIN @whatsapp_contacts ct
               ON ct.account = m.account
              AND ct.jid = COALESCE(NULLIF(sender_alias.phone_jid, ''), m.sender_jid)
-            """
+            """,
+            dependents=("marts_messages_messages",),
         )
+        self._ensure_messages_mart_view_if_possible()
+
+    def _ensure_messages_mart_view_if_possible(self) -> None:
+        """marts_messages.messages: iMessage/SMS and WhatsApp on one column set.
+
+        Before this the two per-source views shared exactly one column name
+        (message_at), so "all my messages with X last month" meant hand-writing
+        the cross-source UNION and its column map — the very thing the search
+        contract tells agents never to do. Both sources are conformed here, and
+        each keeps its own view for full provider detail.
+
+        Guarded on both sources existing: it is ensured from whichever of the
+        two per-source paths runs, and a deployment holding only one of them
+        simply has no unified view yet.
+        """
+        if not all(
+            self._relation_exists(name)
+            for name in ("clean_apple_messages", "clean_whatsapp_messages")
+        ):
+            return
+        # chat_kind is one vocabulary across sources: WhatsApp calls a DM
+        # 'user' and Apple encodes it as chat.style = 45, and an agent asking
+        # for direct messages must not have to know either. Apple's own kinds
+        # (43/45) are the only two chat.db styles present. WhatsApp's remaining
+        # kinds (status/broadcast/newsletter) are real distinctions with no
+        # Apple counterpart, so they pass through unchanged.
+        #
+        # message_kind is likewise conformed, with source_message_kind keeping
+        # the provider's own token so nothing is lost. Apple cannot say image
+        # vs video at the message level (that lives in
+        # base_apple_messages.attachments), so its media rows read
+        # 'attachment'.
+        self._ensure_view(
+            "marts_messages_messages",
+            """
+            CREATE OR REPLACE VIEW @marts_messages_messages AS
+            SELECT
+                'apple_messages'::text AS source,
+                t.account,
+                COALESCE(cm.chat_id, '') AS chat_id,
+                COALESCE(
+                    NULLIF(c.display_name, ''), NULLIF(c.chat_identifier, ''),
+                    NULLIF(t.sender_name, ''), NULLIF(t.sender_address, ''), t.service
+                ) AS chat_name,
+                CASE c.style WHEN 45 THEN 'direct' WHEN 43 THEN 'group' ELSE 'unknown' END AS chat_kind,
+                t.message_id,
+                t.sender_address,
+                t.sender_name,
+                t.is_from_me,
+                t.body_text,
+                CASE
+                    WHEN t.associated_message_type <> 0 THEN 'reaction'
+                    WHEN t.is_system_message = 1 OR t.is_service_message = 1 THEN 'system'
+                    WHEN t.is_audio_message = 1 THEN 'audio'
+                    WHEN t.cache_has_attachments <> 0 THEN 'attachment'
+                    WHEN t.body_text <> '' THEN 'text'
+                    ELSE 'other'
+                END AS message_kind,
+                ''::text AS source_message_kind,
+                NULL::text AS media_type,
+                t.service,
+                NULLIF(t.reply_to_guid, '') AS reply_to_message_id,
+                -- EVERY timestamp this view exposes is NULLIF'd against the
+                -- epoch, never some of them: the base columns are NOT NULL and
+                -- store "never" as 1970-01-01 (228 of 172,631 iMessage rows
+                -- have no real send time, 172,608 have never been edited, 41%
+                -- of recent rows were never read and 83% never delivered).
+                -- Translating a subset would be worse than translating none —
+                -- it is what would give one conformed column two spellings of
+                -- unknown. Precedent: marts_ops.pipeline_health.
+                NULLIF(t.message_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS message_at,
+                NULLIF(t.date_edited, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS edited_at,
+                NULLIF(t.date_read, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS read_at,
+                NULLIF(t.date_delivered, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS delivered_at,
+                t.is_deleted
+            FROM @clean_apple_messages t
+            LEFT JOIN LATERAL (
+                SELECT min(chat_id) AS chat_id
+                FROM @apple_message_chat_messages
+                WHERE account = t.account AND message_id = t.message_id
+            ) cm ON TRUE
+            LEFT JOIN @apple_message_chats c
+              ON c.account = t.account AND c.chat_id = cm.chat_id
+            UNION ALL
+            SELECT
+                'whatsapp'::text AS source,
+                w.account,
+                w.chat_id,
+                COALESCE(w.chat_name, w.chat_id) AS chat_name,
+                CASE w.chat_kind WHEN 'user' THEN 'direct' ELSE w.chat_kind END AS chat_kind,
+                w.message_id,
+                w.sender_jid AS sender_address,
+                w.sender_name,
+                w.is_from_me,
+                w.body_text,
+                CASE w.message_kind
+                    WHEN 'text' THEN 'text'
+                    WHEN 'image' THEN 'image'
+                    WHEN 'video' THEN 'video'
+                    WHEN 'voice' THEN 'audio'
+                    WHEN 'audio' THEN 'audio'
+                    WHEN 'document' THEN 'document'
+                    WHEN 'sticker' THEN 'sticker'
+                    WHEN 'reaction' THEN 'reaction'
+                    WHEN 'encReactionMessage' THEN 'reaction'
+                    WHEN 'revoke' THEN 'revoked'
+                    ELSE 'other'
+                END AS message_kind,
+                w.message_kind AS source_message_kind,
+                NULLIF(w.media_type, '') AS media_type,
+                NULL::text AS service,
+                NULLIF(w.quoted_message_id, '') AS reply_to_message_id,
+                NULLIF(w.message_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS message_at,
+                NULLIF(w.edited_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS edited_at,
+                -- WhatsApp exposes no read/delivered receipt to a linked device.
+                NULL::timestamptz AS read_at,
+                NULL::timestamptz AS delivered_at,
+                w.is_deleted
+            FROM @clean_whatsapp_messages w
+            """,
+        )
+
+    def _ensure_voice_memos_mart_views(self) -> None:
+        """marts_voice_memos.*: one entry point for every voice recording.
+
+        Two unrelated sources feed this domain — base_apple_voice_memos.files
+        and base_alice_voice_recordings.recordings — and the domain had a full
+        derived layer with no mart at all, so "my voice memos" had no correct
+        entry point: the timeline's voice_memos source misses every Alice
+        recording, and transcript/participants/action items were folded into
+        search_text without ever being columns.
+
+        This is also where "latest enrichment per recording" now lives.
+        derived_voice_memos.enrichments is keyed by
+        (account, recording_id, provider, model, prompt_version) — 802 rows for
+        597 recordings — so every consumer had to re-derive the DISTINCT ON,
+        and three of them had copy-pasted it.
+
+        Columns a source cannot answer are NULL, never a plausible-looking
+        default: Alice recordings are not transcribed or enriched here.
+        """
+        # Both sources' tables must exist for the union, and either source's
+        # ensure_* path can be the one that runs. Declaring the dependency the
+        # way ensure_finance_tables declares its Plaid tables keeps a
+        # single-source ensure from failing on a missing relation.
+        self._ensure_table_group(
+            [
+                "apple_voice_memos_files",
+                "apple_voice_memos_transcription_runs",
+                "apple_voice_memos_transcript_segments",
+                "apple_voice_memos_enrichments",
+                "alice_voice_recordings",
+            ]
+        )
+        self._ensure_view(
+            "marts_voice_memos_recordings",
+            """
+            CREATE OR REPLACE VIEW @marts_voice_memos_recordings AS
+            WITH latest_enrichment AS (
+                -- THE definition of "the enrichment that counts" for a
+                -- recording: newest completed attempt per recording, tie-broken
+                -- deterministically. derived_voice_memos.enrichments is keyed by
+                -- (account, recording_id, provider, model, prompt_version), so
+                -- anything that skips this de-duplication double-counts.
+                SELECT DISTINCT ON (account, recording_id)
+                    account,
+                    recording_id,
+                    provider,
+                    model,
+                    prompt_version,
+                    calendar_event_id,
+                    calendar_confidence,
+                    title,
+                    start_at,
+                    end_at,
+                    participants_json,
+                    transcript,
+                    summary,
+                    action_items_json,
+                    evidence_json,
+                    created_at
+                FROM @apple_voice_memos_enrichments
+                WHERE status = 'completed'
+                ORDER BY account, recording_id, created_at DESC, provider DESC, model DESC, prompt_version DESC
+            ),
+            latest_transcription AS (
+                SELECT DISTINCT ON (account, recording_id)
+                    account,
+                    recording_id,
+                    provider,
+                    transcript_text
+                FROM @apple_voice_memos_transcription_runs
+                WHERE status = 'completed'
+                ORDER BY account, recording_id, completed_at DESC, requested_at DESC, provider DESC
+            )
+            SELECT
+                'apple_voice_memos'::text AS source,
+                f.account,
+                f.recording_id,
+                -- Absence is stored as the epoch, not NULL: these columns are
+                -- NOT NULL, so a recording with no known date reads
+                -- 1970-01-01 and sorts oldest instead of unknown. Translating
+                -- the sentinel is part of conforming the sources, not a
+                -- nicety — marts_ops.pipeline_health does the same.
+                NULLIF(f.recorded_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
+                -- The uploader records the app's own duration for recordings
+                -- whose metadata carried one; older exports have none.
+                CASE
+                    WHEN left(f.raw_metadata_json, 1) = '{'
+                        THEN (f.raw_metadata_json::jsonb -> 'recording' ->> 'duration_seconds')::numeric
+                END AS duration_seconds,
+                COALESCE(NULLIF(en.title, ''), NULLIF(f.title, ''), f.filename) AS title,
+                f.title AS source_title,
+                f.filename,
+                NULLIF(en.summary, '') AS summary,
+                COALESCE(NULLIF(en.transcript, ''), NULLIF(run.transcript_text, '')) AS transcript,
+                NULLIF(en.participants_json, '') AS participants_json,
+                NULLIF(en.action_items_json, '') AS action_items_json,
+                NULLIF(en.evidence_json, '') AS evidence_json,
+                NULLIF(en.calendar_event_id, '') AS calendar_event_id,
+                en.calendar_confidence,
+                NULLIF(en.start_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS meeting_start_at,
+                NULLIF(en.end_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS meeting_end_at,
+                en.title AS enrichment_title,
+                en.provider AS enrichment_provider,
+                en.model AS enrichment_model,
+                en.prompt_version AS enrichment_prompt_version,
+                NULLIF(en.created_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS enriched_at,
+                run.provider AS transcript_provider,
+                f.content_type,
+                f.size_bytes,
+                f.content_sha256,
+                f.storage_backend,
+                f.storage_key,
+                f.storage_file_id,
+                f.storage_url,
+                NULL::text AS recording_url,
+                f.is_deleted,
+                NULLIF(f.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
+            FROM @apple_voice_memos_files f
+            LEFT JOIN latest_enrichment en
+              ON en.account = f.account AND en.recording_id = f.recording_id
+            LEFT JOIN latest_transcription run
+              ON run.account = f.account AND run.recording_id = f.recording_id
+            UNION ALL
+            SELECT
+                'alice_voice_recordings'::text AS source,
+                r.account,
+                r.recording_id,
+                NULLIF(r.recorded_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
+                NULLIF(r.duration_seconds, 0)::numeric AS duration_seconds,
+                COALESCE(NULLIF(r.title, ''), r.filename) AS title,
+                r.title AS source_title,
+                r.filename,
+                NULL::text AS summary,
+                NULL::text AS transcript,
+                NULL::text AS participants_json,
+                NULL::text AS action_items_json,
+                NULL::text AS evidence_json,
+                NULL::text AS calendar_event_id,
+                NULL::double precision AS calendar_confidence,
+                NULL::timestamptz AS meeting_start_at,
+                NULL::timestamptz AS meeting_end_at,
+                NULL::text AS enrichment_title,
+                NULL::text AS enrichment_provider,
+                NULL::text AS enrichment_model,
+                NULL::text AS enrichment_prompt_version,
+                NULL::timestamptz AS enriched_at,
+                NULL::text AS transcript_provider,
+                r.content_type,
+                r.size_bytes,
+                r.content_sha256,
+                r.storage_backend,
+                r.storage_key,
+                r.storage_file_id,
+                r.storage_url,
+                NULLIF(r.recording_page_url, '') AS recording_url,
+                -- The Alice archive never tombstones a recording.
+                0::bigint AS is_deleted,
+                NULLIF(r.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
+            FROM @alice_voice_recordings r
+            """,
+            dependents=(
+                "marts_voice_memos_transcript_segments",
+                "clean_calendar_with_transcripts",
+                "clean_transcripts_no_calendar_match",
+            ),
+        )
+        self._ensure_view(
+            "marts_voice_memos_transcript_segments",
+            """
+            CREATE OR REPLACE VIEW @marts_voice_memos_transcript_segments AS
+            SELECT
+                'apple_voice_memos'::text AS source,
+                s.account,
+                s.recording_id,
+                r.recorded_at,
+                r.title AS recording_title,
+                s.provider,
+                s.provider_transcript_id,
+                s.segment_index,
+                s.speaker_label,
+                s.start_ms,
+                s.end_ms,
+                s.confidence,
+                s.text,
+                r.recorded_at + make_interval(secs => s.start_ms / 1000.0) AS spoken_at
+            FROM @apple_voice_memos_transcript_segments s
+            LEFT JOIN @marts_voice_memos_recordings r
+              ON r.source = 'apple_voice_memos'
+             AND r.account = s.account
+             AND r.recording_id = s.recording_id
+            """,
+        )
+        # The marts_calendar transcript views consume the mart, so they are
+        # rebuilt here: the column-drift path above may have had to drop them
+        # to replace the mart, and this is the one place that always runs
+        # afterwards.
+        self._ensure_calendar_transcript_views()
 
     def _ensure_photo_marts_views(self) -> None:
         # marts_photos.files: every rendition from every photo source, one
@@ -9484,6 +9896,18 @@ class PostgresWarehouse:
         )
 
     def _ensure_clean_calendar_transcript_views_if_possible(self) -> None:
+        """Entry point for the calendar side of the voice-memo transcripts.
+
+        Both views read the recording side through marts_voice_memos.recordings,
+        so the mart is ensured first and owns their (re)creation — see
+        _ensure_voice_memos_mart_views, which calls the body below. The call
+        goes one way only: wrapper → mart → body.
+        """
+        if not self._relation_exists("calendar_events"):
+            return
+        self._ensure_voice_memos_mart_views()
+
+    def _ensure_calendar_transcript_views(self) -> None:
         if not all(
             self._relation_exists(table)
             for table in ("calendar_events", "apple_voice_memos_files", "apple_voice_memos_enrichments")
@@ -9511,24 +9935,28 @@ class PostgresWarehouse:
                 WHERE is_deleted = 0
                 ORDER BY event_id, synced_at DESC, account DESC, calendar_id DESC
             ),
-            latest_enrichments AS (
-                SELECT DISTINCT ON (account, recording_id)
+            enriched_recordings AS (
+                SELECT
                     account,
                     recording_id,
-                    calendar_event_id,
-                    calendar_confidence,
-                    title,
-                    start_at,
-                    end_at,
-                    participants_json,
-                    transcript,
-                    summary,
-                    action_items_json,
-                    evidence_json,
-                    created_at AS enriched_at
-                FROM @apple_voice_memos_enrichments
-                WHERE status = 'completed'
-                ORDER BY account, recording_id, created_at DESC, provider DESC, model DESC, prompt_version DESC
+                    recorded_at,
+                    title AS resolved_title,
+                    enrichment_title,
+                    COALESCE(calendar_event_id, '') AS calendar_event_id,
+                    COALESCE(calendar_confidence, 0) AS calendar_confidence,
+                    meeting_start_at AS start_at,
+                    meeting_end_at AS end_at,
+                    COALESCE(participants_json, '') AS participants_json,
+                    COALESCE(transcript, '') AS transcript,
+                    COALESCE(summary, '') AS summary,
+                    COALESCE(action_items_json, '') AS action_items_json,
+                    COALESCE(evidence_json, '') AS evidence_json,
+                    enriched_at
+                FROM @marts_voice_memos_recordings
+                -- enrichment_provider, not enriched_at: the timestamp is
+                -- NULL-when-sentinel, and "has a completed enrichment" must not
+                -- ride on whether that enrichment carried a real clock reading.
+                WHERE source = 'apple_voice_memos' AND enrichment_provider IS NOT NULL
             )
             SELECT
                 c.calendar_account AS calendar_account,
@@ -9536,7 +9964,7 @@ class PostgresWarehouse:
                 c.calendar_id,
                 c.event_id,
                 e.recording_id,
-                CASE WHEN e.title != '' THEN e.title ELSE c.summary END AS title,
+                COALESCE(NULLIF(e.enrichment_title, ''), c.summary) AS title,
                 e.start_at,
                 e.end_at,
                 c.organizer_email,
@@ -9556,7 +9984,7 @@ class PostgresWarehouse:
                 e.evidence_json,
                 e.enriched_at AS created_at
             FROM latest_calendar_events AS c
-            INNER JOIN latest_enrichments AS e
+            INNER JOIN enriched_recordings AS e
               ON c.event_id = e.calendar_event_id
             WHERE e.calendar_event_id != ''
             """
@@ -9571,30 +9999,34 @@ class PostgresWarehouse:
                 WHERE is_deleted = 0
                 GROUP BY event_id
             ),
-            latest_enrichments AS (
-                SELECT DISTINCT ON (account, recording_id)
+            enriched_recordings AS (
+                SELECT
                     account,
                     recording_id,
-                    calendar_event_id,
-                    calendar_confidence,
-                    title,
-                    start_at,
-                    end_at,
-                    participants_json,
-                    transcript,
-                    summary,
-                    action_items_json,
-                    evidence_json,
-                    created_at AS enriched_at
-                FROM @apple_voice_memos_enrichments
-                WHERE status = 'completed'
-                ORDER BY account, recording_id, created_at DESC, provider DESC, model DESC, prompt_version DESC
+                    recorded_at,
+                    title AS resolved_title,
+                    enrichment_title,
+                    COALESCE(calendar_event_id, '') AS calendar_event_id,
+                    COALESCE(calendar_confidence, 0) AS calendar_confidence,
+                    meeting_start_at AS start_at,
+                    meeting_end_at AS end_at,
+                    COALESCE(participants_json, '') AS participants_json,
+                    COALESCE(transcript, '') AS transcript,
+                    COALESCE(summary, '') AS summary,
+                    COALESCE(action_items_json, '') AS action_items_json,
+                    COALESCE(evidence_json, '') AS evidence_json,
+                    enriched_at
+                FROM @marts_voice_memos_recordings
+                -- enrichment_provider, not enriched_at: the timestamp is
+                -- NULL-when-sentinel, and "has a completed enrichment" must not
+                -- ride on whether that enrichment carried a real clock reading.
+                WHERE source = 'apple_voice_memos' AND enrichment_provider IS NOT NULL
             )
             SELECT
                 e.account,
                 e.recording_id,
-                f.recorded_at,
-                CASE WHEN e.title != '' THEN e.title ELSE f.title END AS title,
+                e.recorded_at,
+                e.resolved_title AS title,
                 e.start_at,
                 e.end_at,
                 e.calendar_event_id AS attempted_calendar_event_id,
@@ -9611,11 +10043,7 @@ class PostgresWarehouse:
                 e.action_items_json,
                 e.evidence_json,
                 e.enriched_at AS created_at
-            FROM latest_enrichments AS e
-            LEFT JOIN @apple_voice_memos_files AS f
-              ON e.account = f.account
-             AND e.recording_id = f.recording_id
-             AND f.is_deleted = 0
+            FROM enriched_recordings AS e
             LEFT JOIN latest_calendar_events AS c
               ON e.calendar_event_id = c.event_id
             WHERE e.calendar_event_id = ''
