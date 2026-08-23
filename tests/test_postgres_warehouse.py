@@ -4743,3 +4743,62 @@ def test_search_hybrid_drops_its_previous_signature() -> None:
     sql = _search_text_function_sql()
     assert "DROP FUNCTION IF EXISTS" in sql
     assert "@search_hybrid(text, text, text, integer, text[], timestamptz)" in sql
+
+
+def test_search_hybrid_fuses_a_literal_leg_for_short_queries() -> None:
+    # An identifier-shaped question is where BM25 tokenization and embeddings
+    # both fail and literal matching wins: on the labeled benchmark, exact mode
+    # scores MRR 0.518 on that stratum against hybrid's 0.245. Fusing the
+    # literal hits in as a third leg took hybrid overall from 0.292 to 0.383
+    # and answered three queries that previously had nothing in the top 50.
+    sql = _search_text_function_sql()
+    assert "exact_refs" in sql and "@search_text_exact(" in sql
+
+
+def test_search_hybrid_literal_leg_is_gated_on_query_length() -> None:
+    # The literal leg costs seconds (the trigram recheck detoasts multi-MB
+    # documents) and a natural-language question gains nothing from it --
+    # ungated it scored WORSE (0.374 against 0.383) while making every long
+    # query pay. It must also never run below search_text_exact's minimum
+    # needle length, which raises.
+    sql = _search_text_function_sql()
+    assert "regexp_split_to_array" in sql, "the leg must be gated on the query's word count"
+    assert f"<= {postgres_module_exact_max_words()}" in sql
+    assert f"length(btrim(query)) >= {postgres_module_exact_min_chars()}" in sql, (
+        "a shorter needle makes search_text_exact raise, which would take the "
+        "whole hybrid search down with it"
+    )
+
+
+def postgres_module_exact_max_words() -> int:
+    import personal_data_warehouse.postgres as postgres_module
+
+    return postgres_module.SEARCH_HYBRID_EXACT_MAX_WORDS
+
+
+def postgres_module_exact_min_chars() -> int:
+    import personal_data_warehouse.postgres as postgres_module
+
+    return postgres_module.SEARCH_HYBRID_EXACT_MIN_CHARS
+
+
+def test_search_hybrid_weights_the_literal_leg_above_the_others() -> None:
+    # A literal match on a short query is strong evidence; a rank-1 BM25 hit on
+    # two common words is not.
+    sql = _search_text_function_sql()
+    import personal_data_warehouse.postgres as postgres_module
+
+    assert f"{postgres_module.SEARCH_HYBRID_EXACT_WEIGHT} * COALESCE(1.0 / (" in sql
+
+
+def test_search_hybrid_literal_leg_failure_does_not_take_down_the_search() -> None:
+    # The literal leg is an enhancement over the ranked and semantic legs.
+    # Losing an entire search because it errored (a future validation in
+    # search_text_exact, a statement timeout on a pathological needle) would be
+    # worse than returning the other two legs -- but the drop must be LOUD,
+    # because a silent degrade is how a broken search layer goes unnoticed for
+    # weeks. Same contract as search_text's per-branch guard.
+    sql = _search_text_function_sql()
+    leg = sql[sql.index("exact_refs"):]
+    assert "EXCEPTION WHEN OTHERS THEN" in leg
+    assert "RAISE WARNING 'search_hybrid: literal leg failed" in leg

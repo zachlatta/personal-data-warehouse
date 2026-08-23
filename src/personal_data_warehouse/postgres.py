@@ -293,6 +293,25 @@ SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.1
 # Filtered ANN recall depends on asking the iterative scan for a deep enough
 # qualifying pool. A 4x pool was adequate at 30 days but became unstable at 90
 # days because the global HNSW index had three times as many filtered-out rows.
+# Hybrid retrieval also runs a LITERAL-SUBSTRING leg, but only for a short
+# query. Identifier-shaped questions ("admin/api-keys", a Drive file id, a
+# person's name) are exactly where BM25 tokenization and embeddings both fail
+# and literal matching wins: on the labeled benchmark the exact MODE scores MRR
+# 0.518 on that stratum against hybrid's 0.245. Folding it in as a third fused
+# leg took hybrid from MRR 0.292 to 0.383, hit@5 12 -> 15, and answered three
+# queries that previously had nothing in the top 50.
+#
+# It is gated on query length because it is not free: the leg costs seconds
+# (the trigram recheck detoasts multi-megabyte documents), and a natural-
+# language question gains nothing from it -- ungated it scored *worse* (0.374)
+# while making every long query pay. Weight 2 because a literal match on a
+# short query is strong evidence, where a rank-1 BM25 hit on two common words
+# is not.
+SEARCH_HYBRID_EXACT_WEIGHT = 2.0
+SEARCH_HYBRID_EXACT_MAX_WORDS = 3
+# search_text_exact() raises below this needle length, so the leg must not be
+# attempted for a shorter query.
+SEARCH_HYBRID_EXACT_MIN_CHARS = 3
 SEARCH_HYBRID_CANDIDATE_MULTIPLIER = 20
 SEARCH_HYBRID_MIN_CANDIDATES = 1000
 SEARCH_HYBRID_MAX_CANDIDATES = 2000
@@ -7453,6 +7472,8 @@ class PostgresWarehouse:
                 str(SEARCH_HYBRID_RRF_K),
                 str(SEARCH_HYBRID_SEMANTIC_WEIGHT),
                 str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER),
+                str(SEARCH_HYBRID_EXACT_WEIGHT),
+                str(SEARCH_HYBRID_EXACT_MAX_WORDS),
                 str(SEARCH_HYBRID_MIN_CANDIDATES),
                 str(SEARCH_HYBRID_MAX_CANDIDATES),
                 str(SEARCH_EMBEDDING_DIMENSIONS),
@@ -8179,6 +8200,7 @@ class PostgresWarehouse:
                 per_source integer := least(greatest(coalesce(max_results, 50), 1), """
                 + str(SEARCH_TEXT_MAX_RESULTS_CAP)
                 + r""");
+                exact_refs text[];
                 qvec_alt public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
                 + r""");
@@ -8224,6 +8246,33 @@ class PostgresWarehouse:
                 """
                 + sources_alias_sql
                 + r"""
+                -- The literal-substring leg. Gated on a short query: it is where
+                -- BM25 tokenization and embeddings both fail (identifiers,
+                -- names, paths) and literal matching wins, and it costs seconds
+                -- because the trigram recheck detoasts multi-megabyte
+                -- documents. A natural-language question gains nothing from it.
+                -- The length floor matters: search_text_exact RAISES below it,
+                -- which would take the whole hybrid search down.
+                IF length(btrim(query)) >= """ + str(SEARCH_HYBRID_EXACT_MIN_CHARS) + r""" AND coalesce(
+                       array_length(regexp_split_to_array(btrim(query), '\s+'), 1), 0
+                   ) <= """ + str(SEARCH_HYBRID_EXACT_MAX_WORDS) + r""" THEN
+                    BEGIN
+                        SELECT array_agg(x.ref)
+                          INTO exact_refs
+                          FROM (
+                            SELECT h.ref FROM @search_text_exact(query, per_source, sources, since) AS h
+                          ) x;
+                    EXCEPTION WHEN OTHERS THEN
+                        -- The literal leg is an enhancement; losing the whole
+                        -- search because it failed would be worse than
+                        -- returning the other two legs. Loud, though: a silent
+                        -- drop is how a degraded search layer goes unnoticed
+                        -- for weeks. Same contract as search_text's per-branch
+                        -- guard.
+                        RAISE WARNING 'search_hybrid: literal leg failed (%); returning ranked + semantic results only', SQLERRM;
+                        exact_refs := NULL;
+                    END;
+                END IF;
                 RETURN QUERY
                 WITH lex AS (
                     SELECT h.ref, h.source, h.subsource, h.context, h.who, h.occurred_at,
@@ -8309,8 +8358,13 @@ class PostgresWarehouse:
                         GROUP BY sl.ref
                     ) g
                 ),
+                exact_ranked AS (
+                    SELECT u.ref, u.ordinality AS rnk
+                    FROM unnest(coalesce(exact_refs, '{}'::text[]))
+                         WITH ORDINALITY AS u(ref, ordinality)
+                ),
                 merged AS (
-                    SELECT COALESCE(l.ref, s.ref) AS ref,
+                    SELECT COALESCE(l.ref, s.ref, x.ref) AS ref,
                            l.source, l.subsource, l.context AS lex_context, l.who,
                            l.occurred_at, l.account, l.text AS lex_text, l.title,
                            l.source_table, l.source_pk,
@@ -8321,9 +8375,14 @@ class PostgresWarehouse:
                 + str(SEARCH_HYBRID_SEMANTIC_WEIGHT)
                 + r""" * COALESCE(1.0 / ("""
                 + str(SEARCH_HYBRID_RRF_K)
-                + r""" + s.rnk), 0)) AS rrf
+                + r""" + s.rnk), 0) + """
+                + str(SEARCH_HYBRID_EXACT_WEIGHT)
+                + r""" * COALESCE(1.0 / ("""
+                + str(SEARCH_HYBRID_RRF_K)
+                + r""" + x.rnk), 0)) AS rrf
                     FROM lex l
                     FULL OUTER JOIN sem_ranked s ON s.ref = l.ref
+                    FULL OUTER JOIN exact_ranked x ON x.ref = COALESCE(l.ref, s.ref)
                 )
                 SELECT COALESCE(m.source, tmap.source, t.source) AS source,
                        COALESCE(m.subsource, """
@@ -8334,7 +8393,8 @@ class PostgresWarehouse:
                        COALESCE(m.occurred_at, m.sem_ts, t.event_ts) AS occurred_at,
                        COALESCE(m.account, t.source_pk->>'account', t.metadata->>'account', '') AS account,
                        m.ref,
-                       COALESCE(m.sem_text, m.lex_text) AS text,
+                       COALESCE(m.sem_text, m.lex_text,
+                                """ + preview_fn_sql + r"""(t.search_text, query)) AS text,
                        (-m.rrf)::real AS score,
                        COALESCE(m.occurred_at, m.sem_ts, t.event_ts) AS event_ts,
                        COALESCE(m.title, t.title, '') AS title,

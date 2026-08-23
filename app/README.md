@@ -287,7 +287,9 @@ unified timeline document. Raw message/body columns are deliberately not text-in
 - Tool-level entry point: the `search` tool wraps this contract for callers that don't want to
   write SQL. Its default `hybrid` mode embeds the query through an OpenAI-compatible embeddings
   API (`SEARCH_EMBEDDINGS_BASE_URL`, `SEARCH_EMBEDDINGS_API_KEY`, `SEARCH_EMBEDDINGS_MODEL`,
-  `SEARCH_EMBEDDINGS_DIMENSIONS`) and calls `timeline.search_hybrid`. Instruction-tuned models can
+  `SEARCH_EMBEDDINGS_DIMENSIONS`) and calls `timeline.search_hybrid`, which fuses BM25, one
+  semantic leg per query representation, and — for a short, identifier-shaped query — a
+  literal-substring leg. Instruction-tuned models can
   prepend `SEARCH_EMBEDDINGS_QUERY_PREFIX` on queries only (write its newline as the two
   characters `\n`: a real newline in an environment value does not survive every deploy
   pipeline, and a truncated instruction retrieves measurably worse). With a prefix set the client embeds

@@ -95,8 +95,14 @@ index walks past millions of gmail/slack documents and took 15-16s on an unlucky
 And the pool depth is a measured trade (`SEARCH_TEXT_BROAD_POOL`): deeper gives the
 per-source floor more to promote, up to a point where latency grows and scores do not.
 
-- The app's `search` tool — hybrid semantic+keyword retrieval: it embeds the query and
-  calls `timeline.search_hybrid` (BM25 + pgvector ANN fused by reciprocal rank), falling
+- The app's `search` tool — hybrid retrieval over **three** legs fused by reciprocal rank:
+  BM25, pgvector ANN (one leg per query representation, see below), and — for a query of
+  at most `SEARCH_HYBRID_EXACT_MAX_WORDS` words — literal substring. The literal leg is
+  what makes identifier-shaped questions work ("admin/api-keys", a Drive file id, a
+  person's name), where BM25 tokenization and embeddings both fail: adding it took the
+  labeled benchmark from MRR 0.292 to 0.383 and answered three queries that previously
+  had nothing in the top 50. It stays gated because it costs seconds (its trigram recheck
+  detoasts multi-megabyte documents) and ungated it scored *worse*. Hybrid falls
   back to keyword with an explicit `fallback_reason` when embeddings or pgvector are
   unavailable. Agent sessions are indexed per turn (`kind = 'agent_turn'`); the session
   roll-up row carries headline fields only.
