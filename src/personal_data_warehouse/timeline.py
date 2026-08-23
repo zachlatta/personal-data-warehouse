@@ -74,6 +74,32 @@ TIMELINE_PRIORITY_DIRECT = "'direct'"  # real people reaching him directly (DMs,
 TIMELINE_PRIORITY_CC = "'cc'"  # real-people activity he is peripheral to (cc'd, channels, big groups)
 TIMELINE_PRIORITY_NOISE = "'noise'"  # bulk/automated traffic (newsletters, bots, non-member channels)
 TIMELINE_PRIORITY_BACKGROUND = "'background'"  # the warehouse's own machinery (enrichment, mutation workers)
+# The sixth enum label is the column DEFAULT and nothing else: no adapter may
+# emit it. It exists so a row inserted outside the sync engine is visibly
+# unclassified instead of silently mis-tiered, and its presence in
+# timeline.events is a bug, never a steady state. Dropping the label would
+# rewrite a 60 GB column, so it stays — enforced by
+# tests/test_timeline.py::test_no_adapter_can_emit_the_unclassified_sentinel.
+TIMELINE_PRIORITY_UNCLASSIFIED = "'unclassified'"
+
+# The definitions agents are told to filter on. Published verbatim as the
+# Postgres COMMENT on the enum type (postgres.py), because an agent reading the
+# schema directly never sees this module.
+TIMELINE_PRIORITY_DEFINITIONS: tuple[tuple[str, str], ...] = (
+    ("self", "actions Zach initiated"),
+    ("direct", "real people reaching him directly"),
+    ("cc", "real-people activity he is peripheral to"),
+    ("noise", "bulk/automated traffic"),
+    ("background", "the warehouse's own machinery"),
+    (
+        "unclassified",
+        "the column default and never valid in steady state; its presence is a bug",
+    ),
+)
+# The five tiers an adapter may emit, in enum declaration (attention) order.
+TIMELINE_PRIORITY_LABELS: tuple[str, ...] = tuple(
+    label for label, _ in TIMELINE_PRIORITY_DEFINITIONS if label != "unclassified"
+)
 
 _EPOCH = "'1970-01-01 00:00:00+00'::timestamptz"
 # Sentinel guard: house style stores "no timestamp" as the epoch, so anything
@@ -1110,6 +1136,8 @@ _APPLE_NOTE_REVISION = _simple_adapter(
     ),
     metadata="jsonb_build_object('note_id', t.note_id, 'deleted', t.is_deleted <> 0)",
     search_text=_search_concat("t.title", "t.folder_path", "t.body_text"),
+    # A note revision only exists because Zach typed one: a deliberate 'self',
+    # not an unexamined default.
     priority=TIMELINE_PRIORITY_SELF,
 )
 
@@ -1154,6 +1182,7 @@ _VOICE_MEMO = _simple_adapter(
         "'deleted', t.is_deleted <> 0)"
     ),
     search_text=_search_concat("t.title", "t.filename", "ens.enrichment_search_text"),
+    # He pressed record: a deliberate 'self', not an unexamined default.
     priority=TIMELINE_PRIORITY_SELF,
 )
 
@@ -1163,13 +1192,66 @@ _CALENDAR_START_TS = (
     f"CASE WHEN t.start_date ~ {_DATE_ONLY} THEN t.start_date::date::timestamptz ELSE NULL END, "
     "t.synced_at)"
 )
+# attendees_json is a text column holding the provider's array; it defaults to
+# '' on rows written before an attendee list existed, and casting that to jsonb
+# raises. Only cast what looks like an array, so one malformed row cannot take
+# the whole adapter down.
+_CALENDAR_ATTENDEES = (
+    "CASE WHEN t.attendees_json LIKE '[%%' THEN t.attendees_json::jsonb ELSE '[]'::jsonb END"
+)
+# Google marks the calendar owner's own entry in the attendee list with
+# "self": true, and the organizer's entry with "organizer": true. That pair is
+# a far better identity signal than matching organizer_email against the
+# account string, because it survives aliases and delegated calendars.
+_CALENDAR_ORGANIZED_BY_ME = (
+    "t.organizer_email ILIKE '%%' || t.account || '%%' "
+    "  OR EXISTS (SELECT 1 FROM @gmail_sync_state self "
+    "             WHERE self.account <> '' AND t.organizer_email ILIKE '%%' || self.account || '%%') "
+    f"  OR EXISTS (SELECT 1 FROM jsonb_array_elements({_CALENDAR_ATTENDEES}) a "
+    "             WHERE a->>'self' = 'true' AND a->>'organizer' = 'true')"
+)
+_CALENDAR_DECLINED_BY_ME = (
+    f"EXISTS (SELECT 1 FROM jsonb_array_elements({_CALENDAR_ATTENDEES}) a "
+    "        WHERE a->>'self' = 'true' AND a->>'responseStatus' = 'declined')"
+)
+# Rooms and equipment are attendees too; they must not inflate the headcount.
+_CALENDAR_HUMAN_ATTENDEES = (
+    f"(SELECT count(*) FROM jsonb_array_elements({_CALENDAR_ATTENDEES}) a "
+    "  WHERE COALESCE(a->>'resource', '') <> 'true')"
+)
+# Prod's base_google_calendar.events holds 145 rows whose (account,
+# calendar_id, event_id) bytes duplicate another row's, despite a valid unique
+# primary key on exactly those columns (17,141 rows, 16,996 distinct keys under
+# a collation-free bytea comparison, measured 2026-08-23). The source table
+# needs a REINDEX; until then 30 of those pairs disagree on content, so with no
+# tiebreak the timeline row for them flips with batch order and the content
+# guard bumps seq — and re-chunks and re-embeds the event — on every sync.
+#
+# The dedup key is deliberately the bytea form of each column, not the columns
+# themselves: whatever admitted the duplicates also makes Postgres' own text
+# sort disagree with byte equality, so `DISTINCT ON (account, calendar_id,
+# event_id)` returns all 17,141 rows unchanged. bytea has no collation, so the
+# comparison is exact; measured, it collapses to exactly 16,996 rows, each the
+# copy with the highest sync_version. Note this is also why the event_id is
+# fine as it stands: nothing derived from those three columns — concatenation,
+# escaping, or a hash — can separate two rows whose three columns are
+# byte-identical.
+_CALENDAR_KEY_BYTES = (
+    "convert_to(account, 'UTF8'), convert_to(calendar_id, 'UTF8'), "
+    "convert_to(event_id, 'UTF8')"
+)
+_CALENDAR_FROM = f"""(
+        SELECT DISTINCT ON ({_CALENDAR_KEY_BYTES}) *
+        FROM @calendar_events
+        ORDER BY {_CALENDAR_KEY_BYTES}, sync_version DESC
+    ) t"""
 
 _CALENDAR_EVENT = _simple_adapter(
     name="calendar_event",
     source_table="calendar_events",
     source="calendar",
     kind="event",
-    from_sql="@calendar_events t",
+    from_sql=_CALENDAR_FROM,
     event_id="concat_ws('|', t.account, t.calendar_id, t.event_id)",
     event_ts=_CALENDAR_START_TS,
     end_ts=(
@@ -1194,25 +1276,42 @@ _CALENDAR_EVENT = _simple_adapter(
         "'deleted', t.is_deleted <> 0)"
     ),
     search_text=_search_concat("t.summary", "t.description", "t.location", "t.organizer_email", "t.attendees_json"),
-    # Subscribed feeds (yoga studios, holidays) and marketing-mail invites
-    # (their descriptions carry the invisible-padding chars marketing HTML
-    # uses) are noise; cancelled/deleted and not-yet-started rows are not
-    # self activity for past-window reviews; events any of Zach's identities
-    # organized are his own actions, except Flighty's auto-created ✈-titled
-    # flight events; real invites from humans are attention.
+    # Who set the meeting up, not when it starts. The rule used to short-circuit
+    # on `start_ts > synced_at` — every event that had not happened *at first
+    # ingest* was filed 'cc' and, with no refresh window, froze there forever:
+    # measured on prod 2026-08-23, `source = 'calendar' AND event_ts > now()`
+    # held 0 'self' and 0 'direct' rows out of 2,487, so the documented
+    # `priority IN ('self','direct','cc')` review surfaced nothing Zach had
+    # organized. An event's tier is a property of who organized it and whether
+    # he is going, which is stable, so the ordering below never consults the
+    # clock. Subscribed feeds (yoga studios, holidays) and marketing-mail
+    # invites (their descriptions carry the invisible-padding chars marketing
+    # HTML uses) are noise; events any of Zach's identities organized are his
+    # own actions, except Flighty's auto-created ✈-titled flight events; a
+    # meeting he declined is not attention owed; an invite alongside a crowd is
+    # real-people activity he is peripheral to; the rest are humans inviting him.
     priority=(
         "CASE "
         "WHEN t.is_deleted <> 0 OR t.status = 'cancelled' THEN 'noise' "
-        f"WHEN ({_CALENDAR_START_TS}) > t.synced_at THEN 'cc' "
         "WHEN t.organizer_email ILIKE '%%group.calendar.google.com%%' "
         "  OR t.organizer_email ILIKE '%%holiday%%' THEN 'noise' "
         "WHEN t.description LIKE '%%͏%%' OR t.description LIKE '%%­%%' THEN 'noise' "
-        "WHEN t.organizer_email ILIKE '%%' || t.account || '%%' "
-        "  OR EXISTS (SELECT 1 FROM @gmail_sync_state self "
-        "             WHERE self.account <> '' AND t.organizer_email ILIKE '%%' || self.account || '%%') THEN "
+        f"WHEN {_CALENDAR_ORGANIZED_BY_ME} THEN "
         "  CASE WHEN t.summary LIKE '✈%%' THEN 'noise' ELSE 'self' END "
+        f"WHEN {_CALENDAR_DECLINED_BY_ME} THEN 'noise' "
+        # 8 is where prod's future window splits cleanly: invitee counts run
+        # 0-6 for the 1:1s and small syncs and 9+ for the recurring team-wide
+        # meetings, with nothing in between.
+        f"WHEN {_CALENDAR_HUMAN_ATTENDEES} > 8 THEN 'cc' "
         "ELSE 'direct' END"
     ),
+    # This adapter had no convergence net at all, which is how the frozen
+    # classification above went unnoticed. The refresh walk starts at the
+    # far-future cursor, so it re-walks the not-yet-happened tail plus the last
+    # two days every pass: any classification input that changes without
+    # advancing this adapter's synced_at watermark past its cursor converges on
+    # its own instead of freezing at first-ingest values.
+    refresh_hours=48,
 )
 
 _DRIVE_FILE = _simple_adapter(
@@ -1403,7 +1502,13 @@ _WHOOP_CYCLE = _simple_adapter(
         "'max_heart_rate', t.max_heart_rate)"
     ),
     search_text=_search_concat("t.score_state", "t.strain", "t.average_heart_rate", "t.max_heart_rate"),
-    priority=TIMELINE_PRIORITY_SELF,
+    # A day's strain score is a reading the strap computes about Zach, not
+    # something he did: nobody creates a cycle, the device closes one when he
+    # next falls asleep. Automated telemetry is 'noise' by the tier
+    # definitions, and 'self' here put a machine-generated row per day into the
+    # surface agents are told holds his own actions. His workouts stay 'self'
+    # below, because he did those.
+    priority=TIMELINE_PRIORITY_NOISE,
 )
 
 _WHOOP_RECOVERY = _simple_adapter(
@@ -1438,7 +1543,9 @@ _WHOOP_RECOVERY = _simple_adapter(
         "'skin_temp_celsius', t.skin_temp_celsius)"
     ),
     search_text=_search_concat("t.score_state", "t.recovery_score", "t.resting_heart_rate", "t.hrv_rmssd_milli"),
-    priority=TIMELINE_PRIORITY_SELF,
+    # Purely a sensor computation (HRV, resting HR, SpO2) — no action of his
+    # produced this row. See the cycle adapter above.
+    priority=TIMELINE_PRIORITY_NOISE,
 )
 
 _WHOOP_SLEEP = _simple_adapter(
@@ -1469,7 +1576,9 @@ _WHOOP_SLEEP = _simple_adapter(
         "'respiratory_rate', t.respiratory_rate)"
     ),
     search_text=_search_concat("t.score_state", "t.sleep_performance_percentage", "t.respiratory_rate"),
-    priority=TIMELINE_PRIORITY_SELF,
+    # The scored sleep record, not the act of going to bed: WHOOP detects and
+    # scores it on its own. See the cycle adapter above.
+    priority=TIMELINE_PRIORITY_NOISE,
 )
 
 _WHOOP_WORKOUT = _simple_adapter(
@@ -1501,6 +1610,8 @@ _WHOOP_WORKOUT = _simple_adapter(
         "'distance_meter', t.distance_meter)"
     ),
     search_text=_search_concat("t.sport_name", "t.score_state", "t.strain", "t.average_heart_rate"),
+    # Unlike the cycle/recovery/sleep scores above, a workout IS an action Zach
+    # took — the strap only recorded it — so this one stays at the self tier.
     priority=TIMELINE_PRIORITY_SELF,
 )
 
@@ -1593,6 +1704,7 @@ _ALICE_VOICE_RECORDING = _simple_adapter(
         "'recovery_source', t.recovery_source)"
     ),
     search_text=_search_concat("t.title", "t.filename", "t.raw_metadata_json"),
+    # Same call as the Voice Memos adapter: a recording he made himself.
     priority=TIMELINE_PRIORITY_SELF,
 )
 
@@ -1625,7 +1737,25 @@ _FINANCE_TRANSACTION = _simple_adapter(
     search_text=_search_concat(
         "t.description", "t.merchant", "t.amount", "t.currency", "a.name", "a.institution"
     ),
-    priority=TIMELINE_PRIORITY_SELF,
+    # The ledger mixes two very different things under one constant 'self':
+    # money Zach chose to move (a card swipe, a Venmo payment) and money that
+    # moved because a machine was scheduled to move it. The second kind is
+    # automated traffic by the tier definitions, and it is the bulk of the
+    # table — 3,981 of 14,372 rows on prod (2026-08-23) are brokerage cash
+    # sweeps into and out of the core FDIC/money-market position, recurring
+    # auto-invest allocations, collateral moves, interest, dividends, fees and
+    # rebates, autopay, payroll and bare ACH transfers. Matching is on the
+    # provider's own label because that is the only description these carry;
+    # `fee` is anchored on word boundaries so a coffee shop is not a fee.
+    priority=(
+        "CASE WHEN COALESCE(NULLIF(t.merchant, ''), t.description) ~* "
+        "  '(\\minterest\\M|dividend|\\mfees?\\M|\\mrebate\\M|core account|"
+        "fdic insured deposit|money market|collateral movement|bulk equity order|"
+        "\\mrecurring\\M|auto.?pay|automatic payment|payroll|direct deposit|"
+        "\\mach (debit|credit|deposit|withdrawal)\\M)' "
+        "  THEN 'noise' "
+        "ELSE 'self' END"
+    ),
 )
 
 _FINANCE_OBSERVATION = _simple_adapter(
@@ -1657,7 +1787,14 @@ _FINANCE_OBSERVATION = _simple_adapter(
         "'side', a.side)"
     ),
     search_text=_search_concat("a.name", "a.institution", "t.kind", "t.value", "t.currency"),
-    priority=TIMELINE_PRIORITY_SELF,
+    # A balance observation is not an event: nobody did anything at this
+    # timestamp. The row exists because the finance_ledger asset snapshots
+    # every live account once a day (Plaid keeps only current state, so this
+    # table IS the balance history) — the warehouse's own machinery writing its
+    # own derived history, which is exactly the background tier. Classifying it
+    # 'self' put one machine-written row per account per day into the surface
+    # agents are told holds Zach's own actions.
+    priority=TIMELINE_PRIORITY_BACKGROUND,
 )
 
 _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
@@ -1703,7 +1840,30 @@ _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
     search_text=_search_concat(
         "t.filename", "t.original_path", "ex.institution", "ex.account_name_hint", "ex.summary"
     ),
+    # Every row here is a document Zach chose to collect and upload, so the
+    # upload is his action even though the statement itself is machine-issued.
     priority=TIMELINE_PRIORITY_SELF,
+)
+
+
+# Harness-injected `role = 'user'` turns. Every agent CLI opens a transcript by
+# feeding the model an environment/instructions block through the user channel,
+# so the literal first user row is usually not something Zach typed. Taking it
+# as the session's first prompt cost codex every 'self' classification it
+# should have had: its `<recommended_plugins>` preamble is byte-identical
+# across sessions, so the "same long opening prompt in >= 4 sessions is a
+# scheduled routine" rule fired on all of them - measured on prod 2026-08-23,
+# codex emitted 0 'self' rows over the previous 7 days (28 codex_cli_rs, 6
+# Codex Desktop and 4 codex-tui sessions, all 'background') while every sibling
+# agent source emitted 'self'. It also made those sessions' titles read
+# "<recommended_plugins> Here is a list of plugins...". The patterns are prefix
+# matches taken from the corpus, not guesses.
+_AGENT_INJECTED_PREAMBLE = (
+    "(e2.text LIKE '<recommended_plugins>%%' "
+    " OR e2.text LIKE '<environment_context>%%' "
+    " OR e2.text LIKE '<codex_internal_context%%' "
+    " OR e2.text LIKE '<local-command-caveat>%%' "
+    " OR e2.text LIKE '# AGENTS.md instructions for %%')"
 )
 
 
@@ -1770,6 +1930,10 @@ def _agent_session_adapter() -> TimelineAdapter:
                    THEN {TIMELINE_PRIORITY_BACKGROUND}
                  WHEN s.user_event_count = 0 THEN {TIMELINE_PRIORITY_BACKGROUND}
                  WHEN s.non_sidechain_count = 0 THEN {TIMELINE_PRIORITY_BACKGROUND}
+                 -- fp now skips harness-injected preambles, so a NULL here
+                 -- means the transcript has user rows but nobody ever typed
+                 -- one: a programmatic run, whatever its entrypoint says.
+                 WHEN fp.text IS NULL THEN {TIMELINE_PRIORITY_BACKGROUND}
                  -- The same long opening prompt recurring across sessions is a
                  -- scheduled routine (daily monitor runs), not a human typing.
                  WHEN length(COALESCE(fp.text, '')) > 40 AND (
@@ -1810,6 +1974,7 @@ def _agent_session_adapter() -> TimelineAdapter:
             SELECT e2.text FROM @ai_conversation_events e2
             WHERE e2.source = s.source AND e2.session_id = s.session_id
               AND e2.role = 'user' AND e2.text != ''
+              AND NOT {_AGENT_INJECTED_PREAMBLE}
             ORDER BY e2.seq LIMIT 1
         ) fp ON TRUE
         LEFT JOIN LATERAL (

@@ -21,6 +21,9 @@ from personal_data_warehouse.timeline import (
     RAW_DDL_TABLES,
     TIMELINE_ADAPTERS,
     TIMELINE_NORMALIZED_COLUMNS,
+    TIMELINE_PRIORITY_DEFINITIONS,
+    TIMELINE_PRIORITY_LABELS,
+    TIMELINE_PRIORITY_UNCLASSIFIED,
     TIMELINE_TABLE_COVERAGE,
     BACKFILL_CURSOR_START,
     TimelineSyncEngine,
@@ -174,6 +177,59 @@ def test_adapter_sql_carries_the_pagination_contract():
         assert adapter.max_ingest_sql.lstrip().upper().startswith("SELECT")
 
 
+def _priority_literals(sql: str) -> set[str]:
+    """Every enum-label literal the adapter's SQL could emit as a priority.
+
+    The priority expression is always built from quoted label literals (the
+    TIMELINE_PRIORITY_* constants or an inline CASE arm), so scanning for
+    quoted occurrences of the six enum labels is exact enough to catch both a
+    typo'd tier and the unclassified sentinel.
+    """
+    labels = (*TIMELINE_PRIORITY_LABELS, TIMELINE_PRIORITY_UNCLASSIFIED.strip("'"))
+    return {label for label in labels if f"'{label}'" in sql}
+
+
+def test_every_adapter_emits_a_real_priority_tier():
+    """The tiers are a contract, not free text.
+
+    Agents are told to filter on these five labels; an adapter that emitted a
+    sixth (or nothing) would silently drop its whole source out of every
+    documented review. The engine's own COALESCE fallback is 'cc', which is why
+    a missing tier is invisible rather than loud.
+    """
+    for adapter in TIMELINE_ADAPTERS:
+        for sql in (adapter.backfill_sql, adapter.incremental_sql):
+            emitted = _priority_literals(sql)
+            assert emitted, f"{adapter.name} emits no priority tier literal"
+            assert emitted <= set(TIMELINE_PRIORITY_LABELS), (adapter.name, emitted)
+
+
+def test_no_adapter_can_emit_the_unclassified_sentinel():
+    """'unclassified' is the column DEFAULT and a bug marker, never a tier.
+
+    The label cannot be dropped (rewriting a 60 GB enum column), so the
+    guarantee that it only ever marks a row the sync engine never wrote has to
+    be enforced here instead.
+    """
+    assert TIMELINE_PRIORITY_UNCLASSIFIED.strip("'") not in TIMELINE_PRIORITY_LABELS
+    for adapter in TIMELINE_ADAPTERS:
+        for sql in (adapter.backfill_sql, adapter.incremental_sql):
+            assert TIMELINE_PRIORITY_UNCLASSIFIED not in sql, adapter.name
+
+
+def test_expected_fixtures_cover_every_adapter():
+    """Pin the fixtures to the registry, not the other way round.
+
+    test_backfill_normalizes_every_source iterates EXPECTED_SEEDED_EVENTS, so
+    for as long as that dict was the source of truth an adapter could be added
+    with no row count and no tier assertion anywhere — which is exactly how the
+    four whoop adapters and apple_contact_update went unasserted.
+    """
+    registered = {adapter.name for adapter in TIMELINE_ADAPTERS}
+    assert set(EXPECTED_SEEDED_EVENTS) == registered
+    assert set(EXPECTED_SEEDED_PRIORITIES) == registered
+
+
 def test_heavy_adapters_bound_incremental_scans_to_changed_candidates():
     # The incremental predicate is a computed ingest_ts (GREATEST over the
     # attachment/enrichment LATERAL), which no index can serve: without a
@@ -314,6 +370,29 @@ def test_ensure_timeline_tables_is_idempotent_and_indexed(warehouse):
             "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
             "VALUES ('t', 'ebad', 's', 'k', now(), 'x', 'not-a-tier')"
         )
+    # The tiers and the columns must be self-documenting in Postgres itself:
+    # agents are told to filter on `priority` and many of them read the schema
+    # directly, where col_description() used to return NULL for all nineteen
+    # columns and the tier labels were undefined anywhere but a Python comment.
+    type_comment = warehouse._query(
+        "SELECT obj_description(%s::regtype, 'pg_type')",
+        (warehouse.sql_relation("timeline_priority"),),
+    )[0][0]
+    for label, meaning in TIMELINE_PRIORITY_DEFINITIONS:
+        assert f"{label} = {meaning}" in type_comment, label
+    column_comments = dict(
+        warehouse._query(
+            """
+            SELECT a.attname, col_description(a.attrelid, a.attnum)
+            FROM pg_attribute a
+            WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped
+            """,
+            (warehouse.sql_relation("timeline_events"),),
+        )
+    )
+    assert all(comment for comment in column_comments.values()), column_comments
+    assert "timeline_priority" in column_comments["priority"]
+
     # seq must be sequence-backed so upserts can bump it.
     warehouse._command(
         "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table) "
@@ -647,6 +726,51 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
         """,
         (_NOW, sync_version),
     )
+    wh._command(
+        """
+        INSERT INTO @apple_contact_cards (source, account, source_kind, address_book_id, card_id,
+                                         display_name, organization, source_updated_at, synced_at)
+        VALUES ('apple', 'z@x.test', 'local', 'ab-apple', 'apple-card1', 'Bo Example',
+                'Example Engines', %s, %s)
+        """,
+        (_NOW - timedelta(hours=17), _NOW),
+    )
+    wh._command(
+        """
+        INSERT INTO @whoop_cycles (account, cycle_id, start_at, end_at, score_state, strain,
+                                  average_heart_rate, max_heart_rate, created_at, synced_at)
+        VALUES ('z@x.test', 'cyc1', %s, %s, 'SCORED', 12.5, 62, 141, %s, %s)
+        """,
+        (_NOW - timedelta(hours=18), _NOW - timedelta(hours=17), _NOW, _NOW),
+    )
+    wh._command(
+        """
+        INSERT INTO @whoop_recoveries (account, cycle_id, sleep_id, score_state, recovery_score,
+                                      resting_heart_rate, hrv_rmssd_milli, created_at,
+                                      updated_at, synced_at)
+        VALUES ('z@x.test', 'cyc1', 'slp1', 'SCORED', 71, 54, 84.2, %s, %s, %s)
+        """,
+        (_NOW, _NOW, _NOW),
+    )
+    wh._command(
+        """
+        INSERT INTO @whoop_sleeps (account, sleep_id, cycle_id, start_at, end_at, nap,
+                                  score_state, respiratory_rate,
+                                  sleep_performance_percentage, sleep_efficiency_percentage,
+                                  created_at, synced_at)
+        VALUES ('z@x.test', 'slp1', 'cyc1', %s, %s, 0, 'SCORED', 14.1, 92, 95, %s, %s)
+        """,
+        (_NOW - timedelta(hours=19), _NOW - timedelta(hours=18), _NOW, _NOW),
+    )
+    wh._command(
+        """
+        INSERT INTO @whoop_workouts (account, workout_id, start_at, end_at, sport_name,
+                                    score_state, strain, average_heart_rate, max_heart_rate,
+                                    distance_meter, created_at, synced_at)
+        VALUES ('z@x.test', 'wk1', %s, %s, 'Running', 'SCORED', 9.4, 148, 172, 5000, %s, %s)
+        """,
+        (_NOW - timedelta(hours=20), _NOW - timedelta(hours=19), _NOW, _NOW),
+    )
 
 
 # The seeded fixture rows exercise one classification branch per adapter:
@@ -654,8 +778,10 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
 # from someone else (3), a 1:1 iMessage in a chat Zach replies in (2, plus
 # his own reply at 1), an unknown-roster whatsapp group (3), a session Zach
 # prompted (1), his own notes/memos (1), a calendar event he organizes (1),
-# an unstarred drive file (3), contact churn (5: sync machinery), and the
-# warehouse's own machinery (5).
+# an unstarred drive file (3), contact churn (5: sync machinery), device
+# telemetry vs a workout he did (4), and the warehouse's own machinery (5).
+# Every adapter appears: test_expected_fixtures_cover_every_adapter pins the
+# keys to the registry, so a new adapter cannot ship without a tier assertion.
 EXPECTED_SEEDED_PRIORITIES = {
     "gmail_email": "direct",
     "slack_message": "cc",
@@ -671,8 +797,13 @@ EXPECTED_SEEDED_PRIORITIES = {
     "drive_file": "cc",
     "photo": "self",
     "contact_update": "background",
+    "apple_contact_update": "background",
+    "whoop_cycle": "noise",
+    "whoop_recovery": "noise",
+    "whoop_sleep": "noise",
+    "whoop_workout": "self",
     "finance_transaction": "self",
-    "finance_observation": "self",
+    "finance_observation": "background",
     "manual_finance_document": "self",
     "mutation": "background",
     "mutation_request": "background",
@@ -694,6 +825,11 @@ EXPECTED_SEEDED_EVENTS = {
     "drive_file": 1,
     "photo": 1,
     "contact_update": 1,
+    "apple_contact_update": 1,
+    "whoop_cycle": 1,
+    "whoop_recovery": 1,
+    "whoop_sleep": 1,
+    "whoop_workout": 1,
     "finance_transaction": 1,
     "finance_observation": 1,
     "manual_finance_document": 1,
@@ -812,16 +948,18 @@ def test_backfill_normalizes_every_source(warehouse):
     priorities = {row["adapter"]: row["priority"] for row in rows}
     assert priorities == EXPECTED_SEEDED_PRIORITIES
 
-    # Second run is a no-op: nothing new, no seq churn.
-    seqs_before = {row["event_id"]: row["seq"] for row in rows}
+    # Second run is a no-op: nothing new, no seq churn. Keyed on the real
+    # primary key: event_id alone is only unique within an adapter, and the
+    # whoop cycle/recovery adapters legitimately share one (account, cycle_id).
+    seqs_before = {(row["adapter"], row["event_id"]): row["seq"] for row in rows}
     engine2 = _engine(warehouse)
     try:
         stats2 = engine2.run()
     finally:
         engine2.close()
     assert all(s.backfill_rows == 0 and s.incremental_rows == 0 for s in stats2)
-    rows_after = warehouse._query_dicts("SELECT event_id, seq FROM @timeline_events")
-    assert {r["event_id"]: r["seq"] for r in rows_after} == seqs_before
+    rows_after = warehouse._query_dicts("SELECT adapter, event_id, seq FROM @timeline_events")
+    assert {(r["adapter"], r["event_id"]): r["seq"] for r in rows_after} == seqs_before
 
 
 def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
@@ -1343,6 +1481,75 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
         (_NOW, _NOW, _NOW) * 4,
     )
 
+    # Google marks the owner's own attendee entry "self" and the organizer's
+    # "organizer"; that pair identifies an event Zach set up even when
+    # organizer_email is an alias. A meeting he declined is not attention owed,
+    # and an invite alongside a crowd is activity he is peripheral to.
+    warehouse._command(
+        """
+        INSERT INTO @calendar_events (account, calendar_id, event_id, summary, organizer_email,
+                                     attendees_json, start_at, updated_at, synced_at)
+        VALUES ('z@x.test', 'cal1', 'ev-alias', 'Board prep', 'alias@x.test',
+                '[{"email": "alias@x.test", "self": true, "organizer": true}]', %s, %s, %s),
+               ('z@x.test', 'cal1', 'ev-declined', 'Optional sync', 'human@example.test',
+                '[{"email": "human@example.test", "organizer": true},
+                  {"email": "z@x.test", "self": true, "responseStatus": "declined"}]',
+                %s, %s, %s),
+               ('z@x.test', 'cal1', 'ev-allhands', 'All hands', 'human@example.test',
+                '[{"email": "human@example.test", "organizer": true},
+                  {"email": "a@example.test"}, {"email": "b@example.test"},
+                  {"email": "c@example.test"}, {"email": "d@example.test"},
+                  {"email": "e@example.test"}, {"email": "f@example.test"},
+                  {"email": "g@example.test"}, {"email": "h@example.test"},
+                  {"email": "z@x.test", "self": true}]', %s, %s, %s),
+               ('z@x.test', 'cal1', 'ev-room', 'Design review', 'human@example.test',
+                '[{"email": "human@example.test", "organizer": true},
+                  {"email": "room@resource.calendar.google.com", "resource": true},
+                  {"email": "z@x.test", "self": true}]', %s, %s, %s)
+        """,
+        (_NOW, _NOW, _NOW) * 4,
+    )
+
+    # --- finance: his own spend vs money a machine moved ----------------------
+    sync_version = int(_NOW.timestamp() * 1_000_000)
+    warehouse._command(
+        """
+        INSERT INTO @finance_transactions (transaction_id, account_id, posted_at, amount,
+                                          currency, description, merchant, pending, source,
+                                          created_at, sync_version)
+        VALUES ('ft-coffee', 'fa1', %s, -6.42, 'USD', 'VILLAGE WINE AND COFFEE', '', 0,
+                'plaid', %s, %s),
+               ('ft-sweep', 'fa1', %s, -3582.92, 'USD',
+                'PURCHASE INTO CORE ACCOUNT FDIC INSURED DEPOSIT', '', 0, 'plaid', %s, %s),
+               ('ft-interest', 'fa1', %s, 0.55, 'USD', 'Interest Earned', '', 0, 'plaid', %s, %s),
+               ('ft-autopay', 'fa1', %s, -240.00, 'USD', 'CAPITAL ONE AUTOPAY PYMT', '', 0,
+                'plaid', %s, %s)
+        """,
+        (_NOW, _NOW, sync_version) * 4,
+    )
+
+    # --- codex: the harness-injected opening turn is not a human prompt -------
+    for session in ("codex-a", "codex-b", "codex-c", "codex-d"):
+        warehouse._command(
+            """
+            INSERT INTO @codex_events (source, session_id, event_uuid, seq, occurred_at,
+                                       role, text, entrypoint, ingested_at)
+            VALUES ('codex', %s, 'p0', 0, %s, 'user', %s, 'codex_cli_rs', %s),
+                   ('codex', %s, 'u1', 1, %s, 'user', %s, 'codex_cli_rs', %s)
+            """,
+            (
+                session,
+                _NOW,
+                "<recommended_plugins>\nHere is a list of plugins that are available "
+                "but not installed. Ask before installing any of them.",
+                _NOW,
+                session,
+                _NOW,
+                f"pull latest from main and keep going on {session}",
+                _NOW,
+            ),
+        )
+
     # --- drive: form pipelines and shortcuts ---------------------------------
     warehouse._command(
         """
@@ -1416,6 +1623,20 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("z@x.test|cal1|ev-promo") == "noise", "promo-invite blasts are noise"
     assert priority_of("z@x.test|cal1|ev-flight") == "noise", "flighty auto-events are not his actions"
     assert priority_of("z@x.test|cal1|ev-invite") == "direct", "human invites are attention"
+    assert priority_of("z@x.test|cal1|ev-alias") == "self", "the self+organizer attendee flags are him"
+    assert priority_of("z@x.test|cal1|ev-declined") == "noise", "a meeting he declined is not attention"
+    assert priority_of("z@x.test|cal1|ev-allhands") == "cc", "an invite alongside a crowd is peripheral"
+    assert priority_of("z@x.test|cal1|ev-room") == "direct", "a booked room is not an extra attendee"
+    # finance
+    assert priority_of("ft-coffee") == "self", "a card purchase is money he chose to move"
+    assert priority_of("ft-sweep") == "noise", "brokerage cash sweeps are automated movement"
+    assert priority_of("ft-interest") == "noise", "interest is credited by the institution"
+    assert priority_of("ft-autopay") == "noise", "autopay runs without him"
+    # codex
+    assert priority_of("codex|codex-a") == "self", (
+        "the identical <recommended_plugins> preamble every codex session opens with "
+        "must not read as a recurring scheduled prompt"
+    )
     # drive
     assert priority_of("z@x.test|f-form") == "cc", "form-response uploads are pipeline traffic"
     assert priority_of("z@x.test|f-shortcut") == "cc", "shortcut churn is ambient"
@@ -1535,8 +1756,12 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
         (now,),
     )
 
-    # Cancelled/deleted calendar events and future own-calendar entries should
-    # not classify as self activity in a recent-self review.
+    # Cancelled/deleted calendar events are noise. A meeting Zach set up is his
+    # own action whether or not it has started yet: the tier describes who
+    # organized it, and a past-window review bounds on event_ts, so a future
+    # event cannot leak into one. Classifying not-yet-started events 'cc' froze
+    # them there forever (no refresh window), which is why prod held 0 'self'
+    # and 0 'direct' calendar rows in the future.
     warehouse._command(
         """
         INSERT INTO @calendar_events (account, calendar_id, event_id, summary, organizer_email,
@@ -1603,9 +1828,55 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     imessage = by_event_id["z@x.test|im-attach"]
     assert imessage["snippet"] == "[attachment: photo.jpg]"
 
-    assert by_event_id["z@x.test|primary|cancelled"]["priority"] != "self"
-    assert by_event_id["z@x.test|primary|future"]["priority"] != "self"
+    assert by_event_id["z@x.test|primary|cancelled"]["priority"] == "noise"
+    assert by_event_id["z@x.test|primary|future"]["priority"] == "self"
     assert by_event_id["openclaw|subagent-cron"]["priority"] == "background"
+
+
+def test_calendar_collapses_duplicate_source_rows_to_the_newest(warehouse):
+    """Prod's calendar heap holds rows its own primary key says cannot exist.
+
+    Measured 2026-08-23: base_google_calendar.events has 17,141 rows but only
+    16,996 distinct (account, calendar_id, event_id) byte-triples, despite a
+    valid unique index on exactly those columns. Repairing the source table is
+    a REINDEX, not an adapter change — and no event_id derivation can help,
+    since concatenating or hashing three byte-identical columns yields the same
+    16,996 keys. What the adapter owes is a deterministic choice: 30 of the 145
+    duplicate pairs disagree on content, so with no tiebreak the timeline row
+    for them flips with batch order and the content guard bumps seq — and
+    re-chunks and re-embeds the event — on every sync. It keeps the newest
+    copy.
+
+    The constraint has to be dropped to reproduce this, which is only safe
+    because the fixture runs in a throwaway schema.
+    """
+    _ensure_all_source_tables(warehouse)
+    table_ref = warehouse.sql_relation("calendar_events")
+    constraint = warehouse._query(
+        "SELECT conname FROM pg_constraint WHERE conrelid = %s::regclass AND contype = 'p'",
+        (table_ref,),
+    )[0][0]
+    warehouse._command(f'ALTER TABLE @calendar_events DROP CONSTRAINT "{constraint}"')
+    warehouse._command(
+        """
+        INSERT INTO @calendar_events (account, calendar_id, event_id, summary, organizer_email,
+                                     start_at, updated_at, synced_at, sync_version)
+        VALUES ('z@x.test', 'primary', 'dup', 'Stale copy', 'z@x.test', %s, %s, %s, 1),
+               ('z@x.test', 'primary', 'dup', 'Current copy', 'z@x.test', %s, %s, %s, 2)
+        """,
+        (_NOW, _NOW, _NOW, _NOW, _NOW, _NOW),
+    )
+
+    engine = _engine(warehouse, adapters=[adapter_by_name("calendar_event")])
+    try:
+        engine.run()
+    finally:
+        engine.close()
+
+    rows = warehouse._query_dicts(
+        "SELECT title FROM @timeline_events WHERE event_id = 'z@x.test|primary|dup'"
+    )
+    assert [row["title"] for row in rows] == ["Current copy"]
 
 
 def test_voice_memo_timeline_refreshes_when_enrichment_arrives_later(warehouse):

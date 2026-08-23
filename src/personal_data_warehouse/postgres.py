@@ -134,6 +134,11 @@ from personal_data_warehouse.relations import (
     physical_schema_names,
     relation as canonical_relation,
 )
+# The tier definitions belong to the timeline's classifier, so they are
+# imported rather than restated here; this module only publishes them as
+# Postgres COMMENTs. timeline.py imports nothing from postgres.py, so there is
+# no cycle.
+from personal_data_warehouse.timeline import TIMELINE_PRIORITY_DEFINITIONS
 
 logger = logging.getLogger(__name__)
 
@@ -3328,6 +3333,7 @@ class PostgresWarehouse:
             )
             """
         )
+        self._ensure_timeline_comments()
         self._ensure_search_views_if_possible()
 
     def pgvector_available(self) -> bool:
@@ -3375,7 +3381,17 @@ class PostgresWarehouse:
         probe and the CREATE name the type through the catalog: an unqualified
         CREATE TYPE would land in whichever schema the search_path happens to
         list first, which is a base_* source schema.
+
+        The labels are the five real tiers plus ``unclassified``, which is the
+        column default and never a value an adapter emits — see
+        ``TIMELINE_PRIORITY_UNCLASSIFIED``. Dropping the label would rewrite a
+        60 GB column, so it stays as a fail-loud sentinel; the type's COMMENT
+        (``_ensure_timeline_comments``) says so to anyone reading the schema.
         """
+        # Generated from the one definition list so the labels and the COMMENT
+        # can never drift apart. Order is load-bearing: enum declaration order
+        # is the tier sort order.
+        labels = ", ".join(f"'{label}'" for label, _ in TIMELINE_PRIORITY_DEFINITIONS)
         type_ref = self.sql_relation("timeline_priority")
         type_literal = type_ref.replace("\'", "\'\'")
         self._command(
@@ -3387,13 +3403,116 @@ class PostgresWarehouse:
             + r"""') IS NULL THEN
                     CREATE TYPE """
             + type_ref
-            + r""" AS ENUM
-                        ('self', 'direct', 'cc', 'noise', 'background', 'unclassified');
+            + r""" AS ENUM ("""
+            + labels
+            + r""");
                 END IF;
             END
             $do$;
             """
         )
+
+    # What every agent-facing timeline.events column means, published as
+    # Postgres COMMENTs. The timeline is the documented entry point and agents
+    # are told to filter on `priority`, but col_description() returned NULL for
+    # all nineteen columns, so anything reading the schema directly (psql \d+,
+    # a generic SQL client, an agent that never calls describe_table) got the
+    # names and nothing else.
+    _TIMELINE_EVENT_COLUMN_COMMENTS = {
+        "adapter": (
+            "Which timeline adapter produced this row (timeline.py). Stable "
+            "identifier; one source can have several (slack_message vs slack_file)."
+        ),
+        "event_id": (
+            "Adapter-scoped identity of the underlying thing. (adapter, event_id) "
+            "is the primary key, so re-syncing the same source row updates in place."
+        ),
+        "source": (
+            "The originating system: gmail, slack, calendar, whatsapp, photos, "
+            "finance, and for agent sessions the provider (claude_code, codex, ...)."
+        ),
+        "kind": "The shape of the event within its source: email, message, event, photo, agent_turn, ...",
+        "priority": (
+            "Attention tier. See the timeline_priority type's own comment for the "
+            "five definitions; filter priority IN ('self','direct','cc') for a review "
+            "of what involved Zach, and exclude 'noise'/'background' machinery."
+        ),
+        "event_ts": "When the thing happened in the real world. The timeline's default sort.",
+        "end_ts": (
+            "When it finished (meeting end, workout end, session end), or the epoch "
+            "sentinel 1970-01-01 when the event is instantaneous or the end is unknown."
+        ),
+        "actor": "Who or what caused it, as the source names them: sender, uploader, organizer, 'me'.",
+        "title": "Short headline (subject, summary, filename, first prompt), capped.",
+        "snippet": "Capped preview of the body. The full record lives behind source_table/source_pk.",
+        "context": (
+            "The stream this event belongs to: channel, chat, folder, calendar, or "
+            "'<provider>|<session_id>' for agent turns. It is the key timeline.context() pages over."
+        ),
+        "source_table": (
+            "Catalog logical id of the authoritative relation (gmail_messages, "
+            "slack_messages, ...), not a physical schema-qualified name."
+        ),
+        "source_pk": "JSON primary key of the authoritative row in source_table. One hop to the full record.",
+        "metadata": "Per-source structured extras kept out of the flat columns (counts, ids, flags, sizes).",
+        "search_text": (
+            "The BM25/trigram-indexed document for this event, assembled per adapter. "
+            "Search it through timeline.search_text() rather than scanning it."
+        ),
+        "ingest_ts": (
+            "When the warehouse last learned about this row from its source. Drives "
+            "the adapter's incremental watermark; unrelated to event_ts."
+        ),
+        "seq": (
+            "Monotonic arrival/change order, bumped only when the row's content "
+            "changes. Checkpoint on this to consume the timeline exactly once, "
+            "including late backfills that land in the past by event_ts."
+        ),
+        "first_seen_at": "When this timeline row was first written.",
+        "updated_at": "When this timeline row was last written.",
+    }
+
+    def _ensure_timeline_comments(self) -> None:
+        """Publish the priority tiers and column meanings as Postgres COMMENTs.
+
+        Same posture as _ensure_schema_comments: probe first and write only on
+        drift, because ensure_timeline_tables runs on every timeline sync
+        (~288/day in prod) and an unconditional COMMENT ON per column would
+        churn pg_description forever.
+        """
+        type_ref = self.sql_relation("timeline_priority")
+        tiers = "; ".join(
+            f"{label} = {meaning}" for label, meaning in TIMELINE_PRIORITY_DEFINITIONS
+        )
+        type_comment = (
+            "Attention tier of a timeline.events row, classified per row at sync "
+            "time by its adapter. Enum declaration order is the sort order, highest "
+            f"attention first. {tiers}."
+        )
+        current_type = self._query(
+            "SELECT obj_description(%s::regtype, 'pg_type')", (type_ref,)
+        )
+        if not current_type or current_type[0][0] != type_comment:
+            self._raw_command(f"COMMENT ON TYPE {type_ref} IS %s", (type_comment,))
+
+        table_ref = self.sql_relation("timeline_events")
+        current = {
+            column: comment
+            for column, comment in self._query(
+                """
+                SELECT a.attname, col_description(a.attrelid, a.attnum)
+                FROM pg_attribute a
+                WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped
+                """,
+                (table_ref,),
+            )
+        }
+        for column, comment in self._TIMELINE_EVENT_COLUMN_COMMENTS.items():
+            if column not in current or current[column] == comment:
+                continue
+            self._raw_command(
+                f"COMMENT ON COLUMN {table_ref}.{_identifier(column)} IS %s", (comment,)
+            )
 
     def ensure_claude_desktop_tables(self) -> None:
         """Tables for the serverside Claude Desktop poller.
@@ -9690,8 +9809,12 @@ def _postgres_type(column: str, *, table: str | None = None) -> str:
 
 def _default_sql(column: str, *, table: str | None = None) -> str:
     if table == "timeline_events" and column == "priority":
-        # Not-yet-(re)synced rows sit at the "unknown" tier; every adapter emits
-        # a real tier, so this should only ever be transient.
+        # A fail-loud sentinel, not a tier. Every adapter emits one of the five
+        # real tiers, so a row can only carry 'unclassified' if it was inserted
+        # outside the sync engine — i.e. it marks a bug rather than filing the
+        # row silently under a plausible-looking tier. Enforced by
+        # tests/test_timeline.py::test_no_adapter_can_emit_the_unclassified_sentinel;
+        # prod carried 0 such rows at 2026-08-23.
         return "'unclassified'"
     if _is_jsonb_column(table, column):
         if column in JSONB_ARRAY_COLUMNS_BY_TABLE.get(table or "", set()):
