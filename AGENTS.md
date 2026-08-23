@@ -466,6 +466,49 @@ someone notices a gap in an answer).
 Photo sources have five *additional* registry edits on top of this list — see
 [Adding a photo source](#adding-a-photo-source-google_photos-takeout-import-manual-imports-).
 
+## Collation drift and index corruption
+
+**This database cannot warn you about collation changes, and one has already happened.**
+`pg_database.datcollversion` is **NULL** while `pg_database_collation_actual_version()`
+reports glibc **2.36**. Postgres only raises its "collation version mismatch" warning when
+it has a recorded baseline to compare against, and `ALTER DATABASE ... REFRESH COLLATION
+VERSION` refuses to create one from NULL (`ERROR: invalid collation version change`,
+`AlterDatabaseRefreshColl`). So the `en_US.utf8` sort order changed underneath the data
+silently, and the next change will be silent too.
+
+What that did, found and repaired 2026-08-23: seven btree indexes failed
+`bt_index_check` with `item order invariant violated`, and four UNIQUE indexes were
+admitting duplicate rows — a `ON CONFLICT` lookup missed the existing row through the
+mis-ordered index and INSERTed a second one instead of upserting. 36,825 duplicate rows
+had accumulated: `base_apple_messages.chat_messages` 30,043, `base_slack.message_reactions`
+6,622, `base_google_calendar.events` 145, `base_apple_notes.notes` 15. Every duplicate group
+differed in `sync_version` and `ingested_at`, which is the upsert-became-insert signature.
+
+**How to check, and the two traps.** `amcheck` is the reliable tool
+(`SELECT bt_index_check('schema.index'::regclass)`; it raises rather than returning a
+value, so check for an exception, not a result):
+
+- **Do not conclude "no duplicates" from a query the planner can answer with the index.**
+  A corrupt unique index reports exactly what it believes. `SELECT DISTINCT`, `GROUP BY`
+  and `count(DISTINCT ...)` can each read either the heap or the index depending on plan
+  shape, and they disagreed by 145 rows on one table here. Force the heap:
+  `SET LOCAL enable_indexscan=off; SET LOCAL enable_indexonlyscan=off; SET LOCAL enable_bitmapscan=off;`
+- **A duplicate-count sweep is not sufficient.** Three of the seven damaged indexes had
+  **no** duplicates — they were merely mis-ordered, which makes an index *miss rows that
+  exist* and surfaces as quietly wrong query results, never as a count. Only `amcheck`
+  catches that class.
+- Any home-grown divergence probe must apply the index's partial predicate
+  (`pg_index.indpred`). Ignoring it made one clean partial unique index report 53,035
+  phantom excess rows.
+
+Repair order matters: dedupe first (`REINDEX` on a UNIQUE index fails while the heap holds
+duplicates), keeping the highest `sync_version` per key because that is what a working
+upsert would have left, then `REINDEX INDEX CONCURRENTLY`, then re-verify with `amcheck`.
+All 220 btree indexes were swept; the large ones (`base_gmail.messages`,
+`base_slack.messages`, `timeline.events`) were clean. All 178 collatable indexes use the
+database default collation — the 871 drifted `*-x-icu` collations have no dependent index
+and are noise.
+
 ## Commit and Push Safety
 
 Before committing or pushing, review the complete staged diff line by line for secrets,
