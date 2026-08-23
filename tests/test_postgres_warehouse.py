@@ -4847,3 +4847,21 @@ def test_search_text_branch_loop_pins_the_index_ordered_plan() -> None:
     assert "set_config('enable_sort', 'on', true)" in sql[loop_at:merge_at], (
         "enable_sort must be restored after the branch loop and before the merge"
     )
+
+
+def test_search_hybrid_pushes_the_source_filter_into_the_ann_scan() -> None:
+    # Filtering the semantic legs through a joined adapter->source VALUES list
+    # keeps the predicate ABOVE the index scan, so pgvector's iterative scan
+    # cannot use it: it walks the graph feeding candidates up to be discarded.
+    # Measured on the production corpus, a photo-scoped hybrid search took 44.6s
+    # that way -- past the app's 30s statement budget -- while the same ANN scan
+    # with the adapter predicate pushed down took 1.0s. Resolve `sources` to
+    # adapters once, then filter the scan on c.adapter directly.
+    sql = _search_text_function_sql()
+    hybrid = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid("):]
+    legs = hybrid[hybrid.index("sem_legs AS ("):hybrid.index("sem_ranked AS (")]
+    assert "sem_adapters" in legs, "the semantic legs must filter on resolved adapters"
+    assert "c.adapter = ANY (sem_adapters)" in legs
+    assert "map.source = ANY (sources)" not in legs, (
+        "a post-join source filter blocks pgvector's filtered iterative scan"
+    )

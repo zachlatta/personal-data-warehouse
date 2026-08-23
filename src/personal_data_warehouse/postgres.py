@@ -8218,6 +8218,7 @@ class PostgresWarehouse:
                 + str(SEARCH_TEXT_MAX_RESULTS_CAP)
                 + r""");
                 exact_refs text[];
+                sem_adapters text[];
                 qvec_alt public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
                 + r""");
@@ -8263,6 +8264,19 @@ class PostgresWarehouse:
                 """
                 + sources_alias_sql
                 + r"""
+                -- Resolve `sources` to ADAPTERS once. Filtering the ANN legs
+                -- through a joined adapter->source list keeps the predicate
+                -- above the index scan, where pgvector's iterative scan cannot
+                -- use it: a photo-scoped search took 44.6s that way, past the
+                -- app's statement budget, against 1.0s for the same scan with
+                -- the adapter predicate pushed down.
+                IF sources IS NOT NULL THEN
+                    sem_adapters := ARRAY(
+                        SELECT map.adapter
+                        FROM (VALUES """ + adapter_source_values + r""") AS map(adapter, source)
+                        WHERE map.source = ANY (sources)
+                    );
+                END IF;
                 -- The literal-substring leg. Gated on a short query: it is where
                 -- BM25 tokenization and embeddings both fail (identifiers,
                 -- names, paths) and literal matching wins, and it costs seconds
@@ -8309,12 +8323,9 @@ class PostgresWarehouse:
                            ) AS rnk
                     FROM @search_chunk_embeddings e
                     JOIN @search_chunks c ON c.text_sha256 = e.text_sha256
-                    JOIN (VALUES """
-                + adapter_source_values
-                + r""") AS map(adapter, source) ON map.adapter = c.adapter
                     WHERE e.model = embedding_model
                       AND e.embedding IS NOT NULL
-                                            AND (sources IS NULL OR map.source = ANY (sources))
+                      AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
                       AND (since IS NULL OR c.event_ts >= since)
                     ORDER BY e.embedding OPERATOR(public.<=>) qvec
                     LIMIT least(greatest(per_source * """
@@ -8334,13 +8345,10 @@ class PostgresWarehouse:
                            ) AS rnk
                     FROM @search_chunk_embeddings e
                     JOIN @search_chunks c ON c.text_sha256 = e.text_sha256
-                    JOIN (VALUES """
-                + adapter_source_values
-                + r""") AS map(adapter, source) ON map.adapter = c.adapter
                     WHERE e.model = embedding_model
                       AND e.embedding IS NOT NULL
                       AND qvec_alt IS NOT NULL
-                      AND (sources IS NULL OR map.source = ANY (sources))
+                      AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
                       AND (since IS NULL OR c.event_ts >= since)
                     ORDER BY e.embedding OPERATOR(public.<=>) qvec_alt
                     LIMIT least(greatest(per_source * """
