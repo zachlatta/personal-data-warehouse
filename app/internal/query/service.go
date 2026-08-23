@@ -1270,7 +1270,7 @@ func numericCastHint(message, sql string) string {
 	if !strings.Contains(strings.ToLower(sql), "cursor_ts") {
 		return ""
 	}
-	return "(hint: slack.sync_state.cursor_ts is text and is often '' (empty), which breaks ::numeric — guard it with NULLIF(cursor_ts, '')::numeric.)"
+	return "(hint: ops.slack_sync_state.cursor_ts is text and is often '' (empty), which breaks ::numeric — guard it with NULLIF(cursor_ts, '')::numeric.)"
 }
 
 // soleTimeTable returns the table and its primary time column when the SQL
