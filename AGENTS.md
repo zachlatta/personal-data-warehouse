@@ -128,10 +128,13 @@ OpenAI-compatible `/v1/embeddings` endpoint (`SEARCH_EMBEDDINGS_BASE_URL` / `_AP
 `_MODEL` / `_DIMENSIONS` on the Dagster AND app deployments). Unconfigured or
 pre-pgvector hosts skip loudly, never red.
 
-**The production embedding server runs on `mew` (the GPU box, `ssh mew`)**: a
-`text-embeddings-inference` container named `pdw-embeddings` (`--restart unless-stopped`,
-HF cache volume at `/opt/pdw-embeddings/hf-cache`) serving `Qwen/Qwen3-Embedding-4B` on
-the RTX 3080 Ti, bound to the tailnet at `http://100.104.110.27:8485/v1`. 4B was chosen
+**The production embedding server runs on `mew` (the GPU box, `ssh mew`) and is managed
+by Coolify** as the `personal-data-warehouse-embeddings` application. Coolify targets the
+physical `mew` server directly; the GPU is deliberately not passed through to the
+`mew-coolify` VM. Its Git-backed deployment definition is
+`embeddings/docker-compose.yaml`, the HF cache persists at
+`/opt/pdw-embeddings/hf-cache`, and it serves `Qwen/Qwen3-Embedding-4B` on the RTX 3080 Ti,
+bound to the tailnet at `http://100.104.110.27:8485/v1`. 4B was chosen
 over 0.6B off the 2026 MTEB standings (multilingual 69.45 vs 64.33; the 8B leader does
 not fit 12 GB) — the family tops open self-hosted models and the GPU is otherwise idle.
 Queries (the app's Go client only, never the Python document indexer) are wrapped in the
@@ -147,9 +150,10 @@ so re-measure with `search_benchmark` before changing it. Write the instruction'
 the two characters `\n`, which the app decodes: Coolify truncates an environment value at a
 real newline, and production silently ran with the instruction's second half missing. `SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT`
 is removed; the app logs a warning if it is still set. None of this changes document
-embeddings. Inspect with
-`ssh mew docker logs pdw-embeddings`;
-relaunch with the same `docker run` flags plus `--auto-truncate` (required: the model's
+embeddings. Find and inspect the live Coolify-managed container with
+`ssh mew 'docker ps --filter label=coolify.resourceName=personal-data-warehouse-embeddings'`;
+deploy changes through Coolify rather than running a replacement container by hand. The
+compose definition pins `--auto-truncate` (required: the model's
 32k context exceeds TEI's default batch limit) **and `--max-client-batch-size 256`**
 (the indexer posts 128-text batches; TEI's default cap of 32 makes them 413 —
 this exact omission broke a relaunch once already).
