@@ -1,5 +1,11 @@
 # Timeline retrieval replay evaluation
 
+> These labels are the *previous retriever's own results*, so this harness measures
+> **regression only**: whether a change stopped returning something it used to return. It
+> structurally cannot show that a change is an improvement, because a better result the old
+> system never returned scores as a miss. For that, use the independently-labeled
+> [search benchmark](search-benchmark.md).
+
 The retrieval evaluator replays real `timeline.search_text()` calls mined from
 agent transcripts. Generated query corpora and reports contain private data and
 must stay under the gitignored `.search-eval/` directory.
