@@ -1248,3 +1248,40 @@ def test_mart_input_pipelines_are_recorded_alongside_the_tables(warehouse):
             if TABLE_PIPELINES[table].role != "state"
         }
         assert set(view.input_pipelines) == derived, view.view_id
+
+
+def test_ensure_widens_a_pipeline_health_table_provisioned_before_the_new_columns(warehouse):
+    """A warehouse older than a column must be widened, not left behind.
+
+    _ensure_table_group only CREATEs; it does not ALTER an existing table. So a
+    column added to PIPELINE_HEALTH_COLUMNS reaches a fresh database (and every
+    test, and CI) while a long-lived warehouse keeps the old shape -- and the
+    marts views that reference the column then fail on every collection. That
+    is not hypothetical: it happened in production on 2026-08-23, where the
+    collector raised every ten minutes while the whole suite was green,
+    precisely because no test provisions an OLD table and re-ensures over it.
+    """
+    warehouse.ensure_pipeline_health_tables()
+    rel = relation("pipeline_health").with_namespace(warehouse.schema_namespace)
+    added = ("data_basis", "expected_event_interval_seconds", "event_tables_probed")
+    for column in added:
+        warehouse._command(
+            f'ALTER TABLE "{rel.schema}"."{rel.name}" DROP COLUMN IF EXISTS {column} CASCADE'
+        )
+
+    # Re-ensuring must both re-add the columns and rebuild the views over them.
+    warehouse.ensure_pipeline_health_tables()
+
+    present = {
+        row[0]
+        for row in warehouse._query(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s",
+            (rel.schema, rel.name),
+        )
+    }
+    assert set(added) <= present, f"ensure did not widen the table; missing {sorted(set(added) - present)}"
+
+    # The view is the thing that actually broke, so prove it reads.
+    marts = relation("marts_pipeline_health").with_namespace(warehouse.schema_namespace)
+    warehouse._query(f'SELECT count(*) FROM "{marts.schema}"."{marts.name}"')

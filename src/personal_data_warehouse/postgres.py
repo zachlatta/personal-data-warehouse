@@ -3163,6 +3163,22 @@ class PostgresWarehouse:
                 "collation_health",
             ]
         )
+        # _ensure_table_group only CREATEs; it does not widen an existing
+        # table. A warehouse provisioned before these columns existed would
+        # therefore keep the old shape and the marts views below -- which
+        # reference them -- would fail on every run. Fresh-database tests
+        # cannot catch that by construction, which is exactly how it reached
+        # production: the collector raised every ten minutes while the suite
+        # was green.
+        for column, ddl_type, default in (
+            ("data_basis", "text", "''"),
+            ("expected_event_interval_seconds", "bigint", "0"),
+            ("event_tables_probed", "bigint", "0"),
+        ):
+            self._command(
+                f"ALTER TABLE @pipeline_health ADD COLUMN IF NOT EXISTS "
+                f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
+            )
         self._ensure_pipeline_health_mart_views()
 
     def _ensure_pipeline_health_mart_views(self) -> None:
