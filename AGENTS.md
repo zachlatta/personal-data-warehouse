@@ -2060,24 +2060,33 @@ Three things now hold this up, and the second is the one that is easy to undo:
   returns `MaterializeResult` with `skipped_due_to_lock: true` and a green run, so six of
   every eight metadata runs did nothing and mpim metadata went 11.5 hours between refreshes.
   Reverting to a clock rotation reintroduces that.
-- **`marts_ops.slack_conversation_health` judges the OLDEST stamp, per type.** This is the
-  detector that was missing. `marts_ops.pipeline_health` aggregates Slack as a single
+- **`marts_ops.slack_conversation_health` judges the SHARE re-listed, per type.** This is
+  the detector that was missing. `marts_ops.pipeline_health` aggregates Slack as a single
   pipeline and ~19k public-channel messages a day kept it `ok` with `state_error_rows = 0`
   through a total group-DM outage.
 
 ```sql
-SELECT conversation_type, conversation_count, status,
-       oldest_conversation_synced_at, discovery_age_seconds, discovery_cursor
+SELECT conversation_type, live_count, refreshed_count, refreshed_fraction, status,
+       discovery_status, oldest_conversation_synced_at
 FROM marts_ops.slack_conversation_health ORDER BY status, conversation_type;
 ```
 
-**Read `oldest_conversation_synced_at`, never `newest_`.** A page-1-only walk re-stamps the
-first 200 rows every hour, so `max(synced_at)` looks perfect while the tail is months old;
-that is exactly how this hid for three months. And the status is deliberately about the
-**sync attempt**, not about messages: mpim had eleven legitimate zero-message days between
-2026-07-11 and 2026-08-18, so alerting on "no group DM messages" is a guaranteed false
-positive, while "no conversation of this type has been re-listed in three months" has no
-innocent explanation.
+**`refreshed_fraction` is the number that means something — not `max(synced_at)`, and not
+the single oldest row either.** A page-1-only walk re-stamps the first 200 rows every hour,
+so `max()` looks perfect while the tail is months old; that is exactly how this hid for
+three months. But `min()` over-fires in the other direction: a conversation archived
+*upstream* after we last listed it keeps `is_archived = 0` forever, because the only path
+that would correct the flag is the same walk that excludes archived rows — so roughly 1% of
+rows can never be re-stamped and the oldest-row rule is permanently red. Measured after the
+repair: im 100%, mpim 100%, private_channel 99.1%, public_channel 99.2%, against 200 of
+2,597 (**7.7%**) during the outage. Thresholds are `ok` >= 95%, `late` >= 75%, `stale`
+below.
+
+The status is also deliberately about the **sync attempt**, not about messages: mpim had
+eleven legitimate zero-message days between 2026-07-11 and 2026-08-18, so alerting on "no
+group DM messages" is a guaranteed false positive. It would also have been wrong here —
+group DMs really were silent from 2026-08-20T18:57 onward, which is exactly what Slack
+itself reports.
 
 ## Slack huddles: metadata yes, content no
 
