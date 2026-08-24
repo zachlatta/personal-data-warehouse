@@ -144,15 +144,23 @@ they have no other home, and one call carries the whole series (~6 months). `SAG
 `HOURS_OF_SLEEP_GOAL` are advertised as valid but return 500; the three
 `EXERCISE_PROGRESS_BY_EXERCISE*` keys return 400.
 
-### Payload sizes decide what gets a history
+### Payload sizes set the per-run budget, not what gets stored
 
 Measured per day, 2026-08-23: `stress` ~1.7 MB, `sleep_deep_dive` ~935 KB,
-`strain_deep_dive` ~5 KB, `behavior_impact` 326 bytes. Backfilling a year of all four
-would store ~800 MB of UI payload for two facts, so the sync walks history only for the
-cheap pair and leaves the expensive two on their rolling recent window. Every one of the
-four answers **200 on any date**, including years before the account existed (an empty
-payload, not a 404), so a backfill needs no missing-day handling -- but it also cannot
-detect its own floor, which is why the walk stops at the first cycle.
+`strain_deep_dive` ~5 KB, `behavior_impact` 326 bytes. All four are backfilled anyway --
+storage is recoverable and an unpulled history is not -- so a full walk is a few hundred
+MB of jsonb. What the sizes govern is the *rate*: the per-run day budget is set by bytes
+rather than by the rate limit (20 days is ~50 MB of payload; 1,220 requests for a year of
+all four is nothing against 2,000 per five minutes), and documents are flushed per day
+rather than accumulated so a run never holds a whole batch in memory.
+
+The early days are much smaller than the recent ones: `stress` was 94 KB at the account's
+second week and 1.5 MB six months later, because the payload carries history up to its
+date. Sizing a backfill from a recent day therefore overestimates it.
+
+Every one of the four answers **200 on any date**, including years before the account
+existed (an empty payload, not a 404), so a backfill needs no missing-day handling -- but
+it also cannot detect its own floor, which is why the walk stops at the first cycle.
 
 ### Confirmed absent
 

@@ -111,11 +111,14 @@ DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNKS_PER_RUN = 8
 DEFAULT_WHOOP_PRIVATE_HEART_RATE_RECENT_HOURS = 6
 DEFAULT_WHOOP_PRIVATE_JOURNAL_DAYS_PER_RUN = 7
 DEFAULT_WHOOP_PRIVATE_DOCUMENTS_LOOKBACK_DAYS = 3
-#: Historic days walked per run, on top of the lookback window. Two document
-#: kinds are backfilled (see WhoopPrivateSyncRunner.BACKFILL_DOCUMENT_KINDS),
-#: so this costs ~2x that many requests against a 2,000-per-five-minute limit.
-#: At 60, a year of history lands in about five runs of the */15 schedule.
-DEFAULT_WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN = 60
+#: Historic days walked per run, on top of the lookback window. All four
+#: day-keyed document kinds are backfilled, so this is ~4x that many requests
+#: against a 2,000-per-five-minute limit -- comfortable -- but it is BYTES that
+#: set this number, not requests: a recent `stress` day is ~1.7 MB, so 20 days
+#: is ~50 MB of payload per run. At 20 a year of history lands in about 18 runs
+#: of the */15 schedule, which is the dial to turn down if the pull ever needs
+#: to be lighter.
+DEFAULT_WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN = 20
 DEFAULT_WHOOP_PRIVATE_MAX_SLEEP_EVENT_REQUESTS = 25
 DEFAULT_WHOOP_PRIVATE_MAX_WORKOUT_REQUESTS = 25
 DEFAULT_WHOOP_PRIVATE_SPORTS_COUNTRY_CODE = "US"

@@ -91,6 +91,7 @@ class FakeWhoopPrivateWarehouse:
         self.journal_entries: list[dict] = []
         self.sports: list[dict] = []
         self.documents: list[dict] = []
+        self.document_batches: list[list[dict]] = []
         # Documents already in the warehouse from earlier runs: the backfill
         # cursor IS the table, so this is what makes a resumed run resume.
         self.stored_documents: list[dict] = list(stored_documents or [])
@@ -159,6 +160,7 @@ class FakeWhoopPrivateWarehouse:
 
     def insert_whoop_private_documents(self, rows):
         self.documents.extend(rows)
+        self.document_batches.append(list(rows))
 
     def whoop_private_document_keys(self, *, account, kinds):
         return {
@@ -1048,7 +1050,7 @@ def test_a_backfilled_day_is_never_fetched_twice(monkeypatch) -> None:
     """The documents table is the cursor, so a resumed run skips what it has."""
     stored = [
         {"account": ACCOUNT, "kind": kind, "doc_key": day}
-        for kind in ("strain_deep_dive", "behavior_impact")
+        for kind in ("strain_deep_dive", "behavior_impact", "stress", "sleep_deep_dive")
         for day in ("2026-08-22", "2026-08-21")
     ]
     warehouse = FakeWhoopPrivateWarehouse(
@@ -1074,7 +1076,7 @@ def test_a_backfilled_day_is_never_fetched_twice(monkeypatch) -> None:
 def test_the_backfill_stops_at_the_first_cycle_and_does_not_run_forever(monkeypatch) -> None:
     stored = [
         {"account": ACCOUNT, "kind": kind, "doc_key": f"2026-08-{day:02d}"}
-        for kind in ("strain_deep_dive", "behavior_impact")
+        for kind in ("strain_deep_dive", "behavior_impact", "stress", "sleep_deep_dive")
         for day in range(18, 23)
     ]
     warehouse = FakeWhoopPrivateWarehouse(
@@ -1111,12 +1113,13 @@ def test_no_document_backfill_before_cycles_have_landed(monkeypatch) -> None:
     assert days == ["2026-08-23"]
 
 
-def test_the_historic_walk_skips_the_megabyte_kinds(monkeypatch) -> None:
-    """Measured 2026-08-23: `stress` is ~1.7 MB per day and `sleep_deep_dive`
-    ~935 KB, against ~5 KB and 326 bytes for the two kinds carrying facts we
-    cannot get elsewhere. History is only worth having for the cheap pair."""
+def test_a_partially_stored_day_only_fetches_the_kinds_it_is_missing(monkeypatch) -> None:
+    """`stress` and `sleep_deep_dive` predate the newer kinds, so historic days
+    are half-filled. Re-fetching a stored 1.7 MB `stress` day would spend the
+    run's budget restating it."""
     stored = [
-        {"account": ACCOUNT, "kind": "strain_deep_dive", "doc_key": "2026-08-22"},
+        {"account": ACCOUNT, "kind": kind, "doc_key": "2026-08-22"}
+        for kind in ("stress", "sleep_deep_dive")
     ]
     warehouse = FakeWhoopPrivateWarehouse(
         session=_session_row(),
@@ -1138,6 +1141,60 @@ def test_the_historic_walk_skips_the_megabyte_kinds(monkeypatch) -> None:
         for endpoint, params in client.calls
         if endpoint in day_kinds and params.get("day") == "2026-08-22"
     }
-    assert backfilled == {"behavior_impact"}, (
-        "strain is already stored for that day, and the megabyte kinds never backfill"
+    assert backfilled == {"strain_deep_dive", "behavior_impact"}
+
+
+def test_historic_days_backfill_every_day_keyed_kind(monkeypatch) -> None:
+    """All four kinds get history, megabytes included.
+
+    `stress` and `sleep_deep_dive` are ~1.7 MB and ~935 KB per day against ~5 KB
+    and 326 bytes for the other two, so this is a deliberate storage trade: an
+    unpulled history is not recoverable later, and the per-run day budget is the
+    dial for making the pull lighter.
+    """
+    warehouse = FakeWhoopPrivateWarehouse(
+        session=_session_row(),
+        earliest_cycle_day=date(2026, 8, 21),
     )
+    client = FakeWhoopPrivateClient()
+
+    _run(
+        monkeypatch,
+        warehouse=warehouse,
+        client=client,
+        WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN="2",
+    )
+
+    historic = {
+        (row["kind"], row["doc_key"])
+        for row in warehouse.documents
+        if row["doc_key"] in {"2026-08-21", "2026-08-22"}
+    }
+    assert historic == {
+        (kind, day)
+        for kind in ("stress", "sleep_deep_dive", "strain_deep_dive", "behavior_impact")
+        for day in ("2026-08-21", "2026-08-22")
+    }
+
+
+def test_documents_are_flushed_per_day_not_accumulated(monkeypatch) -> None:
+    """A 20-day run would otherwise hold tens of MB of UI payload in memory."""
+    warehouse = FakeWhoopPrivateWarehouse(
+        session=_session_row(),
+        earliest_cycle_day=date(2026, 8, 21),
+    )
+    client = FakeWhoopPrivateClient()
+
+    _run(
+        monkeypatch,
+        warehouse=warehouse,
+        client=client,
+        WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN="2",
+    )
+
+    day_batches = [
+        batch
+        for batch in warehouse.document_batches
+        if {row["doc_key"] for row in batch} <= {"2026-08-21", "2026-08-22", "2026-08-23"}
+    ]
+    assert len(day_batches) == 3, "one insert per day, not one insert for the whole run"

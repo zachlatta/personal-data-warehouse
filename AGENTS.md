@@ -1680,12 +1680,13 @@ reproduces the displayed strain and is the check that the fields still mean what
 did. Two sibling kinds landed with it: `behavior_impact` (one row per day — WHOOP's own
 attribution of yesterday's journal behaviors to today's recovery, which nothing else in
 the warehouse can reconstruct) and `health_tab` (one current row under
-`doc_key = 'current'` — WHOOP Age, Pace of Aging, Health Monitor statuses). History for
-the first two is walked backwards to the account's first cycle, bounded by
-`WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN`; **the documents table is the cursor**,
-so an interrupted backfill resumes with no watermark to repair. `stress` and
-`sleep_deep_dive` deliberately do NOT get history — measured 1.7 MB and 935 KB per day
-against 5 KB and 326 bytes for the pair above.
+`doc_key = 'current'` — WHOOP Age, Pace of Aging, Health Monitor statuses). Every day-keyed
+kind — those two plus `stress` and `sleep_deep_dive` — is walked backwards to the
+account's first cycle, bounded by `WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN`;
+**the documents table is the cursor**, so an interrupted backfill resumes with no
+watermark to repair. That budget is set by bytes, not by the rate limit: a recent
+`stress` day is ~1.7 MB and `sleep_deep_dive` ~935 KB, against ~5 KB and 326 bytes for
+the other two, so lower it (not the kind list) if the pull ever needs to be lighter.
 
 **Only `journal_entries` reaches `timeline.events`** (adapter `whoop_private_journal`,
 source `whoop_private`, priority `self` — Zach opened the app and answered the question

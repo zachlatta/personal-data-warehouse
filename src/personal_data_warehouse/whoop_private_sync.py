@@ -1059,14 +1059,14 @@ class WhoopPrivateSyncRunner:
     #: ``cardio_details`` is keyed by activity, so none of them are here.
     DAY_DOCUMENT_KINDS = ("stress", "sleep_deep_dive", "strain_deep_dive", "behavior_impact")
 
-    #: The subset the historic backfill walks, and the reason is size measured
-    #: against the live API on 2026-08-23: `stress` is ~1.7 MB per day and
+    #: The historic backfill walks all of them. These are not cheap -- measured
+    #: against the live API on 2026-08-23, a recent `stress` day is ~1.7 MB and
     #: `sleep_deep_dive` ~935 KB, against ~5 KB for `strain_deep_dive` and 326
-    #: BYTES for `behavior_impact`. Walking a year of all four would store
-    #: ~800 MB of UI payload to gain two facts, and the expensive pair largely
-    #: restates `base_whoop_private.sleeps` and the STRESS trend. They keep
-    #: their rolling recent window; only the cheap pair gets history.
-    BACKFILL_DOCUMENT_KINDS = ("strain_deep_dive", "behavior_impact")
+    #: BYTES for `behavior_impact` -- so a full walk is a few hundred MB of
+    #: jsonb. That is a deliberate trade: storage is recoverable, an unpulled
+    #: history is not, and the per-run budget below is the dial to turn down if
+    #: it ever needs turning down.
+    BACKFILL_DOCUMENT_KINDS = DAY_DOCUMENT_KINDS
 
     def _day_document(self, *, client, kind: str, day: str):
         return {
@@ -1153,15 +1153,20 @@ class WhoopPrivateSyncRunner:
                 backfill[-1],
             )
         recent_days = set(recent)
+        written = 0
         for day in [*recent, *backfill]:
+            # Flushed per day rather than accumulated: a `stress` day alone is
+            # ~1.7 MB, so a 20-day run would otherwise hold tens of MB of
+            # payload in memory before the first insert.
+            day_rows: list[dict[str, Any]] = []
             for kind in self.DAY_DOCUMENT_KINDS:
-                if day not in recent_days:
-                    # A historic day fetches only the cheap kinds, and only the
-                    # ones it is missing, so a half-filled day does not spend
-                    # the run's budget restating itself.
-                    if kind not in self.BACKFILL_DOCUMENT_KINDS or (kind, day) in stored_keys:
-                        continue
-                rows.append(
+                # A recent day is always refreshed -- an in-progress day still
+                # changes. A historic day fetches only what it is missing, so a
+                # half-filled day does not spend the run's budget restating
+                # itself.
+                if day not in recent_days and (kind, day) in stored_keys:
+                    continue
+                day_rows.append(
                     document_to_row(
                         account=account,
                         kind=kind,
@@ -1171,6 +1176,9 @@ class WhoopPrivateSyncRunner:
                         synced_at=synced_at,
                     )
                 )
+            if day_rows:
+                self._warehouse.insert_whoop_private_documents(day_rows)
+                written += len(day_rows)
         for activity_id, start, _end in self._workout_windows[: config.max_workout_requests]:
             rows.append(
                 document_to_row(
@@ -1184,7 +1192,7 @@ class WhoopPrivateSyncRunner:
             )
         if rows:
             self._warehouse.insert_whoop_private_documents(rows)
-        return len(rows), "snapshot", synced_at
+        return written + len(rows), "snapshot", synced_at
 
     # -- plumbing ------------------------------------------------------
 
