@@ -5251,3 +5251,317 @@ def test_search_text_filters_hits_to_the_requested_priority(warehouse: PostgresW
             )
         assert "unknown priority" in str(excinfo.value)
         warehouse._connection.rollback()
+
+
+# --- marts_ops.slack_conversation_health --------------------------------------
+
+
+def _health_conversation_row(
+    conversation_id: str,
+    conversation_type: str,
+    *,
+    synced_at: datetime,
+) -> dict:
+    return {
+        "account": "zrl",
+        "team_id": "T1",
+        "conversation_id": conversation_id,
+        "conversation_type": conversation_type,
+        "name": conversation_id.lower(),
+        "is_channel": 1 if conversation_type.endswith("channel") else 0,
+        "is_group": 0,
+        "is_im": 1 if conversation_type == "im" else 0,
+        "is_mpim": 1 if conversation_type == "mpim" else 0,
+        "is_private": 0,
+        "is_archived": 0,
+        "is_member": 1,
+        "creator": "U1",
+        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "topic": "",
+        "purpose": "",
+        "num_members": 3,
+        "raw_json": "{}",
+        "synced_at": synced_at,
+        "sync_version": 1,
+    }
+
+
+def test_slack_conversation_health_catches_a_discovery_walk_that_never_advances(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The exact production failure: page-1-only conversation discovery.
+
+    ``conversations.list`` was re-read from page 1 on every metadata run and
+    stopped after one page, so only the first 200 conversations of a type were
+    ever re-stamped. 172 group DMs and 1,948 public channels created after the
+    last full walk were never discovered at all, and because the freshness pass
+    reads *cached* conversation rows they were never polled for messages either.
+
+    marts_ops.pipeline_health could not see it: it aggregates Slack as one
+    pipeline, and ~19k public-channel messages a day kept it green. The signal
+    that works is per type and is about the *sync attempt*, not the messages —
+    mpim legitimately has zero-message days, but a conversation whose metadata
+    has not been re-stamped in three months is always a broken walk.
+    """
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    fresh = now - timedelta(minutes=30)
+    ancient = now - timedelta(days=98)
+
+    warehouse.insert_slack_conversations(
+        [
+            # A healthy type: the whole list was walked recently.
+            _health_conversation_row("D1", "im", synced_at=fresh),
+            _health_conversation_row("D2", "im", synced_at=fresh),
+            # mpim: only page 1 got re-stamped; the tail is frozen in May.
+            _health_conversation_row("C_PAGE1", "mpim", synced_at=fresh),
+            _health_conversation_row("C_TAIL_A", "mpim", synced_at=ancient),
+            _health_conversation_row("C_TAIL_B", "mpim", synced_at=ancient),
+        ]
+    )
+
+    rows = {
+        row[0]: row[1:]
+        for row in warehouse._query(
+            """
+            SELECT conversation_type, conversation_count, status,
+                   oldest_conversation_synced_at, newest_conversation_synced_at
+            FROM @marts_ops_slack_conversation_health
+            WHERE account = 'zrl'
+            ORDER BY conversation_type
+            """
+        )
+    }
+
+    assert rows["im"][1] == "ok"
+    assert rows["mpim"][0] == 3
+    assert rows["mpim"][1] == "stale", "a three-month-old discovery walk must not read as ok"
+    # The newest stamp alone looks perfectly healthy — that is why the view
+    # judges the OLDEST one. Reporting max(synced_at) is what let page-1-only
+    # discovery hide behind a fresh-looking timestamp for three months.
+    assert rows["mpim"][3] >= fresh - timedelta(minutes=1)
+
+
+def test_slack_conversation_health_reports_the_discovery_cursor(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A resumable walk's cursor is the evidence that discovery is advancing."""
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    warehouse.insert_slack_conversations(
+        [_health_conversation_row("C1", "mpim", synced_at=now - timedelta(minutes=5))]
+    )
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation_list",
+        object_id="mpim",
+        cursor_ts="page12",
+        last_sync_type="conversation_refresh",
+        status="ok",
+        error="",
+        updated_at=now - timedelta(minutes=5),
+        sync_version=1,
+    )
+
+    rows = warehouse._query(
+        """
+        SELECT conversation_type, discovery_cursor, status
+        FROM @marts_ops_slack_conversation_health
+        WHERE account = 'zrl' AND conversation_type = 'mpim'
+        """
+    )
+    assert rows == [("mpim", "page12", "ok")]
+
+
+# --- marts_slack.huddles -------------------------------------------------------
+
+
+def test_slack_huddles_view_extracts_participants_and_duration(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Huddle *metadata* is capturable, and was already being stored.
+
+    Slack has no API that lists huddles and none that exposes huddle audio or
+    Slack-AI huddle notes, so it is easy to conclude huddles are entirely
+    missing from the warehouse. They are not: a huddle posts a message with
+    subtype 'huddle_thread' whose payload carries a `room` object with
+    created_by, date_start, date_end and the full participant_history. 5,942 of
+    them were already sitting in base_slack.messages.raw_json, unreadable
+    without hand-parsing JSON.
+
+    What genuinely is NOT in PDW is what was *said* in a huddle. Absence of a
+    decision in the warehouse is therefore never evidence it was not made.
+    """
+    warehouse.ensure_slack_tables()
+    now = datetime(2026, 8, 20, 15, 0, tzinfo=UTC)
+    payload = {
+        "metadata": {"event_type": "slack_system.huddle.started"},
+        "room": {
+            "id": "R0EXAMPLE",
+            "name": "sync on the ledger",
+            "created_by": "UZACH",
+            "date_start": 1787530888,
+            "date_end": 1787537706,
+            "has_ended": True,
+            "call_family": "huddle",
+            "huddle_link": "https://app.slack.com/huddle/E1/C1",
+            "participant_history": ["UZACH", "UMAX", "UDEV"],
+            "channels": ["C1"],
+        },
+    }
+    warehouse.insert_slack_messages(
+        [
+            {
+                "account": "zrl",
+                "team_id": "T1",
+                "conversation_id": "C1",
+                "message_ts": "1787530888.415919",
+                "message_datetime": now,
+                "thread_ts": "1787530888.415919",
+                "parent_message_ts": "",
+                "user_id": "UZACH",
+                "bot_id": "",
+                "username": "",
+                "type": "message",
+                "subtype": "huddle_thread",
+                "text": "A huddle started",
+                "blocks_json": "[]",
+                "attachments_json": "[]",
+                "is_thread_parent": 1,
+                "is_thread_reply": 0,
+                "reply_count": 3,
+                "reply_users_count": 3,
+                "latest_reply_ts": "",
+                "edited_ts": "",
+                "client_msg_id": "",
+                "is_deleted": 0,
+                "raw_json": json.dumps(payload),
+                "synced_at": now,
+                "sync_version": 1,
+            }
+        ]
+    )
+
+    rows = warehouse._query(
+        """
+        SELECT huddle_id, huddle_name, created_by, participant_count,
+               duration_seconds, participant_user_ids
+        FROM @marts_slack_huddles
+        WHERE account = 'zrl'
+        """
+    )
+    assert len(rows) == 1
+    huddle_id, name, created_by, participants, duration, user_ids = rows[0]
+    assert huddle_id == "R0EXAMPLE"
+    assert name == "sync on the ledger"
+    assert created_by == "UZACH"
+    assert participants == 3
+    # date_start/date_end are epoch INTEGERS inside the JSON payload, not the
+    # timestamps the rest of the warehouse uses; the view converts them so a
+    # caller never has to know that.
+    assert duration == 1787537706 - 1787530888
+    assert sorted(user_ids) == ["UDEV", "UMAX", "UZACH"]
+
+
+def test_slack_huddles_view_reports_an_unfinished_huddle_as_null_not_the_epoch(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A live huddle has no end. It must read NULL, not 1970 and not a duration."""
+    warehouse.ensure_slack_tables()
+    now = datetime(2026, 8, 20, 15, 0, tzinfo=UTC)
+    payload = {
+        "room": {
+            "id": "R0LIVE",
+            "name": "",
+            "created_by": "UZACH",
+            "date_start": 1787530888,
+            "date_end": 0,
+            "has_ended": False,
+            "participant_history": ["UZACH"],
+        }
+    }
+    warehouse.insert_slack_messages(
+        [
+            {
+                "account": "zrl",
+                "team_id": "T1",
+                "conversation_id": "C1",
+                "message_ts": "1787530999.000100",
+                "message_datetime": now,
+                "thread_ts": "",
+                "parent_message_ts": "",
+                "user_id": "UZACH",
+                "bot_id": "",
+                "username": "",
+                "type": "message",
+                "subtype": "huddle_thread",
+                "text": "A huddle started",
+                "blocks_json": "[]",
+                "attachments_json": "[]",
+                "is_thread_parent": 0,
+                "is_thread_reply": 0,
+                "reply_count": 0,
+                "reply_users_count": 0,
+                "latest_reply_ts": "",
+                "edited_ts": "",
+                "client_msg_id": "",
+                "is_deleted": 0,
+                "raw_json": json.dumps(payload),
+                "synced_at": now,
+                "sync_version": 1,
+            }
+        ]
+    )
+
+    rows = warehouse._query(
+        """
+        SELECT ended_at, duration_seconds, has_ended
+        FROM @marts_slack_huddles
+        WHERE account = 'zrl' AND huddle_id = 'R0LIVE'
+        """
+    )
+    assert rows == [(None, None, 0)]
+
+
+def test_slack_conversation_list_cursor_reset_survives_the_upsert(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A finished walk must be able to say so through the real upsert.
+
+    ops.slack_sync_state preserves a non-empty ``cursor_ts`` against an empty
+    write, deliberately: a per-conversation error row records status/error with
+    no cursor and must not wipe the message high-water mark from the last
+    successful page. That rule also silently swallows "the walk finished, start
+    over" if completion is expressed by blanking the cursor — the row keeps the
+    last page's cursor and discovery stays pinned to the end of the list
+    forever, never cycling back to re-stamp older conversations. Completion is
+    therefore carried by `status`, which has no preserve rule.
+    """
+    warehouse.ensure_slack_tables()
+    now = datetime(2026, 8, 24, 3, 0, tzinfo=UTC)
+    common = dict(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation_list",
+        object_id="mpim",
+        last_sync_type="conversation_refresh",
+        error="",
+        sync_version=1,
+    )
+    warehouse.insert_slack_sync_state(cursor_ts="page14", status="ok", updated_at=now, **common)
+    warehouse.insert_slack_sync_state(
+        cursor_ts="", status="complete", updated_at=now + timedelta(minutes=1), **common
+    )
+
+    rows = warehouse._query(
+        """
+        SELECT cursor_ts, status FROM @slack_sync_state
+        WHERE object_type = 'conversation_list' AND object_id = 'mpim'
+        """
+    )
+    cursor_ts, status = rows[0]
+    # The cursor is preserved by design...
+    assert cursor_ts == "page14"
+    # ...so the status is the only thing that can mean "begin a new cycle".
+    assert status == "complete"

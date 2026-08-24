@@ -150,7 +150,11 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # contract -- the marts layer itself had no coverage at all) and
         # marts_ops.collation_health, over ops.mart_view_health and
         # ops.collation_health.
-        "marts": 35,
+        # +2 marts: marts_ops.slack_conversation_health (per-conversation-type
+        # discovery freshness -- pipeline_health rolls Slack up as one pipeline
+        # and cannot see one type stall) and marts_slack.huddles (huddle
+        # metadata parsed out of the huddle_thread message payload).
+        "marts": 37,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +1 internal: internal.search_text_preview, the
         # match-windowed preview helper both search functions use.

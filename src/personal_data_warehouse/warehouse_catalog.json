@@ -1376,6 +1376,18 @@
       "secret": false
     },
     {
+      "id": "marts_slack_huddles",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "slack",
+      "schema": "marts_slack",
+      "name": "huddles",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "One row per Slack huddle \u2014 who started it, when it started and ended, and every participant \u2014 parsed from the huddle_thread message Slack posts in the channel. METADATA ONLY: nothing said in a huddle is in PDW, so absence of a decision here is never evidence it was not made."
+    },
+    {
       "id": "slack_image_fingerprints",
       "kind": "view",
       "layer": "marts",
@@ -2080,6 +2092,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "One row per linked Plaid Item, naming the institution and accounts that stop updating when it breaks. status = 'action_required' means re-run `pdw ingest plaid link` for that institution."
+    },
+    {
+      "id": "marts_ops_slack_conversation_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "slack_conversation_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Slack sync health per conversation type (im/mpim/private_channel/public_channel). Judges the OLDEST conversation metadata stamp, because that is what a bounded discovery walk has to keep cycling; marts_ops.pipeline_health aggregates Slack as one pipeline and cannot see one type stall. Message ages are context only \u2014 mpim legitimately has zero-message days."
     },
     {
       "id": "marts_transaction_receipts",

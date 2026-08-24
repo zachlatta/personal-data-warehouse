@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 import os
 
@@ -18,7 +19,12 @@ from dagster import (
 from personal_data_warehouse.build_info import build_metadata
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
-from personal_data_warehouse.slack_sync import SlackSyncRunner, SlackSyncSummary
+from personal_data_warehouse.slack_sync import (
+    SLACK_CONVERSATION_LIST_COMPLETE,
+    SLACK_CONVERSATION_LIST_STATE_TYPE,
+    SlackSyncRunner,
+    SlackSyncSummary,
+)
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
@@ -134,7 +140,7 @@ def run_slack_metadata_sync(
     if respect_interval and current_time.minute % _int_env("SLACK_ASSET_METADATA_EVERY_MINUTES", 15) != 0:
         return summaries
 
-    metadata_conversation_types = _metadata_conversation_types_for_time(current_time)
+    metadata_conversation_types = _metadata_conversation_types(warehouse=warehouse, now=current_time)
     summaries.extend(
         SlackSyncRunner(
             settings=settings,
@@ -143,7 +149,7 @@ def run_slack_metadata_sync(
             sync_users=False,
             sync_members=False,
             conversation_types=metadata_conversation_types,
-            conversation_page_limit=_int_env("SLACK_ASSET_METADATA_CONVERSATION_PAGE_LIMIT", 1),
+            conversation_page_limit=_int_env("SLACK_ASSET_METADATA_CONVERSATION_PAGE_LIMIT", 5),
             sync_conversations_only=True,
             sync_thread_replies=False,
             max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
@@ -246,14 +252,64 @@ def run_slack_member_sync(*, settings, warehouse, logger) -> list[SlackSyncSumma
     ).sync_all()
 
 
+METADATA_CONVERSATION_TYPE_ORDER = (
+    ("im",),
+    ("mpim",),
+    ("private_channel",),
+    ("public_channel",),
+)
+
+
 def _metadata_conversation_types_for_time(now: datetime) -> tuple[str, ...]:
     stage = ((now.hour * 60) + now.minute) // _int_env("SLACK_ASSET_METADATA_EVERY_MINUTES", 15)
-    return (
-        ("im",),
-        ("mpim",),
-        ("private_channel",),
-        ("public_channel",),
-    )[stage % 4]
+    return METADATA_CONVERSATION_TYPE_ORDER[stage % 4]
+
+
+def _metadata_conversation_types(*, warehouse, now: datetime) -> tuple[str, ...]:
+    """Pick the conversation type whose discovery walk is furthest behind.
+
+    A wall-clock rotation hands each type one 15-minute slot per hour and
+    forfeits it whenever that particular run loses the shared Slack lock. In
+    production most metadata runs lost the lock, so mpim discovery went 11.5
+    hours between refreshes. Choosing from persisted state instead means a lost
+    slot is simply picked up by the next metadata run, whenever it wins the lock.
+    """
+    states = _conversation_list_states(warehouse)
+    if states is None:
+        return _metadata_conversation_types_for_time(now)
+
+    def rank(conversation_types: tuple[str, ...]) -> tuple[int, float]:
+        state = states.get(",".join(conversation_types))
+        if state is None:
+            # Never walked: nothing of this type has ever been discovered.
+            return (0, 0.0)
+        # A walk that has not reached the end of the list is part-way through it,
+        # and the newest conversations live on its last pages — finish it before
+        # rotating away. Completion is carried by `status`, not by a blank cursor.
+        mid_walk = str(state.get("status") or "") != SLACK_CONVERSATION_LIST_COMPLETE
+        updated_at = state.get("updated_at")
+        updated = updated_at.timestamp() if isinstance(updated_at, datetime) else 0.0
+        return (0 if mid_walk else 1, updated)
+
+    return min(METADATA_CONVERSATION_TYPE_ORDER, key=rank)
+
+
+def _conversation_list_states(warehouse) -> dict[str, Mapping[str, object]] | None:
+    # Scoped loader by preference: the full-table one materialises 1.1M rows.
+    loader = getattr(warehouse, "load_slack_conversation_list_state", None) or getattr(
+        warehouse, "load_slack_sync_state", None
+    )
+    if loader is None:
+        return None
+    try:
+        rows = loader()
+    except Exception:  # pragma: no cover - a monitoring read must never break sync
+        return None
+    return {
+        str(object_id): state
+        for (_account, _team_id, object_type, object_id), state in rows.items()
+        if object_type == SLACK_CONVERSATION_LIST_STATE_TYPE and isinstance(state, Mapping)
+    }
 
 
 def run_intelligent_slack_sync(*, settings, warehouse, logger, now: datetime | None = None) -> list[SlackSyncSummary]:

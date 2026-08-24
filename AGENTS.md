@@ -2018,3 +2018,93 @@ pdw sql --output json -q "slack fingerprint coverage" \
 
 End-to-end check against real Slack bytes in a throwaway schema (writes nothing to prod):
 `uv run python scripts/verify_slack_image_lookup.py --file-id <F...> [--probe copy.png]`.
+
+## Slack conversation discovery, and the page-1 trap
+
+**Slack sync has two independent halves, and only one of them was ever monitored.**
+`conversations.list` *discovers* conversations into `base_slack.conversations`; every other
+stage (freshness, coverage, read-state, members) then runs off those **cached** rows with
+`use_existing_conversations=True`. So a conversation that discovery never sees is not
+merely stale — it is invisible to every downstream stage forever, and no amount of healthy
+message throughput anywhere else will reveal it.
+
+Discovery walks the list in bounded slices, `SLACK_ASSET_METADATA_CONVERSATION_PAGE_LIMIT`
+pages per metadata run. Until 2026-08-24 that walk **restarted at page 1 on every run and
+stopped after one page**, because no cursor was persisted. Measured against the live Slack
+API that day, the damage was:
+
+| type | live | missing from the warehouse |
+| --- | --- | --- |
+| `mpim` | 2,788 | **172** — every group DM created after 2026-05-18 |
+| `public_channel` | 13,157 | **1,948** — essentially every channel created after 2026-05-18 |
+| `im` | 3,628 | 0 |
+| `private_channel` | 114 | 0 |
+
+1,181 real messages existed in Slack and nowhere in PDW. `im` and `private_channel`
+survived only by luck — 114 private channels fit inside one 200-row page, and page 1 of the
+`im` list happens to carry the newest DMs. For `mpim`, page 1 is the *oldest* 200 and every
+new group DM lands on pages 12-13, which the walk could never reach. 2,354 of 2,597 mpim
+rows still carried `synced_at = 2026-05-18T15:34:34Z`, the last full multi-page walk.
+
+Three things now hold this up, and the second is the one that is easy to undo:
+
+- **The walk is resumable.** `_refresh_active_conversations` stores its `conversations.list`
+  cursor in `ops.slack_sync_state` under `object_type = 'conversation_list'` (`object_id` is
+  the conversation type), resumes from it, and stores `''` at the end of the list so the next
+  pass starts over and keeps cycling. A cursor Slack rejects (`invalid_cursor`) restarts the
+  walk rather than wedging that type.
+- **The rotation is driven by state, not the wall clock.** `_metadata_conversation_types`
+  picks the type whose walk is furthest behind, preferring one that is mid-walk. The old
+  `minute // 15 % 4` rotation gave each type one 15-minute slot per hour and **silently
+  forfeited it whenever that run lost the shared Slack lock** — a lock-starved stage still
+  returns `MaterializeResult` with `skipped_due_to_lock: true` and a green run, so six of
+  every eight metadata runs did nothing and mpim metadata went 11.5 hours between refreshes.
+  Reverting to a clock rotation reintroduces that.
+- **`marts_ops.slack_conversation_health` judges the OLDEST stamp, per type.** This is the
+  detector that was missing. `marts_ops.pipeline_health` aggregates Slack as a single
+  pipeline and ~19k public-channel messages a day kept it `ok` with `state_error_rows = 0`
+  through a total group-DM outage.
+
+```sql
+SELECT conversation_type, conversation_count, status,
+       oldest_conversation_synced_at, discovery_age_seconds, discovery_cursor
+FROM marts_ops.slack_conversation_health ORDER BY status, conversation_type;
+```
+
+**Read `oldest_conversation_synced_at`, never `newest_`.** A page-1-only walk re-stamps the
+first 200 rows every hour, so `max(synced_at)` looks perfect while the tail is months old;
+that is exactly how this hid for three months. And the status is deliberately about the
+**sync attempt**, not about messages: mpim had eleven legitimate zero-message days between
+2026-07-11 and 2026-08-18, so alerting on "no group DM messages" is a guaranteed false
+positive, while "no conversation of this type has been re-listed in three months" has no
+innocent explanation.
+
+## Slack huddles: metadata yes, content no
+
+**Huddle metadata is in the warehouse; huddle content never will be.** It is easy to
+conclude huddles are missing entirely — Slack publishes no API that lists them, and none
+that exposes huddle audio or Slack-AI huddle notes. But every huddle posts a message with
+`subtype = 'huddle_thread'` whose payload carries a `room` object with `created_by`,
+`date_start`, `date_end`, `has_ended` and the full `participant_history`. 5,942 of those
+were already being ingested, unreachable only because they sat inside `raw_json`.
+
+`marts_slack.huddles` is that, parsed: one row per huddle with `huddle_id`, `huddle_name`,
+`created_by`, `started_at`, `ended_at`, `duration_seconds`, `participant_user_ids`,
+`participant_count`, and the conversation it happened in.
+
+```sql
+SELECT started_at, conversation_name, huddle_name, duration_seconds, participant_count
+FROM marts_slack.huddles
+WHERE 'U09UE480JHH' = ANY(participant_user_ids)
+ORDER BY started_at DESC LIMIT 20;
+```
+
+Two traps. `date_start`/`date_end` are epoch **integers** inside the JSON, not the
+`timestamptz` the rest of the warehouse uses, and a huddle still running carries `0` — the
+view converts both, reporting a live huddle as `ended_at IS NULL` rather than 1970 or a
+negative duration. And a huddle's `participant_history` is everyone who ever joined, not
+who was there at any one moment.
+
+**What was said in a huddle is not in PDW and cannot be made to be.** Zach makes real
+decisions in huddles, so absence of a decision in the warehouse is never evidence that the
+decision was not made. Say so rather than reporting a confident negative.

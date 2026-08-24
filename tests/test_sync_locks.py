@@ -371,7 +371,10 @@ def test_slack_metadata_sync_refreshes_one_conversation_type(monkeypatch) -> Non
     assert len(summaries) == 1
     assert calls[0]["sync_conversations_only"] is True
     assert calls[0]["conversation_types"] == ("mpim",)
-    assert calls[0]["conversation_page_limit"] == 1
+    # A bounded slice per run, but wide enough that a resumable walk cycles the
+    # whole list in a few runs rather than a day. Page 1 alone is what left 172
+    # group DMs and 1,948 public channels undiscovered for three months.
+    assert calls[0]["conversation_page_limit"] == 5
 
 
 def test_slack_user_sync_refreshes_all_users_without_messages(monkeypatch) -> None:

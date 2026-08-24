@@ -1173,6 +1173,32 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "slack_messages",
         "CREATE INDEX IF NOT EXISTS slack_messages_synced_at_idx ON @slack_messages (synced_at)",
     ),
+    # The freshness collector refuses max() over a large heap unless an index
+    # leads with the column, so without this base_slack.message_reactions (1.5 GiB)
+    # reported probe_status 'skipped_unindexed' and had no freshness signal at
+    # all — a reaction backlog could freeze indefinitely and nothing would say so.
+    # marts_slack.huddles filters 45M messages down to ~6k huddle_thread rows.
+    # Without this the view is a 6.1M-buffer parallel seq scan measured at 30.4s,
+    # which no read budget tolerates and which the mart-view health probe would
+    # run every ten minutes. The partial index covers 0.013% of the heap.
+    # The metadata stage reads only the conversations.list walk cursors (four
+    # rows). slack_state_scope_idx leads with (account, team_id), so filtering on
+    # object_type alone would seq-scan a 363 MB heap every 15 minutes.
+    IndexSpec(
+        "slack_sync_state_conversation_list_idx",
+        "slack_sync_state",
+        "CREATE INDEX IF NOT EXISTS slack_sync_state_conversation_list_idx ON @slack_sync_state (object_type, object_id) WHERE object_type = 'conversation_list'",
+    ),
+    IndexSpec(
+        "slack_messages_huddle_idx",
+        "slack_messages",
+        "CREATE INDEX IF NOT EXISTS slack_messages_huddle_idx ON @slack_messages (message_datetime DESC) WHERE subtype = 'huddle_thread'",
+    ),
+    IndexSpec(
+        "slack_message_reactions_synced_at_idx",
+        "slack_message_reactions",
+        "CREATE INDEX IF NOT EXISTS slack_message_reactions_synced_at_idx ON @slack_message_reactions (synced_at)",
+    ),
     IndexSpec(
         "slack_messages_recent_scope_time_idx",
         "slack_messages",
@@ -4689,6 +4715,8 @@ class PostgresWarehouse:
         self._ensure_slack_sync_state_gone_reclassified()
         self._ensure_clean_slack_inbox_view()
         self._ensure_slack_image_fingerprint_view()
+        self._ensure_slack_huddles_view()
+        self._ensure_slack_conversation_health_view()
         self._ensure_search_views_if_possible()
 
     def ensure_upstream_mutation_tables(self) -> None:
@@ -7614,6 +7642,36 @@ class PostgresWarehouse:
             SYNC_STATE_COLUMNS,
         )
 
+    def load_slack_conversation_list_state(self) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+        """Just the conversations.list walk cursors — at most one row per type.
+
+        The metadata stage picks which conversation type to walk from this state,
+        and it must not pay for load_slack_sync_state()'s full-table read to do
+        it: ops.slack_sync_state is 1.1M rows / 363 MB, and that whole dict is
+        already materialised once per stage. The partial index keeps this a
+        four-row lookup instead of a seq scan over the heap.
+        """
+        columns = (
+            "account",
+            "team_id",
+            "object_type",
+            "object_id",
+            "cursor_ts",
+            "last_sync_type",
+            "status",
+            "error",
+            "updated_at",
+        )
+        rows = self._query(
+            f"SELECT {', '.join(_identifier(column) for column in columns)} FROM @slack_sync_state "
+            "WHERE object_type = %s",
+            ("conversation_list",),
+        )
+        return {
+            (str(row[0]), str(row[1]), str(row[2]), str(row[3])): dict(zip(columns, row, strict=True))
+            for row in rows
+        }
+
     def load_slack_sync_state(self) -> dict[tuple[str, str, str, str], dict[str, Any]]:
         columns = (
             "account",
@@ -8050,6 +8108,170 @@ class PostgresWarehouse:
             ["slack_files", "slack_users", "slack_conversations", "slack_file_fingerprints", "media_fingerprints"]
         )
         self._ensure_slack_image_fingerprint_view()
+
+    # Slack publishes no API that lists huddles, and none that exposes huddle
+    # audio or Slack-AI huddle notes — which makes it easy to conclude that
+    # huddles are simply absent from the warehouse. Their METADATA is not: every
+    # huddle posts a message with subtype 'huddle_thread' whose payload carries a
+    # `room` object with created_by, date_start, date_end and the full
+    # participant_history. Those rows were already being ingested and were only
+    # unreachable because they sat inside raw_json.
+    #
+    # What is genuinely missing is the huddle's CONTENT. Nothing said in a huddle
+    # reaches PDW, so absence of a decision in the warehouse is never evidence
+    # that the decision was not made — this view exists partly so that gap is
+    # visible rather than inferred.
+    #
+    # date_start / date_end are epoch INTEGERS inside the JSON, not the
+    # timestamptz the rest of the warehouse uses, and a huddle still running
+    # carries 0. Both are normalised here so no caller has to know that.
+    def _ensure_slack_huddles_view(self) -> None:
+        self._ensure_view(
+            "marts_slack_huddles",
+            """
+            CREATE OR REPLACE VIEW @marts_slack_huddles AS
+            WITH huddle AS (
+                SELECT
+                    m.account,
+                    m.team_id,
+                    m.conversation_id,
+                    m.message_ts,
+                    m.message_datetime,
+                    m.user_id,
+                    m.reply_count,
+                    (m.raw_json::jsonb -> 'room') AS room
+                FROM @slack_messages AS m
+                WHERE m.subtype = 'huddle_thread'
+                  AND m.is_deleted = 0
+                  AND m.raw_json <> ''
+                  AND jsonb_typeof(m.raw_json::jsonb -> 'room') = 'object'
+            )
+            SELECT
+                h.account,
+                h.team_id,
+                h.conversation_id,
+                COALESCE(c.name, '') AS conversation_name,
+                COALESCE(c.conversation_type, '') AS conversation_type,
+                h.message_ts,
+                COALESCE(h.room ->> 'id', '') AS huddle_id,
+                COALESCE(h.room ->> 'name', '') AS huddle_name,
+                COALESCE(NULLIF(h.room ->> 'created_by', ''), h.user_id) AS created_by,
+                h.message_datetime AS posted_at,
+                to_timestamp(NULLIF((h.room ->> 'date_start'), '')::bigint) AS started_at,
+                to_timestamp(NULLIF(NULLIF((h.room ->> 'date_end'), ''), '0')::bigint) AS ended_at,
+                (NULLIF(NULLIF((h.room ->> 'date_end'), ''), '0')::bigint
+                    - NULLIF((h.room ->> 'date_start'), '')::bigint) AS duration_seconds,
+                CASE WHEN (h.room ->> 'has_ended')::boolean THEN 1 ELSE 0 END::bigint AS has_ended,
+                COALESCE(participants.user_ids, ARRAY[]::text[]) AS participant_user_ids,
+                COALESCE(array_length(participants.user_ids, 1), 0)::bigint AS participant_count,
+                h.reply_count AS thread_message_count,
+                COALESCE(h.room ->> 'huddle_link', '') AS huddle_link
+            FROM huddle AS h
+            LEFT JOIN LATERAL (
+                SELECT array_agg(DISTINCT value) AS user_ids
+                FROM jsonb_array_elements_text(
+                    CASE
+                        WHEN jsonb_typeof(h.room -> 'participant_history') = 'array'
+                            THEN h.room -> 'participant_history'
+                        ELSE '[]'::jsonb
+                    END
+                ) AS value
+            ) AS participants ON TRUE
+            LEFT JOIN @slack_conversations AS c
+                   ON c.account = h.account
+                  AND c.team_id = h.team_id
+                  AND c.conversation_id = h.conversation_id
+            """,
+        )
+
+    # Per conversation type, because Slack is one pipeline in
+    # marts_ops.pipeline_health and ~19k public-channel messages a day kept that
+    # row green while group-DM ingestion was completely dead. Two things are
+    # deliberate here:
+    #
+    #  * The status is judged on the OLDEST conversation metadata stamp, not the
+    #    newest. Discovery walks conversations.list in bounded slices, so a
+    #    healthy walk keeps cycling and every conversation gets re-stamped within
+    #    a cycle. When the walk restarted at page 1 every run, max(synced_at)
+    #    stayed perpetually fresh (the first 200 rows were re-stamped hourly)
+    #    while min(synced_at) sat frozen in May and 2,120 conversations created
+    #    after it were never discovered at all. Only the oldest stamp saw that.
+    #  * Message ages are reported but never drive the status. mpim genuinely has
+    #    zero-message days — eleven of them between 2026-07-11 and 2026-08-18 —
+    #    so alerting on "no group DM messages" is a guaranteed false positive.
+    #    "No sync attempt" has no such excuse.
+    #
+    # Expected cycle intervals are per type because list sizes differ by two
+    # orders of magnitude (114 private channels versus ~13k public ones), so one
+    # threshold would either cry wolf on public_channel or never fire on mpim.
+    def _ensure_slack_conversation_health_view(self) -> None:
+        self._ensure_view(
+            "marts_ops_slack_conversation_health",
+            """
+            CREATE OR REPLACE VIEW @marts_ops_slack_conversation_health AS
+            WITH expected(conversation_type, cycle_seconds) AS (
+                VALUES
+                    ('im', 172800::bigint),
+                    ('mpim', 172800::bigint),
+                    ('private_channel', 172800::bigint),
+                    ('public_channel', 432000::bigint)
+            ),
+            per_type AS (
+                SELECT
+                    c.account,
+                    c.team_id,
+                    c.conversation_type,
+                    count(*)::bigint AS conversation_count,
+                    min(c.synced_at) AS oldest_conversation_synced_at,
+                    max(c.synced_at) AS newest_conversation_synced_at,
+                    max(s.latest_message_at) AS newest_message_at
+                FROM @slack_conversations AS c
+                LEFT JOIN @slack_conversation_stats AS s
+                       ON s.account = c.account
+                      AND s.team_id = c.team_id
+                      AND s.conversation_id = c.conversation_id
+                WHERE c.conversation_type <> ''
+                GROUP BY c.account, c.team_id, c.conversation_type
+            )
+            SELECT
+                p.account,
+                p.team_id,
+                p.conversation_type,
+                p.conversation_count,
+                p.oldest_conversation_synced_at,
+                p.newest_conversation_synced_at,
+                (EXTRACT(EPOCH FROM now() - p.oldest_conversation_synced_at))::bigint
+                    AS discovery_age_seconds,
+                COALESCE(e.cycle_seconds, 172800) AS expected_cycle_seconds,
+                CASE
+                    WHEN st.status = 'complete' THEN ''
+                    ELSE COALESCE(st.cursor_ts, '')
+                END AS discovery_cursor,
+                COALESCE(st.status, '') AS discovery_status,
+                st.updated_at AS last_discovery_at,
+                NULLIF(p.newest_message_at, '1970-01-01 00:00:00+00'::timestamptz)
+                    AS newest_message_at,
+                (EXTRACT(
+                    EPOCH FROM now()
+                    - NULLIF(p.newest_message_at, '1970-01-01 00:00:00+00'::timestamptz)
+                ))::bigint AS message_age_seconds,
+                CASE
+                    WHEN p.oldest_conversation_synced_at IS NULL THEN 'unknown'
+                    WHEN now() - p.oldest_conversation_synced_at
+                         > make_interval(secs => COALESCE(e.cycle_seconds, 172800) * 3) THEN 'stale'
+                    WHEN now() - p.oldest_conversation_synced_at
+                         > make_interval(secs => COALESCE(e.cycle_seconds, 172800)) THEN 'late'
+                    ELSE 'ok'
+                END AS status
+            FROM per_type AS p
+            LEFT JOIN expected AS e ON e.conversation_type = p.conversation_type
+            LEFT JOIN @slack_sync_state AS st
+                   ON st.account = p.account
+                  AND st.team_id = p.team_id
+                  AND st.object_type = 'conversation_list'
+                  AND st.object_id = p.conversation_type
+            """,
+        )
 
     def _ensure_slack_image_fingerprint_view(self) -> None:
         self._ensure_view(

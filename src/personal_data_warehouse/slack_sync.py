@@ -15,6 +15,24 @@ from slack_sdk.errors import SlackApiError, SlackRequestError
 from personal_data_warehouse.config import Settings, SlackAccount, load_settings
 
 SLACK_CONVERSATION_TYPES = "public_channel,private_channel,mpim,im"
+
+# Discovery walks conversations.list one bounded slice per run and remembers where
+# it stopped under this object_type in ops.slack_sync_state (object_id is the
+# conversation type). Without that memory every run re-reads page 1 and any
+# conversation past it is never discovered.
+SLACK_CONVERSATION_LIST_STATE_TYPE = "conversation_list"
+
+# The end of a conversations.list walk cannot be recorded by storing an empty
+# cursor: ops.slack_sync_state.cursor_ts is upsert-preserved against empty values
+# so that a per-conversation error row cannot wipe the message high-water mark
+# from the last successful page. Writing "" there is silently a no-op, which
+# would leave the walk pinned to the final page forever, never cycling back to
+# re-stamp older conversations. The completed walk is therefore recorded in
+# `status`, which has no such rule.
+SLACK_CONVERSATION_LIST_COMPLETE = "complete"
+
+# Slack rejects an expired/garbled pagination cursor with these codes.
+SLACK_INVALID_CURSOR_CODES = frozenset({"invalid_cursor", "invalid_arguments"})
 DEFAULT_SLACK_API_TIMEOUT_SECONDS = 30
 
 # Slack error codes returned by conversations.* when a channel is no longer
@@ -233,6 +251,7 @@ class SlackSyncRunner:
                 team_id=team_id,
                 client=client,
                 synced_at=synced_at,
+                state_by_key=state_by_key,
             )
             return SlackSyncSummary(
                 account=account.account,
@@ -705,16 +724,83 @@ class SlackSyncRunner:
         team_id: str,
         client,
         synced_at: datetime,
+        state_by_key: Mapping[tuple[str, str, str, str], Any] | None = None,
     ) -> list[object]:
-        conversations: list[object] = []
         types = ",".join(self._conversation_types) if self._conversation_types else SLACK_CONVERSATION_TYPES
-        for page_index, page in enumerate(
-            iter_cursor_pages(
+        start_cursor = self._stored_conversation_list_cursor(
+            account=account, team_id=team_id, types=types, state_by_key=state_by_key
+        )
+        try:
+            conversations, next_cursor = self._walk_conversation_list(
+                account=account,
+                team_id=team_id,
+                client=client,
+                synced_at=synced_at,
+                types=types,
+                start_cursor=start_cursor,
+            )
+        except SlackApiCallError as exc:
+            # Slack cursors expire. A rejected one must restart the walk rather
+            # than wedge discovery for this conversation type forever.
+            if not start_cursor or str(getattr(exc, "code", "")) not in SLACK_INVALID_CURSOR_CODES:
+                raise
+            self._logger.warning(
+                "Slack %s conversation cursor was rejected (%s); restarting the walk", types, getattr(exc, "code", "")
+            )
+            conversations, next_cursor = self._walk_conversation_list(
+                account=account,
+                team_id=team_id,
+                client=client,
+                synced_at=synced_at,
+                types=types,
+                start_cursor="",
+            )
+
+        # An empty next cursor means the walk reached the end of the list, so the
+        # next pass starts over at page 1 and keeps cycling. That has to be
+        # recorded in `status` rather than by blanking cursor_ts — see
+        # SLACK_CONVERSATION_LIST_COMPLETE.
+        self._warehouse.insert_slack_sync_state(
+            account=account,
+            team_id=team_id,
+            object_type=SLACK_CONVERSATION_LIST_STATE_TYPE,
+            object_id=types,
+            cursor_ts=next_cursor,
+            last_sync_type="conversation_refresh",
+            status="ok" if next_cursor else SLACK_CONVERSATION_LIST_COMPLETE,
+            error="",
+            updated_at=synced_at,
+            sync_version=sync_version_from_datetime(synced_at),
+        )
+        self._logger.info(
+            "Freshness discovered %s active Slack conversations for %s (%s), next cursor %s",
+            len(conversations),
+            account,
+            types,
+            next_cursor or "<restart>",
+        )
+        return conversations
+
+    def _walk_conversation_list(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        client,
+        synced_at: datetime,
+        types: str,
+        start_cursor: str,
+    ) -> tuple[list[object], str]:
+        conversations: list[object] = []
+        next_cursor = ""
+        for page_index, (page, page_cursor) in enumerate(
+            iter_cursor_pages_with_cursor(
                 client,
                 "conversations.list",
                 "channels",
                 limit=self._settings.slack_page_size,
                 call=self._call,
+                start_cursor=start_cursor,
                 types=types,
                 exclude_archived="true",
             ),
@@ -732,10 +818,30 @@ class SlackSyncRunner:
                 if isinstance(conversation, Mapping)
             ]
             self._warehouse.insert_slack_conversations(rows)
+            next_cursor = page_cursor
+            if not next_cursor:
+                break
             if self._conversation_page_limit is not None and page_index >= self._conversation_page_limit:
                 break
-        self._logger.info("Freshness discovered %s active Slack conversations for %s", len(conversations), account)
-        return conversations
+        return conversations, next_cursor
+
+    def _stored_conversation_list_cursor(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        types: str,
+        state_by_key: Mapping[tuple[str, str, str, str], Any] | None,
+    ) -> str:
+        if not state_by_key:
+            return ""
+        state = state_by_key.get((account, team_id, SLACK_CONVERSATION_LIST_STATE_TYPE, types))
+        if not isinstance(state, Mapping):
+            return ""
+        if str(state.get("status") or "") == SLACK_CONVERSATION_LIST_COMPLETE:
+            # The previous walk finished the list; start the next cycle at page 1.
+            return ""
+        return str(state.get("cursor_ts") or "")
 
     def _freshness_oldest_ts(self) -> float:
         window = self._history_window or timedelta(minutes=30)
@@ -1457,6 +1563,32 @@ def iter_cursor_items(
             return
 
 
+def iter_cursor_pages_with_cursor(
+    client,
+    method: str,
+    item_key: str,
+    *,
+    limit: int,
+    call: Callable[..., dict[str, Any]] | None = None,
+    start_cursor: str = "",
+    **params,
+) -> Iterator[tuple[list[object], str]]:
+    """Yield (items, next_cursor) pairs, resuming from ``start_cursor``.
+
+    Exposing the cursor is what lets a *bounded* walk (one that stops after N
+    pages) be resumed by a later run instead of restarting at page 1 forever.
+    """
+    cursor = start_cursor
+    call_fn = call or (lambda current_client, current_method, **current_params: current_client.call(current_method, **current_params))
+    while True:
+        response = call_fn(client, method, limit=limit, cursor=cursor, **params)
+        metadata = response.get("response_metadata") or {}
+        cursor = str(metadata.get("next_cursor") or "")
+        yield list(response.get(item_key, []) or []), cursor
+        if not cursor:
+            return
+
+
 def iter_cursor_pages(
     client,
     method: str,
@@ -1466,15 +1598,8 @@ def iter_cursor_pages(
     call: Callable[..., dict[str, Any]] | None = None,
     **params,
 ) -> Iterator[list[object]]:
-    cursor = ""
-    call_fn = call or (lambda current_client, current_method, **current_params: current_client.call(current_method, **current_params))
-    while True:
-        response = call_fn(client, method, limit=limit, cursor=cursor, **params)
-        yield list(response.get(item_key, []) or [])
-        metadata = response.get("response_metadata") or {}
-        cursor = str(metadata.get("next_cursor") or "")
-        if not cursor:
-            return
+    for page, _cursor in iter_cursor_pages_with_cursor(client, method, item_key, limit=limit, call=call, **params):
+        yield page
 
 
 def chunked_objects(values: list[object], size: int) -> Iterator[list[object]]:

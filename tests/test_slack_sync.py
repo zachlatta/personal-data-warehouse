@@ -2289,3 +2289,232 @@ def thread_state_covers_ref(state, ref):
     if not latest_reply_ts or not cursor_ts:
         return True
     return float(cursor_ts) >= float(latest_reply_ts)
+
+
+def _conversation_refresh_runner(monkeypatch, *, client, warehouse, page_limit=1, types=("mpim",)):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    return SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        conversation_page_limit=page_limit,
+        conversation_types=types,
+        sync_conversations_only=True,
+        sleep=lambda seconds: None,
+    )
+
+
+def _auth_pages():
+    return {
+        "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+        "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+    }
+
+
+def test_conversation_refresh_records_its_next_cursor(monkeypatch):
+    # A bounded metadata pass must remember where it stopped. Without this the
+    # walk restarts at page 1 every run, so a workspace with more conversations
+    # of one type than a single page can never discover the rest: in production
+    # 172 group DMs created after the last full walk were invisible for months.
+    client = FakeSlackClient(
+        {
+            **_auth_pages(),
+            "conversations.list": [
+                {
+                    "ok": True,
+                    "channels": [{"id": "C1", "name": "mpdm-zach--alpha-1", "is_mpim": True}],
+                    "response_metadata": {"next_cursor": "page2"},
+                }
+            ],
+        }
+    )
+    warehouse = FakeWarehouse()
+
+    _conversation_refresh_runner(monkeypatch, client=client, warehouse=warehouse).sync_all()
+
+    cursor_updates = [u for u in warehouse.state_updates if u["object_type"] == "conversation_list"]
+    assert cursor_updates, "the conversation walk must persist its cursor"
+    assert cursor_updates[-1]["object_id"] == "mpim"
+    assert cursor_updates[-1]["cursor_ts"] == "page2"
+    assert cursor_updates[-1]["status"] == "ok"
+
+
+def test_conversation_refresh_resumes_from_the_stored_cursor(monkeypatch):
+    # The regression that hid 172 group DMs: page 1 of conversations.list for
+    # mpim is entirely conversations we already have, and every new one lives on
+    # the last pages. Resuming from the stored cursor is what reaches them.
+    client = FakeSlackClient(
+        {
+            **_auth_pages(),
+            "conversations.list": [
+                {
+                    "ok": True,
+                    "channels": [{"id": "C_NEW", "name": "mpdm-zach--alpha--bravo-1", "is_mpim": True}],
+                    "response_metadata": {"next_cursor": ""},
+                }
+            ],
+        }
+    )
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation_list", "mpim"): {
+                "cursor_ts": "page12",
+                "status": "ok",
+            }
+        }
+    )
+
+    # A finished walk keeps its last cursor_ts on the row (the upsert preserves
+    # it), so 'complete' is the only thing that can mean "start over".
+
+    _conversation_refresh_runner(monkeypatch, client=client, warehouse=warehouse).sync_all()
+
+    list_calls = [params for method, params in client.calls if method == "conversations.list"]
+    assert list_calls[0]["cursor"] == "page12"
+    assert [row["conversation_id"] for row in warehouse.conversations] == ["C_NEW"]
+
+
+def test_conversation_refresh_restarts_the_walk_after_the_last_page(monkeypatch):
+    # Slack signals the end of the list with an empty cursor, and the next pass
+    # must start over at page 1 so the walk keeps cycling and re-stamps older
+    # conversations. That completion CANNOT be recorded by blanking cursor_ts:
+    # ops.slack_sync_state preserves a non-empty cursor_ts against an empty
+    # write (so a per-conversation error row cannot wipe a message high-water
+    # mark), so the blank is silently dropped and the walk would stay pinned to
+    # the last page forever. It is recorded in `status` instead.
+    client = FakeSlackClient(
+        {
+            **_auth_pages(),
+            "conversations.list": [
+                {
+                    "ok": True,
+                    "channels": [{"id": "C_LAST", "name": "mpdm-last-1", "is_mpim": True}],
+                    "response_metadata": {"next_cursor": ""},
+                }
+            ],
+        }
+    )
+    warehouse = FakeWarehouse(states={("zrl", "T1", "conversation_list", "mpim"): {"cursor_ts": "page14"}})
+
+    _conversation_refresh_runner(monkeypatch, client=client, warehouse=warehouse).sync_all()
+
+    cursor_updates = [u for u in warehouse.state_updates if u["object_type"] == "conversation_list"]
+    assert cursor_updates[-1]["status"] == "complete"
+
+
+def test_conversation_refresh_restarts_when_slack_rejects_a_stale_cursor(monkeypatch):
+    # Slack cursors expire. A rejected cursor must restart the walk rather than
+    # wedge discovery for that conversation type forever.
+    client = FakeSlackClient(
+        {
+            **_auth_pages(),
+            "conversations.list": [
+                SlackApiCallError("conversations.list failed: invalid_cursor", code="invalid_cursor"),
+                {
+                    "ok": True,
+                    "channels": [{"id": "C_FIRST", "name": "mpdm-first-1", "is_mpim": True}],
+                    "response_metadata": {"next_cursor": "page2"},
+                },
+            ],
+        }
+    )
+    warehouse = FakeWarehouse(states={("zrl", "T1", "conversation_list", "mpim"): {"cursor_ts": "expired"}})
+
+    _conversation_refresh_runner(monkeypatch, client=client, warehouse=warehouse).sync_all()
+
+    list_calls = [params for method, params in client.calls if method == "conversations.list"]
+    assert list_calls[0]["cursor"] == "expired"
+    assert list_calls[1]["cursor"] == ""
+    assert [row["conversation_id"] for row in warehouse.conversations] == ["C_FIRST"]
+
+
+def test_metadata_rotation_prefers_the_conversation_type_furthest_behind(monkeypatch):
+    # Wall-clock rotation gives each conversation type one 15-minute slot an hour
+    # and silently forfeits it whenever that run loses the shared Slack lock —
+    # which in production was most of them, leaving mpim metadata 11.5h stale.
+    # Driving the rotation from persisted state instead makes a lost slot
+    # recoverable on the very next metadata run.
+    from personal_data_warehouse.defs.slack_sync import _metadata_conversation_types
+
+    now = datetime(2026, 8, 24, 1, 45, tzinfo=UTC)  # a wall-clock 'public_channel' slot
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation_list", "im"): {
+                "cursor_ts": "", "status": "complete", "updated_at": now - timedelta(minutes=5)},
+            ("zrl", "T1", "conversation_list", "mpim"): {
+                "cursor_ts": "", "status": "complete", "updated_at": now - timedelta(hours=11)},
+            ("zrl", "T1", "conversation_list", "private_channel"): {
+                "cursor_ts": "", "status": "complete", "updated_at": now - timedelta(minutes=20)},
+            ("zrl", "T1", "conversation_list", "public_channel"): {
+                "cursor_ts": "", "status": "complete", "updated_at": now - timedelta(minutes=30)},
+        }
+    )
+
+    assert _metadata_conversation_types(warehouse=warehouse, now=now) == ("mpim",)
+
+
+def test_metadata_rotation_finishes_a_started_walk_before_moving_on(monkeypatch):
+    # A type mid-walk holds a live cursor. Finishing that walk is what actually
+    # reaches the last pages, where every newly created conversation lives.
+    from personal_data_warehouse.defs.slack_sync import _metadata_conversation_types
+
+    now = datetime(2026, 8, 24, 1, 45, tzinfo=UTC)
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation_list", "im"): {
+                "cursor_ts": "", "status": "complete", "updated_at": now - timedelta(hours=9)},
+            ("zrl", "T1", "conversation_list", "mpim"): {
+                "cursor_ts": "page12", "status": "ok", "updated_at": now - timedelta(minutes=1)},
+            ("zrl", "T1", "conversation_list", "private_channel"): {
+                "cursor_ts": "", "status": "complete", "updated_at": now - timedelta(hours=8)},
+            ("zrl", "T1", "conversation_list", "public_channel"): {
+                "cursor_ts": "", "status": "complete", "updated_at": now - timedelta(hours=7)},
+        }
+    )
+
+    assert _metadata_conversation_types(warehouse=warehouse, now=now) == ("mpim",)
+
+
+def test_metadata_rotation_falls_back_to_the_clock_without_state(monkeypatch):
+    # A warehouse that cannot answer (or a first run with no rows) must still
+    # rotate rather than pinning one type forever.
+    from personal_data_warehouse.defs.slack_sync import _metadata_conversation_types
+    from types import SimpleNamespace
+
+    now = datetime(2026, 4, 24, 17, 15, tzinfo=UTC)
+    assert _metadata_conversation_types(warehouse=SimpleNamespace(), now=now) == ("mpim",)
+    assert _metadata_conversation_types(warehouse=FakeWarehouse(), now=now) == ("im",)
+
+
+def test_conversation_refresh_starts_over_when_the_previous_walk_completed(monkeypatch):
+    # cursor_ts survives on the row after a completed walk because the upsert
+    # preserves it. Only status='complete' can distinguish "finished the list,
+    # begin a new cycle" from "stopped mid-list, resume here".
+    client = FakeSlackClient(
+        {
+            **_auth_pages(),
+            "conversations.list": [
+                {
+                    "ok": True,
+                    "channels": [{"id": "C_PAGE1", "name": "mpdm-page-one-1", "is_mpim": True}],
+                    "response_metadata": {"next_cursor": "page2"},
+                }
+            ],
+        }
+    )
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation_list", "mpim"): {
+                "cursor_ts": "page14",
+                "status": "complete",
+            }
+        }
+    )
+
+    _conversation_refresh_runner(monkeypatch, client=client, warehouse=warehouse).sync_all()
+
+    list_calls = [params for method, params in client.calls if method == "conversations.list"]
+    assert list_calls[0]["cursor"] == ""
