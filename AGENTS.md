@@ -2053,13 +2053,19 @@ Three things now hold this up, and the second is the one that is easy to undo:
   the conversation type), resumes from it, and stores `''` at the end of the list so the next
   pass starts over and keeps cycling. A cursor Slack rejects (`invalid_cursor`) restarts the
   walk rather than wedging that type.
-- **The rotation is driven by state, not the wall clock.** `_metadata_conversation_types`
-  picks the type whose walk is furthest behind, preferring one that is mid-walk. The old
-  `minute // 15 % 4` rotation gave each type one 15-minute slot per hour and **silently
-  forfeited it whenever that run lost the shared Slack lock** — a lock-starved stage still
-  returns `MaterializeResult` with `skipped_due_to_lock: true` and a green run, so six of
-  every eight metadata runs did nothing and mpim metadata went 11.5 hours between refreshes.
-  Reverting to a clock rotation reintroduces that.
+- **Both rotations are driven by state, not the wall clock.**
+  `_metadata_conversation_types` picks the conversation type whose walk is furthest behind
+  (preferring one mid-walk); `_coverage_stage` picks the coverage stage that has gone
+  longest without running, from a `coverage_stage` row per stage in `ops.slack_sync_state`
+  written only *after* the work happens. A clock rotation **silently forfeits a stage's
+  turn whenever that run loses the shared Slack lock**, and a lock-starved stage still
+  returns `MaterializeResult` with `skipped_due_to_lock: true` and a green run. Measured:
+  six of every eight metadata runs did nothing (mpim metadata went 11.5 hours between
+  refreshes), and **38 of 54 coverage runs over six hours — 70% — were no-ops**, which is
+  why the 1,929 newly discovered public channels attempted exactly one backfill in their
+  first fifty minutes. Reverting either rotation to the clock reintroduces this. The tell
+  in Dagster is a materialization whose metadata carries no work counters at all
+  (`conversations_seen` absent rather than zero).
 - **`marts_ops.slack_conversation_health` judges the SHARE re-listed, per type.** This is
   the detector that was missing. `marts_ops.pipeline_health` aggregates Slack as a single
   pipeline and ~19k public-channel messages a day kept it `ok` with `state_error_rows = 0`
