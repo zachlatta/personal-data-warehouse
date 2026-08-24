@@ -8189,13 +8189,16 @@ class PostgresWarehouse:
     # row green while group-DM ingestion was completely dead. Two things are
     # deliberate here:
     #
-    #  * The status is judged on the OLDEST conversation metadata stamp, not the
-    #    newest. Discovery walks conversations.list in bounded slices, so a
-    #    healthy walk keeps cycling and every conversation gets re-stamped within
-    #    a cycle. When the walk restarted at page 1 every run, max(synced_at)
-    #    stayed perpetually fresh (the first 200 rows were re-stamped hourly)
-    #    while min(synced_at) sat frozen in May and 2,120 conversations created
-    #    after it were never discovered at all. Only the oldest stamp saw that.
+    #  * The status is the SHARE of live conversations re-stamped within one
+    #    expected cycle -- never max(synced_at), and not the single oldest row
+    #    either. max() is useless: a page-1-only walk re-stamped the first 200
+    #    rows hourly and looked perfect while 2,120 conversations were never
+    #    discovered at all. min() over-fires: rows archived upstream after we
+    #    last listed them keep is_archived = 0 forever (the walk that would fix
+    #    the flag is the one that excludes them), so a permanent 1% tail can
+    #    never be re-stamped. The share separates them cleanly -- measured after
+    #    the repair, im 100%, mpim 100%, private_channel 99.1%, public_channel
+    #    99.2%, against 200-of-2,597 = 7.7% during the outage.
     #  * Message ages are reported but never drive the status. mpim genuinely has
     #    zero-message days — eleven of them between 2026-07-11 and 2026-08-18 —
     #    so alerting on "no group DM messages" is a guaranteed false positive.
@@ -8223,6 +8226,7 @@ class PostgresWarehouse:
                     c.conversation_type,
                     count(*)::bigint AS conversation_count,
                     count(*) FILTER (WHERE c.is_archived = 1)::bigint AS archived_count,
+                    count(*) FILTER (WHERE c.is_archived = 0)::bigint AS live_count,
                     -- Unarchived conversations only. Discovery lists with
                     -- exclude_archived=true, so an archived row's synced_at can
                     -- never be refreshed and judging it would pin this view to
@@ -8230,14 +8234,20 @@ class PostgresWarehouse:
                     min(c.synced_at) FILTER (WHERE c.is_archived = 0)
                         AS oldest_conversation_synced_at,
                     max(c.synced_at) AS newest_conversation_synced_at,
+                    count(*) FILTER (
+                        WHERE c.is_archived = 0
+                          AND c.synced_at > now() - make_interval(
+                              secs => COALESCE(e.cycle_seconds, 172800))
+                    )::bigint AS refreshed_count,
                     max(s.latest_message_at) AS newest_message_at
                 FROM @slack_conversations AS c
                 LEFT JOIN @slack_conversation_stats AS s
                        ON s.account = c.account
                       AND s.team_id = c.team_id
                       AND s.conversation_id = c.conversation_id
+                LEFT JOIN expected AS e ON e.conversation_type = c.conversation_type
                 WHERE c.conversation_type <> ''
-                GROUP BY c.account, c.team_id, c.conversation_type
+                GROUP BY c.account, c.team_id, c.conversation_type, e.cycle_seconds
             )
             SELECT
                 p.account,
@@ -8245,6 +8255,10 @@ class PostgresWarehouse:
                 p.conversation_type,
                 p.conversation_count,
                 p.archived_count,
+                p.live_count,
+                p.refreshed_count,
+                round(p.refreshed_count::numeric / NULLIF(p.live_count, 0), 4)
+                    AS refreshed_fraction,
                 p.oldest_conversation_synced_at,
                 p.newest_conversation_synced_at,
                 (EXTRACT(EPOCH FROM now() - p.oldest_conversation_synced_at))::bigint
@@ -8263,11 +8277,9 @@ class PostgresWarehouse:
                     - NULLIF(p.newest_message_at, '1970-01-01 00:00:00+00'::timestamptz)
                 ))::bigint AS message_age_seconds,
                 CASE
-                    WHEN p.oldest_conversation_synced_at IS NULL THEN 'unknown'
-                    WHEN now() - p.oldest_conversation_synced_at
-                         > make_interval(secs => COALESCE(e.cycle_seconds, 172800) * 3) THEN 'stale'
-                    WHEN now() - p.oldest_conversation_synced_at
-                         > make_interval(secs => COALESCE(e.cycle_seconds, 172800)) THEN 'late'
+                    WHEN p.live_count = 0 THEN 'unknown'
+                    WHEN p.refreshed_count::numeric / p.live_count < 0.75 THEN 'stale'
+                    WHEN p.refreshed_count::numeric / p.live_count < 0.95 THEN 'late'
                     ELSE 'ok'
                 END AS status
             FROM per_type AS p

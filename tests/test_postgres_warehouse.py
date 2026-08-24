@@ -5604,3 +5604,69 @@ def test_slack_conversation_health_ignores_archived_conversations(
     # Both rows are still counted -- the archived one is simply not judged.
     assert (total, archived) == (2, 1)
     assert oldest >= now - timedelta(minutes=11)
+
+
+def test_slack_conversation_health_tolerates_a_handful_of_unreachable_stragglers(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Judge the share refreshed, not the single oldest row.
+
+    Excluding archived rows is not enough. A conversation archived *upstream*
+    after we last listed it keeps is_archived = 0 in the warehouse forever,
+    because the only path that would correct the flag is the same walk that
+    excludes it -- so a small tail of rows can never be re-stamped and the
+    oldest-row rule reports 'stale' on a perfectly healthy pipeline. Measured
+    right after the production walks completed: private_channel 114/115 and
+    public_channel 13,165/13,272 refreshed, both flagged stale by the oldest row
+    alone.
+
+    The share is what discriminates: those are 99.1% and 99.2%, where the actual
+    outage was 200 of 2,597 mpims -- 7.7%.
+    """
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    rows = [
+        _health_conversation_row(f"C_FRESH_{i}", "private_channel", synced_at=now - timedelta(minutes=5))
+        for i in range(99)
+    ]
+    rows.append(
+        _health_conversation_row("C_STRAGGLER", "private_channel", synced_at=now - timedelta(days=120))
+    )
+    warehouse.insert_slack_conversations(rows)
+
+    status, fraction = warehouse._query(
+        """
+        SELECT status, refreshed_fraction
+        FROM @marts_ops_slack_conversation_health
+        WHERE account = 'zrl' AND conversation_type = 'private_channel'
+        """
+    )[0]
+    assert status == "ok"
+    assert 0.98 <= float(fraction) <= 0.99
+
+
+def test_slack_conversation_health_still_catches_the_page_one_outage_by_share(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The real production shape: one page re-stamped, the rest frozen."""
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    rows = [
+        _health_conversation_row(f"C_PAGE1_{i}", "mpim", synced_at=now - timedelta(minutes=5))
+        for i in range(8)
+    ]
+    rows += [
+        _health_conversation_row(f"C_TAIL_{i}", "mpim", synced_at=now - timedelta(days=98))
+        for i in range(92)
+    ]
+    warehouse.insert_slack_conversations(rows)
+
+    status, fraction = warehouse._query(
+        """
+        SELECT status, refreshed_fraction
+        FROM @marts_ops_slack_conversation_health
+        WHERE account = 'zrl' AND conversation_type = 'mpim'
+        """
+    )[0]
+    assert status == "stale"
+    assert abs(float(fraction) - 0.08) < 0.001
