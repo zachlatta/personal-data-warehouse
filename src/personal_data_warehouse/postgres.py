@@ -1189,6 +1189,15 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "slack_sync_state",
         "CREATE INDEX IF NOT EXISTS slack_sync_state_conversation_list_idx ON @slack_sync_state (object_type, object_id) WHERE object_type = 'conversation_list'",
     ),
+    # Same reason, for the seven coverage-stage rows the coverage rotation reads
+    # every seven minutes. A separate partial index rather than a widened
+    # predicate: CREATE INDEX IF NOT EXISTS cannot express "the predicate moved",
+    # so changing an existing one leaves production on the old definition.
+    IndexSpec(
+        "slack_sync_state_coverage_stage_idx",
+        "slack_sync_state",
+        "CREATE INDEX IF NOT EXISTS slack_sync_state_coverage_stage_idx ON @slack_sync_state (object_type, object_id) WHERE object_type = 'coverage_stage'",
+    ),
     IndexSpec(
         "slack_messages_huddle_idx",
         "slack_messages",
@@ -7642,14 +7651,14 @@ class PostgresWarehouse:
             SYNC_STATE_COLUMNS,
         )
 
-    def load_slack_conversation_list_state(self) -> dict[tuple[str, str, str, str], dict[str, Any]]:
-        """Just the conversations.list walk cursors — at most one row per type.
+    def load_slack_sync_state_by_type(self, object_type: str) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+        """Sync-state rows of one object_type — a handful, not the whole table.
 
-        The metadata stage picks which conversation type to walk from this state,
-        and it must not pay for load_slack_sync_state()'s full-table read to do
+        The metadata and coverage stages pick what to do next from this state,
+        and neither must pay for load_slack_sync_state()'s full-table read to do
         it: ops.slack_sync_state is 1.1M rows / 363 MB, and that whole dict is
-        already materialised once per stage. The partial index keeps this a
-        four-row lookup instead of a seq scan over the heap.
+        already materialised once per stage. The partial indexes keep these
+        single-digit-row lookups instead of a seq scan over the heap.
         """
         columns = (
             "account",
@@ -7665,7 +7674,7 @@ class PostgresWarehouse:
         rows = self._query(
             f"SELECT {', '.join(_identifier(column) for column in columns)} FROM @slack_sync_state "
             "WHERE object_type = %s",
-            ("conversation_list",),
+            (object_type,),
         )
         return {
             (str(row[0]), str(row[1]), str(row[2]), str(row[3])): dict(zip(columns, row, strict=True))

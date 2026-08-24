@@ -31,6 +31,12 @@ SLACK_CONVERSATION_LIST_STATE_TYPE = "conversation_list"
 # `status`, which has no such rule.
 SLACK_CONVERSATION_LIST_COMPLETE = "complete"
 
+# Which coverage stage last ran, keyed by stage name. Coverage rotates over seven
+# heterogeneous stages and a run that loses the shared Slack lock returns green
+# having done nothing, so a wall-clock rotation silently forfeits that stage's
+# slot -- 70% of production coverage runs were such no-ops.
+SLACK_COVERAGE_STAGE_STATE_TYPE = "coverage_stage"
+
 # Slack rejects an expired/garbled pagination cursor with these codes.
 SLACK_INVALID_CURSOR_CODES = frozenset({"invalid_cursor", "invalid_arguments"})
 DEFAULT_SLACK_API_TIMEOUT_SECONDS = 30

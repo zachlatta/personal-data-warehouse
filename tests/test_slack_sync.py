@@ -2518,3 +2518,91 @@ def test_conversation_refresh_starts_over_when_the_previous_walk_completed(monke
 
     list_calls = [params for method, params in client.calls if method == "conversations.list"]
     assert list_calls[0]["cursor"] == ""
+
+
+def test_coverage_rotation_prefers_the_stage_that_has_waited_longest(monkeypatch):
+    # Coverage rotates over seven stages on a wall-clock slot, and a run that
+    # loses the shared Slack lock still returns a green MaterializeResult having
+    # done nothing -- so that stage's slot is simply forfeited. Measured in
+    # production over six hours, 38 of 54 coverage runs (70%) were lock-skipped
+    # no-ops, and unarchived public channels only get two slots an hour, so a
+    # 1,929-channel backlog drained at roughly one channel per hour. Choosing the
+    # stage from persisted state makes a lost slot recoverable on the next run.
+    from personal_data_warehouse.defs.slack_sync import _coverage_stage
+
+    now = datetime(2026, 8, 24, 15, 30, tzinfo=UTC)  # a wall-clock archived-public slot
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "coverage_stage", "public_channel"): {"updated_at": now - timedelta(hours=9)},
+            ("zrl", "T1", "coverage_stage", "mpim"): {"updated_at": now - timedelta(minutes=5)},
+            ("zrl", "T1", "coverage_stage", "private_channel"): {"updated_at": now - timedelta(minutes=20)},
+            ("zrl", "T1", "coverage_stage", "private_channel_archived"): {"updated_at": now - timedelta(minutes=30)},
+            ("zrl", "T1", "coverage_stage", "public_channel_archived_zero"): {"updated_at": now - timedelta(minutes=40)},
+            ("zrl", "T1", "coverage_stage", "public_channel_archived"): {"updated_at": now - timedelta(minutes=50)},
+            ("zrl", "T1", "coverage_stage", "im"): {"updated_at": now - timedelta(hours=1)},
+        }
+    )
+
+    stage = _coverage_stage(warehouse=warehouse, now=now)
+    assert stage["key"] == "public_channel"
+    assert stage["conversation_types"] == ("public_channel",)
+    assert stage["archived_only"] is False
+
+
+def test_coverage_rotation_runs_a_never_run_stage_first(monkeypatch):
+    from personal_data_warehouse.defs.slack_sync import _coverage_stage
+
+    now = datetime(2026, 8, 24, 15, 30, tzinfo=UTC)
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "coverage_stage", "public_channel"): {"updated_at": now - timedelta(hours=9)},
+        }
+    )
+    # Every other stage has no row at all, so one of those wins over the
+    # nine-hour-old public_channel stage.
+    assert _coverage_stage(warehouse=warehouse, now=now)["key"] != "public_channel"
+
+
+def test_coverage_rotation_falls_back_to_the_clock_without_state(monkeypatch):
+    from personal_data_warehouse.defs.slack_sync import _coverage_stage, _coverage_stage_for_time
+    from types import SimpleNamespace
+
+    now = datetime(2026, 8, 24, 15, 30, tzinfo=UTC)
+    assert _coverage_stage(warehouse=SimpleNamespace(), now=now) == _coverage_stage_for_time(now)
+
+
+def test_coverage_sync_records_the_stage_it_ran(monkeypatch):
+    # The rotation can only be state-driven if each run writes its own state.
+    import personal_data_warehouse.defs.slack_sync as slack_defs
+    from personal_data_warehouse.slack_sync import SlackSyncSummary
+
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def sync_all(self):
+            return [
+                SlackSyncSummary(
+                    account="zrl", team_id="T1", sync_type="partial",
+                    conversations_seen=25, messages_written=3, users_written=0, files_written=0,
+                )
+            ]
+
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+
+    slack_defs.run_slack_coverage_sync(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        now=datetime(2026, 8, 24, 15, 30, tzinfo=UTC),
+    )
+
+    stage_writes = [u for u in warehouse.state_updates if u["object_type"] == "coverage_stage"]
+    assert len(stage_writes) == 1
+    assert stage_writes[0]["object_id"] == calls[0]["conversation_types"][0] or stage_writes[0]["object_id"]

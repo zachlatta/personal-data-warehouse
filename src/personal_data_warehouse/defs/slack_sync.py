@@ -22,6 +22,7 @@ from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.slack_sync import (
     SLACK_CONVERSATION_LIST_COMPLETE,
     SLACK_CONVERSATION_LIST_STATE_TYPE,
+    SLACK_COVERAGE_STAGE_STATE_TYPE,
     SlackSyncRunner,
     SlackSyncSummary,
 )
@@ -98,7 +99,7 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
 def run_slack_coverage_sync(*, settings, warehouse, logger, now: datetime | None = None) -> list[SlackSyncSummary]:
     current_time = now or datetime.now(tz=UTC)
     summaries: list[SlackSyncSummary] = []
-    coverage = _coverage_stage_for_time(current_time)
+    coverage = _coverage_stage(warehouse=warehouse, now=current_time)
     if coverage is not None:
         # Don't force a full sync: channels with a partial cursor resume from cursor
         # via _oldest_ts_for_conversation; channels with no state still get a full
@@ -118,13 +119,39 @@ def run_slack_coverage_sync(*, settings, warehouse, logger, now: datetime | None
                 not_full_only=True,
                 zero_messages_only=coverage["zero_messages_only"],
                 skip_known_errors=True,
-                conversation_limit=coverage["limit"],
+                conversation_limit=_coverage_stage_limit(coverage),
                 sync_thread_replies=False,
                 max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
             ).sync_all()
         )
+        # Record the run only after it happened, and only per account that
+        # reported a summary: a stage whose run raised must keep its old
+        # timestamp so the rotation comes straight back to it.
+        _record_coverage_stage_run(
+            warehouse=warehouse, stage=coverage, summaries=summaries, now=current_time
+        )
 
     return summaries
+
+
+def _record_coverage_stage_run(*, warehouse, stage, summaries, now: datetime) -> None:
+    writer = getattr(warehouse, "insert_slack_sync_state", None)
+    if writer is None:
+        return
+    scopes = {(summary.account, summary.team_id) for summary in summaries}
+    for account, team_id in sorted(scopes):
+        writer(
+            account=account,
+            team_id=team_id,
+            object_type=SLACK_COVERAGE_STAGE_STATE_TYPE,
+            object_id=str(stage["key"]),
+            cursor_ts="",
+            last_sync_type="coverage",
+            status="ok",
+            error="",
+            updated_at=now,
+            sync_version=int(now.timestamp() * 1_000_000),
+        )
 
 
 def run_slack_metadata_sync(
@@ -274,7 +301,7 @@ def _metadata_conversation_types(*, warehouse, now: datetime) -> tuple[str, ...]
     hours between refreshes. Choosing from persisted state instead means a lost
     slot is simply picked up by the next metadata run, whenever it wins the lock.
     """
-    states = _conversation_list_states(warehouse)
+    states = _sync_states_of_type(warehouse, SLACK_CONVERSATION_LIST_STATE_TYPE)
     if states is None:
         return _metadata_conversation_types_for_time(now)
 
@@ -287,29 +314,41 @@ def _metadata_conversation_types(*, warehouse, now: datetime) -> tuple[str, ...]
         # and the newest conversations live on its last pages — finish it before
         # rotating away. Completion is carried by `status`, not by a blank cursor.
         mid_walk = str(state.get("status") or "") != SLACK_CONVERSATION_LIST_COMPLETE
-        updated_at = state.get("updated_at")
-        updated = updated_at.timestamp() if isinstance(updated_at, datetime) else 0.0
-        return (0 if mid_walk else 1, updated)
+        return (0 if mid_walk else 1, _last_run_at(state))
 
     return min(METADATA_CONVERSATION_TYPE_ORDER, key=rank)
 
 
-def _conversation_list_states(warehouse) -> dict[str, Mapping[str, object]] | None:
-    # Scoped loader by preference: the full-table one materialises 1.1M rows.
-    loader = getattr(warehouse, "load_slack_conversation_list_state", None) or getattr(
-        warehouse, "load_slack_sync_state", None
-    )
-    if loader is None:
-        return None
+def _sync_states_of_type(warehouse, object_type: str) -> dict[str, Mapping[str, object]] | None:
+    """Sync-state rows of one object_type, keyed by object_id.
+
+    Prefers the scoped loader; the full-table fallback materialises 1.1M rows and
+    exists only so a warehouse double in a test still works.
+    """
+    scoped = getattr(warehouse, "load_slack_sync_state_by_type", None)
     try:
-        rows = loader()
+        if scoped is not None:
+            rows = scoped(object_type)
+        else:
+            loader = getattr(warehouse, "load_slack_sync_state", None)
+            if loader is None:
+                return None
+            rows = loader()
     except Exception:  # pragma: no cover - a monitoring read must never break sync
         return None
     return {
         str(object_id): state
-        for (_account, _team_id, object_type, object_id), state in rows.items()
-        if object_type == SLACK_CONVERSATION_LIST_STATE_TYPE and isinstance(state, Mapping)
+        for (_account, _team_id, row_type, object_id), state in rows.items()
+        if row_type == object_type and isinstance(state, Mapping)
     }
+
+
+def _last_run_at(state: Mapping[str, object] | None) -> float:
+    """Seconds since epoch of a stage's last recorded run; 0.0 if never run."""
+    if state is None:
+        return 0.0
+    updated_at = state.get("updated_at")
+    return updated_at.timestamp() if isinstance(updated_at, datetime) else 0.0
 
 
 def run_intelligent_slack_sync(*, settings, warehouse, logger, now: datetime | None = None) -> list[SlackSyncSummary]:
@@ -324,69 +363,105 @@ def run_intelligent_slack_sync(*, settings, warehouse, logger, now: datetime | N
     return summaries
 
 
-def _coverage_stage_for_time(now: datetime) -> dict[str, object] | None:
-    # The coverage job fires every 7 minutes (*/7), so rotate stages over the
-    # fire-slot index within the hour (minute // 7), not minute % N. A plain
-    # minute % 7 would collapse to a single stage forever because every */7
-    # fire-minute is congruent to 0 (mod 7); minute // 7 advances by one on each
-    # fire, cycling through every stage instead.
-    stage = (now.minute // 7) % 7
-    if stage == 1:
-        return {
-            "conversation_types": ("mpim",),
-            "archived_only": False,
-            "zero_messages_only": False,
-            "limit": _int_env("SLACK_ASSET_MPIM_COVERAGE_LIMIT", 50),
-        }
-    if stage == 2:
-        return {
-            "conversation_types": ("private_channel",),
-            "archived_only": False,
-            "zero_messages_only": False,
-            "limit": _int_env("SLACK_ASSET_PRIVATE_COVERAGE_LIMIT", 25),
-        }
-    if stage == 3:
-        return {
-            "conversation_types": ("private_channel",),
-            "archived_only": True,
-            "zero_messages_only": False,
-            "limit": _int_env("SLACK_ASSET_ARCHIVED_PRIVATE_COVERAGE_LIMIT", 10),
-        }
-    if stage == 4:
-        return {
-            "conversation_types": ("public_channel",),
-            "archived_only": True,
-            "zero_messages_only": True,
-            "limit": _int_env("SLACK_ASSET_ARCHIVED_PUBLIC_ZERO_COVERAGE_LIMIT", 25),
-        }
-    if stage == 5:
-        return {
-            "conversation_types": ("public_channel",),
-            "archived_only": True,
-            "zero_messages_only": False,
-            "limit": _int_env("SLACK_ASSET_ARCHIVED_PUBLIC_COVERAGE_LIMIT", 25),
-        }
-    if stage == 6:
-        # Direct messages have no other backfill path: the freshness pass only
-        # fetches IMs active within its short recent window, so a DM whose last
-        # activity predates that window is otherwise never pulled — leaving a large
-        # backlog of never-synced IMs (and stale ones) whose history we never grab.
-        # Mirror the mpim stage to walk their history; not_full_only (set by
-        # run_slack_coverage_sync) scopes this to IMs not yet fully synced, and the
-        # activity gate is skipped for never-synced conversations so their full
-        # history is backfilled.
-        return {
-            "conversation_types": ("im",),
-            "archived_only": False,
-            "zero_messages_only": False,
-            "limit": _int_env("SLACK_ASSET_IM_COVERAGE_LIMIT", 50),
-        }
-    return {
+# One entry per coverage stage, in the wall-clock slot order the rotation used
+# before it became state-driven. `key` is what ops.slack_sync_state records, so
+# renaming one resets that stage's clock — treat these as stable identifiers.
+COVERAGE_STAGES: tuple[dict[str, object], ...] = (
+    {
+        "key": "public_channel",
         "conversation_types": ("public_channel",),
         "archived_only": False,
         "zero_messages_only": False,
-        "limit": _int_env("SLACK_ASSET_PUBLIC_COVERAGE_LIMIT", 25),
-    }
+        "limit_env": "SLACK_ASSET_PUBLIC_COVERAGE_LIMIT",
+        "limit_default": 25,
+    },
+    {
+        "key": "mpim",
+        "conversation_types": ("mpim",),
+        "archived_only": False,
+        "zero_messages_only": False,
+        "limit_env": "SLACK_ASSET_MPIM_COVERAGE_LIMIT",
+        "limit_default": 50,
+    },
+    {
+        "key": "private_channel",
+        "conversation_types": ("private_channel",),
+        "archived_only": False,
+        "zero_messages_only": False,
+        "limit_env": "SLACK_ASSET_PRIVATE_COVERAGE_LIMIT",
+        "limit_default": 25,
+    },
+    {
+        "key": "private_channel_archived",
+        "conversation_types": ("private_channel",),
+        "archived_only": True,
+        "zero_messages_only": False,
+        "limit_env": "SLACK_ASSET_ARCHIVED_PRIVATE_COVERAGE_LIMIT",
+        "limit_default": 10,
+    },
+    {
+        "key": "public_channel_archived_zero",
+        "conversation_types": ("public_channel",),
+        "archived_only": True,
+        "zero_messages_only": True,
+        "limit_env": "SLACK_ASSET_ARCHIVED_PUBLIC_ZERO_COVERAGE_LIMIT",
+        "limit_default": 25,
+    },
+    {
+        "key": "public_channel_archived",
+        "conversation_types": ("public_channel",),
+        "archived_only": True,
+        "zero_messages_only": False,
+        "limit_env": "SLACK_ASSET_ARCHIVED_PUBLIC_COVERAGE_LIMIT",
+        "limit_default": 25,
+    },
+    {
+        # Direct messages have no other backfill path: the freshness pass only
+        # fetches IMs active within its short recent window, so a DM whose last
+        # activity predates that window is otherwise never pulled.
+        "key": "im",
+        "conversation_types": ("im",),
+        "archived_only": False,
+        "zero_messages_only": False,
+        "limit_env": "SLACK_ASSET_IM_COVERAGE_LIMIT",
+        "limit_default": 50,
+    },
+)
+
+_COVERAGE_STAGES_BY_KEY = {str(stage["key"]): stage for stage in COVERAGE_STAGES}
+
+
+def _coverage_stage(*, warehouse, now: datetime) -> dict[str, object]:
+    """Pick the coverage stage that has gone longest without running.
+
+    The wall-clock rotation gave each of the seven stages one slot per 49
+    minutes and forfeited it whenever that run lost the shared Slack lock. In
+    production 38 of 54 coverage runs over six hours (70%) were lock-skipped
+    no-ops, so unarchived public channels — two slots an hour — effectively
+    drained a 1,929-channel backlog at about one channel per hour. Reading the
+    stage from persisted state means a lost slot is picked up by the next run.
+    """
+    states = _sync_states_of_type(warehouse, SLACK_COVERAGE_STAGE_STATE_TYPE)
+    if states is None:
+        stage = _coverage_stage_for_time(now)
+        return stage if stage is not None else dict(COVERAGE_STAGES[0])
+    return min(COVERAGE_STAGES, key=lambda stage: _last_run_at(states.get(str(stage["key"]))))
+
+
+def _coverage_stage_limit(stage: Mapping[str, object]) -> int:
+    return _int_env(str(stage["limit_env"]), int(stage["limit_default"]))
+
+
+def _coverage_stage_for_time(now: datetime) -> dict[str, object]:
+    """Clock fallback, used only when the warehouse cannot report stage state.
+
+    The coverage job fires every 7 minutes (*/7), so this rotates over the
+    fire-slot index within the hour (minute // 7), not minute % N. A plain
+    minute % 7 would collapse to a single stage forever because every */7
+    fire-minute is congruent to 0 (mod 7); minute // 7 advances by one on each
+    fire. The slot order is COVERAGE_STAGES' order, so the two rotations agree.
+    """
+    return COVERAGE_STAGES[((now.minute // 7) % 7)]
 
 
 def _int_env(name: str, default: int) -> int:
