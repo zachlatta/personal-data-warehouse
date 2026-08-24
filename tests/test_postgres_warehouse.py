@@ -5565,3 +5565,42 @@ def test_slack_conversation_list_cursor_reset_survives_the_upsert(
     assert cursor_ts == "page14"
     # ...so the status is the only thing that can mean "begin a new cycle".
     assert status == "complete"
+
+
+def test_slack_conversation_health_ignores_archived_conversations(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Archived conversations must not hold the freshness clock hostage.
+
+    Discovery calls conversations.list with exclude_archived=true, so an
+    archived conversation's synced_at is frozen at whatever it was when it was
+    last active and can never be refreshed. Judging the oldest stamp over ALL
+    rows therefore reports 'stale' forever after a perfectly healthy complete
+    walk -- measured on production, three archived IMs stuck at 2026-07-06 held
+    the im row at 48.9 days old seconds after its walk finished. A monitor that
+    cannot ever go green is a monitor everyone learns to ignore.
+    """
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    warehouse.insert_slack_conversations(
+        [
+            _health_conversation_row("D_LIVE", "im", synced_at=now - timedelta(minutes=10)),
+            {
+                **_health_conversation_row("D_ARCHIVED", "im", synced_at=now - timedelta(days=120)),
+                "is_archived": 1,
+            },
+        ]
+    )
+
+    rows = warehouse._query(
+        """
+        SELECT status, conversation_count, archived_count, oldest_conversation_synced_at
+        FROM @marts_ops_slack_conversation_health
+        WHERE account = 'zrl' AND conversation_type = 'im'
+        """
+    )
+    status, total, archived, oldest = rows[0]
+    assert status == "ok"
+    # Both rows are still counted -- the archived one is simply not judged.
+    assert (total, archived) == (2, 1)
+    assert oldest >= now - timedelta(minutes=11)

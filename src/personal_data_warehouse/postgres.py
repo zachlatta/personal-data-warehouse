@@ -8222,7 +8222,13 @@ class PostgresWarehouse:
                     c.team_id,
                     c.conversation_type,
                     count(*)::bigint AS conversation_count,
-                    min(c.synced_at) AS oldest_conversation_synced_at,
+                    count(*) FILTER (WHERE c.is_archived = 1)::bigint AS archived_count,
+                    -- Unarchived conversations only. Discovery lists with
+                    -- exclude_archived=true, so an archived row's synced_at can
+                    -- never be refreshed and judging it would pin this view to
+                    -- 'stale' forever after a perfectly healthy walk.
+                    min(c.synced_at) FILTER (WHERE c.is_archived = 0)
+                        AS oldest_conversation_synced_at,
                     max(c.synced_at) AS newest_conversation_synced_at,
                     max(s.latest_message_at) AS newest_message_at
                 FROM @slack_conversations AS c
@@ -8238,6 +8244,7 @@ class PostgresWarehouse:
                 p.team_id,
                 p.conversation_type,
                 p.conversation_count,
+                p.archived_count,
                 p.oldest_conversation_synced_at,
                 p.newest_conversation_synced_at,
                 (EXTRACT(EPOCH FROM now() - p.oldest_conversation_synced_at))::bigint
