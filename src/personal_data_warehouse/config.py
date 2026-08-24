@@ -111,11 +111,21 @@ DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNKS_PER_RUN = 8
 DEFAULT_WHOOP_PRIVATE_HEART_RATE_RECENT_HOURS = 6
 DEFAULT_WHOOP_PRIVATE_JOURNAL_DAYS_PER_RUN = 7
 DEFAULT_WHOOP_PRIVATE_DOCUMENTS_LOOKBACK_DAYS = 3
+#: Historic days walked per run, on top of the lookback window. Two document
+#: kinds are backfilled (see WhoopPrivateSyncRunner.BACKFILL_DOCUMENT_KINDS),
+#: so this costs ~2x that many requests against a 2,000-per-five-minute limit.
+#: At 60, a year of history lands in about five runs of the */15 schedule.
+DEFAULT_WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN = 60
 DEFAULT_WHOOP_PRIVATE_MAX_SLEEP_EVENT_REQUESTS = 25
 DEFAULT_WHOOP_PRIVATE_MAX_WORKOUT_REQUESTS = 25
 DEFAULT_WHOOP_PRIVATE_SPORTS_COUNTRY_CODE = "US"
 #: progression-service trend names that answer 200. RESTING_HEART_RATE is not
 #: one of them (HTTP 400), so do not add it back without re-probing.
+#: Deliberately NOT the full 36-key list the 400 error advertises: DAY_STRAIN,
+#: RECOVERY, RHR, RESPIRATORY_RATE, SLEEP_PERFORMANCE, SLEEP_EFFICIENCY,
+#: TIME_IN_BED, AVERAGE_HR, SLEEP_DEBT_POST and SLEEP_CONSISTENCY are already
+#: typed columns on base_whoop/base_whoop_private at better grain, and each
+#: trend costs ~120 KB of chart scaffolding to restate them.
 DEFAULT_WHOOP_PRIVATE_TREND_METRICS = (
     "VO2_MAX",
     "WEIGHT",
@@ -124,6 +134,10 @@ DEFAULT_WHOOP_PRIVATE_TREND_METRICS = (
     "CALORIES",
     "HRV",
     "STRESS_DURING_SLEEP",
+    # WHOOP Age and Pace of Aging have no other home in the warehouse, and one
+    # call carries the whole series rather than a single day.
+    "WHOOP_AGE",
+    "PACE_OF_AGING",
 )
 DEFAULT_CLAUDE_DESKTOP_BASE_URL = "https://claude.ai"
 DEFAULT_CLAUDE_DESKTOP_ENABLED = True
@@ -415,6 +429,7 @@ class WhoopPrivateConfig:
     heart_rate_recent_hours: int = DEFAULT_WHOOP_PRIVATE_HEART_RATE_RECENT_HOURS
     journal_days_per_run: int = DEFAULT_WHOOP_PRIVATE_JOURNAL_DAYS_PER_RUN
     documents_lookback_days: int = DEFAULT_WHOOP_PRIVATE_DOCUMENTS_LOOKBACK_DAYS
+    documents_backfill_days_per_run: int = DEFAULT_WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN
     max_sleep_event_requests: int = DEFAULT_WHOOP_PRIVATE_MAX_SLEEP_EVENT_REQUESTS
     max_workout_requests: int = DEFAULT_WHOOP_PRIVATE_MAX_WORKOUT_REQUESTS
     sports_country_code: str = DEFAULT_WHOOP_PRIVATE_SPORTS_COUNTRY_CODE
@@ -1580,6 +1595,11 @@ def load_settings(
                 "WHOOP_PRIVATE_DOCUMENTS_LOOKBACK_DAYS",
                 DEFAULT_WHOOP_PRIVATE_DOCUMENTS_LOOKBACK_DAYS,
                 1,
+            ),
+            "documents_backfill_days_per_run": (
+                "WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN",
+                DEFAULT_WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN,
+                0,
             ),
             "max_sleep_event_requests": (
                 "WHOOP_PRIVATE_MAX_SLEEP_EVENT_REQUESTS",

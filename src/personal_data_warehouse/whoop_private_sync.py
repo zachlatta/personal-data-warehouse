@@ -1054,10 +1054,64 @@ class WhoopPrivateSyncRunner:
             self._warehouse.insert_whoop_private_sports(rows)
         return len(rows), "snapshot", synced_at
 
+    #: Document kinds keyed by a local day. ``trend`` and ``health_tab`` are
+    #: whole-series/current-state snapshots a single call already covers, and
+    #: ``cardio_details`` is keyed by activity, so none of them are here.
+    DAY_DOCUMENT_KINDS = ("stress", "sleep_deep_dive", "strain_deep_dive", "behavior_impact")
+
+    #: The subset the historic backfill walks, and the reason is size measured
+    #: against the live API on 2026-08-23: `stress` is ~1.7 MB per day and
+    #: `sleep_deep_dive` ~935 KB, against ~5 KB for `strain_deep_dive` and 326
+    #: BYTES for `behavior_impact`. Walking a year of all four would store
+    #: ~800 MB of UI payload to gain two facts, and the expensive pair largely
+    #: restates `base_whoop_private.sleeps` and the STRESS trend. They keep
+    #: their rolling recent window; only the cheap pair gets history.
+    BACKFILL_DOCUMENT_KINDS = ("strain_deep_dive", "behavior_impact")
+
+    def _day_document(self, *, client, kind: str, day: str):
+        return {
+            "stress": lambda: client.stress(day=day),
+            "sleep_deep_dive": lambda: client.sleep_deep_dive(day=day),
+            "strain_deep_dive": lambda: client.strain_deep_dive(day=day),
+            "behavior_impact": lambda: client.behavior_impact(day=day),
+        }[kind]()
+
+    def _document_backfill_days(
+        self, *, config, warehouse, recent: list[str], today: date
+    ) -> tuple[list[str], set[tuple[str, str]]]:
+        """Historic days still missing a document, newest first and bounded.
+
+        The documents table is the cursor: a day is skipped once it is stored,
+        so an interrupted backfill resumes with no watermark to repair, and a
+        day WHOOP has no data for is stored once (empty) and never re-asked.
+        """
+        budget = max(0, config.documents_backfill_days_per_run)
+        if budget == 0:
+            return [], set()
+        floor = warehouse.whoop_private_earliest_cycle_day(account=config.account)
+        if floor is None:
+            # Cycles sync first and had nothing, so there is no floor. Not a
+            # reason to guess one.
+            return [], set()
+        stored = warehouse.whoop_private_document_keys(
+            account=config.account, kinds=self.BACKFILL_DOCUMENT_KINDS
+        )
+        recent_days = set(recent)
+        wanted: list[str] = []
+        day = today - timedelta(days=1)
+        while day >= floor and len(wanted) < budget:
+            key = day.isoformat()
+            if key not in recent_days and not all(
+                (kind, key) in stored for kind in self.BACKFILL_DOCUMENT_KINDS
+            ):
+                wanted.append(key)
+            day -= timedelta(days=1)
+        return wanted, stored
+
     def _sync_documents(self, *, config, client, identity, state, synced_at):
         offset = parse_timezone_offset(identity.timezone_offset)
         today = local_day(synced_at, offset)
-        days = [
+        recent = [
             (today - timedelta(days=index)).isoformat()
             for index in range(max(1, config.documents_lookback_days))
         ]
@@ -1070,32 +1124,53 @@ class WhoopPrivateSyncRunner:
                     account=account,
                     kind="trend",
                     doc_key=metric,
-                    payload=client.trend(metric=metric, end_date=days[0]),
+                    payload=client.trend(metric=metric, end_date=recent[0]),
                     collected_at=synced_at,
                     synced_at=synced_at,
                 )
             )
-        for day in days:
-            rows.append(
-                document_to_row(
-                    account=account,
-                    kind="stress",
-                    doc_key=day,
-                    payload=client.stress(day=day),
-                    collected_at=parse_rfc3339(f"{day}T00:00:00Z"),
-                    synced_at=synced_at,
-                )
+        # WHOOP Age, Pace of Aging and the Health Monitor are account state
+        # rather than a day, so one row is kept current under a fixed key.
+        rows.append(
+            document_to_row(
+                account=account,
+                kind="health_tab",
+                doc_key="current",
+                payload=client.health_tab(),
+                collected_at=synced_at,
+                synced_at=synced_at,
             )
-            rows.append(
-                document_to_row(
-                    account=account,
-                    kind="sleep_deep_dive",
-                    doc_key=day,
-                    payload=client.sleep_deep_dive(day=day),
-                    collected_at=parse_rfc3339(f"{day}T00:00:00Z"),
-                    synced_at=synced_at,
-                )
+        )
+        backfill, stored_keys = self._document_backfill_days(
+            config=config, warehouse=self._warehouse, recent=recent, today=today
+        )
+        if backfill:
+            self._logger.info(
+                "whoop_private documents: refreshing %d recent day(s) and backfilling %d "
+                "historic day(s) from %s",
+                len(recent),
+                len(backfill),
+                backfill[-1],
             )
+        recent_days = set(recent)
+        for day in [*recent, *backfill]:
+            for kind in self.DAY_DOCUMENT_KINDS:
+                if day not in recent_days:
+                    # A historic day fetches only the cheap kinds, and only the
+                    # ones it is missing, so a half-filled day does not spend
+                    # the run's budget restating itself.
+                    if kind not in self.BACKFILL_DOCUMENT_KINDS or (kind, day) in stored_keys:
+                        continue
+                rows.append(
+                    document_to_row(
+                        account=account,
+                        kind=kind,
+                        doc_key=day,
+                        payload=self._day_document(client=client, kind=kind, day=day),
+                        collected_at=parse_rfc3339(f"{day}T00:00:00Z"),
+                        synced_at=synced_at,
+                    )
+                )
         for activity_id, start, _end in self._workout_windows[: config.max_workout_requests]:
             rows.append(
                 document_to_row(

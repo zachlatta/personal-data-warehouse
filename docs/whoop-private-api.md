@@ -95,13 +95,73 @@ The data is in there, wrapped in presentation scaffolding that WHOOP can restyle
 any time without notice. Every `progression-service` trend returns an identical
 top-level key set regardless of metric, because the top level is a template.
 
-`/progression-service/v3/trends/{VO2_MAX|WEIGHT|BODY_COMPOSITION|STEPS|CALORIES|HRV|STRESS_DURING_SLEEP}`,
+`/progression-service/v3/trends/{VO2_MAX|WEIGHT|BODY_COMPOSITION|STEPS|CALORIES|HRV|STRESS_DURING_SLEEP|WHOOP_AGE|PACE_OF_AGING}`,
 `/health-service/v2/stress-bff/{date}`, `/health-tab-bff/v1/health-tab`,
 `/home-service/v1/deep-dive/sleep/last-night?date=`,
+`/home-service/v1/deep-dive/strain?date=`,
+`/behavior-impact-service/v1/impact/summary-card/{date}`,
 `/core-details-bff/v1/cardio-details?activityId=` (carries `map`, the GPS route).
 
 `RESTING_HEART_RATE` is not a valid trend name (400); `/core-details-bff/v1/strength-details`
 and `/activities-service/v1/blackouts/current` both 404.
+
+### The Strain Coach target, and where it actually lives
+
+`/home-service/v1/deep-dive/strain?date=` is the ONLY carrier of the Strain Coach
+target. Twelve plausible names for a dedicated service were probed on 2026-08-23 --
+`/coaching-service/*`, `/strain-coach-bff/*`, `/strain-coach-service/*`,
+`/activities-service/v1/strain-target`, `/core-details-bff/v{1,2}/strain-coach` -- and
+every one answered 404. Do not re-walk them.
+
+Inside, the `SCORE_GAUGE` item carries `score_target`, `lower_optimal_percentage` and
+`higher_optimal_percentage`. **They are gauge fractions, not strain units: multiply by
+21.** So a `score_target` of 0.58 is a target strain of 12.2, and the optimal band is
+roughly the target +/- 2.
+
+Three properties were verified against the live account over ten sampled days, and each
+one is worth re-checking if the payload is ever restyled:
+
+- **The scale is linear.** `gauge_fill_percentage * 21` reproduced the displayed strain
+  on every day sampled. That identity is the cheapest check that these fields still
+  mean what they did.
+- **The target rises and falls with recovery**, monotonically but not linearly, across
+  the full range sampled.
+- **It is stable per cycle, and independent of the strain actually achieved.** Two days
+  with equal recovery returned bit-identical targets, and days where the achieved strain
+  fell far short of the target did not move it. That is what makes it a fact worth
+  storing rather than something recomputable.
+
+### Which trends are worth storing, and which only look like it
+
+The 400 from an invalid `graphKey` enumerates all **36** valid names. Most are not worth
+collecting: `DAY_STRAIN`, `RECOVERY`, `HRV`, `RHR`, `RESPIRATORY_RATE`,
+`SLEEP_PERFORMANCE`, `SLEEP_EFFICIENCY`, `TIME_IN_BED` and `AVERAGE_HR` are already
+per-cycle columns, and `SLEEP_DEBT_POST` / `SLEEP_CONSISTENCY` are literally
+`base_whoop_private.sleeps.debt_post` and `.sleep_consistency`. Each trend is ~120 KB of
+chart scaffolding around a handful of numbers, so adding them costs megabytes per
+snapshot to restate typed data. `WHOOP_AGE` and `PACE_OF_AGING` are the exceptions --
+they have no other home, and one call carries the whole series (~6 months). `SAGE` and
+`HOURS_OF_SLEEP_GOAL` are advertised as valid but return 500; the three
+`EXERCISE_PROGRESS_BY_EXERCISE*` keys return 400.
+
+### Payload sizes decide what gets a history
+
+Measured per day, 2026-08-23: `stress` ~1.7 MB, `sleep_deep_dive` ~935 KB,
+`strain_deep_dive` ~5 KB, `behavior_impact` 326 bytes. Backfilling a year of all four
+would store ~800 MB of UI payload for two facts, so the sync walks history only for the
+cheap pair and leaves the expensive two on their rolling recent window. Every one of the
+four answers **200 on any date**, including years before the account existed (an empty
+payload, not a 404), so a backfill needs no missing-day handling -- but it also cannot
+detect its own floor, which is why the walk stops at the first cycle.
+
+### Confirmed absent
+
+No endpoint exists for the Strength Trainer, the weekly Performance Assessment, blood
+pressure, hormonal insights, or WHOOP Coach chat history (four service names probed, all
+404). Two unresolved leads: `/sleep-service/v1/sleep-planner` and
+`/sleep-service/v1/sleep-need` answer **405** to both GET and POST, so the paths exist
+but want something else; `/notification-service/v1/notifications` answers **401**, so it
+wants different auth.
 
 **Store Tier 2 as faithful `raw_json` and promote typed columns only where the shape
 proves stable.** A typed column over a UI payload is a silent-breakage machine: the

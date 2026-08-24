@@ -70,7 +70,14 @@ class RecordingLogger(NullLogger):
 class FakeWhoopPrivateWarehouse:
     """The warehouse surface `whoop_private` sync writes through."""
 
-    def __init__(self, *, state=None, session=None) -> None:
+    def __init__(
+        self,
+        *,
+        state=None,
+        session=None,
+        stored_documents=None,
+        earliest_cycle_day=None,
+    ) -> None:
         self.state = dict(state or {})
         self.session_row = session
         self.ensure_called = False
@@ -84,6 +91,10 @@ class FakeWhoopPrivateWarehouse:
         self.journal_entries: list[dict] = []
         self.sports: list[dict] = []
         self.documents: list[dict] = []
+        # Documents already in the warehouse from earlier runs: the backfill
+        # cursor IS the table, so this is what makes a resumed run resume.
+        self.stored_documents: list[dict] = list(stored_documents or [])
+        self.earliest_cycle_day = earliest_cycle_day
         self.state_rows: list[dict] = []
         self.rotations: list[dict] = []
 
@@ -148,6 +159,16 @@ class FakeWhoopPrivateWarehouse:
 
     def insert_whoop_private_documents(self, rows):
         self.documents.extend(rows)
+
+    def whoop_private_document_keys(self, *, account, kinds):
+        return {
+            (str(row["kind"]), str(row["doc_key"]))
+            for row in self.stored_documents
+            if row["account"] == account and row["kind"] in set(kinds)
+        }
+
+    def whoop_private_earliest_cycle_day(self, *, account):
+        return self.earliest_cycle_day
 
     def insert_whoop_private_sync_state(self, **row):
         self.state_rows.append(row)
@@ -351,6 +372,37 @@ class FakeWhoopPrivateClient:
     def sleep_deep_dive(self, *, day):
         self._record("sleep_deep_dive", day=day)
         return {"onboarding_overlays": [], "sleep": {}}
+
+    def strain_deep_dive(self, *, day):
+        self._record("strain_deep_dive", day=day)
+        return {
+            "header": {"deep_dive_score_type": "STRAIN"},
+            "sections": [
+                {
+                    "items": [
+                        {
+                            "type": "SCORE_GAUGE",
+                            "content": {
+                                "id": "STRAIN_SCORE_GAUGE",
+                                "score_display": "15.3",
+                                "gauge_fill_percentage": 0.7280952188951144,
+                                "score_target": 0.7285798037142287,
+                                "lower_optimal_percentage": 0.6333417084761335,
+                                "higher_optimal_percentage": 0.8860181885714286,
+                            },
+                        }
+                    ]
+                }
+            ],
+        }
+
+    def behavior_impact(self, *, day):
+        self._record("behavior_impact", day=day)
+        return {"impact_summary_card": {"content": {"title": "BEHAVIOR INSIGHTS", "items": []}}}
+
+    def health_tab(self):
+        self._record("health_tab")
+        return {"sections": [{"items": [{"type": "WHOOP_AGE_AMOEBA", "content": {"style_values": {"age": 28.2}}}]}]}
 
 
 def _session_row(**overrides):
@@ -916,3 +968,176 @@ def test_every_row_mapper_fills_exactly_its_warehouse_column_tuple() -> None:
 
     for columns, row in rows_by_columns:
         assert set(row) == set(columns), f"row/column drift: {set(row) ^ set(columns)}"
+
+
+# ------------------------------------------------- strain coach & friends ----
+
+
+def test_the_strain_coach_target_lands_in_documents(monkeypatch) -> None:
+    """The Strain Coach target is the one strain fact no table can reconstruct.
+
+    It is a Tier-2 UI payload, so it stays raw_json under its own kind rather
+    than becoming a typed column that goes quietly null on the next restyle.
+    """
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    strain = [row for row in warehouse.documents if row["kind"] == "strain_deep_dive"]
+    assert strain, "the strain deep dive carries score_target / lower_ / higher_optimal_percentage"
+    assert strain[0]["doc_key"] == "2026-08-23"
+    gauge = strain[0]["raw_json"]["sections"][0]["items"][0]["content"]
+    assert gauge["score_target"] == pytest.approx(0.7285798037142287)
+
+
+def test_behavior_insights_and_the_health_tab_land_in_documents(monkeypatch) -> None:
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    kinds = {(row["kind"], row["doc_key"]) for row in warehouse.documents}
+    # Behavior insights are per-day: WHOOP's own attribution of journal
+    # behaviors to the day's recovery, which nothing else in the warehouse holds.
+    assert ("behavior_impact", "2026-08-23") in kinds
+    # The health tab is account-state, not a day, so it gets a fixed key.
+    assert ("health_tab", "current") in kinds
+
+
+def test_whoop_age_and_pace_of_aging_are_collected_trends(monkeypatch) -> None:
+    """WHOOP Age has no other home; the trend carries its whole history."""
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    trends = {row["doc_key"] for row in warehouse.documents if row["kind"] == "trend"}
+    assert {"WHOOP_AGE", "PACE_OF_AGING"} <= trends
+
+
+# ------------------------------------------------------ document backfill ----
+
+
+def test_day_documents_backfill_towards_the_first_cycle(monkeypatch) -> None:
+    """Historic days are walked backwards, bounded per run.
+
+    The floor is the account's first cycle, not `full_sync_start`: a member has
+    no deep dives before they had a WHOOP, and walking to 2015 would spend
+    thousands of requests re-confirming that.
+    """
+    warehouse = FakeWhoopPrivateWarehouse(
+        session=_session_row(),
+        earliest_cycle_day=date(2026, 8, 18),
+    )
+    client = FakeWhoopPrivateClient()
+
+    _run(
+        monkeypatch,
+        warehouse=warehouse,
+        client=client,
+        WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN="2",
+    )
+
+    days = sorted({row["doc_key"] for row in warehouse.documents if row["kind"] == "strain_deep_dive"})
+    # The lookback day (today) plus two backfilled days, newest first.
+    assert days == ["2026-08-21", "2026-08-22", "2026-08-23"]
+
+
+def test_a_backfilled_day_is_never_fetched_twice(monkeypatch) -> None:
+    """The documents table is the cursor, so a resumed run skips what it has."""
+    stored = [
+        {"account": ACCOUNT, "kind": kind, "doc_key": day}
+        for kind in ("strain_deep_dive", "behavior_impact")
+        for day in ("2026-08-22", "2026-08-21")
+    ]
+    warehouse = FakeWhoopPrivateWarehouse(
+        session=_session_row(),
+        stored_documents=stored,
+        earliest_cycle_day=date(2026, 8, 18),
+    )
+    client = FakeWhoopPrivateClient()
+
+    _run(
+        monkeypatch,
+        warehouse=warehouse,
+        client=client,
+        WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN="2",
+    )
+
+    fetched = sorted(params["day"] for endpoint, params in client.calls if endpoint == "strain_deep_dive")
+    # Today is always refreshed (an in-progress day changes); 08-22 and 08-21
+    # are already stored, so the budget moves on to the next two older days.
+    assert fetched == ["2026-08-19", "2026-08-20", "2026-08-23"]
+
+
+def test_the_backfill_stops_at_the_first_cycle_and_does_not_run_forever(monkeypatch) -> None:
+    stored = [
+        {"account": ACCOUNT, "kind": kind, "doc_key": f"2026-08-{day:02d}"}
+        for kind in ("strain_deep_dive", "behavior_impact")
+        for day in range(18, 23)
+    ]
+    warehouse = FakeWhoopPrivateWarehouse(
+        session=_session_row(),
+        stored_documents=stored,
+        earliest_cycle_day=date(2026, 8, 18),
+    )
+    client = FakeWhoopPrivateClient()
+
+    _run(
+        monkeypatch,
+        warehouse=warehouse,
+        client=client,
+        WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN="30",
+    )
+
+    fetched = sorted(params["day"] for endpoint, params in client.calls if endpoint == "strain_deep_dive")
+    assert fetched == ["2026-08-23"], "nothing older than the first cycle should be requested"
+
+
+def test_no_document_backfill_before_cycles_have_landed(monkeypatch) -> None:
+    """Cycles sync first; with no cycle yet there is no floor, so do not guess."""
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row(), earliest_cycle_day=None)
+    client = FakeWhoopPrivateClient()
+
+    _run(
+        monkeypatch,
+        warehouse=warehouse,
+        client=client,
+        WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN="30",
+    )
+
+    days = sorted({row["doc_key"] for row in warehouse.documents if row["kind"] == "strain_deep_dive"})
+    assert days == ["2026-08-23"]
+
+
+def test_the_historic_walk_skips_the_megabyte_kinds(monkeypatch) -> None:
+    """Measured 2026-08-23: `stress` is ~1.7 MB per day and `sleep_deep_dive`
+    ~935 KB, against ~5 KB and 326 bytes for the two kinds carrying facts we
+    cannot get elsewhere. History is only worth having for the cheap pair."""
+    stored = [
+        {"account": ACCOUNT, "kind": "strain_deep_dive", "doc_key": "2026-08-22"},
+    ]
+    warehouse = FakeWhoopPrivateWarehouse(
+        session=_session_row(),
+        stored_documents=stored,
+        earliest_cycle_day=date(2026, 8, 22),
+    )
+    client = FakeWhoopPrivateClient()
+
+    _run(
+        monkeypatch,
+        warehouse=warehouse,
+        client=client,
+        WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN="5",
+    )
+
+    day_kinds = {"stress", "sleep_deep_dive", "strain_deep_dive", "behavior_impact"}
+    backfilled = {
+        endpoint
+        for endpoint, params in client.calls
+        if endpoint in day_kinds and params.get("day") == "2026-08-22"
+    }
+    assert backfilled == {"behavior_impact"}, (
+        "strain is already stored for that day, and the megabyte kinds never backfill"
+    )

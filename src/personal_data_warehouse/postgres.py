@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import inspect
 import json
@@ -6357,6 +6357,43 @@ class PostgresWarehouse:
 
     def insert_whoop_private_documents(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("whoop_private_documents", rows, WHOOP_PRIVATE_DOCUMENT_COLUMNS)
+
+    def whoop_private_document_keys(self, *, account: str, kinds: Sequence[str]) -> set[tuple[str, str]]:
+        """Which (kind, doc_key) documents are already stored.
+
+        This IS the document backfill's cursor -- there is no watermark to
+        repair, so an interrupted backfill resumes by itself. Reads only the
+        two key columns, which the primary key covers.
+        """
+        if not kinds:
+            return set()
+        rows = self._query(
+            "SELECT kind, doc_key FROM @whoop_private_documents "
+            "WHERE account = %s AND kind = ANY(%s)",
+            (account, list(kinds)),
+        )
+        return {(str(row[0]), str(row[1])) for row in rows}
+
+    def whoop_private_earliest_cycle_day(self, *, account: str) -> date | None:
+        """The account's first cycle day -- the floor for the document backfill.
+
+        A member has no deep dives before they had a WHOOP, so this stops the
+        walk instead of `full_sync_start` sending it to 2015. ``None`` means no
+        cycle has landed yet, which is a reason not to backfill rather than a
+        reason to guess.
+        """
+        rows = self._query(
+            "SELECT min(start_at) FROM @whoop_private_cycles WHERE account = %s",
+            (account,),
+        )
+        if not rows or rows[0][0] is None:
+            return None
+        earliest = rows[0][0]
+        # The warehouse-wide absence sentinel, not NULL. A cycles table holding
+        # only the epoch has no usable floor.
+        if earliest <= datetime.fromtimestamp(0, tz=UTC):
+            return None
+        return earliest.astimezone(UTC).date()
 
     def load_whoop_private_sync_state(self) -> dict[tuple[str, str], dict[str, Any]]:
         columns = WHOOP_PRIVATE_SYNC_STATE_COLUMNS

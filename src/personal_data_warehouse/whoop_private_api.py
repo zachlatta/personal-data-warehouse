@@ -284,3 +284,31 @@ class WhoopPrivateClient:
 
     def sleep_deep_dive(self, *, day: str) -> Any:
         return self.get_json("/home-service/v1/deep-dive/sleep/last-night", {"date": day})
+
+    def strain_deep_dive(self, *, day: str) -> Any:
+        """The day's strain screen -- and the only carrier of the Strain Coach target.
+
+        The ``SCORE_GAUGE`` item holds ``score_target`` plus
+        ``lower_optimal_percentage`` / ``higher_optimal_percentage``. They are
+        gauge FRACTIONS, not strain units: multiply by 21. There is no
+        ``strain-coach`` service; twelve plausible names were probed on
+        2026-08-23 and every one answered 404, so this endpoint is the only
+        source. Days before the account's first cycle answer 200 with a null
+        target, not an error.
+        """
+        return self.get_json("/home-service/v1/deep-dive/strain", {"date": day})
+
+    def behavior_impact(self, *, day: str) -> Any:
+        """WHOOP's own attribution of yesterday's journal behaviors to today's recovery.
+
+        The journal answers are already ours; this is the analysis of them, and
+        it is not reproducible from anything the warehouse stores.
+        """
+        return self.get_json(f"/behavior-impact-service/v1/impact/summary-card/{day}")
+
+    def health_tab(self) -> Any:
+        """WHOOP Age, Pace of Aging and the Health Monitor's in-range statuses.
+
+        Account state rather than a day, so it is stored under a fixed doc_key.
+        """
+        return self.get_json("/health-tab-bff/v1/health-tab")

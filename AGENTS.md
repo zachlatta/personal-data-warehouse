@@ -1667,9 +1667,25 @@ ORDER BY started_at DESC LIMIT 50;
 | `base_whoop_private.journal_entries` | the journal answers Zach typed; **the only table here with a timeline adapter** |
 | `base_whoop_private.cycles`, `.sleeps`, `.recoveries`, `.workouts` | high-resolution copies of the public rows (strain components, sleep debt, HRV/RHR components, zone durations, GPS) |
 | `base_whoop_private.sports` | the 204-sport catalog resolving a workout's `sport_id` |
-| `base_whoop_private.documents` | Tier-2 raw UI payloads (trends, stress, cardio details, sleep deep-dive) kept as `raw_json` |
+| `base_whoop_private.documents` | Tier-2 raw UI payloads kept as `raw_json`, keyed `(kind, doc_key)`: `trend`, `stress`, `cardio_details`, `sleep_deep_dive`, `strain_deep_dive`, `behavior_impact`, `health_tab` |
 | `ops.whoop_private_sync_state` | per-collection watermark, status and error |
 | `private.whoop_private_sessions` | the credential |
+
+**The Strain Coach target lives in `documents`, and it is not in strain units.**
+`kind = 'strain_deep_dive'` (one row per day) carries WHOOP's recommended strain in its
+`SCORE_GAUGE` item as `score_target`, with the optimal band as
+`lower_optimal_percentage` / `higher_optimal_percentage`. All three are **gauge
+fractions: multiply by 21**. The scale is linear, so `gauge_fill_percentage * 21`
+reproduces the displayed strain and is the check that the fields still mean what they
+did. Two sibling kinds landed with it: `behavior_impact` (one row per day — WHOOP's own
+attribution of yesterday's journal behaviors to today's recovery, which nothing else in
+the warehouse can reconstruct) and `health_tab` (one current row under
+`doc_key = 'current'` — WHOOP Age, Pace of Aging, Health Monitor statuses). History for
+the first two is walked backwards to the account's first cycle, bounded by
+`WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN`; **the documents table is the cursor**,
+so an interrupted backfill resumes with no watermark to repair. `stress` and
+`sleep_deep_dive` deliberately do NOT get history — measured 1.7 MB and 935 KB per day
+against 5 KB and 326 bytes for the pair above.
 
 **Only `journal_entries` reaches `timeline.events`** (adapter `whoop_private_journal`,
 source `whoop_private`, priority `self` — Zach opened the app and answered the question
