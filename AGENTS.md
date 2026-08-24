@@ -1686,7 +1686,9 @@ account's first cycle, bounded by `WHOOP_PRIVATE_DOCUMENTS_BACKFILL_DAYS_PER_RUN
 **the documents table is the cursor**, so an interrupted backfill resumes with no
 watermark to repair. That budget is set by bytes, not by the rate limit: a recent
 `stress` day is ~1.7 MB and `sleep_deep_dive` ~935 KB, against ~5 KB and 326 bytes for
-the other two, so lower it (not the kind list) if the pull ever needs to be lighter.
+the other two, so lower it (not the kind list) if the pull ever needs to be lighter. Those
+are *wire* bytes and they overstate the disk by ~13x: the walk finished 2026-08-24 at the
+first cycle (2025-10-23) with 306 days of each kind stored in a 75 MB table.
 
 **Only `journal_entries` reaches `timeline.events`** (adapter `whoop_private_journal`,
 source `whoop_private`, priority `self` — Zach opened the app and answered the question

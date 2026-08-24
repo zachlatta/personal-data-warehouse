@@ -146,13 +146,23 @@ they have no other home, and one call carries the whole series (~6 months). `SAG
 
 ### Payload sizes set the per-run budget, not what gets stored
 
-Measured per day, 2026-08-23: `stress` ~1.7 MB, `sleep_deep_dive` ~935 KB,
-`strain_deep_dive` ~5 KB, `behavior_impact` 326 bytes. All four are backfilled anyway --
-storage is recoverable and an unpulled history is not -- so a full walk is a few hundred
-MB of jsonb. What the sizes govern is the *rate*: the per-run day budget is set by bytes
-rather than by the rate limit (20 days is ~50 MB of payload; 1,220 requests for a year of
-all four is nothing against 2,000 per five minutes), and documents are flushed per day
-rather than accumulated so a run never holds a whole batch in memory.
+Measured per day over the wire, 2026-08-23: `stress` ~1.7 MB, `sleep_deep_dive`
+~935 KB, `strain_deep_dive` ~5 KB, `behavior_impact` 326 bytes. All four are backfilled
+anyway -- storage is recoverable and an unpulled history is not. What those sizes govern
+is the *rate*, not the disk: the per-run day budget is set by bytes rather than by the
+rate limit (20 days is ~50 MB of payload; 1,220 requests for a year of all four is
+nothing against 2,000 per five minutes), and documents are flushed per day rather than
+accumulated so a run never holds a whole batch in memory.
+
+**Sizing the stored table from the wire overestimates it by about 13x.** The finished
+walk is the measurement to quote: it completed 2026-08-24, reaching the account's first
+cycle on 2025-10-23, and stores 306 days of each day-keyed kind in a **75 MB** table
+(`stress` 38 MB, `sleep_deep_dive` 19 MB, `cardio_details` 8.9 MB, `strain_deep_dive`
+774 kB, `behavior_impact` 115 kB). These payloads are mostly repeated key names and
+presentation scaffolding, so Postgres compresses them hard in TOAST: the 2026-08-23
+`stress` document is 1,858,608 JSON characters stored in 144,434 bytes, and that day's
+`sleep_deep_dive` is 843,694 characters in 59,351. A pre-walk estimate of "a few hundred
+MB" was wrong by an order of magnitude in the cheap direction.
 
 The early days are much smaller than the recent ones: `stress` was 94 KB at the account's
 second week and 1.5 MB six months later, because the payload carries history up to its
