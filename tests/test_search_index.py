@@ -101,6 +101,47 @@ def test_vector_literal_shape() -> None:
     assert literal == "[0.500000,-1.000000,0.250000]"
 
 
+def test_search_health_distinguishes_fresh_work_from_convergence(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A fresh heartbeat with backlog must never present as green."""
+    warehouse.ensure_pipeline_health_tables()
+    warehouse.write_search_health(
+        "chunks",
+        timeline_max_seq=120,
+        chunk_cursor_seq=100,
+        caught_up=0,
+        processed_rows=50,
+        pending_count=-1,
+        last_success_at=datetime.now(tz=UTC),
+    )
+    row = warehouse._query_dicts("SELECT * FROM @marts_search_health WHERE component = 'chunks'")[0]
+    assert row["status"] == "backfilling"
+    assert row["seq_lag"] == 20
+    assert row["pending_count"] is None
+
+    warehouse.write_search_health(
+        "chunks",
+        timeline_max_seq=120,
+        chunk_cursor_seq=120,
+        caught_up=1,
+        processed_rows=20,
+        pending_count=0,
+        last_success_at=datetime.now(tz=UTC),
+    )
+    row = warehouse._query_dicts("SELECT * FROM @marts_search_health WHERE component = 'chunks'")[0]
+    assert row["status"] == "ok"
+    assert row["pending_count"] == 0
+
+    success_at = row["last_success_at"]
+    warehouse.write_search_health("chunks", last_error="worker failed")
+    row = warehouse._query_dicts(
+        "SELECT * FROM @marts_search_health WHERE component = 'chunks'"
+    )[0]
+    assert row["status"] == "failing"
+    assert row["last_success_at"] == success_at
+
+
 # --- chunk builder (live) -----------------------------------------------------
 
 from tests.test_postgres_warehouse import (  # noqa: E402 - shared fixtures
@@ -167,9 +208,7 @@ def test_chunk_builder_windows_chat_and_chunks_documents(warehouse: PostgresWare
     _sync_timeline(warehouse)
     stats2 = SearchChunkBuilder(warehouse).run()
     assert stats2.caught_up
-    slack_rows = warehouse._query_dicts(
-        "SELECT anchor, text FROM @search_chunks WHERE adapter = 'slack_message'"
-    )
+    slack_rows = warehouse._query_dicts("SELECT anchor, text FROM @search_chunks WHERE adapter = 'slack_message'")
     assert len(slack_rows) == 1
     assert "zeppelin" in slack_rows[0]["text"]
     assert "quokka budget" in slack_rows[0]["text"]
@@ -210,8 +249,9 @@ class _FakeEmbeddingClient(EmbeddingClient):
     """Deterministic offline embedder: hash-bucket one-hot-ish vectors."""
 
     def __init__(self) -> None:
-        super().__init__(base_url="http://fake", api_key="fake", model="fake-model",
-                         dimensions=SEARCH_EMBEDDING_DIMENSIONS)
+        super().__init__(
+            base_url="http://fake", api_key="fake", model="fake-model", dimensions=SEARCH_EMBEDDING_DIMENSIONS
+        )
         self.calls = 0
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -292,8 +332,7 @@ def test_search_hybrid_fuses_semantic_and_keyword_ranks(warehouse: PostgresWareh
     # window chunk containing the marmoset line is the nearest neighbor.
     [query_vector] = client.embed(["marmoset enclosure"])
     hits = warehouse._query_dicts(
-        "SELECT source, ref, text, score, event_ts, source_table FROM @search_hybrid("
-        "%s, %s, 'fake-model', 10)",
+        "SELECT source, ref, text, score, event_ts, source_table FROM @search_hybrid(%s, %s, 'fake-model', 10)",
         ("marmoset enclosure", vector_literal(query_vector)),
     )
     assert hits, "expected hybrid hits"

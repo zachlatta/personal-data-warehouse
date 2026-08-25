@@ -1118,6 +1118,9 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
         note="embedding coverage lags chunks by design; staleness here must not page while unconfigured",
     ),
     "search_chunk_sync_state": _state("search_index", "updated_at", "timeline seq watermark"),
+    "search_health": _state(
+        "search_index", "updated_at", "first-class chunk and embedding convergence facts"
+    ),
     # Upstream mutations
     "upstream_mutations": _data("upstream_mutations", "updated_at", "created_at"),
     "upstream_mutation_requests": _data("upstream_mutations", "updated_at", "created_at"),
@@ -1134,7 +1137,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "collation_health": _data(
         "collation_health",
         "collected_at",
-        note="collation baselines and the corroborating unique-index divergence probe",
+        note="collation baselines, duplicate-key corroboration, and scheduled amcheck",
     ),
     # The warehouse's own enrichment agent
     "agent_runs": _data("enrichment_agent", "started_at", "started_at"),

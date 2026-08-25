@@ -1991,6 +1991,27 @@ SEARCH_CHUNK_SYNC_STATE_COLUMNS = (
     "updated_at",
 )
 
+# One row per search stage.  Unlike generic table freshness this records the
+# convergence facts that determine whether hybrid retrieval is complete.
+SEARCH_HEALTH_COLUMNS = (
+    "component",
+    "model",
+    "configured",
+    "pgvector_available",
+    "timeline_max_seq",
+    "chunk_cursor_seq",
+    "caught_up",
+    "processed_rows",
+    # Exact when caught_up=1 (zero); -1 means the bounded worker proved a
+    # backlog exists but deliberately did not scan millions of rows to count it.
+    "pending_count",
+    "oldest_pending_at",
+    "last_success_at",
+    "last_run_at",
+    "last_error",
+    "updated_at",
+)
+
 TIMELINE_SYNC_STATE_COLUMNS = (
     "adapter",
     "backfill_cursor_event_ts",
@@ -2141,6 +2162,13 @@ COLLATION_HEALTH_COLUMNS = (
     "distinct_keys",
     "excess_rows",
     "probe_ms",
+    # Rigorous btree structural verification.  This is separate from the
+    # duplicate-key corroboration above: amcheck sees mis-ordering even when it
+    # has not produced duplicates, including indexes whose heaps are too large
+    # for the count(DISTINCT) probe.
+    "amcheck_status",
+    "amcheck_detail",
+    "amcheck_ms",
     "collected_at",
 )
 

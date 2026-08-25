@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.collation_health import (
+    AMCHECK_STATEMENT_TIMEOUT_MS,
     DIVERGENCE_MAX_HEAP_BYTES,
     FINDING_DUPLICATE_KEYS,
     FINDING_NO_BASELINE,
@@ -37,6 +38,7 @@ from personal_data_warehouse.collation_health import (
     SCOPE_COLLATION,
     SCOPE_DATABASE,
     SCOPE_INDEX,
+    CollationFinding,
     CollationHealthCollector,
 )
 from personal_data_warehouse.postgres import PostgresWarehouse
@@ -145,11 +147,7 @@ def test_only_collations_with_a_dependent_index_are_reported(warehouse):
     how a monitor earns the ignore-it reflex.
     """
     CollationHealthCollector(warehouse).run()
-    reported = {
-        row["object_name"]
-        for row in _findings(warehouse).values()
-        if row["scope"] == SCOPE_COLLATION
-    }
+    reported = {row["object_name"] for row in _findings(warehouse).values() if row["scope"] == SCOPE_COLLATION}
     depended_on = {
         f"{schema}.{name}"
         for schema, name in warehouse._query(
@@ -254,7 +252,7 @@ def test_real_duplicate_keys_under_a_unique_index_are_reported(warehouse):
     """
     warehouse.ensure_upstream_mutation_tables()
     rel = relation("upstream_mutations").with_namespace(warehouse._schema)
-    index_name, = warehouse._query(
+    (index_name,) = warehouse._query(
         """
         SELECT n.nspname || '.' || ic.relname
         FROM pg_index AS i
@@ -371,6 +369,63 @@ def test_the_probe_cannot_see_a_mis_ordered_index_and_the_surface_says_so(wareho
 def test_probe_budget_is_bounded(warehouse):
     assert 0 < PROBE_STATEMENT_TIMEOUT_MS <= 60_000
     assert DIVERGENCE_MAX_HEAP_BYTES >= 256 * 1024 * 1024
+    assert AMCHECK_STATEMENT_TIMEOUT_MS >= PROBE_STATEMENT_TIMEOUT_MS
+
+
+def test_amcheck_pass_is_recorded_independently_of_the_count_probe() -> None:
+    class FakeWarehouse:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+            self.queries: list[tuple[str, tuple]] = []
+
+        def _raw_command(self, sql: str) -> None:
+            self.commands.append(sql)
+
+        def _query(self, sql: str, params=()):
+            self.queries.append((sql, params))
+            return [(None,)]
+
+    fake = FakeWarehouse()
+    collector = CollationHealthCollector(fake, run_amcheck=True)
+    finding = CollationFinding(
+        object_id="index:derived_search.chunks_pkey",
+        scope=SCOPE_INDEX,
+        object_name="derived_search.chunks_pkey",
+        provider="",
+        recorded_version="",
+        actual_version="",
+        dependent_indexes=0,
+        finding="skipped_large",
+        detail="count probe skipped",
+    )
+    collector._run_amcheck(
+        {"index_schema": "derived_search", "index_name": "chunks_pkey"},
+        finding,
+        "public",
+    )
+    assert finding.amcheck_status == "ok"
+    assert "structural verification" in finding.amcheck_detail
+    assert fake.queries[0][1] == ('"derived_search"."chunks_pkey"',)
+    assert any(str(AMCHECK_STATEMENT_TIMEOUT_MS) in command for command in fake.commands)
+
+
+def test_amcheck_candidates_include_non_unique_btrees() -> None:
+    class FakeWarehouse:
+        schema_namespace = "public"
+
+        def physical_schema_names(self, *, include_hidden: bool):
+            assert include_hidden
+            return ["base_gmail"]
+
+        def _query_dicts(self, sql: str, params):
+            assert "am.amname = 'btree'" in sql
+            assert "i.indisunique" not in sql
+            assert params == (["base_gmail"],)
+            return [{"index_name": "messages_date_idx"}]
+
+    assert CollationHealthCollector(FakeWarehouse())._amcheck_candidates() == [
+        {"index_name": "messages_date_idx"}
+    ]
 
 
 def test_the_detector_issues_no_ddl_and_no_repair():
@@ -401,13 +456,7 @@ def test_the_detector_issues_no_ddl_and_no_repair():
             if isinstance(literal, ast.Constant):
                 raw_commands.append(str(literal.value))
             else:
-                raw_commands.append(
-                    "".join(
-                        part.value
-                        for part in literal.values
-                        if isinstance(part, ast.Constant)
-                    )
-                )
+                raw_commands.append("".join(part.value for part in literal.values if isinstance(part, ast.Constant)))
 
     # Reads and planner hints only. `_command` is the warehouse's write door and
     # this module never opens it; persistence goes through the warehouse's own
@@ -494,9 +543,7 @@ def test_duplicate_key_finding_is_classified_as_failing(warehouse):
                 excess_rows=6_622,
             )
         ],
-        collected_at=__import__("datetime").datetime.now(
-            tz=__import__("datetime").UTC
-        ),
+        collected_at=__import__("datetime").datetime.now(tz=__import__("datetime").UTC),
     )
     row = _findings(warehouse)["index:base_slack.message_reactions_pkey"]
     assert row["status"] == "failing"

@@ -154,17 +154,16 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # discovery freshness -- pipeline_health rolls Slack up as one pipeline
         # and cannot see one type stall) and marts_slack.huddles (huddle
         # metadata parsed out of the huddle_thread message payload).
-        "marts": 37,
+        "marts": 38,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +1 internal: internal.search_text_preview, the
         # match-windowed preview helper both search functions use.
         "timeline": 9,
         # +1 ops / +1 private: whoop_private's sync state and its rotating
-        # browser-session credential.
-        # +1 private: slack_sessions, the captured Slack client session that
-        # lets the sync ask client.counts what changed instead of polling every
-        # conversation.
-        "ops": 26,
+        # browser-session credential. Search convergence adds one ops row;
+        # slack_sessions adds the captured Slack client session that lets the
+        # sync ask client.counts what changed instead of polling everything.
+        "ops": 27,
         "private": 7,
         "internal": 2,
     }
@@ -293,6 +292,7 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
         # the collation-drift findings, both rendered by /pipelines.
         "mart_view_health",
         "collation_health",
+        "search_health",
         "upstream_mutations",
         "upstream_mutation_requests",
         "upstream_mutation_events",

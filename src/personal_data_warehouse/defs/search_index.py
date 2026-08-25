@@ -13,6 +13,8 @@ Two assets, deliberately independent:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from dagster import (
     DefaultScheduleStatus,
     Definitions,
@@ -50,6 +52,7 @@ def _warehouse() -> PostgresWarehouse:
     settings = load_settings(require_gmail=False)
     warehouse = PostgresWarehouse(settings.postgres_database_url or "")
     warehouse.ensure_search_index_tables()
+    warehouse.ensure_pipeline_health_tables()
     return warehouse
 
 
@@ -68,9 +71,21 @@ def search_chunks(context) -> MaterializeResult:
         else:
             warehouse = _warehouse()
             try:
-                stats = SearchChunkBuilder(warehouse).run(
-                    max_seconds=SEARCH_CHUNKS_RUN_BUDGET_SECONDS
+                stats = SearchChunkBuilder(warehouse).run(max_seconds=SEARCH_CHUNKS_RUN_BUDGET_SECONDS)
+                timeline_max = int(warehouse._query("SELECT COALESCE(max(seq), 0) FROM @timeline_events")[0][0])
+                warehouse.write_search_health(
+                    "chunks",
+                    timeline_max_seq=timeline_max,
+                    chunk_cursor_seq=stats.last_seq,
+                    caught_up=1 if stats.caught_up and stats.last_seq >= timeline_max else 0,
+                    processed_rows=stats.processed_events,
+                    pending_count=(0 if stats.caught_up and stats.last_seq >= timeline_max else -1),
+                    last_success_at=datetime.now(tz=UTC),
+                    last_error="",
                 )
+            except Exception as error:
+                warehouse.write_search_health("chunks", last_error=str(error)[:500])
+                raise
             finally:
                 warehouse.close()
     return MaterializeResult(
@@ -99,10 +114,37 @@ def search_chunk_embeddings(context) -> MaterializeResult:
         else:
             warehouse = _warehouse()
             try:
-                stats = SearchEmbeddingRunner(warehouse).run(
+                runner = SearchEmbeddingRunner(warehouse)
+                stats = runner.run(
                     limit=SEARCH_EMBEDDINGS_RUN_LIMIT,
                     max_seconds=SEARCH_EMBEDDINGS_RUN_BUDGET_SECONDS,
                 )
+                # from_env is intentionally repeated only for the small config
+                # fact; no request is sent. It keeps the SQL surface honest
+                # when this deployment is deliberately keyword-only.
+                from personal_data_warehouse.search_index import EmbeddingClient
+
+                client = runner._client or EmbeddingClient.from_env()
+                configured = client is not None
+                pgvector = runner._embedding_column_exists()
+                warehouse.write_search_health(
+                    "embeddings",
+                    model=(client.model if client else ""),
+                    configured=1 if configured else 0,
+                    pgvector_available=1 if pgvector else 0,
+                    caught_up=1 if stats.caught_up else 0,
+                    processed_rows=stats.embedded,
+                    pending_count=0 if stats.caught_up else -1,
+                    last_success_at=(
+                        datetime.now(tz=UTC)
+                        if configured and pgvector and not stats.skipped_reason
+                        else datetime.fromtimestamp(0, tz=UTC)
+                    ),
+                    last_error=stats.skipped_reason,
+                )
+            except Exception as error:
+                warehouse.write_search_health("embeddings", last_error=str(error)[:500])
+                raise
             finally:
                 warehouse.close()
             if stats.skipped_reason:
@@ -111,17 +153,13 @@ def search_chunk_embeddings(context) -> MaterializeResult:
         metadata={
             "embedded": MetadataValue.int(stats.embedded if stats else 0),
             "caught_up": MetadataValue.bool(bool(stats.caught_up) if stats else False),
-            "skipped_reason": MetadataValue.text(
-                (stats.skipped_reason if stats else "") or ""
-            ),
+            "skipped_reason": MetadataValue.text((stats.skipped_reason if stats else "") or ""),
         }
     )
 
 
 search_chunks_job = define_asset_job("search_chunks_job", selection=[search_chunks])
-search_chunk_embeddings_job = define_asset_job(
-    "search_chunk_embeddings_job", selection=[search_chunk_embeddings]
-)
+search_chunk_embeddings_job = define_asset_job("search_chunk_embeddings_job", selection=[search_chunk_embeddings])
 
 
 @schedule(

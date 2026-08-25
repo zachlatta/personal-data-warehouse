@@ -23,6 +23,7 @@ const (
 	pipelinesMartMaxRows      = 500
 	pipelinesAdapterMaxRows   = 500
 	pipelinesCollationMaxRows = 2000
+	pipelinesSearchMaxRows    = 10
 )
 
 var pipelineHealthSQL = `
@@ -73,9 +74,17 @@ var pipelineCollationHealthSQL = `
 SELECT object_id, scope, object_name, status, finding, detail, provider,
        recorded_version, actual_version, dependent_indexes, table_name,
        is_unique, is_partial, predicate, key_columns, heap_rows, distinct_keys,
-       excess_rows, probe_ms, collected_at
+       excess_rows, probe_ms, amcheck_status, amcheck_detail, amcheck_ms, collected_at
 FROM ` + warehouse.SQLRelation("marts_collation_health") + `
 ORDER BY scope, object_name`
+
+var pipelineSearchHealthSQL = `
+SELECT component, status, model, configured, pgvector_available,
+       timeline_max_seq, chunk_cursor_seq, seq_lag, caught_up,
+       processed_rows, pending_count, oldest_pending_at,
+       last_success_at, last_run_at, last_error, updated_at, snapshot_age_seconds
+FROM ` + warehouse.SQLRelation("marts_search_health") + `
+ORDER BY component`
 
 type pipelineService struct {
 	warehouse timelineQuerier
@@ -106,6 +115,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 				"marts":      []map[string]any{},
 				"adapters":   []map[string]any{},
 				"collation":  []map[string]any{},
+				"search":     []map[string]any{},
 				"server_now": s.now().UTC().Format(time.RFC3339Nano),
 				"pending":    true,
 			})
@@ -130,12 +140,14 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	marts := s.optionalRows(r, "mart health", pipelineMartHealthSQL, pipelinesMartMaxRows)
 	adapters := s.optionalRows(r, "timeline adapter health", pipelineAdapterHealthSQL, pipelinesAdapterMaxRows)
 	collation := s.optionalRows(r, "collation health", pipelineCollationHealthSQL, pipelinesCollationMaxRows)
+	search := s.optionalRows(r, "search health", pipelineSearchHealthSQL, pipelinesSearchMaxRows)
 	writeJSON(w, map[string]any{
 		"pipelines":  nonNilRows(pipelines.Rows),
 		"tables":     nonNilRows(tables.Rows),
 		"marts":      marts,
 		"adapters":   adapters,
 		"collation":  collation,
+		"search":     search,
 		"server_now": s.now().UTC().Format(time.RFC3339Nano),
 	})
 }

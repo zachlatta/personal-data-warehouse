@@ -300,6 +300,10 @@ func newFullPipelinesTestRunner() *fakeTimelineRunner {
 			collationHealthRow("index:base_slack.messages_pkey", "index", "ok", "ok"),
 		},
 	}
+	runner.argResults[warehouse.SQLRelation("marts_search_health")] = query.RawResult{
+		Columns: []string{"component"},
+		Rows:    []map[string]any{{"component": "chunks", "status": "ok"}, {"component": "embeddings", "status": "backfilling"}},
+	}
 	return runner
 }
 
@@ -317,6 +321,7 @@ func TestPipelinesAPIReturnsEveryHealthLevel(t *testing.T) {
 		Marts     []map[string]any `json:"marts"`
 		Adapters  []map[string]any `json:"adapters"`
 		Collation []map[string]any `json:"collation"`
+		Search    []map[string]any `json:"search"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatalf("decode: %v (%s)", err, body)
@@ -329,6 +334,9 @@ func TestPipelinesAPIReturnsEveryHealthLevel(t *testing.T) {
 	}
 	if len(payload.Collation) != 2 {
 		t.Fatalf("expected collation health in the payload, got %d rows", len(payload.Collation))
+	}
+	if len(payload.Search) != 2 {
+		t.Fatalf("expected search convergence health in the payload, got %d rows", len(payload.Search))
 	}
 	if payload.Marts[0]["stalest_pipeline"] != "pi" {
 		t.Fatalf("mart rows must carry the stalest pipeline: %v", payload.Marts[0])
@@ -343,6 +351,7 @@ func TestPipelinesAPIDegradesPerLevel(t *testing.T) {
 		warehouse.SQLRelation("marts_mart_view_health"),
 		warehouse.SQLRelation("marts_timeline_adapter_health"),
 		warehouse.SQLRelation("marts_collation_health"),
+		warehouse.SQLRelation("marts_search_health"),
 	} {
 		runner := newFullPipelinesTestRunner()
 		runner.argErrs = map[string]error{
@@ -358,6 +367,7 @@ func TestPipelinesAPIDegradesPerLevel(t *testing.T) {
 			Marts     []map[string]any `json:"marts"`
 			Adapters  []map[string]any `json:"adapters"`
 			Collation []map[string]any `json:"collation"`
+			Search    []map[string]any `json:"search"`
 		}
 		if err := json.Unmarshal(body, &payload); err != nil {
 			t.Fatalf("decode: %v (%s)", err, body)
@@ -367,7 +377,7 @@ func TestPipelinesAPIDegradesPerLevel(t *testing.T) {
 		}
 		// The absent level answers with an empty slice, never null: the page
 		// iterates these without a nil check, like every other row list here.
-		if payload.Marts == nil || payload.Adapters == nil || payload.Collation == nil {
+		if payload.Marts == nil || payload.Adapters == nil || payload.Collation == nil || payload.Search == nil {
 			t.Fatalf("%s missing produced a null level: %s", relation, body)
 		}
 	}

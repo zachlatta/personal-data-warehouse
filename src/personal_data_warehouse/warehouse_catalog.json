@@ -2058,6 +2058,18 @@
       "secret": false
     },
     {
+      "id": "search_health",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "search_health",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false,
+      "comment": "Worker-owned convergence facts for search chunking and embeddings; timestamps alone cannot prove a backlog is drained."
+    },
+    {
       "id": "marts_mart_view_health",
       "kind": "view",
       "layer": "marts",
@@ -2079,7 +2091,19 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Collation drift and unique-index divergence. This database has NO recorded collation baseline (pg_database.datcollversion is NULL) while the live library does report a version, and ALTER DATABASE ... REFRESH COLLATION VERSION refuses to create one from NULL - so Postgres can never raise its own mismatch warning and this view is the only cover. Reports only collations an index actually depends on. The duplicate-key probe is corroboration and cannot see a mis-ordered index that has no duplicates; amcheck's bt_index_check is the rigorous tool for that."
+      "comment": "Collation and index integrity. The duplicate-key probe is corroboration; scheduled amcheck bt_index_check is the rigorous structural signal and covers large/expression indexes the count probe skips. Unavailable, timeout, error, and corruption are explicit."
+    },
+    {
+      "id": "marts_search_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "search_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "First-class hybrid-search convergence: timeline seq versus chunk cursor, active embedding model/configuration, exact caught-up state, bounded backlog signal, last success, and errors. A fresh write timestamp alone is not health."
     },
     {
       "id": "marts_ops_plaid_item_health",

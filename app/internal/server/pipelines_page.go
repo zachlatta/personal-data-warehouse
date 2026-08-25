@@ -175,6 +175,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   <div id="groups"></div>
   <div id="marts"></div>
   <div id="adapters"></div>
+  <div id="search"></div>
   <div id="collation"></div>
   <div id="status"></div>
   <div id="legend"></div>
@@ -234,12 +235,13 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   var LEVELS = [
     ["marts", "marts — the read interface, judged on the freshness of what it reads"],
     ["adapters", "timeline adapters — is THIS kind of data reaching timeline.events"],
+    ["search", "search — do chunks and embeddings converge with the timeline"],
     ["collation", "integrity — collation drift and unique-index divergence"]
   ];
 
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
-    pipelines: [], tables: [], marts: [], adapters: [], collation: [],
+    pipelines: [], tables: [], marts: [], adapters: [], search: [], collation: [],
     skew: 0, filter: "", attentionOnly: false, open: {}
   };
 
@@ -355,6 +357,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     return state.pipelines
       .concat(state.marts)
       .concat(state.adapters)
+      .concat(state.search)
       .concat(state.collation);
   }
 
@@ -683,6 +686,8 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       columns.push(["rows", rows(c.heap_rows),
         (c.table_name || "") + (keys.length ? " (" + keys.join(", ") + ")" : ""), false]);
       columns.push(["distinct keys", rows(c.distinct_keys), "", true]);
+      columns.push(["amcheck", c.amcheck_status || "unavailable",
+        (c.amcheck_detail || "") + (c.amcheck_ms ? " · " + c.amcheck_ms + "ms" : ""), true]);
       columns.push(["excess", String(c.excess_rows || 0),
         c.is_partial ? "counted under the index predicate: " + c.predicate
                      : "no partial predicate", true]);
@@ -697,6 +702,22 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     return healthRow(c, c.object_name,
       c.scope + (c.provider ? " · " + c.provider : ""),
       columns, c.detail || "");
+  }
+
+  function searchNode(s) {
+    return healthRow(s, s.component,
+      s.model ? "model " + s.model : "no active model",
+      [
+        ["caught up", s.caught_up ? "yes" : "no",
+          s.component === "chunks"
+            ? "timeline max seq " + s.timeline_max_seq + " · cursor " + s.chunk_cursor_seq
+            : "false is an exact proof a backlog remains; counting the whole corpus is deliberately avoided", false],
+        ["backlog", s.pending_count === null || s.pending_count === undefined
+          ? "exists (bounded)" : rows(s.pending_count),
+          "pending_count is exact at convergence; otherwise the bounded worker reports existence without a full scan", true],
+        ["last success", s.last_success_at ? ago(ageOf(s.last_success_at)) + " ago" : "never",
+          stamp(s.last_success_at), true]
+      ], s.last_error || (!s.configured ? "hybrid falls back to keyword: embeddings unconfigured" : ""));
   }
 
   function renderSection(id, heading, items, nodeFn, sortFn) {
@@ -720,9 +741,10 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   function renderLevels() {
     renderSection("marts", LEVELS[0][1], state.marts, martNode);
     renderSection("adapters", LEVELS[1][1], state.adapters, adapterNode);
+    renderSection("search", LEVELS[2][1], state.search, searchNode);
     // The database's own collation row first: it is the finding the other rows
     // corroborate, and it is the one that says this database cannot warn itself.
-    renderSection("collation", LEVELS[2][1], state.collation, collationNode,
+    renderSection("collation", LEVELS[3][1], state.collation, collationNode,
       function (a, b) {
         if ((a.scope === "database") !== (b.scope === "database")) {
           return a.scope === "database" ? -1 : 1;
@@ -793,11 +815,12 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       " is the only cover; the live library version is stored each run so a future change is visible by comparison. Only" +
       " collations an index actually depends on are shown. The duplicate-key probe applies each index's partial predicate" +
       " and is corroboration only: it cannot see a mis-ordered index that has no duplicates, and three of the seven" +
-      " indexes damaged on 2026-08-23 were exactly that — use amcheck's bt_index_check for that class."));
+      " indexes damaged on 2026-08-23 were exactly that — the scheduled amcheck status on every index is the rigorous signal."));
     node.appendChild(h("br"));
     node.appendChild(document.createTextNode(
       "Everything here is queryable at parity: marts_ops.pipeline_health, marts_ops.table_freshness," +
-      " marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.collation_health."));
+      " marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health," +
+      " marts_ops.collation_health."));
   }
 
   function render() {
@@ -823,6 +846,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       state.tables = body.tables || [];
       state.marts = body.marts || [];
       state.adapters = body.adapters || [];
+      state.search = body.search || [];
       state.collation = body.collation || [];
       state.skew = body.server_now ? new Date(body.server_now).getTime() - Date.now() : 0;
       el("status").textContent = "";

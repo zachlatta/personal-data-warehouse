@@ -39,8 +39,9 @@ COLLATION_HEALTH_CRON = "41 3 * * *"
 def collation_health(context) -> MaterializeResult:
     """Detect collation drift and unique-index divergence.
 
-    Read-only: catalog reads plus bounded ``count(*)``/``count(DISTINCT key)``
-    probes. It issues no DDL, creates no extension, and never REINDEXes —
+    Read-only: catalog reads, bounded ``count(*)``/``count(DISTINCT key)``
+    probes, and rigorous amcheck checks including large indexes. It issues no
+    DDL, creates no extension, and never REINDEXes —
     repair is a human decision with an ordering that matters (dedupe first, or
     the REINDEX fails).
 

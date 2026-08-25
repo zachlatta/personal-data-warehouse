@@ -39,12 +39,13 @@ Four things it gets right, each learned the hard way:
   phantom excess rows on ``ops.upstream_mutation_operations``'s partial unique
   index, which is completely clean.
 
-**And it cannot see the worst class.** Three of the seven damaged indexes had no
-duplicates at all; they were merely mis-ordered, which makes an index *miss rows
-that exist* and surfaces as quietly wrong query results, never as a count. Only
-``amcheck``'s ``bt_index_check`` catches that, and ``amcheck`` needs an
-extension this detector will not create. The duplicate probe is corroboration;
-``amcheck`` is the rigorous tool, and the dashboard says so.
+**The duplicate count is not the integrity check.** Three of the seven damaged
+indexes had no duplicates at all; they were merely mis-ordered, which makes an
+index *miss rows that exist*. The scheduled collector therefore runs amcheck's
+``bt_index_check`` for every valid btree index,
+including large and expression indexes skipped by the corroborating count. It
+never creates the extension or repairs an index; unavailable/error/timeout are
+published explicitly instead of being mistaken for a pass.
 """
 
 from __future__ import annotations
@@ -73,6 +74,7 @@ __all__ = [
     "FINDING_UNKNOWN_ACTUAL",
     "FINDING_VERSION_CHANGED",
     "PROBE_STATEMENT_TIMEOUT_MS",
+    "AMCHECK_STATEMENT_TIMEOUT_MS",
     "SCOPE_COLLATION",
     "SCOPE_DATABASE",
     "SCOPE_INDEX",
@@ -126,6 +128,10 @@ DIVERGENCE_MAX_HEAP_BYTES = 2 * 1024 * 1024 * 1024
 #: index that is in fact clean, and one of the two that actually accumulated
 #: duplicates in the incident, so skipping it instead would have been worse.
 PROBE_STATEMENT_TIMEOUT_MS = 60_000
+# Structural checks are the reason this daily job exists.  Give large indexes
+# a real maintenance-window budget rather than turning them into permanent
+# ``unknown`` rows after sixty seconds.
+AMCHECK_STATEMENT_TIMEOUT_MS = 15 * 60_000
 
 
 @dataclass
@@ -150,6 +156,9 @@ class CollationFinding:
     excess_rows: int = 0
     probe_ms: int = 0
     key_columns: list[str] = field(default_factory=list)
+    amcheck_status: str = "unavailable"
+    amcheck_detail: str = "amcheck extension/function is not installed"
+    amcheck_ms: int = 0
 
 
 #: Postgres spells providers as single characters. Rendering them as words is
@@ -171,9 +180,12 @@ class CollationHealthCollector:
     Nothing here writes to a source relation or issues DDL.
     """
 
-    def __init__(self, warehouse, *, now: Any = None) -> None:
+    def __init__(self, warehouse, *, now: Any = None, run_amcheck: bool | None = None) -> None:
         self._warehouse = warehouse
         self._now = now or (lambda: datetime.now(tz=UTC))
+        self._run_structural_checks = (
+            warehouse.schema_namespace == "public" if run_amcheck is None else run_amcheck
+        )
 
     # -- collection --------------------------------------------------------
 
@@ -335,10 +347,7 @@ class CollationHealthCollector:
                 )
             elif str(recorded) != str(actual):
                 finding.finding = FINDING_VERSION_CHANGED
-                finding.detail = (
-                    f"recorded {recorded}, live {actual}; indexes on this collation "
-                    "may be mis-ordered"
-                )
+                finding.detail = f"recorded {recorded}, live {actual}; indexes on this collation may be mis-ordered"
             findings.append(finding)
         return findings
 
@@ -347,13 +356,94 @@ class CollationHealthCollector:
     def _index_findings(self) -> list[CollationFinding]:
         candidates = self._unique_index_candidates()
         findings: list[CollationFinding] = []
+        amcheck = self._amcheck_function() if self._run_structural_checks else ""
         self._warehouse._raw_command(f"SET statement_timeout = {PROBE_STATEMENT_TIMEOUT_MS}")
         try:
-            for row in candidates:
-                findings.append(self._probe_unique_index(row))
+            findings = [self._probe_unique_index(row) for row in candidates]
+            by_name = {finding.object_name: finding for finding in findings}
+            # Structural integrity applies to every valid btree, not only
+            # UNIQUE indexes. The latter merely get the additional duplicate
+            # corroboration above.
+            for row in self._amcheck_candidates():
+                name = f"{row['index_schema']}.{row['index_name']}"
+                finding = by_name.get(name)
+                if finding is None:
+                    finding = CollationFinding(
+                        object_id=f"index:{name}",
+                        scope=SCOPE_INDEX,
+                        object_name=name,
+                        provider="",
+                        recorded_version="",
+                        actual_version="",
+                        dependent_indexes=0,
+                        finding=FINDING_OK,
+                        detail="non-unique btree; duplicate-key corroboration is not applicable",
+                        table_name=f"{row['table_schema']}.{row['table_name']}",
+                    )
+                    findings.append(finding)
+                self._run_amcheck(row, finding, amcheck)
         finally:
             self._warehouse._raw_command("SET statement_timeout = DEFAULT")
         return findings
+
+    def _amcheck_candidates(self) -> list[dict[str, Any]]:
+        return self._warehouse._query_dicts(
+            """
+            SELECT n.nspname AS index_schema, ic.relname AS index_name,
+                   tn.nspname AS table_schema, tc.relname AS table_name
+            FROM pg_index i
+            JOIN pg_class ic ON ic.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = ic.relnamespace
+            JOIN pg_class tc ON tc.oid = i.indrelid
+            JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+            JOIN pg_am am ON am.oid = ic.relam
+            WHERE i.indisvalid AND i.indisready AND am.amname = 'btree'
+              AND n.nspname = ANY(%s)
+            ORDER BY 1, 2
+            """,
+            (self._warehouse.physical_schema_names(include_hidden=True),),
+        )
+
+    def _amcheck_function(self) -> str:
+        """Return the installed function's qualified schema, never CREATE it."""
+        rows = self._warehouse._query(
+            """
+            SELECT n.nspname
+            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            JOIN pg_extension e ON e.extnamespace = n.oid
+            WHERE e.extname = 'amcheck' AND p.proname = 'bt_index_check'
+            ORDER BY p.pronargs DESC LIMIT 1
+            """
+        )
+        return str(rows[0][0]) if rows else ""
+
+    def _run_amcheck(self, row: dict[str, Any], finding: CollationFinding, function_schema: str) -> None:
+        if not function_schema:
+            return
+        started = time.monotonic()
+        self._warehouse._raw_command(f"SET statement_timeout = {AMCHECK_STATEMENT_TIMEOUT_MS}")
+        try:
+            qualified_index = f"{_ident(row['index_schema'])}.{_ident(row['index_name'])}"
+            self._warehouse._query(
+                f"SELECT {_ident(function_schema)}.bt_index_check(%s::regclass, false)",
+                (qualified_index,),
+            )
+            finding.amcheck_status = "ok"
+            finding.amcheck_detail = "bt_index_check structural verification passed"
+        except psycopg2.errors.QueryCanceled as error:
+            finding.amcheck_status = "timeout"
+            finding.amcheck_detail = _one_line(str(error))[:500]
+        except psycopg2.Error as error:
+            # amcheck reports corruption as an ERROR; unlike an infrastructure
+            # error, the invariant wording is a definitive failing result.
+            detail = _one_line(str(error))[:500]
+            finding.amcheck_status = (
+                "failed" if "invariant" in detail.lower() or "corrupt" in detail.lower() else "error"
+            )
+            finding.amcheck_detail = detail
+        finally:
+            finding.amcheck_ms = int((time.monotonic() - started) * 1000)
+            self._warehouse._raw_command(f"SET statement_timeout = {PROBE_STATEMENT_TIMEOUT_MS}")
 
     def _unique_index_candidates(self) -> list[dict[str, Any]]:
         """Unique btree indexes over plain columns, with their partial predicate.

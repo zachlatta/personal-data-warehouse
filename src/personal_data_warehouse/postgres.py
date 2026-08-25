@@ -86,6 +86,7 @@ from personal_data_warehouse.schema import (
     SLACK_TEAM_COLUMNS,
     SEARCH_CHUNK_COLUMNS,
     SEARCH_CHUNK_EMBEDDING_COLUMNS,
+    SEARCH_HEALTH_COLUMNS,
     SEARCH_CHUNK_SYNC_STATE_COLUMNS,
     SLACK_USER_COLUMNS,
     SYNC_STATE_COLUMNS,
@@ -798,6 +799,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         "embedded_at",
     ),
     "search_chunk_sync_state": TableSpec(SEARCH_CHUNK_SYNC_STATE_COLUMNS, ("id",), "updated_at"),
+    "search_health": TableSpec(SEARCH_HEALTH_COLUMNS, ("component",), "updated_at"),
     # Pipeline freshness snapshot (personal_data_warehouse/pipeline_health.py).
     # One row per pipeline and one per warehouse table, replaced in place by each
     # collection; collected_at is the version column so a stale collector can
@@ -1916,6 +1918,8 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    "oldest_pending_at",
+    "last_success_at",
     # mart health: the stalest input pipeline's last write. (When the view's
     # current definition hash was first observed reuses first_seen_at.)
     "stalest_pipeline_at",
@@ -2007,6 +2011,14 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    "configured",
+    "pgvector_available",
+    "timeline_max_seq",
+    "chunk_cursor_seq",
+    "caught_up",
+    "processed_rows",
+    "pending_count",
+    "amcheck_ms",
     # mart health: input counts and the bounded non-empty probe's answer
     "input_count",
     "inputs_unmeasured",
@@ -3591,6 +3603,7 @@ class PostgresWarehouse:
                 "pipeline_table_freshness",
                 "mart_view_health",
                 "collation_health",
+                "search_health",
             ]
         )
         # _ensure_table_group only CREATEs; it does not widen an existing
@@ -3607,6 +3620,15 @@ class PostgresWarehouse:
         ):
             self._command(
                 f"ALTER TABLE @pipeline_health ADD COLUMN IF NOT EXISTS "
+                f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
+            )
+        for column, ddl_type, default in (
+            ("amcheck_status", "text", "'unavailable'"),
+            ("amcheck_detail", "text", "''"),
+            ("amcheck_ms", "bigint", "0"),
+        ):
+            self._command(
+                f"ALTER TABLE @collation_health ADD COLUMN IF NOT EXISTS "
                 f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
             )
         self._ensure_pipeline_health_mart_views()
@@ -3914,6 +3936,8 @@ class PostgresWarehouse:
                     NULLIF(predicate, '') AS predicate,
                     key_columns,
                     heap_rows, distinct_keys, excess_rows, probe_ms,
+                    amcheck_status, NULLIF(amcheck_detail, '') AS amcheck_detail,
+                    amcheck_ms,
                     NULLIF(collected_at, {epoch}) AS collected_at
                 FROM @collation_health
             )
@@ -3927,6 +3951,7 @@ class PostgresWarehouse:
                             secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
                     -- Duplicate rows under a UNIQUE index are the loudest
                     -- evidence: a working ON CONFLICT cannot produce them.
+                    WHEN scope = 'index' AND amcheck_status = 'failed' THEN 'failing'
                     WHEN finding = 'duplicate_keys' THEN 'failing'
                     -- A recorded baseline that no longer matches the library.
                     WHEN finding = 'version_changed' THEN 'failing'
@@ -3935,8 +3960,11 @@ class PostgresWarehouse:
                     -- drift either, and text index ordering is unverified.
                     WHEN finding = 'no_baseline' THEN 'attention'
                     WHEN finding = 'unknown_actual' THEN 'attention'
+                    WHEN scope = 'index'
+                      AND amcheck_status IN ('timeout', 'error', 'unavailable') THEN 'attention'
                     WHEN finding IN ('timeout', 'error') THEN 'attention'
-                    WHEN finding IN ('skipped_expression', 'skipped_large') THEN 'unmeasured'
+                    WHEN finding IN ('skipped_expression', 'skipped_large')
+                      AND amcheck_status <> 'ok' THEN 'unmeasured'
                     ELSE 'ok'
                 END AS status,
                 finding,
@@ -3954,8 +3982,48 @@ class PostgresWarehouse:
                 distinct_keys,
                 excess_rows,
                 probe_ms,
+                amcheck_status,
+                amcheck_detail,
+                amcheck_ms,
                 collected_at,
                 (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds
+            FROM measured
+            """,
+        )
+
+        # Search convergence cannot be inferred from max(built_at): a chunk
+        # worker or embedder can keep writing recent rows while a backlog grows.
+        self._ensure_view(
+            "marts_search_health",
+            f"""
+            CREATE OR REPLACE VIEW @marts_search_health AS
+            WITH measured AS (
+                SELECT component, NULLIF(model, '') AS model,
+                       configured, pgvector_available,
+                       timeline_max_seq, chunk_cursor_seq, caught_up,
+                       processed_rows,
+                       CASE WHEN pending_count < 0 THEN NULL ELSE pending_count END AS pending_count,
+                       NULLIF(oldest_pending_at, {epoch}) AS oldest_pending_at,
+                       NULLIF(last_success_at, {epoch}) AS last_success_at,
+                       NULLIF(last_run_at, {epoch}) AS last_run_at,
+                       NULLIF(last_error, '') AS last_error,
+                       NULLIF(updated_at, {epoch}) AS updated_at
+                FROM @search_health
+            )
+            SELECT component,
+                   CASE
+                     WHEN updated_at IS NULL OR now() - updated_at > interval '30 minutes' THEN 'unknown'
+                     WHEN configured = 0 OR pgvector_available = 0 THEN 'failing'
+                     WHEN last_error IS NOT NULL THEN 'failing'
+                     WHEN caught_up = 0 THEN 'backfilling'
+                     ELSE 'ok'
+                   END AS status,
+                   model, configured, pgvector_available,
+                   timeline_max_seq, chunk_cursor_seq,
+                   GREATEST(0, timeline_max_seq - chunk_cursor_seq) AS seq_lag,
+                   caught_up, processed_rows, pending_count, oldest_pending_at,
+                   last_success_at, last_run_at, last_error, updated_at,
+                   (EXTRACT(EPOCH FROM now() - updated_at))::bigint AS snapshot_age_seconds
             FROM measured
             """,
         )
@@ -4070,6 +4138,39 @@ class PostgresWarehouse:
             "DELETE FROM @collation_health WHERE object_id <> ALL(%s)",
             ([finding.object_id for finding in findings],),
         )
+
+    def write_search_health(self, component: str, **facts: Any) -> None:
+        """Upsert one search-stage heartbeat without scanning the corpus."""
+        if component not in {"chunks", "embeddings"}:
+            raise ValueError(f"unknown search health component: {component}")
+        now = datetime.now(tz=UTC)
+        row = {
+            "component": component,
+            "model": "",
+            "configured": 1,
+            "pgvector_available": 1,
+            "timeline_max_seq": 0,
+            "chunk_cursor_seq": 0,
+            "caught_up": 0,
+            "processed_rows": 0,
+            "pending_count": -1,
+            "oldest_pending_at": datetime.fromtimestamp(0, tz=UTC),
+            "last_success_at": datetime.fromtimestamp(0, tz=UTC),
+            "last_run_at": now,
+            "last_error": "",
+            "updated_at": now,
+        }
+        previous = self._query_dicts(
+            "SELECT " + ", ".join(SEARCH_HEALTH_COLUMNS) +
+            " FROM @search_health WHERE component = %s",
+            (component,),
+        )
+        if previous:
+            row.update(previous[0])
+            row["last_run_at"] = now
+            row["updated_at"] = now
+        row.update(facts)
+        self._insert_rows("search_health", [row], SEARCH_HEALTH_COLUMNS)
 
     def ensure_timeline_tables(self) -> None:
         """Tables for the unified timeline (personal_data_warehouse/timeline.py).
