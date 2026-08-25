@@ -25,9 +25,18 @@ from personal_data_warehouse.slack_session import (
 
 
 def _resolve_account(explicit: str | None) -> str:
+    """The label the credential is stored under.
+
+    SLACK_ACCOUNTS comes first and the generic personal-email fallbacks come
+    last, because the *sync* looks this credential up by its own Slack account
+    label. Publishing under a different label stores a credential that reads
+    healthy everywhere and that the sync can never find, so it would silently
+    fall back to polling forever.
+    """
     for candidate in (
         explicit,
         os.getenv("SLACK_ACCOUNT"),
+        (os.getenv("SLACK_ACCOUNTS") or "").split(",")[0].strip() or None,
         os.getenv("AGENT_SESSIONS_ACCOUNT"),
         os.getenv("APPLE_MESSAGES_ACCOUNT"),
         (os.getenv("GMAIL_ACCOUNTS") or "").split(",")[0].strip() or None,

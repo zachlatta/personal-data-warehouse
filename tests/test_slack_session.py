@@ -277,3 +277,33 @@ def test_an_unknown_enterprise_says_what_to_do(monkeypatch):
     monkeypatch.setattr(slack_setup, "_workspace_ids_for_enterprise", lambda _e: [])
     with pytest.raises(SlackSessionCaptureError, match="no workspace"):
         slack_setup.resolve_team_id(team_id="", enterprise_id="E_UNKNOWN")
+
+
+def test_the_session_is_keyed_by_the_slack_sync_account(monkeypatch):
+    """The publisher and the sync must agree on the account label.
+
+    The sync looks the credential up by its own Slack account label
+    (SLACK_ACCOUNTS, e.g. "zrl"). Publishing under the generic personal-email
+    fallback instead stores a credential that every dashboard shows as healthy
+    and that the sync can never find -- it would just fall back to polling
+    forever, which is the exact no-op this feature exists to remove.
+    """
+    from personal_data_warehouse import slack_setup
+
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("AGENT_SESSIONS_ACCOUNT", "zach@hackclub.com")
+    assert slack_setup._resolve_account(None) == "zrl"
+
+
+def test_multiple_slack_accounts_take_the_first(monkeypatch):
+    from personal_data_warehouse import slack_setup
+
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl, other")
+    assert slack_setup._resolve_account(None) == "zrl"
+
+
+def test_an_explicit_account_still_wins(monkeypatch):
+    from personal_data_warehouse import slack_setup
+
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    assert slack_setup._resolve_account("chosen") == "chosen"
