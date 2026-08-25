@@ -313,7 +313,10 @@ unified timeline document. Raw message/body columns are deliberately not text-in
   concurrent ANN leg. The instructed/raw forms land in different neighbourhoods and each retrieves
   answers the other misses (blending them into a single vector measured MRR 0.234 against 0.300 for
   separate legs); the content-word forms raised the expanded live-agent benchmark from MRR 0.305 to
-  0.324 and hit@1 from 7 to 8 without reducing hit@5, hit@10, or found@50. When embeddings are not
+  0.321 and hit@1 from 7 to 8 without reducing hit@5, hit@10, or found@50. Their ANN legs use a
+  measured `max(200, 2 * max_results)` candidate bound instead of repeating the original vectors'
+  1,000-row floor. A pooled in-container A/B kept median latency flat while reducing mean latency
+  41%, p90 52%, and maximum 53%. When embeddings are not
   configured or `search_hybrid` is not installed (no pgvector), it automatically falls back to
   keyword search and reports a `fallback_reason`. Agent-session-only searches bound each ANN
   leg to 4x the requested depth (40-200 rows): those chunks are 3.05% of the global HNSW, and

@@ -1740,6 +1740,22 @@ def test_search_hybrid_semantic_helper_runs_exactly_one_vector_leg() -> None:
     assert "chunk_id" in semantic
 
 
+def test_search_hybrid_semantic_helper_can_bound_extra_query_forms() -> None:
+    """Term-bag vectors improve quality from the top of their neighborhoods;
+    they must not each repeat the original vectors' measured 1,000-row floor.
+    """
+
+    sql = _search_text_function_sql()
+    start = sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_semantic(")
+    end = sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(", start)
+    semantic = sql[start:end]
+
+    assert "candidate_limit integer DEFAULT NULL" in semantic
+    assert "requested_candidates integer" in semantic
+    assert semantic.count("LIMIT requested_candidates") == 2  # global + Drive plans
+    assert "DROP FUNCTION IF EXISTS @search_hybrid_semantic(text, text, integer, text[], timestamptz)" in sql
+
+
 def test_search_hybrid_fuse_accepts_compact_parallel_leg_results() -> None:
     sql = _search_text_function_sql()
     start = sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_fuse(")
@@ -1767,7 +1783,9 @@ def test_parallel_hybrid_helpers_reject_unknown_source_tokens() -> None:
 def test_search_hybrid_uses_a_deep_filtered_semantic_candidate_pool() -> None:
     sql = _search_text_function_sql()
 
-    assert sql.count("least(greatest(per_source * 20, 1000), 2000)") >= 2
+    # The full-depth formula is computed once per helper invocation; the app
+    # invokes the helper independently for each original query vector.
+    assert sql.count("least(greatest(per_source * 20, 1000), 2000)") >= 1
 
 
 def test_search_hybrid_bounds_agent_session_semantic_candidate_work() -> None:

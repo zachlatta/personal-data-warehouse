@@ -10075,6 +10075,7 @@ class PostgresWarehouse:
             -- replaces, so obsolete public signatures have to go explicitly.
             DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz);
             DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz, text);
+            DROP FUNCTION IF EXISTS @search_hybrid_semantic(text, text, integer, text[], timestamptz);
             CREATE OR REPLACE FUNCTION @search_hybrid_semantic(
                 query_embedding text,
                 embedding_model text DEFAULT '"""
@@ -10082,7 +10083,8 @@ class PostgresWarehouse:
                 + r"""',
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
-                since timestamptz DEFAULT NULL
+                since timestamptz DEFAULT NULL,
+                candidate_limit integer DEFAULT NULL
             )
             RETURNS TABLE (ref text, best bigint, fuse double precision, chunk_id text)
             LANGUAGE plpgsql
@@ -10092,6 +10094,7 @@ class PostgresWarehouse:
                 per_source integer := least(greatest(coalesce(max_results, 50), 1), """
                 + str(SEARCH_TEXT_MAX_RESULTS_CAP)
                 + r""");
+                requested_candidates integer;
                 sem_adapters text[];
                 qvec public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
@@ -10125,6 +10128,34 @@ class PostgresWarehouse:
                             USING HINT = 'use timeline.search_text_sources() to list accepted source tokens';
                     END IF;
                 END IF;
+                requested_candidates := CASE
+                    WHEN candidate_limit IS NOT NULL THEN least(
+                        greatest(candidate_limit, per_source),
+                        CASE WHEN sem_adapters <@ ARRAY[
+                            'agent_session', 'agent_session_turn'
+                        ]::text[] THEN """
+                + str(SEARCH_HYBRID_AGENT_MAX_CANDIDATES)
+                + r""" ELSE """
+                + str(SEARCH_HYBRID_MAX_CANDIDATES)
+                + r""" END
+                    )
+                    WHEN sem_adapters <@ ARRAY[
+                        'agent_session', 'agent_session_turn'
+                    ]::text[] THEN least(greatest(per_source * """
+                + str(SEARCH_HYBRID_AGENT_CANDIDATE_MULTIPLIER)
+                + ", "
+                + str(SEARCH_HYBRID_AGENT_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_AGENT_MAX_CANDIDATES)
+                + r""")
+                    ELSE least(greatest(per_source * """
+                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
+                + ", "
+                + str(SEARCH_HYBRID_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_MAX_CANDIDATES)
+                + r""")
+                END;
                 RETURN QUERY
                 WITH sem_chunks AS (
                     -- Most scopes use global HNSW. Drive is excluded because a
@@ -10144,21 +10175,7 @@ class PostgresWarehouse:
                       AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
                       AND (since IS NULL OR c.event_ts >= since)
                     ORDER BY e.embedding OPERATOR(public.<=>) qvec
-                    LIMIT CASE WHEN sem_adapters <@ ARRAY[
-                        'agent_session', 'agent_session_turn'
-                    ]::text[] THEN least(greatest(per_source * """
-                + str(SEARCH_HYBRID_AGENT_CANDIDATE_MULTIPLIER)
-                + ", "
-                + str(SEARCH_HYBRID_AGENT_MIN_CANDIDATES)
-                + "), "
-                + str(SEARCH_HYBRID_AGENT_MAX_CANDIDATES)
-                + r""") ELSE least(greatest(per_source * """
-                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
-                + ", "
-                + str(SEARCH_HYBRID_MIN_CANDIDATES)
-                + "), "
-                + str(SEARCH_HYBRID_MAX_CANDIDATES)
-                + r""") END
+                    LIMIT requested_candidates
                     )
                     UNION ALL
                     (
@@ -10186,13 +10203,7 @@ class PostgresWarehouse:
                             OFFSET 0
                         ) s
                         ORDER BY s.distance
-                        LIMIT least(greatest(per_source * """
-                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
-                + ", "
-                + str(SEARCH_HYBRID_MIN_CANDIDATES)
-                + "), "
-                + str(SEARCH_HYBRID_MAX_CANDIDATES)
-                + r""")
+                        LIMIT requested_candidates
                     ) top
                     ORDER BY top.distance
                     )

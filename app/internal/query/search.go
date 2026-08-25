@@ -140,7 +140,7 @@ const (
 	// Search fans these statements out over the connection pool and gives their
 	// refs/ranks to search_hybrid_fuse, keeping all ranking constants in SQL.
 	searchHybridLexicalSQL  = "SELECT ref FROM timeline.search_text($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
-	searchHybridSemanticSQL = "SELECT ref, best, fuse, chunk_id FROM timeline.search_hybrid_semantic($1, $2, $3::integer, $4::text[], $5::timestamptz)"
+	searchHybridSemanticSQL = "SELECT ref, best, fuse, chunk_id FROM timeline.search_hybrid_semantic($1, $2, $3::integer, $4::text[], $5::timestamptz, $6::integer)"
 	searchHybridExactSQL    = "SELECT ref FROM timeline.search_hybrid_exact($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
 	searchHybridFuseSQL     = "SELECT " + searchResultColumns + " FROM timeline.search_hybrid_fuse($1, $2::integer, $3::text[], $4::jsonb, $5::text[], $6::text[])"
 
@@ -150,9 +150,19 @@ const (
 	// tool answering (via keyword fallback) instead of erroring there.
 	searchHybridProbeSQL = "SELECT " +
 		"to_regprocedure('timeline.search_hybrid(text,text,text,integer,text[],timestamptz,text,text[])') IS NOT NULL " +
-		"AND to_regprocedure('timeline.search_hybrid_semantic(text,text,integer,text[],timestamptz)') IS NOT NULL " +
+		"AND to_regprocedure('timeline.search_hybrid_semantic(text,text,integer,text[],timestamptz,integer)') IS NOT NULL " +
 		"AND to_regprocedure('timeline.search_hybrid_exact(text,integer,text[],timestamptz,text[])') IS NOT NULL " +
 		"AND to_regprocedure('timeline.search_hybrid_fuse(text,integer,text[],jsonb,text[],text[])') IS NOT NULL AS installed"
+)
+
+// Content-word variants only need the top of their ANN neighborhoods to
+// deliver the measured quality gain. Repeating the original vectors' 1,000-row
+// floor made warm searches slower despite the parallel fan-out. Keep at least
+// two candidates per requested result for unusually deep calls, with a floor
+// validated against the expanded live-agent benchmark.
+const (
+	searchHybridTermBagMinCandidates = 200
+	searchHybridTermBagMultiplier    = 2
 )
 
 // Fallback reasons the response carries when hybrid mode ran the keyword path
@@ -372,11 +382,21 @@ func (s *Service) runHybridSearch(
 		index, vector := index, vector
 		group.Go(func() error {
 			var err error
+			var candidateLimit any
+			if index >= 2 {
+				limit := maxResults * searchHybridTermBagMultiplier
+				if limit < searchHybridTermBagMinCandidates {
+					limit = searchHybridTermBagMinCandidates
+				}
+				candidateLimit = limit
+			}
 			// The SQL function owns a measured 40-200 or 1000-2000 row
-			// bound. maxRows=0 avoids duplicating that tuning constant here.
+			// bound for the original forms. Extra deterministic term-bag
+			// forms use the smaller measured override above. maxRows=0 lets
+			// SQL return every event inside whichever candidate bound applies.
 			semantic[index], err = runner.QueryArgs(
 				groupCtx, searchHybridSemanticSQL,
-				[]any{vector, embeddingModel, maxResults, sources, since}, 0,
+				[]any{vector, embeddingModel, maxResults, sources, since, candidateLimit}, 0,
 			)
 			if err != nil {
 				return fmt.Errorf("hybrid semantic leg %d: %w", index+1, err)

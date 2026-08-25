@@ -286,7 +286,12 @@ helpers. Separate legs, not a blend: the instructed and raw forms land in differ
 neighbourhoods and each retrieves answers the other misses, so averaging them into one vector
 averages the difference away — measured on the labeled benchmark, blending scored MRR 0.234
 where two legs scored 0.300. The content-word forms raised the expanded live-agent benchmark
-from MRR 0.305 to 0.324 and hit@1 from 7 to 8 without reducing hit@5, hit@10, or found@50. The instruction
+from MRR 0.305 to 0.321 and hit@1 from 7 to 8 without reducing hit@5, hit@10, or found@50. Their
+ANN legs deliberately use only `max(200, 2 * max_results)` candidates; repeating the original
+vectors' 1,000-row floor made warm searches slower, while the 200-row floor preserved every
+headline quality metric. In an in-container pooled A/B over eight queries twice, the parallel
+path kept median latency flat (1.108s → 1.102s) while cutting mean 2.10s → 1.25s, p90
+3.79s → 1.82s, and max 6.40s → 3.01s. The instruction
 *text* matters as much as its presence (0.240 vs 0.300 for two wordings of the same task),
 so re-measure with `search_benchmark` before changing it. Write the instruction's newline as
 the two characters `\n`, which the app decodes: Coolify truncates an environment value at a

@@ -228,11 +228,14 @@ func TestSearchHybridModeFansIndependentLegsOutThenFuses(t *testing.T) {
 		}
 	}
 	semanticArgs := runner.callsFor(searchHybridSemanticSQL)
-	if len(semanticArgs) != 1 || len(semanticArgs[0]) != 5 {
+	if len(semanticArgs) != 1 || len(semanticArgs[0]) != 6 {
 		t.Fatalf("semantic args = %#v", semanticArgs)
 	}
 	if semanticArgs[0][0] != "[0.5,-1.25]" || semanticArgs[0][1] != "test-model" || semanticArgs[0][2] != searchDefaultMaxResults {
 		t.Fatalf("semantic args = %#v", semanticArgs[0])
+	}
+	if semanticArgs[0][5] != nil {
+		t.Fatalf("the original query leg must keep the measured full candidate pool: %#v", semanticArgs[0])
 	}
 	fuseCalls := runner.callsFor(searchHybridFuseSQL)
 	if len(fuseCalls) != 1 {
@@ -283,6 +286,39 @@ func TestSearchHybridPassesBothQueryRepresentations(t *testing.T) {
 	}
 	if embedder.calls != 1 {
 		t.Fatalf("both representations must ride in one request; calls = %d", embedder.calls)
+	}
+}
+
+func TestSearchHybridBoundsOnlyTheExtraTermBagLegs(t *testing.T) {
+	runner := &fakeSearchRunner{
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{
+			searchHybridSemanticSQL: semanticHits(),
+			searchHybridFuseSQL:     searchHit(),
+		},
+	}
+	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{
+		{1, 0}, {0, 1}, {2, 0}, {0, 2},
+	}}
+	svc := NewService(runner, Options{SearchEmbedder: embedder})
+
+	resp := svc.Search(context.Background(), SearchRequest{Query: "what is still owed to the vet clinic"})
+	if resp.Error != "" {
+		t.Fatalf("error: %s", resp.Error)
+	}
+	calls := runner.callsFor(searchHybridSemanticSQL)
+	if len(calls) != 4 {
+		t.Fatalf("semantic calls = %#v", calls)
+	}
+	wantLimit := map[any]any{
+		"[1,0]": nil, "[0,1]": nil,
+		"[2,0]": searchHybridTermBagMinCandidates,
+		"[0,2]": searchHybridTermBagMinCandidates,
+	}
+	for _, args := range calls {
+		if len(args) != 6 || args[5] != wantLimit[args[0]] {
+			t.Fatalf("semantic args = %#v, want candidate limit %#v", args, wantLimit[args[0]])
+		}
 	}
 }
 
