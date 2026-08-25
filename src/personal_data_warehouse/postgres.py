@@ -108,6 +108,7 @@ from personal_data_warehouse.schema import (
     WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS,
     WHOOP_PRIVATE_JOURNAL_ENTRY_COLUMNS,
     WHOOP_PRIVATE_RECOVERY_COLUMNS,
+    SLACK_SESSION_COLUMNS,
     WHOOP_PRIVATE_SESSION_COLUMNS,
     WHOOP_PRIVATE_SLEEP_COLUMNS,
     WHOOP_PRIVATE_SLEEP_EVENT_COLUMNS,
@@ -750,6 +751,13 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "whoop_private_sync_state": TableSpec(
         WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
         ("account", "collection"),
+    ),
+    # PK (account, session_key) is load-bearing: the app's publish endpoint
+    # upserts this same table with ON CONFLICT (account, session_key). See
+    # app/internal/slacksession/store.go.
+    "slack_sessions": TableSpec(
+        SLACK_SESSION_COLUMNS,
+        ("account", "session_key"),
     ),
     # PK (account, session_key) is load-bearing: the app's publish endpoint
     # upserts this same table with ON CONFLICT (account, session_key). See

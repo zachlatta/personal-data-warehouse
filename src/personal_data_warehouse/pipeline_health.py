@@ -968,6 +968,9 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "slack_messages": _data("slack", "synced_at", "message_datetime"),
     "slack_files": _data("slack", "synced_at", "created_at"),
     "slack_message_reactions": _support("slack", "synced_at", note="too large to probe unindexed"),
+    "slack_sessions": _state(
+        "slack", "updated_at", "captured client session (xoxc token + `d` cookie) for client.counts"
+    ),
     "slack_teams": _support("slack", "synced_at"),
     "slack_account_identities": _support("slack", "synced_at"),
     "slack_users": _support("slack", "synced_at"),

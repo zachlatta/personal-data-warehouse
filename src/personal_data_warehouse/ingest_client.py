@@ -326,6 +326,51 @@ class IngestClient:
             params={},
         )
 
+    def publish_slack_session(
+        self,
+        *,
+        account: str,
+        session_token: str,
+        session_cookie: str,
+        team_id: str,
+        enterprise_id: str = "",
+        user_id: str = "",
+        team_url: str = "",
+        cookie_expires_at: str = "",
+        session_key: str = "default",
+        source_app: str = "",
+    ) -> Mapping[str, Any]:
+        """Publish a captured Slack client session to the app.
+
+        Both halves go together on purpose: an ``xoxc`` token without the ``d``
+        cookie authenticates as nobody, and the app rejects a publish carrying
+        only one. ``team_id`` must be the workspace id -- Enterprise Grid's
+        auth.test reports the org's ``E`` id, and the app refuses that in this
+        field because storing it would fork every warehouse row.
+
+        Returns the app's acknowledgement, which carries a fingerprint and
+        identity but never the credential itself.
+        """
+        payload = {
+            "account": account,
+            "session_key": session_key,
+            "session_token": session_token,
+            "session_cookie": session_cookie,
+            "team_id": team_id,
+            "enterprise_id": enterprise_id,
+            "user_id": user_id,
+            "team_url": team_url,
+            "source_app": source_app,
+            "cookie_expires_at": cookie_expires_at,
+        }
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return self._signed_post(
+            "/ingest/slack/session",
+            body=body,
+            content_type="application/json",
+            params={},
+        )
+
     # --- agent sessions -----------------------------------------------------
     def upload_agent_sessions_batch(self, gzip_bytes: bytes, *, exported_at: str) -> StoredObjectDict:
         return self._post(

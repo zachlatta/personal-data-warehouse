@@ -2397,6 +2397,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     ),
     "whoop_private_sports": _entity("sport catalog resolving a workout's sport_id"),
     "whoop_private_sync_state": _state("per-collection private-API scan watermark"),
+    "slack_sessions": _state("captured Slack client session credential (xoxc token + `d` cookie)"),
     "whoop_private_sessions": _state("rotating private-API browser session credential"),
     # Plaid finance data is queryable through base_plaid.* and marts_finance.* but
     # deliberately excluded from the general communications/activity timeline.

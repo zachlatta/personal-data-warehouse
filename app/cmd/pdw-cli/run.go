@@ -81,6 +81,10 @@ COMMANDS
                              agent-sessions. Flags after <source> are forwarded
                              to the uploader (e.g. --mode incremental|full,
                              --limit N). See "pdw ingest --help".
+  slack publish-session      Publish this Mac's Slack client session to the
+                             warehouse, so the sync can ask Slack what changed
+                             in one request instead of polling every
+                             conversation. See "pdw slack --help".
   version                    Print the build version.
   update                     Replace this binary with the latest GitHub release.
                                --check  Only report whether an update is available.
@@ -206,6 +210,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	// posted to the app's signed endpoint, with no /api/tools client needed.
 	if cmd == "whoop" {
 		return runWhoop(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
+	}
+	// slack publish-session captures the Slack desktop app's client session and
+	// posts it to the app's signed endpoint -- same shape again.
+	if cmd == "slack" {
+		return runSlack(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
 	}
 	if hasHelpArg(rest) {
 		fmt.Fprint(stdout, usage)

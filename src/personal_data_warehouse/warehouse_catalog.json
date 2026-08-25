@@ -2687,6 +2687,17 @@
       }
     },
     {
+      "id": "slack_sessions",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "slack_sessions",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true
+    },
+    {
       "id": "whoop_private_sessions",
       "kind": "table",
       "layer": "private",

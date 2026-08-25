@@ -1826,6 +1826,35 @@ WHOOP_PRIVATE_SYNC_STATE_COLUMNS = (
 #: before any poll has run. The two definitions must agree column for column --
 #: the app's upsert names ``ON CONFLICT (account, session_key)``, so even the
 #: primary key is part of the contract.
+# The Slack *client* session: an xoxc token plus the `d` cookie, which are
+# useless apart. It exists because Slack's public API has no bulk "what changed"
+# call -- see slack_session.py -- and client.counts does, but only for a real
+# signed-in session.
+SLACK_SESSION_COLUMNS = (
+    "account",
+    "session_key",
+    "session_token",
+    "session_cookie",
+    # Non-secret fingerprint of the token, so sync state can record which
+    # credential was rejected without storing the secret a second time.
+    "token_sha256",
+    # Hack Club is Enterprise Grid, so the session authenticates against the ORG
+    # and auth.test returns an E-id. Every warehouse row is keyed by the
+    # workspace T-id, so the two are stored apart on purpose; conflating them
+    # would silently fork the dataset. See slack_session.py.
+    "team_id",
+    "enterprise_id",
+    "user_id",
+    "team_url",
+    "source_app",
+    "cookie_expires_at",
+    "published_at",
+    "updated_at",
+    "sync_version",
+    "status",
+    "error",
+)
+
 WHOOP_PRIVATE_SESSION_COLUMNS = (
     "account",
     "session_key",

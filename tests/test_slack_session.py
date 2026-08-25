@@ -235,3 +235,45 @@ def test_capture_keeps_a_real_workspace_team_id(tmp_path):
         auth_test=lambda **_: {"ok": True, "team_id": "T0266FRGM", "user_id": "U1", "url": ""},
     )
     assert (session.team_id, session.enterprise_id) == ("T0266FRGM", "")
+
+
+def test_workspace_id_is_resolved_from_the_enterprise_id(monkeypatch):
+    """A client session knows only the org; the warehouse is keyed by workspace.
+
+    base_slack.teams already carries the enterprise_id -> team_id mapping, so the
+    publisher resolves it rather than asking the human to know it. Without this
+    the credential would arrive with an empty team_id and the sync would have
+    nothing to key its writes by.
+    """
+    from personal_data_warehouse import slack_setup
+
+    monkeypatch.setattr(
+        slack_setup, "_workspace_ids_for_enterprise", lambda _e: ["T0266FRGM"]
+    )
+    assert slack_setup.resolve_team_id(team_id="", enterprise_id="E09V59WQY1E") == "T0266FRGM"
+
+
+def test_a_session_that_already_names_a_workspace_is_left_alone(monkeypatch):
+    from personal_data_warehouse import slack_setup
+
+    monkeypatch.setattr(slack_setup, "_workspace_ids_for_enterprise", lambda _e: ["T_OTHER"])
+    assert slack_setup.resolve_team_id(team_id="T0266FRGM", enterprise_id="") == "T0266FRGM"
+
+
+def test_an_ambiguous_enterprise_refuses_to_guess(monkeypatch):
+    """Two workspaces under one org is a coin flip we must not take silently."""
+    from personal_data_warehouse import slack_setup
+
+    monkeypatch.setattr(
+        slack_setup, "_workspace_ids_for_enterprise", lambda _e: ["T1", "T2"]
+    )
+    with pytest.raises(SlackSessionCaptureError, match="more than one workspace"):
+        slack_setup.resolve_team_id(team_id="", enterprise_id="E1")
+
+
+def test_an_unknown_enterprise_says_what_to_do(monkeypatch):
+    from personal_data_warehouse import slack_setup
+
+    monkeypatch.setattr(slack_setup, "_workspace_ids_for_enterprise", lambda _e: [])
+    with pytest.raises(SlackSessionCaptureError, match="no workspace"):
+        slack_setup.resolve_team_id(team_id="", enterprise_id="E_UNKNOWN")

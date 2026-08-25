@@ -18,6 +18,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/slacksession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/whoopsession"
 )
@@ -302,6 +303,16 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		} else {
 			mux.Handle(whoopsession.Endpoint, whoopsession.NewService(whoopStore, authSvc, time.Now, logger).Handler())
 			logger.Info("whoop private session publishing enabled", "endpoint", whoopsession.Endpoint)
+		}
+
+		// Slack's public API has no bulk "what changed" call, so the sync needs a
+		// real client session to use client.counts. Same signed-publish shape.
+		slackStore, sderr := slacksession.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+		if sderr != nil {
+			logger.Error("slack session store failed to initialize; session publishing disabled", "error", sderr.Error())
+		} else {
+			mux.Handle(slacksession.Endpoint, slacksession.NewService(slackStore, authSvc, time.Now, logger).Handler())
+			logger.Info("slack client session publishing enabled", "endpoint", slacksession.Endpoint)
 		}
 
 		// The Claude Desktop credential endpoint persists a secret in Postgres
