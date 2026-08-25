@@ -2218,10 +2218,10 @@ def test_null_priority_fails_the_adapter_and_is_visible_in_health(warehouse):
             'null-priority' AS event_id, 'gmail' AS source, 'email' AS kind,
             m.internal_date AS event_ts, '1970-01-01'::timestamptz AS end_ts,
             '' AS actor, '' AS title, '' AS snippet, '' AS context,
-            m.id::text AS source_pk, '{}'::jsonb::text AS metadata,
+            m.message_id::text AS source_pk, '{}'::jsonb::text AS metadata,
             '' AS search_text, m.synced_at AS ingest_ts, NULL::text AS priority
         FROM @gmail_messages m
-        WHERE m.id = 'm1'
+        WHERE m.message_id = 'm1'
     """
     broken = adapter_by_name("gmail_email").__class__(
         name="null_priority",

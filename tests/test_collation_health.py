@@ -182,7 +182,7 @@ def test_only_collations_with_a_dependent_index_are_reported(warehouse):
 # --- the corroborating divergence probe ---------------------------------------
 
 
-def test_a_partial_unique_index_with_rows_outside_its_predicate_reads_clean(warehouse):
+def test_a_partial_unique_index_with_rows_outside_its_predicate_has_a_clean_count(warehouse):
     """The predicate is not optional. Ignoring it invents duplicates.
 
     ``ops.upstream_mutation_operations`` has a UNIQUE index over
@@ -238,7 +238,12 @@ def test_a_partial_unique_index_with_rows_outside_its_predicate_reads_clean(ware
     assert row["is_partial"] == 1
     assert row["predicate"] == predicate
     assert row["finding"] == FINDING_OK, row["detail"]
-    assert row["status"] == "ok"
+    # This fixture deliberately does not run amcheck in its throwaway schema,
+    # so the holistic integrity status remains attention even though the
+    # duplicate-key corroboration itself is clean. An unavailable structural
+    # check must never be presented as a clean bill of health.
+    assert row["amcheck_status"] == "unavailable"
+    assert row["status"] == "attention"
     assert row["excess_rows"] == 0
     # Only the two rows inside the predicate were counted, not all eight.
     assert row["heap_rows"] == 2

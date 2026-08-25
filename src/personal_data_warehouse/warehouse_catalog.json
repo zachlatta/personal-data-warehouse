@@ -2091,7 +2091,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Collation and index integrity. A bounded persisted rotation runs amcheck bt_index_check across every valid btree, prioritizing never-checked, old, large, and previously failing indexes while retaining unvisited results. Pending/unavailable/timeout/error/corruption are explicit."
+      "comment": "Collation and index integrity. The duplicate-key count is corroboration and cannot see mis-ordered indexes; a bounded persisted rotation runs amcheck bt_index_check across every valid btree, prioritizing never-checked, old, large, and previously failing indexes while retaining unvisited results. Pending/unavailable/timeout/error/corruption are explicit."
     },
     {
       "id": "marts_search_health",
