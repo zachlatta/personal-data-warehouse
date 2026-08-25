@@ -138,7 +138,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         session = discover_slack_session(source=args.source)
     except SlackSessionCaptureError as exc:
-        print(json.dumps({"error": str(exc)}, indent=2))
+        report = {"error": str(exc)}
+        if "timed out" in str(exc):
+            # `security` blocking to its timeout means it put up a prompt and
+            # nobody answered -- which in a LaunchAgent is always true. Naming the
+            # two real causes here saves the next reader from debugging a "hung"
+            # binary that is working exactly as designed.
+            report["likely_cause"] = (
+                "the macOS keychain prompted and no one could answer: either the login "
+                "keychain is locked (Mac asleep or at the login screen), or the ACL on "
+                "'Slack Safe Storage' is a one-shot 'Allow' instead of 'Always Allow'"
+            )
+            report["fix"] = (
+                "unlock the Mac, then run `pdw slack publish-session` once from a GUI "
+                "terminal and choose 'Always Allow'"
+            )
+        print(json.dumps(report, indent=2, sort_keys=True))
         return 1
     report["session"] = session.redacted()
 

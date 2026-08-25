@@ -2278,6 +2278,15 @@ Three behaviours are load-bearing and each failure would be silent:
 - Run cadence: every 3600 seconds with `RunAtLoad`
 - Run log: `~/Library/Logs/personal-data-warehouse/slack-auth.run.log`
 
+**When it fails, `security` timing out after 60 seconds is the usual reason and it is not
+a hung binary.** It means the keychain put up a prompt no LaunchAgent can answer: either the
+login keychain is locked (Mac asleep or at the login screen) or the ACL on "Slack Safe
+Storage" is a one-shot "Allow" rather than "Always Allow". The command says so in its own
+output. This is benign in itself — the `d` cookie is valid for ~13 months, so an hour (or a
+week) of missed re-publishes changes nothing; only a genuinely rotated session needs the
+agent to succeed. Repair by unlocking the Mac and running it once from a GUI terminal,
+choosing **Always Allow**.
+
 It runs on the Mac signed in to the Slack desktop app (**crobat**), not on porygon, because
 that is where the session lives. **The wrapper execs `uv run python -m
 personal_data_warehouse.slack_setup` directly and deliberately keeps `pdw` out of the exec

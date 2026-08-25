@@ -307,3 +307,34 @@ def test_an_explicit_account_still_wins(monkeypatch):
 
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     assert slack_setup._resolve_account("chosen") == "chosen"
+
+
+def test_a_keychain_prompt_timeout_explains_itself(monkeypatch):
+    """`security` timing out means a prompt nobody can answer, not a broken tool.
+
+    In a LaunchAgent there is no one to click, so `security find-generic-password`
+    blocks until its 60s timeout. The raw error says only "timed out after 60
+    seconds", which reads like a hung binary and sends the next person hunting.
+    It has exactly two causes worth naming: the login keychain is locked (the Mac
+    is asleep or at the login screen), or the ACL says one-shot "Allow" instead
+    of "Always Allow". Observed on crobat 2026-08-25: the agent published fine
+    for an hour, then began timing out hourly.
+    """
+    from personal_data_warehouse import slack_setup
+    from personal_data_warehouse.slack_session import SlackSessionCaptureError
+
+    def boom(**_):
+        raise SlackSessionCaptureError(
+            "could not run `security` to read Slack Safe Storage: Command "
+            "'['security', ...]' timed out after 60 seconds"
+        )
+
+    monkeypatch.setattr(slack_setup, "discover_slack_session", boom)
+    printed: list[str] = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+
+    assert slack_setup.main([]) == 1
+    blob = " ".join(printed).lower()
+    assert "keychain" in blob
+    assert "always allow" in blob
+    assert "locked" in blob
