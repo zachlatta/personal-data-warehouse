@@ -23,9 +23,10 @@ quietly becoming untrue, and several of these have been.
 - **C2 — the timeline has five priority tiers and everything is properly categorized.**
   `self`, `direct`, `cc`, `noise`, `background`, in that attention order, stored in the
   `timeline.timeline_priority` enum. *Held up by* the enum itself (an invalid label is a
-  Postgres error) and the classification tests. *Gap:* which tier an adapter assigns is a
-  judgement no test can make for you, and a forgotten classification silently defaults to
-  `cc`. See [Timeline priority tiers](#timeline-priority-tiers).
+  Postgres error), required per-adapter priority expressions, runtime validation that rejects
+  NULL/unknown outputs before a batch is written, and the classification tests. Failures are
+  recorded in `marts_ops.timeline_adapter_health`. *Gap:* which valid tier an adapter assigns
+  is a judgement no test can make for you. See [Timeline priority tiers](#timeline-priority-tiers).
 - **C3 — agents start at the timeline and can filter by priority.** The `search` tool or
   `timeline.events`/`timeline.search_text()` in SQL, then one hop out to the source row.
   *Held up by* the catalog's `START HERE` guidance being published as real schema comments
@@ -184,9 +185,13 @@ changes) and it is part of `adapter_signature` in `ops.timeline_sync_state`. Cha
 changes the signature, which resets that adapter's backfill and re-walks **every row it
 owns** — slack alone is 46.8M rows, and a past re-walk grew `timeline.events` to 93 GB before
 it settled. Batch the change with any other adapter edit you were going to make, expect the
-table to bloat while it runs, and plan the vacuum. A forgotten classification is the quieter
-failure: the engine wraps every adapter's expression in `COALESCE(..., 'cc')`, so a new
-adapter that never assigns a tier produces plausible-looking `cc` rows instead of an error.
+table to bloat while it runs, and plan the vacuum. There is no fallback tier: every adapter
+must declare a priority expression, and a NULL or unknown result fails that adapter before
+the batch is written. The error is persisted in `ops.timeline_sync_state` and surfaces as
+`failing` in `marts_ops.timeline_adapter_health`. The fail-loud engine rollout deliberately
+preserves the legacy generated SQL only for signature calculation, so removing the old
+`COALESCE(..., 'cc')` wrapper itself does **not** reset all adapter backfills; changing an
+adapter's actual classification expression still resets that adapter normally.
 
 ## Timeline search and hybrid retrieval
 

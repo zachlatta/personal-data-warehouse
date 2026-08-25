@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from datetime import UTC, datetime, timedelta
@@ -28,6 +29,8 @@ from personal_data_warehouse.timeline import (
     BACKFILL_CURSOR_START,
     TimelineSyncEngine,
     TimelineSyncError,
+    _simple_adapter,
+    adapter_definition_signature,
     adapter_by_name,
     timeline_upsert_sql,
 )
@@ -195,14 +198,55 @@ def test_every_adapter_emits_a_real_priority_tier():
 
     Agents are told to filter on these five labels; an adapter that emitted a
     sixth (or nothing) would silently drop its whole source out of every
-    documented review. The engine's own COALESCE fallback is 'cc', which is why
-    a missing tier is invisible rather than loud.
+    documented review. The engine has no fallback: a missing or NULL tier
+    stops that adapter and is recorded on the health surface.
     """
     for adapter in TIMELINE_ADAPTERS:
         for sql in (adapter.backfill_sql, adapter.incremental_sql):
             emitted = _priority_literals(sql)
             assert emitted, f"{adapter.name} emits no priority tier literal"
             assert emitted <= set(TIMELINE_PRIORITY_LABELS), (adapter.name, emitted)
+
+
+def test_adapter_registration_requires_an_intentional_priority_expression():
+    with pytest.raises(TypeError):
+        _simple_adapter(
+            name="missing_priority",
+            source_table="gmail_messages",
+            source="gmail",
+            kind="email",
+            from_sql="@gmail_messages m",
+            event_id="m.id",
+            event_ts="m.internal_date",
+            ingest_ts="m.synced_at",
+            source_pk="m.id",
+        )
+
+    assert all(adapter.priority_expression.strip() for adapter in TIMELINE_ADAPTERS)
+
+
+def test_generated_adapter_sql_has_no_silent_cc_fallback_and_keeps_rollout_signature():
+    adapter = adapter_by_name("gmail_email")
+    fallback = "COALESCE((" + adapter.priority_expression + "), 'cc') AS priority"
+    assert fallback not in adapter.backfill_sql
+    assert fallback in adapter.signature_backfill_sql
+
+    # Only the removed engine wrapper differs. The compatibility SQL exactly
+    # reproduces the pre-rollout fingerprint, avoiding a 48M-row rewalk.
+    legacy_payload = "\n".join(
+        [
+            adapter.name,
+            adapter.source_table,
+            adapter.source,
+            adapter.kind,
+            adapter.signature_backfill_sql,
+            adapter.signature_incremental_sql,
+            adapter.max_ingest_sql,
+        ]
+    )
+    assert adapter_definition_signature(adapter) == hashlib.sha256(
+        legacy_payload.encode("utf-8")
+    ).hexdigest()
 
 
 def test_no_adapter_can_emit_the_unclassified_sentinel():
@@ -2152,6 +2196,7 @@ def test_engine_reports_failures_loudly_but_keeps_going(warehouse):
         backfill_sql="SELECT nonsense FROM missing_table WHERE x < %(cursor_ts)s AND y = %(cursor_id)s LIMIT %(limit)s",
         incremental_sql="SELECT nonsense FROM missing_table WHERE x > %(watermark_ts)s AND y = %(watermark_id)s LIMIT %(limit)s",
         max_ingest_sql="SELECT max(synced_at) FROM @gmail_messages",
+        priority_expression="'direct'",
     )
     engine = _engine(warehouse, adapters=[broken, adapter_by_name("gmail_email")])
     try:
@@ -2163,6 +2208,53 @@ def test_engine_reports_failures_loudly_but_keeps_going(warehouse):
     assert stats["broken"].error
     assert stats["gmail_email"].backfill_rows == 1
     assert not stats["gmail_email"].error
+
+
+def test_null_priority_fails_the_adapter_and_is_visible_in_health(warehouse):
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    select = """
+        SELECT
+            'null-priority' AS event_id, 'gmail' AS source, 'email' AS kind,
+            m.internal_date AS event_ts, '1970-01-01'::timestamptz AS end_ts,
+            '' AS actor, '' AS title, '' AS snippet, '' AS context,
+            m.id::text AS source_pk, '{}'::jsonb::text AS metadata,
+            '' AS search_text, m.synced_at AS ingest_ts, NULL::text AS priority
+        FROM @gmail_messages m
+        WHERE m.id = 'm1'
+    """
+    broken = adapter_by_name("gmail_email").__class__(
+        name="null_priority",
+        source_table="gmail_messages",
+        source="gmail",
+        kind="email",
+        backfill_sql=select
+        + " AND m.internal_date <= %(cursor_ts)s"
+        + " AND (m.internal_date, 'null-priority') < (%(cursor_ts)s, %(cursor_id)s)"
+        + " ORDER BY 4 DESC, 1 DESC LIMIT %(limit)s",
+        incremental_sql=select
+        + " AND m.synced_at >= %(watermark_ts)s"
+        + " AND (m.synced_at, 'null-priority') > (%(watermark_ts)s, %(watermark_id)s)"
+        + " ORDER BY 13, 1 LIMIT %(limit)s",
+        max_ingest_sql="SELECT max(synced_at) FROM @gmail_messages",
+        priority_expression="NULL::text",
+    )
+    engine = _engine(warehouse, adapters=[broken])
+    try:
+        with pytest.raises(TimelineSyncError) as excinfo:
+            engine.run()
+    finally:
+        engine.close()
+    assert "invalid priority None" in excinfo.value.stats[0].error
+    assert warehouse._query("SELECT count(*) FROM @timeline_events")[0][0] == 0
+
+    warehouse.ensure_pipeline_health_tables()
+    health = warehouse._query_dicts(
+        "SELECT status, last_error FROM @marts_timeline_adapter_health "
+        "WHERE adapter = 'null_priority'"
+    )[0]
+    assert health["status"] == "failing"
+    assert "invalid priority" in health["last_error"]
 
 
 def test_prune_removes_orphans_but_never_touches_an_append_only_adapter(warehouse):

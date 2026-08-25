@@ -150,6 +150,10 @@ class TimelineAdapter:
     backfill_sql: str
     incremental_sql: str
     max_ingest_sql: str
+    # Deliberate classification expression supplied by the adapter author.
+    # This is required even though the expression also appears in the SELECT:
+    # registration must not be able to inherit a plausible-looking default.
+    priority_expression: str
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE
     # Zero means drain the incremental watermark until caught up. A bounded
     # value lets unusually broad dimension invalidations make steady progress
@@ -174,6 +178,13 @@ class TimelineAdapter:
     # re-keyed repeatedly, leaving 4,944 orphaned timeline rows (25.6%) that
     # search still returned alongside their live replacements.
     prune_sql: str = ""
+    # `_simple_adapter` used to wrap every priority expression in
+    # COALESCE(..., 'cc'). Removing that unsafe runtime fallback changes the
+    # generated SQL text but not any adapter's intentional classification.
+    # Keep the legacy generated text only for signature calculation so this
+    # safety rollout does not reset all 26 production backfills (48M rows).
+    signature_backfill_sql: str = ""
+    signature_incremental_sql: str = ""
 
 
 def _real_ts(*exprs: str) -> str:
@@ -200,7 +211,7 @@ def _simple_adapter(
     context: str = "''",
     metadata: str = "'{}'::jsonb",
     search_text: str | None = None,
-    priority: str = TIMELINE_PRIORITY_CC,
+    priority: str,
     where: str = "TRUE",
     changed_join_sql: str = "",
     changed_join_anchor: str = "",
@@ -209,6 +220,8 @@ def _simple_adapter(
     refresh_hours: float = 0.0,
     prune_sql: str = "",
 ) -> TimelineAdapter:
+    if not priority.strip():
+        raise ValueError(f"timeline adapter {name!r} must declare a priority expression")
     if search_text is None:
         search_text = _search_concat(title, snippet, context, actor)
 
@@ -218,7 +231,10 @@ def _simple_adapter(
     # (measured at ~90s/batch on the 30M-row slack_messages in production).
     # Source columns are NOT NULL throughout the warehouse schema; adapters
     # that need fallback chains state them explicitly.
-    def build_select(from_clause: str) -> str:
+    def build_select(from_clause: str, *, legacy_priority_fallback: bool = False) -> str:
+        priority_select = (
+            f"COALESCE(({priority}), 'cc')" if legacy_priority_fallback else f"({priority})"
+        )
         return f"""
         SELECT
             COALESCE(({event_id}), '') AS event_id,
@@ -234,14 +250,23 @@ def _simple_adapter(
             COALESCE(({metadata}), '{{}}'::jsonb)::text AS metadata,
             COALESCE(({search_text}), '') AS search_text,
             ({ingest_ts}) AS ingest_ts,
-            COALESCE(({priority}), 'cc') AS priority
+            {priority_select} AS priority
         FROM {from_clause}
         WHERE ({where})
     """
 
     select = build_select(from_sql)
+    legacy_select = build_select(from_sql, legacy_priority_fallback=True)
     backfill_sql = f"""
         {select}
+          AND ({event_ts}) <= %(cursor_ts)s
+          AND (({event_ts}), COALESCE(({event_id}), ''))
+              < (%(cursor_ts)s, %(cursor_id)s)
+        ORDER BY 4 DESC, 1 DESC
+        LIMIT %(limit)s
+    """
+    signature_backfill_sql = f"""
+        {legacy_select}
           AND ({event_ts}) <= %(cursor_ts)s
           AND (({event_ts}), COALESCE(({event_id}), ''))
               < (%(cursor_ts)s, %(cursor_id)s)
@@ -276,6 +301,14 @@ def _simple_adapter(
         ORDER BY 13 ASC, 1 ASC
         LIMIT %(limit)s
     """
+    signature_incremental_sql = f"""
+        {build_select(incremental_from, legacy_priority_fallback=True)}
+          AND ({ingest_ts}) >= %(watermark_ts)s
+          AND (({ingest_ts}), COALESCE(({event_id}), ''))
+              > (%(watermark_ts)s, %(watermark_id)s)
+        ORDER BY 13 ASC, 1 ASC
+        LIMIT %(limit)s
+    """
     max_ingest_sql = f"SELECT max({ingest_ts}) FROM {from_sql} WHERE ({where})"
     return TimelineAdapter(
         name=name,
@@ -285,10 +318,13 @@ def _simple_adapter(
         backfill_sql=backfill_sql,
         incremental_sql=incremental_sql,
         max_ingest_sql=max_ingest_sql,
+        priority_expression=priority,
         batch_size=batch_size,
         max_incremental_batches_per_run=max_incremental_batches_per_run,
         refresh_hours=refresh_hours,
         prune_sql=prune_sql,
+        signature_backfill_sql=signature_backfill_sql,
+        signature_incremental_sql=signature_incremental_sql,
     )
 
 
@@ -2095,6 +2131,7 @@ def _agent_session_adapter() -> TimelineAdapter:
         backfill_sql=backfill_sql,
         incremental_sql=incremental_sql,
         max_ingest_sql="SELECT max(ingested_at) FROM @ai_conversation_events",
+        priority_expression="CASE ... 'self' ... 'background' ... END",
         batch_size=10000,
     )
 
@@ -2162,6 +2199,7 @@ def _agent_session_turn_adapter() -> TimelineAdapter:
             "SELECT max(ingested_at) FROM @ai_conversation_events "
             "WHERE role IN ('user', 'assistant') AND text != ''"
         ),
+        priority_expression=TIMELINE_PRIORITY_BACKGROUND,
         batch_size=5000,
     )
 
@@ -2214,14 +2252,22 @@ def adapter_definition_signature(adapter: TimelineAdapter) -> str:
     re-walks and converges to the new shape. The content-guarded upsert makes
     an unchanged row a no-op, so a reset costs reads, not rewrites.
     """
+    # The fail-loud priority rollout removes only the generated
+    # COALESCE(..., 'cc') safety bug. That wrapper was engine behavior, not an
+    # adapter author's classification rule, so `_simple_adapter` retains its
+    # former generated SQL solely here. Existing production signatures remain
+    # byte-for-byte stable; a real change to `priority_expression` still
+    # changes these compatibility strings and resets only that adapter.
+    backfill_sql = adapter.signature_backfill_sql or adapter.backfill_sql
+    incremental_sql = adapter.signature_incremental_sql or adapter.incremental_sql
     payload = "\n".join(
         [
             adapter.name,
             adapter.source_table,
             adapter.source,
             adapter.kind,
-            adapter.backfill_sql,
-            adapter.incremental_sql,
+            backfill_sql,
+            incremental_sql,
             adapter.max_ingest_sql,
         ]
     )
@@ -2583,6 +2629,11 @@ class TimelineSyncEngine:
         self._source_schema = source_schema
         self._dest_schema = dest_schema
         self._adapters = tuple(adapters)
+        for adapter in self._adapters:
+            if not adapter.priority_expression.strip():
+                raise ValueError(
+                    f"timeline adapter {adapter.name!r} must declare a priority expression"
+                )
         self._batch_size = batch_size
         self._source_conn: Any = None
         self._dest_conn: Any = None
@@ -2745,6 +2796,18 @@ class TimelineSyncEngine:
     def _upsert(self, adapter: TimelineAdapter, rows: list[tuple[Any, ...]]) -> None:
         if not rows:
             return
+        invalid = [
+            (str(row[0]) if row else "<missing event_id>", row[13] if len(row) > 13 else None)
+            for row in rows
+            if len(row) != len(TIMELINE_NORMALIZED_COLUMNS)
+            or row[13] not in TIMELINE_PRIORITY_LABELS
+        ]
+        if invalid:
+            event_id, priority = invalid[0]
+            raise TimelinePriorityError(
+                f"timeline adapter {adapter.name!r} emitted invalid priority {priority!r} "
+                f"for event {event_id!r}; expected one of {', '.join(TIMELINE_PRIORITY_LABELS)}"
+            )
         # Adapter queries are keyed by event_id, but guard against in-batch
         # duplicates anyway: ON CONFLICT DO UPDATE rejects them outright.
         deduped: dict[str, tuple[Any, ...]] = {}
@@ -3010,6 +3073,9 @@ class TimelineSyncEngine:
             except Exception as exc:  # noqa: BLE001 - keep other adapters running
                 logger.exception("timeline incremental sync failed for %s", adapter.name)
                 stats[adapter.name].error = str(exc)
+                state = states.get(adapter.name)
+                if state is not None:
+                    self._save_state(adapter, state, error=str(exc))
                 failed.append(adapter.name)
             if _past(deadline):
                 break
@@ -3029,6 +3095,7 @@ class TimelineSyncEngine:
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("timeline backfill failed for %s", adapter.name)
                     stats[adapter.name].error = str(exc)
+                    self._save_state(adapter, state, error=str(exc))
                     failed.append(adapter.name)
                     active.remove(adapter)
                     continue
@@ -3050,6 +3117,10 @@ class TimelineSyncError(RuntimeError):
     def __init__(self, message: str, *, stats: list[AdapterSyncStats] | None = None) -> None:
         super().__init__(message)
         self.stats = stats or []
+
+
+class TimelinePriorityError(ValueError):
+    """An adapter did not classify a row into one of the five real tiers."""
 
 
 def _past(deadline: float | None) -> bool:
