@@ -3,8 +3,11 @@ package query
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // fakeSearchRunner implements both Runner (the hybrid-probe path) and
@@ -14,13 +17,29 @@ type fakeSearchRunner struct {
 	fakeRunner
 	argsResults map[string]RawResult
 	argsErrs    map[string]error
+	delays      map[string]time.Duration
+	mu          sync.Mutex
+	active      int
+	maxActive   int
 	statements  []string
 	args        [][]any
 }
 
 func (r *fakeSearchRunner) QueryArgs(_ context.Context, statement string, args []any, maxRows int) (RawResult, error) {
+	r.mu.Lock()
 	r.statements = append(r.statements, statement)
 	r.args = append(r.args, args)
+	r.active++
+	if r.active > r.maxActive {
+		r.maxActive = r.active
+	}
+	r.mu.Unlock()
+	if delay := r.delays[statement]; delay > 0 {
+		time.Sleep(delay)
+	}
+	r.mu.Lock()
+	r.active--
+	r.mu.Unlock()
 	if err := r.argsErrs[statement]; err != nil {
 		return RawResult{}, err
 	}
@@ -29,6 +48,18 @@ func (r *fakeSearchRunner) QueryArgs(_ context.Context, statement string, args [
 		result.Rows = result.Rows[:maxRows]
 	}
 	return result, nil
+}
+
+func (r *fakeSearchRunner) callsFor(statement string) [][]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var calls [][]any
+	for index, got := range r.statements {
+		if got == statement {
+			calls = append(calls, r.args[index])
+		}
+	}
+	return calls
 }
 
 type fakeEmbedder struct {
@@ -51,6 +82,24 @@ func searchHit() RawResult {
 		Rows: []map[string]any{
 			{"source": "slack", "who": "zach", "text": "offer letter attached", "score": -3.2},
 		},
+	}
+}
+
+func searchRefRows(refs ...string) RawResult {
+	rows := make([]map[string]any, 0, len(refs))
+	for _, ref := range refs {
+		rows = append(rows, map[string]any{"ref": ref})
+	}
+	return RawResult{Columns: []string{"ref"}, Rows: rows}
+}
+
+func semanticHits() RawResult {
+	return RawResult{
+		Columns: []string{"ref", "best", "fuse", "chunk_id"},
+		Rows: []map[string]any{{
+			"ref": "slack_message:zrl|T1|C1|1.0", "best": int64(1),
+			"fuse": 1.0 / 61.0, "chunk_id": "chunk-1",
+		}},
 	}
 }
 
@@ -139,10 +188,20 @@ func TestSearchPassesMaxResultsSourcesAndSince(t *testing.T) {
 	}
 }
 
-func TestSearchHybridModeEmbedsAndRunsSearchHybrid(t *testing.T) {
+func TestSearchHybridModeFansIndependentLegsOutThenFuses(t *testing.T) {
 	runner := &fakeSearchRunner{
-		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
-		argsResults: map[string]RawResult{searchHybridSQL: searchHit()},
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{
+			searchHybridLexicalSQL:  searchRefRows("gmail_email:a|m1"),
+			searchHybridSemanticSQL: semanticHits(),
+			searchHybridExactSQL:    searchRefRows(),
+			searchHybridFuseSQL:     searchHit(),
+		},
+		delays: map[string]time.Duration{
+			searchHybridLexicalSQL:  25 * time.Millisecond,
+			searchHybridSemanticSQL: 25 * time.Millisecond,
+			searchHybridExactSQL:    25 * time.Millisecond,
+		},
 	}
 	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5, -1.25}}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
@@ -157,20 +216,40 @@ func TestSearchHybridModeEmbedsAndRunsSearchHybrid(t *testing.T) {
 	if embedder.calls != 1 {
 		t.Fatalf("embedder calls = %d", embedder.calls)
 	}
-	if len(runner.statements) != 1 || runner.statements[0] != searchHybridSQL {
+	if runner.maxActive < 3 {
+		t.Fatalf("hybrid retrieval legs ran serially; max concurrent calls = %d", runner.maxActive)
+	}
+	if len(runner.statements) != 4 || runner.statements[len(runner.statements)-1] != searchHybridFuseSQL {
 		t.Fatalf("statements = %#v", runner.statements)
 	}
-	args := runner.args[0]
-	if len(args) != 8 {
+	for _, statement := range []string{searchHybridLexicalSQL, searchHybridSemanticSQL, searchHybridExactSQL, searchHybridFuseSQL} {
+		if !slices.Contains(runner.statements, statement) {
+			t.Fatalf("missing %q from statements %#v", statement, runner.statements)
+		}
+	}
+	semanticArgs := runner.callsFor(searchHybridSemanticSQL)
+	if len(semanticArgs) != 1 || len(semanticArgs[0]) != 5 {
+		t.Fatalf("semantic args = %#v", semanticArgs)
+	}
+	if semanticArgs[0][0] != "[0.5,-1.25]" || semanticArgs[0][1] != "test-model" || semanticArgs[0][2] != searchDefaultMaxResults {
+		t.Fatalf("semantic args = %#v", semanticArgs[0])
+	}
+	fuseCalls := runner.callsFor(searchHybridFuseSQL)
+	if len(fuseCalls) != 1 {
+		t.Fatalf("fuse calls = %#v", fuseCalls)
+	}
+	args := fuseCalls[0]
+	if len(args) != 6 {
 		t.Fatalf("args = %#v", args)
 	}
-	if args[0] != "offer letter" || args[1] != "[0.5,-1.25]" || args[2] != "test-model" || args[3] != searchDefaultMaxResults {
+	if args[0] != "offer letter" || args[1] != searchDefaultMaxResults {
 		t.Fatalf("args = %#v", args)
 	}
-	// One query representation means no alternate vector, and search_hybrid
-	// skips its second ANN leg on a NULL rather than scanning twice.
-	if args[6] != nil {
-		t.Fatalf("alternate embedding = %#v, want nil", args[6])
+	if refs, ok := args[2].([]string); !ok || len(refs) != 1 || refs[0] != "gmail_email:a|m1" {
+		t.Fatalf("lexical refs = %#v", args[2])
+	}
+	if semanticJSON, ok := args[3].(string); !ok || !strings.Contains(semanticJSON, "chunk-1") {
+		t.Fatalf("semantic JSON = %#v", args[3])
 	}
 }
 
@@ -179,8 +258,11 @@ func TestSearchHybridPassesBothQueryRepresentations(t *testing.T) {
 	// vector; both must reach search_hybrid, because each neighbourhood holds
 	// answers the other misses.
 	runner := &fakeSearchRunner{
-		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
-		argsResults: map[string]RawResult{searchHybridSQL: searchHit()},
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{
+			searchHybridSemanticSQL: semanticHits(),
+			searchHybridFuseSQL:     searchHit(),
+		},
 	}
 	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5, -1.25}, {1, 0}}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
@@ -189,15 +271,15 @@ func TestSearchHybridPassesBothQueryRepresentations(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("error: %s", resp.Error)
 	}
-	args := runner.args[0]
-	if len(args) != 8 {
-		t.Fatalf("args = %#v", args)
+	calls := runner.callsFor(searchHybridSemanticSQL)
+	if len(calls) != 2 {
+		t.Fatalf("semantic calls = %#v", calls)
 	}
-	if args[1] != "[0.5,-1.25]" {
-		t.Fatalf("primary embedding = %#v", args[1])
-	}
-	if args[6] != "[1,0]" {
-		t.Fatalf("alternate embedding = %#v", args[6])
+	want := map[any]bool{"[0.5,-1.25]": true, "[1,0]": true}
+	for _, args := range calls {
+		if !want[args[0]] {
+			t.Fatalf("unexpected semantic embedding = %#v", args[0])
+		}
 	}
 	if embedder.calls != 1 {
 		t.Fatalf("both representations must ride in one request; calls = %d", embedder.calls)
@@ -371,7 +453,7 @@ func TestSearchHintsWhenTheQueryIsPhrasedAsASentence(t *testing.T) {
 	// nothing-in-the-top-50 to ranks 10, 10, 12, 15 and 48.
 	runner := &fakeSearchRunner{
 		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
-		argsResults: map[string]RawResult{searchHybridSQL: searchHit()},
+		argsResults: map[string]RawResult{searchHybridFuseSQL: searchHit()},
 	}
 	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5}}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
@@ -392,7 +474,7 @@ func TestSearchDoesNotHintOnATermBagQuery(t *testing.T) {
 	// already the strong case, so they get nothing.
 	runner := &fakeSearchRunner{
 		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
-		argsResults: map[string]RawResult{searchHybridSQL: searchHit()},
+		argsResults: map[string]RawResult{searchHybridFuseSQL: searchHit()},
 	}
 	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5}}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
@@ -440,7 +522,6 @@ func TestSearchScopesEveryModeToPriorityTiers(t *testing.T) {
 	}{
 		{SearchModeKeyword, searchTextSQL, 4},
 		{SearchModeExact, searchExactSQL, 4},
-		{SearchModeHybrid, searchHybridSQL, 7},
 	}
 	for _, tc := range cases {
 		t.Run(tc.mode, func(t *testing.T) {
@@ -471,6 +552,42 @@ func TestSearchScopesEveryModeToPriorityTiers(t *testing.T) {
 			}
 		})
 	}
+	t.Run(SearchModeHybrid, func(t *testing.T) {
+		runner := &fakeSearchRunner{
+			fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+			argsResults: map[string]RawResult{
+				searchHybridFuseSQL: searchHit(),
+			},
+		}
+		svc := NewService(runner, Options{
+			SearchEmbedder: &fakeEmbedder{model: "test-model", vectors: [][]float64{{1}}},
+		})
+
+		resp := svc.Search(context.Background(), SearchRequest{
+			Query:      "offer letter",
+			Mode:       SearchModeHybrid,
+			Priorities: []string{"self", "direct"},
+		})
+		if resp.Error != "" {
+			t.Fatalf("error: %s", resp.Error)
+		}
+		for _, check := range []struct {
+			statement string
+			index     int
+		}{
+			{searchHybridExactSQL, 4},
+			{searchHybridFuseSQL, 5},
+		} {
+			calls := runner.callsFor(check.statement)
+			if len(calls) != 1 {
+				t.Fatalf("%s calls = %#v", check.statement, calls)
+			}
+			tiers, ok := calls[0][check.index].([]string)
+			if !ok || !slices.Equal(tiers, []string{"self", "direct"}) {
+				t.Fatalf("priorities missing from %s args: %#v", check.statement, calls[0])
+			}
+		}
+	})
 }
 
 func TestSearchWithoutPrioritiesBindsNull(t *testing.T) {
@@ -521,7 +638,7 @@ func TestSearchHitsCarryPriority(t *testing.T) {
 	if !strings.Contains(searchResultColumns, "priority") {
 		t.Fatalf("searchResultColumns must select priority: %q", searchResultColumns)
 	}
-	for _, statement := range []string{searchTextSQL, searchExactSQL, searchHybridSQL} {
+	for _, statement := range []string{searchTextSQL, searchExactSQL, searchHybridSQL, searchHybridFuseSQL} {
 		if !strings.Contains(statement, "priority") {
 			t.Fatalf("statement must select priority: %q", statement)
 		}
@@ -536,9 +653,14 @@ func TestSearchSQLPassesPrioritiesToEverySQLFunction(t *testing.T) {
 		t.Fatalf("search_text/search_text_exact must pass priorities: %q %q", searchTextSQL, searchExactSQL)
 	}
 	if !strings.Contains(searchHybridSQL, "$8::text[]") {
-		t.Fatalf("search_hybrid must pass priorities: %q", searchHybridSQL)
+		t.Fatalf("compatibility search_hybrid must pass priorities: %q", searchHybridSQL)
 	}
-	if !strings.Contains(searchHybridProbeSQL, "timestamptz,text,text[]") {
-		t.Fatalf("the hybrid probe must match the installed signature: %q", searchHybridProbeSQL)
+	if !strings.Contains(searchHybridExactSQL, "$5::text[]") || !strings.Contains(searchHybridFuseSQL, "$6::text[]") {
+		t.Fatalf("parallel exact/fuse helpers must pass priorities: %q %q", searchHybridExactSQL, searchHybridFuseSQL)
+	}
+	for _, function := range []string{"search_hybrid", "search_hybrid_semantic", "search_hybrid_exact", "search_hybrid_fuse"} {
+		if !strings.Contains(searchHybridProbeSQL, function) {
+			t.Fatalf("the hybrid probe must require %s: %q", function, searchHybridProbeSQL)
+		}
 	}
 }

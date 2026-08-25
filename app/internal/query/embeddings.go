@@ -31,8 +31,9 @@ type Embedder interface {
 	Model() string
 	// Embed returns one or more query vectors for text, most specific first.
 	// An instruction-tuned client returns the instructed and the raw vector so
-	// retrieval can search both neighbourhoods; a plain one returns a single
-	// vector. Retrieval fuses whatever it is given by rank.
+	// retrieval can search both neighbourhoods; for a sentence it also returns
+	// those two forms of a deterministic content-word query. A plain client
+	// returns a single vector. Retrieval fuses whatever it is given by rank.
 	Embed(ctx context.Context, text string) ([][]float64, error)
 }
 
@@ -54,8 +55,8 @@ type EmbeddingsOptions struct {
 	// tuned retrieval models (Qwen3-Embedding) embed documents raw but expect
 	// queries wrapped in a task instruction; this client only ever embeds
 	// queries, so the prefix applies to everything it sends.
-	// When it is set the client embeds BOTH forms and returns both vectors,
-	// because retrieval searches each neighbourhood separately -- see Embed.
+	// When it is set the client embeds instructed+raw forms separately; a
+	// sentence also gets instructed+raw content-word forms -- see Embed.
 	QueryPrefix string
 	// HTTPClient overrides the default 30s-timeout client (tests).
 	HTTPClient *http.Client
@@ -63,10 +64,10 @@ type EmbeddingsOptions struct {
 
 // EmbeddingsClient calls an OpenAI-compatible POST /embeddings endpoint.
 type EmbeddingsClient struct {
-	baseURL        string
-	apiKey         string
-	model          string
-	dimensions     int
+	baseURL     string
+	apiKey      string
+	model       string
+	dimensions  int
 	queryPrefix string
 	httpClient  *http.Client
 }
@@ -107,20 +108,26 @@ func NewEmbeddingsClient(opts EmbeddingsOptions) *EmbeddingsClient {
 
 func (c *EmbeddingsClient) Model() string { return c.model }
 
-// Embed returns one or two query vectors in a single round trip. It retries
+// Embed returns one, two, or four query vectors in a single round trip. It retries
 // once on a 429 or 5xx response; every other failure is returned immediately.
 //
-// Two vectors, not a blend. Qwen3-Embedding is instruction-asymmetric: the
+// Separate vectors, not a blend. Qwen3-Embedding is instruction-asymmetric: the
 // instructed and the raw form of the same question land in different regions
 // of the space, and each one retrieves answers the other misses. Averaging
 // them into one vector averages that away — measured on the labeled benchmark,
 // blending scored MRR 0.234 while searching both neighbourhoods and fusing by
-// rank scored 0.300. The instructed vector is always first, so a caller that
-// can only use one still gets the better single vector.
+// rank scored 0.300. Sentence-shaped queries are additionally embedded in a
+// deterministic content-word form, instructed and raw. On the expanded live-
+// agent benchmark, those extra neighbourhoods improved MRR and hit@1 without
+// losing hit@5, hit@10, or found@50. The original instructed vector is always
+// first, so a caller that can only use one still gets the established one.
 func (c *EmbeddingsClient) Embed(ctx context.Context, text string) ([][]float64, error) {
 	inputs := []string{text}
 	if c.queryPrefix != "" {
 		inputs = []string{c.queryPrefix + text, text}
+		if termBag := searchTermBag(text); searchQueryIsSentence(text) && termBag != "" && termBag != text {
+			inputs = append(inputs, c.queryPrefix+termBag, termBag)
+		}
 	}
 	body, err := json.Marshal(map[string]any{
 		"model":      c.model,

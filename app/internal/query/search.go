@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -10,9 +11,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Search modes. Hybrid is the default: semantic+keyword retrieval through
-// timeline.search_hybrid, falling back to the keyword path whenever embeddings
-// or the SQL function are unavailable so the tool always answers.
+// Search modes. Hybrid is the default: semantic+keyword retrieval through the
+// timeline.search_hybrid_* helpers, falling back to the keyword path whenever
+// embeddings or those SQL functions are unavailable so the tool always answers.
 const (
 	SearchModeHybrid  = "hybrid"
 	SearchModeKeyword = "keyword"
@@ -68,13 +69,10 @@ var searchSentenceWords = map[string]bool{
 	"did": true, "does": true, "do": true, "should": true, "could": true, "me": true, "i": true,
 }
 
-// searchHintFor returns advice for the caller, or "" when the query is already
-// in the shape that retrieves well. Hinting every response is noise nobody
-// reads, so the strong case gets nothing.
-func searchHintFor(query string) string {
+func searchQueryIsSentence(query string) bool {
 	fields := strings.Fields(strings.ToLower(query))
 	if len(fields) < 5 {
-		return ""
+		return false
 	}
 	sentenceWords := 0
 	for _, field := range fields {
@@ -82,7 +80,32 @@ func searchHintFor(query string) string {
 			sentenceWords++
 		}
 	}
-	if sentenceWords < 2 {
+	return sentenceWords >= 2
+}
+
+// searchTermBag removes only the function words used by the sentence detector,
+// preserving identifiers, amounts, punctuation, names, and the caller's own
+// vocabulary. It is deliberately not a synonym rewriter: the resulting extra
+// embeddings are deterministic and auditable, and never invent a term that was
+// absent from the query.
+func searchTermBag(query string) string {
+	fields := strings.Fields(query)
+	kept := make([]string, 0, len(fields))
+	for _, field := range fields {
+		token := strings.Trim(strings.ToLower(field), ".,!?;:'\"")
+		if searchSentenceWords[token] {
+			continue
+		}
+		kept = append(kept, field)
+	}
+	return strings.Join(kept, " ")
+}
+
+// searchHintFor returns advice for the caller, or "" when the query is already
+// in the shape that retrieves well. Hinting every response is noise nobody
+// reads, so the strong case gets nothing.
+func searchHintFor(query string) string {
+	if !searchQueryIsSentence(query) {
 		return ""
 	}
 	return searchPhrasingHint
@@ -106,15 +129,30 @@ const searchResultColumns = "source, subsource, context, who, occurred_at, accou
 // resolution, so an uncast $2 would fail to match the functions' integer
 // max_results parameter.
 const (
-	searchTextSQL   = "SELECT " + searchResultColumns + " FROM timeline.search_text($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
-	searchExactSQL  = "SELECT " + searchResultColumns + " FROM timeline.search_text_exact($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
+	searchTextSQL  = "SELECT " + searchResultColumns + " FROM timeline.search_text($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
+	searchExactSQL = "SELECT " + searchResultColumns + " FROM timeline.search_text_exact($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
+	// searchHybridSQL is the stable direct-SQL compatibility entry point. The
+	// app deliberately does not call it: one function invocation uses one
+	// Postgres backend, so its BM25, ANN and literal work remains serial.
 	searchHybridSQL = "SELECT " + searchResultColumns + " FROM timeline.search_hybrid($1, $2, $3, $4::integer, $5::text[], $6::timestamptz, $7, $8::text[])"
+
+	// Hybrid's expensive retrieval legs return compact evidence independently.
+	// Search fans these statements out over the connection pool and gives their
+	// refs/ranks to search_hybrid_fuse, keeping all ranking constants in SQL.
+	searchHybridLexicalSQL  = "SELECT ref FROM timeline.search_text($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
+	searchHybridSemanticSQL = "SELECT ref, best, fuse, chunk_id FROM timeline.search_hybrid_semantic($1, $2, $3::integer, $4::text[], $5::timestamptz)"
+	searchHybridExactSQL    = "SELECT ref FROM timeline.search_hybrid_exact($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
+	searchHybridFuseSQL     = "SELECT " + searchResultColumns + " FROM timeline.search_hybrid_fuse($1, $2::integer, $3::text[], $4::jsonb, $5::text[], $6::text[])"
 
 	// searchHybridProbeSQL reports whether timeline.search_hybrid exists with
 	// the exact signature the hybrid path calls. Deployments whose Postgres
 	// image lacks pgvector never install it, and the probe is what keeps the
 	// tool answering (via keyword fallback) instead of erroring there.
-	searchHybridProbeSQL = "SELECT to_regprocedure('timeline.search_hybrid(text,text,text,integer,text[],timestamptz,text,text[])') IS NOT NULL AS installed"
+	searchHybridProbeSQL = "SELECT " +
+		"to_regprocedure('timeline.search_hybrid(text,text,text,integer,text[],timestamptz,text,text[])') IS NOT NULL " +
+		"AND to_regprocedure('timeline.search_hybrid_semantic(text,text,integer,text[],timestamptz)') IS NOT NULL " +
+		"AND to_regprocedure('timeline.search_hybrid_exact(text,integer,text[],timestamptz,text[])') IS NOT NULL " +
+		"AND to_regprocedure('timeline.search_hybrid_fuse(text,integer,text[],jsonb,text[],text[])') IS NOT NULL AS installed"
 )
 
 // Fallback reasons the response carries when hybrid mode ran the keyword path
@@ -229,6 +267,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 
 	statement := ""
 	var args []any
+	var hybridVectors []string
 	switch mode {
 	case SearchModeExact:
 		statement = searchExactSQL
@@ -245,19 +284,22 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 			args = []any{resp.Query, maxResults, sources, since, priorities}
 			break
 		}
-		// The second vector is optional: search_hybrid scans one ANN leg per
-		// vector and skips the second with a one-time filter when it is NULL.
-		var alternate any
-		if len(vectors) > 1 {
-			alternate = vectors[1]
-		}
-		statement = searchHybridSQL
-		args = []any{resp.Query, vectors[0], s.embedder.Model(), maxResults, sources, since, alternate, priorities}
+		hybridVectors = vectors
+		statement = searchHybridFuseSQL
 	}
 
 	started := time.Now()
 	s.logger.InfoContext(ctx, "search started", "query", resp.Query, "mode", resp.Mode, "fallback_reason", resp.FallbackReason, "max_results", maxResults, "sources", req.Sources, "since", req.Since, "priorities", req.Priorities)
-	raw, err := runner.QueryArgs(ctx, statement, args, maxResults)
+	var raw RawResult
+	var err error
+	if len(hybridVectors) > 0 {
+		raw, err = s.runHybridSearch(
+			ctx, runner, resp.Query, maxResults, sources, since, priorities,
+			hybridVectors, s.embedder.Model(),
+		)
+	} else {
+		raw, err = runner.QueryArgs(ctx, statement, args, maxResults)
+	}
 	if err != nil {
 		resp.Error = s.queryErrorMessage(ctx, err.Error(), statement)
 		s.logger.ErrorContext(ctx, "search failed", "query", resp.Query, "mode", resp.Mode, "sql", statement, "error", err, "duration", time.Since(started))
@@ -280,11 +322,106 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	return resp
 }
 
+// runHybridSearch fans BM25, one ANN call per query representation, and the
+// short-literal leg across independent read-only transactions. PostgreSQL does
+// not parallelize HNSW scans inside the old monolithic function; at production
+// scale that left one core saturated while a 28-vCPU host sat 80-92% idle.
+// Separate pooled connections make wall time approximately max(legs)+fusion
+// instead of sum(legs), while search_hybrid_fuse remains the single authority
+// for RRF weights and result shaping.
+func (s *Service) runHybridSearch(
+	ctx context.Context,
+	runner ArgsRunner,
+	query string,
+	maxResults int,
+	sources any,
+	since any,
+	priorities any,
+	vectors []string,
+	embeddingModel string,
+) (RawResult, error) {
+	var (
+		lexical  RawResult
+		exact    RawResult
+		semantic = make([]RawResult, len(vectors))
+	)
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		var err error
+		lexical, err = runner.QueryArgs(
+			groupCtx, searchHybridLexicalSQL,
+			[]any{query, maxResults, sources, since, priorities}, maxResults,
+		)
+		if err != nil {
+			return fmt.Errorf("hybrid lexical leg: %w", err)
+		}
+		return nil
+	})
+	group.Go(func() error {
+		var err error
+		exact, err = runner.QueryArgs(
+			groupCtx, searchHybridExactSQL,
+			[]any{query, maxResults, sources, since, priorities}, maxResults,
+		)
+		if err != nil {
+			return fmt.Errorf("hybrid literal leg: %w", err)
+		}
+		return nil
+	})
+	for index, vector := range vectors {
+		index, vector := index, vector
+		group.Go(func() error {
+			var err error
+			// The SQL function owns a measured 40-200 or 1000-2000 row
+			// bound. maxRows=0 avoids duplicating that tuning constant here.
+			semantic[index], err = runner.QueryArgs(
+				groupCtx, searchHybridSemanticSQL,
+				[]any{vector, embeddingModel, maxResults, sources, since}, 0,
+			)
+			if err != nil {
+				return fmt.Errorf("hybrid semantic leg %d: %w", index+1, err)
+			}
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return RawResult{}, err
+	}
+
+	semanticRows := make([]map[string]any, 0)
+	for _, leg := range semantic {
+		semanticRows = append(semanticRows, leg.Rows...)
+	}
+	semanticJSON, err := json.Marshal(semanticRows)
+	if err != nil {
+		return RawResult{}, fmt.Errorf("encode hybrid semantic evidence: %w", err)
+	}
+	return runner.QueryArgs(
+		ctx, searchHybridFuseSQL,
+		[]any{
+			query, maxResults, searchRefs(lexical), string(semanticJSON),
+			searchRefs(exact), priorities,
+		},
+		maxResults,
+	)
+}
+
+func searchRefs(result RawResult) []string {
+	refs := make([]string, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		if ref, ok := row["ref"].(string); ok && ref != "" {
+			refs = append(refs, ref)
+		}
+	}
+	return refs
+}
+
 // hybridQueryVectors embeds the query for the hybrid path, returning one
-// literal per query representation (instructed and raw, when the deployment
-// configures an instruction prefix). A non-empty reason means hybrid is
-// unavailable and the caller should run keyword search, reporting the reason
-// so a misconfigured deployment is visible instead of silently degraded.
+// literal per query representation: instructed and raw, plus instructed and
+// raw content-word forms when the query carries removable sentence grammar.
+// A non-empty reason means hybrid is unavailable and the caller should run
+// keyword search, reporting the reason so a misconfigured deployment is
+// visible instead of silently degraded.
 func (s *Service) hybridQueryVectors(ctx context.Context, queryText string) ([]string, string) {
 	if s.embedder == nil {
 		return nil, searchFallbackEmbeddingsUnconfigured

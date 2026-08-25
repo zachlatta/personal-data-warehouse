@@ -156,9 +156,11 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # metadata parsed out of the huddle_thread message payload).
         "marts": 38,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
-        # neighborhood reader. +1 internal: internal.search_text_preview, the
-        # match-windowed preview helper both search functions use.
-        "timeline": 9,
+        # neighborhood reader. +3 timeline: the semantic, literal, and fusion
+        # helpers that let the app execute hybrid retrieval legs concurrently.
+        # +1 internal: internal.search_text_preview, the match-windowed preview
+        # helper both search functions use.
+        "timeline": 12,
         # +1 ops / +1 private: whoop_private's sync state and its rotating
         # browser-session credential. Search convergence adds one ops row;
         # slack_sessions adds the captured Slack client session that lets the

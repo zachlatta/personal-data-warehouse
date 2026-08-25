@@ -277,12 +277,16 @@ over 0.6B off the 2026 MTEB standings (multilingual 69.45 vs 64.33; the 8B leade
 not fit 12 GB) — the family tops open self-hosted models and the GPU is otherwise idle.
 Queries (the app's Go client only, never the Python document indexer) are wrapped in the
 instruction prefix from `SEARCH_EMBEDDINGS_QUERY_PREFIX`, per Qwen3-Embedding's
-instruction-asymmetric training. The app embeds the instructed **and** the raw query in one
-two-item request and passes **both** vectors to `timeline.search_hybrid`, which scans one
-ANN leg per vector and fuses them by rank. Two legs, not a blend: the instructed and raw
-forms of a question land in different neighbourhoods and each retrieves answers the other
-misses, so averaging them into one vector averages the difference away — measured on the
-labeled benchmark, blending scored MRR 0.234 where two legs scored 0.300. The instruction
+instruction-asymmetric training. The app embeds the instructed **and** raw query in one
+batched request; sentence-shaped queries also get instructed and raw deterministic
+content-word forms in that request. BM25, literal, and one ANN leg per vector run concurrently
+on separate pooled Postgres connections, then `timeline.search_hybrid_fuse` combines their
+compact evidence; `timeline.search_hybrid` is the compatible direct-SQL wrapper over the same
+helpers. Separate legs, not a blend: the instructed and raw forms land in different
+neighbourhoods and each retrieves answers the other misses, so averaging them into one vector
+averages the difference away — measured on the labeled benchmark, blending scored MRR 0.234
+where two legs scored 0.300. The content-word forms raised the expanded live-agent benchmark
+from MRR 0.305 to 0.324 and hit@1 from 7 to 8 without reducing hit@5, hit@10, or found@50. The instruction
 *text* matters as much as its presence (0.240 vs 0.300 for two wordings of the same task),
 so re-measure with `search_benchmark` before changing it. Write the instruction's newline as
 the two characters `\n`, which the app decodes: Coolify truncates an environment value at a

@@ -294,9 +294,10 @@ unified timeline document. Raw message/body columns are deliberately not text-in
 - Tool-level entry point: the `search` tool wraps this contract for callers that don't want to
   write SQL. Its default `hybrid` mode embeds the query through an OpenAI-compatible embeddings
   API (`SEARCH_EMBEDDINGS_BASE_URL`, `SEARCH_EMBEDDINGS_API_KEY`, `SEARCH_EMBEDDINGS_MODEL`,
-  `SEARCH_EMBEDDINGS_DIMENSIONS`) and calls `timeline.search_hybrid`, which fuses BM25, one
-  semantic leg per query representation, and — for a short, identifier-shaped query — a
-  literal-substring leg. Machine tokens (ids, paths, emails and version-like strings) search
+  `SEARCH_EMBEDDINGS_DIMENSIONS`) and fans BM25, one semantic leg per query representation,
+  and the short-literal leg over separate pooled Postgres connections. It then calls
+  `timeline.search_hybrid_fuse`; `timeline.search_hybrid` remains the compatible direct-SQL
+  wrapper over the same helpers. Machine tokens (ids, paths, emails and version-like strings) search
   bounded plain-document chunks through the `derived_search.chunks.text` trigram index instead
   of rechecking multi-megabyte timeline documents. Matching conversation windows and ordinary
   alphabetic names retain full-document exact matching: a window's representative ref is its
@@ -307,10 +308,12 @@ unified timeline document. Raw message/body columns are deliberately not text-in
   prepend `SEARCH_EMBEDDINGS_QUERY_PREFIX` on queries only (write its newline as the two
   characters `\n`: a real newline in an environment value does not survive every deploy
   pipeline, and a truncated instruction retrieves measurably worse). With a prefix set the client embeds
-  the instructed AND the raw form of the query in one batched request and passes both to
-  `timeline.search_hybrid`, which scans one ANN leg per vector and fuses them by rank — the two
-  forms land in different neighbourhoods and each retrieves answers the other misses (blending
-  them into a single vector measured MRR 0.234 against 0.300 for two legs). When embeddings are not
+  the instructed AND raw query in one batched request; sentence-shaped queries also get instructed
+  and raw deterministic content-word forms in that same request. Each vector gets an independent,
+  concurrent ANN leg. The instructed/raw forms land in different neighbourhoods and each retrieves
+  answers the other misses (blending them into a single vector measured MRR 0.234 against 0.300 for
+  separate legs); the content-word forms raised the expanded live-agent benchmark from MRR 0.305 to
+  0.324 and hit@1 from 7 to 8 without reducing hit@5, hit@10, or found@50. When embeddings are not
   configured or `search_hybrid` is not installed (no pgvector), it automatically falls back to
   keyword search and reports a `fallback_reason`. Agent-session-only searches bound each ANN
   leg to 4x the requested depth (40-200 rows): those chunks are 3.05% of the global HNSW, and

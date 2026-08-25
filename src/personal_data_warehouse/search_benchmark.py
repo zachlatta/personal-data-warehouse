@@ -602,9 +602,10 @@ def run_smoke(
 ) -> dict[str, Any]:
     """Call search once per (source token, mode). No labels, no scoring.
 
-    This exists because every labeled query is unscoped: the scored benchmark
-    cannot see a scoped-search failure at all, and two of them shipped to
-    production unnoticed.
+    Labels exercise only the scopes represented by real queries; they cannot
+    cover every source token in every mode. This exhaustive pass catches
+    scoped-search failures scoring can miss -- two shipped unnoticed before
+    the smoke check existed.
     """
 
     sources = _pdw_json(

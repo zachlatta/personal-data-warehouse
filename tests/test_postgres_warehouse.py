@@ -1700,6 +1700,70 @@ def test_search_hybrid_gives_semantic_rank_a_measured_bounded_boost() -> None:
     assert "1.5 * COALESCE(1.0 / (60 + s.rnk), 0)" in sql
 
 
+def test_search_hybrid_is_composed_from_independently_callable_legs() -> None:
+    """The app can only use several host cores if each expensive leg can run
+    on its own pooled Postgres connection.
+
+    The public compatibility function must compose those helpers rather than
+    retaining a second copy of the legacy monolith; otherwise the two ranking
+    implementations drift on the first tuning change.
+    """
+
+    sql = _search_text_function_sql()
+    for marker in (
+        "CREATE OR REPLACE FUNCTION @search_hybrid_semantic(",
+        "CREATE OR REPLACE FUNCTION @search_hybrid_exact(",
+        "CREATE OR REPLACE FUNCTION @search_hybrid_fuse(",
+        "CREATE OR REPLACE FUNCTION @search_hybrid(",
+    ):
+        assert marker in sql
+
+    wrapper = sql[sql.rindex("CREATE OR REPLACE FUNCTION @search_hybrid("):]
+    assert "FROM @search_hybrid_semantic(" in wrapper
+    assert "FROM @search_hybrid_exact(" in wrapper
+    assert "FROM @search_hybrid_fuse(" in wrapper
+    assert "FROM @search_text(" in wrapper
+    assert "OPERATOR(public.<=>)" not in wrapper, (
+        "the compatibility wrapper must not retain the legacy ANN flow"
+    )
+
+
+def test_search_hybrid_semantic_helper_runs_exactly_one_vector_leg() -> None:
+    sql = _search_text_function_sql()
+    start = sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_semantic(")
+    end = sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(", start)
+    semantic = sql[start:end]
+
+    assert semantic.count("OPERATOR(public.<=>) qvec") >= 2  # global + Drive plans
+    assert "qvec_alt" not in semantic
+    assert "sum(1.0 / (" in semantic
+    assert "chunk_id" in semantic
+
+
+def test_search_hybrid_fuse_accepts_compact_parallel_leg_results() -> None:
+    sql = _search_text_function_sql()
+    start = sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_fuse(")
+    end = sql.rindex("CREATE OR REPLACE FUNCTION @search_hybrid(")
+    fuse = sql[start:end]
+
+    assert "lexical_refs text[]" in fuse
+    assert "semantic_legs jsonb" in fuse
+    assert "exact_refs text[]" in fuse
+    assert "jsonb_to_recordset" in fuse
+    assert "sum(j.fuse)" in fuse, (
+        "per-vector event evidence must still combine by reciprocal rank"
+    )
+
+
+def test_parallel_hybrid_helpers_reject_unknown_source_tokens() -> None:
+    # The helpers are public catalogued functions, not private implementation
+    # text. Calling one directly with a typo must fail loudly rather than make
+    # an invalid scope look like an honestly empty result.
+    sql = _search_text_function_sql()
+    for function_name in ("search_hybrid_semantic", "search_hybrid_exact"):
+        assert f"RAISE EXCEPTION '{function_name}: unknown source filter %'" in sql
+
+
 def test_search_hybrid_uses_a_deep_filtered_semantic_candidate_pool() -> None:
     sql = _search_text_function_sql()
 
@@ -1709,9 +1773,11 @@ def test_search_hybrid_uses_a_deep_filtered_semantic_candidate_pool() -> None:
 def test_search_hybrid_bounds_agent_session_semantic_candidate_work() -> None:
     sql = _search_text_function_sql()
 
-    assert sql.count("sem_adapters <@ ARRAY[") >= 2
-    assert sql.count("'agent_session', 'agent_session_turn'") >= 2
-    assert sql.count("least(greatest(per_source * 4, 40), 200)") >= 2
+    # One helper invocation searches one vector; the app invokes that same
+    # measured plan concurrently for the instructed and raw representations.
+    assert sql.count("sem_adapters <@ ARRAY[") >= 1
+    assert sql.count("'agent_session', 'agent_session_turn'") >= 1
+    assert sql.count("least(greatest(per_source * 4, 40), 200)") >= 1
 
 
 def test_search_hybrid_scans_drive_embeddings_source_first_in_parallel() -> None:
@@ -1722,10 +1788,16 @@ def test_search_hybrid_scans_drive_embeddings_source_first_in_parallel() -> None
     # barrier that keeps the adapter-first join below the distance sort; text
     # must only be fetched after the top-k or all Drive documents are detoasted.
     assert "sem_adapters = ARRAY['drive_file']::text[]" in sql
-    assert "drive_semantic_legs AS" in sql
-    assert sql.count("OFFSET 0") >= 2
-    assert "JOIN @search_chunks c2 ON c2.chunk_id = top.chunk_id" in sql
-    assert "sem_global_legs" in sql
+    assert "WITH sem_chunks AS" in sql
+    assert sql.count("OFFSET 0") >= 1
+    semantic = sql[
+        sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_semantic(") :
+        sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(")
+    ]
+    assert "JOIN @search_chunks c2" not in semantic
+    assert " c.text," not in semantic and " c2.text" not in semantic, (
+        "the parallel semantic helper must defer text until final fused top-k"
+    )
 
 
 def test_search_schema_signature_covers_hybrid_tuning(monkeypatch) -> None:
@@ -4727,7 +4799,9 @@ def test_search_hybrid_accepts_a_second_query_embedding() -> None:
     # any direct SQL caller, keeps the single-vector behaviour.
     sql = _search_text_function_sql()
     assert "query_embedding_alt text DEFAULT NULL" in sql
-    assert "qvec_alt" in sql
+    wrapper = sql[sql.rindex("CREATE OR REPLACE FUNCTION @search_hybrid("):]
+    assert "query_embedding_alt" in wrapper
+    assert wrapper.count("FROM @search_hybrid_semantic(") == 2
 
 
 def test_search_hybrid_second_leg_is_skipped_when_no_alt_embedding() -> None:
@@ -4743,7 +4817,8 @@ def test_search_hybrid_fuses_semantic_legs_by_rank_not_distance() -> None:
     # rank, the same argument that keeps BM25 scores and cosine distances
     # apart in the outer fusion.
     sql = _search_text_function_sql()
-    assert "sem_legs" in sql and "sum(1.0 / (" in sql
+    assert "sum(1.0 / (" in sql
+    assert "sum(j.fuse)" in sql
 
 
 def test_search_hybrid_clamps_ef_search_to_pgvectors_maximum() -> None:
@@ -4823,8 +4898,8 @@ def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -
     assert "text public.gin_trgm_ops" in index.sql
 
     sql = _search_text_function_sql()
-    hybrid = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid("):]
-    literal = hybrid[hybrid.index("exact_refs"):hybrid.index("RETURN QUERY")]
+    exact = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact("):]
+    literal = exact[exact.index("exact_refs"):exact.index("RETURN QUERY")]
     assert "exact_needle ~ '[0-9_./@-]'" in literal
     assert "pg_catalog.to_regclass" in literal
     assert "i.indisvalid" in literal and "i.indisready" in literal
@@ -4863,8 +4938,8 @@ def test_search_hybrid_ranks_symbolic_chunk_matches_by_prominence() -> None:
     # ids containing digits are different: position is arbitrary there and
     # hurt one label, so they deliberately keep the old recency order.
     sql = _search_text_function_sql()
-    hybrid = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid("):]
-    literal = hybrid[hybrid.index("exact_refs"):hybrid.index("RETURN QUERY")]
+    exact = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact("):]
+    literal = exact[exact.index("exact_refs"):exact.index("RETURN QUERY")]
     assert "WHEN exact_needle ~ '[0-9]' THEN NULL" in literal
     assert "c.chunk_index" in literal
     assert "strpos(lower(c.text), lower(exact_needle))" in literal
@@ -4916,7 +4991,7 @@ def test_search_hybrid_literal_leg_failure_does_not_take_down_the_search() -> No
     sql = _search_text_function_sql()
     leg = sql[sql.index("exact_refs"):]
     assert "EXCEPTION WHEN OTHERS THEN" in leg
-    assert "RAISE WARNING 'search_hybrid: literal leg failed" in leg
+    assert "RAISE WARNING 'search_hybrid_exact: literal leg failed" in leg
 
 
 def test_each_search_branch_names_the_index_that_covers_its_adapters() -> None:
@@ -4973,9 +5048,9 @@ def test_search_hybrid_pushes_the_source_filter_into_the_ann_scan() -> None:
     # with the adapter predicate pushed down took 1.0s. Resolve `sources` to
     # adapters once, then filter the scan on c.adapter directly.
     sql = _search_text_function_sql()
-    hybrid = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid("):]
-    legs = hybrid[
-        hybrid.index("sem_global_legs AS (") : hybrid.index("sem_ranked AS (")
+    legs = sql[
+        sql.index("WITH sem_chunks AS") :
+        sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(")
     ]
     assert "sem_adapters" in legs, "the semantic legs must filter on resolved adapters"
     assert "c.adapter = ANY (sem_adapters)" in legs
@@ -5077,7 +5152,7 @@ def test_search_hybrid_filters_the_semantic_leg_on_priority() -> None:
     assert "query, per_source, sources, since, priorities" in sql, (
         "search_hybrid's literal leg must pass the tier filter down"
     )
-    assert "OR COALESCE(m.priority, t.priority::text) = ANY (priorities))" in sql, (
+    assert "OR t.priority::text = ANY (priorities))" in sql, (
         "search_hybrid must filter its fused output on priority, or the semantic "
         "leg would return rows from tiers the caller excluded"
     )

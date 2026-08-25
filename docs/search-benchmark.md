@@ -42,10 +42,10 @@ uv run python scripts/search_benchmark.py latency --sample 8
 uv run python scripts/search_benchmark.py smoke
 ```
 
-**Run `smoke` after touching the search indexes or the search SQL.** Every
-labeled query is unscoped, so the scored benchmark cannot see a scoped-search
-failure at all -- and two of them reached production unnoticed on 2026-08-23. A
-plan flip made seven source tokens raise *"query specifies index X but planner
+**Run `smoke` after touching the search indexes or the search SQL.** Labels
+exercise only the scopes represented by real queries, so scoring cannot see
+every source-token/mode failure -- and two reached production unnoticed on
+2026-08-23. A plan flip made seven source tokens raise *"query specifies index X but planner
 chose index Y"*, and a scoped hybrid search took 73s, past the app's statement
 budget, so callers got a timeout instead of results. Both were one call per
 token away from obvious. `smoke` needs no labels, exits non-zero when a source

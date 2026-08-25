@@ -9267,6 +9267,13 @@ class PostgresWarehouse:
             (self._object_schema("search_text_preview"), "search_text_preview"),
             (self._object_schema("timeline_context"), "context"),
         )
+        if self.pgvector_available() and self._relation_exists("search_chunks"):
+            expected += (
+                (self._object_schema("search_hybrid"), "search_hybrid"),
+                (self._object_schema("search_hybrid_semantic"), "search_hybrid_semantic"),
+                (self._object_schema("search_hybrid_exact"), "search_hybrid_exact"),
+                (self._object_schema("search_hybrid_fuse"), "search_hybrid_fuse"),
+            )
         rows = self._query(
             """
             SELECT count(DISTINCT (n.nspname, p.proname))
@@ -10056,30 +10063,165 @@ class PostgresWarehouse:
             chunk_index_regclass = (
                 f"{self._object_schema('search_chunks')}.search_chunks_text_trgm_idx"
             ).replace("'", "''")
+            # Each expensive hybrid leg is independently callable. The app fans
+            # them out over separate pooled Postgres connections so ANN, BM25,
+            # and literal retrieval use several host cores instead of adding
+            # their wall times inside one backend. search_hybrid() below remains
+            # the direct-SQL compatibility entry point and composes these same
+            # helpers -- there is no second legacy ranking flow to drift.
             self._command(
                 r"""
             -- CREATE OR REPLACE with a new parameter OVERLOADS rather than
-            -- replaces, so the previous signature has to go explicitly or a
-            -- caller omitting the alternate embedding keeps reaching the old
-            -- implementation.
+            -- replaces, so obsolete public signatures have to go explicitly.
             DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz);
             DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz, text);
-            CREATE OR REPLACE FUNCTION @search_hybrid(
-                query text,
+            CREATE OR REPLACE FUNCTION @search_hybrid_semantic(
                 query_embedding text,
                 embedding_model text DEFAULT '"""
                 + SEARCH_EMBEDDING_DEFAULT_MODEL
                 + r"""',
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
-                since timestamptz DEFAULT NULL,
-                query_embedding_alt text DEFAULT NULL,
-                priorities text[] DEFAULT NULL
+                since timestamptz DEFAULT NULL
             )
-            RETURNS SETOF @search_text_hit
+            RETURNS TABLE (ref text, best bigint, fuse double precision, chunk_id text)
             LANGUAGE plpgsql
             STABLE
-            AS $fn$
+            AS $semantic$
+            DECLARE
+                per_source integer := least(greatest(coalesce(max_results, 50), 1), """
+                + str(SEARCH_TEXT_MAX_RESULTS_CAP)
+                + r""");
+                sem_adapters text[];
+                qvec public.halfvec("""
+                + str(SEARCH_EMBEDDING_DIMENSIONS)
+                + r""");
+            BEGIN
+                IF query_embedding IS NULL OR trim(query_embedding) = '' THEN
+                    RAISE EXCEPTION 'search_hybrid_semantic: query_embedding is required'
+                        USING HINT = 'pass one query embedding as a vector literal';
+                END IF;
+                qvec := query_embedding::public.halfvec("""
+                + str(SEARCH_EMBEDDING_DIMENSIONS)
+                + r""");
+                -- Each invocation owns exactly one vector. Running two calls
+                -- concurrently preserves the two distinct Qwen neighbourhoods
+                -- without making one Postgres backend scan them serially.
+                PERFORM set_config('hnsw.ef_search', least(1000, greatest(1000, per_source * 8))::text, true);
+                PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);
+                PERFORM set_config('hnsw.max_scan_tuples', '100000', true);
+                PERFORM set_config('hnsw.scan_mem_multiplier', '4', true);
+                """
+                + sources_alias_sql
+                + r"""
+                IF sources IS NOT NULL THEN
+                    sem_adapters := ARRAY(
+                        SELECT map.adapter
+                        FROM (VALUES """ + adapter_source_values + r""") AS map(adapter, source)
+                        WHERE map.source = ANY (sources)
+                    );
+                    IF coalesce(array_length(sem_adapters, 1), 0) = 0 THEN
+                        RAISE EXCEPTION 'search_hybrid_semantic: unknown source filter %', sources
+                            USING HINT = 'use timeline.search_text_sources() to list accepted source tokens';
+                    END IF;
+                END IF;
+                RETURN QUERY
+                WITH sem_chunks AS (
+                    -- Most scopes use global HNSW. Drive is excluded because a
+                    -- source-first exact scan is materially faster for its
+                    -- selective 223k-chunk partition.
+                    (
+                    SELECT c.adapter || ':' || c.event_id AS ref,
+                           c.chunk_id,
+                           row_number() OVER (
+                               ORDER BY (e.embedding OPERATOR(public.<=>) qvec)
+                           ) AS rnk
+                    FROM @search_chunk_embeddings e
+                    JOIN @search_chunks c ON c.text_sha256 = e.text_sha256
+                    WHERE e.model = embedding_model
+                      AND e.embedding IS NOT NULL
+                      AND sem_adapters IS DISTINCT FROM ARRAY['drive_file']::text[]
+                      AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
+                      AND (since IS NULL OR c.event_ts >= since)
+                    ORDER BY e.embedding OPERATOR(public.<=>) qvec
+                    LIMIT CASE WHEN sem_adapters <@ ARRAY[
+                        'agent_session', 'agent_session_turn'
+                    ]::text[] THEN least(greatest(per_source * """
+                + str(SEARCH_HYBRID_AGENT_CANDIDATE_MULTIPLIER)
+                + ", "
+                + str(SEARCH_HYBRID_AGENT_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_AGENT_MAX_CANDIDATES)
+                + r""") ELSE least(greatest(per_source * """
+                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
+                + ", "
+                + str(SEARCH_HYBRID_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_MAX_CANDIDATES)
+                + r""") END
+                    )
+                    UNION ALL
+                    (
+                    -- OFFSET 0 is the measured plan barrier that keeps this
+                    -- source-first and parallel instead of returning to global
+                    -- filtered HNSW. Text is deferred all the way to final
+                    -- fusion, so even the top-k candidates are not detoasted.
+                    SELECT top.adapter || ':' || top.event_id AS ref,
+                           top.chunk_id,
+                           top.rnk
+                    FROM (
+                        SELECT s.*,
+                               row_number() OVER (ORDER BY s.distance) AS rnk
+                        FROM (
+                            SELECT c.chunk_id, c.adapter, c.event_id,
+                                   e.embedding OPERATOR(public.<=>) qvec AS distance
+                            FROM @search_chunks c
+                            JOIN @search_chunk_embeddings e
+                              ON e.text_sha256 = c.text_sha256
+                            WHERE sem_adapters = ARRAY['drive_file']::text[]
+                              AND c.adapter = ANY (sem_adapters)
+                              AND e.model = embedding_model
+                              AND e.embedding IS NOT NULL
+                              AND (since IS NULL OR c.event_ts >= since)
+                            OFFSET 0
+                        ) s
+                        ORDER BY s.distance
+                        LIMIT least(greatest(per_source * """
+                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
+                + ", "
+                + str(SEARCH_HYBRID_MIN_CANDIDATES)
+                + "), "
+                + str(SEARCH_HYBRID_MAX_CANDIDATES)
+                + r""")
+                    ) top
+                    ORDER BY top.distance
+                    )
+                )
+                SELECT sc.ref,
+                       min(sc.rnk)::bigint AS best,
+                       sum(1.0 / ("""
+                + str(SEARCH_HYBRID_RRF_K)
+                + r""" + sc.rnk))::double precision AS fuse,
+                       (array_agg(sc.chunk_id ORDER BY sc.rnk))[1] AS chunk_id
+                FROM sem_chunks sc
+                GROUP BY sc.ref;
+            END;
+            $semantic$;
+            """
+            )
+            self._command(
+                r"""
+            CREATE OR REPLACE FUNCTION @search_hybrid_exact(
+                query text,
+                max_results integer DEFAULT 50,
+                sources text[] DEFAULT NULL,
+                since timestamptz DEFAULT NULL,
+                priorities text[] DEFAULT NULL
+            )
+            RETURNS TABLE (ref text, rnk bigint)
+            LANGUAGE plpgsql
+            STABLE
+            AS $exact$
             DECLARE
                 per_source integer := least(greatest(coalesce(max_results, 50), 1), """
                 + str(SEARCH_TEXT_MAX_RESULTS_CAP)
@@ -10095,66 +10237,23 @@ class PostgresWarehouse:
                 exact_pattern_c text;
                 requested_priority text;
                 sem_adapters text[];
-                qvec_alt public.halfvec("""
-                + str(SEARCH_EMBEDDING_DIMENSIONS)
-                + r""");
-                qvec public.halfvec("""
-                + str(SEARCH_EMBEDDING_DIMENSIONS)
-                + r""");
             BEGIN
-                IF query_embedding IS NULL OR trim(query_embedding) = '' THEN
-                    RAISE EXCEPTION 'search_hybrid: query_embedding is required'
-                        USING HINT = 'pass the query embedding as a vector literal; use search_text() for keyword-only search';
-                END IF;
-                qvec := query_embedding::public.halfvec("""
-                + str(SEARCH_EMBEDDING_DIMENSIONS)
-                + r""");
-                -- The optional second vector is the same question in its other
-                -- form (instructed vs raw). Qwen3-Embedding is
-                -- instruction-asymmetric, so the two land in different
-                -- neighbourhoods and each retrieves answers the other misses.
-                IF query_embedding_alt IS NOT NULL AND trim(query_embedding_alt) <> '' THEN
-                    qvec_alt := query_embedding_alt::public.halfvec("""
-                + str(SEARCH_EMBEDDING_DIMENSIONS)
-                + r""");
-                END IF;
-                -- Recent/source filters are applied during the ANN scan. With
-                -- iterative scan disabled, ef_search candidates from the full
-                -- corpus can contain too few qualifying rows and silently
-                -- omit excellent recent matches. Relaxed iterative scan keeps
-                -- expanding until the filtered LIMIT is satisfied and gives
-                -- better filtered recall than strict ordering; the outer
-                -- semantic ranking restores distance order. The larger
-                -- exploration floor improves approximate recall. The
-                -- default 20k tuple/memory budgets became too small once the
-                -- embedding corpus covered 90 days: selective 30-day queries
-                -- could exhaust the global ANN scan before reaching their
-                -- best recent neighbors.
-                -- pgvector's hard ceiling for this GUC is 1000: an unclamped
-                -- floor raised "1600 is outside the valid range" for any
-                -- max_results above 125, which search_text's cap allows.
-                PERFORM set_config('hnsw.ef_search', least(1000, greatest(1000, per_source * 8))::text, true);
-                PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);
-                PERFORM set_config('hnsw.max_scan_tuples', '100000', true);
-                PERFORM set_config('hnsw.scan_mem_multiplier', '4', true);
                 """
                 + sources_alias_sql
                 + r"""
                 """
-                + priorities_guard_sql("search_hybrid")
+                + priorities_guard_sql("search_hybrid_exact")
                 + r"""
-                -- Resolve `sources` to ADAPTERS once. Filtering the ANN legs
-                -- through a joined adapter->source list keeps the predicate
-                -- above the index scan, where pgvector's iterative scan cannot
-                -- use it: a photo-scoped search took 44.6s that way, past the
-                -- app's statement budget, against 1.0s for the same scan with
-                -- the adapter predicate pushed down.
                 IF sources IS NOT NULL THEN
                     sem_adapters := ARRAY(
                         SELECT map.adapter
                         FROM (VALUES """ + adapter_source_values + r""") AS map(adapter, source)
                         WHERE map.source = ANY (sources)
                     );
+                    IF coalesce(array_length(sem_adapters, 1), 0) = 0 THEN
+                        RAISE EXCEPTION 'search_hybrid_exact: unknown source filter %', sources
+                            USING HINT = 'use timeline.search_text_sources() to list accepted source tokens';
+                    END IF;
                 END IF;
                 -- The literal-substring leg. Gated on a short query: it is where
                 -- BM25 tokenization and embeddings both fail (identifiers,
@@ -10341,192 +10440,62 @@ class PostgresWarehouse:
                         -- drop is how a degraded search layer goes unnoticed
                         -- for weeks. Same contract as search_text's per-branch
                         -- guard.
-                        RAISE WARNING 'search_hybrid: literal leg failed (%); returning ranked + semantic results only', SQLERRM;
+                        RAISE WARNING 'search_hybrid_exact: literal leg failed (%); returning no literal evidence', SQLERRM;
                         exact_refs := NULL;
                     END;
                 END IF;
                 RETURN QUERY
+                SELECT u.ref, u.ordinality::bigint AS rnk
+                FROM unnest(coalesce(exact_refs, '{}'::text[]))
+                     WITH ORDINALITY AS u(ref, ordinality);
+            END;
+            $exact$;
+            """
+            )
+            self._command(
+                r"""
+            CREATE OR REPLACE FUNCTION @search_hybrid_fuse(
+                query text,
+                max_results integer DEFAULT 50,
+                lexical_refs text[] DEFAULT NULL,
+                semantic_legs jsonb DEFAULT '[]'::jsonb,
+                exact_refs text[] DEFAULT NULL,
+                priorities text[] DEFAULT NULL
+            )
+            RETURNS SETOF @search_text_hit
+            LANGUAGE plpgsql
+            STABLE
+            AS $fuse$
+            DECLARE
+                per_source integer := least(greatest(coalesce(max_results, 50), 1), """
+                + str(SEARCH_TEXT_MAX_RESULTS_CAP)
+                + r""");
+                requested_priority text;
+            BEGIN
+                """
+                + priorities_guard_sql("search_hybrid_fuse")
+                + r"""
+                RETURN QUERY
                 WITH lex AS (
-                    SELECT h.ref, h.source, h.subsource, h.context, h.who, h.occurred_at,
-                           h.account, h.text, h.title, h.source_table, h.source_pk,
-                           h.priority,
-                           row_number() OVER () AS rnk
-                    FROM @search_text(query, per_source, sources, since, priorities) AS h
+                    SELECT u.ref, u.ordinality AS rnk
+                    FROM unnest(coalesce(lexical_refs, '{}'::text[]))
+                         WITH ORDINALITY AS u(ref, ordinality)
                 ),
-                -- One leg per query vector. The second leg is gated on the
-                -- parameter, so a single-vector call pays a one-time filter,
-                -- not a second ANN scan. Most scopes use the global HNSW.
-                -- Drive is excluded here: its 223k chunks are large enough
-                -- for an adapter-first exact scan to use parallel workers,
-                -- but selective enough that filtered HNSW spends longer
-                -- walking past other adapters than doing the exact math.
-                sem_global_legs AS (
-                    (
-                    SELECT c.adapter || ':' || c.event_id AS ref,
-                           c.context, c.event_ts, c.text,
-                           row_number() OVER (
-                               ORDER BY (e.embedding OPERATOR(public.<=>) qvec)
-                           ) AS rnk
-                    FROM @search_chunk_embeddings e
-                    JOIN @search_chunks c ON c.text_sha256 = e.text_sha256
-                    WHERE e.model = embedding_model
-                      AND e.embedding IS NOT NULL
-                      AND sem_adapters IS DISTINCT FROM ARRAY['drive_file']::text[]
-                      AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
-                      AND (since IS NULL OR c.event_ts >= since)
-                    ORDER BY e.embedding OPERATOR(public.<=>) qvec
-                    LIMIT CASE WHEN sem_adapters <@ ARRAY[
-                        'agent_session', 'agent_session_turn'
-                    ]::text[] THEN least(greatest(per_source * """
-                + str(SEARCH_HYBRID_AGENT_CANDIDATE_MULTIPLIER)
-                + ", "
-                + str(SEARCH_HYBRID_AGENT_MIN_CANDIDATES)
-                + "), "
-                + str(SEARCH_HYBRID_AGENT_MAX_CANDIDATES)
-                + r""") ELSE least(greatest(per_source * """
-                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
-                + ", "
-                + str(SEARCH_HYBRID_MIN_CANDIDATES)
-                + "), "
-                + str(SEARCH_HYBRID_MAX_CANDIDATES)
-                + r""") END
-                    )
-                    UNION ALL
-                    (
-                    SELECT c.adapter || ':' || c.event_id AS ref,
-                           c.context, c.event_ts, c.text,
-                           row_number() OVER (
-                               ORDER BY (e.embedding OPERATOR(public.<=>) qvec_alt)
-                           ) AS rnk
-                    FROM @search_chunk_embeddings e
-                    JOIN @search_chunks c ON c.text_sha256 = e.text_sha256
-                    WHERE e.model = embedding_model
-                      AND e.embedding IS NOT NULL
-                      AND qvec_alt IS NOT NULL
-                      AND sem_adapters IS DISTINCT FROM ARRAY['drive_file']::text[]
-                      AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
-                      AND (since IS NULL OR c.event_ts >= since)
-                    ORDER BY e.embedding OPERATOR(public.<=>) qvec_alt
-                    LIMIT CASE WHEN sem_adapters <@ ARRAY[
-                        'agent_session', 'agent_session_turn'
-                    ]::text[] THEN least(greatest(per_source * """
-                + str(SEARCH_HYBRID_AGENT_CANDIDATE_MULTIPLIER)
-                + ", "
-                + str(SEARCH_HYBRID_AGENT_MIN_CANDIDATES)
-                + "), "
-                + str(SEARCH_HYBRID_AGENT_MAX_CANDIDATES)
-                + r""") ELSE least(greatest(per_source * """
-                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
-                + ", "
-                + str(SEARCH_HYBRID_MIN_CANDIDATES)
-                + "), "
-                + str(SEARCH_HYBRID_MAX_CANDIDATES)
-                + r""") END
-                    )
-                ),
-                -- A source-scoped Drive HNSW leg is pathologically selective:
-                -- LIMIT 40 walked 14,737 global embeddings and took 16.0s.
-                -- Scanning all 223k Drive chunks source-first launched three
-                -- workers and took 7.0s cold / 0.66s warm even at LIMIT 1000.
-                -- OFFSET 0 is a load-bearing plan barrier: without it the
-                -- planner returns to the global HNSW. Fetch text only after
-                -- top-k, or the exact scan detoasts every Drive chunk.
-                drive_semantic_legs AS (
-                    (
-                    SELECT top.adapter || ':' || top.event_id AS ref,
-                           top.context, top.event_ts, c2.text, top.rnk
-                    FROM (
-                        SELECT s.*,
-                               row_number() OVER (ORDER BY s.distance) AS rnk
-                        FROM (
-                            SELECT c.chunk_id, c.adapter, c.event_id,
-                                   c.context, c.event_ts,
-                                   e.embedding OPERATOR(public.<=>) qvec AS distance
-                            FROM @search_chunks c
-                            JOIN @search_chunk_embeddings e
-                              ON e.text_sha256 = c.text_sha256
-                            WHERE sem_adapters = ARRAY['drive_file']::text[]
-                              AND c.adapter = ANY (sem_adapters)
-                              AND e.model = embedding_model
-                              AND e.embedding IS NOT NULL
-                              AND (since IS NULL OR c.event_ts >= since)
-                            OFFSET 0
-                        ) s
-                        ORDER BY s.distance
-                        LIMIT least(greatest(per_source * """
-                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
-                + ", "
-                + str(SEARCH_HYBRID_MIN_CANDIDATES)
-                + "), "
-                + str(SEARCH_HYBRID_MAX_CANDIDATES)
-                + r""")
-                    ) top
-                    JOIN @search_chunks c2 ON c2.chunk_id = top.chunk_id
-                    ORDER BY top.distance
-                    )
-                    UNION ALL
-                    (
-                    SELECT top.adapter || ':' || top.event_id AS ref,
-                           top.context, top.event_ts, c2.text, top.rnk
-                    FROM (
-                        SELECT s.*,
-                               row_number() OVER (ORDER BY s.distance) AS rnk
-                        FROM (
-                            SELECT c.chunk_id, c.adapter, c.event_id,
-                                   c.context, c.event_ts,
-                                   e.embedding OPERATOR(public.<=>) qvec_alt AS distance
-                            FROM @search_chunks c
-                            JOIN @search_chunk_embeddings e
-                              ON e.text_sha256 = c.text_sha256
-                            WHERE sem_adapters = ARRAY['drive_file']::text[]
-                              AND c.adapter = ANY (sem_adapters)
-                              AND e.model = embedding_model
-                              AND e.embedding IS NOT NULL
-                              AND qvec_alt IS NOT NULL
-                              AND (since IS NULL OR c.event_ts >= since)
-                            OFFSET 0
-                        ) s
-                        ORDER BY s.distance
-                        LIMIT least(greatest(per_source * """
-                + str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER)
-                + ", "
-                + str(SEARCH_HYBRID_MIN_CANDIDATES)
-                + "), "
-                + str(SEARCH_HYBRID_MAX_CANDIDATES)
-                + r""")
-                    ) top
-                    JOIN @search_chunks c2 ON c2.chunk_id = top.chunk_id
-                    ORDER BY top.distance
-                    )
-                ),
-                sem_legs AS (
-                    SELECT g.ref, g.context, g.event_ts, g.text, g.rnk
-                    FROM sem_global_legs g
-                    UNION ALL
-                    SELECT d.ref, d.context, d.event_ts, d.text, d.rnk
-                    FROM drive_semantic_legs d
+                sem_input AS (
+                    SELECT j.ref, j.best, j.fuse, j.chunk_id
+                    FROM jsonb_to_recordset(coalesce(semantic_legs, '[]'::jsonb))
+                         AS j(ref text, best bigint, fuse double precision, chunk_id text)
                 ),
                 sem_ranked AS (
-                    -- Ranks, not distances: two query vectors are calibrated to
-                    -- their own neighbourhoods, so their distances are not
-                    -- comparable -- the same reason BM25 and cosine meet only
-                    -- as ranks in the outer fusion. Summing each event's
-                    -- chunk reciprocal ranks also rewards a document matching
-                    -- in several places, which scoring only its single best
-                    -- chunk throws away (measured MRR 0.212 -> 0.300).
-                    SELECT g.ref, g.context, g.event_ts, g.text,
+                    SELECT g.ref, g.chunk_id,
                            row_number() OVER (ORDER BY g.fuse DESC, g.best ASC) AS rnk
                     FROM (
-                        SELECT sl.ref,
-                               min(sl.rnk) AS best,
-                               sum(1.0 / ("""
-                + str(SEARCH_HYBRID_RRF_K)
-                + r""" + sl.rnk)) AS fuse,
-                               (array_agg(sl.context ORDER BY sl.rnk))[1] AS context,
-                               (array_agg(sl.event_ts ORDER BY sl.rnk))[1] AS event_ts,
-                               (array_agg(sl.text ORDER BY sl.rnk))[1] AS text
-                        FROM sem_legs sl
-                        GROUP BY sl.ref
+                        SELECT j.ref,
+                               min(j.best) AS best,
+                               sum(j.fuse) AS fuse,
+                               (array_agg(j.chunk_id ORDER BY j.best))[1] AS chunk_id
+                        FROM sem_input j
+                        GROUP BY j.ref
                     ) g
                 ),
                 exact_ranked AS (
@@ -10536,10 +10505,7 @@ class PostgresWarehouse:
                 ),
                 merged AS (
                     SELECT COALESCE(l.ref, s.ref, x.ref) AS ref,
-                           l.source, l.subsource, l.context AS lex_context, l.who,
-                           l.occurred_at, l.account, l.text AS lex_text, l.title,
-                           l.source_table, l.source_pk, l.priority,
-                           s.context AS sem_context, s.event_ts AS sem_ts, s.text AS sem_text,
+                           s.chunk_id,
                            (COALESCE(1.0 / ("""
                 + str(SEARCH_HYBRID_RRF_K)
                 + r""" + l.rnk), 0) + """
@@ -10555,53 +10521,105 @@ class PostgresWarehouse:
                     FULL OUTER JOIN sem_ranked s ON s.ref = l.ref
                     FULL OUTER JOIN exact_ranked x ON x.ref = COALESCE(l.ref, s.ref)
                 )
-                SELECT COALESCE(m.source, tmap.source, t.source) AS source,
-                       COALESCE(m.subsource, """
-                + exact_subsource_case
-                + r""") AS subsource,
-                       COALESCE(m.lex_context, m.sem_context, t.context) AS context,
-                       COALESCE(m.who, t.actor, '') AS who,
-                       COALESCE(m.occurred_at, m.sem_ts, t.event_ts) AS occurred_at,
-                       COALESCE(m.account, t.source_pk->>'account', t.metadata->>'account', '') AS account,
+                SELECT COALESCE(tmap.source, t.source) AS source,
+                       """ + exact_subsource_case + r""" AS subsource,
+                       t.context,
+                       COALESCE(t.actor, '') AS who,
+                       t.event_ts AS occurred_at,
+                       COALESCE(t.source_pk->>'account', t.metadata->>'account', '') AS account,
                        m.ref,
-                       COALESCE(m.sem_text, m.lex_text,
-                                """ + preview_fn_sql + r"""(t.search_text, query)) AS text,
+                       COALESCE(c.text, """ + preview_fn_sql + r"""(t.search_text, query)) AS text,
                        (-m.rrf)::real AS score,
-                       COALESCE(m.occurred_at, m.sem_ts, t.event_ts) AS event_ts,
-                       COALESCE(m.title, t.title, '') AS title,
-                       COALESCE(m.source_table, t.source_table, '') AS source_table,
-                       COALESCE(m.source_pk, t.source_pk) AS source_pk,
-                       COALESCE(m.priority, t.priority::text) AS priority
+                       t.event_ts,
+                       COALESCE(t.title, '') AS title,
+                       COALESCE(t.source_table, '') AS source_table,
+                       t.source_pk,
+                       t.priority::text AS priority
                 FROM merged m
-                -- LATERAL forces a per-row primary-key probe. A plain join on
-                -- these computed expressions let the planner pick a hash join,
-                -- which seq-scanned the ~47M-row timeline table (~29s of a
-                -- 36s call) for a <=200-row merge.
+                -- Per-result primary-key probes avoid a 47M-row hash join.
                 LEFT JOIN LATERAL (
                     SELECT te.* FROM @timeline_events te
                     WHERE te.adapter = split_part(m.ref, ':', 1)
                       AND te.event_id = substring(m.ref FROM length(split_part(m.ref, ':', 1)) + 2)
                     LIMIT 1
                 ) t ON TRUE
+                LEFT JOIN @search_chunks c ON c.chunk_id = m.chunk_id
                 LEFT JOIN (VALUES """
                 + adapter_source_values
                 + r""") AS tmap(adapter, source) ON tmap.adapter = t.adapter
-                -- The two lexical legs above already filtered on `priorities`
-                -- at full depth. The ANN legs cannot: derived_search.chunks
-                -- carries no priority, and hanging a join above pgvector's
-                -- iterative scan is the exact shape that made a source-scoped
-                -- search take 44.6s. So the semantic leg is filtered HERE, on
-                -- the timeline row the fusion already probes by primary key --
-                -- correct, and cheap, at the cost of some semantic recall
-                -- inside a narrow tier. The filter is not optional: a hybrid
-                -- search that honored the tier in two legs out of three would
-                -- answer a priority-scoped question with unscoped rows.
-                WHERE (priorities IS NULL
-                       OR COALESCE(m.priority, t.priority::text) = ANY (priorities))
-                ORDER BY m.rrf DESC, COALESCE(m.occurred_at, m.sem_ts, t.event_ts) DESC
+                WHERE t.event_id IS NOT NULL
+                  AND (priorities IS NULL OR t.priority::text = ANY (priorities))
+                ORDER BY m.rrf DESC, t.event_ts DESC
                 LIMIT per_source;
             END;
-            $fn$;
+            $fuse$;
+            """
+            )
+            self._command(
+                r"""
+            CREATE OR REPLACE FUNCTION @search_hybrid(
+                query text,
+                query_embedding text,
+                embedding_model text DEFAULT '"""
+                + SEARCH_EMBEDDING_DEFAULT_MODEL
+                + r"""',
+                max_results integer DEFAULT 50,
+                sources text[] DEFAULT NULL,
+                since timestamptz DEFAULT NULL,
+                query_embedding_alt text DEFAULT NULL,
+                priorities text[] DEFAULT NULL
+            )
+            RETURNS SETOF @search_text_hit
+            LANGUAGE plpgsql
+            STABLE
+            AS $hybrid$
+            DECLARE
+                per_source integer := least(greatest(coalesce(max_results, 50), 1), """
+                + str(SEARCH_TEXT_MAX_RESULTS_CAP)
+                + r""");
+                lexical_refs text[];
+                semantic_legs jsonb := '[]'::jsonb;
+                one_semantic_leg jsonb;
+                exact_refs text[];
+                requested_priority text;
+            BEGIN
+                """
+                + priorities_guard_sql("search_hybrid")
+                + r"""
+                IF query_embedding IS NULL OR trim(query_embedding) = '' THEN
+                    RAISE EXCEPTION 'search_hybrid: query_embedding is required'
+                        USING HINT = 'pass the query embedding as a vector literal; use search_text() for keyword-only search';
+                END IF;
+                SELECT array_agg(x.ref ORDER BY x.rnk)
+                  INTO lexical_refs
+                  FROM (
+                    SELECT h.ref, row_number() OVER () AS rnk
+                    FROM @search_text(query, per_source, sources, since, priorities) h
+                  ) x;
+                SELECT coalesce(jsonb_agg(to_jsonb(s)), '[]'::jsonb)
+                  INTO semantic_legs
+                  FROM @search_hybrid_semantic(
+                      query_embedding, embedding_model, per_source, sources, since
+                  ) s;
+                IF query_embedding_alt IS NOT NULL AND trim(query_embedding_alt) <> '' THEN
+                    SELECT coalesce(jsonb_agg(to_jsonb(s)), '[]'::jsonb)
+                      INTO one_semantic_leg
+                      FROM @search_hybrid_semantic(
+                          query_embedding_alt, embedding_model, per_source, sources, since
+                      ) s;
+                    semantic_legs := semantic_legs || one_semantic_leg;
+                END IF;
+                SELECT array_agg(x.ref ORDER BY x.rnk)
+                  INTO exact_refs
+                  FROM @search_hybrid_exact(
+                      query, per_source, sources, since, priorities
+                  ) x;
+                RETURN QUERY
+                SELECT * FROM @search_hybrid_fuse(
+                    query, per_source, lexical_refs, semantic_legs, exact_refs, priorities
+                );
+            END;
+            $hybrid$;
             """
             )
         # to_bm25query() resolves the timeline BM25 index by NAME, and the

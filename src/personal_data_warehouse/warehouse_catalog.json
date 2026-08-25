@@ -2296,6 +2296,39 @@
       "secret": false
     },
     {
+      "id": "search_hybrid_semantic",
+      "kind": "function",
+      "layer": "timeline",
+      "domain": "timeline",
+      "schema": "timeline",
+      "name": "search_hybrid_semantic",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "search_hybrid_exact",
+      "kind": "function",
+      "layer": "timeline",
+      "domain": "timeline",
+      "schema": "timeline",
+      "name": "search_hybrid_exact",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "search_hybrid_fuse",
+      "kind": "function",
+      "layer": "timeline",
+      "domain": "timeline",
+      "schema": "timeline",
+      "name": "search_hybrid_fuse",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "search_hybrid",
       "kind": "function",
       "layer": "timeline",

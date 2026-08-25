@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -121,6 +122,101 @@ func TestEmbeddingsClientReturnsInstructedAndRawQueryVectors(t *testing.T) {
 		t.Fatalf("inputs = %#v", gotInputs)
 	}
 	// One round trip, not two: both forms ride in the same batched request.
+}
+
+func TestEmbeddingsClientAlsoEmbedsTheQueriesTermBag(t *testing.T) {
+	// Sentence-shaped queries are the benchmark's weak stratum. Searching the
+	// instructed+raw vectors for both the original sentence and its deterministic
+	// content-word form improved labeled MRR without losing hit@5/hit@10/recall.
+	// All four inputs must ride in the same GPU request; only the independent ANN
+	// scans are fanned out by Search.
+	var gotInputs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		gotInputs = body.Input
+		_, _ = w.Write([]byte(`{"data":[` +
+			`{"index":0,"embedding":[1,0]},` +
+			`{"index":1,"embedding":[0,1]},` +
+			`{"index":2,"embedding":[2,0]},` +
+			`{"index":3,"embedding":[0,2]}]}`))
+	}))
+	defer srv.Close()
+
+	client := NewEmbeddingsClient(EmbeddingsOptions{
+		BaseURL:     srv.URL,
+		Dimensions:  2,
+		QueryPrefix: "Instruct: retrieve personal data\nQuery:",
+	})
+	vectors, err := client.Embed(
+		context.Background(),
+		"what is still owed to the vet clinic",
+	)
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if len(vectors) != 4 {
+		t.Fatalf("want original+term-bag instructed/raw vectors, got %d", len(vectors))
+	}
+	want := []string{
+		"Instruct: retrieve personal data\nQuery:what is still owed to the vet clinic",
+		"what is still owed to the vet clinic",
+		"Instruct: retrieve personal data\nQuery:still owed vet clinic",
+		"still owed vet clinic",
+	}
+	if !slices.Equal(gotInputs, want) {
+		t.Fatalf("inputs = %#v, want %#v", gotInputs, want)
+	}
+}
+
+func TestEmbeddingsClientDoesNotDuplicateAnExistingTermBag(t *testing.T) {
+	var gotInputs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotInputs = body.Input
+		_, _ = w.Write([]byte(`{"data":[{"index":0,"embedding":[1]},{"index":1,"embedding":[2]}]}`))
+	}))
+	defer srv.Close()
+
+	client := NewEmbeddingsClient(EmbeddingsOptions{
+		BaseURL: srv.URL, Dimensions: 1, QueryPrefix: "Query:",
+	})
+	if _, err := client.Embed(context.Background(), "runway burn rate months cash remaining"); err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if len(gotInputs) != 2 {
+		t.Fatalf("an existing term bag must keep two inputs, got %#v", gotInputs)
+	}
+}
+
+func TestEmbeddingsClientDoesNotExpandAShortEntityQuery(t *testing.T) {
+	var gotInputs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotInputs = body.Input
+		_, _ = w.Write([]byte(`{"data":[{"index":0,"embedding":[1]},{"index":1,"embedding":[2]}]}`))
+	}))
+	defer srv.Close()
+
+	client := NewEmbeddingsClient(EmbeddingsOptions{
+		BaseURL: srv.URL, Dimensions: 1, QueryPrefix: "Query:",
+	})
+	if _, err := client.Embed(context.Background(), "the kernel magazine"); err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if len(gotInputs) != 2 {
+		t.Fatalf("short entity query must keep two inputs, got %#v", gotInputs)
+	}
 }
 
 func TestEmbeddingsClientOmitsAuthorizationWithoutKey(t *testing.T) {
