@@ -46,6 +46,15 @@ TRADE_MATCH_MAX_DAYS = 3
 # (Plaid rounds; statements print six decimals), so quantity equality is
 # relative, not exact.
 QUANTITY_MATCH_TOLERANCE = Decimal("0.0001")
+# The relative rule alone is not enough for a fractional crypto position.
+# Plaid prints crypto quantities to six decimals, so a 0.003183 BTC buy that
+# a statement records as 0.00318255 differs by 1.4e-4 RELATIVE — wider than
+# the tolerance above — purely because one source rounded. A quantity also
+# matches, then, when the finer value rounds exactly to the coarser one. That
+# rule is bounded to differences no larger than this, so it can only ever
+# explain a rounding at six or more decimal places: a share count printed
+# without decimals must not absorb a trade half a share larger.
+QUANTITY_ROUNDING_MAX_ABSOLUTE = Decimal("0.0000005")
 # Same-size buys can occur repeatedly. When both sources carry a cash total,
 # require it to agree within one percent before calling them the same trade.
 AMOUNT_MATCH_TOLERANCE = Decimal("0.01")
@@ -718,7 +727,28 @@ def _quantities_match(left: Decimal, right: Decimal) -> bool:
     larger = max(left, right)
     if larger == 0:
         return False
-    return abs(left - right) / larger <= QUANTITY_MATCH_TOLERANCE
+    if abs(left - right) / larger <= QUANTITY_MATCH_TOLERANCE:
+        return True
+    return _is_rounding_of(left, right) or _is_rounding_of(right, left)
+
+
+def _is_rounding_of(coarse: Decimal, fine: Decimal) -> bool:
+    """Is ``coarse`` simply ``fine`` rounded to the decimals it prints?
+
+    Only sub-microshare rounding qualifies (``QUANTITY_ROUNDING_MAX_ABSOLUTE``),
+    which is the crypto case and nothing else: at coarser precision the
+    difference between two printed share counts is a different trade, not a
+    different printer.
+    """
+    if not coarse.is_finite() or not fine.is_finite():
+        return False
+    places = -int(coarse.as_tuple().exponent)
+    if places < 1:
+        return False
+    half_unit = Decimal(1).scaleb(-places) / 2
+    if half_unit > QUANTITY_ROUNDING_MAX_ABSOLUTE:
+        return False
+    return abs(fine - coarse) <= half_unit
 
 
 def _amounts_match(left: Decimal | None, right: Decimal | None) -> bool:

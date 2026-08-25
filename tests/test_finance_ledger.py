@@ -870,7 +870,7 @@ def test_folder_spanning_account_number_change_resolves_by_any_mask(warehouse):
     # document carries a retired mask, later ones carry the mask plaid knows.
     # Resolution must consider every mask in the group, not the founding
     # document's — otherwise the folder founds a duplicate account.
-    _seed_plaid(warehouse, [_plaid_account_row(type="brokerage", subtype="brokerage", mask="2700")])
+    _seed_plaid(warehouse, [_plaid_account_row(type="brokerage", subtype="brokerage", mask="4420")])
     _seed_document(
         warehouse,
         document=_document_row(
@@ -897,7 +897,7 @@ def test_folder_spanning_account_number_change_resolves_by_any_mask(warehouse):
             content_sha256="sha-modern",
             document_type="brokerage_statement",
             institution="Broker",
-            account_mask="2700",
+            account_mask="4420",
             balances_json=[{"date": "2026-03-31", "balance": "200.00"}],
         ),
     )
@@ -912,6 +912,130 @@ def test_folder_spanning_account_number_change_resolves_by_any_mask(warehouse):
     assert links == {"broker-individual-5270": "mask"}
     # Both eras' balances land on the one account.
     assert warehouse._query("SELECT count(*) FROM @finance_observations WHERE source='manual_finance'") == [(2,)]
+
+
+def test_a_link_made_from_thinner_evidence_is_re_resolved_next_run(warehouse):
+    """A document group's link is a derived decision, not a fact, so it has to
+    move when the evidence moves.
+
+    Robinhood's crypto folder founded its link from the one statement that had
+    been extracted at the time, and that statement printed the linked
+    BROKERAGE account number instead of the crypto one. Every later statement
+    reported the crypto mask, but the link was consulted before resolution and
+    never revisited, so the crypto trades were booked against the brokerage
+    account for six weeks — where nothing could dedupe them against the plaid
+    crypto rows describing the same trades.
+    """
+    _seed_plaid(
+        warehouse,
+        [
+            _plaid_account_row(
+                account_id="acc-individual",
+                name="Broker individual",
+                mask="4420",
+                type="brokerage",
+                subtype="brokerage",
+            ),
+            _plaid_account_row(
+                account_id="acc-crypto",
+                name="Crypto",
+                mask="9910",
+                type="brokerage",
+                subtype="crypto exchange",
+            ),
+        ],
+    )
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-crypto-2024-12",
+            source_native_id="sha-crypto-2024-12",
+            original_path="broker-crypto-9910/crypto-2024-12.pdf",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-crypto-2024-12",
+            document_type="brokerage_statement",
+            institution="Broker",
+            account_name_hint="Crypto",
+            account_mask="4420",  # the statement header carries the brokerage number
+            balances_json=[{"date": "2024-12-31", "balance": "100.00"}],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    crypto_id = warehouse._query(
+        "SELECT account_id FROM @finance_accounts WHERE mask = '9910'"
+    )[0][0]
+    individual_id = warehouse._query(
+        "SELECT account_id FROM @finance_accounts WHERE mask = '4420'"
+    )[0][0]
+    assert warehouse._query(
+        "SELECT account_id FROM @finance_account_links WHERE source_account_key = 'broker-crypto-9910'"
+    ) == [(individual_id,)]
+
+    # The rest of the folder arrives, and every one of those statements names
+    # the crypto account.
+    for month in ("2025-01", "2025-02"):
+        _seed_document(
+            warehouse,
+            document=_document_row(
+                content_sha256=f"sha-crypto-{month}",
+                source_native_id=f"sha-crypto-{month}",
+                original_path=f"broker-crypto-9910/crypto-{month}.pdf",
+            ),
+            extraction=_extraction_row(
+                content_sha256=f"sha-crypto-{month}",
+                document_type="brokerage_statement",
+                institution="Broker",
+                account_name_hint="Crypto",
+                account_mask="9910",
+                balances_json=[{"date": f"{month}-28", "balance": "100.00"}],
+            ),
+        )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert warehouse._query(
+        "SELECT account_id FROM @finance_account_links WHERE source_account_key = 'broker-crypto-9910'"
+    ) == [(crypto_id,)]
+    # The folder's observations follow the link rather than staying behind.
+    assert warehouse._query(
+        "SELECT count(*) FROM @finance_observations WHERE source = 'manual_finance' AND account_id = %s",
+        (individual_id,),
+    ) == [(0,)]
+
+
+def test_re_resolution_keeps_an_account_the_documents_themselves_founded(warehouse):
+    """Re-resolving must not orphan a founded account. A private-fund folder
+    matches no plaid mask on any run, so its link has to stay put."""
+    _seed_plaid(warehouse, [_plaid_account_row()])
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-fund",
+            source_native_id="sha-fund",
+            original_path="acme-fund-i-lp/2026-q1.pdf",
+            filename="2026-q1.pdf",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-fund",
+            document_type="fund_statement",
+            institution="Acme Fund I LP",
+            account_name_hint="Acme Fund I LP",
+            account_mask="",
+            valuations_json=[{"date": "2026-03-31", "value": "50000.00"}],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    before = warehouse._query(
+        "SELECT account_id FROM @finance_account_links WHERE source_account_key = 'acme-fund-i-lp'"
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    after = warehouse._query(
+        "SELECT account_id FROM @finance_account_links WHERE source_account_key = 'acme-fund-i-lp'"
+    )
+    assert before == after and before
+    assert warehouse._query(
+        "SELECT count(*) FROM @finance_accounts WHERE account_id = %s", (before[0][0],)
+    ) == [(1,)]
 
 
 def test_valuation_documents_found_asset_accounts(warehouse):
@@ -1268,6 +1392,118 @@ def test_security_trades_dedup_against_the_plaid_overlap(warehouse):
     assert methods == {"sha-b|0": "security_quantity_date", "sha-b|1": "source_id"}
 
 
+def test_crypto_trades_are_not_double_booked_across_the_two_robinhood_accounts(warehouse):
+    """The two defects that produced ~$60k of phantom open crypto lots, end to
+    end.
+
+    Robinhood reports crypto as its own plaid account while its crypto
+    statements live in their own folder. The folder's link was made from the
+    single statement extracted at the time, which printed the BROKERAGE
+    account number, and was then never revisited — so the statement's trades
+    sat in the brokerage account and could not be deduped against the plaid
+    rows describing the same trades. Even in one account they would not have
+    merged: plaid prints crypto quantities to six decimals, and on a 0.003 BTC
+    buy that rounding is wider than the relative quantity tolerance.
+    """
+    _seed_plaid(
+        warehouse,
+        [
+            _plaid_account_row(
+                account_id="acc-individual",
+                name="Broker individual",
+                mask="4420",
+                type="brokerage",
+                subtype="brokerage",
+            ),
+            _plaid_account_row(
+                account_id="acc-crypto",
+                name="Crypto",
+                mask="9910",
+                type="brokerage",
+                subtype="crypto exchange",
+            ),
+        ],
+    )
+    warehouse.insert_plaid_investment_securities(
+        [_security_row(security_id="sec-btc", name="Bitcoin", ticker_symbol="BTC", type="cryptocurrency")]
+    )
+    warehouse.insert_plaid_investment_transactions(
+        [
+            _plaid_investment_transaction_row(
+                account_id="acc-crypto",
+                investment_transaction_id="itx-btc",
+                security_id="sec-btc",
+                name="BTC buy",
+                type="buy",
+                subtype="buy",
+                quantity=0.003183,  # six decimals is all plaid prints
+                price=94225.0,
+                amount=299.922,
+                transaction_at=_TS,
+            )
+        ]
+    )
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-crypto-a",
+            source_native_id="sha-crypto-a",
+            original_path="broker-crypto-9910/crypto-2026-07.pdf",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-crypto-a",
+            document_type="brokerage_statement",
+            institution="Broker",
+            account_name_hint="Crypto",
+            account_mask="4420",  # the statement header carries the brokerage number
+            transactions_json=[
+                _doc_trade(
+                    date=_TS.date().isoformat(),
+                    description="Bitcoin",
+                    security_name="Bitcoin",
+                    ticker="BTC",
+                    cusip="",
+                    quantity="0.00318255",
+                    price_per_share="",
+                    amount="299.92",
+                )
+            ],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    # The bug's shape: one buy, booked twice, in two different accounts.
+    assert warehouse._query(
+        "SELECT count(*) FROM @marts_finance_tax_lots WHERE status = 'open'"
+    ) == [(2,)]
+
+    # The rest of the folder arrives, and those statements name the crypto
+    # account — so the group's own evidence now points somewhere else.
+    for month in ("2026-08", "2026-09"):
+        _seed_document(
+            warehouse,
+            document=_document_row(
+                content_sha256=f"sha-crypto-{month}",
+                source_native_id=f"sha-crypto-{month}",
+                original_path=f"broker-crypto-9910/crypto-{month}.pdf",
+            ),
+            extraction=_extraction_row(
+                content_sha256=f"sha-crypto-{month}",
+                document_type="brokerage_statement",
+                institution="Broker",
+                account_name_hint="Crypto",
+                account_mask="9910",
+            ),
+        )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert summary.links_relinked == 1
+    assert summary.security_trades_merged == 1
+    lots = warehouse._query(
+        "SELECT account_name, ticker, quantity_remaining, status FROM @marts_finance_tax_lots"
+    )
+    assert lots == [("Crypto", "BTC", Decimal("0.003183"), "open")]
+
+
 def test_option_contracts_do_not_pollute_the_underlying_position(warehouse):
     """Real row: 'ACME 09/18/2020 Call $60.00' qty 1 @ $0.30. One contract is
     100 shares — counting it as a share of ACME corrupts the position."""
@@ -1368,6 +1604,58 @@ def test_position_coverage_surfaces_independent_basis_disagreement(warehouse):
         "SELECT quantity_held, quantity_with_known_basis, basis_difference, coverage_status "
         "FROM @marts_finance_position_coverage"
     ) == [(Decimal("10"), Decimal("10"), Decimal("-50"), "basis_mismatch")]
+
+
+def test_position_coverage_reports_open_lots_the_account_does_not_hold(warehouse):
+    """The detector the crypto double-booking got past.
+
+    Coverage used to start from held positions, so open lots for a security an
+    account does NOT hold produced no row at all — which is exactly the shape
+    of a trade booked into the wrong account. The account has a holdings feed
+    disagreeing with the lots, so the disagreement is reportable; a
+    statement-only account, which has no feed to disagree with, still is not.
+    """
+    _seed_plaid(warehouse, [_plaid_brokerage_account_row()])
+    warehouse.insert_plaid_investment_securities([_security_row()])
+    warehouse.insert_plaid_investment_holdings([_holding_row()])
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-b",
+            source_native_id="sha-b",
+            original_path="acme-wheel-fund-0002/statement.csv",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-b",
+            document_type="brokerage_statement",
+            account_mask="0002",
+            transactions_json=[
+                _doc_trade(),
+                # A security this account has never held: a buy that belongs to
+                # some other account, or one whose disposal never reached us.
+                _doc_trade(
+                    description="Zenith Systems",
+                    security_name="Zenith Systems",
+                    ticker="ZNTH",
+                    cusip="222222BB2",
+                    quantity="5",
+                    price_per_share="20.00",
+                    amount="100.00",
+                ),
+            ],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    coverage = dict(
+        warehouse._query(
+            "SELECT ticker, coverage_status FROM @marts_finance_position_coverage ORDER BY ticker"
+        )
+    )
+    assert coverage == {"ACME": "complete", "ZNTH": "no_holding"}
+    assert warehouse._query(
+        "SELECT quantity_held, quantity_with_lots FROM @marts_finance_position_coverage "
+        "WHERE ticker = 'ZNTH'"
+    ) == [(Decimal("0"), Decimal("5"))]
 
 
 def test_position_coverage_excludes_plaid_cash_securities(warehouse):

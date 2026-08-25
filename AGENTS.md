@@ -1997,10 +1997,40 @@ Use instead:
   the security while the transaction name reads *"buy 2.000 QBIT call with strike of $12.00"*.
   Options therefore get their own `security_key` and are excluded from spot pricing/coverage.
 - **Check `position_coverage` before quoting a return.** `coverage_status` is `complete` /
-  `partial` / `none` / `lots_exceed_holding` / `basis_mismatch`. The last two mean either more
-  open lots than shares held (a missing disposal) or reconstructed basis disagrees materially
-  with the provider's independent position basis. A percentage alone can only understate these
+  `partial` / `none` / `lots_exceed_holding` / `basis_mismatch` / `no_holding`. The last three
+  mean either more open lots than shares held (a missing disposal), reconstructed basis
+  disagreeing materially with the provider's independent position basis, or open lots in an
+  account that holds none of that security at all. A percentage alone can only understate these
   problems because it is capped at 100.
+- **A trade is only deduped against its twin inside ONE ledger account, so an account
+  misresolution double-books the position and nothing downstream can tell.** That is what
+  happened to Robinhood crypto, and it survived six weeks because it was invisible from every
+  direction. Robinhood reports crypto as its own Plaid account while its crypto statements live
+  in their own upload folder; the folder's `derived_finance.account_links` row was made from the
+  one statement extracted at the time, which printed the *brokerage* account number in its
+  header, and links were consulted before resolution and never revisited — so 48 statement
+  crypto trades sat in the brokerage account, where nothing could merge them into the Plaid rows
+  describing the same trades. `marts_finance.tax_lots` then reported phantom open BTC/ETH/SOL
+  lots — worth more than the whole real position — in an account that never held a coin.
+  Three things now hold this shut, and each was independently necessary:
+  - **Document account links are re-resolved every run** and an evidence-backed match supersedes
+    a stored link (`links_relinked` in the run summary). A link is a derived decision, and this
+    is what makes "delete the links and rerun replays every decision" actually true. A group
+    that matches nothing keeps the account its own documents founded, so a private-fund folder
+    is never orphaned. Statement observations are reconciled to the current corpus for the same
+    reason — otherwise a relinked group leaves balances behind on its old account.
+  - **Quantity equality tolerates the coarser source's rounding.** Plaid prints crypto share
+    counts to six decimals; on a 0.003183 BTC buy that is 1.4e-4 *relative*, wider than
+    `QUANTITY_MATCH_TOLERANCE`, so even in one account five of those buys still would not have
+    merged. A quantity now also matches when the finer value rounds exactly to the coarser one,
+    bounded to sub-microshare differences so a share count printed without decimals can never
+    absorb a trade half a share larger.
+  - **`marts_finance.position_coverage` reports lots the account does not hold.** It used to
+    start from held positions, so the phantom lots produced no row and the real crypto account
+    read `complete` throughout. It is a FULL join now, and open lots with no holding behind them
+    read `no_holding` — but only for an account whose holdings Plaid actually reports, because a
+    statement-only account has no feed to disagree with and judging its lots against silence
+    would make every reconstructed position look broken.
 
 Extraction contract: `PROMPT_VERSION = manual-finance-agent-v2` captures per-trade
 `ticker`/`cusip`/`quantity`/`price_per_share`/`trade_side`/`fees` plus a `positions[]` snapshot
@@ -2023,6 +2053,9 @@ Verification scripts (they hit the real agent and the real corpus, so run them d
 `scripts/verify_manual_finance_extraction_v2.py <pdf>...` checks the agent against a statement's
 printed detail; `scripts/verify_securities_ledger_e2e.py <extraction json>...` replays real Plaid
 data plus real extractions through the production runner into a throwaway schema.
+`scripts/verify_finance_ledger_replay.py` answers the different question that caught the crypto
+double-booking: what the ledger would look like if **every stored decision were made again now**.
+Production cannot show you that, because production is the thing carrying the frozen decision.
 
 ## Shared file-attachment enrichment
 

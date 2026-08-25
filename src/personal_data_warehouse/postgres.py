@@ -3195,28 +3195,60 @@ class PostgresWarehouse:
                     ORDER BY st.ticker DESC, st.trade_date DESC
                     LIMIT 1
                 ) AS t ON TRUE
+                -- Same ticker gate the held side applies: a lot whose
+                -- security never printed a symbol has nothing to compare
+                -- against and would report as a nameless phantom position.
                 WHERE l.status = 'open' AND t.asset_class = 'spot'
+                  AND COALESCE(t.ticker, '') <> ''
                 GROUP BY 1, 2
+            ), covered_accounts AS (
+                -- Accounts whose holdings plaid actually reports. Only for
+                -- these does "no holding" mean something: a statement-only
+                -- account has no holdings feed to disagree with, and judging
+                -- its lots against silence would make every reconstructed
+                -- position look broken.
+                SELECT DISTINCT account_id FROM held
+            ), positions AS (
+                -- FULL join, not held-driven: open lots for a security the
+                -- account does NOT hold produced no row at all, so the one
+                -- signature of cross-account double-booking was invisible
+                -- here. A brokerage's crypto statements were booked against
+                -- its cash-brokerage account for six weeks, carrying open lots
+                -- against a position that account never held, and this view
+                -- reported the real crypto account 'complete' throughout.
+                SELECT
+                    COALESCE(held.account_id, r.account_id) AS account_id,
+                    COALESCE(held.ticker, r.ticker) AS ticker,
+                    COALESCE(held.quantity_held, 0) AS quantity_held,
+                    COALESCE(held.reported_cost_basis, 0) AS reported_cost_basis,
+                    held.account_id IS NOT NULL AS is_held,
+                    r.quantity_with_lots,
+                    r.quantity_with_known_basis,
+                    r.reconstructed_cost_basis,
+                    r.earliest_acquisition
+                FROM held
+                FULL OUTER JOIN reconstructed AS r
+                  ON r.account_id = held.account_id AND r.ticker = held.ticker
             )
             SELECT
-                held.account_id,
+                p.account_id,
                 a.name AS account_name,
                 a.institution,
                 a.mask,
-                held.ticker,
-                held.quantity_held,
-                COALESCE(r.quantity_with_lots, 0) AS quantity_with_lots,
-                COALESCE(r.quantity_with_known_basis, 0) AS quantity_with_known_basis,
-                held.reported_cost_basis,
-                r.reconstructed_cost_basis,
-                CASE WHEN r.reconstructed_cost_basis IS NOT NULL
-                     THEN r.reconstructed_cost_basis - held.reported_cost_basis
+                p.ticker,
+                p.quantity_held,
+                COALESCE(p.quantity_with_lots, 0) AS quantity_with_lots,
+                COALESCE(p.quantity_with_known_basis, 0) AS quantity_with_known_basis,
+                p.reported_cost_basis,
+                p.reconstructed_cost_basis,
+                CASE WHEN p.reconstructed_cost_basis IS NOT NULL
+                     THEN p.reconstructed_cost_basis - p.reported_cost_basis
                      END AS basis_difference,
-                r.earliest_acquisition,
-                CASE WHEN held.quantity_held > 0
+                p.earliest_acquisition,
+                CASE WHEN p.quantity_held > 0
                      THEN round(
-                         least(COALESCE(r.quantity_with_known_basis, 0), held.quantity_held)
-                         / held.quantity_held * 100, 1)
+                         least(COALESCE(p.quantity_with_known_basis, 0), p.quantity_held)
+                         / p.quantity_held * 100, 1)
                      END AS pct_quantity_with_basis,
                 -- The percentage alone can only understate a problem: it is
                 -- capped at 100, so a position holding MORE open lots than
@@ -3224,21 +3256,21 @@ class PostgresWarehouse:
                 -- a month whose statement was never uploaded) would read as a
                 -- clean 100%. That case gets its own status instead.
                 CASE
-                    WHEN COALESCE(r.quantity_with_lots, 0) = 0 THEN 'none'
-                    WHEN r.quantity_with_lots > held.quantity_held * 1.001
+                    WHEN NOT p.is_held THEN 'no_holding'
+                    WHEN COALESCE(p.quantity_with_lots, 0) = 0 THEN 'none'
+                    WHEN p.quantity_with_lots > p.quantity_held * 1.001
                         THEN 'lots_exceed_holding'
-                    WHEN COALESCE(r.quantity_with_known_basis, 0) >= held.quantity_held * 0.999
-                         AND abs(r.reconstructed_cost_basis - held.reported_cost_basis)
-                             > greatest(0.02::numeric, abs(held.reported_cost_basis) * 0.001)
+                    WHEN COALESCE(p.quantity_with_known_basis, 0) >= p.quantity_held * 0.999
+                         AND abs(p.reconstructed_cost_basis - p.reported_cost_basis)
+                             > greatest(0.02::numeric, abs(p.reported_cost_basis) * 0.001)
                         THEN 'basis_mismatch'
-                    WHEN COALESCE(r.quantity_with_known_basis, 0) >= held.quantity_held * 0.999
+                    WHEN COALESCE(p.quantity_with_known_basis, 0) >= p.quantity_held * 0.999
                         THEN 'complete'
                     ELSE 'partial'
                 END AS coverage_status
-            FROM held
-            JOIN @finance_accounts AS a ON a.account_id = held.account_id
-            LEFT JOIN reconstructed AS r
-              ON r.account_id = held.account_id AND r.ticker = held.ticker
+            FROM positions AS p
+            JOIN @finance_accounts AS a ON a.account_id = p.account_id
+            WHERE p.is_held OR p.account_id IN (SELECT account_id FROM covered_accounts)
             """,
         )
         self._ensure_account_freshness_mart_view()
@@ -7295,6 +7327,32 @@ class PostgresWarehouse:
                 SELECT (SELECT count(*) FROM removed_trades)
                 """
             )
+        return int(removed[0][0]) if removed else 0
+
+    def delete_missing_document_observations(self, keep_keys: list[str]) -> int:
+        """Drop statement-derived observations the current corpus no longer says.
+
+        Manual observations are wholly derived from the documents present now,
+        so this reconciles them the way the ledger reconciles transactions.
+        It matters because an observation's identity includes its account: when
+        a document group re-resolves to a different ledger account, its old
+        rows would otherwise stay behind as history the source no longer
+        claims. Scoped to ``manual_finance`` on purpose — Plaid's daily balance
+        rows ARE the balance history and are never rebuildable from a source.
+        Keys are compared as ``account_id|as_of|kind`` strings.
+        """
+        removed = self._query(
+            """
+            WITH removed AS (
+                DELETE FROM @finance_observations
+                WHERE source = 'manual_finance'
+                  AND (account_id || '|' || as_of::text || '|' || kind) <> ALL(%s::text[])
+                RETURNING 1
+            )
+            SELECT count(*) FROM removed
+            """,
+            (keep_keys,),
+        )
         return int(removed[0][0]) if removed else 0
 
     def insert_receipt_transaction_receipts(self, rows: list[dict[str, Any]]) -> None:

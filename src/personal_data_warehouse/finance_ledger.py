@@ -199,6 +199,8 @@ class FinanceLedgerSummary:
     transactions_removed: int = 0
     accounts_merged: int = 0
     accounts_pruned: int = 0
+    links_relinked: int = 0
+    observations_removed: int = 0
     security_trades_upserted: int = 0
     security_trades_merged: int = 0
     security_trades_removed: int = 0
@@ -229,6 +231,7 @@ class FinanceLedgerRunner:
         existing_created_at = self._load_account_created_at()
         accounts_created = 0
         links_created = 0
+        links_relinked = 0
         observation_rows: list[dict[str, Any]] = []
 
         # --- plaid accounts + daily balance observations -----------------------
@@ -343,46 +346,63 @@ class FinanceLedgerRunner:
         for (owner, key), group in sorted(groups.items()):
             group.sort(key=lambda e: str(e["content_sha256"]))
             link_key = (owner, key)
-            account_id = manual_links.get(link_key)
-            if account_id is None:
-                account_id, match_method, match_score = self._resolve_document_account_group(
-                    group, account_index=account_index
+            linked_account_id = manual_links.get(link_key)
+            # A link is a derived decision, not a fact, so it is re-resolved
+            # every run rather than consulted and trusted. A link founded on
+            # thinner evidence — fewer statements extracted, a plaid account
+            # not yet linked, a superseded resolver — otherwise freezes: the
+            # Robinhood crypto folder linked to the BROKERAGE account because
+            # the one statement extracted at the time printed the brokerage
+            # number in its header, and every later statement naming the
+            # crypto account was ignored. The crypto trades then sat in an
+            # account where nothing could dedupe them against the plaid rows
+            # describing the same trades, double-booking the position.
+            account_id, match_method, match_score = self._resolve_document_account_group(
+                group, account_index=account_index
+            )
+            if match_method == "new" and linked_account_id is not None:
+                # Nothing in the index claims any of this group's masks, which
+                # is not a reason to abandon the account its own documents
+                # founded on an earlier run.
+                account_id, match_method = linked_account_id, ""
+            elif match_method == "new":
+                founding = group[0]
+                kind, side = document_kind_side(
+                    str(founding["document_type"]),
+                    name_hint=str(founding["account_name_hint"]),
+                    account_folder=key,
                 )
-                if match_method == "new":
-                    founding = group[0]
-                    kind, side = document_kind_side(
-                        str(founding["document_type"]),
-                        name_hint=str(founding["account_name_hint"]),
-                        account_folder=key,
-                    )
-                    account_id = stable_finance_account_id(LEDGER_SOURCE_MANUAL, owner, key)
-                    doc_account_rows.append(
-                        {
-                            "account_id": account_id,
-                            "account": owner,
-                            "name": str(founding["account_name_hint"]) or key,
-                            "kind": kind,
-                            "side": side,
-                            "currency": str(founding["currency"]),
-                            "institution": str(founding["institution"]),
-                            "mask": _group_primary_mask(group),
-                            "created_at": now,
-                            "updated_at": now,
-                            "sync_version": sync_version,
-                        }
-                    )
-                    account_index.append(
-                        {
-                            "account_id": account_id,
-                            "mask": _group_primary_mask(group),
-                            "institution": str(founding["institution"]),
-                            "kind": kind,
-                            "side": side,
-                        }
-                    )
-                    accounts_created += 1
-                    match_method = "document_new"
-                    match_score = 1.0
+                account_id = stable_finance_account_id(LEDGER_SOURCE_MANUAL, owner, key)
+                doc_account_rows.append(
+                    {
+                        "account_id": account_id,
+                        "account": owner,
+                        "name": str(founding["account_name_hint"]) or key,
+                        "kind": kind,
+                        "side": side,
+                        "currency": str(founding["currency"]),
+                        "institution": str(founding["institution"]),
+                        "mask": _group_primary_mask(group),
+                        "created_at": now,
+                        "updated_at": now,
+                        "sync_version": sync_version,
+                    }
+                )
+                account_index.append(
+                    {
+                        "account_id": account_id,
+                        "mask": _group_primary_mask(group),
+                        "institution": str(founding["institution"]),
+                        "kind": kind,
+                        "side": side,
+                    }
+                )
+                accounts_created += 1
+                match_method = "document_new"
+                match_score = 1.0
+            # Only write when the decision actually changed, so an unchanged
+            # link keeps the timestamp of the run that first made it.
+            if match_method and account_id != linked_account_id:
                 doc_link_rows.append(
                     self._link_row(
                         source=LEDGER_SOURCE_MANUAL,
@@ -396,7 +416,10 @@ class FinanceLedgerRunner:
                     )
                 )
                 manual_links[link_key] = account_id
-                links_created += 1
+                if linked_account_id is None:
+                    links_created += 1
+                else:
+                    links_relinked += 1
             account_kind = next(
                 (
                     str(entry.get("kind", ""))
@@ -412,14 +435,23 @@ class FinanceLedgerRunner:
         self._warehouse.insert_finance_accounts(doc_account_rows)
         self._warehouse.insert_finance_account_links(doc_link_rows)
 
-        observation_rows.extend(
-            self._document_observation_rows(
-                extractions,
-                doc_accounts=doc_accounts,
-                doc_account_kinds=doc_account_kinds,
-                now=now,
-                sync_version=sync_version,
-            )
+        document_observations = self._document_observation_rows(
+            extractions,
+            doc_accounts=doc_accounts,
+            doc_account_kinds=doc_account_kinds,
+            now=now,
+            sync_version=sync_version,
+        )
+        observation_rows.extend(document_observations)
+        # Statement observations are rebuilt from the corpus every run, so a
+        # row the corpus no longer produces is residue — most sharply after a
+        # group re-resolves to a different account, which leaves its old
+        # account holding balances no document claims any more.
+        observations_removed = self._warehouse.delete_missing_document_observations(
+            [
+                f"{row['account_id']}|{row['as_of']}|{row['kind']}"
+                for row in document_observations
+            ]
         )
         # Manual documents are immutable source facts. Rebuilding the ledger
         # used to re-upsert every historical observation with ``observed_at =
@@ -466,6 +498,8 @@ class FinanceLedgerRunner:
             transactions_removed=transactions["removed"],
             accounts_merged=accounts_merged,
             accounts_pruned=accounts_pruned,
+            links_relinked=links_relinked,
+            observations_removed=observations_removed,
             security_trades_upserted=securities["upserted"],
             security_trades_merged=securities["merged"],
             security_trades_removed=securities["removed"],
@@ -474,6 +508,7 @@ class FinanceLedgerRunner:
         self._logger.info(
             "Finance ledger: accounts_seen=%s accounts_created=%s links_created=%s observations=%s "
             "transactions=%s merged=%s skipped=%s removed=%s accounts_merged=%s accounts_pruned=%s "
+            "links_relinked=%s observations_removed=%s "
             "security_trades=%s security_merged=%s security_removed=%s tax_lots=%s",
             summary.accounts_seen,
             summary.accounts_created,
@@ -485,6 +520,8 @@ class FinanceLedgerRunner:
             summary.transactions_removed,
             summary.accounts_merged,
             summary.accounts_pruned,
+            summary.links_relinked,
+            summary.observations_removed,
             summary.security_trades_upserted,
             summary.security_trades_merged,
             summary.security_trades_removed,

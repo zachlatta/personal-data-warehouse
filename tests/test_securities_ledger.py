@@ -830,3 +830,62 @@ def test_lot_ids_are_stable_across_rebuilds():
     assert [lot["lot_id"] for lot in build_tax_lots(trades)] == [
         lot["lot_id"] for lot in build_tax_lots(trades)
     ]
+
+
+def test_a_six_decimal_rounded_crypto_quantity_still_merges():
+    """Plaid prints crypto share counts to six decimals; statements print
+    eight. On a 0.003 BTC buy that rounding is 1.4e-4 of the position — wider
+    than the relative tolerance — so the pair looked like two different trades
+    and both were booked. The cash totals agree to a tenth of a cent."""
+    plaid = [
+        _trade(
+            source="plaid",
+            source_row_key="z|investment|p1",
+            identity=SecurityIdentity(ticker="BTC", cusip="", name="Bitcoin"),
+            trade_date=date(2024, 12, 23),
+            quantity=D("0.003183"),
+            price=None,
+            amount=D("299.922"),
+        )
+    ]
+    document = [
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|4",
+            identity=SecurityIdentity(ticker="BTC", cusip="", name="Bitcoin"),
+            trade_date=date(2024, 12, 23),
+            quantity=D("0.00318255"),
+            price=None,
+            amount=D("299.92"),
+        )
+    ]
+    rows, _links, merged = dedupe_security_trades(plaid, document)
+    assert merged == 1
+    assert len(rows) == 1
+
+
+def test_a_coarsely_printed_share_count_never_absorbs_a_different_trade():
+    """The rounding allowance is bounded to sub-microshare differences. A whole
+    share printed without decimals must not swallow a trade 0.4 shares larger,
+    even though 100 is 100.4 'rounded to zero decimals'."""
+    plaid = [
+        _trade(
+            source="plaid",
+            source_row_key="z|investment|p1",
+            trade_date=date(2025, 3, 3),
+            quantity=D("100"),
+            amount=D("4000.00"),
+        )
+    ]
+    document = [
+        _trade(
+            source="manual_finance",
+            source_row_key="sha-a|4",
+            trade_date=date(2025, 3, 3),
+            quantity=D("100.4"),
+            amount=D("4016.00"),
+        )
+    ]
+    rows, _links, merged = dedupe_security_trades(plaid, document)
+    assert merged == 0
+    assert len(rows) == 2
