@@ -70,6 +70,7 @@ class CapturedSlackSession:
     token: str
     cookie_d: str
     team_id: str
+    enterprise_id: str
     user_id: str
     team_url: str
     cookie_expires_at: datetime | None
@@ -85,6 +86,7 @@ class CapturedSlackSession:
         return {
             "source": self.source,
             "team_id": self.team_id,
+            "enterprise_id": self.enterprise_id,
             "user_id": self.user_id,
             "team_url": self.team_url,
             "cookie_expires_at": self.cookie_expires_at.isoformat() if self.cookie_expires_at else None,
@@ -158,11 +160,20 @@ def capture_slack_session(
     for token in candidates:
         payload = auth_test(token=token, cookie_header=header)
         if payload.get("ok"):
+            # On Enterprise Grid the client session authenticates against the ORG,
+            # so auth.test returns an `E...` id here where the app token returns
+            # the workspace `T...` id that every warehouse row is keyed by.
+            # Storing the org id as team_id would fork the whole dataset, so the
+            # two are kept apart and the caller resolves the workspace from
+            # base_slack.teams.enterprise_id.
+            reported = str(payload.get("team_id") or "")
+            is_enterprise = reported.startswith("E")
             return CapturedSlackSession(
                 source=source,
                 token=token,
                 cookie_d=cookie_d,
-                team_id=str(payload.get("team_id") or ""),
+                team_id="" if is_enterprise else reported,
+                enterprise_id=reported if is_enterprise else "",
                 user_id=str(payload.get("user_id") or ""),
                 team_url=str(payload.get("url") or ""),
                 cookie_expires_at=cookie_expires_at,

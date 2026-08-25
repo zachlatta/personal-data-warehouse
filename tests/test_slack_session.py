@@ -138,6 +138,7 @@ def test_redacted_view_carries_no_secret():
         token="xoxc-secrettoken1",
         cookie_d="xoxd-secretcookie",
         team_id="T1",
+        enterprise_id="",
         user_id="U1",
         team_url="https://hackclub.slack.com/",
         cookie_expires_at=datetime(2027, 9, 28, tzinfo=UTC),
@@ -159,6 +160,7 @@ def test_probe_output_never_prints_the_credential(capsys, monkeypatch):
         token="xoxc-supersecrettoken",
         cookie_d="xoxd-supersecretcookie",
         team_id="T0266FRGM",
+        enterprise_id="E09V59WQY1E",
         user_id="U09UE480JHH",
         team_url="https://hackclub.slack.com/",
         cookie_expires_at=datetime(2027, 9, 28, tzinfo=UTC),
@@ -186,10 +188,50 @@ def test_probe_reports_a_failed_client_counts_as_a_nonzero_exit(capsys, monkeypa
 
     session = CapturedSlackSession(
         source="slack-app", token="xoxc-t", cookie_d="xoxd-c", team_id="T1",
-        user_id="U1", team_url="", cookie_expires_at=None,
+        enterprise_id="", user_id="U1", team_url="", cookie_expires_at=None,
     )
     monkeypatch.setattr(mod, "discover_slack_session", lambda **_: session)
     monkeypatch.setattr(mod, "probe_client_counts", lambda _s: {"ok": False, "error": "not_allowed_token_type"})
 
     assert mod.main([]) != 0
     assert "not_allowed_token_type" in capsys.readouterr().out
+
+
+def test_capture_does_not_pass_off_an_enterprise_id_as_a_team_id(tmp_path):
+    """Hack Club is on Enterprise Grid, and the client session reports the ORG.
+
+    auth.test with the xoxc session returns team_id `E09V59WQY1E` and
+    hackclub.enterprise.slack.com, while the app token returns the workspace
+    `T0266FRGM` -- which is what all 23,342 conversations and 45M messages in the
+    warehouse are keyed by. Storing the E-id as team_id would fork every row into
+    a second, parallel dataset. Slack's E-prefix is the tell, so the capture
+    refuses to call it a team_id.
+    """
+    root = _write_leveldb(tmp_path, {"a.ldb": b"xoxc-enterprisetok1"})
+    session = capture_slack_session(
+        store_root=root,
+        cookies={"d": "xoxd-cookievalue"},
+        cookie_expires_at=None,
+        source="slack-app",
+        auth_test=lambda **_: {
+            "ok": True,
+            "team_id": "E09V59WQY1E",
+            "user_id": "U09UE480JHH",
+            "url": "https://hackclub.enterprise.slack.com/",
+        },
+    )
+    assert session.enterprise_id == "E09V59WQY1E"
+    assert session.team_id == "", "an enterprise id must never be stored as a team id"
+    assert session.redacted()["enterprise_id"] == "E09V59WQY1E"
+
+
+def test_capture_keeps_a_real_workspace_team_id(tmp_path):
+    root = _write_leveldb(tmp_path, {"a.ldb": b"xoxc-workspacetok1"})
+    session = capture_slack_session(
+        store_root=root,
+        cookies={"d": "xoxd-cookievalue"},
+        cookie_expires_at=None,
+        source="slack-app",
+        auth_test=lambda **_: {"ok": True, "team_id": "T0266FRGM", "user_id": "U1", "url": ""},
+    )
+    assert (session.team_id, session.enterprise_id) == ("T0266FRGM", "")
