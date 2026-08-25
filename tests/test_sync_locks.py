@@ -36,6 +36,20 @@ from personal_data_warehouse.sync_locks import (
 )
 
 
+class _NullLogger:
+    """Dagster's context.log has these; a bare SimpleNamespace does not."""
+
+    def info(self, *args, **kwargs):
+        pass
+
+    def warning(self, *args, **kwargs):
+        pass
+
+    def error(self, *args, **kwargs):
+        pass
+
+
+
 def test_advisory_lock_ids_are_unique() -> None:
     source_dir = (
         Path(__file__).resolve().parents[1] / "src" / "personal_data_warehouse"
@@ -133,7 +147,7 @@ def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
     summaries = run_slack_freshness_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
     )
 
     assert len(summaries) == 5
@@ -196,7 +210,7 @@ def test_slack_freshness_sync_piggybacks_read_state(monkeypatch) -> None:
     summaries = run_slack_freshness_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
     )
 
     assert len(summaries) == 5
@@ -257,7 +271,7 @@ def test_slack_coverage_sync_runs_current_stage(monkeypatch) -> None:
     summaries = run_slack_coverage_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
         now=datetime(2026, 4, 24, 17, 7, tzinfo=UTC),
     )
 
@@ -286,7 +300,7 @@ def test_slack_coverage_sync_includes_im_backfill_stage(monkeypatch) -> None:
     summaries = run_slack_coverage_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
         now=datetime(2026, 4, 24, 17, 42, tzinfo=UTC),
     )
 
@@ -311,7 +325,7 @@ def test_slack_coverage_rotation_reaches_every_stage_under_seven_minute_cron(mon
         run_slack_coverage_sync(
             settings=settings,
             warehouse=SimpleNamespace(),
-            logger=SimpleNamespace(),
+            logger=_NullLogger(),
             now=datetime(2026, 4, 24, 17, minute, tzinfo=UTC),
         )
         seen_types.add(calls[0]["conversation_types"])
@@ -364,7 +378,7 @@ def test_slack_metadata_sync_refreshes_one_conversation_type(monkeypatch) -> Non
     summaries = run_slack_metadata_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
         now=datetime(2026, 4, 24, 17, 15, tzinfo=UTC),
     )
 
@@ -419,7 +433,7 @@ def test_slack_user_sync_refreshes_all_users_without_messages(monkeypatch) -> No
     summaries = run_slack_user_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
     )
 
     assert len(summaries) == 1
@@ -535,7 +549,7 @@ def test_slack_thread_sync_backfills_known_threads_conservatively(monkeypatch) -
     summaries = run_slack_thread_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
     )
 
     assert len(summaries) == 1
@@ -591,7 +605,7 @@ def test_slack_thread_backfill_drains_missing_replies_newest_first(monkeypatch) 
     summaries = run_slack_thread_backfill_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
     )
 
     assert len(summaries) == 1
@@ -650,7 +664,7 @@ def test_slack_member_sync_refreshes_private_members_conservatively(monkeypatch)
     summaries = run_slack_member_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
     )
 
     assert len(summaries) == 1
@@ -705,7 +719,7 @@ def test_slack_read_state_sync_refreshes_recent_conversation_info(monkeypatch) -
     summaries = run_slack_read_state_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
     )
 
     assert len(summaries) == 1
@@ -757,7 +771,7 @@ def test_slack_intelligent_sync_keeps_legacy_combined_behavior(monkeypatch) -> N
     summaries = run_intelligent_slack_sync(
         settings=settings,
         warehouse=SimpleNamespace(),
-        logger=SimpleNamespace(),
+        logger=_NullLogger(),
         now=datetime(2026, 4, 24, 17, 1, tzinfo=UTC),
     )
 

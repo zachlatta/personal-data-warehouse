@@ -1,0 +1,32 @@
+#!/bin/zsh
+set -u
+
+LABEL="com.zachlatta.personal-data-warehouse.slack-auth"
+LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
+RUN_LOG="$LOG_DIR/slack-auth.run.log"
+HEARTBEAT_FILE="$LOG_DIR/slack-auth.heartbeat"
+
+echo "LaunchAgent:"
+launchctl print "gui/$(id -u)/$LABEL" | sed -n '1,45p'
+
+echo
+. "$(cd "$(dirname "$0")" && pwd)/_pdw-upload-lib.sh"
+pdw_print_health "$HEARTBEAT_FILE" 7200
+
+echo
+# A green run can still be publishing a nearly-dead session: the token's own
+# expiry is the thing to read, and publish-session prints it as a WARNING.
+echo "Token expiry warnings (last 20):"
+if [[ -f "$RUN_LOG" ]]; then
+  grep -F "WARNING:" "$RUN_LOG" | tail -20 || echo "none"
+else
+  echo "missing: $RUN_LOG"
+fi
+
+echo
+echo "Recent run log:"
+if [[ -f "$RUN_LOG" ]]; then
+  tail -40 "$RUN_LOG"
+else
+  echo "missing: $RUN_LOG"
+fi

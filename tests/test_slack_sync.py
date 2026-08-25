@@ -108,6 +108,7 @@ class FakeWarehouse:
         zero_messages_only=False,
         skip_known_errors=False,
         limit=None,
+        conversation_ids=None,
     ):
         self.conversation_payload_calls.append(
             {

@@ -1,0 +1,51 @@
+#!/bin/zsh
+set -u
+
+REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
+UV="/opt/homebrew/bin/uv"
+# Run the Python module DIRECTLY, not through `pdw slack publish-session`.
+# This job reads the Slack desktop app's "Slack Safe Storage" keychain item, and
+# macOS attributes that grant to the binaries in the exec chain -- while pdw
+# replaces its own binary on every release. Keeping pdw out of the chain is what
+# stops a routine pdw update from silently revoking the grant and turning this
+# into an hourly failure, the same reasoning the photos uploader documents.
+# Credentials still come from pdw's own config, so `pdw login` remains the one
+# credential setup step.
+PDW_CONFIG="$HOME/.config/pdw/config.json"
+if [ -r "$PDW_CONFIG" ]; then
+  export PDW_API_URL="${PDW_API_URL:-$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["base_url"])' "$PDW_CONFIG" 2>/dev/null)}"
+  export PDW_SECRET_TOKEN="${PDW_SECRET_TOKEN:-$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' "$PDW_CONFIG" 2>/dev/null)}"
+fi
+LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
+LOG_FILE="$LOG_DIR/slack-auth.run.log"
+HEARTBEAT_FILE="$LOG_DIR/slack-auth.heartbeat"
+
+mkdir -p "$LOG_DIR"
+
+if [ -f "$REPO_DIR/.env" ]; then
+  set -a
+  source "$REPO_DIR/.env"
+  set +a
+fi
+
+started_at_epoch="$(date +%s)"
+started_at_iso="$(date -Iseconds)"
+echo "[$started_at_iso] starting slack session publish" >> "$LOG_FILE"
+
+if ! cd "$REPO_DIR"; then
+  exit_code=1
+  echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
+else
+  "$UV" run python -m personal_data_warehouse.slack_setup >> "$LOG_FILE" 2>&1
+  exit_code=$?
+fi
+
+finished_at_epoch="$(date +%s)"
+finished_at_iso="$(date -Iseconds)"
+duration_seconds="$((finished_at_epoch - started_at_epoch))"
+
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+echo "[$finished_at_iso] finished slack session publish exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
+
+exit "$exit_code"

@@ -89,3 +89,106 @@ def test_feed_reports_coverage_so_the_gap_is_visible():
     )
     assert feed.covered_conversation_ids == {"C1", "D1"}
     assert feed.coverage == {"channels": 1, "ims": 1, "mpims": 0}
+
+
+# --- the freshness pass's use of the feed -------------------------------------
+
+
+def _settings(monkeypatch):
+    from personal_data_warehouse.config import load_settings
+
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    return load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+
+
+class _Warehouse:
+    def __init__(self, session=None, cursors=None):
+        self._session = session or {}
+        self._cursors = cursors or {}
+
+    def load_slack_session(self, **_):
+        return self._session
+
+    def load_slack_conversation_cursors(self, **_):
+        return self._cursors
+
+
+def test_freshness_limits_shrink_to_the_changed_set(monkeypatch):
+    """With a session, the pass fetches what moved instead of everything.
+
+    Production numbers: 950 conversations polled per five-minute cycle against a
+    ~39 call/minute ceiling, for ~51 conversations that actually had activity.
+    """
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    monkeypatch.setattr(
+        slack_defs,
+        "fetch_client_counts",
+        lambda **_: {"ok": True, "ims": [{"id": "D1", "latest": "99.0"}], "channels": [], "mpims": []},
+    )
+    plan = slack_defs.slack_change_plan(
+        settings=_settings(monkeypatch),
+        warehouse=_Warehouse(
+            session={"session_token": "xoxc-t", "session_cookie": "xoxd-c", "team_id": "T1"},
+            cursors={"D1": 1.0},
+        ),
+        account="zrl",
+        logger=NullLog(),
+    )
+    assert plan.usable is True
+    assert plan.changed_conversation_ids == ("D1",)
+
+
+def test_no_session_falls_back_to_polling_rather_than_syncing_nothing(monkeypatch):
+    """Absent credential must degrade to the old behaviour, not to silence."""
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    plan = slack_defs.slack_change_plan(
+        settings=_settings(monkeypatch),
+        warehouse=_Warehouse(session={}),
+        account="zrl",
+        logger=NullLog(),
+    )
+    assert plan.usable is False
+    assert "no published Slack session" in plan.reason
+
+
+def test_a_broken_counts_call_falls_back_to_polling(monkeypatch):
+    # A revoked session must not stop ingestion; it must cost throughput only.
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    monkeypatch.setattr(
+        slack_defs, "fetch_client_counts", lambda **_: {"ok": False, "error": "invalid_auth"}
+    )
+    plan = slack_defs.slack_change_plan(
+        settings=_settings(monkeypatch),
+        warehouse=_Warehouse(session={"session_token": "t", "session_cookie": "c", "team_id": "T1"}),
+        account="zrl",
+        logger=NullLog(),
+    )
+    assert plan.usable is False
+    assert "invalid_auth" in plan.reason
+
+
+def test_half_a_credential_is_not_used(monkeypatch):
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    plan = slack_defs.slack_change_plan(
+        settings=_settings(monkeypatch),
+        warehouse=_Warehouse(session={"session_token": "xoxc-t", "session_cookie": "", "team_id": "T1"}),
+        account="zrl",
+        logger=NullLog(),
+    )
+    assert plan.usable is False
+
+
+class NullLog:
+    def info(self, *a, **k):
+        pass
+
+    def warning(self, *a, **k):
+        pass
+
+    def error(self, *a, **k):
+        pass

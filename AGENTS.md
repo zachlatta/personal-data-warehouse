@@ -2190,6 +2190,72 @@ group DM messages" is a guaranteed false positive. It would also have been wrong
 group DMs really were silent from 2026-08-20T18:57 onward, which is exactly what Slack
 itself reports.
 
+## Slack change feed: how the sync knows what to fetch
+
+**Slack's public API cannot tell you which conversations have new messages.**
+`conversations.list` returns no last-message marker at all — only `updated`, which tracks
+topic and member edits. So with an app token the only way to find a new message is to call
+`conversations.history` on every conversation. Measured 2026-08-24: the freshness pass
+attempts **950 conversations per five-minute cron** against a token ceiling of **~39
+`conversations.history` calls/minute** (37-call burst, then a steady `Retry-After: 10`).
+It is ~5x oversubscribed, so it spends ~10 minutes of every hour asleep on 429s *while
+holding the exclusive Slack lock* — which is why 70% of coverage runs and 83% of metadata
+runs were lock-skipped no-ops, and why backfills never drained.
+
+**`client.counts` answers the same question in one request** — but only for a real
+signed-in session, which is why `private.slack_sessions` exists. The credential is two
+pieces that are useless apart: an `xoxc-` token from the Slack desktop app's localStorage
+and the `d` cookie. Capture and publish both with:
+
+```bash
+pdw slack publish-session            # add --dry-run to check without publishing
+```
+
+Run it from a **GUI terminal** on the Mac signed in to Slack (SSH cannot reach the
+keychain) and choose **Always Allow** — a one-shot "Allow" makes every later run fail. The
+`d` cookie is good for ~13 months and rolls forward with use, so this is setup, not a
+chore.
+
+**What the feed does and does not cover.** Measured on the real workspace: 316 channels
+(exactly the 317 the account belongs to), 237 open DMs, 137 open group DMs — 690 total. It
+is complete for everything Zach participates in and **silent about the ~13k public channels
+he is not a member of**, which keep the slow coverage sweep. `slack_change_feed.py` reports
+that coverage rather than assuming it.
+
+Three behaviours are load-bearing and each failure would be silent:
+
+- **An entry with no `latest` marker is ignored, not fetched.** Treating unknown as changed
+  restores the blanket poll this replaces.
+- **A failed `client.counts` raises; it never returns an empty list.** "Nothing changed" and
+  "we could not ask" must not look alike — the empty reading would stop ingestion silently.
+- **Any failure degrades to the old polling path** (`SlackChangePlan.usable = False`), so a
+  revoked or missing session costs throughput and never coverage. `SLACK_ASSET_USE_CHANGE_FEED=0`
+  forces that fallback.
+
+### Local Slack Auth Scheduler
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.slack-auth`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.slack-auth.plist`
+- Wrapper script: `bin/slack-auth-launchd`; status helper: `bin/slack-auth-status`
+- Run cadence: every 3600 seconds with `RunAtLoad`
+- Run log: `~/Library/Logs/personal-data-warehouse/slack-auth.run.log`
+
+It runs on the Mac signed in to the Slack desktop app (**crobat**), not on porygon, because
+that is where the session lives. **The wrapper execs `uv run python -m
+personal_data_warehouse.slack_setup` directly and deliberately keeps `pdw` out of the exec
+chain**: macOS attributes the "Slack Safe Storage" keychain grant to the binaries in that
+chain, and pdw replaces its own binary on every release, so routing through `pdw slack`
+would let a routine update silently revoke the grant. The photos uploader avoids Full Disk
+Access loss the same way. Credentials still come from `pdw login`'s config file.
+
+**Enterprise Grid is a live trap here.** Hack Club is an Enterprise Grid org, so a client
+session's `auth.test` returns the **org** id `E09V59WQY1E` where the app token returns the
+**workspace** id `T0266FRGM` — and all ~45M warehouse rows are keyed by the workspace. Storing
+one as the other would not error; it would write a second parallel copy of Slack. The capture
+refuses to put an `E` id in `team_id`, the publish endpoint rejects it, and
+`pdw slack publish-session` resolves the workspace through `base_slack.teams.enterprise_id`
+rather than guessing (an org covering several workspaces raises instead).
+
 ## Slack huddles: metadata yes, content no
 
 **Huddle metadata is in the warehouse; huddle content never will be.** It is easy to

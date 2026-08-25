@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import argparse
@@ -146,6 +146,7 @@ class SlackSyncRunner:
         skip_known_errors: bool = False,
         conversation_limit: int | None = None,
         conversation_page_limit: int | None = None,
+        conversation_ids: Sequence[str] | None = None,
         sync_thread_replies: bool = True,
         sync_thread_replies_only: bool = False,
         sync_members_only: bool = False,
@@ -180,6 +181,9 @@ class SlackSyncRunner:
         self._skip_known_errors = skip_known_errors
         self._conversation_limit = conversation_limit
         self._conversation_page_limit = conversation_page_limit
+        # When set, only these conversations are candidates: the change feed has
+        # already established that nothing else moved.
+        self._conversation_ids = conversation_ids
         self._sync_thread_replies = sync_thread_replies
         self._sync_thread_replies_only = sync_thread_replies_only
         self._sync_members_only = sync_members_only
@@ -335,6 +339,7 @@ class SlackSyncRunner:
                 zero_messages_only=self._zero_messages_only,
                 skip_known_errors=self._skip_known_errors,
                 limit=self._conversation_limit,
+                conversation_ids=self._conversation_ids,
             )
             self._logger.info(
                 "Loaded %s cached Slack conversations for %s",

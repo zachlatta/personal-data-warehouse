@@ -161,8 +161,11 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         "timeline": 9,
         # +1 ops / +1 private: whoop_private's sync state and its rotating
         # browser-session credential.
+        # +1 private: slack_sessions, the captured Slack client session that
+        # lets the sync ask client.counts what changed instead of polling every
+        # conversation.
         "ops": 26,
-        "private": 6,
+        "private": 7,
         "internal": 2,
     }
 

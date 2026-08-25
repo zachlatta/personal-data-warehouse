@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import os
 
@@ -19,6 +20,7 @@ from dagster import (
 from personal_data_warehouse.build_info import build_metadata
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
+from personal_data_warehouse.slack_change_feed import SlackChangeFeed
 from personal_data_warehouse.slack_sync import (
     SLACK_CONVERSATION_LIST_COMPLETE,
     SLACK_CONVERSATION_LIST_STATE_TYPE,
@@ -45,8 +47,94 @@ def _user_sync_lock_wait_seconds() -> int:
     return _int_env("SLACK_USER_SYNC_LOCK_WAIT_SECONDS", 1800)
 
 
+@dataclass(frozen=True)
+class SlackChangePlan:
+    """What Slack says has moved, or why we could not ask."""
+
+    usable: bool
+    changed_conversation_ids: tuple[str, ...] = ()
+    coverage: Mapping[str, int] = field(default_factory=dict)
+    reason: str = ""
+
+
+def fetch_client_counts(*, token: str, cookie: str) -> Mapping[str, object]:
+    """One request that reports every conversation's newest message."""
+    from personal_data_warehouse.slack_session import _slack_post
+
+    return _slack_post(
+        "client.counts",
+        token=token,
+        cookie_header=f"d={cookie}",
+        form={"thread_counts_by_channel": "true", "org_wide_aware": "true"},
+    )
+
+
+def slack_change_plan(*, settings, warehouse, account: str, logger) -> SlackChangePlan:
+    """Ask Slack what changed, in one request, using the published session.
+
+    Every failure here degrades to `usable=False`, which leaves the caller
+    polling exactly as before. That direction is deliberate: a revoked or
+    missing session must cost throughput, never coverage -- returning "nothing
+    changed" would silently stop ingestion, which is a far worse outcome than
+    the rate-limited polling this replaces.
+    """
+    try:
+        session = warehouse.load_slack_session(account=account)
+    except Exception as exc:  # pragma: no cover - a missing table must not break sync
+        return SlackChangePlan(usable=False, reason=f"could not read the Slack session: {exc}")
+    token = str(session.get("session_token") or "")
+    cookie = str(session.get("session_cookie") or "")
+    if not token or not cookie:
+        # Both halves or nothing: an xoxc token without the `d` cookie
+        # authenticates as nobody.
+        return SlackChangePlan(usable=False, reason="no published Slack session (run `pdw slack publish-session`)")
+
+    payload = fetch_client_counts(token=token, cookie=cookie)
+    try:
+        feed = SlackChangeFeed.from_counts(payload)
+    except SlackChangeFeed.Error as exc:
+        logger.warning("Slack change feed unavailable, falling back to polling: %s", exc)
+        return SlackChangePlan(usable=False, reason=str(exc))
+
+    team_id = str(session.get("team_id") or "")
+    cursors = warehouse.load_slack_conversation_cursors(account=account, team_id=team_id)
+    changed = feed.changed_since(cursors)
+    logger.info(
+        "Slack change feed: %s conversations covered, %s changed since our high-water",
+        sum(feed.coverage.values()),
+        len(changed),
+    )
+    return SlackChangePlan(
+        usable=True,
+        changed_conversation_ids=tuple(changed),
+        coverage=feed.coverage,
+    )
+
+
 def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
     summaries: list[SlackSyncSummary] = []
+
+    # Ask Slack once what moved. When that works, the per-type blanket polls
+    # below collapse to just those conversations; when it does not, they run
+    # exactly as before, so a missing or revoked session costs throughput and
+    # never coverage.
+    plan = SlackChangePlan(usable=False, reason="change feed disabled")
+    if _bool_env("SLACK_ASSET_USE_CHANGE_FEED", True):
+        for account in settings.slack_accounts:
+            plan = slack_change_plan(
+                settings=settings, warehouse=warehouse, account=account.account, logger=logger
+            )
+            break
+    changed_ids: Sequence[str] | None = None
+    if plan.usable:
+        changed_ids = plan.changed_conversation_ids
+        if not changed_ids:
+            logger.info("Slack change feed reports nothing new; skipping the freshness fetch")
+            if _bool_env("SLACK_ASSET_READ_STATE_WITH_FRESHNESS", True):
+                summaries.extend(run_slack_read_state_sync(settings=settings, warehouse=warehouse, logger=logger))
+            return summaries
+    else:
+        logger.info("Slack change feed unusable (%s); polling as before", plan.reason)
 
     for conversation_types, window_minutes, conversation_limit in [
         (("im",), _int_env("SLACK_ASSET_DM_WINDOW_MINUTES", 240), _int_env("SLACK_ASSET_DM_FRESHNESS_LIMIT", 500)),
@@ -73,7 +161,13 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
                 freshness_priority=True,
                 use_existing_conversations=True,
                 conversation_types=conversation_types,
-                conversation_limit=conversation_limit,
+                # A change-feed pass is bounded by what actually moved (~51 on a
+                # normal day), so the per-type caps that exist to ration a
+                # blanket poll would only get in the way.
+                conversation_limit=(
+                    _int_env("SLACK_ASSET_CHANGED_LIMIT", 500) if changed_ids is not None else conversation_limit
+                ),
+                conversation_ids=changed_ids,
                 # Stop gracefully when the rate-limit budget is exhausted instead of
                 # failing the run. The history cursor is persisted per conversation as
                 # the pass proceeds, so the next freshness run resumes from there. (This

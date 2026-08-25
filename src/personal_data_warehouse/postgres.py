@@ -4726,6 +4726,9 @@ class PostgresWarehouse:
                 "media_fingerprints",
                 "slack_sync_state",
                 "slack_account_state_item_rows",
+                # The captured client session that lets the sync ask Slack what
+                # changed in one request instead of polling every conversation.
+                "slack_sessions",
             ]
         )
         self._ensure_slack_conversation_stats_backfilled()
@@ -6516,6 +6519,50 @@ class PostgresWarehouse:
             WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
         )
 
+    def load_slack_session(self, *, account: str, session_key: str = "default") -> dict[str, Any]:
+        """The stored Slack client session, or an empty dict when none is published.
+
+        Empty rather than None so a caller cannot mistake "no credential yet" for
+        a row with falsy fields; the sync checks for both halves and falls back
+        to polling when either is missing.
+        """
+        columns = SLACK_SESSION_COLUMNS
+        rows = self._query(
+            f"SELECT {', '.join(_identifier(column) for column in columns)} "
+            "FROM @slack_sessions WHERE account = %s AND session_key = %s",
+            (account, session_key),
+        )
+        if not rows:
+            return {}
+        return dict(zip(columns, rows[0], strict=True))
+
+    def load_slack_conversation_cursors(self, *, account: str, team_id: str) -> dict[str, float]:
+        """Per-conversation high-water marks, for diffing against client.counts.
+
+        Read from derived_slack.conversation_stats, not from a max() over
+        base_slack.messages. Measured on production the direct aggregate is a
+        parallel index-only scan of 45M rows at **34.9s**, against **115ms** for
+        the 19k-row stats table -- and this runs on every freshness pass, so the
+        difference is the whole benefit.
+
+        Staleness here is safe in the only direction that matters: a stats row
+        behind the messages table yields a low cursor, so the conversation is
+        re-fetched. A conversation with no row at all reads as 0 and is fetched.
+        Both err toward doing work, never toward missing a message.
+        """
+        rows = self._query(
+            "SELECT conversation_id, EXTRACT(EPOCH FROM latest_message_at) "
+            "FROM @slack_conversation_stats WHERE account = %s AND team_id = %s",
+            (account, team_id),
+        )
+        cursors: dict[str, float] = {}
+        for conversation_id, latest in rows:
+            try:
+                cursors[str(conversation_id)] = float(latest)
+            except (TypeError, ValueError):
+                continue
+        return cursors
+
     def load_whoop_private_session(self, *, account: str, session_key: str = "default") -> dict[str, Any]:
         """The stored browser session, or an empty dict when none is published.
 
@@ -7859,9 +7906,16 @@ class PostgresWarehouse:
         zero_messages_only: bool = False,
         skip_known_errors: bool = False,
         limit: int | None = None,
+        conversation_ids: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         where = ["c.account = %s", "c.team_id = %s"]
         params: list[Any] = [account, team_id]
+        if conversation_ids is not None:
+            # Restricting to an explicit set is how the change-feed path avoids
+            # the blanket poll: Slack has already told us which conversations
+            # moved, so everything else is known not to need a history call.
+            where.append("c.conversation_id = ANY(%s)")
+            params.append(list(conversation_ids))
         if archived_only:
             where.append("c.is_archived = 1")
         elif not include_archived:
