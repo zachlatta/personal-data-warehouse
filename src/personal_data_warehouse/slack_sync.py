@@ -549,6 +549,9 @@ class SlackSyncRunner:
                 include_archived=False,
                 archived_only=False,
                 conversation_types=self._conversation_types,
+                # The change feed has already established which conversations
+                # moved; everything else is known not to need a history call.
+                conversation_ids=self._conversation_ids,
             )
             self._logger.info("Freshness loaded %s cached active Slack conversations for %s", len(conversations), account.account)
         else:

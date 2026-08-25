@@ -112,6 +112,7 @@ class FakeWarehouse:
     ):
         self.conversation_payload_calls.append(
             {
+                "conversation_ids": conversation_ids,
                 "account": account,
                 "team_id": team_id,
                 "include_archived": include_archived,
@@ -2607,3 +2608,42 @@ def test_coverage_sync_records_the_stage_it_ran(monkeypatch):
     stage_writes = [u for u in warehouse.state_updates if u["object_type"] == "coverage_stage"]
     assert len(stage_writes) == 1
     assert stage_writes[0]["object_id"] == calls[0]["conversation_types"][0] or stage_writes[0]["object_id"]
+
+
+def test_freshness_pass_restricts_candidates_to_the_changed_conversations(monkeypatch):
+    """The change feed only helps if the freshness loader actually gets the ids.
+
+    _sync_account_freshness_priority loads its own candidates rather than going
+    through the generic path in _sync_account, so wiring the filter into one of
+    them leaves the other polling everything. In production that looked like
+    success -- the run logged "change feed: 690 covered, 175 changed" and then
+    fetched 413 conversations anyway.
+    """
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+        }
+    )
+    warehouse = FakeWarehouse()
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        freshness_priority=True,
+        use_existing_conversations=True,
+        sync_users=False,
+        sync_members=False,
+        conversation_types=("im",),
+        conversation_ids=("D_CHANGED",),
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.conversation_payload_calls, "the freshness pass must load candidates"
+    assert warehouse.conversation_payload_calls[0]["conversation_ids"] == ("D_CHANGED",)
