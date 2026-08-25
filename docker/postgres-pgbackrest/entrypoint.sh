@@ -83,6 +83,7 @@ repo1-s3-uri-style=${uri_style}
 repo1-cipher-type=${cipher_type}
 compress-type=${compress_type}
 process-max=${process_max}
+io-timeout=${PGBACKREST_IO_TIMEOUT:-600}
 start-fast=${PGBACKREST_START_FAST:-y}
 spool-path=${PGBACKREST_SPOOL_PATH:-/var/spool/pgbackrest}
 log-path=${PGBACKREST_LOG_PATH:-/var/log/pgbackrest}

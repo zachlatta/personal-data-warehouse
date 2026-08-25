@@ -85,6 +85,7 @@ PGBACKREST_REPO1_S3_KEY_SECRET=...
 PGBACKREST_REPO1_S3_URI_STYLE=path
 PGBACKREST_REPO1_PATH=/personal-data-warehouse
 PGBACKREST_REPO1_CIPHER_PASS=...
+PGBACKREST_IO_TIMEOUT=600
 ```
 
 The image defaults to client-side AES-256 encryption:
@@ -95,6 +96,12 @@ PGBACKREST_REPO1_CIPHER_TYPE=aes-256-cbc
 
 Keep `PGBACKREST_REPO1_CIPHER_PASS` somewhere outside Coolify as well. Without
 that value, encrypted backups cannot be restored.
+
+The generated config uses a 600-second I/O timeout by default. The Garage S3
+repository is backed by an HDD array, where a saturated but healthy read can
+exceed pgBackRest's 60-second default. Override `PGBACKREST_IO_TIMEOUT` only
+after measuring the repository; the setting applies consistently to WAL
+archive commands, checks, backups, and restores.
 
 If a secret contains `$`, enable Coolify's literal environment-variable mode for
 that value.
