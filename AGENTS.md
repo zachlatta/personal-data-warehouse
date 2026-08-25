@@ -2054,13 +2054,15 @@ number:
   still shown as realized, because disallowance is a tax *opinion*, not a fact the sources
   witness. Say so before anyone trades on a harvesting number.
 
-Verification scripts (they hit the real agent and the real corpus, so run them deliberately):
+External verification scripts (they hit the real agent and real source data, so run them
+deliberately):
 `scripts/verify_manual_finance_extraction_v2.py <pdf>...` checks the agent against a statement's
 printed detail; `scripts/verify_securities_ledger_e2e.py <extraction json>...` replays real Plaid
-data plus real extractions through the production runner into a throwaway schema.
-`scripts/verify_finance_ledger_replay.py` answers the different question that caught the crypto
-double-booking: what the ledger would look like if **every stored decision were made again now**.
-Production cannot show you that, because production is the thing carrying the frozen decision.
+data plus real extractions through the production runner into a throwaway schema. The ledger's
+full-replay contract is deterministic test coverage rather than an operator script:
+`test_crypto_relink_converges_to_the_same_state_as_a_full_replay` first reproduces the frozen
+Robinhood link, repairs it incrementally, deletes all derived finance state, and proves a clean
+rebuild from the complete source corpus produces exactly the same links, trades, and lots.
 
 ## Shared file-attachment enrichment
 

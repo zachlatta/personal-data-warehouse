@@ -1392,9 +1392,10 @@ def test_security_trades_dedup_against_the_plaid_overlap(warehouse):
     assert methods == {"sha-b|0": "security_quantity_date", "sha-b|1": "source_id"}
 
 
-def test_crypto_trades_are_not_double_booked_across_the_two_robinhood_accounts(warehouse):
+def test_crypto_relink_converges_to_the_same_state_as_a_full_replay(warehouse):
     """The two defects that produced ~$60k of phantom open crypto lots, end to
-    end.
+    end, including the full-replay check that originally lived in a manual
+    verification script.
 
     Robinhood reports crypto as its own plaid account while its crypto
     statements live in their own folder. The folder's link was made from the
@@ -1502,6 +1503,40 @@ def test_crypto_trades_are_not_double_booked_across_the_two_robinhood_accounts(w
         "SELECT account_name, ticker, quantity_remaining, status FROM @marts_finance_tax_lots"
     )
     assert lots == [("Crypto", "BTC", Decimal("0.003183"), "open")]
+
+    # A correction applied incrementally must converge to exactly the state a
+    # fresh replay derives from the complete source corpus. This is the useful
+    # contract from the former live-corpus verification script, expressed as a
+    # deterministic regression test instead of an operator-run comparison.
+    snapshot_queries = (
+        "SELECT source, source_account_key, account_id, match_method "
+        "FROM @finance_account_links ORDER BY source, source_account_key",
+        "SELECT transaction_id, account_id, security_key, ticker, side, quantity, amount, source "
+        "FROM @finance_security_transactions ORDER BY transaction_id",
+        "SELECT source, source_row_key, transaction_id, match_method "
+        "FROM @finance_security_transaction_links ORDER BY source, source_row_key",
+        "SELECT lot_id, account_id, security_key, quantity_remaining, cost_basis_remaining, status "
+        "FROM @finance_tax_lots ORDER BY lot_id",
+    )
+    incrementally_corrected = [warehouse._query(query) for query in snapshot_queries]
+
+    for table in (
+        "finance_tax_lots",
+        "finance_security_transaction_links",
+        "finance_security_transactions",
+        "finance_transaction_links",
+        "finance_transactions",
+        "finance_observations",
+        "finance_account_links",
+        "finance_accounts",
+    ):
+        warehouse._command(f"DELETE FROM @{table}")
+
+    replay = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert replay.links_relinked == 0
+    assert replay.security_trades_merged == 1
+    assert [warehouse._query(query) for query in snapshot_queries] == incrementally_corrected
 
 
 def test_option_contracts_do_not_pollute_the_underlying_position(warehouse):

@@ -24,12 +24,13 @@ product). Each account's movements arrive via exactly one feed.
 The ledger stores facts only. Categories and other opinions belong to future
 enrichment layers, never to these tables.
 
-Replayability contract: this runner never mutates raw source rows.
-Accounts/links/observations are append-or-update; transactions+links are
-reconciled to the current source rows every run (a Plaid pending row's ledger
-row disappears when its posted successor arrives). Deleting every `finance.*`
-row and re-running rebuilds identically (ids are deterministic from source
-provenance) — pinned by tests/test_finance_ledger.py.
+Replayability contract: this runner never mutates raw source rows. Accounts and
+links are append-or-update; manual observations, transactions, and their links
+are reconciled to the current source rows every run (a Plaid pending row's
+ledger row disappears when its posted successor arrives). Plaid observations
+remain the irreplaceable daily balance history. Deleting every `finance.*` row
+and re-running rebuilds the derivable state identically (ids are deterministic
+from source provenance) — pinned by tests/test_finance_ledger.py.
 """
 
 from __future__ import annotations
