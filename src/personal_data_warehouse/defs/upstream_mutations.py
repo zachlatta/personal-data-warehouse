@@ -21,6 +21,7 @@ from personal_data_warehouse.calendar_mutations import (
     CalendarMutationResult,
     CalendarMutationExecutor,
 )
+from personal_data_warehouse.apple_notes_mutations import APPLE_NOTES_PROVIDER
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.contact_mutations import (
     GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
@@ -49,6 +50,13 @@ RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("gmail", GMAIL_ARCHIVE_OPERATION),
     ("gmail", GMAIL_UNARCHIVE_OPERATION),
 )
+
+# Providers whose upstream has no server API, so the only write path is an app running on
+# one of Zach's Macs. The cloud worker must not claim these: it cannot execute them, and a
+# claim it then fails as unknown-provider both bumps attempt_count and hides the row from
+# the Mac worker that could have applied it. Each entry needs a local worker (see
+# personal_data_warehouse_apple_notes.mutation_worker) or its rows sit approved forever.
+LOCAL_ONLY_MUTATION_PROVIDERS: tuple[str, ...] = (APPLE_NOTES_PROVIDER,)
 
 # Bootstrap guard for the sensor's table-ensure. The sensor evaluates every
 # UPSTREAM_MUTATION_SENSOR_INTERVAL_SECONDS in the long-lived user-code server,
@@ -132,7 +140,10 @@ def upstream_mutation_sensor(context):
     warehouse = warehouse_from_settings(settings)
     try:
         _ensure_upstream_mutation_tables_once(warehouse)
-        count = warehouse.approved_upstream_mutation_count(ensure_tables=False)
+        count = warehouse.approved_upstream_mutation_count(
+            ensure_tables=False,
+            exclude_providers=LOCAL_ONLY_MUTATION_PROVIDERS,
+        )
         if count <= 0:
             reclaimable_count = warehouse.stale_reclaimable_upstream_mutation_count(
                 stale_after=_upstream_mutation_reclaim_after(),
@@ -178,7 +189,11 @@ def process_upstream_mutation_batch(
     observed += warehouse.observe_succeeded_gmail_email_mutations()
     observed += warehouse.observe_succeeded_contact_mutations()
     observed += warehouse.observe_succeeded_calendar_event_mutations()
-    claimed = warehouse.claim_approved_upstream_mutations(limit=limit, claimed_by=claimed_by)
+    claimed = warehouse.claim_approved_upstream_mutations(
+        limit=limit,
+        claimed_by=claimed_by,
+        exclude_providers=LOCAL_ONLY_MUTATION_PROVIDERS,
+    )
 
     succeeded = 0
     failed_retryable = 0

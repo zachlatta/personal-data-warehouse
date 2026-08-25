@@ -53,6 +53,7 @@ func main() {
 			GmailAccounts:         cfg.GmailAccounts,
 			ContactGoogleAccounts: cfg.ContactGoogleAccounts,
 			CalendarAccounts:      cfg.CalendarAccounts,
+			AppleNotesAccounts:    cfg.AppleNotesAccounts,
 		})
 		logger.Info("mutation review UI enabled", "path", mutations.ReviewPath)
 	}

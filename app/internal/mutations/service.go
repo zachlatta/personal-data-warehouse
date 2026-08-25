@@ -41,6 +41,7 @@ func NewService(store Store, cfg Config) *Service {
 	cfg.GmailAccounts = normalizeAccountList(cfg.GmailAccounts)
 	cfg.ContactGoogleAccounts = normalizeAccountList(cfg.ContactGoogleAccounts)
 	cfg.CalendarAccounts = normalizeAccountList(cfg.CalendarAccounts)
+	cfg.AppleNotesAccounts = normalizeAccountList(cfg.AppleNotesAccounts)
 	return &Service{store: store, cfg: cfg}
 }
 
@@ -190,8 +191,15 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		if strings.TrimSpace(mutation.EventID) == "" {
 			return fmt.Errorf("mutation %d must include event_id", index)
 		}
+	case AppleNotesCreateNoteOperation, AppleNotesUpdateNoteOperation:
+		if err := validateConfiguredAccount(account, s.cfg.AppleNotesAccounts, "APPLE_NOTES_ACCOUNTS"); err != nil {
+			return err
+		}
+		if err := validateAppleNotesMutation(mutation); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 	default:
-		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, or calendar.delete_event", index, mutationType)
+		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, or apple_notes.update_note", index, mutationType)
 	}
 	return nil
 }
@@ -244,6 +252,11 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 		SendUpdates:   strings.TrimSpace(stringFromAny(raw["send_updates"])),
 		Event:         mapFromAny(raw["event"]),
 		Patch:         mapFromAny(raw["patch"]),
+		Folder:        strings.TrimSpace(stringFromAny(raw["folder"])),
+		NoteID:        strings.TrimSpace(stringFromAny(raw["note_id"])),
+		Name:          strings.TrimSpace(stringFromAny(raw["name"])),
+		Body:          stringFromAny(raw["body"]),
+		AppendBody:    stringFromAny(raw["append_body"]),
 	}, nil
 }
 

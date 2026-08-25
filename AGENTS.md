@@ -876,6 +876,100 @@ hardcode it — derive the current target with
 kickstart the LaunchAgent again. Because the path changes under you, re-check it whenever an
 uploader starts failing with a permission error after working fine before.
 
+## Writing to Apple Notes (apple_notes mutations)
+
+Apple Notes is the first **write-back** source that reviewed mutations reach. Everything
+else `propose_mutation` supports — Gmail, Calendar, Contacts — has a server API the cloud
+worker can call. Notes has none: iCloud publishes no write endpoint, and the desktop app
+keeps note bodies as gzipped protobuf inside a Core Data store whose decryption key and
+auth token sit behind OpenAI-style team-scoped entitlements. **The only supported way to
+change a note is to ask Notes.app itself, on a Mac that is signed in.** So the proposal
+and review halves live with every other mutation type, and the executor is local.
+
+```
+agent  → propose_mutation apple_notes.create_note / apple_notes.update_note
+       → ops.upstream_mutation_operations, status pending_review
+human  → /mutation-review approves it
+Mac    → the apple-notes uploader run claims provider apple_notes and applies it
+         through Notes.app over AppleScript
+Mac    → the same run's upload stage ships the changed note back
+warehouse → base_apple_notes.notes, then timeline.events
+```
+
+The round trip closes inside one uploader run because mutations are applied **before** the
+scan, not after: an approved edit reaches the warehouse in that cycle instead of waiting
+five minutes for the next one.
+
+### The two operations
+
+- `apple_notes.create_note` — `folder` (default `PDW Agent`, created if missing), optional
+  `name`, required `body`.
+- `apple_notes.update_note` — `note_id` plus any of `name`, `body`, `append_body`.
+
+**`body` and `append_body` are not interchangeable and the difference is destructive.**
+`body` replaces the entire note; `append_body` leaves it alone and adds to the end. They
+are rejected together at proposal time. Prefer `append_body`: the executor cannot tell an
+intentional rewrite from a stale read, so it records the pre-edit body in the mutation's
+`result_json.previous_body` — that is a recovery path, not a guard.
+
+**A note has two identifiers and they look nothing alike.** Notes' AppleScript `id` is
+`x-coredata://<store-uuid>/ICNote/p<Z_PK>`; `base_apple_notes.notes.note_id` is the store's
+ZIDENTIFIER, a bare UUID. An agent can only discover the second one, so the executor
+accepts either and resolves a UUID through a snapshot of the local store. Requiring the
+Core Data form would have meant the one id a proposal can find is the one the executor
+rejects.
+
+**Title is the first line, not the `name` property.** Notes recomputes a note's name from
+its body, so setting `name` alone does not survive; the executor promotes it into a leading
+heading and, on update, rewrites the existing first line.
+
+### Why the cloud worker must not claim these
+
+`LOCAL_ONLY_MUTATION_PROVIDERS` in `defs/upstream_mutations.py` excludes `apple_notes` from
+both the sensor's count and the worker's claim. Without that exclusion the cloud worker
+claims the row, fails it as unknown-provider, and bumps `attempt_count` every ten seconds
+while the Mac that could have applied it never sees an approved row. Any future source
+whose upstream is a local app belongs in that tuple **and** needs a local worker, or its
+rows sit approved forever with nothing reporting that they are stuck.
+
+A create is also never reclaimed from a stale `executing` claim: replaying it makes a
+second note. Only `apple_notes.update_note` is in the reclaim set.
+
+### macOS Automation permission — the part that will break
+
+The executor sends AppleEvents, so the calling chain needs **Automation → Notes**, which is
+separate from the Full Disk Access the uploaders already hold. Three things learned the
+hard way on porygon, 2026-08-24:
+
+- **An unanswered prompt wedges the whole machine's AppleEvents, and it does not look like
+  a permission problem.** `tccd` blocks in `CFUserNotificationReceiveResponse` waiting for a
+  click nobody will make on an unattended Mac, and every AppleEvent to a *TCC-protected*
+  app (Notes, Contacts, Calendar, Reminders) then hangs to `-1712 AppleEvent timed out` —
+  while unprotected apps (TextEdit, Music) answer instantly, which is what makes it read as
+  "Notes is broken" rather than "consent is pending". Restarting Notes does not clear it;
+  the pending dialog does. Diagnose with
+  `sample $(pgrep -f 'tccd$') 1 -mayDie -f /tmp/t.txt` and grep for
+  `CFUserNotificationReceiveResponse`.
+- **A grant row with `flags = 1` is a pending prompt, not an allow.** Flipping `auth_value`
+  to 2 while leaving `flags = 1` re-prompts forever. A working row reads
+  `auth_value = 2, auth_reason = 3, flags = NULL`. The user TCC database is readable and
+  writable only from a chain that already holds Full Disk Access — in practice a LaunchAgent,
+  not an SSH shell — and `tccd` caches, so a change needs `kill -9 $(pgrep -f 'tccd$')`.
+- **TCC attributes the event to `uv`, at its versioned Cellar path.** The chain is
+  launchd → `/bin/zsh` → `uv` → python → `osascript`, and the grant lands on
+  `/opt/homebrew/Cellar/uv/<version>/bin/uv`. That path **drifts on every uv upgrade**,
+  exactly like the Full Disk Access python-path drift documented above, so a working
+  executor will start returning `blocked_missing_credentials` after a `brew upgrade` with no
+  code change. The executor classifies `-1743` as `blocked_missing_credentials` rather than
+  a failure precisely so this reads as "a human must re-grant on that Mac".
+
+`APPLE_NOTES_MUTATIONS_ENABLED=0` pauses the local worker without touching the uploader.
+`pdw ingest apple-notes --mutations-only` applies approved mutations and skips the upload;
+`--no-mutations` does the reverse.
+
+SQL starting points: `base_apple_notes.notes` for the resulting note, and
+`ops.upstream_mutation_operations` for the mutation's own status, result and error.
+
 ## Local Apple Messages Upload Scheduler
 
 This Mac is intended to run the local Apple Messages uploader through a user LaunchAgent:

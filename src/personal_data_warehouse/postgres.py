@@ -4866,17 +4866,38 @@ class PostgresWarehouse:
         rows = self._query_dicts("SELECT * FROM @upstream_mutations WHERE id = %s", (mutation_id,))
         return rows[0] if rows else None
 
-    def claim_approved_upstream_mutations(self, *, limit: int, claimed_by: str) -> list[dict[str, Any]]:
+    def claim_approved_upstream_mutations(
+        self,
+        *,
+        limit: int,
+        claimed_by: str,
+        providers: Sequence[str] | None = None,
+        exclude_providers: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Claim approved mutations, optionally scoped to a set of providers.
+
+        Scoping is what keeps two workers off one queue. Apple Notes can only be applied
+        on a Mac running Notes.app, so the cloud worker excludes that provider and the
+        Mac worker claims only it. Without the filter the cloud worker would claim an
+        apple_notes row, fail it as unknown-provider, and bump attempt_count on every
+        tick while the Mac never got a chance at it.
+        """
+
         self.ensure_upstream_mutation_tables()
         if limit <= 0:
             return []
+        provider_filter, provider_params = _upstream_mutation_provider_filter(
+            providers=providers,
+            exclude_providers=exclude_providers,
+        )
         now = datetime.now(tz=UTC)
         rows = self._query_dicts(
-            """
+            f"""
             WITH candidates AS (
                 SELECT id
                 FROM @upstream_mutations
                 WHERE status = ANY(%s)
+                  {provider_filter}
                 ORDER BY approved_at ASC, created_at ASC, id ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
@@ -4891,7 +4912,14 @@ class PostgresWarehouse:
              WHERE mutation.id = candidates.id
             RETURNING mutation.*
             """,
-            (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), int(limit), claimed_by, now, now),
+            (
+                list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES),
+                *provider_params,
+                int(limit),
+                claimed_by,
+                now,
+                now,
+            ),
         )
         for row in rows:
             self._append_upstream_mutation_event(
@@ -5129,16 +5157,27 @@ class PostgresWarehouse:
         if mutation and mutation.get("request_id"):
             self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
 
-    def approved_upstream_mutation_count(self, *, ensure_tables: bool = True) -> int:
+    def approved_upstream_mutation_count(
+        self,
+        *,
+        ensure_tables: bool = True,
+        providers: Sequence[str] | None = None,
+        exclude_providers: Sequence[str] | None = None,
+    ) -> int:
         if ensure_tables:
             self.ensure_upstream_mutation_tables()
+        provider_filter, provider_params = _upstream_mutation_provider_filter(
+            providers=providers,
+            exclude_providers=exclude_providers,
+        )
         rows = self._query(
-            """
+            f"""
             SELECT count(*)::bigint
             FROM @upstream_mutations
             WHERE status = ANY(%s)
+              {provider_filter}
             """,
-            (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES),),
+            (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), *provider_params),
         )
         return int(rows[0][0]) if rows else 0
 
@@ -12171,3 +12210,28 @@ def _numeric_ts(expression: str) -> str:
 
 def _json_numeric(expression: str, field: str) -> str:
     return f"COALESCE(NULLIF(({expression}::jsonb ->> '{field}'), '')::numeric, 0)"
+
+
+def _upstream_mutation_provider_filter(
+    *,
+    providers: Sequence[str] | None,
+    exclude_providers: Sequence[str] | None,
+) -> tuple[str, tuple[Any, ...]]:
+    """Build the provider predicate shared by the claim and count queries.
+
+    Returned as SQL text plus positional params so both callers interpolate the same
+    clause in the same parameter order; the two drifting apart would let the sensor
+    report work the worker then refuses to claim, which reads as a stuck queue.
+    """
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    included = [str(item) for item in (providers or []) if str(item).strip()]
+    excluded = [str(item) for item in (exclude_providers or []) if str(item).strip()]
+    if included:
+        clauses.append("AND provider = ANY(%s)")
+        params.append(included)
+    if excluded:
+        clauses.append("AND NOT (provider = ANY(%s))")
+        params.append(excluded)
+    return " ".join(clauses), tuple(params)

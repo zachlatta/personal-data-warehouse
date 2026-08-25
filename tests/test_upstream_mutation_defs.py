@@ -50,7 +50,13 @@ class FakeWarehouse:
         self.ensure_called = True
         self.ensure_call_count += 1
 
-    def approved_upstream_mutation_count(self, *, ensure_tables: bool = True) -> int:
+    def approved_upstream_mutation_count(
+        self,
+        *,
+        ensure_tables: bool = True,
+        providers=None,
+        exclude_providers=None,
+    ) -> int:
         self.approved_count_ensure_flags.append(ensure_tables)
         return self.approved_count
 
@@ -76,7 +82,14 @@ class FakeWarehouse:
     def observe_succeeded_calendar_event_mutations(self) -> int:
         return 0
 
-    def claim_approved_upstream_mutations(self, *, limit: int, claimed_by: str):
+    def claim_approved_upstream_mutations(
+        self,
+        *,
+        limit: int,
+        claimed_by: str,
+        providers=None,
+        exclude_providers=None,
+    ):
         self.claim_limit = limit
         self.claimed_by = claimed_by
         return self.claimed

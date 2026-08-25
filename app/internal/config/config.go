@@ -46,6 +46,7 @@ type Config struct {
 	GmailAccounts           []string
 	ContactGoogleAccounts   []string
 	CalendarAccounts        []string
+	AppleNotesAccounts      []string
 
 	// Object storage (optional). When configured, the app can read blob objects
 	// (Gmail attachments, Apple Notes/Messages attachments, Voice Memo audio,
@@ -178,6 +179,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		GmailAccounts:           parseCSV(getenv("GMAIL_ACCOUNTS")),
 		ContactGoogleAccounts:   parseCSV(getenv("CONTACT_GOOGLE_ACCOUNTS")),
 		CalendarAccounts:        parseCSV(firstNonEmpty(getenv("CALENDAR_ACCOUNTS"), getenv("GMAIL_ACCOUNTS"))),
+		AppleNotesAccounts:      parseCSV(firstNonEmpty(getenv("APPLE_NOTES_ACCOUNTS"), getenv("APPLE_NOTES_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
 	}
 
 	var missing []string

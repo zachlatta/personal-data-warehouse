@@ -404,6 +404,10 @@ func renderMutationArticle(w http.ResponseWriter, mutation Mutation, requestID s
 		renderCalendarMutation(w, mutation)
 		return
 	}
+	if isAppleNotesMutation(mutation) {
+		renderAppleNotesMutation(w, mutation)
+		return
+	}
 	fmt.Fprintf(w, `<article class="mutation"><h3>%s</h3><p class="mutation-meta">%s %s for %s</p><pre>%s</pre><pre>%s</pre></article>`,
 		html.EscapeString(mutation.Title),
 		html.EscapeString(mutation.Status),

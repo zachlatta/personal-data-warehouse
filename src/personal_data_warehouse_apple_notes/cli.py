@@ -14,6 +14,10 @@ from personal_data_warehouse_voice_memos.network import (
     preflight_app_ingest,
 )
 from personal_data_warehouse_apple_notes.notes_app import ensure_notes_app_running
+from personal_data_warehouse_apple_notes.mutation_worker import (
+    apple_notes_mutations_enabled,
+    process_apple_notes_mutations,
+)
 from personal_data_warehouse_apple_notes.state import AppleNotesUploadState, default_state_file
 from personal_data_warehouse_apple_notes.sync import AppleNotesUploadRunner
 
@@ -46,6 +50,16 @@ def main() -> None:
         type=int,
         default=None,
         help="Maximum changed or deleted notes to upload in this run; 0 means unlimited",
+    )
+    parser.add_argument(
+        "--no-mutations",
+        action="store_true",
+        help="Skip applying approved Apple Notes mutations in this run",
+    )
+    parser.add_argument(
+        "--mutations-only",
+        action="store_true",
+        help="Apply approved Apple Notes mutations and skip the upload stage",
     )
     parser.add_argument(
         "--workers",
@@ -86,6 +100,13 @@ def main() -> None:
         if not acquired:
             print("Apple Notes upload skipped: another uploader run is active")
             return
+        # Mutations run BEFORE the upload stage on purpose: a note this run writes is
+        # then picked up by the same run's scan, so an approved edit reaches the
+        # warehouse in one cycle instead of waiting five minutes for the next one.
+        if not args.no_mutations and apple_notes_mutations_enabled():
+            print(run_apple_notes_mutations(logger))
+        if args.mutations_only:
+            return
         try:
             summary = AppleNotesUploadRunner(
                 account=settings.apple_notes.account,
@@ -113,6 +134,30 @@ def main() -> None:
         f"attachments={summary.attachments_uploaded} "
         f"missing={summary.attachments_missing}"
     )
+
+
+def run_apple_notes_mutations(logger) -> str:
+    """Apply approved Apple Notes mutations, never failing the upload run.
+
+    The uploader is the source of truth for note *data*; mutations are a rider on it. A
+    warehouse that is unreachable, or a Notes.app that refuses one edit, must not stop
+    the day's notes from syncing -- so every failure here is reported and swallowed.
+    """
+
+    try:
+        from personal_data_warehouse.config import load_settings as _load_settings
+        from personal_data_warehouse.warehouse import warehouse_from_settings
+
+        settings = _load_settings(require_postgres=True, require_gmail=False)
+        warehouse = warehouse_from_settings(settings)
+    except Exception as error:  # noqa: BLE001 - reported, never fatal to the upload
+        return f"Apple Notes mutations skipped: warehouse unavailable ({error})"
+    try:
+        return process_apple_notes_mutations(warehouse=warehouse).describe()
+    except Exception as error:  # noqa: BLE001 - reported, never fatal to the upload
+        return f"Apple Notes mutations failed: {error}"
+    finally:
+        warehouse.close()
 
 
 def build_before_upload_check(*, preflight_timeout_seconds: float):

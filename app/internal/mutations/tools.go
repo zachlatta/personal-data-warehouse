@@ -222,6 +222,48 @@ func MutationHelp() MutationHelpDocument {
 				},
 			},
 			{
+				Type:        AppleNotesCreateNoteOperation,
+				Summary:     "Create a note in Apple Notes. Executed on Zach's Mac through Notes.app, not in the cloud.",
+				RequiresEnv: "APPLE_NOTES_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + AppleNotesCreateNoteOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Apple Notes account label"},
+					{Name: "folder", JSONType: "string", Required: false, Description: `Notes folder to create in; defaults to "` + appleNotesDefaultFolder + `" and is created if missing`},
+					{Name: "name", JSONType: "string", Required: false, Description: "note title; when omitted Notes uses the body's first line"},
+					{Name: "body", JSONType: "string", Required: true, Description: "note body. Plain text is converted to paragraphs; HTML (<div>, <b>, <ul>) is passed through, which is how Notes stores rich text."},
+				},
+				Example: map[string]any{
+					"type":    AppleNotesCreateNoteOperation,
+					"account": "you@example.com",
+					"folder":  "PDW Agent",
+					"name":    "Runway",
+					"body":    "12 months of cash remaining at the current burn.",
+				},
+				ExtraNotes: "Executed by the local apple-notes worker on a Mac running Notes.app, so it completes on that Mac's next run rather than within seconds of approval. " +
+					"The result JSON carries the created note's x-coredata:// id. base_apple_notes.notes.note_id holds a different identifier for the same note (ZIDENTIFIER, a UUID) once the uploader syncs it; apple_notes.update_note accepts either form.",
+			},
+			{
+				Type:        AppleNotesUpdateNoteOperation,
+				Summary:     "Retitle, rewrite, or append to an existing Apple note.",
+				RequiresEnv: "APPLE_NOTES_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + AppleNotesUpdateNoteOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Apple Notes account label"},
+					{Name: "note_id", JSONType: "string", Required: true, Description: "base_apple_notes.notes.note_id (a UUID), or Notes' own x-coredata:// id; the executor accepts either and resolves the UUID against the local store"},
+					{Name: "name", JSONType: "string", Required: false, Description: "new title"},
+					{Name: "body", JSONType: "string", Required: false, Description: "REPLACES the whole body; mutually exclusive with append_body"},
+					{Name: "append_body", JSONType: "string", Required: false, Description: "appends to the end of the existing body, leaving it otherwise untouched"},
+				},
+				Example: map[string]any{
+					"type":        AppleNotesUpdateNoteOperation,
+					"account":     "you@example.com",
+					"note_id":     "0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9",
+					"append_body": "Updated 2026-08-24: burn is down 8%.",
+				},
+				ExtraNotes: "Prefer append_body over body. body discards whatever the note currently holds, and the executor cannot tell an intentional rewrite from a stale read — " +
+					"it records the pre-edit body in the result JSON so an unwanted replacement is recoverable, but that is a repair, not a guard.",
+			},
+			{
 				Type:        CalendarDeleteEventOperation,
 				Summary:     "Delete a Google Calendar event. Use an instance event_id to cancel a single occurrence of a recurring series.",
 				RequiresEnv: "CALENDAR_ACCOUNTS",

@@ -18,6 +18,9 @@ const (
 	CalendarCreateEventOperation   = "calendar.create_event"
 	CalendarUpdateEventOperation   = "calendar.update_event"
 	CalendarDeleteEventOperation   = "calendar.delete_event"
+	AppleNotesProvider             = "apple_notes"
+	AppleNotesCreateNoteOperation  = "apple_notes.create_note"
+	AppleNotesUpdateNoteOperation  = "apple_notes.update_note"
 
 	defaultRequestedBy = "mcp"
 	reviewerActorID    = "web-ui"
@@ -33,6 +36,7 @@ type Config struct {
 	GmailAccounts         []string
 	ContactGoogleAccounts []string
 	CalendarAccounts      []string
+	AppleNotesAccounts    []string
 	Now                   func() time.Time
 }
 
@@ -82,6 +86,11 @@ type MutationInput struct {
 	SendUpdates   string
 	Event         map[string]any
 	Patch         map[string]any
+	Folder        string
+	NoteID        string
+	Name          string
+	Body          string
+	AppendBody    string
 }
 
 type GmailEmailVariantInput struct {

@@ -1505,6 +1505,22 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 					"context": input.Context,
 				},
 			})
+		case AppleNotesCreateNoteOperation, AppleNotesUpdateNoteOperation:
+			if err := validateAppleNotesMutation(mutation); err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			out = append(out, storedMutation{
+				Provider:  AppleNotesProvider,
+				Operation: mutation.Type,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, appleNotesTitle(mutation)),
+				Reason:    reason,
+				Payload:   appleNotesPayload(mutation),
+				Preview: map[string]any{
+					"note":    appleNotesPreview(mutation),
+					"context": input.Context,
+				},
+			})
 		default:
 			return nil, fmt.Errorf("mutation %d has unsupported type %q", index, mutation.Type)
 		}
