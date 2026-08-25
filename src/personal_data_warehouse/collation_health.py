@@ -41,9 +41,11 @@ Four things it gets right, each learned the hard way:
 
 **The duplicate count is not the integrity check.** Three of the seven damaged
 indexes had no duplicates at all; they were merely mis-ordered, which makes an
-index *miss rows that exist*. The scheduled collector therefore runs amcheck's
-``bt_index_check`` for every valid btree index,
-including large and expression indexes skipped by the corroborating count. It
+index *miss rows that exist*. The scheduled collector therefore rotates
+amcheck's ``bt_index_check`` across every valid btree index, including large
+and expression indexes skipped by the corroborating count. Each run is bounded
+by count and wall time; never-checked, old, large, and previously failing
+indexes go first, while unvisited indexes retain their last result. It
 never creates the extension or repairs an index; unavailable/error/timeout are
 published explicitly instead of being mistaken for a pass.
 """
@@ -75,6 +77,8 @@ __all__ = [
     "FINDING_VERSION_CHANGED",
     "PROBE_STATEMENT_TIMEOUT_MS",
     "AMCHECK_STATEMENT_TIMEOUT_MS",
+    "AMCHECK_MAX_PER_RUN",
+    "AMCHECK_RUN_BUDGET_SECONDS",
     "SCOPE_COLLATION",
     "SCOPE_DATABASE",
     "SCOPE_INDEX",
@@ -132,6 +136,12 @@ PROBE_STATEMENT_TIMEOUT_MS = 60_000
 # a real maintenance-window budget rather than turning them into permanent
 # ``unknown`` rows after sixty seconds.
 AMCHECK_STATEMENT_TIMEOUT_MS = 15 * 60_000
+# Rotation bounds.  A 1,200-index database must make steady progress without a
+# daily job turning into an unbounded I/O sweep.
+AMCHECK_MAX_PER_RUN = 25
+AMCHECK_RUN_BUDGET_SECONDS = 45 * 60
+AMCHECK_STALE_SECONDS = 14 * 24 * 60 * 60
+AMCHECK_FAILURE_RETRY_CAP = 5
 
 
 @dataclass
@@ -159,6 +169,7 @@ class CollationFinding:
     amcheck_status: str = "unavailable"
     amcheck_detail: str = "amcheck extension/function is not installed"
     amcheck_ms: int = 0
+    amcheck_at: datetime | None = None
 
 
 #: Postgres spells providers as single characters. Rendering them as words is
@@ -361,10 +372,19 @@ class CollationHealthCollector:
         try:
             findings = [self._probe_unique_index(row) for row in candidates]
             by_name = {finding.object_name: finding for finding in findings}
-            # Structural integrity applies to every valid btree, not only
-            # UNIQUE indexes. The latter merely get the additional duplicate
-            # corroboration above.
-            for row in self._amcheck_candidates():
+            all_amcheck = self._amcheck_candidates() if self._run_structural_checks else []
+            prior = self._previous_amcheck_results() if all_amcheck else {}
+            selected = {
+                self._candidate_name(row)
+                for row in self._select_amcheck_candidates(
+                    all_amcheck, prior, limit=AMCHECK_MAX_PER_RUN
+                )
+            }
+            deadline = time.monotonic() + AMCHECK_RUN_BUDGET_SECONDS
+            # Structural integrity applies to every valid btree, but only a
+            # bounded rotation is checked on one day. Every unvisited index is
+            # still emitted with its previous rigorous result intact.
+            for row in all_amcheck:
                 name = f"{row['index_schema']}.{row['index_name']}"
                 finding = by_name.get(name)
                 if finding is None:
@@ -381,7 +401,26 @@ class CollationHealthCollector:
                         table_name=f"{row['table_schema']}.{row['table_name']}",
                     )
                     findings.append(finding)
-                self._run_amcheck(row, finding, amcheck)
+                previous = prior.get(name)
+                if previous:
+                    self._restore_amcheck(finding, previous)
+                elif not amcheck:
+                    finding.amcheck_status = "unavailable"
+                    finding.amcheck_detail = "amcheck extension/function is not installed"
+                else:
+                    finding.amcheck_status = "never_checked"
+                    finding.amcheck_detail = "pending the bounded daily amcheck rotation"
+                if name in selected and amcheck and time.monotonic() < deadline:
+                    remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                    self._run_amcheck(
+                        row,
+                        finding,
+                        amcheck,
+                        timeout_ms=min(AMCHECK_STATEMENT_TIMEOUT_MS, remaining_ms),
+                    )
+                elif name in selected and amcheck:
+                    finding.amcheck_status = "pending"
+                    finding.amcheck_detail = "daily amcheck wall-time budget exhausted"
         finally:
             self._warehouse._raw_command("SET statement_timeout = DEFAULT")
         return findings
@@ -390,7 +429,9 @@ class CollationHealthCollector:
         return self._warehouse._query_dicts(
             """
             SELECT n.nspname AS index_schema, ic.relname AS index_name,
-                   tn.nspname AS table_schema, tc.relname AS table_name
+                   tn.nspname AS table_schema, tc.relname AS table_name,
+                   pg_relation_size(ic.oid) AS index_bytes,
+                   pg_relation_size(tc.oid) AS heap_bytes
             FROM pg_index i
             JOIN pg_class ic ON ic.oid = i.indexrelid
             JOIN pg_namespace n ON n.oid = ic.relnamespace
@@ -403,6 +444,64 @@ class CollationHealthCollector:
             """,
             (self._warehouse.physical_schema_names(include_hidden=True),),
         )
+
+    @staticmethod
+    def _candidate_name(row: dict[str, Any]) -> str:
+        schema = str(row.get("index_schema") or "")
+        name = str(row["index_name"])
+        return f"{schema}.{name}" if schema else name
+
+    def _previous_amcheck_results(self) -> dict[str, dict[str, Any]]:
+        rows = self._warehouse._query_dicts(
+            """
+            SELECT object_name, amcheck_status, amcheck_detail, amcheck_ms,
+                   NULLIF(amcheck_at, '1970-01-01 00:00:00+00'::timestamptz) AS amcheck_at
+            FROM @collation_health WHERE scope = 'index'
+            """
+        )
+        return {str(row["object_name"]): row for row in rows}
+
+    def _select_amcheck_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        prior: dict[str, dict[str, Any]],
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        now = self._now()
+
+        def priority(row: dict[str, Any]) -> tuple[int, float, int, str]:
+            name = self._candidate_name(row)
+            old = prior.get(name)
+            status = str((old or {}).get("amcheck_status") or "")
+            at = (old or {}).get("amcheck_at")
+            if status in {"failed", "error", "timeout"}:
+                tier = 0
+            elif not at or status in {"", "never_checked", "pending", "unavailable"}:
+                tier = 1
+            elif (now - at).total_seconds() >= AMCHECK_STALE_SECONDS:
+                tier = 2
+            else:
+                tier = 3
+            age = (now - at).total_seconds() if at else float("inf")
+            return (tier, -age, -int(row.get("index_bytes") or 0), name)
+
+        ordered = sorted(candidates, key=priority)
+        failed = [row for row in ordered if priority(row)[0] == 0]
+        rest = [row for row in ordered if priority(row)[0] != 0]
+        # A fleet of permanently timing-out indexes must not starve the
+        # never-checked tail forever. Retried failures still lead every run,
+        # but consume only a bounded share of the rotation.
+        chosen = failed[:AMCHECK_FAILURE_RETRY_CAP]
+        chosen.extend(rest[: max(0, min(limit, AMCHECK_MAX_PER_RUN) - len(chosen))])
+        return chosen
+
+    @staticmethod
+    def _restore_amcheck(finding: CollationFinding, previous: dict[str, Any]) -> None:
+        finding.amcheck_status = str(previous.get("amcheck_status") or "never_checked")
+        finding.amcheck_detail = str(previous.get("amcheck_detail") or "")
+        finding.amcheck_ms = int(previous.get("amcheck_ms") or 0)
+        finding.amcheck_at = previous.get("amcheck_at")
 
     def _amcheck_function(self) -> str:
         """Return the installed function's qualified schema, never CREATE it."""
@@ -417,11 +516,18 @@ class CollationHealthCollector:
         )
         return str(rows[0][0]) if rows else ""
 
-    def _run_amcheck(self, row: dict[str, Any], finding: CollationFinding, function_schema: str) -> None:
+    def _run_amcheck(
+        self,
+        row: dict[str, Any],
+        finding: CollationFinding,
+        function_schema: str,
+        *,
+        timeout_ms: int = AMCHECK_STATEMENT_TIMEOUT_MS,
+    ) -> None:
         if not function_schema:
             return
         started = time.monotonic()
-        self._warehouse._raw_command(f"SET statement_timeout = {AMCHECK_STATEMENT_TIMEOUT_MS}")
+        self._warehouse._raw_command(f"SET statement_timeout = {timeout_ms}")
         try:
             qualified_index = f"{_ident(row['index_schema'])}.{_ident(row['index_name'])}"
             self._warehouse._query(
@@ -443,6 +549,7 @@ class CollationHealthCollector:
             finding.amcheck_detail = detail
         finally:
             finding.amcheck_ms = int((time.monotonic() - started) * 1000)
+            finding.amcheck_at = self._now()
             self._warehouse._raw_command(f"SET statement_timeout = {PROBE_STATEMENT_TIMEOUT_MS}")
 
     def _unique_index_candidates(self) -> list[dict[str, Any]]:

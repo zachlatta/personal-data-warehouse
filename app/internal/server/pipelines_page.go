@@ -687,7 +687,8 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
         (c.table_name || "") + (keys.length ? " (" + keys.join(", ") + ")" : ""), false]);
       columns.push(["distinct keys", rows(c.distinct_keys), "", true]);
       columns.push(["amcheck", c.amcheck_status || "unavailable",
-        (c.amcheck_detail || "") + (c.amcheck_ms ? " · " + c.amcheck_ms + "ms" : ""), true]);
+        (c.amcheck_detail || "") + (c.amcheck_at ? " · checked " + stamp(c.amcheck_at) : "") +
+        (c.amcheck_ms ? " · " + c.amcheck_ms + "ms" : ""), true]);
       columns.push(["excess", String(c.excess_rows || 0),
         c.is_partial ? "counted under the index predicate: " + c.predicate
                      : "no partial predicate", true]);

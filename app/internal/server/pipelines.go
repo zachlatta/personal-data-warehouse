@@ -74,7 +74,7 @@ var pipelineCollationHealthSQL = `
 SELECT object_id, scope, object_name, status, finding, detail, provider,
        recorded_version, actual_version, dependent_indexes, table_name,
        is_unique, is_partial, predicate, key_columns, heap_rows, distinct_keys,
-       excess_rows, probe_ms, amcheck_status, amcheck_detail, amcheck_ms, collected_at
+       excess_rows, probe_ms, amcheck_status, amcheck_detail, amcheck_ms, amcheck_at, collected_at
 FROM ` + warehouse.SQLRelation("marts_collation_health") + `
 ORDER BY scope, object_name`
 

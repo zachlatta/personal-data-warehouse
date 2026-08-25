@@ -2162,13 +2162,14 @@ COLLATION_HEALTH_COLUMNS = (
     "distinct_keys",
     "excess_rows",
     "probe_ms",
-    # Rigorous btree structural verification.  This is separate from the
+    # Rigorous, bounded-rotation btree structural verification. This is separate from the
     # duplicate-key corroboration above: amcheck sees mis-ordering even when it
     # has not produced duplicates, including indexes whose heaps are too large
     # for the count(DISTINCT) probe.
     "amcheck_status",
     "amcheck_detail",
     "amcheck_ms",
+    "amcheck_at",
     "collected_at",
 )
 

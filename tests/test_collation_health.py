@@ -19,6 +19,7 @@ and would each have made it silently useless:
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from dotenv import load_dotenv
@@ -26,6 +27,8 @@ from dotenv import load_dotenv
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.collation_health import (
+    AMCHECK_MAX_PER_RUN,
+    AMCHECK_RUN_BUDGET_SECONDS,
     AMCHECK_STATEMENT_TIMEOUT_MS,
     DIVERGENCE_MAX_HEAP_BYTES,
     FINDING_DUPLICATE_KEYS,
@@ -426,6 +429,112 @@ def test_amcheck_candidates_include_non_unique_btrees() -> None:
     assert CollationHealthCollector(FakeWarehouse())._amcheck_candidates() == [
         {"index_name": "messages_date_idx"}
     ]
+
+
+def test_amcheck_rotation_is_bounded_and_prioritizes_failures_never_checked_and_large() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    collector = object.__new__(CollationHealthCollector)
+    collector._now = lambda: now
+    candidates = [
+        {"index_name": "recent_ok", "index_bytes": 10},
+        {"index_name": "never_small", "index_bytes": 20},
+        {"index_name": "never_large", "index_bytes": 20_000},
+        {"index_name": "failed", "index_bytes": 1},
+    ]
+    prior = {
+        "recent_ok": {"amcheck_status": "ok", "amcheck_at": now - timedelta(hours=1)},
+        "failed": {"amcheck_status": "failed", "amcheck_at": now - timedelta(hours=1)},
+    }
+    selected = collector._select_amcheck_candidates(candidates, prior, limit=3)
+    assert [row["index_name"] for row in selected] == [
+        "failed",
+        "never_large",
+        "never_small",
+    ]
+    assert len(selected) <= AMCHECK_MAX_PER_RUN
+
+
+def test_unvisited_index_retains_its_last_rigorous_result() -> None:
+    collector = object.__new__(CollationHealthCollector)
+    finding = CollationFinding(
+        object_id="index:base_gmail.messages_date_idx",
+        scope=SCOPE_INDEX,
+        object_name="base_gmail.messages_date_idx",
+        provider="",
+        recorded_version="",
+        actual_version="",
+        dependent_indexes=0,
+        finding=FINDING_OK,
+        detail="",
+    )
+    checked_at = datetime(2026, 8, 24, tzinfo=UTC)
+    collector._restore_amcheck(
+        finding,
+        {"amcheck_status": "ok", "amcheck_detail": "passed", "amcheck_ms": 42,
+         "amcheck_at": checked_at},
+    )
+    assert finding.amcheck_status == "ok"
+    assert finding.amcheck_at == checked_at
+    assert finding.amcheck_ms == 42
+
+
+def test_rotation_limit_is_small_enough_for_steady_daily_progress() -> None:
+    assert 1 <= AMCHECK_MAX_PER_RUN <= 50
+    assert 60 <= AMCHECK_RUN_BUDGET_SECONDS <= 60 * 60
+
+
+def test_rotation_emits_every_active_index_and_preserves_unvisited_results() -> None:
+    class FakeWarehouse:
+        schema_namespace = "public"
+
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def _raw_command(self, sql: str) -> None:
+            self.commands.append(sql)
+
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    collector = CollationHealthCollector(FakeWarehouse(), now=lambda: now)
+    collector._unique_index_candidates = lambda: []
+    collector._amcheck_function = lambda: "public"
+    candidates = [
+        {
+            "index_schema": "base_gmail",
+            "index_name": f"idx_{i:02d}",
+            "table_schema": "base_gmail",
+            "table_name": "messages",
+            "index_bytes": i,
+            "heap_bytes": 1,
+        }
+        for i in range(AMCHECK_MAX_PER_RUN + 5)
+    ]
+    collector._amcheck_candidates = lambda: candidates
+    retained_name = f"base_gmail.idx_{AMCHECK_MAX_PER_RUN + 4:02d}"
+    collector._previous_amcheck_results = lambda: {
+        retained_name: {
+            "amcheck_status": "ok",
+            "amcheck_detail": "previous pass",
+            "amcheck_ms": 9,
+            "amcheck_at": now - timedelta(days=1),
+        }
+    }
+    checked: list[str] = []
+
+    def fake_check(row, finding, _schema, *, timeout_ms):
+        assert 0 < timeout_ms <= AMCHECK_STATEMENT_TIMEOUT_MS
+        checked.append(row["index_name"])
+        finding.amcheck_status = "ok"
+        finding.amcheck_at = now
+
+    collector._run_amcheck = fake_check
+
+    findings = collector._index_findings()
+    assert len(checked) == AMCHECK_MAX_PER_RUN
+    assert len(findings) == len(candidates), "unvisited active indexes must survive snapshot replace"
+    retained = next(f for f in findings if f.object_name == retained_name)
+    assert retained.amcheck_status == "ok"
+    assert retained.amcheck_detail == "previous pass"
+    assert retained.amcheck_at == now - timedelta(days=1)
 
 
 def test_the_detector_issues_no_ddl_and_no_repair():

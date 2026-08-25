@@ -1918,6 +1918,7 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    "amcheck_at",
     "oldest_pending_at",
     "last_success_at",
     # mart health: the stalest input pipeline's last write. (When the view's
@@ -3626,6 +3627,7 @@ class PostgresWarehouse:
             ("amcheck_status", "text", "'unavailable'"),
             ("amcheck_detail", "text", "''"),
             ("amcheck_ms", "bigint", "0"),
+            ("amcheck_at", "timestamptz", "'1970-01-01 00:00:00+00'"),
         ):
             self._command(
                 f"ALTER TABLE @collation_health ADD COLUMN IF NOT EXISTS "
@@ -3937,7 +3939,7 @@ class PostgresWarehouse:
                     key_columns,
                     heap_rows, distinct_keys, excess_rows, probe_ms,
                     amcheck_status, NULLIF(amcheck_detail, '') AS amcheck_detail,
-                    amcheck_ms,
+                    amcheck_ms, NULLIF(amcheck_at, {epoch}) AS amcheck_at,
                     NULLIF(collected_at, {epoch}) AS collected_at
                 FROM @collation_health
             )
@@ -3962,6 +3964,10 @@ class PostgresWarehouse:
                     WHEN finding = 'unknown_actual' THEN 'attention'
                     WHEN scope = 'index'
                       AND amcheck_status IN ('timeout', 'error', 'unavailable') THEN 'attention'
+                    WHEN scope = 'index' AND amcheck_status IN ('pending', 'never_checked')
+                      THEN 'unmeasured'
+                    WHEN scope = 'index' AND amcheck_at IS NOT NULL
+                      AND now() - amcheck_at > interval '14 days' THEN 'attention'
                     WHEN finding IN ('timeout', 'error') THEN 'attention'
                     WHEN finding IN ('skipped_expression', 'skipped_large')
                       AND amcheck_status <> 'ok' THEN 'unmeasured'
@@ -3985,6 +3991,7 @@ class PostgresWarehouse:
                 amcheck_status,
                 amcheck_detail,
                 amcheck_ms,
+                amcheck_at,
                 collected_at,
                 (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds
             FROM measured

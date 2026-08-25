@@ -40,7 +40,8 @@ def collation_health(context) -> MaterializeResult:
     """Detect collation drift and unique-index divergence.
 
     Read-only: catalog reads, bounded ``count(*)``/``count(DISTINCT key)``
-    probes, and rigorous amcheck checks including large indexes. It issues no
+    probes, and a persisted amcheck rotation including large indexes, bounded
+    by both index count and total wall time. It issues no
     DDL, creates no extension, and never REINDEXes —
     repair is a human decision with an ordering that matters (dedupe first, or
     the REINDEX fails).
@@ -89,6 +90,17 @@ def collation_health(context) -> MaterializeResult:
             "objects_checked": MetadataValue.int(len(findings)),
             "indexes_with_duplicates": MetadataValue.json(
                 sorted(f.object_name for f in duplicates)
+            ),
+            "indexes_with_amcheck_result": MetadataValue.int(
+                sum(1 for f in findings if f.scope == "index" and f.amcheck_at is not None)
+            ),
+            "indexes_pending_amcheck": MetadataValue.int(
+                sum(
+                    1
+                    for f in findings
+                    if f.scope == "index"
+                    and f.amcheck_status in {"pending", "never_checked", "unavailable"}
+                )
             ),
             "excess_rows": MetadataValue.int(sum(f.excess_rows for f in duplicates)),
             "collations_version_changed": MetadataValue.json(
