@@ -710,12 +710,20 @@ _SLACK_SYSTEM_SUBTYPES = (
 # to Zach's announcement ("First", "sigh", a Q&A between two other people) are
 # not aimed at him even though he wrote the root -- measured 2026-08-26, every
 # reply in a 95-reply <!here> thread of his was 'direct'.
+#
+# Shape matters: written as EXISTS(... AND (reply_count > 20 OR text ~ ...))
+# the planner hashed the whole predicate set instead of probing the root --
+# a six-worker parallel seq scan over all 46M slack rows, materialized once
+# per 5,000-row backfill page (29s and 48 GB of reads per page, measured on
+# prod 2026-08-26). A scalar subquery keyed on the primary key cannot be
+# hashed, so the OR is evaluated on the one root row it finds.
 _SLACK_THREAD_ROOT_BROADCAST = (
-    "(t.thread_ts <> '' AND EXISTS ("
-    "SELECT 1 FROM @slack_messages z "
+    "(t.thread_ts <> '' AND COALESCE(("
+    "SELECT z.reply_count > 20 OR z.text ~ '<!(channel|here|everyone)>' "
+    "FROM @slack_messages z "
     "WHERE z.account = t.account AND z.team_id = t.team_id "
     "  AND z.conversation_id = t.conversation_id AND z.message_ts = t.thread_ts "
-    "  AND (z.reply_count > 20 OR z.text ~ '<!(channel|here|everyone)>')))"
+    "LIMIT 1), false))"
 )
 # A real Slack ping: the message carries his user id, so Slack itself notified
 # him. Distinct from his NAME in the text, which in a public channel is far more
