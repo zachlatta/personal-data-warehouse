@@ -2071,6 +2071,51 @@ def test_refresh_window_converges_late_signals(warehouse):
     assert row[0][0] == "direct", "his replies retroactively promote the conversation window"
 
 
+def test_coverage_reconcile_picks_the_stalest_adapter_not_the_first(warehouse):
+    """The sweep must rotate by state, never by position in the adapter list.
+
+    Its cost is the ingest window, not the gap count -- 24s for slack_message
+    whether it repairs 62,891 rows or none -- so within one run's deadline only
+    some adapters get swept. Walking the fixed adapter order would hand the
+    budget to the same few every time and the tail would never reconcile, which
+    is exactly how Slack's coverage rotation forfeited a stage's turn on every
+    lock-skipped run and hid a three-month discovery outage. Order by
+    last_reconcile_at so the one that has waited longest goes first.
+    """
+
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+        # Level the field first: an adapter whose backfill did not finish in
+        # run 1 never reconciled, so it still sits at the epoch and would be
+        # the stalest for reasons that have nothing to do with rotation.
+        warehouse._command("UPDATE @timeline_sync_state SET last_reconcile_at = now()")
+        stalest = engine._adapters[-1].name
+        warehouse._command(
+            "UPDATE @timeline_sync_state SET last_reconcile_at = %s WHERE adapter = %s",
+            (datetime(1971, 1, 1, tzinfo=UTC), stalest),
+        )
+        swept: list[str] = []
+        original = engine._run_coverage_reconcile
+
+        def record(adapter, state, deadline):
+            swept.append(adapter.name)
+            return original(adapter, state, deadline)
+
+        engine._run_coverage_reconcile = record  # type: ignore[method-assign]
+        engine.run()
+    finally:
+        engine.close()
+
+    assert swept, "no adapter was reconciled at all"
+    assert swept[0] == stalest, (
+        f"reconcile swept {swept[0]!r} first but {stalest!r} had waited longest; "
+        "the rotation is positional, so the tail of the registry can starve"
+    )
+
+
 def test_no_adapter_declares_a_placeholder_priority_expression():
     """`priority_expression` must name a rule, not gesture at one.
 

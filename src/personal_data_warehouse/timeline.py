@@ -2917,6 +2917,11 @@ class TimelineSyncEngine:
     def _run_incremental(self, adapter: TimelineAdapter, state: _AdapterState, deadline: float | None) -> int:
         total = 0
         batches = 0
+        # Re-reading is bounded by the lag WINDOW, not by the budget above, but
+        # a pathological source (every row restamped inside the window) must
+        # still terminate.
+        stale_batches = 0
+        max_stale_batches = 8
         limit = self._batch_limit(adapter)
         # Restart a little behind the stored watermark so a row that committed
         # after the previous pass read -- but carries an earlier ingest stamp --
@@ -2958,10 +2963,21 @@ class TimelineSyncEngine:
             if fresh:
                 self._bump_counter(adapter, "incremental_rows", fresh)
             total += fresh
-            batches += 1
+            # A batch that only re-read the lag window must not spend the
+            # bounded budget. `max_incremental_batches_per_run` exists to stop
+            # ONE adapter's new work from starving the others; charging a
+            # re-read to it silently converts a bounded adapter into one that
+            # makes no progress at all. apple_message allows a single batch, so
+            # before this its every run re-read the lag window and synced
+            # nothing -- caught by the contact-identity re-emit test.
+            if fresh:
+                batches += 1
+            else:
+                stale_batches += 1
             if (
                 len(rows) < limit
                 or _past(deadline)
+                or stale_batches >= max_stale_batches
                 or (
                     adapter.max_incremental_batches_per_run > 0
                     and batches >= adapter.max_incremental_batches_per_run
@@ -3247,10 +3263,6 @@ class TimelineSyncEngine:
                 stats[adapter.name].incremental_rows = self._run_incremental(adapter, state, deadline)
                 if adapter.refresh_hours > 0 and state.backfill_done:
                     stats[adapter.name].refreshed_rows = self._run_refresh(adapter, deadline)
-                if state.backfill_done:
-                    stats[adapter.name].reconciled_rows = self._run_coverage_reconcile(
-                        adapter, state, deadline
-                    )
                 if adapter.prune_sql and state.backfill_done:
                     stats[adapter.name].pruned_rows = self._run_prune(adapter)
                 stats[adapter.name].backfill_done = state.backfill_done
@@ -3293,6 +3305,41 @@ class TimelineSyncEngine:
                     active.remove(adapter)
                 if _past(deadline):
                     break
+
+        # Coverage reconcile, LAST and STALEST-FIRST.
+        #
+        # Not inside the per-adapter loop above: that walks a fixed order, and
+        # the sweep is the one pass whose cost does not shrink when there is
+        # nothing to do (24s for slack_message either way). In fixed order the
+        # first few adapters would spend the run's deadline every time and the
+        # tail would never reconcile at all -- the same shape as the Slack
+        # coverage rotation that silently forfeited a stage's turn on every run
+        # that lost the lock, and went unnoticed for three months. Choosing the
+        # adapter that has gone longest without a sweep makes starvation
+        # impossible instead of unlikely.
+        due = sorted(
+            (
+                adapter
+                for adapter in self._adapters
+                if adapter.name in states
+                and states[adapter.name].backfill_done
+                and not stats[adapter.name].error
+            ),
+            key=lambda adapter: states[adapter.name].last_reconcile_at,
+        )
+        for adapter in due:
+            if _past(deadline):
+                break
+            state = states[adapter.name]
+            try:
+                stats[adapter.name].reconciled_rows = self._run_coverage_reconcile(
+                    adapter, state, deadline
+                )
+            except Exception as exc:  # noqa: BLE001 - a sweep must never fail the run
+                # Reconcile is a repair pass over data every other pass already
+                # delivered. Failing the run on it would turn a self-healing
+                # mechanism into an outage, so it reports and yields.
+                logger.exception("timeline coverage reconcile failed for %s", adapter.name)
 
         if failed:
             raise TimelineSyncError(
