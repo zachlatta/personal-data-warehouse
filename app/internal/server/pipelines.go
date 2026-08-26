@@ -24,6 +24,8 @@ const (
 	pipelinesAdapterMaxRows   = 500
 	pipelinesCollationMaxRows = 2000
 	pipelinesSearchMaxRows    = 10
+	pipelinesSlackMaxRows     = 100
+	pipelinesPlaidMaxRows     = 200
 )
 
 var pipelineHealthSQL = `
@@ -78,6 +80,29 @@ SELECT object_id, scope, object_name, status, finding, detail, provider,
 FROM ` + warehouse.SQLRelation("marts_collation_health") + `
 ORDER BY scope, object_name`
 
+// Level 5: per-source detectors. These exist because level 1 AGGREGATES a
+// source into one row and that is exactly how two outages hid. Slack rolls up
+// as a single pipeline, and ~19k public-channel messages a day kept it `ok`
+// through a total group-DM outage; Plaid rolls up the same way, and a re-link
+// that minted a second live Item double-counted net worth while the pipeline
+// stayed green. Both had a detector in SQL and neither appeared on this page,
+// so the page disagreed with the warehouse about what "healthy" means.
+var pipelineSlackConversationHealthSQL = `
+SELECT account, team_id, conversation_type, conversation_count, archived_count,
+       live_count, refreshed_count, refreshed_fraction,
+       oldest_conversation_synced_at, newest_conversation_synced_at,
+       discovery_age_seconds, expected_cycle_seconds, discovery_status,
+       last_discovery_at, newest_message_at, message_age_seconds, status
+FROM ` + warehouse.SQLRelation("marts_ops_slack_conversation_health") + `
+ORDER BY status, conversation_type`
+
+var pipelinePlaidItemHealthSQL = `
+SELECT account, item_id, institution_name, linked_at, synced_at,
+       error_code, error_type, error_message, status, account_count,
+       account_names, newest_transaction_at, transaction_age_seconds
+FROM ` + warehouse.SQLRelation("marts_ops_plaid_item_health") + `
+ORDER BY status, institution_name`
+
 var pipelineSearchHealthSQL = `
 SELECT component, status, model, configured, pgvector_available,
        timeline_max_seq, chunk_cursor_seq, seq_lag, caught_up,
@@ -116,6 +141,8 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 				"adapters":   []map[string]any{},
 				"collation":  []map[string]any{},
 				"search":     []map[string]any{},
+				"slack":      []map[string]any{},
+				"plaid":      []map[string]any{},
 				"server_now": s.now().UTC().Format(time.RFC3339Nano),
 				"pending":    true,
 			})
@@ -131,7 +158,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 		httpError(w, http.StatusInternalServerError, "pipeline table freshness query failed")
 		return
 	}
-	// The three levels below the pipeline roll-up degrade independently. Each
+	// The levels below the pipeline roll-up degrade independently. Each
 	// one is provisioned by a different ensure path and a different collector,
 	// so a deploy can legitimately have the pipeline views before the mart or
 	// collation snapshot exists. Answering 500 for the whole dashboard because
@@ -141,6 +168,8 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	adapters := s.optionalRows(r, "timeline adapter health", pipelineAdapterHealthSQL, pipelinesAdapterMaxRows)
 	collation := s.optionalRows(r, "collation health", pipelineCollationHealthSQL, pipelinesCollationMaxRows)
 	search := s.optionalRows(r, "search health", pipelineSearchHealthSQL, pipelinesSearchMaxRows)
+	slack := s.optionalRows(r, "slack conversation health", pipelineSlackConversationHealthSQL, pipelinesSlackMaxRows)
+	plaid := s.optionalRows(r, "plaid item health", pipelinePlaidItemHealthSQL, pipelinesPlaidMaxRows)
 	writeJSON(w, map[string]any{
 		"pipelines":  nonNilRows(pipelines.Rows),
 		"tables":     nonNilRows(tables.Rows),
@@ -148,6 +177,8 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 		"adapters":   adapters,
 		"collation":  collation,
 		"search":     search,
+		"slack":      slack,
+		"plaid":      plaid,
 		"server_now": s.now().UTC().Format(time.RFC3339Nano),
 	})
 }

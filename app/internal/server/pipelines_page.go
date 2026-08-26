@@ -176,6 +176,8 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   <div id="marts"></div>
   <div id="adapters"></div>
   <div id="search"></div>
+  <div id="slack"></div>
+  <div id="plaid"></div>
   <div id="collation"></div>
   <div id="status"></div>
   <div id="legend"></div>
@@ -236,12 +238,21 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     ["marts", "marts — the read interface, judged on the freshness of what it reads"],
     ["adapters", "timeline adapters — is THIS kind of data reaching timeline.events"],
     ["search", "search — do chunks and embeddings converge with the timeline"],
+    // Per-source detectors. They are here because level 1 AGGREGATES a source
+    // into one row, and that is how both of these outages hid: ~19k
+    // public-channel messages a day kept Slack ok through a total group-DM
+    // outage, and a Plaid re-link that minted a second live Item double-counted
+    // net worth while the pipeline stayed green. Both had a SQL detector and
+    // neither was on this page, so the page disagreed with the warehouse about
+    // what healthy means.
+    ["slack", "slack conversations — the SHARE re-listed per type, not the newest stamp"],
+    ["plaid", "plaid items — which institution stops updating when it breaks"],
     ["collation", "integrity — collation drift and unique-index divergence"]
   ];
 
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
-    pipelines: [], tables: [], marts: [], adapters: [], search: [], collation: [],
+    pipelines: [], tables: [], marts: [], adapters: [], search: [], slack: [], plaid: [], collation: [],
     skew: 0, filter: "", attentionOnly: false, open: {}
   };
 
@@ -358,6 +369,8 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       .concat(state.marts)
       .concat(state.adapters)
       .concat(state.search)
+      .concat(state.slack)
+      .concat(state.plaid)
       .concat(state.collation);
   }
 
@@ -721,6 +734,42 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       ], s.last_error || (!s.configured ? "hybrid falls back to keyword: embeddings unconfigured" : ""));
   }
 
+  function slackConversationNode(s) {
+    // refreshed_fraction is THE number. Not max(synced_at): a walk that
+    // restarts at page 1 re-stamps the first 200 rows every hour and looks
+    // perfect while the tail is months old, which is exactly how 172 group DMs
+    // and 1,948 public channels went missing for three months. Not the oldest
+    // row either: ~1% were archived upstream and can never be re-listed, so
+    // that rule is permanently red.
+    var pct = s.refreshed_fraction === null || s.refreshed_fraction === undefined
+      ? "unknown" : (Number(s.refreshed_fraction) * 100).toFixed(1) + "%";
+    return healthRow(s, s.conversation_type,
+      rows(s.live_count) + " live",
+      [
+        ["re-listed", pct,
+          s.refreshed_count + " of " + s.live_count +
+          " re-listed within one discovery cycle — the share, not the newest stamp", false],
+        ["discovery", s.discovery_status || "unknown",
+          s.last_discovery_at ? "last walk " + ago(ageOf(s.last_discovery_at)) + " ago" : "never walked", true],
+        ["newest message", s.newest_message_at ? ago(ageOf(s.newest_message_at)) + " ago" : "none",
+          "context only: mpim legitimately has zero-message days, so this is never the alarm", true]
+      ], "");
+  }
+
+  function plaidItemNode(p) {
+    return healthRow(p, p.institution_name || p.item_id,
+      rows(p.account_count) + " accounts",
+      [
+        ["synced", p.synced_at ? ago(ageOf(p.synced_at)) + " ago" : "never", stamp(p.synced_at), false],
+        ["newest txn", p.newest_transaction_at ? ago(ageOf(p.newest_transaction_at)) + " ago" : "none",
+          "Capital One holds only 90 days and never pending rows; that is the bank, not a gap", true],
+        ["accounts", p.account_names || "—", "what stops updating when this Item breaks", true]
+      ],
+      p.error_message || (p.status === "action_required"
+        ? "re-run: pdw ingest plaid link  for this institution, then check for a DUPLICATE item"
+        : ""));
+  }
+
   function renderSection(id, heading, items, nodeFn, sortFn) {
     var node = el(id);
     node.textContent = "";
@@ -743,9 +792,11 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     renderSection("marts", LEVELS[0][1], state.marts, martNode);
     renderSection("adapters", LEVELS[1][1], state.adapters, adapterNode);
     renderSection("search", LEVELS[2][1], state.search, searchNode);
+    renderSection("slack", LEVELS[3][1], state.slack, slackConversationNode);
+    renderSection("plaid", LEVELS[4][1], state.plaid, plaidItemNode);
     // The database's own collation row first: it is the finding the other rows
     // corroborate, and it is the one that says this database cannot warn itself.
-    renderSection("collation", LEVELS[3][1], state.collation, collationNode,
+    renderSection("collation", LEVELS[5][1], state.collation, collationNode,
       function (a, b) {
         if ((a.scope === "database") !== (b.scope === "database")) {
           return a.scope === "database" ? -1 : 1;
@@ -848,6 +899,8 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       state.marts = body.marts || [];
       state.adapters = body.adapters || [];
       state.search = body.search || [];
+      state.slack = body.slack || [];
+      state.plaid = body.plaid || [];
       state.collation = body.collation || [];
       state.skew = body.server_now ? new Date(body.server_now).getTime() - Date.now() : 0;
       el("status").textContent = "";

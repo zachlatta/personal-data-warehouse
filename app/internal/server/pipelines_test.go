@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
@@ -502,5 +503,50 @@ func TestPipelinesPageNormalizesPostgresArrayLiterals(t *testing.T) {
 	}
 	if !strings.Contains(pipelinesPageHTML, "list(m.input_tables)") {
 		t.Fatal("the marts row must normalize input_tables")
+	}
+}
+
+// TestPipelinesPageCoversEveryOpsHealthView pins web/SQL parity.
+//
+// C7 says pipeline health is inspectable "via SQL and web". It drifted:
+// marts_ops.slack_conversation_health and marts_ops.plaid_item_health existed
+// in SQL and appeared nowhere on /pipelines. Those two are not incidental —
+// they are the detectors built BECAUSE the level-1 roll-up hid an outage.
+// Slack aggregates as one pipeline and ~19k public-channel messages a day kept
+// it green through a total group-DM outage; a Plaid re-link minted a second
+// live Item and double-counted net worth while the pipeline stayed green.
+// A health page that omits exactly the detectors written for the failures the
+// page could not see is worse than no page.
+func TestPipelinesPageCoversEveryOpsHealthView(t *testing.T) {
+	source, err := os.ReadFile("pipelines.go")
+	if err != nil {
+		t.Fatalf("read pipelines.go: %v", err)
+	}
+	page, err := os.ReadFile("pipelines_page.go")
+	if err != nil {
+		t.Fatalf("read pipelines_page.go: %v", err)
+	}
+	// Every marts_ops health view the warehouse publishes must be queried by
+	// the API and rendered by the page.
+	for _, view := range []struct{ catalogID, pageKey string }{
+		{"marts_pipeline_health", "pipelines"},
+		{"marts_pipeline_table_freshness", "tables"},
+		{"marts_mart_view_health", "marts"},
+		{"marts_timeline_adapter_health", "adapters"},
+		{"marts_collation_health", "collation"},
+		{"marts_search_health", "search"},
+		{"marts_ops_slack_conversation_health", "slack"},
+		{"marts_ops_plaid_item_health", "plaid"},
+	} {
+		if !strings.Contains(string(source), view.catalogID) {
+			t.Errorf("/api/pipelines does not query %s; it is inspectable in SQL and invisible on the web", view.catalogID)
+		}
+		// The page reaches a level either as a rendered section keyed by name
+		// or as state.<key>; pipelines and tables are the primary view and are
+		// not in the LEVELS list.
+		if !strings.Contains(string(page), `"`+view.pageKey+`"`) &&
+			!strings.Contains(string(page), "state."+view.pageKey) {
+			t.Errorf("the /pipelines page does not render the %q level", view.pageKey)
+		}
 	}
 }
