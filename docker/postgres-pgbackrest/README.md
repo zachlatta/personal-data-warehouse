@@ -86,6 +86,7 @@ PGBACKREST_REPO1_S3_URI_STYLE=path
 PGBACKREST_REPO1_PATH=/personal-data-warehouse
 PGBACKREST_REPO1_CIPHER_PASS=...
 PGBACKREST_IO_TIMEOUT=600
+PGBACKREST_ARCHIVE_TIMEOUT=1800
 ```
 
 The image defaults to client-side AES-256 encryption:
@@ -96,6 +97,17 @@ PGBACKREST_REPO1_CIPHER_TYPE=aes-256-cbc
 
 Keep `PGBACKREST_REPO1_CIPHER_PASS` somewhere outside Coolify as well. Without
 that value, encrypted backups cannot be restored.
+
+`archive-timeout` is a **separate** budget and defaults to 60 seconds in pgBackRest.
+It governs the wait for the WAL segment that `backup` forces after `pg_backup_start`,
+not ordinary I/O, so raising `io-timeout` alone does not cover it. On this HDD-backed
+repository WAL pushes measure 5.7-200.3 seconds, and the 60-second default aborted
+**every** backup between 2026-08-25 and 2026-08-26 with `ERROR: [082]: WAL segment ...
+was not archived before the 60000ms timeout` while `pgbackrest info` reported
+`status: error (no valid backups)`. WAL archiving itself kept working throughout, which
+is why the outage was invisible. Do not confuse this with `POSTGRES_ARCHIVE_TIMEOUT`,
+which is PostgreSQL's own `archive_timeout` (how often an idle server forces a segment
+switch).
 
 The generated config uses a 600-second I/O timeout by default. The Garage S3
 repository is backed by an HDD array, where a saturated but healthy read can
