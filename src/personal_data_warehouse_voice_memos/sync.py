@@ -7,6 +7,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 import threading
 
+from personal_data_warehouse_voice_memos.voice_memos_app import (
+    ensure_voice_memos_app_running,
+)
 from personal_data_warehouse_voice_memos.scanner import (
     VoiceMemoFileCandidate,
     VoiceMemoRecording,
@@ -89,6 +92,11 @@ class VoiceMemosUploadRunner:
         self._before_upload_check = before_upload_check
 
     def sync(self) -> VoiceMemosUploadSummary:
+        # Before trusting what the store contains, make sure the store is still
+        # being fed. macOS stops pulling Voice Memos iCloud changes when
+        # voicememod and the app are both quit, and the uploader cannot tell
+        # that apart from "Zach recorded nothing" -- both are selected=0.
+        ensure_voice_memos_app_running(self._recordings_path, self._logger)
         self._logger.info(
             "Scanning Voice Memos in %s for extensions: %s",
             self._recordings_path,
