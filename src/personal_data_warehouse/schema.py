@@ -1764,16 +1764,6 @@ WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS = (
     "sync_version",
 )
 
-WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS = (
-    "account",
-    "activity_id",
-    "sample_at",
-    "heart_rate",
-    "raw_json",
-    "synced_at",
-    "sync_version",
-)
-
 WHOOP_PRIVATE_JOURNAL_ENTRY_COLUMNS = (
     "account",
     # User-local calendar day the entry was logged for, not an instant.
@@ -1828,6 +1818,13 @@ WHOOP_PRIVATE_SYNC_STATE_COLUMNS = (
     # Hash of the exact session rejected with a permanent auth error, so the
     # schedule skips only while that same dead credential is still installed.
     "credential_sha256",
+    # What this collection's stored rows depend on beyond the window they cover
+    # -- today, the heart-rate grain. A run that reads a different signature
+    # restarts that collection's backfill instead of resuming a cursor that has
+    # already reached its floor, which is the only way a grain change reaches
+    # rows the walk is finished with. Same contract as timeline adapter_signature.
+    # Appended, never inserted: the writer below positions its values by index.
+    "collection_signature",
 )
 
 #: The captured browser session. This tuple is the Python half of a table the

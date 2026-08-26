@@ -103,11 +103,17 @@ DEFAULT_WHOOP_PRIVATE_BACKFILL_WINDOW_DAYS = 14
 # this, so an early floor costs one empty window, not a wrong answer.
 DEFAULT_WHOOP_PRIVATE_FULL_SYNC_START = "2015-01-01T00:00:00Z"
 DEFAULT_WHOOP_PRIVATE_CYCLES_PAGE_LIMIT = 25
-# Heart rate is the expensive collection: minute grain is 1,440 points a day.
-# One run covers `chunk_hours * chunks_per_run` of backfill plus the recent
-# window, which is what keeps a */15 schedule inside the rate limit.
+# Heart rate is the expensive collection: six-second grain is 14,400 points a
+# day, and one six-hour chunk is 3,600 of them (~150 KB of JSON). One run covers
+# `chunk_hours * chunks_per_run` of backfill plus the recent window.
+#
+# 48 chunks is twelve days a run. That is sized against the WALK, not the tick:
+# the private API allows 2,000 requests per five minutes and a run spends ~49 of
+# them, so the limit is nowhere near the binding constraint -- what matters is
+# that a year of history is ~30 runs rather than ~180, so a grain change or a
+# fresh account is hours of catching up instead of days.
 DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNK_HOURS = 6
-DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNKS_PER_RUN = 8
+DEFAULT_WHOOP_PRIVATE_HEART_RATE_CHUNKS_PER_RUN = 48
 DEFAULT_WHOOP_PRIVATE_HEART_RATE_RECENT_HOURS = 6
 DEFAULT_WHOOP_PRIVATE_JOURNAL_DAYS_PER_RUN = 7
 DEFAULT_WHOOP_PRIVATE_DOCUMENTS_LOOKBACK_DAYS = 3

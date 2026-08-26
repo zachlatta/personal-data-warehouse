@@ -9,10 +9,15 @@ journal, and the trend metrics that have no public endpoint. See
 
 Four things in this module look arbitrary and are not:
 
-* **Six-second heart rate is workout-scoped; minute-grain runs continuously.**
+* **Six-second heart rate runs continuously, and there is only one grid.**
   ``metrics-service`` accepts only ``step`` 6, 60 or 600 (everything else is an
-  HTTP 400), and step 6 is 600 points an hour -- 14,400 a day. The workout's
-  ``during`` bounds are where that resolution is worth having.
+  HTTP 400), and it serves step 6 for ANY window, not only inside a workout --
+  verified against the live API on 2026-08-26 at one, sixty and two hundred and
+  forty days back. So the whole history is collected at 6s: 14,400 points a day,
+  ~5.2M rows a year, and no second workout-scoped copy of the same readings.
+  ``collection_signature`` in ``ops.whoop_private_sync_state`` is what made the
+  switch a re-walk rather than a seam -- a changed grain restarts that
+  collection's backfill, exactly as ``adapter_signature`` does for the timeline.
 * **``during`` / ``days`` / ``optimal_sleep_times`` are PostgreSQL range
   literals**, not timestamps. They are parsed, never cast.
 * **Tier-2 (BFF) payloads go to ``documents`` as raw JSON.** They are UI
@@ -69,7 +74,6 @@ EPOCH_DATE = date(1970, 1, 1)
 WHOOP_PRIVATE_COLLECTIONS = (
     "cycles",
     "sleep_events",
-    "workout_heart_rate",
     "heart_rate",
     "journal",
     "sports",
@@ -83,10 +87,10 @@ WHOOP_PRIVATE_STATUS_ACTION_REQUIRED = "action_required"
 #: is a clean early end to a run, not a failure to page on.
 WHOOP_PRIVATE_STATUS_RATE_LIMITED = "rate_limited"
 
-#: metrics-service accepts only 6/60/600. Minute grain is affordable for every
-#: hour of every day; six-second grain is not, so it is workout-scoped.
-WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS = 60
-WHOOP_PRIVATE_WORKOUT_HEART_RATE_STEP_SECONDS = 6
+#: metrics-service accepts only 6/60/600, and serves 6 for any window. This is
+#: the ONE grain the heart-rate series is stored at; changing it changes
+#: `whoop_private_collection_signature` and re-walks every day of history.
+WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS = 6
 
 PUBLISH_SESSION_HINT = (
     "run `pdw whoop publish-session` on the Mac whose Chrome holds an "
@@ -245,6 +249,36 @@ def plan_windows(
         sync_type=sync_type,
         backfill_complete=not backfilling,
     )
+
+
+def whoop_private_collection_signature(collection: str) -> str:
+    """What a collection's stored rows depend on, beyond the window they cover.
+
+    A cursor answers "how far back have we walked"; it cannot answer "walked
+    asking WHAT". When the request that produced the rows changes -- the
+    heart-rate grain is the case that exists -- resuming the cursor leaves every
+    historic row at the old answer and nothing ever revisits them, because the
+    walk has already reached its floor. Storing the signature beside the cursor
+    turns that into an automatic re-walk on the next tick, with no manual
+    force-full-sync and no operator who has to know. It is the same contract
+    ``adapter_signature`` gives a timeline adapter.
+
+    An empty string means the collection's rows depend on nothing but their
+    window, which is true of every collection but this one.
+    """
+    if collection == "heart_rate":
+        return f"step={WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS}"
+    return ""
+
+
+def stored_signature(state: Mapping[str, Any] | None) -> str:
+    """The signature a previous run recorded. Absent reads as empty.
+
+    An existing database predates the column, so every row reads "" and every
+    collection whose signature is non-empty re-walks exactly once. That is the
+    intended migration, not an accident of the default.
+    """
+    return str((state or {}).get("collection_signature", "") or "")
 
 
 def chunk_window(window: SyncWindow, span: timedelta) -> list[SyncWindow]:
@@ -528,32 +562,6 @@ def heart_rate_samples_to_rows(
     return rows
 
 
-def workout_heart_rate_samples_to_rows(
-    *,
-    account: str,
-    activity_id: str,
-    payload: Any,
-    synced_at: datetime,
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for point in _metric_values(payload):
-        heart_rate = _int(point.get("data"))
-        if heart_rate <= 0:
-            continue
-        rows.append(
-            {
-                "account": account,
-                "activity_id": activity_id,
-                "sample_at": _epoch_millis(point.get("time")),
-                "heart_rate": heart_rate,
-                "raw_json": dict(point),
-                "synced_at": synced_at,
-                "sync_version": sync_version_from_datetime(synced_at),
-            }
-        )
-    return rows
-
-
 #: The day's answers come back under one of these keys depending on whether the
 #: draft exists; the endpoint is a mobile BFF, so tolerate the wrappers.
 _JOURNAL_ENTRY_KEYS = ("entries", "journal_entries", "responses", "drafts", "records", "answers")
@@ -794,6 +802,7 @@ class WhoopPrivateSyncRunner:
         for collection in WHOOP_PRIVATE_COLLECTIONS:
             remaining.remove(collection)
             state = state_by_key.get((account, collection))
+            signature = whoop_private_collection_signature(collection)
             try:
                 written, sync_type, watermark = self._sync_collection(
                     collection=collection,
@@ -802,6 +811,7 @@ class WhoopPrivateSyncRunner:
                     identity=identity,
                     state=state,
                     synced_at=synced_at,
+                    signature=signature,
                 )
             except WhoopPrivateAuthError as error:
                 # The session is global: every remaining collection is dead too.
@@ -817,6 +827,10 @@ class WhoopPrivateSyncRunner:
                         status=WHOOP_PRIVATE_STATUS_ACTION_REQUIRED,
                         error=truncate_error(self._redact(str(reason), session)),
                         updated_at=synced_at,
+                        # A run that wrote nothing has re-walked nothing: claiming
+                        # the current signature here would retire the re-walk
+                        # before it happened.
+                        collection_signature=stored_signature(state_by_key.get((account, pending))),
                     )
                 self._logger.warning(reason)
                 raise WhoopPrivateActionRequiredError(reason) from error
@@ -829,6 +843,7 @@ class WhoopPrivateSyncRunner:
                     status=WHOOP_PRIVATE_STATUS_RATE_LIMITED,
                     error=truncate_error(str(error)),
                     updated_at=synced_at,
+                    collection_signature=stored_signature(state),
                 )
                 self._logger.warning(
                     "WHOOP private API rate limited during %s; ending this run cleanly", collection
@@ -844,6 +859,7 @@ class WhoopPrivateSyncRunner:
                     status=WHOOP_PRIVATE_STATUS_FAILED,
                     error=truncate_error(self._redact(str(error), session)),
                     updated_at=synced_at,
+                    collection_signature=stored_signature(state),
                 )
                 failures.append(f"{collection}: {self._redact(str(error), session)}")
                 continue
@@ -858,6 +874,7 @@ class WhoopPrivateSyncRunner:
                 status=WHOOP_PRIVATE_STATUS_OK,
                 error="",
                 updated_at=synced_at,
+                collection_signature=signature,
             )
 
         if failures:
@@ -875,25 +892,33 @@ class WhoopPrivateSyncRunner:
         identity: WhoopPrivateIdentity,
         state: Mapping[str, Any] | None,
         synced_at: datetime,
+        signature: str = "",
     ) -> tuple[int, str, datetime]:
         handler = {
             "cycles": self._sync_cycles,
             "sleep_events": self._sync_sleep_events,
-            "workout_heart_rate": self._sync_workout_heart_rate,
             "heart_rate": self._sync_heart_rate,
             "journal": self._sync_journal,
             "sports": self._sync_sports,
             "documents": self._sync_documents,
         }[collection]
-        return handler(config=config, client=client, identity=identity, state=state, synced_at=synced_at)
+        return handler(
+            config=config,
+            client=client,
+            identity=identity,
+            state=state,
+            synced_at=synced_at,
+            signature=signature,
+        )
 
-    def _sync_cycles(self, *, config, client, identity, state, synced_at):
+    def _sync_cycles(self, *, config, client, identity, state, synced_at, signature=""):
         plan = self._plan(
             state=state,
             config=config,
             now=synced_at,
             backfill_span=timedelta(days=config.backfill_window_days),
             lookback=timedelta(days=config.incremental_lookback_days),
+            signature=signature,
         )
         account = config.account
         self._sleep_ids = []
@@ -951,7 +976,7 @@ class WhoopPrivateSyncRunner:
             self._warehouse.insert_whoop_private_workouts(workouts)
         return len(cycles) + len(sleeps) + len(recoveries) + len(workouts)
 
-    def _sync_sleep_events(self, *, config, client, identity, state, synced_at):
+    def _sync_sleep_events(self, *, config, client, identity, state, synced_at, signature=""):
         written = 0
         rows: list[dict[str, Any]] = []
         for activity_id in _unique(self._sleep_ids)[: config.max_sleep_event_requests]:
@@ -969,30 +994,27 @@ class WhoopPrivateSyncRunner:
             written = len(rows)
         return written, "follows_cycles", self._cycles_watermark(state, synced_at)
 
-    def _sync_workout_heart_rate(self, *, config, client, identity, state, synced_at):
-        rows: list[dict[str, Any]] = []
-        for activity_id, start, end in self._workout_windows[: config.max_workout_requests]:
-            # Six-second grain is affordable exactly here: a workout is bounded,
-            # and its `during` bounds came from the range literal, parsed.
-            payload = client.heart_rate(
-                user_id=identity.user_id,
-                start=start,
-                end=end,
-                step=WHOOP_PRIVATE_WORKOUT_HEART_RATE_STEP_SECONDS,
-            )
-            rows.extend(
-                workout_heart_rate_samples_to_rows(
-                    account=config.account,
-                    activity_id=activity_id,
-                    payload=payload,
-                    synced_at=synced_at,
-                )
-            )
-        if rows:
-            self._warehouse.insert_whoop_private_workout_heart_rate_samples(rows)
-        return len(rows), "follows_cycles", self._cycles_watermark(state, synced_at)
+    def _sync_heart_rate(self, *, config, client, identity, state, synced_at, signature=""):
+        """Every hour of the account's life, at the one grain, chunk by chunk.
 
-    def _sync_heart_rate(self, *, config, client, identity, state, synced_at):
+        Three things here are the difference between this and a naive loop, and
+        each of them was a real problem first:
+
+        * **A chunk is written before the next is fetched.** At 6s a six-hour
+          chunk is 3,600 points carrying their own raw_json, and a run's budget
+          is dozens of chunks; accumulating them all before one insert was
+          affordable at minute grain and is not now.
+        * **The stale grain is deleted over exactly the window just written,
+          after it is written.** A 60s sample colliding with a 6s sample on the
+          primary key loses to it, but one whose millisecond offset misses the
+          6s grid survives beside it and double-counts that minute in every
+          average. Deleting after the insert means the series is never briefly
+          empty.
+        * **The floor is the account's first cycle**, not `full_sync_start`. A
+          member has no heart rate before they had a WHOOP, and production spent
+          real runs walking an account whose first cycle is 2025-10-23 back to
+          2025-02-03 asking for windows that cannot contain a reading.
+        """
         chunk = timedelta(hours=config.heart_rate_chunk_hours)
         plan = self._plan(
             state=state,
@@ -1000,8 +1022,10 @@ class WhoopPrivateSyncRunner:
             now=synced_at,
             backfill_span=chunk * config.heart_rate_chunks_per_run,
             lookback=timedelta(hours=config.heart_rate_recent_hours),
+            signature=signature,
+            floor=self._heart_rate_floor(config),
         )
-        rows: list[dict[str, Any]] = []
+        written = 0
         for window in plan.windows:
             for slice_ in chunk_window(window, chunk):
                 payload = client.heart_rate(
@@ -1010,25 +1034,47 @@ class WhoopPrivateSyncRunner:
                     end=slice_.end,
                     step=WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS,
                 )
-                rows.extend(
-                    heart_rate_samples_to_rows(
-                        account=config.account,
-                        payload=payload,
-                        step_seconds=WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS,
-                        synced_at=synced_at,
-                    )
+                rows = heart_rate_samples_to_rows(
+                    account=config.account,
+                    payload=payload,
+                    step_seconds=WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS,
+                    synced_at=synced_at,
                 )
-        if rows:
-            self._warehouse.insert_whoop_private_heart_rate_samples(rows)
-        return len(rows), plan.sync_type, plan.next_cursor
+                if rows:
+                    self._warehouse.insert_whoop_private_heart_rate_samples(rows)
+                    written += len(rows)
+                _call_supported(
+                    self._warehouse.delete_whoop_private_heart_rate_samples,
+                    account=config.account,
+                    start=slice_.start,
+                    end=slice_.end,
+                    keep_step_seconds=WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS,
+                )
+        return written, plan.sync_type, plan.next_cursor
 
-    def _sync_journal(self, *, config, client, identity, state, synced_at):
+    def _heart_rate_floor(self, config: WhoopPrivateConfig) -> datetime | None:
+        """The account's first cycle day, or None to keep the configured floor.
+
+        Cycles sync first, so on a fresh database this floor tightens as the
+        cycle backfill walks back -- and because the cursor is stored where it
+        stopped, a heart-rate walk that declared itself complete against a
+        too-recent floor simply resumes once the real one appears.
+        """
+        earliest = _call_supported(
+            self._warehouse.whoop_private_earliest_cycle_day, account=config.account
+        )
+        if earliest is None:
+            return None
+        return datetime(earliest.year, earliest.month, earliest.day, tzinfo=UTC)
+
+    def _sync_journal(self, *, config, client, identity, state, synced_at, signature=""):
         plan = self._plan(
             state=state,
             config=config,
             now=synced_at,
             backfill_span=timedelta(days=config.journal_days_per_run),
             lookback=timedelta(days=1),
+            signature=signature,
         )
         offset = parse_timezone_offset(identity.timezone_offset)
         days = local_days(plan.windows, offset)[: config.journal_days_per_run + 1]
@@ -1044,7 +1090,7 @@ class WhoopPrivateSyncRunner:
             self._warehouse.insert_whoop_private_journal_entries(rows)
         return len(rows), plan.sync_type, plan.next_cursor
 
-    def _sync_sports(self, *, config, client, identity, state, synced_at):
+    def _sync_sports(self, *, config, client, identity, state, synced_at, signature=""):
         rows = sports_to_rows(
             account=config.account,
             payload=client.sports_catalog(country_code=config.sports_country_code),
@@ -1108,7 +1154,7 @@ class WhoopPrivateSyncRunner:
             day -= timedelta(days=1)
         return wanted, stored
 
-    def _sync_documents(self, *, config, client, identity, state, synced_at):
+    def _sync_documents(self, *, config, client, identity, state, synced_at, signature=""):
         offset = parse_timezone_offset(identity.timezone_offset)
         today = local_day(synced_at, offset)
         recent = [
@@ -1196,15 +1242,36 @@ class WhoopPrivateSyncRunner:
 
     # -- plumbing ------------------------------------------------------
 
-    def _plan(self, *, state, config: WhoopPrivateConfig, now: datetime, backfill_span, lookback) -> SyncPlan:
-        floor = parse_rfc3339(config.full_sync_start)
-        if floor <= EPOCH_UTC:
-            floor = now - timedelta(days=3650)
-        cursor = EPOCH_UTC if config.force_full_sync else state_datetime(state, "watermark_updated_at")
+    def _plan(
+        self,
+        *,
+        state,
+        config: WhoopPrivateConfig,
+        now: datetime,
+        backfill_span,
+        lookback,
+        signature: str = "",
+        floor: datetime | None = None,
+    ) -> SyncPlan:
+        configured_floor = parse_rfc3339(config.full_sync_start)
+        if configured_floor <= EPOCH_UTC:
+            configured_floor = now - timedelta(days=3650)
+        # A collection's own floor may only tighten the configured one: it is
+        # there to stop a walk early, never to reach back past what was asked
+        # for.
+        if floor is not None and floor > configured_floor:
+            configured_floor = floor
+        if config.force_full_sync or stored_signature(state) != signature:
+            # A different signature means the stored rows were produced by a
+            # different question. Resuming the cursor would leave every one of
+            # them at the old answer forever.
+            cursor = EPOCH_UTC
+        else:
+            cursor = state_datetime(state, "watermark_updated_at")
         return plan_windows(
             cursor=cursor,
             now=now,
-            floor=floor,
+            floor=configured_floor,
             backfill_span=backfill_span,
             lookback=lookback,
         )
@@ -1273,6 +1340,7 @@ class WhoopPrivateSyncRunner:
                 status=status,
                 error=truncate_error(error),
                 updated_at=updated_at,
+                collection_signature=stored_signature(state),
             )
 
     def _fail_action_required(self, *, account, state_by_key, reason, updated_at) -> None:

@@ -1049,19 +1049,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Continuous heart rate at the metrics-service grain (step_seconds is 6, 60 or 600). ~525k rows/year; range-scan it by (account, sample_at), the primary key."
-    },
-    {
-      "id": "whoop_private_workout_heart_rate_samples",
-      "kind": "table",
-      "layer": "base",
-      "domain": "whoop_private",
-      "schema": "base_whoop_private",
-      "name": "workout_heart_rate_samples",
-      "discoverable": true,
-      "query_access": "public",
-      "secret": false,
-      "comment": "6-second heart rate scoped to one workout. Cross-workout time ranges use the (account, sample_at) index, not the activity-leading primary key."
+      "comment": "Continuous heart rate for every hour of the account's life at the six-second grain metrics-service serves (step_seconds is 6; 60 and 600 are retired grains that no longer land here). ~14,400 rows a day and ~5.2M a year; range-scan it by (account, sample_at), the primary key. This is the only heart-rate series - for the readings inside one workout, read marts_health.workout_heart_rate_samples, which joins it to that workout's own bounds."
     },
     {
       "id": "whoop_private_journal_entries",
@@ -2888,6 +2876,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "One row per workout, conforming base_whoop.workouts with base_whoop_private.workouts. sport_name is the readable name from the private source's sport catalog, with the provider's own token beside it in sport_slug. strain is the displayed 0-21 score. Every exposed timestamp translates the 1970-01-01 epoch sentinel to NULL."
+    },
+    {
+      "id": "marts_health_workout_heart_rate_samples",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "health",
+      "schema": "marts_health",
+      "name": "workout_heart_rate_samples",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Six-second heart rate scoped to one workout: marts_health.workouts joined to the one continuous series on the workout's own start/end bounds. elapsed_seconds is the offset into the workout, for plotting. Replaced the separate base_whoop_private.workout_heart_rate_samples table on 2026-08-26, when the continuous series moved to the same six-second grain and that table became a second copy of identical readings. Filter by workout_id or a time range; it is a range join over millions of samples."
     }
   ],
   "renamed_timeline_source_tables": {

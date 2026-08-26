@@ -456,7 +456,6 @@ def test_whoop_private_is_registered_in_both_registries() -> None:
         "whoop_private_recoveries",
         "whoop_private_workouts",
         "whoop_private_heart_rate_samples",
-        "whoop_private_workout_heart_rate_samples",
         "whoop_private_sleep_events",
         "whoop_private_documents",
     }

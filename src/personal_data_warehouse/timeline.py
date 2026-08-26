@@ -2612,10 +2612,8 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
         "whoop_private_sleeps", "the hypnogram: one row per LIGHT/REM/SWS/DISTURBANCE stage"
     ),
     "whoop_private_heart_rate_samples": _detail(
-        "whoop_cycles", "per-6-second heart rate time series under the day's cycle"
-    ),
-    "whoop_private_workout_heart_rate_samples": _detail(
-        "whoop_private_workouts", "per-sample heart rate inside one workout"
+        "whoop_cycles",
+        "the one per-6-second heart rate series, every hour of every day, under the day's cycle",
     ),
     "whoop_private_documents": _detail(
         "whoop_cycles",

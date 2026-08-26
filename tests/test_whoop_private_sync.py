@@ -25,7 +25,6 @@ from personal_data_warehouse.whoop_private_sync import (
     WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS,
     WHOOP_PRIVATE_STATUS_ACTION_REQUIRED,
     WHOOP_PRIVATE_STATUS_RATE_LIMITED,
-    WHOOP_PRIVATE_WORKOUT_HEART_RATE_STEP_SECONDS,
     WhoopPrivateActionRequiredError,
     WhoopPrivateSyncRunner,
     cycle_to_row,
@@ -40,9 +39,9 @@ from personal_data_warehouse.whoop_private_sync import (
     sleep_event_rows,
     sleep_to_row,
     sports_to_rows,
+    whoop_private_collection_signature,
     whoop_private_credential_sha256,
     whoop_private_reauthorization_skip_reason,
-    workout_heart_rate_samples_to_rows,
     workout_to_row,
 )
 
@@ -87,7 +86,8 @@ class FakeWhoopPrivateWarehouse:
         self.workouts: list[dict] = []
         self.sleep_events: list[dict] = []
         self.heart_rate_samples: list[dict] = []
-        self.workout_heart_rate_samples: list[dict] = []
+        self.heart_rate_batches: list[list[dict]] = []
+        self.heart_rate_deletes: list[dict] = []
         self.journal_entries: list[dict] = []
         self.sports: list[dict] = []
         self.documents: list[dict] = []
@@ -148,9 +148,13 @@ class FakeWhoopPrivateWarehouse:
 
     def insert_whoop_private_heart_rate_samples(self, rows):
         self.heart_rate_samples.extend(rows)
+        self.heart_rate_batches.append(list(rows))
 
-    def insert_whoop_private_workout_heart_rate_samples(self, rows):
-        self.workout_heart_rate_samples.extend(rows)
+    def delete_whoop_private_heart_rate_samples(self, *, account, start, end, keep_step_seconds):
+        self.heart_rate_deletes.append(
+            {"account": account, "start": start, "end": end, "keep_step_seconds": keep_step_seconds}
+        )
+        return 0
 
     def insert_whoop_private_journal_entries(self, rows):
         self.journal_entries.extend(rows)
@@ -561,22 +565,16 @@ def test_sleep_event_rows_index_the_hypnogram_in_order() -> None:
 def test_heart_rate_rows_convert_millisecond_epochs_and_record_the_grain() -> None:
     payload = {
         "name": "heart_rate",
-        "values": [{"time": 1_787_000_000_000, "data": 61}, {"time": 1_787_000_060_000, "data": 0}],
+        "values": [{"time": 1_787_000_000_000, "data": 61}, {"time": 1_787_000_006_000, "data": 0}],
     }
 
-    rows = heart_rate_samples_to_rows(account=ACCOUNT, payload=payload, step_seconds=60, synced_at=NOW)
+    rows = heart_rate_samples_to_rows(account=ACCOUNT, payload=payload, step_seconds=6, synced_at=NOW)
 
     assert rows[0]["sample_at"] == datetime.fromtimestamp(1_787_000_000, tz=UTC)
     assert rows[0]["heart_rate"] == 61
-    assert rows[0]["step_seconds"] == 60
+    assert rows[0]["step_seconds"] == 6
     # A zero reading is a real gap marker, not a row to invent.
     assert len(rows) == 1
-
-    workout_rows = workout_heart_rate_samples_to_rows(
-        account=ACCOUNT, activity_id="workout-xyz", payload=payload, synced_at=NOW
-    )
-    assert workout_rows[0]["activity_id"] == "workout-xyz"
-    assert workout_rows[0]["heart_rate"] == 61
 
 
 def test_journal_and_sport_rows_carry_their_keys() -> None:
@@ -689,7 +687,7 @@ def test_sync_writes_every_collection_and_records_a_watermark_per_collection(mon
     assert warehouse.ensure_called
     assert warehouse.cycles and warehouse.sleeps and warehouse.recoveries and warehouse.workouts
     assert warehouse.sleep_events and warehouse.heart_rate_samples
-    assert warehouse.workout_heart_rate_samples and warehouse.journal_entries
+    assert warehouse.journal_entries
     assert warehouse.sports and warehouse.documents
     assert {row["collection"] for row in warehouse.state_rows} == set(WHOOP_PRIVATE_COLLECTIONS)
     assert all(row["status"] == "ok" for row in warehouse.state_rows)
@@ -697,28 +695,166 @@ def test_sync_writes_every_collection_and_records_a_watermark_per_collection(mon
     assert public_whoop_private_sync_summary(summaries[0])["has_token"] is False
 
 
-def test_minute_grain_runs_continuously_and_six_second_grain_only_inside_workouts(monkeypatch) -> None:
-    """metrics-service accepts only 6/60/600, and 6s over a whole day is
-    600 points an hour. Six-second detail is therefore workout-scoped."""
+def test_six_second_grain_runs_continuously_not_only_inside_workouts(monkeypatch) -> None:
+    """Every hour of every day at the finest grain metrics-service serves.
+
+    This used to be the other way round: minute grain all day, six-second grain
+    only inside a workout's `during` bounds. The private API in fact serves true
+    six-second heart rate for ANY window -- verified against the live API on
+    2026-08-26 at one day, sixty days and two hundred and forty days back -- so
+    the workout scoping was buying nothing but a second copy of the same
+    readings in a second table. There is now one grid, and it is 6.
+    """
     warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
     client = FakeWhoopPrivateClient()
 
     _run(monkeypatch, warehouse=warehouse, client=client)
 
     heart_rate_calls = [params for endpoint, params in client.calls if endpoint == "heart_rate"]
-    continuous = [call for call in heart_rate_calls if call["step"] == WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS]
-    workout_scoped = [
-        call for call in heart_rate_calls if call["step"] == WHOOP_PRIVATE_WORKOUT_HEART_RATE_STEP_SECONDS
-    ]
 
-    assert WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS == 60
-    assert WHOOP_PRIVATE_WORKOUT_HEART_RATE_STEP_SECONDS == 6
-    assert continuous, "minute-grain heart rate must be collected continuously"
-    assert len(workout_scoped) == 1
-    # Exactly the workout's `during` bounds, parsed from the range notation.
-    assert workout_scoped[0]["start"] == datetime(2026, 8, 22, 18, tzinfo=UTC)
-    assert workout_scoped[0]["end"] == datetime(2026, 8, 22, 19, tzinfo=UTC)
-    assert warehouse.workout_heart_rate_samples[0]["activity_id"] == "workout-xyz"
+    assert WHOOP_PRIVATE_HEART_RATE_STEP_SECONDS == 6
+    assert heart_rate_calls, "continuous heart rate must be collected"
+    assert {call["step"] for call in heart_rate_calls} == {6}
+    assert {row["step_seconds"] for row in warehouse.heart_rate_samples} == {6}
+    # The workout-scoped collection is gone, not merely unused: a second table
+    # of the same readings is a second thing to ask, and one of them would rot.
+    assert "workout_heart_rate" not in WHOOP_PRIVATE_COLLECTIONS
+    assert not hasattr(warehouse, "insert_whoop_private_workout_heart_rate_samples")
+
+
+def test_each_chunk_is_written_before_the_next_is_fetched(monkeypatch) -> None:
+    """Six-second grain is 3,600 points per six-hour chunk.
+
+    Accumulating a whole run's chunks before one insert was affordable at minute
+    grain and is not at 6s: a run's budget of chunks would hold hundreds of
+    thousands of rows, each carrying its own raw_json, in memory before the
+    first write. Each chunk is flushed as it lands.
+    """
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+
+    _run(monkeypatch, warehouse=warehouse, client=FakeWhoopPrivateClient())
+
+    assert len(warehouse.heart_rate_batches) > 1
+    assert all(batch for batch in warehouse.heart_rate_batches)
+
+
+def test_a_rewalk_drops_the_samples_left_behind_at_the_old_grain(monkeypatch) -> None:
+    """Two grids in one table double-count every aggregate.
+
+    A 60s sample and a 6s sample landing on the same instant collide on the
+    primary key and the finer one wins, but a 60s sample whose timestamp is not
+    on the 6s grid -- window boundaries drift by milliseconds -- survives beside
+    it, and then avg(heart_rate) over any range weights those minutes twice. The
+    stale grain is deleted over exactly the window just written, AFTER it is
+    written, so the series is never briefly empty.
+    """
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+
+    _run(monkeypatch, warehouse=warehouse, client=FakeWhoopPrivateClient())
+
+    assert warehouse.heart_rate_deletes
+    assert {delete["keep_step_seconds"] for delete in warehouse.heart_rate_deletes} == {6}
+    written = [
+        (min(row["sample_at"] for row in batch), max(row["sample_at"] for row in batch))
+        for batch in warehouse.heart_rate_batches
+    ]
+    for oldest, newest in written:
+        assert any(
+            delete["start"] <= oldest and delete["end"] >= newest
+            for delete in warehouse.heart_rate_deletes
+        ), "every written window must have had its stale grain cleared"
+
+
+def test_changing_the_heart_rate_grain_rewalks_every_day_it_owns(monkeypatch) -> None:
+    """The stored signature is what makes the re-walk automatic.
+
+    Switching the step is not a going-forward change: every historic row is at
+    the old grain, and a cursor that has already reached the floor would never
+    revisit them. The collection records what its rows depend on, and a run that
+    reads a different signature starts the backfill again from now -- the same
+    contract `adapter_signature` gives the timeline.
+    """
+    finished = {
+        (ACCOUNT, "heart_rate"): {
+            # A cursor that has already walked back past the floor: without a
+            # signature this collection is DONE and re-walks nothing, forever.
+            "watermark_updated_at": datetime(2025, 1, 1, tzinfo=UTC),
+            "last_sync_type": "backfill",
+            "status": "ok",
+            "collection_signature": "step=60",
+            "updated_at": NOW,
+        }
+    }
+    warehouse = FakeWhoopPrivateWarehouse(state=finished, session=_session_row())
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    heart_rate_calls = [params for endpoint, params in client.calls if endpoint == "heart_rate"]
+    assert heart_rate_calls, "a changed grain must re-fetch"
+    assert max(call["end"] for call in heart_rate_calls) == NOW, "the re-walk restarts at now"
+    recorded = next(row for row in warehouse.state_rows if row["collection"] == "heart_rate")
+    assert recorded["collection_signature"] == whoop_private_collection_signature("heart_rate")
+    assert recorded["collection_signature"] == "step=6"
+    # Not resumed from 2025-01-01: the cursor is back to one backfill span
+    # below now, which is where a walk that starts over stores itself.
+    assert recorded["watermark_updated_at"] == NOW - timedelta(hours=12)
+
+
+def test_an_unchanged_signature_resumes_instead_of_restarting(monkeypatch) -> None:
+    cursor = NOW - timedelta(days=2)
+    state = {
+        (ACCOUNT, "heart_rate"): {
+            "watermark_updated_at": cursor,
+            "last_sync_type": "backfill",
+            "status": "ok",
+            "collection_signature": whoop_private_collection_signature("heart_rate"),
+            "updated_at": NOW,
+        }
+    }
+    warehouse = FakeWhoopPrivateWarehouse(state=state, session=_session_row())
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    backfill_ends = [
+        params["end"]
+        for endpoint, params in client.calls
+        if endpoint == "heart_rate" and params["end"] <= cursor
+    ]
+    assert backfill_ends, "the backfill must resume at the stored watermark"
+    assert max(backfill_ends) == cursor
+
+
+def test_the_heart_rate_backfill_stops_at_the_accounts_first_cycle(monkeypatch) -> None:
+    """A member has no heart rate before they had a WHOOP.
+
+    Left at `full_sync_start`, the walk spends ten years of runs asking for
+    windows that cannot contain a reading -- which is exactly what production
+    did, reaching 2025-02-03 for an account whose first cycle is 2025-10-23.
+    """
+    first_cycle = date(2026, 8, 20)
+    state = {
+        (ACCOUNT, "heart_rate"): {
+            "watermark_updated_at": datetime(2026, 8, 20, 6, tzinfo=UTC),
+            "last_sync_type": "backfill",
+            "status": "ok",
+            "collection_signature": whoop_private_collection_signature("heart_rate"),
+            "updated_at": NOW,
+        }
+    }
+    warehouse = FakeWhoopPrivateWarehouse(
+        state=state, session=_session_row(), earliest_cycle_day=first_cycle
+    )
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    floor = datetime(2026, 8, 20, tzinfo=UTC)
+    heart_rate_calls = [params for endpoint, params in client.calls if endpoint == "heart_rate"]
+    assert all(call["start"] >= floor for call in heart_rate_calls)
+    recorded = next(row for row in warehouse.state_rows if row["collection"] == "heart_rate")
+    assert recorded["watermark_updated_at"] == floor
 
 
 def test_tier_two_endpoints_land_in_documents_with_kind_and_key(monkeypatch) -> None:
@@ -929,16 +1065,7 @@ def test_every_row_mapper_fills_exactly_its_warehouse_column_tuple() -> None:
             heart_rate_samples_to_rows(
                 account=ACCOUNT,
                 payload={"values": [{"time": 1_787_000_000_000, "data": 61}]},
-                step_seconds=60,
-                synced_at=synced_at,
-            )[0],
-        ),
-        (
-            schema.WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS,
-            workout_heart_rate_samples_to_rows(
-                account=ACCOUNT,
-                activity_id="workout-xyz",
-                payload={"values": [{"time": 1_787_000_000_000, "data": 61}]},
+                step_seconds=6,
                 synced_at=synced_at,
             )[0],
         ),

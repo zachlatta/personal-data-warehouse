@@ -137,9 +137,13 @@ def test_catalog_object_counts_match_the_target_map() -> None:
     for obj in CATALOG.objects:
         by_layer[obj.layer] = by_layer.get(obj.layer, 0) + 1
     assert by_layer == {
-        # +10 base: the whoop_private source (base_whoop_private), which adds
-        # the time series the public WHOOP API has no endpoint for.
-        "base": 62,
+        # +9 base: the whoop_private source (base_whoop_private), which adds
+        # the time series the public WHOOP API has no endpoint for. It was 10
+        # until 2026-08-26, when continuous heart rate moved to the same
+        # six-second grain the workout-scoped table held and that table became a
+        # second copy of identical readings; the workout view of the one series
+        # is marts_health.workout_heart_rate_samples.
+        "base": 61,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 23,
@@ -158,7 +162,10 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # read interface over BOTH WHOOP sources. Reading either raw schema alone
         # is wrong in a different direction, and their units disagree (private
         # HRV in SECONDS, public in milliseconds).
-        "marts": 43,
+        # +1 marts: marts_health.workout_heart_rate_samples, which replaced the
+        # retired base table of the same name by joining the one continuous
+        # series to each workout's own bounds.
+        "marts": 44,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

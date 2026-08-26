@@ -1091,9 +1091,10 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
         "whoop_private",
         "synced_at",
         "sample_at",
-        note="the per-6-second series; only synced_at leads an index, so event time may read as skipped",
+        note="the one per-6-second series, every hour of every day: ~14,400 rows a day, "
+        "with whoop_private_heart_rate_samples_time_idx leading on sample_at so the event-time "
+        "probe stays cheap as the heap grows",
     ),
-    "whoop_private_workout_heart_rate_samples": _data("whoop_private", "synced_at", "sample_at"),
     "whoop_private_journal_entries": _data("whoop_private", "synced_at", "day"),
     "whoop_private_documents": _data(
         "whoop_private",

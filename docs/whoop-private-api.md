@@ -84,6 +84,14 @@ Backfill is not limit-constrained.
 return HTTP 400. Verified: `step=6` yields 600 points/hour at exactly 6.0s spacing,
 `step=60` at 60.0s.
 
+**`step=6` works for ANY window, not only inside a workout.** Verified against the
+live API on 2026-08-26 on quiet non-workout windows one day, sixty days and two
+hundred and forty days back: 1,200 points per two hours at 6.0s spacing every
+time, with values varying point to point rather than the endpoint padding a
+coarser series. That is why the sync collects the whole history at 6 and keeps no
+workout-scoped second copy — see the WHOOP private-API section of `AGENTS.md`.
+A zero `data` value is a gap marker, not a reading, and is dropped.
+
 **`heart_rate` is the only metric name.** `hrv`, `rmssd`, `spo2`, `skin_temp`,
 `respiratory_rate` and `steps` all return 400 at a step that works for heart rate.
 There is no continuous HRV series here, contrary to what the iOS write-ups imply —

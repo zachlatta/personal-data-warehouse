@@ -2050,9 +2050,13 @@ independently and one of them dying is never hidden by the other still writing.
 ### SQL starting points
 
 ```sql
--- the day's minute-by-minute heart rate
+-- the day's heart rate, one reading every six seconds
 SELECT sample_at, heart_rate FROM base_whoop_private.heart_rate_samples
 WHERE sample_at >= now() - interval '1 day' ORDER BY sample_at;
+
+-- the readings inside one workout, offset from its start
+SELECT elapsed_seconds, heart_rate FROM marts_health.workout_heart_rate_samples
+WHERE workout_id = '<id>' ORDER BY sample_at;
 
 -- last night's hypnogram
 SELECT stage, started_at, ended_at FROM base_whoop_private.sleep_events
@@ -2061,8 +2065,8 @@ ORDER BY started_at DESC LIMIT 50;
 
 | relation | what it holds |
 | --- | --- |
-| `base_whoop_private.heart_rate_samples` | continuous heart rate (step 6s / 60s / 600s — the API accepts no other step) |
-| `base_whoop_private.workout_heart_rate_samples` | the same series scoped to one workout |
+| `base_whoop_private.heart_rate_samples` | continuous heart rate at 6s, every hour of every day (`step` 6/60/600 are the only values the API accepts; 6 is the only one stored) |
+| `marts_health.workout_heart_rate_samples` | that same series joined to each workout's own bounds, with `elapsed_seconds` |
 | `base_whoop_private.sleep_events` | the hypnogram: one row per LIGHT / REM / SWS / DISTURBANCES stage |
 | `base_whoop_private.journal_entries` | the journal answers Zach typed; **the only table here with a timeline adapter** |
 | `base_whoop_private.cycles`, `.sleeps`, `.recoveries`, `.workouts` | high-resolution copies of the public rows (strain components, sleep debt, HRV/RHR components, zone durations, GPS) |
@@ -2089,6 +2093,37 @@ watermark to repair. That budget is set by bytes, not by the rate limit: a recen
 the other two, so lower it (not the kind list) if the pull ever needs to be lighter. Those
 are *wire* bytes and they overstate the disk by ~13x: the walk finished 2026-08-24 at the
 first cycle (2025-10-23) with 306 days of each kind stored in a 75 MB table.
+
+**Heart rate is one series at one grain, and it covers every hour, not just
+workouts.** Until 2026-08-26 it was minute-grain all day plus a six-second copy
+scoped to workouts, in a second table. The private API in fact serves true
+six-second heart rate for **any** window — verified against the live API that day
+at one, sixty and two hundred and forty days back — so the workout scoping was
+buying nothing but a duplicate of the same readings, and that
+workout-scoped table was retired (dropped in place by `ensure_whoop_private_tables`;
+`marts_health.workout_heart_rate_samples` is the replacement, and it is a view). It is 14,400 rows a
+day and ~5.2M a year, which is the trade that was made deliberately: storage is
+recoverable, an unrecorded resolution is not.
+
+**Changing the grain re-walks the history, by itself.**
+`ops.whoop_private_sync_state.collection_signature` records what a collection's
+rows depend on beyond the window they cover, exactly as `adapter_signature` does
+for a timeline adapter. A cursor alone cannot express this: heart rate had
+already walked back past the account's first cycle, so it was *finished*, and
+resuming it would have left every historic row at the old grain forever. A run
+that reads a different signature starts that collection's backfill again from
+now — no `force_full_sync`, no operator who has to know. The walk is bounded by
+`WHOOP_PRIVATE_HEART_RATE_CHUNKS_PER_RUN` (48 six-hour chunks, twelve days a
+run), so a year of history is ~30 runs. The old grain is deleted over exactly
+each window the new one has just written, *after* it is written: two grids in one
+table double-count every minute whose old timestamp misses the new grid, and
+deleting first would leave the series briefly empty.
+
+**The backfill floor is the account's first cycle, not `full_sync_start`.** A
+member has no heart rate before they had a WHOOP. Left at the configured floor
+the walk spends ten years of runs asking for windows that cannot contain a
+reading — production had reached 2025-02-03 for an account whose first cycle is
+2025-10-23.
 
 **Only `journal_entries` reaches `timeline.events`** (adapter `whoop_private_journal`,
 source `whoop_private`, priority `self` — Zach opened the app and answered the question

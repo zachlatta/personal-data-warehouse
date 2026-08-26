@@ -19,7 +19,7 @@ API, sat in prod uncataloged. The same shape (a stale duplicate of
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from dotenv import load_dotenv
@@ -52,6 +52,7 @@ from personal_data_warehouse.schema import (
     WHATSAPP_MESSAGE_COLUMNS,
     WHOOP_CYCLE_COLUMNS,
     WHOOP_PRIVATE_CYCLE_COLUMNS,
+    WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS,
     WHOOP_PRIVATE_RECOVERY_COLUMNS,
     WHOOP_PRIVATE_SLEEP_COLUMNS,
     WHOOP_PRIVATE_SPORT_COLUMNS,
@@ -1396,6 +1397,54 @@ def _seed_health(wh: PostgresWarehouse) -> None:
             )
         ]
     )
+
+
+def test_the_workout_heart_rate_view_windows_the_one_series_by_the_workout(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The replacement for the retired workout-scoped table.
+
+    Continuous heart rate is collected at the same six-second grain that table
+    held, for every hour rather than only inside a workout, so a second copy of
+    those readings was two things to ask and one of them would have rotted.
+    "HR during workout X" is now this join, and it must select exactly the
+    workout's own bounds -- end-exclusive, or the first sample of whatever came
+    next is attributed to the workout.
+    """
+    _seed_health(warehouse)
+    # TS..TS+1h is workout-1's window; the seeded workout ends at 13:00.
+    warehouse.insert_whoop_private_heart_rate_samples(
+        [
+            _row(
+                WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS,
+                account="zach",
+                sample_at=sample_at,
+                heart_rate=heart_rate,
+                step_seconds=6,
+                synced_at=TS,
+                sync_version=1,
+            )
+            for sample_at, heart_rate in (
+                (TS - timedelta(minutes=1), 58),  # before it started
+                (TS, 121),
+                (TS + timedelta(minutes=30), 154),
+                (TS.replace(hour=13), 96),  # exactly the end bound: excluded
+                (TS.replace(hour=14), 61),  # after it ended
+            )
+        ]
+    )
+
+    rows = sorted(
+        (row for row in _dicts(warehouse, "marts_health_workout_heart_rate_samples")),
+        key=lambda row: row["sample_at"],
+    )
+
+    assert [row["heart_rate"] for row in rows] == [121, 154]
+    assert [row["elapsed_seconds"] for row in rows] == [0, 1800]
+    assert {row["workout_id"] for row in rows} == {"workout-1"}
+    # The readable name comes through the mart, not the public row's slug.
+    assert {row["sport_name"] for row in rows} == {"Running"}
+    assert {row["step_seconds"] for row in rows} == {6}
 
 
 def test_health_mart_conforms_both_whoop_sources(warehouse: PostgresWarehouse) -> None:

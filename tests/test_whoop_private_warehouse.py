@@ -17,7 +17,7 @@ from dataclasses import replace
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from threading import Event
 
 import pytest
@@ -46,7 +46,6 @@ from personal_data_warehouse.schema import (
     WHOOP_PRIVATE_SPORT_COLUMNS,
     WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
     WHOOP_PRIVATE_WORKOUT_COLUMNS,
-    WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS,
     whoop_private_hrv_rmssd_milli,
 )
 
@@ -68,11 +67,6 @@ EXPECTED_TABLES: dict[str, tuple[str, str, tuple[str, ...]]] = {
         "base_whoop_private",
         "heart_rate_samples",
         ("account", "sample_at"),
-    ),
-    "whoop_private_workout_heart_rate_samples": (
-        "base_whoop_private",
-        "workout_heart_rate_samples",
-        ("account", "activity_id", "sample_at"),
     ),
     "whoop_private_journal_entries": (
         "base_whoop_private",
@@ -217,25 +211,24 @@ def test_every_data_table_has_an_index_leading_with_the_freshness_column() -> No
         assert (table, "synced_at") in leading, table
 
 
-def test_the_sample_tables_are_indexed_for_time_range_scans() -> None:
-    """The two tables the source exists for.
+def test_the_sample_table_is_indexed_for_time_range_scans() -> None:
+    """The one table the source exists for.
 
-    heart_rate_samples is ~525k rows/year; its primary key IS the time-range
-    index. The workout samples' primary key leads with activity_id, so a
-    cross-workout time range needs its own index or it degenerates to a seq
-    scan.
+    At six-second grain heart_rate_samples is ~5.2M rows a year, so both things
+    asked of it have to be index work: its primary key IS the time-range index
+    for an account, and a separate sample_at index is what keeps the freshness
+    collector's max(sample_at) from being a full-heap scan it refuses to run.
     """
     assert POSTGRES_TABLES["whoop_private_heart_rate_samples"].primary_key == (
         "account",
         "sample_at",
     )
-    assert ("whoop_private_workout_heart_rate_samples", "account") in _leading_index_columns()
     time_index = next(
         index
         for index in POSTGRES_INDEXES
-        if index.name == "whoop_private_workout_hr_samples_time_idx"
+        if index.name == "whoop_private_heart_rate_samples_time_idx"
     )
-    assert "sample_at" in index_sql_columns(time_index.sql)
+    assert index_sql_columns(time_index.sql).startswith("(sample_at")
 
 
 def index_sql_columns(sql: str) -> str:
@@ -365,28 +358,89 @@ def test_samples_upsert_by_their_natural_key(warehouse: PostgresWarehouse) -> No
         (ACCOUNT,),
     ) == [(62, 6)]
 
-    warehouse.insert_whoop_private_workout_heart_rate_samples(
+
+
+def test_a_retired_grain_is_deleted_over_exactly_the_window_rewritten(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """One table, one grid.
+
+    A retired-grain sample that lands on the current grid loses the upsert to
+    the finer reading; one whose millisecond offset misses it survives beside it
+    and weights that instant twice in every average. The delete is scoped to the
+    window just written -- a sample outside it has not been replaced yet and
+    must not be removed, or the series goes briefly empty behind the walk.
+    """
+    warehouse.ensure_whoop_private_tables()
+    synced_at = datetime(2026, 8, 23, 12, tzinfo=UTC)
+    start = datetime(2026, 8, 23, 6, tzinfo=UTC)
+    end = datetime(2026, 8, 23, 12, tzinfo=UTC)
+
+    def sample(sample_at: datetime, step_seconds: int) -> dict:
+        return {
+            "account": ACCOUNT,
+            "sample_at": sample_at,
+            "heart_rate": 60,
+            "step_seconds": step_seconds,
+            "raw_json": {},
+            "synced_at": synced_at,
+            "sync_version": 1,
+        }
+
+    warehouse.insert_whoop_private_heart_rate_samples(
         [
-            {
-                "account": ACCOUNT,
-                "activity_id": "workout-1",
-                "sample_at": sample_at,
-                "heart_rate": 148,
-                "raw_json": {},
-                "synced_at": synced_at,
-                "sync_version": 1,
-            }
+            sample(start + timedelta(seconds=31), 60),  # stale grain, inside
+            sample(start + timedelta(seconds=36), 6),  # current grain, inside
+            sample(start - timedelta(minutes=1), 60),  # stale grain, OUTSIDE
+            sample(end, 60),  # stale grain, on the exclusive upper bound
         ]
     )
+
+    warehouse.delete_whoop_private_heart_rate_samples(
+        account=ACCOUNT, start=start, end=end, keep_step_seconds=6
+    )
+
+    assert sorted(
+        warehouse._query(
+            "SELECT sample_at, step_seconds FROM @whoop_private_heart_rate_samples "
+            "WHERE account = %s ORDER BY sample_at",
+            (ACCOUNT,),
+        )
+    ) == sorted(
+        [
+            (start - timedelta(minutes=1), 60),
+            (start + timedelta(seconds=36), 6),
+            (end, 60),
+        ]
+    )
+
+
+def test_the_retired_workout_sample_table_is_dropped_in_place(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A table absent from the catalog but present in the database is invisible.
+
+    Nothing in TIMELINE_TABLE_COVERAGE, TABLE_PIPELINES or the freshness
+    collector would ever mention it again, so it would sit there accumulating
+    nothing while looking like data. ensure_* drops it, which is what makes the
+    retirement reach a database that already has one.
+    """
+    warehouse.ensure_whoop_private_tables()
+    schema = warehouse._object_schema("whoop_private_heart_rate_samples")
+    warehouse._command(
+        f'CREATE TABLE IF NOT EXISTS "{schema}".workout_heart_rate_samples '
+        "(account text NOT NULL, activity_id text NOT NULL, PRIMARY KEY (account, activity_id))"
+    )
+
+    warehouse.ensure_whoop_private_tables()
+
     assert warehouse._query(
-        "SELECT activity_id, heart_rate FROM @whoop_private_workout_heart_rate_samples "
-        "WHERE account = %s AND sample_at >= %s AND sample_at < %s",
-        (ACCOUNT, datetime(2026, 8, 23, tzinfo=UTC), datetime(2026, 8, 24, tzinfo=UTC)),
-    ) == [("workout-1", 148)]
+        "SELECT to_regclass(%s)", (f"{schema}.workout_heart_rate_samples",)
+    ) == [(None,)]
 
 
 def test_every_insert_method_writes_its_table(warehouse: PostgresWarehouse) -> None:
-    """One row through each of the ten writers, so no method is only ever
+    """One row through each of the nine writers, so no method is only ever
 
     exercised against a fake. The row is built FROM the column tuple, so a
     column added later is written too rather than quietly skipped.
@@ -451,12 +505,6 @@ def test_every_insert_method_writes_its_table(warehouse: PostgresWarehouse) -> N
             "whoop_private_heart_rate_samples",
             WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS,
             {"sample_at": synced_at, "heart_rate": 60, "step_seconds": 6},
-        ),
-        (
-            warehouse.insert_whoop_private_workout_heart_rate_samples,
-            "whoop_private_workout_heart_rate_samples",
-            WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS,
-            {"activity_id": "workout-1", "sample_at": synced_at, "heart_rate": 150},
         ),
         (
             warehouse.insert_whoop_private_journal_entries,

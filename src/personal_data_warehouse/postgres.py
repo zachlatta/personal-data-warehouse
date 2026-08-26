@@ -117,7 +117,6 @@ from personal_data_warehouse.schema import (
     WHOOP_PRIVATE_SPORT_COLUMNS,
     WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
     WHOOP_PRIVATE_WORKOUT_COLUMNS,
-    WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS,
     WHOOP_PROFILE_COLUMNS,
     WHOOP_RECOVERY_COLUMNS,
     WHOOP_SLEEP_COLUMNS,
@@ -777,14 +776,6 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
             ("autovacuum_vacuum_scale_factor", "0.05"),
         ),
     ),
-    "whoop_private_workout_heart_rate_samples": TableSpec(
-        WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS,
-        ("account", "activity_id", "sample_at"),
-        storage_parameters=(
-            ("autovacuum_analyze_scale_factor", "0.02"),
-            ("autovacuum_vacuum_scale_factor", "0.05"),
-        ),
-    ),
     "whoop_private_journal_entries": TableSpec(
         WHOOP_PRIVATE_JOURNAL_ENTRY_COLUMNS,
         ("account", "day", "question_id"),
@@ -1434,21 +1425,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "ON @whoop_private_heart_rate_samples (sample_at DESC)",
     ),
     IndexSpec(
-        "whoop_private_workout_hr_samples_synced_idx",
-        "whoop_private_workout_heart_rate_samples",
-        "CREATE INDEX IF NOT EXISTS whoop_private_workout_hr_samples_synced_idx "
-        "ON @whoop_private_workout_heart_rate_samples (synced_at)",
-    ),
-    # The workout samples' primary key leads with activity_id, so "what was my
-    # heart rate between 09:00 and 10:00" cannot use it. This is the index that
-    # makes a cross-workout time range a range scan instead of a seq scan.
-    IndexSpec(
-        "whoop_private_workout_hr_samples_time_idx",
-        "whoop_private_workout_heart_rate_samples",
-        "CREATE INDEX IF NOT EXISTS whoop_private_workout_hr_samples_time_idx "
-        "ON @whoop_private_workout_heart_rate_samples (account, sample_at)",
-    ),
-    IndexSpec(
         "whoop_private_journal_entries_synced_idx",
         "whoop_private_journal_entries",
         "CREATE INDEX IF NOT EXISTS whoop_private_journal_entries_synced_idx "
@@ -1865,7 +1841,6 @@ JSONB_COLUMNS_BY_TABLE = {
     },
     "whoop_private_sleep_events": {"raw_json"},
     "whoop_private_heart_rate_samples": {"raw_json"},
-    "whoop_private_workout_heart_rate_samples": {"raw_json"},
     "whoop_private_journal_entries": {"raw_json"},
     "whoop_private_sports": {"raw_json"},
     # Tier-2 BFF payloads: faithful raw only. See docs/whoop-private-api.md --
@@ -2380,7 +2355,6 @@ _WHOOP_PRIVATE_TABLES = (
     "whoop_private_workouts",
     "whoop_private_sleep_events",
     "whoop_private_heart_rate_samples",
-    "whoop_private_workout_heart_rate_samples",
     "whoop_private_journal_entries",
     "whoop_private_sports",
     "whoop_private_documents",
@@ -3681,6 +3655,22 @@ class PostgresWarehouse:
             "ALTER TABLE @whoop_private_sessions ALTER COLUMN session_key SET DEFAULT 'default'"
         )
         self._command("ALTER TABLE @whoop_private_sessions ALTER COLUMN status SET DEFAULT 'ok'")
+        self._command(
+            "ALTER TABLE @whoop_private_sync_state "
+            "ADD COLUMN IF NOT EXISTS collection_signature text NOT NULL DEFAULT ''"
+        )
+        # Retired 2026-08-26: continuous heart rate is collected at the same
+        # six-second grain this table held, for every hour rather than only
+        # inside a workout, so it was an exact second copy of those readings.
+        # "HR during workout X" is marts_health.workout_heart_rate_samples,
+        # which joins the one series to the workout's own bounds. Dropped here
+        # rather than left orphaned: a table absent from the catalog but present
+        # in the database is invisible to every registry that would have noticed
+        # it going stale.
+        retired_schema = self._object_schema("whoop_private_heart_rate_samples")
+        self._raw_command(
+            f"DROP TABLE IF EXISTS {_identifier(retired_schema)}.workout_heart_rate_samples"
+        )
         self._ensure_health_marts_views()
 
     def _ensure_health_marts_views(self) -> None:
@@ -3721,6 +3711,9 @@ class PostgresWarehouse:
                 "whoop_private_sleeps",
                 "whoop_private_workouts",
                 "whoop_private_sports",
+                # marts_health.workout_heart_rate_samples reads it, and either
+                # source's ensure_* path may be the one that builds these views.
+                "whoop_private_heart_rate_samples",
             ]
         )
         epoch = "TIMESTAMPTZ '1970-01-01 00:00:00+00'"
@@ -3880,6 +3873,31 @@ class PostgresWarehouse:
               ON p.account = w.account AND p.activity_id = w.workout_id
             LEFT JOIN @whoop_private_sports sp
               ON sp.account = w.account AND sp.sport_id = w.sport_id
+            """,
+        )
+        self._ensure_view(
+            "marts_health_workout_heart_rate_samples",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_workout_heart_rate_samples AS
+            SELECT
+                w.account,
+                w.workout_id,
+                w.sport_name,
+                w.start_at AS workout_start_at,
+                w.end_at AS workout_end_at,
+                NULLIF(s.sample_at, {epoch}) AS sample_at,
+                EXTRACT(EPOCH FROM (s.sample_at - w.start_at))::bigint AS elapsed_seconds,
+                s.heart_rate,
+                s.step_seconds
+            FROM @marts_health_workouts w
+            JOIN @whoop_private_heart_rate_samples s
+              ON s.account = w.account
+             AND s.sample_at >= w.start_at
+             AND s.sample_at < w.end_at
+            -- A workout still running exposes end_at as NULL here (the raw row
+            -- holds the epoch sentinel), and an open-ended range is not a
+            -- window. It reappears the moment the workout is scored.
+            WHERE w.start_at IS NOT NULL AND w.end_at IS NOT NULL
             """,
         )
 
@@ -7035,11 +7053,21 @@ class PostgresWarehouse:
             WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS,
         )
 
-    def insert_whoop_private_workout_heart_rate_samples(self, rows: list[dict[str, Any]]) -> None:
-        self._insert_rows(
-            "whoop_private_workout_heart_rate_samples",
-            rows,
-            WHOOP_PRIVATE_WORKOUT_HEART_RATE_SAMPLE_COLUMNS,
+    def delete_whoop_private_heart_rate_samples(
+        self, *, account: str, start: datetime, end: datetime, keep_step_seconds: int
+    ) -> None:
+        """Clear any other grain over a window the current grain just covered.
+
+        The series is one grid. A sample at a retired step whose timestamp does
+        not land on the current grid survives the upsert -- window boundaries
+        drift by milliseconds -- and then avg(heart_rate) over any range weights
+        that instant twice. Called AFTER the window is written, so the series is
+        never briefly empty.
+        """
+        self._command(
+            "DELETE FROM @whoop_private_heart_rate_samples "
+            "WHERE account = %s AND sample_at >= %s AND sample_at < %s AND step_seconds <> %s",
+            (account, start, end, int(keep_step_seconds)),
         )
 
     def insert_whoop_private_journal_entries(self, rows: list[dict[str, Any]]) -> None:
@@ -7106,6 +7134,7 @@ class PostgresWarehouse:
         error: str,
         updated_at: datetime,
         credential_sha256: str = "",
+        collection_signature: str = "",
     ) -> None:
         self._insert(
             "whoop_private_sync_state",
@@ -7120,6 +7149,7 @@ class PostgresWarehouse:
                     updated_at,
                     int(_ensure_utc(updated_at).timestamp() * 1_000_000),
                     credential_sha256,
+                    collection_signature,
                 )
             ],
             WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
