@@ -209,10 +209,10 @@ with a newsletter. The enum's declaration order **is** the sort order, most atte
 | tier | what it means | typical rows |
 | --- | --- | --- |
 | `self` | Zach initiated it | his sent mail and messages, his notes and voice memos, his agent sessions, his own calendar events |
-| `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, a mention |
-| `cc` | real-people activity he is peripheral to | cc'd mail, channel traffic, big group threads |
-| `noise` | bulk or automated traffic | newsletters, notifications, bots, channels he is not a member of |
-| `background` | the warehouse's own machinery | enrichment runs, mutation workers, per-turn agent-session rows |
+| `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, a real `<@id>` ping, replies in a thread of his that is a conversation rather than an announcement |
+| `cc` | real-people activity he is peripheral to | cc'd mail, private team channels he sits in, big group threads, replies piling under his `<!channel>` broadcasts, people talking *about* him in public, others editing a file he owns |
+| `noise` | bulk or automated traffic | newsletters, notifications, bots, GitHub/CI relays, and public-channel chatter not aimed at him — **member or not** |
+| `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, per-turn agent-session rows, orchestrator-spawned agent sessions, Drive files other people change |
 
 ```sql
 SELECT event_ts, priority, source, actor, title, snippet

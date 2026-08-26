@@ -429,8 +429,8 @@ _GMAIL_BULK_SENDER_PATTERN = (
 )
 _GMAIL_AUTOMATED_SENDER_PATTERN = (
     "'(notifications?@|digest@|updates@|alerts?@|billing@|receipts?@|invoice|"
-    "statements?@|bank@|hcb@|dinobox@|sign@|bot@|replies\\+|info@|contact@|hello@|"
-    "support@|feedback@|service@|security@|account@|verify|apply@|jobs@|"
+    "statements?@|bank@|hcb@|dinobox@|sign@|bot@|metabase@|\\mfact\\w*@|replies\\+|info@|contact@|hello@|"
+    "support@|feedback@|service@|security@|accounts?@|verify|apply@|jobs@|"
     "calendar-notification@|\\mmail@|menu@|reports?@|abuse@|coolify@|deploy@|"
     "\\mci@|build@|@members\\.|"
     "@(email|mail|msg|notify|alert|news|marketing|info|update)[\\w-]*\\.|"
@@ -459,12 +459,38 @@ _GMAIL_OTP_SUBJECT_PATTERN = (
     "'(login code|verification code|security code|confirmation code|authentication code|"
     "confirm(ation)? code|one.?time|password reset|identification code|2fa)'"
 )
+# Google and Outlook both prefix auto-generated RSVP/cancellation mail with the
+# verb ("Accepted: ...", "Canceled: ...", "Tentative: ..."); the body is a
+# calendar stub, not a person writing.
 _GMAIL_RSVP_SUBJECT_PATTERN = (
-    "'^(accepted|declined|tentatively accepted|updated invitation|"
-    "canceled event|invitation)[: ]'"
+    "'^(accepted|declined|tentative(ly accepted)?|updated invitation|"
+    "cancell?ed( event)?|invitation)[: ]'"
 )
+# GitHub relays a bot's review under notifications@github.com, so the sender
+# cannot say it is a bot: the payload has to. "@x[bot] commented", "x[bot] left
+# a comment", Copilot's "was unable to review" all read as a reviewer to the
+# old pattern and landed at direct on Zach's own PRs (sampled 2026-08-26).
 _GMAIL_RELAYED_BOT_BODY_PATTERN = (
-    "'(\\[bot\\] left a comment|latest updates on your projects|dependabot)'"
+    "'(\\[bot\\]|latest updates on your projects|dependabot|"
+    "copilot (commented|was unable to review))'"
+)
+# GitHub's X-GitHub-Reason lands in the cc list as <reason>@noreply.github.com.
+# mention/author/assign/review_requested are the copies aimed at Zach;
+# push/ci_activity/state_change are the machinery copies; subscribed is a
+# thread he opted into but nobody addressed him in.
+_GMAIL_RELAY_REASON_ADDRESSED = (
+    "EXISTS (SELECT 1 FROM unnest(t.to_addresses || t.cc_addresses) a "
+    "        WHERE a ~* '(mention|author|assign|review_requested)@noreply\\.github\\.com')"
+)
+_GMAIL_RELAY_REASON_AUTOMATED = (
+    "EXISTS (SELECT 1 FROM unnest(t.to_addresses || t.cc_addresses) a "
+    "        WHERE a ~* '(push|ci_activity|state_change|security_alert)@noreply\\.github\\.com')"
+)
+# "Merged #12 into main", "Closed #7", "@who pushed 2 commits": a human did
+# something, but the mail is the platform reporting it, not the human writing.
+_GMAIL_RELAY_STATE_CHANGE = (
+    "((t.subject || ' ' || t.snippet) ~* "
+    "'(^|\\s)(merged|closed|reopened) #\\d+|pushed \\d+ commits?')"
 )
 _GMAIL_CI_SUBJECT_PATTERN = (
     "'(run failed|workflow run|deploy(ment)? (failed|succeeded)|build failed)'"
@@ -625,13 +651,17 @@ _GMAIL_EMAIL = _simple_adapter(
         # Relay services carrying a human's activity: mention/author copies are
         # directed at me; bot-authored payloads (CI, deploy status) are noise;
         # the rest is skim-worthy cc.
+        # Bot payloads are judged BEFORE the addressed-to-me copies: a review
+        # bot commenting on Zach's own PR arrives as an author copy, and it is
+        # still a machine talking.
         f"WHEN t.from_address ~* {_GMAIL_RELAY_SENDER_PATTERN} THEN "
-        "  CASE WHEN EXISTS (SELECT 1 FROM unnest(t.to_addresses || t.cc_addresses) a "
-        "                    WHERE a ILIKE '%%mention@noreply.github.com%%' "
-        "                       OR a ILIKE '%%author@noreply.github.com%%') THEN 'direct' "
-        f"       WHEN t.from_address ~* '\\[bot\\]' OR t.subject ~* {_GMAIL_CI_SUBJECT_PATTERN} "
+        f"  CASE WHEN t.from_address ~* '\\[bot\\]' OR t.subject ~* {_GMAIL_CI_SUBJECT_PATTERN} "
         f"         OR t.snippet ~* {_GMAIL_RELAYED_BOT_BODY_PATTERN} "
         "         OR t.subject ~* '^(re: )?\\[[^\\]]+\\] bump ' THEN 'noise' "
+        f"       WHEN {_GMAIL_RELAY_STATE_CHANGE} THEN "
+        f"         CASE WHEN {_GMAIL_RELAY_REASON_ADDRESSED} THEN 'cc' ELSE 'noise' END "
+        f"       WHEN {_GMAIL_RELAY_REASON_ADDRESSED} THEN 'direct' "
+        f"       WHEN {_GMAIL_RELAY_REASON_AUTOMATED} THEN 'noise' "
         "       ELSE 'cc' END "
         f"WHEN t.subject ~* {_GMAIL_RSVP_SUBJECT_PATTERN} THEN 'cc' "
         f"WHEN t.subject ~* {_GMAIL_OTP_SUBJECT_PATTERN} THEN 'noise' "
@@ -670,6 +700,28 @@ _SLACK_THREAD_ROOT_MINE = (
     "  AND z.conversation_id = t.conversation_id AND z.message_ts = t.thread_ts "
     "  AND z.user_id = ident.user_id AND z.is_deleted = 0))"
 )
+# Slack's own narration of membership/topic changes; never a person writing.
+_SLACK_SYSTEM_SUBTYPES = (
+    "('channel_join', 'channel_leave', 'channel_archive', 'channel_name', "
+    "'channel_purpose', 'channel_topic', 'group_join', 'group_leave')"
+)
+# The thread root is a broadcast, not a conversation: an announcement with
+# <!channel>/<!here>, or a thread that has grown past twenty replies. Replies
+# to Zach's announcement ("First", "sigh", a Q&A between two other people) are
+# not aimed at him even though he wrote the root -- measured 2026-08-26, every
+# reply in a 95-reply <!here> thread of his was 'direct'.
+_SLACK_THREAD_ROOT_BROADCAST = (
+    "(t.thread_ts <> '' AND EXISTS ("
+    "SELECT 1 FROM @slack_messages z "
+    "WHERE z.account = t.account AND z.team_id = t.team_id "
+    "  AND z.conversation_id = t.conversation_id AND z.message_ts = t.thread_ts "
+    "  AND (z.reply_count > 20 OR z.text ~ '<!(channel|here|everyone)>')))"
+)
+# A real Slack ping: the message carries his user id, so Slack itself notified
+# him. Distinct from his NAME in the text, which in a public channel is far more
+# often people talking about him ("doesn't zach mostly vibecode") than to him.
+_SLACK_ID_MENTION = "(ident.user_id <> '' AND t.text LIKE '%%<@' || ident.user_id || '>%%')"
+_SLACK_NAME_TEXT_MENTION = "(t.text ~* '\\m(zach|zrl|latta|zachlatta)\\M')"
 # Zach posted in this thread within the preceding 12 hours: the reply lands in
 # a conversation he is actively part of. (Unbounded thread participation
 # over-promoted: RSVP piles in announcement threads and day-old ship threads
@@ -699,6 +751,10 @@ def _slack_my_msgs_in_window(*, before: str, after: str, limit: int) -> str:
         f"                             AND t.message_datetime + interval '{after}'"
         "  AND z.account = t.account AND z.team_id = t.team_id"
         "  AND z.conversation_id = t.conversation_id AND z.is_deleted = 0"
+        # Slack narrating "<@me> has joined the channel" under his user id is
+        # not him taking part: without this, being added to a channel promoted
+        # its next six hours of chatter (sampled 2026-08-26).
+        f"  AND z.subtype NOT IN {_SLACK_SYSTEM_SUBTYPES}"
         f" LIMIT {limit}) win) "
     )
 
@@ -728,10 +784,6 @@ _SLACK_IS_BOT = (
     "(t.bot_id <> '' OR t.user_id LIKE 'USLACK%%' OR u.is_bot = 1 "
     " OR t.subtype LIKE 'bot%%' OR (t.user_id = '' AND t.username <> '') "
     f" OR {_SLACK_DISPLAY_NAME} ~* 'bot\\M')"
-)
-_SLACK_SYSTEM_SUBTYPES = (
-    "('channel_join', 'channel_leave', 'channel_archive', 'channel_name', "
-    "'channel_purpose', 'channel_topic', 'group_join', 'group_leave')"
 )
 _SLACK_MPIM_ROSTER = (
     "GREATEST(c.num_members, (SELECT count(*) FROM @slack_conversation_members m "
@@ -770,29 +822,36 @@ _SLACK_DM_CONTEXT = (
     " ORDER BY dm_peer.source_order, dm_peer.user_id LIMIT 1)"
 )
 
-# Benchmark-tuned ordering (sampling/rubric.md, 2026-07). Mine > bots (app DMs
-# relaying a human's action stay skim-worthy) > system messages > DMs >
-# mentions and name references > replies to/with him in threads > group DMs he
-# is engaged in > channel conversations he is actively part of > ambient
-# member channels > the workspace firehose. Two standing reversals from
-# sampling: "channels I post in a lot" must NOT promote (lounge-chatter
-# flood), and one drive-by message must not promote a busy channel's +/-6h —
-# participation means at least two of his messages in the window.
+# Tier semantics (re-audited 2026-08-26 against the definitions in AGENTS.md):
+# direct = a real person addressing HIM -- a DM, a real <@id> ping, a reply in
+# a thread of his that is a conversation rather than an announcement, a group
+# DM or channel exchange he is actively in, or his name used where addressing
+# him by name is plausible (private rooms, group DMs, or while he is engaged).
+# cc = real people he is peripheral to: private team channels he sits in,
+# group DMs he is not engaged in, replies piling under his broadcasts, and
+# people talking ABOUT him in public. noise = everything a public channel
+# says that is not aimed at him -- member or not; being in #lounge does not
+# make its chatter his. Two standing reversals from the 2026-07 sampling still
+# hold: "channels I post in a lot" must NOT promote (lounge-chatter flood), and
+# one drive-by message must not promote a busy channel's +/-6h -- participation
+# means at least two of his messages in the window. System subtypes are judged
+# before 'self': "<@me> has joined the channel" is Slack narrating, not him.
 _SLACK_MESSAGE_PRIORITY = (
     "CASE "
     f"WHEN {_SLACK_ATTACHMENT_ONLY_MESSAGE} THEN {TIMELINE_PRIORITY_BACKGROUND} "
+    f"WHEN t.subtype IN {_SLACK_SYSTEM_SUBTYPES} THEN 'noise' "
     "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 'self' "
     f"WHEN {_SLACK_IS_BOT} THEN "
     "  CASE WHEN c.is_im = 1 AND t.text ~* '(commented on|shared an item|replied to|"
     "mentioned you|upgrade request|invited you|assigned you)' THEN 'cc' ELSE 'noise' END "
-    f"WHEN t.subtype IN {_SLACK_SYSTEM_SUBTYPES} THEN 'noise' "
     "WHEN c.is_im = 1 THEN 'direct' "
-    "WHEN ident.user_id <> '' AND t.text LIKE '%%<@' || ident.user_id || '>%%' THEN 'direct' "
-    "WHEN t.text ~* '\\m(zrl|latta|zach latta|zachlatta)\\M' THEN 'direct' "
-    "WHEN t.text ~* '\\mzach\\M' AND (c.is_private = 1 "
-    f"  OR c.num_members <= 1000 OR {_SLACK_W6H} >= 1) THEN 'direct' "
-    f"WHEN {_SLACK_THREAD_ROOT_MINE} THEN 'direct' "
-    f"WHEN {_SLACK_MY_THREAD_RECENT} THEN 'direct' "
+    f"WHEN {_SLACK_ID_MENTION} THEN 'direct' "
+    f"WHEN {_SLACK_NAME_TEXT_MENTION} AND (c.is_mpim = 1 OR c.is_private = 1 "
+    f"  OR {_SLACK_W6H} >= 1 OR {_SLACK_THREAD_ROOT_MINE} OR {_SLACK_MY_THREAD_RECENT}) "
+    "  THEN 'direct' "
+    f"WHEN {_SLACK_THREAD_ROOT_MINE} OR {_SLACK_MY_THREAD_RECENT} THEN "
+    f"  CASE WHEN {_SLACK_THREAD_ROOT_BROADCAST} THEN 'cc' ELSE 'direct' END "
+    f"WHEN {_SLACK_NAME_TEXT_MENTION} THEN 'cc' "
     f"WHEN c.is_mpim = 1 THEN "
     f"  CASE WHEN {_SLACK_W6H} >= 1 OR {_SLACK_MPIM_ROSTER} BETWEEN 1 AND 5 "
     f"        OR {_SLACK_P3D} >= 3 THEN 'direct' ELSE 'cc' END "
@@ -801,7 +860,9 @@ _SLACK_MESSAGE_PRIORITY = (
     f"         OR ({_SLACK_W6H} >= 3 AND {_SLACK_P3D} >= 2)) THEN 'direct' "
     f"       WHEN c.is_private = 1 AND {_SLACK_MPIM_ROSTER} <= 20 "
     f"         AND {_SLACK_P24H} >= 1 THEN 'direct' "
-    "       ELSE 'cc' END "
+    "       WHEN c.is_private = 1 THEN 'cc' "
+    f"       WHEN {_SLACK_W6H} >= 1 THEN 'cc' "
+    "       ELSE 'noise' END "
     "ELSE 'noise' END"
 )
 
@@ -826,7 +887,8 @@ _SLACK_FILE_PRIORITY = (
     "                                    AND t.created_at + interval '6 hours' "
     "         AND z.account = t.account AND z.team_id = t.team_id "
     "         AND z.conversation_id = t.conversation_id AND z.is_deleted = 0 "
-    "       LIMIT 2) fw) >= 2 THEN 'direct' ELSE 'cc' END "
+    "       LIMIT 2) fw) >= 2 THEN 'direct' "
+    "       WHEN c.is_private = 1 THEN 'cc' ELSE 'noise' END "
     "ELSE 'noise' END"
 )
 # IM/MPIM checks come first: slack stores a user-id-ish "name" on DM
@@ -1423,6 +1485,10 @@ _CALENDAR_EVENT = _simple_adapter(
         "WHEN t.is_deleted <> 0 OR t.status = 'cancelled' THEN 'noise' "
         "WHEN t.organizer_email ILIKE '%%group.calendar.google.com%%' "
         "  OR t.organizer_email ILIKE '%%holiday%%' THEN 'noise' "
+        # Event platforms (lu.ma, Eventbrite, Meetup) send the invite from a
+        # robot; the human who listed the event never addressed him.
+        "WHEN t.organizer_email ~* '(calendar-invite@|no-?reply|invite@|eventbrite|"
+        "lu\\.ma|meetup\\.com)' THEN 'noise' "
         "WHEN t.description LIKE '%%͏%%' OR t.description LIKE '%%­%%' THEN 'noise' "
         f"WHEN {_CALENDAR_ORGANIZED_BY_ME} THEN "
         "  CASE WHEN t.summary LIKE '✈%%' THEN 'noise' ELSE 'self' END "
@@ -1475,7 +1541,10 @@ _DRIVE_FILE = _simple_adapter(
     ),
     search_text=_search_concat("t.name", "t.folder_path", "t.last_modifying_user", "txt.extracted_search_text"),
     # My own files edited by me are my actions; my files edited by someone
-    # else are directed at me; the rest of the corpus is ambient. Ownership
+    # else, and files I starred, keep me in the loop (cc); everything else
+    # changing in Drive is other people's work that does not concern me,
+    # which the tier definitions file as background -- nobody reaches Zach by
+    # editing a document, so this adapter never emits 'direct'. Ownership
     # matches the account email inside owners_json (the raw metadata's
     # lastModifyingUser.me flag is not stored), and "edited by me" means the
     # last modifier is the owning identity's display name.
@@ -1489,17 +1558,17 @@ _DRIVE_FILE = _simple_adapter(
         "WHEN t.trashed <> 0 THEN 'noise' "
         # Google-Forms response uploads and shared-with-organizers intake
         # folders are pipeline traffic, not someone reaching Zach; shortcut
-        # churn likewise reads as ambient.
+        # churn likewise.
         "WHEN t.folder_path LIKE '%%(File responses)%%' "
-        "  OR t.folder_path ~* 'shared with|shared w/' THEN 'cc' "
-        "WHEN t.mime_type = 'application/vnd.google-apps.shortcut' THEN 'cc' "
+        "  OR t.folder_path ~* 'shared with|shared w/' THEN 'background' "
+        "WHEN t.mime_type = 'application/vnd.google-apps.shortcut' THEN 'background' "
         "WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(t.owners_json) o "
         "             WHERE o->>'emailAddress' ILIKE t.account "
         "               AND (t.last_modifying_user = '' OR t.last_modifying_user = o->>'displayName')) THEN 'self' "
         "WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(t.owners_json) o "
-        "             WHERE o->>'emailAddress' ILIKE t.account) THEN 'direct' "
-        "WHEN t.starred <> 0 THEN 'direct' "
-        "ELSE 'cc' END"
+        "             WHERE o->>'emailAddress' ILIKE t.account) THEN 'cc' "
+        "WHEN t.starred <> 0 THEN 'cc' "
+        "ELSE 'background' END"
     ),
 )
 
@@ -2003,6 +2072,24 @@ _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
 )
 
 
+# An opening prompt another program wrote. Every orchestrator (paseo
+# subagents, runbook fan-outs, the daily run-sheet job, /command invocations)
+# writes a role brief -- "You are auditing ...", "Research task, web only",
+# "Reply with ONLY minified JSON" -- and Zach does not talk to an agent that
+# way. This is judged on the prompt's SHAPE because the entrypoint cannot tell
+# them apart: paseo launches the sessions Zach types into through the same
+# `sdk-cli` entrypoint as the ones it spawns for itself, and classifying by
+# entrypoint filed 383 of 390 claude_code sessions in a fortnight as
+# background, "how did the freight break down for this?" included (measured on
+# prod 2026-08-26).
+_AGENT_ORCHESTRATED_PROMPT_PATTERN = (
+    "'^\\s*(you are |you''re |your (task|job|goal|mission|role)\\M|"
+    "(pure |external |live )*(public )?web research|research task|"
+    "(task|goal|context|mission|objective)\\s*[:—-]|\\*\\*(task|goal|context|objective)|"
+    "<command-name>|\\x7b\"|small install task|work in /|in the repo (at )?/|"
+    "reply with (only|exactly)|respond with only|cleanup task)'"
+)
+
 # Harness-injected `role = 'user'` turns. Every agent CLI opens a transcript by
 # feeding the model an environment/instructions block through the user channel,
 # so the literal first user row is usually not something Zach typed. Taking it
@@ -2071,10 +2158,11 @@ def _agent_session_adapter() -> TimelineAdapter:
             concat_ws(E'\n', NULLIF(st.session_title, ''), NULLIF(fp.text, ''),
                       NULLIF(cw.cwd, ''), NULLIF(gb.git_branch, ''), NULLIF(ru.repo_url, '')) AS search_text,
             s.ingest_ts AS ingest_ts,
-            -- Interactive vs background (benchmark-tuned, sampling/ 2026-07).
-            -- chatgpt/claude_desktop are always human conversations, and some
-            -- sync as a header row with zero user events. Cron/inter-session
-            -- prompts, programmatic entrypoints, zero-user-turn transcripts,
+            -- Interactive vs background (benchmark-tuned, sampling/ 2026-07,
+            -- re-audited 2026-08-26). chatgpt/claude_desktop are always human
+            -- conversations, and some sync as a header row with zero user
+            -- events. Cron/inter-session prompts, programmatic entrypoints,
+            -- orchestrator-shaped opening prompts, zero-user-turn transcripts,
             -- and sidechain-only subagent transcripts are machinery.
             CASE WHEN s.source IN ('chatgpt', 'claude_desktop') THEN {TIMELINE_PRIORITY_SELF}
                  WHEN COALESCE(NULLIF(st.session_title, ''), fp.text, '') LIKE '[cron:%%'
@@ -2083,7 +2171,9 @@ def _agent_session_adapter() -> TimelineAdapter:
                    OR COALESCE(NULLIF(st.session_title, ''), fp.text, '') LIKE '[Subagent Context]%%'
                    OR COALESCE(fp.text, '') LIKE '[Subagent Context]%%'
                    THEN {TIMELINE_PRIORITY_BACKGROUND}
-                 WHEN s.entrypoint IN ('sdk-cli', 'codex_exec', 'zrl-claw')
+                 WHEN s.entrypoint IN ('codex_exec', 'zrl-claw')
+                   THEN {TIMELINE_PRIORITY_BACKGROUND}
+                 WHEN fp.text ~* {_AGENT_ORCHESTRATED_PROMPT_PATTERN}
                    THEN {TIMELINE_PRIORITY_BACKGROUND}
                  WHEN s.user_event_count = 0 THEN {TIMELINE_PRIORITY_BACKGROUND}
                  WHEN s.non_sidechain_count = 0 THEN {TIMELINE_PRIORITY_BACKGROUND}
@@ -2191,7 +2281,8 @@ def _agent_session_adapter() -> TimelineAdapter:
         # a placeholder that named no rule at all -- the registration test only
         # checks that it is non-empty.
         priority_expression=(
-            f"CASE WHEN <opening user turn repeats across >=4 sessions> "
+            f"CASE WHEN <opening user turn is orchestrator-shaped "
+            f"({_AGENT_ORCHESTRATED_PROMPT_PATTERN}) or repeats across >=4 sessions> "
             f"THEN {TIMELINE_PRIORITY_BACKGROUND} ELSE {TIMELINE_PRIORITY_SELF} END"
         ),
         batch_size=10000,

@@ -869,8 +869,8 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
 # keys to the registry, so a new adapter cannot ship without a tier assertion.
 EXPECTED_SEEDED_PRIORITIES = {
     "gmail_email": "direct",
-    "slack_message": "cc",
-    "slack_file": "cc",
+    "slack_message": "noise",
+    "slack_file": "noise",
     "apple_message": "direct",
     "whatsapp_message": "cc",
     "agent_session": "self",
@@ -878,7 +878,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "apple_note_revision": "self",
     "voice_memo": "self",
     "calendar_event": "self",
-    "drive_file": "cc",
+    "drive_file": "background",
     "photo": "self",
     "contact_update": "background",
     "apple_contact_update": "background",
@@ -1120,8 +1120,18 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
         """,
         (_NOW, _NOW, _NOW, _NOW),
     )
+    # Slack narrating that I was added to a channel is not my action -> noise.
+    warehouse._command(
+        """
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
+                                    message_datetime, user_id, subtype, text, synced_at)
+        VALUES ('z', 'T1', 'C1', '3000.5', %s, 'UME', 'channel_join',
+                '<@UME> has joined the channel', %s)
+        """,
+        (_NOW, _NOW),
+    )
     # A drive file I own and last modified myself -> self; my file edited by
-    # someone else -> direct.
+    # someone else keeps me in the loop -> cc.
     warehouse._command(
         """
         INSERT INTO @google_drive_files (account, file_id, name, owners_json,
@@ -1205,7 +1215,8 @@ def test_priority_classifies_self_direct_mention_bulk_and_cron(warehouse):
     assert priority_of("z|T1|C1|3000.4") == "noise", "bot posts are noise"
     assert priority_of("z|T1|C1|4000.2") == "direct", "a reply in my thread is direct"
     assert priority_of("z@x.test|f-mine") == "self", "my own drive edits are self"
-    assert priority_of("z@x.test|f-shared") == "direct", "someone editing my file is direct"
+    assert priority_of("z@x.test|f-shared") == "cc", "someone editing my file keeps me in the loop"
+    assert priority_of("z|T1|C1|3000.5") == "noise", "a channel_join narrated by Slack is not his action"
     assert priority_of("z@x.test|am-biz") == "noise", "business/RCS senders are noise"
     assert priority_of("z@x.test|f-excluded") == "background", "warehouse-excluded drive blobs are background"
     assert priority_of("z@x.test|m-promo") == "noise", "promos are noise even when addressed to me"
@@ -1254,9 +1265,39 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
             _NOW, _NOW,
             _NOW, _NOW,
             _NOW + timedelta(hours=2), _NOW,
-            _NOW + timedelta(hours=3), _NOW,
+            _NOW + timedelta(hours=8), _NOW,
             _NOW, _NOW,
             _NOW, _NOW,
+        ),
+    )
+    # A real <@id> ping in the 40k channel is aimed at him wherever it lands;
+    # a message in a member channel days from any post of his is the public
+    # firehose; and replies under his <!channel> announcement are a crowd
+    # reacting to a broadcast, not people addressing him -- unless one of them
+    # says his name.
+    warehouse._command(
+        """
+        INSERT INTO @slack_conversations (account, team_id, conversation_id, name, is_member,
+                                         num_members, is_mpim, is_private)
+        VALUES ('z', 'T1', 'CANN', 'announcements', 1, 40000, 0, 0)
+        """
+    )
+    warehouse._command(
+        """
+        INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts, thread_ts,
+                                    message_datetime, user_id, text, reply_count, synced_at)
+        VALUES ('z', 'T1', 'CBIG', '5000.10', '', %s, 'U1', 'hey <@UME> can you look at this', 0, %s),
+               ('z', 'T1', 'C1', '5000.11', '', %s, 'U1', 'ambient member-channel chatter', 0, %s),
+               ('z', 'T1', 'CANN', '6000.1', '6000.1', %s, 'UME', '<!channel> watch this video', 40, %s),
+               ('z', 'T1', 'CANN', '6000.2', '6000.1', %s, 'U1', 'First', 0, %s),
+               ('z', 'T1', 'CANN', '6000.3', '6000.1', %s, 'U1', 'zach can i still sign up?', 0, %s)
+        """,
+        (
+            _NOW + timedelta(hours=8), _NOW,
+            _NOW - timedelta(days=4), _NOW,
+            _NOW - timedelta(hours=2), _NOW,
+            _NOW - timedelta(hours=1), _NOW,
+            _NOW - timedelta(hours=1), _NOW,
         ),
     )
     # A legacy integration posting with a username and no user account.
@@ -1330,12 +1371,22 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
                 'notifications@github.com', %s, %s,
                 'vercel[bot] left a comment (org/repo#2)', %s),
                ('z@x.test', 'gh-plain', %s, 'Re: [org/repo] discussion (Issue #3)',
-                'notifications@github.com', %s, %s, 'a human wrote words here', %s)
+                'notifications@github.com', %s, %s, 'a human wrote words here', %s),
+               ('z@x.test', 'gh-bot-author', %s, 'Re: [org/repo] my feature (PR #4)',
+                'notifications@github.com', %s, %s,
+                '@coderabbitai[bot] commented on this pull request. In src/x.go:', %s),
+               ('z@x.test', 'gh-state-author', %s, 'Re: [org/repo] my feature (PR #4)',
+                'notifications@github.com', %s, %s, 'Merged #4 into main.', %s),
+               ('z@x.test', 'gh-push', %s, 'Re: [org/repo] their feature (PR #5)',
+                'notifications@github.com', %s, %s, '@someone pushed 1 commit. abc123 tidy', %s)
         """,
         (
             _NOW, ["z@x.test"], ["mention@noreply.github.com"], _NOW,
             _NOW, ["z@x.test"], ["push@noreply.github.com"], _NOW,
             _NOW, ["z@x.test"], ["subscribed@noreply.github.com"], _NOW,
+            _NOW, ["z@x.test"], ["author@noreply.github.com"], _NOW,
+            _NOW, ["z@x.test"], ["author@noreply.github.com"], _NOW,
+            _NOW, ["z@x.test"], ["push@noreply.github.com"], _NOW,
         ),
     )
     warehouse._command(
@@ -1345,9 +1396,11 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
         VALUES ('z@x.test', 'm-otp', %s, 'Your login code: 123-456', 'human.sounding@bank.example', %s, %s),
                ('z@x.test', 'm-confirm-code', %s, '123456 is your confirmation code', 'human.sounding@example.test', %s, %s),
                ('z@x.test', 'm-rsvp', %s, 'Accepted: 1:1 @ Fri (owner)', 'colleague@example.test', %s, %s),
+               ('z@x.test', 'm-outlook-cancel', %s, 'Canceled: Partner sync', 'partner@example.test', %s, %s),
                ('z@x.test', 'm-shipment-confirmation', %s, 'Shipment Confirmation', 'dinobox@example.test', %s, %s)
         """,
         (
+            _NOW, ["z@x.test"], _NOW,
             _NOW, ["z@x.test"], _NOW,
             _NOW, ["z@x.test"], _NOW,
             _NOW, ["z@x.test"], _NOW,
@@ -1508,6 +1561,8 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # --- agent sessions: programmatic entrypoints and empty transcripts -----
     for sess, entrypoint, rows in (
         ("sdk-sess", "sdk-cli", [("user", "Reply with ONLY minified JSON")]),
+        ("sdk-typed", "sdk-cli", [("user", "how did the freight break down for this?")]),
+        ("cli-brief", "cli", [("user", "You are auditing the PDW repo at /tmp/x. Report findings.")]),
         ("empty-sess", "", []),
         ("desktop-conv", "", []),
     ):
@@ -1569,9 +1624,11 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
                ('z@x.test', 'cal1', 'ev-flight', '✈ BTV→IAD • UA 4178', '',
                 'z@x.test', %s, %s, %s),
                ('z@x.test', 'cal1', 'ev-invite', 'Coffee', '',
-                'human@example.test', %s, %s, %s)
+                'human@example.test', %s, %s, %s),
+               ('z@x.test', 'cal1', 'ev-luma', 'AMA with a founder', '',
+                'calendar-invite@lu.ma', %s, %s, %s)
         """,
-        (_NOW, _NOW, _NOW) * 4,
+        (_NOW, _NOW, _NOW) * 5,
     )
 
     # Google marks the owner's own attendee entry "self" and the organizer's
@@ -1688,7 +1745,11 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # slack
     assert priority_of("z|T1|C1|5000.3") == "direct", "channel msg inside his two-post window is a conversation"
     assert priority_of("z|T1|CBIG|5000.5") == "cc", "one drive-by post does not promote a 40k channel"
-    assert priority_of("z|T1|CBIG|5000.6") == "direct", "naming him promotes anywhere"
+    assert priority_of("z|T1|CBIG|5000.6") == "cc", "his name in public, outside his window, is people talking about him"
+    assert priority_of("z|T1|CBIG|5000.10") == "direct", "a real <@id> ping is aimed at him anywhere"
+    assert priority_of("z|T1|C1|5000.11") == "noise", "member-channel chatter he is nowhere near is the public firehose"
+    assert priority_of("z|T1|CANN|6000.2") == "cc", "a reply under his <!channel> broadcast is a crowd reacting"
+    assert priority_of("z|T1|CANN|6000.3") == "direct", "a reply under his broadcast that names him is aimed at him"
     assert priority_of("z|T1|G1|5000.7") == "cc", "a big group DM he is not engaged in is peripheral"
     assert priority_of("z|T1|G2|5000.8") == "direct", "small group DMs are attention"
     assert priority_of("z|T1|C1|5000.9") == "noise", "username-only legacy integrations are bots"
@@ -1699,6 +1760,10 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("z@x.test|gh-mention") == "direct", "github mention copies are direct"
     assert priority_of("z@x.test|gh-bot") == "noise", "relayed bot payloads are noise"
     assert priority_of("z@x.test|gh-plain") == "cc", "relayed human comments are cc"
+    assert priority_of("z@x.test|gh-bot-author") == "noise", "a review bot on his own PR is still a machine"
+    assert priority_of("z@x.test|gh-state-author") == "cc", "a merge of his PR is the platform reporting, not a person writing"
+    assert priority_of("z@x.test|gh-push") == "noise", "push notifications on a watched repo are machinery"
+    assert priority_of("z@x.test|m-outlook-cancel") == "cc", "Outlook-style Canceled: stubs are auto-RSVP notices"
     assert priority_of("z@x.test|m-otp") == "noise", "login codes are noise"
     assert priority_of("z@x.test|m-confirm-code") == "noise", "confirmation codes are noise"
     assert priority_of("z@x.test|m-rsvp") == "cc", "auto-RSVP notices are cc"
@@ -1723,7 +1788,9 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("z@x.test|agent@lid|wm-agent") == "noise", "business/bot accounts are automated"
     assert priority_of("z@x.test|chat@g.us|wm-stub") == "noise", "contentless E2E stubs are noise"
     # agent sessions
-    assert priority_of("claude_code|sdk-sess") == "background", "sdk-cli runs are machinery"
+    assert priority_of("claude_code|sdk-sess") == "background", "an output-format brief is a program talking"
+    assert priority_of("claude_code|sdk-typed") == "self", "sdk-cli is also how paseo launches the sessions he types into"
+    assert priority_of("claude_code|cli-brief") == "background", "a 'You are ...' role brief is orchestrator-written whatever the entrypoint"
     assert priority_of("claude_code|empty-sess") == "background", "zero-user-turn transcripts are machinery"
     assert priority_of("claude_desktop|desktop-conv") == "self", "desktop conversations are his even header-only"
     assert priority_of("claude_code|side-sess") == "background", "sidechain-only subagent transcripts are machinery"
@@ -1733,6 +1800,7 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("z@x.test|cal1|ev-promo") == "noise", "promo-invite blasts are noise"
     assert priority_of("z@x.test|cal1|ev-flight") == "noise", "flighty auto-events are not his actions"
     assert priority_of("z@x.test|cal1|ev-invite") == "direct", "human invites are attention"
+    assert priority_of("z@x.test|cal1|ev-luma") == "noise", "event-platform robots are not a person inviting him"
     assert priority_of("z@x.test|cal1|ev-alias") == "self", "the self+organizer attendee flags are him"
     assert priority_of("z@x.test|cal1|ev-declined") == "noise", "a meeting he declined is not attention"
     assert priority_of("z@x.test|cal1|ev-allhands") == "cc", "an invite alongside a crowd is peripheral"
@@ -1748,17 +1816,17 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
         "must not read as a recurring scheduled prompt"
     )
     # drive
-    assert priority_of("z@x.test|f-form") == "cc", "form-response uploads are pipeline traffic"
-    assert priority_of("z@x.test|f-shortcut") == "cc", "shortcut churn is ambient"
+    assert priority_of("z@x.test|f-form") == "background", "form-response uploads are pipeline traffic"
+    assert priority_of("z@x.test|f-shortcut") == "background", "shortcut churn is machinery"
     assert priority_of("z@x.test|f-trashed") == "noise", (
         "a trashed file is noise even though he owns and last touched it -- the "
         "trashed branch must win over the ownership branches below it"
     )
-    assert priority_of("z@x.test|f-starred") == "direct", (
-        "starring someone else's file is Zach marking it as his attention"
+    assert priority_of("z@x.test|f-starred") == "cc", (
+        "starring someone else's file is Zach asking to be kept in the loop"
     )
-    assert priority_of("z@x.test|f-other") == "cc", (
-        "a file he neither owns nor starred falls through to cc"
+    assert priority_of("z@x.test|f-other") == "background", (
+        "a file he neither owns nor starred changing is other people's work"
     )
 
 
@@ -2078,7 +2146,7 @@ def test_refresh_window_converges_late_signals(warehouse):
     row = warehouse._query(
         "SELECT priority FROM @timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
     )
-    assert row[0][0] == "cc", "no engagement yet: ambient member channel"
+    assert row[0][0] == "noise", "no engagement yet: public member-channel chatter is the firehose"
 
     # Zach replies twice; the original message predates the watermark so only
     # the refresh re-walk can reclassify it.
