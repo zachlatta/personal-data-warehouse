@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import shutil
 import subprocess
 
@@ -17,13 +17,11 @@ from personal_data_warehouse.agent_runner import (
     write_builtin_cli_tools,
 )
 from personal_data_warehouse.agent_tool_proxy import WarehouseAppConfig, run_agent_tool_proxy
+from tests.local_test_runtime import LocalTestStartupError, preflight_subscription_auth
 from tests.warehouse_app_stub import StubWarehouseApp
 
 
-pytestmark = pytest.mark.skipif(
-    os.getenv("RUN_LIVE_AGENT_TESTS") != "1",
-    reason="set RUN_LIVE_AGENT_TESTS=1 to run Docker/subscription-backed agent tests",
-)
+pytestmark = pytest.mark.local_integration
 
 
 def live_agent_config(tmp_path) -> AgentContainerConfig:
@@ -42,7 +40,38 @@ def live_agent_config(tmp_path) -> AgentContainerConfig:
 
 def require_docker() -> None:
     if not shutil.which("docker"):
-        pytest.skip("docker CLI is not installed")
+        pytest.fail(
+            "Docker CLI is required for local agent integration tests; "
+            "install/start Docker or explicitly use `uv run pytest --unit-only`",
+            pytrace=False,
+        )
+    try:
+        completed = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        completed = None
+    if completed is None or completed.returncode != 0:
+        pytest.fail(
+            "Docker daemon is required for local agent integration tests; "
+            "start Docker or explicitly use `uv run pytest --unit-only`",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(scope="module")
+def subscription_agent_config(tmp_path_factory):
+    require_docker()
+    config = live_agent_config(tmp_path_factory.mktemp("subscription-agent"))
+    try:
+        preflight_subscription_auth(config)
+    except LocalTestStartupError as error:
+        pytest.fail(str(error), pytrace=False)
+    return config
 
 
 def test_live_agent_image_has_clis_and_no_socket(tmp_path) -> None:
@@ -211,9 +240,9 @@ def test_live_agent_pdw_cli_cannot_reach_blocked_tools(tmp_path) -> None:
     assert app.tool_call_paths() == []
 
 
-def test_live_agent_subscription_smoke_returns_schema_json(tmp_path) -> None:
-    require_docker()
-    config = live_agent_config(tmp_path)
+@pytest.mark.subscription_agent
+def test_live_agent_subscription_smoke_returns_schema_json(subscription_agent_config) -> None:
+    config = subscription_agent_config
 
     result = ContainerAgentRunner(config).run(
         AgentRunRequest(
@@ -236,9 +265,9 @@ def test_live_agent_subscription_smoke_returns_schema_json(tmp_path) -> None:
     assert "smoke" in result.final_output_json["message"].lower()
 
 
-def test_live_agent_can_use_builtin_cli_tool_before_final_json(tmp_path) -> None:
-    require_docker()
-    config = live_agent_config(tmp_path)
+@pytest.mark.subscription_agent
+def test_live_agent_can_use_builtin_cli_tool_before_final_json(subscription_agent_config) -> None:
+    config = subscription_agent_config
 
     result = ContainerAgentRunner(config).run(
         AgentRunRequest(

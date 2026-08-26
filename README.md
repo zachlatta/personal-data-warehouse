@@ -83,9 +83,26 @@ uv run pytest
 uv run dg dev
 ```
 
+`uv run pytest` is the canonical full local verification command. If
+`POSTGRES_DATABASE_URL` is unset, pytest starts the extension-complete warehouse
+Postgres image on a random loopback port, runs the database-backed tests, and
+removes the container afterward. An explicitly configured test URL is reused.
+The same command builds or reuses the managed agent image and runs the real
+subscription smokes by default on a local machine. First-time setup is one
+command (use `claude` instead when `AGENT_PROVIDER=claude`):
+
+```bash
+uv run personal-data-warehouse-agent-auth login codex
+```
+
+For a deliberately faster iteration that excludes Postgres and Docker/agent
+integrations, run `uv run pytest --unit-only`. Missing environment variables are
+never an implicit opt-out. A production database URL is neither necessary nor
+recommended for tests.
+
 ## Required Environment
 
-Add these to `.env`:
+For running the warehouse services and source syncs, add these to `.env`:
 
 ```bash
 POSTGRES_DATABASE_URL=...
@@ -1352,28 +1369,13 @@ is also available to arbitrary Bash inside the agent container.
 Because the image compiles `pdw` from `app/`, the image tag hashes those sources too: editing the
 CLI changes the tag and the next run rebuilds, rather than silently keeping a stale binary.
 
-Written tests that do not call live agents run with the normal suite:
-
-```bash
-uv run pytest tests/test_agent_runner.py tests/test_apple_voice_memos_enrichment_defs.py tests/test_postgres_warehouse.py
-```
-
-Live Docker/subscription smoke tests are opt-in because they require Docker and a logged-in
-subscription auth volume:
-
-```bash
-uv run personal-data-warehouse-agent-auth login codex
-
-RUN_LIVE_AGENT_TESTS=1 \
-AGENT_PROVIDER=codex \
-AGENT_MODEL=gpt-5.6-sol \
-AGENT_REASONING_EFFORT=medium \
-uv run pytest tests/test_agent_runner_live.py -q
-```
-
-The live tests verify the image has both agent CLIs and no Docker socket, start real one-off agent
-containers through the subscription login, and check that the image's `pdw` can query through the
-host-owned per-run proxy — and that a blocked tool such as `propose_mutation` never reaches the app.
+The canonical `uv run pytest` suite includes the Docker agent integrations. It builds or reuses
+the managed image, verifies both agent CLIs and Docker isolation, exercises the real `pdw` proxy
+path and allowlist, and locally runs two real subscription-backed agent canaries after checking the
+durable auth volume. If that preflight fails, run the one-time login command shown above. Generic CI
+runs the four hermetic Docker integrations but leaves the subscription canaries off unless
+`RUN_LIVE_AGENT_TESTS=1` is explicit. A local `RUN_LIVE_AGENT_TESTS=0` is an intentional, reported
+opt-out; `uv run pytest --unit-only` is the explicit opt-out from every local integration.
 
 ## Warehouse Tables
 

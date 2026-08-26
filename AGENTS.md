@@ -5,6 +5,14 @@ Development practices:
 * We use TDD for this repo and follow good code practices
 * When asked to refactor or change existing code flows, please plan to completely replace the old legacy flow with the new requested flow - including ripping out any and all legacy code
 * When querying the database, you can use the pdw CLI
+* Before finishing a change, run `uv run pytest`, the canonical full local verification command.
+  It self-provisions and removes an extension-complete warehouse Postgres on a random local port
+  when `POSTGRES_DATABASE_URL` is absent, reuses an explicitly configured test URL, builds/reuses
+  the managed agent image, and locally runs the subscription smokes. First-time auth is
+  `uv run personal-data-warehouse-agent-auth login codex` (or `claude` for that provider). Use
+  `uv run pytest --unit-only` only as an explicit faster iteration, not final verification;
+  missing environment variables never opt tests out. No production database URL is necessary or
+  recommended for tests.
 
 ## The seven contracts
 

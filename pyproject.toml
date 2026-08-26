@@ -54,6 +54,12 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.pytest.ini_options]
+markers = [
+    "local_integration: tests that need local Docker or a real disposable Postgres",
+    "subscription_agent: real subscription-backed agent canaries",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = [
     "src/personal_data_warehouse",
