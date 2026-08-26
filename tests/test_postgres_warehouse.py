@@ -1944,12 +1944,14 @@ def test_search_text_casts_branch_rows_to_the_physical_hit_type() -> None:
 
 def test_only_timeline_bm25_indexes_are_registered() -> None:
     # BM25 indexes are expensive enough that per-source sprawl once left ~25GB
-    # of dead text indexes behind. Exactly two are justified: the global
-    # timeline index, and the PARTIAL index over the low-volume adapters that
-    # the broad-search pool's second partition scans. The partial one indexes a
-    # disjoint 2.6% of the rows, so it adds a fraction of the corpus rather
-    # than a second copy of it -- any further bm25 index needs the same
-    # argument made explicitly.
+    # of dead text indexes behind. Exactly four are justified, and every one
+    # after the first has to indexes a small DISJOINT slice rather than a
+    # second copy of the corpus: the global timeline index; the PARTIAL index
+    # over the low-volume adapters the broad pool's second partition scans
+    # (2.6% of rows); and the two ATTENTION partitions over
+    # priority IN ('self','direct'), which is 2.72% of rows and 7.9% of
+    # document bytes. Any further bm25 index needs the same argument made
+    # explicitly.
     import personal_data_warehouse.postgres as postgres_module
 
     bm25_indexes = {
@@ -1960,6 +1962,8 @@ def test_only_timeline_bm25_indexes_are_registered() -> None:
     assert set(bm25_indexes) == {
         "timeline_events_search_text_bm25_idx",
         "timeline_events_search_text_bm25_lowvol_idx",
+        "timeline_events_search_text_bm25_attention_idx",
+        "timeline_events_search_text_bm25_attention_lowvol_idx",
     }
     lowvol = bm25_indexes["timeline_events_search_text_bm25_lowvol_idx"].sql
     assert "WHERE adapter IN (" in lowvol, (
@@ -1968,6 +1972,34 @@ def test_only_timeline_bm25_indexes_are_registered() -> None:
     )
     assert "'gmail_email'" not in lowvol and "'slack_message'" not in lowvol, (
         "high-volume adapters belong to the global index partition only"
+    )
+    for name in (
+        "timeline_events_search_text_bm25_attention_idx",
+        "timeline_events_search_text_bm25_attention_lowvol_idx",
+    ):
+        attention = bm25_indexes[name].sql
+        assert (
+            f"WHERE priority IN ({postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})"
+            in attention
+        ), f"{name} must be PARTIAL on the attention tiers, not a second full corpus"
+    # The BIG attention partition deliberately carries NO adapter list. A
+    # predicate derived from the adapter registry has to be rebuilt when that
+    # registry moves, and rebuilding this one is a ~10 minute exclusive lock on
+    # a 45 GB table. The tiny low-volume attention partition carries the list
+    # (it must, to be the low-volume partition) and rebuilds in seconds.
+    big = bm25_indexes["timeline_events_search_text_bm25_attention_idx"]
+    small = bm25_indexes["timeline_events_search_text_bm25_attention_lowvol_idx"]
+    assert "adapter" not in big.sql, (
+        "the big attention index must not carry the adapter registry in its predicate"
+    )
+    assert not big.rebuild_on_definition_change
+    assert "adapter IN (" in small.sql
+    assert small.rebuild_on_definition_change, (
+        "a partial index whose predicate comes from the adapter registry must "
+        "rebuild when the registry moves, or broad search goes down"
+    )
+    assert "CREATE INDEX CONCURRENTLY" in big.sql, (
+        "a multi-minute build on the 45 GB timeline heap must not hold a write lock"
     )
 
 
@@ -5164,6 +5196,23 @@ def test_search_text_broad_candidates_are_scored_through_their_own_partition_ind
     )
     assert "to_bm25query(query, 'timeline_events_search_text_bm25_idx')" in ranking
     assert "to_bm25query(query, 'timeline_events_search_text_bm25_lowvol_idx')" in ranking
+    # The attention partitions are two more corpora with their own statistics.
+    assert "to_bm25query(query, 'timeline_events_search_text_bm25_attention_idx')" in ranking
+    assert (
+        "to_bm25query(query, 'timeline_events_search_text_bm25_attention_lowvol_idx')" in ranking
+    )
+    import personal_data_warehouse.postgres as postgres_module
+
+    for part in (
+        postgres_module.SEARCH_TEXT_POOL_PART_HIGH_VOLUME,
+        postgres_module.SEARCH_TEXT_POOL_PART_LOW_VOLUME,
+        postgres_module.SEARCH_TEXT_POOL_PART_ATTENTION_HIGH_VOLUME,
+        postgres_module.SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME,
+    ):
+        assert f"c.part = {part}" in ranking, (
+            f"pool partition {part} has no scoring branch, so its rows are scored "
+            "against another partition's term statistics"
+        )
 
 
 def test_search_hybrid_accepts_a_second_query_embedding() -> None:
@@ -5607,6 +5656,238 @@ def test_search_schema_signature_covers_the_priority_tokens() -> None:
     assert before and before != after, (
         "changing the priority token list must change the search schema signature"
     )
+
+
+def test_search_text_serves_an_attention_scoped_call_from_the_attention_index() -> None:
+    """A priority-scoped broad call must scan the PARTIAL attention index.
+
+    `self` is 1.01% of a 49M-row timeline and `self` + `direct` together are
+    2.72%. Filling a 5,000-row pool from the global BM25 index therefore walks
+    ~500k score-ordered documents and pays a random heap visit for each to
+    check the tier -- measured on production 2026-08-26 at 15-20s cold on a
+    novel query, which took `pdw search --priority self` through the app's
+    multi-leg hybrid past the 60s statement ceiling twice. The same pool from
+    an index that contains only those tiers is a shallow scan.
+    """
+    import personal_data_warehouse.postgres as postgres_module
+
+    sql = _search_text_function_sql()
+    pool = sql[
+        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
+            "set_config('enable_sort', 'on', true)"
+        )
+    ]
+    assert (
+        "priorities <@ ARRAY["
+        + postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL
+        + "]" in pool
+    ), (
+        "the broad pool must choose the attention index only when the requested "
+        "tiers are a SUBSET of the ones it contains"
+    )
+    assert "to_bm25query(query, 'timeline_events_search_text_bm25_attention_idx')" in pool
+    assert (
+        "to_bm25query(query, 'timeline_events_search_text_bm25_attention_lowvol_idx')" in pool
+    )
+
+
+def test_the_attention_pool_repeats_the_index_predicate_as_a_literal() -> None:
+    """The scan's WHERE must literally imply the partial index's predicate.
+
+    A partial index is only usable when the planner can PROVE the query implies
+    its predicate, and `priorities` is a runtime array parameter it can prove
+    nothing about. Without the literal tier predicate beside it the planner
+    falls back to the global index -- and vchord-bm25 then RAISES, because
+    to_bm25query() pins an index by name and the plan used another one. So this
+    is not an optimization that degrades quietly; getting it wrong takes broad
+    priority search down.
+    """
+    import personal_data_warehouse.postgres as postgres_module
+
+    sql = _search_text_function_sql()
+    pool = sql[
+        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
+            "set_config('enable_sort', 'on', true)"
+        )
+    ]
+    literal = f"t.priority IN ({postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})"
+    assert pool.count(literal) == 2, (
+        "both attention partitions must carry the index predicate as a literal; "
+        f"found {pool.count(literal)}"
+    )
+    # And the index it names must be partial on exactly that predicate.
+    for name in (
+        "timeline_events_search_text_bm25_attention_idx",
+        "timeline_events_search_text_bm25_attention_lowvol_idx",
+    ):
+        spec = next(ix for ix in postgres_module.POSTGRES_INDEXES if ix.name == name)
+        assert (
+            f"priority IN ({postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})" in spec.sql
+        )
+
+
+def test_a_non_subset_priority_call_keeps_the_general_indexes() -> None:
+    """`noise`, `cc`, `background` and an unscoped call must NOT read the attention index.
+
+    The attention index contains only `self` and `direct`, so serving any other
+    tier from it silently returns nothing -- the worst failure this search layer
+    has: an empty result that reads as "no matches". The general pool has to
+    stay the default and the attention pool has to be the guarded exception.
+    """
+    import personal_data_warehouse.postgres as postgres_module
+
+    sql = _search_text_function_sql()
+    pool = sql[
+        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
+            "set_config('enable_sort', 'on', true)"
+        )
+    ]
+    # The attention pool sits under a guard; the general pool is the ELSE.
+    guard = "priorities <@ ARRAY[" + postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + "]"
+    assert guard in pool
+    general = pool[pool.index("ELSE", pool.index(guard)) :]
+    assert "attention" not in general, (
+        "the fallback pool must not name an attention index: it cannot answer "
+        "a call for noise/cc/background at all"
+    )
+    assert "to_bm25query(query, 'timeline_events_search_text_bm25_idx')" in general
+    assert "to_bm25query(query, 'timeline_events_search_text_bm25_lowvol_idx')" in general
+
+
+def test_search_schema_signature_covers_the_attention_tiers() -> None:
+    # The attention tier list is baked into the generated pool SQL and into the
+    # index predicates. If it moves without the signature moving, the rebuild
+    # guard skips the recompile and the function keeps naming an index whose
+    # predicate no longer matches its WHERE -- which is a RAISE, not a slowdown.
+    import personal_data_warehouse.postgres as postgres_module
+
+    class _Stub:
+        _SEARCHABLE_TEXT_TABLES = ("timeline_events",)
+        _SEARCH_PRIORITY_TOKENS = postgres_module.PostgresWarehouse._SEARCH_PRIORITY_TOKENS
+        _search_schema_signature = postgres_module.PostgresWarehouse._search_schema_signature
+        _ensure_search_text_function = postgres_module.PostgresWarehouse._ensure_search_text_function
+
+        def pgvector_available(self) -> bool:
+            return True
+
+        def _relation_exists(self, table: str) -> bool:
+            return True
+
+    stub = _Stub()
+    before = stub._search_schema_signature()
+    original = postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL
+    postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL = "'self'"
+    try:
+        after = stub._search_schema_signature()
+    finally:
+        postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL = original
+    assert before and before != after, (
+        "changing the attention tier list must change the search schema signature"
+    )
+
+
+def test_search_text_attention_scoped_results_match_the_general_path(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Correctness before speed: the fast index must return the same rows.
+
+    Against a real timeline, a call scoped to `self` / `direct` / both --
+    served by the attention partitions -- must return exactly what the general
+    pool returns filtered to the same tiers, and a call that mixes an attention
+    tier with a non-attention one must fall back and still be right.
+    """
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(
+                conversation_id="C1", conversation_type="private_channel", sync_version=1
+            )
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="900.1",
+                message_datetime=message_datetime,
+                text="xylocarp rollout schedule",
+            )
+        ]
+    )
+    warehouse.insert_messages(
+        [
+            _message_row(
+                message_id="m-xylo",
+                subject="xylocarp kickoff",
+                labels=["INBOX"],
+                sync_version=1,
+            )
+        ]
+    )
+    warehouse.insert_contact_cards(
+        [_contact_card_row(card_id="card-xylo", display_name="Xylocarp Person", sync_version=1)]
+    )
+    _sync_timeline(warehouse)
+
+    general = {
+        (row[0], row[1])
+        for row in warehouse._query(
+            "SELECT ref, priority FROM @search_text('xylocarp', 50) WHERE score < 0"
+        )
+    }
+    assert general, "expected ranked hits before any tier filter"
+
+    def scoped(tiers: list[str]) -> set[tuple[str, str]]:
+        return {
+            (row[0], row[1])
+            for row in warehouse._query(
+                "SELECT ref, priority FROM @search_text('xylocarp', 50, NULL, NULL, %s::text[]) "
+                "WHERE score < 0",
+                (tiers,),
+            )
+        }
+
+    attention_tiers = ["self", "direct"]
+    for tiers in (["self"], ["direct"], attention_tiers):
+        want = {hit for hit in general if hit[1] in tiers}
+        assert scoped(tiers) == want, (
+            f"the attention-index path disagrees with the general path for {tiers}"
+        )
+
+    # A tier the attention index does not contain must fall back, not vanish.
+    mixed = ["self", "noise"]
+    assert scoped(mixed) == {hit for hit in general if hit[1] in mixed}
+    assert scoped(["noise"]) == {hit for hit in general if hit[1] == "noise"}
+
+    # The test is only meaningful if the seeded corpus actually reaches the
+    # attention path with rows in it.
+    assert any(hit[1] in attention_tiers for hit in general), (
+        "seed a self/direct event or this test proves nothing about the "
+        "attention partitions"
+    )
+
+    # Scores come from a DIFFERENT corpus here (the attention index has its own
+    # term statistics), so they are not comparable to the general path's
+    # numbers -- but they must still be real operator scores, and within one
+    # source the output must still be in score order, which is what proves the
+    # pool ordinal still tracks the score on this path.
+    ranked = warehouse._query(
+        "SELECT source, score FROM @search_text('xylocarp', 50, NULL, NULL, %s::text[]) "
+        "WHERE score < 0",
+        (attention_tiers,),
+    )
+    assert ranked, "expected attention-scoped hits to score"
+    for source in {row[0] for row in ranked}:
+        scores = [row[1] for row in ranked if row[0] == source]
+        assert scores == sorted(scores), (
+            f"{source} attention hits came back out of score order: {scores}"
+        )
 
 
 def test_search_functions_drop_their_previous_signature() -> None:

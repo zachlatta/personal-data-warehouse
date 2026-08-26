@@ -216,6 +216,33 @@ SEARCH_TEXT_BROAD_SMALL_POOL = 800
 # row scored against the global index is a different number.
 SEARCH_TEXT_POOL_PART_HIGH_VOLUME = 0
 SEARCH_TEXT_POOL_PART_LOW_VOLUME = 1
+# The same two partitions, scanned through the ATTENTION indexes instead of the
+# general ones. Separate part numbers because they are separate BM25 corpora:
+# a row scored against the attention index's term statistics is a different
+# number than the same row scored against the global index's.
+SEARCH_TEXT_POOL_PART_ATTENTION_HIGH_VOLUME = 2
+SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME = 3
+# The tiers the partial "attention" BM25 indexes contain.
+#
+# `priorities => ARRAY['self']` is the single most important query an agent
+# makes -- it is what contract C3 ("agents start at the timeline and can filter
+# by priority") is for -- and it was the slowest thing in the search layer.
+# Measured on production 2026-08-26: `self` is 496,049 of 49,010,739 rows
+# (1.01%) and `self` + `direct` is 1,333,799 (2.72%). A broad pool wants 5,000
+# candidates, so filling it from the global index walks ~500k score-ordered
+# documents and pays a RANDOM HEAP VISIT on each one to read the tier -- 15-20s
+# cold on a novel query, and past the app's 60s statement ceiling through the
+# multi-leg hybrid. The same pool taken from an index that contains only those
+# tiers is a shallow scan of a small corpus.
+#
+# Why these two tiers and no more: they are 7.9% of the corpus by document
+# bytes (1,451 MB of 18.4 GB), so the partial index is a fraction of the global
+# index rather than a second copy of it. Adding `cc` would pull in 6.9M more
+# rows and most of that argument.
+SEARCH_TEXT_ATTENTION_PRIORITIES: tuple[str, ...] = ("self", "direct")
+SEARCH_TEXT_ATTENTION_PRIORITIES_SQL = ", ".join(
+    f"'{priority}'" for priority in SEARCH_TEXT_ATTENTION_PRIORITIES
+)
 # Sources whose documents dominate the corpus, and therefore the global BM25
 # ordering. Everything else is scanned as the second pool partition.
 SEARCH_TEXT_HIGH_VOLUME_SOURCES: tuple[str, ...] = (
@@ -1558,6 +1585,41 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         requires_pg_textsearch=True,
         # The adapter list above grows whenever a low-volume timeline adapter is
         # added, and a stale predicate breaks broad search outright.
+        rebuild_on_definition_change=True,
+    ),
+    # The ATTENTION partitions. Same two-partition shape as the pair above --
+    # the broad pool needs a low-volume partition or the per-source floor has
+    # nothing to promote -- but restricted to the tiers an attention-scoped
+    # search asks for. Measured on production 2026-08-26: 1,243,419 high-volume
+    # documents (1,397 MB of text) and 90,256 low-volume ones (54 MB), against
+    # a global index of 10.2 GB over the whole 49M-row corpus.
+    #
+    # The BIG one deliberately carries NO adapter list. Its predicate is the
+    # tier alone, and the high-volume partition adds `adapter NOT IN (...)` as
+    # an ordinary filter on top. A predicate derived from the adapter registry
+    # has to be REBUILT when that registry moves, and the rebuild path is a
+    # plain (non-concurrent) DROP+CREATE -- minutes of exclusive lock on the
+    # 45 GB timeline heap. The low-volume one must carry the list to be the
+    # low-volume partition at all, and at 54 MB of text its rebuild is seconds.
+    IndexSpec(
+        "timeline_events_search_text_bm25_attention_idx",
+        "timeline_events",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS timeline_events_search_text_bm25_attention_idx "
+        "ON @timeline_events USING bm25 (search_text) WITH (text_config='english') "
+        f"WHERE priority IN ({SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})",
+        requires_pg_textsearch=True,
+    ),
+    IndexSpec(
+        "timeline_events_search_text_bm25_attention_lowvol_idx",
+        "timeline_events",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "timeline_events_search_text_bm25_attention_lowvol_idx "
+        "ON @timeline_events USING bm25 (search_text) WITH (text_config='english') "
+        f"WHERE priority IN ({SEARCH_TEXT_ATTENTION_PRIORITIES_SQL}) "
+        f"AND adapter IN ({SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL})",
+        requires_pg_textsearch=True,
+        # Same reason as the low-volume index above: a stale adapter predicate
+        # means the planner picks another index and vchord-bm25 RAISES.
         rebuild_on_definition_change=True,
     ),
     IndexSpec(
@@ -9633,6 +9695,7 @@ class PostgresWarehouse:
                 str(SEARCH_TEXT_BROAD_POOL),
                 str(SEARCH_TEXT_BROAD_SMALL_POOL),
                 SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL,
+                SEARCH_TEXT_ATTENTION_PRIORITIES_SQL,
                 ",".join(self._SEARCH_PRIORITY_TOKENS),
                 str(SEARCH_HYBRID_RRF_K),
                 str(SEARCH_HYBRID_SEMANTIC_WEIGHT),
@@ -9813,7 +9876,13 @@ class PostgresWarehouse:
         # `row_number() OVER ()` numbers rows in the order its input produces
         # them; the input is an ORDER BY ... LIMIT subquery, which cannot be
         # pulled up and which no window without PARTITION BY/ORDER BY re-sorts.
-        def pool_partition(adapter_sql: str, index_name: str, limit: int, part: int) -> str:
+        def pool_partition(
+            adapter_sql: str,
+            index_name: str,
+            limit: int,
+            part: int,
+            extra_where: str = "",
+        ) -> str:
             rank = f"t.search_text <@> to_bm25query(query, '{index_name}')"
             return (
                 "( SELECT p.adapter, p.event_id, p.source, "
@@ -9821,24 +9890,58 @@ class PostgresWarehouse:
                 "FROM ( SELECT t.adapter, t.event_id, "
                 f"{pool_source_case} AS source "
                 "FROM @timeline_events t "
-                f"WHERE {pool_where} AND {adapter_sql} "
+                f"WHERE {pool_where} AND {adapter_sql}{extra_where} "
                 f"ORDER BY {rank} LIMIT {limit} ) p )"
             )
 
-        broad_pool_sql = (
-            pool_partition(
-                f"t.adapter NOT IN ({low_volume_list})",
-                "timeline_events_search_text_bm25_idx",
-                SEARCH_TEXT_BROAD_POOL,
-                SEARCH_TEXT_POOL_PART_HIGH_VOLUME,
+        def two_partition_pool(
+            high_index: str, low_index: str, high_part: int, low_part: int, extra_where: str = ""
+        ) -> str:
+            return (
+                pool_partition(
+                    f"t.adapter NOT IN ({low_volume_list})",
+                    high_index,
+                    SEARCH_TEXT_BROAD_POOL,
+                    high_part,
+                    extra_where,
+                )
+                + "\n                        UNION ALL\n                        "
+                + pool_partition(
+                    f"t.adapter IN ({low_volume_list})",
+                    low_index,
+                    SEARCH_TEXT_BROAD_SMALL_POOL,
+                    low_part,
+                    extra_where,
+                )
             )
-            + "\n                        UNION ALL\n                        "
-            + pool_partition(
-                f"t.adapter IN ({low_volume_list})",
-                "timeline_events_search_text_bm25_lowvol_idx",
-                SEARCH_TEXT_BROAD_SMALL_POOL,
-                SEARCH_TEXT_POOL_PART_LOW_VOLUME,
-            )
+
+        broad_pool_sql = two_partition_pool(
+            "timeline_events_search_text_bm25_idx",
+            "timeline_events_search_text_bm25_lowvol_idx",
+            SEARCH_TEXT_POOL_PART_HIGH_VOLUME,
+            SEARCH_TEXT_POOL_PART_LOW_VOLUME,
+        )
+        # The ATTENTION pool: the identical two-partition shape, taken from the
+        # partial indexes that contain only `self` and `direct`. Used only when
+        # the requested tiers are a SUBSET of those -- a call for `noise` or an
+        # unscoped call cannot be answered from an index that does not hold
+        # those rows, and answering it from there would return silently empty
+        # results, the worst failure mode this layer has.
+        #
+        # The literal tier predicate is REQUIRED, not belt-and-braces. A
+        # partial index is usable only when the planner can prove the query
+        # implies its predicate, and `priorities` is a runtime array parameter
+        # it can prove nothing about. Without the literal the planner falls
+        # back to the global index and vchord-bm25 raises, because
+        # to_bm25query() pins an index by name and checks the plan used it.
+        # The runtime `priorities` filter in pool_where still does the actual
+        # selection (a call for just `self` must not return `direct`).
+        attention_pool_sql = two_partition_pool(
+            "timeline_events_search_text_bm25_attention_idx",
+            "timeline_events_search_text_bm25_attention_lowvol_idx",
+            SEARCH_TEXT_POOL_PART_ATTENTION_HIGH_VOLUME,
+            SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME,
+            f" AND t.priority IN ({SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})",
         )
         # Scoring a candidate needs the index its partition was scanned
         # through: the two partitions are two BM25 corpora with their own
@@ -9848,8 +9951,23 @@ class PostgresWarehouse:
             f"CASE WHEN c.part = {SEARCH_TEXT_POOL_PART_HIGH_VOLUME} "
             "THEN (t.search_text <@> "
             "to_bm25query(query, 'timeline_events_search_text_bm25_idx'))::real "
-            "ELSE (t.search_text <@> "
+            f"WHEN c.part = {SEARCH_TEXT_POOL_PART_LOW_VOLUME} "
+            "THEN (t.search_text <@> "
             "to_bm25query(query, 'timeline_events_search_text_bm25_lowvol_idx'))::real "
+            f"WHEN c.part = {SEARCH_TEXT_POOL_PART_ATTENTION_HIGH_VOLUME} "
+            "THEN (t.search_text <@> "
+            "to_bm25query(query, 'timeline_events_search_text_bm25_attention_idx'))::real "
+            f"WHEN c.part = {SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME} "
+            "THEN (t.search_text <@> "
+            "to_bm25query(query, "
+            "'timeline_events_search_text_bm25_attention_lowvol_idx'))::real "
+            # Deliberately no ELSE: every partition names itself. A catch-all
+            # would score a future partition's rows against whichever corpus
+            # happened to be last, which is a WRONG number rather than a
+            # missing one. An unscored partition yields NULL and is dropped by
+            # the `score < 0` guard below, and
+            # test_search_text_broad_candidates_are_scored_through_their_own_partition_index
+            # fails the moment a declared part has no branch here.
             "END"
         )
 
@@ -10131,12 +10249,29 @@ class PostgresWarehouse:
                 -- immediately so the hint cannot leak into the caller's query.
                 IF sources IS NULL THEN
                     PERFORM set_config('enable_sort', 'off', true);
-                    SELECT array_agg(p.adapter), array_agg(p.event_id),
-                           array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
-                      INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
-                      FROM (
-                        """ + broad_pool_sql + r"""
-                      ) p;
+                    -- Two pools, one shape. The ATTENTION pool reads the
+                    -- partial indexes that contain only """ + SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + r""",
+                    -- so it is usable ONLY when every requested tier is one of
+                    -- them; anything else (including no filter at all) has to
+                    -- read the general indexes or it returns silently empty.
+                    -- `priorities` is NULL-normalized to "all tiers" above, so
+                    -- an unscoped call correctly fails this test.
+                    IF priorities IS NOT NULL
+                       AND priorities <@ ARRAY[""" + SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + r"""] THEN
+                        SELECT array_agg(p.adapter), array_agg(p.event_id),
+                               array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
+                          INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
+                          FROM (
+                            """ + attention_pool_sql + r"""
+                          ) p;
+                    ELSE
+                        SELECT array_agg(p.adapter), array_agg(p.event_id),
+                               array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
+                          INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
+                          FROM (
+                            """ + broad_pool_sql + r"""
+                          ) p;
+                    END IF;
                     PERFORM set_config('enable_sort', 'on', true);
                     RETURN QUERY
                         -- The per-source floor needs a RANK, not a score, and

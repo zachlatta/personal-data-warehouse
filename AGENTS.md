@@ -329,6 +329,75 @@ index walks past millions of gmail/slack documents and took 15-16s on an unlucky
 And the pool depth is a measured trade (`SEARCH_TEXT_BROAD_POOL`): deeper gives the
 per-source floor more to promote, up to a point where latency grows and scores do not.
 
+**An attention-scoped broad call reads its own pair of indexes, and the literal tier
+predicate beside them is load-bearing.** `priorities => ARRAY['self']` is the query C3
+exists for, and it was the slowest thing in the layer: `self` is 1.01% of 49M rows and
+`self` + `direct` is 2.72%, so filling a 5,000-row pool from the global index walks ~500k
+score-ordered documents and pays a *random heap visit* on each one to read the tier —
+measured 2026-08-26 on novel queries, cold 15-20s, and through the app's multi-leg hybrid
+past the 60s statement ceiling twice. When every requested tier is one the partial
+`..._bm25_attention_idx` / `..._bm25_attention_lowvol_idx` pair contains, the same
+two-partition pool is taken from them instead. Three things there are easy to get wrong:
+
+- **The subset test is the whole safety argument.** Those indexes hold only `self` and
+  `direct`, so a call for `noise` (82% of the corpus), for `cc`, or with no filter at all
+  must fall back to the general pair. Serving it from the attention pair would return
+  *silently empty*, which is the worst failure this layer has.
+- **The scan repeats `priority IN ('self','direct')` as a LITERAL**, beside the runtime
+  `priorities` filter that does the actual selecting. A partial index is only usable when
+  the planner can prove the query implies its predicate, and `priorities` is a runtime
+  array it can prove nothing about. Drop the literal and the planner picks the global index
+  — and vchord-bm25 then RAISES, because `to_bm25query()` pins an index by name and checks.
+- **The big attention index deliberately carries no adapter list.** Its predicate is the
+  tier alone and the high-volume partition adds `adapter NOT IN (...)` as an ordinary
+  filter, because a predicate derived from the adapter registry needs
+  `rebuild_on_definition_change`, and that rebuild is a non-concurrent DROP+CREATE — minutes
+  of exclusive lock on the 45 GB timeline heap. The low-volume attention index must carry
+  the list to be the low-volume partition at all, and at 90k documents it rebuilds in 59s.
+
+The pair cost 14 MB + 533 MB against the global index's 10.2 GB and took 59s + 4m35s to
+build `CONCURRENTLY` on production (1,333,278 documents). Measured there the same day on
+twelve novel term-bag queries per tier, **alternating which implementation ran first** so
+neither one gets the other's warmed cache — an unbalanced order is worth 5-10x here and
+will tell you whatever you want to hear:
+
+| call | before (p50 / p90) | after (p50 / p90) |
+| --- | --- | --- |
+| `priorities => ARRAY['self']` cold | 13.7s / 24.2s | **2.3s / 8.7s** |
+| `priorities => ARRAY['self']` warm | 10.7s / 20.8s | **1.7s / 1.9s** |
+| `priorities => ARRAY['self','direct']` cold | 8.7s / 15.4s | **1.1s / 1.5s** |
+| `priorities => ARRAY['self','direct']` warm | 7.1s / 16.5s | **1.0s / 1.4s** |
+| unscoped (must not regress) cold | 1.7s / 3.3s | 2.0s / 3.7s |
+| unscoped warm | 0.19s / 0.79s | 0.21s / 0.70s |
+| `ARRAY['noise']` (must not regress) cold | 1.8s / 2.5s | 2.0s / 2.9s |
+| `ARRAY['noise']` warm | 1.9s / 2.3s | 2.0s / 2.2s |
+
+The unscoped and `noise` rows run byte-identical SQL before and after — verified by
+comparing `(ref, score)` for the whole top 50, which matched 50/50 on both — so their
+difference is measurement noise, and it is the honest scale for reading the tier rows.
+
+**The attention path returns a DIFFERENT ranking, and that is not a bug to fix.** On three
+common-term queries the top 50 overlapped the old path's by 30, 25 and 34 of 50, with an
+identical source mix (same twelve sources, same per-source counts) — so the divergence is
+*within* each source. It is the IDF: BM25 statistics come from the index being scanned, and
+an index over `self` + `direct` has different term frequencies than one over all 49M rows.
+That is textbook — the collection you compute IDF over should be the collection you retrieve
+from — and it is the same property the low-volume partition has had all along. Scored back
+on the global scale the new top 50 averages -12.7 against the old -13.5 with an identical
+best hit, and re-scoring the attention pool globally instead did **not** restore the old
+ranking (31/25/35 overlap), which is what proves the shift comes from the deeper candidate
+pool and the sub-corpus statistics rather than from the score column. There is currently no
+labelled benchmark to put an MRR on this (`.search-eval/ground_truth.json` is gone), so it
+is stated rather than quantified.
+
+A **scoped** call needs none of this and does not get it: its branch limit is `max_results`,
+not the pool depth, so it stops after ~20 matching rows rather than 5,000. Measured the same
+day, `sources => ARRAY['gmail'], priorities => ARRAY['self']` was 275ms before the index
+existed. The depth of the pool, not the tier filter, is what made the broad path expensive
+— and that is also why a *rare* term never showed the problem: for a query only a few
+thousand documents match, the global scan exhausts the postings before the tier filter can
+make it walk. Benchmark this with common words, or you will measure nothing.
+
 **A scoped search still pays the operator per returned row, and for Google Drive that is
 the whole cost.** Measured 2026-08-26, `sources => ARRAY['google_drive']` at depth 50 takes
 5.1-8.6s, and the decomposition is 161ms to find the rows, 441ms to window their previews,
