@@ -85,7 +85,7 @@ PGBACKREST_REPO1_S3_KEY_SECRET=...
 PGBACKREST_REPO1_S3_URI_STYLE=path
 PGBACKREST_REPO1_PATH=/personal-data-warehouse
 PGBACKREST_REPO1_CIPHER_PASS=...
-PGBACKREST_IO_TIMEOUT=600
+PGBACKREST_IO_TIMEOUT=1800
 PGBACKREST_ARCHIVE_TIMEOUT=1800
 ```
 
@@ -109,9 +109,15 @@ is why the outage was invisible. Do not confuse this with `POSTGRES_ARCHIVE_TIME
 which is PostgreSQL's own `archive_timeout` (how often an idle server forces a segment
 switch).
 
-The generated config uses a 600-second I/O timeout by default. The Garage S3
+The generated config uses a 1800-second I/O timeout by default. The Garage S3
 repository is backed by an HDD array, where a saturated but healthy read can
-exceed pgBackRest's 60-second default. Override `PGBACKREST_IO_TIMEOUT` only
+exceed pgBackRest's 60-second default. 600 seconds was the first estimate and
+proved too low: slowking runs its own offsite `restic` backup against the same
+array, and while it does, throughput to Garage collapses to ~13 KB/s. Measured
+2026-08-26, that starved a running full backup for 26 minutes, and on 08-25 it
+aborted one outright with `ERROR: [042]: timeout after 600000ms waiting for
+read`. The two backup jobs contend by schedule, so the budget has to survive
+the overlap rather than assume it away. Override `PGBACKREST_IO_TIMEOUT` only
 after measuring the repository; the setting applies consistently to WAL
 archive commands, checks, backups, and restores.
 

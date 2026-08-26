@@ -14,13 +14,21 @@ def test_pgbackrest_io_timeout_is_configurable_and_safe_for_hdd_repositories() -
     reads exceeded 60 seconds and aborted both WAL checks and a differential
     backup.  Keep the default in the generated config so archive-push, checks,
     scheduled backups, and restores all use the same measured budget.
+
+    Raised 600 -> 1800 on 2026-08-26.  600 assumed the repository was merely
+    slow; it is also CONTENDED.  slowking runs its own offsite ``restic``
+    backup against the same HDD array, and while it does, throughput to Garage
+    measured ~13 KB/s -- a running full backup made no progress for 26 minutes,
+    and the 08-25 21:38 attempt died with ``ERROR: [042]: timeout after
+    600000ms waiting for read``.  The budget must outlast the overlap, because
+    nothing coordinates the two schedules.
     """
 
     entrypoint = ENTRYPOINT.read_text()
     readme = README.read_text()
 
-    assert "io-timeout=${PGBACKREST_IO_TIMEOUT:-600}" in entrypoint
-    assert "PGBACKREST_IO_TIMEOUT=600" in readme
+    assert "io-timeout=${PGBACKREST_IO_TIMEOUT:-1800}" in entrypoint
+    assert "PGBACKREST_IO_TIMEOUT=1800" in readme
 
 
 def test_pgbackrest_archive_timeout_is_configurable_and_safe_for_hdd_repositories() -> None:
