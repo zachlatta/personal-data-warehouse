@@ -16,7 +16,8 @@
           "remote-notification"
         ],
         "ITSAppUsesNonExemptEncryption": false
-      }
+      },
+      "appleTeamId": "P6PV2R9443"
     },
     "android": {
       "adaptiveIcon": {
