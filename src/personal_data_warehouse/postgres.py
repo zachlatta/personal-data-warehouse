@@ -1919,6 +1919,8 @@ def _is_text_column(table: str | None, column: str) -> bool:
 
 TIMESTAMP_COLUMNS = {
     "amcheck_at",
+    # timeline: when the coverage reconcile last swept this adapter
+    "last_reconcile_at",
     "oldest_pending_at",
     "last_success_at",
     # mart health: the stalest input pipeline's last write. (When the view's
@@ -4198,6 +4200,11 @@ class PostgresWarehouse:
         self._command(
             "ALTER TABLE @timeline_sync_state "
             "ADD COLUMN IF NOT EXISTS adapter_signature text NOT NULL DEFAULT ''"
+        )
+        self._command(
+            "ALTER TABLE @timeline_sync_state ADD COLUMN IF NOT EXISTS "
+            "last_reconcile_at timestamptz NOT NULL "
+            "DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
         )
         # These ALTERs run under an ACCESS EXCLUSIVE lock on a 45+ GB table and
         # ensure_timeline_tables runs on every timeline sync (~288/day in

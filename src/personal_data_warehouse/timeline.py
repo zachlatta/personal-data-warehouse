@@ -109,6 +109,9 @@ _EPOCH_GUARD = "'1970-01-02 00:00:00+00'::timestamptz"
 # (not 'infinity') so the value roundtrips cleanly through drivers and the
 # NOT NULL state row.
 BACKFILL_CURSOR_START = datetime(9999, 1, 1, tzinfo=UTC)
+# The warehouse-wide "absent" sentinel (see AGENTS.md): absence is the
+# epoch here, never NULL.
+BACKFILL_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 # The exact output shape every adapter query must produce, in order. The
 # engine prepends the adapter name and appends the source table on insert.
@@ -165,6 +168,35 @@ class TimelineAdapter:
     # his answer to an email promotes the thread) converge through this window
     # instead of freezing at first-ingest values.
     refresh_hours: float = 0.0
+    # How far BEHIND the stored watermark each incremental pass restarts.
+    #
+    # The engine walks (ingest_ts, event_id) strictly ascending, so a row whose
+    # ingest stamp is assigned before the watermark moves but whose transaction
+    # commits after this pass has read is skipped FOREVER: the next pass starts
+    # above it, and `_run_refresh` re-walks by EVENT time, which for a
+    # late-backfilled old message is long past. Measured in production
+    # 2026-08-26, that cost 798 of 26,217 Slack rows (3.0%) in one settled day,
+    # every one stamped hours behind a watermark already sitting at "now".
+    #
+    # This is cheap insurance, not the guarantee -- re-reading is bounded by the
+    # source's ingest index and the upsert is content-guarded, so a converged
+    # window writes nothing. It is deliberately SMALL because a source that
+    # restamps rows (Slack rewrites ~330k rows/day for ~25k real messages) makes
+    # a wide window expensive. `reconcile_hours` is what actually closes C1.
+    incremental_lag_hours: float = 0.25
+    # When > 0, every sync pass asks the source which rows in the last N hours
+    # of EVENT time are missing from the timeline, and inserts exactly those.
+    #
+    # Unlike `refresh_hours` (which re-walks a window to reconverge CONTENT),
+    # this is an anti-join against the timeline's own primary key, so it returns
+    # only genuine gaps and costs one index probe per source row in the window.
+    # It is what makes "everything synced eventually lands on the timeline" a
+    # property the engine enforces rather than a claim, because it is immune to
+    # HOW a row was missed -- a lost race, a crashed pass, a watermark repair.
+    reconcile_hours: float = 48.0
+    # How often that sweep may run. Its cost is the window, not the gap count,
+    # so it gets its own cadence instead of riding every pass.
+    reconcile_interval_hours: float = 1.0
     # Opt-in orphan prune. A SELECT returning the adapter's authoritative
     # CURRENT set of event_ids (one text column). Timeline rows for this
     # adapter whose event_id is absent from that set are deleted.
@@ -185,6 +217,11 @@ class TimelineAdapter:
     # safety rollout does not reset all 26 production backfills (48M rows).
     signature_backfill_sql: str = ""
     signature_incremental_sql: str = ""
+    # Gap-only query for `reconcile_hours`, generated beside the others. It is
+    # deliberately NOT part of `adapter_signature`: it changes no row's
+    # normalized content, so including it would reset every adapter's backfill
+    # and re-walk 48M rows to add a pass whose whole purpose is to avoid that.
+    reconcile_sql: str = ""
 
 
 def _real_ts(*exprs: str) -> str:
@@ -310,6 +347,31 @@ def _simple_adapter(
         LIMIT %(limit)s
     """
     max_ingest_sql = f"SELECT max({ingest_ts}) FROM {from_sql} WHERE ({where})"
+    # Rows the source has INGESTED recently that the timeline does not have.
+    #
+    # Windowed on ingest, never on event time: the rows most likely to be
+    # missing are exactly the ones with an old event_ts and a new ingest_ts --
+    # a newly discovered Slack channel backfilling years of history, a late
+    # attachment, a repaired sync. An event-time window is blind to precisely
+    # that population, which is the population that was actually lost.
+    #
+    # The anti-join probes timeline.events' primary key, (adapter, event_id),
+    # so it costs one index lookup per source row in the window and returns
+    # only real gaps. Newest ingest first, so a deadline-bounded run repairs
+    # the freshest damage before it runs out of budget.
+    reconcile_sql = f"""
+        {select}
+          AND ({ingest_ts}) >= %(window_start)s
+          AND (({ingest_ts}), COALESCE(({event_id}), ''))
+              < (%(cursor_ts)s, %(cursor_id)s)
+          AND NOT EXISTS (
+              SELECT 1 FROM @timeline_events tl
+              WHERE tl.adapter = %(adapter)s
+                AND tl.event_id = COALESCE(({event_id}), '')
+          )
+        ORDER BY 13 DESC, 1 DESC
+        LIMIT %(limit)s
+    """
     return TimelineAdapter(
         name=name,
         source_table=source_table,
@@ -325,6 +387,7 @@ def _simple_adapter(
         prune_sql=prune_sql,
         signature_backfill_sql=signature_backfill_sql,
         signature_incremental_sql=signature_incremental_sql,
+        reconcile_sql=reconcile_sql,
     )
 
 
@@ -2588,6 +2651,7 @@ class AdapterSyncStats:
     backfill_rows: int = 0
     incremental_rows: int = 0
     refreshed_rows: int = 0
+    reconciled_rows: int = 0
     pruned_rows: int = 0
     backfill_done: bool = False
     error: str = ""
@@ -2600,6 +2664,7 @@ class _AdapterState:
     backfill_done: bool
     watermark_ts: datetime
     watermark_id: str
+    last_reconcile_at: datetime = BACKFILL_EPOCH
 
 
 class TimelineSyncEngine:
@@ -2689,7 +2754,8 @@ class TimelineSyncEngine:
                 self._dest_sql(
                     """
                     SELECT backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
-                           watermark_ingest_ts, watermark_event_id, adapter_signature
+                           watermark_ingest_ts, watermark_event_id, adapter_signature,
+                           last_reconcile_at
                     FROM @timeline_sync_state
                     WHERE adapter = %s
                     """
@@ -2704,6 +2770,7 @@ class TimelineSyncEngine:
                 backfill_done=bool(row[2]),
                 watermark_ts=row[3],
                 watermark_id=row[4],
+                last_reconcile_at=row[6],
             )
             stored_signature = row[5]
             if stored_signature != adapter_definition_signature(adapter):
@@ -2759,7 +2826,8 @@ class TimelineSyncEngine:
                         last_run_at = now(),
                         last_error = EXCLUDED.last_error,
                         updated_at = now(),
-                        adapter_signature = EXCLUDED.adapter_signature
+                        adapter_signature = EXCLUDED.adapter_signature,
+                        last_reconcile_at = EXCLUDED.last_reconcile_at
                     """
                 ),
                 (
@@ -2840,24 +2908,46 @@ class TimelineSyncEngine:
         total = 0
         batches = 0
         limit = self._batch_limit(adapter)
+        # Restart a little behind the stored watermark so a row that committed
+        # after the previous pass read -- but carries an earlier ingest stamp --
+        # is still reachable. See TimelineAdapter.incremental_lag_hours.
+        lag = timedelta(hours=adapter.incremental_lag_hours)
+        # Rows at or below this are re-reads of the lag window, not new work.
+        # Counting them would make every converged run report progress it did
+        # not make, and `incremental_rows` is what tells an operator whether an
+        # adapter is actually moving.
+        start_ts, start_id = state.watermark_ts, state.watermark_id
+        if lag:
+            cursor_ts = max(state.watermark_ts - lag, datetime(1970, 1, 1, tzinfo=UTC))
+            cursor_id = ""
+        else:
+            cursor_ts, cursor_id = state.watermark_ts, state.watermark_id
         while True:
             rows = self._fetch(
                 adapter.incremental_sql,
                 {
-                    "watermark_ts": state.watermark_ts,
-                    "watermark_id": state.watermark_id,
+                    "watermark_ts": cursor_ts,
+                    "watermark_id": cursor_id,
                     "limit": limit,
                 },
             )
             if not rows:
                 break
             self._upsert(adapter, rows)
+            fresh = sum(1 for row in rows if (row[12], row[0]) > (start_ts, start_id))
             last = rows[-1]
-            state.watermark_ts = last[12]
-            state.watermark_id = last[0]
-            self._save_state(adapter, state)
-            self._bump_counter(adapter, "incremental_rows", len(rows))
-            total += len(rows)
+            cursor_ts, cursor_id = last[12], last[0]
+            # The STORED watermark only ever moves forward. Re-reading the lag
+            # window must not rewind it: an interrupted pass would then resume
+            # even further back each time, and `watermark_age_seconds` would
+            # report a regression that never happened.
+            if (cursor_ts, cursor_id) > (state.watermark_ts, state.watermark_id):
+                state.watermark_ts = cursor_ts
+                state.watermark_id = cursor_id
+                self._save_state(adapter, state)
+            if fresh:
+                self._bump_counter(adapter, "incremental_rows", fresh)
+            total += fresh
             batches += 1
             if (
                 len(rows) < limit
@@ -2945,6 +3035,85 @@ class TimelineSyncEngine:
                 ),
                 rows,
             )
+
+    def _run_coverage_reconcile(
+        self, adapter: TimelineAdapter, state: _AdapterState, deadline: float | None
+    ) -> int:
+        """Insert the rows a recent event window has that the timeline does not.
+
+        C1 says everything synced eventually lands on `timeline.events`. Until
+        this pass existed nothing enforced it: the incremental walk could skip a
+        row permanently (see `incremental_lag_hours`), and the only other pass,
+        `_run_refresh`, re-walks by event time to reconverge CONTENT -- it never
+        asks whether a row is present at all. Measured 2026-08-26, Slack was
+        missing 798 of 26,217 rows (3.0%) in one settled day and every health
+        surface read `ok`, because "adapter is not erroring" was the only thing
+        being checked.
+
+        This asks the source the one question that matters -- which of your rows
+        am I missing -- as an anti-join on the timeline's primary key. It repairs
+        the gap whatever caused it, which is why it is a property and not a
+        patch for one race.
+        """
+
+        if adapter.reconcile_hours <= 0 or not adapter.reconcile_sql:
+            return 0
+        # The sweep's cost is the WINDOW's size, not the number of gaps it
+        # finds: measured on production 2026-08-26, slack_message took 24s to
+        # sweep 48h whether it repaired 62,891 rows or none. Running that on
+        # every pass (~288/day) would spend 2 hours of database time a day to
+        # answer a question that changes slowly, so it runs on its own cadence.
+        interval = timedelta(hours=adapter.reconcile_interval_hours)
+        if interval and datetime.now(tz=UTC) - state.last_reconcile_at < interval:
+            return 0
+        # Anchor the window to the SOURCE's newest ingest, not to wall clock.
+        # A source that is paused, slow, or on a skewed clock would otherwise
+        # have an empty window and reconcile nothing -- reporting healthy for
+        # exactly the reason it is not.
+        with self._source_conn.cursor() as cursor:
+            cursor.execute(self._source_sql(adapter.max_ingest_sql))
+            row = cursor.fetchone()
+        newest_ingest = row[0] if row else None
+        if newest_ingest is None:
+            return 0
+        window_start = newest_ingest - timedelta(hours=adapter.reconcile_hours)
+        cursor_ts: datetime = BACKFILL_CURSOR_START
+        cursor_id = ""
+        total = 0
+        limit = self._batch_limit(adapter)
+        while not _past(deadline):
+            rows = self._fetch(
+                adapter.reconcile_sql,
+                {
+                    "window_start": window_start,
+                    "cursor_ts": cursor_ts,
+                    "cursor_id": cursor_id,
+                    "adapter": adapter.name,
+                    "limit": limit,
+                },
+            )
+            if not rows:
+                break
+            self._upsert(adapter, rows)
+            total += len(rows)
+            self._bump_counter(adapter, "incremental_rows", len(rows))
+            last = rows[-1]
+            cursor_ts, cursor_id = last[3], last[0]
+            if len(rows) < limit:
+                break
+        state.last_reconcile_at = datetime.now(tz=UTC)
+        self._save_state(adapter, state)
+        if total:
+            # Loud on purpose. A steady-state reconcile finds nothing; a nonzero
+            # count means another pass is losing rows, and the number is the
+            # evidence for which one.
+            logger.warning(
+                "timeline reconcile repaired %d missing %s rows in the last %.0fh",
+                total,
+                adapter.name,
+                adapter.reconcile_hours,
+            )
+        return total
 
     def _run_backfill_batch(self, adapter: TimelineAdapter, state: _AdapterState) -> int:
         limit = self._batch_limit(adapter)
@@ -3068,6 +3237,10 @@ class TimelineSyncEngine:
                 stats[adapter.name].incremental_rows = self._run_incremental(adapter, state, deadline)
                 if adapter.refresh_hours > 0 and state.backfill_done:
                     stats[adapter.name].refreshed_rows = self._run_refresh(adapter, deadline)
+                if state.backfill_done:
+                    stats[adapter.name].reconciled_rows = self._run_coverage_reconcile(
+                        adapter, state, deadline
+                    )
                 if adapter.prune_sql and state.backfill_done:
                     stats[adapter.name].pruned_rows = self._run_prune(adapter)
                 stats[adapter.name].backfill_done = state.backfill_done

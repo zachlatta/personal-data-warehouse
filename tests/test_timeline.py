@@ -2043,6 +2043,128 @@ def test_refresh_window_converges_late_signals(warehouse):
     assert row[0][0] == "direct", "his replies retroactively promote the conversation window"
 
 
+def test_coverage_reconcile_is_not_part_of_the_adapter_signature():
+    """Adding the gap repair must not re-walk 48M rows to install itself.
+
+    `adapter_signature` resets an adapter's backfill when it changes, and Slack
+    alone owns 46.8M timeline rows -- a past re-walk grew `timeline.events` to
+    93 GB. `reconcile_sql` changes no row's normalized content, so it must stay
+    out of the signature payload, and so must the two tuning knobs beside it.
+    """
+
+    from dataclasses import replace
+
+    from personal_data_warehouse.timeline import (
+        TIMELINE_ADAPTERS,
+        adapter_definition_signature,
+    )
+
+    for adapter in TIMELINE_ADAPTERS:
+        baseline = adapter_definition_signature(adapter)
+        mutated = replace(
+            adapter,
+            reconcile_sql="SELECT 'obviously different'",
+            reconcile_hours=adapter.reconcile_hours + 24,
+            incremental_lag_hours=adapter.incremental_lag_hours + 1,
+        )
+        assert adapter_definition_signature(mutated) == baseline, (
+            f"{adapter.name}: reconcile/lag settings leaked into adapter_signature, "
+            "which would reset every production backfill"
+        )
+
+
+def test_coverage_reconcile_repairs_a_gap_whatever_caused_it(warehouse):
+    """Delete a synced row behind the engine's back; the next pass restores it.
+
+    The reconcile pass exists so C1 does not depend on every other pass being
+    correct. It asks the source which of its rows the timeline is missing, so
+    it repairs a gap regardless of cause -- a lost watermark race, a crashed
+    pass, a hand-run DELETE. Nothing else in the engine asks that question:
+    `_run_refresh` re-walks a window to reconverge CONTENT and never notices an
+    absent row.
+    """
+
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+        before = warehouse._query_dicts(
+            "SELECT count(*) AS n FROM @timeline_events WHERE adapter = 'slack_message'"
+        )[0]["n"]
+        assert before > 0
+        warehouse._command(
+            "DELETE FROM @timeline_events WHERE adapter = 'slack_message'"
+        )
+        # Drive the reconcile pass directly. Through a full run() the
+        # incremental lag window would restore these rows first, which proves
+        # the belt works but says nothing about the braces.
+        slack = next(a for a in engine._adapters if a.name == "slack_message")
+        slack_state = engine._load_state(slack)
+        # The cadence gate would otherwise skip this sweep: the run above just
+        # stamped last_reconcile_at.
+        slack_state.last_reconcile_at = datetime(1970, 1, 1, tzinfo=UTC)
+        repaired = engine._run_coverage_reconcile(slack, slack_state, None)
+    finally:
+        engine.close()
+
+    after = warehouse._query_dicts(
+        "SELECT count(*) AS n FROM @timeline_events WHERE adapter = 'slack_message'"
+    )[0]["n"]
+    assert after == before, "reconcile did not restore rows missing from the timeline"
+    assert repaired == before
+
+
+def test_incremental_recovers_a_row_written_behind_the_watermark(warehouse):
+    """A source row whose ingest_ts predates the stored watermark must still land.
+
+    This is the loss class C1 was quietly failing, measured in production on
+    2026-08-26: `base_slack.messages` held 26,217 rows in a settled one-day
+    window (8->7 days ago) against 25,419 on the timeline -- 798 missing, 3.0%,
+    across only 12 conversations. Every missing row carried a `synced_at`
+    between 08-25 04:37 and 08-26 06:07 while `ops.timeline_sync_state` had
+    `slack_message.watermark_ingest_ts = 2026-08-26 12:23:14`, i.e. hours to a
+    day AHEAD of them.
+
+    The engine walks `(ingest_ts, event_id)` strictly ascending, so a row that
+    commits after the pass has read -- but carries an ingest stamp from before
+    the watermark moved -- is skipped forever. `_run_refresh` cannot recover it
+    either: that pass re-walks by EVENT time (slack_message keeps 12h), and the
+    lost rows were 7-8 days old by event time. Permanent, silent loss.
+    """
+
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+
+        # The watermark now sits at _NOW. Write a row stamped BEHIND it, exactly
+        # as a late-committing Slack backfill of a newly discovered channel does.
+        behind = _NOW - timedelta(hours=2)
+        warehouse._command(
+            """
+            INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,
+                                        message_datetime, user_id, text, synced_at)
+            VALUES ('z', 'T1', 'C1', '3000.1', %s, 'U1', 'written behind the watermark', %s)
+            """,
+            (behind, behind),
+        )
+        engine.run()
+    finally:
+        engine.close()
+
+    landed = warehouse._query_dicts(
+        "SELECT event_id, snippet FROM @timeline_events "
+        "WHERE adapter = 'slack_message' AND event_id = 'z|T1|C1|3000.1'"
+    )
+    assert landed, (
+        "a source row stamped behind the watermark never reached the timeline; "
+        "this is the permanent-loss class that cost 3.0% of a settled Slack window"
+    )
+    assert landed[0]["snippet"] == "written behind the watermark"
+
+
 def test_incremental_picks_up_new_and_changed_rows(warehouse):
     _ensure_all_source_tables(warehouse)
     _seed_sources(warehouse)

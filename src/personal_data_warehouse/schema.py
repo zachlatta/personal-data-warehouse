@@ -2028,6 +2028,12 @@ TIMELINE_SYNC_STATE_COLUMNS = (
     # definition resets the backfill cursor so historical rows converge to the
     # new shape (the content-guarded upsert makes an unchanged row a no-op).
     "adapter_signature",
+    # When the coverage reconcile last ran for this adapter. The pass is an
+    # anti-join over an ingest window, so its cost is the window's size and NOT
+    # the number of gaps it finds: measured 2026-08-26, slack_message took 24s
+    # to sweep 48h whether it repaired 62,891 rows or none. Gating it on this
+    # column keeps a sweep that must be wide from running every few minutes.
+    "last_reconcile_at",
 )
 
 # Pipeline freshness snapshot (see personal_data_warehouse/pipeline_health.py).
