@@ -50,7 +50,12 @@ SLACK_SYNC_POSTGRES_LOCK_ID = 7_403_111_837
 # the API budget, so it no longer needs to wait behind sweeps that take
 # minutes -- and the sweeps still serialize against each other on the original
 # lock.
-SLACK_FRESHNESS_POSTGRES_LOCK_ID = 7_403_111_838
+# Deliberately clear of the 7_403_111_83x-85x block: several ids in it are
+# written as `<OTHER>_LOCK_ID + 1`, so the next free-looking literal is not
+# free. `tests/test_sync_locks.py::test_advisory_lock_ids_are_unique` resolves
+# those expressions and caught this twice while picking this number - first
+# against calendar sync, then against an alice-voice derived id.
+SLACK_FRESHNESS_POSTGRES_LOCK_ID = 7_403_111_920
 
 
 def _rate_limit_budget_seconds() -> int:
