@@ -14,9 +14,9 @@ Development practices:
   missing environment variables never opt tests out. No production database URL is necessary or
   recommended for tests.
 
-## The seven contracts
+## The eleven contracts
 
-Everything after this section is detail. These seven are what the warehouse *is*, and
+Everything after this section is detail. These eleven are what the warehouse *is*, and
 future work — human or agent — is expected to honor them rather than route around them.
 Each one names what holds it up, because an unenforced contract is one refactor away from
 quietly becoming untrue, and several of these have been.
@@ -48,6 +48,13 @@ quietly becoming untrue, and several of these have been.
 - **C5 — multi-source concepts layer `base_* → derived_*/marts_* → timeline`; consumers read
   the other way, `timeline → marts_* → base_*`.** Raw rows never learn about identity;
   identity and enrichment live in `derived_*`; `marts_*` is the stable read interface.
+  **An intelligent transformation must also READ from the intermediate layer, not from one
+  source's raw table** — enrichment, transcription, extraction and fingerprinting take their
+  candidates from a `marts_*`/`derived_*` relation so a second source is covered the day it
+  lands. Saying only where the *output* lives is what let
+  `base_alice_voice_recordings` sit at 53 recordings with 0 transcripts while every enforced
+  registry passed: the transcription pass scanned `base_apple_voice_memos.files` by name.
+  Identity-layer scanners that genuinely must read raw are the documented exception.
   *Held up by* `tests/test_schema_reorg_contract.py` (layer/schema-name consistency, the
   catalog as the only editable authority, no pre-reorg name anywhere in the source **or the
   docs**).
@@ -63,7 +70,37 @@ quietly becoming untrue, and several of these have been.
   `tests/test_pipeline_health.py`, which asserts the freshness registry and the timeline
   registry cover *exactly* the same tables, and that every catalogued mart gets a health row.
 
-Adding a source touches all seven. The step-by-step list, marked by which steps a test
+- **C8 — search is one hybrid path over the timeline, and its quality is measured.** The
+  `search` tool fuses BM25, pgvector ANN and a gated literal leg by reciprocal rank; the
+  semantic corpus converges on `timeline.events.seq`, so embeddings track the timeline rather
+  than a schedule. *Held up by* `marts_ops.search_health` (chunk/embedding lag as data, not a
+  flag), the source-token and pool-partition tests in `tests/test_repo_contracts.py`, and the
+  labeled benchmark in `src/personal_data_warehouse/search_benchmark.py`
+  (`docs/search-benchmark.md`). *Gap:* the labels are private and gitignored by necessity, so
+  the benchmark is only as alive as the copy someone keeps — it was lost once already, which
+  made retrieval quality unmeasurable until it was rebuilt on 2026-08-26.
+- **C9 — one obvious way to do a thing, on both surfaces.** There is exactly one hybrid
+  search, one SQL entry point per surface, one schema-discovery call. *Held up by*
+  `tool.Surface` splitting MCP-only and CLI-only tools, the `runCall` fence that refuses
+  `pdw call sql|query|search|schema_overview|describe_table` with a redirect, and the usage
+  drift tests in `app/cmd/pdw-cli/usage_test.go`, which derive the command list from the
+  dispatcher rather than a hand-kept list.
+- **C10 — the database is backed up, and a restore has actually been performed.** pgBackRest
+  ships WAL continuously to an encrypted S3 repository and takes periodic fulls. *Held up by*
+  `tests/test_pgbackrest_image.py` for the settings that make it possible, and by nothing at
+  all for the part that matters: whether a backup EXISTS. On 2026-08-26 the stanza reported
+  `status: error (no valid backups)` and had for a day, while WAL archiving kept working and
+  every PDW health surface stayed green, because backups appear in none of them. A backup you
+  have not restored is a hypothesis; the restore drill is the test.
+- **C11 — a source's own SLA is stated and detected, not inferred from the pipeline being
+  green.** A feed can be healthy in aggregate while the part that matters is frozen. *Held up
+  by* per-source detectors where they exist — `marts_ops.slack_conversation_health` judges the
+  SHARE of conversations re-listed per type, because `marts_ops.pipeline_health` rolls Slack up
+  as one pipeline and ~19k public-channel messages a day kept it `ok` straight through a total
+  group-DM outage. *Gap:* Slack is the only source with one. Latency, as opposed to
+  freshness, is still unmeasured almost everywhere.
+
+Adding a source touches all eleven. The step-by-step list, marked by which steps a test
 catches and which fail silently, is [Adding a warehouse source](#adding-a-warehouse-source).
 
 ## Warehouse Schema Layout

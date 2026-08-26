@@ -1477,7 +1477,7 @@ The warehouse also creates read views for current inbox and transcript state:
 - `marts_calendar.unmatched_voice_memos`: completed Voice Memo transcript enrichments without a calendar match
 
 And every one of those sources also lands on `timeline.events`, the cross-source event stream
-that is the recommended starting point — see [The seven contracts](AGENTS.md#the-seven-contracts).
+that is the recommended starting point — see [The eleven contracts](AGENTS.md#the-eleven-contracts).
 
 `base_gmail.messages` stores:
 

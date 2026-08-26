@@ -225,18 +225,43 @@ def test_the_two_bm25_pool_partitions_cover_every_adapter_exactly_once() -> None
 # ---------------------------------------------------------------------------
 
 
-def test_agents_md_states_the_seven_contracts() -> None:
-    """The seven contracts must be stated where future work will read them.
+def test_agents_md_states_every_contract() -> None:
+    """Every contract must be stated where future work will read them.
 
     Zach's requirement is that "future developers / developer agents understand
     these contracts and honor them on future work in this repo". A contract that
     lives only in a Python comment is not a contract anyone can honor.
+
+    Grew from seven to eleven on 2026-08-26. The four added were each already a
+    real requirement that nothing in the repo named, and an unnamed contract is
+    one nobody is accountable for: search quality and embedding freshness (C8),
+    one obvious way to do a thing (C9), backups that have actually been restored
+    (C10), and per-source SLAs (C11). C10 is the cautionary one -- production
+    had no valid backup for a day while every health surface read green.
     """
     text = AGENTS_MD.read_text()
-    assert "## The seven contracts" in text
-    section = text.split("## The seven contracts", 1)[1]
-    for marker in ("C1", "C2", "C3", "C4", "C5", "C6", "C7"):
-        assert re.search(rf"\*\*{marker}\b", section[:6000]), f"contract {marker} is not stated"
+    assert "## The eleven contracts" in text
+    section = text.split("## The eleven contracts", 1)[1]
+    for marker in ("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11"):
+        assert re.search(rf"\*\*{marker}\b", section[:12000]), f"contract {marker} is not stated"
+
+
+def test_c5_requires_enrichment_to_read_the_intermediate_layer() -> None:
+    """C5 must say what a transformation READS, not only where its output lives.
+
+    The original wording said identity and enrichment "live in derived_*" and
+    stopped there. Every enforced registry therefore passed while
+    base_alice_voice_recordings sat at 53 recordings with 0 transcripts: the
+    transcription pass named base_apple_voice_memos.files directly, so a second
+    voice source was invisible to it. The contract has to constrain the input.
+    """
+    text = AGENTS_MD.read_text()
+    section = text.split("## The eleven contracts", 1)[1].split("\n## ", 1)[0]
+    c5 = section.split("**C5", 1)[1].split("**C6", 1)[0]
+    assert "READ" in c5, "C5 does not say what a transformation must read from"
+    assert "alice" in c5.lower(), (
+        "C5 does not carry the evidence that made the input rule necessary"
+    )
 
 
 def test_agents_md_documents_every_priority_tier() -> None:
