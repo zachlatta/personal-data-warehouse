@@ -2647,3 +2647,60 @@ def test_freshness_pass_restricts_candidates_to_the_changed_conversations(monkey
 
     assert warehouse.conversation_payload_calls, "the freshness pass must load candidates"
     assert warehouse.conversation_payload_calls[0]["conversation_ids"] == ("D_CHANGED",)
+
+
+def test_freshness_does_not_share_a_lock_with_the_slow_slack_sweeps():
+    """The stage that sets DM latency must not queue behind the sweeps.
+
+    Every Slack stage used to serialize on one advisory lock with a
+    NON-BLOCKING try, so `slack_workspace_sync` (freshness) simply forfeited
+    its turn whenever coverage, threads-backfill or metadata held it -- and
+    still returned a green MaterializeResult. Measured in production
+    2026-08-26: freshness executed 84 of 225 ticks in 24h (63% were
+    `skipped_due_to_lock` no-ops), with p50 15 min, p90 30 min and max 160 min
+    between real executions. DM ingest latency was p50 13.4 min but **p95 10.3
+    days**, and 13.6% of DMs landed more than a day late.
+
+    Serializing it was right when freshness called conversations.history on
+    ~950 conversations against a ~39/min ceiling. The client.counts change feed
+    ended that: production logs show it fetching 11-43 of ~690 conversations
+    per tick. The sweeps still serialize against each other; freshness no
+    longer waits for them.
+    """
+
+    from personal_data_warehouse.defs.slack_sync import (
+        SLACK_FRESHNESS_POSTGRES_LOCK_ID,
+        SLACK_SYNC_POSTGRES_LOCK_ID,
+    )
+    from personal_data_warehouse.sync_locks import lock_env_prefix, sync_lock_path
+
+    assert SLACK_FRESHNESS_POSTGRES_LOCK_ID != SLACK_SYNC_POSTGRES_LOCK_ID, (
+        "freshness must hold a different advisory lock id than the sweeps, or it "
+        "keeps losing its turn to them"
+    )
+    # The file-lock fallback has to separate too, or a host without
+    # DAGSTER_POSTGRES_URL silently reintroduces the shared lock.
+    assert sync_lock_path("slack-freshness") != sync_lock_path("slack")
+    # The lock name has to survive env-prefix normalisation as its own key.
+    assert lock_env_prefix("slack-freshness") == "SLACK_FRESHNESS"
+
+
+def test_only_the_freshness_stage_gets_the_freshness_lock():
+    """The sweeps must stay serialized with each other.
+
+    Giving every stage its own lock would let coverage, threads-backfill and
+    metadata run concurrently and multiply Slack API concurrency against a
+    ~39 conversations.history calls/min ceiling -- the oversubscription the
+    change feed was built to end. Only freshness is cheap enough to run beside
+    them.
+    """
+
+    import inspect
+
+    from personal_data_warehouse.defs import slack_sync
+
+    source = inspect.getsource(slack_sync)
+    assert source.count("SLACK_FRESHNESS_POSTGRES_LOCK_ID") == 2, (
+        "the freshness lock id should be defined once and used by exactly one "
+        "stage; another stage adopting it would un-serialize the sweeps"
+    )

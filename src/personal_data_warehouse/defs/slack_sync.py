@@ -32,6 +32,25 @@ from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 SLACK_SYNC_POSTGRES_LOCK_ID = 7_403_111_837
+# The freshness stage gets its OWN lock, and that is the point.
+#
+# Every Slack stage used to serialize on one lock with a non-blocking try, so
+# the stage that decides how fast a DM reaches the warehouse competed with the
+# slow sweeps (coverage, threads backfill, metadata) and simply forfeited its
+# turn whenever one was running. Measured 2026-08-26: freshness executed 84 of
+# 225 ticks in 24h -- 63% were `skipped_due_to_lock` no-ops, every one of them
+# reporting SUCCESS -- with gaps of p50 15 min, p90 30 min and max 160 min
+# between real executions. DM ingest latency was p50 13.4 min but p95 10.3
+# DAYS, and 13.6% of DMs arrived more than a day late.
+#
+# Serializing it made sense when freshness meant calling conversations.history
+# on ~950 conversations against a ~39/min ceiling. It does not now: the
+# client.counts change feed tells it which conversations moved, and production
+# logs it fetching 11-43 of ~690 per tick. That is a small, bounded share of
+# the API budget, so it no longer needs to wait behind sweeps that take
+# minutes -- and the sweeps still serialize against each other on the original
+# lock.
+SLACK_FRESHNESS_POSTGRES_LOCK_ID = 7_403_111_838
 
 
 def _rate_limit_budget_seconds() -> int:
@@ -579,6 +598,8 @@ def slack_workspace_sync(context) -> MaterializeResult:
         context,
         stage_name="freshness",
         run_fn=run_slack_freshness_sync,
+        lock_name="slack-freshness",
+        postgres_lock_id=SLACK_FRESHNESS_POSTGRES_LOCK_ID,
     )
 
 
@@ -675,12 +696,14 @@ def _run_locked_slack_stage(
     run_fn,
     fail_on_lock_contention: bool = False,
     lock_wait_seconds: float | None = None,
+    lock_name: str = "slack",
+    postgres_lock_id: int = SLACK_SYNC_POSTGRES_LOCK_ID,
 ) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_slack=True)
     warehouse = warehouse_from_settings(settings)
     with exclusive_sync_lock(
-        name="slack",
-        postgres_lock_id=SLACK_SYNC_POSTGRES_LOCK_ID,
+        name=lock_name,
+        postgres_lock_id=postgres_lock_id,
         wait_seconds=lock_wait_seconds,
     ) as acquired:
         if not acquired:
