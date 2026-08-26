@@ -62,7 +62,9 @@ export default function TimelineScreen() {
     if (fetching === 'none') return;
     const reset = fetching === 'reset';
     let cancelled = false;
-    listTimeline(config, { priorities: tiers, before: reset ? undefined : cursor, limit: PAGE })
+    // A reset starts at now: the timeline is "what happened", and calendar
+    // holds events years out that would otherwise open the list.
+    listTimeline(config, { priorities: tiers, before: reset ? undefined : cursor, jump: reset ? new Date().toISOString() : undefined, limit: PAGE })
       .then((page) => {
         if (!cancelled) dispatch({ type: 'page', generation, reset, items: page.items, cursor: page.next_cursor, hasMore: page.has_more });
       })
@@ -134,10 +136,10 @@ export default function TimelineScreen() {
             <View style={styles.titleRow}>
               <PriorityBadge priority={item.priority} />
               <ThemedText type="smallBold" style={styles.title} numberOfLines={2}>
-                {item.title || '(untitled)'}
+                {item.title || item.context || truncate(item.snippet, 80) || '(untitled)'}
               </ThemedText>
             </View>
-            {item.snippet ? (
+            {item.snippet && (item.title || item.context) ? (
               <ThemedText type="small" themeColor="textSecondary" numberOfLines={2}>
                 {truncate(item.snippet, 200)}
               </ThemedText>
@@ -167,7 +169,7 @@ const styles = StyleSheet.create({
   chipText: { fontSize: 13, fontWeight: '600' },
   row: { paddingHorizontal: Spacing.three, paddingVertical: 10, gap: 4, borderBottomWidth: StyleSheet.hairlineWidth },
   rowHeader: { flexDirection: 'row', justifyContent: 'space-between', gap: Spacing.two },
-  source: { flexShrink: 1, textTransform: 'capitalize' },
+  source: { flexShrink: 1 },
   titleRow: { flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.two },
   title: { flex: 1 },
   footer: { paddingVertical: Spacing.three },

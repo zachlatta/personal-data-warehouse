@@ -9,15 +9,20 @@ import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { getTimelineItem, type TimelineItemDetail } from '@/lib/api';
-import { formatWhen, humanSource, pretty } from '@/lib/format';
+import { cleanSnippet, formatWhen, humanSource, pretty } from '@/lib/format';
 import { useConfig } from '@/lib/session';
 
 const HIDDEN_SOURCE_KEYS = new Set(['raw_json', 'raw', 'body_html', 'search_text']);
 
+// Raw provider blobs (*_json) belong to SQL, not a phone screen.
+function isHiddenKey(key: string): boolean {
+  return HIDDEN_SOURCE_KEYS.has(key) || key.endsWith('_json');
+}
+
 // One line per child row: the values that read as text, in column order.
 function compactRow(row: Record<string, unknown>): string {
   return Object.entries(row)
-    .filter(([key, value]) => !HIDDEN_SOURCE_KEYS.has(key) && value !== null && value !== '' && value !== undefined)
+    .filter(([key, value]) => !isHiddenKey(key) && value !== null && value !== '' && value !== undefined)
     .map(([, value]) => (typeof value === 'string' ? value : pretty(value)))
     .join(' · ')
     .slice(0, 600);
@@ -56,7 +61,7 @@ export default function TimelineItemScreen() {
   const media = detail.item_media ?? null;
   const children = Object.entries(detail.children ?? {}).filter(([, rows]) => Array.isArray(rows) ? rows.length > 0 : true);
   const rows = sourceRow
-    ? Object.entries(sourceRow).filter(([key, value]) => !HIDDEN_SOURCE_KEYS.has(key) && value !== null && value !== '' && value !== undefined)
+    ? Object.entries(sourceRow).filter(([key, value]) => !isHiddenKey(key) && value !== null && value !== '' && value !== undefined)
     : [];
 
   return (
@@ -69,9 +74,9 @@ export default function TimelineItemScreen() {
             {item.kind.replace(/_/g, ' ')} · {formatWhen(item.event_ts)}
           </ThemedText>
         </View>
-        <ThemedText type="subtitle">{item.title || '(untitled)'}</ThemedText>
+        <ThemedText type="subtitle">{item.title || item.context || '(untitled)'}</ThemedText>
         {item.actor ? <ThemedText themeColor="textSecondary">{item.actor}</ThemedText> : null}
-        {item.context ? (
+        {item.context && item.title ? (
           <ThemedText type="small" themeColor="textSecondary">
             {item.context}
           </ThemedText>
@@ -79,7 +84,7 @@ export default function TimelineItemScreen() {
         {media?.media_kind === 'image' && media.media_url ? <Image source={{ uri: media.media_url }} style={styles.image} contentFit="contain" /> : null}
         {item.snippet ? (
           <View style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
-            <ThemedText>{item.snippet}</ThemedText>
+            <ThemedText>{cleanSnippet(item.snippet)}</ThemedText>
           </View>
         ) : null}
         {detail.source_row_error ? (

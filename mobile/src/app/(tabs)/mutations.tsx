@@ -16,6 +16,7 @@ export const STATUS_COLORS: Record<string, string> = {
   executing: '#2563EB',
   executed: '#16A34A',
   succeeded: '#16A34A',
+  observed: '#16A34A',
   rejected: '#6B7280',
   failed: '#DC2626',
   superseded: '#6B7280',

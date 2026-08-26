@@ -13,14 +13,34 @@ import { useConfig } from '@/lib/session';
 
 // The fields that make a mutation reviewable at a glance, per operation. Any
 // other payload key still renders below, so nothing is hidden — only ordered.
-const HEADLINE_KEYS = ['to', 'cc', 'bcc', 'subject', 'body_text', 'thread_ids', 'summary', 'start', 'end', 'name', 'body', 'append_body', 'folder', 'note_id'];
+// Nested payload objects (a calendar event, a patch, an email message) read
+// better as fields than as a JSON blob: lift their entries one level.
+const NESTED_KEYS = ['message', 'event', 'patch'];
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function flattenPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (NESTED_KEYS.includes(key) && isPlainObject(value)) {
+      for (const [sub, subValue] of Object.entries(value)) {
+        // Google's {dateTime, timeZone} start/end objects collapse to the instant.
+        out[sub] = isPlainObject(subValue) && typeof subValue.dateTime === 'string' ? subValue.dateTime : subValue;
+      }
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+const HEADLINE_KEYS = ['to', 'cc', 'bcc', 'subject', 'body_text', 'thread_ids', 'summary', 'start', 'end', 'location', 'description', 'attendees', 'name', 'body', 'append_body', 'folder', 'note_id'];
 
 function MutationCard({ mutation, pending, onRemove }: { mutation: Mutation; pending: boolean; onRemove: () => void }) {
   const theme = useTheme();
-  const payload = mutation.payload ?? {};
-  const message = (payload.message as Record<string, unknown> | undefined) ?? undefined;
-  const merged: Record<string, unknown> = { ...payload, ...(message ?? {}) };
-  delete merged.message;
+  const merged = flattenPayload(mutation.payload ?? {});
   const headline = HEADLINE_KEYS.filter((key) => merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);
   const rest = Object.keys(merged).filter((key) => !HEADLINE_KEYS.includes(key) && merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);
   const removed = mutation.status === 'removed' || mutation.status === 'skipped';
