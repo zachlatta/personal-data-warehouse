@@ -180,8 +180,26 @@ SQLEOF
 
 run_backup() {
   local type="$1"
+  local output status
   log "starting ${type} backup"
-  if ! run_pgbackrest --type="$type" backup; then
+  # Capture the output so a LOCK collision can be told apart from a real
+  # failure. pgBackRest exits non-zero for both, and they are opposite facts:
+  # "another backup is already running" means backups are working.
+  output="$(run_pgbackrest --type="$type" backup 2>&1)"
+  status=$?
+  printf '%s\n' "$output"
+  if [ "$status" -ne 0 ]; then
+    case "$output" in
+      *"unable to acquire lock"*)
+        # Exception 050. Seen for real on 2026-08-26: a long manual full held
+        # the lock and the 6-hourly loop tripped over it every cycle. Recording
+        # that as a failed attempt would paint /pipelines `attention` for the
+        # entire duration of a backup that was succeeding.
+        log "${type} backup skipped: another pgBackRest operation holds the lock"
+        report_health "" 1 ""
+        return 1
+        ;;
+    esac
     log "${type} backup failed"
     # Report the FAILURE too. Reporting only successes is how a loop that never
     # succeeds says nothing at all, which is exactly what happened here.

@@ -70,3 +70,37 @@ def test_pgbackrest_archive_timeout_is_not_confused_with_the_postgres_setting() 
 
     assert "archive_timeout=${POSTGRES_ARCHIVE_TIMEOUT:-300s}" in entrypoint
     assert "archive-timeout=${PGBACKREST_ARCHIVE_TIMEOUT:-1800}" in entrypoint
+
+
+def test_a_lock_collision_is_not_reported_as_a_failed_backup() -> None:
+    """"Another backup is already running" is the opposite of a failure.
+
+    pgBackRest exits non-zero for both, so the loop has to read the message.
+    Seen for real on 2026-08-26: a long manual full held
+    `/tmp/pgbackrest/pdw-backup-1.lock` and the 6-hourly loop tripped over it
+    with `ERROR: [050]: unable to acquire lock`. Recording that as
+    `last_attempt_ok = 0` would paint /pipelines `attention` for the whole
+    duration of a backup that was succeeding — turning the health surface added
+    the same day into a source of false alarms.
+    """
+
+    loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
+
+    assert '*"unable to acquire lock"*' in loop, (
+        "the loop does not distinguish a lock collision from a real failure"
+    )
+    lock_branch = loop.split('*"unable to acquire lock"*', 1)[1].split(";;", 1)[0]
+    assert "report_health \"\" 1 \"\"" in lock_branch, (
+        "a lock collision must refresh collected_at without marking the attempt failed"
+    )
+    assert 'report_health "$type" 0' not in lock_branch, (
+        "a lock collision must not be recorded as a failed backup attempt"
+    )
+
+
+def test_a_real_backup_failure_is_still_reported_as_one() -> None:
+    """The loosening must not swallow the signal it was built to carry."""
+
+    loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
+    assert 'report_health "$type" 0 "${type} backup failed"' in loop
+    assert 'report_health "$type" 1 ""' in loop, "a success must be recorded too"
