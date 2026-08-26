@@ -474,3 +474,61 @@ func TestAPIRejectsUnknownPriorityTier(t *testing.T) {
 		t.Fatalf("invalid tier must not reach the database; statements = %#v", runner.statements)
 	}
 }
+
+func TestPushAndMutationAPIRoutesRequireBearer(t *testing.T) {
+	srv := newMuxAPITestServer(t)
+	for _, path := range []string{"/api/push/register", "/api/push/test", "/api/mutations/requests"} {
+		resp, err := http.Post(srv.URL+path, "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s without a bearer returned %d, want 401", path, resp.StatusCode)
+		}
+	}
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/push/register", strings.NewReader(`{"expo_push_token":"ExponentPushToken[t]","device_name":"sim","platform":"ios"}`))
+	req.Header.Set("Authorization", "Bearer iphone:"+muxAPITestSecret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("register with a bearer returned %d: %s", resp.StatusCode, body)
+	}
+	var registered struct {
+		Device struct {
+			ClientName string `json:"client_name"`
+		} `json:"device"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&registered)
+	if registered.Device.ClientName != "iphone" {
+		t.Fatalf("bearer client name not attributed to the device: %+v", registered)
+	}
+	list, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/mutations/requests", nil)
+	list.Header.Set("Authorization", "Bearer iphone:"+muxAPITestSecret)
+	listResp, err := http.DefaultClient.Do(list)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listResp.Body.Close()
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("mutation list with a bearer returned %d", listResp.StatusCode)
+	}
+}
+
+func TestMutationNotificationShape(t *testing.T) {
+	n := mutationNotification(mutations.Request{ID: "r1", Title: "Send reply", Reason: "asked for it", MutationCount: 2})
+	if n.Title != "2 mutations to review: Send reply" || n.Body != "asked for it" {
+		t.Fatalf("unexpected notification %+v", n)
+	}
+	if n.Data["route"] != "/mutations/r1" || n.Data["request_id"] != "r1" {
+		t.Fatalf("route data missing: %+v", n.Data)
+	}
+	single := mutationNotification(mutations.Request{ID: "r2", Title: "Archive", Mutations: []mutations.Mutation{{}}})
+	if single.Title != "Mutation to review: Archive" || single.Body == "" {
+		t.Fatalf("single-mutation shape wrong: %+v", single)
+	}
+}

@@ -1161,6 +1161,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "upstream_mutation_requests": _data("upstream_mutations", "updated_at", "created_at"),
     "upstream_mutation_events": _support("upstream_mutations", "created_at"),
     "upstream_mutation_request_events": _support("upstream_mutations", "created_at"),
+    "push_devices": _state("upstream_mutations", "updated_at", "iOS app devices registered for push notifications"),
     # This snapshot itself
     "pipeline_health": _data("pipeline_health", "collected_at"),
     "pipeline_table_freshness": _support("pipeline_health", "collected_at"),

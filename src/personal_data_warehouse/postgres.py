@@ -5283,6 +5283,7 @@ class PostgresWarehouse:
             "upstream_mutations",
             "upstream_mutation_events",
             "upstream_mutation_request_events",
+            "push_devices",
         ):
             self._apply_catalog_grant(logical)
 
@@ -5383,6 +5384,28 @@ class PostgresWarehouse:
             "CREATE INDEX IF NOT EXISTS upstream_mutations_status_updated_idx ON @upstream_mutations (status, updated_at)",
             "CREATE INDEX IF NOT EXISTS upstream_mutation_request_events_request_idx ON @upstream_mutation_request_events (request_id, event_index)",
             "CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON @upstream_mutation_events (mutation_id, event_index)",
+            # Devices registered by the PDW iOS app for push notifications. The
+            # Go app owns the writes (POST /api/push/register) and the sends; the
+            # idempotent twin of this DDL lives in app/internal/push/store.go.
+            # A device stays a row after it stops working: `status` flips to
+            # `disabled` with the provider's reason so an unreachable phone is a
+            # fact, not a silently shrinking fan-out.
+            """
+            CREATE TABLE IF NOT EXISTS @push_devices (
+                expo_push_token text PRIMARY KEY,
+                client_name text NOT NULL DEFAULT '',
+                device_name text NOT NULL DEFAULT '',
+                platform text NOT NULL DEFAULT '',
+                app_version text NOT NULL DEFAULT '',
+                status text NOT NULL DEFAULT 'active',
+                error text NOT NULL DEFAULT '',
+                registered_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                last_sent_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                last_error_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS push_devices_status_updated_idx ON @push_devices (status, updated_at)",
         ):
             self._command(sql)
         # Recreate search_text() if needed; general search now reads the

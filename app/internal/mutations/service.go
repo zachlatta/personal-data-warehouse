@@ -79,6 +79,9 @@ func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (
 	if err != nil {
 		return ProposalResponse{}, err
 	}
+	if s.cfg.RequestCreated != nil {
+		s.cfg.RequestCreated(ctx, request)
+	}
 	return s.responseForRequest(request), nil
 }
 
@@ -202,6 +205,15 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, or apple_notes.update_note", index, mutationType)
 	}
 	return nil
+}
+
+// SetRequestCreated installs (or replaces) the Config.RequestCreated hook
+// after construction, for wiring that happens later than NewService.
+func (s *Service) SetRequestCreated(hook func(context.Context, Request)) {
+	if s == nil {
+		return
+	}
+	s.cfg.RequestCreated = hook
 }
 
 func (s *Service) responseForRequest(request Request) ProposalResponse {

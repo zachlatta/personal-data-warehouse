@@ -38,6 +38,10 @@ type Config struct {
 	CalendarAccounts      []string
 	AppleNotesAccounts    []string
 	Now                   func() time.Time
+	// RequestCreated is called after a request lands in pending_review — the
+	// hook the push notifier hangs off. It must not block: the proposal has
+	// already been stored, and a slow provider must not slow the proposer.
+	RequestCreated func(context.Context, Request)
 }
 
 type Store interface {

@@ -47,6 +47,10 @@ type Config struct {
 	ContactGoogleAccounts   []string
 	CalendarAccounts        []string
 	AppleNotesAccounts      []string
+	// ExpoAccessToken authenticates sends to the Expo push service. Optional:
+	// Expo accepts unauthenticated sends unless the project enables enhanced
+	// push security, in which case this is required.
+	ExpoAccessToken string
 
 	// Object storage (optional). When configured, the app can read blob objects
 	// (Gmail attachments, Apple Notes/Messages attachments, Voice Memo audio,
@@ -180,6 +184,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		ContactGoogleAccounts:   parseCSV(getenv("CONTACT_GOOGLE_ACCOUNTS")),
 		CalendarAccounts:        parseCSV(firstNonEmpty(getenv("CALENDAR_ACCOUNTS"), getenv("GMAIL_ACCOUNTS"))),
 		AppleNotesAccounts:      parseCSV(firstNonEmpty(getenv("APPLE_NOTES_ACCOUNTS"), getenv("APPLE_NOTES_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
+		ExpoAccessToken:         strings.TrimSpace(getenv("PDW_EXPO_ACCESS_TOKEN")),
 	}
 
 	var missing []string

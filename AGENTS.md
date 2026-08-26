@@ -973,6 +973,27 @@ LaunchAgents dodge the problem differently — they exec `uv run python` directl
 in the chain — and their `/bin/zsh`/`uv`/venv-python grants (including the uv python
 path-drift gotcha described below) are unchanged.
 
+## iOS app and push notifications
+
+`mobile/` is an Expo app over the app's own HTTP API — the timeline, the mutation
+review queue, and push notifications; see `mobile/README.md`. Three server pieces
+back it, all behind the static bearer the CLI uses:
+
+- `GET|POST /api/mutations/requests…` (`app/internal/mutations/api.go`) is the JSON
+  twin of the `/mutation-review` HTML UI: same store, same approve/deny/remove
+  semantics, actor `app:<client_name>`. It executes nothing.
+- `POST /api/push/register` stores the device's Expo push token in
+  `private.push_devices` (`app/internal/push`); `POST /api/push/test` sends to every
+  active device and returns the fan-out report.
+- A request landing in `pending_review` fires `mutations.Config.RequestCreated`, which
+  the server wires to the push notifier. Delivery is asynchronous and bounded; a
+  `DeviceNotRegistered` ticket flips that row to `disabled` with the reason, so an
+  unreachable phone is a fact in the table rather than a quietly shrinking fan-out.
+
+Push is delivered through the Expo push service (`exp.host`), not APNs directly.
+`PDW_EXPO_ACCESS_TOKEN` is optional on the app deployment. A simulator cannot
+receive push; the app reports `unsupported` there and everything else still works.
+
 ## Voice recordings (a multi-source domain, one pipeline)
 
 Voice has **two** sources — `base_apple_voice_memos.files` (the Mac uploader) and

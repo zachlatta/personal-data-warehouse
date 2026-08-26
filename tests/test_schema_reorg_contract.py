@@ -170,7 +170,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # slack_sessions adds the captured Slack client session that lets the
         # sync ask client.counts what changed instead of polling everything.
         "ops": 28,
-        "private": 7,
+        # +1 private: push_devices, the iOS app's registered push tokens.
+        "private": 8,
         "internal": 2,
     }
 

@@ -2567,6 +2567,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "upstream_mutation_requests": _events(),
     "upstream_mutation_events": _detail("upstream_mutations"),
     "upstream_mutation_request_events": _detail("upstream_mutation_requests"),
+    "push_devices": _state("iOS app devices registered for push notifications"),
     # Search surfaces
     "search_schema_state": _state("search_text DDL signature cache"),
     "search_chunks": _state("derived retrieval chunks behind timeline.search_hybrid()"),
@@ -2602,6 +2603,7 @@ RAW_DDL_TABLES: tuple[str, ...] = (
     "upstream_mutations",
     "upstream_mutation_events",
     "upstream_mutation_request_events",
+    "push_devices",
     "search_schema_state",
 )
 

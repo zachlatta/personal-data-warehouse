@@ -2786,6 +2786,21 @@
       "secret": true
     },
     {
+      "id": "push_devices",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "push_devices",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true,
+      "previous": {
+        "schema": "private",
+        "name": "push_devices"
+      }
+    },
+    {
       "id": "whoop_private_sessions",
       "kind": "table",
       "layer": "private",

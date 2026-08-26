@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/push"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/slacksession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
@@ -214,6 +216,34 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	if mutationSvc != nil {
 		mux.Handle(mutations.ReviewPath+"/", mutationSvc.HTTPHandler())
 		mux.Handle(mutations.ReviewPath, mutationSvc.HTTPHandler())
+		// The iOS app's JSON twin of the review UI, behind the static bearer.
+		mutationSvc.RegisterAPI(mux, authSvc.RequireStaticBearer())
+	}
+	// Push notifications for the iOS app. Devices register through
+	// /api/push/register; a new pending mutation request fans out to every
+	// active device. The registry lives in Postgres when the app has it and
+	// in memory otherwise (tests, and local runs without a database).
+	{
+		var pushStore push.Store
+		if cfg.PostgresDatabaseURL != "" {
+			store, perr := push.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+			if perr != nil {
+				logger.Error("push device store failed to initialize; falling back to in-memory registry", "error", perr.Error())
+			} else {
+				pushStore = store
+			}
+		}
+		if pushStore == nil {
+			pushStore = push.NewMemoryStore()
+		}
+		notifier := push.NewNotifier(pushStore, push.NewExpoClient(cfg.ExpoAccessToken), time.Now, logger)
+		push.NewHandler(pushStore, notifier, time.Now, logger).Register(mux, authSvc.RequireStaticBearer())
+		if mutationSvc != nil {
+			mutationSvc.SetRequestCreated(func(_ context.Context, request mutations.Request) {
+				notifier.NotifyAsync(mutationNotification(request))
+			})
+		}
+		logger.Info("push notification endpoints enabled", "register", push.RegisterPath, "expo_access_token", cfg.ExpoAccessToken != "")
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -399,6 +429,36 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	}
 
 	return logRequests(logger, mux)
+}
+
+// mutationNotification is the alert sent when a request lands in
+// pending_review. data.route is what the app navigates to on tap.
+func mutationNotification(request mutations.Request) push.Notification {
+	body := request.Reason
+	if body == "" {
+		body = "Open the app to review it."
+	}
+	const maxBody = 180
+	if len(body) > maxBody {
+		body = body[:maxBody-1] + "…"
+	}
+	count := request.MutationCount
+	if count == 0 {
+		count = len(request.Mutations)
+	}
+	title := "Mutation to review: " + request.Title
+	if count > 1 {
+		title = fmt.Sprintf("%d mutations to review: %s", count, request.Title)
+	}
+	return push.Notification{
+		Title: title,
+		Body:  body,
+		Data: map[string]any{
+			"route":      "/mutations/" + request.ID,
+			"request_id": request.ID,
+			"kind":       "mutation_request",
+		},
+	}
 }
 
 func queryResponseHasError(resp query.QueryResponse) bool {

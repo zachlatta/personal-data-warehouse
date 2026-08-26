@@ -247,6 +247,7 @@ var Objects = []CatalogObject{
 	{ID: "whatsapp_client_sessions", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "whatsapp_client_sessions", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "whoop_oauth_tokens", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "whoop_oauth_tokens", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "slack_sessions", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "slack_sessions", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
+	{ID: "push_devices", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "push_devices", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "whoop_private_sessions", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "whoop_private_sessions", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "plaid_item_tokens", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "plaid_item_tokens", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "utf8_byte_prefix", Kind: "function", Layer: "internal", Domain: "internal", Schema: "internal", Name: "utf8_byte_prefix", Discoverable: false, QueryAccess: "execute_only", Secret: false, Comment: ""},
