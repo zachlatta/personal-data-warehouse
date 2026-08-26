@@ -8401,6 +8401,16 @@ class PostgresWarehouse:
             ORDER BY
                 (NOT (COALESCE(s.status, '') = 'ok' AND COALESCE(s.last_sync_type, '') = 'full')) DESC,
                 (COALESCE(m.message_count, 0) = 0) DESC,
+                -- Channels Zach is IN, before the ~13k he is not. Membership is
+                -- the strongest available signal that a conversation's contents
+                -- are addressed to him, and coverage is rate-limited enough that
+                -- ordering decides what actually gets synced rather than merely
+                -- what gets synced first. Measured 2026-08-26: 1,609 discovered
+                -- public channels had never been fetched, and two of them --
+                -- #athena-announcements (2,054 members) and #hc-videos -- were
+                -- channels he belongs to, indistinguishable in this ORDER BY
+                -- from any channel he has never opened.
+                c.is_member DESC,
                 CASE c.conversation_type
                     WHEN 'im' THEN 1
                     WHEN 'mpim' THEN 2
