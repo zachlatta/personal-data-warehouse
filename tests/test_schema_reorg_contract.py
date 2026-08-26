@@ -158,7 +158,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # read interface over BOTH WHOOP sources. Reading either raw schema alone
         # is wrong in a different direction, and their units disagree (private
         # HRV in SECONDS, public in milliseconds).
-        "marts": 42,
+        "marts": 43,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -169,7 +169,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # browser-session credential. Search convergence adds one ops row;
         # slack_sessions adds the captured Slack client session that lets the
         # sync ask client.counts what changed instead of polling everything.
-        "ops": 27,
+        "ops": 28,
         "private": 7,
         "internal": 2,
     }
@@ -288,6 +288,10 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
     # ops is reachable only for the operational surfaces the app itself renders.
     app_read = {obj.id for obj in CATALOG.objects if obj.query_access == "app_only"}
     assert app_read == {
+        # The app renders backup posture on /pipelines, and it is the one health
+        # question with no Dagster collector: only the loop inside the Postgres
+        # container can ask pgbackrest anything.
+        "pgbackrest_health",
         "timeline_sync_state",
         "search_chunk_sync_state",
         # Read through the marts_ops views by the /pipelines dashboard; granted

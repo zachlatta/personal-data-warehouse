@@ -2154,6 +2154,46 @@ MART_VIEW_HEALTH_COLUMNS = (
 # One row per checked object across three scopes: the database's own collation,
 # the named collations an index actually depends on, and the unique indexes the
 # corroborating divergence probe could afford.
+#: One row per pgBackRest stanza, written by the backup loop INSIDE the Postgres
+#: container -- the only process that can see both pgBackRest and the warehouse.
+#: The Dagster collector runs elsewhere and cannot shell out to pgbackrest, which
+#: is precisely why backups appeared in no health surface at all: on 2026-08-26
+#: production reported `status: error (no valid backups)` and had for a day,
+#: while WAL archiving kept working, every pipeline read green, and the loop
+#: logged "backup failed" to stdout every six hours where nothing escalated it.
+PGBACKREST_HEALTH_COLUMNS = (
+    "stanza",
+    # pgBackRest's own words, from `info --output=json`: "ok", "error", or the
+    # message it prints when the repository holds no valid backup.
+    "repo_status",
+    "repo_message",
+    # Newest backup of each type. Absent is the epoch sentinel, per the
+    # warehouse-wide convention, and the marts view translates it back to NULL.
+    "last_full_at",
+    "last_diff_at",
+    "last_incr_at",
+    "last_backup_label",
+    "last_backup_type",
+    "backup_count",
+    "repo_bytes",
+    # WAL continuity: archiving can be healthy while no base backup exists, and
+    # reporting only one of them is how this stayed invisible.
+    "wal_min",
+    "wal_max",
+    "archived_count",
+    "failed_count",
+    "last_archived_at",
+    # The loop's own attempt, which is NOT the same question as whether a valid
+    # backup exists: a failing loop with an old good backup and a succeeding
+    # loop with none are different emergencies.
+    "last_attempt_at",
+    "last_attempt_type",
+    "last_attempt_ok",
+    "last_error",
+    "collected_at",
+)
+
+
 COLLATION_HEALTH_COLUMNS = (
     "object_id",
     "scope",

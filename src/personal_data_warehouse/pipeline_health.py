@@ -927,6 +927,32 @@ PIPELINES: tuple[Pipeline, ...] = (
             " mis-ordered index that has no duplicates — amcheck can"
         ),
     ),
+    Pipeline(
+        # Written by the pgBackRest loop INSIDE the Postgres container. Nothing
+        # else can: the Dagster collector runs in a different container and
+        # cannot shell out to pgbackrest, which is exactly why backups appeared
+        # in no health surface until 2026-08-26 -- production reported
+        # `status: error (no valid backups)` for a day while WAL archiving kept
+        # working, every pipeline read green, and the loop logged "backup
+        # failed" every six hours where nothing escalated it.
+        id="pgbackrest",
+        label="Backups (pgBackRest)",
+        kind="internal",
+        cadence="backup loop every 6h",
+        transport="pgBackRest backup loop in the Postgres container -> ops.pgbackrest_health",
+        expected_data_interval=DAY,
+        expected_run_interval=None,
+        data_basis=(
+            "the loop wakes every 6h (PDW_PGBACKREST_BACKUP_INTERVAL_SECONDS=21600) and writes a"
+            " row every wake, so 1d puts late at 2d — four missed wakes, not one"
+        ),
+        note=(
+            "status here is about whether a RESTORABLE BACKUP EXISTS, which is not the same"
+            " question as whether WAL is shipping: archiving stayed perfectly healthy through"
+            " the 2026-08-25 outage and you cannot restore from WAL alone. A backup you have"
+            " not restored is a hypothesis"
+        ),
+    ),
 )
 
 
@@ -1138,6 +1164,11 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
         "collation_health",
         "collected_at",
         note="collation baselines, duplicate-key corroboration, and scheduled amcheck",
+    ),
+    "pgbackrest_health": _data(
+        "pgbackrest",
+        "collected_at",
+        note="does a restorable backup exist, and is WAL still shipping",
     ),
     # The warehouse's own enrichment agent
     "agent_runs": _data("enrichment_agent", "started_at", "started_at"),

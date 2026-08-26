@@ -1286,3 +1286,111 @@ def test_ensure_widens_a_pipeline_health_table_provisioned_before_the_new_column
     # The view is the thing that actually broke, so prove it reads.
     marts = relation("marts_pipeline_health").with_namespace(warehouse.schema_namespace)
     warehouse._query(f'SELECT count(*) FROM "{marts.schema}"."{marts.name}"')
+
+
+# --- backups (C10) ------------------------------------------------------------
+
+
+def _backup_row(warehouse, **overrides):
+    """Insert one ops.pgbackrest_health row and read its judged status back."""
+
+    columns = {
+        "stanza": "pdw",
+        "repo_status": "ok",
+        "repo_message": "",
+        "last_full_at": "now() - interval '2 hours'",
+        "last_diff_at": "now() - interval '2 hours'",
+        "last_incr_at": "now() - interval '2 hours'",
+        "last_backup_label": "20260826-120000F",
+        "last_backup_type": "full",
+        "backup_count": "3",
+        "repo_bytes": "1",
+        "wal_min": "000000010000000000000001",
+        "wal_max": "000000010000000000000009",
+        "archived_count": "100",
+        "failed_count": "0",
+        "last_archived_at": "now() - interval '2 minutes'",
+        "last_attempt_at": "now() - interval '2 hours'",
+        "last_attempt_type": "full",
+        "last_attempt_ok": "1",
+        "last_error": "",
+        "collected_at": "now()",
+    }
+    columns.update(overrides)
+    text_cols = {
+        "stanza", "repo_status", "repo_message", "last_backup_label",
+        "last_backup_type", "wal_min", "wal_max", "last_attempt_type", "last_error",
+    }
+    values = ", ".join(
+        (f"'{v}'" if k in text_cols else str(v)) for k, v in columns.items()
+    )
+    warehouse._command("DELETE FROM @pgbackrest_health")
+    warehouse._command(
+        f"INSERT INTO @pgbackrest_health ({', '.join(columns)}) VALUES ({values})"
+    )
+    return warehouse._query_dicts("SELECT * FROM @marts_pgbackrest_health")[0]
+
+
+def test_no_valid_backup_is_the_loudest_state_there_is(warehouse):
+    """The exact production state of 2026-08-26 must not read green.
+
+    `pgbackrest info` reported `status: error (no valid backups)` and had for a
+    day. WAL archiving was perfect the whole time -- 2,696 segments, zero
+    pending -- every pipeline read `ok`, and the backup loop logged "backup
+    failed" every six hours to a stdout nothing escalates. The outage was
+    visible only by running pgbackrest by hand.
+
+    So this is the case the view exists for, and the WAL columns are exactly
+    what must NOT be allowed to redeem it: you cannot restore from WAL alone.
+    """
+
+    warehouse.ensure_pipeline_health_tables()
+    row = _backup_row(
+        warehouse,
+        backup_count=0,
+        last_full_at="'1970-01-01 00:00:00+00'::timestamptz",
+        last_diff_at="'1970-01-01 00:00:00+00'::timestamptz",
+        last_incr_at="'1970-01-01 00:00:00+00'::timestamptz",
+        repo_status="error",
+        repo_message="no valid backups",
+        # Archiving healthy, exactly as it was.
+        last_archived_at="now() - interval '1 minute'",
+        archived_count=2696,
+    )
+    assert row["status"] == "failing", (
+        "a repository with no valid backup read %r; healthy WAL archiving must "
+        "never redeem a missing base backup" % row["status"]
+    )
+    assert row["last_full_at"] is None, "the epoch sentinel must be translated to NULL"
+
+
+def test_a_healthy_repository_reads_ok(warehouse):
+    warehouse.ensure_pipeline_health_tables()
+    assert _backup_row(warehouse)["status"] == "ok"
+
+
+def test_a_failing_loop_with_an_older_good_backup_is_attention_not_ok(warehouse):
+    """Distinct from "no backup": the clock is running but the floor still holds."""
+
+    warehouse.ensure_pipeline_health_tables()
+    row = _backup_row(warehouse, last_attempt_ok=0, last_error="incr backup failed")
+    assert row["status"] == "attention"
+
+
+def test_stalled_wal_archiving_is_reported_even_with_a_recent_full(warehouse):
+    """A backup is a floor, not a recovery point, once shipping stops."""
+
+    warehouse.ensure_pipeline_health_tables()
+    row = _backup_row(warehouse, last_archived_at="now() - interval '6 hours'")
+    assert row["status"] == "attention"
+
+
+def test_a_stale_snapshot_reports_unknown_rather_than_stale_facts(warehouse):
+    """Store facts, derive status -- the rule the rest of marts_ops follows.
+
+    A row nobody has refreshed cannot testify that backups are fine.
+    """
+
+    warehouse.ensure_pipeline_health_tables()
+    row = _backup_row(warehouse, collected_at="now() - interval '30 days'")
+    assert row["status"] == "unknown"

@@ -537,6 +537,7 @@ func TestPipelinesPageCoversEveryOpsHealthView(t *testing.T) {
 		{"marts_search_health", "search"},
 		{"marts_ops_slack_conversation_health", "slack"},
 		{"marts_ops_plaid_item_health", "plaid"},
+		{"marts_pgbackrest_health", "backups"},
 	} {
 		if !strings.Contains(string(source), view.catalogID) {
 			t.Errorf("/api/pipelines does not query %s; it is inspectable in SQL and invisible on the web", view.catalogID)

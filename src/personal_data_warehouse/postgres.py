@@ -69,6 +69,7 @@ from personal_data_warehouse.schema import (
     PHOTO_ASSET_FILE_COLUMNS,
     PHOTO_SOURCE_FILE_COLUMNS,
     COLLATION_HEALTH_COLUMNS,
+    PGBACKREST_HEALTH_COLUMNS,
     MART_VIEW_HEALTH_COLUMNS,
     PIPELINE_HEALTH_COLUMNS,
     PIPELINE_TABLE_FRESHNESS_COLUMNS,
@@ -830,6 +831,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     # measured facts keyed by the object, replaced in place each collection.
     "mart_view_health": TableSpec(MART_VIEW_HEALTH_COLUMNS, ("view_id",), "collected_at"),
     "collation_health": TableSpec(COLLATION_HEALTH_COLUMNS, ("object_id",), "collected_at"),
+    "pgbackrest_health": TableSpec(PGBACKREST_HEALTH_COLUMNS, ("stanza",), "collected_at"),
 }
 
 # Every table whose rows belong to exactly one linked Plaid Item, data first
@@ -1937,6 +1939,11 @@ TIMESTAMP_COLUMNS = {
     "amcheck_at",
     # timeline: when the coverage reconcile last swept this adapter
     "last_reconcile_at",
+    # backups: newest backup of each type, and when WAL last shipped
+    "last_full_at",
+    "last_diff_at",
+    "last_incr_at",
+    "last_archived_at",
     "oldest_pending_at",
     "last_success_at",
     # mart health: the stalest input pipeline's last write. (When the view's
@@ -2030,6 +2037,13 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    # backups: counts and sizes, plus last_attempt_ok as the warehouse's
+    # bigint 0/1 boolean convention.
+    "backup_count",
+    "repo_bytes",
+    "archived_count",
+    "failed_count",
+    "last_attempt_ok",
     "configured",
     "pgvector_available",
     "timeline_max_seq",
@@ -3827,6 +3841,7 @@ class PostgresWarehouse:
                 "mart_view_health",
                 "collation_health",
                 "search_health",
+                "pgbackrest_health",
             ]
         )
         # _ensure_table_group only CREATEs; it does not widen an existing
@@ -4134,6 +4149,89 @@ class PostgresWarehouse:
                 (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds,
                 note
             FROM classified
+            """,
+        )
+
+        # Backups. The one health question with no collector, because the
+        # Dagster collector cannot shell out to pgbackrest from another
+        # container -- so the backup loop writes this row itself. Two states are
+        # reported separately on purpose: whether a RESTORABLE BACKUP EXISTS and
+        # whether WAL is still shipping. On 2026-08-25 the second was perfect
+        # and the first was `error (no valid backups)` for a day, and you
+        # cannot restore from WAL alone.
+        self._ensure_view(
+            "marts_pgbackrest_health",
+            f"""
+            CREATE OR REPLACE VIEW @marts_pgbackrest_health AS
+            WITH measured AS (
+                SELECT
+                    stanza,
+                    NULLIF(repo_status, '') AS repo_status,
+                    NULLIF(repo_message, '') AS repo_message,
+                    NULLIF(last_full_at, '1970-01-01 00:00:00+00'::timestamptz) AS last_full_at,
+                    NULLIF(last_diff_at, '1970-01-01 00:00:00+00'::timestamptz) AS last_diff_at,
+                    NULLIF(last_incr_at, '1970-01-01 00:00:00+00'::timestamptz) AS last_incr_at,
+                    NULLIF(last_backup_label, '') AS last_backup_label,
+                    NULLIF(last_backup_type, '') AS last_backup_type,
+                    backup_count,
+                    repo_bytes,
+                    NULLIF(wal_min, '') AS wal_min,
+                    NULLIF(wal_max, '') AS wal_max,
+                    archived_count,
+                    failed_count,
+                    NULLIF(last_archived_at, '1970-01-01 00:00:00+00'::timestamptz) AS last_archived_at,
+                    NULLIF(last_attempt_at, '1970-01-01 00:00:00+00'::timestamptz) AS last_attempt_at,
+                    NULLIF(last_attempt_type, '') AS last_attempt_type,
+                    last_attempt_ok,
+                    NULLIF(last_error, '') AS last_error,
+                    NULLIF(collected_at, '1970-01-01 00:00:00+00'::timestamptz) AS collected_at
+                FROM @pgbackrest_health
+            )
+            SELECT
+                stanza,
+                CASE
+                    -- Snapshot too old to speak for the present. Store facts,
+                    -- derive status -- the same rule the rest of marts_ops uses.
+                    WHEN collected_at IS NULL
+                      OR collected_at < now() - interval '{COLLECTOR_STALE_SECONDS} seconds'
+                        THEN 'unknown'
+                    -- No restorable backup at all. This is the state that was
+                    -- invisible, and it outranks every other signal.
+                    WHEN backup_count = 0 OR last_full_at IS NULL THEN 'failing'
+                    WHEN repo_status IS DISTINCT FROM 'ok' THEN 'failing'
+                    -- WAL archiving broken: the backup is a floor, not a
+                    -- recovery point, until shipping resumes.
+                    WHEN last_archived_at IS NULL
+                      OR last_archived_at < now() - interval '1 hour' THEN 'attention'
+                    WHEN last_full_at < now() - interval '14 days' THEN 'stale'
+                    WHEN last_full_at < now() - interval '8 days' THEN 'late'
+                    -- The loop is failing while an older good backup still
+                    -- stands: not an outage yet, but the clock is running.
+                    WHEN last_attempt_ok = 0 THEN 'attention'
+                    ELSE 'ok'
+                END AS status,
+                repo_status,
+                repo_message,
+                last_full_at,
+                last_diff_at,
+                last_incr_at,
+                last_backup_label,
+                last_backup_type,
+                backup_count,
+                repo_bytes,
+                wal_min,
+                wal_max,
+                archived_count,
+                failed_count,
+                last_archived_at,
+                last_attempt_at,
+                last_attempt_type,
+                last_attempt_ok,
+                last_error,
+                collected_at,
+                EXTRACT(EPOCH FROM now() - last_full_at)::bigint AS full_age_seconds,
+                EXTRACT(EPOCH FROM now() - collected_at)::bigint AS snapshot_age_seconds
+            FROM measured
             """,
         )
 

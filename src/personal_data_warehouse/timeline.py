@@ -2578,6 +2578,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "pipeline_table_freshness": _state("per-table freshness snapshot"),
     "mart_view_health": _state("per-marts-view input freshness, non-empty probe, and definition hash"),
     "collation_health": _state("collation drift baselines and unique-index divergence findings"),
+    "pgbackrest_health": _state("backup posture: does a restorable backup exist, is WAL shipping"),
     "search_health": _state("search chunk and embedding convergence heartbeats"),
     # The timeline itself
     "timeline_events": _state("the unified timeline"),

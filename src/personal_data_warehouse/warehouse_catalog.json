@@ -2066,6 +2066,17 @@
       "secret": false
     },
     {
+      "id": "pgbackrest_health",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "pgbackrest_health",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
       "id": "search_health",
       "kind": "table",
       "layer": "ops",
@@ -2100,6 +2111,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "Collation and index integrity. The duplicate-key count is corroboration and cannot see mis-ordered indexes; a bounded persisted rotation runs amcheck bt_index_check across every valid btree, prioritizing never-checked, old, large, and previously failing indexes while retaining unvisited results. Pending/unavailable/timeout/error/corruption are explicit."
+    },
+    {
+      "id": "marts_pgbackrest_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "pgbackrest_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Does a restorable backup exist, and is WAL still shipping. Written by the pgBackRest loop inside the Postgres container, because the Dagster collector runs elsewhere and cannot ask pgbackrest anything - which is why backups appeared in no health surface until 2026-08-26, when production had no valid backup for a day while every pipeline read green. Archiving healthy with no base backup is a real and separately reported state: you cannot restore from WAL alone. Timestamps are NULL when absent, translating the warehouse's 1970-01-01 epoch sentinel."
     },
     {
       "id": "marts_search_health",

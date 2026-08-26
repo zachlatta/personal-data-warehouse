@@ -26,6 +26,7 @@ const (
 	pipelinesSearchMaxRows    = 10
 	pipelinesSlackMaxRows     = 100
 	pipelinesPlaidMaxRows     = 200
+	pipelinesBackupMaxRows    = 20
 )
 
 var pipelineHealthSQL = `
@@ -103,6 +104,19 @@ SELECT account, item_id, institution_name, linked_at, synced_at,
 FROM ` + warehouse.SQLRelation("marts_ops_plaid_item_health") + `
 ORDER BY status, institution_name`
 
+// Backups. The level with no Dagster collector: only the pgBackRest loop
+// inside the Postgres container can ask pgbackrest anything, so it writes its
+// own row. Absent from this page until 2026-08-26, which is how production ran
+// a day with no valid backup while every other level here read green.
+var pipelineBackupHealthSQL = `
+SELECT stanza, status, repo_status, repo_message,
+       last_full_at, last_diff_at, last_incr_at, last_backup_label, last_backup_type,
+       backup_count, repo_bytes, wal_min, wal_max, archived_count, failed_count,
+       last_archived_at, last_attempt_at, last_attempt_type, last_attempt_ok,
+       last_error, collected_at, full_age_seconds, snapshot_age_seconds
+FROM ` + warehouse.SQLRelation("marts_pgbackrest_health") + `
+ORDER BY stanza`
+
 var pipelineSearchHealthSQL = `
 SELECT component, status, model, configured, pgvector_available,
        timeline_max_seq, chunk_cursor_seq, seq_lag, caught_up,
@@ -143,6 +157,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 				"search":     []map[string]any{},
 				"slack":      []map[string]any{},
 				"plaid":      []map[string]any{},
+				"backups":    []map[string]any{},
 				"server_now": s.now().UTC().Format(time.RFC3339Nano),
 				"pending":    true,
 			})
@@ -170,6 +185,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	search := s.optionalRows(r, "search health", pipelineSearchHealthSQL, pipelinesSearchMaxRows)
 	slack := s.optionalRows(r, "slack conversation health", pipelineSlackConversationHealthSQL, pipelinesSlackMaxRows)
 	plaid := s.optionalRows(r, "plaid item health", pipelinePlaidItemHealthSQL, pipelinesPlaidMaxRows)
+	backups := s.optionalRows(r, "backup health", pipelineBackupHealthSQL, pipelinesBackupMaxRows)
 	writeJSON(w, map[string]any{
 		"pipelines":  nonNilRows(pipelines.Rows),
 		"tables":     nonNilRows(tables.Rows),
@@ -179,6 +195,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 		"search":     search,
 		"slack":      slack,
 		"plaid":      plaid,
+		"backups":    backups,
 		"server_now": s.now().UTC().Format(time.RFC3339Nano),
 	})
 }
