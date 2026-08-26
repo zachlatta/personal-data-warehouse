@@ -624,14 +624,22 @@ def test_read_only_query_role_can_read_the_collation_view(warehouse):
 
 
 def test_a_stale_snapshot_reports_unknown(warehouse):
-    """Store facts, derive status: an old snapshot must not present itself as current."""
+    """Store facts, derive status: an old snapshot must not present itself as current.
+
+    Measured against COLLATION_SNAPSHOT_STALE_SECONDS, not the ten-minutely
+    collector's hour. This asset runs DAILY, so judging it hourly made all 252
+    production rows read `unknown` ~96% of every day -- a permanent "no
+    opinion" on the one question Postgres cannot answer for this database.
+    The self-distrust still has to hold at the looser window, which is what
+    this asserts.
+    """
     from datetime import UTC, datetime, timedelta
 
-    from personal_data_warehouse.pipeline_health import COLLECTOR_STALE_SECONDS
+    from personal_data_warehouse.pipeline_health import COLLATION_SNAPSHOT_STALE_SECONDS
 
     collector = CollationHealthCollector(warehouse)
     findings = collector.collect()
-    old = datetime.now(tz=UTC) - timedelta(seconds=COLLECTOR_STALE_SECONDS * 2)
+    old = datetime.now(tz=UTC) - timedelta(seconds=COLLATION_SNAPSHOT_STALE_SECONDS * 2)
     warehouse.write_collation_health(findings, collected_at=old)
     assert {row["status"] for row in _findings(warehouse).values()} == {"unknown"}
 
