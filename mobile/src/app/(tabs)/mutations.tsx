@@ -15,6 +15,7 @@ export const STATUS_COLORS: Record<string, string> = {
   approved: '#2563EB',
   executing: '#2563EB',
   executed: '#16A34A',
+  succeeded: '#16A34A',
   rejected: '#6B7280',
   failed: '#DC2626',
   superseded: '#6B7280',

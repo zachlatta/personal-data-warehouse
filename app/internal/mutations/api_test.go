@@ -157,9 +157,15 @@ func TestAPIListFiltersByStatusAndRejectsUnknownStatus(t *testing.T) {
 		t.Fatal("list rows must not carry full mutation bodies")
 	}
 
-	bad, _ := http.Get(srv.URL + APIPath + "/requests?status=bogus")
+	// Production writes statuses the API was not told about (succeeded); the
+	// filter must pass them through and refuse only malformed tokens.
+	ok, _ := http.Get(srv.URL + APIPath + "/requests?status=succeeded")
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for an unlisted but well-formed status, got %d", ok.StatusCode)
+	}
+	bad, _ := http.Get(srv.URL + APIPath + "/requests?status=Bogus%20Status")
 	if bad.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 for an unknown status, got %d", bad.StatusCode)
+		t.Fatalf("expected 400 for a malformed status, got %d", bad.StatusCode)
 	}
 }
 

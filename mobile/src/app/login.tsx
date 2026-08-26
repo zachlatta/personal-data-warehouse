@@ -31,7 +31,10 @@ export default function LoginScreen() {
       await probe(config);
       await signIn(config);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      // A rejected token is nearly always a mangled paste; the length says so
+      // without ever showing the value.
+      setError(message.includes('token') ? `${message} (token length ${config.token.length})` : message);
     } finally {
       setBusy(false);
     }

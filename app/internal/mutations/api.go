@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -31,10 +32,10 @@ func (s *Service) RegisterAPI(mux *http.ServeMux, requireAuth func(http.Handler)
 	mux.Handle(APIPath+"/", handler)
 }
 
-var apiListStatuses = map[string]bool{
-	"pending_review": true, "approved": true, "rejected": true, "executing": true,
-	"executed": true, "failed": true, "superseded": true,
-}
+// A status is whatever the store writes (pending_review, approved, rejected,
+// executing, succeeded, failed, superseded, ...); the API only refuses tokens
+// that could not be a status at all, so a new terminal state needs no edit here.
+var apiStatusPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 func (s *Service) apiListRequests(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -48,8 +49,8 @@ func (s *Service) apiListRequests(w http.ResponseWriter, r *http.Request) {
 			if status == "" {
 				continue
 			}
-			if !apiListStatuses[status] {
-				apiError(w, http.StatusBadRequest, "unknown status "+status)
+			if !apiStatusPattern.MatchString(status) {
+				apiError(w, http.StatusBadRequest, "malformed status "+status)
 				return
 			}
 			filter.Statuses = append(filter.Statuses, status)
