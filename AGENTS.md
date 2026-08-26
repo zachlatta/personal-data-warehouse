@@ -250,18 +250,51 @@ from two index-ordered BM25 scans — the global index for the high-volume adapt
 index (`timeline_events_search_text_bm25_lowvol_idx`) for the low-volume tail — and applies
 the per-source floor to that pool. The old per-source fan-out ran eighteen branches serially
 in one plpgsql loop, so its wall clock was the SUM of every branch (6.9s warm, 21.7s cold on
-the production corpus) while one index-ordered scan of the same index returns the global
-top 200 in 36ms. A **scoped** call (`sources => ARRAY[...]`) still runs the per-source
-branches. Three things there are load-bearing and easy to undo by accident. The pool pins
-`enable_sort = off` for the scans (the planner has no cost model for the bm25 operator and
-otherwise re-scores every row of a selective adapter filter, ~5.6ms per document) — but
-**only** for the scans: the pool is collected into arrays in its own statement and the hint
-is restored before the ranking runs, because leaving it over the whole plan left the
-planner no sane way to feed the window function and one query then ran for five MINUTES.
+the production corpus) while one index-ordered scan of the same index is tens of
+milliseconds. A **scoped** call (`sources => ARRAY[...]`) still runs the per-source
+branches. Several things there are load-bearing and easy to undo by accident.
+
+**The pool carries the scan's ORDINAL, not a score.** Each partition is
+`ORDER BY <bm25 operator> LIMIT n`, so its rows already emerge in exact relevance order and
+the ordinal IS the rank; naming the operator in the pool's SELECT list as well re-tokenizes
+every pooled document to recover a number the ordering already encoded. Because the two
+partitions split by adapter and every source's adapters live entirely in one of them, the
+per-source floor needs no score at all — only the cross-partition fill does, and the top-k
+of two score-sorted lists is contained in each list's own first k, so at most a couple of
+hundred candidates are ever scored instead of ~5,800. Measured on production 2026-08-26,
+end to end through the two-statement shape the function actually uses: a broad pool went
+575ms → 85ms warm and 1.1-2.2s → 0.3-1.2s cold, and with `priorities => ARRAY['self']`,
+where every surviving document is one of Zach's own large ones, 11.5s → 0.47s warm and
+13.6-37.3s → 1.5-7.6s cold (p50 2.4s). The score *vectors* of the top 50 are
+byte-identical before and after on every query tested; only ties reorder.
+**Measure this the way the function does it** — one `array_agg` statement — because
+`SELECT count(*) FROM (…)` lets the planner delete the unused score expression, which made
+an early measurement of this read the whole cost as free.
+
+The ordinal is honest where `bm25_get_current_score()` is not: it is assigned
+after an explicit ORDER BY, so it is right on the seq-scan-and-sort plan a small or new
+table gets, which is exactly where that helper returns a garbage constant. It stays banned
+(`test_search_text_scores_with_the_bm25_operator_not_the_scan_helper`).
+
+The pool pins `enable_sort = off` for the scans (the planner has no cost model for the bm25
+operator and otherwise re-scores every row of a selective adapter filter, ~5.6ms per
+document) — but **only** for the scans: the pool is collected into arrays in its own
+statement and the hint is restored before the ranking runs, because leaving it over the
+whole plan left the planner no sane way to feed the window function and one query then ran
+for five MINUTES. The only window allowed under the hint is the bare `row_number() OVER ()`
+that captures the ordinal, which needs no sort.
 The low-volume partition needs its OWN index — scanning those adapters through the global
 index walks past millions of gmail/slack documents and took 15-16s on an unlucky query.
 And the pool depth is a measured trade (`SEARCH_TEXT_BROAD_POOL`): deeper gives the
 per-source floor more to promote, up to a point where latency grows and scores do not.
+
+**A scoped search still pays the operator per returned row, and for Google Drive that is
+the whole cost.** Measured 2026-08-26, `sources => ARRAY['google_drive']` at depth 50 takes
+5.1-8.6s, and the decomposition is 161ms to find the rows, 441ms to window their previews,
+and **2.7s to score them** — ~53ms per multi-megabyte Drive document. Moving the score off
+the discarded rows cannot help there, because a scoped single-source search discards
+nothing: the 50 rows it scores are the 50 it returns. Lowering the depth or scoping by
+`since` is the lever an agent has today.
 
 **Phrase a search as the words the answering record would contain, not as the question.**
 Sentence-shaped queries score MRR 0.27 on the labeled benchmark where term-bag queries score
@@ -378,7 +411,28 @@ cleverer algorithm; it is a query that has not been allowed to use the machine. 
 *before* reaching for a new index, a narrower scan, or a rewrite. The measured wins in the
 search layer came from exactly this discipline in reverse — the pooled two-partition BM25
 scan replaced eighteen serial per-source branches whose wall clock was the SUM of every
-branch (6.9s warm, 21.7s cold) with one index-ordered scan at 36ms.
+branch (6.9s warm, 21.7s cold) with two index-ordered scans.
+
+**A documented performance number that silently regressed is itself a bug, so re-measure
+before you quote one.** This section claimed the pooled scan returned the global top 200 in
+36ms until 2026-08-26, when it was actually 2.9s — the pool had grown a per-row bm25 score
+in its SELECT list, which re-tokenizes every pooled document. Re-measured 2026-08-26 on the
+production corpus, novel queries every time (a repeated query is ~3x faster and will tell
+you what you want to hear), and through the two-statement shape the function really uses:
+
+| path | before | after |
+| --- | --- | --- |
+| broad `search_text`, warm | 0.58-0.93s | 0.08-0.17s |
+| broad `search_text`, cold | 1.1-2.2s | 0.3-1.2s |
+| `priorities => ARRAY['self']`, warm | 9.3-12.1s | 0.45-0.58s |
+| `priorities => ARRAY['self']`, cold | 13.6-37.3s | 1.5-7.6s (p50 2.4s) |
+| scoped `sources => ARRAY['google_drive']` | 5.1-8.6s | unchanged — see the search section |
+| `search_text_exact`, novel needle | 1.3-3.7s | unchanged |
+
+`search_text_exact` is a different shape and is **not** the same defect: it already launches
+six parallel workers and its cost is the 7 GB trigram index plus the ILIKE recheck's heap
+I/O. It is not comparable to hybrid's `search_hybrid_exact` leg (0.32s) either — that leg
+searches the bounded `derived_search.chunks` documents, not multi-megabyte timeline ones.
 
 **Large rewrites are their own budget.** The `timeline.events` priority column change from
 `bigint` to the enum failed twice before it worked: the table is 43M rows and the rewrite

@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import UTC, datetime, timedelta
 
 import psycopg2
@@ -40,7 +41,9 @@ from personal_data_warehouse.postgres import (
     INTEGER_COLUMNS,
     POSTGRES_TABLES,
     SEARCH_SCHEMA_REFRESH_LOCK_ID,
+    SEARCH_TEXT_LOW_VOLUME_ADAPTERS,
     SEARCH_TEXT_PREVIEW_CHARS,
+    SEARCH_TEXT_SOURCE_FLOOR,
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
     _dedupe_conflict_rows,
@@ -2592,6 +2595,190 @@ def test_search_text_exact_matches_number_format_variants(warehouse: PostgresWar
     assert len(rows) == 1 and "Phone Fixture" in rows[0][0]
 
 
+def test_search_text_broad_scores_are_the_real_operator_score_on_a_small_corpus(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A broad hit's score must be the bm25 operator's own number, on ANY corpus.
+
+    The broad pool no longer carries a per-row score -- it carries the scan
+    ordinal, and only the few candidates that survive the per-source floor are
+    scored. Two things have to stay true for that to be a pure speed change,
+    and this test is deliberately run against a TINY corpus, which is where the
+    tempting shortcut (`bm25_get_current_score()`, banned by
+    test_search_text_scores_with_the_bm25_operator_not_the_scan_helper) returns
+    a garbage constant instead of failing:
+
+    * every reported score equals an independent recompute of the operator for
+      that exact row, and the scores are not all the same value; and
+    * within a source, the returned order is score order -- which is the
+      assumption that lets the ordinal stand in for the score.
+    """
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(
+                conversation_id="C1", conversation_type="private_channel", sync_version=1
+            )
+        ]
+    )
+    # Documents chosen so their BM25 scores genuinely differ: term frequency
+    # falls and document length rises down the list. A constant-score bug
+    # cannot survive rows whose true scores are this far apart.
+    filler = " ".join(f"unrelatedword{n}" for n in range(120))
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts=f"200.{index}",
+                message_datetime=message_datetime,
+                text=text,
+            )
+            for index, text in enumerate(
+                [
+                    "zanzibar zanzibar zanzibar zanzibar rollout rollout",
+                    "zanzibar zanzibar rollout",
+                    "zanzibar rollout schedule",
+                    "zanzibar schedule",
+                    f"zanzibar rollout {filler}",
+                    "friday lunch plans",
+                ]
+            )
+        ]
+    )
+    # ...and a low-volume source too, so the cross-partition merge is exercised
+    # rather than one partition's ordering standing in for the whole answer.
+    warehouse.insert_contact_cards(
+        [
+            _contact_card_row(
+                card_id="card-zan-1", display_name="Zanzibar Rollout Person", sync_version=1
+            ),
+            _contact_card_row(
+                card_id="card-zan-2", display_name="Zanzibar Person", sync_version=1
+            ),
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    hits = warehouse._query(
+        "SELECT source, ref, score FROM @search_text('zanzibar rollout', 20)"
+    )
+    assert len(hits) >= 5, f"expected the fixture corpus to produce hits, got {hits}"
+    assert all(score < 0 for _, _, score in hits), (
+        "a BM25 hit scores negative; a non-negative score means the merge "
+        "returned a document the scan never matched"
+    )
+    assert len({score for _, _, score in hits}) > 1, (
+        "every hit carrying the same score is the signature of a scan-state "
+        "helper standing in for the operator"
+    )
+
+    # Independent recompute, through the same index the row's pool partition
+    # was scanned with. Equality here is what proves the reported score is the
+    # operator's own value and not an artifact of how the row was fetched.
+    for _, ref, score in hits:
+        adapter, event_id = ref.split(":", 1)
+        index_name = (
+            "timeline_events_search_text_bm25_lowvol_idx"
+            if adapter in SEARCH_TEXT_LOW_VOLUME_ADAPTERS
+            else "timeline_events_search_text_bm25_idx"
+        )
+        expected = warehouse._query(
+            "SELECT (t.search_text <@> to_bm25query(%s, '" + index_name + "'))::real "
+            "FROM @timeline_events t WHERE t.adapter = %s AND t.event_id = %s",
+            ("zanzibar rollout", adapter, event_id),
+        )
+        assert expected and expected[0][0] == score, (
+            f"{ref} was reported with score {score} but the bm25 operator "
+            f"scores it {expected}"
+        )
+
+    # Within one source the output order must be score order. It is produced
+    # from the scan ORDINAL, so this is the assertion that fails if the ordinal
+    # ever stops tracking the score.
+    for source in {source for source, _, _ in hits}:
+        scores = [score for hit_source, _, score in hits if hit_source == source]
+        assert scores == sorted(scores), (
+            f"{source} hits came back out of score order: {scores}"
+        )
+        assert len(scores) >= 1
+
+
+def test_search_text_broad_and_scoped_agree_on_a_source_ordering(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """One source, two code paths, one answer.
+
+    The scoped path still scores every branch row with the operator; the broad
+    path ranks by scan ordinal and scores only the survivors. If the ordinal
+    were not the score order, these two would disagree about the same source --
+    silently, because both return plausible-looking hits.
+    """
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(
+                conversation_id="C1", conversation_type="private_channel", sync_version=1
+            )
+        ]
+    )
+    filler = " ".join(f"unrelatedword{n}" for n in range(80))
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts=f"300.{index}",
+                message_datetime=message_datetime,
+                text=text,
+            )
+            for index, text in enumerate(
+                [
+                    "quokka quokka quokka migration migration",
+                    "quokka migration plan",
+                    "quokka migration",
+                    f"quokka migration {filler}",
+                    "quokka",
+                ]
+            )
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    broad = [
+        (ref, score)
+        for source, ref, score in warehouse._query(
+            "SELECT source, ref, score FROM @search_text('quokka migration', 20)"
+        )
+        if source == "slack"
+    ]
+    scoped = [
+        (ref, score)
+        for ref, score in warehouse._query(
+            "SELECT ref, score FROM @search_text('quokka migration', 20, ARRAY['slack'])"
+        )
+    ]
+    assert broad, "the broad path returned no slack hits for the fixture corpus"
+    # The broad path caps each source at SEARCH_TEXT_BROAD_PER_BRANCH_CAP-ish
+    # depth via the floor + global fill, so compare the prefix they share.
+    depth = min(len(broad), len(scoped))
+    assert depth >= 3
+    assert broad[:depth] == scoped[:depth], (
+        "the ordinal-ranked broad path and the score-ranked scoped path "
+        f"disagree: broad={broad[:depth]} scoped={scoped[:depth]}"
+    )
+
+
 def test_search_text_hits_carry_drilldown_columns(warehouse: PostgresWarehouse) -> None:
     # A hit must terminate in one hop: event_ts mirrors occurred_at (agents
     # copy timeline.events column lists into search calls — the #1 recurring
@@ -4776,8 +4963,22 @@ def test_search_text_broad_pool_forces_the_index_ordered_plan() -> None:
         "the pooled scan must be collected in its own statement while the "
         "enable_sort hint is in force"
     )
-    assert "row_number() OVER" not in scoped, (
+    assert "PARTITION BY" not in scoped, (
         "the per-source ranking must run AFTER enable_sort is restored"
+    )
+    # The one window allowed under the hint is the bare `row_number() OVER ()`
+    # that captures each partition's scan ordinal. It carries no PARTITION BY
+    # and no ORDER BY, so it needs no sort and cannot be the plan the disabled
+    # sort would have broken -- it reads its input in the order the
+    # index-ordered scan produced it.
+    for window in re.findall(r"OVER \([^)]*\)", scoped):
+        assert window == "OVER ()", (
+            "only an unordered, unpartitioned window may run while enable_sort "
+            f"is off; found {window}"
+        )
+    assert "row_number() OVER ()" in scoped, (
+        "the pooled scan must capture its ordinal, which is what lets the "
+        "ranking stage rank without recomputing the bm25 operator per row"
     )
 
 
@@ -4805,6 +5006,53 @@ def test_search_text_broad_pool_previews_only_the_returned_rows() -> None:
         "the broad path must window previews after the per-source floor merge, "
         "not for every pooled candidate"
     )
+
+
+def test_search_text_broad_pool_ranks_by_scan_ordinal_not_a_per_row_rescore() -> None:
+    """The pooled scan must not recompute the bm25 operator per pooled row.
+
+    Each partition is `ORDER BY <bm25 operator> LIMIT n`, an index-ordered
+    scan, so its rows already emerge in exact descending relevance order and
+    the scan ordinal IS the rank. Naming the operator in the pool's SELECT list
+    as well re-tokenizes every pooled document to recover a number the ordering
+    already encoded. Measured on the production corpus 2026-08-26, collecting
+    the pool the way the function actually collects it (one array_agg
+    statement): 5,000 high-volume rows cost 350ms with the score column and
+    108ms without; a whole broad pool 575ms against 85ms; and with
+    `priorities => ARRAY['self']`, where every surviving document is one of
+    Zach's own large ones, 11.5s against 0.47s.
+
+    This is the guard for the defect, not for the fix: it fails on the shape
+    that was shipped.
+    """
+    sql = _search_text_function_sql()
+    off_at = sql.index("set_config('enable_sort', 'off', true)")
+    on_at = sql.index("set_config('enable_sort', 'on', true)")
+    pooled = sql[off_at:on_at]
+    assert "<@>" in pooled, "the pooled scan must still ORDER BY the bm25 operator"
+    for match in re.finditer("<@>", pooled):
+        assert pooled[: match.start()].rstrip().endswith("ORDER BY t.search_text"), (
+            "the bm25 operator may appear only in the pooled scan's ORDER BY; "
+            "anywhere else in the pool it re-scores every pooled document"
+        )
+
+
+def test_search_text_broad_candidates_are_scored_through_their_own_partition_index() -> None:
+    """A candidate's score must come from the index its partition was scanned through.
+
+    The two partitions are two BM25 corpora with their own term statistics, so
+    a low-volume row scored against the global index is not the number the
+    merge was built on. The pool therefore carries which partition a row came
+    from, and the ranking stage picks the index from it.
+    """
+    sql = _search_text_function_sql()
+    ranking = sql[sql.index("set_config('enable_sort', 'on', true)") :]
+    ranking = ranking[: ranking.index("RETURN;")]
+    assert "c.part" in ranking, (
+        "the ranking stage must know which pool partition a candidate came from"
+    )
+    assert "to_bm25query(query, 'timeline_events_search_text_bm25_idx')" in ranking
+    assert "to_bm25query(query, 'timeline_events_search_text_bm25_lowvol_idx')" in ranking
 
 
 def test_search_hybrid_accepts_a_second_query_embedding() -> None:

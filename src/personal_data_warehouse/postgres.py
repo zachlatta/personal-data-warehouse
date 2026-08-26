@@ -209,6 +209,12 @@ SEARCH_TEXT_BROAD_PER_BRANCH_CAP = 12
 # flattens. Re-measure with search_benchmark before moving it.
 SEARCH_TEXT_BROAD_POOL = 5000
 SEARCH_TEXT_BROAD_SMALL_POOL = 800
+# Which BM25 index a pooled row was scanned through, carried on the row so the
+# ranking stage can score a candidate against the same corpus statistics the
+# merge was built on. Two partitions means two bm25 corpora, and a low-volume
+# row scored against the global index is a different number.
+SEARCH_TEXT_POOL_PART_HIGH_VOLUME = 0
+SEARCH_TEXT_POOL_PART_LOW_VOLUME = 1
 # Sources whose documents dominate the corpus, and therefore the global BM25
 # ordering. Everything else is scanned as the second pool partition.
 SEARCH_TEXT_HIGH_VOLUME_SOURCES: tuple[str, ...] = (
@@ -9390,14 +9396,36 @@ class PostgresWarehouse:
             f"AND {SEARCH_DRIVE_EXCLUSION_SQL}"
         )
 
-        def pool_partition(adapter_sql: str, index_name: str, limit: int) -> str:
+        # The pool carries the scan's ORDINAL, not its score. Each partition is
+        # `ORDER BY <bm25 operator> LIMIT n`, so its rows already emerge in
+        # exact descending relevance order and the ordinal IS the rank -- while
+        # the score column re-runs the operator over every pooled document.
+        # Measured on the production corpus 2026-08-26, collecting the pool the
+        # way the function actually collects it (one array_agg statement, not
+        # `count(*)`, which lets the planner delete the unused expression and
+        # made an earlier measurement of this read as free): 5000 high-volume
+        # rows cost 350ms with the score column and 108ms without; a broad
+        # search's two partitions cost 575ms with and 85ms without; and with
+        # `priorities => ARRAY['self']`, where every surviving document is one
+        # of Zach's own large ones, 11.5s with and 0.47s without.
+        # The ordinal is safe where `bm25_get_current_score()` is not: it is
+        # assigned AFTER an explicit ORDER BY, so it is right whatever plan the
+        # planner picked, including the seq-scan-and-sort plan a small or new
+        # table gets. The helper returns a garbage constant on exactly that
+        # plan, which is why tests/test_postgres_warehouse.py bans it.
+        # `row_number() OVER ()` numbers rows in the order its input produces
+        # them; the input is an ORDER BY ... LIMIT subquery, which cannot be
+        # pulled up and which no window without PARTITION BY/ORDER BY re-sorts.
+        def pool_partition(adapter_sql: str, index_name: str, limit: int, part: int) -> str:
             rank = f"t.search_text <@> to_bm25query(query, '{index_name}')"
             return (
-                "( SELECT t.adapter, t.event_id, "
-                f"{pool_source_case} AS source, ({rank})::real AS score "
+                "( SELECT p.adapter, p.event_id, p.source, "
+                f"{part} AS part, row_number() OVER () AS pool_rank "
+                "FROM ( SELECT t.adapter, t.event_id, "
+                f"{pool_source_case} AS source "
                 "FROM @timeline_events t "
                 f"WHERE {pool_where} AND {adapter_sql} "
-                f"ORDER BY {rank} LIMIT {limit} )"
+                f"ORDER BY {rank} LIMIT {limit} ) p )"
             )
 
         broad_pool_sql = (
@@ -9405,13 +9433,27 @@ class PostgresWarehouse:
                 f"t.adapter NOT IN ({low_volume_list})",
                 "timeline_events_search_text_bm25_idx",
                 SEARCH_TEXT_BROAD_POOL,
+                SEARCH_TEXT_POOL_PART_HIGH_VOLUME,
             )
             + "\n                        UNION ALL\n                        "
             + pool_partition(
                 f"t.adapter IN ({low_volume_list})",
                 "timeline_events_search_text_bm25_lowvol_idx",
                 SEARCH_TEXT_BROAD_SMALL_POOL,
+                SEARCH_TEXT_POOL_PART_LOW_VOLUME,
             )
+        )
+        # Scoring a candidate needs the index its partition was scanned
+        # through: the two partitions are two BM25 corpora with their own
+        # statistics, so a low-volume row scored against the global index is
+        # not the number the merge was built on.
+        broad_candidate_score_sql = (
+            f"CASE WHEN c.part = {SEARCH_TEXT_POOL_PART_HIGH_VOLUME} "
+            "THEN (t.search_text <@> "
+            "to_bm25query(query, 'timeline_events_search_text_bm25_idx'))::real "
+            "ELSE (t.search_text <@> "
+            "to_bm25query(query, 'timeline_events_search_text_bm25_lowvol_idx'))::real "
+            "END"
         )
 
         # Run each source branch independently so a missing/unusable BM25 index
@@ -9661,7 +9703,8 @@ class PostgresWarehouse:
                 pool_adapter text[];
                 pool_event_id text[];
                 pool_source text[];
-                pool_score real[];
+                pool_part integer[];
+                pool_rank bigint[];
                 branch_hits @search_text_hit[];
                 executed_branches integer := 0;
                 failed_sources text[] := '{}';
@@ -9692,45 +9735,89 @@ class PostgresWarehouse:
                 IF sources IS NULL THEN
                     PERFORM set_config('enable_sort', 'off', true);
                     SELECT array_agg(p.adapter), array_agg(p.event_id),
-                           array_agg(p.source), array_agg(p.score)
-                      INTO pool_adapter, pool_event_id, pool_source, pool_score
+                           array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
+                      INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
                       FROM (
                         """ + broad_pool_sql + r"""
                       ) p;
                     PERFORM set_config('enable_sort', 'on', true);
                     RETURN QUERY
+                        -- The per-source floor needs a RANK, not a score, and
+                        -- inside one partition the scan ordinal IS the score
+                        -- order. The two partitions split by adapter and every
+                        -- source's adapters live entirely in one of them
+                        -- (test_the_two_bm25_pool_partitions_cover_every_adapter_exactly_once),
+                        -- so ordering a source's rows by ordinal orders them by
+                        -- score, without scoring any of them.
                         WITH broad_ranked AS (
-                            SELECT u.adapter, u.event_id, u.source, u.score,
+                            SELECT u.adapter, u.event_id, u.source, u.part, u.pool_rank,
                                    row_number() OVER (
-                                       PARTITION BY u.source ORDER BY u.score ASC
+                                       PARTITION BY u.source ORDER BY u.part, u.pool_rank
                                    ) AS src_rank
-                            FROM unnest(pool_adapter, pool_event_id, pool_source, pool_score)
-                                 AS u(adapter, event_id, source, score)
-                            WHERE u.score < 0
+                            FROM unnest(pool_adapter, pool_event_id, pool_source,
+                                        pool_part, pool_rank)
+                                 AS u(adapter, event_id, source, part, pool_rank)
                         ),
-                        -- The floor merge runs on ranking keys alone; only the
-                        -- survivors are hydrated and previewed, because
-                        -- windowing a preview scans a large prefix of a
-                        -- possibly multi-megabyte document.
-                        broad_top AS (
-                            SELECT r.adapter, r.event_id, r.source, r.score, r.src_rank
-                            FROM broad_ranked r
-                            ORDER BY (r.src_rank > """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r""") ASC,
-                                     r.score ASC
-                            LIMIT per_source
+                        broad_floor AS (
+                            SELECT * FROM broad_ranked
+                            WHERE src_rank <= """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r"""
+                        ),
+                        -- Only the CROSS-partition fill needs comparable score
+                        -- VALUES, and the top-k of two score-sorted lists is
+                        -- contained in each list's own first k. So the fill
+                        -- candidates are the first (per_source - floor rows)
+                        -- by ordinal from each partition -- at most a couple
+                        -- hundred documents to score, against the ~5,800 the
+                        -- pool used to score.
+                        broad_fill AS (
+                            SELECT f.adapter, f.event_id, f.source, f.part,
+                                   f.pool_rank, f.src_rank
+                            FROM (
+                                SELECT r.*, row_number() OVER (
+                                           PARTITION BY r.part ORDER BY r.pool_rank
+                                       ) AS fill_rank
+                                FROM broad_ranked r
+                                WHERE r.src_rank > """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r"""
+                            ) f
+                            WHERE f.fill_rank <= greatest(
+                                per_source - (SELECT count(*) FROM broad_floor), 0)
+                        ),
+                        broad_candidates AS (
+                            SELECT adapter, event_id, source, part, src_rank FROM broad_floor
+                            UNION ALL
+                            SELECT adapter, event_id, source, part, src_rank FROM broad_fill
+                        ),
+                        -- One heap visit per candidate: the score and the
+                        -- windowed preview both read the same document, so
+                        -- doing them in one join detoasts it once. A pooled row
+                        -- always carries a matching (negative) score -- a BM25
+                        -- index scan only emits documents that contain a query
+                        -- term -- so this filter is a guard, not the merge.
+                        broad_scored AS (
+                            SELECT c.source AS source,
+                                   """ + pool_subsource_case + r""" AS subsource,
+                                   t.context AS context, t.actor AS who,
+                                   t.event_ts AS occurred_at,
+                                   COALESCE(t.source_pk->>'account',
+                                            t.metadata->>'account', '') AS account,
+                                   t.adapter || ':' || t.event_id AS ref,
+                                   """ + preview_fn_sql + r"""(t.search_text, query) AS text,
+                                   """ + broad_candidate_score_sql + r""" AS score,
+                                   t.title AS title, t.source_table AS source_table,
+                                   t.source_pk AS source_pk, t.priority::text AS priority,
+                                   c.src_rank AS src_rank
+                            FROM broad_candidates c
+                            JOIN @timeline_events t
+                              ON t.adapter = c.adapter AND t.event_id = c.event_id
                         )
-                        SELECT b.source, """ + pool_subsource_case + r""", t.context, t.actor,
-                               t.event_ts,
-                               COALESCE(t.source_pk->>'account', t.metadata->>'account', ''),
-                               t.adapter || ':' || t.event_id,
-                               """ + preview_fn_sql + r"""(t.search_text, query),
-                               b.score, t.event_ts, t.title, t.source_table, t.source_pk,
-                               t.priority::text
-                        FROM broad_top b
-                        JOIN @timeline_events t
-                          ON t.adapter = b.adapter AND t.event_id = b.event_id
-                        ORDER BY (b.src_rank > """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r""") ASC,
-                                 b.score ASC;
+                        SELECT s.source, s.subsource, s.context, s.who, s.occurred_at,
+                               s.account, s.ref, s.text, s.score, s.occurred_at,
+                               s.title, s.source_table, s.source_pk, s.priority
+                        FROM broad_scored s
+                        WHERE s.score < 0
+                        ORDER BY (s.src_rank > """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r""") ASC,
+                                 s.score ASC
+                        LIMIT per_source;
                     RETURN;
                 END IF;
 """
