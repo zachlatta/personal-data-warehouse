@@ -2194,7 +2194,17 @@ def _agent_session_adapter() -> TimelineAdapter:
         backfill_sql=backfill_sql,
         incremental_sql=incremental_sql,
         max_ingest_sql="SELECT max(ingested_at) FROM @ai_conversation_events",
-        priority_expression="CASE ... 'self' ... 'background' ... END",
+        # The real rule, verbatim in intent from the rollup SELECT above: a
+        # session Zach actually drove is `self`; one whose opening user turn
+        # repeats near-identically across >=4 sessions is an automated harness
+        # firing the same prompt, so it is `background`. This field is metadata
+        # (the rollup computes the value), which is exactly why it drifted into
+        # a placeholder that named no rule at all -- the registration test only
+        # checks that it is non-empty.
+        priority_expression=(
+            f"CASE WHEN <opening user turn repeats across >=4 sessions> "
+            f"THEN {TIMELINE_PRIORITY_BACKGROUND} ELSE {TIMELINE_PRIORITY_SELF} END"
+        ),
         batch_size=10000,
     )
 
@@ -3244,6 +3254,11 @@ class TimelineSyncEngine:
                 if adapter.prune_sql and state.backfill_done:
                     stats[adapter.name].pruned_rows = self._run_prune(adapter)
                 stats[adapter.name].backfill_done = state.backfill_done
+                # Heartbeat. `_save_state` stamps last_run_at, but every other
+                # caller only reaches it when rows were WRITTEN, so a healthy
+                # adapter with nothing to do looked identical to one that had
+                # stopped running -- `run_age_seconds` meant "last wrote".
+                self._save_state(adapter, state)
             except Exception as exc:  # noqa: BLE001 - keep other adapters running
                 logger.exception("timeline incremental sync failed for %s", adapter.name)
                 stats[adapter.name].error = str(exc)

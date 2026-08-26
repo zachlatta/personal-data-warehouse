@@ -496,6 +496,7 @@ def _engine(warehouse, dest_schema: str | None = None, **kwargs) -> TimelineSync
 
 
 _NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+_EPOCH_TS = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _seed_sources(wh: PostgresWarehouse) -> None:
@@ -2041,6 +2042,52 @@ def test_refresh_window_converges_late_signals(warehouse):
         "SELECT priority FROM @timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
     )
     assert row[0][0] == "direct", "his replies retroactively promote the conversation window"
+
+
+def test_no_adapter_declares_a_placeholder_priority_expression():
+    """`priority_expression` must name a rule, not gesture at one.
+
+    C2 requires every adapter to declare its classification deliberately, and
+    the registration test only checks the field is non-empty. `agent_session`
+    therefore shipped the literal string "CASE ... 'self' ... 'background' ...
+    END" -- it mentions two real tiers, so a keyword check passes, while telling
+    a reader nothing about when either applies. Ellipses are the tell.
+    """
+
+    from personal_data_warehouse.timeline import TIMELINE_ADAPTERS
+
+    for adapter in TIMELINE_ADAPTERS:
+        assert "..." not in adapter.priority_expression, (
+            f"{adapter.name}: priority_expression is a placeholder, not a rule: "
+            f"{adapter.priority_expression!r}"
+        )
+
+
+def test_every_adapter_run_stamps_a_heartbeat(warehouse):
+    """A pass that legitimately had nothing to do must still say it ran.
+
+    `_save_state` was reached only when rows were written, so `last_run_at` --
+    and the `run_age_seconds` built on it in marts_ops.timeline_adapter_health --
+    actually meant "last WROTE". A converged adapter and a stopped one were
+    indistinguishable.
+    """
+
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+        warehouse._command("UPDATE @timeline_sync_state SET last_run_at = %s", (_EPOCH_TS,))
+        # A second pass has no new rows for any adapter.
+        engine.run()
+    finally:
+        engine.close()
+
+    stale = warehouse._query_dicts(
+        "SELECT adapter FROM @timeline_sync_state WHERE last_run_at = %s",
+        (_EPOCH_TS,),
+    )
+    assert not stale, f"adapters ran but never stamped last_run_at: {[r['adapter'] for r in stale]}"
 
 
 def test_coverage_reconcile_is_not_part_of_the_adapter_signature():
