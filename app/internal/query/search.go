@@ -131,10 +131,10 @@ const searchResultColumns = "source, subsource, context, who, occurred_at, accou
 const (
 	searchTextSQL  = "SELECT " + searchResultColumns + " FROM timeline.search_text($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
 	searchExactSQL = "SELECT " + searchResultColumns + " FROM timeline.search_text_exact($1, $2::integer, $3::text[], $4::timestamptz, $5::text[])"
-	// searchHybridSQL is the stable direct-SQL compatibility entry point. The
-	// app deliberately does not call it: one function invocation uses one
-	// Postgres backend, so its BM25, ANN and literal work remains serial.
-	searchHybridSQL = "SELECT " + searchResultColumns + " FROM timeline.search_hybrid($1, $2, $3, $4::integer, $5::text[], $6::timestamptz, $7, $8::text[])"
+	// timeline.search_hybrid itself has no Go-side statement: the app builds
+	// hybrid from the parallel legs below, and the SQL function remains the
+	// direct-SQL entry point for callers writing SQL by hand. A constant the
+	// app never executes is a claim nothing checks, which is why it is gone.
 
 	// Hybrid's expensive retrieval legs return compact evidence independently.
 	// Search fans these statements out over the connection pool and gives their
@@ -172,12 +172,21 @@ const (
 	searchFallbackHybridNotInstalled     = "search_hybrid not installed: postgres image lacks pgvector"
 )
 
-// SearchPriorities are the timeline attention tiers a search may be scoped to,
-// in enum declaration order (highest attention first). They mirror
+// SearchPriorities is every label a search may be scoped to: the five real
+// tiers plus the unclassified sentinel, in enum declaration order. They mirror
 // timeline.timeline_priority exactly; the SQL side validates too, but doing it
 // here means a mistyped tier costs no round trip and the error can name the
-// whole set.
+// tiers that exist. Use SearchPriorityTiers when the question is "what are the
+// tiers" rather than "is this accepted".
 var SearchPriorities = []string{"self", "direct", "cc", "noise", "background", "unclassified"}
+
+// SearchPriorityTiers are the five real attention tiers. 'unclassified' is
+// deliberately not one of them: it is the fail-loud sentinel for a row an
+// adapter has not classified, and it must never appear in steady state.
+// Scoping a search to it is how a classification outage is FOUND, so it stays
+// accepted -- but an error that lists it beside the five, as this one used to,
+// teaches the caller it is a sixth tier.
+var SearchPriorityTiers = []string{"self", "direct", "cc", "noise", "background"}
 
 // validateSearchPriorities returns an error naming the valid set on the first
 // unknown token. Silently dropping it would be the worst outcome: the caller
@@ -188,8 +197,9 @@ func validateSearchPriorities(priorities []string) error {
 		if slices.Contains(SearchPriorities, priority) {
 			continue
 		}
-		return fmt.Errorf("unknown priority %q; valid priorities are %s",
-			priority, strings.Join(SearchPriorities, ", "))
+		return fmt.Errorf("unknown priority %q; the attention tiers are %s (most attention first). "+
+			"'unclassified' is also accepted, but it is a fail-loud sentinel for rows an adapter has not classified, not a sixth tier",
+			priority, strings.Join(SearchPriorityTiers, ", "))
 	}
 	return nil
 }

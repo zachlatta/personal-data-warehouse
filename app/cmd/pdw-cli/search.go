@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -47,21 +48,83 @@ type cliSearchHit struct {
 	Ref        string `json:"ref"`
 }
 
-func runSearch(client *cliclient.Client, args []string, stdout, stderr io.Writer) int {
+// searchUsage is this command's OWN help. `pdw search --help` used to
+// short-circuit to the global usage, so the flags the command accepts were
+// undiscoverable from the command itself -- which is a large part of why
+// --priority was used six times in a month of real agent sessions while it
+// silently worked the whole time.
+const searchUsage = `pdw search - hybrid search across every synced source.
+
+USAGE
+  pdw search [flags] QUERY...
+
+Flags may appear before or after the query. This is the normal CLI search
+path; no JSON or SQL required.
+
+FLAGS
+  --mode MODE          hybrid (default), keyword, or exact. Use exact for a
+                       literal phrase, email address, phone, amount, id or path.
+  -n, --max-results N  Maximum hits (default 20).
+  --source NAMES       Source aliases, comma-separated; repeatable.
+                       (alias: --sources)
+  --priority TIERS     Attention tiers, comma-separated; repeatable.
+                       (alias: --priorities)
+                         self        Zach initiated it
+                         direct      a real person reaching him directly
+                         cc          real-people activity he is peripheral to
+                         noise       bulk or automated traffic
+                         background  the warehouse's own machinery
+                       Omitting it searches every tier. "What needs my
+                       attention" means self,direct,cc -- noise is most of the
+                       corpus, so leaving it in is usually why a search returns
+                       junk. (unclassified is also accepted, but it is a
+                       fail-loud sentinel for rows an adapter has not
+                       classified, not a sixth tier.)
+  --since TIME         Lower event-time bound, e.g. 2026-08-01.
+  --output FMT         text (default) or json.
+
+EXAMPLES
+  pdw search 'runway burn rate months cash remaining'
+  pdw search --priority self,direct 'budget approval'
+  pdw search --source gmail,slack --since 2026-08-01 'budget approval'
+  pdw search --mode exact --output json 'admin/api-keys'
+`
+
+// searchOptions holds every value the search FlagSet binds. It exists so the
+// FlagSet can be built once and inspected by the usage-drift test, which walks
+// it with VisitAll and requires each flag to appear in the help text.
+type searchOptions struct {
+	mode       string
+	maxResults int
+	since      string
+	output     string
+	sources    searchSourcesFlag
+	priorities searchSourcesFlag
+}
+
+func newSearchFlagSet(opts *searchOptions) *flag.FlagSet {
 	fs := flag.NewFlagSet("search", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	mode := fs.String("mode", "hybrid", "hybrid, keyword, or exact")
-	maxResults := fs.Int("max-results", cliSearchDefaultMaxResults, "maximum hits")
-	fs.IntVar(maxResults, "n", cliSearchDefaultMaxResults, "alias for --max-results")
-	since := fs.String("since", "", "event-time lower bound")
-	output := fs.String("output", "text", "text or json")
-	var sources searchSourcesFlag
-	fs.Var(&sources, "source", "source aliases, comma-separated; repeatable")
-	fs.Var(&sources, "sources", "alias for --source")
-	var priorities searchSourcesFlag
-	fs.Var(&priorities, "priority", "attention tiers (self, direct, cc, noise, background), comma-separated; repeatable")
-	fs.Var(&priorities, "priorities", "alias for --priority")
+	fs.StringVar(&opts.mode, "mode", "hybrid", "hybrid, keyword, or exact")
+	fs.IntVar(&opts.maxResults, "max-results", cliSearchDefaultMaxResults, "maximum hits")
+	fs.IntVar(&opts.maxResults, "n", cliSearchDefaultMaxResults, "alias for --max-results")
+	fs.StringVar(&opts.since, "since", "", "event-time lower bound")
+	fs.StringVar(&opts.output, "output", "text", "text or json")
+	fs.Var(&opts.sources, "source", "source aliases, comma-separated; repeatable")
+	fs.Var(&opts.sources, "sources", "alias for --source")
+	fs.Var(&opts.priorities, "priority", "attention tiers (self, direct, cc, noise, background), comma-separated; repeatable")
+	fs.Var(&opts.priorities, "priorities", "alias for --priority")
+	return fs
+}
+
+func runSearch(client *cliclient.Client, args []string, stdout, stderr io.Writer) int {
+	var opts searchOptions
+	fs := newSearchFlagSet(&opts)
 	if err := fs.Parse(searchFlagsFirst(args)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stdout, searchUsage)
+			return 0
+		}
 		fmt.Fprintln(stderr, "pdw search:", err)
 		return 2
 	}
@@ -70,19 +133,19 @@ func runSearch(client *cliclient.Client, args []string, stdout, stderr io.Writer
 		fmt.Fprintln(stderr, "pdw search: query is required (example: pdw search 'budget approval')")
 		return 2
 	}
-	if *maxResults <= 0 {
+	if opts.maxResults <= 0 {
 		fmt.Fprintln(stderr, "pdw search: --max-results must be greater than zero")
 		return 2
 	}
-	if *output != "text" && *output != "json" {
+	if opts.output != "text" && opts.output != "json" {
 		fmt.Fprintln(stderr, "pdw search: --output must be text or json")
 		return 2
 	}
 
 	input, err := json.Marshal(map[string]any{
-		"query": queryText, "mode": *mode, "max_results": *maxResults,
-		"sources": []string(sources), "since": *since,
-		"priorities": []string(priorities),
+		"query": queryText, "mode": opts.mode, "max_results": opts.maxResults,
+		"sources": []string(opts.sources), "since": opts.since,
+		"priorities": []string(opts.priorities),
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw search:", err)
@@ -102,7 +165,7 @@ func runSearch(client *cliclient.Client, args []string, stdout, stderr io.Writer
 		fmt.Fprintln(stderr, "pdw search:", resp.Error)
 		return 1
 	}
-	if *output == "json" {
+	if opts.output == "json" {
 		pretty, err := prettyJSON(raw)
 		if err != nil {
 			fmt.Fprintln(stderr, "pdw search: encode response:", err)

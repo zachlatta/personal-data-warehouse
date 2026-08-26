@@ -181,10 +181,32 @@ WHERE priority IN ('self', 'direct', 'cc')
 ORDER BY event_ts DESC LIMIT 100;
 ```
 
+**The tier is a filter, not just a label, and it is the same filter everywhere.** Reading
+`timeline.events` directly, the predicate above is it. Every search entry point takes the
+tiers as `priorities`, a `text[]`, and an unknown token raises with the valid list rather
+than being dropped into a search of everything:
+
+```sql
+SELECT * FROM timeline.search_text('budget approval', 20, priorities => ARRAY['self','direct']);
+SELECT * FROM timeline.search_text_exact('invoice 4831', 20, priorities => ARRAY['self']);
+```
+
+```bash
+pdw search --priority self,direct 'budget approval'      # the CLI form
+```
+
+The `search` tool (and its MCP twin) takes the same filter as `"priorities": ["self","direct"]`.
+Omitting it searches every tier, which is almost never what an attention question wants:
+`noise` alone is most of the corpus, so leaving it in is the usual reason a search comes back
+full of newsletters. Every hit carries its own `priority` column, so a filtered search can
+always show its work.
+
 `unclassified` is the sixth label and is **not a tier** — it is a fail-loud sentinel for rows
-the sync has not classified yet. It must never appear in steady state; if a query returns
-`unclassified` rows, an adapter's classification did not run, and the answer to whatever was
-asked is wrong rather than merely incomplete. The tiers themselves are heuristics and are
+the sync has not classified yet. It is accepted by the `priorities` filter, because scoping a
+search to it is how a classification outage is *found*, but any surface that lists it beside
+the five real tiers is teaching a sixth tier that does not exist. It must never appear in
+steady state; if a query returns `unclassified` rows, an adapter's classification did not run,
+and the answer to whatever was asked is wrong rather than merely incomplete. The tiers themselves are heuristics and are
 expected to be tuned; the sentinel is not.
 
 **Changing a high-volume adapter's classification SQL is not a cheap edit.** `priority` is
@@ -205,7 +227,7 @@ adapter's actual classification expression still resets that adapter normally.
 
 Text search runs through three timeline functions plus one app tool:
 
-- `timeline.search_text(query, max_results, sources, since)` — ranked BM25. Hits carry
+- `timeline.search_text(query, max_results, sources, since, priorities)` — ranked BM25. Hits carry
   `event_ts` (mirror of `occurred_at`), `title`, `source_table`, `source_pk` for one-hop
   drill-down; the `text` preview is windowed around the first matched term; `sources`
   accepts familiar aliases (`apple_messages`, `voice_memos`, `drive`, ...); a partially
@@ -217,6 +239,12 @@ Text search runs through three timeline functions plus one app tool:
 - `timeline.context(ref, before, after)` — the neighboring events of a hit's
   (source, context) stream: the surrounding chat/channel messages, or the surrounding
   turns of an agent session (context `<source>|<session_id>`).
+
+The named parameters are exactly `max_results`, `sources`, `since` and `priorities`; anything
+else is an invented name and raises. `priorities` is the attention filter documented under
+[Timeline priority tiers](#timeline-priority-tiers) — `priorities => ARRAY['self','direct']`
+in SQL, `--priority self,direct` on the CLI, `"priorities": [...]` on the tool.
+
 A **broad** (unscoped) `search_text` call does not fan out per source: it pools candidates
 from two index-ordered BM25 scans — the global index for the high-volume adapters, a partial
 index (`timeline_events_search_text_bm25_lowvol_idx`) for the low-volume tail — and applies

@@ -60,11 +60,50 @@ After installing:
 ```bash
 pdw login    # interactive: stores API URL + token in ~/.config/pdw/config.json
 pdw list     # confirms the connection works
+pdw search 'offer letter signed start date'
 pdw sql -q 'Find offer letters' "SELECT * FROM timeline.search_text('offer letter', 50)"
 pdw update   # later: self-updates to the newest release
 ```
 
 See [`app/README.md`](app/README.md) for the full command reference.
+
+### Searching by attention tier
+
+Every `timeline.events` row carries a `priority` — one of `self` (Zach initiated it),
+`direct` (a real person reaching him directly), `cc` (real-people activity he is peripheral
+to), `noise` (bulk or automated traffic), or `background` (the warehouse's own machinery), in
+that attention order. Scoping to it is usually the difference between an answer and 49M rows:
+`noise` alone is most of the corpus, so leaving it in is the usual reason a search comes back
+full of newsletters.
+
+The filter is the same one on every surface — `priorities`, a `text[]` of tiers — and an
+unknown token raises with the valid list instead of silently searching everything:
+
+```bash
+pdw search --priority self,direct 'budget approval'
+```
+
+```sql
+SELECT * FROM timeline.search_text('budget approval', 20, priorities => ARRAY['self','direct']);
+
+SELECT event_ts, priority, source, actor, title, snippet
+FROM timeline.events
+WHERE priority IN ('self', 'direct', 'cc')
+  AND event_ts >= now() - interval '1 day'
+ORDER BY event_ts DESC LIMIT 100;
+```
+
+The `search` tool takes it as `"priorities": ["self","direct"]`, and every hit carries its own
+`priority` column so a filtered search can show its work. `search_text` /
+`search_text_exact`'s named parameters are exactly `max_results`, `sources`, `since` and
+`priorities`; anything else is an invented name and raises.
+
+`unclassified` is a sixth enum label and is **not a tier**: it is a fail-loud sentinel for
+rows the sync has not classified yet, and it must never appear in steady state. The filter
+accepts it — scoping a search to it is how a classification outage is found — but a row that
+comes back `unclassified` means an adapter's classification did not run, so the answer is
+wrong rather than merely incomplete. See
+[Timeline priority tiers](AGENTS.md#timeline-priority-tiers).
 
 ## Dependency Management
 

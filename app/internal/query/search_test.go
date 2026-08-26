@@ -674,7 +674,7 @@ func TestSearchHitsCarryPriority(t *testing.T) {
 	if !strings.Contains(searchResultColumns, "priority") {
 		t.Fatalf("searchResultColumns must select priority: %q", searchResultColumns)
 	}
-	for _, statement := range []string{searchTextSQL, searchExactSQL, searchHybridSQL, searchHybridFuseSQL} {
+	for _, statement := range []string{searchTextSQL, searchExactSQL, searchHybridFuseSQL} {
 		if !strings.Contains(statement, "priority") {
 			t.Fatalf("statement must select priority: %q", statement)
 		}
@@ -687,9 +687,6 @@ func TestSearchSQLPassesPrioritiesToEverySQLFunction(t *testing.T) {
 	// on a perfectly healthy deployment.
 	if !strings.Contains(searchTextSQL, "$5::text[]") || !strings.Contains(searchExactSQL, "$5::text[]") {
 		t.Fatalf("search_text/search_text_exact must pass priorities: %q %q", searchTextSQL, searchExactSQL)
-	}
-	if !strings.Contains(searchHybridSQL, "$8::text[]") {
-		t.Fatalf("compatibility search_hybrid must pass priorities: %q", searchHybridSQL)
 	}
 	if !strings.Contains(searchHybridExactSQL, "$5::text[]") || !strings.Contains(searchHybridFuseSQL, "$6::text[]") {
 		t.Fatalf("parallel exact/fuse helpers must pass priorities: %q %q", searchHybridExactSQL, searchHybridFuseSQL)

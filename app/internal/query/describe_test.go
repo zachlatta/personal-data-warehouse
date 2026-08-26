@@ -332,9 +332,11 @@ func TestUndefinedColumnErrorListsTheRelationsRealColumns(t *testing.T) {
 	}
 }
 
-// With several relations in play, naming one table's columns would mislead
-// about which side of the join is wrong.
-func TestUndefinedColumnErrorSkipsColumnListForJoins(t *testing.T) {
+// A join now gets every relation's columns (see
+// TestUndefinedColumnErrorListsEveryJoinedRelationsColumns), but a relation the
+// catalog probe cannot read must contribute nothing rather than an empty
+// "columns on x:" that reads as "this table has no columns".
+func TestUndefinedColumnErrorOmitsRelationsItCannotRead(t *testing.T) {
 	const sql = "SELECT ts FROM slack.messages JOIN gmail.messages ON true"
 	runner := fakeRunner{
 		errs: map[string]error{sql: errors.New(`ERROR: column "ts" does not exist (SQLSTATE 42703)`)},
@@ -344,7 +346,7 @@ func TestUndefinedColumnErrorSkipsColumnListForJoins(t *testing.T) {
 	resp := svc.ExecuteFull(context.Background(), "When?", sql, "csv")
 
 	if strings.Contains(resp.Error, "columns on") {
-		t.Fatalf("ambiguous join should not name one table's columns, got: %s", resp.Error)
+		t.Fatalf("unreadable relations should contribute no column list, got: %s", resp.Error)
 	}
 }
 

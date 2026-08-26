@@ -49,6 +49,7 @@ from personal_data_warehouse.timeline import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
+README_MD = REPO_ROOT / "README.md"
 PYTHON_TESTS_WORKFLOW = REPO_ROOT / ".github/workflows/python-tests.yml"
 
 # The tier labels are stored as quoted SQL literals so they can be interpolated
@@ -254,6 +255,41 @@ def test_agents_md_documents_every_priority_tier() -> None:
     assert "adapter_signature" in section, (
         "the re-walk cost of changing an adapter's classification is not documented"
     )
+
+
+def test_the_priority_filter_is_documented_where_search_is_documented() -> None:
+    """``priorities`` is implemented in SQL, the CLI and MCP, and documented nowhere.
+
+    Thirty days of real agent sessions used ``--priority`` six times while
+    writing 321 ``ILIKE``-on-``base_*`` queries. The tiers were written down;
+    the *filter that applies them* was not, in either reader-facing document.
+    """
+    for path in (AGENTS_MD, README_MD):
+        text = path.read_text()
+        assert "priorities" in text, f"{path.name} never mentions the priorities filter"
+        assert "priorities => ARRAY" in text, (
+            f"{path.name} does not show the SQL form of the priority filter"
+        )
+        assert "--priority" in text, (
+            f"{path.name} does not show the CLI form of the priority filter"
+        )
+
+
+def test_the_unclassified_sentinel_is_not_presented_as_a_sixth_tier() -> None:
+    """``unclassified`` is accepted by the filter but is not a tier.
+
+    Scoping a search to it is how a classification outage is found, so it stays
+    valid input — which is exactly why every place that lists it has to say what
+    it is. The CLI's own error used to print it in the same breath as the five
+    real tiers with nothing to distinguish it.
+    """
+    for path in (AGENTS_MD, README_MD):
+        text = path.read_text()
+        assert "unclassified" in text, f"{path.name} never mentions the sentinel"
+        window = text[text.index("unclassified") : text.index("unclassified") + 400]
+        assert "sentinel" in window, (
+            f"{path.name} mentions unclassified without saying it is a fail-loud sentinel"
+        )
 
 
 def test_agents_md_has_a_general_add_a_source_checklist() -> None:

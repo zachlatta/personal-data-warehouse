@@ -881,6 +881,7 @@ func TestSubcommandHelpFlagsDoNotRequireConfig(t *testing.T) {
 		{"list", "--help"},
 		{"describe", "--help"},
 		{"call", "--help"},
+		{"search", "--help"},
 		{"sql", "--help"},
 		{"columns", "--help"},
 		{"schema", "--help"},

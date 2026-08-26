@@ -906,8 +906,8 @@ func csvValue(value any) string {
 // table actually queried instead of reciting the whole per-source map.
 // queryErrorMessage builds the caller-facing error: the Postgres message (now
 // carrying the server's own DETAIL/HINT), our recovery hint, and — for an
-// undefined column against a single relation — that relation's real column
-// list. The wrong column names are a long tail of one-offs, so the only fix
+// undefined column — the real column list of every relation the statement
+// references. The wrong column names are a long tail of one-offs, so the only fix
 // that scales is answering each miss with the columns that do exist instead of
 // sending the caller back to the catalog.
 func (s *Service) queryErrorMessage(ctx context.Context, message, sql string) string {
@@ -915,19 +915,31 @@ func (s *Service) queryErrorMessage(ctx context.Context, message, sql string) st
 	if !strings.Contains(message, "42703") {
 		return out
 	}
-	ref, ok := soleRelationInSQL(sql)
-	if !ok {
+	refs := relationsInSQL(sql)
+	if len(refs) == 0 || len(refs) > maxHintRelations {
 		return out
 	}
-	columns := s.relationColumnNames(ctx, ref)
-	if len(columns) == 0 {
+	parts := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		columns := s.relationColumnNames(ctx, ref)
+		if len(columns) == 0 {
+			continue
+		}
+		if len(columns) > maxHintColumns {
+			columns = append(columns[:maxHintColumns:maxHintColumns], "...")
+		}
+		parts = append(parts, fmt.Sprintf("columns on %s: %s", ref.DisplayName(), strings.Join(columns, ", ")))
+	}
+	if len(parts) == 0 {
 		return out
 	}
-	if len(columns) > maxHintColumns {
-		columns = append(columns[:maxHintColumns:maxHintColumns], "...")
-	}
-	return out + fmt.Sprintf(" (columns on %s: %s)", ref.DisplayName(), strings.Join(columns, ", "))
+	return out + " (" + strings.Join(parts, "; ") + ")"
 }
+
+// maxHintRelations bounds how many relations get their columns inlined. Two or
+// three is a join a caller can still read; past that the hint stops being a
+// hint and becomes a wall of text, and describe_table is the right tool.
+const maxHintRelations = 3
 
 // maxHintColumns bounds the inlined column list. The widest warehouse relation
 // is ~51 columns, so this is a guard against a future wide table rather than a
@@ -979,12 +991,26 @@ var timeGuessColumns = map[string]bool{
 	"synced": true, "synced_at": true,
 }
 
+func init() {
+	// A source's REAL time column used against a different source dead-ends
+	// exactly like an invented name, and the answer is the same one. Deriving
+	// these from the per-source map means a new source cannot be forgotten.
+	for _, tc := range timeColumns {
+		timeGuessColumns[tc.column] = true
+	}
+}
+
 // columnRemaps point a specific wrong column name at the right one. These are
 // structural renames (not time columns) that recur across sessions.
 var columnRemaps = map[string]string{
 	"channel_id": "Slack tables use conversation_id, and the channels table is named base_slack.conversations (not slack_channels)",
 	"channel":    "Slack tables use conversation_id, and the channels table is named base_slack.conversations (not slack_channels)",
 	"chat_jid":   "use chat_id — base_apple_messages.messages/base_whatsapp.messages and their chat tables key on chat_id, not chat_jid",
+	"from_email": "base_gmail.messages stores the sender in from_address; to_addresses/cc_addresses/bcc_addresses are text[], so match them with EXISTS (SELECT 1 FROM unnest(to_addresses) a WHERE a ILIKE '%…%')",
+	"text_content": "no warehouse relation has a text_content column — timeline.events carries the preview in snippet and the indexed body in search_text, " +
+		"the search functions return the matched preview as text, and each source's raw table names its body differently (base_slack.messages.text, base_gmail.messages.body_text, base_whatsapp.messages.body_text)",
+	"body_content": "no warehouse relation has a body_content column — timeline.events carries the preview in snippet and the indexed body in search_text; " +
+		"raw tables name it per source (base_slack.messages.text, base_gmail.messages.body_text, base_whatsapp.messages.body_text)",
 }
 
 // tableRemaps point a wrong table name at the right one. The catalog supplies
@@ -1072,10 +1098,43 @@ func opsPermissionHint(message, sql string) string {
 	if !strings.Contains(message, "42501") && !strings.Contains(message, "permission denied") {
 		return ""
 	}
-	if !strings.Contains(strings.ToLower(sql), "ops.") {
+	// Postgres names only the bare relation ("permission denied for table
+	// slack_sync_state"), and the caller may have reached it through a quoted
+	// name or a view, so the SQL text alone is not a reliable trigger.
+	if !strings.Contains(strings.ToLower(sql), "ops.") && !deniedRelationIsOps(message) {
 		return ""
 	}
-	return "(hint: most ops.* sync-state tables are internal and not readable by the query role. For pipeline and freshness debugging read marts_ops.pipeline_health (per-pipeline status + last error), marts_ops.table_freshness (per-table last write + age), and marts_ops.plaid_item_health — those are the supported surfaces.)"
+	return "(hint: most ops.* sync-state tables are internal and not readable by the query role. For pipeline and freshness debugging read marts_ops.table_freshness (per-table last write, newest event, and age), marts_ops.pipeline_health (per-pipeline status + last error), marts_ops.mart_view_health, marts_ops.timeline_adapter_health, and marts_ops.plaid_item_health — those are the supported surfaces, and they answer the same questions.)"
+}
+
+// opsRelationNames are the bare table names living in the ops schema, so a
+// denial naming only the relation can still be recognized. Built from the
+// catalog rather than a literal list, which would rot on the first rename.
+var opsRelationNames = map[string]bool{}
+
+func init() {
+	for _, obj := range warehouse.Objects {
+		if obj.Schema == "ops" {
+			opsRelationNames[strings.ToLower(obj.Name)] = true
+		}
+	}
+}
+
+func deniedRelationIsOps(message string) bool {
+	for _, marker := range []string{"permission denied for table ", "permission denied for view ", "permission denied for relation "} {
+		_, after, ok := strings.Cut(message, marker)
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(after)
+		if len(fields) == 0 {
+			continue
+		}
+		if opsRelationNames[strings.ToLower(strings.Trim(fields[0], `"`))] {
+			return true
+		}
+	}
+	return false
 }
 
 // bigintBooleanHint fires when a caller writes an honest boolean predicate
@@ -1217,6 +1276,9 @@ func undefinedColumnHint(message, sql string) string {
 		return hint
 	}
 	col := strings.ToLower(quotedIdentifier(message))
+	if hint := timelineEventsColumnHint(col, sql); hint != "" {
+		return hint
+	}
 	if remap, ok := columnRemaps[col]; ok {
 		return "(hint: " + remap + ". Run describe_table('<schema.table>') for the full column list.)"
 	}
@@ -1233,6 +1295,32 @@ func undefinedColumnHint(message, sql string) string {
 		return ""
 	}
 	return "(hint: column names differ per source — run describe_table('<schema.table>') for the exact columns and their (type) annotations.)"
+}
+
+// searchHitOnlyColumns exist on a search FUNCTION's result and nowhere on
+// timeline.events. They are the single most confused pair in the warehouse:
+// the table and the functions describe the same events under different names.
+var searchHitOnlyColumns = map[string]bool{
+	"occurred_at": true, "text": true, "score": true, "subsource": true,
+	"account": true, "ref": true, "who": true,
+}
+
+// timelineEventsColumnHint fires when a search-hit column name is used against
+// timeline.events itself. The generic "column names differ per source" advice
+// is true and useless here, because the caller did not confuse two sources —
+// they confused the table with the function that searches it.
+func timelineEventsColumnHint(col, sql string) string {
+	if !searchHitOnlyColumns[col] {
+		return ""
+	}
+	lower := strings.ToLower(sql)
+	if !containsWord(lower, "timeline.events") || searchFunctionCallRe.MatchString(sql) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"(hint: %q is a column of the search FUNCTIONS' result, not of timeline.events. The table uses event_ts (time), actor (who), title, snippet (preview) and search_text (the indexed body), plus priority/source/source_table/source_pk. "+
+			"timeline.search_text('needle', 50) returns (%s) instead — pick the one whose names you want.)",
+		col, searchHitColumns)
 }
 
 var searchFunctionCallRe = regexp.MustCompile(`(?i)(?:"?timeline"?\s*\.\s*)?"?(search_text(?:_exact)?|search_hybrid)"?\s*\(`)

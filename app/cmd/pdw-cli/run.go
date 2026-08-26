@@ -44,11 +44,19 @@ COMMANDS
                              "call sql" / "call query".
                                --data JSON   Inline JSON input
                                              (aliases: --args, --input, --json).
-  search [flags] QUERY...     Hybrid search across every synced source. This is
+  search [flags] QUERY...    Hybrid search across every synced source. This is
                              the normal CLI search path; no JSON or SQL required.
+                             Run "pdw search --help" for the full flag list.
                                --mode MODE       hybrid (default), keyword, or exact
                                -n, --max-results N  Maximum hits (default 20)
                                --source NAMES    Source aliases, comma-separated; repeatable
+                               --priority TIERS  Attention tiers, comma-separated:
+                                                 self (Zach initiated it), direct (a real
+                                                 person reaching him directly), cc (activity
+                                                 he is peripheral to), noise (bulk/automated),
+                                                 background (warehouse machinery). Omitting
+                                                 it searches every tier; "what needs my
+                                                 attention" means self,direct,cc.
                                --since TIME      Lower event-time bound (e.g. 2026-08-01)
                                --output FMT      text (default) or json
   sql [--output FMT] [-q QUESTION] [--file PATH] [--no-timeout] [SQL]
@@ -85,6 +93,12 @@ COMMANDS
                              warehouse, so the sync can ask Slack what changed
                              in one request instead of polling every
                              conversation. See "pdw slack --help".
+  chatgpt publish-session    Publish this Mac's chatgpt.com browser session so
+                             the server-side poller can keep syncing ChatGPT
+                             conversations. See "pdw chatgpt --help".
+  whoop publish-session      Publish this Mac's app.whoop.com browser session so
+                             the private-API WHOOP sync (heart rate, hypnogram,
+                             journal) keeps running. See "pdw whoop --help".
   version                    Print the build version.
   update                     Replace this binary with the latest GitHub release.
                                --check  Only report whether an update is available.
@@ -119,9 +133,9 @@ EXAMPLES
   pdw list
   pdw describe sql
   pdw search 'runway burn rate months cash remaining'
+  pdw search --priority self,direct 'budget approval'
   pdw search --source gmail,slack --since 2026-08-01 'budget approval'
   pdw search --mode exact --output json 'admin/api-keys'
-  pdw call schema_overview
   pdw columns base_gmail.messages         # every column + type, before writing SQL
   pdw sql -q 'Search for an offer letter' \
     "SELECT * FROM timeline.search_text('offer letter', 20)"
@@ -165,6 +179,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(stdout, usage)
 			return 0
+		}
+		// `pdw --version` is the recurring one: ten invocations in thirty days,
+		// each answered with a bare flag error plus the whole usage blob. One
+		// line naming the real command is the whole fix.
+		if redirect := rootFlagRedirect(args); redirect != "" {
+			fmt.Fprint(stderr, redirect)
+			return 2
 		}
 		fmt.Fprintln(stderr, err)
 		fmt.Fprint(stderr, usage)
@@ -216,6 +237,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	if cmd == "slack" {
 		return runSlack(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
 	}
+	// `pdw search --help` must print the search FlagSet's own help, not the
+	// global usage: the flags this command accepts (notably --priority) are
+	// otherwise undiscoverable from the command itself.
+	if cmd == "search" && hasHelpArg(rest) {
+		fmt.Fprint(stdout, searchUsage)
+		return 0
+	}
 	if hasHelpArg(rest) {
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -236,6 +264,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	if cmd == "config" {
 		return runConfig(rest, stdout, stderr, getenv)
+	}
+
+	// A tool name typed as a command is answered before the config check: the
+	// caller's mistake is the command, and reporting a missing token instead
+	// sends them to fix the wrong thing.
+	if redirect, ok := commandRedirects[cmd]; ok {
+		fmt.Fprintf(stderr, "pdw: there is no %q command; %s\n", cmd, redirect)
+		return 2
 	}
 
 	resolved, err := resolveConfig(*baseURL, *clientName, *token, getenv)
@@ -719,6 +755,15 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		fmt.Fprintln(stderr, "This avoids JSON/shell quoting; `call` is only for non-SQL tools.")
 		return 2
 	}
+	// schema_overview and describe_table have first-class commands that render
+	// their CSV as readable text; reaching them through `call` returns the same
+	// answer as raw JSON, so it is a second path to a worse result. C8 says
+	// there is one way to do each thing.
+	if redirect, ok := callToolRedirects[name]; ok {
+		fmt.Fprintf(stderr, "pdw call: %s does not go through `call`:\n", name)
+		fmt.Fprintf(stderr, "  %s\n", redirect)
+		return 2
+	}
 	if name == "search" {
 		fmt.Fprintln(stderr, "pdw call: use the first-class search command instead of JSON:")
 		fmt.Fprintln(stderr, "  pdw search '<terms>'")
@@ -862,6 +907,44 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// commandRedirects answer a command name that does not exist with the one that
+// does, in a single line. Every key is a server-side TOOL name an agent typed
+// as a command: `pdw query` and `pdw schema_overview` were both observed in
+// real sessions, and both got "unknown command" plus a ~100-line help dump.
+var commandRedirects = map[string]string{
+	"query":           "run SQL with `pdw sql -q '<question>' '<sql>'`",
+	"sql_query":       "run SQL with `pdw sql -q '<question>' '<sql>'`",
+	"schema_overview": "print the warehouse schema with `pdw schema`",
+	"describe_table":  "list one relation's columns with `pdw columns <table>`",
+	"tools":           "list the server's tools with `pdw list`",
+}
+
+// callToolRedirects are the tools `call` refuses, because each already has a
+// first-class command whose output is readable rather than raw JSON.
+var callToolRedirects = map[string]string{
+	"schema_overview": "pdw schema",
+	"describe_table":  "pdw columns <table>",
+}
+
+// rootFlagRedirect answers a root-level flag that does not exist with the
+// command that does. Returns "" when the flag is not one we recognize, so an
+// unknown flag still falls through to the ordinary usage error.
+func rootFlagRedirect(args []string) string {
+	for _, arg := range args {
+		if arg == "--" {
+			return ""
+		}
+		if !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		switch strings.ToLower(strings.TrimLeft(arg, "-")) {
+		case "version", "v":
+			return "pdw: there is no --version flag; run `pdw version`.\n"
+		}
+	}
+	return ""
 }
 
 // hasHelpArg reports whether a help flag appears before a "--" terminator.

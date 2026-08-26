@@ -462,8 +462,13 @@ func TestAPIRejectsUnknownPriorityTier(t *testing.T) {
 	if !strings.Contains(body, `unknown priority \"urgent\"`) {
 		t.Fatalf("body = %s", body)
 	}
-	if !strings.Contains(body, "self, direct, cc, noise, background, unclassified") {
+	if !strings.Contains(body, "self, direct, cc, noise, background") {
 		t.Fatalf("error must list the valid tiers; body = %s", body)
+	}
+	// unclassified stays accepted -- scoping to it is how a classification
+	// outage is found -- but the error must not present it as a sixth tier.
+	if !strings.Contains(body, "sentinel") {
+		t.Fatalf("error must mark unclassified as a fail-loud sentinel, not a tier; body = %s", body)
 	}
 	if len(runner.statements) != 0 {
 		t.Fatalf("invalid tier must not reach the database; statements = %#v", runner.statements)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -285,19 +286,32 @@ func displayNames(refs []tableRef) string {
 // means the caller gets the plain hint.
 var sqlRelationRef = regexp.MustCompile(`(?i)\b(?:from|join|update|into)\s+"?([a-z_][a-z0-9_]*)"?\s*\.\s*"?([a-z_][a-z0-9_]*)"?`)
 
-// soleRelationInSQL returns the single relation a statement reads from, or
-// false when it references none or several. With several, naming one table's
-// columns would be actively misleading about which side of a join is wrong.
-func soleRelationInSQL(sql string) (tableRef, bool) {
-	var found tableRef
+// relationsInSQL returns the distinct schema-qualified relations a statement
+// reads from, in the order they appear. An undefined column is answered with
+// the real columns of EVERY relation in play, not just of a lone one: a join is
+// where the caller knows least about the schema, so it is exactly where
+// withholding the list costs the most. Naming one side would be misleading;
+// naming both is not.
+func relationsInSQL(sql string) []tableRef {
+	var refs []tableRef
 	for _, match := range sqlRelationRef.FindAllStringSubmatch(sql, -1) {
 		ref := tableRef{Schema: strings.ToLower(match[1]), Name: strings.ToLower(match[2])}
-		if found.Name != "" && found != ref {
-			return tableRef{}, false
+		if slices.Contains(refs, ref) {
+			continue
 		}
-		found = ref
+		refs = append(refs, ref)
 	}
-	return found, found.Name != ""
+	return refs
+}
+
+// soleRelationInSQL returns the single relation a statement reads from, or
+// false when it references none or several.
+func soleRelationInSQL(sql string) (tableRef, bool) {
+	refs := relationsInSQL(sql)
+	if len(refs) != 1 {
+		return tableRef{}, false
+	}
+	return refs[0], true
 }
 
 // describeColumnsSQLFor pulls each column's precise type via format_type (e.g.
