@@ -34,6 +34,7 @@ __all__ = [
     "HIDDEN_SCHEMAS",
     "MARTS_SCHEMAS",
     "AI_EVENT_SOURCE_RELATIONS",
+    "VOICE_EVENT_SOURCE_RELATIONS",
     "PHOTO_SOURCE_RELATIONS",
     "Relation",
     "expand_relations",
@@ -84,6 +85,15 @@ ALL_CANONICAL_SCHEMAS: tuple[str, ...] = tuple(sorted(CATALOG.all_schemas()))
 AI_EVENT_SOURCE_RELATIONS: dict[str, str] = {
     source: f"{source}_events"
     for source in ("chatgpt", "claude_desktop", "claude_code", "codex", "openclaw", "pi")
+}
+
+# Raw voice tables, keyed by the ``source`` marts_voice_memos.recordings tags
+# each row with. The timeline reads the MART, not these -- one adapter, one
+# transcription pass, one enrichment pass for every voice source -- so this map
+# is what says which raw tables that single adapter actually covers.
+VOICE_EVENT_SOURCE_RELATIONS: dict[str, str] = {
+    "apple_voice_memos": "apple_voice_memos_files",
+    "alice_voice_recordings": "alice_voice_recordings",
 }
 
 # THE extension point for photo sources. Maps a photo source slug (the

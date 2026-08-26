@@ -87,7 +87,7 @@ class FakeWarehouse:
     def ensure_apple_voice_memos_tables(self) -> None:
         self.ensure_called = True
 
-    def load_untranscribed_apple_voice_memos_files(self, *, provider: str, limit: int):
+    def load_untranscribed_voice_recordings(self, *, provider: str, limit: int):
         assert provider == ASSEMBLYAI_PROVIDER
         return self.recordings[:limit]
 

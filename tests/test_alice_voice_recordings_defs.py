@@ -42,7 +42,7 @@ def test_alice_voice_recordings_schedule_uses_active_run_guard(monkeypatch) -> N
 def test_alice_voice_recordings_asset_writes_summary_metadata(monkeypatch) -> None:
     monkeypatch.setattr(alice_defs, "load_settings", lambda **_kwargs: FakeSettings())
     monkeypatch.setattr(alice_defs, "AliceApiClient", FakeAliceClient)
-    monkeypatch.setattr(alice_defs, "_alice_object_store", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(alice_defs, "alice_object_store", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(alice_defs, "exclusive_sync_lock", fake_exclusive_sync_lock)
     monkeypatch.setattr(alice_defs, "AliceVoiceRecordingsImportRunner", FakeRunner)
 
@@ -57,7 +57,7 @@ def test_alice_voice_recordings_asset_writes_summary_metadata(monkeypatch) -> No
 def test_alice_archive_materialization_writes_summary_metadata(monkeypatch) -> None:
     monkeypatch.setattr(alice_defs, "load_settings", lambda **_kwargs: FakeSettings())
     monkeypatch.setattr(alice_defs, "warehouse_from_settings", lambda _settings: object())
-    monkeypatch.setattr(alice_defs, "_alice_object_store", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(alice_defs, "alice_object_store", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(alice_defs, "iter_archive_payloads", lambda **_kwargs: [])
     monkeypatch.setattr(alice_defs, "exclusive_sync_lock", fake_exclusive_sync_lock)
     monkeypatch.setattr(alice_defs, "AliceVoiceRecordingsDriveIngestRunner", FakeDriveIngestRunner)
@@ -73,7 +73,7 @@ def test_alice_gmail_recovery_asset_writes_summary_metadata(monkeypatch) -> None
     monkeypatch.setattr(alice_defs, "load_settings", lambda **_kwargs: FakeSettings())
     monkeypatch.setattr(alice_defs, "warehouse_from_settings", lambda _settings: object())
     monkeypatch.setattr(alice_defs, "load_alice_gmail_transcript_emails", lambda **_kwargs: [])
-    monkeypatch.setattr(alice_defs, "_alice_object_store", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(alice_defs, "alice_object_store", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(alice_defs, "build_gmail_service", lambda **_kwargs: object())
     monkeypatch.setattr(alice_defs, "exclusive_sync_lock", fake_exclusive_sync_lock)
     monkeypatch.setattr(alice_defs, "AliceGmailRecoveryRunner", FakeGmailRecoveryRunner)

@@ -466,3 +466,186 @@ def test_whoop_private_is_registered_in_both_registries() -> None:
             f"{table} is classified {TIMELINE_TABLE_COVERAGE[table].role!r}; the public "
             "base_whoop adapters already put these events on the timeline"
         )
+
+
+# ---------------------------------------------------------------------------
+# C5, the INPUT half: an intelligent transformation reads the intermediate
+# layer, never a raw source table.
+# ---------------------------------------------------------------------------
+
+SRC_ROOT = REPO_ROOT / "src" / "personal_data_warehouse"
+
+# Every module that runs an "intelligent" pass -- transcription, agent
+# enrichment, document extraction -- over warehouse rows. These are the passes
+# C5's input rule is about: they must scan a conformed relation so that every
+# source in the domain gets the capability, not just the one whose raw table
+# somebody happened to name.
+#
+# Deliberately NOT in scope: derived builders (finance_ledger) and the identity
+# layer (photo_identity, the Slack file fingerprinter). Those legitimately read
+# raw -- resolving identity from source rows is exactly what `base_* ->
+# derived_*` means, and there is no intermediate for them to read because they
+# are the pass that creates it.
+ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
+    "apple_voice_memos_enrichment.py",
+    "apple_voice_memos_transcription.py",
+    "attachment_text_extraction.py",
+    "audio_attachment_enrichment.py",
+    "file_attachment_enrichment.py",
+    "manual_finance_extraction.py",
+    "photo_context.py",
+    "receipt_enrichment.py",
+)
+
+# Raw relations an enrichment runner may still name, each with the reason.
+# An entry here is a claim someone made on purpose, not a default: the whole
+# point is that adding one requires writing down why.
+ALLOWED_RAW_ENRICHMENT_READS: dict[str, dict[str, str]] = {
+    "apple_voice_memos_enrichment.py": {
+        # Context lookups, not the candidate scan: the agent is given identity
+        # hints so it can put a name to a voice. They are single-source
+        # questions ("has Zach emailed this person") rather than a pass over a
+        # domain, so no conforming relation is being bypassed.
+        "calendar_events": "identity hints: which meeting was this recorded in",
+        "gmail_messages": "identity hints: has this attendee corresponded with Zach",
+        "google_drive_files": "identity hints: documents naming an attendee",
+        "slack_messages": "identity hints: how an attendee is addressed in chat",
+        "slack_users": "identity hints: an attendee's Slack display names",
+    },
+    "manual_finance_extraction.py": {
+        # base_manual_finance.documents is the ONLY source of finance
+        # documents; there is no second source for a mart to conform. If one
+        # is ever added, this entry is what has to be revisited.
+        "manual_finance_documents": "single-source domain: no second document source exists",
+    },
+    "photo_context.py": {
+        # Context for the photo caption agent ("what was on the calendar when
+        # this was taken"), not a scan over photos. The photo pass itself
+        # already reads marts_photos.canonical_renditions.
+        "calendar_events": "context hints: what was scheduled when the photo was taken",
+    },
+    "receipt_enrichment.py": {
+        # KNOWN DEBT, tracked as the marts_files.attachments work: receipts are
+        # linked from Gmail attachments only, so a receipt that arrived over
+        # WhatsApp or iMessage is invisible to this pass -- the same shape as
+        # the voice defect, one source earlier in the pipeline.
+        "gmail_attachments": "pending marts_files.attachments",
+        "gmail_messages": "pending marts_files.attachments",
+    },
+}
+
+# The same claim for the attachment-source descriptors, which name their input
+# relation as data rather than in SQL.
+ALLOWED_RAW_ATTACHMENT_SOURCES: dict[str, str] = {
+    "gmail_attachments": "pending marts_files.attachments",
+    "whatsapp_media_items": "pending marts_files.attachments",
+    "apple_message_attachments": "pending marts_files.attachments",
+}
+
+
+def _base_relations_named_in(text: str) -> set[str]:
+    from personal_data_warehouse.warehouse_catalog import CATALOG
+
+    named = set()
+    for marker in re.findall(r"@([A-Za-z_][A-Za-z0-9_]*)", text):
+        try:
+            obj = CATALOG.object(marker)
+        except KeyError:
+            continue
+        if obj.layer == "base":
+            named.add(marker)
+    return named
+
+
+def test_every_enrichment_runner_is_in_the_layering_registry() -> None:
+    """A new enrichment pass cannot skip the input rule by being new.
+
+    Discovery is by filename, so adding ``foo_enrichment.py`` and forgetting
+    the registry fails here rather than shipping a pass that quietly serves one
+    source. The eval harness is excluded: it grades an enrichment, it does not
+    run one.
+    """
+    discovered = {
+        path.name
+        for path in SRC_ROOT.glob("*.py")
+        if path.name.endswith(("_enrichment.py", "_transcription.py", "_extraction.py"))
+        and not path.name.endswith("_eval.py")
+    }
+    missing = discovered - set(ENRICHMENT_RUNNER_MODULES)
+    assert missing == set(), f"enrichment runners not covered by the C5 input contract: {sorted(missing)}"
+
+
+def test_no_enrichment_runner_reads_a_raw_source_table_unaccounted_for() -> None:
+    """C5's input rule, enforced.
+
+    This is the test that would have caught the failure that produced the rule.
+    ``apple_voice_memos_enrichment`` and the transcription runner both named
+    ``base_apple_voice_memos.files`` directly, so ``base_alice_voice_recordings``
+    -- a second voice source that passed every ENFORCED step of the add-a-source
+    checklist -- carried 53 recordings, 0 transcripts and 0 summaries. Nothing
+    failed, because no registry asks what a transformation READS.
+    """
+    offenders: dict[str, set[str]] = {}
+    for module in ENRICHMENT_RUNNER_MODULES:
+        path = SRC_ROOT / module
+        assert path.exists(), f"{module} is registered but does not exist"
+        unexplained = _base_relations_named_in(path.read_text()) - set(
+            ALLOWED_RAW_ENRICHMENT_READS.get(module, {})
+        )
+        if unexplained:
+            offenders[module] = unexplained
+    assert offenders == {}, (
+        "an enrichment pass reads a raw source table with no recorded reason; "
+        "read the domain's marts_* relation instead, or record why it cannot: "
+        f"{ {k: sorted(v) for k, v in offenders.items()} }"
+    )
+
+
+def test_the_allowlist_names_only_relations_still_being_read() -> None:
+    """A stale exemption is how debt becomes permanent.
+
+    When a runner is repointed at a mart its entry must go, so the allowlist
+    keeps describing the present rather than accumulating apologies.
+    """
+    for module, allowed in ALLOWED_RAW_ENRICHMENT_READS.items():
+        named = _base_relations_named_in((SRC_ROOT / module).read_text())
+        stale = set(allowed) - named
+        assert stale == set(), f"{module} no longer reads {sorted(stale)}; drop the exemption"
+
+
+def test_attachment_enrichment_sources_declare_their_input_layer() -> None:
+    """The descriptor form of the same rule.
+
+    ``FileEnrichmentSource`` and friends name their input relation as data, not
+    in SQL, so the marker scan above cannot see them. Photos already read the
+    mart (``marts_photos.canonical_renditions``), which is the shape the
+    attachment sources are headed for.
+    """
+    from personal_data_warehouse.warehouse_catalog import CATALOG
+    from personal_data_warehouse import (
+        attachment_text_extraction,
+        audio_attachment_enrichment,
+        file_attachment_enrichment,
+    )
+
+    seen: dict[str, str] = {}
+    for module in (file_attachment_enrichment, audio_attachment_enrichment, attachment_text_extraction):
+        for name in dir(module):
+            candidate = getattr(module, name)
+            if isinstance(candidate, type) or not hasattr(candidate, "table"):
+                continue
+            table = getattr(candidate, "table", "")
+            if not isinstance(table, str) or not table:
+                continue
+            seen[f"{module.__name__}.{name}"] = table
+
+    assert seen, "no attachment enrichment sources found; the introspection broke"
+    offenders = {
+        where: table
+        for where, table in seen.items()
+        if CATALOG.object(table).layer == "base" and table not in ALLOWED_RAW_ATTACHMENT_SOURCES
+    }
+    assert offenders == {}, (
+        "an attachment enrichment source scans a raw table with no recorded reason: "
+        f"{offenders}"
+    )

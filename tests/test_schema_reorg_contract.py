@@ -154,7 +154,11 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # discovery freshness -- pipeline_health rolls Slack up as one pipeline
         # and cannot see one type stall) and marts_slack.huddles (huddle
         # metadata parsed out of the huddle_thread message payload).
-        "marts": 38,
+        # +4 marts: marts_health.cycles/.sleeps/.recoveries/.workouts, the first
+        # read interface over BOTH WHOOP sources. Reading either raw schema alone
+        # is wrong in a different direction, and their units disagree (private
+        # HRV in SECONDS, public in milliseconds).
+        "marts": 42,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

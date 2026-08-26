@@ -90,7 +90,7 @@ class FakeWarehouse:
     def close(self) -> None:
         self.closed = True
 
-    def load_untranscribed_apple_voice_memos_files(self, *, provider, limit):
+    def load_untranscribed_voice_recordings(self, *, provider, limit):
         return [object()] if self.has_candidate else []
 
 

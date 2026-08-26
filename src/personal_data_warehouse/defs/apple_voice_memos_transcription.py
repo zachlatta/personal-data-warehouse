@@ -17,6 +17,7 @@ from dagster import (
 )
 
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.defs.alice_voice_recordings import alice_object_store
 from personal_data_warehouse.defs.apple_voice_memos_drive_ingest import apple_voice_memos_drive_ingest
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
@@ -73,9 +74,22 @@ def apple_voice_memos_transcription(context) -> MaterializeResult:
                 ),
                 settings=settings,
             )
+            # Transcription is a domain pass over marts_voice_memos.recordings,
+            # not an Apple pass, so it must be able to fetch any voice source's
+            # bytes. Alice recordings normally live in the same Drive account
+            # (their config falls back to it), but not necessarily, so its
+            # store is built when it is configured rather than assumed.
+            object_stores = {}
+            if settings.alice_voice_recordings is not None:
+                object_stores["alice_voice_recordings"] = alice_object_store(
+                    settings.alice_voice_recordings, settings
+                )
             summary = VoiceMemosTranscriptionRunner(
                 warehouse=warehouse,
-                audio_source=GoogleDriveVoiceMemoAudioSource(object_store=object_store),
+                audio_source=GoogleDriveVoiceMemoAudioSource(
+                    object_store=object_store,
+                    object_stores=object_stores,
+                ),
                 transcription_client=assemblyai_client_from_settings(settings),
                 logger=context.log,
             ).sync(limit=batch_size)
@@ -109,7 +123,7 @@ def apple_voice_memos_transcription_backlog_sensor(context):
     settings = load_settings(require_gmail=False, require_assemblyai=True)
     warehouse = warehouse_from_settings(settings)
     try:
-        if not warehouse.load_untranscribed_apple_voice_memos_files(provider=ASSEMBLYAI_PROVIDER, limit=1):
+        if not warehouse.load_untranscribed_voice_recordings(provider=ASSEMBLYAI_PROVIDER, limit=1):
             return SkipReason("No untranscribed Voice Memos found in Postgres.")
     finally:
         warehouse.close()

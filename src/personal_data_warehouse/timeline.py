@@ -1255,47 +1255,61 @@ _APPLE_NOTE_REVISION = _simple_adapter(
     priority=TIMELINE_PRIORITY_SELF,
 )
 
-_VOICE_MEMO = _simple_adapter(
+# ONE adapter for every voice source, over the mart that conforms them.
+#
+# There used to be two: `voice_memo` over base_apple_voice_memos.files and
+# `alice_voice_recording` over base_alice_voice_recordings.recordings. Reading
+# the raw tables meant every capability had to be built per source, and the
+# second source got none of them -- no transcript, no summary, nothing in
+# search but a filename. The mart answers the same questions for both, so a
+# third voice source reaches the timeline with no adapter work at all.
+#
+# `event_id` is source-qualified because a recording_id is only unique inside
+# its own source. That re-keys the Apple rows this adapter already published,
+# which is exactly what `prune_sql` is for: the old ids no longer appear in the
+# authoritative set and are removed over the next few runs.
+_VOICE_RECORDING = _simple_adapter(
     name="voice_memo",
-    source_table="apple_voice_memos_files",
+    source_table="marts_voice_memos_recordings",
     source="voice_memos",
     kind="voice_memo",
-    from_sql=f"""@apple_voice_memos_files t
-    LEFT JOIN LATERAL (
-        SELECT en.title AS en_title, en.summary AS en_summary
-        FROM @apple_voice_memos_enrichments en
-        WHERE en.account = t.account AND en.recording_id = t.recording_id
-          AND (NULLIF(en.title, '') IS NOT NULL OR NULLIF(en.summary, '') IS NOT NULL)
-        ORDER BY en.created_at DESC
-        LIMIT 1
-    ) en ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT
-            string_agg(
-                concat_ws(E'\n', NULLIF(en2.title, ''), NULLIF(en2.summary, ''),
-                          NULLIF(en2.transcript, ''), NULLIF(en2.participants_json, ''),
-                          NULLIF(en2.action_items_json, '')),
-                E'\n' ORDER BY en2.created_at DESC
-            ) AS enrichment_search_text,
-            max(en2.created_at) AS enrichment_ingest_ts
-        FROM @apple_voice_memos_enrichments en2
-        WHERE en2.account = t.account AND en2.recording_id = t.recording_id
-    ) ens ON TRUE""",
-    event_id="concat_ws('|', t.account, t.recording_id)",
-    event_ts=_real_ts("t.recorded_at", "t.file_created_at", "t.ingested_at"),
-    ingest_ts="GREATEST(t.ingested_at, COALESCE(ens.enrichment_ingest_ts, t.ingested_at))",
+    from_sql="@marts_voice_memos_recordings t",
+    event_id="concat_ws('|', t.source, t.account, t.recording_id)",
+    # The mart translates the epoch sentinel to NULL, so these need real
+    # fallbacks: they are the keyset expressions and must never be NULL.
+    event_ts=f"COALESCE(t.recorded_at, t.ingested_at, {_EPOCH})",
+    ingest_ts=(
+        f"GREATEST(COALESCE(t.ingested_at, {_EPOCH}), "
+        f"COALESCE(t.transcribed_at, {_EPOCH}), COALESCE(t.enriched_at, {_EPOCH}))"
+    ),
     actor="'me'",
-    title="COALESCE(NULLIF(en.en_title, ''), NULLIF(t.title, ''), t.filename)",
-    snippet=_snippet("COALESCE(en.en_summary, '')"),
+    title="t.title",
+    snippet=_snippet("COALESCE(t.summary, '')"),
     context="t.account",
-    source_pk="jsonb_build_object('account', t.account, 'recording_id', t.recording_id)",
+    source_pk=(
+        "jsonb_build_object('source', t.source, 'account', t.account, "
+        "'recording_id', t.recording_id)"
+    ),
     metadata=(
         "jsonb_build_object("
+        "'voice_source', t.source, "
         "'content_type', t.content_type, "
         "'size_bytes', t.size_bytes, "
+        "'duration_seconds', t.duration_seconds, "
         "'deleted', t.is_deleted <> 0)"
     ),
-    search_text=_search_concat("t.title", "t.filename", "ens.enrichment_search_text"),
+    search_text=_search_concat(
+        "t.title",
+        "t.filename",
+        "t.summary",
+        "t.transcript",
+        "t.participants_json",
+        "t.action_items_json",
+    ),
+    prune_sql=(
+        "SELECT concat_ws('|', t.source, t.account, t.recording_id) "
+        "FROM @marts_voice_memos_recordings t"
+    ),
     # He pressed record: a deliberate 'self', not an unexamined default.
     priority=TIMELINE_PRIORITY_SELF,
 )
@@ -1844,31 +1858,6 @@ _ENRICHMENT_RUN = _simple_adapter(
     priority=TIMELINE_PRIORITY_BACKGROUND,
 )
 
-_ALICE_VOICE_RECORDING = _simple_adapter(
-    name="alice_voice_recording",
-    source_table="alice_voice_recordings",
-    source="alice_voice_recordings",
-    kind="voice_recording",
-    from_sql="@alice_voice_recordings t",
-    event_id="concat_ws('|', t.account, t.recording_id)",
-    event_ts="t.recorded_at",
-    ingest_ts="t.ingested_at",
-    actor="'me'",
-    title="COALESCE(NULLIF(t.title, ''), t.filename)",
-    snippet="CASE WHEN t.duration_seconds > 0 THEN concat(t.duration_seconds, ' seconds') ELSE '' END",
-    context="t.account",
-    source_pk="jsonb_build_object('account', t.account, 'recording_id', t.recording_id)",
-    metadata=(
-        "jsonb_build_object("
-        "'duration_seconds', t.duration_seconds, "
-        "'content_type', t.content_type, "
-        "'recovery_source', t.recovery_source)"
-    ),
-    search_text=_search_concat("t.title", "t.filename", "t.raw_metadata_json"),
-    # Same call as the Voice Memos adapter: a recording he made himself.
-    priority=TIMELINE_PRIORITY_SELF,
-)
-
 _FINANCE_TRANSACTION = _simple_adapter(
     name="finance_transaction",
     source_table="finance_transactions",
@@ -2288,8 +2277,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _AGENT_SESSION,
     _AGENT_SESSION_TURN,
     _APPLE_NOTE_REVISION,
-    _VOICE_MEMO,
-    _ALICE_VOICE_RECORDING,
+    _VOICE_RECORDING,
     _CALENDAR_EVENT,
     _DRIVE_FILE,
     _PHOTO,
@@ -2307,6 +2295,19 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _MUTATION_REQUEST,
     _ENRICHMENT_RUN,
 )
+
+
+# Adapters that no longer exist, and whose rows must therefore go.
+#
+# timeline.events is keyed (adapter, event_id), so removing an adapter from
+# TIMELINE_ADAPTERS does not remove its rows -- it strands them. Nothing else
+# in the engine can ever correct them: `prune_sql` only reconciles an adapter
+# that still runs. A retired adapter's rows would keep answering searches with
+# a duplicate of whatever superseded them, silently and forever.
+#
+# `alice_voice_recording` was folded into `voice_memo`, which now reads
+# marts_voice_memos.recordings and emits both sources.
+RETIRED_TIMELINE_ADAPTERS: tuple[str, ...] = ("alice_voice_recording",)
 
 
 def adapter_by_name(name: str) -> TimelineAdapter:
@@ -2400,11 +2401,21 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "contact_cards": _events(),
     "apple_contact_cards": _events(),
     "contact_sync_state": _state("contacts sync cursor"),
-    # Voice memos
+    # Voice. One adapter reads marts_voice_memos.recordings, which conforms
+    # every voice source, so each source-owned raw table is what actually feeds
+    # the timeline -- the same shape as AI conversations. The three derived
+    # tables now serve every source (they are keyed by source), so they are
+    # detail of the domain rather than of one source's raw table.
     "apple_voice_memos_files": _events(),
-    "apple_voice_memos_transcription_runs": _detail("apple_voice_memos_files"),
-    "apple_voice_memos_transcript_segments": _detail("apple_voice_memos_files"),
-    "apple_voice_memos_enrichments": _detail("apple_voice_memos_files"),
+    "apple_voice_memos_transcription_runs": _detail(
+        "apple_voice_memos_files", "transcription attempts for every voice source"
+    ),
+    "apple_voice_memos_transcript_segments": _detail(
+        "apple_voice_memos_files", "speaker-labelled utterances for every voice source"
+    ),
+    "apple_voice_memos_enrichments": _detail(
+        "apple_voice_memos_files", "agent enrichment for every voice source"
+    ),
     # Alice Voice Recordings
     "alice_voice_recordings": _events(),
     "alice_voice_recording_artifacts": _detail("alice_voice_recordings"),
@@ -3242,6 +3253,41 @@ class TimelineSyncEngine:
         logger.info("timeline prune removed %s orphaned rows for %s", deleted, adapter.name)
         return deleted
 
+    # Deleting a retired adapter's rows is bounded per run for the same
+    # reason the prune is: the engine has no undo, and timeline.events is the
+    # read surface for every agent. A retirement is a handful of rows in
+    # practice, so a small budget converges immediately and caps the blast
+    # radius if a live adapter is ever named here by mistake.
+    RETIRE_MAX_ROWS_PER_RUN = 5_000
+
+    def _retire_removed_adapters(self) -> int:
+        live = {adapter.name for adapter in TIMELINE_ADAPTERS}
+        retired = [name for name in RETIRED_TIMELINE_ADAPTERS if name not in live]
+        if not retired:
+            return 0
+        events = self._qualified_regclass("timeline_events", namespace=self._dest_schema)
+        state = self._qualified_regclass("timeline_sync_state", namespace=self._dest_schema)
+        deleted = 0
+        with self._dest_conn.cursor() as cursor:
+            for name in retired:
+                cursor.execute(
+                    f"""
+                    DELETE FROM {events}
+                    WHERE ctid IN (
+                        SELECT ctid FROM {events} WHERE adapter = %s LIMIT %s
+                    )
+                    """,
+                    (name, self.RETIRE_MAX_ROWS_PER_RUN),
+                )
+                removed = cursor.rowcount or 0
+                deleted += removed
+                if removed:
+                    logger.info("timeline retired adapter %s: removed %s rows", name, removed)
+                cursor.execute(f"SELECT count(*) FROM {events} WHERE adapter = %s", (name,))
+                if int(cursor.fetchone()[0]) == 0:
+                    cursor.execute(f"DELETE FROM {state} WHERE adapter = %s", (name,))
+        return deleted
+
     def run(self, *, max_seconds: float | None = None) -> list[AdapterSyncStats]:
         self._connect()
         deadline = time.monotonic() + max_seconds if max_seconds else None
@@ -3250,6 +3296,11 @@ class TimelineSyncEngine:
         }
         states: dict[str, _AdapterState] = {}
         failed: list[str] = []
+
+        try:
+            self._retire_removed_adapters()
+        except Exception:  # noqa: BLE001 - cleanup must never stop ingestion
+            logger.exception("timeline retired-adapter cleanup failed")
 
         try:
             self._refresh_gmail_correspondents()

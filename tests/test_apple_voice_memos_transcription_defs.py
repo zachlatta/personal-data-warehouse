@@ -95,7 +95,7 @@ class FakeWarehouse:
         self.limit = None
         self.closed = False
 
-    def load_untranscribed_apple_voice_memos_files(self, *, provider: str, limit: int):
+    def load_untranscribed_voice_recordings(self, *, provider: str, limit: int):
         self.provider = provider
         self.limit = limit
         return self.rows

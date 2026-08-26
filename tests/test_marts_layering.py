@@ -28,6 +28,7 @@ from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
+    DATE_COLUMNS,
     FLOAT_COLUMNS,
     INTEGER_COLUMNS,
     JSONB_ARRAY_COLUMNS_BY_TABLE,
@@ -49,6 +50,15 @@ from personal_data_warehouse.schema import (
     VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS,
     WHATSAPP_CHAT_COLUMNS,
     WHATSAPP_MESSAGE_COLUMNS,
+    WHOOP_CYCLE_COLUMNS,
+    WHOOP_PRIVATE_CYCLE_COLUMNS,
+    WHOOP_PRIVATE_RECOVERY_COLUMNS,
+    WHOOP_PRIVATE_SLEEP_COLUMNS,
+    WHOOP_PRIVATE_SPORT_COLUMNS,
+    WHOOP_PRIVATE_WORKOUT_COLUMNS,
+    WHOOP_RECOVERY_COLUMNS,
+    WHOOP_SLEEP_COLUMNS,
+    WHOOP_WORKOUT_COLUMNS,
 )
 from personal_data_warehouse.warehouse_catalog import CatalogObject
 
@@ -65,6 +75,8 @@ def _row(columns: tuple[str, ...], *, table: str = "", **overrides):
             row[column] = []
         elif column in TIMESTAMP_COLUMNS:
             row[column] = EPOCH
+        elif column in DATE_COLUMNS:
+            row[column] = EPOCH.date()
         elif column in INTEGER_COLUMNS:
             row[column] = 0
         elif column in FLOAT_COLUMNS:
@@ -108,6 +120,22 @@ def _columns(wh: PostgresWarehouse, logical: str) -> list[str]:
         for row in wh._query(
             """
             SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (rel.schema, rel.name),
+        )
+    ]
+
+
+def _column_types(wh: PostgresWarehouse, logical: str) -> list[tuple[str, str]]:
+    rel = relation(logical).with_namespace(wh.schema_namespace)
+    return [
+        (row[0], row[1])
+        for row in wh._query(
+            """
+            SELECT column_name, data_type
             FROM information_schema.columns
             WHERE table_schema = %s AND table_name = %s
             ORDER BY ordinal_position
@@ -246,6 +274,7 @@ def _seed_voice_memos(wh: PostgresWarehouse) -> None:
         [
             _row(
                 VOICE_MEMO_ENRICHMENT_COLUMNS,
+                source="apple_voice_memos",
                 account="zach",
                 recording_id="rec-1",
                 content_sha256="sha-1",
@@ -265,6 +294,7 @@ def _seed_voice_memos(wh: PostgresWarehouse) -> None:
             ),
             _row(
                 VOICE_MEMO_ENRICHMENT_COLUMNS,
+                source="apple_voice_memos",
                 account="zach",
                 recording_id="rec-1",
                 content_sha256="sha-1",
@@ -284,6 +314,7 @@ def _seed_voice_memos(wh: PostgresWarehouse) -> None:
             ),
             _row(
                 VOICE_MEMO_ENRICHMENT_COLUMNS,
+                source="apple_voice_memos",
                 account="zach",
                 recording_id="rec-2",
                 content_sha256="sha-2",
@@ -302,6 +333,7 @@ def _seed_voice_memos(wh: PostgresWarehouse) -> None:
         [
             _row(
                 VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                source="apple_voice_memos",
                 account="zach",
                 recording_id="rec-2",
                 content_sha256="sha-2",
@@ -319,6 +351,7 @@ def _seed_voice_memos(wh: PostgresWarehouse) -> None:
         [
             _row(
                 VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS,
+                source="apple_voice_memos",
                 account="zach",
                 recording_id="rec-1",
                 provider="assemblyai",
@@ -334,6 +367,7 @@ def _seed_voice_memos(wh: PostgresWarehouse) -> None:
             ),
             _row(
                 VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS,
+                source="apple_voice_memos",
                 account="zach",
                 recording_id="rec-1",
                 provider="assemblyai",
@@ -426,7 +460,11 @@ def test_voice_memo_mart_emits_null_where_a_source_has_no_equivalent(
     assert alice["title"] == "Standup"
     assert alice["duration_seconds"] == 300
     assert alice["recording_url"] == "https://example.invalid/r/alice-1"
-    # Alice recordings are not transcribed or enriched by this warehouse.
+    # NULL because nothing has enriched THIS recording yet -- not because the
+    # source is structurally excluded. The mart used to hardcode NULL for the
+    # whole Alice branch, and both enrichment passes scanned
+    # base_apple_voice_memos.files, so the NULLs were self-fulfilling:
+    # 53 recordings, 0 transcripts, 0 summaries, every registry green.
     for column in (
         "summary",
         "transcript",
@@ -437,6 +475,110 @@ def test_voice_memo_mart_emits_null_where_a_source_has_no_equivalent(
         "enriched_at",
     ):
         assert alice[column] is None, column
+
+
+def test_voice_memo_mart_surfaces_a_second_sources_transcript_and_summary(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The defect that made this contract necessary, as a test.
+
+    Enrichment output is keyed by source, so a non-Apple recording's transcript
+    and summary reach the mart through exactly the same columns Apple's do. If
+    the union ever hardcodes NULL for a branch again, this fails.
+    """
+    _seed_voice_memos(warehouse)
+    warehouse.insert_apple_voice_memos_transcription_runs(
+        [
+            _row(
+                VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                source="alice_voice_recordings",
+                account="zach",
+                recording_id="alice-1",
+                content_sha256="sha-3",
+                provider="assemblyai",
+                status="completed",
+                transcript_text="alice run transcript",
+                requested_at=TS,
+                completed_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    warehouse.insert_apple_voice_memos_enrichments(
+        [
+            _row(
+                VOICE_MEMO_ENRICHMENT_COLUMNS,
+                source="alice_voice_recordings",
+                account="zach",
+                recording_id="alice-1",
+                content_sha256="sha-3",
+                provider="agent",
+                model="m",
+                prompt_version="v2",
+                status="completed",
+                title="Morning walk debrief",
+                transcript="alice enriched transcript",
+                summary="alice summary",
+                created_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+
+    rows = {
+        (row["source"], row["recording_id"]): row
+        for row in _dicts(warehouse, "marts_voice_memos_recordings")
+    }
+    alice = rows[("alice_voice_recordings", "alice-1")]
+    assert alice["title"] == "Morning walk debrief"
+    assert alice["summary"] == "alice summary"
+    assert alice["transcript"] == "alice enriched transcript"
+    assert alice["transcript_provider"] == "assemblyai"
+    assert alice["transcribed_at"] == TS
+
+    # Same recording_id in another source must not borrow this one's work.
+    assert rows[("apple_voice_memos", "rec-1")]["summary"] == "new summary"
+
+
+def test_derived_voice_tables_are_keyed_by_source(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Two sources can hold the same recording_id without colliding.
+
+    Before ``source`` joined the key, a second voice source's transcription run
+    upserted onto the Apple run for the same (account, recording_id, provider)
+    -- so the domain could not have stored a second source's transcript even if
+    something had produced one.
+    """
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    for source, text in (
+        ("apple_voice_memos", "apple text"),
+        ("alice_voice_recordings", "alice text"),
+    ):
+        warehouse.insert_apple_voice_memos_transcription_runs(
+            [
+                _row(
+                    VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                    source=source,
+                    account="zach",
+                    recording_id="shared-id",
+                    provider="assemblyai",
+                    status="completed",
+                    transcript_text=text,
+                    requested_at=TS,
+                    completed_at=TS,
+                    sync_version=1,
+                )
+            ]
+        )
+    rows = warehouse._query(
+        "SELECT source, transcript_text FROM @apple_voice_memos_transcription_runs "
+        "WHERE recording_id = 'shared-id' ORDER BY source"
+    )
+    assert rows == [
+        ("alice_voice_recordings", "alice text"),
+        ("apple_voice_memos", "apple text"),
+    ]
 
 
 def test_voice_memo_transcript_segments_carry_recording_context(
@@ -806,6 +948,7 @@ def test_voice_memo_mart_reports_every_sentinel_timestamp_as_null(
         [
             _row(
                 VOICE_MEMO_ENRICHMENT_COLUMNS,
+                source="apple_voice_memos",
                 account="zach",
                 recording_id="rec-undated",
                 content_sha256="sha-4",
@@ -837,6 +980,7 @@ def test_voice_memo_mart_reports_every_sentinel_timestamp_as_null(
         [
             _row(
                 VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS,
+                source="apple_voice_memos",
                 account="zach",
                 recording_id="rec-undated",
                 provider="assemblyai",
@@ -865,6 +1009,7 @@ def test_voice_memo_mart_reports_every_sentinel_timestamp_as_null(
         "meeting_end_at",
         "enriched_at",
         "ingested_at",
+        "transcribed_at",
     ]
     for key in (
         ("apple_voice_memos", "rec-undated"),
@@ -1074,3 +1219,364 @@ def test_live_public_schema_holds_no_warehouse_objects() -> None:
         """
     )
     assert strays == [], f"non-extension objects in public: {strays}"
+
+
+# ---------------------------------------------------------------------------
+# marts_health.* — the first read interface over BOTH WHOOP sources
+# ---------------------------------------------------------------------------
+
+
+def _seed_health(wh: PostgresWarehouse) -> None:
+    wh.ensure_whoop_tables()
+    wh.ensure_whoop_private_tables()
+
+    wh.insert_whoop_cycles(
+        [
+            _row(
+                WHOOP_CYCLE_COLUMNS,
+                account="zach",
+                cycle_id="cycle-done",
+                start_at=TS,
+                end_at=TS.replace(hour=23),
+                score_state="SCORED",
+                strain=14.2,
+                kilojoule=9000.0,
+                average_heart_rate=61,
+                max_heart_rate=170,
+                synced_at=TS,
+                sync_version=1,
+            ),
+            _row(
+                WHOOP_CYCLE_COLUMNS,
+                account="zach",
+                cycle_id="cycle-running",
+                start_at=TS.replace(day=2),
+                # end_at left at the epoch: the cycle is still running.
+                score_state="PENDING_SCORE",
+                strain=3.1,
+                synced_at=TS,
+                sync_version=1,
+            ),
+        ]
+    )
+    wh.insert_whoop_private_cycles(
+        [
+            _row(
+                WHOOP_PRIVATE_CYCLE_COLUMNS,
+                account="zach",
+                cycle_id="cycle-done",
+                start_at=TS,
+                end_at=TS.replace(hour=23),
+                # day_strain is the RAW unscaled value; scaled_strain is what
+                # WHOOP displays and what base_whoop.cycles.strain matches.
+                day_strain=0.019,
+                scaled_strain=14.2,
+                sleep_need=28800.0,
+                data_state="complete",
+                synced_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    wh.insert_whoop_sleeps(
+        [
+            _row(
+                WHOOP_SLEEP_COLUMNS,
+                account="zach",
+                sleep_id="sleep-1",
+                cycle_id="cycle-done",
+                start_at=TS,
+                end_at=TS.replace(hour=20),
+                nap=0,
+                score_state="SCORED",
+                sleep_performance_percentage=88.0,
+                total_in_bed_time_milli=28_800_000,
+                total_rem_sleep_time_milli=5_400_000,
+                synced_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    wh.insert_whoop_private_sleeps(
+        [
+            _row(
+                WHOOP_PRIVATE_SLEEP_COLUMNS,
+                account="zach",
+                activity_id="sleep-1",
+                cycle_id="cycle-done",
+                start_at=TS,
+                end_at=TS.replace(hour=20),
+                debt_pre=1800.0,
+                debt_post=900.0,
+                habitual_sleep_need=27000.0,
+                latency=420.0,
+                synced_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    wh.insert_whoop_recoveries(
+        [
+            _row(
+                WHOOP_RECOVERY_COLUMNS,
+                account="zach",
+                cycle_id="cycle-done",
+                sleep_id="sleep-1",
+                score_state="SCORED",
+                recovery_score=71,
+                resting_heart_rate=52,
+                # The public API's unit: MILLISECONDS.
+                hrv_rmssd_milli=84.5,
+                synced_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    wh.insert_whoop_private_recoveries(
+        [
+            _row(
+                WHOOP_PRIVATE_RECOVERY_COLUMNS,
+                account="zach",
+                activity_id="sleep-1",
+                recovery_score=71,
+                resting_heart_rate=52,
+                # The private API's unit: SECONDS. Same measurement, 1000x apart.
+                hrv_rmssd_seconds=0.0845,
+                hrv_rmssd_milli=84.5,
+                hrv_component=0.6,
+                rhr_component=0.3,
+                synced_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    wh.insert_whoop_workouts(
+        [
+            _row(
+                WHOOP_WORKOUT_COLUMNS,
+                account="zach",
+                workout_id="workout-1",
+                start_at=TS,
+                end_at=TS.replace(hour=13),
+                sport_id=1,
+                # The public row's own token is a slug, when it has one at all.
+                sport_name="hiking-rucking",
+                score_state="SCORED",
+                strain=9.4,
+                synced_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    wh.insert_whoop_private_workouts(
+        [
+            _row(
+                WHOOP_PRIVATE_WORKOUT_COLUMNS,
+                account="zach",
+                activity_id="workout-1",
+                sport_id=1,
+                start_at=TS,
+                end_at=TS.replace(hour=13),
+                total_steps=4200,
+                synced_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    wh.insert_whoop_private_sports(
+        [
+            _row(
+                WHOOP_PRIVATE_SPORT_COLUMNS,
+                account="zach",
+                sport_id=1,
+                name="Running",
+                category="Cardio",
+                synced_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+
+
+def test_health_mart_conforms_both_whoop_sources(warehouse: PostgresWarehouse) -> None:
+    """One read interface over the public API and the app API.
+
+    Reading either alone is wrong in a different direction: the public source
+    has no strain components, sleep debt, steps or sport catalog, and the
+    private source is missing rows the public one has (measured 2026-08-26:
+    305 public sleeps vs 294 private, 268 public workouts vs 257).
+    """
+    _seed_health(warehouse)
+
+    cycles = {row["cycle_id"]: row for row in _dicts(warehouse, "marts_health_cycles")}
+    assert cycles["cycle-done"]["strain"] == 14.2
+    assert cycles["cycle-done"]["sleep_need_seconds"] == 28800.0
+    assert cycles["cycle-done"]["has_private_detail"] == 1
+    assert cycles["cycle-running"]["has_private_detail"] == 0
+
+    sleep = _dicts(warehouse, "marts_health_sleeps")[0]
+    assert sleep["sleep_debt_pre_seconds"] == 1800.0
+    assert sleep["is_nap"] == 0
+
+    workout = _dicts(warehouse, "marts_health_workouts")[0]
+    # The readable name comes from the private source's 204-sport catalog; the
+    # provider's own slug stays available beside it.
+    assert workout["sport_name"] == "Running"
+    assert workout["sport_slug"] == "hiking-rucking"
+    assert workout["sport_category"] == "Cardio"
+    assert workout["total_steps"] == 4200
+
+
+def test_health_mart_exposes_one_hrv_unit(warehouse: PostgresWarehouse) -> None:
+    """The unit trap, as a test.
+
+    base_whoop_private.recoveries.hrv_rmssd_seconds is SECONDS and
+    base_whoop.recoveries.hrv_rmssd_milli is milliseconds. Exposing both under
+    similar names in one view is how a 1000x error gets written, so the mart
+    publishes exactly one HRV column and it is the milliseconds one.
+    """
+    _seed_health(warehouse)
+    columns = _columns(warehouse, "marts_health_recoveries")
+    hrv = [column for column in columns if "hrv_rmssd" in column]
+    assert hrv == ["hrv_rmssd_milli"]
+    assert "hrv_rmssd_seconds" not in columns
+
+    recovery = _dicts(warehouse, "marts_health_recoveries")[0]
+    assert recovery["hrv_rmssd_milli"] == 84.5
+
+
+def test_health_mart_conforms_sleep_stage_durations_to_one_unit(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Public stage totals are milliseconds; private ones are seconds.
+
+    Every duration the mart exposes is seconds and says so in its name, so a
+    caller cannot add a public column to a private one and be silently 1000x
+    out.
+    """
+    _seed_health(warehouse)
+    sleep = _dicts(warehouse, "marts_health_sleeps")[0]
+    assert sleep["time_in_bed_seconds"] == 28800.0
+    assert sleep["rem_sleep_seconds"] == 5400.0
+    assert not [
+        column
+        for column in _columns(warehouse, "marts_health_sleeps")
+        if column.endswith("_milli")
+    ]
+
+
+def test_health_mart_reports_a_running_cycle_as_null_not_the_epoch(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The sibling of the voice-memo sentinel test, for the sharpest case.
+
+    base_whoop.cycles.end_at holds 1970-01-01 for the cycle still in progress,
+    so ORDER BY end_at DESC on the raw table ranks the RUNNING cycle as the
+    oldest row in it.
+    """
+    _seed_health(warehouse)
+    cycles = {row["cycle_id"]: row for row in _dicts(warehouse, "marts_health_cycles")}
+    assert cycles["cycle-running"]["end_at"] is None
+    assert cycles["cycle-running"]["predicted_end"] is None
+    assert cycles["cycle-done"]["end_at"] == TS.replace(hour=23)
+
+
+@pytest.mark.parametrize(
+    "logical",
+    [
+        "marts_health_cycles",
+        "marts_health_sleeps",
+        "marts_health_recoveries",
+        "marts_health_workouts",
+    ],
+)
+def test_health_mart_translates_every_exposed_timestamp_or_none(
+    warehouse: PostgresWarehouse, logical: str
+) -> None:
+    """Per column, because a partial translation MANUFACTURES an inconsistency.
+
+    The sources are internally consistent: every absent timestamp is the epoch.
+    A view that NULLIFs one column and forgets its sibling does not inherit a
+    problem, it invents one — and then ORDER BY, MIN(), COALESCE and IS NULL
+    each disagree depending on which column was asked. Seeding a row whose
+    every timestamp is the sentinel and asserting the whole column set comes
+    back NULL is the only check that scales with the column list.
+    """
+    _seed_health(warehouse)
+    # Every seeded row above already carries the sentinel in the timestamps its
+    # source did not set; the row below carries it in ALL of them.
+    warehouse.insert_whoop_cycles(
+        [_row(WHOOP_CYCLE_COLUMNS, account="sentinel", cycle_id="c", sync_version=1)]
+    )
+    warehouse.insert_whoop_sleeps(
+        [_row(WHOOP_SLEEP_COLUMNS, account="sentinel", sleep_id="s", sync_version=1)]
+    )
+    warehouse.insert_whoop_recoveries(
+        [_row(WHOOP_RECOVERY_COLUMNS, account="sentinel", cycle_id="c", sync_version=1)]
+    )
+    warehouse.insert_whoop_workouts(
+        [_row(WHOOP_WORKOUT_COLUMNS, account="sentinel", workout_id="w", sync_version=1)]
+    )
+
+    timestamps = [
+        column
+        for column, data_type in _column_types(warehouse, logical)
+        if data_type == "timestamp with time zone"
+    ]
+    assert timestamps, logical
+    row = next(row for row in _dicts(warehouse, logical) if row["account"] == "sentinel")
+    for column in timestamps:
+        assert row[column] is None, f"{logical}.{column} still exposes the epoch sentinel"
+
+
+def test_voice_memo_mart_column_order_only_ever_grows_at_the_end(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The deployed view must be replaceable in place.
+
+    ``CREATE OR REPLACE VIEW`` refuses to drop, rename, retype or reorder an
+    existing view's columns; it will only accept new ones appended. When it
+    refuses, ``_ensure_view`` falls back to dropping and recreating, which on
+    this view means taking the two marts_calendar transcript views down with
+    it. Pinning the exact prefix — read from the live production view on
+    2026-08-26 — keeps a routine edit from turning into that.
+    """
+    _seed_voice_memos(warehouse)
+    deployed = [
+        ("source", "text"),
+        ("account", "text"),
+        ("recording_id", "text"),
+        ("recorded_at", "timestamp with time zone"),
+        ("duration_seconds", "numeric"),
+        ("title", "text"),
+        ("source_title", "text"),
+        ("filename", "text"),
+        ("summary", "text"),
+        ("transcript", "text"),
+        ("participants_json", "text"),
+        ("action_items_json", "text"),
+        ("evidence_json", "text"),
+        ("calendar_event_id", "text"),
+        ("calendar_confidence", "double precision"),
+        ("meeting_start_at", "timestamp with time zone"),
+        ("meeting_end_at", "timestamp with time zone"),
+        ("enrichment_title", "text"),
+        ("enrichment_provider", "text"),
+        ("enrichment_model", "text"),
+        ("enrichment_prompt_version", "text"),
+        ("enriched_at", "timestamp with time zone"),
+        ("transcript_provider", "text"),
+        ("content_type", "text"),
+        ("size_bytes", "bigint"),
+        ("content_sha256", "text"),
+        ("storage_backend", "text"),
+        ("storage_key", "text"),
+        ("storage_file_id", "text"),
+        ("storage_url", "text"),
+        ("recording_url", "text"),
+        ("is_deleted", "bigint"),
+        ("ingested_at", "timestamp with time zone"),
+    ]
+    actual = _column_types(warehouse, "marts_voice_memos_recordings")
+    assert actual[: len(deployed)] == deployed
+    assert actual[len(deployed) :] == [("transcribed_at", "timestamp with time zone")]

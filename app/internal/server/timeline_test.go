@@ -452,7 +452,7 @@ func TestTimelineSourcesAggregatesAndCaches(t *testing.T) {
 		}
 	}
 	for _, pair := range [][2]string{
-		{"alice_voice_recordings", "voice_recording"},
+		{"voice_memos", "voice_memo"},
 		{"finance", "transaction"},
 		{"finance", "balance_observation"},
 		{"finance", "document"},
@@ -527,10 +527,10 @@ func TestTimelineChildQueriesCoverEveryEventTable(t *testing.T) {
 	expected := []string{
 		"gmail_messages", "slack_messages", "slack_files", "apple_messages",
 		"whatsapp_messages", "ai_conversation_events", "apple_note_revisions",
-		"apple_voice_memos_files", "calendar_events", "google_drive_files",
+		"marts_voice_memos_recordings", "calendar_events", "google_drive_files",
 		"photo_assets", "contact_cards", "whoop_cycles", "whoop_recoveries",
 		"whoop_sleeps", "whoop_workouts", "upstream_mutations",
-		"upstream_mutation_requests", "agent_runs", "alice_voice_recordings",
+		"upstream_mutation_requests", "agent_runs",
 		"finance_transactions", "finance_observations", "manual_finance_documents",
 	}
 	for _, table := range expected {
@@ -690,8 +690,10 @@ func TestTimelineChildRowsGetSignedMediaURLs(t *testing.T) {
 func TestTimelineVoiceMemoGetsItemMedia(t *testing.T) {
 	item := timelineEventRow("e1", 20, "2026-06-01T12:00:00Z")
 	item["adapter"] = "voice_memo"
-	item["source_table"] = "apple_voice_memos_files"
-	item["source_pk"] = `{"account": "z@x.test", "recording_id": "rec1"}`
+	// One adapter over the conforming mart covers every voice source, so the
+	// mart is what the row records as its source_table.
+	item["source_table"] = "marts_voice_memos_recordings"
+	item["source_pk"] = `{"source": "apple_voice_memos", "account": "z@x.test", "recording_id": "rec1"}`
 	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
 		"FROM " + warehouse.SQLRelation("timeline_events"): {Rows: []map[string]any{item}},
 		"row_to_json": {Rows: []map[string]any{

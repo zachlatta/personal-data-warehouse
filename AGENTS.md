@@ -57,7 +57,11 @@ quietly becoming untrue, and several of these have been.
   Identity-layer scanners that genuinely must read raw are the documented exception.
   *Held up by* `tests/test_schema_reorg_contract.py` (layer/schema-name consistency, the
   catalog as the only editable authority, no pre-reorg name anywhere in the source **or the
-  docs**).
+  docs**) and, for the input half, `tests/test_repo_contracts.py`
+  (`test_no_enrichment_runner_reads_a_raw_source_table_unaccounted_for`): every enrichment
+  runner's raw reads must be listed with a reason, a stale exemption fails, and a newly
+  added `*_enrichment.py` / `*_transcription.py` / `*_extraction.py` module that is not
+  registered fails too.
 - **C6 — PDW responds fast, and saturates the host before anyone optimizes further.**
   *Held up by* nothing automatic. It is the contract that has cost the most: see
   [Performance contract](#performance-contract).
@@ -899,6 +903,40 @@ This covers pdw's own grant (needed by `pdw ingest claude-desktop`). The uploade
 LaunchAgents dodge the problem differently — they exec `uv run python` directly without pdw
 in the chain — and their `/bin/zsh`/`uv`/venv-python grants (including the uv python
 path-drift gotcha described below) are unchanged.
+
+## Voice recordings (a multi-source domain, one pipeline)
+
+Voice has **two** sources — `base_apple_voice_memos.files` (the Mac uploader) and
+`base_alice_voice_recordings.recordings` — and exactly one of everything downstream.
+**Start at `marts_voice_memos.recordings`**: one row per recording from either source,
+with the resolved title, summary, transcript, participants, action items and calendar
+match as real columns. `marts_voice_memos.transcript_segments` holds the speaker-labelled
+utterances.
+
+```sql
+SELECT source, recorded_at, title, summary
+FROM marts_voice_memos.recordings
+WHERE transcript IS NOT NULL ORDER BY recorded_at DESC LIMIT 20;
+```
+
+**That mart is the INPUT to transcription and enrichment, not only an output.** Both
+passes (`defs/apple_voice_memos_transcription.py`, `defs/apple_voice_memos_enrichment.py`)
+take their candidates from it, so a new voice source is transcribed and enriched by
+existing code the day its raw table lands. They used to scan
+`base_apple_voice_memos.files` by name, and the mart hardcoded `NULL` transcript/summary
+for the other branch, which made the NULLs self-fulfilling: Alice sat at 53 recordings, 0
+transcripts and 0 summaries while every ENFORCED registry passed. See C5.
+
+The three derived tables — `derived_voice_memos.transcription_runs`, `.transcript_segments`
+and `.enrichments` — are keyed by **`source` first**, because a `recording_id` is unique
+only inside its own source. Without that column a second source's run upserts onto the
+first source's row, so the domain could not have stored a second transcript even if
+something had produced one.
+
+One timeline adapter (`voice_memo`, source `voice_memos`, kind `voice_memo`, priority
+`self`) covers both sources over the mart; `timeline.events.metadata->>'voice_source'`
+says which one, and `source_pk` carries `{source, account, recording_id}`. Search scopes
+them together under `sources => ARRAY['transcript']`.
 
 ## Local Voice Memos Upload Scheduler
 
@@ -1815,6 +1853,43 @@ first backfill), `CHATGPT_SESSION_KEY`, `CHATGPT_BASE_URL`. The **app** auto-exp
 starting points: `base_chatgpt.events` plus `marts_ai_conversations.events` /
 `marts_ai_conversations.sessions` filtered to `source = 'chatgpt'`, and `private.chatgpt_sessions`
 (credential) / `ops.chatgpt_conversation_sync` (per-conversation watermark).
+
+## Health (two WHOOP sources, one read interface)
+
+**Start at `marts_health`, not at either `base_whoop*` schema.** WHOOP arrives twice — the
+public developer API (`base_whoop`, summary grain) and the app API (`base_whoop_private`,
+high resolution) — and reading either alone is wrong in a different direction. The public
+source has no time series, no strain components, no sleep debt and no sport catalog; the
+private source is missing rows the public one has (measured 2026-08-26: 305 public sleeps
+vs 294 private, 268 public workouts vs 257). `marts_health.{cycles,sleeps,recoveries,workouts}`
+conforms them, LEFT-joined from the public row outward, with `has_private_detail` saying
+whether the higher-resolution row existed.
+
+```sql
+SELECT start_at, strain, sleep_need_seconds, has_private_detail
+FROM marts_health.cycles ORDER BY start_at DESC LIMIT 7;
+```
+
+Two conforming rules are the reason the mart exists, and both are silent 1000x errors
+without it:
+
+- **`hrv_rmssd_milli` is the only HRV column.** `base_whoop_private.recoveries` records it
+  in **seconds**; `base_whoop.recoveries` in milliseconds. The mart publishes one column,
+  in milliseconds.
+- **Every duration is `*_seconds`.** Public sleep-stage totals are milliseconds
+  (`total_rem_sleep_time_milli`) and private ones are seconds; the mart exposes no
+  `*_milli` duration at all, so two sources' columns cannot be added together by accident.
+
+The epoch sentinel is translated on **every** exposed timestamp, which is what makes
+`marts_health.cycles.end_at` NULL for the cycle still running instead of sorting oldest.
+`test_health_mart_translates_every_exposed_timestamp_or_none` seeds an all-sentinel row and
+checks the whole column list, per view, because translating some columns and not their
+siblings manufactures an inconsistency the sources do not have.
+
+The four WHOOP timeline adapters still read `base_whoop` directly and are unchanged:
+repointing them would change `adapter_signature` and re-walk those adapters for no
+behavioural gain, and the private tables are deliberately classified `detail` so the same
+health events are not emitted twice.
 
 ## WHOOP (health)
 

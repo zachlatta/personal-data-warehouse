@@ -17,6 +17,7 @@ from personal_data_warehouse.agent_runner import (
     agent_run_tool_call_rows,
     extract_tool_name,
 )
+from personal_data_warehouse.apple_voice_memos_transcription import voice_recording_source
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
@@ -332,38 +333,48 @@ def load_enrichment_candidates(
         ) AS a
             ON f.recording_id = a.subject_id
         """
+    # Reads the MART, not base_apple_voice_memos.files. Scanning the raw table
+    # made enrichment structurally blind to every voice source but the first:
+    # base_alice_voice_recordings was fully registered and still carried 0
+    # summaries. The transcription-run and enrichment joins stay on the derived
+    # tables because those are the authority on what has already been
+    # attempted, and both now match on `source` as well -- a recording_id is
+    # unique only inside its own source.
     rows = warehouse._query(
         f"""
         SELECT
+            f.source,
             f.account,
             f.recording_id,
             r.content_sha256,
-            f.recorded_at,
-            f.title,
+            COALESCE(f.recorded_at, f.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
+            f.source_title,
             r.transcript_text
-        FROM @apple_voice_memos_files AS f
+        FROM @marts_voice_memos_recordings AS f
         INNER JOIN @apple_voice_memos_transcription_runs AS r
-            ON f.account = r.account
+            ON f.source = r.source
+              AND f.account = r.account
               AND f.recording_id = r.recording_id
               AND f.content_sha256 = r.content_sha256
         LEFT JOIN
         (
-            SELECT account, recording_id, content_sha256, created_at
+            SELECT source, account, recording_id, content_sha256, created_at
             FROM @apple_voice_memos_enrichments
             WHERE provider = {_sql_string(provider)}
               {completed_prompt_filter}
               AND status = 'completed'
         ) AS e
-            ON f.account = e.account
+            ON f.source = e.source
+              AND f.account = e.account
               AND f.recording_id = e.recording_id
               AND e.content_sha256 = r.content_sha256
         {error_attempts_join}
         WHERE {" AND ".join(filters)}
-        ORDER BY f.recorded_at DESC
+        ORDER BY f.recorded_at DESC NULLS LAST
         {limit_sql}
         """
     )
-    columns = ("account", "recording_id", "content_sha256", "recorded_at", "title", "transcript_text")
+    columns = ("source", "account", "recording_id", "content_sha256", "recorded_at", "title", "transcript_text")
     return [dict(zip(columns, row, strict=True)) for row in rows]
 
 
@@ -439,7 +450,8 @@ def load_transcript_segments(warehouse, recording: Mapping[str, Any]) -> list[di
         f"""
         SELECT segment_index, speaker_label, start_ms, end_ms, confidence, text
         FROM @apple_voice_memos_transcript_segments
-        WHERE account = {_sql_string(str(recording.get("account", "")))}
+        WHERE source = {_sql_string(voice_recording_source(recording))}
+          AND account = {_sql_string(str(recording.get("account", "")))}
           AND recording_id = {_sql_string(str(recording.get("recording_id", "")))}
           AND provider = 'assemblyai'
         ORDER BY segment_index
@@ -2298,6 +2310,7 @@ def enrichment_row(
         speaker_names=speaker_names,
     )
     return {
+        "source": voice_recording_source(recording),
         "account": str(recording.get("account", "")),
         "recording_id": str(recording.get("recording_id", "")),
         "content_sha256": str(recording.get("content_sha256", "")),

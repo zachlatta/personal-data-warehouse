@@ -260,7 +260,15 @@ ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS = (
     "sync_version",
 )
 
+# The three derived voice tables are keyed by ``source`` first, because voice
+# is a MULTI-SOURCE domain and a recording_id is only unique inside its own
+# source. Without it, base_alice_voice_recordings could not be transcribed at
+# all: a second source's run would collide with an Apple run on
+# (account, recording_id, provider) and silently overwrite it. That collision,
+# plus transcription reading base_apple_voice_memos.files directly, is why
+# Alice sat at 53 recordings with 0 transcripts for weeks.
 VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS = (
+    "source",
     "account",
     "recording_id",
     "content_sha256",
@@ -294,6 +302,7 @@ RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS = (
 )
 
 VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS = (
+    "source",
     "account",
     "recording_id",
     "provider",
@@ -310,6 +319,7 @@ VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS = (
 )
 
 VOICE_MEMO_ENRICHMENT_COLUMNS = (
+    "source",
     "account",
     "recording_id",
     "content_sha256",

@@ -264,7 +264,6 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "mutations", kind: "mutation"},
 	{source: "mutations", kind: "mutation_request"},
 	{source: "warehouse", kind: "enrichment_run"},
-	{source: "alice_voice_recordings", kind: "voice_recording"},
 	{source: "finance", kind: "transaction"},
 	{source: "finance", kind: "balance_observation"},
 	{source: "finance", kind: "document"},
@@ -587,29 +586,44 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			      WHERE account = $1 AND note_id = $2 AND revision_id = $3 ORDER BY attachment_id`,
 		},
 	},
-	"apple_voice_memos_files": {
+	// Voice drill-down hangs off the MART, because that is what the single
+	// voice adapter records as source_table. Every query is scoped by source
+	// as well: the derived tables serve every voice source and a recording_id
+	// is unique only inside its own source.
+	"marts_voice_memos_recordings": {
 		{
 			name:   "enrichments",
-			params: []string{"account", "recording_id"},
+			params: []string{"source", "account", "recording_id"},
 			sql: `SELECT provider, model, status, title, left(summary, 4000) AS summary,
 			             action_items_json, calendar_event_id
 			      FROM ` + warehouse.SQLRelation("apple_voice_memos_enrichments") + `
-			      WHERE account = $1 AND recording_id = $2 ORDER BY created_at DESC`,
+			      WHERE source = $1 AND account = $2 AND recording_id = $3 ORDER BY created_at DESC`,
 		},
 		{
 			name:   "transcription_runs",
-			params: []string{"account", "recording_id"},
+			params: []string{"source", "account", "recording_id"},
 			sql: `SELECT provider, model, status, requested_at, completed_at, left(error, 500) AS error
 			      FROM ` + warehouse.SQLRelation("apple_voice_memos_transcription_runs") + `
-			      WHERE account = $1 AND recording_id = $2 ORDER BY requested_at DESC`,
+			      WHERE source = $1 AND account = $2 AND recording_id = $3 ORDER BY requested_at DESC`,
 		},
 		{
 			name:     "transcript_segments",
-			params:   []string{"account", "recording_id"},
+			params:   []string{"source", "account", "recording_id"},
 			pageSize: 100,
 			sql: `SELECT segment_index, speaker_label, start_ms, end_ms, left(text, 700) AS text
 			      FROM ` + warehouse.SQLRelation("apple_voice_memos_transcript_segments") + `
-			      WHERE account = $1 AND recording_id = $2 ORDER BY segment_index`,
+			      WHERE source = $1 AND account = $2 AND recording_id = $3 ORDER BY segment_index`,
+		},
+		{
+			// Alice ships per-recording artifacts (the transcript page, the
+			// audio); an Apple row simply has none, so this returns nothing
+			// rather than needing a second source_table.
+			name:   "artifacts",
+			params: []string{"account", "recording_id"},
+			sql: `SELECT artifact_id, kind, filename, content_type, size_bytes,
+			             content_sha256, storage_file_id
+			      FROM ` + warehouse.SQLRelation("alice_voice_recording_artifacts") + `
+			      WHERE account = $1 AND recording_id = $2 ORDER BY kind, artifact_id`,
 		},
 	},
 	"google_drive_files": {
@@ -674,16 +688,6 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 			params: []string{"run_id"},
 			sql: `SELECT event_index, stream, event_type, created_at, left(text, 700) AS text
 			      FROM ` + warehouse.SQLRelation("agent_run_events") + ` WHERE run_id = $1 ORDER BY event_index`,
-		},
-	},
-	"alice_voice_recordings": {
-		{
-			name:   "artifacts",
-			params: []string{"account", "recording_id"},
-			sql: `SELECT artifact_id, kind, filename, content_type, size_bytes,
-			             content_sha256, storage_file_id
-			      FROM ` + warehouse.SQLRelation("alice_voice_recording_artifacts") + `
-			      WHERE account = $1 AND recording_id = $2 ORDER BY kind, artifact_id`,
 		},
 	},
 	"finance_transactions": {
@@ -957,12 +961,11 @@ func timelineMediaKind(contentType string) string {
 // itemMedia surfaces the event's own blob (a voice memo's audio, a Slack
 // file share's file, a Drive file's stored copy) from the fetched source row.
 var timelineItemMediaColumns = map[string][2]string{
-	"apple_voice_memos_files":  {"storage_file_id", "content_type"},
-	"alice_voice_recordings":   {"storage_file_id", "content_type"},
-	"manual_finance_documents": {"storage_file_id", "mime_type"},
-	"slack_files":              {"file_id", "mimetype"},
-	"google_drive_files":       {"storage_file_id", "mime_type"},
-	"photo_assets":             {"thumbnail_storage_file_id", "thumbnail_content_type"},
+	"marts_voice_memos_recordings": {"storage_file_id", "content_type"},
+	"manual_finance_documents":     {"storage_file_id", "mime_type"},
+	"slack_files":                  {"file_id", "mimetype"},
+	"google_drive_files":           {"storage_file_id", "mime_type"},
+	"photo_assets":                 {"thumbnail_storage_file_id", "thumbnail_content_type"},
 }
 
 func (s *timelineService) itemMedia(sourceTable string, sourceRow any) map[string]any {

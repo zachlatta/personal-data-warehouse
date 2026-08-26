@@ -17,6 +17,7 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.slack_sync import SlackApiCallError, SlackSyncRunner
 
 from personal_data_warehouse.schema import (
+    ALICE_VOICE_RECORDING_COLUMNS,
     APPLE_MESSAGE_COLUMNS,
     APPLE_NOTE_ATTACHMENT_COLUMNS,
     APPLE_NOTE_COLUMNS,
@@ -4517,6 +4518,7 @@ def test_postgres_calendar_transcript_views_use_latest_grouping(warehouse: Postg
         [
             _default_row(
                 VOICE_MEMO_ENRICHMENT_COLUMNS,
+                source="apple_voice_memos",
                 account="recording-account",
                 recording_id="rec-1",
                 content_sha256="sha-old",
@@ -4531,6 +4533,7 @@ def test_postgres_calendar_transcript_views_use_latest_grouping(warehouse: Postg
             ),
             _default_row(
                 VOICE_MEMO_ENRICHMENT_COLUMNS,
+                source="apple_voice_memos",
                 account="recording-account",
                 recording_id="rec-1",
                 content_sha256="sha-new",
@@ -4575,6 +4578,7 @@ def test_postgres_voice_memo_ensure_can_skip_runtime_content_hash_backfill(wareh
         [
             _default_row(
                 VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                source="apple_voice_memos",
                 account="zach@example.test",
                 recording_id="rec-1",
                 provider="assemblyai",
@@ -4756,9 +4760,116 @@ def test_postgres_load_untranscribed_voice_memos_uses_valid_retryable_error_sql(
         ]
     )
 
-    rows = warehouse.load_untranscribed_apple_voice_memos_files(provider="assemblyai", limit=1)
+    rows = warehouse.load_untranscribed_voice_recordings(provider="assemblyai", limit=1)
 
     assert [row["recording_id"] for row in rows] == ["rec-1"]
+    assert rows[0]["source"] == "apple_voice_memos"
+
+
+def test_voice_derived_tables_migrate_onto_the_source_key_in_place(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """An existing production table has to move onto the new key by itself.
+
+    CREATE TABLE IF NOT EXISTS never revisits a primary key, so without this
+    migration the deployed table would keep upserting on the OLD conflict
+    target -- which is not a loud error, it is a silent overwrite of a
+    different source's row. Every pre-existing row belongs to Apple Voice
+    Memos, because nothing else could have written one.
+    """
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    runs = warehouse.sql_relation("apple_voice_memos_transcription_runs")
+
+    # Rewind to the pre-multi-source shape and plant a row in it. The marts
+    # views go with it: on the deployed database they are the OLD definitions,
+    # which do not reference `source` at all.
+    warehouse._command(
+        f"DROP VIEW IF EXISTS {warehouse.sql_relation('marts_voice_memos_recordings')} CASCADE"
+    )
+    warehouse._command(f"ALTER TABLE {runs} DROP CONSTRAINT transcription_runs_pkey")
+    warehouse._command(f"ALTER TABLE {runs} DROP COLUMN source")
+    warehouse._command(
+        f"ALTER TABLE {runs} ADD PRIMARY KEY (account, recording_id, provider)"
+    )
+    warehouse._command(
+        f"INSERT INTO {runs} (account, recording_id, provider, transcript_text) "
+        "VALUES ('zach', 'legacy-1', 'assemblyai', 'legacy transcript')"
+    )
+
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+
+    assert warehouse._primary_key_columns("apple_voice_memos_transcription_runs") == (
+        "source",
+        "account",
+        "recording_id",
+        "provider",
+    )
+    assert warehouse._query(
+        "SELECT source, transcript_text FROM @apple_voice_memos_transcription_runs "
+        "WHERE recording_id = 'legacy-1'"
+    ) == [("apple_voice_memos", "legacy transcript")]
+
+
+def test_transcription_candidates_include_every_voice_source(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The defect, as a test: a second voice source must be transcribable.
+
+    Transcription used to scan base_apple_voice_memos.files, so
+    base_alice_voice_recordings -- fully registered, catalogued, pipelined and
+    on the timeline -- was never a candidate. It sat at 53 recordings, 0
+    transcripts and 0 summaries with every ENFORCED registry green, because no
+    registry asks what a transformation READS.
+    """
+    now = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    warehouse.ensure_alice_voice_recordings_tables()
+    warehouse.insert_apple_voice_memos_files(
+        [
+            _default_row(
+                VOICE_MEMO_FILE_COLUMNS,
+                account="zach@example.test",
+                recording_id="rec-1",
+                filename="memo.m4a",
+                content_type="audio/mp4",
+                size_bytes=123,
+                content_sha256="apple-hash",
+                recorded_at=now,
+                storage_backend="google_drive",
+                storage_file_id="drive-apple",
+                sync_version=1,
+            )
+        ]
+    )
+    warehouse.insert_alice_voice_recordings(
+        [
+            _default_row(
+                ALICE_VOICE_RECORDING_COLUMNS,
+                account="zach@example.test",
+                recording_id="alice-1",
+                filename="walk.m4a",
+                content_type="audio/mp4",
+                size_bytes=456,
+                content_sha256="alice-hash",
+                recorded_at=now,
+                storage_backend="google_drive",
+                storage_file_id="drive-alice",
+                ingested_at=now,
+                sync_version=1,
+            )
+        ]
+    )
+
+    rows = warehouse.load_untranscribed_voice_recordings(provider="assemblyai", limit=10)
+
+    assert {(row["source"], row["recording_id"]) for row in rows} == {
+        ("apple_voice_memos", "rec-1"),
+        ("alice_voice_recordings", "alice-1"),
+    }
+    # Every candidate carries what the runner needs to fetch its own bytes.
+    for row in rows:
+        assert row["storage_file_id"]
+        assert row["filename"]
 
 
 def test_postgres_sync_state_round_trips_latest_update(warehouse: PostgresWarehouse) -> None:

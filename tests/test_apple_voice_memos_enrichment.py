@@ -911,7 +911,11 @@ def test_load_enrichment_candidates_scans_all_recording_history_without_limit() 
 
     assert "f.recorded_at >=" not in queries[0]
     assert "LIMIT" not in queries[0]
-    assert "FROM @apple_voice_memos_files AS f" in queries[0]
+    # The mart, never the raw table: enrichment serves the voice DOMAIN, and
+    # scanning one source's raw rows is what left the second source with no
+    # summaries at all.
+    assert "FROM @marts_voice_memos_recordings AS f" in queries[0]
+    assert "@apple_voice_memos_files" not in queries[0]
     assert "INNER JOIN @apple_voice_memos_transcription_runs AS r" in queries[0]
     assert "FROM @apple_voice_memos_enrichments" in queries[0]
     assert "r.content_sha256" in queries[0]

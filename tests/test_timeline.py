@@ -15,11 +15,13 @@ from personal_data_warehouse.postgres import POSTGRES_INDEXES, POSTGRES_TABLES, 
 from personal_data_warehouse.relations import (
     AI_EVENT_SOURCE_RELATIONS,
     CANONICAL_RELATIONS,
+    VOICE_EVENT_SOURCE_RELATIONS,
     physical_schema_names,
     relation,
 )
 from personal_data_warehouse.timeline import (
     RAW_DDL_TABLES,
+    RETIRED_TIMELINE_ADAPTERS,
     TIMELINE_ADAPTERS,
     TIMELINE_NORMALIZED_COLUMNS,
     TIMELINE_PRIORITY_DEFINITIONS,
@@ -95,8 +97,13 @@ def test_every_registered_table_is_classified():
 def test_adapter_source_tables_are_classified_as_events():
     adapter_tables: set[str] = set()
     for adapter in TIMELINE_ADAPTERS:
+        # An adapter over a conforming mart covers every raw table that mart
+        # unions, and those raw tables are what the coverage registry knows
+        # about. The registry is the only thing that can say so.
         if adapter.source_table == "ai_conversation_events":
             adapter_tables.update(AI_EVENT_SOURCE_RELATIONS.values())
+        elif adapter.source_table == "marts_voice_memos_recordings":
+            adapter_tables.update(VOICE_EVENT_SOURCE_RELATIONS.values())
         else:
             adapter_tables.add(adapter.source_table)
     event_tables = {
@@ -114,9 +121,25 @@ def test_adapter_names_are_unique_and_resolvable():
         adapter_by_name("nope")
 
 
-def test_timeline_includes_alice_and_finance_activity_adapters():
+def test_one_voice_adapter_covers_every_voice_source():
+    """Voice reaches the timeline through the mart, not once per source.
+
+    There were two adapters, one per raw table, and only the Apple one had
+    ever been taught about transcripts and summaries -- so the second source's
+    rows carried a filename and nothing else. One adapter over
+    marts_voice_memos.recordings is what makes a third source free.
+    """
+    voice = [a for a in TIMELINE_ADAPTERS if a.source_table in set(VOICE_EVENT_SOURCE_RELATIONS.values())]
+    assert voice == [], "a voice adapter still reads a raw source table"
+    adapter = adapter_by_name("voice_memo")
+    assert adapter.source_table == "marts_voice_memos_recordings"
+    assert "alice_voice_recording" in RETIRED_TIMELINE_ADAPTERS
+    with pytest.raises(KeyError):
+        adapter_by_name("alice_voice_recording")
+
+
+def test_timeline_includes_finance_activity_adapters():
     requested = {
-        "alice_voice_recording": ("alice_voice_recordings", "voice_recording"),
         "finance_transaction": ("finance", "transaction"),
         "finance_observation": ("finance", "balance_observation"),
         "manual_finance_document": ("finance", "document"),
@@ -629,9 +652,10 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
-        INSERT INTO @apple_voice_memos_enrichments (account, recording_id, provider, model,
-                                                   prompt_version, title, summary, created_at)
-        VALUES ('z@x.test', 'rec1', 'p', 'm', 'v1', 'Standup notes', 'we discussed things', %s)
+        INSERT INTO @apple_voice_memos_enrichments (source, account, recording_id, provider, model,
+                                                   prompt_version, status, title, summary, created_at)
+        VALUES ('apple_voice_memos', 'z@x.test', 'rec1', 'p', 'm', 'v1', 'completed',
+                'Standup notes', 'we discussed things', %s)
         """,
         (_NOW,),
     )
@@ -853,7 +877,6 @@ EXPECTED_SEEDED_PRIORITIES = {
     "agent_session_turn": "background",
     "apple_note_revision": "self",
     "voice_memo": "self",
-    "alice_voice_recording": "self",
     "calendar_event": "self",
     "drive_file": "cc",
     "photo": "self",
@@ -881,8 +904,8 @@ EXPECTED_SEEDED_EVENTS = {
     "agent_session": 1,
     "agent_session_turn": 2,
     "apple_note_revision": 1,
-    "voice_memo": 1,
-    "alice_voice_recording": 1,
+    # One adapter, two seeded sources: the Apple memo and the Alice recording.
+    "voice_memo": 2,
     "calendar_event": 1,
     "drive_file": 1,
     "photo": 1,
@@ -971,13 +994,20 @@ def test_backfill_normalizes_every_source(warehouse):
     assert reply["source_pk"]["session_id"] == "sess1"
     assert reply["metadata"]["seq"] == 1
 
-    memo = next(r for r in rows if r["adapter"] == "voice_memo")
+    memos = [r for r in rows if r["adapter"] == "voice_memo"]
+    assert {r["metadata"]["voice_source"] for r in memos} == {
+        "apple_voice_memos",
+        "alice_voice_recordings",
+    }
+    memo = next(r for r in memos if r["metadata"]["voice_source"] == "apple_voice_memos")
     assert memo["title"] == "Standup notes"
     assert memo["snippet"] == "we discussed things"
 
-    alice = next(r for r in rows if r["adapter"] == "alice_voice_recording")
+    alice = next(r for r in memos if r["metadata"]["voice_source"] == "alice_voice_recordings")
     assert alice["title"] == "Alice walk"
-    assert alice["snippet"] == "321 seconds"
+    # The second source is on the SAME adapter, so it inherits every field the
+    # first one has -- including the summary a transcript will later fill in.
+    assert alice["source_pk"]["recording_id"] == "alice-rec1"
 
     transaction = next(r for r in rows if r["adapter"] == "finance_transaction")
     assert transaction["title"] == "Cafe"
@@ -1987,16 +2017,17 @@ def test_voice_memo_timeline_refreshes_when_enrichment_arrives_later(warehouse):
     finally:
         engine.close()
     before = warehouse._query_dicts(
-        "SELECT title, snippet FROM @timeline_events WHERE event_id = 'z@x.test|rec-late'"
+        "SELECT title, snippet FROM @timeline_events "
+        "WHERE event_id = 'apple_voice_memos|z@x.test|rec-late'"
     )[0]
     assert before["title"] == "20260709 raw title"
     assert before["snippet"] == ""
 
     warehouse._command(
         """
-        INSERT INTO @apple_voice_memos_enrichments (account, recording_id, provider, model,
+        INSERT INTO @apple_voice_memos_enrichments (source, account, recording_id, provider, model,
                                                    prompt_version, status, title, summary, created_at)
-        VALUES ('z@x.test', 'rec-late', 'p', 'm', 'v1', 'completed',
+        VALUES ('apple_voice_memos', 'z@x.test', 'rec-late', 'p', 'm', 'v1', 'completed',
                 'Readable memo title', 'Readable memo summary', %s)
         """,
         (_NOW + timedelta(minutes=5),),
@@ -2009,7 +2040,8 @@ def test_voice_memo_timeline_refreshes_when_enrichment_arrives_later(warehouse):
         engine.close()
     assert stats[0].incremental_rows == 1
     after = warehouse._query_dicts(
-        "SELECT title, snippet FROM @timeline_events WHERE event_id = 'z@x.test|rec-late'"
+        "SELECT title, snippet FROM @timeline_events "
+        "WHERE event_id = 'apple_voice_memos|z@x.test|rec-late'"
     )[0]
     assert after["title"] == "Readable memo title"
     assert after["snippet"] == "Readable memo summary"
@@ -2639,3 +2671,55 @@ def test_prune_clamps_a_large_backlog_instead_of_declining_it(warehouse):
     )[0][0]
     assert orphans == 0, f"repeated runs must drain the backlog; {orphans} orphans remain"
     assert settled < total, "the orphans were never removed"
+
+
+def test_a_retired_adapters_rows_are_removed_not_stranded(warehouse):
+    """Removing an adapter must remove its rows, or they answer forever.
+
+    timeline.events is keyed (adapter, event_id), and `prune_sql` only ever
+    reconciles an adapter that still runs. So dropping `alice_voice_recording`
+    from the registry when it was folded into `voice_memo` would have left its
+    53 rows in the read surface for every agent, duplicating the rows that
+    superseded them, with nothing in the engine able to notice.
+    """
+    _ensure_all_source_tables(warehouse)
+    warehouse._command(
+        """
+        INSERT INTO @timeline_events
+            (adapter, event_id, source, kind, priority, event_ts, ingest_ts, title,
+             search_text, source_table, source_pk, metadata, seq)
+        VALUES ('alice_voice_recording', 'z@x.test|gone', 'alice_voice_recordings',
+                'voice_recording', 'self', %s, %s, 'stranded', 'stranded',
+                'alice_voice_recordings', '{}'::jsonb, '{}'::jsonb, 1)
+        """,
+        (_NOW, _NOW),
+    )
+    warehouse._command(
+        """
+        INSERT INTO @timeline_sync_state (adapter) VALUES ('alice_voice_recording')
+        """
+    )
+
+    engine = _engine(warehouse, adapters=[adapter_by_name("voice_memo")])
+    try:
+        engine.run()
+    finally:
+        engine.close()
+
+    assert warehouse._query(
+        "SELECT count(*) FROM @timeline_events WHERE adapter = 'alice_voice_recording'"
+    ) == [(0,)]
+    assert warehouse._query(
+        "SELECT count(*) FROM @timeline_sync_state WHERE adapter = 'alice_voice_recording'"
+    ) == [(0,)]
+
+
+def test_a_live_adapter_is_never_retired_by_the_cleanup(warehouse):
+    """The registry only ever names adapters that are actually gone.
+
+    A live adapter listed there would have its whole history deleted on the
+    next run, so the engine refuses on the registry's own contents rather than
+    trusting whoever edited it.
+    """
+    live = {adapter.name for adapter in TIMELINE_ADAPTERS}
+    assert set(RETIRED_TIMELINE_ADAPTERS).isdisjoint(live)

@@ -236,7 +236,6 @@ SEARCH_TEXT_MAX_RESULTS_CAP = 200
 # exact search accept the same `sources` vocabulary.
 SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("agent_session", ("agent_session", "agent_session_turn"), "t.source"),
-    ("alice_voice_recording", ("alice_voice_recording",), "t.kind"),
     ("calendar", ("calendar_event",), "t.kind"),
     ("contact", ("contact_update", "apple_contact_update"), "t.kind"),
     ("gmail", ("gmail_email",), "t.kind"),
@@ -253,6 +252,10 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("photo", ("photo",), "t.kind"),
     ("slack", ("slack_message",), "t.kind"),
     ("slack_file", ("slack_file",), "t.kind"),
+    # ONE adapter covers every voice source (it reads
+    # marts_voice_memos.recordings), so `transcript` scopes all of them. The
+    # retired per-source token survives as an alias below, so a scoped call
+    # written against the old registry still resolves.
     ("transcript", ("voice_memo",), "t.kind"),
     ("warehouse", ("enrichment_run",), "t.kind"),
     ("whatsapp", ("whatsapp_message",), "t.kind"),
@@ -285,6 +288,9 @@ SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL = ", ".join(
 # Every key must stay disjoint from the canonical token set (test-enforced).
 SEARCH_SOURCE_ALIASES: dict[str, str] = {
     "agent_sessions": "agent_session",
+    "alice": "transcript",
+    "alice_voice_recording": "transcript",
+    "alice_voice_recordings": "transcript",
     "apple_message": "imessage",
     "apple_messages": "imessage",
     "apple_note": "note",
@@ -559,17 +565,21 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("content_sha256", "ai_provider", "ai_model", "ai_prompt_version"),
     ),
     "apple_voice_memos_files": TableSpec(VOICE_MEMO_FILE_COLUMNS, ("account", "recording_id")),
+    # ``source`` leads every key here: derived_voice_memos.* serves EVERY voice
+    # source, and a recording_id is only unique within its own source. Keyed
+    # without it, a second source's transcription run collides with an Apple
+    # one and the upsert silently overwrites the wrong recording.
     "apple_voice_memos_transcription_runs": TableSpec(
         VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
-        ("account", "recording_id", "provider"),
+        ("source", "account", "recording_id", "provider"),
     ),
     "apple_voice_memos_transcript_segments": TableSpec(
         VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS,
-        ("account", "recording_id", "provider", "segment_index"),
+        ("source", "account", "recording_id", "provider", "segment_index"),
     ),
     "apple_voice_memos_enrichments": TableSpec(
         VOICE_MEMO_ENRICHMENT_COLUMNS,
-        ("account", "recording_id", "provider", "model", "prompt_version"),
+        ("source", "account", "recording_id", "provider", "model", "prompt_version"),
     ),
     "alice_voice_recordings": TableSpec(
         ALICE_VOICE_RECORDING_COLUMNS,
@@ -3572,6 +3582,9 @@ class PostgresWarehouse:
             "ALTER TABLE @whoop_sync_state "
             "ADD COLUMN IF NOT EXISTS credential_sha256 text NOT NULL DEFAULT ''"
         )
+        # marts_health.* conforms both WHOOP sources, so either source's
+        # ensure_* path can be the one that builds it.
+        self._ensure_health_marts_views()
 
     def ensure_whoop_private_tables(self) -> None:
         """Provision the WHOOP private (app) API source.
@@ -3591,6 +3604,207 @@ class PostgresWarehouse:
             "ALTER TABLE @whoop_private_sessions ALTER COLUMN session_key SET DEFAULT 'default'"
         )
         self._command("ALTER TABLE @whoop_private_sessions ALTER COLUMN status SET DEFAULT 'ok'")
+        self._ensure_health_marts_views()
+
+    def _ensure_health_marts_views(self) -> None:
+        """marts_health.*: one health read interface over BOTH WHOOP sources.
+
+        `base_whoop` is the public developer API and `base_whoop_private` is the
+        app API; they describe the SAME events at different resolutions, and
+        reading either alone is wrong in a different direction. The public one
+        has no time series and no strain components; the private one is missing
+        rows the public one has (measured 2026-08-26: 305 public sleeps vs 294
+        private, 268 public workouts vs 257). So the union is LEFT-joined from
+        the public row outward: the public source is the spine, the private one
+        adds resolution where it exists.
+
+        Two conforming rules are load-bearing and neither is cosmetic:
+
+        * **Units.** The private API records HRV in SECONDS where the public API
+          uses milliseconds, and its sleep-stage durations in seconds where the
+          public API uses milliseconds. A view that exposed both under one name
+          would be a silent 1000x error, so every conformed column states its
+          unit in its name and one source is converted into the other's.
+        * **The epoch sentinel.** Warehouse timestamps are NOT NULL and store
+          absence as 1970-01-01, so `end_at` on a running cycle sorts OLDEST.
+          Every exposed timestamp is translated with NULLIF, or none would be:
+          translating some and not others does not inherit an inconsistency
+          from internally-consistent sources, it MANUFACTURES one, and then
+          ORDER BY, MIN() and IS NULL disagree depending on which column was
+          asked.
+        """
+        self._ensure_table_group(
+            [
+                "whoop_cycles",
+                "whoop_recoveries",
+                "whoop_sleeps",
+                "whoop_workouts",
+                "whoop_private_cycles",
+                "whoop_private_recoveries",
+                "whoop_private_sleeps",
+                "whoop_private_workouts",
+                "whoop_private_sports",
+            ]
+        )
+        epoch = "TIMESTAMPTZ '1970-01-01 00:00:00+00'"
+        self._ensure_view(
+            "marts_health_cycles",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_cycles AS
+            SELECT
+                c.account,
+                c.cycle_id,
+                NULLIF(c.start_at, {epoch}) AS start_at,
+                -- The in-progress cycle stores the epoch here, not NULL, which
+                -- is why ORDER BY end_at DESC on the raw table ranks the
+                -- RUNNING cycle as the oldest row in it.
+                NULLIF(c.end_at, {epoch}) AS end_at,
+                p.day_start,
+                p.day_end,
+                c.timezone_offset,
+                c.score_state,
+                -- The displayed 0-21 score. In the private table that is
+                -- `scaled_strain`; `day_strain` is the raw unscaled value
+                -- (max ~0.024) and reads as zero.
+                c.strain,
+                p.scaled_strain AS private_strain,
+                c.kilojoule,
+                c.average_heart_rate,
+                c.max_heart_rate,
+                p.sleep_need AS sleep_need_seconds,
+                NULLIF(p.predicted_end, {epoch}) AS predicted_end,
+                p.data_state,
+                (p.cycle_id IS NOT NULL)::int::bigint AS has_private_detail,
+                NULLIF(c.created_at, {epoch}) AS created_at,
+                NULLIF(c.updated_at, {epoch}) AS updated_at,
+                NULLIF(c.synced_at, {epoch}) AS synced_at
+            FROM @whoop_cycles c
+            LEFT JOIN @whoop_private_cycles p
+              ON p.account = c.account AND p.cycle_id = c.cycle_id
+            """,
+        )
+        self._ensure_view(
+            "marts_health_sleeps",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_sleeps AS
+            SELECT
+                s.account,
+                s.sleep_id,
+                s.cycle_id,
+                NULLIF(s.start_at, {epoch}) AS start_at,
+                NULLIF(s.end_at, {epoch}) AS end_at,
+                s.timezone_offset,
+                -- bigint 0/1 throughout the warehouse, never boolean.
+                s.nap AS is_nap,
+                s.score_state,
+                s.sleep_performance_percentage,
+                s.sleep_consistency_percentage,
+                s.sleep_efficiency_percentage,
+                s.respiratory_rate,
+                -- Public stage totals are MILLISECONDS; the private source
+                -- records the same measurements in seconds. Everything here is
+                -- seconds so the two can never be added together by accident.
+                s.total_in_bed_time_milli / 1000.0 AS time_in_bed_seconds,
+                s.total_awake_time_milli / 1000.0 AS awake_seconds,
+                s.total_no_data_time_milli / 1000.0 AS no_data_seconds,
+                s.total_light_sleep_time_milli / 1000.0 AS light_sleep_seconds,
+                s.total_slow_wave_sleep_time_milli / 1000.0 AS slow_wave_sleep_seconds,
+                s.total_rem_sleep_time_milli / 1000.0 AS rem_sleep_seconds,
+                s.sleep_cycle_count,
+                s.disturbance_count,
+                p.debt_pre AS sleep_debt_pre_seconds,
+                p.debt_post AS sleep_debt_post_seconds,
+                p.habitual_sleep_need AS habitual_sleep_need_seconds,
+                p.need_from_strain AS need_from_strain_seconds,
+                p.latency AS sleep_latency_seconds,
+                NULLIF(p.optimal_sleep_start, {epoch}) AS optimal_sleep_start,
+                NULLIF(p.optimal_sleep_end, {epoch}) AS optimal_sleep_end,
+                (p.activity_id IS NOT NULL)::int::bigint AS has_private_detail,
+                NULLIF(s.created_at, {epoch}) AS created_at,
+                NULLIF(s.updated_at, {epoch}) AS updated_at,
+                NULLIF(s.synced_at, {epoch}) AS synced_at
+            FROM @whoop_sleeps s
+            LEFT JOIN @whoop_private_sleeps p
+              ON p.account = s.account AND p.activity_id = s.sleep_id
+            """,
+        )
+        self._ensure_view(
+            "marts_health_recoveries",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_recoveries AS
+            SELECT
+                r.account,
+                r.cycle_id,
+                r.sleep_id,
+                r.score_state,
+                r.user_calibrating AS is_calibrating,
+                r.recovery_score,
+                r.resting_heart_rate,
+                -- ONE HRV column, in milliseconds. base_whoop_private stores
+                -- hrv_rmssd_seconds in SECONDS beside a milliseconds copy;
+                -- exposing both units under similar names is how a 1000x error
+                -- gets written.
+                r.hrv_rmssd_milli,
+                r.spo2_percentage,
+                r.skin_temp_celsius,
+                p.hrv_component,
+                p.rhr_component,
+                p.recovery_rate,
+                p.hr_baseline,
+                p.prob_covid,
+                (p.activity_id IS NOT NULL)::int::bigint AS has_private_detail,
+                NULLIF(r.created_at, {epoch}) AS created_at,
+                NULLIF(r.updated_at, {epoch}) AS updated_at,
+                NULLIF(r.synced_at, {epoch}) AS synced_at
+            FROM @whoop_recoveries r
+            LEFT JOIN @whoop_private_recoveries p
+              ON p.account = r.account AND p.activity_id = r.sleep_id
+            """,
+        )
+        self._ensure_view(
+            "marts_health_workouts",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_workouts AS
+            SELECT
+                w.account,
+                w.workout_id,
+                NULLIF(w.start_at, {epoch}) AS start_at,
+                NULLIF(w.end_at, {epoch}) AS end_at,
+                w.timezone_offset,
+                w.sport_id,
+                -- The public row's sport_name is a slug ('hiking-rucking');
+                -- the private source ships the 204-sport catalog that gives it
+                -- a display name ('Hiking'), and is sometimes the only source
+                -- of one at all. Both are exposed: the readable name under
+                -- sport_name, the provider's own token under sport_slug.
+                COALESCE(NULLIF(sp.name, ''), NULLIF(w.sport_name, '')) AS sport_name,
+                NULLIF(w.sport_name, '') AS sport_slug,
+                sp.category AS sport_category,
+                w.score_state,
+                w.strain,
+                w.average_heart_rate,
+                w.max_heart_rate,
+                w.kilojoule,
+                w.percent_recorded,
+                w.distance_meter,
+                w.altitude_gain_meter,
+                w.altitude_change_meter,
+                w.zone_durations_json,
+                p.total_steps,
+                p.msk_score,
+                p.zone_durations_v2_json,
+                (p.gps_data_json IS NOT NULL AND p.gps_data_json <> '{{}}'::jsonb)::int::bigint AS has_gps,
+                (p.activity_id IS NOT NULL)::int::bigint AS has_private_detail,
+                NULLIF(w.created_at, {epoch}) AS created_at,
+                NULLIF(w.updated_at, {epoch}) AS updated_at,
+                NULLIF(w.synced_at, {epoch}) AS synced_at
+            FROM @whoop_workouts w
+            LEFT JOIN @whoop_private_workouts p
+              ON p.account = w.account AND p.activity_id = w.workout_id
+            LEFT JOIN @whoop_private_sports sp
+              ON sp.account = w.account AND sp.sport_id = w.sport_id
+            """,
+        )
 
     def ensure_agent_sessions_tables(self) -> None:
         self._ensure_table_group(_AI_CONVERSATION_EVENT_TABLES)
@@ -5872,6 +6086,52 @@ class PostgresWarehouse:
                 self._command(f"ALTER TABLE {self.sql_relation(table)} SET ({settings})")
         self._apply_catalog_grant(table)
 
+    def _primary_key_columns(self, table: str) -> tuple[str, ...]:
+        rel = canonical_relation(table).with_namespace(self._schema)
+        rows = self._query(
+            """
+            SELECT a.attname
+            FROM pg_index AS i
+            INNER JOIN pg_class AS c ON c.oid = i.indrelid
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            INNER JOIN pg_attribute AS a
+              ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+            WHERE i.indisprimary AND n.nspname = %s AND c.relname = %s
+            ORDER BY array_position(i.indkey, a.attnum)
+            """,
+            (rel.schema, rel.name),
+        )
+        return tuple(str(row[0]) for row in rows)
+
+    def _ensure_primary_key(self, table: str) -> bool:
+        """Move an existing table onto the key its ``TableSpec`` now declares.
+
+        ``CREATE TABLE IF NOT EXISTS`` never revisits the primary key, so a
+        table that gains a key column keeps upserting on the OLD conflict
+        target -- which is not a loud error, it is a silent overwrite of a
+        different row. Returns True when it changed anything.
+        """
+        desired = tuple(POSTGRES_TABLES[table].primary_key)
+        if self._primary_key_columns(table) == desired:
+            return False
+        rel = canonical_relation(table).with_namespace(self._schema)
+        rows = self._query(
+            """
+            SELECT con.conname
+            FROM pg_constraint AS con
+            INNER JOIN pg_class AS c ON c.oid = con.conrelid
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE con.contype = 'p' AND n.nspname = %s AND c.relname = %s
+            """,
+            (rel.schema, rel.name),
+        )
+        relation_sql = self.sql_relation(table)
+        for (constraint_name,) in rows:
+            self._command(f"ALTER TABLE {relation_sql} DROP CONSTRAINT {_identifier(str(constraint_name))}")
+        columns = ", ".join(_identifier(column) for column in desired)
+        self._command(f"ALTER TABLE {relation_sql} ADD PRIMARY KEY ({columns})")
+        return True
+
     def _table_reloptions(self, table: str) -> set[str]:
         rel = canonical_relation(table).with_namespace(self._schema)
         rows = self._query(
@@ -7788,26 +8048,37 @@ class PostgresWarehouse:
     def insert_agent_run_tool_calls(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("agent_run_tool_calls", rows, AGENT_RUN_TOOL_CALL_COLUMNS)
 
-    def load_untranscribed_apple_voice_memos_files(self, *, provider: str, limit: int) -> list[dict[str, Any]]:
+    def load_untranscribed_voice_recordings(self, *, provider: str, limit: int) -> list[dict[str, Any]]:
+        """Recordings from EVERY voice source that still need transcription.
+
+        Reads marts_voice_memos.recordings, not base_apple_voice_memos.files.
+        Scanning the raw table was the whole defect: a second registered voice
+        source (base_alice_voice_recordings, 53 recordings) was never a
+        candidate, so it carried 0 transcripts and 0 summaries while every
+        enforced registry stayed green. The transcription-run join stays on the
+        derived table because it is the authority on what has already been
+        attempted, and it now matches on ``source`` too -- a recording_id is
+        unique only inside its own source.
+        """
         rows = self._query(
             f"""
             SELECT
-                f.account,
-                f.recording_id,
-                f.title,
-                f.filename,
-                f.extension,
-                f.content_type,
-                f.size_bytes,
-                f.content_sha256,
-                f.recorded_at,
-                f.storage_backend,
-                f.storage_key,
-                f.storage_file_id,
-                f.storage_url
-            FROM @apple_voice_memos_files AS f
+                r.source,
+                r.account,
+                r.recording_id,
+                r.source_title,
+                r.filename,
+                r.content_type,
+                r.size_bytes,
+                r.content_sha256,
+                r.recorded_at,
+                r.storage_backend,
+                r.storage_key,
+                r.storage_file_id,
+                r.storage_url
+            FROM @marts_voice_memos_recordings AS r
             LEFT JOIN (
-                SELECT account, recording_id, content_sha256, completed_at
+                SELECT source, account, recording_id, content_sha256, completed_at
                 FROM @apple_voice_memos_transcription_runs
                 WHERE provider = %s
                   AND (
@@ -7815,22 +8086,24 @@ class PostgresWarehouse:
                     OR (status = 'error' AND NOT ({_postgres_retryable_error_clause('error')}))
                   )
             ) AS terminal
-              ON f.account = terminal.account
-             AND f.recording_id = terminal.recording_id
-             AND terminal.content_sha256 = f.content_sha256
+              ON r.source = terminal.source
+             AND r.account = terminal.account
+             AND r.recording_id = terminal.recording_id
+             AND terminal.content_sha256 = r.content_sha256
             WHERE terminal.recording_id IS NULL
-              AND f.size_bytes > 0
-            ORDER BY f.recorded_at DESC
+              AND r.size_bytes > 0
+              AND r.is_deleted = 0
+            ORDER BY r.recorded_at DESC NULLS LAST
             LIMIT %s
             """,
             (provider, int(limit)),
         )
         columns = (
+            "source",
             "account",
             "recording_id",
             "title",
             "filename",
-            "extension",
             "content_type",
             "size_bytes",
             "content_sha256",
@@ -7841,9 +8114,6 @@ class PostgresWarehouse:
             "storage_url",
         )
         return [dict(zip(columns, row, strict=True)) for row in rows]
-
-    def load_untranscribed_voice_memo_files(self, *, provider: str, limit: int) -> list[dict[str, Any]]:
-        return self.load_untranscribed_apple_voice_memos_files(provider=provider, limit=limit)
 
     def existing_message_ids(self, *, account: str, message_ids: list[str]) -> set[str]:
         if not message_ids:
@@ -9125,6 +9395,25 @@ class PostgresWarehouse:
             if numeric > 0:
                 high_water[str(conversation_id)] = numeric
         return high_water
+
+    # Every derived voice row written before the domain became multi-source
+    # belongs to Apple Voice Memos; nothing else could write one, because the
+    # key had no room for a second source.
+    _VOICE_DERIVED_TABLES = (
+        "apple_voice_memos_transcription_runs",
+        "apple_voice_memos_transcript_segments",
+        "apple_voice_memos_enrichments",
+    )
+
+    def _migrate_voice_derived_tables_to_source_keyed(self) -> None:
+        for table in self._VOICE_DERIVED_TABLES:
+            self._command(
+                f"ALTER TABLE @{table} ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT ''"
+            )
+            # Backfill BEFORE the key moves: '' is not a source and would make
+            # every pre-existing row collide with itself under the new key.
+            self._command(f"UPDATE @{table} SET source = 'apple_voice_memos' WHERE source = ''")
+            self._ensure_primary_key(table)
 
     def _backfill_voice_memo_transcription_run_content_hashes(self) -> None:
         self._command(
@@ -11365,18 +11654,23 @@ class PostgresWarehouse:
         Two unrelated sources feed this domain — base_apple_voice_memos.files
         and base_alice_voice_recordings.recordings — and the domain had a full
         derived layer with no mart at all, so "my voice memos" had no correct
-        entry point: the timeline's voice_memos source misses every Alice
+        entry point: the timeline's voice_memos source missed every Alice
         recording, and transcript/participants/action items were folded into
         search_text without ever being columns.
 
-        This is also where "latest enrichment per recording" now lives.
+        This is also where "latest enrichment per recording" lives.
         derived_voice_memos.enrichments is keyed by
-        (account, recording_id, provider, model, prompt_version) — 802 rows for
-        597 recordings — so every consumer had to re-derive the DISTINCT ON,
-        and three of them had copy-pasted it.
+        (source, account, recording_id, provider, model, prompt_version) — 802
+        rows for 597 recordings — so every consumer had to re-derive the
+        DISTINCT ON, and three of them had copy-pasted it.
 
-        Columns a source cannot answer are NULL, never a plausible-looking
-        default: Alice recordings are not transcribed or enriched here.
+        **This view is the INPUT to transcription and enrichment, not just an
+        output.** It used to hardcode NULL transcript/summary for the Alice
+        branch while both runners scanned base_apple_voice_memos.files
+        directly, which made the NULLs self-fulfilling: 53 Alice recordings, 0
+        transcripts, 0 summaries, with every enforced registry green. The
+        sources are conformed here once and both runners read the union, so a
+        third voice source is transcribed by existing code.
         """
         # Both sources' tables must exist for the union, and either source's
         # ensure_* path can be the one that runs. Declaring the dependency the
@@ -11391,17 +11685,83 @@ class PostgresWarehouse:
                 "alice_voice_recordings",
             ]
         )
+        # Before the view, and in the one path both sources' ensure_* reach:
+        # the view joins the derived tables on `source`, so the column has to
+        # exist whichever source provisioned the domain first.
+        self._migrate_voice_derived_tables_to_source_keyed()
         self._ensure_view(
             "marts_voice_memos_recordings",
             """
             CREATE OR REPLACE VIEW @marts_voice_memos_recordings AS
-            WITH latest_enrichment AS (
+            WITH recordings AS (
+                -- The conformed shape every voice source is mapped onto. Each
+                -- source answers the same questions or says NULL; nothing here
+                -- is a plausible-looking default.
+                --
+                -- Absence is stored as the epoch, not NULL: these columns are
+                -- NOT NULL, so a recording with no known date reads
+                -- 1970-01-01 and sorts oldest instead of unknown. Translating
+                -- the sentinel is part of conforming the sources, not a
+                -- nicety -- marts_ops.pipeline_health does the same. Every
+                -- exposed timestamp is translated, or none: a view that
+                -- translates one column and not its sibling manufactures an
+                -- inconsistency the sources do not have.
+                SELECT
+                    'apple_voice_memos'::text AS source,
+                    f.account,
+                    f.recording_id,
+                    NULLIF(f.recorded_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
+                    -- The uploader records the app's own duration for
+                    -- recordings whose metadata carried one; older exports
+                    -- have none.
+                    CASE
+                        WHEN left(f.raw_metadata_json, 1) = '{'
+                            THEN (f.raw_metadata_json::jsonb -> 'recording' ->> 'duration_seconds')::numeric
+                    END AS duration_seconds,
+                    f.title,
+                    f.filename,
+                    f.content_type,
+                    f.size_bytes,
+                    f.content_sha256,
+                    f.storage_backend,
+                    f.storage_key,
+                    f.storage_file_id,
+                    f.storage_url,
+                    NULL::text AS recording_url,
+                    f.is_deleted,
+                    NULLIF(f.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
+                FROM @apple_voice_memos_files f
+                UNION ALL
+                SELECT
+                    'alice_voice_recordings'::text AS source,
+                    r.account,
+                    r.recording_id,
+                    NULLIF(r.recorded_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
+                    NULLIF(r.duration_seconds, 0)::numeric AS duration_seconds,
+                    r.title,
+                    r.filename,
+                    r.content_type,
+                    r.size_bytes,
+                    r.content_sha256,
+                    r.storage_backend,
+                    r.storage_key,
+                    r.storage_file_id,
+                    r.storage_url,
+                    NULLIF(r.recording_page_url, '') AS recording_url,
+                    -- The Alice archive never tombstones a recording.
+                    0::bigint AS is_deleted,
+                    NULLIF(r.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
+                FROM @alice_voice_recordings r
+            ),
+            latest_enrichment AS (
                 -- THE definition of "the enrichment that counts" for a
                 -- recording: newest completed attempt per recording, tie-broken
                 -- deterministically. derived_voice_memos.enrichments is keyed by
-                -- (account, recording_id, provider, model, prompt_version), so
-                -- anything that skips this de-duplication double-counts.
-                SELECT DISTINCT ON (account, recording_id)
+                -- (source, account, recording_id, provider, model,
+                -- prompt_version), so anything that skips this de-duplication
+                -- double-counts.
+                SELECT DISTINCT ON (source, account, recording_id)
+                    source,
                     account,
                     recording_id,
                     provider,
@@ -11420,37 +11780,29 @@ class PostgresWarehouse:
                     created_at
                 FROM @apple_voice_memos_enrichments
                 WHERE status = 'completed'
-                ORDER BY account, recording_id, created_at DESC, provider DESC, model DESC, prompt_version DESC
+                ORDER BY source, account, recording_id, created_at DESC, provider DESC, model DESC, prompt_version DESC
             ),
             latest_transcription AS (
-                SELECT DISTINCT ON (account, recording_id)
+                SELECT DISTINCT ON (source, account, recording_id)
+                    source,
                     account,
                     recording_id,
                     provider,
-                    transcript_text
+                    transcript_text,
+                    completed_at
                 FROM @apple_voice_memos_transcription_runs
                 WHERE status = 'completed'
-                ORDER BY account, recording_id, completed_at DESC, requested_at DESC, provider DESC
+                ORDER BY source, account, recording_id, completed_at DESC, requested_at DESC, provider DESC
             )
             SELECT
-                'apple_voice_memos'::text AS source,
-                f.account,
-                f.recording_id,
-                -- Absence is stored as the epoch, not NULL: these columns are
-                -- NOT NULL, so a recording with no known date reads
-                -- 1970-01-01 and sorts oldest instead of unknown. Translating
-                -- the sentinel is part of conforming the sources, not a
-                -- nicety — marts_ops.pipeline_health does the same.
-                NULLIF(f.recorded_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
-                -- The uploader records the app's own duration for recordings
-                -- whose metadata carried one; older exports have none.
-                CASE
-                    WHEN left(f.raw_metadata_json, 1) = '{'
-                        THEN (f.raw_metadata_json::jsonb -> 'recording' ->> 'duration_seconds')::numeric
-                END AS duration_seconds,
-                COALESCE(NULLIF(en.title, ''), NULLIF(f.title, ''), f.filename) AS title,
-                f.title AS source_title,
-                f.filename,
+                v.source,
+                v.account,
+                v.recording_id,
+                v.recorded_at,
+                v.duration_seconds,
+                COALESCE(NULLIF(en.title, ''), NULLIF(v.title, ''), v.filename) AS title,
+                v.title AS source_title,
+                v.filename,
                 NULLIF(en.summary, '') AS summary,
                 COALESCE(NULLIF(en.transcript, ''), NULLIF(run.transcript_text, '')) AS transcript,
                 NULLIF(en.participants_json, '') AS participants_json,
@@ -11466,58 +11818,24 @@ class PostgresWarehouse:
                 en.prompt_version AS enrichment_prompt_version,
                 NULLIF(en.created_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS enriched_at,
                 run.provider AS transcript_provider,
-                f.content_type,
-                f.size_bytes,
-                f.content_sha256,
-                f.storage_backend,
-                f.storage_key,
-                f.storage_file_id,
-                f.storage_url,
-                NULL::text AS recording_url,
-                f.is_deleted,
-                NULLIF(f.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
-            FROM @apple_voice_memos_files f
+                v.content_type,
+                v.size_bytes,
+                v.content_sha256,
+                v.storage_backend,
+                v.storage_key,
+                v.storage_file_id,
+                v.storage_url,
+                v.recording_url,
+                v.is_deleted,
+                v.ingested_at,
+                -- Appended, never inserted: CREATE OR REPLACE VIEW only
+                -- tolerates new columns at the end.
+                NULLIF(run.completed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS transcribed_at
+            FROM recordings v
             LEFT JOIN latest_enrichment en
-              ON en.account = f.account AND en.recording_id = f.recording_id
+              ON en.source = v.source AND en.account = v.account AND en.recording_id = v.recording_id
             LEFT JOIN latest_transcription run
-              ON run.account = f.account AND run.recording_id = f.recording_id
-            UNION ALL
-            SELECT
-                'alice_voice_recordings'::text AS source,
-                r.account,
-                r.recording_id,
-                NULLIF(r.recorded_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
-                NULLIF(r.duration_seconds, 0)::numeric AS duration_seconds,
-                COALESCE(NULLIF(r.title, ''), r.filename) AS title,
-                r.title AS source_title,
-                r.filename,
-                NULL::text AS summary,
-                NULL::text AS transcript,
-                NULL::text AS participants_json,
-                NULL::text AS action_items_json,
-                NULL::text AS evidence_json,
-                NULL::text AS calendar_event_id,
-                NULL::double precision AS calendar_confidence,
-                NULL::timestamptz AS meeting_start_at,
-                NULL::timestamptz AS meeting_end_at,
-                NULL::text AS enrichment_title,
-                NULL::text AS enrichment_provider,
-                NULL::text AS enrichment_model,
-                NULL::text AS enrichment_prompt_version,
-                NULL::timestamptz AS enriched_at,
-                NULL::text AS transcript_provider,
-                r.content_type,
-                r.size_bytes,
-                r.content_sha256,
-                r.storage_backend,
-                r.storage_key,
-                r.storage_file_id,
-                r.storage_url,
-                NULLIF(r.recording_page_url, '') AS recording_url,
-                -- The Alice archive never tombstones a recording.
-                0::bigint AS is_deleted,
-                NULLIF(r.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
-            FROM @alice_voice_recordings r
+              ON run.source = v.source AND run.account = v.account AND run.recording_id = v.recording_id
             """,
             dependents=(
                 "marts_voice_memos_transcript_segments",
@@ -11530,7 +11848,7 @@ class PostgresWarehouse:
             """
             CREATE OR REPLACE VIEW @marts_voice_memos_transcript_segments AS
             SELECT
-                'apple_voice_memos'::text AS source,
+                s.source,
                 s.account,
                 s.recording_id,
                 r.recorded_at,
@@ -11546,7 +11864,7 @@ class PostgresWarehouse:
                 r.recorded_at + make_interval(secs => s.start_ms / 1000.0) AS spoken_at
             FROM @apple_voice_memos_transcript_segments s
             LEFT JOIN @marts_voice_memos_recordings r
-              ON r.source = 'apple_voice_memos'
+              ON r.source = s.source
              AND r.account = s.account
              AND r.recording_id = s.recording_id
             """,

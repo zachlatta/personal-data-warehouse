@@ -180,20 +180,34 @@ def assemblyai_transcript_request(
 
 
 class GoogleDriveVoiceMemoAudioSource:
-    """Fetch Voice Memo audio for transcription via the object storage abstraction."""
+    """Fetch voice audio for transcription, for EVERY voice source.
 
-    def __init__(self, *, object_store: ObjectStore) -> None:
+    A Drive file id is global, not folder-scoped, so one store serves every
+    source whose bytes live in the same Drive account -- which is the default
+    (base_alice_voice_recordings falls back to the Voice Memos account).
+    ``object_stores`` overrides that per source for a source configured with
+    its own credential, so adding one never means teaching the runner about it.
+    """
+
+    def __init__(
+        self,
+        *,
+        object_store: ObjectStore,
+        object_stores: Mapping[str, ObjectStore] | None = None,
+    ) -> None:
         self._object_store = object_store
+        self._object_stores = dict(object_stores or {})
 
     @contextmanager
     def audio_file(self, recording: Mapping[str, Any]) -> Iterator[Path]:
         file_id = str(recording.get("storage_file_id", ""))
         if not file_id:
-            raise ValueError(f"Voice Memo {recording.get('recording_id', '')} is missing storage_file_id")
+            raise ValueError(f"Voice recording {recording.get('recording_id', '')} is missing storage_file_id")
         filename = str(recording.get("filename", "")) or f"{recording.get('recording_id', 'recording')}.audio"
+        store = self._object_stores.get(str(recording.get("source", "")), self._object_store)
         with tempfile.TemporaryDirectory(prefix="voice-memo-audio-") as directory:
             path = Path(directory) / filename
-            self._object_store.download_to_path(recording, path)
+            store.download_to_path(recording, path)
             yield path
 
 
@@ -217,7 +231,7 @@ class VoiceMemosTranscriptionRunner:
 
     def sync(self, *, limit: int) -> VoiceMemosTranscriptionSummary:
         self._warehouse.ensure_apple_voice_memos_tables()
-        recordings = self._warehouse.load_untranscribed_apple_voice_memos_files(provider=self._provider, limit=limit)
+        recordings = self._warehouse.load_untranscribed_voice_recordings(provider=self._provider, limit=limit)
         transcribed = 0
         failed = 0
         segments_written = 0
@@ -269,6 +283,20 @@ class VoiceMemosTranscriptionRunner:
         )
 
 
+DEFAULT_VOICE_RECORDING_SOURCE = "apple_voice_memos"
+
+
+def voice_recording_source(recording: Mapping[str, Any]) -> str:
+    """The voice source a candidate row came from.
+
+    Every derived voice row is keyed by source first, so this is a key column,
+    not a label. It falls back to Apple Voice Memos only because that is the
+    one source that existed before the column did -- a row that reached here
+    without a source can only have come from the pre-multi-source path.
+    """
+    return str(recording.get("source", "") or DEFAULT_VOICE_RECORDING_SOURCE)
+
+
 def transcription_run_row(
     recording: Mapping[str, Any],
     result: Mapping[str, Any],
@@ -277,6 +305,7 @@ def transcription_run_row(
     completed_at: datetime,
 ) -> dict[str, Any]:
     return {
+        "source": voice_recording_source(recording),
         "account": str(recording.get("account", "")),
         "recording_id": str(recording.get("recording_id", "")),
         "content_sha256": str(recording.get("content_sha256", "")),
@@ -302,6 +331,7 @@ def failed_transcription_run_row(
     completed_at: datetime,
 ) -> dict[str, Any]:
     return {
+        "source": voice_recording_source(recording),
         "account": str(recording.get("account", "")),
         "recording_id": str(recording.get("recording_id", "")),
         "content_sha256": str(recording.get("content_sha256", "")),
@@ -342,6 +372,7 @@ def transcription_segment_rows(
             continue
         rows.append(
             {
+                "source": voice_recording_source(recording),
                 "account": str(recording.get("account", "")),
                 "recording_id": str(recording.get("recording_id", "")),
                 "provider": ASSEMBLYAI_PROVIDER,

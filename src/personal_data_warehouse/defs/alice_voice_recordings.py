@@ -33,7 +33,7 @@ ALICE_VOICE_RECORDINGS_IMPORT_POSTGRES_LOCK_ID = 7_403_111_845
 ALICE_VOICE_RECORDINGS_DRIVE_INGEST_POSTGRES_LOCK_ID = 7_403_111_854
 
 
-def _alice_object_store(config, settings):
+def alice_object_store(config, settings):
     return build_object_store(
         google_drive_spec(
             folder_id=config.google_drive_folder_id,
@@ -78,7 +78,7 @@ def alice_voice_recordings_import(context) -> MaterializeResult:
             summary = AliceVoiceRecordingsImportRunner(
                 account=config.account,
                 upload_requests=client.iter_recordings(),
-                object_store=_alice_object_store(config, settings),
+                object_store=alice_object_store(config, settings),
                 logger=context.log,
                 mode="incremental",
                 stage="library",
@@ -129,7 +129,7 @@ def alice_voice_recordings_gmail_recovery(context) -> MaterializeResult:
             }
             summary = AliceGmailRecoveryRunner(
                 emails=emails,
-                object_store=_alice_object_store(config, settings),
+                object_store=alice_object_store(config, settings),
                 gmail_services_by_account=gmail_services,
                 logger=context.log,
                 stage="library",
@@ -171,7 +171,7 @@ def alice_voice_recordings_drive_ingest(context) -> MaterializeResult:
             context.log.warning("Skipping Alice Drive ingest because another run is already active")
             summary = None
         else:
-            object_store = _alice_object_store(config, settings)
+            object_store = alice_object_store(config, settings)
             summary = AliceVoiceRecordingsDriveIngestRunner(
                 warehouse=warehouse_from_settings(settings),
                 metadata_source=lambda: iter_archive_payloads(object_store=object_store),
