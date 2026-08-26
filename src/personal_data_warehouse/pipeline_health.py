@@ -114,6 +114,15 @@ STALE_MULTIPLIER = 6
 #: collector runs every ten minutes; past this the dashboard reports 'unknown'
 #: instead of quietly presenting hour-old timestamps as current.
 COLLECTOR_STALE_SECONDS = 3600
+#: How old the COLLATION snapshot may be before marts_ops.collation_health stops
+#: speaking for the present. Deliberately not COLLECTOR_STALE_SECONDS: that asset
+#: runs daily at 03:41, not every ten minutes, because it costs a bounded
+#: sequential scan of every unique index's heap. Judged against the hourly
+#: window, all 252 of its rows read `unknown` for ~96% of every day -- level 4
+#: was dark by construction, and a genuine finding could not be told apart from
+#: the permanent state. Two days is one missed run plus margin, matching the
+#: collation_health pipeline's own expected_data_interval.
+COLLATION_SNAPSHOT_STALE_SECONDS = 2 * 24 * 3600
 
 # --- per-account freshness (marts_finance.account_freshness) ------------------
 #

@@ -1394,3 +1394,55 @@ def test_a_stale_snapshot_reports_unknown_rather_than_stale_facts(warehouse):
     warehouse.ensure_pipeline_health_tables()
     row = _backup_row(warehouse, collected_at="now() - interval '30 days'")
     assert row["status"] == "unknown"
+
+
+def test_a_fresh_daily_collation_snapshot_reads_ok_not_unknown(warehouse):
+    """Level 4 was dark by construction, not clean.
+
+    `marts_ops.collation_health` judged its snapshot against
+    COLLECTOR_STALE_SECONDS (1 hour), but the collation_health asset runs DAILY
+    at 03:41 -- it costs a bounded sequential scan of every unique index's heap,
+    which is a daily amount of work. So all 252 of its rows read `unknown` for
+    ~96% of every day. Measured on production 2026-08-26: 252 of 252 `unknown`.
+
+    That is worse than a missing check. The one level that exists because
+    Postgres CANNOT warn about collation drift on this database was reporting a
+    permanent "no opinion", and a genuine finding would have looked identical to
+    it.
+    """
+
+    warehouse.ensure_pipeline_health_tables()
+    warehouse._command("DELETE FROM @collation_health")
+    warehouse._command(
+        """
+        INSERT INTO @collation_health
+            (object_id, scope, object_name, provider, recorded_version, actual_version,
+             dependent_indexes, finding, detail, collected_at)
+        VALUES ('db:test', 'database', 'pdw', 'libc', '2.36', '2.36', 1, 'ok', '',
+                now() - interval '6 hours')
+        """
+    )
+    row = warehouse._query_dicts("SELECT status FROM @marts_collation_health")[0]
+    assert row["status"] == "ok", (
+        "a snapshot six hours old from a DAILY collector read %r; judged against the "
+        "ten-minutely collector's window, this level can only be non-unknown for one "
+        "hour a day" % row["status"]
+    )
+
+
+def test_a_genuinely_abandoned_collation_snapshot_still_reads_unknown(warehouse):
+    """Loosening the window must not remove the self-distrust that motivates it."""
+
+    warehouse.ensure_pipeline_health_tables()
+    warehouse._command("DELETE FROM @collation_health")
+    warehouse._command(
+        """
+        INSERT INTO @collation_health
+            (object_id, scope, object_name, provider, recorded_version, actual_version,
+             dependent_indexes, finding, detail, collected_at)
+        VALUES ('db:test', 'database', 'pdw', 'libc', '2.36', '2.36', 1, 'ok', '',
+                now() - interval '9 days')
+        """
+    )
+    row = warehouse._query_dicts("SELECT status FROM @marts_collation_health")[0]
+    assert row["status"] == "unknown"

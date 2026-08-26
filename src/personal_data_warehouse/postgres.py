@@ -136,6 +136,7 @@ from personal_data_warehouse.pipeline_health import (
     ACCOUNT_MIN_BASELINE_GAPS,
     ACCOUNT_MIN_EXPECTED_GAP_SECONDS,
     ACCOUNT_STALE_MULTIPLIER,
+    COLLATION_SNAPSHOT_STALE_SECONDS,
     COLLECTOR_STALE_SECONDS,
     EPOCH as PIPELINE_HEALTH_EPOCH,
     LATE_MULTIPLIER,
@@ -4330,9 +4331,18 @@ class PostgresWarehouse:
                 scope,
                 object_name,
                 CASE
+                    -- Judged against the COLLATION collector's own cadence, not
+                    -- the ten-minutely freshness collector's. That asset runs
+                    -- daily at 03:41 because it costs a bounded sequential scan
+                    -- of every unique index's heap; measuring it against
+                    -- COLLECTOR_STALE_SECONDS (1 hour) made every one of its
+                    -- 252 rows read `unknown` for ~96% of each day -- the level
+                    -- was structurally dark rather than clean, and a real
+                    -- finding would have been indistinguishable from the
+                    -- permanent state.
                     WHEN collected_at IS NULL
                       OR now() - collected_at > make_interval(
-                            secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
+                            secs => {COLLATION_SNAPSHOT_STALE_SECONDS}) THEN 'unknown'
                     -- Duplicate rows under a UNIQUE index are the loudest
                     -- evidence: a working ON CONFLICT cannot produce them.
                     WHEN scope = 'index' AND amcheck_status = 'failed' THEN 'failing'
