@@ -1626,6 +1626,23 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
         """,
         (_NOW, _NOW, _NOW, _NOW),
     )
+    # The three branches of drive_file's eight-way CASE that nothing exercised.
+    # A multi-branch classifier with partial coverage is how a tier silently
+    # moves: the untested branches are exactly the ones a refactor can drop.
+    warehouse._command(
+        """
+        INSERT INTO @google_drive_files (account, file_id, name, mime_type, folder_path,
+                                        owners_json, last_modifying_user, trashed, starred,
+                                        modified_time, ingested_at)
+        VALUES ('z@x.test', 'f-trashed', 'Deleted Plan', 'application/pdf', '/My Drive',
+                '[{"emailAddress": "z@x.test", "displayName": "Zach"}]', 'Zach', 1, 0, %s, %s),
+               ('z@x.test', 'f-starred', 'Someone Else Doc', 'application/pdf', '/My Drive',
+                '[{"emailAddress": "other@x.test", "displayName": "Other"}]', 'Other', 0, 1, %s, %s),
+               ('z@x.test', 'f-other', 'Their Doc', 'application/pdf', '/My Drive',
+                '[{"emailAddress": "other@x.test", "displayName": "Other"}]', 'Other', 0, 0, %s, %s)
+        """,
+        (_NOW, _NOW, _NOW, _NOW, _NOW, _NOW),
+    )
 
     engine = _engine(warehouse)
     try:
@@ -1703,6 +1720,16 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # drive
     assert priority_of("z@x.test|f-form") == "cc", "form-response uploads are pipeline traffic"
     assert priority_of("z@x.test|f-shortcut") == "cc", "shortcut churn is ambient"
+    assert priority_of("z@x.test|f-trashed") == "noise", (
+        "a trashed file is noise even though he owns and last touched it -- the "
+        "trashed branch must win over the ownership branches below it"
+    )
+    assert priority_of("z@x.test|f-starred") == "direct", (
+        "starring someone else's file is Zach marking it as his attention"
+    )
+    assert priority_of("z@x.test|f-other") == "cc", (
+        "a file he neither owns nor starred falls through to cc"
+    )
 
 
 def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
