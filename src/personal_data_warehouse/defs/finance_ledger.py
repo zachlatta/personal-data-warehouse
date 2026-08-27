@@ -63,6 +63,19 @@ def finance_ledger(context) -> MaterializeResult:
             # the logical accounts they duplicated, and the residue was pruned.
             "accounts_merged": MetadataValue.int(summary.accounts_merged if summary else 0),
             "accounts_pruned": MetadataValue.int(summary.accounts_pruned if summary else 0),
+            "links_removed": MetadataValue.int(summary.links_removed if summary else 0),
+            # Documents the ledger refused to book as the owner's money: an
+            # entity's own financial statements, and documents that name an
+            # institution but no account within it. Both should be small and
+            # stable. A jump means either a fund's books arrived where an
+            # investor statement used to, or files are landing at the corpus
+            # root instead of in an account folder.
+            "documents_withheld_entity": MetadataValue.int(
+                summary.documents_withheld_entity if summary else 0
+            ),
+            "documents_withheld_unidentified": MetadataValue.int(
+                summary.documents_withheld_unidentified if summary else 0
+            ),
             # Security trades and the lots they reduce to. `security_trades_merged`
             # is the statement/Plaid overlap seam: a drop toward zero while both
             # sources are live would mean the overlap is double-counting.

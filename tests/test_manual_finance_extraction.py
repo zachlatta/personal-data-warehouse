@@ -28,6 +28,7 @@ from personal_data_warehouse.manual_finance_extraction import (
     STATUS_UNREADABLE,
     ManualFinanceExtractionRunner,
     finance_document_extraction_schema,
+    finance_extraction_instructions,
     finance_extraction_prompt,
     has_extraction_candidate,
     load_extraction_candidates,
@@ -131,6 +132,9 @@ def _agent_output(**overrides) -> dict[str, Any]:
         "institution": "Acme Bank",
         "account_name_hint": "Checking",
         "account_mask": "0001",
+        "reporting_scope": "account_holder",
+        "account_holder": "Zach Lata",
+        "value_basis": "market",
         "period_start": "2026-06-01",
         "period_end": "2026-06-30",
         "currency": "USD",
@@ -139,6 +143,7 @@ def _agent_output(**overrides) -> dict[str, Any]:
         "balances": [{"date": "2026-06-30", "balance": "1234.56"}],
         "valuations": [],
         "positions": [],
+        "commitments": [],
         "summary": "June checking statement",
         "uncertainties": [],
     }
@@ -656,3 +661,90 @@ def test_runner_records_unreadable_and_not_useful(warehouse):
         now=lambda: _TS,
     ).sync(limit=None)
     assert summary.documents_not_useful == 1
+
+
+def test_contract_asks_whose_money_the_document_reports():
+    """A fund's own financials and its investor's statement are the same shape.
+
+    Every other extracted field agrees between them -- the fund's name, a
+    closing balance, a period, transactions -- so without an explicit scope the
+    ledger has nothing to tell them apart, and on 2026-08-27 it booked a
+    partnership's entire members' equity as its investor's largest asset.
+    """
+    schema = finance_document_extraction_schema()
+    properties = schema["properties"]
+    assert properties["reporting_scope"]["enum"] == ["account_holder", "entity", "unknown"]
+    assert properties["value_basis"]["enum"] == ["market", "tax", "unknown"]
+    for field in ("reporting_scope", "account_holder", "value_basis", "commitments"):
+        assert field in schema["required"], field
+    # Strict structured outputs require every property to be listed in
+    # `required`; a field the model may omit is a field the ledger cannot
+    # trust.
+    assert set(schema["required"]) == set(properties)
+    instructions = finance_extraction_instructions()
+    assert "reporting_scope" in instructions
+    assert "entity" in instructions
+    assert "unfunded" in instructions
+
+
+def test_validation_rejects_an_invented_reporting_scope_or_value_basis():
+    """An invented value is worse than a missing one: it reads as a licence to
+    book. Fail the run rather than storing something the ledger will guess at."""
+    issues = validate_finance_extraction_result(
+        _agent_output(reporting_scope="investor", value_basis="fair_value")
+    )
+    assert any("reporting_scope" in issue for issue in issues)
+    assert any("value_basis" in issue for issue in issues)
+
+
+def test_validation_enforces_commitment_fields():
+    issues = validate_finance_extraction_result(
+        _agent_output(commitments=[{"date": "2026-04-22", "committed": "25000"}])
+    )
+    assert any("commitments[0].unfunded" in issue for issue in issues)
+
+
+def test_runner_stores_scope_basis_and_commitments(warehouse):
+    warehouse.ensure_manual_finance_tables()
+    warehouse.ensure_finance_tables()
+    warehouse.insert_manual_finance_documents(
+        [
+            _document_row(
+                mime_type="text/csv",
+                filename="export.csv",
+                original_path="acme-checking-0001/export.csv",
+            )
+        ]
+    )
+    ManualFinanceExtractionRunner(
+        warehouse=warehouse,
+        agent=FakeAgent(
+            _agent_output(
+                reporting_scope="account_holder",
+                account_holder="Zach Lata",
+                value_basis="market",
+                commitments=[
+                    {
+                        "date": "2026-04-22",
+                        "committed": "25000",
+                        "called": "9375",
+                        "unfunded": "15625",
+                        "description": "Example Fund I LP",
+                    }
+                ],
+            )
+        ),
+        object_store_factory=lambda: FakeObjectStore(b"Date,Amount\n2026-06-05,-4.50\n"),
+        logger=Logger(),
+        provider="codex",
+        now=lambda: _TS,
+    ).sync(limit=None)
+
+    rows = warehouse._query_dicts(
+        "SELECT reporting_scope, account_holder, value_basis, commitments_json "
+        "FROM @manual_finance_extractions"
+    )
+    assert rows[0]["reporting_scope"] == "account_holder"
+    assert rows[0]["account_holder"] == "Zach Lata"
+    assert rows[0]["value_basis"] == "market"
+    assert rows[0]["commitments_json"][0]["unfunded"] == "15625"

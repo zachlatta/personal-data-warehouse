@@ -1125,6 +1125,15 @@ MANUAL_FINANCE_EXTRACTION_COLUMNS = (
     "institution",
     "account_name_hint",
     "account_mask",
+    # Whose money the document reports, and on what basis. A fund's own
+    # unaudited financial statements and its investor's capital account
+    # statement are the same shape in every other column, so without these a
+    # partnership's total members' equity is indistinguishable from the
+    # owner's holding -- which is how a fund's whole balance sheet became the
+    # largest asset in a personal net worth on 2026-08-27.
+    "reporting_scope",
+    "account_holder",
+    "value_basis",
     "period_start",
     "period_end",
     "currency",
@@ -1133,6 +1142,10 @@ MANUAL_FINANCE_EXTRACTION_COLUMNS = (
     "balances_json",
     "valuations_json",
     "positions_json",
+    # Capital commitments: the committed/called/unfunded triple a private
+    # fund prints. Unfunded capital is a real future cash obligation and is
+    # a fact of its own, not a balance.
+    "commitments_json",
     "summary",
     "uncertainties_json",
     "raw_result_json",

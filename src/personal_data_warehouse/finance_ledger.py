@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -63,6 +64,42 @@ LEDGER_SOURCE_MANUAL = "manual_finance"
 OBSERVATION_KIND_BALANCE = "balance"
 OBSERVATION_KIND_VALUATION = "valuation"
 OBSERVATION_KIND_PRINCIPAL = "principal"
+# Facts that are NOT this account's current worth, stored beside the ones that
+# are. Every reader of a VALUE must exclude them explicitly, because the ledger
+# holds facts and derives status at read time -- so the same list appears as
+# `value_kinds` in `_ensure_finance_ledger_mart_views` (postgres.py), which is
+# what keeps them out of net worth, and
+# `test_every_non_value_observation_kind_is_excluded_from_net_worth` pins the
+# two together.
+OBSERVATION_KIND_TAX_BASIS = "tax_basis"
+OBSERVATION_KIND_COMMITMENT = "commitment"
+OBSERVATION_KIND_CALLED_CAPITAL = "called_capital"
+OBSERVATION_KIND_UNFUNDED_COMMITMENT = "unfunded_commitment"
+NON_VALUE_OBSERVATION_KINDS = (
+    OBSERVATION_KIND_TAX_BASIS,
+    OBSERVATION_KIND_COMMITMENT,
+    OBSERVATION_KIND_CALLED_CAPITAL,
+    OBSERVATION_KIND_UNFUNDED_COMMITMENT,
+)
+
+# Whose money a manual document reports, and on what basis. These mirror the
+# extraction contract's `reporting_scope` / `value_basis` enums; they are
+# repeated rather than imported to keep the ledger free of the extraction
+# runner's agent/Docker dependencies, and
+# `test_ledger_and_extraction_contract_agree_on_scope_tokens` fails if the two
+# ever drift.
+REPORTING_SCOPE_ENTITY = "entity"
+VALUE_BASIS_TAX = "tax"
+
+# A document group whose key carries no account identifier at all. An
+# institution name is a PARTY, not an account: keyed on it alone, every
+# document that institution ever sent collapses into one catch-all ledger
+# account, and whatever the biggest number in the pile is becomes the owner's
+# balance. A fund administrator's `<institution>|` key did exactly that on
+# 2026-08-27 -- it swallowed a partnership's own financial statements, three
+# unrelated investment vehicles, a tax notice and the owner's real capital
+# account statements, then reported the FUND's members' equity as his.
+UNIDENTIFIED_ACCOUNT_KEY = ""
 
 ACCOUNT_SIDE_ASSET = "asset"
 ACCOUNT_SIDE_LIABILITY = "liability"
@@ -167,13 +204,50 @@ def document_account_key(*, original_path: str, institution: str, mask: str, fil
     The uploader's folder-per-account organization is the most stable
     identity (agent-extracted institution/mask can vary between statements of
     the same account); fall back to institution|mask, then the filename stem.
+
+    Returns ``UNIDENTIFIED_ACCOUNT_KEY`` when the evidence names an
+    institution but no account within it. Every other branch identifies ONE
+    account -- a folder is one account by the uploader's contract, a mask is
+    an account number, a filename is one document. ``institution|`` alone
+    identifies a counterparty, and using it as an account key makes a bucket
+    that grows to hold every unrelated thing that party ever sent. A caller
+    must not book anything against this key; see the entity-scope guard in
+    ``FinanceLedgerRunner.sync``.
     """
     parts = [part for part in original_path.split("/") if part]
     if len(parts) > 1:
         return parts[0].strip().lower()
-    if institution.strip() or mask.strip():
+    if mask.strip():
         return f"{_slug(institution)}|{mask.strip()}"
+    if institution.strip():
+        return UNIDENTIFIED_ACCOUNT_KEY
     return _slug(filename.rsplit(".", 1)[0])
+
+
+def document_reports_an_entity(extraction: Mapping[str, Any]) -> bool:
+    """True when the document reports an ENTITY's own books, not the owner's.
+
+    A fund's unaudited financial statements and its investor's capital account
+    statement are the same shape in every other extracted field: both name the
+    fund, both print a closing balance, both list transactions. Only
+    ``reporting_scope`` tells them apart, and a pre-v3 extraction has none --
+    which is read as "not established", not as "entity", because the
+    conservative direction here is to keep booking the corpus the ledger
+    already depends on. The key guard above is what protects an un-re-extracted
+    corpus; this is what protects a document that DOES sit in a real account
+    folder.
+    """
+    return str(extraction.get("reporting_scope") or "").strip().lower() == REPORTING_SCOPE_ENTITY
+
+
+def document_reports_a_tax_basis(extraction: Mapping[str, Any]) -> bool:
+    """True when the document's amounts are a TAX basis, not a market value.
+
+    A Schedule K-1's partner capital account is the motivating case: its
+    tax-basis capital sat in net worth beside the same fund's NAV, so one
+    position was counted twice AND on two incompatible measures.
+    """
+    return str(extraction.get("value_basis") or "").strip().lower() == VALUE_BASIS_TAX
 
 
 def normalize_description(text: str) -> str:
@@ -201,7 +275,14 @@ class FinanceLedgerSummary:
     accounts_merged: int = 0
     accounts_pruned: int = 0
     links_relinked: int = 0
+    links_removed: int = 0
     observations_removed: int = 0
+    # Documents the ledger refused to book, and why. Both are expected to be
+    # small and stable; a jump means either a new institution is uploading to
+    # the corpus root or an entity's books arrived where an investor's
+    # statement used to.
+    documents_withheld_entity: int = 0
+    documents_withheld_unidentified: int = 0
     security_trades_upserted: int = 0
     security_trades_merged: int = 0
     security_trades_removed: int = 0
@@ -334,15 +415,54 @@ class FinanceLedgerRunner:
         # different mask than its later ones), so resolution must consider
         # EVERY mask the group's documents report — not whichever document
         # happened to process first.
+        #
+        # Two guards run before grouping, and both refuse rather than guess.
+        # A refused document keeps its extraction row -- the fact of record is
+        # untouched -- it simply never becomes one of the owner's stocks or
+        # flows.
         groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        withheld_entity: list[dict[str, Any]] = []
+        withheld_unidentified: list[dict[str, Any]] = []
         for extraction in extractions:
+            if document_reports_an_entity(extraction):
+                withheld_entity.append(extraction)
+                continue
             key = document_account_key(
                 original_path=str(extraction["original_path"]),
                 institution=str(extraction["institution"]),
                 mask=str(extraction["account_mask"]),
                 filename=str(extraction["filename"]),
             )
+            if key == UNIDENTIFIED_ACCOUNT_KEY:
+                withheld_unidentified.append(extraction)
+                continue
             groups.setdefault((str(extraction["account"]), key), []).append(extraction)
+        for extraction in withheld_entity:
+            self._logger.warning(
+                "Withholding %s from the ledger: it reports an ENTITY's own books "
+                "(%s), not the account holder's position",
+                extraction["original_path"],
+                extraction["institution"] or extraction["account_name_hint"],
+            )
+        for extraction in withheld_unidentified:
+            self._logger.warning(
+                "Withholding %s from the ledger: %s names no account (no upload "
+                "folder and no account mask), so booking it would need a "
+                "catch-all account keyed on the institution alone",
+                extraction["original_path"],
+                extraction["institution"],
+            )
+        extractions_seen = len(extractions)
+        booked_shas = {
+            str(extraction["content_sha256"])
+            for group in groups.values()
+            for extraction in group
+        }
+        extractions = [
+            extraction
+            for extraction in extractions
+            if str(extraction["content_sha256"]) in booked_shas
+        ]
 
         for (owner, key), group in sorted(groups.items()):
             group.sort(key=lambda e: str(e["content_sha256"]))
@@ -435,6 +555,21 @@ class FinanceLedgerRunner:
 
         self._warehouse.insert_finance_accounts(doc_account_rows)
         self._warehouse.insert_finance_account_links(doc_link_rows)
+        # A link whose group no longer exists is residue that re-resolution
+        # cannot reach, because re-resolution only walks groups that still
+        # exist. Without this the account it founded never loses its last link
+        # and so is never pruned.
+        # An empty corpus is not evidence that every link is residue: on a
+        # deploy where the extraction asset has not run, deleting them all
+        # would erase the whole document ledger. An empty GROUP set with a
+        # non-empty corpus is real (every document withheld) and does delete.
+        links_removed = (
+            self._warehouse.delete_missing_document_account_links(
+                [f"{owner}|{key}" for (owner, key) in sorted(groups)]
+            )
+            if extractions_seen
+            else 0
+        )
 
         document_observations = self._document_observation_rows(
             extractions,
@@ -489,7 +624,7 @@ class FinanceLedgerRunner:
         accounts_pruned = self._warehouse.prune_unlinked_finance_accounts()
 
         summary = FinanceLedgerSummary(
-            accounts_seen=len(plaid_accounts) + len(extractions),
+            accounts_seen=len(plaid_accounts) + extractions_seen,
             accounts_created=accounts_created,
             links_created=links_created,
             observations_upserted=len(observation_rows),
@@ -500,7 +635,10 @@ class FinanceLedgerRunner:
             accounts_merged=accounts_merged,
             accounts_pruned=accounts_pruned,
             links_relinked=links_relinked,
+            links_removed=links_removed,
             observations_removed=observations_removed,
+            documents_withheld_entity=len(withheld_entity),
+            documents_withheld_unidentified=len(withheld_unidentified),
             security_trades_upserted=securities["upserted"],
             security_trades_merged=securities["merged"],
             security_trades_removed=securities["removed"],
@@ -509,7 +647,8 @@ class FinanceLedgerRunner:
         self._logger.info(
             "Finance ledger: accounts_seen=%s accounts_created=%s links_created=%s observations=%s "
             "transactions=%s merged=%s skipped=%s removed=%s accounts_merged=%s accounts_pruned=%s "
-            "links_relinked=%s observations_removed=%s "
+            "links_relinked=%s links_removed=%s observations_removed=%s "
+            "withheld_entity=%s withheld_unidentified=%s "
             "security_trades=%s security_merged=%s security_removed=%s tax_lots=%s",
             summary.accounts_seen,
             summary.accounts_created,
@@ -522,7 +661,10 @@ class FinanceLedgerRunner:
             summary.accounts_merged,
             summary.accounts_pruned,
             summary.links_relinked,
+            summary.links_removed,
             summary.observations_removed,
+            summary.documents_withheld_entity,
+            summary.documents_withheld_unidentified,
             summary.security_trades_upserted,
             summary.security_trades_merged,
             summary.security_trades_removed,
@@ -599,6 +741,14 @@ class FinanceLedgerRunner:
             sha = str(extraction["content_sha256"])
             account_id = doc_accounts.get(sha)
             if account_id is None:
+                continue
+            if document_reports_a_tax_basis(extraction):
+                # A Schedule K-1's line items are allocated shares of the
+                # partnership's income, loss and deductions -- tax facts, not
+                # money that moved through the partner's account. Booking them
+                # as flows puts allocations that never touched a bank account
+                # into the transaction ledger, and as share movements into
+                # tax lots.
                 continue
             currency = str(extraction["currency"])
             for index, entry in enumerate(extraction["transactions_json"] or []):
@@ -902,6 +1052,14 @@ class FinanceLedgerRunner:
             account_id = doc_accounts.get(sha)
             if account_id is None:
                 continue
+            if document_reports_a_tax_basis(extraction):
+                # A Schedule K-1's line items are allocated shares of the
+                # partnership's income, loss and deductions -- tax facts, not
+                # money that moved through the partner's account. Booking them
+                # as flows puts allocations that never touched a bank account
+                # into the transaction ledger, and as share movements into
+                # tax lots.
+                continue
             currency = str(extraction["currency"])
             for index, entry in enumerate(extraction["transactions_json"] or []):
                 source_row_key = f"{sha}|{index}"
@@ -1080,49 +1238,89 @@ class FinanceLedgerRunner:
         sync_version: int,
     ) -> list[dict[str, Any]]:
         rows: dict[tuple[str, date, str], dict[str, Any]] = {}
+        sources: dict[tuple[str, date, str], str] = {}
+
+        def put(account_id: str, as_of: date, kind: str, value: Decimal, currency: str, sha: str) -> None:
+            # Two documents claiming the same account/day/kind is a real
+            # conflict, and a silent last-writer-wins is how the ledger lost
+            # the owner's own capital balance to the FUND's members' equity on
+            # the very same key -- three orders of magnitude apart, no trace.
+            # The write still resolves deterministically (documents are
+            # iterated in content-sha order), but it says so.
+            key = (account_id, as_of, kind)
+            previous = rows.get(key)
+            if previous is not None and previous["value"] != value:
+                self._logger.warning(
+                    "Two documents disagree on %s %s %s: %s says %s, %s says %s; keeping %s",
+                    account_id,
+                    as_of,
+                    kind,
+                    sources[key],
+                    previous["value"],
+                    sha,
+                    value,
+                    value,
+                )
+            rows[key] = {
+                "account_id": account_id,
+                "as_of": as_of,
+                "kind": kind,
+                "value": value,
+                "currency": currency,
+                "source": LEDGER_SOURCE_MANUAL,
+                "observed_at": now,
+                "sync_version": sync_version,
+            }
+            sources[key] = sha
+
         for extraction in extractions:
             sha = str(extraction["content_sha256"])
             account_id = doc_accounts.get(sha)
             if account_id is None:
                 continue
             currency = str(extraction["currency"])
-            # A mortgage statement's balance is its outstanding principal.
-            balance_kind = (
-                OBSERVATION_KIND_PRINCIPAL
-                if doc_account_kinds.get(sha) == "mortgage"
-                else OBSERVATION_KIND_BALANCE
-            )
+            # A mortgage statement's balance is its outstanding principal; a
+            # tax form's is a TAX basis, which is not what the account is
+            # worth and must not be summed beside a NAV.
+            tax_basis = document_reports_a_tax_basis(extraction)
+            if tax_basis:
+                balance_kind = OBSERVATION_KIND_TAX_BASIS
+            elif doc_account_kinds.get(sha) == "mortgage":
+                balance_kind = OBSERVATION_KIND_PRINCIPAL
+            else:
+                balance_kind = OBSERVATION_KIND_BALANCE
             for entry in extraction["balances_json"] or []:
                 as_of = _parse_iso_date(str(entry.get("date", "")))
                 value = _parse_money(str(entry.get("balance", "")))
                 if as_of is None or value is None:
                     continue
-                rows[(account_id, as_of, balance_kind)] = {
-                    "account_id": account_id,
-                    "as_of": as_of,
-                    "kind": balance_kind,
-                    "value": value,
-                    "currency": currency,
-                    "source": LEDGER_SOURCE_MANUAL,
-                    "observed_at": now,
-                    "sync_version": sync_version,
-                }
+                put(account_id, as_of, balance_kind, value, currency, sha)
             # A valuation document may report several positions for one day
             # (e.g. a fund export listing every entity plus a totals row, all
             # attributed to the folder's account): the account's value for the
             # day is the explicit total when one exists, else the sum of the
             # parts.
+            valuation_kind = OBSERVATION_KIND_TAX_BASIS if tax_basis else OBSERVATION_KIND_VALUATION
             for (as_of, value) in _daily_valuations(extraction["valuations_json"] or []):
-                rows[(account_id, as_of, OBSERVATION_KIND_VALUATION)] = {
-                    "account_id": account_id,
-                    "as_of": as_of,
-                    "kind": OBSERVATION_KIND_VALUATION,
-                    "value": value,
-                    "currency": currency,
-                    "source": LEDGER_SOURCE_MANUAL,
-                    "observed_at": now,
-                    "sync_version": sync_version,
-                }
+                put(account_id, as_of, valuation_kind, value, currency, sha)
+            # Capital commitments are stocks too — "this obligation was $X on
+            # this day" — but they are not what the account is WORTH, so they
+            # get their own kinds and stay out of net worth. Unfunded capital
+            # is a real future cash obligation that appeared nowhere in the
+            # model before v3.
+            for entry in extraction["commitments_json"] or []:
+                as_of = _parse_iso_date(str(entry.get("date", "")))
+                if as_of is None:
+                    continue
+                for field, kind in (
+                    ("committed", OBSERVATION_KIND_COMMITMENT),
+                    ("called", OBSERVATION_KIND_CALLED_CAPITAL),
+                    ("unfunded", OBSERVATION_KIND_UNFUNDED_COMMITMENT),
+                ):
+                    value = _parse_money(str(entry.get(field, "")))
+                    if value is None:
+                        continue
+                    put(account_id, as_of, kind, value, currency, sha)
         return list(rows.values())
 
     # --- loading -------------------------------------------------------------
@@ -1190,8 +1388,9 @@ class FinanceLedgerRunner:
             SELECT DISTINCT ON (e.content_sha256)
                    e.content_sha256, e.document_type, e.institution,
                    e.account_name_hint, e.account_mask, e.currency,
+                   e.reporting_scope, e.account_holder, e.value_basis,
                    e.transactions_json, e.balances_json, e.valuations_json,
-                   e.positions_json, e.period_end,
+                   e.positions_json, e.commitments_json, e.period_end,
                    d.account, d.original_path, d.filename
             FROM @manual_finance_extractions e
             JOIN @manual_finance_documents d

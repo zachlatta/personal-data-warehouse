@@ -55,7 +55,35 @@ TASK_TYPE = "manual_finance_extraction"
 # statement's position snapshot. v1 stored a brokerage buy as an anonymous cash
 # debit, which left every purchase lot older than Plaid's 730-day window
 # unreconstructable. Bumping re-extracts the corpus without clobbering v1.
-PROMPT_VERSION = "manual-finance-agent-v2"
+#
+# v3 asks WHOSE money the document reports (`reporting_scope`), who is named as
+# the holder (`account_holder`), on what basis the values are stated
+# (`value_basis`), and the committed/called/unfunded triple a private fund
+# prints (`commitments`). Everything before it treated a partnership's own
+# unaudited financial statements exactly like its investor's capital account
+# statement, because in every other field they look identical -- both name the
+# fund, both print a closing balance, both list transactions. On 2026-08-27 that
+# put a partnership's entire members' equity and its portfolio purchases into
+# one limited partner's personal ledger.
+PROMPT_VERSION = "manual-finance-agent-v3"
+
+# `reporting_scope`: whose position the document reports.
+REPORTING_SCOPE_ACCOUNT_HOLDER = "account_holder"
+REPORTING_SCOPE_ENTITY = "entity"
+REPORTING_SCOPE_UNKNOWN = "unknown"
+REPORTING_SCOPES = (
+    REPORTING_SCOPE_ACCOUNT_HOLDER,
+    REPORTING_SCOPE_ENTITY,
+    REPORTING_SCOPE_UNKNOWN,
+)
+
+# `value_basis`: what the stated amounts mean. A Schedule K-1's capital account
+# is a TAX basis, not a market value; summing it into net worth beside a NAV is
+# an apples-to-oranges error the ledger cannot detect after the fact.
+VALUE_BASIS_MARKET = "market"
+VALUE_BASIS_TAX = "tax"
+VALUE_BASIS_UNKNOWN = "unknown"
+VALUE_BASES = (VALUE_BASIS_MARKET, VALUE_BASIS_TAX, VALUE_BASIS_UNKNOWN)
 
 STATUS_OK = "ok"
 STATUS_NOT_USEFUL = "not_useful"
@@ -171,12 +199,33 @@ def finance_document_extraction_schema() -> dict[str, Any]:
             "description": {"type": "string"},
         },
     }
+    commitment_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["date", "committed", "called", "unfunded", "description"],
+        "properties": {
+            "date": {"type": "string", "description": "ISO as-of date YYYY-MM-DD"},
+            "committed": {"type": "string", "description": "total capital commitment, decimal string or empty"},
+            "called": {
+                "type": "string",
+                "description": "cumulative called/contributed capital, decimal string or empty",
+            },
+            "unfunded": {
+                "type": "string",
+                "description": "remaining uncalled/unfunded commitment, decimal string or empty",
+            },
+            "description": {"type": "string", "description": "the vehicle the commitment is to, as printed"},
+        },
+    }
     return {
         "type": "object",
         "additionalProperties": False,
         "required": [
             "is_financial",
             "document_type",
+            "reporting_scope",
+            "account_holder",
+            "value_basis",
             "institution",
             "account_name_hint",
             "account_mask",
@@ -188,6 +237,7 @@ def finance_document_extraction_schema() -> dict[str, Any]:
             "balances",
             "valuations",
             "positions",
+            "commitments",
             "summary",
             "uncertainties",
         ],
@@ -198,7 +248,39 @@ def finance_document_extraction_schema() -> dict[str, Any]:
                 "description": (
                     "e.g. bank_statement, credit_card_statement, brokerage_statement, "
                     "mortgage_statement, property_valuation, fund_positions, "
-                    "transaction_export, receipt, other"
+                    "capital_account_statement, entity_financial_statement, "
+                    "capital_call_notice, tax_form, transaction_export, receipt, other"
+                ),
+            },
+            "reporting_scope": {
+                "type": "string",
+                "enum": ["account_holder", "entity", "unknown"],
+                "description": (
+                    "Whose finances the amounts on this document describe. "
+                    "'account_holder' = the individual investor/customer's own account, "
+                    "position, or property. 'entity' = a fund, partnership, company or "
+                    "trust's OWN books (its balance sheet, members'/partners' equity in "
+                    "total, its portfolio investments, its income statement), even when "
+                    "the file was sent to one investor. 'unknown' when the document does "
+                    "not make it clear."
+                ),
+            },
+            "account_holder": {
+                "type": "string",
+                "description": (
+                    "The individual person or household the amounts belong to, exactly as "
+                    "printed (e.g. 'Zachary R Latta'). Empty when the document names no "
+                    "individual holder, which is itself evidence of entity scope."
+                ),
+            },
+            "value_basis": {
+                "type": "string",
+                "enum": ["market", "tax", "unknown"],
+                "description": (
+                    "What the stated balances/valuations mean. 'market' = current value, "
+                    "NAV, or account balance. 'tax' = a tax basis figure (a Schedule K-1 "
+                    "partner capital account, a cost-basis-only report). 'unknown' when "
+                    "the document does not say."
                 ),
             },
             "institution": {"type": "string"},
@@ -212,6 +294,7 @@ def finance_document_extraction_schema() -> dict[str, Any]:
             "balances": {"type": "array", "items": balance_schema},
             "valuations": {"type": "array", "items": valuation_schema},
             "positions": {"type": "array", "items": position_schema},
+            "commitments": {"type": "array", "items": commitment_schema},
             "summary": {"type": "string"},
             "uncertainties": {"type": "array", "items": {"type": "string"}},
         },
@@ -228,6 +311,12 @@ When a transaction is a SECURITY MOVEMENT (a brokerage buy, sell, incoming/outgo
 For a brokerage/investment statement, also fill positions from the holdings or portfolio-summary table: one entry per security held, with the as-of date (normally the statement period end), security_name, ticker, cusip, quantity held, price, and market_value, each exactly as printed. Leave positions empty for documents that report no holdings.
 
 Identify the account: the institution name, the account's own name/type as printed, and the mask (last digits). The document's original_path folder name usually encodes institution-name-mask — use it as a hint, but prefer what the document itself says. Match against known_accounts when one clearly corresponds. period_start/period_end are the statement period when stated.
+
+Say WHOSE money the amounts describe, in reporting_scope. This is the most consequential field on the form. A private fund sends its limited partners two documents that look almost identical: the fund's OWN unaudited financial statements (balance sheet, statement of operations, schedule of investments, "total members' equity", "total assets", the fund's portfolio purchases) and that investor's OWN capital account statement (their beginning capital, their contributions, their ending capital, their unfunded commitment). The first is reporting_scope="entity"; the second is reporting_scope="account_holder". The same split applies to a company's financials, a trust's accounts, and an issuer's cap table. Getting it wrong books a whole partnership's balance sheet as one person's asset. If the document reports an entity's own books, set reporting_scope="entity" even though it was addressed to one investor and even though it names them on the cover. Put the individual's name in account_holder when the document prints one, and leave account_holder empty when it does not — a document with no named individual holder is almost always entity-scoped.
+
+Say what the amounts MEAN, in value_basis. A Schedule K-1's partner capital account, or any report that states only cost basis, is value_basis="tax"; a market value, NAV, or bank/brokerage balance is value_basis="market".
+
+Fill commitments when the document states a capital commitment: the total committed, the cumulative called/contributed to date, and the remaining unfunded/uncalled amount, with the as-of date and the vehicle's name. Capital call notices and capital account statements both print these. A capital call is money LEAVING the investor, so its contribution transaction is direction="out" — never "in" — and its date is the due date the notice states.
 
 Amounts must be copied exactly as printed (no rounding, no sign flips). Use empty strings/arrays for anything the document does not state — never invent or infer missing values. Put doubts, unreadable regions, ambiguous signs, or parsing caveats into uncertainties. Set is_financial=false only when the document contains no financial information at all.
 
@@ -288,6 +377,9 @@ def validate_finance_extraction_result(result: Mapping[str, Any]) -> list[str]:
         "institution",
         "account_name_hint",
         "account_mask",
+        "reporting_scope",
+        "account_holder",
+        "value_basis",
         "period_start",
         "period_end",
         "currency",
@@ -296,6 +388,13 @@ def validate_finance_extraction_result(result: Mapping[str, Any]) -> list[str]:
     ):
         if not isinstance(result.get(key), str):
             issues.append(f"{key} must be a string")
+    # An invented scope is worse than a missing one: it would be read as a
+    # licence to book. Fail the run rather than storing a value the ledger
+    # cannot interpret.
+    if isinstance(result.get("reporting_scope"), str) and result["reporting_scope"] not in REPORTING_SCOPES:
+        issues.append(f"reporting_scope must be one of {', '.join(REPORTING_SCOPES)}")
+    if isinstance(result.get("value_basis"), str) and result["value_basis"] not in VALUE_BASES:
+        issues.append(f"value_basis must be one of {', '.join(VALUE_BASES)}")
     for key, required_fields in (
         (
             "transactions",
@@ -316,6 +415,7 @@ def validate_finance_extraction_result(result: Mapping[str, Any]) -> list[str]:
         ("balances", ("date", "balance")),
         ("valuations", ("date", "value", "description")),
         ("positions", ("date", "security_name", "ticker", "cusip", "quantity", "price", "market_value")),
+        ("commitments", ("date", "committed", "called", "unfunded", "description")),
     ):
         value = result.get(key)
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
@@ -628,6 +728,9 @@ class ManualFinanceExtractionRunner:
             "institution": str(output.get("institution", "")),
             "account_name_hint": str(output.get("account_name_hint", "")),
             "account_mask": str(output.get("account_mask", "")),
+            "reporting_scope": str(output.get("reporting_scope", "")),
+            "account_holder": str(output.get("account_holder", "")),
+            "value_basis": str(output.get("value_basis", "")),
             "period_start": _parse_date(str(output.get("period_start", ""))),
             "period_end": _parse_date(str(output.get("period_end", ""))),
             "currency": str(output.get("currency", "")),
@@ -636,6 +739,7 @@ class ManualFinanceExtractionRunner:
             "balances_json": list(output.get("balances", []) or []),
             "valuations_json": list(output.get("valuations", []) or []),
             "positions_json": list(output.get("positions", []) or []),
+            "commitments_json": list(output.get("commitments", []) or []),
             "summary": str(output.get("summary", "")),
             "uncertainties_json": list(output.get("uncertainties", []) or []),
             "raw_result_json": dict(output),

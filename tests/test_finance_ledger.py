@@ -18,10 +18,16 @@ from dotenv import load_dotenv
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.finance_ledger import (
+    NON_VALUE_OBSERVATION_KINDS,
+    REPORTING_SCOPE_ENTITY,
+    UNIDENTIFIED_ACCOUNT_KEY,
+    VALUE_BASIS_TAX,
     FinanceLedgerRunner,
     description_similarity,
     document_account_key,
     document_kind_side,
+    document_reports_a_tax_basis,
+    document_reports_an_entity,
     has_pending_finance_observations,
     plaid_account_kind_side,
     stable_finance_account_id,
@@ -178,6 +184,9 @@ def _extraction_row(**overrides) -> dict:
         "institution": "Acme Bank",
         "account_name_hint": "Checking",
         "account_mask": "0001",
+        "reporting_scope": "account_holder",
+        "account_holder": "Zach Lata",
+        "value_basis": "market",
         "period_start": date(2026, 6, 1),
         "period_end": date(2026, 6, 30),
         "currency": "USD",
@@ -186,6 +195,7 @@ def _extraction_row(**overrides) -> dict:
         "balances_json": [],
         "valuations_json": [],
         "positions_json": [],
+        "commitments_json": [],
         "summary": "",
         "uncertainties_json": [],
         "raw_result_json": {},
@@ -583,6 +593,61 @@ def test_document_account_key_prefers_folder_over_extraction():
         )
         == "acme-bank|0001"
     )
+
+
+def test_an_institution_with_no_account_number_is_not_an_account_key():
+    """An ``<institution>|`` key was a catch-all, and it cost seven figures.
+
+    An institution name identifies a COUNTERPARTY. Keyed on it alone, every
+    document that party ever sent lands in one ledger account: on 2026-08-27 a
+    partnership's own financial statements, two unrelated investment vehicles,
+    a tax notice and the owner's real capital account statements all collapsed
+    into one, and the FUND's total members' equity became his largest asset.
+    Every other branch of this function identifies exactly one account -- a
+    folder by the uploader's contract, a mask by account number, a filename by
+    document.
+    """
+    assert (
+        document_account_key(
+            original_path="1Q26 Unaudited Financials.pdf",
+            institution="Carta",
+            mask="",
+            filename="1Q26 Unaudited Financials.pdf",
+        )
+        == UNIDENTIFIED_ACCOUNT_KEY
+    )
+    # A document with no institution either still keys on its own filename,
+    # which is per-document and therefore never a bucket.
+    assert (
+        document_account_key(
+            original_path="Debt_Record.pdf", institution="", mask="", filename="Debt_Record.pdf"
+        )
+        == "debt-record"
+    )
+    # And a folder still wins over everything, mask or no mask.
+    assert (
+        document_account_key(
+            original_path="fundadmin-example-fund-i-lp/1Q26.pdf",
+            institution="Carta",
+            mask="",
+            filename="1Q26.pdf",
+        )
+        == "fundadmin-example-fund-i-lp"
+    )
+
+
+def test_reporting_scope_and_value_basis_are_read_as_declared_never_inferred():
+    assert document_reports_an_entity({"reporting_scope": "entity"}) is True
+    assert document_reports_an_entity({"reporting_scope": "account_holder"}) is False
+    # A pre-v3 extraction has no scope at all. Absence is NOT entity (that
+    # would silently drop the whole existing corpus) and NOT account_holder
+    # (that is the bug); the key guard is what protects an un-re-extracted
+    # corpus.
+    assert document_reports_an_entity({"reporting_scope": ""}) is False
+    assert document_reports_an_entity({}) is False
+    assert document_reports_a_tax_basis({"value_basis": "tax"}) is True
+    assert document_reports_a_tax_basis({"value_basis": "market"}) is False
+    assert document_reports_a_tax_basis({}) is False
 
 
 def test_description_similarity():
@@ -1825,3 +1890,429 @@ def test_lots_shrink_when_a_source_trade_disappears(warehouse):
     assert summary.security_trades_removed == 1
     assert warehouse._query("SELECT count(*) FROM @finance_tax_lots") == [(1,)]
     assert warehouse._query("SELECT count(*) FROM @finance_security_transaction_links") == [(1,)]
+
+
+# --- entity documents are not the owner's money -----------------------------------
+
+
+def _fund_level_financials(**overrides) -> dict:
+    """A private fund's own Q1 2026 unaudited financial statements.
+
+    Every field except ``reporting_scope`` is indistinguishable from an
+    investor's capital account statement for the same fund on the same day:
+    the fund's name, a closing balance, a period, transactions.
+    """
+    defaults = dict(
+        content_sha256="sha-fund-financials",
+        document_type="entity_financial_statement",
+        institution="Carta",
+        account_name_hint="Example Fund I LP",
+        account_mask="",
+        reporting_scope="entity",
+        account_holder="",
+        value_basis="market",
+        period_start=date(2026, 1, 1),
+        period_end=date(2026, 3, 31),
+        closing_balance=Decimal("4820000"),
+        balances_json=[
+            {"date": "2026-01-01", "balance": "3100000"},
+            {"date": "2026-03-31", "balance": "4820000"},
+        ],
+        valuations_json=[
+            {"date": "2026-03-31", "value": "6350000", "description": "Total assets"},
+            {"date": "2026-03-31", "value": "4820000", "description": "Total members' equity"},
+        ],
+        transactions_json=[
+            {
+                "date": "2025-07-10",
+                "description": "Portfolio Co SAFE",
+                "amount": "1500000",
+                "direction": "out",
+                "security_name": "Portfolio Co SAFE",
+                "ticker": "",
+                "cusip": "",
+                "quantity": "",
+                "price_per_share": "",
+                "trade_side": "buy",
+                "fees": "",
+            }
+        ],
+    )
+    defaults.update(overrides)
+    return _extraction_row(**defaults)
+
+
+def test_a_fund_level_document_never_becomes_the_owners_balance(warehouse):
+    """The seven-figure 2026-08-27 bug, in one test.
+
+    A private fund sends its LPs two documents that look alike in every
+    extracted field: its own financial statements and their capital account
+    statement. Booking the first as a personal account reported the whole
+    partnership's members' equity as the investor's asset and put the fund's
+    entire portfolio purchase history into his transaction ledger.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-fund-financials",
+            source_native_id="sha-fund-financials",
+            filename="1Q26 Unaudited Financials.pdf",
+            # In an account folder, so the key guard cannot be what saves it:
+            # only the declared scope can.
+            original_path="fundadmin-example-fund-i-lp/1Q26 Unaudited Financials.pdf",
+        ),
+        extraction=_fund_level_financials(),
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert summary.documents_withheld_entity == 1
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(0,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_observations") == [(0,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_transactions") == [(0,)]
+    # The extraction itself is untouched: the document remains a fact of
+    # record, it is only never the owner's stock or flow.
+    assert warehouse._query(
+        "SELECT count(*) FROM @manual_finance_extractions WHERE status = 'ok'"
+    ) == [(1,)]
+
+
+def test_a_document_naming_an_institution_but_no_account_is_withheld(warehouse):
+    """The corpus-root case, which needs no re-extraction to be safe.
+
+    Nineteen private-fund files were uploaded to the root of the
+    manual-finance corpus, so they had no account folder, and a fund statement
+    prints no account mask. ``institution|mask`` therefore degenerated to
+    ``<institution>|``, a bucket. Refusing it understates rather than fabricates -- and it is the
+    only guard that works on a corpus extracted before v3.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-root",
+            source_native_id="sha-root",
+            filename="1Q26 Unaudited Financials.pdf",
+            original_path="1Q26 Unaudited Financials.pdf",
+        ),
+        extraction=_fund_level_financials(
+            content_sha256="sha-root",
+            # Pre-v3: no scope was ever asked for, so the ledger cannot know.
+            reporting_scope="",
+            value_basis="",
+        ),
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert summary.documents_withheld_unidentified == 1
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(0,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_observations") == [(0,)]
+
+
+def test_net_worth_stays_the_owners_when_an_entity_statement_arrives(warehouse):
+    """The plausibility assertion: one document must not move net worth 13x.
+
+    Zach's take-home is about $118k a year, so a single new PDF adding
+    $6.48M to net worth is not a market move, it is a modelling error. This
+    seeds the real shape -- a personal balance beside a fund's own balance
+    sheet -- and pins that net worth reports the personal one alone.
+    """
+    _seed_plaid(warehouse, [_plaid_account_row(current_balance=12636.04)])
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-fund-financials",
+            source_native_id="sha-fund-financials",
+            filename="1Q26 Unaudited Financials.pdf",
+            original_path="fundadmin-example-fund-i-lp/1Q26 Unaudited Financials.pdf",
+        ),
+        extraction=_fund_level_financials(),
+    )
+    warehouse.insert_manual_finance_documents(
+        [
+            _document_row(
+                content_sha256="sha-capital-account",
+                source_native_id="sha-capital-account",
+                filename="Capital Account Statements.pdf",
+                original_path="fundadmin-example-fund-i-lp/Capital Account Statements.pdf",
+            )
+        ]
+    )
+    warehouse.insert_manual_finance_extractions(
+        [
+            _extraction_row(
+                content_sha256="sha-capital-account",
+                document_type="capital_account_statement",
+                institution="Carta",
+                account_name_hint="Example Fund I LP",
+                account_mask="",
+                reporting_scope="account_holder",
+                account_holder="Zach Lata",
+                value_basis="market",
+                period_end=date(2026, 3, 31),
+                closing_balance=Decimal("8140"),
+                balances_json=[{"date": "2026-03-31", "balance": "8140"}],
+            )
+        ]
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    rows = warehouse._query(
+        "SELECT name, value FROM @marts_finance_net_worth ORDER BY value DESC"
+    )
+    assert rows == [("Checking", Decimal("12636.04")), ("Example Fund I LP", Decimal("8140"))]
+    (net_worth,) = warehouse._query("SELECT sum(signed_value) FROM @marts_finance_net_worth")[0]
+    assert net_worth == Decimal("20776.04")
+
+
+def test_tax_basis_capital_is_stored_but_never_summed_into_net_worth(warehouse):
+    """A Schedule K-1 states TAX basis, which is not what the position is worth.
+
+    K-1 tax-basis capital sat in net worth beside the same fund's NAV: the
+    position was counted twice, and the second count was on an incompatible
+    measure. The fact is still stored -- it is real, and it is what the IRS was
+    told -- under its own observation kind.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-k1",
+            source_native_id="sha-k1",
+            filename="Schedule K-1.pdf",
+            original_path="fundadmin-example-fund-i-lp/Schedule K-1.pdf",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-k1",
+            document_type="tax_form",
+            institution="Example Fund I LP",
+            account_name_hint="Example Fund I LP partnership interest",
+            account_mask="",
+            reporting_scope="account_holder",
+            account_holder="Zach Lata",
+            value_basis="tax",
+            period_end=date(2025, 12, 31),
+            closing_balance=Decimal("3275"),
+            balances_json=[{"date": "2025-12-31", "balance": "3275"}],
+            transactions_json=[
+                {
+                    "date": "2025-12-31",
+                    "description": "Ordinary business income (loss)",
+                    "amount": "220",
+                    "direction": "out",
+                    "security_name": "",
+                    "ticker": "",
+                    "cusip": "",
+                    "quantity": "",
+                    "price_per_share": "",
+                    "trade_side": "",
+                    "fees": "",
+                }
+            ],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert warehouse._query("SELECT kind, value FROM @finance_observations") == [
+        ("tax_basis", Decimal("3275"))
+    ]
+    # No market value for the account, so it contributes no net-worth line at
+    # all rather than a wrong one.
+    assert warehouse._query("SELECT count(*) FROM @marts_finance_net_worth") == [(0,)]
+    # A K-1's line items are allocated shares of partnership income, not money
+    # that moved through the partner's account.
+    assert warehouse._query("SELECT count(*) FROM @finance_transactions") == [(0,)]
+
+
+def test_unfunded_commitment_is_recorded_and_kept_out_of_net_worth(warehouse):
+    """A future capital call is a real obligation with nowhere to live before v3.
+
+    It is deliberately not a liability: a commitment is contingent on the fund
+    calling it, and booking it as debt would make net worth disagree with every
+    statement. marts_finance.commitments is where it is answerable.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-capital-call",
+            source_native_id="sha-capital-call",
+            filename="capital-call.pdf",
+            original_path="fundadmin-example-fund-i-lp/capital-call.pdf",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-capital-call",
+            document_type="capital_call_notice",
+            institution="Carta",
+            account_name_hint="Example Fund I LP",
+            account_mask="",
+            reporting_scope="account_holder",
+            account_holder="Zach Lata",
+            value_basis="market",
+            period_end=date(2026, 4, 22),
+            closing_balance=Decimal("0"),
+            balances_json=[{"date": "2026-04-22", "balance": "12000"}],
+            commitments_json=[
+                {
+                    "date": "2026-04-22",
+                    "committed": "40000",
+                    "called": "12000",
+                    "unfunded": "28000",
+                    "description": "Example Fund I LP",
+                }
+            ],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert warehouse._query(
+        "SELECT kind, value FROM @finance_observations ORDER BY kind"
+    ) == [
+        ("balance", Decimal("12000")),
+        ("called_capital", Decimal("12000")),
+        ("commitment", Decimal("40000")),
+        ("unfunded_commitment", Decimal("28000")),
+    ]
+    assert warehouse._query(
+        "SELECT committed, called, unfunded FROM @marts_finance_commitments"
+    ) == [(Decimal("40000"), Decimal("12000"), Decimal("28000"))]
+    # Net worth reports what is owned today: the called capital, not the
+    # commitment and not the unfunded balance.
+    assert warehouse._query("SELECT sum(signed_value) FROM @marts_finance_net_worth") == [
+        (Decimal("12000"),)
+    ]
+
+
+def test_a_link_whose_documents_are_gone_is_reconciled_away(warehouse):
+    """Re-resolution cannot reach a group that no longer exists.
+
+    7adf12e made document links re-resolve every run so a frozen decision
+    cannot survive. That only walks groups that still exist -- so when a
+    group's documents are withheld, moved into a folder, or deleted, its link
+    stayed behind, kept its ledger account above ``prune_unlinked_finance_accounts``
+    (which only reaches accounts with zero links), and the catch-all account
+    lived on with no document claiming it.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(
+            content_sha256="sha-root",
+            source_native_id="sha-root",
+            filename="fund-report.pdf",
+            original_path="fund-report.pdf",
+        ),
+        extraction=_extraction_row(
+            content_sha256="sha-root",
+            document_type="fund_positions",
+            institution="",  # no institution: keys on the filename stem
+            account_name_hint="Example Fund",
+            account_mask="",
+            balances_json=[{"date": "2026-03-31", "balance": "1000"}],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert warehouse._query("SELECT count(*) FROM @finance_account_links") == [(1,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(1,)]
+
+    # The same document, now filed under an institution with no mask: its key
+    # becomes unidentifiable and the group disappears.
+    warehouse.insert_manual_finance_extractions(
+        [
+            _extraction_row(
+                content_sha256="sha-root",
+                ai_prompt_version="manual-finance-agent-v3",
+                document_type="fund_positions",
+                institution="Carta",
+                account_name_hint="Example Fund",
+                account_mask="",
+                balances_json=[{"date": "2026-03-31", "balance": "1000"}],
+                created_at=datetime(2026, 7, 13, 13, 0, tzinfo=UTC),
+            )
+        ]
+    )
+    summary = FinanceLedgerRunner(
+        warehouse=warehouse, now=datetime(2026, 7, 13, 14, 0, tzinfo=UTC)
+    ).sync()
+
+    assert summary.links_removed == 1
+    assert summary.accounts_pruned == 1
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(0,)]
+    assert warehouse._query("SELECT count(*) FROM @finance_observations") == [(0,)]
+
+
+def test_ledger_and_extraction_contract_agree_on_scope_tokens():
+    """The ledger repeats the extraction contract's enums rather than importing
+    them, to stay free of the extraction runner's agent/Docker dependencies.
+    A silent divergence would make every entity document book again."""
+    from personal_data_warehouse.manual_finance_extraction import (
+        REPORTING_SCOPE_ENTITY as CONTRACT_ENTITY,
+        VALUE_BASIS_TAX as CONTRACT_TAX,
+    )
+
+    assert REPORTING_SCOPE_ENTITY == CONTRACT_ENTITY
+    assert VALUE_BASIS_TAX == CONTRACT_TAX
+
+
+def test_every_non_value_observation_kind_is_excluded_from_net_worth(warehouse):
+    """The ledger stores facts and derives status at read time, so a kind that
+    is not a current value must be filtered by every reader of a VALUE. The
+    SQL list lives in postgres.py and cannot import the Python one; this is
+    what keeps them the same list."""
+    warehouse.ensure_finance_tables()
+    warehouse.insert_finance_accounts(
+        [
+            {
+                "account_id": "fa_test",
+                "account": "z@x.test",
+                "name": "Fund",
+                "kind": "private_fund",
+                "side": "asset",
+                "currency": "USD",
+                "institution": "Carta",
+                "mask": "",
+                "created_at": _TS,
+                "updated_at": _TS,
+                "sync_version": 1,
+            }
+        ]
+    )
+    warehouse.insert_finance_observations(
+        [
+            {
+                "account_id": "fa_test",
+                "as_of": date(2026, 6, 1),
+                "kind": "valuation",
+                "value": Decimal("100"),
+                "currency": "USD",
+                "source": "manual_finance",
+                "observed_at": _TS,
+                "sync_version": 1,
+            }
+        ]
+        + [
+            {
+                "account_id": "fa_test",
+                # Newer than the valuation on purpose: net worth takes the
+                # LATEST observation, so a non-value kind that is not filtered
+                # wins outright rather than merely being added.
+                "as_of": date(2026, 7, 1),
+                "kind": kind,
+                "value": Decimal("999999"),
+                "currency": "USD",
+                "source": "manual_finance",
+                "observed_at": _TS,
+                "sync_version": 1,
+            }
+            for kind in NON_VALUE_OBSERVATION_KINDS
+        ]
+    )
+    assert warehouse._query(
+        "SELECT observation_kind, value FROM @marts_finance_net_worth"
+    ) == [("valuation", Decimal("100"))]
+    assert warehouse._query(
+        "SELECT net_worth FROM @marts_finance_net_worth_history ORDER BY day DESC LIMIT 1"
+    ) == [(Decimal("100"),)]
+    assert warehouse._query(
+        "SELECT latest_observation_kind, latest_value FROM @marts_finance_accounts"
+    ) == [("valuation", Decimal("100"))]

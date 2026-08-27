@@ -172,7 +172,13 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # source so a tier that swallows a source is a row, not a hunch.
         # +1 marts: marts_ops.agent_usage.
         # +1 marts: marts_ops.search_benchmark.
-        "marts": 48,
+        # +1 marts: marts_finance.commitments. Unfunded capital is a real future
+        # cash obligation that had nowhere to live: a five-figure uncalled
+        # commitment to a private fund was in the corpus and no finance surface
+        # said so. It is deliberately not a
+        # net-worth liability -- a commitment is contingent on the fund calling
+        # it -- so it needed its own read interface.
+        "marts": 49,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
