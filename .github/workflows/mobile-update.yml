@@ -1,0 +1,37 @@
+name: mobile-update
+
+# Publish the iOS app's JS over the air on every push to main that touches
+# mobile/. The installed app checks for an update on launch, so Zach's phone
+# picks it up without a reinstall. Native changes (a new package, an iOS
+# config change) do not ship this way: they need `eas build --profile preview`
+# and a reinstall from the build link.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mobile/**"
+      - ".github/workflows/mobile-update.yml"
+
+concurrency:
+  group: mobile-update
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - name: Publish OTA update to the preview channel
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: npx eas-cli update --channel preview --auto --non-interactive
