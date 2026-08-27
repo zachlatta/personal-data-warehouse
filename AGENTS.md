@@ -581,6 +581,13 @@ you what you want to hear), and through the two-statement shape the function rea
 | scoped `sources => ARRAY['google_drive']` | 5.1-8.6s | unchanged — see the search section |
 | `search_text_exact`, novel needle | 1.3-3.7s | unchanged |
 
+**The query tool warns before the timeout, not after.** A statement that pattern-matches
+(`ILIKE`, `LIKE`, `~`, `regexp_*`, `position()`) over a raw `base_*` table with no `timeline.`
+reference gets a `hint` attached to its result before it runs — that shape was every
+statement timeout in 14 days of agent sessions (324 such calls), and the timeout hint
+arrived ten seconds too late. The statement still executes; `pdw sql` prints the hint on
+stderr so scripted `--output` consumers keep clean rows on stdout.
+
 `search_text_exact` is a different shape and is **not** the same defect: it already launches
 six parallel workers and its cost is the 7 GB trigram index plus the ILIKE recheck's heap
 I/O. It is not comparable to hybrid's `search_hybrid_exact` leg (0.32s) either — that leg
@@ -2392,7 +2399,12 @@ enrichment layer.
   and found property/vehicle/private_fund accounts.
 - Net worth: `marts_finance.net_worth` (latest observation per account, signed by side; net worth
   = `SUM(signed_value)`) and `marts_finance.net_worth_history` (forward-filled daily
-  assets/liabilities/net series). `marts_finance.accounts` (accounts + latest observation) and
+  assets/liabilities/net series). **Every net-worth row says how stale it is**: `age_days`,
+  `expected_refresh_days` (3 for Plaid-fed kinds, 35 for a mortgage statement, 120 for
+  property / vehicle / private_fund / receivable valuations) and `staleness`
+  (`ok` / `late` / `stale` at 1x / 3x). Measured 2026-08-26 the private-fund valuation was
+  4.5 months old and the mortgage 8 weeks with nothing flagging either; quote a net worth
+  with its stalest input, not as today's number. `marts_finance.accounts` (accounts + latest observation) and
   `marts_finance.transactions` (the ledger joined to accounts) REPLACED the old Plaid passthrough
   views of the same names; the plaid-specific `marts_finance.investment_*` / `marts_finance.liabilities`
   passthroughs remain.

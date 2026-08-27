@@ -366,6 +366,7 @@ type sqlCommandInput struct {
 type sqlCommandResponse struct {
 	Rows  json.RawMessage `json:"rows"`
 	Error string          `json:"error"`
+	Hint  string          `json:"hint"`
 }
 
 func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -428,6 +429,11 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 	if payload.Error != "" {
 		fmt.Fprintln(stderr, "pdw sql:", payload.Error)
 		return 1
+	}
+	if payload.Hint != "" {
+		// Advice about the statement's shape, on stderr so scripted --output
+		// consumers still get clean rows on stdout.
+		fmt.Fprintln(stderr, "pdw sql:", payload.Hint)
 	}
 	if !formatSpecified {
 		fmt.Fprintln(stdout, sqlOutputHint)

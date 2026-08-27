@@ -1656,7 +1656,7 @@ def _search_text_index_names() -> set[str]:
     return set(re.findall(r"to_bm25query\([^,]+,\s*'([a-z0-9_]+)'\)", sql))
 
 
-def _search_text_function_sql() -> str:
+def _search_text_function_sql(*, include_all: bool = False) -> str:
     import personal_data_warehouse.postgres as postgres_module
 
     captured: list[str] = []
@@ -1694,10 +1694,25 @@ def _search_text_function_sql() -> str:
             return True
 
     postgres_module.PostgresWarehouse._ensure_search_text_function(_Capture())
+    if include_all:
+        return "\n".join(captured)
     # The generator issues the core DDL first, then (prerequisites permitting)
     # the search_hybrid DDL as a second command; concatenate so structural
     # tests see everything a fully-equipped warehouse would run.
     return "\n".join(sql for sql in captured if "CREATE OR REPLACE FUNCTION" in sql or "DO $do$" in sql)
+
+
+def test_search_hybrid_carries_a_comment_saying_it_is_not_callable_from_plain_sql() -> None:
+    """The function is a trap from `pdw schema`: agents found it and called
+    search_hybrid('terms', 20), which fails with 42883 because it wants a
+    precomputed embedding. The catalog cannot comment a function, so the
+    comment is published beside the function itself."""
+    statements = _search_text_function_sql(include_all=True)
+    comments = [sql for sql in statements.split("\n") if "COMMENT ON FUNCTION @search_hybrid(" in sql]
+    assert len(comments) == 1
+    assert "NOT callable from plain SQL" in comments[0]
+    assert "42883" in comments[0]
+    assert "timeline.search_text" in comments[0]
 
 
 def test_search_hybrid_gives_semantic_rank_a_measured_bounded_boost() -> None:

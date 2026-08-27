@@ -964,3 +964,25 @@ func TestExecuteFullJSONFormatReturnsRowSlice(t *testing.T) {
 		t.Fatalf("encoded JSON missing rows array: %s", encoded)
 	}
 }
+
+func TestRawTextScanHintFiresOnlyForRawPatternScansOutsideTheTimeline(t *testing.T) {
+	// The shape behind every statement timeout in 14 days of agent sessions:
+	// ILIKE over a raw base_* table with no timeline reference.
+	cases := map[string]bool{
+		"SELECT * FROM base_slack.messages WHERE text ILIKE '%malted%' LIMIT 20":                                                            true,
+		"SELECT * FROM base_gmail.messages m WHERE m.subject ~* 'invoice' ORDER BY internal_date DESC":                                      true,
+		"SELECT * FROM base_slack.messages WHERE conversation_id = 'C1' AND message_datetime > now() - interval '1 day'":                    false,
+		"SELECT * FROM timeline.search_text('malted', 20)":                                                                                  false,
+		"SELECT e.* FROM timeline.events e JOIN base_slack.messages m ON m.message_ts = e.source_pk->>'ts' WHERE e.search_text ILIKE '%x%'": false,
+		"SELECT * FROM marts_messages.messages WHERE body ILIKE '%x%'":                                                                      false,
+	}
+	for sql, want := range cases {
+		got := rawTextScanHint(sql) != ""
+		if got != want {
+			t.Fatalf("rawTextScanHint(%q) fired=%v, want %v", sql, got, want)
+		}
+	}
+	if hint := rawTextScanHint("SELECT * FROM base_slack.messages WHERE text ILIKE '%x%'"); !strings.Contains(hint, "timeline.search_text") {
+		t.Fatalf("the hint must say what to use instead; got %q", hint)
+	}
+}

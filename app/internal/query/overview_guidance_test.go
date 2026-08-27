@@ -121,8 +121,12 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 			guidance += len(line) + 1
 		}
 	}
-	if guidance > 8000 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 8000)", guidance)
+	// 8000 held until 2026-08-27, when two START HERE relations were added
+	// (marts_files.attachments, marts_ops.timeline_priority_mix) and one
+	// schema line with them. Each is a headline agents need on the first call;
+	// the budget moves for those, not for prose.
+	if guidance > 8600 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 8600)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

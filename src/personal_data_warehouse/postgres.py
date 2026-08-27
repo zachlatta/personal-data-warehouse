@@ -3111,7 +3111,48 @@ class PostgresWarehouse:
                 o.value,
                 o.source,
                 o.observed_at,
-                CASE WHEN a.side = 'liability' THEN -o.value ELSE o.value END AS signed_value
+                CASE WHEN a.side = 'liability' THEN -o.value ELSE o.value END AS signed_value,
+                -- Appended, never inserted: CREATE OR REPLACE VIEW only
+                -- tolerates new columns at the end.
+                --
+                -- A net worth is only as current as its stalest input, and the
+                -- manual sources have no pipeline SLA (the upload is `manual`
+                -- on /pipelines). Measured 2026-08-26 the private-fund
+                -- valuation was 4.5 months old and the mortgage 8 weeks, with
+                -- nothing flagging either. Each account kind carries the
+                -- refresh its source can honestly promise: Plaid balances land
+                -- daily; a mortgage statement is monthly; property, vehicle and
+                -- fund valuations are quarterly documents. `late` is past the
+                -- interval, `stale` past three of them.
+                (CURRENT_DATE - o.as_of)::bigint AS age_days,
+                CASE a.kind
+                    WHEN 'mortgage' THEN 35
+                    WHEN 'property' THEN 120
+                    WHEN 'vehicle' THEN 120
+                    WHEN 'private_fund' THEN 120
+                    WHEN 'receivable' THEN 120
+                    WHEN 'other' THEN 120
+                    ELSE 3
+                END::bigint AS expected_refresh_days,
+                CASE
+                    WHEN (CURRENT_DATE - o.as_of) > 3 * CASE a.kind
+                        WHEN 'mortgage' THEN 35
+                        WHEN 'property' THEN 120
+                        WHEN 'vehicle' THEN 120
+                        WHEN 'private_fund' THEN 120
+                        WHEN 'receivable' THEN 120
+                        WHEN 'other' THEN 120
+                        ELSE 3 END THEN 'stale'
+                    WHEN (CURRENT_DATE - o.as_of) > CASE a.kind
+                        WHEN 'mortgage' THEN 35
+                        WHEN 'property' THEN 120
+                        WHEN 'vehicle' THEN 120
+                        WHEN 'private_fund' THEN 120
+                        WHEN 'receivable' THEN 120
+                        WHEN 'other' THEN 120
+                        ELSE 3 END THEN 'late'
+                    ELSE 'ok'
+                END AS staleness
             FROM @finance_accounts AS a
             JOIN LATERAL (
                 SELECT o.kind, o.as_of, o.value, o.source, o.observed_at
@@ -11695,6 +11736,16 @@ class PostgresWarehouse:
             END;
             $hybrid$;
             """
+            )
+            # The catalog cannot comment a function, and this one is a trap
+            # from `pdw schema`: agents found it, called search_hybrid('terms',
+            # 20) and got 42883. The comment travels with the function so any
+            # \df / describe surface says so before the call is made.
+            self._command(
+                "COMMENT ON FUNCTION @search_hybrid(text, text, text, integer, text[], timestamptz, text, text[]) "
+                "IS $c$NOT callable from plain SQL: takes a precomputed query embedding only the app can "
+                "produce, so search_hybrid('terms', 20) fails with 42883. Hybrid retrieval is the search tool "
+                "/ pdw search; from SQL use timeline.search_text (BM25) or timeline.search_text_exact.$c$"
             )
         # to_bm25query() resolves the timeline BM25 index by NAME, and the
         # EXECUTE'd branch SQL resolves the search_text_hit row type, both

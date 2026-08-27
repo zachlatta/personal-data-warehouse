@@ -110,6 +110,9 @@ type QueryResult struct {
 	Preview     any               `json:"preview,omitempty"`
 	Truncations []FieldTruncation `json:"truncations,omitempty"`
 	Error       string            `json:"error,omitempty"`
+	// Hint is advice about the statement's SHAPE, attached before it runs and
+	// regardless of whether it succeeds: the query still executes.
+	Hint string `json:"hint,omitempty"`
 }
 
 type RowsResponse struct {
@@ -170,6 +173,7 @@ type FullQueryResponse struct {
 	Truncated   bool     `json:"truncated,omitempty"`
 	Rows        any      `json:"rows,omitempty"`
 	Error       string   `json:"error,omitempty"`
+	Hint        string   `json:"hint,omitempty"`
 }
 
 type DebugCacheStatus struct {
@@ -321,7 +325,7 @@ func (s *Service) Execute(ctx context.Context, statements []Statement, previewRo
 	results := make([]QueryResult, 0, len(statements))
 	for _, statement := range statements {
 		queryStarted := time.Now()
-		result := QueryResult{SQL: statement.SQL, Format: format}
+		result := QueryResult{SQL: statement.SQL, Format: format, Hint: rawTextScanHint(statement.SQL)}
 		if err := ValidateReadOnlySQL(statement.SQL); err != nil {
 			result.Error = err.Error()
 			results = append(results, result)
@@ -541,6 +545,7 @@ func (s *Service) ExecuteFull(ctx context.Context, question, sql, format string)
 	}
 	started := time.Now()
 	s.logger.InfoContext(ctx, "sql started", "question", question, "sql", sql, "format", format, "row_cap", FullQueryRowCap)
+	resp.Hint = rawTextScanHint(sql)
 	raw, err := s.runner.Query(ctx, sql, FullQueryRowCap+1)
 	if err != nil {
 		resp.Error = s.queryErrorMessage(ctx, err.Error(), sql)
@@ -945,6 +950,32 @@ const maxHintRelations = 3
 // is ~51 columns, so this is a guard against a future wide table rather than a
 // limit anything hits today.
 const maxHintColumns = 80
+
+// rawTextScanHint warns BEFORE a statement runs when its shape is the one
+// that times out: a pattern match (ILIKE, LIKE, ~, ~*, regexp_*) over a raw
+// base_* table with no timeline reference anywhere in the statement. In 14
+// days of agent sessions 324 SQL calls did exactly this, and every statement
+// timeout in that window was one of them; the timeout hint arrived ten
+// seconds too late. The statement still runs -- a bounded ILIKE over a small
+// table is fine -- so this is advice, not a fence.
+func rawTextScanHint(sql string) string {
+	lower := strings.ToLower(sql)
+	if strings.Contains(lower, "timeline.") {
+		return ""
+	}
+	if !rawBaseTableRef.MatchString(lower) || !rawTextScanOp.MatchString(lower) {
+		return ""
+	}
+	return "(hint: this pattern-matches text in a raw base_* table without going through the timeline. " +
+		"That is the query shape that hits the statement timeout on the large sources. For text search use " +
+		"timeline.search_text('needle', 50, sources => ARRAY['slack']) or timeline.search_text_exact('needle', 50) " +
+		"and drill to the raw row via source_table/source_pk; keep raw-table predicates to indexed columns and a time bound.)"
+}
+
+var (
+	rawBaseTableRef = regexp.MustCompile(`\bbase_[a-z0-9_]+\.[a-z0-9_]+`)
+	rawTextScanOp   = regexp.MustCompile(`\bilike\b|\blike\b|\bsimilar to\b|~\*?|\bregexp_(?:matches|like|replace|count)\s*\(|\bposition\s*\(`)
+)
 
 func queryErrorWithHint(message, sql string) string {
 	if hint := schemaErrorHint(message, sql); hint != "" {

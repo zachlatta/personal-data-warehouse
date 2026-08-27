@@ -277,6 +277,44 @@ def test_net_worth_signs_liabilities_and_uses_latest_observation(warehouse):
     assert total == [(Decimal("60.00"),)]
 
 
+def test_net_worth_says_how_stale_each_input_is_by_account_kind(warehouse):
+    """A net worth is as current as its stalest input, and the manual kinds
+    have no pipeline SLA: the private-fund valuation was 4.5 months old on
+    2026-08-26 with nothing flagging it. Each kind carries the refresh its
+    source can promise -- daily for Plaid balances, monthly for a mortgage
+    statement, quarterly for valuation documents."""
+    warehouse.ensure_finance_tables()
+    # The view judges against the database's CURRENT_DATE, which is UTC and
+    # can be a day ahead of the test host's local calendar in the evening.
+    today = warehouse._query("SELECT CURRENT_DATE")[0][0]
+    warehouse.insert_finance_accounts(
+        [
+            _account_row(account_id="fa_chk", kind="checking"),
+            _account_row(account_id="fa_mtg", name="Mortgage", kind="mortgage", side="liability", mask="0003"),
+            _account_row(account_id="fa_fund", name="Fund", kind="private_fund", mask="0004"),
+        ]
+    )
+    warehouse.insert_finance_observations(
+        [
+            _observation_row(account_id="fa_chk", as_of=today, value=Decimal("1.00")),
+            _observation_row(account_id="fa_mtg", kind="principal", as_of=today - timedelta(days=50), value=Decimal("2.00")),
+            _observation_row(account_id="fa_fund", kind="valuation", as_of=today - timedelta(days=400), value=Decimal("3.00")),
+        ]
+    )
+    rows = {
+        row["account_id"]: row
+        for row in warehouse._query_dicts(
+            "SELECT account_id, age_days, expected_refresh_days, staleness FROM @marts_finance_net_worth"
+        )
+    }
+    assert rows["fa_chk"]["staleness"] == "ok"
+    assert rows["fa_chk"]["expected_refresh_days"] == 3
+    assert rows["fa_mtg"]["staleness"] == "late"
+    assert rows["fa_mtg"]["age_days"] == 50
+    assert rows["fa_mtg"]["expected_refresh_days"] == 35
+    assert rows["fa_fund"]["staleness"] == "stale"
+
+
 def test_net_worth_prefers_balance_over_valuation_on_the_same_day(warehouse):
     warehouse.ensure_finance_tables()
     warehouse.insert_finance_accounts([_account_row()])
