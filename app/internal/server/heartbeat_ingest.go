@@ -74,7 +74,7 @@ func (s *uploaderHeartbeatStore) Close() error {
 	return s.db.Close()
 }
 
-// Identical to the Python TableSpec for `uploader_heartbeats` (text '' / bigint
+// Identical to the Python TableSpec for `uploader_heartbeats` (text ” / bigint
 // 0 / epoch-sentinel timestamptz defaults), so whichever side provisions first
 // leaves the same table and the other side's CREATE IF NOT EXISTS is a no-op.
 var uploaderHeartbeatSchemaDDL = "CREATE SCHEMA IF NOT EXISTS " +

@@ -1237,6 +1237,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
         note="collation baselines, duplicate-key corroboration, and scheduled amcheck",
     ),
     "uploader_heartbeats": _data("uploader_heartbeats", "updated_at", "ran_at"),
+    "timeline_priority_mix": _support("pipeline_health", "collected_at", note="per-source tier mix, last 7 days"),
     "pgbackrest_health": _data(
         "pgbackrest",
         "collected_at",
@@ -1322,6 +1323,28 @@ class PipelineSnapshot:
     state_attention_rows: int
     last_error: str
     last_error_at: datetime | None
+
+
+@dataclass(frozen=True)
+class PriorityMixSnapshot:
+    """One (source, priority) cell of the last seven days of timeline.events.
+
+    Facts only: the counts and the newest event. ``marts_ops.timeline_priority_mix``
+    derives the share and the verdict, so a stale snapshot reads ``unknown``.
+    """
+
+    source: str
+    priority: str
+    events_7d: int
+    events_1d: int
+    newest_event_at: datetime | None
+
+
+#: The tier-mix aggregate walks seven days of timeline.events through the
+#: (event_ts) index -- ~200k rows in production, ~1-3s. A bloated week must not
+#: stretch the ten-minute collection, so it gets its own bound and a failure
+#: keeps the previous snapshot rather than blanking the surface.
+PRIORITY_MIX_STATEMENT_TIMEOUT_MS = 30_000
 
 
 @dataclass
@@ -1437,20 +1460,57 @@ class PipelineHealthCollector:
                 for view_id in mart_view_ids()
             ]
 
+    def collect_priority_mix(self) -> list[PriorityMixSnapshot] | None:
+        """Count the last seven days of timeline.events per (source, tier).
+
+        Returns None when the aggregate could not run (timeout, missing table),
+        so the caller keeps the previous snapshot: a blank surface would read
+        as "every source is unclassified-free", which is the opposite of what a
+        failed measurement means.
+        """
+        sql = """
+            SELECT source, priority::text AS priority,
+                   count(*)::bigint AS events_7d,
+                   count(*) FILTER (WHERE event_ts >= now() - interval '1 day')::bigint AS events_1d,
+                   max(event_ts) AS newest_event_at
+            FROM @timeline_events
+            WHERE event_ts >= now() - interval '7 days'
+            GROUP BY source, priority
+        """
+        try:
+            with self._probe_budget(PRIORITY_MIX_STATEMENT_TIMEOUT_MS):
+                rows = self._warehouse._query_dicts(sql)
+        except psycopg2.Error as error:
+            logger.warning("timeline priority mix aggregate failed: %s", error)
+            return None
+        return [
+            PriorityMixSnapshot(
+                source=str(row["source"]),
+                priority=str(row["priority"]),
+                events_7d=int(row["events_7d"] or 0),
+                events_1d=int(row["events_1d"] or 0),
+                newest_event_at=row["newest_event_at"],
+            )
+            for row in rows
+        ]
+
     def run_all(
         self,
     ) -> tuple[list[PipelineSnapshot], list[TableSnapshot], list[MartViewSnapshot]]:
         """Collect and persist everything this collector measures.
 
-        One ``collected_at`` for all three snapshots, so the views' staleness
+        One ``collected_at`` for every snapshot, so the views' staleness
         guard applies to the whole dashboard at once rather than letting one
         surface silently outlive another.
         """
         pipelines, tables = self.collect()
         marts = self.collect_marts(pipelines, tables)
+        mix = self.collect_priority_mix()
         collected_at = self._now()
         self._warehouse.write_pipeline_health(pipelines, tables, collected_at=collected_at)
         self._warehouse.write_mart_view_health(marts, collected_at=collected_at)
+        if mix is not None:
+            self._warehouse.write_timeline_priority_mix(mix, collected_at=collected_at)
         return pipelines, tables, marts
 
     def run(self) -> tuple[list[PipelineSnapshot], list[TableSnapshot]]:

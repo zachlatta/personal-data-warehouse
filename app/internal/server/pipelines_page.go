@@ -177,6 +177,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   <div id="adapters"></div>
   <div id="backups"></div>
   <div id="search"></div>
+  <div id="priority"></div>
   <div id="slack"></div>
   <div id="plaid"></div>
   <div id="collation"></div>
@@ -243,6 +244,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     ["marts", "marts — the read interface, judged on the freshness of what it reads"],
     ["adapters", "timeline adapters — is THIS kind of data reaching timeline.events"],
     ["search", "search — do chunks and embeddings converge with the timeline"],
+    ["priority", "priority tiers — how each source's last seven days split across self / direct / cc / noise / background"],
     // Per-source detectors. They are here because level 1 AGGREGATES a source
     // into one row, and that is how both of these outages hid: ~19k
     // public-channel messages a day kept Slack ok through a total group-DM
@@ -258,7 +260,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
     pipelines: [], tables: [], marts: [], adapters: [], search: [], slack: [], plaid: [], collation: [],
-    backups: [],
+    backups: [], priority: [],
     skew: 0, filter: "", attentionOnly: false, open: {}
   };
 
@@ -741,6 +743,19 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       ], s.last_error || (!s.configured ? "hybrid falls back to keyword: embeddings unconfigured" : ""));
   }
 
+  function priorityMixNode(p) {
+    var share = Math.round((p.share_7d || 0) * 1000) / 10;
+    return healthRow(p, p.source + " · " + p.priority,
+      share + "% of " + rows(p.source_events_7d) + " events this week",
+      [
+        ["7 days", rows(p.events_7d), "events in this tier over the last seven days", false],
+        ["24 hours", rows(p.events_1d), "events in this tier over the last day", true],
+        ["newest", p.newest_event_at ? ago(ageOf(p.newest_event_at)) + " ago" : "—",
+          stamp(p.newest_event_at), true]
+      ],
+      p.priority === "unclassified" ? "unclassified is not a tier: an adapter's classification did not run" : "");
+  }
+
   function backupNode(b) {
     // Two independent facts, because reporting either alone is how this hid:
     // WAL shipped perfectly through the 2026-08-25 outage while no base backup
@@ -816,11 +831,16 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     renderSection("marts", LEVELS[1][1], state.marts, martNode);
     renderSection("adapters", LEVELS[2][1], state.adapters, adapterNode);
     renderSection("search", LEVELS[3][1], state.search, searchNode);
-    renderSection("slack", LEVELS[4][1], state.slack, slackConversationNode);
-    renderSection("plaid", LEVELS[5][1], state.plaid, plaidItemNode);
+    renderSection("priority", LEVELS[4][1], state.priority, priorityMixNode,
+      function (a, b) {
+        if (a.source !== b.source) return a.source < b.source ? -1 : 1;
+        return bySeverity(a, b);
+      });
+    renderSection("slack", LEVELS[5][1], state.slack, slackConversationNode);
+    renderSection("plaid", LEVELS[6][1], state.plaid, plaidItemNode);
     // The database's own collation row first: it is the finding the other rows
     // corroborate, and it is the one that says this database cannot warn itself.
-    renderSection("collation", LEVELS[6][1], state.collation, collationNode,
+    renderSection("collation", LEVELS[7][1], state.collation, collationNode,
       function (a, b) {
         if ((a.scope === "database") !== (b.scope === "database")) {
           return a.scope === "database" ? -1 : 1;
@@ -895,7 +915,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     node.appendChild(h("br"));
     node.appendChild(document.createTextNode(
       "Everything here is queryable at parity: marts_ops.pipeline_health, marts_ops.table_freshness," +
-      " marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health," +
+      " marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health, marts_ops.timeline_priority_mix," +
       " marts_ops.collation_health."));
   }
 
@@ -924,6 +944,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       state.adapters = body.adapters || [];
       state.backups = body.backups || [];
       state.search = body.search || [];
+      state.priority = body.priority || [];
       state.slack = body.slack || [];
       state.plaid = body.plaid || [];
       state.collation = body.collation || [];

@@ -242,6 +242,13 @@ Omitting it searches every tier, which is almost never what an attention questio
 full of newsletters. Every hit carries its own `priority` column, so a filtered search can
 always show its work.
 
+**The mix is measured, per source.** `marts_ops.timeline_priority_mix` (also on `/pipelines`)
+is one row per (source, tier) over the last seven days — `events_7d`, `events_1d`, `share_7d`,
+`newest_event_at` — snapshotted by the `pipeline_health` collector every ten minutes. It is the
+surface on which a tier that quietly swallows a source after an adapter edit, or a source that
+stops producing `direct` at all, is a number rather than a hunch; any `unclassified` row there
+reads `failing`.
+
 `unclassified` is the sixth label and is **not a tier** — it is a fail-loud sentinel for rows
 the sync has not classified yet. It is accepted by the `priorities` filter, because scoping a
 search to it is how a classification outage is *found*, but any surface that lists it beside
@@ -715,6 +722,7 @@ The `uploader_heartbeats` pipeline row says whether ANY device is reporting at a
 | 1 — pipelines | `marts_ops.pipeline_health` (+ `marts_ops.table_freshness`) | is this feed still delivering |
 | 2 — marts | `marts_ops.mart_view_health` | is the read interface built on anything current |
 | 3 — timeline adapters | `marts_ops.timeline_adapter_health` | is THIS kind of data reaching `timeline.events` |
+| 3b — priority tiers | `marts_ops.timeline_priority_mix` | how each source's last seven days split across the five tiers; an `unclassified` row is `failing` |
 | 4 — integrity | `marts_ops.collation_health` | did the sort order move under us, and did anything break |
 
 **Level 2 exists because a view cannot be probed like a table.** `TABLE_PIPELINES` measures

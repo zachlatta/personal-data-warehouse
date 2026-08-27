@@ -71,6 +71,7 @@ from personal_data_warehouse.schema import (
     COLLATION_HEALTH_COLUMNS,
     PGBACKREST_HEALTH_COLUMNS,
     UPLOADER_HEARTBEAT_COLUMNS,
+    TIMELINE_PRIORITY_MIX_COLUMNS,
     MART_VIEW_HEALTH_COLUMNS,
     PIPELINE_HEALTH_COLUMNS,
     PIPELINE_TABLE_FRESHNESS_COLUMNS,
@@ -917,6 +918,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "collation_health": TableSpec(COLLATION_HEALTH_COLUMNS, ("object_id",), "collected_at"),
     "pgbackrest_health": TableSpec(PGBACKREST_HEALTH_COLUMNS, ("stanza",), "collected_at"),
     "uploader_heartbeats": TableSpec(UPLOADER_HEARTBEAT_COLUMNS, ("pipeline", "device")),
+    "timeline_priority_mix": TableSpec(TIMELINE_PRIORITY_MIX_COLUMNS, ("source", "priority"), "collected_at"),
 }
 
 # Every table whose rows belong to exactly one linked Plaid Item, data first
@@ -2167,6 +2169,8 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    "events_7d",
+    "events_1d",
     # backups: counts and sizes, plus last_attempt_ok as the warehouse's
     # bigint 0/1 boolean convention.
     "backup_count",
@@ -4023,6 +4027,7 @@ class PostgresWarehouse:
                 "search_health",
                 "pgbackrest_health",
                 "uploader_heartbeats",
+                "timeline_priority_mix",
             ]
         )
         # _ensure_table_group only CREATEs; it does not widen an existing
@@ -4599,6 +4604,43 @@ class PostgresWarehouse:
             """,
         )
 
+        # C2 made visible: the tier mix per source over the last seven days.
+        # `unclassified` is a fail-loud sentinel, so a row carrying it is a
+        # classification outage, not a sixth tier; `share_7d` is what shows a
+        # source's mix quietly collapsing into one tier after an adapter edit.
+        self._ensure_view(
+            "marts_timeline_priority_mix",
+            f"""
+            CREATE OR REPLACE VIEW @marts_timeline_priority_mix AS
+            WITH measured AS (
+                SELECT source, priority, events_7d, events_1d,
+                       NULLIF(newest_event_at, {epoch}) AS newest_event_at,
+                       NULLIF(collected_at, {epoch}) AS collected_at,
+                       sum(events_7d) OVER (PARTITION BY source) AS source_events_7d
+                FROM @timeline_priority_mix
+            )
+            SELECT
+                source,
+                priority,
+                CASE
+                    WHEN collected_at IS NULL
+                      OR now() - collected_at > make_interval(secs => {COLLECTOR_STALE_SECONDS})
+                        THEN 'unknown'
+                    WHEN priority = 'unclassified' THEN 'failing'
+                    ELSE 'ok'
+                END AS status,
+                events_7d,
+                events_1d,
+                CASE WHEN source_events_7d > 0
+                     THEN round(events_7d::numeric / source_events_7d, 4) ELSE 0 END AS share_7d,
+                source_events_7d,
+                newest_event_at,
+                collected_at,
+                (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds
+            FROM measured
+            """,
+        )
+
     def write_pipeline_health(
         self,
         pipelines: Sequence[Any],
@@ -4698,6 +4740,20 @@ class PostgresWarehouse:
             except Exception as error:  # noqa: BLE001 - reported, not raised
                 errors[name] = str(error).strip()[:300]
         return errors
+
+    def write_timeline_priority_mix(
+        self, rows: Sequence[Any], *, collected_at: datetime
+    ) -> None:
+        """Replace the per-source tier-mix snapshot with one collection's counts."""
+        self._insert_rows(
+            "timeline_priority_mix",
+            [_pipeline_health_row(snapshot, collected_at=collected_at) for snapshot in rows],
+            TIMELINE_PRIORITY_MIX_COLUMNS,
+        )
+        self._command(
+            "DELETE FROM @timeline_priority_mix WHERE (source || ':' || priority) <> ALL(%s)",
+            ([f"{snapshot.source}:{snapshot.priority}" for snapshot in rows],),
+        )
 
     def write_search_health(self, component: str, **facts: Any) -> None:
         """Upsert one search-stage heartbeat without scanning the corpus."""

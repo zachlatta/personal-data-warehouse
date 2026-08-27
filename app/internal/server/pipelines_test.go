@@ -118,6 +118,7 @@ func TestPipelinesAPIReadsTheMartsViews(t *testing.T) {
 	for _, relation := range []string{
 		warehouse.SQLRelation("marts_pipeline_health"),
 		warehouse.SQLRelation("marts_pipeline_table_freshness"),
+		warehouse.SQLRelation("marts_timeline_priority_mix"),
 	} {
 		if !strings.Contains(joined, relation) {
 			t.Fatalf("expected a query against %s, got:\n%s", relation, joined)

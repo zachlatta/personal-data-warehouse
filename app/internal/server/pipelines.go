@@ -27,6 +27,7 @@ const (
 	pipelinesSlackMaxRows     = 100
 	pipelinesPlaidMaxRows     = 200
 	pipelinesBackupMaxRows    = 20
+	pipelinesPriorityMaxRows  = 500
 )
 
 var pipelineHealthSQL = `
@@ -117,6 +118,15 @@ SELECT stanza, status, repo_status, repo_message,
 FROM ` + warehouse.SQLRelation("marts_pgbackrest_health") + `
 ORDER BY stanza`
 
+// Contract C2, per source: the five tiers are only a contract if the mix is
+// visible. An `unclassified` row is a classification outage; a source whose
+// share collapses into one tier after an adapter edit shows here first.
+var pipelinePriorityMixSQL = `
+SELECT source, priority, status, events_7d, events_1d, share_7d, source_events_7d,
+       newest_event_at, collected_at, snapshot_age_seconds
+FROM ` + warehouse.SQLRelation("marts_timeline_priority_mix") + `
+ORDER BY source, priority`
+
 var pipelineSearchHealthSQL = `
 SELECT component, status, model, configured, pgvector_available,
        timeline_max_seq, chunk_cursor_seq, seq_lag, caught_up,
@@ -155,6 +165,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 				"adapters":   []map[string]any{},
 				"collation":  []map[string]any{},
 				"search":     []map[string]any{},
+				"priority":   []map[string]any{},
 				"slack":      []map[string]any{},
 				"plaid":      []map[string]any{},
 				"backups":    []map[string]any{},
@@ -183,6 +194,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	adapters := s.optionalRows(r, "timeline adapter health", pipelineAdapterHealthSQL, pipelinesAdapterMaxRows)
 	collation := s.optionalRows(r, "collation health", pipelineCollationHealthSQL, pipelinesCollationMaxRows)
 	search := s.optionalRows(r, "search health", pipelineSearchHealthSQL, pipelinesSearchMaxRows)
+	priorityMix := s.optionalRows(r, "timeline priority mix", pipelinePriorityMixSQL, pipelinesPriorityMaxRows)
 	slack := s.optionalRows(r, "slack conversation health", pipelineSlackConversationHealthSQL, pipelinesSlackMaxRows)
 	plaid := s.optionalRows(r, "plaid item health", pipelinePlaidItemHealthSQL, pipelinesPlaidMaxRows)
 	backups := s.optionalRows(r, "backup health", pipelineBackupHealthSQL, pipelinesBackupMaxRows)
@@ -193,6 +205,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 		"adapters":   adapters,
 		"collation":  collation,
 		"search":     search,
+		"priority":   priorityMix,
 		"slack":      slack,
 		"plaid":      plaid,
 		"backups":    backups,

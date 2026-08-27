@@ -2074,6 +2074,17 @@
       "secret": false
     },
     {
+      "id": "timeline_priority_mix",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "timeline_priority_mix",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "uploader_heartbeats",
       "kind": "table",
       "layer": "ops",
@@ -2142,6 +2153,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "Does a restorable backup exist, and is WAL still shipping. Written by the pgBackRest loop inside the Postgres container, because the Dagster collector runs elsewhere and cannot ask pgbackrest anything - which is why backups appeared in no health surface until 2026-08-26, when production had no valid backup for a day while every pipeline read green. Archiving healthy with no base backup is a real and separately reported state: you cannot restore from WAL alone. Timestamps are NULL when absent, translating the warehouse's 1970-01-01 epoch sentinel."
+    },
+    {
+      "id": "marts_timeline_priority_mix",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "timeline_priority_mix",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "How the last seven days of timeline.events split across the five priority tiers, per source: events_7d, events_1d, share_7d and newest_event_at for every (source, priority) the collector saw. A row whose priority is 'unclassified' is a classification outage and reads failing; a source whose mix collapses into one tier is visible here before anyone notices a search full of newsletters. Snapshot taken by the pipeline_health collector; older than COLLECTOR_STALE_SECONDS reads unknown."
     },
     {
       "id": "marts_search_health",

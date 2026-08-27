@@ -2688,6 +2688,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "collation_health": _state("collation drift baselines and unique-index divergence findings"),
     "pgbackrest_health": _state("backup posture: does a restorable backup exist, is WAL shipping"),
     "uploader_heartbeats": _state("run heartbeats posted by the remote-device uploaders"),
+    "timeline_priority_mix": _state("per-source priority-tier counts over the last seven days (collector snapshot)"),
     "search_health": _state("search chunk and embedding convergence heartbeats"),
     # The timeline itself
     "timeline_events": _state("the unified timeline"),

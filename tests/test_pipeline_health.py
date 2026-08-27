@@ -635,6 +635,44 @@ def test_every_remote_device_uploader_declares_a_run_heartbeat():
         assert entry.expected_run_interval is not None, pipeline_id
 
 
+def test_priority_mix_counts_each_sources_tiers_and_flags_unclassified(warehouse):
+    """Contract C2 on a surface: the tier mix per source, with the sentinel red.
+
+    `unclassified` is a fail-loud sentinel, not a sixth tier -- a row carrying
+    it means an adapter's classification did not run and every attention
+    question answered from that source is wrong. It must read `failing` here,
+    where the adapter row (which only knows about SQL errors) reads `ok`.
+    """
+    _provision_every_table(warehouse)
+    warehouse.ensure_timeline_tables()
+    for event_id, source, priority, hours_ago in (
+        ("s1", "slack", "noise", 1),
+        ("s2", "slack", "noise", 30),
+        ("s3", "slack", "direct", 2),
+        ("g1", "gmail", "unclassified", 3),
+        ("old", "gmail", "self", 24 * 9),
+    ):
+        warehouse._command(
+            "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
+            "VALUES ('t', %s, %s, 'k', now() - make_interval(hours => %s), 'x', %s::timeline.timeline_priority)"
+            .replace("timeline.timeline_priority", warehouse.physical_schema_name("timeline") + ".timeline_priority"),
+            (event_id, source, hours_ago, priority),
+        )
+    PipelineHealthCollector(warehouse).run()
+
+    rows = {
+        (row["source"], row["priority"]): row
+        for row in warehouse._query_dicts("SELECT * FROM @marts_timeline_priority_mix")
+    }
+    assert set(rows) == {("slack", "noise"), ("slack", "direct"), ("gmail", "unclassified")}
+    assert rows[("slack", "noise")]["events_7d"] == 2
+    assert rows[("slack", "noise")]["events_1d"] == 1
+    assert float(rows[("slack", "noise")]["share_7d"]) == pytest.approx(0.6667, abs=1e-4)
+    assert rows[("slack", "direct")]["status"] == "ok"
+    assert rows[("gmail", "unclassified")]["status"] == "failing"
+    assert rows[("gmail", "unclassified")]["newest_event_at"] is not None
+
+
 def test_a_stale_snapshot_reports_unknown_instead_of_stale_facts(warehouse):
     """The dashboard must distrust itself when the collector stops running."""
     _provision_every_table(warehouse)

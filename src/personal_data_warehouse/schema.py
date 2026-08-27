@@ -2169,6 +2169,21 @@ MART_VIEW_HEALTH_COLUMNS = (
 #: production reported `status: error (no valid backups)` and had for a day,
 #: while WAL archiving kept working, every pipeline read green, and the loop
 #: logged "backup failed" to stdout every six hours where nothing escalated it.
+# One row per (source, priority tier) over the last seven days of
+# timeline.events, taken by the pipeline_health collector. Contract C2 says
+# every row is classified into one of five tiers; this is the surface that
+# shows the classification actually happening, per source, so a tier that
+# silently swallows a source (or an `unclassified` row) is a red row rather
+# than a search that comes back full of newsletters.
+TIMELINE_PRIORITY_MIX_COLUMNS = (
+    "source",
+    "priority",
+    "events_7d",
+    "events_1d",
+    "newest_event_at",
+    "collected_at",
+)
+
 # One row per (pipeline, device) from the machines that push data through the
 # app's /ingest/* endpoints: the run's own verdict, posted by the upload
 # wrapper after the uploader exits. It is the only in-warehouse heartbeat a
