@@ -190,7 +190,15 @@ class SearchBenchmarkRunner:
             ranks.append(first_relevant_rank(rows, set(case.truth_refs), (), case.truth_predicate))
         found = [r for r in ranks if r]
         mrr = (sum(1.0 / r for r in found) / len(ranks)) if ranks else 0.0
-        note = "" if cases else "no labels in private.search_benchmark_labels; run `search_benchmark publish-labels`"
+        notes = []
+        if not cases:
+            notes.append("no labels in private.search_benchmark_labels; run `search_benchmark publish-labels`")
+        if not timings:
+            # Every unscoped hybrid probe failed (a cold HNSW cache after a page
+            # sweep takes each one past the app's budget). Latency is
+            # unmeasured, not zero, and the row must say which.
+            notes.append(f"all {len(self._probes)} latency probes failed; p50/p90 are unmeasured this run")
+        note = "; ".join(notes)
         return SearchBenchmarkRun(
             mode=self._mode, probe_queries=len(timings),
             latency_p50_ms=int(_percentile(timings, 50) * 1000), latency_p90_ms=int(_percentile(timings, 90) * 1000),

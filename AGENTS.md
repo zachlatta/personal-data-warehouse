@@ -95,8 +95,10 @@ quietly becoming untrue, and several of these have been.
   `private.search_benchmark_labels`, loaded with
   `uv run python -m personal_data_warehouse.search_benchmark publish-labels` and exported
   with `pull-labels`, so a lost gitignored directory can no longer make retrieval quality
-  unmeasurable — which it did once, in 2026-08. *Gap:* the table is empty until someone
-  publishes labels; the row says so (`no labels published`) rather than reading green.
+  unmeasurable — which it did once, in 2026-08. First run, 2026-08-27 04:44Z: **MRR 0.434
+  over 68 labeled cases** (hit@1 24, hit@5 36, hit@10 44, found 49), latency unmeasured
+  because every unscoped probe timed out on a cold HNSW cache — and the row says so, rather
+  than reporting zero.
 - **C9 — one obvious way to do a thing, on both surfaces.** There is exactly one hybrid
   search, one SQL entry point per surface, one schema-discovery call. *Held up by*
   `tool.Surface` splitting MCP-only and CLI-only tools, the `runCall` fence that refuses

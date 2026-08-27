@@ -89,3 +89,18 @@ def test_benchmark_view_judges_latency_and_staleness(warehouse: PostgresWarehous
     assert warehouse._query_dicts("SELECT status FROM @marts_search_benchmark")[0]["status"] == "ok"
     warehouse._command("UPDATE @search_benchmark_runs SET collected_at = %s", (now - timedelta(days=12),))
     assert warehouse._query_dicts("SELECT status FROM @marts_search_benchmark")[0]["status"] == "unknown"
+
+
+def test_runner_says_when_every_latency_probe_failed(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_pipeline_health_tables()
+
+    class FailingClient:
+        def search(self, query, *, mode, max_results, sources=(), since=""):
+            raise RuntimeError("statement timeout")
+
+    result = SearchBenchmarkRunner(warehouse=warehouse, client=FailingClient(), probe_queries=("a", "b")).run()
+    assert result.probe_queries == 0 and result.errors == 2
+    assert "latency probes failed" in result.note
+    row = warehouse._query_dicts("SELECT status, note FROM @marts_search_benchmark")[0]
+    assert row["status"] == "no_data"
+    assert "unmeasured" in row["note"]
