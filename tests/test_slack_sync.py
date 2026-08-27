@@ -2704,3 +2704,101 @@ def test_only_the_freshness_stage_gets_the_freshness_lock():
         "the freshness lock id should be defined once and used by exactly one "
         "stage; another stage adopting it would un-serialize the sweeps"
     )
+
+
+def _thread_backfill_runner(settings, warehouse, client, now):
+    from personal_data_warehouse.slack_sync import SlackSyncRunner
+
+    return SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: now,
+        sync_thread_replies_only=True,
+        skip_completed_threads=True,
+        skip_known_errors=True,
+        thread_limit=100,
+        thread_missing_replies_only=True,
+        sleep=lambda seconds: None,
+    )
+
+
+def test_drained_thread_backfill_walk_is_remembered_and_bounded_until_cooldown(monkeypatch):
+    """The unbounded missing-replies walk reads every thread parent in the
+    workspace. Once it comes up empty it must not run again every five
+    minutes; only the recent window is checked until the cooldown elapses."""
+
+    from personal_data_warehouse.slack_sync import (
+        THREAD_BACKFILL_DRAINED_COOLDOWN,
+        THREAD_BACKFILL_RECENT_WINDOW,
+        THREAD_BACKFILL_WALK_ID,
+        THREAD_BACKFILL_WALK_TYPE,
+    )
+
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}] * 3,
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}] * 3,
+        }
+    )
+    now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+
+    # First walk: unbounded, finds nothing -> the drained marker is written.
+    warehouse = FakeWarehouse()
+    _thread_backfill_runner(settings, warehouse, client, now).sync_all()
+    assert warehouse.thread_ref_calls[0]["since_ts"] is None
+    marker = [
+        u for u in warehouse.state_updates
+        if u["object_type"] == THREAD_BACKFILL_WALK_TYPE and u["object_id"] == THREAD_BACKFILL_WALK_ID
+    ]
+    assert len(marker) == 1 and marker[0]["status"] == "ok"
+
+    # Inside the cooldown: only the recent window is walked, no new marker.
+    warehouse = FakeWarehouse(
+        states={("zrl", "T1", THREAD_BACKFILL_WALK_TYPE, THREAD_BACKFILL_WALK_ID): {
+            "status": "ok", "updated_at": now,
+        }}
+    )
+    later = now + timedelta(hours=1)
+    _thread_backfill_runner(settings, warehouse, client, later).sync_all()
+    expected_since = later.timestamp() - THREAD_BACKFILL_RECENT_WINDOW.total_seconds()
+    assert warehouse.thread_ref_calls[0]["since_ts"] == expected_since
+    assert not [u for u in warehouse.state_updates if u["object_type"] == THREAD_BACKFILL_WALK_TYPE]
+
+    # After the cooldown: the full walk runs again.
+    warehouse = FakeWarehouse(
+        states={("zrl", "T1", THREAD_BACKFILL_WALK_TYPE, THREAD_BACKFILL_WALK_ID): {
+            "status": "ok", "updated_at": now,
+        }}
+    )
+    much_later = now + THREAD_BACKFILL_DRAINED_COOLDOWN + timedelta(minutes=1)
+    _thread_backfill_runner(settings, warehouse, client, much_later).sync_all()
+    assert warehouse.thread_ref_calls[0]["since_ts"] is None
+
+
+def test_full_thread_backfill_walk_that_hits_its_limit_is_not_marked_drained(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    from personal_data_warehouse.slack_sync import THREAD_BACKFILL_WALK_TYPE
+
+    warehouse = FakeWarehouse()
+    warehouse.thread_refs = [
+        {"conversation_id": "C1", "thread_ts": f"17139744{i:02d}.000100", "reply_count": 1, "latest_reply_ts": ""}
+        for i in range(100)
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.replies": [
+                {"ok": True, "messages": [], "response_metadata": {}} for _ in range(100)
+            ],
+        }
+    )
+    _thread_backfill_runner(settings, warehouse, client, datetime(2026, 8, 26, tzinfo=UTC)).sync_all()
+    assert not [u for u in warehouse.state_updates if u["object_type"] == THREAD_BACKFILL_WALK_TYPE]

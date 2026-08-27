@@ -274,6 +274,28 @@ def load_cases(path: Path, *, include_not_in_corpus: bool = False) -> list[Bench
     return cases
 
 
+def partition_stale_cases(
+    cases: Sequence[BenchmarkCase], truth_meta: dict[str, Any]
+) -> tuple[list[BenchmarkCase], list[BenchmarkCase]]:
+    """Split cases into (scorable, stale).
+
+    A case whose every ref has left the timeline cannot be answered by any
+    retriever, so scoring it as a miss charges the ranker for a stale label.
+    A case that still has one live ref, or a predicate, stays scorable on what
+    remains. On 2026-08-26 twelve voice-memo labels went stale in one day when
+    that adapter's event ids changed shape, and the aggregate silently read as
+    a 0.15 MRR regression.
+    """
+
+    stale = [
+        c for c in cases
+        if c.truth_refs and not c.truth_predicate
+        and all(r not in truth_meta for r in c.truth_refs)
+    ]
+    live = [c for c in cases if c not in stale]
+    return live, stale
+
+
 def _metrics(ranks: Sequence[int | None], depth: int) -> dict[str, Any]:
     total = len(ranks)
     found = [r for r in ranks if r]
@@ -426,9 +448,17 @@ def capture_environment(*, include_corpus: bool = True) -> dict[str, Any]:
         ).stdout.strip()
     except (subprocess.SubprocessError, OSError):
         env["pdw_version"] = ""
+    # Planner estimates, not count(*): an exact count walks 7M chunk rows and
+    # 6M embedding rows, which took minutes and, under production load, blew
+    # the server's 60s statement budget AFTER a ten-minute scored run -- so
+    # the whole report was lost to its own environment stamp. The estimate is
+    # refreshed by every autovacuum/analyze and is accurate to well under the
+    # "materially different corpus" threshold this stamp exists to flag.
     corpus_sql = (
-        "SELECT (SELECT count(*) FROM derived_search.chunks) AS chunks, "
-        "(SELECT count(*) FROM derived_search.chunk_embeddings) AS embeddings, "
+        "SELECT (SELECT reltuples::bigint FROM pg_class "
+        "WHERE oid = 'derived_search.chunks'::regclass) AS chunks, "
+        "(SELECT reltuples::bigint FROM pg_class "
+        "WHERE oid = 'derived_search.chunk_embeddings'::regclass) AS embeddings, "
         "(SELECT max(seq) FROM timeline.events) AS timeline_max_seq"
     )
     if include_corpus:
@@ -439,7 +469,11 @@ def capture_environment(*, include_corpus: bool = True) -> dict[str, Any]:
                 timeout=600,
             )
             env["corpus"] = rows[0] if isinstance(rows, list) and rows else {}
-        except (subprocess.SubprocessError, OSError, ValueError, KeyError, IndexError) as error:
+        except (subprocess.SubprocessError, OSError, ValueError, KeyError, IndexError,
+                RuntimeError) as error:
+            # RuntimeError is what _pdw_json raises for a failed CLI call. A
+            # stamp that cannot be taken is recorded as such; it must never
+            # discard the scored results it was meant to annotate.
             env["corpus"] = {"error": str(error)[:160]}
     env["captured_at"] = datetime.now(timezone.utc).isoformat()
     return env
@@ -457,6 +491,13 @@ def run_benchmark(
     contamination = contamination or ContaminationFilter()
     truth_meta = resolve_truth_metadata(sorted({r for c in cases for r in c.truth_refs}))
     unresolved = sorted({r for c in cases for r in c.truth_refs} - set(truth_meta))
+    # A case whose every ref has left the timeline cannot be answered by any
+    # retriever, so scoring it as a miss charges the ranker for a stale label.
+    # Set it aside and report it; a case that still has one live ref (or a
+    # predicate) is scored on what remains. On 2026-08-26 twelve voice-memo
+    # labels went stale in one day when that adapter's event ids changed
+    # shape, and the aggregate silently read as a 0.15 MRR regression.
+    cases, stale_cases = partition_stale_cases(cases, truth_meta)
 
     # Identical (query, mode) pairs across cases are executed once.  Searches
     # cost tens of seconds, so the fan-out is what makes this runnable at all.
@@ -531,6 +572,7 @@ def run_benchmark(
             ),
         },
         "unresolved_truth_refs": unresolved,
+        "stale_cases": [c.query for c in stale_cases],
         "wall_seconds": round(wall_seconds, 1),
         "latency_under_concurrency": latency,
         "latency_note": (
@@ -676,6 +718,11 @@ def _print_report(report: dict[str, Any]) -> None:
               f"{len(report['unresolved_truth_refs'])}")
         for ref in report["unresolved_truth_refs"][:5]:
             print(f"    {ref}")
+    if report.get("stale_cases"):
+        print(f"  {len(report['stale_cases'])} case(s) NOT SCORED because every ref is stale; "
+              "relabel them:")
+        for query in report["stale_cases"][:10]:
+            print(f"    {query[:80]}")
     print(f"\n  wall clock {report['wall_seconds']}s for {report['config']['calls']} calls "
           f"across {report['config']['workers']} workers")
     print(f"  latency under concurrency (not single-user): {report['latency_under_concurrency']}")

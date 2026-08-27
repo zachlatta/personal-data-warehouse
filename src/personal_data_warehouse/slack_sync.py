@@ -122,6 +122,30 @@ class SlackWebApiClient:
         return data
 
 
+# Marker row in slack_sync_state recording that the unbounded missing-replies
+# walk last came up (nearly) empty, so the next full walk can wait.
+THREAD_BACKFILL_WALK_TYPE = "thread_backfill_walk"
+THREAD_BACKFILL_WALK_ID = "drained"
+THREAD_BACKFILL_DRAINED_COOLDOWN = timedelta(hours=6)
+# While the full walk is cooling down, still look for gaps among parents this
+# recent: a parent that only just arrived through history sync is the common
+# way a new gap appears, and this window is index-bounded.
+THREAD_BACKFILL_RECENT_WINDOW = timedelta(days=30)
+
+
+def _state_updated_at(state: Mapping[str, Any]) -> datetime | None:
+    value = state.get("updated_at")
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return None
+
+
 class SlackSyncRunner:
     def __init__(
         self,
@@ -874,6 +898,26 @@ class SlackSyncRunner:
         since_ts = None
         if self._thread_since_days is not None:
             since_ts = self._now().timestamp() - self._thread_since_days * 24 * 60 * 60
+        # The unbounded missing-replies walk reads every thread parent in the
+        # workspace (~1.2M rows, ~8 GB of heap and index pages on production)
+        # to find the parents whose replies were never fetched. Once that
+        # backlog is drained the walk returns nothing, and repeating it every
+        # five minutes evicted the search indexes from the page cache for no
+        # work. So a drained walk is remembered, and until the cooldown
+        # elapses only the recent window is checked -- which is where a new
+        # gap appears in practice (a newly synced parent), and which the
+        # message_datetime index answers cheaply.
+        drained_walk_ok = False
+        if self._thread_missing_replies_only and since_ts is None:
+            drained_key = (account.account, team_id, THREAD_BACKFILL_WALK_TYPE, THREAD_BACKFILL_WALK_ID)
+            drained = state_by_key.get(drained_key)
+            drained_at = _state_updated_at(drained) if drained else None
+            if drained_at is not None and (
+                self._now() - drained_at < THREAD_BACKFILL_DRAINED_COOLDOWN
+            ):
+                since_ts = self._now().timestamp() - THREAD_BACKFILL_RECENT_WINDOW.total_seconds()
+            else:
+                drained_walk_ok = True
         thread_refs = self._warehouse.load_slack_thread_parent_refs(
             account=account.account,
             team_id=team_id,
@@ -884,6 +928,24 @@ class SlackSyncRunner:
             order=self._thread_order,
             missing_replies_only=self._thread_missing_replies_only,
         )
+        if drained_walk_ok and (
+            self._thread_limit is None or len(thread_refs) < self._thread_limit
+        ):
+            # Fewer candidates than the limit means the walk saw the end of
+            # the backlog: everything it found is processed below, and the
+            # next full walk can wait out the cooldown.
+            self._warehouse.insert_slack_sync_state(
+                account=account.account,
+                team_id=team_id,
+                object_type=THREAD_BACKFILL_WALK_TYPE,
+                object_id=THREAD_BACKFILL_WALK_ID,
+                cursor_ts="",
+                last_sync_type="thread_backfill_walk",
+                status="ok",
+                error="",
+                updated_at=synced_at,
+                sync_version=sync_version,
+            )
         messages_written = 0
         files_written = 0
         for index, thread_ref in enumerate(thread_refs, start=1):

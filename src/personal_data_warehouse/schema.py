@@ -1991,11 +1991,22 @@ SEARCH_CHUNK_EMBEDDING_COLUMNS = (
     "embedded_at",
 )
 
-# Single-row cursor over timeline.events.seq for the chunk builder.
+# One row per search-index stage. The chunk builder's row ("timeline") is a
+# cursor over timeline.events.seq. The embedding drain's row ("embeddings")
+# carries its two persisted cursors: the built_at watermark behind which every
+# chunk has been offered to the embedder, and the newest-first (event_ts,
+# chunk_id) keyset of the one-time historical backfill. Without persistence
+# the drain restarted at the newest chunk on every run and re-scanned the
+# whole 7 GB chunk heap each time, which evicted the search indexes from the
+# page cache ten minutes after every search warmed them.
 SEARCH_CHUNK_SYNC_STATE_COLUMNS = (
     "id",
     "last_seq",
     "updated_at",
+    "embed_fresh_built_at",
+    "embed_cursor_ts",
+    "embed_cursor_id",
+    "embed_backfill_status",
 )
 
 # One row per search stage.  Unlike generic table freshness this records the

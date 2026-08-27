@@ -357,7 +357,31 @@ SEARCH_HYBRID_RRF_K = 60
 # experiment drowned. Re-measured against the independent 26-label benchmark,
 # 1.5 improved three ranks across all three query strata with zero regressions
 # (MRR 0.429 -> 0.446); 1.7 crossed the safe boundary and regressed two labels.
-SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.5
+SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.0
+# The BM25 head bonus for a query that is NOT sentence-shaped (a term bag or
+# an identifier): its top-ranked lexical hits count double. Re-measured on
+# the 73-case benchmark with the offline fusion lab
+# (scripts/search_fusion_lab.py) on 2026-08-26: four ANN legs each return
+# hundreds of candidates and the old 1.5 semantic weight let semantic ranks
+# 1-16 outvote a correct BM25 #1 on every term bag (keyword alone: hit@1 7/20,
+# hybrid: 2/20). Semantic 1.0 + literal 3.0 + this head bonus took hybrid from
+# MRR 0.339 / hit@1 15 / hit@10 40 to 0.394 / 20 / 44 on 67 scored queries
+# with no loss of found@50 (51 both ways); flat weights (lexical 2, semantic
+# 0.5) scored MRR 0.400 but lost seven found@50, which is why the bonus is a
+# head bonus and not a flat weight. Sentence-shaped queries keep 1.0 lexical
+# throughout: their BM25 head is where the wrong answers live.
+SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT = 2.0
+# The function words the app's sentence detector counts (searchSentenceWords in
+# app/internal/query/search.go); the fuse repeats the test in SQL so the
+# direct-SQL wrapper and the app agree on which queries get the head bonus.
+SEARCH_SENTENCE_WORDS = (
+    "a", "an", "the", "my", "our", "your", "their", "is", "are", "was", "were", "will",
+    "would", "can", "of", "for", "with", "that", "this", "at", "on", "in", "to", "from",
+    "and", "or", "by", "about", "how", "what", "when", "where", "why", "who", "which",
+    "did", "does", "do", "should", "could", "me", "i",
+)
+SEARCH_SENTENCE_WORDS_SQL = ", ".join("'" + w + "'" for w in SEARCH_SENTENCE_WORDS)
+SEARCH_HYBRID_LEXICAL_HEAD_RANKS = 5
 # Filtered ANN recall depends on asking the iterative scan for a deep enough
 # qualifying pool. A 4x pool was adequate at 30 days but became unstable at 90
 # days because the global HNSW index had three times as many filtered-out rows.
@@ -376,7 +400,7 @@ SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.5
 # chunk anchoring regressed one proper-name label. Weight 2 because a literal
 # match on a short query is strong evidence, where a rank-1 BM25 hit on two
 # common words is not.
-SEARCH_HYBRID_EXACT_WEIGHT = 2.0
+SEARCH_HYBRID_EXACT_WEIGHT = 3.0
 SEARCH_HYBRID_EXACT_MAX_WORDS = 3
 # search_text_exact() raises below this needle length, so the leg must not be
 # attempted for a shorter query.
@@ -1498,10 +1522,17 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "search_chunks",
         "CREATE INDEX IF NOT EXISTS search_chunks_anchor_idx ON @search_chunks (anchor)",
     ),
+    # Covering: the semantic leg joins each ANN candidate to its chunk by
+    # content sha and needs only these columns, so the join is index-only and
+    # never visits the 7 GB chunk heap. Measured cold on production
+    # 2026-08-26, that heap probe was ~2.4ms per candidate on top of the ANN
+    # scan itself; with 1,000-2,000 candidates per leg and four legs per
+    # hybrid call it was seconds of random I/O per search.
     IndexSpec(
-        "search_chunks_sha_idx",
+        "search_chunks_sha_cover_idx",
         "search_chunks",
-        "CREATE INDEX IF NOT EXISTS search_chunks_sha_idx ON @search_chunks (text_sha256)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS search_chunks_sha_cover_idx "
+        "ON @search_chunks (text_sha256) INCLUDE (adapter, event_id, chunk_id, event_ts)",
     ),
     IndexSpec(
         "search_chunks_adapter_ts_idx",
@@ -1509,12 +1540,23 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS search_chunks_adapter_ts_idx "
         "ON @search_chunks (adapter, event_ts DESC)",
     ),
-    # Newest-first keyset cursor for the embedding drain (event_ts, chunk_id).
+    # The embedding drain's fresh pass reads only chunks built since its
+    # persisted watermark, so a run over a caught-up corpus touches a few
+    # thousand rows instead of the whole heap.
     IndexSpec(
-        "search_chunks_ts_chunk_idx",
+        "search_chunks_built_at_sha_idx",
         "search_chunks",
-        "CREATE INDEX IF NOT EXISTS search_chunks_ts_chunk_idx "
-        "ON @search_chunks (event_ts DESC, chunk_id DESC)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS search_chunks_built_at_sha_idx "
+        "ON @search_chunks (built_at) INCLUDE (text_sha256, chunk_id)",
+    ),
+    # Newest-first keyset cursor for the embedding drain (event_ts, chunk_id).
+    # Covering for the same reason: the backfill only needs the sha to decide
+    # whether a row still wants a vector, so the walk is an index-only scan.
+    IndexSpec(
+        "search_chunks_ts_chunk_sha_idx",
+        "search_chunks",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS search_chunks_ts_chunk_sha_idx "
+        "ON @search_chunks (event_ts DESC, chunk_id DESC) INCLUDE (text_sha256)",
     ),
     # Hybrid's short-query literal leg needs identifier recall, not the full
     # multi-megabyte timeline document returned by search_text_exact(). Search
@@ -1682,6 +1724,10 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
 # Indexes that used to exist but have been superseded. Dropped idempotently
 # during _ensure_indexes so existing deployments converge with fresh installs.
 POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
+    # Replaced by the covering search_chunks_sha_cover_idx and
+    # search_chunks_ts_chunk_sha_idx (same keys, INCLUDE columns added).
+    ("search_chunks_sha_idx", "search_chunks"),
+    ("search_chunks_ts_chunk_idx", "search_chunks"),
     # Replaced by the full-coverage slack_messages_text_trgm_idx.
     ("slack_messages_text_trgm_live_idx", "slack_messages"),
     # Legacy per-source BM25 indexes from the pre-timeline cross-source search.
@@ -1975,6 +2021,9 @@ def _is_text_column(table: str | None, column: str) -> bool:
 
 TIMESTAMP_COLUMNS = {
     "amcheck_at",
+    # search embedding drain cursors (search_chunk_sync_state)
+    "embed_fresh_built_at",
+    "embed_cursor_ts",
     # timeline: when the coverage reconcile last swept this adapter
     "last_reconcile_at",
     # backups: newest backup of each type, and when WAL last shipped
@@ -4666,6 +4715,15 @@ class PostgresWarehouse:
         self._ensure_table_group(
             ["search_chunks", "search_chunk_embeddings", "search_chunk_sync_state"]
         )
+        # The embedding drain's persisted cursors joined an existing table;
+        # CREATE TABLE IF NOT EXISTS cannot add them to a live deployment.
+        for column in ("embed_fresh_built_at", "embed_cursor_ts", "embed_cursor_id",
+                       "embed_backfill_status"):
+            self._command(
+                "ALTER TABLE @search_chunk_sync_state ADD COLUMN IF NOT EXISTS "
+                f"{_identifier(column)} {_postgres_type(column)} NOT NULL DEFAULT "
+                f"{_default_sql(column)}"
+            )
         if self.pgvector_available():
             if not self._pgvector_ensured:
                 self._command("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
@@ -9781,6 +9839,8 @@ class PostgresWarehouse:
                 str(SEARCH_HYBRID_SEMANTIC_WEIGHT),
                 str(SEARCH_HYBRID_CANDIDATE_MULTIPLIER),
                 str(SEARCH_HYBRID_EXACT_WEIGHT),
+                str(SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT),
+                str(SEARCH_HYBRID_LEXICAL_HEAD_RANKS),
                 str(SEARCH_HYBRID_EXACT_MAX_WORDS),
                 str(SEARCH_HYBRID_MIN_CANDIDATES),
                 str(SEARCH_HYBRID_MAX_CANDIDATES),
@@ -11188,10 +11248,22 @@ class PostgresWarehouse:
                 + str(SEARCH_TEXT_MAX_RESULTS_CAP)
                 + r""");
                 requested_priority text;
+                -- The app's sentence detector, mirrored: five or more words
+                -- of which at least two are function words. A sentence keeps
+                -- flat lexical weight; a term bag or identifier gets the
+                -- BM25 head bonus below.
+                query_words text[] := regexp_split_to_array(lower(btrim(coalesce(query, ''))), '\s+');
+                query_is_sentence boolean;
             BEGIN
                 """
                 + priorities_guard_sql("search_hybrid_fuse")
                 + r"""
+                query_is_sentence := coalesce(array_length(query_words, 1), 0) >= 5 AND (
+                    SELECT count(*) FROM unnest(query_words) AS w(word)
+                    WHERE btrim(w.word, '.,!?;:''"') = ANY (ARRAY["""
+                + SEARCH_SENTENCE_WORDS_SQL
+                + r"""])
+                ) >= 2;
                 RETURN QUERY
                 WITH lex AS (
                     SELECT u.ref, u.ordinality AS rnk
@@ -11223,7 +11295,12 @@ class PostgresWarehouse:
                 merged AS (
                     SELECT COALESCE(l.ref, s.ref, x.ref) AS ref,
                            s.chunk_id,
-                           (COALESCE(1.0 / ("""
+                           (COALESCE(
+                                CASE WHEN NOT query_is_sentence AND l.rnk <= """
+                + str(SEARCH_HYBRID_LEXICAL_HEAD_RANKS)
+                + r""" THEN """
+                + str(SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT)
+                + r""" ELSE 1.0 END / ("""
                 + str(SEARCH_HYBRID_RRF_K)
                 + r""" + l.rnk), 0) + """
                 + str(SEARCH_HYBRID_SEMANTIC_WEIGHT)

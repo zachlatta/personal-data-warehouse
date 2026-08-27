@@ -67,6 +67,18 @@ EMBED_SLAB_SIZE = 5_000
 EMBED_MAX_CHARS = 20_000
 
 _STATE_ID = "timeline"
+_EMBED_STATE_ID = "embeddings"
+_EPOCH = datetime.fromtimestamp(0, tz=UTC)
+# How far behind its own start a fresh-pass watermark is left, so a chunk
+# committed late by a long builder transaction is still offered next run.
+EMBED_FRESH_OVERLAP = timedelta(minutes=15)
+# Index rows the historical backfill may walk per run. It bounds the heap
+# reads a run can cause (~250k rows is well under 1 GB) while still finishing
+# a 7.9M-row corpus in a few hours of ten-minute runs.
+EMBED_BACKFILL_SCAN_ROWS = 250_000
+# Same bound for the fresh pass. Both walks are index-only, so a run's read
+# cost is a few hundred MB of index at most, never the chunk heap.
+EMBED_FRESH_SCAN_ROWS = 500_000
 
 
 def _sha256(text: str) -> str:
@@ -451,6 +463,66 @@ class SearchEmbeddingRunner:
         )
         return bool(rows)
 
+    # -- persisted cursors ---------------------------------------------------
+
+    def _load_state(self) -> dict[str, Any]:
+        rows = self._wh._query(
+            "SELECT embed_fresh_built_at, embed_cursor_ts, embed_cursor_id, embed_backfill_status"
+            " FROM @search_chunk_sync_state WHERE id = %s",
+            (_EMBED_STATE_ID,),
+        )
+        if not rows:
+            return {}
+        fresh_at, cursor_ts, cursor_id, status = rows[0]
+        # Warehouse-wide convention: absence is the epoch, never NULL. A
+        # backfill that has not started yet has no keyset, and the walk
+        # begins from the newest chunk.
+        return {
+            "fresh_built_at": fresh_at,
+            "cursor_ts": None if cursor_ts is None or cursor_ts <= _EPOCH else cursor_ts,
+            "cursor_id": cursor_id or "",
+            "backfill_status": status or "",
+        }
+
+    def _save_state(self, state: dict[str, Any]) -> None:
+        self._wh._command(
+            "INSERT INTO @search_chunk_sync_state"
+            " (id, last_seq, updated_at, embed_fresh_built_at, embed_cursor_ts,"
+            "  embed_cursor_id, embed_backfill_status)"
+            " VALUES (%s, 0, now(), %s, %s, %s, %s)"
+            " ON CONFLICT (id) DO UPDATE SET updated_at = now(),"
+            "  embed_fresh_built_at = EXCLUDED.embed_fresh_built_at,"
+            "  embed_cursor_ts = EXCLUDED.embed_cursor_ts,"
+            "  embed_cursor_id = EXCLUDED.embed_cursor_id,"
+            "  embed_backfill_status = EXCLUDED.embed_backfill_status",
+            (
+                _EMBED_STATE_ID,
+                state["fresh_built_at"],
+                state["cursor_ts"] if state["cursor_ts"] is not None else _EPOCH,
+                state["cursor_id"],
+                state["backfill_status"],
+            ),
+        )
+
+    def _unembedded(self, model: str, shas: list[str]) -> set[str]:
+        """The subset of ``shas`` with no vector yet, by primary-key probe."""
+
+        if not shas:
+            return set()
+        rows = self._wh._query(
+            "SELECT text_sha256 FROM @search_chunk_embeddings"
+            " WHERE model = %s AND text_sha256 = ANY(%s)",
+            (model, shas),
+        )
+        return set(shas) - {row[0] for row in rows}
+
+    def _texts_for(self, chunk_ids: list[str]) -> dict[str, str]:
+        rows = self._wh._query(
+            "SELECT text_sha256, text FROM @search_chunks WHERE chunk_id = ANY(%s)",
+            (chunk_ids,),
+        )
+        return {sha: text for sha, text in rows}
+
     def run(self, *, limit: int = 5000, max_seconds: float | None = None) -> EmbedStats:
         client = self._client or EmbeddingClient.from_env()
         if client is None:
@@ -469,97 +541,217 @@ class SearchEmbeddingRunner:
             )
         deadline = time.monotonic() + max_seconds if max_seconds else None
         stats = EmbedStats()
-        remaining = limit
-        table = self._wh.sql_relation("search_chunk_embeddings")
-        # Newest-first keyset cursor over chunks. Recency-first means the
-        # searchable period grows backwards from today — the year Zach
-        # actually queries completes long before 2014's Slack does. The
-        # keyset (event_ts, chunk_id) pages the anti-join WITHOUT re-scanning
-        # the whole chunk table per batch: the previous per-batch
-        # GROUP-BY-over-everything candidate query collapsed throughput to
-        # ~40k/h once the corpus hit millions of chunks.
-        cursor_ts: datetime | None = None
-        cursor_id = ""
-        while remaining > 0:
-            if cursor_ts is None:
+        budget = _EmbedBudget(remaining=limit, deadline=deadline)
+        run_started = self._wh._query("SELECT now()")[0][0]
+        state = self._load_state()
+        if not state:
+            # First run on this deployment. The fresh pass takes over from a
+            # day ago; everything older is the backfill's job, walked
+            # newest-first from the top exactly once.
+            state = {
+                "fresh_built_at": run_started - timedelta(days=1),
+                "cursor_ts": None,
+                "cursor_id": "",
+                "backfill_status": "",
+            }
+        # Two passes, both resumable and both bounded, so a run over a
+        # caught-up corpus reads a few index pages rather than the 7 GB chunk
+        # heap: newly BUILT chunks first (a rebuilt chunk gets a new
+        # built_at, so re-chunked text is offered again and the sha probe
+        # dedups it), then the one-time historical walk.
+        fresh_done = self._drain_fresh(client, state, stats, budget, run_started)
+        backfill_done = state["backfill_status"] == "done"
+        if fresh_done and not backfill_done and not budget.exhausted():
+            backfill_done = self._drain_backfill(client, state, stats, budget)
+        self._save_state(state)
+        stats.caught_up = fresh_done and backfill_done
+        return stats
+
+    def _drain_fresh(
+        self,
+        client: EmbeddingClient,
+        state: dict[str, Any],
+        stats: EmbedStats,
+        budget: "_EmbedBudget",
+        run_started: datetime,
+    ) -> bool:
+        """Offer every chunk built since the watermark, oldest-built first.
+
+        Returns True when the pass reached the present. The watermark it
+        leaves behind is the last built_at it fully processed, or
+        ``run_started - EMBED_FRESH_OVERLAP`` once it has: built_at is the
+        writer's transaction start, so a chunk committed by a long transaction
+        can carry a built_at older than the newest one already seen, and the
+        overlap re-reads that window on the next run. The sha probe makes the
+        re-read free.
+        """
+
+        floor = state["fresh_built_at"]
+        scanned = 0
+        while True:
+            slab = self._wh._query(
+                "SELECT text_sha256, chunk_id, built_at FROM @search_chunks"
+                " WHERE built_at > %s ORDER BY built_at LIMIT %s",
+                (floor, EMBED_SLAB_SIZE),
+            )
+            if not slab:
+                state["fresh_built_at"] = max(floor, run_started - EMBED_FRESH_OVERLAP)
+                return True
+            scanned += len(slab)
+            if not self._embed_shas(client, [(sha, cid) for sha, cid, _ in slab], stats, budget):
+                # Budget ran out mid-slab; resume from the same floor.
+                return False
+            floor = slab[-1][2]
+            state["fresh_built_at"] = floor
+            if scanned >= EMBED_FRESH_SCAN_ROWS:
+                # A timeline re-walk (an adapter's SQL changed) rebuilds
+                # millions of chunks in a day, nearly all with unchanged text.
+                # Offer them across runs rather than in one unbounded pass.
+                return False
+            if len(slab) < EMBED_SLAB_SIZE:
+                state["fresh_built_at"] = max(floor, run_started - EMBED_FRESH_OVERLAP)
+                return True
+
+    def _drain_backfill(
+        self,
+        client: EmbeddingClient,
+        state: dict[str, Any],
+        stats: EmbedStats,
+        budget: "_EmbedBudget",
+    ) -> bool:
+        """Walk the corpus newest-first ONCE, resuming from the saved keyset.
+
+        Recency-first means the searchable period grows backwards from today:
+        the year Zach actually queries completes long before 2014's Slack
+        does. Each run scans at most EMBED_BACKFILL_SCAN_ROWS rows of the
+        (event_ts, chunk_id) index so the walk is amortized across runs
+        instead of restarting from the newest chunk every ten minutes.
+        Returns True when the walk has reached the oldest chunk.
+        """
+
+        scanned = 0
+        state["backfill_status"] = state["backfill_status"] or "running"
+        while scanned < EMBED_BACKFILL_SCAN_ROWS:
+            if state["cursor_ts"] is None:
                 slab = self._wh._query(
-                    """
-                    SELECT c.text_sha256, c.text, c.event_ts, c.chunk_id
-                    FROM @search_chunks c
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM @search_chunk_embeddings e
-                        WHERE e.text_sha256 = c.text_sha256 AND e.model = %s
-                    )
-                    ORDER BY c.event_ts DESC, c.chunk_id DESC
-                    LIMIT %s
-                    """,
-                    (client.model, EMBED_SLAB_SIZE),
+                    "SELECT text_sha256, chunk_id, event_ts FROM @search_chunks"
+                    " ORDER BY event_ts DESC, chunk_id DESC LIMIT %s",
+                    (EMBED_SLAB_SIZE,),
                 )
             else:
                 slab = self._wh._query(
-                    """
-                    SELECT c.text_sha256, c.text, c.event_ts, c.chunk_id
-                    FROM @search_chunks c
-                    WHERE (c.event_ts, c.chunk_id) < (%s, %s)
-                      AND NOT EXISTS (
-                        SELECT 1 FROM @search_chunk_embeddings e
-                        WHERE e.text_sha256 = c.text_sha256 AND e.model = %s
-                    )
-                    ORDER BY c.event_ts DESC, c.chunk_id DESC
-                    LIMIT %s
-                    """,
-                    (cursor_ts, cursor_id, client.model, EMBED_SLAB_SIZE),
+                    "SELECT text_sha256, chunk_id, event_ts FROM @search_chunks"
+                    " WHERE (event_ts, chunk_id) < (%s, %s)"
+                    " ORDER BY event_ts DESC, chunk_id DESC LIMIT %s",
+                    (state["cursor_ts"], state["cursor_id"], EMBED_SLAB_SIZE),
                 )
             if not slab:
-                stats.caught_up = True
-                break
-            cursor_ts, cursor_id = slab[-1][2], slab[-1][3]
-            # Dedupe by content sha within the slab (identical text repeats
-            # across windows); the anti-join handles cross-slab repeats.
-            seen: dict[str, str] = {}
-            for sha, text, _ts, _cid in slab:
-                if sha not in seen:
-                    seen[sha] = text
-            pending = list(seen.items())[: max(remaining, 0)]
-            if not pending:
-                continue
-            batches = [
-                pending[i : i + EMBED_BATCH_SIZE]
-                for i in range(0, len(pending), EMBED_BATCH_SIZE)
-            ]
-            # Two requests in flight keeps the GPU busy while the previous
-            # batch's rows insert; more would only queue inside TEI.
-            from concurrent.futures import ThreadPoolExecutor
+                state["backfill_status"] = "done"
+                return True
+            scanned += len(slab)
+            if not self._embed_shas(client, [(sha, cid) for sha, cid, _ in slab], stats, budget):
+                return False
+            state["cursor_ts"], state["cursor_id"] = slab[-1][2], slab[-1][1]
+            if len(slab) < EMBED_SLAB_SIZE:
+                state["backfill_status"] = "done"
+                return True
+        return False
 
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                futures = [
-                    pool.submit(client.embed, [text for _, text in batch])
-                    for batch in batches
-                ]
-                for batch, future in zip(batches, futures, strict=True):
-                    vectors = future.result()
-                    with self._wh._connection.cursor() as db_cursor:
-                        execute_values(
-                            db_cursor,
-                            f"INSERT INTO {table} (text_sha256, model, token_count, embedded_at, embedding)"
-                            " VALUES %s ON CONFLICT (text_sha256, model) DO UPDATE SET"
-                            " token_count = EXCLUDED.token_count, embedded_at = now(),"
-                            " embedding = EXCLUDED.embedding",
-                            [
-                                (sha, client.model, max(1, len(text) // 4), vector_literal(vector))
-                                for (sha, text), vector in zip(batch, vectors, strict=True)
-                            ],
-                            template=(
-                                "(%s, %s, %s, now(), %s::public.halfvec("
-                                + str(SEARCH_EMBEDDING_DIMENSIONS)
-                                + "))"
-                            ),
-                            page_size=200,
-                        )
-                    stats.embedded += len(batch)
-                    remaining -= len(batch)
-                    if deadline is not None and time.monotonic() >= deadline:
-                        for pending_future in futures:
-                            pending_future.cancel()
-                        return stats
-        return stats
+    def _embed_shas(
+        self,
+        client: EmbeddingClient,
+        candidates: list[tuple[str, str]],
+        stats: EmbedStats,
+        budget: "_EmbedBudget",
+    ) -> bool:
+        """Embed the un-embedded shas among ``candidates``.
+
+        Returns False when the run budget stopped it before the slab was
+        fully processed, so the caller leaves its cursor where it was.
+        """
+
+        by_sha: dict[str, str] = {}
+        for sha, chunk_id in candidates:
+            by_sha.setdefault(sha, chunk_id)
+        missing = self._unembedded(client.model, list(by_sha))
+        if not missing:
+            return True
+        if budget.exhausted():
+            return False
+        pending_ids = [by_sha[sha] for sha in by_sha if sha in missing]
+        texts = self._texts_for(pending_ids)
+        pending = [(sha, texts[sha]) for sha in by_sha if sha in missing and sha in texts]
+        if len(pending) > budget.remaining:
+            # More than the run may spend: do what fits and report a partial
+            # slab so the cursor is not advanced past unembedded rows.
+            pending = pending[: budget.remaining]
+            partial = True
+        else:
+            partial = False
+        self._embed_batches(client, pending, stats, budget)
+        return not partial and not budget.exhausted_by_deadline
+
+    def _embed_batches(
+        self,
+        client: EmbeddingClient,
+        pending: list[tuple[str, str]],
+        stats: EmbedStats,
+        budget: "_EmbedBudget",
+    ) -> None:
+        table = self._wh.sql_relation("search_chunk_embeddings")
+        batches = [
+            pending[i : i + EMBED_BATCH_SIZE]
+            for i in range(0, len(pending), EMBED_BATCH_SIZE)
+        ]
+        # Two requests in flight keeps the GPU busy while the previous
+        # batch's rows insert; more would only queue inside TEI.
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(client.embed, [text for _, text in batch])
+                for batch in batches
+            ]
+            for batch, future in zip(batches, futures, strict=True):
+                if budget.exhausted_by_deadline:
+                    future.cancel()
+                    continue
+                vectors = future.result()
+                with self._wh._connection.cursor() as db_cursor:
+                    execute_values(
+                        db_cursor,
+                        f"INSERT INTO {table} (text_sha256, model, token_count, embedded_at, embedding)"
+                        " VALUES %s ON CONFLICT (text_sha256, model) DO UPDATE SET"
+                        " token_count = EXCLUDED.token_count, embedded_at = now(),"
+                        " embedding = EXCLUDED.embedding",
+                        [
+                            (sha, client.model, max(1, len(text) // 4), vector_literal(vector))
+                            for (sha, text), vector in zip(batch, vectors, strict=True)
+                        ],
+                        template=(
+                            "(%s, %s, %s, now(), %s::public.halfvec("
+                            + str(SEARCH_EMBEDDING_DIMENSIONS)
+                            + "))"
+                        ),
+                        page_size=200,
+                    )
+                stats.embedded += len(batch)
+                budget.remaining -= len(batch)
+                budget.check_deadline()
+
+
+@dataclass
+class _EmbedBudget:
+    """What one drain run may still spend: rows, and wall-clock."""
+
+    remaining: int
+    deadline: float | None
+    exhausted_by_deadline: bool = False
+
+    def check_deadline(self) -> None:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            self.exhausted_by_deadline = True
+
+    def exhausted(self) -> bool:
+        self.check_deadline()
+        return self.remaining <= 0 or self.exhausted_by_deadline

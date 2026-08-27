@@ -982,6 +982,13 @@ def test_backfill_normalizes_every_source(warehouse):
     # outside the search preview.
     assert "done" not in session["search_text"]
 
+    drive = next(r for r in rows if r["adapter"] == "drive_file")
+    # The file id is searchable: an agent holding a Drive id (from a URL or
+    # an email) must be able to reach the file itself, not only the mail
+    # that mentions it.
+    assert "f1" in drive["search_text"].split()
+    assert "Design doc" in drive["search_text"]
+
     turns = [r for r in rows if r["adapter"] == "agent_session_turn"]
     assert len(turns) == 2
     assert {t["kind"] for t in turns} == {"agent_turn"}

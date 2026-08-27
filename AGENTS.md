@@ -406,6 +406,34 @@ the discarded rows cannot help there, because a scoped single-source search disc
 nothing: the 50 rows it scores are the 50 it returns. Lowering the depth or scoping by
 `since` is the lever an agent has today.
 
+**Fusion weights are conditional on query shape, and they were measured offline.**
+`scripts/search_fusion_lab.py collect` gathers each hybrid leg's raw evidence once per
+labeled query (the same SQL helpers the app calls, the same four query embeddings) and
+`score` re-fuses it under a weight grid in seconds, so a fusion change is measured before
+it is written into `search_hybrid_fuse`. Measured 2026-08-26 on 67 scored queries: four
+ANN legs return hundreds of candidates each, and at the old 1.5 semantic weight semantic
+ranks 1-16 outvoted a correct BM25 #1 on every term bag (keyword alone hit@1 7/20, hybrid
+2/20). Now semantic weight 1.0, literal 3.0, and for a query that is NOT sentence-shaped
+(the app's own function-word test, repeated in SQL) the BM25 head, ranks 1-5, counts
+double: MRR 0.339 -> 0.394, hit@1 15 -> 20, hit@10 40 -> 44, found@50 unchanged at 51.
+Flat lexical 2.0 / semantic 0.5 scored MRR 0.400 but lost seven found@50 -- a head
+bonus, not a flat weight, is what keeps semantic recall. Re-run the lab before touching
+`SEARCH_HYBRID_*_WEIGHT`.
+
+**A Drive file id finds the file itself.** The `drive_file` search document carries
+`file_id` (since 2026-08-26), because an agent holding an id from a URL or an email
+searched for it verbatim and got only the emails that mentioned the file -- the id had
+lived solely in `event_id`/`source_pk`, which no search reads.
+
+**The label file rots with the adapters, and the harness now says so instead of scoring
+it.** On 2026-08-26 the voice-memo adapter's event ids changed shape (`apple_voice_memos|`
+prefix, from the mart rewrite) and twelve labels went stale in one day; scored as misses
+they read as a 0.15 MRR regression. `search_benchmark run` now sets aside a case whose every
+ref has left the timeline and lists it under "NOT SCORED"; refs are still stamped as
+`adapter:event_id`, so re-resolve them after any adapter id change. The benchmark set is
+73 cases as of 2026-08-26, 28 of them the exact queries live agents issued that week
+(`origin: live-agent-2026-08-26`), kept off-repo at `~/.config/pdw/search-eval/`.
+
 **Phrase a search as the words the answering record would contain, not as the question.**
 Sentence-shaped queries score MRR 0.27 on the labeled benchmark where term-bag queries score
 0.53, and rewording the nine questions that returned nothing useful — "how long our money
@@ -543,6 +571,41 @@ you what you want to hear), and through the two-statement shape the function rea
 six parallel workers and its cost is the 7 GB trigram index plus the ILIKE recheck's heap
 I/O. It is not comparable to hybrid's `search_hybrid_exact` leg (0.32s) either — that leg
 searches the bounded `derived_search.chunks` documents, not multi-megabyte timeline ones.
+
+**The search working set does not fit in RAM, so what evicts it decides the latency.**
+Measured 2026-08-26 on `mew-coolify` (28 vCPU, 26 GB, `shared_buffers` 10 GB): the
+HNSW index is 8.5 GB, the global BM25 index 10.7 GB, the chunk heap 7.4 GB, the chunk
+embeddings 8.6 GB. `fincore` on the data files found the HNSW index **2% resident** in the
+page cache and the BM25 index 34%, and `pg_stat_statements` put the semantic leg at
+**93% I/O wait** (2.5s of a 2.7s mean, ~12,400 blocks read per call). The same leg is
+100ms when its pages are cached: a broad ANN scan `EXPLAIN (ANALYZE, BUFFERS)`'d cold at
+17.3s (14,125 reads) and 0.1s warm on the very next run, and the BM25 pool scan 6.1s
+cold / 0.15s warm. Nothing about the queries was wrong; the pages were simply gone every
+time. `/proc/pressure/io` read `full avg10=32%` -- the disk was the saturated resource,
+not the CPU -- and three jobs were the reason:
+
+| job | reads per run | cadence | what it was doing |
+| --- | --- | --- | --- |
+| `search_chunk_embeddings` drain | 8.2 GB + 6.7 GB per slab | every 10 min | anti-joined the whole 7.9M-row chunk heap against the embeddings from the newest chunk down, **every run**, because its keyset cursor was a local variable |
+| Slack thread backfill (`missing_replies_only`) | 8.0 GB | every ~5 min | walked all 1.2M thread parents to find the ones with no fetched replies -- and found **zero**, the backlog having drained weeks earlier |
+| a leaked `pdw_test_*` schema probe | 28 GB | ~17 min, for a day | a test run pointed at the production URL left a full `base_slack` copy behind, and the freshness collector kept `max()`-ing it |
+
+Together that was on the order of 150 GB of reads an hour against a 12 GB page cache.
+The fixes are structural, not tuning: the drain now keeps **two persisted cursors** in
+`ops.search_chunk_sync_state` (row `embeddings`) -- a `built_at` watermark for freshly
+built chunks and a resumable newest-first keyset for the one-time historical walk -- and
+both walks are index-only over `search_chunks_built_at_sha_idx` /
+`search_chunks_ts_chunk_sha_idx`, bounded to 500k / 250k index rows per run. The thread
+backfill remembers a drained walk (`ops.slack_sync_state` row
+`thread_backfill_walk/drained`) and checks only the last 30 days, index-bounded, for six
+hours before walking everything again. The semantic leg's chunk join reads
+`search_chunks_sha_cover_idx` and never touches the chunk heap. **Before optimizing a
+search query on this host, run `fincore` on its index files and read
+`shared_blk_read_time / total_exec_time` for its statement in `pg_stat_statements`**; a
+leg that is 90% I/O wait needs its pages kept, not a better plan. The A/B that says so:
+`hnsw.ef_search` 1000 -> 300 at the same 1,000-candidate pool kept a 9.2/10 top-10
+overlap and changed warm latency by 4ms, so shrinking the scan buys almost nothing once
+the index is resident.
 
 **Large rewrites are their own budget.** The `timeline.events` priority column change from
 `bigint` to the enum failed twice before it worked: the table is 43M rows and the rewrite

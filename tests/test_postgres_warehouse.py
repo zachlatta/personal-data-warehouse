@@ -1700,8 +1700,11 @@ def _search_text_function_sql() -> str:
 
 def test_search_hybrid_gives_semantic_rank_a_measured_bounded_boost() -> None:
     sql = _search_text_function_sql()
+    import personal_data_warehouse.postgres as postgres_module
 
-    assert "1.5 * COALESCE(1.0 / (60 + s.rnk), 0)" in sql
+    assert (
+        f"{postgres_module.SEARCH_HYBRID_SEMANTIC_WEIGHT} * COALESCE(1.0 / (60 + s.rnk), 0)"
+    ) in sql
 
 
 def test_search_hybrid_is_composed_from_independently_callable_legs() -> None:
@@ -5405,6 +5408,23 @@ def test_search_hybrid_weights_the_literal_leg_above_the_others() -> None:
     import personal_data_warehouse.postgres as postgres_module
 
     assert f"{postgres_module.SEARCH_HYBRID_EXACT_WEIGHT} * COALESCE(1.0 / (" in sql
+
+
+def test_search_hybrid_gives_a_term_bag_query_a_bm25_head_bonus_but_not_a_sentence() -> None:
+    # Four ANN legs return hundreds of candidates each, so at a flat weight
+    # semantic ranks 1-16 outvote a correct BM25 #1 on a term bag. The head
+    # bonus is conditional on the query NOT reading like a sentence, using the
+    # same function-word test the app's hint uses.
+    sql = _search_text_function_sql()
+    import personal_data_warehouse.postgres as postgres_module
+
+    assert (
+        f"CASE WHEN NOT query_is_sentence AND l.rnk <= "
+        f"{postgres_module.SEARCH_HYBRID_LEXICAL_HEAD_RANKS} THEN "
+        f"{postgres_module.SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT} ELSE 1.0 END"
+    ) in sql
+    assert "query_is_sentence := coalesce(array_length(query_words, 1), 0) >= 5" in sql
+    assert postgres_module.SEARCH_HYBRID_SEMANTIC_WEIGHT <= 1.0
 
 
 def test_search_hybrid_literal_leg_failure_does_not_take_down_the_search() -> None:

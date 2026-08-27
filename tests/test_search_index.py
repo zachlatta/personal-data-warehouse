@@ -352,3 +352,99 @@ def test_search_hybrid_fuses_semantic_and_keyword_ranks(warehouse: PostgresWareh
 
     with pytest.raises(Exception, match="query_embedding is required"):
         warehouse._query("SELECT * FROM @search_hybrid('x', '')")
+
+
+def _embed_state(wh: PostgresWarehouse) -> tuple:
+    rows = wh._query(
+        "SELECT embed_fresh_built_at, embed_cursor_ts, embed_cursor_id, embed_backfill_status"
+        " FROM @search_chunk_sync_state WHERE id = 'embeddings'"
+    )
+    return rows[0] if rows else None
+
+
+def test_embedding_runner_persists_its_cursors_and_reads_only_new_chunks(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A run over a caught-up corpus must not restart the walk from the top.
+
+    The drain used to re-scan the whole chunk heap on every run because its
+    keyset cursor lived in a local variable; the state row is what makes the
+    second run cheap. Observable contract: after the first run the row
+    exists with the backfill marked done; a chunk built afterwards is
+    embedded by the next run; a run with nothing new makes no embedding
+    calls and stays caught up.
+    """
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["alpha bravo charlie", "delta echo foxtrot"])
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+
+    client = _FakeEmbeddingClient()
+    stats = SearchEmbeddingRunner(warehouse, client).run()
+    assert stats.embedded > 0 and stats.caught_up
+    fresh_at, cursor_ts, cursor_id, status = _embed_state(warehouse)
+    assert status == "done"
+    assert fresh_at.year >= 2026
+
+    # New chunk after the watermark: only it is embedded next run.
+    _seed_slack(warehouse, ["golf hotel india"], start_minute=120)
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    calls_before = client.calls
+    stats2 = SearchEmbeddingRunner(warehouse, client).run()
+    assert stats2.embedded == 1 and stats2.caught_up
+    assert client.calls == calls_before + 1
+    assert _embed_state(warehouse)[3] == "done"
+
+    # Nothing new: no embedding request at all.
+    calls_before = client.calls
+    stats3 = SearchEmbeddingRunner(warehouse, client).run()
+    assert stats3.embedded == 0 and stats3.caught_up
+    assert client.calls == calls_before
+
+
+def test_embedding_runner_resumes_a_bounded_backfill_across_runs(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A run that stops at its limit leaves a cursor the next run continues from."""
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    warehouse._set_search_path()
+    # One chat window per hour, so four texts two hours apart are four
+    # distinct chunks rather than one window holding all of them.
+    for i in range(4):
+        _seed_slack(warehouse, [f"token{i} unique text number {i}"], start_minute=120 * i)
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    # Age every chunk out of the fresh window so the backfill has to do it.
+    warehouse._command(
+        "UPDATE @search_chunks SET built_at = now() - interval '3 days'"
+    )
+    client = _FakeEmbeddingClient()
+    runner = SearchEmbeddingRunner(warehouse, client)
+    total = warehouse._query("SELECT count(DISTINCT text_sha256) FROM @search_chunks")[0][0]
+    assert total >= 2
+
+    first = runner.run(limit=1)
+    assert first.embedded == 1 and not first.caught_up
+    assert _embed_state(warehouse)[3] == "running"
+
+    embedded = first.embedded
+    for _ in range(total + 2):
+        stats = runner.run(limit=1)
+        embedded += stats.embedded
+        if stats.caught_up:
+            break
+    assert stats.caught_up
+    assert embedded == total
+    assert _embed_state(warehouse)[3] == "done"
+    rows = warehouse._query(
+        "SELECT count(*) FROM @search_chunk_embeddings WHERE model = 'fake-model'"
+    )
+    assert rows[0][0] == total

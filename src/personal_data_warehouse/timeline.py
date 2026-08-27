@@ -1547,7 +1547,14 @@ _DRIVE_FILE = _simple_adapter(
         "'trashed', t.trashed <> 0, "
         "'excluded', t.is_excluded <> 0)"
     ),
-    search_text=_search_concat("t.name", "t.folder_path", "t.last_modifying_user", "txt.extracted_search_text"),
+    # The file id is in the document on purpose: an agent that holds a Drive
+    # id (from a URL, an email, a prior session) searches for it verbatim, and
+    # before 2026-08-26 the file itself was the one row that could NOT match --
+    # the id lived only in event_id/source_pk, so exact and hybrid returned the
+    # emails that mention the file and never the file.
+    search_text=_search_concat(
+        "t.name", "t.file_id", "t.folder_path", "t.last_modifying_user", "txt.extracted_search_text"
+    ),
     # My own files edited by me are my actions; my files edited by someone
     # else, and files I starred, keep me in the loop (cc); everything else
     # changing in Drive is other people's work that does not concern me,

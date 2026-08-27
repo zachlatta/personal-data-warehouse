@@ -22,6 +22,7 @@ from personal_data_warehouse.search_benchmark import (
     load_cases,
     matches_predicate,
     parse_search_payload,
+    partition_stale_cases,
     summarize,
     trim_to_json,
 )
@@ -411,3 +412,31 @@ def test_run_search_uses_first_class_cli_with_structured_flags(monkeypatch) -> N
     ]
     assert seen["kwargs"]["timeout"] == 420.0
     assert result.rows[0].ref == "slack_message:abc"
+
+
+class TestPartitionStaleCases:
+    def _case(self, query, refs=(), predicate=None):
+        return BenchmarkCase(
+            query=query, stratum="x", verdict="FOUND", truth_refs=tuple(refs),
+            truth_predicate=predicate, ambiguous=False, note="",
+        )
+
+    def test_case_with_no_live_ref_is_set_aside_not_scored(self):
+        live = {"a:1": ("gmail", "", None)}
+        scorable, stale = partition_stale_cases(
+            [self._case("q1", ["a:1"]), self._case("q2", ["gone:1", "gone:2"])], live
+        )
+        assert [c.query for c in scorable] == ["q1"]
+        assert [c.query for c in stale] == ["q2"]
+
+    def test_case_with_one_live_ref_stays_scorable(self):
+        scorable, stale = partition_stale_cases(
+            [self._case("q", ["gone:1", "a:1"])], {"a:1": ("gmail", "", None)}
+        )
+        assert [c.query for c in scorable] == ["q"] and stale == []
+
+    def test_predicate_case_is_never_stale(self):
+        scorable, stale = partition_stale_cases(
+            [self._case("q", ["gone:1"], predicate={"sources": ["gmail"]})], {}
+        )
+        assert [c.query for c in scorable] == ["q"] and stale == []

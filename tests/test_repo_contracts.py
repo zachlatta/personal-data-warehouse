@@ -648,3 +648,18 @@ def test_attachment_enrichment_sources_declare_their_input_layer() -> None:
         "an attachment enrichment source scans a raw table with no recorded reason: "
         f"{offenders}"
     )
+
+
+def test_sql_sentence_detector_uses_the_same_function_words_as_the_app() -> None:
+    """search_hybrid_fuse decides the BM25 head bonus with the app's sentence
+    test; the two word lists must not drift or the SQL wrapper and the tool
+    would fuse the same query differently."""
+
+    import re
+
+    import personal_data_warehouse.postgres as postgres_module
+
+    go = (REPO_ROOT / "app" / "internal" / "query" / "search.go").read_text(encoding="utf-8")
+    block = go.split("var searchSentenceWords = map[string]bool{", 1)[1].split("}", 1)[0]
+    go_words = set(re.findall(r'"([a-z]+)": true', block))
+    assert go_words == set(postgres_module.SEARCH_SENTENCE_WORDS)
