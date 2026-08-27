@@ -303,3 +303,22 @@ def test_an_interrupted_restore_can_be_resumed_in_place() -> None:
     )
     # The guard must not be bypassable by accident: an unset variable refuses.
     assert 'bool_enabled "${PDW_PGBACKREST_RESTORE_RESUME:-}"' in restore
+
+
+def test_archiving_freshness_is_judged_against_the_snapshot_not_now() -> None:
+    """`last_archived_at` is a fact captured when the loop reported.
+
+    The loop reports every six hours, so comparing that field against now()
+    guarantees it ages past any threshold shorter than the reporting interval.
+    Observed 2026-08-27: the view read `attention` with archiving perfectly
+    healthy -- WAL had shipped one second before the snapshot was taken, and the
+    snapshot was 70 minutes old.
+
+    Whether the snapshot is too old to be believed at all is a different
+    question, and the staleness rule above already answers it.
+    """
+
+    postgres = (REPO_ROOT / "src/personal_data_warehouse/postgres.py").read_text()
+
+    assert "last_archived_at < collected_at - interval '1 hour'" in postgres
+    assert "last_archived_at < now() - interval '1 hour'" not in postgres

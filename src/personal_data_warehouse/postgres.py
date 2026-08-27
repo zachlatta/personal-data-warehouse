@@ -4493,9 +4493,18 @@ class PostgresWarehouse:
                     WHEN wal_ready_count >= {WAL_READY_FAILING} THEN 'failing'
                     WHEN wal_ready_count >= {WAL_READY_ATTENTION} THEN 'attention'
                     -- WAL archiving broken: the backup is a floor, not a
-                    -- recovery point, until shipping resumes.
+                    -- recovery point, until shipping resumes. Judged against
+                    -- collected_at, NOT now(): last_archived_at is a fact
+                    -- captured when the loop reported, and the loop reports
+                    -- every six hours, so measuring it against now() means the
+                    -- row necessarily ages past any threshold shorter than the
+                    -- reporting interval and the view sits at 'attention'
+                    -- forever. Observed 2026-08-27 with archiving perfectly
+                    -- healthy -- WAL had shipped one second before collection.
+                    -- Whether the snapshot is too old to believe at all is a
+                    -- separate question, already answered above.
                     WHEN last_archived_at IS NULL
-                      OR last_archived_at < now() - interval '1 hour' THEN 'attention'
+                      OR last_archived_at < collected_at - interval '1 hour' THEN 'attention'
                     WHEN last_full_at < now() - interval '14 days' THEN 'stale'
                     WHEN last_full_at < now() - interval '8 days' THEN 'late'
                     -- The loop is failing while an older good backup still
