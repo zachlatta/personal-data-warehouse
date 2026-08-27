@@ -5,6 +5,7 @@ import { useEffect } from 'react';
 import { useColorScheme } from 'react-native';
 
 import { routeFromNotification } from '@/lib/push';
+import { applyUpdateNow } from '@/lib/updates';
 import { SessionProvider, useSession } from '@/lib/session';
 
 SplashScreen.preventAutoHideAsync();
@@ -16,6 +17,11 @@ function Root() {
   useEffect(() => {
     if (ready) SplashScreen.hideAsync();
   }, [ready]);
+
+  // Apply a newer OTA bundle on this launch rather than the next one.
+  useEffect(() => {
+    void applyUpdateNow(() => {});
+  }, []);
 
   // Notification taps: the one that launched the app, and any while running.
   useEffect(() => {

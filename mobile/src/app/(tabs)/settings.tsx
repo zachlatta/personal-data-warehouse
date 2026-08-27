@@ -8,6 +8,7 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { sendTestPush } from '@/lib/api';
 import { useConfig, useSession } from '@/lib/session';
+import { applyUpdateNow, describeInstalledUpdate, type UpdateState } from '@/lib/updates';
 
 function describePush(push: ReturnType<typeof useSession>['push']): string {
   if (!push) return 'Registering…';
@@ -28,6 +29,7 @@ export default function SettingsScreen() {
   const config = useConfig();
   const { push, refreshPush, signOut } = useSession();
   const [testing, setTesting] = useState(false);
+  const [update, setUpdate] = useState<UpdateState | null>(null);
   const [testResult, setTestResult] = useState<string | null>(null);
 
   const test = async () => {
@@ -90,6 +92,19 @@ export default function SettingsScreen() {
           <ThemedText type="small">
             PDW {Constants.expoConfig?.version ?? ''} · EAS project {(Constants.expoConfig?.extra?.eas?.projectId as string | undefined) ?? 'none'}
           </ThemedText>
+          <ThemedText type="small" themeColor="textSecondary" selectable>
+            {describeInstalledUpdate()}
+          </ThemedText>
+          <View style={styles.rowButtons}>
+            <Pressable onPress={() => void applyUpdateNow(setUpdate)} disabled={update?.state === 'checking' || update?.state === 'downloading'} style={styles.secondary}>
+              <ThemedText type="smallBold">Check for update</ThemedText>
+            </Pressable>
+          </View>
+          {update ? (
+            <ThemedText type="small" themeColor="textSecondary">
+              {update.state === 'current' ? 'Up to date.' : update.state === 'error' ? `Update error: ${update.message}` : update.state === 'disabled' ? 'Updates are disabled in this build.' : `${update.state}…`}
+            </ThemedText>
+          ) : null}
         </View>
         <Pressable onPress={confirmSignOut} style={styles.danger}>
           <ThemedText style={styles.dangerText}>Disconnect</ThemedText>
