@@ -4921,6 +4921,18 @@ class PostgresWarehouse:
         for name in self.bm25_timeline_index_names():
             if not self._index_exists(name):
                 continue
+            # A partial index is only usable when the query implies its
+            # predicate; without it the planner picks the global index and
+            # to_bm25query RAISES ("query specifies index X but planner chose
+            # Y") -- a false "failing" that says nothing about the pages.
+            predicate = self._query(
+                "SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE c.relname = %s AND n.nspname = %s",
+                (name, self._object_schema("timeline_events")),
+            )
+            where = f"WHERE {predicate[0][0]} " if predicate and predicate[0][0] else ""
             try:
                 # Several common words rather than one: a bad page is only
                 # found by a scan that reads it, and each term walks its own
@@ -4928,6 +4940,7 @@ class PostgresWarehouse:
                 # while a query on other terms hit block 704084.
                 self._query(
                     "SELECT 1 FROM @timeline_events t "
+                    + where +
                     "ORDER BY t.search_text OPERATOR(public.<@>) "
                     f"public.to_bm25query({_literal(BM25_PROBE_QUERY)}, {_literal(name)}) LIMIT 50"
                 )
