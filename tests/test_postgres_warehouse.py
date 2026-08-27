@@ -17,11 +17,13 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.slack_sync import SlackApiCallError, SlackSyncRunner
 
 from personal_data_warehouse.schema import (
+    APPLE_MESSAGE_ATTACHMENT_COLUMNS,
+    APPLE_NOTE_ATTACHMENT_COLUMNS,
+    APPLE_NOTE_REVISION_COLUMNS,
+    WHATSAPP_MEDIA_ITEM_COLUMNS,
     ALICE_VOICE_RECORDING_COLUMNS,
     APPLE_MESSAGE_COLUMNS,
-    APPLE_NOTE_ATTACHMENT_COLUMNS,
     APPLE_NOTE_COLUMNS,
-    APPLE_NOTE_REVISION_COLUMNS,
     CALENDAR_EVENT_COLUMNS,
     CONTACT_CARD_COLUMNS,
     SLACK_ACCOUNT_IDENTITY_COLUMNS,
@@ -30,8 +32,7 @@ from personal_data_warehouse.schema import (
     SLACK_MESSAGE_COLUMNS,
     VOICE_MEMO_ENRICHMENT_COLUMNS,
     VOICE_MEMO_FILE_COLUMNS,
-    VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
-)
+    VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,)
 from personal_data_warehouse.relations import relation
 from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
 from personal_data_warehouse.postgres import (
@@ -42,6 +43,7 @@ from personal_data_warehouse.postgres import (
     INTEGER_COLUMNS,
     POSTGRES_TABLES,
     SEARCH_SCHEMA_REFRESH_LOCK_ID,
+    SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID,
     SEARCH_TEXT_LOW_VOLUME_ADAPTERS,
     SEARCH_TEXT_PREVIEW_CHARS,
     SEARCH_TEXT_SOURCE_FLOOR,
@@ -4773,6 +4775,268 @@ def test_postgres_slack_account_state_uses_empty_actor_for_missing_user(warehous
     assert warehouse._query("SELECT actor_name FROM @slack_account_state_item_rows WHERE is_deleted = 0") == [("",)]
 
 
+def _seed_slack_inbox_scope(warehouse: PostgresWarehouse, *, now: datetime) -> None:
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_account_identities(
+        [
+            _default_row(
+                SLACK_ACCOUNT_IDENTITY_COLUMNS,
+                account="zrl",
+                team_id="T1",
+                user_id="U_SELF",
+                synced_at=now,
+                sync_version=1,
+            )
+        ]
+    )
+
+
+def _seed_slack_dm(
+    warehouse: PostgresWarehouse,
+    *,
+    conversation_id: str,
+    now: datetime,
+    synced_at: datetime,
+    message_ts: str | None = None,
+    is_deleted: int = 0,
+) -> None:
+    message_ts = message_ts or f"{int(now.timestamp())}.{conversation_id[-1]}00001"
+    warehouse.insert_slack_conversations(
+        [
+            _default_row(
+                SLACK_CONVERSATION_COLUMNS,
+                account="zrl",
+                team_id="T1",
+                conversation_id=conversation_id,
+                conversation_type="im",
+                is_im=1,
+                raw_json='{"last_read":"0"}',
+                created_at=now,
+                synced_at=synced_at,
+                sync_version=int(synced_at.timestamp()),
+            )
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _default_row(
+                SLACK_MESSAGE_COLUMNS,
+                account="zrl",
+                team_id="T1",
+                conversation_id=conversation_id,
+                message_ts=message_ts,
+                message_datetime=now,
+                thread_ts=message_ts,
+                user_id="U_OTHER",
+                text="hello",
+                raw_json="{}",
+                is_deleted=is_deleted,
+                synced_at=synced_at,
+                sync_version=int(synced_at.timestamp()),
+            )
+        ]
+    )
+
+
+def _inbox_rows(warehouse: PostgresWarehouse) -> dict[str, tuple[int, int]]:
+    rows = warehouse._query(
+        "SELECT container_id, is_deleted, sync_version FROM @slack_account_state_item_rows ORDER BY container_id"
+    )
+    return {str(container): (int(deleted), int(version)) for container, deleted, version in rows}
+
+
+def test_postgres_slack_account_state_refresh_only_recomputes_changed_conversations(
+    warehouse: PostgresWarehouse,
+) -> None:
+    now = datetime.now(tz=UTC)
+    _seed_slack_inbox_scope(warehouse, now=now)
+    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=now - timedelta(hours=6))
+
+    first = warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now - timedelta(hours=3))
+    assert first.mode == "full"
+    before = _inbox_rows(warehouse)
+    assert before["D1"][0] == 0
+
+    _seed_slack_dm(warehouse, conversation_id="D2", now=now, synced_at=now)
+    second = warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
+
+    assert second.mode == "incremental"
+    assert second.changed_conversations == 1
+    after = _inbox_rows(warehouse)
+    assert after["D2"][0] == 0
+    # D1 was not touched since the last refresh, so its row is exactly as it was.
+    assert after["D1"] == before["D1"]
+
+
+def test_postgres_slack_account_state_refresh_tombstones_items_of_changed_conversations(
+    warehouse: PostgresWarehouse,
+) -> None:
+    now = datetime.now(tz=UTC)
+    _seed_slack_inbox_scope(warehouse, now=now)
+    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=now - timedelta(hours=6))
+    _seed_slack_dm(warehouse, conversation_id="D2", now=now, synced_at=now - timedelta(hours=6))
+    warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now - timedelta(hours=3))
+
+    # The only message in D1 is deleted upstream; D2 is untouched.
+    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=now, is_deleted=1)
+    warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
+
+    rows = _inbox_rows(warehouse)
+    assert rows["D1"][0] == 1
+    assert rows["D2"][0] == 0
+
+
+def test_postgres_slack_account_state_refresh_ages_out_items_without_touching_their_conversation(
+    warehouse: PostgresWarehouse,
+) -> None:
+    now = datetime.now(tz=UTC)
+    _seed_slack_inbox_scope(warehouse, now=now)
+    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=now - timedelta(hours=6))
+    warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now - timedelta(hours=3))
+    warehouse._command(
+        "UPDATE @slack_account_state_item_rows SET latest_activity_at = %s WHERE container_id = 'D1'",
+        (now - timedelta(days=40),),
+    )
+
+    result = warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
+
+    assert result.mode == "incremental"
+    assert _inbox_rows(warehouse)["D1"][0] == 1
+
+
+def test_postgres_slack_account_state_refresh_reruns_fully_once_a_day(warehouse: PostgresWarehouse) -> None:
+    now = datetime.now(tz=UTC)
+    _seed_slack_inbox_scope(warehouse, now=now)
+    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=now - timedelta(days=3))
+    warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now - timedelta(days=2))
+    before = _inbox_rows(warehouse)
+
+    result = warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
+
+    assert result.mode == "full"
+    after = _inbox_rows(warehouse)
+    assert after["D1"][0] == 0
+    assert after["D1"][1] > before["D1"][1]
+
+
+def test_postgres_slack_account_state_refresh_skips_while_another_refresh_holds_the_lock(
+    warehouse: PostgresWarehouse,
+) -> None:
+    now = datetime.now(tz=UTC)
+    _seed_slack_inbox_scope(warehouse, now=now)
+    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=now)
+
+    other = psycopg2.connect(_postgres_url())
+    other.autocommit = True
+    try:
+        with other.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_lock(%s)", (SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID,))
+        result = warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
+    finally:
+        other.close()
+
+    assert result.mode == "skipped"
+    assert _inbox_rows(warehouse) == {}
+
+    result = warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
+    assert result.mode == "full"
+    assert _inbox_rows(warehouse)["D1"][0] == 0
+
+
+def test_files_attachments_mart_conforms_every_attachment_source(warehouse: PostgresWarehouse) -> None:
+    """One row per attachment from all four sources, in one column set.
+
+    Every enrichment pass and the receipt evidence check read this view, so a
+    source missing here is a source that is silently never enriched -- the
+    Apple Notes shape (40 audio attachments, 0 transcripts) that motivated it.
+    """
+    now = datetime(2026, 8, 20, 12, tzinfo=UTC)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    warehouse.ensure_tables()
+    warehouse.ensure_whatsapp_tables()
+    warehouse.ensure_apple_messages_tables()
+    warehouse.ensure_apple_notes_tables()
+    warehouse.insert_attachments(
+        [
+            _default_row(
+                ATTACHMENT_COLUMNS,
+                account="z", message_id="gm1", part_id="1", attachment_id="ga1", filename="invoice.pdf",
+                mime_type="application/pdf", size=10, content_sha256="sha-g", storage_status="stored",
+                internal_date=now, synced_at=now,
+            ),
+            _default_row(
+                ATTACHMENT_COLUMNS,
+                account="z", message_id="gm2", part_id="1", attachment_id="ga2", filename="pending.pdf",
+                mime_type="application/pdf", size=10, content_sha256="sha-g2", storage_status="pending",
+                internal_date=epoch, synced_at=now,
+            ),
+        ]
+    )
+    warehouse.insert_whatsapp_media_items(
+        [
+            _default_row(
+                WHATSAPP_MEDIA_ITEM_COLUMNS,
+                account="z", chat_id="c1", message_id="wm1", filename="receipt.jpg", mime_type="image/jpeg",
+                size_bytes=20, content_sha256="sha-w", is_missing=0, message_at=now, ingested_at=now,
+            ),
+            _default_row(
+                WHATSAPP_MEDIA_ITEM_COLUMNS,
+                account="z", chat_id="c1", message_id="wm2", filename="gone.jpg", mime_type="image/jpeg",
+                size_bytes=20, content_sha256="", is_missing=1, message_at=now, ingested_at=now,
+            ),
+        ]
+    )
+    warehouse.insert_apple_message_attachments(
+        [
+            _default_row(
+                APPLE_MESSAGE_ATTACHMENT_COLUMNS,
+                account="z", attachment_id="aa1", message_id="am1", filename="voice.caf", mime_type="audio/x-caf",
+                size_bytes=30, content_sha256="sha-a", is_missing=0, created_at=now, ingested_at=now,
+            )
+        ]
+    )
+    warehouse.insert_apple_note_revisions(
+        [
+            _default_row(
+                APPLE_NOTE_REVISION_COLUMNS,
+                account="z", note_id="n1", revision_id="r1", title="memo", modified_at=now, ingested_at=now,
+            )
+        ]
+    )
+    warehouse.insert_apple_note_attachments(
+        [
+            _default_row(
+                APPLE_NOTE_ATTACHMENT_COLUMNS,
+                account="z", note_id="n1", revision_id="r1", attachment_id="na1", filename="Recording.m4a",
+                content_type="audio/mp4a-latm", size_bytes=40, content_sha256="sha-n", is_missing=0,
+                ingested_at=now,
+            )
+        ]
+    )
+
+    rows = {
+        (row["source"], row["attachment_id"]): row
+        for row in warehouse._query_dicts("SELECT * FROM @marts_files_attachments")
+    }
+    assert set(rows) == {
+        ("gmail", "ga1"), ("gmail", "ga2"), ("whatsapp", "wm1"), ("whatsapp", "wm2"),
+        ("apple_messages", "aa1"), ("apple_notes", "na1"),
+    }
+    assert rows[("gmail", "ga1")]["is_stored"] == 1
+    assert rows[("gmail", "ga2")]["is_stored"] == 0
+    assert rows[("gmail", "ga2")]["occurred_at"] is None  # epoch sentinel translated
+    assert rows[("whatsapp", "wm1")]["is_stored"] == 1
+    assert rows[("whatsapp", "wm2")]["is_stored"] == 0
+    assert rows[("apple_messages", "aa1")]["parent_id"] == "am1"
+    note = rows[("apple_notes", "na1")]
+    assert note["parent_id"] == "n1"
+    assert note["mime_type"] == "audio/mp4a-latm"
+    assert note["occurred_at"] == now
+    assert note["is_stored"] == 1
+    assert {row["size_bytes"] for row in rows.values()} == {10, 20, 30, 40}
+    assert all(row["is_deleted"] == 0 for row in rows.values())
+
+
 def test_postgres_load_untranscribed_voice_memos_uses_valid_retryable_error_sql(
     warehouse: PostgresWarehouse,
 ) -> None:
@@ -4905,6 +5169,73 @@ def test_transcription_candidates_include_every_voice_source(
     for row in rows:
         assert row["storage_file_id"]
         assert row["filename"]
+
+
+def test_voice_mart_treats_apple_notes_audio_as_a_voice_source(warehouse: PostgresWarehouse) -> None:
+    """Audio saved in Apple Notes is a recording, once, on the newest revision.
+
+    40 audio attachments across 10 notes sat in base_apple_notes.attachments
+    with 0 transcripts: uploaded, stored, and voice to nobody. The mart is the
+    input to transcription, so listing them here is what gets them transcribed,
+    enriched, calendar-matched and onto the timeline with no new code.
+    """
+    now = datetime(2026, 8, 20, 12, tzinfo=UTC)
+    warehouse.ensure_apple_notes_tables()
+    warehouse.insert_apple_note_revisions(
+        [
+            _default_row(APPLE_NOTE_REVISION_COLUMNS, account="z", note_id="n1", revision_id="r1",
+                         title="Call with the bank", modified_at=now - timedelta(days=1), ingested_at=now),
+            _default_row(APPLE_NOTE_REVISION_COLUMNS, account="z", note_id="n1", revision_id="r2",
+                         title="Call with the bank (edited)", modified_at=now, ingested_at=now),
+        ]
+    )
+    # 2001-01-01 + 800000000s = 2026-05-09T06:13:20Z (Core Data reference date).
+    core_data = '{"raw": {"ZCREATIONDATE": "800000000.5", "ZDURATION": "44.92", "ZTITLE": "Call Recording"}}'
+    warehouse.insert_apple_note_attachments(
+        [
+            _default_row(APPLE_NOTE_ATTACHMENT_COLUMNS, account="z", note_id="n1", revision_id=rev,
+                         attachment_id="att-audio", filename="Call Recording.m4a",
+                         content_type="audio/mp4a-latm", size_bytes=870960, content_sha256="sha-audio",
+                         is_missing=0, storage_backend="google_drive", storage_file_id="drive-note-audio",
+                         raw_metadata_json=core_data, ingested_at=now)
+            for rev in ("r1", "r2")
+        ]
+        + [
+            _default_row(APPLE_NOTE_ATTACHMENT_COLUMNS, account="z", note_id="n1", revision_id="r2",
+                         attachment_id="att-image", filename="photo.png", content_type="image/png",
+                         size_bytes=10, content_sha256="sha-img", is_missing=0, ingested_at=now),
+            _default_row(APPLE_NOTE_ATTACHMENT_COLUMNS, account="z", note_id="n1", revision_id="r2",
+                         attachment_id="att-octet", filename="memo.m4a", content_type="application/octet-stream",
+                         size_bytes=10, content_sha256="sha-octet", is_missing=0, ingested_at=now),
+            _default_row(APPLE_NOTE_ATTACHMENT_COLUMNS, account="z", note_id="n1", revision_id="r2",
+                         attachment_id="att-missing", filename="lost.m4a", content_type="audio/mp4",
+                         size_bytes=10, content_sha256="", is_missing=1, ingested_at=now),
+        ]
+    )
+
+    rows = {
+        row["recording_id"]: row
+        for row in warehouse._query_dicts(
+            "SELECT * FROM @marts_voice_memos_recordings WHERE source = 'apple_notes'"
+        )
+    }
+    # One row per recording (not per revision); the image and the never-stored
+    # file are not recordings; an audio file typed octet-stream still is.
+    assert set(rows) == {"att-audio", "att-octet"}
+    audio = rows["att-audio"]
+    assert audio["title"] == "Call Recording"
+    assert audio["recorded_at"] == datetime(2026, 5, 9, 6, 13, 20, 500000, tzinfo=UTC)
+    assert float(audio["duration_seconds"]) == pytest.approx(44.92)
+    assert audio["storage_file_id"] == "drive-note-audio"
+    assert audio["transcript"] is None
+    assert rows["att-octet"]["title"] == "Call with the bank (edited)"
+    assert rows["att-octet"]["recorded_at"] == now
+
+    candidates = warehouse.load_untranscribed_voice_recordings(provider="assemblyai", limit=10)
+    assert {(row["source"], row["recording_id"]) for row in candidates} == {
+        ("apple_notes", "att-audio"),
+        ("apple_notes", "att-octet"),
+    }
 
 
 def test_postgres_sync_state_round_trips_latest_update(warehouse: PostgresWarehouse) -> None:

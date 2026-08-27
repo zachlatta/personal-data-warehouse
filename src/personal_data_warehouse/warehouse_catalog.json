@@ -284,6 +284,14 @@
       "comment": "Stable contacts read interface across Apple and Google address books. Start with marts_contacts.contacts for one row per card; marts_contacts.contact_points gives the normalized emails/phones other sources join identities through."
     },
     {
+      "name": "marts_files",
+      "layer": "marts",
+      "domain": "files",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Stable read interface over every attachment the warehouse holds bytes for, from any source. Start with marts_files.attachments: one conformed row per attachment from Gmail, WhatsApp, iMessage and Apple Notes. It is also the INPUT to attachment enrichment, so a new attachment source is enriched by existing code."
+    },
+    {
       "name": "marts_finance",
       "layer": "marts",
       "domain": "finance",
@@ -1812,6 +1820,18 @@
         "schema": "marts",
         "name": "apple_voice_memos_without_calendar_match"
       }
+    },
+    {
+      "id": "marts_files_attachments",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "files",
+      "schema": "marts_files",
+      "name": "attachments",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Start here for attachments. One conformed row per attachment across EVERY attachment source \u2014 base_gmail.attachments, base_whatsapp.media_items, base_apple_messages.attachments and base_apple_notes.attachments \u2014 with source, parent_id (the message or note it belongs to), attachment_id, filename, mime_type, size_bytes, content_sha256, is_stored (bigint 0/1: the bytes are in the object store), is_deleted and the storage_* columns. This view is the INPUT to file, audio and text attachment enrichment and to receipt evidence checks, so a new attachment source gains all of them with no new code. Apple Notes attachments appear once per note revision. occurred_at and ingested_at are NULL when absent, translating the warehouse's 1970-01-01 epoch sentinel."
     },
     {
       "id": "marts_voice_memos_recordings",

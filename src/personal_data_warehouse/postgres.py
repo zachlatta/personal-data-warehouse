@@ -478,6 +478,46 @@ WHOOP_TOKEN_AUTHORITY_LOCK_ID = 8_407_112_472
 # from the public credential's: the two rotate independently and must not
 # serialize against each other.
 WHOOP_PRIVATE_SESSION_AUTHORITY_LOCK_ID = 8_407_112_476
+
+# Single-flight guard for the Slack inbox snapshot (derived_slack.inbox_items).
+# Every Slack stage refreshes it at the end of sync_all(); before this lock four
+# copies of the refresh queued behind each other for up to eleven minutes.
+# One waiter is pointless: the refresh that holds the lock produces the same
+# snapshot the waiter would have, so a contender skips instead of queueing.
+SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID = 8_407_112_478
+
+# How far the incremental inbox refresh looks back past its own watermark. A
+# sync stage stamps every row with the `synced_at` it computed when it STARTED,
+# then may run for minutes before committing, so rows can land carrying a stamp
+# older than a refresh that already ran. The overlap re-reads that window; a
+# stage longer than this is caught by the daily full refresh below.
+SLACK_ACCOUNT_STATE_REFRESH_OVERLAP = timedelta(hours=1)
+SLACK_ACCOUNT_STATE_FULL_REFRESH_INTERVAL = timedelta(hours=24)
+SLACK_ACCOUNT_STATE_REFRESH_OBJECT_TYPE = "account_state_refresh"
+SLACK_ACCOUNT_STATE_ITEM_WINDOW = timedelta(days=30)
+
+# marts_ops.search_health reports `late` once the oldest timeline row the chunk
+# builder has not reached has waited this long. The builder runs every five
+# minutes and converges in one run when the timeline is quiet, so an hour of
+# waiting means the semantic corpus is materially behind what search_text
+# already sees, not merely one tick behind.
+SEARCH_HEALTH_LATE_AFTER_MINUTES = 60
+
+
+@dataclass(frozen=True)
+class SlackAccountStateRefresh:
+    """What one derived_slack.inbox_items refresh did.
+
+    ``mode`` is ``full`` (every member conversation recomputed), ``incremental``
+    (only conversations whose rows changed since the last refresh) or ``skipped``
+    (another refresh held the lock).
+    """
+
+    mode: str
+    changed_conversations: int = 0
+    rows_tombstoned: int = 0
+
+
 # Serializes the one-time timeline priority bigint -> enum rewrite. Without it
 # two processes booting together both see a bigint column, both issue the ALTER,
 # and the second one rewrites the whole table again behind the first.
@@ -2584,6 +2624,7 @@ class PostgresWarehouse:
                 f"ALTER TABLE @gmail_attachments ADD COLUMN IF NOT EXISTS {_identifier(column)} text NOT NULL DEFAULT ''"
             )
         self._ensure_clean_gmail_inbox_view()
+        self._ensure_files_mart_views()
         self._ensure_search_views_if_possible()
 
     def ensure_file_attachment_enrichment_tables(self) -> None:
@@ -3637,6 +3678,10 @@ class PostgresWarehouse:
 
     def ensure_apple_notes_tables(self) -> None:
         self._ensure_table_group(["apple_notes", "apple_note_revisions", "apple_note_attachments"])
+        self._ensure_files_mart_views()
+        # Audio attachments are a voice source: marts_voice_memos.recordings
+        # unions them, so this source's ensure_* path builds that mart too.
+        self._ensure_voice_memos_mart_views()
         self._ensure_search_views_if_possible()
 
     def ensure_apple_messages_tables(self) -> None:
@@ -3652,12 +3697,14 @@ class PostgresWarehouse:
             ]
         )
         self._ensure_clean_apple_messages_view()
+        self._ensure_files_mart_views()
         self._ensure_search_views_if_possible()
 
     def ensure_whatsapp_tables(self) -> None:
         self._ensure_table_group(_WHATSAPP_TABLES)
         self.ensure_whatsapp_client_session_table()
         self._ensure_clean_whatsapp_messages_view()
+        self._ensure_files_mart_views()
         self._ensure_search_views_if_possible()
 
     def ensure_photos_tables(self) -> None:
@@ -4459,6 +4506,10 @@ class PostgresWarehouse:
 
         # Search convergence cannot be inferred from max(built_at): a chunk
         # worker or embedder can keep writing recent rows while a backlog grows.
+        # `seq_lag` is the backlog in timeline rows; `oldest_pending_at` is when
+        # the oldest unprocessed timeline row was written, which is the honest
+        # lateness (a re-walk emits millions of rows and the chunker converges
+        # at ~70k a run, so a seq threshold would mean nothing).
         self._ensure_view(
             "marts_search_health",
             f"""
@@ -4481,6 +4532,9 @@ class PostgresWarehouse:
                      WHEN updated_at IS NULL OR now() - updated_at > interval '30 minutes' THEN 'unknown'
                      WHEN configured = 0 OR pgvector_available = 0 THEN 'failing'
                      WHEN last_error IS NOT NULL THEN 'failing'
+                     WHEN caught_up = 0
+                      AND oldest_pending_at < now() - interval '{SEARCH_HEALTH_LATE_AFTER_MINUTES} minutes'
+                       THEN 'late'
                      WHEN caught_up = 0 THEN 'backfilling'
                      ELSE 'ok'
                    END AS status,
@@ -4488,6 +4542,7 @@ class PostgresWarehouse:
                    timeline_max_seq, chunk_cursor_seq,
                    GREATEST(0, timeline_max_seq - chunk_cursor_seq) AS seq_lag,
                    caught_up, processed_rows, pending_count, oldest_pending_at,
+                   (EXTRACT(EPOCH FROM now() - oldest_pending_at))::bigint AS pending_age_seconds,
                    last_success_at, last_run_at, last_error, updated_at,
                    (EXTRACT(EPOCH FROM now() - updated_at))::bigint AS snapshot_age_seconds
             FROM measured
@@ -9636,39 +9691,169 @@ class PostgresWarehouse:
             SLACK_SYNC_STATE_COLUMNS,
         )
 
-    def refresh_slack_account_state_items(self, *, account: str, team_id: str, synced_at: datetime) -> None:
-        sync_version = int(_ensure_utc(synced_at).timestamp() * 1_000_000)
+    def refresh_slack_account_state_items(
+        self, *, account: str, team_id: str, synced_at: datetime
+    ) -> SlackAccountStateRefresh:
+        """Bring derived_slack.inbox_items up to date for one account/team.
+
+        The snapshot used to be rebuilt from scratch on every call: all thirty
+        days of every member conversation's messages, re-read from the heap four
+        times (one per UNION branch), then every previous row re-inserted as a
+        tombstone. Called by every Slack stage, that was 44s mean and the single
+        largest consumer on the host (22.6 CPU-hours in 46h) while eleven
+        conversations actually changed per five minutes.
+
+        Now a watermark in ``ops.slack_sync_state`` records when the last refresh
+        ran. Only conversations whose own row or messages were stamped after
+        it (minus SLACK_ACCOUNT_STATE_REFRESH_OVERLAP) are recomputed; their
+        stale items are tombstoned by container, and items anywhere that have
+        aged past the thirty-day window are tombstoned without touching their
+        conversation. A full rebuild still runs when there is no watermark and
+        once every SLACK_ACCOUNT_STATE_FULL_REFRESH_INTERVAL, so a row missed by
+        the overlap is wrong for at most a day, never forever.
+        """
+        synced_at = _ensure_utc(synced_at)
+        sync_version = int(synced_at.timestamp() * 1_000_000)
         columns = ", ".join(_identifier(column) for column in SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS)
-        active_rows = self._query(
-            f"""
-            SELECT {columns}
-            FROM @slack_account_state_item_rows
-            WHERE account = %s
-              AND scope_id = %s
-              AND is_deleted = 0
-            """,
-            (account, team_id),
+        self._command("BEGIN")
+        try:
+            (locked,) = self._query(
+                "SELECT pg_try_advisory_xact_lock(%s)", (SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID,)
+            )[0]
+            if not locked:
+                self._command("ROLLBACK")
+                return SlackAccountStateRefresh(mode="skipped")
+            # The four-branch UNION compiles ~540 JIT functions (5.6s measured)
+            # for a statement that now touches a handful of conversations.
+            self._command("SET LOCAL jit = off")
+
+            watermark, last_full_at = self._slack_account_state_watermark(account=account, team_id=team_id)
+            full = (
+                watermark is None
+                or last_full_at is None
+                or synced_at - last_full_at >= SLACK_ACCOUNT_STATE_FULL_REFRESH_INTERVAL
+            )
+            changed: list[str] = []
+            if not full:
+                since = watermark - SLACK_ACCOUNT_STATE_REFRESH_OVERLAP
+                changed = [
+                    str(row[0])
+                    for row in self._query(
+                        """
+                        SELECT conversation_id FROM @slack_conversations
+                        WHERE account = %s AND team_id = %s AND synced_at > %s
+                        UNION
+                        SELECT DISTINCT conversation_id FROM @slack_messages
+                        WHERE account = %s AND team_id = %s AND synced_at > %s
+                        """,
+                        (account, team_id, since, account, team_id, since),
+                    )
+                ]
+
+            if full or changed:
+                select_sql = self._slack_account_state_items_select_sql(scoped=not full)
+                params: tuple[Any, ...] = (account, team_id, synced_at, sync_version)
+                if not full:
+                    params = (*params, changed)
+                self._command(
+                    f"""
+                    INSERT INTO @slack_account_state_item_rows AS target ({columns})
+                    {select_sql}
+                    {_upsert_clause("slack_account_state_item_rows", POSTGRES_TABLES["slack_account_state_item_rows"], target_alias="target")}
+                    """,
+                    params,
+                )
+
+            tombstone_scope = "" if full else "AND (container_id = ANY(%s::text[]) OR latest_activity_at < %s)"
+            tombstone_params: tuple[Any, ...] = (synced_at, sync_version, account, team_id, sync_version)
+            if not full:
+                tombstone_params = (*tombstone_params, changed, synced_at - SLACK_ACCOUNT_STATE_ITEM_WINDOW)
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    self._expand_relations(
+                        f"""
+                        UPDATE @slack_account_state_item_rows
+                        SET is_deleted = 1, synced_at = %s, sync_version = %s
+                        WHERE account = %s AND scope_id = %s AND is_deleted = 0 AND sync_version < %s
+                          {tombstone_scope}
+                        """
+                    ),
+                    tombstone_params,
+                )
+                tombstoned = int(cursor.rowcount or 0)
+
+            self._record_slack_account_state_watermark(
+                account=account,
+                team_id=team_id,
+                synced_at=synced_at,
+                sync_version=sync_version,
+                full=full,
+            )
+            self._command("COMMIT")
+        except Exception:
+            self._command("ROLLBACK")
+            raise
+        return SlackAccountStateRefresh(
+            mode="full" if full else "incremental",
+            changed_conversations=len(changed),
+            rows_tombstoned=tombstoned,
         )
-        self._command(
-            f"""
-            INSERT INTO @slack_account_state_item_rows AS target ({columns})
-            {self._slack_account_state_items_select_sql()}
-            {_upsert_clause("slack_account_state_item_rows", POSTGRES_TABLES["slack_account_state_item_rows"], target_alias="target")}
+
+    def _slack_account_state_watermark(
+        self, *, account: str, team_id: str
+    ) -> tuple[datetime | None, datetime | None]:
+        """(last refresh, last FULL refresh) for one account/team, or Nones.
+
+        Two ``ops.slack_sync_state`` rows of object_type
+        ``account_state_refresh``: object_id ``<team>`` is stamped by every
+        refresh, ``<team>:full`` only by a full one, so the daily backstop reads
+        its own row instead of overloading a column meant for something else.
+        """
+        rows = self._query(
+            """
+            SELECT object_id, cursor_ts
+            FROM @slack_sync_state
+            WHERE account = %s AND team_id = %s AND object_type = %s AND object_id = ANY(%s::text[])
             """,
-            (account, team_id, synced_at, sync_version + 1),
+            (account, team_id, SLACK_ACCOUNT_STATE_REFRESH_OBJECT_TYPE, [team_id, f"{team_id}:full"]),
         )
-        if active_rows:
-            tombstones = []
-            is_deleted_index = SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS.index("is_deleted")
-            synced_at_index = SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS.index("synced_at")
-            sync_version_index = SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS.index("sync_version")
-            for row in active_rows:
-                values = list(row)
-                values[is_deleted_index] = 1
-                values[synced_at_index] = synced_at
-                values[sync_version_index] = sync_version
-                tombstones.append(tuple(values))
-            self._insert("slack_account_state_item_rows", tombstones, SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS)
+        stamps = {str(object_id): str(cursor_ts or "") for object_id, cursor_ts in rows}
+        watermark = stamps.get(team_id) or ""
+        last_full = stamps.get(f"{team_id}:full") or ""
+        return (
+            datetime.fromisoformat(watermark) if watermark else None,
+            datetime.fromisoformat(last_full) if last_full else None,
+        )
+
+    def _record_slack_account_state_watermark(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        synced_at: datetime,
+        sync_version: int,
+        full: bool,
+    ) -> None:
+        object_ids = [team_id, f"{team_id}:full"] if full else [team_id]
+        self._insert(
+            "slack_sync_state",
+            [
+                (
+                    account,
+                    team_id,
+                    SLACK_ACCOUNT_STATE_REFRESH_OBJECT_TYPE,
+                    object_id,
+                    synced_at.isoformat(),
+                    "full" if full else "incremental",
+                    "ok",
+                    "",
+                    synced_at,
+                    sync_version,
+                )
+                for object_id in object_ids
+            ],
+            SLACK_SYNC_STATE_COLUMNS,
+        )
 
     def existing_slack_message_ids(
         self,
@@ -12083,6 +12268,106 @@ class PostgresWarehouse:
             """,
         )
 
+    def _ensure_files_mart_views(self) -> None:
+        """marts_files.attachments: one entry point for every stored attachment.
+
+        Four sources hold attachment bytes -- Gmail, WhatsApp, iMessage and
+        Apple Notes -- each in its own raw table with its own column names
+        (`size` vs `size_bytes`, `storage_status = 'stored'` vs `is_missing =
+        0`, `mime_type` vs `content_type`). Until this view every attachment
+        enrichment pass carried a per-source descriptor naming the raw table,
+        which is the shape C5 forbids: a receipt that arrived over WhatsApp was
+        invisible to the receipt pass because that pass only knew Gmail, and
+        Apple Notes attachments were enriched by nothing at all.
+
+        **This view is the INPUT to file, audio and text enrichment and to
+        receipt evidence checks**, so a new attachment source is one UNION
+        branch here, never a new scan. Any source's ensure_* path may run
+        first, so every branch's table is ensured before the union.
+        """
+        self._ensure_table_group(
+            [
+                "gmail_attachments",
+                "whatsapp_media_items",
+                "apple_message_attachments",
+                "apple_note_attachments",
+                "apple_note_revisions",
+            ]
+        )
+        epoch = "TIMESTAMPTZ '1970-01-01 00:00:00+00'"
+        self._ensure_view(
+            "marts_files_attachments",
+            f"""
+            CREATE OR REPLACE VIEW @marts_files_attachments AS
+            SELECT
+                'gmail'::text AS source,
+                a.account,
+                a.message_id AS parent_id,
+                a.attachment_id,
+                a.filename,
+                a.mime_type,
+                a.size::bigint AS size_bytes,
+                a.content_sha256,
+                (CASE WHEN a.is_deleted = 0 AND a.content_sha256 <> '' AND a.storage_status = 'stored'
+                      THEN 1 ELSE 0 END)::bigint AS is_stored,
+                a.is_deleted::bigint AS is_deleted,
+                NULLIF(a.internal_date, {epoch}) AS occurred_at,
+                a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
+                NULLIF(a.synced_at, {epoch}) AS ingested_at
+            FROM @gmail_attachments a
+            UNION ALL
+            SELECT
+                'whatsapp'::text,
+                a.account,
+                a.message_id,
+                a.message_id,
+                a.filename,
+                a.mime_type,
+                a.size_bytes::bigint,
+                a.content_sha256,
+                (CASE WHEN a.is_missing = 0 AND a.content_sha256 <> '' THEN 1 ELSE 0 END)::bigint,
+                0::bigint,
+                NULLIF(a.message_at, {epoch}),
+                a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
+                NULLIF(a.ingested_at, {epoch})
+            FROM @whatsapp_media_items a
+            UNION ALL
+            SELECT
+                'apple_messages'::text,
+                a.account,
+                a.message_id,
+                a.attachment_id,
+                a.filename,
+                a.mime_type,
+                a.size_bytes::bigint,
+                a.content_sha256,
+                (CASE WHEN a.is_missing = 0 AND a.content_sha256 <> '' THEN 1 ELSE 0 END)::bigint,
+                0::bigint,
+                NULLIF(a.created_at, {epoch}),
+                a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
+                NULLIF(a.ingested_at, {epoch})
+            FROM @apple_message_attachments a
+            UNION ALL
+            SELECT
+                'apple_notes'::text,
+                a.account,
+                a.note_id,
+                a.attachment_id,
+                a.filename,
+                a.content_type,
+                a.size_bytes::bigint,
+                a.content_sha256,
+                (CASE WHEN a.is_missing = 0 AND a.content_sha256 <> '' THEN 1 ELSE 0 END)::bigint,
+                0::bigint,
+                NULLIF(r.modified_at, {epoch}),
+                a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
+                NULLIF(a.ingested_at, {epoch})
+            FROM @apple_note_attachments a
+            LEFT JOIN @apple_note_revisions r
+              ON r.account = a.account AND r.note_id = a.note_id AND r.revision_id = a.revision_id
+            """,
+        )
+
     def _ensure_voice_memos_mart_views(self) -> None:
         """marts_voice_memos.*: one entry point for every voice recording.
 
@@ -12118,6 +12403,8 @@ class PostgresWarehouse:
                 "apple_voice_memos_transcript_segments",
                 "apple_voice_memos_enrichments",
                 "alice_voice_recordings",
+                "apple_note_attachments",
+                "apple_note_revisions",
             ]
         )
         # Before the view, and in the one path both sources' ensure_* reach:
@@ -12187,6 +12474,65 @@ class PostgresWarehouse:
                     0::bigint AS is_deleted,
                     NULLIF(r.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
                 FROM @alice_voice_recordings r
+                UNION ALL
+                SELECT * FROM (
+                -- Audio recorded or saved inside Apple Notes (call recordings,
+                -- voicemails, the Notes app's own audio recorder). The bytes
+                -- were uploaded and stored for months while nothing knew they
+                -- were voice: 40 attachments, 10 recordings, 0 transcripts,
+                -- the Alice defect one source later. An attachment appears
+                -- once per note REVISION with the same sha, so it is collapsed
+                -- to one recording on the newest revision. Core Data stamps
+                -- (seconds since 2001-01-01) are the recording's own creation
+                -- time; the revision's date is only the fallback.
+                SELECT DISTINCT ON (a.account, a.attachment_id)
+                    'apple_notes'::text AS source,
+                    a.account,
+                    a.attachment_id AS recording_id,
+                    COALESCE(
+                        CASE
+                            WHEN left(a.raw_metadata_json, 1) = '{'
+                             AND (a.raw_metadata_json::jsonb -> 'raw' ->> 'ZCREATIONDATE') ~ '^[0-9.]+$'
+                                THEN TIMESTAMPTZ '2001-01-01 00:00:00+00'
+                                     + make_interval(secs => (a.raw_metadata_json::jsonb -> 'raw' ->> 'ZCREATIONDATE')::numeric)
+                        END,
+                        NULLIF(n.modified_at, TIMESTAMPTZ '1970-01-01 00:00:00+00')
+                    ) AS recorded_at,
+                    CASE
+                        WHEN left(a.raw_metadata_json, 1) = '{'
+                         AND (a.raw_metadata_json::jsonb -> 'raw' ->> 'ZDURATION') ~ '^[0-9.]+$'
+                            THEN NULLIF((a.raw_metadata_json::jsonb -> 'raw' ->> 'ZDURATION')::numeric, 0)
+                    END AS duration_seconds,
+                    COALESCE(
+                        CASE
+                            WHEN left(a.raw_metadata_json, 1) = '{'
+                                THEN NULLIF(a.raw_metadata_json::jsonb -> 'raw' ->> 'ZTITLE', '')
+                        END,
+                        NULLIF(n.title, ''),
+                        a.filename
+                    ) AS title,
+                    a.filename,
+                    a.content_type,
+                    a.size_bytes,
+                    a.content_sha256,
+                    a.storage_backend,
+                    a.storage_key,
+                    a.storage_file_id,
+                    a.storage_url,
+                    NULL::text AS recording_url,
+                    0::bigint AS is_deleted,
+                    NULLIF(a.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
+                FROM @apple_note_attachments a
+                LEFT JOIN @apple_note_revisions n
+                  ON n.account = a.account AND n.note_id = a.note_id AND n.revision_id = a.revision_id
+                WHERE a.is_missing = 0
+                  AND a.content_sha256 <> ''
+                  AND (
+                      lower(a.content_type) LIKE 'audio/%'
+                      OR lower(a.filename) ~ '\\.(m4a|mp3|caf|wav|aac|aiff?|opus|ogg)$'
+                  )
+                ORDER BY a.account, a.attachment_id, n.modified_at DESC, a.revision_id DESC
+                ) AS note_audio
             ),
             latest_enrichment AS (
                 -- THE definition of "the enrichment that counts" for a
@@ -12646,8 +12992,17 @@ class PostgresWarehouse:
         )
         return bool(rows)
 
-    def _slack_account_state_items_select_sql(self) -> str:
+    def _slack_account_state_items_select_sql(self, *, scoped: bool = False) -> str:
+        """The inbox snapshot for one account/team.
+
+        With ``scoped`` the conversation set is restricted to an array bound as
+        the fifth parameter, which is what makes the incremental refresh cheap:
+        every branch below joins through ``current_conversations``, so the scan
+        of ``@slack_messages`` is bounded by the conversations that changed
+        rather than by every member conversation's last thirty days.
+        """
         last_read = _json_numeric("c.raw_json", "last_read")
+        conversation_scope = "AND c.conversation_id = ANY(%s::text[])" if scoped else ""
         message_ts = _numeric_ts("m.message_ts")
         parent_thread_last_read = _json_numeric("p.raw_json", "last_read")
         parent_is_subscribed = "COALESCE((p.raw_json::jsonb ->> 'subscribed')::boolean, false)"
@@ -12671,6 +13026,7 @@ class PostgresWarehouse:
                       AND c.team_id = vars.team_id
                       AND c.is_archived = 0
                       AND (c.is_member = 1 OR c.is_im = 1 OR c.is_mpim = 1)
+                      {conversation_scope}
                 )
             SELECT
                 'slack' AS source,

@@ -385,8 +385,10 @@ _EVIDENCE_SQL_BY_SOURCE = {
         "SELECT message_id AS native_id FROM @gmail_messages "
         "WHERE message_id = ANY(%s) AND is_deleted = 0"
     ),
+    # Attachment evidence resolves through the conformed mart, so a receipt
+    # that arrived over WhatsApp or iMessage is as citable as a Gmail one.
     SOURCE_GMAIL_ATTACHMENT: (
-        "SELECT attachment_id AS native_id FROM @gmail_attachments "
+        "SELECT attachment_id AS native_id FROM @marts_files_attachments "
         "WHERE attachment_id = ANY(%s) AND is_deleted = 0"
     ),
 }

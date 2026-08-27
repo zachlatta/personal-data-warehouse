@@ -18,6 +18,7 @@ from dagster import (
 
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs.alice_voice_recordings import alice_object_store
+from personal_data_warehouse.defs.apple_notes_drive_ingest import apple_notes_object_store
 from personal_data_warehouse.defs.apple_voice_memos_drive_ingest import apple_voice_memos_drive_ingest
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
@@ -84,6 +85,11 @@ def apple_voice_memos_transcription(context) -> MaterializeResult:
                 object_stores["alice_voice_recordings"] = alice_object_store(
                     settings.alice_voice_recordings, settings
                 )
+            # Audio saved in Apple Notes lives in the notes source's own Drive
+            # objects; without this store the mart would list those recordings
+            # and the runner could not fetch a single byte of them.
+            if settings.apple_notes is not None:
+                object_stores["apple_notes"] = apple_notes_object_store(settings)
             summary = VoiceMemosTranscriptionRunner(
                 warehouse=warehouse,
                 audio_source=GoogleDriveVoiceMemoAudioSource(

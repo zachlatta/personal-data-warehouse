@@ -256,7 +256,14 @@ changes) and it is part of `adapter_signature` in `ops.timeline_sync_state`. Cha
 changes the signature, which resets that adapter's backfill and re-walks **every row it
 owns** — slack alone is 46.8M rows, and a past re-walk grew `timeline.events` to 93 GB before
 it settled. Batch the change with any other adapter edit you were going to make, expect the
-table to bloat while it runs, and plan the vacuum. There is no fallback tier: every adapter
+table to bloat while it runs, and plan the vacuum. **The re-walk also writes WAL faster
+than the archiver can ship it**: measured 2026-08-26, the slack/gmail re-walk generated
+~19 GB/h against pgBackRest pushing ~2 GB/h to the HDD-backed Garage, so the unarchived
+backlog grew ~15 GB/h and `pg_wal` passed 62 GB. Throttle it by setting
+`TIMELINE_SYNC_BACKFILL_BUDGET_SECONDS` (seconds of each 5-minute run the backfill may
+use; unset = the whole 240s budget, `0` = pause the re-walk) on the Dagster deployment
+until `pg_stat_archiver` catches up, then unset it. Incremental sync is never throttled
+by it, so the timeline stays current while history waits. There is no fallback tier: every adapter
 must declare a priority expression, and a NULL or unknown result fails that adapter before
 the batch is written. The error is persisted in `ops.timeline_sync_state` and surfaces as
 `failing` in `marts_ops.timeline_adapter_health`. The fail-loud engine rollout deliberately
@@ -1089,8 +1096,11 @@ receive push; the app reports `unsupported` there and everything else still work
 
 ## Voice recordings (a multi-source domain, one pipeline)
 
-Voice has **two** sources — `base_apple_voice_memos.files` (the Mac uploader) and
-`base_alice_voice_recordings.recordings` — and exactly one of everything downstream.
+Voice has **three** sources — `base_apple_voice_memos.files` (the Mac uploader),
+`base_alice_voice_recordings.recordings`, and the audio rows of
+`base_apple_notes.attachments` (call recordings, voicemails and the Notes app's own
+recorder; collapsed to one recording per attachment on its newest revision) — and exactly
+one of everything downstream.
 **Start at `marts_voice_memos.recordings`**: one row per recording from either source,
 with the resolved title, summary, transcript, participants, action items and calendar
 match as real columns. `marts_voice_memos.transcript_segments` holds the speaker-labelled
@@ -1117,7 +1127,7 @@ first source's row, so the domain could not have stored a second transcript even
 something had produced one.
 
 One timeline adapter (`voice_memo`, source `voice_memos`, kind `voice_memo`, priority
-`self`) covers both sources over the mart; `timeline.events.metadata->>'voice_source'`
+`self`) covers every source over the mart; `timeline.events.metadata->>'voice_source'`
 says which one, and `source_pk` carries `{source, account, recording_id}`. Search scopes
 them together under `sources => ARRAY['transcript']`.
 
@@ -2495,13 +2505,30 @@ rebuild from the complete source corpus produces exactly the same links, trades,
 
 ## Shared file-attachment enrichment
 
+**Start at `marts_files.attachments`**: one conformed row per attachment from every source
+that holds bytes — `base_gmail.attachments`, `base_whatsapp.media_items`,
+`base_apple_messages.attachments`, `base_apple_notes.attachments` — with `source`,
+`parent_id` (the message or note), `attachment_id`, `filename`, `mime_type`, `size_bytes`,
+`content_sha256`, `is_stored` (bigint 0/1: the bytes are in the object store), `is_deleted`,
+`occurred_at` and the `storage_*` columns. Apple Notes attachments appear once per note
+revision. That view is the **input** to the file (vision), audio (AssemblyAI) and
+deterministic-text enrichment passes and to the receipt pass's attachment-evidence check —
+never the raw tables. Until 2026-08-27 each `FileEnrichmentSource` /
+`AudioEnrichmentSource` / `TextExtractionSource` named its raw table, which is the C5 hole:
+a receipt that arrived over WhatsApp was invisible to the receipt pass, and Apple Notes
+attachments were enriched by nothing. `ALLOWED_RAW_ATTACHMENT_SOURCES` in
+`tests/test_repo_contracts.py` is empty on purpose; adding an entry re-opens the hole.
+
 `gmail_attachment_enrichments` was renamed to `file_attachment_enrichments` and generalized into
 a single source-agnostic enrichment pipeline (`file_attachment_enrichment.py`). To add a new
-attachment source, define a `FileEnrichmentSource` (its table, sha/filename/mime/size/order
-columns, a `stored_predicate`, and whether PDFs need a prior deterministic-extraction step), then
-wire a Dagster asset/sensor that runs `FileAttachmentEnrichmentRunner` with that source — see
-`defs/gmail_attachment_enrichment.py` and `defs/whatsapp_media_enrichment.py`. The table rename
-migrates in place via `ensure_*` (`ALTER TABLE IF EXISTS … RENAME`), preserving existing rows.
+attachment source: add its UNION branch to `marts_files.attachments`
+(`_ensure_files_mart_views`), then define a `FileEnrichmentSource` whose `table` is
+`marts_files_attachments` and whose `stored_predicate` is `a.source = '<source>' AND
+a.is_stored = 1` (the descriptor exists only to give that source its own task_type/prompt
+version), and wire a Dagster asset/sensor that runs `FileAttachmentEnrichmentRunner` with it —
+see `defs/gmail_attachment_enrichment.py` and `defs/whatsapp_media_enrichment.py`. The table
+rename migrates in place via `ensure_*` (`ALTER TABLE IF EXISTS … RENAME`), preserving
+existing rows.
 
 ## Slack file bytes and "who sent this image?"
 
@@ -2700,6 +2727,24 @@ Three behaviours are load-bearing and each failure would be silent:
 - **Any failure degrades to the old polling path** (`SlackChangePlan.usable = False`), so a
   revoked or missing session costs throughput and never coverage. `SLACK_ASSET_USE_CHANGE_FEED=0`
   forces that fallback.
+
+**`derived_slack.inbox_items` is refreshed incrementally, and the watermark is the reason.**
+Every Slack stage ends by refreshing that snapshot (`refresh_slack_account_state_items`).
+Until 2026-08-27 each call rebuilt it from scratch — thirty days of every member
+conversation's messages, read from the heap once per UNION branch, then every previous
+row re-inserted as a tombstone — at 44s mean, ~40 calls an hour, 22.6 CPU-hours in 46h:
+the single largest statement on the host while **eleven** conversations changed per five
+minutes. It now records a watermark in `ops.slack_sync_state`
+(`object_type = 'account_state_refresh'`, object_id `<team>`; `<team>:full` for the last
+full rebuild) and recomputes only conversations whose row or messages were stamped after
+it, minus a one-hour overlap, because a stage stamps rows with the `synced_at` it computed
+at *start* and may commit minutes later. Items of a changed conversation that are not
+re-emitted are tombstoned by `container_id`; items past the 30-day window are tombstoned
+without touching their conversation; a full rebuild still runs once a day, so anything the
+overlap misses is wrong for at most a day. Concurrent refreshes take
+`pg_try_advisory_xact_lock` and **skip** rather than queue — four of them used to wait up
+to eleven minutes on each other for an identical result. Delete the two state rows to
+force a full rebuild.
 
 ### Local Slack Auth Scheduler
 

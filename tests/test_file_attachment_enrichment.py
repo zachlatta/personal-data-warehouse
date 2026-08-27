@@ -287,7 +287,8 @@ def test_apple_messages_source_has_no_prior_pdf_extraction_gate() -> None:
     # Same as WhatsApp: there is no deterministic PDF text-extraction stage for
     # iMessage attachments, so any PDF is directly eligible for the vision pass.
     assert APPLE_MESSAGES_SOURCE.pdf_requires_prior_extraction is False
-    assert APPLE_MESSAGES_SOURCE.table == "apple_message_attachments"
+    assert APPLE_MESSAGES_SOURCE.table == "marts_files_attachments"
+    assert "a.source = 'apple_messages'" in APPLE_MESSAGES_SOURCE.stored_predicate
     assert APPLE_MESSAGES_SOURCE.size_column == "size_bytes"
 
 

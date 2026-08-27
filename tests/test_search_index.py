@@ -119,6 +119,33 @@ def test_search_health_distinguishes_fresh_work_from_convergence(
     assert row["status"] == "backfilling"
     assert row["seq_lag"] == 20
     assert row["pending_count"] is None
+    assert row["pending_age_seconds"] is None
+
+    # A backlog is only "backfilling" while the oldest unprocessed timeline
+    # row is recent. Once it has waited longer than SEARCH_HEALTH_LATE_AFTER
+    # the semantic corpus is materially behind the timeline and the row says
+    # so, instead of reporting a heartbeat that looks like progress forever.
+    warehouse.write_search_health(
+        "chunks",
+        timeline_max_seq=120,
+        chunk_cursor_seq=100,
+        caught_up=0,
+        processed_rows=50,
+        pending_count=-1,
+        oldest_pending_at=datetime.now(tz=UTC) - timedelta(hours=2),
+        last_success_at=datetime.now(tz=UTC),
+    )
+    row = warehouse._query_dicts("SELECT * FROM @marts_search_health WHERE component = 'chunks'")[0]
+    assert row["status"] == "late"
+    assert row["pending_age_seconds"] >= 7000
+
+    warehouse.write_search_health(
+        "chunks",
+        oldest_pending_at=datetime.now(tz=UTC) - timedelta(minutes=5),
+        last_success_at=datetime.now(tz=UTC),
+    )
+    row = warehouse._query_dicts("SELECT * FROM @marts_search_health WHERE component = 'chunks'")[0]
+    assert row["status"] == "backfilling"
 
     warehouse.write_search_health(
         "chunks",
@@ -140,6 +167,15 @@ def test_search_health_distinguishes_fresh_work_from_convergence(
     )[0]
     assert row["status"] == "failing"
     assert row["last_success_at"] == success_at
+
+
+def test_oldest_pending_timeline_write_is_the_epoch_when_nothing_is_pending(
+    warehouse: PostgresWarehouse,
+) -> None:
+    from personal_data_warehouse.defs.search_index import _oldest_pending_timeline_write
+
+    warehouse.ensure_timeline_tables()
+    assert _oldest_pending_timeline_write(warehouse, 0) == datetime.fromtimestamp(0, tz=UTC)
 
 
 # --- chunk builder (live) -----------------------------------------------------

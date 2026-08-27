@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from dagster import (
     DefaultScheduleStatus,
     Definitions,
@@ -24,6 +26,25 @@ TIMELINE_SYNC_POSTGRES_LOCK_ID = 8_407_112_466
 # the 5-minute cadence so runs never pile up behind the overlap guard.
 TIMELINE_SYNC_RUN_BUDGET_SECONDS = 240
 
+# Operator throttle for the history re-walk, in seconds per run. Unset = the
+# backfill may use the whole run budget. Changing a high-volume adapter's SQL
+# re-walks every row it owns; at the full budget the 2026-08-26 slack/gmail
+# re-walk wrote ~19 GB/h of WAL against an archiver shipping ~2 GB/h, so the
+# unarchived backlog grew ~15 GB/h. Set this (e.g. 30) in the Dagster
+# deployment to slow the re-walk while the archive catches up, and unset it
+# afterwards. Incremental sync is never throttled by it.
+TIMELINE_SYNC_BACKFILL_BUDGET_ENV = "TIMELINE_SYNC_BACKFILL_BUDGET_SECONDS"
+
+
+def _backfill_budget_seconds() -> float | None:
+    raw = os.environ.get(TIMELINE_SYNC_BACKFILL_BUDGET_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError as error:
+        raise RuntimeError(f"{TIMELINE_SYNC_BACKFILL_BUDGET_ENV} must be a number of seconds, got {raw!r}") from error
+
 
 @asset(
     group_name="timeline",
@@ -41,7 +62,10 @@ def timeline_sync(context) -> MaterializeResult:
         else:
             engine = TimelineSyncEngine(source_url=settings.postgres_database_url or "")
             try:
-                stats = engine.run(max_seconds=TIMELINE_SYNC_RUN_BUDGET_SECONDS)
+                stats = engine.run(
+                    max_seconds=TIMELINE_SYNC_RUN_BUDGET_SECONDS,
+                    backfill_max_seconds=_backfill_budget_seconds(),
+                )
             except TimelineSyncError as error:
                 # Persisted per-adapter progress survives; surface the failure
                 # loudly so monitoring goes red instead of silently stalling.

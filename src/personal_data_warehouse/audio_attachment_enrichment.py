@@ -114,10 +114,11 @@ APPLE_MESSAGES_AUDIO_SOURCE = AudioEnrichmentSource(
     label="iMessage voice message",
     task_type="apple_messages_audio_transcription",
     prompt_version="apple-messages-audio-agent-v1",
-    table="apple_message_attachments",
-    stored_predicate="a.is_missing = 0 AND a.content_sha256 <> ''",
+    # Candidates come from the conformed mart (C5); the predicate names the source.
+    table="marts_files_attachments",
+    stored_predicate="a.source = 'apple_messages' AND a.is_stored = 1",
     size_column="size_bytes",
-    order_column="created_at",
+    order_column="occurred_at",
 )
 
 WHATSAPP_AUDIO_SOURCE = AudioEnrichmentSource(
@@ -125,10 +126,10 @@ WHATSAPP_AUDIO_SOURCE = AudioEnrichmentSource(
     label="WhatsApp voice message",
     task_type="whatsapp_audio_transcription",
     prompt_version="whatsapp-audio-agent-v1",
-    table="whatsapp_media_items",
-    stored_predicate="a.is_missing = 0 AND a.content_sha256 <> ''",
+    table="marts_files_attachments",
+    stored_predicate="a.source = 'whatsapp' AND a.is_stored = 1",
     size_column="size_bytes",
-    order_column="message_at",
+    order_column="occurred_at",
 )
 
 

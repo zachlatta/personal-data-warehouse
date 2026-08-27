@@ -2529,7 +2529,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # state; the revisions are the edit activity).
     "apple_notes": _entity("current note state; edits surface via apple_note_revisions"),
     "apple_note_revisions": _events(),
-    "apple_note_attachments": _detail("apple_note_revisions"),
+    # Its audio rows are voice recordings, on the timeline through the one
+    # voice adapter over marts_voice_memos.recordings; the rest are detail of
+    # the note revision that carries them.
+    "apple_note_attachments": _events(),
     # Apple Messages
     "apple_messages": _events(),
     "apple_message_handles": _entity("sender dimension joined into message events"),
@@ -3395,7 +3398,20 @@ class TimelineSyncEngine:
                     cursor.execute(f"DELETE FROM {state} WHERE adapter = %s", (name,))
         return deleted
 
-    def run(self, *, max_seconds: float | None = None) -> list[AdapterSyncStats]:
+    def run(
+        self,
+        *,
+        max_seconds: float | None = None,
+        backfill_max_seconds: float | None = None,
+    ) -> list[AdapterSyncStats]:
+        """One sync pass: incremental for every adapter, then backfill, then reconcile.
+
+        ``max_seconds`` bounds the whole pass. ``backfill_max_seconds`` bounds
+        only the history re-walk inside it (``None`` = the pass budget, ``0`` =
+        no backfill this pass): a changed adapter re-walks every row it owns,
+        and at the full budget that wrote WAL faster than the archiver could
+        ship it. Incremental sync is never throttled by it.
+        """
         self._connect()
         deadline = time.monotonic() + max_seconds if max_seconds else None
         stats: dict[str, AdapterSyncStats] = {
@@ -3446,7 +3462,11 @@ class TimelineSyncEngine:
             and not states[adapter.name].backfill_done
             and not stats[adapter.name].error
         ]
-        while active and not _past(deadline):
+        backfill_deadline = deadline
+        if backfill_max_seconds is not None:
+            capped = time.monotonic() + backfill_max_seconds
+            backfill_deadline = capped if deadline is None else min(deadline, capped)
+        while active and not _past(backfill_deadline):
             for adapter in list(active):
                 state = states[adapter.name]
                 try:
@@ -3461,7 +3481,7 @@ class TimelineSyncEngine:
                 stats[adapter.name].backfill_done = state.backfill_done
                 if state.backfill_done:
                     active.remove(adapter)
-                if _past(deadline):
+                if _past(backfill_deadline):
                     break
 
         # Coverage reconcile, LAST and STALEST-FIRST.

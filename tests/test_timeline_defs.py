@@ -20,8 +20,11 @@ class _FakeEngine:
         self.raise_error: TimelineSyncError | None = None
         _FakeEngine.instances.append(self)
 
-    def run(self, *, max_seconds: float | None = None) -> list[AdapterSyncStats]:
+    def run(
+        self, *, max_seconds: float | None = None, backfill_max_seconds: float | None = None
+    ) -> list[AdapterSyncStats]:
         self.ran_with = max_seconds
+        self.backfill_budget = backfill_max_seconds
         if self.raise_error is not None:
             raise self.raise_error
         return [
@@ -68,10 +71,23 @@ def test_timeline_sync_asset_runs_engine_within_budget(monkeypatch):
     engine = _FakeEngine.instances[0]
     assert engine.source_url == "postgresql://example/warehouse"
     assert engine.ran_with == timeline_defs.TIMELINE_SYNC_RUN_BUDGET_SECONDS
+    assert engine.backfill_budget is None
     assert engine.closed
     assert result.metadata["backfill_rows"].value == 5
     assert result.metadata["incremental_rows"].value == 2
     assert result.metadata["backfill_pending"].value == ["slack_message"]
+
+
+def test_timeline_sync_asset_passes_the_backfill_throttle_from_the_environment(monkeypatch):
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(timeline_defs, "exclusive_sync_lock", _acquired_lock)
+    monkeypatch.setenv("TIMELINE_SYNC_BACKFILL_BUDGET_SECONDS", "45")
+
+    timeline_defs.timeline_sync(build_asset_context())
+
+    engine = _FakeEngine.instances[0]
+    assert engine.ran_with == timeline_defs.TIMELINE_SYNC_RUN_BUDGET_SECONDS
+    assert engine.backfill_budget == 45.0
 
 
 def test_timeline_sync_asset_skips_when_lock_busy(monkeypatch):

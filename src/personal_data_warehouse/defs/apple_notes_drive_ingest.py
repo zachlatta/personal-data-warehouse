@@ -31,7 +31,8 @@ APPLE_NOTES_DRIVE_INGEST_POSTGRES_LOCK_ID = 8_407_112_439
 APPLE_NOTES_SENSOR_INTERVAL_SECONDS = 60
 
 
-def _apple_notes_object_store(settings):
+def apple_notes_object_store(settings):
+    """The Drive store holding Apple Notes bodies and attachments (shared with the voice passes)."""
     return build_object_store(
         google_drive_spec(
             folder_id=settings.apple_notes.google_drive_folder_id,
@@ -62,15 +63,15 @@ def apple_notes_drive_ingest(context) -> MaterializeResult:
             context.log.warning("Skipping Apple Notes Drive ingest because another run is already active")
             summary = None
         else:
-            object_store = _apple_notes_object_store(settings)
+            object_store = apple_notes_object_store(settings)
             summary = AppleNotesDriveIngestRunner(
                 warehouse=warehouse,
                 metadata_source=lambda: iter_metadata_payloads(
                     object_store=object_store,
-                    object_store_factory=lambda: _apple_notes_object_store(settings),
+                    object_store_factory=lambda: apple_notes_object_store(settings),
                     download_workers=int(os.getenv("APPLE_NOTES_DRIVE_INGEST_DOWNLOAD_WORKERS", "8")),
                 ),
-                object_store_factory=lambda: _apple_notes_object_store(settings),
+                object_store_factory=lambda: apple_notes_object_store(settings),
                 promotion_workers=int(os.getenv("APPLE_NOTES_DRIVE_INGEST_PROMOTION_WORKERS", "8")),
                 logger=context.log,
             ).sync()
@@ -105,7 +106,7 @@ def apple_notes_drive_inbox_sensor(context):
     settings = load_settings(require_gmail=False, require_apple_notes=True)
     if settings.apple_notes is None:
         raise RuntimeError("Apple Notes sync is not configured")
-    if not has_metadata_payloads(object_store=_apple_notes_object_store(settings), stage="inbox"):
+    if not has_metadata_payloads(object_store=apple_notes_object_store(settings), stage="inbox"):
         return SkipReason("No Apple Notes inbox metadata found in object storage.")
 
     return RunRequest(tags={"apple_notes_trigger": "drive_inbox"})

@@ -165,7 +165,10 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +1 marts: marts_health.workout_heart_rate_samples, which replaced the
         # retired base table of the same name by joining the one continuous
         # series to each workout's own bounds.
-        "marts": 44,
+        # +1 marts: marts_files.attachments, the conformed input to every
+        # attachment enrichment pass (C5), which retired the last raw-table
+        # descriptors and let Apple Notes attachments be enriched at all.
+        "marts": 45,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

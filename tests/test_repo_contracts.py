@@ -524,22 +524,18 @@ ALLOWED_RAW_ENRICHMENT_READS: dict[str, dict[str, str]] = {
         "calendar_events": "context hints: what was scheduled when the photo was taken",
     },
     "receipt_enrichment.py": {
-        # KNOWN DEBT, tracked as the marts_files.attachments work: receipts are
-        # linked from Gmail attachments only, so a receipt that arrived over
-        # WhatsApp or iMessage is invisible to this pass -- the same shape as
-        # the voice defect, one source earlier in the pipeline.
-        "gmail_attachments": "pending marts_files.attachments",
-        "gmail_messages": "pending marts_files.attachments",
+        # Not a candidate scan: the agent cites a Gmail message id as evidence
+        # and the runner checks the row exists. A message id is inherently
+        # single-source; attachment evidence goes through marts_files.attachments.
+        "gmail_messages": "evidence check: the Gmail message id the agent cited exists",
     },
 }
 
 # The same claim for the attachment-source descriptors, which name their input
-# relation as data rather than in SQL.
-ALLOWED_RAW_ATTACHMENT_SOURCES: dict[str, str] = {
-    "gmail_attachments": "pending marts_files.attachments",
-    "whatsapp_media_items": "pending marts_files.attachments",
-    "apple_message_attachments": "pending marts_files.attachments",
-}
+# relation as data rather than in SQL. Empty on purpose since
+# marts_files.attachments: every descriptor reads the mart and names its
+# source in the predicate. Adding an entry here is re-opening the C5 hole.
+ALLOWED_RAW_ATTACHMENT_SOURCES: dict[str, str] = {}
 
 
 def _base_relations_named_in(text: str) -> set[str]:

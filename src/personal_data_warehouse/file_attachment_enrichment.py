@@ -245,10 +245,12 @@ GMAIL_SOURCE = FileEnrichmentSource(
     # per-attachment error budget after the generalization rename.
     task_type="gmail_attachment_enrichment",
     prompt_version="gmail-attachment-agent-v1",
-    table="gmail_attachments",
-    stored_predicate="a.is_deleted = 0 AND a.content_sha256 <> '' AND a.storage_status = 'stored'",
-    size_column="size",
-    order_column="internal_date",
+    # Candidates come from the conformed mart, never the raw table (C5): the
+    # descriptor only says WHICH source's rows this prompt/task_type covers.
+    table="marts_files_attachments",
+    stored_predicate="a.source = 'gmail' AND a.is_stored = 1",
+    size_column="size_bytes",
+    order_column="occurred_at",
     pdf_requires_prior_extraction=True,
 )
 
@@ -257,13 +259,12 @@ WHATSAPP_SOURCE = FileEnrichmentSource(
     label="WhatsApp media attachment",
     task_type="whatsapp_media_enrichment",
     prompt_version="whatsapp-media-agent-v1",
-    table="whatsapp_media_items",
-    # is_missing is stored as an integer flag (0/1). A downloaded media blob has
-    # is_missing=0 and a content hash; metadata-only history rows (is_missing=1)
-    # carry no bytes to enrich.
-    stored_predicate="a.is_missing = 0 AND a.content_sha256 <> ''",
+    table="marts_files_attachments",
+    # is_stored is the mart's conformed "bytes are in the object store" flag;
+    # metadata-only history rows (WhatsApp is_missing=1) carry no bytes to enrich.
+    stored_predicate="a.source = 'whatsapp' AND a.is_stored = 1",
     size_column="size_bytes",
-    order_column="message_at",
+    order_column="occurred_at",
     pdf_requires_prior_extraction=False,
 )
 
@@ -272,13 +273,10 @@ APPLE_MESSAGES_SOURCE = FileEnrichmentSource(
     label="iMessage attachment",
     task_type="apple_messages_attachment_enrichment",
     prompt_version="apple-messages-attachment-agent-v1",
-    table="apple_message_attachments",
-    # Same shape as WhatsApp: is_missing=0 marks a blob that was actually
-    # uploaded to the object store; metadata-only rows (never downloaded) carry
-    # no bytes to enrich.
-    stored_predicate="a.is_missing = 0 AND a.content_sha256 <> ''",
+    table="marts_files_attachments",
+    stored_predicate="a.source = 'apple_messages' AND a.is_stored = 1",
     size_column="size_bytes",
-    order_column="created_at",
+    order_column="occurred_at",
     # No deterministic PDF text-extraction stage exists for iMessage, same as
     # WhatsApp, so any PDF is directly eligible.
     pdf_requires_prior_extraction=False,

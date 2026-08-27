@@ -94,6 +94,9 @@ AI_EVENT_SOURCE_RELATIONS: dict[str, str] = {
 VOICE_EVENT_SOURCE_RELATIONS: dict[str, str] = {
     "apple_voice_memos": "apple_voice_memos_files",
     "alice_voice_recordings": "alice_voice_recordings",
+    # Audio saved inside Apple Notes (call recordings, voicemails, the app's
+    # own recorder); the mart selects the audio rows of the attachment table.
+    "apple_notes": "apple_note_attachments",
 }
 
 # THE extension point for photo sources. Maps a photo source slug (the

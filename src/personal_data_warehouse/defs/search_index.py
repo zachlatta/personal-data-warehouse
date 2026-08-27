@@ -56,6 +56,23 @@ def _warehouse() -> PostgresWarehouse:
     return warehouse
 
 
+def _oldest_pending_timeline_write(warehouse, cursor_seq: int) -> datetime:
+    """When the oldest timeline row past the chunk cursor was written.
+
+    One index-ordered probe on `seq`, never a count: it is what lets
+    marts_ops.search_health say `late` in wall-clock terms while a re-walk is
+    pumping millions of re-stamped rows through the chunker. The epoch means
+    "nothing pending" (the warehouse's absent sentinel).
+    """
+    rows = warehouse._query(
+        "SELECT updated_at FROM @timeline_events WHERE seq > %s ORDER BY seq ASC LIMIT 1",
+        (cursor_seq,),
+    )
+    if not rows or rows[0][0] is None:
+        return datetime.fromtimestamp(0, tz=UTC)
+    return rows[0][0]
+
+
 @asset(
     group_name="search",
     retry_policy=RetryPolicy(max_retries=3, delay=60),
@@ -73,13 +90,15 @@ def search_chunks(context) -> MaterializeResult:
             try:
                 stats = SearchChunkBuilder(warehouse).run(max_seconds=SEARCH_CHUNKS_RUN_BUDGET_SECONDS)
                 timeline_max = int(warehouse._query("SELECT COALESCE(max(seq), 0) FROM @timeline_events")[0][0])
+                caught_up = stats.caught_up and stats.last_seq >= timeline_max
                 warehouse.write_search_health(
                     "chunks",
                     timeline_max_seq=timeline_max,
                     chunk_cursor_seq=stats.last_seq,
-                    caught_up=1 if stats.caught_up and stats.last_seq >= timeline_max else 0,
+                    caught_up=1 if caught_up else 0,
                     processed_rows=stats.processed_events,
-                    pending_count=(0 if stats.caught_up and stats.last_seq >= timeline_max else -1),
+                    pending_count=(0 if caught_up else -1),
+                    oldest_pending_at=_oldest_pending_timeline_write(warehouse, stats.last_seq),
                     last_success_at=datetime.now(tz=UTC),
                     last_error="",
                 )

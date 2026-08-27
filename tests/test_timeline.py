@@ -645,6 +645,16 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
+        INSERT INTO @apple_note_attachments (account, note_id, revision_id, attachment_id, filename,
+                                            content_type, size_bytes, content_sha256, is_missing,
+                                            storage_file_id, ingested_at)
+        VALUES ('z@x.test', 'n1', 'r1', 'note-audio-1', 'Call Recording.m4a',
+                'audio/mp4a-latm', 4096, 'note-audio-sha', 0, 'drive-note-audio', %s)
+        """,
+        (_NOW,),
+    )
+    wh._command(
+        """
         INSERT INTO @apple_voice_memos_files (account, recording_id, title, filename, recorded_at, ingested_at)
         VALUES ('z@x.test', 'rec1', 'Standup', 'standup.m4a', %s, %s)
         """,
@@ -905,7 +915,7 @@ EXPECTED_SEEDED_EVENTS = {
     "agent_session_turn": 2,
     "apple_note_revision": 1,
     # One adapter, two seeded sources: the Apple memo and the Alice recording.
-    "voice_memo": 2,
+    "voice_memo": 3,
     "calendar_event": 1,
     "drive_file": 1,
     "photo": 1,
@@ -1005,7 +1015,11 @@ def test_backfill_normalizes_every_source(warehouse):
     assert {r["metadata"]["voice_source"] for r in memos} == {
         "apple_voice_memos",
         "alice_voice_recordings",
+        "apple_notes",
     }
+    note_audio = next(r for r in memos if r["metadata"]["voice_source"] == "apple_notes")
+    assert note_audio["source_pk"]["recording_id"] == "note-audio-1"
+    assert note_audio["title"] == "Groceries"  # the note's title until an enrichment names it
     memo = next(r for r in memos if r["metadata"]["voice_source"] == "apple_voice_memos")
     assert memo["title"] == "Standup notes"
     assert memo["snippet"] == "we discussed things"
@@ -2507,6 +2521,54 @@ def test_backfill_pages_newest_first(warehouse):
     state = warehouse._query_dicts("SELECT * FROM @timeline_sync_state")[0]
     assert state["backfill_done"] == 1
     assert state["backfill_rows"] == 7
+
+
+def test_backfill_budget_throttles_the_rewalk_but_never_incremental_sync(warehouse):
+    """`backfill_max_seconds` bounds only the history re-walk.
+
+    A changed adapter re-walks every row it owns (slack alone is 46.8M), and
+    the run budget let that spend 240 of every 300 seconds writing WAL faster
+    than the archiver could ship it. The throttle is a separate, smaller
+    budget for the backfill loop; incremental sync -- the part that keeps the
+    timeline current -- is never throttled by it.
+    """
+    _ensure_all_source_tables(warehouse)
+    # Ingested well before the incremental lag window, so only the backfill
+    # re-walk can deliver these seven.
+    for i in range(7):
+        warehouse._command(
+            """
+            INSERT INTO @gmail_messages (account, message_id, internal_date, subject, synced_at)
+            VALUES ('z@x.test', %s, %s, %s, %s)
+            """,
+            (f"m{i}", _NOW - timedelta(hours=i), f"mail {i}", _NOW - timedelta(days=10 + i)),
+        )
+    engine = _engine(warehouse, adapters=[adapter_by_name("gmail_email")], batch_size=3)
+    try:
+        engine.run(backfill_max_seconds=0.000001)
+        landed = warehouse._query("SELECT count(*) FROM @timeline_events")[0][0]
+        assert landed < 7
+
+        # A zero backfill budget: the re-walk does not advance at all...
+        warehouse._command(
+            """
+            INSERT INTO @gmail_messages (account, message_id, internal_date, subject, synced_at)
+            VALUES ('z@x.test', 'm-new', %s, 'mail new', %s)
+            """,
+            (_NOW + timedelta(hours=1), _NOW + timedelta(hours=1)),
+        )
+        stats = engine.run(backfill_max_seconds=0)
+        # ...but the new message still lands through incremental sync.
+        assert stats[0].backfill_rows == 0
+        assert stats[0].incremental_rows == 1
+        assert warehouse._query("SELECT count(*) FROM @timeline_events")[0][0] == landed + 1
+        state = warehouse._query_dicts("SELECT * FROM @timeline_sync_state")[0]
+        assert state["backfill_done"] == 0
+
+        engine.run()
+    finally:
+        engine.close()
+    assert warehouse._query("SELECT count(*) FROM @timeline_events")[0][0] == 8
 
 
 def test_engine_pumps_into_a_separate_destination_schema(warehouse):

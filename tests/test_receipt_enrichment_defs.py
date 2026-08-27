@@ -195,7 +195,7 @@ def test_one_pdw_agent_operation_per_transaction():
                 {"native_id": native_id} for native_id in params[0] if native_id == "ph_1"
             ],
             "FROM @gmail_messages WHERE": [],
-            "FROM @gmail_attachments WHERE": [],
+            "FROM @marts_files_attachments WHERE": [],
         }
     )
     agent = FakeAgent(_found_result())
@@ -218,7 +218,7 @@ def test_receipt_is_not_published_when_agent_invents_evidence():
             "FROM @finance_transactions AS t": [_transaction()],
             "FROM @clean_photos WHERE": [],
             "FROM @gmail_messages WHERE": [],
-            "FROM @gmail_attachments WHERE": [],
+            "FROM @marts_files_attachments WHERE": [],
         }
     )
     summary = _runner(warehouse, FakeAgent(_found_result())).sync()
@@ -247,7 +247,7 @@ def test_gmail_attachment_evidence_is_validated_by_attachment_id():
     warehouse = FakeWarehouse(
         {
             "FROM @finance_transactions AS t": [_transaction()],
-            "FROM @gmail_attachments WHERE": [{"native_id": "att_1"}],
+            "FROM @marts_files_attachments WHERE": [{"native_id": "att_1"}],
         }
     )
 
@@ -256,7 +256,7 @@ def test_gmail_attachment_evidence_is_validated_by_attachment_id():
     assert summary.receipts_found == 1
     assert warehouse.rows[0]["primary_native_id"] == "att_1"
     attachment_sql = next(
-        sql for sql, _ in warehouse.queries if "FROM @gmail_attachments WHERE" in sql
+        sql for sql, _ in warehouse.queries if "FROM @marts_files_attachments WHERE" in sql
     )
     assert "SELECT attachment_id AS native_id" in attachment_sql
     assert "WHERE attachment_id = ANY(%s)" in attachment_sql
