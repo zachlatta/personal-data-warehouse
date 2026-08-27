@@ -1211,6 +1211,64 @@ hours while the row read green and 45 recordings across three sources sat untran
 attributed to a quiet uploader. A successful retry overwrites the error row, so the failure
 clears itself; a persistent one is a billing or credential action, not a pipeline bug.
 
+**A recording the provider will never accept is `rejected`, not `error`, and that
+distinction is what keeps the row readable.** The error count behind
+`state_error_rows` is over the WHOLE runs table with no time bound, so a single
+permanently unacceptable recording pins `voice_memo_transcription` to `failing`
+forever. Production had eleven of them -- "no spoken audio", "audio duration is too
+short", "does not appear to contain audio", oldest 2026-05-01 -- which means the row
+was **already red** when the balance outage arrived on 2026-08-27 and the StateSource
+added to catch that outage could not have caught it. `rejected` is terminal for the
+candidate query and sits outside `StateSource.error_statuses`, exactly as slack's
+`gone` does. The classifier is an **allow-list** of recognised rejections
+(`PERMANENT_VOICE_MEMO_TRANSCRIPTION_REJECTION_PATTERNS`), never "whatever is not
+retryable": mistaking a permanent rejection for a transient one costs one wasted API
+call, while mistaking a TRANSIENT failure for permanent silently retires the recording
+and hides the outage. An unrecognised error stays `error` and stays red on purpose.
+
+**"Out of credits" was the wrong account, and the balance alone cannot tell you which.**
+The 2026-08-27 rejection was real, but it belonged to an AssemblyAI account whose balance
+had gone negative -- while the account Zach was reading a positive balance on was a
+*different* one, whose key production did not hold. Both statements were true at once, so
+the disagreement is not evidence that the API is lying. The check that settles it takes one
+call and names the account: post a transcript with the key production actually has and read
+`project_id` off the response. Rotating the key is the repair, and it is only complete when
+the value in the Coolify **Dagster** deployment changes -- the app deployment carries no
+`ASSEMBLYAI_API_KEY`, so updating the repo `.env` alone fixes nothing in production.
+
+**The speech model mishears "Hack Club" as "HackPad", and the transcript is left
+alone on purpose.** Universal-3.5 Pro produces `HackPad` on some audio even though
+`Hack Club` sits in `keyterms_prompt`, and AssemblyAI's `custom_spelling` cannot repair
+it -- the API rejects a multi-word `to` field, and "Hack Club" is two words. Measured
+2026-08-27 across seven recordings re-run through both models: `Hack Club` 29 -> 23 and
+`HackPad` 0 -> 3, with **all** of the loss inside one acoustically hard recording and
+five of seven preserving the term exactly. The corpus says which one is real -- 504 of
+632 stored transcripts contain `Hack Club`, 12 contain `HackPad` -- so a `HackPad` hit
+is almost always the mishearing rather than the defunct Dropbox product.
+
+**No stored transcript is unreachable by this today, and that is a fact with a shelf
+life.** Measured 2026-08-27, every one of the 12 transcripts containing `HackPad` also
+contains `Hack Club` somewhere else, so a `Hack Club` search currently misses **zero**
+recordings. What the mishearing costs is a *count*, not a document -- until a short
+recording arrives whose every mention is misheard, at which point that one really does
+become unreachable. Search both spellings when the answer depends on completeness. The repair is
+deliberately NOT a rewrite of `transcript`: editing the provider's words would destroy
+the evidence that the mishearing happened and would corrupt a genuine mention. Instead
+`ASR_CONFUSION_HINTS` in `apple_voice_memos_enrichment.py` carries the (heard, intended,
+why) triple, `enrichment_system_prompt()` hands it to the enrichment agent, and the
+agent resolves the term in `title`, `summary`, `participants` and `action_items` while
+leaving `transcript` untouched and recording what it did in `evidence`. Adding a future
+mishearing is one tuple. The prompt version bump (`...-agent-v7`) re-enriches within
+`VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS` rather than the whole corpus.
+
+**Universal-3.5 Pro is the model, with the older two as fallback.**
+`ASSEMBLYAI_SPEECH_MODELS` is `("universal-3-5-pro", "universal-3-pro", "universal-2")`,
+sent as the `speech_models` fallback chain. Those three are the only slugs the API accepts;
+an unknown one is a 400 that names the valid list, so a typo fails loud instead of quietly
+transcribing at a lower quality. `speech_model_used` on the response records which one ran,
+and it is what `derived_voice_memos.transcription_runs.model` stores -- read that column
+rather than assuming the head of the chain served the request.
+
 **That mart is the INPUT to transcription and enrichment, not only an output.** Both
 passes (`defs/apple_voice_memos_transcription.py`, `defs/apple_voice_memos_enrichment.py`)
 take their candidates from it, so a new voice source is transcribed and enriched by

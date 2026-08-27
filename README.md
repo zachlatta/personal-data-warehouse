@@ -1249,8 +1249,11 @@ uv run python -c "from dagster import materialize; from personal_data_warehouse.
 ```
 
 The transcription asset stores the raw AssemblyAI response JSON in Postgres and also stores
-normalized diarized segments for search. AssemblyAI is configured with Universal-3 Pro plus
-domain keyterms for Hack Club and common project/product terms.
+normalized diarized segments for search. AssemblyAI is configured with **Universal-3.5 Pro**
+(`universal-3-5-pro`), falling back to `universal-3-pro` then `universal-2`, plus domain keyterms
+for Hack Club and common project/product terms. Those three slugs are the only values the API
+accepts today; it answers 400 with the valid list for anything else, so a typo fails loud rather
+than silently downgrading the model.
 
 Transcript enrichment is a separate agent-backed Dagster asset. It reads completed transcription
 runs, asks a one-off subscription-authenticated Codex or Claude Code container to produce structured

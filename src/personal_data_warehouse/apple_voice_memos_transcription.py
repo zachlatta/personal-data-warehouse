@@ -14,10 +14,11 @@ from typing import Any
 import requests
 
 from personal_data_warehouse.objectstore import ObjectStore
+from personal_data_warehouse.schema import voice_memo_transcription_failure_status
 
 
 ASSEMBLYAI_PROVIDER = "assemblyai"
-ASSEMBLYAI_SPEECH_MODELS = ("universal-3-pro", "universal-2")
+ASSEMBLYAI_SPEECH_MODELS = ("universal-3-5-pro", "universal-3-pro", "universal-2")
 DEFAULT_ASSEMBLYAI_SPEAKER_OPTIONS = {"min_speakers_expected": 1, "max_speakers_expected": 8}
 MAX_ASSEMBLYAI_ERROR_BODY_CHARS = 2000
 ASSEMBLYAI_KEYTERMS_PROMPT = (
@@ -338,7 +339,13 @@ def failed_transcription_run_row(
         "provider": provider,
         "provider_transcript_id": "",
         "model": "",
-        "status": "error",
+        # 'error' only when a retry could plausibly succeed. A provider that
+        # rejected the INPUT -- no speech, too short, not audio -- is recorded
+        # as 'rejected', which is terminal for the candidate query but is NOT
+        # in StateSource.error_statuses, so one impossible recording cannot pin
+        # voice_memo_transcription to failing forever and drown out a real
+        # provider outage.
+        "status": voice_memo_transcription_failure_status(error),
         "error": error,
         "transcript_text": "",
         "raw_result_json": "{}",

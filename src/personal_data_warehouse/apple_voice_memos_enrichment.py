@@ -21,7 +21,7 @@ from personal_data_warehouse.apple_voice_memos_transcription import voice_record
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
-AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v6"
+AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v7"
 DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
 DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 5
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
@@ -1906,13 +1906,56 @@ def unresolved_speaker_name_for_enrichment(name: str) -> bool:
     )
 
 
+# Terms the speech model reliably mishears, as (what the transcript may say,
+# what was probably said, why we believe that). This is GUIDANCE for the agent,
+# not a rewrite rule: the transcript is kept exactly as the provider returned it,
+# because silently editing it would destroy the evidence that the mishearing
+# happened and would corrupt a genuine mention of the other term.
+#
+# Universal-3.5 Pro produces "HackPad" for "Hack Club" on some audio even though
+# "Hack Club" is in keyterms_prompt, and AssemblyAI's custom_spelling cannot fix
+# it (its "to" field accepts a single word only, and "Hack Club" is two).
+# Measured 2026-08-27 over seven recordings: "Hack Club" 29 -> 23 and "HackPad"
+# 0 -> 3, all of the loss inside one acoustically hard recording. The corpus
+# says which is real: 504 of 632 stored transcripts contain "Hack Club" and 12
+# contain "HackPad".
+ASR_CONFUSION_HINTS: tuple[tuple[str, str, str], ...] = (
+    (
+        "HackPad",
+        "Hack Club",
+        'the speech model mishears "Hack Club"; "Hack Club" appears in 504 of 632 '
+        'stored transcripts and "HackPad" in 12',
+    ),
+)
+
+
+def asr_confusion_guidance() -> str:
+    """One sentence per known mishearing, for the enrichment agent's prompt."""
+    if not ASR_CONFUSION_HINTS:
+        return ""
+    items = "; ".join(
+        f'"{heard}" is very likely "{intended}" ({why})'
+        for heard, intended, why in ASR_CONFUSION_HINTS
+    )
+    return (
+        "Known speech-recognition confusions in these transcripts: "
+        f"{items}. "
+        "Treat such a token as the intended term when the surrounding context supports it, "
+        "and use the intended term in title, summary, participants and action_items. "
+        "Do NOT edit the transcript field itself -- keep it exactly as transcribed -- and "
+        "say in evidence that you resolved the term and why. "
+        "Verify against the warehouse with a read-only query rather than assuming. "
+    )
+
+
 def enrichment_system_prompt() -> str:
     return (
         "You enrich transcripts from personal Voice Memos. Return only structured JSON matching the schema. "
         "Before final JSON, you must use warehouse tools: first call show_schema to inspect live table/column names, then use sql for read-only investigation. "
         "Use read-only queries to verify likely calendar matches, participants, speaker identities, and domain terms. "
         "The non-negotiable requirements are accurate time/date, accurate participant/name spellings, and accurate domain terms in transcript. "
-        "Do not invent calendar links, people, or locations. If uncertain, set low confidence and explain the uncertainty in evidence. "
+        + asr_confusion_guidance()
+        + "Do not invent calendar links, people, or locations. If uncertain, set low confidence and explain the uncertainty in evidence. "
         "Keep transcript faithful to the source; put synthesized narrative writing only in summary."
     )
 

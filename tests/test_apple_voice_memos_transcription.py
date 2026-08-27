@@ -41,7 +41,7 @@ class FakeSession:
             {
                 "id": "tx1",
                 "status": "completed",
-                "speech_model_used": "universal-3-pro",
+                "speech_model_used": "universal-3-5-pro",
                 "text": "Hello there.",
                 "utterances": [],
             },
@@ -114,7 +114,7 @@ class FakeTranscriptionClient:
         return {
             "id": "tx1",
             "status": "completed",
-            "speech_model_used": "universal-3-pro",
+            "speech_model_used": "universal-3-5-pro",
             "text": "Alice: hello. Bob: hi.",
             "utterances": [
                 {"speaker": "A", "start": 0, "end": 900, "confidence": 0.98, "text": "Hello.", "words": []},
@@ -153,7 +153,10 @@ def test_assemblyai_request_enables_diarization_and_best_models() -> None:
     assert request["speaker_labels"] is True
     assert request["speaker_options"] == {"min_speakers_expected": 1, "max_speakers_expected": 8}
     assert request["language_detection"] is True
-    assert request["speech_models"] == ["universal-3-pro", "universal-2"]
+    # Universal-3.5 Pro first, older models only as fallback. AssemblyAI rejects an
+    # unknown slug with 400, so a typo here fails loud rather than silently downgrading.
+    assert request["speech_models"] == ["universal-3-5-pro", "universal-3-pro", "universal-2"]
+    assert request["speech_models"][0] == "universal-3-5-pro"
     assert "keyterms_prompt" in request
     assert "prompt" not in request
     assert "Pellegrino" in request["keyterms_prompt"]
@@ -245,3 +248,36 @@ def test_transcription_runner_writes_run_and_segments() -> None:
     assert warehouse.run_rows[0]["provider_transcript_id"] == "tx1"
     assert warehouse.run_rows[0]["content_sha256"] == "audio-hash"
     assert warehouse.segment_rows[0]["speaker_label"] == "A"
+
+
+def test_the_enrichment_agent_is_told_hackpad_probably_means_hack_club() -> None:
+    """Universal-3.5 Pro mishears the corpus's most common proper noun.
+
+    "Hack Club" is in keyterms_prompt and the model overrides it anyway, and
+    custom_spelling cannot express the repair (its "to" field takes one word;
+    "Hack Club" is two). So the transcript keeps the provider's exact words and
+    the AGENT is told how to read them. Deleting this guidance silently
+    degrades every downstream title, summary and action item.
+    """
+    from personal_data_warehouse.apple_voice_memos_enrichment import (
+        ASR_CONFUSION_HINTS,
+        enrichment_system_prompt,
+    )
+
+    assert ("HackPad", "Hack Club") in {(heard, intended) for heard, intended, _ in ASR_CONFUSION_HINTS}
+
+    prompt = enrichment_system_prompt()
+    assert "HackPad" in prompt
+    assert "Hack Club" in prompt
+    # The transcript itself must stay untouched -- the guidance is for the
+    # agent's OUTPUT fields, not a licence to rewrite the evidence.
+    assert "Do NOT edit the transcript" in prompt
+
+
+def test_a_transcript_is_never_rewritten_to_repair_a_misheard_term() -> None:
+    """The provider's words are the evidence; only the agent's reading changes."""
+    from personal_data_warehouse.apple_voice_memos_transcription import clean_transcript_text
+
+    assert clean_transcript_text("800 weighted grants from HackPad.") == (
+        "800 weighted grants from HackPad."
+    )

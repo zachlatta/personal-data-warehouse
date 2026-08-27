@@ -91,7 +91,7 @@ class FakeTranscriptionClient:
         self.calls.append({"path": path, "content_type": content_type, "bytes": path.read_bytes()})
         if self.error is not None:
             raise self.error
-        return {"id": "transcript-1", "status": "completed", "text": self.text, "speech_model_used": "universal-3-pro"}
+        return {"id": "transcript-1", "status": "completed", "text": self.text, "speech_model_used": "universal-3-5-pro"}
 
 
 class FakeAgent:
