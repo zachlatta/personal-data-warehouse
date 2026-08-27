@@ -298,6 +298,13 @@ main() {
   ensure_stanza || log "stanza preparation failed at startup; will retry each cycle"
   run_check || log "pgBackRest check failed at startup; will retry each cycle"
 
+  # Report once at startup, before the first six-hour sleep. The cycle timer
+  # restarts with the container, so a container recreated more often than the
+  # interval would never reach the periodic report and the row would simply go
+  # stale -- the monitor reading 'unknown' for a reason that has nothing to do
+  # with the backups. Startup is also exactly when the facts have just changed.
+  report_health "" 1 ""
+
   if bool_enabled "${PDW_PGBACKREST_BACKUP_ON_STARTUP:-true}" && ! has_backup; then
     if run_backup full; then
       mark_backup_type_done full

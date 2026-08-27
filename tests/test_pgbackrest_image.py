@@ -264,3 +264,18 @@ def test_repo_bytes_falls_back_to_the_block_incremental_delta() -> None:
     loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
 
     assert "'repository'->>'delta'" in loop
+
+
+def test_health_is_reported_at_startup_before_the_first_sleep() -> None:
+    """A container recreated more often than the interval never reports.
+
+    The cycle timer restarts with the container, so the periodic report at the
+    end of each six-hour loop is unreachable for a container that keeps being
+    recreated -- and the row goes stale for a reason unrelated to the backups.
+    """
+
+    loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
+    startup = loop[loop.index("def main() {") if "def main() {" in loop else loop.index("main() {"):]
+    startup = startup[: startup.index("local interval=")]
+
+    assert 'report_health "" 1 ""' in startup, "startup must refresh the health row"
