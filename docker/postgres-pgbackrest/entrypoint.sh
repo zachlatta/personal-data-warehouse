@@ -41,12 +41,32 @@ append_config_if_set() {
 
 render_pgbackrest_config() {
   local cipher_type="${PGBACKREST_REPO1_CIPHER_TYPE:-aes-256-cbc}"
+  local repo_type="${PGBACKREST_REPO1_TYPE:-s3}"
 
-  require_env \
-    PGBACKREST_REPO1_S3_BUCKET \
-    PGBACKREST_REPO1_S3_ENDPOINT \
-    PGBACKREST_REPO1_S3_KEY \
-    PGBACKREST_REPO1_S3_KEY_SECRET
+  # Only the selected transport's credentials are mandatory. An SFTP
+  # deployment has no bucket, endpoint, or access key, and an S3 one has no
+  # private key, so requiring both sets would refuse to start after a cutover.
+  case "$repo_type" in
+    s3)
+      require_env \
+        PGBACKREST_REPO1_S3_BUCKET \
+        PGBACKREST_REPO1_S3_ENDPOINT \
+        PGBACKREST_REPO1_S3_KEY \
+        PGBACKREST_REPO1_S3_KEY_SECRET
+      ;;
+    sftp)
+      require_env \
+        PGBACKREST_REPO1_SFTP_HOST \
+        PGBACKREST_REPO1_SFTP_HOST_USER \
+        PGBACKREST_REPO1_SFTP_PRIVATE_KEY_FILE
+      ;;
+    posix|cifs)
+      ;;
+    *)
+      log "unsupported PGBACKREST_REPO1_TYPE: $repo_type"
+      exit 1
+      ;;
+  esac
 
   if [ "$cipher_type" != "none" ]; then
     require_env PGBACKREST_REPO1_CIPHER_PASS
@@ -72,14 +92,34 @@ render_pgbackrest_config() {
   umask 0077
   cat > "$PGBACKREST_CONFIG_PATH" <<EOF
 [global]
-repo1-type=s3
+repo1-type=${repo_type}
 repo1-path=${repo_path}
+EOF
+
+  if [ "$repo_type" = "s3" ]; then
+    cat >> "$PGBACKREST_CONFIG_PATH" <<EOF
 repo1-s3-bucket=${PGBACKREST_REPO1_S3_BUCKET}
 repo1-s3-endpoint=${PGBACKREST_REPO1_S3_ENDPOINT}
 repo1-s3-region=${region}
 repo1-s3-key=${PGBACKREST_REPO1_S3_KEY}
 repo1-s3-key-secret=${PGBACKREST_REPO1_S3_KEY_SECRET}
 repo1-s3-uri-style=${uri_style}
+EOF
+  elif [ "$repo_type" = "sftp" ]; then
+    # libssh2 negotiates ECDSA against Synology DSM, so the known-hosts file
+    # must contain the ECDSA host key ONLY: libssh2 reports
+    # LIBSSH2_KNOWNHOST_CHECK_MISMATCH when the host has entries of a type it
+    # did not negotiate. Verified against slowking 2026-08-26.
+    cat >> "$PGBACKREST_CONFIG_PATH" <<EOF
+repo1-sftp-host=${PGBACKREST_REPO1_SFTP_HOST}
+repo1-sftp-host-user=${PGBACKREST_REPO1_SFTP_HOST_USER}
+repo1-sftp-private-key-file=${PGBACKREST_REPO1_SFTP_PRIVATE_KEY_FILE}
+repo1-sftp-host-key-hash-type=${PGBACKREST_REPO1_SFTP_HOST_KEY_HASH_TYPE:-sha256}
+repo1-sftp-host-key-check-type=${PGBACKREST_REPO1_SFTP_HOST_KEY_CHECK_TYPE:-strict}
+EOF
+  fi
+
+  cat >> "$PGBACKREST_CONFIG_PATH" <<EOF
 repo1-cipher-type=${cipher_type}
 compress-type=${compress_type}
 process-max=${process_max}
@@ -101,6 +141,14 @@ EOF
   append_config_if_set "repo1-s3-ca-file" "PGBACKREST_REPO1_S3_CA_FILE"
   append_config_if_set "repo1-s3-ca-path" "PGBACKREST_REPO1_S3_CA_PATH"
   append_config_if_set "repo1-storage-verify-tls" "PGBACKREST_REPO1_STORAGE_VERIFY_TLS"
+  append_config_if_set "repo1-sftp-public-key-file" "PGBACKREST_REPO1_SFTP_PUBLIC_KEY_FILE"
+  append_config_if_set "repo1-sftp-known-host" "PGBACKREST_REPO1_SFTP_KNOWN_HOST"
+  append_config_if_set "repo1-sftp-host-port" "PGBACKREST_REPO1_SFTP_HOST_PORT"
+  append_config_if_set "repo1-sftp-host-fingerprint" "PGBACKREST_REPO1_SFTP_HOST_FINGERPRINT"
+  append_config_if_set "repo1-sftp-private-key-passphrase" "PGBACKREST_REPO1_SFTP_PRIVATE_KEY_PASSPHRASE"
+  append_config_if_set "repo1-bundle" "PGBACKREST_REPO1_BUNDLE"
+  append_config_if_set "repo1-block" "PGBACKREST_REPO1_BLOCK"
+  append_config_if_set "repo1-storage-upload-chunk-size" "PGBACKREST_REPO1_STORAGE_UPLOAD_CHUNK_SIZE"
   append_config_if_set "archive-async" "PGBACKREST_ARCHIVE_ASYNC"
   append_config_if_set "archive-push-queue-max" "PGBACKREST_ARCHIVE_PUSH_QUEUE_MAX"
   append_config_if_set "repo1-retention-diff" "PGBACKREST_REPO1_RETENTION_DIFF"

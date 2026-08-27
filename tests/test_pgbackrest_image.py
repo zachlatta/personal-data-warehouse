@@ -104,3 +104,79 @@ def test_a_real_backup_failure_is_still_reported_as_one() -> None:
     loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
     assert 'report_health "$type" 0 "${type} backup failed"' in loop
     assert 'report_health "$type" 1 ""' in loop, "a success must be recorded too"
+
+
+def test_pgbackrest_repository_type_is_configurable_for_sftp() -> None:
+    """PDW must be able to back up over SFTP, not only to S3.
+
+    Measured 2026-08-26 against the Garage S3 repository on slowking: a single
+    512 MB object took 886.9 s (0.58 MB/s).  The payload was all zeros, so
+    Garage's own compression meant almost nothing reached the platters --
+    the cost was ~1.73 s per 1 MiB block of metadata commit (LMDB fsync on
+    btrfs on a RAID5 array whose queue never drains), not data bandwidth.
+    The same 512 MB written to the same array over SFTP took 26 s (19.7 MB/s),
+    a 34x improvement, because pgBackRest's large sequential files never get
+    shredded into a million blocks.  Keep the repository type env-driven so the
+    transport is a deployment decision, not an image rebuild.
+    """
+
+    entrypoint = ENTRYPOINT.read_text()
+
+    assert "repo1-type=${repo_type}" in entrypoint
+    assert 'repo_type="${PGBACKREST_REPO1_TYPE:-s3}"' in entrypoint
+
+    # SFTP transport options must all be renderable from the environment.
+    for option in (
+        "repo1-sftp-host=",
+        "repo1-sftp-host-user=",
+        "repo1-sftp-private-key-file=",
+        "repo1-sftp-host-key-hash-type=",
+        "repo1-sftp-host-key-check-type=",
+    ):
+        assert option in entrypoint, option
+
+    for env_name in (
+        "PGBACKREST_REPO1_SFTP_PUBLIC_KEY_FILE",
+        "PGBACKREST_REPO1_SFTP_KNOWN_HOST",
+        "PGBACKREST_REPO1_SFTP_HOST_PORT",
+        "PGBACKREST_REPO1_SFTP_HOST_FINGERPRINT",
+    ):
+        assert env_name in entrypoint, env_name
+
+
+def test_pgbackrest_s3_credentials_are_only_required_for_an_s3_repository() -> None:
+    """An SFTP deployment has no bucket, endpoint, or access key.
+
+    Requiring the S3 quartet unconditionally would make the container refuse to
+    start after the transport cutover.
+    """
+
+    entrypoint = ENTRYPOINT.read_text()
+
+    # The S3 requirement must sit inside a branch on the repository type.
+    s3_requirement = entrypoint.index("PGBACKREST_REPO1_S3_BUCKET")
+    type_branch = entrypoint.index('case "$repo_type"')
+    assert type_branch < s3_requirement
+
+
+def test_pgbackrest_wal_archiving_can_run_asynchronously() -> None:
+    """Synchronous archive-push pushes one 16 MB segment at a time.
+
+    On 2026-08-26 PDW had 5,075 unarchived segments (79 GB) growing +8.7 GB/h
+    net, because each segment cost ~27 s of Garage block commits and archive
+    push was serialised.  archive-async plus a spool path lets pgBackRest batch
+    and parallelise, so the queue can actually drain.
+    """
+
+    entrypoint = ENTRYPOINT.read_text()
+
+    for option, env_name in (
+        ("archive-async", "PGBACKREST_ARCHIVE_ASYNC"),
+        ("repo1-bundle", "PGBACKREST_REPO1_BUNDLE"),
+        ("repo1-block", "PGBACKREST_REPO1_BLOCK"),
+    ):
+        assert f'append_config_if_set "{option}" "{env_name}"' in entrypoint, option
+
+    # archive-timeout is emitted unconditionally with a default, so it must NOT
+    # also be appended conditionally: a duplicated option fails config parsing.
+    assert entrypoint.count("archive-timeout") == 1

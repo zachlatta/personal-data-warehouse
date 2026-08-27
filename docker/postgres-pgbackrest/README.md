@@ -77,6 +77,7 @@ POSTGRES_PASSWORD=change-me
 POSTGRES_DB=pdw
 
 PGBACKREST_STANZA=pdw
+PGBACKREST_REPO1_TYPE=s3
 PGBACKREST_REPO1_S3_BUCKET=...
 PGBACKREST_REPO1_S3_ENDPOINT=...
 PGBACKREST_REPO1_S3_REGION=auto
@@ -88,6 +89,69 @@ PGBACKREST_REPO1_CIPHER_PASS=...
 PGBACKREST_IO_TIMEOUT=1800
 PGBACKREST_ARCHIVE_TIMEOUT=1800
 ```
+
+## Repository Transport
+
+`PGBACKREST_REPO1_TYPE` selects the transport and defaults to `s3`. Only the
+selected transport's credentials are required, so a deployment that uses SFTP
+does not need a bucket, endpoint, or access key.
+
+**Do not leave the other transport's variables set.** pgBackRest reads
+`PGBACKREST_*` from the environment at a *higher* precedence than any config
+file, so a stale `PGBACKREST_REPO1_S3_BUCKET` will both override the rendered
+config and fail option validation once the type is `sftp`. Remove them.
+
+For `PGBACKREST_REPO1_TYPE=sftp`:
+
+```bash
+PGBACKREST_REPO1_TYPE=sftp
+PGBACKREST_REPO1_PATH=/<share>/backups/pgbackrest/pdw
+PGBACKREST_REPO1_SFTP_HOST=...
+PGBACKREST_REPO1_SFTP_HOST_USER=...
+PGBACKREST_REPO1_SFTP_PRIVATE_KEY_FILE=/var/lib/postgresql/.pgbackrest/id_ed25519
+PGBACKREST_REPO1_SFTP_PUBLIC_KEY_FILE=/var/lib/postgresql/.pgbackrest/id_ed25519.pub
+PGBACKREST_REPO1_SFTP_KNOWN_HOST=/var/lib/postgresql/.pgbackrest/known_hosts
+PGBACKREST_REPO1_SFTP_HOST_KEY_HASH_TYPE=sha256
+PGBACKREST_REPO1_SFTP_HOST_KEY_CHECK_TYPE=strict
+```
+
+Keep the key pair and `known_hosts` under `/var/lib/postgresql`, which is the
+persistent volume: anything written elsewhere in the container is lost on the
+next recreation, and the repository then becomes unreachable.
+
+Two traps, both measured against Synology DSM on 2026-08-26:
+
+- **The known-hosts file must contain exactly one host key type.** libssh2
+  negotiates ECDSA against DSM, and reports
+  `LIBSSH2_KNOWNHOST_CHECK_MISMATCH` when the host also has entries of a type
+  it did not negotiate. `ssh-keyscan -t ecdsa <host>` is the correct input;
+  a plain `ssh-keyscan` returns several types and fails the strict check.
+- **DSM presents SFTP paths relative to the share, not the filesystem root.**
+  The repository path is `/<share>/backups/...`, never
+  `/volume1/<share>/backups/...`. An absolute volume path fails with
+  `unable to create path '/volume1': permission denied`, because pgBackRest is
+  trying to create a share at the SFTP root.
+
+## Why SFTP Instead of S3 for an HDD Repository
+
+pgBackRest writes a few hundred large sequential files. Garage splits every
+object into 1 MiB blocks and indexes each one in LMDB. Measured on
+2026-08-26 against the Garage repository on slowking:
+
+| Path | Throughput |
+| --- | --- |
+| Garage S3, single 512 MB PUT | 0.58 MB/s (886.9 s) |
+| SFTP to the same array, same 512 MB | 19.7 MB/s (26 s) |
+| Raw TCP over Tailscale | 38.4 MB/s |
+| Raw TCP over the LAN | 100.2 MB/s |
+| The array's own sequential write | 103 MB/s |
+
+The Garage payload was all zeros, so its own compression meant almost nothing
+reached the platters, and it *still* took 886.9 s. The cost is ~1.73 s per
+1 MiB block of metadata commit -- an LMDB fsync on btrfs on a RAID5 array whose
+queue never drains -- not data bandwidth. Object storage on spinning disks is
+the wrong shape for this workload; the network and the disks were never the
+limit.
 
 The image defaults to client-side AES-256 encryption:
 
