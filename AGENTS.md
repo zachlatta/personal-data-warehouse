@@ -97,8 +97,11 @@ quietly becoming untrue, and several of these have been.
   with `pull-labels`, so a lost gitignored directory can no longer make retrieval quality
   unmeasurable — which it did once, in 2026-08. First run, 2026-08-27 04:44Z: **MRR 0.434
   over 68 labeled cases** (hit@1 24, hit@5 36, hit@10 44, found 49), latency unmeasured
-  because every unscoped probe timed out on a cold HNSW cache — and the row says so, rather
-  than reporting zero.
+  because every unscoped probe timed out on a cold HNSW cache — and the row said so, rather
+  than reporting zero. Second run, 12:02Z the same day, after all four BM25 indexes were
+  rebuilt and the HNSW index prewarmed: **MRR 0.450** (hit@1 24, hit@5 37, hit@10 48, found
+  54), unscoped hybrid **p50 2.09s / p90 3.54s / max 3.59s** — `attention` by 90ms against
+  the 2s goal, which is the honest distance left.
 - **C9 — one obvious way to do a thing, on both surfaces.** There is exactly one hybrid
   search, one SQL entry point per surface, one schema-discovery call. *Held up by*
   `tool.Surface` splitting MCP-only and CLI-only tools, the `runCall` fence that refuses
