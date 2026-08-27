@@ -83,7 +83,24 @@ except Exception:
 # operator or a wrapper pointing at a different origin is never overridden, and
 # a missing or unreadable config is a silent no-op (openclaw and CI have none).
 pdw_export_app_credentials() {
-  _cfg="${PDW_CONFIG:-$HOME/.config/pdw/config.json}"
+  # Mirror the Go CLI's resolution exactly (app/internal/cliconfig/cliconfig.go):
+  # $XDG_CONFIG_HOME (else ~/.config), directory "pdw", falling back to the
+  # pre-rename "pdw-cli" when the canonical file is absent or empty. Checking
+  # only the canonical path makes this a silent no-op on a host that logged in
+  # before the rename and never re-ran `pdw login` -- which is exactly the
+  # openclaw VM, whose uploader kept working (the Go CLI knows both paths)
+  # while its heartbeat kept failing.
+  _base="${XDG_CONFIG_HOME:-$HOME/.config}"
+  _cfg="${PDW_CONFIG:-}"
+  if [ -z "$_cfg" ]; then
+    for _candidate in "$_base/pdw/config.json" "$_base/pdw-cli/config.json"; do
+      if [ -r "$_candidate" ] && [ -s "$_candidate" ]; then
+        _cfg="$_candidate"
+        break
+      fi
+    done
+  fi
+  [ -n "$_cfg" ] || return 0
   [ -r "$_cfg" ] || return 0
   if [ -z "${PDW_API_URL:-}" ]; then
     _url="$(_pdw_config_value "$_cfg" base_url)"

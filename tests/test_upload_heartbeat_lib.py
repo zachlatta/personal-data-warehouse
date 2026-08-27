@@ -19,7 +19,17 @@ LIB = Path(__file__).resolve().parent.parent / "bin" / "_pdw-upload-lib.sh"
 def _run(snippet: str, *, env: dict[str, str] | None = None) -> str:
     """Source the lib and run a shell snippet, returning combined stdout."""
     script = f'. "{LIB}"\n{snippet}\n'
-    full_env = {**os.environ, **(env or {})}
+    # HOME and XDG_CONFIG_HOME are redirected to a path that cannot exist, so a
+    # helper that ignores the test's config location falls back to NOTHING
+    # rather than silently reading -- and printing -- the developer's real
+    # ~/.config/pdw/config.json. That happened once; the token went into a
+    # transcript.
+    full_env = {
+        **os.environ,
+        "HOME": "/nonexistent-pdw-test-home",
+        "XDG_CONFIG_HOME": "/nonexistent-pdw-test-home/.config",
+        **(env or {}),
+    }
     result = subprocess.run(
         ["/bin/sh", "-c", script],
         capture_output=True,
@@ -191,6 +201,40 @@ def test_post_heartbeat_reaches_the_app_when_only_pdw_login_is_configured(tmp_pa
         },
     )
     assert log.read_text().strip() == "https://warehouse.example|s3cret"
+
+
+def test_export_app_credentials_reads_the_legacy_pdw_cli_directory(tmp_path: Path):
+    """The openclaw VM logged in before the rename and still has only that file.
+
+    The Go CLI resolves ``<config>/pdw/config.json`` and falls back to the
+    pre-rename ``<config>/pdw-cli/config.json``; `cliconfig.go` says so
+    explicitly. The shell helper has to resolve the SAME two paths or it is a
+    silent no-op on exactly the hosts that never re-ran `pdw login` -- which is
+    what left openclaw's heartbeat failing after the first fix, with its
+    uploader working fine beside it because the Go CLI did know the legacy path.
+    """
+    legacy = tmp_path / "pdw-cli"
+    legacy.mkdir()
+    _pdw_config(legacy, url="https://legacy.example", token="legacy-token")
+    out = _run(
+        'pdw_export_app_credentials; printf "%s|%s\\n" "${PDW_API_URL-unset}" "${PDW_SECRET_TOKEN-unset}"',
+        env={"XDG_CONFIG_HOME": str(tmp_path), "PDW_API_URL": "", "PDW_SECRET_TOKEN": ""},
+    )
+    assert out.strip() == "https://legacy.example|legacy-token"
+
+
+def test_export_app_credentials_prefers_the_canonical_path_over_the_legacy_one(tmp_path: Path):
+    canonical = tmp_path / "pdw"
+    canonical.mkdir()
+    _pdw_config(canonical, url="https://canonical.example", token="canonical-token")
+    legacy = tmp_path / "pdw-cli"
+    legacy.mkdir()
+    _pdw_config(legacy, url="https://legacy.example", token="legacy-token")
+    out = _run(
+        'pdw_export_app_credentials; printf "%s|%s\\n" "${PDW_API_URL-unset}" "${PDW_SECRET_TOKEN-unset}"',
+        env={"XDG_CONFIG_HOME": str(tmp_path), "PDW_API_URL": "", "PDW_SECRET_TOKEN": ""},
+    )
+    assert out.strip() == "https://canonical.example|canonical-token"
 
 
 def test_export_app_credentials_never_overrides_an_explicit_environment(tmp_path: Path):
