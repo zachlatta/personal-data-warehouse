@@ -385,6 +385,9 @@ SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.0
 # head bonus and not a flat weight. Sentence-shaped queries keep 1.0 lexical
 # throughout: their BM25 head is where the wrong answers live.
 SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT = 2.0
+# The BM25 health probe's query: common, mixed-frequency terms so the scan
+# touches many posting lists across the index rather than one.
+BM25_PROBE_QUERY = "meeting order email update warehouse magazine budget photo call plan"
 # The function words the app's sentence detector counts (searchSentenceWords in
 # app/internal/query/search.go); the fuse repeats the test in SQL so the
 # direct-SQL wrapper and the app agree on which queries get the head bonus.
@@ -4919,10 +4922,14 @@ class PostgresWarehouse:
             if not self._index_exists(name):
                 continue
             try:
+                # Several common words rather than one: a bad page is only
+                # found by a scan that reads it, and each term walks its own
+                # posting list. On 2026-08-27 a single-term probe read `ok`
+                # while a query on other terms hit block 704084.
                 self._query(
                     "SELECT 1 FROM @timeline_events t "
                     "ORDER BY t.search_text OPERATOR(public.<@>) "
-                    f"public.to_bm25query('health', {_literal(name)}) LIMIT 1"
+                    f"public.to_bm25query({_literal(BM25_PROBE_QUERY)}, {_literal(name)}) LIMIT 50"
                 )
                 errors[name] = ""
             except Exception as error:  # noqa: BLE001 - reported, not raised
