@@ -963,6 +963,17 @@ PIPELINES: tuple[Pipeline, ...] = (
         expected_run_interval=None,
     ),
     Pipeline(
+        id="agent_usage",
+        label="Agent usage (contract C3)",
+        kind="internal",
+        cadence="daily 04:23",
+        transport="Dagster agent_usage asset over marts_ai_conversations.events",
+        expected_data_interval=2 * DAY,
+        expected_run_interval=None,
+        data_basis="a daily asset; 2d puts late at 4d, so one missed run is not an alarm",
+        note="are agents starting at the timeline and scoping by tier; measured, not asserted",
+    ),
+    Pipeline(
         id="uploader_heartbeats",
         label="Uploader run heartbeats",
         kind="internal",
@@ -1238,6 +1249,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     ),
     "uploader_heartbeats": _data("uploader_heartbeats", "updated_at", "ran_at"),
     "timeline_priority_mix": _support("pipeline_health", "collected_at", note="per-source tier mix, last 7 days"),
+    "agent_usage": _data("agent_usage", "collected_at", "newest_session_at"),
     "pgbackrest_health": _data(
         "pgbackrest",
         "collected_at",

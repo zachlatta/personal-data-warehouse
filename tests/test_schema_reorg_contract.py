@@ -170,7 +170,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # descriptors and let Apple Notes attachments be enriched at all.
         # +1 marts: marts_ops.timeline_priority_mix, contract C2 made visible per
         # source so a tier that swallows a source is a row, not a hunch.
-        "marts": 46,
+        # +1 marts: marts_ops.agent_usage.
+        "marts": 47,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -186,7 +187,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # pipelines have had.
         # +1 ops: ops.timeline_priority_mix, the collector's per-source tier-mix
         # snapshot behind marts_ops.timeline_priority_mix.
-        "ops": 30,
+        # +1 ops: ops.agent_usage, the daily measurement of contract C3.
+        "ops": 31,
         # +1 private: push_devices, the iOS app's registered push tokens.
         "private": 8,
         "internal": 2,

@@ -178,6 +178,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   <div id="backups"></div>
   <div id="search"></div>
   <div id="priority"></div>
+  <div id="agents"></div>
   <div id="slack"></div>
   <div id="plaid"></div>
   <div id="collation"></div>
@@ -245,6 +246,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     ["adapters", "timeline adapters — is THIS kind of data reaching timeline.events"],
     ["search", "search — do chunks and embeddings converge with the timeline"],
     ["priority", "priority tiers — how each source's last seven days split across self / direct / cc / noise / background"],
+    ["agents", "agent usage — do agents start at the timeline and scope by tier (measured from their sessions)"],
     // Per-source detectors. They are here because level 1 AGGREGATES a source
     // into one row, and that is how both of these outages hid: ~19k
     // public-channel messages a day kept Slack ok through a total group-DM
@@ -260,7 +262,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
     pipelines: [], tables: [], marts: [], adapters: [], search: [], slack: [], plaid: [], collation: [],
-    backups: [], priority: [],
+    backups: [], priority: [], agents: [],
     skew: 0, filter: "", attentionOnly: false, open: {}
   };
 
@@ -756,6 +758,24 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       p.priority === "unclassified" ? "unclassified is not a tier: an adapter's classification did not run" : "");
   }
 
+  function pct(v) { return v === null || v === undefined ? "—" : Math.round(v * 100) + "%"; }
+
+  function agentUsageNode(a) {
+    return healthRow(a, a.source,
+      rows(a.pdw_sessions) + " of " + rows(a.sessions) + " sessions used PDW in " + a.window_days + " days",
+      [
+        ["search first", pct(a.search_first_rate),
+          "share of PDW sessions whose FIRST call was a search (target 60%); schema-first " + rows(a.first_schema) + ", sql-first " + rows(a.first_sql), false],
+        ["priority filter", pct(a.priority_filter_rate),
+          "searches that carried a priority filter (target 40%)", true],
+        ["base-only SQL", pct(a.sql_base_only_rate),
+          rows(a.sql_base_only) + " SQL calls went straight to base_* with no timeline reference", true],
+        ["SQL errors", pct(a.sql_error_session_rate),
+          "sessions with an undefined-column/table, permission or timeout error (ceiling 10%); timeouts " + rows(a.sql_timeouts), true]
+      ],
+      a.invented_calls ? rows(a.invented_calls) + " invented pdw commands (pdw query, pdw --version, …)" : "");
+  }
+
   function backupNode(b) {
     // Two independent facts, because reporting either alone is how this hid:
     // WAL shipped perfectly through the 2026-08-25 outage while no base backup
@@ -836,11 +856,16 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
         if (a.source !== b.source) return a.source < b.source ? -1 : 1;
         return bySeverity(a, b);
       });
-    renderSection("slack", LEVELS[5][1], state.slack, slackConversationNode);
-    renderSection("plaid", LEVELS[6][1], state.plaid, plaidItemNode);
+    renderSection("agents", LEVELS[5][1], state.agents, agentUsageNode,
+      function (a, b) {
+        if ((a.source === "all") !== (b.source === "all")) return a.source === "all" ? -1 : 1;
+        return bySeverity(a, b);
+      });
+    renderSection("slack", LEVELS[6][1], state.slack, slackConversationNode);
+    renderSection("plaid", LEVELS[7][1], state.plaid, plaidItemNode);
     // The database's own collation row first: it is the finding the other rows
     // corroborate, and it is the one that says this database cannot warn itself.
-    renderSection("collation", LEVELS[7][1], state.collation, collationNode,
+    renderSection("collation", LEVELS[8][1], state.collation, collationNode,
       function (a, b) {
         if ((a.scope === "database") !== (b.scope === "database")) {
           return a.scope === "database" ? -1 : 1;
@@ -915,7 +940,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     node.appendChild(h("br"));
     node.appendChild(document.createTextNode(
       "Everything here is queryable at parity: marts_ops.pipeline_health, marts_ops.table_freshness," +
-      " marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health, marts_ops.timeline_priority_mix," +
+      " marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health, marts_ops.timeline_priority_mix, marts_ops.agent_usage," +
       " marts_ops.collation_health."));
   }
 
@@ -945,6 +970,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       state.backups = body.backups || [];
       state.search = body.search || [];
       state.priority = body.priority || [];
+      state.agents = body.agents || [];
       state.slack = body.slack || [];
       state.plaid = body.plaid || [];
       state.collation = body.collation || [];

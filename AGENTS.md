@@ -39,7 +39,14 @@ quietly becoming untrue, and several of these have been.
   `timeline.events`/`timeline.search_text()` in SQL, then one hop out to the source row.
   *Held up by* the catalog's `START HERE` guidance being published as real schema comments
   (`test_schema_comments_publish_the_start_here_guidance`) so discovery cannot disagree with
-  the docs.
+  the docs — and, since 2026-08-27, **measured**: `marts_ops.agent_usage` (daily
+  `agent_usage` asset over `marts_ai_conversations.events`) reports, per agent source, the
+  share of PDW sessions whose first call was a search, the share of searches carrying a
+  priority filter, the share of SQL that went straight to `base_*`, and the SQL-error
+  session rate, judged against targets (search-first ≥ 60%, priority filter ≥ 40%,
+  error sessions < 10%). The baseline on 2026-08-26 was 27% / 6% / 35% / 27%. The
+  `search` tool hints when an unscoped result came back mostly noise, and the query tool
+  hints before running a raw-table text scan; this row is how we know whether that lands.
 - **C4 — raw source data for every source is queryable via SQL.** `base_<source>` is a
   faithful copy, discoverable, and readable by the read-only `pdw_query` role. The timeline
   is the recommended entry point, never the only truth. *Held up by*
@@ -101,8 +108,11 @@ quietly becoming untrue, and several of these have been.
   by* per-source detectors where they exist — `marts_ops.slack_conversation_health` judges the
   SHARE of conversations re-listed per type, because `marts_ops.pipeline_health` rolls Slack up
   as one pipeline and ~19k public-channel messages a day kept it `ok` straight through a total
-  group-DM outage. *Gap:* Slack is the only source with one. Latency, as opposed to
-  freshness, is still unmeasured almost everywhere.
+  group-DM outage; `marts_ops.plaid_item_health` does the same per institution, because a
+  re-link that mints a second live Item double-counts net worth while the pipeline stays
+  green; `marts_finance.net_worth.staleness` judges each manual valuation against its own
+  kind's refresh. *Gap:* every other source rides aggregate freshness. Latency, as opposed
+  to freshness, is still unmeasured almost everywhere.
 
 Adding a source touches all eleven. The step-by-step list, marked by which steps a test
 catches and which fail silently, is [Adding a warehouse source](#adding-a-warehouse-source).
@@ -730,6 +740,7 @@ The `uploader_heartbeats` pipeline row says whether ANY device is reporting at a
 | 2 — marts | `marts_ops.mart_view_health` | is the read interface built on anything current |
 | 3 — timeline adapters | `marts_ops.timeline_adapter_health` | is THIS kind of data reaching `timeline.events` |
 | 3b — priority tiers | `marts_ops.timeline_priority_mix` | how each source's last seven days split across the five tiers; an `unclassified` row is `failing` |
+| 3c — agent usage | `marts_ops.agent_usage` | are agents starting at the timeline and scoping by tier (C3), measured daily from their own sessions |
 | 4 — integrity | `marts_ops.collation_health` | did the sort order move under us, and did anything break |
 
 **Level 2 exists because a view cannot be probed like a table.** `TABLE_PIPELINES` measures
@@ -840,13 +851,15 @@ someone notices a gap in an answer).
     `(event_ts, event_id)`, `incremental_sql` oldest-first by `(ingest_ts, event_id)`, both
     returning exactly `TIMELINE_NORMALIZED_COLUMNS`, plus `max_ingest_sql`. **ENFORCED**
     (`test_adapter_sql_carries_the_pagination_contract`).
-12. **Assign a priority tier** in the adapter's SELECT. **SILENT** — a missing classification
-    becomes `cc` via `COALESCE`, which looks like a decision. See
+12. **Assign a priority tier** in the adapter's SELECT. **ENFORCED for presence, SILENT for
+    correctness** — an adapter with no priority expression raises at registration, and a
+    NULL or unknown label fails the batch before it is written (`TimelinePriorityError`);
+    which of the five valid tiers you chose is a judgement no test makes. See
     [Timeline priority tiers](#timeline-priority-tiers).
 13. **Seed the adapter in the end-to-end timeline tests** (`_seed_sources` +
-    `EXPECTED_SEEDED_EVENTS` in `tests/test_timeline.py`). **SILENT** — that test iterates the
-    *seed dictionary*, not the adapter registry, so an unseeded adapter is simply never
-    exercised and its SQL is never run against a real schema.
+    `EXPECTED_SEEDED_EVENTS` in `tests/test_timeline.py`). **ENFORCED** —
+    `test_timeline.py` asserts the seed dictionary covers exactly the registered adapters,
+    so an unseeded adapter fails the suite instead of never having its SQL run.
 14. **Add the `SEARCH_SOURCE_DEFS` token** in `postgres.py`. **ENFORCED** since 2026-08-23
     (`tests/test_repo_contracts.py::test_every_timeline_adapter_has_a_search_source_token`).
     It was silent before, and silent here means two things at once: the source cannot be

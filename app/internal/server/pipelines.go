@@ -28,6 +28,7 @@ const (
 	pipelinesPlaidMaxRows     = 200
 	pipelinesBackupMaxRows    = 20
 	pipelinesPriorityMaxRows  = 500
+	pipelinesAgentsMaxRows    = 50
 )
 
 var pipelineHealthSQL = `
@@ -127,6 +128,16 @@ SELECT source, priority, status, events_7d, events_1d, share_7d, source_events_7
 FROM ` + warehouse.SQLRelation("marts_timeline_priority_mix") + `
 ORDER BY source, priority`
 
+// Contract C3, measured: are agents starting at the timeline and scoping by
+// tier. Daily from the sessions PDW indexes; a one-off audit decays.
+var pipelineAgentUsageSQL = `
+SELECT source, status, window_days, sessions, pdw_sessions, first_search, first_schema, first_sql,
+       first_invented, search_calls, search_with_priority, sql_calls, sql_base_only,
+       sql_error_sessions, sql_timeouts, invented_calls, search_first_rate, priority_filter_rate,
+       sql_base_only_rate, sql_error_session_rate, newest_session_at, collected_at, snapshot_age_seconds
+FROM ` + warehouse.SQLRelation("marts_agent_usage") + `
+ORDER BY (source = 'all') DESC, source`
+
 var pipelineSearchHealthSQL = `
 SELECT component, status, model, configured, pgvector_available,
        timeline_max_seq, chunk_cursor_seq, seq_lag, caught_up,
@@ -166,6 +177,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 				"collation":  []map[string]any{},
 				"search":     []map[string]any{},
 				"priority":   []map[string]any{},
+				"agents":     []map[string]any{},
 				"slack":      []map[string]any{},
 				"plaid":      []map[string]any{},
 				"backups":    []map[string]any{},
@@ -195,6 +207,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	collation := s.optionalRows(r, "collation health", pipelineCollationHealthSQL, pipelinesCollationMaxRows)
 	search := s.optionalRows(r, "search health", pipelineSearchHealthSQL, pipelinesSearchMaxRows)
 	priorityMix := s.optionalRows(r, "timeline priority mix", pipelinePriorityMixSQL, pipelinesPriorityMaxRows)
+	agents := s.optionalRows(r, "agent usage", pipelineAgentUsageSQL, pipelinesAgentsMaxRows)
 	slack := s.optionalRows(r, "slack conversation health", pipelineSlackConversationHealthSQL, pipelinesSlackMaxRows)
 	plaid := s.optionalRows(r, "plaid item health", pipelinePlaidItemHealthSQL, pipelinesPlaidMaxRows)
 	backups := s.optionalRows(r, "backup health", pipelineBackupHealthSQL, pipelinesBackupMaxRows)
@@ -206,6 +219,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 		"collation":  collation,
 		"search":     search,
 		"priority":   priorityMix,
+		"agents":     agents,
 		"slack":      slack,
 		"plaid":      plaid,
 		"backups":    backups,

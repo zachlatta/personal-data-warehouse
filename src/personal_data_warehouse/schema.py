@@ -2169,6 +2169,30 @@ MART_VIEW_HEALTH_COLUMNS = (
 #: production reported `status: error (no valid backups)` and had for a day,
 #: while WAL archiving kept working, every pipeline read green, and the loop
 #: logged "backup failed" to stdout every six hours where nothing escalated it.
+# One row per agent source (plus 'all') measuring how agents use PDW over a
+# trailing window, from their own transcripts: what their first PDW call was,
+# how often searches carried a priority filter, how much SQL bypassed the
+# timeline. Contract C3, as a number that is re-taken daily.
+AGENT_USAGE_COLUMNS = (
+    "source",
+    "window_days",
+    "sessions",
+    "pdw_sessions",
+    "first_search",
+    "first_schema",
+    "first_sql",
+    "first_invented",
+    "search_calls",
+    "search_with_priority",
+    "sql_calls",
+    "sql_base_only",
+    "sql_error_sessions",
+    "sql_timeouts",
+    "invented_calls",
+    "newest_session_at",
+    "collected_at",
+)
+
 # One row per (source, priority tier) over the last seven days of
 # timeline.events, taken by the pipeline_health collector. Contract C2 says
 # every row is classified into one of five tiers; this is the surface that

@@ -2689,6 +2689,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "pgbackrest_health": _state("backup posture: does a restorable backup exist, is WAL shipping"),
     "uploader_heartbeats": _state("run heartbeats posted by the remote-device uploaders"),
     "timeline_priority_mix": _state("per-source priority-tier counts over the last seven days (collector snapshot)"),
+    "agent_usage": _state("how agents use PDW over a trailing window (daily collector snapshot)"),
     "search_health": _state("search chunk and embedding convergence heartbeats"),
     # The timeline itself
     "timeline_events": _state("the unified timeline"),

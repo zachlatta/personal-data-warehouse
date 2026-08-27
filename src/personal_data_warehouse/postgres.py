@@ -16,6 +16,11 @@ import psycopg2
 from psycopg2 import Binary
 from psycopg2.extras import Json, execute_values
 
+from personal_data_warehouse.agent_usage import (
+    PRIORITY_FILTER_TARGET,
+    SEARCH_FIRST_TARGET,
+    SQL_ERROR_SESSION_CEILING,
+)
 from personal_data_warehouse.schema import (
     ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS,
     ALICE_VOICE_RECORDING_COLUMNS,
@@ -72,6 +77,7 @@ from personal_data_warehouse.schema import (
     PGBACKREST_HEALTH_COLUMNS,
     UPLOADER_HEARTBEAT_COLUMNS,
     TIMELINE_PRIORITY_MIX_COLUMNS,
+    AGENT_USAGE_COLUMNS,
     MART_VIEW_HEALTH_COLUMNS,
     PIPELINE_HEALTH_COLUMNS,
     PIPELINE_TABLE_FRESHNESS_COLUMNS,
@@ -919,6 +925,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "pgbackrest_health": TableSpec(PGBACKREST_HEALTH_COLUMNS, ("stanza",), "collected_at"),
     "uploader_heartbeats": TableSpec(UPLOADER_HEARTBEAT_COLUMNS, ("pipeline", "device")),
     "timeline_priority_mix": TableSpec(TIMELINE_PRIORITY_MIX_COLUMNS, ("source", "priority"), "collected_at"),
+    "agent_usage": TableSpec(AGENT_USAGE_COLUMNS, ("source",), "collected_at"),
 }
 
 # Every table whose rows belong to exactly one linked Plaid Item, data first
@@ -2064,6 +2071,7 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    "newest_session_at",
     "ran_at",
     "amcheck_at",
     # search embedding drain cursors (search_chunk_sync_state)
@@ -2169,6 +2177,20 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    "window_days",
+    "sessions",
+    "pdw_sessions",
+    "first_search",
+    "first_schema",
+    "first_sql",
+    "first_invented",
+    "search_calls",
+    "search_with_priority",
+    "sql_calls",
+    "sql_base_only",
+    "sql_error_sessions",
+    "sql_timeouts",
+    "invented_calls",
     "events_7d",
     "events_1d",
     # backups: counts and sizes, plus last_attempt_ok as the warehouse's
@@ -4069,6 +4091,7 @@ class PostgresWarehouse:
                 "pgbackrest_health",
                 "uploader_heartbeats",
                 "timeline_priority_mix",
+                "agent_usage",
             ]
         )
         # _ensure_table_group only CREATEs; it does not widen an existing
@@ -4599,6 +4622,84 @@ class PostgresWarehouse:
             """,
         )
 
+        # C2 made visible: the tier mix per source over the last seven days.
+        # `unclassified` is a fail-loud sentinel, so a row carrying it is a
+        # classification outage, not a sixth tier; `share_7d` is what shows a
+        # source's mix quietly collapsing into one tier after an adapter edit.
+        self._ensure_view(
+            "marts_timeline_priority_mix",
+            f"""
+            CREATE OR REPLACE VIEW @marts_timeline_priority_mix AS
+            WITH measured AS (
+                SELECT source, priority, events_7d, events_1d,
+                       NULLIF(newest_event_at, {epoch}) AS newest_event_at,
+                       NULLIF(collected_at, {epoch}) AS collected_at,
+                       sum(events_7d) OVER (PARTITION BY source) AS source_events_7d
+                FROM @timeline_priority_mix
+            )
+            SELECT
+                source,
+                priority,
+                CASE
+                    WHEN collected_at IS NULL
+                      OR now() - collected_at > make_interval(secs => {COLLECTOR_STALE_SECONDS})
+                        THEN 'unknown'
+                    WHEN priority = 'unclassified' THEN 'failing'
+                    ELSE 'ok'
+                END AS status,
+                events_7d,
+                events_1d,
+                CASE WHEN source_events_7d > 0
+                     THEN round(events_7d::numeric / source_events_7d, 4) ELSE 0 END AS share_7d,
+                source_events_7d,
+                newest_event_at,
+                collected_at,
+                (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds
+            FROM measured
+            """,
+        )
+
+        # Contract C3 as a measurement: are agents starting at the timeline and
+        # scoping by tier? Rates come from the daily snapshot; the verdict is
+        # judged here against the targets so a guidance change shows within
+        # days and a regression is a row, not a re-audit.
+        self._ensure_view(
+            "marts_agent_usage",
+            f"""
+            CREATE OR REPLACE VIEW @marts_agent_usage AS
+            WITH measured AS (
+                SELECT *,
+                       NULLIF(newest_session_at, {epoch}) AS newest_session,
+                       NULLIF(collected_at, {epoch}) AS collected
+                FROM @agent_usage
+            ),
+            rated AS (
+                SELECT source, window_days, sessions, pdw_sessions,
+                       first_search, first_schema, first_sql, first_invented,
+                       search_calls, search_with_priority, sql_calls, sql_base_only,
+                       sql_error_sessions, sql_timeouts, invented_calls,
+                       newest_session AS newest_session_at,
+                       collected AS collected_at,
+                       CASE WHEN pdw_sessions > 0 THEN round(first_search::numeric / pdw_sessions, 3) END AS search_first_rate,
+                       CASE WHEN search_calls > 0 THEN round(search_with_priority::numeric / search_calls, 3) END AS priority_filter_rate,
+                       CASE WHEN sql_calls > 0 THEN round(sql_base_only::numeric / sql_calls, 3) END AS sql_base_only_rate,
+                       CASE WHEN pdw_sessions > 0 THEN round(sql_error_sessions::numeric / pdw_sessions, 3) END AS sql_error_session_rate
+                FROM measured
+            )
+            SELECT *,
+                   CASE
+                       WHEN collected_at IS NULL OR now() - collected_at > interval '2 days' THEN 'unknown'
+                       WHEN pdw_sessions < 10 THEN 'no_data'
+                       WHEN search_first_rate < {SEARCH_FIRST_TARGET}
+                         OR priority_filter_rate < {PRIORITY_FILTER_TARGET}
+                         OR sql_error_session_rate > {SQL_ERROR_SESSION_CEILING} THEN 'attention'
+                       ELSE 'ok'
+                   END AS status,
+                   (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds
+            FROM rated
+            """,
+        )
+
         # Level 3 of the health contract: "is THIS kind of data current on the
         # timeline?" The pipeline row cannot answer it. `timeline` is a single
         # pipeline whose run heartbeat is a max() over every adapter, so one
@@ -4645,42 +4746,7 @@ class PostgresWarehouse:
             """,
         )
 
-        # C2 made visible: the tier mix per source over the last seven days.
-        # `unclassified` is a fail-loud sentinel, so a row carrying it is a
-        # classification outage, not a sixth tier; `share_7d` is what shows a
-        # source's mix quietly collapsing into one tier after an adapter edit.
-        self._ensure_view(
-            "marts_timeline_priority_mix",
-            f"""
-            CREATE OR REPLACE VIEW @marts_timeline_priority_mix AS
-            WITH measured AS (
-                SELECT source, priority, events_7d, events_1d,
-                       NULLIF(newest_event_at, {epoch}) AS newest_event_at,
-                       NULLIF(collected_at, {epoch}) AS collected_at,
-                       sum(events_7d) OVER (PARTITION BY source) AS source_events_7d
-                FROM @timeline_priority_mix
-            )
-            SELECT
-                source,
-                priority,
-                CASE
-                    WHEN collected_at IS NULL
-                      OR now() - collected_at > make_interval(secs => {COLLECTOR_STALE_SECONDS})
-                        THEN 'unknown'
-                    WHEN priority = 'unclassified' THEN 'failing'
-                    ELSE 'ok'
-                END AS status,
-                events_7d,
-                events_1d,
-                CASE WHEN source_events_7d > 0
-                     THEN round(events_7d::numeric / source_events_7d, 4) ELSE 0 END AS share_7d,
-                source_events_7d,
-                newest_event_at,
-                collected_at,
-                (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds
-            FROM measured
-            """,
-        )
+
 
     def write_pipeline_health(
         self,
@@ -4781,6 +4847,18 @@ class PostgresWarehouse:
             except Exception as error:  # noqa: BLE001 - reported, not raised
                 errors[name] = str(error).strip()[:300]
         return errors
+
+    def write_agent_usage(self, rows: Sequence[Any], *, collected_at: datetime) -> None:
+        """Replace the agent-usage snapshot with one collection's measurements."""
+        self._insert_rows(
+            "agent_usage",
+            [_pipeline_health_row(snapshot, collected_at=collected_at) for snapshot in rows],
+            AGENT_USAGE_COLUMNS,
+        )
+        self._command(
+            "DELETE FROM @agent_usage WHERE source <> ALL(%s)",
+            ([snapshot.source for snapshot in rows],),
+        )
 
     def write_timeline_priority_mix(
         self, rows: Sequence[Any], *, collected_at: datetime
