@@ -4605,9 +4605,44 @@ class PostgresWarehouse:
             ([finding.object_id for finding in findings],),
         )
 
+    def bm25_timeline_index_names(self) -> list[str]:
+        """Every BM25 index declared on the timeline, in registry order."""
+
+        return [
+            spec.name for spec in POSTGRES_INDEXES
+            if spec.table == "timeline_events" and spec.requires_pg_textsearch
+        ]
+
+    def probe_bm25_indexes(self) -> dict[str, str]:
+        """Scan one row through each timeline BM25 index; return errors by name.
+
+        pg_textsearch indexes are not covered by amcheck, and a crash can
+        leave one with bad pages while it still reads `indisvalid`. On
+        2026-08-27 an OOM kill did exactly that to two of the four: every
+        low-volume source then failed keyword and hybrid search with
+        "invalid page index at block N" and nothing on /pipelines moved,
+        because no health surface ever read the indexes. This does, once per
+        chunk-builder run, with the cheapest query that touches them.
+        """
+
+        errors: dict[str, str] = {}
+        for name in self.bm25_timeline_index_names():
+            if not self._index_exists(name):
+                continue
+            try:
+                self._query(
+                    "SELECT 1 FROM @timeline_events t "
+                    "ORDER BY t.search_text OPERATOR(public.<@>) "
+                    f"public.to_bm25query('health', {_literal(name)}) LIMIT 1"
+                )
+                errors[name] = ""
+            except Exception as error:  # noqa: BLE001 - reported, not raised
+                errors[name] = str(error).strip()[:300]
+        return errors
+
     def write_search_health(self, component: str, **facts: Any) -> None:
         """Upsert one search-stage heartbeat without scanning the corpus."""
-        if component not in {"chunks", "embeddings"}:
+        if component not in {"chunks", "embeddings", "bm25_indexes"}:
             raise ValueError(f"unknown search health component: {component}")
         now = datetime.now(tz=UTC)
         row = {
@@ -12876,6 +12911,10 @@ class PostgresWarehouse:
             ],
             columns,
         )
+
+
+def _literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _postgres_type(column: str, *, table: str | None = None) -> str:

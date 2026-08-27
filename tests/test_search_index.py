@@ -448,3 +448,29 @@ def test_embedding_runner_resumes_a_bounded_backfill_across_runs(
         "SELECT count(*) FROM @search_chunk_embeddings WHERE model = 'fake-model'"
     )
     assert rows[0][0] == total
+
+
+def test_bm25_index_probe_covers_every_timeline_bm25_index(warehouse: PostgresWarehouse) -> None:
+    """A corrupt BM25 index must show up as a health fact, so the probe has
+    to read every index the search functions pin by name."""
+
+    from personal_data_warehouse.postgres import POSTGRES_INDEXES
+
+    declared = {
+        spec.name for spec in POSTGRES_INDEXES
+        if spec.table == "timeline_events" and spec.requires_pg_textsearch
+    }
+    assert set(warehouse.bm25_timeline_index_names()) == declared
+    assert len(declared) >= 4
+
+    _provision(warehouse)
+    warehouse.ensure_pipeline_health_tables()
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["alpha bravo charlie"])
+    _sync_timeline(warehouse)
+    probe = warehouse.probe_bm25_indexes()
+    assert probe, "no BM25 index existed to probe"
+    assert all(err == "" for err in probe.values()), probe
+    warehouse.write_search_health("bm25_indexes", caught_up=1, processed_rows=len(probe))
+    rows = warehouse._query("SELECT status FROM @marts_search_health WHERE component = 'bm25_indexes'")
+    assert rows and rows[0][0] == "ok"

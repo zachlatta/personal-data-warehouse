@@ -83,6 +83,23 @@ def search_chunks(context) -> MaterializeResult:
                     last_success_at=datetime.now(tz=UTC),
                     last_error="",
                 )
+                # Level 4 of the health contract for search: are the BM25
+                # indexes readable at all. Reported as its own component so a
+                # corrupt index is a red row, never a silently empty search.
+                probe = warehouse.probe_bm25_indexes()
+                broken = {name: err for name, err in probe.items() if err}
+                warehouse.write_search_health(
+                    "bm25_indexes",
+                    caught_up=1,
+                    processed_rows=len(probe),
+                    pending_count=len(broken),
+                    last_success_at=(
+                        datetime.now(tz=UTC) if not broken else datetime.fromtimestamp(0, tz=UTC)
+                    ),
+                    last_error="; ".join(f"{name}: {err}" for name, err in broken.items())[:500],
+                )
+                if broken:
+                    context.log.error("BM25 index probe failed: %s", broken)
             except Exception as error:
                 warehouse.write_search_health("chunks", last_error=str(error)[:500])
                 raise

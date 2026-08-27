@@ -607,6 +607,20 @@ leg that is 90% I/O wait needs its pages kept, not a better plan. The A/B that s
 overlap and changed warm latency by 4ms, so shrinking the scan buys almost nothing once
 the index is resident.
 
+**A BM25 index can be corrupt while `indisvalid` says true, and only a scan finds out.**
+The OOM kill on 2026-08-27 (a backend at 6.5 GB anon RSS during a deploy build) took the
+cluster through crash recovery and left `..._bm25_lowvol_idx` and `..._bm25_attention_idx`
+with bad pages (`invalid page index at block N, SQLSTATE XX001`), plus a half-built
+`_ccnew` from a `REINDEX CONCURRENTLY` the crash interrupted. Every low-volume source then
+failed keyword AND hybrid search, and no health surface moved: `amcheck` does not cover
+pg_textsearch, and nothing read the indexes. `marts_ops.search_health` now carries a
+`bm25_indexes` row, written by the chunk builder every five minutes from a one-row scan
+through each timeline BM25 index (`probe_bm25_indexes`); a corrupt index is `failing`
+with the index name and error in `last_error`. Repair is `REINDEX INDEX CONCURRENTLY`;
+it deadlocks readily against the timeline sync's `ShareUpdateExclusiveLock`, so retry
+rather than diagnose, and drop the `_ccnew` leftover first. `search_benchmark.py smoke`
+is the manual check: one call per source token, failing sources named.
+
 **Large rewrites are their own budget.** The `timeline.events` priority column change from
 `bigint` to the enum failed twice before it worked: the table is 43M rows and the rewrite
 drags every index with it. Dropping the indexes first and rebuilding them after brought it
