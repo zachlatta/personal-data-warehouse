@@ -233,11 +233,24 @@ with a newsletter. The enum's declaration order **is** the sort order, most atte
 
 | tier | what it means | typical rows |
 | --- | --- | --- |
-| `self` | Zach initiated it | his sent mail and messages, his notes and voice memos, his agent sessions, his own calendar events |
-| `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, a real `<@id>` ping, replies in a thread of his that is a conversation rather than an announcement |
-| `cc` | real-people activity he is peripheral to | cc'd mail, private team channels he sits in, big group threads, replies piling under his `<!channel>` broadcasts, people talking *about* him in public, others editing a file he owns |
-| `noise` | bulk or automated traffic | newsletters, notifications, bots, GitHub/CI relays, and public-channel chatter not aimed at him — **member or not** |
-| `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, per-turn agent-session rows, orchestrator-spawned agent sessions, Drive files other people change |
+| `self` | Zach initiated it | his sent mail and messages, his notes and voice memos, his agent sessions **and the turns he typed into them**, his own calendar events |
+| `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, big group chats **for the week he takes part in them**, a real `<@id>` ping, replies in a thread of his that is a conversation rather than an announcement |
+| `cc` | real-people activity he is peripheral to | cc'd mail, private team channels he sits in, big group chats he is not taking part in that week, replies piling under his `<!channel>` broadcasts, people talking *about* him in public, others editing a file he owns |
+| `noise` | bulk or automated traffic | newsletters, notifications, bots, Slackbot file posts, GitHub/CI relays, Gmail's auto-created calendar events, his own health telemetry, and public-channel chatter not aimed at him — **member or not** |
+| `background` | the warehouse's own machinery, other people's background work, and facts that merely got recorded | enrichment runs, mutation workers, the model's turns in agent sessions, orchestrator-spawned agent sessions, Drive files other people change, card purchases and other ledger facts |
+
+Three of those lines were redrawn on 2026-08-27 after grading twenty random rows per
+tier, and each is a *why*, not a mechanism. **A big group chat is one tier for the week**:
+the old rule promoted a message to `direct` when Zach had posted within six hours, so a
+23-person event-ops WhatsApp group read 140 `cc` / 3 `direct` in one week — the same
+people, the same conversation, split by the clock. It is `direct` now when at least two
+of the group's messages within ±7 days are his and at least one in ten is
+(`_group_week_engaged`); his share in that group is 0.4%, in the groups he actually talks
+in 10–55%. **The words Zach typed into an agent session are `self`**: turn rows were
+uniformly `background`, so `priorities => ARRAY['self']` could reach a session's title
+and never a sentence he wrote; the model's replies and every harness-injected user turn
+stay `background`. **A card purchase is `background`, not `self`**: it is a fact the bank
+recorded, it was a third of a week's `self` rows, and nobody reads one.
 
 ```sql
 SELECT event_ts, priority, source, actor, title, snippet

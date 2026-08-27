@@ -989,7 +989,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "apple_message": "direct",
     "whatsapp_message": "cc",
     "agent_session": "self",
-    "agent_session_turn": "background",
+    "agent_session_turn": "self",
     "apple_note_revision": "self",
     "voice_memo": "self",
     "calendar_event": "self",
@@ -1002,7 +1002,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "whoop_sleep": "noise",
     "whoop_workout": "self",
     "whoop_private_journal": "self",
-    "finance_transaction": "self",
+    "finance_transaction": "background",
     "finance_observation": "background",
     "manual_finance_document": "self",
     "mutation": "background",
@@ -1109,7 +1109,8 @@ def test_backfill_normalizes_every_source(warehouse):
     assert {t["kind"] for t in turns} == {"agent_turn"}
     assert {t["source"] for t in turns} == {"claude_code"}
     assert {t["context"] for t in turns} == {"claude_code|sess1"}
-    assert all(t["priority"] == "background" for t in turns)
+    # The typed turn is his; the model's reply is machinery.
+    assert {t["actor"]: t["priority"] for t in turns} == {"user": "self", "assistant": "background"}
     reply = next(t for t in turns if t["metadata"]["role"] == "assistant")
     assert reply["actor"] == "assistant"
     assert "done" in reply["search_text"]
@@ -1618,12 +1619,25 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
                ('z@x.test', 'c-biggroup', 'Trip Crew', 43)
         """
     )
-    for chat_id, handle, mid, offset in (
-        ("c-oneway", "h-oneway", "am-oneway", 0),
-        ("c-shortcode", "h-group", "am-shortcode", 0),
-        ("c-biggroup", "h-group", "am-group-active", 0),
-        ("c-biggroup", "h-group", "am-group-idle", 90),
-    ):
+    # c-biggroup: a big group Zach takes part in that week (two of his own
+    # posts, a fair share of the traffic). c-crowd: a big group where he
+    # posted once amid a crowd, in the very same hour as the crowd's messages.
+    # The tier belongs to the group's week, not to the hour: am-group-farweek
+    # is five days from any post of his and still direct; am-crowd-samehour
+    # sits an hour from his one post and is still cc. The old +/-6h rule
+    # flipped one real group between direct and cc every few hours.
+    apple_rows = [
+        ("c-oneway", "h-oneway", "am-oneway", 0, 0),
+        ("c-shortcode", "h-group", "am-shortcode", 0, 0),
+        ("c-biggroup", "h-group", "am-group-active", 0, 0),
+        ("c-biggroup", "h-group", "am-group-farweek", 5, 0),
+        ("c-biggroup", "h-group", "am-group-idle", 90, 0),
+        ("c-biggroup", "", "am-group-mine", 0.1, 1),
+        ("c-biggroup", "", "am-group-mine2", 3, 1),
+        ("c-crowd", "", "am-crowd-mine", 0.05, 1),
+        ("c-crowd", "h-group", "am-crowd-samehour", 0, 0),
+    ] + [("c-crowd", "h-group", f"am-crowd-{i}", i / 24, 0) for i in range(30)]
+    for chat_id, handle, mid, offset, mine in apple_rows:
         warehouse._command(
             """
             INSERT INTO @apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
@@ -1635,36 +1649,28 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
             """
             INSERT INTO @apple_messages (account, message_id, handle_id, body_text, message_at,
                                         is_from_me, ingested_at)
-            VALUES ('z@x.test', %s, %s, 'hello', %s, 0, %s)
+            VALUES ('z@x.test', %s, %s, 'hello', %s, %s, %s)
             """,
-            (mid, handle, _NOW - timedelta(days=offset), _NOW),
+            (mid, handle, _NOW - timedelta(days=offset), mine, _NOW),
         )
-    # Eleven other participants make c-biggroup a big group (the attention
-    # threshold is nine distinct addresses); Zach posted in it near _NOW
-    # (active window) but not near the idle message.
-    for i in range(11):
+    # Eleven other participants make both a big group (the attention
+    # threshold is nine distinct addresses).
+    for chat_id in ("c-biggroup", "c-crowd"):
         warehouse._command(
             """
-            INSERT INTO @apple_message_chat_handles (account, chat_id, handle_id)
-            VALUES ('z@x.test', 'c-biggroup', %s)
+            INSERT INTO @apple_message_chats (account, chat_id, display_name, style)
+            VALUES ('z@x.test', %s, 'Crowd', 43) ON CONFLICT DO NOTHING
             """,
-            (f"h-g{i}",),
+            (chat_id,),
         )
-    warehouse._command(
-        """
-        INSERT INTO @apple_message_chat_messages (account, chat_id, message_id, message_date, ingested_at)
-        VALUES ('z@x.test', 'c-biggroup', 'am-group-mine', %s, %s)
-        """,
-        (_NOW - timedelta(hours=2), _NOW),
-    )
-    warehouse._command(
-        """
-        INSERT INTO @apple_messages (account, message_id, handle_id, body_text, message_at,
-                                    is_from_me, ingested_at)
-        VALUES ('z@x.test', 'am-group-mine', '', 'on my way', %s, 1, %s)
-        """,
-        (_NOW - timedelta(hours=2), _NOW),
-    )
+        for i in range(11):
+            warehouse._command(
+                """
+                INSERT INTO @apple_message_chat_handles (account, chat_id, handle_id)
+                VALUES ('z@x.test', %s, %s)
+                """,
+                (chat_id, f"h-g{i}"),
+            )
 
     # --- whatsapp: business senders and E2E stubs ----------------------------
     warehouse._command(
@@ -1682,6 +1688,51 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
                ('z@x.test', 'chat@g.us', 'wm-stub', 'chat@g.us', '', '', %s, 0, %s)
         """,
         (_NOW, _NOW, _NOW, _NOW),
+    )
+
+    # --- whatsapp: big groups are one tier for the week, not per hour --------
+    for chat_id, n in (("crew@g.us", 8), ("crowd@g.us", 23)):
+        warehouse._command(
+            """
+            INSERT INTO @whatsapp_chats (account, chat_id, name, chat_type, ingested_at)
+            VALUES ('z@x.test', %s, 'Group', 'group', %s)
+            """,
+            (chat_id, _NOW),
+        )
+        for i in range(n):
+            warehouse._command(
+                """
+                INSERT INTO @whatsapp_chat_participants (account, chat_id, participant_jid, ingested_at)
+                VALUES ('z@x.test', %s, %s, %s)
+                """,
+                (chat_id, f"p{i}@s.whatsapp.net", _NOW),
+            )
+    wa_rows = [
+        ("crew@g.us", "wm-crew-mine", 0.1, 1),
+        ("crew@g.us", "wm-crew-mine2", 3, 1),
+        ("crew@g.us", "wm-crew-farweek", 5, 0),
+        ("crowd@g.us", "wm-crowd-mine", 0.05, 1),
+        ("crowd@g.us", "wm-crowd-samehour", 0, 0),
+    ] + [("crowd@g.us", f"wm-crowd-{i}", i / 24, 0) for i in range(30)]
+    for chat_id, mid, offset, mine in wa_rows:
+        warehouse._command(
+            """
+            INSERT INTO @whatsapp_messages (account, chat_id, message_id, sender_jid, push_name,
+                                           body_text, message_at, is_from_me, ingested_at)
+            VALUES ('z@x.test', %s, %s, 'p1@s.whatsapp.net', 'Pat', 'hey', %s, %s, %s)
+            """,
+            (chat_id, mid, _NOW - timedelta(days=offset), mine, _NOW),
+        )
+
+    # --- slack: Slackbot and app uploads are machines posting files ---------
+    warehouse._command(
+        """
+        INSERT INTO @slack_files (account, team_id, file_id, conversation_id, message_ts,
+                                 user_id, created_at, name, title, mimetype, synced_at)
+        VALUES ('z', 'T1', 'FSLACKBOT', 'C1', '7000.1', 'USLACKBOT', %s,
+                'zoom.txt', 'Someone has joined your meeting - Zoom Meeting', 'text/plain', %s)
+        """,
+        (_NOW, _NOW),
     )
 
     # --- agent sessions: programmatic entrypoints and empty transcripts -----
@@ -1752,9 +1803,13 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
                ('z@x.test', 'cal1', 'ev-invite', 'Coffee', '',
                 'human@example.test', %s, %s, %s),
                ('z@x.test', 'cal1', 'ev-luma', 'AMA with a founder', '',
-                'calendar-invite@lu.ma', %s, %s, %s)
+                'calendar-invite@lu.ma', %s, %s, %s),
+               ('z@x.test', 'cal1', 'ev-autoflight', 'Flight to Newark (UA 269)',
+                'To see detailed information for automatically created events like this one, '
+                'use the official Google Calendar app. https://g.co/calendar',
+                'z@x.test', %s, %s, %s)
         """,
-        (_NOW, _NOW, _NOW) * 5,
+        (_NOW, _NOW, _NOW) * 6,
     )
 
     # Google marks the owner's own attendee entry "self" and the organizer's
@@ -1824,6 +1879,25 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
                 f"pull latest from main and keep going on {session}",
                 _NOW,
             ),
+        )
+
+    # --- agent turns: Zach's own words are searchable under 'self' -----------
+    # sdk-typed is a session he drove; its typed user turn is his, its
+    # assistant turn and a harness-injected task notification are not.
+    # cli-brief is orchestrator-written, so even its user turn is machinery.
+    for sess, seq, role, text in (
+        ("sdk-typed", 1, "assistant", "The freight came to 412.10 across three carriers."),
+        ("sdk-typed", 2, "user", "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
+        ("sdk-typed", 3, "user", "ok now split it by carrier"),
+        ("cli-brief", 1, "user", "continue"),
+    ):
+        warehouse._command(
+            """
+            INSERT INTO @claude_code_events (source, session_id, event_uuid, seq, occurred_at,
+                                              role, text, entrypoint, ingested_at)
+            VALUES ('claude_code', %s, %s, %s, %s, %s, %s, 'sdk-cli', %s)
+            """,
+            (sess, f"t{seq}", seq, _NOW + timedelta(minutes=seq), role, text, _NOW),
         )
 
     # --- drive: form pipelines and shortcuts ---------------------------------
@@ -1908,11 +1982,24 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     # apple
     assert priority_of("z@x.test|am-oneway") == "noise", "a 1:1 chat he never answers is a broadcast"
     assert priority_of("z@x.test|am-shortcode") == "noise", "shortcode-named group blasts are noise"
-    assert priority_of("z@x.test|am-group-active") == "direct", "big group during his active window"
-    assert priority_of("z@x.test|am-group-idle") == "cc", "big group outside his window is peripheral"
+    assert priority_of("z@x.test|am-group-active") == "direct", "big group he takes part in that week"
+    assert priority_of("z@x.test|am-group-farweek") == "direct", (
+        "the tier belongs to the group's week: five days from his nearest post is still direct"
+    )
+    assert priority_of("z@x.test|am-group-idle") == "cc", "big group in a week he is absent from is peripheral"
+    assert priority_of("z@x.test|am-crowd-samehour") == "cc", (
+        "one post amid a crowd does not promote the crowd, not even the messages an hour from it"
+    )
     # whatsapp
     assert priority_of("z@x.test|agent@lid|wm-agent") == "noise", "business/bot accounts are automated"
     assert priority_of("z@x.test|chat@g.us|wm-stub") == "noise", "contentless E2E stubs are noise"
+    assert priority_of("z@x.test|crew@g.us|wm-crew-farweek") == "direct", "a big group he takes part in that week"
+    assert priority_of("z@x.test|crowd@g.us|wm-crowd-samehour") == "cc", (
+        "a big group where he is one voice in thirty stays cc in the hour he spoke"
+    )
+    assert priority_of("z@x.test|crowd@g.us|wm-crowd-3") == "cc", "and the rest of that group's week"
+    # slack files
+    assert priority_of("z|T1|FSLACKBOT|C1|7000.1") == "noise", "Slackbot uploads are a machine posting"
     # agent sessions
     assert priority_of("claude_code|sdk-sess") == "background", "an output-format brief is a program talking"
     assert priority_of("claude_code|sdk-typed") == "self", "sdk-cli is also how paseo launches the sessions he types into"
@@ -1927,15 +2014,27 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("z@x.test|cal1|ev-flight") == "noise", "flighty auto-events are not his actions"
     assert priority_of("z@x.test|cal1|ev-invite") == "direct", "human invites are attention"
     assert priority_of("z@x.test|cal1|ev-luma") == "noise", "event-platform robots are not a person inviting him"
+    assert priority_of("z@x.test|cal1|ev-autoflight") == "noise", (
+        "Gmail's auto-created flight events name him as organizer but he never made them"
+    )
     assert priority_of("z@x.test|cal1|ev-alias") == "self", "the self+organizer attendee flags are him"
     assert priority_of("z@x.test|cal1|ev-declined") == "noise", "a meeting he declined is not attention"
     assert priority_of("z@x.test|cal1|ev-allhands") == "cc", "an invite alongside a crowd is peripheral"
     assert priority_of("z@x.test|cal1|ev-room") == "direct", "a booked room is not an extra attendee"
     # finance
-    assert priority_of("ft-coffee") == "self", "a card purchase is money he chose to move"
+    assert priority_of("ft-coffee") == "background", (
+        "a card purchase is a fact the bank recorded, not something he said or made; "
+        "it was a third of 'self' events a week and never something to read"
+    )
     assert priority_of("ft-sweep") == "noise", "brokerage cash sweeps are automated movement"
     assert priority_of("ft-interest") == "noise", "interest is credited by the institution"
     assert priority_of("ft-autopay") == "noise", "autopay runs without him"
+    # agent turns
+    assert priority_of("claude_code|sdk-typed|0") == "self", "the words he typed are his"
+    assert priority_of("claude_code|sdk-typed|3") == "self", "every typed turn, not only the opener"
+    assert priority_of("claude_code|sdk-typed|1") == "background", "the model's reply is machinery"
+    assert priority_of("claude_code|sdk-typed|2") == "background", "a harness notification on the user channel is not him"
+    assert priority_of("claude_code|cli-brief|1") == "background", "typed into an orchestrated session is still machinery"
     # codex
     assert priority_of("codex|codex-a") == "self", (
         "the identical <recommended_plugins> preamble every codex session opens with "

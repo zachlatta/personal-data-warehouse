@@ -853,6 +853,61 @@ _SLACK_DM_CONTEXT = (
 # one drive-by message must not promote a busy channel's +/-6h -- participation
 # means at least two of his messages in the window. System subtypes are judged
 # before 'self': "<@me> has joined the channel" is Slack narrating, not him.
+
+# A big group chat's tier belongs to the group's WEEK, not to the hour of the
+# message. Measured 2026-08-27: one 23-person WhatsApp event-ops group was 140
+# cc / 3 direct rows in a week, the three being reactions that happened to land
+# within six hours of one post of Zach's — the same people, the same
+# conversation, two tiers. He is a participant in a group that week when at
+# least two of the messages within +/-7 days are his AND at least one in ten
+# is (Zach's share of that group's traffic is 0.4%; of the groups he actually
+# talks in it is 10-55%). Both probes are bounded LIMIT scans over the chat's
+# (account, chat_id, time) index.
+_GROUP_WEEK_MINE_MIN = 2
+_GROUP_WEEK_SHARE_DENOMINATOR = 10
+
+
+def _group_week_engaged(mine_count_sql: str, all_count_sql: str) -> str:
+    return (
+        f"({mine_count_sql} >= {_GROUP_WEEK_MINE_MIN} "
+        f"AND {mine_count_sql} * {_GROUP_WEEK_SHARE_DENOMINATOR} >= {all_count_sql})"
+    )
+
+
+_APPLE_GROUP_WEEK_MINE = (
+    "(SELECT count(*) FROM ("
+    "  SELECT 1 FROM @apple_message_chat_messages zc "
+    "  JOIN @apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
+    "  WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
+    "    AND zc.message_date BETWEEN t.message_at - interval '7 days' "
+    "                            AND t.message_at + interval '7 days' "
+    "    AND z.is_from_me = 1 LIMIT 500) w)"
+)
+_APPLE_GROUP_WEEK_ALL = (
+    "(SELECT count(*) FROM ("
+    "  SELECT 1 FROM @apple_message_chat_messages zc "
+    "  WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
+    "    AND zc.message_date BETWEEN t.message_at - interval '7 days' "
+    "                            AND t.message_at + interval '7 days' "
+    "  LIMIT 5000) w)"
+)
+_WHATSAPP_GROUP_WEEK_MINE = (
+    "(SELECT count(*) FROM ("
+    "  SELECT 1 FROM @whatsapp_messages z "
+    "  WHERE z.account = t.account AND z.chat_id = t.chat_id AND z.is_from_me = 1 "
+    "    AND z.message_at BETWEEN t.message_at - interval '7 days' "
+    "                         AND t.message_at + interval '7 days' "
+    "  LIMIT 500) w)"
+)
+_WHATSAPP_GROUP_WEEK_ALL = (
+    "(SELECT count(*) FROM ("
+    "  SELECT 1 FROM @whatsapp_messages z "
+    "  WHERE z.account = t.account AND z.chat_id = t.chat_id "
+    "    AND z.message_at BETWEEN t.message_at - interval '7 days' "
+    "                         AND t.message_at + interval '7 days' "
+    "  LIMIT 5000) w)"
+)
+
 _SLACK_MESSAGE_PRIORITY = (
     "CASE "
     f"WHEN {_SLACK_ATTACHMENT_ONLY_MESSAGE} THEN {TIMELINE_PRIORITY_BACKGROUND} "
@@ -887,7 +942,10 @@ _SLACK_FILE_PRIORITY = (
     "CASE "
     f"WHEN {_SLACK_INACCESSIBLE_FILE_STUB} THEN {TIMELINE_PRIORITY_BACKGROUND} "
     "WHEN t.user_id <> '' AND t.user_id = ident.user_id THEN 'self' "
-    "WHEN u.is_bot = 1 THEN 'noise' "
+    # Slackbot (USLACKBOT, is_bot = 0 in users.list) posts the Zoom/huddle
+    # join notices as files: 6,052 of the last 30 days' uploads, every one a
+    # machine talking, and until 2026-08-27 every one was cc.
+    "WHEN t.user_id LIKE 'USLACK%%' OR u.is_bot = 1 THEN 'noise' "
     "WHEN c.is_im = 1 THEN 'direct' "
     f"WHEN c.is_mpim = 1 THEN "
     "  CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM @slack_messages z "
@@ -1153,7 +1211,8 @@ _APPLE_MESSAGE = _simple_adapter(
     # business/RCS token (airlines, delivery bots); 3-6 digit senders and
     # shortcode-named group chats are SMS blasts; +1 toll-free numbers are
     # automated services; a 1:1 chat Zach has never once replied to is a
-    # one-way broadcast, not a conversation.
+    # one-way broadcast, not a conversation; a big group is direct for the
+    # week he takes part in it (see _group_week_engaged), never per hour.
     priority=(
         "CASE "
         "WHEN t.is_from_me = 1 THEN 'self' "
@@ -1182,12 +1241,7 @@ _APPLE_MESSAGE = _simple_adapter(
         "           AND z.is_from_me = 0 LIMIT 20) iw) < 20 THEN 'direct' "
         "       ELSE 'noise' END "
         "WHEN COALESCE(roster.n, 0) <= 9 THEN 'direct' "
-        "WHEN EXISTS (SELECT 1 FROM @apple_message_chat_messages zc "
-        "             JOIN @apple_messages z ON z.account = zc.account AND z.message_id = zc.message_id "
-        "             WHERE zc.account = t.account AND zc.chat_id = cm.chat_id "
-        "               AND zc.message_date BETWEEN t.message_at - interval '6 hours' "
-        "                                       AND t.message_at + interval '6 hours' "
-        "               AND z.is_from_me = 1) THEN 'direct' "
+        f"WHEN {_group_week_engaged(_APPLE_GROUP_WEEK_MINE, _APPLE_GROUP_WEEK_ALL)} THEN 'direct' "
         "ELSE 'cc' END"
     ),
     max_incremental_batches_per_run=1,
@@ -1284,8 +1338,8 @@ _WHATSAPP_MESSAGE = _simple_adapter(
     # Group roster counts include me, so <= 5 is a group of at most five.
     # Business accounts (incl. Zach's own WhatsApp-bridged agent) are
     # automated; contentless rows with a group-jid "sender" are E2E/system
-    # stubs; big groups are attention only while Zach is actively in the
-    # conversation (his own message within +/-6 hours).
+    # stubs; big groups are attention for the week Zach takes part in them
+    # (see _group_week_engaged), never per hour.
     priority=(
         "CASE "
         "WHEN t.is_from_me = 1 THEN 'self' "
@@ -1300,11 +1354,7 @@ _WHATSAPP_MESSAGE = _simple_adapter(
         "                   NULLIF(t.push_name, '')) IS NULL) THEN 'noise' "
         "WHEN c.chat_type = 'group' OR t.chat_id LIKE '%%@g.us' THEN "
         "  CASE WHEN COALESCE(roster.n, 99) <= 5 THEN 'direct' "
-        "       WHEN EXISTS (SELECT 1 FROM @whatsapp_messages z "
-        "                    WHERE z.account = t.account AND z.chat_id = t.chat_id "
-        "                      AND z.is_from_me = 1 "
-        "                      AND z.message_at BETWEEN t.message_at - interval '6 hours' "
-        "                                           AND t.message_at + interval '6 hours') THEN 'direct' "
+        f"       WHEN {_group_week_engaged(_WHATSAPP_GROUP_WEEK_MINE, _WHATSAPP_GROUP_WEEK_ALL)} THEN 'direct' "
         "       ELSE 'cc' END "
         "ELSE 'direct' END"
     ),
@@ -1507,6 +1557,10 @@ _CALENDAR_EVENT = _simple_adapter(
         "WHEN t.organizer_email ~* '(calendar-invite@|no-?reply|invite@|eventbrite|"
         "lu\\.ma|meetup\\.com)' THEN 'noise' "
         "WHEN t.description LIKE '%%͏%%' OR t.description LIKE '%%­%%' THEN 'noise' "
+        # Gmail's auto-created flight/hotel/reservation events list Zach as
+        # the organizer and carry Google's boilerplate description; he never
+        # made them, any more than the Flighty ones below.
+        "WHEN t.description ~* 'automatically created events' THEN 'noise' "
         f"WHEN {_CALENDAR_ORGANIZED_BY_ME} THEN "
         "  CASE WHEN t.summary LIKE '✈%%' THEN 'noise' ELSE 'self' END "
         f"WHEN {_CALENDAR_DECLINED_BY_ME} THEN 'noise' "
@@ -2004,7 +2058,7 @@ _FINANCE_TRANSACTION = _simple_adapter(
         "\\mrecurring\\M|auto.?pay|automatic payment|payroll|direct deposit|"
         "\\mach (debit|credit|deposit|withdrawal)\\M)' "
         "  THEN 'noise' "
-        "ELSE 'self' END"
+        "ELSE 'background' END"
     ),
 )
 
@@ -2316,6 +2370,34 @@ def _agent_session_adapter() -> TimelineAdapter:
 _AGENT_SESSION = _agent_session_adapter()
 
 
+
+# Turns the harness writes on the user channel: task notifications, stop-hook
+# feedback, slash-command echoes, heartbeat polls, interruption markers.
+# Prefix matches taken from the two weeks of prod user turns on 2026-08-27
+# (675 heartbeat polls, 388 task notifications, 132 plugin preambles ...).
+_AGENT_HARNESS_USER_TURN_PATTERN = (
+    "'^\\s*(<task-notification>|<system-reminder>|<command-name>|<local-command-stdout>|"
+    "<realtime_delegation>|<local-command-caveat>|\\[openclaw heartbeat poll\\]|"
+    "\\[request interrupted|stop hook feedback:|\\[system notification|"
+    "another claude session|\\[image: |a session-scoped stop hook)'"
+)
+
+# The words Zach typed are his. A user turn is 'self' when the SESSION is
+# his (the roll-up's classification, read from the sibling agent_session row
+# rather than recomputed per turn: orchestrated briefs and recurring routine
+# prompts stay machinery down to the last turn) and the row is not a
+# harness-injected preamble or notification. Everything else -- the model's
+# replies, tool output, orchestrated sessions -- is background, so turn rows
+# still never crowd the browse view. Until 2026-08-27 every turn was
+# background, which hid every sentence Zach ever typed from a
+# priorities => ARRAY['self'] search: only the session title was reachable.
+_AGENT_TURN_PRIORITY = (
+    "CASE WHEN e.role = 'user' AND sess.priority = 'self' "
+    f"      AND NOT {_AGENT_INJECTED_PREAMBLE.replace('e2.', 'e.')} "
+    f"      AND e.text !~* {_AGENT_HARNESS_USER_TURN_PATTERN} "
+    f"     THEN {TIMELINE_PRIORITY_SELF} ELSE {TIMELINE_PRIORITY_BACKGROUND} END"
+)
+
 def _agent_session_turn_adapter() -> TimelineAdapter:
     """One timeline row per user/assistant turn of every agent session.
 
@@ -2323,10 +2405,11 @@ def _agent_session_turn_adapter() -> TimelineAdapter:
     the SEARCH surface for transcript content. One row per whole session
     diluted BM25 relevance across arbitrarily long transcripts and the hit
     preview routinely missed the matched turn — measured as a primary reason
-    agents fell back to raw-table scans. Turn rows are priority 'background'
-    so they never crowd the browse/priority views; their `context` is
-    '<source>|<session_id>', so timeline.context(ref) pages the surrounding
-    turns of the same session.
+    agents fell back to raw-table scans. A user turn Zach typed into a
+    session that is his is 'self' (see _AGENT_TURN_PRIORITY); every other
+    turn is 'background' so the transcript never crowds the browse/priority
+    views. Their `context` is '<source>|<session_id>', so
+    timeline.context(ref) pages the surrounding turns of the same session.
     """
     select = f"""
         SELECT
@@ -2345,8 +2428,11 @@ def _agent_session_turn_adapter() -> TimelineAdapter:
                                 'session_title', e.session_title))::text AS metadata,
             concat_ws(E'\n', NULLIF(e.session_title, ''), NULLIF(e.text, '')) AS search_text,
             e.ingested_at AS ingest_ts,
-            {TIMELINE_PRIORITY_BACKGROUND} AS priority
+            {_AGENT_TURN_PRIORITY} AS priority
         FROM @ai_conversation_events e
+        LEFT JOIN @timeline_events sess
+          ON sess.adapter = 'agent_session'
+         AND sess.event_id = concat_ws('|', e.source, e.session_id)
         WHERE e.role IN ('user', 'assistant') AND e.text != ''
     """
     backfill_sql = f"""
@@ -2376,7 +2462,7 @@ def _agent_session_turn_adapter() -> TimelineAdapter:
             "SELECT max(ingested_at) FROM @ai_conversation_events "
             "WHERE role IN ('user', 'assistant') AND text != ''"
         ),
-        priority_expression=TIMELINE_PRIORITY_BACKGROUND,
+        priority_expression=_AGENT_TURN_PRIORITY,
         batch_size=5000,
     )
 
