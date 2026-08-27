@@ -3755,6 +3755,7 @@ class PostgresWarehouse:
         # marts_voice_memos.* unions both voice sources, so either source's
         # ensure_* path builds it.
         self._ensure_voice_memos_mart_views()
+        self._ensure_transcription_runs_rejections_reclassified()
         self._ensure_clean_calendar_transcript_views_if_possible()
         self._ensure_search_views_if_possible()
 
@@ -5732,7 +5733,6 @@ class PostgresWarehouse:
 
     def ensure_voice_memo_transcription_tables(self) -> None:
         self.ensure_apple_voice_memos_tables()
-        self._ensure_transcription_runs_rejections_reclassified()
 
     def _ensure_transcription_runs_rejections_reclassified(self) -> None:
         """Reclassify legacy permanent input rejections from 'error' to 'rejected'.

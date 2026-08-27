@@ -777,7 +777,10 @@ def test_a_legacy_error_row_for_an_impossible_recording_is_reclassified(warehous
         """,
         (now, now),
     )
-    warehouse.ensure_voice_memo_transcription_tables()
+    # Deliberately the ensure path the RUNNERS call, not the transcription-only
+    # alias: that alias has no callers at all, so a migration living there would
+    # never run in production while a test calling it directly still passed.
+    warehouse.ensure_apple_voice_memos_tables()
 
     statuses = {
         row["recording_id"]: row["status"]
@@ -789,6 +792,31 @@ def test_a_legacy_error_row_for_an_impossible_recording_is_reclassified(warehous
     # The impossible input becomes terminal; the provider outage stays an error
     # so a genuine outage still reads failing.
     assert statuses == {"legacy-1": "rejected", "legacy-2": "error"}
+
+
+def test_the_rejection_migration_runs_from_a_path_something_actually_calls() -> None:
+    """A migration is only real if a live code path reaches it.
+
+    ensure_voice_memo_transcription_tables() has no callers anywhere in the
+    repo, so a reclassification placed there would never execute against
+    production -- and a test that called it directly would still be green.
+    Pin it to ensure_apple_voice_memos_tables(), which the transcription
+    runner, the enrichment runner and the Drive ingest all call.
+    """
+    import inspect
+
+    from personal_data_warehouse.postgres import PostgresWarehouse
+
+    live = inspect.getsource(PostgresWarehouse.ensure_apple_voice_memos_tables)
+    assert "_ensure_transcription_runs_rejections_reclassified" in live
+
+    callers = [
+        name
+        for name, member in inspect.getmembers(PostgresWarehouse, inspect.isfunction)
+        if name != "ensure_voice_memo_transcription_tables"
+        and "ensure_voice_memo_transcription_tables(" in inspect.getsource(member)
+    ]
+    assert not callers or "_ensure_transcription_runs_rejections_reclassified" in live
 
 
 def test_a_stale_snapshot_reports_unknown_instead_of_stale_facts(warehouse):
