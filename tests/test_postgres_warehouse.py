@@ -3075,6 +3075,216 @@ def test_timeline_context_returns_neighboring_events(warehouse: PostgresWarehous
         warehouse._query("SELECT * FROM @timeline_context('not-a-ref', 1, 1)")
 
 
+def test_timeline_context_of_a_gmail_hit_is_its_thread(warehouse: PostgresWarehouse) -> None:
+    # gmail's timeline `context` is the MAILBOX ACCOUNT, so the generic
+    # (source, context) walk answered an email with whatever else happened to
+    # land in the inbox around it -- measured on production 2026-08-27, 1,187
+    # emails over 472 threads in one account-week, so a 15-a-side window was
+    # thirty strangers and never the reply. The thread is resolved from
+    # base_gmail.messages (account, thread_id, internal_date DESC) instead.
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    base = datetime(2026, 5, 19, 12, tzinfo=UTC)
+
+    def _gmail(message_id: str, thread_id: str, minutes: int, subject: str) -> None:
+        warehouse._command(
+            """
+            INSERT INTO @gmail_messages (account, message_id, thread_id, internal_date,
+                                         subject, from_address, to_addresses, snippet, synced_at)
+            VALUES ('z@x.test', %s, %s, %s, %s, 'alice@example.test', %s, %s, %s)
+            """,
+            (
+                message_id,
+                thread_id,
+                base + timedelta(minutes=minutes),
+                subject,
+                ["Zach <z@x.test>"],
+                subject,
+                base,
+            ),
+        )
+
+    _gmail("m1", "th1", 0, "offsite agenda")
+    # An unrelated email lands BETWEEN the thread's messages: it is the
+    # nearest neighbour in time and the exact row the old walk returned.
+    _gmail("m2", "th2", 1, "vexillology newsletter")
+    _gmail("m3", "th1", 2, "Re: offsite agenda")
+    _gmail("m4", "th1", 3, "Re: offsite agenda again")
+    _sync_timeline(warehouse)
+
+    rows = warehouse._query(
+        "SELECT title FROM @timeline_context('gmail_email:z@x.test|m3', 5, 5) "
+        "ORDER BY event_ts, seq"
+    )
+    titles = [row[0] for row in rows]
+    assert titles == ["offsite agenda", "Re: offsite agenda", "Re: offsite agenda again"], titles
+    assert not any("newsletter" in title for title in titles), (
+        "a different thread's mail must not appear just because it is near in time"
+    )
+
+    # The window still bounds the thread in both directions, so a long thread
+    # cannot be materialized and sliced.
+    rows = warehouse._query(
+        "SELECT title FROM @timeline_context('gmail_email:z@x.test|m3', 1, 0) "
+        "ORDER BY event_ts, seq"
+    )
+    assert [row[0] for row in rows] == ["offsite agenda", "Re: offsite agenda"]
+
+
+def test_timeline_context_of_a_slack_reply_is_its_thread(warehouse: PostgresWarehouse) -> None:
+    # In a channel a threaded reply reads as noise beside whatever else was
+    # said at that minute; what makes it readable is the thread it answers.
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    base = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="public_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=base,
+                thread_ts="100.1",
+                reply_count=2,
+                is_thread_parent=1,
+                text="parent: can we ship the offsite budget",
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.2",
+                message_datetime=base + timedelta(minutes=1),
+                thread_ts="100.2",
+                text="unrelated channel chatter at the same minute",
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.3",
+                message_datetime=base + timedelta(minutes=2),
+                thread_ts="100.1",
+                is_thread_reply=1,
+                text="reply one: yes",
+            ),
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.4",
+                message_datetime=base + timedelta(minutes=3),
+                thread_ts="100.1",
+                is_thread_reply=1,
+                text="reply two: shipping it",
+            ),
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    rows = warehouse._query(
+        "SELECT snippet FROM @timeline_context('slack_message:zrl|T1|C1|100.3', 5, 5) "
+        "ORDER BY event_ts, seq"
+    )
+    snippets = [row[0] for row in rows]
+    assert len(snippets) == 3, f"expected the thread parent and both replies, got {snippets}"
+    assert "parent" in snippets[0] and "reply one" in snippets[1] and "reply two" in snippets[2]
+    assert not any("unrelated" in snippet for snippet in snippets)
+
+    # A message that is NOT in a thread still gets its channel, which is the
+    # only readable answer for it.
+    rows = warehouse._query(
+        "SELECT snippet FROM @timeline_context('slack_message:zrl|T1|C1|100.2', 5, 5) "
+        "ORDER BY event_ts, seq"
+    )
+    snippets = [row[0] for row in rows]
+    assert len(snippets) == 4, f"expected the whole channel around it, got {snippets}"
+    assert any("unrelated" in snippet for snippet in snippets)
+
+
+def test_timeline_context_keeps_two_group_dms_apart(warehouse: PostgresWarehouse) -> None:
+    # Every Slack mpim stores the LITERAL string 'group DM' as its timeline
+    # context, so the generic walk spliced unrelated group DMs into one
+    # transcript -- 65 conversations and 635 events over thirty days on
+    # production, 2026-08-27. Conversation identity comes from the source row.
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    base = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(conversation_id="G1", conversation_type="mpim", sync_version=1),
+            _slack_conversation_row(conversation_id="G2", conversation_type="mpim", sync_version=1),
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="G1", message_ts="100.1", message_datetime=base,
+                text="G1 first",
+            ),
+            _slack_message_row(
+                conversation_id="G2", message_ts="200.1",
+                message_datetime=base + timedelta(seconds=30), text="G2 interloper",
+            ),
+            _slack_message_row(
+                conversation_id="G1", message_ts="100.2",
+                message_datetime=base + timedelta(minutes=1), text="G1 second",
+            ),
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    contexts = warehouse._query(
+        "SELECT DISTINCT context FROM @timeline_events WHERE source = 'slack'"
+    )
+    assert [row[0] for row in contexts] == ["group DM"], (
+        "this test is only meaningful while both conversations share one context string"
+    )
+
+    rows = warehouse._query(
+        "SELECT snippet FROM @timeline_context('slack_message:zrl|T1|G1|100.1', 5, 5) "
+        "ORDER BY event_ts, seq"
+    )
+    snippets = [row[0] for row in rows]
+    assert snippets == ["G1 first", "G1 second"], snippets
+
+
+def test_timeline_context_falls_back_when_the_source_row_is_gone(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # A stream that resolves nothing must not answer an empty conversation.
+    # An empty result is never a broken lookup in disguise here: the generic
+    # (source, context) walk still runs, so the caller gets the best available
+    # answer rather than silence.
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    base = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1", message_ts="100.1", message_datetime=base, text="first",
+            ),
+            _slack_message_row(
+                conversation_id="C1", message_ts="100.2",
+                message_datetime=base + timedelta(minutes=1), text="second",
+            ),
+        ]
+    )
+    _sync_timeline(warehouse)
+    # The timeline row survives its source row, which is exactly what a
+    # source-side delete plus a not-yet-run prune looks like.
+    warehouse._command("DELETE FROM @slack_messages WHERE message_ts = '100.1'")
+
+    rows = warehouse._query(
+        "SELECT snippet FROM @timeline_context('slack_message:zrl|T1|C1|100.1', 5, 5) "
+        "ORDER BY event_ts, seq"
+    )
+    assert [row[0] for row in rows] == ["first", "second"], rows
+
+
 def test_search_text_excludes_internal_agent_run_events(warehouse: PostgresWarehouse) -> None:
     # agent_run_events holds the warehouse's OWN internal enrichment-agent
     # operational logs: its `text` column is raw JSON / stderr for every event

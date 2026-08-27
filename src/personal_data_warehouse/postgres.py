@@ -172,7 +172,10 @@ from personal_data_warehouse.relations import (
 # imported rather than restated here; this module only publishes them as
 # Postgres COMMENTs. timeline.py imports nothing from postgres.py, so there is
 # no cycle.
-from personal_data_warehouse.timeline import TIMELINE_PRIORITY_DEFINITIONS
+from personal_data_warehouse.timeline import (
+    TIMELINE_PRIORITY_DEFINITIONS,
+    timeline_context_branch_sql,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1567,8 +1570,11 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS timeline_events_priority_time_idx ON @timeline_events (priority, event_ts DESC, seq DESC)",
     ),
     # timeline.context(ref, before, after) walks a hit's neighbors within the
-    # same (source, context) stream — the surrounding chat/channel/thread
-    # messages a search hit needs to be readable without a raw-table drill.
+    # same (source, context) stream — the surrounding events a search hit needs
+    # to be readable without a raw-table drill. This serves every adapter in
+    # TIMELINE_CONTEXT_GENERIC_ADAPTERS; the conversational sources resolve
+    # their neighbours in the SOURCE table's own indexes instead, which is why
+    # that fix needed no new index on this 45 GB heap.
     # CONCURRENTLY: timeline_events is ~47M rows in production.
     IndexSpec(
         "timeline_events_context_time_idx",
@@ -5236,8 +5242,12 @@ class PostgresWarehouse:
         "title": "Short headline (subject, summary, filename, first prompt), capped.",
         "snippet": "Capped preview of the body. The full record lives behind source_table/source_pk.",
         "context": (
-            "The stream this event belongs to: channel, chat, folder, calendar, or "
-            "'<provider>|<session_id>' for agent turns. It is the key timeline.context() pages over."
+            "A DISPLAY label for the stream this event belongs to: channel, chat, folder, "
+            "calendar, or '<provider>|<session_id>' for agent turns. It is a label, not an "
+            "identity -- gmail stores the mailbox account and every Slack group DM stores the "
+            "literal 'group DM' -- so timeline.context() resolves a chat/email conversation "
+            "from the source row instead, and pages over this column only for the sources "
+            "where it IS the identity."
         ),
         "source_table": (
             "Catalog logical id of the authoritative relation (gmail_messages, "
@@ -10407,6 +10417,13 @@ class PostgresWarehouse:
         source, or changing the source floor force a one-time rebuild. If source
         introspection is unavailable, return an empty signature so the guard
         never matches and safely degrades to the old always-rebuild behavior.
+
+        Anything the generator INTERPOLATES has to be in here too, or a
+        deployment keeps serving the old function forever with no symptom.
+        timeline.context()'s per-adapter branches come from
+        TIMELINE_CONTEXT_STREAMS in timeline.py, so a registry edit that never
+        touches this module would otherwise leave production on the previous
+        conversation shapes.
         """
         try:
             source = inspect.getsource(type(self)._ensure_search_text_function)
@@ -10435,6 +10452,7 @@ class PostgresWarehouse:
                 str(SEARCH_TEXT_BROAD_SMALL_POOL),
                 SEARCH_TEXT_LOW_VOLUME_ADAPTERS_SQL,
                 SEARCH_TEXT_ATTENTION_PRIORITIES_SQL,
+                timeline_context_branch_sql(),
                 ",".join(self._SEARCH_PRIORITY_TOKENS),
                 str(SEARCH_HYBRID_RRF_K),
                 str(SEARCH_HYBRID_SEMANTIC_WEIGHT),
@@ -11355,13 +11373,26 @@ class PostgresWarehouse:
             + r""") AS s(source)
                 ORDER BY s.source
             $sources$;
-            -- timeline.context(ref, before, after): the surrounding events of
-            -- one timeline row, within the same (source, context) stream — the
-            -- neighboring chat/channel/thread messages a search hit needs to
-            -- be readable. `ref` is exactly what search_text()/search_text_exact()
-            -- return ('<adapter>:<event_id>'), so a hit terminates in one hop
-            -- instead of a raw-table drill. Served by
-            -- timeline_events_context_time_idx.
+            -- timeline.context(ref, before, after): the conversation around
+            -- one timeline row — the rest of the email thread, the replies in
+            -- the Slack thread or the messages around it in its channel, the
+            -- neighbouring messages of the same iMessage/WhatsApp chat. `ref`
+            -- is exactly what search_text()/search_text_exact() return
+            -- ('<adapter>:<event_id>'), so a hit terminates in one hop instead
+            -- of a raw-table drill.
+            --
+            -- Conversational sources resolve their neighbours in the SOURCE
+            -- table, whose indexes already express the real conversation, and
+            -- join the resolved ids back by timeline.events' primary key.
+            -- `context` is a DISPLAY string and cannot carry that identity:
+            -- gmail stores the mailbox account (1,187 emails over 472 threads
+            -- in one account-week) and slack stores the literal 'group DM'
+            -- for every mpim (65 conversations interleaved over 30 days), so
+            -- the generic walk answered those two with strangers. Every other
+            -- adapter keeps that generic (source, context) walk below, served
+            -- by timeline_events_context_time_idx; which adapters do is
+            -- declared in TIMELINE_CONTEXT_STREAMS /
+            -- TIMELINE_CONTEXT_GENERIC_ADAPTERS, never inferred.
             CREATE OR REPLACE FUNCTION @timeline_context(
                 ref text,
                 before integer DEFAULT 5,
@@ -11382,6 +11413,13 @@ class PostgresWarehouse:
                 ref_event_id text;
                 n_before integer := least(greatest(coalesce(before, 5), 0), 50);
                 n_after integer := least(greatest(coalesce(after, 5), 0), 50);
+                anchor_pk jsonb;
+                -- The anchor's own SOURCE row, read once per call into a
+                -- plpgsql record so every ordering bound below is a parameter
+                -- the source index can use. Joining it in as a CTE instead
+                -- made the same walk time out; see _context_stream_sql.
+                src record;
+                matched integer := 0;
             BEGIN
                 IF position(':' IN coalesce(ref, '')) = 0 THEN
                     RAISE EXCEPTION 'context: ref must look like <adapter>:<event_id>, got %', ref
@@ -11394,6 +11432,12 @@ class PostgresWarehouse:
                     RAISE EXCEPTION 'context: no timeline event for ref %', ref
                         USING HINT = 'refs come from search_text()/search_text_exact() as <adapter>:<event_id>';
                 END IF;
+                anchor_pk := anchor.source_pk;
+"""
+            + timeline_context_branch_sql()
+            + r"""
+                -- The generic walk: neighbours in time within the same
+                -- (source, context) stream.
                 RETURN QUERY
                     SELECT w.* FROM (
                         (

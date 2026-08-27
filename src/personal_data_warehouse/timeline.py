@@ -222,6 +222,14 @@ class TimelineAdapter:
     # normalized content, so including it would reset every adapter's backfill
     # and re-walk 48M rows to add a pass whose whole purpose is to avoid that.
     reconcile_sql: str = ""
+    # The adapter's own `event_id` expression, retained verbatim so a
+    # TimelineContextStream can be checked against it. A stream resolves a
+    # hit's neighbours in the SOURCE table and then joins them to
+    # timeline.events by (adapter, event_id), so a drift between the two
+    # expressions returns SILENTLY EMPTY -- the worst failure this layer has.
+    # Also not part of `adapter_signature`: it is a copy of text already
+    # inside backfill_sql, not a new input to any row's content.
+    event_id_expression: str = ""
 
 
 def _real_ts(*exprs: str) -> str:
@@ -388,6 +396,7 @@ def _simple_adapter(
         signature_backfill_sql=signature_backfill_sql,
         signature_incremental_sql=signature_incremental_sql,
         reconcile_sql=reconcile_sql,
+        event_id_expression=event_id,
     )
 
 
@@ -2414,6 +2423,326 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
 # `alice_voice_recording` was folded into `voice_memo`, which now reads
 # marts_voice_memos.recordings and emits both sources.
 RETIRED_TIMELINE_ADAPTERS: tuple[str, ...] = ("alice_voice_recording",)
+
+
+@dataclass(frozen=True)
+class TimelineContextStream:
+    """How ``timeline.context()`` reads the conversation around one event.
+
+    The naive answer -- neighbours are the timeline rows sharing this row's
+    ``(source, context)`` -- is wrong for exactly the sources people ask about,
+    because ``context`` is a DISPLAY string, not an identity:
+
+    * ``gmail`` stores the mailbox account, so a hit's "conversation" was the
+      whole mailbox in time order. Measured on production 2026-08-27, one
+      account carried 1,187 emails across 472 threads in seven days, so a
+      15-a-side window returned thirty unrelated emails and never the reply.
+    * ``slack`` stores the literal ``'group DM'`` for every mpim, so 65
+      distinct group DMs and 635 events interleaved into one transcript over
+      thirty days -- and a threaded reply read as bare channel chatter.
+
+    So a stream resolves neighbours in the SOURCE table, whose indexes already
+    express the real conversation (``base_gmail.messages (account, thread_id,
+    internal_date DESC)``, ``base_slack.messages (account, team_id,
+    conversation_id, thread_ts)``, ...), and joins the resolved ids back to
+    ``timeline.events`` by its primary key. Nothing about the timeline heap
+    changes: no new 45 GB index, and -- because ``context`` itself is
+    untouched -- no ``adapter_signature`` change and no re-walk.
+
+    Fields, all SQL fragments:
+
+    ``anchor_sql``
+        One row from the source table, keyed by the anchor event's
+        ``source_pk`` (available as the jsonb variable ``anchor_pk``). It is
+        read into the plpgsql record ``src``, which is how the other
+        fragments see it -- deliberately a record and not a joined CTE; see
+        ``_context_stream_sql`` for the measurement that settled that.
+    ``from_sql``
+        The neighbour relation, aliased ``t`` -- the SAME alias the adapters
+        use, so ``event_id_sql`` can be the adapter's own expression
+        character for character and be checked against it.
+    ``where_sql``
+        What makes a row a neighbour: same thread, same conversation, same
+        chat. May reference both ``t`` and ``src``.
+    ``time_column`` / ``tiebreak_column``
+        The source's own ordering key, as bare column names (they are read on
+        both the neighbour row and the anchor row, so an expression could not
+        be aliased to either). Both a plain ``<=``/``>=`` bound -- which the
+        index serves -- and an exact row comparison -- which breaks ties on a
+        second-precision stamp like ``internal_date`` -- are generated from
+        them, so the walk is index-driven AND exact.
+    ``applies_sql``
+        Boolean over ``src`` deciding whether this stream is the right one. The
+        first stream whose test passes wins; the last stream of an adapter
+        must be unconditional.
+    """
+
+    label: str
+    anchor_sql: str
+    from_sql: str
+    where_sql: str
+    time_column: str
+    tiebreak_column: str
+    event_id_sql: str
+    neighbor_adapter: str
+    applies_sql: str = "TRUE"
+
+
+_GMAIL_ANCHOR = (
+    "SELECT a.* FROM @gmail_messages a "
+    "WHERE a.account = anchor_pk->>'account' AND a.message_id = anchor_pk->>'message_id'"
+)
+_SLACK_ANCHOR = (
+    "SELECT a.* FROM @slack_messages a "
+    "WHERE a.account = anchor_pk->>'account' AND a.team_id = anchor_pk->>'team_id' "
+    "AND a.conversation_id = anchor_pk->>'conversation_id' "
+    "AND a.message_ts = anchor_pk->>'message_ts'"
+)
+# The apple_message adapter attributes a message to min(chat_id) of its
+# chat_messages rows; ORDER BY chat_id LIMIT 1 is that same choice, so the
+# anchor and its neighbours agree on which chat they are in.
+_APPLE_MESSAGE_ANCHOR = (
+    "SELECT a.* FROM @apple_message_chat_messages a "
+    "WHERE a.account = anchor_pk->>'account' AND a.message_id = anchor_pk->>'message_id' "
+    "ORDER BY a.chat_id LIMIT 1"
+)
+_WHATSAPP_ANCHOR = (
+    "SELECT a.* FROM @whatsapp_messages a "
+    "WHERE a.account = anchor_pk->>'account' AND a.chat_id = anchor_pk->>'chat_id' "
+    "AND a.message_id = anchor_pk->>'message_id'"
+)
+
+# A Slack message is in a thread when Slack says so, and Slack says so two
+# ways: the row is a reply, or the row is a parent that has replies. thread_ts
+# alone is not the test -- 3,804 of the 4,618 messages carrying
+# `thread_ts = message_ts` in one production day had no replies at all, so
+# reading thread_ts as "threaded" would scope a plain channel message to a
+# thread of one and hide the channel it was said in.
+_SLACK_IN_THREAD = "src.thread_ts <> '' AND (src.is_thread_reply = 1 OR src.reply_count > 0)"
+
+TIMELINE_CONTEXT_STREAMS: dict[str, tuple[TimelineContextStream, ...]] = {
+    "gmail_email": (
+        TimelineContextStream(
+            label="thread",
+            anchor_sql=_GMAIL_ANCHOR,
+            from_sql="@gmail_messages t",
+            where_sql="t.account = src.account AND t.thread_id = src.thread_id",
+            time_column="internal_date",
+            tiebreak_column="message_id",
+            event_id_sql="concat_ws('|', t.account, t.message_id)",
+            neighbor_adapter="gmail_email",
+        ),
+    ),
+    "slack_message": (
+        TimelineContextStream(
+            label="thread",
+            anchor_sql=_SLACK_ANCHOR,
+            from_sql="@slack_messages t",
+            where_sql=(
+                "t.account = src.account AND t.team_id = src.team_id "
+                "AND t.conversation_id = src.conversation_id AND t.thread_ts = src.thread_ts"
+            ),
+            time_column="message_datetime",
+            tiebreak_column="message_ts",
+            event_id_sql="concat_ws('|', t.account, t.team_id, t.conversation_id, t.message_ts)",
+            neighbor_adapter="slack_message",
+            applies_sql=_SLACK_IN_THREAD,
+        ),
+        TimelineContextStream(
+            label="conversation",
+            anchor_sql=_SLACK_ANCHOR,
+            from_sql="@slack_messages t",
+            where_sql=(
+                "t.account = src.account AND t.team_id = src.team_id "
+                "AND t.conversation_id = src.conversation_id"
+            ),
+            time_column="message_datetime",
+            tiebreak_column="message_ts",
+            event_id_sql="concat_ws('|', t.account, t.team_id, t.conversation_id, t.message_ts)",
+            neighbor_adapter="slack_message",
+        ),
+    ),
+    "apple_message": (
+        TimelineContextStream(
+            label="chat",
+            anchor_sql=_APPLE_MESSAGE_ANCHOR,
+            from_sql="@apple_message_chat_messages t",
+            where_sql="t.account = src.account AND t.chat_id = src.chat_id",
+            time_column="message_date",
+            tiebreak_column="message_id",
+            event_id_sql="concat_ws('|', t.account, t.message_id)",
+            neighbor_adapter="apple_message",
+        ),
+    ),
+    "whatsapp_message": (
+        TimelineContextStream(
+            label="chat",
+            anchor_sql=_WHATSAPP_ANCHOR,
+            from_sql="@whatsapp_messages t",
+            where_sql="t.account = src.account AND t.chat_id = src.chat_id",
+            time_column="message_at",
+            tiebreak_column="message_id",
+            event_id_sql="concat_ws('|', t.account, t.chat_id, t.message_id)",
+            neighbor_adapter="whatsapp_message",
+        ),
+    ),
+}
+
+# Adapters that deliberately keep the generic `(source, context)` walk.
+#
+# Listed rather than inferred, because "no stream" and "nobody got to it yet"
+# are the same thing to every test that only reads TIMELINE_CONTEXT_STREAMS --
+# the same silent hole TIMELINE_TABLE_COVERAGE exists to close for C1. An
+# adapter added without a decision here fails
+# test_every_adapter_declares_how_its_conversation_is_read.
+#
+# Two shapes qualify:
+#   * `context` already IS the identity -- an agent session's
+#     '<source>|<session_id>', a calendar id, a folder path, an account.
+#   * the events are not a conversation at all (photos, health, finance,
+#     enrichment runs), where neighbours-in-time is the honest answer.
+# `slack_file` stays generic on purpose: its neighbours are slack_message
+# rows, so a stream would return a transcript the anchor is not in and the
+# `is_anchor` row both UIs light would be missing.
+TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
+    {
+        "slack_file",
+        "agent_session",
+        "agent_session_turn",
+        "apple_note_revision",
+        "voice_memo",
+        "calendar_event",
+        "drive_file",
+        "photo",
+        "contact_update",
+        "apple_contact_update",
+        "whoop_cycle",
+        "whoop_recovery",
+        "whoop_sleep",
+        "whoop_workout",
+        "whoop_private_journal",
+        "finance_transaction",
+        "finance_observation",
+        "manual_finance_document",
+        "mutation",
+        "mutation_request",
+        "enrichment_run",
+    }
+)
+
+
+def _context_stream_sql(stream: TimelineContextStream) -> str:
+    """One stream's neighbour query, as the body of a plpgsql RETURN QUERY.
+
+    Two shapes here are load-bearing, and both were settled by measuring
+    against the production corpus rather than by argument.
+
+    **The anchor is a plpgsql record, never a joined CTE.** The obvious
+    formulation puts the anchor row in a ``WITH a AS (...)`` and cross-joins it
+    into both legs -- and because that makes ``a`` referenced twice, Postgres
+    materializes it, so every ordering bound becomes a join qual against an
+    opaque CTE scan instead of an index qual. Measured 2026-08-27 on the
+    busiest Slack channel: each leg on its own ran in 183ms (one reference, so
+    the CTE inlined), and the two together **timed out past the 60s budget**.
+    Reading the anchor into a record first makes each bound a parameter the
+    index can use; the same walk then returns 31 rows in 162-295ms.
+
+    **The walk goes OUTWARD from the anchor in both directions**, rather than
+    materializing the conversation and slicing it. A production Gmail thread
+    runs past 60 messages, and a Slack channel past a million.
+    """
+    for column in (stream.time_column, stream.tiebreak_column):
+        if not column.isidentifier():
+            raise ValueError(
+                f"context stream ordering column must be a bare column name, got {column!r}"
+            )
+    time_t = f"t.{stream.time_column}"
+    time_a = f"src.{stream.time_column}"
+    tie_t = f"t.{stream.tiebreak_column}"
+    tie_a = f"src.{stream.tiebreak_column}"
+
+    def leg(*, bound: str, exact: str, order: str, limit: str) -> str:
+        # The `<=` / `>=` bound is what the source index can serve; the row
+        # comparison beside it is what makes the split exact when several rows
+        # share the anchor's timestamp (gmail's internal_date is only
+        # second-precision, so a busy thread really does tie).
+        return f"""(
+                            SELECT {stream.event_id_sql} AS event_id
+                            FROM {stream.from_sql}
+                            WHERE ({stream.where_sql})
+                              AND {time_t} {bound} {time_a}
+                              AND ({time_t}, {tie_t}) {exact} ({time_a}, {tie_a})
+                            ORDER BY {time_t} {order}, {tie_t} {order}
+                            LIMIT {limit}
+                        )"""
+
+    # The anchor is the first row of the forward leg, which is why that leg
+    # takes n_after + 1 -- the caller asked for n_after neighbours after it.
+    return f"""
+                    WITH cand AS (
+                        {leg(bound="<=", exact="<", order="DESC", limit="n_before")}
+                        UNION ALL
+                        {leg(bound=">=", exact=">=", order="ASC", limit="n_after + 1")}
+                    )
+                    SELECT ev.* FROM cand c
+                    JOIN @timeline_events ev
+                      ON ev.adapter = '{stream.neighbor_adapter}' AND ev.event_id = c.event_id
+                    ORDER BY ev.event_ts ASC, ev.seq ASC"""
+
+
+def timeline_context_branch_sql() -> str:
+    """The per-adapter plpgsql branches of timeline.context().
+
+    Emitted into the function body by postgres.py. Each branch loads the
+    anchor's own source row into ``src``, tries its adapter's streams in
+    order, and RETURNs on the first that produced rows. Anything that resolves
+    nothing -- an iMessage with no chat row, a source row deleted out from
+    under its timeline event, a stream whose condition does not hold -- falls
+    through to the generic (source, context) walk rather than answering an
+    empty transcript, because an empty result must never be a broken lookup in
+    disguise.
+    """
+    branches: list[str] = []
+    for adapter_name in sorted(TIMELINE_CONTEXT_STREAMS):
+        streams = TIMELINE_CONTEXT_STREAMS[adapter_name]
+        if not streams:
+            raise ValueError(f"context streams for {adapter_name!r} must not be empty")
+        if streams[-1].applies_sql.strip() != "TRUE":
+            raise ValueError(
+                f"the last context stream for {adapter_name!r} must be unconditional; "
+                f"got applies_sql={streams[-1].applies_sql!r}"
+            )
+        anchors = {stream.anchor_sql for stream in streams}
+        if len(anchors) != 1:
+            raise ValueError(
+                f"every context stream for {adapter_name!r} must read the same anchor row"
+            )
+        body: list[str] = []
+        for stream in streams:
+            attempt = f"""RETURN QUERY{_context_stream_sql(stream)};
+                        GET DIAGNOSTICS matched = ROW_COUNT;
+                        IF matched > 0 THEN
+                            RETURN;
+                        END IF;"""
+            if stream.applies_sql.strip() == "TRUE":
+                body.append(f"""
+                        -- {stream.label}
+                        {attempt}""")
+            else:
+                body.append(f"""
+                        -- {stream.label}
+                        IF {stream.applies_sql} THEN
+                            {attempt}
+                        END IF;""")
+        branches.append(
+            f"""
+                IF anchor.adapter = '{adapter_name}' THEN
+                    SELECT * INTO src FROM ({streams[0].anchor_sql}) anchor_src;
+                    IF FOUND THEN{"".join(body)}
+                    END IF;
+                END IF;"""
+        )
+    return "".join(branches)
 
 
 def adapter_by_name(name: str) -> TimelineAdapter:

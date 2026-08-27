@@ -257,9 +257,10 @@ unified timeline document. Raw message/body columns are deliberately not text-in
   relation; `ref` (`<adapter>:<event_id>`) still joins to `timeline.events` when the
   normalized row is wanted.
 - Surrounding conversation: `SELECT * FROM timeline.context(ref, 5, 5)` returns the
-  neighboring `timeline.events` rows of the hit's `(source, context)` stream — the messages
-  around a chat/channel hit, or the turns around an agent-session hit — so a hit reads as a
-  conversation without a raw-table excursion.
+  `timeline.events` rows of the conversation the hit belongs to — an email's thread, a Slack
+  message's thread or its channel, the rest of an iMessage/WhatsApp chat, the neighbouring
+  turns of an agent session — so a hit reads as a conversation without a raw-table
+  excursion. Sources that are not conversations return their neighbours in time.
 - Literal substring/phrase/id search: `SELECT * FROM timeline.search_text_exact('offer letter', 50)` —
   the same document and hit shape, matched exactly (trigram-indexed, case-insensitive, LIKE
   wildcards treated literally), ordered by recency, with the returned text windowed around the

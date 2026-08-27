@@ -23,17 +23,22 @@ from personal_data_warehouse.timeline import (
     RAW_DDL_TABLES,
     RETIRED_TIMELINE_ADAPTERS,
     TIMELINE_ADAPTERS,
+    TIMELINE_CONTEXT_GENERIC_ADAPTERS,
+    TIMELINE_CONTEXT_STREAMS,
     TIMELINE_NORMALIZED_COLUMNS,
     TIMELINE_PRIORITY_DEFINITIONS,
     TIMELINE_PRIORITY_LABELS,
     TIMELINE_PRIORITY_UNCLASSIFIED,
     TIMELINE_TABLE_COVERAGE,
     BACKFILL_CURSOR_START,
+    TimelineContextStream,
     TimelineSyncEngine,
     TimelineSyncError,
+    _context_stream_sql,
     _simple_adapter,
     adapter_definition_signature,
     adapter_by_name,
+    timeline_context_branch_sql,
     timeline_upsert_sql,
 )
 
@@ -317,6 +322,106 @@ def test_heavy_adapters_bound_incremental_scans_to_changed_candidates():
         # first-contact max-ingest stay full-range.
         assert "pdw_changed" not in adapter.backfill_sql, name
         assert "pdw_changed" not in adapter.max_ingest_sql, name
+
+
+def test_every_adapter_declares_how_its_conversation_is_read():
+    """C1's context sibling: "no stream" must be a decision, not an omission.
+
+    timeline.context() answers a hit with either a source-resolved
+    conversation (the email thread, the Slack thread or channel, the chat) or
+    the generic neighbours-in-time walk. Both are legitimate, and nothing in
+    the SQL can tell a deliberate generic answer from an adapter whose author
+    never considered the question -- so the decision is written down per
+    adapter and checked here, exactly as TIMELINE_TABLE_COVERAGE does for
+    whether a table reaches the timeline at all.
+    """
+    registered = {adapter.name for adapter in TIMELINE_ADAPTERS}
+    declared = set(TIMELINE_CONTEXT_STREAMS) | set(TIMELINE_CONTEXT_GENERIC_ADAPTERS)
+    assert registered - declared == set(), (
+        "these adapters declare no conversation shape: add a TimelineContextStream "
+        "or list them in TIMELINE_CONTEXT_GENERIC_ADAPTERS"
+    )
+    assert declared - registered == set(), "these declarations name no registered adapter"
+    assert not (set(TIMELINE_CONTEXT_STREAMS) & set(TIMELINE_CONTEXT_GENERIC_ADAPTERS)), (
+        "an adapter is either source-resolved or generic, never both"
+    )
+
+
+def test_context_streams_use_their_adapters_own_event_id_expression():
+    """A stream resolves ids in the source table and joins them to
+    timeline.events by (adapter, event_id). If the two expressions ever drift,
+    the join matches nothing and context() returns SILENTLY EMPTY -- the worst
+    failure this layer has, and one no runtime check can see. Compare them
+    character for character; the stream fragments deliberately alias the
+    source table `t`, the same alias the adapters use, so this can be an
+    equality rather than a resemblance.
+    """
+    for adapter_name, streams in TIMELINE_CONTEXT_STREAMS.items():
+        for stream in streams:
+            neighbor = adapter_by_name(stream.neighbor_adapter)
+            assert stream.event_id_sql == neighbor.event_id_expression, (
+                f"{adapter_name}/{stream.label} builds event_id as {stream.event_id_sql!r} "
+                f"but adapter {neighbor.name} emits {neighbor.event_id_expression!r}"
+            )
+
+
+def test_the_last_context_stream_of_an_adapter_is_unconditional():
+    """Streams are tried in order and the generated branch falls through when
+    one does not apply. A final conditional stream would leave the adapter
+    silently on the generic walk whenever its condition is false, which is the
+    one outcome the registry exists to make explicit."""
+    for adapter_name, streams in TIMELINE_CONTEXT_STREAMS.items():
+        assert streams, f"{adapter_name} declares an empty stream tuple"
+        assert streams[-1].applies_sql.strip() == "TRUE", (
+            f"the last stream for {adapter_name} is conditional"
+        )
+
+
+def test_context_branches_are_generated_for_every_stream():
+    sql = timeline_context_branch_sql()
+    for adapter_name, streams in TIMELINE_CONTEXT_STREAMS.items():
+        assert f"IF anchor.adapter = '{adapter_name}' THEN" in sql
+        for stream in streams:
+            assert stream.where_sql in sql, f"{adapter_name}/{stream.label} scoping is missing"
+    # The walk must stay bounded by the caller's window in BOTH directions.
+    # Materializing a conversation and slicing it is the failure this shape
+    # exists to avoid: production Gmail threads run past 60 messages and a
+    # Slack channel past a million.
+    assert sql.count("LIMIT n_before") == 5
+    assert sql.count("LIMIT n_after + 1") == 5
+
+
+def test_a_context_stream_edit_forces_the_search_layer_to_rebuild():
+    """The deployed timeline.context() is only recreated when the search
+    schema signature changes, and that signature is built from the SOURCE of
+    postgres.py's generator -- which does not contain the branches, only the
+    call that interpolates them. Without the registry in the payload, editing
+    TIMELINE_CONTEXT_STREAMS would leave production serving the previous
+    conversation shapes indefinitely, with nothing to see."""
+    import inspect
+
+    from personal_data_warehouse.postgres import PostgresWarehouse
+
+    source = inspect.getsource(PostgresWarehouse._search_schema_signature)
+    assert "timeline_context_branch_sql()" in source, (
+        "the context-stream registry must be part of the search schema signature"
+    )
+
+
+def test_context_stream_ordering_columns_must_be_bare_columns():
+    with pytest.raises(ValueError, match="bare column name"):
+        _context_stream_sql(
+            TimelineContextStream(
+                label="bad",
+                anchor_sql="SELECT 1",
+                from_sql="@gmail_messages t",
+                where_sql="TRUE",
+                time_column="coalesce(t.internal_date, now())",
+                tiebreak_column="message_id",
+                event_id_sql="t.message_id",
+                neighbor_adapter="gmail_email",
+            )
+        )
 
 
 def test_apple_message_contact_changes_invalidate_message_history():

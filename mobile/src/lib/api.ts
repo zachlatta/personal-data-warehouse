@@ -87,8 +87,9 @@ export function listTimeline(config: AppConfig, params: TimelineListParams): Pro
 export type TimelineMedia = { media_url: string; media_kind: string; mime_type?: string; filename?: string };
 export type TimelineChildRows = Record<string, unknown>[] | { error: string };
 
-// The (source, context) stream around one event — the surrounding chat or
-// channel messages, the neighboring turns of a session — from timeline.context().
+// The conversation around one event, from timeline.context(): an email's
+// thread, a Slack message's thread or its channel, the surrounding chat
+// messages, the neighboring turns of a session.
 export type TimelineContextPage = { items: TimelineItem[]; before: number; after: number };
 export const TIMELINE_CONTEXT_MAX_WINDOW = 50;
 

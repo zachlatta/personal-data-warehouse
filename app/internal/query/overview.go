@@ -278,9 +278,9 @@ const overviewPreamble = `--
 --   first matched term. event_ts = occurred_at (same value, both names accepted downstream).
 --   A hit carries its own drill-down: source_table + source_pk point at the source relation
 --   (source_table is the catalog id, e.g. gmail_messages, not a SQL name; this listing shows
---   which schema each one lives in). For a chat/channel hit, read the surrounding conversation
---   with timeline.context(ref, 5, 5) — it returns the neighboring timeline.events rows of the
---   same (source, context) stream, so you rarely need the raw tables just for context.
+--   which schema each one lives in). Read the conversation around a hit with
+--   timeline.context(ref, 5, 5): a Gmail hit's thread, a Slack hit's thread or channel, a
+--   message's chat, else neighbors in the same (source, context) stream.
 --   valid ` + "`sources`" + ` tokens: SELECT * FROM timeline.search_text_sources(); familiar aliases
 --   (apple_messages, apple_notes, voice_memos, drive, contacts, photos, ...) resolve to the
 --   right token, and an unknown token raises an error listing the valid set. Detail text

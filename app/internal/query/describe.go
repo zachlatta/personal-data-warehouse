@@ -192,7 +192,7 @@ func describeFunction(relation string) string {
 		if schema != "timeline" {
 			return ""
 		}
-		return header + "timeline.context is a function, not a relation: timeline.context(ref text, before integer DEFAULT 5, after integer DEFAULT 5) returns SETOF timeline.events rows — the neighboring events of a search hit's (source, context) stream. Pass the ref column a search function returned."
+		return header + "timeline.context is a function, not a relation: timeline.context(ref text, before integer DEFAULT 5, after integer DEFAULT 5) returns SETOF timeline.events rows — the conversation around a search hit, chosen per source: an email's thread, a Slack message's thread or its channel, the rest of an iMessage/WhatsApp chat, the neighbouring turns of an agent session, and otherwise the neighbouring events of the hit's (source, context) stream. Pass the ref column a search function returned."
 	}
 	return ""
 }

@@ -846,9 +846,10 @@ a.filelink:hover { text-decoration: underline; }
   function isReal(ts) { return ts && ts.slice(0, 4) !== "1970"; }
 
   /* ---- conversation context ----
-     The (source, context) stream around the event, from timeline.context():
-     the surrounding channel/DM messages, the neighboring turns of an agent
-     session, the adjacent events of the same calendar. */
+     The conversation around the event, from timeline.context(): an email's
+     thread, a Slack message's thread or its channel, the rest of an
+     iMessage/WhatsApp chat, the neighboring turns of an agent session, and
+     otherwise the adjacent events of the same (source, context) stream. */
   function contextRowNode(row, anchorItem, lastDay) {
     var node = h("div", "crow p-" + (row.priority || "unclassified") + (row.is_anchor ? " anchor" : ""));
     var day = dayOf(row.event_ts);

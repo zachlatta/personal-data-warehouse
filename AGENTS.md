@@ -313,14 +313,72 @@ Text search runs through three timeline functions plus one app tool:
 - `timeline.search_text_exact(...)` — literal substring, recency-ordered, and it also
   matches number-format variants of the needle (thousands separators both ways, phone
   punctuation stripped).
-- `timeline.context(ref, before, after)` — the neighboring events of a hit's
-  (source, context) stream: the surrounding chat/channel messages, or the surrounding
-  turns of an agent session (context `<source>|<session_id>`).
+- `timeline.context(ref, before, after)` — the **conversation** around a hit, chosen per
+  source: a Gmail hit returns its thread, a Slack hit returns its thread when it is in one
+  and otherwise the messages around it in its channel, an iMessage/WhatsApp hit returns the
+  rest of that chat, and an agent-session turn returns the neighbouring turns of the same
+  session. Everything else returns the neighbouring events of the hit's `(source, context)`
+  stream. See [Conversation context](#conversation-context-what-timelinecontext-returns).
 
 The named parameters are exactly `max_results`, `sources`, `since` and `priorities`; anything
 else is an invented name and raises. `priorities` is the attention filter documented under
 [Timeline priority tiers](#timeline-priority-tiers) — `priorities => ARRAY['self','direct']`
 in SQL, `--priority self,direct` on the CLI, `"priorities": [...]` on the tool.
+
+### Conversation context: what `timeline.context()` returns
+
+A hit is one line. What makes it readable is the conversation it was said in — and for the
+sources people actually ask about, that is **not** the rows sharing its `context` column.
+`context` is a DISPLAY label, and two of them are actively misleading:
+
+| source | what `context` stores | what the generic walk returned |
+| --- | --- | --- |
+| `gmail` | the mailbox account | 1,187 emails across 472 threads in one account-week (2026-08-27), so a 15-a-side window was thirty strangers and never the reply |
+| `slack` (mpim) | the literal string `group DM` | 65 distinct group DMs and 635 events interleaved over 30 days |
+| `slack` (channel) | `#name` | the channel, but a threaded reply read as bare channel chatter |
+
+So a conversational source resolves its neighbours in the **source table**, whose indexes
+already express the real conversation, and joins the resolved ids back to `timeline.events`
+by its primary key:
+
+| adapter | the conversation | index that serves it |
+| --- | --- | --- |
+| `gmail_email` | the thread | `base_gmail.messages (account, thread_id, internal_date DESC)` |
+| `slack_message` | the thread when Slack says the row is a reply or a parent with replies, else the conversation | `base_slack.messages (account, team_id, conversation_id, thread_ts)` / `(…, message_datetime DESC)` |
+| `apple_message` | the chat | `base_apple_messages.chat_messages (account, chat_id, message_date DESC)` |
+| `whatsapp_message` | the chat | `base_whatsapp.messages (account, chat_id, message_at DESC)` |
+
+Every other adapter keeps the generic `(source, context)` walk, which is the right answer
+where `context` IS the identity (an agent session's `<source>|<session_id>`, a calendar id,
+a folder path) or where the events are not a conversation at all (photos, health, finance).
+Which adapters do is **declared**, in `TIMELINE_CONTEXT_STREAMS` /
+`TIMELINE_CONTEXT_GENERIC_ADAPTERS`, never inferred — `test_every_adapter_declares_how_its_conversation_is_read`
+fails a new adapter that made no decision, the same hole `TIMELINE_TABLE_COVERAGE` closes
+for C1.
+
+Four things here are load-bearing and each was paid for:
+
+- **Nothing about `timeline.events` changed.** Not the stored `context`, so no
+  `adapter_signature` change and no 46.8M-row Slack re-walk; and no new index on the 45 GB
+  heap, because the source tables already had the right ones.
+- **The anchor is a plpgsql record, not a joined CTE.** Putting it in a `WITH` makes it
+  referenced twice, so Postgres materializes it and every ordering bound becomes a join
+  qual against an opaque CTE scan instead of an index qual. Measured 2026-08-27 on the
+  busiest Slack channel: each leg alone ran 183ms (one reference, so the CTE inlined) and
+  the two together **timed out past the 60s budget**. As a record it is 162-295ms for 31
+  rows; the Gmail thread walk is 165-212ms.
+- **The walk goes outward from the anchor in both directions**, rather than materializing
+  the conversation and slicing it — production Gmail threads run past 60 messages and a
+  Slack channel past a million.
+- **A stream that resolves nothing falls through to the generic walk**, never to an empty
+  transcript. An iMessage with no chat row, or a source row deleted out from under its
+  timeline event, gets neighbours-in-time rather than silence.
+
+**Known gap:** the stored Slack `context` is still `group DM` for every mpim, and that
+column also keys the semantic chunk windows in `derived_search.chunks`, so all 65 group DMs
+are still embedded as one hourly conversation. Fixing it is an adapter edit that re-walks
+every Slack row — batch it with the next one, and read
+[Timeline priority tiers](#timeline-priority-tiers) for the WAL/vacuum playbook first.
 
 A **broad** (unscoped) `search_text` call does not fan out per source: it pools candidates
 from two index-ordered BM25 scans — the global index for the high-volume adapters, a partial

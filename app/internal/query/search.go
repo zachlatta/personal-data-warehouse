@@ -28,8 +28,9 @@ const (
 const searchDefaultMaxResults = 20
 
 const (
-	searchHitGuidance = "For a chat/channel or agent-turn hit, read neighboring events with " +
-		"timeline.context(ref, 5, 5). If the hit is still insufficient, use source_table and " +
+	searchHitGuidance = "For an email, chat/channel, or agent-turn hit, read the conversation " +
+		"around it with timeline.context(ref, 5, 5) — a Gmail hit returns its thread, a Slack hit " +
+		"its thread or channel, a message its chat. If the hit is still insufficient, use source_table and " +
 		"source_pk for a one-hop drill-down to the authoritative row; raise max_results explicitly " +
 		"only when you need more recall."
 	searchEmptyGuidance = "No hits is not proof of absence. Retry once with fewer terms or the " +
