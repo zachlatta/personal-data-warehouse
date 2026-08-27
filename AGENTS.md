@@ -669,10 +669,27 @@ failed keyword AND hybrid search, and no health surface moved: `amcheck` does no
 pg_textsearch, and nothing read the indexes. `marts_ops.search_health` now carries a
 `bm25_indexes` row, written by the chunk builder every five minutes from a one-row scan
 through each timeline BM25 index (`probe_bm25_indexes`); a corrupt index is `failing`
-with the index name and error in `last_error`. Repair is `REINDEX INDEX CONCURRENTLY`;
-it deadlocks readily against the timeline sync's `ShareUpdateExclusiveLock`, so retry
-rather than diagnose, and drop the `_ccnew` leftover first. `search_benchmark.py smoke`
-is the manual check: one call per source token, failing sources named.
+with the index name and error in `last_error`. Repair is `REINDEX`; the CONCURRENTLY form
+deadlocks readily against the timeline sync's `ShareUpdateExclusiveLock` (retry rather
+than diagnose, and drop the `_ccnew` leftover first) and, measured 2026-08-27 on all
+three rebuilt indexes, **produces an index about twice the size of a plain build** (lowvol
+198 MB vs 96 MB, attention 1.2 GB vs 527 MB, global 11 GB vs 5.5 GB) -- bloat that is
+paid straight out of the page cache the search working set needs. The three indexes
+rebuilt CONCURRENTLY that night all read `invalid page index` again after the next clean
+restart, so a rebuild is not done until it has been **validated cold**: evict it from
+`shared_buffers` (`pg_buffercache_evict_relation`), `echo 3 > /proc/sys/vm/drop_caches`
+on the guest, then scan it with a multi-term `to_bm25query` (with the partial index's
+predicate in the WHERE clause, or the planner picks the global index and the query raises
+for an unrelated reason). Every index passing that scan was also the state left behind
+for the next restart to test. `search_benchmark.py smoke` is the manual check: one call
+per source token, failing sources named.
+
+**What warm actually costs, measured 2026-08-27 after the rebuilds** (serial, depth 10,
+eight labeled queries, host quiet): hybrid p50 **3.2s**, p90 5.0s; keyword p50 0.56s.
+The same sample taken on the cold cache earlier that night was hybrid p50 26s with six of
+eight calls past the 60s budget. The BM25 index is 5.5 GB after a plain rebuild, so
+"HNSW and BM25 cannot both be resident" is no longer true as stated: 8.6 + 5.5 GB against
+~11 GB of usable page cache plus 8 GB of shared buffers, warm BM25 first and HNSW last.
 
 **Large rewrites are their own budget.** The `timeline.events` priority column change from
 `bigint` to the enum failed twice before it worked: the table is 43M rows and the rewrite
