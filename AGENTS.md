@@ -449,7 +449,13 @@ ranks 1-16 outvoted a correct BM25 #1 on every term bag (keyword alone hit@1 7/2
 double: MRR 0.339 -> 0.394, hit@1 15 -> 20, hit@10 40 -> 44, found@50 unchanged at 51.
 Flat lexical 2.0 / semantic 0.5 scored MRR 0.400 but lost seven found@50 -- a head
 bonus, not a flat weight, is what keeps semantic recall. Re-run the lab before touching
-`SEARCH_HYBRID_*_WEIGHT`.
+`SEARCH_HYBRID_*_WEIGHT`. Confirmed end to end through the deployed `search` tool on
+2026-08-27, same 57 queries before and after: hybrid MRR 0.408 -> 0.489, hit@1 18 -> 24,
+hit@10 33 -> 37, found@50 44 -> 43 (the one loss a statement timeout), while keyword mode --
+the control, untouched by the change -- moved 0.362 -> 0.352. Term bags gained most
+("acon 20k mini magazines order" 33 -> 1, "mixam magazine order quote" 17 -> 3); the
+regressions are long term bags where BM25's head was wrong ("DDP duties customs prepaid
+shipment AGH Fulfillment" 21 -> 40).
 
 **A Drive file id finds the file itself.** The `drive_file` search document carries
 `file_id` (since 2026-08-26), because an agent holding an id from a URL or an email
