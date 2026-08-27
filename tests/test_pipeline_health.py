@@ -43,6 +43,7 @@ from personal_data_warehouse.pipeline_health import (
 )
 from personal_data_warehouse.postgres import POSTGRES_INDEXES, POSTGRES_TABLES, PostgresWarehouse
 from personal_data_warehouse.relations import CANONICAL_RELATIONS, CATALOG, relation
+from personal_data_warehouse.schema import voice_memo_transcription_failure_status
 from personal_data_warehouse.timeline import RAW_DDL_TABLES, TIMELINE_TABLE_COVERAGE
 
 
@@ -699,6 +700,95 @@ def test_a_rejected_transcription_provider_call_reads_failing(warehouse):
     assert row["status"] == "failing"
     assert row["state_error_rows"] == 1
     assert "balance is negative" in row["last_error"]
+
+
+def test_an_impossible_recording_does_not_pin_transcription_to_failing(warehouse):
+    """A memo the provider will NEVER accept must not read as a pipeline failure.
+
+    The error count is over the whole runs table with no time bound, so before
+    'rejected' existed one silent voice memo turned voice_memo_transcription red
+    permanently. Production carried eleven of them going back to 2026-05-01 --
+    "no spoken audio", "audio duration is too short", "does not appear to
+    contain audio" -- which meant the row was ALREADY failing when the
+    AssemblyAI balance outage arrived, and the StateSource that was added to
+    catch that outage could not have caught it.
+    """
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    for index, error in enumerate(
+        (
+            "language_detection cannot be performed on files with no spoken audio.",
+            "Audio duration is too short.",
+            "Transcoding failed. File does not appear to contain audio.",
+        )
+    ):
+        warehouse._command(
+            """
+            INSERT INTO @apple_voice_memos_transcription_runs
+                (source, account, recording_id, content_sha256, provider, status, error, requested_at, sync_version)
+            VALUES ('apple_voice_memos', 'z', %s, 'sha', 'assemblyai', %s, %s, %s, 1)
+            """,
+            (
+                f"rec-impossible-{index}",
+                voice_memo_transcription_failure_status(error),
+                error,
+                now,
+            ),
+        )
+
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status, state_error_rows FROM @marts_pipeline_health"
+        " WHERE pipeline = 'voice_memo_transcription'"
+    )[0]
+    assert row["state_error_rows"] == 0
+    assert row["status"] != "failing"
+
+
+def test_an_impossible_recording_is_still_terminal_and_never_retried(warehouse):
+    """'rejected' must stay terminal, or the fix trades a red row for a retry loop."""
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @apple_voice_memos_transcription_runs
+            (source, account, recording_id, content_sha256, provider, status, error, requested_at, sync_version)
+        VALUES ('apple_voice_memos', 'z', 'rec-1', 'sha-1', 'assemblyai', 'rejected',
+                'Audio duration is too short.', %s, 1)
+        """,
+        (now,),
+    )
+    candidates = warehouse.load_untranscribed_voice_recordings(provider="assemblyai", limit=50)
+    assert not [row for row in candidates if row["recording_id"] == "rec-1"]
+
+
+def test_a_legacy_error_row_for_an_impossible_recording_is_reclassified(warehouse):
+    """Rows written before 'rejected' existed must migrate, or the row stays red."""
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @apple_voice_memos_transcription_runs
+            (source, account, recording_id, content_sha256, provider, status, error, requested_at, sync_version)
+        VALUES ('apple_voice_memos', 'z', 'legacy-1', 'sha', 'assemblyai', 'error',
+                'language_detection cannot be performed on files with no spoken audio.', %s, 1),
+               ('apple_voice_memos', 'z', 'legacy-2', 'sha', 'assemblyai', 'error',
+                '400 Client Error: account balance is negative', %s, 1)
+        """,
+        (now, now),
+    )
+    warehouse.ensure_voice_memo_transcription_tables()
+
+    statuses = {
+        row["recording_id"]: row["status"]
+        for row in warehouse._query_dicts(
+            "SELECT recording_id, status FROM @apple_voice_memos_transcription_runs"
+            " WHERE recording_id LIKE 'legacy-%'"
+        )
+    }
+    # The impossible input becomes terminal; the provider outage stays an error
+    # so a genuine outage still reads failing.
+    assert statuses == {"legacy-1": "rejected", "legacy-2": "error"}
 
 
 def test_a_stale_snapshot_reports_unknown_instead_of_stale_facts(warehouse):

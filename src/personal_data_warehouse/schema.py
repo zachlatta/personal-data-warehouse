@@ -284,6 +284,34 @@ VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS = (
     "sync_version",
 )
 
+# A transcription attempt ends in one of three states, and the third one is the
+# reason this distinction exists at all.
+#
+# ``error`` means the PROVIDER failed us and a retry may work -- a negative
+# balance, a rate limit, a 5xx. ``rejected`` means the provider looked at the
+# INPUT and will refuse it identically forever: a memo containing no speech, a
+# recording too short to transcribe, a file that is not really audio. Both used
+# to be written as ``error``, which made the pipeline's own health surface
+# unable to tell an outage from a silent voice memo -- and since
+# ``voice_memo_transcription`` counts error rows over the whole table with no
+# time bound, ONE such recording pinned the pipeline to ``failing`` forever.
+# Measured 2026-08-27: eleven rows, the oldest from 2026-05-01, every one of
+# them a permanently unacceptable input, so the row was already red when the
+# AssemblyAI billing outage arrived and the outage changed nothing.
+#
+# ``rejected`` is deliberately outside ``StateSource.error_statuses``, the same
+# way slack's terminal ``gone`` is, so it stays terminal for the candidate query
+# while never colouring the pipeline. This mirrors ``STATUS_UNREADABLE`` in
+# file_attachment_enrichment.py, which solved the identical problem for
+# attachments.
+VOICE_MEMO_TRANSCRIPTION_STATUS_COMPLETED = "completed"
+VOICE_MEMO_TRANSCRIPTION_STATUS_ERROR = "error"
+VOICE_MEMO_TRANSCRIPTION_STATUS_REJECTED = "rejected"
+VOICE_MEMO_TRANSCRIPTION_TERMINAL_STATUSES = (
+    VOICE_MEMO_TRANSCRIPTION_STATUS_COMPLETED,
+    VOICE_MEMO_TRANSCRIPTION_STATUS_REJECTED,
+)
+
 RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS = (
     "current account balance is negative",
     "please top up",
@@ -300,6 +328,59 @@ RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS = (
     "503 server error",
     "504 server error",
 )
+
+
+# The provider looked at the INPUT and will refuse it identically forever.
+# This list is deliberately an ALLOW-LIST of recognised rejections rather than
+# "anything the retryable list does not match", because the two mistakes are
+# not symmetric: calling a permanent rejection retryable costs one wasted API
+# call and a red row a human can act on, while calling a TRANSIENT failure
+# permanent silently stops retrying that recording forever AND hides the
+# failure from /pipelines. An unrecognised error therefore stays ``error`` --
+# red, and someone classifies it.
+PERMANENT_VOICE_MEMO_TRANSCRIPTION_REJECTION_PATTERNS = (
+    "no spoken audio",
+    "audio duration is too short",
+    "does not appear to contain audio",
+    "file does not appear to be",
+    "audio file is too short",
+    "transcoding failed",
+)
+
+
+def is_retryable_voice_memo_transcription_error(error: str) -> bool:
+    """True when a transcription failure is worth attempting again.
+
+    The pattern list is the single authority on this question, shared with the
+    SQL candidate query, so the Python writer and the re-attempt filter can
+    never drift into disagreeing about whether a given recording is finished.
+    """
+    haystack = str(error or "").lower()
+    return any(
+        pattern in haystack for pattern in RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS
+    )
+
+
+def is_permanent_voice_memo_transcription_rejection(error: str) -> bool:
+    """True only for a rejection of the AUDIO ITSELF, which no retry can fix.
+
+    A retryable pattern always wins: a provider that names a transient reason
+    is transient even if the sentence happens to contain a rejection word.
+    """
+    if is_retryable_voice_memo_transcription_error(error):
+        return False
+    haystack = str(error or "").lower()
+    return any(
+        pattern in haystack
+        for pattern in PERMANENT_VOICE_MEMO_TRANSCRIPTION_REJECTION_PATTERNS
+    )
+
+
+def voice_memo_transcription_failure_status(error: str) -> str:
+    """``rejected`` for a recognised impossible input, otherwise ``error``."""
+    if is_permanent_voice_memo_transcription_rejection(error):
+        return VOICE_MEMO_TRANSCRIPTION_STATUS_REJECTED
+    return VOICE_MEMO_TRANSCRIPTION_STATUS_ERROR
 
 VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS = (
     "source",

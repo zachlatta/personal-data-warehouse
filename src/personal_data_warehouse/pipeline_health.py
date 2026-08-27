@@ -856,6 +856,15 @@ PIPELINES: tuple[Pipeline, ...] = (
         # recordings across three sources untranscribed, attributed to a quiet
         # uploader. A retry that succeeds overwrites the error row, so the
         # failure clears itself the way it should.
+        #
+        # Only a PROVIDER failure is written as 'error'. A recording the
+        # provider will never accept -- no speech, too short, not audio -- is
+        # written as 'rejected', which stays terminal for the candidate query
+        # but sits outside error_statuses. Without that split this row is red
+        # permanently, because the count is over the whole table with no time
+        # bound: production carried eleven impossible recordings going back to
+        # 2026-05-01, so the row was ALREADY failing when the balance outage
+        # arrived and the outage changed nothing.
         state=StateSource(
             table="apple_voice_memos_transcription_runs",
             updated_column="requested_at",

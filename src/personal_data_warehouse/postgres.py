@@ -84,7 +84,9 @@ from personal_data_warehouse.schema import (
     MART_VIEW_HEALTH_COLUMNS,
     PIPELINE_HEALTH_COLUMNS,
     PIPELINE_TABLE_FRESHNESS_COLUMNS,
+    PERMANENT_VOICE_MEMO_TRANSCRIPTION_REJECTION_PATTERNS,
     RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS,
+    VOICE_MEMO_TRANSCRIPTION_TERMINAL_STATUSES,
     SLACK_ACCOUNT_IDENTITY_COLUMNS,
     SLACK_ACCOUNT_STATE_ITEM_ROW_COLUMNS,
     SLACK_CONVERSATION_COLUMNS,
@@ -5730,6 +5732,35 @@ class PostgresWarehouse:
 
     def ensure_voice_memo_transcription_tables(self) -> None:
         self.ensure_apple_voice_memos_tables()
+        self._ensure_transcription_runs_rejections_reclassified()
+
+    def _ensure_transcription_runs_rejections_reclassified(self) -> None:
+        """Reclassify legacy permanent input rejections from 'error' to 'rejected'.
+
+        Rows written before 'rejected' existed recorded "no spoken audio",
+        "audio duration is too short" and "does not appear to contain audio" as
+        status 'error'. Nothing ever retries them -- the candidate query already
+        treated a non-retryable error as terminal -- so once
+        voice_memo_transcription declared this table as its StateSource they
+        pinned it to 'failing' permanently, because the error count is over the
+        whole table with no time bound. Measured on production 2026-08-27:
+        eleven such rows, the oldest from 2026-05-01, which is why the row was
+        already red before the AssemblyAI billing outage it was meant to catch.
+
+        The retryable-pattern list is the same authority the candidate query and
+        the Python writer use, so this cannot reclassify a row that a retry
+        would have fixed. The error text is kept as the reason.
+        """
+        self._command(
+            f"""
+            UPDATE @apple_voice_memos_transcription_runs
+            SET status = 'rejected'
+            WHERE status = 'error'
+              AND COALESCE(error, '') != ''
+              AND NOT ({_postgres_retryable_error_clause('error')})
+              AND ({_postgres_permanent_rejection_clause('error')})
+            """
+        )
 
     def ensure_agent_tables(self) -> None:
         self._ensure_table_group(["agent_runs", "agent_run_events", "agent_run_tool_calls"])
@@ -8795,7 +8826,10 @@ class PostgresWarehouse:
                 FROM @apple_voice_memos_transcription_runs
                 WHERE provider = %s
                   AND (
-                    status = 'completed'
+                    status = ANY(%s)
+                    -- Rows written before 'rejected' existed are still plain
+                    -- 'error', so the pattern test stays as the fallback for
+                    -- them. Both halves read the same authority.
                     OR (status = 'error' AND NOT ({_postgres_retryable_error_clause('error')}))
                   )
             ) AS terminal
@@ -8809,7 +8843,7 @@ class PostgresWarehouse:
             ORDER BY r.recorded_at DESC NULLS LAST
             LIMIT %s
             """,
-            (provider, int(limit)),
+            (provider, list(VOICE_MEMO_TRANSCRIPTION_TERMINAL_STATUSES), int(limit)),
         )
         columns = (
             "source",
@@ -13980,6 +14014,16 @@ def _postgres_retryable_error_clause(column: str) -> str:
     return " OR ".join(
         f"{column} ILIKE '%%{_escape_like(pattern)}%%' ESCAPE E'\\\\'"
         for pattern in RETRYABLE_VOICE_MEMO_TRANSCRIPTION_ERROR_PATTERNS
+    )
+
+
+def _postgres_permanent_rejection_clause(column: str) -> str:
+    """Recognised rejections of the audio itself. An ALLOW-list on purpose --
+    see PERMANENT_VOICE_MEMO_TRANSCRIPTION_REJECTION_PATTERNS: an unrecognised
+    error must stay 'error' and stay red rather than be silently retired."""
+    return " OR ".join(
+        f"{column} ILIKE '%%{_escape_like(pattern)}%%' ESCAPE E'\\\\'"
+        for pattern in PERMANENT_VOICE_MEMO_TRANSCRIPTION_REJECTION_PATTERNS
     )
 
 
