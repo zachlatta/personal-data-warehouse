@@ -2281,6 +2281,11 @@ PGBACKREST_HEALTH_COLUMNS = (
     # reporting only one of them is how this stayed invisible.
     "wal_min",
     "wal_max",
+    # The archive backlog: unarchived .ready segments. pg_stat_archiver cannot
+    # express this -- archived_count and failed_count both climbed normally
+    # through the 2026-08-26 incident while the queue reached 5,910 segments,
+    # because WAL was shipping, just slower than it was produced.
+    "wal_ready_count",
     "archived_count",
     "failed_count",
     "last_archived_at",

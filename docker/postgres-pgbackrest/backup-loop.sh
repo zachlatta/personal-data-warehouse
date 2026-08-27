@@ -90,77 +90,93 @@ report_health() {
   command -v psql >/dev/null 2>&1 || return 0
 
   local stanza="${PGBACKREST_STANZA:-pdw}"
+  local pgdata="${PGDATA:-/var/lib/postgresql/${PG_MAJOR:-18}/docker}"
   local info
   info="$(run_pgbackrest info --output=json 2>/dev/null)" || info=""
 
-  # jq is not in this image, so the JSON is reduced by python3 (which the
-  # postgres image does ship). Any parse failure yields empty fields rather
-  # than a failed report: an unparseable `info` is itself worth recording.
-  local parsed
-  parsed="$(PGBK_INFO="$info" PGBK_STANZA="$stanza" python3 - <<'PYEOF' 2>/dev/null || true
-import json, os
-raw = os.environ.get("PGBK_INFO") or ""
-stanza = os.environ.get("PGBK_STANZA") or "pdw"
-out = {"repo_status": "", "repo_message": "", "full": 0, "diff": 0, "incr": 0,
-       "label": "", "type": "", "count": 0, "bytes": 0, "wal_min": "", "wal_max": ""}
-try:
-    for entry in json.loads(raw):
-        if entry.get("name") != stanza:
-            continue
-        status = entry.get("status") or {}
-        out["repo_status"] = "ok" if status.get("code") == 0 else "error"
-        out["repo_message"] = str(status.get("message") or "")
-        backups = entry.get("backup") or []
-        out["count"] = len(backups)
-        for b in backups:
-            stop = int(((b.get("timestamp") or {}).get("stop")) or 0)
-            btype = str(b.get("type") or "")
-            if btype in ("full", "diff", "incr") and stop > out[btype]:
-                out[btype] = stop
-        if backups:
-            newest = max(backups, key=lambda b: int(((b.get("timestamp") or {}).get("stop")) or 0))
-            out["label"] = str(newest.get("label") or "")
-            out["type"] = str(newest.get("type") or "")
-            out["bytes"] = int(((newest.get("info") or {}).get("repository") or {}).get("size") or 0)
-        for db in entry.get("archive") or []:
-            out["wal_min"] = str(db.get("min") or "")
-            out["wal_max"] = str(db.get("max") or "")
-except Exception:
-    pass
-print("\t".join(str(out[k]) for k in
-      ("repo_status", "repo_message", "full", "diff", "incr", "label", "type", "count", "bytes", "wal_min", "wal_max")))
-PYEOF
-)"
-  [ -n "$parsed" ] || parsed="$(printf 'unparseable\t\t0\t0\t0\t\t\t0\t0\t\t')"
+  # Reduce the JSON in Postgres, not in a helper interpreter. This image ships
+  # no such interpreter (verified in production 2026-08-27), after the reducer
+  # had silently fallen through to its "unparseable" fallback on every call and
+  # published `backup_count = 0` while a valid, restore-verified full existed.
+  # psql is already a hard dependency of this function, and jsonb parsing is
+  # free. Guard the cast in shell: malformed JSON must degrade to "no entry
+  # found" (which still records the attempt and the archiver counters) rather
+  # than abort the statement and record nothing at all.
+  case "$info" in
+    \[*) : ;;
+    *) info="" ;;
+  esac
 
-  local repo_status repo_message full diff incr label btype count bytes wal_min wal_max
-  IFS="$(printf '\t')" read -r repo_status repo_message full diff incr label btype count bytes wal_min wal_max <<EOF
-$parsed
-EOF
+  # The WAL backlog, counted from the filesystem. pg_stat_archiver cannot
+  # express it -- archived_count and failed_count both climbed normally right
+  # through the 2026-08-26 incident while the queue grew to 5,910 segments,
+  # because WAL *was* shipping, just slower than it was produced. Counted with
+  # find rather than pg_ls_dir() so this never depends on the reporting role
+  # holding superuser or pg_monitor.
+  local wal_ready_count
+  wal_ready_count="$(find "$pgdata/pg_wal/archive_status" -maxdepth 1 -name '*.ready' 2>/dev/null | wc -l | tr -d '[:space:]')"
+  [ -n "$wal_ready_count" ] || wal_ready_count=0
 
   # `ON CONFLICT DO UPDATE` keyed by stanza: one durable row per stanza whose
   # collected_at is what tells the view whether it may still be believed.
   PGPASSWORD="${POSTGRES_PASSWORD:-}" psql \
     --no-psqlrc --quiet --set ON_ERROR_STOP=0 \
     -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-${POSTGRES_USER:-postgres}}" \
-    -v stanza="$stanza" -v repo_status="${repo_status:-}" -v repo_message="${repo_message:-}" \
-    -v full="${full:-0}" -v diff="${diff:-0}" -v incr="${incr:-0}" \
-    -v label="${label:-}" -v btype="${btype:-}" -v cnt="${count:-0}" -v bytes="${bytes:-0}" \
-    -v wal_min="${wal_min:-}" -v wal_max="${wal_max:-}" \
+    -v stanza="$stanza" -v info="$info" -v wal_ready="$wal_ready_count" \
     -v attempt_type="${attempt_type:-}" -v attempt_ok="${attempt_ok:-1}" \
     -v attempt_error="${attempt_error:-}" >/dev/null 2>&1 <<'SQLEOF' || log "health report failed (backup itself unaffected)"
+WITH doc AS (
+    SELECT NULLIF(:'info', '')::jsonb AS j
+), entry AS (
+    SELECT e
+    FROM doc, LATERAL jsonb_array_elements(doc.j) AS e
+    WHERE e->>'name' = :'stanza'
+    LIMIT 1
+), backups AS (
+    SELECT b FROM entry, LATERAL jsonb_array_elements(entry.e->'backup') AS b
+), agg AS (
+    SELECT
+        count(*)::bigint AS cnt,
+        max((b->'timestamp'->>'stop')::bigint) FILTER (WHERE b->>'type' = 'full') AS full_stop,
+        max((b->'timestamp'->>'stop')::bigint) FILTER (WHERE b->>'type' = 'diff') AS diff_stop,
+        max((b->'timestamp'->>'stop')::bigint) FILTER (WHERE b->>'type' = 'incr') AS incr_stop
+    FROM backups
+), newest AS (
+    SELECT b FROM backups ORDER BY (b->'timestamp'->>'stop')::bigint DESC LIMIT 1
+), arch AS (
+    SELECT a->>'min' AS wal_min, a->>'max' AS wal_max
+    FROM entry, LATERAL jsonb_array_elements(entry.e->'archive') AS a
+    LIMIT 1
+)
 INSERT INTO ops.pgbackrest_health AS t (
     stanza, repo_status, repo_message,
     last_full_at, last_diff_at, last_incr_at,
     last_backup_label, last_backup_type, backup_count, repo_bytes,
-    wal_min, wal_max, archived_count, failed_count, last_archived_at,
+    wal_min, wal_max, wal_ready_count, archived_count, failed_count, last_archived_at,
     last_attempt_at, last_attempt_type, last_attempt_ok, last_error, collected_at)
 SELECT
-    :'stanza', :'repo_status', :'repo_message',
-    to_timestamp(NULLIF(:'full','')::bigint), to_timestamp(NULLIF(:'diff','')::bigint),
-    to_timestamp(NULLIF(:'incr','')::bigint),
-    :'label', :'btype', NULLIF(:'cnt','')::bigint, NULLIF(:'bytes','')::bigint,
-    :'wal_min', :'wal_max',
+    :'stanza',
+    CASE
+        WHEN (SELECT e FROM entry) IS NULL THEN 'unparseable'
+        WHEN (SELECT e->'status'->>'code' FROM entry) = '0' THEN 'ok'
+        ELSE 'error'
+    END,
+    COALESCE((SELECT e->'status'->>'message' FROM entry), ''),
+    to_timestamp(COALESCE((SELECT full_stop FROM agg), 0)),
+    to_timestamp(COALESCE((SELECT diff_stop FROM agg), 0)),
+    to_timestamp(COALESCE((SELECT incr_stop FROM agg), 0)),
+    COALESCE((SELECT b->>'label' FROM newest), ''),
+    COALESCE((SELECT b->>'type' FROM newest), ''),
+    COALESCE((SELECT cnt FROM agg), 0),
+    -- repo1-block=y reports `repository.delta` and omits `repository.size`,
+    -- so reading only `size` silently published 0 bytes for every backup.
+    COALESCE(
+        (SELECT (b->'info'->'repository'->>'size')::bigint FROM newest),
+        (SELECT (b->'info'->'repository'->>'delta')::bigint FROM newest),
+        0),
+    COALESCE((SELECT wal_min FROM arch), ''),
+    COALESCE((SELECT wal_max FROM arch), ''),
+    NULLIF(:'wal_ready','')::bigint,
     COALESCE(a.archived_count, 0), COALESCE(a.failed_count, 0),
     COALESCE(a.last_archived_time, '1970-01-01 00:00:00+00'::timestamptz),
     now(), :'attempt_type', NULLIF(:'attempt_ok','')::bigint, :'attempt_error', now()
@@ -171,6 +187,7 @@ ON CONFLICT (stanza) DO UPDATE SET
     last_incr_at = EXCLUDED.last_incr_at, last_backup_label = EXCLUDED.last_backup_label,
     last_backup_type = EXCLUDED.last_backup_type, backup_count = EXCLUDED.backup_count,
     repo_bytes = EXCLUDED.repo_bytes, wal_min = EXCLUDED.wal_min, wal_max = EXCLUDED.wal_max,
+    wal_ready_count = EXCLUDED.wal_ready_count,
     archived_count = EXCLUDED.archived_count, failed_count = EXCLUDED.failed_count,
     last_archived_at = EXCLUDED.last_archived_at, last_attempt_at = EXCLUDED.last_attempt_at,
     last_attempt_type = EXCLUDED.last_attempt_type, last_attempt_ok = EXCLUDED.last_attempt_ok,

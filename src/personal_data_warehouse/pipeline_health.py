@@ -84,10 +84,13 @@ __all__ = [
     "ACCOUNT_STALE_MULTIPLIER",
     "COLLECTOR_STALE_SECONDS",
     "LATE_MULTIPLIER",
+    "PGBACKREST_SNAPSHOT_STALE_SECONDS",
     "PIPELINES",
     "PROBE_MAX_UNINDEXED_BYTES",
     "PROBE_STATEMENT_TIMEOUT_MS",
     "STALE_MULTIPLIER",
+    "WAL_READY_ATTENTION",
+    "WAL_READY_FAILING",
     "TABLE_PIPELINES",
     "Pipeline",
     "PipelineHealthCollector",
@@ -123,6 +126,27 @@ COLLECTOR_STALE_SECONDS = 3600
 #: the permanent state. Two days is one missed run plus margin, matching the
 #: collation_health pipeline's own expected_data_interval.
 COLLATION_SNAPSHOT_STALE_SECONDS = 2 * 24 * 3600
+
+#: How old the pgBackRest snapshot may be before marts_ops.pgbackrest_health
+#: stops speaking for the present. Deliberately not COLLECTOR_STALE_SECONDS:
+#: the backup loop reports every PDW_PGBACKREST_BACKUP_INTERVAL_SECONDS (6h by
+#: default), not every ten minutes, so judged against the hourly window this
+#: view read `unknown` for five hours out of every six -- the backup surface was
+#: dark by construction, in exactly the same way collation_health was. Two
+#: cycles is one missed report plus margin.
+PGBACKREST_SNAPSHOT_STALE_SECONDS = 2 * 6 * 3600
+
+#: Unarchived WAL segments (.ready files) above which archiving is judged to be
+#: losing ground. Steady state on this database is 0-160 segments; the
+#: 2026-08-26 incident reached 5,910 (96 GB) over two days while every other
+#: signal stayed green, because WAL *was* shipping, just slower than it was
+#: produced. 500 segments is 8 GB: comfortably above normal churn, far below the
+#: point where pg_wal threatens the volume.
+WAL_READY_ATTENTION = 500
+#: Above this the backlog is an outage in progress rather than a wobble: pg_wal
+#: is growing without bound and the newest backup cannot be completed, because
+#: `backup stop` waits on the WAL beneath it.
+WAL_READY_FAILING = 2000
 
 # --- per-account freshness (marts_finance.account_freshness) ------------------
 #

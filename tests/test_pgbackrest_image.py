@@ -180,3 +180,87 @@ def test_pgbackrest_wal_archiving_can_run_asynchronously() -> None:
     # archive-timeout is emitted unconditionally with a default, so it must NOT
     # also be appended conditionally: a duplicated option fails config parsing.
     assert entrypoint.count("archive-timeout") == 1
+
+
+def test_health_report_does_not_depend_on_python3() -> None:
+    """The Postgres image ships no python3, so the reducer never ran.
+
+    Verified in production 2026-08-27: `command -v python3` is empty inside
+    ghcr.io/zachlatta/personal-data-warehouse-postgres-pgbackrest.  The health
+    writer therefore fell through to its "unparseable" fallback on every call,
+    and `ops.pgbackrest_health` recorded `backup_count = 0` and
+    `repo_status = 'unparseable'` **while a valid, restore-verified full backup
+    existed**.  `marts_ops.pgbackrest_health` read `failing` as designed.
+
+    A monitor that is permanently red is worse than no monitor, because it
+    trains the reader to ignore it -- and it would have masked exactly the
+    outage it was built to catch.  psql is already a hard dependency here and
+    Postgres parses JSON natively, so the reduction belongs in SQL.
+    """
+
+    loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
+
+    # The word may appear in the comment that explains this; the *invocation*
+    # must not.
+    assert "python3 -" not in loop, "python3 is not installed in this image"
+    assert "PYEOF" not in loop, "no heredoc-fed interpreter may sit in this path"
+    assert "jsonb" in loop, "the info JSON must be reduced by Postgres itself"
+
+
+def test_health_report_records_the_wal_backlog() -> None:
+    """`.ready` count is the earliest signal that archiving is losing.
+
+    pg_stat_archiver's archived_count and failed_count both kept climbing
+    normally through the 2026-08-26 incident: WAL *was* being archived, just far
+    slower than it was generated.  Nothing in the health row expressed the
+    backlog, so a queue that grew to 5,910 segments (96 GB) over two days was
+    invisible to every health surface.
+
+    Counted from the filesystem rather than via pg_ls_dir() so the report does
+    not depend on the reporting role holding superuser or pg_monitor.
+    """
+
+    loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
+    schema = (REPO_ROOT / "src/personal_data_warehouse/schema.py").read_text()
+
+    assert "wal_ready_count" in loop
+    assert "archive_status" in loop
+    assert '"wal_ready_count",' in schema, "the column must exist in the table spec"
+
+
+def test_marts_view_escalates_on_a_growing_wal_backlog() -> None:
+    """A backlog past a threshold is an outage in progress, not a curiosity."""
+
+    postgres = (REPO_ROOT / "src/personal_data_warehouse/postgres.py").read_text()
+
+    assert "wal_ready_count" in postgres
+    assert "WAL_READY_ATTENTION" in postgres
+
+
+def test_new_health_column_is_migrated_onto_existing_tables() -> None:
+    """`CREATE TABLE IF NOT EXISTS` never widens a table that already exists.
+
+    Without an explicit ALTER, `wal_ready_count` would be absent in production
+    and the backup loop's INSERT would fail -- silently, because the health
+    report is best-effort by design.  The monitor would go stale rather than
+    loud, which is the same dark failure it exists to prevent.  Fresh-database
+    tests cannot catch this by construction.
+    """
+
+    postgres = (REPO_ROOT / "src/personal_data_warehouse/postgres.py").read_text()
+
+    assert 'ALTER TABLE @pgbackrest_health ADD COLUMN IF NOT EXISTS' in postgres
+    assert '("wal_ready_count", "bigint", "0"),' in postgres
+
+
+def test_repo_bytes_falls_back_to_the_block_incremental_delta() -> None:
+    """`repo1-block=y` reports `repository.delta` and omits `repository.size`.
+
+    Measured against the real repository on 2026-08-27: a 61.6 GB full backup
+    published `repo_bytes = 0` because only `size` was read.  Block incremental
+    is now on, so `delta` is the field that always exists.
+    """
+
+    loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
+
+    assert "'repository'->>'delta'" in loop

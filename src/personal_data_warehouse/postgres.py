@@ -148,6 +148,9 @@ from personal_data_warehouse.pipeline_health import (
     ACCOUNT_STALE_MULTIPLIER,
     COLLATION_SNAPSHOT_STALE_SECONDS,
     COLLECTOR_STALE_SECONDS,
+    PGBACKREST_SNAPSHOT_STALE_SECONDS,
+    WAL_READY_ATTENTION,
+    WAL_READY_FAILING,
     EPOCH as PIPELINE_HEALTH_EPOCH,
     LATE_MULTIPLIER,
     STALE_MULTIPLIER,
@@ -2213,6 +2216,7 @@ INTEGER_COLUMNS = {
     # bigint 0/1 boolean convention.
     "backup_count",
     "repo_bytes",
+    "wal_ready_count",
     "archived_count",
     "failed_count",
     "last_attempt_ok",
@@ -4129,6 +4133,18 @@ class PostgresWarehouse:
                 f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
             )
         for column, ddl_type, default in (
+            # The archive backlog gauge, added 2026-08-27. The backup loop's
+            # INSERT names it, and a missing column makes that INSERT fail --
+            # silently, because the health report is deliberately best-effort.
+            # The monitor would then go stale rather than loud, which is the
+            # same class of dark failure it exists to prevent.
+            ("wal_ready_count", "bigint", "0"),
+        ):
+            self._command(
+                f"ALTER TABLE @pgbackrest_health ADD COLUMN IF NOT EXISTS "
+                f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
+            )
+        for column, ddl_type, default in (
             ("amcheck_status", "text", "'unavailable'"),
             ("amcheck_detail", "text", "''"),
             ("amcheck_ms", "bigint", "0"),
@@ -4445,6 +4461,7 @@ class PostgresWarehouse:
                     repo_bytes,
                     NULLIF(wal_min, '') AS wal_min,
                     NULLIF(wal_max, '') AS wal_max,
+                    wal_ready_count,
                     archived_count,
                     failed_count,
                     NULLIF(last_archived_at, '1970-01-01 00:00:00+00'::timestamptz) AS last_archived_at,
@@ -4461,12 +4478,20 @@ class PostgresWarehouse:
                     -- Snapshot too old to speak for the present. Store facts,
                     -- derive status -- the same rule the rest of marts_ops uses.
                     WHEN collected_at IS NULL
-                      OR collected_at < now() - interval '{COLLECTOR_STALE_SECONDS} seconds'
+                      OR collected_at < now() - interval '{PGBACKREST_SNAPSHOT_STALE_SECONDS} seconds'
                         THEN 'unknown'
                     -- No restorable backup at all. This is the state that was
                     -- invisible, and it outranks every other signal.
                     WHEN backup_count = 0 OR last_full_at IS NULL THEN 'failing'
                     WHEN repo_status IS DISTINCT FROM 'ok' THEN 'failing'
+                    -- Archiving is losing to WAL generation. pg_wal grows
+                    -- without bound and no new backup can complete, because
+                    -- `backup stop` waits on the WAL beneath it. This is the
+                    -- signal that was missing on 2026-08-26, when the queue
+                    -- reached 5,910 segments while archived_count kept rising
+                    -- and every other field read healthy.
+                    WHEN wal_ready_count >= {WAL_READY_FAILING} THEN 'failing'
+                    WHEN wal_ready_count >= {WAL_READY_ATTENTION} THEN 'attention'
                     -- WAL archiving broken: the backup is a floor, not a
                     -- recovery point, until shipping resumes.
                     WHEN last_archived_at IS NULL
@@ -4489,6 +4514,7 @@ class PostgresWarehouse:
                 repo_bytes,
                 wal_min,
                 wal_max,
+                wal_ready_count,
                 archived_count,
                 failed_count,
                 last_archived_at,
