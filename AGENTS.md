@@ -1181,6 +1181,14 @@ FROM marts_voice_memos.recordings
 WHERE transcript IS NOT NULL ORDER BY recorded_at DESC LIMIT 20;
 ```
 
+**A provider rejection is the transcription pipeline's state, and it reads `failing`.**
+`derived_voice_memos.transcription_runs` records every AssemblyAI rejection as
+`status = 'error'` with the response text, and `voice_memo_transcription` declares it as its
+`StateSource`. On 2026-08-27 every call had returned `400 … account balance is negative` for
+hours while the row read green and 45 recordings across three sources sat untranscribed,
+attributed to a quiet uploader. A successful retry overwrites the error row, so the failure
+clears itself; a persistent one is a billing or credential action, not a pipeline bug.
+
 **That mart is the INPUT to transcription and enrichment, not only an output.** Both
 passes (`defs/apple_voice_memos_transcription.py`, `defs/apple_voice_memos_enrichment.py`)
 take their candidates from it, so a new voice source is transcribed and enriched by

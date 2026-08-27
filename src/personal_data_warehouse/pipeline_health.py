@@ -825,6 +825,19 @@ PIPELINES: tuple[Pipeline, ...] = (
             " its hourly schedule; the previous 30d could not reach 'late' inside"
             " two months"
         ),
+        # The runs table is also this pipeline's failure record: a provider
+        # rejection lands there as status='error' with the response text. On
+        # 2026-08-27 every AssemblyAI call had returned 400 "account balance is
+        # negative" for hours while this row read a quiet green -- 45
+        # recordings across three sources untranscribed, attributed to a quiet
+        # uploader. A retry that succeeds overwrites the error row, so the
+        # failure clears itself the way it should.
+        state=StateSource(
+            table="apple_voice_memos_transcription_runs",
+            updated_column="requested_at",
+            status_column="status",
+            error_column="error",
+        ),
     ),
     Pipeline(
         id="voice_memo_enrichment",

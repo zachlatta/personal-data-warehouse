@@ -133,7 +133,10 @@ def test_pipeline_metadata_is_complete():
             if entry.state.scope_column:
                 assert entry.state.table in TABLE_PIPELINES, entry.id
             else:
-                assert pipeline_tables(entry.id, role="state"), entry.id
+                # Either a dedicated state table, or one of the pipeline's own
+                # tables doubling as its failure record (transcription runs).
+                owned = {table for table, cov in TABLE_PIPELINES.items() if cov.pipeline == entry.id}
+                assert entry.state.table in owned, entry.id
 
 
 def test_table_coverage_roles_and_columns_are_valid():
@@ -671,6 +674,31 @@ def test_priority_mix_counts_each_sources_tiers_and_flags_unclassified(warehouse
     assert rows[("slack", "direct")]["status"] == "ok"
     assert rows[("gmail", "unclassified")]["status"] == "failing"
     assert rows[("gmail", "unclassified")]["newest_event_at"] is not None
+
+
+def test_a_rejected_transcription_provider_call_reads_failing(warehouse):
+    """AssemblyAI returned 400 "account balance is negative" on every call for
+    hours on 2026-08-27 while the transcription pipeline read green: the runs
+    table recorded each rejection and nothing read it. The error row is the
+    pipeline's state, and a later success overwrites it."""
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @apple_voice_memos_transcription_runs
+            (source, account, recording_id, content_sha256, provider, status, error, requested_at, sync_version)
+        VALUES ('apple_notes', 'z', 'rec-1', 'sha', 'assemblyai', 'error',
+                '400 Client Error: account balance is negative', %s, 1)
+        """,
+        (now,),
+    )
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status, state_error_rows, last_error FROM @marts_pipeline_health WHERE pipeline = 'voice_memo_transcription'"
+    )[0]
+    assert row["status"] == "failing"
+    assert row["state_error_rows"] == 1
+    assert "balance is negative" in row["last_error"]
 
 
 def test_a_stale_snapshot_reports_unknown_instead_of_stale_facts(warehouse):
