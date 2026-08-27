@@ -2735,7 +2735,8 @@ statements are the mortgage's only source.
   page renders — `MANUAL_FINANCE_RENDER_MAX_PAGES`, default 10 — when scanned; raw text for
   CSV/OFX/RTF; normalized JPEG for screenshots). The agent runs with read-only warehouse access
   (`run_with_pdw`), gets known `derived_finance.accounts` + `original_path` as context, and returns
-  a strict-schema payload (transactions[]/balances[]/valuations[] with decimal-string money)
+  a strict-schema payload (transactions[]/balances[]/valuations[]/positions[]/commitments[]
+  with decimal-string money, plus `reporting_scope` / `account_holder` / `value_basis`)
   mapped into typed columns; bumping `PROMPT_VERSION` re-extracts without clobbering. Retry cap:
   agent failures count per run in `agent_runs`; permanent input-prep failures record status
   `unreadable` and are excluded within the error window.
@@ -2743,9 +2744,77 @@ statements are the mortgage's only source.
   `PDW_INGEST_MANUAL_FINANCE_FOLDER_ID` (app) + `MANUAL_FINANCE_GOOGLE_DRIVE_FOLDER_ID` (Dagster
   reader) to use a dedicated `manual-finance` subfolder inside the existing PDW Drive folder.
 
+### A document about an ENTITY is never one of Zach's accounts
+
+**The upload folder is the account, and a document that names no account is refused.**
+On 2026-08-27 a batch of private-fund files was uploaded to the *root* of the corpus. With
+no folder, `document_account_key` fell back to `institution|mask` — and a fund's financial
+statement prints no account mask, so the key degenerated to **`<institution>|`**: a
+catch-all keyed on a counterparty rather than an account. It swallowed three unrelated
+investment vehicles, a tax notice, Zach's real capital account statements and the fund's OWN
+unaudited financials, then reported the **fund's** total members' equity as his largest
+asset — `marts_finance.net_worth` came back more than an order of magnitude too high. The
+same account took the fund's portfolio SAFE purchases into `marts_finance.transactions` and
+two phantom `marts_finance.tax_lots` for a company Zach has never held directly. Every other
+branch of that function names exactly one account (a folder by the uploader's contract, a
+mask by account number, a filename by document), so `institution|` with an empty mask now
+returns `UNIDENTIFIED_ACCOUNT_KEY` and the group books **nothing** — no account, no
+observation, no transaction. Understating is recoverable; fabricating is not.
+
+**`reporting_scope` is the guard the key cannot be.** A private fund sends its LPs two
+documents that are identical in every extracted field — its own financial statements
+(balance sheet, "total members' equity", its portfolio purchases) and that investor's
+capital account statement — so a fund statement sitting in a *correct* account folder would
+still book the wrong number. The v3 extraction contract
+(`PROMPT_VERSION = manual-finance-agent-v3`) asks the agent directly: `reporting_scope` is
+`account_holder` / `entity` / `unknown`, `account_holder` is the individual named on the
+document, and an `entity`-scoped extraction contributes nothing to the ledger while
+remaining a fact of record in `derived_finance.document_extractions`. **Absence is not
+`account_holder`**: a pre-v3 row has no scope and is read as "not established", which is why
+the key guard exists — it is the half that protects a corpus nobody has re-extracted yet.
+
+**`value_basis` keeps a tax number out of a market total.** A Schedule K-1's partner capital
+account is a *tax* basis. It sat in net worth beside the same fund's NAV: the position
+counted twice, and the second count on an incompatible measure. A `value_basis = 'tax'`
+document's balances become `tax_basis` observations, which `marts_finance.net_worth`
+excludes, and its line items book no transactions (a K-1 reports allocated shares of
+partnership income, not money that moved).
+
+**Unfunded capital commitments are facts, not liabilities.** `commitments[]` on the v3
+contract carries the committed / called / unfunded triple a fund prints, stored as the
+`commitment`, `called_capital` and `unfunded_commitment` observation kinds and read through
+**`marts_finance.commitments`**. They are deliberately outside net worth — a commitment is
+contingent on the fund calling it, and booking it as debt would make net worth disagree with
+every statement — but they are a real future cash obligation, and before this they appeared
+nowhere at all.
+
+**A document link whose group no longer exists is residue re-resolution cannot reach.**
+7adf12e made document links re-resolve every run so a decision made from thinner evidence
+cannot freeze. That only walks groups that still exist, so a link left behind by deleted,
+moved or refused documents kept its ledger account alive past
+`prune_unlinked_finance_accounts` (which only reaches accounts with *zero* links).
+`delete_missing_document_account_links` reconciles them, and the runner skips it when the
+extraction corpus is empty — "the extraction asset has not run yet" and "every document was
+withheld" are different states.
+
+**One document reporting several vehicles still lands on one account.** A fund-administrator
+positions report lists each vehicle with its own NAV plus a total, and the ledger books the
+total on the folder's account. Splitting it would need per-position account attribution in
+the extraction contract, which does not exist. So keep all investor-level documents for one
+administrator's portfolio in **one** folder: per-vehicle folders plus a multi-vehicle
+positions report double-counts the portfolio.
+
+**`scripts/audit_finance_entity_documents.py` previews the effect, read-only.** Production
+is the thing carrying the bad rows, so it cannot show you what it looks like without them;
+that script runs the deployed predicates over the live corpus through `pdw sql` and prints
+what would be withheld, which links lose their group, and net worth before and after. The
+repair itself needs no migration — deploying and letting `finance_ledger` run reconciles
+observations, transactions, security trades, tax lots, links and accounts by itself.
+
 Finance SQL starting points: `marts_finance.net_worth`, `marts_finance.net_worth_history`,
-`derived_finance.accounts`, `derived_finance.observations`, `base_manual_finance.documents`,
-`derived_finance.document_extractions`, plus the existing `base_plaid.*` / `marts_finance.*` views.
+`marts_finance.commitments`, `derived_finance.accounts`, `derived_finance.observations`,
+`base_manual_finance.documents`, `derived_finance.document_extractions`, plus the existing
+`base_plaid.*` / `marts_finance.*` views.
 
 ## Securities: trades, tax lots, and coverage
 

@@ -2004,6 +2004,18 @@
       }
     },
     {
+      "id": "marts_finance_commitments",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "finance",
+      "schema": "marts_finance",
+      "name": "commitments",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Capital commitments per account: total committed, cumulative called, and the unfunded balance still owed, as of the newest document that stated them. Unfunded capital is a real future cash obligation and is deliberately absent from marts_finance.net_worth, which reports what is owned today."
+    },
+    {
       "id": "marts_finance_account_freshness",
       "kind": "view",
       "layer": "marts",

@@ -1981,6 +1981,7 @@ JSONB_COLUMNS_BY_TABLE = {
         "balances_json",
         "valuations_json",
         "positions_json",
+        "commitments_json",
         "uncertainties_json",
         "raw_result_json",
     },
@@ -2019,6 +2020,7 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
         "balances_json",
         "valuations_json",
         "positions_json",
+        "commitments_json",
         "uncertainties_json",
     },
 }
@@ -3153,6 +3155,16 @@ class PostgresWarehouse:
         # ties resolve by kind: balance (institution-authoritative) beats
         # principal beats valuation.
         kind_rank = "CASE o.kind WHEN 'balance' THEN 0 WHEN 'principal' THEN 1 ELSE 2 END"
+        # Observation kinds that are facts about an account but NOT what it is
+        # worth today. They are stored in the same table on purpose — the
+        # ledger holds facts, and status is derived at read time — so every
+        # reader of a VALUE must filter them out explicitly. Two of them are
+        # incidents: a Schedule K-1's tax-basis capital sat in net worth beside
+        # the same fund's NAV (double-counted, on two incompatible measures),
+        # and an unfunded capital commitment had nowhere to live at all.
+        # Mirrors NON_VALUE_OBSERVATION_KINDS in finance_ledger.py; the test
+        # named there fails if the two lists drift.
+        value_kinds = "o.kind NOT IN ('tax_basis', 'commitment', 'called_capital', 'unfunded_commitment')"
         self._ensure_view(
             "marts_finance_net_worth",
             f"""
@@ -3217,7 +3229,7 @@ class PostgresWarehouse:
             JOIN LATERAL (
                 SELECT o.kind, o.as_of, o.value, o.source, o.observed_at
                 FROM @finance_observations AS o
-                WHERE o.account_id = a.account_id
+                WHERE o.account_id = a.account_id AND {value_kinds}
                 ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
                 LIMIT 1
             ) AS o ON TRUE
@@ -3241,7 +3253,7 @@ class PostgresWarehouse:
                 LEFT JOIN LATERAL (
                     SELECT o.value
                     FROM @finance_observations AS o
-                    WHERE o.account_id = a.account_id AND o.as_of <= d.day
+                    WHERE o.account_id = a.account_id AND o.as_of <= d.day AND {value_kinds}
                     ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
                     LIMIT 1
                 ) AS o ON TRUE
@@ -3282,10 +3294,49 @@ class PostgresWarehouse:
             LEFT JOIN LATERAL (
                 SELECT o.kind, o.as_of, o.value, o.source
                 FROM @finance_observations AS o
-                WHERE o.account_id = a.account_id
+                WHERE o.account_id = a.account_id AND {value_kinds}
                 ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
                 LIMIT 1
             ) AS o ON TRUE
+            """,
+        )
+        # Unfunded capital is a real future cash obligation, and until 2026-08-27
+        # it appeared nowhere in the model: a five-figure uncalled commitment to
+        # a private fund was invisible in every finance surface, even though the
+        # capital call notices stating it were in the corpus. It is deliberately NOT a
+        # liability in net worth -- a commitment is contingent on the fund
+        # calling it, and booking it as debt would make net worth disagree with
+        # every statement -- so it gets its own read surface instead.
+        self._ensure_view(
+            "marts_finance_commitments",
+            """
+            CREATE OR REPLACE VIEW @marts_finance_commitments AS
+            SELECT
+                a.account_id,
+                a.account,
+                a.name,
+                a.kind,
+                a.institution,
+                a.currency,
+                c.as_of,
+                c.committed,
+                c.called,
+                c.unfunded,
+                (CURRENT_DATE - c.as_of)::bigint AS age_days
+            FROM @finance_accounts AS a
+            JOIN LATERAL (
+                SELECT
+                    o.as_of,
+                    max(o.value) FILTER (WHERE o.kind = 'commitment') AS committed,
+                    max(o.value) FILTER (WHERE o.kind = 'called_capital') AS called,
+                    max(o.value) FILTER (WHERE o.kind = 'unfunded_commitment') AS unfunded
+                FROM @finance_observations AS o
+                WHERE o.account_id = a.account_id
+                  AND o.kind IN ('commitment', 'called_capital', 'unfunded_commitment')
+                GROUP BY o.as_of
+                ORDER BY o.as_of DESC
+                LIMIT 1
+            ) AS c ON TRUE
             """,
         )
         self._ensure_view(
@@ -3749,6 +3800,19 @@ class PostgresWarehouse:
             "ALTER TABLE @manual_finance_extractions "
             "ADD COLUMN IF NOT EXISTS positions_json jsonb NOT NULL DEFAULT '[]'::jsonb"
         )
+        # v3: whose money the document reports, on what basis, and the
+        # committed/called/unfunded triple a private fund prints. Empty on
+        # every pre-v3 row, which the ledger reads as "unknown" -- it never
+        # reads absence as "this is the owner's position".
+        for column, ddl in (
+            ("reporting_scope", "text NOT NULL DEFAULT ''"),
+            ("account_holder", "text NOT NULL DEFAULT ''"),
+            ("value_basis", "text NOT NULL DEFAULT ''"),
+            ("commitments_json", "jsonb NOT NULL DEFAULT '[]'::jsonb"),
+        ):
+            self._command(
+                f"ALTER TABLE @manual_finance_extractions ADD COLUMN IF NOT EXISTS {column} {ddl}"
+            )
 
     def ensure_apple_voice_memos_tables(self, *, backfill_content_hashes: bool = True) -> None:
         self._ensure_table_group(
@@ -8513,6 +8577,43 @@ class PostgresWarehouse:
                 DELETE FROM @finance_observations
                 WHERE source = 'manual_finance'
                   AND (account_id || '|' || as_of::text || '|' || kind) <> ALL(%s::text[])
+                RETURNING 1
+            )
+            SELECT count(*) FROM removed
+            """,
+            (keep_keys,),
+        )
+        return int(removed[0][0]) if removed else 0
+
+    def delete_missing_document_account_links(self, keep_keys: list[str]) -> int:
+        """Drop manual-document account links no document group claims any more.
+
+        A link is a derived decision, and 7adf12e made document links
+        re-resolve every run so a decision made from thinner evidence cannot
+        freeze. That is only half of it: a link whose GROUP no longer exists --
+        because its documents were deleted, moved into a folder, or refused as
+        unidentifiable -- is never revisited by re-resolution, because nothing
+        iterates it. It then keeps its ledger account alive past
+        ``prune_unlinked_finance_accounts``, which only reaches accounts with
+        zero links. An ``<institution>|`` catch-all is the case: withholding
+        its documents removes their observations, but without this the account
+        and its link would sit in ``derived_finance.accounts`` forever.
+
+        Scoped to ``manual_finance``; Plaid links are keyed on live source rows
+        and reconciled by their own resolver. Keys are ``account|source_account_key``.
+
+        An EMPTY ``keep_keys`` means "no group survives", which is a real
+        state (every document withheld) and deletes every manual link. The
+        caller must therefore not confuse it with "the extraction asset has
+        not run on this deployment yet" -- ``FinanceLedgerRunner.sync`` skips
+        the call entirely when the corpus itself is empty.
+        """
+        removed = self._query(
+            """
+            WITH removed AS (
+                DELETE FROM @finance_account_links
+                WHERE source = 'manual_finance'
+                  AND (account || '|' || source_account_key) <> ALL(%s::text[])
                 RETURNING 1
             )
             SELECT count(*) FROM removed
