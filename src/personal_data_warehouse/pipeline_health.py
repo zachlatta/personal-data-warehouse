@@ -974,6 +974,17 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="are agents starting at the timeline and scoping by tier; measured, not asserted",
     ),
     Pipeline(
+        id="search_benchmark",
+        label="Search benchmark (contract C8)",
+        kind="internal",
+        cadence="weekly Monday 05:17",
+        transport="Dagster search_benchmark asset → app /api/tools/search → ops.search_benchmark_runs",
+        expected_data_interval=8 * DAY,
+        expected_run_interval=None,
+        data_basis="a weekly asset; 8d puts late at 16d, so one missed week is late and two are stale",
+        note="p50/p90 latency over fixed probes and MRR over private.search_benchmark_labels",
+    ),
+    Pipeline(
         id="uploader_heartbeats",
         label="Uploader run heartbeats",
         kind="internal",
@@ -1250,6 +1261,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "uploader_heartbeats": _data("uploader_heartbeats", "updated_at", "ran_at"),
     "timeline_priority_mix": _support("pipeline_health", "collected_at", note="per-source tier mix, last 7 days"),
     "agent_usage": _data("agent_usage", "collected_at", "newest_session_at"),
+    "search_benchmark_runs": _data("search_benchmark", "collected_at"),
+    "search_benchmark_labels": _support("search_benchmark", "updated_at", note="private labels; a mirror of the published file"),
     "pgbackrest_health": _data(
         "pgbackrest",
         "collected_at",

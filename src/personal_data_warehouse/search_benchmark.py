@@ -728,6 +728,42 @@ def _print_report(report: dict[str, Any]) -> None:
     print(f"  latency under concurrency (not single-user): {report['latency_under_concurrency']}")
 
 
+def _labels_command(args: argparse.Namespace) -> int:
+    """Move labels between the private file and private.search_benchmark_labels.
+
+    The warehouse copy is what the weekly Dagster benchmark scores against and
+    what survives a lost checkout; the file is the editing surface.
+    """
+    from personal_data_warehouse.config import load_settings
+    from personal_data_warehouse.warehouse import warehouse_from_settings
+
+    warehouse = warehouse_from_settings(load_settings(require_gmail=False))
+    try:
+        warehouse.ensure_pipeline_health_tables()
+        if args.command == "publish-labels":
+            cases = load_cases(args.labels, include_not_in_corpus=True)
+            count = warehouse.publish_search_benchmark_labels(cases)
+            print(f"published {count} labeled cases to private.search_benchmark_labels")
+            return 0
+        assert_private_path(args.output)
+        rows = warehouse.load_search_benchmark_labels()
+        payload = [
+            {
+                "query": row["query"], "stratum": row["stratum"], "verdict": row["verdict"],
+                "truth_refs": json.loads(row["truth_refs_json"] or "[]"),
+                "truth_predicate": json.loads(row["truth_predicate_json"]) if row["truth_predicate_json"] else None,
+                "sources": json.loads(row["sources_json"] or "[]"), "since": row["since"], "note": row["note"],
+            }
+            for row in rows
+        ]
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        print(f"wrote {len(payload)} labeled cases to {args.output}")
+        return 0
+    finally:
+        warehouse.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -763,7 +799,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     smoke.add_argument("--workers", type=int, default=4)
     smoke.add_argument("--output", type=Path, default=Path(".search-eval/smoke_report.json"))
 
+    publish = subparsers.add_parser(
+        "publish-labels", help="store the label file in private.search_benchmark_labels (needs the database URL)"
+    )
+    publish.add_argument("--labels", type=Path, default=DEFAULT_LABELS)
+    pull = subparsers.add_parser(
+        "pull-labels", help="export private.search_benchmark_labels to a private label file"
+    )
+    pull.add_argument("--output", type=Path, default=DEFAULT_LABELS)
+
     args = parser.parse_args(argv)
+    if args.command in {"publish-labels", "pull-labels"}:
+        return _labels_command(args)
     assert_private_path(args.output)
     modes = tuple(m.strip() for m in args.modes.split(",") if m.strip())
     # smoke takes no labels: it asks whether every source ANSWERS, which is a

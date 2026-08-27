@@ -2690,6 +2690,8 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "uploader_heartbeats": _state("run heartbeats posted by the remote-device uploaders"),
     "timeline_priority_mix": _state("per-source priority-tier counts over the last seven days (collector snapshot)"),
     "agent_usage": _state("how agents use PDW over a trailing window (daily collector snapshot)"),
+    "search_benchmark_runs": _state("weekly search benchmark: latency and labeled quality per mode"),
+    "search_benchmark_labels": _state("the benchmark's private labels (queries and truth refs)"),
     "search_health": _state("search chunk and embedding convergence heartbeats"),
     # The timeline itself
     "timeline_events": _state("the unified timeline"),

@@ -177,6 +177,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   <div id="adapters"></div>
   <div id="backups"></div>
   <div id="search"></div>
+  <div id="benchmark"></div>
   <div id="priority"></div>
   <div id="agents"></div>
   <div id="slack"></div>
@@ -245,6 +246,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     ["marts", "marts — the read interface, judged on the freshness of what it reads"],
     ["adapters", "timeline adapters — is THIS kind of data reaching timeline.events"],
     ["search", "search — do chunks and embeddings converge with the timeline"],
+    ["benchmark", "search benchmark — weekly latency and labeled quality through the search tool"],
     ["priority", "priority tiers — how each source's last seven days split across self / direct / cc / noise / background"],
     ["agents", "agent usage — do agents start at the timeline and scope by tier (measured from their sessions)"],
     // Per-source detectors. They are here because level 1 AGGREGATES a source
@@ -262,7 +264,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
     pipelines: [], tables: [], marts: [], adapters: [], search: [], slack: [], plaid: [], collation: [],
-    backups: [], priority: [], agents: [],
+    backups: [], priority: [], agents: [], benchmark: [],
     skew: 0, filter: "", attentionOnly: false, open: {}
   };
 
@@ -776,6 +778,21 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       a.invented_calls ? rows(a.invented_calls) + " invented pdw commands (pdw query, pdw --version, …)" : "");
   }
 
+  function benchmarkNode(b) {
+    return healthRow(b, b.mode + " search",
+      rows(b.probe_queries) + " latency probes · " + rows(b.labeled_cases) + " labeled cases",
+      [
+        ["p50", b.latency_p50_ms !== null && b.latency_p50_ms !== undefined ? (b.latency_p50_ms / 1000).toFixed(2) + "s" : "—",
+          "serial, through the app's search tool; the goal is under 2s", false],
+        ["p90", b.latency_p90_ms !== null && b.latency_p90_ms !== undefined ? (b.latency_p90_ms / 1000).toFixed(2) + "s" : "—",
+          "max " + (b.latency_max_ms / 1000).toFixed(2) + "s", true],
+        ["MRR", b.labeled_cases ? b.mrr : "—",
+          b.labeled_cases ? "hit@1 " + rows(b.hit_at_1) + " · hit@5 " + rows(b.hit_at_5) + " · hit@10 " + rows(b.hit_at_10) + " of " + rows(b.labeled_cases) : "no labels published", true],
+        ["measured", b.collected_at ? ago(ageOf(b.collected_at)) + " ago" : "never", stamp(b.collected_at), true]
+      ],
+      b.note || (b.errors ? rows(b.errors) + " searches failed during the run" : ""));
+  }
+
   function backupNode(b) {
     // Two independent facts, because reporting either alone is how this hid:
     // WAL shipped perfectly through the 2026-08-25 outage while no base backup
@@ -851,21 +868,22 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     renderSection("marts", LEVELS[1][1], state.marts, martNode);
     renderSection("adapters", LEVELS[2][1], state.adapters, adapterNode);
     renderSection("search", LEVELS[3][1], state.search, searchNode);
-    renderSection("priority", LEVELS[4][1], state.priority, priorityMixNode,
+    renderSection("benchmark", LEVELS[4][1], state.benchmark, benchmarkNode);
+    renderSection("priority", LEVELS[5][1], state.priority, priorityMixNode,
       function (a, b) {
         if (a.source !== b.source) return a.source < b.source ? -1 : 1;
         return bySeverity(a, b);
       });
-    renderSection("agents", LEVELS[5][1], state.agents, agentUsageNode,
+    renderSection("agents", LEVELS[6][1], state.agents, agentUsageNode,
       function (a, b) {
         if ((a.source === "all") !== (b.source === "all")) return a.source === "all" ? -1 : 1;
         return bySeverity(a, b);
       });
-    renderSection("slack", LEVELS[6][1], state.slack, slackConversationNode);
-    renderSection("plaid", LEVELS[7][1], state.plaid, plaidItemNode);
+    renderSection("slack", LEVELS[7][1], state.slack, slackConversationNode);
+    renderSection("plaid", LEVELS[8][1], state.plaid, plaidItemNode);
     // The database's own collation row first: it is the finding the other rows
     // corroborate, and it is the one that says this database cannot warn itself.
-    renderSection("collation", LEVELS[8][1], state.collation, collationNode,
+    renderSection("collation", LEVELS[9][1], state.collation, collationNode,
       function (a, b) {
         if ((a.scope === "database") !== (b.scope === "database")) {
           return a.scope === "database" ? -1 : 1;
@@ -940,7 +958,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     node.appendChild(h("br"));
     node.appendChild(document.createTextNode(
       "Everything here is queryable at parity: marts_ops.pipeline_health, marts_ops.table_freshness," +
-      " marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health, marts_ops.timeline_priority_mix, marts_ops.agent_usage," +
+      " marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health, marts_ops.timeline_priority_mix, marts_ops.agent_usage, marts_ops.search_benchmark," +
       " marts_ops.collation_health."));
   }
 
@@ -969,6 +987,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       state.adapters = body.adapters || [];
       state.backups = body.backups || [];
       state.search = body.search || [];
+      state.benchmark = body.benchmark || [];
       state.priority = body.priority || [];
       state.agents = body.agents || [];
       state.slack = body.slack || [];

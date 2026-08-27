@@ -16,6 +16,7 @@ import psycopg2
 from psycopg2 import Binary
 from psycopg2.extras import Json, execute_values
 
+from personal_data_warehouse.search_benchmark_runner import LATENCY_P50_TARGET_MS, MRR_FLOOR
 from personal_data_warehouse.agent_usage import (
     PRIORITY_FILTER_TARGET,
     SEARCH_FIRST_TARGET,
@@ -78,6 +79,8 @@ from personal_data_warehouse.schema import (
     UPLOADER_HEARTBEAT_COLUMNS,
     TIMELINE_PRIORITY_MIX_COLUMNS,
     AGENT_USAGE_COLUMNS,
+    SEARCH_BENCHMARK_LABEL_COLUMNS,
+    SEARCH_BENCHMARK_RUN_COLUMNS,
     MART_VIEW_HEALTH_COLUMNS,
     PIPELINE_HEALTH_COLUMNS,
     PIPELINE_TABLE_FRESHNESS_COLUMNS,
@@ -926,6 +929,8 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "uploader_heartbeats": TableSpec(UPLOADER_HEARTBEAT_COLUMNS, ("pipeline", "device")),
     "timeline_priority_mix": TableSpec(TIMELINE_PRIORITY_MIX_COLUMNS, ("source", "priority"), "collected_at"),
     "agent_usage": TableSpec(AGENT_USAGE_COLUMNS, ("source",), "collected_at"),
+    "search_benchmark_runs": TableSpec(SEARCH_BENCHMARK_RUN_COLUMNS, ("mode",), "collected_at"),
+    "search_benchmark_labels": TableSpec(SEARCH_BENCHMARK_LABEL_COLUMNS, ("query",)),
 }
 
 # Every table whose rows belong to exactly one linked Plaid Item, data first
@@ -2177,6 +2182,17 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    "probe_queries",
+    "latency_p50_ms",
+    "latency_p90_ms",
+    "latency_max_ms",
+    "labeled_cases",
+    "found",
+    "hit_at_1",
+    "hit_at_5",
+    "hit_at_10",
+    "mrr_milli",
+    "errors",
     "window_days",
     "sessions",
     "pdw_sessions",
@@ -4092,6 +4108,8 @@ class PostgresWarehouse:
                 "uploader_heartbeats",
                 "timeline_priority_mix",
                 "agent_usage",
+                "search_benchmark_runs",
+                "search_benchmark_labels",
             ]
         )
         # _ensure_table_group only CREATEs; it does not widen an existing
@@ -4700,6 +4718,33 @@ class PostgresWarehouse:
             """,
         )
 
+        # C8 measured: the weekly benchmark's latency and labeled quality as a
+        # health row, judged against the goal (p50 under two seconds) and the
+        # MRR floor. A row older than ten days reads unknown -- the asset is
+        # weekly and a benchmark that stopped running must not keep its last
+        # green.
+        self._ensure_view(
+            "marts_search_benchmark",
+            f"""
+            CREATE OR REPLACE VIEW @marts_search_benchmark AS
+            SELECT mode,
+                   CASE
+                       WHEN collected_at = {epoch} OR now() - collected_at > interval '10 days' THEN 'unknown'
+                       WHEN probe_queries = 0 THEN 'no_data'
+                       WHEN latency_p50_ms > {LATENCY_P50_TARGET_MS} THEN 'attention'
+                       WHEN labeled_cases > 0 AND mrr_milli < {int(MRR_FLOOR * 1000)} THEN 'attention'
+                       ELSE 'ok'
+                   END AS status,
+                   probe_queries, latency_p50_ms, latency_p90_ms, latency_max_ms,
+                   labeled_cases, found, hit_at_1, hit_at_5, hit_at_10,
+                   round(mrr_milli / 1000.0, 3) AS mrr,
+                   errors, NULLIF(note, '') AS note,
+                   NULLIF(collected_at, {epoch}) AS collected_at,
+                   (EXTRACT(EPOCH FROM now() - NULLIF(collected_at, {epoch})))::bigint AS snapshot_age_seconds
+            FROM @search_benchmark_runs
+            """,
+        )
+
         # Level 3 of the health contract: "is THIS kind of data current on the
         # timeline?" The pipeline row cannot answer it. `timeline` is a single
         # pipeline whose run heartbeat is a max() over every adapter, so one
@@ -4745,6 +4790,7 @@ class PostgresWarehouse:
             FROM @timeline_sync_state
             """,
         )
+
 
 
 
@@ -4847,6 +4893,51 @@ class PostgresWarehouse:
             except Exception as error:  # noqa: BLE001 - reported, not raised
                 errors[name] = str(error).strip()[:300]
         return errors
+
+    def write_search_benchmark_runs(self, rows: Sequence[Any], *, collected_at: datetime) -> None:
+        """Replace one mode's benchmark row with this run's measurement."""
+        self._insert_rows(
+            "search_benchmark_runs",
+            [_pipeline_health_row(run, collected_at=collected_at) for run in rows],
+            SEARCH_BENCHMARK_RUN_COLUMNS,
+        )
+
+    def load_search_benchmark_labels(self) -> list[dict[str, Any]]:
+        return self._query_dicts(
+            "SELECT query, stratum, verdict, truth_refs_json, truth_predicate_json, sources_json, since, note "
+            "FROM @search_benchmark_labels ORDER BY query"
+        )
+
+    def publish_search_benchmark_labels(self, cases: Sequence[Any], *, replace: bool = True) -> int:
+        """Store the benchmark's labels in the warehouse (private schema).
+
+        `replace` drops labels absent from the new set, so the table mirrors
+        the file that was published rather than accumulating retired cases.
+        """
+        now = datetime.now(tz=UTC)
+        version = int(now.timestamp())
+        rows = [
+            {
+                "query": case.query,
+                "stratum": case.stratum,
+                "verdict": case.verdict,
+                "truth_refs_json": json.dumps(list(case.truth_refs)),
+                "truth_predicate_json": json.dumps(case.truth_predicate) if case.truth_predicate else "",
+                "sources_json": json.dumps(list(case.sources)),
+                "since": case.since,
+                "note": case.note,
+                "updated_at": now,
+                "sync_version": version,
+            }
+            for case in cases
+        ]
+        self._insert_rows("search_benchmark_labels", rows, SEARCH_BENCHMARK_LABEL_COLUMNS)
+        if replace:
+            self._command(
+                "DELETE FROM @search_benchmark_labels WHERE query <> ALL(%s)",
+                ([case.query for case in cases],),
+            )
+        return len(rows)
 
     def write_agent_usage(self, rows: Sequence[Any], *, collected_at: datetime) -> None:
         """Replace the agent-usage snapshot with one collection's measurements."""

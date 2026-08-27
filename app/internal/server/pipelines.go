@@ -138,6 +138,14 @@ SELECT source, status, window_days, sessions, pdw_sessions, first_search, first_
 FROM ` + warehouse.SQLRelation("marts_agent_usage") + `
 ORDER BY (source = 'all') DESC, source`
 
+// Contract C8, measured weekly: search latency and labeled quality.
+var pipelineSearchBenchmarkSQL = `
+SELECT mode, status, probe_queries, latency_p50_ms, latency_p90_ms, latency_max_ms,
+       labeled_cases, found, hit_at_1, hit_at_5, hit_at_10, mrr, errors, note,
+       collected_at, snapshot_age_seconds
+FROM ` + warehouse.SQLRelation("marts_search_benchmark") + `
+ORDER BY mode`
+
 var pipelineSearchHealthSQL = `
 SELECT component, status, model, configured, pgvector_available,
        timeline_max_seq, chunk_cursor_seq, seq_lag, caught_up,
@@ -176,6 +184,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 				"adapters":   []map[string]any{},
 				"collation":  []map[string]any{},
 				"search":     []map[string]any{},
+				"benchmark":  []map[string]any{},
 				"priority":   []map[string]any{},
 				"agents":     []map[string]any{},
 				"slack":      []map[string]any{},
@@ -206,6 +215,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	adapters := s.optionalRows(r, "timeline adapter health", pipelineAdapterHealthSQL, pipelinesAdapterMaxRows)
 	collation := s.optionalRows(r, "collation health", pipelineCollationHealthSQL, pipelinesCollationMaxRows)
 	search := s.optionalRows(r, "search health", pipelineSearchHealthSQL, pipelinesSearchMaxRows)
+	benchmark := s.optionalRows(r, "search benchmark", pipelineSearchBenchmarkSQL, pipelinesSearchMaxRows)
 	priorityMix := s.optionalRows(r, "timeline priority mix", pipelinePriorityMixSQL, pipelinesPriorityMaxRows)
 	agents := s.optionalRows(r, "agent usage", pipelineAgentUsageSQL, pipelinesAgentsMaxRows)
 	slack := s.optionalRows(r, "slack conversation health", pipelineSlackConversationHealthSQL, pipelinesSlackMaxRows)
@@ -218,6 +228,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 		"adapters":   adapters,
 		"collation":  collation,
 		"search":     search,
+		"benchmark":  benchmark,
 		"priority":   priorityMix,
 		"agents":     agents,
 		"slack":      slack,

@@ -87,9 +87,16 @@ quietly becoming untrue, and several of these have been.
   than a schedule. *Held up by* `marts_ops.search_health` (chunk/embedding lag as data, not a
   flag), the source-token and pool-partition tests in `tests/test_repo_contracts.py`, and the
   labeled benchmark in `src/personal_data_warehouse/search_benchmark.py`
-  (`docs/search-benchmark.md`). *Gap:* the labels are private and gitignored by necessity, so
-  the benchmark is only as alive as the copy someone keeps — it was lost once already, which
-  made retrieval quality unmeasurable until it was rebuilt on 2026-08-26.
+  (`docs/search-benchmark.md`), and — since 2026-08-27 — the weekly `search_benchmark`
+  Dagster asset, which runs the same measurement through the app's own `search` tool and
+  writes p50/p90 latency over fixed term-bag probes plus MRR / hit@k over the labeled cases
+  into `marts_ops.search_benchmark` (`attention` when p50 > 2s or MRR < 0.30; `unknown`
+  after ten days), rendered on `/pipelines`. The labels now live in
+  `private.search_benchmark_labels`, loaded with
+  `uv run python -m personal_data_warehouse.search_benchmark publish-labels` and exported
+  with `pull-labels`, so a lost gitignored directory can no longer make retrieval quality
+  unmeasurable — which it did once, in 2026-08. *Gap:* the table is empty until someone
+  publishes labels; the row says so (`no labels published`) rather than reading green.
 - **C9 — one obvious way to do a thing, on both surfaces.** There is exactly one hybrid
   search, one SQL entry point per surface, one schema-discovery call. *Held up by*
   `tool.Surface` splitting MCP-only and CLI-only tools, the `runCall` fence that refuses
@@ -576,7 +583,14 @@ scan replaced eighteen serial per-source branches whose wall clock was the SUM o
 branch (6.9s warm, 21.7s cold) with two index-ordered scans.
 
 **A documented performance number that silently regressed is itself a bug, so re-measure
-before you quote one.** This section claimed the pooled scan returned the global top 200 in
+before you quote one — and prefer the living number.** Since 2026-08-27 the weekly
+`search_benchmark` asset writes p50/p90 hybrid latency and labeled MRR into
+`marts_ops.search_benchmark` (on `/pipelines`), and `scripts/contract_audit.py` times three
+novel searches on demand; the tables below are the history of how each fix was measured,
+not a promise the current deployment keeps. Measured 2026-08-26 through the CLI on the
+audit day, before the host-saturation fixes in this section landed, hybrid search ran
+4.7-13.9s (median ~9.5s) with a 28-core VM at load 19.7 and 29% iowait — the point of the
+benchmark row is that the next such regression is a red row, not a doc line. This section claimed the pooled scan returned the global top 200 in
 36ms until 2026-08-26, when it was actually 2.9s — the pool had grown a per-row bm25 score
 in its SELECT list, which re-tokenizes every pooled document. Re-measured 2026-08-26 on the
 production corpus, novel queries every time (a repeated query is ~3x faster and will tell
@@ -741,6 +755,7 @@ The `uploader_heartbeats` pipeline row says whether ANY device is reporting at a
 | 3 — timeline adapters | `marts_ops.timeline_adapter_health` | is THIS kind of data reaching `timeline.events` |
 | 3b — priority tiers | `marts_ops.timeline_priority_mix` | how each source's last seven days split across the five tiers; an `unclassified` row is `failing` |
 | 3c — agent usage | `marts_ops.agent_usage` | are agents starting at the timeline and scoping by tier (C3), measured daily from their own sessions |
+| 3d — search benchmark | `marts_ops.search_benchmark` | weekly p50/p90 search latency and labeled MRR through the search tool (C8) |
 | 4 — integrity | `marts_ops.collation_health` | did the sort order move under us, and did anything break |
 
 **Level 2 exists because a view cannot be probed like a table.** `TABLE_PIPELINES` measures

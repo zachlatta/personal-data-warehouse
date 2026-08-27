@@ -2169,6 +2169,43 @@ MART_VIEW_HEALTH_COLUMNS = (
 #: production reported `status: error (no valid backups)` and had for a day,
 #: while WAL archiving kept working, every pipeline read green, and the loop
 #: logged "backup failed" to stdout every six hours where nothing escalated it.
+# The weekly search benchmark, one row per retrieval mode: serial latency
+# over fixed probe queries and labeled quality (MRR, hit@k) through the app's
+# own search tool. mrr is stored x1000 as a bigint; the marts view divides.
+SEARCH_BENCHMARK_RUN_COLUMNS = (
+    "mode",
+    "probe_queries",
+    "latency_p50_ms",
+    "latency_p90_ms",
+    "latency_max_ms",
+    "labeled_cases",
+    "found",
+    "hit_at_1",
+    "hit_at_5",
+    "hit_at_10",
+    "mrr_milli",
+    "errors",
+    "note",
+    "collected_at",
+)
+
+# The benchmark's labels, kept in the warehouse (private: they are Zach's own
+# queries and timeline refs) so losing a gitignored directory can no longer
+# make retrieval quality unmeasurable. Loaded with `search_benchmark
+# publish-labels`, exported with `pull-labels`.
+SEARCH_BENCHMARK_LABEL_COLUMNS = (
+    "query",
+    "stratum",
+    "verdict",
+    "truth_refs_json",
+    "truth_predicate_json",
+    "sources_json",
+    "since",
+    "note",
+    "updated_at",
+    "sync_version",
+)
+
 # One row per agent source (plus 'all') measuring how agents use PDW over a
 # trailing window, from their own transcripts: what their first PDW call was,
 # how often searches carried a priority filter, how much SQL bypassed the
