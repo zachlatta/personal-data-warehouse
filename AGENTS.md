@@ -1053,6 +1053,22 @@ back it, all behind the static bearer the CLI uses:
   `DeviceNotRegistered` ticket flips that row to `disabled` with the reason, so an
   unreachable phone is a fact in the table rather than a quietly shrinking fan-out.
 
+**Every timeline row carries its deep link, and the detail carries the conversation.**
+`GET /api/timeline`, `/api/timeline/item` and `/api/timeline/item/context` attach
+`open: {url, label, app_url?}` to each row (`app/internal/server/timeline_links.go`),
+computed from `adapter` + `source_pk` + `metadata` alone so the list pays no extra query:
+a Slack permalink (`<domain>.slack.com/archives/<conv>/p<ts>`, with `thread_ts`/`cid` for
+a reply, domain from `base_slack.teams`), Gmail `#all/<message_id>` in that account,
+Calendar's base64 `eid`, Drive `open?id=`, Google Contacts, ChatGPT/claude.ai conversations,
+`wa.me` for a 1:1 WhatsApp chat, `imessage:`/`sms:` for a 1:1 iMessage chat, and the
+Notes `showNote?identifier=` scheme. `app_url` is the native scheme a phone tries first
+and falls back from — the iOS app never calls `canOpenURL`, which would need every scheme
+declared in the native Info.plist. A source with no honest URL (health, photos, voice memos,
+a group chat, a CLI agent transcript) gets **no** link rather than a guessed one.
+`/api/timeline/item` also inlines `context` — `timeline.context(ref, 15, 15)`, the same
+function agents call — with `is_anchor` on the row asked about; both UIs render it as a
+scrollable transcript with earlier/later controls up to the function's 50-a-side cap.
+
 Push is delivered through the Expo push service (`exp.host`), not APNs directly.
 `PDW_EXPO_ACCESS_TOKEN` is optional on the app deployment. A simulator cannot
 receive push; the app reports `unsupported` there and everything else still works.

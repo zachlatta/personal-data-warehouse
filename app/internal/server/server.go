@@ -416,6 +416,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		}
 		media := &timelineMediaSigner{baseURL: mediaBase, signer: mediaSigner, ttl: cfg.ObjectStoreURLTTL, now: time.Now}
 		timelineSvc := newTimelineService(timelineRunner, sourceRunner, media, logger)
+		timelineSvc.baseURL = strings.TrimRight(baseURL, "/")
 		timelineSvc.registerRoutes(mux, authSvc.RequireStaticBearer())
 		logger.Info("timeline endpoints enabled",
 			"dedicated_database", cfg.TimelineDatabaseURL != "",

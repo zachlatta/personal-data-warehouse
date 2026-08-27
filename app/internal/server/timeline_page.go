@@ -138,6 +138,38 @@ button.primary { color: #10131a; background: var(--amber); border-color: var(--a
 .row .snip { color: var(--dim); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .ctx { color: var(--faint); font-size: 10px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .flags { color: var(--faint); font-size: 9px; letter-spacing: .08em; }
+.row .right { text-align: right; }
+a.open {
+  display: inline-block; color: var(--amber-dim); text-decoration: none; font-size: 11px;
+  padding: 0 4px; border-radius: 2px; border: 1px solid transparent; margin-left: 6px;
+}
+a.open:hover { color: var(--amber); border-color: var(--amber-dim); background: var(--surface2); }
+a.openbtn {
+  display: inline-flex; align-items: center; gap: 6px; text-decoration: none;
+  color: #10131a; background: var(--amber); border: 1px solid var(--amber); border-radius: 3px;
+  padding: 5px 12px; font-size: 11px; letter-spacing: .06em; font-weight: 700; white-space: nowrap;
+}
+a.openbtn:hover { filter: brightness(1.08); }
+/* the conversation around the selected event: a scrollable transcript with
+   the anchor row lit, so a single Slack line reads as the exchange it was */
+.convo {
+  max-height: 46vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 4px;
+  background: var(--bg); padding: 4px 0;
+}
+.crow {
+  display: grid; grid-template-columns: 44px 1fr; gap: 0 10px; padding: 5px 10px;
+  cursor: pointer; border-left: 2px solid transparent;
+}
+.crow:hover { background: var(--surface); }
+.crow.anchor { background: var(--surface2); border-left-color: var(--amber); }
+.crow .ct { color: var(--faint); font-size: 10px; padding-top: 2px; text-align: right; }
+.crow .ca { color: var(--dim); font-size: 10.5px; letter-spacing: .04em; }
+.crow.anchor .ca { color: var(--amber); }
+.crow .cb { white-space: pre-wrap; word-break: break-word; color: var(--text); font-size: 12px; line-height: 1.45; }
+.crow .cd { color: var(--faint); font-size: 9px; letter-spacing: .1em; text-transform: uppercase; padding: 2px 0 6px; grid-column: 1 / 3; }
+.crow.p-noise .cb, .crow.p-background .cb { color: var(--dim); }
+.convo-ctl { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; gap: 8px; }
+.convo-ctl .m { color: var(--faint); font-size: 10px; }
 
 #sentinel { height: 60px; }
 #status { padding: 18px 6px; color: var(--faint); font-size: 11px; letter-spacing: .08em; }
@@ -509,11 +541,18 @@ a.filelink:hover { text-decoration: underline; }
       if (!item.title && !item.snippet) body.appendChild(h("div", "snip", "(" + item.kind + ")"));
       row.appendChild(body);
 
-      var right = h("div");
+      var right = h("div", "right");
       right.appendChild(h("div", "ctx", item.context || ""));
       var badges = h("div", "flags");
       badges.appendChild(h("span", "pbadge", item.priority));
       if (flags.length) badges.appendChild(document.createTextNode(" " + flags.join(" · ")));
+      if (item.open && item.open.url) {
+        var openLink = h("a", "open", "⇗");
+        openLink.href = item.open.url; openLink.target = "_blank"; openLink.rel = "noopener";
+        openLink.title = "open in " + item.open.label;
+        openLink.addEventListener("click", function (ev) { ev.stopPropagation(); });
+        badges.appendChild(openLink);
+      }
       right.appendChild(badges);
       row.appendChild(right);
 
@@ -728,6 +767,14 @@ a.filelink:hover { text-decoration: underline; }
     var body = el("dbody");
     body.textContent = "";
 
+    if (item.open && item.open.url) {
+      var openSect = h("div", "sect");
+      var openBtn = h("a", "openbtn", "⇗  open in " + item.open.label);
+      openBtn.href = item.open.url; openBtn.target = "_blank"; openBtn.rel = "noopener";
+      openSect.appendChild(openBtn);
+      body.appendChild(openSect);
+    }
+
     var head = section("event");
     head.appendChild(kvTable([
       ["when", fmtFull(item.event_ts)], ["until", isReal(item.end_ts) ? fmtFull(item.end_ts) : ""],
@@ -754,6 +801,21 @@ a.filelink:hover { text-decoration: underline; }
 
     api("/api/timeline/item", { adapter: item.adapter, event_id: item.event_id }).then(function (detail) {
       body.removeChild(loading);
+      // The detail row carries the deep link even when the list row
+      // predates it (context rows opened from the transcript, search hits).
+      if (detail.item && detail.item.open && !(item.open && item.open.url)) {
+        item.open = detail.item.open;
+        var lateOpen = h("div", "sect");
+        var lateBtn = h("a", "openbtn", "⇗  open in " + item.open.label);
+        lateBtn.href = item.open.url; lateBtn.target = "_blank"; lateBtn.rel = "noopener";
+        lateOpen.appendChild(lateBtn);
+        body.insertBefore(lateOpen, body.firstChild);
+      }
+      if (detail.context) {
+        // right after the preview (or the event table when there is none)
+        var anchorSect = body.children[item.open && item.open.url ? 3 : 2] || null;
+        appendContextSection(body, item, detail.context, anchorSect);
+      }
       if (detail.item_media) {
         var mediaSect = section("media");
         var node = mediaNode(detail.item_media, detail.item_media.filename);
@@ -782,6 +844,80 @@ a.filelink:hover { text-decoration: underline; }
     });
   }
   function isReal(ts) { return ts && ts.slice(0, 4) !== "1970"; }
+
+  /* ---- conversation context ----
+     The (source, context) stream around the event, from timeline.context():
+     the surrounding channel/DM messages, the neighboring turns of an agent
+     session, the adjacent events of the same calendar. */
+  function contextRowNode(row, anchorItem, lastDay) {
+    var node = h("div", "crow p-" + (row.priority || "unclassified") + (row.is_anchor ? " anchor" : ""));
+    var day = dayOf(row.event_ts);
+    if (day !== lastDay.value) {
+      lastDay.value = day;
+      node.appendChild(h("div", "cd", day));
+    }
+    node.appendChild(h("div", "ct", fmtTime(row.event_ts)));
+    var main = h("div");
+    var who = h("div", "ca", (row.actor || "—") + (row.title && row.title !== row.snippet ? "  ·  " + row.title : ""));
+    main.appendChild(who);
+    var text = row.snippet || (row.title ? "" : "(" + row.kind + ")");
+    if (text) main.appendChild(h("div", "cb", text));
+    node.appendChild(main);
+    if (!row.is_anchor) {
+      node.title = "open this event";
+      node.addEventListener("click", function () { openItem(row); });
+    }
+    return node;
+  }
+
+  function appendContextSection(body, item, page, beforeNode) {
+    if (!page || !page.items || !page.items.length) return;
+    var sect = section("conversation");
+    var box = h("div", "convo");
+    var window_ = { before: page.before || 0, after: page.after || 0 };
+    var ctl = h("div", "convo-ctl");
+    var earlier = h("button", "", "← earlier");
+    var later = h("button", "", "later →");
+    var status = h("div", "m");
+    ctl.appendChild(earlier); ctl.appendChild(status); ctl.appendChild(later);
+
+    function render(items) {
+      box.textContent = "";
+      var lastDay = { value: "" };
+      var anchorNode = null;
+      items.forEach(function (row) {
+        var node = contextRowNode(row, item, lastDay);
+        if (row.is_anchor) anchorNode = node;
+        box.appendChild(node);
+      });
+      status.textContent = items.length + " events · " + window_.before + " before / " + window_.after + " after";
+      earlier.disabled = window_.before >= 50;
+      later.disabled = window_.after >= 50;
+      if (anchorNode) {
+        // center the selected event once the box has laid out
+        setTimeout(function () {
+          box.scrollTop = Math.max(0, anchorNode.offsetTop - box.clientHeight / 2 + anchorNode.offsetHeight / 2);
+        }, 0);
+      }
+    }
+    function refetch() {
+      status.textContent = "loading…";
+      api("/api/timeline/item/context", {
+        adapter: item.adapter, event_id: item.event_id,
+        before: window_.before, after: window_.after
+      }).then(function (next) {
+        window_.before = next.before; window_.after = next.after;
+        render(next.items || []);
+      }).catch(function (err) { status.textContent = "context failed: " + err.message; });
+    }
+    earlier.addEventListener("click", function () { window_.before = Math.min(50, window_.before + 15); refetch(); });
+    later.addEventListener("click", function () { window_.after = Math.min(50, window_.after + 15); refetch(); });
+
+    sect.appendChild(box);
+    sect.appendChild(ctl);
+    render(page.items);
+    body.insertBefore(sect, beforeNode || null);
+  }
 
   function closeDrawer() {
     el("drawer").classList.remove("open");

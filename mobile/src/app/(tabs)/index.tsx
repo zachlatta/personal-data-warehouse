@@ -2,6 +2,7 @@ import { useRouter } from 'expo-router';
 import { useEffect, useMemo, useReducer } from 'react';
 import { ActivityIndicator, FlatList, Pressable, RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
 
+import { OpenInSourceButton } from '@/components/open-in-source-button';
 import { PRIORITY_COLORS, PriorityBadge } from '@/components/priority-badge';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -129,9 +130,12 @@ export default function TimelineScreen() {
                 {humanSource(item.source)}
                 {item.actor ? ` · ${truncate(item.actor, 40)}` : ''}
               </ThemedText>
-              <ThemedText type="small" themeColor="textSecondary">
-                {formatWhen(item.event_ts)}
-              </ThemedText>
+              <View style={styles.rowHeaderRight}>
+                <ThemedText type="small" themeColor="textSecondary">
+                  {formatWhen(item.event_ts)}
+                </ThemedText>
+                <OpenInSourceButton link={item.open} compact />
+              </View>
             </View>
             <View style={styles.titleRow}>
               <PriorityBadge priority={item.priority} />
@@ -169,6 +173,7 @@ const styles = StyleSheet.create({
   chipText: { fontSize: 13, fontWeight: '600' },
   row: { paddingHorizontal: Spacing.three, paddingVertical: 10, gap: 4, borderBottomWidth: StyleSheet.hairlineWidth },
   rowHeader: { flexDirection: 'row', justifyContent: 'space-between', gap: Spacing.two },
+  rowHeaderRight: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
   source: { flexShrink: 1 },
   titleRow: { flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.two },
   title: { flex: 1 },

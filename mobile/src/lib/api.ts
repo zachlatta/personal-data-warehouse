@@ -37,6 +37,10 @@ async function request<T>(config: AppConfig, path: string, init: RequestInit = {
 export type Priority = 'self' | 'direct' | 'cc' | 'noise' | 'background' | 'unclassified';
 export const PRIORITIES: Priority[] = ['self', 'direct', 'cc', 'noise', 'background'];
 
+// "Open in its source": url works anywhere a browser does; app_url is a
+// native scheme a phone should try first (Slack, Messages, Notes, WhatsApp).
+export type TimelineDeepLink = { url: string; label: string; app_url?: string };
+
 export type TimelineItem = {
   adapter: string;
   event_id: string;
@@ -53,6 +57,9 @@ export type TimelineItem = {
   source_pk: Record<string, unknown>;
   metadata: Record<string, unknown>;
   seq: number;
+  open?: TimelineDeepLink;
+  // Set on rows returned by the context endpoint for the event asked about.
+  is_anchor?: boolean;
 };
 
 export type TimelinePage = { items: TimelineItem[]; has_more: boolean; next_cursor?: string };
@@ -80,8 +87,15 @@ export function listTimeline(config: AppConfig, params: TimelineListParams): Pro
 export type TimelineMedia = { media_url: string; media_kind: string; mime_type?: string; filename?: string };
 export type TimelineChildRows = Record<string, unknown>[] | { error: string };
 
+// The (source, context) stream around one event — the surrounding chat or
+// channel messages, the neighboring turns of a session — from timeline.context().
+export type TimelineContextPage = { items: TimelineItem[]; before: number; after: number };
+export const TIMELINE_CONTEXT_MAX_WINDOW = 50;
+
 export type TimelineItemDetail = {
   item: TimelineItem;
+  context?: TimelineContextPage;
+  context_error?: string;
   source_row?: Record<string, unknown> | null;
   source_row_error?: string;
   item_media?: TimelineMedia | null;
@@ -92,6 +106,16 @@ export type TimelineItemDetail = {
 export function getTimelineItem(config: AppConfig, adapter: string, eventId: string): Promise<TimelineItemDetail> {
   const query = new URLSearchParams({ adapter, event_id: eventId });
   return request<TimelineItemDetail>(config, `/api/timeline/item?${query.toString()}`);
+}
+
+export function getTimelineContext(
+  config: AppConfig,
+  adapter: string,
+  eventId: string,
+  window: { before: number; after: number },
+): Promise<TimelineContextPage> {
+  const query = new URLSearchParams({ adapter, event_id: eventId, before: String(window.before), after: String(window.after) });
+  return request<TimelineContextPage>(config, `/api/timeline/item/context?${query.toString()}`);
 }
 
 // --- mutations --------------------------------------------------------------

@@ -81,10 +81,18 @@ type timelineService struct {
 	media    *timelineMediaSigner
 	logger   *slog.Logger
 
+	// baseURL is this app's public origin, for deep links into its own
+	// pages (the mutation review UI).
+	baseURL string
+
 	mu                sync.Mutex
 	sourcesPayload    []byte
 	sourcesFetched    time.Time
 	sourcesRefreshing bool
+
+	linksMu            sync.Mutex
+	slackDomainCache   map[string]string
+	slackDomainFetched time.Time
 }
 
 func newTimelineService(timeline, source timelineQuerier, media *timelineMediaSigner, logger *slog.Logger) *timelineService {
@@ -173,8 +181,11 @@ func (s *timelineService) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	items := make([]map[string]any, 0, len(result.Rows))
+	env := s.linkEnv(r.Context())
 	for _, row := range result.Rows {
-		items = append(items, timelineItemJSON(row))
+		item := timelineItemJSON(row)
+		attachDeepLink(item, row, env)
+		items = append(items, item)
 	}
 	response := map[string]any{"items": items, "has_more": len(items) == limit}
 	if len(items) == limit {
@@ -822,11 +833,21 @@ func (s *timelineService) handleItem(w http.ResponseWriter, r *http.Request) {
 	}
 	row := result.Rows[0]
 	item := timelineItemJSON(row)
+	attachDeepLink(item, row, s.linkEnv(r.Context()))
 	sourceTable, pk := timelineSourcePointer(row)
 	// Rows written before a catalog rename still carry the historical token.
 	sourceTable = warehouse.CurrentSourceTable(sourceTable)
 
 	response := map[string]any{"item": item}
+	// The surrounding stream (the channel/chat/thread around a message, the
+	// neighboring turns of a session, the same calendar's adjacent events)
+	// is what makes one row readable; ship the default window inline so the
+	// inspector opens with it rather than after a second round trip.
+	if contextPage, ctxErr := s.fetchContext(r.Context(), adapter, eventID, timelineContextDefaultWindow, timelineContextDefaultWindow); ctxErr != nil {
+		response["context_error"] = ctxErr.Error()
+	} else {
+		response["context"] = contextPage
+	}
 	children, known := timelineChildQueries[sourceTable]
 	if !known {
 		// A source table the UI does not know children for yet; still return
@@ -867,6 +888,93 @@ func (s *timelineService) handleItem(w http.ResponseWriter, r *http.Request) {
 		response["item_media"] = media
 	}
 	writeJSON(w, response)
+}
+
+// --- conversation context ---------------------------------------------------
+
+const (
+	timelineContextDefaultWindow = 15
+	// timeline.context() itself clamps to 50 a side.
+	timelineContextMaxWindow = 50
+)
+
+var timelineContextSQL = `
+SELECT adapter, event_id, source, kind, priority, event_ts, end_ts, actor, title, snippet, context,
+       source_table, source_pk::text AS source_pk, metadata::text AS metadata, seq
+FROM ` + warehouse.SQLRelation("timeline_context") + `($1, $2, $3)
+ORDER BY event_ts, seq`
+
+type timelineContextPage struct {
+	Items  []map[string]any `json:"items"`
+	Before int              `json:"before"`
+	After  int              `json:"after"`
+}
+
+// fetchContext reads the (source, context) stream around one event through
+// timeline.context(), the same function agents call in SQL, and flags the
+// anchor row so a UI can scroll to it.
+func (s *timelineService) fetchContext(ctx context.Context, adapter, eventID string, before, after int) (timelineContextPage, error) {
+	before = max(0, min(before, timelineContextMaxWindow))
+	after = max(0, min(after, timelineContextMaxWindow))
+	ref := adapter + ":" + eventID
+	result, err := s.timeline.QueryArgs(ctx, timelineContextSQL, []any{ref, before, after}, before+after+1)
+	if err != nil {
+		return timelineContextPage{}, err
+	}
+	env := s.linkEnv(ctx)
+	items := make([]map[string]any, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		item := timelineItemJSON(row)
+		attachDeepLink(item, row, env)
+		if a, _ := row["adapter"].(string); a == adapter {
+			if e, _ := row["event_id"].(string); e == eventID {
+				item["is_anchor"] = true
+			}
+		}
+		items = append(items, item)
+	}
+	return timelineContextPage{Items: items, Before: before, After: after}, nil
+}
+
+func parseContextWindow(raw string, fallback int) (int, error) {
+	if raw == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("before/after must be non-negative integers")
+	}
+	return parsed, nil
+}
+
+func (s *timelineService) handleItemContext(w http.ResponseWriter, r *http.Request) {
+	adapter := r.URL.Query().Get("adapter")
+	eventID := r.URL.Query().Get("event_id")
+	if adapter == "" || eventID == "" {
+		httpError(w, http.StatusBadRequest, "adapter and event_id are required")
+		return
+	}
+	before, err := parseContextWindow(r.URL.Query().Get("before"), timelineContextDefaultWindow)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	after, err := parseContextWindow(r.URL.Query().Get("after"), timelineContextDefaultWindow)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	page, err := s.fetchContext(r.Context(), adapter, eventID, before, after)
+	if err != nil {
+		if strings.Contains(err.Error(), "no timeline event for ref") {
+			httpError(w, http.StatusNotFound, "timeline item not found")
+			return
+		}
+		s.logger.ErrorContext(r.Context(), "timeline context query failed", "error", err)
+		httpError(w, http.StatusInternalServerError, "timeline context query failed")
+		return
+	}
+	writeJSON(w, page)
 }
 
 func (s *timelineService) handleItemChildren(w http.ResponseWriter, r *http.Request) {
@@ -1095,6 +1203,7 @@ func (s *timelineService) registerRoutes(mux *http.ServeMux, requireAuth func(ht
 	mux.Handle("/api/timeline/sources", requireAuth(http.HandlerFunc(s.handleSources)))
 	mux.Handle("/api/timeline/item", requireAuth(http.HandlerFunc(s.handleItem)))
 	mux.Handle("/api/timeline/item/children", requireAuth(http.HandlerFunc(s.handleItemChildren)))
+	mux.Handle("/api/timeline/item/context", requireAuth(http.HandlerFunc(s.handleItemContext)))
 	mux.HandleFunc("/timeline", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		// The shell is tiny and iterated on; never let a browser cache a stale copy.
